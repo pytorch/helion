@@ -26,6 +26,7 @@
  "test/test_benchmarking_batched_replay.py": 0.3,
  "test/test_best_available.py": 0.2,
  "test/test_better_benchmark.py": 2.6,
+ "test/test_better_benchmark_statistics.py": 104.9,
  "test/test_block_ptr_support.py": 0.0,
  "test/test_block_sized_buffer_slices.py": 4.5,
  "test/test_bound_kernel.py": 0.1,

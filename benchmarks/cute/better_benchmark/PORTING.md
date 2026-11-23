@@ -59,22 +59,135 @@ autotune records pinned to it, alone.
   wrapper's `aten.sort.stable` does: Helion's `torch.sort` compares every
   pair of elements, which the Triton backend cannot compile at that length).
   Both implementations then spend the same time in the library, and the
-  comparison stays one of the kernels.
+  comparison stays one of the kernels. One departure is prescribed: the
+  split statistics of "Counts and statistics" pass four workspaces where
+  Inductor passes three, three of them in fp64 (28 bytes per block and
+  channel against 12); that traffic is part of the port's time.
 - **Same math.** Load in the input dtype, compute in fp32 like Inductor
   (`.to(torch.float32)` at loads, cast to the output dtype at stores), keep
-  the graph's op order and constants, and use exact functions (`torch.exp`,
-  `torch.rsqrt`, true division); do not enable `fast_math`. Integer index
-  math (iota, fmod, floor-divide) uses the same formulas as the graph.
-- **Divide by counts the way Inductor does.** A Python number or
-  `hl.constexpr` divisor becomes a multiply by its reciprocal (with static
+  the graph's op order and constants, and use the functions the graph names
+  (`torch.exp`, `torch.rsqrt`, true division), not approximations of them;
+  do not enable `fast_math`. Integer index math (iota, fmod, floor-divide)
+  uses the same formulas as the graph. The split statistics of the next
+  rule are the exception: they are taken in fp64.
+  Keep the fusion of the captured shape point at every shape: which values
+  stay in fp32 between the graph's bf16 casts and which pass through a bf16
+  store that more math reads back. Where Inductor compiles another shape
+  with another fusion, its result follows another rounding there and the
+  port's differs from it by that rounding, which is not an approximation
+  (`var_mean_mean_e790938418f4`'s pooled mean at 128x32x112x112, where
+  Inductor averages the stored bf16 activations in kernels of their own).
+  Where a port's algorithm differs from the one in Inductor's kernel, its
+  results must not be less accurate on average than Inductor's, on the
+  inputs a model would feed it and not only on the repro's centered `randn`
+  inputs: random differences are fine (another summation order, FMA
+  contraction); a bias or a systematically larger error is not. The port's
+  docstring says what differs and why it is not less accurate; the next
+  rule says how to check it.
+- **Counts and statistics.** fp32 `/` is not an IEEE division, on either
+  backend or in Inductor's Triton: it multiplies by the divisor's correctly
+  rounded reciprocal (`div.full`), so a quotient by a count that is not a
+  power of two carries the reciprocal's relative error, up to 2**-24 and the
+  same for every dividend (-0.34 * 2**-24 for 392 or 6272). A Python number
+  or `hl.constexpr` divisor is the same multiply written out (with static
   shapes, `torch.sum(x, -1) / hidden` at `hidden = 192` computes
-  `sum * 0.005208333333333333`), which rounds differently from a division
-  unless the divisor is a power of two. Inductor divides a mean, a variance
-  and a Welford combine by their element count, so write means as
-  `torch.mean` (which divides by the count) and divide a combine by the
-  summed weights, a tensor; keep other run-time counts runtime arguments.
-  Only a divisor that is a literal in the graph (`div(x, 512)`) is a
-  reciprocal multiply in Inductor too.
+  `sum * 0.005208333333333333`). Where Inductor's kernel divides a sum by a
+  count (a persistent reduction's statistics), write the same division, so
+  both sides round alike: `torch.mean` for a mean, `/` by the count for a
+  variance, a literal divisor for a literal in the graph (`div(x, 512)`);
+  keep other run-time counts runtime arguments.
+  Where Inductor's kernel runs Welford (`welford_reduce`,
+  `welford_combine`: every looped or split `var_mean`), its mean is never
+  the quotient of a sum: the recurrences divide only differences, and a mean
+  that is not small against the spread stays within about half an ulp for
+  any count (on centered data, where it is small, Inductor's batch mean
+  measured 2 to 11 ulp).
+  Reductions over full slices do not express the recurrence, and the fp32
+  statistics they do express (a block's mean, the sum of squared deviations
+  from it, an n-way combine of the partials) are less accurate than it in
+  ways that the repro's centered inputs hide:
+  - the mean is a sum times a rounded reciprocal at every level, a bias
+    that every block shares once a channel's mean is a few standard errors
+    from zero (1.4 to 3.2 times Inductor's error on ReLU outputs at the
+    study's four such points);
+  - the squared deviations of bf16 values are exact numbers with biased low
+    bits (a square is 0, 1 or 4 modulo 8), so an fp32 accumulator rounds
+    them one way, the more the longer the chain a config gives it (rstd 9
+    times Inductor's error, 5 ulp, at one tuned config with one accumulator
+    per block, where the default config's 32 show nothing);
+  - a block's statistics folded chunk by chunk in fp32, where a loop cuts
+    the block, depend on the chunk size (rstd up to 56 times Inductor's
+    error at chunks of 16).
+
+  So take such statistics in fp64, in one pass, as moments about a pivot:
+  with `pivot` the block's first row and `shifted = x.to(torch.float64) -
+  pivot`, the block's sum is `pivot * n + torch.sum(shifted)` and its m2 is
+  `torch.sum(shifted * shifted) - torch.sum(shifted) ** 2 / n`. For bf16
+  values the deviations and their squares are exact in fp64 (up to an
+  exponent spread of 17 bits) and their sums are while they fit 53 bits;
+  beyond that, and for fp32 values, they round at 2**-53, far below an fp32
+  ulp. A loop adds its chunks' sums without a fold or a division, both sums
+  share one loop over the rows, and the pivot, one of the block's values,
+  keeps the cancellation in m2 harmless for any offset.
+  Pass the partials on in fp64 workspaces (the sum, the mean and m2; the
+  count fits fp32): partials rounded to fp32 add their roundings to the
+  result, several ulps of the mean and of rstd where blocks have few rows
+  or the data is centered, at shape points whose Inductor kernel does not
+  split. Combine them in fp64: add the block sums and divide once for the
+  mean (exact sums give the mean of the data, zero included, rounded once),
+  and take the second moment about the first block's mean from the stored
+  block means' deviations (the n-way formula about a pivot; an fp64
+  division per block is what the stored means save). Take the last level's
+  variance and `rstd = torch.rsqrt(var + eps)` in fp64 and round each
+  result once (in fp32, `torch.rsqrt` is the GPU's approximate reciprocal
+  square root on both backends and in Inductor's kernel, off by more than
+  half an ulp in one direction over ranges of its argument, which an exact
+  variance no longer offsets; in fp64 it measured within an fp64 ulp on
+  both backends, while `torch.sqrt` of an fp64 value does not compile on
+  Triton, whose `tl.sqrt_rn` takes fp32 only). Store a NaN sum for a block
+  that holds an infinity or a NaN, so that its channel's statistics are NaN
+  as the recurrence returns them, and give a block without elements a zero
+  weight and a guarded quotient
+  (`kernels/var_mean_mean_5a1b8c788e4b.py`; with masked loads
+  `kernels/var_mean_mean_e790938418f4.py`; with index math
+  `kernels/var_mean_var_mean_5cc92f5d49c1.py`;
+  `test/test_better_benchmark_statistics.py` holds each kernel to the
+  statistics of what it read and each port's `forward()` to the statistics
+  of the activation, rounded once).
+  Two things go with fp64 statements. A Python scalar of the graph is an
+  fp32 constant in the graph's fp32 ops (`add(var, 1e-05)` adds fp32's
+  1e-05, in eager on CUDA and in Inductor's kernel alike), and in an fp64
+  statement the literal is another number, up to half an fp32 ulp away
+  (0.4 for 0.9): hand the kernel the fp32 value
+  (`torch.tensor(0.9, dtype=torch.float32).item()`, as an `hl.constexpr`
+  argument), or eps biases rstd where the variance is small and a momentum
+  weight biases the running statistic. And take the momentum updates of the
+  running statistics in fp64 as well, rounded once: the variance's from the
+  fp64 variance, the mean's from the mean as the kernel stores it (the
+  tensor the graph's update reads, and an output the update can be checked
+  against). In fp32, `stat * 0.1 + running * 0.9` rounds two or three
+  times, depending on which product a compiler contracts into the sum
+  (Inductor's kernel contracts the running statistic's; 1.3 times its error
+  where the other one is contracted or none).
+  Check by measuring the mean ULP error and the bias of every output
+  against an exact float64 evaluation of the graph, next to Inductor's, on
+  inputs that are not centered as well as on the repro's (ReLU outputs,
+  per-channel offsets of 0.01 to 100 standard deviations, a constant
+  offset, offsets that differ between images, an infinity), at the tuned
+  and at the default config, and at the repro's other shape points, where
+  Inductor's kernels differ. What fp32 sums of squares lose shows on a
+  coarse grid (`3 + 0.1 * randn`) and on sparse ReLU outputs
+  (`relu(randn - 2)`) at a config with one accumulator per block; what
+  fp32 partials lose shows on few-valued channels (a constant with one
+  element a bf16 step off) at a shape point with few rows per block.
+  Two ports are open exceptions to this rule.
+  `kernels/var_mean_b19e82f2a47b.py` and `kernels/var_mean_3a2d56cdea00.py`
+  (a LayerNorm over the hidden dim) are looped reductions at their ported
+  shape point, where Inductor runs Welford, and they still take two-pass
+  fp32 statistics over a full slice; their docstrings give the measured
+  effect: Inductor's mean error at CuTe's default and campaign configs and
+  on Triton, 1.1 to 1.3 times it on near-constant rows at 3 of 6 random
+  CuTe configs. Converting them to the fp64 moments above is open.
 - **Let the autotuner tile.** `@helion.kernel(static_shapes=True)` with no
   config. Tile parallel dimensions with `hl.tile`, and express reductions as
   torch reductions over full slices (`x[tile_m, :].sum(-1)`, `torch.amax`,
@@ -162,9 +275,9 @@ autotune records pinned to it, alone.
   gathered residual add feeding a LayerNorm, its statistics two
   `torch.mean`s) with index math from the graph.
 - `kernels/var_mean_42fad1ece813.py`: Inductor's three-kernel BatchNorm
-  training forward (split reduction writing Welford partials to fp32
-  workspaces, a combine kernel that divides by the summed weights and
-  updates the running statistics in place, then a pointwise normalize), on
+  training forward (split reduction writing each block's sum, mean and
+  second moment to fp64 workspaces, a combine kernel that updates the
+  running statistics in place, then a pointwise normalize), on
   a channels-last input viewed as `[N*H*W, C]`. `forward()` rejects other
   layouts before its first launch, so an unsupported shape point never
   leaves the running statistics updated.

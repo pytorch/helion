@@ -19,15 +19,15 @@ the reduction is looped rather than persistent, with two passes over each row:
 So the statistics come from the fp32 sum and the normalized values from the
 bf16-rounded one, and the kernel reads the two inputs, its own first output,
 the weight and the bias, and writes only the two bf16 outputs. The port keeps
-that: the row statistics are reductions over the full row of the fp32 sum
-(``mean = sum(x) / hidden``, ``var = sum((x - mean)**2) / hidden``; Inductor
-accumulates the same two numbers with a Welford update), which leaves
-persistent versus looped to the autotuner, and the normalize reads the sum
-back from the output it was stored to.
+that, with two-pass row statistics of the fp32 sum (``mean = sum(x) / hidden``,
+``var = sum((x - mean)**2) / hidden``) where Inductor runs Welford; at hidden
+2048 both divisions are exact. Its mean error is Inductor's at CuTe's default
+and campaign configs and on Triton (1e-5 more elements off the nearest bf16:
+integer grids, Triton's sparse ReLU), 1.1-1.3x it at 3 of 6 random configs.
 
-At the shape points with hidden <= 1024 Inductor emits a persistent reduction
-instead, which normalizes the fp32 sum without reading it back; the port
-follows the looped form.
+At the shape points with hidden <= 1024 Inductor's reduction is persistent and
+normalizes the fp32 sum without reading it back; the port keeps the looped
+form, so rows of tiny variance differ there by that rounding.
 """
 
 from __future__ import annotations
@@ -52,8 +52,8 @@ def residual_add_layernorm(
     for tile_r in hl.tile(rows):
         summed = residual[tile_r, :].to(torch.float32) + x[tile_r, :].to(torch.float32)
         add_out[tile_r, :] = summed.to(add_out.dtype)
-        # torch.mean divides by the count, as Inductor does (a constant
-        # divisor would become a reciprocal multiply).
+        # torch.mean divides by the count: exact at hidden 2048 (fp32 `/` by
+        # a count that is no power of two multiplies by a rounded reciprocal).
         mean = torch.mean(summed, dim=-1, keepdim=True)
         centered = summed - mean
         var = torch.mean(centered * centered, dim=-1, keepdim=True)
