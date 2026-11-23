@@ -25,6 +25,8 @@ import torch.nn.functional as F
 from torch.testing._internal.distributed.fake_pg import FakeStore
 
 import helion
+from helion._compat import GLUON_REQUIREMENT
+from helion._compat import supports_gluon
 from helion._hardware import HardwareInfo
 from helion._hardware import get_hardware_info
 from helion._testing import DEVICE
@@ -37,7 +39,9 @@ from helion._testing import skipIfCute
 from helion._testing import skipIfNotTriton
 from helion._testing import skipIfRefEager
 from helion._testing import skipIfSharedMemoryLessThan
+from helion._testing import skipUnlessGluon
 from helion._testing import slowIfBackends
+import helion.language as hl
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -443,110 +447,35 @@ def test_deepseek_v3_tp_megakernels_compile() -> None:
         dist.destroy_process_group()
 
 
-@skipIfRefEager("tile dependencies are built only in compiled mode")
-@skipIfNotTriton("the TP4 megakernels are pinned to backend='triton'")
-def test_muse_spark_tp4_megakernels_compile() -> None:
-    if _current_compute_capability() != "sm100":
-        pytest.skip("the TP4 megakernels are pretuned for SM100")
-    lm = _import_muse_spark_module("lm_head")
-    router = _import_muse_spark_module("router")
-    moe = _import_muse_spark_module("moe_tp4")
-    from pretuned_kernels.megakernels.muse_spark._common import ExpertInputs
+def muse_experts_of(ids, out, distinct_table, expert_of) -> torch.Tensor:
+    for j in hl.tile(out.size(0), block_size=1):
+        words, counts, before, _ = distinct_table(ids[:])
+        out[j] = expert_of(words, counts, before, j.begin)
+    return out
 
-    dist.init_process_group(backend="fake", store=FakeStore(), rank=0, world_size=4)
-    try:
-        group = dist.group.WORLD
-        tokens = 16
-        f32 = {"device": DEVICE, "dtype": torch.float32}
-        u8 = {"device": DEVICE, "dtype": torch.uint8}
-        expert_inputs = ExpertInputs.zeros(tokens, DEVICE)
 
-        hidden, weight = lm.make_inputs(0, 0, tokens)
-        padded = -(-lm.VOCAB_SHARD // lm.G_BLOCK) * lm.G_BLOCK
-        lm_args = (
-            hidden,
-            weight,
-            torch.zeros((tokens, padded), **f32),
-            torch.zeros((tokens, lm.WORLD_SIZE, lm.VOCAB_SHARD), **f32),
-            group.group_name,
-            lm.WORLD_SIZE,
-            lm.LOGIT_SCALE,
-            lm.LOGIT_CAP,
-        )
+@skipIfRefEager("expert_of runs inside a compiled kernel")
+@skipIfNotTriton("the test kernel runs in the triton lane")
+@pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64])
+def test_muse_spark_expert_of(index_dtype: torch.dtype) -> None:
+    from pretuned_kernels.megakernels.muse_spark import _moe
 
-        weights = router.prepare_weights(router.make_full_weights(0), 0)
-        n_local = router.EXPERT_HIDDEN // router.WORLD_SIZE
-        router_args = (
-            router.make_input(0, tokens),
-            weights.pooler,
-            weights.router.view(router.SPLIT_R, -1, router.NUM_EXPERTS),
-            weights.pre_expert_norm,
-            weights.router_bias,
-            torch.zeros((router.SPLIT_P, n_local, tokens), **f32),
-            torch.zeros((router.SPLIT_R, tokens, router.NUM_EXPERTS), **f32),
-            torch.zeros((tokens, n_local), device=DEVICE, dtype=torch.bfloat16),
-            torch.zeros((tokens, router.NUM_EXPERTS), **f32),
-            expert_inputs.fp4,
-            expert_inputs.scales,
-            expert_inputs.per_token_scale,
-            expert_inputs.packed,
-            torch.zeros((tokens, router.TOPK), device=DEVICE, dtype=torch.int32),
-            group.group_name,
-            0,
-            router.NORM_EPS,
-            router.GLOBAL_SCALE_INV,
-            router.ROUTER_MULTIPLIER,
-            router.ROUTE_SCALE,
-            router.ROUTE_EPS,
-        )
-
-        experts, hidden_size = moe.NUM_EXPERTS, moe.HIDDEN
-        local = moe.INTERMEDIATE // moe.WORLD_SIZE
-        e4m3 = torch.float8_e4m3fn
-        bank = moe.build_moe_tp4_verify_bank(
-            w13=torch.zeros((experts, 2 * local, hidden_size // 2), **u8),
-            w13_scale=torch.zeros((experts, 2 * local, hidden_size // 16), **u8).view(
-                e4m3
-            ),
-            w2=torch.zeros((experts, hidden_size, local // 2), **u8),
-            w2_scale=torch.zeros((experts, hidden_size, local // 16), **u8).view(e4m3),
-            group=group,
-        )
-        slots = tokens * moe.TOPK
-        quarter = hidden_size // moe.WORLD_SIZE
-        alphas = torch.ones((experts,), **f32)
-        moe_args = (
-            bank.weights,
-            bank.weights2,
-            bank.scales,
-            expert_inputs.fp4,
-            expert_inputs.scales.view(torch.uint8).reshape(moe.MOE_TOKENS, -1),
-            expert_inputs.per_token_scale,
-            expert_inputs.packed,
-            expert_inputs.packed.view(-1),
-            alphas,
-            alphas,
-            alphas,
-            torch.zeros((slots, moe.MOE_TOKENS, moe.INTERMEDIATE // 2), **u8),
-            torch.zeros((slots, moe.MOE_TOKENS, moe.INTERMEDIATE // 16), **u8),
-            torch.zeros((slots, quarter), device=DEVICE, dtype=torch.bfloat16),
-            torch.zeros((slots, quarter // moe.TILE_M), **f32),
-            torch.ones((hidden_size,), device=DEVICE, dtype=torch.bfloat16),
-            torch.zeros((tokens, hidden_size), device=DEVICE, dtype=torch.bfloat16),
-            group.group_name,
-            0,
-            moe.WORLD_SIZE,
-            moe.NORM_EPS,
-        )
-
-        for kernel, args in (
-            (lm.muse_spark_lm_head, lm_args),
-            (router.muse_spark_router, router_args),
-            (moe.muse_spark_moe_tp4, moe_args),
-        ):
-            kernel.bind(args).to_triton_code(kernel.configs[0])
-    finally:
-        dist.destroy_process_group()
+    kernel = helion.kernel(
+        muse_experts_of,
+        config=helion.Config(block_sizes=[]),
+        index_dtype=index_dtype,
+        static_shapes=True,
+    )
+    # Experts in every bitmap word, the top bit of the last one included. The
+    # 128 ids (a power of two) load unmasked: a masked slot would read expert 0.
+    ids = torch.tensor(
+        [3, 31, 32, 40, 63, 64, 100, 128, 160, 200, 224, 250, 255] * 9 + [5] * 11,
+        device=DEVICE,
+        dtype=torch.int32,
+    )
+    expected = torch.unique(ids)
+    out = kernel(ids, torch.zeros_like(expected), _moe.distinct_table, _moe.expert_of)
+    torch.testing.assert_close(out, expected)
 
 
 @skipIfRefEager("tile dependencies are built only in compiled mode")
@@ -619,10 +548,16 @@ def test_muse_spark_moe_ep4_compiles() -> None:
     "name", ["deepseek_v3_moe_nvfp4_tp", "deepseek_v3_attention_nvfp4_tp"]
 )
 def test_deepseek_v3_tp_megakernels_run_on_four_ranks(name: str) -> None:
+    # main() checks every rank's output against the matched references.
+    _run_on_four_ranks(name)
+
+
+def _run_on_four_ranks(name: str, *args: str, directory: Path | None = None) -> None:
+    """Run the module's __main__ on four ranks (torchrun), with ``args``."""
     _require_four_sm100_gpus()
     if _under_xdist():
         pytest.skip("four-rank runs need every local GPU")
-    # main() checks every rank's output against the matched references.
+    directory = directory or _pretuned_kernel_directory(name)
     subprocess.run(
         [
             sys.executable,
@@ -630,7 +565,8 @@ def test_deepseek_v3_tp_megakernels_run_on_four_ranks(name: str) -> None:
             "torch.distributed.run",
             "--standalone",
             "--nproc-per-node=4",
-            str(_pretuned_kernel_directory(name) / f"{name}.py"),
+            str(directory / f"{name}.py"),
+            *args,
         ],
         env={
             **os.environ,
@@ -643,39 +579,27 @@ def test_deepseek_v3_tp_megakernels_run_on_four_ranks(name: str) -> None:
 
 @pytest.mark.slow
 @skipIfRefEager("Pretuned kernels use AOT; ref-eager bypasses heuristic logic.")
+@skipIfNotTriton("the gluon tests run in the triton lane")
+@skipUnlessGluon()
 @pytest.mark.timeout(1800)
-@pytest.mark.parametrize(
-    "name",
-    [
-        "router",
-        "lm_head",
-        "moe_tp4",
-        "moe_ep4",
-    ],
-)
+def test_deepseek_v3_tp_verify_megakernel_checks_on_four_ranks() -> None:
+    # correctness_check() compares every rank with the single-GPU verify kernel.
+    _run_on_four_ranks("deepseek_v3_moe_nvfp4_tp_verify")
+
+
+@pytest.mark.slow
+@skipIfRefEager("Pretuned kernels use AOT; ref-eager bypasses heuristic logic.")
+@skipIfNotTriton("the Muse Spark megakernels are pinned to Triton and Gluon")
+@pytest.mark.timeout(1800)
+@pytest.mark.parametrize("name", ["layer", "lm_head", "moe_ep4"])
 def test_muse_spark_megakernels_check_on_four_ranks(name: str) -> None:
-    _require_four_sm100_gpus()
-    if _under_xdist():
-        pytest.skip("four-rank runs need every local GPU")
+    if name in ("layer", "lm_head") and not supports_gluon():
+        pytest.skip(f"the gluon backend needs {GLUON_REQUIREMENT}")
     if name.startswith("moe_") and not importlib.util.find_spec("flashinfer"):
         pytest.skip("the MoE check lays its weights out with FlashInfer")
     # --check runs only the FP64 checks, so sglang is not needed.
-    subprocess.run(
-        [
-            sys.executable,
-            "-m",
-            "torch.distributed.run",
-            "--standalone",
-            "--nproc-per-node=4",
-            str(PRETUNED_KERNELS_DIR / "megakernels" / "muse_spark" / f"{name}.py"),
-            "--check",
-        ],
-        env={
-            **os.environ,
-            "PYTHONPATH": str(PRETUNED_KERNELS_DIR.parent),
-            "NVSHMEM_DISABLE_CUDA_VMM": "1",
-        },
-        check=True,
+    _run_on_four_ranks(
+        name, "--check", directory=PRETUNED_KERNELS_DIR / "megakernels" / "muse_spark"
     )
 
 
@@ -1077,6 +1001,11 @@ _GEOMEAN_NOISE_BAND = 0.10
 # The SM100 megakernels pass backend="triton" to their decorator, so a cute run
 # would repeat the Triton run.
 _PINNED_TO_TRITON = "megakernel is pinned to backend='triton'"
+# The spec-decode verify megakernels pass backend="gluon"; the gluon tests run in
+# the triton lane.
+_PINNED_TO_GLUON = "megakernel is pinned to backend='gluon'"
+# The speculative-decoding windows the verify megakernels are pretuned for.
+_VERIFY_TOKENS = (8, 16)
 
 
 @onlyBackends(["triton", "cute"])
@@ -1262,15 +1191,6 @@ class TestPretunedKernelsCorrectness(TestCase):
             self.skipTest("flash_mla correctness requires FlashInfer.")
         module.correctness_check()
 
-    @pytest.mark.timeout(600)
-    @skipIfCute(_PINNED_TO_TRITON)
-    def test_muse_spark_swa(self):
-        if not is_cuda() or torch.cuda.get_device_capability() != (10, 0):
-            self.skipTest("muse_spark_swa is pretuned for NVIDIA SM100.")
-        # The FP64 check needs no sglang; only main()'s baseline does.
-        module = _import_muse_spark_module("swa")
-        module.correctness_check()
-
     @pytest.mark.timeout(900)
     @skipIfCute(_PINNED_TO_TRITON)
     def test_deepseek_v3_moe_nvfp4(self):
@@ -1280,6 +1200,34 @@ class TestPretunedKernelsCorrectness(TestCase):
         if not module.has_vllm():
             self.skipTest("deepseek_v3_moe_nvfp4 correctness requires vLLM.")
         module.correctness_check()
+
+    @pytest.mark.slow
+    @pytest.mark.timeout(900)
+    @skipIfCute(_PINNED_TO_GLUON)
+    @skipUnlessGluon()
+    def test_llama32_1b_verify_layer_bf16(self):
+        # The FP32 PyTorch reference needs no vLLM.
+        module = _import_pretuned_kernel_module("llama32_1b_verify_layer_bf16")
+        for tokens in _VERIFY_TOKENS:
+            module.correctness_check(tokens)
+
+    @pytest.mark.slow
+    @pytest.mark.timeout(900)
+    @skipIfCute(_PINNED_TO_GLUON)
+    @skipUnlessGluon()
+    def test_qwen3_verify_layer_bf16(self):
+        module = _import_pretuned_kernel_module("qwen3_verify_layer_bf16")
+        for tokens in _VERIFY_TOKENS:
+            module.correctness_check(tokens)
+
+    @pytest.mark.slow
+    @pytest.mark.timeout(900)
+    @skipIfCute(_PINNED_TO_GLUON)
+    @skipUnlessGluon()
+    def test_deepseek_v3_moe_nvfp4_verify(self):
+        module = _import_pretuned_kernel_module("deepseek_v3_moe_nvfp4_verify")
+        for tokens in _VERIFY_TOKENS:
+            module.correctness_check(tokens)
 
 
 @onlyBackends(["cute"])
