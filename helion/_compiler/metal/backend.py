@@ -908,12 +908,14 @@ class MetalBackend(Backend):
         from .mpp_matmul import plan_mpp_matmuls
         from .mpp_registers import REGISTER_LOWERING
         from .mpp_registers import register_split
+        from .mpp_support import mpp_available
         from .operand_elements import split_refusal
         from .positional_rebind import reject_positional_rebinds
         from .reduction import plan_reduced_tile_axes
         from .repeated_blocks import plan_repeated_blocks
         from .search_surface import fragment_split
         from .search_surface import kernel_facts
+        from .search_surface import matmul_choices
         from .search_surface import metal_matmul
         from .search_surface import mpp_one_simdgroup
 
@@ -944,6 +946,25 @@ class MetalBackend(Backend):
                 REGISTER_LOWERING if metal_matmul(config) == "mpp" else None,
             )
             self.mpp_plan_refused = False
+            # The device matters: render_msl generates MSL from CPU tensors
+            # without compiling it, where MPP's headers are never needed and
+            # the MPS version query is unavailable.
+            if (
+                metal_matmul(config) == "mpp"
+                and self.mpp_plan.by_matmul
+                and not mpp_available(CompileEnvironment.current().device)
+            ):
+                others = [
+                    repr(choice)
+                    for choice in matmul_choices(
+                        CompileEnvironment.current().config_spec
+                    )
+                    if choice != "mpp"
+                ]
+                raise metal_unsupported(
+                    "MPP matmul lowering needs macOS 26 or later; use "
+                    f"metal_matmul={' or '.join(others)}"
+                )
         if metal_matmul(config) == "mpp":
             # A config whose tiles take one SIMD group splits its register
             # runs' K loops over its num_warps SIMD groups where they all

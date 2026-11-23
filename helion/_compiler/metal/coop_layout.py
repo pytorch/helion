@@ -44,6 +44,7 @@ from torch._subclasses.fake_tensor import unset_fake_temporarily
 
 from ._constants import SIMD_WIDTH
 from .affine_fold import Fact
+from .mpp_support import mpp_preamble
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -182,10 +183,8 @@ def blocked_layout(atom: Atom) -> Layout:
 
 _PROBE = r"""
 #include <metal_stdlib>
-#include <metal_tensor>
-#include <MetalPerformancePrimitives/MPPTensorOpsMatMul2d.h>
 using namespace metal;
-using namespace mpp::tensor_ops;
+{preamble}
 template <typename T>
 void _helion_coop_write(thread T& t, device int* o, ushort slots) {{
     o[0] = t.get_capacity();
@@ -245,7 +244,10 @@ def probe(atom: Atom) -> Layout:
             f"    _helion_coop_write(t{o}, o + {o * block}, {slots});",
         ]
     source = _PROBE.format(
-        descriptor=atom.descriptor(), stride=stride, writes="\n".join(writes)
+        preamble="\n".join(mpp_preamble()),
+        descriptor=atom.descriptor(),
+        stride=stride,
+        writes="\n".join(writes),
     )
     # Codegen may ask under its fake tensor mode; the probe runs for real.
     with unset_fake_temporarily():

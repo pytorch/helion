@@ -51,6 +51,7 @@ from .mpp_matmul import REG_RUN
 from .mpp_matmul import RUN
 from .mpp_registers import LANE as REGISTER_LANE
 from .mpp_registers import REGISTER_LOWERING
+from .mpp_support import mpp_preamble
 from .msl_ast_walker import MASKED_LOAD
 from .msl_ast_walker import MASKED_LOAD_PREAMBLE
 from .msl_ast_walker import EmitState
@@ -317,25 +318,7 @@ def _generate_msl(
         msl_parts.append("#include <metal_simdgroup_matrix>")
     if uses_mpp:
         _raise_if_mpp_unsupported_device()
-        msl_parts.extend(
-            [
-                "#if !__has_include(<metal_tensor>)",
-                '#error "Helion Metal MPP lowering requires <metal_tensor>"',
-                "#endif",
-                (
-                    "#if !__has_include("
-                    "<MetalPerformancePrimitives/MPPTensorOpsMatMul2d.h>)"
-                ),
-                (
-                    '#error "Helion Metal MPP lowering requires '
-                    '<MetalPerformancePrimitives/MPPTensorOpsMatMul2d.h>"'
-                ),
-                "#endif",
-                "#include <metal_tensor>",
-                "#include <MetalPerformancePrimitives/MPPTensorOpsMatMul2d.h>",
-                "using namespace mpp::tensor_ops;",
-            ]
-        )
+        msl_parts.extend(mpp_preamble())
     # A register run writes its bfloat operands' elements through BF16_CAST
     # (``msl_ast_walker``'s put).
     if ROUND in referenced or BF16_CAST in referenced or uses_registers:
