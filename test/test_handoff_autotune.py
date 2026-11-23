@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import threading
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -29,8 +30,10 @@ pytestmark = pytest.mark.cpu_only
 
 @pytest.fixture
 def case(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
+    agent = Mock(side_effect=AssertionError("the bundle is mocked"))
     settings = Settings(
         autotune_handoff=True,
+        autotune_handoff_agent=agent,
         autotune_handoff_budget_seconds=90,
         autotune_budget_seconds=30,
         autotune_log=str(tmp_path / "tuning.log"),
@@ -84,12 +87,10 @@ def case(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
 
     find = Mock(return_value=point)
     build_mock = Mock(side_effect=build)
-    validate_available = pipeline.CLISourceAgent.validate_available
-    preflight = Mock(return_value="/mock/codex")
     monkeypatch.setattr(pipeline, "find_handoff", find)
     monkeypatch.setattr(pipeline, "build_handoff", build_mock)
-    monkeypatch.setattr(pipeline.CLISourceAgent, "validate_available", preflight)
     return SimpleNamespace(
+        agent=agent,
         settings=settings,
         ordinary=ordinary,
         selected=selected,
@@ -99,8 +100,6 @@ def case(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
         bundle=bundle,
         find=find,
         build=build_mock,
-        preflight=preflight,
-        validate_available=validate_available,
         paths=paths,
     )
 
@@ -117,23 +116,16 @@ def test_disabled_handoff_keeps_logging_passive(case, cached, skip_cache):
     autotuner.autotune.assert_called_once_with(skip_cache=skip_cache)
     case.find.assert_not_called()
     case.build.assert_not_called()
-    case.preflight.assert_not_called()
     case.bundle.run_agent_rounds.assert_not_called()
     assert not Path(case.settings.autotune_log).with_suffix(".handoff").exists()
 
 
 @pytest.mark.parametrize("cached", [False, True])
-@pytest.mark.parametrize("agent", ["codex", "claude"])
-def test_missing_cli_fails_before_search_or_export(case, cached, agent, monkeypatch):
-    monkeypatch.setenv("HELION_HANDOFF_AGENT", agent)
-    which = Mock(return_value=None)
-    monkeypatch.setattr("helion.autotuner.handoff_cli.shutil.which", which)
-    case.preflight.side_effect = case.validate_available
+def test_missing_agent_fails_before_search_or_export(case, cached):
+    case.settings.autotune_handoff_agent = None
     autotuner = case.cached if cached else case.search
-    with pytest.raises(FileNotFoundError, match=f"{agent.title()} CLI"):
+    with pytest.raises(ValueError, match="autotune_handoff_agent"):
         pipeline.autotune_with_handoff(autotuner)
-    which.assert_called_once_with(agent)
-    case.preflight.assert_called_once_with()
     case.find.assert_not_called()
     case.build.assert_not_called()
     case.bundle.run_agent_rounds.assert_not_called()
@@ -159,7 +151,12 @@ def test_backend_disabled_handoff_supports_custom_autotuners(
         autotune_log_details=True,
         force_autotune=False,
     )
-    bound = SimpleNamespace(settings=settings, kernel=SimpleNamespace(configs=[]))
+    # No fixed config (Backend.autotune asks _fixed_config): this one searches.
+    bound = SimpleNamespace(
+        settings=settings,
+        kernel=SimpleNamespace(configs=[]),
+        _fixed_config=lambda force=False: None,
+    )
     backend = SimpleNamespace(supports_precompile=lambda: True)
     automatic = Mock(side_effect=AssertionError("handoff is disabled"))
     monkeypatch.setattr(pipeline, "autotune_with_handoff", automatic)
@@ -176,19 +173,29 @@ def test_enabled_handoff_preserves_wrapper_and_returns_config(case, cached, skip
     autotuner = case.cached if cached else case.search
     result = pipeline.autotune_with_handoff(autotuner, skip_cache=skip_cache)
     assert result is case.selected
-    case.preflight.assert_called_once_with()
     assert case.find.call_args.args[0] is autotuner
     assert case.find.call_args.kwargs == {"skip_cache": skip_cache}
     policy = case.find.call_args.args[1]
     assert policy.after_seconds == 30
     assert case.build.call_args.args[:2] == (autotuner, case.point)
     case.bundle.run_agent_rounds.assert_called_once_with(
-        budget_seconds=90, log=case.search.log
+        case.agent, budget_seconds=90, log=case.search.log
     )
     # Neither the cache wrapper nor the inner search is run twice by the hook.
     case.cached.autotune.assert_not_called()
     case.search.autotune.assert_not_called()
     case.search.kernel.compile_config.assert_not_called()
+
+
+def test_enabled_handoff_warns_that_it_is_experimental(case):
+    with pytest.warns(UserWarning, match="hand-off .* is experimental"):
+        pipeline.autotune_with_handoff(case.search)
+
+
+def test_disabled_handoff_does_not_warn(case, recwarn):
+    case.settings.autotune_handoff = False
+    pipeline.autotune_with_handoff(case.search)
+    assert not [w for w in recwarn if "experimental" in str(w.message)]
 
 
 def test_no_search_time_limit_waits_for_completion(case):
@@ -244,7 +251,6 @@ def test_nested_automatic_calls_use_ordinary_autotune(case, stage):
     assert pipeline.autotune_with_handoff(case.search) is case.selected
     nested.autotune.assert_called_once_with(skip_cache=True)
     assert case.find.call_count == 1
-    case.preflight.assert_called_once_with()
 
 
 @pytest.mark.parametrize("stage", ["find", "build", "agent"])
@@ -283,25 +289,48 @@ def test_explicit_find_handoff_does_not_start_automatic_pipeline(
     nested.autotune.assert_called_once_with(skip_cache=True)
     case.find.assert_not_called()
     case.build.assert_not_called()
-    case.preflight.assert_not_called()
     case.bundle.run_agent_rounds.assert_not_called()
 
 
-def test_handoff_settings_environment_and_explicit_overrides(monkeypatch):
-    monkeypatch.delenv("HELION_AUTOTUNE_HANDOFF", raising=False)
-    monkeypatch.delenv("HELION_AUTOTUNE_HANDOFF_BUDGET_SECONDS", raising=False)
+def test_settings_keep_the_agent_object():
+    class Agent:
+        def __init__(self) -> None:
+            # Live state that cannot be deep-copied, like a client or Popen.
+            self.lock = threading.Lock()
+
+        def __call__(self, request):
+            return None
+
+    agent = Agent()
+    settings = Settings(autotune_handoff_agent=agent)
+    values = settings.to_dict()
+    assert values["autotune_handoff_agent"] is agent
+    assert settings.autotune_handoff_agent is agent
+    assert Settings(**values).autotune_handoff_agent is agent
+    with pytest.raises(TypeError, match="autotune_handoff_agent must be a callable"):
+        Settings(autotune_handoff_agent="codex")
+
+
+def test_handoff_settings_are_set_on_the_kernel_only(monkeypatch):
+    # The hand-off needs an agent object, so it has no environment switches.
+    monkeypatch.setenv("HELION_AUTOTUNE_HANDOFF", "1")
+    monkeypatch.setenv("HELION_AUTOTUNE_HANDOFF_BUDGET_SECONDS", "123")
     defaults = Settings()
     assert not defaults.autotune_handoff
     assert defaults.autotune_handoff_budget_seconds == 1500
-    monkeypatch.setenv("HELION_AUTOTUNE_HANDOFF", "1")
-    monkeypatch.setenv("HELION_AUTOTUNE_HANDOFF_BUDGET_SECONDS", "123")
-    environment = Settings()
-    assert environment.autotune_handoff
-    assert environment.autotune_handoff_budget_seconds == 123
-    explicit = Settings(autotune_handoff=False, autotune_handoff_budget_seconds=45)
-    assert not explicit.autotune_handoff
+    assert defaults.autotune_handoff_agent is None
+    agent = Mock()
+    explicit = Settings(
+        autotune_handoff=True,
+        autotune_handoff_budget_seconds=45,
+        autotune_handoff_agent=agent,
+    )
+    assert explicit.autotune_handoff
     assert explicit.autotune_handoff_budget_seconds == 45
-    assert environment.copy(autotune_handoff_budget_seconds=60).autotune_handoff
+    assert explicit.autotune_handoff_agent is agent
+    copied = explicit.copy(autotune_handoff_budget_seconds=60)
+    assert copied.autotune_handoff
+    assert copied.autotune_handoff_budget_seconds == 60
 
 
 def test_native_graph_measurements_do_not_replace_search_best(case):
@@ -314,7 +343,7 @@ def test_native_graph_measurements_do_not_replace_search_best(case):
             )
         return case.point
 
-    def run_rounds(**kwargs):
+    def run_rounds(*args, **kwargs):
         log.record_handoff_event(
             "native_round",
             perf_ms=0.1,
@@ -338,47 +367,3 @@ def test_native_graph_measurements_do_not_replace_search_best(case):
     assert native["best_perf_ms"] == native["best_objective"] == 2.0
     assert rows[-1]["event"] == "run_end"
     assert rows[-1]["best_perf_ms"] == rows[-1]["best_objective"] == 2.0
-
-
-@pytest.mark.parametrize("details", [False, True])
-def test_handoff_chat_preserves_full_raw_bytes_independently_of_details(
-    tmp_path: Path, details: bool
-):
-    transcript = tmp_path / "conversation.jsonl"
-    raw = (
-        '{"type": "session_meta", "payload": {"id": "session-one"}}\r\n'
-        '{"type":"response_item","payload":{"role":"user","text":"µs"}}\n'
-        '{"type":"response_item","payload":{"role":"assistant","text":"done"}}'
-    ).encode()
-    transcript.write_bytes(raw)
-    log = AutotuningLogger(
-        Settings(
-            autotune_log=str(tmp_path / "logs" / "run.log"),
-            autotune_log_details=details,
-        )
-    )
-    saved = log.record_handoff_chat(transcript, "session-one")
-    assert saved == tmp_path / "logs" / "run.handoff.session-one.chat.jsonl"
-    assert saved.read_bytes() == raw
-    assert transcript.read_bytes() == raw
-
-
-def test_handoff_chat_keeps_separate_sessions(tmp_path: Path):
-    transcript = tmp_path / "conversation.jsonl"
-    log = AutotuningLogger(Settings(autotune_log=str(tmp_path / "run")))
-    transcript.write_bytes(b'{"session":"first"}\n')
-    first = log.record_handoff_chat(transcript, "first")
-    transcript.write_bytes(b'{"session":"second"}\n')
-    second = log.record_handoff_chat(transcript, "second")
-    assert first == tmp_path / "run.handoff.first.chat.jsonl"
-    assert second == tmp_path / "run.handoff.second.chat.jsonl"
-    assert first.read_bytes() == b'{"session":"first"}\n'
-    assert second.read_bytes() == b'{"session":"second"}\n'
-
-
-def test_handoff_chat_without_log_path_creates_no_artifact(tmp_path: Path):
-    transcript = tmp_path / "conversation.jsonl"
-    transcript.write_bytes(b'{"type":"response_item"}\n')
-    log = AutotuningLogger(Settings(autotune_log=None, autotune_log_details=True))
-    assert log.record_handoff_chat(transcript, "session-one") is None
-    assert list(tmp_path.iterdir()) == [transcript]

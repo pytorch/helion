@@ -265,7 +265,6 @@ def _dot_lhs_stays_in_smem(node: torch.fx.Node) -> bool:
     from ..language._tracing_ops import _new_var
     from ..language.memory_ops import load
     from .device_ir import NodeArgsGraphInfo
-    from .host_function import HostFunction
 
     transparent_targets = (
         _new_var,
@@ -275,12 +274,7 @@ def _dot_lhs_stays_in_smem(node: torch.fx.Node) -> bool:
         torch.ops.aten.t.default,
         torch.ops.aten.transpose.int,
     )
-    # Codegen interprets per-config graph copies, but placeholder_to_outer_arg
-    # on a copy returns nodes from the original traced graphs, so search both.
-    graphs = [
-        *DeviceFunction.current().codegen.codegen_graphs,
-        *HostFunction.current().device_ir.graphs,
-    ]
+    graphs = DeviceFunction.current().graph_infos()
     while True:
         if node.op == "placeholder":
             graph_info = next((g for g in graphs if g.graph is node.graph), None)
@@ -436,7 +430,7 @@ def emit_tl_dot_with_padding(
         and common_dtype.itemsize in (2, 4)
         and (len(lhs_shape_list) == 2 or need_squeeze_dim)
         and not (pad_needed["m"] or pad_needed["n"])
-        and env.backend.name == "triton"
+        and env.backend.uses_triton_compiler
         and sm100_dot_tmem_lhs_broken(env.device)
         and not _dot_lhs_stays_in_smem(lhs_fx_node)
     )
@@ -668,6 +662,27 @@ def matmul_contraction_block_ids() -> set[int]:
             if block_id is not None:
                 result.add(env.canonical_block_id(block_id))
     return result
+
+
+def kernel_holds_tensor_memory() -> bool:
+    """Whether the kernel may take tensor memory on Blackwell: its device IR
+    holds a matmul (``matmul_operand_indices``: tcgen05.mma, and tcgen05.cp
+    for ``dot_scaled``'s scales) or user Triton or assembly, which may."""
+    from ..language import inline_asm_ops
+    from ..language import inline_triton_ops
+    from .host_function import HostFunction
+
+    targets = {
+        *matmul_operand_indices(),
+        inline_asm_ops.inline_asm_elementwise,
+        inline_triton_ops.inline_triton,
+        inline_triton_ops.triton_kernel,
+    }
+    return any(
+        node.op == "call_function" and node.target in targets
+        for graph_info in HostFunction.current().device_ir.graphs
+        for node in graph_info.graph.nodes
+    )
 
 
 def kernel_has_half_precision_matmul() -> bool:

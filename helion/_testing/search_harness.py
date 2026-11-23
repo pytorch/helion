@@ -41,16 +41,21 @@ def mock_kernel(settings: Settings, **attrs: object) -> SimpleNamespace:
             supports_precompile=lambda: True,
             autotune_config_is_viable=lambda config_spec, config: True,
             should_deduplicate_generated_sources=lambda config_spec: False,
+            collapses_generated_source_aliases=lambda config_spec: False,
+            generated_source_hash=lambda compiled_fn: None,
             get_do_bench=lambda: None,
             default_final_selection_regime=lambda: None,
             classify_autotune_exception=lambda error: None,
             probe_long_autotune_kernels=lambda config_spec: False,
+            autotune_short_kernel_below_us=lambda config_spec: None,
         ),
     )
     kernel = SimpleNamespace(
         settings=settings,
         config_spec=config_spec,
-        env=SimpleNamespace(process_group_name=None, device=DEVICE),
+        env=SimpleNamespace(
+            process_group_name=None, device=DEVICE, backend_name="triton"
+        ),
         format_kernel_decorator=lambda config, settings: "decorator",
         to_triton_code=lambda config: "code",
         maybe_log_repro=lambda log_func, args, config=None: None,

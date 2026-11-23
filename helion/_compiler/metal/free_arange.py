@@ -673,12 +673,17 @@ def _assign_axes(
 
 
 def check_free_lanes(
-    plan: FreeArangePlan, mpp_plan: MppPlan, graphs: list[GraphInfo]
+    plan: FreeArangePlan,
+    mpp_plan: MppPlan,
+    graphs: list[GraphInfo],
+    fragment_tiles: bool,
 ) -> None:
     """A free block walked in lanes needs every value that holds it to be
     MPP's: a device view, a cooperative value, or an element-loop store, the
     only code that binds the block's lane (``mpp_matmul._block_layout``).
-    Scalar code evaluating such a value has no lane loop to run in."""
+    Scalar code evaluating such a value has no lane loop to run in.
+    ``fragment_tiles``: the config's tiles take one SIMD group whatever its
+    ``num_warps`` (``search_surface.fragment_tiles``)."""
     laned = [block_id for block_id, (_, _, lanes) in plan.items() if lanes > 1]
     if not laned:
         return
@@ -687,7 +692,7 @@ def check_free_lanes(
 
     owned: set[Node] = set()
     staged: set[int] = set()
-    for group in mpp_plan.by_matmul.values():
+    for group in mpp_plan.groups():
         _acc, lhs, rhs = matmul_operands(group.matmul)
         for node, operand, blocks in (
             (lhs, group.lhs, (group.m_block, group.k_block)),
@@ -719,11 +724,13 @@ def check_free_lanes(
         )
         if why is not None:
             threads, lanes = plan[block_id][1:]
+            # More num_warps gives a fragment config's tiles no threads: its
+            # SIMD groups split the K loops (``fragment_mma``).
+            more = "" if fragment_tiles else ", or more num_warps"
             raise _unsupported(
                 f"block {block_id} on {threads} threads x {lanes} lanes, but "
                 f"{why} reads it in Scalar code, which has no lane loop over a "
-                "free block; give it num_threads equal to its size, or more "
-                "num_warps"
+                f"free block; give it num_threads equal to its size{more}"
             )
 
 

@@ -16,6 +16,9 @@ from .ast_extension import create
 from .ast_extension import expr_from_string
 from .ast_extension import statement_from_string
 from .compile_environment import CompileEnvironment
+from .cross_loop_dsmem import cluster_size
+from .cross_loop_dsmem import dsmem_transports
+from .cross_loop_dsmem import dsmem_worker_count
 from .device_function import DeviceFunction
 from .device_function import TensorArg
 from .host_function import HostFunction
@@ -595,15 +598,11 @@ class XYZProgramIDs(ProgramIDs):
         )
 
 
-def _xcd_device_str() -> str:
+def _compile_device_str() -> str:
     """Device expression for the current compile device (for host-side helpers)."""
-    host_function = HostFunction.current()
     device = CompileEnvironment.current().device
-    origins = [
-        o for t, o in host_function.tensor_to_origin.items() if t.device == device
-    ]
-    if origins:
-        return f"{origins[0].host_str()}.device"
+    if (origin := HostFunction.current().first_tensor_origin(device)) is not None:
+        return f"{origin.host_str()}.device"
     return f"torch.{device!r}"
 
 
@@ -632,7 +631,7 @@ def _maybe_emit_xcd_remap(
     if device_function.constexpr_arg(NUM_XCD_VAR):
         device_function.codegen.host_statements.append(
             statement_from_string(
-                f"{NUM_XCD_VAR} = helion.runtime.get_num_xcd({_xcd_device_str()})"
+                f"{NUM_XCD_VAR} = helion.runtime.get_num_xcd({_compile_device_str()})"
             )
         )
 
@@ -1051,22 +1050,34 @@ class PersistentProgramIDs(ProgramIDs):
         if device_function.constexpr_arg(NUM_SM_VAR):
             reserved_sms = CompileEnvironment.current().settings.persistent_reserved_sms
             reserved_arg = f", reserved_sms={reserved_sms}" if reserved_sms > 0 else ""
+            # Dsmem transports launch as many SMs as whole clusters keep
+            # resident, by the rule the code was built for
+            # (``dsmem_worker_count``).
+            if transports := dsmem_transports(device_function):
+                reserved_arg += f", cluster_size={cluster_size(transports)}"
             device_function.codegen.host_statements.append(
                 statement_from_string(
                     f"{NUM_SM_VAR} = helion.runtime.get_num_sm({self.get_device_str()}{reserved_arg})"
                 )
             )
+            if transports:
+                # The schedule takes the compile device's count, but another
+                # device's GPCs may keep fewer clusters resident.
+                workers = dsmem_worker_count(
+                    device_function, CompileEnvironment.current().config_spec.num_sm
+                )
+                device_function.codegen.host_statements.append(
+                    statement_from_string(
+                        f"if {NUM_SM_VAR} != {workers}:\n"
+                        f"    raise RuntimeError('cross_loop_dsmem: built for {workers}"
+                        f" SMs in clusters of {cluster_size(transports)}, the device"
+                        f" keeps ' + str({NUM_SM_VAR}))"
+                    )
+                )
 
     def get_device_str(self) -> str:
         """Get the device string for the current device, reusing the first tensor's origin."""
-        host_function = HostFunction.current()
-        device = CompileEnvironment.current().device
-        origins = [
-            o for t, o in host_function.tensor_to_origin.items() if t.device == device
-        ]
-        if origins:
-            return f"{origins[0].host_str()}.device"
-        return f"torch.{device!r}"
+        return _compile_device_str()
 
     def codegen_grid(self) -> ast.AST:
         # Use num_sms * multiplier for persistent kernels (multi-occupancy)
@@ -1079,6 +1090,7 @@ class PersistentProgramIDs(ProgramIDs):
         num_sm = CompileEnvironment.current().config_spec.num_sm
         if num_sm <= 1:
             return None
+        num_sm = dsmem_worker_count(DeviceFunction.current(), num_sm)
         return num_sm * self.num_sm_multiplier
 
     def _persistent_setup_statements(self, total_pids_expr: str) -> list[ast.stmt]:

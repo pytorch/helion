@@ -46,6 +46,7 @@ from helion._testing import import_path
 from helion._testing import onlyBackends
 from helion._testing import skipIfNotCUDA
 from helion._testing.cute_flash import compiled_source
+import helion.language as hl
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -104,9 +105,14 @@ def _reference_grads(
                 kf = k[b, h // groups].detach().float().requires_grad_(True)
                 vf = v[b, h // groups].detach().float().requires_grad_(True)
                 s = (qf @ kf.T) * scale
-                s = score_mod(s, b_t, h_t, q_idx, kv_idx)
                 if mask_mod is not None:
                     keep = mask_mod(b_t, h_t, q_idx, kv_idx)
+                    # Masked entries take no gradient through score_mod
+                    # (whose Jacobian need not be finite there), as in
+                    # eager and Triton's flex backward.
+                    s = torch.where(keep, s, s.detach())
+                s = score_mod(s, b_t, h_t, q_idx, kv_idx)
+                if mask_mod is not None:
                     s = torch.where(keep, s, float("-inf"))
                     # A fully masked row attends nothing: zero output and
                     # zero gradients (not the NaNs of an all -inf softmax).
@@ -148,6 +154,9 @@ def _run(
     mask_dims: tuple[int | None, int | None] = (None, None),
     capture: bool = False,
     reference: bool = True,
+    qk_map: Callable[[torch.Tensor, torch.Tensor], tuple[torch.Tensor, torch.Tensor]]
+    | None = None,
+    do_scale: float = 1.0,
 ) -> tuple[tuple[torch.Tensor, ...], tuple[torch.Tensor, ...], str]:
     """Run the example backward on the fused CuTe path with the default config
     (``config_overrides``: knob values on top of it; ``table_steps``: a
@@ -165,13 +174,18 @@ def _run(
     viewed ``[B, H, S, D]``, the forward output O included) or ``packed``
     (Q/K/V head-dim slices of one ``[B, S, H, 3 * D]`` buffer, O and dO
     transposed); the values are the same for every layout. ``dv`` is the
-    value head dim (V / dO / dV columns; default ``d``)."""
+    value head dim (V / dO / dV columns; default ``d``). ``qk_map`` maps
+    the generated Q and K to the ones the run uses; ``do_scale`` scales dO
+    (as loss scaling does)."""
     dv = d if dv is None else dv
     gen = torch.Generator(device=DEVICE).manual_seed(seed)
     q = torch.randn((b, hq, m, d), device=DEVICE, dtype=dtype, generator=gen)
     k = torch.randn((b, hkv, n, d), device=DEVICE, dtype=dtype, generator=gen)
     v = torch.randn((b, hkv, n, dv), device=DEVICE, dtype=dtype, generator=gen)
     do = torch.randn((b, hq, m, dv), device=DEVICE, dtype=dtype, generator=gen)
+    do = do * do_scale
+    if qk_map is not None:
+        q, k = qk_map(q, k)
     if layout == "bshd":
         q, k, v, do = (_as_bshd(t) for t in (q, k, v, do))
     elif layout == "packed":
@@ -457,6 +471,221 @@ def test_ragged_lengths() -> None:
     _assert_close(got, ref)
 
 
+def _far_bias(score, b, h, q_idx, kv_idx):
+    # Grows with the distance from the diagonal: on the rows and lanes of a
+    # ragged tile past the sequences (q or kv up to 383 at length 257) it
+    # pushes exp2 past the fp32 range.
+    return score + (q_idx - kv_idx).abs().to(torch.float32)
+
+
+_RAGGED_SEQ = 257
+
+
+def _over_rows_left(score, b, h, q_idx, kv_idx):
+    return score / (_RAGGED_SEQ - q_idx).to(torch.float32)
+
+
+def _over_rows_left_bwd(grad, score, b, h, q_idx, kv_idx):
+    # Infinite on the first Q lane past the sequence (q_idx == 257).
+    return grad / (_RAGGED_SEQ - q_idx).to(torch.float32)
+
+
+def _scores_below_exp_range(
+    q: torch.Tensor, k: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    # Every score at most -128 (64 products of at least 16, times 1/8): the
+    # LSE of every row lies below the fp32 exp range, so even the score 0 of
+    # the zero-filled entries overflows exp2(0 - lse) without any score_mod.
+    # (The spread keeps dQ well conditioned: a large common component of
+    # the keys cancels in sum_j dS_j k_j, which bf16 dS resolves poorly.)
+    return -(4 * q.abs() + 4), 4 * k.abs() + 4
+
+
+@_gpu_test
+@pytest.mark.parametrize(
+    ("d", "m", "n", "kwargs", "in_code", "not_in_code"),
+    [
+        pytest.param(
+            64, _RAGGED_SEQ, _RAGGED_SEQ, {"score_mod": _far_bias},
+            ("fbwd_lse_fold",), (), id="bias_fold",
+        ),
+        pytest.param(
+            64, _RAGGED_SEQ, _RAGGED_SEQ,
+            {"score_mod": _far_bias,
+             "config_overrides": {"cute_flash_bwd_bias_fold": 0}},
+            (), ("fbwd_lse_fold",), id="score_hook",
+        ),
+        pytest.param(
+            64, _RAGGED_SEQ, _RAGGED_SEQ,
+            {"score_mod": _over_rows_left, "score_mod_bwd": _over_rows_left_bwd},
+            ("fbwd_mul_jacobian_packed(",), (),
+            id="jacobian",
+        ),
+        pytest.param(
+            64, 384, 384, {"score_mod": _far_bias, "block_size": (256, 128)},
+            (), (), id="q_block_256",
+        ),
+        pytest.param(
+            64, _RAGGED_SEQ, _RAGGED_SEQ, {"qk_map": _scores_below_exp_range},
+            (), (), id="no_score_mod",
+        ),
+        pytest.param(
+            128, _RAGGED_SEQ, 449,
+            {"score_mod": _far_bias,
+             "config_overrides": {"cute_flash_bwd_two_cta": 1}},
+            ("cta_group=2",), (), id="two_cta",
+        ),
+        pytest.param(
+            256, _RAGGED_SEQ, _RAGGED_SEQ, {"score_mod": _far_bias},
+            ("fbwd_is_dq",), (), id="pair",
+        ),
+    ],
+)  # fmt: skip
+def test_ragged_entries_past_the_sequences(
+    d: int,
+    m: int,
+    n: int,
+    kwargs: dict[str, object],
+    in_code: tuple[str, ...],
+    not_in_code: tuple[str, ...],
+) -> None:
+    """The rows and lanes of the visited tiles past the sequences (ragged M
+    and N, or a 256-row Q block's padded tile at M = 384) hold zero-filled
+    operands, but their scores are whatever a coordinate-dependent score_mod
+    makes of their coordinates -- or, without one, 0 against a row's LSE --
+    and exp2 of that (or a Jacobian infinite on the first lane past M) times
+    the zero operands was NaN in dK / dV / dQ; P is cleared there, and so is
+    dS = P (dP - delta), which the Jacobian multiply keeps 0.
+    The additive bias folded into the LSE and as a score hook, a
+    score_mod_bwd hook, the padded Q tile, scores below the exp range with
+    no score_mod, the 2-CTA kernel and the head-dim-256 pair kernel (both
+    cluster roles)."""
+    got, ref, code = _run(b=1, hq=2, hkv=2, m=m, n=n, d=d, **kwargs)  # pyrefly: ignore[bad-argument-type]
+    assert "_helion_flash_rt.fbwd_zero_past(" in code
+    for text in in_code:
+        assert text in code, text
+    for text in not_in_code:
+        assert text not in code, text
+    _assert_close(got, ref)
+
+
+def _over_distance(score, b, h, q_idx, kv_idx):
+    return score / (1 + (q_idx - kv_idx)).to(torch.float32)
+
+
+def _over_distance_bwd(grad, score, b, h, q_idx, kv_idx):
+    # Infinite at the masked kv_idx == q_idx + 1.
+    return grad / (1 + (q_idx - kv_idx)).to(torch.float32)
+
+
+@_gpu_test
+@pytest.mark.parametrize(
+    ("d", "overrides", "do_scale", "kernel"),
+    [
+        (64, {}, 1.0, "bhsd"),
+        # The emulation's exp2(-inf) is about 2e-41, not 0: with dO scaled
+        # (|dP - delta| in the thousands) dS = P (dP - delta) is a normal
+        # float at the masked entries.
+        (64, {"cute_flash_bwd_exp2_emu": 3}, 1000.0, "bhsd"),
+        (128, {"cute_flash_bwd_two_cta": 1}, 1.0, "two_cta"),
+        (256, {}, 1.0, "pair"),
+    ],
+    ids=["one_cta", "exp2_emulation", "two_cta", "pair"],
+)
+def test_masked_entries_with_an_infinite_jacobian(
+    d: int, overrides: dict[str, object], do_scale: float, kernel: str
+) -> None:
+    """At an entry the mask_mod masks, P and dS are 0 but the Jacobian of its
+    score can be infinite (``score / (1 + q - kv)`` at ``kv == q + 1``):
+    0 * inf was NaN in dQ and dK, where eager and Triton drop the masked
+    entries' dS. dS is set to 0 where P is 0 or subnormal."""
+    got, ref, code = _run(
+        b=1,
+        hq=2,
+        hkv=2,
+        m=256,
+        n=256,
+        d=d,
+        score_mod=_over_distance,
+        score_mod_bwd=_over_distance_bwd,
+        mask_mod=_causal,
+        config_overrides=overrides,
+        do_scale=do_scale,
+    )
+    assert "_helion_flash_rt.fbwd_mul_jacobian_packed(" in code
+    if (mark := _KERNEL_MARKS[kernel]) is not None:
+        assert mark in code, kernel
+    _assert_close(got, ref)
+
+
+# 8 cases: q_seq 32 and 1, each in the four coordinate lists (the 1-CTA
+# kernel's rank-3 and rank-4 maps, the 2-CTA and pair kernels' own).
+_TWO_CTA = {"cute_flash_bwd_two_cta": 1}
+_KERNEL_MARKS = {
+    "bhsd": None,
+    "bshd": "'flex_strides': (",
+    "two_cta": "flash_bwd_flex_2cta_shared_storage",
+    "pair": "fbwd_is_dq",
+}
+
+
+@_gpu_test
+@pytest.mark.parametrize(
+    ("m", "d", "layout", "overrides", "kernel"),
+    [
+        (32, 64, "bhsd", {}, "bhsd"),
+        (32, 64, "bshd", {}, "bshd"),
+        (32, 128, "bhsd", _TWO_CTA, "two_cta"),
+        (32, 256, "bhsd", {}, "pair"),
+        (1, 64, "bhsd", {}, "bhsd"),
+        (1, 64, "bshd", {}, "bshd"),
+        (1, 128, "bhsd", _TWO_CTA, "two_cta"),
+        (1, 256, "bhsd", {}, "pair"),
+    ],
+    ids=[
+        "one_cta",
+        "rank4_maps",
+        "two_cta",
+        "pair",
+        "one_row",
+        "one_row_rank4",
+        "one_row_2cta",
+        "one_row_pair",
+    ],
+)
+def test_q_sequence_within_one_tile(
+    m: int, d: int, layout: str, overrides: dict[str, object], kernel: str
+) -> None:
+    """A 32-row Q sequence under 256-row BlockMask Q blocks: the walk's second
+    128-row Q tile lies wholly past the sequence and the dQ drain's 32-row
+    boxes past the first. With a single tile (box) in the sequence mode its
+    index used to wrap to the first one: the padded tile reloaded the real
+    Q / dO rows (dK / dV counted them twice) and the boxes reduce-added the
+    padded rows' dQ into the real ones. The 1-CTA kernel with the rank-3
+    and the rank-4 maps, the 2-CTA kernel and the pair kernel; and a
+    one-row sequence in each kernel, whose maps carried no stride for the
+    sequence mode at all. The one-row cases attend the first KV block
+    (``_prefix_only``) rather than use the causal mask, under which the row
+    sees one key and dQ / dK are exactly zero."""
+    got, ref, code = _run(
+        b=1,
+        hq=2,
+        hkv=2,
+        m=m,
+        n=256,
+        d=d,
+        mask_mod=_causal if m > 1 else _prefix_only,
+        block_size=(256, 128),
+        layout=layout,
+        config_overrides=overrides,
+    )
+    assert "'flex_walk_q_rows': 256" in code
+    mark = _KERNEL_MARKS[kernel]
+    if mark is not None:
+        assert mark in code, kernel
+    _assert_close(got, ref)
+
+
 @_gpu_test
 def test_empty_kv_tiles_store_zero() -> None:
     got, ref, _ = _run(b=1, hq=2, hkv=2, m=256, n=384, d=64, mask_mod=_prefix_only)
@@ -465,12 +694,44 @@ def test_empty_kv_tiles_store_zero() -> None:
 
 
 @_gpu_test
+@pytest.mark.parametrize(
+    ("index", "d"), [("q", 64), ("kv", 256)], ids=["one_cta", "pair"]
+)
+def test_table_starting_inside_its_storage(index: str, d: int) -> None:
+    """An fp16 bias table viewed one element into its storage (a 2-byte
+    aligned base) read along the lanes -- by ``q_idx`` in the 1-CTA kernel's
+    transposed frame, by ``kv_idx`` in the pair kernel's dQ clusters -- is
+    loaded in single elements: the 16-byte vector load faulted with a
+    misaligned address."""
+    full = torch.randn(257, device=DEVICE, dtype=torch.float16)
+    bias = full[1:]
+
+    def score_mod(score, b, h, q_idx, kv_idx):
+        return score + hl.load(bias, [q_idx if index == "q" else kv_idx])
+
+    def ref_score_mod(score, b, h, q_idx, kv_idx):
+        return score + bias[q_idx if index == "q" else kv_idx]
+
+    got, ref, code = _run(
+        b=1,
+        hq=2,
+        hkv=2,
+        m=256,
+        n=256,
+        d=d,
+        score_mod=score_mod,
+        mask_mod=_causal,
+        ref_score_mod=ref_score_mod,
+    )
+    assert "_cute_flex_load_vec(_flash_aux0.iterator" in code
+    _assert_close(got, ref)
+
+
+@_gpu_test
 def test_score_mod_table_gather() -> None:
     bias = torch.randn((2, 1023), device=DEVICE, dtype=torch.float32)
 
     def score_mod(score, b, h, q_idx, kv_idx):
-        import helion.language as hl
-
         return score + hl.load(bias, [h, q_idx - kv_idx + 511])
 
     def ref_score_mod(score, b, h, q_idx, kv_idx):
@@ -544,8 +805,6 @@ def test_gathered_table_score_mod(aux_smem: int) -> None:
     bias = torch.randn((2, 7), device=DEVICE, dtype=torch.float32)
 
     def score_mod(score, b, h, q_idx, kv_idx):
-        import helion.language as hl
-
         dist = hl.load(index, [b, q_idx, kv_idx])
         return score + hl.load(bias, [h, dist])
 
@@ -593,7 +852,7 @@ def test_softcap_score_mod_with_jacobian() -> None:
         score_mod=score_mod,
         score_mod_bwd=score_mod_bwd,
     )
-    assert "fbwd_spre" in code and "fbwd_mul_pairs_packed" in code
+    assert "fbwd_spre" in code and "fbwd_mul_jacobian_packed" in code
     _assert_close(got, ref)
 
 
@@ -631,7 +890,40 @@ def test_softcap_jacobian_with_gradient_arithmetic(
         score_mod_bwd=score_mod_bwd,
         mask_mod=_causal,
     )
-    assert "fbwd_spre" in code and "fbwd_mul_pairs_packed" in code
+    assert "fbwd_spre" in code and "fbwd_mul_jacobian_packed" in code
+    _assert_close(got, ref)
+
+
+def _squared(score, b, h, q_idx, kv_idx):
+    return score * score
+
+
+def _squared_bwd(grad, score, b, h, q_idx, kv_idx):
+    # The VJP as traced from ``score * score``: one product per use, which
+    # the unit gradient turns into ``s + s`` (one node read twice).
+    return grad * score + grad * score
+
+
+@_gpu_test
+@pytest.mark.parametrize("d", [64, 256], ids=["one_cta", "pair"])
+def test_score_mod_reading_the_score_twice(d: int) -> None:
+    """``score * score`` and its traced VJP: the score region and the
+    Jacobian region each read one value twice (the pair kernel's dQ clusters
+    render both again in the forward frame)."""
+    got, ref, code = _run(
+        b=1,
+        hq=2,
+        hkv=2,
+        m=256,
+        n=256,
+        d=d,
+        score_mod=_squared,
+        score_mod_bwd=_squared_bwd,
+        mask_mod=_causal,
+    )
+    assert "fbwd_mul_jacobian_packed" in code
+    if d == 256:
+        assert _KERNEL_MARKS["pair"] in code
     _assert_close(got, ref)
 
 
@@ -914,8 +1206,6 @@ def test_head_dim_256_pair_table_bias(bias_fold: int) -> None:
     bias = torch.randn((4, 1279), device=DEVICE, dtype=torch.float32)
 
     def score_mod(score, b, h, q_idx, kv_idx):
-        import helion.language as hl
-
         return score + hl.load(bias, [h, q_idx - kv_idx + 639])
 
     def ref_score_mod(score, b, h, q_idx, kv_idx):

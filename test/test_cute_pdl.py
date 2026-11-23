@@ -36,13 +36,6 @@ import pytest
 import torch
 from torch._inductor.codecache import PyCodeCache
 
-from test._cute_vloop_sink_kernels import col_reduce_max_dynamic
-from test._cute_vloop_sink_kernels import col_reduce_sum_dynamic
-from test._cute_vloop_sink_kernels import col_reduce_sum_from8_static
-from test._cute_vloop_sink_kernels import col_reduce_sum_lower_triangle_static
-from test._cute_vloop_sink_kernels import col_reduce_sum_pair_dynamic
-from test._cute_vloop_sink_kernels import col_reduce_sum_static
-from test._cute_vloop_sink_kernels import col_weighted_mean_static
 from test.test_cute_dynamic_vector_reduction import _bind_rms_norm
 from test.test_cute_dynamic_vector_reduction import _dynamic_kernel
 from test.test_cute_dynamic_vector_reduction import _rms_norm_specialized_n
@@ -70,6 +63,13 @@ from helion._testing.cute_pdl import attribute_only_control as _attribute_only_c
 from helion._testing.cute_pdl import kernel_definition as _kernel_def
 from helion._testing.cute_pdl import produce as _produce
 from helion._testing.cute_pdl import triton_kernels as _tk
+from helion._testing.cute_vloop_sink_kernels import col_reduce_max_dynamic
+from helion._testing.cute_vloop_sink_kernels import col_reduce_sum_dynamic
+from helion._testing.cute_vloop_sink_kernels import col_reduce_sum_from8_static
+from helion._testing.cute_vloop_sink_kernels import col_reduce_sum_lower_triangle_static
+from helion._testing.cute_vloop_sink_kernels import col_reduce_sum_pair_dynamic
+from helion._testing.cute_vloop_sink_kernels import col_reduce_sum_static
+from helion._testing.cute_vloop_sink_kernels import col_weighted_mean_static
 from helion.autotuner.benchmarking import _make_cudagraph_replay
 import helion.language as hl
 

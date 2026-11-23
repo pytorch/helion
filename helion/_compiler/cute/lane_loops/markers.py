@@ -7,7 +7,8 @@ iterates the per-thread elements of a lane-distributed block; the reduction
 strategies emit a ``_helion_lane_reduce(...)`` marker inside it and the lane
 split (``split.py``) lowers the marker into the two-pass accumulate /
 finalize / consume structure.  This module owns the loop constructors, the
-marker expression and its parser (``_LaneReduceMarker``), the finalize
+marker expression and its parser (``_LaneReduceMarker``), the record of what
+the split emitted for a loop's markers (``LaneSplitRecord``), the finalize
 emitters (warp / grouped / two-stage combines) and the validators that reject
 an owned marker without a proved lowering.
 """
@@ -249,6 +250,8 @@ def _is_constexpr_lane_iter(loop: ast.For) -> bool:
 # The marker never reaches the emitted kernel — the post-pass strips every
 # marker it processes.
 _HELION_LANE_REDUCE_MARKER = "_helion_lane_reduce"
+# Stands for the finalized reduction in a marker's ``wrap_template``.
+HELION_FINALIZED = "__HELION_FINALIZED__"
 HELION_VECTOR_REDUCTION_OWNER_ATTR = "_helion_vector_reduction_owner"
 _CUTE_UNIFORM_GLOBAL_NAMES = frozenset(
     {
@@ -285,6 +288,7 @@ def _lane_reduce_marker_expr(
     matmul_contribution: bool = False,
     strided_restore: bool = False,
     shared_lane_expr: str = "",
+    index_candidates: bool = False,
 ) -> str:
     """The marker call text of a lane reduction (see :class:`_LaneReduceMarker`
     for the fields); ``_LaneReduceMarker.to_call`` renders it."""
@@ -309,6 +313,7 @@ def _lane_reduce_marker_expr(
         matmul_contribution=matmul_contribution,
         strided_restore=strided_restore,
         shared_lane_expr=shared_lane_expr,
+        index_candidates=index_candidates,
     ).to_call()
 
 
@@ -331,9 +336,9 @@ class _LaneReduceMarker:
     reduction_type: str
     identity_expr: str
     threads_in_group: int
-    # The original RHS expression with the marker call replaced by the string
-    # ``{finalized}``; ``finalize_expr(x)`` substitutes ``x`` to re-apply any
-    # surrounding dtype cast / reshape to the finalized reduced scalar.
+    # The original RHS expression with the marker call replaced by the name
+    # ``HELION_FINALIZED``; ``finalize_expr(x)`` substitutes ``x`` to re-apply
+    # any surrounding dtype cast / reshape to the finalized reduced scalar.
     wrap_template: str
     # Optional strided grouped reduction (the reduction's live thread axis
     # shares a warp / CTA with an unrelated sibling axis). When ``group_span``
@@ -372,9 +377,34 @@ class _LaneReduceMarker:
     # expression the ownership analysis parses). Used to key on the full
     # runtime thread id so redundant thread axes get their own slots.
     shared_lane_expr: str = ""
+    # True for the minimum over the candidate indices of an argmin / argmax
+    # (``argreduce_candidate_expr``).  A candidate is an index or the highest
+    # index, never a negation of one of the kernel's values, so the lanes'
+    # accumulate keeps the plain minimum (``_combine_expr``), which ptxas
+    # turns into selects.
+    index_candidates: bool = False
 
     def finalize_expr(self, reduced: str) -> str:
-        return self.wrap_template.replace("__HELION_FINALIZED__", f"({reduced})")
+        return self.wrap_template.replace(HELION_FINALIZED, f"({reduced})")
+
+    def accumulate_expr(self, acc: str, input_name: str | None = None) -> str:
+        """``acc`` combined with this marker's input (or with ``input_name``,
+        a name that holds a share of it): the right-hand side of a lane
+        accumulate.  The input is cast to the accumulator's dtype first (the
+        DSL type-checks the operands of a combine: a bf16 load against an
+        fp32 accumulator does not compile), and the combine is
+        ``_combine_expr``'s for this marker's dtype and kind of minimum."""
+        ctor = _dtype_ctor_from_identity(self.identity_expr)
+        value = self.input_name if input_name is None else input_name
+        if ctor is not None:
+            value = f"{ctor}({value})"
+        return _combine_expr(
+            self.reduction_type,
+            acc,
+            value,
+            ctor,
+            index_candidates=self.index_candidates,
+        )
 
     def to_call(self) -> str:
         """The marker call: ``threads_in_group`` always, the other keyword
@@ -456,6 +486,32 @@ _MARKER_KEYWORD_FIELDS = tuple(
 )
 _MARKER_KEYWORD_NAMES = frozenset(field.name for field in _MARKER_KEYWORD_FIELDS)
 
+# On the accumulate loop the two-pass lane split builds: its ``LaneSplitRecord``.
+HELION_LANE_SPLIT_ATTR = "_helion_lane_split"
+# On a statement that hands a lane's carried value back to the serial loop
+# around its lane loop (``carried.append(value)``, built by
+# ``_lane_carry_nest``): no memory is written, and the two-pass lane split
+# runs it with the producers of its value in the accumulate pass.
+HELION_LANE_CARRY_ATTR = "_helion_lane_carry"
+# The refusal of a marker inside another lane's loop
+# (``validate_lane_reduce_owners``, the two-pass split).  The passes that
+# try such a nest first append the reason they declined it to this text.
+NESTED_OWNER_REFUSAL = "reduction marker is nested in a different lane owner"
+
+
+@dataclasses.dataclass(frozen=True)
+class LaneSplitRecord:
+    """What the two-pass split of one lane loop emitted around the accumulate
+    loop that carries this record: per marker the accumulator it folds, and
+    the statements that reset the accumulators (before the loop) and combine
+    them across the threads into the markers' results (after it).  The split
+    writes it and ``defer_tile_reductions`` reads it."""
+
+    markers: tuple[_LaneReduceMarker, ...]
+    accumulators: tuple[str, ...]
+    resets: tuple[ast.AST, ...]
+    finalize: tuple[ast.AST, ...]
+
 
 def set_marker_owner(call: ast.Call, owner_lane: str) -> None:
     """Bind ``call`` (a marker) to the serial lane ``owner_lane``."""
@@ -523,7 +579,7 @@ class _ReplaceLaneReduceCall(ast.NodeTransformer):
             and node.func.id == _HELION_LANE_REDUCE_MARKER
         ):
             return ast.copy_location(
-                create(ast.Name, id="__HELION_FINALIZED__", ctx=ast.Load()), node
+                create(ast.Name, id=HELION_FINALIZED, ctx=ast.Load()), node
             )
         return node
 
@@ -588,9 +644,7 @@ def validate_lane_reduce_owners(body: list[ast.AST]) -> None:
             if not owners or not all(
                 constexpr for _, constexpr in lanes[owners[-1] + 1 :]
             ):
-                raise exc.BackendUnsupported(
-                    "cute", "reduction marker is nested in a different lane owner"
-                )
+                raise exc.BackendUnsupported("cute", NESTED_OWNER_REFUSAL)
         for child in ast.iter_child_nodes(node):
             visit(child, lanes)
 
@@ -599,10 +653,20 @@ def validate_lane_reduce_owners(body: list[ast.AST]) -> None:
 
 
 def _combine_expr(
-    reduction_type: str, acc: str, val: str, dtype_ctor: str | None = None
+    reduction_type: str,
+    acc: str,
+    val: str,
+    dtype_ctor: str | None = None,
+    *,
+    index_candidates: bool = False,
 ) -> str:
     """Combine ``val`` into ``acc``; ``dtype_ctor`` is the accumulator's type
-    constructor (``_dtype_ctor_from_identity``), when known."""
+    constructor (``_dtype_ctor_from_identity``), when known.
+
+    The lanes' accumulate is a chain of extrema over the kernel's values,
+    which ``nan_extremum_expr`` takes over unsigned keys for Int32 and
+    Int16; ``index_candidates`` (the marker's field) exempts the candidate
+    indices of an argmin / argmax."""
     if reduction_type == "sum":
         return f"({acc}) + ({val})"
     if reduction_type == "prod":
@@ -617,6 +681,7 @@ def _combine_expr(
             f"({acc})",
             f"({val})",
             float32=dtype_ctor == "cutlass.Float32",
+            chain_dtype=None if index_candidates else dtype_ctor,
         )
     raise NotImplementedError(f"lane reduce combine {reduction_type!r}")
 

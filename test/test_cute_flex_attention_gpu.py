@@ -478,8 +478,8 @@ def test_bool_table_mask_mod_by_row_and_column() -> None:
     )
     _assert_list_walk(code, mask=True, score=False)
     assert "_cute_flex_load_vec(" in code
-    assert "16, cutlass.Int8)" in code
-    assert "16, cutlass.Boolean)" not in code
+    assert "16, cutlass.Int8, align=" in code
+    assert "16, cutlass.Boolean" not in code
     _assert_close(out, lse, ref_out, ref_lse)
 
 
@@ -544,7 +544,9 @@ def test_column_table_vector_loads(dtype: torch.dtype, lanes: int) -> None:
         q, k, v, block_mask, mods=_column_table_mods(table)
     )
     _assert_list_walk(code, mask=True, score=True)
-    vec_call = re.search(r"_cute_flex_load_vec\(.*, (\d+), cutlass\.(\w+)\)", code)
+    vec_call = re.search(
+        r"_cute_flex_load_vec\(.*, (\d+), cutlass\.(\w+), align=", code
+    )
     assert vec_call is not None and int(vec_call.group(1)) == lanes
     _assert_close(out, lse, ref_out, ref_lse)
 

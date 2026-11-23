@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
@@ -8,9 +9,11 @@ import torch
 import helion
 from helion import _compat
 from helion._compiler import indexing_strategy
+from helion._compiler.compile_environment import CompileEnvironment
 from helion._compiler.indexing_strategy import BlockPtrIndexingStrategy
 from helion._compiler.indexing_strategy import IndexingStrategy
 from helion._compiler.indexing_strategy import PointerIndexingStrategy
+from helion._compiler.triton.backend import TritonBackend
 from helion._testing import DEVICE
 from helion._testing import TestCase
 from helion._testing import code_and_output
@@ -92,7 +95,12 @@ class TestBlockPtrProbe(unittest.TestCase):
 @skipIfRefEager("checks generated Triton code")
 class TestBlockPtrFallback(TestCase):
     def test_select_follows_the_probe(self) -> None:
-        with patch.object(_compat, "_supports_block_ptr", lambda: True):
+        # The backend answers for block pointers (Triton: the probe).
+        environment = SimpleNamespace(backend=TritonBackend())
+        with (
+            patch.object(CompileEnvironment, "current", return_value=environment),
+            patch.object(_compat, "_supports_block_ptr", lambda: True),
+        ):
             self.assertIsInstance(
                 IndexingStrategy.select("block_ptr"), BlockPtrIndexingStrategy
             )
@@ -101,6 +109,7 @@ class TestBlockPtrFallback(TestCase):
         # result does not depend on whether an earlier test on this worker
         # took the fallback.
         with (
+            patch.object(CompileEnvironment, "current", return_value=environment),
             patch.object(indexing_strategy, "_warned_block_ptr_fallback", True),
             patch.object(_compat, "_supports_block_ptr", lambda: False),
         ):

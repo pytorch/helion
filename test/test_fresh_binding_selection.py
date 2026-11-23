@@ -10,6 +10,7 @@ import torch
 import helion
 from helion._testing import cpu_render_target
 from helion._testing import onlyBackends
+from helion._testing import skipIfRefEager
 from helion.autotuner import EnumFragment
 import helion.language as hl
 from helion.runtime.kernel import BoundKernel
@@ -42,6 +43,7 @@ def _compile(bound, config, *, allow_print=True):
 
 
 @pytest.mark.parametrize("explicit", [False, True])
+@skipIfRefEager("reads compiler state, which ref mode does not build")
 def test_kernel_retains_selected_config_across_fresh_traces(explicit):
     tensor = torch.empty(17)
     args = (tensor, SAVED)
@@ -70,6 +72,7 @@ def test_kernel_retains_selected_config_across_fresh_traces(explicit):
 
 
 @onlyBackends(["triton", "cute", "pallas"])
+@skipIfRefEager("reads compiler state, which ref mode does not build")
 def test_autotune_multi_retains_selection_for_fresh_bindings():
     tensor = torch.empty(17)
     args = (tensor, SAVED)
@@ -101,6 +104,7 @@ def test_autotune_multi_retains_selection_for_fresh_bindings():
 
 
 @pytest.mark.parametrize("bypass", [None, "force", "environment"])
+@skipIfRefEager("reads compiler state, which ref mode does not build")
 def test_assert_cache_hit_refuses_uncached_search(monkeypatch, bypass):
     calls = []
 
@@ -163,6 +167,7 @@ def _choice(bound, factor=3):
 
 
 @pytest.mark.parametrize("static_shapes", [False, True])
+@skipIfRefEager("reads compiler state, which ref mode does not build")
 def test_fresh_selection_retains_input_layout(static_shapes):
     tensors = (torch.empty(17), torch.empty(34)[::2], torch.empty(18)[1:])
     with cpu_render_target(), patch.object(BoundKernel, "compile_config", _compile):
@@ -183,6 +188,7 @@ def test_fresh_selection_retains_input_layout(static_shapes):
             assert tune.call_count == 3
 
 
+@skipIfRefEager("reads compiler state, which ref mode does not build")
 def test_selection_uses_all_frontend_branches_and_changed_domains(monkeypatch):
     import sys
 
@@ -221,6 +227,7 @@ def test_selection_uses_all_frontend_branches_and_changed_domains(monkeypatch):
             assert len(calls) == 3
 
 
+@skipIfRefEager("reads compiler state, which ref mode does not build")
 def test_force_skip_reset_and_explicit_bound_selection(monkeypatch):
     tensor = torch.empty(17)
     args = (tensor, SAVED)
@@ -275,6 +282,7 @@ def _custom_identity(x, value: hl.constexpr):
     return out
 
 
+@skipIfRefEager("reads compiler state, which ref mode does not build")
 def test_custom_domain_retunes_with_one_warning(caplog):
     args = (torch.empty(17), SAVED)
     with cpu_render_target(), patch.object(BoundKernel, "compile_config", _compile):
@@ -298,6 +306,7 @@ def test_custom_domain_retunes_with_one_warning(caplog):
         )
 
 
+@skipIfRefEager("reads compiler state, which ref mode does not build")
 def test_custom_domain_fixed_config_does_not_warn_about_retuning(caplog):
     args = (torch.empty(17), SAVED)
     with cpu_render_target(), patch.object(BoundKernel, "compile_config", _compile):
@@ -348,6 +357,7 @@ def _optional_identity(x, value: hl.constexpr, opaque: hl.constexpr):
 
 
 @onlyBackends(["triton", "cute", "pallas"])
+@skipIfRefEager("reads compiler state, which ref mode does not build")
 def test_mixed_multi_shape_uses_uncached_factory_for_all_cases():
     from helion.autotuner.base_cache import _UncachedAutotuneCache
 
@@ -394,6 +404,7 @@ def test_mixed_multi_shape_uses_uncached_factory_for_all_cases():
 
 
 @pytest.mark.parametrize("cached_first", [False, True])
+@skipIfRefEager("reads compiler state, which ref mode does not build")
 def test_direct_fresh_call_does_not_overwrite_reusable_selection(cached_first):
     tensor = torch.empty(17)
     fresh_args = (tensor, SAVED, True)
@@ -421,6 +432,7 @@ def test_direct_fresh_call_does_not_overwrite_reusable_selection(cached_first):
 
 @pytest.mark.parametrize("cached_first", [False, True])
 @pytest.mark.parametrize("selection", ["set_config", "autotune"])
+@skipIfRefEager("reads compiler state, which ref mode does not build")
 def test_direct_fresh_call_supplies_unconfigured_shared_binding(
     cached_first, selection
 ):
@@ -452,6 +464,7 @@ def test_direct_fresh_call_supplies_unconfigured_shared_binding(
         assert kernel(*shared_args) is rebound
 
 
+@skipIfRefEager("reads compiler state, which ref mode does not build")
 def test_selection_store_is_bounded_copied_and_does_not_retain_tensors():
     import gc
     import weakref
@@ -495,6 +508,7 @@ def _identity_domain_argument(x, value: hl.constexpr, choices: hl.constexpr):
 
 
 @onlyBackends(["triton", "cute", "pallas"])
+@skipIfRefEager("reads compiler state, which ref mode does not build")
 def test_multi_shape_rejects_changed_declared_domain_before_search():
     tensor = torch.empty(17)
     with (
@@ -522,6 +536,7 @@ def test_multi_shape_rejects_changed_declared_domain_before_search():
 
 
 @pytest.mark.parametrize("mixed", [False, True])
+@skipIfRefEager("reads compiler state, which ref mode does not build")
 def test_fresh_search_never_reads_warm_start_caches(mixed):
     from helion.autotuner.base_search import BaseSearch
     from helion.autotuner.benchmark_provider import _MultiShapeAutotuneArgs
@@ -566,6 +581,7 @@ def test_fresh_search_never_reads_warm_start_caches(mixed):
 
 
 @onlyBackends(["triton", "cute"])
+@skipIfRefEager("reads compiler state, which ref mode does not build")
 def test_forced_fresh_selection_overrides_decorator_config():
     args = (torch.empty(17), SAVED)
     with cpu_render_target(), patch.object(BoundKernel, "compile_config", _compile):
@@ -585,6 +601,7 @@ def test_forced_fresh_selection_overrides_decorator_config():
             assert kernel(*args)._config.config["factor"] == 2
 
 
+@skipIfRefEager("reads compiler state, which ref mode does not build")
 def test_fresh_selection_respects_the_evaluated_custom_key():
     state = {"key": 0, "calls": 0}
 
@@ -612,3 +629,35 @@ def test_fresh_selection_respects_the_evaluated_custom_key():
         assert second._config["factor"] == 3
         assert tune.call_count == 2
         assert state["calls"] == 3
+
+
+@pytest.mark.parametrize(
+    ("settings", "configs", "force", "kind"),
+    [
+        ({"autotune_effort": "none"}, (), False, "default"),
+        ({"autotune_effort": "none", "force_autotune": True}, (1,), False, "default"),
+        ({}, (1,), False, "given"),
+        ({"force_autotune": True}, (1,), False, None),
+        ({}, (), False, None),
+        ({}, (1, 2), False, None),
+        # Backend.autotune's force argument, as force_autotune.
+        ({}, (1,), True, None),
+        ({"autotune_effort": "none"}, (1,), True, "default"),
+    ],
+)
+def test_fixed_config_kind(
+    settings: dict[str, object],
+    configs: tuple[int, ...],
+    force: bool,
+    kind: str | None,
+) -> None:
+    """Calls take the default config under autotune_effort="none" (without
+    configs, or when forced), the one config given (unless forced), or
+    search."""
+
+    def fn(x: torch.Tensor) -> torch.Tensor:
+        return x
+
+    given = [helion.Config(block_sizes=[16 * c]) for c in configs]
+    kernel = helion.kernel(configs=given, **settings)(fn)
+    assert kernel._fixed_config_kind(force=force) == kind

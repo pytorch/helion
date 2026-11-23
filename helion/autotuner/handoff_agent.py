@@ -1,26 +1,60 @@
-"""Run provider-independent native-source proposals against a handoff bundle."""
+"""Evaluate a caller-supplied source agent's proposals against a handoff bundle."""
 
 from __future__ import annotations
 
+from collections.abc import Callable
+from collections.abc import Mapping
 import dataclasses
 import datetime
 import json
 import math
 import time
 from typing import TYPE_CHECKING
+from typing import Any
 import uuid
 
-from .handoff_cli import CLISourceAgent
 from .handoff_evaluation import _artifact_path
+from .handoff_prompt import _evaluation_summary
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
-    from collections.abc import Mapping
     from pathlib import Path
 
     from .handoff_bundle import HandoffBundle
     from .handoff_evaluation import HandoffEvaluation
     from .logger import AutotuningLogger
+
+
+@dataclasses.dataclass(frozen=True)
+class HandoffRequest:
+    """A request for the next proposal, passed to a :data:`SourceAgent`.
+
+    The agent answers with complete replacement sources for one or more of
+    ``sources``, keyed by the same paths, or ``None`` to end the session.
+    Helion only validates and measures what the agent returns: how the agent
+    produces it (a model API, a coding-agent CLI, a person), where it runs,
+    and what it may access are the agent's concern. Calls are synchronous and
+    Helion does not interrupt them, so the agent must return by ``deadline``.
+    Every hand-off session (one per autotuned specialization) calls the same
+    agent; a session's first request has ``feedback`` None, and Helion does
+    not signal a session's end.
+    """
+
+    # The task and its contracts (the bundle's prompt.md), and the deadline.
+    prompt: str
+    # The retained native sources, keyed by bundle-relative path.
+    sources: Mapping[str, str]
+    # The outcome of the previous proposal (see run_agent_rounds); None at first.
+    feedback: Mapping[str, Any] | None
+    # Absolute time.monotonic() deadline of the session.
+    deadline: float
+
+
+# Returns replacement sources to evaluate, or None to end the session.
+SourceAgent = Callable[[HandoffRequest], Mapping[str, str] | None]
+
+# Invalid proposals cost no evaluation, so an agent that keeps returning them
+# would otherwise spin through rounds until the deadline.
+MAX_CONSECUTIVE_INVALID_PROPOSALS = 20
 
 
 @dataclasses.dataclass(frozen=True)
@@ -81,10 +115,37 @@ def _noise(evaluation: HandoffEvaluation) -> float:
     return evaluation.perf * relative_noise
 
 
+def _feedback(
+    record: HandoffAgentRound, incumbent: HandoffEvaluation, deadline: float
+) -> dict[str, Any]:
+    """The outcome of one round, as the next request reports it to the agent."""
+    return {
+        "round": record.round,
+        "accepted": record.accepted,
+        "reason": record.reason,
+        # The retained source's latest measurement.
+        "current": _evaluation_summary(dataclasses.asdict(incumbent)),
+        **{
+            name: _evaluation_summary(dataclasses.asdict(evaluation))
+            for name, evaluation in (
+                ("candidate", record.candidate),
+                ("incumbent", record.incumbent),
+            )
+            if evaluation is not None
+        },
+        **({"error": record.error} if record.error is not None else {}),
+        **(
+            {"improvement_threshold": record.improvement_threshold}
+            if record.improvement_threshold is not None
+            else {}
+        ),
+        "remaining_seconds": max(0.0, deadline - time.monotonic()),
+    }
+
+
 def run_agent_rounds(
     bundle: HandoffBundle,  # Native sources, inputs, and references to optimize.
-    agent: Callable[[HandoffBundle], Mapping[str, str]]
-    | None = None,  # None uses the CLI selected by HELION_HANDOFF_AGENT.
+    agent: SourceAgent,  # Proposes replacement sources; see HandoffRequest.
     *,
     budget_seconds: float,  # Total session budget, in seconds.
     repetitions: int = 5,  # Timing samples per case for median and noise estimates.
@@ -93,15 +154,19 @@ def run_agent_rounds(
 ) -> HandoffAgentResult:
     """Retain validated improvements, restoring the incumbent after every failure.
 
-    ``budget_seconds`` includes baseline evaluation, callbacks, and comparisons.
-    Rounds track progress without limiting the number of submissions. Callbacks
-    are synchronous and must enforce their own timeout using the absolute
-    ``time.monotonic()`` deadline in the prompt. Late proposals are never
-    accepted. Each invocation starts a separate log directory, without resuming
-    earlier agent context. By default, :class:`CLISourceAgent` runs one
-    continuous CLI session; each explicit candidate submission records a
-    round and returns evaluation feedback to that session. Explicit callbacks
-    retain control of provider and context management.
+    Each round calls ``agent`` with a :class:`HandoffRequest`: the bundle's
+    prompt with the session deadline, the retained sources, and the previous
+    round's feedback (its decision and reason, summaries of the candidate's
+    and the incumbent's measurements and of the retained source's latest one,
+    any error, the improvement threshold, and the seconds remaining). The
+    proposal is measured against the incumbent and retained only if it is
+    faster by more than the noise. The session ends at the deadline, when
+    the agent returns ``None`` (``agent_stopped``), when it raises
+    (``agent_error``), or after ``MAX_CONSECUTIVE_INVALID_PROPOSALS`` invalid
+    proposals in a row (``invalid_proposals``). ``budget_seconds`` includes baseline evaluation, agent
+    calls, and comparisons. Calls are synchronous: the agent must return by
+    the request's deadline, and proposals completed late are not accepted.
+    Sources, feedback, and decisions are saved under ``agent_runs/``.
     """
     if not math.isfinite(budget_seconds) or budget_seconds <= 0:
         raise ValueError("budget_seconds must be finite and positive")
@@ -110,18 +175,7 @@ def run_agent_rounds(
     deadline = started + budget_seconds
     directory = bundle.directory / "agent_runs" / uuid.uuid4().hex
     directory.mkdir(parents=True)
-    source_agent = None
-    if agent is None:
-        source_agent = CLISourceAgent(directory / "calls", deadline=deadline, log=log)
-        agent = source_agent
-    elif isinstance(agent, CLISourceAgent):
-        source_agent = agent
-        if source_agent.deadline is not None:
-            deadline = min(deadline, source_agent.deadline)
-        source_agent.deadline = deadline
-    prompt_path = bundle.directory / "prompt.md"
-    original_prompt = prompt_path.read_text()
-    prompt = original_prompt + f"\n\nSession deadline (time.monotonic()): {deadline}."
+    prompt = bundle.prompt + f"\n\nSession deadline (time.monotonic()): {deadline}."
     incumbent_sources = bundle.sources
     _write_sources(directory / "initial", incumbent_sources, readonly=True)
     _write_json(
@@ -134,7 +188,10 @@ def run_agent_rounds(
             "timeout": timeout,
         },
     )
+    (directory / "prompt.md").write_text(prompt)
     rounds: list[HandoffAgentRound] = []
+    feedback: dict[str, Any] | None = None
+    invalid_streak = 0
 
     def expired() -> bool:
         return time.monotonic() >= deadline
@@ -146,16 +203,6 @@ def run_agent_rounds(
         return bundle.evaluate(
             repetitions=repetitions, timeout=timeout, deadline=deadline
         )
-
-    def feedback(evaluation: HandoffEvaluation) -> dict[str, object]:
-        return {
-            "round": len(rounds) + 1,
-            "deadline_monotonic": deadline,
-            "remaining_seconds": max(0.0, deadline - time.monotonic()),
-            "incumbent_evaluation": dataclasses.asdict(evaluation),
-            "history": [dataclasses.asdict(record) for record in rounds],
-            "log_directory": str(directory),
-        }
 
     stop_reason = "interrupted"
     try:
@@ -173,27 +220,27 @@ def run_agent_rounds(
                 else "Native source baseline failed validation or measurement"
             )
         incumbent = baseline
-        _write_json(directory / "feedback.json", feedback(incumbent))
-        (directory / "prompt.md").write_text(prompt)
         while baseline.ok and not expired():
             number = len(rounds) + 1
-            prompt_path.write_text(prompt)
-            replacements = None
-            if source_agent is not None:
-                # Waiting for a submission is not itself an optimization round.
-                try:
-                    if log is not None:
-                        log("Native source session: waiting for candidate submission")
-                    replacements = source_agent(bundle)
-                except StopIteration:
-                    assert source_agent.stop_reason is not None
-                    stop_reason = source_agent.stop_reason
-                    break
-                except Exception as exception:
-                    stop_reason = "agent_error"
-                    if log is not None:
-                        log(f"Native source session failed: {exception}")
-                    break
+            if log is not None:
+                log(f"Native source round {number}: requesting proposal")
+            request = HandoffRequest(
+                prompt, dict(incumbent_sources), feedback, deadline
+            )
+            try:
+                replacements = agent(request)
+            except Exception as exception:
+                stop_reason = "agent_error"
+                if log is not None:
+                    log.warning(
+                        "Native source agent failed: "
+                        f"{type(exception).__qualname__}: {exception}",
+                        exc_info=True,
+                    )
+                break
+            if replacements is None:
+                stop_reason = "deadline" if expired() else "agent_stopped"
+                break
             round_directory = directory / f"round_{number:04d}"
             round_directory.mkdir()
             _write_sources(
@@ -203,16 +250,11 @@ def run_agent_rounds(
             accepted = False
             threshold = None
             error = None
-            reason = "agent_error"
+            reason = "invalid_proposal"
             try:
-                if source_agent is None:
-                    if log is not None:
-                        log(f"Native source round {number}: requesting proposal")
-                    replacements = agent(bundle)
-                elif log is not None:
-                    log(f"Native source round {number}: evaluating submission")
                 if (
-                    not replacements
+                    not isinstance(replacements, Mapping)
+                    or not replacements
                     or not replacements.keys() <= incumbent_sources.keys()
                 ):
                     raise ValueError(
@@ -226,6 +268,8 @@ def run_agent_rounds(
                 _write_sources(round_directory / "candidate", proposed, readonly=True)
                 if proposed == incumbent_sources:
                     raise ValueError("Agent proposal did not change native source")
+                if log is not None:
+                    log(f"Native source round {number}: evaluating proposal")
                 order = (
                     ("candidate", "incumbent")
                     if number % 2
@@ -285,25 +329,22 @@ def run_agent_rounds(
             )
             rounds.append(record)
             _write_json(round_directory / "round.json", dataclasses.asdict(record))
+            feedback = _feedback(record, incumbent, deadline)
+            _write_json(round_directory / "feedback.json", feedback)
             if log is not None:
                 log.record_handoff_event(
                     "handoff_round", round=dataclasses.asdict(record)
                 )
                 log(f"Native source round {number}: {reason}")
-            context = feedback(incumbent)
-            _write_json(directory / "feedback.json", context)
-            if source_agent is not None:
-                try:
-                    source_agent.complete_round(
-                        incumbent_sources,
-                        context,
-                        done=expired(),
+            invalid_streak = invalid_streak + 1 if reason == "invalid_proposal" else 0
+            if invalid_streak >= MAX_CONSECUTIVE_INVALID_PROPOSALS:
+                stop_reason = "invalid_proposals"
+                if log is not None:
+                    log.warning(
+                        f"Native source agent made {invalid_streak} invalid "
+                        "proposals in a row; ending the session"
                     )
-                except Exception as exception:
-                    stop_reason = "agent_error"
-                    if log is not None:
-                        log(f"Native source feedback failed: {exception}")
-                    break
+                break
         else:
             if not baseline.ok:
                 stop_reason = "baseline_failed"
@@ -325,9 +366,4 @@ def run_agent_rounds(
             log(f"Native source session completed: {stop_reason}, {len(rounds)} rounds")
         return result
     finally:
-        try:
-            if source_agent is not None:
-                source_agent.close(reason=stop_reason)
-        finally:
-            _write_sources(bundle.directory, incumbent_sources)
-            prompt_path.write_text(original_prompt)
+        _write_sources(bundle.directory, incumbent_sources)

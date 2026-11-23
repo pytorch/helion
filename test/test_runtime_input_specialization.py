@@ -249,6 +249,7 @@ class TestCuteRuntimeInputSpecialization(unittest.TestCase):
             specialized_strides=set(),
             tensor_descriptor_layout_guards={},
             runtime_input_specializations={},
+            torch_mode_sensitive=False,
             specialize_expr=lambda expr: expr,
             size_hint=lambda size: hints[str(size)],
             get_block_id=lambda size: block_ids.get(str(size)),
@@ -725,6 +726,7 @@ class TestRuntimeInputSpecialization(unittest.TestCase):
             specialized_strides=set(),
             tensor_descriptor_layout_guards={},
             runtime_input_specializations={"state_ring_alias": specialization},
+            torch_mode_sensitive=False,
         )
         kernel = SimpleNamespace(signature=inspect.signature(lambda state, other: None))
         bound = SimpleNamespace(
@@ -1108,6 +1110,7 @@ class TestRuntimeInputSpecialization(unittest.TestCase):
                 specialized_strides=set(),
                 tensor_descriptor_layout_guards={},
                 runtime_input_specializations=dict(ordered_entries),
+                torch_mode_sensitive=False,
             )
             kernel = SimpleNamespace(
                 signature=inspect.signature(lambda first, second: None)
@@ -1400,7 +1403,10 @@ class TestLayoutProvenance(unittest.TestCase):
             self.assertIsInstance(literal, StaticShape)
             self.assertEqual(literal.name, "1")
 
-            host = SimpleNamespace(params=SimpleNamespace(arguments={"x": fake_input}))
+            host = SimpleNamespace(
+                params=SimpleNamespace(arguments={"x": fake_input}),
+                compiler_state=SimpleNamespace(static_peer_layouts=()),
+            )
             with patch(
                 "helion._compiler.host_function.HostFunction.current",
                 return_value=host,

@@ -707,8 +707,10 @@ class TestAutotunerAccuracy(AutotunerTestCase):
         self.assertIsNotNone(relative_l2_disagreement(zeros, zeros + 1, 0.05))
 
     def test_autotune_baseline_tolerance(self) -> None:
+        # Two kernels on every backend: CuTe ignores ``num_warps``, and one
+        # generated source is checked once.
         cfg1 = helion.Config(block_sizes=[1], num_warps=4)
-        cfg2 = helion.Config(block_sizes=[1], num_warps=8)
+        cfg2 = helion.Config(block_sizes=[2], num_warps=8)
         a, b = torch.randn([32], device=DEVICE), torch.randn([32], device=DEVICE)
 
         # Baseline that returns slightly incorrect result (1e-4 error)
@@ -1226,8 +1228,10 @@ class TestAutotunerAccuracy(AutotunerTestCase):
 
     def test_autotune_baseline_accuracy_check_fn_rejects(self) -> None:
         """Test that a strict custom check function properly rejects configs."""
+        # Two kernels on every backend: CuTe ignores ``num_warps``, and one
+        # generated source is checked once.
         cfg1 = helion.Config(block_sizes=[1], num_warps=4)
-        cfg2 = helion.Config(block_sizes=[1], num_warps=8)
+        cfg2 = helion.Config(block_sizes=[2], num_warps=8)
 
         def strict_check(actual: object, expected: object) -> None:
             # Always reject
@@ -1257,6 +1261,49 @@ class TestAutotunerAccuracy(AutotunerTestCase):
         self.assertEqual(
             search._autotune_metrics.num_accuracy_failures, len(search.configs)
         )
+
+    @onlyBackends(["cute"])
+    def test_cute_checks_and_times_one_generated_source_once(self) -> None:
+        """Configs that differ only in ``num_warps`` are one CuTe kernel.  In
+        one search of two generated sources the real provider checks and
+        times each source once and settles its second config by the source:
+        deduplicated without a timing where the source passed the accuracy
+        check, rejected with it where it failed."""
+        configs = [
+            helion.Config(block_sizes=[block_size], num_warps=num_warps)
+            for block_size in (1, 2)
+            for num_warps in (4, 8)
+        ]
+        checks: list[None] = []
+
+        def first_source_passes(actual: object, expected: object) -> None:
+            checks.append(None)
+            if len(checks) > 1:
+                raise AssertionError("every source after the first fails")
+
+        @helion.kernel(
+            configs=configs,
+            autotune_log_level=0,
+            autotune_baseline_accuracy_check_fn=first_source_passes,
+            autotune_benchmark_subprocess=False,
+        )
+        def add(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+            o = torch.empty_like(a)
+            for t in hl.tile(o.size()):
+                o[t] = a[t] + b[t]
+            return o
+
+        a = torch.randn([32], device=DEVICE)
+        b = torch.randn([32], device=DEVICE)
+        search = FiniteSearch(add.bind((a, b)), (a, b), configs=configs)
+        search.autotune()
+
+        metrics = search._autotune_metrics
+        self.assertEqual(len(checks), 2)
+        self.assertEqual(metrics.num_unique_sources, 2)
+        self.assertEqual(metrics.num_accuracy_failures, 1)
+        self.assertEqual(metrics.num_source_deduplications, 2)
+        self.assertEqual(metrics.num_successful_candidate_measurements, 1)
 
 
 class TestMismatchTolerance(TestCase):
@@ -2450,6 +2497,22 @@ class TestBaselinePrecompileCache(TestCase):
         self.assertGreater(cubins, 0)
 
     @skipIfNotCUDA()
+    def test_a_forked_baseline_precompile_keys_on_a_stages_hook(self) -> None:
+        # A stages-inspection hook (hl.prefetch_code installs one) adds its
+        # pipeline to the kernel's specialization in JITFunction.run(); the
+        # precompile has to compile that same specialization.
+        from triton import knobs
+
+        def hook(*args: object) -> tuple[str, str] | None:
+            return None if args else ("stages-hook", "stages-hook")
+
+        with patch.object(knobs.runtime, "add_stages_inspection_hook", hook):
+            pids, cubins = self._baseline_compiles("fork", 1536)
+        self.assertTrue(pids)
+        self.assertNotIn(os.getpid(), pids)
+        self.assertGreater(cubins, 0)
+
+    @skipIfNotCUDA()
     @pytest.mark.slow
     def test_a_spawned_baseline_precompile_compiles_for_the_run(self) -> None:
         # A spawned child loads the arguments from a file, which holds them as
@@ -2848,6 +2911,7 @@ class TestAccuracyCheck(unittest.TestCase):
                 SimpleNamespace(  # type: ignore[arg-type]
                     settings=settings,
                     _benchmark_provider_cls=LocalBenchmarkProvider,
+                    _benchmark_prelude=None,
                 ),
                 cute_flash_search_enabled=False,
             )

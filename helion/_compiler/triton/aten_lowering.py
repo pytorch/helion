@@ -897,7 +897,7 @@ def _keys_selection_source(
     # crossover range. Multi-row tiles, smaller k, and other targets use topk.
     if (
         k is not None
-        and env.backend_name == "triton"
+        and env.backend.uses_triton_compiler
         and not is_hip()
         and capability is not None
         and capability[0] == 10

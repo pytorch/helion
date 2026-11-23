@@ -43,11 +43,14 @@ from .fragment_mma import FRAGMENT_LOWERING
 from .fragment_mma import LANE
 from .fragment_mma import LANE_PREAMBLE
 from .fragment_mma import is_fragment_acc
-from .fragment_mma import kernel_constants
 from .lane_fold import MSL_SCALAR_BYTES
 from .lane_fold import jam_lanes_into_loops
 from .lane_fold import unroll_lane_folds
 from .mpp_matmul import ACC
+from .mpp_matmul import REG_RUN
+from .mpp_matmul import RUN
+from .mpp_registers import LANE as REGISTER_LANE
+from .mpp_registers import REGISTER_LOWERING
 from .msl_ast_walker import MASKED_LOAD
 from .msl_ast_walker import MASKED_LOAD_PREAMBLE
 from .msl_ast_walker import EmitState
@@ -57,6 +60,9 @@ from .msl_reduction import GROUP_PATHS
 from .msl_reduction import REDUCTION_INCLUDES
 from .msl_reduction import REDUCTION_NAMESPACE
 from .msl_reduction import REDUCTION_PREAMBLE
+from .operand_elements import SIMDGROUP
+from .operand_elements import SPLIT_BUFFER
+from .operand_elements import kernel_constants
 from .reduction import LAUNCH_DIM_VARS
 from .reduction import RED_SITE_GLOBAL_PREFIX
 from .reduction import TG_BUFFER_GLOBAL_PREFIX
@@ -236,6 +242,16 @@ def _generate_msl(
     for dtype in tensor_dtypes.values():
         if dtype not in DTYPE_TO_METAL:
             raise ValueError(f"Unsupported Metal dtype: {dtype}")
+    # The threads each SIMD group lays the tiles out over when SIMD groups
+    # split the fragment or register runs' K loops (``fragment_mma``,
+    # ``mpp_registers``): the launch stacks one such layout per SIMD group
+    # along z.
+    split = _k_split(body_stmts)
+    layout = required_threads_per_threadgroup
+    if layout is not None and split > 1:
+        tx, ty, tz = layout
+        assert tz % split == 0, (layout, split)
+        layout = (tx, ty, tz // split)
     body_stmts = elementize(
         body_stmts,
         tensor_dtypes,
@@ -244,8 +260,9 @@ def _generate_msl(
             for k in fn_globals
             if k.startswith(TG_BUFFER_GLOBAL_PREFIX)
         ),
-        required_threads_per_threadgroup,
+        layout,
         FRAGMENT_LOWERING,
+        REGISTER_LOWERING,
     )
     body_stmts = jam_lanes_into_loops(unroll_lane_folds(body_stmts, names_read))
     msl_parts: list[str] = [
@@ -260,15 +277,9 @@ def _generate_msl(
         for node in ast.walk(stmt)
         if isinstance(node, ast.Name)
     }
-    reduction_sites = _reduction_sites(
-        fn_globals, referenced, required_threads_per_threadgroup
-    )
+    reduction_sites = _reduction_sites(fn_globals, referenced, layout)
     body_stmts, threadgroup_buffers = _threadgroup_buffers(
-        body_stmts,
-        fn_globals,
-        referenced,
-        reduction_sites,
-        required_threads_per_threadgroup,
+        body_stmts, fn_globals, referenced, reduction_sites, layout
     )
     body_stmts = fuse_multiply_adds(
         body_stmts,
@@ -293,10 +304,15 @@ def _generate_msl(
         ),
     )
     uses_reductions = _uses_reductions(body_stmts)
+    # Each SIMD group that splits the K loops runs the kernel's other code
+    # too, as the only one would, so codegen refuses kernels with reductions
+    # or staged tiles (``operand_elements.split_refusal``): their threadgroup
+    # memory would take writes from all of them.
+    assert split == 1 or not (uses_reductions or threadgroup_buffers)
     if uses_reductions:
         msl_parts.extend(REDUCTION_INCLUDES)
         msl_parts.extend(("", REDUCTION_PREAMBLE))
-    uses_mpp, uses_fragments = _matmul_kinds(body_stmts)
+    uses_mpp, uses_fragments, uses_registers = _matmul_kinds(body_stmts)
     if uses_fragments:
         msl_parts.append("#include <metal_simdgroup_matrix>")
     if uses_mpp:
@@ -320,9 +336,11 @@ def _generate_msl(
                 "using namespace mpp::tensor_ops;",
             ]
         )
-    if ROUND in referenced or BF16_CAST in referenced:
+    # A register run writes its bfloat operands' elements through BF16_CAST
+    # (``msl_ast_walker``'s put).
+    if ROUND in referenced or BF16_CAST in referenced or uses_registers:
         msl_parts.append(ROUND_PREAMBLE)
-    if BF16_CAST in referenced:
+    if BF16_CAST in referenced or uses_registers:
         msl_parts.append(BF16_CAST_PREAMBLE)
     if any(
         isinstance(node, ast.Name) and node.id == MASKED_LOAD
@@ -360,14 +378,16 @@ def _generate_msl(
             params.append(f"device {metal_dtype}* {name} [[buffer({buf_idx})]]")
         buf_idx += 1
 
-    params.extend(
-        (
-            "uint3 tgid [[threadgroup_position_in_grid]]",
-            "uint3 tid [[thread_position_in_threadgroup]]",
-        )
-    )
+    params.append("uint3 tgid [[threadgroup_position_in_grid]]")
+    if split == 1:
+        params.append("uint3 tid [[thread_position_in_threadgroup]]")
     if uses_fragments:
         params.append(f"uint {LANE} [[thread_index_in_simdgroup]]")
+    if uses_registers:
+        params.append(f"uint {REGISTER_LANE} [[thread_index_in_simdgroup]]")
+    if split > 1:
+        # The same integer type as the other position attributes.
+        params.append(f"uint {SIMDGROUP} [[simdgroup_index_in_threadgroup]]")
     sig = ",\n    ".join(params)
     required_threads_attr = ""
     if required_threads_per_threadgroup is not None:
@@ -375,6 +395,7 @@ def _generate_msl(
         required_threads_attr = (
             f"[[required_threads_per_threadgroup({tx}, {ty}, {tz})]] "
         )
+    kernel_at = len(msl_parts)
     msl_parts.append(
         f"{required_threads_attr}kernel void {kernel_name}(\n    {sig}\n) {{"
     )
@@ -388,15 +409,22 @@ def _generate_msl(
     }
     for name in sorted(block_sizes):
         msl_parts.append(f"    constexpr int {name} = {block_sizes[name]};")
-    if required_threads_per_threadgroup is not None:
-        for name, size in zip(
-            LAUNCH_DIM_VARS, required_threads_per_threadgroup, strict=True
-        ):
+    if layout is not None:
+        for name, size in zip(LAUNCH_DIM_VARS, layout, strict=True):
             msl_parts.append(f"    constexpr uint {name} = {size};")
     for site, (path, _) in sorted(reduction_sites.items()):
         msl_parts.append(f"    constexpr uint {site} = {GROUP_PATHS.index(path)};")
     if uses_fragments:
         msl_parts.extend(f"    {line}" for line in LANE_PREAMBLE)
+    if split > 1:
+        # Each SIMD group's lanes take the layout's threads, in launch order.
+        assert layout is not None
+        tx, ty, _ = layout
+        lane = LANE if uses_fragments else REGISTER_LANE
+        msl_parts.append(
+            f"    const uint3 tid = uint3({lane} % {tx}, ({lane} / {tx}) % {ty}, "
+            f"{lane} / {tx * ty});"
+        )
 
     # ``threadgroup`` variables are only legal at kernel scope, but a reduction
     # can be emitted from inside a loop body, so their declarations are hoisted
@@ -411,10 +439,35 @@ def _generate_msl(
             *reduction_sites,
             *(name for name, _, _ in threadgroup_buffers),
         },
-        constants=kernel_constants(body_stmts) if uses_fragments else {},
+        constants=(
+            kernel_constants(body_stmts) if uses_fragments or uses_registers else {}
+        ),
+        split=split,
+        # Register operands' layouts are probed where the kernel runs
+        # (``coop_layout``).
+        on_gpu=any(
+            isinstance(arg, torch.Tensor) and arg.device.type == "mps" for arg in args
+        ),
     )
 
+    body_at = len(msl_parts)
     _emit_stmts(body_stmts, msl_parts, indent=4, state=state)
+    # The lane bases of the register operands' layouts.
+    msl_parts[body_at:body_at] = [f"    {line}" for line in state.lane_decls]
+    if state.split_slots:
+        # ``fragment_mma._split`` and ``mpp_registers.register_split`` kept
+        # it within the threadgroup memory.
+        assert (
+            state.split_slots * MSL_SCALAR_BYTES["float"]
+            <= MAX_THREADGROUP_MEMORY_BYTES
+        )
+        msl_parts.insert(
+            body_at, f"    threadgroup float {SPLIT_BUFFER}[{state.split_slots}];"
+        )
+    msl_parts[kernel_at:kernel_at] = [
+        f"constant {ctype} {name}[{len(entries)}] = {{{', '.join(entries)}}};"
+        for (ctype, entries), name in state.tables.items()
+    ]
 
     msl_parts.append("}")
     return "\n".join(msl_parts)
@@ -435,12 +488,13 @@ def _constexpr_decl(name: str, value: object) -> str:
     raise exc.BackendUnsupported("metal", f"kernel argument type: {type(value)}")
 
 
-def _matmul_kinds(body_stmts: list[ast.stmt]) -> tuple[bool, bool]:
-    """Whether the body needs MPP's ``matmul2d`` and whether it has fragment
+def _matmul_kinds(body_stmts: list[ast.stmt]) -> tuple[bool, bool, bool]:
+    """Whether the body needs MPP's ``matmul2d``, whether it has fragment
     groups (``fragment_mma``), each of which declares its accumulator with a
-    ``fragment`` keyword.  The planner lowers all of a kernel's groups one
+    ``fragment`` keyword, and whether it has register runs
+    (``mpp_registers``).  The planner lowers all of a kernel's groups one
     way, so MPP markers with no fragment group are ``matmul2d``'s."""
-    markers = fragments = False
+    markers = fragments = registers = False
     for node in ast.walk(ast.Module(body=body_stmts, type_ignores=[])):
         if not isinstance(node, ast.Call):
             continue
@@ -448,7 +502,26 @@ def _matmul_kinds(body_stmts: list[ast.stmt]) -> tuple[bool, bool]:
         if isinstance(func, ast.Name) and func.id.startswith("_helion_mpp_"):
             markers = True
             fragments |= func.id == ACC and is_fragment_acc(node)
-    return markers and not fragments, fragments
+            registers |= func.id == REG_RUN
+    return markers and not fragments, fragments, registers
+
+
+def _k_split(body_stmts: list[ast.stmt]) -> int:
+    """The SIMD groups that split the body's K loops, 1 when one SIMD group
+    runs them: the ``split`` of each fragment run (``fragment_mma``) and the
+    ``k_split`` of each register run (``mpp_registers``), both keywords of
+    the run's ``RUN`` call, as the body reads before elementize."""
+    splits = set()
+    for node in ast.walk(ast.Module(body=body_stmts, type_ignores=[])):
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+            if node.func.id != RUN:
+                continue
+            for keyword in node.keywords:
+                if keyword.arg in ("split", "k_split"):
+                    split = ast.literal_eval(keyword.value)
+                    splits.add(1 if split is None else split[1])
+    assert len(splits) <= 1, splits
+    return splits.pop() if splits else 1
 
 
 def _uses_reductions(body_stmts: list[ast.stmt]) -> bool:
@@ -556,6 +629,8 @@ def _threadgroup_buffers(
 
 
 def _raise_if_mpp_unsupported_device() -> None:
+    if not torch.backends.mps.is_available():
+        return
     device_name = torch._C._mps_get_name()  # type: ignore[attr-defined]
     if "paravirtual" in device_name.lower():
         raise exc.BackendUnsupported(

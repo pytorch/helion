@@ -36,11 +36,13 @@ import torch.distributed as dist
 import torch.nn.functional
 from torch.utils._pytree import tree_map
 
+from .._compat import GLUON_REQUIREMENT
 from .._compat import get_mtia_tunable_fragments
 from .._compat import get_tensor_descriptor_fn_name
 from .._compat import requires_torch_version
 from .._compat import supports_amd_cdna_tunables
 from .._compat import supports_block_ptr
+from .._compat import supports_gluon
 from .._compat import supports_host_tensor_descriptor
 from .._compat import supports_tensor_descriptor
 from .._compat import target_device_capability
@@ -324,6 +326,14 @@ def skipIfRefEager(reason: str) -> Callable[[Callable], Callable]:
     return unittest.skipIf(os.environ.get("HELION_INTERPRET") == "1", reason)
 
 
+def skipIfRefEagerMark(reason: str) -> pytest.MarkDecorator:
+    """Return a pytest mark that skips in ref eager mode (HELION_INTERPRET=1).
+
+    For a module's ``pytestmark``, which takes pytest marks rather than the
+    unittest decorator :func:`skipIfRefEager` returns."""
+    return pytest.mark.skipif(os.environ.get("HELION_INTERPRET") == "1", reason=reason)
+
+
 def skipIfNormalMode(reason: str) -> Callable[[Callable], Callable]:
     """Skip test if running in normal mode (i.e. if HELION_INTERPRET=1 is not set)."""
     return unittest.skipIf(os.environ.get("HELION_INTERPRET") != "1", reason)
@@ -356,6 +366,19 @@ def skipIfTileIR(reason: str) -> Callable[[Callable], Callable]:
     """Skip test if running with tileir"""
     # Defers check to test execution time to avoid CUDA init during pytest-xdist collection.
     return skipIfFn(lambda: _get_backend() == "tileir", reason)
+
+
+def skipUnlessTritonBarriers(test: Callable) -> Callable:
+    """Skip a test of the barriers Triton code generation emits unless the
+    backend is Triton: TileIR does not legalize ``tl.debug_barrier``, and
+    ref-eager mode generates no code."""
+    for skip in (
+        skipUnlessBackends(["triton"]),
+        skipIfTileIR("TileIR does not legalize tl.debug_barrier"),
+        skipIfRefEager("ref-eager mode generates no code"),
+    ):
+        test = skip(test)
+    return test
 
 
 def skipIfMetal(reason: str) -> Callable[[Callable], Callable]:
@@ -995,6 +1018,13 @@ def skipIfA10G(reason: str) -> Callable[[Callable], Callable]:
     return skipIfFn(lambda: "A10G" in get_nvidia_gpu_model(), reason=reason)
 
 
+def skipUnlessGluon(
+    reason: str = f"the gluon backend needs {GLUON_REQUIREMENT}",
+) -> Callable[[Callable], Callable]:
+    """Skip unless the gluon backend can run here (``supports_gluon``)."""
+    return skipIfFn(lambda: not supports_gluon(), reason)
+
+
 def skipIfNotCUDA() -> Callable[[Callable], Callable]:
     """Skip test if not running on CUDA (NVIDIA GPU)."""
     # Defers check to test execution time to avoid CUDA init during pytest-xdist collection.
@@ -1474,12 +1504,18 @@ def import_example(name: str) -> types.ModuleType:
 
 
 def import_path(filename: Path) -> types.ModuleType:
+    # Compare the unresolved paths as well: a build can link the examples into
+    # a tree of symlinks (fbcode's pars), where the resolved file lies outside
+    # the resolved EXAMPLES_DIR.
+    for path, examples_dir in (
+        (Path(os.path.abspath(filename)), Path(os.path.abspath(EXAMPLES_DIR))),
+        (filename.resolve(), EXAMPLES_DIR.resolve()),
+    ):
+        if path.is_relative_to(examples_dir):
+            # One module per example everywhere; see ``import_example``.
+            relative = path.relative_to(examples_dir).with_suffix("")
+            return import_example(".".join(relative.parts))
     filename = filename.resolve()
-    examples_dir = EXAMPLES_DIR.resolve()
-    if filename.is_relative_to(examples_dir):
-        # One module per example everywhere; see ``import_example``.
-        relative = filename.relative_to(examples_dir).with_suffix("")
-        return import_example(".".join(relative.parts))
     module_name = f"{__name__}.{filename.stem}"
     if module_name not in sys.modules:
         # pyrefly: ignore [implicit-import]

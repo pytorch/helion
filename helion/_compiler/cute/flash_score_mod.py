@@ -1992,6 +1992,12 @@ class _HookEmitter:
             if staged
             else f"_flash_aux{meta.aux_index}.iterator"
         )
+        # The vector forms' base alignment (bytes, a trace-time int): the
+        # launcher passes each tensor with the alignment it proves from the
+        # argument (at most 16) and keys the compiled kernel on it, so a
+        # table starting inside its storage is read in narrower pieces.  The
+        # staged shared-memory copy is aligned.
+        align = "" if staged else f", align={pointer_base}.alignment"
         t = self.dtype_str(buffer.dtype)
         zero = f"{t}(False)" if buffer.dtype is torch.bool else f"{t}(0)"
         indices = cast("Sequence[object]", node.args[1])
@@ -2108,6 +2114,7 @@ class _HookEmitter:
             self._window_load(
                 name,
                 pointer,
+                align,
                 affine,
                 sign=meta.window_sign,
                 lanes=window,
@@ -2139,6 +2146,7 @@ class _HookEmitter:
                 name,
                 buffer=buffer,
                 pointer_base=pointer_base,
+                align=align,
                 offsets=offsets,
                 affine=affine,
                 lane_dim=lane_dim,
@@ -2182,12 +2190,13 @@ class _HookEmitter:
             scaled = lo if stride == 1 else f"({lo}) * cutlass.Int32({stride})"
             if vectors == 1:
                 load = (
-                    f"_cute_flex_load_vec({pointer} + {scaled}, {per_vector}, {vec_t})"
+                    f"_cute_flex_load_vec({pointer} + {scaled}, {per_vector}, "
+                    f"{vec_t}{align})"
                 )
             else:
                 load = (
                     f"_cute_flex_load_run({pointer} + {scaled}, {vectors}, "
-                    f"{per_vector}, {vec_t})"
+                    f"{per_vector}, {vec_t}{align})"
                 )
             if prefetch:
                 self.prefetch_slots(f"{run}_pf")
@@ -2225,6 +2234,7 @@ class _HookEmitter:
         *,
         buffer: FlexAuxBuffer,
         pointer_base: str,
+        align: str,
         offsets: Sequence[str],
         affine: _Affine,
         lane_dim: int,
@@ -2297,7 +2307,8 @@ class _HookEmitter:
             _PISSUE,
             f"_cute_flex_coop_issue({pointer_base} + {cb}, {scaled}, {slot}, "
             f"{meta.coop_step}, {request}, {units}, {per_vector}, {vec_t}, "
-            f"{stage} + {_PREFETCH_SLOT} * {slot_elems}, {lane}, {pitch_elems}{limit})",
+            f"{stage} + {_PREFETCH_SLOT} * {slot_elems}, {lane}, {pitch_elems}{limit}"
+            f"{align})",
         )
         run = f"{name}_run"
         vectors = self.chunk_cols * stride * itemsize // _VECTOR_BYTES
@@ -2312,6 +2323,7 @@ class _HookEmitter:
         self,
         name: str,
         pointer: str,
+        align: str,
         affine: _Affine,
         *,
         sign: int,
@@ -2359,7 +2371,7 @@ class _HookEmitter:
         last = f"cutlass.min({base} + cutlass.Int32({self.chunk_cols}), cutlass.Int32({size - lanes}))"
         window_load = (
             f"_cute_flex_load_window({pointer} + {base}, "
-            f"{pointer} + {last}, {count}, {lanes}, {vec_t})"
+            f"{pointer} + {last}, {count}, {lanes}, {vec_t}{align})"
         )
         # Prefetched: the window and its misalignment bits are computed for
         # the next chunk into the parity slots; the chunk block reads them.

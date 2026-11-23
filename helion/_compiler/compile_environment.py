@@ -171,6 +171,9 @@ class TensorDescriptorAlignmentGuard:
     memory_op_indices: set[int] = dataclasses.field(default_factory=set)
     atomic_op_indices: set[int] = dataclasses.field(default_factory=set)
     requires_zero_storage_offset: bool = False
+    # A prefetch's box form (``prefetch_indexing`` "tensor_descriptor") can
+    # read the input: it needs only an aligned base.
+    prefetch: bool = False
 
 
 @dataclasses.dataclass(frozen=True)
@@ -822,6 +825,13 @@ class CompileEnvironment:
             f"helion_runtime_arg_values_{id(self)}",
             default=None,
         )
+        # Set while ``generate_ast`` regenerates a kernel whose tagged peer
+        # transport failed a late precondition (``TaggedPeerFallback``):
+        # its cross-rank pushes keep keyed peer counters.
+        self.tagged_peer_disabled: bool = False
+        # Set while ``generate_ast`` regenerates a kernel whose gluon ring the
+        # lowering rejected (``RingFallback``): the rejection's reason.
+        self.ring_disabled: str | None = None
         self._dispatch_guards_enforced: contextvars.ContextVar[bool] = (
             contextvars.ContextVar(
                 f"helion_dispatch_guards_enforced_{id(self)}",
@@ -844,6 +854,10 @@ class CompileEnvironment:
         # its hints are the ones that trace chose, recorded here so that code
         # generation refuses them whether or not the FakeTensor is still alive.
         self._binds_outer_trace_inputs = False
+        # With ``Backend.orders_overlapping_inputs``: the fake storage id of
+        # each tensor argument that overlaps an earlier one at runtime, mapped
+        # to that one's, for the barrier walks (``_storage_ids``).
+        self.input_storage_aliases: dict[int, int] = {}
         # Host integer helpers such as cdiv/next_power_of_2 deliberately return
         # unbacked SymInts during tracing. Preserve the config expression beside
         # that symbol so a fixed block size derived from a user tunable can still
@@ -920,8 +934,10 @@ class CompileEnvironment:
         # guard fact so it keys every bound kernel.
         self.singleton_vars: set[sympy.Symbol] = set()
         # Input sizes code generation relied on being equal (a block store
-        # bounded by its tensor covering the tile's loop) only at this
-        # binding's values; like a guard, each keys the bound kernel.
+        # bounded by its tensor covering the tile's loop), or on having their
+        # values (a block size it reads as an integer, ``from_config_int``),
+        # only at this binding's values; like a guard, each keys the bound
+        # kernel.
         self.keyed_size_equalities: set[tuple[sympy.Symbol, sympy.Expr]] = set()
         self.specialized_strides: set[TensorPropertySource] = set()
         # Config-backed values created by hl.register_tunable().
@@ -957,12 +973,16 @@ class CompileEnvironment:
             Source, TensorDescriptorAlignmentGuard
         ] = {}
         self.bound_tensor_descriptor_alignments: dict[Source, bool] = {}
+        self.bound_prefetch_alignments: dict[Source, bool] = {}
         self.runtime_input_specializations: dict[str, RuntimeInputSpecialization] = {}
         # Original inputs/proxies are retained only until frontend compilation
         # completes. Identity witnesses never become serialized cache-key data.
         self._container_identities: dict[int, tuple[object, _ContainerIdentity]] = {}
         # Opaque Python container identities cannot be guarded by value metadata.
         self.requires_fresh_binding = False
+        # A host torch.ops call reached the torch-mode check
+        # (type_info._is_known_host_call): the cache key records its answer.
+        self.torch_mode_sensitive = False
         # Opaque helper calls can inspect a fragment's Python identity. Their
         # bindings retain explicit constexpr owners and need a bounded cache.
         self.has_opaque_fragment_inputs = False
@@ -1001,6 +1021,12 @@ class CompileEnvironment:
         # (e.g. compact_block != ordered_block); resident caching sizes its window to a
         # multiple of THIS so a single ordered tile read always fits the window.
         self.compact_worklist_ordered_block: int = 1
+        # Sublane tiling of the in-kernel worklist.
+        self.compact_worklist_sublane: int = 1
+        # Row bucket of plans with static inner loops (pallas_worklist_bucket_rows
+        # below the compact block), else 0: each work item runs the compact body
+        # on its live rows rounded up to a multiple of it.
+        self.compact_worklist_bucket_rows: int = 0
         # Offsets-tensor parameter names the generated _build_worklist takes, in
         # order (set when the builder is emitted); used by the launcher to map
         # them to host-call arg positions.
@@ -1026,6 +1052,11 @@ class CompileEnvironment:
         # hl.pdl_* ops in source order, run at kernel entry or exit.
         self.pdl_entry: list[str] = []
         self.pdl_exit: list[str] = []
+        # The root a trigger between top-level loops precedes (it also stays in
+        # ``pdl_exit``, where a kernel that cannot place it runs it).
+        self.pdl_trigger_root: int | None = None
+        # hl.prefetch_code(): the kernel prefetches its native code into L2 at entry.
+        self.prefetch_code: bool = False
 
     def warn_symbolic_fragment_domain(self) -> None:
         """Emit at most once per binding, subject to Python's warning filters."""
@@ -1291,7 +1322,7 @@ class CompileEnvironment:
         # specialization.
         alignment_source = (
             self.tensor_descriptor_alignment_source(fake_tensor)
-            if self.backend_name == "triton" and self.device.type in ("cuda", "xpu")
+            if self.backend.uses_triton_compiler and self.device.type in ("cuda", "xpu")
             else None
         )
         if alignment_source is not None:
@@ -1327,6 +1358,26 @@ class CompileEnvironment:
             and _is_supported_tensor_input_source(source)
             and source in self.tensor_descriptor_layout_guards
         )
+
+    def register_prefetch_alignment_guard(self, fake_tensor: torch.Tensor) -> None:
+        """Key the bound kernel on the base alignment of an input a prefetch
+        can read as TMA boxes: its tensor map needs a 16-byte aligned base on
+        every launch."""
+        source = self.tensor_descriptor_alignment_source(fake_tensor)
+        if source is not None:
+            self.tensor_descriptor_alignment_guards.setdefault(
+                source, TensorDescriptorAlignmentGuard()
+            ).prefetch = True
+
+    def prefetch_base_is_aligned(self, fake_tensor: torch.Tensor) -> bool | None:
+        """Whether every launch of the bound kernel gives a prefetch of
+        ``fake_tensor`` a 16-byte aligned base: the bound kernel's snapshot of
+        its owner input, keyed by ``register_prefetch_alignment_guard``; None
+        when no guard keys it (no tensor-form prefetch of it)."""
+        source = self.tensor_descriptor_alignment_source(fake_tensor)
+        if source is None:
+            return None
+        return self.bound_prefetch_alignments.get(source)
 
     def tensor_descriptor_base_is_aligned(self, fake_tensor: torch.Tensor) -> bool:
         """Whether a tensor descriptor can prove its runtime base is 16B aligned."""
@@ -1400,18 +1451,19 @@ class CompileEnvironment:
         """The input whose runtime base ``fake_tensor`` starts a fixed number of bytes past.
 
         A direct input is its own owner at offset zero.  A statically exact
-        view of the storage of exactly one zero-offset input starts
-        ``storage_offset * element_size`` bytes past that input's base, so
-        its base residue follows from the owner's bound residue and the
-        static offset.  Layout legality remains a separate proof.
+        view of the storage of exactly one owner input starts the difference
+        of their byte storage offsets past that input's base, so its base
+        residue follows from the owner's bound residue whenever that
+        difference is a constant (with dynamic shapes, both offsets may carry
+        the input's symbolic storage offset).  The input at the storage's
+        start owns the views when there is one.  Layout legality remains a
+        separate proof.
         """
         source = self.tensor_input_source(fake_tensor)
         if source is not None and _is_supported_tensor_input_source(source):
             return source, 0
-        storage_offset = fake_tensor.storage_offset()
         if (
-            not isinstance(storage_offset, int)
-            or not (
+            not (
                 self.settings.static_shapes
                 or self.tensor_layout_is_symbolically_exact(fake_tensor)
             )
@@ -1420,20 +1472,36 @@ class CompileEnvironment:
         ):
             return None
 
-        def is_zero_offset(tensor: torch.Tensor) -> bool:
+        def byte_offset(tensor: torch.Tensor) -> sympy.Expr:
+            offset = tensor.storage_offset()
+            expr = (
+                offset._sympy_()
+                if isinstance(offset, torch.SymInt)
+                else sympy.Integer(offset)
+            )
+            return sympy.Mul(expr, tensor.element_size())
+
+        def at_storage_start(tensor: torch.Tensor) -> bool:
             offset = tensor.storage_offset()
             return isinstance(offset, int) and offset == 0
 
-        owners = tuple(
-            (tensor, candidate)
+        owners = [
+            (candidate, delta, at_storage_start(tensor))
             for tensor, candidate in self._tensor_input_storage_owners(fake_tensor)
-            if is_zero_offset(tensor)
+            if (
+                # pyrefly: ignore [unsupported-operation]
+                delta := sympy.expand(byte_offset(fake_tensor) - byte_offset(tensor))
+            ).is_Integer
             and _is_supported_tensor_input_source(candidate)
             and id(tensor) not in self._ambiguous_tensor_input_source_ids
-        )
+        ]
+        # The input at the start of the storage owns its views when there is
+        # one; with symbolic offsets (dynamic shapes), the one at a constant
+        # distance does.
+        owners = [owner for owner in owners if owner[2]] or owners
         if len(owners) != 1:
             return None
-        return owners[0][1], storage_offset * fake_tensor.element_size()
+        return owners[0][0], int(owners[0][1])
 
     def tensor_descriptor_alignment_source(
         self, fake_tensor: torch.Tensor
@@ -1458,7 +1526,16 @@ class CompileEnvironment:
                 value, guard.requires_zero_storage_offset
             )
             for source, guard in self.tensor_descriptor_alignment_guards.items()
-            if (value := _replay_tensor_input_source(source, root_values)) is not None
+            if (guard.memory_op_indices or guard.atomic_op_indices)
+            and (value := _replay_tensor_input_source(source, root_values)) is not None
+        }
+        # A prefetch needs only the base aligned, whatever a descriptor guard
+        # sharing the input requires.
+        self.bound_prefetch_alignments = {
+            source: _concrete_tensor_base_is_aligned(value)
+            for source, guard in self.tensor_descriptor_alignment_guards.items()
+            if guard.prefetch
+            and (value := _replay_tensor_input_source(source, root_values)) is not None
         }
 
     def tensor_input_source(self, fake_tensor: torch.Tensor) -> Source | None:
@@ -1575,6 +1652,15 @@ class CompileEnvironment:
         ):
             return int(v)
         if isinstance(v, int) and self.settings.static_shapes:
+            return v
+        from .host_function import HostFunction
+
+        # A symmetric tensor's peer views share its static layout.
+        if (
+            isinstance(v, int)
+            and tensor.untyped_storage()
+            in HostFunction.current().compiler_state.static_peer_layouts
+        ):
             return v
         return None
 
@@ -4018,7 +4104,7 @@ class CompileEnvironment:
     @property
     def ptx_capability(self) -> tuple[int, int] | None:
         """Compute capability when the kernel lowers to NVIDIA PTX, else None."""
-        if self.backend_name != "triton" or is_hip():
+        if not self.backend.uses_triton_compiler or is_hip():
             return None
         return self.config_spec.target_device_capability
 
@@ -4408,6 +4494,64 @@ class BlockSizeInfo:
         assert val is not None
         return val
 
+    def from_config_int(self, config: Config, *, key: bool = True) -> int:
+        """The block's size under ``config`` as an integer, for code that
+        needs one at compile time (task counts, module constexprs).
+
+        A size the config fixes (a tunable, or a host helper over tunables
+        such as ``block_k = next_power_of_2(cdiv(k, split_k))``) takes the
+        value ``config_value`` gives it: its symbol is unbacked, with torch's
+        fallback hint, and ``int()`` would pin it to that hint for every
+        later config of the bound kernel.  Symbols ``hl.specialize`` keyed
+        count as their values, and so do module-global ints and closure
+        captures, as constants: the bound kernel does not rebind when one of
+        those changes.  A size over input sizes takes their values, and the
+        binding keys on each input size it reads; ``key=False``, for a
+        heuristic whose answer need not hold for every call, keys nothing.
+        Raises InvalidConfig for a size over a scalar argument, which the
+        bound kernel does not key (``hl.specialize`` it), and for a size with
+        no value at compile time (a config value beside a dynamic size)."""
+        env = CompileEnvironment.current()
+        size = self.from_config_assert(config)
+        if isinstance(size, int):
+            return size
+        # hl.specialize keys its symbols' values, so they are constants here.
+        expr = env.specialize_expr(typing.cast("sympy.Expr", size._sympy_()))
+        sources = env.shape_env.var_to_sources
+        unbacked = free_unbacked_symbols(expr)
+        if any(
+            _is_supported_tensor_input_source(source)
+            for symbol in unbacked
+            for source in sources.get(symbol, ())
+        ):
+            raise exc.InvalidConfig(
+                f"block {self.block_id}'s size {expr} reads a scalar argument, "
+                "whose value the bound kernel does not key; hl.specialize it"
+            )
+        # The other sourced unbacked symbols are module-global ints and
+        # closure captures, constants of the kernel's definition.
+        hints = shape_env_var_hints(env.shape_env)
+        expr = expr.xreplace(
+            {symbol: hints[symbol] for symbol in unbacked if sources.get(symbol)}
+        )
+        value = env.config_value(expr, config)
+        if value is not None:
+            return value
+        if free_unbacked_symbols(expr):
+            raise exc.InvalidConfig(
+                f"block {self.block_id}'s size {expr} has no value at compile "
+                "time, as when a config value meets a dynamic size; use "
+                "static_shapes=True or hl.specialize the size"
+            )
+        if key:
+            # Each input size the block reads keys the binding, through the
+            # symbol that stands for it where torch merged two sizes.
+            for symbol in env.shape_env.replace(expr).free_symbols:
+                symbol = typing.cast("sympy.Symbol", symbol)
+                value = shape_env_size_hint(env.shape_env, symbol)
+                env.keyed_size_equalities.add((symbol, sympy.Integer(value)))
+        return int(shape_env_size_hint(env.shape_env, expr))
+
     def is_flattened(self, config: Config) -> bool:
         spec = CompileEnvironment.current().config_spec
         return spec.flatten_loops.config_get(config.flatten_loops, self.block_id, False)
@@ -4476,10 +4620,21 @@ class LoopSpecBlockSizeSource(BlockSizeSource):
     def from_config(self, config: Config, block_size_info: BlockSizeInfo) -> int:
         env = CompileEnvironment.current()
         size = block_size_info.size
-        if isinstance(size, (int, torch.SymInt)) and env.known_equal(size, 1):
+        specs = env.config_spec.block_sizes
+        block_id = block_size_info.block_id
+        # A size-1 dimension tiles by 1 unless the backend's tiles may exceed
+        # it and its block may overshoot (a matmul output dimension).
+        if (
+            isinstance(size, (int, torch.SymInt))
+            and env.known_equal(size, 1)
+            and (
+                not env.backend.tiles_exceed_extents
+                or block_id not in specs.valid_block_ids()
+                or specs.block_id_lookup(block_id).max_size <= 1
+            )
+        ):
             return 1
-        index = env.config_spec.block_sizes.block_id_to_index(block_size_info.block_id)
-        return config.block_sizes[index]
+        return config.block_sizes[specs.block_id_to_index(block_id)]
 
 
 @dataclasses.dataclass

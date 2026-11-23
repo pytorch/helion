@@ -42,6 +42,7 @@ from ..runtime.config import _copy_config_structure
 from ..runtime.config_cache import ConfigCache
 from ..runtime.config_cache import ConfigSet
 from ..runtime.config_cache import _stored_config
+from ..runtime.settings import _env_get_bool
 from ..runtime.settings import _env_get_int
 from ..runtime.settings import _env_get_optional_int
 from ..runtime.structural_policy import StructuralConfig
@@ -50,6 +51,8 @@ from ..runtime.structural_policy import bound_structural_policy
 from ..runtime.structural_policy import require_same_structural_policy
 from .accuracy import effective_fp8_accuracy
 from .accuracy import keyable_accuracy_check
+from .benchmark_prelude import BenchmarkPrelude
+from .benchmark_prelude import active_prelude
 from .benchmark_provider import _COMPILER_SEED_TIMEOUT_RETRY_LIMIT
 from .benchmark_provider import BenchmarkProvider
 from .benchmark_provider import BenchmarkResult
@@ -62,11 +65,13 @@ from .benchmark_provider import _MultiShapeAutotuneArgs
 from .benchmark_provider import _searching_candidates
 from .benchmark_provider import _unset_fn
 from .benchmark_worker import BenchmarkWorkerUnkillable
+from .benchmarking import _BENCHMARK_CUDAGRAPH_ENV
 from .benchmarking import _FINAL_L2_FLUSH_ENV
 from .benchmarking import _L2_FLUSH_ENV
 from .benchmarking import _TARGET_REGIME_ENV
 from .benchmarking import MirroredBenchmarkTrace
 from .benchmarking import _mirrored_bench_call_layout
+from .benchmarking import _resolve_l2_flush_mode
 from .benchmarking import clear_jit_fast_path_caches
 from .benchmarking import do_bench
 from .benchmarking import do_bench_generic
@@ -82,6 +87,7 @@ from .compiler_refinement import compiler_refinement_candidates
 from .compiler_refinement import compiler_refinement_policy
 from .compiler_refinement import same_refinement_value
 from .effort_profile import get_effort_profile
+from .handoff import _active_handoff
 from .handoff import _HandoffStop
 from .handoff import _observe_handoff
 from .handoff import _refresh_handoff
@@ -89,6 +95,8 @@ from .input_banks import InputBankError
 from .input_banks import InputBankMemoryError
 from .logger import AutotuneLogEntry
 from .logger import AutotuningLogger
+from .logger import capture_output
+from .logger import log_candidate_compile_failure
 from .metrics import AutotuneMetrics
 from .metrics import KernelMetadata
 from .metrics import _run_post_autotune_hooks
@@ -99,6 +107,7 @@ from helion._dist_utils import is_master_rank
 from helion._dist_utils import sync_object
 
 if TYPE_CHECKING:
+    from collections.abc import Hashable
     from collections.abc import Iterable
     from collections.abc import Iterator
     from collections.abc import Mapping
@@ -488,6 +497,20 @@ class BaseSearch(BaseAutotuner):
 
     # Snapshot the timing policy for all queued measurements in this search.
     _input_bank_count: int = 1
+    # The prelude this search's candidates are timed behind, read when the
+    # search is made (``benchmark_prelude.timed_behind``); None: alone. Such
+    # a search takes every reading in its benchmark worker, as one that
+    # reads its candidates from the trace does.
+    _benchmark_prelude: BenchmarkPrelude | None = None
+    # The config the search timed the returned kernel under, where it returns
+    # a simpler config of that kernel (``_simplified_selected_config``): the
+    # trace's trial rows are keyed by this one.
+    _selected_config_measured_as: Config | None = None
+    # Whether the search returns a simpler config of its selection where it
+    # knows one. Off for a search whose config only seeds another search
+    # (the LLM stage of the LLM-seeded hybrid): the renders that find the
+    # simpler config would be spent on a config the next stage times again.
+    _simplifies_selected_config: bool = True
 
     def __init__(
         self,
@@ -508,6 +531,7 @@ class BaseSearch(BaseAutotuner):
         self.kernel = kernel
         self.settings: Settings = kernel.settings
         self._input_bank_count = self.settings.autotune_benchmark_input_banks
+        self._benchmark_prelude = active_prelude()
         if isinstance(self.settings.autotune_config_overrides, StructuralConfig):
             raise StructuralPolicyError(
                 "Policy-bearing autotune overrides must be supplied before "
@@ -722,6 +746,28 @@ class BaseSearch(BaseAutotuner):
         """
         if self._prepared:
             return
+        if active_prelude() is not self._benchmark_prelude or (
+            self._benchmark_prelude is not None
+            and self._benchmark_provider_cls is not LocalBenchmarkProvider
+        ):
+            # The provider made below reads the block it is made in, and
+            # only the built-in one runs a prelude: a search that took the
+            # prelude for its cache key and its re-timings must not time
+            # alone, nor the other way round.
+            raise exc.InvalidAPIUsage(
+                "a search runs inside the benchmark_prelude.timed_behind block "
+                "it was made in (or outside any, as it was made), on the "
+                "built-in benchmark provider"
+            )
+        if (
+            self.settings.megakernel_timeline is not None
+            and self.config_spec.offers_megakernel
+        ):
+            # Stamps change a megakernel's timings. (A cache hit returns before
+            # the search, so a tuned config is still used.)
+            raise exc.AutotuningDisallowedInEnvironment(
+                "while megakernel_timeline is set"
+            )
         self._prepared = True
         self._autotune_budget_start = time.perf_counter()
         self._budget_exceeded_logged = ()
@@ -1041,9 +1087,13 @@ class BaseSearch(BaseAutotuner):
         )
 
     def _apply_config_filter(
-        self, configs: list[Config]
+        self, configs: list[Config], *, record_trace: bool = True
     ) -> tuple[list[Config], list[int]]:
-        """Apply backend and user filters, returning configs and source indices."""
+        """Apply backend and user filters, returning configs and source indices.
+
+        A config the filters drop is a search candidate that was not tried,
+        and the trace gets a ``"filtered"`` trial row for it (not without
+        ``record_trace``)."""
         config_filter = self.settings.autotune_config_filter
         filtered: list[Config | None] = []
         for config in configs:
@@ -1054,6 +1104,7 @@ class BaseSearch(BaseAutotuner):
         for config, result in zip(configs, filtered, strict=True):
             if (
                 result is None
+                and record_trace
                 and self.log.trace_enabled
                 and (config_id := self.log.register_config(config)) is not None
             ):
@@ -1193,7 +1244,9 @@ class BaseSearch(BaseAutotuner):
         """
         with self.log.autotune_tracing(type(self).__name__):
             config = self._autotune_with_logging(skip_cache=skip_cache)
-            self.log.record_selected_config(config)
+            self.log.record_selected_config(
+                config, measured_as=self._selected_config_measured_as
+            )
             return config
 
     def _autotune_with_logging(self, *, skip_cache: bool) -> Config:
@@ -1256,6 +1309,7 @@ class BaseSearch(BaseAutotuner):
                             raise exc.NoConfigFound
                         if not self.args.defer_selected_log:
                             self.benchmark_provider.log_selected(best)
+                    best = self._simplified_selected_config(best)
                 except exc.NoConfigFound as error:
                     # Every candidate dropped by the worker's compile deadline
                     # is a deadline (or host) problem, not a kernel without a
@@ -1539,6 +1593,11 @@ class BaseSearch(BaseAutotuner):
         """
         raise NotImplementedError
 
+    def _simplified_selected_config(self, best: Config) -> Config:
+        """The config the search returns for its selection ``best``: the same
+        one, unless the search knows a simpler config of the same kernel."""
+        return best
+
     def _autotune_seed_configs(self) -> Sequence[Config]:
         """Return user-provided autotune seed configs normalized from settings."""
         return normalize_autotune_seed_configs(
@@ -1669,6 +1728,11 @@ class PopulationMember:
         flat_values (FlatConfig): The flat representation of the configuration values.
         config (Config): The full configuration object.
         compile_time (float | None): The compilation time for this configuration.
+        timer_readings_from (int): The index in ``perfs`` of the first reading
+            the member took itself. Above 0 for a config settled with a copy
+            of an earlier candidate's reading in a search that reads its
+            candidates from the trace: the copy and a later reading are not
+            two readings of one config (``pattern_search.rereading_spread``).
     """
 
     fn: Callable[..., object]
@@ -1688,6 +1752,7 @@ class PopulationMember:
         "unknown",
     ] = "unknown"
     compile_time: float | None = None
+    timer_readings_from: int = 0
 
     @property
     def perf(self) -> float:
@@ -1988,6 +2053,24 @@ class PopulationBasedSearch(BaseSearch):
     # for callers that stub them and read the phase from here.
     _benchmarking_initial_population: bool = False
 
+    # ``Backend.autotune_short_kernel_below_us`` of the kernel's backend, read
+    # at construction: a search whose initial population's best config reads
+    # below this many microseconds times every later candidate from the CUDA
+    # activity trace (``_settle_candidate_timer``). ``None``: the backend
+    # names no bound, and the event timer reads every kernel. An algorithm
+    # that reads no initial population (``benchmark_initial_population``; the
+    # LLM-guided search times every batch as it comes) never reaches that
+    # choice and keeps the event timer whatever the bound.
+    short_kernel_below_us: float | None = None
+    # Whether this search settled on the trace timer: its candidates and
+    # re-timings are then kernel durations from the trace, a pattern search
+    # counts steps within their repeatability as ties
+    # (``PatternSearch._reading_tolerance``), and the early stop of a
+    # differential-evolution search counts a move of the best within it as
+    # no improvement (``DifferentialEvolutionSearch._stop_tolerance``).
+    traces_candidates: bool = False
+    _candidate_timer_settled: bool = False
+
     def __init__(
         self,
         kernel: _AutotunableKernel,
@@ -2015,6 +2098,15 @@ class PopulationBasedSearch(BaseSearch):
         self._compiler_seed_members: list[PopulationMember] = []
         self._best_available_seed_configs: list[Config] = []
         self._selected_member: PopulationMember | None = None
+        # The member that holds each kernel this search has timed, by the
+        # ``id`` of its compiled function (the member keeps it alive), where
+        # the search drops source aliases. Filled where members are settled
+        # (``_settle_benchmarked_members``) and read through
+        # ``_kernel_holder``. A holder stays here after it has left the
+        # population and the final selection's history, so the search can
+        # always name the config that stands for a kernel it timed and the
+        # reading that kernel has now.
+        self._kernels: dict[int, PopulationMember] = {}
         self._terminal_refinement_members: (
             MutableMapping[Config, PopulationMember] | None
         ) = None
@@ -2026,6 +2118,9 @@ class PopulationBasedSearch(BaseSearch):
         )
         self._compiler_refinement_keys = (
             self.config_spec.search_surface.compiler_refinement_keys
+        )
+        self.short_kernel_below_us = (
+            self.config_spec.backend.autotune_short_kernel_below_us(self.config_spec)
         )
 
     def _prepare(self) -> None:
@@ -2188,7 +2283,8 @@ class PopulationBasedSearch(BaseSearch):
         ``kernel`` and ``call`` reserve a second column for each other
         without asking the worker whether it can trace (``_traceable``: the
         probe is a profiling session in the worker that times the search, so
-        only the selection itself asks).
+        only the selection itself and the timer choice of a search that
+        would move, ``_settle_candidate_timer``, ask).
         """
         policy = self.final_selection
         assert policy is not None
@@ -2278,6 +2374,322 @@ class PopulationBasedSearch(BaseSearch):
             f"{_FINAL_SELECTION_ROUNDS_ENV}=0 to run that verification instead)."
         )
 
+    def _collapses_source_aliases(self) -> bool:
+        """Whether this search drops source aliases: the backend asks for it
+        (``Backend.collapses_generated_source_aliases``) and the search's
+        provider reports aliases (``BenchmarkProvider.settles_source_aliases``).
+
+        Such a search counts an alias as the kernel it repeats.  The alias
+        has that kernel's reading (``_settle_benchmarked_members``), a
+        re-timing times the config that holds the kernel once and never the
+        alias (``_rebenchmark_kernels``), two configs of one kernel compare
+        equal (``compare``), and the alias takes no entry in the history the
+        final selection draws its shortlist from (a pinned one passes its
+        pin to the kernel's config), so the final selection times a kernel
+        under one config.  The pattern and LFBO searches also drop a
+        generation's new aliases from the population, so no search path and
+        no polish round moves to one, and start one path per kernel; with
+        the copies gone the LFBO polish descent crosses to new code that
+        reads level with its incumbent, within
+        ``LFBOPatternSearch.polish_patience``.  Aliases that stay members
+        until the final selection: those of an initial population, and of
+        the differential-evolution and LLM-guided searches.
+
+        Two providers of such a backend report no aliases: the one of a
+        multi-shape search, whose ``benchmark`` results are joint readings
+        of every shape, and a local one once torch.distributed is
+        initialized, where every rank keeps the same benchmark loop.  There
+        every config stays a candidate of its own and is timed as one, and
+        none of the above is switched on.
+        """
+        return bool(
+            self.config_spec.backend.collapses_generated_source_aliases(
+                self.config_spec
+            )
+            and self.benchmark_provider.settles_source_aliases()
+        )
+
+    def _is_source_alias(self, member: PopulationMember) -> bool:
+        """Whether ``member`` repeats the generated source of an earlier
+        candidate of this run, in a search that drops such aliases."""
+        return member.status == "deduplicated" and self._collapses_source_aliases()
+
+    def _without_source_aliases(
+        self,
+        members: list[PopulationMember],
+        benchmarked: Sequence[PopulationMember],
+    ) -> list[PopulationMember]:
+        """``members`` without the source aliases among the just benchmarked
+        ``benchmarked``.
+
+        An alias is an earlier candidate's code under another config: its
+        reading is that candidate's (``_settle_benchmarked_members``), so
+        keeping it would let a search path move to code it already has and
+        fill the final selection's shortlist with copies of one kernel.
+        Members benchmarked earlier stay, aliases included (an initial
+        population keeps its own; a verification still times their kernel
+        once: ``_rebenchmark_kernels``).
+        """
+        aliases = {
+            id(member) for member in benchmarked if self._is_source_alias(member)
+        }
+        if not aliases:
+            return members
+        return [member for member in members if id(member) not in aliases]
+
+    def _kernel_holder(
+        self, member: PopulationMember, among: Sequence[PopulationMember] = ()
+    ) -> PopulationMember:
+        """The member that holds ``member``'s kernel: the one place that
+        says which config stands for a kernel and has its reading.
+
+        Where the search drops source aliases, an alias is another config of
+        a kernel an earlier candidate produced and holds that candidate's
+        compiled function (the ``fn`` of a ``"deduplicated"`` result), so
+        several members can be configs of one kernel (an initial population
+        keeps its aliases).  One of them holds it: it is the member a
+        re-timing times, its reading is the kernel's, and its config is the
+        kernel's entry in the final selection.
+
+        It is the member with the function that is no alias: one among
+        ``among`` where the members at hand hold the kernel themselves (a
+        batch with the config that was timed, a list with the final
+        selection's entry of the kernel), else the member the search first
+        timed it under (``_kernels``), wherever that member is now.  Where
+        the search knows the kernel under no such config, the first alias of
+        it stands in.  A member that is no alias holds its own kernel, as
+        does every member of a search that keeps its aliases.
+        """
+        if not self._is_source_alias(member):
+            return member
+        stand_in = None
+        for other in among:
+            if other.fn is member.fn:
+                if not self._is_source_alias(other):
+                    return other
+                if stand_in is None:
+                    stand_in = other
+        return self._kernels.get(id(member.fn)) or stand_in or member
+
+    def _kernels_of(
+        self, members: Sequence[PopulationMember]
+    ) -> list[PopulationMember]:
+        """The members that hold the kernels of ``members``, each once, in
+        the order of ``members``."""
+        kernels = {
+            id(kernel): kernel
+            for kernel in (self._kernel_holder(member, members) for member in members)
+        }
+        return [*kernels.values()]
+
+    def _one_member_per_kernel(
+        self, members: Sequence[PopulationMember]
+    ) -> list[PopulationMember]:
+        """``members`` with one member for each kernel, in their order: the
+        one that holds the kernel where ``members`` has it, else the first
+        config of it.  (A search path that started from a second config of a
+        kernel would generate that kernel's neighborhood again, and a final
+        selection that held one would time the kernel twice.)"""
+        listed = {id(member) for member in members}
+        kept: dict[int, PopulationMember] = {}
+        for member in members:
+            holder = self._kernel_holder(member, members)
+            kept.setdefault(id(holder), holder if id(holder) in listed else member)
+        return [*kept.values()]
+
+    def _settle_benchmarked_members(
+        self,
+        members: Sequence[PopulationMember],
+        batch: Sequence[PopulationMember],
+    ) -> None:
+        """What every member takes once it has a result: ``members`` of the
+        just benchmarked ``batch``, or earlier members that a result of it
+        repaired.
+
+        A member with a kernel of its own holds that kernel from here on
+        (``_kernels``) and is recorded for the final selection
+        (``_record_benchmarked_member``).  A source alias is not recorded:
+        the history already holds its code under the config that holds the
+        kernel.  It takes the reading that kernel has now in place of the
+        provider's record of the kernel's first reading (every verification
+        has re-timed the kernels near the best since).
+
+        A pinned alias passes its pin to the kernel's config.  A pinned
+        config (a compiler seed, the default) reaches the final selection
+        whatever the search read for it; one that repeats an earlier
+        candidate's code takes no entry there, since the kernel would be
+        screened twice (``_refresh_benchmarked_members_after_rebenchmark``),
+        so the kernel keeps its place in the final selection whichever of its
+        configs was benchmarked first.
+        """
+        collapse = self._collapses_source_aliases()
+        aliases = []
+        for member in members:
+            if self._is_source_alias(member):
+                aliases.append(member)
+                continue
+            if collapse and member.perfs and math.isfinite(member.perf):
+                holder = self._kernels.get(id(member.fn))
+                # (an alias stands in until the search times the kernel
+                # under a config of its own)
+                if holder is None or self._is_source_alias(holder):
+                    self._kernels[id(member.fn)] = member
+            self._record_benchmarked_member(member)
+        for alias in aliases:
+            kernel = self._kernel_holder(alias, batch)
+            if kernel is alias:
+                self._kernels.setdefault(id(alias.fn), alias)
+                continue
+            if kernel.perfs:
+                alias.perfs[-1] = kernel.perf
+            if (
+                alias.config in self._pinned_finalist_configs
+                and not self._is_source_alias(kernel)
+            ):
+                self.pin_finalist_config(kernel.config)
+                self._record_best_member_for_config(
+                    self._pinned_finalist_members, kernel.config, kernel
+                )
+
+    def _simplified_selected_config(self, best: Config) -> Config:
+        """``best``, or a simpler config of the same kernel that the backend
+        proposes (``Backend.simplified_selected_config``; CuTe: without the
+        load-eviction policies the generated code does not depend on), where
+        the search drops source aliases.
+
+        Such a search times a kernel under the first config that produced
+        its source, so the selection can carry settings that leave no trace
+        in the code.  The backend proposes simpler configs and each is
+        rendered here in process; one is taken only when its generated
+        source hash is that of the kernel the search measured for its
+        selection (the compiled function of the member it holds for
+        ``best``), so the returned config is the measured kernel.
+
+        A proposal is a candidate config like any other, and the rules for
+        one are applied in one place each, to every proposal:
+
+        - It passes the user's ``autotune_config_filter`` and the backend's
+          viability check before it is compiled and stands for the selection
+          only as it was proposed.  The filters see a copy, and the config
+          they return has to be the proposal: a filter that rewrites its
+          argument, in place or into another config, has asked for other
+          code than the one that was proposed.
+        - Every render is compile work, which ``autotune_budget_seconds``
+          covers: none starts once the budget is used up, and the proposals
+          accepted until then stand.
+        - A render that fails is no kernel: that proposal is not taken.  The
+          failure is never raised and is handled as the search handles a
+          candidate that fails to compile: the compiler's output is
+          captured, and the failure is logged by its classification, not at
+          all under ``autotune_ignore_errors``.
+
+        The search returns only a config this step accepted: a backend that
+        answers with one it did not ask about gets the selection back.  Not
+        for a multi-shape search or in a process with torch.distributed
+        initialized (one render does not speak for every shape or rank;
+        neither drops aliases, ``_collapses_source_aliases``), not under
+        user overrides (their values stay as given), not inside
+        ``find_handoff``, whose session confirms the configs that were
+        measured, and not in a search whose config only seeds another
+        search (``_simplifies_selected_config``).
+        """
+        if (
+            not self._simplifies_selected_config
+            or not self._collapses_source_aliases()
+            or self.settings.autotune_config_overrides
+            or _active_handoff.get() is not None
+        ):
+            return best
+        backend = self.config_spec.backend
+        # The kernel that was measured: the member the search holds for its
+        # selection.
+        searched = self._selected_member
+        if searched is None or _config_key(searched.config) != _config_key(best):
+            searched = self._benchmarked_members.get(best)
+        if searched is None:
+            return best
+        selected = backend.generated_source_hash(searched.fn)
+        if selected is None:
+            return best
+        accepted: set[Hashable] = set()
+
+        def renders_selected_source(candidate: Config) -> bool:
+            if self._autotune_budget_exceeded():
+                return False
+            try:
+                with capture_output():
+                    compiled = self.kernel.compile_config(candidate, allow_print=False)
+            except Exception as error:
+                # As for a search candidate that fails to compile: no kernel.
+                log_candidate_compile_failure(
+                    self.log,
+                    self.settings,
+                    backend,
+                    error,
+                    f"Not taking {candidate} in place of the selected config: "
+                    "rendering it to compare the generated sources failed",
+                )
+                return False
+            return backend.generated_source_hash(compiled) == selected
+
+        def same_source(candidate: Config) -> bool:
+            # The filters get a copy, so what they return is compared with
+            # the proposal as the backend made it.
+            key = _config_key(candidate)
+            # (a proposal is no candidate of the search: one the filters
+            # drop takes no "filtered" trial row)
+            passing, _indices = self._apply_config_filter(
+                [_stored_config(candidate.config)], record_trace=False
+            )
+            if (
+                not passing
+                or _config_key(passing[0]) != key
+                or not renders_selected_source(candidate)
+            ):
+                return False
+            accepted.add(key)
+            return True
+
+        simplified = backend.simplified_selected_config(
+            self.config_spec, best, same_source
+        )
+        if _config_key(simplified) == _config_key(best):
+            return best
+        if _config_key(simplified) not in accepted:
+            self.log.warning(
+                "Keeping the selected config as it is: the backend proposed "
+                f"{simplified} in its place without asking whether it "
+                "renders to the selected code"
+            )
+            return best
+        self.log(
+            "Returning a simpler config with the selected config's generated "
+            f"code: {simplified} (selected as {best})"
+        )
+        # The run's records name the returned config and keep the ones the
+        # kernel was measured under. The trace's trial rows are keyed by the
+        # configs the search timed: the kernel's is the config that holds it
+        # (the selection itself can be a config that was never timed: the
+        # finishing phase ends on a minimized one). The final selection's
+        # rows are keyed by the configs it timed, the selection among them.
+        holder = self._kernels.get(id(searched.fn))
+        self._selected_config_measured_as = best if holder is None else holder.config
+        selection = self._autotune_metrics.final_selection
+        if selection is not None:
+            # (only a run with the record computes the ids)
+            measured_id = canonical_config_id(best)
+            if selection.get("selected_config_id") == measured_id:
+                selection["measured_config_id"] = measured_id
+                selection["selected_config_id"] = canonical_config_id(simplified)
+        # The returned config stays linked to the measured kernel.
+        self._selected_member = dataclasses.replace(
+            searched,
+            config=simplified,
+            flat_values=self.config_gen.flatten(simplified),
+            perfs=[*searched.perfs],
+        )
+        return simplified
+
     @property
     def best(self) -> PopulationMember:
         """
@@ -2350,7 +2762,10 @@ class PopulationBasedSearch(BaseSearch):
         ``random_fallback_target``) ``to_check`` is the initial population and
         is benchmarked through :meth:`benchmark_initial_population` (budget
         share, the drop of never-attempted configs, the summary line, the
-        random fallback when a target is given).
+        random fallback when a target is given, and the search's choice of
+        its candidates' timer, which can read the members again, drop the
+        ones the trace timer cannot read and leave one whose re-timing
+        failed with an infinite reading).
 
         Args:
             to_check: A list of flat configurations to benchmark.
@@ -2361,8 +2776,10 @@ class PopulationBasedSearch(BaseSearch):
             For an ordinary batch, one population member per entry in
             ``to_check`` in order.  For the initial population, the members
             that were attempted (never-attempted configs are dropped, random
-            fallback members appended), followed by the invalid entries; the
-            positions no longer correspond to ``to_check``.
+            fallback members appended, and configs that a search settling on
+            the trace timer could not read there are dropped), followed by
+            the invalid entries; the positions no longer correspond to
+            ``to_check``.
         """
         initial_population = (
             self._benchmarking_initial_population or random_fallback_target is not None
@@ -2701,7 +3118,12 @@ class PopulationBasedSearch(BaseSearch):
             member.fn = result.fn
             member.status = result.status
             member.compile_time = result.compile_time
-            self._record_benchmarked_member(member)
+            if self.traces_candidates and member.status == "deduplicated":
+                # Settled with a copy of its kernel's reading: no reading of
+                # this member's own, and no pair with the first one it takes
+                # (``rereading_spread``).
+                member.timer_readings_from = len(member.perfs)
+        self._settle_benchmarked_members(members, members)
         repairs = self.benchmark_provider.take_effective_source_repairs()
         if repairs:
             self._apply_effective_source_repairs(repairs, members)
@@ -2891,6 +3313,16 @@ class PopulationBasedSearch(BaseSearch):
         from ``members`` and ``visited`` rather than kept as failures, and
         the outcome is summarized in one log line whatever
         ``autotune_ignore_errors`` says.
+
+        Once the population has a reading, the search chooses the timer of
+        its candidates (``_settle_candidate_timer``). A search that settles
+        on the CUDA activity trace reads every member with a reading once
+        more there, which replaces the member's CUDA-event readings, and
+        drops from ``members`` and ``visited`` the configs whose kernel the
+        trace read in neither of two passes: a caller that kept its own
+        list of the population holds configs that are no longer in it. A
+        member whose re-timing there leaves a sticky device error reads
+        infinite afterwards, whichever timer the search goes on with.
         """
         self._benchmark_initial_batch(
             members,
@@ -2901,6 +3333,7 @@ class PopulationBasedSearch(BaseSearch):
         if random_fallback_target is None or any(
             math.isfinite(member.perf) for member in members
         ):
+            self._settle_candidate_timer(members, visited)
             return members
         compile_error = self.benchmark_provider.take_no_viable_config_error()
         seen = (
@@ -2936,14 +3369,425 @@ class PopulationBasedSearch(BaseSearch):
             visited=visited,
         )
         members.extend(fallback)
+        self._settle_candidate_timer(members, visited)
         return members
+
+    def _settle_candidate_timer(
+        self,
+        members: list[PopulationMember],
+        visited: MutableSet[Config] | None = None,
+    ) -> None:
+        """Choose, once per search, the timer that reads its candidates,
+        after the initial population ``members`` was benchmarked.
+
+        The initial population is timed with CUDA events, as every search's
+        was: one event pair around each flushed launch, which reads the
+        kernel plus the launch latency in the event clock's steps. When the
+        backend names a bound (``Backend.autotune_short_kernel_below_us``)
+        and the best of those readings is below it, the kernel's configs
+        differ by less than that timer resolves, and every reading from here
+        on (each candidate, each re-timing) is a kernel duration from the
+        CUDA activity trace in the benchmark worker instead
+        (``LocalBenchmarkProvider.trace_search_candidates``).
+
+        The choice is the search's, made once, rather than each reading's:
+        the trace leaves the launch latency out (4-5 us on a B200), so a
+        launch near the bound that picked its timer by its own reading read
+        on two scales from call to call (59 or 64 us for one config). A
+        search stays on one timer for all its candidates, short or long.
+        Where the backend names a bound, a search behind a benchmark prelude
+        (``benchmark_prelude``) moves to the trace whatever its best reading:
+        behind work that the device finishes before the host has queued the
+        candidate, an event-timed sample also holds the candidate's launch
+        on the host (``do_bench``), which the trace leaves out.
+        The initial population moves with it: every member with a reading
+        is read once more, on the trace (``_read_on_settled_timer``), before
+        anything compares it with a traced candidate, and a member the trace
+        cannot read leaves ``members`` and ``visited``. It keeps the events
+        when, without a prelude, the best reading is at or above the bound,
+        for a ratio objective, in another L2 regime than the per-call flush,
+        under ``HELION_BENCHMARK_CUDAGRAPH=1`` (``do_bench`` then times a
+        candidate's graph replay and traces nothing), when the population
+        was not timed in the benchmark worker, when that worker cannot time
+        the re-timings from the trace (``_kernel_timer_usable``: a
+        wall-clock worker, a process group, a build without CUDA activity,
+        another tool holding the activity API, and ``autotune_benchmark_fn``,
+        under which the re-timings run the user's function in this
+        process), inside ``find_handoff`` (its session ranks its shortlist
+        by, and returns, the readings of every batch it observed, the
+        initial population's among them), once ``autotune_budget_seconds``
+        is used up (the search then times no further candidate) or when it
+        runs out before the population has moved, and when the trace reads
+        none of the population's kernels (``_read_on_settled_timer``).
+
+        Whether the worker can trace is asked last, of a search that would
+        move otherwise. The first answer runs a profiling session in the
+        worker, as every traced window does, and a session leaves the
+        activity API attached to that process, which slows its later
+        launches (``kernel_timer_available``). A search that keeps the
+        events for another reason asks nothing of the worker and is timed
+        as before. One that keeps them after a session (a worker whose
+        trace does not work, a trace that reads none of the population, a
+        budget that runs out during the move) gets a new worker process
+        first (``LocalBenchmarkProvider.restart_profiled_benchmark_worker``):
+        its later candidates are then read by CUDA events as its initial
+        population was, not above it (by about 3 us on a B200).
+
+        Source aliases do not move the choice. An alias carries its
+        kernel's reading and none of its own, so the best reading is a timed
+        kernel's; and it runs no job, so whether the worker's process is up
+        after the last candidate is not asked
+        (``LocalBenchmarkProvider.benchmark_worker_started``): a population
+        whose last timed kernel ran into the timeout and whose remaining
+        candidates repeat earlier code settles as any other.
+        """
+        if (
+            self.short_kernel_below_us is None
+            or self._candidate_timer_settled
+            or not math.isfinite(self.best_perf_so_far)
+        ):
+            return
+        self._candidate_timer_settled = True
+        provider = self.benchmark_provider
+        if (
+            self.performance_unit != "ms"
+            # (behind a prelude a kernel of any length moves to the trace:
+            # an event-timed sample there can hold the launch's host time,
+            # ``do_bench``)
+            or not (
+                self._benchmark_prelude is not None
+                or self.best_perf_so_far * 1000.0 < self.short_kernel_below_us
+            )
+            or _resolve_l2_flush_mode(None) != "call"
+            # every candidate would be a graph replay, which is not traced
+            or _env_get_bool(_BENCHMARK_CUDAGRAPH_ENV, default=False)
+            or not isinstance(provider, LocalBenchmarkProvider)
+            or not provider.benchmark_worker_started()
+            # a handoff session ranks and returns every reading it observed
+            # (``HandoffPoint.measurements``), which none can read again
+            or _active_handoff.get() is not None
+            # reading the population again is timing work, which the budget
+            # covers; a search that is over it times no further candidate
+            or self._autotune_budget_exceeded()
+        ):
+            return
+        # Asked last: the first answer runs a profiling session in the
+        # worker (``worker_kernel_timer_available``), which leaves the
+        # activity API attached there, and a search that keeps the events
+        # for a reason above goes on timing in that worker. (Also False
+        # under ``autotune_benchmark_fn``: the re-timings would run the
+        # user's function in this process, on its own scale.)
+        if not self._kernel_timer_usable():
+            # the initial population was read before the probe's session,
+            # where it ran one
+            provider.restart_profiled_benchmark_worker()
+            return
+        best_us = self.best_perf_so_far * 1000.0
+        why = (
+            f"under {self.short_kernel_below_us:g} us"
+            if best_us < self.short_kernel_below_us
+            else "behind a benchmark prelude"
+        )
+        provider.trace_search_candidates = True
+        self.traces_candidates = True
+        # reading the population again stops when the budget runs out
+        with provider.isolated_timings_within_budget():
+            moved = self._read_on_settled_timer(members, visited)
+        if not moved:
+            provider.trace_search_candidates = False
+            self.traces_candidates = False
+            # the event readings the search keeps were taken before the
+            # sessions of the probe and of the windows just tried
+            provider.restart_profiled_benchmark_worker()
+            reason = (
+                "the autotune budget ran out before the CUDA activity trace "
+                "had read every initial config"
+                if self._autotune_budget_exceeded()
+                else "the CUDA activity trace read none of the initial configs"
+            )
+            self.log(
+                f"The best initial config reads {best_us:.1f} us ({why}), but "
+                f"{reason}: timing this search's candidates with CUDA events"
+            )
+            return
+        self.log(
+            f"The best initial config reads {best_us:.1f} us ({why}): timing "
+            "this search's candidates by their kernels' durations in the CUDA "
+            "activity trace"
+        )
+
+    def _read_on_settled_timer(
+        self,
+        members: list[PopulationMember],
+        visited: MutableSet[Config] | None = None,
+    ) -> bool:
+        """Move the initial population ``members`` to the trace timer the
+        search is settling on; ``False`` when the trace read none of them
+        (or none of them has a reading to move) and when the autotune budget
+        ran out before the move was through, so the search stays on the
+        events.
+
+        Their readings so far are CUDA-event readings, 4-5 us above what the
+        trace reads for the same kernel on a B200. A search re-times only
+        the members within its re-timing threshold of the best
+        (``should_rebenchmark``), and none at an effort whose threshold is
+        below 1, so without this the other members kept their event
+        readings: a path started from one compared it with traced
+        neighbours, a search without a verification pass (differential
+        evolution) compared event-read parents with traced children, and a
+        surrogate was fit on labels of both scales. Every member with a
+        finite reading is read here, whatever the threshold, one timing per
+        kernel (``_rebenchmark_kernels``), a population with a single such
+        kernel included (``allow_single``), and a member whose reading fails
+        (a timeout, a window whose trace cannot be read:
+        ``benchmarking.KernelTraceUnreadable``) is read a second time.
+
+        Under ``autotune_budget_seconds`` the two passes are timing work
+        the budget covers, as it covers the candidates'. The caller runs
+        them where the provider asks the budget hook before each kernel
+        (``LocalBenchmarkProvider.isolated_timings_within_budget``), and
+        the second pass is not started once the budget is used up: a
+        failed reading can cost a whole benchmark timeout, and so would
+        its repeat. When the budget is used up and a member is still
+        without a trace reading, the move is undone (``_hold_readings``):
+        every member holds its event readings again, the best reading and
+        the final selection's history are as they were, and the search
+        stays on the events like one whose budget ran out before the move.
+        Moving with the members read so far would keep whichever configs
+        came first in the population and drop the others, the fastest by
+        events possibly among them, and a search over its budget times no
+        candidate to make up for them. A search without a budget reads
+        every kernel as described above.
+
+        A re-timing that leaves a sticky device error in the worker is a
+        failure of the kernel, not a reading of the trace. Its member reads
+        infinite from there on (``_resolve_isolated_rebenchmark_results``),
+        as after a verification that failed, on whichever timer the search
+        goes on with: it is not read a second time, it is no reading that
+        a population moves with, and it stays where the search keeps the
+        events, also in a move that is undone (``_hold_readings``).
+
+        Where no member has a trace reading after both passes, the trace
+        does not read this kernel's windows (calls that launch no kernel,
+        say), every later candidate would fail the same way, and the search
+        keeps the events and every reading it has. Otherwise this is the one
+        place where the search changes timers, and nothing keeps an event
+        reading past it (``_move_search_state_to_trace``): a member the
+        trace read holds trace readings only, one whose re-timing failed
+        holds that failure alone, and one it did not read has no reading in
+        this search and leaves the population.
+        """
+        read = [
+            member for member in members if member.perfs and math.isfinite(member.perf)
+        ]
+        kernels = {id(member): self._kernel_holder(member, read) for member in read}
+        events = {
+            id(member): len(member.perfs) for member in (*read, *kernels.values())
+        }
+        # (a re-timing also gives the population's aliases their kernels'
+        # readings: ``_rebenchmark_kernels``)
+        undo = self._hold_readings((*read, *kernels.values(), *self.population))
+
+        def unread() -> list[PopulationMember]:
+            # Asked of the kernel: a source alias is read when the member
+            # that holds its kernel has a new reading, which the alias then
+            # takes (its own list does not say: it gains nothing where that
+            # reading equals the one it holds).
+            return [
+                member
+                for member in read
+                if len(kernels[id(member)].perfs) == events[id(kernels[id(member)])]
+            ]
+
+        def traced() -> bool:
+            # Whether the trace read a kernel: it has a new reading, and
+            # that is a duration (a re-timing that failed leaves an infinite
+            # one).
+            return any(
+                len(kernel.perfs) > events[id(kernel)] and math.isfinite(kernel.perf)
+                for kernel in kernels.values()
+            )
+
+        self._rebenchmark_kernels(
+            read, desc="Reading the initial population on the trace", allow_single=True
+        )
+        if unread() and not self._autotune_budget_exceeded():
+            self._rebenchmark_kernels(
+                unread(),
+                desc="Reading the initial population on the trace again",
+                allow_single=True,
+            )
+        if not traced():
+            return False
+        if unread() and self._autotune_budget_exceeded():
+            undo()
+            return False
+        self._move_search_state_to_trace(
+            read, unread(), kernels, events, members, visited
+        )
+        return True
+
+    def _reading_registries(self) -> list[MutableMapping[Config, PopulationMember]]:
+        """The mappings that hold snapshots of members with their readings:
+        the final selection's history, its pins and, where the search has
+        one, the refinement registry."""
+        registries = [self._benchmarked_members, self._pinned_finalist_members]
+        terminal_members = getattr(self, "_terminal_refinement_members", None)
+        if terminal_members is not None:
+            registries.append(terminal_members)
+        return registries
+
+    def _hold_readings(self, members: Iterable[PopulationMember]) -> Callable[[], None]:
+        """A function that puts the search's readings back as they are now,
+        after re-timings of ``members``: each member's readings, the best
+        reading, and the entries of the final selection's history, its pins
+        and the refinement registry (``_reading_registries``; an entry is a
+        snapshot that a re-timing replaces and never edits, so the items of
+        the mappings are all there is to keep).
+
+        A failure is not taken back. A member that one of those re-timings
+        left at an infinite reading (its kernel left a sticky device error
+        in the worker: ``_resolve_isolated_rebenchmark_results``) holds that
+        reading again after the ones it had, and the mappings are refreshed
+        for it as the re-timing refreshed them: what a failed re-timing
+        leaves in a search that never changed timers. With its earlier
+        readings alone the config would rank, and could be returned, as if
+        it had not failed."""
+        counts = [
+            (member, len(member.perfs))
+            for member in {id(member): member for member in members}.values()
+        ]
+        best = self.best_perf_so_far
+        entries = [
+            (registry, [*registry.items()]) for registry in self._reading_registries()
+        ]
+
+        def undo() -> None:
+            failed = [
+                member
+                for member, count in counts
+                if len(member.perfs) > count and not math.isfinite(member.perf)
+            ]
+            for member, count in counts:
+                del member.perfs[count:]
+            self.best_perf_so_far = best
+            for registry, items in entries:
+                registry.clear()
+                registry.update(items)
+            for member in failed:
+                member.perfs.append(inf)
+            self._refresh_benchmarked_members_after_rebenchmark(failed)
+
+        return undo
+
+    def _move_search_state_to_trace(
+        self,
+        read: Sequence[PopulationMember],
+        unread: Sequence[PopulationMember],
+        kernels: Mapping[int, PopulationMember],
+        events: Mapping[int, int],
+        members: list[PopulationMember],
+        visited: MutableSet[Config] | None,
+    ) -> None:
+        """Leave no CUDA-event reading in the search's state, after the
+        members ``read`` of the initial population ``members`` were read on
+        the trace (``_read_on_settled_timer``; ``kernels[id(member)]`` is
+        the member that holds a member's kernel, ``events[id(member)]`` the
+        number of event readings a member holds, ``unread`` the members
+        whose kernel the trace read in neither pass).
+
+        - A member the trace read keeps its trace readings only, so
+          whatever ranks it from here on (a comparison, the final
+          selection's low-water reading, the spread of re-readings) sees
+          one timer.  A source alias of a kernel the trace read holds that
+          kernel's trace reading, whatever it held before.  A member whose
+          re-timing failed is among them with that failure, an infinite
+          reading, alone: it stays a member, ranks last and takes no entry
+          in the history.
+        - An unread member has no reading in this search. With its event
+          reading, 4-5 us above the readings it would be compared with, a
+          kernel that is in fact the fastest would lose to slower traced
+          ones, and nothing would read it again (it is outside every
+          re-timing threshold). It leaves ``members`` and ``visited``, as a
+          config the initial population never attempted does
+          (``_benchmark_initial_batch``): it starts no path, is no parent,
+          no surrogate row and no finalist, and the search may come back to
+          its config, which is then timed on the trace like any candidate.
+        - The final selection's history, its pins and the refinement
+          registry were filled, and the history was trimmed to its top k,
+          by event readings: the entries of every member that had one go,
+          and the members the trace read are recorded again, so the trim
+          ranks them by their trace readings.
+        - ``best_perf_so_far``, which the re-timing threshold is taken
+          from, is the best trace reading.
+        - The provider's record of each kernel's reading, which settles
+          later configs with the same generated source, takes the trace
+          reading (``LocalBenchmarkProvider.refresh_source_reading``) or,
+          for an unread kernel, is dropped (``forget_source_reading``), so
+          the next config with that code is timed.
+        - What the algorithm keeps besides its members goes
+          (``_discard_event_readings``).
+        """
+        unread_ids = {id(member) for member in unread}
+        traced = [member for member in read if id(member) not in unread_ids]
+        for member in traced:
+            kernel = kernels[id(member)]
+            if kernel is member:
+                del member.perfs[: events[id(member)]]
+                member.timer_readings_from = 0
+            else:
+                # a copy of its kernel's trace reading, none of its own
+                member.perfs[:] = [kernel.perf]
+                member.timer_readings_from = 1
+        members[:] = [member for member in members if id(member) not in unread_ids]
+        registries = self._reading_registries()
+        for member in read:
+            for registry in registries:
+                registry.pop(member.config, None)
+        for member in unread:
+            if visited is not None:
+                visited.discard(member.config)
+            if self._kernels.get(id(member.fn)) is member:
+                del self._kernels[id(member.fn)]
+        for member in traced:
+            if not self._is_source_alias(member):
+                self._record_benchmarked_member(member)
+        self.best_perf_so_far = min((member.perf for member in traced), default=inf)
+        provider = self.benchmark_provider
+        if isinstance(provider, LocalBenchmarkProvider):
+            for member in traced:
+                provider.refresh_source_reading(member.fn, member.perf)
+            for member in unread:
+                provider.forget_source_reading(member.fn)
+        if unread:
+            self.log.warning(
+                f"The CUDA activity trace read {len(unread)} of the initial "
+                "configs in neither of two passes: this search reads its "
+                "candidates from the trace, so they leave its initial "
+                f"population (the first: {unread[0].config})"
+            )
+        self._discard_event_readings()
+
+    def _discard_event_readings(self) -> None:
+        """Called once, when the search has moved its members' readings to
+        the trace timer (``_read_on_settled_timer``): an algorithm drops the
+        readings it holds outside its members, which were taken with CUDA
+        events and cannot be read again."""
 
     def _apply_effective_source_repairs(
         self,
         repairs: MutableMapping[Config, BenchmarkResult],
         current_members: Sequence[PopulationMember],
     ) -> None:
-        """Repair failed members after a later config proves the same source."""
+        """Repair failed members after a later config proves the same source.
+
+        A repaired member is that config's kernel under its own config: a
+        source alias (``"deduplicated"``).  Where the search drops aliases
+        it takes no entry in the final selection's history, which holds the
+        kernel under the config that was timed, and a pinned one passes its
+        pin to that config, as an alias of the batch does
+        (``_settle_benchmarked_members``).
+        """
         candidates = [
             *current_members,
             *self.population,
@@ -2951,8 +3795,10 @@ class PopulationBasedSearch(BaseSearch):
             *self._benchmarked_members.values(),
             *self._pinned_finalist_members.values(),
             *(getattr(self, "_terminal_refinement_members", None) or {}).values(),
+            *self._members_kept_by_algorithm(),
         ]
         seen: set[int] = set()
+        repaired: list[PopulationMember] = []
         for member in candidates:
             if id(member) in seen:
                 continue
@@ -2970,7 +3816,14 @@ class PopulationBasedSearch(BaseSearch):
             member.fn = repair.fn
             member.status = repair.status
             member.compile_time = None
-            self._record_benchmarked_member(member)
+            repaired.append(member)
+        self._settle_benchmarked_members(repaired, current_members)
+
+    def _members_kept_by_algorithm(self) -> Iterable[PopulationMember]:
+        """Members an algorithm still reads after they left the population,
+        which a source repair therefore reaches as well
+        (``_apply_effective_source_repairs``).  None by default."""
+        return ()
 
     def _record_benchmarked_member(self, member: PopulationMember) -> None:
         """Keep successful benchmarked members available for final verification."""
@@ -3117,7 +3970,16 @@ class PopulationBasedSearch(BaseSearch):
                 # refinement re-measures the config instead of resurrecting a
                 # quarantined result.
                 terminal_members.pop(config, None)
-            if config in pinned_configs and member is not None:
+            if (
+                config in pinned_configs
+                and member is not None
+                # A pinned config that is a source alias is its kernel under
+                # another config, and the pin is with the config that holds
+                # the kernel (``_settle_benchmarked_members``): an alias
+                # that is timed itself (it stands in for a kernel the search
+                # timed under no config of its own) takes no entry here.
+                and not self._is_source_alias(member)
+            ):
                 self._record_best_member_for_config(
                     pinned_members,
                     config,
@@ -3226,9 +4088,7 @@ class PopulationBasedSearch(BaseSearch):
         )
 
     def _final_rebenchmark_use_isolated(self) -> bool:
-        from ..runtime.settings import _env_get_bool
-
-        if self._input_bank_count > 1:
+        if self._input_bank_count > 1 or self._benchmark_prelude is not None:
             return True
 
         # The backend decides whether finalists are timed ISOLATED (each in
@@ -3439,6 +4299,28 @@ class PopulationBasedSearch(BaseSearch):
             *getattr(self, "population", ()),
             best,
         ]
+        # One entry per kernel. A source alias that is still a member (an
+        # initial population keeps its own, as do the populations of the
+        # differential-evolution and LLM-guided searches) is a kernel that
+        # the config holding it stands for. The search's best stands for its
+        # kernel under its own config: every other config of that kernel (a
+        # member with the same compiled function: the config that holds the
+        # kernel where the best is an alias, or the config a finishing phase
+        # started from when it reset settings the code does not depend on)
+        # stands behind it, so a win returns the config the search ended on.
+        # A pin among them passes to the best's config: the kernel keeps the
+        # rules of a pinned finalist under whichever config stands for it.
+        behind = [
+            member
+            for member in candidates
+            if member is not best and member.fn is best.fn
+        ]
+        if behind and self._collapses_source_aliases():
+            if any(member.config in self._pinned_finalist_configs for member in behind):
+                self.pin_finalist_config(best.config)
+            candidates = [member for member in candidates if member.fn is not best.fn]
+            candidates.append(best)
+        candidates = self._one_member_per_kernel(candidates)
         for member in candidates:
             if not member.perfs or not math.isfinite(
                 self._finalist_history_perf(member)
@@ -3792,6 +4674,11 @@ class PopulationBasedSearch(BaseSearch):
         if self._input_bank_count > 1:
             raise exc.InvalidAPIUsage(
                 "rotating input banks require isolated final selection"
+            )
+        if self._benchmark_prelude is not None:
+            raise exc.InvalidAPIUsage(
+                "a benchmark prelude requires the final selection's windows in "
+                "the benchmark worker"
             )
         args: _PrivateBenchmarkArgs | Sequence[object] | None = None
         if private_copies and not dist.is_initialized():
@@ -4604,6 +5491,13 @@ class PopulationBasedSearch(BaseSearch):
             "policy": dataclasses.asdict(policy),
             "family_keys": list(family_keys),
             "input_banks": self._input_bank_count,
+            # (only behind a prelude: the earlier kernel calls every window
+            # ran between its flush and its timed call)
+            **(
+                {}
+                if self._benchmark_prelude is None
+                else {"prelude_steps": len(self._benchmark_prelude.steps)}
+            ),
             "l2_flush_mode": regime_label,
             "second_l2_flush_mode": second_regime,
             "target_regime": final_selection_target_regime(),
@@ -4629,8 +5523,18 @@ class PopulationBasedSearch(BaseSearch):
         Returns:
             -1 if a is better than b, 1 if b is better than a, 0 if they are equal.
         """
+        if self._kernel_holder(a, (a, b)) is self._kernel_holder(b, (a, b)):
+            # Two configs of one kernel are equal, whatever each has read:
+            # there is nothing to time, and a child that repeats its
+            # parent's code does not replace it.
+            return 0
+        # A config reads what its kernel reads now. A candidate that was
+        # settled before an earlier comparison re-timed its kernel (a batch
+        # that is benchmarked first and compared afterwards) is not a member
+        # of the population yet, so that re-timing did not reach it.
+        self._follow_kernel_readings((a, b), (a, b))
         if self.should_rebenchmark(a) and self.should_rebenchmark(b):
-            self.rebenchmark([a, b])
+            self._rebenchmark_kernels([a, b])
         return (a.perf > b.perf) - (a.perf < b.perf)
 
     def should_rebenchmark(self, member: PopulationMember) -> bool:
@@ -4658,6 +5562,7 @@ class PopulationBasedSearch(BaseSearch):
         confirm_suspicious: bool = True,
         use_interleaved: bool = True,
         candidate_private_args: bool = False,
+        allow_single: bool = False,
     ) -> None:
         """
         Re-benchmark a list of population members to avoid outliers.
@@ -4667,9 +5572,25 @@ class PopulationBasedSearch(BaseSearch):
             desc: Description for the progress bar.
             candidate_private_args: Use a fresh worker process per candidate;
                 when unavailable, keep argument storage private in-process.
+            allow_single: Re-time a single member too. A re-timing compares
+                members, so one member alone needs none (the default); a
+                pass that moves the readings to another timer
+                (``_read_on_settled_timer``) reads every member.
         """
-        if len(members) < 2:
+        if len(members) < (1 if allow_single else 2):
             return
+        # A search that reads its candidates from the trace re-times in the
+        # benchmark worker whatever the caller asks: the in-process timers
+        # read with CUDA events, on another scale than the members' readings
+        # (the single-pass final verification asks for them under
+        # ``HELION_AUTOTUNE_FINAL_REBENCHMARK_ISOLATED=0``).
+        # So does a search behind a prelude: the in-process timers would
+        # time its members alone.
+        use_isolated = (
+            use_isolated
+            or self.traces_candidates
+            or self._benchmark_prelude is not None
+        )
         if isinstance(self.benchmark_provider, MultiShapeBenchmarkProvider):
             provider_timings = self.benchmark_provider.rebenchmark(
                 [member.config for member in members],
@@ -4721,6 +5642,25 @@ class PopulationBasedSearch(BaseSearch):
                     new_timings,
                     failure_statuses=failure_statuses,
                     trace_results=isolated_results,
+                )
+                return
+            if self.traces_candidates:
+                # The search reads from the trace in the benchmark worker,
+                # which cannot time these members now: the in-process timers
+                # read with CUDA events, on another scale than the readings
+                # the members have, so they keep those.
+                self.log.warning(
+                    f"{desc}: the benchmark worker cannot time the "
+                    f"{len(members)} configs; this search reads its candidates "
+                    "from the CUDA activity trace, so they keep their readings"
+                )
+                return
+            if self._benchmark_prelude is not None:
+                # Likewise behind a prelude, which only the worker runs.
+                self.log.warning(
+                    f"{desc}: the benchmark worker cannot time the "
+                    f"{len(members)} configs; this search times its candidates "
+                    "behind a prelude, so they keep their readings"
                 )
                 return
             if candidate_private_args and dist.is_initialized():
@@ -4931,7 +5871,12 @@ class PopulationBasedSearch(BaseSearch):
             warmup=1,
             rep=rep,
             desc=desc,
-            fresh_process=candidate_private_args,
+            # Behind a prelude neither is needed: every timed call follows
+            # a flush and the prelude's work, which hands each member its
+            # arguments anew, and every window first displaces the L2 lines
+            # earlier ones pinned (``do_bench``), so no member reads what an
+            # earlier one left.
+            fresh_process=candidate_private_args and self._benchmark_prelude is None,
         )
 
     def mirrored_rebenchmark(
@@ -4951,6 +5896,11 @@ class PopulationBasedSearch(BaseSearch):
         if self.settings.autotune_benchmark_fn is not None:
             raise exc.AutotuneError(
                 "mirrored terminal refinement requires the default benchmark function"
+            )
+        if self._benchmark_prelude is not None:
+            # (these sweeps run in this process, which has no prelude)
+            raise exc.AutotuneError(
+                "mirrored terminal refinement cannot time behind a benchmark prelude"
             )
 
         repeat_reference_perf_ms = self._repeat_reference_perf(members)
@@ -5368,13 +6318,65 @@ class PopulationBasedSearch(BaseSearch):
         """
         Re-benchmark the entire population to avoid outliers.
 
+        Where the search drops source aliases, each kernel is re-timed once
+        however many of ``members`` are configs of it
+        (``_rebenchmark_kernels``).
+
         Args:
             members: The list of population members to rebenchmark.
             desc: Description for the progress bar.
         """
         if members is None:
             members = self.population
-        self.rebenchmark([p for p in members if self.should_rebenchmark(p)], desc=desc)
+        self._rebenchmark_kernels(
+            [p for p in members if self.should_rebenchmark(p)], desc=desc
+        )
+
+    def _rebenchmark_kernels(
+        self,
+        members: Sequence[PopulationMember],
+        *,
+        desc: str = "Rebenchmarking",
+        allow_single: bool = False,
+    ) -> None:
+        """Re-benchmark ``members`` with one timing per kernel, and keep one
+        reading per kernel (``rebenchmark`` says what ``allow_single`` is
+        for).
+
+        Every re-timing of a search phase comes through here.  A source
+        alias is its kernel under another config: the member that holds the
+        kernel is timed for it (``_kernel_holder``; its config is the
+        kernel's entry in the final selection's history, and only a member
+        that is timed refreshes its entry there), once however many of
+        ``members`` are configs of it.  A list that is one kernel is not
+        timed at all: a re-timing compares kernels, and ``rebenchmark``
+        leaves a single member as it is.  Afterwards every other config of a
+        kernel, in ``members`` and in the population, has the reading its
+        holder has: an alias that a re-timing leaves out (a polish round
+        verifies its candidates, ``compare`` a pair) does not keep a reading
+        its kernel no longer has.  In a search that keeps its aliases every
+        member is timed, as before.
+        """
+        if not self._collapses_source_aliases():
+            self.rebenchmark([*members], desc=desc, allow_single=allow_single)
+            return
+        self.rebenchmark(
+            self._kernels_of(members), desc=desc, allow_single=allow_single
+        )
+        self._follow_kernel_readings((*members, *self.population), members)
+
+    def _follow_kernel_readings(
+        self,
+        members: Iterable[PopulationMember],
+        among: Sequence[PopulationMember],
+    ) -> None:
+        """Give each of ``members`` that is a config of another member's
+        kernel the reading that kernel has now (``_kernel_holder``, with
+        ``among`` at hand), as a new reading of its own."""
+        for member in {id(m): m for m in members}.values():
+            kernel = self._kernel_holder(member, among)
+            if kernel is not member and kernel.perfs and member.perf != kernel.perf:
+                member.perfs.append(kernel.perf)
 
     def statistics(self) -> str:
         """
@@ -5442,8 +6444,14 @@ class PopulationBasedSearch(BaseSearch):
                     unbenchmarked, desc=f"Finishing round {round_num}"
                 )
 
-            # Rebenchmark all candidates (including current) for fair comparison
-            self.rebenchmark(candidates, desc=f"Finishing round {round_num}: verifying")
+            # Rebenchmark all candidates (including current) for fair
+            # comparison. A reset the generated code does not depend on is
+            # the incumbent's kernel again: it takes the incumbent's reading
+            # instead of a timing of its own, so it counts as a reset that
+            # kept the performance.
+            self._rebenchmark_kernels(
+                candidates, desc=f"Finishing round {round_num}: verifying"
+            )
 
             # Log performance of each candidate at debug level
             current_perf = current.perf
@@ -5482,7 +6490,7 @@ class PopulationBasedSearch(BaseSearch):
                         [combined],
                         desc=f"Finishing round {round_num}: combined",
                     )
-                    self.rebenchmark(
+                    self._rebenchmark_kernels(
                         [current, combined],
                         desc=f"Finishing round {round_num}: verifying combined",
                     )
@@ -5519,6 +6527,7 @@ class PopulationBasedSearch(BaseSearch):
             config=minimal_config,
             status=current.status,
             compile_time=current.compile_time,
+            timer_readings_from=current.timer_readings_from,
         )
         self._selected_member = current
         self.log(f"Finishing phase complete: final config={current.config}")
@@ -5770,6 +6779,14 @@ class PopulationBasedSearch(BaseSearch):
                         trial["outcome"] = "unkillable_worker"
                         raise
                     trial["outcome"] = member.status
+                    if self._is_source_alias(member):
+                        # Code an earlier candidate already produced: no
+                        # trial of a new kernel, and its reading is that
+                        # candidate's, an earlier sample that must not
+                        # displace the incumbent.
+                        new_trials -= 1
+                        transcript["new_trials"] = new_trials
+                        continue
                 if reusable(member):
                     trial["perf"] = member.perf
                     if member.perf < best.perf:

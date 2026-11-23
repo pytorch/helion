@@ -13,13 +13,19 @@ from torch.utils._pytree import tree_flatten
 
 from .accuracy import assert_close
 from .accuracy import poison_cached_device_memory
+from .benchmark_prelude import LoadedPrelude
+from .benchmark_prelude import PreludeFailed
+from .benchmark_prelude import load_prelude
 from .benchmark_worker import PHASE_COMPILED
 from .benchmark_worker import PhasedJob
+from .benchmarking import KernelTraceUnreadable
 from .benchmarking import _resolve_l2_flush_mode
+from .benchmarking import check_prelude_regime
 from .benchmarking import do_bench
 from .benchmarking import do_bench_cuda_graph
 from .benchmarking import do_bench_generic
 from .benchmarking import kernel_timer_unready_reason
+from .benchmarking import prelude_trace_unready_reason
 from .benchmarking import steady_graph_dispatch
 from .benchmarking import synchronize_device
 from .input_banks import InputBankMemoryError
@@ -86,6 +92,50 @@ class BenchmarkJob(PhasedJob):
     # final selection names its own regime (``final_selection_l2_flush_mode``).
     l2_flush_mode: str | None = None
     input_banks: int = 1
+    # Time the window from the CUDA activity trace (``do_bench``'s
+    # ``trace_kernel_durations``): the candidates and re-timings of a search
+    # that settled on the trace timer, a seed's retry with fixed repetitions
+    # included. False keeps the event timer. A window the worker cannot read
+    # from the trace raises ``KernelTraceUnreadable`` rather than be timed
+    # with CUDA events.
+    trace_kernel_durations: bool = False
+    # The file of the prelude the candidate is timed behind
+    # (``BenchmarkPrelude.save``): the kernels that run before it in a
+    # sequence run between the L2 flush and every timed call, and the
+    # candidate takes the arguments they leave it instead of the trusted
+    # ones. None (the default) times the candidate alone on the trusted
+    # arguments.
+    prelude_path: str | None = None
+
+    def _check_prelude_mode(self) -> None:
+        """A prelude needs a timer that flushes before every call and can
+        leave the work out: one input bank, CUDA events or the trace."""
+        if self.input_banks > 1 or self.use_wall_clock:
+            raise ValueError(
+                "a benchmark prelude needs one input bank and a CUDA event or "
+                "trace timer"
+            )
+        check_prelude_regime(_resolve_l2_flush_mode(self.l2_flush_mode))
+
+    def _warm_prelude(self, device: torch.device | None) -> LoadedPrelude:
+        """The job's prelude, loaded (once per process) and run once on the
+        arguments' device before the candidate's first call. A failure here
+        is the prelude's, whatever the candidate (``PreludeFailed``)."""
+        assert self.prelude_path is not None
+        try:
+            prelude = load_prelude(self.prelude_path)
+            with (
+                torch.cuda.device(device)
+                if device is not None
+                else contextlib.nullcontext()
+            ):
+                prelude.run()
+        except Exception as error:
+            raise PreludeFailed(
+                "the benchmark prelude failed before the candidate's first "
+                f"call: {type(error).__name__}: {error}"
+            ) from error
+        return prelude
 
     def __call__(self, report_phase: Callable[[str], None] | None = None) -> float:
         # Subprocess inherits parent stderr; capture so Triton runtime
@@ -95,12 +145,16 @@ class BenchmarkJob(PhasedJob):
             wall_clock=self.use_wall_clock,
             l2_flush_mode=self.l2_flush_mode,
         )
+        if self.prelude_path is not None:
+            self._check_prelude_mode()
         with capture_output():
             fn = _load_compiled_fn_for_worker(self.fn_spec)
             try:
                 if self.args_slot is None:
                     args = load_trusted_kernel_args(self.args_path)
-                    if self.mutated_arg_indices:
+                    # (behind a prelude the candidate runs on the prelude's
+                    # arguments: these only name the device)
+                    if self.mutated_arg_indices and self.prelude_path is None:
                         args = _clone_args(
                             args,
                             None,
@@ -116,13 +170,27 @@ class BenchmarkJob(PhasedJob):
                         raise InputBankMemoryError(
                             "optional finalist input copies exceed device memory"
                         ) from error
-                bench = do_bench_generic if self.use_wall_clock else do_bench
+                bench: Callable[..., float | tuple[float, ...]] = (
+                    do_bench_generic if self.use_wall_clock else do_bench
+                )
+                # (the wall-clock timer has no trace path)
+                traced = self.trace_kernel_durations and not self.use_wall_clock
+                if traced:
+                    bench = functools.partial(do_bench, trace_kernel_durations=True)
                 # The worker warmed the current device before this job; the
                 # kernel's graphs, its warm call (or bank warm-up), the
                 # synchronization after it and the timers (which flush, mark
                 # and trace the current device) run on its arguments' device.
                 device = _cuda_device_of(args)
                 benchmark_fn: Callable[[], object] = functools.partial(fn, *args)
+                # Behind a prelude the candidate's arguments are the ones
+                # the prelude's work leaves (the same tensors a sequence
+                # hands it), read at every call.
+                prelude = (
+                    None if self.prelude_path is None else self._warm_prelude(device)
+                )
+                if prelude is not None:
+                    benchmark_fn = prelude.timed(fn)
                 with (
                     torch.cuda.device(device)
                     if device is not None
@@ -162,16 +230,37 @@ class BenchmarkJob(PhasedJob):
                             pre_timing=pre_timing,
                         )
                     else:
-                        if self.l2_flush_mode == "kernel" and not self.use_wall_clock:
+                        kernel_window = (
+                            self.l2_flush_mode == "kernel" and not self.use_wall_clock
+                        )
+                        if kernel_window or traced:
                             reason = kernel_timer_unready_reason()
+                            if reason is None and prelude is not None:
+                                # (the trace must split off the prelude's
+                                # work as well as the flush)
+                                reason = prelude_trace_unready_reason(prelude)
                             if reason is not None:
-                                # The parent labelled this window ``kernel``
-                                # (``LocalBenchmarkProvider.worker_kernel_timer_available``):
-                                # a reading timed with CUDA events instead
-                                # must not pass as one.
-                                raise RuntimeError(
-                                    f"the kernel trace timer is unavailable in "
-                                    f"the benchmark worker: {reason}"
+                                if kernel_window:
+                                    # The parent labelled this window
+                                    # ``kernel``
+                                    # (``LocalBenchmarkProvider.worker_kernel_timer_available``):
+                                    # a reading timed with CUDA events
+                                    # instead must not pass as one.
+                                    raise RuntimeError(
+                                        f"the kernel trace timer is unavailable "
+                                        f"in the benchmark worker: {reason}"
+                                    )
+                                # The search reads its candidates from the
+                                # trace (it asked this worker's probe before
+                                # it settled on it): ``do_bench`` would time
+                                # this window with CUDA events, a reading on
+                                # another scale than the ones it is compared
+                                # with. A worker that lost the trace since
+                                # (respawned beside a tool that holds the
+                                # activity API) gives no reading instead.
+                                raise KernelTraceUnreadable(
+                                    f"the benchmark worker cannot read the "
+                                    f"CUDA activity trace: {reason}"
                                 )
                         result = bench(
                             benchmark_fn,
@@ -182,6 +271,9 @@ class BenchmarkJob(PhasedJob):
                             probe_long_kernel=self.probe_long_kernel,
                             l2_flush_mode=self.l2_flush_mode,
                             pre_warmed=True,
+                            # (named only behind a prelude: a job without
+                            # one calls the timer as it always did)
+                            **({} if prelude is None else {"prelude": prelude}),
                         )
                 return cast("float", result) / self.input_banks
             finally:
@@ -192,19 +284,30 @@ class BenchmarkJob(PhasedJob):
 class KernelTimerProbeJob:
     """Why the benchmark worker cannot time ``kernel`` windows from the trace
     on ``device``, ``None`` when it can: the profiling session runs in the
-    worker, which keeps the learned footprint for the windows that follow."""
+    worker, which keeps the learned footprint for the windows that follow in
+    that process (a new process learns it in its first such window)."""
 
     device: int | None = None
+    # The file of the prelude the search's candidates are timed behind
+    # (``BenchmarkJob.prelude_path``): the trace must then split the
+    # prelude's work off a window as well as the flush.
+    prelude_path: str | None = None
 
     def __call__(self) -> str | None:
-        """``kernel_timer_unready_reason``: ``None`` when the worker traces."""
+        """``kernel_timer_unready_reason``, and behind a prelude
+        ``prelude_trace_unready_reason``: ``None`` when the worker traces."""
         with (
             capture_output(),
             torch.cuda.device(self.device)
             if self.device is not None
             else contextlib.nullcontext(),
         ):
-            return kernel_timer_unready_reason()
+            reason = kernel_timer_unready_reason()
+            if reason is None and self.prelude_path is not None:
+                prelude = load_prelude(self.prelude_path)
+                prelude.run()
+                reason = prelude_trace_unready_reason(prelude)
+            return reason
 
 
 @functools.cache

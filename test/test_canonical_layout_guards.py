@@ -24,6 +24,7 @@ from helion._compiler.runtime_tensor_guards import _CanonicalLayoutClassifier
 from helion._compiler.runtime_tensor_guards import _guard_canonical_layout
 from helion._compiler.variable_origin import ArgumentOrigin
 from helion._testing import cpu_render_target
+from helion._testing import skipIfRefEager
 from helion._testing.cute_codegen import cpu_bind
 from helion._testing.tunable_fragments import load_host_function
 import helion.language as hl
@@ -136,6 +137,7 @@ def _copy_nested_layout(values):
     return out
 
 
+@skipIfRefEager("reads compiler state, which ref mode does not build")
 def test_canonical_layout_classifier_can_be_captured_without_eliding_metadata():
     real_input = torch.empty(4, 6)
     with cpu_render_target():
@@ -168,6 +170,7 @@ def test_canonical_layout_classifier_can_be_captured_without_eliding_metadata():
         assert captured(value) == classify(value)
 
 
+@skipIfRefEager("reads compiler state, which ref mode does not build")
 def test_compound_outer_tensor_layout_uses_whole_metadata_source():
     outer_shapes = ShapeEnv()
     real_input = torch.empty(5, 8)
@@ -189,6 +192,7 @@ def test_compound_outer_tensor_layout_uses_whole_metadata_source():
     assert spec["leaf_specs"][0]["stride"] == list(sliced.stride())
 
 
+@skipIfRefEager("reads compiler state, which ref mode does not build")
 def test_compound_outer_factory_extent_uses_whole_input_size():
     outer_shapes = ShapeEnv()
     real_input = torch.empty(5, 8)
@@ -213,6 +217,7 @@ def test_compound_outer_factory_extent_uses_whole_input_size():
     assert tuple(outer_shapes.guards) == before
 
 
+@skipIfRefEager("reads compiler state, which ref mode does not build")
 def test_factory_extent_product_does_not_replay_an_inferred_input_stride():
     _fresh_product_layout.reset()
     with cpu_render_target():
@@ -262,6 +267,7 @@ def test_factory_extent_product_does_not_replay_an_inferred_input_stride():
 
 
 @pytest.mark.parametrize("rank", [1, 2])
+@skipIfRefEager("reads compiler state, which ref mode does not build")
 def test_direct_canonical_leading_extent_keeps_normal_dispatch(rank):
     _copy_layout.reset()
     first = None
@@ -289,6 +295,7 @@ def test_noncanonical_input_does_not_partition_unused_extents():
         assert classifier((value, size)) == (False, ())
 
 
+@skipIfRefEager("reads compiler state, which ref mode does not build")
 def test_symbolic_noncanonical_rank_one_compacts_only_nondegenerate_extents():
     _copy_layout.reset()
     first = None
@@ -311,6 +318,7 @@ def test_symbolic_noncanonical_rank_one_compacts_only_nondegenerate_extents():
 
 
 @pytest.mark.parametrize("size", [0, 1])
+@skipIfRefEager("reads compiler state, which ref mode does not build")
 def test_static_rank_one_fallback_has_no_constant_layout_classifier(size):
     with cpu_render_target():
         x = torch.empty_strided((size,), (2,))
@@ -325,6 +333,7 @@ def test_static_rank_one_fallback_has_no_constant_layout_classifier(size):
         assert host(x).stride() == torch.empty_like(x).stride() == (2,)
 
 
+@skipIfRefEager("reads compiler state, which ref mode does not build")
 def test_dynamic_rank_one_degenerate_layouts_share_layout_fallback():
     _copy_layout.reset()
     fallback = None
@@ -367,6 +376,7 @@ def test_dynamic_rank_one_degenerate_layouts_share_layout_fallback():
             assert bound.env.tensor_layout_is_symbolically_exact(fake) is (size > 1)
 
 
+@skipIfRefEager("reads compiler state, which ref mode does not build")
 def test_rank_one_equal_output_layouts_keep_distinct_input_indexing():
     _copy_layout.reset()
     contiguous = torch.empty(4)
@@ -397,6 +407,7 @@ def test_rank_one_equal_output_layouts_keep_distinct_input_indexing():
 
 
 @pytest.mark.parametrize("nested", [False, True])
+@skipIfRefEager("reads compiler state, which ref mode does not build")
 def test_canonical_metadata_fast_and_prepared_keep_layout_fallback(nested):
     kernel = _copy_nested_layout if nested else _copy_layout
     kernel.reset()

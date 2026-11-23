@@ -66,7 +66,10 @@ def sigmoid_approx_ftz_f32(
     loc: ir.Location | None = None,
     ip: ir.InsertionPoint | None = None,
 ) -> Float32:
-    """FP32 sigmoid with the native approximate reciprocal instruction."""
+    """FP32 sigmoid with the bare native approximate reciprocal: 0 where the
+    sigmoid is subnormal (arguments in about (-88.72, -87.34)), which
+    ``torch.sigmoid`` is not (``math_templates.SIGMOID_TEMPLATE``).  Only
+    the rank-1 recurrence's gate uses it, a ``fast_math``-only lowering."""
     value = Float32(x)  # pyrefly: ignore[bad-argument-type]
     return _rcp_approx_ftz_impl(
         1.0 + cute.math.exp2(value * -_LOG2_E),

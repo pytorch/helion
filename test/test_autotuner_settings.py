@@ -21,6 +21,7 @@ from unittest.mock import Mock
 from unittest.mock import patch
 import zlib
 
+import pytest
 import torch
 
 from test._autotuner_test_utils import RecordingRandomSearch
@@ -50,11 +51,14 @@ from helion.autotuner.base_search import PopulationMember
 from helion.autotuner.base_search import population_statistics
 from helion.autotuner.benchmark_provider import BenchmarkResult
 from helion.autotuner.benchmark_provider import LocalBenchmarkProvider
+from helion.autotuner.benchmark_provider import MultiShapeBenchmarkProvider
 from helion.autotuner.benchmark_provider import _compile_config_failure_source_hash
+from helion.autotuner.benchmark_provider import _MultiShapeAutotuneArgs
 from helion.autotuner.finite_search import FiniteSearch
 from helion.autotuner.local_cache import LocalAutotuneCache
 from helion.autotuner.local_cache import StrictLocalAutotuneCache
 from helion.autotuner.logger import AutotuningLogger
+from helion.autotuner.metrics import AutotuneMetrics
 from helion.autotuner.metrics import KernelMetadata
 from helion.autotuner.pattern_search import InitialPopulationStrategy
 from helion.autotuner.precompile_future import PrecompileFuture
@@ -586,6 +590,116 @@ class TestAutotuneBudget(TestCase):
         )
         self.assertEqual(provider._autotune_metrics.num_unique_sources, 2)
         self.assertEqual(provider._autotune_metrics.num_source_deduplications, 2)
+
+    def _deduplicating_provider(self, timings):
+        """A stub provider that deduplicates generated sources, on a kernel
+        whose configs with an even ``block_sizes[0]`` are one source and
+        whose timings come from ``timings`` in order."""
+        provider = self._make_stub_provider()
+        provider.config_spec.backend = SimpleNamespace(
+            classify_autotune_exception=lambda error: None,
+            generated_source_hash=lambda fn: fn.source_hash,
+            should_deduplicate_generated_sources=lambda config_spec: True,
+        )
+
+        def compile_config(config, allow_print):
+            def fn():
+                return None
+
+            block_size = config.block_sizes[0]
+            fn.source_hash = "even" if block_size % 2 == 0 else str(block_size)
+            return fn
+
+        provider.kernel.compile_config = compile_config
+        provider._benchmark_function = Mock(side_effect=timings)
+        return provider
+
+    @pytest.mark.cpu_only
+    def test_fresh_source_timings_time_a_source_the_provider_holds(self) -> None:
+        """A provider that deduplicates settles a config whose source it has
+        timed with that first reading; inside ``fresh_source_timings`` every
+        config is timed, and the record is the first reading afterwards."""
+        provider = self._deduplicating_provider([1.0, 3.0, 1.5, 1.6, 3.5])
+        configs = [helion.Config(block_sizes=[size]) for size in (2, 3, 4)]
+
+        first = provider.benchmark(configs)
+        self.assertTrue(provider.settles_source_aliases())
+        with provider.fresh_source_timings():
+            self.assertFalse(provider.settles_source_aliases())
+            again = provider.benchmark(configs)
+        later = provider.benchmark([helion.Config(block_sizes=[6])])
+
+        self.assertEqual(
+            [(result.perf, result.status) for result in first],
+            [(1.0, "ok"), (3.0, "ok"), (1.0, "deduplicated")],
+        )
+        # Each config is timed again, the two configs of one source included.
+        self.assertEqual(
+            [(result.perf, result.status) for result in again],
+            [(1.5, "ok"), (1.6, "ok"), (3.5, "ok")],
+        )
+        self.assertEqual(provider._benchmark_function.call_count, 5)
+        self.assertEqual((later[0].perf, later[0].status), (1.0, "deduplicated"))
+        self.assertTrue(provider.settles_source_aliases())
+
+    @pytest.mark.cpu_only
+    def test_provider_reports_no_aliases_once_torch_distributed_is_up(self) -> None:
+        """Every rank keeps the same benchmark loop, so a provider of a
+        process with torch.distributed initialized deduplicates nothing and
+        says so."""
+        provider = self._deduplicating_provider([])
+
+        self.assertTrue(provider.settles_source_aliases())
+        with patch(
+            "helion.autotuner.benchmark_provider.dist.is_initialized",
+            return_value=True,
+        ):
+            self.assertFalse(provider._effective_source_dedup_enabled())
+            self.assertFalse(provider.settles_source_aliases())
+
+    @pytest.mark.cpu_only
+    def test_multi_shape_rebenchmark_times_sources_its_children_hold(self) -> None:
+        """The children of a multi-shape search deduplicate generated
+        sources on a backend that asks for it.  A re-timing of the joint
+        configs still times every shape of every config: it does not come
+        back with the children's first readings."""
+        children = [
+            self._deduplicating_provider([1.0, 3.0, 1.5, 3.5, 1.6]),
+            self._deduplicating_provider([2.0, 6.0, 3.0, 7.0, 3.2]),
+        ]
+        provider = MultiShapeBenchmarkProvider.__new__(MultiShapeBenchmarkProvider)
+        provider.kernel = children[0].kernel
+        provider.settings = children[0].settings
+        provider.config_spec = SimpleNamespace(normalize=lambda config: None)
+        provider.args = _MultiShapeAutotuneArgs(
+            cases=tuple((child.kernel, ()) for child in children),
+            aggregation="max",
+            relative_to=None,
+            cache_tag=None,
+            workload_key=("workload",),
+        )
+        provider.log = children[0].log
+        provider._autotune_metrics = AutotuneMetrics()
+        provider.children = children
+        provider._collect_effective_source_repairs = False
+        provider._original_configs_by_materialized_key = {}
+        provider._anchor_fns_by_materialized_key = {}
+        configs = [helion.Config(block_sizes=[size]) for size in (2, 3, 4)]
+
+        first = provider.benchmark(configs)
+        again = provider.rebenchmark(
+            configs, [result.perf for result in first], desc="verifying"
+        )
+
+        # The third config repeats the first one's source on both shapes:
+        # no child timed it, and the joint result is an ordinary one.
+        self.assertEqual([result.perf for result in first], [2.0, 6.0, 2.0])
+        self.assertEqual([result.status for result in first], ["ok", "ok", "ok"])
+        self.assertFalse(provider.settles_source_aliases())
+        # The re-timing times all three configs on both shapes.
+        self.assertEqual(again, [3.0, 7.0, 3.2])
+        for child in children:
+            self.assertEqual(child._benchmark_function.call_count, 5)
 
     def test_trial_timestamps_track_measurements_and_new_source_aliases(self) -> None:
         provider = self._make_stub_provider()
@@ -1329,7 +1443,9 @@ class TestAutotuneBudget(TestCase):
         search._pinned_finalist_members = {}
         search.config_spec = SimpleNamespace(
             backend=SimpleNamespace(
-                generated_source_hash=lambda fn: getattr(fn, "source_hash", None)
+                generated_source_hash=lambda fn: getattr(fn, "source_hash", None),
+                # (a search that keeps its aliases records a repaired member)
+                collapses_generated_source_aliases=lambda config_spec: False,
             )
         )
         search.train_configs = [copy.deepcopy(config)]
@@ -1552,7 +1668,8 @@ class TestAutotuneBudget(TestCase):
         self.assertTrue(
             backend.should_deduplicate_generated_sources(_cute_flash_test_config_spec())
         )
-        self.assertFalse(
+        # Every CuTe search times a generated source once, not only flash.
+        self.assertTrue(
             backend.should_deduplicate_generated_sources(
                 SimpleNamespace(cute_flash_search_enabled=False)
             )

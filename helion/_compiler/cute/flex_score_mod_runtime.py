@@ -57,44 +57,78 @@ def tanh_f32(y: Float32, approx: bool = False) -> Float32:
     return cute.math.fma(cutlass.Float32(2.0), nr, one)
 
 
-def load_vec(ptr: object, width: int, dtype: type) -> list:
-    """One 16-byte-class vector load of ``width`` consecutive ``dtype`` values.
+def _piece_lanes(width: int, bits: int, align: int) -> int:
+    """Lanes per load of a ``width``-lane vector of ``bits``-bit elements
+    from a table whose base is ``align``-byte aligned: the whole vector, or
+    the widest piece the base alignment allows (the renderer keeps every
+    vector start a multiple of ``width`` elements from the base, so the base
+    alignment is the start's)."""
+    return max(1, min(width, align * 8 // bits))
+
+
+def load_vec(ptr: object, width: int, dtype: type, align: int = 16) -> list:
+    """``width`` consecutive ``dtype`` values: one vector load (16 bytes at
+    most) when the table base allows it, else narrower pieces.
 
     Returns the lanes as typed DSL scalars.  ``ptr`` must be aligned to the
-    vector's byte size; the renderer proves that statically from the aux
-    tensor's shape and strides and the chunk base column.
+    vector's byte size relative to the table base (the renderer proves that
+    statically from the aux tensor's shape and strides and the chunk base
+    column); ``align`` is the base's own alignment in bytes, a trace-time
+    int (the renderer passes the table pointer's: the launcher proves it
+    from the argument, at most 16, and keys the compiled kernel on it).  A
+    base below the vector's size (a view starting inside its storage) is
+    read in the pieces it allows, down to single elements: ``cute.arch.load``
+    issues the full-width vector whatever the pointer's alignment, and a
+    misaligned one faults.
     """
     numeric = cast("Any", dtype)
-    vec = cute.arch.load(ptr, ir.VectorType.get([width], numeric.mlir_type))
-    return [numeric(cast("Any", vec)[j]) for j in range(width)]
+    lanes = _piece_lanes(width, numeric.width, align)
+    base = cast("Any", ptr)
+    values: list = []
+    for k in range(width // lanes):
+        piece = base + lanes * k if k else base
+        if lanes == 1:
+            # ``nvvm.load.ext`` takes no scalar float type.
+            values.append(numeric(piece.load()))
+            continue
+        vec = cute.arch.load(piece, ir.VectorType.get([lanes], numeric.mlir_type))
+        values.extend(numeric(cast("Any", vec)[j]) for j in range(lanes))
+    return values
 
 
-def load_run(ptr: object, count: int, width: int, dtype: type) -> list:
+def load_run(ptr: object, count: int, width: int, dtype: type, align: int = 16) -> list:
     """``count`` consecutive ``width``-lane vectors from ``ptr`` as a flat list:
     the contiguous run one group of lanes reads in the strided-run form.
-    ``ptr`` must be aligned to the vector's byte size."""
+    ``ptr`` must be aligned to the vector's byte size relative to the table
+    base; ``align`` is the base's (``load_vec``)."""
     values: list = []
     base = cast("Any", ptr)
     for k in range(count):
-        values.extend(load_vec(base + width * k, width, dtype))
+        values.extend(load_vec(base + width * k, width, dtype, align))
     return values
 
 
 def load_window(
-    ptr: object, last_ptr: object, count: int, width: int, dtype: type
+    ptr: object,
+    last_ptr: object,
+    count: int,
+    width: int,
+    dtype: type,
+    align: int = 16,
 ) -> list:
     """``count`` consecutive ``width``-lane vectors from ``ptr`` as a flat list.
 
     The last vector is read at ``last_ptr`` (the renderer clamps it to the
     table end: its lanes are only selected when the thread's window is
     misaligned, in which case it lies inside the table).  ``ptr`` must be
-    aligned to the vector's byte size.
+    aligned to the vector's byte size relative to the table base; ``align``
+    is the base's (``load_vec``).
     """
     values: list = []
     base = cast("Any", ptr)
     for k in range(count - 1):
-        values.extend(load_vec(base + width * k, width, dtype))
-    values.extend(load_vec(last_ptr, width, dtype))
+        values.extend(load_vec(base + width * k, width, dtype, align))
+    values.extend(load_vec(last_ptr, width, dtype, align))
     return values
 
 
@@ -132,6 +166,7 @@ def coop_issue(
     lane: object,
     pitch: int,
     limit: int | None = None,
+    align: int = 16,
 ) -> None:
     """Issue this lane's share of the warp's block copy for one chunk.
 
@@ -149,7 +184,13 @@ def coop_issue(
     start, unproven tables) each piece's element offset is clamped into the
     table: the owner selects zero for out-of-range columns, so the clamped
     vector's values are never used.  The caller commits the group (one per
-    chunk) and waits before the rows are read.
+    chunk) and waits before the rows are read.  ``align`` is the table
+    base's alignment in bytes (``load_vec``): at 4 or 8 each 16-byte piece
+    is copied as ``16 // align`` ``cp.async.ca`` copies of ``align`` bytes
+    (``cp.async.cg`` copies only 16); below 4 no ``cp.async`` can read it, so
+    it is loaded in the pieces the base allows and stored to its slot
+    directly (the consumer's warp sync orders those stores like the
+    copies).
     """
     lanes_per_row = width // 16
     rows_per_request = 32 // lanes_per_row
@@ -165,12 +206,23 @@ def coop_issue(
             )
         piece = cast("Any", row_ptr) + offset
         for k in range(lanes_per_row):
-            prims.cp_async_shared_global(
-                target + (u * unit_elems + k * rows_per_request * pitch),
-                piece + k * rows_per_request * row_step,
-                16,
-                "cg",
-            )
+            slot_ptr = target + (u * unit_elems + k * rows_per_request * pitch)
+            source_ptr = piece + k * rows_per_request * row_step
+            if align >= 16:
+                prims.cp_async_shared_global(slot_ptr, source_ptr, 16, "cg")
+            elif align >= 4:
+                step = per_vector * align // 16
+                for j in range(16 // align):
+                    prims.cp_async_shared_global(
+                        slot_ptr + step * j if j else slot_ptr,
+                        source_ptr + step * j if j else source_ptr,
+                        align,
+                        "ca",
+                    )
+            else:
+                values = load_vec(source_ptr, per_vector, dtype, align)
+                for j in range(per_vector):
+                    (slot_ptr + j if j else slot_ptr).store(values[j])
 
 
 def lane_below(limit: object, width: int) -> cutlass.Int32:

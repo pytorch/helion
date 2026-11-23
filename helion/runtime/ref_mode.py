@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import contextlib
 import enum
+import functools
 import threading
 import typing
 from typing import TYPE_CHECKING
@@ -20,6 +21,7 @@ from .._compiler.compile_environment import CompileEnvironment
 from .._compiler.compile_environment import NoCurrentEnvironment
 from .._compiler.compile_environment import tls as ce_tls
 from .._utils import convert_size_arg
+from .._utils import convert_tile_indices_to_slices
 from .._utils import create_shape_matching_slices
 
 if TYPE_CHECKING:
@@ -122,11 +124,80 @@ def cartesian_indices(indices: list[Any]) -> list[Any]:
     ]
     if len(positions) < 2 or any(indices[i].ndim != 1 for i in positions):
         return indices
-    grids = torch.meshgrid(*(indices[i] for i in positions), indexing="ij")
+    grids = torch.meshgrid(
+        *index_tensors_of_one_dtype([indices[i] for i in positions]), indexing="ij"
+    )
     indices = [*indices]
     for i, grid in zip(positions, grids, strict=True):
         indices[i] = grid
     return indices
+
+
+def index_tensors_of_one_dtype(tensors: list[torch.Tensor]) -> list[torch.Tensor]:
+    """``tensors`` for ``torch.meshgrid``, which takes one dtype only: integer
+    index tensors of several dtypes (a tile's int32 index beside an int64
+    index tensor) are promoted to their common one.  Any other list is
+    returned as it is."""
+    dtypes = {tensor.dtype for tensor in tensors}
+    if len(dtypes) > 1 and all(is_integer_dtype(dtype) for dtype in dtypes):
+        dtype = functools.reduce(torch.promote_types, dtypes)
+        return [tensor.to(dtype) for tensor in tensors]
+    return tensors
+
+
+def slice_indices(tensor: torch.Tensor, indices: list[Any]) -> list[Any]:
+    """``indices`` with every slice as an index tensor of the elements it
+    selects along its dim of ``tensor``, so that the sliced axes join the
+    cartesian product (or the broadcast) of the index tensors in place."""
+    dtype = next(
+        (idx.dtype for idx in indices if isinstance(idx, torch.Tensor)), torch.int64
+    )
+    result = []
+    for dim, idx in enumerate(indices):
+        if isinstance(idx, slice):
+            if isinstance(idx.step, int) and idx.step <= 0:
+                # Refused by compiled code and by PyTorch indexing alike.
+                raise exc.InvalidSliceStep(idx)
+            # Counted as a range: an empty slice may stop before it starts,
+            # which torch.arange refuses as bounds.
+            chosen = range(*idx.indices(tensor.size(dim)))
+            idx = torch.arange(
+                chosen.start,
+                chosen.start + len(chosen) * chosen.step,
+                chosen.step,
+                device=tensor.device,
+                dtype=dtype,
+            )
+        result.append(idx)
+    return result
+
+
+def enclosed_slice_indices(tensor: torch.Tensor, indices: list[Any]) -> list[Any]:
+    """Turn the slices and tiles of ``indices`` into index tensors when one of
+    them lies between two one-dimensional integer index tensors.
+
+    PyTorch moves the dims of index tensors that a slice separates to the
+    front of the result; compiled Helion keeps every dim at its index's
+    position.  As index tensors the sliced axes join the cartesian product
+    of the others (``cartesian_indices``) in place.  Any other index list is
+    returned unchanged: one with an index tensor of another rank or dtype,
+    or with a ``None``, keeps the layout it had.
+    """
+    tensors = {i: idx for i, idx in enumerate(indices) if type(idx) is torch.Tensor}
+    sliced = list(cast("tuple[Any, ...]", convert_tile_indices_to_slices((*indices,))))
+    if (
+        len(tensors) < 2
+        or any(
+            idx.ndim != 1 or not is_integer_dtype(idx.dtype) for idx in tensors.values()
+        )
+        or not any(
+            isinstance(idx, slice) for idx in sliced[min(tensors) : max(tensors)]
+        )
+        # A None would shift the dims that the entries after it index.
+        or not all(isinstance(idx, (torch.Tensor, slice, int)) for idx in sliced)
+    ):
+        return indices
+    return slice_indices(tensor, sliced)
 
 
 class NoCurrentRefModeContext(RuntimeError):
@@ -207,6 +278,13 @@ class RefModeContext:
             return True
         except NoCurrentRefModeContext:
             return False
+
+    @property
+    def in_device_code(self) -> bool:
+        """Whether the code running now is the kernel's own device code:
+        inside an ``hl.tile`` / ``hl.grid`` loop and outside the reference
+        implementation of a Helion API."""
+        return bool(self.device_loop_depth) and not self.ref_impl_depth
 
     def allocate_rng_seed_slot(self) -> int:
         seed_slot = self.rng_seed_slot_count
@@ -553,38 +631,88 @@ class RefModeTorchFunctionMode(BaseTorchFunctionMode):
         args: tuple[object, ...],
         kwargs: dict[str, object],
     ) -> torch.Tensor:
-        """Handle tensor indexing with out-of-bounds index clamping."""
+        """Handle tensor indexing in a device loop: cartesian index tensors
+        and out-of-bounds index clamping.  Host code indexes as PyTorch does."""
         tensor = cast("torch.Tensor", args[0])
         indices: Any = args[1]
+        context = RefModeContext.current()
+        if not context.device_loop_depth:
+            # A compiled kernel runs its host code as plain PyTorch.
+            return tensor[indices]
         is_tuple = isinstance(indices, tuple)
-        indices_list = cartesian_indices(list(indices) if is_tuple else [indices])
+        index_list = list(indices) if is_tuple else [indices]
+        in_device_code = context.in_device_code
+        if in_device_code:
+            index_list = enclosed_slice_indices(tensor, index_list)
+        indices_list = cartesian_indices(index_list)
 
         for dim, idx in enumerate(indices_list):
             if self._is_int_tensor(idx):
                 indices_list[dim] = torch.clamp(idx, min=0, max=tensor.size(dim) - 1)
 
         result = tensor[tuple(indices_list) if is_tuple else indices_list[0]]
-        context = RefModeContext.current()
-        if context.device_loop_depth and not context.ref_impl_depth:
+        if in_device_code:
             return device_load(result)
         return result
+
+    @staticmethod
+    def _trim_to_tiles(
+        value: torch.Tensor, shape: torch.Size, tile_dims: list[int]
+    ) -> torch.Tensor:
+        """``value`` without the elements that run past the tiles of a store
+        whose tiles became index tensors, as a store to tiles drops them
+        (``RefTile._handle_setitem``).  ``shape`` is that of the elements
+        the store indexes and ``tile_dims`` the tiles' dims of it; a value of
+        another size along any other dim is left to be refused."""
+        if not tile_dims or value.dim() != len(shape):
+            return value
+        return value[
+            tuple(
+                slice(shape[dim]) if dim in tile_dims else slice(None)
+                for dim in range(value.dim())
+            )
+        ]
 
     def _handle_setitem(
         self,
         args: tuple[object, ...],
         kwargs: dict[str, object],
     ) -> None:
-        """Handle tensor indexed assignment with out-of-bounds index clamping."""
+        """Handle tensor indexed assignment in a device loop: cartesian index
+        tensors, and no store for an element whose index is out of bounds.
+        Host code assigns as PyTorch does."""
         tensor = cast("torch.Tensor", args[0])
         indices: Any = args[1]
         value: Any = args[2]
         if is_device_load(tensor):
             raise exc.DeviceTensorSubscriptAssignmentNotAllowed(DEVICE_LOAD_NAME)
+        context = RefModeContext.current()
+        if not context.device_loop_depth:
+            # A compiled kernel runs its host code as plain PyTorch.
+            tensor[indices] = value
+            return
+        from ..language.ref_tile import RefTile
+
         is_tuple = isinstance(indices, tuple)
-        indices_list = cartesian_indices(list(indices) if is_tuple else [indices])
+        index_list = list(indices) if is_tuple else [indices]
+        indices_list = cartesian_indices(
+            enclosed_slice_indices(tensor, index_list)
+            if context.in_device_code
+            else index_list
+        )
+        # The result dims of the tiles that became index tensors: with them,
+        # every entry of the index is an integer or takes one dim, in order.
+        tile_dims: list[int] = []
+        result_dim = 0
+        for old, new in zip(index_list, indices_list, strict=True):
+            if isinstance(old, RefTile) and type(new) is torch.Tensor:
+                tile_dims.append(result_dim)
+            if not isinstance(new, int):
+                result_dim += 1
 
         # Clamp int-tensor indices and record which were in bounds
         bounds_mask: torch.Tensor | None = None
+        dim_masks: dict[int, torch.Tensor] = {}  # by dim
         mask_out_pos = 0
         for dim, idx in enumerate(indices_list):
             if isinstance(idx, int):
@@ -592,6 +720,7 @@ class RefModeTorchFunctionMode(BaseTorchFunctionMode):
             if self._is_int_tensor(idx):
                 max_idx = tensor.size(dim) - 1
                 dim_mask = (idx >= 0) & (idx <= max_idx)
+                dim_masks[dim] = dim_mask
                 bounds_mask = (
                     dim_mask if bounds_mask is None else (bounds_mask & dim_mask)
                 )
@@ -599,10 +728,47 @@ class RefModeTorchFunctionMode(BaseTorchFunctionMode):
             elif bounds_mask is None:
                 mask_out_pos += 1
 
-        # Preserve original values at out-of-bounds positions
         final_indices = tuple(indices_list) if is_tuple else indices_list[0]
+        if (
+            bounds_mask is not None
+            and not bounds_mask.all()
+            # Every entry indexes the dim at its position, which the bounds
+            # above assume; a ``None`` or a mask would shift the dims.
+            and all(
+                (isinstance(idx, (int, slice, RefTile)) and not isinstance(idx, bool))
+                or self._is_int_tensor(idx)
+                for idx in indices_list
+            )
+        ):
+            # Store into a copy with one more element along each indexed dim,
+            # where the indices out of bounds go, and take the tensor's own
+            # elements back.  Clamped onto the edge element instead, whatever
+            # they wrote would land on a store to that element.
+            padded = tensor.new_empty(
+                [size + (dim in dim_masks) for dim, size in enumerate(tensor.shape)]
+            )
+            inside = tuple(slice(size) for size in tensor.shape)
+            padded[inside] = tensor
+            for dim, dim_mask in dim_masks.items():
+                indices_list[dim] = torch.where(
+                    dim_mask, indices_list[dim], tensor.size(dim)
+                )
+            padded_indices = tuple(indices_list) if is_tuple else indices_list[0]
+            if type(value) is torch.Tensor:
+                shape = padded[padded_indices].shape
+                value = self._trim_to_tiles(value, shape, tile_dims)
+                # Broadcast against the indexed elements, as ``torch.where``
+                # does for a store in bounds.
+                value = value.expand(torch.broadcast_shapes(value.shape, shape))
+            padded[padded_indices] = value
+            tensor.copy_(padded[inside])
+            return
+
+        # Every index is in bounds, or the index has a ``None`` or a mask and
+        # keeps the clamped store it had.
         if bounds_mask is not None and type(value) is torch.Tensor:
             current = tensor[final_indices]
+            value = self._trim_to_tiles(value, current.shape, tile_dims)
             n_trailing = current.dim() - bounds_mask.dim() - mask_out_pos
             shape = (1,) * mask_out_pos + bounds_mask.shape + (1,) * n_trailing
             value = torch.where(bounds_mask.view(shape), value, current)

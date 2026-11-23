@@ -32,6 +32,11 @@ from torch.utils._sympy.functions import FloorDiv
 from torch.utils._sympy.functions import IntTrueDiv
 from torch.utils._sympy.functions import ToFloat
 
+try:
+    from torch._higher_order_ops.effects import _get_effect
+except ImportError:  # older torch has no effect query: torch.ops calls stay opaque
+    _get_effect = None
+
 from .. import exc
 from .._utils import cdiv
 from .._utils import next_power_of_2
@@ -67,6 +72,8 @@ from .fragment_call import guard_fragment_call_input
 from .host_function import HostFunction
 from .host_function import NoCurrentFunction
 from .host_function import SymbolOrigin
+from .tensor_utils import host_dispatch_mode
+from .tensor_utils import host_modes_trusted
 from .utils import compute_slice_size
 from .utils import host_subscript_geometry
 from .utils import is_basic_host_subscript
@@ -88,6 +95,7 @@ if TYPE_CHECKING:
     from typing_extensions import Self
 
     from torch._ops import OpOverload
+    from torch._ops import OpOverloadPacket
 
     _T = TypeVar("_T")
 
@@ -170,15 +178,36 @@ def _is_known_host_value(value: object) -> bool:
 
 # Capture Python-library identities before user code can replace module attrs.
 _NATIVE_TENSOR_CLASS = torch.Tensor
-# The receivers of an operator lookup (``torch.ops.prims.fma``), and with
-# the overload it ends in, the values such a lookup yields: torch's own
-# classes, whose attribute lookup and equality run no user protocol.
-_TORCH_OPS_LOOKUP_TYPES = (
-    type(torch.ops),
-    torch._ops._OpNamespace,
-    torch._ops.OpOverloadPacket,
+_NATIVE_OP_OVERLOAD = torch._ops.OpOverload
+_NATIVE_OP_PACKET = torch._ops.OpOverloadPacket
+_RESOLVE_PACKET = torch._C._jit_resolve_packet
+_OPERATOR_HOOKS = (
+    "__new__",
+    "__init__",
+    "__getattribute__",
+    "__getattr__",
+    "__setattr__",
+    "__call__",
+    "__eq__",
 )
-_TORCH_OPS_VALUE_TYPES = (*_TORCH_OPS_LOOKUP_TYPES, torch._ops.OpOverload)
+# ``torch.ops``, its namespaces and packets: an attribute lookup on one
+# resolves the next (an overload's attributes are plain).
+_TORCH_OPS_LOOKUP_TYPES = (torch._ops._Ops, torch._ops._OpNamespace, _NATIVE_OP_PACKET)
+# The values such lookups yield. Their lookups, calls and equality run no user
+# protocol while _registry_unpatched holds.
+_TORCH_OPS_VALUE_TYPES = (*_TORCH_OPS_LOOKUP_TYPES, _NATIVE_OP_OVERLOAD)
+# Each of them with the Python hooks it had at import (None where it has none).
+_NATIVE_OPERATOR_HOOKS = tuple(
+    (kind, tuple(getattr_static(kind, hook, None) for hook in _OPERATOR_HOOKS))
+    for kind in _TORCH_OPS_VALUE_TYPES
+)
+# The pybind11 function record type native operator entries (like every
+# pybind11 builtin) are bound to, and the dispatcher record torch.library
+# operators dispatch through (torch 2.14+).
+_PYBIND_RECORD = type(cast("Any", torch.ops.aten.clone.default._op).__self__)
+_PYOBJ_DISPATCHER = getattr(torch._ops, "_PyObjectDispatcher", None)
+_HEAP_TYPE_FLAG = 1 << 9  # Py_TPFLAGS_HEAPTYPE: every class Python code defines
+_NO_ATTRIBUTE = object()
 _KNOWN_HOST_CONSTRUCTORS = (
     abs,
     all,
@@ -254,6 +283,41 @@ def _is_known_host_call(
         return True
     if any(fn is split for split in _KNOWN_HOST_SPLITS):
         return bool(args) and type(args[0]) is FakeTensor
+    if type(fn) is _NATIVE_OP_PACKET or type(fn) is _NATIVE_OP_OVERLOAD:
+        # An operator reaches only its arguments, whose sizes, strides, offsets
+        # and storages the tracker compares before and after the call, as for
+        # a native Tensor method; a registered effect reaches beyond them. The
+        # kernels registered for it (Python ones from torch.library too) are
+        # trusted to honor its schema, as functionalization and torch.compile
+        # trust them.
+        # A module attribute can hold an operator, so the registry hooks are
+        # checked here too, not only on torch.ops lookups.
+        if (
+            _get_effect is None
+            or not _registry_unpatched(fn)
+            or not _dispatches_natively(fn)
+        ):
+            return False
+        # A torch mode's Python runs inside the call and may restride tensors
+        # it does not take (or answer a call no schema matches). Modes change
+        # between calls with the same arguments, so the binding's cache key
+        # records this answer.
+        if CompileEnvironment.has_current():
+            CompileEnvironment.current().torch_mode_sensitive = True
+        if not host_modes_trusted():
+            return False
+        if type(fn) is _NATIVE_OP_OVERLOAD:
+            # The effect key from the schema (torch's C++ object), and the
+            # instance's name must agree with it.
+            overload = cast("OpOverload", fn)
+            schema = overload._schema
+            key = _effect_key(schema.name, schema.overload_name)
+            return overload._name == key and _get_effect(key) is None
+        # A packet's dispatcher entry picks the overload by the same schema
+        # matching; effects are registered by overload name.
+        name = cast("OpOverloadPacket", fn)._qualified_op_name
+        resolved = _RESOLVE_PACKET(name, *args, **kwargs)
+        return _get_effect(_effect_key(name, resolved)) is None
     if type(fn) is types.MethodType:
         return fn.__func__ is _KNOWN_HOST_SPLITS[1] and type(fn.__self__) is FakeTensor
     if type(fn) is types.MethodDescriptorType:
@@ -282,6 +346,87 @@ def _is_known_host_call(
     return (
         getattr(torch._C._VariableFunctions, fn.__name__, None) is fn
         or getattr(torch._C, fn.__name__, None) is fn
+    )
+
+
+def _registry_unpatched(value: object) -> bool:
+    """Whether every ``torch.ops`` class keeps the Python hooks it had at import
+    and ``value`` has no instance ``__getattr__``.
+
+    A lookup on one registry class constructs the next (namespace, packet,
+    overload), so all of them count. This guards the objects host code holds;
+    torch's registry code behind those hooks is trusted like any other torch
+    call.
+    """
+    return "__getattr__" not in vars(value) and all(
+        getattr_static(kind, hook, None) is original
+        for kind, hooks in _NATIVE_OPERATOR_HOOKS
+        for hook, original in zip(_OPERATOR_HOOKS, hooks, strict=True)
+    )
+
+
+def _dispatches_natively(op: OpOverload | OpOverloadPacket) -> bool:
+    """Whether calling a packet or overload enters torch's dispatcher for that
+    operator, by the links torch keeps: a packet's entry is a pybind11 builtin
+    named after the operator, with its namespace's module; an overload's is its
+    own C++ dispatch handle (a pybind11 builtin, kept apart from the entry
+    since torch 2.14; before, nothing links an overload to its entry, so its
+    calls stay opaque), or, for a torch.library operator, the callable of its
+    PyObject dispatcher record, an instance of a static (not heap) torch._C
+    type, which no Python class can be. Swapping in another operator's native
+    entries everywhere torch links them is not detected."""
+    target = op._op
+    if type(op) is _NATIVE_OP_PACKET:
+        namespace, _, name = cast("OpOverloadPacket", op)._qualified_op_name.partition(
+            "::"
+        )
+        return (
+            _is_pybind_builtin(target)
+            and target.__name__ == name
+            and target.__module__ == f"torch._ops.{namespace}"
+        )
+    # Before torch 2.14 nothing links an overload to its entry: opaque there.
+    handle = getattr(op, "_cpp_dispatch_handle", None)
+    if not _is_pybind_builtin(handle):
+        return False
+    if target is handle:
+        return True
+    dispatcher = op._pyobj_dispatcher
+    kind = type(target)
+    return (
+        dispatcher is not None
+        and type(dispatcher) is _PYOBJ_DISPATCHER
+        and target is dispatcher.dispatch
+        and f"{kind.__module__}.{kind.__qualname__}" == "torch._C._PyObjectDispatchFunc"
+        and not kind.__flags__ & _HEAP_TYPE_FLAG
+    )
+
+
+def _effect_key(qualified_name: str, overload_name: str) -> str:
+    """The name torch registers an overload's effect under."""
+    if overload_name in ("", "default"):
+        return qualified_name
+    return f"{qualified_name}.{overload_name}"
+
+
+def _is_pybind_builtin(value: object) -> bool:
+    return (
+        type(value) is types.BuiltinFunctionType
+        and type(cast("Any", value).__self__) is _PYBIND_RECORD
+    )
+
+
+def _is_native_operator_lookup(value: object, attr: str) -> bool:
+    """Whether ``value.attr`` is a stock ``torch.ops`` registry lookup: it
+    resolves (and caches) a registered operator and runs none of its kernels."""
+    # Without a class attribute of that name (descriptors come before the
+    # instance dict), the lookup reads the cached entry or runs the class's
+    # import-time __getattr__.
+    kind = type(value)
+    return (
+        any(kind is native for native in _TORCH_OPS_LOOKUP_TYPES)
+        and _registry_unpatched(value)
+        and getattr_static(kind, attr, _NO_ATTRIBUTE) is _NO_ATTRIBUTE
     )
 
 
@@ -1425,7 +1570,7 @@ class LiteralType(TypeInfo):
             # Native Tensor method lookup does not invoke a user descriptor.
             # Python replacements still go through opaque effect tracking.
             result = descriptor
-        elif any(type(self.value) is kind for kind in _TORCH_OPS_LOOKUP_TYPES):
+        elif _is_native_operator_lookup(self.value, attr):
             # ``torch.ops.<namespace>.<op>.<overload>`` resolves a registered
             # operator: torch's own lookup, which runs no user protocol and
             # touches no tensor, so the storage proofs survive it.
@@ -1452,8 +1597,9 @@ class LiteralType(TypeInfo):
 
     def merge(self, other: TypeInfo, var_name: str | None = None) -> TypeInfo:
         compared = other.value if isinstance(other, LiteralType) else None
-        # Native function/module/Tensor-class equality has no user hook. Keep
-        # them forbidden as call arguments, where they could be callbacks.
+        # Native function/module/Tensor-class equality has no user hook, nor
+        # does an unpatched torch.ops registry value's. Keep them forbidden as
+        # call arguments, where they could be callbacks.
         inputs = tuple(
             value
             for value in (self.value, compared)
@@ -1466,8 +1612,11 @@ class LiteralType(TypeInfo):
                     types.MethodDescriptorType,
                     types.ModuleType,
                     type,
-                    *_TORCH_OPS_VALUE_TYPES,
                 )
+            )
+            and not (
+                any(type(value) is kind for kind in _TORCH_OPS_VALUE_TYPES)
+                and _registry_unpatched(value)
             )
         )
         with _track_host_storage_effects(inputs, self.origin):
@@ -1655,6 +1804,7 @@ def _offset_expr(tensor: torch.Tensor) -> object:
     return offset if isinstance(offset, int) else _symint_expr(offset)
 
 
+@host_dispatch_mode
 class _PeerViewCapture(TorchDispatchMode):
     """Record get_remote_tensors views, also when a host helper calls it."""
 
@@ -1681,6 +1831,9 @@ class _PeerViewCapture(TorchDispatchMode):
                 and local.is_contiguous()
             )
             if mapped:
+                HostFunction.current().compiler_state.symmetric_bases[storage] = (
+                    _offset_expr(owners[0])
+                )
                 env.register_runtime_input_specialization(
                     f"symmetric_allocation_base:{source!r}",
                     RuntimeInputSpecialization(
@@ -1691,6 +1844,14 @@ class _PeerViewCapture(TorchDispatchMode):
                             ("data_ptr", "storage_span")
                         ),
                     ),
+                )
+            if all(
+                isinstance(size, int)
+                or isinstance(env.shape_env.replace(size._sympy_()), sympy.Integer)
+                for size in local.shape[1:]
+            ):
+                HostFunction.current().compiler_state.static_peer_layouts.update(
+                    peer.untyped_storage() for peer in result
                 )
             HostFunction.current().compiler_state.peer_views.update(
                 (
@@ -2451,6 +2612,7 @@ class TileIndexType(TypeInfo):
                     size_hint=_get_hint(numel),
                     max_size=outer_max,
                     bounded_by_block_id=bounded_by,
+                    data_dependent=numel is None,
                 )
             )
             if env.config_spec.supports_config_key("num_threads"):
@@ -3335,7 +3497,27 @@ def _eval_binary(op: ast.operator, left: object, right: object) -> object:
     return result
 
 
+def _symbool_operand_guards(
+    left: object, right: object
+) -> contextlib.AbstractContextManager[None]:
+    """Suppress shape guards for an operation between a SymBool and a tensor.
+
+    The tensor op converts the SymBool with ``bool()``, which guards on its
+    hint (and specializes a tunable it depends on). Neither the traced op,
+    which keeps the symbol, nor the result's dtype and shape depend on that
+    value."""
+    for scalar, other in ((left, right), (right, left)):
+        if isinstance(scalar, torch.SymBool) and isinstance(other, torch.Tensor):
+            return CompileEnvironment.current().shape_env.suppress_guards()
+    return contextlib.nullcontext()
+
+
 def _eval_binary_impl(op: ast.operator, left: object, right: object) -> object:
+    with _symbool_operand_guards(left, right):
+        return _eval_binary_op(op, left, right)
+
+
+def _eval_binary_op(op: ast.operator, left: object, right: object) -> object:
     if isinstance(op, ast.Add):
         # pyrefly: ignore [unsupported-operation]
         return left + right
@@ -3390,6 +3572,11 @@ def _eval_compare(op: ast.cmpop, left: object, right: object) -> object:
 
 
 def _eval_compare_impl(op: ast.cmpop, left: object, right: object) -> object:
+    with _symbool_operand_guards(left, right):
+        return _eval_compare_op(op, left, right)
+
+
+def _eval_compare_op(op: ast.cmpop, left: object, right: object) -> object:
     if isinstance(op, ast.Eq):
         return left == right
     if isinstance(op, ast.NotEq):

@@ -32,7 +32,7 @@ from helion.runtime.settings import _get_backend
 if TYPE_CHECKING:
     from collections.abc import Callable
 
-BackendName = Literal["triton", "cute"]
+BackendName = Literal["triton", "gluon", "cute"]
 
 BF16IN_CUTE_CONFIG = helion.Config(
     block_sizes=[1, 128],
@@ -382,21 +382,21 @@ FP4IN_TRITON_CONFIG = helion.Config(
 
 def _selected_backend(backend: BackendName | None) -> BackendName:
     selected = _get_backend() if backend is None else backend
-    if selected not in ("triton", "cute"):
+    if selected not in ("triton", "gluon", "cute"):
         raise ValueError(
-            f"nvfp4_gemv supports backend='triton' or 'cute', got {selected!r}"
+            f"nvfp4_gemv supports backend='triton', 'gluon' or 'cute', got {selected!r}"
         )
     return selected
 
 
 @functools.cache
-def _nvfp4_gemv_bf16in_triton_kernel() -> helion.Kernel[Tensor]:
-    """Coalesced-load W4A16 GEMV, Triton backend (the triton path)."""
+def _nvfp4_gemv_bf16in_triton_kernel(backend: BackendName) -> helion.Kernel[Tensor]:
+    """Coalesced-load W4A16 GEMV, Triton (or gluon) backend (the triton path)."""
     return helion.kernel(
         _nvfp4_gemv_bf16in_triton_body,
         static_shapes=True,
         config=BF16IN_TRITON_CONFIG,
-        backend="triton",
+        backend=backend,
     )
 
 
@@ -412,12 +412,12 @@ def _nvfp4_gemv_bf16in_cute_kernel() -> helion.Kernel[Tensor]:
 
 
 @functools.cache
-def _nvfp4_gemv_fp4in_triton_kernel() -> helion.Kernel[Tensor]:
+def _nvfp4_gemv_fp4in_triton_kernel(backend: BackendName) -> helion.Kernel[Tensor]:
     return helion.kernel(
         _nvfp4_gemv_fp4in_triton_body,
         static_shapes=True,
         config=FP4IN_TRITON_CONFIG,
-        backend="triton",
+        backend=backend,
     )
 
 
@@ -459,10 +459,10 @@ def nvfp4_gemv_bf16in(
     )
     n_rows, k_bytes = weight_bytes.shape
     groups = k_bytes // 8
-    if backend == "triton":
+    if backend != "cute":
         # Coalesced-load Triton kernel: weight stored as bytes, activation as
         # contiguous (groups, 16) bf16, scales as the raw SWIZZLE_32_4_4 bytes.
-        return _nvfp4_gemv_bf16in_triton_kernel()(
+        return _nvfp4_gemv_bf16in_triton_kernel(backend)(
             weight_bytes,
             x_bf16.view(groups, 16),
             weight_scale.reshape(-1).view(torch.int8),
@@ -508,8 +508,8 @@ def nvfp4_gemv_fp4in(
     out = torch.empty(
         weight_bytes.shape[0], dtype=torch.bfloat16, device=weight_bytes.device
     )
-    if backend == "triton":
-        return _nvfp4_gemv_fp4in_triton_kernel()(
+    if backend != "cute":
+        return _nvfp4_gemv_fp4in_triton_kernel(backend)(
             weight_bytes,
             x_bytes,
             weight_scale.reshape(-1).view(torch.int8),

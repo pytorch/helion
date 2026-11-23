@@ -29,6 +29,7 @@ from .lane_loops.markers import _dtype_ctor_from_identity
 from .lane_loops.markers import _is_lane_reduce_marker_assign
 from .lane_loops.markers import _lane_reduce_marker_expr
 from .lane_loops.markers import _LaneReduceMarker
+from .math_templates import nan_extremum_expr
 from .packet_access import match_packet_access
 from .resident_reductions import ResidentPassContext
 from .resident_reductions import _pointer_parts
@@ -561,9 +562,20 @@ def _uniform(
     )
 
 
-def _combine(kind: str, left: str, right: str) -> str:
+def _combine(kind: str, left: str, right: str, chain_dtype: str | None = None) -> str:
+    """``left`` combined with ``right`` as the reduction ``kind`` does.
+
+    ``chain_dtype`` is the accumulator's dtype where ``right`` is the tile's
+    next element: such an accumulate is a chain of extrema, which
+    ``nan_extremum_expr`` takes over unsigned keys for Int32 and Int16.  The
+    warps' partials come from shared memory and the steps of a warp
+    reduction from shuffles; those keep the plain form, and so does fp32
+    everywhere in this lowering.
+    """
     if kind in {"max", "min"}:
-        return f"cute.math.{kind}({left}, {right}, propagate_nan=True)"
+        return nan_extremum_expr(
+            kind, left, right, float32=False, chain_dtype=chain_dtype
+        )
     return f"({left}) {'+' if kind == 'sum' else '*'} ({right})"
 
 
@@ -591,6 +603,12 @@ def _finalize(
         new_var("sequence_" + name)
         for name in ("smem_ptr", "smem", "tid", "group_value", "warp")
     )
+    partial_read = f"{buffer}[({tid} // {region.threads}) * {warps} + {index}]"
+    if dtype.startswith("cutlass.Uint"):
+        # The shared-memory tensor of an unsigned dtype reads back as the
+        # signed dtype of its width, which the DSL refuses to combine with
+        # the unsigned accumulator.
+        partial_read = f"{dtype}({partial_read})"
     return [
         statement_from_string(
             f"{pointer} = cute.arch.alloc_smem({dtype}, {region.thread_count // 32})"
@@ -606,7 +624,7 @@ def _finalize(
         statement_from_string("cute.arch.sync_threads()"),
         statement_from_string(f"{value} = {marker.identity_expr}"),
         statement_from_string(
-            f"for {index} in cutlass.range_constexpr({warps}):\n    {value} = {_combine(marker.reduction_type, value, f'{buffer}[({tid} // {region.threads}) * {warps} + {index}]')}"
+            f"for {index} in cutlass.range_constexpr({warps}):\n    {value} = {_combine(marker.reduction_type, value, partial_read)}"
         ),
         # The same static allocation is reused on the next logical tile.
         statement_from_string("cute.arch.sync_threads()"),
@@ -987,7 +1005,7 @@ def _lower_region(
             inner_body.append(
                 replay(
                     statement_from_string(
-                        f"{accumulator} = {_combine(marker.reduction_type, accumulator, value)}"
+                        f"{accumulator} = {_combine(marker.reduction_type, accumulator, value, dtype)}"
                     )
                 )
             )

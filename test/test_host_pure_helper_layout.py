@@ -9,11 +9,15 @@ import torch
 
 import helion
 from helion._testing import cpu_render_target
+from helion._testing import skipIfRefEagerMark
 from helion._testing.cute_codegen import cpu_bind
 from helion._testing.cute_codegen import forbid_cuda_work
 import helion.language as hl
 
-pytestmark = pytest.mark.cpu_only
+pytestmark = [
+    pytest.mark.cpu_only,
+    skipIfRefEagerMark("reads compiler state, which ref mode does not build"),
+]
 
 
 def _helper_lane_output(x):
@@ -34,7 +38,14 @@ def _helper_lane_output(x):
 def test_pure_helpers_before_allocation_preserve_metal_lane_proof():
     # Model the target before kernel construction; the outer guard stays active.
     with cpu_render_target(forbid_native=False, forbid_cuda_init=None):
-        kernel = helion.kernel(_helper_lane_output, backend="metal", static_shapes=True)
+        # Metal emits no dtype asserts; the dtype-asserts lane's
+        # HELION_DEBUG_DTYPE_ASSERTS=1 would otherwise reject the backend.
+        kernel = helion.kernel(
+            _helper_lane_output,
+            backend="metal",
+            static_shapes=True,
+            debug_dtype_asserts=False,
+        )
         bound = cpu_bind(kernel, (torch.empty(16, 16),))
         code = bound.to_code(helion.Config(block_sizes=[16, 16], num_threads=[16, 1]))
     loops = [

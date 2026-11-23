@@ -271,6 +271,33 @@ def tile_loop_facts(
     return path_blocks, strategy_paths
 
 
+def innermost_loop_reduction_blocks(
+    device_ir: DeviceIR, graphs: Sequence[GraphInfo]
+) -> frozenset[int]:
+    """The blocks reduced inside the innermost loop of a tile loop path: the
+    block of every reduction (``ReductionLowering``) in a graph whose stack
+    of tiles is one of :func:`tile_loop_paths` and holds a tile loop, which
+    is that loop's own graph or a branch's under it.  A reduction in a
+    root's graph, or in the graph of a loop around another tile loop, runs
+    behind or around the innermost loop and does not count.  Structure
+    only: no extent is read."""
+    from ..inductor_lowering import ReductionLowering
+
+    graph_paths = _root_graph_tile_loop_paths(device_ir, graphs)
+    innermost = {
+        path
+        for path in _maximal_paths(path for _, _, path in graph_paths)
+        if len(path) > 1
+    }
+    return frozenset(
+        lowering.block_index
+        for _, info, path in graph_paths
+        if path in innermost
+        for node in info.graph.nodes
+        if isinstance(lowering := node.meta.get("lowering"), ReductionLowering)
+    )
+
+
 def sibling_row_loop_blocks(
     env: CompileEnvironment,
     device_ir: DeviceIR,

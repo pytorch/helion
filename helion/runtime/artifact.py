@@ -11,6 +11,7 @@ import hashlib
 import importlib.metadata
 import inspect
 import json
+import math
 from pathlib import Path
 import platform
 import sys
@@ -154,9 +155,9 @@ def _value_spec(
     if type(value) in (bool, int, str):
         return {"type": type(value).__name__, "value": value}
     if type(value) is float:
+        if math.isnan(value):
+            raise ValueError("Artifacts do not support NaN scalar values")
         return {"type": "float", "value": value.hex()}
-    if type(value) is bytes:
-        return {"type": "bytes", "value": value.hex()}
     if isinstance(value, (torch.dtype, torch.device)):
         return {
             "type": "dtype" if isinstance(value, torch.dtype) else "device",
@@ -193,9 +194,10 @@ def _literal_from_spec(spec: object) -> object:
     if kind in ("bool", "int", "str") and type(value).__name__ == kind:
         return value
     if kind == "float" and isinstance(value, str):
-        return float.fromhex(value)
-    if kind == "bytes" and isinstance(value, str):
-        return bytes.fromhex(value)
+        number = float.fromhex(value)
+        if math.isnan(number):
+            raise ValueError("Artifacts do not support NaN scalar values")
+        return number
     if kind == "device" and isinstance(value, str):
         return torch.device(value)
     if kind == "dtype" and isinstance(value, str) and value.startswith("torch."):
@@ -304,9 +306,15 @@ def export_artifact(
             )
         if any(
             indexing_uses_tensor_descriptor(value)
-            for value in (config.indexing, config.atomic_indexing)
+            for value in (
+                config.indexing,
+                config.atomic_indexing,
+                config.prefetch_indexing,
+            )
         ):
-            raise ValueError("Tensor-descriptor indexing is not supported by artifacts")
+            raise ValueError(
+                "Tensor-descriptor indexing and prefetch are not supported by artifacts"
+            )
         source = bound.to_code(
             config, options=OutputCodeOptions(allow_helion_deps=False)
         )

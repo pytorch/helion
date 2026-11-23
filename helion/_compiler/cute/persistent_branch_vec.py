@@ -22,6 +22,8 @@ import re
 from typing import TYPE_CHECKING
 from typing import cast
 
+import torch
+
 from ..ast_read_writes import ReadWrites
 from ._ast_pass_utils import loop_extent
 from ._ast_pass_utils import names_read
@@ -30,6 +32,10 @@ from ._ast_pass_utils import reparse_expr as _clone_expr
 from ._ast_pass_utils import replace_call
 from .cache_policy_loads import _CUTE_CACHE_LOAD_HELPER_NAMES
 from .cache_policy_loads import CachePolicy
+from .emitters.lane_packets import _CUTE_BYTE_PACK_TYPE
+from .emitters.lane_packets import _CUTE_BYTE_PACKET_WIDTHS
+from .emitters.lane_packets import _cute_unroll_vec_extract
+from .emitters.lane_packets import _cute_unroll_vec_load_expr
 from .packet_access import PERSISTENT_BRANCH_VEC_LOAD
 from .packet_access import PERSISTENT_BRANCH_VEC_STORE
 from .packet_access import call_write_roots
@@ -54,8 +60,8 @@ _DTYPE_INFO = {
 }
 # FP8 stores collect unconverted lanes, which their flush helper converts as
 # one packet; bool stores collect converted ``cutlass.Uint8`` lanes, which
-# ``_cute_store_u8_vec`` only packs.  Loads of these dtypes keep their scalar
-# path.
+# ``_cute_store_u8_vec`` only packs.  FP8 loads keep their scalar path; a
+# bool row's marker (``cute_bool_byte_packets``) loads one packed integer.
 _STORE_DTYPE_INFO = {
     **_DTYPE_INFO,
     "cutlass.Float8E4M3FN": ("cutlass.Uint8", 1, "_cute_store_fp8e4m3fn_vec"),
@@ -1555,6 +1561,14 @@ def _scalar_load_and_mask(node: ast.expr) -> tuple[ast.Call, ast.expr | None] | 
         value = node
         mask = None
     if (
+        isinstance(value, ast.Compare)
+        and len(value.ops) == 1
+        and isinstance(value.ops[0], ast.NotEq)
+        and ast.unparse(value.comparators[0]) == "cutlass.Uint8(0)"
+    ):
+        # A bool load compares its byte against zero.
+        value = value.left
+    if (
         isinstance(value, ast.Call)
         and isinstance(value.func, ast.Attribute)
         and value.func.attr == "load"
@@ -1928,6 +1942,17 @@ class _BranchLocalPersistentVectorizer:
                     else None
                 )
                 dtype_info = _DTYPE_INFO.get(dtype) if isinstance(dtype, str) else None
+                # A bool row's packet (``cute_bool_byte_packets``): its bytes
+                # in one packed integer.
+                byte_pack = (
+                    _CUTE_BYTE_PACK_TYPE[marker_width]
+                    if dtype == "cutlass.Boolean"
+                    and isinstance(marker_width, int)
+                    and marker_width in _CUTE_BYTE_PACKET_WIDTHS
+                    else None
+                )
+                if byte_pack is not None:
+                    dtype_info = (byte_pack, 1, "")
                 chunks = self._packet_chunks(lane_var, width, marker_width)
                 if (
                     marker_block == block_id
@@ -1978,15 +2003,25 @@ class _BranchLocalPersistentVectorizer:
                             # helper of its width (32 bytes: nc_l2_first, and
                             # the L2 policies under ``cute_wide_packet_hints``).
                             policy = CachePolicy.from_suffix(eviction)
-                            load_source = render_packet_load(
-                                ast.unparse(base),
-                                marker_width,
-                                carrier,
-                                helper=policy.vector_helper(
-                                    marker_width * itemsize,
-                                    wide_packets=self.wide_packet_hints,
-                                ),
-                                kwargs=policy.load_kwargs,
+                            load_source = (
+                                # A packed integer takes no L2 policy.
+                                _cute_unroll_vec_load_expr(
+                                    ast.unparse(base),
+                                    torch.bool,
+                                    marker_width,
+                                    eviction,
+                                )
+                                if byte_pack is not None
+                                else render_packet_load(
+                                    ast.unparse(base),
+                                    marker_width,
+                                    carrier,
+                                    helper=policy.vector_helper(
+                                        marker_width * itemsize,
+                                        wide_packets=self.wide_packet_hints,
+                                    ),
+                                    kwargs=policy.load_kwargs,
+                                )
                             )
                             vector_load = ast.parse(load_source, mode="eval").body
                             before.append(
@@ -2005,14 +2040,20 @@ class _BranchLocalPersistentVectorizer:
                                     for node in ast.walk(base)
                                 ),
                             )
-                        element = (
-                            f"{vec_names[0]}[{lane_var}]"
+                        packet, element_index = (
+                            (vec_names[0], lane_var)
                             if chunks == 1
-                            else f"({', '.join(vec_names)})"
-                            f"[{lane_var} // {marker_width}][{lane_var} % {marker_width}]"
+                            else (
+                                f"({', '.join(vec_names)})[{lane_var} // {marker_width}]",
+                                f"{lane_var} % {marker_width}",
+                            )
                         )
                         extract = ast.parse(
-                            f"{carrier}({element}).bitcast({dtype})",
+                            # The byte the scalar load reads, which the
+                            # marker's value compares against zero.
+                            _cute_unroll_vec_extract(packet, element_index, torch.bool)
+                            if byte_pack is not None
+                            else f"{carrier}({packet}[{element_index}]).bitcast({dtype})",
                             mode="eval",
                         ).body
                         replacement, _ = replace_call(

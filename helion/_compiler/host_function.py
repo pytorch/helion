@@ -7,6 +7,7 @@ import math
 import struct
 import sys
 import threading
+import types
 import typing
 from typing import TYPE_CHECKING
 from typing import NamedTuple
@@ -26,6 +27,7 @@ from .ast_extension import expr_from_string
 from .ast_extension import statement_from_string
 from .compile_environment import CompileEnvironment
 from .output_header import SOURCE_MODULE
+from .output_header import library_import_value
 from .type_printer import print_ast
 from .variable_origin import AttributeOrigin
 from .variable_origin import GlobalOrigin
@@ -35,7 +37,6 @@ from .variable_origin import Origin
 if TYPE_CHECKING:
     from collections.abc import Iterator
     import inspect
-    import types
 
     from ..runtime.config import Config
     from .device_ir import DeviceIR
@@ -176,6 +177,16 @@ class CompilerState:
     # get_remote_tensors views -> (local storage, owner rank), None if unmapped.
     peer_views: dict[torch.UntypedStorage, tuple[torch.UntypedStorage, int] | None] = (
         dataclasses.field(default_factory=dict)
+    )
+    # get_remote_tensors views with a fixed layout: contiguous views of
+    # local.size() whose trailing sizes are specialized.
+    static_peer_layouts: set[torch.UntypedStorage] = dataclasses.field(
+        default_factory=set
+    )
+    # Mapped local storage -> its guarded owner's storage offset: the symmetric
+    # allocation base, where the peer views start.
+    symmetric_bases: dict[torch.UntypedStorage, object] = dataclasses.field(
+        default_factory=dict
     )
 
     def ssa_source(self, tensor: torch.Tensor) -> torch.Tensor | None:
@@ -339,7 +350,18 @@ class HostFunction:
 
     def import_from_module(
         self, module_scope: dict[str, object], name: str
-    ) -> AttributeOrigin:
+    ) -> AttributeOrigin | GlobalOrigin:
+        # A library module referenced from a traced callable (a score/mask mod)
+        # resolves like a kernel-body global, not through the source module,
+        # when it is the module the backend's generated code imports under
+        # that name.
+        imports = CompileEnvironment.current().backend.library_imports
+        if (
+            name in imports
+            and isinstance(value := module_scope.get(name), types.ModuleType)
+            and value is library_import_value(name, imports)
+        ):
+            return GlobalOrigin(name=name, function=self)
         # pyrefly: ignore [missing-attribute]
         if module_scope is self.fn.__globals__:
             return self.global_scope_origin(name)
@@ -563,6 +585,26 @@ class HostFunction:
         if self._device_ir is not None:
             result.append(self._device_ir.debug_str())
         return "\n\n".join(result)
+
+    def first_tensor_param(self) -> str | None:
+        """The first tensor parameter, whose device code generation gives a
+        host factory call that names none (``device=x.device``)."""
+        return next(
+            (
+                name
+                for name, value in self.params.arguments.items()
+                if isinstance(value, torch.Tensor)
+            ),
+            None,
+        )
+
+    def first_tensor_origin(self, device: torch.device) -> Origin | None:
+        """The first host tensor on ``device``, whose device host-side helpers
+        read (``get_num_sm(x.device)`` for a persistent kernel)."""
+        return next(
+            (o for t, o in self.tensor_to_origin.items() if t.device == device),
+            None,
+        )
 
     def codegen_function_def(
         self,

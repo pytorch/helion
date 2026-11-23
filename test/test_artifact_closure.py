@@ -12,6 +12,7 @@ from helion._compiler.output_code_utils import dependency_free_runtime_source
 from helion._compiler.triton.backend import TritonBackend
 from helion._utils import cdiv
 from helion._utils import next_power_of_2
+from helion.autotuner.aot_compile import _standalone_call_key
 from helion.autotuner.aot_compile import generate_standalone_file
 
 pytestmark = pytest.mark.cpu_only
@@ -203,6 +204,38 @@ def test_aot_variants_share_runtime_and_host_helpers() -> None:
     assert namespace["_kernel_c0"](65) == 32
     assert namespace["_kernel_c1"](65) == 32
     assert namespace["kernel"](65) == 32
+
+
+def test_static_dispatch_preserves_literals_when_renaming_symbols() -> None:
+    source = """
+class tl:
+    constexpr = int
+
+_BLOCK_SIZE_0 = tl.constexpr(32)
+
+def _helion_example():
+    return _BLOCK_SIZE_0, "_helion_example", "_BLOCK_SIZE_0", b"_helion_example"
+
+def example(tag):
+    return _helion_example(), tag
+"""
+    tags = ("_helion_example", "_BLOCK_SIZE_0")
+    with tempfile.TemporaryDirectory() as directory:
+        path = generate_standalone_file(
+            "example",
+            [source, source.replace("constexpr(32)", "constexpr(64)")],
+            "",
+            Path(directory),
+            dispatch_keys=[_standalone_call_key((tag,)) for tag in tags],
+        )
+        closed = close_artifact_source(path.read_text())
+    namespace = {}
+    exec(closed, namespace)
+    for tag, size in zip(tags, (32, 64), strict=True):
+        assert namespace["example"](tag) == (
+            (size, "_helion_example", "_BLOCK_SIZE_0", b"_helion_example"),
+            tag,
+        )
 
 
 @pytest.mark.parametrize(

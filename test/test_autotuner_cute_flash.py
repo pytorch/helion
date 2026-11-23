@@ -37,6 +37,7 @@ from helion._compiler.cute.attention_plan import AttentionScorePlan
 from helion._compiler.cute.autotune.config_generation_ext import (
     CuteConfigGenerationExtension,
 )
+from helion._compiler.cute.autotune.config_keys import CUTE_LOAD_HINT_FORM_KEYS
 from helion._compiler.cute.autotune.flash_search import FlashCoverageDesign
 from helion._compiler.cute.autotune.flash_search import _flash_log_maximin_refinements
 from helion._compiler.cute.autotune.flash_surface import enable_cute_flash_search
@@ -8207,8 +8208,12 @@ class TestCuteAutotuner(TestCase):
 
         configs = [gen.random_config() for _ in range(20)]
         self.assertTrue(any(config.num_threads for config in configs))
+        # A decoded config also names the load forms that carry its
+        # ``load_eviction_policies`` (``open_load_hint_forms``); those knobs
+        # are in no flat layout.
+        hint_forms = set(CUTE_LOAD_HINT_FORM_KEYS)
         for config in configs:
-            self.assertLessEqual(set(config.config), flat_keys)
+            self.assertLessEqual(set(config.config) - hint_forms, flat_keys)
             self.assertNotIn("persistent", config.pid_type)
             explicit_threads = [nt for nt in config.num_threads if nt > 0]
             if explicit_threads:

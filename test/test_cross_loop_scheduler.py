@@ -3,6 +3,7 @@ from __future__ import annotations
 import ast
 import dataclasses
 import itertools
+import re
 from types import SimpleNamespace
 from typing import Any
 from typing import Literal
@@ -22,6 +23,7 @@ from helion._compiler.cross_loop_scheduler import ReadinessEvent
 from helion._compiler.cross_loop_scheduler import ReadinessGraph
 from helion._compiler.cross_loop_scheduler import ReadinessProducer
 from helion._compiler.cross_loop_scheduler import StaticPipelinePlan
+from helion._compiler.cross_loop_scheduler import _barrier_reasons
 from helion._compiler.cross_loop_scheduler import _segmented_nested_loop_counter
 from helion._compiler.cross_loop_scheduler import _select_root_barrier_edges
 from helion._compiler.cross_loop_scheduler import build_static_pipeline_plan
@@ -43,6 +45,12 @@ from helion._compiler.tile_dependency import coordinate_axis_symbol
 from helion._compiler.tile_dependency import instantiate_coordinate_domains
 from helion._compiler.triton.backend import TritonBackend
 from helion._testing import TestCase
+from helion._testing import skipIfRefEager
+from helion._testing import skipIfTileIR
+from helion._testing import skipUnlessBackends
+from helion._testing.cute_codegen import cuda_metadata_trace
+from helion._testing.distributed_kernels import fake_group as fake_group
+from helion._testing.distributed_kernels import scatter_after_local_kernel
 
 pytestmark = pytest.mark.cpu_only
 
@@ -124,6 +132,38 @@ def test_integer_fill_dry_pass_keeps_the_bound_available() -> None:
             guards,
         )
         assert not cross_loop_codegen._dry_pass_binds(result, guards, set())
+
+
+@skipUnlessBackends(["triton"])
+@skipIfTileIR("TileIR does not support barrier operations")
+@skipIfRefEager("tile dependencies are built only in compiled mode")
+def test_hold_waits_before_the_first_scatter(fake_group: str) -> None:
+    """The in-band scatter hold runs where the first scatter store's block
+    starts: the roots before it write no scatter row, so their loads issue
+    without it.  The launch is announced and the hold flag read before the
+    first root's tasks."""
+    args = (
+        torch.zeros(32, 64, dtype=torch.bfloat16),
+        torch.zeros(4, 8, 64, dtype=torch.bfloat16),
+        torch.zeros(4, 8, dtype=torch.int32),
+        torch.zeros(1, dtype=torch.int32),
+        fake_group,
+    )
+    scatter_after_local_kernel.reset()
+    with cuda_metadata_trace():
+        code = scatter_after_local_kernel.bind(args).to_triton_code()
+    assert code.count("_hold_after_fallback(") == 1
+    body = code[code.index("def _helion_scatter_after_local_kernel(") :]
+    # The task loops of roots 0 (local) and 1 (the scatter), in order.
+    local, scatter = (
+        m.start() for m in itertools.islice(re.finditer("for virtual_pid in", body), 2)
+    )
+    assert body.index("tile_dependency_peer_held = ") < local
+    announce = re.search(r"tile_dependency_every_rank(_\d+)? = ", body)
+    assert announce is not None
+    assert announce.start() < local
+    hold = body.index("_hold_after_fallback(tile_dependency_peer_state")
+    assert local < hold < scatter
 
 
 def _domain(
@@ -451,6 +491,7 @@ def _access(
 def _dependency_graph(
     root_axes: list[list[int]],
     *accesses: TileAccess,
+    root_phases: tuple[int, ...] | None = None,
 ) -> TileDependencyGraph:
     return build_tile_dependency_graph(
         tuple(
@@ -458,6 +499,7 @@ def _dependency_graph(
             for index, access in enumerate(accesses)
         ),
         root_axes,
+        root_phases=root_phases,
     )
 
 
@@ -492,11 +534,15 @@ class TestCrossLoopScheduler(TestCase):
         )
         static = _plan(roots, 4, barriers=frozenset(((0, 1),)))
         dynamic = dataclasses.replace(static, dispatch_mode="dynamic")
+        claimed = dataclasses.replace(static, dispatch_mode="claimed")
 
         self.assertEqual(static.execution_orders, dynamic.execution_orders)
         self.assertEqual(static.readiness_counters, dynamic.readiness_counters)
         self.assertEqual(static.root_barrier_arrival_count(0), 4)
         self.assertEqual(dynamic.root_barrier_arrival_count(0), 5)
+        # Claiming workers still publish once each, after their task loop.
+        self.assertEqual(claimed.root_barrier_arrival_count(0), 4)
+        self.assertEqual(claimed.deferred_peer_releases(frozenset({1})), {})
         with self.assertRaisesRegex(ValueError, "invalid cross-loop dispatch mode"):
             dataclasses.replace(static, dispatch_mode=cast("Any", "invalid"))
 
@@ -511,6 +557,7 @@ class TestCrossLoopScheduler(TestCase):
         graph = ReadinessGraph((root,), (event,))
         static = _plan((root,), 1, counters=(counter,))
         dynamic = dataclasses.replace(static, dispatch_mode="dynamic")
+        claimed = dataclasses.replace(static, dispatch_mode="claimed")
 
         def is_safe(plan: StaticPipelinePlan) -> bool:
             return cross_loop_scheduler._schedule_is_progress_safe(
@@ -524,6 +571,7 @@ class TestCrossLoopScheduler(TestCase):
 
         self.assertTrue(is_safe(static))
         self.assertFalse(is_safe(dynamic))
+        self.assertFalse(is_safe(claimed))
 
     def test_static_geometry_uses_all_root_padded_prefixes(self) -> None:
         roots = tuple(
@@ -1129,6 +1177,30 @@ class TestCrossLoopScheduler(TestCase):
             (counter,),
         )
 
+        # With the work budget spent, the nested wait's reason says so.
+        obligation: DependencyObligation = (0, None, 7)
+        consumer = dataclasses.replace(
+            event.consumers[0], covered_obligations=frozenset({obligation})
+        )
+        graph = ReadinessGraph(
+            graph.root_domains, (dataclasses.replace(event, consumers=(consumer,)),)
+        )
+        remaining = 0
+
+        def spent(amount: int) -> bool:
+            nonlocal remaining
+            remaining -= amount
+            return remaining >= 0
+
+        skipped: dict[DependencyObligation, str] = {}
+        self.assertEqual(
+            cross_loop_scheduler.collect_nested_loop_scheduling_counters(
+                graph, spent, skipped
+            ),
+            (),
+        )
+        self.assertEqual(skipped, {obligation: "the scheduler's work budget ran out"})
+
     def test_nested_counter_admission_uses_emitted_wait_count(self) -> None:
         producer_root = _domain((10, 2, 1), identity=0)
         consumer_root = _domain((20, 3, 1), identity=1)
@@ -1530,6 +1602,10 @@ class TestCrossLoopScheduler(TestCase):
         )
         self.assertEqual(plan.readiness_counters, ())
         self.assertEqual(plan.root_barrier_edges, frozenset(((0, 1),)))
+        self.assertEqual(
+            set(plan.barrier_reasons.values()),
+            {"the producer's tensor has a data-dependent shape, stride or offset"},
+        )
 
         dynamic = build_static_pipeline_plan(
             dependency_graph=graph,
@@ -1541,6 +1617,91 @@ class TestCrossLoopScheduler(TestCase):
         self.assertEqual(dynamic.dispatch_mode, "dynamic")
         self.assertEqual(dynamic.root_barrier_edges, plan.root_barrier_edges)
         self.assertEqual(dynamic.root_barrier_arrival_count(0), 4)
+
+    def test_barrier_reasons_name_only_the_dependencies_without_counters(self) -> None:
+        # tmp_0's dependency has an exact counter, tmp_1's has none: the barrier
+        # tmp_1 forces also orders tmp_0, which is not reported as a cause.
+        graph = _dependency_graph(
+            [[10], [20]],
+            _access(root=0, kind="store", block_id=10),
+            _access(root=1, kind="load", block_id=20),
+            _access(root=0, kind="store", block_id=10, allocation_id=1, exact=False),
+            _access(root=1, kind="load", block_id=20, allocation_id=1, exact=False),
+        )
+        roots, sites = instantiate_coordinate_domains(
+            graph, axis_geometry={10: (4, 16), 20: (4, 16)}
+        )
+        assert all(root is not None for root in roots)
+        root_domains = tuple(root for root in roots if root is not None)
+        plan = build_static_pipeline_plan(
+            dependency_graph=graph,
+            root_task_orders=tuple(_dense(root) for root in root_domains),
+            site_domains=sites,
+            worker_count=4,
+        )
+        self.assertEqual(plan.root_barrier_edges, frozenset(((0, 1),)))
+        allocations = {
+            dependency.dependency_id: edge.allocation_id
+            for edge in graph.edges
+            for dependency in edge.access_dependencies
+        }
+        self.assertEqual(
+            {allocations[dependency] for dependency, *_ in plan.barrier_reasons}, {1}
+        )
+
+    def test_exact_all_to_all_barrier_reason(self) -> None:
+        # The consumer's one task reads every producer task's tile: one total
+        # key, which a root barrier orders as a counter would.
+        graph = _dependency_graph(
+            [[10], [20]],
+            _access(root=0, kind="store", block_id=10),
+            _access(root=1, kind="load", block_id=20),
+        )
+        roots, sites = instantiate_coordinate_domains(
+            graph, axis_geometry={10: (4, 16), 20: (1, 64)}
+        )
+        assert all(root is not None for root in roots)
+        root_domains = tuple(root for root in roots if root is not None)
+        plan = build_static_pipeline_plan(
+            dependency_graph=graph,
+            root_task_orders=tuple(_dense(root) for root in root_domains),
+            site_domains=sites,
+            worker_count=4,
+        )
+        self.assertEqual(plan.readiness_counters, ())
+        self.assertEqual(plan.root_barrier_edges, frozenset(((0, 1),)))
+        self.assertEqual(
+            set(plan.barrier_reasons.values()),
+            {"every consumer task waits for every producer task (exact)"},
+        )
+
+    def test_all_to_all_reason_yields_only_for_an_unkeyed_obligation(self) -> None:
+        # An obligation a keyed all-to-all event still represents keeps that
+        # reason beside why another relation of its was dropped; one only a
+        # whole-root event covers has the dropped relation's reason alone.
+        obligation = (0, None, None)
+        inversion = "the readiness keys do not invert to the producer's tasks"
+        plan = cast(
+            "StaticPipelinePlan",
+            SimpleNamespace(readiness_counters=(), root_barrier_edges={(0, 1)}),
+        )
+
+        def reasons(unkeyed: frozenset[tuple[int, None, None]]) -> set[str]:
+            return set(
+                _barrier_reasons(
+                    plan,
+                    (((0, 1), frozenset((obligation,))),),
+                    frozenset((obligation,)),
+                    {obligation: cross_loop_scheduler._ALL_TO_ALL},
+                    {obligation: inversion},
+                    unkeyed,
+                ).values()
+            )
+
+        self.assertEqual(
+            reasons(frozenset()), {f"{cross_loop_scheduler._ALL_TO_ALL}; {inversion}"}
+        )
+        self.assertEqual(reasons(frozenset((obligation,))), {inversion})
 
     def test_exhausted_relation_budget_uses_root_barrier(self) -> None:
         graph = _dependency_graph(
@@ -1563,6 +1724,48 @@ class TestCrossLoopScheduler(TestCase):
 
         self.assertEqual(plan.readiness_counters, ())
         self.assertEqual(plan.root_barrier_edges, frozenset(((0, 1),)))
+        self.assertEqual(
+            set(plan.barrier_reasons.values()), {"the scheduler's work budget ran out"}
+        )
+
+    def test_spent_budget_keeps_a_whole_root_events_reason(self) -> None:
+        # tmp_0's exact dependency spends the budget first; tmp_1's whole-root
+        # event, built for its inexact layout, keeps that reason alone.
+        graph = _dependency_graph(
+            [[10], [20]],
+            _access(root=0, kind="store", block_id=10),
+            _access(root=1, kind="load", block_id=20),
+            _access(root=0, kind="store", block_id=10, allocation_id=1, exact=False),
+            _access(root=1, kind="load", block_id=20, allocation_id=1, exact=False),
+        )
+        roots, sites = instantiate_coordinate_domains(
+            graph, axis_geometry={10: (4, 16), 20: (4, 16)}
+        )
+        assert all(root is not None for root in roots)
+        root_domains = tuple(root for root in roots if root is not None)
+        allocations = {
+            dependency.dependency_id: edge.allocation_id
+            for edge in graph.edges
+            for dependency in edge.access_dependencies
+        }
+        for budget in range(8):
+            with mock.patch.object(
+                cross_loop_scheduler, "_MAX_SYMBOLIC_RELATION_WORK", budget
+            ):
+                plan = build_static_pipeline_plan(
+                    dependency_graph=graph,
+                    root_task_orders=tuple(_dense(root) for root in root_domains),
+                    site_domains=sites,
+                    worker_count=4,
+                )
+            reasons = {
+                allocations[dependency]: reason
+                for (dependency, *_), reason in plan.barrier_reasons.items()
+            }
+            self.assertEqual(
+                reasons[1],
+                "the producer's tensor has a data-dependent shape, stride or offset",
+            )
 
     def test_relation_budget_degrades_monotonically_to_root_barrier(self) -> None:
         budgets = (0, 1, 2, 4, 8, 12, 16, 32, 64, 128, 192)

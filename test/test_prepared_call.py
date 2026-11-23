@@ -1500,6 +1500,42 @@ class TestPreparedCall(RefEagerTestDisabled, TestCase):
 
     @onlyBackends(["triton"])
     @skipIfTileIR("legacy torch.compile rejects TileIR launch options")
+    def test_fullgraph_capture_without_fusion_integration_with_torch_ops_call(
+        self,
+    ) -> None:
+        # A torch.ops host call makes the cache key read the torch modes
+        # (_HostModesTrustedExtractor); capture still reuses the eager binding.
+        @helion.kernel(
+            static_shapes=True,
+            config=helion.Config(block_sizes=[64]),
+            torch_compile_fusion=False,
+        )
+        def add_one_cloned(x: torch.Tensor) -> torch.Tensor:
+            x = torch.ops.aten.clone(x)
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.size(0)):
+                out[tile] = x[tile] + 1
+            return out
+
+        x = torch.randn(64, device=DEVICE)
+        torch.testing.assert_close(add_one_cloned(x), x + 1)
+        self.assertTrue(add_one_cloned._has_specialization_extras)  # type: ignore[attr-defined]
+
+        def call(x: torch.Tensor) -> torch.Tensor:
+            return add_one_cloned(x)
+
+        with patch(
+            "helion._compiler._dynamo.variables.supports_torch_compile_fusion",
+            return_value=False,
+        ):
+            compiled = torch.compile(call, fullgraph=True)
+            torch.testing.assert_close(compiled(x), x + 1)
+            # A torch.device context is trusted in eager and under capture.
+            with torch.device(DEVICE):
+                torch.testing.assert_close(compiled(x), x + 1)
+
+    @onlyBackends(["triton"])
+    @skipIfTileIR("legacy torch.compile rejects TileIR launch options")
     def test_fullgraph_capture_without_fusion_integration_keeps_metadata_guards(
         self,
     ) -> None:

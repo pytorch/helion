@@ -8,11 +8,15 @@ import torch
 import helion
 from helion._testing import cpu_render_target
 from helion._testing import onlyBackends
+from helion._testing import skipIfRefEagerMark
 from helion._testing.tunable_fragments import check_host_selected_value
 from helion.autotuner import BooleanFragment
 import helion.language as hl
 
-pytestmark = pytest.mark.cpu_only
+pytestmark = [
+    pytest.mark.cpu_only,
+    skipIfRefEagerMark("reads compiler state, which ref mode does not build"),
+]
 
 
 @helion.kernel(autotune_effort="none")

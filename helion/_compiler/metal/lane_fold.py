@@ -404,6 +404,41 @@ def _array_writes(tree: ast.AST, lane: str) -> set[str]:
 BF16_CAST = "helion_bf16_cast"
 
 
+def _round_bf16_cast(node: ast.Call) -> ast.AST:
+    """``node``, or for a ``static_cast`` to bfloat the same conversion
+    through :data:`BF16_CAST`: Metal miscompiles float -> bfloat conversions
+    that lane copies multiply (exact in float16 and float32 at the same
+    MSL), and its own cast flushes bfloat subnormals; BF16_CAST rounds in
+    integer arithmetic, as the MPP path's float tiles do."""
+    if (
+        isinstance(node.func, ast.Name)
+        and node.func.id == "static_cast"
+        and isinstance(node.args[0], ast.Name)
+        and node.args[0].id == "bfloat"
+    ):
+        return ast.copy_location(
+            ast.Call(
+                func=ast.Name(id=BF16_CAST, ctx=ast.Load()),
+                args=node.args[1:],
+                keywords=[],
+            ),
+            node,
+        )
+    return node
+
+
+class _RoundBf16(ast.NodeTransformer):
+    def visit_Call(self, node: ast.Call) -> ast.AST:
+        self.generic_visit(node)
+        return _round_bf16_cast(node)
+
+
+def round_bf16_casts(stmts: list[ast.stmt]) -> list[ast.stmt]:
+    """``stmts`` with each conversion to bfloat through :data:`BF16_CAST`
+    (:func:`_round_bf16_cast`), as lane copies convert."""
+    return [_RoundBf16().visit(copy.deepcopy(stmt)) for stmt in stmts]
+
+
 class _RenameLane(ast.NodeTransformer):
     def __init__(self, dependent: set[str], lane: str, index: int) -> None:
         self.dependent = dependent
@@ -411,25 +446,8 @@ class _RenameLane(ast.NodeTransformer):
         self.index = index
 
     def visit_Call(self, node: ast.Call) -> ast.AST:
-        # Metal miscompiles float -> bfloat conversions that lane copies
-        # multiply (exact in float16 and float32 at the same MSL); round
-        # them in integer arithmetic, as the MPP path's float tiles do.
         self.generic_visit(node)
-        if (
-            isinstance(node.func, ast.Name)
-            and node.func.id == "static_cast"
-            and isinstance(node.args[0], ast.Name)
-            and node.args[0].id == "bfloat"
-        ):
-            return ast.copy_location(
-                ast.Call(
-                    func=ast.Name(id=BF16_CAST, ctx=ast.Load()),
-                    args=node.args[1:],
-                    keywords=[],
-                ),
-                node,
-            )
-        return node
+        return _round_bf16_cast(node)
 
     def visit_Name(self, node: ast.Name) -> ast.AST:
         if node.id == self.lane:

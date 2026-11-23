@@ -180,6 +180,12 @@ class TestBackendRegistry(unittest.TestCase):
         self.assertEqual(get_heuristics("_test_late"), ())
         self.assertFalse(_tunable_name_conflicts("_test_late_key"))
 
+    def test_reregister_same_class_is_noop(self) -> None:
+        repaired = frozenset({"triton"})
+        with mock.patch.object(backend_registry, "_REPAIRED_CODEGEN_NAMES", repaired):
+            register_compiler_backend(get_backend_class("triton"))
+            self.assertIs(backend_registry._REPAIRED_CODEGEN_NAMES, repaired)
+
     def test_all_reserved_launch_param_names_is_union(self) -> None:
         result = all_reserved_launch_param_names()
         self.assertIsInstance(result, frozenset)

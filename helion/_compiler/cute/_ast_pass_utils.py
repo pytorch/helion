@@ -105,6 +105,19 @@ def names_stored_or_deleted(node: ast.AST) -> set[str]:
     }
 
 
+def loop_target_names(node: ast.AST) -> list[ast.Name]:
+    """Every ``ast.Name`` in the target of a ``for`` under ``node``.  A
+    generated loop target may carry no Store context, so the names a body
+    binds are these beside ``names_stored_or_deleted``."""
+    return [
+        child
+        for loop in ast.walk(node)
+        if isinstance(loop, ast.For)
+        for child in ast.walk(loop.target)
+        if isinstance(child, ast.Name)
+    ]
+
+
 def is_name_assign(stmt: ast.AST) -> TypeGuard[ast.Assign]:
     """``stmt`` is ``NAME = value`` with a single ``ast.Name`` target."""
     return (

@@ -51,6 +51,7 @@ from helion.runtime.settings import default_autotuner_fn
 if TYPE_CHECKING:
     from collections.abc import Callable
     from collections.abc import Iterable
+    from collections.abc import Iterator
     from collections.abc import Sequence
 
 
@@ -327,7 +328,9 @@ class TestMultiShapeRuntime(unittest.TestCase):
             workload_key=workload_key,
         )
         cache.autotuner = SimpleNamespace(  # pyrefly: ignore [bad-assignment]
-            settings=settings, _benchmark_provider_cls=LocalBenchmarkProvider
+            settings=settings,
+            _benchmark_provider_cls=LocalBenchmarkProvider,
+            _benchmark_prelude=None,
         )
 
         key = cache._generate_key()
@@ -666,6 +669,16 @@ class _FakeLocalBenchmarkProvider:
         self.budget_exceeded_fn: Callable[[], bool] = lambda: False
         self.fns = [lambda: None for _ in kernel.timings]
         self.effective_source_repairs: dict[Config, BenchmarkResult] = {}
+        self.fresh_source_timing_calls: list[bool] = []
+        self._fresh = False
+
+    @contextlib.contextmanager
+    def fresh_source_timings(self) -> Iterator[None]:
+        self._fresh = True
+        try:
+            yield
+        finally:
+            self._fresh = False
 
     def set_budget_exceeded_fn(self, fn: Callable[[], bool]) -> None:
         self.budget_exceeded_fn = fn
@@ -692,6 +705,7 @@ class _FakeLocalBenchmarkProvider:
         raise_if_no_viable_config: bool = True,
     ) -> list[BenchmarkResult]:
         self.benchmark_calls.append((configs, desc))
+        self.fresh_source_timing_calls.append(self._fresh)
         if self.kernel.error is not None:
             raise self.kernel.error
         self._autotune_metrics.num_accuracy_failures += self.kernel.accuracy_failures
@@ -1291,6 +1305,9 @@ class TestMultiShapeBenchmarkProvider(unittest.TestCase):
         self.assertFalse(provider.has_valid_measurement(configs[1]))
         for child in provider.children:
             self.assertEqual(len(child.benchmark_calls), 2)
+            # The first batch may be settled from a child's source records;
+            # the re-timing asks every child for timings.
+            self.assertEqual(child.fresh_source_timing_calls, [False, True])
 
     def test_rebenchmark_preserves_previous_values_after_budget(self) -> None:
         spec = _make_config_spec()
@@ -1548,6 +1565,10 @@ class TestMultiShapeBestOfK(unittest.TestCase):
 
 
 class _StageSearch:
+    # (the config a stage's kernel was measured under, when it returns
+    # a simpler one)
+    _selected_config_measured_as: Config | None = None
+
     def __init__(self, config: Config | None, perf: float, tested: int) -> None:
         self.config = config
         self.best_perf_so_far = perf

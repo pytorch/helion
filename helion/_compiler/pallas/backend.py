@@ -93,6 +93,7 @@ def _config_not_viable_due_to_grid_size(
                 / block_size_by_id[block_id]
             )
             for block_id in root.block_ids
+            if block_id in block_size_by_id
         )
         if programs > max_programs_per_root_grid:
             return True
@@ -126,7 +127,7 @@ def _inner_loop_steps_exceed(
     """Whether any candidate device loop exceeds ``limit`` grouped steps."""
     grid_block_ids = set(config_spec.grid_block_ids)
     for spec in config_spec.block_sizes:
-        if spec.block_id in grid_block_ids:
+        if spec.block_id in grid_block_ids or spec.data_dependent:
             continue
         extent = spec.size_hint
         if spec.bounded_by_block_id is not None:
@@ -175,7 +176,7 @@ def _embedded_helper_source(body: str) -> str:
                 "_helion_divide_filter_topk = divide_filter_topk",
             ]
         )
-    if "flatten_worklist" in body:
+    if "flatten_worklist" in body or "fill_owner_tiles" in body:
         from ...runtime.pallas import compact_worklist
 
         blocks.append(_embed_source(inspect.getsource(compact_worklist)))
@@ -461,6 +462,7 @@ class PallasBackend(Backend):
             # (see ``embedded_helper_source`` / ``build_dependency_free_code``).
             "_helion_divide_filter_topk": "from helion._compiler.pallas.topk_impl import divide_filter_topk as _helion_divide_filter_topk",
             "flatten_worklist": "from helion.runtime.pallas.compact_worklist import flatten_worklist",
+            "fill_owner_tiles": "from helion.runtime.pallas.compact_worklist import fill_owner_tiles",
         }
 
     def embedded_helper_source(self, body: str) -> str:
@@ -484,11 +486,13 @@ class PallasBackend(Backend):
             "loop_orders",
             "flatten_loops",
             "pallas_worklist_grouping",
+            "pallas_worklist_bucket_rows",
             "pallas_loop_type",
             "pallas_emit_pipeline_group_size",
             "pallas_use_low_level_scheduler",
             "pallas_fold_dot_lhs_cast",
             "pallas_load_buffer_count",
+            "pallas_worklist_buffer_count",
             "pallas_indirect_access_mode",
             "pallas_pre_broadcast",
             "pallas_internal_scratch",
@@ -1897,6 +1901,9 @@ class PallasBackend(Backend):
             and sorted_args is not None
         ):
             launcher_args.extend(self._compact_worklist_launcher_args(sorted_args))
+            buffer_counts = self._compact_buffer_counts(sorted_args, config)
+            if buffer_counts:
+                launcher_args.append(f"_compact_buffer_counts={buffer_counts!r}")
 
         return launcher_args
 
@@ -1904,11 +1911,13 @@ class PallasBackend(Backend):
         """Emit the compact-worklist-specific launcher kwargs.
 
         ``_build_worklist`` is the module-level jnp builder (emitted in
-        generate_ast); the offset arg indices map its params to host-call arg
-        positions; the metadata fields + owner-ref position drive scalar-prefetch
-        selection and the owner-indexed BlockSpec index_maps.
+        generate_ast), or ``_fill_worklist`` the in-kernel one for a plan with
+        static inner loops; the offset arg indices map its params to host-call
+        arg positions; the metadata fields + owner-ref position drive
+        scalar-prefetch selection and the owner-indexed BlockSpec index_maps.
         """
         from ..compile_environment import CompileEnvironment
+        from ..device_function import DeviceFunction
         from ..device_function import TensorArg
         from .compact_worklist import metadata_field_names
 
@@ -1994,8 +2003,7 @@ class PallasBackend(Backend):
                     "compact_worklist resident caching: active range metadata or "
                     "offset args are missing from the kernel argument list."
                 )
-        return [
-            "_compact_build_worklist=_build_worklist",
+        args = [
             f"_compact_offset_arg_indices={offset_indices!r}",
             f"_compact_metadata_fields={fields!r}",
             "_compact_owner_ref_pos=0",
@@ -2009,6 +2017,44 @@ class PallasBackend(Backend):
             f"_compact_active_mask_arg_index={active_mask_arg_index}",
             f"_compact_ordered_window={ordered_window}",
         ]
+        if plan.static_inner_loops:
+            sublane = DeviceFunction.current().aligned_tiles.get(
+                plan.compact_axis.block_id, 0
+            )
+            assert sublane == env.compact_worklist_sublane, sublane
+            args = [
+                "_compact_fill_worklist=_fill_worklist",
+                f"_compact_upper={env.compact_worklist_upper}",
+                f"_compact_sublane={sublane}",
+                *args,
+            ]
+        else:
+            args.insert(0, "_compact_build_worklist=_build_worklist")
+        return args
+
+    def _compact_buffer_counts(
+        self, sorted_args: list[Argument], config: Config
+    ) -> dict[int, int]:
+        """Launcher arg index -> non-default buffer count for compact-worklist inputs."""
+        from ..device_function import TensorArg
+        from ..device_ir import LiftGraphArgs
+        from ..host_function import HostFunction
+
+        counts = cast("list[int]", config.get("pallas_worklist_buffer_count") or [])
+        # Slots of pallas_worklist_buffer_count: the kernel's tensor arguments,
+        # as counted in device_ir.
+        params = dict(HostFunction.current().params.arguments)
+        graph_args = LiftGraphArgs(params).get_graph_args()
+        inputs = [arg for arg in graph_args if isinstance(arg, torch.Tensor)]
+        slot_of = {id(tensor): slot for slot, tensor in enumerate(inputs)}
+        result: dict[int, int] = {}
+        for i, arg in enumerate(sorted_args):
+            if not isinstance(arg, TensorArg):
+                continue
+            slot = slot_of.get(id(arg.fake_value))
+            if slot is not None and slot < len(counts) and counts[slot] != 2:
+                result[i] = counts[slot]
+        return result
 
     def build_launcher_name(self, config: Config) -> str:
         """Return the single Pallas launcher name.
@@ -2094,6 +2140,8 @@ class PallasBackend(Backend):
         env.compact_worklist_upper = 1
         env.compact_worklist_block = 1
         env.compact_worklist_ordered_block = 1
+        env.compact_worklist_sublane = 1
+        env.compact_worklist_bucket_rows = 0
         env.compact_worklist_offset_params = []
 
         if grouping in (1, 2):
@@ -2144,6 +2192,14 @@ class PallasBackend(Backend):
             # env.compact_worklist_plan = None so downstream lowering paths
             # gated on `plan is not None` skip cleanly.
             return
+        if detected.static_inner_loops and (
+            config.get("pallas_loop_type", "unroll") != "unroll"
+            or config.get("pallas_worklist_grouping", 1) != 1
+        ):
+            # Static inner loops run over the blocks of one work item
+            # (``pallas_loop_type='unroll'``), one compact block per item.
+            # Other loop types and groupings keep the per-owner lowering.
+            return
         plan = dataclasses.replace(
             detected,
             grouping=cast("int", config.get("pallas_worklist_grouping", 1)),
@@ -2158,19 +2214,31 @@ class PallasBackend(Backend):
 
         # Compact-axis tile block size (NOT max(block_sizes): a distinct larger
         # ordered block would undersize the worklist metadata).
-        compact_block = env.block_sizes[plan.compact_axis.block_id].from_config(config)
-        assert compact_block is not None, "compact tile has no block size"
-        env.compact_worklist_block = int(compact_block)
+        env.compact_worklist_block = env.block_sizes[
+            plan.compact_axis.block_id
+        ].from_config_int(config)
         # Ordered (reduction) tile block -- resident caching uses this compile-side to
         # choose a block-aligned physical window (it can differ from the compact
         # block, e.g. compact_block != ordered_block).
         env.compact_worklist_ordered_block = 1
         if plan.ordered_axis is not None:
-            ordered_block = env.block_sizes[plan.ordered_axis.block_id].from_config(
-                config
+            ordered = env.block_sizes[plan.ordered_axis.block_id]
+            if ordered.from_config(config) is not None:
+                env.compact_worklist_ordered_block = ordered.from_config_int(config)
+        if plan.static_inner_loops:
+            from .ordered_carry import aligned_window_sublane
+
+            env.compact_worklist_sublane = aligned_window_sublane(env) or 1
+            if env.compact_worklist_block % env.compact_worklist_sublane:
+                raise exc.InvalidConfig(
+                    f"compact_worklist: block {env.compact_worklist_block} is not "
+                    f"a multiple of the sublane {env.compact_worklist_sublane}."
+                )
+            env.compact_worklist_bucket_rows = self._compact_worklist_bucket_rows(
+                cast("int", config.get("pallas_worklist_bucket_rows", 0)),
+                env.compact_worklist_block,
+                env.compact_worklist_sublane,
             )
-            if ordered_block is not None:
-                env.compact_worklist_ordered_block = int(ordered_block)
         env.compact_worklist_upper = self._compact_worklist_upper(plan, config, host_fn)
 
         if config.get("pallas_loop_type", "unroll") == "unroll" and (
@@ -2197,6 +2265,31 @@ class PallasBackend(Backend):
             env.compact_worklist_resident_prep_hoists = admission.prep_hoists
             env.compact_worklist_resident_cache_decision = admission.decision
 
+    _MAX_COMPACT_ROW_BUCKETS = 16
+
+    @classmethod
+    def _compact_worklist_bucket_rows(
+        cls, bucket: int, block: int, sublane: int
+    ) -> int:
+        """Validated ``pallas_worklist_bucket_rows``; 0 when it buckets nothing.
+
+        Each branch slices whole sublane tiles of the work item's window, so
+        the bucket must be a multiple of the sublane and divide the block.
+        """
+        if bucket == 0 or bucket >= block:
+            return 0
+        if bucket % sublane or block % bucket:
+            raise exc.InvalidConfig(
+                f"compact_worklist: bucket rows {bucket} must be a multiple of the "
+                f"sublane {sublane} and divide the block {block}."
+            )
+        if block // bucket > cls._MAX_COMPACT_ROW_BUCKETS:
+            raise exc.InvalidConfig(
+                f"compact_worklist: bucket rows {bucket} split block {block} into "
+                f"more than {cls._MAX_COMPACT_ROW_BUCKETS} row buckets."
+            )
+        return bucket
+
     def _compact_worklist_upper(
         self, plan: CompactWorklistPlan, config: Config, host_fn: HostFunction
     ) -> int:
@@ -2210,8 +2303,11 @@ class PallasBackend(Backend):
         safety), so owner ranges are contiguous/non-overlapping. The compact
         input shape is at least their packed total (and may include padding), so
         ``cdiv(total, BLOCK * grouping) + num_owners - 1`` provably holds. All
-        terms are concrete ints under ``static_shapes=True``.
+        terms are concrete ints under ``static_shapes=True``. The in-kernel
+        worklist of a plan with static inner loops starts each owner's tiles at
+        its sublane-aligned base, which ``aligned_upper_bound`` accounts for.
         """
+        from ...runtime.pallas.compact_worklist import aligned_upper_bound
         from ...runtime.pallas.compact_worklist import packed_upper_bound
         from ..compile_environment import CompileEnvironment
 
@@ -2233,7 +2329,12 @@ class PallasBackend(Backend):
             p.arg_name for p in plan.tensor_policies if p.kind == "compact_aligned_load"
         )
         total = int(params[compact_arg].shape[0])
-        block = CompileEnvironment.current().compact_worklist_block * plan.grouping
+        env = CompileEnvironment.current()
+        block = env.compact_worklist_block * plan.grouping
+        if plan.static_inner_loops:
+            return aligned_upper_bound(
+                total, num_owners, block, env.compact_worklist_sublane
+            )
         # Single source of the tight megablocks bound (also unit-tested).
         return packed_upper_bound(total, num_owners, block)
 
@@ -2242,6 +2343,7 @@ class PallasBackend(Backend):
 # module doesn't emit yet (compact-worklist, matmul dot_general).
 _JAX_UNSUPPORTED_KWARGS = (
     "_compact_build_worklist",
+    "_compact_fill_worklist",
     "_matmul_dot_general",
 )
 

@@ -74,9 +74,11 @@ checkout a run reads corrupts its results.
 --head` (the last commit) when the change is a complete logical unit; skip it
 for trivial fixes and run it once over the finished stack
 (`scripts/autoreview.py origin/main..HEAD`) before handing a larger project
-back. Fix every finding, or classify it as invalid with an explanation in the
-commit message's `Review notes:` paragraph (AGENTS.md, Answering the
-findings); do not make a change you believe is wrong to get a pass. When it passes,
+back. Fix every finding, classify it as invalid with an explanation in the
+commit message's `Review notes:` paragraph, or defer a pre-existing defect
+whose fix is too large to `KNOWN_GAPS.md` with a `Deferred:` item in that
+paragraph (AGENTS.md, Answering the findings); do not make a change you
+believe is wrong to get a pass. When it passes,
 add the `autoreview passed: ...` line it prints as the last line of each commit
 it covered (above any `stack-info:` line; AGENTS.md, Recording the review). If the review
 itself fails, stop and report it; do not substitute your own review. The one

@@ -5,6 +5,7 @@ from typing import Callable
 from typing import NamedTuple
 from typing_extensions import TypeVar
 
+import sympy
 import torch
 from torch._dynamo.source import TensorProperty
 from torch._dynamo.source import TensorPropertySource
@@ -119,7 +120,21 @@ def _(value: TypeInfo, *, origin: Origin) -> TypeInfo:
                     and source.idx is not None
                 ):
                     env.specialized_strides.add(source)
-        return symint.__int__()
+        concrete = symint.__int__()
+        # ``__int__`` guards ``expr == concrete``, and the guard installs the
+        # shape-env replacement it implies (``u0 -> 128``, or ``u0 -> 64``
+        # for ``2 * u0``), which folds the value into every later expression
+        # (a table row index ``m_begin // QB`` traces with the literal QB).
+        # A compile under the PyTorch profiler suppresses guards
+        # (``HostFunction._suppress_guards_if_profiler_enabled``), and with
+        # them that replacement: install it here through the guard's own
+        # ``_maybe_guard_rel``, so a specialized value is a constant either
+        # way. Without the profiler the guard already did, so this repeats it
+        # to no effect.
+        env.shape_env._maybe_guard_rel(
+            sympy.Eq(symint.node.expr, sympy.Integer(concrete))
+        )
+        return concrete
 
     _convert_specializable(proxy, on_symint=handle_symint)
     return value

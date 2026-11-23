@@ -8,9 +8,11 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
+import pytest
 import torch
 from torch.fx import Graph
 
+import helion
 from helion import exc
 from helion._compiler import backend_registry
 from helion._compiler.aten_lowering import AtenLowering
@@ -20,9 +22,12 @@ from helion._compiler.device_ir import ForLoopGraphInfo
 from helion._compiler.device_ir import IfGraphInfo
 from helion._compiler.device_ir import RootGraphInfo
 from helion._compiler.device_ir import iter_loop_graph_nodes
+from helion._compiler.per_thread_planning import _graph_used_block_ids
+from helion._testing.cute_codegen import cpu_bind
 from helion.autotuner.config_spec import BlockSizeSpec
 from helion.autotuner.config_spec import ConfigSpec
 from helion.autotuner.config_spec import NumThreadsSpec
+import helion.language as hl
 from helion.language import _tracing_ops
 from helion.language._decorators import BackendDispatchTable
 
@@ -45,9 +50,11 @@ class TestCapabilityHooks(unittest.TestCase):
             self.assertEqual(str(error), f"Backend '{name}' does not support: a detail")
 
     def test_table(self) -> None:
-        for name, backend in _backends().items():
+        for registered, backend in _backends().items():
             codegen_name = backend.codegen_name
-            with self.subTest(backend=name):
+            # The gluon backend answers as Triton, whose lowering it compiles.
+            name = "triton" if registered == "gluon" else registered
+            with self.subTest(backend=registered):
                 self.assertEqual(
                     backend.reserved_device_names(),
                     frozenset({"_"}) if name == "cute" else frozenset(),
@@ -63,6 +70,7 @@ class TestCapabilityHooks(unittest.TestCase):
                 )
                 self.assertFalse(backend.prefers_wall_clock_bench())
                 triton_barriers = codegen_name == "triton" and name != "tileir"
+                self.assertEqual(backend.uses_triton_compiler, name == "triton")
                 self.assertEqual(backend.supports_inter_loop_barriers, triton_barriers)
                 self.assertEqual(
                     backend.supports_intra_loop_barriers(
@@ -175,7 +183,8 @@ class TestCapabilityHooks(unittest.TestCase):
                     backend.finish_device_loop_body(arg, arg, outputs, {})
                 )
                 self.assertEqual(outputs, [arg])
-                self.assertEqual(backend.finalize_kernel_def(arg, [], arg), [])
+                if name != "gluon":  # gluon finalizes its ring and pipelining
+                    self.assertEqual(backend.finalize_kernel_def(arg, [], arg), [])
                 statements: list[object] = [arg]
                 result = backend.finalize_host_statements(arg, arg, statements)
                 self.assertIs(result[0], statements)
@@ -265,7 +274,9 @@ class TestLoopGraphWalker(unittest.TestCase):
 
     def test_pre_order_descends_for_loop_steps_only(self) -> None:
         fn, root, step, branch = self._fixture()
-        host = SimpleNamespace(device_ir=SimpleNamespace(grid_block_ids=[[0, 1]]))
+        host = SimpleNamespace(
+            device_ir=SimpleNamespace(root_ids=[0], grid_block_ids=[[0, 1]])
+        )
         with patch(
             "helion._compiler.host_function.HostFunction.current", return_value=host
         ):
@@ -288,13 +299,62 @@ class TestLoopGraphWalker(unittest.TestCase):
             self.assertTrue(_loop_contains_matmul(fn, [0, 1]))
             self.assertTrue(_loop_contains_matmul(fn, [3]))
 
-    def test_phase_index_out_of_range_matches_nothing(self) -> None:
+    def test_roots_in_one_phase_only_match_their_own_grid(self) -> None:
         fn, _root, _step, _branch = self._fixture()
-        host = SimpleNamespace(device_ir=SimpleNamespace(grid_block_ids=[]))
+        other_root = Graph()
+        x = other_root.placeholder("x")
+        other_root.output(x)
+        fn.codegen.codegen_graphs.append(
+            RootGraphInfo(graph_id=3, graph=other_root, phase_index=0)
+        )
+        host = SimpleNamespace(
+            device_ir=SimpleNamespace(root_ids=[0, 3], grid_block_ids=[[0, 1], [4]])
+        )
+        with patch(
+            "helion._compiler.host_function.HostFunction.current", return_value=host
+        ):
+            self.assertTrue(_loop_contains_matmul(fn, [0, 1]))
+            self.assertFalse(_loop_contains_matmul(fn, [4]))
+            self.assertEqual(
+                list(iter_loop_graph_nodes(fn, [4])), list(other_root.nodes)
+            )
+
+    def test_root_without_grid_matches_nothing(self) -> None:
+        fn, _root, _step, _branch = self._fixture()
+        host = SimpleNamespace(
+            device_ir=SimpleNamespace(root_ids=[], grid_block_ids=[])
+        )
         with patch(
             "helion._compiler.host_function.HostFunction.current", return_value=host
         ):
             self.assertEqual(list(iter_loop_graph_nodes(fn, [0, 1])), [])
+
+
+@pytest.mark.cpu_only
+def test_used_block_ids_follow_roots_not_barrier_phases() -> None:
+    @helion.kernel(backend="triton", static_shapes=True)
+    def kernel(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        first = torch.empty_like(x)
+        second = torch.empty_like(x)
+        third = torch.empty_like(x)
+        for row, col in hl.tile(x.shape):
+            first[row, col] = x[row, col] + 1
+        for row, col in hl.tile(x.shape):
+            second[row, col] = x[row, col] + 2
+        hl.barrier()
+        for row, col in hl.tile(x.shape):
+            third[row, col] = x[row, col] + 3
+        return first, second, third
+
+    bound = cpu_bind(kernel, (torch.zeros(8, 16),))
+    host = bound.host_function
+    ir = host.device_ir
+    fn = SimpleNamespace(codegen=SimpleNamespace(codegen_graphs=ir.graphs))
+    assert len(ir.phases) == 2
+    assert len(ir.root_ids) == 3
+    with bound.env, host:
+        for grid in ir.grid_block_ids:
+            assert _graph_used_block_ids(fn, grid) == set(grid)
 
 
 class TestBackendDispatchTable(unittest.TestCase):

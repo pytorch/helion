@@ -16,7 +16,11 @@ Usage:
 
 HELION_LOGS=+helion.runtime.kernel python test.py
 
-will run test.py with helion.runtime.kernel logs enabled at logging.DEBUG level
+will run test.py with helion.runtime.kernel logs enabled at logging.DEBUG level.
+Aliases name groups of logs: ``all``; ``megakernel`` (a megakernel's schedule
+and why each root barrier has no counter); ``timeline`` (also turns on
+Settings.megakernel_timeline, under ./helion_timeline/, so autotuning a
+megakernel raises: record a fixed or cached config).
 """
 
 
@@ -33,7 +37,33 @@ class LogRegistry:
     log_levels: dict[str, int] = field(default_factory=dict)
 
 
-_LOG_REGISTRY = LogRegistry({"all": ["helion"]})
+# ``megakernel``: a megakernel's schedule, its root barriers and why, the
+# transport of its cross-rank dependencies and why a ring falls back or an
+# allocation keeps epoch words.
+# ``timeline``: the paths megakernel timelines are written to; the setting reads
+# the same value (Settings.megakernel_timeline) and records them.
+_LOG_REGISTRY = LogRegistry(
+    {
+        "all": ["helion"],
+        "megakernel": [
+            "helion.megakernel",
+            "helion._compiler.cross_loop_codegen",
+            "helion._compiler.tile_dependency",
+            "helion._compiler.triton.gluon_ring",
+        ],
+        "timeline": ["helion.runtime.timeline"],
+    }
+)
+
+
+def log_entries(value: str) -> list[tuple[str, int]]:
+    """The (log or alias, level) entries of a string like "foo.bar,+baz.fizz":
+    [("foo.bar", logging.INFO), ("baz.fizz", logging.DEBUG)]."""
+    entries = [e.strip() for e in value.split(",") if e.strip()]
+    return [
+        (entry.lstrip("+"), logging.DEBUG if entry.startswith("+") else logging.INFO)
+        for entry in entries
+    ]
 
 
 def parse_log_value(value: str) -> None:
@@ -42,11 +72,7 @@ def parse_log_value(value: str) -> None:
     it to a mapping of {"foo.bar": logging.INFO, "baz.fizz": logging.DEBUG}
     and updates the registry with this mapping
     """
-    entries = [e.strip() for e in value.split(",") if e.strip()]
-    for entry in entries:
-        log_level = logging.DEBUG if entry.startswith("+") else logging.INFO
-        alias = entry.lstrip("+")
-
+    for alias, log_level in log_entries(value):
         if alias in _LOG_REGISTRY.alias_map:
             for log in _LOG_REGISTRY.alias_map[alias]:
                 _LOG_REGISTRY.log_levels[log] = log_level

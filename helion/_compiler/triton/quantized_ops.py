@@ -20,9 +20,35 @@ from ...language.quantized_ops import load_bfloat16_x16_to_float16
 from ...language.quantized_ops import load_float4_e2m1fn_x16_to_float16
 from ..ast_extension import create
 from ..ast_extension import expr_from_string
+from ..compile_environment import CompileEnvironment
 
 if TYPE_CHECKING:
     from ..inductor_lowering import CodegenState
+
+
+def _lowers_to_ptx() -> bool:
+    """The decodes below are PTX; every target that does not lower to PTX
+    (ROCm, XPU, TileIR) gets plain arithmetic instead."""
+    return CompileEnvironment.current().ptx_capability is not None
+
+
+def _decode_e2m1(state: CodegenState, nibble: ast.AST, dtype: str) -> ast.AST:
+    """Plain-Triton E2M1 decode of a 4-bit value (0, .5, 1, 1.5, 2, 3, 4, 6)."""
+    nib = state.codegen.lift(
+        expr_from_string("({nibble}).to(tl.int32)", nibble=nibble),
+        dce=True,
+        prefix="fp4_nibble",
+    )
+    mag = state.codegen.lift(
+        expr_from_string(f"({nib.id} & 7).to(tl.float32)"), dce=True, prefix="fp4_mag"
+    ).id
+    value = (
+        f"tl.where(({nib.id} & 8) != 0, -1.0, 1.0) * tl.where({mag} < 4.0, "
+        f"{mag} * 0.5, tl.where({mag} < 6.0, {mag} - 2.0, {mag} * 2.0 - 8.0))"
+    )
+    return state.codegen.lift(
+        expr_from_string(f"({value}).to({dtype})"), dce=True, prefix="fp4_value"
+    )
 
 
 # Triton uses inline asm for the same fp4x2 unpack instruction as CuTe.
@@ -47,6 +73,16 @@ def _(state: CodegenState) -> list[ast.AST]:
         dce=True,
         prefix="fp4_packed",
     )
+    if not _lowers_to_ptx():
+        byte = state.codegen.lift(
+            expr_from_string(f"{value.id}.to(tl.int32) & 0xFF"),
+            dce=True,
+            prefix="fp4_byte",
+        )
+        return [
+            _decode_e2m1(state, expr_from_string(f"{byte.id} & 0xF"), "tl.float32"),
+            _decode_e2m1(state, expr_from_string(f"{byte.id} >> 4"), "tl.float32"),
+        ]
     call = create(
         ast.Call,
         func=expr_from_string("tl.inline_asm_elementwise"),
@@ -89,11 +125,15 @@ _FP4X16_TO_F16_ASM = """
 
 @_decorators.codegen(load_float4_e2m1fn_x16_to_float16, "triton")
 def _(state: CodegenState) -> list[ast.AST]:
+    from ..loop_dependency_checker import emit_intra_loop_raw_barrier
+
     storage = state.proxy_arg(0)
     if not isinstance(storage, torch.Tensor):
         raise exc.InvalidAPIUsage(
             "hl.load_float4_e2m1fn_x16_to_float16 expects tensor storage"
         )
+    # A store of another thread earlier in its loop may reach it.
+    emit_intra_loop_raw_barrier(state, storage)
     group_offset = state.ast_arg(1)
     extra_mask = state.ast_args[2]
     base = state.device_function.tensor_arg(storage).name
@@ -112,6 +152,14 @@ def _(state: CodegenState) -> list[ast.AST]:
             mask=mask_ast,
         )
     qword = state.codegen.lift(load_call, dce=True, prefix="fp4_qword")
+    if not _lowers_to_ptx():
+        # Lane i is nibble i, least significant first, as with the PTX unpack.
+        return [
+            _decode_e2m1(
+                state, expr_from_string(f"({qword.id} >> {4 * i}) & 0xF"), "tl.float16"
+            )
+            for i in range(16)
+        ]
     call = create(
         ast.Call,
         func=expr_from_string("tl.inline_asm_elementwise"),
@@ -153,11 +201,15 @@ _BF16X16_TO_F16_ASM = """
 
 @_decorators.codegen(load_bfloat16_x16_to_float16, "triton")
 def _(state: CodegenState) -> list[ast.AST]:
+    from ..loop_dependency_checker import emit_intra_loop_raw_barrier
+
     storage = state.proxy_arg(0)
     if not isinstance(storage, torch.Tensor):
         raise exc.InvalidAPIUsage(
             "hl.load_bfloat16_x16_to_float16 expects tensor storage"
         )
+    # A store of another thread earlier in its loop may reach it.
+    emit_intra_loop_raw_barrier(state, storage)
     group_offset = state.ast_arg(1)
     extra_mask = state.ast_args[2]
     base = state.device_function.tensor_arg(storage).name
@@ -178,6 +230,19 @@ def _(state: CodegenState) -> list[ast.AST]:
                 mask=extra_mask,
             )
         qwords.append(state.codegen.lift(load_call, dce=True, prefix="bf16_qword"))
+    if not _lowers_to_ptx():
+        # Lane i is the i-th 16-bit word, least significant first.
+        return [
+            state.codegen.lift(
+                expr_from_string(
+                    f"(({qwords[i // 4].id} >> {16 * (i % 4)}) & 0xFFFF)"
+                    ".to(tl.uint16).to(tl.bfloat16, bitcast=True).to(tl.float16)"
+                ),
+                dce=True,
+                prefix="bf16_lane",
+            )
+            for i in range(16)
+        ]
     call = create(
         ast.Call,
         func=expr_from_string("tl.inline_asm_elementwise"),

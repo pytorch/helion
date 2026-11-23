@@ -8,9 +8,12 @@ import torch
 import helion
 from helion._testing import DEVICE
 from helion._testing import onlyBackends
+from helion._testing import skipIfRefEagerMark
 from helion._testing.host_float_control_flow import aliased_host_float
 from helion._testing.host_float_control_flow import rebound_host_float
 import helion.language as hl
+
+pytestmark = skipIfRefEagerMark("reads compiler state, which ref mode does not build")
 
 SCALAR = 1e16
 

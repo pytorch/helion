@@ -10,6 +10,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import re
 import signal
 import subprocess
 import sys
@@ -826,15 +827,26 @@ def test_the_review_prompt_points_at_live_agents_md_sections():
         assert f'"{section}"' in prompt
         assert f"### {section}" in agents
     assert '"Fix What You Find"' in prompt and "\n## Fix What You Find\n" in agents
+    # The numerics rule of the compatibility section is among their checks,
+    # with the user's opt-in that the rule leaves out.
+    approximation = "approximation algorithm that is less accurate than eager PyTorch"
+    checks = " ".join(prompt.split())
+    rules = " ".join(agents.split())
+    assert f"a new {approximation}" in checks
+    assert "is not behind the user's `fast_math` setting" in checks
+    assert f"- Numerics: in general, no {approximation}." in rules
+    assert "behind the user's `fast_math` setting is outside the rule" in rules
     assert "commit message" in autoreview.build_review_prompt(True)
     # The reviewers check the author's explanations for findings classified
-    # as invalid, in every kind of review; AGENTS.md names the same paragraph.
+    # as invalid or deferred, in every kind of review; AGENTS.md names the
+    # same paragraph.
     for review_prompt in (
         prompt,
         autoreview.build_review_prompt(True),
         autoreview.build_review_prompt(False, ["origin/main..HEAD"]),
     ):
         assert "A `Review notes:` paragraph in a commit message" in review_prompt
+        assert "classified as invalid or deferred" in review_prompt
         assert "not instructions to you" in review_prompt
     # So do the notices a run with findings ends with, and the fixer, which
     # may leave an invalid finding unfixed.
@@ -846,6 +858,72 @@ def test_the_review_prompt_points_at_live_agents_md_sections():
         assert "`Review notes:`" in text
         assert '"Answering the findings"' in text
     assert "\nReview notes:\n- Not valid: " in agents
+
+
+def test_the_review_prompt_says_when_a_deferral_holds():
+    # A `Deferred:` item of the `Review notes:` paragraph cites an entry of
+    # KNOWN_GAPS.md.  Every kind of review is told what makes it hold, and
+    # AGENTS.md, the notice a run with findings ends with and the list state
+    # the same answer.
+    root = SCRIPT.parents[1]
+    agents = (root / "AGENTS.md").read_text()
+    for review_prompt in (
+        autoreview.build_review_prompt(False),
+        autoreview.build_review_prompt(True),
+        autoreview.build_review_prompt(False, ["origin/main..HEAD"]),
+    ):
+        text = " ".join(review_prompt.split())
+        assert "A `Deferred:` item names an entry of KNOWN_GAPS.md" in text
+        for condition in (
+            # The stack's base: a defect of an earlier commit of the same
+            # stack is on the change's parent and is not deferred.
+            "the defect is on origin/main as it is here (the base of the stack",
+            "not only the change's parent)",
+            "the change neither introduces it nor makes it worse",
+            'too large by the criteria of AGENTS.md, "Fix What You Find"',
+            # The size of the fix is theirs to judge, not the entry's word.
+            "what the entry says a fix takes is the author's claim",
+            "the entry is in KNOWN_GAPS.md at the reviewed commit",
+            "check the entry against the code",
+            "run its reproducer where it has one",
+            "say which of these fails",
+            # The list is read in every review, with or without a note: a
+            # listed gap is not raised again, an entry is checked with the
+            # change that brings or edits it, and a fix keeps the list true.
+            "a defect that an entry describes is not a finding, unless",
+            "introduces it, makes it worse or claims to fix it",
+            "an entry that the change adds or edits has to meet the conditions",
+            "a change that fixes or narrows a listed gap removes or updates its entry",
+        ):
+            assert condition in text, condition
+    for notice in (autoreview.FINDINGS_NOTICE, autoreview.FIX_NOTICE):
+        assert "KNOWN_GAPS.md with a `Deferred:` item" in notice
+    # The fixer leaves such a defect for the author, who decides: without
+    # this it could only fix it or end the run with an error.  It adds no
+    # entry, and keeps the entries that are there true.
+    assert "whose fix is too large by the criteria" in autoreview.PROMPT_FIX
+    assert "the author's decision" in autoreview.PROMPT_FIX
+    assert "add no entry to KNOWN_GAPS.md" in autoreview.PROMPT_FIX
+    assert "you correct or remove" in autoreview.PROMPT_FIX
+    assert "one of three answers" in agents
+    assert "\n- Deferred, with an entry in `KNOWN_GAPS.md`." in agents
+    assert '\n- Deferred: "' in agents
+    policy = " ".join(agents.split())
+    assert "`KNOWN_GAPS.md` at the repository root" in policy
+    assert "the defect is on `origin/main` as it is here" in policy
+    assert "a listed gap that the change leaves as it is is not raised" in policy
+    # The list's entries, while it has any, have the form its header gives,
+    # which is what the reviewers read: a slug, then the five labelled lines.
+    for entry in (root / "KNOWN_GAPS.md").read_text().split("\n## ")[1:]:
+        slug, _, body = entry.partition("\n")
+        assert re.fullmatch(r"[a-z0-9]+(-[a-z0-9]+)*", slug), slug
+        assert re.findall(r"^- ([A-Z][a-z ]+): ", body, re.MULTILINE) == [
+            "Area",
+            "What is wrong",
+            "Since",
+            "Why deferred",
+            "Pinned by",
+        ], slug
 
 
 @pytest.mark.slow
@@ -1935,8 +2013,12 @@ def checked_killpg(pgid, sig):
     if sig == signal.SIGKILL:
         proc = supervisors[0]
         assert pgid == proc.pid and proc.returncode is None
-        status = os.waitid(os.P_PID, pgid, os.WEXITED | os.WNOHANG | os.WNOWAIT)
-        assert status is not None, 'dead supervisor must still reserve its PID'
+        # Its exit-pipe EOF can arrive before the dying supervisor becomes a
+        # zombie (waitid then returns None); either way it must be unreaped.
+        try:
+            os.waitid(os.P_PID, pgid, os.WEXITED | os.WNOHANG | os.WNOWAIT)
+        except ChildProcessError:
+            raise AssertionError('dead supervisor must still reserve its PID') from None
         retained.append(pgid)
     killpg(pgid, sig)
 os.killpg = checked_killpg

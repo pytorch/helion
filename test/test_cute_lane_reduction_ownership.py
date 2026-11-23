@@ -65,6 +65,7 @@ from helion._testing import code_and_output
 from helion._testing import import_example
 from helion._testing import onlyBackends
 from helion._testing import skipUnlessCuteAvailable
+from helion._testing.cute_affine_vector_model import Pointer as _Pointer
 from helion._testing.cute_codegen import cpu_bind
 from helion._testing.cute_codegen import forbid_native_compile
 from helion._testing.cute_codegen import mock_cuda_unavailable
@@ -139,8 +140,6 @@ def test_tile_id_reduction_store_uses_scalar_tile_bounds(rows, columns, masked):
 
 def _execute_tile_id_program(code, x, output, *, require_unique_writes=True):
     """Replay the actual scalar body with an exact-integer warp-sum oracle."""
-    from test.test_cute_affine_vector_io import _Pointer
-
     current = [0, 0]
     reads = dict.fromkeys(("scalar_loads", "scalar_stores"), 0)
     writes = []

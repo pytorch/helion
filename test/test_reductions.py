@@ -3652,10 +3652,19 @@ def _integer_loop_model(source, x, *, return_scratch=False):
         events.append(op)
         return np.full(threads, v, dtype=a.dtype)
 
+    def wrapping(dtype):
+        # The DSL's integer constructors wrap; numpy's refuse a Python int
+        # outside the dtype, such as the sign bit a keyed extremum flips.
+        return lambda value: np.asarray(value).astype(dtype)[()]
+
     ns = {
         "np": np,
         "operator": operator,
-        "cutlass": SimpleNamespace(Int32=np.int32, Int64=np.int64),
+        # Uint32 is the key dtype of an Int32 extremum that the loop carries
+        # (``math_templates.nan_extremum_expr``).
+        "cutlass": SimpleNamespace(
+            Int32=wrapping(np.int32), Int64=np.int64, Uint32=wrapping(np.uint32)
+        ),
         "cute": SimpleNamespace(
             arch=SimpleNamespace(
                 thread_idx=lambda: (np.arange(threads, dtype=np.int32), 0, 0),

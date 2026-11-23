@@ -15,6 +15,19 @@ the ``cute_wide_packet_hints`` config knob, ``hint_wide_packets``).  The
 predicated packet loads of ``masked_packet_load`` take the hint as their
 priority argument instead (``CachePolicy.masked_priority``), at every width.
 
+An element load (a gather, a lane on a strided dim) carries an L1 priority
+or the streaming operator on the ``cute.arch.load(ptr, cutlass.T, ...)``
+placeholder the scheduling passes recognize, at 4 and 8 bytes, which
+``scalar_policy_loads.lower_scalar_policy_loads`` turns into exact-policy
+PTX at the end of the pipeline (``l2_policy.scalar_policy_load``).  An L2
+policy has no placeholder: under the ``cute_scalar_load_hints`` config knob
+the load lowering records it for the tensor (``element_load_hint``) and
+``scalar_policy_loads.hint_element_loads`` gives it to the tensor's element
+loads that are still plain once every pass has run, so a hint never keeps a
+pass from merging element loads into a packet (the helpers of
+``element_policy_loads.py``).  A 2-byte element (bf16, fp16, int16) takes
+every policy the same way, under ``cute_narrow_load_hints``.
+
 The load lowering threads the hint through its load-site facts
 (``CuteScalarLoadSite``, ``CuteVloopLoadFact``, the persistent branch-vec
 marker) as the ``eviction_suffix`` string: the ``cute.arch.load`` keyword
@@ -92,8 +105,8 @@ class PacketLoadHelper:
     ``CachePolicy.l2_helper`` family of an L2-policy packet load
     (``l2_last`` / ``l1_l2_first`` / ``l1_l2_last`` / ``nc_l2_first``),
     ``predicated`` for the ``_if`` loads (their priority is an argument) or
-    ``scalar`` for the scalar policy load; ``packet_bytes`` is the packet
-    width, 0 for the scalar load (its width follows its dtype).
+    ``scalar`` for the scalar policy loads; ``packet_bytes`` is the packet
+    width, 0 for the scalar loads (their width follows their dtype).
     """
 
     name: str
@@ -172,6 +185,27 @@ PACKET_LOAD_HELPERS = (
     _l2_helper("l2_last", 32),
     _l2_helper("l1_l2_first", 32),
     _l2_helper("l1_l2_last", 32),
+    PacketLoadHelper(
+        "_cute_element_policy_load",
+        "element_policy_loads",
+        "element_policy_load",
+        "scalar",
+        0,
+    ),
+    PacketLoadHelper(
+        "_cute_element_policy_load_if",
+        "element_policy_loads",
+        "element_policy_load_if",
+        "scalar",
+        0,
+    ),
+    PacketLoadHelper(
+        "_cute_element_fill_load_if",
+        "element_policy_loads",
+        "element_fill_load_if",
+        "scalar",
+        0,
+    ),
 )
 # Packet byte width -> noncoherent L2 evict-first helper.
 _CUTE_NC_L2_FIRST_HELPERS = {
@@ -352,6 +386,18 @@ class CachePolicy:
             return "cs"
         return ""
 
+    @classmethod
+    def from_masked_priority(cls, priority: str) -> CachePolicy:
+        """The hint a predicated packet load carries as its priority argument
+        (``masked_priority`` inverted)."""
+        if not priority:
+            return cls.NONE
+        if priority == "cs":
+            return cls(streaming=True)
+        if priority == _NC_L2_FIRST_POLICY or priority in _L2_HELPER_POLICIES:
+            return cls(l2_helper=priority)
+        return cls(l1_priority=priority)
+
     @property
     def scalar_policy(self) -> str | None:
         """The ``_cute_scalar_policy_load`` policy name of this hint
@@ -360,8 +406,59 @@ class CachePolicy:
             return "streaming"
         return _SCALAR_POLICY_NAMES.get(self.l1_priority)
 
+    @property
+    def l2_element_policy(self) -> str | None:
+        """The L2 family an element load takes for this hint (``l2_last`` /
+        ``l1_l2_first`` / ``l1_l2_last``), or None: ``nc_l2_first`` is a
+        packet form only."""
+        return self.l2_helper if self.l2_helper in _L2_HELPER_POLICIES else None
+
 
 CachePolicy.NONE = CachePolicy()
+
+# The element dtypes whose loads take an L2 policy under
+# ``cute_scalar_load_hints``: the 4- and 8-byte elements an L1 priority or
+# the streaming operator already reach.
+_L2_ELEMENT_DTYPES = frozenset((torch.float32, torch.float64, torch.int32, torch.int64))
+# The 2-byte element dtypes whose loads take every policy under
+# ``cute_narrow_load_hints``.  ``torch.uint16`` is not among them: the
+# backend has no element type of its own for it.
+_NARROW_ELEMENT_DTYPES = frozenset((torch.bfloat16, torch.float16, torch.int16))
+
+
+def element_load_hint(
+    dtype: torch.dtype, policy: CachePolicy, *, l2_elements: bool, narrow_elements: bool
+) -> str | None:
+    """The policy the element loads of a ``dtype`` tensor take from a load
+    slot naming ``policy`` (``scalar_policy_loads.hint_element_loads``).
+
+    Under ``cute_scalar_load_hints`` (``l2_elements``): an L2 policy on a 4-
+    or 8-byte element.  An L1 priority and the streaming operator have
+    their ``cute.arch.load`` placeholder at these sizes and record nothing.
+    Under ``cute_narrow_load_hints`` (``narrow_elements``): any of those on
+    a bf16, fp16 or int16 element, which has no placeholder (its
+    ``cute.arch.load`` lowers to ``nvvm.load.ext``, which rejects cache
+    modifiers).  None otherwise: ``nc_l2_first`` is a packet form, and byte
+    elements and bools take no hint."""
+    if dtype in _L2_ELEMENT_DTYPES:
+        return policy.l2_element_policy if l2_elements else None
+    if narrow_elements and dtype in _NARROW_ELEMENT_DTYPES:
+        return policy.l2_element_policy or policy.scalar_policy
+    return None
+
+
+def spelled_hint_excludes_element_hints(
+    dtype: torch.dtype, *, narrow_elements: bool
+) -> bool:
+    """Whether an element load that spells out its own policy
+    (``hl.load(..., eviction_policy=...)``) keeps its whole tensor out of the
+    element hints: under ``cute_narrow_load_hints`` (``narrow_elements``) on
+    a bf16, fp16 or int16 tensor.  Such a load has no placeholder, so after
+    the passes it is a plain load like the tensor's other element loads and
+    ``hint_element_loads`` could neither leave it its own policy nor keep
+    the tensor's from it.  A 4- or 8-byte element with a policy of its own
+    is no plain load and is never rewritten."""
+    return narrow_elements and dtype in _NARROW_ELEMENT_DTYPES
 
 
 def hint_wide_packets(cute_wide_packet_hints: bool) -> bool:

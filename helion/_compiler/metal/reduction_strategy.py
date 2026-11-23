@@ -15,6 +15,10 @@ One over a block that its own loop walks in a lane loop, on one thread or
 several, splits that lane loop into passes (``lane_reduction.py``).  A count
 it sums there (``_is_count``) folds and combines in int32, not torch's int64.
 
+A rolled reduction (``reduction_loops``) runs the shared looped strategy
+(``MetalLoopedReductionStrategy``), whose final combine across threads is a
+collective like the others'.
+
 A reduction block that is only the power-of-two padding of a ``:`` slice
 block (see ``padded_twin``) owns no threads, lanes or mask: its reductions
 run on the slice block's strategy (``MetalPaddedTwinStrategy``).
@@ -32,6 +36,7 @@ from ..ast_extension import expr_from_string
 from ..ast_extension import statement_from_string
 from ..compile_environment import CompileEnvironment
 from ..reduction_strategy import BlockReductionStrategy
+from ..reduction_strategy import LoopedReductionStrategy
 from ..reduction_strategy import PersistentReductionStrategy
 from ..reduction_strategy import reduction_acc_dtype
 from ..tile_strategy import LoopDimInfo
@@ -44,6 +49,8 @@ from .lane_reduction import GridLaneSplit
 from .lane_reduction import LaneSplit
 from .lane_reduction import grid_lane_split_for
 from .lane_reduction import lane_split_for
+from .mpp_matmul import Graphs
+from .mpp_matmul import check_uniform
 from .msl_reduction import SUPPORTED_REDUCTIONS
 from .padded_twin import cone_violation
 from .padded_twin import padded_twins
@@ -56,6 +63,28 @@ if TYPE_CHECKING:
 
     from ..device_function import DeviceFunction
     from ..inductor_lowering import CodegenState
+
+
+def check_collective_reached(state: CodegenState, block_id: int) -> None:
+    """A reduction over ``block_id`` that combines across threads runs a
+    threadgroup collective, whose barriers every thread of the threadgroup
+    must reach: raise ``BackendUnsupported`` for one under an if or a while
+    on a predicate that differs between threads (over a block whose tile
+    spreads over threads), where threads would diverge at a barrier.  One
+    whose block takes one thread combines in registers."""
+    tile_strategy = state.device_function.tile_strategy
+
+    def threaded(block: int) -> bool:
+        return (tile_strategy.thread_extent_for_block_id(block) or 1) > 1
+
+    if not threaded(block_id) or state.fx_node is None:
+        return
+    check_uniform(
+        state.fx_node,
+        Graphs(state.codegen.codegen_graphs),
+        "a reduction across threads (a threadgroup collective)",
+        threaded,
+    )
 
 
 class MetalPersistentReductionStrategy(PersistentReductionStrategy):
@@ -144,6 +173,7 @@ class MetalPersistentReductionStrategy(PersistentReductionStrategy):
         fake_input: torch.Tensor,
         fake_output: torch.Tensor,
     ) -> ast.AST:
+        check_collective_reached(state, self.block_index)
         if not self._folds:
             return super().codegen_reduction(
                 state, input_name, reduction_type, dim, fake_input, fake_output
@@ -379,6 +409,7 @@ class MetalBlockReductionStrategy(BlockReductionStrategy):
         fake_input: torch.Tensor,
         fake_output: torch.Tensor,
     ) -> ast.AST:
+        check_collective_reached(state, self.block_index)
         split: LaneSplit | GridLaneSplit | None = lane_split_for(
             state, self.fn, self.block_index, reduction_type
         )
@@ -470,3 +501,38 @@ class MetalBlockReductionStrategy(BlockReductionStrategy):
                 "inside the loop, or run the other sibling loops on one thread",
             )
         return False
+
+
+class MetalLoopedReductionStrategy(LoopedReductionStrategy):
+    """The shared rolled reduction, refused under an if in its loop's body
+    and where threads would diverge at the collective that combines its
+    chunks' partials across threads.
+
+    The reduction loop wraps the if, and the result is combined after the
+    loop, so the if's body would read it inside the loop, before it is
+    declared: invalid MSL, on any predicate.  The persistent form
+    (``reduction_loops=None``) lowers it."""
+
+    def codegen_reduction(
+        self,
+        state: CodegenState,
+        input_name: str,
+        reduction_type: str,
+        dim: int,
+        fake_input: torch.Tensor,
+        fake_output: torch.Tensor,
+    ) -> ast.AST:
+        assert state.fx_node is not None
+        owner = Graphs(state.codegen.codegen_graphs).owner(state.fx_node)
+        if owner is not None and owner.target is _tracing_ops._if:
+            raise exc.BackendUnsupported(
+                "metal",
+                "a rolled reduction (reduction_loops) under an if: the "
+                "result, combined after the reduction loop, would be read "
+                "inside it; leave the dimension persistent "
+                "(reduction_loops=None)",
+            )
+        check_collective_reached(state, self.block_index)
+        return super().codegen_reduction(
+            state, input_name, reduction_type, dim, fake_input, fake_output
+        )

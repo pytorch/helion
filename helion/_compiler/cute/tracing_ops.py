@@ -19,12 +19,14 @@ from ...language import _decorators
 from ...language._tracing_ops import _if
 from ...language._tracing_ops import _mask_select
 from ...language._tracing_ops import _mask_to
+from ...language._tracing_ops import _new_var
 from ..ast_extension import expr_from_string
 from ..ast_extension import statement_from_string
 from ..ast_read_writes import HELION_BLOCK_UNIFORM_ATTR
 from ..compile_environment import CompileEnvironment
 from ..dtype_utils import cast_ast
 from .block_uniform import block_uniform
+from .handler_ops import extremum_result_kind
 from .synthetic_axes import branch_scope
 
 if TYPE_CHECKING:
@@ -259,6 +261,22 @@ def _constant_other(value: float | bool) -> Callable[[torch.dtype], ast.AST]:
     return lambda dtype: CompileEnvironment.current().backend.cast_ast(
         expr_from_string(constant_repr(value)), dtype
     )
+
+
+@_decorators.codegen(_new_var, "cute")
+def _(state: CodegenState) -> object:
+    """The plain copy of the common codegen (``kept = v``).  The copy of a
+    variable that holds an extremum's result holds it too
+    (``CuteDeviceFunctionState.extremum_results``): an extremum that reads
+    the copy chains with that extremum (``handler_ops._nan_extremum``)."""
+    copy = _new_var._codegen["common"](state)  # pyrefly: ignore[missing-attribute]
+    value = state.ast_arg(0)
+    if isinstance(copy, ast.Name) and isinstance(value, ast.Name):
+        device_function = state.device_function
+        kind = extremum_result_kind(device_function, value.id)
+        if kind is not None:
+            device_function.cute_state.extremum_results[copy.id] = kind
+    return copy
 
 
 @_decorators.codegen(_mask_to, "cute")

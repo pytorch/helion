@@ -429,23 +429,107 @@ class TestInlineAsmElementwisePacked(RefEagerTestDisabled, TestCase):
         torch.testing.assert_close(result_d, a)
 
 
+@onlyBackends(["triton"])
+@unittest.skipIf(torch.version.hip is None, "ROCm only")
+class TestTritonInlineAsmOnRocm(RefEagerTestDisabled, TestCase):
+    def test_nvptx_constraints_are_rejected(self) -> None:
+        """Triton's AMD backend drops asm with NVPTX register classes and
+        still builds, so the kernel would compute garbage: refuse it."""
+
+        @helion.kernel(autotune_effort="none")
+        def ptx_f16(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.size(0)):
+                out[tile] = hl.inline_asm_elementwise(
+                    "mov.b16 $0, $1;",
+                    "=h,h",
+                    [x[tile]],
+                    dtype=torch.float16,
+                    is_pure=True,
+                    pack=1,
+                )
+            return out
+
+        @helion.kernel(autotune_effort="none")
+        def ptx_input_only(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.size(0)):
+                out[tile] = hl.inline_asm_elementwise(
+                    "v_mov_b32 $0, $1",
+                    "=v,f",
+                    [x[tile]],
+                    dtype=torch.float32,
+                    is_pure=True,
+                    pack=1,
+                )
+            return out
+
+        x = torch.ones([64], device=DEVICE)
+        with self.assertRaisesRegex(helion.exc.BackendUnsupported, r"\['h'\]"):
+            ptx_f16(x.half())
+        with self.assertRaisesRegex(helion.exc.BackendUnsupported, r"\['f'\]"):
+            ptx_input_only(x)
+
+    def test_read_write_constraints(self) -> None:
+        """Without an '=' output (GCC's read-write "+v,v") LLVM aborts the
+        process, so it is refused; an input spelled "+v" still works."""
+
+        @helion.kernel(autotune_effort="none")
+        def no_output(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.size(0)):
+                out[tile] = hl.inline_asm_elementwise(
+                    "v_mov_b32 $0, $1",
+                    "+v,v",
+                    [x[tile]],
+                    dtype=torch.int32,
+                    is_pure=True,
+                    pack=1,
+                )
+            return out
+
+        @helion.kernel(autotune_effort="none")
+        def plus_input(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.size(0)):
+                out[tile] = hl.inline_asm_elementwise(
+                    "v_lshlrev_b32 $0, 3, $1",
+                    "=v,+v",
+                    [x[tile]],
+                    dtype=torch.int32,
+                    is_pure=True,
+                    pack=1,
+                )
+            return out
+
+        x = torch.arange(1, 65, device=DEVICE, dtype=torch.int32)
+        with self.assertRaisesRegex(helion.exc.BackendUnsupported, "no '=' output"):
+            no_output(x)
+        _code, result = code_and_output(plus_input, (x,))
+        torch.testing.assert_close(result, x << 3)
+
+    def test_amdgcn_asm_runs(self) -> None:
+        @helion.kernel(autotune_effort="none")
+        def amdgcn_copy(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.size(0)):
+                out[tile] = hl.inline_asm_elementwise(
+                    "v_mov_b32 $0, $1",
+                    "=v,v",
+                    [x[tile]],
+                    dtype=torch.int32,
+                    is_pure=True,
+                    pack=1,
+                )
+            return out
+
+        x = torch.arange(1, 65, device=DEVICE, dtype=torch.int32)
+        _code, result = code_and_output(amdgcn_copy, (x,))
+        torch.testing.assert_close(result, x)
+
+
 @onlyBackends(["cute"])
 class TestCuteInlineAsmElementwise(RefEagerTestDisabled, TestCase):
-    def test_input_constraint_codes(self) -> None:
-        """Inputs follow the outputs in operand order; a matching constraint
-        takes its output's register class; clobbers bind nothing; GCC's
-        read-write ``+`` is not LLVM syntax and is rejected."""
-        from helion._compiler.cute.inline_asm_helpers import input_constraint_codes
-
-        self.assertEqual(input_constraint_codes("=h,h,h"), ["h", "h"])
-        self.assertEqual(input_constraint_codes("=&r,r,0"), ["r", "r"])
-        self.assertEqual(input_constraint_codes("=h,0,h"), ["h", "h"])
-        self.assertEqual(input_constraint_codes("=r,=h,h,r,~{memory}"), ["h", "r"])
-        self.assertEqual(input_constraint_codes("=f, f, f"), ["f", "f"])
-        for constraints in ("+r,r", "=r,+h,h"):
-            with self.assertRaisesRegex(ValueError, "not an LLVM inline asm"):
-                input_constraint_codes(constraints)
-
     @pytest.mark.skipif(
         DEVICE.type != "cuda", reason="inline_asm_elementwise is only supported on CUDA"
     )

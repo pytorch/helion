@@ -66,7 +66,11 @@ class DESurrogateHybrid(DifferentialEvolutionSearch):
         refit_frequency: Refit surrogate every N generations (default: 5)
         n_estimators: Number of trees in Random Forest (default: 50)
         min_improvement_delta: Relative improvement threshold for early stopping.
-            Default: 0.001 (0.1%). Early stopping enabled by default.
+            Default: 0.001 (0.1%). Early stopping enabled by default. A search
+            that times its candidates from the CUDA activity trace stops on
+            the larger of this, 0.5% and 1.5 steps of the trace's clock
+            (``DifferentialEvolutionSearch._stop_tolerance``), so 0 no longer
+            disables it there.
         patience: Number of generations without improvement before stopping.
             Default: 3. Early stopping enabled by default.
         initial_population_strategy: Strategy for generating the initial population.
@@ -182,6 +186,8 @@ class DESurrogateHybrid(DifferentialEvolutionSearch):
 
         # Evolution loop
         for gen in self._budgeted_range(2, self.max_generations + 1):
+            if not self._population_can_mutate():
+                break
             self.set_generation(gen)
             self._evolve_generation(gen)
 
@@ -206,17 +212,18 @@ class DESurrogateHybrid(DifferentialEvolutionSearch):
         if use_surrogate and (generation % self.refit_frequency == 0):
             self._fit_surrogate()
 
-        # Generate candidates using DE mutation/crossover
+        # Generate candidates using DE mutation/crossover: one per member of
+        # the population, which can hold fewer than ``population_size``
+        # (configs that left the initial population: a budget cut, a trace
+        # timer that could not read them).
+        slots = len(self.population)
         if use_surrogate:
             # Generate more candidates and use surrogate to select best
-            n_candidates = self.population_size * self.candidate_ratio
-            candidates = self._generate_de_candidates(n_candidates)
-            selected_candidates = self._surrogate_select(
-                candidates, self.population_size
-            )
+            candidates = self._generate_de_candidates(slots * self.candidate_ratio)
+            selected_candidates = self._surrogate_select(candidates, slots)
         else:
             # Standard DE: generate and evaluate all
-            selected_candidates = self._generate_de_candidates(self.population_size)
+            selected_candidates = self._generate_de_candidates(slots)
 
         # Evaluate selected candidates
         new_members = self.benchmark_flat_batch(selected_candidates)
@@ -239,7 +246,7 @@ class DESurrogateHybrid(DifferentialEvolutionSearch):
         self.log(
             f"Gen {generation}: {surrogate_status} | "
             f"best={self.format_performance(best_perf)} | "
-            f"replaced={replacements}/{self.population_size} | "
+            f"replaced={replacements}/{slots} | "
             f"total_evals={len(self.all_observations)}"
         )
 

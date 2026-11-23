@@ -9,6 +9,7 @@ from helion import exc
 from helion._compiler.utils import host_subscript_geometry
 from helion._testing import DEVICE
 from helion._testing import cpu_render_target
+from helion._testing import skipIfRefEager
 from helion._testing.tunable_fragments import load_host_function
 import helion.language as hl
 
@@ -67,6 +68,7 @@ def _slice_copy(x: torch.Tensor, kind: hl.constexpr) -> torch.Tensor:
     ],
 )
 @pytest.mark.parametrize("reverse", [False, True])
+@skipIfRefEager("reads compiler state, which ref mode does not build")
 def test_host_slice_bounds_match_runtime_geometry(kind, slice_, reverse):
     kernel = helion.kernel(
         _slice_copy.fn,
@@ -106,6 +108,7 @@ def _bounded_copy(x: torch.Tensor, start: int, stop: int, step: int) -> torch.Te
     return out
 
 
+@skipIfRefEager("reads compiler state, which ref mode does not build")
 def test_host_symbolic_slice_bounds_and_steps():
     kernel = helion.kernel(
         _bounded_copy.fn,
@@ -134,6 +137,7 @@ def _composed_copy(x: torch.Tensor) -> torch.Tensor:
     return out
 
 
+@skipIfRefEager("reads compiler state, which ref mode does not build")
 def test_host_basic_index_rank_and_offset():
     kernel = helion.kernel(
         _composed_copy.fn,
@@ -177,6 +181,7 @@ def test_host_slice_keeps_python_index_conversion():
 
 
 @pytest.mark.parametrize("as_list", [False, True])
+@skipIfRefEager("checks a compile-time error, which ref mode does not raise")
 def test_host_repeated_ellipsis_is_rejected_before_torch_indexing(as_list):
     @helion.kernel(static_shapes=False, config=helion.Config(block_sizes=[4, 8]))
     def copy(x: torch.Tensor, as_list: hl.constexpr) -> torch.Tensor:

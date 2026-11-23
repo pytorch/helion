@@ -20,9 +20,11 @@ from torch._inductor import config as inductor_config
 import helion
 from helion._compiler.output_code_utils import dependency_free_runtime_source
 from helion._compiler.triton.backend import TritonBackend
+from helion._testing import DEVICE
 from helion._testing import RefEagerTestDisabled
 from helion._testing import TestCase
 from helion._testing import onlyBackends
+from helion._testing import skipIfCudaCapabilityLessThan
 from helion._utils import next_power_of_2
 from helion.autotuner import BooleanFragment
 from helion.autotuner import PowerOfTwoFragment
@@ -50,6 +52,14 @@ def _artifact_maximum(x: torch.Tensor, y: torch.Tensor):
     out = torch.empty_like(x)
     for tile in hl.tile(x.size(0)):
         out[tile] = torch.maximum(x[tile], y[tile])
+    return out
+
+
+def _artifact_prefetch(x: torch.Tensor, y: torch.Tensor):
+    out = torch.empty_like(x)
+    for tile_m, tile_n in hl.tile(x.size()):
+        hl.prefetch(y, [tile_m, tile_n])
+        out[tile_m, tile_n] = x[tile_m, tile_n] + y[tile_m, tile_n]
     return out
 
 
@@ -278,6 +288,31 @@ class TestKernelArtifact(RefEagerTestDisabled, TestCase):
                     frozen(*args, **kwargs)
             loader.assert_not_called()
 
+    def test_unsupported_scalars_are_rejected_at_export_and_call(self):
+        unsupported = (
+            (float("nan"), "NaN scalar"),
+            (b"2", "Unsupported artifact input type bytes"),
+        )
+        frozen = load_artifact(self._export())
+        for value, message in unsupported:
+            with self.subTest(value=value):
+                with (
+                    patch.object(helion.Kernel, "bind") as bind,
+                    self.assertRaisesRegex(ValueError, message),
+                ):
+                    self._export(
+                        name="unsupported.json",
+                        cases=[ArtifactCase((self.x, self.y, value), self.config)],
+                    )
+                bind.assert_not_called()
+                self.assertFalse((self.root / "unsupported.json").exists())
+                with (
+                    patch.object(PyCodeCache, "load") as loader,
+                    self.assertRaisesRegex(ValueError, message),
+                ):
+                    frozen(self.x, self.y, value)
+                loader.assert_not_called()
+
     def test_integrity_failure_precedes_source_loading(self):
         path = self._export()
         original = path.read_text()
@@ -434,6 +469,31 @@ class TestKernelArtifact(RefEagerTestDisabled, TestCase):
 @pytest.mark.cuda
 @onlyBackends(["triton"])
 class TestKernelArtifactCUDA(RefEagerTestDisabled, TestCase):
+    @skipIfCudaCapabilityLessThan((9, 0), reason="tensor prefetch needs TMA")
+    def test_descriptor_prefetch_is_rejected_before_codegen(self):
+        x = torch.zeros((96, 1024), device=DEVICE, dtype=torch.bfloat16)
+        y = torch.zeros_like(x)
+        config = helion.Config(
+            block_sizes=[16, 64],
+            indexing="pointer",
+            prefetch_indexing="tensor_descriptor",
+        )
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            patch.object(BoundKernel, "to_code") as to_code,
+        ):
+            destination = Path(directory) / "prefetch.json"
+            with self.assertRaisesRegex(
+                ValueError, "Tensor-descriptor indexing and prefetch"
+            ):
+                export_artifact(
+                    _kernel(_artifact_prefetch, config),
+                    [ArtifactCase((x, y), config)],
+                    destination,
+                )
+            to_code.assert_not_called()
+            self.assertFalse(destination.exists())
+
     def test_scaled_mm_with_embedded_native_helpers(self):
         args = _scaled_mm_inputs("cuda")
         out, a, b, a_scales, b_scales = args

@@ -8,6 +8,7 @@ import torch
 
 import helion
 from helion._testing import cpu_render_target
+from helion._testing import skipIfRefEager
 from helion._testing.cute_codegen import cpu_bind
 from helion.autotuner import benchmark_job
 from helion.autotuner import benchmark_provider
@@ -60,6 +61,7 @@ def _mutate_callback(x, callback, tail):
 
 
 @pytest.mark.parametrize("capture", ["closure", "default", "keyword_default"])
+@skipIfRefEager("reads compiler state, which ref mode does not build")
 def test_callback_baseline_detects_original_pytree_slot(monkeypatch, capture):
     x = torch.zeros(8)
     tensor = torch.arange(8, dtype=torch.float32)

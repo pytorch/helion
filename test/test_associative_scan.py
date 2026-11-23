@@ -119,6 +119,59 @@ def jit_add_combine_fn(x, y):
     return x + y
 
 
+@skipUnlessBackends(["triton", "cute"])
+@pytest.mark.parametrize(
+    "input_dtype,sum_value,prod_value",
+    [
+        (torch.int8, 100, 3),
+        (torch.uint8, 200, 3),
+        (torch.int16, 2**14, 5),
+        (torch.int32, 2**30, 16),
+        (torch.bool, True, True),
+    ],
+)
+def test_integer_scan_default_promotion(
+    input_dtype: torch.dtype, sum_value: int, prod_value: int
+) -> None:
+    @helion.kernel(static_shapes=True, config=helion.Config(block_sizes=[1]))
+    def scan(x: torch.Tensor, y: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        sums = torch.empty_like(x, dtype=torch.int64)
+        products = torch.empty_like(y, dtype=torch.int64)
+        for row in hl.tile(x.size(0)):
+            sums[row, :] = torch.cumsum(x[row, :], dim=-1)
+            values = y[row, :]
+            products[row, :] = hl.cumprod(values, dim=-1) + values
+        return sums, products
+
+    x = torch.full((2, 8), sum_value, dtype=input_dtype, device=DEVICE)
+    y = torch.full_like(x, prod_value)
+    torch.testing.assert_close(
+        output_only(scan, (x, y)), (torch.cumsum(x, -1), torch.cumprod(y, -1) + y)
+    )
+
+
+@skipUnlessBackends(["triton", "cute"])
+def test_scan_explicit_dtype() -> None:
+    @helion.kernel(static_shapes=True, config=helion.Config(block_sizes=[1]))
+    def scan(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        sums = torch.empty_like(x, dtype=torch.int8)
+        products = torch.empty_like(x, dtype=torch.int32)
+        for row in hl.tile(x.size(0)):
+            values = x[row, :]
+            sums[row, :] = hl.cumsum(values, -1, reverse=True, dtype=torch.int8)
+            products[row, :] = torch.cumprod(values, -1, dtype=torch.int32)
+        return sums, products
+
+    x = torch.tensor([[40.5, 41.5, 42.5, 43.5]], device=DEVICE, dtype=torch.float32)
+    torch.testing.assert_close(
+        output_only(scan, (x,)),
+        (
+            torch.cumsum(x.flip([-1]), -1, dtype=torch.int8).flip([-1]),
+            torch.cumprod(x, -1, dtype=torch.int32),
+        ),
+    )
+
+
 @onlyBackends(["triton", "cute"])
 class TestAssociativeScan(RefEagerTestBase, TestCase):
     def test_computed_cumsum_numeric_dtypes(self) -> None:
@@ -128,7 +181,12 @@ class TestAssociativeScan(RefEagerTestBase, TestCase):
             for row in hl.tile(x.size(0)):
                 columns = hl.arange(x.size(1))
                 values = torch.where(columns[None, :] < x.size(1), x[row, :] + 1, 0)
-                output[row, :] = hl.cumsum(values, dim=-1, reverse=reverse)
+                output[row, :] = hl.cumsum(
+                    values,
+                    dim=-1,
+                    reverse=reverse,
+                    dtype=None if x.dtype.is_floating_point else x.dtype,
+                )
             return output
 
         for dtype in (
@@ -160,7 +218,12 @@ class TestAssociativeScan(RefEagerTestBase, TestCase):
             output = torch.empty_like(x)
             for row in hl.tile(x.size(0)):
                 values = x[row, :] + 1
-                output[row, :] = hl.cumsum(values, dim=-1, reverse=reverse)
+                output[row, :] = hl.cumsum(
+                    values,
+                    dim=-1,
+                    reverse=reverse,
+                    dtype=None if x.dtype.is_floating_point else x.dtype,
+                )
             return output
 
         for dtype in (

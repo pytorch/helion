@@ -25,6 +25,7 @@ from helion._compiler.cute.autotune.search_surface import CUTE_SEARCH_SURFACE
 from helion._compiler.cute.backend import CuteBackend
 from helion._compiler.cute.cute_flash_gated import FLASH_GATE_WARPGROUPS_KEY
 from helion._compiler.pallas.backend import PallasBackend
+from helion._compiler.triton.backend import GluonBackend
 from helion._compiler.triton.backend import TileIRBackend
 from helion._compiler.triton.backend import TritonBackend
 from helion.autotuner.config_spec import BACKEND_SPECIFIC_KEYS
@@ -47,7 +48,8 @@ _BASE_VALID_KEYS = """
     cute_collective_copy cute_collective_epilogue cute_collective_mma
     cute_collective_native_seeded cute_collective_operand_packets
     cute_collective_recipe cute_collective_stages cute_collective_static_layouts
-    cute_collective_tmem_a cute_collective_tmem_seed cute_compiler_pipeline cute_exact_div_form
+    cute_collective_tmem_a cute_collective_tmem_seed cute_compiler_pipeline cute_defer_tile_reduce
+    cute_exact_div_form
     cute_flash_bias_form cute_flash_bias_stage cute_flash_bwd_aux_smem
     cute_flash_bwd_bias_fold cute_flash_bwd_ds_tmem cute_flash_bwd_exp2_emu
     cute_flash_bwd_exp2_f32 cute_flash_bwd_family cute_flash_bwd_hook_cols
@@ -90,7 +92,8 @@ _BASE_VALID_KEYS = """
     cute_flash_stat_transport cute_flash_tensor_4d_tma cute_flash_topology
     cute_flash_uneven_kv_ring cute_flash_use_2cta cute_flash_wait_hint
     cute_flash_ws_k_stage_extra cute_flash_ws_loader_warp cute_flash_ws_mask_phases
-    cute_flash_ws_one_pass cute_fp32_dot cute_fragment_atomic_aggregation
+    cute_flash_ws_one_pass cute_fmnmx_extrema cute_fp32_dot
+    cute_fragment_atomic_aggregation
     cute_fragment_atomic_consumer_fusion cute_fragment_batched_loads
     cute_fragment_bounded_gather cute_fragment_cta_topk cute_fragment_half_mma
     cute_fragment_integer_atomic_epochs cute_fragment_local_atomic_registers
@@ -109,6 +112,7 @@ _BASE_VALID_KEYS = """
     cute_grid_lane_jam
     cute_grouped_ab_stages cute_grouped_ctas_per_sm cute_grouped_descriptor_policy
     cute_grouped_prefix_scan cute_grouped_rna_block_k cute_grouped_rna_warps
+    cute_guarded_lanes
     cute_host_paired_sum cute_independent_reduction cute_integer_loop_reduction
     cute_lane_layouts cute_lane_unroll cute_materialized_operand_schedule
     cute_materialized_schedule cute_matmul_family cute_min_blocks_per_mp
@@ -121,8 +125,8 @@ _BASE_VALID_KEYS = """
     cute_mma_dag_value_metadata_read_overlap
     cute_mma_dag_store cute_mma_dag_v_lag
     cute_mma_dag_warps
-    cute_mma_f32_conversion cute_packet_prefetch cute_pair_lane_math cute_pdl cute_pdl_capture_overlap cute_pdl_release
-    cute_pointwise_pid_type cute_proven_bounds cute_radix_boundary_early_exit
+    cute_mma_f32_conversion cute_narrow_load_hints cute_packet_prefetch cute_pair_lane_math cute_pdl cute_pdl_capture_overlap cute_pdl_release
+    cute_pointwise_pid_type cute_predicated_element_loads cute_proven_bounds cute_radix_boundary_early_exit
     cute_radix_cached_payload_inverse cute_radix_candidate_capacity
     cute_radix_candidate_key_cache cute_radix_cluster_ctas cute_radix_defer_output
     cute_radix_histogram_mode cute_radix_packet_bits cute_radix_partial_scan
@@ -138,7 +142,7 @@ _BASE_VALID_KEYS = """
     cute_register_tile_store_first
     cute_register_tile_warp_fold cute_replicated_reduction cute_rng_packet
     cute_scalar_epilogue cute_scalar_epilogue_keep_inputs
-    cute_scalar_epilogue_owner_fold cute_scaled_cluster_m cute_scaled_compact_m
+    cute_scalar_epilogue_owner_fold cute_scalar_load_hints cute_scaled_cluster_m cute_scaled_compact_m
     cute_scaled_epilogue_mode cute_scaled_epilogue_n cute_scaled_fused_scales
     cute_scaled_mma cute_scaled_persistent cute_scaled_prepare
     cute_scaled_prepare_rows cute_scaled_sf_inplace cute_scaled_sf_tma
@@ -147,7 +151,8 @@ _BASE_VALID_KEYS = """
     cute_selection_algorithm cute_signed_bitfield_bf16
     cute_simt_mma cute_simt_mma_layout cute_split_k_finalizer_warps
     cute_split_k_partitions cute_split_k_schedule cute_split_k_stages
-    cute_split_k_workspace cute_store_policy cute_tail_peel cute_tiles_per_block
+    cute_split_k_workspace cute_staged_store cute_store_packet_tiers
+    cute_store_policy cute_tail_peel cute_tiles_per_block
     cute_topk_coarse_keys cute_topk_defer_value_gathers cute_topk_key_dtype
     cute_topk_key_encoder cute_topk_key_recovery cute_topk_lanes_per_row
     cute_topk_merge_schedule cute_topk_output_vector_width cute_topk_rank_mode
@@ -159,12 +164,14 @@ _BASE_VALID_KEYS = """
     cute_warp_fp32_redux cute_wide_packet_hints cute_warp_mma_warps epilogue_subtile flatten_loops
     host_tensor_descriptors indexing l2_groupings load_cache_modifiers
     load_eviction_policies loop_orders matrix_instr_nonkdim maxnreg metal_matmul
-    num_ctas num_sm_multiplier num_stages num_threads num_warps occupancy
+    metal_tabulate_max_entries num_ctas num_sm_multiplier num_stages num_threads num_warps occupancy
     pallas_emit_pipeline_group_size pallas_fold_dot_lhs_cast
     pallas_indirect_access_mode pallas_internal_scratch pallas_load_buffer_count
     pallas_loop_type pallas_pre_broadcast pallas_use_low_level_scheduler
-    pallas_worklist_grouping pid_type range_flattens range_multi_buffers
-    range_num_stages range_unroll_factors range_warp_specializes reduction_fusion
+    pallas_worklist_bucket_rows pallas_worklist_buffer_count
+    pallas_worklist_grouping pid_type prefetch_indexing range_flattens
+    range_multi_buffers range_num_stages range_unroll_factors
+    range_warp_specializes reduction_fusion
     reduction_loops static_ranges store_cache_modifiers tcgen05_ab_stages
     tcgen05_ab_startup_prefill tcgen05_acc_stages tcgen05_acc_wait_placement
     tcgen05_aux_fragment_hoist tcgen05_aux_load_mode tcgen05_aux_load_placement
@@ -200,6 +207,10 @@ _BASE_VALID_KEYS = """
     tcgen05_warp_spec_scheduler_warps tcgen05_warp_spec_store_warps waves_per_eu
     xcd_remap
     cute_dot_fragment_mma cute_dot_ring_mma cute_dot_ring_split cute_dot_ring_stages cute_flash_gated_row_warps cute_pdl_spread cute_split_k_atomic_epilogue tcgen05_epi_round_subtiles cute_privatize_atomics
+    cross_loop_tmem_prefetch
+    cross_loop_dsmem
+    cross_loop_inband_protocol
+    worker_registers
 """
 
 # ``BACKEND_SPECIFIC_KEYS``.
@@ -213,7 +224,8 @@ _BASE_BACKEND_SPECIFIC_KEYS = """
     cute_collective_copy cute_collective_epilogue cute_collective_mma
     cute_collective_native_seeded cute_collective_operand_packets
     cute_collective_recipe cute_collective_stages cute_collective_static_layouts
-    cute_collective_tmem_a cute_collective_tmem_seed cute_compiler_pipeline cute_exact_div_form
+    cute_collective_tmem_a cute_collective_tmem_seed cute_compiler_pipeline cute_defer_tile_reduce
+    cute_exact_div_form
     cute_flash_bias_form cute_flash_bias_stage cute_flash_bwd_aux_smem
     cute_flash_bwd_bias_fold cute_flash_bwd_ds_tmem cute_flash_bwd_exp2_emu
     cute_flash_bwd_exp2_f32 cute_flash_bwd_family cute_flash_bwd_hook_cols
@@ -256,7 +268,8 @@ _BASE_BACKEND_SPECIFIC_KEYS = """
     cute_flash_stat_transport cute_flash_tensor_4d_tma cute_flash_topology
     cute_flash_uneven_kv_ring cute_flash_use_2cta cute_flash_wait_hint
     cute_flash_ws_k_stage_extra cute_flash_ws_loader_warp cute_flash_ws_mask_phases
-    cute_flash_ws_one_pass cute_fp32_dot cute_fragment_atomic_aggregation
+    cute_flash_ws_one_pass cute_fmnmx_extrema cute_fp32_dot
+    cute_fragment_atomic_aggregation
     cute_fragment_atomic_consumer_fusion cute_fragment_batched_loads
     cute_fragment_bounded_gather cute_fragment_cta_topk cute_fragment_half_mma
     cute_fragment_integer_atomic_epochs cute_fragment_local_atomic_registers
@@ -275,6 +288,7 @@ _BASE_BACKEND_SPECIFIC_KEYS = """
     cute_grid_lane_jam
     cute_grouped_ab_stages cute_grouped_ctas_per_sm cute_grouped_descriptor_policy
     cute_grouped_prefix_scan cute_grouped_rna_block_k cute_grouped_rna_warps
+    cute_guarded_lanes
     cute_host_paired_sum cute_independent_reduction cute_integer_loop_reduction
     cute_lane_layouts cute_lane_unroll cute_materialized_operand_schedule
     cute_materialized_schedule cute_matmul_family cute_min_blocks_per_mp
@@ -287,8 +301,8 @@ _BASE_BACKEND_SPECIFIC_KEYS = """
     cute_mma_dag_value_metadata_read_overlap
     cute_mma_dag_store cute_mma_dag_v_lag
     cute_mma_dag_warps
-    cute_mma_f32_conversion cute_packet_prefetch cute_pair_lane_math cute_pdl cute_pdl_capture_overlap cute_pdl_release
-    cute_pointwise_pid_type cute_proven_bounds cute_radix_boundary_early_exit
+    cute_mma_f32_conversion cute_narrow_load_hints cute_packet_prefetch cute_pair_lane_math cute_pdl cute_pdl_capture_overlap cute_pdl_release
+    cute_pointwise_pid_type cute_predicated_element_loads cute_proven_bounds cute_radix_boundary_early_exit
     cute_radix_cached_payload_inverse cute_radix_candidate_capacity
     cute_radix_candidate_key_cache cute_radix_cluster_ctas cute_radix_defer_output
     cute_radix_histogram_mode cute_radix_packet_bits cute_radix_partial_scan
@@ -304,7 +318,7 @@ _BASE_BACKEND_SPECIFIC_KEYS = """
     cute_register_tile_store_first
     cute_register_tile_warp_fold cute_replicated_reduction cute_rng_packet
     cute_scalar_epilogue cute_scalar_epilogue_keep_inputs
-    cute_scalar_epilogue_owner_fold cute_scaled_cluster_m cute_scaled_compact_m
+    cute_scalar_epilogue_owner_fold cute_scalar_load_hints cute_scaled_cluster_m cute_scaled_compact_m
     cute_scaled_epilogue_mode cute_scaled_epilogue_n cute_scaled_fused_scales
     cute_scaled_mma cute_scaled_persistent cute_scaled_prepare
     cute_scaled_prepare_rows cute_scaled_sf_inplace cute_scaled_sf_tma
@@ -313,7 +327,8 @@ _BASE_BACKEND_SPECIFIC_KEYS = """
     cute_selection_algorithm cute_signed_bitfield_bf16
     cute_simt_mma cute_simt_mma_layout cute_split_k_finalizer_warps
     cute_split_k_partitions cute_split_k_schedule cute_split_k_stages
-    cute_split_k_workspace cute_store_policy cute_tail_peel cute_tiles_per_block
+    cute_split_k_workspace cute_staged_store cute_store_packet_tiers
+    cute_store_policy cute_tail_peel cute_tiles_per_block
     cute_topk_coarse_keys cute_topk_defer_value_gathers cute_topk_key_dtype
     cute_topk_key_encoder cute_topk_key_recovery cute_topk_lanes_per_row
     cute_topk_merge_schedule cute_topk_output_vector_width cute_topk_rank_mode
@@ -323,13 +338,16 @@ _BASE_BACKEND_SPECIFIC_KEYS = """
     cute_vector_packet_unroll
     cute_vector_widths cute_vloop_sink cute_warp_aggregated_atomics
     cute_warp_fp32_redux cute_wide_packet_hints cute_warp_mma_warps host_tensor_descriptors
-    load_cache_modifiers matrix_instr_nonkdim metal_matmul num_ctas num_threads
-    occupancy
+    load_cache_modifiers matrix_instr_nonkdim metal_matmul
+    metal_tabulate_max_entries num_ctas num_threads occupancy
     pallas_emit_pipeline_group_size pallas_fold_dot_lhs_cast
     pallas_indirect_access_mode pallas_load_buffer_count pallas_loop_type
-    pallas_pre_broadcast pallas_use_low_level_scheduler pallas_worklist_grouping
-    store_cache_modifiers tcgen05_ab_stages tcgen05_ab_startup_prefill
-    tcgen05_acc_stages tcgen05_acc_wait_placement tcgen05_aux_fragment_hoist
+    pallas_pre_broadcast pallas_use_low_level_scheduler
+    pallas_worklist_bucket_rows
+    pallas_worklist_buffer_count pallas_worklist_grouping
+    prefetch_indexing store_cache_modifiers tcgen05_ab_stages
+    tcgen05_ab_startup_prefill tcgen05_acc_stages tcgen05_acc_wait_placement
+    tcgen05_aux_fragment_hoist
     tcgen05_aux_load_mode tcgen05_aux_load_placement tcgen05_aux_prefetch_subtiles
     tcgen05_aux_stages tcgen05_batch_raster tcgen05_c_acquire_placement
     tcgen05_c_stages tcgen05_c_store_mode tcgen05_clc_query_pacing tcgen05_cluster_m
@@ -362,6 +380,10 @@ _BASE_BACKEND_SPECIFIC_KEYS = """
     tcgen05_warp_spec_scheduler_warps tcgen05_warp_spec_store_warps waves_per_eu
     xcd_remap
     cute_dot_fragment_mma cute_dot_ring_mma cute_dot_ring_split cute_dot_ring_stages cute_flash_gated_row_warps cute_pdl_spread cute_split_k_atomic_epilogue tcgen05_epi_round_subtiles cute_privatize_atomics
+    cross_loop_tmem_prefetch
+    cross_loop_dsmem
+    cross_loop_inband_protocol
+    worker_registers
 """
 
 # ``_CUTE_IMPLICIT_DEFAULT_KEYS``.
@@ -373,8 +395,9 @@ _BASE_CUTE_IMPLICIT_DEFAULT_KEYS = """
     cute_collective_copy cute_collective_epilogue cute_collective_mma
     cute_collective_native_seeded cute_collective_operand_packets
     cute_collective_recipe cute_collective_stages cute_collective_static_layouts
-    cute_collective_tmem_a cute_collective_tmem_seed cute_compiler_pipeline cute_exact_div_form
-    cute_fp32_dot cute_fragment_atomic_aggregation
+    cute_collective_tmem_a cute_collective_tmem_seed cute_compiler_pipeline cute_defer_tile_reduce
+    cute_exact_div_form
+    cute_fmnmx_extrema cute_fp32_dot cute_fragment_atomic_aggregation
     cute_fragment_atomic_consumer_fusion cute_fragment_batched_loads
     cute_fragment_bounded_gather cute_fragment_cta_topk cute_fragment_half_mma
     cute_fragment_integer_atomic_epochs cute_fragment_local_atomic_registers
@@ -389,10 +412,11 @@ _BASE_CUTE_IMPLICIT_DEFAULT_KEYS = """
     cute_fragment_warp_producer_regions cute_fragment_warp_results
     cute_fragment_warp_scan cute_gathered_mma_n cute_gathered_mma_stages
     cute_grid_lane_jam
+    cute_guarded_lanes
     cute_host_paired_sum cute_independent_reduction cute_integer_loop_reduction
     cute_lane_unroll cute_materialized_operand_schedule cute_materialized_schedule
-    cute_packet_prefetch cute_pair_lane_math cute_pdl cute_pdl_capture_overlap cute_pdl_release cute_pointwise_pid_type
-    cute_proven_bounds cute_radix_boundary_early_exit
+    cute_narrow_load_hints cute_packet_prefetch cute_pair_lane_math cute_pdl cute_pdl_capture_overlap cute_pdl_release cute_pointwise_pid_type
+    cute_predicated_element_loads cute_proven_bounds cute_radix_boundary_early_exit
     cute_radix_cached_payload_inverse cute_radix_candidate_capacity
     cute_radix_candidate_key_cache cute_radix_cluster_ctas cute_radix_defer_output
     cute_radix_histogram_mode cute_radix_packet_bits cute_radix_partial_scan
@@ -405,7 +429,7 @@ _BASE_CUTE_IMPLICIT_DEFAULT_KEYS = """
     cute_register_tile_cooperative_fold cute_register_tile_store_first
     cute_register_tile_warp_fold cute_replicated_reduction cute_rng_packet
     cute_scalar_epilogue cute_scalar_epilogue_keep_inputs
-    cute_scalar_epilogue_owner_fold cute_scaled_cluster_m cute_scaled_compact_m
+    cute_scalar_epilogue_owner_fold cute_scalar_load_hints cute_scaled_cluster_m cute_scaled_compact_m
     cute_scaled_epilogue_mode cute_scaled_epilogue_n cute_scaled_fused_scales
     cute_scaled_mma cute_scaled_persistent cute_scaled_prepare
     cute_scaled_prepare_rows cute_scaled_sf_inplace cute_scaled_sf_tma
@@ -414,7 +438,8 @@ _BASE_CUTE_IMPLICIT_DEFAULT_KEYS = """
     cute_selection_algorithm cute_signed_bitfield_bf16
     cute_simt_mma cute_simt_mma_layout cute_split_k_finalizer_warps
     cute_split_k_partitions cute_split_k_schedule cute_split_k_stages
-    cute_split_k_workspace cute_store_policy cute_tail_peel cute_topk_coarse_keys
+    cute_split_k_workspace cute_staged_store cute_store_packet_tiers
+    cute_store_policy cute_tail_peel cute_topk_coarse_keys
     cute_topk_key_recovery cute_uniform_lane_compares cute_unpadded_rows
     cute_vector_packet_unroll cute_vloop_sink
     cute_warp_aggregated_atomics cute_warp_fp32_redux cute_wide_packet_hints flatten_loops indexing
@@ -435,7 +460,8 @@ _BASE_CUTE_ACCEPTED = """
     cute_collective_copy cute_collective_epilogue cute_collective_mma
     cute_collective_native_seeded cute_collective_operand_packets
     cute_collective_recipe cute_collective_stages cute_collective_static_layouts
-    cute_collective_tmem_a cute_collective_tmem_seed cute_compiler_pipeline cute_exact_div_form
+    cute_collective_tmem_a cute_collective_tmem_seed cute_compiler_pipeline cute_defer_tile_reduce
+    cute_exact_div_form
     cute_flash_bias_form cute_flash_bias_stage cute_flash_bwd_aux_smem
     cute_flash_bwd_bias_fold cute_flash_bwd_ds_tmem cute_flash_bwd_exp2_emu
     cute_flash_bwd_exp2_f32 cute_flash_bwd_family cute_flash_bwd_hook_cols
@@ -478,7 +504,8 @@ _BASE_CUTE_ACCEPTED = """
     cute_flash_stat_transport cute_flash_tensor_4d_tma cute_flash_topology
     cute_flash_uneven_kv_ring cute_flash_use_2cta cute_flash_wait_hint
     cute_flash_ws_k_stage_extra cute_flash_ws_loader_warp cute_flash_ws_mask_phases
-    cute_flash_ws_one_pass cute_fp32_dot cute_fragment_atomic_aggregation
+    cute_flash_ws_one_pass cute_fmnmx_extrema cute_fp32_dot
+    cute_fragment_atomic_aggregation
     cute_fragment_atomic_consumer_fusion cute_fragment_batched_loads
     cute_fragment_bounded_gather cute_fragment_cta_topk cute_fragment_half_mma
     cute_fragment_integer_atomic_epochs cute_fragment_local_atomic_registers
@@ -497,6 +524,7 @@ _BASE_CUTE_ACCEPTED = """
     cute_grid_lane_jam
     cute_grouped_ab_stages cute_grouped_ctas_per_sm cute_grouped_descriptor_policy
     cute_grouped_prefix_scan cute_grouped_rna_block_k cute_grouped_rna_warps
+    cute_guarded_lanes
     cute_host_paired_sum cute_independent_reduction cute_integer_loop_reduction
     cute_lane_layouts cute_lane_unroll cute_materialized_operand_schedule
     cute_materialized_schedule cute_matmul_family cute_min_blocks_per_mp
@@ -509,8 +537,8 @@ _BASE_CUTE_ACCEPTED = """
     cute_mma_dag_value_metadata_read_overlap
     cute_mma_dag_store cute_mma_dag_v_lag
     cute_mma_dag_warps
-    cute_mma_f32_conversion cute_packet_prefetch cute_pair_lane_math cute_pdl cute_pdl_capture_overlap cute_pdl_release
-    cute_pointwise_pid_type cute_proven_bounds cute_radix_boundary_early_exit
+    cute_mma_f32_conversion cute_narrow_load_hints cute_packet_prefetch cute_pair_lane_math cute_pdl cute_pdl_capture_overlap cute_pdl_release
+    cute_pointwise_pid_type cute_predicated_element_loads cute_proven_bounds cute_radix_boundary_early_exit
     cute_radix_cached_payload_inverse cute_radix_candidate_capacity
     cute_radix_candidate_key_cache cute_radix_cluster_ctas cute_radix_defer_output
     cute_radix_histogram_mode cute_radix_packet_bits cute_radix_partial_scan
@@ -526,7 +554,7 @@ _BASE_CUTE_ACCEPTED = """
     cute_register_tile_store_first
     cute_register_tile_warp_fold cute_replicated_reduction cute_rng_packet
     cute_scalar_epilogue cute_scalar_epilogue_keep_inputs
-    cute_scalar_epilogue_owner_fold cute_scaled_cluster_m cute_scaled_compact_m
+    cute_scalar_epilogue_owner_fold cute_scalar_load_hints cute_scaled_cluster_m cute_scaled_compact_m
     cute_scaled_epilogue_mode cute_scaled_epilogue_n cute_scaled_fused_scales
     cute_scaled_mma cute_scaled_persistent cute_scaled_prepare
     cute_scaled_prepare_rows cute_scaled_sf_inplace cute_scaled_sf_tma
@@ -535,7 +563,8 @@ _BASE_CUTE_ACCEPTED = """
     cute_selection_algorithm cute_signed_bitfield_bf16
     cute_simt_mma cute_simt_mma_layout cute_split_k_finalizer_warps
     cute_split_k_partitions cute_split_k_schedule cute_split_k_stages
-    cute_split_k_workspace cute_store_policy cute_tail_peel cute_tiles_per_block
+    cute_split_k_workspace cute_staged_store cute_store_packet_tiers
+    cute_store_policy cute_tail_peel cute_tiles_per_block
     cute_topk_coarse_keys cute_topk_defer_value_gathers cute_topk_key_dtype
     cute_topk_key_encoder cute_topk_key_recovery cute_topk_lanes_per_row
     cute_topk_merge_schedule cute_topk_output_vector_width cute_topk_rank_mode
@@ -586,13 +615,28 @@ _BASE_CUTE_ACCEPTED = """
 
 # The same census for ``TritonBackend``.
 _BASE_TRITON_ACCEPTED = """
-    advanced_controls_file atomic_indexing block_sizes cross_loop_pipeline
+    advanced_controls_file atomic_indexing block_sizes
+    cross_loop_inband_protocol cross_loop_pipeline
     epilogue_subtile flatten_loops host_tensor_descriptors indexing l2_groupings
     load_cache_modifiers load_eviction_policies loop_orders maxnreg
     num_sm_multiplier num_stages num_warps pallas_internal_scratch pid_type
-    range_flattens range_multi_buffers range_num_stages range_unroll_factors
-    range_warp_specializes reduction_fusion reduction_loops static_ranges
-    store_cache_modifiers
+    prefetch_indexing range_flattens range_multi_buffers range_num_stages
+    range_unroll_factors range_warp_specializes reduction_fusion reduction_loops
+    static_ranges store_cache_modifiers
+"""
+
+# The same census for ``GluonBackend``: Triton's keys but the ones Gluon
+# ignores (``maxnreg``, ``range_flattens``, ``range_multi_buffers``), and its
+# own: ``cross_loop_dsmem``, ``cross_loop_tmem_prefetch`` and
+# ``worker_registers`` (the last two hand overrides the search never proposes).
+_BASE_GLUON_ACCEPTED = """
+    advanced_controls_file atomic_indexing block_sizes cross_loop_dsmem
+    cross_loop_inband_protocol cross_loop_pipeline
+    cross_loop_tmem_prefetch epilogue_subtile flatten_loops indexing l2_groupings load_cache_modifiers
+    load_eviction_policies loop_orders num_sm_multiplier num_stages num_warps
+    pallas_internal_scratch pid_type prefetch_indexing range_num_stages
+    range_unroll_factors range_warp_specializes reduction_fusion reduction_loops
+    static_ranges store_cache_modifiers worker_registers
 """
 
 # The same census for ``TileIRBackend``.
@@ -610,19 +654,24 @@ _BASE_PALLAS_ACCEPTED = """
     block_sizes flatten_loops loop_orders pallas_emit_pipeline_group_size
     pallas_fold_dot_lhs_cast pallas_indirect_access_mode pallas_internal_scratch
     pallas_load_buffer_count pallas_loop_type pallas_pre_broadcast
-    pallas_use_low_level_scheduler pallas_worklist_grouping
+    pallas_use_low_level_scheduler
+    pallas_worklist_bucket_rows
+    pallas_worklist_buffer_count pallas_worklist_grouping
 """
 
 
 # The keys ``TritonBackend.supports_config_key`` decides by the device the
 # row runs on: ``host_tensor_descriptors`` needs a CUDA device of capability
-# >= 9.0, ``cross_loop_pipeline`` is off on ROCm, ``waves_per_eu`` /
-# ``matrix_instr_nonkdim`` / ``xcd_remap`` are AMD tunables accepted only
-# there, and the MTIA tunables only on MTIA.
+# >= 9.0, ``cross_loop_pipeline``,
+# ``cross_loop_inband_protocol`` and ``prefetch_indexing`` are off on ROCm,
+# ``waves_per_eu`` / ``matrix_instr_nonkdim`` / ``xcd_remap`` are AMD tunables
+# accepted only there, and the MTIA tunables only on MTIA.
 _DEVICE_DECIDED_KEYS = frozenset(
     {
         "host_tensor_descriptors",
         "cross_loop_pipeline",
+        "cross_loop_inband_protocol",
+        "prefetch_indexing",
         "matrix_instr_nonkdim",
         "waves_per_eu",
         "xcd_remap",
@@ -677,10 +726,11 @@ def test_cute_backend_acceptance_matches_the_literal_chain() -> None:
     ("backend", "expected"),
     [
         (TritonBackend(), _BASE_TRITON_ACCEPTED),
+        (GluonBackend(), _BASE_GLUON_ACCEPTED),
         (TileIRBackend(), _BASE_TILEIR_ACCEPTED),
         (PallasBackend(), _BASE_PALLAS_ACCEPTED),
     ],
-    ids=["triton", "tileir", "pallas"],
+    ids=["triton", "gluon", "tileir", "pallas"],
 )
 def test_other_backends_reject_the_cute_surface(backend: object, expected: str) -> None:
     # The surface split is what this test pins (the expected tables carry no

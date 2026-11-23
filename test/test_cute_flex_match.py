@@ -352,6 +352,20 @@ def test_score_mod_closure_table_and_mask() -> None:
                 assert isinstance(values[slot], torch.SymInt)
 
 
+def test_bound_under_the_profiler_matches() -> None:
+    """Bound inside a torch.profiler context, whose compile suppresses the
+    shape env's guards, the forward still matches: the BlockMask's block
+    sizes, ``hl.specialize``-d scalar arguments, still fold into the table
+    row index as the literal ``m_begin // 128``.  The profiler used to leave
+    them symbolic and the envelope declined (``table row index is not
+    m_begin // QB``)."""
+    q, k, v = _qkv(2, 4, 512, 512, 128)
+    dense = create_block_mask(noop_mask, None, None, 512, 512, device=_CPU)
+    with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU]):
+        bound = _bind(_flex_kernel(), _flex_args(q, k, v, _identity, dense), flex=True)
+    _match_or_fail(bound)
+
+
 def test_dense_noop_mask_and_trivial_empty_mask() -> None:
     """(c) an all-full ``noop_mask`` BlockMask is a real walk without regions;
     ``_create_empty_block_mask`` is the trivial walk (``KB >= N``)."""

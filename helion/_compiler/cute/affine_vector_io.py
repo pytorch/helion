@@ -4,6 +4,44 @@ Address analysis happens after scalar code generation, where indirect index
 arithmetic and its definitions are visible together. A complete-fragment
 guard selects the vector path; partial tails retain the original scalar loop.
 Unknown effects, aliased stores, and non-unit lane mappings are left intact.
+
+Store tiers (``cute_store_packet_tiers``).  A store whose packet alignment
+is not proven is guarded at run time, and a fragment that fails the guard
+runs the scalar loop: one element per store and one scalar load per element.
+An output whose row stride is no multiple of the packet (a ``[rows, 30522]``
+bf16 tensor: its rows are 61044 bytes apart, so three rows in four start 4,
+8 or 12 bytes past a sixteen-byte boundary) then stores most of its rows
+that way.  With the knob on, the fragment that fails a store's guard is
+vectorized again with the same loads and the store split into packets of
+half the lanes, down to two lanes (``_tiers``; eight bf16 lanes here)::
+
+    if <masks> and row * stride % 8 == 0:    # one 16-byte packet
+    elif <masks> and row * stride % 4 == 0:  # two 8-byte packets
+    elif <masks>:                            # four 4-byte packets (stride even)
+    else: <scalar loop>
+
+Every tier proves what the first one does, at its own packet: all lanes
+active, the tensor base aligned to the full packet, every pointer prefix and
+the lane-zero offset a multiple of the tier's lanes (proven, or a guard of
+that tier).  A tier whose stores need no guard ends the chain.  Loads keep
+their full packets in every tier, so a fragment whose load guard fails falls
+through to the scalar loop as before.
+
+The stores of one loop step through their tiers together, each only as far
+as its own alignment asks (``_store_tier``): in arm ``k`` of the chain a
+store is at its ``k``-th tier, or at the first one that proves its alignment
+without a guard (it is not narrowed for another store's sake), or at its
+last one.  Stores of different element sizes have chains of different
+lengths (sixteen lanes: four tiers of a 16-bit dtype, down to 4-byte
+packets; three of a 32-bit one, down to 8-byte packets).  The chain goes on
+while a store that this tier guards has a narrower tier.
+
+A fragment whose first lane's offset is a multiple of all its lanes cannot
+cross the Int32 wrap of that offset, which is why the whole loop's packets
+are pointer steps from the first one.  A narrower tier aligns the first lane
+to its own packet only, so where the whole-loop alignment is not proven each
+of its packets takes the offset the scalar code computes for the packet's
+first lane.
 """
 
 from __future__ import annotations
@@ -46,6 +84,17 @@ if TYPE_CHECKING:
     from .bounded_loop_cache import OwnedFragment
 
 _LANE = re.compile(r"(?:vec_lane_|synthetic_lane_)(\d+)")
+# Dtypes whose elements ``vectorize_affine_tile_lanes`` loads and stores in
+# packets; the search offers ``cute_store_packet_tiers`` on stores of the
+# same ones (``store_tier_blocks``).
+PACKET_DTYPES = (
+    torch.float16,
+    torch.bfloat16,
+    torch.float32,
+    torch.int32,
+    torch.uint32,
+)
+
 _CASTS = frozenset(
     f"cutlass.{name}"
     for name in (
@@ -641,7 +690,9 @@ class _Vectorizer:
         private_accesses: frozenset[str] = frozenset(),
         register_accesses: frozenset[str] = frozenset(),
         unshadowed_abs: bool = False,
+        store_tiers: bool = False,
     ) -> None:
+        self.store_tiers = store_tiers
         self.strides = strides
         self.alignments = alignments
         self.dtypes = dtypes
@@ -996,6 +1047,72 @@ class _Vectorizer:
         multiples: dict[str, int],
         int32_names: frozenset[str],
     ) -> list[ast.stmt] | None:
+        return self._emit(original, outer, multiples, int32_names, 0)
+
+    @staticmethod
+    def _tiers(width: int, memory_width: int) -> list[tuple[int, int]]:
+        """``(guard lanes, packet lanes)`` of each store tier of a site:
+        first the whole loop (every packet of ``memory_width`` lanes aligned
+        to ``width`` lanes, the only tier without the knob), then the packet
+        itself where the loop holds several, then halves down to two lanes.
+        """
+        tiers = [(width, memory_width)]
+        if memory_width < width:
+            tiers.append((memory_width, memory_width))
+        lanes = memory_width // 2
+        while lanes >= 2:
+            tiers.append((lanes, lanes))
+            lanes //= 2
+        return tiers
+
+    def _store_tier(
+        self,
+        tiers: list[tuple[int, int]],
+        tier: int,
+        pointer: ast.BinOp,
+        lane: str,
+        writes: set[str],
+        outer: dict[str, ast.expr],
+        multiples: dict[str, int],
+        int32_names: frozenset[str],
+    ) -> int:
+        """Which of its ``tiers`` a store takes in arm ``tier`` of the chain.
+
+        The stores of a loop step through their chains together, but each
+        one only as far as its own alignment asks: a store whose alignment
+        an earlier tier proves without a guard keeps that tier's packets
+        while another store's guard fails (rows 1024 elements apart beside
+        rows 1018 apart), and a store past the end of a shorter chain (a
+        32-bit dtype beside a 16-bit one) stays at its narrowest packet.
+        """
+        last = min(tier, len(tiers) - 1)
+        offset = _expand(pointer.right, {}, lane, ast.Constant(value=0))
+        for index in range(last):
+            lanes = tiers[index][0]
+            try:
+                guarded = bool(
+                    self.pointer_prefix_guards(
+                        pointer.left, lanes, lane, writes, outer, int32_names
+                    )
+                )
+            except _Decline:
+                continue
+            if not guarded and self.divisible(offset, lanes, outer, multiples):
+                return index
+        return last
+
+    def _emit(
+        self,
+        original: ast.For,
+        outer: dict[str, ast.expr],
+        multiples: dict[str, int],
+        int32_names: frozenset[str],
+        tier: int,
+    ) -> list[ast.stmt] | None:
+        """Vectorize ``original`` with its stores at ``tier`` (``_tiers``;
+        0 without ``cute_store_packet_tiers``).  The fragment that fails a
+        store's alignment guard runs the next tier, the base emitter's (not a
+        subclass's broadened traversal), instead of the scalar loop."""
         # Subclasses can broaden traversal, but this emitter's intrinsic
         # preconditions also apply when called through super().loop().
         if not _affine_loop_candidate(original):
@@ -1022,7 +1139,8 @@ class _Vectorizer:
             # (``_disjoint_store_pair``: an interleaved operand written as
             # rows ``2k`` and ``2k + 1`` from two sites).  Stores flush after
             # the loop in site order, so two sites that never alias may
-            # reorder freely.
+            # reorder freely.  A narrower store tier takes the distance as
+            # the Int32 offsets see it.
             for left, site in enumerate(sites):
                 if not site.store:
                     continue
@@ -1033,7 +1151,7 @@ class _Vectorizer:
                         other.store
                         and root == roots[left]
                         and self._disjoint_store_pair(
-                            site, other, snapshots, outer, lane, width
+                            site, other, snapshots, outer, lane, width, bool(tier)
                         )
                     ):
                         return None
@@ -1052,6 +1170,9 @@ class _Vectorizer:
             vectors: dict[str, list[str]] = {}
             uniform_masks: list[ast.expr] = []
             inactive_proven = True
+            # Whether a store whose alignment this tier checks at run time
+            # has a narrower tier to fall back to.
+            narrower_tier = False
             for site, root in zip(sites, roots, strict=True):
                 assert root is not None
                 dtype = self.dtypes[root]
@@ -1072,11 +1193,29 @@ class _Vectorizer:
                     pointer.op, ast.Add
                 ):
                     raise _Decline
-                prefix_guards.extend(
-                    self.pointer_prefix_guards(
-                        pointer.left, width, lane, writes, outer, int32_names
+                # Lanes the site's alignment is proven or guarded for, and
+                # lanes per store packet (``_store_tier``).
+                aligned_width = width
+                splittable = False
+                if site.store:
+                    tiers = self._tiers(width, memory_width)
+                    index = self._store_tier(
+                        tiers,
+                        tier,
+                        pointer,
+                        lane,
+                        writes,
+                        outer,
+                        multiples,
+                        int32_names,
                     )
+                    aligned_width, memory_width = tiers[index]
+                    splittable = index + 1 < len(tiers)
+                site_prefix_guards = self.pointer_prefix_guards(
+                    pointer.left, aligned_width, lane, writes, outer, int32_names
                 )
+                narrower_tier |= splittable and bool(site_prefix_guards)
+                prefix_guards.extend(site_prefix_guards)
                 form = _pointer_integer_affine_form(
                     pointer.right, lane, self.strides, set(), "pointer"
                 )
@@ -1098,14 +1237,15 @@ class _Vectorizer:
                 offset = _expand(pointer.right, {}, lane, ast.Constant(value=0))
                 if set(ReadWrites.from_ast(offset).reads) & writes:
                     raise _Decline
-                if not self.divisible(offset, width, outer, multiples):
+                if not self.divisible(offset, aligned_width, outer, multiples):
                     inactive_proven = False
+                    narrower_tier |= splittable
                     alignment_guards.append(
                         ast.Compare(
                             left=ast.BinOp(
                                 left=_clone_expr(offset),
                                 op=ast.Mod(),
-                                right=ast.Constant(value=width),
+                                right=ast.Constant(value=aligned_width),
                             ),
                             ops=[ast.Eq()],
                             comparators=[ast.Constant(value=0)],
@@ -1156,13 +1296,38 @@ class _Vectorizer:
                         keywords=[],
                     )
                     stores.add(id(site.call))
+                    # A fragment whose first lane's offset is a multiple of
+                    # all its lanes cannot cross the Int32 wrap of that
+                    # offset, so its later packets are pointer steps from
+                    # the first.  A narrower tier aligns the first lane to
+                    # its own packet only: each packet then takes the offset
+                    # the scalar code computes for its first lane, which
+                    # wraps where the scalar code's does.
+                    stepped = aligned_width == width or self.divisible(
+                        offset, width, outer, multiples
+                    )
                     for start in range(0, width, memory_width):
-                        pointer = ast.unparse(base)
                         selected = values
                         if memory_width != width:
-                            pointer = f"({pointer}) + {start}"
                             selected = f"{values}[{start}:{start + memory_width}]"
-                        after.extend(ast.parse(f"{helper}({pointer}, {selected})").body)
+                        if stepped or not start:
+                            address = ast.unparse(base)
+                            if memory_width != width:
+                                address = f"({address}) + {start}"
+                        else:
+                            address = ast.unparse(
+                                ast.BinOp(
+                                    left=_clone_expr(pointer.left),
+                                    op=ast.Add(),
+                                    right=_expand(
+                                        pointer.right,
+                                        {},
+                                        lane,
+                                        ast.Constant(value=start),
+                                    ),
+                                )
+                            )
+                        after.extend(ast.parse(f"{helper}({address}, {selected})").body)
                 else:
                     key = ast.dump(base, include_attributes=False) + dtype
                     loaded = vectors.get(key)
@@ -1235,12 +1400,16 @@ class _Vectorizer:
             # protected by the original memory masks. Prove all lanes active
             # before evaluating either alignment check.
             guard = _conjunction([*guards, *alignment_guards, *prefix_guards])
-            self.changed += 1
-            return (
-                fast
-                if guard is None
-                else [ast.If(test=guard, body=fast, orelse=[fallback])]
-            )
+            if not tier:
+                self.changed += 1
+            if guard is None:
+                return fast
+            orelse: list[ast.stmt] = [fallback]
+            if self.store_tiers and narrower_tier:
+                narrower = self._emit(original, outer, multiples, int32_names, tier + 1)
+                if narrower is not None:
+                    orelse = narrower
+            return [ast.If(test=guard, body=fast, orelse=orelse)]
         except _Decline:
             return None
 
@@ -1252,6 +1421,7 @@ class _Vectorizer:
         outer: dict[str, ast.expr],
         lane: str,
         width: int,
+        int32_wrap: bool = False,
     ) -> bool:
         """Whether two stores into one tensor never address the same element
         for any pair of lanes ``l, l'`` of the V-loop.
@@ -1260,6 +1430,16 @@ class _Vectorizer:
         scopes' definitions (``_offset_affine_form``), must advance one
         element per lane, agree on every other term and differ by a constant
         of at least ``width`` elements: ``l - l' + delta`` is then never zero.
+
+        The constant is an integer of the offsets as written; the Int32
+        offsets the code computes differ by it modulo ``2**32`` (``2**32 +
+        2`` is two elements).  The whole packet's tier is safe either way:
+        both stores are then a multiple of ``width`` lanes in, by proof or
+        by guard, so they write the same elements from the same lanes, in
+        site order, or are whole packets apart.  A narrower store tier
+        aligns each store to its own packet only (``int32_wrap``): there the
+        distance is taken modulo ``2**32``, and a pair it brings within
+        ``width`` elements keeps the scalar loop.
         """
         forms = []
         for site in (first, second):
@@ -1294,10 +1474,13 @@ class _Vectorizer:
                 (second_linear, second_constant),
             ),
         ) = forms
+        delta = first_constant - second_constant
+        if int32_wrap:
+            delta = (delta + 2**31) % 2**32 - 2**31
         return (
             first_base == second_base
             and first_linear == second_linear
-            and abs(first_constant - second_constant) >= width
+            and abs(delta) >= width
         )
 
     def definition_reads(self, value: ast.expr) -> frozenset[str]:
@@ -1424,7 +1607,11 @@ def vectorize_affine_tile_lanes(
     private_fragments: tuple[OwnedFragment, ...] = (),
     register_accesses: frozenset[str] = frozenset(),
     integer_names: frozenset[str] = frozenset(),
+    store_tiers: bool = False,
 ) -> list[ast.stmt]:
+    """``store_tiers`` (``cute_store_packet_tiers``): a fragment that fails
+    a store's alignment guard stores narrower packets instead of scalars
+    (see the module docstring)."""
     from ..device_function import TensorArg
     from ..device_function import TensorPropertyArg
 
@@ -1433,13 +1620,7 @@ def vectorize_affine_tile_lanes(
     alignments = {}
     dtypes = {}
     for arg in device_function.arguments:
-        if not isinstance(arg, TensorArg) or arg.fake_value.dtype not in (
-            torch.float16,
-            torch.bfloat16,
-            torch.float32,
-            torch.int32,
-            torch.uint32,
-        ):
+        if not isinstance(arg, TensorArg) or arg.fake_value.dtype not in PACKET_DTYPES:
             continue
         tensor = arg.fake_value
         dtypes[arg.name] = env.backend.dtype_str(tensor.dtype)
@@ -1542,6 +1723,7 @@ def vectorize_affine_tile_lanes(
                 )
             )
         ),
+        store_tiers=store_tiers,
     )
     return ast.fix_missing_locations(
         ast.Module(body=vectorizer.body(body), type_ignores=[])

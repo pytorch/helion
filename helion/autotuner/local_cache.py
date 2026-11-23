@@ -156,6 +156,15 @@ def _search_policy_hash(
     callback state cannot be fingerprinted; their owner must regenerate them
     after changes to that state. This does not enable automatic winner reuse.
     """
+    if autotuner._benchmark_prelude is not None and not explicit_aot:
+        # Timed behind a prelude (``benchmark_prelude``): the winner is the
+        # kernel's in that sequence, which no key names. It is neither read
+        # from the automatic cache nor written to it. (An explicit AOT
+        # artifact keeps its stable identifier, as for the other state this
+        # key cannot name.)
+        return _hash_search_policy(
+            json.dumps(_uncacheable_search_policy(autotuner), sort_keys=True).encode()
+        )
     banks = autotuner.settings.autotune_benchmark_input_banks
     resident_bank_policy = None
     if banks > 1:

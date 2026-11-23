@@ -26,11 +26,15 @@ from .ast_read_writes import dead_assignment_elimination
 from .ast_read_writes import dead_expression_elimination
 from .ast_read_writes import definitely_does_not_have_side_effects
 from .compile_environment import CompileEnvironment
+from .cross_loop_report import log_once
 from .device_function import DeviceFunction
 from .emitter_protocols import KernelTransforms
 from .helper_function import CodegenInterface
 from .inductor_lowering import CodegenState
 from .inductor_lowering import codegen_call_with_graph
+from .loop_dependency_checker import _Pending
+from .loop_dependency_checker import graph_accesses
+from .loop_dependency_checker import mark_intra_loop_raw_barriers
 from .output_header import get_needed_import_lines
 from .program_id import ForEachProgramID
 from .scratch_tensors import drop_unused_scratch_arguments
@@ -266,6 +270,8 @@ class GenerateAST(NodeVisitor, CodegenInterface):
         # lives on the pass rather than on the transform so the register-tile
         # retry in ``generate_ast`` emits every placeholder again.
         self.prologue_first_indexing: dict[str, str] = {}
+        # The statement blocks each fused input's placeholder was emitted in.
+        self.prologue_blocks: dict[str, list[list[ast.AST]]] = {}
         self._statement_owner_fx_node: Node | None = None
         self._codegen_results_by_owner_node_id: dict[int, object] = {}
         self.resident_prep_lowering_stack: list[
@@ -296,9 +302,11 @@ class GenerateAST(NodeVisitor, CodegenInterface):
         CodegenInterface.__init__(self, self.device_function)
 
         # Decide once which sibling for-loops need a tl.debug_barrier()
-        # to make global writes visible to subsequent reads.
+        # to make global writes visible to subsequent reads (and, with
+        # Backend.intra_loop_barriers_order_reads, to finish reads before
+        # subsequent writes).
         self._compute_inter_loop_barriers()
-        # Same, for a store->load read-after-write *within* one loop body.
+        # Same, for a hazard *within* one loop body.
         self._compute_intra_loop_barriers()
 
     def allow_dead_assignments_owned_by_nodes(self, nodes: tuple[Node, ...]) -> None:
@@ -399,7 +407,9 @@ class GenerateAST(NodeVisitor, CodegenInterface):
         """Walk every codegen graph; for each pair of consecutive sibling
         ``_for_loop`` / ``_for_loop_step`` nodes, set ``needs_barrier_before``
         on the second loop's ``ForLoopGraphInfo`` when their underlying tensor
-        storages have a RAW dependency.
+        storages have a RAW dependency (or, with
+        ``Backend.intra_loop_barriers_order_reads``, a WAR one, or a store
+        after a store, a WAW one).
 
         TileIR shares Triton surface syntax but ``tl.debug_barrier()`` lowers
         to ``ttg.barrier`` which the TileIR pass pipeline does not legalize,
@@ -408,19 +418,16 @@ class GenerateAST(NodeVisitor, CodegenInterface):
         from ..language._tracing_ops import _for_loop
         from ..language._tracing_ops import _for_loop_step
         from .device_ir import ForLoopGraphInfo
-        from .loop_dependency_checker import graph_memory_access_storage_ids
 
         env = CompileEnvironment.current()
         if not env.backend.supports_inter_loop_barriers:
             return
+        order_reads = env.backend.intra_loop_barriers_order_reads
 
         for graph_info in self.codegen_graphs:
-            # Pending writes accumulate across ALL prior sibling for-loops
-            # since the last emitted barrier.  When a barrier is inserted
-            # before a loop, it flushes all earlier writes, so the pending set
-            # is reset and only writes from loops AFTER the barrier need to be
-            # tracked for subsequent siblings.
-            pending_writes: set[int] = set()
+            # Accesses of all prior sibling loops since the last barrier, which
+            # orders everything before it.
+            pending = _Pending()
             for node in graph_info.graph.nodes:
                 if node.op != "call_function":
                     continue
@@ -431,27 +438,27 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                 cur_info = self.codegen_graphs[cur_id]
                 if not isinstance(cur_info, ForLoopGraphInfo):
                     continue
-                reads, writes = graph_memory_access_storage_ids(
-                    self.codegen_graphs, cur_id
-                )
-                need_barrier = bool(pending_writes & reads)
+                accesses = graph_accesses(self.codegen_graphs, cur_id)
+                need_barrier = pending.conflicts(accesses, reads=order_reads)
                 cur_info.needs_barrier_before = need_barrier
                 if need_barrier:
-                    # Barrier flushes everything written before it.
-                    pending_writes.clear()
-                # Accumulate the current loop's writes for future siblings.
-                pending_writes.update(writes)
+                    # Barrier orders everything before it.
+                    pending.clear()
+                pending.update(accesses if order_reads else accesses.writes())
 
     def _compute_intra_loop_barriers(self) -> None:
-        """Mark loads that read a tensor an earlier store in the same body wrote,
-        so the Triton ``load`` codegen emits a ``tl.debug_barrier()`` before them
-        (the CuTe ``load`` codegen emits ``cute.arch.sync_threads()``).
+        """Mark loads that may read what an earlier store of the same body or
+        of an earlier iteration of its loop wrote (also through device pointers
+        or by a snippet), so the Triton ``load`` codegen emits a
+        ``tl.debug_barrier()`` before them (the CuTe ``load`` codegen emits
+        ``cute.arch.sync_threads()``), and with
+        ``Backend.intra_loop_barriers_order_reads`` writes to a tensor an
+        earlier access read or stored (``mark_intra_loop_raw_barriers``).
 
         TileIR is excluded for the same reason as ``_compute_inter_loop_barriers``:
         ``tl.debug_barrier()`` lowers to ``ttg.barrier`` which the TileIR pass
         pipeline does not legalize.
         """
-        from .loop_dependency_checker import mark_intra_loop_raw_barriers
 
         backend = CompileEnvironment.current().backend
         if not backend.supports_intra_loop_barriers(in_divergent_control_flow=False):
@@ -463,6 +470,8 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                 in_divergent_control_flow=True
             ),
             atomics=backend.intra_loop_barriers_order_atomics,
+            carries=backend.intra_loop_barriers_carry_iterations,
+            reads=backend.intra_loop_barriers_order_reads,
         )
 
     def ensure_module_statements(self, source: str) -> None:
@@ -1331,12 +1340,10 @@ class GenerateAST(NodeVisitor, CodegenInterface):
         return not any(kw.arg == "device" for kw in node.keywords)
 
     def _inject_device_kwarg(self, node: ast.Call) -> ast.Call:
-        for name, val in self.host_function.params.arguments.items():
-            if isinstance(val, torch.Tensor):
-                device_expr = expr_from_string(f"{name}.device")
-                new_kw = create(ast.keyword, arg="device", value=device_expr)
-                node.keywords = [*node.keywords, new_kw]
-                return node
+        if (name := self.host_function.first_tensor_param()) is not None:
+            device_expr = expr_from_string(f"{name}.device")
+            new_kw = create(ast.keyword, arg="device", value=device_expr)
+            node.keywords = [*node.keywords, new_kw]
         return node
 
     def host_dead_code_elimination(
@@ -1401,18 +1408,31 @@ if __name__ == "__main__":
 
 
 def _maybe_emit_compact_worklist_builder(codegen: GenerateAST) -> None:
-    """Emit the module-level jnp ``_build_worklist`` for a compact-worklist kernel."""
+    """Emit the module-level worklist builder for a compact-worklist kernel.
+
+    The jnp ``_build_worklist`` runs as XLA ops before the launch; a plan with
+    static inner loops instead gets ``_fill_worklist``, which the launcher runs
+    inside the kernel on SMEM refs.
+    """
     env = CompileEnvironment.current()
     plan = env.compact_worklist_plan
     if plan is None:
         return
     from .pallas.compact_worklist import render_build_worklist
+    from .pallas.compact_worklist import render_fill_worklist
 
-    source, offset_params = render_build_worklist(
-        plan,
-        block_expr=str(env.compact_worklist_block),
-        upper_expr=str(env.compact_worklist_upper),
-    )
+    if plan.static_inner_loops:
+        source, offset_params = render_fill_worklist(
+            plan,
+            block=env.compact_worklist_block,
+            sublane=env.compact_worklist_sublane,
+        )
+    else:
+        source, offset_params = render_build_worklist(
+            plan,
+            block_expr=str(env.compact_worklist_block),
+            upper_expr=str(env.compact_worklist_upper),
+        )
     env.compact_worklist_offset_params = offset_params
     codegen.module_statements.append(statement_from_string(source))
 
@@ -1555,6 +1575,20 @@ def _generate_ast(
                         raise
                     raise failure from error
             env.backend.after_device_codegen(codegen, func, config)
+            if (
+                env.settings.megakernel_timeline is not None
+                and codegen.device_function.timeline is None
+                and env.config_spec.offers_megakernel
+            ):
+                # Kernels no config compiles as a megakernel record nothing.
+                pipeline = config.config.get("cross_loop_pipeline", "barrier")
+                log_once(
+                    f"megakernel_timeline is set, but {func.name} compiles no "
+                    f"megakernel with this config (cross_loop_pipeline={pipeline!r}): "
+                    "nothing is recorded",
+                    logging.getLogger("helion.runtime.timeline"),
+                    logging.WARNING,
+                )
             try:
                 if _bounded_cache_request is None:
                     kernel_def = codegen.device_function.codegen_function_def()

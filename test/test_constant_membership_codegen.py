@@ -15,6 +15,7 @@ from helion._compiler.type_info import SymFloatType
 from helion._compiler.type_info import SymIntType
 from helion._testing import cpu_render_target
 from helion._testing import onlyBackends
+from helion._testing import skipIfRefEagerMark
 from helion._testing.binding_observation import scalar_additions
 from helion._testing.constant_membership import approximate_comprehension_membership
 from helion._testing.constant_membership import approximate_membership_alias
@@ -29,7 +30,10 @@ from helion._testing.cute_codegen import cpu_bind
 from helion._testing.tunable_fragments import load_host_function
 import helion.language as hl
 
-pytestmark = pytest.mark.cpu_only
+pytestmark = [
+    pytest.mark.cpu_only,
+    skipIfRefEagerMark("reads compiler state, which ref mode does not build"),
+]
 
 
 @pytest.mark.parametrize(

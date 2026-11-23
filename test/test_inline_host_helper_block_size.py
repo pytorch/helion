@@ -7,14 +7,14 @@ axis of a tile; a loop extent written the same way is that value too, and so
 is the helper's value in device code (a device loop's block size or extent, a
 scale).  Python's min and max over tunables on the host take the argument
 every config picks, or else the config's value, instead of comparing the
-tunables at their hints.  Code generation only; test_register_tunable.py runs
-one.
+tunables at their hints.  Code generation only, apart from a GPU run of
+cross-loop split-K; test_register_tunable.py runs one too.
 """
 
 from __future__ import annotations
 
-import os
 import re
+from typing import TYPE_CHECKING
 from unittest.mock import patch
 
 import pytest
@@ -22,23 +22,29 @@ import torch
 
 import helion
 from helion._compiler.compile_environment import CompileEnvironment
+from helion._testing import DEVICE
 from helion._testing import cpu_render_target
 from helion._testing import import_example
+from helion._testing import skipIfNotCUDA
+from helion._testing import skipIfRefEagerMark
 from helion._testing import skipIfTileIR
 from helion._testing import skipUnlessBackends
+from helion._testing import skipUnlessGluon
 from helion._testing.cute_codegen import cpu_bind
 from helion.autotuner.config_fragment import EnumFragment
 from helion.autotuner.config_fragment import IntegerFragment
 from helion.autotuner.config_fragment import PowerOfTwoFragment
 import helion.language as hl
 
+if TYPE_CHECKING:
+    from collections.abc import Callable
+
 pytestmark = [
     pytest.mark.cpu_only,
     skipUnlessBackends(["triton", "cute"]),
     # Every test binds a kernel and reads its config spec or generated code.
-    pytest.mark.skipif(
-        os.environ.get("HELION_INTERPRET") == "1",
-        reason="inspects config specs and generated code; ref mode has neither",
+    skipIfRefEagerMark(
+        "inspects config specs and generated code; ref mode has neither"
     ),
 ]
 
@@ -154,6 +160,28 @@ def branch_on_device_helper(x: torch.Tensor) -> torch.Tensor:
             out[tile_m, tile_n] = x[tile_m, tile_n] * 2.0
         else:
             out[tile_m, tile_n] = x[tile_m, tile_n]
+    return out
+
+
+@helion.kernel(autotune_effort="none")
+def mask_tile_at_tunable_index(x: torch.Tensor) -> torch.Tensor:
+    (n,) = x.size()
+    out = torch.empty_like(x)
+    foo = hl.register_tunable("foo", PowerOfTwoFragment(16, 256))
+    for tile_n in hl.tile(n, block_size=1):
+        keep = (tile_n.id == foo - 1) & (x[tile_n] > 0)
+        out[tile_n] = torch.where(keep, x[tile_n], 0.0)
+    return out
+
+
+@helion.kernel(autotune_effort="none")
+def flip_tile_at_tunable_index(x: torch.Tensor) -> torch.Tensor:
+    (n,) = x.size()
+    out = torch.empty_like(x)
+    foo = hl.register_tunable("foo", PowerOfTwoFragment(16, 256))
+    for tile_n in hl.tile(n, block_size=1):
+        keep = (x[tile_n] > 0) != (tile_n.id == foo - 1)
+        out[tile_n] = torch.where(keep, x[tile_n], 0.0)
     return out
 
 
@@ -833,6 +861,27 @@ def test_device_branch_on_a_helper_value_follows_the_config(
     assert f"if {taken}:" in code, code
 
 
+# A scalar comparison with the tunable combined with a tensor (``(tile.id ==
+# foo - 1) & mask``, ``mask != (tile.id == foo - 1)``): the tensor op
+# converted the SymBool with bool(), a test at the hint that refused the
+# kernel. The comparison stays in the code, and the mask combines with it
+# (CuTe spells != as operator.ne).
+@pytest.mark.parametrize(
+    ("kernel", "combine"),
+    [
+        (mask_tile_at_tunable_index, r"v_\d+ & eq\b"),
+        (flip_tile_at_tunable_index, r"v_\d+ != eq\b|operator\.ne\(v_\d+, eq\)"),
+    ],
+)
+def test_device_comparison_with_the_tunable_masks_a_tensor(
+    kernel: helion.Kernel, combine: str
+) -> None:
+    code = _render(kernel, torch.empty(1000), foo=64)
+    assert "eq = tile_id == -1 + foo" in code, code
+    assert re.search(combine, code), code
+    assert "foo = 64" in code, code
+
+
 # A device cdiv over config values is the arithmetic it stands for, so its
 # shape is the same arithmetic written out (as a symbol of its own, it was
 # not, and the shapes did not match).
@@ -1198,3 +1247,511 @@ def test_host_min_max_of_one_element_is_the_element() -> None:
 def test_host_min_of_a_number_is_refused() -> None:
     with pytest.raises(helion.exc.TorchOpTracingError, match="not iterable"):
         _render(scale_by_host_min_of_a_number, torch.empty(64, 1000), foo=64)
+
+
+# The SM count of the modelled CPU target, which sets the workers' stride.
+_CPU_TARGET_SMS = 148
+
+
+def _worker_tasks(code: str) -> str:
+    """The task count of the first root a static plan's workers stride over."""
+    return re.findall(
+        rf"tl\.range\(tl\.program_id\(0\)[^,]*, (\d+), {_CPU_TARGET_SMS}\)", code
+    )[0]
+
+
+def _assert_no_config_value_pinned(bound: helion.BoundKernel) -> None:
+    """No symbol a config sets got replaced by an integer in the binding."""
+    env = bound.env
+    assert not set(env.shape_env.replacements) & env.config_value_expressions.keys()
+
+
+def _split_k_partials_then_sum(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    # examples/split_k_barrier.py without its barrier: the cross-loop
+    # pipeline orders the sum after the partials it reads.
+    m, k = x.size()
+    _, n = y.size()
+    split_k = hl.register_tunable("split_k", PowerOfTwoFragment(1, 8, 4))
+    block_k = helion.next_power_of_2(helion.cdiv(k, split_k))
+    partials = torch.empty([split_k, m, n], device=x.device, dtype=torch.float32)
+    out = torch.empty([m, n], device=x.device, dtype=torch.float32)
+    for tile_m, tile_n, tile_k in hl.tile([m, n, k], block_size=[None, None, block_k]):
+        acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+        for tile_k_inner in hl.tile(tile_k.begin, tile_k.end):
+            acc = hl.dot(x[tile_m, tile_k_inner], y[tile_k_inner, tile_n], acc=acc)
+        partials[tile_k.id, tile_m, tile_n] = acc
+    for tile_m, tile_n in hl.tile([m, n]):
+        out[tile_m, tile_n] = torch.sum(partials[:, tile_m, tile_n], dim=0)
+    return out
+
+
+def _split_k_config(split_k: int, pipeline: str) -> helion.Config:
+    return helion.Config(
+        block_sizes=[16, 64, 256, 16, 64],
+        num_warps=4,
+        num_stages=3,
+        split_k=split_k,
+        pid_type="persistent_blocked",
+        cross_loop_pipeline=pipeline,
+    )
+
+
+# The static plan read the named helper's block_k with int(), which pinned
+# its symbol to the fallback hint 8192 in the bound kernel's shape
+# environment: every config, static or dynamic, then planned the partials
+# root for two K tiles while the host passed the config's block_k, and the
+# sum read partials nobody wrote.  One bound kernel compiles each config.
+@skipUnlessBackends(["triton"])
+@skipIfTileIR("implicit tile-dependency lowering is unavailable on TileIR")
+@pytest.mark.parametrize("splits", [(2, 4, 8), (8, 4, 2)], ids=["up", "down"])
+def test_cross_loop_plan_takes_each_configs_named_helper_block(
+    splits: tuple[int, ...],
+) -> None:
+    x = torch.empty(16, 16384, dtype=torch.bfloat16)
+    y = torch.empty(16384, 512, dtype=torch.bfloat16)
+    kernel = helion.kernel(_split_k_partials_then_sum, static_shapes=True)
+    with cpu_render_target(fake_device_sm_count=_CPU_TARGET_SMS):
+        bound = cpu_bind(kernel, (x, y))
+        for split_k, pipeline in [(s, "static") for s in splits] + [
+            (splits[0], "dynamic")
+        ]:
+            code = bound.to_triton_code(_split_k_config(split_k, pipeline))
+            # The sum's root barrier waits for every task of the partials
+            # root: one 16x64 output tile of 8 per K tile.
+            assert re.findall(r"tl\.cast\((\d+), tl\.uint32\)", code)[0] == str(
+                8 * split_k
+            ), (split_k, pipeline, code)
+            # So is the module constant an outlined root reads block_k from.
+            assert _literal_block_sizes(code)[2] == 16384 // split_k, code
+    _assert_no_config_value_pinned(bound)
+
+
+def _plan_over_an_input_size_block(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    mid = torch.empty_like(x)
+    out = torch.empty_like(x)
+    for tile in hl.tile(256, block_size=y.size(0)):
+        mid[tile] = x[tile] + 1
+    for tile in hl.tile(256):
+        out[tile] = mid[tile] * 2
+    return out
+
+
+def _plan_over_a_derived_size_block(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    mid = torch.empty_like(x)
+    out = torch.empty_like(x)
+    for tile in hl.tile(256, block_size=y.size(0) // 2):
+        mid[tile] = x[tile] + 1
+    for tile in hl.tile(256):
+        out[tile] = mid[tile] * 2
+    return out
+
+
+def _plan_over_a_merged_size_block(
+    x: torch.Tensor, y: torch.Tensor, z: torch.Tensor
+) -> torch.Tensor:
+    assert z.size(0) == y.size(0)
+    mid = torch.empty_like(x)
+    out = torch.empty_like(x)
+    for tile in hl.tile(256, block_size=y.size(0) // 2):
+        mid[tile] = x[tile] + 1
+    for tile in hl.tile(256):
+        out[tile] = mid[tile] * 2
+    return out
+
+
+# An input size torch merged into another (``assert z.size(0) == y.size(0)``)
+# keys the binding through the size that stands for it.
+@skipUnlessBackends(["triton"])
+@skipIfTileIR("implicit tile-dependency lowering is unavailable on TileIR")
+def test_cross_loop_plan_keys_a_merged_input_size() -> None:
+    kernel = helion.kernel(_plan_over_a_merged_size_block, static_shapes=False)
+    config = helion.Config(
+        block_sizes=[64], pid_type="persistent_blocked", cross_loop_pipeline="static"
+    )
+    with cpu_render_target(fake_device_sm_count=_CPU_TARGET_SMS):
+        args = (torch.empty(256), torch.empty(128), torch.empty(128))
+        bound = kernel.bind(args)
+        code = bound.to_triton_code(config)
+        assert _worker_tasks(code) == "4", code
+        assert kernel.bind(args) is bound
+        smaller = (torch.empty(256), torch.empty(64), torch.empty(64))
+        assert kernel.bind(smaller) is not bound
+
+
+# The static plan counts the tasks of a block an input size gives by the bound
+# size, so the binding keys each input size the block reads (from_config_int).
+# main's int() keyed a bare size through a replacement but only guarded a
+# derived one, so the derived case is the regression check.
+@skipUnlessBackends(["triton"])
+@skipIfTileIR("implicit tile-dependency lowering is unavailable on TileIR")
+@pytest.mark.parametrize(
+    ("fn", "size"),
+    [(_plan_over_an_input_size_block, 64), (_plan_over_a_derived_size_block, 128)],
+    ids=["bare", "derived"],
+)
+def test_cross_loop_plan_keys_the_binding_on_an_input_size_block(
+    fn: Callable[[torch.Tensor, torch.Tensor], torch.Tensor], size: int
+) -> None:
+    kernel = helion.kernel(fn, static_shapes=False)
+    config = helion.Config(
+        block_sizes=[64], pid_type="persistent_blocked", cross_loop_pipeline="static"
+    )
+    with cpu_render_target(fake_device_sm_count=_CPU_TARGET_SMS):
+        bound = kernel.bind((torch.empty(256), torch.empty(size)))
+        code = bound.to_triton_code(config)
+        assert _worker_tasks(code) == "4", code
+        assert kernel.bind((torch.empty(256), torch.empty(size))) is bound
+        assert kernel.bind((torch.empty(256), torch.empty(size // 2))) is not bound
+
+
+def _plan_over_a_scalar_block(x: torch.Tensor, bs: int) -> torch.Tensor:
+    mid = torch.empty_like(x)
+    out = torch.empty_like(x)
+    for tile in hl.tile(256, block_size=bs * 2):
+        mid[tile] = x[tile] + 1
+    for tile in hl.tile(256):
+        out[tile] = mid[tile] * 2
+    return out
+
+
+# A module constant: the plan takes its value at compile time.
+_PLAN_GLOBAL_BLOCK = 32
+
+
+def _plan_over_a_global_block(x: torch.Tensor) -> torch.Tensor:
+    mid = torch.empty_like(x)
+    out = torch.empty_like(x)
+    for tile in hl.tile(256, block_size=_PLAN_GLOBAL_BLOCK * 2):
+        mid[tile] = x[tile] + 1
+    for tile in hl.tile(256):
+        out[tile] = mid[tile] * 2
+    return out
+
+
+def _plan_over_a_scalar_times_tunable_block(x: torch.Tensor, bs: int) -> torch.Tensor:
+    factor = hl.register_tunable("factor", PowerOfTwoFragment(1, 4, 2))
+    mid = torch.empty_like(x)
+    out = torch.empty_like(x)
+    for tile in hl.tile(256, block_size=bs * factor):
+        mid[tile] = x[tile] + 1
+    for tile in hl.tile(256):
+        out[tile] = mid[tile] * 2
+    return out
+
+
+def _plan_over_a_specialized_scalar_block(x: torch.Tensor, bs: int) -> torch.Tensor:
+    bs = hl.specialize(bs)
+    mid = torch.empty_like(x)
+    out = torch.empty_like(x)
+    for tile in hl.tile(256, block_size=bs * 2):
+        mid[tile] = x[tile] + 1
+    for tile in hl.tile(256):
+        out[tile] = mid[tile] * 2
+    return out
+
+
+def _plan_over_a_specialized_derived_block(x: torch.Tensor, bs: int) -> torch.Tensor:
+    bs = hl.specialize(bs // 2)
+    mid = torch.empty_like(x)
+    out = torch.empty_like(x)
+    for tile in hl.tile(256, block_size=bs * 2):
+        mid[tile] = x[tile] + 1
+    for tile in hl.tile(256):
+        out[tile] = mid[tile] * 2
+    return out
+
+
+def _plan_over_a_specialized_times_tunable_block(
+    x: torch.Tensor, bs: int
+) -> torch.Tensor:
+    bs = hl.specialize(bs // 2)
+    factor = hl.register_tunable("factor", PowerOfTwoFragment(1, 4, 2))
+    mid = torch.empty_like(x)
+    out = torch.empty_like(x)
+    for tile in hl.tile(256, block_size=bs * factor):
+        mid[tile] = x[tile] + 1
+    for tile in hl.tile(256):
+        out[tile] = mid[tile] * 2
+    return out
+
+
+# hl.specialize and a tunable fix a block between them: 32 * factor.
+@skipUnlessBackends(["triton"])
+@skipIfTileIR("implicit tile-dependency lowering is unavailable on TileIR")
+@pytest.mark.parametrize(("factor", "tasks"), [(2, "4"), (4, "2")])
+def test_cross_loop_plan_takes_a_specialized_times_tunable_block(
+    factor: int, tasks: str
+) -> None:
+    kernel = helion.kernel(
+        _plan_over_a_specialized_times_tunable_block, static_shapes=True
+    )
+    config = helion.Config(
+        block_sizes=[64],
+        pid_type="persistent_blocked",
+        cross_loop_pipeline="static",
+        factor=factor,
+    )
+    with cpu_render_target(fake_device_sm_count=_CPU_TARGET_SMS):
+        code = kernel.bind((torch.empty(256), 64)).to_triton_code(config)
+    assert _worker_tasks(code) == tasks, code
+
+
+def _plan_over_a_global_times_tunable_block(x: torch.Tensor) -> torch.Tensor:
+    factor = hl.register_tunable("factor", PowerOfTwoFragment(1, 4, 2))
+    mid = torch.empty_like(x)
+    out = torch.empty_like(x)
+    for tile in hl.tile(256, block_size=_PLAN_GLOBAL_BLOCK * factor):
+        mid[tile] = x[tile] + 1
+    for tile in hl.tile(256):
+        out[tile] = mid[tile] * 2
+    return out
+
+
+# A module constant times a tunable: 32 * factor.
+@skipUnlessBackends(["triton"])
+@skipIfTileIR("implicit tile-dependency lowering is unavailable on TileIR")
+@pytest.mark.parametrize(("factor", "tasks"), [(2, "4"), (4, "2")])
+def test_cross_loop_plan_takes_a_global_times_tunable_block(
+    factor: int, tasks: str
+) -> None:
+    kernel = helion.kernel(_plan_over_a_global_times_tunable_block, static_shapes=True)
+    config = helion.Config(
+        block_sizes=[64],
+        pid_type="persistent_blocked",
+        cross_loop_pipeline="static",
+        factor=factor,
+    )
+    with cpu_render_target(fake_device_sm_count=_CPU_TARGET_SMS):
+        code = kernel.bind((torch.empty(256),)).to_triton_code(config)
+    assert _worker_tasks(code) == tasks, code
+
+
+# Split-K's block_k over a dynamic K has no value to plan by: the plan says
+# so and how to give it one.
+@skipUnlessBackends(["triton"])
+@skipIfTileIR("implicit tile-dependency lowering is unavailable on TileIR")
+def test_cross_loop_plan_refuses_a_tunable_beside_a_dynamic_size() -> None:
+    kernel = helion.kernel(_split_k_partials_then_sum, static_shapes=False)
+    x = torch.empty(16, 16384, dtype=torch.bfloat16)
+    y = torch.empty(16384, 512, dtype=torch.bfloat16)
+    with cpu_render_target(fake_device_sm_count=_CPU_TARGET_SMS):
+        bound = kernel.bind((x, y))
+        with pytest.raises(helion.exc.InvalidConfig, match="static_shapes=True"):
+            bound.to_triton_code(_split_k_config(4, "static"))
+
+
+# A bound kernel does not key a scalar argument's value, so a plan over a
+# block it gives would serve every value with the first one's task count: the
+# plan refuses it, also times a tunable, and hl.specialize keys the value and
+# plans it.  A module constant's block plans its value.
+@skipUnlessBackends(["triton"])
+@skipIfTileIR("implicit tile-dependency lowering is unavailable on TileIR")
+def test_cross_loop_plan_takes_a_scalar_arguments_block_only_specialized() -> None:
+    config = helion.Config(
+        block_sizes=[64], pid_type="persistent_blocked", cross_loop_pipeline="static"
+    )
+    with cpu_render_target(fake_device_sm_count=_CPU_TARGET_SMS):
+        kernel = helion.kernel(_plan_over_a_scalar_block, static_shapes=True)
+        bound = kernel.bind((torch.empty(256), 32))
+        with pytest.raises(helion.exc.InvalidConfig, match="hl.specialize"):
+            bound.to_triton_code(config)
+        kernel = helion.kernel(_plan_over_a_scalar_times_tunable_block)
+        bound = kernel.bind((torch.empty(256), 32))
+        with pytest.raises(helion.exc.InvalidConfig, match="scalar argument"):
+            bound.to_triton_code(helion.Config(**config, factor=2))
+        for fn, args in [
+            (_plan_over_a_specialized_scalar_block, (32,)),
+            (_plan_over_a_specialized_derived_block, (64,)),
+            (_plan_over_a_global_block, ()),
+        ]:
+            kernel = helion.kernel(fn, static_shapes=True)
+            bound = kernel.bind((torch.empty(256), *args))
+            code = bound.to_triton_code(config)
+            if args:
+                assert kernel.bind((torch.empty(256), args[0] // 2)) is not bound
+            assert "_BLOCK_SIZE_0 = tl.constexpr(64)" in code, code
+            assert _worker_tasks(code) == "4", code
+
+
+@helion.kernel(autotune_effort="none")
+def _rows_over_a_helper_block(x: torch.Tensor) -> torch.Tensor:
+    m, n = x.size()
+    split = hl.register_tunable("split", PowerOfTwoFragment(1, 8, 4))
+    block = helion.next_power_of_2(helion.cdiv(n, split))
+    out = torch.empty_like(x)
+    for tile_m in hl.tile(m):
+        for tile_n in hl.tile(n, block_size=block):
+            out[tile_m, tile_n] = x[tile_m, tile_n] * 2
+    return out
+
+
+# The range pipeline clamp counts a device loop's iterations by the config's
+# block (4096 / 512 = 8 at split 8), not the 8192 fallback hint, which made
+# every config one stage and pinned the tunable.
+@skipUnlessBackends(["triton"])
+@skipIfTileIR("TileIR does not pipeline ranges")
+@pytest.mark.parametrize(
+    ("split", "unroll", "num_warps", "stages"),
+    [(8, 2, 1, 3), (8, 4, 1, 2), (2, 2, 1, 1), (8, 2, 4, 1)],
+)
+def test_range_clamp_counts_a_helper_blocks_iterations(
+    split: int, unroll: int, num_warps: int, stages: int
+) -> None:
+    with cpu_render_target():
+        bound = cpu_bind(_rows_over_a_helper_block, (torch.empty(64, 4096),))
+        code = bound.to_triton_code(
+            helion.Config(
+                block_sizes=[16],
+                num_warps=num_warps,
+                split=split,
+                range_num_stages=[0, 3],
+                range_unroll_factors=[0, unroll],
+            )
+        )
+    assert f"loop_unroll_factor={unroll}, num_stages={stages})" in code, code
+    _assert_no_config_value_pinned(bound)
+
+
+@helion.kernel(autotune_effort="none")
+def _rows_over_a_scalar_block(x: torch.Tensor, bs: int) -> torch.Tensor:
+    m, n = x.size()
+    out = torch.empty_like(x)
+    for tile_m in hl.tile(m):
+        for tile_n in hl.tile(n, block_size=bs * 2):
+            out[tile_m, tile_n] = x[tile_m, tile_n] * 2
+    return out
+
+
+# A block over a scalar argument has no size the clamp may count by: one
+# warp has no hazard and keeps the stages asked for, and more warps keep one.
+@skipUnlessBackends(["triton"])
+@skipIfTileIR("TileIR does not pipeline ranges")
+@pytest.mark.parametrize(("num_warps", "stages"), [(1, 3), (4, 1)])
+def test_range_clamp_without_a_blocks_size(num_warps: int, stages: int) -> None:
+    with cpu_render_target():
+        bound = cpu_bind(_rows_over_a_scalar_block, (torch.empty(64, 4096), 256))
+        code = bound.to_triton_code(
+            helion.Config(
+                block_sizes=[16],
+                num_warps=num_warps,
+                range_num_stages=[0, 3],
+                range_unroll_factors=[0, 2],
+            )
+        )
+    assert f"loop_unroll_factor=2, num_stages={stages})" in code, code
+
+
+def _rows_over_a_derived_size_block(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    m = x.size(0)
+    out = torch.empty_like(x)
+    for tile_m in hl.tile(m):
+        for tile_n in hl.tile(4096, block_size=y.size(0) // 2):
+            out[tile_m, tile_n] = x[tile_m, tile_n] * 2
+    return out
+
+
+# With more than one warp the clamp keeps one stage whatever the block, so it
+# reads no block size and keys no input size it would read.
+@skipUnlessBackends(["triton"])
+@skipIfTileIR("TileIR does not pipeline ranges")
+def test_multi_warp_range_clamp_keys_no_size() -> None:
+    kernel = helion.kernel(_rows_over_a_derived_size_block, static_shapes=False)
+    config = helion.Config(
+        block_sizes=[16],
+        num_warps=4,
+        range_num_stages=[0, 3],
+        range_unroll_factors=[0, 2],
+    )
+    with cpu_render_target():
+        bound = kernel.bind((torch.empty(64, 4096), torch.empty(1024)))
+        code = bound.to_triton_code(config)
+        assert kernel.bind((torch.empty(64, 4096), torch.empty(512))) is bound
+    assert "loop_unroll_factor=2, num_stages=1)" in code, code
+    assert not bound.env.keyed_size_equalities
+
+
+# On one warp the clamp counts by the bound size's block, a heuristic, so it
+# keys no size: another size shares the bound kernel.
+@skipUnlessBackends(["triton"])
+@skipIfTileIR("TileIR does not pipeline ranges")
+def test_one_warp_range_clamp_keys_no_size() -> None:
+    kernel = helion.kernel(_rows_over_a_derived_size_block, static_shapes=False)
+    config = helion.Config(
+        block_sizes=[16],
+        num_warps=1,
+        range_num_stages=[0, 3],
+        range_unroll_factors=[0, 2],
+    )
+    with cpu_render_target():
+        bound = kernel.bind((torch.empty(64, 4096), torch.empty(1024)))
+        code = bound.to_triton_code(config)
+        assert kernel.bind((torch.empty(64, 4096), torch.empty(512))) is bound
+    assert "loop_unroll_factor=2, num_stages=3)" in code, code
+    assert not bound.env.keyed_size_equalities
+
+
+@helion.kernel(autotune_effort="none")
+def _swizzle_gather_over_a_helper_block(
+    scale: torch.Tensor, out: torch.Tensor
+) -> torch.Tensor:
+    (n,) = out.shape
+    split = hl.register_tunable("split", PowerOfTwoFragment(1, 8, 4))
+    block = helion.next_power_of_2(helion.cdiv(n, split))
+    for tile in hl.tile(n, block_size=block):
+        out[tile] = scale[(tile.index // 4) * 512 + tile.index % 4]
+    return out
+
+
+# The gather contiguity proof evaluates program 0's tile at the config's
+# block; reading it with int() pinned the tunable to 8192, and later configs
+# passed that block.
+@skipUnlessBackends(["triton"])
+@skipIfTileIR("hint is emitted by the Triton pointer indexing strategy")
+def test_contiguity_proof_reads_a_helper_block_unpinned() -> None:
+    with cpu_render_target():
+        bound = cpu_bind(
+            _swizzle_gather_over_a_helper_block,
+            (torch.empty(8192), torch.empty(64)),
+        )
+        for split in (8, 2):
+            code = bound.to_triton_code(
+                helion.Config(indexing=["pointer", "pointer"], split=split)
+            )
+            assert "tl.max_contiguous(" in code and ", [4])" in code, code
+            assert "_BLOCK_SIZE_0 = block" in code, code
+    _assert_no_config_value_pinned(bound)
+
+
+def _run_split_k_configs(backend: str) -> None:
+    x = torch.randn(16, 4096, device=DEVICE, dtype=torch.bfloat16)
+    y = torch.randn(4096, 128, device=DEVICE, dtype=torch.bfloat16)
+    expected = x.float() @ y.float()
+    kernel = helion.kernel(
+        _split_k_partials_then_sum, static_shapes=True, backend=backend
+    )
+    bound = kernel.bind((x, y))
+    for split_k, pipeline in [(2, "static"), (8, "static"), (4, "dynamic")]:
+        out = bound.compile_config(_split_k_config(split_k, pipeline))(x, y)
+        torch.testing.assert_close(
+            out,
+            expected,
+            rtol=1e-3,
+            atol=1e-2,
+            msg=lambda message, case=(split_k, pipeline): f"{case}: {message}",
+        )
+
+
+@pytest.mark.cuda
+@skipIfNotCUDA()
+@skipUnlessBackends(["triton"])
+@skipIfTileIR("implicit tile-dependency lowering is unavailable on TileIR")
+def test_cross_loop_split_k_over_a_tunable_split_count() -> None:
+    _run_split_k_configs("triton")
+
+
+@pytest.mark.cuda
+@skipIfNotCUDA()
+@skipUnlessBackends(["triton"])
+@skipUnlessGluon()
+def test_gluon_cross_loop_split_k_over_a_tunable_split_count() -> None:
+    _run_split_k_configs("gluon")

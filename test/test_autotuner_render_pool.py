@@ -838,6 +838,10 @@ class TestRenderPool(TestCase):
                     side_effect=benchmark_function,
                 ),
                 patch.object(search, "rebenchmark", lambda *args, **kwargs: None),
+                # The candidates are the pool's work.  A search that drops
+                # source aliases renders once more after it, in this process,
+                # for the config it returns (it has its own tests).
+                patch.object(search, "_simplified_selected_config", lambda best: best),
             ):
                 best = search.autotune()
             trajectories[mode] = (compiled, benchmarked, repr(best))

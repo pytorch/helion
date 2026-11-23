@@ -1,7 +1,8 @@
 """The search surface of K-loop matmuls lowered on simdgroup fragments
 (``metal_matmul="fragment"``): the config keys, seeds and normalization,
-the thread fit (``search_surface.fit_threads``) and the code each config
-generates.  Binds CPU tensors only."""
+the thread fit (``search_surface.fit_threads``), the code each config
+generates, and the lowering a config without the key falls back to
+(``search_surface.MatmulFallback``).  Binds CPU tensors only."""
 
 from __future__ import annotations
 
@@ -16,8 +17,14 @@ import helion
 from helion import exc
 from helion._compiler.metal.fragment_mma import _max_offset
 from helion._compiler.metal.search_surface import kernel_facts
+from helion._compiler.metal.search_surface import matmul_choices
 from helion._testing import import_example
 from helion._testing import skipUnlessBackends
+from helion._testing.metal import addmm_k_loop
+from helion._testing.metal import render_msl
+from helion._testing.metal_fragment import fp8_rows
+from helion._testing.metal_fragment import fragment_config
+from helion._testing.metal_fragment import k_from_16
 from helion._testing.metal_fragment import nvfp4_cpu_args
 from helion._testing.metal_fragment import nvfp4_rows
 from helion._testing.metal_fragment import views_epilogue
@@ -29,12 +36,30 @@ import helion.language as hl
 pytestmark = [pytest.mark.cpu_only, skipUnlessBackends(["metal"])]
 
 F32 = torch.float32
-FRAG = {"metal_matmul": "fragment", "num_warps": 1}
 REFUSED = "metal_matmul='fragment' can't lower"
 
 
-def _frag(block_sizes: list[int], **knobs: object) -> helion.Config:
-    return helion.Config(block_sizes=block_sizes, **knobs, **FRAG)
+@helion.kernel(backend="metal", static_shapes=True)
+def k_from_offset(x: torch.Tensor, y: torch.Tensor, k0: int) -> torch.Tensor:
+    """A K loop from an offset known only at runtime."""
+    m, k = x.size()
+    n = y.size(1)
+    out = torch.empty([m, n], dtype=torch.float32, device=x.device)
+    for tile_m, tile_n in hl.tile([m, n]):
+        acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+        for tile_k in hl.tile(k0, k):
+            acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+        out[tile_m, tile_n] = acc
+    return out
+
+
+def _lowering(msl: str) -> str:
+    """The lowering whose code the MSL holds."""
+    if "matmul2d_descriptor" in msl:
+        return "mpp"
+    if "simdgroup_matrix" in msl:
+        return "fragment"
+    return "scalar"
 
 
 @helion.kernel(backend="metal", static_shapes=True)
@@ -168,8 +193,8 @@ def scalar_dot(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     for tile_m, tile_n in hl.tile([m, n]):
         acc = hl.zeros([tile_m, tile_n], dtype=torch.float16)
         for tile_k in hl.tile(k):
-            acc = acc + hl.dot(x[tile_m, tile_k], y[tile_k, tile_n], out_dtype=F32).to(
-                torch.float16
+            acc = acc + hl.dot(
+                x[tile_m, tile_k], y[tile_k, tile_n], out_dtype=torch.float16
             )
         out[tile_m, tile_n] = acc
     return out
@@ -207,42 +232,209 @@ class TestFragmentConfig(unittest.TestCase):
         self.assertIn("fragment=", fragment)
         with self.assertRaisesRegex(exc.InvalidConfig, "metal_matmul must be one of"):
             bound.config_spec.normalize(helion.Config(metal_matmul="tensor"))
+        with self.assertRaisesRegex(exc.InvalidConfig, "metal_matmul must be one of"):
+            bound.config_spec.normalize(helion.Config(metal_matmul=None))
+        for cap in (16.0, True, 32, None):
+            with self.assertRaisesRegex(
+                exc.InvalidConfig, "metal_tabulate_max_entries must be one of"
+            ):
+                bound.config_spec.normalize(
+                    helion.Config(
+                        metal_matmul="fragment", metal_tabulate_max_entries=cap
+                    )
+                )
 
     def test_search(self) -> None:
-        """The search tries ``metal_matmul`` where both lowerings apply, from
-        a fragment seed beside the MPP default, which leaves the key out, and
-        repairs a fragment config to one SIMD group; a matmul the fragment run
-        can't lower, and a kernel with none, have no such field."""
+        """The search tries ``metal_matmul`` over every lowering that applies,
+        from fragment seeds beside the MPP default, which leaves the key out,
+        and ``metal_tabulate_max_entries`` at the caps that admit the kernel's
+        tables, on one SIMD group and on four splitting the K loop
+        (``num_warps``, which the search keeps); a matmul the fragment run
+        can't lower searches MPP and the scalar contraction, without tables,
+        and a kernel with no matmul has neither field."""
         spec = nvfp4_rows.bind(nvfp4_cpu_args()).config_spec
         field = spec._flat_fields()["metal_matmul"]
         assert isinstance(field, EnumFragment)
-        self.assertEqual(field.choices, ("mpp", "fragment"))
+        self.assertEqual(field.choices, ("mpp", "fragment", "scalar"))
         self.assertNotIn("metal_matmul", spec.default_config().config)
+        tables = spec._flat_fields()["metal_tabulate_max_entries"]
+        assert isinstance(tables, EnumFragment)
+        # The code's nibble takes 16 entries.  The E4M3 scale's 7-bit field
+        # takes none: its shift is an integer of promoted type, and the cast
+        # after it reads the whole byte.
+        self.assertEqual(tables.choices, (0, 16))
         self.assertEqual(
-            [c.config.get("metal_matmul") for c in spec.autotune_seed_configs()],
-            ["fragment"],
+            [
+                (
+                    c.config.get("metal_matmul"),
+                    c.config.get("metal_tabulate_max_entries"),
+                    c.config.get("range_num_stages"),
+                    c.config.get("num_warps"),
+                )
+                for c in spec.autotune_seed_configs()
+            ],
+            [
+                (*knobs, num_warps)
+                for num_warps in (1, 4)
+                for knobs in (
+                    ("fragment", None, None),
+                    ("fragment", None, [2]),
+                    ("fragment", 16, None),
+                    ("fragment", 16, [2]),
+                )
+            ],
         )
-        # The search repairs a fragment config to one SIMD group.
-        repaired = helion.Config(
+        # The search keeps a fragment config's SIMD groups, which split its
+        # K loop.
+        split = helion.Config(
             block_sizes=[16, 16, 64], metal_matmul="fragment", num_warps=4
         )
-        spec.normalize(repaired, _fix_invalid=True)
-        self.assertEqual(repaired["num_warps"], 1)
+        spec.normalize(split, _fix_invalid=True)
+        self.assertEqual(split["num_warps"], 4)
         # A fragment config without num_warps takes one SIMD group.
         bare = helion.Config(block_sizes=[16, 16, 64], metal_matmul="fragment")
         spec.normalize(bare)
         self.assertEqual(bare["num_warps"], 1)
+        # One range_num_stages slot, the K loop's, searched at 0 and 2; 3 is
+        # rejected.
+        self.assertEqual(len(spec.range_num_stages), 1)
+        self.assertEqual(
+            spec.range_num_stages[0]._fragment(spec).search_values(), [0, 2]
+        )
+        with self.assertRaisesRegex(exc.InvalidConfig, r"must be one of \(0, 1, 2\)"):
+            spec.normalize(
+                helion.Config(
+                    block_sizes=[16, 16, 64],
+                    metal_matmul="fragment",
+                    range_num_stages=[3],
+                )
+            )
+        # Only a K loop that can load ahead has a slot (``loads_ahead``): known
+        # bounds it runs between.  One from 16 has one and loads ahead under
+        # it; one from a runtime offset, or to an end known only at runtime,
+        # has none, so the search never asks it for 2 stages.
+        from_16 = k_from_16.bind((torch.randn(16, 64), torch.randn(64, 16)))
+        self.assertEqual(len(from_16.config_spec.range_num_stages), 1)
+        code = from_16.to_code(fragment_config([16, 16, 16], range_num_stages=[2]))
+        self.assertRegex(code, r"k_step=\('offset_\d+', 16\)")
+        x = torch.randn(8, 64, dtype=torch.float16)
+        y = torch.randn(64, 16, dtype=torch.float16)
+        dynamic = helion.kernel(nvfp4_rows.fn, backend="metal", static_shapes=False)
+        for bound in (k_from_offset.bind((x, y, 16)), dynamic.bind(nvfp4_cpu_args())):
+            with self.subTest(kernel=bound.kernel.name):
+                self.assertEqual(len(bound.config_spec.range_num_stages), 0)
+                # A user's fragment config asking for stages there is
+                # refused; the search's repair drops them.
+                staged = fragment_config([16, 16, 16], range_num_stages=[2])
+                with self.assertRaisesRegex(
+                    exc.InvalidConfig, "one entry per Metal fragment K loop"
+                ):
+                    bound.config_spec.normalize(staged)
+                bound.config_spec.normalize(staged, _fix_invalid=True)
+                self.assertNotIn("range_num_stages", staged.config)
+        # An MPP config keeps loading with the range_num_stages a config
+        # carried before Metal read the key (a Triton config's), as zeros.
+        mpp = helion.Config(block_sizes=[16, 16, 64], range_num_stages=[3, 4])
+        spec.normalize(mpp)
+        self.assertEqual(mpp["range_num_stages"], [0])
+        # A byte's decode takes a 256-entry table.
+        fp8_args = (
+            torch.randn(8, 224).to(torch.bfloat16),
+            torch.randint(-(2**31), 2**31 - 1, (40, 56), dtype=torch.int32),
+            torch.randint(120, 130, (40, 7), dtype=torch.uint8),
+        )
+        spec = fp8_rows.bind(fp8_args).config_spec
+        tables = spec._flat_fields()["metal_tabulate_max_entries"]
+        assert isinstance(tables, EnumFragment)
+        self.assertEqual(tables.choices, (0, 256))
         x = torch.randn(16, 32, dtype=torch.float16)
         y = torch.randn(32, 16, dtype=torch.float16)
-        for kernel, kernel_args in ((centered, (x, y)), (add, (x, x))):
+        for kernel, kernel_args, choices in (
+            (centered, (x, y), ("mpp", "scalar")),
+            (add, (x, x), None),
+        ):
             with self.subTest(kernel=kernel.name):
                 spec = kernel.bind(kernel_args).config_spec
-                self.assertNotIn("metal_matmul", spec._flat_fields())
+                fields = spec._flat_fields()
+                field = fields.get("metal_matmul")
+                self.assertEqual(
+                    None if field is None else getattr(field, "choices", None),
+                    choices,
+                )
+                self.assertNotIn("metal_tabulate_max_entries", fields)
+                self.assertEqual(len(spec.range_num_stages), 0)
+                # A config with range_num_stages loads as before: without it.
+                old = helion.Config(
+                    **spec.default_config().config, range_num_stages=[2]
+                )
+                spec.normalize(old)
+                self.assertNotIn("range_num_stages", old.config)
+
+    def test_fallback(self) -> None:
+        """A config without ``metal_matmul`` takes the first lowering that
+        compiles it: MPP's, then fragments' on one SIMD group, then the
+        scalar contraction's, from the config as given.  One that names a
+        lowering keeps it and fails with that lowering's error, as the
+        search's drawn configs do."""
+        h = torch.float16
+        deep = (torch.randn(32, 1024, dtype=h), torch.randn(1024, 32, dtype=h))
+        wide = (torch.randn(16, 128, dtype=h), torch.randn(128, 512, dtype=h))
+        for args, config, expected in (
+            (deep, helion.Config(block_sizes=[16, 16, 64]), "mpp"),
+            # N = 512, past an MPP op's 256: fragments take it.
+            (wide, helion.Config(block_sizes=[16, 512, 32]), "fragment"),
+            # K = 512, past an MPP op's 256 and the 16 steps a fragment run
+            # unrolls.
+            (deep, helion.Config(block_sizes=[16, 16, 512]), "scalar"),
+            # One thread, which neither cooperative lowering runs on.
+            (
+                deep,
+                helion.Config(block_sizes=[16, 16, 64], num_threads=[1, 1, 1]),
+                "scalar",
+            ),
+        ):
+            with self.subTest(config=config):
+                msl = render_msl(addmm_k_loop, args, config)
+                self.assertEqual(_lowering(msl), expected)
+        # The scalar fallback keeps the config's threads, not the fragment
+        # pass's one SIMD group.
+        config = helion.Config(
+            block_sizes=[16, 16, 512], num_threads=[16, 16, 1], num_warps=8
+        )
+        msl = render_msl(addmm_k_loop, deep, config)
+        self.assertEqual(_lowering(msl), "scalar")
+        self.assertIn("required_threads_per_threadgroup(16, 16, 1)", msl)
+        for config, message in (
+            (
+                helion.Config(block_sizes=[16, 16, 512], metal_matmul="mpp"),
+                "one op covers M, N <= 256 and K <= 256",
+            ),
+            (
+                helion.Config(
+                    block_sizes=[16, 16, 64], num_threads=[1, 1, 1], metal_matmul="mpp"
+                ),
+                "it needs whole 32-thread SIMD groups",
+            ),
+        ):
+            with (
+                self.subTest(config=config),
+                self.assertRaisesRegex(exc.BackendUnsupported, re.escape(message)),
+            ):
+                render_msl(addmm_k_loop, deep, config)
+        # Every lowering refusing: the scalar contraction's error, caused by
+        # MPP's.
+        int8 = torch.int8
+        args = (torch.ones(16, 64, dtype=int8), torch.ones(64, 16, dtype=h))
+        with self.assertRaises(exc.BackendUnsupported) as caught:
+            addmm_k_loop.bind(args).to_code(helion.Config(block_sizes=[16, 16, 16]))
+        self.assertIn("on the scalar contraction", str(caught.exception))
+        self.assertIsInstance(caught.exception.__cause__, exc.BackendUnsupported)
 
     def test_threads(self) -> None:
         """The search gives a matmul config a threadgroup its matmuls run
         on, by the launch its counts make (``thread_counts.launch_threads``):
-        one SIMD group for a fragment run, whole SIMD groups up to 1024
+        a fragment run's tile over one SIMD group, whatever the SIMD groups
+        splitting its K loop (``num_warps``), whole SIMD groups up to 1024
         threads for MPP's.  Counts that launch more (fragment ``[0, 0, 4]``:
         the M and N tiles fill the SIMD group, then 4 K threads each; MPP
         ``[16, 32, 8]``: 2048) or fewer (``[2, 2, 1]``: 4) are fitted to the
@@ -259,6 +451,8 @@ class TestFragmentConfig(unittest.TestCase):
             ("fragment", 1, [16, 16, 64], [1, 1, 0], [1, 1, 0]),
             ("fragment", 1, [16, 16, 16], [0, 0, 0], [0, 0, 0]),
             ("fragment", 1, [16, 16, 16], [2, 2, 0], [2, 2, 0]),
+            ("fragment", 4, [16, 16, 16], [0, 0, 4], [8, 1, 4]),
+            ("fragment", 8, [16, 16, 16], [16, 16, 16], [2, 4, 4]),
             ("mpp", 16, [16, 16, 16], [16, 32, 8], [8, 8, 8]),
             ("mpp", 4, [16, 16, 16], [2, 2, 1], [8, 4, 4]),
             ("mpp", 4, [16, 16, 16], [0, 0, 4], [0, 0, 4]),
@@ -274,7 +468,7 @@ class TestFragmentConfig(unittest.TestCase):
                 )
                 spec.normalize(config, _fix_invalid=True)
                 self.assertEqual(config.config.get("num_threads", [0] * 3), fitted)
-        kept = helion.Config(block_sizes=[16, 16, 16], num_threads=[0, 0, 4], **FRAG)
+        kept = fragment_config([16, 16, 16], [0, 0, 4])
         spec.normalize(kept)
         self.assertEqual(kept["num_threads"], [0, 0, 4])
         x = torch.randn(16, 32, dtype=torch.float16)
@@ -327,7 +521,9 @@ class TestFragmentConfig(unittest.TestCase):
         y = torch.randn(64, 32, dtype=torch.float16)
         bound = two_roots.bind((x, y, x, y))
         self.assertEqual(kernel_facts(bound.config_spec).thread_loops, ())
-        config = _frag([16, 16, 16, 16, 16, 16], num_threads=[8, 1, 4, 8, 1, 4])
+        config = fragment_config(
+            [16, 16, 16, 16, 16, 16], num_threads=[8, 1, 4, 8, 1, 4]
+        )
         bound.config_spec.normalize(config, _fix_invalid=True)
         self.assertEqual(config["num_threads"], [8, 1, 4, 8, 1, 4])
         bound.to_code(config)
@@ -361,17 +557,48 @@ class TestFragmentConfig(unittest.TestCase):
         configs = [gen.unflatten(list(flat)) for flat in candidates]
         self.assertGreater(len(configs), 40)
         refused = []
-        compiled = {"fragment": 0, "mpp": 0}
+        compiled = {"fragment": 0, "mpp": 0, "scalar": 0}
         for config in configs:
             try:
                 bound.to_code(config)
             except exc.BackendUnsupported as e:
-                if "threadgroup" in str(e):
+                # check_mpp_launch's refusals of an MPP threadgroup and of a
+                # fragment tile's threads.
+                if re.search("threadgroup of|whose tile takes", str(e)):
                     refused.append(config)
             else:
                 compiled[str(lowering(config))] += 1
         self.assertEqual(refused, [])
         self.assertTrue(all(compiled.values()), compiled)
+
+    def test_whole_k(self) -> None:
+        """A matmul over a ':' K is one fragment run from zeroed
+        accumulators, which no K loop carries, so SIMD groups don't split
+        it (``split_refusal``)."""
+        x = torch.randn(16, 32, dtype=torch.float16)
+        y = torch.randn(32, 16, dtype=torch.float16)
+        msl = render_msl(whole_k, (x, y), fragment_config([16, 16]))
+        self.assertEqual(_lowering(msl), "fragment")
+        bound = whole_k.bind((x, y))
+        self.assertFalse(kernel_facts(bound.config_spec).fragment_splits)
+
+    def test_whole_k_extent(self) -> None:
+        """A ':' K is one fragment K tile, which no config changes: past the
+        unrolled steps' bound the search offers no fragment configs, and an
+        explicit one raises at codegen."""
+        for k, fits in ((64, True), (1024, False)):
+            x, y = torch.randn(16, k), torch.randn(k, 16)
+            choices = matmul_choices(whole_k.bind((x, y)).config_spec)
+            self.assertEqual("fragment" in choices, fits, choices)
+            if fits:
+                msl = render_msl(whole_k, (x, y), fragment_config([16, 16]))
+                self.assertEqual(_lowering(msl), "fragment")
+            else:
+                with self.assertRaisesRegex(
+                    exc.BackendUnsupported,
+                    f"{REFUSED} a matmul over a ':' K: .* 128 MMA steps",
+                ):
+                    render_msl(whole_k, (x, y), fragment_config([16, 16]))
 
     def test_rejects(self) -> None:
         """Forms the fragment run can't lower raise at codegen rather than
@@ -380,23 +607,30 @@ class TestFragmentConfig(unittest.TestCase):
         y = torch.randn(32, 16, dtype=torch.float16)
         g = torch.randn(16)
         for kernel, args, config, message in (
-            (centered, (x, y), _frag([16, 16, 16]), f"{REFUSED} the operand"),
-            (carried_scale, (x, y, g), _frag([16, 16, 16]), f"{REFUSED} the operand"),
-            (row_sums, (x, y), _frag([16, 16]), "result is read in the Scalar layout"),
-            (whole_k, (x, y), _frag([16, 16]), f"{REFUSED} a matmul over a ':' K"),
+            (centered, (x, y), fragment_config([16, 16, 16]), f"{REFUSED} the operand"),
+            (
+                carried_scale,
+                (x, y, g),
+                fragment_config([16, 16, 16]),
+                f"{REFUSED} the operand",
+            ),
+            (
+                row_sums,
+                (x, y),
+                fragment_config([16, 16]),
+                "result is read in the Scalar layout",
+            ),
             (
                 overwritten,
                 (x.clone(), y),
-                _frag([16, 16, 16]),
+                fragment_config([16, 16, 16]),
                 "a tensor the kernel writes",
             ),
             (
                 views_epilogue,
                 (x, y, g),
-                helion.Config(
-                    block_sizes=[16, 16, 16], metal_matmul="fragment", num_warps=4
-                ),
-                "one 32-thread SIMD group",
+                fragment_config([16, 16, 16], num_threads=[2, 2, 1]),
+                "whose tile takes 4 threads; it runs on a 32-thread SIMD group",
             ),
             (
                 views_epilogue,
@@ -405,7 +639,7 @@ class TestFragmentConfig(unittest.TestCase):
                     torch.randn(256, 16, dtype=torch.float16),
                     g,
                 ),
-                _frag([16, 16, 256]),
+                fragment_config([16, 16, 256]),
                 "its 32 MMA steps are unrolled (max 16)",
             ),
         ):
@@ -426,7 +660,7 @@ class TestFragmentConfig(unittest.TestCase):
         b = torch.randint(-128, 127, (64, 64), dtype=torch.int8)
         message = f"{REFUSED} a matmul over a K held as per-thread parts"
         with self.assertRaisesRegex(exc.BackendUnsupported, re.escape(message)):
-            matmul_bf16_int4.bind((a, b)).to_code(_frag([16, 16, 16]))
+            matmul_bf16_int4.bind((a, b)).to_code(fragment_config([16, 16, 16]))
 
 
 if __name__ == "__main__":

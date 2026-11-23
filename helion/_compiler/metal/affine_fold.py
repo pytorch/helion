@@ -35,11 +35,14 @@ if TYPE_CHECKING:
 @dataclasses.dataclass(frozen=True)
 class Fact:
     """What codegen knows of an integer name: a multiple of ``multiple``,
-    at least ``lo`` and at most ``hi`` (None: unbounded)."""
+    at least ``lo`` and at most ``hi`` (None: unbounded).  A floor term's
+    ``depends`` holds the names it is computed from, its own floor terms'
+    included."""
 
     multiple: int = 1
     lo: int | None = None
     hi: int | None = None
+    depends: frozenset[str] = frozenset()
 
 
 @dataclasses.dataclass(frozen=True)
@@ -135,6 +138,7 @@ def floor_divide(value: Affine, divisor: int, facts: dict[str, Fact]) -> Affine 
         1,
         math.floor(lo / divisor),
         None if hi is None else math.floor(hi / divisor),
+        frozenset().union(*({n} | facts[n].depends for n, _ in rest)),
     )
     return base + Affine.of(quotient) + Affine.term(name)
 
@@ -284,15 +288,23 @@ def render(value: Affine) -> ast.expr:
     return ast.parse(f"({text})", mode="eval").body
 
 
+def evaluate(
+    node: ast.AST, env: Mapping[str, object], facts: dict[str, Fact]
+) -> Affine | None:
+    """``node``'s affine value over ``env`` and ``facts``, or None;
+    ``facts`` gains the facts of the floor terms in it."""
+    return _Evaluator(facts, dict(env))(node)
+
+
 def fold(
-    stmts: list[ast.stmt], env: dict[str, object], facts: Mapping[str, Fact]
+    stmts: list[ast.stmt], env: dict[str, object], facts: dict[str, Fact]
 ) -> list[ast.stmt]:
     """``stmts`` with each assignment or element binding whose value divides
     or takes a remainder, and is affine over ``env`` (names' affine values,
     or tuples of them for a ``uint3``) and ``facts``, rewritten to its
-    folded form.  ``env`` gains the statements' affine values."""
-    # Floor terms add names to a copy (floor_divide).
-    evaluate = _Evaluator(dict(facts), env)
+    folded form.  ``env`` gains the statements' affine values, and ``facts``
+    the facts of the floor terms in them (``floor_divide``)."""
+    evaluate = _Evaluator(facts, env)
     out: list[ast.stmt] = []
     for stmt in stmts:
         if isinstance(stmt, ast.Expr) and _callee(stmt.value) == BIND:

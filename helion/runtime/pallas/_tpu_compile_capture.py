@@ -178,7 +178,10 @@ def _is_functional(kernel: Kernel) -> bool:
 def _resolves_without_benchmark(kernel: Kernel) -> bool:
     """True if the kernel resolves a config with no runtime benchmark, any shape.
 
-    Mirrors the benchmark-free cases of the autotune dispatch (backend.autotune):
+    Mirrors the benchmark-free cases of the autotune dispatch (backend.autotune,
+    which decides them with ``Kernel._fixed_config_kind``; this copy treats
+    ``force_autotune`` with ``autotune_effort="none"`` as benchmarking, which
+    only sends such kernels down the warm-up path):
     a single ``config=``, ``autotune_effort="none"`` with at most one config, or an
     ``aot_kernel`` (heuristic cache, never benchmarks). ``force_autotune`` overrides
     all of these (it benchmarks regardless), and ``configs=[...]`` / open autotuning

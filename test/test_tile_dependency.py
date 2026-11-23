@@ -30,6 +30,7 @@ from helion._compiler.tile_dependency import TileDependencyKind
 from helion._compiler.tile_dependency import _access_layout
 from helion._compiler.tile_dependency import _CoordinateRelationPiece
 from helion._compiler.tile_dependency import _interval_hull
+from helion._compiler.tile_dependency import _rectangular_overlap_sources
 from helion._compiler.tile_dependency import _simplify_logical_expression
 from helion._compiler.tile_dependency import _symbolic_access_map
 from helion._compiler.tile_dependency import allocation_regions_may_overlap
@@ -568,6 +569,58 @@ class TestTileDependency(TestCase):
             _index(domain, {10: 1, 20: 0}, (20, 10)),
             3,
         )
+
+    def test_fixed_index_pieces_that_never_meet_add_no_source(self) -> None:
+        # The owner writes row 1 of a view dimension; one query piece reads
+        # row 0 (never met: no piece), the other row 1 (keyed by the tile).
+        owner_domain = CoordinateDomain((10,), ((10, 4),))
+        query_domain = CoordinateDomain((20,), ((20, 4),))
+        allocation = CoordinateDomain(
+            (0, 1, 2), ((0, 4), (1, 2), (2, 64)), kind="allocation"
+        )
+        owner_tile = coordinate_axis_symbol(10)
+        query_tile = coordinate_axis_symbol(20)
+        owner = CoordinateRelation(
+            owner_domain,
+            allocation,
+            (
+                _CoordinateRelationPiece(
+                    ((10, 0, 4, 1),),
+                    ((0, owner_tile, owner_tile + 1, 1), (1, 1, 2, 1), (2, 0, 64, 1)),
+                ),
+            ),
+        )
+
+        def query(*rows: tuple[int, int, int]) -> CoordinateRelation:
+            return CoordinateRelation(
+                query_domain,
+                allocation,
+                tuple(
+                    _CoordinateRelationPiece(
+                        ((20, begin, end, 1),),
+                        (
+                            (0, query_tile, query_tile + 1, 1),
+                            (1, row, row + 1, 1),
+                            (2, 0, 64, 1),
+                        ),
+                    )
+                    for begin, end, row in rows
+                ),
+            )
+
+        sources = _rectangular_overlap_sources(owner, query((0, 2, 0), (2, 4, 1)))
+        self.assertIsNotNone(sources)
+        assert sources is not None
+        self.assertEqual(
+            sources.pieces,
+            (
+                _CoordinateRelationPiece(
+                    ((20, 2, 4, 1),), ((10, query_tile, query_tile + 1, 1),)
+                ),
+            ),
+        )
+        # Every piece pair apart: the dense path decides the edge.
+        self.assertIsNone(_rectangular_overlap_sources(owner, query((0, 4, 0))))
 
     def test_relation_axis_renaming_preserves_positional_coordinates(self) -> None:
         source = CoordinateDomain((10, 20), ((10, 2), (20, 3)))
@@ -2204,7 +2257,9 @@ class TestTileDependency(TestCase):
             tuple(frozenset((task,)) for task in range(8)),
         )
 
-    def test_masked_store_falls_back_to_root(self) -> None:
+    def test_masked_store_keeps_task_producers(self) -> None:
+        # A masked store writes a subset of its tile: the tile still bounds
+        # what it may write, so each consumer task waits for its own producer.
         plan = build_tile_dependency_graph(
             (
                 _access(0, root=0, kind="store", block_ids=(10,), masked=True),
@@ -2213,7 +2268,10 @@ class TestTileDependency(TestCase):
             [[10], [20]],
         )
 
-        self.assertIsNone(_root_producers_by_consumer(plan, _one_dimensional_domains()))
+        self.assertEqual(
+            _root_producers_by_consumer(plan, _one_dimensional_domains()),
+            tuple(frozenset((task,)) for task in range(8)),
+        )
 
     def test_nonzero_or_dynamic_grid_start_falls_back_to_root(self) -> None:
         plan = build_tile_dependency_graph(

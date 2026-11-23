@@ -28,6 +28,7 @@ import uuid
 from .. import exc
 from ..runtime.precompile_shim import already_compiled
 from ..runtime.precompile_shim import already_compiled_fail
+from ..runtime.precompile_shim import cached_compile_failure_error
 from ..runtime.precompile_shim import make_precompiler
 from .benchmarking import clear_jit_fast_path_caches
 from .benchmarking import synchronize_device
@@ -370,15 +371,6 @@ def _detach_error(error: BaseException) -> None:
         pending += [link for link in (node.__cause__, node.__context__) if link]
 
 
-def cached_compile_failure_error() -> RuntimeError:
-    """Why a kernel an earlier compile in this process cached but could not
-    load (``already_compiled_fail``) fails again: the precompile phase and the
-    in-process compile report the same error."""
-    return RuntimeError(
-        "an earlier compile of this kernel in this process could not load it"
-    )
-
-
 def _write_error_result(
     result_path: str, exc: Exception, decorator: str, captured_output: str
 ) -> None:
@@ -405,17 +397,33 @@ def _write_error_result(
         )
 
 
+def _prefetch_code_hook_installed() -> bool:
+    """Whether this process compiles under ``hl.prefetch_code``'s stages hook
+    (``helion.runtime.triton.prefetch_code``, imported by the first kernel that
+    calls it); a spawned child installs it only when told."""
+    from triton import knobs
+
+    hook = knobs.runtime.add_stages_inspection_hook
+    return getattr(hook, "prefetch_code_key", None) is not None
+
+
 def _run_kernel_in_subprocess_spawn(
     fn_spec: SerializedCompiledFunction,
     args_path: str,
     result_path: str,
     decorator: str,
+    prefetch_code_hook: bool = False,
 ) -> None:
     start_isolated_process_group()
     # Exit status 0 only after the "ok" result (see the fork child below).
     status = 1
     _cap: list[str] = [""]
     try:
+        if prefetch_code_hook:
+            # The parent compiles under hl.prefetch_code's stages hook, which
+            # keys every kernel; compile the specialization it will look up.
+            import helion.runtime.triton.prefetch_code  # noqa: F401
+
         fn = _load_compiled_fn(fn_spec)
         args = load_trusted_kernel_args(args_path)
         assert isinstance(args, (tuple, list))
@@ -622,7 +630,13 @@ class PrecompileFuture:
                 "mp.Process",
                 mp_ctx.Process(
                     target=_run_kernel_in_subprocess_spawn,
-                    args=(fn_spec, args_path, result_path, decorator),
+                    args=(
+                        fn_spec,
+                        args_path,
+                        result_path,
+                        decorator,
+                        _prefetch_code_hook_installed(),
+                    ),
                 ),
             )
             process.daemon = True

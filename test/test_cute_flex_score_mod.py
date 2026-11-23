@@ -28,6 +28,7 @@ from helion._compiler.cute.attention_plan import AttentionScorePlan
 from helion._compiler.cute.attention_plan import FlexAuxBuffer
 from helion._compiler.cute.attention_plan import FlexKvWalk
 from helion._compiler.cute.attention_plan import FlexRegion
+from helion._compiler.cute.device_state import CuteDeviceFunctionState
 from helion._compiler.cute.flash_score_mod import FlexHookCode
 from helion._compiler.cute.flash_score_mod import build_flex_region
 from helion._compiler.cute.flash_score_mod import flex_aux_smem_candidates
@@ -68,7 +69,8 @@ _BOUNDS = (_BATCH, _HEADS, 4 * 128, 8 * 128)
 
 # ---------------------------------------------------------------------------
 # Codegen context stand-ins (the live GenerateAST / DeviceFunction of a kernel
-# compile; here only the naming and statement-capture surface is needed).
+# compile; here only the naming and statement-capture surface is needed, and
+# the CuTe state in which the extremum handler records its results).
 # ---------------------------------------------------------------------------
 
 
@@ -103,6 +105,7 @@ class _StubDeviceFunction:
         self.expr_to_var_info: dict[object, object] = {}
         self._constexpr_args: dict[str, object] = {}
         self.config = helion.Config()
+        self.cute_state = CuteDeviceFunctionState()
         self.tile_strategy = types.SimpleNamespace(
             supports_index_rank_expansion=lambda: False,
             shape_str=lambda shape: str(shape),
@@ -117,6 +120,9 @@ class _StubDeviceFunction:
 
     def user_sympy_expr(self, expr: object) -> str:
         return str(expr)
+
+    def variable_aliases(self, name: str) -> tuple[str, ...]:
+        return (name,)
 
 
 @contextlib.contextmanager
@@ -226,6 +232,10 @@ _BOOL = _Dtype(bool)  # pyrefly: ignore [bad-argument-type]
 
 
 class _Ptr:
+    # The byte alignment of the base the launcher proves (the hooks pass a
+    # table's to its vector loads); the emulated loads ignore it.
+    alignment = 16
+
     def __init__(self, storage: list[object], offset: int) -> None:
         self.storage = storage
         self.offset = offset
@@ -269,13 +279,15 @@ class _Coords:
         raise IndexError(key)
 
 
-def _load_vec(ptr: _Ptr, width: int, dtype: _Dtype) -> list[object]:
+def _load_vec(ptr: _Ptr, width: int, dtype: _Dtype, align: int = 16) -> list[object]:
     if ptr.offset < 0 or ptr.offset + width > len(ptr.storage):
         raise IndexError("vector load out of bounds")
     return [dtype(ptr.storage[ptr.offset + j]) for j in range(width)]
 
 
-def _load_run(ptr: _Ptr, count: int, width: int, dtype: _Dtype) -> list[object]:
+def _load_run(
+    ptr: _Ptr, count: int, width: int, dtype: _Dtype, align: int = 16
+) -> list[object]:
     values: list[object] = []
     for k in range(count):
         values.extend(_load_vec(ptr + width * k, width, dtype))
@@ -283,7 +295,12 @@ def _load_run(ptr: _Ptr, count: int, width: int, dtype: _Dtype) -> list[object]:
 
 
 def _load_window(
-    ptr: _Ptr, last_ptr: _Ptr, count: int, width: int, dtype: _Dtype
+    ptr: _Ptr,
+    last_ptr: _Ptr,
+    count: int,
+    width: int,
+    dtype: _Dtype,
+    align: int = 16,
 ) -> list[object]:
     values: list[object] = []
     for k in range(count - 1):
@@ -305,6 +322,7 @@ def _coop_issue(
     lane: object,
     pitch: int,
     limit: int | None = None,
+    align: int = 16,
 ) -> None:
     """The GPU copies every lane's share of the block into the slot; the
     single-thread emulation writes the owner row's values into the lane's
@@ -1645,14 +1663,15 @@ class TestCuteFlexScoreMod(TestCase):
         self.assertIn(
             "_cute_flex_coop_issue(_flash_aux0.iterator + flash_flex1s_load_cb, "
             "flash_flex1s_load_lo, flash_flex1_coops128, 1024, 128, 1, 4, cutlass.Int32, "
-            "flash_flex1s_load_sp + flash_flex_ps * 4352, flash_flex1_lane, 36)",
+            "flash_flex1s_load_sp + flash_flex_ps * 4352, flash_flex1_lane, 36, "
+            "align=_flash_aux0.iterator.alignment)",
             issue,
         )
         self.assertIn(
             "_cute_flex_coop_issue(_flash_aux1.iterator + flash_flex1s_load_1_cb, "
             "(flash_flex1s_load_1_lo) * cutlass.Int32(3), flash_flex1_coops128, 3072, "
             "128, 3, 4, cutlass.Int32, flash_flex1s_load_1_sp + flash_flex_ps * 4352, "
-            "flash_flex1_lane, 100)",
+            "flash_flex1_lane, 100, align=_flash_aux1.iterator.alignment)",
             issue,
         )
         self.assertTrue(issue.rstrip().endswith("cute.arch.cp_async_commit_group()"))
@@ -1701,12 +1720,14 @@ class TestCuteFlexScoreMod(TestCase):
         )
         self.assertIn(
             "flash_flex0_coops64, 1024, 64, 1, 4, cutlass.Int32, flash_flex0s_load_sp + "
-            "flash_flex_ps * 2304, flash_flex0_lane, 20)",
+            "flash_flex_ps * 2304, flash_flex0_lane, 20, "
+            "align=_flash_aux0.iterator.alignment)",
             narrow.chunk_issue,
         )
         self.assertIn(
             "flash_flex0_coops64, 3072, 64, 3, 4, cutlass.Int32, flash_flex0s_load_1_sp + "
-            "flash_flex_ps * 2304, flash_flex0_lane, 52)",
+            "flash_flex_ps * 2304, flash_flex0_lane, 52, "
+            "align=_flash_aux1.iterator.alignment)",
             narrow.chunk_issue,
         )
         self.assertIn("cute.arch.cp_async_wait_group(0)", narrow.chunk_consume)
@@ -1724,7 +1745,10 @@ class TestCuteFlexScoreMod(TestCase):
             "(flash_flex0s_load_glo < cutlass.Int32(64))",
             guarded.chunk_body,
         )
-        self.assertIn("flash_flex0_lane, 100, 188)", guarded.chunk_issue)
+        self.assertIn(
+            "flash_flex0_lane, 100, 188, align=_flash_aux0.iterator.alignment)",
+            guarded.chunk_issue,
+        )
         self.assertIn(
             "cutlass.select_(flash_flex0s_load_ok, cutlass.Int32("
             "flash_flex0s_load_run[flash_flex_i * 3 + 1])",
@@ -2189,7 +2213,7 @@ class TestCuteFlexScoreMod(TestCase):
             "flash_flex0s_load_1_run = _cute_flex_load_run(_flash_aux1.iterator + "
             "flash_flex0s_load_1_i0 * cutlass.Int32(3145728) + flash_flex0s_load_1_i1 "
             "* cutlass.Int32(3072) + (flash_flex0s_load_1_lo) * cutlass.Int32(3), 3, 4, "
-            "cutlass.Int32)",
+            "cutlass.Int32, align=_flash_aux1.iterator.alignment)",
             code.chunk_body,
         )
         for n, name in (
@@ -2209,7 +2233,9 @@ class TestCuteFlexScoreMod(TestCase):
         )
         self.assertEqual(code.chunk_body.count(".load()"), 3)
         # ``path_lengths`` keeps the plain four-lane vector of the same group.
-        self.assertIn(", 4, cutlass.Int32)", code.chunk_body)
+        self.assertIn(
+            ", 4, cutlass.Int32, align=_flash_aux0.iterator.alignment)", code.chunk_body
+        )
         self.assertEqual(
             [a.index_class for a in plan.aux_buffers],
             ["column_affine", "row_col", "value"],
@@ -2242,10 +2268,18 @@ class TestCuteFlexScoreMod(TestCase):
             "for flash_flex_g in cutlass.range_constexpr(cute.size(flash_disc_frg) // 8):",
             code.chunk_body,
         )
-        self.assertIn(", 6, 4, cutlass.Int32)", code.chunk_body)
-        self.assertIn(", 3, 8, cutlass.BFloat16)", code.chunk_body)
+        self.assertIn(
+            ", 6, 4, cutlass.Int32, align=_flash_aux0.iterator.alignment)",
+            code.chunk_body,
+        )
+        self.assertIn(
+            ", 3, 8, cutlass.BFloat16, align=_flash_aux1.iterator.alignment)",
+            code.chunk_body,
+        )
         self.assertIn("_cute_flex_load_vec(_flash_aux2.iterator", code.chunk_body)
-        self.assertIn(", 16, cutlass.Int8)", code.chunk_body)
+        self.assertIn(
+            ", 16, cutlass.Int8, align=_flash_aux2.iterator.alignment)", code.chunk_body
+        )
         self.assertIn("[flash_flex_j * 2 + 1]) != cutlass.Int8(0)", code.chunk_body)
 
     def test_staged_gathers_read_shared_memory_through_the_sentinel(self) -> None:
@@ -2321,7 +2355,8 @@ class TestCuteFlexScoreMod(TestCase):
         self.assertIn(
             "flash_flex0s_load_win = _cute_flex_load_window(_flash_aux0.iterator + "
             "flash_flex0s_load_wb, _flash_aux0.iterator + cutlass.min(flash_flex0s_load_wb"
-            " + cutlass.Int32(32), cutlass.Int32(2046)), 17, 2, cutlass.Float32)",
+            " + cutlass.Int32(32), cutlass.Int32(2046)), 17, 2, cutlass.Float32, "
+            "align=_flash_aux0.iterator.alignment)",
             code.chunk_body,
         )
         self.assertIn(
@@ -2403,7 +2438,9 @@ class TestCuteFlexScoreMod(TestCase):
             "for flash_flex_g in cutlass.range_constexpr(cute.size(flash_disc_frg) // 4):",
             code.chunk_body,
         )
-        self.assertIn(", 4, cutlass.Int32)", code.chunk_body)
+        self.assertIn(
+            ", 4, cutlass.Int32, align=_flash_aux0.iterator.alignment)", code.chunk_body
+        )
         self.assertIn("_cute_flex_load_vec(_flash_aux0.iterator", code.chunk_body)
         # The dependent ``bias[h, dist]`` read stays a per-lane gather.
         self.assertIn("(_flash_aux1.iterator", code.chunk_body)
@@ -2414,7 +2451,10 @@ class TestCuteFlexScoreMod(TestCase):
     def test_bf16_table_uses_eight_wide_vectors(self) -> None:
         case = next(c for c in _CASES if c.name == "bf16_table")
         code, _plan_, _tables, _values = _render_case(case, with_tail=False)
-        self.assertIn(", 8, cutlass.BFloat16)", code.chunk_body)
+        self.assertIn(
+            ", 8, cutlass.BFloat16, align=_flash_aux0.iterator.alignment)",
+            code.chunk_body,
+        )
 
     def test_hook_params_follow_plan_order(self) -> None:
         case = next(c for c in _CASES if c.name == "graphormer_spatial")
@@ -2448,7 +2488,11 @@ class TestCuteFlexScoreMod(TestCase):
     def test_sigmoid_and_log_use_backend_overrides(self) -> None:
         case = next(c for c in _CASES if c.name == "sigmoid_act")
         code, _plan_, _tables, _values = _render_case(case, with_tail=False)
-        self.assertIn("cute.math.rcp(1.0 + cute.math.exp2(", code.chunk_body)
+        self.assertIn(" = cute.math.rcp(cute.math.exp2(", code.chunk_body)
+        self.assertIn(
+            "fastmath=True) * 0.25 + 0.25, approx=True, ftz=True) * 0.25\n",
+            code.chunk_body,
+        )
         self.assertIn("cute.math.log(", code.chunk_body)
         self.assertNotIn(
             "cute.math.log(v_", code.chunk_body.replace("cute.math.log(v_", "LOG(", 0)

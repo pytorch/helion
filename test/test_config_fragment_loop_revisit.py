@@ -9,6 +9,7 @@ import torch
 import helion
 from helion._testing import cpu_render_target
 from helion._testing import onlyBackends
+from helion._testing import skipIfRefEagerMark
 from helion._testing.config_fragment_registration import HIGH_LITERAL_GLOBAL
 from helion._testing.config_fragment_registration import check_shared_fragment_revisit
 from helion._testing.config_fragment_registration import container_fragment_revisit
@@ -25,7 +26,10 @@ from helion.autotuner.config_fragment import NumThreadsFragment
 import helion.language as hl
 from helion.language.tunable_ops import _get_tunable
 
-pytestmark = pytest.mark.cpu_only
+pytestmark = [
+    pytest.mark.cpu_only,
+    skipIfRefEagerMark("reads compiler state, which ref mode does not build"),
+]
 
 
 def _register_from_helper():

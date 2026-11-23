@@ -403,6 +403,26 @@ def supports_host_tensor_descriptor() -> bool:
     return _supports_host_tensor_descriptor()
 
 
+@functools.cache
+def gluon_api_available() -> bool:
+    """Whether the installed Triton has the Gluon API the gluon backend is
+    written against (Triton 3.8's, or a later one's)."""
+    return triton_is_available() and get_triton_version().release[:2] >= (3, 8)
+
+
+# What ``supports_gluon`` checks, for messages that explain a refusal or skip.
+GLUON_REQUIREMENT = "an NVIDIA GPU of compute capability 10.x and Triton >= 3.8"
+
+
+@functools.cache
+def supports_gluon() -> bool:
+    """Whether the gluon backend can run here: CUDA Blackwell (sm_10x) with
+    ``gluon_api_available``."""
+    if torch.version.hip is not None or not torch.cuda.is_available():
+        return False
+    return gluon_api_available() and torch.cuda.get_device_capability()[0] == 10
+
+
 def tensor_descriptor_supports_dtype(dtype: torch.dtype) -> bool:
     """Whether a Triton tensor descriptor can address elements of ``dtype``.
 
@@ -549,15 +569,20 @@ def _is_amd_cdna() -> bool:
     return match is not None and int(match.group(1), 16) >= 0x908
 
 
+def amd_base_arch(arch_name: str) -> str:
+    """Base AMD GPU architecture, e.g. "gfx942" from "gfx942:sramecc+:xnack-"."""
+    return arch_name.split(":")[0]
+
+
 @functools.cache
 def _amd_base_arch() -> str | None:
-    """Base AMD GPU architecture, e.g. "gfx942" from "gfx942:sramecc+:xnack-"."""
+    """Base architecture of the current AMD GPU (see ``amd_base_arch``)."""
     try:
         props = torch.cuda.get_device_properties(torch.cuda.current_device())
         arch = getattr(props, "gcnArchName", None)
     except Exception:
         return None
-    return None if arch is None else arch.split(":")[0]
+    return None if arch is None else amd_base_arch(arch)
 
 
 def device_num_sm(device: torch.device | int | None = None) -> int:

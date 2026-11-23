@@ -288,6 +288,22 @@ each native launch. Dynamic
 launch layouts and plans that require additional descriptor preparation are not
 yet supported.
 
+A CuTe export also changes the entry point's signature and scalars:
+
+- Callable arguments (such as score or mask modifiers) are compiled into the
+  kernel, so the exported entry point omits them. Export refuses a kernel
+  whose host code uses one, for example to read a value the callable's
+  closure captures.
+- Bool and float arguments stay runtime arguments. By default, export fails
+  with `GuardOnDataDependentSymNode` when the host code branches on one or a
+  launch needs one as a compile-time constant. With
+  `HELION_CUTE_EXPORT_HARDCODE_SCALARS=1`, export instead hard-codes those
+  arguments as constants; a call with another value raises `ValueError`. The
+  hard-coded values are those the `BoundKernel` was created with (a hand-off
+  uses each case's values). Bool and float arguments do not key bound kernels
+  by value, so `kernel.bind(args)` can return a `BoundKernel` created by an
+  earlier call with other values.
+
 ### Explicit kernel artifacts
 
 An explicitly selected artifact can skip Helion's frontend and source generation
@@ -321,9 +337,9 @@ and scalar/container values. Unexported inputs raise an error rather than
 triggering compilation. This initial API targets Triton inference kernels with
 ordinary `torch.Tensor` or `torch.nn.Parameter` inputs with `requires_grad=False`.
 Tensor subclasses, conjugate/negative views, Torch modes, autocast, distributed
-kernels, tensor-descriptor indexing, and runtime input specialization are
-unsupported. CPU examples can be exported for code inspection; execution requires
-accelerator tensors.
+kernels, tensor-descriptor indexing or prefetch, runtime input specialization,
+and NaN or bytes scalar values are unsupported. CPU examples can be exported
+for code inspection; execution requires accelerator tensors.
 
 Unsupported dependencies on the original Python module are rejected at export.
 Exporting a kernel does not precompile Triton's device binaries, so a cold Triton

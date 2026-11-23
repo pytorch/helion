@@ -539,8 +539,7 @@ def _graph_used_block_ids(
 ) -> set[int]:
     from ..language import memory_ops
     from .compile_environment import CompileEnvironment
-    from .device_ir import ForLoopGraphInfo
-    from .device_ir import RootGraphInfo
+    from .device_ir import _iter_loop_graphs
     from .device_ir import control_flow_child_graph_ids
     from .host_function import HostFunction
     from .variable_origin import BlockSizeOrigin
@@ -596,25 +595,9 @@ def _graph_used_block_ids(
         if block_info.reduction:
             used.add(block_id)
 
-    def graph_matches_loop(graph_info: GraphInfo) -> bool:
-        if isinstance(graph_info, ForLoopGraphInfo):
-            return graph_info.block_ids == block_ids
-        if not isinstance(graph_info, RootGraphInfo):
-            return False
-        phase_index = graph_info.phase_index
-        return (
-            0 <= phase_index < len(device_ir.grid_block_ids)
-            and device_ir.grid_block_ids[phase_index] == block_ids
-        )
-
-    graph_by_id = {
-        graph_info.graph_id: graph_info for graph_info in fn.codegen.codegen_graphs
-    }
-    pending = [
-        graph_info
-        for graph_info in fn.codegen.codegen_graphs
-        if graph_matches_loop(graph_info)
-    ]
+    graphs = fn.codegen.codegen_graphs
+    graph_by_id = {graph_info.graph_id: graph_info for graph_info in graphs}
+    pending = list(_iter_loop_graphs(device_ir, graphs, block_ids))
     visited: set[int] = set()
     while pending:
         graph_info = pending.pop()

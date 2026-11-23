@@ -20,6 +20,7 @@ from torch._inductor.runtime.runtime_utils import next_power_of_2
 import torch.distributed as dist
 
 from .._compat import _regs_per_block
+from .._compat import amd_base_arch
 from .._compat import device_num_sm
 from .._compat import get_triton_version
 from .._compat import num_compute_units
@@ -37,6 +38,7 @@ from .._utils import prev_power_of_2
 from .._utils import widest_halvable
 from ..exc import InvalidConfig
 from ..runtime.config import _copy_config_structure
+from ..runtime.triton.launcher import MAX_CLUSTER_SIZE
 from ..runtime.triton.launcher import get_num_xcd
 from .block_id_sequence import BlockIdSequence
 from .block_id_sequence import _BlockIdItem
@@ -654,6 +656,111 @@ class AccumulatorFact(NamedTuple):
     itemsize: int
 
 
+# A dsmem transport's limits (``cross_loop_dsmem``): rank 0's shared memory
+# opens with a header (the flag, 8 bytes, then one barrier an entry), and every
+# entry's slab together takes at most ``MAX_CLUSTER_SLAB`` bytes after it,
+# leaving the rest of what a CTA may take (227 KB on sm_100) to the kernel's
+# dynamic shared memory (past 48 KB a static array needs a ptxas of CUDA 13,
+# which Triton uses for sm_100 and up); clusters of at most
+# ``MAX_CLUSTER_SIZE`` (the launcher's portable limit), one size for every
+# entry.
+CLUSTER_SMEM_HEADER = 128
+MAX_DSMEM_ENTRIES = (CLUSTER_SMEM_HEADER - 8) // 8
+
+
+def cluster_barrier_offset(entry: int) -> int:
+    """The byte offset of the ``entry``-th entry's barrier in the header,
+    after the launch flag's 8 bytes (``cluster_entry`` arms them)."""
+    return 8 + 8 * entry
+
+
+MAX_CLUSTER_SLAB = 96 * 1024
+
+
+class DsmemLayout:
+    """Rank 0's shared memory for the ``cross_loop_dsmem`` entries taken so
+    far, in candidate order: the header, then each entry's slab, 16-byte
+    aligned.  Normalize and codegen pack entries with it alike."""
+
+    def __init__(self) -> None:
+        self.size: int | None = None
+        self.entries = 0
+        self.offset = CLUSTER_SMEM_HEADER
+
+    def refusal(self, cluster: int, nbytes: int) -> str | None:
+        """The limit one more entry (``nbytes`` of slab in clusters of
+        ``cluster``) breaks, or None."""
+        end = self._buffer() + nbytes - CLUSTER_SMEM_HEADER
+        if not 2 <= cluster <= MAX_CLUSTER_SIZE:
+            return f"clusters of {cluster} (2 to {MAX_CLUSTER_SIZE})"
+        if self.entries >= MAX_DSMEM_ENTRIES:
+            return f"more than {MAX_DSMEM_ENTRIES} entries"
+        if cluster != (self.size or cluster):
+            return f"clusters of {cluster}, unlike an earlier entry's"
+        if end > MAX_CLUSTER_SLAB:
+            return f"slabs of {end} bytes (at most {MAX_CLUSTER_SLAB})"
+        return None
+
+    def take(self, cluster: int, nbytes: int) -> tuple[int, int]:
+        """Take one more entry: the offsets of its slab and its barrier."""
+        buffer, barrier = self._buffer(), cluster_barrier_offset(self.entries)
+        self.size, self.entries, self.offset = (
+            cluster,
+            self.entries + 1,
+            buffer + nbytes,
+        )
+        return buffer, barrier
+
+    def _buffer(self) -> int:
+        return (self.offset + 15) // 16 * 16
+
+
+class DsmemSlabFacts(NamedTuple):
+    """A dsmem candidate's slab under a config (``cross_loop_dsmem``): the
+    factors of its elements (the ranges its load reads) and of one producer
+    task's tile (the ranges its store writes), each an integer, a tunable
+    expression (``ConfigValueExpression``) or ``("block", i)``, the config's
+    ``block_sizes[i]``.  Its 32-bit elements make ``4 * numel`` bytes, in
+    clusters of ``numel // tile``.  ``carried`` is False for a candidate that
+    breaks a rule under every config."""
+
+    numel: tuple[object, ...]
+    tile: tuple[object, ...]
+    carried: bool = True
+
+    def evaluate(self, config: dict[str, object]) -> tuple[int, int] | None:
+        """``(cluster size, slab bytes)`` under ``config``, or None when a
+        factor has no integer value there."""
+        block_sizes = config.get("block_sizes")
+
+        def product(factors: tuple[object, ...]) -> int | None:
+            total = 1
+            for factor in factors:
+                if isinstance(factor, tuple):
+                    index = factor[1]
+                    value = (
+                        block_sizes[index]
+                        if isinstance(block_sizes, list) and index < len(block_sizes)
+                        else None
+                    )
+                elif isinstance(factor, int):
+                    value = factor
+                else:
+                    try:
+                        value = factor.evaluate(config)  # pyrefly: ignore [missing-attribute]
+                    except (KeyError, TypeError):
+                        return None
+                if not isinstance(value, int) or value < 1:
+                    return None
+                total *= value
+            return total
+
+        numel, tile = product(self.numel), product(self.tile)
+        if numel is None or tile is None or numel % tile:
+            return None
+        return numel // tile, 4 * numel
+
+
 class PointwiseElementwiseFact(NamedTuple):
     """Workload facts for a PURE elementwise/pointwise kernel — DEFINED by the absence of any
     reduction/matmul/accumulator fact (the disjointness rule): if one of those fired, the kernel
@@ -748,6 +855,8 @@ def fit_thread_count(threads: int, block_size: int) -> int:
 
 DEFAULT_NUM_WARPS = 4
 DEFAULT_NUM_STAGES = 1
+# setmaxnreg's per-thread register range (``worker_registers``).
+MIN_REGISTERS, MAX_REGISTERS = 24, 256
 VALID_CROSS_LOOP_PIPELINES = ("barrier", "static", "dynamic")
 # Upper bound (power of two) that a matmul tile dimension's block size may reach
 # even when the dimension itself is smaller. Applied only to dimensions that
@@ -771,6 +880,7 @@ _BASE_BACKEND_TUNABLE_KEYS: frozenset[str] = frozenset(
         "num_ctas",
         "occupancy",
         "pallas_worklist_grouping",
+        "pallas_worklist_bucket_rows",
         "pallas_loop_type",
         "pallas_emit_pipeline_group_size",
         "pallas_use_low_level_scheduler",
@@ -790,21 +900,33 @@ def _get_backend_tunable_keys() -> frozenset[str]:
         return _BASE_BACKEND_TUNABLE_KEYS
 
 
+# cross_loop_inband_protocol's choices: "tagged" in-band words carry the launch
+# epoch; "lamport" words carry none, each lane xor'd with a NaN key, in three
+# launch slots that readers re-arm.
+INBAND_PROTOCOLS: tuple[str, ...] = ("tagged", "lamport")
+
 BACKEND_TUNABLE_KEYS: frozenset[str] = _get_backend_tunable_keys()
-# Generic keys whose support is gated per backend (the Triton host descriptor
-# and cache-modifier knobs, the Pallas loop knobs, the AMD XCD remap and the
-# cross-loop pipeline) rather than declared by one backend's surface.
+# Generic keys whose support is gated per backend (``supports_config_key``)
+# rather than declared by one backend's surface: the Triton host descriptor and
+# cache-modifier knobs, the Pallas loop knobs, the AMD XCD remap, the
+# cross-loop pipeline and Gluon ring knobs, and the prefetch forms.
 _BACKEND_GATED_GENERIC_KEYS: frozenset[str] = frozenset(
     {
         "cross_loop_pipeline",
+        "cross_loop_tmem_prefetch",
+        "cross_loop_dsmem",
+        "cross_loop_inband_protocol",
+        "worker_registers",
         "load_cache_modifiers",
         "store_cache_modifiers",
         "host_tensor_descriptors",
+        "prefetch_indexing",
         "pallas_loop_type",
         "pallas_emit_pipeline_group_size",
         "pallas_use_low_level_scheduler",
         "pallas_fold_dot_lhs_cast",
         "pallas_load_buffer_count",
+        "pallas_worklist_buffer_count",
         "pallas_indirect_access_mode",
         "pallas_pre_broadcast",
         "xcd_remap",
@@ -842,6 +964,7 @@ GENERIC_KEYS: frozenset[str] = frozenset(
 AUTOTUNED_PALLAS_LOOP_TYPES = ("emit_pipeline", "unroll", "fori_loop")
 VALID_PALLAS_LOOP_TYPES = AUTOTUNED_PALLAS_LOOP_TYPES
 VALID_PALLAS_WORKLIST_GROUPINGS = (0, 1, 2)
+AUTOTUNED_PALLAS_WORKLIST_BUCKET_ROWS = (0, 16, 32, 64)
 VALID_PID_TYPES = (
     "flat",
     "xyz",
@@ -851,6 +974,27 @@ VALID_PID_TYPES = (
 MIN_NUM_SM_MULTIPLIER = 1
 MAX_NUM_SM_MULTIPLIER = 128
 DEFAULT_NUM_SM_MULTIPLIER = 1
+
+
+def ring_depth(config: Mapping[str, object], backend_name: str) -> int:
+    """Slots of the gluon backend's shared-memory ring (``gluon_ring``):
+    ``num_stages`` when at least 2 on programs of whole warpgroups (Triton
+    warp-specializes only those) with tensor-descriptor loads (the ring's only
+    kind), else 0 (no ring: loads are plain loads, dot operands staged from
+    registers)."""
+    stages = cast("int", config.get("num_stages", DEFAULT_NUM_STAGES))
+    indexing = config.get("indexing", "pointer")
+    if (
+        backend_name != "gluon"
+        or stages < 2
+        or cast("int", config.get("num_warps", DEFAULT_NUM_WARPS)) % 4
+        or "tensor_descriptor"
+        not in ([indexing] if isinstance(indexing, str) else cast("list", indexing))
+    ):
+        return 0
+    return stages
+
+
 EPILOGUE_SUBTILE_EXTENDED_CHOICES = (None, 2, 4)
 EPILOGUE_SUBTILE_DEFAULT_CHOICES = (None, 2)
 EPILOGUE_SUBTILE_MIN_K_HINT = 1024
@@ -871,7 +1015,7 @@ DEFAULT_MAXNREG = None
 # only on backend name can poison later Triton ConfigSpec construction inside
 # the same worker process.
 def get_valid_eviction_policies(backend: Backend) -> tuple[str, ...]:
-    if backend.name == "triton" and not supports_amd_cdna_tunables():
+    if backend.uses_triton_compiler and not supports_amd_cdna_tunables():
         return ("", "first", "last")
     return backend.config_spec_extension().eviction_policies()
 
@@ -971,6 +1115,10 @@ class ConfigSpec:
         # blocks it runs beside: used between the path's root and its
         # innermost loop, or inside that loop.
         self.cute_tile_loop_path_reductions: dict[TileLoopPath, frozenset[int]] = {}
+        # The blocks reduced inside the innermost loop of one of those paths,
+        # as opposed to behind or around it
+        # (``innermost_loop_reduction_blocks``).
+        self.cute_innermost_loop_reduction_blocks: frozenset[int] = frozenset()
         # The static size of each block on the ``cute_tile_loop_paths`` that
         # no config tunes: a fixed ``hl.tile`` block size, or an ``hl.grid``'s
         # step (``hl.grid(0, 64, 8)`` records 8, although its loop runs one
@@ -1024,9 +1172,7 @@ class ConfigSpec:
         self.flatten_loops: BlockIdSequence[FlattenLoopSpec] = BlockIdSequence()
         self.reduction_loops: BlockIdSequence[ReductionLoopSpec] = BlockIdSequence()
         self.reduction_fusion_available: bool = False
-        self.cute_vector_widths: BlockIdSequence[CuteVectorWidthSpec] = (
-            BlockIdSequence()
-        )
+        self.cute_vector_widths: BlockIdSequence[VectorWidthSpec] = BlockIdSequence()
         self.cute_lane_layouts: BlockIdSequence[CuteLaneLayoutSpec] = BlockIdSequence()
         self.cute_reduction_reloads: BlockIdSequence[CuteReductionReloadSpec] = (
             BlockIdSequence()
@@ -1045,6 +1191,16 @@ class ConfigSpec:
         # see ``cute/register_tile_admission.py``).  Only these may keep a
         # thread count below their extent persistent.
         self.cute_register_tile_reduction_blocks: set[int] = set()
+        # Set by DeviceIR analysis: the kernel has a rollable reduction and
+        # no two of its memory accesses can need an order across threads (no
+        # loop region reads back storage it stores, and a tensor it stores
+        # into is touched by that store only and shares no buffer with
+        # another tensor it accesses).  A row held in
+        # registers on vector lanes has no place for the thread barrier such
+        # an order takes, so only these kernels keep a lane-unrolled row
+        # persistent beside several rows per block or carry row seeds that
+        # do.
+        self.cute_register_lane_rows = False
         self.cute_async_load_pipeline_enabled = False
         self.cute_bf16x2_recurrence_enabled = False
         # Set by DeviceIR analysis: a reduction over a strided full slice
@@ -1055,21 +1211,88 @@ class ConfigSpec:
         self.cute_strided_reduction_sites = False
         self.cute_signed_bitfield_bf16_available = False
         # Set by DeviceIR analysis: the reductions whose ``reduction_loops``
-        # slot may roll (is not pinned) along which a load reads a bool
-        # tensor, none in a kernel with a matmul; ``cute_bool_byte_packets``
-        # is tunable when there are any (``bool_reduction_row_blocks``).
+        # slot may roll (is not pinned), and the persistent rows without a
+        # slot, along which a load reads a bool tensor, none in a kernel with
+        # a matmul; ``cute_bool_byte_packets`` is tunable when there are any
+        # (``bool_reduction_row_blocks``).
         self.cute_bool_byte_packet_blocks: frozenset[int] = frozenset()
         # Set by DeviceIR analysis: the blocks of the device loops over a
         # static extent that load a float tensor along their tile, none in a
         # kernel with a matmul; ``cute_tail_peel`` is tunable when there are
         # any (``tail_peel_blocks``).
         self.cute_tail_peel_blocks: frozenset[int] = frozenset()
+        # Set by DeviceIR analysis: the blocks of the device loops that store
+        # along their tile into the last dimension of a packet-dtype tensor
+        # of two or more dimensions, none in a kernel with a matmul;
+        # ``cute_store_packet_tiers`` is tunable when there are any
+        # (``store_tier_blocks``).
+        self.cute_store_tier_blocks: frozenset[int] = frozenset()
+        # Set by DeviceIR analysis: for each of those blocks, the most vector
+        # lanes with which its loops still store packets under the layout of
+        # the tensors they store (16: any width; 0: none).  Config
+        # normalization reads ``cute_store_packet_tiers`` off where no packet
+        # is stored; the search space does not depend on it
+        # (``store_packet_lane_limits``).
+        self.cute_store_tier_packet_lanes: dict[int, int] = {}
+        # Set by DeviceIR analysis: for each of those blocks, a number of
+        # elements every packet its loops store starts a multiple of from
+        # its tensor's base (1: not known).  Vector lanes that divide it
+        # need no alignment guard, so ``cute_store_packet_tiers`` reads off
+        # there too (``aligned_row_multiples``).
+        self.cute_store_tier_row_multiples: dict[int, int] = {}
+        # Set by DeviceIR analysis: the names (``MemoryOpFact.tensor_name``)
+        # of the stored tensors whose base is on no 16-byte boundary, none in
+        # a kernel with a matmul.  Config normalization reads
+        # ``cute_store_policy`` as the default where every packet the policy
+        # applies to would go to one of them (``unaligned_store_tensors``).
+        self.cute_unaligned_store_tensors: frozenset[str] = frozenset()
+        # Set by DeviceIR analysis: ``(MemoryOpFact.tensor_name, subscript
+        # position)`` of the store subscripts that are slices, none in a
+        # kernel with a matmul.  The same normalization reads a slice's
+        # lanes off the blocks that are not tiles (``sliced_store_dims``).
+        self.cute_sliced_store_dims: frozenset[tuple[str, int]] = frozenset()
+        # Set by DeviceIR analysis: whether a store has a ``None`` subscript,
+        # never in a kernel with a matmul.  The positions of that store's
+        # ``MemoryOpFact`` are then off its tensor's dims, and the same
+        # normalization leaves ``cute_store_policy`` alone
+        # (``new_axis_stores``).
+        self.cute_new_axis_stores = False
+        # Set by DeviceIR analysis: the blocks of the device loops whose
+        # reductions over their own tile are all fp32 or fp64 sums added to
+        # a value the loop carries, none in a kernel with a matmul;
+        # ``cute_defer_tile_reduce`` is tunable when there are any
+        # (``carried_tile_sum_blocks``).
+        self.cute_carried_tile_sum_blocks: frozenset[int] = frozenset()
+        # Set by DeviceIR analysis: a flattened gather whose lane tile
+        # (``index = row + tile.index``) is a tile of a store but not the one
+        # on the stored tensor's last dimension, both tensors of a dtype with
+        # 16-byte packets, in a kernel with static shapes and without a
+        # matmul: no thread layout makes both the loads and the stores
+        # contiguous, so ``cute_staged_store`` is tunable, and
+        # ``cute_vloop_sink`` and ``cute_lane_unroll`` (the gather's packet
+        # loads) at every extent (``lane_gather_stores``).
+        self.cute_lane_gather_store_sites = False
         # Set by DeviceIR analysis under ``Settings.cute_exact_division``: an
         # fp32 quotient whose divisor is a scalar or a broadcast row value
         # (``hoist_loop_invariant_recip``'s exact hoist can apply), so
         # ``cute_exact_div_form`` is tunable.
         self.cute_exact_division_sites = False
         self.cute_pair_lane_math_sites = False
+        # Set by DeviceIR analysis: a load through a computed or gathered
+        # coordinate or with an ``extra_mask``
+        # (``guarded_lanes.has_guarded_lane_sites``), so
+        # ``cute_guarded_lanes`` is tunable at every extent.
+        self.cute_guarded_lane_sites = False
+        # Set by DeviceIR analysis: an fp32 ``torch.maximum`` / ``minimum``
+        # of two tensors (``handler_ops.has_fp32_extrema``), so
+        # ``cute_fmnmx_extrema`` is tunable.
+        self.cute_fmnmx_extrema_sites = False
+        # Set by DeviceIR analysis: an ``hl.load`` under an ``extra_mask``
+        # whose last subscript is a scaled or gathered coordinate that
+        # loads no packets
+        # (``predicated_element_loads.has_masked_gather_sites``), so
+        # ``cute_predicated_element_loads`` is tunable at every extent.
+        self.cute_masked_gather_sites = False
         self.cute_scaled_mma_available = False
         self.cute_mxfp8_fused_scales_available = False
         self.cute_mxfp8_sf_tma_available = False
@@ -1099,6 +1322,19 @@ class ConfigSpec:
         )
         self.range_flattens: BlockIdSequence[RangeFlattenSpec] = BlockIdSequence()
         self.static_ranges: BlockIdSequence[StaticRangeSpec] = BlockIdSequence()
+        # The cross-loop K loops whose ungated weight stream may prefetch into
+        # tensor memory ahead of their task's dependency wait (``gluon_ring``):
+        # a hand-set override the search never proposes.
+        self.cross_loop_tmem_prefetch: BlockIdSequence[CrossLoopTmemPrefetchSpec] = (
+            BlockIdSequence()
+        )
+        # One entry per allocation a launch cluster may carry between roots
+        # (TileDependencyGraph.dsmem_candidate_ids, sorted); True carries it so.
+        self.cross_loop_dsmem = ListOf(BooleanFragment(), length=0)
+        # Each candidate's slab facts (``cross_loop_dsmem.dsmem_slab_facts``;
+        # None: codegen alone checks it), which ``normalize`` holds to the
+        # limits that need no more than the config.
+        self.cross_loop_dsmem_slabs: tuple[DsmemSlabFacts | None, ...] = ()
 
         self.allowed_pid_types: tuple[PidTypeLiteral, ...] = tuple(VALID_PID_TYPES)
         # Keep alternative pid types searchable when an ordered reference uses flat.
@@ -1141,8 +1377,16 @@ class ConfigSpec:
             EnumFragment(choices=self.valid_atomic_indexing_types()),
             length=0,
         )
+        self.prefetch_indexing = ListOf(
+            EnumFragment(choices=self.valid_prefetch_indexing_types()),
+            length=0,
+        )
         self.pallas_load_buffer_count = ListOf(
             IntegerFragment(1, 2, 1),
+            length=0,
+        )
+        self.pallas_worklist_buffer_count = ListOf(
+            IntegerFragment(2, 8, 2),
             length=0,
         )
         self.epilogue_subtile_candidate_enabled: bool = False
@@ -1163,6 +1407,19 @@ class ConfigSpec:
         # implicit cross-root dependency the backend can lower (CuTe offers
         # the barrier pipeline only).
         self.cross_loop_pipeline: EnumFragment | None = None
+        # One entry per inband allocation whose words may travel as Lamport words
+        # (TileDependencyGraph.lamport_candidate_ids, sorted).
+        self.cross_loop_inband_protocol = ListOf(
+            EnumFragment(choices=INBAND_PROTOCOLS), length=0
+        )
+        # Whether a cross-rank dependency transports a scatter in band: its
+        # guard-skipped tasks need static or claimed (gluon ring) roots.
+        self.inband_scatter: bool = False
+        # Set when a later write overlaps a load of a prefetch-only root that
+        # it no longer waits for: if that leaves no dependency (no
+        # cross_loop_pipeline), a config saved before still loads (normalize
+        # ignores the key).
+        self.cross_loop_pipeline_retired: bool = False
         # Whether the kernel runs several phases in one persistent launch
         # (``hl.barrier()`` or an implicit cross-root dependency).
         self.multi_phase: bool = False
@@ -1549,10 +1806,29 @@ class ConfigSpec:
         # kernels on cute once device-IR analysis proves the fact.
         self.cute_reflatten_candidates: list[FlattenLoopSpec] = []
         self.backend_tunable_fragments = self.backend.tunable_fragments()
-        unknown_tunables = set(self.backend_tunable_fragments) - BACKEND_TUNABLE_KEYS
+        # A backend may give a fragment to any of its own surface's keys
+        # (built-in or plugin) except Helion's gated generic ones;
+        # _surface_key_fragments adds those to the search.
+        unknown_tunables = (
+            set(self.backend_tunable_fragments)
+            - BACKEND_TUNABLE_KEYS
+            - self._own_surface_keys()
+        )
         if unknown_tunables:
             raise RuntimeError(
                 f"Backend {self.backend_name!r} returned unknown tunables: {sorted(unknown_tunables)!r}"
+            )
+        unsupported = sorted(
+            key
+            for key in self._surface_key_fragments()
+            if not self.backend.supports_config_key(key)
+        )
+        if unsupported:
+            raise RuntimeError(
+                f"Backend {self.backend_name!r} gives fragments to its surface keys "
+                f"{unsupported!r} but its supports_config_key rejects them here; "
+                "return a fragment only for a key it supports (an override must "
+                "defer to super() for its surface keys)"
             )
 
     def rollable_reduction_block_ids(self) -> set[int]:
@@ -1700,6 +1976,10 @@ class ConfigSpec:
         if supports_tensor_descriptor():
             return ("pointer", "tensor_descriptor")
         return ("pointer",)
+
+    def valid_prefetch_indexing_types(self) -> tuple[IndexingLiteral, ...]:
+        """Prefetches lower as pointers or as TMA boxes (tensor_descriptor)."""
+        return self.valid_atomic_indexing_types()
 
     def _remove_duplicates(self) -> None:
         self.num_threads._remove_duplicates()
@@ -1872,6 +2152,12 @@ class ConfigSpec:
                 and self.target_device_capability >= (9, 0)
                 and self.backend.supports_config_key(key)
             )
+        if key == "prefetch_indexing":
+            # Prefetches lower only to PTX (``CompileEnvironment.ptx_capability``).
+            return (
+                self.target_device_capability is not None
+                and self.backend.supports_config_key(key)
+            )
         if (
             key == "cross_loop_pipeline"
             and self.device is not None
@@ -1889,6 +2175,16 @@ class ConfigSpec:
                 f"cross_loop_pipeline is not supported by backend {self.backend_name!r}"
             )
         self.cross_loop_pipeline = EnumFragment(choices)
+
+    @property
+    def offers_megakernel(self) -> bool:
+        """Whether some config compiles this kernel as a megakernel: it has
+        cross-loop dependencies and its backend lowers a pipeline other than
+        root barriers between separate phases."""
+        fragment = self.cross_loop_pipeline
+        return fragment is not None and any(
+            choice != "barrier" for choice in fragment.choices
+        )
 
     @property
     def cute_l2_evict_last_store_policy_supported(self) -> bool:
@@ -1966,7 +2262,7 @@ class ConfigSpec:
             return
         properties = torch.cuda.get_device_properties(self.device)
         arch = properties.gcnArchName  # pyrefly: ignore [missing-attribute]
-        if arch.split(":")[0] != "gfx950":
+        if amd_base_arch(arch) != "gfx950":
             return
 
         block_sizes = cast("list[int]", config["block_sizes"])
@@ -2051,6 +2347,39 @@ class ConfigSpec:
                 continue
             new_num_threads[i] = fit_thread_count(num_thread, clamped[nt_spec.block_id])
         config["num_threads"] = new_num_threads
+
+    def _normalize_dsmem(self, config: dict[str, object]) -> None:
+        """Turn off the ``cross_loop_dsmem`` entries whose slabs break a limit
+        of the config alone (clusters of 2 to ``MAX_CLUSTER_SIZE``, one size
+        for every entry, ``MAX_DSMEM_ENTRIES`` entries, ``MAX_CLUSTER_SLAB``
+        bytes of slabs), in candidate order as codegen takes them, so they
+        never regenerate the kernel.  A candidate without slab facts keeps
+        its entry for codegen to check."""
+        flags = list(cast("list[bool]", config["cross_loop_dsmem"]))
+        # Set together from the candidates (``lower_to_device_ir``).
+        assert len(self.cross_loop_dsmem_slabs) == len(flags)
+        layout = DsmemLayout()
+        for index, (enabled, facts) in enumerate(
+            zip(flags, self.cross_loop_dsmem_slabs, strict=True)
+        ):
+            if not enabled:
+                continue
+            if facts is not None and not facts.carried:
+                flags[index] = False
+                continue
+            slab = None if facts is None else facts.evaluate(config)
+            if slab is None:
+                # Codegen checks its slab; it still takes an entry, and the
+                # count's limit needs no slab.
+                if layout.entries >= MAX_DSMEM_ENTRIES:
+                    flags[index] = False
+                else:
+                    layout.entries += 1
+            elif layout.refusal(*slab) is None:
+                layout.take(*slab)
+            else:
+                flags[index] = False
+        config["cross_loop_dsmem"] = flags
 
     def normalize(
         self,
@@ -2143,6 +2472,23 @@ class ConfigSpec:
         ):
             if _fix_invalid:
                 config.pop("cross_loop_pipeline", None)
+            elif self.cross_loop_pipeline_retired:
+                pipeline = config.pop("cross_loop_pipeline")
+                # Without the pipeline, cross_loop_tmem_prefetch has no
+                # candidates either (the other pipeline keys are dropped where
+                # they are normalized).
+                dropped = ""
+                if self.supports_config_key("cross_loop_tmem_prefetch") and (
+                    config.pop("cross_loop_tmem_prefetch", None) is not None
+                ):
+                    dropped = " and its cross_loop_tmem_prefetch"
+                log.warning(
+                    "Ignoring cross_loop_pipeline=%r%s: this kernel no longer "
+                    "has cross-loop dependencies (its prefetch-only roots' loads "
+                    "order no later write)",
+                    pipeline,
+                    dropped,
+                )
             else:
                 raise InvalidConfig(
                     "cross_loop_pipeline is available only for kernels "
@@ -2189,6 +2535,7 @@ class ConfigSpec:
             ("range_multi_buffers", self.range_multi_buffers, True),
             ("range_flattens", self.range_flattens, True),
             ("static_ranges", self.static_ranges, True),
+            ("cross_loop_tmem_prefetch", self.cross_loop_tmem_prefetch, True),
         ]:
             if not self.supports_config_key(name):
                 if name in config:
@@ -2267,9 +2614,10 @@ class ConfigSpec:
                 ("range_multi_buffers", self.range_multi_buffers),
                 ("range_flattens", self.range_flattens),
             ):
-                config[name] = mapping._reset_config_to_default(
-                    name, config.get(name, ()), block_ids=static_range_block_ids
-                )
+                if self.supports_config_key(name):
+                    config[name] = mapping._reset_config_to_default(
+                        name, config.get(name, ()), block_ids=static_range_block_ids
+                    )
 
         for name in (
             "loop_orders",
@@ -2285,15 +2633,24 @@ class ConfigSpec:
             "range_multi_buffers",
             "range_flattens",
             "static_ranges",
+            "cross_loop_tmem_prefetch",
+            "cross_loop_dsmem",
             "load_eviction_policies",
             "load_cache_modifiers",
             "store_cache_modifiers",
+            "cross_loop_inband_protocol",
             "indexing",
             "atomic_indexing",
+            "prefetch_indexing",
         ):
             value = config.get(name)
             if name == "load_eviction_policies" and value == "":
                 continue
+            # A hand-set override only (never searched): all off is no entry.
+            if name == "cross_loop_tmem_prefetch" and not any(
+                cast("list[bool]", value or [])
+            ):
+                value = None
             if not value:
                 config.pop(name, None)
 
@@ -2304,9 +2661,13 @@ class ConfigSpec:
             "load_eviction_policies",
             "load_cache_modifiers",
             "store_cache_modifiers",
+            "cross_loop_dsmem",
+            "cross_loop_inband_protocol",
             "indexing",
             "atomic_indexing",
+            "prefetch_indexing",
             "pallas_load_buffer_count",
+            "pallas_worklist_buffer_count",
             "pid_type",
             "num_sm_multiplier",
             "maxnreg",
@@ -2315,6 +2676,9 @@ class ConfigSpec:
         ):
             if not self.supports_config_key(name):
                 config.pop(name, None)
+        if self.prefetch_indexing.length == 0:
+            # No prefetch here can take the box form: the entry is unused.
+            config.pop("prefetch_indexing", None)
 
         if self.supports_config_key("num_warps"):
             config.setdefault("num_warps", DEFAULT_NUM_WARPS)
@@ -2356,10 +2720,46 @@ class ConfigSpec:
             config.setdefault(
                 "store_cache_modifiers", self.store_cache_modifiers.default()
             )
+        for key, flags, entry, valid in (
+            (
+                "cross_loop_dsmem",
+                self.cross_loop_dsmem,
+                "one bool per cluster candidate",
+                lambda value: type(value) is bool,
+            ),
+            (
+                "cross_loop_inband_protocol",
+                self.cross_loop_inband_protocol,
+                '"tagged" or "lamport" per Lamport candidate',
+                lambda value: value in INBAND_PROTOCOLS,
+            ),
+        ):
+            if not (self.supports_config_key(key) and flags.length > 0):
+                config.pop(key, None)
+                continue
+            values = config.setdefault(key, flags.default())
+            if (
+                not isinstance(values, (list, tuple))
+                or len(values) != flags.length
+                or not all(map(valid, values))
+            ):
+                if not _fix_invalid:
+                    raise InvalidConfig(
+                        f"{key} must be a list of {entry} "
+                        f"(expected {flags.length}, got {values!r})"
+                    )
+                config[key] = flags.default()
+            else:
+                config[key] = list(values)
         if self.supports_config_key("indexing"):
             config.setdefault("indexing", self.indexing.default())
         if self.supports_config_key("atomic_indexing"):
             config.setdefault("atomic_indexing", self.atomic_indexing.default())
+        if (
+            self.supports_config_key("prefetch_indexing")
+            and self.prefetch_indexing.length > 0
+        ):
+            config.setdefault("prefetch_indexing", self.prefetch_indexing.default())
         if config.get("host_tensor_descriptors"):
             indexing_values = (config.get("indexing"), config.get("atomic_indexing"))
             uses_tensor_descriptor = any(
@@ -2393,6 +2793,35 @@ class ConfigSpec:
                         f"{cross_loop_pipeline_fragment.choices!r}, got "
                         f"{cross_loop_pipeline!r}"
                     )
+            if (
+                self.inband_scatter
+                and config["cross_loop_pipeline"] == "dynamic"
+                and not ring_depth(config, self.backend_name)
+            ):
+                # Guard-skipped tasks mark their inband scatter's done words
+                # from each worker's lanes, which static and claimed roots
+                # keep; dynamic packets have none.
+                if _fix_invalid:
+                    config["cross_loop_pipeline"] = "static"
+                else:
+                    raise InvalidConfig(
+                        "inband scatters need cross_loop_pipeline='static', or "
+                        "'dynamic' with a ring (claimed roots)"
+                    )
+            # Only workers that own their tasks carry a dsmem transport
+            # (cross_loop_dsmem's C2): the barrier pipeline and dynamic packets
+            # (no ring) keep one tune point.
+            if "cross_loop_dsmem" in config and (
+                config["cross_loop_pipeline"] == "barrier"
+                or (
+                    config["cross_loop_pipeline"] == "dynamic"
+                    and not ring_depth(config, self.backend_name)
+                )
+            ):
+                config["cross_loop_dsmem"] = self.cross_loop_dsmem.default()
+        dsmem = config.get("cross_loop_dsmem")
+        if isinstance(dsmem, list) and any(dsmem):
+            self._normalize_dsmem(config)
         surface.normalize_recurrence_families(self, config, fix_invalid=_fix_invalid)
         surface.normalize_pre_pid_type(self, config, fix_invalid=_fix_invalid)
         indirect_modes = (
@@ -2477,6 +2906,42 @@ class ConfigSpec:
                 config.pop("pallas_load_buffer_count")
         else:
             config.pop("pallas_load_buffer_count", None)
+        if (
+            self.supports_config_key("pallas_worklist_buffer_count")
+            and config.get("pallas_worklist_grouping") in (1, 2)
+            and "pallas_worklist_buffer_count" in config
+        ):
+            values = config["pallas_worklist_buffer_count"]
+            expected = self.pallas_worklist_buffer_count.length
+            if (
+                not isinstance(values, list)
+                or len(values) != expected
+                or any(
+                    type(value) is not int or not 2 <= value <= 8 for value in values
+                )
+            ):
+                raise InvalidConfig(
+                    "pallas_worklist_buffer_count must be a list containing one "
+                    "buffer count (2 to 8) per input tensor "
+                    f"(expected {expected}, got {values!r})"
+                )
+            if expected == 0:
+                config.pop("pallas_worklist_buffer_count")
+        else:
+            config.pop("pallas_worklist_buffer_count", None)
+        if (
+            self.supports_config_key("pallas_worklist_bucket_rows")
+            and config.get("pallas_worklist_grouping") == 1
+            and "pallas_worklist_bucket_rows" in config
+        ):
+            value = config["pallas_worklist_bucket_rows"]
+            if type(value) is not int or value < 0:
+                raise InvalidConfig(
+                    "pallas_worklist_bucket_rows must be a non-negative int "
+                    f"(0 for no row buckets), got {value!r}"
+                )
+        else:
+            config.pop("pallas_worklist_bucket_rows", None)
         if (
             self.supports_config_key("pallas_pre_broadcast")
             and self.has_pallas_inner_loops
@@ -2648,6 +3113,22 @@ class ConfigSpec:
                 )
             config["advanced_controls_file"] = value
 
+        if "worker_registers" in config:
+            regs = config["worker_registers"]
+            if regs is None or (isinstance(regs, (list, tuple)) and not regs):
+                config.pop("worker_registers")
+            elif not isinstance(regs, (list, tuple)) or not all(
+                type(r) is int and MIN_REGISTERS <= r <= MAX_REGISTERS and r % 8 == 0
+                for r in regs
+            ):
+                raise InvalidConfig(
+                    "worker_registers must be a list of multiples of 8 in "
+                    f"[{MIN_REGISTERS}, {MAX_REGISTERS}] (setmaxnreg's range), "
+                    f"got {regs!r}"
+                )
+            else:
+                config["worker_registers"] = list(regs)
+
         if "epilogue_subtile" in config:
             val = config["epilogue_subtile"]
             # Normalize bool to int for backward compat
@@ -2700,8 +3181,13 @@ class ConfigSpec:
             # Only one range_warp_specializes per loop nest, take the first one
             # Prefer warp specialize on outermost loop
             nest_starts = [0]
-            if config.get("cross_loop_pipeline") == "static":
-                # Static cross-loop roots are sequential loop nests in one kernel.
+            if config.get("cross_loop_pipeline") == "static" or ring_depth(
+                config, self.backend_name
+            ):
+                # Static cross-loop roots are sequential loop nests in one kernel;
+                # under the ring (which takes the requests in place of Triton)
+                # each root's loop nest is one even when dynamic dispatch
+                # wraps the roots.
                 grid_ids = {*self.grid_block_ids}
                 nest_starts = [
                     i
@@ -2973,6 +3459,25 @@ class ConfigSpec:
                     num_items=0,
                 )
 
+    def _own_surface_keys(self) -> frozenset[str]:
+        """Surface config keys the backend may give fragments to: not the gated
+        generic keys (e.g. ``xcd_remap``), whose fields Helion builds itself."""
+        return self.search_surface.config_keys - _BACKEND_GATED_GENERIC_KEYS
+
+    def _surface_key_fragments(self) -> dict[str, ConfigSpecFragment]:
+        """Fragments the backend returns for its own surface's config keys.
+
+        The generic table already holds every ``tunable_fragments`` entry; a
+        surface's own ``fields()`` table gets these added, replacing its
+        fragment for the same key so the search and ``normalize``'s defaults
+        agree."""
+        own_keys = self._own_surface_keys()
+        return {
+            key: fragment
+            for key, fragment in self.backend_tunable_fragments.items()
+            if key in own_keys
+        }
+
     def _flat_fields(
         self,
     ) -> dict[str, BlockIdSequence[Any] | ConfigSpecFragment]:
@@ -2990,7 +3495,7 @@ class ConfigSpec:
             self, flash_pipeline_family=_flash_pipeline_family_override
         )
         if surface_fields is not None:
-            return surface_fields
+            return {**surface_fields, **self._surface_key_fragments()}
         fields: dict[str, BlockIdSequence[Any] | ConfigSpecFragment] = {
             "block_sizes": self.block_sizes,
         }
@@ -3033,6 +3538,11 @@ class ConfigSpec:
             fields["indexing"] = self.indexing
         if self.supports_config_key("atomic_indexing"):
             fields["atomic_indexing"] = self.atomic_indexing
+        if (
+            self.supports_config_key("prefetch_indexing")
+            and self.prefetch_indexing.length > 0
+        ):
+            fields["prefetch_indexing"] = self.prefetch_indexing
         if self.supports_config_key("host_tensor_descriptors") and (
             self.indexing.length > 0 or self.atomic_indexing.length > 0
         ):
@@ -3078,6 +3588,14 @@ class ConfigSpec:
             and self.store_cache_modifiers.length > 0
         ):
             fields["store_cache_modifiers"] = self.store_cache_modifiers
+        fields.update(
+            (key, flags)
+            for key, flags in (
+                ("cross_loop_dsmem", self.cross_loop_dsmem),
+                ("cross_loop_inband_protocol", self.cross_loop_inband_protocol),
+            )
+            if self.supports_config_key(key) and flags.length > 0
+        )
         if self.supports_config_key("num_threads"):
             fields["num_threads"] = self.num_threads
         if is_tileir:
@@ -3108,6 +3626,17 @@ class ConfigSpec:
                     fields["pallas_worklist_grouping"] = EnumFragment(
                         choices=VALID_PALLAS_WORKLIST_GROUPINGS
                     )
+                    if self.supports_config_key("pallas_worklist_bucket_rows"):
+                        fields["pallas_worklist_bucket_rows"] = EnumFragment(
+                            choices=AUTOTUNED_PALLAS_WORKLIST_BUCKET_ROWS
+                        )
+                    if (
+                        self.supports_config_key("pallas_worklist_buffer_count")
+                        and self.pallas_worklist_buffer_count.length > 0
+                    ):
+                        fields["pallas_worklist_buffer_count"] = (
+                            self.pallas_worklist_buffer_count
+                        )
             fields["pallas_loop_type"] = EnumFragment(choices=choices)
             if self.supports_config_key("pallas_emit_pipeline_group_size"):
                 fields["pallas_emit_pipeline_group_size"] = PowerOfTwoFragment(1, 16, 1)
@@ -3394,12 +3923,16 @@ class ConfigSpec:
             "range_multi_buffers",
             "range_flattens",
             "static_ranges",
+            "cross_loop_dsmem",
             "load_eviction_policies",
             "load_cache_modifiers",
             "store_cache_modifiers",
+            "cross_loop_inband_protocol",
             "indexing",
             "atomic_indexing",
+            "prefetch_indexing",
             "pallas_load_buffer_count",
+            "pallas_worklist_buffer_count",
         ):
             if not config.get(name):
                 config.pop(name, None)
@@ -3468,6 +4001,7 @@ class BlockSizeSpec(_PowerOfTwoBlockIdItem):
         min_size: int = 1,
         max_size: int | None = None,
         bounded_by_block_id: int | None = None,
+        data_dependent: bool = False,
     ) -> None:
         super().__init__([block_id])
         self.size_hint = size_hint
@@ -3512,6 +4046,7 @@ class BlockSizeSpec(_PowerOfTwoBlockIdItem):
         # raised this block's, ``None`` where it did not
         # (``drop_occupancy_floor``).
         self.occupancy_floor: tuple[int, int] | None = None
+        self.data_dependent: bool = data_dependent
         if self.max_size < self.min_size:
             self.max_size = self.min_size
         assert self.min_size <= self.max_size
@@ -3797,6 +4332,11 @@ class ReductionLoopSpec(_PowerOfTwoBlockIdItem):
                 default = high
         return BlockSizeFragment(low, high, default)
 
+    def _fragment(self, base: ConfigSpec) -> BlockSizeFragment:
+        # cardinality() reaches items through _fragment; this item's fragment is
+        # the flat one, so expose it under both names.
+        return self._flat_fragment(base)
+
     def _flat_config(
         self, base: ConfigSpec, fn: Callable[[ConfigSpecFragment], object]
     ) -> int | None:
@@ -3991,10 +4531,10 @@ class CuteLaneLayoutSpec(_BlockIdItem):
         return "blocked"
 
 
-class CuteVectorWidthSpec(_BlockIdItem):
-    """Per-reduction-block vector load width for the CuTe backend.
+class VectorWidthSpec(_BlockIdItem):
+    """Per-reduction-block vector load width (the ``cute_vector_widths`` key).
 
-    V=1 disables vectorization (scalar loads). V=2/4/8/16 emits
+    V=1 disables vectorization (scalar loads). On CuTe, V=2/4/8/16 emits
     ``cute.arch.load(..., ir.VectorType.get([V], elem_dtype.mlir_type))``
     for the inner reduction load. SM100+ also admits 32-byte vectors.
     A persistent reduction row whose threads each hold a multiple of V
@@ -4029,6 +4569,11 @@ class CuteVectorWidthSpec(_BlockIdItem):
         return 1
 
 
+# Older name; CuTe code still uses it. Not public API (helion.backend_api
+# exports VectorWidthSpec).
+CuteVectorWidthSpec = VectorWidthSpec
+
+
 class _OptionalIntSpec(_BlockIdItem):
     def _normalize(self, name: str, value: object) -> int:
         if not isinstance(value, int):
@@ -4061,9 +4606,11 @@ class RangeUnrollFactorSpec(_OptionalIntSpec):
 
 class RangeWarpSpecializeSpec(_OptionalBoolSpec):
     # Set by ``lower_to_device_ir`` (``intra_loop_raw_reread_block_ids``) for
-    # a loop whose region stores and then re-reads the same storage: Triton's
-    # warp specialization splits such a body across partitions and the
-    # re-read observes stale memory.  The slot stays, so the config shape
+    # a loop whose region stores and then re-reads the same storage (also in a
+    # later iteration), or with ``Backend.intra_loop_barriers_order_reads``
+    # reads or stores and then overwrites it: Triton's warp specialization
+    # splits such a body across partitions and the barrier between the two
+    # accesses no longer orders them.  The slot stays, so the config shape
     # does not depend on the analysis, but its value is pinned to None.
     pinned: bool = False
 
@@ -4106,7 +4653,7 @@ class RangeFlattenSpec(_OptionalBoolSpec):
     pass
 
 
-class StaticRangeSpec(_BlockIdItem):
+class _BoolSpec(_BlockIdItem):
     def _fragment(self, base: ConfigSpec) -> BooleanFragment:
         return BooleanFragment()
 
@@ -4118,6 +4665,15 @@ class StaticRangeSpec(_BlockIdItem):
     def _fill_missing(self) -> bool:
         """Provide a value when not provided by the user."""
         return False
+
+
+class StaticRangeSpec(_BoolSpec):
+    pass
+
+
+class CrossLoopTmemPrefetchSpec(_BoolSpec):
+    """A candidate K loop (``Backend.tmem_prefetch_candidates``): True streams
+    the last steps' weight tiles into the tensor memory its accumulators leave."""
 
 
 def _product(seq: Sequence[int]) -> int:

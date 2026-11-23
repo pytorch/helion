@@ -9,7 +9,6 @@ kernel below binds on CPU (no code generation) and checks the analysis.
 from __future__ import annotations
 
 import ast
-import os
 import types
 from typing import TYPE_CHECKING
 
@@ -22,6 +21,7 @@ from helion._compiler import scratch_tensors
 from helion._compiler.scratch_tensors import kernel_local_scratch
 from helion._compiler.triton.backend import TritonBackend
 from helion._testing import _get_backend
+from helion._testing import skipIfRefEagerMark
 from helion._testing import skipUnlessBackends
 from helion._testing.cute_codegen import cpu_bind
 from helion._testing.scratch_kernels import returned_unread_workspace
@@ -36,10 +36,7 @@ pytestmark = [
     pytest.mark.cpu_only,
     # The analysis reads the compiler's host function, which ref eager mode
     # (``HELION_INTERPRET=1``) never builds.
-    pytest.mark.skipif(
-        os.environ.get("HELION_INTERPRET") == "1",
-        reason="no host function in ref eager mode",
-    ),
+    skipIfRefEagerMark("no host function in ref eager mode"),
 ]
 
 

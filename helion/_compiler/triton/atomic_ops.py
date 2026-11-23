@@ -29,6 +29,8 @@ from ..ast_extension import statement_from_string
 from ..compile_environment import CompileEnvironment
 from ..host_function import HostFunction
 from ..indexing_strategy import SubscriptIndexing
+from ..loop_dependency_checker import INTRA_LOOP_RAW_BARRIER_META
+from ..loop_dependency_checker import emit_intra_loop_raw_barrier
 
 if TYPE_CHECKING:
     import ast
@@ -45,10 +47,28 @@ def _program_sync_supported() -> bool:
     return CompileEnvironment.current().backend_name != "tileir"
 
 
+def _sync_before(state: CodegenState, target: torch.Tensor) -> None:
+    """The barrier ``mark_intra_loop_raw_barriers`` asks for before an atomic,
+    which reads its target (another thread's store to it, earlier in the body
+    or in an earlier iteration, may still be pending), else the release
+    barrier; the former does what the latter would."""
+    if state.fx_node is not None and state.fx_node.meta.get(
+        INTRA_LOOP_RAW_BARRIER_META
+    ):
+        # A release takes the full barrier, which a read barrier is not.
+        emit_intra_loop_raw_barrier(state, target, full=_releases(state))
+    else:
+        _sync_before_release(state)
+
+
+def _releases(state: CodegenState) -> bool:
+    return _sem(state) in ("release", "acq_rel") and _program_sync_supported()
+
+
 def _sync_before_release(state: CodegenState) -> None:
     # Triton issues a scalar atomic from one thread; bar.sync puts every thread's
     # writes (TMA drained) before that release. Branches are uniform per program.
-    if _sem(state) in ("release", "acq_rel") and _program_sync_supported():
+    if _releases(state):
         for drain in state.device_function.async_store_drain():
             state.add_statement(drain)
         state.add_statement(statement_from_string("tl.debug_barrier()"))
@@ -91,7 +111,7 @@ def _codegen_common(
         raise exc.AtomicOnDeviceTensor(op)
 
     device_fn = state.device_function
-    _sync_before_release(state)
+    _sync_before(state, target)
     fx_node = state.fx_node
     epilogue_subtile_group_id = (
         None if fx_node is None else fx_node.meta.get("epilogue_subtile_group_id")
@@ -174,7 +194,7 @@ def _(state: CodegenState) -> ast.AST:
     # but increment the counter to keep per-op atomic_indexing aligned.
     device_fn = state.device_function
     device_fn.atomic_op_index += 1
-    _sync_before_release(state)
+    _sync_before(state, target)
 
     indices = SubscriptIndexing.create(state, target, index, for_store=True)
     name = state.device_function.tensor_arg(target).name

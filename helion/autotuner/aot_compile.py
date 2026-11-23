@@ -23,11 +23,13 @@ from __future__ import annotations
 
 import ast
 import inspect
+import io
 import logging
 from pathlib import Path
 import re
 import tempfile
 import textwrap
+import tokenize
 from typing import TYPE_CHECKING
 
 import torch
@@ -37,6 +39,7 @@ from .._compiler.compile_environment import (
 )
 from .._compiler.output_code_utils import _check_kernel_name_not_shadowed
 from .._compiler.output_code_utils import dependency_free_runtime_source
+from .._compiler.triton.backend import TritonBackend
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -150,6 +153,9 @@ def _is_supported_helion_import(import_line: str) -> bool:
     return import_line in {
         "import helion",
         "from helion.runtime import default_launcher as _default_launcher",
+        # The tensor maps of box-form prefetches, inlined as ``to_code``'s
+        # Helion-free output does (``TritonBackend.embedded_helper_source``).
+        TritonBackend().library_imports["helion_tensor_maps"],
     }
 
 
@@ -175,27 +181,27 @@ def _rename_config_symbols(body: str, kernel_name: str, config_idx: int) -> str:
     Appends ``_c<N>`` to: ``_helion_<kernel>``, the host wrapper
     ``def <kernel>(``, and every ``tl.constexpr`` constant.
     """
-    sfx = f"_c{config_idx}"
-
-    body = body.replace(f"_helion_{kernel_name}", f"_helion_{kernel_name}{sfx}")
-
-    body = re.sub(
-        rf"^(def ){kernel_name}\(",
-        rf"\g<1>_{kernel_name}{sfx}(",
-        body,
-        flags=re.MULTILINE,
+    suffix = f"_c{config_idx}"
+    device_name = f"_helion_{kernel_name}"
+    constexpr_names = set(
+        re.findall(r"^(_[A-Z][A-Z0-9_]*)\s*=\s*tl\.constexpr\(", body, re.MULTILINE)
     )
-
-    # Word-boundary rename, longest first so _BLOCK_SIZE_0_1 is renamed
-    # before _BLOCK_SIZE_0.
-    constexpr_names = re.findall(
-        r"^(_[A-Z][A-Z0-9_]*)\s*=\s*tl\.constexpr\(", body, re.MULTILINE
-    )
-    for name in sorted(constexpr_names, key=len, reverse=True):
-        # pyrefly: ignore [bad-specialization]
-        body = re.sub(rf"\b{re.escape(name)}\b", f"{name}{sfx}", body)
-
-    return body
+    tokens = []
+    for token in tokenize.generate_tokens(io.StringIO(body).readline):
+        name = token.string
+        if token.type == tokenize.NAME:
+            if name == device_name or name.startswith(f"{device_name}_"):
+                name = device_name + suffix + name[len(device_name) :]
+            elif name in constexpr_names:
+                name += suffix
+            elif (
+                name == kernel_name
+                and token.start[1] == 4
+                and token.line.startswith("def ")
+            ):
+                name = f"_{name}{suffix}"
+        tokens.append(token._replace(string=name))
+    return tokenize.untokenize(tokens)
 
 
 def _extract_heuristic_body(heuristic_code: str, kernel_name: str) -> str:
@@ -380,8 +386,6 @@ def generate_standalone_file(
         all_imports.add("import torch")
 
     if needs_runtime:
-        from .._compiler.triton.backend import TritonBackend
-
         launcher_info = TritonBackend().dependency_free_launcher_info
         supported_runtime_names = {
             launcher_info.launcher_symbol,
@@ -393,6 +397,9 @@ def generate_standalone_file(
                 f"{', '.join(sorted(unknown))}"
             )
         runtime_source = dependency_free_runtime_source(launcher_info)
+        all_imports.add("import types")
+    embedded = TritonBackend().embedded_helper_source("\n".join(bodies))
+    if embedded:
         all_imports.add("import types")
 
     # -- assemble -----------------------------------------------------------
@@ -413,6 +420,8 @@ def generate_standalone_file(
 
     if runtime_source is not None:
         parts.append(runtime_source)
+    if embedded:
+        parts.append(embedded)
     if dispatch_keys is not None:
         parts.extend(
             [

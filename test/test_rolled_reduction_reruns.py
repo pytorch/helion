@@ -12,7 +12,6 @@ saved while it rolled still loads.
 from __future__ import annotations
 
 import ast
-import os
 from typing import TYPE_CHECKING
 
 import pytest
@@ -20,6 +19,7 @@ import torch
 
 import helion
 from helion._testing import cpu_render_target
+from helion._testing import skipIfRefEagerMark
 from helion._testing import skipUnlessBackends
 from helion._testing.cute_codegen import cpu_bind
 import helion.language as hl
@@ -31,9 +31,7 @@ pytestmark = [
     pytest.mark.cpu_only,
     # The tests read the device IR and the generated code, which
     # HELION_INTERPRET=1 bypasses.
-    pytest.mark.skipif(
-        os.environ.get("HELION_INTERPRET") == "1", reason="requires compiler IR"
-    ),
+    skipIfRefEagerMark("requires compiler IR"),
     skipUnlessBackends(["triton", "cute"]),
 ]
 

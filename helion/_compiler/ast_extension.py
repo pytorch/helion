@@ -61,6 +61,7 @@ class ExtendedAST:
         _is_kernel_call: bool = False,
         _root_id: int | None = None,
         _compiler_inserted: bool = False,
+        _plan: object = None,
         **kwargs: object,
     ) -> None:
         super().__init__(**kwargs)
@@ -72,6 +73,9 @@ class ExtendedAST:
         # Set on host statements a backend rewrite added (not user source);
         # user-facing warnings about host tensor operations skip them.
         self._compiler_inserted: bool = _compiler_inserted
+        # A backend's analysis result for the code this node emits (the gluon
+        # backend's ``dot_input`` on a load): kept through copies and clones.
+        self._plan: object = _plan
 
     def new(self, fields: dict[str, object]) -> ExtendedAST:
         result = self.__class__(
@@ -82,6 +86,7 @@ class ExtendedAST:
             _is_kernel_call=self._is_kernel_call,
             _root_id=self._root_id,
             _compiler_inserted=self._compiler_inserted,
+            _plan=self._plan,
         )
         return self._location.to_ast(result)
 

@@ -15,6 +15,7 @@ from helion._compiler.fragment_call import _fragment_call_input
 from helion._compiler.fragment_call import _fragment_call_inputs
 from helion._testing import cpu_render_target
 from helion._testing import onlyBackends
+from helion._testing import skipIfRefEager
 from helion._testing.binding_observation import observe_compiled_binding
 from helion.autotuner import BooleanFragment
 from helion.autotuner.config_fragment import ConfigSpecFragment
@@ -30,6 +31,7 @@ HELPER_CALLS = []
 
 @onlyBackends(["triton", "cute"])
 @pytest.mark.parametrize("static_shapes", [False, True])
+@skipIfRefEager("reads compiler state, which ref mode does not build")
 def test_tensor_metadata_calls_do_not_register_fragment_guards(static_shapes):
     @helion.kernel(static_shapes=static_shapes, autotune_effort="none")
     def metadata(x):
@@ -152,6 +154,7 @@ def _frozenset_default_input(fragment):
         "frozenset_default",
     ],
 )
+@skipIfRefEager("reads compiler state, which ref mode does not build")
 def test_opaque_calls_guard_explicit_and_implicit_fragment_inputs(kind):
     tensor = torch.empty(17)
     if kind in ("bool", "int"):
@@ -286,6 +289,7 @@ def _has_callable_guard(bound):
 
 @onlyBackends(["triton", "cute"])
 @pytest.mark.parametrize("explicit", [False, True])
+@skipIfRefEager("reads compiler state, which ref mode does not build")
 def test_fragment_free_function_uses_existing_dispatch_key(explicit):
     x = torch.empty(17)
     kernel = helion.kernel(_callable_default_input.fn, autotune_effort="none")
@@ -309,6 +313,7 @@ def test_fragment_free_function_uses_existing_dispatch_key(explicit):
 
 @onlyBackends(["triton", "cute"])
 @pytest.mark.parametrize("kind", ["default", "kwdefault", "closure"])
+@skipIfRefEager("reads compiler state, which ref mode does not build")
 def test_empty_function_input_still_rebinds_when_fragment_is_added(kind):
     if kind == "default":
         fn = _default_input(None)
@@ -382,6 +387,7 @@ class _ClassVarDefault:
 
 @onlyBackends(["triton", "cute"])
 @pytest.mark.parametrize("holder_type", [_InitVarDefault, _ClassVarDefault])
+@skipIfRefEager("reads compiler state, which ref mode does not build")
 def test_dataclass_pseudo_fields_do_not_enter_opaque_call_guards(holder_type):
     holder = holder_type(ANCHOR)
 
@@ -419,6 +425,7 @@ def test_dataclass_pseudo_fields_do_not_enter_opaque_call_guards(holder_type):
         "constexpr_closure",
     ],
 )
+@skipIfRefEager("reads compiler state, which ref mode does not build")
 def test_unkeyed_empty_callable_inputs_keep_identity_guard(kind):
     value = _OpaqueDefault()
     if kind in ("opaque_default", "opaque_kwdefault"):
@@ -485,6 +492,7 @@ def test_unkeyed_empty_callable_inputs_keep_identity_guard(kind):
 
 @onlyBackends(["triton", "cute"])
 @pytest.mark.parametrize("kind", ["default", "closure"])
+@skipIfRefEager("reads compiler state, which ref mode does not build")
 def test_constexpr_custom_fragment_keeps_callable_identity_guard(kind):
     if kind == "default":
         wrapped = hl.constexpr(RECEIVER_ANCHOR)
@@ -548,6 +556,7 @@ class _NullEqualFragment(ConfigSpecFragment):
 
 
 @onlyBackends(["triton", "cute"])
+@skipIfRefEager("reads compiler state, which ref mode does not build")
 def test_primitive_constexpr_can_be_replaced_by_equal_custom_fragment():
     captured = hl.constexpr(None)
 
@@ -579,6 +588,7 @@ def test_primitive_constexpr_can_be_replaced_by_equal_custom_fragment():
 
 @onlyBackends(["triton", "cute"])
 @pytest.mark.parametrize("kind", ["dataclass", "container"])
+@skipIfRefEager("reads compiler state, which ref mode does not build")
 def test_empty_opaque_constexpr_default_detects_later_fragment(kind):
     holder = _IdentityDefault()
     wrapped = hl.constexpr(holder if kind == "dataclass" else (holder,))
@@ -632,6 +642,7 @@ def _unused_empty_cell_callback():
 
 @onlyBackends(["triton", "cute"])
 @pytest.mark.parametrize("kind", ["direct", "opaque", "constexpr", "default"])
+@skipIfRefEager("reads compiler state, which ref mode does not build")
 def test_empty_callback_cell_binds_and_tracks_later_filling(kind):
     callback = _unused_empty_cell_callback()
     original = callback
@@ -669,6 +680,7 @@ def test_empty_callback_cell_binds_and_tracks_later_filling(kind):
 
 @onlyBackends(["triton", "cute"])
 @pytest.mark.parametrize("action", ["fill", "delete"])
+@skipIfRefEager("checks a compile-time error, which ref mode does not raise")
 def test_lifted_closure_rejects_changes_to_cell_occupancy(action):
     value = None
 

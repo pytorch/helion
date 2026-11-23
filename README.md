@@ -22,6 +22,7 @@ the `HELION_BACKEND` environment variable or the `backend=` argument of
 * [Triton] (default): `HELION_BACKEND=triton`
 * [TileIR](#tileir-backend), for NVIDIA Blackwell GPUs: `HELION_BACKEND=tileir` (also set `ENABLE_TILE=1`)
 * [CuTe DSL](#cute-backend-cuda-13), for NVIDIA Blackwell GPUs: `HELION_BACKEND=cute`
+* [Gluon], for NVIDIA Blackwell (sm_10x) GPUs (experimental): `HELION_BACKEND=gluon` (needs Triton >= 3.8)
 * [Pallas], for Google TPUs: `HELION_BACKEND=pallas`
 * Metal, for Apple GPUs (experimental): `HELION_BACKEND=metal`
 * FlyDSL, for AMD GPUs (experimental): `HELION_BACKEND=flydsl`
@@ -33,6 +34,7 @@ def my_kernel(x: torch.Tensor) -> torch.Tensor:
 ```
 
 [Triton]: https://github.com/triton-lang/triton
+[Gluon]: https://github.com/triton-lang/triton/tree/main/python/tutorials/gluon
 [Pallas]: https://docs.jax.dev/en/latest/pallas/index.html
 
 The name *Helion* refers to the nucleus of a helium-3 atom, while *Triton*

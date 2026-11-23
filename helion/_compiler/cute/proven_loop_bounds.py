@@ -2,8 +2,16 @@
 
 The proof uses immutable scalar value snapshots, exact launch dimensions, and
 nonnegative signed-int32 intervals. A loop's induction value is at most end-1;
-when (end-start) is divisible by its step it is at most end-step. No memory
-contents or runtime tensor size hints are proof inputs.
+when (end-start) is divisible by its step it is at most end-step. The proof
+reads no memory contents and no runtime tensor size hints itself; a block grid
+is its caller's fact (``block_grid_dims``: the launch's exact grid, static or,
+from the tail peel, of an XYZ launch over input sizes the cache key fixes).
+
+With ``propagate_truths`` (the tail peel of sunk nests, ``peel_vector_tails``)
+the proof also reads the comparisons a kernel's own index masks lower to
+(``operator.lt(row, rows)``) and follows a predicate it proved through the
+names it is bound to: ``valid = row_ok & tile_ok`` and every ``x if valid else
+0`` that reads it.
 """
 
 from __future__ import annotations
@@ -69,9 +77,48 @@ class _Value:
 class _Context:
     values: dict[str, _Value] = field(default_factory=dict)
     upper: dict[int, _Form] = field(default_factory=dict)
+    # Names bound to a predicate the proof replaced by ``True``
+    # (``propagate_truths``).
+    truths: set[str] = field(default_factory=set)
 
     def copy(self) -> _Context:
-        return _Context(dict(self.values), dict(self.upper))
+        return _Context(dict(self.values), dict(self.upper), set(self.truths))
+
+    def forget(self, name: str) -> None:
+        """``name`` is bound again: drop what was proven of its value."""
+        self.values.pop(name, None)
+        self.truths.discard(name)
+
+
+_OPERATOR_COMPARISONS: dict[str, type[ast.cmpop]] = {
+    "lt": ast.Lt,
+    "le": ast.LtE,
+    "gt": ast.Gt,
+    "ge": ast.GtE,
+}
+
+
+def _operator_comparison(node: ast.Call) -> ast.Compare | None:
+    """``a < b`` for ``operator.lt(a, b)`` (``le`` / ``gt`` / ``ge`` likewise)."""
+    path = _call_path(node.func)
+    if (
+        path is None
+        or len(path) != 2
+        or path[0] != "operator"
+        or path[1] not in _OPERATOR_COMPARISONS
+        or len(node.args) != 2
+        or node.keywords
+    ):
+        return None
+    return ast.Compare(
+        left=node.args[0],
+        ops=[_OPERATOR_COMPARISONS[path[1]]()],
+        comparators=[node.args[1]],
+    )
+
+
+def _is_true(node: ast.expr) -> bool:
+    return isinstance(node, ast.Constant) and node.value is True
 
 
 @dataclass
@@ -82,6 +129,9 @@ class _Proof:
     intervals: dict[int, tuple[int, int]] = field(default_factory=dict)
     changed: int = 0
     ordinal: int = 0
+    # Also prove ``operator.lt``-style comparisons and replace the reads of
+    # names bound to a proven predicate (``_Context.truths``).
+    propagate_truths: bool = False
 
     def symbol(self, key: object, low: int, high: int) -> _Form:
         symbol = self.symbols.setdefault(key, len(self.symbols))
@@ -302,6 +352,36 @@ class _Proof:
                     return node.body
                 return node
 
+            def visit_Name(self, node: ast.Name) -> ast.AST:
+                # ``truths`` is empty without ``propagate_truths``.
+                if isinstance(node.ctx, ast.Load) and node.id in context.truths:
+                    proof.changed += 1
+                    return ast.copy_location(ast.Constant(value=True), node)
+                return node
+
+            def visit_Call(self, node: ast.Call) -> ast.AST:
+                if (
+                    proof.propagate_truths
+                    and (comparison := _operator_comparison(node)) is not None
+                    and proof.true_comparison(comparison, context)
+                ):
+                    proof.changed += 1
+                    return ast.copy_location(ast.Constant(value=True), node)
+                return self.generic_visit(node)
+
+            def visit_BinOp(self, node: ast.BinOp) -> ast.AST:
+                node = cast("ast.BinOp", self.generic_visit(node))
+                if (
+                    proof.propagate_truths
+                    and isinstance(node.op, ast.BitAnd)
+                    and _is_true(node.left)
+                    and _is_true(node.right)
+                ):
+                    # The ``&`` of two masks the proof replaced by ``True``.
+                    proof.changed += 1
+                    return ast.copy_location(ast.Constant(value=True), node)
+                return node
+
         return cast("ast.expr", Rewrite().visit(expression))
 
     def block(self, statements: list[ast.stmt], context: _Context) -> list[ast.stmt]:
@@ -312,20 +392,22 @@ class _Proof:
                 if isinstance(statement.targets[0], ast.Name):
                     target = statement.targets[0].id
                     value = self.value(statement.value, context)
-                    context.values.pop(target, None)
+                    context.forget(target)
                     if value is not None:
                         context.values[target] = value
+                    elif self.propagate_truths and _is_true(statement.value):
+                        context.truths.add(target)
                 else:
                     # Tuple results (for example packed arithmetic) need no
                     # interval inference, but every rebound name must forget
                     # its previous proof before subsequent predicates are read.
                     for target in _assigned_names(statement.targets[0]):
-                        context.values.pop(target, None)
+                        context.forget(target)
             elif isinstance(statement, ast.For):
                 induction = self.loop_value(statement, context)
                 local = context.copy()
                 for name in _assigned_names(statement):
-                    local.values.pop(name, None)
+                    local.forget(name)
                 if induction is not None:
                     value, symbol, upper = induction
                     assert isinstance(statement.target, ast.Name)
@@ -333,7 +415,7 @@ class _Proof:
                     local.upper[symbol] = upper
                 statement.body = self.block(statement.body, local)
                 for name in _assigned_names(statement):
-                    context.values.pop(name, None)
+                    context.forget(name)
                 statement.orelse = self.block(statement.orelse, context.copy())
             elif isinstance(statement, ast.If):
                 statement.test = self.expression(statement.test, context)
@@ -347,16 +429,16 @@ class _Proof:
                 statement.body = self.block(statement.body, context.copy())
                 statement.orelse = self.block(statement.orelse, context.copy())
                 for name in _assigned_names(statement):
-                    context.values.pop(name, None)
+                    context.forget(name)
             elif isinstance(statement, ast.With):
                 local = context.copy()
                 for item in statement.items:
                     if item.optional_vars is not None:
                         for name in _assigned_names(item.optional_vars):
-                            local.values.pop(name, None)
+                            local.forget(name)
                 statement.body = self.block(statement.body, local)
                 for name in _assigned_names(statement):
-                    context.values.pop(name, None)
+                    context.forget(name)
             elif isinstance(statement, ast.Expr):
                 statement.value = self.expression(statement.value, context)
             output.append(statement)
@@ -405,8 +487,16 @@ def simplify_proven_loop_bounds(
     thread_block_dims: tuple[int, int, int] | None,
     constexpr_values: dict[str, int],
     block_grid_dims: tuple[int, int, int] | None = None,
+    propagate_truths: bool = False,
 ) -> list[ast.stmt]:
-    """Keep unknown arithmetic, partial tiles, and all memory-derived bounds."""
+    """Keep unknown arithmetic, partial tiles, and all memory-derived bounds.
+
+    ``block_grid_dims`` is the launch's exact block grid, which the caller
+    vouches for (the architectural limits bound ``block_idx`` without it).
+    ``propagate_truths`` also proves ``operator.lt``-style comparisons and
+    replaces the reads of names bound to a proven predicate.  The loops of
+    ``body`` are rewritten in place: a caller may keep a reference to one
+    and read the result there (``peel_vector_tails``)."""
     if not enabled or thread_block_dims is None or len(thread_block_dims) != 3:
         return body
     if any(type(size) is not int or not 0 < size <= 1024 for size in thread_block_dims):
@@ -447,7 +537,9 @@ def simplify_proven_loop_bounds(
         for node in ast.walk(module)
     ):
         return body
-    proof = _Proof(thread_block_dims, block_grid_dims)
+    proof = _Proof(
+        thread_block_dims, block_grid_dims, propagate_truths=propagate_truths
+    )
     context = _Context(
         {
             name: _Value(value, value, _Form(value))

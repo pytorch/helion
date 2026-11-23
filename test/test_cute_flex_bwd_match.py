@@ -422,7 +422,7 @@ def test_softcap_jacobian_region_with_gradient_arithmetic(
     bound = _bind(_args(t, _causal, _softcap_20, score_mod_bwd))
     plan = _match_or_fail(bound).plan
     assert plan.grad_region is not None
-    assert "fbwd_mul_pairs_packed" in _render(bound)
+    assert "fbwd_mul_jacobian_packed" in _render(bound)
 
 
 def test_transformed_gradient_operands_keep_tensor_slots() -> None:
@@ -464,6 +464,30 @@ def test_bare_constant_gradient_region() -> None:
     assert region.output.kwargs["dtype"] == torch.float32
     assert region.output.meta["val"].dtype == torch.float32
     _render(bound)
+
+
+def _squared(score, b, h, q_idx, kv_idx):
+    return score * score
+
+
+def _squared_bwd(grad, score, b, h, q_idx, kv_idx):
+    # The VJP as traced from ``score * score``: one product per use.
+    return grad * score + grad * score
+
+
+def test_jacobian_reading_one_value_twice_renders() -> None:
+    """``grad * s + grad * s``: with the unit gradient both products become
+    ``s``, so the sum's two lowering inputs are one node. The renderer binds
+    one value per operand (merging repeats left one value for two input
+    names and the render failed)."""
+    bound = _bind(_args(_tensors(), _causal, _squared, _squared_bwd))
+    plan = _match_or_fail(bound).plan
+    assert plan.grad_region is not None
+    (add,) = (
+        node for node in plan.grad_region.graph.nodes if node.target is _aten.add.Tensor
+    )
+    assert add.args[0] is add.args[1]
+    assert "fbwd_mul_jacobian_packed" in _render(bound)
 
 
 def test_ragged_lengths_match() -> None:
@@ -1007,6 +1031,22 @@ def test_head_dim_192_persistent_tile_boundary_order() -> None:
     assert "storage.sV.get_tensor(_fbwd_epil" not in code
 
 
+def test_block_mask_for_a_longer_q_sequence_declines() -> None:
+    """A BlockMask built for 256 Q rows over a 128-row sequence lists a Q
+    block past M: the walk sizes its step table (and its Q coordinate maps)
+    from M, so that block's steps would overrun it. The backward declines
+    such tables (PyTorch's flex_attention rejects the mask too); the mask
+    built for the sequence still matches."""
+    t = _tensors(q_seq=128, kv_seq=256)
+    longer = create_block_mask(
+        _causal, None, None, 256, 256, device=str(_CPU), BLOCK_SIZE=128
+    )
+    reasons: list[str] = []
+    assert _match(_bind(_args(t, None, block_mask=longer)), reasons) is None
+    assert any("lists more Q blocks than M has" in r for r in reasons), reasons
+    assert _match(_bind(_args(t, _causal))) is not None
+
+
 def test_q_block_256_pads_the_step_table() -> None:
     # Ragged M with 256-row Q blocks: the last block's second 128-row tile
     # lies past M; the table and the hook bounds cover it.
@@ -1017,6 +1057,81 @@ def test_q_block_256_pads_the_step_table() -> None:
     assert plan.walk.q_block == 256
     assert plan.num_q_tiles == 3 and plan.num_q_tiles_padded == 4
     assert plan.max_steps == plan.group * 4
+
+
+def test_bound_under_the_profiler_matches() -> None:
+    """Bound inside a torch.profiler context, whose compile suppresses the
+    shape env's guards, the backward still matches: the BlockMask's block
+    sizes, ``hl.specialize``-d scalar arguments, still fold into the table
+    column index as the literal ``n_begin // 128``."""
+    with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU]):
+        bound = _bind(_args(_tensors(), _causal))
+    _match_or_fail(bound)
+
+
+def test_walk_past_the_q_sequence_spans_the_coordinate_tensors() -> None:
+    """A walk whose Q tiles reach past the sequence (here a 128-row sequence
+    under 256-row blocks) records the rows it spans, and the launcher spans
+    the Q / dO / dQ TMA coordinate tensors over them (a single-tile mode
+    divides into stride 0, wrapping the padded tile onto the first), the
+    sequence mode's stride set to its coordinate basis (a one-row
+    sequence's came as 0 too); a walk inside the sequence keeps the plain
+    maps."""
+    t = _tensors(q_seq=128, kv_seq=256)
+    wrapper = _wrapper_plan(_render(_bind(_args(t, _causal, block_size=(256, 128)))))
+    assert wrapper["flex_walk_q_rows"] == 256
+    host = _host_lines(wrapper)
+    one_row = _host_lines(
+        _wrapper_plan(_render(_bind(_args(_tensors(q_seq=1), _causal))))
+    )
+    for name in ("_fbwd_mQt", "_fbwd_mdOt", "_fbwd_mDQt"):
+        stride = f"stride=(*{name}.stride[:0], cute.E(1), *{name}.stride[1:])"
+        assert (
+            f"{name} = cute.make_tensor({name}.iterator, cute.make_layout("
+            f"(*{name}.shape[:0], 256, *{name}.shape[1:]), {stride}))"
+        ) in host
+        assert (
+            f"{name} = cute.make_tensor({name}.iterator, cute.make_layout("
+            f"(*{name}.shape[:0], 128, *{name}.shape[1:]), {stride}))"
+        ) in one_row
+    aligned = _wrapper_plan(_render(_bind(_args(_tensors(), _causal))))
+    assert "flex_walk_q_rows" not in aligned
+    assert "_fbwd_mQt = cute.make_tensor(" not in _host_lines(aligned)
+
+
+def _far_bias(score: Any, b: Any, h: Any, q_idx: Any, kv_idx: Any) -> torch.Tensor:
+    return score + (q_idx - kv_idx).abs().to(torch.float32)
+
+
+def test_entries_past_the_sequences_are_cleared_on_the_tiles_reaching_them() -> None:
+    """P (so dS too, which a Jacobian hook keeps 0) is cleared past the sequences, per
+    32-column chunk after its pass, on the steps whose tile reaches past one
+    -- the last KV tile of a ragged N (the thread's row checked) and the Q
+    tiles from ``q_seq // 128`` on (the lanes checked) -- with or without a
+    score_mod; an aligned walk renders no clear."""
+    ragged = _render(_bind(_args(_tensors(q_seq=257, kv_seq=257), _causal)))
+    clear = (
+        "if (cutlass.Int32(fbwd_m_tile_h) >= cutlass.Int32(2)) | "
+        "(cutlass.Int32(fbwd_n_tile) >= cutlass.Int32(2)):\n"
+        "{ind}_helion_flash_rt.fbwd_zero_past(cute.make_tensor(tLDrS[None, None, "
+        "fbwd_ch].iterator, cute.make_layout(32)), cutlass.Int32(cutlass.select_("
+        "cutlass.Int32(fbwd_n_tile) * cutlass.Int32(128) + cutlass.Int32(fbwd_thr_row) "
+        "< cutlass.Int32(257), cutlass.Int32(257) - cutlass.Int32(fbwd_m_tile_h) * "
+        "cutlass.Int32(128) - cutlass.Int32(tLDcS[None, None, fbwd_ch][0][1]), "
+        "cutlass.Int32(0))))"
+    )
+    # Both compute warpgroups, each with its masked and plain pass.
+    assert ragged.count(clear.format(ind=" " * 24)) == 4
+    jacobian = _render(
+        _bind(_args(_tensors(q_seq=192), None, _softcap_20, _softcap_20_bwd_scaled))
+    )
+    # Only the Q lanes reach past their sequence (N = 512 is aligned); dS
+    # needs no clear of its own.
+    assert "if cutlass.Int32(fbwd_m_tile_h) >= cutlass.Int32(1):\n" in jacobian
+    clears = [line for line in jacobian.splitlines() if "fbwd_zero_past(" in line]
+    assert clears and all("fbwd_zero_past(cute.make_tensor(tLDrS[" in c for c in clears)
+    assert "fbwd_thr_row) < cutlass.Int32(512)" not in jacobian
+    assert "fbwd_zero_past" not in _render(_bind(_args(_tensors(), None, _far_bias)))
 
 
 # -- the step table: one table per walk, or chunks of it ---------------------
@@ -1675,10 +1790,9 @@ def test_two_cta_table_chunks_the_walk() -> None:
         r"for fbwd_wb in cutlass\.range\(0, 51, 512, unroll=1\):",
         code,
     )
-    # The bitmaps hold the 512 Q blocks plus a sentinel for the blocks a
-    # BlockMask built for a longer Q lists past the sequence (17 words each,
-    # 51 in all); every index into them is clamped to the sentinel, so such
-    # entries never reach the mbarrier words after the bitmaps.
+    # The bitmaps hold the 512 Q blocks plus a sentinel (17 words each, 51 in
+    # all); every index into them is clamped to the sentinel, a guard behind
+    # the matcher's decline of tables wider than the sequence's Q blocks.
     assert "storage.sBits.get_tensor(cute.make_layout(51))" in code
     assert (
         "fbwd_x = cutlass.min(cutlass.Int32(_fbwd_full_idx[fbwd_tb, fbwd_th, fbwd_pt0, fbwd_j]), cutlass.Int32(512))"

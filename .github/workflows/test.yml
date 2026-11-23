@@ -402,7 +402,7 @@ jobs:
           # lane, to the CPUs), so pass it explicitly except as "-n auto" there.
           # Lanes: the CuTe modules marked cpu_only (source generation only,
           # about 80 worker-minutes) run on a CPU runner (matrix "lane": "cpu";
-          # it installs the cu130 torch wheel because Helion's CuTe codegen
+          # it installs the cu132 torch wheel because Helion's CuTe codegen
           # reads torch.version.cuda and the Linux cpu wheel ships no Triton;
           # no driver is needed), and the CuTe B200 shards deselect them. The
           # Triton backend's cpu_only tests are about five worker-minutes, less

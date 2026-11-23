@@ -4,16 +4,25 @@ from __future__ import annotations
 
 import ast
 from contextlib import ExitStack
+from contextlib import contextmanager
+import dataclasses
 import importlib.util
 import sys
+from types import MappingProxyType
+from types import SimpleNamespace
 from typing import TYPE_CHECKING
 from unittest.mock import patch
 
 import pytest
 
+from .cute_codegen import cuda_metadata_trace
+
 if TYPE_CHECKING:
     from collections.abc import Generator
+    from collections.abc import Mapping
     from pathlib import Path
+
+    from ..runtime.kernel import BoundKernel
 
 
 @pytest.fixture
@@ -43,6 +52,76 @@ def cpu_codegen() -> Generator[None, None, None]:
         yield
 
 
+# The config every Gluon ring test starts from: tensor-descriptor operands, one
+# persistent worker a SM, a two-stage ring (read-only: tests spread it).
+GLUON_RING_CONFIG: Mapping[str, object] = MappingProxyType(
+    {
+        "indexing": "tensor_descriptor",
+        "pid_type": "persistent_blocked",
+        "num_sm_multiplier": 1,
+        "num_stages": 2,
+    }
+)
+
+
+def gluon_tail_ring_config(
+    bound: BoundKernel, *, task_loop: int = -1, **extra: object
+) -> dict[str, object]:
+    """The ring config of the ``cross_loop_tmem_prefetch`` tests (their
+    ``scale_then_*`` kernels): the ``task_loop``-th
+    warp-specializable loop warp-specialized, 128-row weight tiles over K steps
+    of 64, a four-stage ring; ``extra`` overrides."""
+    slots: list[bool | None] = [None] * len(bound.config_spec.range_warp_specialize)
+    slots[task_loop] = True
+    block_sizes = [32, 64, 128, 32, 64]
+    block_sizes += [64] * (len(bound.config_spec.block_sizes) - len(block_sizes))
+    return {
+        **GLUON_RING_CONFIG,
+        "block_sizes": block_sizes,
+        "range_warp_specializes": slots,
+        "cross_loop_pipeline": "static",
+        "num_warps": 4,
+        "num_stages": 4,
+        **extra,
+    }
+
+
+@contextmanager
+def gluon_cpu_codegen() -> Generator[None, None, None]:
+    """Generate Gluon (``backend="gluon"``) source in a CPU-only process for a
+    148-SM sm100 target: kernels trace on ``cuda:0`` as on the GPU
+    (``cute_codegen.cuda_metadata_trace``, so kernels with cross-loop
+    dependencies bind), the Gluon, warp-specialization and tensor-descriptor
+    probes report support, the ring lowering sees 2048 thread slots a SM, the
+    dsmem transports' residency probe sees every SM in clusters of any size
+    (``_cluster_capacity``), and initializing CUDA fails the test."""
+    device = SimpleNamespace(max_threads_per_multi_processor=2048)
+    with ExitStack() as stack:
+        stack.enter_context(cuda_metadata_trace())
+        for name, value in (
+            ("torch.cuda.get_device_properties", device),
+            ("helion._compat.supports_gluon", True),
+            ("helion._compat._supports_tensor_descriptor", True),
+            ("helion.language.loops._supports_warp_specialize", True),
+            ("helion.autotuner.config_spec.num_compute_units", 148),
+        ):
+            stack.enter_context(patch(name, return_value=value))
+        stack.enter_context(
+            patch(
+                "helion._compiler.cross_loop_dsmem.get_cluster_capacity",
+                side_effect=_cluster_capacity,
+            )
+        )
+        yield
+
+
+def _cluster_capacity(device: object, cluster_size: int) -> int:
+    """A model of ``launcher.get_cluster_capacity`` on a 148-SM GPU whose GPCs
+    all divide into clusters of any size (the driver's answer is smaller on
+    real parts: a GPC's leftover SMs stay idle)."""
+    return 148 // cluster_size * cluster_size
+
+
 def interpret_triton_selection(
     source: str,
     inputs: tuple[object, ...],
@@ -58,8 +137,18 @@ def interpret_triton_selection(
     """
     from triton.runtime.interpreter import InterpretedFunction
     from triton.runtime.interpreter import _patch_lang
+    from triton.runtime.interpreter import interpreter_builder
     from triton.runtime.jit import JITFunction
 
+    # Compiled kernels check integer overflow only in debug mode, and the
+    # ordered images (_emit_ordered_image) rely on unsigned wraparound. The
+    # interpreter checks by default, so turn that off to run the body as
+    # compiled.
+    monkeypatch.setattr(
+        interpreter_builder,
+        "options",
+        dataclasses.replace(interpreter_builder.options, sanitize_overflow=False),
+    )
     path.write_text(source)
     spec = importlib.util.spec_from_file_location("selection_interpreter_fixture", path)
     assert spec is not None and spec.loader is not None

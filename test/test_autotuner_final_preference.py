@@ -9,6 +9,11 @@ separates its back-to-back calls, and paid by its successor in the real call
 sequence.  The lowering is read off the finalist's rendered module: on the
 families that own their wait and release (tcgen05 here) every config ranks
 alike, so their finalists stay a plain tie.
+
+Behind those it ranks a kernel that flushes a packet with the streaming store
+policy (``cute_store_policy='streaming'``): the evict-first lines of its
+output are what the next kernel of the call sequence reads, and the kernel's
+own timing cannot see that either.
 """
 
 from __future__ import annotations
@@ -20,7 +25,6 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from test._cute_vloop_sink_kernels import col_reduce_sum_static
 from test.cute_population_contracts import tcgen05_mma_support
 from test.test_cute_pdl import _COLUMN_SUM
 from test.test_cute_tcgen05_fixed_chain import _bind_gemm
@@ -29,11 +33,14 @@ from test.test_cute_tcgen05_pdl import _persistent_config
 
 import helion
 from helion._compiler.cute.backend import CuteBackend
+from helion._compiler.cute.packet_flush_names import PACKET_FLUSH_STREAMING
+from helion._compiler.cute.packet_flush_names import streaming_store_rendered
 from helion._compiler.cute.pdl_release import generic_release_rendered
 from helion._compiler.triton.backend import TritonBackend
 from helion._testing import skipUnlessBackends
 from helion._testing.cute_codegen import cpu_bind
 from helion._testing.cute_codegen import mock_cuda_unavailable
+from helion._testing.cute_vloop_sink_kernels import col_reduce_sum_static
 from helion.autotuner.base_search import PopulationBasedSearch
 from helion.runtime.settings import Settings
 
@@ -79,6 +86,19 @@ _SPREAD = _module(
     + _BODY
 )
 _NONE = _module(_WAIT + _BODY)
+# A kernel whose packet flush took the streaming policy, and the plain flush.
+_STREAMING = _module(
+    _BODY + "    _cute_store_u32x4_streaming(out.iterator + pid_0 * 4, vals)\n"
+)
+_PLAIN_FLUSH = _module(
+    _BODY + "    _cute_store_u32_vec(out.iterator + pid_0 * 4, vals)\n"
+)
+_STREAMING_ENTRY = _module(
+    _WAIT
+    + _RELEASE
+    + _BODY
+    + "    _cute_store_u16x8_streaming(out.iterator + pid_0 * 8, vals)\n"
+)
 _EXIT = _module(_WAIT + _BODY + _RELEASE)
 _FAMILY = _module(_WAIT + _BODY + "    if warp_idx == 0:\n    " + _RELEASE)
 _OFF = _module(_BODY)
@@ -115,7 +135,8 @@ def test_the_generic_early_release_is_read_off_the_rendered_module() -> None:
     assert not generic_release_rendered(_FAMILY)
     assert not generic_release_rendered(_OFF)
     assert not generic_release_rendered("def not_a_kernel(): pass\n")
-    assert not generic_release_rendered("this is not python")
+    # (a module that does not parse)
+    assert not generic_release_rendered("def kernel(:")
 
 
 def test_cute_prefers_a_kernel_that_renders_the_generic_release() -> None:
@@ -141,6 +162,122 @@ def test_cute_prefers_a_kernel_that_renders_the_generic_release() -> None:
         )
         == 2
     )
+
+
+@skipUnlessBackends(["cute"])
+def test_the_streaming_flush_is_read_off_the_rendered_module() -> None:
+    for helper in PACKET_FLUSH_STREAMING.values():
+        assert streaming_store_rendered(_module(_BODY + f"    {helper}(p, vals)\n"))
+    for helper in PACKET_FLUSH_STREAMING:
+        assert not streaming_store_rendered(_module(_BODY + f"    {helper}(p, v)\n"))
+    assert streaming_store_rendered(_STREAMING_ENTRY)
+    assert not streaming_store_rendered(_PLAIN_FLUSH)
+    assert not streaming_store_rendered(_OFF)
+    # The import of a helper the kernel never calls is no streaming store.
+    assert not streaming_store_rendered(
+        "from helion._compiler.cute.l2_policy import store_u32x4_streaming"
+        " as _cute_store_u32x4_streaming\n" + _OFF
+    )
+
+
+@skipUnlessBackends(["cute"])
+def test_cute_ranks_a_streaming_store_behind_every_default_store() -> None:
+    # A kernel that flushes a streaming packet ranks three behind the same
+    # kernel with the default policy, so behind every kernel that stores
+    # with the default policy whatever it releases.
+    streaming = helion.Config(block_sizes=[64], cute_store_policy="streaming")
+    assert CuteBackend.finalist_preference(streaming, lambda: _STREAMING) == 5
+    both = helion.Config(block_sizes=[64], cute_store_policy="streaming", cute_pdl=True)
+    assert CuteBackend.finalist_preference(both, lambda: _STREAMING_ENTRY) == 4
+    # The policy on a kernel that flushes no such packet (scalar stores,
+    # narrower packets, a staged store) is the default policy's kernel.
+    assert CuteBackend.finalist_preference(streaming, lambda: _PLAIN_FLUSH) == 2
+    assert CuteBackend.finalist_preference(streaming, lambda: _OFF) == 2
+    assert CuteBackend.finalist_preference(both, lambda: _ENTRY) == 1
+    # A config with the default policy is never rendered for it.
+    never = Mock(side_effect=AssertionError("rendered"))
+    for policy in ("default", "l2_evict_last"):
+        config = helion.Config(block_sizes=[64], cute_store_policy=policy)
+        assert CuteBackend.finalist_preference(config, never) == 2
+
+
+@skipUnlessBackends(["cute"])
+def test_a_default_store_within_tolerance_wins_over_a_streaming_one() -> None:
+    # Three finalists of one layout 0.03% apart, two of them with streaming
+    # stores (the final selection of the GELU backward this rule was measured
+    # on): the default store wins.  One 2% behind does not, and a streaming
+    # config whose kernel flushes no packet ties as a default store.
+    fastest = _member(
+        92.69, _STREAMING, block_sizes=[512], cute_store_policy="streaming"
+    )
+    second = _member(
+        92.70,
+        _STREAMING,
+        block_sizes=[512],
+        cute_store_policy="streaming",
+        cute_min_blocks_per_mp=3,
+    )
+    default = _member(92.72, _PLAIN_FLUSH, block_sizes=[512])
+    far_default = _member(94.60, _PLAIN_FLUSH, block_sizes=[1024])
+    live = [fastest, second, default, far_default]
+    search = _search("cute", live)
+    assert search._prefer_backend_preference_within_tolerance(fastest, live) is default
+    search.log.assert_called_once()
+    # The band's streaming finalist was rendered; the default one was not.
+    assert search.kernel.renders == [fastest.config, second.config]
+    search = _search("cute", [fastest, second, far_default])
+    assert (
+        search._prefer_backend_preference_within_tolerance(
+            fastest, [fastest, second, far_default]
+        )
+        is fastest
+    )
+    search.log.assert_not_called()
+    inert = _member(92.60, _OFF, block_sizes=[32], cute_store_policy="streaming")
+    search = _search("cute", [inert, default])
+    assert (
+        search._prefer_backend_preference_within_tolerance(inert, [inert, default])
+        is inert
+    )
+    # The store ranks before the release: a default store that releases
+    # nothing wins over a streaming store that releases at entry.
+    releasing = _member(
+        92.65,
+        _STREAMING_ENTRY,
+        block_sizes=[256],
+        cute_store_policy="streaming",
+        cute_pdl=True,
+    )
+    search = _search("cute", [releasing, default])
+    assert (
+        search._prefer_backend_preference_within_tolerance(
+            releasing, [releasing, default]
+        )
+        is default
+    )
+
+
+def test_a_finalist_is_rendered_once_however_often_the_backend_reads_it() -> None:
+    # A rendering is a codegen pass: the hook gets the module on demand and
+    # may read it more than once.
+    class Rereads:
+        @classmethod
+        def finalist_preference(cls, config: helion.Config, source) -> int:
+            return 1 + len(source()) - len(source())
+
+    fastest = _member(3.640, block_sizes=[32])
+    close = _member(3.651, block_sizes=[64])
+    search = _search("triton", [fastest, close])
+    with patch(
+        "helion._compiler.backend_registry.get_backend_class", return_value=Rereads
+    ):
+        assert (
+            search._prefer_backend_preference_within_tolerance(
+                fastest, [fastest, close]
+            )
+            is fastest
+        )
+    assert search.kernel.renders == [fastest.config, close.config]
 
 
 def test_the_default_backend_prefers_nothing() -> None:

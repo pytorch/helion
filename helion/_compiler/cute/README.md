@@ -353,7 +353,8 @@ of the disk-cache key.  Two sets of module paths are byte-pinned:
 
 * the modules `CuteBackend.library_imports` writes into generated import lines
   (`atomic_helpers`, `aux_copy_layout`, `clc_helpers`, `cluster_helpers`,
-  `copysign`, `epilogue_helpers`, `exact_division`, `_flash_row_mma_runtime`,
+  `copysign`, `element_policy_loads`, `epilogue_helpers`, `exact_division`,
+  `_flash_row_mma_runtime`,
   `flex_score_mod_runtime`, `fold_helpers`, `grid_barrier`,
   `inline_asm_helpers`, `integer_helpers`, `join_cast`, `l2_policy`,
   `masked_packet_load`, `_mma_dag_runtime`, `packet_store_helpers`,

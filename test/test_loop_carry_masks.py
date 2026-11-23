@@ -10,7 +10,6 @@ only; test_masking.py runs the kernels.
 from __future__ import annotations
 
 import contextlib
-import os
 import re
 from unittest.mock import patch
 
@@ -20,6 +19,7 @@ import torch
 import helion
 from helion._testing import cpu_render_target
 from helion._testing import onlyBackends
+from helion._testing import skipIfRefEagerMark
 from helion._testing import skipUnlessBackends
 from helion._testing.cute_codegen import cpu_bind
 import helion.language as hl
@@ -28,10 +28,7 @@ from helion.runtime.settings import _get_backend
 pytestmark = [
     pytest.mark.cpu_only,
     skipUnlessBackends(["triton", "cute"]),
-    pytest.mark.skipif(
-        os.environ.get("HELION_INTERPRET") == "1",
-        reason="inspects generated code; ref mode has none",
-    ),
+    skipIfRefEagerMark("inspects generated code; ref mode has none"),
 ]
 
 

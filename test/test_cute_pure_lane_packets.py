@@ -11,12 +11,6 @@ import numpy as np
 import pytest
 import torch
 
-from test.test_cute_affine_vector_io import _Float32
-from test.test_cute_affine_vector_io import _Pointer
-from test.test_cute_affine_vector_io import _Tensor
-from test.test_cute_affine_vector_io import _Uint32
-from test.test_cute_affine_vector_io import _vector_load
-from test.test_cute_affine_vector_io import _vector_store
 from test.test_cute_philox_stream import _oracle
 
 import helion
@@ -27,6 +21,12 @@ from helion._compiler.cute.pure_lane_packets import is_pure_scalar_assembly
 from helion._compiler.rng_utils import philox_rand_ref
 from helion._testing import import_example
 from helion._testing import pairwise
+from helion._testing.cute_affine_vector_model import Float32 as _Float32
+from helion._testing.cute_affine_vector_model import Pointer as _Pointer
+from helion._testing.cute_affine_vector_model import Tensor as _Tensor
+from helion._testing.cute_affine_vector_model import Uint32 as _Uint32
+from helion._testing.cute_affine_vector_model import vector_load as _vector_load
+from helion._testing.cute_affine_vector_model import vector_store as _vector_store
 import helion.language as hl
 
 _examples_low_mem_dropout = import_example("low_mem_dropout")

@@ -24,6 +24,7 @@ from helion._testing import cpu_render_target
 from helion._testing import import_path
 from helion._testing import matchesBackends
 from helion._testing import onlyBackends
+from helion._testing import skipIfRefEager
 from helion._testing.cute_codegen import cpu_bind
 from helion._testing.selected_tunable import emitted_device_arguments
 from helion._testing.selected_tunable import nested_selected_float_results
@@ -67,6 +68,7 @@ def device_selected_default(x, fragment: hl.constexpr):
     "kind", ["host", "nested", "integer", "boolean", "fraction", "custom"]
 )
 @onlyBackends(["triton", "cute"])
+@skipIfRefEager("reads compiler state, which ref mode does not build")
 def test_omitted_registered_default_matches_explicit_render(kind):
     with cpu_render_target():
         if kind == "host":
@@ -109,6 +111,7 @@ def test_omitted_registered_default_matches_explicit_render(kind):
 
 @pytest.mark.parametrize("value", [0, False, -0.0])
 @onlyBackends(["triton", "cute"])
+@skipIfRefEager("reads compiler state, which ref mode does not build")
 def test_explicit_registered_value_does_not_call_default(value):
     with cpu_render_target():
         fragment = IdentityFragment(2.5)
@@ -124,6 +127,7 @@ def test_explicit_registered_value_does_not_call_default(value):
 
 
 @onlyBackends(["triton", "cute"])
+@skipIfRefEager("reads compiler state, which ref mode does not build")
 def test_minimize_keeps_custom_selection_and_removes_schedule_defaults():
     with cpu_render_target():
         fragment = IdentityFragment(-0.0)
@@ -149,6 +153,7 @@ def test_minimize_keeps_custom_selection_and_removes_schedule_defaults():
 
 
 @onlyBackends(["triton", "cute"])
+@skipIfRefEager("reads compiler state, which ref mode does not build")
 def test_host_selected_float_executes_without_device_context():
     x = torch.empty(17)
     with cpu_render_target():
@@ -295,6 +300,7 @@ def mixed_selected_scalar(x, nested: hl.constexpr, domain: hl.constexpr):
 @pytest.mark.parametrize("domain", [(2, 4.5), (4.5, 2)])
 @pytest.mark.parametrize("nested", [False, True])
 @onlyBackends(["triton", "cute"])
+@skipIfRefEager("reads compiler state, which ref mode does not build")
 def test_mixed_selected_scalar_keeps_selected_type(domain, nested):
     with cpu_render_target():
         bound = cpu_bind(mixed_selected_scalar, (torch.empty(17, 19), nested, domain))
@@ -325,6 +331,7 @@ def test_mixed_selected_scalar_keeps_selected_type(domain, nested):
 
 
 @onlyBackends(["triton", "cute"])
+@skipIfRefEager("reads compiler state, which ref mode does not build")
 def test_nested_boolean_capture_preserves_selected_scalar():
     with cpu_render_target():
         bound = cpu_bind(
@@ -381,6 +388,7 @@ def nested_selected_float(x, operation: hl.constexpr):
 
 @pytest.mark.parametrize("operation", ["direct", "divide", "negate"])
 @onlyBackends(["triton", "cute"])
+@skipIfRefEager("reads compiler state, which ref mode does not build")
 def test_nested_selected_float_preserves_signed_zero(operation):
     with cpu_render_target():
         bound = cpu_bind(nested_selected_float, (torch.empty(17, 19), operation))
@@ -434,11 +442,13 @@ def _check_selected_runtime_expressions(x, selected_values):
 
 
 @onlyBackends(["triton", "cute"])
+@skipIfRefEager("reads compiler state, which ref mode does not build")
 def test_selected_zero_keeps_runtime_expression_and_sign():
     _check_selected_runtime_expressions(torch.empty(17, 19), (-0.0, 0.0))
 
 
 @onlyBackends(["triton", "cute"])
+@skipIfRefEager("reads compiler state, which ref mode does not build")
 def test_selected_nonzero_float_keeps_runtime_precision():
     _check_selected_runtime_expressions(
         torch.empty(17, 19, dtype=torch.float64),
@@ -447,6 +457,7 @@ def test_selected_nonzero_float_keeps_runtime_precision():
 
 
 @onlyBackends(["triton", "cute"])
+@skipIfRefEager("reads compiler state, which ref mode does not build")
 def test_combined_selected_expressions_do_not_reuse_inner_alias():
     x = torch.empty(17, 38)[:, ::2]
     with cpu_render_target():
@@ -518,6 +529,7 @@ def _capture_compiled_modules(bound):
 
 @pytest.mark.parametrize("explicit_zero", [False, True])
 @onlyBackends(["triton"])
+@skipIfRefEager("reads compiler state, which ref mode does not build")
 def test_legacy_minimized_winner_clears_effective_default_cache(explicit_zero):
     with cpu_render_target():
         bound = cpu_bind(host_selected_float, (torch.empty(17),))
@@ -557,6 +569,7 @@ def test_legacy_minimized_winner_clears_effective_default_cache(explicit_zero):
 
 @pytest.mark.parametrize("reverse", [False, True])
 @onlyBackends(["triton", "cute"])
+@skipIfRefEager("reads compiler state, which ref mode does not build")
 def test_compiled_selected_zero_keeps_both_signs(reverse):
     with cpu_render_target():
         bound = cpu_bind(nested_selected_float_results, (torch.empty(17, 19),))
@@ -598,6 +611,7 @@ def test_compiled_selected_zero_keeps_both_signs(reverse):
 
 
 @onlyBackends(["triton", "cute"])
+@skipIfRefEager("reads compiler state, which ref mode does not build")
 def test_primed_selected_zero_keeps_source_and_render_state():
     with cpu_render_target():
         bound = cpu_bind(nested_selected_float_results, (torch.empty(17, 19),))
@@ -665,6 +679,7 @@ def test_external_compile_cache_preserves_nested_float_types_and_paths():
 
 @pytest.mark.parametrize("selected", [-0.0, 1.0])
 @onlyBackends(["triton", "cute"])
+@skipIfRefEager("reads compiler state, which ref mode does not build")
 def test_local_cache_persists_backend_key_for_minimized_config(tmp_path, selected):
     args = (torch.empty(17, 19),)
     with (
@@ -705,6 +720,7 @@ def test_local_cache_persists_backend_key_for_minimized_config(tmp_path, selecte
 
 @pytest.mark.parametrize("selected", [None, -0.0, 0.0, 1.0])
 @onlyBackends(["cute"])
+@skipIfRefEager("reads compiler state, which ref mode does not build")
 def test_minimized_winner_finalizes_existing_cute_launcher(selected):
     with cpu_render_target():
         if selected is None:
@@ -763,6 +779,7 @@ def selected_float_truncation(x, nested: hl.constexpr):
 
 @pytest.mark.parametrize("nested", [False, True])
 @onlyBackends(["triton", "cute"])
+@skipIfRefEager("reads compiler state, which ref mode does not build")
 def test_selected_float_truncation_emits_python_integer(nested):
     with cpu_render_target():
         bound = cpu_bind(selected_float_truncation, (torch.empty(3, 5), nested))

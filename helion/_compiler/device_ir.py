@@ -42,6 +42,7 @@ from ..autotuner.config_fragment import ConfigSpecFragment
 from ..autotuner.config_spec import FULL_EXTENT_CATEGORIES
 from ..autotuner.config_spec import SIZED_REDUCTION_CATEGORIES
 from ..autotuner.config_spec import VALID_CROSS_LOOP_PIPELINES
+from ..autotuner.config_spec import CrossLoopTmemPrefetchSpec
 from ..autotuner.config_spec import MatmulWithReductionEpilogueFact
 from ..autotuner.config_spec import ReductionCategory
 from ..autotuner.config_spec import ReductionDescriptor
@@ -70,6 +71,7 @@ from .compile_environment import _symint_expr
 from .compile_environment import warning
 from .container_identity import compare_container_identity
 from .container_identity import record_opaque_container_result
+from .cross_loop_dsmem import dsmem_slab_facts
 from .fragment_call import guard_fragment_call_input
 from .fragment_comparison import guard_fragment_comparison
 from .fx_side_effects import is_impure_node
@@ -204,6 +206,10 @@ def _get_custom_decomp_table() -> dict[torch._ops.OpOverload, Callable[..., obje
     # figure out the right Triton implementation for aten.cat. As a workaround, we disable
     # the decomp for aten.stack and implement aten.stack in Triton (codegen_stack) instead.
     decomp_table.pop(torch.ops.aten.stack.default, None)
+    # Every backend lowers aten.topk itself (topk_lowering). Inductor's table
+    # can decompose a small-k topk into argmax rounds and an aten.cat, which
+    # would bypass that lowering.
+    decomp_table.pop(torch.ops.aten.topk.default, None)
     # Override lerp.Scalar to avoid data-dependent guard on the weight parameter.
     decomp_table[torch.ops.aten.lerp.Scalar] = _lerp_scalar_decomp
     # Map F.gelu(x, approximate="tanh") to a single _gelu_tanh_approx FX
@@ -411,8 +417,8 @@ class ForLoopGraphInfo(NodeArgsGraphInfo):
     block_ids: list[int]
     # Precomputed by GenerateAST._compute_inter_loop_barriers: True iff a
     # tl.debug_barrier() must be emitted immediately before this for-loop's
-    # outer prefix to make global writes from the previous sibling for-loop
-    # in this scope visible.  Not copied across graph copies; recomputed.
+    # outer prefix to order the accesses of the previous sibling for-loops in
+    # this scope before its own.  Not copied across graph copies; recomputed.
     needs_barrier_before: bool = False
 
     @property
@@ -744,6 +750,17 @@ def device_loop_bounds(
     return value(begins[position]), value(ends[position])
 
 
+def _iter_loop_graphs(
+    device_ir: DeviceIR, graphs: Sequence[GraphInfo], block_ids: list[int]
+) -> Iterator[GraphInfo]:
+    grids = dict(zip(device_ir.root_ids, device_ir.grid_block_ids, strict=True))
+    for info in graphs:
+        if (isinstance(info, ForLoopGraphInfo) and info.block_ids == block_ids) or (
+            isinstance(info, RootGraphInfo) and grids.get(info.graph_id) == block_ids
+        ):
+            yield info
+
+
 def iter_loop_graph_nodes(
     fn: DeviceFunction, block_ids: list[int]
 ) -> Iterator[torch.fx.Node]:
@@ -753,25 +770,12 @@ def iter_loop_graph_nodes(
     ``_for_loop_step`` node is followed by the nodes of the nested for-loop
     graph it names (other nested graphs are not descended).  A graph belongs
     to the loop when it is the for-loop graph over ``block_ids`` or the root
-    graph of the phase whose grid block ids are ``block_ids``.  Reads only
-    ``fn.codegen.codegen_graphs`` and the current device IR's ``grid_block_ids``.
+    graph whose grid block ids are ``block_ids``.
     """
     from ..language._decorators import is_api_func
 
-    grid_block_ids = HostFunction.current().device_ir.grid_block_ids
     graphs = fn.codegen.codegen_graphs
     graph_by_id = {graph_info.graph_id: graph_info for graph_info in graphs}
-
-    def matches_loop(graph_info: GraphInfo) -> bool:
-        if isinstance(graph_info, ForLoopGraphInfo):
-            return graph_info.block_ids == block_ids
-        if not isinstance(graph_info, RootGraphInfo):
-            return False
-        phase_index = graph_info.phase_index
-        return (
-            0 <= phase_index < len(grid_block_ids)
-            and grid_block_ids[phase_index] == block_ids
-        )
 
     def walk(graph: torch.fx.Graph) -> Iterator[torch.fx.Node]:
         for node in graph.nodes:
@@ -786,9 +790,10 @@ def iter_loop_graph_nodes(
                     if nested is not None:
                         yield from walk(nested.graph)
 
-    for graph_info in graphs:
-        if matches_loop(graph_info):
-            yield from walk(graph_info.graph)
+    for graph_info in _iter_loop_graphs(
+        HostFunction.current().device_ir, graphs, block_ids
+    ):
+        yield from walk(graph_info.graph)
 
 
 class ReductionLoopGraphInfo(ForLoopGraphInfo):
@@ -4260,7 +4265,71 @@ def _register_atomic_tunables(atomic_count: int) -> None:
     )
 
 
-def _register_tensor_descriptor_layout_guards(device_ir: DeviceIR) -> None:
+def _number_prefetches(device_ir: DeviceIR) -> list[torch.fx.Node]:
+    """Give each prefetch its ``prefetch_indexing`` slot
+    (``memory_ops.PREFETCH_SLOT_META``), one per ``hl.prefetch`` in code
+    generation order, and return them in slot order.  It runs before
+    reduction rolling copies the nodes (copies keep their meta), so every
+    lowering of a prefetch reads its slot."""
+    from ..language import memory_ops
+
+    prefetches = list(
+        dict.fromkeys(
+            node
+            for _graph_id, node in codegen_node_order(
+                device_ir.graphs, device_ir.root_ids, unreached=False
+            )
+            if node.op == "call_function" and node.target is memory_ops.prefetch
+        )
+    )
+    for slot, node in enumerate(prefetches):
+        node.meta[memory_ops.PREFETCH_SLOT_META] = slot
+    return prefetches
+
+
+def _register_prefetch_tunables(
+    prefetches: list[torch.fx.Node], box_possible: list[torch.fx.Node]
+) -> None:
+    """Register the prefetch_indexing tunable, one entry per prefetch, when
+    some prefetch can take the box form (``Backend.prefetch_box_possible``):
+    for the others "tensor_descriptor" compiles what "pointer" does."""
+    if not box_possible:
+        return
+
+    from ..autotuner.config_fragment import EnumFragment
+    from ..autotuner.config_fragment import ListOf
+
+    env = CompileEnvironment.current()
+    env.config_spec.prefetch_indexing = ListOf(
+        EnumFragment(choices=env.config_spec.valid_prefetch_indexing_types()),
+        length=len(prefetches),
+    )
+
+
+def _box_possible_prefetches(prefetches: list[torch.fx.Node]) -> list[torch.fx.Node]:
+    """The prefetches some config can give the box form
+    (``Backend.prefetch_box_possible``)."""
+    env = CompileEnvironment.current()
+
+    def value(arg: object) -> object:
+        return arg.meta.get("val") if isinstance(arg, torch.fx.Node) else arg
+
+    result = []
+    for node in prefetches:
+        tensor, index, extra_mask = node.args
+        tensor = value(tensor)
+        assert isinstance(tensor, torch.Tensor)
+        assert isinstance(index, (list, tuple))
+        if env.backend.prefetch_box_possible(
+            tensor, [value(i) for i in index], extra_mask is not None
+        ):
+            result.append(node)
+    return result
+
+
+def _register_tensor_descriptor_layout_guards(
+    device_ir: DeviceIR, box_prefetches: list[torch.fx.Node]
+) -> None:
     env = CompileEnvironment.current()
 
     from .._compat import supports_tensor_descriptor
@@ -4290,6 +4359,13 @@ def _register_tensor_descriptor_layout_guards(device_ir: DeviceIR) -> None:
                 return True
         return False
 
+    # A box-form prefetch (``prefetch_indexing``) keys the kernel on its base's
+    # alignment (a misaligned base keeps the pointer form); its map needs
+    # nothing else.
+    for node in box_prefetches:
+        tensor = tensor_arg_value(node.args[0])
+        assert isinstance(tensor, torch.Tensor)
+        env.register_prefetch_alignment_guard(tensor)
     # The slots of the configs that roll no reduction; one that rolls can
     # reorder them (``BoundKernel`` maps them through
     # ``DeviceIR.config_memory_op_fact_pairs``).
@@ -4459,14 +4535,17 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
         if warp_specialize_specs:
             from .loop_dependency_checker import intra_loop_raw_reread_block_ids
 
-            # A loop that stores and then re-reads the same storage cannot be
-            # warp-specialized (see intra_loop_raw_reread_block_ids); its
-            # slot stays in the config space pinned to None.
+            # A loop that stores and then re-reads the same storage (or reads
+            # and then overwrites it) cannot be warp-specialized (see
+            # intra_loop_raw_reread_block_ids); its slot stays in the config
+            # space pinned to None.
             reread_block_ids = intra_loop_raw_reread_block_ids(
                 device_ir.graphs,
                 device_ir.root_ids,
                 device_ir.grid_block_ids,
                 atomics=backend.intra_loop_barriers_order_atomics,
+                carries=backend.intra_loop_barriers_carry_iterations,
+                reads=backend.intra_loop_barriers_order_reads,
             )
             for spec in warp_specialize_specs:
                 if reread_block_ids.intersection(spec.block_ids):
@@ -4511,6 +4590,7 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
             for block_id in unused_rdims:
                 block = CompileEnvironment.current().block_sizes[block_id]
                 block.retire_reduction()
+        prefetches = _number_prefetches(device_ir)
         device_ir.register_rollable_reductions()
         backend.register_search_surface(device_ir, config_spec)
         if len(device_ir.root_ids) > 1 and not backend.roots_fissioned(
@@ -4555,24 +4635,34 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
         if len(device_ir.task_families) > 1 and not env.backend.roots_fissioned(env):
             # Ranks check that they agree at the first launch, not here.
             group_name = env.process_group_name
+            group = (
+                _dist_utils._resolve_process_group(group_name)
+                if group_name is not None
+                else None
+            )
             device_ir.tile_dependency_graph = build_tile_dependency_graph(
                 tile_accesses,
                 device_ir=device_ir,
                 root_phases=source_root_phases,
                 world_size=(
-                    torch.distributed.get_world_size(
-                        _dist_utils._resolve_process_group(group_name)
-                    )
-                    if group_name is not None
-                    else 1
+                    torch.distributed.get_world_size(group) if group is not None else 1
                 ),
             )
             cross_rank = device_ir.tile_dependency_graph.crosses_ranks()
+            if config_spec.supports_config_key("cross_loop_inband_protocol"):
+                config_spec.cross_loop_inband_protocol.length = len(
+                    device_ir.tile_dependency_graph.lamport_candidate_ids
+                )
             _install_dependency_phases(
                 device_ir,
                 visitor.root_nodes,
                 device_ir.tile_dependency_graph,
                 source_phase_starts,
+            )
+            # Dropped hint edges were the kernel's only dependencies.
+            config_spec.cross_loop_pipeline_retired = (
+                bool(device_ir.tile_dependency_graph.unordered_hint_reads)
+                and not device_ir.implicit_dependency_starts
             )
             if device_ir.implicit_dependency_starts and not (
                 env.backend.lower_dependency_phases_as_ordered_launches(func, device_ir)
@@ -4595,15 +4685,18 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
                 )
                 env.require_persistent_blocked(reason)
                 # Peer transports order static and dynamic schedules alike; only
-                # static ones mark guard-skipped tasks for inband scatters.
+                # static ones, and dynamic ones with a gluon ring's claimed roots
+                # (ConfigSpec.normalize checks the config), mark guard-skipped
+                # tasks for inband scatters.
                 graph = device_ir.tile_dependency_graph
+                config_spec.inband_scatter = any(
+                    graph.scatter_position(allocation_id) is not None
+                    for allocation_id in graph.inband_allocation_ids
+                )
                 allowed = (
                     ("static", "dynamic") if cross_rank else VALID_CROSS_LOOP_PIPELINES
                 )
-                if any(
-                    graph.scatter_position(allocation_id) is not None
-                    for allocation_id in graph.inband_allocation_ids
-                ):
+                if config_spec.inband_scatter and env.backend_name != "gluon":
                     allowed = ("static",)
                 choices = tuple(
                     pipeline
@@ -4617,9 +4710,24 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
                         f"{allowed}",
                     )
                 config_spec.enable_cross_loop_pipeline(choices=choices)
+                if config_spec.supports_config_key("cross_loop_tmem_prefetch"):
+                    for block_ids in env.backend.tmem_prefetch_candidates(device_ir):
+                        config_spec.cross_loop_tmem_prefetch.append(
+                            CrossLoopTmemPrefetchSpec(block_ids)
+                        )
+                if config_spec.supports_config_key("cross_loop_dsmem"):
+                    config_spec.cross_loop_dsmem.length = len(graph.dsmem_candidate_ids)
+                    config_spec.cross_loop_dsmem_slabs = dsmem_slab_facts(
+                        graph, device_ir.root_ids
+                    )
         config_spec.multi_phase = len(device_ir.phases) > 1
         if config_spec.supports_config_key("pallas_load_buffer_count"):
             config_spec.pallas_load_buffer_count.length = sum(
+                isinstance(arg, torch.Tensor)
+                for arg in LiftGraphArgs(dict(func.params.arguments)).get_graph_args()
+            )
+        if config_spec.supports_config_key("pallas_worklist_buffer_count"):
+            config_spec.pallas_worklist_buffer_count.length = sum(
                 isinstance(arg, torch.Tensor)
                 for arg in LiftGraphArgs(dict(func.params.arguments)).get_graph_args()
             )
@@ -4637,7 +4745,9 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
             [f.indexing_index for f in memory_op_facts if f.kind == "store"],
         )
         _register_atomic_tunables(_count_device_atomics(device_ir))
-        _register_tensor_descriptor_layout_guards(device_ir)
+        box_prefetches = _box_possible_prefetches(prefetches)
+        _register_prefetch_tunables(prefetches, box_prefetches)
+        _register_tensor_descriptor_layout_guards(device_ir, box_prefetches)
 
         # Accumulator facts are a standalone, reduction-agnostic fact layer (any heuristic
         # may read them), so build them independently of the reduction facts. Must run

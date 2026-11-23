@@ -62,6 +62,7 @@ if TYPE_CHECKING:
     from .host_function import HostFunction
     from .inductor_lowering import CodegenState
     from .inductor_lowering import GenerateASTFromInductor
+    from .inductor_lowering import GraphInterpreter
     from .program_id import ProgramIDs
     from .reduction_strategy import BlockReductionStrategy
     from .reduction_strategy import ReductionEmitter
@@ -378,22 +379,67 @@ class Backend(abc.ABC):
     @property
     def supports_inter_loop_barriers(self) -> bool:
         """Whether a barrier can be placed between sibling device loops that
-        write and then read the same tensor (``needs_barrier_before``)."""
+        write and then read the same tensor (``needs_barrier_before``), or
+        with ``intra_loop_barriers_order_reads`` read and then write it."""
+        return False
+
+    @property
+    def orders_overlapping_inputs(self) -> bool:
+        """Whether the barrier walks order accesses through tensor arguments
+        that overlap at runtime as accesses of one storage
+        (``CompileEnvironment.input_storage_aliases``), so the cache key
+        partitions tensor arguments by overlap rather than by identity
+        (``_overlap_aliases``)."""
         return False
 
     def supports_intra_loop_barriers(self, *, in_divergent_control_flow: bool) -> bool:
-        """Whether a load that reads a tensor an earlier store of the same
-        body wrote can be preceded by a barrier; ``in_divergent_control_flow``
-        asks about a load inside a branch whose condition may differ across
-        the threads that would synchronize."""
+        """Whether a load that may read what a store wrote, earlier in the
+        same body, in an earlier iteration or through device pointers
+        (``mark_intra_loop_raw_barriers``), can be preceded by a barrier, as
+        can a write after a read or a store with
+        ``intra_loop_barriers_order_reads``; ``in_divergent_control_flow``
+        asks about an access inside a branch whose condition may differ
+        across the threads that would synchronize."""
         return False
 
     @property
     def intra_loop_barriers_order_atomics(self) -> bool:
-        """Whether a load after an atomic of its loop body takes the barrier
-        ``mark_intra_loop_raw_barriers`` asks for, as one after a store does;
-        a backend whose own barrier pass orders atomics says False."""
+        """Whether atomics take part in the barriers
+        ``mark_intra_loop_raw_barriers`` asks for: a load after an atomic of
+        its loop body takes one, as one after a store does, and so does an
+        atomic after a store (or an atomic it does not commute with) that may
+        reach its target; a backend whose own barrier pass orders atomics
+        says False."""
         return True
+
+    @property
+    def intra_loop_barriers_carry_iterations(self) -> bool:
+        """Whether a load in a device loop's body takes the barrier
+        ``mark_intra_loop_raw_barriers`` asks for when a store late in an
+        earlier iteration may reach it, as one after an earlier store of the
+        same iteration does; a backend whose own barrier pass orders the
+        accesses of consecutive iterations says False (the walk still carries
+        a loop that accesses memory through device pointers, which may reach
+        any storage)."""
+        return True
+
+    @property
+    def intra_loop_barriers_order_flat_loads(self) -> bool:
+        """Whether the barrier walk orders the packed quantized loads
+        (``flat_offset_loads``) as loads of anywhere in their tensor: a
+        pending store's barrier moves to such a load, so only a backend whose
+        packed-load codegen places the barrier the walk marks says True; with
+        False the hazard stays pending for the next access."""
+        return False
+
+    @property
+    def intra_loop_barriers_order_reads(self) -> bool:
+        """Whether a store (or atomic, or snippet) after another thread's read
+        of its storage takes the barrier ``mark_intra_loop_raw_barriers``
+        asks for, as does a later sibling loop that writes what an earlier
+        one read (a write-after-read); and a store after another thread's
+        store it may overwrite, and such a sibling loop (a write-after-write)."""
+        return False
 
     @property
     def lowers_chunk_unbind(self) -> bool:
@@ -634,6 +680,38 @@ class Backend(abc.ABC):
         lowerings read and write exactly the dimension keep the search
         ceiling at the extent.
         """
+        return False
+
+    @property
+    def tiles_exceed_extents(self) -> bool:
+        """Whether a tile may be larger than its dimension: a size-1 matmul
+        output dimension takes its configured block (``pads_small_matmul_dims``)
+        rather than 1, and a tensor descriptor's box may exceed the tensor
+        (TMA zero-fills a load's excess and drops a store's) and, along the
+        contiguous dimension, 256 elements (issued as several boxes)."""
+        return False
+
+    @property
+    def places_pdl_markers(self) -> bool:
+        """Whether the backend's finalize hooks (``finalize_device_body`` and
+        ``finalize_kernel_def``) take the kernel's entry markers
+        (``hl.prefetch_code`` and the PDL entry ops) and exit ops in the body and
+        place them themselves; otherwise they surround the final body."""
+        return False
+
+    @property
+    def uses_triton_compiler(self) -> bool:
+        """Whether kernels compile through Triton's compiler and GPU targets,
+        whose libdevice, inline PTX, descriptor legality checks and outlined
+        helpers Helion relies on (Triton and Gluon; not TileIR, whose Triton
+        front end feeds another compiler)."""
+        return False
+
+    @property
+    def compiler_pipelines_ranges(self) -> bool:
+        """Whether the compiler software-pipelines ``tl.range`` loops by their
+        ``num_stages`` (Triton's), issuing an iteration's loads ahead of the
+        body by data dependencies alone."""
         return False
 
     @property
@@ -968,11 +1046,46 @@ class Backend(abc.ABC):
 
         return VALID_CROSS_LOOP_PIPELINES
 
+    def tmem_prefetch_candidates(self, device_ir: DeviceIR) -> list[list[int]]:
+        """The block ids of each K loop ``cross_loop_tmem_prefetch`` may stream
+        into tensor memory (one config entry each), from the device IR and its
+        tile dependency graph.
+
+        Consulted only when the backend supports the
+        ``cross_loop_tmem_prefetch`` config key.
+        """
+        return []
+
+    def prefetch_box_possible(
+        self, tensor: torch.Tensor, index: Sequence[object], has_extra_mask: bool
+    ) -> bool:
+        """Whether ``hl.prefetch(tensor, index)`` lowers to TMA box prefetches
+        from a host-built tensor map under some config (``prefetch_indexing``
+        "tensor_descriptor"): the bound kernel then keys the base's alignment."""
+        return False
+
     # -- indexing, fake tensors and block-size constraints ---------------------
 
     def supports_block_ptr_indexing(self) -> bool:
         """Whether ``indexing="block_ptr"`` is a valid config value for this backend."""
         return True
+
+    def host_tensor_descriptors(self, config: Config) -> bool:
+        """Whether ``config``'s tensor descriptors are built on the host."""
+        return config.host_tensor_descriptors
+
+    def range_warp_specializes(self, config: Config) -> list[bool | None]:
+        """The loops whose warp specialization ``config`` asks the compiler for."""
+        return config.range_warp_specializes
+
+    def descriptor_call(self, method: str, desc: str, args: str) -> str:
+        """A tensor descriptor's ``load`` / ``store`` in generated code."""
+        return f"{desc}.{method}({args})"
+
+    def codegen_node(self, interp: GraphInterpreter, node: torch.fx.Node) -> object:
+        """This backend's own lowering of ``node``, or NotImplemented (its
+        ``Lowering``'s)."""
+        return NotImplemented
 
     # Generated-code helper functions with no side effects: dead-code
     # elimination may drop a scalar assignment whose value only calls them
@@ -1147,6 +1260,37 @@ class Backend(abc.ABC):
         """
         return False
 
+    def autotune_short_kernel_below_us(self, config_spec: ConfigSpec) -> float | None:
+        """Opt the autotuner's search into resolving short kernels.
+
+        The search times a candidate with a CUDA event pair around one
+        flushed launch, which reads in the event clock's steps (about 2 us
+        on a B200) and includes the launch latency, so configs of a kernel
+        of a few tens of microseconds read alike. A population search that
+        reads an initial population (the pattern, LFBO and
+        differential-evolution searches; not the LLM-guided search, which
+        times every batch as it comes and keeps the event timer) and whose
+        initial population's best config reads below the returned number of
+        microseconds reads that population once more and times every later
+        candidate in the benchmark worker from the CUDA activity trace
+        instead, as ``default_final_selection_regime``'s ``kernel`` does for
+        finalists (``PopulationBasedSearch._settle_candidate_timer``), and
+        its pattern search paths count a step smaller than the repeatability
+        of those readings as a tie (``PatternSearch._reading_tolerance``), as
+        the early stop of a differential-evolution search counts such a move
+        of its best reading as no improvement
+        (``DifferentialEvolutionSearch._stop_tolerance``). A
+        search whose best initial reading is at or above it (unless it is
+        behind a benchmark prelude, ``helion.autotuner.benchmark_prelude``,
+        where it moves to the trace whatever that reading), and every
+        search with ``None``, keeps the event timer and the fixed
+        ``min_improvement_delta``. A backend answers ``None`` for a search
+        that re-times its members with another timer than the benchmark
+        worker's (CuTe: the flash search, whose terminal refinement compares
+        members by mirrored wall-clock sweeps in this process).
+        """
+        return None
+
     def get_interleaved_bench(
         self,
     ) -> Callable[..., list[float]] | None:
@@ -1289,6 +1433,51 @@ class Backend(abc.ABC):
         search domain.
         """
         return False
+
+    def collapses_generated_source_aliases(self, config_spec: ConfigSpec) -> bool:
+        """Whether a search counts a source alias as the candidate it repeats.
+
+        A source alias is a candidate whose generated source an earlier
+        candidate of the run already produced (its result has the status
+        ``"deduplicated"``, so this needs
+        ``should_deduplicate_generated_sources``): a config that differs from
+        the earlier one only in settings the code does not depend on.  With
+        this hook a population search treats it as another config of the
+        kernel it repeats instead of a candidate of its own, wherever its
+        benchmark provider reports aliases; what follows from that is
+        described at ``PopulationBasedSearch._collapses_source_aliases``.
+        Off by default, which leaves every alias a candidate of its own.
+        """
+        return False
+
+    def simplified_selected_config(
+        self,
+        config_spec: ConfigSpec,
+        config: Config,
+        same_source: Callable[[Config], bool],
+    ) -> Config:
+        """A simpler config with the generated source of the selected one.
+
+        Called once after a search that drops source aliases
+        (``collapses_generated_source_aliases``) has selected ``config``.
+        Such a search times a kernel under the first config that produced
+        it, which may carry settings the code does not depend on.
+        ``same_source(candidate)`` says whether ``candidate`` may stand for
+        the selection: it passes the search's config filters as it is and
+        renders to the generated source of the kernel the search measured
+        (``False`` also once the autotune budget is used up, and for a
+        render that fails).  A backend resets settings of its choice that
+        can be inert and keeps each reset ``same_source`` accepts, so the
+        returned config, and a pin made from it, does not carry those
+        settings where the code does not depend on them.  It returns
+        ``config`` or a config ``same_source`` accepted: the search takes no
+        other.  It is no minimal config: a setting the backend does not try
+        stays as selected, whether the code depends on it or not (CuTe tries
+        ``load_eviction_policies`` only: each try is a render in the
+        autotuning process, and those policies are the setting a selection
+        most often carries without effect).  The default returns ``config``.
+        """
+        return config
 
     def classify_autotune_exception(self, err: BaseException) -> str | None:
         """Classify an exception that occurred during autotuning.
@@ -1634,6 +1823,12 @@ class Backend(abc.ABC):
         """
         ...
 
+    @property
+    def helper_decorator(self) -> str:
+        """Expression string for the decorator of the device helper functions a
+        kernel calls (combine functions, outlined helpers)."""
+        return "triton.jit"
+
     def function_decorator_for_args(self, args: Sequence[Argument]) -> str:
         """Expression string for the kernel function decorator.
 
@@ -1713,6 +1908,13 @@ class Backend(abc.ABC):
     ) -> ast.Module | None:
         """Optionally specialize standalone launch code for the bound workload."""
         return None
+
+    def standalone_entry_args(
+        self, bound: BoundKernel[Any], args: Sequence[object]
+    ) -> tuple[object, ...]:
+        """The arguments of a call of ``bound`` (``args``) that the entry point
+        of its standalone export takes. Default: all of them."""
+        return tuple(args)
 
     def capture_jax_launch_metadata(
         self, bound: BoundKernel[Any], config: Config | dict[str, object]
@@ -2323,8 +2525,9 @@ class Backend(abc.ABC):
         """Rewrite the rendered kernel body before variable renaming.
 
         Called by ``DeviceFunction.codegen_function_def`` once every statement
-        of the kernel body (preambles and computation, without explicit PDL
-        markers) is rendered and before ``ast_rename`` applies the loop-carried aliases.
+        of the kernel body (preambles and computation, plus the entry and exit
+        markers when ``places_pdl_markers``) is rendered and before
+        ``ast_rename`` applies the loop-carried aliases.
         Returns the body and the kernel parameters to append to the signature
         (``ctx.args`` is the signature so far).  Facts for
         ``finalize_kernel_def`` go on ``ctx``.  The default changes nothing.
@@ -2345,6 +2548,15 @@ class Backend(abc.ABC):
         nothing and returns ``[]``.
         """
         return []
+
+    def pipeline_loops(
+        self, body: list[ast.stmt], device_function: DeviceFunction
+    ) -> list[ast.stmt]:
+        """``body`` (a kernel's, after ``finalize_kernel_def``, or an outlined
+        helper's) with its loops software pipelined by the backend, or
+        constrained for the pipelining its compiler does (Triton's); the
+        default returns it unchanged."""
+        return body
 
     def validate_codegen_config(
         self, env: CompileEnvironment, device_ir: DeviceIR, config: Config
@@ -2802,14 +3014,9 @@ class Backend(abc.ABC):
             self, bound_kernel.settings.autotune_precompile
         )
 
-        if bound_kernel.settings.autotune_effort == "none" and (
-            force or not bound_kernel.kernel.configs
-        ):
-            return bound_kernel.config_spec.default_config()
+        if (config := bound_kernel._fixed_config(force=force)) is not None:
+            return config
         if not force and bound_kernel.kernel.configs:
-            if len(bound_kernel.kernel.configs) == 1:
-                (config,) = bound_kernel.kernel.configs
-                return config
             # We have finite predetermined configs, no need to precompile
             bound_kernel.settings.autotune_precompile = None
 

@@ -12,6 +12,7 @@ from helion._testing import code_and_output
 from helion._testing import onlyBackends
 from helion._testing import skipIfCudaCapabilityLessThan
 from helion._testing import skipIfNotCUDA
+from helion._testing import skipIfTileIR
 import helion.language as hl
 
 
@@ -24,6 +25,16 @@ def _dequant_e2m1(nibbles: torch.Tensor) -> torch.Tensor:
         torch.where(u < 6.0, u - 2.0, u * 2.0 - 8.0),
     )
     return abs_val * (1.0 - 2.0 * sign)
+
+
+def _assert_same_bits(actual: torch.Tensor, expected: torch.Tensor) -> None:
+    """Bitwise equality (NaNs only need to be NaN), so -0.0 and subnormals count."""
+    int_dtype = {2: torch.int16, 4: torch.int32}[actual.element_size()]
+    nan = torch.isnan(expected)
+    torch.testing.assert_close(torch.isnan(actual), nan)
+    torch.testing.assert_close(
+        actual[~nan].view(int_dtype), expected[~nan].view(int_dtype)
+    )
 
 
 @onlyBackends(["cute"])
@@ -177,7 +188,8 @@ class TestCuteQuantizedOps(RefEagerTestDisabled, TestCase):
 
 @onlyBackends(["triton"])
 class TestTritonQuantizedOps(RefEagerTestDisabled, TestCase):
-    @skipIfNotCUDA()
+    @unittest.skipIf(DEVICE.type != "cuda", "needs a CUDA or ROCm GPU")
+    @skipIfTileIR("TileIR's plain decode is untested")
     @skipIfCudaCapabilityLessThan(
         (10, 0), reason="FP4/FP8 conversion instructions require Blackwell"
     )
@@ -195,20 +207,26 @@ class TestTritonQuantizedOps(RefEagerTestDisabled, TestCase):
                 hi[tile] = hi_value
             return lo, hi
 
-        raw = torch.arange(16, dtype=torch.uint8, device=DEVICE) * 17  # 0x00..0xFF
+        # Every byte, so the low and high nibbles differ; bits catch -0.0.
+        raw = torch.arange(256, dtype=torch.uint8, device=DEVICE)
         code, (lo, hi) = code_and_output(
             fp4_to_f32_pair,
             (raw.view(torch.float4_e2m1fn_x2),),
         )
         raw_i32 = raw.to(torch.int32)
-        torch.testing.assert_close(lo, _dequant_e2m1(raw_i32 & 0xF))
-        torch.testing.assert_close(hi, _dequant_e2m1((raw_i32 >> 4) & 0xF))
+        _assert_same_bits(lo, _dequant_e2m1(raw_i32 & 0xF))
+        _assert_same_bits(hi, _dequant_e2m1((raw_i32 >> 4) & 0xF))
         self.assertIn(" = load.to(tl.int16)", code)
-        self.assertIn("[fp4_packed_", code)
-        self.assertIn("=f,=f,h", code)
-        self.assertIn("tl.inline_asm_elementwise", code)
+        if torch.version.hip is None:
+            self.assertIn("[fp4_packed_", code)
+            self.assertIn("=f,=f,h", code)
+            self.assertIn("tl.inline_asm_elementwise", code)
+        else:
+            # PTX does not lower on ROCm; the decode is plain arithmetic.
+            self.assertNotIn("tl.inline_asm_elementwise", code)
 
-    @skipIfNotCUDA()
+    @unittest.skipIf(DEVICE.type != "cuda", "needs a CUDA or ROCm GPU")
+    @skipIfTileIR("TileIR's plain decode is untested")
     @skipIfCudaCapabilityLessThan(
         (10, 0), reason="FP4 conversion instructions require Blackwell"
     )
@@ -230,19 +248,24 @@ class TestTritonQuantizedOps(RefEagerTestDisabled, TestCase):
                     out[tile, i] = lanes[i]
             return out
 
-        raw = torch.arange(16, dtype=torch.uint8, device=DEVICE) * 17
-        offsets = torch.tensor([0, 1], dtype=torch.int64, device=DEVICE)
+        raw = torch.arange(256, dtype=torch.uint8, device=DEVICE)
+        offsets = torch.arange(32, dtype=torch.int64, device=DEVICE)
         code, result = code_and_output(fp4_to_f16_lanes, (raw, offsets))
 
-        raw_i32 = raw.view(2, 8).to(torch.int32)
+        raw_i32 = raw.view(32, 8).to(torch.int32)
         nibbles = torch.stack((raw_i32 & 0xF, (raw_i32 >> 4) & 0xF), dim=-1)
-        expected = _dequant_e2m1(nibbles.reshape(2, 16)).to(torch.float16)
-        torch.testing.assert_close(result, expected)
+        expected = _dequant_e2m1(nibbles.reshape(32, 16)).to(torch.float16)
+        _assert_same_bits(result, expected)
         self.assertIn("tl.pointer_type(tl.uint64)", code)
-        self.assertIn("[fp4_qword_", code)
-        self.assertIn("=h,=h", code)
+        if torch.version.hip is None:
+            self.assertIn("[fp4_qword_", code)
+            self.assertIn("=h,=h", code)
+        else:
+            self.assertIn("fp4_qword_", code)
+            self.assertNotIn("tl.inline_asm_elementwise", code)
 
-    @skipIfNotCUDA()
+    @unittest.skipIf(DEVICE.type != "cuda", "needs a CUDA or ROCm GPU")
+    @skipIfTileIR("TileIR's plain decode is untested")
     @skipIfCudaCapabilityLessThan(
         (10, 0), reason="Packed BF16 conversion requires Blackwell"
     )
@@ -262,14 +285,24 @@ class TestTritonQuantizedOps(RefEagerTestDisabled, TestCase):
                     out[tile, i] = lanes[i]
             return out
 
-        values = torch.randn(32, dtype=torch.bfloat16, device=DEVICE)
+        # Distinct lanes plus the edge cases: signed zero, f16 subnormal and
+        # underflow, f16 overflow to inf, inf and NaN.
+        edges = [0.0, -0.0, 2.0**-24, 2.0**-30, 70000.0, -1e30, float("inf")]
+        edges += [float("-inf"), float("nan"), 65504.0, -3.5, 1e-40]
+        values = torch.cat([torch.randn(20), torch.tensor(edges)]).to(
+            device=DEVICE, dtype=torch.bfloat16
+        )
         offsets = torch.tensor([0, 1], dtype=torch.int64, device=DEVICE)
         code, result = code_and_output(bf16_to_f16_lanes, (values, offsets))
 
-        torch.testing.assert_close(result, values.view(2, 16).to(torch.float16))
+        _assert_same_bits(result, values.view(2, 16).to(torch.float16))
         self.assertIn("tl.pointer_type(tl.uint64)", code)
-        self.assertIn("[bf16_qword_", code)
-        self.assertIn("cvt.rn.f16.bf16", code)
+        if torch.version.hip is None:
+            self.assertIn("[bf16_qword_", code)
+            self.assertIn("cvt.rn.f16.bf16", code)
+        else:
+            self.assertIn("bf16_qword_", code)
+            self.assertNotIn("tl.inline_asm_elementwise", code)
 
 
 if __name__ == "__main__":

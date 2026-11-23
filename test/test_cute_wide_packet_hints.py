@@ -15,9 +15,14 @@ The GPU numerics are at the end of the module.
 from __future__ import annotations
 
 import ast
+import copy
 import importlib
+import logging
 import re
+import sys
+from types import SimpleNamespace
 from typing import Any
+from unittest.mock import Mock
 from unittest.mock import patch
 
 import pytest
@@ -39,13 +44,19 @@ from helion._testing import import_example
 from helion._testing import skipIfCudaCapabilityLessThan
 from helion._testing import skipIfNotCUDA
 from helion._testing.cute_codegen import cpu_bind
+from helion.autotuner.base_search import PopulationBasedSearch
+from helion.autotuner.base_search import PopulationMember
 from helion.autotuner.config_spec import ConfigSpec
+from helion.autotuner.metrics import AutotuneMetrics
 import helion.language as hl
+from helion.runtime.config_cache import ConfigCache
 
 rms_norm_fwd = import_example("rms_norm").rms_norm_fwd
 
-# CUDA hidden and native compilation forbidden; no device facts are modelled.
-pytestmark = pytest.mark.cpu_render(TargetFacts())
+# Source checks, in the CPU lane: CUDA hidden and native compilation
+# forbidden; no device facts are modelled.  The GPU numerics at the end of
+# the module are marked ``cuda``.
+pytestmark = [pytest.mark.cpu_only, pytest.mark.cpu_render(TargetFacts())]
 
 _HELPER = {
     "l2_last": "_cute_load_l2_evict_last",
@@ -261,6 +272,166 @@ for synthetic_lane_7 in cutlass.range_constexpr(8):
     assert (
         hinted.replace("_cute_load_l1_l2_evict_last_32b(", "cute.arch.load(") == plain
     )
+
+
+def _set_policies(config: helion.Config) -> list[int]:
+    policies = config.config["load_eviction_policies"]
+    assert isinstance(policies, list)
+    return [index for index, policy in enumerate(policies) if policy]
+
+
+@pytest.mark.parametrize(
+    "vec,threads,policies,kept,renders",
+    [
+        # 32-byte packets have no hinted L2 load without the knob: both
+        # policies are dead, and one render of the cleared config says so.
+        (8, 128, ["l2_last", "l2_last"], [], 1),
+        # The L1 priority reaches the 32-byte packet; the L2 policy does not.
+        (8, 128, ["last", "l2_last"], [0], 3),
+        # 16-byte packets take the hinted load: both policies are live.
+        (4, 256, ["l2_last", "l2_last"], [0, 1], 3),
+        # One live policy: the cleared render already answers for its slot.
+        (4, 256, ["l2_last", ""], [0], 1),
+    ],
+)
+def test_selected_config_keeps_only_the_policies_its_code_carries(
+    vec: int, threads: int, policies: list[str], kept: list[int], renders: int
+) -> None:
+    bound, _arguments = _bind_rows(torch.float32)
+    selected = _row_config(bound, threads=threads, vec=vec, policies=policies)
+    code = bound.to_code(selected)
+    asked: list[helion.Config] = []
+
+    def same_source(candidate: helion.Config) -> bool:
+        asked.append(candidate)
+        return bound.to_code(candidate) == code
+
+    simplified = CuteBackend().simplified_selected_config(
+        bound.config_spec, selected, same_source
+    )
+
+    assert _set_policies(simplified) == kept
+    assert len(asked) == renders
+    # The same kernel, and nothing but the policies changed.
+    assert bound.to_code(simplified) == code
+    assert {
+        key: value
+        for key, value in simplified.config.items()
+        if key != "load_eviction_policies"
+    } == {
+        key: value
+        for key, value in selected.config.items()
+        if key != "load_eviction_policies"
+    }
+    if kept == _set_policies(selected):
+        assert simplified is selected
+    # Every policy that stays is live: resetting it changes the code.
+    for index in kept:
+        values = list(simplified.config["load_eviction_policies"])  # type: ignore[call-overload]
+        values[index] = ""
+        reset = helion.Config(**{**simplified.config, "load_eviction_policies": values})  # type: ignore[arg-type]
+        assert bound.to_code(reset) != code
+
+
+def _selecting_search(
+    bound: Any, arguments: Any, selected: helion.Config
+) -> tuple[PopulationBasedSearch, PopulationMember]:
+    """A bare search over the real bound kernel that measured ``selected``;
+    returns it with the measured member."""
+    search = object.__new__(PopulationBasedSearch)
+    search.config_spec = bound.config_spec
+    search.config_gen = bound.config_spec.create_config_generation()
+    search.kernel = bound
+    search.settings = copy.copy(bound.settings)
+    search.args = arguments
+    search.benchmark_provider = SimpleNamespace(settles_source_aliases=lambda: True)  # type: ignore[assignment]
+    search.log = Mock()
+    search._kernels = {}
+    search._benchmarked_members = ConfigCache()
+    search._autotune_metrics = AutotuneMetrics()
+    measured = PopulationMember(
+        bound.compile_config(selected, allow_print=False),
+        [1.0],
+        search.config_gen.flatten(selected),
+        selected,
+        status="ok",
+    )
+    search._selected_member = measured
+    return search, measured
+
+
+def test_search_returns_the_selected_kernel_without_its_dead_policies() -> None:
+    """The search side with a real bound kernel: candidates are rendered in
+    process and compared with the measured kernel by generated-source
+    hash."""
+    bound, arguments = _bind_rows(torch.float32)
+    selected = _row_config(bound, threads=128, vec=8, policies=["last", "l2_last"])
+    search, measured = _selecting_search(bound, arguments, selected)
+
+    returned = search._simplified_selected_config(selected)
+
+    assert _set_policies(returned) == [0]
+    assert bound.to_code(returned) == bound.to_code(selected)
+    # The returned config stays linked to the kernel that was measured.
+    assert search._selected_member is not measured
+    assert search._selected_member.config == returned
+    assert search._selected_member.fn is measured.fn
+    assert search._selected_member.perfs == [1.0]
+    (message,) = [call.args[0] for call in search.log.call_args_list]
+    assert message.startswith("Returning a simpler config")
+    # A selection whose policies are all live comes back as it is.
+    live = _row_config(bound, threads=256, vec=4, policies=["l2_last", "l2_last"])
+    search, _measured = _selecting_search(bound, arguments, live)
+    assert search._simplified_selected_config(live) is live
+
+
+class _StderrHandler(logging.Handler):
+    """Writes records to whatever ``sys.stderr`` is when they are emitted,
+    as a console handler of the application would."""
+
+    def emit(self, record: logging.LogRecord) -> None:
+        sys.stderr.write(self.format(record) + "\n")
+        sys.stderr.flush()
+
+
+@pytest.mark.parametrize("ignore_errors", [True, False])
+def test_a_proposal_that_fails_to_render_leaves_the_console_alone(
+    ignore_errors: bool, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A proposal whose render raises inside the real ``compile_config``:
+    the runtime logs the failure with a traceback before it re-raises.  The
+    search captures that output for a candidate, and the step that renders
+    the proposals does the same, so under ``autotune_ignore_errors`` nothing
+    is printed, and otherwise only the step's own warning is logged.  The
+    proposals after the failing one are still tried."""
+    bound, arguments = _bind_rows(torch.float32)
+    selected = _row_config(bound, threads=128, vec=8, policies=["last", "l2_last"])
+    search, _measured = _selecting_search(bound, arguments, selected)
+    search.settings.autotune_ignore_errors = ignore_errors
+    render = bound.to_triton_code
+
+    def failing(config: helion.Config, **kwargs: Any) -> str:
+        if not _set_policies(config):
+            raise RuntimeError("the cleared config does not render")
+        return render(config, **kwargs)
+
+    runtime_log = logging.getLogger("helion.runtime.kernel")
+    handler = _StderrHandler()
+    runtime_log.addHandler(handler)
+    try:
+        with patch.object(bound, "to_triton_code", side_effect=failing):
+            returned = search._simplified_selected_config(selected)
+    finally:
+        runtime_log.removeHandler(handler)
+
+    assert _set_policies(returned) == [0]
+    assert "codegen error" not in capsys.readouterr().err
+    warnings = [call.args[0] for call in search.log.warning.call_args_list]
+    if ignore_errors:
+        assert warnings == []
+    else:
+        (warning,) = warnings
+        assert warning.startswith("Not taking ")
 
 
 def test_knob_is_a_cute_boolean() -> None:

@@ -11,6 +11,7 @@ import unittest
 from unittest.mock import patch
 import warnings
 
+import pytest
 import torch
 from torch import Tensor
 from torch._C._distributed_c10d import _SymmetricMemory
@@ -26,6 +27,9 @@ from torch.testing._internal.common_utils import run_tests
 from torch.testing._internal.distributed.fake_pg import FakeStore
 
 import helion
+from helion._compat import GLUON_REQUIREMENT
+from helion._compat import supports_gluon
+from helion._compiler import cross_loop_codegen
 from helion._compiler import tile_dependency
 from helion._dist_utils import all_gather_object
 from helion._dist_utils import kernel_uses_symm_mem
@@ -36,12 +40,18 @@ from helion._testing import EXAMPLES_DIR
 from helion._testing import TestCase
 from helion._testing import import_path
 from helion._testing import onlyBackends
+from helion._testing import pairwise
 from helion._testing import skipIfCudaCapabilityLessThan
 from helion._testing import skipIfNotCUDA
 from helion._testing import skipIfNotTriton
 from helion._testing import skipIfRefEager
 from helion._testing import skipIfTileIR
 from helion._testing import skipIfXPU
+from helion._testing.distributed_kernels import TAGGED_RING
+from helion._testing.distributed_kernels import pipelined_allreduce_kernel
+from helion._testing.distributed_kernels import remote_views as _remote_views
+from helion._testing.distributed_kernels import scatter_after_local_kernel
+from helion._testing.distributed_kernels import tagged_ring_exchange_kernel
 from helion.autotuner import search_algorithms
 from helion.autotuner.effort_profile import _PROFILES
 from helion.autotuner.effort_profile import AutotuneEffortProfile
@@ -106,18 +116,14 @@ def one_shot_allreduce_kernel(
     return out
 
 
-def _remote_views(
-    t: torch.Tensor, group_name: hl.constexpr
-) -> tuple[torch.Tensor, ...]:
-    return torch.ops.symm_mem.get_remote_tensors(t, group_name)
-
-
 def _with_pipeline(
-    kernel: helion.Kernel, args: tuple[object, ...], pipeline: str
+    kernel: helion.Kernel, args: tuple[object, ...], pipeline: str, **keys: object
 ) -> BoundKernel[object]:
     bound = kernel.bind(args)
     config = bound.config_spec.default_config().config
-    bound.set_config(helion.Config(**{**config, "cross_loop_pipeline": pipeline}))
+    bound.set_config(
+        helion.Config(**{**config, "cross_loop_pipeline": pipeline, **keys})
+    )
     return bound
 
 
@@ -235,6 +241,141 @@ def inband_rule_kernel(
 
 
 @helion.kernel(autotune_effort="none", static_shapes=True)
+def inband_gated_kernel(
+    symm: torch.Tensor,
+    credit: torch.Tensor,
+    x: torch.Tensor,
+    gate: torch.Tensor,
+    group_name: hl.ProcessGroupName,
+    variant: hl.constexpr,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """``symm`` travels only when ``gate`` is set; ``credit``, polled in full by
+    every rank, gives the mirrors their parity credit."""
+    peers = _remote_views(symm, group_name)
+    credit_peers = _remote_views(credit, group_name)
+    out = torch.zeros_like(symm)
+    total = torch.zeros_like(credit)
+    for tile in hl.tile(symm.size(0)):
+        if variant == "tile-mask":
+            last = tile.index < symm.size(0) - 1
+            hl.store(symm, [tile], x[tile], extra_mask=(gate[hl.arange(1)] != 0) & last)
+        else:
+            hl.store(symm, [tile], x[tile], extra_mask=gate[hl.arange(1)] != 0)
+        credit[tile] = x[tile]
+    for tile in hl.tile(symm.size(0)):
+        keep = (tile.index < symm.size(0)) & (gate[hl.arange(1)] != 0)
+        if variant in ("rank0", "rank1"):
+            # A term built from a rank constant, on the peer loads and the local
+            # store: ranks need not agree on it.
+            keep = keep & (gate[hl.arange(1)] != (2 if variant == "rank0" else 3))
+        acc = hl.zeros([tile], dtype=x.dtype)
+        tot = hl.zeros([tile], dtype=x.dtype)
+        for r in hl.static_range(len(peers)):
+            if variant == "R9":
+                acc = acc + peers[r][tile]
+            else:
+                acc = acc + hl.load(peers[r], [tile], extra_mask=keep)
+            tot = tot + credit_peers[r][tile]
+        hl.store(out, [tile], acc, extra_mask=keep)
+        total[tile] = tot
+        if variant == "written":
+            # A gate the kernel writes may change during the launch.
+            hl.store(gate, [hl.arange(1)], gate[hl.arange(1)])
+    return out, total
+
+
+@helion.kernel(autotune_effort="none", static_shapes=True)
+def inband_two_gates_kernel(
+    symm: torch.Tensor,
+    credit: torch.Tensor,
+    x: torch.Tensor,
+    gates: list[torch.Tensor],
+    group_name: hl.ProcessGroupName,
+) -> torch.Tensor:
+    """``inband_gated_kernel`` whose peer loads take another gate of the same
+    list than the store."""
+    peers = _remote_views(symm, group_name)
+    credit_peers = _remote_views(credit, group_name)
+    out = torch.zeros_like(symm)
+    for tile in hl.tile(symm.size(0)):
+        hl.store(symm, [tile], x[tile], extra_mask=gates[0][hl.arange(1)] != 0)
+        credit[tile] = x[tile]
+    for tile in hl.tile(symm.size(0)):
+        keep = (tile.index < symm.size(0)) & (gates[1][hl.arange(1)] != 0)
+        acc = hl.zeros([tile], dtype=x.dtype)
+        for r in hl.static_range(len(peers)):
+            acc = acc + hl.load(peers[r], [tile], extra_mask=keep)
+            acc = acc + credit_peers[r][tile]
+        hl.store(out, [tile], acc, extra_mask=keep)
+    return out
+
+
+@helion.kernel(autotune_effort="none", static_shapes=True)
+def inband_view_kernel(
+    symm: torch.Tensor,
+    x: torch.Tensor,
+    group_name: hl.ProcessGroupName,
+    view: hl.constexpr,
+) -> torch.Tensor:
+    """The store fills the buffer through another view than the peer loads."""
+    peers = _remote_views(symm, group_name)
+    out = torch.empty_like(symm)
+    # The store fills the buffer through a [16, 16] view, in either order.
+    symm2 = symm.view(16, -1).t() if view == "cols" else symm.view(-1, 16)
+    x2 = x.view(16, -1).t() if view == "cols" else x.view(-1, 16)
+    for rows, cols in hl.tile(symm2.size()):
+        symm2[rows, cols] = x2[rows, cols]
+    for tile in hl.tile(symm.size(0)):
+        acc = hl.zeros([tile], dtype=x.dtype)
+        for r in hl.static_range(len(peers)):
+            acc = acc + peers[r][tile]
+        out[tile] = acc
+    return out
+
+
+@helion.kernel(autotune_effort="none", static_shapes=True)
+def inband_partial_polls_kernel(
+    symm: torch.Tensor,
+    b: torch.Tensor,
+    c: torch.Tensor,
+    rows: torch.Tensor,
+    x: torch.Tensor,
+    group_name: hl.ProcessGroupName,
+) -> torch.Tensor:
+    peers = _remote_views(symm, group_name)
+    b_peers = _remote_views(b, group_name)
+    c_peers = _remote_views(c, group_name)
+    out = torch.empty_like(symm)
+    for tile in hl.tile(symm.size(0)):
+        symm[tile] = x[tile]
+        b[tile] = x[tile]
+        c[tile] = x[tile]
+    # Every rank polls symm in full, b only from rank 0, c at data-dependent rows.
+    for tile in hl.tile(symm.size(0)):
+        acc = b_peers[0][tile]
+        for r, peer in enumerate(peers):
+            acc = acc + peer[tile] + c_peers[r][rows[tile]]
+        out[tile] = acc
+    return out
+
+
+@helion.kernel(autotune_effort="none", static_shapes=False)
+def specialized_inband_kernel(
+    symm: torch.Tensor, x: torch.Tensor, group_name: hl.ProcessGroupName
+) -> torch.Tensor:
+    """Sizes and strides specialized; the storage offset stays symbolic."""
+    hl.specialize(symm.size())
+    hl.specialize(symm.stride())
+    peers = _remote_views(symm, group_name)
+    out = torch.empty_like(symm)
+    for tile in hl.tile(symm.size(0)):
+        symm[tile] = x[tile]
+    for tile in hl.tile(symm.size(0)):
+        out[tile] = peers[0][tile] + peers[1][tile]
+    return out
+
+
+@helion.kernel(autotune_effort="none", static_shapes=True)
 def diagonal_store_kernel(
     symm: torch.Tensor, x: torch.Tensor, group_name: hl.ProcessGroupName
 ) -> torch.Tensor:
@@ -246,39 +387,6 @@ def diagonal_store_kernel(
         symm[tile_i, tile_i] = x[tile_i, tile_j]
     for tile in hl.tile(symm.size()):
         out[tile] = peers[0][tile] + peers[1][tile]
-    return out
-
-
-@helion.kernel(autotune_effort="none", static_shapes=True)
-def pipelined_allreduce_kernel(
-    symm: torch.Tensor,
-    x: torch.Tensor,
-    group_name: hl.ProcessGroupName,
-    variant: hl.constexpr,
-    world: hl.constexpr,
-) -> torch.Tensor:
-    peers = _remote_views(symm, group_name)
-    out = torch.empty_like(x)
-    for tile in hl.tile(x.size(0)):
-        if variant == "constant":
-            symm[tile] = hl.full([tile], 1.0, dtype=x.dtype)
-        else:
-            symm[tile] = x[tile]
-        if variant == "R1":
-            symm[tile] = x[tile] + 0
-    for tile in hl.tile(x.size(0)):
-        acc = hl.zeros([tile], dtype=x.dtype)
-        for r in hl.static_range(world):
-            acc = acc + peers[r][tile]
-        out[tile] = acc
-        if variant == "print":
-            print("acc", acc)
-        if variant == "loop":
-            for inner in hl.tile(tile.begin, tile.end, block_size=64):
-                part = hl.zeros([inner], dtype=x.dtype)
-                for r in hl.static_range(world):
-                    part = part + peers[r][inner]
-                out[inner] = part
     return out
 
 
@@ -401,6 +509,145 @@ def scatter_matmul_exchange_kernel(
             total = total + peer[tile_m, tile_c].to(torch.float32)
         out[tile_m, tile_c] = total
     return out
+
+
+@helion.kernel(autotune_effort="none", static_shapes=True, backend="gluon")
+def tagged_credit_in_push_kernel(
+    z: torch.Tensor,
+    symm: torch.Tensor,
+    x: torch.Tensor,
+    w: torch.Tensor,
+    s: torch.Tensor,
+    group_name: hl.ProcessGroupName,
+    rank: hl.constexpr,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """``tagged_ring_exchange_kernel`` with the credit stored in the push's root,
+    which the push's keyed counters end."""
+    z_peers = _remote_views(z, group_name)
+    peers = _remote_views(symm, group_name)
+    out = torch.empty([z.size(0), w.size(1)], dtype=torch.float32, device=z.device)
+    total = torch.empty_like(s)
+    k = x.size(1)
+    for tile_m in hl.tile(x.size(0)):
+        rows = x[tile_m, :]
+        for z_peer in z_peers:
+            z_peer[tile_m, rank * k + hl.arange(k)] = rows
+        symm[tile_m] = s[tile_m]
+    for tile in hl.tile(s.size(0)):
+        acc = hl.zeros([tile], dtype=s.dtype)
+        for peer in peers:
+            acc = acc + peer[tile]
+        total[tile] = acc
+    for tile_m, tile_n in hl.tile([z.size(0), w.size(1)]):
+        acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+        for tile_k in hl.tile(z.size(1)):
+            acc = hl.dot(z[tile_m, tile_k], w[tile_k, tile_n], acc=acc)
+        out[tile_m, tile_n] = acc
+    return out, total
+
+
+@helion.kernel(autotune_effort="none", static_shapes=True, backend="gluon")
+def tagged_masked_guarded_kernel(
+    z: torch.Tensor,
+    symm: torch.Tensor,
+    x: torch.Tensor,
+    keep: torch.Tensor,
+    live: torch.Tensor,
+    wt: torch.Tensor,
+    s: torch.Tensor,
+    group_name: hl.ProcessGroupName,
+    rank: hl.constexpr,
+    variant: hl.constexpr = "",
+) -> tuple[torch.Tensor, torch.Tensor]:
+    z_peers = _remote_views(z, group_name)
+    peers = _remote_views(symm, group_name)
+    slots, rows, width = z.size(0), z.size(1), z.size(2)
+    q_tiles = x.size(2) // 64
+    out = torch.zeros([slots, wt.size(0), rows], dtype=torch.float32, device=z.device)
+    total = torch.empty_like(s)
+    # Each rank pushes its 64-column tiles of the live slots' kept rows.
+    for tile_q, tile_j in hl.tile([q_tiles, slots], block_size=[1, 1]):
+        bound = torch.sum(live[:])
+        if variant == "rootsame":
+            # "rootsame": a masked push at root, every slot's task into slot 0.
+            kept0 = keep[tile_j, :] != 0
+            for z_peer in z_peers:
+                hl.store(
+                    z_peer,
+                    [
+                        0,
+                        slice(None),
+                        (rank * q_tiles + tile_q.begin) * 64 + hl.arange(64),
+                    ],
+                    x[tile_j, :, tile_q.begin * 64 + hl.arange(64)],
+                    extra_mask=kept0[:, :, None],
+                )
+        # "branch": the push sits under a data-dependent branch, not a guard.
+        elif (bound > 0) if variant == "branch" else (tile_j.begin < bound):
+            # "share": every rank pushes the same columns.
+            share = 0 if variant == "share" else rank * q_tiles
+            col = (share + tile_q.begin) * 64
+            vals = x[tile_j, :, tile_q.begin * 64 + hl.arange(64)]
+            kept = keep[tile_j, :] != 0
+            for z_peer in z_peers:
+                hl.store(
+                    z_peer,
+                    # "same": every slot's task pushes into slot 0.
+                    [
+                        0 if variant == "same" else tile_j,
+                        slice(None),
+                        col + hl.arange(64),
+                    ],
+                    vals,
+                    # "unmasked": every row, under the guard.
+                    extra_mask=None if variant == "unmasked" else kept[:, :, None],
+                )
+    for tile in hl.tile(s.size(0)):
+        symm[tile] = s[tile]
+    for tile in hl.tile(s.size(0)):
+        acc = hl.zeros([tile], dtype=s.dtype)
+        for peer in peers:
+            acc = acc + peer[tile]
+        total[tile] = acc
+    # The live slots' consumers read every rank's columns through the ring.
+    for tile_n, tile_f in hl.tile([wt.size(0), slots], block_size=[128, 1]):
+        # "bound": the consumer skips on another bound.
+        bound2 = torch.sum(live[:] & 1) if variant == "bound" else torch.sum(live[:])
+        if tile_f.begin < bound2:
+            acc2 = hl.zeros([tile_n, rows], dtype=torch.float32)
+            for tile_k in hl.tile(width, block_size=64):
+                acc2 = hl.dot(
+                    wt[tile_n, tile_k],
+                    z[tile_f.begin, :, tile_k].permute(1, 0),
+                    acc=acc2,
+                )
+            out[tile_f.begin, tile_n, :] = acc2
+    return out, total
+
+
+def _tagged_masked_guarded_args(
+    world: int, rank: int, group_name: str, device: object, symmetric: bool = False
+) -> tuple[object, ...]:
+    """Arguments of tagged_masked_guarded_kernel: 8 slots of 16 rows, two
+    64-column tiles per rank."""
+    slots, rows, q, n = 8, 16, 2, 128
+
+    def buffer(*shape: int, dtype: torch.dtype) -> torch.Tensor:
+        if not symmetric:
+            return torch.zeros(*shape, device=device, dtype=dtype)
+        t = symm_mem.empty(*shape, device=device, dtype=dtype)
+        symm_mem.rendezvous(t, group=group_name)
+        return t.zero_()
+
+    z = buffer(slots, rows, world * q * 64, dtype=torch.bfloat16)
+    symm = buffer(256, dtype=torch.float32)
+    s = torch.full((256,), float(rank + 1), device=device)
+    x = torch.ones(slots, rows, q * 64, device=device, dtype=torch.bfloat16)
+    keep = torch.ones(slots, rows, device=device, dtype=torch.int32)
+    live = torch.tensor([2, 1, 1, 1], device=device, dtype=torch.int32)
+    wt = torch.arange(n * world * q * 64, device=device) % 7 - 3
+    wt = wt.to(torch.bfloat16).view(n, world * q * 64)
+    return (z, symm, x, keep, live, wt, s, group_name, rank)
 
 
 # make it easy to use a 'smaller' profile than 'quick' in unit test
@@ -603,17 +850,41 @@ class TestDistributed(TestCase, MultiProcessTestCase):
 
         torch.testing.assert_close(result, expected, rtol=1e-1, atol=1e-1)
 
+    @pytest.mark.slow
     @skipIfNotCUDA()
     @skipIfXPU("Distributed operations require CCL, not yet fully integrated")
     @skip_if_lt_x_gpu(4)
-    @parametrize("variant", ("inband", "R1", "R1-ws"))
-    @parametrize("pipeline", ("static", "dynamic"))
-    @parametrize("dtype", (torch.float32, torch.bfloat16))
+    # variant: each transport (tagged and Lamport inband words, peer counters
+    # with and without warp specialization); pipeline: the static and dynamic
+    # schedules order the done barrier differently; dtype: one element a word
+    # (fp32 tagged) against packed lanes. All pairs, not the product: each case
+    # spawns a world of interpreters.
+    @parametrize(
+        "variant,pipeline,dtype",
+        pairwise(
+            variant=("inband", "inband-lamport", "R1", "R1-ws"),
+            pipeline=("static", "dynamic"),
+            dtype=(torch.float32, torch.bfloat16),
+        ),
+    )
     def test_pipelined_allreduce_replays(
         self, variant: str, pipeline: str, dtype: torch.dtype
     ) -> None:
         if variant == "R1-ws" and torch.cuda.get_device_capability() < (10, 0):
             self.skipTest("warp specialization needs sm100")
+        # Lamport words: the three re-armed slots must keep skewed launches
+        # apart too, and 128-element tiles (32 or 64 words for 128 threads) put
+        # copies of each word in a replicated layout, all landing in their launch.
+        # Some lanes hold the key's own NaN, which would encode as unwritten
+        # (and hang) without its remap; their sums are NaN.
+        key = tile_dependency.LAMPORT_KEYS[dtype] - (1 << 8 * dtype.itemsize)
+        bits = torch.int16 if dtype.itemsize == 2 else torch.int32
+        keys = (
+            {"cross_loop_inband_protocol": ["lamport"], "block_sizes": [128, 128]}
+            if "lamport" in variant
+            else {}
+        )
+        variant = variant.removesuffix("-lamport")
         self._init_process()
         group = dist.group.WORLD
         world, n = self.world_size, 4096
@@ -624,7 +895,7 @@ class TestDistributed(TestCase, MultiProcessTestCase):
         # mixups in packed words.
         lane = torch.arange(n, device=self.device, dtype=dtype) % 16
         args = (symm, x, group.group_name, variant.removesuffix("-ws"), world)
-        bound = _with_pipeline(pipelined_allreduce_kernel, args, pipeline)
+        bound = _with_pipeline(pipelined_allreduce_kernel, args, pipeline, **keys)
         if variant == "R1-ws":
             config = bound.config_spec.default_config().config
             ws = {
@@ -642,6 +913,7 @@ class TestDistributed(TestCase, MultiProcessTestCase):
             # launch's values, which the done barrier orders.
             torch.cuda._sleep(100_000 * ((self.rank + step) % world))
             x.copy_(lane + 4 * step + self.rank)
+            x.view(bits)[::97] = key
             if replay:
                 graph.replay()
                 outs.append(graph_out.clone())
@@ -659,7 +931,45 @@ class TestDistributed(TestCase, MultiProcessTestCase):
         torch.cuda.synchronize()
         for step, out in enumerate(outs):
             expected = world * (lane + 4 * step) + world * (world - 1) // 2
-            torch.testing.assert_close(out, expected, rtol=0, atol=0)
+            expected[::97] = float("nan")
+            torch.testing.assert_close(out, expected, rtol=0, atol=0, equal_nan=True)
+        self._cleanup_process()
+
+    @pytest.mark.slow
+    @skipIfNotCUDA()
+    @skipIfXPU("Distributed operations require CCL, not yet fully integrated")
+    @skip_if_lt_x_gpu(4)
+    @parametrize(
+        "pipeline,dtype",
+        (("static", torch.float32), ("dynamic", torch.bfloat16)),
+    )
+    def test_inband_gated_store_replays(
+        self, pipeline: str, dtype: torch.dtype
+    ) -> None:
+        """Launches with the gate off push and poll nothing, and the next gated-on
+        launch still reads only its own words, across skewed ranks."""
+        self._init_process()
+        group = dist.group.WORLD
+        world, n = self.world_size, 4096
+        symm = symm_mem.empty(n, device=self.device, dtype=dtype)
+        credit = symm_mem.empty(n, device=self.device, dtype=dtype)
+        for buffer in (symm, credit):
+            symm_mem.rendezvous(buffer, group=group)
+        x = torch.empty(n, device=self.device, dtype=dtype)
+        gate = torch.empty(1, device=self.device, dtype=torch.int32)
+        # Small integers stay exact in bf16 and catch lane mixups in packed words.
+        lane = torch.arange(n, device=self.device, dtype=dtype) % 16
+        args = (symm, credit, x, gate, group.group_name, "")
+        bound = _with_pipeline(inband_gated_kernel, args, pipeline)
+        self.assertIn("@p st.relaxed.sys.global.", bound.to_triton_code())
+        for step, on in enumerate((1, 0, 0, 1, 0, 1, 1, 0, 1)):
+            torch.cuda._sleep(100_000 * ((self.rank + step) % world))
+            x.copy_(lane + 4 * step + self.rank)
+            gate.fill_(on)
+            out, total = bound(*args)
+            expected = world * (lane + 4 * step) + world * (world - 1) // 2
+            torch.testing.assert_close(total, expected, rtol=0, atol=0)
+            torch.testing.assert_close(out, expected * on, rtol=0, atol=0)
         self._cleanup_process()
 
     @skipIfNotCUDA()
@@ -690,6 +1000,21 @@ class TestDistributed(TestCase, MultiProcessTestCase):
     @skip_if_lt_x_gpu(4)
     @parametrize("dtype", (torch.bfloat16, torch.float32))
     def test_inband_scatter_reads_unwritten_rows(self, dtype: torch.dtype) -> None:
+        self._check_inband_scatter_reads_unwritten_rows(scatter_exchange_kernel, dtype)
+
+    @pytest.mark.slow
+    @skipIfNotCUDA()
+    @skipIfXPU("Distributed operations require CCL, not yet fully integrated")
+    @skip_if_lt_x_gpu(4)
+    def test_inband_scatter_after_a_local_root_reads_unwritten_rows(self) -> None:
+        # The launch hold waits in the scatter root's block, after a local root.
+        self._check_inband_scatter_reads_unwritten_rows(
+            scatter_after_local_kernel, torch.float32, scale=2
+        )
+
+    def _check_inband_scatter_reads_unwritten_rows(
+        self, kernel: helion.Kernel, dtype: torch.dtype, scale: int = 1
+    ) -> None:
         self._init_process()
         group = dist.group.WORLD
         world, tasks, lanes, cols = self.world_size, 4, 8, 64
@@ -706,7 +1031,13 @@ class TestDistributed(TestCase, MultiProcessTestCase):
         rows = torch.empty(tasks, lanes, device=self.device, dtype=torch.int32)
         count = torch.empty(1, device=self.device, dtype=torch.int32)
         args = (symm, x, rows, count, group.group_name)
-        bound = scatter_exchange_kernel.bind(args)
+        bound = kernel.bind(args)
+        if dtype.itemsize < 4:
+            # The scatter's polls read whole words (unwritten ones from the
+            # peer's buffer too), not one word per element.
+            self.assertNotRegex(
+                bound.to_triton_code(), r">> tl\.cast\(inband_offset_\d+ %"
+            )
         for step in range(6):
             generator = torch.Generator().manual_seed(step)
             plans = []
@@ -720,7 +1051,7 @@ class TestDistributed(TestCase, MultiProcessTestCase):
                 values = ((index * (r + 1) + 3 * step) % 128).float()
                 for t in range(live):
                     written = row[t] >= 0
-                    mirror[r, row[t][written].long()] = values[t][written]
+                    mirror[r, row[t][written].long()] = scale * values[t][written]
                 plans.append((values, row, live))
             values, row, live = plans[self.rank]
             torch.cuda._sleep(100_000 * ((self.rank + step) % world))
@@ -758,11 +1089,19 @@ class TestDistributed(TestCase, MultiProcessTestCase):
         args = (symm, x, w, rows, count, group.group_name)
         bound = scatter_matmul_exchange_kernel.bind(args)
         config = bound.config_spec.default_config().config
-        ws = {"block_sizes": [32], "range_warp_specializes": [None, True, None]}
+        # num_warps below 4, which the warp-specialized loop raises.
+        ws = {
+            "block_sizes": [32],
+            "num_warps": 2,
+            "range_warp_specializes": [None, True, None],
+        }
         bound.set_config(helion.Config(**{**config, **ws}))
         code = bound.to_triton_code()
         self.assertIn("warp_specialize=True", code)
         self.assertIn("_scatter_cover(", code)
+        # The loop raises the launch to 4 warps; the poll barriers count them all.
+        self.assertIn("num_warps=4", code)
+        self.assertIn("bar.red.or.pred q, 0, 128, p", code)
         written = torch.zeros(tasks * lanes, 1, device=self.device, dtype=torch.bool)
         written[rows[0][rows[0] >= 0].long()] = True
         # Each written element sums k // 2 ones; unwritten rows keep rank + 1.
@@ -1058,6 +1397,7 @@ class TestDistributed(TestCase, MultiProcessTestCase):
         torch.testing.assert_close(result, expected, rtol=8e-1, atol=8e-1)
         self._cleanup_process()
 
+    @pytest.mark.slow
     @skipIfXPU("Distributed operations require CCL, not yet fully integrated")
     @skip_if_lt_x_gpu(4)
     def test_two_dim_parallel_matmul(self):
@@ -1126,12 +1466,11 @@ class TestDistributed(TestCase, MultiProcessTestCase):
         symm_mem_buf = symm_mem.empty(M_local, N, dtype=dtype, device=self.device)
         hdl = symm_mem.rendezvous(symm_mem_buf, tp_group_name)
 
-        import unittest.mock
-
+        mock_sync_seed = unittest.mock.MagicMock(wraps=sync_seed)
         with (
-            unittest.mock.patch(
-                "helion._dist_utils.sync_seed", wraps=sync_seed
-            ) as mock_sync_seed,
+            # The autotuner modules import sync_seed by name, and mock.patch
+            # only intercepts the binding it names, so spy on each module's.
+            contextlib.ExitStack() as sync_seed_spies,
             # The autotuner's compile/accuracy/timing gathers live in
             # BenchmarkProvider (moved from BaseSearch in #2029), and mock.patch
             # only intercepts the module-level binding, so spy there.
@@ -1143,6 +1482,18 @@ class TestDistributed(TestCase, MultiProcessTestCase):
                 "helion.autotuner.base_search.sync_object", wraps=sync_object
             ) as mock_sync_object,
         ):
+            # Every helion.autotuner module that imports sync_seed by name.
+            for module in (
+                "config_generation",
+                "de_surrogate_hybrid",
+                "differential_evolution",
+                "surrogate_pattern_search",
+            ):
+                sync_seed_spies.enter_context(
+                    unittest.mock.patch(
+                        f"helion.autotuner.{module}.sync_seed", mock_sync_seed
+                    )
+                )
             result = helion_fn(
                 a_local,
                 b_local,
@@ -1168,6 +1519,176 @@ class TestDistributed(TestCase, MultiProcessTestCase):
 
         expected = ref_fn(a_local, b_local, tp_group)
         torch.testing.assert_close(result, expected, rtol=1e-1, atol=1e-1)
+
+    @skipIfNotCUDA()
+    @skipIfXPU("Distributed operations require CCL, not yet fully integrated")
+    @skip_if_lt_x_gpu(4)
+    def test_tagged_ring_operand_replays(self) -> None:
+        """Tagged words polled into ring slots by two pollers feed the MMA,
+        exactly, across skewed launches and CUDA graph replays."""
+        if not supports_gluon():
+            self.skipTest(f"the gluon ring needs {GLUON_REQUIREMENT}")
+        self._init_process()
+        group = dist.group.WORLD
+        world, m, k, n = self.world_size, 128, 64, 128
+        z = symm_mem.empty(m, world * k, device=self.device, dtype=torch.bfloat16)
+        symm_mem.rendezvous(z, group=group)
+        symm = symm_mem.empty(256, device=self.device)
+        symm_mem.rendezvous(symm, group=group)
+        w = torch.arange(world * k * n, device=self.device) % 7 - 3
+        w = w.to(torch.bfloat16).view(world * k, n)
+        s = torch.full((256,), float(self.rank + 1), device=self.device)
+        x = torch.empty(m, k, device=self.device, dtype=torch.bfloat16)
+        args = (z, symm, x, w, s, group.group_name, self.rank)
+        bound = tagged_ring_exchange_kernel.bind(args)
+        config = bound.config_spec.default_config().config
+        config.pop("range_warp_specializes")
+        bound.set_config(helion.Config(**{**config, **TAGGED_RING}))
+        self.assertIn("_helion_ring.tagged_load(", bound.to_triton_code())
+        outs, inputs = [], []
+
+        def launch(step: int, replay: bool = False) -> None:
+            torch.cuda._sleep(100_000 * ((self.rank + step) % world))
+            values = torch.arange(m * k, device=self.device) + 3 * step + 11 * self.rank
+            x.copy_((values % 9 - 4).to(torch.bfloat16).view(m, k))
+            inputs.append(x.clone())
+            if replay:
+                graph.replay()
+                outs.append(graph_out[0].clone())
+            else:
+                outs.append(bound(*args)[0].clone())
+
+        for step in range(3):
+            launch(step)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            graph_out = bound(*args)
+        for step in range(3, 9):
+            launch(step, replay=step % 2 == 0)
+        torch.cuda.synchronize()
+        for out, local in zip(outs, inputs, strict=True):
+            gathered = [torch.empty_like(local) for _ in range(world)]
+            dist.all_gather(gathered, local)
+            expected = torch.cat(gathered, dim=1).float() @ w.float()
+            torch.testing.assert_close(out, expected, rtol=0, atol=0)
+        # The pushes also store to every rank's copy, as peer counters would.
+        torch.testing.assert_close(z, torch.cat(gathered, dim=1), rtol=0, atol=0)
+        self._cleanup_process()
+
+    @skipIfNotCUDA()
+    @skipIfXPU("Distributed operations require CCL, not yet fully integrated")
+    @skip_if_lt_x_gpu(4)
+    def test_tagged_masked_guarded_replays(self) -> None:
+        """Masked, guarded tagged pushes across skewed launches and CUDA graph
+        replays, each rank skipping its own slots: rows a rank did not push
+        (masked, or slots its guard skipped) read as zeros, every launch
+        exactly; the copy ends as the pushes left it."""
+        if not supports_gluon():
+            self.skipTest(f"the gluon ring needs {GLUON_REQUIREMENT}")
+        self._init_process()
+        group = dist.group.WORLD
+        world = self.world_size
+        args = _tagged_masked_guarded_args(
+            world, self.rank, group.group_name, self.device, symmetric=True
+        )
+        z, symm, x, keep, live, wt, s, _, _ = args
+        bound = tagged_masked_guarded_kernel.bind(args)
+        config = bound.config_spec.default_config().config
+        config.pop("range_warp_specializes", None)
+        ring = {
+            "indexing": "tensor_descriptor",
+            "pid_type": "persistent_blocked",
+            "num_sm_multiplier": 1,
+            "num_stages": 2,
+            "num_warps": 4,
+        }
+        bound.set_config(helion.Config(**{**config, **ring}))
+        self.assertIn("_helion_ring.tagged_load(", bound.to_triton_code())
+        outs, inputs = [], []
+
+        def launch(step: int, replay: bool = False) -> None:
+            torch.cuda._sleep(100_000 * ((self.rank + step) % world))
+            values = (
+                torch.arange(x.numel(), device=self.device) + 3 * step + 11 * self.rank
+            )
+            x.copy_((values % 9 - 4).to(torch.bfloat16).view(x.shape))
+            rows = torch.arange(keep.numel(), device=self.device).view(keep.shape)
+            keep.copy_(((rows + step + self.rank) % 3 != 0).to(torch.int32))
+            # Each rank's own live slot count (the guard bound).
+            live.copy_(
+                torch.tensor([1 + (step + self.rank) % 4, 1, 1, 1], device=self.device)
+            )
+            inputs.append((x.clone(), keep.clone(), int(live.sum())))
+            if replay:
+                graph.replay()
+                outs.append(graph_out[0].clone())
+            else:
+                outs.append(bound(*args)[0].clone())
+
+        for step in range(3):
+            launch(step)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            graph_out = bound(*args)
+        for step in range(3, 9):
+            launch(step, replay=step % 2 == 0)
+        torch.cuda.synchronize()
+        # Every rank's copy (zeroed at first): each element as last pushed.
+        copy = torch.zeros_like(z, dtype=torch.float32)
+        for out, (local, kept, live_slots) in zip(outs, inputs, strict=True):
+            written = kept[:, :, None].expand_as(local).to(torch.int8)
+            written[live_slots:] = 0
+            values = [torch.empty_like(local) for _ in range(world)]
+            dist.all_gather(values, local)
+            masks = [torch.empty_like(written) for _ in range(world)]
+            dist.all_gather(masks, written)
+            pushed = torch.cat(masks, dim=2).bool()
+            full = torch.cat(values, dim=2).float()
+            copy = torch.where(pushed, full, copy)
+            expected = torch.einsum("nc,frc->fnr", wt.float(), full * pushed)
+            expected[live_slots:] = 0
+            torch.testing.assert_close(out, expected, rtol=0, atol=0)
+        torch.testing.assert_close(z.float(), copy, rtol=0, atol=0)
+        self._cleanup_process()
+
+
+class TestTaggedShares(CommonTestCase):
+    """The first launch checks that the ranks' tagged pushes cover each tensor
+    once (rule T7) from the state fingerprints the ranks exchange; no device."""
+
+    def _allocate(self, shares: list[tuple[int, ...]]) -> None:
+        """This rank (0) allocates the state, the ranks pushing ``shares``."""
+        from helion.runtime.triton import launcher
+
+        def gather(
+            output: list[object], obj: tuple[object, ...], group: object
+        ) -> None:
+            output[:] = [(obj[0], share) for share in shares]
+
+        with (
+            patch("torch.cuda.device", lambda device: contextlib.nullcontext()),
+            patch("torch.cuda.get_device_capability", lambda device: (10, 0)),
+            patch(
+                "torch.distributed.distributed_c10d._resolve_process_group",
+                lambda name: None,
+            ),
+            patch("torch.distributed.get_world_size", lambda group: len(shares)),
+            patch("torch.distributed.all_gather_object", gather),
+            patch(
+                "torch.distributed._symmetric_memory.empty",
+                side_effect=RuntimeError("allocated"),
+            ),
+        ):
+            launcher._new_symmetric_state(
+                torch.device("cuda", 0), ("k",), 8, torch.uint64, "g", shares[0]
+            )
+
+    def test_ranks_push_different_shares(self) -> None:
+        with self.assertRaisesRegex(RuntimeError, "push its own share"):
+            self._allocate([(0,), (0,), (2,), (3,)])
+        # Each tensor's shares a permutation of the ranks: on to the allocation.
+        with self.assertRaisesRegex(RuntimeError, "allocated"):
+            self._allocate([(1, 0), (0, 1), (3, 3), (2, 2)])
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
@@ -1478,6 +1999,103 @@ class TestDistributedTileDependencies(TestCase):
 
     @skipIfRefEager("tile dependencies are built only in compiled mode")
     @parametrize("world", (2, 4, 8))
+    def test_inband_gated_store(self, world: int) -> None:
+        """A store masked by a launch-uniform gate travels inband when every peer
+        load carries the gate (its push is predicated on it); else peer counters."""
+        group = self._world(world, inband_gated_kernel)
+        inband = "use inband (epoch words: a rank may not poll every word)"
+        for variant, dtype, expected in (
+            ("", torch.float32, inband),
+            # Two bf16 lanes a word: the masked polls take the load's mask.
+            ("", torch.bfloat16, inband),
+            ("R9", torch.float32, "use peer_counter (R9:"),
+            ("tile-mask", torch.float32, "use peer_counter (R1:"),
+            ("written", torch.float32, "use peer_counter (R1:"),
+        ):
+            symm, x = torch.zeros(2, 256, device=DEVICE, dtype=dtype)
+            credit = torch.zeros(256, device=DEVICE, dtype=dtype)
+            gate = torch.ones(1, device=DEVICE, dtype=torch.int32)
+            inband_gated_kernel.reset()
+            with (
+                self.subTest(variant=variant, dtype=dtype),
+                self.assertLogs(tile_dependency.log, "INFO") as logs,
+            ):
+                bound = inband_gated_kernel.bind(
+                    (symm, credit, x, gate, group, variant)
+                )
+            (line,) = (line for line in logs.output if "peers/symm " in line)
+            self.assertIn(f"on peers/symm {expected}", line)
+            if not variant:
+                code = bound.to_triton_code()
+                # The gated pushes (one asm per rank) are predicated on the
+                # gate, the credit's are not.
+                pushes = code.count("st.relaxed.sys.global.")
+                self.assertEqual(code.count("@p st.relaxed.sys.global."), world)
+                self.assertEqual(pushes, 2 * world)
+
+    @skipIfRefEager("tile dependencies are built only in compiled mode")
+    def test_inband_gates_differ_by_their_whole_path(self) -> None:
+        """Gates are keyed by their host path: a store gated on ``gates[0]``
+        whose peer loads take ``gates[1]`` keeps peer counters (R9)."""
+        group = self._world(2, inband_two_gates_kernel)
+        symm, x = torch.zeros(2, 256, device=DEVICE)
+        credit = torch.zeros(256, device=DEVICE)
+        gates = [torch.ones(1, device=DEVICE, dtype=torch.int32) for _ in range(2)]
+        with self.assertLogs(tile_dependency.log, "INFO") as logs:
+            inband_two_gates_kernel.bind((symm, credit, x, gates, group))
+        (line,) = (line for line in logs.output if "peers/symm " in line)
+        self.assertIn("on peers/symm use peer_counter (R9:", line)
+
+    @skipIfRefEager("tile dependencies are built only in compiled mode")
+    def test_rank_digest_ignores_other_masks(self) -> None:
+        """Ranks agree on the gates of inband pushes, not on the other terms of
+        peer loads' or local stores' masks (here built from a rank constant)."""
+        group = self._world(2, inband_gated_kernel)
+        digests = []
+        for variant in ("rank0", "rank1"):
+            symm, x = torch.zeros(2, 256, device=DEVICE)
+            credit = torch.zeros(256, device=DEVICE)
+            gate = torch.ones(1, device=DEVICE, dtype=torch.int32)
+            inband_gated_kernel.reset()
+            code = inband_gated_kernel.bind(
+                (symm, credit, x, gate, group, variant)
+            ).to_triton_code()
+            self.assertIn("@p st.relaxed.sys.global.", code)
+            digest = re.search(r"_persistent_state_rank_digest='([0-9a-f]{16})'", code)
+            assert digest is not None
+            digests.append(digest[1])
+        self.assertEqual(*digests)
+
+    @skipIfRefEager("tile dependencies are built only in compiled mode")
+    def test_inband_store_through_another_view(self) -> None:
+        """Pushes and polls address words by storage offset, so the store's
+        view may differ from the peer loads' in shape and order (R2)."""
+        group = self._world(2, inband_view_kernel)
+        for view in ("rows", "cols"):
+            # bf16 packs two row-adjacent elements per word where rows allow.
+            symm, x = torch.zeros(2, 256, device=DEVICE, dtype=torch.bfloat16)
+            with (
+                self.subTest(view=view),
+                self.assertLogs(tile_dependency.log, "INFO") as logs,
+            ):
+                inband_view_kernel.bind((symm, x, group, view))
+            (line,) = logs.output
+            self.assertIn("on peers/symm2 use inband", line)
+
+    @skipIfRefEager("tile dependencies are built only in compiled mode")
+    def test_inband_places_views_from_symmetric_base(self) -> None:
+        """A symbolic storage offset leaves inband: the guarded owner starts
+        the symmetric allocation, as its peer views do."""
+        group = self._world(2, specialized_inband_kernel)
+        symm, x = torch.zeros(2, 256, device=DEVICE).unbind()
+        symm, x = symm.clone(), x.clone()
+        with self.assertLogs(tile_dependency.log, "INFO") as logs:
+            specialized_inband_kernel.bind((symm, x, group))
+        (line,) = logs.output
+        self.assertIn("on peers/symm use inband", line)
+
+    @skipIfRefEager("tile dependencies are built only in compiled mode")
+    @parametrize("world", (2, 4, 8))
     def test_peer_counters_order_cross_rank_edges(self, world: int) -> None:
         symm, x = torch.zeros(2, 256, device=DEVICE)
         group = self._world(world, inband_rule_kernel)
@@ -1509,11 +2127,12 @@ class TestDistributedTileDependencies(TestCase):
                 f"{state} + 16, tile_dependency_peer_epoch * {8 * world})",
             ):
                 self.assertIn(expected, code)
-            # A static launch takes its epoch from the slot after the done slot,
-            # which worker 0 advances once every rank is done with the launch.
+            # A static launch counts each worker's launches in its own word;
+            # worker 0 first waits until every rank is done with the launch.
+            own = "tile_dependency_peer_launch + tl.program_id(0)"
             launch = (
-                f"tile_dependency_peer_epoch = tl.load({state} + 17) + 1",
-                f"tl.store({state} + 17, tile_dependency_peer_epoch)",
+                f"tile_dependency_peer_epoch = tl.load({own}) + 1",
+                f"tl.store({own}, tile_dependency_peer_epoch)",
             )
             for expected in launch:
                 if pipeline == "static":
@@ -1575,7 +2194,7 @@ class TestDistributedTileDependencies(TestCase):
             words = ", ".join(["tl.uint64"] * world)
             self.assertIn(f"dtype=({words}), is_pure=False, pack={pack})", code)
             # Two parities of a word per rank and element, the done and launch slots.
-            self.assertIn(f"(x, {2 * world * 4000 + 2}, torch.uint64, True)", code)
+            self.assertIn(f"(x, {2 * world * 4000 + 1}, torch.uint64, True)", code)
             self.assertNotIn("_wait_at_least", code)
             self.assertNotIn("_add_on_every_rank", code)
         # Under dynamic tickets the poller waits only in band, yet still warms
@@ -1608,7 +2227,118 @@ class TestDistributedTileDependencies(TestCase):
         self.assertIn("<< 16 | tile_dependency_peer_epoch << 32", code)
         self.assertIn("tl.reshape(tl.join(tl.cast(tl.cast(inband_word", code)
         self.assertNotIn("% 2, tl.uint64) * 16", code)
-        self.assertIn(f"(x, {2 * world * 2048 + 2}, torch.uint64, True)", code)
+        self.assertIn(f"(x, {2 * world * 2048 + 1}, torch.uint64, True)", code)
+
+    @skipIfRefEager("tile dependencies are built only in compiled mode")
+    @parametrize(
+        "dtype", (torch.bfloat16, torch.float16, torch.float32, torch.float8_e4m3fn)
+    )
+    def test_inband_lamport_words(self, dtype: torch.dtype) -> None:
+        world, n = 4, 4096
+        symm, x = torch.zeros(2, n, device=DEVICE, dtype=dtype)
+        group = self._world(world, pipelined_allreduce_kernel)
+        self.addCleanup(pipelined_allreduce_kernel.reset)
+        bound = pipelined_allreduce_kernel.bind((symm, x, group, "inband", world))
+        config = bound.config_spec.default_config().config
+        # One candidate, off by default; a config saved before the key existed
+        # keeps the epoch words too.
+        self.assertEqual(config["cross_loop_inband_protocol"], ["tagged"])
+        old = {k: v for k, v in config.items() if k != "cross_loop_inband_protocol"}
+        tagged = bound.to_triton_code(helion.Config(**old))
+        self.assertIn("tile_dependency_peer_epoch << 32", tagged)
+        self.assertNotIn("fence.acq_rel.gpu", tagged)
+        # Rows of 32 elements fill 16-byte word pairs at every element size (a
+        # device's default may tile narrower: 8 float8 elements fill one word).
+        lamport = {**config, "block_sizes": [32, 32]}
+        code = bound.to_triton_code(
+            helion.Config(**{**lamport, "cross_loop_inband_protocol": ["lamport"]})
+        )
+        lanes, bits = 8 // dtype.itemsize, 8 * dtype.itemsize
+        ones = sum(1 << (bits * i) for i in range(lanes))
+        # A word packs 8 bytes of elements and no epoch: three launch slots of
+        # half the tagged words each.
+        self.assertIn(f"(x, {3 * world * n // lanes + 1}, torch.uint64, True)", code)
+        self.assertNotIn("tile_dependency_peer_epoch << 32", code)
+        # Pushes are the tagged words' 16-byte stores, one asm per rank, into
+        # this launch's slot; no zeroing, fence or atomics on the push side.
+        self.assertEqual(code.count("st.relaxed.sys.global.v2.u64"), world)
+        self.assertIn("tile_dependency_peer_epoch % 3", code)
+        self.assertNotIn("tl.atomic_", code)
+        self.assertNotIn("fence.acq_rel", code)
+        # The poll re-arms what it read in the previous launch's slot.
+        self.assertIn("tl.where(tile_dependency_peer_epoch % 3 == 0, 2, -1)", code)
+        self.assertEqual(code.count("& 0)"), world)  # one poll a rank
+        # Lanes encode x ^ key (the key's own NaN as key ^ sign) and decode by
+        # xor with the key; polls wait while a lane is zero.
+        key = tile_dependency.LAMPORT_KEYS[dtype]
+        k = f"tl.full([], {key}, tl.uint{bits})"
+        spare = f"tl.full([], {key ^ 1 << bits - 1}, tl.uint{bits})"
+        self.assertIn(f" == {k}, {spare}, ", code)
+        self.assertIn(f"tl.uint{bits}) ^ {k}, ", code)
+        self.assertIn(f"sub.u64 t, $0, 0x{ones:016x};", code)
+        # (The unparsed code drops the redundant parentheses around the mask.)
+        self.assertIn(f">> {bits - 1} & {ones} != 0", code)
+        self.assertNotIn("setp.ne.b32 p, hi", code)
+
+    @skipIfRefEager("tile dependencies are built only in compiled mode")
+    @parametrize("dtype", (torch.bfloat16, torch.float32))
+    def test_inband_lamport_masked_polls(self, dtype: torch.dtype) -> None:
+        """A tile past the end masks its polls: a masked lane reads every lane
+        as the key (a Lamport word just written with zeros), so it neither
+        waits nor decodes to garbage."""
+        world, n = 4, 4000
+        symm, x = torch.zeros(2, n, device=DEVICE, dtype=dtype)
+        group = self._world(world, pipelined_allreduce_kernel)
+        self.addCleanup(pipelined_allreduce_kernel.reset)
+        bound = pipelined_allreduce_kernel.bind((symm, x, group, "inband", world))
+        config = bound.config_spec.default_config().config
+        # Stores in 16-element tiles, which fill whole words; polls in 1024-element
+        # tiles, the fourth of which holds the last 928 elements.
+        code = bound.to_triton_code(
+            helion.Config(
+                **{
+                    **config,
+                    "block_sizes": [16, 1024],
+                    "cross_loop_inband_protocol": ["lamport"],
+                }
+            )
+        )
+        self.assertNotIn("tile_dependency_peer_epoch << 32", code)
+        bits = 8 * dtype.itemsize
+        words = sum(
+            tile_dependency.LAMPORT_KEYS[dtype] << (bits * i) for i in range(64 // bits)
+        )
+        unwritten = words - (1 << 64) if words >> 63 else words
+        self.assertIn(f", {unwritten}, volatile=True)", code)
+
+    @skipIfRefEager("tile dependencies are built only in compiled mode")
+    def test_inband_lamport_needs_full_polls(self) -> None:
+        world, n = 4, 4096
+        # Separate allocations: a peer view starts at its symmetric allocation.
+        symm, b, c, x = (torch.zeros(n, device=DEVICE) for _ in range(4))
+        rows = torch.arange(n, device=DEVICE).flip(0)
+        group = self._world(world, inband_partial_polls_kernel)
+        self.addCleanup(inband_partial_polls_kernel.reset)
+        with self.assertLogs(tile_dependency.log, "INFO") as logs:
+            bound = inband_partial_polls_kernel.bind((symm, b, c, rows, x, group))
+        # Only rank 0's b is read, and c at rows only known at run time, so a
+        # word a rank never reads would never be re-armed: only symm is a
+        # candidate, and b and c keep their epochs.
+        lines = sorted(logs.output)
+        self.assertEqual(len(lines), 3)
+        never = "use inband (epoch words: a rank may not poll every word)"
+        self.assertIn(f"on b/b_peers {never}", lines[0])
+        self.assertIn(f"on c/c_peers {never}", lines[1])
+        self.assertIn("on peers/symm use inband (Lamport candidate)", lines[2])
+        config = bound.config_spec.default_config().config
+        code = bound.to_triton_code(
+            helion.Config(**{**config, "cross_loop_inband_protocol": ["lamport"]})
+        )
+        # symm travels as Lamport words (2 fp32 a word, three slots).
+        words = 3 * world * n // 2 + 2 * (2 * world * n) + 1
+        self.assertIn(f"(x, {words}, torch.uint64, True)", code)
+        self.assertIn("tile_dependency_peer_epoch << 32", code)
+        self.assertIn("tile_dependency_peer_epoch % 3", code)
 
     @skipIfRefEager("tile dependencies are built only in compiled mode")
     @parametrize("world", (2, 4, 8))
@@ -1665,6 +2395,31 @@ class TestDistributedTileDependencies(TestCase):
         self.assertIn(f"{done}, tile_dependency_peer_epoch * {9 * world})", code)
 
     @skipIfRefEager("tile dependencies are built only in compiled mode")
+    @parametrize("world", (2, 4))
+    def test_done_barrier_static_counts_own_launches(self, world: int) -> None:
+        symm, x = torch.zeros(2, 4096, device=DEVICE)
+        moment = torch.zeros(1, device=DEVICE, dtype=torch.float64)
+        group = self._world(world, chained_exchange_kernel)
+        bound = chained_exchange_kernel.bind((symm, moment, x, group))
+        config = bound.config_spec.default_config().config
+        code = bound.to_triton_code(
+            {
+                **config,
+                "block_sizes": [1024, 1024, 1, 512],
+                "cross_loop_pipeline": "static",
+            }
+        )
+        # Worker 0 holds the grid open until every peer's done roots published,
+        # but each worker counts its own launches in its own word (one reader,
+        # one writer), as without a done barrier.
+        self.assertIn("_wait_at_least", code)
+        launch = "tile_dependency_peer_launch + tl.program_id(0)"
+        self.assertIn(f"tile_dependency_peer_epoch = tl.load({launch}) + 1", code)
+        self.assertIn(f"tl.store({launch}, tile_dependency_peer_epoch)", code)
+        store = code.index(f"tl.store({launch}, tile_dependency_peer_epoch)")
+        self.assertLess(code.rindex("_wait_at_least", 0, store), store)
+
+    @skipIfRefEager("tile dependencies are built only in compiled mode")
     @parametrize("world", (2, 4, 8))
     def test_done_barrier_skips_ended_roots(self, world: int) -> None:
         symm, x = torch.zeros(2, 4096, device=DEVICE, dtype=torch.float64)
@@ -1717,7 +2472,8 @@ class TestDistributedTileDependencies(TestCase):
             bound = scatter_exchange_kernel.bind((symm, x, rows, count, group))
         (line,) = logs.output
         self.assertIn("on peers/symm use inband", line)
-        # Only a static launch marks the guard-skipped tasks.
+        # Only a static launch marks the guard-skipped tasks (or, on gluon, the
+        # claimed roots of a ring).
         self.assertEqual(bound.config_spec.cross_loop_pipeline.choices, ("static",))
         code = bound.to_triton_code()
         # Each task records one tagged key per row, then pushes a done word to
@@ -1727,10 +2483,18 @@ class TestDistributedTileDependencies(TestCase):
         self.assertIn("tl.cast(tl.sum(inband_record), tl.uint64)", code)
         self.assertIn("tile_dependency_peer_epoch << 32 | 4294967295", code)
         # After a long spin, readers scan each source's records and done words and
-        # copy rows no task wrote from the peer's buffer into the mailbox.
-        self.assertEqual(code.count("_scatter_cover("), world)
+        # copy rows no task wrote from the peer's buffer into the mailbox, both in
+        # one loop over the sources, so the code does not grow with the world.
+        self.assertEqual(code.count("_scatter_cover("), 1)
+        self.assertIn(f"for inband_entry in tl.range({world}, num_stages=1):", code)
+        self.assertIn(f"for inband_peer in tl.range({world}, num_stages=1):", code)
+        self.assertEqual(code.count("inband_uncovered = "), 1)
         self.assertIn("tl.pointer_type(tl.uint32)) + inband_offset_", code)
-        self.assertIn("tl.store(inband_address_", code)
+        self.assertIn("tl.store(inband_address_0 + inband_peer * ", code)
+        # Each peer's poll of the tile is the first one's address plus its slot
+        # stride, so the spin asm takes one address and immediate offsets.
+        self.assertIn("inband_address_1 = inband_address_0 + ", code)
+        self.assertRegex(code, r"ld\.volatile\.global\.b64 \$\d+, \[\$\d+\+\d+\]")
         self.assertIn("_hold_after_fallback(tile_dependency_peer_state", code)
         # The record key must index the row block the reader computes.
         self.assertIn("% 64 // 32 * 1 + inband_offset_1 // 64 * 2", code)
@@ -1792,6 +2556,154 @@ class TestDistributedTileDependencies(TestCase):
                         local_source,
                     )
                 )
+
+    @skipIfRefEager("tile dependencies are built only in compiled mode")
+    def test_tagged_ring_operand_codegen(self) -> None:
+        """A keyed push consumed as a ring operand travels tagged: two pollers
+        of the gated group fill alternate steps of z from the mirror, each
+        arriving on every step; the producer pushes words, no peer counter."""
+        if not supports_gluon():
+            self.skipTest(f"the gluon ring needs {GLUON_REQUIREMENT}")
+        group = self._world(4, tagged_ring_exchange_kernel)
+        world, m, k, n = 4, 128, 64, 128
+        z = torch.zeros(m, world * k, device=DEVICE, dtype=torch.bfloat16)
+        symm = torch.zeros(256, device=DEVICE)
+        s = torch.zeros(256, device=DEVICE)
+        x = torch.ones(m, k, device=DEVICE, dtype=torch.bfloat16)
+        w = torch.ones(world * k, n, device=DEVICE, dtype=torch.bfloat16)
+        args = (z, symm, x, w, s, group, 0)
+        with self.assertLogs(tile_dependency.log, "INFO") as logs:
+            bound = tagged_ring_exchange_kernel.bind(args)
+        (line,) = [line for line in logs.output if "on z/z_peers" in line]
+        self.assertIn("use peer_counter (R1:", line)
+        self.assertTrue(line.endswith("; tagged candidate"))
+        config = bound.config_spec.default_config().config
+        config.pop("range_warp_specializes")
+        ring = helion.Config(**{**config, **TAGGED_RING})
+        code = bound.to_triton_code(ring)
+        name = "_helion_tagged_ring_exchange_kernel"
+        self.assertIn(f"def {name}_producer1_1(", code)
+        self.assertEqual(code.count("_helion_ring.tagged_load("), 2)
+        self.assertEqual(code.count("_helion_ring.ring_put_tagged("), 2)
+        # Each poller arrives on every step: two groups and the second poller.
+        self.assertIn("ring_barriers(_helion_ring_S, 3)", code)
+
+        def puts_z(code: str) -> bool:
+            """Whether a producer TMA-loads z into the ring."""
+            lines = code.splitlines()
+            return any("ring_put(" in line and "z_ring_desc" in line for line in lines)
+
+        self.assertFalse(puts_z(code))
+        with patch.object(bound.env, "tagged_peer_disabled", True):
+            dense = bound.to_triton_code(ring)
+        self.assertNotIn("tagged_load", dense)
+        self.assertTrue(puts_z(dense))
+        # The tagged pushes, beside the inband exchange's.
+        push = "st.relaxed.sys.global.v2.u64"
+        self.assertGreater(code.count(push), dense.count(push))
+
+        # A late tagged failure regenerates exactly the peer-counter kernel.
+        with patch.object(
+            cross_loop_codegen, "tagged_coverage_failure", lambda *_: "T4: forced"
+        ):
+            self.assertEqual(bound.to_triton_code(ring), dense)
+
+    @skipIfRefEager("tile dependencies are built only in compiled mode")
+    def test_tagged_credit_in_a_keyed_root(self) -> None:
+        """The credit's polls give the mirrors their parity credit (T5) even
+        when the credit is stored in a root keyed counters end."""
+        if not supports_gluon():
+            self.skipTest(f"the gluon ring needs {GLUON_REQUIREMENT}")
+        group = self._world(4, tagged_credit_in_push_kernel)
+        world, m, k, n = 4, 128, 64, 128
+        z = torch.zeros(m, world * k, device=DEVICE, dtype=torch.bfloat16)
+        symm, s = torch.zeros(2, m, device=DEVICE)
+        x = torch.ones(m, k, device=DEVICE, dtype=torch.bfloat16)
+        w = torch.ones(world * k, n, device=DEVICE, dtype=torch.bfloat16)
+        with self.assertLogs(tile_dependency.log, "INFO") as logs:
+            tagged_credit_in_push_kernel.bind((z, symm, x, w, s, group, 0))
+        (line,) = [line for line in logs.output if "on z/z_peers" in line]
+        self.assertTrue(line.endswith("; tagged candidate"), line)
+
+    @skipIfRefEager("tile dependencies are built only in compiled mode")
+    def test_tagged_masked_guarded_codegen(self) -> None:
+        """A push under the root's guard travels tagged with row presence words,
+        which the guard's skipped tasks mark, whatever the consumer's bound; a
+        push outside the guard keeps peer counters, as does one of a tile per
+        task; every rank picks the same transport and launches check shares."""
+        if not supports_gluon():
+            self.skipTest(f"the gluon ring needs {GLUON_REQUIREMENT}")
+        from helion._compiler.triton import gluon_ring  # needs Triton >= 3.8
+
+        ring = {
+            "indexing": "tensor_descriptor",
+            "pid_type": "persistent_blocked",
+            "num_sm_multiplier": 1,
+            "num_stages": 2,
+            "num_warps": 4,
+        }
+
+        def code(variant: str, rank: int = 0) -> str:
+            dist.destroy_process_group()
+            dist.init_process_group(
+                backend="fake", store=FakeStore(), rank=rank, world_size=4
+            )
+            tagged_masked_guarded_kernel.reset()
+            group = dist.group.WORLD.group_name
+            args = (*_tagged_masked_guarded_args(4, rank, group, DEVICE), variant)
+            bound = tagged_masked_guarded_kernel.bind(args)
+            config = bound.config_spec.default_config().config
+            config.pop("range_warp_specializes", None)
+            with patch.object(gluon_ring.log, "info") as info:
+                generated = bound.to_triton_code(helion.Config(**{**config, **ring}))
+            fallbacks = [
+                f"tagged peer transport disabled: {call.args[2]}"
+                for call in info.call_args_list
+                if call.args[1:2] == ("tagged peer transport",)
+            ]
+            return generated + "".join(fallbacks)
+
+        def skip_marks(generated: str) -> int:
+            """Row presence words a guard-skipped task marks (no rows)."""
+            return len(
+                re.findall(
+                    r"tl\.cast\(\w+ << 32, tl\.uint64\), \(tl\.arange\(0, \d+\) == 0\)",
+                    generated,
+                )
+            )
+
+        tagged = code("")
+        self.assertEqual(tagged.count("_helion_ring.tagged_load("), 2)
+        self.assertIn("tagged_presence", tagged)
+        self.assertEqual(skip_marks(tagged), 1)
+        self.assertIn("_persistent_state_rank_shares=(0,)", tagged)
+        self.assertNotIn("tagged peer transport disabled", tagged)
+        # The consumer skipping on another bound, an unmasked push (every row):
+        # the guard's skipped tasks mark their tiles either way.
+        for variant, rank, share in (("", 1, 1), ("bound", 0, 0), ("unmasked", 0, 0)):
+            with self.subTest(variant=variant, rank=rank):
+                generated = code(variant, rank)
+                self.assertNotIn("tagged peer transport disabled", generated)
+                self.assertEqual(skip_marks(generated), 1)
+                self.assertIn(f"_persistent_state_rank_shares=({share},)", generated)
+                if variant == "unmasked":
+                    self.assertIn("tl.cast(tl.full([], 65535, tl.int64)", generated)
+        # Every rank pushing the same columns is tagged on every rank too (the
+        # same transport): the first launch rejects the shares.
+        self.assertIn("_persistent_state_rank_shares=(0,)", code("share", rank=1))
+        generated = code("branch")
+        rule = "T4: z: a push under a branch that is not the root's guard"
+        self.assertIn(f"tagged peer transport disabled: {rule}", generated)
+        self.assertNotIn("tagged_load", generated)
+        # Tasks sharing a tile would race on its row presence words, guarded or
+        # masked.
+        rule = "T1: a masked or guard-skipped push writes one tile per task"
+        for variant in ("same", "rootsame"):
+            with self.subTest(variant=variant):
+                with self.assertLogs(tile_dependency.log, "INFO") as logs:
+                    generated = code(variant)
+                self.assertTrue(any(rule in line for line in logs.output), logs.output)
+                self.assertNotIn("tagged_load", generated)
 
 
 if __name__ == "__main__":

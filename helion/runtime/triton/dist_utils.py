@@ -223,33 +223,16 @@ def _add_on_every_rank(  # noqa: ANN202
 
 
 @triton.jit
-def _store_on_every_rank(  # noqa: ANN202
-    buffer_ptrs,  # noqa: ANN001
-    offset,  # noqa: ANN001
-    value,  # noqa: ANN001
-    world_size: tl.constexpr,
-    lanes: tl.constexpr,
-):
-    """Store one tagged uint64 word, relaxed at system scope, on every rank."""
-    ranks = tl.arange(0, lanes)
-    bases = tl.load(
-        buffer_ptrs.to(tl.pointer_type(tl.uint64)) + ranks,
-        mask=ranks < world_size,
-        other=0,
-    )
-    tl.inline_asm_elementwise(
-        "{ .reg .pred p; setp.ne.b32 p, $3, 0; "
-        "@p st.relaxed.sys.global.u64 [$1], $2; mov.u32 $0, 0; }",
-        "=r,l,l,r",
-        [
-            bases.to(tl.pointer_type(tl.uint64)) + offset,
-            tl.cast(value, tl.uint64) + tl.zeros([lanes], tl.uint64),
-            (ranks < world_size).to(tl.int32),
-        ],
-        dtype=tl.int32,
-        is_pure=False,
-        pack=1,
-    )
+def _claim(counter, claims, first, end):  # noqa: ANN001, ANN202
+    """A root's next claimed task index after the ``first`` static ones, or
+    ``end`` (the root's static task count, which stops a reader of the ticket)
+    once none of the ``claims`` live tasks is left; the launch's last claim
+    resets the counter."""
+    ticket = tl.atomic_add(counter, 1, sem="relaxed", scope="gpu")
+    if ticket == claims - 1:
+        tl.atomic_xchg(counter, 0, sem="relaxed", scope="gpu")
+    task = (ticket + first).to(tl.int32)
+    return tl.where(task < claims, task, end).to(tl.uint64)  # a task-channel ticket
 
 
 @triton.jit
@@ -319,15 +302,16 @@ def _scatter_cover(  # noqa: ANN202
     done,  # noqa: ANN001
     cover,  # noqa: ANN001
     votes,  # noqa: ANN001
-    tasks: tl.constexpr,
-    lanes: tl.constexpr,
-    keys: tl.constexpr,
+    tasks,  # noqa: ANN001
+    lanes,  # noqa: ANN001
+    keys,  # noqa: ANN001
     world_size: tl.constexpr,
     threads: tl.constexpr,
 ):
     """Mark the keys ``source``'s scatter tasks wrote this launch in the local
     cover table. 1 on every thread once each task recorded its rows or was
-    skipped, so an unmarked key is one no task wrote."""
+    skipped, so an unmarked key is one no task wrote. The layout arguments may
+    be runtime values: a reader loops over its sources with one copy of this."""
     parity = tl.cast(epoch & 1, tl.int64)
     tag = tl.cast(epoch, tl.uint32)
     remote = tl.load(ptrs.to(tl.pointer_type(tl.uint64)) + source)

@@ -1850,7 +1850,7 @@ class TestCuteLowerings(unittest.TestCase):
             patch(
                 "helion._compiler.host_function.HostFunction.current",
                 return_value=SimpleNamespace(
-                    device_ir=SimpleNamespace(grid_block_ids=[[0, 1]])
+                    device_ir=SimpleNamespace(root_ids=[0], grid_block_ids=[[0, 1]])
                 ),
             ),
             patch(
@@ -1896,7 +1896,7 @@ class TestCuteLowerings(unittest.TestCase):
             patch(
                 "helion._compiler.host_function.HostFunction.current",
                 return_value=SimpleNamespace(
-                    device_ir=SimpleNamespace(grid_block_ids=[[0, 1]])
+                    device_ir=SimpleNamespace(root_ids=[0], grid_block_ids=[[0, 1]])
                 ),
             ),
             patch(
@@ -9077,8 +9077,9 @@ class TestCuteLowerings(unittest.TestCase):
 
         ``acc = x @ I`` is exactly ``x``, and the fp32 outputs keep every
         rounding visible.  At ``x = -88`` the sigmoid is denormal: the
-        sigmoid contract flushes it (``-0``) where a reciprocal of the exact
-        ``exp`` kept it (about ``-5.3e-37``, which survives a bf16 cast).
+        sigmoid form keeps it (about ``-5.3e-37``, which survives a bf16
+        cast), and the ``fast_math`` quotient flushes it (``-0``), as the
+        pointwise ``div.approx.ftz`` does.
         The renderings are compared on CPU in
         ``test_cute_native_sigmoid.py``.
         """
@@ -9290,9 +9291,9 @@ class TestCuteLowerings(unittest.TestCase):
         # be a bare sigmoid step and a free-standing outer mul.
         self.assertRegex(
             code,
-            r"tcgen05_chain_step_\d+ = (tcgen05_acc_loaded_\d+) \* cute\.math\.rcp\("
-            r"1\.0 \+ cute\.math\.exp2\(\1 \* -1\.4426950408889634, fastmath=True\), "
-            r"approx=True, ftz=True\)",
+            r"tcgen05_chain_step_\d+ = (tcgen05_acc_loaded_\d+) \* \(cute\.math\.rcp\("
+            r"cute\.math\.exp2\(\1 \* -1\.4426950408889634, fastmath=True\) \* 0\.25 "
+            r"\+ 0\.25, approx=True, ftz=True\) \* 0\.25\)",
         )
         out = bound(x, y)
         ref = x @ y
@@ -13577,7 +13578,7 @@ class TestCuteLowerings(unittest.TestCase):
         with patch(
             "helion._compiler.host_function.HostFunction.current",
             return_value=SimpleNamespace(
-                device_ir=SimpleNamespace(grid_block_ids=[[0, 1]])
+                device_ir=SimpleNamespace(root_ids=[0], grid_block_ids=[[0, 1]])
             ),
         ):
             self.assertTrue(_loop_contains_matmul(fn, [0, 1]))
@@ -13619,7 +13620,7 @@ class TestCuteLowerings(unittest.TestCase):
             patch(
                 "helion._compiler.host_function.HostFunction.current",
                 return_value=SimpleNamespace(
-                    device_ir=SimpleNamespace(grid_block_ids=[[0, 1]])
+                    device_ir=SimpleNamespace(root_ids=[0], grid_block_ids=[[0, 1]])
                 ),
             ),
             patch(
@@ -16197,7 +16198,10 @@ class TestCuteLowerings(unittest.TestCase):
                     code = bound.to_code(config)
                     self.assertIn("for tcgen05_epi_position", code)
                     self.assertIn("tcgen05_compact_gD_epi", code)
-                    self.assertIn("_cute_sigmoid_approx_ftz_f32(", code)
+                    # The pointwise sigmoid, under fast_math too: the
+                    # scaled reciprocal, not the flushing helper.
+                    self.assertIn("* 0.25 + 0.25, approx=True, ftz=True) * 0.25", code)
+                    self.assertNotIn("_cute_sigmoid_approx_ftz_f32", code)
                     self.assertIn(
                         f"'kind': 'tcgen05_d_tma', 'bm': 128, 'bn': {source_bn // 2}",
                         code,
@@ -16231,8 +16235,8 @@ class TestCuteLowerings(unittest.TestCase):
         self.assertIn("for tcgen05_epi_position", code)
         # The default sigmoid lowering is the triton-parity RCP.APPROX +
         # EX2.APPROX sequence (same accuracy class as the IEEE-div form it
-        # replaced); strict math means the fragment-level ftz HELPER —
-        # which skips the epilogue pipeline entirely — stays fastmath-only.
+        # replaced); the fragment renderer takes it with and without
+        # fast_math, never the flushing helper.
         self.assertIn("cute.math.rcp", code)
         self.assertNotIn("_cute_sigmoid_approx_ftz_f32", code)
         acc = torch.einsum("mk,hkd->hmd", args[0].float(), args[1].float())

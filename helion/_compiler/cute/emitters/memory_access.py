@@ -1163,9 +1163,14 @@ def _cute_combined_mask(
     *,
     include_tensor_index_masks: bool = True,
     for_store: bool = False,
+    proven_index_bounds: frozenset[int] = frozenset(),
 ) -> str | None:
     # Destination stores may need an element-owner mask for arbitration.
     # A source/reloaded tile scalar must remain uniform across those lanes.
+    # ``proven_index_bounds`` are the subscript positions of gathered
+    # coordinates the caller proved inside their dim on every lane the tile
+    # masks admit (``gathered_bounds.proven_gather_positions``): their
+    # ``index < size`` term repeats those masks and is left out.
     env = CompileEnvironment.current()
     terms: list[str] = []
 
@@ -1235,6 +1240,8 @@ def _cute_combined_mask(
 
     def tensor_index_bounds_term(pos: int, tensor_dim: int) -> str | None:
         if tensor is None or tensor_dim >= tensor.ndim:
+            return None
+        if pos in proven_index_bounds:
             return None
         ast_args = state.ast_args
         if not (

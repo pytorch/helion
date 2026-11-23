@@ -124,6 +124,11 @@ class CompactWorklistPlan:
     # clamp this narrows only the compute range -- range_len, the resident
     # window, and its refills still describe the whole source range.
     ordered_begin_window: int | None = None
+    # Every loop nested in the compact tile is a static tile loop whose bounds
+    # are host-evaluable (e.g. ``hl.tile(0, N)`` / ``hl.tile(0, K)`` of a
+    # grouped GEMM). Those loops need no worklist metadata: they are emitted
+    # as ordinary static loops over VMEM-resident blocks.
+    static_inner_loops: bool = False
 
     @property
     def owner_axis(self) -> Axis:
@@ -724,12 +729,63 @@ def render_build_worklist(
     return "\n".join(lines), offset_params
 
 
+def render_fill_worklist(
+    plan: CompactWorklistPlan,
+    *,
+    block: int,
+    sublane: int,
+    fill_name: str = "_fill_worklist",
+    owner_var: str = "_owner",
+) -> tuple[str, list[str]]:
+    """Render the module-level in-kernel ``_fill_worklist`` source.
+
+    Used for ``plan.static_inner_loops``. Returns ``(source, offset_params)``
+    like :func:`render_build_worklist`, but the function runs inside the
+    Pallas kernel: its offset params are SMEM copies of the host offset
+    tensors, and it writes the worklist into the SMEM tables
+    ``(num_work_ref, owner_ref, start_ref, extent_ref)`` with one scalar loop
+    per owner (:func:`fill_owner_tiles`). Tiles are ``sublane``-aligned so
+    that each work item's rows sit in one aligned window of at most ``block``
+    rows.
+    """
+    leak_ok = _bound_tensors(plan)
+    subs = {plan.owner_axis.loop_var: owner_var}
+    compact = plan.compact_axis
+    base_resolved = resolve_for_worklist(compact.base, subs, leak_ok=leak_ok)
+    length_resolved = resolve_for_worklist(compact.length, subs, leak_ok=leak_ok)
+    num_owners_expr = plan.num_owners_expr or (
+        f"{_offset_tensor_name(base_resolved)}.shape[0] - 1"
+    )
+    offset_params = _free_host_names_in_order(
+        [base_resolved, length_resolved, _plain(num_owners_expr)], owner_var
+    )
+    params = ", ".join(
+        [*offset_params, "num_work_ref", "owner_ref", "start_ref", "extent_ref"]
+    )
+    lines = [
+        f"def {fill_name}({params}):",
+        "    import jax",
+        "    import jax.numpy as jnp",
+        f"    def _fill_owner({owner_var}, _num_work):",
+        f"        _base = {ast.unparse(base_resolved)}",
+        f"        _length = {ast.unparse(length_resolved)}",
+        "        return fill_owner_tiles(",
+        f"            _num_work, {owner_var}, _base, _length, {block}, {sublane},",
+        "            owner_ref, start_ref, extent_ref",
+        "        )",
+        "    num_work_ref[0] = jax.lax.fori_loop(",
+        f"        0, {num_owners_expr}, _fill_owner, jnp.int32(0)",
+        "    )",
+    ]
+    return "\n".join(lines), offset_params
+
+
 # ---------------------------------------------------------------------------
 # Detection
 # ---------------------------------------------------------------------------
 
 
-def _to_plain(node: ast.AST) -> ast.AST:
+def _to_plain(node: ast.AST) -> ast.expr:
     """Strip ExtendedAST/location by round-tripping through source.
 
     Captured host bounds (``offsets[source + 1]``) come from ``host_fn.body`` as
@@ -750,23 +806,21 @@ def _torch_size_to_jnp_shape(node: ast.AST) -> ast.AST:
 
     The owner count comes from the kernel's host ``hl.grid`` bound, which is
     written in torch (``offsets.size(0) - 1``); the builder runs on jax
-    arrays, so it must read ``.shape[i]`` instead.
+    arrays, so it must read ``.shape[i]`` instead. A bare ``x.size()`` (a
+    tuple-unpacked prologue name, ``x.size()[i]``) becomes ``x.shape``.
     """
 
     class _T(ast.NodeTransformer):
         def visit_Call(self, node: ast.Call) -> ast.AST:
             self.generic_visit(node)
             func = node.func
-            if (
-                isinstance(func, ast.Attribute)
-                and func.attr == "size"
-                and len(node.args) == 1
-            ):
-                return ast.Subscript(
-                    value=ast.Attribute(value=func.value, attr="shape", ctx=ast.Load()),
-                    slice=node.args[0],
-                    ctx=ast.Load(),
-                )
+            if not (isinstance(func, ast.Attribute) and func.attr == "size"):
+                return node
+            shape = ast.Attribute(value=func.value, attr="shape", ctx=ast.Load())
+            if not node.args and not node.keywords:
+                return shape
+            if len(node.args) == 1:
+                return ast.Subscript(value=shape, slice=node.args[0], ctx=ast.Load())
             return node
 
     return ast.fix_missing_locations(_T().visit(node))
@@ -809,7 +863,9 @@ def _collect_prologue_assigns(
     """Map ``name -> rhs AST`` for simple top-level ``name = expr`` assigns.
 
     Used to inline loop-prologue scalar loads (``start = offsets[source]``) so
-    a captured bound resolves to a host expression over the owner var.
+    a captured bound resolves to a host expression over the owner var. A tuple
+    unpack (``G, _, N = w.size()``) binds each name to its element of the value
+    (``w.size()[2]``).
 
     Only statements that appear *before* ``before`` (the statement that is or
     contains the selected loop) are scanned -- a reassignment of a bound variable
@@ -819,12 +875,20 @@ def _collect_prologue_assigns(
     for stmt in body:
         if before is not None and any(node is before for node in ast.walk(stmt)):
             break
-        if (
-            isinstance(stmt, ast.Assign)
-            and len(stmt.targets) == 1
-            and isinstance(stmt.targets[0], ast.Name)
+        if not (isinstance(stmt, ast.Assign) and len(stmt.targets) == 1):
+            continue
+        target = stmt.targets[0]
+        if isinstance(target, ast.Name):
+            out[target.id] = _to_plain(stmt.value)
+        elif isinstance(target, ast.Tuple) and all(
+            isinstance(elt, ast.Name) for elt in target.elts
         ):
-            out[stmt.targets[0].id] = _to_plain(stmt.value)
+            value = _to_plain(stmt.value)
+            for i, elt in enumerate(target.elts):
+                assert isinstance(elt, ast.Name)
+                out[elt.id] = ast.Subscript(
+                    value=copy.deepcopy(value), slice=ast.Constant(i), ctx=ast.Load()
+                )
     return out
 
 
@@ -861,6 +925,83 @@ def _tile_loops(grid_body: list[ast.stmt]) -> list[ast.For]:
         loops.append(found)
         body = found.body
     return loops
+
+
+def _nested_tile_loops(loop: ast.For) -> list[ast.For]:
+    """Every ``hl.tile`` for-loop anywhere inside ``loop``'s body."""
+    found: list[ast.For] = []
+    for stmt in loop.body:
+        for node in ast.walk(stmt):
+            if not isinstance(node, ast.For):
+                continue
+            call = _loop_iter_call(node)
+            if call is not None and _iter_func_name(call) == "tile":
+                found.append(node)
+    return found
+
+
+def _is_static_tile_loop(
+    loop: ast.For, host_names: set[str], loop_vars: set[str]
+) -> bool:
+    """True if ``loop`` covers the same static range in every work item.
+
+    Its bounds read only host values (``hl.tile(0, N)`` with ``N`` unpacked from
+    ``w.size()``): no loop coordinate, no device scalar, no tensor element. Such
+    a loop runs whole inside each work item over the work item's blocks, so it
+    needs no worklist metadata of its own.
+    """
+    from ..compile_environment import CompileEnvironment
+
+    block_id = _block_id_of_loop(loop)
+    if block_id is None:
+        return False
+    spec = CompileEnvironment.current().config_spec.block_sizes.block_id_lookup(
+        block_id
+    )
+    if spec.data_dependent:
+        return False
+    call = _loop_iter_call(loop)
+    if call is None or not call.args or not isinstance(loop.target, ast.Name):
+        return False
+    for bound in call.args:
+        names = _names_read(bound)
+        if names & loop_vars or not names <= host_names:
+            return False
+        if any(
+            isinstance(node, ast.Subscript) and isinstance(node.value, ast.Name)
+            for node in ast.walk(bound)
+        ):
+            return False
+    return True
+
+
+def _fold_static_shapes(node: ast.AST, params: Mapping[str, object]) -> ast.AST:
+    """Fold ``x.shape[i]`` of a multi-dim host tensor into its static size.
+
+    The owner count may come from a data tensor (``G, _, N = w.size()``). The
+    worklist builder takes only offsets-like 1-D tensors, so a shape-only use of
+    any other tensor becomes a literal instead of a builder parameter.
+    """
+
+    class _Fold(ast.NodeTransformer):
+        def visit_Subscript(self, node: ast.Subscript) -> ast.AST:
+            self.generic_visit(node)
+            value = node.value
+            if not (
+                isinstance(value, ast.Attribute)
+                and value.attr == "shape"
+                and isinstance(value.value, ast.Name)
+                and isinstance(node.slice, ast.Constant)
+                and type(node.slice.value) is int
+            ):
+                return node
+            tensor = params.get(value.value.id)
+            if not isinstance(tensor, torch.Tensor) or tensor.ndim == 1:
+                return node
+            size = tensor.shape[node.slice.value]
+            return ast.Constant(size) if isinstance(size, int) else node
+
+    return _Fold().visit(node)
 
 
 def _length_ast(begin: ast.AST, end: ast.AST) -> ast.AST:
@@ -1304,8 +1445,9 @@ def detect_compact_worklist_plan(
     if grid_call is None or not grid_call.args:
         raise exc.InvalidConfig("compact_worklist: owner hl.grid has no size arg.")
     top_level = _collect_prologue_assigns(host_fn.body, before=grid_loop)
-    num_owners_ast = _torch_size_to_jnp_shape(
-        _inline(_to_plain(grid_call.args[0]), top_level)
+    num_owners_ast = _fold_static_shapes(
+        _torch_size_to_jnp_shape(_inline(_to_plain(grid_call.args[0]), top_level)),
+        host_fn.params.arguments,
     )
     num_owners_expr = ast.unparse(num_owners_ast)
 
@@ -1314,19 +1456,33 @@ def detect_compact_worklist_plan(
         raise exc.InvalidConfig(
             "compact_worklist requires a jagged hl.tile inside the owner grid."
         )
-    if len(tile_loops) > 2:
+    compact_loop = tile_loops[0]
+    if not isinstance(compact_loop.target, ast.Name):
+        raise exc.InvalidConfig("compact_worklist: compact tile var is not a Name.")
+    compact_var = compact_loop.target.id
+    ordered_var: str | None = None
+
+    # Inner tile loops either all have static bounds (e.g. the N and K loops
+    # of a grouped GEMM: each work item runs them whole over its blocks) or are
+    # a single ordered (carried-state, jagged) loop.
+    inner_loops = _nested_tile_loops(compact_loop)
+    loop_vars = {owner_var, compact_var} | {
+        loop.target.id for loop in inner_loops if isinstance(loop.target, ast.Name)
+    }
+    host_names = _host_evaluable_names(host_fn)
+    static_inner_loops = bool(inner_loops) and all(
+        _is_static_tile_loop(loop, host_names, loop_vars) for loop in inner_loops
+    )
+    if static_inner_loops:
+        ordered_loop = None
+    elif len(tile_loops) > 2:
         raise exc.InvalidConfig(
             "compact_worklist supports at most a compact tile + one ordered "
             f"inner tile; found {len(tile_loops)} nested hl.tile loops "
             "(3+-level ragged products are out of scope)."
         )
-
-    compact_loop = tile_loops[0]
-    ordered_loop = tile_loops[1] if len(tile_loops) == 2 else None
-    if not isinstance(compact_loop.target, ast.Name):
-        raise exc.InvalidConfig("compact_worklist: compact tile var is not a Name.")
-    compact_var = compact_loop.target.id
-    ordered_var: str | None = None
+    else:
+        ordered_loop = tile_loops[1] if len(tile_loops) == 2 else None
 
     # An inner tile loop is only supported when it is the ordered (carried-state)
     # axis: a name assigned in its body, read in its body, and read after it.
@@ -1505,6 +1661,7 @@ def detect_compact_worklist_plan(
         num_owners_expr=num_owners_expr,
         ordered_end_clamped_to_compact=ordered_end_clamped_to_compact,
         ordered_begin_window=ordered_begin_window,
+        static_inner_loops=static_inner_loops,
     )
 
 

@@ -73,6 +73,7 @@ from .launch_shape import plan_owned_launch
 from .math_templates import SIGMOID_TEMPLATE
 from .math_templates import argreduce_candidate_expr
 from .math_templates import nan_extremum_expr
+from .packet_flush_names import streaming_store_rendered
 from .pdl_release import ZERO_FILL_KERNEL_PREFIX
 from .pdl_release import generic_release_rendered
 from .pdl_release import spread_rendered
@@ -1489,14 +1490,42 @@ class CuteBackend(Backend):
         ranking by the release there would break ties between unrelated
         knobs (matmul backward s2: a clc-persistent finalist 0.5% behind in
         the autotuner's regime, 7% behind in the catalogue's).  A config
-        without the knob ranks last without a render.
+        without the knob ranks 2, and is rendered only for the store policy
+        below.
+
+        Behind all of these come the kernels that flush a packet with the
+        streaming store policy (``cute_store_policy='streaming'``,
+        ``st.global.cs``): three ranks back, so the ranks 0 to 2 are those of
+        kernels that store with the default policy.  The policy marks the
+        output's lines evict-first at L1 and L2.  The kernel's own isolated
+        timing reads that as a tie wherever the output displaces nothing the
+        kernel reads again, and the next kernel of the real call sequence
+        pays for it when it reads that output, which a default store would
+        have left in L2.  A displaced output costs its reader in proportion
+        to its size and a missed early launch at most one launch overlap,
+        so the store ranks before the release.  Whether a config flushes
+        such a packet is read off its module as well
+        (``streaming_store_rendered``): on scalar stores, narrower packets
+        and staged stores the policy renders nothing.  A config with the
+        default policy is never rendered for it.
+
+        The direction is fixed, so this is a tie break with a bounded loss
+        and not a claim that default stores are faster: it acts only
+        between finalists the selection's windows read within the
+        tolerance, where a kernel gives up at most that share of its own
+        time.
         """
-        if config.config.get("cute_pdl") is not True:
+        streaming = config.config.get("cute_store_policy") == "streaming"
+        releasing = config.config.get("cute_pdl") is True
+        if not streaming and not releasing:
             return 2
         rendered = source()
-        if not generic_release_rendered(rendered):
-            return 2
-        return 0 if spread_rendered(rendered) else 1
+        rank = 2
+        if releasing and generic_release_rendered(rendered):
+            rank = 0 if spread_rendered(rendered) else 1
+        if streaming and streaming_store_rendered(rendered):
+            rank += 3
+        return rank
 
     def build_standalone_code(
         self,
@@ -1507,6 +1536,20 @@ class CuteBackend(Backend):
         from .standalone import build_standalone_code
 
         return build_standalone_code(bound, import_lines, body_root)
+
+    def standalone_entry_args(
+        self, bound: BoundKernel[Any], args: Sequence[object]
+    ) -> tuple[object, ...]:
+        """Callable arguments (score/mask mods) are compiled into the kernel,
+        so the standalone entry point omits them (:func:`omitted_parameters`)."""
+        from .standalone import omitted_parameters
+
+        omitted = omitted_parameters(bound)
+        return tuple(
+            arg
+            for name, arg in zip(bound.kernel.signature.parameters, args, strict=False)
+            if name not in omitted
+        )
 
     def collective_owns_tile(self, fn: DeviceFunction, block_id: int) -> bool:
         from ..compile_environment import CompileEnvironment
@@ -1595,6 +1638,15 @@ class CuteBackend(Backend):
         # after an atomic itself, and refuses a config that would need such a
         # barrier in a body a later pass rewrites; a barrier emitted before
         # the load would hide that refusal.
+        return False
+
+    @property
+    def intra_loop_barriers_carry_iterations(self) -> bool:
+        # The thread-barrier pass checks every access pair across consecutive
+        # iterations too and closes the body where they meet
+        # (``lane_loops/barriers.py``), with the lane loops' own refusals.  It
+        # does not take an access through device pointers (``cute.make_ptr``)
+        # to reach other storage, so the walk still carries such loops.
         return False
 
     @property
@@ -2881,6 +2933,25 @@ class CuteBackend(Backend):
         # keeps a slow seed inside the timeout.
         return True
 
+    def autotune_short_kernel_below_us(self, config_spec: ConfigSpec) -> float | None:
+        # A row-reduction or pointwise kernel of 3-30 us has dozens of
+        # configs within a few percent of each other. The search's event
+        # timer reads them in steps of about 2 us, launch latency included
+        # (every finalist of a 13 us LayerNorm read 16.4 us while the final
+        # selection's trace separated them over 12.8-14.0 us), so the search
+        # walked over ties and the final selection picked among a random
+        # handful of them. A search whose best initial config reads below
+        # 64 us, where an event step is over 3% of a reading, reads its
+        # candidates' kernel durations from the trace, the timer of this
+        # backend's final selection (``default_final_selection_regime``).
+        # Not the flash search: its terminal refinement re-times members
+        # with mirrored wall-clock sweeps in this process
+        # (``mirrored_rebenchmark``) and ranks its history by the latest
+        # reading, so its candidates stay on one scale with those sweeps.
+        if config_spec.cute_flash_search_enabled:
+            return None
+        return 64.0
+
     def supports_parallel_render(self) -> bool:
         # Code generation only reads the device facts the render pool
         # captures (the MMA-support probe's current device, device properties
@@ -3042,7 +3113,86 @@ class CuteBackend(Backend):
         return source_hash if isinstance(source_hash, str) else None
 
     def should_deduplicate_generated_sources(self, config_spec: ConfigSpec) -> bool:
-        return config_spec.cute_flash_search_enabled
+        # A candidate is its generated module (``BenchmarkJob`` takes the
+        # source and the arguments, never the config), so two configs with one
+        # source are one kernel.  Many are: a ``load_eviction_policies`` slot
+        # whose load the layout serves from registers, an L2 policy on a
+        # packet width without a hinted load, a knob of a pass the config
+        # leaves off.
+        return True
+
+    def collapses_generated_source_aliases(self, config_spec: ConfigSpec) -> bool:
+        # The flash search runs its own alias policy (structural lanes,
+        # source quarantine); every other search drops the aliases.
+        return not config_spec.cute_flash_search_enabled
+
+    def simplified_selected_config(
+        self,
+        config_spec: ConfigSpec,
+        config: Config,
+        same_source: Callable[[Config], bool],
+    ) -> Config:
+        # A ``load_eviction_policies`` slot is dead when the selected layout
+        # serves its load from registers, or when its packet width has no
+        # hinted load: the policy leaves no trace in the code.  Which slots
+        # those are is decided by the lane passes after codegen, so it is
+        # read off renders: every policy reset at once first (one render when
+        # all are dead), else slot by slot, keeping each reset that leaves
+        # the source as it is.  The load-form knobs the search set for the
+        # policies go with them where the source allows.  What is returned
+        # is a config ``same_source`` accepted, as it was asked about, or
+        # ``config`` itself.
+        policies = config.config.get("load_eviction_policies")
+        if not isinstance(policies, list) or not any(policies):
+            return config
+        from .autotune.config_keys import CUTE_LOAD_HINT_FORM_KEYS
+
+        def with_policies(values: list[object]) -> Config:
+            return config.from_dict(
+                {**config.config, "load_eviction_policies": [*values]}
+            )
+
+        cleared = config.from_dict(
+            {
+                **{
+                    name: value
+                    for name, value in config.config.items()
+                    if name not in CUTE_LOAD_HINT_FORM_KEYS
+                },
+                "load_eviction_policies": [""] * len(policies),
+            }
+        )
+        if same_source(cleared):
+            return cleared
+        # ``cleared`` dropped the form knobs too.  Where the config names
+        # one, the policies may all be dead with the knob alive (it also
+        # predicates a masked element whose hint the kernel spells out), so
+        # resetting the last set policy is asked about as well.
+        forms = any(config.config.get(key) is True for key in CUTE_LOAD_HINT_FORM_KEYS)
+        accepted = config
+        live = list(policies)
+        for index, policy in enumerate(policies):
+            trial = [*live]
+            trial[index] = ""
+            # Without a form knob ``cleared`` is answered: the last set
+            # policy stays.
+            if policy == "" or not (forms or any(trial)):
+                continue
+            candidate = with_policies(trial)
+            if same_source(candidate):
+                live = trial
+                accepted = candidate
+        # A load-form knob the search set for the policies (``open_load_hint_
+        # forms``) is dead when no policy that stays needs its form.
+        for key in CUTE_LOAD_HINT_FORM_KEYS:
+            if accepted.config.get(key) is not True:
+                continue
+            candidate = config.from_dict(
+                {name: value for name, value in accepted.config.items() if name != key}
+            )
+            if same_source(candidate):
+                accepted = candidate
+        return accepted
 
     def classify_autotune_exception(self, err: BaseException) -> str | None:
         # Exceptions raised from inside the cute/cutlass DSL during compile or
@@ -3554,6 +3704,86 @@ class CuteBackend(Backend):
                 return CuteDSLOpOverrides._apply_unary_op(x, "cute.math.roundeven({x})")
 
             @staticmethod
+            # pyrefly: ignore [bad-override]
+            def fma(x: CuteDSLArg, y: CuteDSLArg, z: CuteDSLArg) -> CuteDSLArg:
+                """``x * y + z`` rounded once, for a node that computes in fp32
+                or fp64.
+
+                ``ops.fma`` is what Inductor lowers ``torch.addcmul``,
+                ``add`` with ``alpha``, ``addcdiv`` with a value and
+                ``prims.fma`` to on a CUDA device, and its Triton form is
+                ``tl.fma``.  The base ``add(mul(x, y), z)`` is a separate
+                product and sum in the source, which NVVM and ptxas contract
+                or not: where the addend is a product too (the softmax
+                backward's ``fma(-p, total, grad * p)``) they may fuse that
+                one and round this.
+
+                The dtype is the one the node computes in
+                (``division_dtype``, which is not about divisions only):
+                ``x.add_(y, alpha=2)`` with an fp32 ``x`` and an fp64 ``y``
+                is an fp64 fma whose result alone is cast to fp32.
+
+                Like integers, two forms keep the base lowering:
+
+                * a bf16 or fp16 computation.  ``cute.math.fma`` of 16-bit
+                  operands is the fp32 fma of the widened operands, and
+                  rounding that to the dtype rounds twice (Inductor's
+                  result, and eager CUDA's for ``addcmul``).  A product and
+                  sum in the dtype is contracted to one 16-bit fma, which
+                  rounds once, as ``tl.fma`` of 16-bit operands does.  Which
+                  product that fma fuses when the addend is a product too
+                  stays the assembler's choice there.
+                * ``torch.add(x, 2.5, alpha=0.3)`` in fp32, whose
+                  multiplicands are both Python scalars: their product is
+                  folded in double precision when the kernel is traced and
+                  one add remains, where the fma multiplies by ``alpha``
+                  rounded to fp32 (eager CUDA's result).  In fp64 neither
+                  scalar is rounded: it is the fma, eager's result, where
+                  the folded sum would add the rounded product.
+                """
+                from torch._inductor.virtualized import V
+
+                from ..inductor_lowering import division_dtype
+
+                node = V.current_node
+                dtype = (
+                    division_dtype(node) if isinstance(node, torch.fx.Node) else None
+                )
+                # A Python scalar as the second argument is ``add``'s
+                # ``other``, beside its scalar ``alpha``: the other nodes
+                # that reach ``ops.fma`` take tensors there.
+                if (
+                    dtype is None
+                    or dtype not in (torch.float32, torch.float64)
+                    or (
+                        dtype == torch.float32
+                        and isinstance(node.args[1], (int, float))
+                    )
+                ):
+                    # pyrefly: ignore [bad-argument-type]
+                    return CuteDSLOpOverrides.fma(x, y, z)
+                operands = [
+                    CuteDSLOpOverrides._cast_expr(
+                        CuteDSLOpOverrides._as_expr(operand), dtype
+                    )
+                    for operand in (x, y, z)
+                ]
+                if (
+                    node.target is torch.ops.prims.fma.default
+                    and isinstance(node.args[0], torch.fx.Node)
+                    and node.args[0].target is torch.ops.aten.neg.default
+                ):
+                    # ``fma(-p, t, c)`` as ``fma(p, -t, c)``, the same value
+                    # bit for bit, where ``-(-p)`` folds back to ``p``: NVVM
+                    # moves the negation of a quotient ``p = e / s`` into its
+                    # dividend, and ``(-e) / s`` no longer shares the division
+                    # with the other uses of ``p`` (the softmax backward's
+                    # ``fma(-p, total, grad * p)`` recomputes ``p``).
+                    operands[0] = f"-{operands[0]}"
+                    operands[1] = f"-{operands[1]}"
+                return f"cute.math.fma({', '.join(operands)})"
+
+            @staticmethod
             def tanh(x0: CuteDSLArg) -> CuteDSLArg:
                 return HelionCuteDSLOpOverrides._unary_math(x0, "tanh")
 
@@ -3572,19 +3802,19 @@ class CuteBackend(Backend):
                     return CuteDSLOpOverrides._apply_unary_op(
                         x, "1.0 / (1.0 + cute.math.exp(-({x})))"
                     )
-                # RCP.APPROX + EX2.APPROX, the same sequence triton's default
-                # tl.sigmoid compiles to (one MUFU.EX2 + one MUFU.RCP).  The
-                # base lowering's division (``div.full.f32``, or under
-                # ``cute_exact_division`` the IEEE one, a ~20-instruction
-                # BRANCHY SASS expansion with a BSSY/BSYNC reconvergence per
-                # element) buys no accuracy here: sigmoid's error is
-                # dominated by the shared x*log2e argument rounding, and both
-                # forms measure max 64 ulp / mean 3.5 ulp vs an fp64
-                # reference on [-87, 87] (identical distributions), with
-                # specials preserved (nan->nan, +-inf->1/0, saturation->0).
-                # Only denormal OUTPUTS differ: this form flushes them to
-                # zero, as triton kernels do by default.  fp16 sigmoid
-                # 67108864: 4943 -> 5805 GB/s (B200, cold autotune).
+                # EX2.APPROX and one MUFU.RCP of the scaled denominator, with
+                # the bits of triton's default tl.sigmoid (``ex2.approx`` and
+                # ``div.full(1, d)``) for every fp32 input: see
+                # ``SIGMOID_TEMPLATE``.  The base lowering's division
+                # (``div.full.f32``, or under ``cute_exact_division`` the
+                # IEEE one, a ~20-instruction BRANCHY SASS expansion with a
+                # BSSY/BSYNC reconvergence per element) buys no accuracy
+                # here: sigmoid's error is dominated by the shared x*log2e
+                # argument rounding, and both forms measure max 64 ulp /
+                # mean 3.5 ulp vs an fp64 reference on [-87, 87] (identical
+                # distributions), with specials preserved (nan->nan,
+                # +-inf->1/0, saturation->0) and denormal outputs kept, as
+                # triton keeps them.
                 x_cse = CuteDSLOpOverrides._get_cse_var(x)
                 if x_cse is not None:
                     x_fp32: CuteDSLArg = CuteDSLOpOverrides.to_dtype(
@@ -4081,34 +4311,26 @@ class CuteBackend(Backend):
         val: str,
         dtype: torch.dtype,
     ) -> str:
-        # Use Python ternary instead of cute.where for max/min because
-        # these operate on scalar registers, not tensors.
-        #
         # Cast the incoming value to the accumulator dtype first.  The
         # accumulator is promoted to the computation dtype (fp32 for
         # half-precision inputs), but the per-iteration reduction input keeps
-        # the tensor's storage dtype (e.g. bf16 for a masked half load).  The
-        # CUTLASS DSL strictly type-checks the two branches of a Python ternary
-        # ("Then and else blocks of ifexp return different types"), so a bare
-        # ``acc if acc > val else val`` with mixed fp32/bf16 operands fails to
-        # compile.  The cast is a no-op when ``val`` already matches.
+        # the tensor's storage dtype (e.g. bf16 for a masked half load), and
+        # the CUTLASS DSL type-checks the operands of a combine: mixed
+        # fp32/bf16 operands fail to compile.  The cast is a no-op when
+        # ``val`` already matches.
         val = self.cast_expr(val, self.dtype_str(dtype))
         if reduction_type == "sum":
             return f"({acc} + {val})"
-        if reduction_type in ("min", "max") and dtype == torch.int32:
-            # Preserve signed ordering through unsigned keys. The CUDA compiler
-            # can lose a source negation when combining a signed Int32 extrema
-            # chain into VIMNMX3. Flipping the sign bit is an exact order
-            # isomorphism and avoids that invalid signed fusion.
-            sign_bit = "cutlass.Uint32(2147483648)"
-            lhs = f"(cutlass.Uint32({acc}) ^ {sign_bit})"
-            rhs = f"(cutlass.Uint32({val}) ^ {sign_bit})"
-            return (
-                f"cutlass.Int32(cute.math.{reduction_type}({lhs}, {rhs}) ^ {sign_bit})"
-            )
         if reduction_type in ("max", "min"):
+            # The accumulate is a chain of extrema: Int32 and Int16 compare
+            # through unsigned keys, since ptxas loses a negation when it
+            # fuses their signed chain (``nan_extremum_expr``).
             return nan_extremum_expr(
-                reduction_type, acc, val, float32=dtype == torch.float32
+                reduction_type,
+                acc,
+                val,
+                float32=dtype == torch.float32,
+                chain_dtype=self.dtype_str(dtype),
             )
         if reduction_type == "prod":
             return f"({acc} * {val})"
@@ -4165,6 +4387,20 @@ class CuteBackend(Backend):
     def reduction_threads_hint(self, block_size_var: str | None = None) -> int | None:
         return self._threads_for_block_size_var(block_size_var)
 
+    def _record_reduce_input_dtype(self, input_name: str, dtype: torch.dtype) -> None:
+        """Record that the direct warp reduction of ``input_name`` combines in
+        ``dtype`` (``CuteLaneState.reduce_input_dtypes``): the call text
+        carries no dtype for the passes that fold its input.  Every reduction
+        ``reduction_expr`` writes for a caller that passes a dtype is recorded
+        under the text it reduces, a name or an expression (an argmax's index
+        candidate); the fold looks up the names of the calls it folds."""
+        from ..device_function import DeviceFunction
+
+        recorded = DeviceFunction.current().cute_state.lanes.reduce_input_dtypes
+        dtype_str = self.dtype_str(dtype)
+        if recorded.setdefault(input_name, dtype_str) != dtype_str:
+            recorded[input_name] = None
+
     def reduction_expr(
         self,
         input_name: str,
@@ -4175,6 +4411,8 @@ class CuteBackend(Backend):
         threads_in_group: int | None = None,
         dtype: torch.dtype | None = None,
     ) -> str:
+        if dtype is not None:
+            self._record_reduce_input_dtype(input_name, dtype)
         threads = (
             threads_in_group
             if threads_in_group is not None
@@ -4240,6 +4478,7 @@ class CuteBackend(Backend):
             dim,
             block_size_var=block_size_var,
             threads_in_group=threads_in_group,
+            dtype=dtype,
         )
         index_dtype_str = self.index_type_str(index_dtype)
         max_index = self.cast_expr(repr(torch.iinfo(index_dtype).max), index_dtype_str)
@@ -4252,6 +4491,7 @@ class CuteBackend(Backend):
             dim,
             block_size_var=block_size_var,
             threads_in_group=threads_in_group,
+            dtype=index_dtype,
         )
         return self.cast_expr(reduced_index, self.dtype_str(output_dtype))
 
@@ -5451,15 +5691,86 @@ class CuteBackend(Backend):
         demoted = False
         for context in strategy.lane_contexts_with_vec_stores():
             inside = None
-            if placement is not None:
+            component_scope: tuple[list[ast.AST], list[ast.AST]] = ([], [])
+            if placement is not None or state.component_lane_vars:
                 assert context.vloop is not None
                 lane_var = state.vec_wrapper_lane_var(context.vloop)
-                inside = statements_inside_loop(placement, lane_var)
+                if placement is not None:
+                    inside = statements_inside_loop(placement, lane_var)
+                component_scope = self._component_loop_statements(
+                    state, body, placement, lane_var
+                )
             if demote_reordered_tile_vec_stores(
-                context, strategy.fn, body, inside=inside
+                context,
+                strategy.fn,
+                body,
+                inside=inside,
+                component_scope=component_scope,
             ):
                 demoted = True
         return demoted
+
+    @staticmethod
+    def _component_loop_statements(
+        state: DeviceGridState,
+        body: list[ast.AST],
+        placement: list[ast.AST | LanePlacement] | None,
+        lane_var: str,
+    ) -> tuple[list[ast.AST], list[ast.AST]]:
+        """The statements of ``body`` that run inside every trace-time
+        component loop of the grid (``DeviceGridState.component_lane_vars``)
+        and those inside any, for the stores collected in ``lane_var``'s lane.
+
+        A store that names every component of a lane element appends once
+        per component, in component order, only inside each of those loops,
+        with the loops innermost in the nest and right inside ``lane_var``'s
+        V-loop, as they were when the store was lowered, and walking their
+        components upwards: a reverse scan over a component tile runs its
+        loop from the last component down
+        (``DeviceGridState.reversed_lane_vars``), which would fill the list
+        against the order its flush stores.  A loop the body no longer reads
+        is not materialized and holds nothing.
+        """
+        from .lane_loops.placement import statements_inside_loop
+
+        lanes = state.component_lane_vars
+        if not lanes:
+            return [], []
+        nest = [name for name, _extent in state.lane_loops]
+        depth = len(nest) - len(lanes)
+        ordered = (
+            depth >= 1
+            and set(nest[depth:]) == lanes
+            and nest[depth - 1] == lane_var
+            and not lanes & state.reversed_lane_vars
+        )
+        if placement is None:
+            needed, _setup, spliced = state._live_lane_setup(body)
+            live = [
+                lane
+                for lane in lanes
+                if state._lane_loop_is_live(lane, needed, spliced)
+            ]
+            every = list(body) if ordered and len(live) == len(lanes) else []
+            return every, list(body) if live else []
+        inside = [statements_inside_loop(placement, lane) for lane in sorted(lanes)]
+        some: list[ast.AST] = []
+        for statements in inside:
+            some.extend(
+                statement
+                for statement in statements
+                if not any(statement is other for other in some)
+            )
+        every = [
+            statement
+            for statement in inside[0]
+            if ordered
+            and all(
+                any(statement is other for other in statements)
+                for statements in inside[1:]
+            )
+        ]
+        return every, some
 
     def demote_loop_tile_vec_stores(
         self, strategy: TileStrategy, block_ids: list[int]

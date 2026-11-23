@@ -41,6 +41,7 @@ from helion._testing.cute_output_addresses import generated_output_address_cover
 from helion._testing.cute_repeated_axes import full_slice_add
 from helion._testing.cute_repeated_axes import full_slice_row_sum
 from helion._testing.cute_repeated_axes import grid_full_slice_add
+from helion._testing.cute_scan_kernels import computed_scan as _computed_scan
 from helion._testing.tunable_fragments import load_host_function
 import helion.language as hl
 from helion.runtime.ref_mode import RefMode
@@ -703,7 +704,7 @@ def _fragment_byte_storage(
         values = hl.load(x, [row, slice(None)], extra_mask=enabled)
         copied[row, :] = values
         mask_copy[row, :] = enabled
-        prefix[row, :] = hl.cumsum(values + 17, dim=-1, reverse=reverse)
+        prefix[row, :] = hl.cumsum(values + 17, dim=-1, reverse=reverse, dtype=x.dtype)
         hl.store(
             destination,
             [row, slice(None)],
@@ -2536,8 +2537,6 @@ def test_fragment_threads_nan_order_cpu(threads, kind):
 @pytest.mark.parametrize("threads", [32, 64, 128, 256, 512, 1024])
 @pytest.mark.parametrize("mode", ["serial", "cooperative"])
 def test_fragment_threads_native_scan(threads, mode):
-    from test.test_cute_fragment_scan_config import _computed_scan
-
     x = torch.arange(3 * 5 * 65, device=DEVICE).reshape(3, 5, 65).to(torch.int64)
     bound = _computed_scan.bind((x, 2, False))
     config = bound.config_spec.default_config()
@@ -3121,7 +3120,7 @@ def _fragment_int32_negated_extrema(x: torch.Tensor):
     for row in hl.tile(x.size(0), block_size=1):
         # The scan establishes a complete-fragment producer. Integer overflow is
         # intentional: reductions must preserve the logical Int32 value bits.
-        values = -hl.cumsum(x[row, :] + 1, dim=-1)
+        values = -hl.cumsum(x[row, :] + 1, dim=-1, dtype=torch.int32)
         low[row] = values.amin(-1)
         high[row] = values.amax(-1)
     return low, high
@@ -3569,8 +3568,6 @@ def test_fragment_producer_cache_preserves_special_value_bits():
 def test_fragment_warp_scan_cpu_typed_axes_tail_and_input_reuse(
     dtype, axis, reverse, columns, threads
 ):
-    from test.test_cute_fragment_scan_config import _computed_scan
-
     shape = (3, columns, 5) if axis == 1 else (3, 5, columns)
     x = (torch.arange(math.prod(shape)).reshape(shape) % 7 - 3).to(dtype)
     if dtype == torch.int64:
@@ -3723,8 +3720,6 @@ def test_fragment_warp_scan_sdk_shuffles_preserve_32_and_64_bit_types():
     "reverse,threads", [(False, 32), (True, 128), (True, 512), (True, 1024)]
 )
 def test_fragment_warp_scan_native_tails_typed_reuse(dtype, reverse, threads):
-    from test.test_cute_fragment_scan_config import _computed_scan
-
     x = (torch.arange(3 * 5 * 65, device=DEVICE).reshape(3, 5, 65) % 7 - 3).to(dtype)
     if dtype == torch.int64:
         x += 2**40
@@ -3912,8 +3907,6 @@ def test_fragment_warp_scan_sdk_staged_values_and_guarded_load(
     from cutlass._mlir import ir
     from cutlass._mlir.dialects import func
     import cutlass.cute as cute
-
-    from test.test_cute_fragment_scan_config import _computed_scan
 
     with mock_cuda_unavailable(), _target(), forbid_native_compile():
         bound = cpu_bind(_computed_scan, (torch.ones(3, 5, 65, dtype=dtype), 2, False))
@@ -4968,8 +4961,6 @@ def test_fragment_hierarchical_integer_scan_native(dtype, width, reverse):
 
 @pytest.mark.parametrize("axis,reverse", [(1, False), (1, True), (2, True)])
 def test_fragment_hierarchical_integer_scan_cpu_strides_and_input_reuse(axis, reverse):
-    from test.test_cute_fragment_scan_config import _computed_scan
-
     width = 1057
     shape = (3, width, 2) if axis == 1 else (3, 2, width)
     storage = torch.arange(2 * math.prod(shape)).reshape(*shape, 2)
@@ -5034,8 +5025,6 @@ def test_fragment_hierarchical_integer_scan_resource_limit():
     [(torch.int32, 1, False), (torch.int64, 1, True), (torch.int64, 2, True)],
 )
 def test_fragment_hierarchical_integer_scan_native_strides(dtype, axis, reverse):
-    from test.test_cute_fragment_scan_config import _computed_scan
-
     shape = (3, 1057, 2) if axis == 1 else (3, 2, 1057)
     backing = (torch.arange(2 * math.prod(shape), device=DEVICE) % 13 - 6).to(dtype)
     backing = backing.reshape(*shape, 2)
@@ -5872,7 +5861,7 @@ def _fragment_pure_region_alias(x):
         )
         adjusted = word + 1
         x[row, :] = value * 0
-        out[row, :] = hl.cumsum(adjusted, dim=0)
+        out[row, :] = hl.cumsum(adjusted, dim=0, dtype=torch.int32)
     return out
 
 

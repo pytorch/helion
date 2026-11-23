@@ -34,6 +34,8 @@ from .backend import dedupe_preserve_order
 from .backend import read_launcher_source
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
+
     from ..runtime.config import Config
     from ..runtime.kernel import BoundKernel
     from ..runtime.kernel import OutputCodeOptions
@@ -355,70 +357,72 @@ def _runtime_shim_statements(info: LauncherInfo) -> list[ast.stmt]:
     """The dependency-free launcher inlined as a local ``helion.runtime`` shim,
     returned as AST statements to prepend to the module body.
 
-    The launcher is inlined inside ``_make_helion_runtime`` -- a private function
-    scope, so none of its symbols (``get_num_sm``, ``default_launcher``, ...) land at
-    module level where they could clash with the generated kernel -- and re-exported
-    on a ``types.SimpleNamespace`` as ``helion.runtime``. Pure host helpers are
-    embedded from their canonical implementations on the outer ``helion``
-    namespace, so generated host expressions need no Helion package either.
-
-    Built by editing the AST: parse a small template, splice the launcher body into
-    the function and the exports into the returned namespace -- no string surgery.
+    The launcher is inlined inside ``_make_helion_runtime``
+    (:func:`private_module_statements`), so none of its symbols
+    (``get_num_sm``, ``default_launcher``, ...) land at module level where they
+    could clash with the generated kernel, and re-exported as ``helion.runtime``
+    so the body's verbatim ``helion.runtime.<fn>(...)`` calls resolve against it.
+    The outer namespace also exports the canonical pure host helpers.
     """
-    launcher_ast = ast.parse(read_launcher_source(info.launcher_module))
-    # Everything but the module docstring and ``from __future__`` (illegal inside a
-    # function) is inlined into ``_make_helion_runtime``; the launcher's own imports
-    # come along as function-local imports.
-    launcher_stmts = [
-        stmt
-        for stmt in launcher_ast.body
-        if not _is_future_import(stmt) and not _is_docstring_expr(stmt)
-    ]
-    # The launcher's module-level state (e.g. a ``global``-mutated cache) becomes a
-    # ``_make_helion_runtime`` local once inlined, so rewrite those ``global``
-    # declarations to ``nonlocal`` -- otherwise a nested helper would look for a
-    # module global that no longer exists.
-    global_to_nonlocal = _GlobalToNonlocal(set(_module_level_names(launcher_ast)))
-    launcher_stmts = [global_to_nonlocal.visit(stmt) for stmt in launcher_stmts]
     exports = dedupe_preserve_order([*info.runtime_helper_names, info.launcher_symbol])
+    host_source = "\n".join(inspect.getsource(helper) for helper in _HOST_HELPERS)
     module = ast.parse(
-        "def _make_helion_runtime():\n"
-        "    return types.SimpleNamespace()\n"
-        "helion = _make_helion_runtime()\n"
+        "helion = _make_helion_namespace()\n"
         f"{info.launcher_alias} = helion.runtime.{info.launcher_symbol}\n"
     )
+    return [
+        *private_module_statements(
+            read_launcher_source(info.launcher_module),
+            "_make_helion_runtime",
+            exports,
+            doc=_SHIM_DOC,
+        ),
+        *private_module_statements(
+            host_source + "\nruntime = _make_helion_runtime()\n",
+            "_make_helion_namespace",
+            ["runtime", *(helper.__name__ for helper in _HOST_HELPERS)],
+        ),
+        *module.body,
+    ]
+
+
+def private_module_statements(
+    source: str, factory: str, exports: Sequence[str], doc: str | None = None
+) -> list[ast.stmt]:
+    """Module ``source`` inlined into a private function ``factory`` that
+    returns its ``exports`` on a ``types.SimpleNamespace``, as AST statements:
+    none of its names land at module level, where they could clash with the
+    generated kernel.
+
+    Built by editing the AST: everything but the module docstring and
+    ``from __future__`` (illegal inside a function) is spliced into the
+    function, the module's own imports becoming function-local imports, and
+    its ``global`` declarations become ``nonlocal`` (its module-level state is
+    a local of ``factory`` once inlined).
+    """
+    source_ast = ast.parse(source)
+    statements = [
+        stmt
+        for stmt in source_ast.body
+        if not _is_future_import(stmt) and not _is_docstring_expr(stmt)
+    ]
+    global_to_nonlocal = _GlobalToNonlocal(set(_module_level_names(source_ast)))
+    statements = [global_to_nonlocal.visit(stmt) for stmt in statements]
+    module = ast.parse(f"def {factory}():\n    return types.SimpleNamespace()\n")
     make_fn = module.body[0]
     assert isinstance(make_fn, ast.FunctionDef)
     return_stmt = make_fn.body[0]
     assert isinstance(return_stmt, ast.Return)
     namespace_call = return_stmt.value
     assert isinstance(namespace_call, ast.Call)
-    # Docstring explaining the shim, then the inlined launcher, then the return.
-    host_helpers = [
-        ast.parse(inspect.getsource(helper)).body[0] for helper in _HOST_HELPERS
-    ]
     make_fn.body = [
-        ast.Expr(ast.Constant(_SHIM_DOC)),
-        *launcher_stmts,
-        *host_helpers,
+        *([ast.Expr(ast.Constant(doc))] if doc is not None else []),
+        *statements,
         return_stmt,
     ]
-    runtime_namespace = ast.Call(
-        func=namespace_call.func,
-        args=[],
-        keywords=[
-            ast.keyword(arg=name, value=ast.Name(id=name, ctx=ast.Load()))
-            for name in exports
-        ],
-    )
     namespace_call.keywords = [
-        ast.keyword(arg="runtime", value=runtime_namespace),
-        *(
-            ast.keyword(
-                arg=helper.__name__, value=ast.Name(id=helper.__name__, ctx=ast.Load())
-            )
-            for helper in _HOST_HELPERS
-        ),
+        ast.keyword(arg=name, value=ast.Name(id=name, ctx=ast.Load()))
+        for name in exports
     ]
     ast.fix_missing_locations(module)
     return module.body

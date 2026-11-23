@@ -12,6 +12,7 @@ from test.test_cute_full_chunk_row_seeds import bind
 from test.test_cute_rolled_cluster_packet_seeds import _fused_rows
 
 import helion
+from helion._compiler.cute.autotune import heuristics as cute_heuristics
 from helion._compiler.cute.autotune.heuristics.cute_rolled_cluster_packet import (
     CuteRolledClusterPacketHeuristic,
 )
@@ -108,11 +109,22 @@ def test_actual_full_population_keeps_old_prefix_and_contains_full_row(
         torch.empty((rows, size), dtype=dtype),
         torch.empty(size, dtype=dtype),
     )
-    with patch.object(
-        CuteRolledClusterPacketHeuristic, "full_row_seed_configs", return_value=[]
+    # The warp-rows seed and the stream-retention twins follow every family,
+    # the full rows too (``postprocess_seed_configs``): without them the full
+    # row is the last seed and what precedes it is the old list.
+    with (
+        patch.object(
+            cute_heuristics, "lane_unrolled_warp_rows_seed_configs", return_value=[]
+        ),
+        patch.object(
+            cute_heuristics, "row_stream_retention_seed_configs", return_value=[]
+        ),
     ):
-        previous = kernel._bind_isolated(args)
-    current = kernel._bind_isolated(args)
+        with patch.object(
+            CuteRolledClusterPacketHeuristic, "full_row_seed_configs", return_value=[]
+        ):
+            previous = kernel._bind_isolated(args)
+        current = kernel._bind_isolated(args)
     seeds = full_rows(current)
     assert len(seeds) == 1
     old = previous.config_spec.compiler_seed_configs

@@ -92,6 +92,7 @@ from helion._compiler.cute.tcgen05_constants import (
 )
 from helion._compiler.cute.tcgen05_constants import tcgen05_grouped_worklist_smem_bytes
 from helion._compiler.pallas.backend import PallasBackend
+from helion._compiler.triton.backend import GluonBackend
 from helion._compiler.triton.backend import TritonBackend
 from helion._testing import TestCase
 from helion._testing import cpu_render_target
@@ -368,6 +369,91 @@ class TestPallasLoadBufferCountConfig(TestCase):
                     pallas_loop_type="fori_loop", pallas_load_buffer_count=[2]
                 )
             )
+
+
+class TestPallasWorklistBufferCountConfig(TestCase):
+    @staticmethod
+    def _config_spec(num_tensors: int) -> ConfigSpec:
+        spec = ConfigSpec(backend=PallasBackend())
+        spec.pallas_worklist_buffer_count.length = num_tensors
+        return spec
+
+    def test_kept_only_with_a_compact_worklist(self) -> None:
+        spec = self._config_spec(3)
+        self.assertEqual(spec.pallas_worklist_buffer_count.default(), [2, 2, 2])
+        for grouping in (1, 2):
+            with self.subTest(grouping=grouping):
+                config = helion.Config(
+                    pallas_worklist_grouping=grouping,
+                    pallas_worklist_buffer_count=[3, 4, 2],
+                )
+                spec.normalize(config)
+                self.assertEqual(config.pallas_worklist_buffer_count, [3, 4, 2])
+        config = helion.Config(pallas_worklist_grouping=1)
+        spec.normalize(config)
+        self.assertNotIn("pallas_worklist_buffer_count", config)
+        for config in (
+            helion.Config(pallas_worklist_buffer_count=[3, 4, 2]),
+            helion.Config(
+                pallas_worklist_grouping=0, pallas_worklist_buffer_count=[3, 4, 2]
+            ),
+        ):
+            with self.subTest(config=config):
+                spec.normalize(config)
+                self.assertNotIn("pallas_worklist_buffer_count", config)
+
+    def test_rejects_invalid_explicit_lists(self) -> None:
+        spec = self._config_spec(2)
+        for value in ((2, 3), [3], [2, True], [1, 2], [9, 2]):
+            with self.subTest(value=value), self.assertRaises(exc.InvalidConfig):
+                spec.normalize(
+                    helion.Config.from_dict(
+                        {
+                            "pallas_worklist_grouping": 1,
+                            "pallas_worklist_buffer_count": value,
+                        }
+                    )
+                )
+
+    def test_accepts_counts_up_to_8(self) -> None:
+        spec = self._config_spec(2)
+        config = helion.Config(
+            pallas_worklist_grouping=1, pallas_worklist_buffer_count=[8, 5]
+        )
+        spec.normalize(config)
+        self.assertEqual(config.pallas_worklist_buffer_count, [8, 5])
+
+
+class TestPallasWorklistBucketRowsConfig(TestCase):
+    def test_kept_only_with_grouping_one(self) -> None:
+        spec = ConfigSpec(backend=PallasBackend())
+        config = helion.Config(
+            pallas_worklist_grouping=1, pallas_worklist_bucket_rows=32
+        )
+        spec.normalize(config)
+        self.assertEqual(config.pallas_worklist_bucket_rows, 32)
+        for config in (
+            helion.Config(pallas_worklist_bucket_rows=32),
+            helion.Config(pallas_worklist_grouping=0, pallas_worklist_bucket_rows=32),
+            helion.Config(pallas_worklist_grouping=2, pallas_worklist_bucket_rows=32),
+        ):
+            with self.subTest(config=config):
+                # Without grouping 1 the bucket does not apply: normalize drops it.
+                spec.normalize(config)
+                self.assertNotIn("pallas_worklist_bucket_rows", config)
+
+    def test_rejects_invalid_values(self) -> None:
+        spec = ConfigSpec(backend=PallasBackend())
+        for value in (-16, True, 16.0, "16"):
+            with self.subTest(value=value), self.assertRaises(exc.InvalidConfig):
+                spec.normalize(
+                    helion.Config.from_dict(
+                        {
+                            "pallas_worklist_grouping": 1,
+                            "pallas_worklist_bucket_rows": value,
+                        }
+                    )
+                )
 
 
 def _count_columns_then_sum_rows(
@@ -819,6 +905,37 @@ class TestConfigAPI(TestCase):
                 spec.normalize(
                     helion.Config.from_dict({"cross_loop_pipeline": "unknown"})
                 )
+
+    def test_retired_pipeline_drops_a_saved_value(self) -> None:
+        """A kernel whose only cross-loop dependencies were a prefetch-only
+        root's loads offers no cross_loop_pipeline: a config saved before
+        still normalizes, without the key and with a warning."""
+        with patch("helion._compat.is_hip", return_value=False):
+            spec = ConfigSpec(backend=TritonBackend())
+            spec.cross_loop_pipeline_retired = True
+            config = helion.Config(
+                cross_loop_pipeline="static", pid_type="persistent_blocked"
+            )
+            with self.assertLogs("helion.autotuner.config_spec", "WARNING") as logs:
+                spec.normalize(config)
+            self.assertNotIn("cross_loop_pipeline", config)
+            self.assertIn(
+                "Ignoring cross_loop_pipeline='static'", "\n".join(logs.output)
+            )
+            # On Gluon a saved cross_loop_tmem_prefetch, whose candidates exist
+            # only under the pipeline, goes with it.
+            spec = ConfigSpec(backend=GluonBackend())
+            spec.cross_loop_pipeline_retired = True
+            config = helion.Config(
+                cross_loop_pipeline="dynamic",
+                cross_loop_tmem_prefetch=[True],
+                pid_type="persistent_blocked",
+            )
+            with self.assertLogs("helion.autotuner.config_spec", "WARNING") as logs:
+                spec.normalize(config)
+            self.assertNotIn("cross_loop_pipeline", config)
+            self.assertEqual(config.get("cross_loop_tmem_prefetch", []), [])
+            self.assertIn("and its cross_loop_tmem_prefetch", "\n".join(logs.output))
 
     def test_legacy_cross_loop_schedule_normalizes_to_pipeline(self) -> None:
         with patch("helion._compat.is_hip", return_value=False):

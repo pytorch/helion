@@ -320,6 +320,11 @@ class TestAutotunerRebenchmark(AutotunerTestCase):
         search.kernel.format_kernel_decorator.return_value = "@helion.kernel(...)"
         search.kernel.get_cached_path.return_value = None
         search.args = ()
+        search.config_spec = SimpleNamespace(
+            backend=SimpleNamespace(
+                collapses_generated_source_aliases=lambda config_spec: False
+            )
+        )
         search._autotune_metrics = AutotuneMetrics()
         search._search_space_tracker = None
         search.benchmark_provider = Mock()
@@ -1968,6 +1973,7 @@ class TestAutotuneBestOfK(RefEagerTestDisabled, TestCase):
                 self.best_perf_so_far = math.inf
                 self._skip_cache = False
                 self._benchmark_provider_cls = LocalBenchmarkProvider
+                self._benchmark_prelude = None
 
                 class _Log:
                     def __call__(self, *a, **kw):
@@ -2032,6 +2038,7 @@ class TestAutotuneBestOfK(RefEagerTestDisabled, TestCase):
                 self.best_perf_so_far = math.inf
                 self._skip_cache = False
                 self._benchmark_provider_cls = LocalBenchmarkProvider
+                self._benchmark_prelude = None
 
                 class _Log:
                     def __call__(self, *a, **kw):
@@ -2269,6 +2276,7 @@ class TestAutotuneBestOfK(RefEagerTestDisabled, TestCase):
                 self.best_perf_so_far = math.inf
                 self._skip_cache = False
                 self._benchmark_provider_cls = LocalBenchmarkProvider
+                self._benchmark_prelude = None
 
                 class _Log:
                     def __call__(self, *a, **kw):
@@ -2366,6 +2374,7 @@ class TestAutotuneBestOfK(RefEagerTestDisabled, TestCase):
                 self.best_perf_so_far = 1.0
                 self._skip_cache = False
                 self._benchmark_provider_cls = LocalBenchmarkProvider
+                self._benchmark_prelude = None
                 self.log = _Log()
 
             def autotune(self, *, skip_cache: bool = False):

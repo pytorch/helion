@@ -54,8 +54,13 @@ from ..register_tile_admission import RegisterTileOptions
 from ..register_tile_admission import RegisterTileUnsupported
 from .markers import _CUTE_THREAD_VARYING_INTRINSICS
 from .markers import _CUTE_UNIFORM_GLOBAL_NAMES
+from .markers import _HELION_LANE_REDUCE_MARKER
+from .markers import HELION_FINALIZED
+from .markers import HELION_LANE_CARRY_ATTR
+from .markers import HELION_LANE_SPLIT_ATTR
 from .markers import HELION_VECTOR_REDUCTION_OWNER_ATTR
-from .markers import _combine_expr
+from .markers import NESTED_OWNER_REFUSAL
+from .markers import LaneSplitRecord
 from .markers import _create_lane_loop
 from .markers import _dtype_ctor_from_identity
 from .markers import _finalize_lane_reduce_marker
@@ -65,6 +70,7 @@ from .markers import _is_constexpr_lane_iter
 from .markers import _is_lane_reduce_marker_assign
 from .markers import _lane_loop_extent
 from .markers import _LaneReduceMarker
+from .markers import _literal_lane_loop_extent
 from .markers import _static_lane_loop_extent
 from .owner_guards import _guard_stmt_with_owner
 from .owner_guards import _has_impure_inline_asm
@@ -84,6 +90,8 @@ from .statements import _analyze
 from .statements import _depends
 from .statements import _is_device_loop
 from .statements import runs_once_outside_lane
+from .tile_trips import HELION_TILE_TRIP_NEST_ATTR
+from .tile_trips import TileTripNest
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -722,13 +730,7 @@ def _split_impure_producer(
         statement_from_string(f"{stash}.append({name})")
         for name, stash in produced_stashes.items()
     )
-    ctor = _dtype_ctor_from_identity(marker.identity_expr)
-    value = f"{ctor}({marker.input_name})" if ctor else marker.input_name
-    produce.append(
-        statement_from_string(
-            f"{acc} = {_combine_expr(marker.reduction_type, acc, value, ctor)}"
-        )
-    )
+    produce.append(statement_from_string(f"{acc} = {marker.accumulate_expr(acc)}"))
     result.extend(
         [unrolled(produce), statement_from_string("cute.arch.sync_threads()")]
     )
@@ -904,9 +906,7 @@ def _split_one_lane_loop(
         marker.owner_lane is not None and marker.owner_lane != lane_var
         for _, marker in markers
     ):
-        raise exc.BackendUnsupported(
-            "cute", "reduction marker is nested in a different lane owner"
-        )
+        raise exc.BackendUnsupported("cute", NESTED_OWNER_REFUSAL)
     running_sum = _certify_lane_running_sum(
         loop, lane_var, markers, rename_groups, running_sums
     )
@@ -1110,21 +1110,70 @@ def _split_one_lane_loop(
             scalar_definitions,
         )
 
+    # The hand-backs of the values this lane carries through a serial loop
+    # around it (``_lane_carry_nest``) run in the accumulate pass with the
+    # producers of those values, which read no reduction: every load of the
+    # lanes is issued before the reductions combine, and nothing but the
+    # consumers' own inputs stays live across them.  A carried value that
+    # did read one (or a producer that cannot be rerun) leaves the
+    # hand-backs with the consumers, where the owner guards refuse a
+    # statement that is no store, and so does a producer behind a marker
+    # that binds the marker's input again (``product = product * 2.0``
+    # ahead of ``dot = dot + product``, or the update of a carried value
+    # that is itself reduced): the reductions' accumulations follow the
+    # pass's other statements, where they would read the later binding.
+    # ``_lane_carry_nest`` declines such nests itself, and these checks do
+    # not rely on it.
+    carry_indices = {
+        index
+        for index in tail_indices
+        if getattr(body[index], HELION_LANE_CARRY_ATTR, False)
+    }
+    if carry_indices and running_sum is None:
+        carry_slice = set(carry_indices)
+        for index in carry_indices:
+            indices, _written = _backward_slice(
+                body[:index], set(ReadWrites.from_ast(body[index]).reads), rename_groups
+            )
+            carry_slice.update(indices)
+        if (
+            carry_slice & marker_indices
+            or any(
+                _contains_unduplicatable_op(body[index])
+                or (index not in carry_indices and _has_side_effect(body[index]))
+                for index in carry_slice
+            )
+            or any(
+                index > marker_index
+                and rename_groups.get(marker.input_name, marker.input_name)
+                in {
+                    rename_groups.get(name, name)
+                    for name in ReadWrites.from_ast(body[index]).writes
+                }
+                for marker_index, marker in markers
+                for index in carry_slice
+            )
+        ):
+            carry_indices = set()
+        else:
+            # The producers join the accumulate pass: a statement the
+            # consume pass needs as well is copied for it, like the
+            # producers of the reductions' inputs.
+            phase1_index_set |= carry_slice
+            phase1_indices = sorted(phase1_index_set)
+    else:
+        carry_indices = set()
+
     prefix: list[ast.AST] = []  # acc init statements (outside the lane loops)
     accumulate_body: list[ast.AST] = [body[i] for i in phase1_indices]
     marker_updates: dict[int, ast.AST] = {}
+    accumulators: list[str] = []
     finalize: list[ast.AST] = []
     for marker_index, m in markers:
         acc_var = f"{m.result_var}_lane_acc"
+        accumulators.append(acc_var)
         prefix.append(statement_from_string(f"{acc_var} = {m.identity_expr}"))
-        # Cast the per-lane input to the accumulator dtype before combining so
-        # the CUTLASS DSL's strict ternary type check (max/min emit a Python
-        # ``a if a > b else b``) does not see mixed fp32/bf16 operands.
-        ctor = _dtype_ctor_from_identity(m.identity_expr)
-        combine_val = f"{ctor}({m.input_name})" if ctor is not None else m.input_name
-        update = statement_from_string(
-            f"{acc_var} = {_combine_expr(m.reduction_type, acc_var, combine_val, ctor)}"
-        )
+        update = statement_from_string(f"{acc_var} = {m.accumulate_expr(acc_var)}")
         accumulate_body.append(update)
         marker_updates[marker_index] = update
         finalize.extend(_finalize_lane_reduce_marker(m, acc_var))
@@ -1139,7 +1188,11 @@ def _split_one_lane_loop(
 
     # Phase 2: everything except the marker assignments themselves; the
     # reduced scalar is already finalized so consumers read it directly.
-    phase2_indices = [index for index in tail_indices if index not in marker_indices]
+    phase2_indices = [
+        index
+        for index in tail_indices
+        if index not in marker_indices and index not in carry_indices
+    ]
     phase2_body = [body[index] for index in phase2_indices]
 
     # A statement is lane-varying if it (transitively) reads the lane var, or
@@ -1168,13 +1221,8 @@ def _split_one_lane_loop(
     )
 
     def is_lane_varying(stmt: ast.AST) -> bool:
-        rw = ReadWrites.from_ast(stmt)
-        reads = {rename_groups.get(name, name) for name in rw.reads}
-        writes = {rename_groups.get(name, name) for name in rw.writes}
-        return (
-            lane_var in reads
-            or bool(reads & lane_varying_names)
-            or bool(writes & lane_varying_names)
+        return _is_lane_varying_statement(
+            stmt, lane_var, lane_varying_names, rename_groups
         )
 
     if running_sum is not None:
@@ -1241,7 +1289,21 @@ def _split_one_lane_loop(
 
     result: list[ast.AST] = []
     result.extend(prefix)
-    result.append(_clone_lane_loop_with_body(loop, accumulate_body))
+    accumulate_loop = _clone_lane_loop_with_body(loop, accumulate_body)
+    if running_sum is None:
+        # What ``defer_tile_reductions`` moves out of an enclosing device
+        # loop (``cute_defer_tile_reduce``).
+        setattr(
+            accumulate_loop,
+            HELION_LANE_SPLIT_ATTR,
+            LaneSplitRecord(
+                markers=tuple(marker for _, marker in markers),
+                accumulators=tuple(accumulators),
+                resets=tuple(prefix),
+                finalize=tuple(finalize),
+            ),
+        )
+    result.append(accumulate_loop)
     result.extend(finalize)
     result.extend(lane_invariant_tail)
     if lane_varying_tail:
@@ -1524,16 +1586,9 @@ def _validate_owned_lane_carry_schedule(
             marker = _is_lane_reduce_marker_assign(body[index])
             assert marker is not None
             accumulator = f"{marker.result_var}_lane_acc"
-            ctor = _dtype_ctor_from_identity(marker.identity_expr)
-            value = (
-                f"{ctor}({marker.input_name})"
-                if ctor is not None
-                else marker.input_name
-            )
             expected.append(
                 statement_from_string(
-                    f"{accumulator} = "
-                    f"{_combine_expr(marker.reduction_type, accumulator, value, ctor)}"
+                    f"{accumulator} = {marker.accumulate_expr(accumulator)}"
                 )
             )
         if not (
@@ -2013,15 +2068,8 @@ def _split_dependent_lane_reductions(
         acc_var = f"{marker.result_var}_lane_acc"
         result.append(statement_from_string(f"{acc_var} = {marker.identity_expr}"))
         acc_body = [_rerun_copy(stmt) for stmt in stage]
-        ctor = _dtype_ctor_from_identity(marker.identity_expr)
-        combine_val = (
-            f"{ctor}({marker.input_name})" if ctor is not None else marker.input_name
-        )
         acc_body.append(
-            statement_from_string(
-                f"{acc_var} = "
-                f"{_combine_expr(marker.reduction_type, acc_var, combine_val, ctor)}"
-            )
+            statement_from_string(f"{acc_var} = {marker.accumulate_expr(acc_var)}")
         )
         result.append(_clone_lane_loop_with_body(loop, acc_body))
         result.extend(_finalize_lane_reduce_marker(marker, acc_var))
@@ -2040,14 +2088,7 @@ def _split_dependent_lane_reductions(
     lane_varying = _lane_varying_names(consume_candidates, lane_var, rename_groups)
 
     def is_lane_varying(stmt: ast.AST) -> bool:
-        rw = ReadWrites.from_ast(stmt)
-        reads = {rename_groups.get(name, name) for name in rw.reads}
-        writes = {rename_groups.get(name, name) for name in rw.writes}
-        return (
-            lane_var in reads
-            or bool(reads & lane_varying)
-            or bool(writes & lane_varying)
-        )
+        return _is_lane_varying_statement(stmt, lane_var, lane_varying, rename_groups)
 
     varying_indices = {
         idx for idx, stmt in enumerate(consume_candidates) if is_lane_varying(stmt)
@@ -2571,12 +2612,8 @@ def _split_lane_loop_with_register_stash(
         acc_body.extend(_rerun_copy(s) for s in recompute_kept)
         acc_body.extend(read_stash_stmts())
         acc_body.extend(_rerun_copy(s) for s in input_stmts)
-        ctor = _dtype_ctor_from_identity(m.identity_expr)
-        combine_val = f"{ctor}({m.input_name})" if ctor is not None else m.input_name
         acc_body.append(
-            statement_from_string(
-                f"{acc_var} = {_combine_expr(m.reduction_type, acc_var, combine_val, ctor)}"
-            )
+            statement_from_string(f"{acc_var} = {m.accumulate_expr(acc_var)}")
         )
         result.append(_clone_lane_loop_with_body(loop, acc_body))
         result.extend(_finalize_lane_reduce_marker(m, acc_var))
@@ -3232,15 +3269,11 @@ def _rereduce_restored_lane_markers(
         # The per-lane finalize of the restore, assigned to the share instead
         # of the result (the wrap, a cast or reshape, is applied to the total).
         per_lane = dataclasses.replace(
-            marker, result_var=share, wrap_template="__HELION_FINALIZED__"
+            marker, result_var=share, wrap_template=HELION_FINALIZED
         )
         loop_body.extend(_finalize_lane_reduce_marker(per_lane, marker.input_name))
-        ctor = _dtype_ctor_from_identity(marker.identity_expr)
-        value = f"{ctor}({share})" if ctor is not None else share
         loop_body.append(
-            statement_from_string(
-                f"{total} = {_combine_expr(marker.reduction_type, total, value, ctor)}"
-            )
+            statement_from_string(f"{total} = {marker.accumulate_expr(total, share)}")
         )
         finalized.append(
             statement_from_string(
@@ -3572,8 +3605,6 @@ def _lane_varying_names(
     every spelling, so its initializer ``acc = 0`` is one of its lane-varying
     writes and runs in every pass of a lane split.
     """
-    from ...ast_read_writes import ReadWrites
-
     renames = rename_groups or {}
 
     def canonical(names: Iterable[str]) -> set[str]:
@@ -3592,6 +3623,34 @@ def _lane_varying_names(
                     changed = True
     varying.discard(lane_var)
     return varying
+
+
+def _is_lane_varying_statement(
+    stmt: ast.AST,
+    lane_var: str,
+    lane_varying: set[str],
+    rename_groups: Mapping[str, str],
+    bound: set[str] | None = None,
+) -> bool:
+    """Whether ``stmt`` runs once per lane: it reads the lane variable, or
+    reads or binds one of the ``lane_varying`` names
+    (``_lane_varying_names``), compared through ``rename_groups``.
+
+    A statement that only binds one counts: the initializer of a value a
+    loop accumulates per lane (``total = 0.0`` ahead of ``for k: total =
+    total + load``) reads no lane value, and run once ahead of the lanes it
+    leaves every lane after the first adding to the lane before it.
+    ``bound`` narrows the names whose binding counts (all of them by
+    default) to those the caller's lanes read.
+    """
+    effects = ReadWrites.from_ast(stmt)
+    reads = {rename_groups.get(name, name) for name in effects.reads}
+    writes = {rename_groups.get(name, name) for name in effects.writes}
+    return (
+        lane_var in reads
+        or bool(reads & lane_varying)
+        or bool(writes & (lane_varying if bound is None else bound))
+    )
 
 
 def _is_serial_for(stmt: ast.AST) -> bool:
@@ -3635,6 +3694,68 @@ def _forward_live_names(
     return tainted
 
 
+def _rebound_names(stmt: ast.AST) -> set[str]:
+    """The names a plain assignment binds: its ``Name`` targets, those of a
+    tuple target included (``a, b = x, y``).  A subscript or attribute
+    target binds none, and no other statement counts."""
+    if not isinstance(stmt, ast.Assign):
+        return set()
+    return {name for target in stmt.targets for name in names_written(target)}
+
+
+def _reductions_handed_on(
+    serial_body: list[ast.AST],
+    after: list[ast.AST],
+    marker_results: set[str],
+    rename_groups: Mapping[str, str],
+) -> set[str]:
+    """The names through which ``serial_body``, the body of a serial loop,
+    hands a value computed from one of its lane reductions
+    (``marker_results``) to its next iteration or to ``after``, the
+    statements behind the loop.
+
+    A statement that reads such a value passes it to every name of its
+    ``ReadWrites.writes``: the names it binds and the thread-local storage
+    it writes an element of (and whatever else that set names, such as a
+    tensor written by subscript, which errs towards a refusal).  A plain
+    assignment that reads none rebinds the names it binds
+    (``_rebound_names``: ``mask = reduced > 0`` behind the statements that
+    read ``mask`` hands nothing on when the body starts with ``mask = row <
+    rows``), and a name is read from the iteration before only where no
+    such assignment binds it first.  Names one pending rename merges
+    (``rename_groups``) are one value.
+
+    Thread-local storage is one value here, whose elements are not told
+    apart: an element write neither rebinds it nor counts as written before
+    a read, so storage that takes such a value and that the body reads
+    anywhere counts as handed on, also where every iteration writes the
+    element before reading it.
+    """
+
+    def canonical(names: Iterable[str]) -> set[str]:
+        return {rename_groups.get(name, name) for name in names}
+
+    results = canonical(marker_results)
+    # At the end of an iteration; grows until the next iteration adds nothing.
+    derived: set[str] = set()
+    while True:
+        live = set(derived)
+        for stmt in serial_body:
+            effects = ReadWrites.from_ast(stmt)
+            written = canonical(effects.writes)
+            if written & results or canonical(effects.reads) & live:
+                live |= written
+            else:
+                live -= canonical(_rebound_names(stmt))
+        if live == derived:
+            break
+        derived = live
+    return derived & (
+        exposed_reads(serial_body, renames=rename_groups, defines=_rebound_names)
+        | exposed_reads(after, renames=rename_groups, defines=_rebound_names)
+    )
+
+
 def interchange_lane_outside_serial_reductions(
     body: list[ast.AST],
     *,
@@ -3643,6 +3764,7 @@ def interchange_lane_outside_serial_reductions(
     proven_tensor_stride_values: Mapping[tuple[str, int], int] | None = None,
     constexpr_value: Callable[[str], int | None] | None = None,
     rename_groups: Mapping[str, str] | None = None,
+    new_var: Callable[[str], str] | None = None,
 ) -> list[ast.AST]:
     """Interchange a ``for LANE: ... for MB: ...`` nest whose inner serial loop
     contains ``_helion_lane_reduce`` markers.
@@ -3674,9 +3796,30 @@ def interchange_lane_outside_serial_reductions(
       carries from one iteration to the next (a lane's running total the
       consumer stores), which Nest A's order would carry from lane to lane.
 
+    Neither nest can keep a value computed from a lane reduction that the
+    ``mb`` loop hands on, to its next iteration or to the statements behind
+    it in the lane loop (the column sums of centered rows,
+    ``_reductions_handed_on``): Nest B computes it from each lane's partial
+    reduction and Nest A has no lane to carry it in, so such a nest is
+    declined as well.
+
+    Nest A runs the lane-invariant statements it keeps ahead of its lanes
+    and reruns the lane prefix's per-lane statements in every ``mb``
+    iteration.  A statement that binds a lane-varying name Nest A reads is
+    per-lane like one that reads one (an accumulator's initializer).  The
+    nest is declined when a per-lane statement binds a lane-invariant name
+    as well that another statement of Nest A uses, or when a lane-invariant
+    assignment would run ahead of a per-lane prefix statement that uses the
+    name it binds.
+
     Names one pending codegen rename merges (``rename_groups``, each name's
     shared name) are one variable there: ``v_27 = scale_copy * 2.0``, which
     the loop's carry renames to ``scale``, updates ``scale``.
+
+    A trace-time vector lane loop (``cutlass.range_constexpr``) whose two
+    nests are declined becomes one nest instead when its lanes can carry
+    their values through the serial loop (``_lane_carry_nest``, which names
+    its carry variables with ``new_var``).
 
     Returns ``body`` unchanged when no such pattern is present.
     """
@@ -3690,6 +3833,7 @@ def interchange_lane_outside_serial_reductions(
                 proven_tensor_stride_values or {},
                 constexpr_value,
                 rename_groups or {},
+                new_var,
             )
         )
     return new_body
@@ -3702,6 +3846,7 @@ def _interchange_stmt(
     proven_tensor_stride_values: Mapping[tuple[str, int], int],
     constexpr_value: Callable[[str], int | None] | None,
     rename_groups: Mapping[str, str],
+    new_var: Callable[[str], str] | None,
 ) -> list[ast.AST]:
     for field in ("body", "orelse", "finalbody"):
         old = getattr(stmt, field, None)
@@ -3716,6 +3861,7 @@ def _interchange_stmt(
                     proven_tensor_stride_values=proven_tensor_stride_values,
                     constexpr_value=constexpr_value,
                     rename_groups=rename_groups,
+                    new_var=new_var,
                 ),
             )
     lane_var = getattr(stmt, HELION_LANE_LOOP_VAR_ATTR, None)
@@ -3726,15 +3872,73 @@ def _interchange_stmt(
         or stmt.target.id != lane_var
     ):
         return [stmt]
-    return _interchange_one_lane_loop(
-        stmt,
-        lane_var,
-        proven_disjoint_tensor_pairs,
-        protected_names,
-        proven_tensor_stride_values,
-        constexpr_value,
-        rename_groups,
-    )
+    trips = getattr(stmt, HELION_TILE_TRIP_NEST_ATTR, None)
+    if trips is not None:
+        # The reductions of this lane sit in the rows of a serial loop's
+        # tile (``tile_trips.py``): the two nests have no form for it.
+        delattr(stmt, HELION_TILE_TRIP_NEST_ATTR)
+        nest = _lane_carry_trip_nest(
+            stmt,
+            lane_var,
+            trips,
+            proven_disjoint_tensor_pairs,
+            protected_names,
+            proven_tensor_stride_values,
+            constexpr_value,
+            rename_groups,
+            new_var,
+        )
+        if not isinstance(nest, list):
+            raise exc.BackendUnsupported(
+                "cute",
+                f"{NESTED_OWNER_REFUSAL}; its lanes cannot carry their values "
+                "through the rows of the tile in one nest either: "
+                f"{nest or 'the nest has no such values'}",
+            )
+        return nest
+    # The two nests rebind the bodies of the lane loop and of its serial loop
+    # (pruned first-pass statements, restored markers) and mutate no
+    # statement: these lists are the nest as it stood, should they decline.
+    bodies = [
+        (node, list(node.body))
+        for node in (stmt, *stmt.body)
+        if isinstance(node, ast.For)
+    ]
+    try:
+        return _interchange_one_lane_loop(
+            stmt,
+            lane_var,
+            proven_disjoint_tensor_pairs,
+            protected_names,
+            proven_tensor_stride_values,
+            constexpr_value,
+            rename_groups,
+        )
+    except RegisterTileUnsupported:
+        raise
+    except exc.BackendUnsupported as refusal:
+        for node, statements in bodies:
+            node.body = statements
+        nest = _lane_carry_nest(
+            stmt,
+            lane_var,
+            proven_disjoint_tensor_pairs,
+            protected_names,
+            proven_tensor_stride_values,
+            constexpr_value,
+            rename_groups,
+            new_var,
+        )
+        if nest is None:
+            raise
+        if isinstance(nest, str):
+            detail = str(refusal)[: refusal.base_msg_len].partition(": ")[2]
+            raise exc.BackendUnsupported(
+                "cute",
+                f"{detail}; its lanes cannot carry their values through the "
+                f"serial loop in one nest either: {nest}",
+            ) from refusal
+        return nest
 
 
 def _flatten_vector_reduction_lane(
@@ -3929,6 +4133,462 @@ def _rerun_copy(statement: ast.AST) -> ast.AST:
     return copy
 
 
+def _lane_carry_nest(
+    loop: ast.For,
+    lane_var: str,
+    proven_disjoint_tensor_pairs: set[frozenset[str]],
+    protected_names: set[str],
+    proven_tensor_stride_values: Mapping[tuple[str, int], int],
+    constexpr_value: Callable[[str], int | None] | None,
+    rename_groups: Mapping[str, str],
+    new_var: Callable[[str], str] | None,
+    trips: ast.For | None = None,
+    memory_proven: bool = False,
+) -> list[ast.AST] | str | None:
+    """One loop nest for a trace-time vector lane loop that holds a serial
+    loop with this lane's reduction markers and values each lane carries
+    through it (the per-column partial sums of a mix-order reduction).
+
+    ``for LANE in constexpr(V): PREFIX; for MB: BODY; SUFFIX`` becomes
+
+        for LANE: PREFIX; inits.append(carried)
+        carried_lane<l> = inits[l]                    # V values per name
+        UNIFORM PREFIX
+        for MB:
+            HEAD
+            for LANE: LANE PREFIX; carried = slots[LANE]; BODY; next.append(carried)
+            carried_lane<l> = next[l]
+        for LANE: LANE PREFIX; carried = slots[LANE]; SUFFIX
+
+    The serial loop runs once, outside the lanes, so the two-pass lane split
+    finalizes each iteration's reductions between the loads of all lanes and
+    their consumers, where the two nests of the interchange walk the serial
+    loop a second time per lane.  ``BODY`` and ``SUFFIX`` are the nest's own
+    statements, each run once per lane and serial iteration as before, but
+    for ``HEAD``: the serial body's relocatable assignments of a name bound
+    once that read no value a lane has of its own (``lane_values``: the
+    lane variable, the carried values and whatever is computed from them or
+    bound beside a side effect), which run once per serial iteration ahead
+    of the lanes, so both passes of the split name one row.  The prefix
+    statements other than the carried values' initializers are rerun where a
+    lane needs them (``_rerun_copy``), those reading no lane value once
+    before the serial loop.  The hand-backs (``next.append``) are tagged
+    ``HELION_LANE_CARRY_ATTR``: the split runs them, with the producers of
+    their values, in its accumulate pass.
+
+    Returns ``None`` for any other shape, and the reason when the nest has
+    carried values but the single nest is not proven to compute what the
+    lane-major order does.  That takes:
+
+    * straight-line lanes: no control transfer, nested lane loop, atomic,
+      collective, impure inline assembly or thread-local storage write, and
+      a prefix of relocatable assignments, those rerun among the lanes
+      reading no name from outside them that the serial loop or the suffix
+      binds, or that a prefix statement behind them binds, and the suffix
+      binding no name of the prefix statements run once that it reads first;
+    * scalars private to a lane: no name a lane reads before writing it is
+      written in the lane loop (a value carried from lane to lane), and the
+      serial range reads nothing the lanes vary or the loops write;
+    * carried values (the names the serial body writes that it, or the
+      suffix, may read first; names one pending rename merges,
+      ``rename_groups``, are one value) that each have one initializer in
+      the prefix, read by no other prefix statement, and only plain
+      top-level assignments in the serial body, none reading a reduction
+      (the accumulate pass runs before the reductions finalize);
+    * reductions whose input no statement behind them binds again (the
+      accumulate pass reads it behind the carried values' producers);
+    * memory accesses the new order leaves alone
+      (``serial_loop_outside_lanes_keeps_memory``).
+
+    With ``trips`` the reductions sit one loop further in: ``trips`` is a
+    serial loop of the serial body (the rows of its tile,
+    ``tile_trips.py``).  The lanes then stay around ``trips`` in each
+    iteration of the serial loop, for the caller to run this once more on;
+    it has proven the memory accesses of both levels (``memory_proven``,
+    ``_lane_carry_trip_nest``).
+    """
+    from ..interchanged_store_dce import atomic_write_calls
+    from ..interchanged_store_dce import serial_loop_outside_lanes_keeps_memory
+
+    extent = _literal_lane_loop_extent(loop)
+    if (
+        not _is_constexpr_lane_iter(loop)
+        or loop.orelse
+        or extent is None
+        or new_var is None
+    ):
+        return None
+    name_var = new_var
+    body: list[ast.AST] = list(loop.body)
+    serial_indices = [
+        index
+        for index, stmt in enumerate(body)
+        if isinstance(stmt, ast.For)
+        and _is_serial_for(stmt)
+        and (
+            any(_is_lane_reduce_marker_assign(s) is not None for s in stmt.body)
+            if trips is None
+            else any(s is trips for s in stmt.body)
+        )
+    ]
+    if len(serial_indices) != 1:
+        return None
+    mb_loop = cast("ast.For", body[serial_indices[0]])
+    prefix = body[: serial_indices[0]]
+    suffix = body[serial_indices[0] + 1 :]
+    mb_body: list[ast.AST] = list(mb_loop.body)
+    # The statements of the serial body one by one: those of ``trips`` stand
+    # for it where a value's flow from statement to statement is read.
+    mb_leaves: list[ast.AST] = [
+        leaf
+        for stmt in mb_body
+        for leaf in (cast("ast.For", stmt).body if stmt is trips else [stmt])
+    ]
+    markers = [
+        marker
+        for stmt in mb_leaves
+        if (marker := _is_lane_reduce_marker_assign(stmt)) is not None
+    ]
+    if (
+        mb_loop.orelse
+        or not isinstance(mb_loop.target, ast.Name)
+        or any(marker.owner_lane not in (None, lane_var) for marker in markers)
+        # A marker anywhere else is another nest's.
+        or len(markers)
+        != sum(
+            isinstance(node, ast.Call)
+            and call_path_str(node.func) == _HELION_LANE_REDUCE_MARKER
+            for node in ast.walk(loop)
+        )
+    ):
+        return None
+
+    def canonical(names: Iterable[str]) -> set[str]:
+        return {rename_groups.get(name, name) for name in names}
+
+    # As for the two nests: a side effect of the serial body consumes a
+    # reduction.
+    reduced = _forward_live_names(
+        mb_leaves, {marker.result_var for marker in markers}, rename_groups
+    )
+    if not any(
+        _has_side_effect(stmt) and canonical(ReadWrites.from_ast(stmt).reads) & reduced
+        for stmt in mb_leaves
+    ):
+        return None
+    carried = sorted(
+        canonical(ReadWrites.from_list(mb_body).writes)
+        & (
+            exposed_reads(mb_body, renames=rename_groups)
+            | exposed_reads(suffix, renames=rename_groups)
+        )
+    )
+    if not carried:
+        # The nest is the lowering of lanes that carry values, and only such
+        # kernels were measured with it: a serial loop that carries nothing
+        # (rows reduced and stored, no partials) keeps the two nests'
+        # refusal, though nothing below needs a carried value.
+        return None
+
+    statements = [*prefix, *mb_body, *suffix]
+    if any(
+        isinstance(
+            node, (ast.Break, ast.Continue, ast.Return, ast.While, ast.Try, ast.With)
+        )
+        or getattr(node, HELION_LANE_LOOP_VAR_ATTR, None) is not None
+        for stmt in statements
+        for node in ast.walk(stmt)
+    ):
+        return "its lanes are not straight-line code"
+    if (
+        _has_impure_inline_asm(loop)
+        or any(_contains_unduplicatable_op(stmt) for stmt in statements)
+        or any(atomic_write_calls(stmt) for stmt in statements)
+    ):
+        return "it holds an atomic, a collective or impure inline assembly"
+    if ReadWrites.from_ast(loop).inplace_writes:
+        return "it writes thread-local storage"
+    if not all(
+        _is_proven_relocatable_assignment(stmt, allow_load=True) for stmt in prefix
+    ):
+        return "the lane loop's prefix cannot be rerun"
+    if exposed_reads(body, renames=rename_groups) & (
+        canonical(ReadWrites.from_ast(loop).writes) - {lane_var}
+    ):
+        return "a value is carried from one lane to the next"
+    # The names with a value per lane: the lane variable, the carried values,
+    # a name the serial body binds twice, and every name a statement binds
+    # that reads one of them or is no relocatable assignment.
+    bindings = [
+        name for stmt in mb_body for name in canonical(ReadWrites.from_ast(stmt).writes)
+    ]
+    lane_values = {
+        lane_var,
+        *carried,
+        *(name for name in bindings if bindings.count(name) > 1),
+    }
+    changed = True
+    while changed:
+        changed = False
+        for stmt in statements:
+            effects = ReadWrites.from_ast(stmt)
+            written = canonical(effects.writes)
+            if not written <= lane_values and (
+                canonical(effects.reads) & lane_values
+                or written & lane_values
+                or not _is_proven_relocatable_assignment(stmt, allow_load=True)
+            ):
+                lane_values |= written
+                changed = True
+
+    def lane_free(stmt: ast.AST) -> bool:
+        effects = ReadWrites.from_ast(stmt)
+        return (
+            _is_proven_relocatable_assignment(stmt, allow_load=True)
+            and not canonical([*effects.reads, *effects.writes]) & lane_values
+        )
+
+    if canonical(ReadWrites.from_ast(mb_loop.iter).reads) & (
+        lane_values | canonical(ReadWrites.from_list([mb_loop, *suffix]).writes)
+    ):
+        return "the serial loop's range varies with the lane or the loop"
+
+    inits: dict[str, str] = {}
+    init_ids: set[int] = set()
+    for name in carried:
+        found = [stmt for stmt in prefix if canonical(names_written(stmt)) == {name}]
+        if len(found) != 1:
+            return f"{name} has no single initializer in the lane loop's prefix"
+        inits[name] = cast("str", assigned_name(found[0]))
+        init_ids.add(id(found[0]))
+    reruns = [stmt for stmt in prefix if id(stmt) not in init_ids]
+    if canonical(ReadWrites.from_list(reruns).reads) & set(carried):
+        return "the lane loop's prefix reads a carried value"
+    # The prefix statements rerun among the lanes run behind the serial
+    # loop's earlier iterations and the lanes before their own.  What they
+    # read from outside themselves (a name no earlier one of them binds) is
+    # what the prefix read only while neither the serial loop nor the
+    # suffix binds it: ``factor = 2.0`` ahead of ``scale = factor * lane``,
+    # with ``factor = 3.0`` among the rows, would scale by 3.
+    if exposed_reads(
+        [stmt for stmt in reruns if not lane_free(stmt)], renames=rename_groups
+    ) & canonical(ReadWrites.from_list([mb_loop, *suffix]).writes):
+        return "the lane loop's prefix reads a name the serial loop binds"
+    # They also run behind the whole of the prefix that holds no lane value,
+    # which runs once, ahead of the serial loop: with ``factor = 3.0`` behind
+    # ``scale = factor * lane`` in the prefix itself, they would scale by 3
+    # as well.
+    read_per_lane: set[str] = set()
+    for stmt in reruns:
+        effects = ReadWrites.from_ast(stmt)
+        if not lane_free(stmt):
+            read_per_lane |= canonical(effects.reads)
+        elif canonical(effects.writes) & read_per_lane:
+            return (
+                "the lane loop's prefix binds a name behind a per-lane statement "
+                "that reads it"
+            )
+    # No lane runs that part of the prefix again, so the suffix's lanes follow
+    # one another with nothing between them to bind its names: with ``factor
+    # = 2.0`` in the prefix, a suffix that reads ``factor`` and then binds
+    # ``factor = 3.0`` would read 3 in every lane after the first.
+    if (
+        canonical(
+            ReadWrites.from_list([stmt for stmt in reruns if lane_free(stmt)]).writes
+        )
+        & exposed_reads(suffix, renames=rename_groups)
+        & canonical(ReadWrites.from_list(suffix).writes)
+    ):
+        return "the suffix binds a name of the lane loop's prefix that it reads first"
+    updates: dict[str, str] = {}
+    for stmt in mb_body:
+        name = assigned_name(stmt)
+        group = None if name is None else rename_groups.get(name, name)
+        if (canonical(ReadWrites.from_ast(stmt).writes) - {group}) & set(carried):
+            return "a carried value is not updated by plain assignments"
+        if name is not None and group in inits:
+            updates[cast("str", group)] = name
+    if set(updates) != set(carried):
+        return "a carried value is not updated by plain assignments"
+    if reduced & set(carried):
+        return "a carried value reads a lane reduction"
+    # The split accumulates each reduction behind the producers of the
+    # carried values, which run in its accumulate pass: the reduction's
+    # input is the value its marker read only while nothing behind the
+    # marker binds it again.
+    for position, stmt in enumerate(mb_leaves):
+        marker = _is_lane_reduce_marker_assign(stmt)
+        if marker is not None and canonical([marker.input_name]) & canonical(
+            ReadWrites.from_list(mb_leaves[position + 1 :]).writes
+        ):
+            return "a reduction's input is bound again behind the reduction"
+    refusal = (
+        serial_loop_outside_lanes_keeps_memory(
+            loop,
+            mb_loop,
+            proven_disjoint_tensor_pairs,
+            protected_names,
+            proven_tensor_stride_values,
+            constexpr_value,
+        )
+        if not memory_proven
+        else None
+    )
+    if refusal is not None:
+        return refusal
+
+    slots = {
+        name: [name_var(f"{name}_lane{index}") for index in range(extent)]
+        for name in carried
+    }
+
+    def fills() -> list[ast.AST]:
+        return [
+            statement_from_string(
+                f"{inits[name]} = ({', '.join(slots[name])},)[{lane_var}]"
+            )
+            for name in carried
+        ]
+
+    def collect(
+        suffix_name: str, spellings: Mapping[str, str], handback: bool
+    ) -> tuple[list[ast.AST], list[ast.AST], list[ast.AST]]:
+        lists = {name: name_var(f"{name}_lane_{suffix_name}") for name in carried}
+        opens: list[ast.AST] = [
+            statement_from_string(f"{lists[name]} = []") for name in carried
+        ]
+        appends: list[ast.AST] = [
+            statement_from_string(f"{lists[name]}.append({spellings[name]})")
+            for name in carried
+        ]
+        if handback:
+            for append in appends:
+                setattr(append, HELION_LANE_CARRY_ATTR, True)
+        binds: list[ast.AST] = [
+            statement_from_string(f"{slot} = {lists[name]}[{index}]")
+            for name in carried
+            for index, slot in enumerate(slots[name])
+        ]
+        return opens, appends, binds
+
+    def per_lane() -> list[ast.AST]:
+        return [_rerun_copy(stmt) for stmt in reruns if not lane_free(stmt)]
+
+    init_opens, init_appends, init_binds = collect("init", inits, False)
+    next_opens, next_appends, next_binds = collect("next", updates, True)
+    init_loop = _clone_lane_loop_with_body(loop, [*prefix, *init_appends])
+    loop.body = cast(
+        "list[ast.stmt]",
+        [
+            *per_lane(),
+            *fills(),
+            *(stmt for stmt in mb_body if not lane_free(stmt)),
+            *next_appends,
+        ],
+    )
+    mb_loop.body = cast(
+        "list[ast.stmt]",
+        [
+            *next_opens,
+            *(stmt for stmt in mb_body if lane_free(stmt)),
+            loop,
+            *next_binds,
+        ],
+    )
+    result: list[ast.AST] = [
+        *init_opens,
+        init_loop,
+        *init_binds,
+        *(_rerun_copy(stmt) for stmt in reruns if lane_free(stmt)),
+        mb_loop,
+    ]
+    if suffix:
+        result.append(
+            _clone_lane_loop_with_body(loop, [*per_lane(), *fills(), *suffix])
+        )
+    return result
+
+
+def _lane_carry_trip_nest(
+    loop: ast.For,
+    lane_var: str,
+    trips: TileTripNest,
+    proven_disjoint_tensor_pairs: set[frozenset[str]],
+    protected_names: set[str],
+    proven_tensor_stride_values: Mapping[tuple[str, int], int],
+    constexpr_value: Callable[[str], int | None] | None,
+    rename_groups: Mapping[str, str],
+    new_var: Callable[[str], str] | None,
+) -> list[ast.AST] | str | None:
+    """One loop nest for a trace-time vector lane loop whose serial loop
+    walks a tile of rows per trip (``tile_trips.py``): the lanes carry their
+    values through the trips and, within a trip, the tile's folds through
+    its rows.
+
+        for LANE: PREFIX; for MB: HOISTED; for ROW: BODY; CONSUMERS; SUFFIX
+
+    becomes ``_lane_carry_nest``'s nest of the serial loop ``MB``, whose
+    lane loop holds ``HOISTED; for ROW: BODY; CONSUMERS`` and is itself such
+    a nest of ``ROW``: every trip runs its rows one after another, each row's
+    lanes accumulating before the row's reductions combine, and the
+    consumers of the tile's folds once per lane after the last row.
+
+    The order of the memory accesses is proven on the flat nest
+    (``TileTripNest.flat``: one serial loop over the same rows, the same
+    statements per row and lane): the single nest of that one runs the rows
+    outside the lanes, as this one does within and across its trips, and
+    the accesses that change their order there are the ones that change it
+    here.  Whatever ``_lane_carry_nest`` needs of the nest's scalars is
+    checked on the tiled nest itself, at both levels.
+
+    Returns the reason (``None`` for a nest without carried values) when
+    either level declines.
+    """
+    proof = _lane_carry_nest(
+        trips.flat,
+        lane_var,
+        proven_disjoint_tensor_pairs,
+        protected_names,
+        proven_tensor_stride_values,
+        constexpr_value,
+        rename_groups,
+        lambda name: name,
+    )
+    if not isinstance(proof, list):
+        return proof
+    outer = _lane_carry_nest(
+        loop,
+        lane_var,
+        proven_disjoint_tensor_pairs,
+        protected_names,
+        proven_tensor_stride_values,
+        constexpr_value,
+        rename_groups,
+        new_var,
+        trips=trips.trip_loop,
+        memory_proven=True,
+    )
+    if not isinstance(outer, list):
+        return outer
+    # ``loop`` is now the lane loop of one trip, in the serial loop's body.
+    inner = _lane_carry_nest(
+        loop,
+        lane_var,
+        proven_disjoint_tensor_pairs,
+        protected_names,
+        proven_tensor_stride_values,
+        constexpr_value,
+        rename_groups,
+        new_var,
+        memory_proven=True,
+    )
+    if not isinstance(inner, list):
+        return inner or "a trip's rows carry no value of the tile"
+    position = trips.serial_loop.body.index(cast("ast.stmt", loop))
+    trips.serial_loop.body[position : position + 1] = cast("list[ast.stmt]", inner)
+    return outer
+
+
 def _interchange_one_lane_loop(
     loop: ast.For,
     lane_var: str,
@@ -4020,14 +4680,25 @@ def _interchange_one_lane_loop(
         _restore_per_lane_markers(mb_loop, markers, lane_var=lane_var)
         return [loop]
 
+    # Nest B computes each marker from its own lane's input, a partial value
+    # that only the consumers Nest A stores again may read.  A value the
+    # serial loop hands on, to its next iteration or to the lane suffix (the
+    # per-column sum of the centered rows), would keep the partial: Nest A,
+    # whose lanes run inside the serial loop, has no lane to carry it in.
+    if _reductions_handed_on(mb_body, lane_suffix, marker_results, rename_groups):
+        raise exc.BackendUnsupported(
+            "cute",
+            "interchanged lane reduction would hand a lane's partial reduction "
+            "on through the serial loop",
+        )
+
     # A name is lane-varying if it (transitively) depends on the lane var across
     # the whole lane-loop body; lane-invariant names (mb bounds, masks, ...) are
-    # recomputed once rather than per lane.
-    lane_varying = _lane_varying_names([*lane_prefix, *mb_body, *lane_suffix], lane_var)
-
-    def reads_lane(stmt: ast.AST) -> bool:
-        reads = set(ReadWrites.from_ast(stmt).reads)
-        return lane_var in reads or bool(reads & lane_varying)
+    # recomputed once rather than per lane.  Names one pending rename merges
+    # are one value.
+    lane_varying = _lane_varying_names(
+        [*lane_prefix, *mb_body, *lane_suffix], lane_var, rename_groups
+    )
 
     # --- Nest A (grad_x): for MB: for LANE: <reduction + broadcast store> ------
     # Backward slice from the reduction-broadcast stores and the marker inputs,
@@ -4072,6 +4743,90 @@ def _interchange_one_lane_loop(
             needed |= canonical(rw.reads)
     keep_prefix_a.reverse()
 
+    # Nest A runs the statements it keeps in another order than the lane loop:
+    # those that hold no lane value once, ahead of the serial loop (the lane
+    # prefix's) or ahead of the lanes in every serial iteration (the serial
+    # body's), and the others in every lane of every serial iteration, the
+    # prefix's again each time.  A statement runs per lane when it reads a
+    # lane-varying name, or binds one that Nest A reads: the initializer of a
+    # value a loop of the serial body accumulates per lane (``total = 0.0``
+    # ahead of ``for k: total = total + load``), run once per serial iteration
+    # instead, left every lane after the first adding to the lane before it.
+    # A lane-varying name Nest A never reads decides nothing: the statement
+    # that binds it beside a lane-invariant value the nest carries (``total,
+    # count = 0.0, 0.0``, ``total`` summed for the lane suffix alone) stays
+    # ahead of the lanes, where rerun in them it would reset ``count`` in
+    # every serial iteration.
+    kept_a = [*keep_prefix_a, *keep_mb_a]
+    effects_a = [ReadWrites.from_ast(stmt) for stmt in kept_a]
+    uses_a = [canonical([*effects.reads, *effects.writes]) for effects in effects_a]
+    reads_a = seeds.union(*(canonical(effects.reads) for effects in effects_a))
+
+    def is_lane_varying(stmt: ast.AST) -> bool:
+        return _is_lane_varying_statement(
+            stmt, lane_var, lane_varying, rename_groups, lane_varying & reads_a
+        )
+
+    # That order computes what the lane loop computes only while the two
+    # groups keep to themselves:
+    # - What a statement binds per lane, the statements ahead of the lanes
+    #   must not use.  A statement that reads a lane-varying name binds only
+    #   such names, and whatever reads those, or binds one Nest A reads, runs
+    #   per lane.  One that runs per lane for a name it binds may bind a
+    #   second, lane-invariant one (a branch whose arms bind ``total = 0.0``
+    #   and a row offset ``base``): the statements that read ``base`` stay
+    #   ahead of the lanes, where they read the ``base`` of the iteration
+    #   before.  Declined, unless no other statement of the nest uses the
+    #   name.
+    # - The lane split, which lowers Nest A's lane loop, hoists what holds no
+    #   lane value out of it again, by the lane values of that loop alone:
+    #   the names its own statements bind from a lane value
+    #   (``lane_values_a``; the reductions are complete there).  It keeps a
+    #   statement that binds one of those in the lanes, so whatever else that
+    #   statement binds must be one of them too: ``total, scale = 0.0, scale
+    #   * 2.0`` beside a hoisted ``scale = row * 1.0`` would double ``scale``
+    #   once more in every lane.  Declined on the same terms.
+    # - A statement ahead of the lanes must not bind a name that a per-lane
+    #   statement before it uses.  Within the serial body that is
+    #   ``decline_stale_reads``'s check, below.  The lane prefix's per-lane
+    #   statements run again in every serial iteration, behind the rest of
+    #   the prefix and that iteration's lane-invariant statements: declined
+    #   when one of those binds a name that such a prefix statement uses,
+    #   whether it follows it in the prefix (``m = 2.0`` behind ``t = m +
+    #   lane``) or stands in the serial body (``scale = scale * 2.0``).
+    # - A per-lane update the serial loop carries has no lane to stay in:
+    #   declined below (``carried_lane_updates``).
+    lane_values_a = _lane_varying_names(
+        [
+            stmt
+            for stmt in kept_a
+            if is_lane_varying(stmt) and _is_lane_reduce_marker_assign(stmt) is None
+        ],
+        lane_var,
+        rename_groups,
+    )
+    rerun_uses: set[str] = set()
+    for index, stmt in enumerate(kept_a):
+        writes = canonical(effects_a[index].writes)
+        if not is_lane_varying(stmt):
+            if writes & rerun_uses:
+                raise exc.BackendUnsupported(
+                    "cute",
+                    "an interchanged lane reduction would run a lane-invariant "
+                    "assignment ahead of a statement of the lane prefix that uses "
+                    "the name it binds",
+                )
+            continue
+        beside = writes - (lane_values_a if writes & lane_values_a else lane_varying)
+        if any(beside & uses for other, uses in enumerate(uses_a) if other != index):
+            raise exc.BackendUnsupported(
+                "cute",
+                "an interchanged lane reduction would bind a lane-invariant value "
+                "in every lane, beside a lane's own",
+            )
+        if index < len(keep_prefix_a):
+            rerun_uses |= uses_a[index]
+
     if _has_impure_inline_asm(loop):
         # Both nests can retain the original producers. The in-place restore
         # and register-tile fallback above do not clone these effects.
@@ -4082,16 +4837,20 @@ def _interchange_one_lane_loop(
 
     # Partition kept statements into lane-invariant (run once per mb iteration)
     # vs lane-varying (recomputed per lane inside the inner lane loop).
-    prefix_invariant_a = [_rerun_copy(s) for s in keep_prefix_a if not reads_lane(s)]
-    prefix_varying_a = [_rerun_copy(s) for s in keep_prefix_a if reads_lane(s)]
+    prefix_invariant_a = [
+        _rerun_copy(s) for s in keep_prefix_a if not is_lane_varying(s)
+    ]
+    prefix_varying_a = [_rerun_copy(s) for s in keep_prefix_a if is_lane_varying(s)]
     # Nest A's serial loop is another loop over the serial loop's tiles, at
     # another iteration than Nest B's at any moment: its copies drop the
     # access regions recorded in Nest B's loop (``_without_access_regions``).
     mb_head_a = [
-        _without_access_regions(deep_clone(s)) for s in keep_mb_a if not reads_lane(s)
+        _without_access_regions(deep_clone(s))
+        for s in keep_mb_a
+        if not is_lane_varying(s)
     ]
     mb_varying_a = [
-        _without_access_regions(deep_clone(s)) for s in keep_mb_a if reads_lane(s)
+        _without_access_regions(deep_clone(s)) for s in keep_mb_a if is_lane_varying(s)
     ]
 
     inner_lane_loop_a = _clone_lane_loop_with_body(
@@ -4140,7 +4899,7 @@ def _interchange_one_lane_loop(
     # update is the same in every lane, once per iteration.
     carried_updates = carried_lane_updates(loop, mb_body, rename_groups)
     if any(
-        reads_lane(statement) and carried_updates(statement)
+        is_lane_varying(statement) and carried_updates(statement)
         for statement in keep_mb_a
         if _is_lane_reduce_marker_assign(statement) is None
     ):
@@ -4251,7 +5010,7 @@ def _interchange_one_lane_loop(
     head_moves: list[tuple[ast.AST, list[ast.AST]]] = []
     heads, varying = iter(mb_head_a), 0
     for stmt in keep_mb_a:
-        if reads_lane(stmt):
+        if is_lane_varying(stmt):
             varying += 1
         else:
             head_moves.append((next(heads), mb_varying_a[:varying]))

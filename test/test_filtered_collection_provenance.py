@@ -9,6 +9,7 @@ from helion._compiler.type_info import NumericType
 from helion._testing import DEVICE
 from helion._testing import cpu_render_target
 from helion._testing import onlyBackends
+from helion._testing import skipIfRefEager
 from helion._testing.binding_observation import scalar_additions
 from helion._testing.cute_codegen import cpu_bind
 from helion._testing.tunable_fragments import load_host_function
@@ -46,6 +47,7 @@ def _host_calls(x, limit: int, kind: hl.constexpr):
 @pytest.mark.parametrize(
     "kind", ["print", "print_starred", "helper_none", "helper_unused_result"]
 )
+@skipIfRefEager("reads compiler state, which ref mode does not build")
 def test_unused_host_collection_call(kind, capsys):
     x = torch.ones(7)
     with cpu_render_target():
@@ -78,6 +80,7 @@ def _inline_length(x, limit: int, form: hl.constexpr):
 
 
 @pytest.mark.parametrize("form", ["list", "tuple", "dict"])
+@skipIfRefEager("reads compiler state, which ref mode does not build")
 def test_inline_filtered_length_bound(form):
     with cpu_render_target():
         x = torch.ones(7)
@@ -107,6 +110,7 @@ def _filtered_endpoints(x, limit: int):
     return out
 
 
+@skipIfRefEager("reads compiler state, which ref mode does not build")
 def test_filtered_indices_have_distinct_runtime_values():
     with cpu_render_target():
         x = torch.ones(7)
@@ -144,6 +148,7 @@ def _dict_collision(x, y, limit: int):
 
 
 @pytest.mark.parametrize("stride", [0, 1, 2])
+@skipIfRefEager("reads compiler state, which ref mode does not build")
 def test_filtered_dict_collision_passes_actual_tensor(stride):
     x = torch.ones(7)
     y = torch.full((max(1, 7 * stride),), 3.0).as_strided((7,), (stride,))
@@ -167,6 +172,7 @@ def test_filtered_dict_collision_passes_actual_tensor(stride):
 
 
 @pytest.mark.parametrize("mismatch", ["shape", "dtype"])
+@skipIfRefEager("checks a compile-time error, which ref mode does not raise")
 def test_filtered_dict_collision_rejects_incompatible_tensors(mismatch):
     x = torch.ones(7)
     y = torch.ones(8) if mismatch == "shape" else torch.ones(7, dtype=torch.int64)
@@ -184,6 +190,7 @@ def _indexed_length(x, limit: int, index: hl.constexpr):
 
 
 @pytest.mark.parametrize("index", [0, 1, -1])
+@skipIfRefEager("reads compiler state, which ref mode does not build")
 def test_inline_filtered_index_bound(index):
     with cpu_render_target():
         x = torch.ones(7)
@@ -211,6 +218,7 @@ def _nested_length(x, limit: int):
     return out
 
 
+@skipIfRefEager("reads compiler state, which ref mode does not build")
 def test_nested_filtered_length_bound():
     with cpu_render_target():
         x = torch.ones(7)
@@ -263,6 +271,7 @@ def _derived_layout(x, y, limit: int, form: hl.constexpr):
 @pytest.mark.parametrize(
     "form", ["like", "keyword", "clone", "chain", "zeros", "binary", "unary", "branch"]
 )
+@skipIfRefEager("reads compiler state, which ref mode does not build")
 def test_filtered_tensor_derived_allocation_uses_runtime_layout(form):
     x = torch.arange(16, dtype=torch.float32).reshape(4, 4)
     y = x.t()
@@ -298,6 +307,7 @@ def test_filtered_tensor_derived_allocation_uses_runtime_layout(form):
                 ]
 
 
+@skipIfRefEager("reads compiler state, which ref mode does not build")
 def test_filtered_tensor_does_not_taint_independent_static_allocation():
     x = torch.empty(4, 4)
     with cpu_render_target():
@@ -312,6 +322,7 @@ def test_filtered_tensor_does_not_taint_independent_static_allocation():
 @pytest.mark.cuda
 @onlyBackends(["triton", "cute"])
 @pytest.mark.parametrize("form", ["like", "chain"])
+@skipIfRefEager("reads compiler state, which ref mode does not build")
 def test_filtered_tensor_derived_allocation_copies_current_layout(form):
     x = torch.arange(16, dtype=torch.float32, device=DEVICE).reshape(4, 4)
     y = x.t()
@@ -342,6 +353,7 @@ def _direct_branch_layout(x, y, flag: int):
 
 
 @pytest.mark.parametrize("layout", ["transpose", "reverse", "same"])
+@skipIfRefEager("reads compiler state, which ref mode does not build")
 def test_host_branch_introduces_only_required_layout_uncertainty(layout):
     x = torch.arange(16, dtype=torch.float32).reshape(4, 4)
     y = x.clone() if layout == "same" else x.t()
@@ -412,6 +424,7 @@ def _projected_reference(selected, form):
 @pytest.mark.parametrize(
     "form", ["advanced", "comparison", "property", "method", "function"]
 )
+@skipIfRefEager("reads compiler state, which ref mode does not build")
 def test_host_tensor_projection_keeps_actual_layout(form):
     x = torch.arange(64, dtype=torch.float32).reshape(4, 4, 4)
     y = x.transpose(1, 2)
@@ -456,6 +469,7 @@ def test_host_tensor_projection_keeps_actual_layout(form):
 @pytest.mark.cuda
 @onlyBackends(["triton", "cute"])
 @pytest.mark.parametrize("form", ["branch", "advanced", "comparison"])
+@skipIfRefEager("reads compiler state, which ref mode does not build")
 def test_host_tensor_layout_exits_copy_current_values(form):
     if form == "branch":
         x = torch.arange(16, dtype=torch.float32, device=DEVICE).reshape(4, 4)
@@ -512,6 +526,7 @@ def _fixed_layout_destination(x, y, destination, limit: int, form: hl.constexpr)
     "form",
     ["copy", "out", "new_empty", "new_strided", "new_zeros", "new_ones", "new_full"],
 )
+@skipIfRefEager("reads compiler state, which ref mode does not build")
 def test_host_fixed_storage_layout_does_not_inherit_selected_strides(form):
     x = torch.arange(64, dtype=torch.float32).reshape(4, 4, 4)
     y = x.transpose(1, 2)
@@ -554,6 +569,7 @@ def test_host_fixed_storage_layout_does_not_inherit_selected_strides(form):
                 assert not any(type(arg) is int for arg in launches[-1])
 
 
+@skipIfRefEager("reads compiler state, which ref mode does not build")
 def test_host_marked_view_reuses_runtime_stride_expressions():
     x = torch.empty(4, 4, 4)
     with cpu_render_target():
@@ -583,6 +599,7 @@ def _resized_out_layout(x, y, limit: int, form: hl.constexpr):
 
 
 @pytest.mark.parametrize("form", ["direct", "view"])
+@skipIfRefEager("reads compiler state, which ref mode does not build")
 def test_host_resized_out_uses_current_layout(form):
     x = torch.arange(64, dtype=torch.float32).reshape(4, 4, 4)
     y = x.transpose(1, 2)
@@ -621,6 +638,7 @@ def test_host_resized_out_uses_current_layout(form):
 
 
 @pytest.mark.parametrize("transpose", [False, True])
+@skipIfRefEager("reads compiler state, which ref mode does not build")
 def test_host_branch_preserves_common_nondense_layout(transpose):
     x = torch.arange(32, dtype=torch.float32).reshape(4, 8)[:, ::2]
     y = (torch.arange(32, dtype=torch.float32) + 100).reshape(4, 8)[:, ::2]
@@ -652,6 +670,7 @@ def test_host_branch_preserves_common_nondense_layout(transpose):
 @pytest.mark.cuda
 @onlyBackends(["triton", "cute"])
 @pytest.mark.parametrize("form", ["direct", "view", "common_nondense"])
+@skipIfRefEager("reads compiler state, which ref mode does not build")
 def test_host_resized_and_common_branch_layouts_copy_values(form):
     if form != "common_nondense":
         x = torch.arange(64, dtype=torch.float32, device=DEVICE).reshape(4, 4, 4)
@@ -701,6 +720,7 @@ def _shape_factory_layout(x, form: hl.constexpr):
 
 
 @pytest.mark.parametrize("form", ["empty_strided", "zeros", "ones", "full"])
+@skipIfRefEager("reads compiler state, which ref mode does not build")
 def test_host_shape_factories_preserve_exact_layout_with_dynamic_shapes(form):
     x = torch.empty(4, 4, 4)
     with cpu_render_target():
@@ -772,6 +792,7 @@ def _factory_like_inputs(form, device="cpu"):
 @pytest.mark.parametrize(
     "form", ["torch_runtime", "method_runtime", "torch_literal", "method_literal"]
 )
+@skipIfRefEager("reads compiler state, which ref mode does not build")
 def test_empty_like_replays_shape_and_stride_dependent_layout(form):
     first, second = _factory_like_inputs(form)
     with cpu_render_target():
@@ -825,6 +846,7 @@ def test_empty_like_replays_shape_and_stride_dependent_layout(form):
         assert outputs[0].stride() != outputs[1].stride()
 
 
+@skipIfRefEager("reads compiler state, which ref mode does not build")
 def test_empty_like_keeps_fully_literal_layout_exact():
     x = torch.empty(4, 4)
     with cpu_render_target():
@@ -839,6 +861,7 @@ def test_empty_like_keeps_fully_literal_layout_exact():
 @pytest.mark.cuda
 @onlyBackends(["triton", "cute"])
 @pytest.mark.parametrize("form", ["torch_runtime", "method_runtime", "torch_literal"])
+@skipIfRefEager("reads compiler state, which ref mode does not build")
 def test_empty_like_compiled_copy_tracks_factory_layout(form):
     first, second = _factory_like_inputs(form, DEVICE)
     originals = first.clone(), second.clone()
@@ -877,6 +900,7 @@ def _canonical_input_like(x, form: hl.constexpr):
 
 
 @pytest.mark.parametrize("form", ["factory", "input", "view"])
+@skipIfRefEager("reads compiler state, which ref mode does not build")
 def test_empty_like_proves_symbolic_canonical_layout(form):
     x = torch.empty(4, 4)
     with cpu_render_target():
@@ -888,6 +912,7 @@ def test_empty_like_proves_symbolic_canonical_layout(form):
         assert f"out.stride({output.ndim - 1})" not in source
 
 
+@skipIfRefEager("reads compiler state, which ref mode does not build")
 def test_empty_like_input_layout_guard_changes_with_runtime_metadata():
     canonical = torch.arange(16, dtype=torch.float32).reshape(4, 4)
     transpose = canonical.t()
@@ -910,6 +935,7 @@ def test_empty_like_input_layout_guard_changes_with_runtime_metadata():
 
 
 @onlyBackends(["cute"])
+@skipIfRefEager("reads compiler state, which ref mode does not build")
 def test_empty_like_nondegenerate_rank_one_keeps_topk_output_layout():
     @helion.kernel(static_shapes=True, autotune_effort="none")
     def topk_sum(x, stride: int):
@@ -933,6 +959,7 @@ def test_empty_like_nondegenerate_rank_one_keeps_topk_output_layout():
 
 
 @pytest.mark.parametrize("form", ["factory", "input", "view"])
+@skipIfRefEager("reads compiler state, which ref mode does not build")
 def test_empty_like_canonical_guard_includes_empty_and_singleton_strides(form):
     shapes = ((4, 4), (4, 0), (4, 1), (0, 4), (1, 4))
     with cpu_render_target():
@@ -992,6 +1019,7 @@ def test_empty_like_canonical_guard_dispatch_copies_runtime_layouts():
         assert out.stride() == torch.empty_like(value).stride()
 
 
+@skipIfRefEager("reads compiler state, which ref mode does not build")
 def test_empty_like_derived_extent_class_is_guarded():
     with cpu_render_target():
         bindings = {}
@@ -1030,6 +1058,7 @@ def test_empty_like_derived_extent_class_is_guarded():
         assert bindings[3] is not bindings[4] and bindings[4] is not bindings[6]
 
 
+@skipIfRefEager("reads compiler state, which ref mode does not build")
 def test_empty_like_rank_one_preserves_requires_grad():
     @helion.kernel(static_shapes=True, autotune_effort="none")
     def copy_grad(x):

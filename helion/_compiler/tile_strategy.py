@@ -848,10 +848,19 @@ class DeviceGridState(DeviceLoopOrGridState):
     pending_relocations: list[CuteLaneRelocation] = dataclasses.field(
         default_factory=list
     )
-    # Synthetic reduction lanes materialized as ``cutlass.range_constexpr``
-    # loops OUTSIDE the one-vector tile wrappers (register-tile reductions,
-    # see ``nest_reduction_lane_outside_vector_tiles``).
+    # Lane loops materialized as ``cutlass.range_constexpr`` loops: the
+    # synthetic reduction lanes OUTSIDE the one-vector tile wrappers
+    # (register-tile reductions, see
+    # ``nest_reduction_lane_outside_vector_tiles``) and the component loops
+    # INSIDE a vectorized lane (``component_lane_vars`` below).
     constexpr_lane_vars: set[str] = dataclasses.field(default_factory=set)
+    # Trace-time lane loops that walk the components of each element of the
+    # vectorized lane enclosing them (a backend marks a tile axis it has made
+    # one).  They do not end that lane's vector operations: ``wrap_body``
+    # looks past them for the innermost vectorized lane, and the backend
+    # checks where the operations ended up once the body is placed
+    # (``Backend.demote_grid_tile_vec_stores``).
+    component_lane_vars: set[str] = dataclasses.field(default_factory=set)
     # The thread extents of the root tile's own axes when the grid became
     # active, before the body's reductions added theirs to
     # ``thread_axis_sizes`` (``GenerateAST.set_active_loops``).
@@ -984,6 +993,8 @@ class DeviceGridState(DeviceLoopOrGridState):
             # the innermost live lane only after the entire body is available.
             innermost = None
             for lane_var, _extent in self.lane_loops:
+                if lane_var in self.component_lane_vars:
+                    continue
                 wrapper = self.vec_lane_wrappers.get(lane_var)
                 names = {lane_var}
                 if wrapper is not None:
@@ -1326,16 +1337,21 @@ class TileStrategy:
         return [str(size) for size in self.thread_block_sizes()]
 
     @staticmethod
-    def get_tl_range_kwargs(config: Config, block_idx: int) -> list[str]:
-        """Get the range_extra string for loop unroll factor and num_stages based on config."""
+    def get_tl_range_options(
+        config: Config, block_idx: int
+    ) -> list[tuple[str, object]]:
+        """The ``tl.range`` options (name, value) of the loop over ``block_idx``:
+        unroll factor, warp specialization, num_stages and the rest, from config."""
         env = CompileEnvironment.current()
-        kwargs = []
+        kwargs: list[tuple[str, object]] = []
 
         range_unroll_factor = env.config_spec.range_unroll_factors.config_get(
             config.range_unroll_factors, block_idx, 0
         )
         range_warp_specialize = env.config_spec.range_warp_specialize.config_get(
-            config.range_warp_specializes, block_idx, None
+            CompileEnvironment.current().backend.range_warp_specializes(config),
+            block_idx,
+            None,
         )
         range_num_stages = env.config_spec.range_num_stages.config_get(
             config.range_num_stages, block_idx, 0
@@ -1352,8 +1368,13 @@ class TileStrategy:
             if range_num_stages > 0 and not config.host_tensor_descriptors:
                 range_num_stages = 0
             # Host construction has not established that descriptor indexing
-            # is safe with both unrolling and a separate kernel-level pipeline.
-            if range_unroll_factor > 0 and num_stages > 1:
+            # is safe with both unrolling and a separate kernel-level pipeline
+            # (Triton's: gluon has none, its num_stages is the ring's depth).
+            if (
+                range_unroll_factor > 0
+                and num_stages > 1
+                and env.backend.name != "gluon"
+            ):
                 range_unroll_factor = 0
         elif (
             range_num_stages > 1
@@ -1361,46 +1382,52 @@ class TileStrategy:
             and env.block_sizes[block_idx].size
             and env.block_sizes[block_idx].numel.is_number
         ):
-            loop_numel = int(env.block_sizes[block_idx].numel)
-            block_size = int(env.block_sizes[block_idx].from_config_assert(config))
-            if env.backend.effective_num_warps(config) == 1:
+            if env.backend.effective_num_warps(config) != 1:
+                # Multi-warp unrolling plus pipelining can cause CUDA IMA. The
+                # conservative legacy bound, the last tile's remainder over
+                # one unrolled step, is a single stage whenever unrolling is.
+                range_num_stages = 1
+            else:
                 # One-warp kernels have no cross-warp layout hazard. Keep the
                 # pipeline within the number of complete unrolled iterations;
                 # using only the final tile's remainder would collapse every
-                # exactly divisible reduction to one stage.
-                loop_iterations = int(math.ceil(loop_numel / block_size))
-                unrolled_iterations = int(
-                    math.ceil(loop_iterations / range_unroll_factor)
-                )
-                range_num_stages = min(max(1, unrolled_iterations), range_num_stages)
-            else:
-                # Multi-warp unrolling plus pipelining can cause CUDA IMA. Keep
-                # the conservative legacy bound for those kernels.
-                step = range_unroll_factor * block_size
-                last_offset = ((loop_numel - 1) // block_size) * block_size
-                remainder = loop_numel - last_offset
-                range_num_stages = min(
-                    max(1, int(math.ceil(remainder / step))), range_num_stages
-                )
+                # exactly divisible reduction to one stage.  A block with no
+                # size to count by (a scalar the bound kernel does not key,
+                # or a tunable beside a dynamic size) keeps the stages.
+                loop_numel = int(env.block_sizes[block_idx].numel)
+                try:
+                    block_size = env.block_sizes[block_idx].from_config_int(
+                        config, key=False
+                    )
+                except exc.InvalidConfig:
+                    pass
+                else:
+                    loop_iterations = int(math.ceil(loop_numel / block_size))
+                    unrolled_iterations = int(
+                        math.ceil(loop_iterations / range_unroll_factor)
+                    )
+                    range_num_stages = min(
+                        max(1, unrolled_iterations), range_num_stages
+                    )
 
         if range_unroll_factor > 0:
-            kwargs.append(f"loop_unroll_factor={range_unroll_factor}")
+            kwargs.append(("loop_unroll_factor", range_unroll_factor))
         if range_warp_specialize is not None:
-            kwargs.append(f"warp_specialize={range_warp_specialize}")
+            kwargs.append(("warp_specialize", range_warp_specialize))
         if range_num_stages > 0:
-            kwargs.append(f"num_stages={range_num_stages}")
+            kwargs.append(("num_stages", range_num_stages))
 
         range_multi_buffer = env.config_spec.range_multi_buffers.config_get(
             config.range_multi_buffers, block_idx, None
         )
         if range_multi_buffer is not None:
-            kwargs.append(f"disallow_acc_multi_buffer={not range_multi_buffer}")
+            kwargs.append(("disallow_acc_multi_buffer", not range_multi_buffer))
 
         range_flatten = env.config_spec.range_flattens.config_get(
             config.range_flattens, block_idx, None
         )
         if range_flatten is not None:
-            kwargs.append(f"flatten={range_flatten}")
+            kwargs.append(("flatten", range_flatten))
 
         dpf_range = config.get("_triton_range_id_data_partition_factor", None)
         dpf_value = config.get("_triton_range_value_data_partition_factor", None)
@@ -1410,12 +1437,27 @@ class TileStrategy:
             from .compile_environment import warning
 
             if range_supports_data_partition_factor():
-                kwargs.append(f"data_partition_factor={dpf_value}")
+                kwargs.append(("data_partition_factor", dpf_value))
             elif not _warned_data_partition_factor:
                 _warned_data_partition_factor.append(True)
                 warning(exc.TritonOptionUnavailable("data_partition_factor"))
 
         return kwargs
+
+    @staticmethod
+    def get_tl_range_kwargs(config: Config, block_idx: int) -> list[str]:
+        """``get_tl_range_options`` as ``tl.range`` keyword arguments."""
+        return [
+            f"{name}={value}"
+            for name, value in TileStrategy.get_tl_range_options(config, block_idx)
+        ]
+
+    @staticmethod
+    def effective_range_num_stages(config: Config, block_idx: int) -> int:
+        """The stages of the ``tl.range`` loop over ``block_idx``: its
+        ``num_stages`` option, else the kernel's."""
+        options = dict(TileStrategy.get_tl_range_options(config, block_idx))
+        return cast("int", options.get("num_stages", config.num_stages))
 
     @staticmethod
     def get_range_call_str(
@@ -4278,7 +4320,9 @@ class PerThreadFlattenedTileStrategy(_LaneContextOwner, FlattenedTileStrategy):
         # (flattened N-D) form ``flat_multi`` is set and the hoist emits FLAT
         # base pointers (``t.iterator + lane_base``) -- valid only for
         # contiguous tensors covering the whole iteration space, which
-        # ``_cute_vector_load_ctx`` gates per tensor.
+        # ``_cute_vector_load_ctx`` gates per tensor: any other tensor's
+        # packet sits at the element the lane base decodes to, or its
+        # accesses stay per element.
         for block_id in block_ids:
             fn.register_lane(block_id, flat_multi=len(block_ids) > 1)
         self._cute_lane_layout: str = "blocked"

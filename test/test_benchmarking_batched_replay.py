@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import math
+import re
 from types import SimpleNamespace
 from typing import TYPE_CHECKING
 from unittest.mock import Mock
@@ -22,6 +23,7 @@ from helion.autotuner.benchmark_provider import LocalBenchmarkProvider
 from helion.autotuner.benchmark_worker import BenchmarkTimeout
 from helion.autotuner.benchmark_worker import BenchmarkWorker
 from helion.autotuner.benchmark_worker import BenchmarkWorkerUnkillable
+from helion.runtime.settings import _get_backend
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -738,6 +740,381 @@ def test_kernel_timer_falls_back_to_events(monkeypatch, caplog) -> None:
 
 
 @pytest.mark.cpu_only
+@pytest.mark.parametrize("failure", ["unsplit", "unsettled"])
+def test_an_unreadable_trace_window_reads_infinite_or_raises(
+    monkeypatch, caplog, failure: str
+) -> None:
+    """A window whose trace does not split into its calls, or holds no
+    settled call, reads infinite for the final selection (a finalist's
+    window cannot win) and raises for a search that reads its candidates
+    from the trace (``unreadable_reads_infinite=False``): no reading, rather
+    than an event reading among trace readings. Without a device: the
+    trace and the event clock are stand-ins."""
+    # the window summarizes its samples with ``triton.testing``
+    pytest.importorskip("triton")
+    monkeypatch.setattr(benchmarking, "_kernel_timer_preconditions", lambda group: True)
+    monkeypatch.setattr(benchmarking, "_flush_trace", 1)
+    monkeypatch.setattr(benchmarking, "_trace_marker", lambda: None)
+    monkeypatch.setattr(benchmarking, "_cuda_kernel_events", _no_trace)
+    if failure == "unsettled":
+        # every traced call starts before the warmup has passed
+        monkeypatch.setattr(
+            benchmarking,
+            "_kernel_trace_samples",
+            lambda events, count, per_flush: [(0, 0.001)] * count,
+        )
+    event = SimpleNamespace(record=lambda: None, elapsed_time=lambda end: 1.0)
+    device = SimpleNamespace(
+        Event=lambda enable_timing: event, synchronize=lambda: None
+    )
+
+    def window(unreadable_reads_infinite: bool) -> object:
+        return benchmarking._do_bench_kernel_durations(
+            lambda: None,
+            lambda: None,
+            device,
+            warmup=1,
+            rep=20,
+            quantiles=None,
+            return_mode="median",
+            fixed_repetitions=None,
+            unreadable_reads_infinite=unreadable_reads_infinite,
+        )
+
+    message = "could not split" if failure == "unsplit" else "no settled call"
+    with caplog.at_level(logging.WARNING, logger=benchmarking.__name__):
+        assert window(True) == math.inf
+    assert message in caplog.text
+    assert "the window reads inf" in caplog.text
+    with pytest.raises(benchmarking.KernelTraceUnreadable, match=message):
+        window(False)
+
+
+def _event_reading_us(call: Callable[[], object]) -> float:
+    """The smallest of five CUDA event readings of one flushed launch of
+    ``call``, in microseconds: what ``do_bench`` reads of it without the
+    trace."""
+    clear_cache = benchmarking._make_l2_cache_clearer()
+    readings = []
+    for _ in range(5):
+        clear_cache()
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        start.record()
+        call()
+        end.record()
+        torch.cuda.synchronize()
+        readings.append(start.elapsed_time(end) * 1000.0)
+    return min(readings)
+
+
+@pytest.fixture
+def released_pins(monkeypatch) -> list[torch.Tensor]:
+    """The flush buffers ``_release_l2_pins`` swept during a test."""
+    buffers: list[torch.Tensor] = []
+    release = benchmarking._release_l2_pins
+
+    def recorded(buffer: torch.Tensor) -> None:
+        buffers.append(buffer)
+        release(buffer)
+
+    monkeypatch.setattr(benchmarking, "_release_l2_pins", recorded)
+    return buffers
+
+
+@_trace_test
+@pytest.mark.parametrize("probe_long_kernel", [False, True])
+def test_search_timer_traces_every_window_it_is_asked_to(
+    traced_windows, released_pins, probe_long_kernel: bool
+) -> None:
+    """With ``trace_kernel_durations`` (a candidate of a search that settled
+    on the trace timer, whose estimate also probes for long kernels; the
+    other estimate is every other caller's) a window is timed from the
+    trace, which leaves the launch latency out, after the L2 lines earlier
+    work pinned were displaced. The search chose the timer, not the launch:
+    a short and a long launch are both traced, in every call, so one config
+    never reads on two scales. Without it every launch keeps the event timer
+    and L2 as it is."""
+    small = torch.randn(64, device=DEVICE)
+    # (a few hundred microseconds on a B200: well clear of the short
+    # launch's event reading, which is mostly launch latency)
+    large = torch.randn(2048, 2048, device=DEVICE)
+
+    def short_call() -> None:
+        torch.add(small, 1.0)
+
+    def long_call() -> None:
+        torch.mm(large, large)
+
+    short_call()
+    long_call()
+    torch.cuda.synchronize()
+    short_us, long_us = _event_reading_us(short_call), _event_reading_us(long_call)
+    assert long_us > 4 * short_us
+
+    def reading_us(call: Callable[[], object], trace: bool) -> float:
+        return 1000.0 * benchmarking.do_bench(  # pyrefly: ignore[unsupported-operation]
+            call,
+            return_mode="median",
+            warmup=1,
+            rep=20,
+            probe_long_kernel=probe_long_kernel,
+            pre_warmed=True,
+            trace_kernel_durations=trace,
+        )
+
+    for window in range(1, 4):
+        traced = reading_us(short_call, True)
+        assert len(traced_windows) == window
+        # the 256 MB flush buffer, swept once before each window
+        assert [buffer.numel() for buffer in released_pins] == [1 << 26] * window
+        # the kernel's own duration: an event pair also holds the launch latency
+        assert 0.0 < traced < short_us
+    assert 0.0 < reading_us(long_call, True) < math.inf
+    assert len(traced_windows) == 4
+    assert len(released_pins) == 4
+    assert reading_us(short_call, False) >= traced
+    assert reading_us(long_call, False) > 0.0
+    assert len(traced_windows) == 4
+    assert len(released_pins) == 4
+
+
+@_trace_test
+@pytest.mark.parametrize("probe_long_kernel", [False, True])
+def test_a_traced_window_runs_no_event_estimate_first(
+    monkeypatch, traced_windows, probe_long_kernel: bool
+) -> None:
+    """The trace timer sizes its own window: a window that is traced starts
+    there, with the caller's long-kernel probe, before any CUDA-event
+    estimate (five flushed calls, or the probe's batches) has run the
+    kernel.  With the probe a launch longer than both windows is its own
+    sample, read from the trace like every other reading of the search."""
+    small = torch.randn(64, device=DEVICE)
+    calls: list[None] = []
+
+    def call() -> None:
+        calls.append(None)
+        torch.add(small, 1.0)
+
+    call()
+    torch.cuda.synchronize()
+    calls.clear()
+    entered: list[tuple[int, bool]] = []
+    window = benchmarking._traced_candidate_window
+
+    def traced(*args: object, **kwargs: object) -> object:
+        entered.append((len(calls), bool(kwargs.get("probe_long_kernel"))))
+        return window(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(benchmarking, "_traced_candidate_window", traced)
+    monkeypatch.setattr(
+        benchmarking,
+        "_estimate_runtime_and_warmup",
+        Mock(side_effect=AssertionError("the event estimate ran")),
+    )
+
+    def reading_us(warmup: int, rep: int) -> float:
+        return 1000.0 * benchmarking.do_bench(  # pyrefly: ignore[unsupported-operation]
+            call,
+            return_mode="median",
+            warmup=warmup,
+            rep=rep,
+            probe_long_kernel=probe_long_kernel,
+            pre_warmed=True,
+            trace_kernel_durations=True,
+        )
+
+    assert 0.0 < reading_us(1, 20) < math.inf
+    assert entered == [(0, probe_long_kernel)]
+    assert traced_windows
+
+    if probe_long_kernel:
+        # Windows of no length: the first launch is longer than both, so
+        # the probe is the sample, one traced call.
+        calls.clear()
+        del traced_windows[:]
+        assert 0.0 < reading_us(0, 0) < math.inf
+        assert traced_windows == [1]
+        assert len(calls) == 1
+
+
+@_trace_test
+@pytest.mark.parametrize("probe_long_kernel", [False, True])
+def test_search_timer_keeps_the_events_where_it_cannot_trace(
+    monkeypatch, caplog, traced_windows, released_pins, probe_long_kernel: bool
+) -> None:
+    """A window asked to be traced is timed with CUDA events, on the
+    arguments as they are, in a regime other than the per-call flush, as a
+    graph replay (batched instead), in a backward benchmark, and when the
+    process cannot trace (a profiler is running, or the flush's trace could
+    not be learned): conditions the search knows when it chooses its timer.
+    Fixed repetitions are no such condition: the retry of a seed that ran
+    into the benchmark timeout is compared with the search's other readings,
+    so its calls are traced, exactly as many as asked for. A window that was
+    traced and does not split into its calls is no reading: an event reading
+    would land among the search's trace readings, so it raises, whatever the
+    caller summarizes."""
+    small = torch.randn(64, device=DEVICE)
+    weight = torch.ones(4, device=DEVICE, requires_grad=True)
+
+    def short_call() -> None:
+        torch.add(small, 1.0)
+
+    def backward_call() -> None:
+        weight.sum().backward()
+
+    def reading(call: Callable[[], object] = short_call, **kwargs: object) -> float:
+        return benchmarking.do_bench(  # pyrefly: ignore[bad-return]
+            call,
+            **{"return_mode": "median", **kwargs},  # pyrefly: ignore[bad-argument-type]
+            warmup=1,
+            rep=20,
+            probe_long_kernel=probe_long_kernel,
+            trace_kernel_durations=True,
+        )
+
+    # the process can trace: none of the readings below falls back for that
+    assert benchmarking.kernel_timer_unready_reason() is None
+    assert 0.0 < reading(l2_flush_mode="off") < math.inf
+    assert 0.0 < reading(l2_flush_mode="replay") < math.inf
+    # (its flush-corrected batch may read anything; it must not be traced)
+    assert isinstance(reading(default_cudagraph=True), float)
+    assert 0.0 < reading(backward_call, grad_to_none=[weight]) < math.inf
+    assert traced_windows == []
+    with monkeypatch.context() as patched:
+        patched.setattr(
+            benchmarking, "_kernel_timer_preconditions", lambda group: False
+        )
+        assert 0.0 < reading() < math.inf
+    with monkeypatch.context() as patched:
+        # another tool holds the activity API: learned once for the process
+        patched.setattr(benchmarking, "_flush_trace", 0)
+        assert 0.0 < reading() < math.inf
+    assert traced_windows == []
+    # no window was traced, so L2 was left as it was
+    assert released_pins == []
+    # fixed repetitions: one traced window of exactly that many calls
+    assert 0.0 < reading(fixed_repetitions=3) < math.inf
+    assert traced_windows == [3]
+    assert len(released_pins) == 1
+    monkeypatch.setattr(benchmarking, "_flush_trace", 1)
+    monkeypatch.setattr(benchmarking, "_cuda_kernel_events", _no_trace)
+    # the unsplit window was traced, and is no reading on either timer
+    for window, return_mode in enumerate(("median", "all"), start=2):
+        with pytest.raises(benchmarking.KernelTraceUnreadable, match="could not split"):
+            reading(return_mode=return_mode)
+        assert len(traced_windows) == window
+    # the pins were released before each traced window
+    assert len(released_pins) == 3
+
+
+@_trace_test
+def test_release_l2_pins_reads_the_buffer_with_evict_last_loads(monkeypatch) -> None:
+    """The pin release is one sweep of the whole buffer whose loads carry
+    the evict-last hint: only such loads displace the lines earlier work
+    pinned in L2 (an evict-first or a plain sweep leaves them)."""
+    buffer = torch.empty(1 << 20, dtype=torch.int32, device=DEVICE)
+    benchmarking._release_l2_pins(buffer)  # compiled outside the trace
+    torch.cuda.synchronize()
+
+    def release() -> None:
+        benchmarking._release_l2_pins(buffer)
+        torch.cuda.synchronize()
+
+    assert [event.name for event in benchmarking._cuda_kernel_events(release)] == [
+        "helion_l2_sweep_evict_last"
+    ]
+    programs = buffer.numel() // benchmarking._L2_SWEEP_WIDTH
+    sink = benchmarking._l2_sweep_sinks[(buffer.device.index, programs)]
+    assert sink.numel() == programs
+    # Read the IR of a compile of its own. The kernel compiled above may come
+    # from the Triton cache, where an autotune that ran it (another test, maybe
+    # in another worker) left only the binary: autotuning sets
+    # TRITON_STORE_BINARY_ONLY. A new JITFunction skips the in-memory cache.
+    monkeypatch.setenv("TRITON_ALWAYS_COMPILE", "1")
+    monkeypatch.setenv("TRITON_STORE_BINARY_ONLY", "0")
+    kernel = benchmarking._l2_sweep_kernel()
+    compiled = type(kernel)(kernel.fn)[(programs,)](
+        buffer, sink, WIDTH=benchmarking._L2_SWEEP_WIDTH
+    )
+    # Triton 3.9 prints the load's policy as ``eviction_policy``, 3.8 and
+    # older as ``evictionPolicy``
+    assert re.search(
+        r"\b(eviction_policy|evictionPolicy) = evict_last\b", compiled.asm["ttir"]
+    )
+    if _get_backend() != "tileir":  # the Tile IR toolchain emits no PTX
+        assert "createpolicy.fractional.L2::evict_last" in compiled.asm["ptx"]
+
+
+@pytest.mark.cpu_only
+def test_worker_job_passes_the_searchs_timer_to_do_bench(monkeypatch) -> None:
+    """A worker job asked to trace times its candidate with
+    ``trace_kernel_durations`` (and a wall-clock job, whose timer has no
+    trace path, without it); every other job calls its timer as before. A
+    job asked to trace in a worker that cannot (it was respawned beside a
+    tool that holds the activity API, say) fails instead of timing with CUDA
+    events, whose reading the search would compare with trace readings.
+    A job with fixed repetitions (the retry of a timed-out seed) is traced
+    like any other and is refused the same way."""
+    monkeypatch.setattr(
+        benchmark_job, "_load_compiled_fn_for_worker", lambda spec: lambda: None
+    )
+    monkeypatch.setattr(benchmark_job, "_unload_compiled_fn", lambda fn: None)
+    monkeypatch.setattr(benchmark_job, "load_trusted_kernel_args", lambda path: ())
+    monkeypatch.setattr(benchmark_job, "steady_graph_dispatch", lambda device: None)
+    monkeypatch.setattr(benchmark_job, "synchronize_device", lambda: None)
+    seen: list[dict[str, object]] = []
+    unready: list[str | None] = [None]
+    asked: list[None] = []
+
+    def bench(fn: Callable[[], object], **kwargs: object) -> float:
+        seen.append(kwargs)
+        return 1.0
+
+    def unready_reason() -> str | None:
+        asked.append(None)
+        return unready[0]
+
+    monkeypatch.setattr(benchmark_job, "do_bench", bench)
+    monkeypatch.setattr(benchmark_job, "do_bench_generic", bench)
+    monkeypatch.setattr(benchmark_job, "kernel_timer_unready_reason", unready_reason)
+
+    def job(**kwargs: object) -> None:
+        benchmark_job.BenchmarkJob(
+            fn_spec=None,  # pyrefly: ignore[bad-argument-type]
+            args_path="",
+            **kwargs,  # pyrefly: ignore[bad-argument-type]
+        )()
+
+    job(trace_kernel_durations=True)
+    assert len(asked) == 1
+    job()
+    job(trace_kernel_durations=True, use_wall_clock=True)
+    assert len(asked) == 1
+    assert [kwargs.get("trace_kernel_durations") for kwargs in seen] == [
+        True,
+        None,
+        None,
+    ]
+
+    unready[0] = "the CUDA activity trace is held by another tool"
+    with pytest.raises(benchmarking.KernelTraceUnreadable, match="another tool"):
+        job(trace_kernel_durations=True)
+    with pytest.raises(benchmarking.KernelTraceUnreadable, match="another tool"):
+        job(trace_kernel_durations=True, fixed_repetitions=3)
+    assert len(seen) == 3
+    job()
+    assert len(seen) == 4
+    assert len(asked) == 3
+
+    # A worker that can trace runs the retry's fixed repetitions traced.
+    unready[0] = None
+    job(trace_kernel_durations=True, fixed_repetitions=3)
+    assert seen[-1]["trace_kernel_durations"] is True
+    assert seen[-1]["fixed_repetitions"] == 3
+
+
+@pytest.mark.cpu_only
 def test_worker_probe_is_asked_once_and_explains_a_refusal() -> None:
     """``worker_kernel_timer_available`` runs the probe in the worker once,
     logs its reason (a raising probe as a warning), turns any failed probe
@@ -815,8 +1192,11 @@ def test_worker_job_refuses_an_untraceable_kernel_window(monkeypatch) -> None:
         args_path="",
         l2_flush_mode="kernel",
     )
-    with pytest.raises(RuntimeError, match="the trace is held"):
+    with pytest.raises(RuntimeError, match="the trace is held") as refused:
         job()
+    # (not the "no reading" of a search's traced candidate, which the
+    # provider would take for a window that could not be read)
+    assert type(refused.value) is RuntimeError
 
 
 @pytest.mark.cpu_only
@@ -1088,7 +1468,13 @@ def test_do_bench_drains_the_launch_queue_on_hip(monkeypatch, hip: bool) -> None
     and timed loops (each loop counts its own, so the end of the warm-up and the
     start of the timing queue under twice that); elsewhere those loops never
     wait on the device."""
+    from triton import runtime
+
     monkeypatch.delenv("HELION_BENCHMARK_CUDAGRAPH", raising=False)
+    # Triton picks its driver from ``torch.version.hip`` on first use: build
+    # the device's own before the patch (alone in a process, the test would
+    # otherwise hand do_bench the AMD driver on an NVIDIA device).
+    runtime.driver.active.get_device_interface()
     monkeypatch.setattr(torch.version, "hip", "7.2" if hip else None)
     monkeypatch.setattr(benchmarking, "_HIP_MAX_QUEUED_CALLS", 10)
     trace: list[str] = []
