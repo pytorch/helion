@@ -32,6 +32,7 @@ from torch.fx import Node
 
 from ..._compat import shape_env_size_hint
 from ...language import _tracing_ops
+from ...language import memory_ops
 from ...language import tile_ops
 from ...language import view_ops
 from ..compile_environment import CompileEnvironment
@@ -69,12 +70,31 @@ class FlatGatherLaneSplit:
     lane_dim: int
 
 
-def _is_broadcast_view(node: Node) -> bool:
+def _is_broadcast_subscript(subscripts: object) -> bool:
+    return isinstance(subscripts, (list, tuple)) and all(
+        item is None or (isinstance(item, slice) and item == slice(None))
+        for item in subscripts
+    )
+
+
+def _is_broadcast_view(node: Node, *, tile_index_loads: bool = True) -> bool:
     if node.target is view_ops.subscript:
-        subscripts = node.args[1]
-        return isinstance(subscripts, (list, tuple)) and all(
-            item is None or (isinstance(item, slice) and item == slice(None))
-            for item in subscripts
+        return _is_broadcast_subscript(node.args[1])
+    if node.target is memory_ops.load:
+        # ``tile.index[:, None]`` of a root grid tile, in the root graph or
+        # in a device loop under it: subscripting that index traces to an
+        # unmasked ``hl.load`` of the ``tile_index`` node, not to
+        # ``view_ops.subscript`` (as a device loop's own tile index does).
+        # Only that operand: a load of a tensor reads memory.
+        operand = node.args[0]
+        return (
+            tile_index_loads
+            and isinstance(operand, Node)
+            and operand.target is tile_ops.tile_index
+            and len(node.args) >= 2
+            and _is_broadcast_subscript(node.args[1])
+            and all(arg is None for arg in node.args[2:])
+            and not any(value is not None for value in node.kwargs.values())
         )
     return node.target in _PASSTHROUGH_TARGETS
 
@@ -92,8 +112,11 @@ def _block_id_of_size(env: CompileEnvironment, size: object) -> int | None:
     return None
 
 
-def _tile_index_block(node: object, env: CompileEnvironment) -> int | None:
-    """The block id of a (broadcast view of a) bare ``tile_index`` node."""
+def _tile_index_block(
+    node: object, env: CompileEnvironment, *, tile_index_loads: bool = True
+) -> int | None:
+    """The block id of a (broadcast view of a) bare ``tile_index`` node;
+    ``tile_index_loads`` as for :func:`match_flat_gather_lane`."""
     current = node
     while isinstance(current, Node) and current.op == "call_function":
         if current.target is tile_ops.tile_index:
@@ -101,10 +124,33 @@ def _tile_index_block(node: object, env: CompileEnvironment) -> int | None:
             if value is None or value.ndim != 1:
                 return None
             return _block_id_of_size(env, value.shape[0])
-        if not _is_broadcast_view(current):
+        if not _is_broadcast_view(current, tile_index_loads=tile_index_loads):
             return None
         current = current.args[0]
     return None
+
+
+def _keeps_index_values(node: object) -> bool:
+    """Whether the views between ``node`` and the ``tile_index`` under it
+    keep every index value: a dtype conversion among them must be to an
+    integer dtype that holds every value of the one it converts (``int32``
+    to ``int64``), not one that can wrap an index (``int32`` to ``uint8``).
+    An index is not negative, so the dtypes' largest values decide."""
+    current = node
+    while isinstance(current, Node) and current.target is not tile_ops.tile_index:
+        if current.target is torch.ops.prims.convert_element_type.default:
+            source = node_tensor(current.args[0])
+            converted = node_tensor(current)
+            if (
+                source is None
+                or converted is None
+                or source.dtype not in _INTEGER_DTYPES
+                or converted.dtype not in _INTEGER_DTYPES
+                or torch.iinfo(converted.dtype).max < torch.iinfo(source.dtype).max
+            ):
+                return False
+        current = current.args[0]
+    return True
 
 
 def _scalar(value: object) -> int | torch.SymInt | None:
@@ -149,7 +195,7 @@ def _static_int(
 
 
 def match_flat_gather_lane(
-    index: object, env: CompileEnvironment
+    index: object, env: CompileEnvironment, *, tile_index_loads: bool = True
 ) -> FlatGatherLaneSplit | None:
     """Match an integer index tensor ``row + tile_index(block)``.
 
@@ -159,7 +205,11 @@ def match_flat_gather_lane(
     the lane coordinate enters the index with unit coefficient and the rest
     of the index does not change with the lane.  Anything else (a scaled or
     shifted lane term, a lane term inside a product, a second occurrence of
-    the lane) returns None.
+    the lane, a lane term converted to a dtype that can wrap it) returns
+    None: callers address the lane with the block's own index.  Without
+    ``tile_index_loads`` the views of the tile term are view subscripts
+    only, not the ``hl.load`` a root grid tile's ``tile.index[:, None]``
+    traces to.
     """
     if not isinstance(index, Node) or index.op != "call_function":
         return None
@@ -171,8 +221,12 @@ def match_flat_gather_lane(
     if index_value is None or index_value.dtype not in _INTEGER_DTYPES:
         return None
     for lane_term, row in (index.args, index.args[::-1]):
-        block_id = _tile_index_block(lane_term, env)
-        if block_id is None or not isinstance(row, Node):
+        block_id = _tile_index_block(lane_term, env, tile_index_loads=tile_index_loads)
+        if (
+            block_id is None
+            or not isinstance(row, Node)
+            or not _keeps_index_values(lane_term)
+        ):
             continue
         lane_value = node_tensor(lane_term)
         row_value = node_tensor(row)
@@ -316,8 +370,6 @@ def flat_gather_sink_vec_width(
     dtype; ``row`` must be a multiple of V and every tensor's base aligned
     for it.  None when any access fails or none exists.
     """
-    from ...language.memory_ops import load
-    from ...language.memory_ops import store
     from ..device_ir import ForLoopGraphInfo
     from .emitters.lane_packets import _CUTE_VECTOR_MAX_BYTES
 
@@ -334,7 +386,10 @@ def flat_gather_sink_vec_width(
         ) <= set(loop_block_ids):
             continue
         for node in graph_info.graph.nodes:
-            if node.op != "call_function" or node.target not in (load, store):
+            if node.op != "call_function" or node.target not in (
+                memory_ops.load,
+                memory_ops.store,
+            ):
                 continue
             tensor = node_tensor(node.args[0])
             subscript = node.args[1]
@@ -395,8 +450,6 @@ def flat_gather_rows_hint(
     rows: a seed heuristic uses it to size the jagged thread count (a
     ``int`` row-width argument's hint is read for this estimate only).
     """
-    from ...language.memory_ops import load
-    from ...language.memory_ops import store
     from ..device_ir import ForLoopGraphInfo
 
     elements: int | None = None
@@ -406,7 +459,10 @@ def flat_gather_rows_hint(
         ) <= set(loop_block_ids):
             continue
         for node in graph_info.graph.nodes:
-            if node.op != "call_function" or node.target not in (load, store):
+            if node.op != "call_function" or node.target not in (
+                memory_ops.load,
+                memory_ops.store,
+            ):
                 continue
             tensor = node_tensor(node.args[0])
             subscript = node.args[1]
@@ -443,8 +499,6 @@ def flat_gather_row_width_hint(
     multiplying their row term (``M`` in ``(start + k) * M + tile_m.index``),
     for a seed heuristic sizing a jagged feature tile; None when the row
     term is not such a product."""
-    from ...language.memory_ops import load
-    from ...language.memory_ops import store
     from ..device_ir import ForLoopGraphInfo
 
     widths: set[int] = set()
@@ -454,7 +508,10 @@ def flat_gather_row_width_hint(
         ) <= set(loop_block_ids):
             continue
         for node in graph_info.graph.nodes:
-            if node.op != "call_function" or node.target not in (load, store):
+            if node.op != "call_function" or node.target not in (
+                memory_ops.load,
+                memory_ops.store,
+            ):
                 continue
             subscript = node.args[1]
             if not isinstance(subscript, (list, tuple)):
@@ -592,8 +649,6 @@ def flat_gather_int_factor_sources(
     env: CompileEnvironment, device_ir: DeviceIR
 ) -> tuple[LocalSource, ...]:
     """The ``int`` arguments multiplying a flat gather's row term."""
-    from ...language.memory_ops import load
-    from ...language.memory_ops import store
 
     sources: dict[str, LocalSource] = {}
 
@@ -618,13 +673,23 @@ def flat_gather_int_factor_sources(
 
     for graph_info in device_ir.graphs:
         for node in graph_info.graph.nodes:
-            if node.op != "call_function" or node.target not in (load, store):
+            if node.op != "call_function" or node.target not in (
+                memory_ops.load,
+                memory_ops.store,
+            ):
                 continue
             subscript = node.args[1]
             if not isinstance(subscript, (list, tuple)):
                 continue
             for item in subscript:
-                split = match_flat_gather_lane(item, env)
+                # On the lane terms the matcher read before a root grid
+                # tile's ``tile.index[:, None]`` became a view: what a bound
+                # kernel is keyed on does not follow the matcher, and an
+                # ``int``-scaled row of such a gather keeps its scalar load
+                # (``row_is_multiple_of`` finds no pinned residue).  A lane
+                # term a conversion can wrap is refused here as everywhere:
+                # its residue served only the address no caller builds now.
+                split = match_flat_gather_lane(item, env, tile_index_loads=False)
                 if split is not None:
                     visit(split.row, 0)
     return tuple(sources[name] for name in sorted(sources))

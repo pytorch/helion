@@ -375,6 +375,7 @@
  "test/test_cute_warp_per_row_layout.py": 2.2,
  "test/test_cute_warp_row_reduce_gpu.py": 1.1,
  "test/test_cute_warp_tf32_swizzle.py": 0.1,
+ "test/test_cute_window_gather_packets.py": 17.7,
  "test/test_cute_zero_fill_launch.py": 8.6,
  "test/test_debug_utils.py": 0.6,
  "test/test_distributed.py": 0.5,

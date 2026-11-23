@@ -54,12 +54,23 @@ the mask guarded into the add that reads it, where per-lane masks keep the
 two in separate basic blocks.  Those elements can differ by about one ulp,
 as under ``cute_lane_unroll``, so the comparison rewrite is a knob, off by
 default.
+
+``uniform_load_predicates`` is the same proof run for the V-loop sink
+(``sink_vector_loops.py``), which widens a masked load only under a mask
+that is one value per vector and runs before this pass.  It rewrites a copy
+of the body, and less of it: the quotients, and the comparisons in the
+predicate of a load the sink may widen (``t = load if predicate else 0``),
+whose select guards the load and no arithmetic.  There it also follows the
+loops a vector loop encloses (the lane loops the sink interchanges the
+vector loop into): a lane offset recorded before such a loop holds inside
+it unless the loop assigns its name or a name its base reads.
 """
 
 from __future__ import annotations
 
 import ast
 import dataclasses
+from functools import partial
 import math
 from typing import TYPE_CHECKING
 
@@ -79,7 +90,9 @@ from .simplify_proven_bounds import _python_mod_operands
 from .simplify_proven_bounds import _supported_body
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
     from collections.abc import Iterable
+    from collections.abc import Iterator
     from collections.abc import Mapping
     from collections.abc import Set as AbstractSet
 
@@ -308,8 +321,17 @@ class _Rewriter:
         *,
         in_trial: bool = False,
         carried_cache: dict[tuple[object, ...], _Facts] | None = None,
+        load_predicate: Callable[[ast.IfExp], bool] | None = None,
     ) -> None:
         self.facts = facts
+        # ``uniform_load_predicates``: which conditional expressions are the
+        # predicate of a load the V-loop sink may widen.  Set, the rewriter
+        # compares bases in those tests only, leaves remainders alone and
+        # follows the loops nested in a vector loop.
+        self.load_predicate = load_predicate
+        # The vector loops (``id``) with a statement this rewriter changed.
+        self.rewritten_loops: set[int] = set()
+        self._rewrites = 0
         # Set on the rewriters of ``carried_facts``'s passes over a copy of a
         # loop body, which need only the facts it leaves: a loop nested there
         # takes the facts it carries without a pass over its own body.
@@ -344,11 +366,16 @@ class _Rewriter:
             self.facts = entry
             self.facts.forget(names_stored_or_deleted(statement))
 
-    def loop(self, loop: ast.For) -> None:
+    def loop(
+        self,
+        loop: ast.For,
+        iteration: Callable[[ast.For, _Facts], None] | None = None,
+    ) -> None:
         # The body may run again with the values it leaves, so it starts
         # without facts about the names it assigns, as does the code after,
         # except those of the integers it carries and preserves (a
-        # software-pipelined lane base).
+        # software-pipelined lane base).  ``iteration`` rewrites the body
+        # under the counter's facts (``self.iteration`` unless given).
         assigned = names_stored_or_deleted(loop)
         counter = self.counter_facts(loop)
         carried = self.carried_facts(loop, assigned, counter)
@@ -358,7 +385,7 @@ class _Rewriter:
             if loop.orelse:
                 self.facts.forget(assigned)
             return
-        self.iteration(loop, counter)
+        (iteration or self.iteration)(loop, counter)
         self.facts.forget(assigned)
         self.facts.update(carried)
         if loop.orelse:
@@ -415,7 +442,10 @@ class _Rewriter:
             return carried
         for _ in range(_CARRY_ROUNDS):
             trial = _Rewriter(
-                self.facts.copy(), in_trial=True, carried_cache=self.carried_cache
+                self.facts.copy(),
+                in_trial=True,
+                carried_cache=self.carried_cache,
+                load_predicate=self.load_predicate,
             )
             trial.facts.forget(assigned)
             trial.facts.update(carried)
@@ -435,14 +465,12 @@ class _Rewriter:
         body_assigned = names_stored_or_deleted(
             ast.Module(body=loop.body, type_ignores=[])
         )
-        width = loop_extent(loop, kinds=("constexpr",), minimum=2)
-        # A vector loop counts its lane through 0..V-1, V a power of two.
-        if (
-            width is not None
-            and width & (width - 1) == 0
-            and target not in self.facts.with_merged(body_assigned)
-        ):
-            self.vector_body(loop.body, target, width)
+        width = _vector_width(loop)
+        if width is not None and target not in self.facts.with_merged(body_assigned):
+            rewrites = self._rewrites
+            self.vector_body(loop.body, target, width, {})
+            if self._rewrites != rewrites:
+                self.rewritten_loops.add(id(loop))
         else:
             self.body(loop.body)
 
@@ -481,12 +509,17 @@ class _Rewriter:
                 return base
         return None
 
-    def vector_body(self, statements: list[ast.stmt], lane: str, width: int) -> None:
-        # Lane-offset names: ``name = base + lane`` with ``base`` a multiple
-        # of the vector width, and the names ``offset_base`` resolves (aliases
-        # and casts of them, and their shifts by integer multiples of the
-        # width).
-        bases: dict[str, ast.expr] = {}
+    def vector_body(
+        self,
+        statements: list[ast.stmt],
+        lane: str,
+        width: int,
+        bases: dict[str, ast.expr],
+    ) -> None:
+        # Lane-offset names (``bases``): ``name = base + lane`` with ``base``
+        # a multiple of the vector width, and the names ``offset_base``
+        # resolves (aliases and casts of them, and their shifts by integer
+        # multiples of the width).
         for statement in statements:
             if isinstance(statement, ast.Assign) and isinstance(
                 statement.targets[0], ast.Name
@@ -520,7 +553,40 @@ class _Rewriter:
             for name, base in list(bases.items()):
                 if name in stored or stored & names_read(base):
                     del bases[name]
-            self.statement(statement)
+            nested = self.nested_lane_loop(statement)
+            if nested is not None:
+                self.loop(
+                    nested,
+                    partial(self.lane_iteration, lane=lane, width=width, bases=bases),
+                )
+            else:
+                self.statement(statement)
+
+    def nested_lane_loop(self, statement: ast.stmt) -> ast.For | None:
+        """``statement`` when ``uniform_load_predicates`` follows it, a loop
+        in a vector loop's body, with that loop's lane offsets: any loop but
+        a vector loop of its own, which keeps its own lane's."""
+        if self.load_predicate is None or not isinstance(statement, ast.For):
+            return None
+        if statement.orelse or _vector_width(statement) is not None:
+            return None
+        return statement
+
+    def lane_iteration(
+        self,
+        loop: ast.For,
+        counter: _Facts,
+        *,
+        lane: str,
+        width: int,
+        bases: dict[str, ast.expr],
+    ) -> None:
+        """``iteration`` for ``loop`` inside a vector loop, each of whose
+        iterations runs for one lane: ``bases`` holds the lane offsets the
+        loop leaves alone, which hold at every statement of its body, and
+        the offsets the body binds hold to its end."""
+        self.facts.update(counter)
+        self.vector_body(loop.body, lane, width, dict(bases))
 
     def offset_base(
         self, node: ast.expr, lane: str, bases: dict[str, ast.expr], width: int
@@ -573,6 +639,10 @@ class _Rewriter:
         comparison of an offset with an integer multiple of the width
         comparing the base."""
         facts = self.facts
+        rewriter = self
+        load_predicate = self.load_predicate
+        # Inside the predicate of a load the sink may widen.
+        predicate_depth = 0
 
         def base_of(node: ast.expr) -> ast.expr | None:
             return self.offset_base(node, lane, bases, width)
@@ -581,7 +651,9 @@ class _Rewriter:
             # ``base + lane < bound`` iff ``base < bound`` when both are
             # multiples of the width: the lane stays below the next one.
             # (``factor_of`` is 1 for a bound that may not be an integer.)
-            if not facts.uniform_compares or facts.factor_of(bound) % width:
+            if not (facts.uniform_compares or predicate_depth):
+                return None
+            if facts.factor_of(bound) % width:
                 return None
             if (base := base_of(offset)) is not None:
                 return base
@@ -599,8 +671,20 @@ class _Rewriter:
                 base = compared_base(operands[side], operands[1 - side])
                 if base is not None:
                     operands[side] = base
+                    rewriter._rewrites += 1
 
         class BaseTerms(ast.NodeTransformer):
+            def visit_IfExp(self, node: ast.IfExp) -> ast.AST:
+                nonlocal predicate_depth
+                if load_predicate is None or not load_predicate(node):
+                    return self.generic_visit(node)
+                predicate_depth += 1
+                node.test = self.visit(node.test)
+                predicate_depth -= 1
+                node.body = self.visit(node.body)
+                node.orelse = self.visit(node.orelse)
+                return node
+
             def visit_Compare(self, node: ast.Compare) -> ast.AST:
                 visited = self.generic_visit(node)
                 assert isinstance(visited, ast.Compare)
@@ -631,6 +715,7 @@ class _Rewriter:
                     and (dividend := base_of(visited.left)) is not None
                 ):
                     visited.left = dividend
+                    rewriter._rewrites += 1
                 return visited
 
             def visit_Call(self, node: ast.Call) -> ast.AST:
@@ -641,7 +726,7 @@ class _Rewriter:
                     if len(visited.args) == 2 and not visited.keywords:
                         compare_offset(visited.args, side)
                     return visited
-                if not _is_python_mod(visited):
+                if load_predicate is not None or not _is_python_mod(visited):
                     return visited
                 divisor = facts.constant_of(visited.args[1])
                 if (
@@ -680,13 +765,78 @@ def divide_vector_bases(
     apart, so a name counts as assigned wherever a name merged with it is.
     """
     if _supported_body(body):
-        facts = _Facts(
-            set(constexpr_values),
-            set(),
-            {},
-            dict(constexpr_values),
-            merged_names(rename_groups or {}),
-            compare_bases,
-        )
+        facts = _starting_facts(constexpr_values, rename_groups, compare_bases)
         _Rewriter(facts).body(body)
     return body
+
+
+def _starting_facts(
+    constexpr_values: Mapping[str, int],
+    rename_groups: Mapping[str, str] | None,
+    uniform_compares: bool,
+) -> _Facts:
+    """The facts a pass starts a kernel body with: its static constexpr
+    values, and the names ``ast_rename`` will merge."""
+    return _Facts(
+        set(constexpr_values),
+        set(),
+        {},
+        dict(constexpr_values),
+        merged_names(rename_groups or {}),
+        uniform_compares,
+    )
+
+
+def _vector_width(loop: ast.For) -> int | None:
+    """``V`` when ``loop`` is a vector loop, one that counts its lane through
+    0..V-1 with ``V`` a power of two; None for any other loop."""
+    width = loop_extent(loop, kinds=("constexpr",), minimum=2)
+    return width if width is not None and width & (width - 1) == 0 else None
+
+
+def _paired_loops(
+    statements: list[ast.stmt], copies: list[ast.stmt]
+) -> Iterator[tuple[ast.For, ast.For]]:
+    """Each ``for`` of ``statements`` with its twin in ``copies``, a copy
+    whose statement lists were left as they were."""
+    for statement, copy in zip(statements, copies, strict=True):
+        if isinstance(statement, ast.For):
+            assert isinstance(copy, ast.For)
+            yield statement, copy
+        for field in ("body", "orelse"):
+            inner = getattr(statement, field, None)
+            if isinstance(inner, list):
+                yield from _paired_loops(inner, getattr(copy, field))
+
+
+def uniform_load_predicates(
+    body: list[ast.stmt],
+    *,
+    constexpr_values: Mapping[str, int],
+    rename_groups: Mapping[str, str] | None = None,
+    load_predicate: Callable[[ast.IfExp], bool],
+) -> dict[int, ast.For]:
+    """Copies of ``body``'s vector loops in which the proof rewrote a
+    statement (a lane quotient anywhere, a recorded load's predicate), by
+    the ``id`` of the loop each replaces.
+
+    For the V-loop sink, which runs before ``divide_vector_bases`` and
+    declines a load under a mask that differs between the lanes: in a copy
+    of ``body``, each lane quotient divides its base, and each comparison
+    of a lane offset with a multiple of the width in the test of a
+    conditional expression ``load_predicate`` accepts compares the base (a
+    window or padding mask ``(i // d) % s + k`` of a gather at ``i + d * k``
+    and the gather's own bound are then one value per aligned chunk of
+    ``i``).  ``body`` is left as it was; only the loops with a statement the
+    proof changed are returned.
+    """
+    if not _supported_body(body):
+        return {}
+    copies = [deep_clone(statement) for statement in body]
+    pairs = list(_paired_loops(body, copies))
+    facts = _starting_facts(constexpr_values, rename_groups, False)
+    rewriter = _Rewriter(facts, load_predicate=load_predicate)
+    rewriter.body(copies)
+    return {
+        id(loop): copy for loop, copy in pairs if id(copy) in rewriter.rewritten_loops
+    }
