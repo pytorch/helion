@@ -29,6 +29,8 @@ from torch._inductor.utils import IndentedBuffer
 from torch._inductor.utils import sympy_subs
 from torch._inductor.virtualized import V
 from torch.utils._ordered_set import OrderedSet
+from torch.utils._sympy.functions import FloorDiv
+from torch.utils._sympy.functions import Identity
 from torch.utils._sympy.value_ranges import ValueRanges
 from torch.utils._sympy.value_ranges import bound_sympy
 
@@ -132,6 +134,8 @@ class HelionCSEProxy(CSEProxy):
         # dtypes, (x * 2 - 1).to(torch.uint8) skips the int16 step that wraps a
         # negative value as eager does (HelionOverrides.to_dtype), and every
         # store casts: out0[tile_x] = tmp4.to(torch.float32).
+        if isinstance(result, CSEVariable):
+            cast("HelionKernel", self.kernel).note_predicate(name, args, result)
         if isinstance(result, CSEVariable) and name != "masked":
             if result.dtype is None:
                 dtype = getattr(DtypePropagationOpsHandler(), name)(*args, **kwargs)
@@ -173,6 +177,7 @@ class HelionCSEProxy(CSEProxy):
         symbol = super().indirect_indexing(var, size, check, wrap_neg)
         # Named after var or its wrap, both CSE variables.
         kernel.indirect[symbol] = kernel.cse.varname_map[symbol.name]
+        kernel.indirect_sizes[symbol] = sympy.sympify(size)
         return symbol
 
     def dot(self, x: CSEVariable, y: CSEVariable) -> CSEVariable:
@@ -221,6 +226,15 @@ class HelionCSEProxy(CSEProxy):
         # The epilogue then reads value, not out0[tile_y, tile_x] from memory.
         kernel.outer_vars.add(value)
         return value
+
+
+def as_less(relation: sympy.Rel) -> tuple[sympy.Basic, sympy.Basic, bool]:
+    """`relation` as lhs < rhs or lhs <= rhs, and whether it is strict: a > b
+    as b < a (HelionKernel.proven(), masked_extents())."""
+    lhs, rhs = relation.lhs, relation.rhs
+    if isinstance(relation, (sympy.Gt, sympy.Ge)):
+        lhs, rhs = rhs, lhs
+    return lhs, rhs, isinstance(relation, (sympy.Lt, sympy.Gt))
 
 
 # The longest rdim a kernel that names it (rdim, codegen_rdim()) names by a
@@ -285,6 +299,11 @@ class HelionKernel(SIMDKernel[CSEVariable]):
         # One buffer, so that a masked load follows the computation of its mask.
         self.loads = self.compute
         self.load_masks: list[CSEVariable] = []
+        # The index or integer each CSE variable of index_expr() or constant()
+        # holds, and the bounds on tiles each mask of them proves; see
+        # note_predicate().
+        self.symbolic: dict[str, sympy.Expr] = {}
+        self.predicates: dict[str, list[sympy.Rel]] = {}
         self.accumulator_count = 0
         self.has_fp32_dot = False
         # Whether the kernel draws random numbers; see rand().
@@ -300,8 +319,10 @@ class HelionKernel(SIMDKernel[CSEVariable]):
         self.outer_stores: dict[str, CSEVariable] = {}
         # Whether an indirect index needs a bounds check; see check_bounds().
         self.needs_bounds_check = False
-        # The values indices read, by the symbols that stand for them.
+        # The values indices read, by the symbols that stand for them, and the
+        # size of the dim each indexes.
         self.indirect: dict[sympy.Symbol, CSEVariable] = {}
+        self.indirect_sizes: dict[sympy.Symbol, sympy.Expr] = {}
 
     def __enter__(self) -> Self:
         if self.mix_order_reduction and "y" not in self.symbols:
@@ -533,13 +554,28 @@ class HelionKernel(SIMDKernel[CSEVariable]):
             if shape == tuple(arg.shape or ()):
                 return arg
             line = f"{arg}.reshape([{self.dims_code(shape)}])"
-            return self.cse.generate(self.compute, line, dtype=arg.dtype, shape=shape)
+            aligned = self.cse.generate(
+                self.compute, line, dtype=arg.dtype, shape=shape
+            )
+            # A reshape keeps what the tiles' ranges prove of a condition
+            # (proven()): the masks of torch.cat([x, y], 0) over x's part of y
+            # only reach torch.where as [tile_y, 1].
+            if arg.name in self.predicates:
+                self.predicates.setdefault(aligned.name, self.predicates[arg.name])
+            return aligned
 
         return tuple(map(align, args))
 
     def tile_index(self, index: sympy.Expr) -> sympy.Expr:
-        """`index` over the range tree roots, i.e. the tile indices."""
-        index = sympy.sympify(index)
+        """`index` over the range tree roots, i.e. the tile indices. Without
+        Identity, which Inductor wraps around a term to keep it from being
+        simplified, as cat's lowering does: x[:, :50] of cat([x, y], -1) reads
+        x at 100*y0 + Identity(x1), which no view of x matches, and the load
+        would be flat:
+            tmp5 = hl.load(in0, [100*tile_y.index.reshape([tile_y, 1])
+                + (tile_x.index)], extra_mask=tmp4)
+        rather than tmp5 = in0[tile_y, tile_x]."""
+        index = sympy.sympify(index).replace(Identity, lambda arg: arg)
         entries: dict[sympy.Expr, sympy.Expr] = {
             symbol: self.range_tree_nodes[symbol].expr
             for symbol in index.free_symbols
@@ -573,32 +609,57 @@ class HelionKernel(SIMDKernel[CSEVariable]):
         return self.arguments[key]
 
     def tiled_view(
-        self, buffer: IRNode, index: sympy.Expr, axes: Sequence[str]
+        self,
+        buffer: IRNode,
+        index: sympy.Expr,
+        axes: Sequence[str],
+        extents: dict[str, sympy.Expr],
     ) -> IRNode | None:
-        """A view of `buffer` with one dim per axis in `axes`, if `index` is affine
-        in those tiles and the view stays inside the storage."""
-        layout = buffer.get_layout()
+        """A view of `buffer` with one dim per axis in `axes`, of `extents`, if
+        `index` is affine in those tiles and the view stays inside the storage
+        (affine_view())."""
+        return self.affine_view(
+            buffer,
+            index,
+            [self.symbols[axis] for axis in axes],
+            [extents[axis] for axis in axes],
+        )
+
+    def affine_view(
+        self,
+        buffer: IRNode,
+        index: sympy.Expr,
+        symbols: Sequence[sympy.Expr],
+        sizes: Sequence[sympy.Expr],
+    ) -> IRNode | None:
+        """A view of `buffer` with a dim of each of `sizes` along each of
+        `symbols`, if `index` is affine in them and the view stays inside the
+        storage: its strides are the symbols' coefficients and its offset the
+        rest of the index."""
         expanded = sympy.expand(index)
-        sizes = [self.extents[axis] for axis in axes]
-        strides = [expanded.coeff(self.symbols[axis]) for axis in axes]
-        offset = expanded.xreplace({self.symbols[axis]: 0 for axis in self.axes})
+        strides = [expanded.coeff(symbol) for symbol in symbols]
+        offset = expanded.xreplace(dict.fromkeys(symbols, sympy.S.Zero))
         if not all(
             isinstance(value, (int, sympy.Integer))
             for value in (*sizes, *strides, offset)
         ):
             return None
         expected = offset + sum(
-            self.symbols[a] * s for a, s in zip(axes, strides, strict=True)
+            symbol * stride for symbol, stride in zip(symbols, strides, strict=True)
         )
         end = offset + sum(
-            (size - 1) * stride for size, stride in zip(sizes, strides, strict=True)
+            # pyrefly: ignore [unsupported-operation]
+            (size - 1) * stride
+            for size, stride in zip(sizes, strides, strict=True)
         )
         # The storage size can be symbolic, e.g. x[0] @ w with x [s, 40, 72] and a
         # dynamic s: end = 2879 < 2880 * s holds since s >= 2.
         if (
             offset < 0
             or any(stride < 0 for stride in strides)
-            or not V.graph.sizevars.statically_known_lt(end, layout.storage_size())
+            or not V.graph.sizevars.statically_known_lt(
+                end, buffer.get_layout().storage_size()
+            )
             or not V.graph.sizevars.statically_known_equals(index, expected)
         ):
             return None
@@ -630,7 +691,10 @@ class HelionKernel(SIMDKernel[CSEVariable]):
         return ReinterpretView(data=buffer, layout=view)
 
     def dim_assignments(
-        self, sizes: tuple[sympy.Expr | int, ...], axes: tuple[str, ...]
+        self,
+        sizes: tuple[sympy.Expr | int, ...],
+        axes: tuple[str, ...],
+        extents: dict[str, sympy.Expr],
     ) -> Iterator[tuple[str | None, ...]]:
         """Each way to give the dims of `sizes` the tile `axes`, in order, and
         None to the size-1 dims left out. Choosing per dim among the axes of its
@@ -642,13 +706,11 @@ class HelionKernel(SIMDKernel[CSEVariable]):
                 yield ()
             return
         size, rest = sizes[0], sizes[1:]
-        if axes and V.graph.sizevars.statically_known_equals(
-            size, self.extents[axes[0]]
-        ):
-            for dims in self.dim_assignments(rest, axes[1:]):
+        if axes and V.graph.sizevars.statically_known_equals(size, extents[axes[0]]):
+            for dims in self.dim_assignments(rest, axes[1:], extents):
                 yield (axes[0], *dims)
         if size == 1:
-            for dims in self.dim_assignments(rest, axes):
+            for dims in self.dim_assignments(rest, axes, extents):
                 yield (None, *dims)
 
     def subscript(
@@ -658,14 +720,24 @@ class HelionKernel(SIMDKernel[CSEVariable]):
         axes: Sequence[str],
         *,
         output: bool = False,
+        bounds: dict[str, sympy.Expr] | None = None,
     ) -> tuple[HelionTensorArg, list[str], TileShape]:
         """The parameter and subscript that read `buffer` at `index`, and its shape.
 
         Tries the buffer's own dims (dropping size-1 dims the index skips), then
-        a tiled_view(), then a flat_subscript().
+        a tiled_view(), then a flat_subscript(). `bounds` are the extents a
+        masked load's mask bounds its tiles to (masked_extents()): the view
+        need only cover those, as the pad of x from 30522 to 30528 reads
+            tmp5 = hl.load(in0, [tile_y, tile_x], extra_mask=tmp4)
+        of in0 [16384, 30522], where without them the view of an x of 30528
+        would run past the storage and the load be flat:
+            tmp5 = hl.load(in0, [tile_x.index + 30522*tile_y.index.reshape(
+                [tile_y, 1])], extra_mask=tmp4)
+        whose lanes the backend cannot tell are consecutive along x.
         """
         layout = buffer.get_layout()
-        for dims in self.dim_assignments(tuple(layout.size), tuple(axes)):
+        extents = {**self.extents, **(bounds or {})}
+        for dims in self.dim_assignments(tuple(layout.size), tuple(axes), extents):
             expected = layout.offset + sum(  # pyrefly: ignore [unsupported-operation]
                 self.symbols[dim] * stride  # pyrefly: ignore [unsupported-operation]
                 for dim, stride in zip(dims, layout.stride, strict=True)
@@ -684,13 +756,127 @@ class HelionKernel(SIMDKernel[CSEVariable]):
                 coordinates = [*map(self.coordinate, tiles)] or ["()"]
                 self.note_rdim(arg, coordinates)
                 return arg, coordinates, tiles
-        if (view := self.tiled_view(buffer, index, axes)) is not None:
+        if (view := self.tiled_view(buffer, index, axes, extents)) is not None:
             tiles = tuple(TILE_NAMES[axis] for axis in axes)
             coordinates = [*map(self.coordinate, tiles)] or ["()"]
             arg = self.tensor_arg(view, output=output)
             self.note_rdim(arg, coordinates)
             return arg, coordinates, tiles
+        if not output and (gather := self.gather_subscript(buffer, index, axes)):
+            return gather
+        if not output and (gather := self.quotient_subscript(buffer, index, axes)):
+            return gather
         return self.flat_subscript(buffer, index, axes, output=output)
+
+    def quotient_subscript(
+        self, buffer: IRNode, index: sympy.Expr, axes: Sequence[str]
+    ) -> tuple[HelionTensorArg, list[str], TileShape] | None:
+        """The parameter, subscript and shape that read `buffer` at an index
+        that takes the quotient of the first tile's index by a constant, and
+        is affine in it and in the other tiles: a view of the storage whose
+        first dim the quotient indexes, as gather_subscript() does for a value
+        read from memory. repeat_kv's expand of k, stored token-major [S, Hk,
+        D] with Hk = 4 and D = 256, to Hk * n heads, x + 256*(z // 2) +
+        1024*y, would read flat,
+            in0[tile_x.index + 256*(tile_z.index.reshape([tile_z, 1, 1]) // 2)
+                + 1024*tile_y.index.reshape([tile_y, 1])]
+        one element per lane, where the [Hk, S, D] view subscripted by the
+        quotient and the tiles,
+            in0[tile_z.index // 2, tile_y, tile_x]
+        reads consecutive elements along x, which the backend vectorizes."""
+        quotients = index.atoms(FloorDiv)
+        if len(quotients) != 1:
+            return None
+        ((quotient),) = quotients
+        numerator, divisor = quotient.args
+        axis_of = {symbol: axis for axis, symbol in self.symbols.items()}
+        if (
+            numerator not in axis_of
+            or not isinstance(divisor, sympy.Integer)
+            or divisor <= 1
+        ):
+            return None
+        axis = axis_of[numerator]
+        if axis == "r0_":
+            # A reduced dim's quotient (w.repeat_interleave(2) read at r // 2)
+            # is a one-dim gather either way: the flat read keeps it.
+            return None
+        head = sympy.Symbol("quotient", integer=True, nonnegative=True)
+        affine = index.xreplace({quotient: head})
+        if numerator in affine.free_symbols:
+            return None
+        extent = self.extents[axis]
+        if not isinstance(extent, (int, sympy.Integer)):
+            return None
+        size = sympy.Integer(-(-int(extent) // int(divisor)))
+        code = f"{TILE_NAMES[axis]}.index // {int(divisor)}"
+        return self.leading_subscript(buffer, affine, axes, (head, size, code), [axis])
+
+    def leading_subscript(
+        self,
+        buffer: IRNode,
+        index: sympy.Expr,
+        axes: Sequence[str],
+        lead: tuple[sympy.Symbol, sympy.Expr, str],
+        lead_axes: Sequence[str],
+    ) -> tuple[HelionTensorArg, list[str], TileShape] | None:
+        """The parameter, subscript and shape that read `buffer` at `index`
+        through a view whose first dim a leading index indexes, `lead`: its
+        symbol in `index`, the dim's size and its code, a value read from
+        memory (gather_subscript()) or a tile's quotient (quotient_subscript()).
+        The view's other dims are the tiles of `axes` the leading index's
+        tiles `lead_axes` leave, which must come after those in the kernel's
+        axis order: Helion puts the leading index's tiles first in the
+        result."""
+        symbol, size, code = lead
+        other = [axis for axis in axes if axis not in lead_axes]
+        if [axis for axis in self.axes if axis in axes] != [*lead_axes, *other]:
+            return None
+        view = self.affine_view(
+            buffer,
+            index,
+            [symbol, *(self.symbols[axis] for axis in other)],
+            [size, *(self.extents[axis] for axis in other)],
+        )
+        if view is None:
+            return None
+        tiles = [TILE_NAMES[axis] for axis in other]
+        coordinates = [code, *map(self.coordinate, tiles)]
+        return self.tensor_arg(view), coordinates, self.value_shape(axes)
+
+    def gather_subscript(
+        self, buffer: IRNode, index: sympy.Expr, axes: Sequence[str]
+    ) -> tuple[HelionTensorArg, list[str], TileShape] | None:
+        """The parameter, subscript and shape that read `buffer` at an index of
+        one value i, as in w[i] of an embedding table w [V, E]: a view of the
+        storage whose first dim i indexes and whose other dims are tiles the
+        value does not have. Read at 1024*tmp1 + r, with tmp1 = i[tile_y,
+        tile_x], the flat subscript
+            in1[hl.arange(1024) + 1024*tmp1.reshape([tile_y, tile_x, 1])]
+        becomes the [V, 1024] view of w subscripted by the value and the rdim:
+            in1[tmp1, :]
+        whose loads of an rdim's consecutive elements the backend can vectorize.
+        Helion puts the value's tiles first in the result, then the other
+        tiles, so those must come after the value's in the kernel's axis
+        order; and an index that also reads one of the value's tiles, as in
+        x.gather(1, i), is a gather along a tile, which stays flat."""
+        indirect = self.indirect_vars(index)
+        if len(indirect) != 1:
+            return None
+        ((symbol, value),) = indirect.items()
+        size = self.indirect_sizes[symbol]
+        # Helion keeps a size-1 dim of the value: tmp1 of [tile_y, 1] would
+        # read [tile_y, 1, tile_x] beside the kernel's [tile_y, tile_x].
+        if any(str(dim) == "1" for dim in value.shape or ()):
+            return None
+        value_axes = tile_axes(value.shape)
+        if not value_axes or any(
+            self.symbols[axis] in index.free_symbols for axis in value_axes
+        ):
+            return None
+        return self.leading_subscript(
+            buffer, index, axes, (symbol, size, str(value)), value_axes
+        )
 
     def note_rdim(self, arg: HelionTensorArg, coordinates: list[str]) -> None:
         """Keep the first full rdim of an input (in0[tile_x, :]) as the rdim
@@ -953,7 +1139,8 @@ class HelionKernel(SIMDKernel[CSEVariable]):
             axes = [axis for axis in self.axes if axis in axes or axis in mask_axes]
             arg, coordinates, shape = self.flat_subscript(buffer, index, axes)
         else:
-            arg, coordinates, shape = self.subscript(buffer, index, axes)
+            bounds = None if mask is None else self.masked_extents(mask)
+            arg, coordinates, shape = self.subscript(buffer, index, axes, bounds=bounds)
         # A bf16 a in (a + 1).float() @ b is read as fp32, so that a + 1 is fp32 as
         # its CSE dtype says. Read as bf16, bf16 + hl.full([], 1.0, dtype=float32)
         # stays bf16 and the dot fails: "lhs and rhs bitwidth must be the same".
@@ -1052,14 +1239,100 @@ class HelionKernel(SIMDKernel[CSEVariable]):
         if not index.free_symbols:
             value = int(index) if index.is_Integer else float(index)
             line = HelionOverrides.constant(value, dtype)
-            return self.cse.generate(self.compute, line, dtype=dtype, shape=())
-        axes = self.index_axes(index)
-        return self.cse.generate(
-            self.compute,
-            f"({self.index_tensor_expr(index, axes)}).to({dtype})",
-            dtype=dtype,
-            shape=self.value_shape(axes),
-        )
+            var = self.cse.generate(self.compute, line, dtype=dtype, shape=())
+        else:
+            axes = self.index_axes(index)
+            var = self.cse.generate(
+                self.compute,
+                f"({self.index_tensor_expr(index, axes)}).to({dtype})",
+                dtype=dtype,
+                shape=self.value_shape(axes),
+            )
+        if dtype != torch.bool and not dtype.is_floating_point:
+            # Only where the cast keeps every value: int8(tile_x.index) < 100
+            # holds at 128..255 too, where the cast wraps negative.
+            bound = bound_sympy(index, self.value_ranges(self.symbols))
+            info = torch.iinfo(dtype)
+            sizevars = V.graph.sizevars
+            if sizevars.statically_known_geq(
+                bound.lower, info.min
+            ) and sizevars.statically_known_leq(bound.upper, info.max):
+                self.symbolic[var.name] = index
+        return var
+
+    def note_predicate(
+        self, name: str, args: tuple[Any, ...], result: CSEVariable
+    ) -> None:
+        """Keep what `result` of op `name` says of the tiles: the integer of a
+        constant, and the comparisons of indices and integers (and their
+        conjunctions) a mask is, as the mask tile_x.index < 30522 of a pad of
+        x from 30522 to 30528 (masked_extents())."""
+
+        def value(arg: object) -> sympy.Expr | None:
+            if isinstance(arg, CSEVariable):
+                return self.symbolic.get(arg.name)
+            if isinstance(arg, int) and not isinstance(arg, bool):
+                return sympy.Integer(arg)
+            return None
+
+        if name == "constant" and isinstance(args[0], bool):
+            # A bool constant is a comparison that always or never holds.
+            one, zero = sympy.Integer(1), sympy.Integer(0)
+            self.predicates[result.name] = [
+                sympy.Lt(zero, one, evaluate=False)
+                if args[0]
+                else sympy.Lt(one, zero, evaluate=False)
+            ]
+        elif name == "constant":
+            number, dtype = args[0], args[1]
+            if (
+                isinstance(number, int)
+                and not isinstance(number, bool)
+                and dtype != torch.bool
+                and not dtype.is_floating_point
+                and torch.iinfo(dtype).min <= number <= torch.iinfo(dtype).max
+            ):
+                self.symbolic[result.name] = sympy.Integer(number)
+        elif name in ("lt", "le", "gt", "ge") and len(args) == 2:
+            lhs, rhs = value(args[0]), value(args[1])
+            if lhs is not None and rhs is not None:
+                relation = {
+                    "lt": sympy.Lt,
+                    "le": sympy.Le,
+                    "gt": sympy.Gt,
+                    "ge": sympy.Ge,
+                }
+                self.predicates[result.name] = [
+                    relation[name](lhs, rhs, evaluate=False)
+                ]
+        elif name in ("and_", "logical_and") and len(args) == 2:
+            parts = [
+                self.predicates.get(arg.name) if isinstance(arg, CSEVariable) else None
+                for arg in args
+            ]
+            if parts[0] is not None and parts[1] is not None:
+                self.predicates[result.name] = [*parts[0], *parts[1]]
+
+    def masked_extents(self, mask: CSEVariable) -> dict[str, sympy.Expr]:
+        """The tile extents `mask` bounds below the kernel's: the axes it
+        proves below a number, as tile_x.index < 30522 bounds tile_x of a pad
+        to 30528 at 30522."""
+        extents: dict[str, sympy.Expr] = {}
+        axis_of = {symbol: axis for axis, symbol in self.symbols.items()}
+        for relation in self.predicates.get(mask.name, ()):
+            lhs, rhs, strict = as_less(relation)
+            # lhs < rhs, or lhs <= rhs
+            if lhs in axis_of and isinstance(rhs, sympy.Integer):
+                bound = sympy.Integer(int(rhs) + (0 if strict else 1))
+                axis = axis_of[lhs]
+                # Not a persistent rdim, whose whole rdim in0[tile_x, :] would
+                # be the view's, shorter than the kernel's.
+                if self.coordinate(TILE_NAMES[axis]) == ":":
+                    continue
+                current = extents.get(axis, self.extents[axis])
+                if bound > 0 and V.graph.sizevars.statically_known_lt(bound, current):
+                    extents[axis] = bound
+        return extents
 
     def index_tensor_expr(self, index: sympy.Expr, axes: Sequence[str]) -> str:
         indirect = self.indirect_vars(index)
@@ -1074,9 +1347,7 @@ class HelionKernel(SIMDKernel[CSEVariable]):
         # tmp1 + 100*(tile_x.index // 10). A 0-d value does not promote an int32
         # tensor, so an index that reads one always widens: in
         # ((tile_x.index + 4*tmp0) % 100) with tmp0 = 2**29, the sum would wrap.
-        ranges = {
-            self.symbols[axis]: ValueRanges(0, self.extents[axis] - 1) for axis in axes
-        }
+        ranges = self.value_ranges(axes)
         # The terms without a value are summed in int32 before the value's term
         # joins: bound their sum too.
         rest = index.xreplace(dict.fromkeys(values, sympy.Integer(0)))
@@ -1092,11 +1363,13 @@ class HelionKernel(SIMDKernel[CSEVariable]):
             self.symbols[axis]: sympy.Symbol(self.index_tensor(axis, scope) + suffix)
             for axis in axes
         }
-        # A value read as an index broadcasts like a tile index:
-        # softmax(embedding(i, w), -1) reads w at
-        #     in1[64*tmp1.reshape([tile_x, 1]) + tile_r.index]
-        # where tmp1 = in0[tile_x].to(torch.int64) alone would be [tile_x] against
-        # [tile_r].
+        # A value read as an index broadcasts like a tile index: in
+        # F.embedding(i, w).t(), over [tile_y, tile_x], tmp1 of tmp0 =
+        # in0[tile_x] indexes w at
+        #     in1[tile_y.index.reshape([tile_y, 1]) + 64*tmp1]
+        # where the value is [tile_x] beside [tile_y, 1]. (A gather whose
+        # value's tiles come first is a view instead, in1[tmp1, tile_r] or
+        # in1[tmp1, :], gather_subscript().)
         shape = self.value_shape(scope)
         for symbol, var in indirect.items():
             replacements[symbol] = sympy.Symbol(self.align(var, shape))
@@ -1112,13 +1385,52 @@ class HelionKernel(SIMDKernel[CSEVariable]):
             return f"hl.full([{tiles}], {expr}, dtype={dtype})"
         return f"({expr}).expand({tiles})"
 
+    def value_ranges(self, axes: Iterable[str]) -> dict[sympy.Symbol, ValueRanges]:
+        """The range of each tile of `axes`' index, 0 to its extent - 1, as
+        bound_sympy() takes it."""
+        return {
+            cast("sympy.Symbol", self.symbols[axis]): ValueRanges(
+                0, self.extents[axis] - 1
+            )
+            for axis in axes
+        }
+
+    def proven(self, condition: CSEVariable) -> bool | None:
+        """Whether the tiles' ranges make `condition` true on every lane (True)
+        or false (False), from the comparisons note_predicate() kept of it;
+        None if they do neither or it kept none. Inductor's value ranges of the
+        variable would not do: they ignore an integer cast's wrap, so the
+        condition int8(tile_x.index) < 0 over tiles of 128 to 255 has the
+        ranges [False, False], where every lane is true."""
+        relations = self.predicates.get(condition.name)
+        if not relations:
+            return None
+        ranges = self.value_ranges(self.symbols)
+        known = V.graph.sizevars
+        truths = []
+        for relation in relations:
+            lhs, rhs, strict = as_less(relation)
+            # lhs - rhs, against 0
+            bound = bound_sympy(sympy.Add(lhs, sympy.Mul(-1, rhs)), ranges)
+            low, high = bound.lower, bound.upper
+            if strict:
+                truth = (
+                    known.statically_known_lt(high, 0),
+                    known.statically_known_geq(low, 0),
+                )
+            else:
+                truth = (
+                    known.statically_known_leq(high, 0),
+                    known.statically_known_gt(low, 0),
+                )
+            truths.append(True if truth[0] else False if truth[1] else None)
+        if False in truths:
+            return False
+        return True if all(truths) else None
+
     def in_range(self, buffer: IRNode, index: sympy.Expr) -> bool:
         """Whether a direct `index` is within `buffer`'s storage on every lane."""
-        ranges = {
-            symbol: ValueRanges(0, self.extents[axis] - 1)
-            for axis, symbol in self.symbols.items()
-        }
-        bound = bound_sympy(index, ranges)
+        bound = bound_sympy(index, self.value_ranges(self.symbols))
         sizevars = V.graph.sizevars
         return sizevars.statically_known_geq(
             bound.lower, 0
@@ -1157,6 +1469,19 @@ class HelionKernel(SIMDKernel[CSEVariable]):
         body: Callable[[], CSEVariable],
         other: bool | float,
     ) -> CSEVariable:
+        """body() where `mask` is true, else `other`; body() alone when the
+        tiles' ranges prove `mask` true (proven()), as for the tile_x.index < 100
+        of (torch.cat([x, y], -1) * 2)[:, :50] over tiles of x < 50 only,
+        where the masked load
+            tmp4 = tmp0 < tmp3
+            tmp5 = hl.load(in0, [100*tile_y.index.reshape([tile_y, 1])
+                + (tile_x.index)], extra_mask=tmp4)
+            tmp6 = hl.full([], 0.0, dtype=torch.float32)
+            tmp7 = torch.where(tmp4, tmp5, tmp6)
+        becomes tmp5 = in0[tile_y, tile_x], with no where."""
+        truth = self.proven(mask)
+        if truth is True:
+            return body()
         self.load_masks.append(mask)
         try:
             result = body()
@@ -1164,6 +1489,10 @@ class HelionKernel(SIMDKernel[CSEVariable]):
             self.load_masks.pop()
         if result.dtype is None:
             raise AssertionError(f"expected a dtype for masked value {result}")
+        if truth is False:
+            # Proven false, as cat's mask for the sink over those tiles: the
+            # value is `other`, and Helion drops the body's unused loads.
+            return V.ops.constant(other, result.dtype)
         return V.ops.where(mask, result, V.ops.constant(other, result.dtype))
 
     def check_bounds(
