@@ -91,7 +91,12 @@ edit as well until its point is autotuned again.
   inputs: random differences are fine (another summation order, FMA
   contraction); a bias or a systematically larger error is not. The port's
   docstring says what differs and why it is not less accurate; the next
-  rule says how to check it.
+  rule says how to check it. This is the repository's numerics rule
+  (`AGENTS.md`, Compatibility guardrails) with Inductor's kernel in the
+  place of eager PyTorch, since that is what a port is compared with: no
+  approximation algorithm that is less accurate, while changes that are
+  neutral for accuracy, such as another order of the adds in a reduction,
+  are fine.
 - **Counts and statistics.** fp32 `/` is not an IEEE division, on either
   backend or in Inductor's Triton: it multiplies by the divisor's correctly
   rounded reciprocal (`div.full`), so a quotient by a count that is not a
