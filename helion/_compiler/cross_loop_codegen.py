@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 import dataclasses
+import logging
 import math
 from typing import TYPE_CHECKING
 from typing import TypeGuard
@@ -74,6 +75,7 @@ if TYPE_CHECKING:
     from .tile_dependency import TileAccess
     from .tile_dependency import TileDependencyGraph
 
+log = logging.getLogger(__name__)
 
 # Independent readiness counters occupy distinct cache lines so polling one
 # dependency does not contend with publication to another. Cross-loop event
@@ -85,7 +87,6 @@ _CROSS_LOOP_COUNTER_DTYPE = torch.uint32
 _CROSS_LOOP_COUNTER_ALIGNMENT_WORDS = (
     _CROSS_LOOP_COUNTER_ALIGNMENT_BYTES // _CROSS_LOOP_COUNTER_DTYPE.itemsize
 )
-
 
 # One 128-byte line per uint64 peer_counter slot.
 _PEER_SLOT_WORDS = _CROSS_LOOP_COUNTER_ALIGNMENT_BYTES // torch.uint64.itemsize
@@ -1140,6 +1141,30 @@ class TaggedMirror:
 
 
 @dataclasses.dataclass(frozen=True)
+class Mailbox:
+    """An in-band allocation's words in every rank's state: from word
+    ``offset``, one ``words``-word slot per source rank in each of ``phases``
+    launch phases, ``lanes`` elements a word; ``pair``: stores may write
+    16-byte word pairs.
+
+    ``lane_bits`` set: Lamport words, each lane ``enc(x) = bits(x) ^ key``
+    (``LAMPORT_KEYS``), so a lane is zero only until it is written; three
+    phases, a reader zeroing what it read one phase back (``PeerState.rearm``).
+    None: each word carries 32 bits of elements and its launch epoch; two
+    phases (the epoch's parity)."""
+
+    offset: int
+    words: int
+    lanes: int
+    pair: bool
+    lane_bits: int | None = None
+
+    @property
+    def phases(self) -> int:
+        return 2 if self.lane_bits is None else 3
+
+
+@dataclasses.dataclass(frozen=True)
 class PeerState:
     """Symmetric uint64 state: inband mailboxes, peer counters and a done slot.
 
@@ -1152,9 +1177,7 @@ class PeerState:
     ptrs: str
     rank: str
     bases: tuple[str, ...]
-    # allocation id -> (first word, words per slot, elements per word, whether
-    # stores may write 16-byte word pairs)
-    mailboxes: dict[int, tuple[int, int, int, bool]]
+    mailboxes: dict[int, Mailbox]
     slots: dict[int, int]
     done: int
     scatters: dict[int, Scatter] = dataclasses.field(default_factory=dict)
@@ -1168,11 +1191,33 @@ class PeerState:
     votes: int = 0
 
     def mailbox(self, allocation_id: int, source: object) -> str:
-        """Word offset of ``source``'s slot for this launch's parity."""
-        offset, words, _, _ = self.mailboxes[allocation_id]
+        """Word offset of ``source``'s slot for this launch's phase."""
+        box = self.mailboxes[allocation_id]
+        phase = f"{self.epoch} & 1" if box.phases == 2 else f"{self.epoch} % 3"
         return (
-            f"{offset} + tl.cast({self.epoch} & 1, tl.int64) * "
-            f"{len(self.bases) * words} + {source} * {words}"
+            f"{box.offset} + tl.cast({phase}, tl.int64) * "
+            f"{len(self.bases) * box.words} + {source} * {box.words}"
+        )
+
+    def rearm(self, allocation_id: int) -> str:
+        """Word offset from a Lamport mailbox's slot to the previous launch's,
+        which a poll zeroes once it holds this launch's words.
+
+        Those words prove the source's previous launch over, every copy of
+        every store included: a kernel with cross-loop state waits on the
+        previous launch at entry (``PdlStateWithoutWait``), so its stores
+        follow that launch's end.  In launch n the reader re-arms slot n - 1,
+        which the source next writes in launch n + 2, after reading this
+        rank's pushes of launch n + 1 (every rank polls every word of a
+        candidate), which follow launch n.  Several readers of a word store the
+        same zeros, to a slot nobody reads this launch.  The epoch is a uint64:
+        ``% 3`` never wraps.
+        """
+        box = self.mailboxes[allocation_id]
+        assert box.lane_bits is not None
+        return (
+            f"tl.where({self.epoch} % 3 == 0, 2, -1).to(tl.int64) * "
+            f"{len(self.bases) * box.words}"
         )
 
     def mirror(self, allocation_id: int) -> str:
@@ -1225,19 +1270,41 @@ def peer_state(device_function: DeviceFunction) -> PeerState | None:
     def block_size(block_id: int) -> int:
         return env.block_sizes[block_id].from_config_int(config)
 
-    mailboxes: dict[int, tuple[int, int, int, bool]] = {}
+    mailboxes: dict[int, Mailbox] = {}
     words = 0
+    # One protocol per Lamport candidate, in allocation id order.
+    choices = cast("list[str]", config.config.get("cross_loop_inband_protocol") or [])
+    enabled = {
+        allocation_id
+        for allocation_id, choice in zip(
+            sorted(graph.lamport_candidate_ids), choices, strict=False
+        )
+        if choice == "lamport"
+    }
     for allocation_id in sorted(graph.inband_allocation_ids):
-        # Sub-word elements share a tagged word when tile rows align to it.
+        # Sub-word elements share a tagged word when tile rows align to it; a
+        # Lamport word (a candidate the config enables) holds 8 bytes of them.
         store = graph.inband_store(allocation_id)
         assert store.dtype is not None
         row = graph.inband_row(store, block_size)
-        lanes = 4 // store.dtype.itemsize
+        itemsize = store.dtype.itemsize
+        lamport = allocation_id in enabled and row % (8 // itemsize) == 0
+        if allocation_id in enabled and not lamport:
+            log.info(
+                "cross_loop_inband_protocol: allocation %d keeps epoch words: "
+                "its tiles' rows of %d elements do not fill 8-byte words",
+                allocation_id,
+                row,
+            )
+        lanes = (8 if lamport else 4) // itemsize
         lanes = lanes if row % lanes == 0 else 1
         size = graph.inband_numel(allocation_id) // lanes
         pair = row % (2 * lanes) == 0 and size % 2 == 0
-        mailboxes[allocation_id] = (words, size, lanes, pair)
-        words += 2 * world_size * size
+        box = Mailbox(words, size, lanes, pair, 8 * itemsize if lamport else None)
+        mailboxes[allocation_id] = box
+        words += box.phases * world_size * size
+        # Each mailbox starts at a 16-byte boundary, for word pairs.
+        words += words % 2
     mirrors: dict[int, TaggedMirror] = {}
     for allocation_id in sorted(graph.tagged_allocation_ids):
         # A mirror word holds lanes elements of one producer tile (T1, T2); a
