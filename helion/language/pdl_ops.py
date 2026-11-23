@@ -47,8 +47,15 @@ def pdl_launch_dependents() -> None:
     """
     Let the next PDL-launched kernel on the stream start launching.
 
-    Call it on the host before the first loop to trigger at kernel entry, or after
-    the last loop to trigger at exit.
+    Call it on the host before the first device loop to trigger at kernel entry,
+    or after the last one to trigger at exit (host loops do not count). Between
+    two top level device loops of a kernel whose loops run as one persistent
+    megakernel with static or claimed task dispatch, each program triggers at
+    the later loop's block (or the first resident block after it, when that
+    loop's tasks continue an earlier loop's); elsewhere (packet dispatch, the
+    barrier pipeline, no megakernel) such a call triggers at exit. The next
+    kernel's launch then overlaps the rest of this one, while its wait still
+    follows this kernel's end.
     """
     raise exc.NotInsideKernel
 

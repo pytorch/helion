@@ -18,6 +18,7 @@ import triton
 import triton.language as tl
 
 import helion
+from helion._compat import gluon_api_available
 from helion._testing import DEVICE
 from helion._testing import TestCase
 from helion._testing import code_and_output
@@ -29,11 +30,14 @@ from helion._testing.gluon_kernels import scale_then_two_wx
 from helion._testing.gluon_kernels import scale_then_wx
 from helion._testing.gluon_kernels import scale_then_wx_and_f16_vx
 from helion._testing.gluon_kernels import scale_then_wx_and_nvfp4
+from helion._testing.gluon_kernels import split_k_gemv
+from helion._testing.gluon_kernels import split_k_parts
 from helion._testing.timeline_checks import check_written
 from helion._testing.triton_codegen import GLUON_RING_CONFIG as RING
 from helion._testing.triton_codegen import gluon_tail_ring_config
 import helion.language as hl
 from helion.runtime import timeline
+from helion.runtime.triton.launcher import get_cluster_capacity
 
 
 @helion.kernel(static_shapes=True, backend="gluon")
@@ -292,6 +296,28 @@ def scale_then_mm(
 
 
 @helion.kernel(static_shapes=True, backend="gluon")
+def mm_then_scale(
+    x: torch.Tensor, w: torch.Tensor, b: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """A dot, then a root of its output: the next launch starts once a worker
+    reaches the second root."""
+    m, k = x.size()
+    _, n = w.size()
+    out = torch.empty([m, n], dtype=torch.float32, device=x.device)
+    y = torch.empty([m, n], dtype=torch.float32, device=x.device)
+    hl.pdl_wait()
+    for tile_m, tile_n in hl.tile([m, n]):
+        acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+        for tile_k in hl.tile(k):
+            acc = hl.dot(x[tile_m, tile_k], w[tile_k, tile_n], acc=acc)
+        out[tile_m, tile_n] = acc
+    hl.pdl_launch_dependents()
+    for tile_r, tile_c in hl.tile([m, n]):
+        y[tile_r, tile_c] = out[tile_r, tile_c] * 2 + b[tile_r, tile_c]
+    return out, y
+
+
+@helion.kernel(static_shapes=True, backend="gluon")
 def scale_boxprefetch_mm(
     x: torch.Tensor, w: torch.Tensor, wp: torch.Tensor
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -509,6 +535,45 @@ def scale_by_last_row(x: torch.Tensor) -> torch.Tensor:
     return out
 
 
+@helion.kernel(static_shapes=True, backend="gluon")
+def ring_mm_in_dry_loop(
+    x: torch.Tensor, xm: torch.Tensor, wm: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """A chain of narrow roots (p, q, then e after d) with a ring matmul root
+    between e's anchor and e on e's workers: e's dry-pass loop runs the matmul
+    (a ring root takes its ring step and accumulators from the kernel scope)."""
+    batch, width = x.size()
+    rows, k = xm.size()
+    n = wm.size(1)
+    a = torch.empty_like(x)
+    p = torch.empty((batch, 4), dtype=torch.float32, device=x.device)
+    q = torch.empty((batch, 4), dtype=torch.float32, device=x.device)
+    d = torch.empty_like(x)
+    m = torch.empty((rows, n), dtype=torch.float32, device=x.device)
+    side = torch.empty((batch, 8), dtype=torch.float32, device=x.device)
+    e = torch.empty((batch, 4), dtype=torch.float32, device=x.device)
+    for tile_batch, tile_width in hl.tile([batch, width]):
+        a[tile_batch, tile_width] = x[tile_batch, tile_width] + 1
+    for row, col in hl.tile([batch, 4], block_size=[1, 1]):
+        p[row, col] = torch.sum(a[row, :], dim=-1)[:, None]
+    for row, col in hl.tile([batch, 4], block_size=[1, 1]):
+        q[row, col] = torch.sum(p[row, :], dim=-1)[:, None]
+    for tile_batch, tile_width in hl.tile([batch, width]):
+        d[tile_batch, tile_width] = (
+            a[tile_batch, tile_width] * torch.sum(q[tile_batch, :], dim=-1)[:, None]
+        )
+    for tile_m, tile_n in hl.tile([rows, n]):
+        acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+        for tile_k in hl.tile(k):
+            acc = hl.dot(xm[tile_m, tile_k], wm[tile_k, tile_n], acc=acc)
+        m[tile_m, tile_n] = acc
+    for row, col in hl.tile([batch, 8], block_size=[1, 1]):
+        side[row, col] = torch.sum(a[row, :], dim=-1)[:, None]
+    for row, col in hl.tile([batch, 4], block_size=[1, 1]):
+        e[row, col] = torch.sum(d[row, :], dim=-1)[:, None]
+    return e, m, side
+
+
 def _replay(run: object, inputs: list[tuple[torch.Tensor, ...]]) -> list[object]:
     """``run`` on each input back to back in a CUDA graph, so that each launch
     overlaps the last (PDL)."""
@@ -520,12 +585,102 @@ def _replay(run: object, inputs: list[tuple[torch.Tensor, ...]]) -> list[object]
     return results
 
 
+def _cluster_workers(splits: int) -> int:
+    """The workers a persistent launch in clusters of ``splits`` takes on
+    this device: the count the generated host code asks ``get_num_sm`` for."""
+    return helion.runtime.get_num_sm(DEVICE, cluster_size=splits)
+
+
+def _one_wave(splits: int, most: int, test: TestCase) -> int:
+    """At most ``most`` keys of ``splits`` producer tasks that run in one wave
+    of clusters on this device (skipping ``test`` where no cluster fits)."""
+    if get_cluster_capacity(DEVICE, splits) < splits:
+        test.skipTest(f"no whole cluster of {splits} on this device")
+    return min(most, _cluster_workers(splits) // splits)
+
+
 def _functions(code: str) -> dict[str, str]:
     """The generated module's functions, by name."""
     return {chunk.split("(", 1)[0]: chunk for chunk in code.split("\ndef ")[1:]}
 
 
+if gluon_api_available():
+    # (gluon_ops needs the Gluon API, which each test checks for.)
+    from helion._compiler.triton import gluon_ops
+
+    _CLUSTER_VALUE_ASM = tl.constexpr(
+        "{ .reg .b32 t, u, w; .reg .b64 v, s, c; "
+        + gluon_ops._CLUSTER_VALUE
+        + "mov.b64 $0, v; }"
+    )
+
+    @triton.jit
+    def _cluster_values(epochs, states, values, n, BLOCK: tl.constexpr):
+        """``gluon_ops``' cluster flag value of each epoch and launch state (in a
+        launch without clusters: cluster 0)."""
+        offsets = tl.arange(0, BLOCK)
+        mask = offsets < n
+        epoch = tl.load(epochs + offsets, mask=mask).to(tl.uint32)
+        state = tl.load(states + offsets, mask=mask)
+        value = tl.inline_asm_elementwise(
+            _CLUSTER_VALUE_ASM,
+            "=l,r,l",
+            [epoch, state],
+            dtype=tl.int64,
+            is_pure=True,
+            pack=1,
+        )
+        tl.store(values + offsets, value, mask=mask)
+
+
 class TestGluonRing(TestCase):
+    @skipIfRefEager("checks generated code")
+    @skipUnlessGluon()
+    def test_trigger_between_roots_in_a_ring(self) -> None:
+        """The trigger between the loops runs in the body before the second
+        root's tasks, after its own wait. Back-to-back launches (PDL) stay
+        exact."""
+        x = torch.randn([256, 1024], device=DEVICE, dtype=torch.bfloat16)
+        w = torch.randn([1024, 256], device=DEVICE, dtype=torch.bfloat16)
+        b = torch.randn([256, 256], device=DEVICE, dtype=torch.float32)
+        base = {
+            "block_sizes": [128, 64, 64, 128, 64],
+            "pid_type": "persistent_blocked",
+            "num_sm_multiplier": 1,
+            "num_warps": 4,
+            "indexing": "tensor_descriptor",
+        }
+        bound = mm_then_scale.bind((x, w, b))
+        slots = len(bound.config_spec.range_warp_specialize)
+        ring = {
+            **base,
+            "num_stages": 2,
+            "cross_loop_pipeline": "static",
+            "range_warp_specializes": [None] * (slots - 1) + [True],
+        }
+        code, results = code_and_output(mm_then_scale, (x, w, b), **ring)
+        static = bound.compile_config(
+            helion.Config(**base, cross_loop_pipeline="static")
+        )
+        for result, expected in zip(results, static(x, w, b), strict=True):
+            torch.testing.assert_close(result, expected, atol=0, rtol=0)
+        functions = _functions(code)
+        # Only the body triggers.
+        for name, function in functions.items():
+            if "_producer" in name:
+                self.assertNotIn("gdc_launch_dependents", function)
+        body = functions["_helion_mm_then_scale_body"]
+        trigger = body.index("gdc_launch_dependents()")
+        self.assertLess(body.index("_launch("), trigger)
+        self.assertLess(body.index("x_ring_desc, ("), trigger)
+        self.assertLess(trigger, body.index("b_ring_desc, ("))
+        self.assertEqual(code.count("gdc_launch_dependents()"), 1)
+        inputs = [(x + launch, w, b) for launch in range(4)]
+        replayed = _replay(bound.compile_config(helion.Config(**ring)), inputs)
+        for got, args in zip(replayed, inputs, strict=True):
+            for result, expected in zip(got, static(*args), strict=True):
+                torch.testing.assert_close(result, expected, atol=0, rtol=0)
+
     @skipIfRefEager("checks generated code")
     @skipUnlessGluon()
     def test_dot(self) -> None:
@@ -1502,6 +1657,167 @@ class TestGluonRing(TestCase):
                 (scale_then_wx_and_nvfp4, nvfp4, nvfp4_ring, 1, 10),
             ]
         )
+
+    @skipIfRefEager("checks generated code")
+    @skipUnlessGluon()
+    def test_dsmem(self) -> None:
+        """A split and combine pair's parts travel in clusters of two CTAs
+        (``cross_loop_dsmem``): a block's two K splits run on the CTAs
+        of one cluster, which send them into rank 0's shared memory, and its
+        sum on rank 0, which reads them there.  Every block count fits one
+        wave of clusters on this device."""
+        x = torch.randn([16, 1024], device=DEVICE, dtype=torch.bfloat16)
+        w = torch.randn([1024, 1024], device=DEVICE, dtype=torch.bfloat16)
+        blocks = _one_wave(2, 16, self)
+        w = w[: 64 * blocks]
+        w4 = w.view(blocks, 64, 8, 128).permute(0, 2, 1, 3).contiguous()
+        part = torch.zeros([2, 16, 64 * blocks], device=DEVICE, dtype=torch.float32)
+        args = (x, w4, part)
+        bound = split_k_parts.bind(args)
+        self.assertEqual(bound.config_spec.cross_loop_dsmem.length, 1)
+        ring = {**RING, "num_warps": 4, "cross_loop_pipeline": "static"}
+        code, out = code_and_output(
+            split_k_parts, args, **ring, cross_loop_dsmem=[True]
+        )
+        plain, reference = code_and_output(split_k_parts, args, **ring)
+        torch.testing.assert_close(out, reference, atol=0, rtol=0)
+        self.assertNotIn("cluster_send", plain)
+        self.assertIn("_cluster_size=2", code)
+        body = _functions(code)["_helion_split_k_parts_body"]
+        self.assertEqual(body.count("cluster_send("), 1)
+        self.assertEqual(body.count("cluster_recv("), 1)
+        # One slab of 2 x 16 x 64 fp32 parts after the 128-byte header.
+        self.assertIn("cluster_entry(9216, '8192')", code)
+        # Launches back to back on changing inputs match the counter edge's.
+        run = bound.compile_config(helion.Config(**ring, cross_loop_dsmem=[True]))
+        run_reference = bound.compile_config(helion.Config(**ring))
+        for launch in range(3):
+            x_launch = x + launch
+            torch.testing.assert_close(
+                run(x_launch, w4, part),
+                run_reference(x_launch, w4, part),
+                atol=0,
+                rtol=0,
+            )
+        # A slab past 48 KB of static shared memory: 2 x 128 x 64 fp32 parts.
+        x128 = torch.randn([128, 1024], device=DEVICE, dtype=torch.bfloat16)
+        part128 = torch.zeros([2, 128, 64 * blocks], device=DEVICE, dtype=torch.float32)
+        code128, out128 = code_and_output(
+            split_k_parts, (x128, w4, part128), **ring, cross_loop_dsmem=[True]
+        )
+        self.assertIn("cluster_entry(66560, '65536')", code128)
+        torch.testing.assert_close(
+            out128, (w.float() @ x128.float().T).T, atol=1e-3, rtol=1e-3
+        )
+        # Four and eight splits a block: clusters of four and eight, the
+        # launch taking the SMs whole clusters keep resident (no
+        # ``persistent_reserved_sms``), which the host asks for.
+        for splits in (4, 8):
+            if get_cluster_capacity(DEVICE, splits) < splits:
+                continue
+            blocks = min(w4.size(0), _cluster_workers(splits) // splits)
+            part_s = torch.zeros([splits, 16, 64 * blocks], device=DEVICE)
+            code_s, out_s = code_and_output(
+                split_k_parts,
+                (x, w4[:blocks], part_s),
+                **ring,
+                cross_loop_dsmem=[True],
+            )
+            self.assertIn(f"_cluster_size={splits}", code_s)
+            self.assertIn(f"cluster_size={splits})", code_s)
+            torch.testing.assert_close(
+                out_s,
+                (w[: 64 * blocks].float() @ x.float().T).T,
+                atol=1e-3,
+                rtol=1e-3,
+            )
+
+    @skipUnlessGluon()
+    def test_cluster_flag_value_is_a_hash(self) -> None:
+        """The value a cluster's rank 0 raises its flag to is splitmix64's
+        finalizer of the launch epoch, the cluster's id and the launch state's
+        address, with the top bit set: never the 0 every CTA clears its flag
+        to, nor a structured word another kernel's data would hold (an epoch
+        of 1 in cluster 0 of a 1 MiB-aligned state)."""
+        epochs = [0, 1, 7, 0xFFFFFFFF]
+        states = [1 << 20, 1 << 20, 0x12345670, 0]
+        values = torch.empty([4], device=DEVICE, dtype=torch.int64)
+        _cluster_values[(1,)](
+            torch.tensor(epochs, device=DEVICE),
+            torch.tensor(states, device=DEVICE),
+            values,
+            4,
+            BLOCK=4,
+        )
+        mask = (1 << 64) - 1
+
+        def mix(v: int) -> int:
+            v = (v ^ (v >> 30)) * 0xBF58476D1CE4E5B9 & mask
+            v = (v ^ (v >> 27)) * 0x94D049BB133111EB & mask
+            return (v ^ (v >> 31)) | 1 << 63
+
+        expected = [mix(e ^ s) for e, s in zip(epochs, states, strict=True)]
+        # The values as unsigned words.
+        got = [value % (1 << 64) for value in values.tolist()]
+        self.assertEqual(got, expected)
+        self.assertEqual(len(set(got)), len(got))
+        self.assertNotIn(0, got)
+        self.assertNotIn((1 << 63) | 1, got)
+
+    @skipIfRefEager("checks generated code")
+    @skipUnlessGluon()
+    def test_dsmem_any_loop_order(self) -> None:
+        """The split axis may take any place in the producer root's task
+        order: split slower (``hl.tile([n, splits])``'s default) or first
+        (``loop_orders``), a key's parts run on one cluster and match the
+        counter edge's bit for bit.  Parts of 64 rows by 2 columns, one
+        element a thread, send single words; the receive of both parts takes
+        two words a thread.  Parts of 16 x 16 (``block_sizes`` 16), which four
+        elements a thread would put on 64 of the 128 threads (C3), send two a
+        thread.  Every tile count fits one wave of clusters on this device."""
+        x = torch.randn([16, 1024], device=DEVICE, dtype=torch.bfloat16)
+        w = torch.randn([1024, 1024], device=DEVICE, dtype=torch.bfloat16)
+        keys = _one_wave(2, 32, self)
+        w = w[: 64 * min(keys, 16)]
+        part = torch.zeros([2, 16, w.size(0)], device=DEVICE, dtype=torch.float32)
+        config = {
+            "pid_type": "persistent_blocked",
+            "num_sm_multiplier": 1,
+            "num_warps": 4,
+            "cross_loop_pipeline": "static",
+        }
+        tiles = {**config, "block_sizes": [64, 128, 64]}
+        _, reference = code_and_output(split_k_gemv, (x, w, part), **tiles)
+        torch.testing.assert_close(
+            reference, (w.float() @ x.float().T).T, atol=1e-3, rtol=1e-3
+        )
+        for order in ({}, {"loop_orders": [[1, 0]]}):
+            code, out = code_and_output(
+                split_k_gemv,
+                (x, w, part),
+                **tiles,
+                **order,
+                cross_loop_dsmem=[True],
+            )
+            self.assertIn("cluster_send", code)
+            torch.testing.assert_close(out, reference, atol=0, rtol=0)
+        x64 = torch.randn([64, 1024], device=DEVICE, dtype=torch.bfloat16)
+        narrow = (x64, w[: 2 * keys], torch.zeros([2, 64, 2 * keys], device=DEVICE))
+        columns = {**config, "block_sizes": [2, 128, 2]}
+        _, reference = code_and_output(split_k_gemv, narrow, **columns)
+        code, out = code_and_output(
+            split_k_gemv, narrow, **columns, cross_loop_dsmem=[True]
+        )
+        self.assertRegex(code, r"(?m)cluster_send\(.*, 8, 1\)$")
+        self.assertIn("tl.float32, 8, 2)", code)
+        torch.testing.assert_close(out, reference, atol=0, rtol=0)
+        small = {**config, "block_sizes": [16, 128, 16]}
+        _, reference = code_and_output(split_k_gemv, (x, w, part), **small)
+        code, out = code_and_output(
+            split_k_gemv, (x, w, part), **small, cross_loop_dsmem=[True]
+        )
+        self.assertRegex(code, r"(?m)cluster_send\(.*, 2\)$")
+        torch.testing.assert_close(out, reference, atol=0, rtol=0)
 
     @skipIfRefEager("checks generated code")
     @skipUnlessGluon()

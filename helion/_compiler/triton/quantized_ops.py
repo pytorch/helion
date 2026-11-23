@@ -125,11 +125,15 @@ _FP4X16_TO_F16_ASM = """
 
 @_decorators.codegen(load_float4_e2m1fn_x16_to_float16, "triton")
 def _(state: CodegenState) -> list[ast.AST]:
+    from ..loop_dependency_checker import emit_intra_loop_raw_barrier
+
     storage = state.proxy_arg(0)
     if not isinstance(storage, torch.Tensor):
         raise exc.InvalidAPIUsage(
             "hl.load_float4_e2m1fn_x16_to_float16 expects tensor storage"
         )
+    # A store of another thread earlier in its loop may reach it.
+    emit_intra_loop_raw_barrier(state, storage)
     group_offset = state.ast_arg(1)
     extra_mask = state.ast_args[2]
     base = state.device_function.tensor_arg(storage).name
@@ -197,11 +201,15 @@ _BF16X16_TO_F16_ASM = """
 
 @_decorators.codegen(load_bfloat16_x16_to_float16, "triton")
 def _(state: CodegenState) -> list[ast.AST]:
+    from ..loop_dependency_checker import emit_intra_loop_raw_barrier
+
     storage = state.proxy_arg(0)
     if not isinstance(storage, torch.Tensor):
         raise exc.InvalidAPIUsage(
             "hl.load_bfloat16_x16_to_float16 expects tensor storage"
         )
+    # A store of another thread earlier in its loop may reach it.
+    emit_intra_loop_raw_barrier(state, storage)
     group_offset = state.ast_arg(1)
     extra_mask = state.ast_args[2]
     base = state.device_function.tensor_arg(storage).name

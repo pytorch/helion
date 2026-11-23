@@ -7,7 +7,9 @@ reads and writes its tensors one vector transaction per lane group:
 above it, whose lanes the body extracts with ``_cute_unroll_vec_extract``, or
 a compile-time list the body appends to and one ``_cute_store_u16_vec`` /
 ``_cute_store_u32_vec`` flush after it.  A ``GuardBuilder`` decides what
-predicates a whole packet and where a masked-off thread points instead: the
+predicates a whole packet and where a masked-off thread points instead (or,
+for a ``predicated`` packet, that the load itself is predicated and leaves
+zeros, ``masked_packet_load_expr``): the
 tile lane's guard (``TilePacketGuard``: the uniform mask terms and the
 per-thread bound unless the tile provably covers the extent) and the rolled
 reduction's (``cute/memory_ops._cute_register_unroll_vec_hoist``: the non-lane
@@ -32,8 +34,10 @@ import torch
 
 from ...ast_extension import statement_from_string
 from ...compile_environment import CompileEnvironment
+from ..cache_policy_loads import MASKED_PACKET_LOAD_HELPERS
 from ..cache_policy_loads import CachePolicy
 from ..cache_policy_loads import hint_wide_packets
+from ..packet_access import render_masked_packet_load
 from ..packet_access import render_packet_load
 from .memory_access import _cute_scalar_pointer_expr
 
@@ -175,6 +179,54 @@ def _cute_unroll_vec_load_expr(
     )
 
 
+# The dtypes whose packet lanes ``LanePacketEmitter.hoist_load`` may take
+# from a predicated load with no select behind them: the integer-carrier
+# dtypes but fp16.  A predicated load returns its packet as 32-bit words
+# (``masked_packet_load``), so an odd 16-bit lane is the upper half of a
+# word: ``shr.u32 word, 16`` in the PTX where the lane's first use is in
+# another basic block than the load (NVVM sinks the last compare of a
+# lane's maximum under the guard of the store it feeds).  ptxas (13.3.27,
+# which the DSL embeds, and 13.4.59 alike) then widens the wrong half:
+# ``cvt.f32.f16`` of the shifted word assembles to ``HADD2.F32`` of the
+# *lower* half of the loaded word, and the lane computes on its neighbour's
+# value (with the shift in the block of its use the same PTX assembles to
+# the upper half).  A bf16 lane widens by a shift of the shifted register,
+# which is assembled as written, and int16 lanes convert correctly at every
+# packet width (``test_cute_guarded_lanes_cuda``); a plain vector load
+# splits its words in the block of the load with PTX's packed ``mov``,
+# without a shift.  So the emitter gives an fp16 packet the anchored load
+# and the lane selects it has without ``cute_guarded_lanes``.  The
+# ``guard_lanes`` pass may still move that load under its stores' guard and
+# drop the selects the guard implies: the lanes are then those of a plain
+# vector load, never of a predicated one.
+PREDICATED_LANE_DTYPES: frozenset[torch.dtype] = frozenset(
+    _CUTE_VECTOR_UNROLL_DTYPES
+) - {torch.float16}
+
+
+def masked_packet_load_expr(
+    pointer: str, guard: str, dtype: torch.dtype, vec_width: int, eviction_suffix: str
+) -> str:
+    """``_cute_load_vNb_if(ptr, guard, vec_type[, priority])``: the packet when
+    ``guard`` holds, zeros otherwise (``masked_packet_load``), for a packet
+    of 4 to 64 bytes of an integer-carrier dtype.
+
+    The cache hint of the site is kept: its L1 eviction priority
+    (``'evict_first'`` / ``'evict_last'``), the streaming ``cop='cs'``, or its
+    L2 policy family, which the predicated load carries as a ``createpolicy``
+    descriptor like the unpredicated L2 helpers (at every width, the 32-byte
+    one too without ``cute_wide_packet_hints``).
+    """
+    return render_masked_packet_load(
+        MASKED_PACKET_LOAD_HELPERS[vec_width * dtype.itemsize],
+        pointer,
+        guard,
+        vec_width,
+        _cute_unroll_vec_elem_type(dtype),
+        CachePolicy.from_suffix(eviction_suffix).masked_priority,
+    )
+
+
 def _cute_unroll_vec_extract(hoist_var: str, idx: str, dtype: torch.dtype) -> str:
     """Per-lane extract expr from a hoisted ``unroll``-mode vec load.
 
@@ -215,6 +267,63 @@ class CuteTileVecStoreSite:
     scalar_stmt: ast.stmt | None
     init_stmt: ast.stmt | None
     flush_stmt: ast.stmt
+    # A component packet's sibling stores (``CuteComponentGroup``); None for
+    # a store of one element per lane.
+    group: CuteComponentGroup | None = None
+
+    def site_statements(self) -> list[ast.stmt]:
+        """The statements standing in for this site's stores in the V-loop
+        body: the one of a plain site, each sibling's of a component packet."""
+        if self.group is None:
+            return [self.body_stmt]
+        return [member.body_stmt for member in self.group.members]
+
+    def scalar_statements(self) -> list[ast.stmt]:
+        """The scalar stores the site statements replaced, in the same order."""
+        if self.group is None:
+            return [] if self.scalar_stmt is None else [self.scalar_stmt]
+        return [member.scalar_stmt for member in self.group.members]
+
+
+@dataclasses.dataclass(eq=False)
+class CuteComponentStore:
+    """One sibling store of a component packet: the ``count`` components from
+    ``first`` of every lane element, appended by ``body_stmt`` in place of the
+    scalar store ``scalar_stmt``."""
+
+    first: int
+    count: int
+    body_stmt: ast.stmt
+    scalar_stmt: ast.stmt
+
+
+@dataclasses.dataclass(eq=False)
+class CuteComponentGroup:
+    """The sibling stores sharing one component packet.
+
+    A tile lane on a dim of stride K whose K trailing elements are contiguous
+    (``out[tile, c]`` of an ``[n, K]`` tensor) stores K components per lane
+    element.  The sibling stores of one lane body append to ONE list, so the
+    V lanes leave ``V * K`` values in memory order and one flush writes them
+    at ``pointer``, component 0 of the lane base.  That order is the
+    registration order: a store joins only as the group's next components
+    (``_cute_register_tile_component_store``); one that cannot marks the
+    group ``broken``.  ``mask_expr`` is the tile mask every sibling shares.
+    The flush is legal only for a complete group whose statements are the
+    lane body's only accesses of the tensor
+    (``memory_ops.component_group_refusal``); any other group returns to its
+    scalar stores.
+    """
+
+    components: int
+    pointer: str
+    mask_expr: str | None
+    members: list[CuteComponentStore] = dataclasses.field(default_factory=list)
+    broken: bool = False
+
+    def collected(self) -> int:
+        """Components the members append per lane element so far."""
+        return sum(member.count for member in self.members)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -245,6 +354,45 @@ class GuardBuilder(Protocol):
     def build(self) -> PacketGuard: ...
 
 
+@dataclasses.dataclass(frozen=True)
+class FlatRowPacket:
+    """Where a flattened multi-dim tile's packet sits in a tensor the tile
+    does not walk contiguously (a permuted view): at the element the flat
+    lane base decodes to.
+
+    ``extents`` are the static extents of the tile's dims, outermost first.
+    The tile walks them row-major and the tensor's dims are those dims in
+    order, so the element at flat offset ``e`` has the coordinate
+    ``(e // prod(extents[d + 1:])) % extents[d]`` on dim ``d``.  The
+    admission (``cute/memory_ops._cute_flat_row_packet``) proves that the
+    tensor's innermost dim has unit stride and that its extent and every
+    lane base are multiples of V: the V elements of a packet then share
+    their outer coordinates and are V consecutive elements of one row, at
+    the address of the lane base's element.  It also proves every lane base
+    below 2**31, so the unsigned 32-bit decode is exact.
+    """
+
+    extents: tuple[int, ...]
+
+    def index_exprs(self, lane_base: str) -> list[str]:
+        """The per-dim coordinates of the element at flat offset ``lane_base``."""
+        exprs: list[str] = []
+        inner = 1
+        for dim in reversed(range(len(self.extents))):
+            extent = self.extents[dim]
+            expr = f"cutlass.Uint32({lane_base})"
+            if inner != 1:
+                expr = f"({expr} // cutlass.Uint32({inner}))"
+            if extent == 1:
+                expr = "0"
+            elif dim > 0:
+                expr = f"{expr} % cutlass.Uint32({extent})"
+            exprs.append(expr)
+            inner *= extent
+        exprs.reverse()
+        return exprs
+
+
 class LanePacketEmitter:
     """Splices one vector transaction per lane group around a V-loop.
 
@@ -264,13 +412,16 @@ class LanePacketEmitter:
         index_exprs: list[str],
         lane_pos: int,
         lane_base_expr: str | None = None,
+        flat_rows: FlatRowPacket | None = None,
     ) -> str:
         """The packet's pointer: the per-thread lane base at the lane axis.
 
         A flattened multi-dim tile addresses the chunk by its flat lane base
         (the ctx gate guarantees the tensor is contiguous and covers the
         whole iteration space, so the V-wide chunk is memory-contiguous even
-        when it straddles a row boundary).  Otherwise the lane-axis index
+        when it straddles a row boundary), or, on a tensor the admission
+        gave ``flat_rows`` (a permuted view), at the element the lane base
+        decodes to (``FlatRowPacket``).  Otherwise the lane-axis index
         (the stride-1 dim) is swapped for the per-lane base -- or for
         ``lane_base_expr`` (``lane_base - n1`` for ``tile.index - n1``) -- so
         the vector access points at the start of the V-wide chunk this thread
@@ -279,8 +430,13 @@ class LanePacketEmitter:
         base_index_var = self.context.base_index_var
         assert base_index_var is not None
         if self.context.flat_multi:
+            if flat_rows is not None:
+                return _cute_scalar_pointer_expr(
+                    tensor_name, flat_rows.index_exprs(base_index_var)
+                )
             index_dtype = CompileEnvironment.current().index_type()
             return f"({tensor_name}.iterator + {index_dtype}({base_index_var}))"
+        assert flat_rows is None
         base_exprs = list(index_exprs)
         base_exprs[lane_pos] = (
             base_index_var if lane_base_expr is None else lane_base_expr
@@ -300,12 +456,21 @@ class LanePacketEmitter:
         guard: GuardBuilder,
         var_prefix: str,
         wide_packets: bool = False,
+        predicated: bool = False,
     ) -> tuple[str, ast.stmt | None]:
         """Place the packet load of ``(tensor_name, base_ptr_expr, cache_tag)``
         above the V-loop, or reuse the one already placed.
 
         Returns the packet variable and the hoist statement (None when the
         packet was already placed).  The guard is built only for a new packet.
+
+        A ``predicated`` packet with a guard predicate is one predicated load
+        that leaves zeros where the predicate fails
+        (``masked_packet_load_expr``), instead of an unconditional load from
+        the anchor: the caller's ``cache_tag`` tells the two forms of one
+        packet apart, and ``CuteLaneState.zero_filled_packets`` records the
+        packets that read as zeros where masked off, each with its
+        unpredicated load.
         """
         context = self.context
         lane_body = context.lane_body
@@ -318,10 +483,32 @@ class LanePacketEmitter:
             f"{var_prefix}{len(context.vec_loads)}", dce=False
         )
         context.vec_loads[cache_key] = (hoist_var, dtype)
-        pointer = guard.build().pointer(base_ptr_expr)
-        load_expr = _cute_unroll_vec_load_expr(
-            pointer, dtype, vec_width, eviction_suffix, wide_packets=wide_packets
-        )
+        packet_guard = guard.build()
+        if predicated and packet_guard.predicate is not None:
+            load_expr = masked_packet_load_expr(
+                base_ptr_expr,
+                packet_guard.predicate,
+                dtype,
+                vec_width,
+                eviction_suffix,
+            )
+            state.device_function.cute_state.lanes.zero_filled_packets[hoist_var] = (
+                _cute_unroll_vec_load_expr(
+                    "{pointer}",
+                    dtype,
+                    vec_width,
+                    eviction_suffix,
+                    wide_packets=wide_packets,
+                )
+            )
+        else:
+            load_expr = _cute_unroll_vec_load_expr(
+                packet_guard.pointer(base_ptr_expr),
+                dtype,
+                vec_width,
+                eviction_suffix,
+                wide_packets=wide_packets,
+            )
         hoist_stmt = statement_from_string(f"{hoist_var} = {load_expr}")
         # Insert the hoist just BEFORE the constexpr V-loop.
         lane_body.insert(context.vloop_position(), hoist_stmt)
@@ -541,6 +728,7 @@ def _cute_register_tile_unroll_vec_store(
     scalar_stmt: ast.stmt,
     lane_axis_pos: int | None = None,
     packed_values: PackedStoreValue | None = None,
+    flat_rows: FlatRowPacket | None = None,
 ) -> ast.stmt | None:
     """Vector-store counterpart of ``_cute_register_tile_unroll_vec_hoist``.
 
@@ -550,8 +738,9 @@ def _cute_register_tile_unroll_vec_store(
     (uniform) value after the V-loop.  ``scalar_stmt`` is the per-lane scalar
     store this site replaces; the site is recorded in ``context.vec_stores``
     so a later access of the tensor in the same lane loop can restore it.
-    Returns the per-lane site statement, or None when the lane context isn't
-    available.
+    ``flat_rows`` addresses a flattened tile's packet in a permuted view
+    (``FlatRowPacket``).  Returns the per-lane site statement, or None when
+    the lane context isn't available.
     """
     if (
         context.base_index_var is None
@@ -566,7 +755,9 @@ def _cute_register_tile_unroll_vec_store(
     return emitter.flush_store(
         state,
         tensor_name=tensor_name,
-        base_ptr_expr=emitter.base_pointer(tensor_name, index_exprs, lane_pos),
+        base_ptr_expr=emitter.base_pointer(
+            tensor_name, index_exprs, lane_pos, flat_rows=flat_rows
+        ),
         value_expr=value_expr,
         mask_expr=mask_expr,
         dtype=dtype,
@@ -574,6 +765,93 @@ def _cute_register_tile_unroll_vec_store(
         scalar_stmt=scalar_stmt,
         packed_values=packed_values,
     )
+
+
+def _cute_register_tile_component_store(
+    state: CodegenState,
+    context: LaneLoopContext,
+    tensor_name: str,
+    index_exprs: list[str],
+    value_expr: str,
+    mask_expr: str | None,
+    dtype: torch.dtype,
+    *,
+    scalar_stmt: ast.stmt,
+    lane_axis_pos: int,
+    first: int,
+    count: int,
+    components: int,
+) -> ast.stmt | None:
+    """Collect a sibling store of a component packet (``CuteComponentGroup``).
+
+    ``index_exprs[lane_axis_pos]`` is the lane coordinate and the trailing
+    coordinates name components ``first`` to ``first + count`` of the
+    ``components`` contiguous elements of each lane element.  Component 0
+    opens the group: its list above the V-loop and the flush after it, at
+    component 0 of the lane base (the trailing dims are left out of the
+    pointer, so the lane-loop passes read an address along the lane dim alone
+    and never pair the packet with an access of one component).  A later
+    sibling appends to the same list when it stores the group's next
+    components under the same mask; otherwise the group is marked broken and
+    this store stays scalar.  Returns the per-lane site statement, or None to
+    keep the scalar store.
+    """
+    if (
+        context.base_index_var is None
+        or context.lane_body is None
+        or context.vloop is None
+    ):
+        return None
+    pointer = _cute_scalar_pointer_expr(
+        tensor_name, [*index_exprs[:lane_axis_pos], context.base_index_var]
+    )
+    site = next(
+        (
+            candidate
+            for candidate in context.vec_stores
+            if candidate.group is not None
+            and candidate.tensor_name == tensor_name
+            and candidate.group.pointer == pointer
+        ),
+        None,
+    )
+    if site is None:
+        if first != 0:
+            return None
+        body_stmt = LanePacketEmitter(context).flush_store(
+            state,
+            tensor_name=tensor_name,
+            base_ptr_expr=pointer,
+            value_expr=value_expr,
+            mask_expr=mask_expr,
+            dtype=dtype,
+            var_prefix=f"_tile_store_vals_{context.block_id}_",
+            scalar_stmt=scalar_stmt,
+        )
+        context.vec_stores[-1].group = CuteComponentGroup(
+            components,
+            pointer,
+            mask_expr,
+            [CuteComponentStore(first, count, body_stmt, scalar_stmt)],
+        )
+        return body_stmt
+    group = site.group
+    assert group is not None
+    if (
+        group.broken
+        or group.components != components
+        or first != group.collected()
+        or first + count > components
+        or mask_expr != group.mask_expr
+    ):
+        group.broken = True
+        return None
+    carrier = _CUTE_VECTOR_UNROLL_CARRIER[dtype]
+    body_stmt = statement_from_string(
+        f"{site.list_var}.append(({value_expr}).bitcast({carrier}))"
+    )
+    group.members.append(CuteComponentStore(first, count, body_stmt, scalar_stmt))
+    return body_stmt
 
 
 def _cute_register_reduction_unroll_vec_store(
@@ -637,16 +915,21 @@ def _cute_register_tile_unroll_vec_hoist(
     uniform_mask: str | None = None,
     lane_base_expr: str | None = None,
     rows_at_lane_base: bool = False,
-) -> str:
+    flat_rows: FlatRowPacket | None = None,
+    predicated: bool = False,
+) -> tuple[str, bool]:
     """Tile-loop variant of ``_cute_register_unroll_vec_hoist`` for the
     per-thread tile strategies' lane loops.
 
     Splices a single ``cute.arch.load(base_ptr, <elem>x V)`` into the
     outer-lane body (above the constexpr V-loop) and returns the
     per-element extract expression so the existing scalar pipeline keeps
-    working.  bf16/fp16 load as ``Uint16`` and bitcast; the byte dtypes load
-    ``vec_width`` bytes as one packed integer, whose bytes an fp8 consumer
-    decodes downstream, int8 bitcasts back and bool compares against zero.
+    working, and whether the packet reads as zeros where its guard fails (a
+    ``predicated`` packet with a guard, ``LanePacketEmitter.hoist_load``:
+    its lanes then need no select against the mask).  bf16/fp16 load as
+    ``Uint16`` and bitcast; the byte dtypes load ``vec_width`` bytes as one
+    packed integer, whose bytes an fp8 consumer decodes downstream, int8
+    bitcasts back and bool compares against zero.
 
     ``uniform_mask`` carries the mask terms other than the lane mask (an
     outer tile mask, the bound of a gathered row coordinate, an
@@ -656,7 +939,10 @@ def _cute_register_tile_unroll_vec_hoist(
     as the lane-axis coordinate of the packet (``lane_base - n1`` for
     ``tile.index - n1``); ``rows_at_lane_base`` says that ``index_exprs``
     holds non-lane coordinates evaluated at the lane base
-    (``TilePacketGuard``).
+    (``TilePacketGuard``).  ``flat_rows`` addresses a flattened tile's packet
+    in a permuted view (``FlatRowPacket``); its guard is the flat tile's: the
+    flat lane base against the tile's total extent, and the view's first
+    element (the start of a whole row) for a masked-off thread.
     """
     assert context.base_index_var is not None
     assert context.lane_body is not None
@@ -674,7 +960,7 @@ def _cute_register_tile_unroll_vec_hoist(
             else context.lane_axis(index_exprs)
         )
     base_ptr_expr = emitter.base_pointer(
-        tensor_name, index_exprs, lane_pos, lane_base_expr
+        tensor_name, index_exprs, lane_pos, lane_base_expr, flat_rows
     )
     hoist_var, hoist_stmt = emitter.hoist_load(
         state,
@@ -683,7 +969,8 @@ def _cute_register_tile_unroll_vec_hoist(
         base_ptr_expr=base_ptr_expr,
         vec_width=vec_width,
         eviction_suffix=eviction_suffix,
-        cache_tag=uniform_mask,
+        # The anchored and the predicated load of one packet are two packets.
+        cache_tag=f"if {uniform_mask}" if predicated else uniform_mask,
         guard=TilePacketGuard(
             state,
             strategy,
@@ -697,6 +984,7 @@ def _cute_register_tile_unroll_vec_hoist(
         ),
         var_prefix=f"_tile_unroll_vec_{context.block_id}_",
         wide_packets=hint_wide_packets(state.config.cute_wide_packet_hints),
+        predicated=predicated,
     )
     if (
         tensor.dtype is torch.int8
@@ -715,4 +1003,10 @@ def _cute_register_tile_unroll_vec_hoist(
             mask_expr,
             signed_byte_site,
         )
-    return _cute_unroll_vec_extract(hoist_var, vec_lane_var, tensor.dtype)
+    zero_filled = (
+        hoist_var in state.device_function.cute_state.lanes.zero_filled_packets
+    )
+    return (
+        _cute_unroll_vec_extract(hoist_var, vec_lane_var, tensor.dtype),
+        zero_filled,
+    )

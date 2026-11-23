@@ -35,6 +35,7 @@ from ....autotuner.search_surface import BackendSearchSurface
 from ....exc import InvalidConfig
 from ..block_scaled_config import block_scaled_choices
 from ..block_scaled_config import normalize_block_scaled_config
+from ..cache_hint_forms import L2_POLICY_FORMS
 from ..cute_flash import FLASH_KV_STAGE_KEY
 from ..cute_flash import FLASH_PIPELINE_FAMILY_KEY
 from ..cute_flash_bwd_row_mma import FLASH_BWD_FA4_FAMILY
@@ -85,14 +86,17 @@ from ..emitters.lane_packets import _CUTE_BYTE_PACKET_WIDTHS
 from ..fragment_mma_dot import FRAGMENT_MMA_K_THREADS
 from ..fragment_mma_dot import FRAGMENT_MMA_KEY
 from ..fragment_mma_dot import FRAGMENT_MMA_ROW_THREADS
+from ..packet_store_policy import store_policy_reaches_a_packet
 from ..pdl_release import CUTE_PDL_CAPTURE_RELEASE_CHOICES
 from ..pdl_release import CUTE_PDL_RELEASE_CHOICES
 from ..pdl_release import CUTE_PDL_RELEASE_DEFAULT
 from ..pdl_release import CUTE_PDL_SPREAD_KEY
+from ..reduction_lanes import THREADED_SEQUENCES
 from ..reduction_lanes import WARP_THREADS
 from ..reduction_lanes import fit_reduction_threads
 from ..reduction_lanes import fits_row_packets
 from ..reduction_lanes import looped_reduction_lanes
+from ..reduction_lanes import sequence_tile_holds_warp_lanes
 from ..reduction_lanes import synthetic_reduction_lanes
 from ..reduction_lanes import tiled_row_threads
 from ..reduction_lanes import whole_vector_lanes
@@ -155,6 +159,7 @@ from ..tcgen05_tma_rn import CONVERSION_KEY as CUTE_MMA_F32_CONVERSION_KEY
 from ..tcgen05_tma_rn import TMA_RN as CUTE_MMA_F32_TMA_RN
 from ..tcgen05_tma_rn import WARP_RAW as CUTE_MMA_F32_WARP_RAW
 from ..thread_budget import CUTE_REGISTER_TILE_MAX_ELEMENTS
+from ..thread_budget import MAX_THREAD_BLOCK_DIMS
 from ..unpadded_rows import unpadded_row_layout
 from .config_generation_ext import CuteConfigGenerationExtension
 from .config_keys import CUTE_AFFINE_SCAN_SCHEDULE_KEY
@@ -170,6 +175,7 @@ from .config_keys import CUTE_GDN_RECURRENCE_MMA_M_KEY
 from .config_keys import CUTE_GDN_RECURRENCE_STAGES_KEY
 from .config_keys import CUTE_GDN_RECURRENCE_TOKEN_GROUPS_KEY
 from .config_keys import CUTE_IMPLICIT_DEFAULT_KEYS
+from .config_keys import CUTE_LOAD_HINT_FORM_KEYS
 from .config_keys import CUTE_TOPK_CHOICES
 from .config_keys import VALID_CUTE_CHUNK_PREPARE_SCHEDULES
 from .config_keys import VALID_CUTE_CHUNK_RECURRENCE_REGISTER_CAPS
@@ -196,12 +202,16 @@ if TYPE_CHECKING:
     from collections.abc import Mapping
     from collections.abc import Sequence
 
+    from torch.fx import Node
+
     from ....autotuner.block_id_sequence import BlockIdSequence
     from ....autotuner.config_generation import ConfigGeneration
     from ....autotuner.config_spec import BlockSizeSpec
     from ....autotuner.config_spec import ConfigSpec
     from ....autotuner.config_spec import MatmulFact
+    from ....autotuner.config_spec import MemoryOpFact
     from ....runtime.config import Config
+    from ...device_ir import DeviceIR
     from ..loop_nesting import TileLoopPath
 
 
@@ -809,6 +819,82 @@ def _cute_config_forms_one_vector_lane(
     return isinstance(vec, int) and vec > 1 and rl_spec.size_hint // requested == vec
 
 
+def _cute_config_forms_lane_unrolled_row(
+    config_spec: ConfigSpec,
+    config: dict[str, object],
+    rl_spec: ReductionLoopSpec,
+    available: int,
+) -> bool:
+    """Whether ``config`` spells out a lane-unrolled row for the persistent
+    reduction ``rl_spec``: ``cute_lane_unroll`` above 1 and an explicit
+    thread count that fits the remaining budget, walks the static extent in
+    whole lanes (it divides it) and is the count the row runs on.  Like the
+    one-vector lane, that is the requested geometry, not a thread count the
+    budget shrank: the threads keep the row in registers across its sweeps,
+    several rows to a CTA, where rolling it would re-read every operand the
+    roll does not prefetch.  A one-warp row beside one row per CTA leaves an
+    SM at 32 warps (its CTA limit); four such rows per CTA read 1.5-2%
+    faster on a 768-wide fp32 LayerNorm with a stride-2 operand (B200, hand
+    edit of the same code).
+
+    The persistent row must form the lane loop the unroll takes
+    (``_cute_reduction_plans``: a masked row walking its live lanes on one
+    warp, an even number of them) on exactly the requested threads: a count
+    the plan lowers (a lane-loop row runs on one warp at most) would render
+    the code of the lower count, so it rolls as before and each admitted
+    count is a kernel of its own.  ``cute_vloop_sink``
+    excludes it (its row loop takes the unroll instead), and so does a row
+    whose extent is not static: only a hint says a symbolic row is walked
+    in whole lanes.  So does a kernel whose memory accesses may need an
+    order across threads (``ConfigSpec.cute_register_lane_rows``: it reads
+    back storage it stores, touches a tensor it stores into a second time,
+    or writes a tensor that may share a buffer with another it accesses): a
+    row held in registers on lanes has no
+    place for the thread barrier, the code generator refuses it, and the
+    rolled row the config meant before this rule compiles.
+    ``_normalize_cute_lane_knobs`` keeps the knob for an
+    admitted row, so the normalized config names it and normalizes to
+    itself; any other row (a power-of-two row whose lanes are a vector's
+    elements) rolls as before.
+
+    A config without the knob keeps the looped reduction a shrunk thread
+    count always meant.  So does a normalized config saved before this rule,
+    with or without the knob (a rolled row's lane loops take the unroll
+    too): where normalization rolled the row it wrote the chunk into
+    ``reduction_loops``, and only a row the config leaves persistent is
+    asked here.
+    """
+    unroll = config.get("cute_lane_unroll", 1)
+    if (
+        not isinstance(unroll, int)
+        or isinstance(unroll, bool)
+        or unroll <= 1
+        # Under ``cute_vloop_sink`` the unroll belongs to the sunk nest's
+        # row loop, whatever the reduction forms.
+        or config.get("cute_vloop_sink")
+        # Accesses that need an order across threads take a barrier, which
+        # the lane loop of a row held in registers has no place for.
+        or not config_spec.cute_register_lane_rows
+    ):
+        return False
+    nt_list = cast("list[int]", config.get("num_threads", []) or [])
+    requested = config_spec.num_threads.config_get(nt_list, rl_spec.block_id, 0)
+    extent = config_spec.cute_static_reduction_extents.get(rl_spec.block_id)
+    if (
+        not isinstance(requested, int)
+        or not 0 < requested <= available
+        or extent is None
+        or extent % requested
+    ):
+        return False
+    return any(
+        plan.block_id == rl_spec.block_id
+        and plan.lane_loop
+        and plan.threads == requested
+        for plan in _cute_reduction_plans(config_spec, config)
+    )
+
+
 def cute_config_forms_register_tile(
     config_spec: ConfigSpec,
     config: dict[str, object],
@@ -1339,6 +1425,241 @@ def _normalize_cute_vector_reductions(
             raise InvalidConfig(f"{key} requires cute_register_row")
 
 
+def predicated_element_loads_offered(config_spec: ConfigSpec) -> bool:
+    """Whether ``cute_predicated_element_loads`` is offered: a pointwise
+    kernel with a load under an ``extra_mask`` that gathers single elements
+    along its tensor's last dim at every config, through a scaled or loaded
+    coordinate (``predicated_element_loads.has_masked_gather_sites``).
+    Structure only."""
+    return config_spec.cute_masked_gather_sites and bool(config_spec.pointwise_facts)
+
+
+def guarded_lanes_offered(config_spec: ConfigSpec) -> bool:
+    """Whether ``cute_guarded_lanes`` is offered: a pointwise kernel (no
+    reduction, matmul or atomic: the kernels the knob was measured on) with
+    a load whose mask is more than its tiles' own
+    (``guarded_lanes.has_guarded_lane_sites``).  Structure only."""
+    return config_spec.cute_guarded_lane_sites and bool(config_spec.pointwise_facts)
+
+
+def fmnmx_extrema_offered(config_spec: ConfigSpec) -> bool:
+    """Whether ``cute_fmnmx_extrema`` is offered: a pointwise kernel with an
+    fp32 maximum or minimum of two tensors
+    (``handler_ops.has_fp32_extrema``).  Structure only."""
+    return config_spec.cute_fmnmx_extrema_sites and bool(config_spec.pointwise_facts)
+
+
+def _reads_along(access: MemoryOpFact, block: int) -> list[bool]:
+    """The subscripts of a load that run along ``block``'s axis, in order:
+    True for the block's tile itself at the load's stride-1 position, False
+    for one that gathers along the axis (a scaled coordinate, or the tile
+    on another dim than the stride-1 one).  One load can have both
+    (``x[tile, tile]`` over a square): ``_reads_packets`` takes it for a
+    gather, ``loads_gather_along`` for a direct load."""
+    return [
+        tile == block and stride == 1 and scale == 1
+        for tile, affine, stride, scale in zip(
+            access.subscript_block_ids,
+            access.subscript_affine_block_ids,
+            access.subscript_strides,
+            access.subscript_index_scales,
+            strict=False,
+        )
+        if block in (tile, affine)
+    ]
+
+
+def _reads_packets(access: MemoryOpFact, packet_block: int) -> bool | None:
+    """How a load reads ``packet_block``'s axis: True for the block's tile
+    itself at the load's stride-1 position (the threads of a vector lane
+    there load packets), False for a load that does not index the axis, and
+    None for one that gathers along it (a window over the contiguous dim, a
+    scaled coordinate), which reads scalars, one per lane."""
+    direct = False
+    for itself in _reads_along(access, packet_block):
+        if not itself:
+            return None
+        direct = True
+    return direct
+
+
+def loads_take_packets(config_spec: ConfigSpec, packet_block: int) -> bool:
+    """Whether the loads along ``packet_block`` read its tile itself at their
+    stride-1 position, so the threads of a vector lane there load packets: a
+    load that gathers along the axis (a window over the contiguous dim, a
+    scaled coordinate) reads scalars, one per lane."""
+    direct = False
+    for access in config_spec.memory_op_facts:
+        if access.kind != "load":
+            continue
+        reads = _reads_packets(access, packet_block)
+        if reads is None:
+            return False
+        direct = direct or reads
+    return direct
+
+
+def extremum_packet_loads(device_ir: DeviceIR, packet_block: int) -> int:
+    """The most packet loads along ``packet_block`` (``loads_take_packets``)
+    that one fp32 extremum fold joins: a tree of ``torch.maximum`` /
+    ``minimum`` whose leaves are the loads themselves, through dtype casts at
+    most (the nine taps of a 3x3 max pooling: 9).  A load whose value
+    reaches an extremum through other arithmetic is not one of its packets:
+    the taps an average pooling adds up before a leaky ReLU count 0.
+    Structure only, no extents."""
+    from ....language.memory_ops import load as language_load
+    from ...device_ir import MEMORY_OP_FACT_META
+    from ..handler_ops import is_fp32_extremum
+
+    cast_target = torch.ops.prims.convert_element_type.default
+    most = 0
+    for info in device_ir.graphs:
+        # Per node, the packet loads it is an extremum fold (or a cast) of.
+        folded: dict[Node, frozenset[Node]] = {}
+        for node in info.graph.nodes:
+            if node.op != "call_function":
+                continue
+            if node.target is language_load:
+                if any(
+                    _reads_packets(fact, packet_block)
+                    for fact in node.meta.get(MEMORY_OP_FACT_META, ())
+                ):
+                    folded[node] = frozenset((node,))
+            elif node.target is cast_target:
+                if (source := node.args[0]) in folded:
+                    folded[node] = folded[source]
+            elif is_fp32_extremum(node):
+                folded[node] = frozenset().union(
+                    *(folded.get(operand, ()) for operand in node.all_input_nodes)
+                )
+                most = max(most, len(folded[node]))
+    return most
+
+
+def packet_tile_storage_order(
+    config_spec: ConfigSpec,
+    blocks: Sequence[int],
+    packet_block: int,
+    *,
+    layout_changing_gathers: bool = False,
+) -> list[int] | None:
+    """The tile ``blocks`` from the stride-1 axis outward, as every store
+    that indexes all of them lays them out (by ascending stride); None
+    without such a store, or when two disagree or ``packet_block`` is not the
+    stride-1 axis of one.
+
+    ``layout_changing_gathers`` also orders the tiles of stores that agree
+    on a layout with another tile at stride 1, where the loads gather for
+    them (``gathers_for_stores``: the taps of a pooling window over a
+    channels-last activation, stored channel-first) and do not feed a copy.
+    The order is then ``packet_block`` followed by the other tiles as the
+    stores lay them out."""
+    found: list[int] | None = None
+    for access in config_spec.memory_op_facts:
+        indexed = access.subscript_block_ids
+        if (
+            access.kind != "store"
+            or len(indexed) != len(blocks)
+            or set(indexed) != set(blocks)
+            or len(access.subscript_strides) != len(indexed)
+        ):
+            continue
+        by_stride = sorted(zip(access.subscript_strides, indexed, strict=True))
+        strides = [stride for stride, _ in by_stride]
+        order = [cast("int", block) for _, block in by_stride]
+        if (
+            strides[0] != 1
+            or len(set(strides)) != len(strides)
+            or (found is not None and found != order)
+        ):
+            return None
+        found = order
+    if found is None or found[0] == packet_block:
+        return found
+    if not layout_changing_gathers or not gathers_for_stores(config_spec, found):
+        return None
+    return [packet_block, *(block for block in found if block != packet_block)]
+
+
+def gathers_for_stores(config_spec: ConfigSpec, order: Sequence[int]) -> bool:
+    """Whether the loads of a kernel gather for its stores, which lay the
+    tiles out as ``order`` (``packet_tile_storage_order``), where a copy has
+    one load per store.  Loads and stores are counted on one measure: those
+    that run along every tile of ``order``, each through the tile itself or
+    through a coordinate computed from the tile's index (an affine block in
+    the fact).  A bias along the channels and a mask of the rows do not,
+    and neither does a load or a store through an index tensor that is
+    itself loaded, which has no affine block.  Either makes the loads a
+    gather:
+
+    - one of them reaches a tile through a computed coordinate, an affine
+      block without a tile of its own in its fact: the taps of a strided
+      window, a subsample, and a lone such load too, a copy through a
+      shifted or reshaped tile index.  The seeds that serve copies
+      (``CuteTransposedStoreSeedsHeuristic``) read the tiles of a load and
+      have none to read there.  Which coordinates keep their tile is the
+      fact's to say and not this test's: today a tile's index plus a
+      constant does (``add_tile_with_offset_metadata``), and
+      ``2 * tile.index + j``, ``tile.index - 1`` and ``tile.index[:, None]``
+      do not;
+    - there are more of them than stores, counted over the kernel and not
+      per stored element: the taps of a window with fewer outputs than
+      taps, the operands of a sum.  A window that stores as many outputs as
+      it has taps (the maximum and the minimum of a pair, to a buffer each)
+      has a copy's loads per store and is left to the copies' seeds, as two
+      copies in one kernel are, also where one of them is stored through a
+      coordinate computed from a tile's index.
+
+    False as well where a store through such a coordinate lays the tiles
+    out in another order than ``order``: the stores then have no one layout
+    for the threads to follow.
+
+    A known over-seed: a copy stored through a loaded index
+    (``out[rows[tile], ...]``) beside another copy.  That store is not
+    counted and its load is, two loads for one store, so the kernel reads
+    as a gather and is seeded.  Structure only, no extents."""
+    along = [
+        access
+        for access in config_spec.memory_op_facts
+        if set(access.subscript_affine_block_ids) == set(order)
+    ]
+    taps = [access for access in along if access.kind == "load"]
+    stores = [access for access in along if access.kind == "store"]
+    for access in stores:
+        # Every block here is one of ``order``'s: none is None.
+        by_stride = sorted(
+            zip(
+                access.subscript_strides,
+                access.subscript_affine_block_ids,
+                strict=False,
+            )
+        )
+        if [block for _, block in by_stride] != list(order):
+            return False
+    return len(taps) > len(stores) or any(
+        None in access.subscript_block_ids for access in taps
+    )
+
+
+def loads_gather_along(config_spec: ConfigSpec, block: int) -> bool:
+    """Whether every load that runs along ``block`` gathers there (a scaled
+    or offset coordinate of the tile, or the tile on a dim that is not the
+    load's stride-1 one) and at least one does: none reads the tile itself
+    at its stride-1 position, the direct loads of ``loads_take_packets``.
+    A kernel with one direct load of the tile beside its gathers (a padded
+    copy next to a gathered operand) streams that load in packets and is
+    not such a kernel."""
+    gathers = False
+    for access in config_spec.memory_op_facts:
+        if access.kind != "load":
+            continue
+        for itself in _reads_along(access, block):
+            if itself:
+                return False
+            gathers = True
+    return gathers
+
+
 def _normalize_gated_boolean(
     config: dict[str, object],
     key: str,
@@ -1506,45 +1827,125 @@ def _normalize_cute_tiles_per_block(
         config["cute_tiles_per_block"] = pack
 
 
-def _normalize_cute_wide_packet_hints(
+# The ``load_eviction_policies`` values ``cute_wide_packet_hints`` carries
+# onto 32-byte packets and ``cute_scalar_load_hints`` onto element loads:
+# the L2 families but the read-only one, a packet form at every width.
+_CUTE_L2_HELPER_POLICIES = frozenset(L2_POLICY_FORMS) - {"nc_l2_first"}
+# The values an element load can carry: those, and the L1 priorities and the
+# streaming operator, whose masked loads ``cute_scalar_load_hints`` predicates.
+_CUTE_ELEMENT_HINT_POLICIES = _CUTE_L2_HELPER_POLICIES | {"first", "last", "streaming"}
+# The load-form knobs the search sets on the configs it decodes
+# (``open_load_hint_forms``), each with the policies that need its form.
+_CUTE_SEARCHED_LOAD_HINT_FORMS: dict[str, frozenset[str]] = {
+    "cute_wide_packet_hints": _CUTE_L2_HELPER_POLICIES,
+    "cute_scalar_load_hints": _CUTE_ELEMENT_HINT_POLICIES,
+}
+
+
+def _normalize_cute_load_hint_forms(
     config: dict[str, object], *, fix_invalid: bool
 ) -> None:
-    """``cute_wide_packet_hints`` is a boolean, absent meaning False: the
-    L2 policies of ``load_eviction_policies`` reach 32-byte packets
-    through the SM100 ``_32b`` helpers only when it is set (and only on a
-    toolchain with the 256-bit hinted load, which codegen checks the way
-    it does for ``nc_l2_first``).  Not in the flat search layout: the knob
-    is default-off until its effect is measured."""
-    key = "cute_wide_packet_hints"
-    if key not in config:
+    """``CUTE_LOAD_HINT_FORM_KEYS`` are booleans, absent meaning False: a
+    config saved before a knob existed renders the loads it was tuned with.
+    ``cute_wide_packet_hints`` takes the SM100 ``_32b`` helpers (only on a
+    toolchain with the 256-bit hinted load, which codegen checks the way it
+    does for ``nc_l2_first``); ``cute_scalar_load_hints`` the L2 policies
+    and the predicated form of the element loads.  Neither is in the flat
+    search layout: a config with a knob off renders what the same config
+    without the policy renders (the scalar knob: with the older conditional
+    form of a masked hinted element), so a searched boolean would mostly
+    repeat code.  ``open_load_hint_forms`` sets both on the configs the
+    search decodes.  ``cute_narrow_load_hints`` (every policy on the 2-byte
+    element loads) is set by hand only: see the knob in ``Config``."""
+    for key in CUTE_LOAD_HINT_FORM_KEYS:
+        if key not in config:
+            continue
+        value = config[key]
+        if type(value) is not bool:
+            if not fix_invalid:
+                raise InvalidConfig(f"{key} must be a boolean")
+            value = False
+        config[key] = value
+
+
+def open_load_hint_forms(config: dict[str, object]) -> None:
+    """Give a config decoded from the flat search layout the load forms
+    that carry its ``load_eviction_policies``: ``cute_wide_packet_hints``
+    when they name an L2 policy, ``cute_scalar_load_hints`` when they name
+    any policy an element load takes.
+
+    With the wide-packet knob off, an L2 policy on a 32-byte packet renders
+    the plain load, losing the ``nc_l2_first`` the load had too, so from a
+    32-byte incumbent the hinted family was two coordinated changes away,
+    one of them in no search layout.  With the scalar knob off an L2 policy
+    on an element load renders nothing, and an L1 priority on a masked one
+    renders inline PTX under a branch.  Every search-side config takes the
+    hinted forms instead, and a policy change is one coordinate from any
+    layout.  Neither knob changes which loads are packets: the wide-packet
+    knob picks the helper of a packet that is a packet either way, and the
+    scalar knob rewrites the element loads that remain after every pass has
+    run (``hint_element_loads``).  Only decoded configs are touched: a
+    config given to ``normalize`` (a saved or pinned one) keeps the forms it
+    names, so it renders the code it was tuned with.
+
+    ``cute_narrow_load_hints`` is not opened: the hinted 2-byte element
+    load measured slower than the plain one where it was tried (the value
+    arrives through a 32-bit register and an L2 policy rebuilds its
+    descriptor for every second load)."""
+    policies = config.get("load_eviction_policies")
+    if isinstance(policies, str):
+        policies = [policies]
+    if not isinstance(policies, list):
         return
-    value = config[key]
-    if type(value) is not bool:
-        if not fix_invalid:
-            raise InvalidConfig(f"{key} must be a boolean")
-        value = False
-    config[key] = value
+    for key, needed in _CUTE_SEARCHED_LOAD_HINT_FORMS.items():
+        if any(policy in needed for policy in policies):
+            config[key] = True
+
+
+def reopen_load_hint_forms(
+    config: dict[str, object], overrides: Mapping[str, object]
+) -> None:
+    """``open_load_hint_forms`` again for a decoded config whose
+    ``load_eviction_policies`` an override (``autotune_config_overrides``)
+    replaced: the forms follow the policies the config runs with, not the
+    sampled ones the override threw away, so every candidate of a search
+    with fixed policies renders them the same way and one with none carries
+    no form.  A form the overrides name themselves stays as they set it."""
+    if "load_eviction_policies" not in overrides:
+        return
+    forms: dict[str, object] = {
+        "load_eviction_policies": config.get("load_eviction_policies")
+    }
+    open_load_hint_forms(forms)
+    for key in _CUTE_SEARCHED_LOAD_HINT_FORMS:
+        if key in overrides:
+            continue
+        if key in forms:
+            config[key] = True
+        else:
+            config.pop(key, None)
 
 
 def _normalize_cute_bool_byte_packets(
     config_spec: ConfigSpec, config: dict[str, object], *, fix_invalid: bool
 ) -> None:
     """``cute_bool_byte_packets`` is a boolean, absent meaning False, that the
-    search surface offers only where a reduction ``reduction_loops`` may roll
-    reads a bool tensor along its dim (``cute_bool_byte_packet_blocks``);
-    elsewhere an explicit False (a config tuned for another binding) is
-    dropped and True is an error unless ``fix_invalid``.  An absent knob
-    stays absent, so a config without it (a compiler seed) normalizes to
-    itself.  ``_normalize_cute_lane_knobs`` turns the knob off in a config
-    that rolls none of those reductions at a byte packet's width."""
+    search surface offers only where a reduction ``reduction_loops`` may
+    roll, or a persistent row without a slot there, reads a bool tensor
+    along its dim (``cute_bool_byte_packet_blocks``); elsewhere an explicit
+    False (a config tuned for another binding) is dropped and True is an
+    error unless ``fix_invalid``.  An absent knob stays absent, so a config
+    without it (a compiler seed) normalizes to itself.
+    ``_normalize_cute_lane_knobs`` turns the knob off in a config that runs
+    none of those reductions at a byte packet's width."""
     key = "cute_bool_byte_packets"
     if key not in config:
         return
     if not config_spec.cute_bool_byte_packet_blocks:
         if config[key] is not False and not fix_invalid:
             raise InvalidConfig(
-                f"{key} requires a rollable reduction reading a bool tensor "
-                "along its dim"
+                f"{key} requires a rollable reduction, or a persistent row of "
+                "vectors, reading a bool tensor along its dim"
             )
         del config[key]
         return
@@ -1827,6 +2228,58 @@ def cute_lone_row_reduction(
     return row_spec.block_id, reduction_block_id
 
 
+def cute_lane_carry_row(config_spec: ConfigSpec) -> tuple[tuple[int, ...], int] | None:
+    """``(tile_block_ids, reduction_block_id)`` of a kernel with no matmul
+    whose one reduction runs along a row of static length that no
+    ``reduction_loops`` slot may roll (it always runs persistent) under two or
+    more tile axes, one block each, nested in one loop path (the tile blocks
+    outermost first), and is reduced inside the path's innermost loop
+    (``cute_innermost_loop_reduction_blocks``): the structure of a row
+    reduced inside a device loop, as where per-column partials are carried
+    over the loop's rows (a mix-order reduction).  Every block has a
+    ``num_threads`` entry and the row a ``cute_vector_widths`` one, and no
+    ``hl.reduce`` reduces it; else None.  A kernel of the same blocks that
+    reduces the row only behind its device loop (values carried over the
+    loop, summed after it) does not match: its row's lanes sit around no
+    row loop.  Whether the loop carries a value is not part of the
+    structure: a loop that only reduces and stores its rows matches too,
+    though the lowering this structure is searched for
+    (``lane_loops/split.py``, ``_lane_carry_nest``) takes lanes that carry
+    one.
+
+    Only the kernel's structure decides (and whether its shapes are static),
+    never its extents: the knobs opened on it keep the search space
+    (``structural_fingerprint``) the same across shapes, which
+    ``autotune_multi`` requires.
+    """
+    if (
+        config_spec.matmul_facts
+        or config_spec.reduction_loops
+        or len(config_spec.block_sizes) < 2
+        or len(config_spec.reduction_block_ids) != 1
+        or any(len(item.block_ids) != 1 for item in config_spec.block_sizes)
+        or len(config_spec.cute_tile_loop_paths) != 1
+    ):
+        return None
+    (reduction_block_id,) = config_spec.reduction_block_ids
+    (path,) = config_spec.cute_tile_loop_paths
+    tile_block_ids = tuple(block_id for level in path for block_id in level)
+    threaded = config_spec.num_threads.valid_block_ids()
+    if (
+        any(len(level) != 1 for level in path)
+        or sorted(tile_block_ids)
+        != sorted(item.block_id for item in config_spec.block_sizes)
+        or reduction_block_id not in config_spec.cute_innermost_loop_reduction_blocks
+        or reduction_block_id not in config_spec.cute_static_reduction_extents
+        or reduction_block_id not in threaded
+        or reduction_block_id not in config_spec.cute_vector_widths.valid_block_ids()
+        or reduction_block_id in config_spec.cute_user_reduce_block_ids
+        or any(block_id not in threaded for block_id in tile_block_ids)
+    ):
+        return None
+    return tile_block_ids, reduction_block_id
+
+
 def _normalize_cute_lane_knobs(
     config_spec: ConfigSpec, config: dict[str, object]
 ) -> None:
@@ -1834,9 +2287,24 @@ def _normalize_cute_lane_knobs(
     nothing takes them: ``cute_unpadded_rows`` applies to a persistent row it
     runs unpadded, ``cute_lane_unroll`` to the lane loops of a sunk vector
     nest or, without sinking, to the lane loops the config forms
-    (``cute/unroll_lane_loads.py``) and ``cute_bool_byte_packets`` to a bool
-    row a looped reduction loads at a byte packet's width
-    (``_rolls_a_byte_packet_row``); each is off when the config has none.
+    (``cute/unroll_lane_loads.py``), ``cute_bool_byte_packets`` to a bool
+    row a looped reduction, or a persistent vector row without a
+    ``reduction_loops`` slot, loads at a byte packet's width
+    (``_rolls_a_byte_packet_row``), ``cute_store_packet_tiers`` to a
+    device loop that stores along its tile in lanes wide enough to split
+    (``_stores_a_splittable_packet``) and ``cute_store_policy`` to the stores
+    with 16 bytes of vector lanes or more
+    (``packet_store_policy.store_policy_reaches_a_packet``); each is off, or
+    the default policy, when the config has none.  A search then no longer
+    carries a policy through the configs it changes nothing in, to meet it
+    on the first packet store a mutation forms.
+    A threaded ``cute_reduction_sequence`` (``reload``, ``resident``) runs
+    ``scalar`` where no tile of the config can hold its lanes
+    (``_cute_sequence_tile_holds_warp_lanes``).  On a row under a device
+    loop the loop's one-thread tile loses its vector width under a vector
+    row (``_normalize_cute_carry_row_tile_vector``) and
+    ``cute_lane_unroll`` the values past what the tiles' lane loops take
+    (``_cute_carry_row_lane_unroll``).
 
     They follow the reduction loops and threads, which ``ConfigSpec.normalize``
     settles before this runs (the sequences and their defaults, the
@@ -1850,52 +2318,260 @@ def _normalize_cute_lane_knobs(
             plan.unpadded for plan in plans
         ):
             config["cute_unpadded_rows"] = False
-    if (
-        config.get("cute_lane_unroll", 1) != 1
-        and not config.get("cute_vloop_sink")
-        and not _cute_config_forms_lane_loop(config_spec, config)
-    ):
-        config["cute_lane_unroll"] = 1
+    _normalize_cute_carry_row_tile_vector(config_spec, config)
+    unroll = config.get("cute_lane_unroll", 1)
+    if unroll != 1 and not config.get("cute_vloop_sink"):
+        if not _cute_config_forms_lane_loop(config_spec, config):
+            config["cute_lane_unroll"] = 1
+        elif type(unroll) is int:
+            config["cute_lane_unroll"] = _cute_carry_row_lane_unroll(
+                config_spec, config, unroll
+            )
     if config.get("cute_bool_byte_packets") and not _rolls_a_byte_packet_row(
         config_spec, config
     ):
         config["cute_bool_byte_packets"] = False
+    if config.get(
+        "cute_reduction_sequence"
+    ) in THREADED_SEQUENCES and not _cute_sequence_tile_holds_warp_lanes(
+        config_spec, config
+    ):
+        config["cute_reduction_sequence"] = "scalar"
+    if config.get(
+        "cute_store_packet_tiers"
+    ) is True and not _stores_a_splittable_packet(config_spec, config):
+        config["cute_store_packet_tiers"] = False
+    if config.get(
+        "cute_store_policy", "default"
+    ) != "default" and not store_policy_reaches_a_packet(
+        config_spec, _as_sequence(config.get("cute_vector_widths"))
+    ):
+        config["cute_store_policy"] = "default"
+
+
+def _normalize_cute_carry_row_tile_vector(
+    config_spec: ConfigSpec, config: dict[str, object]
+) -> None:
+    """Drop the vector width of the device loop's tile under a vector row
+    (``cute_lane_carry_row``) where the tile runs on one thread.
+
+    The tile's rows are then a lane loop of the one thread, which runs as a
+    serial loop of rows under the row's vector lanes
+    (``lane_loops/tile_trips.py``).  A vector width that divides the tile
+    makes its lanes a trace-time loop of rows instead, which no pass runs
+    under them ("reduction marker is nested in a different lane owner"),
+    and any other width changes nothing: the config compiles what the width
+    1 does, or nothing.  The row's lanes are whole vectors
+    (``_CuteReductionPlan.row_width``) once the unpadded layout is decided;
+    scalar lanes or a thread per element keep the tile's width, which a
+    vector of rows under them may take.
+    """
+    blocks = cute_lane_carry_row(config_spec)
+    if blocks is None:
+        return
+    tiles, reduction_block_id = blocks
+    tile_block_id = tiles[-1]
+    widths = config.get("cute_vector_widths")
+    if (
+        not isinstance(widths, list)
+        or tile_block_id not in config_spec.cute_vector_widths.valid_block_ids()
+    ):
+        return
+    index = config_spec.cute_vector_widths.block_id_to_index(tile_block_id)
+    threads = config_spec.num_threads.config_get(
+        cast("list[int]", config.get("num_threads", []) or []), tile_block_id, 0
+    )
+    if (
+        widths[index] != 1
+        and threads == 1
+        and any(
+            plan.block_id == reduction_block_id and plan.row_width > 1
+            for plan in _cute_reduction_plans(config_spec, config)
+        )
+    ):
+        config["cute_vector_widths"] = [
+            1 if position == index else width for position, width in enumerate(widths)
+        ]
+
+
+def _cute_sequence_tile_holds_warp_lanes(
+    config_spec: ConfigSpec, config: Mapping[str, object]
+) -> bool:
+    """Whether some tile a reduction sequence runs on
+    (``cute_sequence_reduction_blocks``) is large enough for the threaded
+    sequences at the block sizes of the normalized ``config``
+    (``sequence_tile_holds_warp_lanes``); a block without a block size of
+    its own counts as large enough."""
+    bs_list = cast("list[int]", config.get("block_sizes", []) or [])
+    sized = config_spec.block_sizes.valid_block_ids()
+    return sequence_tile_holds_warp_lanes(
+        config_spec.block_sizes.config_get(bs_list, block_id, 1)
+        if block_id in sized
+        else None
+        for block_id in config_spec.cute_sequence_reduction_blocks
+    )
+
+
+# The narrowest packet ``affine_vector_io`` stores holds two elements
+# (``_Vectorizer._tiers``), so lanes of fewer than four have no tier below
+# their own packet.
+_CUTE_STORE_TIER_MIN_LANES = 4
+
+
+def _cute_tile_vector_lanes(
+    config_spec: ConfigSpec, config: Mapping[str, object], block_id: int
+) -> int:
+    """The elements per vector lane the tile axis ``block_id`` runs with
+    under the normalized ``config``: its ``cute_vector_widths`` entry where
+    the axis has a per-thread lane loop (``_cute_tile_lane_loop``) whose
+    elements per thread the width divides, the condition the tile strategy
+    builds a V-loop on; otherwise 1, the scalar lanes it falls back to."""
+    lanes = _cute_tile_lane_loop(config_spec, config, block_id)
+    width = config_spec.cute_vector_widths.config_get(
+        _as_sequence(config.get("cute_vector_widths")), block_id, 1
+    )
+    if lanes and isinstance(width, int) and lanes % width == 0:
+        return width
+    return 1
+
+
+def _splittable_store_tier_blocks(
+    config_spec: ConfigSpec, config: Mapping[str, object]
+) -> list[int]:
+    """The blocks of the device loops that store along their tile
+    (``cute_store_tier_blocks``) to which ``config`` gives vector lanes of
+    at least ``_CUTE_STORE_TIER_MIN_LANES`` elements that their stores take
+    as packets under a guard: where ``cute_store_packet_tiers`` has a
+    narrower packet to fall back to.
+
+    The lanes are the ones the config forms (``_cute_tile_vector_lanes``),
+    not the requested ``cute_vector_widths`` entry: a tile without a lane
+    loop, or with a width that does not divide each thread's elements, runs
+    scalar lanes and stores no packet.  The stored tensors' layout bounds
+    them (``cute_store_tier_packet_lanes``): an output view whose last
+    dimension is not unit-stride, or whose base is off the packet's
+    boundary, stores scalars at every width, with or without the knob.
+    And lanes that every row is aligned to
+    (``cute_store_tier_row_multiples``: a row stride that is a multiple of
+    them) store their whole packet unguarded: ``affine_vector_io`` emits
+    no guard to hang a tier on."""
+    limits = config_spec.cute_store_tier_packet_lanes
+    multiples = config_spec.cute_store_tier_row_multiples
+    blocks = []
+    for block_id in sorted(config_spec.cute_store_tier_blocks):
+        lanes = _cute_tile_vector_lanes(config_spec, config, block_id)
+        if (
+            _CUTE_STORE_TIER_MIN_LANES <= lanes <= limits.get(block_id, 0)
+            and multiples.get(block_id, 1) % lanes != 0
+        ):
+            blocks.append(block_id)
+    return blocks
+
+
+def _stores_a_splittable_packet(
+    config_spec: ConfigSpec, config: Mapping[str, object]
+) -> bool:
+    """Whether ``config`` gives some device loop lanes whose store packets
+    ``cute_store_packet_tiers`` can split
+    (``_splittable_store_tier_blocks``); the knob reads off otherwise."""
+    return bool(_splittable_store_tier_blocks(config_spec, config))
 
 
 def _rolls_a_byte_packet_row(
     config_spec: ConfigSpec, config: Mapping[str, object]
 ) -> bool:
-    """Whether ``config`` rolls one of the reductions along a bool row
+    """Whether ``config`` runs one of the reductions along a bool row
     (``cute_bool_byte_packet_blocks``) in lanes of a width one packed integer
     holds (``_CUTE_BYTE_PACKET_WIDTHS``): where ``cute_bool_byte_packets``
     takes effect.  The width is the one the lanes take with the fitted
-    threads (``_CuteReductionPlan.rolled_width``), not the requested
-    ``cute_vector_widths`` entry: lanes of one element, where the threads
-    cover the chunk or the width does not divide each thread's elements,
-    load no packet."""
+    threads (``_CuteReductionPlan.rolled_width`` of a looped reduction,
+    ``row_width`` of a persistent row without a ``reduction_loops`` slot),
+    not the requested ``cute_vector_widths`` entry: lanes of one element,
+    where the threads cover the chunk or the width does not divide each
+    thread's elements, load no packet."""
     blocks = config_spec.cute_bool_byte_packet_blocks
     return any(
-        plan.block_id in blocks and plan.rolled_width in _CUTE_BYTE_PACKET_WIDTHS
+        plan.block_id in blocks
+        and (
+            plan.rolled_width in _CUTE_BYTE_PACKET_WIDTHS
+            or plan.row_width in _CUTE_BYTE_PACKET_WIDTHS
+        )
         for plan in _cute_reduction_plans(config_spec, config)
     )
+
+
+def _cute_tile_lane_loop(
+    config_spec: ConfigSpec, config: Mapping[str, object], block_id: int
+) -> int:
+    """The lanes per thread of the per-thread lane loop the tile axis
+    ``block_id`` gets under the normalized ``config``, 0 where it gets none:
+    an explicit thread count below its static block size that divides it
+    (the condition ``PerThreadNDTileStrategy`` allocates a lane variable on)
+    walks ``block size / threads`` lanes per thread."""
+    nt = config_spec.num_threads.config_get(
+        cast("list[int]", config.get("num_threads", []) or []), block_id, 0
+    )
+    bs = config_spec.block_sizes.config_get(
+        cast("list[int]", config.get("block_sizes", []) or []), block_id, 1
+    )
+    if isinstance(nt, int) and isinstance(bs, int) and 0 < nt < bs and bs % nt == 0:
+        return bs // nt
+    return 0
+
+
+def _cute_tile_lane_loops(
+    config_spec: ConfigSpec, config: Mapping[str, object]
+) -> list[int]:
+    """The lanes of each per-thread lane loop the tile axes of the normalized
+    ``config`` get (``_cute_tile_lane_loop``), of the grid or of a device
+    loop."""
+    return [
+        lanes
+        for block_id in config_spec.num_threads.valid_block_ids()
+        if (lanes := _cute_tile_lane_loop(config_spec, config, block_id))
+    ]
 
 
 def _cute_config_forms_lane_loop(
     config_spec: ConfigSpec, config: Mapping[str, object]
 ) -> bool:
     """Whether some axis of the normalized ``config`` gets a per-thread
-    lane loop the unroll may take: a tile axis (of the grid or of a device
-    loop) with an explicit thread count below its static block size that
-    divides it (the condition ``PerThreadNDTileStrategy`` allocates a lane
-    variable on), or a reduction (``_cute_reduction_plans``)."""
-    nt_list = cast("list[int]", config.get("num_threads", []) or [])
-    bs_list = cast("list[int]", config.get("block_sizes", []) or [])
-    for block_id in config_spec.num_threads.valid_block_ids():
-        nt = config_spec.num_threads.config_get(nt_list, block_id, 0)
-        bs = config_spec.block_sizes.config_get(bs_list, block_id, 1)
-        if isinstance(nt, int) and isinstance(bs, int) and 0 < nt < bs and bs % nt == 0:
-            return True
-    return any(plan.lane_loop for plan in _cute_reduction_plans(config_spec, config))
+    lane loop the unroll may take: a tile axis (``_cute_tile_lane_loops``)
+    or a reduction (``_cute_reduction_plans``)."""
+    return bool(_cute_tile_lane_loops(config_spec, config)) or any(
+        plan.lane_loop for plan in _cute_reduction_plans(config_spec, config)
+    )
+
+
+def _cute_carry_row_lane_unroll(
+    config_spec: ConfigSpec, config: Mapping[str, object], unroll: int
+) -> int:
+    """The ``cute_lane_unroll`` value that compiles what ``unroll`` does on
+    a row under a device loop (``cute_lane_carry_row``) whose reduction
+    forms no lane loop of its own in the normalized ``config`` (a vector
+    row, a thread per element); ``unroll`` anywhere else.
+
+    The lane loops are then those of the tile axes
+    (``_cute_tile_lane_loops``): the rows of the device loop's tile on one
+    thread (``lane_loops/tile_trips.py``), the grid tile's.  The unroll
+    takes, per loop, the largest factor within the knob that divides the
+    loop's lanes (``unroll_lane_loads._unroll_factor``), so a larger value
+    compiles the same code: 16 on a tile of two rows is 2.  The structure
+    that opens the knob to the search at every extent
+    (``cute_flat_fields``) would otherwise time those duplicates.
+    """
+    lanes = _cute_tile_lane_loops(config_spec, config)
+    if (
+        not lanes
+        or cute_lane_carry_row(config_spec) is None
+        or any(plan.lane_loop for plan in _cute_reduction_plans(config_spec, config))
+    ):
+        return unroll
+    return max(
+        choice
+        for choice in _CUTE_LANE_UNROLL_CHOICES
+        if choice <= unroll and any(count % choice == 0 for count in lanes)
+    )
 
 
 class _CuteReductionPlan(NamedTuple):
@@ -1912,6 +2588,14 @@ class _CuteReductionPlan(NamedTuple):
     # The vector width of a looped reduction's lanes (``looped_reduction_lanes``),
     # 1 for a persistent row.
     rolled_width: int
+    # The threads the reduction runs on: the requested count once the budget,
+    # the lane tiling and the one-warp rule of a lane-loop row have lowered it.
+    threads: int
+    # The vector width of a persistent row without a ``reduction_loops`` slot
+    # whose lanes are whole vectors (a constexpr loop: one vector per thread,
+    # unpadded or not, or several), 1 for scalar lanes and for a row with a
+    # slot, rolled or not.
+    row_width: int
 
 
 def _cute_reduction_plans(
@@ -1954,7 +2638,8 @@ def _cute_reduction_plans(
     (``supports_resident_threads``): the emitter refuses an unpadded row in
     either place (``_unpadded_lanes``).  The search never meets the first,
     as it opens ``cute_unpadded_rows`` only on a lone row
-    (``cute_lone_row_reduction``).
+    (``cute_lone_row_reduction``) and on the one row under a device loop
+    (``cute_lane_carry_row``), which have no other block to run on.
     """
     nt_list = cast("list[int]", config.get("num_threads", []) or [])
     rl_list = cast("list[int | None]", config.get("reduction_loops", []) or [])
@@ -2001,6 +2686,7 @@ def _cute_reduction_plans(
         unpadded = exact and threads == requested
         lane_loop = False
         rolled_width = 1
+        row_width = vec if unpadded else 1
         if chunk is not None:
             lanes, rolled_width = looped_reduction_lanes(chunk, threads, vec)
             lane_loop = _unrollable_lanes(lanes)
@@ -2059,9 +2745,19 @@ def _cute_reduction_plans(
                     # knob that count is even, as the padded one is: both
                     # form a lane loop.
                     lane_loop = _unrollable_lanes(lanes)
+                else:
+                    row_width = vec
+            else:
+                row_width = vec
         plans.append(
             _CuteReductionPlan(
-                block_id, unpadded, exact and not unpadded, lane_loop, rolled_width
+                block_id,
+                unpadded,
+                exact and not unpadded,
+                lane_loop,
+                rolled_width,
+                threads,
+                1 if block_id in rolled else row_width,
             )
         )
         others *= threads
@@ -2678,6 +3374,67 @@ def normalize_knobs(
     )
     _normalize_gated_boolean(
         config,
+        "cute_staged_store",
+        enabled=config_spec.cute_lane_gather_store_sites,
+        requirement=(
+            "a flattened gather along one hl.tile (index = row + tile.index) "
+            "stored along another, both tensors bf16, fp16, fp32, int16 or "
+            "int32, in a kernel with static shapes and without a matmul"
+        ),
+        fix_invalid=fix_invalid,
+        fill=False,
+    )
+    _normalize_gated_boolean(
+        config,
+        "cute_guarded_lanes",
+        enabled=guarded_lanes_offered(config_spec),
+        requirement=(
+            "a load through a computed or gathered coordinate or with an "
+            "extra_mask, in a pointwise kernel (no reduction, matmul or atomic)"
+        ),
+        fix_invalid=fix_invalid,
+        fill=False,
+    )
+    _normalize_gated_boolean(
+        config,
+        "cute_fmnmx_extrema",
+        enabled=fmnmx_extrema_offered(config_spec),
+        requirement=(
+            "an fp32 torch.maximum or torch.minimum of two tensors, in a "
+            "pointwise kernel (no reduction, matmul or atomic)"
+        ),
+        fix_invalid=fix_invalid,
+        fill=False,
+    )
+    _normalize_gated_boolean(
+        config,
+        "cute_predicated_element_loads",
+        enabled=predicated_element_loads_offered(config_spec),
+        requirement=(
+            "an hl.load under an extra_mask whose last subscript is a scaled "
+            "or gathered coordinate (not a tile or a tile shifted by a "
+            "constant, nor a row offset plus a tile's index into a tensor "
+            "that vector lanes load in packets), in a pointwise kernel (no "
+            "reduction, matmul or atomic)"
+        ),
+        fix_invalid=fix_invalid,
+        fill=False,
+    )
+    _normalize_gated_boolean(
+        config,
+        "cute_store_packet_tiers",
+        enabled=bool(config_spec.cute_store_tier_blocks),
+        requirement=(
+            "a one-axis hl.tile loop inside the kernel's outer hl.tile loop "
+            "that stores along its tile into the last dimension of a "
+            "float16, bfloat16, float32, int32 or uint32 tensor of two or "
+            "more dimensions, in a kernel without a matmul"
+        ),
+        fix_invalid=fix_invalid,
+        fill=False,
+    )
+    _normalize_gated_boolean(
+        config,
         "cute_defer_tile_reduce",
         enabled=bool(config_spec.cute_carried_tile_sum_blocks),
         requirement=(
@@ -2688,7 +3445,7 @@ def normalize_knobs(
         fix_invalid=fix_invalid,
         fill=False,
     )
-    _normalize_cute_wide_packet_hints(config, fix_invalid=fix_invalid)
+    _normalize_cute_load_hint_forms(config, fix_invalid=fix_invalid)
     _normalize_cute_pdl(config_spec, config, fix_invalid=fix_invalid)
     _normalize_cute_dot_fragment_mma(config_spec, config, fix_invalid=fix_invalid)
     _normalize_cute_dot_ring_mma(config_spec, config, fix_invalid=fix_invalid)
@@ -2863,6 +3620,100 @@ def normalize_after_sequences(
             ):
                 canonical_layouts[index] = "blocked"
         config["cute_lane_layouts"] = canonical_layouts
+    if fix_invalid:
+        _lead_threads_with_the_packet_axis(config_spec, config)
+
+
+def _lead_threads_with_the_packet_axis(
+    config_spec: ConfigSpec, config: dict[str, object]
+) -> None:
+    """Under ``cute_guarded_lanes``, keep the packet threads of an N-D packet
+    tile on thread x in the configs the search generates.
+
+    A tile's threaded blocks take the thread axes in loop order
+    (``_thread_axis_map``).  Once the lanes run under their stores' guard a
+    pointwise packet tile is bound by its loads, and with another axis on
+    thread x each warp's packets touch a fraction of many rows of the
+    stride-1 axis, every row fetched by several warps: the same code ran
+    2.7x slower on a channels-last pooling window (198 against 72 us on
+    B200; measured on that one kernel).  Two thirds of the loop orders of a
+    tile with three threaded axes are that layout, so a generated config
+    that has it moves the packet block ahead of the first threaded block of
+    its loop order; the other blocks keep their order.  The move shifts the
+    threaded blocks it passes one thread axis up, so a config keeps its
+    order where one of them would then exceed its axis' limit (a block of
+    more than 64 threads on z, ``MAX_THREAD_BLOCK_DIMS``): the launch would
+    be refused, and the config as generated may be launchable.
+
+    The rule covers the tiles the N-D packet tile seeds lay out in storage
+    order (``CutePointwiseVecHeuristic._packet_tile_seeds``): the loads
+    along the packet block take packets (``loads_take_packets``) and a store
+    lays out the loop's blocks with the packet block at stride 1
+    (``packet_tile_storage_order``).  Any other kernel the knob is offered
+    to keeps its loop orders, and so the search's whole range of thread
+    layouts under the knob: a transposed store, and a window that changes
+    the layout, whose packet tile the seeds plant with the packet threads on
+    thread x (two searches of such a pooling from those seeds, one of them
+    with this rule extended to it, ended on the same time).  A config a
+    user or a saved search pinned is left as it is (``fix_invalid`` only),
+    and so is a config without the knob, whose compute-bound code preferred
+    the other layouts.
+    """
+    if config.get("cute_guarded_lanes") is not True or not guarded_lanes_offered(
+        config_spec
+    ):
+        return
+    loop_orders = config.get("loop_orders")
+    vector_widths = config.get("cute_vector_widths")
+    if not isinstance(loop_orders, list) or not isinstance(vector_widths, list):
+        return
+    contiguous = set(config_spec.pointwise_facts[0].contig_block_ids)
+    threaded = _tile_axis_threads(
+        config_spec, config, _reduction_axis_block_ids(config_spec)
+    )
+    for index, order_spec in enumerate(config_spec.loop_orders):
+        order = loop_orders[index]
+        if not isinstance(order, list):
+            continue
+        blocks = [order_spec.block_ids[position] for position in order]
+        leading = [block_id for block_id in blocks if block_id in threaded]
+        packets = [
+            block_id
+            for block_id in leading
+            if block_id in contiguous
+            and cast(
+                "int",
+                config_spec.cute_vector_widths.config_get(vector_widths, block_id, 1),
+            )
+            > 1
+        ]
+        if (
+            len(packets) != 1
+            or len(leading) < 2
+            or leading[0] == packets[0]
+            or not loads_take_packets(config_spec, packets[0])
+            or packet_tile_storage_order(config_spec, order_spec.block_ids, packets[0])
+            is None
+        ):
+            continue
+        moved_threads = [
+            threaded[block_id][1]
+            for block_id in (
+                packets[0],
+                *(block_id for block_id in leading if block_id != packets[0]),
+            )
+        ]
+        if any(
+            threads > limit
+            for threads, limit in zip(
+                moved_threads, MAX_THREAD_BLOCK_DIMS, strict=False
+            )
+        ):
+            continue
+        entry = order[blocks.index(packets[0])]
+        moved = [position for position in order if position != entry]
+        moved.insert(blocks.index(leading[0]), entry)
+        loop_orders[index] = moved
 
 
 # A persistent reduction nested in a tile keeps at least a warp of the
@@ -3149,12 +4000,19 @@ def normalize_reduction_threads(
                             config_spec, config, spec, available
                         )
                     )
-                    if forms_register_tile or _cute_config_forms_one_vector_lane(
-                        config_spec, config, spec, available
+                    if (
+                        forms_register_tile
+                        or _cute_config_forms_one_vector_lane(
+                            config_spec, config, spec, available
+                        )
+                        or _cute_config_forms_lane_unrolled_row(
+                            config_spec, config, spec, available
+                        )
                     ):
                         # Only the register tile honours the schedule
-                        # knobs; a one-vector lane that is not one keeps
-                        # its lane loop but drops them below.
+                        # knobs; a one-vector lane or a lane-unrolled row
+                        # that is not one keeps its lane loop but drops
+                        # them below.
                         register_tile = register_tile or forms_register_tile
                         continue
                     chunk = min(spec.size_hint, available)
@@ -3920,6 +4778,52 @@ def cute_flat_fields(
             # packet and no proven predicate, a shared-memory reduce in a loop
             # with a partial tile) the loop stays whole (``peel_vector_tails``).
             fields["cute_tail_peel"] = BooleanFragment()
+        if config_spec.cute_lane_gather_store_sites:
+            # A CTA's scalar stores staged in shared memory and flushed as
+            # 16-byte packets, each warp writing 32 consecutive ones; the
+            # values and elements written are unchanged.  Offered where a
+            # flattened gather runs along one tile and its store along
+            # another (``lane_gather_stores``), the layouts where packet
+            # loads leave the stores scattered, in a kernel with static
+            # shapes.  Where the generated kernel is not proven to write one
+            # aligned span per block (several tiles on the stored tensor's
+            # last dimension, an unaligned output view) the code stays as it
+            # is (``staged_stores``).
+            fields["cute_staged_store"] = BooleanFragment()
+        if guarded_lanes_offered(config_spec):
+            # A tile's loads and lane arithmetic under the guard of the
+            # stores they feed, the selects that guard implies dropped and
+            # padded packets loaded predicated; the same values but for FMA
+            # contraction and the sign and payload bits of a NaN.  Where no
+            # store of the config's code is guarded (every tile divides its
+            # extent) the pass leaves the code as it is (``guard_lanes``);
+            # a padded packet still loads predicated.
+            fields["cute_guarded_lanes"] = BooleanFragment()
+        if fmnmx_extrema_offered(config_spec):
+            # An fp32 maximum / minimum as one FMNMX.NaN instead of two
+            # compares and a select; the same values but for the sign of a
+            # zero where zeros of both signs meet.
+            fields["cute_fmnmx_extrema"] = BooleanFragment()
+        if predicated_element_loads_offered(config_spec):
+            # A masked element load as one predicated instruction instead of
+            # a load inside a conditional, with the constant of the select
+            # it feeds as its masked-off value where that is proven; the
+            # same values but for the sign and payload bits of a NaN.  A
+            # config whose masked loads are all packets renders its code
+            # without the knob.
+            fields["cute_predicated_element_loads"] = BooleanFragment()
+        if config_spec.cute_store_tier_blocks:
+            # A lane loop's stores in narrower packets where a row fails the
+            # full packet's alignment guard, instead of the scalar loop;
+            # bitwise identical.  A config whose lanes are too narrow to
+            # split, whose stored tensors take no packet of them or whose
+            # rows are all aligned to them reads the knob off
+            # (``_normalize_cute_lane_knobs``); where the lowering proves
+            # every store's alignment some other way the code is unchanged
+            # (``affine_vector_io``).  Its coverage group
+            # (``register_store_packet_tiers_coverage``) keeps it off in the
+            # random initial population and on in witnesses it changes.
+            fields["cute_store_packet_tiers"] = BooleanFragment()
         if config_spec.cute_carried_tile_sum_blocks:
             # A carried tile sum's threads combined once after the device
             # loop instead of once per tile; changes the summation order
@@ -4078,6 +4982,7 @@ def cute_flat_fields(
             fields["cute_warp_aggregated_atomics"] = BooleanFragment()
         if config_spec.cute_privatize_atomics_enabled:
             fields["cute_privatize_atomics"] = BooleanFragment()
+        carry_row = cute_lane_carry_row(config_spec) is not None
         if len(config_spec.cute_lane_layouts) > 0 and not config_spec.matmul_facts:
             # The kernel's structure opens it, not its seeds: a max, a min or
             # an ``any`` the knob reduces natively (``cute_native_redux_sites``),
@@ -4128,10 +5033,14 @@ def cute_flat_fields(
             if (
                 cute_lone_row_reduction(config_spec, config_spec.cute_vector_widths)
                 is not None
+                or carry_row
             ):
                 # Its seeds plant only where whole warps cover the row; the
                 # kernel's structure opens it, as for ``cute_lane_unroll``,
-                # so the search space is the same at every extent.
+                # so the search space is the same at every extent: a lone
+                # row, or a row under a device loop whose lanes carry values
+                # through it (``cute_lane_carry_row``; the vector row of
+                # ``CuteLaneCarryRowHeuristic``).
                 fields["cute_unpadded_rows"] = EnumFragment(
                     (False, True), search_choices=(False, True)
                 )
@@ -4168,7 +5077,13 @@ def cute_flat_fields(
             # extent: the strided seeds that sink it fit only some extents,
             # and a knob only they opened would change the search space
             # (``structural_fingerprint``) between shapes.
-            sink_open = sink_seeded or config_spec.cute_strided_reduction_sites
+            # So does a flattened gather along one tile stored along another
+            # (its register-tile seeds fit only some aligned shapes).
+            sink_open = (
+                sink_seeded
+                or config_spec.cute_strided_reduction_sites
+                or config_spec.cute_lane_gather_store_sites
+            )
             fields["cute_vloop_sink"] = EnumFragment(
                 (False, True),
                 search_choices=(False, True) if sink_open else (False,),
@@ -4176,13 +5091,18 @@ def cute_flat_fields(
             # A lone persistent row walks synthetic lanes at many extents
             # and threads (``CutePersistentLaneUnrollHeuristic`` seeds the
             # masked ones): its kernel structure opens the knob, so the
-            # search space is the same at every extent.
+            # search space is the same at every extent.  So does a row under
+            # a device loop (``cute_lane_carry_row``): a tile of the loop on
+            # one thread is a lane loop of rows, whose loads the unroll
+            # issues ahead of the first row's reductions
+            # (``lane_loops/tile_trips.py``).
             fields["cute_lane_unroll"] = EnumFragment(
                 _CUTE_LANE_UNROLL_CHOICES,
                 search_choices=_CUTE_LANE_UNROLL_CHOICES
                 if sink_open
                 or unroll_seeded
                 or cute_lone_row_reduction(config_spec) is not None
+                or carry_row
                 else (1,),
             )
         # A launch attribute plus one wait, live on every kernel of
@@ -4554,6 +5474,7 @@ def prepare_flat_config(config_spec: ConfigSpec, config: dict[str, object]) -> N
     ):
         if config.get(key) is None:
             config.pop(key, None)
+    open_load_hint_forms(config)
 
 
 # ``load_eviction_policies`` values of the CuTe loads.  "first"/"last" lower to
@@ -4573,7 +5494,13 @@ def prepare_flat_config(config_spec: ConfigSpec, config: dict[str, object]) -> N
 # evict it after its final use.  Both reach 16-, 8- and 4-byte packets; the
 # unpredicated 32-byte packet (SM100+) only under the cute_wide_packet_hints
 # knob, while the predicated packets of a masked row strip carry them at every
-# width up to 64 bytes.
+# width up to 64 bytes.  An element load (a gather, a strided or unaligned
+# lane) takes the L1 priorities and the streaming operator at 4 and 8 bytes
+# and, under the cute_scalar_load_hints knob, the L2 policies at those sizes
+# (per tensor: ``hint_element_loads``).  The search sets both knobs on the
+# configs it decodes (``open_load_hint_forms``).  A 2-byte element takes a
+# policy only under the cute_narrow_load_hints knob, which the search leaves
+# alone.
 CUTE_EVICTION_POLICIES: tuple[str, ...] = (
     "",
     "first",
@@ -4980,6 +5907,7 @@ class CuteSearchSurface(BackendSearchSurface):
         overrides: Mapping[str, object],
     ) -> None:
         prepare_override_normalization(config_spec, config, overrides)
+        reopen_load_hint_forms(config, overrides)
 
     def trim_reference_config(self, config_spec: ConfigSpec, config: Config) -> None:
         trim_reference_config(config_spec, config)

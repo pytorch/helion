@@ -31,7 +31,9 @@ import torch
 
 import helion
 from helion import exc
+from helion._compiler.autotuner_heuristics.common import matches_hardware
 from helion._hardware import HardwareInfo
+from helion._hardware import get_hardware_info
 from helion._testing import cpu_render_target
 from helion._testing import onlyBackends
 from helion._testing import skipIfRefEager
@@ -92,6 +94,56 @@ def test_future_cuda_arch_does_not_load_sm103_aot_fallback(tmp_path: Path) -> No
         ):
             assert aot_cache_module.find_heuristic_file(source_path) == sm100_heuristic
     finally:
+        aot_cache_module.clear_heuristic_cache()
+
+
+def test_rocm_hardware_info_uses_the_base_arch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.version, "cuda", None)
+    monkeypatch.setattr(torch.version, "hip", "7.2.0")
+
+    def rocm_hardware(name: str) -> HardwareInfo:
+        # ROCm reports the arch with its target features.
+        props = SimpleNamespace(gcnArchName=name)
+        monkeypatch.setattr(torch.cuda, "get_device_properties", lambda _device: props)
+        get_hardware_info.cache_clear()
+        return get_hardware_info()
+
+    source_path = tmp_path / "demo.py"
+    source_path.touch()
+    (tmp_path / "_helion_aot_demo_rocm_gfx950.py").touch()
+    aot_cache_module.clear_heuristic_cache()
+    try:
+        mi300x = rocm_hardware("gfx942:sramecc+:xnack-")
+        assert mi300x.compute_capability == "gfx942"
+        # The full name, with features, still separates cache entries.
+        assert mi300x.hardware_name == "gfx942:sramecc+:xnack-"
+        # The fallback runs to older arches only, never to gfx950.
+        compute_ids = mi300x.get_compatible_compute_ids()
+        assert compute_ids[:3] == ["gfx942", "gfx942:sramecc+:xnack-", "gfx941"]
+        assert "gfx950" not in compute_ids
+        # A heuristic saved under the full arch name, as older versions named
+        # them, still loads...
+        saved = tmp_path / "_helion_aot_demo_rocm_gfx942:sramecc+:xnack-.py"
+        saved.touch()
+        assert aot_cache_module.find_heuristic_file(source_path) == saved
+        # ...until one is regenerated under the base arch.
+        gfx942_heuristic = tmp_path / "_helion_aot_demo_rocm_gfx942.py"
+        gfx942_heuristic.touch()
+        aot_cache_module.clear_heuristic_cache()
+        assert aot_cache_module.find_heuristic_file(source_path) == gfx942_heuristic
+
+        # Heuristic hardware targets name the base arch and match the report.
+        env = SimpleNamespace(device=torch.device("cuda", 0))
+        gfx950_only = (("rocm", "gfx950"),)
+        rocm_hardware("gfx950:sramecc+:xnack-")
+        assert matches_hardware(env, gfx950_only)  # pyrefly: ignore [bad-argument-type]
+        rocm_hardware("gfx942:sramecc+:xnack-")
+        assert not matches_hardware(env, gfx950_only)  # pyrefly: ignore [bad-argument-type]
+    finally:
+        get_hardware_info.cache_clear()
         aot_cache_module.clear_heuristic_cache()
 
 
@@ -901,6 +953,7 @@ def test_aot_cache_canonicalizes_defaults_for_compile_get(
         settings=bound_kernel.settings,
         args=(tensor,),
         _benchmark_provider_cls=LocalBenchmarkProvider,
+        _benchmark_prelude=None,
     )
     monkeypatch.setenv("HELION_AOT_MODE", "compile")
     monkeypatch.setattr(aot_cache_module, "get_aot_data_dir", lambda: tmp_path)

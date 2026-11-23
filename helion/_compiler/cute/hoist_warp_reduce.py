@@ -42,6 +42,7 @@ from __future__ import annotations
 import ast
 from collections import Counter
 import re
+from typing import TYPE_CHECKING
 from typing import cast
 
 from ... import exc
@@ -53,10 +54,17 @@ from ._ast_pass_utils import names_read
 from ._ast_pass_utils import names_written
 from .reduce_call import CLUSTER_REDUCES
 from .reduce_call import LANE_FOLD_REDUCES
+from .reduce_call import extremum_carrier
+from .reduce_call import extremum_identity
+from .reduce_call import is_extremum_carrier
 from .unroll_lane_loads import _loop_trips
 
+if TYPE_CHECKING:
+    from collections.abc import Mapping
+
 # Warp-reduction call attribute names recognised by this pass.  Each maps
-# to the identity element used for the per-thread V-fold accumulator.
+# to the identity element used for a floating-point per-thread V-fold
+# accumulator (``_fold_identity`` gives an integer one's).
 _REDUCE_IDENTITY: dict[str, str] = {
     "warp_reduction_sum": "0",
     "warp_reduction_max": "float('-inf')",
@@ -283,6 +291,7 @@ def _try_hoist_one_vloop(
     v: int,
     acc_name_counter: list[int],
     running_sums: set[str],
+    input_dtypes: Mapping[str, str | None] | None = None,
 ) -> list[ast.stmt] | None:
     """Try to hoist warp reductions out of a single constexpr V-loop.
 
@@ -468,14 +477,15 @@ def _try_hoist_one_vloop(
         input_def_rhs = _assignment_rhs(body_copy[input_def_idx])
         assert input_def_rhs is not None
 
-        identity = _REDUCE_IDENTITY[op]
         combine_template = _REDUCE_COMBINE[op]
-        acc_dtype_probe = _infer_input_dtype(input_def_rhs)
-        if acc_dtype_probe in (
-            "cutlass.Float32",
-            "cutlass.Float16",
-            "cutlass.BFloat16",
-        ):
+        fold_dtype = _fold_dtype(
+            call_node, input_name, input_def_rhs, input_dtypes or {}
+        )
+        # The dtype the accumulator is held in: the fold's, or the float
+        # that carries an integer's extremum (``extremum_carrier`` says
+        # why), which is converted back for the reduce.
+        carrier = None if fold_dtype is None else _fold_carrier(op, fold_dtype)
+        if carrier == "cutlass.Float32":
             # ``cute.math.max(propagate_nan=True)`` lowers to compares and
             # selects; the hardware FMNMX.NaN is one instruction and, like the
             # warp shuffle reduction, propagates NaN as torch.amax does.
@@ -512,24 +522,32 @@ def _try_hoist_one_vloop(
         vloop_body: list[ast.stmt] = []
         v_members = sorted(v_loop_members[reduce_pos])
         acc_dtype: str | None = None
+        reduce_input = input_name
         if input_is_loop_carried:
             acc_name = input_name
             for j in v_members:
                 vloop_body.append(body_copy[j])
         else:
+            # The accumulator takes the dtype the reduce combines in.  A
+            # reduce that does not say which keeps its loop: an accumulator
+            # of another dtype would round every lane's value to it.
+            acc_dtype = fold_dtype
+            if acc_dtype is None or carrier is None:
+                return None
+            identity = _fold_identity(op, acc_dtype)
             acc_name = f"_helion_vfold_acc_{acc_name_counter[0]}"
             acc_name_counter[0] += 1
-            acc_dtype = _infer_input_dtype(input_def_rhs)
-            if acc_dtype is None:
-                return None
-            acc_init_expr = f"{acc_dtype}({identity})"
+            acc_init_expr = f"{carrier}({identity})"
             new_stmts.append(statement_from_string(f"{acc_name} = {acc_init_expr}"))
+            reduce_input = (
+                acc_name if carrier == acc_dtype else f"{acc_dtype}({acc_name})"
+            )
 
             # V-loop body: all V-dep stmts in this reduce's closure, in
             # original order.  When we hit input_def_idx, also emit acc
-            # combine after it.  Rewrite the acc combine's input expression's
-            # cast wrapper to use the acc dtype (avoids a double cast on
-            # fp16/bf16 inputs being promoted to fp32 acc).  Keep the
+            # combine after it: the input's definition converted to the acc
+            # dtype, any conversion it holds included (a narrower one rounds
+            # the value the loop reduced).  Keep the
             # original input def stmt — it may be read by later V-loop stmts
             # (the dependency closure can include paths through it), and the
             # CuTe DSL will DCE it if unused.
@@ -539,6 +557,8 @@ def _try_hoist_one_vloop(
                     input_rhs = _assignment_rhs(body_copy[j])
                     assert input_rhs is not None
                     promoted_rhs = _rewrite_cast_wrapper(input_rhs, acc_dtype)
+                    if carrier != acc_dtype:
+                        promoted_rhs = _rewrite_cast_wrapper(promoted_rhs, carrier)
                     rhs_text = ast.unparse(promoted_rhs)
                     combine_expr = combine_template.format(a=acc_name, b=rhs_text)
                     vloop_body.append(
@@ -556,9 +576,9 @@ def _try_hoist_one_vloop(
         ast.fix_missing_locations(new_vloop_template)
         new_stmts.append(new_vloop_template)
 
-        # Emit the reduce stmt with input -> acc.
+        # Emit the reduce stmt with input -> acc, in the reduce's dtype.
         new_reduce_stmt = _replace_reduce_input(
-            reduce_stmt, call_node, acc_name, acc_dtype
+            reduce_stmt, call_node, reduce_input, acc_dtype
         )
         if new_reduce_stmt is None:
             return None
@@ -572,13 +592,16 @@ def _try_hoist_one_vloop(
 
 
 def _rewrite_cast_wrapper(rhs: ast.expr, new_dtype: str) -> ast.expr:
-    """Rewrite a narrowing dtype wrapper (e.g. ``cutlass.Float16(x)``) to
-    use ``new_dtype`` instead, recursing into IfExp branches and arg lists.
+    """Convert ``rhs`` to ``new_dtype``, recursing into IfExp branches:
+    ``cutlass.Float16(values) if mask else cutlass.Float16(-inf)`` becomes
+    ``cutlass.Float32(cutlass.Float16(values)) if mask else
+    cutlass.Float32(cutlass.Float16(-inf))``.
 
-    For ``cutlass.Float16(values) if mask else cutlass.Float16(-inf)``,
-    returns ``cutlass.Float32(values) if mask else cutlass.Float32(-inf)``.
-    Falls back to ``new_dtype(<original>)`` if the structure isn't a
-    recognised cast wrapper.
+    A conversion that ``rhs`` holds is kept and converted, never replaced by
+    ``new_dtype``'s: it rounds an operand wider than itself
+    (``x.to(torch.float16)`` of an fp32 ``x``), and the fold has to add the
+    values the loop reduced; where the operand has its dtype already it costs
+    nothing.  A conversion to ``new_dtype`` itself is left as it is.
     """
     if isinstance(rhs, ast.IfExp):
         new_body = _rewrite_cast_wrapper(rhs.body, new_dtype)
@@ -587,60 +610,110 @@ def _rewrite_cast_wrapper(rhs: ast.expr, new_dtype: str) -> ast.expr:
     if (
         isinstance(rhs, ast.Call)
         and isinstance(rhs.func, ast.Attribute)
-        and ast.unparse(rhs.func)
-        in ("cutlass.Float16", "cutlass.BFloat16", "cutlass.Float32")
+        and ast.unparse(rhs.func) == new_dtype
     ):
-        # Rewrite the cast wrapper to use new_dtype.
-        # Parse "<new_dtype>(<args>)" template.
-        args_text = ", ".join(ast.unparse(a) for a in rhs.args)
-        new_call = ast.parse(f"{new_dtype}({args_text})").body[0]
-        assert isinstance(new_call, ast.Expr)
-        return new_call.value
-    # Otherwise wrap with new_dtype.
+        return rhs
     return ast.parse(f"{new_dtype}({ast.unparse(rhs)})").body[0].value  # type: ignore[union-attr]
 
 
-def _infer_input_dtype(rhs: ast.expr) -> str | None:
-    """Detect the dtype wrapper at the outermost level of ``rhs``.
+# The floating-point dtypes narrower than fp32 (the half and fp8 formats
+# ``CuteBackend.dtype_str`` names): a reduction in one of them folds in fp32,
+# which holds each of its values exactly.
+_NARROW_FLOAT_DTYPES = (
+    "cutlass.Float16",
+    "cutlass.BFloat16",
+    "cutlass.Float8E4M3FN",
+    "cutlass.Float8E5M2",
+    "cutlass.Float8E8M0FNU",
+)
+# The other dtypes a V-fold accumulates in: fp32, float64 and the integers,
+# whose identities ``_fold_identity`` writes (not ``cutlass.Boolean``, whose
+# constructor turns an infinity into True).
+_FOLD_DTYPE = re.compile(r"cutlass\.(?:Float(?:32|64)|(?:Int|Uint)\d+)")
 
-    Examples:
-        ``cutlass.Float32(x)`` → "cutlass.Float32"
-        ``cutlass.Float16(x) if cond else cutlass.Float16(-inf)`` → "cutlass.Float16"
-        ``cute.math.exp2(...)`` → None (no explicit wrapper)
+
+def _fold_dtype(
+    call: ast.Call,
+    input_name: str,
+    input_def: ast.expr,
+    input_dtypes: Mapping[str, str | None],
+) -> str | None:
+    """The dtype the V-fold of the reduce ``call`` converts each lane's value
+    to and reduces in, or None when nothing says which dtype the reduce
+    combines in.  (The accumulator has that dtype, or holds it in a carrier:
+    ``_fold_carrier``.)
+
+    A grouped helper names that dtype in its identity argument: the helper
+    types its shared-memory staging and its masked lanes with it, and the
+    emitters convert the input to it.  A direct ``cute.arch.warp_reduction_*``
+    has no such argument: its emitter records the reduction's dtype under the
+    name of the value it reduces (``CuteLaneState.reduce_input_dtypes``), and
+    without a record the dtype is known when that value's definition is a
+    conversion (``cutlass.Float32(x)``), as for an input this pass named
+    (``_name_explicit_fp32_reduce_inputs``).  The text of any other
+    definition (a load, a product, a call) does not show its dtype.
+
+    A reduction in a floating-point dtype narrower than fp32 (half precision,
+    fp8) accumulates in fp32, to which its values convert exactly: the
+    downstream uses convert to fp32 anyway, an fp16 max is no cheaper than an
+    fp32 max on a B200, and a sum keeps more of its addends.  No other dtype
+    is changed.
     """
-    if isinstance(rhs, ast.IfExp):
-        # Assume body and orelse share the same outer wrapper.
-        return _infer_input_dtype(rhs.body)
-    if isinstance(rhs, ast.Call) and isinstance(rhs.func, ast.Attribute):
-        func_text = ast.unparse(rhs.func)
-        # Only match a bare dtype constructor (``cutlass.<Dtype>``); a
-        # compound expression like ``cutlass.Uint16(v[i]).bitcast`` is NOT
-        # a dtype wrapper and must fall through to the fp32 default.
-        if re.fullmatch(r"cutlass\.(?:B?Float|U?Int)\d+", func_text):
-            # Promote fp16/bf16 accumulators to fp32 for better perf and
-            # accuracy: the downstream uses convert to fp32 anyway, and
-            # fp16 max is no cheaper than fp32 max on B200.  Sum benefits
-            # from fp32 to avoid losing precision over the V-fold.
-            if func_text in ("cutlass.Float16", "cutlass.BFloat16"):
-                return "cutlass.Float32"
-            return func_text
-    # Conservative default — sufficient for sum/max in fp32 accumulators.
-    return "cutlass.Float32"
+    if isinstance(call.func, ast.Name):
+        dtype = _dtype_constructor(call.args[2])
+    elif input_name in input_dtypes:
+        dtype = input_dtypes[input_name]
+    else:
+        dtype = _dtype_constructor(input_def)
+    if dtype in _NARROW_FLOAT_DTYPES:
+        return "cutlass.Float32"
+    if dtype is None or not _FOLD_DTYPE.fullmatch(dtype):
+        return None
+    return dtype
+
+
+def _dtype_constructor(node: ast.expr) -> str | None:
+    """``cutlass.<Dtype>`` when ``node`` is a conversion
+    ``cutlass.<Dtype>(x)`` (``_strip_dtype_wrap`` peels one), else None."""
+    if isinstance(node, ast.Call) and _strip_dtype_wrap(node) is not node:
+        return ast.unparse(node.func)
+    return None
+
+
+def _fold_identity(op: str, dtype: str) -> str:
+    """The literal the V-fold of a reduction in ``dtype`` starts from: an
+    integer's lowest or highest value for its maximum or minimum
+    (``extremum_identity``), else ``_REDUCE_IDENTITY``."""
+    if op != "warp_reduction_sum":
+        identity = extremum_identity(dtype, op == "warp_reduction_max")
+        if identity is not None:
+            return identity
+    return _REDUCE_IDENTITY[op]
+
+
+def _fold_carrier(op: str, dtype: str) -> str:
+    """The dtype the V-fold of a reduction in ``dtype`` holds its
+    accumulator in: ``dtype``, but a float that holds it for the maximum or
+    minimum of an integer of at most 32 bits (``extremum_carrier``).  A sum
+    keeps its dtype: an integer sum wraps, which no floating-point sum does."""
+    return dtype if op == "warp_reduction_sum" else extremum_carrier(dtype)
 
 
 def _replace_reduce_input(
     reduce_stmt: ast.stmt,
     call_node: ast.Call,
-    acc_name: str,
+    acc_input: str,
     acc_dtype: str | None = None,
 ) -> ast.stmt | None:
     """Return a copy of ``reduce_stmt`` with ``call_node``'s first arg replaced
-    by ``Name(acc_name)``.
+    by the expression ``acc_input``: the accumulator, or its conversion to
+    the reduce's dtype.
 
     For grouped-reduce helper calls, the identity element (args[2]) must
     match the input dtype (the helpers derive their smem dtype from it), so
-    when ``acc_dtype`` is given the identity's dtype wrapper is rewritten to
-    it (e.g. ``cutlass.BFloat16(float('-inf'))`` -> ``cutlass.Float32(...)``).
+    when ``acc_dtype`` is given the identity is converted to it (e.g.
+    ``cutlass.BFloat16(float('-inf'))`` ->
+    ``cutlass.Float32(cutlass.BFloat16(float('-inf')))``).
     """
     if not isinstance(reduce_stmt, ast.Assign):
         return None
@@ -652,7 +725,7 @@ def _replace_reduce_input(
         def visit_Call(self, node: ast.Call) -> ast.AST:
             if node is call_node and not self.done:
                 self.done = True
-                new_args = [ast.Name(id=acc_name, ctx=ast.Load()), *node.args[1:]]
+                new_args = [ast.parse(acc_input, mode="eval").body, *node.args[1:]]
                 if (
                     acc_dtype is not None
                     and isinstance(node.func, ast.Name)
@@ -738,6 +811,7 @@ def _hoist_in_body(
     acc_counter: list[int],
     running_sums: set[str],
     unfoldable_vec_lanes: set[str],
+    input_dtypes: Mapping[str, str | None],
 ) -> list[ast.stmt]:
     """Walk ``body`` recursively; for each constexpr V-loop containing warp
     reductions, replace it with the V-fold + hoisted-reduce form.  A V-loop
@@ -746,7 +820,9 @@ def _hoist_in_body(
     """
 
     def walk(stmts: list[ast.stmt]) -> list[ast.stmt]:
-        return _hoist_in_body(stmts, acc_counter, running_sums, unfoldable_vec_lanes)
+        return _hoist_in_body(
+            stmts, acc_counter, running_sums, unfoldable_vec_lanes, input_dtypes
+        )
 
     new_body: list[ast.stmt] = []
     for stmt in body:
@@ -759,7 +835,9 @@ def _hoist_in_body(
                 and stmt.target.id in unfoldable_vec_lanes
             ):
                 vloop, v = match
-                replacement = _try_hoist_one_vloop(vloop, v, acc_counter, running_sums)
+                replacement = _try_hoist_one_vloop(
+                    vloop, v, acc_counter, running_sums, input_dtypes
+                )
                 if replacement is not None:
                     new_body.extend(replacement)
                     continue
@@ -787,6 +865,7 @@ def hoist_warp_reduce_from_vloop(
     running_sum_accumulators: set[str] | None = None,
     rename_groups: dict[str, str] | None = None,
     unfoldable_vec_lanes: set[str] | None = None,
+    reduce_input_dtypes: Mapping[str, str | None] | None = None,
 ) -> list[ast.stmt]:
     """Apply the hoist pass to a list of kernel-body statements.
 
@@ -805,6 +884,15 @@ def hoist_warp_reduce_from_vloop(
     another block (recorded by the reduction lowering): their lanes are
     distinct output elements, which a V-fold would combine.
 
+    ``reduce_input_dtypes`` maps the name of a value that a direct
+    ``cute.arch.warp_reduction_*`` reduces to the dtype the reduction
+    combines in (recorded by ``CuteBackend.reduction_expr``; None for a name
+    recorded with two dtypes).  A V-fold's accumulator takes that dtype, or
+    the one a grouped helper's identity argument names (``_fold_dtype``); a
+    reduce whose dtype nothing states keeps its loop.  The maximum or minimum
+    of an integer of at most 32 bits is held in a float that holds it and
+    converted back for the reduce (``_fold_carrier``).
+
     After the per-V-loop hoist, a second walk collapses the remaining
     per-lane-iteration reduces: a static lane loop that runs ``REDUCE`` +
     ``carry = combine(carry, result)`` once per iteration is rewritten to
@@ -813,13 +901,13 @@ def hoist_warp_reduce_from_vloop(
     ``L-1`` two-barrier shared-memory reductions per sweep.
     """
     new_body = _hoist_in_body(
-        body, [0], running_sum_accumulators or set(), unfoldable_vec_lanes or set()
+        body,
+        [0],
+        running_sum_accumulators or set(),
+        unfoldable_vec_lanes or set(),
+        reduce_input_dtypes or {},
     )
-    import os
-
-    if os.environ.get("HELION_DISABLE_LANE_REDUCE_COLLAPSE") != "1":
-        new_body = _collapse_in_body(new_body, new_body, rename_groups or {})
-    return new_body
+    return _collapse_in_body(new_body, new_body, rename_groups or {})
 
 
 # ---------------------------------------------------------------------------
@@ -924,7 +1012,7 @@ def _try_collapse_lane_reduce(
             ACC = <dtype>(<identity>)
             for V in cutlass.range_constexpr(V): ... ACC = combine(ACC, x)
             <reduce-arg scalars (loop-invariant)>
-            R = REDUCE(ACC, ...)
+            R = REDUCE(ACC, ...)    # or REDUCE(<dtype>(ACC), ...): a carrier
             <casts of R>
             COPY = CARRY            # optional
             CARRY = combine(COPY | CARRY, cast(R))
@@ -938,18 +1026,10 @@ def _try_collapse_lane_reduce(
     assert isinstance(loop.target, ast.Name)
     lane_var = loop.target.id
 
-    import os as _os
-
-    _dbg = _os.environ.get("HELION_DEBUG_COLLAPSE") == "1"
-    if _dbg:
-        import sys as _sys
-
-        print("=== collapse attempt ===", file=_sys.stderr)
-        for _i, _s in enumerate(body):
-            print(_i, ast.unparse(_s)[:100].replace("\n", " | "), file=_sys.stderr)
-
-    # Locate reduce statements at the top level of the loop body.
-    reduce_entries: list[tuple[int, str, str, ast.Call, str]] = []
+    # Locate reduce statements at the top level of the loop body.  A reduce
+    # reads its accumulator, or the accumulator converted to the reduce's
+    # dtype (an integer extremum held in a float, ``_fold_carrier``).
+    reduce_entries: list[tuple[int, str, str, ast.Call, str, str | None]] = []
     for i, stmt in enumerate(body):
         rhs = _assignment_rhs(stmt)
         lhs = assigned_name(stmt)
@@ -959,9 +1039,12 @@ def _try_collapse_lane_reduce(
         if found is None:
             continue
         op, input_expr, call_node = found
+        reduced = _dtype_constructor(input_expr)
+        if isinstance(input_expr, ast.Call) and reduced is not None:
+            input_expr = input_expr.args[0]
         if not isinstance(input_expr, ast.Name):
             return None
-        reduce_entries.append((i, lhs, op, call_node, input_expr.id))
+        reduce_entries.append((i, lhs, op, call_node, input_expr.id, reduced))
     if not reduce_entries:
         return None
 
@@ -978,7 +1061,7 @@ def _try_collapse_lane_reduce(
     prefix: list[ast.stmt] = []
     tail: list[ast.stmt] = []
 
-    for idx, result_name, op, call_node, acc_name in reduce_entries:
+    for idx, result_name, op, call_node, acc_name, reduced in reduce_entries:
         op_kind = _COLLAPSE_UPDATE_OPS.get(op)
         if op_kind is None:
             return None
@@ -996,7 +1079,25 @@ def _try_collapse_lane_reduce(
         if init_rhs is None:
             return None
         init_text = ast.unparse(_strip_dtype_wrap(init_rhs))
-        expected_identity = _REDUCE_IDENTITY[op]
+        init_dtype = _dtype_constructor(init_rhs)
+        if reduced is None:
+            # The identity of the accumulator's own dtype, as the V-fold
+            # wrote it.
+            expected_identity = (
+                _REDUCE_IDENTITY[op]
+                if init_dtype is None
+                else _fold_identity(op, init_dtype)
+            )
+        elif (
+            op != "warp_reduction_sum"
+            and init_dtype is not None
+            and is_extremum_carrier(init_dtype, reduced)
+        ):
+            # An extremum held in its carrier starts from the identity of the
+            # dtype it is reduced in.
+            expected_identity = _fold_identity(op, reduced)
+        else:
+            return None
         if init_text not in (expected_identity, f"({expected_identity})"):
             return None
         vloop_idx = None

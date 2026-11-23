@@ -69,8 +69,16 @@ class MetalKernelFacts:
     #: (``tabulate.table_sizes``).
     table_sizes: frozenset[int] = frozenset()
     #: Whether SIMD groups can split those matmuls' K loops
-    #: (``fragment_mma.split_refusal``): a fragment config's ``num_warps``.
+    #: (``operand_elements.split_refusal``): a fragment config's ``num_warps``.
     fragment_splits: bool = False
+    #: Whether, besides, no free ``hl.arange`` axis takes threads from the
+    #: ``num_warps`` budget and ``thread_loops`` gives the launch, so that
+    #: normalization sees an MPP config's launch as codegen does and, where
+    #: its counts launch one SIMD group, ``num_warps`` changes nothing but
+    #: the SIMD groups splitting its register runs' K loops
+    #: (``mpp_registers.register_split``, which codegen runs only here); a
+    #: reduction, which also would draw on it, refuses the split.
+    register_splits: bool = False
     #: The tunable tiles of each device loop, the grid's first (empty when it
     #: has none), when the kernel's matmuls lower on MPP's cooperative ops or
     #: on fragments, whose launches take whole SIMD groups (:func:`fit_threads`),
@@ -89,6 +97,9 @@ class MetalKernelFacts:
     #: the staged tile), the staged operand's other side, and K
     #: (``staged_matmul_heuristic``).
     staged_matmuls: tuple[tuple[int, int, int], ...] = ()
+    #: The K-loop matmuls the fragment lowering takes: ``(m, n, k)`` blocks
+    #: of each (``fragment_matmul_heuristic``).
+    fragment_blocks: tuple[tuple[int, int, int], ...] = ()
 
 
 def kernel_facts(config_spec: ConfigSpec) -> MetalKernelFacts:
@@ -288,6 +299,55 @@ def fragment_stages(
     return stages
 
 
+def _launch(
+    config_spec: ConfigSpec, config: Mapping[str, object], budget: int
+) -> tuple[list[int], int, int]:
+    """A matmul config's tile sizes per count, the product of its
+    literal-size tiles (a fixed ``block_size=``, one thread per element)
+    and the threads its counts launch under ``budget``
+    (``thread_counts.launch_threads``)."""
+    facts = kernel_facts(config_spec)
+    spec = config_spec.num_threads
+    blocks = config["block_sizes"]
+    threads = config.get("num_threads", [0] * len(spec))
+    assert isinstance(blocks, list) and isinstance(threads, list)
+    # A tile over a size-1 dimension runs on one thread.
+    sizes = [
+        1
+        if item.size_hint == 1
+        else int(config_spec.block_sizes.config_get(blocks, item.block_ids[0], 1))
+        for item in spec
+    ]
+    # Literal-size tiles take their threads first, one per element.
+    literal = math.prod(facts.literal_threads)
+    launch = literal * math.prod(
+        launch_threads(
+            [[spec.block_id_to_index(b) for b in loop] for loop in facts.thread_loops],
+            sizes,
+            threads,
+            budget,
+            fixed=facts.literal_threads,
+            to_one={spec.block_id_to_index(b) for b in facts.reduced_after_loop},
+        )
+    )
+    return sizes, literal, launch
+
+
+def mpp_one_simdgroup(config_spec: ConfigSpec, config: Mapping[str, object]) -> bool:
+    """Whether an MPP config's counts, all explicit, launch one SIMD group:
+    a launch ``num_warps`` doesn't change, whose ``num_warps`` SIMD groups
+    split the register runs' K loops (``mpp_registers.register_split``)."""
+    threads = config.get("num_threads")
+    if (
+        metal_matmul(config) != "mpp"
+        or not isinstance(threads, list)
+        or len(threads) != len(config_spec.num_threads)
+        or not all(isinstance(t, int) and t > 0 for t in threads)
+    ):
+        return False
+    return _launch(config_spec, config, MAX_THREADS_PER_THREADGROUP)[2] == SIMD_WIDTH
+
+
 def fit_threads(config_spec: ConfigSpec, config: dict[str, object]) -> None:
     """Give a matmul config a threadgroup its matmuls run on: tiles over
     exactly one SIMD group for a fragment run, which each of the
@@ -316,37 +376,17 @@ def fit_threads(config_spec: ConfigSpec, config: dict[str, object]) -> None:
     if metal_matmul(config) == "scalar":
         # The scalar contraction runs on any threadgroup.
         return
-    facts = kernel_facts(config_spec)
     spec = config_spec.num_threads
-    blocks = config["block_sizes"]
     # Normalization leaves out counts that are all auto.
     threads = config.get("num_threads", [0] * len(spec))
-    assert isinstance(blocks, list) and isinstance(threads, list)
+    assert isinstance(threads, list)
     if not any(t > 0 for t in threads):
         # Every count on auto, as in the default config: left as it is.
         return
-    # A tile over a size-1 dimension runs on one thread.
-    sizes = [
-        1
-        if item.size_hint == 1
-        else int(config_spec.block_sizes.config_get(blocks, item.block_ids[0], 1))
-        for item in spec
-    ]
     budget = min(
         MAX_THREADS_PER_THREADGROUP, SIMD_WIDTH * tile_warps(config_spec, config)
     )
-    # Literal-size tiles take their threads first, one per element.
-    literal = math.prod(facts.literal_threads)
-    launch = literal * math.prod(
-        launch_threads(
-            [[spec.block_id_to_index(b) for b in loop] for loop in facts.thread_loops],
-            sizes,
-            threads,
-            budget,
-            fixed=facts.literal_threads,
-            to_one={spec.block_id_to_index(b) for b in facts.reduced_after_loop},
-        )
-    )
+    sizes, literal, launch = _launch(config_spec, config, budget)
     if metal_matmul(config) == "fragment":
         if launch == SIMD_WIDTH:
             return
@@ -468,7 +508,7 @@ class MetalSearchSurface(BackendSearchSurface):
             # its K loops (``fragment_split``).  One that leaves it out gets
             # 1, as fragment configs ran before K loops split, rather than
             # the default.  Where the K loops can't split
-            # (``fragment_mma.split_refusal``) the search's fragment configs
+            # (``operand_elements.split_refusal``) the search's fragment configs
             # take 1, and a config setting another value fails, saying why.
             config["num_warps"] = 1
 
@@ -514,6 +554,20 @@ class MetalSearchSurface(BackendSearchSurface):
             config.pop("range_num_stages", None)
         if fix_invalid and kernel_facts(config_spec).thread_loops:
             fit_threads(config_spec, config)
+        if (
+            "num_warps" not in provided_keys
+            and kernel_facts(config_spec).register_splits
+            and mpp_one_simdgroup(config_spec, config)
+        ):
+            # An MPP config whose counts launch one SIMD group splits its
+            # register runs' K loops over its num_warps SIMD groups
+            # (``mpp_registers.register_split``), where the kernel lets them
+            # split and nothing else of the launch draws on num_warps
+            # (``register_splits``).  One that leaves num_warps out gets 1,
+            # as such configs ran before, rather than the default.  Last, so
+            # the counts read are the ones codegen reads: flat, whole, and
+            # past the clamp of bounded blocks and fit_threads.
+            config["num_warps"] = 1
 
 
 METAL_SEARCH_SURFACE = MetalSearchSurface()

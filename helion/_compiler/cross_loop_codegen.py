@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 import dataclasses
+import logging
 import math
 from typing import TYPE_CHECKING
 from typing import TypeGuard
@@ -24,6 +25,13 @@ from .ast_extension import create
 from .ast_extension import expr_from_string
 from .ast_extension import statement_from_string
 from .compile_environment import CompileEnvironment
+from .cross_loop_dsmem import CLUSTER_FLAG
+from .cross_loop_dsmem import CLUSTER_READY
+from .cross_loop_dsmem import check_dispatch
+from .cross_loop_dsmem import config_fallback
+from .cross_loop_dsmem import dsmem_transports
+from .cross_loop_dsmem import dsmem_worker_count
+from .cross_loop_dsmem import split_task
 from .cross_loop_report import RootNames
 from .cross_loop_report import log_root_barriers
 from .cross_loop_report import log_schedule
@@ -74,6 +82,7 @@ if TYPE_CHECKING:
     from .tile_dependency import TileAccess
     from .tile_dependency import TileDependencyGraph
 
+log = logging.getLogger(__name__)
 
 # Independent readiness counters occupy distinct cache lines so polling one
 # dependency does not contend with publication to another. Cross-loop event
@@ -85,7 +94,6 @@ _CROSS_LOOP_COUNTER_DTYPE = torch.uint32
 _CROSS_LOOP_COUNTER_ALIGNMENT_WORDS = (
     _CROSS_LOOP_COUNTER_ALIGNMENT_BYTES // _CROSS_LOOP_COUNTER_DTYPE.itemsize
 )
-
 
 # One 128-byte line per uint64 peer_counter slot.
 _PEER_SLOT_WORDS = _CROSS_LOOP_COUNTER_ALIGNMENT_BYTES // torch.uint64.itemsize
@@ -436,12 +444,14 @@ def _covering(
     allocations: frozenset[int],
     publication: bool = False,
 ) -> list[ast.stmt]:
-    """``wait``, recorded as ordering reads of ``allocations`` only (and, with
+    """``wait``, recorded as ordering accesses of ``allocations`` only (any
+    access a partition makes of them, reads or writes; and, with
     ``publication``, its root's barrier publication).  An allocation no tensor
-    argument names is one no partition can tell it reads: the wait stays
-    ordering every access."""
-    if not allocations <= set(_argument_allocations(device_function).values()):
-        return wait
+    argument names is one no partition can tell it reads: such a wait keeps
+    ordering every access.  ``gluon_ring._orders`` checks that when a partition
+    reads the covers, since a wait emitted before the access that registers a
+    tensor's argument (a barrier before a loop's first access of it) may
+    cover it."""
     for name in _stored_names(wait) & device_function.sync_names("wait"):
         role = device_function.sync_roles[name]
         role.covers, role.publication = allocations, publication
@@ -1055,15 +1065,19 @@ def tagged_allocations(device_function: DeviceFunction) -> frozenset[int]:
 
 
 def tagged_codegen_graph(device_function: DeviceFunction) -> TileDependencyGraph | None:
-    """The dependency graph whose transport is "tagged" for the enabled ones."""
+    """The dependency graph whose transport is "tagged" (or "cluster") for the
+    allocations this config enables."""
     if device_function.codegen_dependency_graph is None:
         graph = HostFunction.current().device_ir.tile_dependency_graph
         if graph is None:
             return None
         tagged = tagged_allocations(device_function)
+        cluster = frozenset(dsmem_transports(device_function))
         device_function.codegen_dependency_graph = (
-            dataclasses.replace(graph, tagged_allocation_ids=tagged)
-            if tagged
+            dataclasses.replace(
+                graph, tagged_allocation_ids=tagged, dsmem_allocation_ids=cluster
+            )
+            if tagged or cluster
             else graph
         )
     return device_function.codegen_dependency_graph
@@ -1138,6 +1152,30 @@ class TaggedMirror:
 
 
 @dataclasses.dataclass(frozen=True)
+class Mailbox:
+    """An in-band allocation's words in every rank's state: from word
+    ``offset``, one ``words``-word slot per source rank in each of ``phases``
+    launch phases, ``lanes`` elements a word; ``pair``: stores may write
+    16-byte word pairs.
+
+    ``lane_bits`` set: Lamport words, each lane ``enc(x) = bits(x) ^ key``
+    (``LAMPORT_KEYS``), so a lane is zero only until it is written; three
+    phases, a reader zeroing what it read one phase back (``PeerState.rearm``).
+    None: each word carries 32 bits of elements and its launch epoch; two
+    phases (the epoch's parity)."""
+
+    offset: int
+    words: int
+    lanes: int
+    pair: bool
+    lane_bits: int | None = None
+
+    @property
+    def phases(self) -> int:
+        return 2 if self.lane_bits is None else 3
+
+
+@dataclasses.dataclass(frozen=True)
 class PeerState:
     """Symmetric uint64 state: inband mailboxes, peer counters and a done slot.
 
@@ -1150,9 +1188,7 @@ class PeerState:
     ptrs: str
     rank: str
     bases: tuple[str, ...]
-    # allocation id -> (first word, words per slot, elements per word, whether
-    # stores may write 16-byte word pairs)
-    mailboxes: dict[int, tuple[int, int, int, bool]]
+    mailboxes: dict[int, Mailbox]
     slots: dict[int, int]
     done: int
     scatters: dict[int, Scatter] = dataclasses.field(default_factory=dict)
@@ -1166,11 +1202,33 @@ class PeerState:
     votes: int = 0
 
     def mailbox(self, allocation_id: int, source: object) -> str:
-        """Word offset of ``source``'s slot for this launch's parity."""
-        offset, words, _, _ = self.mailboxes[allocation_id]
+        """Word offset of ``source``'s slot for this launch's phase."""
+        box = self.mailboxes[allocation_id]
+        phase = f"{self.epoch} & 1" if box.phases == 2 else f"{self.epoch} % 3"
         return (
-            f"{offset} + tl.cast({self.epoch} & 1, tl.int64) * "
-            f"{len(self.bases) * words} + {source} * {words}"
+            f"{box.offset} + tl.cast({phase}, tl.int64) * "
+            f"{len(self.bases) * box.words} + {source} * {box.words}"
+        )
+
+    def rearm(self, allocation_id: int) -> str:
+        """Word offset from a Lamport mailbox's slot to the previous launch's,
+        which a poll zeroes once it holds this launch's words.
+
+        Those words prove the source's previous launch over, every copy of
+        every store included: a kernel with cross-loop state waits on the
+        previous launch at entry (``PdlStateWithoutWait``), so its stores
+        follow that launch's end.  In launch n the reader re-arms slot n - 1,
+        which the source next writes in launch n + 2, after reading this
+        rank's pushes of launch n + 1 (every rank polls every word of a
+        candidate), which follow launch n.  Several readers of a word store the
+        same zeros, to a slot nobody reads this launch.  The epoch is a uint64:
+        ``% 3`` never wraps.
+        """
+        box = self.mailboxes[allocation_id]
+        assert box.lane_bits is not None
+        return (
+            f"tl.where({self.epoch} % 3 == 0, 2, -1).to(tl.int64) * "
+            f"{len(self.bases) * box.words}"
         )
 
     def mirror(self, allocation_id: int) -> str:
@@ -1223,19 +1281,41 @@ def peer_state(device_function: DeviceFunction) -> PeerState | None:
     def block_size(block_id: int) -> int:
         return env.block_sizes[block_id].from_config_int(config)
 
-    mailboxes: dict[int, tuple[int, int, int, bool]] = {}
+    mailboxes: dict[int, Mailbox] = {}
     words = 0
+    # One protocol per Lamport candidate, in allocation id order.
+    choices = cast("list[str]", config.config.get("cross_loop_inband_protocol") or [])
+    enabled = {
+        allocation_id
+        for allocation_id, choice in zip(
+            sorted(graph.lamport_candidate_ids), choices, strict=False
+        )
+        if choice == "lamport"
+    }
     for allocation_id in sorted(graph.inband_allocation_ids):
-        # Sub-word elements share a tagged word when tile rows align to it.
+        # Sub-word elements share a tagged word when tile rows align to it; a
+        # Lamport word (a candidate the config enables) holds 8 bytes of them.
         store = graph.inband_store(allocation_id)
         assert store.dtype is not None
         row = graph.inband_row(store, block_size)
-        lanes = 4 // store.dtype.itemsize
+        itemsize = store.dtype.itemsize
+        lamport = allocation_id in enabled and row % (8 // itemsize) == 0
+        if allocation_id in enabled and not lamport:
+            log.info(
+                "cross_loop_inband_protocol: allocation %d keeps epoch words: "
+                "its tiles' rows of %d elements do not fill 8-byte words",
+                allocation_id,
+                row,
+            )
+        lanes = (8 if lamport else 4) // itemsize
         lanes = lanes if row % lanes == 0 else 1
         size = graph.inband_numel(allocation_id) // lanes
         pair = row % (2 * lanes) == 0 and size % 2 == 0
-        mailboxes[allocation_id] = (words, size, lanes, pair)
-        words += 2 * world_size * size
+        box = Mailbox(words, size, lanes, pair, 8 * itemsize if lamport else None)
+        mailboxes[allocation_id] = box
+        words += box.phases * world_size * size
+        # Each mailbox starts at a 16-byte boundary, for word pairs.
+        words += words % 2
     mirrors: dict[int, TaggedMirror] = {}
     for allocation_id in sorted(graph.tagged_allocation_ids):
         # A mirror word holds lanes elements of one producer tile (T1, T2); a
@@ -1445,9 +1525,10 @@ def _presence_layout(
 
 
 def _worker_count(device_function: DeviceFunction) -> int:
-    return CompileEnvironment.current().config_spec.num_sm * cast(
-        "int", device_function.config.get("num_sm_multiplier", 1)
+    num_sm = dsmem_worker_count(
+        device_function, CompileEnvironment.current().config_spec.num_sm
     )
+    return num_sm * cast("int", device_function.config.get("num_sm_multiplier", 1))
 
 
 def _scatter_layout(
@@ -1553,7 +1634,8 @@ def _outline_cross_loop_region(
     # Warp specialization (Triton's, or the ring kernel's partitions) changes
     # kernel-wide thread participation. Keep scheduler helpers inline so Triton
     # lowers their explicit and implicit barriers for the caller's active warp
-    # group rather than the physical CTA.
+    # group rather than the physical CTA; and a region with dsmem ops, whose
+    # shared memory is a symbol of the kernel's scope.
     config = device_function.config
     helper_name, arguments = device_function.register_triton_outlined_helper(
         name_hint,
@@ -1563,9 +1645,41 @@ def _outline_cross_loop_region(
         and not (
             any(CompileEnvironment.current().backend.range_warp_specializes(config))
             or device_function.ring is not None
+            or _calls_cluster_ops(device_function, body)
         ),
     )
     return statement_from_string(f"{helper_name}({', '.join(arguments)})")
+
+
+def _calls_cluster_ops(device_function: DeviceFunction, body: list[ast.stmt]) -> bool:
+    """Whether ``body`` calls a dsmem op (``_helion_gluon.cluster_*``), also
+    through an outlined helper it calls."""
+    helpers = {
+        name: helper_body
+        for name, _, helper_body, _ in device_function.triton_outlined_helpers
+    }
+    seen: set[str] = set()
+    pending = [body]
+    while pending:
+        for node in (n for s in pending.pop() for n in ast.walk(s)):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            if (
+                isinstance(func, ast.Attribute)
+                and isinstance(func.value, ast.Name)
+                and func.value.id == "_helion_gluon"
+                and func.attr.startswith("cluster_")
+            ):
+                return True
+            if (
+                isinstance(func, ast.Name)
+                and func.id in helpers
+                and func.id not in seen
+            ):
+                seen.add(func.id)
+                pending.append(list(helpers[func.id]))
+    return False
 
 
 def _outline_opaque_tile_body(
@@ -1607,16 +1721,23 @@ def _triton_root_requires_kernel_scope(
     """
     if target_device_capability is None or target_device_capability[0] < 10:
         return False
+    # Gluon ring sites (``gluon_ring`` / ``gluon_ops`` in generated code) carry
+    # the kernel's ring step and TMEM accumulators.
+    return _calls_module(
+        body,
+        {"tl": {"dot", "dot_scaled"}, "_helion_ring": None, "_helion_gluon": None},
+    )
+
+
+def _calls_module(body: list[ast.stmt], names: dict[str, set[str] | None]) -> bool:
+    """Whether ``body`` calls ``module.<name>`` for a module of ``names`` and one
+    of its names (any name when None)."""
     return any(
         isinstance(node, ast.Call)
         and isinstance(node.func, ast.Attribute)
         and isinstance(node.func.value, ast.Name)
-        and (
-            (node.func.value.id == "tl" and node.func.attr in {"dot", "dot_scaled"})
-            # Gluon ring sites (``gluon_ring`` / ``gluon_ops`` in generated
-            # code) carry the kernel's ring step and TMEM accumulators.
-            or node.func.value.id in {"_helion_ring", "_helion_gluon"}
-        )
+        and node.func.value.id in names
+        and ((attrs := names[node.func.value.id]) is None or node.func.attr in attrs)
         for statement in body
         for node in ast.walk(statement)
     )
@@ -2011,13 +2132,95 @@ def _reuse_guard_values(body: list[ast.stmt], candidates: set[int]) -> None:
         assign(target, number)
 
 
-def _stored_names(nodes: Iterable[ast.AST]) -> set[str]:
+def _stored_names(
+    nodes: Iterable[ast.AST], renames: Mapping[str, str] | None = None
+) -> set[str]:
+    """The names ``nodes`` store (as ``renames`` maps them)."""
+    renames = renames or {}
     return {
-        node.id
+        renames.get(node.id, node.id)
         for root in nodes
         for node in ast.walk(root)
         if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store)
     }
+
+
+def _free_reads(
+    statements: Sequence[ast.stmt],
+    bound: frozenset[str] = frozenset(),
+    skipped: frozenset[int] = frozenset(),
+    renames: Mapping[str, str] | None = None,
+) -> set[str]:
+    """The names ``statements`` may read before storing them (``bound`` is
+    stored on entry): a name stored on only some paths (one side of a branch,
+    a loop body) may still be read from before.  The bodies of the ``If``
+    nodes in ``skipped`` (by id) count as empty.  ``renames`` maps each name to
+    the one it will be emitted as: a value both branches of an ``if`` assign
+    has a name per branch until ``DeviceFunction``'s final rename merges them
+    (``DeviceFunction.variable_renames``)."""
+    return _read_and_stored(statements, bound, skipped, renames)[0]
+
+
+def _read_and_stored(
+    statements: Sequence[ast.stmt],
+    bound: frozenset[str],
+    skipped: frozenset[int] = frozenset(),
+    renames: Mapping[str, str] | None = None,
+) -> tuple[set[str], frozenset[str]]:
+    """(``_free_reads``, the names stored on every path through ``statements``
+    or in ``bound``)."""
+    renames = renames or {}
+
+    def loads(node: ast.AST) -> set[str]:
+        return {
+            renames.get(n.id, n.id)
+            for n in ast.walk(node)
+            if isinstance(n, ast.Name)
+            and (isinstance(n.ctx, ast.Load) or isinstance(node, ast.AugAssign))
+        }
+
+    free: set[str] = set()
+    stored = set(bound)
+    for statement in statements:
+        if isinstance(statement, ast.For):
+            free |= loads(statement.iter) - stored
+            inner = frozenset(stored | _stored_names([statement.target], renames))
+            free |= _read_and_stored(statement.body, inner, skipped, renames)[0]
+            free |= _read_and_stored(
+                statement.orelse, frozenset(stored), skipped, renames
+            )[0]
+        elif isinstance(statement, ast.While):
+            free |= loads(statement.test) - stored
+            free |= _read_and_stored(
+                statement.body, frozenset(stored), skipped, renames
+            )[0]
+            free |= _read_and_stored(
+                statement.orelse, frozenset(stored), skipped, renames
+            )[0]
+        elif isinstance(statement, ast.If):
+            free |= loads(statement.test) - stored
+            then_body = [] if id(statement) in skipped else statement.body
+            body, then = _read_and_stored(
+                then_body, frozenset(stored), skipped, renames
+            )
+            orelse, otherwise = _read_and_stored(
+                statement.orelse, frozenset(stored), skipped, renames
+            )
+            free |= body | orelse
+            stored |= then & otherwise
+        elif isinstance(statement, ast.With):
+            for item in statement.items:
+                free |= loads(item) - stored
+                stored |= _stored_names([item], renames)
+            body, always = _read_and_stored(
+                statement.body, frozenset(stored), skipped, renames
+            )
+            free |= body
+            stored |= always
+        else:
+            free |= loads(statement) - stored
+            stored |= _stored_names([statement], renames)
+    return free, frozenset(stored)
 
 
 def _all_names(nodes: Iterable[ast.AST]) -> set[str]:
@@ -2237,26 +2440,47 @@ def _dry_pass_rewrite(
 
 
 def _dry_pass_binds(
-    body: list[ast.stmt], guards: list[ast.If], bound: set[str]
+    body: list[ast.stmt],
+    guards: list[ast.If],
+    bound: set[str],
+    renames: Mapping[str, str] | None = None,
 ) -> bool:
-    """Whether every name a guard binds is read only under that guard."""
+    """Whether every name a guard binds is read only under that guard (names
+    as ``renames`` maps them, see ``_free_reads``)."""
+    renames = renames or {}
     guard_ids = {id(guard) for guard in guards}
+    bound = {renames.get(name, name) for name in bound}
     stores: dict[str, set[int]] = {name: {0} for name in bound}
     loads: list[tuple[str, int]] = []
 
     def visit(node: ast.AST, scope: int) -> None:
         scope = id(node) if id(node) in guard_ids else scope
         if isinstance(node, ast.Name):
+            name = renames.get(node.id, node.id)
             if isinstance(node.ctx, ast.Store):
-                stores.setdefault(node.id, set()).add(scope)
+                stores.setdefault(name, set()).add(scope)
             else:
-                loads.append((node.id, scope))
+                loads.append((name, scope))
         for child in ast.iter_child_nodes(node):
             visit(child, scope)
 
     for statement in body:
         visit(statement, 0)
-    return all(name not in stores or stores[name] & {0, scope} for name, scope in loads)
+    for name, scope in loads:
+        scopes = stores.get(name)
+        # Bound outside every guard or by its own; a guard reading what
+        # another guard binds reads a name Triton does not carry past that
+        # guard's ``if``, whatever binds it later outside the guards.
+        if scopes is not None and (
+            not scopes & {0, scope} or (scope != 0 and scopes - {0, scope})
+        ):
+            return False
+    # A guard may not run: a name it binds that is read outside it must be
+    # bound on every path that skips the guards.
+    guarded = {name for name, scopes in stores.items() if scopes - {0}}
+    return not guarded or not (
+        _free_reads(body, frozenset(bound), frozenset(guard_ids), renames) & guarded
+    )
 
 
 def emit_cross_loop_schedule(
@@ -2274,6 +2498,7 @@ def emit_cross_loop_schedule(
     pipeline = device_function.config.cross_loop_pipeline
     dependency_graph = tagged_codegen_graph(device_function)
     assert dependency_graph is not None
+    clusters = dsmem_transports(device_function)
     if dependency_graph.crosses_ranks() and pipeline == "barrier":
         raise AssertionError("cross-rank tile dependencies cannot use 'barrier'")
     if pipeline == "barrier":
@@ -2754,6 +2979,9 @@ def emit_cross_loop_schedule(
 
     dispatch_ticket: str | None = None
     peer_launch = ""
+    # This launch's announcement (before the first task loop) and the hold
+    # (before the first inband scatter store's block).
+    entry_announce: list[ast.stmt] = []
     entry_gate: list[ast.stmt] = []
     if not uses_packet_dispatch:
         assert state_arg is not None
@@ -2763,6 +2991,18 @@ def emit_cross_loop_schedule(
             *([] if timeline is None else timeline.setup(epoch_var, worker)),
         ]
         device_function.sync_roles[epoch_var] = SyncRole("launch")
+        if clusters:
+            # Rank 0's barriers (armed at entry) are this launch's once its
+            # flag holds the launch's epoch, tagged with this kernel's state,
+            # and its cluster's id (the ring moves this after its read).
+            device_function.sync_roles[CLUSTER_FLAG] = SyncRole("cluster")
+            device_function.sync_roles[CLUSTER_READY] = SyncRole("cluster")
+            result.append(
+                statement_from_string(
+                    f"{CLUSTER_FLAG} = _helion_gluon.cluster_flag("
+                    f"{epoch_var}, {state_arg})"
+                )
+            )
         if peer is not None:
             device_function.sync_roles[peer.epoch] = SyncRole("launch")
             # uint64 so peer targets never wrap.  Every worker counts its own
@@ -2780,8 +3020,8 @@ def emit_cross_loop_schedule(
                 statement_from_string(f"{peer.epoch} = tl.load({peer_launch}) + 1")
             )
             if peer.scatters:
-                # Read the hold flag now; its wait runs once the first loop's
-                # prologue loads are in flight.
+                # Read the hold flag now; its wait runs where the first scatter
+                # store's block starts.
                 held = device_function.new_var("tile_dependency_peer_held", dce=False)
                 result.append(
                     statement_from_string(
@@ -2789,9 +3029,14 @@ def emit_cross_loop_schedule(
                         f" == {peer.epoch}"
                     )
                 )
-                # Announce this launch, then wait out last launch's reads of rows
-                # no task wrote, which this launch may now overwrite.
-                entry_gate = [
+                # Announce this launch where the first root's block starts;
+                # before the first scatter store's block, wait out last
+                # launch's reads of rows no task wrote, which this launch's
+                # scatters may now overwrite.  Until then the roots write no
+                # scatter row, so their loads need not wait; nor do partitions
+                # that access none of the scattered allocations (the wait
+                # covers those).
+                entry_announce = [
                     create(
                         ast.If,
                         test=expr_from_string(f"{worker} == 0"),
@@ -2805,12 +3050,26 @@ def emit_cross_loop_schedule(
                         ],
                         orelse=[],
                     ),
-                    _bound_wait(
-                        device_function,
-                        f"helion_dist_utils._hold_after_fallback({peer.state}, "
-                        f"{peer.started}, {world_size}, {peer.epoch}, {held})",
-                    ),
                 ]
+                assert dependency_graph is not None
+                scattered = frozenset(
+                    allocation
+                    for access_id, allocation in _access_allocations().items()
+                    if dependency_graph.accesses[access_id].allocation_id
+                    in peer.scatters
+                )
+                assert scattered, "an inband scatter allocation has its store"
+                entry_gate = _covering(
+                    device_function,
+                    [
+                        _bound_wait(
+                            device_function,
+                            f"helion_dist_utils._hold_after_fallback({peer.state}, "
+                            f"{peer.started}, {world_size}, {peer.epoch}, {held})",
+                        )
+                    ],
+                    scattered,
+                )
     else:
         assert dispatch_ticket_arg is not None
         raw_dispatch_ticket = device_function.new_var(
@@ -3161,6 +3420,12 @@ def emit_cross_loop_schedule(
                 for edge in dependency_graph.edges
                 if edge.producer_root == root
             }
+            # (A hint load's later writers no longer wait for it: no edge.)
+            | {
+                allocation_id
+                for hint_root, allocation_id in dependency_graph.unordered_hint_reads
+                if hint_root == root
+            }
             | {
                 edge.allocation_id
                 for edge in dependency_graph.edges
@@ -3216,6 +3481,37 @@ def emit_cross_loop_schedule(
             guarded_extents[root] = extent
             if _all_names(extent.hoisted) & settled & access_names[True]:
                 settled_extents.add(root)
+    if clusters and (uses_packet_dispatch or static_pipeline_plan.continuation_roots):
+        # Of the whole config: every entry goes off at once.
+        raise config_fallback(
+            clusters,
+            "C2: packet dispatch" if uses_packet_dispatch else "C2: continuations",
+        )
+    for transport in clusters.values():
+        for root in (transport.store.root, transport.load.root):
+            unfit = (
+                "not resident"
+                if root not in static_pipeline_plan.resident_roots
+                else "a guarded extent"
+                if root in guarded_extents
+                else "claimed tasks"
+                if root in claim_indices
+                else "L2 grouping"
+                if isinstance(owner.cases[root], L2GroupingProgramIDs)
+                else "reordered tasks"
+                if static_pipeline_plan.execution_orders[root] != root_task_orders[root]
+                or root in scheduled_task_roots
+                else None
+            )
+            if unfit is not None:
+                raise transport.fallback(f"C2: root {root}: {unfit}")
+    split_multipliers = check_dispatch(
+        clusters,
+        config=device_function.config,
+        domains=root_domains,
+        geometries=case_geometries,
+        workers=launch_worker_count,
+    )
     if tagged := dependency_graph.tagged_allocation_ids:
         failure = tagged_coverage_failure(dependency_graph, tagged, guarded_extents)
         if failure is not None:
@@ -3283,7 +3579,10 @@ def emit_cross_loop_schedule(
                 frozenset(reachable),
                 guards,
             )
-            return rewritten if _dry_pass_binds(rewritten, guards, bound) else None
+            binds = _dry_pass_binds(
+                rewritten, guards, bound, device_function.variable_renames()
+            )
+            return rewritten if binds else None
 
         helper_bodies = {
             name: rewrite(helpers[name][1], set(helpers[name][0])) for name in reachable
@@ -4065,6 +4364,15 @@ def emit_cross_loop_schedule(
         placed like the covered readiness waits.  ``root_arrival``: the
         worker's root-barrier arrival, made with its last task's arrivals."""
         body: list[ast.stmt] = []
+        if root in dsmem_producers:
+            # Before any send, rank 0's barriers are this launch's.
+            assert state_arg is not None
+            body.append(
+                statement_from_string(
+                    f"{CLUSTER_READY} = _helion_gluon.cluster_ready("
+                    f"{epoch_var}, {state_arg})"
+                )
+            )
         extent = guarded_extents.get(root)
         root_body = case_bodies[root] if extent is None else extent.body
         has_task_scheduling = root in nested_loop_counters_by_consumer
@@ -4448,7 +4756,38 @@ def emit_cross_loop_schedule(
         run.append(resident)
         lanes_end = root_lane_origins[resident] + tasks
 
+    dsmem_producers = {t.store.root: t for t in clusters.values()}
+    dsmem_consumers = {t.load.root: t for t in clusters.values()}
+
     def root_lane(root: int) -> str:
+        if (transport := dsmem_producers.get(root)) is not None:
+            # The key of the lane rank 0 of the worker's cluster would take
+            # (that lane over the cluster size), and the worker's rank on the
+            # split axis: one cluster runs the tasks of one key (a bijection,
+            # single wave).
+            size = transport.size
+            leader = f"(({worker}) // {size} * {size})"
+            return (
+                "("
+                + split_task(
+                    f"({rotated_lane(root, leader)}) // {size}",
+                    f"({worker}) % {size}",
+                    size,
+                    split_multipliers[transport.allocation_id],
+                )
+                + ")"
+            )
+        if (transport := dsmem_consumers.get(root)) is not None:
+            # Rank 0 takes the key whose producer tasks its cluster runs.
+            size = transport.size
+            return (
+                f"tl.where(({worker}) % {size} == 0, "
+                f"({rotated_lane(transport.store.root, worker)}) // {size}, "
+                f"{launch_worker_count})"
+            )
+        return rotated_lane(root, worker)
+
+    def rotated_lane(root: int, worker: str) -> str:
         # A root begins mid-wave, where the earlier roots' live tasks end
         # (without packing, only trailing roots): rotate workers onto its
         # lanes. Waves and slots stay the plan's; only a lane's worker moves.
@@ -4929,9 +5268,33 @@ def emit_cross_loop_schedule(
 
     if not uses_packet_dispatch:
         assert state_arg is not None
-        for root in static_pipeline_plan.resident_roots:
+        blocks: dict[int, list[ast.stmt]] = {}
+        resident_roots = static_pipeline_plan.resident_roots
+        # A continuation root's tasks run in the block of whichever producer
+        # arrives last.
+        hosts: dict[int, set[int]] = {}
+        for plan in static_pipeline_plan.readiness_counters:
+            if (consumer := plan.continuation_consumer) is not None:
+                hosts.setdefault(consumer.consumer_root, set()).update(
+                    producer.producer_root for producer in plan.producers
+                )
+
+        def host(root: int) -> int:
+            """The earliest block that may run ``root``'s tasks (blocks follow
+            root order)."""
+            return min(map(host, hosts[root])) if root in hosts else root
+
+        gate_root = (
+            min(map(host, peer.scatter_roots), default=None)
+            if peer is not None
+            else None
+        )
+        for root in resident_roots:
             body = static_root_body(root)
-            # The gate precedes the first task loop, after its hoisted loads.
+            # The gates precede the first task loop, after the loads hoisted
+            # above it, at kernel scope (a root on fewer workers than the
+            # launch has its loop inside the membership test: the gates open
+            # its block).
             first = next(
                 (
                     i
@@ -4940,9 +5303,31 @@ def emit_cross_loop_schedule(
                 ),
                 0,
             )
-            result.extend([*body[:first], *entry_gate, *body[first:]])
-            entry_gate = []
-        assert not entry_gate, "inband scatters need a resident root"
+            gates = [
+                *(entry_announce if root == resident_roots[0] else ()),
+                *(entry_gate if root == gate_root else ()),
+            ]
+            blocks[root] = [*body[:first], *gates, *body[first:]]
+        assert not entry_gate or gate_root in blocks, (
+            "inband scatters need a resident root"
+        )
+        # A trigger between loops (``hl.pdl_launch_dependents()``): each worker
+        # lets the next launch start once it reaches the root's block (or the
+        # first resident one after it), at kernel scope so that every worker
+        # does, member or not.
+        env = CompileEnvironment.current()
+        trigger_root = (
+            None
+            if env.pdl_trigger_root is None
+            else next((r for r in resident_roots if r >= env.pdl_trigger_root), None)
+        )
+        if trigger_root is not None:
+            blocks[trigger_root].insert(
+                0,
+                statement_from_string(env.backend.pdl_instruction("launch_dependents")),
+            )
+            device_function.pdl_trigger_placed = True
+        result.extend(statement for block in blocks.values() for statement in block)
         _reuse_guard_values(result, guard_statements)
         writes: list[ast.stmt] = [
             statement_from_string(f"tl.store({state_arg} + {worker}, {epoch_var})")

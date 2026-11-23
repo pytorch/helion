@@ -21,6 +21,7 @@ from ..._utils import next_power_of_2
 from ..per_thread_planning import MAX_THREADS_PER_BLOCK
 
 if TYPE_CHECKING:
+    from collections.abc import Iterable
     from collections.abc import Mapping
 
 # Threads of one warp: argmin/argmax reduce within one
@@ -100,6 +101,30 @@ def fits_row_packets(
         return True
     max_bytes = 32 if capability is not None and capability >= (10, 0) else 16
     return vector_width * row_itemsize <= max_bytes
+
+
+# The ``cute_reduction_sequence`` values that combine a device loop's tile
+# across the threads of its lane axis.
+THREADED_SEQUENCES = ("reload", "resident")
+
+
+def sequence_tile_holds_warp_lanes(block_sizes: Iterable[object]) -> bool:
+    """Whether one of the tiles a reduction sequence runs on, of the given
+    ``block_sizes``, is large enough for the threaded sequences
+    (``THREADED_SEQUENCES``); a size that is no integer (a block without a
+    block size of its own) counts as large enough.
+
+    They combine the tile across a power-of-two number of whole warps on its
+    lane axis, each thread walking a lane loop of two or more elements
+    (``resident_sequence.sequence_reduction_expr`` refuses any other
+    layout), so the tile holds two warps' elements or more.  A config whose
+    tiles are all smaller compiles no ``reload`` or ``resident`` sequence,
+    whatever its threads: normalization runs it ``scalar``
+    (``_normalize_cute_lane_knobs``), and so does the flat repair after a
+    shrink (``CuteConfigGenerationExtension.repair_flat_config``)."""
+    return any(
+        type(size) is not int or size >= 2 * WARP_THREADS for size in block_sizes
+    )
 
 
 # The most lanes a persistent row's thread walks as several vectors

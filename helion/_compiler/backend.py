@@ -379,7 +379,8 @@ class Backend(abc.ABC):
     @property
     def supports_inter_loop_barriers(self) -> bool:
         """Whether a barrier can be placed between sibling device loops that
-        write and then read the same tensor (``needs_barrier_before``)."""
+        write and then read the same tensor (``needs_barrier_before``), or
+        with ``intra_loop_barriers_order_reads`` read and then write it."""
         return False
 
     @property
@@ -392,18 +393,53 @@ class Backend(abc.ABC):
         return False
 
     def supports_intra_loop_barriers(self, *, in_divergent_control_flow: bool) -> bool:
-        """Whether a load that reads a tensor an earlier store of the same
-        body wrote can be preceded by a barrier; ``in_divergent_control_flow``
-        asks about a load inside a branch whose condition may differ across
-        the threads that would synchronize."""
+        """Whether a load that may read what a store wrote, earlier in the
+        same body, in an earlier iteration or through device pointers
+        (``mark_intra_loop_raw_barriers``), can be preceded by a barrier, as
+        can a write after a read or a store with
+        ``intra_loop_barriers_order_reads``; ``in_divergent_control_flow``
+        asks about an access inside a branch whose condition may differ
+        across the threads that would synchronize."""
         return False
 
     @property
     def intra_loop_barriers_order_atomics(self) -> bool:
-        """Whether a load after an atomic of its loop body takes the barrier
-        ``mark_intra_loop_raw_barriers`` asks for, as one after a store does;
-        a backend whose own barrier pass orders atomics says False."""
+        """Whether atomics take part in the barriers
+        ``mark_intra_loop_raw_barriers`` asks for: a load after an atomic of
+        its loop body takes one, as one after a store does, and so does an
+        atomic after a store (or an atomic it does not commute with) that may
+        reach its target; a backend whose own barrier pass orders atomics
+        says False."""
         return True
+
+    @property
+    def intra_loop_barriers_carry_iterations(self) -> bool:
+        """Whether a load in a device loop's body takes the barrier
+        ``mark_intra_loop_raw_barriers`` asks for when a store late in an
+        earlier iteration may reach it, as one after an earlier store of the
+        same iteration does; a backend whose own barrier pass orders the
+        accesses of consecutive iterations says False (the walk still carries
+        a loop that accesses memory through device pointers, which may reach
+        any storage)."""
+        return True
+
+    @property
+    def intra_loop_barriers_order_flat_loads(self) -> bool:
+        """Whether the barrier walk orders the packed quantized loads
+        (``flat_offset_loads``) as loads of anywhere in their tensor: a
+        pending store's barrier moves to such a load, so only a backend whose
+        packed-load codegen places the barrier the walk marks says True; with
+        False the hazard stays pending for the next access."""
+        return False
+
+    @property
+    def intra_loop_barriers_order_reads(self) -> bool:
+        """Whether a store (or atomic, or snippet) after another thread's read
+        of its storage takes the barrier ``mark_intra_loop_raw_barriers``
+        asks for, as does a later sibling loop that writes what an earlier
+        one read (a write-after-read); and a store after another thread's
+        store it may overwrite, and such a sibling loop (a write-after-write)."""
+        return False
 
     @property
     def lowers_chunk_unbind(self) -> bool:
@@ -1244,7 +1280,9 @@ class Backend(abc.ABC):
         the early stop of a differential-evolution search counts such a move
         of its best reading as no improvement
         (``DifferentialEvolutionSearch._stop_tolerance``). A
-        search whose best initial reading is at or above it, and every
+        search whose best initial reading is at or above it (unless it is
+        behind a benchmark prelude, ``helion.autotuner.benchmark_prelude``,
+        where it moves to the trace whatever that reading), and every
         search with ``None``, keeps the event timer and the fixed
         ``min_improvement_delta``. A backend answers ``None`` for a search
         that re-times its members with another timer than the benchmark

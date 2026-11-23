@@ -44,7 +44,19 @@ The jobs:
 - ``bench``: ``bench.py`` for one (repro, shape) once its autotunes have
   finished, whether or not they succeeded (a backend without a usable
   autotune record fails on its own; the other implementations are timed),
-  written to ``<run>/bench/<repro>__<shape>.json``.
+  written to ``<run>/bench/<repro>__<shape>.json``. With ``--bench-repeats
+  N`` a point has N bench jobs, each a fresh process with a cache directory
+  (and so an Inductor cache) and a placement of its own, written to
+  ``<run>/bench/<repro>__<shape>.r<k>.json``; every rule below about a
+  bench holds for each of them. Once none of a point's repeats is left to
+  run, ``<repro>__<shape>.json`` is written as the aggregate of those that
+  are ok (``common.aggregate_bench_records``: each implementation's median
+  over the processes, with the per-process values and Inductor picks; the
+  ``bench_aggregate`` event names the records it counts, leaves out and
+  misses). ``report.py`` takes a point's ratio from it process by process
+  (README, Baseline). A repeat that starts again sets the aggregate aside
+  as ``<record>.prev``, like its own record, and a restart writes it again
+  when the records it is of have changed (another count of repeats, say).
 
 A ``provisional`` autotune record, an earlier run's Triton record that
 ``plan_run.py --provisional-triton`` copied into the run, stands in for an
@@ -80,7 +92,9 @@ benched again when one of its autotunes runs again, is newer than its bench
 record, or is another record than the one that bench record's port was timed
 on. The last is judged by what the records hold, not by their dates
 (``common.timed_on_record``: a bench record names the kernels each port was
-pinned to), so it also holds for a record that was copied, removed or dated
+pinned to by the digests of their code, source-line comments apart where
+the bench record and the autotune record both hold the digests without
+them), so it also holds for a record that was copied, removed or dated
 oddly, and for a bench that left out a port of ``--backends`` which the
 benches now time and the point has an ok autotune record of (it ran with
 other ``--bench-impls``). Starting a job moves its previous record to
@@ -159,6 +173,27 @@ time (``bench_impls``). A finished bench does not run again for
 another N than their records have, or where the pass on N sets failed, it
 starts nothing for them and names them in a ``rotate_inputs_not_added``
 event (``--rebench`` runs them again).
+
+A baseline run is this with another environment's Python: the picks of a
+main run, benched beside the Inductor kernels that another Triton build
+compiles (fbtriton with ``TRITON_USE_META_WS=1``, the Triton-to-tile-IR
+fork with ``ENABLE_TILE=1``; the README's Other Triton builds says what the
+environment must contain). The jobs run under the interpreter that started
+the campaign and inherit its environment, the switches among it, each with
+empty cache directories of its own (``job_env``). The campaign names its
+Triton build and switches in the ``campaign_start`` event and, when it
+benches, in ``<run>/triton_backend.json`` (``RUN_BACKEND``): it stops
+before changing anything when a switch cannot be in effect
+(``common.check_triton_switches``) or when the run directory's benches are
+another build's or switch state's, so a restart from a shell without the
+baseline's environment adds no stock record to a baseline's run. A
+baseline run keeps the main run's listing of implementations, the default
+with ``--configs-from`` and ``--backends cute``
+(``inductor,inductor_cd,inductor_max,oracle,helion_cute,memcopy``), so that
+each is timed in the slot and between the neighbours it has in the main
+run's rounds. Where Helion cannot run in an environment, ``--phases bench
+--bench-impls inductor,inductor_cd,inductor_max,oracle,memcopy`` without
+``--configs-from`` benches that listing without the port.
 
 ``--seeds-from RUN`` pairs this run's searches with another run's, for a
 before/after comparison of two trees. On a large kernel the pick of a cold
@@ -252,11 +287,15 @@ class Job:
     attempt: int = 1
     avoid_gpu: str | None = None
     contaminated: tuple[str, ...] = ()
+    # Which of a point's bench processes this is under --bench-repeats
+    # (from 1); None for the one bench of a point without it.
+    repeat: int | None = None
 
     @property
     def key(self) -> str:
         suffix = f"__{self.backend}" if self.backend else ""
-        return f"{self.kind}:{self.repro}__{self.shape}{suffix}"
+        repeat = "" if self.repeat is None else f"#r{self.repeat}"
+        return f"{self.kind}:{self.repro}__{self.shape}{suffix}{repeat}"
 
 
 @dataclasses.dataclass
@@ -622,6 +661,66 @@ def job_env(
 # before the entry went): the entries of the selected records are then
 # those of the copies the run holds (``ConfigCopies.entries``).
 COPIED_CONFIGS = common.COPIED_CONFIGS
+# The Triton build and switch state whose benches a run directory holds
+# (``common.triton_identity``), written by the first campaign that benches
+# into it: a campaign started with another one stops before it changes
+# anything, so the records of a baseline run (fbtriton with
+# ``TRITON_USE_META_WS=1``, the Tile IR fork with ``ENABLE_TILE=1``) are
+# never mixed with a stock run's, also not by a restart from a shell
+# without the baseline's environment.
+RUN_BACKEND = "triton_backend.json"
+
+
+def foreign_run(run_dir: Path, backend: dict[str, Any] | None) -> str | None:
+    """Why a campaign of the Triton build ``backend``
+    (``common.triton_backend``) may not bench into ``run_dir``, or None:
+    the benches of one run directory are one build's in one switch state.
+
+    The directory's stamp (``RUN_BACKEND``) says whose it is. Without one,
+    the bench records that are there do: one that names its build
+    (``bench.py``'s ``triton_backend``: a bench by hand, or a run whose
+    stamp went) must name this campaign's, and one that names none is from
+    before records did and is taken for stock Triton's, so that no other
+    build goes on beside it, with its switch or as a baseline's control
+    without."""
+    # (Without a Triton the identity is empty.)
+    here = common.triton_identity(backend) or {}
+    stamp = run_dir / RUN_BACKEND
+    if stamp.exists():
+        standing = json.loads(stamp.read_text())
+        if standing == here:
+            return None
+        differs = sorted(
+            key for key in {*standing, *here} if standing.get(key) != here.get(key)
+        )
+        return (
+            f"{stamp} names another Triton build or switch state than this "
+            f"campaign's ({', '.join(differs)}: "
+            f"{[standing.get(key) for key in differs]} there, "
+            f"{[here.get(key) for key in differs]} here): the benches of one "
+            "run directory are one baseline's; give this one a --run-dir of "
+            "its own"
+        )
+    for path in sorted((run_dir / "bench").glob("*.json")):
+        record = json.loads(path.read_text())
+        if "triton_backend" in record:
+            theirs = common.triton_identity(record["triton_backend"]) or {}
+            if theirs != here:
+                return (
+                    f"{path} is of another Triton build or switch state "
+                    f"({common.triton_label(theirs)}) than this campaign's, and "
+                    f"{run_dir} names none ({RUN_BACKEND}): the benches of one "
+                    "run directory are one baseline's; give this one a "
+                    "--run-dir of its own"
+                )
+        elif backend is not None and backend["name"] != "stock":
+            return (
+                f"{run_dir} holds bench records and does not name the Triton "
+                f"build that made them ({RUN_BACKEND}): they are taken for "
+                f"stock Triton's, and a run with {backend['name']} needs a "
+                "--run-dir of its own"
+            )
+    return None
 
 
 class ConfigCopies(NamedTuple):
@@ -715,6 +814,17 @@ def main() -> None:
     parser.add_argument("--only", nargs="*", default=None, help="repro ids")
     parser.add_argument("--retune", action="store_true")
     parser.add_argument("--rebench", action="store_true")
+    parser.add_argument(
+        "--regime",
+        choices=common.REGIMES,
+        default=None,
+        help="how the autotunes of both backends time their candidates "
+        "(autotune.py --regime): 'port' times a kernel that runs behind "
+        "earlier kernels of its port behind those kernels; 'alone' times "
+        "every kernel alone after an L2 flush, as the runs before the regime "
+        "existed did, for a comparison with one of them (default: each "
+        "backend's own, port for cute and alone for triton)",
+    )
     parser.add_argument("--autotune-timeout-s", type=float, default=4 * 3600)
     parser.add_argument("--bench-timeout-s", type=float, default=3600)
     parser.add_argument(
@@ -758,6 +868,17 @@ def main() -> None:
         "(bench.py --rotate-inputs: rot_us)",
     )
     parser.add_argument(
+        "--bench-repeats",
+        type=int,
+        default=1,
+        metavar="N",
+        help="bench every point in N fresh processes (records <point>.r1.json "
+        "to <point>.rN.json), each with its own Inductor cache and placement, "
+        "and write <point>.json as their aggregate: every implementation's "
+        "median over the processes, with the per-process values "
+        "(common.aggregate_bench_records)",
+    )
+    parser.add_argument(
         "--retry-contaminated",
         type=int,
         default=2,
@@ -779,6 +900,22 @@ def main() -> None:
     phases = set(args.phases.split(","))
     run_dir = args.run_dir.resolve()
     configs_dir = run_dir / "configs"
+    # A plan (plan_run.py --write) copied into this run the earlier Triton
+    # records it reused, for the regime it was made for. The campaign takes
+    # such copies as finished autotunes, so its Triton autotunes must run in
+    # that regime too (a plan written before plans named one reused records
+    # tuned alone). A campaign that tunes no Triton port takes any regime.
+    plan_path = run_dir / "plan.json"
+    if plan_path.exists() and "triton" in backends and "autotune" in phases:
+        planned = json.loads(plan_path.read_text()).get("triton_regime", "alone")
+        triton_regime = args.regime or common.default_regime("triton")
+        if planned != triton_regime:
+            parser.error(
+                f"--regime: the plan of this run ({plan_path}) reused earlier "
+                f"Triton records for the regime {planned!r}, and this campaign "
+                f"would tune Triton ports in {triton_regime!r}; plan the run "
+                "again with plan_run.py --regime, or run in the plan's regime"
+            )
     # The implementations the benches time (bench.py --impls; None: all).
     bench_impls: str | None = args.bench_impls or None
     # --configs-from: the names of the selected records, what to do about
@@ -891,10 +1028,38 @@ def main() -> None:
             )
     if args.rotate_inputs < 0 or args.rotate_inputs == 1:
         parser.error(f"--rotate-inputs {args.rotate_inputs}: at least 2 input sets")
+    # The Triton build of this interpreter, which runs the jobs, and the
+    # switches the jobs inherit (common.TRITON_SWITCHES). A switch that
+    # cannot be in effect stops the campaign here, and so does a run
+    # directory whose benches another build or switch state made: its
+    # records, and the aggregates of its repeats, are one baseline's.
+    triton_backend = common.triton_backend()
+    try:
+        common.check_triton_switches(triton_backend)
+    except common.TritonSwitchError as error:
+        parser.error(str(error))
+    if "bench" in phases and (issue := foreign_run(run_dir, triton_backend)):
+        parser.error(issue)
+    if args.bench_repeats < 1:
+        parser.error(f"--bench-repeats {args.bench_repeats}: at least 1 process")
+    # The repeats of a point's bench (None: its one bench, as without the
+    # option).
+    repeats: list[int | None] = (
+        [None] if args.bench_repeats == 1 else list(range(1, args.bench_repeats + 1))
+    )
     bench_dir = run_dir / "bench"
     logs_dir = run_dir / "logs"
     for d in (configs_dir, bench_dir, logs_dir / "autotune", logs_dir / "bench"):
         d.mkdir(parents=True, exist_ok=True)
+    if "bench" in phases:
+        # Left only where none stands, and held against the one that does:
+        # another campaign may have started in the directory meanwhile.
+        if not (run_dir / RUN_BACKEND).exists():
+            common.leave_stamp(
+                run_dir / RUN_BACKEND, common.triton_identity(triton_backend) or {}
+            )
+        if issue := foreign_run(run_dir, triton_backend):
+            parser.error(issue)
 
     def config_file(repro: str, shape: str, backend: str) -> Path:
         return common.config_record_path(configs_dir, repro, shape, backend)
@@ -903,6 +1068,8 @@ def main() -> None:
         if job.kind == "autotune":
             assert job.backend is not None
             return config_file(job.repro, job.shape, job.backend)
+        if job.repeat is not None:
+            return common.bench_repeat_path(bench_dir, job.repro, job.shape, job.repeat)
         return common.bench_record_path(bench_dir, job.repro, job.shape)
 
     def set_aside(job: Job, suffix: str) -> Path:
@@ -1146,6 +1313,50 @@ def main() -> None:
             return not settle(job, None)
         return False
 
+    def set_aggregate_aside(repro: str, shape: str) -> None:
+        """Move a point's aggregate record to ``<record>.prev``: a repeat of
+        its bench starts again, or it is to be replaced."""
+        out = common.bench_record_path(bench_dir, repro, shape)
+        with stop_signals_deferred():
+            if out.exists():
+                out.replace(out.with_name(f"{out.name}.prev"))
+
+    def aggregate(repro: str, shape: str) -> None:
+        """Write a point's aggregate record from the ok records of its
+        repeats (``common.aggregate_bench_records``), unless the one that
+        is there is of those very records. Without an ok record the point
+        has no aggregate, like a point whose one bench failed."""
+        out = common.bench_record_path(bench_dir, repro, shape)
+        processes: dict[str, dict[str, Any]] = {}
+        digests: dict[str, str] = {}
+        names: list[str] = []
+        for repeat in repeats:
+            assert repeat is not None
+            path = common.bench_repeat_path(bench_dir, repro, shape, repeat)
+            names.append(path.name)
+            record = read(path)
+            if record is not None and record.get("status") == "ok":
+                processes[path.name] = record
+                digests[path.name] = hashlib.sha256(path.read_bytes()).hexdigest()
+        standing = read(out)
+        if standing is not None and (standing.get("aggregate") or {}).get(
+            "records"
+        ) == (digests or None):
+            return
+        set_aggregate_aside(repro, shape)
+        if not processes:
+            return
+        record = common.aggregate_bench_records(processes, digests)
+        common.write_json(out, record)
+        event(
+            kind="bench_aggregate",
+            point=f"{repro}__{shape}",
+            record=str(out),
+            processes=record["aggregate"]["counted"],
+            left_out=record["aggregate"]["left_out"],
+            missing=[name for name in names if name not in processes],
+        )
+
     if args.configs_from is not None:
         # The records byte for byte. Each copy is in COPIED_CONFIGS before
         # it is made, with the digest of the copy it replaces, and a removed
@@ -1206,6 +1417,9 @@ def main() -> None:
     # records lack the timing on that many sets: they have none, one on
     # another count of sets, or a pass on that count that failed.
     unrotated = []
+    # --bench-repeats: the repeats of each point that are still to finish,
+    # by job key. The point's aggregate record is written once none is left.
+    unaggregated: dict[tuple[str, str], set[str]] = {}
     for e in entries:
         repro, shape = e["repro"], e["shape"]
         deps = []
@@ -1215,27 +1429,40 @@ def main() -> None:
             deps.append(job.key)
             if "autotune" in phases and queue(job, args.retune):
                 autotune_pending = True
-        bench = Job("bench", repro, shape, None, tuple(deps))
-        bench_out = record_path(bench)
-        # A finished bench stands while none of the point's autotune records
-        # is newer than it or another record than its port was timed on: one
-        # that an autotune or --configs-from replaced, added or removed
-        # since, which the dates need not show (a copy of an older record, a
-        # clock that stepped back).
-        finished = read(bench_out) if ok(bench_out) else None
-        stale = finished is not None and not (
-            newer_than_all(bench_out, [config_file(repro, shape, b) for b in backends])
-            and timed_on_current(bench, finished)
-        )
-        if "bench" in phases:
-            queued = queue(bench, args.rebench or autotune_pending or stale)
-            if args.rotate_inputs and not queued:
-                decision = (read(bench_out) or {}).get("rotate_inputs") or {}
-                if (
-                    decision.get("sets") != args.rotate_inputs
-                    or decision["status"] == "error"
-                ):
-                    unrotated.append(bench_out.name)
+        for repeat in repeats:
+            bench = Job("bench", repro, shape, None, tuple(deps), repeat=repeat)
+            bench_out = record_path(bench)
+            # A finished bench stands while none of the point's autotune
+            # records is newer than it or another record than its port was
+            # timed on: one that an autotune or --configs-from replaced,
+            # added or removed since, which the dates need not show (a copy
+            # of an older record, a clock that stepped back).
+            finished = read(bench_out) if ok(bench_out) else None
+            stale = finished is not None and not (
+                newer_than_all(
+                    bench_out, [config_file(repro, shape, b) for b in backends]
+                )
+                and timed_on_current(bench, finished)
+            )
+            if "bench" in phases:
+                queued = queue(bench, args.rebench or autotune_pending or stale)
+                if queued and repeat is not None:
+                    unaggregated.setdefault((repro, shape), set()).add(bench.key)
+                if args.rotate_inputs and not queued:
+                    decision = (read(bench_out) or {}).get("rotate_inputs") or {}
+                    if (
+                        decision.get("sets") != args.rotate_inputs
+                        or decision["status"] == "error"
+                    ):
+                        unrotated.append(bench_out.name)
+        if (
+            "bench" in phases
+            and args.bench_repeats > 1
+            and (repro, shape) not in unaggregated
+        ):
+            # Every repeat has finished (in an earlier start, or with
+            # another count of repeats): the aggregate is of these records.
+            aggregate(repro, shape)
     if unrotated:
         event(
             kind="rotate_inputs_not_added",
@@ -1313,6 +1540,8 @@ def main() -> None:
                 job.shape,
                 "--backend",
                 job.backend,
+                # (unnamed: autotune.py's default for the backend)
+                *(["--regime", args.regime] if args.regime else []),
                 "--output",
                 str(out),
             ]
@@ -1338,6 +1567,9 @@ def main() -> None:
         # the superseded config. Its log goes along.
         if out.exists():
             set_aside(job, ".prev")
+        if job.repeat is not None:
+            # Nor the aggregate of the repeats that this one replaces.
+            set_aggregate_aside(job.repro, job.shape)
         if job.kind == "autotune":
             # The search logs of a start that left no record (stopped,
             # killed): the autotuner appends to the files it finds, and this
@@ -1389,8 +1621,10 @@ def main() -> None:
         if reason is not None:
             return
         if code == 0:
-            if settle(job.job, gpu):
-                done[job.job.key] = True
+            if not settle(job.job, gpu):
+                # Queued again: the point's aggregate waits for the rerun.
+                return
+            done[job.job.key] = True
         elif job.job.contaminated:
             # A retry that failed (timed out, ran out of memory) leaves the
             # cleanest attempt before it standing, flagged, as when every
@@ -1408,6 +1642,15 @@ def main() -> None:
             done[job.job.key] = True
         else:
             done[job.job.key] = False
+        if job.job.repeat is not None:
+            # The last of a point's repeats to finish, ok or not: the
+            # aggregate is of those that are ok.
+            point = (job.job.repro, job.job.shape)
+            left = unaggregated[point]
+            left.discard(job.job.key)
+            if not left:
+                del unaggregated[point]
+                aggregate(*point)
 
     def schedule() -> None:
         last_pick = 0.0
@@ -1541,7 +1784,14 @@ def main() -> None:
             )
         return problems
 
-    event(kind="campaign_start", jobs=len(pending), gpus=gpus, run_dir=str(run_dir))
+    event(
+        kind="campaign_start",
+        jobs=len(pending),
+        gpus=gpus,
+        run_dir=str(run_dir),
+        python=sys.executable,
+        triton_backend=triton_backend,
+    )
     error: BaseException | None = None
     try:
         schedule()

@@ -148,6 +148,15 @@ class TritonBackend(Backend):
     def orders_overlapping_inputs(self) -> bool:
         return True
 
+    @property
+    def intra_loop_barriers_order_reads(self) -> bool:
+        return True
+
+    @property
+    def intra_loop_barriers_order_flat_loads(self) -> bool:
+        # The packed-load codegen places the barrier (``quantized_ops.py``).
+        return True
+
     def supports_intra_loop_barriers(self, *, in_divergent_control_flow: bool) -> bool:
         # Triton branches are uniform per program, so the barrier is always
         # placeable.
@@ -236,7 +245,11 @@ class TritonBackend(Backend):
     def supports_config_key(self, key: str) -> bool:
         if key == "host_tensor_descriptors":
             return self.name == "triton" and _compat.supports_host_tensor_descriptor()
-        if key == "cross_loop_pipeline":
+        if key in (
+            "cross_loop_pipeline",
+            # distributed_ops lowers the in-band transport.
+            "cross_loop_inband_protocol",
+        ):
             return self.uses_triton_compiler and not _compat.is_hip()
         if key in ("load_cache_modifiers", "store_cache_modifiers"):
             return True
@@ -773,7 +786,10 @@ class TritonBackend(Backend):
             out.append("_rng_seed_buffer")
         from ..compile_environment import CompileEnvironment
         from ..cross_loop_codegen import tagged_codegen_graph
+        from ..cross_loop_dsmem import cluster_size
+        from ..cross_loop_dsmem import dsmem_transports
         from ..device_function import DeviceFunction
+        from ..matmul_utils import kernel_holds_tensor_memory
 
         device_fn = DeviceFunction.current()
         if device_fn.triton_remote_copy_signal_slots:
@@ -830,12 +846,21 @@ class TritonBackend(Backend):
                     f"_persistent_state_process_group_name={process_group_name!r}"
                 )
                 # Ranks compare the digest when they first allocate the state;
-                # it covers the transports this config picked (tagged or not).
+                # it covers the transports this config picked (tagged or Lamport).
                 graph = tagged_codegen_graph(device_fn)
                 assert graph is not None
-                out.append(f"_persistent_state_rank_digest={graph.rank_digest()!r}")
-                # And that their tagged pushes cover each tensor once (T7).
                 peer = device_fn.peer_state
+                lamport = tuple(
+                    (allocation_id, box.lanes, box.lane_bits)
+                    for allocation_id, box in sorted(
+                        peer.mailboxes.items() if peer is not None else ()
+                    )
+                    if box.lane_bits is not None
+                )
+                out.append(
+                    f"_persistent_state_rank_digest={graph.rank_digest(lamport)!r}"
+                )
+                # And that their tagged pushes cover each tensor once (T7).
                 if peer is not None and peer.mirrors:
                     shares = tuple(peer.mirrors[i].share for i in sorted(peer.mirrors))
                     out.append(f"_persistent_state_rank_shares={shares!r}")
@@ -847,6 +872,12 @@ class TritonBackend(Backend):
                 "_minimum_resident_programs="
                 f"{device_fn.triton_minimum_resident_programs}"
             )
+        elif has_barrier and not kernel_holds_tensor_memory():
+            # A cooperative grid's launch patches only tensor memory; without
+            # any it skips the patched launch's compile lookup and lock.
+            out.append("_tensor_memory=False")
+        if transports := dsmem_transports(device_fn):
+            out.append(f"_cluster_size={cluster_size(transports)}")
         out.extend(self.launcher_keyword_args(config, has_barrier=has_barrier))
         return out
 
@@ -894,8 +925,13 @@ class GluonBackend(TritonBackend):
     _IGNORED_KEYS = frozenset(["maxnreg", "range_flattens", "range_multi_buffers"])
 
     def supports_config_key(self, key: str) -> bool:
-        # Keys only the ring lowering implements (``gluon_ring``).
-        if key in ("cross_loop_tmem_prefetch", "worker_registers"):
+        # Keys only the Gluon backend implements: the ring lowering
+        # (``gluon_ring``), and dsmem with or without a ring.
+        if key in (
+            "cross_loop_tmem_prefetch",
+            "cross_loop_dsmem",
+            "worker_registers",
+        ):
             return True
         return key not in self._IGNORED_KEYS and super().supports_config_key(key)
 
@@ -941,10 +977,17 @@ class GluonBackend(TritonBackend):
         prefix: list[ast.stmt],
         ctx: DeviceBodyContext,
     ) -> list[ast.stmt]:
+        from ..cross_loop_dsmem import cluster_entry
+        from ..cross_loop_dsmem import cluster_exit
+        from ..cross_loop_dsmem import dsmem_transports
         from .gluon_ring import finalize_ring
 
         trailing = super().finalize_kernel_def(fn_def, prefix, ctx)
         statements = finalize_ring(fn_def, ctx)
+        transports = dsmem_transports(ctx.device_function)
+        if transports and ctx.device_function.ring is None:
+            fn_def.body.insert(0, cluster_entry(transports))
+            fn_def.body.append(cluster_exit())
         return [*statements, *trailing]
 
     def pipeline_loops(
@@ -1049,6 +1092,22 @@ class TileIRBackend(TritonBackend):
         return False
 
     def supports_intra_loop_barriers(self, *, in_divergent_control_flow: bool) -> bool:
+        return False
+
+    @property
+    def intra_loop_barriers_order_reads(self) -> bool:
+        # No barrier walk runs here: the write hazards would only pin loops
+        # out of ``range_warp_specialize``.
+        return False
+
+    @property
+    def intra_loop_barriers_carry_iterations(self) -> bool:
+        # Likewise for the hazards carried across iterations.
+        return False
+
+    @property
+    def intra_loop_barriers_order_flat_loads(self) -> bool:
+        # And for the packed quantized loads.
         return False
 
     @property

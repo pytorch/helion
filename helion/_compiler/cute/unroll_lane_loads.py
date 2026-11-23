@@ -74,6 +74,10 @@ read earlier in the lane body: a loop-carried value or a name defined twice
 pins its readers, and a loop-carried name's assignment keeps its place (in
 the load phase it would leave the last lane's value where the lane reads
 the carried one).
+A one-thread tile's rows that run as a serial loop under a vector row
+(``lane_loops/tile_trips.py``) are such a lane loop too: the packets of the
+vector row's lanes sit in its body ahead of the row's reductions, so the
+unroll issues the loads of ``U`` rows before the first of them reduces.
 Bodies still holding ``_helion_*`` compiler markers, reversed lane loops and
 already-constexpr lane loops are left alone, and so is a body holding any loop
 the trace keeps rolled other than a lane loop and a loop of one trip (a looped
@@ -113,6 +117,7 @@ from .lane_loops.markers import HELION_REDUCTION_VLOOP_ATTR
 from .lane_loops.markers import _literal_range_trips
 from .lane_loops.owner_guards import _memory_write_calls
 from .lane_loops.statements import contains_compiler_marker
+from .lane_loops.tile_trips import HELION_TILE_TRIP_ATTR
 from .packet_access import match_packet_access
 from .scalar_policy_loads import is_extended_scalar_load
 from .scalar_policy_loads import scalar_load_policy
@@ -262,10 +267,19 @@ def _ascending_range_extent(loop: ast.AST) -> int | None:
     return loop_extent(loop, kinds=("range",), minimum=1)
 
 
-def _is_lane_loop(stmt: ast.AST) -> bool:
-    return isinstance(stmt, ast.For) and bool(
-        getattr(stmt, HELION_LANE_LOOP_VAR_ATTR, None)
+def _lane_loop_var(stmt: ast.AST) -> str | None:
+    """The lane variable of a lane loop, or of a one-thread tile's rows that
+    run as a serial loop under a vector row (``lane_loops/tile_trips.py``):
+    a thread walks them one after another just the same."""
+    if not isinstance(stmt, ast.For):
+        return None
+    return getattr(stmt, HELION_LANE_LOOP_VAR_ATTR, None) or getattr(
+        stmt, HELION_TILE_TRIP_ATTR, None
     )
+
+
+def _is_lane_loop(stmt: ast.AST) -> bool:
+    return bool(_lane_loop_var(stmt))
 
 
 def _calls(node: ast.AST) -> list[ast.Call]:
@@ -770,8 +784,10 @@ def _drop_lane_attr(loop: ast.For) -> None:
     """The rewritten nest is no longer a canonical lane loop (its trips are
     trace-time copies); later lane-loop passes must not pick it up."""
     for node in ast.walk(loop):
-        if isinstance(node, ast.For) and hasattr(node, HELION_LANE_LOOP_VAR_ATTR):
-            delattr(node, HELION_LANE_LOOP_VAR_ATTR)
+        if isinstance(node, ast.For):
+            for attr in (HELION_LANE_LOOP_VAR_ATTR, HELION_TILE_TRIP_ATTR):
+                if hasattr(node, attr):
+                    delattr(node, attr)
 
 
 def _force_constexpr(
@@ -848,7 +864,7 @@ def unroll_lane_loads(
         result: list[ast.stmt] = []
         for stmt in statements:
             if _is_lane_loop(stmt):
-                lane_var = getattr(stmt, HELION_LANE_LOOP_VAR_ATTR)
+                lane_var = _lane_loop_var(stmt)
                 extent = _ascending_range_extent(stmt)
                 if lane_var in forced and extent is not None and extent >= 2:
                     replacement = _unroll_one(

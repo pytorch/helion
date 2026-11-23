@@ -503,9 +503,9 @@ def test_finalize_shared_reduce_groups_leaves_other_shapes_alone() -> None:
 def test_finalize_shared_reduce_groups_resizes_the_vloop_sink_fragment() -> None:
     # The V-loop sink's fragment combine keeps the emitted count of the
     # per-lane reduces it replaces and is resized with them: the one launched
-    # group of four warps then folds its warp partials in the serial form's
-    # order, as the resized per-lane reduce does, where the emitted count
-    # would have taken the butterfly tree.
+    # group of four warps then folds its warp partials as the serial form
+    # does, like the resized per-lane reduce, where the emitted count would
+    # have taken the two-stage form's tree with its identity lanes.
     emitted = (
         f"lane = {RUNTIME_LANE}\n"
         "lane_in_group = lane % 128\n"

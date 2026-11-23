@@ -3,6 +3,7 @@ from __future__ import annotations
 import ast
 import dataclasses
 import itertools
+import re
 from types import SimpleNamespace
 from typing import Any
 from typing import Literal
@@ -44,6 +45,12 @@ from helion._compiler.tile_dependency import coordinate_axis_symbol
 from helion._compiler.tile_dependency import instantiate_coordinate_domains
 from helion._compiler.triton.backend import TritonBackend
 from helion._testing import TestCase
+from helion._testing import skipIfRefEager
+from helion._testing import skipIfTileIR
+from helion._testing import skipUnlessBackends
+from helion._testing.cute_codegen import cuda_metadata_trace
+from helion._testing.distributed_kernels import fake_group as fake_group
+from helion._testing.distributed_kernels import scatter_after_local_kernel
 
 pytestmark = pytest.mark.cpu_only
 
@@ -125,6 +132,38 @@ def test_integer_fill_dry_pass_keeps_the_bound_available() -> None:
             guards,
         )
         assert not cross_loop_codegen._dry_pass_binds(result, guards, set())
+
+
+@skipUnlessBackends(["triton"])
+@skipIfTileIR("TileIR does not support barrier operations")
+@skipIfRefEager("tile dependencies are built only in compiled mode")
+def test_hold_waits_before_the_first_scatter(fake_group: str) -> None:
+    """The in-band scatter hold runs where the first scatter store's block
+    starts: the roots before it write no scatter row, so their loads issue
+    without it.  The launch is announced and the hold flag read before the
+    first root's tasks."""
+    args = (
+        torch.zeros(32, 64, dtype=torch.bfloat16),
+        torch.zeros(4, 8, 64, dtype=torch.bfloat16),
+        torch.zeros(4, 8, dtype=torch.int32),
+        torch.zeros(1, dtype=torch.int32),
+        fake_group,
+    )
+    scatter_after_local_kernel.reset()
+    with cuda_metadata_trace():
+        code = scatter_after_local_kernel.bind(args).to_triton_code()
+    assert code.count("_hold_after_fallback(") == 1
+    body = code[code.index("def _helion_scatter_after_local_kernel(") :]
+    # The task loops of roots 0 (local) and 1 (the scatter), in order.
+    local, scatter = (
+        m.start() for m in itertools.islice(re.finditer("for virtual_pid in", body), 2)
+    )
+    assert body.index("tile_dependency_peer_held = ") < local
+    announce = re.search(r"tile_dependency_every_rank(_\d+)? = ", body)
+    assert announce is not None
+    assert announce.start() < local
+    hold = body.index("_hold_after_fallback(tile_dependency_peer_state")
+    assert local < hold < scatter
 
 
 def _domain(
@@ -452,6 +491,7 @@ def _access(
 def _dependency_graph(
     root_axes: list[list[int]],
     *accesses: TileAccess,
+    root_phases: tuple[int, ...] | None = None,
 ) -> TileDependencyGraph:
     return build_tile_dependency_graph(
         tuple(
@@ -459,6 +499,7 @@ def _dependency_graph(
             for index, access in enumerate(accesses)
         ),
         root_axes,
+        root_phases=root_phases,
     )
 
 

@@ -28,6 +28,7 @@ from helion._compiler.cute.attention_plan import AttentionScorePlan
 from helion._compiler.cute.attention_plan import FlexAuxBuffer
 from helion._compiler.cute.attention_plan import FlexKvWalk
 from helion._compiler.cute.attention_plan import FlexRegion
+from helion._compiler.cute.device_state import CuteDeviceFunctionState
 from helion._compiler.cute.flash_score_mod import FlexHookCode
 from helion._compiler.cute.flash_score_mod import build_flex_region
 from helion._compiler.cute.flash_score_mod import flex_aux_smem_candidates
@@ -68,7 +69,8 @@ _BOUNDS = (_BATCH, _HEADS, 4 * 128, 8 * 128)
 
 # ---------------------------------------------------------------------------
 # Codegen context stand-ins (the live GenerateAST / DeviceFunction of a kernel
-# compile; here only the naming and statement-capture surface is needed).
+# compile; here only the naming and statement-capture surface is needed, and
+# the CuTe state in which the extremum handler records its results).
 # ---------------------------------------------------------------------------
 
 
@@ -103,6 +105,7 @@ class _StubDeviceFunction:
         self.expr_to_var_info: dict[object, object] = {}
         self._constexpr_args: dict[str, object] = {}
         self.config = helion.Config()
+        self.cute_state = CuteDeviceFunctionState()
         self.tile_strategy = types.SimpleNamespace(
             supports_index_rank_expansion=lambda: False,
             shape_str=lambda shape: str(shape),
@@ -117,6 +120,9 @@ class _StubDeviceFunction:
 
     def user_sympy_expr(self, expr: object) -> str:
         return str(expr)
+
+    def variable_aliases(self, name: str) -> tuple[str, ...]:
+        return (name,)
 
 
 @contextlib.contextmanager
@@ -2482,7 +2488,11 @@ class TestCuteFlexScoreMod(TestCase):
     def test_sigmoid_and_log_use_backend_overrides(self) -> None:
         case = next(c for c in _CASES if c.name == "sigmoid_act")
         code, _plan_, _tables, _values = _render_case(case, with_tail=False)
-        self.assertIn("cute.math.rcp(1.0 + cute.math.exp2(", code.chunk_body)
+        self.assertIn(" = cute.math.rcp(cute.math.exp2(", code.chunk_body)
+        self.assertIn(
+            "fastmath=True) * 0.25 + 0.25, approx=True, ftz=True) * 0.25\n",
+            code.chunk_body,
+        )
         self.assertIn("cute.math.log(", code.chunk_body)
         self.assertNotIn(
             "cute.math.log(v_", code.chunk_body.replace("cute.math.log(v_", "LOG(", 0)

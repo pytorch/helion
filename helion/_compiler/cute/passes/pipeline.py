@@ -688,6 +688,7 @@ def _hoist_warp_reduce_from_vloop(s: _DeviceBodyState) -> None:
 
     s.kernel_body = hoist_warp_reduce_from_vloop(
         s.kernel_body,
+        reduce_input_dtypes=s.fn.cute_state.lanes.reduce_input_dtypes,
         running_sum_accumulators=s.fn.cute_state.lanes.matmul_running_sums,
         rename_groups=s.ctx.rename_groups,
         unfoldable_vec_lanes=s.fn.cute_state.lanes.unfoldable_vec_lanes,
@@ -741,16 +742,18 @@ def _peel_vector_tails(s: _DeviceBodyState) -> None:
 def _vectorize_affine_tile_lanes(s: _DeviceBodyState) -> None:
     from ..affine_vector_io import vectorize_affine_tile_lanes
 
+    store_tiers = bool(s.ctx.config.get("cute_store_packet_tiers", False))
     if s.bounded_cache_request is not None:
         s.kernel_body = vectorize_affine_tile_lanes(
             s.kernel_body,
             s.fn,
             s.ctx.constexpr_values,
             private_fragments=s.private_fragments,
+            store_tiers=store_tiers,
         )
     else:
         s.kernel_body = vectorize_affine_tile_lanes(
-            s.kernel_body, s.fn, s.ctx.constexpr_values
+            s.kernel_body, s.fn, s.ctx.constexpr_values, store_tiers=store_tiers
         )
 
 
@@ -889,7 +892,11 @@ def _fuse_fma(s: _DeviceBodyState) -> None:
     # backend.
     from ..fuse_fma import fuse_fma
 
-    s.kernel_body = fuse_fma(s.kernel_body, rename_groups=s.ctx.rename_groups)
+    s.kernel_body = fuse_fma(
+        s.kernel_body,
+        rename_groups=s.ctx.rename_groups,
+        fp32_extrema=bool(s.ctx.config.get("cute_fmnmx_extrema", False)),
+    )
 
 
 def _ring_mma_dot(s: _DeviceBodyState) -> None:
@@ -1427,6 +1434,10 @@ def _lower_philox_packets(s: _DeviceBodyState) -> None:
 
     fn = s.fn
     constexpr_values = s.ctx.constexpr_values
+    # A packet's stores are packed by this call of the affine vectorizer
+    # (the ``vectorize_affine_tile_lanes`` pass declines a lane loop with a
+    # random call), so it takes ``cute_store_packet_tiers`` as that pass does.
+    store_tiers = bool(s.ctx.config.get("cute_store_packet_tiers", False))
     s.kernel_body = lower_philox_packets(
         s.kernel_body,
         seed_exprs=fn.cute_state.explicit_rng_seed_exprs,
@@ -1438,6 +1449,7 @@ def _lower_philox_packets(s: _DeviceBodyState) -> None:
             constexpr_values,
             register_accesses=frozenset({ast.dump(read, include_attributes=False)}),
             integer_names=known,
+            store_tiers=store_tiers,
         ),
     )
 
@@ -1555,6 +1567,37 @@ def _lower_scalar_policy_loads(s: _KernelDefState) -> None:
     s.definition.body = lower_scalar_policy_loads(s.definition.body)
 
 
+def _hint_element_loads(s: _KernelDefState) -> None:
+    from ..scalar_policy_loads import hint_element_loads
+
+    s.definition.body = hint_element_loads(
+        s.definition,
+        s.fn.cute_state.element_load_hints,
+        predicate_lowered=s.ctx.config.cute_scalar_load_hints,
+    )
+
+
+def _element_load_hints(s: _KernelDefState) -> bool:
+    return s.ctx.config.cute_scalar_load_hints or s.ctx.config.cute_narrow_load_hints
+
+
+def _predicate_element_loads(s: _KernelDefState) -> None:
+    from ..predicated_element_loads import predicate_element_loads
+
+    renamed = s.ctx.rename_groups
+    s.definition.body = predicate_element_loads(
+        s.definition,
+        # Shared and register pointers are no global elements.
+        {
+            renamed.get(argument.name, argument.name): argument.fake_value.dtype
+            for argument in s.param_args
+            if isinstance(argument, TensorArg)
+            and not isinstance(argument, TensorDescriptorArg)
+        },
+        s.fn.cute_state.element_load_hints,
+    )
+
+
 def _pack_half_extremum_folds(s: _KernelDefState) -> None:
     from ..half_extremum_folds import pack_half_extremum_folds
 
@@ -1612,6 +1655,54 @@ def _lower_packet_store_policy(s: _KernelDefState) -> None:
         ),
         target_device_capability=s.ctx.target_device_capability,
         cuda_version=torch.version.cuda,
+    )
+
+
+def _guard_lanes(s: _KernelDefState) -> None:
+    from ..guarded_lanes import guard_lanes
+
+    s.definition.body = guard_lanes(
+        s.definition.body, s.fn.cute_state.lanes.zero_filled_packets
+    )
+
+
+def _stage_cta_stores(s: _KernelDefState) -> None:
+    from ..memory_ops import cute_tensor_base_is_aligned
+    from ..staged_stores import PACKET_BYTES
+    from ..staged_stores import stage_cta_stores
+    from ..target_facts import static_smem_budget
+
+    ctx = s.ctx
+    renamed = ctx.rename_groups
+    stage_cta_stores(
+        s.definition.body,
+        tensors={
+            renamed.get(argument.name, argument.name): argument.fake_value
+            for argument in s.param_args
+            if isinstance(argument, TensorArg)
+            and not isinstance(argument, TensorDescriptorArg)
+        },
+        base_aligned=lambda tensor: cute_tensor_base_is_aligned(
+            ctx.env, tensor, PACKET_BYTES
+        ),
+        proven_disjoint_tensor_pairs={
+            frozenset(renamed.get(name, name) for name in pair)
+            for pair in ctx.proven_disjoint_tensor_pairs
+        },
+        proven_tensor_stride_values={
+            (renamed.get(name, name), dim): value
+            for (name, dim), value in ctx.proven_tensor_stride_values.items()
+        },
+        constexpr_values=ctx.constexpr_values,
+        thread_block_dims=ctx.exact_thread_block_dims,
+        # The launch's block grid, when every extent of it is proven.
+        block_grid_dims=cast("tuple[int, int, int]", ctx.block_grid_dims)
+        if ctx.exact_grid and None not in ctx.block_grid_dims
+        else None,
+        index_type=ctx.env.index_type(),
+        dtype_str=ctx.env.backend.dtype_str,
+        smem_budget=static_smem_budget(),
+        new_var=ctx.new_var,
     )
 
 
@@ -2032,7 +2123,59 @@ KERNEL_DEF_PASSES: tuple[KernelDefPass, ...] = (
         "select_native_warp_reductions",
         _config_flag("cute_warp_fp32_redux"),
         _select_native_warp_reductions,
-        # Last: every earlier pass recognizes the shuffle reductions by name.
+        # Last of the lowerings: every earlier pass recognizes the shuffle
+        # reductions by name.
+        requires=(RENAMED,),
+    ),
+    KernelDefPass(
+        "stage_cta_stores",
+        _config_flag("cute_staged_store"),
+        _stage_cta_stores,
+        # After every pass that rewrites the kernel's stores: its proof runs
+        # the body they left, and the image's stores name no tensor.  Before
+        # ``guard_lanes``: the proof takes a store alone under its mask, and
+        # would leave a kernel whose lanes moved under that mask unstaged.
+        # Before ``hint_element_loads``: the proof takes plain loads, not the
+        # hinted helper calls, and would leave a hinted kernel unstaged.
+        requires=(RENAMED,),
+    ),
+    KernelDefPass(
+        "guard_lanes",
+        _config_flag("cute_guarded_lanes"),
+        _guard_lanes,
+        # After every pass that matches a packet's hoists directly above its
+        # V-loop and its flushes directly after it, or a store alone under
+        # its mask (``stage_cta_stores``): this one nests them under the
+        # stores' guard.  A staged store is a store under the same mask, so
+        # its lanes move under it too; a store the staged form split by CTA
+        # (a partial last tile) is no group of stores and keeps its lanes.
+        # Before ``hint_element_loads``: the run ahead of a store ends at a
+        # call the relocation proofs do not know, the hinted helpers among
+        # them.
+        requires=(RENAMED,),
+    ),
+    KernelDefPass(
+        "predicate_element_loads",
+        _config_flag("cute_predicated_element_loads"),
+        _predicate_element_loads,
+        # After ``guard_lanes``: a masked element load's test is then the
+        # mask the program gave it wherever its store's guard implies the
+        # tile masks and bounds, which is the test of the select the load's
+        # fill comes from.  Before ``hint_element_loads``, whose predicated
+        # form has no fill: a load taken here carries the policy that pass
+        # would give it.
+        requires=(RENAMED,),
+    ),
+    KernelDefPass(
+        "hint_element_loads",
+        _element_load_hints,
+        _hint_element_loads,
+        # Last, after every pass that reads, moves or merges an element load
+        # (the staged store's proof reads them, ``guard_lanes`` moves them,
+        # ``predicate_element_loads`` takes the masked ones it can prove):
+        # the loads still plain here are the ones that take a hint.  A hint
+        # changes no value and no store, and the staged image's loads name
+        # no tensor parameter.
         requires=(RENAMED,),
     ),
 )

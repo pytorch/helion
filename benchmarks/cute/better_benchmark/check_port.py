@@ -1,18 +1,30 @@
 # ruff: noqa: ANN401
 """Check a Helion port against its better-benchmark repro.
 
-For each backend the port runs with the default config (no autotuning) and,
-with ``--random-configs N``, with N random configs per kernel. Every run gets
-fresh inputs and must match eager PyTorch in output count, shapes, dtypes and
-strides, with integer and boolean outputs exact. Float outputs must pass the
+For each backend the port runs with the default config (no autotuning),
+with ``--random-configs N`` with N random configs per kernel, and with
+``--configs-dir DIR`` pinned to the autotune record that DIR holds for it (a
+campaign's pick, as ``bench.py`` pins it). Every run gets fresh inputs and
+free device memory filled with poison (``common.call_on_poisoned_memory``),
+and must match eager PyTorch in output count, shapes, dtypes and strides,
+with integer and boolean outputs exact. A port that leaves part of an output
+unwritten fails whatever that memory held (``common.check_written``: before
+the fill, ``torch.empty`` handed a config the block that the config checked
+before it had just freed, right values included). Float outputs must pass the
 anchored numerics gate (``common.AnchoredGate``, a loosened variant of
 better-benchmark's: the error against its reference, eager PyTorch on
 float64 copies of the inputs with the graph's own casts kept, may be at most
 3x Inductor's or 1e-5 of the output's magnitude, and a bf16 or fp16 element
 may also be one unit in the last place off), and outputs that depend on
 random numbers must match Inductor's compiled outputs (masks exactly).
-Without the gate (``--no-anchored``) float outputs must be allclose to eager
-instead and random outputs go unchecked.
+An integer or boolean output that Inductor's own compiled output does not
+reproduce either (eager leaves the order of ``topk``'s tied values to its
+implementation, and Inductor's decomposition returns them in index order)
+must equal Inductor's exactly instead; the check prints each such output
+with the number of elements in which Inductor's differs from eager's.
+Without the gate (``--no-anchored``) nothing is compiled by Inductor: float
+outputs must be allclose to eager instead, random outputs go unchecked and
+every integer and boolean output must equal eager's.
 
 A random config that fails to compile or run is classified the way the
 autotuner treats the failure: ``rejected`` when the backend declines the
@@ -43,8 +55,11 @@ from typing import Any
 
 if __name__ == "__main__":
     sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
-    # The default config is enough to check a port; no search.
-    os.environ.setdefault("HELION_AUTOTUNE_EFFORT", "none")
+    # The default config is enough to check a port; no search. An empty
+    # value names no effort, for load_port as for Helion's settings: left
+    # in place beside HELION_FORCE_AUTOTUNE=1 it would be a full search.
+    if not os.environ.get("HELION_AUTOTUNE_EFFORT", "").strip():
+        os.environ["HELION_AUTOTUNE_EFFORT"] = "none"
 
 from benchmarks.cute.better_benchmark import common
 import torch
@@ -57,7 +72,11 @@ from helion.autotuner.logger import match_unrecoverable_runtime_error
 def classify_failure(error: BaseException, backend: Any) -> str:
     """``rejected``, ``warn`` or ``error`` for a random config that failed to
     compile or run, following the autotuner: the backend's
-    ``classify_autotune_exception``, then ``classify_triton_exception``."""
+    ``classify_autotune_exception``, then ``classify_triton_exception``. A
+    call that could not be judged (``common.UnfilledMemory``) is the
+    check's own failure, not one of the config: an ``error``."""
+    if isinstance(error, common.UnfilledMemory):
+        return "error"
     if isinstance(error, (helion.exc.BackendUnsupported, helion.exc.InvalidConfig)):
         return "rejected"
     if match_unrecoverable_runtime_error(error):
@@ -72,11 +91,22 @@ def judge(
     out: Any,
     eager_out: Any,
     gate: common.AnchoredGate | None,
-    run: Any,
+    port: Any,
+    repro_id: str,
+    shape: str,
     args: argparse.Namespace,
 ) -> dict[str, Any]:
-    """Raise unless ``out`` is acceptable; returns what was checked."""
+    """Raise unless ``out``, the port's outputs on the shape point from
+    ``common.forward_on_poisoned_memory``, is acceptable; returns what was
+    checked. An output that the port left partly unwritten is never
+    acceptable (``common.check_written``, which calls the port again when an
+    output still holds the poison)."""
     record: dict[str, Any] = {"errors_vs_eager": common.output_errors(out, eager_out)}
+    common.check_written(
+        out,
+        lambda byte: common.forward_on_poisoned_memory(port, repro_id, shape, byte),
+    )
+    vs_inductor: list[dict[str, Any]] = []
     try:
         common.check_outputs(
             out,
@@ -84,13 +114,17 @@ def judge(
             rtol=args.rtol,
             atol=args.atol,
             stochastic=args.stochastic,
+            inductor=None if gate is None else lambda: gate.baseline,
+            vs_inductor=vs_inductor,
         )
     except common.FloatMismatch as error:
         if gate is None:
             raise
         record["eager_allclose_warning"] = str(error)[:1000]
+    if vs_inductor:
+        record["exact_vs_inductor"] = vs_inductor
     if gate is not None:
-        verdict = gate.check(run)
+        verdict = gate.check(port.forward)
         record["anchored"] = verdict
         if not verdict["pass"]:
             raise AssertionError(f"anchored numerics gate failed: {verdict}")
@@ -108,10 +142,9 @@ def check_backend(
     record: dict[str, Any] = {"backend": backend, "status": "error"}
     try:
         port = common.load_port(repro_id, backend)
-        with torch.no_grad():
-            out = port.forward(common.make_inputs(repro_id, shape))
-        torch.cuda.synchronize()
-        record.update(judge(out, eager_out, gate, port.forward, args))
+        out = common.forward_on_poisoned_memory(port, repro_id, shape)
+        record.update(judge(out, eager_out, gate, port, repro_id, shape, args))
+        del out
         if args.print_code:
             for name, kernel in common.port_kernels(port).items():
                 for bound in kernel._bound_kernels.values():
@@ -119,11 +152,11 @@ def check_backend(
                         print(f"# ===== {backend}:{name} =====")
                         print(common.generated_code(bound))
         samples = []
+        lost_context = False
         for sample in range(args.random_configs):
             picked: dict[str, str] = {}
             entry: dict[str, Any] = {"configs": picked}
             backend_impl = None
-            lost_context = False
             try:
                 for name, kernel in common.port_kernels(port).items():
                     for bound in kernel._bound_kernels.values():
@@ -132,16 +165,16 @@ def check_backend(
                         config = generation.random_config()
                         picked[name] = config.to_json()
                         bound.set_config(config)
-                with torch.no_grad():
-                    out = port.forward(common.make_inputs(repro_id, shape))
-                torch.cuda.synchronize()
+                out = common.forward_on_poisoned_memory(port, repro_id, shape)
             except Exception as error:
                 entry["status"] = classify_failure(error, backend_impl)
                 entry["error"] = f"{type(error).__name__}: {str(error)[:2000]}"
                 lost_context = match_unrecoverable_runtime_error(error)
             else:
                 try:
-                    entry.update(judge(out, eager_out, gate, port.forward, args))
+                    entry.update(
+                        judge(out, eager_out, gate, port, repro_id, shape, args)
+                    )
                     entry["status"] = "ok"
                 except Exception as error:
                     # Wrong outputs, or a failure while checking them.
@@ -158,6 +191,51 @@ def check_backend(
         record["random_configs"] = samples
         failed = [s for s in samples if s["status"] == "error"]
         record["status"] = "ok" if not failed else "random_config_failures"
+        if args.configs_dir is not None and not lost_context:
+            pinned = check_pinned(repro_id, shape, backend, args, eager_out, gate)
+            record["pinned"] = pinned
+            if pinned["status"] == "error" and record["status"] == "ok":
+                record["status"] = "pinned_config_failure"
+    except Exception:
+        record["error"] = traceback.format_exc()
+    return record
+
+
+def check_pinned(
+    repro_id: str,
+    shape: str,
+    backend: str,
+    args: argparse.Namespace,
+    eager_out: Any,
+    gate: common.AnchoredGate | None,
+) -> dict[str, Any]:
+    """Check the port with its kernels pinned to the autotune record that
+    ``--configs-dir`` holds for it (a campaign's pick, as ``bench.py`` pins
+    it): ``ok`` with what was checked, ``error`` with why, or ``missing``
+    when the directory has no record of the port on this backend, or the
+    record of an autotune that failed. A record that is there and cannot be
+    read is an error: nothing was checked. ``code_matches_autotune`` says
+    whether the pinned kernels still generate the code the record holds
+    (``common.pin_roundtrip``: the source-line comments do not count, except
+    for a record that holds only the digest of the whole text)."""
+    path = common.config_record_path(args.configs_dir, repro_id, shape, backend)
+    record: dict[str, Any] = {"autotune_record": str(path), "status": "error"}
+    if not path.exists():
+        record["status"] = "missing"
+        return record
+    try:
+        tuned = json.loads(path.read_text())
+        if tuned.get("status") != "ok":
+            record["status"] = "missing"
+            return record
+        port = common.load_port(
+            repro_id, backend, pinned=common.per_kernel(tuned["kernels"], "decorator")
+        )
+        out = common.forward_on_poisoned_memory(port, repro_id, shape)
+        record.update(judge(out, eager_out, gate, port, repro_id, shape, args))
+        roundtrip = common.pin_roundtrip(port, tuned["kernels"])
+        record["code_matches_autotune"] = all(roundtrip.values())
+        record["status"] = "ok"
     except Exception:
         record["error"] = traceback.format_exc()
     return record
@@ -181,9 +259,20 @@ def main() -> None:
         help="skip Inductor and the anchored gate (eager allclose only; "
         "random outputs go unchecked)",
     )
+    parser.add_argument(
+        "--configs-dir",
+        type=Path,
+        default=None,
+        metavar="DIR",
+        help="also check each backend's port pinned to its autotune record "
+        "in DIR (a campaign's configs), where DIR has an ok one",
+    )
     parser.add_argument("--print-code", action="store_true")
     parser.add_argument("--output", type=Path, default=None)
     args = parser.parse_args()
+    if args.configs_dir is not None and not args.configs_dir.is_dir():
+        # A mistyped directory would read as no record for any backend.
+        parser.error(f"--configs-dir {args.configs_dir}: not a directory")
 
     torch.cuda.set_device(0)
     shape = args.shape or common.default_shape(args.repro_id)
@@ -193,7 +282,7 @@ def main() -> None:
     gate = None
     if not args.no_anchored:
         torch._dynamo.reset()
-        compiled = common.compile_inductor(args.repro_id, shape, instance, cd=False)
+        compiled = common.compile_inductor(args.repro_id, shape, instance)
         gate = common.AnchoredGate(args.repro_id, shape, instance, compiled)
         if gate.ref_fallback is not None:
             print(
@@ -227,6 +316,12 @@ def main() -> None:
             continue
         for row in record["errors_vs_eager"]:
             print(f"[{backend}]   output {row}", flush=True)
+        for entry in record.get("exact_vs_inductor", []):
+            print(
+                f"[{backend}]   exact output vs Inductor, whose own differs from "
+                f"eager's: {entry}",
+                flush=True,
+            )
         if "anchored" in record:
             print(f"[{backend}]   anchored gate pass={record['anchored']['pass']}")
             for leaf in record["anchored"].get("per_output", []):
@@ -246,6 +341,27 @@ def main() -> None:
             }
             print(f"[{backend}]   random configs {counts}", flush=True)
             warned += counts["warn"]
+        pinned = record.get("pinned")
+        if pinned is not None:
+            print(
+                f"[{backend}]   pinned config ({pinned['autotune_record']}): "
+                f"{pinned['status']}",
+                flush=True,
+            )
+            if "error" in pinned:
+                print(pinned["error"], flush=True)
+            elif pinned["status"] == "ok":
+                if not pinned["code_matches_autotune"]:
+                    print(
+                        f"[{backend}]   note: the pinned kernels generate other "
+                        "code than the autotune recorded",
+                        flush=True,
+                    )
+                print(
+                    f"[{backend}]   pinned anchored gate "
+                    f"pass={pinned.get('anchored', {}).get('pass')}",
+                    flush=True,
+                )
     results["seconds"] = round(time.time() - started, 1)
     if args.output:
         args.output.write_text(json.dumps(results, indent=1, default=str) + "\n")

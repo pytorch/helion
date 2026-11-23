@@ -71,6 +71,7 @@ from .compile_environment import _symint_expr
 from .compile_environment import warning
 from .container_identity import compare_container_identity
 from .container_identity import record_opaque_container_result
+from .cross_loop_dsmem import dsmem_slab_facts
 from .fragment_call import guard_fragment_call_input
 from .fragment_comparison import guard_fragment_comparison
 from .fx_side_effects import is_impure_node
@@ -416,8 +417,8 @@ class ForLoopGraphInfo(NodeArgsGraphInfo):
     block_ids: list[int]
     # Precomputed by GenerateAST._compute_inter_loop_barriers: True iff a
     # tl.debug_barrier() must be emitted immediately before this for-loop's
-    # outer prefix to make global writes from the previous sibling for-loop
-    # in this scope visible.  Not copied across graph copies; recomputed.
+    # outer prefix to order the accesses of the previous sibling for-loops in
+    # this scope before its own.  Not copied across graph copies; recomputed.
     needs_barrier_before: bool = False
 
     @property
@@ -4534,14 +4535,17 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
         if warp_specialize_specs:
             from .loop_dependency_checker import intra_loop_raw_reread_block_ids
 
-            # A loop that stores and then re-reads the same storage cannot be
-            # warp-specialized (see intra_loop_raw_reread_block_ids); its
-            # slot stays in the config space pinned to None.
+            # A loop that stores and then re-reads the same storage (or reads
+            # and then overwrites it) cannot be warp-specialized (see
+            # intra_loop_raw_reread_block_ids); its slot stays in the config
+            # space pinned to None.
             reread_block_ids = intra_loop_raw_reread_block_ids(
                 device_ir.graphs,
                 device_ir.root_ids,
                 device_ir.grid_block_ids,
                 atomics=backend.intra_loop_barriers_order_atomics,
+                carries=backend.intra_loop_barriers_carry_iterations,
+                reads=backend.intra_loop_barriers_order_reads,
             )
             for spec in warp_specialize_specs:
                 if reread_block_ids.intersection(spec.block_ids):
@@ -4645,11 +4649,20 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
                 ),
             )
             cross_rank = device_ir.tile_dependency_graph.crosses_ranks()
+            if config_spec.supports_config_key("cross_loop_inband_protocol"):
+                config_spec.cross_loop_inband_protocol.length = len(
+                    device_ir.tile_dependency_graph.lamport_candidate_ids
+                )
             _install_dependency_phases(
                 device_ir,
                 visitor.root_nodes,
                 device_ir.tile_dependency_graph,
                 source_phase_starts,
+            )
+            # Dropped hint edges were the kernel's only dependencies.
+            config_spec.cross_loop_pipeline_retired = (
+                bool(device_ir.tile_dependency_graph.unordered_hint_reads)
+                and not device_ir.implicit_dependency_starts
             )
             if device_ir.implicit_dependency_starts and not (
                 env.backend.lower_dependency_phases_as_ordered_launches(func, device_ir)
@@ -4702,6 +4715,11 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
                         config_spec.cross_loop_tmem_prefetch.append(
                             CrossLoopTmemPrefetchSpec(block_ids)
                         )
+                if config_spec.supports_config_key("cross_loop_dsmem"):
+                    config_spec.cross_loop_dsmem.length = len(graph.dsmem_candidate_ids)
+                    config_spec.cross_loop_dsmem_slabs = dsmem_slab_facts(
+                        graph, device_ir.root_ids
+                    )
         config_spec.multi_phase = len(device_ir.phases) > 1
         if config_spec.supports_config_key("pallas_load_buffer_count"):
             config_spec.pallas_load_buffer_count.length = sum(

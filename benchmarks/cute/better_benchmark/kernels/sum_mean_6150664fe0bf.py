@@ -16,8 +16,8 @@ the input viewed as ``[N, H*W, C]``:
 - ``triton_poi_fused_add_addcmul_convert_element_type_div_erf_mean_mul_pow_view_2``:
   recomputes the GELU, finishes the mean (a true division of that sum by C)
   and writes ``g + addcmul(beta, gamma, g * (sqrt(sum_sq) / (mean + 1e-6)))``
-  in bf16 (Inductor and Helion's Triton backend lower the addcmul to an fma;
-  the CuTe backend currently renders ``prims.fma`` as a multiply and an add).
+  in bf16 with the two fmas the port states: the addcmul, and the add, which
+  Inductor's fp fusion contracts with the product g (``g * nx`` reads g rounded).
 
 As in Inductor (no ``emulate_precision_casts``), the graph's bf16 round trips
 of the GELU output, of ``gx``, of the mean and of the products stay in fp32;
@@ -71,7 +71,9 @@ def gelu_grn_apply(
     out = torch.empty([n, hw, c], dtype=x.dtype, device=x.device)
     for tile_n, tile_hw, tile_c in hl.tile([n, hw, c]):
         v = x[tile_n, tile_hw, tile_c].to(torch.float32)
-        g = (v * 0.5) * (torch.erf(v * 0.7071067811865476) + 1.0)
+        half_v = v * 0.5
+        erf1 = torch.erf(v * 0.7071067811865476) + 1.0
+        g = half_v * erf1
         gx_mean = gx_sum[tile_n] / channels
         nx = torch.sqrt(sum_sq[tile_n, tile_c]) / (gx_mean[:, None] + 1e-6)
         y = torch.addcmul(
@@ -79,7 +81,9 @@ def gelu_grn_apply(
             gamma[tile_c].to(torch.float32),
             g * nx[:, None, :],
         )
-        out[tile_n, tile_hw, tile_c] = (g + y).to(out.dtype)
+        # g + y as Inductor's kernel computes it: fp fusion contracts the add
+        # with the product g, fma(half_v, erf1, y); g * nx reads the rounded g.
+        out[tile_n, tile_hw, tile_c] = torch.addcmul(y, half_v, erf1).to(out.dtype)
     return out
 
 

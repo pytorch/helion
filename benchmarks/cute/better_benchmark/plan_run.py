@@ -8,11 +8,15 @@ newest first) when
 - its activity was sampled and clean (``common.activity_issue``; with
   ``--reuse-unsampled`` a record made before the sampling existed, with no
   samples at all, counts as clean, never one whose samples miss its job),
-  and
+- its searches ran in the regime the run's Triton autotunes will run in
+  (``--regime``; unnamed, Triton's default, ``common.default_regime``),
+  where its port has several kernels (``common.record_regime``: a record
+  made before records named a regime was tuned alone), and
 - its pinned kernels still generate the code they were tuned as, at this
   tree (``common.pin_roundtrip`` after one forward of the pinned port, as
-  ``bench.py`` checks it; this needs a GPU, and ``--no-pin-check`` reuses
-  nothing);
+  ``bench.py`` checks it: the comments that quote the port's source do not
+  count, except for a record made before records held the digest without
+  them; this needs a GPU, and ``--no-pin-check`` reuses nothing);
 
 any other Triton point, one whose config this tree rejects included, is
 autotuned again.  Every point is benched.  Run it on a GPU of your own::
@@ -102,11 +106,25 @@ def _cuda_broken() -> bool:
 
 
 def triton_reuse(
-    path: Path, record: dict[str, Any], *, reuse_unsampled: bool, pin_check: bool
+    path: Path,
+    record: dict[str, Any],
+    *,
+    reuse_unsampled: bool,
+    pin_check: bool,
+    regime: str | None = None,
 ) -> str | None:
-    """Why the Triton autotune record at ``path`` cannot be reused, or None."""
+    """Why the Triton autotune record at ``path`` cannot be reused, or None.
+    A record of a port with several kernels stands only for the regime its
+    searches ran in (``common.record_regime``: ``alone`` for every record
+    made before ``autotune.py`` named one); a port with one kernel is tuned
+    alone in every regime. ``regime`` is the one the run's Triton autotunes
+    will run in (None: Triton's default, ``common.default_regime``, which is
+    ``alone``, so the records of earlier runs stand)."""
     if issue := common.activity_issue(record, reuse_unsampled):
         return issue
+    regime = regime or common.default_regime("triton")
+    if len(record.get("kernels", ())) > 1 and common.record_regime(record) != regime:
+        return f"tuned in the regime {common.record_regime(record)!r}, not {regime!r}"
     if not pin_check:
         return "pinned code not checked"
     try:
@@ -134,6 +152,7 @@ def plan(
     reuse_unsampled: bool = False,
     pin_check: bool = True,
     provisional: bool = False,
+    regime: str | None = None,
 ) -> dict[str, Any]:
     """The jobs of a run (autotunes with the reason for each, reused Triton
     records and benches), each job with an estimated duration in seconds.
@@ -160,7 +179,11 @@ def plan(
                 reason = "no ok earlier record"
             else:
                 reason = triton_reuse(
-                    path, record, reuse_unsampled=reuse_unsampled, pin_check=pin_check
+                    path,
+                    record,
+                    reuse_unsampled=reuse_unsampled,
+                    pin_check=pin_check,
+                    regime=regime,
                 )
                 if reason is None:
                     reused.append({**job, "record": str(path)})
@@ -211,6 +234,9 @@ def plan(
     return {
         "tree": common.git_revision(common.REPO_ROOT),
         "priors": [str(run) for run in priors],
+        # The regime the plan reused Triton records for: the run's campaign
+        # must tune its Triton ports in it (``campaign.py`` checks).
+        "triton_regime": regime or common.default_regime("triton"),
         "autotune": autotunes,
         "reuse": reused,
         "bench": bench_jobs,
@@ -291,6 +317,15 @@ def main() -> None:
         action="store_true",
         help="write <run>/plan.json and copy the reused records into the run",
     )
+    parser.add_argument(
+        "--regime",
+        choices=common.REGIMES,
+        default=None,
+        help="the regime the run's autotunes will time their candidates in "
+        "(campaign.py --regime): an earlier Triton record of a port with "
+        "several kernels is reused only when it was tuned in it (default: "
+        "Triton's own, alone)",
+    )
     args = parser.parse_args()
     # A record already there would pass for a finished job of the plan.
     if args.write and any(
@@ -307,6 +342,7 @@ def main() -> None:
         reuse_unsampled=args.reuse_unsampled,
         pin_check=not args.no_pin_check,
         provisional=args.provisional_triton,
+        regime=args.regime,
     )
     result["selection"] = str(args.selection)
     if args.write:

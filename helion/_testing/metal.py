@@ -14,6 +14,9 @@ import helion.language as hl
 if TYPE_CHECKING:
     from types import ModuleType
 
+    from helion._compiler.autotuner_heuristics.registry import AutotunerHeuristic
+    from helion.runtime.kernel import BoundKernel
+
 
 class _NoShader:
     """A compiled library stand-in: every kernel in it launches nothing."""
@@ -49,6 +52,21 @@ def _compiled_msl(module: ModuleType) -> str:
         if isinstance(obj, _MetalKernel) and obj.msl_source is not None
     ]
     return msl
+
+
+def heuristic_seeds(
+    heuristic: type[AutotunerHeuristic], bound: BoundKernel
+) -> list[helion.Config]:
+    """``heuristic``'s seed configs for a bound kernel, as the autotuner
+    plants them at bind: its list, or its one seed where it gives none."""
+    assert bound.host_function is not None
+    with bound.env:
+        device_ir = bound.host_function.device_ir
+        seeds = heuristic.get_seed_configs(bound.env, device_ir)
+        if seeds is None:
+            seed = heuristic.get_seed_config(bound.env, device_ir)
+            seeds = [] if seed is None else [seed]
+    return seeds
 
 
 def render_msl(

@@ -34,6 +34,7 @@ from .markers import validate_lane_reduce_owners
 from .split import interchange_lane_outside_serial_reductions
 from .split import sink_lane_loops_into_uniform_branches
 from .split import split_lane_loop_reductions
+from .tile_trips import serialize_tile_lane_trips
 
 if TYPE_CHECKING:
     import ast
@@ -125,6 +126,14 @@ def run_root_lane_passes(codegen: GenerateAST) -> None:
             proven_tensor_stride_values=codegen.device_function.proven_tensor_stride_values(),
             rename_groups=lane_rename_groups,
         )
+        # A one-thread tile's lane loop holding a vector row's reductions
+        # becomes a serial loop of rows: the validation refuses the lane loop.
+        serialize_tile_lane_trips(
+            list(codegen.device_function.body),
+            constexpr_value=codegen.device_function.resolved_int_constexpr,
+            rename_groups=lane_rename_groups,
+            new_var=codegen.device_function.new_var,
+        )
         validate_lane_reduce_owners(list(codegen.device_function.body))
     codegen.device_function.body = interchange_lane_outside_serial_reductions(
         list(codegen.device_function.body),
@@ -140,6 +149,7 @@ def run_root_lane_passes(codegen: GenerateAST) -> None:
         ),
         constexpr_value=codegen.device_function.resolved_int_constexpr,
         rename_groups=lane_rename_groups,
+        new_var=codegen.device_function.new_var,
     )
     # The interchange only moves markers that already exist
     # (``_interchange_one_lane_loop`` keeps a nest without
@@ -234,6 +244,14 @@ def sink_root_vector_loops(codegen: GenerateAST) -> None:
             ),
             stores=cute_state.lanes.vloop_sink_stores,
             wide_packet_hints=codegen.device_function.config.cute_wide_packet_hints,
+            # The static block sizes: the chunk-base proofs read their
+            # factors.
+            constexpr_values={
+                name: value
+                for name in codegen.device_function._constexpr_args
+                if (value := codegen.device_function.resolved_int_constexpr(name))
+                is not None
+            },
         )
         cute_state.lanes.vloop_sink_unrolled = unrolled
     if not fired and cute_state.lanes.vloop_sink_shaped_code:

@@ -17,6 +17,7 @@ from helion._testing import RefEagerTestDisabled
 from helion._testing import TestCase
 from helion._testing import code_and_output
 from helion._testing import onlyBackends
+from helion._testing import prefetch_kernels
 from helion._testing import skipIfCudaCapabilityLessThan
 from helion._testing import skipIfNotCUDA
 from helion._testing import skipIfRocm
@@ -95,6 +96,11 @@ def independent_roots(
         hl.prefetch(tmp, [tile])
         out[tile] = y[tile] * 2
     return tmp, out
+
+
+hint_read_roots = helion.kernel(autotune_effort="none", static_shapes=True)(
+    prefetch_kernels.hint_read_roots
+)
 
 
 @helion.kernel(autotune_effort="none", static_shapes=True)
@@ -573,6 +579,27 @@ class TestPrefetch(RefEagerTestDisabled, TestCase):
         torch.testing.assert_close(out, y * 2 + x + 1)
         self.assertEqual(len(_prefetch_lines(code)), 1)
         self.assertIn("tile_dependency", code)
+
+    def test_prefetch_only_root_runs_without_pipeline(self) -> None:
+        # The later root rewrites ``ids`` without waiting for the prefetch-only
+        # root's loads (test_prefetch_hints), so nothing is scheduled.
+        x = torch.randn(64, 256, device=DEVICE)
+        ids = torch.arange(32, device=DEVICE, dtype=torch.int32)
+        z = torch.full_like(ids, 7)
+        # A config saved while the rewrite still waited still loads.
+        config = helion.Config(cross_loop_pipeline="static")
+        spec = hint_read_roots.bind((x, ids, z)).config_spec
+        self.assertTrue(spec.cross_loop_pipeline_retired)
+        spec.normalize(config)
+        self.assertNotIn("cross_loop_pipeline", config)
+        code, out = code_and_output(
+            hint_read_roots,
+            (x, ids, z),
+            pid_type="persistent_blocked",
+            num_sm_multiplier=1,
+        )
+        torch.testing.assert_close(out, z)
+        self.assertNotIn("tile_dependency", code)
 
 
 if __name__ == "__main__":

@@ -157,6 +157,11 @@ def _mark_non_fp32_reads(body: list[ast.stmt]) -> None:
 
 
 _FLOAT_CALL_PREFIXES = ("cutlass.Float32", "cute.math.")
+# The fp32 ``torch.maximum`` / ``minimum`` of a kernel under
+# ``cute_fmnmx_extrema`` (``handler_ops._nan_extremum``), which always return
+# a ``Float32``: typed like the ``cute.math.max`` / ``min`` they replace, so
+# the knob does not cost a product next to an extremum its contraction.
+_FP32_EXTREMA = frozenset({"cute.arch.fmax", "cute.arch.fmin"})
 _NUMERIC_CASTS = (
     "cutlass.Boolean",
     "cutlass.BFloat",
@@ -220,11 +225,14 @@ _RANGE_CALLS = frozenset({"range", "cutlass.range", "cutlass.range_constexpr"})
 class _Fragments:
     """The single-store fp32 fragments (``_single_store_fragments``), the
     names that index one of their elements, and the fragments whose store
-    ``_process_list`` has met with a value proven fp32."""
+    ``_process_list`` has met with a value proven fp32; and whether the
+    kernel's ``cute.arch.fmax`` / ``fmin`` calls are its fp32 pointwise
+    extrema (``_FP32_EXTREMA``)."""
 
     names: frozenset[str]
     indices: frozenset[str]
     proven: set[str] = dataclasses.field(default_factory=set)
+    fp32_extrema: bool = False
 
     def element(self, node: ast.expr) -> bool:
         """``f[i]`` of such a fragment, indexed by one element."""
@@ -335,7 +343,9 @@ def _is_float_expr(
         return _is_float_expr(node.operand, float_names, fragments)
     if isinstance(node, ast.Call):
         func = _callee(node, float_names, fragments)
-        return func.startswith(_FLOAT_CALL_PREFIXES)
+        return func.startswith(_FLOAT_CALL_PREFIXES) or (
+            fragments.fp32_extrema and func in _FP32_EXTREMA
+        )
     return fragments.fp32_element(node)
 
 
@@ -498,8 +508,14 @@ def _process_list(
 
 
 def fuse_fma(
-    body: list[ast.stmt], rename_groups: dict[str, str] | None = None
+    body: list[ast.stmt],
+    rename_groups: dict[str, str] | None = None,
+    *,
+    fp32_extrema: bool = False,
 ) -> list[ast.stmt]:
+    """``fp32_extrema``: the kernel lowers its fp32 ``torch.maximum`` /
+    ``minimum`` to ``cute.arch.fmax`` / ``fmin`` (``cute_fmnmx_extrema``),
+    whose results are fp32 operands like those of the calls they replace."""
     reads, writes = _collect_counts(body)
     _mark_non_fp32_reads(body)
     float_names: set[str] = set()
@@ -509,6 +525,8 @@ def fuse_fma(
         writes,
         float_names,
         rename_groups or {},
-        _single_store_fragments(body, writes),
+        dataclasses.replace(
+            _single_store_fragments(body, writes), fp32_extrema=fp32_extrema
+        ),
     )
     return contract_distributed_scale_subtractions(body, rename_groups or {})

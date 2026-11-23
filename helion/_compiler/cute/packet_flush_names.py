@@ -15,6 +15,8 @@ dtype table of ``persistent_branch_vec`` and to the backend's
 
 from __future__ import annotations
 
+import ast
+
 # Plain packet flush -> its L2 evict-last form.
 PACKET_FLUSH_L2_EVICT_LAST = {
     "_cute_store_u16_vec": "_cute_store_u16x8_l2_evict_last",
@@ -42,3 +44,25 @@ PACKET_FLUSH_HELPER_NAMES = (
     | frozenset(PACKET_FLUSH_L2_EVICT_LAST.values())
     | frozenset(PACKET_FLUSH_STREAMING.values())
 )
+
+
+def streaming_store_rendered(source: str) -> bool:
+    """Whether the generated module ``source`` flushes a packet with the
+    streaming policy (``st.global.cs``, evict-first at L1 and L2): a call of
+    one of the ``PACKET_FLUSH_STREAMING`` helpers, the names
+    ``packet_store_policy.lower_packet_store_policy`` gives the flushes that
+    ``cute_store_policy='streaming'`` applies to.  A config with that policy
+    whose stores are scalars, narrower packets or staged renders none, and
+    its kernel is the default policy's.  The autotuner's final selection asks
+    this of a finalist's rendered source (``CuteBackend.finalist_preference``):
+    ``source`` is the text ``BoundKernel.to_code`` rendered in this process,
+    or the empty string for a kernel without generated code, so it parses.
+    """
+    module = ast.parse(source)
+    streaming = frozenset(PACKET_FLUSH_STREAMING.values())
+    return any(
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id in streaming
+        for node in ast.walk(module)
+    )

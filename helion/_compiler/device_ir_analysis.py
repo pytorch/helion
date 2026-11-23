@@ -234,6 +234,17 @@ TENSOR_ROUTING_OPS = (
     hl.prefetch,
 )
 
+# Ops that keep a prefetching root's loads ordered although they touch no
+# memory: any loop (conservatively: its loads may decide the trip count), a
+# print or breakpoint that shows them.
+_HINT_BREAKING_OPS = (
+    _tracing_ops._for_loop,
+    _tracing_ops._for_loop_step,
+    _tracing_ops._while_loop,
+    hl.device_print,
+    hl.breakpoint,
+)
+
 
 def _may_access_memory_unseen(node: torch.fx.Node, state: CompilerState) -> bool:
     """Whether a side-effecting Helion op or an op on symmetric memory hides accesses."""
@@ -258,6 +269,155 @@ def _accessed_tensor_fake(node: torch.fx.Node) -> torch.Tensor | None:
         if isinstance(value, torch.Tensor):
             return value
     return None
+
+
+# Pure functions a launch-uniform predicate may apply (``_launch_uniform_terms``).
+_UNIFORM_OPS = frozenset(
+    (
+        torch.ops.aten.eq.Scalar,
+        torch.ops.aten.eq.Tensor,
+        torch.ops.aten.ne.Scalar,
+        torch.ops.aten.ne.Tensor,
+        torch.ops.aten.lt.Scalar,
+        torch.ops.aten.lt.Tensor,
+        torch.ops.aten.le.Scalar,
+        torch.ops.aten.le.Tensor,
+        torch.ops.aten.gt.Scalar,
+        torch.ops.aten.gt.Tensor,
+        torch.ops.aten.ge.Scalar,
+        torch.ops.aten.ge.Tensor,
+        torch.ops.aten.bitwise_and.Tensor,
+        torch.ops.aten.bitwise_or.Tensor,
+        torch.ops.aten.bitwise_xor.Tensor,
+        torch.ops.aten.bitwise_not.default,
+        torch.ops.aten.logical_and.default,
+        torch.ops.aten.logical_or.default,
+        torch.ops.aten.logical_not.default,
+        torch.ops.prims.convert_element_type.default,
+        operator.and_,
+        operator.or_,
+        operator.invert,
+    )
+)
+_CONJUNCTIONS = (
+    torch.ops.aten.bitwise_and.Tensor,
+    torch.ops.aten.logical_and.default,
+    operator.and_,
+)
+
+
+def _launch_uniform_terms(
+    mask: object,
+    uniform_tensor: Callable[[torch.Tensor], object | None],
+) -> tuple[frozenset[object], bool]:
+    """The conjuncts of an extra mask that hold one value for the whole launch
+    (keys equal across roots for the same predicate), and whether every
+    conjunct does.
+
+    A launch-uniform conjunct is one element, reads no tile index or program
+    id and reads some data: it is built from constants, one-element loads at
+    constant indices of tensors the kernel never writes (``uniform_tensor``
+    keys a load's tensor by name and view, None when it may change during the
+    launch), broadcasts and the pure functions of ``_UNIFORM_OPS``. Keys hold
+    only names and numbers, so the rank digest compares them across ranks (a
+    gate built from a rank constant differs there).
+    """
+    from ..language import memory_ops
+    from ..language import view_ops
+
+    def broadcast_only(index: object) -> bool:
+        return isinstance(index, (list, tuple)) and all(
+            item is None or is_full_slice(item) for item in index
+        )
+
+    def constant_index(item: object) -> object | None:
+        if type(item) is int:
+            return item
+        if (
+            isinstance(item, torch.fx.Node)
+            and item.target is torch.ops.prims.iota.default
+            and item.args[:1] == (1,)
+            and item.kwargs.get("start", 0) == 0
+        ):
+            return 0
+        return None
+
+    memo: dict[torch.fx.Node, object | None] = {}
+
+    def single(node: torch.fx.Node) -> bool:
+        """One element: a value the whole launch shares, not one per lane."""
+        fake = node.meta.get("val")
+        return isinstance(fake, torch.Tensor) and fake.numel() == 1
+
+    def key(value: object) -> object | None:
+        if isinstance(value, (bool, int, float)):
+            return ("constant", type(value).__name__, value)
+        if isinstance(value, torch.dtype):
+            return ("dtype", str(value))
+        if (
+            not isinstance(value, torch.fx.Node)
+            or value.op != "call_function"
+            or not single(value)
+        ):
+            return None
+        if value in memo:
+            return memo[value]
+        memo[value] = None
+        target, args = value.target, value.args
+        result: object | None = None
+        if target is view_ops.subscript and len(args) >= 2 and broadcast_only(args[1]):
+            result = key(args[0])
+        elif target in _UNIFORM_OPS and not value.kwargs.keys() - {"dtype"}:
+            operands = [key(arg) for arg in args]
+            if all(operand is not None for operand in operands):
+                result = (str(target), *operands, value.kwargs.get("dtype"))
+        elif target is memory_ops.load and len(args) >= 2:
+            fake = _accessed_tensor_fake(value)
+            tensor = None if fake is None else uniform_tensor(fake)
+            index = args[1]
+            extra_mask = args[2] if len(args) >= 3 else None
+            if (
+                tensor is not None
+                and extra_mask is None
+                and isinstance(index, (list, tuple))
+            ):
+                items = [constant_index(item) for item in index]
+                if all(item is not None for item in items):
+                    result = ("load", tensor, tuple(items))
+        memo[value] = result
+        return result
+
+    def boolean(value: object) -> bool:
+        fake = value.meta.get("val") if isinstance(value, torch.fx.Node) else None
+        return isinstance(fake, torch.Tensor) and fake.dtype is torch.bool
+
+    def conjuncts(value: object) -> list[object]:
+        if isinstance(value, torch.fx.Node):
+            if (
+                value.target in _CONJUNCTIONS
+                and len(value.args) == 2
+                and all(boolean(arg) for arg in value.args)
+            ):
+                return [*conjuncts(value.args[0]), *conjuncts(value.args[1])]
+            if (
+                value.target is view_ops.subscript
+                and len(value.args) >= 2
+                and broadcast_only(value.args[1])
+                and isinstance(value.args[0], torch.fx.Node)
+                and value.args[0].target in _CONJUNCTIONS
+            ):
+                return conjuncts(value.args[0])
+        return [value]
+
+    def reads_data(term: object) -> bool:
+        return isinstance(term, tuple) and (
+            term[:1] == ("load",) or any(reads_data(part) for part in term)
+        )
+
+    keys = [key(term) for term in conjuncts(mask)]
+    keys = [k if reads_data(k) else None for k in keys]
+    uniform = frozenset(k for k in keys if k is not None)
+    return uniform, bool(keys) and all(k is not None for k in keys)
 
 
 def _subscript_block_id(env: CompileEnvironment, subscript: object) -> int | None:
@@ -1966,9 +2126,10 @@ class DeviceIRAnalysis:
         """Record allocation-coordinate accesses used for cross-root scheduling."""
         from ..language import memory_ops
         from ..language.atomic_ops import ATOMIC_OPS
-        from ..language.quantized_ops import load_bfloat16_x16_to_float16
-        from ..language.quantized_ops import load_float4_e2m1fn_x16_to_float16
+        from ..language.reduce_ops import _reduce
+        from ..language.scan_ops import _associative_scan
         from .device_ir import memory_op_slots
+        from .loop_dependency_checker import flat_offset_loads
         from .tile_dependency import TileAccess
         from .tile_dependency import owner_roots_by_graph_id
 
@@ -1976,9 +2137,79 @@ class DeviceIRAnalysis:
             return ()
         # Loads of the tensor they are passed at flat offsets (a footprint of
         # the whole tensor), not memory ops of the indexing config.
-        flat_loads = (load_float4_e2m1fn_x16_to_float16, load_bfloat16_x16_to_float16)
+        flat_loads = flat_offset_loads()
 
         graph_owners = owner_roots_by_graph_id(device_ir)
+
+        def owners_of(graph_id: int) -> tuple[int, ...]:
+            return graph_owners[graph_id] if graph_id < len(graph_owners) else ()
+
+        # A root whose only effects are prefetches warms caches and nothing
+        # else: when its loads only steer prefetch addresses (a newer value
+        # warms another line and changes no result), later writes need not
+        # wait for them (``TileAccess.hint``).  So a root with a loop, a print
+        # or an effect is no such root, nor one where a loaded value reaches a
+        # load's operands (an index, a mask: a stale or newer value could make
+        # it read out of bounds) or a load sits in a branch (its condition may
+        # be such a value).
+        prefetching = {
+            root
+            for graph_analysis in self.graphs
+            if any(
+                node.op == "call_function" and node.target is memory_ops.prefetch
+                for node in graph_analysis.nodes
+            )
+            for root in owners_of(graph_analysis.graph_id)
+        }
+        combine_callers = {
+            node.args[0]: graph_analysis.graph_id
+            for graph_analysis in self.graphs
+            for node in graph_analysis.nodes
+            if node.op == "call_function"
+            and node.target in (_reduce, _associative_scan)
+        }
+
+        def hint_owners_of(graph_id: int) -> tuple[int, ...]:
+            # A reduction's or scan's combine function is a graph no loop
+            # owns: it runs in the roots that call it.
+            while graph_id in combine_callers:
+                graph_id = combine_callers[graph_id]
+            return owners_of(graph_id)
+
+        effectful: set[int] = set()
+        if prefetching:
+            for graph_analysis in self.graphs:
+                owners = hint_owners_of(graph_analysis.graph_id)
+                if not prefetching.intersection(owners):
+                    continue
+                for node in graph_analysis.nodes:
+                    if node.op == "call_function" and (
+                        node.target in _HINT_BREAKING_OPS
+                        or _may_access_memory_unseen(node, host.compiler_state)
+                    ):
+                        effectful.update(owners)
+                        break
+
+        def steers_only(root: int) -> bool:
+            top = device_ir.root_ids[root]
+            loaded: set[torch.fx.Node] = set()
+            for graph_analysis in self.graphs:
+                graph_id = graph_analysis.graph_id
+                if root not in hint_owners_of(graph_id):
+                    continue
+                for node in graph_analysis.nodes:
+                    if node.op != "call_function":
+                        continue
+                    reads = node.all_input_nodes
+                    if node.target is memory_ops.load or node.target in flat_loads:
+                        if graph_id != top or not loaded.isdisjoint(reads):
+                            return False
+                        loaded.add(node)
+                    elif graph_id == top and not loaded.isdisjoint(reads):
+                        loaded.add(node)
+            return True
+
+        hint_roots = {root for root in prefetching - effectful if steers_only(root)}
         allocation_ids: dict[torch.UntypedStorage, int] = {}
         accesses: list[TileAccess] = []
         # The indexing slot of each load and store: codegen numbers them in
@@ -1990,6 +2221,50 @@ class DeviceIRAnalysis:
         ):
             if node.target in (memory_ops.load, memory_ops.store):
                 slots.setdefault(node, slot)
+
+        def allocation_of(
+            fake: torch.Tensor,
+        ) -> tuple[torch.UntypedStorage, int | None] | None:
+            """The local allocation a tensor views and the rank whose copy a
+            peer view reaches (None: this rank's), or None when unknown."""
+            source = host.compiler_state.ssa_source(fake)
+            if source is None:
+                return None
+            storage = source.untyped_storage()
+            return host.compiler_state.peer_views.get(storage, (storage, None))
+
+        # Allocations some memory op of the kernel writes: a load of this
+        # rank's copy of any other one reads one value for the whole launch.
+        written: set[torch.UntypedStorage] = set()
+        for graph_analysis in self.graphs:
+            for node in graph_analysis.nodes:
+                if node.op == "call_function" and (
+                    node.target is memory_ops.store or node.target in ATOMIC_OPS
+                ):
+                    fake = _accessed_tensor_fake(node)
+                    allocation = None if fake is None else allocation_of(fake)
+                    if allocation is not None:
+                        written.add(allocation[0])
+
+        def uniform_tensor(fake: torch.Tensor) -> object | None:
+            allocation = allocation_of(fake)
+            origin = host.tensor_to_origin.get(fake)
+            if (
+                allocation is None
+                or allocation[1] is not None
+                or allocation[0] in written
+                or origin is None
+                or origin.root_rw_name() is None
+            ):
+                return None
+            # The whole host path (gates[0] and gates[1] differ).
+            return (
+                origin.host_str(),
+                str(fake.dtype),
+                tuple(map(str, fake.shape)),
+                tuple(map(str, fake.stride())),
+                str(fake.storage_offset()),
+            )
 
         for graph_analysis in self.graphs:
             for graph_node_index, node in enumerate(graph_analysis.nodes):
@@ -2119,11 +2394,13 @@ class DeviceIRAnalysis:
                     and len(node.args) > (2 if is_load else 3)
                     and node.args[2 if is_load else 3] is not None
                 )
-                owner_roots = (
-                    graph_owners[graph_analysis.graph_id]
-                    if graph_analysis.graph_id < len(graph_owners)
-                    else ()
-                )
+                mask_uniform_terms: frozenset[object] = frozenset()
+                mask_is_uniform = False
+                if has_explicit_mask and not is_flat_load:
+                    mask_uniform_terms, mask_is_uniform = _launch_uniform_terms(
+                        node.args[2 if is_load else 3], uniform_tensor
+                    )
+                owner_roots = owners_of(graph_analysis.graph_id)
                 if owner_roots:
                     node.meta[TILE_ACCESS_META] = tuple(
                         range(len(accesses), len(accesses) + len(owner_roots))
@@ -2151,6 +2428,8 @@ class DeviceIRAnalysis:
                             subscript_offsets=subscript_offsets,
                             subscript_is_scalar=subscript_is_scalar,
                             has_explicit_mask=has_explicit_mask,
+                            mask_uniform_terms=mask_uniform_terms,
+                            mask_is_uniform=mask_is_uniform,
                             subscript_is_full_slice=subscript_is_full_slice,
                             subscript_static_extents=subscript_static_extents,
                             subscript_dense_spans=subscript_dense_spans,
@@ -2158,6 +2437,7 @@ class DeviceIRAnalysis:
                             layout_is_symbolically_exact=layout_is_symbolically_exact,
                             graph_node_index=graph_node_index,
                             affine_subscript_ranges=affine_subscript_ranges,
+                            hint=is_load and owner_root in hint_roots,
                         )
                     )
 

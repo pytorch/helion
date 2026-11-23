@@ -2171,24 +2171,9 @@ class _Evaluator:
             )
             for input_node in inputs
         ]
-        output = node.meta.get("val")
-        # Fragment FP32 values can use the native reciprocal instruction for
-        # sigmoid. Keep the ordinary CuTe epilogue lowering unchanged.
-        if (
-            node.target is torch.ops.aten.sigmoid.default
-            and isinstance(output, torch.Tensor)
-            and output.dtype is torch.float32
-            and CompileEnvironment.current().settings.fast_math
-        ):
-            if len(input_values) != 1:
-                raise RuntimeError("invalid fragment sigmoid input count")
-            return self._bind(
-                "tcgen05_epi_value",
-                expr_from_string(
-                    "_cute_sigmoid_approx_ftz_f32({x})",
-                    x=input_values[0],
-                ),
-            )
+        # A sigmoid takes the pointwise lowering like every other op, with and
+        # without ``fast_math`` (``SIGMOID_TEMPLATE``): a fused epilogue
+        # computes the bits of the configs that do not fuse it.
         statements: list[ast.AST] = []
         result = lower_pointwise_scalar(
             self.state.codegen,

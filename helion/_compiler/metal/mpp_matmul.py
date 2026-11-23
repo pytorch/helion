@@ -142,6 +142,8 @@ if TYPE_CHECKING:
     from ..device_ir import IfGraphInfo
     from ..generate_ast import GenerateAST
     from .fragment_mma import FragmentLowering
+    from .mpp_registers import RegisterLowering
+    from .mpp_registers import RegisterRun
 
 ACC = "_helion_mpp_acc"
 #: Position of ``_helion_mpp_acc``'s seed argument: the name of its staged seed tile,
@@ -159,7 +161,26 @@ ELEMENTS = "_helion_mpp_elements"
 FRAG_RUN = "_helion_mpp_fragments"
 FRAG_A = "_helion_mpp_frag_a"
 FRAG_B = "_helion_mpp_frag_b"
-_ELEMENT_LOOPS = (ELEMENTS, FRAG_RUN, FRAG_A, FRAG_B)
+#: An MPP op whose computed operands are cooperative tensors each lane fills
+#: in registers (``mpp_registers``): the loop over its K tile's steps, and
+#: in it the loops over the elements each lane holds of its left and right
+#: inputs, and, under an affine split, of the destination.
+REG_RUN = "_helion_mpp_registers"
+REG_A = "_helion_mpp_reg_a"
+REG_B = "_helion_mpp_reg_b"
+REG_EPILOGUE = "_helion_mpp_reg_epilogue"
+#: The runs whose element statements fold per element (``operand_elements``).
+ELEMENT_RUNS = (FRAG_RUN, REG_RUN)
+_ELEMENT_LOOPS = (
+    ELEMENTS,
+    FRAG_RUN,
+    FRAG_A,
+    FRAG_B,
+    REG_RUN,
+    REG_A,
+    REG_B,
+    REG_EPILOGUE,
+)
 BIND = "_helion_mpp_bind"
 STAGE = "_helion_mpp_stage"
 MAT = "_helion_mpp_materialize"
@@ -234,7 +255,7 @@ WRITES = (
 )
 
 #: One ``matmul2d`` op's hardware-validated tile range (M, N, K).
-_MAX_TILE = (128, 128, 256)
+MAX_OP_TILE = (128, 128, 256)
 #: M or N up to this when the op's scope has ``_WIDE_MIN_SIMDGROUPS`` or more.
 #: Measured on an M4 Pro: a wide M or N miscomputes on one SIMD group and a
 #: wide N on two, while device views, staged and transposed operands, loaded
@@ -362,6 +383,17 @@ class _Operand:
     #: The group from whose element loop the operand is staged
     #: (:func:`_link_element_staging`); None to stage it from the Scalar layout.
     elements: int | None = None
+    #: A few-row activation read as the 16-bit view it widens
+    #: (:func:`_operand`), whose transposed group's runs order their MMAs
+    #: fragment by fragment (``fragment_mma``).
+    few_rows: bool = False
+    #: A computed operand a lane can recompute at any element, which a launch
+    #: of one SIMD group builds in registers instead of staging
+    #: (``mpp_registers``).
+    registers: bool = False
+    #: A computed operand that widens a 16-bit device view (``x.to(float32)``):
+    #: the view, which a register run may read instead (``mpp_registers``).
+    widened: View | None = None
 
     @property
     def staged(self) -> bool:
@@ -461,13 +493,27 @@ class MppPlan:
     #: The storages the kernel writes, keyed by fake storage so views of one
     #: tensor fall together (as ``free_arange._check_write_once``).
     written: set[StorageWeakRef] = dataclasses.field(default_factory=set)
-    #: Each op's (M, N) when either is over ``_MAX_TILE``'s, checked against
+    #: Each op's (M, N) when either is over ``MAX_OP_TILE``'s, checked against
     #: the launch's SIMD groups (``check_mpp_launch``).
     wide: dict[int, tuple[int, int]] = dataclasses.field(default_factory=dict)
     #: The lowering of every group when the config asks for fragments.
     fragment: FragmentLowering | None = None
-    #: The SIMD groups that split each fragment group's K loop (``num_warps``,
-    #: ``fragment_mma``), each running the tile's 32-thread layout.
+    #: The lowering of computed operands in registers (``mpp_registers``),
+    #: under an MPP config; codegen takes it for a group where the launch
+    #: is one SIMD group.
+    registers: RegisterLowering | None = None
+    #: The groups whose ops take their operands in registers, each to the
+    #: launch's threads codegen saw, which ``check_mpp_launch`` checks.
+    register_groups: dict[int, int] = dataclasses.field(default_factory=dict)
+    #: Each group's register run, or None for the staged op, decided once at
+    #: its accumulator (:func:`_acc_expr`), which its run then follows:
+    #: inside a loop the launch's thread axes codegen sees differ.
+    register_specs: dict[int, RegisterRun | None] = dataclasses.field(
+        default_factory=dict
+    )
+    #: The SIMD groups that split each group's K loop (``num_warps``): a
+    #: fragment group's (``fragment_mma``) or a register run's
+    #: (``mpp_registers``), each running the tile's 32-thread layout.
     split: int = 1
 
     def groups(self) -> list[MppGroup]:
@@ -861,24 +907,122 @@ def _operand(
     dims: tuple[tuple[int, int], tuple[int, int]],
     batch: int | None,
     graphs: Graphs,
+    widen: bool = False,
 ) -> _Operand:
     """A device view when the operand is one, else staged.  The threads
     compute a staged operand in the Scalar layout, one element per block
     coordinate (``c`` parts on a factored K), and write it into the tile at
     those coordinates, so every node it is computed from must meet its
-    operands' dims by block."""
+    operands' dims by block.  A staged float32 operand that widens a 16-bit
+    view records the view (``widened``), which MPP's register runs may read
+    instead (``mpp_registers``).  Under the fragment lowering, with
+    ``widen`` (:func:`_widen`), an lhs of float32 that widens a 16-bit view
+    (:func:`_widened_view`) of at most :data:`_WIDENED_ROWS` rows, as a
+    decode's activation does, is that view, read and widened at each
+    element (``few_rows``)."""
     try:
         view = _view(node, dims, batch, graphs)
     except _NotAView:
         val = node.meta["val"]
         assert isinstance(val, torch.Tensor)
+        widened = _widened_view(node, dims, batch, graphs)
+        if widened is not None and widen and _few_rows(widened):
+            return _Operand(val.dtype, widened, few_rows=True)
         if val.dtype not in _OPERAND_DTYPES:
             raise metal_unsupported(f"an MPP operand of dtype {val.dtype}") from None
         positional_rebind.check_positional_merges(
             _producers(node, graphs), _STAGE_REBIND
         )
-        return _Operand(val.dtype)
+        return _Operand(val.dtype, widened=widened)
     return _Operand(view.tensor.dtype, view)
+
+
+#: The most rows a fragment group's activation may have to be read as the
+#: view it widens (:func:`_operand`): a few-row matmul's.
+_WIDENED_ROWS = 16
+
+
+def _widen(allowed: bool, weight: Node, graphs: Graphs) -> bool:
+    """Whether a fragment group (``allowed``: its K tiles whole and not
+    loaded a tile ahead) may read its lhs, a few-row activation, as the
+    16-bit view it widens (:func:`_operand`), which transposes the group
+    (``fragment_mma.transposed``): the rhs ``weight`` then is the MMA's A.
+    Only for the weights that form was measured to pay on: codes unpacked
+    from integer words by shifts (as 4- and 8-bit affine weights are), each
+    tensor read once per element and none at an index read from memory.  Codes that straddle two words (5 or 6 bits) ran slower in that
+    form and stay untransposed, as do other computed weights (a dense int8
+    weight, a lookup table's), whose transposed form wasn't measured."""
+    if not allowed:
+        return False
+    producers = _producers(weight, graphs)
+    loads = [n for n in producers if n.target is load]
+    keys = [storage_key(n) for n in loads]
+    codes = any(
+        isinstance(val := n.meta.get("val"), torch.Tensor)
+        and not val.dtype.is_floating_point
+        for n in loads
+    )
+    unpacked = any(
+        isinstance(n.target, torch._ops.OpOverload)
+        and n.target.overloadpacket in _SHIFTS
+        for n in producers
+    )
+    gathered = any(
+        m.target is load
+        for n in loads
+        for index in n.all_input_nodes
+        for m in _producers(index, graphs)
+    )
+    return codes and unpacked and not gathered and len(keys) == len(set(keys))
+
+
+#: The right shifts that unpack codes from words (:func:`_widen`).
+_SHIFTS = (torch.ops.aten.__rshift__, torch.ops.aten.bitwise_right_shift)
+
+
+def _widened_view(
+    node: Node,
+    dims: tuple[tuple[int, int], tuple[int, int]],
+    batch: int | None,
+    graphs: Graphs,
+) -> View | None:
+    """The 16-bit device view a float32 operand widens (``x.to(float32)``),
+    exactly, or None."""
+    val = node.meta["val"]
+    if node.target not in WIDENING or val.dtype != torch.float32:
+        return None
+    source = node.args[0]
+    if not isinstance(source, Node):
+        return None
+    source_val = source.meta.get("val")
+    if not isinstance(source_val, torch.Tensor) or source_val.dtype not in (
+        torch.float16,
+        torch.bfloat16,
+    ):
+        return None
+    try:
+        return _view(source, dims, batch, graphs)
+    except (_NotAView, exc.BackendUnsupported):
+        return None
+
+
+#: Conversions whose result holds its input's values exactly.
+WIDENING = (
+    torch.ops.prims.convert_element_type.default,
+    torch.ops.aten._to_copy.default,
+)
+
+
+def _few_rows(view: View) -> bool:
+    """Whether an lhs ``view``'s rows number at most :data:`_WIDENED_ROWS`. A
+    fragment group that reads such an activation as its view, beside a
+    computed weight, takes the transposed form
+    (``fragment_mma.transposed``): the weight is the MMA's A, each lane's
+    elements one run of K positions of one row."""
+    from .backend import static_extent
+
+    rows = static_extent(view.tensor.size(view.positions[0]))
+    return rows is not None and rows <= _WIDENED_ROWS
 
 
 def _view_mask(extra_mask: object, dims: Sequence[Dim], graphs: Graphs) -> None:
@@ -919,6 +1063,8 @@ def plan_mpp_matmuls(
     graphs: list[GraphInfo],
     threaded: set[int],
     fragment: FragmentLowering | None = None,
+    widen_k: Callable[[int], bool] | None = None,
+    registers: RegisterLowering | None = None,
 ) -> MppPlan:
     """Admit each aten matmul (``addmm``, ``mm``, ``bmm``, ``baddbmm``), each
     ``hl.dot`` over a K held as per-thread parts, and the other ``hl.dot`` calls
@@ -928,7 +1074,13 @@ def plan_mpp_matmuls(
     than one thread; ``fragment`` (``fragment_mma.FRAGMENT_LOWERING`` under
     the config's ``metal_matmul="fragment"``) lowers every group on
     simdgroup-matrix fragments, or raises ``BackendUnsupported`` for one that
-    can't be.
+    can't be; ``widen_k`` says of a K block whether the config's tiles of
+    it are whole and loaded in their own iteration, where a few-row
+    activation may be read as the view it widens (:func:`_widen`; None:
+    they are); ``registers`` (``mpp_registers.REGISTER_LOWERING`` under
+    the config's ``metal_matmul="mpp"``) marks the computed operands it can
+    build in registers, which codegen does where the launch is one SIMD
+    group, instead of staging them.
 
     Each use of a group's cooperative value is decided from the FX graph: an
     element-wise use or a store that an element loop can evaluate at any
@@ -955,9 +1107,9 @@ def plan_mpp_matmuls(
     take_dots = (
         bool(dots)
         and all(_dot_admissible(m, dot_ks) for m in dots)
-        and _takes_dots(graphs, threaded, fragment)
+        and _takes_dots(graphs, threaded, fragment, widen_k)
     )
-    return _plan_matmuls(graphs, take_dots, fragment)
+    return _plan_matmuls(graphs, take_dots, fragment, widen_k, registers)
 
 
 def has_matmuls(graphs: list[GraphInfo]) -> bool:
@@ -976,10 +1128,12 @@ def _plan_matmuls(
     graphs: list[GraphInfo],
     take_dots: bool,
     fragment: FragmentLowering | None = None,
+    widen_k: Callable[[int], bool] | None = None,
+    registers: RegisterLowering | None = None,
 ) -> MppPlan:
     from ..device_ir import ForLoopGraphInfo
 
-    plan = MppPlan(fragment=fragment)
+    plan = MppPlan(fragment=fragment, registers=registers)
     taken: set[Node] = set()
     products: list[MppGroup] = []
     live = live_graphs(graphs)
@@ -1026,15 +1180,17 @@ def _plan_matmuls(
                     )
                 continue
             tile_product = True
-        if k_block is not None:
-            group = _plan_full_k(len(plan.by_matmul), matmul, k_block, known)
-        elif not isinstance(g, ForLoopGraphInfo) or len(g.block_ids) != 1:
-            raise metal_unsupported(
-                "a matmul over a tiled K outside its K loop; loop over K with "
-                "hl.tile, or take K whole with a ':' slice"
-            )
-        else:
-            group = _plan_group(len(plan.by_matmul), matmul, g.block_ids[0], known)
+        plan_k = _plan_full_k
+        if k_block is None:
+            if not isinstance(g, ForLoopGraphInfo) or len(g.block_ids) != 1:
+                raise metal_unsupported(
+                    "a matmul over a tiled K outside its K loop; loop over K "
+                    "with hl.tile, or take K whole with a ':' slice"
+                )
+            k_block = g.block_ids[0]
+            plan_k = _plan_group
+        widen = fragment is not None and (widen_k is None or widen_k(k_block))
+        group = plan_k(len(plan.by_matmul), matmul, k_block, known, widen)
         # Each group's op updates its storage in place, so one value can hold
         # only one group's cooperative tensor.
         storage = group.old | group.cur
@@ -1069,6 +1225,8 @@ def _plan_matmuls(
             _finalize(group, plan, known)
             if fragment is not None:
                 fragment.check_group(group, plan, known)
+            if registers is not None:
+                registers.check_group(group, plan, known)
     return plan
 
 
@@ -1170,6 +1328,7 @@ def _takes_dots(
     graphs: list[GraphInfo],
     threaded: set[int],
     fragment: FragmentLowering | None = None,
+    widen_k: Callable[[int], bool] | None = None,
 ) -> bool:
     """Whether the planner takes the kernel's ``hl.dot`` calls: it
     plans a copy of the graphs with them, with ``fragment``'s lowering when
@@ -1190,7 +1349,7 @@ def _takes_dots(
         if _matmul_derived(_node(m.args[side]), known)
     }
     try:
-        plan = _plan_matmuls(copies, take_dots=True, fragment=fragment)
+        plan = _plan_matmuls(copies, take_dots=True, fragment=fragment, widen_k=widen_k)
     except exc.BackendUnsupported:
         return False
     if any(
@@ -1245,7 +1404,7 @@ def _dot_admissible(matmul: Node, dot_ks: set[int]) -> bool:
     for size, low, high, is_k in (
         (lval.size(-2), 8, _WIDE_TILE, False),
         (rval.size(-1), 8, _WIDE_TILE, False),
-        (lval.size(-1), 16, _MAX_TILE[2], True),
+        (lval.size(-1), 16, MAX_OP_TILE[2], True),
     ):
         block = block_id_of(size)
         if block is None or (tile := _static_tile(block)) is None:
@@ -1332,7 +1491,12 @@ def _if_result(if_node: Node, index: int, graphs: Graphs) -> Node | None:
     return value if isinstance(value, Node) else None
 
 
-def _plan_group(gid: int, matmul: Node, k_loop_block: int, graphs: Graphs) -> MppGroup:
+def _plan_group(
+    gid: int, matmul: Node, k_loop_block: int, graphs: Graphs, widen: bool = False
+) -> MppGroup:
+    """The group of ``matmul``, accumulated across its K loop over
+    ``k_loop_block``; ``widen``: whether a fragment group may read a few-row
+    activation as the 16-bit view it widens (:func:`_widen`)."""
     acc, lhs, rhs = matmul_operands(matmul)
     assert acc is not None
     placeholder = acc
@@ -1375,7 +1539,7 @@ def _plan_group(gid: int, matmul: Node, k_loop_block: int, graphs: Graphs) -> Mp
         m,
         n,
         kdim[0],
-        _operand(lhs, ((m, 1), kdim), batch, graphs),
+        _operand(lhs, ((m, 1), kdim), batch, graphs, _widen(widen, rhs, graphs)),
         _operand(rhs, (kdim, (n, 1)), batch, graphs),
         k_factor=kdim[1],
         levels=levels,
@@ -1588,7 +1752,9 @@ def _full_k(matmul: Node) -> int | None:
     return block
 
 
-def _plan_full_k(gid: int, matmul: Node, k_block: int, graphs: Graphs) -> MppGroup:
+def _plan_full_k(
+    gid: int, matmul: Node, k_block: int, graphs: Graphs, widen: bool = False
+) -> MppGroup:
     """A matmul over a ``:`` K: one op over the whole K, seeded by a constant
     fill or a Scalar value of the op's own graph, or, with no acc, by zeros
     the op emits itself.  Also a matmul with no acc in the loop over its
@@ -1621,7 +1787,7 @@ def _plan_full_k(gid: int, matmul: Node, k_block: int, graphs: Graphs) -> MppGro
         m,
         n,
         kdim[0],
-        _operand(lhs, ((m, 1), kdim), batch, graphs),
+        _operand(lhs, ((m, 1), kdim), batch, graphs, _widen(widen, rhs, graphs)),
         _operand(rhs, (kdim, (n, 1)), batch, graphs),
         batch_block=batch,
     )
@@ -2875,7 +3041,8 @@ def check_mpp_launch(plan: MppPlan, block_dims: Sequence[int]) -> None:
     """Every thread joins each MPP op, whose scope is the launch's SIMD
     groups.  A fragment group's tile takes one SIMD group's 32 threads,
     ``block_dims``, which each of the ``split`` SIMD groups of the launch
-    runs."""
+    runs; so does a register run's when SIMD groups split its K loop
+    (``mpp_registers.register_split``)."""
     if not plan.by_matmul:
         return
     threads = math.prod(block_dims)
@@ -2898,11 +3065,22 @@ def check_mpp_launch(plan: MppPlan, block_dims: Sequence[int]) -> None:
             "needs whole 32-thread SIMD groups and at most 1024 threads (change "
             "num_threads or the block sizes)"
         )
+    # Codegen builds operands in registers only for the launch it sees
+    # (``mpp_registers.register_run_spec``), whose SIMD groups a split
+    # stacks (``register_split`` checked both).
+    assert all(t == threads for t in plan.register_groups.values()), (
+        threads,
+        plan.register_groups,
+    )
+    assert plan.split == 1 or (threads == 32 and plan.split * 32 <= 1024), (
+        threads,
+        plan.split,
+    )
     for m, n in plan.wide.values():
         if threads // 32 < _WIDE_MIN_SIMDGROUPS:
             raise metal_unsupported(
                 f"an MPP matmul tile {m}x{n} on {threads // 32} SIMD groups; over "
-                f"{_MAX_TILE[0]} rows or columns it needs {_WIDE_MIN_SIMDGROUPS} "
+                f"{MAX_OP_TILE[0]} rows or columns it needs {_WIDE_MIN_SIMDGROUPS} "
                 "(raise num_warps)"
             )
 
@@ -2917,8 +3095,18 @@ def current_plan() -> MppPlan:
 
 def _transposed(operand: _Operand) -> bool:
     """A staged tile is written row-major."""
-    view = operand.view
-    return view is not None and view.strides[1] != 1
+    return operand.view is not None and transposed_view(operand.view)
+
+
+def transposed_view(view: View) -> bool:
+    """Whether a 2-D view's rows aren't contiguous: MPP reads it transposed."""
+    return view.strides[1] != 1
+
+
+def view_span(view: View, tile: Sequence[int]) -> int:
+    """The elements a view's handle over ``tile`` spans from its origin;
+    MPP tensor handles index in int32."""
+    return 1 + sum((b - 1) * s for b, s in zip(tile, view.strides, strict=True))
 
 
 def group_sides(group: MppGroup) -> tuple[tuple[_Operand, tuple[int, int], int], ...]:
@@ -3071,15 +3259,20 @@ def _acc_expr(
     group's carries its fragment grid as ``fragment=(rows, cols,
     transposed)`` (``FragmentLowering.acc_keywords``)."""
     lowering = current_plan().fragment
+    registers = current_plan().registers
+    spec = None if registers is None else registers.spec(cg, group)
+    current_plan().register_specs[group.gid] = spec
     tile = static_tile(cg, (group.m_block, group.n_block, group.k_block))
     tile[2] *= group.k_factor
-    limits = (_WIDE_TILE, _WIDE_TILE, _MAX_TILE[2])
-    if lowering is None and any(
-        b > limit for b, limit in zip(tile, limits, strict=True)
+    limits = (_WIDE_TILE, _WIDE_TILE, MAX_OP_TILE[2])
+    if (
+        lowering is None
+        and spec is None
+        and any(b > limit for b, limit in zip(tile, limits, strict=True))
     ):
         raise metal_unsupported(
             f"an MPP matmul tile {tile[0]}x{tile[1]}x{tile[2]}: one op covers M, "
-            f"N <= {_WIDE_TILE} and K <= {_MAX_TILE[2]}"
+            f"N <= {_WIDE_TILE} and K <= {MAX_OP_TILE[2]}"
         )
     m, n, k = tile
     block_m, block_n = m, n
@@ -3092,8 +3285,16 @@ def _acc_expr(
     keywords = ""
     if lowering is not None:
         keywords = lowering.acc_keywords(cg, group, m, n, k)
+    elif spec is not None:
+        # The op on cooperative inputs (``mpp_registers``): its own M, N and K.
+        assert registers is not None
+        keywords = registers.acc_keywords(spec)
+        m, n, k = spec.atom.m, spec.atom.n, spec.atom.k
+        current_plan().register_groups[group.gid] = math.prod(
+            cg.launch_thread_axis_sizes().values()
+        )
     else:
-        if m > _MAX_TILE[0] or n > _MAX_TILE[1]:
+        if m > MAX_OP_TILE[0] or n > MAX_OP_TILE[1]:
             current_plan().wide[group.gid] = (m, n)
         # MPP's static_asserts for a SIMD-group scope (MPPTensorOpsMatMul2dImpl.h).
         if m % 8 or n % 8 or (m % 16 and n % 16) or k % 16:
@@ -3712,7 +3913,11 @@ def _staged_args(
 
 
 def _codegen_matmul(
-    cg: GenerateAST, node: Node, acc: object, values: tuple[object, object]
+    cg: GenerateAST,
+    node: Node,
+    acc: object,
+    values: tuple[object, object],
+    env: Mapping[Node, object],
 ) -> ast.AST:
     group = current_plan().by_matmul[node]
     _check_threads(cg, group)
@@ -3726,6 +3931,12 @@ def _codegen_matmul(
     lowering = current_plan().fragment
     if lowering is not None:
         return lowering.codegen_run(cg, group, acc, values)
+    registers = current_plan().registers
+    # The accumulator decided the op's form (:func:`_acc_expr`).
+    spec = current_plan().register_specs.get(group.gid)
+    if spec is not None:
+        assert registers is not None
+        return registers.codegen_run(cg, group, acc, values, env, spec)
     tiles: list[int] = []
     tile_dims: list[str] = []
     parts: list[list[str]] = []
@@ -3768,7 +3979,7 @@ def _codegen_matmul(
             # Each handle is rebased at its tile in 64 bits, so every offset
             # MPP computes inside it (in int32) is below the tile's span; the
             # outer dims are folded into the base.
-            span = 1 + sum((b - 1) * s for b, s in zip(tile, view.strides, strict=True))
+            span = view_span(view, tile)
             if span >= 2**31:
                 raise metal_unsupported(
                     f"an MPP view whose tile spans {span} elements (MPP tensor "
@@ -3851,7 +4062,11 @@ def _codegen_aten_matmul(ctx: LoweringContext, node: Node) -> object:
             )
         )
     return _codegen_matmul(
-        cg, node, None if acc is None else ctx.env[acc], (ctx.env[lhs], ctx.env[rhs])
+        cg,
+        node,
+        None if acc is None else ctx.env[acc],
+        (ctx.env[lhs], ctx.env[rhs]),
+        ctx.env,
     )
 
 
@@ -3868,7 +4083,7 @@ def codegen_dot_metal(state: CodegenState) -> ast.AST:
     cg = state.codegen
     assert isinstance(cg, GenerateAST)
     lhs, rhs, acc = state.ast_args[0], state.ast_args[1], state.ast_args[2]
-    return _codegen_matmul(cg, node, acc, (lhs, rhs))
+    return _codegen_matmul(cg, node, acc, (lhs, rhs), state.env)
 
 
 # MSL assembly: element loops for stores of cooperative values.
@@ -4225,12 +4440,14 @@ def elementize(
     tg_buffers: frozenset[str],
     tg_size: Sequence[int] | None,
     fragment: FragmentLowering,
+    registers: RegisterLowering,
 ) -> list[ast.stmt]:
     """Move each store of a cooperative value into a loop over the
     cooperative tensor's elements; ``tensor_dtypes`` are the kernel's tensor
     parameters' dtypes, ``tg_buffers`` its threadgroup buffer names and
     ``tg_size`` its threadgroup's threads per axis.  ``fragment`` lowers
-    fragment groups' ops.
+    fragment groups' ops, and ``registers`` ops that take operands in
+    registers.
 
     The loop binds the Scalar layout's thread of each element and re-runs the
     recomputed statements the store reads, in body order.  A collective's
@@ -4238,7 +4455,8 @@ def elementize(
     collective can't run there, and the planner admits such a value only when
     it is 0-d, the same on every thread.
 
-    A fragment group's op becomes its fragment run (``fragment_mma``), whose
+    A fragment group's op becomes its fragment run (``fragment_mma``), and an
+    op with register operands its register run (``mpp_registers``), whose
     operand loops re-run, by the same rules, the statements that compute each
     operand element.
     """
@@ -4301,7 +4519,8 @@ def elementize(
         _bind_name(b)
         for a in _assigns(body)
         if call_name(a.value) == RUN
-        for side in fragment.run_binds(cast("ast.Call", a.value))
+        for lowering in (fragment, registers)
+        for side in lowering.run_binds(cast("ast.Call", a.value))
         for b in side
     }
     copies = _Copies(body, bound, set(alias), leaves, vec_reads)
@@ -4319,13 +4538,17 @@ def elementize(
             t, value = _assigned(s) or (None, None)
             if isinstance(value, ast.Call) and call_name(value) == RUN:
                 copies.rewrite_run(value)
-                if fragment.run_binds(value):
-                    # The op on fragments: its loop, then the result's name
-                    # as a reference to the accumulator it updated.
+                lowering = next(
+                    (x for x in (fragment, registers) if x.run_binds(value)), None
+                )
+                if lowering is not None:
+                    # The op on fragments or register operands: its loop, then
+                    # the result's name as a reference to the accumulator it
+                    # updated.
                     assert t is not None
                     src = _node_name(value.args[0])
                     out.append(
-                        fragment.run(
+                        lowering.run(
                             value,
                             groups[alias[src]],
                             lambda b, r, c: rerun(b, r, c, seen)[0],

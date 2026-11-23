@@ -3065,6 +3065,9 @@ _NOT_RELOADED = (
 )
 #: 64 lane copies of the staging writes in a K loop.
 JAM64 = helion.Config(block_sizes=[128, 16, 16], num_threads=[2, 2, 8])
+#: JAM64's lane jam on two SIMD groups, which stage a computed operand; on
+#: JAM64's one, MPP builds it in registers (``mpp_registers``).
+JAM64_STAGED = helion.Config(block_sizes=[128, 16, 16], num_threads=[2, 2, 16])
 _NOT_FOLLOWED = (
     "whose bfloat conversions the planner does not follow (a loop, an if or a "
     "node with several outputs)"
@@ -4981,7 +4984,8 @@ class TestMppStaging(_MppCase):
         at a fixed address too or beside the K tile's index, from a constant
         fill, a scalar argument or a
         block size, and a ':' K view staged in its loop because the loop
-        writes its tensor, under a lane jam."""
+        writes its tensor, under a lane jam; on one SIMD group (JAM64) the
+        K loop's operand is built in registers instead."""
         bf = torch.bfloat16
         x = torch.randn(48, 72, device=DEVICE, dtype=bf)
         y = torch.randn(72, 128, device=DEVICE, dtype=bf)
@@ -4996,7 +5000,7 @@ class TestMppStaging(_MppCase):
         k = torch.randn(40, 128, device=DEVICE, dtype=bf)
         q0 = q.clone()
         jam32 = helion.Config(block_sizes=[64, 16], num_threads=[2, 8], num_warps=32)
-        jams = (None, JAM64)
+        jams = (None, JAM64_STAGED, JAM64)
         for kernel, args, configs, expected in (
             (kloop_load_exp, (x, y), jams, ref(torch.exp(xf * 0.5))),
             (
@@ -5013,7 +5017,11 @@ class TestMppStaging(_MppCase):
             (
                 kloop_block_size,
                 (x, y),
-                (helion.Config(block_sizes=[64, 16, 16], num_warps=32), JAM64),
+                (
+                    helion.Config(block_sizes=[64, 16, 16], num_warps=32),
+                    JAM64_STAGED,
+                    JAM64,
+                ),
                 ref(xf + 16),
             ),
             (
@@ -5032,8 +5040,16 @@ class TestMppStaging(_MppCase):
                 with self.subTest(kernel=kernel.name, config=config):
                     out, _, msl = _run(kernel, args, config)
                     _close(out, expected)
+                    if config is JAM64 and kernel is not kloop_arg_scale:
+                        # One SIMD group builds the K loop's operand in
+                        # registers; kloop_arg_scale's reads a scalar
+                        # argument, which the lanes' recompute check
+                        # (OperandRecomputable) doesn't follow: staged.
+                        self.assertIn("_mr_a", msl)
+                        continue
                     self.assertIn("threadgroup bfloat _mpp_tile", msl)
-                    if config is configs[1]:
+                    if config is configs[1] or config is JAM64:
+                        # A one-SIMD-group stage jams its lanes.
                         self.assertIn("__lane1", msl)
         torch.testing.assert_close(q, q0)
 

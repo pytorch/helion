@@ -118,20 +118,78 @@ def _record_pad_info(
     blocks[block_id] = max(blocks.get(block_id, 0), extra_pad)
 
 
-def _ref_masked_slice_indices(
-    tensor: torch.Tensor, indices: list[object]
-) -> list[object]:
-    """Include sliced axes in Cartesian indexing and mask broadcasting."""
-    index_dtype = next(
-        (index.dtype for index in indices if isinstance(index, torch.Tensor)),
-        torch.int64,
+def _ref_broadcast_indices(
+    tensor: torch.Tensor, index: list[object]
+) -> list[object] | None:
+    """``index`` with every tile, slice and index tensor expanded to the shape
+    of the indexed result, when its index tensors broadcast; else None.
+
+    Compiled code broadcasts the index tensors of consecutive positions
+    against each other unless all are one-dimensional (the Cartesian product
+    the callers build for every other index).  The dims of their common shape
+    sit where the first of them is; a tile or slice keeps a dim of its own
+    (the layout ``atomic_ops._ref_lane_coords`` gives the atomics).
+    """
+    from ..runtime.ref_mode import slice_indices
+    from .ref_tile import RefTile
+
+    block = {
+        i: idx
+        for i, idx in enumerate(index)
+        if isinstance(idx, torch.Tensor) and not isinstance(idx, RefTile)
+    }
+    if (
+        # A None would shift the dims that the entries after it index.
+        not all(isinstance(idx, (torch.Tensor, slice, int)) for idx in index)
+        # An index tensor beside integers alone needs no layout.
+        or sum(not isinstance(idx, int) for idx in index) < 2
+        or not any(idx.ndim > 1 for idx in block.values())
+        or list(block) != list(range(min(block), max(block) + 1))
+    ):
+        return None
+    indices = slice_indices(
+        tensor, [idx.index if isinstance(idx, RefTile) else idx for idx in index]
     )
-    return [
-        torch.arange(tensor.size(dim), device=tensor.device, dtype=index_dtype)[index]
-        if isinstance(index, slice)
-        else index
-        for dim, index in enumerate(indices)
-    ]
+    tensors = {i: idx for i, idx in enumerate(indices) if isinstance(idx, torch.Tensor)}
+    block_ndim = max(idx.ndim for idx in block.values())
+    trailing = 0  # result dims after those of the index tensor
+    for i in reversed(tensors):
+        # Broadcasting aligns the last dims.
+        tensors[i] = tensors[i].reshape(tensors[i].shape + (1,) * trailing)
+        if i not in block:
+            trailing += 1
+        elif i == min(block):
+            trailing += block_ndim
+    grids = torch.broadcast_tensors(*tensors.values())
+    for i, grid in zip(tensors, grids, strict=True):
+        indices[i] = grid
+    return indices
+
+
+def _ref_layout_indices(
+    tensor: torch.Tensor, index: list[object], indices: list[object]
+) -> list[object]:
+    """``indices``, the ``index`` of an ``hl.load`` or ``hl.store`` with its
+    tiles as index tensors, with two or more index tensors expanded to the
+    shape of the indexed result: broadcast as compiled code does
+    (``_ref_broadcast_indices``) or, for any other index, as their Cartesian
+    product."""
+    from ..runtime.ref_mode import index_tensors_of_one_dtype
+
+    positions = [i for i, idx in enumerate(indices) if isinstance(idx, torch.Tensor)]
+    if len(positions) < 2:
+        return indices
+    broadcast = _ref_broadcast_indices(tensor, index)
+    if broadcast is not None:
+        return broadcast
+    grids = torch.meshgrid(
+        # pyrefly: ignore [bad-argument-type]
+        *index_tensors_of_one_dtype([indices[i] for i in positions]),
+        indexing="ij",
+    )
+    for i, grid in zip(positions, grids, strict=False):
+        indices[i] = grid
+    return indices
 
 
 # TODO(joydddd): Add support for stack tensor in ref mode.
@@ -143,7 +201,9 @@ def _(
     extra_mask: torch.Tensor | None = None,
 ) -> None:
     from ..runtime.ref_mode import DEVICE_LOAD_NAME
+    from ..runtime.ref_mode import enclosed_slice_indices
     from ..runtime.ref_mode import is_device_load
+    from ..runtime.ref_mode import slice_indices
     from .ref_tile import RefTile
 
     if is_device_load(tensor):
@@ -152,21 +212,11 @@ def _(
     # Normalize indices and identify tensor indices
     indices = [idx.index if isinstance(idx, RefTile) else idx for idx in index]
     if extra_mask is not None:
-        indices = _ref_masked_slice_indices(tensor, indices)
-    tensor_idx_positions = [
-        i for i, idx in enumerate(indices) if isinstance(idx, torch.Tensor)
-    ]
-
+        indices = slice_indices(tensor, indices)
+    else:
+        indices = enclosed_slice_indices(tensor, indices)
     # Handle broadcasting for multiple tensor indices
-    if len(tensor_idx_positions) > 1:
-        grids = torch.meshgrid(
-            # pyrefly: ignore [bad-argument-type]
-            *(indices[i] for i in tensor_idx_positions),
-            indexing="ij",
-        )
-        for i, grid in zip(tensor_idx_positions, grids, strict=False):
-            # pyrefly: ignore [unsupported-operation]
-            indices[i] = grid
+    indices = _ref_layout_indices(tensor, index, indices)
 
     if extra_mask is not None:
         mask = extra_mask.to(torch.bool)
@@ -194,6 +244,9 @@ def _(
                 )
 
         if isinstance(value, torch.Tensor):
+            if value.shape[: mask.ndim] != mask.shape:
+                # The value broadcasts to the indexed elements.
+                value = value.expand(mask.shape + value.shape[mask.ndim :])
             values = value[mask]
         else:
             val = int(value) if isinstance(value, torch.SymInt) else value
@@ -341,20 +394,17 @@ def _(
     eviction_policy: str | None = None,
 ) -> torch.Tensor:
     from ..runtime.ref_mode import device_load
+    from ..runtime.ref_mode import enclosed_slice_indices
+    from ..runtime.ref_mode import slice_indices
     from .ref_tile import RefTile
 
     if extra_mask is None:
-        # Convert RefTiles to indices
-        indices = [idx.index if isinstance(idx, RefTile) else idx for idx in index]
-        # Use meshgrid for Cartesian product when we have multiple tensor indices
-        tensor_idxs = [
-            i for i, idx in enumerate(indices) if isinstance(idx, torch.Tensor)
-        ]
-        if len(tensor_idxs) > 1:
-            # pyrefly: ignore [bad-argument-type]
-            grids = torch.meshgrid(*(indices[i] for i in tensor_idxs), indexing="ij")
-            for i, grid in zip(tensor_idxs, grids, strict=False):
-                indices[i] = grid
+        # Tiles, and slices that lie between index tensors, become index tensors
+        indices = enclosed_slice_indices(
+            tensor, [idx.index if isinstance(idx, RefTile) else idx for idx in index]
+        )
+        # Several index tensors broadcast or form a Cartesian product
+        indices = _ref_layout_indices(tensor, index, indices)
         # Integer and slice indices give a view.
         return device_load(
             # pyrefly: ignore [bad-argument-type, bad-index]
@@ -364,7 +414,18 @@ def _(
     # Create zero result matching mask shape
     result = torch.zeros(extra_mask.shape, dtype=tensor.dtype, device=tensor.device)
 
-    index = _ref_masked_slice_indices(
+    broadcast = _ref_broadcast_indices(tensor, index)
+    if broadcast is not None:
+        # Clamp each index tensor; an element it had to clamp reads as masked.
+        valid_mask = extra_mask
+        for dim, idx in enumerate(broadcast):
+            if isinstance(idx, torch.Tensor):
+                valid_mask = valid_mask & (idx >= 0) & (idx < tensor.shape[dim])
+                broadcast[dim] = idx.clamp(0, tensor.shape[dim] - 1)
+        # pyrefly: ignore [bad-index]
+        return torch.where(valid_mask, tensor[tuple(broadcast)], result)
+
+    index = slice_indices(
         tensor, [idx.index if isinstance(idx, RefTile) else idx for idx in index]
     )
     # Process indices: clamp tensor indices
@@ -447,6 +508,12 @@ def prefetch(
     is its entry in the ``prefetch_indexing`` config key (one per
     ``hl.prefetch``, in code order; the key exists when some prefetch of the
     kernel can take the ``"tensor_descriptor"`` form).
+
+    In a top-level loop whose only effects are prefetches, later loops' stores
+    need not wait for its loads, so the values that compute a prefetch's index
+    or guard may come from such a store, and from different stores for
+    different loads (or elements): keep every value those loads can see a
+    valid index, or take the index and its guard from one element of one load.
 
     On NVIDIA GPUs (Triton and Gluon backends), in the ``"pointer"`` form
     (the default), when the last index is a full slice or a tile of a

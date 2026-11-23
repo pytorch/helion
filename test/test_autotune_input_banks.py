@@ -714,6 +714,7 @@ def test_cache_context_versions_cloning_and_distinguishes_explicit_banks():
         search = SimpleNamespace(
             settings=Settings(autotune_benchmark_input_banks=count),
             _benchmark_provider_cls=LocalBenchmarkProvider,
+            _benchmark_prelude=None,
         )
         return _search_policy_hash(search, cute_flash_search_enabled=False)
 
@@ -759,6 +760,7 @@ def test_resident_bank_cache_does_not_reuse_replay_winner(monkeypatch, flash):
         settings=Settings(autotune_benchmark_input_banks=3),
         cache_policy=lambda: {"unchanged_policy": True},
         _benchmark_provider_cls=LocalBenchmarkProvider,
+        _benchmark_prelude=None,
     )
 
     def key(search_mode, final_mode):

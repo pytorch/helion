@@ -368,6 +368,19 @@ def skipIfTileIR(reason: str) -> Callable[[Callable], Callable]:
     return skipIfFn(lambda: _get_backend() == "tileir", reason)
 
 
+def skipUnlessTritonBarriers(test: Callable) -> Callable:
+    """Skip a test of the barriers Triton code generation emits unless the
+    backend is Triton: TileIR does not legalize ``tl.debug_barrier``, and
+    ref-eager mode generates no code."""
+    for skip in (
+        skipUnlessBackends(["triton"]),
+        skipIfTileIR("TileIR does not legalize tl.debug_barrier"),
+        skipIfRefEager("ref-eager mode generates no code"),
+    ):
+        test = skip(test)
+    return test
+
+
 def skipIfMetal(reason: str) -> Callable[[Callable], Callable]:
     """Skip test if running with metal"""
     return skipIfFn(lambda: _get_backend() == "metal", reason)

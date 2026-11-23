@@ -489,6 +489,13 @@ class CuteLaneState:
     vloop_sink_stores: dict[str, CuteVloopStoreFact] = dataclasses.field(
         default_factory=dict
     )
+    # The hoisted tile packets loaded by a predicated load, which leaves
+    # zeros where the packet's guard fails (``LanePacketEmitter.hoist_load``
+    # under ``cute_guarded_lanes``): their lanes take no select against the
+    # mask.  Each with the load it is where that guard is known to hold, as
+    # a template over its ``{pointer}`` (``guarded_lanes`` renders it for a
+    # packet whose whole predicate the guard of its store implies).
+    zero_filled_packets: dict[str, str] = dataclasses.field(default_factory=dict)
     # Persistent-reduction lane loops walking several V-wide chunks per
     # thread, by lane variable: V.  The branch-local persistent vectorizer
     # places one packet per chunk in them.
@@ -498,6 +505,12 @@ class CuteLaneState:
     # for it); when no V-loop is sunk after all, codegen restarts with the
     # knob off.
     vloop_sink_shaped_code: bool = False
+    # The vector loops (by constexpr lane variable) with an access whose
+    # address ``cute_vloop_sink`` respelled for the sink: a flattened gather
+    # that is contiguous along the lane (``_cute_flat_gather_sink_pointer``).
+    # The loops inside such a vector loop are the sink's to interchange, so
+    # no component packet takes them (``_cute_component_store_ctx``).
+    vloop_sink_shaped_lanes: set[str] = dataclasses.field(default_factory=set)
     # The sinking pass unrolled a lane loop itself (``cute_lane_unroll``);
     # otherwise the loads-first unroll of ``cute/unroll_lane_loads.py``
     # applies to the sunk lane loops once their packets are placed.
@@ -544,6 +557,15 @@ class CuteLaneState:
     # (instead of building a per-lane V-fold, which would double-count the
     # already-accumulated running sum).  See ``_emit_cute_matmul``.
     matmul_running_sums: set[str] = dataclasses.field(default_factory=set)
+    # The dtype each direct warp reduction combines in (``warp_reduction_sum``,
+    # ``warp_reduction_max`` and the generic ``warp_reduction``), by the text
+    # of the value it reduces: a name, or an expression such as an argmax's
+    # index candidate (``CuteBackend.reduction_expr``, where its caller
+    # passes the dtype).  The call names no
+    # dtype (a grouped helper's identity argument does), so
+    # ``hoist_warp_reduce`` looks up the input name of a call it folds here
+    # to type its V-fold; ``None`` for a text recorded with two dtypes.
+    reduce_input_dtypes: dict[str, str | None] = dataclasses.field(default_factory=dict)
     # Rolled reductions over a symbolic extent expose their trip count as
     # a host-computed ``cutlass.Constexpr`` kernel parameter so the
     # two-pass load fuser can size a per-thread register cache that is

@@ -186,8 +186,15 @@ class Config(Mapping[str, object]):
         cute_bool_byte_packets: bool | None = None,
         cute_uniform_lane_compares: bool | None = None,
         cute_tail_peel: bool | None = None,
+        cute_guarded_lanes: bool | None = None,
+        cute_fmnmx_extrema: bool | None = None,
+        cute_predicated_element_loads: bool | None = None,
+        cute_store_packet_tiers: bool | None = None,
         cute_defer_tile_reduce: bool | None = None,
+        cute_staged_store: bool | None = None,
         cute_wide_packet_hints: bool | None = None,
+        cute_scalar_load_hints: bool | None = None,
+        cute_narrow_load_hints: bool | None = None,
         cute_pdl: bool | None = None,
         cute_pdl_capture_overlap: bool | None = None,
         cute_pdl_release: CutePdlReleaseLiteral | None = None,
@@ -252,6 +259,8 @@ class Config(Mapping[str, object]):
             cute_store_policy: Cache policy for proven full aligned 16-byte CuTe
                 global store packets ("default", "streaming" = evict-first
                 ``st.global.cs`` for outputs written once, or "l2_evict_last").
+                The packets ``cute_staged_store`` flushes are not covered:
+                they keep the default policy.
             cute_compiler_pipeline: CuTe compiler optimization pipeline. "default"
                 leaves SDK options unchanged; "opt2" requests optimization level 2.
                 Explicit SDK compiler environment overrides still take precedence.
@@ -335,9 +344,20 @@ class Config(Mapping[str, object]):
                 looped reductions whose chunk spans more than one vector per
                 thread and of persistent reduction rows their threads do not
                 cover; kernels where no loop takes it generate exactly the
-                knob-off code. With the loads apart from the arithmetic, LLVM
-                may contract into one FMA a float multiply and add that the
-                knob-off code rounds separately (a product feeding an add
+                knob-off code. A persistent row whose explicit thread count,
+                at most a warp, walks its static extent in whole lanes keeps
+                that layout under the knob beside a tile axis of several rows
+                per CTA (the rows in registers), in a kernel none of whose
+                memory accesses can need an order across threads. That test
+                is conservative: a tensor the kernel writes must be touched
+                by that one store only or by atomics alone, and must share
+                no buffer with another tensor the kernel accesses (a row
+                written in place rolls). Without the knob, with more threads,
+                under cute_vloop_sink or in any other kernel, such a row is
+                rolled in chunks of the threads the tile leaves. With the loads
+                apart from the arithmetic, LLVM may contract into one FMA a
+                float multiply and add that the knob-off code rounds
+                separately (a product feeding an add
                 whose other operand is a masked load stays in that load's
                 branch there), so float results can round differently, and so
                 can values computed from them (a comparison, an integer cast,
@@ -361,15 +381,17 @@ class Config(Mapping[str, object]):
                 and one warp), and without the masked loads' branches LLVM may
                 contract float multiply-adds differently, so results can differ
                 from the padded row's by more than an ulp.
-            cute_bool_byte_packets: Load a bool row that a looped reduction
-                reads along its reduction dim as byte packets: one integer of
-                2, 4 or 8 bytes per lane, each element a byte compared against
-                zero, instead of one byte load per element. The packets cost
-                fewer instructions and load requests; where a later sweep
-                reloads the row from L2, the faster first sweep can leave less
-                of it there. Results are bitwise unchanged. Off by default;
-                offered to the autotuner for kernels whose looped reduction
-                reads a bool row.
+            cute_bool_byte_packets: Load a bool row that a looped reduction,
+                or a persistent row of vectors that has no ``reduction_loops``
+                slot, reads along its reduction dim as byte packets: one
+                integer of 2, 4 or 8 bytes per lane, each element a byte
+                compared against zero, instead of one byte load per element.
+                The packets cost fewer instructions and load requests; where a
+                later sweep reloads the row from L2, the faster first sweep
+                can leave less of it there. Results are bitwise unchanged. Off
+                by default; offered to the autotuner for kernels whose looped
+                reduction, or persistent row without a ``reduction_loops``
+                slot, reads a bool row.
             cute_uniform_lane_compares: Compare a vector's lane base, once per
                 vector, instead of each lane where a lane index meets a
                 bound that is a multiple of the vector width (a chunk's tile
@@ -410,6 +432,97 @@ class Config(Mapping[str, object]):
                 over a static extent that loads a float tensor along its tile
                 and no matmul, and elsewhere rejected (an explicit False is
                 dropped).
+            cute_guarded_lanes: Run the loads and the arithmetic of a tile's
+                lanes under the guard of the stores they feed, so a thread
+                that the tile masks turn off (a partial last tile, a block
+                with more threads than the extent has elements) skips them
+                instead of loading from an in-bounds anchor and computing a
+                value no store writes.  Selects and load predicates that the
+                stores' guard implies are dropped; a packet whose mask the
+                guard does not imply (a padding ``extra_mask``) loads
+                predicated and reads as zeros where masked off, instead of
+                through one select per lane (an fp16 packet never loads
+                predicated: the assembler widens the wrong half of a
+                predicated packet's word for an fp16 lane without a select,
+                so it keeps its plain load and the selects the guard does
+                not imply); and a gathered coordinate that
+                the masks of its tiles keep inside its dim carries no bound
+                of its own.  Every stored value is computed as before from
+                the same elements; like ``cute_uniform_lane_compares`` its
+                only possible numeric effects are FMA contraction where
+                per-lane selects kept products unfused, and which NaN (its
+                sign and payload bits) a NaN result is: without the selects
+                an fp32 chain over widened half-precision lanes can run in
+                half-precision instructions.  Off by default;
+                offered to the autotuner on pointwise kernels (no reduction,
+                matmul or atomic) with a load through a computed or gathered
+                coordinate or with an ``extra_mask``, and elsewhere rejected
+                (an explicit False is dropped).
+            cute_fmnmx_extrema: Lower an fp32 ``torch.maximum`` /
+                ``torch.minimum`` (and the ``relu`` and ``clamp`` beside it)
+                to the single NaN-propagating instruction the extremum
+                reductions use (FMNMX.NaN) instead of two compares and a
+                select per element; over widened bf16 / fp16 lanes the
+                assembler then folds the maxima into packed half-precision
+                instructions.  NaN results are NaNs in the same places;
+                which NaN (its sign and payload bits) is not part of the
+                result and can differ.  The sign of a zero
+                result can differ: the instruction orders ``-0.0`` below
+                ``+0.0`` (IEEE 754-2019 maximum / minimum), where the
+                compare-and-select form returns one of its operands by
+                position, so ``maximum(-0.0, +0.0)`` is ``+0.0`` in either
+                operand order.  Off by default; offered to the autotuner on
+                pointwise kernels (no reduction, matmul or atomic) with an
+                fp32 ``torch.maximum`` or ``torch.minimum`` of two tensors,
+                and elsewhere rejected (an explicit False is dropped).
+            cute_predicated_element_loads: Load a single element under a
+                mask (a gathered or computed coordinate with an
+                ``extra_mask``) with one predicated instruction instead of a
+                load inside a conditional, which compiles to a branch around
+                the load.  Where the load's only reader is a select under the
+                same mask against a constant the element type holds exactly
+                (``torch.where(mask, hl.load(x, [...], extra_mask=mask),
+                -inf)``, also through widening casts), the load leaves that
+                constant where the mask is false and the select is dropped.
+                Every stored value is computed as before from the same
+                elements; without the selects an fp32 chain over widened
+                half-precision elements can run in half-precision
+                instructions, so which NaN (its sign and payload bits) a NaN
+                result is can differ, as under ``cute_guarded_lanes``.  A
+                masked load whose address is not plain arithmetic, or whose
+                element is not a 2-, 4- or 8-byte float or signed integer
+                (a byte, a bool, an unsigned integer), keeps its
+                conditional.  Off by default; offered to the autotuner on
+                pointwise kernels (no reduction, matmul or atomic) with an
+                ``hl.load`` under an ``extra_mask`` whose last subscript is
+                a scaled or gathered coordinate (not a tile or a tile
+                shifted by a constant, nor a row offset plus a tile's index
+                into a tensor that vector lanes load in packets), and
+                elsewhere rejected (an explicit False is dropped).
+            cute_store_packet_tiers: Store a vector lane loop's elements in
+                narrower packets where a row fails the full packet's
+                alignment check at run time (an output whose row stride is
+                not a multiple of the packet, such as ``[rows, 30522]``
+                bf16), instead of one element at a time with scalar reloads:
+                sixteen-byte packets where the row is aligned to them, then
+                packets of half the elements, each tier under its own guard,
+                down to two elements (four bytes of a 16-bit dtype, eight of
+                a 32-bit one), and the scalar loop last.  The stored values
+                and their order are unchanged.  Off by default; offered to the
+                autotuner on kernels with a one-axis ``hl.tile`` loop inside
+                the kernel's outer ``hl.tile`` loop that stores along its
+                tile into the last dimension of a float16, bfloat16,
+                float32, int32 or uint32 tensor of two or more dimensions
+                and no matmul, and elsewhere rejected (an explicit False is
+                dropped): the outer loop's own tiles do not open it, though
+                their stores take the narrower packets too once it is on.
+                Read as False in a config that gives no such loop vector
+                lanes of four or more elements (two elements are already
+                the narrowest packet); where the stored tensor takes no
+                packet of those lanes (a view that is not unit-stride along
+                that dimension, or whose base is off the packet's
+                boundary); and where its row strides align every row to
+                them, so that no check can fail.
             cute_defer_tile_reduce: Combine a carried tile sum across the
                 threads once, after its ``hl.tile`` loop, instead of once per
                 tile: in ``for tile in hl.tile(n): acc = acc + x[tile].sum(0)``
@@ -438,12 +551,59 @@ class Config(Mapping[str, object]):
                 gives each thread one element of the tile (as many threads as
                 the tile is long) or folds the tile's lanes as vector lanes,
                 the knob leaves the code as it is.
+            cute_staged_store: Write a pointwise kernel's output through a
+                shared-memory image of each block's tile: the threads store
+                their elements into the image, meet at one barrier, and
+                flush it as 16-byte packets, each warp writing 32 consecutive
+                packets, so that every 32-byte sector of the output is sent
+                to L2 once however the threads' own elements lie in it.  For
+                a kernel whose loads are contiguous along one tile and whose
+                stores along another (an unfold or sliding window, ``out[n,
+                k] = x[n + c * k]``) this is what lets the loads be packets.
+                The values and the elements written are those of the
+                knob-off code; the flushed packets take the default cache
+                policy whatever ``cute_store_policy`` says, so on a staged
+                kernel that option changes nothing.  Applied only where the
+                generated kernel is proven to write one contiguous,
+                16-byte-aligned span of a single output per block, each
+                element once, into a tensor no load can alias, at static
+                shapes; a block with a partial tile keeps its direct stores,
+                and where the proof fails the code is the knob-off code.
+                One barrier and ``tile elements x element size`` bytes of
+                shared memory per block (at most 48 KiB).  Off by default;
+                offered to the autotuner on kernels with static shapes that
+                gather a flattened tensor along one tile and store along
+                another (bf16, fp16, fp32, int16 or int32 tensors), without
+                a matmul, and elsewhere rejected (an explicit False is
+                dropped).
             cute_wide_packet_hints: Carry the ``l2_last`` / ``l1_l2_first`` /
                 ``l1_l2_last`` load eviction policies onto 32-byte CuTe packets
                 (``cute_vector_widths`` 8 for fp32, 16 for bf16/fp16) through
                 one 256-bit cache-hinted load; SM100+ with CUDA 13 or newer,
                 elsewhere inert. Off by default: a hinted 32-byte packet then
-                loads without the hint, as it always has.
+                loads without the hint, as it always has. The autotuner sets
+                it on every config it tries that names one of those policies.
+            cute_scalar_load_hints: Carry ``load_eviction_policies`` onto the
+                CuTe loads of single 4- and 8-byte elements (a gather, a lane
+                on a strided dim) in full: the element loads of a tensor take
+                the first ``l2_last`` / ``l1_l2_first`` / ``l1_l2_last`` its
+                load slots name, and a hinted element load under a mask
+                becomes one predicated load. Off by default: an L2 policy
+                then reaches packets only and a masked hinted element keeps
+                its conditional, as they always have. The autotuner sets it
+                on every config it tries that names a policy an element load
+                takes (any but ``nc_l2_first``).
+            cute_narrow_load_hints: Carry ``load_eviction_policies`` onto the
+                CuTe loads of single 2-byte elements (bf16, fp16, int16): the
+                element loads of such a tensor take the first policy its load
+                slots name (``first`` / ``last`` / ``streaming`` / ``l2_last``
+                / ``l1_l2_first`` / ``l1_l2_last``), a masked one as one
+                predicated load. A tensor one of whose loads spells out its
+                own policy (``hl.load(..., eviction_policy=...)``) takes none.
+                Off by default: those loads then go without a hint, as they
+                always have. The autotuner neither searches nor sets it: the
+                hinted 2-byte load costs instructions of its own and has
+                measured slower than the plain one.
             cute_pdl: Launch the kernel as a programmatic dependent of the
                 previous kernel in the stream: its launch and prologue overlap
                 that kernel's tail and it waits (``griddepcontrol.wait``) ahead
@@ -647,8 +807,15 @@ class Config(Mapping[str, object]):
             "cute_bool_byte_packets": cute_bool_byte_packets,
             "cute_uniform_lane_compares": cute_uniform_lane_compares,
             "cute_tail_peel": cute_tail_peel,
+            "cute_guarded_lanes": cute_guarded_lanes,
+            "cute_fmnmx_extrema": cute_fmnmx_extrema,
+            "cute_predicated_element_loads": cute_predicated_element_loads,
+            "cute_store_packet_tiers": cute_store_packet_tiers,
             "cute_defer_tile_reduce": cute_defer_tile_reduce,
+            "cute_staged_store": cute_staged_store,
             "cute_wide_packet_hints": cute_wide_packet_hints,
+            "cute_scalar_load_hints": cute_scalar_load_hints,
+            "cute_narrow_load_hints": cute_narrow_load_hints,
             "cute_pdl": cute_pdl,
             "cute_pdl_capture_overlap": cute_pdl_capture_overlap,
             "cute_pdl_release": cute_pdl_release,
@@ -992,6 +1159,14 @@ class Config(Mapping[str, object]):
     @property
     def cute_wide_packet_hints(self) -> bool:
         return self.config.get("cute_wide_packet_hints") is True
+
+    @property
+    def cute_scalar_load_hints(self) -> bool:
+        return self.config.get("cute_scalar_load_hints") is True
+
+    @property
+    def cute_narrow_load_hints(self) -> bool:
+        return self.config.get("cute_narrow_load_hints") is True
 
     @property
     def cute_exact_div_form(self) -> CuteExactDivFormLiteral:

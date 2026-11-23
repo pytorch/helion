@@ -63,10 +63,13 @@ from ..cute_mma_dag import MMA_DAG_PASS_WARPS_ATTENTION_PAIRED
 from ..cute_mma_dag import MMA_DAG_PASS_WARPS_KEY
 from ..cute_mma_dag import MMA_DAG_TCGEN05
 from ..flash_knobs import FLASH_COVERAGE_CHILD_PARENTS
+from ..packet_store_policy import store_policy_reaches_a_packet
 from ..pdl_release import CUTE_PDL_CAPTURE_RELEASE_CHOICES
 from ..pdl_release import CUTE_PDL_RELEASE_DEFAULT
 from ..pdl_release import CUTE_PDL_SPREAD_KEY
+from ..reduction_lanes import THREADED_SEQUENCES
 from ..reduction_lanes import fit_reduction_threads
+from ..reduction_lanes import sequence_tile_holds_warp_lanes
 from ..thread_budget import MAX_THREADS_PER_BLOCK
 from ..thread_budget import tile_level_axes
 from ..tile_packing import packed_grid_block
@@ -1119,6 +1122,23 @@ class CuteConfigGenerationExtension(ConfigGenerationExtension):
         if flat_config[schedule[0][0]] != "pipelined":
             flat_config[depth[0][0]] = 2
 
+    def _repair_reduction_sequence(self, flat_config: FlatConfig) -> None:
+        """Run a threaded reduction sequence ``scalar`` where no tile of
+        the config can hold its lanes, as normalization does
+        (``sequence_tile_holds_warp_lanes``): a shrink halves the block
+        sizes of a canonical row."""
+        sequence = self.generation._key_to_flat_indices.get("cute_reduction_sequence")
+        if sequence is None or flat_config[sequence[0][0]] not in THREADED_SEQUENCES:
+            return
+        block_index_by_id = self._threads.block_index_by_id
+        if not sequence_tile_holds_warp_lanes(
+            flat_config[block_index_by_id[block_id]]
+            if block_id in block_index_by_id
+            else None
+            for block_id in self.generation.config_spec.cute_sequence_reduction_blocks
+        ):
+            flat_config[sequence[0][0]] = "scalar"
+
     def _repair_collective_thread_layouts(self, flat_config: FlatConfig) -> None:
         """Give an enabled collective MMA the thread layout its lowering admits."""
         slots = self._threads
@@ -1141,7 +1161,7 @@ class CuteConfigGenerationExtension(ConfigGenerationExtension):
         # The tiles the collective lowering admits (``collective_matmul``'s
         # ``m_choices`` / ``n_choices``); outside them the collective declines
         # whatever the thread layout says, so the lane loops keep the layout
-        # ``repair_flat_config`` gave them.
+        # ``_repair_thread_layouts`` gave them.
         m_choices = (16, 32, 64, 128) if register_chain else (32, 64, 128)
         n_choices = (16, 32, 64) if register_chain else (32, 64)
         for (
@@ -1166,10 +1186,33 @@ class CuteConfigGenerationExtension(ConfigGenerationExtension):
         for width_index in slots.collective_vector_width_indices:
             flat_config[width_index] = 1
 
+    def _repair_store_policy(self, flat_config: FlatConfig) -> None:
+        """Keep the default store policy where no store takes another
+        (``store_policy_reaches_a_packet``, as config normalization does)."""
+        layout = self.generation._key_to_flat_indices
+        policy = layout.get("cute_store_policy")
+        widths = layout.get("cute_vector_widths")
+        if policy is None or flat_config[policy[0][0]] == "default":
+            return
+        if not store_policy_reaches_a_packet(
+            self.generation.config_spec,
+            [flat_config[index] for index in widths[0]] if widths else [],
+        ):
+            flat_config[policy[0][0]] = "default"
+
     def repair_flat_config(self, flat_config: FlatConfig) -> None:
-        """Keep CuTe launch-thread choices compatible with tuned block sizes."""
+        """Make a random or mutated flat config one the normalization keeps:
+        the packet prefetch, the reduction pipeline and sequence, the thread
+        layouts and the store policy."""
         self._repair_packet_prefetch(flat_config)
         self._repair_reduction_pipeline_depth(flat_config)
+        self._repair_reduction_sequence(flat_config)
+        self._repair_thread_layouts(flat_config)
+        # Last: it reads the vector widths the other repairs leave.
+        self._repair_store_policy(flat_config)
+
+    def _repair_thread_layouts(self, flat_config: FlatConfig) -> None:
+        """Keep CuTe launch-thread choices compatible with tuned block sizes."""
         slots = self._threads
         if not slots.num_thread_block_pairs:
             return

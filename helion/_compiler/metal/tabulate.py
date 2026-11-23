@@ -323,7 +323,7 @@ def _reads(node: ast.AST) -> set[str]:
 
 def _assignments(stmts: list[ast.stmt]) -> collections.Counter[str]:
     """How many times ``stmts`` assign each name (``mpp_matmul.assigned_names``,
-    as ``fragment_mma.kernel_constants`` counts them).  A name assigned once
+    as ``operand_elements.kernel_constants`` counts them).  A name assigned once
     is assigned only by its one statement."""
     return collections.Counter(
         name for stmt in stmts for n in ast.walk(stmt) for name in assigned_names(n)

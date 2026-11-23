@@ -41,6 +41,8 @@ from .distributed_ops import inband_load_codegen
 from .distributed_ops import inband_store_codegen
 from .distributed_ops import tagged_access
 from .distributed_ops import tagged_store_codegen
+from .dsmem import dsmem_load_codegen
+from .dsmem import dsmem_store_codegen
 from .prefetch import TENSOR_MAP_ACQUIRE_ASM
 from .prefetch import prefetch_asm
 from .prefetch import tensor_prefetch_asm
@@ -65,7 +67,17 @@ _EVICTION_POLICY_MAP = {
 
 @_decorators.codegen(store, "triton")
 def _(state: CodegenState) -> ast.AST:
+    # A load or a store of this tensor earlier in the same loop body or in an
+    # earlier iteration, or through device pointers, followed by this store
+    # is a cross-thread write-after-read or write-after-write on global
+    # memory; emit a barrier so every thread has read and stored before the
+    # overwrite (see mark_intra_loop_raw_barriers).
+    from ..loop_dependency_checker import emit_intra_loop_raw_barrier
+
     tensor = state.proxy_arg(0)
+    emit_intra_loop_raw_barrier(
+        state, tensor if isinstance(tensor, torch.Tensor) else None
+    )
     subscript = state.proxy_arg(1)
     assert isinstance(subscript, (list, tuple))
     value = state.ast_arg(2)
@@ -97,8 +109,11 @@ def _(state: CodegenState) -> ast.AST:
             if modifier_idx < len(modifiers) and modifiers[modifier_idx]:
                 cache_modifier = ast.Constant(value=modifiers[modifier_idx])
 
-        codegen_store = tagged_store_codegen(
-            state, inband_store_codegen(state, strategy.codegen_store)
+        codegen_store = dsmem_store_codegen(
+            state,
+            tagged_store_codegen(
+                state, inband_store_codegen(state, strategy.codegen_store)
+            ),
         )
         if state.codegen.store_transform is not None:
             return state.codegen.store_transform(
@@ -140,15 +155,16 @@ def _(state: CodegenState) -> ast.AST:
 
 @_decorators.codegen(load, "triton")
 def _(state: CodegenState) -> ast.AST | SharedValue:
-    # A store or an atomic to this tensor earlier in the same loop body followed
-    # by this load is a cross-thread read-after-write on global memory; emit a
-    # barrier so the write is visible before the read (see
-    # mark_intra_loop_raw_barriers).
+    # A store or an atomic that may reach this load, earlier in the same loop
+    # body or in an earlier iteration, or through device pointers, is a
+    # cross-thread read-after-write on global memory; emit a barrier so the
+    # write is visible before the read (see mark_intra_loop_raw_barriers).
     from ..loop_dependency_checker import emit_intra_loop_raw_barrier
 
-    emit_intra_loop_raw_barrier(state)
-
     tensor = state.proxy_arg(0)
+    emit_intra_loop_raw_barrier(
+        state, tensor if isinstance(tensor, torch.Tensor) else None
+    )
     subscript = state.proxy_arg(1)
     assert isinstance(subscript, (list, tuple))
     ast_subscript = state.ast_args[1]
@@ -197,7 +213,9 @@ def _(state: CodegenState) -> ast.AST | SharedValue:
         device_fn.device_memory_op_index += 1
         strategy = device_fn.get_indexing_strategy(indexing_idx)
 
-        codegen_load = inband_load_codegen(state, strategy.codegen_load)
+        codegen_load = dsmem_load_codegen(
+            state, inband_load_codegen(state, strategy.codegen_load)
+        )
         # A ring slot replaces a plain load (not an in-band poll or a fusion).
         if (
             device_fn.ring is not None

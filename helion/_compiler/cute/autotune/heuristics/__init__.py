@@ -16,6 +16,7 @@ Role: heuristic (section 6 of ``../../README.md``).
 from __future__ import annotations
 
 from copy import deepcopy
+import functools
 import operator
 from typing import TYPE_CHECKING
 
@@ -100,6 +101,7 @@ from ..fragment_knobs import register_fragment_warp_producer_regions_coverage
 from ..fragment_knobs import register_fragment_warp_results_coverage
 from ..fragment_knobs import register_fragment_warp_scan_coverage
 from ..search_surface import _rolls_a_byte_packet_row
+from ..search_surface import _splittable_store_tier_blocks
 from .cute import CuteAffineScanHeuristic
 from .cute import CuteAsyncPersistentSubwarpRowsHeuristic
 from .cute import CuteAsyncStateLoadHeuristic
@@ -173,6 +175,9 @@ from .cute_host_paired_sum import add_host_sum_seeds
 from .cute_integer_loop_reduction import CuteIntegerLoopReductionHeuristic
 from .cute_integer_loop_reduction import register_integer_loop_reduction_coverage
 from .cute_l2_row_swizzle import register_l2_row_swizzle_coverage
+from .cute_lane_carry_rows import CuteLaneCarryRowHeuristic
+from .cute_lane_unrolled_warp_rows import CuteLaneUnrolledWarpRowsHeuristic
+from .cute_lane_unrolled_warp_rows import lane_unrolled_warp_rows_seed_configs
 from .cute_launch_bounds import CutePointwiseMinBlocksHeuristic
 from .cute_launch_bounds import pointwise_min_blocks_seeds
 from .cute_launch_bounds import register_matmul_min_blocks_coverage
@@ -192,6 +197,8 @@ from .cute_resident_sequence import CuteResidentSequenceHeuristic
 from .cute_rolled_cluster_packet import CuteRolledClusterPacketHeuristic
 from .cute_row_packets import row_packet_seed_configs
 from .cute_row_resident import register_row_resident_coverage
+from .cute_row_stream_retention import CuteRowStreamRetentionHeuristic
+from .cute_row_stream_retention import row_stream_retention_seed_configs
 from .cute_signed_bitfield import add_signed_bitfield_seeds
 from .cute_simt_mma import CuteSimtMmaHeuristic
 from .cute_split_k_cluster import CuteSplitKClusterHeuristic
@@ -324,6 +331,7 @@ _CUTE_HEURISTIC_CLASSES: tuple[AutotunerHeuristicType, ...] = (
     CuteStridedReductionHeuristic,
     CutePrivatizeAtomicsHeuristic,
     CuteTransposedStoreSeedsHeuristic,
+    CuteLaneCarryRowHeuristic,
 )
 
 
@@ -503,6 +511,20 @@ def postprocess_seed_configs(
         if row_seeds:
             configs.extend(row_seeds)
             env.config_spec.autotuner_heuristics.append(family)
+    # The lane-unrolled row at several one-warp rows per CTA.
+    warp_rows = lane_unrolled_warp_rows_seed_configs(env, device_ir, configs)
+    if warp_rows:
+        configs.extend(warp_rows)
+        env.config_spec.autotuner_heuristics.append(
+            CuteLaneUnrolledWarpRowsHeuristic.name
+        )
+    # Twins of the row seeds above with one input stream kept in L2.
+    retention = row_stream_retention_seed_configs(env, device_ir, configs)
+    if retention:
+        configs.extend(retention)
+        env.config_spec.autotuner_heuristics.append(
+            CuteRowStreamRetentionHeuristic.name
+        )
     return configs
 
 
@@ -522,6 +544,7 @@ def _register_knob_witnesses(
     carries: Callable[[Config], bool] = lambda seed: True,
     candidates: Sequence[Config] | None = None,
     dependencies: tuple[CoverageDependency, ...] = (),
+    own_without_witnesses: bool = False,
 ) -> bool:
     """Cover the boolean knob ``key``, off by default, with a knob-on witness
     for each of the first ``candidates`` that ``carries`` admits, at most
@@ -529,7 +552,9 @@ def _register_knob_witnesses(
     The candidates are the compiler seeds as the search canonicalizes them
     unless given (carriers that hold the values ``dependencies`` names, of
     groups registered earlier); each is kept only when its witness transfers
-    strictly.
+    strictly.  ``own_without_witnesses`` registers the group with no witness
+    too: the knob then stays off in the random initial population (a group
+    owns its field), for a knob normalization reads off in most random rows.
     """
     spec = env.config_spec
     # A knob the search surface does not offer here (``cute_flat_fields``)
@@ -552,7 +577,7 @@ def _register_knob_witnesses(
         carriers.append(seed)
         if len(carriers) == MAX_COMPILER_COVERAGE_CONFIGS:
             break
-    if carriers:
+    if carriers or own_without_witnesses:
         spec.register_compiler_coverage_group(
             CompilerCoverageGroup(
                 mechanism=mechanism,
@@ -618,6 +643,103 @@ def register_uniform_lane_compares_coverage(env: CompileEnvironment) -> None:
         key="cute_uniform_lane_compares",
         mechanism="cute.uniform_lane_compares",
         carries=carries,
+    )
+
+
+def register_guarded_lanes_coverage(env: CompileEnvironment) -> None:
+    """Cover ``cute_guarded_lanes`` and ``cute_fmnmx_extrema`` on the first
+    compiler seeds that do not set them and that they change.
+
+    Both knobs are off by default, so every seed renders as before; each
+    witness is an extra candidate, measured like any other.  Under
+    ``cute_fmnmx_extrema`` a seed's fp32 maxima and minima are single
+    instructions, whatever its tiles.  Under ``cute_guarded_lanes`` a seed's
+    lanes run under their stores' guard, so a carrier has a store to guard:
+    a tile that does not divide its extent (a seed whose tiles all divide
+    theirs masks nothing, and most such seeds render the same code with the
+    knob; the search still samples it there).  Whether the knob changes a
+    carrier's code beyond that is decided load by load in the lowering (a
+    packet that loads predicated, a bound the tile masks imply, a store
+    whose guard is known ahead of its lanes), not by the seed's shape: a
+    witness that renders its carrier's code is a source alias, which the
+    search drops once it is rendered, ahead of the DSL compile and the
+    timing.  The N-D packet tile seeds set both knobs themselves
+    (``CutePointwiseVecHeuristic._packet_tile_seeds``) and need no witness.
+    Neither knob is offered to a kernel without its sites
+    (``cute_flat_fields``), where nothing is registered.
+    """
+    spec = env.config_spec
+    blocks = [block.block_id for block in spec.block_sizes]
+
+    def has_partial_tile(seed: Config) -> bool:
+        return any(
+            isinstance(extent, int) and isinstance(tile, int) and extent % tile != 0
+            for extent, tile, _threads, _width in _block_layouts(env, seed, blocks)
+        )
+
+    _register_knob_witnesses(
+        env,
+        key="cute_guarded_lanes",
+        mechanism="cute.guarded_lanes",
+        carries=lambda seed: (
+            seed.config.get("cute_guarded_lanes") is not True and has_partial_tile(seed)
+        ),
+    )
+    _register_knob_witnesses(
+        env,
+        key="cute_fmnmx_extrema",
+        mechanism="cute.fmnmx_extrema",
+        carries=lambda seed: seed.config.get("cute_fmnmx_extrema") is not True,
+    )
+
+
+def register_predicated_element_loads_coverage(env: CompileEnvironment) -> None:
+    """Cover ``cute_predicated_element_loads``: by the compiler seeds that
+    set it, or else on the first seeds that do not.
+
+    The knob is off by default, so every seed renders as before.  It is
+    offered where a load under an ``extra_mask`` gathers single elements
+    along its tensor's last dim at every config
+    (``predicated_element_loads_offered``), so whatever a seed's tiles, the
+    knob loads those elements predicated and changes its code (but for a
+    seed whose masked loads all carry a cache policy and take no fill, and
+    from whose masks the knob drops no bound: ``hint_element_loads``
+    predicates those with or without the knob.  Where such a load's mask
+    states its gather's bound and ``cute_guarded_lanes`` has not left that
+    term out already, the knob does, so the witness is code of its own).
+
+    The N-D gather tile seeds set the knob themselves
+    (``CutePointwiseVecHeuristic._gather_tile_seed_configs``), at tiles
+    where the masked taps are a thread's whole cost.  Where a kernel has
+    them the group takes no witness: the tile family's own seeds of such a
+    kernel walk whole rows per thread and read several times slower than
+    the gather tiles (22.6 against 9.5 us on the padded max pooling the
+    seeds were measured on), so a witness there would time the knob where
+    it cannot win.  The group still owns the knob, which keeps it off in
+    the random part of the initial population; the search flips it from the
+    seeds.  A kernel offered the knob without gather tiles (a direct load of
+    the row beside the gather) gets a witness on each of its first seeds,
+    an extra candidate measured like any other.  Not offered to a kernel
+    without such a load (``cute_flat_fields``), where nothing is
+    registered.
+    """
+    key = "cute_predicated_element_loads"
+    spec = env.config_spec
+    if key not in spec._flat_fields():
+        return
+    # The canonical seeds, once: to see whether one carries the knob, and
+    # as the witnesses' candidates (the helper's default would canonicalize
+    # them a second time).
+    seeds = [
+        seed for _flat, seed in spec.create_config_generation().seed_flat_config_pairs()
+    ]
+    seeded = any(seed.config.get(key) is True for seed in seeds)
+    _register_knob_witnesses(
+        env,
+        key=key,
+        mechanism="cute.predicated_element_loads",
+        candidates=[] if seeded else seeds,
+        own_without_witnesses=seeded,
     )
 
 
@@ -922,17 +1044,21 @@ def register_coverage_groups(env: CompileEnvironment, device_ir: DeviceIR) -> No
     # Before the tail peel's: its witnesses of sunk nests ride on these.
     register_defer_tile_reduce_coverage(env)
     register_tail_peel_coverage(env)
+    register_guarded_lanes_coverage(env)
+    register_predicated_element_loads_coverage(env)
+    register_store_packet_tiers_coverage(env)
 
 
 def register_bool_byte_packets_coverage(env: CompileEnvironment) -> None:
     """Cover ``cute_bool_byte_packets`` on the first compiler seeds whose
-    looped reductions can take a bool row's byte packets.
+    looped reductions or persistent vector rows can take a bool row's byte
+    packets.
 
     The knob is off by default, so every seed renders as before.  The
     witnesses are extra candidates, measured like any other: the packets win
     where no later sweep reloads the row from memory (a single sweep, or
     register reloads) and can lose where one reloads it from L2 (the cheaper
-    first sweep leaves less of the row there).  A carrier rolls a reduction
+    first sweep leaves less of the row there).  A carrier runs a reduction
     along the bool row at a vector width one packed integer holds
     (``_rolls_a_byte_packet_row``).
     """
@@ -1038,6 +1164,75 @@ def register_tail_peel_coverage(env: CompileEnvironment) -> None:
     _register_knob_witnesses(
         env, key="cute_tail_peel", mechanism="cute.tail_peel", carries=carries
     )
+
+
+def register_store_packet_tiers_coverage(env: CompileEnvironment) -> None:
+    """Cover ``cute_store_packet_tiers`` on the first compiler seeds that give
+    a device loop storing along its tile (``cute_store_tier_blocks``) lanes
+    whose store packets the knob can split.
+
+    The knob is off by default, so every seed renders as before.  A witness
+    stores narrower packets where a row fails the lanes' alignment guard,
+    instead of scalars: the same values, an extra candidate measured like any
+    other.  A seed that gives the loop no such lanes (fewer than four
+    elements, lanes its stored tensors take no packet of, or lanes every row
+    is aligned to) has no packet to split or no guard to fail: the config
+    normalization reads the knob off there, by the same test
+    (``_splittable_store_tier_blocks``), and the witness would be the seed
+    again.  A seed that already sets the knob is its own witness.
+
+    The test reads the stored tensors only.  Every tier keeps the loop's
+    packet loads whole, under their own alignment guard, so where the loop
+    loads along its tile from rows at the stored rows' phase (``out = f(x)``
+    over two tensors of one row stride) a row that fails the store's guard
+    fails the load's too and runs the scalar loop: the narrower arms are
+    emitted and never taken, and such a witness times its carrier's code.
+    The knob changes what runs where the loads' rows are aligned and the
+    stored rows are not (a padded input beside a contiguous output), or
+    where the stored value is not loaded along the tile.
+
+    The seeds that run the loop over several tiles come first, and a seed
+    whose tile covers the loop's extent carries a witness only where none of
+    those does.  The witnesses are a sample of at most
+    ``MAX_COMPILER_COVERAGE_CONFIGS`` seeds in seed order, and the whole-row
+    seeds lead that order: on a loop that also reduces over its tile they
+    are the resident and reload row sequences, which do not compile beside a
+    per-element store, and they would take every witness.
+
+    The group is registered where no seed carries a witness too.  A group
+    owns its field, so the random initial population keeps the knob off, as
+    before the knob existed: drawn at random it would be on in rows whose
+    lanes are too narrow for it, which normalization would have to rewrite.
+    """
+    spec = env.config_spec
+    if not spec.cute_store_tier_blocks:
+        return
+    key = "cute_store_packet_tiers"
+
+    def carries(seed: Config, *, several_tiles: bool) -> bool:
+        if seed.config.get(key) is True:
+            return False
+        blocks = _splittable_store_tier_blocks(spec, seed.config)
+        if not several_tiles:
+            return bool(blocks)
+        return any(
+            isinstance(extent, int) and isinstance(tile, int) and tile < extent
+            for extent, tile, _count, _width in _block_layouts(env, seed, blocks)
+        )
+
+    if not _register_knob_witnesses(
+        env,
+        key=key,
+        mechanism="cute.store_packet_tiers",
+        carries=functools.partial(carries, several_tiles=True),
+    ):
+        _register_knob_witnesses(
+            env,
+            key=key,
+            mechanism="cute.store_packet_tiers",
+            carries=functools.partial(carries, several_tiles=False),
+            own_without_witnesses=True,
+        )
 
 
 def walks_a_deferrable_tile_sum(env: CompileEnvironment, config: Config) -> bool:

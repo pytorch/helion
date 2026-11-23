@@ -85,7 +85,6 @@ from ._ast_pass_utils import loop_extent
 from .fuse_two_pass_loads import _is_store_call
 from .hoist_lane_invariant_reductions import _CUTLASS_SCALAR_TYPES
 from .lane_loops.markers import _CUTE_UNIFORM_GLOBAL_NAMES
-from .lane_loops.markers import _combine_expr
 from .lane_loops.markers import _dtype_ctor_from_identity
 from .lane_loops.markers import _grouped_two_stage_reduce_stmts
 from .lane_loops.markers import _grouped_warp_reduce_expr
@@ -864,12 +863,8 @@ def lower_register_tile_lane_loop(
         assert marker is not None
         acc = acc_name[leaf.index]
         position = _flat_index(nest, leaf.path, with_owner=False)
-        ctor = _dtype_ctor_from_identity(marker.identity_expr)
-        value = f"{ctor}({marker.input_name})" if ctor else marker.input_name
-        combined = _combine_expr(
-            marker.reduction_type, f"{acc}[{position}]", value, ctor
-        )
-        return statement_from_string(f"{acc}[{position}] = {combined}")
+        slot = f"{acc}[{position}]"
+        return statement_from_string(f"{slot} = {marker.accumulate_expr(slot)}")
 
     def select_phase1(leaf: _Leaf) -> list[ast.AST]:
         if leaf.kind == "marker":

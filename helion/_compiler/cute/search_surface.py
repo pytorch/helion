@@ -187,10 +187,13 @@ def register_search_surface(device_ir: DeviceIR, config_spec: ConfigSpec) -> Non
     env = CompileEnvironment.current()
     env_state = cute_env_state(env)
     register_lane_vector_width_specs(config_spec)
+    from .guarded_lanes import has_guarded_lane_sites
     from .half_extremum_folds import has_half_extremum_reduction
+    from .handler_ops import has_fp32_extrema
     from .hoist_loop_invariant_recip import has_hoistable_fp32_divisions
     from .pair_lane_math import has_fp32_arithmetic
     from .pair_lane_math import has_pairable_exps_or_divisions
+    from .predicated_element_loads import has_masked_gather_sites
     from .signed_bitfield import has_signed_byte_field
     from .tile_packing import tile_pack_counts
 
@@ -203,6 +206,20 @@ def register_search_surface(device_ir: DeviceIR, config_spec: ConfigSpec) -> Non
         env.settings.cute_exact_division
         and has_hoistable_fp32_divisions(info.graph for info in device_ir.graphs)
     )
+    # A load whose mask is more than its tiles' own (a computed or gathered
+    # coordinate, an ``extra_mask``): running the lanes under their stores'
+    # guard is tunable at every extent (on pointwise kernels,
+    # ``guarded_lanes_offered``).
+    config_spec.cute_guarded_lane_sites = has_guarded_lane_sites(device_ir)
+    # An fp32 maximum or minimum of two computed values: its one-instruction
+    # form is tunable (it can lose on a memory-bound gather; on pointwise
+    # kernels, ``fmnmx_extrema_offered``).
+    config_spec.cute_fmnmx_extrema_sites = has_fp32_extrema(device_ir)
+    # A load under an ``extra_mask`` that gathers along its tensor's last
+    # dim and takes no packets there: its lanes are single elements under a
+    # mask at every config, so their predicated form is tunable (on
+    # pointwise kernels, ``predicated_element_loads_offered``).
+    config_spec.cute_masked_gather_sites = has_masked_gather_sites(env, device_ir)
     # Exps (sigmoids lower through one), exact divisions or fp32 products,
     # sums and differences to pair over vector lanes in Blackwell's packed
     # fp32 instructions, or half-precision maxima to fold as half2 words;
@@ -225,17 +242,23 @@ def register_search_surface(device_ir: DeviceIR, config_spec: ConfigSpec) -> Non
     # sinking its V-loop and unrolling its lanes are tunable at every extent,
     # though the seeds that sink it fit only some.
     from .autotune.heuristics.cute import CuteStridedReductionHeuristic
+    from .autotune.heuristics.cute import lane_rows_stay_in_registers
 
     config_spec.cute_strided_reduction_sites = (
         CuteStridedReductionHeuristic.strided_reduction(env, device_ir) is not None
     )
+    # Whether a row of this kernel may stay in registers on vector lanes: no
+    # two of its memory accesses can need a thread barrier, which that
+    # layout has no place for.
+    config_spec.cute_register_lane_rows = lane_rows_stay_in_registers(env, device_ir)
     config_spec.cute_signed_bitfield_bf16_available = (
         config_spec.target_device_capability == (10, 0)
         and any(has_signed_byte_field(info.graph) for info in device_ir.graphs)
     )
-    # The reductions that may roll along a bool row a load reads: their byte
-    # packets are tunable (``cute_bool_byte_packets``), not in a kernel with
-    # a matmul (its facts are recorded by now).
+    # The reductions that may roll along a bool row a load reads, and the
+    # persistent rows without a ``reduction_loops`` slot that read one: their
+    # byte packets are tunable (``cute_bool_byte_packets``), not in a kernel
+    # with a matmul (its facts are recorded by now).
     from .memory_ops import bool_reduction_row_blocks
 
     config_spec.cute_bool_byte_packet_blocks = (
@@ -253,6 +276,48 @@ def register_search_surface(device_ir: DeviceIR, config_spec: ConfigSpec) -> Non
         if config_spec.matmul_facts
         else tail_peel_blocks(device_ir, config_spec)
     )
+    # A device loop that stores along its tile into the last dimension of a
+    # packet-dtype tensor of two or more dimensions: narrower store packets
+    # where a row's alignment fails at run time are tunable
+    # (``cute_store_packet_tiers``).  The packets the stored tensors' layout
+    # leaves, and the lanes it aligns every row to, are recorded beside the
+    # blocks, for the config normalization.
+    from .store_packet_layout import aligned_row_multiples
+    from .store_packet_layout import new_axis_stores
+    from .store_packet_layout import sliced_store_dims
+    from .store_packet_layout import store_packet_lane_limits
+    from .store_packet_layout import unaligned_store_tensors
+    from .store_tier_blocks import store_tier_blocks
+
+    config_spec.cute_store_tier_blocks = (
+        frozenset()
+        if config_spec.matmul_facts
+        else store_tier_blocks(device_ir, config_spec)
+    )
+    config_spec.cute_store_tier_packet_lanes = (
+        {}
+        if config_spec.matmul_facts
+        else store_packet_lane_limits(device_ir, config_spec)
+    )
+    config_spec.cute_store_tier_row_multiples = (
+        {}
+        if config_spec.matmul_facts
+        else aligned_row_multiples(device_ir, config_spec)
+    )
+    # The stored tensors whose base no 16-byte packet lands on: the store
+    # policy (``cute_store_policy``) renames no flush into them.  The store
+    # subscripts that are slices, whose lanes are no tile's.  And whether a
+    # store has a ``None`` subscript, behind which the store facts do not
+    # say whose lanes a flush holds.
+    config_spec.cute_unaligned_store_tensors = (
+        frozenset() if config_spec.matmul_facts else unaligned_store_tensors(device_ir)
+    )
+    config_spec.cute_sliced_store_dims = (
+        frozenset() if config_spec.matmul_facts else sliced_store_dims(device_ir)
+    )
+    config_spec.cute_new_axis_stores = not config_spec.matmul_facts and new_axis_stores(
+        device_ir
+    )
     # A device loop whose reductions over its own tile are all sums added to
     # a value it carries: combining the sums' threads once after the loop is
     # tunable (``cute_defer_tile_reduce``), not in a kernel with a matmul.
@@ -260,6 +325,21 @@ def register_search_surface(device_ir: DeviceIR, config_spec: ConfigSpec) -> Non
 
     config_spec.cute_carried_tile_sum_blocks = (
         frozenset() if config_spec.matmul_facts else carried_tile_sum_blocks(device_ir)
+    )
+    # A flattened gather along one tile stored along another, in dtypes that
+    # have packets: staging the stores in shared memory is tunable
+    # (``cute_staged_store``), and so are the gather's packet loads
+    # (``cute_vloop_sink``, ``cute_lane_unroll``).  Not in a kernel with a
+    # matmul, and not under dynamic shapes: the staged store needs a static
+    # launch grid, and packet loads without it are the layout's slowest
+    # form.  The setting decides, not an extent, so the search space is the
+    # same at every shape.
+    from .flat_gather_lane import lane_gather_stores
+
+    config_spec.cute_lane_gather_store_sites = (
+        env.settings.static_shapes
+        and not config_spec.matmul_facts
+        and bool(lane_gather_stores(env, device_ir))
     )
     # A max, a min or an ``any`` whose warp reduction ``redux.sync`` takes on
     # this target: ``cute_warp_fp32_redux`` is tunable.
@@ -910,19 +990,24 @@ def record_tile_loop_facts(
     func: HostFunction | None, device_ir: DeviceIR, analysis: DeviceIRAnalysis | None
 ) -> None:
     """After the structural analysis: tile loop paths, the reduction blocks
-    on each and the path of each tile strategy, boundary-only grid blocks,
+    on each, the blocks reduced inside their innermost loops and the path of
+    each tile strategy, boundary-only grid blocks,
     the sizes of the paths' fixed blocks, the loops the planner never
     flattens and whether an fp32 dot is exact on this target."""
     env = CompileEnvironment.current()
     config_spec = env.config_spec
     from ..per_thread_planning import tile_loop_keeps_nd_layout
     from .loop_nesting import boundary_only_grid_blocks
+    from .loop_nesting import innermost_loop_reduction_blocks
     from .loop_nesting import tile_loop_facts
 
     path_reductions, strategy_paths = tile_loop_facts(
         env, device_ir, device_ir.graphs, config_spec.reduction_block_ids
     )
     config_spec.cute_tile_loop_path_reductions = path_reductions
+    config_spec.cute_innermost_loop_reduction_blocks = innermost_loop_reduction_blocks(
+        device_ir, device_ir.graphs
+    )
     config_spec.cute_tile_strategy_paths = strategy_paths
     fixed = {
         block_id: source.value

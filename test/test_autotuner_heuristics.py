@@ -4380,6 +4380,7 @@ _CUTE_HEURISTIC_ORDER = (
     "cute_reduction_lane_jam",
     "cute_reduction_lane_jam_forwarding",
     "cute_delinearized_row_reduction",
+    "cute_lane_carry_row",
 )
 
 
@@ -4438,7 +4439,12 @@ class TestHeuristicRegistry(TestCase):
                 "pallas_matmul_no_tiling_seed",
                 "pallas_matmul_f32_no_tiling_seed",
             ),
-            "metal": ("metal_row_reduction", "metal_staged_matmul"),
+            "metal": (
+                "metal_row_reduction",
+                "metal_staged_matmul",
+                "metal_fragment_matmul",
+                "metal_split_reduction",
+            ),
         }
         for backend, names in expected.items():
             with self.subTest(backend):

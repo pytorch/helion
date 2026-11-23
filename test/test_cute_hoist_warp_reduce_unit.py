@@ -39,10 +39,15 @@ from helion._testing import TestCase
 pytestmark = pytest.mark.cpu_only
 
 
-def _run(src: str, running_sums: set[str] | None = None) -> str:
+def _run(
+    src: str,
+    running_sums: set[str] | None = None,
+    input_dtypes: dict[str, str | None] | None = None,
+) -> str:
     body = hoist_warp_reduce_from_vloop(
         ast.parse(textwrap.dedent(src)).body,
         running_sum_accumulators=running_sums,
+        reduce_input_dtypes=input_dtypes,
     )
     return ast.unparse(ast.Module(body=body, type_ignores=[]))
 
@@ -84,7 +89,8 @@ class TestHoistWarpReduceRunningSum(TestCase):
     def test_fresh_sum_keeps_vfold(self) -> None:
         # Not flagged and not loop-carried: the input ``p`` is recomputed each
         # lane, so the original V-fold path applies (a ``_helion_vfold_acc``
-        # accumulator + one warp reduce after the loop).
+        # accumulator + one warp reduce after the loop).  The emitter says
+        # which dtype the direct reduce combines in.
         src = """
         for vec_lane_1 in cutlass.range_constexpr(4):
             values = cutlass.Float32(_v0[vec_lane_1])
@@ -92,7 +98,9 @@ class TestHoistWarpReduceRunningSum(TestCase):
             s = cutlass.Float32(cute.arch.warp_reduction_sum(p, threads_in_group=32))
             di = di + s
         """
-        self.assertExpectedJournal(_run(src, running_sums=set()))
+        self.assertExpectedJournal(
+            _run(src, running_sums=set(), input_dtypes={"p": "cutlass.Float32"})
+        )
 
     # ---- (c) loop-carried but unflagged -> untouched ----
 

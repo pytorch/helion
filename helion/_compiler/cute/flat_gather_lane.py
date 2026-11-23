@@ -32,6 +32,7 @@ from torch.fx import Node
 
 from ..._compat import shape_env_size_hint
 from ...language import _tracing_ops
+from ...language import memory_ops
 from ...language import tile_ops
 from ...language import view_ops
 from ..compile_environment import CompileEnvironment
@@ -69,12 +70,31 @@ class FlatGatherLaneSplit:
     lane_dim: int
 
 
-def _is_broadcast_view(node: Node) -> bool:
+def _is_broadcast_subscript(subscripts: object) -> bool:
+    return isinstance(subscripts, (list, tuple)) and all(
+        item is None or (isinstance(item, slice) and item == slice(None))
+        for item in subscripts
+    )
+
+
+def _is_broadcast_view(node: Node, *, tile_index_loads: bool = True) -> bool:
     if node.target is view_ops.subscript:
-        subscripts = node.args[1]
-        return isinstance(subscripts, (list, tuple)) and all(
-            item is None or (isinstance(item, slice) and item == slice(None))
-            for item in subscripts
+        return _is_broadcast_subscript(node.args[1])
+    if node.target is memory_ops.load:
+        # ``tile.index[:, None]`` of a root grid tile, in the root graph or
+        # in a device loop under it: subscripting that index traces to an
+        # unmasked ``hl.load`` of the ``tile_index`` node, not to
+        # ``view_ops.subscript`` (as a device loop's own tile index does).
+        # Only that operand: a load of a tensor reads memory.
+        operand = node.args[0]
+        return (
+            tile_index_loads
+            and isinstance(operand, Node)
+            and operand.target is tile_ops.tile_index
+            and len(node.args) >= 2
+            and _is_broadcast_subscript(node.args[1])
+            and all(arg is None for arg in node.args[2:])
+            and not any(value is not None for value in node.kwargs.values())
         )
     return node.target in _PASSTHROUGH_TARGETS
 
@@ -92,8 +112,11 @@ def _block_id_of_size(env: CompileEnvironment, size: object) -> int | None:
     return None
 
 
-def _tile_index_block(node: object, env: CompileEnvironment) -> int | None:
-    """The block id of a (broadcast view of a) bare ``tile_index`` node."""
+def _tile_index_block(
+    node: object, env: CompileEnvironment, *, tile_index_loads: bool = True
+) -> int | None:
+    """The block id of a (broadcast view of a) bare ``tile_index`` node;
+    ``tile_index_loads`` as for :func:`match_flat_gather_lane`."""
     current = node
     while isinstance(current, Node) and current.op == "call_function":
         if current.target is tile_ops.tile_index:
@@ -101,10 +124,33 @@ def _tile_index_block(node: object, env: CompileEnvironment) -> int | None:
             if value is None or value.ndim != 1:
                 return None
             return _block_id_of_size(env, value.shape[0])
-        if not _is_broadcast_view(current):
+        if not _is_broadcast_view(current, tile_index_loads=tile_index_loads):
             return None
         current = current.args[0]
     return None
+
+
+def _keeps_index_values(node: object) -> bool:
+    """Whether the views between ``node`` and the ``tile_index`` under it
+    keep every index value: a dtype conversion among them must be to an
+    integer dtype that holds every value of the one it converts (``int32``
+    to ``int64``), not one that can wrap an index (``int32`` to ``uint8``).
+    An index is not negative, so the dtypes' largest values decide."""
+    current = node
+    while isinstance(current, Node) and current.target is not tile_ops.tile_index:
+        if current.target is torch.ops.prims.convert_element_type.default:
+            source = node_tensor(current.args[0])
+            converted = node_tensor(current)
+            if (
+                source is None
+                or converted is None
+                or source.dtype not in _INTEGER_DTYPES
+                or converted.dtype not in _INTEGER_DTYPES
+                or torch.iinfo(converted.dtype).max < torch.iinfo(source.dtype).max
+            ):
+                return False
+        current = current.args[0]
+    return True
 
 
 def _scalar(value: object) -> int | torch.SymInt | None:
@@ -149,7 +195,7 @@ def _static_int(
 
 
 def match_flat_gather_lane(
-    index: object, env: CompileEnvironment
+    index: object, env: CompileEnvironment, *, tile_index_loads: bool = True
 ) -> FlatGatherLaneSplit | None:
     """Match an integer index tensor ``row + tile_index(block)``.
 
@@ -159,7 +205,11 @@ def match_flat_gather_lane(
     the lane coordinate enters the index with unit coefficient and the rest
     of the index does not change with the lane.  Anything else (a scaled or
     shifted lane term, a lane term inside a product, a second occurrence of
-    the lane) returns None.
+    the lane, a lane term converted to a dtype that can wrap it) returns
+    None: callers address the lane with the block's own index.  Without
+    ``tile_index_loads`` the views of the tile term are view subscripts
+    only, not the ``hl.load`` a root grid tile's ``tile.index[:, None]``
+    traces to.
     """
     if not isinstance(index, Node) or index.op != "call_function":
         return None
@@ -171,8 +221,12 @@ def match_flat_gather_lane(
     if index_value is None or index_value.dtype not in _INTEGER_DTYPES:
         return None
     for lane_term, row in (index.args, index.args[::-1]):
-        block_id = _tile_index_block(lane_term, env)
-        if block_id is None or not isinstance(row, Node):
+        block_id = _tile_index_block(lane_term, env, tile_index_loads=tile_index_loads)
+        if (
+            block_id is None
+            or not isinstance(row, Node)
+            or not _keeps_index_values(lane_term)
+        ):
             continue
         lane_value = node_tensor(lane_term)
         row_value = node_tensor(row)
@@ -297,6 +351,91 @@ def row_is_multiple_of(
     return prove(node, 0)
 
 
+@dataclass(frozen=True)
+class LaneGatherStore:
+    """A flattened gather along one tile and a store along another
+    (:func:`lane_gather_stores`)."""
+
+    gather: Node
+    # The gathered tensor's dimension that the lane subscript indexes.
+    gather_dim: int
+    split: FlatGatherLaneSplit
+    store: Node
+    # The block ids of the store's subscripts (None for one that is not a
+    # tile).
+    store_blocks: list[int | None]
+
+
+def lane_gather_stores(
+    env: CompileEnvironment, device_ir: DeviceIR
+) -> list[LaneGatherStore]:
+    """Each flattened gather of a graph whose lane tile is a tile of a store
+    of that graph but not the tile on the stored tensor's last dimension,
+    with dtypes that have packets: one site per lane subscript and store.
+
+    Along the gather's lane tile the loads are contiguous
+    (:func:`match_flat_gather_lane`) and the stores are not: they are
+    contiguous along the tile of the last subscript, so no thread layout
+    makes packets of both (an unfold, ``out[tile_n, tile_k] = x_flat[tile_n
+    .index[:, None] + C * tile_k.index[None, :]]``).  The gathered tensor
+    must have a dtype the V-loop sink loads in packets and the stored one a
+    dtype ``cute_staged_store`` flushes in packets (bf16, fp16, fp32, int16,
+    int32): for any other the knobs these sites open would change nothing.
+    Only the kernel's structure and dtypes are read, never an extent: the
+    knobs opened on it (``cute_staged_store``, ``cute_vloop_sink``,
+    ``cute_lane_unroll``) keep the search space the same at every shape.
+    """
+    from .emitters.lane_packets import _CUTE_VECTOR_UNROLL_CARRIER
+    from .emitters.lane_packets import _CUTE_VECTOR_UNROLL_DTYPES
+
+    found: list[LaneGatherStore] = []
+    for graph_info in device_ir.graphs:
+        stores: list[tuple[Node, list[int | None]]] = []
+        gathers: list[tuple[Node, int, FlatGatherLaneSplit]] = []
+        for node in graph_info.graph.nodes:
+            if node.op != "call_function" or node.target not in (
+                memory_ops.load,
+                memory_ops.store,
+            ):
+                continue
+            subscript = node.args[1]
+            tensor = node_tensor(node.args[0])
+            if not isinstance(subscript, (list, tuple)) or tensor is None:
+                continue
+            if node.target is memory_ops.store:
+                if tensor.dtype not in _CUTE_VECTOR_UNROLL_CARRIER:
+                    continue
+                stores.append(
+                    (
+                        node,
+                        [
+                            _block_id_of_size(env, _scalar(item))
+                            for item in subscript
+                            if item is not None
+                        ],
+                    )
+                )
+                continue
+            if tensor.dtype not in _CUTE_VECTOR_UNROLL_DTYPES:
+                continue
+            for position, item in enumerate(subscript):
+                split = match_flat_gather_lane(item, env)
+                if split is not None:
+                    # ``None`` subscripts index no dimension of the tensor.
+                    dim = sum(
+                        1 for before in subscript[:position] if before is not None
+                    )
+                    gathers.append((node, dim, split))
+        found.extend(
+            LaneGatherStore(gather, dim, split, node, blocks)
+            for gather, dim, split in gathers
+            for node, blocks in stores
+            if split.lane_block_id in blocks[:-1]
+            and blocks[-1] not in (None, split.lane_block_id)
+        )
+    return found
+
+
 def flat_gather_sink_vec_width(
     env: CompileEnvironment,
     device_ir: DeviceIR,
@@ -316,8 +455,6 @@ def flat_gather_sink_vec_width(
     dtype; ``row`` must be a multiple of V and every tensor's base aligned
     for it.  None when any access fails or none exists.
     """
-    from ...language.memory_ops import load
-    from ...language.memory_ops import store
     from ..device_ir import ForLoopGraphInfo
     from .emitters.lane_packets import _CUTE_VECTOR_MAX_BYTES
 
@@ -334,7 +471,10 @@ def flat_gather_sink_vec_width(
         ) <= set(loop_block_ids):
             continue
         for node in graph_info.graph.nodes:
-            if node.op != "call_function" or node.target not in (load, store):
+            if node.op != "call_function" or node.target not in (
+                memory_ops.load,
+                memory_ops.store,
+            ):
                 continue
             tensor = node_tensor(node.args[0])
             subscript = node.args[1]
@@ -395,8 +535,6 @@ def flat_gather_rows_hint(
     rows: a seed heuristic uses it to size the jagged thread count (a
     ``int`` row-width argument's hint is read for this estimate only).
     """
-    from ...language.memory_ops import load
-    from ...language.memory_ops import store
     from ..device_ir import ForLoopGraphInfo
 
     elements: int | None = None
@@ -406,7 +544,10 @@ def flat_gather_rows_hint(
         ) <= set(loop_block_ids):
             continue
         for node in graph_info.graph.nodes:
-            if node.op != "call_function" or node.target not in (load, store):
+            if node.op != "call_function" or node.target not in (
+                memory_ops.load,
+                memory_ops.store,
+            ):
                 continue
             tensor = node_tensor(node.args[0])
             subscript = node.args[1]
@@ -443,8 +584,6 @@ def flat_gather_row_width_hint(
     multiplying their row term (``M`` in ``(start + k) * M + tile_m.index``),
     for a seed heuristic sizing a jagged feature tile; None when the row
     term is not such a product."""
-    from ...language.memory_ops import load
-    from ...language.memory_ops import store
     from ..device_ir import ForLoopGraphInfo
 
     widths: set[int] = set()
@@ -454,7 +593,10 @@ def flat_gather_row_width_hint(
         ) <= set(loop_block_ids):
             continue
         for node in graph_info.graph.nodes:
-            if node.op != "call_function" or node.target not in (load, store):
+            if node.op != "call_function" or node.target not in (
+                memory_ops.load,
+                memory_ops.store,
+            ):
                 continue
             subscript = node.args[1]
             if not isinstance(subscript, (list, tuple)):
@@ -486,25 +628,19 @@ def flat_gather_row_width_hint(
     return min(widths) if widths else None
 
 
-def _packet_layout_aligned(
-    env: CompileEnvironment, tensor: torch.Tensor, lane_dim: int, vec_width: int
+def _example_base_aligned(
+    env: CompileEnvironment, tensor: torch.Tensor, alignment: int
 ) -> bool:
-    """``cute_reduction_vector_layout_aligned`` for a seed heuristic.
-
-    Seeds are generated before the binding snapshots its runtime input
-    specializations, so the bound alignment residues the codegen reads are
-    not available yet.  Read the example input's residue live through the
-    registered alignment specialization instead (the snapshot pins the same
-    residue into the cache key, so the codegen will prove what is read here).
-    """
+    """Whether the example input that owns ``tensor`` puts its base on a
+    multiple of ``alignment`` bytes, read live through the registered
+    alignment specialization; False once the binding has snapshot its
+    residues (the bound facts then decide) and for a tensor no specialized
+    input owns."""
     from torch._subclasses import FakeTensor
 
     from ..compile_environment import _replay_tensor_input_source
     from .memory_ops import _PERSISTENT_VEC_ALIGNMENT_SPECIALIZATION_KEY
-    from .memory_ops import cute_reduction_vector_layout_aligned
 
-    if cute_reduction_vector_layout_aligned(env, tensor, lane_dim, vec_width):
-        return True
     key = _PERSISTENT_VEC_ALIGNMENT_SPECIALIZATION_KEY
     if key in env.bound_runtime_input_specialization_results:
         return False
@@ -518,7 +654,43 @@ def _packet_layout_aligned(
     value = _replay_tensor_input_source(source, env.runtime_arg_values_by_name)
     if not isinstance(value, torch.Tensor) or isinstance(value, FakeTensor):
         return False
-    if (int(value.data_ptr()) + offset_bytes) % (vec_width * tensor.dtype.itemsize):
+    return (int(value.data_ptr()) + offset_bytes) % alignment == 0
+
+
+def base_aligned_for_seed(
+    env: CompileEnvironment, tensor: torch.Tensor, alignment: int
+) -> bool:
+    """``cute_tensor_base_is_aligned`` for a seed heuristic, which runs
+    before the binding snapshots the inputs' pointer residues (see
+    ``_packet_layout_aligned``): a kernel argument's base is read from the
+    example input, under the conditions the bound proof will hold it to."""
+    from .memory_ops import _CUTE_ALIGNMENT_MAX_BYTES
+    from .memory_ops import cute_tensor_base_is_aligned
+
+    return cute_tensor_base_is_aligned(env, tensor, alignment) or (
+        _CUTE_ALIGNMENT_MAX_BYTES % alignment == 0
+        and env.traced_strides_hold(tensor)
+        and env.input_residues_hold_modulo(alignment)
+        and _example_base_aligned(env, tensor, alignment)
+    )
+
+
+def _packet_layout_aligned(
+    env: CompileEnvironment, tensor: torch.Tensor, lane_dim: int, vec_width: int
+) -> bool:
+    """``cute_reduction_vector_layout_aligned`` for a seed heuristic.
+
+    Seeds are generated before the binding snapshots its runtime input
+    specializations, so the bound alignment residues the codegen reads are
+    not available yet.  Read the example input's residue live through the
+    registered alignment specialization instead (the snapshot pins the same
+    residue into the cache key, so the codegen will prove what is read here).
+    """
+    from .memory_ops import cute_reduction_vector_layout_aligned
+
+    if cute_reduction_vector_layout_aligned(env, tensor, lane_dim, vec_width):
+        return True
+    if not _example_base_aligned(env, tensor, vec_width * tensor.dtype.itemsize):
         return False
     for dim in range(tensor.ndim):
         if dim == lane_dim:
@@ -592,8 +764,6 @@ def flat_gather_int_factor_sources(
     env: CompileEnvironment, device_ir: DeviceIR
 ) -> tuple[LocalSource, ...]:
     """The ``int`` arguments multiplying a flat gather's row term."""
-    from ...language.memory_ops import load
-    from ...language.memory_ops import store
 
     sources: dict[str, LocalSource] = {}
 
@@ -618,13 +788,23 @@ def flat_gather_int_factor_sources(
 
     for graph_info in device_ir.graphs:
         for node in graph_info.graph.nodes:
-            if node.op != "call_function" or node.target not in (load, store):
+            if node.op != "call_function" or node.target not in (
+                memory_ops.load,
+                memory_ops.store,
+            ):
                 continue
             subscript = node.args[1]
             if not isinstance(subscript, (list, tuple)):
                 continue
             for item in subscript:
-                split = match_flat_gather_lane(item, env)
+                # On the lane terms the matcher read before a root grid
+                # tile's ``tile.index[:, None]`` became a view: what a bound
+                # kernel is keyed on does not follow the matcher, and an
+                # ``int``-scaled row of such a gather keeps its scalar load
+                # (``row_is_multiple_of`` finds no pinned residue).  A lane
+                # term a conversion can wrap is refused here as everywhere:
+                # its residue served only the address no caller builds now.
+                split = match_flat_gather_lane(item, env, tile_index_loads=False)
                 if split is not None:
                     visit(split.row, 0)
     return tuple(sources[name] for name in sorted(sources))

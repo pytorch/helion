@@ -185,3 +185,33 @@ def test_rebound_pointer_name_between_loads_stays_scalar() -> None:
     rewritten = ast.unparse(ast.Module(body=body, type_ignores=[]))
     assert rewritten.count("ir.VectorType.get([4], cutlass.Uint8.mlir_type)") == 1
     assert "a3 = cutlass.Uint8(_helion_literal_vec_1[3])" in rewritten
+
+
+@pytest.mark.parametrize("cast", ["cutlass.Float32", "cutlass.Float64"])
+def test_an_fma_between_literal_loads_does_not_split_the_run(cast: str) -> None:
+    """``ops.fma`` (``torch.addcmul``, ``add`` with ``alpha``) is a
+    ``cute.math.fma`` call on fp32 or fp64 casts when this pass runs, where
+    it was a product and a sum: like those it has no memory effect, so the
+    loads around it merge.  A call the pass does not know keeps them apart."""
+    from helion._compiler.cute.literal_offset_loads import _Merger
+    from helion._compiler.cute.literal_offset_loads import _TensorFacts
+
+    facts = {"w": _TensorFacts("cutlass.Uint8", {0: 8, 1: 1}, 16)}
+    load = (
+        "cute.arch.load(w.iterator + cutlass.Int32(indices) * "
+        "cutlass.Int32(w.layout.stride[0]) + cutlass.Int32({byte}) * "
+        "cutlass.Int32(w.layout.stride[1]), cutlass.Uint8)"
+    )
+    lines = [f"a{byte} = {load.format(byte=byte)}" for byte in range(4)]
+
+    def merged(between: str) -> str:
+        body = _Merger(facts).block(
+            ast.parse("\n".join([*lines[:2], between, *lines[2:]])).body
+        )
+        return ast.unparse(ast.Module(body=body, type_ignores=[]))
+
+    fma = f"t = cute.math.fma({cast}(x), {cast}(y), {cast}(z))"
+    rewritten = merged(fma)
+    assert rewritten.count("ir.VectorType.get([4], cutlass.Uint8.mlir_type)") == 1
+    assert fma in rewritten
+    assert "ir.VectorType.get([4]" not in merged("t = opaque_call(x)")
