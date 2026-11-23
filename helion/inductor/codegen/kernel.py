@@ -3,6 +3,7 @@ from __future__ import annotations
 import collections
 import contextlib
 from dataclasses import dataclass
+import itertools
 import re
 from typing import TYPE_CHECKING
 from typing import Any
@@ -228,6 +229,12 @@ class HelionCSEProxy(CSEProxy):
         return value
 
 
+# The segments a persistent rdim is emitted over (HelionKernel.rdim_segment()):
+# at most this many, each a power of two of at least this many elements.
+RDIM_SEGMENTS_MAX = 4
+RDIM_SEGMENT_MIN = 16
+
+
 def as_less(relation: sympy.Rel) -> tuple[sympy.Basic, sympy.Basic, bool]:
     """`relation` as lhs < rhs or lhs <= rhs, and whether it is strict: a > b
     as b < a (HelionKernel.proven(), masked_extents())."""
@@ -323,6 +330,15 @@ class HelionKernel(SIMDKernel[CSEVariable]):
         # size of the dim each indexes.
         self.indirect: dict[sympy.Symbol, CSEVariable] = {}
         self.indirect_sizes: dict[sympy.Symbol, sympy.Expr] = {}
+        # A persistent rdim's constant cuts that each node's comparisons of the
+        # r index make (a cat's or pad's r < 128); the nodes emitted over
+        # segments of the rdim, and the segments, each in turn (rdim_segment());
+        # see HelionScheduling.create_kernel_choices().
+        self.rdim_cuts: dict[str, OrderedSet[int]] = {}
+        self.segment_nodes: list[str] = []
+        self.segments: list[tuple[int, int]] = []
+        self.segment: tuple[int, int] | None = None
+        self.rdim_extent = 0
 
     def __enter__(self) -> Self:
         if self.mix_order_reduction and "y" not in self.symbols:
@@ -435,7 +451,8 @@ class HelionKernel(SIMDKernel[CSEVariable]):
 
     def dim_code(self, dim: object) -> str:
         """A dim of a value's shape, as code: in a persistent reduction tile_r
-        is no loop variable but the whole rdim (rdim_code())."""
+        is no loop variable but the whole rdim (rdim_code()), or the segment of it
+        emitted (rdim_segment())."""
         if self.persistent_reduction and str(dim) == "tile_r":
             return self.rdim_code()
         return str(dim)
@@ -454,6 +471,12 @@ class HelionKernel(SIMDKernel[CSEVariable]):
         Helion cannot roll into a loop: with hl.arange(262144) in the kernel,
         its Config has no reduction_loops, and an rdim of 262144 elements is read
         as one block whatever the autotuner tries."""
+        if self.segment is not None:
+            # A power of two (rdim_cut_segments()), which Helion takes as the dim of
+            # the segment's slices, in0[tile_y, tile_x, 128:256]
+            # (segment_subscript()).
+            lo, hi = self.segment
+            return str(hi - lo)
         self.uses_rdim = True
         return "rdim"
 
@@ -589,6 +612,12 @@ class HelionKernel(SIMDKernel[CSEVariable]):
                 # pyrefly: ignore [unsupported-operation]
                 index.xreplace({x: self.extents["x"] * self.symbols["y"] + x})
             )
+        if self.segment is not None:
+            # Within a segment of the rdim (rdim_segment()), its tile counts from
+            # the segment's start.
+            r = self.symbols["r0_"]
+            lo = sympy.Integer(self.segment[0])
+            index = sympy.expand(index.xreplace({r: sympy.Add(r, lo)}))
         return V.graph.sizevars.simplify_with_ranges(index, self.tile_ranges)
 
     def tensor_arg(self, operand: IRNode, *, output: bool = False) -> HelionTensorArg:
@@ -724,8 +753,10 @@ class HelionKernel(SIMDKernel[CSEVariable]):
     ) -> tuple[HelionTensorArg, list[str], TileShape]:
         """The parameter and subscript that read `buffer` at `index`, and its shape.
 
-        Tries the buffer's own dims (dropping size-1 dims the index skips), then
-        a tiled_view(), then a flat_subscript(). `bounds` are the extents a
+        Tries an rdim segment's slice of the whole rdim (segment_subscript()), the
+        buffer's own dims (dropping size-1 dims the index skips) or a
+        tiled_view() (tiled_subscript()), for a load a gather_subscript() or a
+        quotient_subscript(), then a flat_subscript(). `bounds` are the extents a
         masked load's mask bounds its tiles to (masked_extents()): the view
         need only cover those, as the pad of x from 30522 to 30528 reads
             tmp5 = hl.load(in0, [tile_y, tile_x], extra_mask=tmp4)
@@ -735,8 +766,33 @@ class HelionKernel(SIMDKernel[CSEVariable]):
                 [tile_y, 1])], extra_mask=tmp4)
         whose lanes the backend cannot tell are consecutive along x.
         """
-        layout = buffer.get_layout()
+        if (sliced := self.segment_subscript(buffer, index, axes, output)) is not None:
+            return sliced
         extents = {**self.extents, **(bounds or {})}
+        if (
+            tiled := self.tiled_subscript(buffer, index, axes, extents, output)
+        ) is not None:
+            return tiled
+        if not output and (gather := self.gather_subscript(buffer, index, axes)):
+            return gather
+        if not output and (quotient := self.quotient_subscript(buffer, index, axes)):
+            return quotient
+        return self.flat_subscript(buffer, index, axes, output=output)
+
+    def tiled_subscript(
+        self,
+        buffer: IRNode,
+        index: sympy.Expr,
+        axes: Sequence[str],
+        extents: dict[str, sympy.Expr],
+        output: bool,
+    ) -> tuple[HelionTensorArg, list[str], TileShape] | None:
+        """The parameter and subscript that read `buffer` at `index` through
+        its own dims (dropping size-1 dims the index skips) or a tiled_view(),
+        a coordinate per tile; None when neither does, with no parameter or
+        rdim taken on the way (segment_subscript() tries this alone, where
+        subscript()'s flat fallback would name the rdim)."""
+        layout = buffer.get_layout()
         for dims in self.dim_assignments(tuple(layout.size), tuple(axes), extents):
             expected = layout.offset + sum(  # pyrefly: ignore [unsupported-operation]
                 self.symbols[dim] * stride  # pyrefly: ignore [unsupported-operation]
@@ -762,11 +818,53 @@ class HelionKernel(SIMDKernel[CSEVariable]):
             arg = self.tensor_arg(view, output=output)
             self.note_rdim(arg, coordinates)
             return arg, coordinates, tiles
-        if not output and (gather := self.gather_subscript(buffer, index, axes)):
-            return gather
-        if not output and (gather := self.quotient_subscript(buffer, index, axes)):
-            return gather
-        return self.flat_subscript(buffer, index, axes, output=output)
+        return None
+
+    def segment_subscript(
+        self, buffer: IRNode, index: sympy.Expr, axes: Sequence[str], output: bool
+    ) -> tuple[HelionTensorArg, list[str], TileShape] | None:
+        """Within a segment of a persistent rdim (rdim_segment()), the subscript
+        of the whole rdim, its dim sliced to the elements the segment reads:
+        the second half of rdims of 256 as in0[tile_y, tile_x, 128:256], of the
+        parameter that reads whole rdims, in0[tile_y, tile_x, :]. A view of each
+        part would be a parameter of its own, and the CuTe backend packs the
+        stores of an output only when no other parameter shares its storage
+        (cute_tensor_base_is_aligned()): out0 and out1, the halves of one
+        output, were stored a lane at a time."""
+        if self.segment is None or "r0_" not in axes:
+            return None
+        r = self.symbols["r0_"]
+        length = self.segment[1] - self.segment[0]
+        stride = index.coeff(r)
+        # sympify: of the index r alone, xreplace() returns the int itself.
+        start = sympy.sympify(index.xreplace(dict.fromkeys(self.symbols.values(), 0)))
+        if not (
+            isinstance(stride, sympy.Integer)
+            and stride > 0
+            and isinstance(start, sympy.Integer)
+        ):
+            return None
+        # Where the segment starts within its rdim of the parameter.
+        first = (
+            int(start - buffer.get_layout().offset) // int(stride) % self.rdim_extent
+        )
+        if first + length > self.rdim_extent:
+            return None
+        shifted = sympy.expand(index.xreplace({r: sympy.Add(r, sympy.Integer(-first))}))
+        with self.rdim_state(self.rdim_extent, None):
+            # The parameter's own dims or a tiled view, a coordinate per tile:
+            # subscript() would fall back to a flat read, which takes a
+            # parameter and names the rdim even where this declines.
+            tiled = self.tiled_subscript(
+                buffer, shifted, axes, dict(self.extents), output
+            )
+        if tiled is None:
+            return None
+        # tile_r's coordinate is the whole rdim, ":", in a persistent rdim.
+        arg, coordinates, tiles = tiled
+        coordinates = list(coordinates)
+        coordinates[tiles.index("tile_r")] = f"{first}:{first + length}"
+        return arg, coordinates, tiles
 
     def quotient_subscript(
         self, buffer: IRNode, index: sympy.Expr, axes: Sequence[str]
@@ -1227,11 +1325,20 @@ class HelionKernel(SIMDKernel[CSEVariable]):
     @staticmethod
     def index_list(coordinates: Sequence[str]) -> str:
         """`coordinates` as the index list of hl.load or hl.atomic_add, where the
-        whole row is slice(None): a masked load through its buffer's own layout
-        in a persistent reduction is
+        whole rdim is slice(None) and a segment of it (segment_subscript())
+        slice(lo, hi): a masked load through its buffer's own layout in a
+        persistent reduction is
             tmp0 = hl.load(in0, [tile_x, slice(None)], extra_mask=tmp3)
         where hl.load(in0, [tile_x, :], extra_mask=tmp3) is a SyntaxError."""
-        return ", ".join("slice(None)" if c == ":" else c for c in coordinates)
+
+        def entry(coordinate: str) -> str:
+            if coordinate == ":":
+                return "slice(None)"
+            if bounds := re.fullmatch(r"(\d+):(\d+)", coordinate):
+                return f"slice({bounds[1]}, {bounds[2]})"
+            return coordinate
+
+        return ", ".join(map(entry, coordinates))
 
     def index_expr(self, expr: sympy.Expr, dtype: torch.dtype) -> CSEVariable:
         index = self.tile_index(expr)
@@ -1305,6 +1412,7 @@ class HelionKernel(SIMDKernel[CSEVariable]):
                 self.predicates[result.name] = [
                     relation[name](lhs, rhs, evaluate=False)
                 ]
+                self.note_rdim_cut(self.predicates[result.name][0])
         elif name in ("and_", "logical_and") and len(args) == 2:
             parts = [
                 self.predicates.get(arg.name) if isinstance(arg, CSEVariable) else None
@@ -1312,6 +1420,79 @@ class HelionKernel(SIMDKernel[CSEVariable]):
             ]
             if parts[0] is not None and parts[1] is not None:
                 self.predicates[result.name] = [*parts[0], *parts[1]]
+
+    def note_rdim_cut(self, relation: sympy.Rel) -> None:
+        """Keep where `relation`, a comparison of a persistent rdim's index with
+        an integer, cuts the rdim, by the node it is of: r < 128 at 128, the
+        cut of rotate_half's cat([-y[..., 128:], y[..., :128]], -1)."""
+        if not self.persistent_reduction or self.segment is not None:
+            return
+        node = self.current_node
+        if node is None or "r0_" not in self.symbols:
+            return
+        lhs, rhs, strict = as_less(relation)
+        r = self.symbols["r0_"]
+        if lhs == r and isinstance(rhs, sympy.Integer):
+            cut = int(rhs) + (0 if strict else 1)
+        elif rhs == r and isinstance(lhs, sympy.Integer):
+            cut = int(lhs) + (1 if strict else 0)
+        else:
+            return
+        extent = self.extents["r0_"]
+        if isinstance(extent, (int, sympy.Integer)) and 0 < cut < int(extent):
+            self.rdim_cuts.setdefault(node.get_name(), OrderedSet()).add(cut)
+
+    def rdim_cut_segments(self, names: Iterable[str]) -> list[tuple[int, int]] | None:
+        """The segments the cuts of the nodes `names` (note_rdim_cut()) make of
+        the rdim, when each is a power of two of at least RDIM_SEGMENT_MIN
+        elements (whose literal dim Helion takes, rdim_code()); else None."""
+        cuts = OrderedSet(cut for name in names for cut in self.rdim_cuts.get(name, ()))
+        extent = self.extents.get("r0_")
+        if not cuts or not isinstance(extent, (int, sympy.Integer)):
+            return None
+        points = [0, *sorted(cuts), int(extent)]
+        segments = list(itertools.pairwise(points))
+        if len(segments) > RDIM_SEGMENTS_MAX or any(
+            hi - lo < RDIM_SEGMENT_MIN or (hi - lo) & (hi - lo - 1)
+            for lo, hi in segments
+        ):
+            return None
+        return segments
+
+    @contextlib.contextmanager
+    def rdim_segment(self, lo: int, hi: int) -> Iterator[None]:
+        """Emit within the segment [lo, hi) of a persistent rdim: its tile
+        counts from lo (tile_index()) over hi - lo elements, so that the
+        comparisons of a cat's or pad's mask are proven (proven()) and its
+        parts are read and written as slices of the whole rdim's parameters
+        (segment_subscript()), as rotate_half after an RMSNorm (Gemma's q/k
+        norm and RoPE), where the whole rdim would read the halves as flat
+        masked loads:
+            tmp8 = hl.load(in1, [128 + hl.arange(rdim) + 256*tile_x.index...],
+                           extra_mask=tmp7)              # r < 128
+        and the segments read and write them as the hand-written kernel does,
+            tmp8 = in0[tile_y, tile_x, 128:256]
+            out0[tile_y, tile_x, 0:128] = ...
+        HelionScheduling.create_kernel_choices() picks the segments."""
+        self.rdim_extent = int(self.extents["r0_"])
+        with self.rdim_state(hi - lo, (lo, hi)):
+            yield
+
+    @contextlib.contextmanager
+    def rdim_state(
+        self, extent: int, segment: tuple[int, int] | None
+    ) -> Iterator[None]:
+        """Within the block, tile_r spans `extent` elements of the rdim and the
+        kernel emits within `segment` (None: the whole rdim); rdim_segment() and
+        segment_subscript() each set and restore these together."""
+        r = self.symbols["r0_"]
+        saved = (self.extents["r0_"], self.tile_ranges[r], self.segment)
+        self.extents["r0_"] = self.tile_ranges[r] = sympy.Integer(extent)
+        self.segment = segment
+        try:
+            yield
+        finally:
+            self.extents["r0_"], self.tile_ranges[r], self.segment = saved
 
     def masked_extents(self, mask: CSEVariable) -> dict[str, sympy.Expr]:
         """The tile extents `mask` bounds below the kernel's: the axes it

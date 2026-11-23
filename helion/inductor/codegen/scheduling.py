@@ -10,12 +10,15 @@ from torch._inductor import config
 from torch._inductor import metrics
 from torch._inductor.codegen.common import BackendFeature
 from torch._inductor.codegen.simd import SIMDScheduling
+from torch._inductor.codegen.simd_kernel_features import DisableReduction
+from torch._inductor.codegen.simd_kernel_features import EnableReduction
 from torch._inductor.codegen.triton import TritonScheduling
 from torch._inductor.ir import Reduction
 from torch._inductor.ops_handler import OpsHandler
 from torch._inductor.scheduler import BaseSchedulerNode
 from torch._inductor.scheduler import FusedMixOrderReductions
 from torch._inductor.scheduler import MixOrderReduction
+from torch._inductor.scheduler import SchedulerNode
 from torch._inductor.utils import get_fused_kernel_name
 from torch._inductor.virtualized import V
 from torch.utils._ordered_set import OrderedSet
@@ -46,7 +49,6 @@ if TYPE_CHECKING:
     from torch._inductor.ir import ComputedBuffer
     from torch._inductor.scheduler import FusedSchedulerNode
     from torch._inductor.scheduler import Scheduler
-    from torch._inductor.scheduler import SchedulerNode
     from torch._inductor.tiling_utils import CoalesceVarAnalysis
 
 
@@ -397,10 +399,48 @@ class HelionScheduling(SIMDScheduling):
     def codegen_node_schedule_with_kernel(
         self, node_schedule: list[Any], kernel: SIMDKernel[Any]
     ) -> None:
-        super().codegen_node_schedule_with_kernel(node_schedule, kernel)
+        # The nodes create_kernel_choices() emits over segments of the rdim: all
+        # of them for one segment, then the next (HelionKernel.rdim_segment()),
+        # where a node reads an earlier one's part of the segment through the
+        # CSE store cache. The first runs them; the others run within it.
+        helion_kernel = cast("HelionKernel", kernel)
+        group = [
+            node
+            for node in node_schedule
+            if isinstance(node, SchedulerNode)
+            and node.get_name() in helion_kernel.segment_nodes
+        ]
+        if group:
+            emits = {node: node.codegen for node in group}
+
+            def codegen(index_vars: Any) -> None:  # noqa: ANN401
+                ranges = {group[0]: index_vars}
+                for node in group[1:]:
+                    self._prepare_loop_body(node._body)
+                    ranges[node] = helion_kernel.split_and_set_ranges(node.get_ranges())
+                # Each segment starts from the store cache the group started
+                # with: a node that stores a buffer the group reads (x.add_(...)
+                # of a load of x) would otherwise hand the next segment its own
+                # stored part as x.
+                store_cache = dict(helion_kernel.cse.store_cache)
+                for lo, hi in helion_kernel.segments:
+                    helion_kernel.cse.store_cache.clear()
+                    helion_kernel.cse.store_cache.update(store_cache)
+                    with helion_kernel.rdim_segment(lo, hi):
+                        for node in group:
+                            emits[node](ranges[node])
+
+            setattr(group[0], "codegen", codegen)  # noqa: B010
+            for node in group[1:]:
+                setattr(node, "codegen", lambda index_vars: None)  # noqa: B010
+        try:
+            super().codegen_node_schedule_with_kernel(node_schedule, kernel)
+        finally:
+            for node in group:
+                del node.codegen
         # What only emitting the kernel shows: an indirect index that needs a
         # bounds check (HelionKernel.check_bounds()).
-        if cast("HelionKernel", kernel).needs_bounds_check:
+        if helion_kernel.needs_bounds_check:
             raise Unsupported("check_bounds")
 
     def create_kernel_choices(  # pyrefly: ignore [bad-override]
@@ -413,36 +453,108 @@ class HelionScheduling(SIMDScheduling):
         if not HelionKernel.supports_tiling(tiling):
             raise Unsupported(f"tiling {tiling}")
         kernel = HelionKernel(*kernel_args, **kernel_kwargs)
-        if (
-            kernel.persistent_reduction
-            and not kernel.mix_order_reduction
-            and "override_persistent_reduction" not in kernel_kwargs
-            and V.graph.sizevars.statically_known_gt(
+        if not kernel.persistent_reduction or kernel.mix_order_reduction:
+            return [kernel]
+        long_rdim = "override_persistent_reduction" not in kernel_kwargs and (
+            V.graph.sizevars.statically_known_gt(
                 kernel.numels["r0_"], UNROLLED_RDIM_MAX
             )
-        ):
+        )
+        group, earlier = self.trailing_nodes(kernel_features.node_schedule)
+        # Only a trailing node with a masked part (a cat's or pad's
+        # ops.masked()) can cut the rdim into segments.
+        cuttable = any(node._body.subblocks for node in group)
+        if not long_rdim and not cuttable:
+            return [kernel]
+        # Emitting the body tells what the kernel needs of its rdim.
+        self.codegen_node_schedule_with_kernel(kernel_features.node_schedule, kernel)
+        # The kernel emitted to tell is not the one returned below: take back
+        # the count its Kernel.__init__ added to metrics.generated_kernel_count,
+        # which tests compare with the kernels a graph launches.
+        metrics.generated_kernel_count -= 1
+        if long_rdim and kernel.uses_rdim and kernel.rdim_anchor is None:
             # An rdim past UNROLLED_RDIM_MAX that the kernel names (rdim) but no
             # input's full rdim does (HelionKernel.rdim_anchor) has a factory's
             # dim, which Helion cannot roll: x.flip(-1).sum(-1) over rdims of
-            # 100000 would read each rdim as one block of 131072 lanes.
-            # Emitting the body tells; such a kernel loops over the rdim, as
-            # Triton's rule has it. A gather's rdim, in1[tmp1, :], needs no
-            # rdim name and stays one block.
-            self.codegen_node_schedule_with_kernel(
-                kernel_features.node_schedule, kernel
-            )
-            # The kernel emitted to tell is not the one returned below: take
-            # back the count its Kernel.__init__ added to
-            # metrics.generated_kernel_count, which tests compare with the
-            # kernels a graph launches.
-            metrics.generated_kernel_count -= 1
-            if kernel.uses_rdim and kernel.rdim_anchor is None:
-                kernel = HelionKernel(
+            # 100000 would read each rdim as one block of 131072 lanes. Such a
+            # kernel loops over the rdim, as Triton's rule has it. A gather's
+            # rdim, in1[tmp1, :], needs no rdim name and stays one block.
+            return [
+                HelionKernel(
                     *kernel_args, **kernel_kwargs, override_persistent_reduction=False
                 )
-            else:
-                kernel = HelionKernel(*kernel_args, **kernel_kwargs)
+            ]
+        # An rdim past UNROLLED_RDIM_MAX keeps its tail in one emission over the
+        # whole rdim, which Helion can roll: a segment's dim is a literal
+        # (HelionKernel.rdim_code()), which it cannot.
+        segmented = (
+            self.rdim_segments(group, earlier, kernel)
+            if cuttable and not long_rdim
+            else None
+        )
+        kernel = HelionKernel(*kernel_args, **kernel_kwargs)
+        if segmented is not None:
+            kernel.segment_nodes, kernel.segments = segmented
         return [kernel]
+
+    @staticmethod
+    def trailing_nodes(
+        node_schedule: list[Any],
+    ) -> tuple[list[SchedulerNode], list[BaseSchedulerNode]]:
+        """The nodes over the rdim after a persistent reduction's last
+        reduction, which HelionScheduling.rdim_segments() may emit over
+        segments of the rdim, and the nodes before them."""
+        group: list[SchedulerNode] = []
+        earlier: list[BaseSchedulerNode] = []
+        inside = True
+        for node in node_schedule:
+            if node is DisableReduction:
+                inside = False
+            elif node is EnableReduction:
+                inside = True
+            elif isinstance(node, BaseSchedulerNode):
+                if (
+                    isinstance(node, SchedulerNode)
+                    and inside
+                    and not node.is_reduction()
+                ):
+                    group.append(node)
+                else:
+                    earlier.extend(group)
+                    group = []
+                    earlier.append(node)
+        return group, earlier
+
+    @staticmethod
+    def rdim_segments(
+        group: list[SchedulerNode],
+        earlier: list[BaseSchedulerNode],
+        kernel: HelionKernel,
+    ) -> tuple[list[str], list[tuple[int, int]]] | None:
+        """The nodes of a persistent reduction to emit over segments of the
+        rdim (HelionKernel.rdim_segment()), and the segments: the trailing
+        nodes (trailing_nodes()), when their comparisons of the rdim index cut
+        the rdim (rdim_cut_segments()) and none reads an rdim that a node before
+        them writes, whose value is the whole rdim's."""
+        segments = kernel.rdim_cut_segments(node.get_name() for node in group)
+        if segments is None:
+            return None
+        numel = sympy.Mul(
+            kernel.numels["r0_"], *(kernel.numels[axis] for axis in kernel.outer_axes)
+        )
+        earlier_full = OrderedSet(
+            name
+            for node in earlier
+            for name in node.get_buffer_names()
+            if V.graph.sizevars.statically_known_equals(
+                V.graph.get_buffer(name).get_numel(), numel
+            )
+        )
+        if any(
+            dep.name in earlier_full for node in group for dep in node.read_writes.reads
+        ):
+            return None
+        return [node.get_name() for node in group], segments
 
     def define_kernel(
         self, src_code: str, node_schedule: list[Any], kernel: SIMDKernel[Any]
