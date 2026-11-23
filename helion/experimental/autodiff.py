@@ -4633,6 +4633,14 @@ class FXToHelionConverter:
                     if all(d in full_slice_dims for d in param_iter_dims):
                         # One ':' per param dim — `p[:]`, `p[:, :]`, etc.
                         load_expr = f"{p}[{', '.join([':'] * len(param_iter_dims))}]"
+                    elif p in self.forward_whole_inputs:
+                        # A whole-loaded input that maps onto a tiled dim here
+                        # would be sliced per-tile below, silently reading only
+                        # part of what the forward read in full.
+                        raise exc.AutodiffNotSupported(
+                            f"{p!r}, which the forward loads whole, would be "
+                            "tile-indexed along a tiled dimension here"
+                        )
                     else:
                         indices = []
                         for d in range(iter_ndim):
@@ -4799,6 +4807,18 @@ class FXToHelionConverter:
 
             for p in input_params:
                 indices = self._nonreduction_load_indices(p, iter_shape, tile_vars)
+                if p in self.forward_whole_inputs and any(
+                    index in tile_vars for index in indices
+                ):
+                    # A whole-loaded input only gets ":"/"None" here when its
+                    # own dims are singleton; a real (matching) dim falls
+                    # through to a tile var, silently reading a slice of what
+                    # the forward read in full.
+                    raise exc.AutodiffNotSupported(
+                        f"{p!r}, which the forward loads whole, would be "
+                        "tile-indexed along a tiled dimension in this "
+                        f"{iter_ndim}-D tile loop"
+                    )
                 load_expr = f"{p}[{', '.join(indices)}]"
                 loop_body.append(parse_stmt(f"{p}_tile = {load_expr}"))
 
@@ -4809,6 +4829,11 @@ class FXToHelionConverter:
             # for every output regardless of its rank.
             for grad_name, var_name in output_assignments:
                 out_tensor = self._grad_target(grad_name)
+                if out_tensor in self.forward_whole_inputs:
+                    raise exc.AutodiffNotSupported(
+                        f"the gradient of {out_tensor!r}, which the forward "
+                        "loads whole, needs a sum across tiles"
+                    )
                 out_shape = self.tensor_shapes.get(out_tensor, ())
                 out_ndim = len(out_shape)
                 if out_ndim >= iter_ndim:

@@ -1534,9 +1534,11 @@ class TestAutodiff(RefEagerTestDisabled, TestCase):
             return out
 
         # Each count spans all of t, also when t is exactly as long as x, and
-        # the loop follows x even when the forward loads t first.
-        for kernel in (x_first, t_first):
-            for n in (5, 64):
+        # the loop follows x even when the forward loads t first. x_first
+        # covers both n values; t_first only needs the n == len(x) edge
+        # case, since the ordering effect doesn't depend on n.
+        for kernel, ns in ((x_first, (5, 64)), (t_first, (64,))):
+            for n in ns:
                 with self.subTest(kernel=kernel.fn.__name__, n=n):
                     torch.manual_seed(0)
                     x = torch.randn(64, device=DEVICE)
