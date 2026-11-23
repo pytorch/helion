@@ -16,6 +16,7 @@ Role: heuristic (section 6 of ``../../README.md``).
 from __future__ import annotations
 
 from copy import deepcopy
+import functools
 import operator
 from typing import TYPE_CHECKING
 
@@ -100,6 +101,7 @@ from ..fragment_knobs import register_fragment_warp_producer_regions_coverage
 from ..fragment_knobs import register_fragment_warp_results_coverage
 from ..fragment_knobs import register_fragment_warp_scan_coverage
 from ..search_surface import _rolls_a_byte_packet_row
+from ..search_surface import _splittable_store_tier_blocks
 from .cute import CuteAffineScanHeuristic
 from .cute import CuteAsyncPersistentSubwarpRowsHeuristic
 from .cute import CuteAsyncStateLoadHeuristic
@@ -542,6 +544,7 @@ def _register_knob_witnesses(
     carries: Callable[[Config], bool] = lambda seed: True,
     candidates: Sequence[Config] | None = None,
     dependencies: tuple[CoverageDependency, ...] = (),
+    own_without_witnesses: bool = False,
 ) -> bool:
     """Cover the boolean knob ``key``, off by default, with a knob-on witness
     for each of the first ``candidates`` that ``carries`` admits, at most
@@ -549,7 +552,9 @@ def _register_knob_witnesses(
     The candidates are the compiler seeds as the search canonicalizes them
     unless given (carriers that hold the values ``dependencies`` names, of
     groups registered earlier); each is kept only when its witness transfers
-    strictly.
+    strictly.  ``own_without_witnesses`` registers the group with no witness
+    too: the knob then stays off in the random initial population (a group
+    owns its field), for a knob normalization reads off in most random rows.
     """
     spec = env.config_spec
     # A knob the search surface does not offer here (``cute_flat_fields``)
@@ -572,7 +577,7 @@ def _register_knob_witnesses(
         carriers.append(seed)
         if len(carriers) == MAX_COMPILER_COVERAGE_CONFIGS:
             break
-    if carriers:
+    if carriers or own_without_witnesses:
         spec.register_compiler_coverage_group(
             CompilerCoverageGroup(
                 mechanism=mechanism,
@@ -990,6 +995,7 @@ def register_coverage_groups(env: CompileEnvironment, device_ir: DeviceIR) -> No
     register_defer_tile_reduce_coverage(env)
     register_tail_peel_coverage(env)
     register_guarded_lanes_coverage(env)
+    register_store_packet_tiers_coverage(env)
 
 
 def register_bool_byte_packets_coverage(env: CompileEnvironment) -> None:
@@ -1107,6 +1113,75 @@ def register_tail_peel_coverage(env: CompileEnvironment) -> None:
     _register_knob_witnesses(
         env, key="cute_tail_peel", mechanism="cute.tail_peel", carries=carries
     )
+
+
+def register_store_packet_tiers_coverage(env: CompileEnvironment) -> None:
+    """Cover ``cute_store_packet_tiers`` on the first compiler seeds that give
+    a device loop storing along its tile (``cute_store_tier_blocks``) lanes
+    whose store packets the knob can split.
+
+    The knob is off by default, so every seed renders as before.  A witness
+    stores narrower packets where a row fails the lanes' alignment guard,
+    instead of scalars: the same values, an extra candidate measured like any
+    other.  A seed that gives the loop no such lanes (fewer than four
+    elements, lanes its stored tensors take no packet of, or lanes every row
+    is aligned to) has no packet to split or no guard to fail: the config
+    normalization reads the knob off there, by the same test
+    (``_splittable_store_tier_blocks``), and the witness would be the seed
+    again.  A seed that already sets the knob is its own witness.
+
+    The test reads the stored tensors only.  Every tier keeps the loop's
+    packet loads whole, under their own alignment guard, so where the loop
+    loads along its tile from rows at the stored rows' phase (``out = f(x)``
+    over two tensors of one row stride) a row that fails the store's guard
+    fails the load's too and runs the scalar loop: the narrower arms are
+    emitted and never taken, and such a witness times its carrier's code.
+    The knob changes what runs where the loads' rows are aligned and the
+    stored rows are not (a padded input beside a contiguous output), or
+    where the stored value is not loaded along the tile.
+
+    The seeds that run the loop over several tiles come first, and a seed
+    whose tile covers the loop's extent carries a witness only where none of
+    those does.  The witnesses are a sample of at most
+    ``MAX_COMPILER_COVERAGE_CONFIGS`` seeds in seed order, and the whole-row
+    seeds lead that order: on a loop that also reduces over its tile they
+    are the resident and reload row sequences, which do not compile beside a
+    per-element store, and they would take every witness.
+
+    The group is registered where no seed carries a witness too.  A group
+    owns its field, so the random initial population keeps the knob off, as
+    before the knob existed: drawn at random it would be on in rows whose
+    lanes are too narrow for it, which normalization would have to rewrite.
+    """
+    spec = env.config_spec
+    if not spec.cute_store_tier_blocks:
+        return
+    key = "cute_store_packet_tiers"
+
+    def carries(seed: Config, *, several_tiles: bool) -> bool:
+        if seed.config.get(key) is True:
+            return False
+        blocks = _splittable_store_tier_blocks(spec, seed.config)
+        if not several_tiles:
+            return bool(blocks)
+        return any(
+            isinstance(extent, int) and isinstance(tile, int) and tile < extent
+            for extent, tile, _count, _width in _block_layouts(env, seed, blocks)
+        )
+
+    if not _register_knob_witnesses(
+        env,
+        key=key,
+        mechanism="cute.store_packet_tiers",
+        carries=functools.partial(carries, several_tiles=True),
+    ):
+        _register_knob_witnesses(
+            env,
+            key=key,
+            mechanism="cute.store_packet_tiers",
+            carries=functools.partial(carries, several_tiles=False),
+            own_without_witnesses=True,
+        )
 
 
 def walks_a_deferrable_tile_sum(env: CompileEnvironment, config: Config) -> bool:

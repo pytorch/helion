@@ -42,9 +42,9 @@ def _capture(width: int):
     original = affine_vector_io.vectorize_affine_tile_lanes
     captured = []
 
-    def record(body, function, constants):
+    def record(body, function, constants, **options):
         before = ast.parse(ast.unparse(ast.Module(body, []))).body
-        result = original(body, function, constants)
+        result = original(body, function, constants, **options)
         after = ast.parse(ast.unparse(ast.Module(result, []))).body
         captured.append((before, after))
         return result

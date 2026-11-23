@@ -8,12 +8,6 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from test.test_cute_affine_vector_io import _Float32
-from test.test_cute_affine_vector_io import _Pointer
-from test.test_cute_affine_vector_io import _Tensor
-from test.test_cute_affine_vector_io import _Uint32
-from test.test_cute_affine_vector_io import _vector_load
-from test.test_cute_affine_vector_io import _vector_store
 from test.test_cute_philox_stream import _f32
 from test.test_cute_philox_stream import _interpret
 from test.test_cute_philox_stream import _oracle
@@ -28,6 +22,12 @@ from helion._compiler.cute.philox_stream import PACKET_ASM
 from helion._compiler.cute.philox_stream import SCALAR_ASM
 from helion._compiler.cute.philox_stream import SCALAR_CONSTRAINTS
 from helion._testing import import_example
+from helion._testing.cute_affine_vector_model import Float32 as _Float32
+from helion._testing.cute_affine_vector_model import Pointer as _Pointer
+from helion._testing.cute_affine_vector_model import Tensor as _Tensor
+from helion._testing.cute_affine_vector_model import Uint32 as _Uint32
+from helion._testing.cute_affine_vector_model import vector_load as _vector_load
+from helion._testing.cute_affine_vector_model import vector_store as _vector_store
 
 pytestmark = pytest.mark.cpu_only
 

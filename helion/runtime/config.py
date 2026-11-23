@@ -188,6 +188,7 @@ class Config(Mapping[str, object]):
         cute_tail_peel: bool | None = None,
         cute_guarded_lanes: bool | None = None,
         cute_fmnmx_extrema: bool | None = None,
+        cute_store_packet_tiers: bool | None = None,
         cute_defer_tile_reduce: bool | None = None,
         cute_staged_store: bool | None = None,
         cute_wide_packet_hints: bool | None = None,
@@ -473,6 +474,30 @@ class Config(Mapping[str, object]):
                 pointwise kernels (no reduction, matmul or atomic) with an
                 fp32 ``torch.maximum`` or ``torch.minimum`` of two tensors,
                 and elsewhere rejected (an explicit False is dropped).
+            cute_store_packet_tiers: Store a vector lane loop's elements in
+                narrower packets where a row fails the full packet's
+                alignment check at run time (an output whose row stride is
+                not a multiple of the packet, such as ``[rows, 30522]``
+                bf16), instead of one element at a time with scalar reloads:
+                sixteen-byte packets where the row is aligned to them, then
+                packets of half the elements, each tier under its own guard,
+                down to two elements (four bytes of a 16-bit dtype, eight of
+                a 32-bit one), and the scalar loop last.  The stored values
+                and their order are unchanged.  Off by default; offered to the
+                autotuner on kernels with a one-axis ``hl.tile`` loop inside
+                the kernel's outer ``hl.tile`` loop that stores along its
+                tile into the last dimension of a float16, bfloat16,
+                float32, int32 or uint32 tensor of two or more dimensions
+                and no matmul, and elsewhere rejected (an explicit False is
+                dropped): the outer loop's own tiles do not open it, though
+                their stores take the narrower packets too once it is on.
+                Read as False in a config that gives no such loop vector
+                lanes of four or more elements (two elements are already
+                the narrowest packet); where the stored tensor takes no
+                packet of those lanes (a view that is not unit-stride along
+                that dimension, or whose base is off the packet's
+                boundary); and where its row strides align every row to
+                them, so that no check can fail.
             cute_defer_tile_reduce: Combine a carried tile sum across the
                 threads once, after its ``hl.tile`` loop, instead of once per
                 tile: in ``for tile in hl.tile(n): acc = acc + x[tile].sum(0)``
@@ -759,6 +784,7 @@ class Config(Mapping[str, object]):
             "cute_tail_peel": cute_tail_peel,
             "cute_guarded_lanes": cute_guarded_lanes,
             "cute_fmnmx_extrema": cute_fmnmx_extrema,
+            "cute_store_packet_tiers": cute_store_packet_tiers,
             "cute_defer_tile_reduce": cute_defer_tile_reduce,
             "cute_staged_store": cute_staged_store,
             "cute_wide_packet_hints": cute_wide_packet_hints,
