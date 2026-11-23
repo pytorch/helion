@@ -140,7 +140,9 @@ def test_a_view_of_another_argument_binds_apart_and_orders_its_load(
     # the loads of ``x`` after the store to ``scratch``, as does one tensor
     # passed twice; two distinct tensors get none and share their binding
     # with two disjoint halves of one storage, row or column halves, under
-    # static shapes.
+    # static shapes.  Without them every binding also orders the update of
+    # ``scratch`` (a write after a read) and the second store to ``out`` (a
+    # write after a write), whose strides may map elements together.
     kernel = helion.kernel(_store_then_load_argument, static_shapes=static_shapes)
     scratch = torch.randn(64, 128)
     other = torch.randn(64, 128)
@@ -152,9 +154,10 @@ def test_a_view_of_another_argument_binds_apart_and_orders_its_load(
         aliased = kernel.bind(_call_args(scratch, other, aliased=True))
         twice = kernel.bind((scratch, scratch))
         assert len({distinct, aliased, twice}) == 3
-        assert "tl.debug_barrier()" not in distinct.to_code(config)
-        assert "tl.debug_barrier()" in aliased.to_code(config)
-        assert "tl.debug_barrier()" in twice.to_code(config)
+        update = 0 if static_shapes else 2
+        assert distinct.to_code(config).count("tl.debug_barrier()") == update
+        assert aliased.to_code(config).count("tl.debug_barrier()") == update + 1
+        assert twice.to_code(config).count("tl.debug_barrier()") == update + 1
         if static_shapes:
             assert kernel.bind((halves[:64], halves[64:])) is distinct
             assert kernel.bind((columns[:, :128], columns[:, 128:])) is kernel.bind(

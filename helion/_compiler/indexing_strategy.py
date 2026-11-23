@@ -29,6 +29,7 @@ from .compile_environment import warning
 from .device_function import DeviceFunction
 from .dtype_utils import cast_ast
 from .host_function import HostFunction
+from .loop_dependency_checker import RESTORES_ITSELF_META
 from .utils import compute_slice_size
 from .variable_origin import BlockSizeOrigin
 from .variable_origin import GridOrigin
@@ -2062,6 +2063,10 @@ class TensorDescriptorIndexingStrategy(IndexingStrategy):
         state.device_function.note_tma_store(
             warp_specialized=_in_warp_specialized_loop(state)
         )
+        if state.fx_node is not None and state.fx_node.meta.get(RESTORES_ITSELF_META):
+            # Its copy from an earlier iteration may still be in flight.
+            for statement in state.device_function.async_store_drain():
+                state.add_statement(statement)
 
         # Apply permutation to the value being stored if needed
         desc_arg = indexing.tensor_descriptor_arg(state)

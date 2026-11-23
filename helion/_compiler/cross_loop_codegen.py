@@ -436,12 +436,14 @@ def _covering(
     allocations: frozenset[int],
     publication: bool = False,
 ) -> list[ast.stmt]:
-    """``wait``, recorded as ordering reads of ``allocations`` only (and, with
+    """``wait``, recorded as ordering accesses of ``allocations`` only (any
+    access a partition makes of them, reads or writes; and, with
     ``publication``, its root's barrier publication).  An allocation no tensor
-    argument names is one no partition can tell it reads: the wait stays
-    ordering every access."""
-    if not allocations <= set(_argument_allocations(device_function).values()):
-        return wait
+    argument names is one no partition can tell it reads: such a wait keeps
+    ordering every access.  ``gluon_ring._orders`` checks that when a partition
+    reads the covers, since a wait emitted before the access that registers a
+    tensor's argument (a barrier before a loop's first access of it) may
+    cover it."""
     for name in _stored_names(wait) & device_function.sync_names("wait"):
         role = device_function.sync_roles[name]
         role.covers, role.publication = allocations, publication
@@ -1607,16 +1609,23 @@ def _triton_root_requires_kernel_scope(
     """
     if target_device_capability is None or target_device_capability[0] < 10:
         return False
+    # Gluon ring sites (``gluon_ring`` / ``gluon_ops`` in generated code) carry
+    # the kernel's ring step and TMEM accumulators.
+    return _calls_module(
+        body,
+        {"tl": {"dot", "dot_scaled"}, "_helion_ring": None, "_helion_gluon": None},
+    )
+
+
+def _calls_module(body: list[ast.stmt], names: dict[str, set[str] | None]) -> bool:
+    """Whether ``body`` calls ``module.<name>`` for a module of ``names`` and one
+    of its names (any name when None)."""
     return any(
         isinstance(node, ast.Call)
         and isinstance(node.func, ast.Attribute)
         and isinstance(node.func.value, ast.Name)
-        and (
-            (node.func.value.id == "tl" and node.func.attr in {"dot", "dot_scaled"})
-            # Gluon ring sites (``gluon_ring`` / ``gluon_ops`` in generated
-            # code) carry the kernel's ring step and TMEM accumulators.
-            or node.func.value.id in {"_helion_ring", "_helion_gluon"}
-        )
+        and node.func.value.id in names
+        and ((attrs := names[node.func.value.id]) is None or node.func.attr in attrs)
         for statement in body
         for node in ast.walk(statement)
     )
@@ -2011,13 +2020,95 @@ def _reuse_guard_values(body: list[ast.stmt], candidates: set[int]) -> None:
         assign(target, number)
 
 
-def _stored_names(nodes: Iterable[ast.AST]) -> set[str]:
+def _stored_names(
+    nodes: Iterable[ast.AST], renames: Mapping[str, str] | None = None
+) -> set[str]:
+    """The names ``nodes`` store (as ``renames`` maps them)."""
+    renames = renames or {}
     return {
-        node.id
+        renames.get(node.id, node.id)
         for root in nodes
         for node in ast.walk(root)
         if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store)
     }
+
+
+def _free_reads(
+    statements: Sequence[ast.stmt],
+    bound: frozenset[str] = frozenset(),
+    skipped: frozenset[int] = frozenset(),
+    renames: Mapping[str, str] | None = None,
+) -> set[str]:
+    """The names ``statements`` may read before storing them (``bound`` is
+    stored on entry): a name stored on only some paths (one side of a branch,
+    a loop body) may still be read from before.  The bodies of the ``If``
+    nodes in ``skipped`` (by id) count as empty.  ``renames`` maps each name to
+    the one it will be emitted as: a value both branches of an ``if`` assign
+    has a name per branch until ``DeviceFunction``'s final rename merges them
+    (``DeviceFunction.variable_renames``)."""
+    return _read_and_stored(statements, bound, skipped, renames)[0]
+
+
+def _read_and_stored(
+    statements: Sequence[ast.stmt],
+    bound: frozenset[str],
+    skipped: frozenset[int] = frozenset(),
+    renames: Mapping[str, str] | None = None,
+) -> tuple[set[str], frozenset[str]]:
+    """(``_free_reads``, the names stored on every path through ``statements``
+    or in ``bound``)."""
+    renames = renames or {}
+
+    def loads(node: ast.AST) -> set[str]:
+        return {
+            renames.get(n.id, n.id)
+            for n in ast.walk(node)
+            if isinstance(n, ast.Name)
+            and (isinstance(n.ctx, ast.Load) or isinstance(node, ast.AugAssign))
+        }
+
+    free: set[str] = set()
+    stored = set(bound)
+    for statement in statements:
+        if isinstance(statement, ast.For):
+            free |= loads(statement.iter) - stored
+            inner = frozenset(stored | _stored_names([statement.target], renames))
+            free |= _read_and_stored(statement.body, inner, skipped, renames)[0]
+            free |= _read_and_stored(
+                statement.orelse, frozenset(stored), skipped, renames
+            )[0]
+        elif isinstance(statement, ast.While):
+            free |= loads(statement.test) - stored
+            free |= _read_and_stored(
+                statement.body, frozenset(stored), skipped, renames
+            )[0]
+            free |= _read_and_stored(
+                statement.orelse, frozenset(stored), skipped, renames
+            )[0]
+        elif isinstance(statement, ast.If):
+            free |= loads(statement.test) - stored
+            then_body = [] if id(statement) in skipped else statement.body
+            body, then = _read_and_stored(
+                then_body, frozenset(stored), skipped, renames
+            )
+            orelse, otherwise = _read_and_stored(
+                statement.orelse, frozenset(stored), skipped, renames
+            )
+            free |= body | orelse
+            stored |= then & otherwise
+        elif isinstance(statement, ast.With):
+            for item in statement.items:
+                free |= loads(item) - stored
+                stored |= _stored_names([item], renames)
+            body, always = _read_and_stored(
+                statement.body, frozenset(stored), skipped, renames
+            )
+            free |= body
+            stored |= always
+        else:
+            free |= loads(statement) - stored
+            stored |= _stored_names([statement], renames)
+    return free, frozenset(stored)
 
 
 def _all_names(nodes: Iterable[ast.AST]) -> set[str]:
@@ -2237,26 +2328,47 @@ def _dry_pass_rewrite(
 
 
 def _dry_pass_binds(
-    body: list[ast.stmt], guards: list[ast.If], bound: set[str]
+    body: list[ast.stmt],
+    guards: list[ast.If],
+    bound: set[str],
+    renames: Mapping[str, str] | None = None,
 ) -> bool:
-    """Whether every name a guard binds is read only under that guard."""
+    """Whether every name a guard binds is read only under that guard (names
+    as ``renames`` maps them, see ``_free_reads``)."""
+    renames = renames or {}
     guard_ids = {id(guard) for guard in guards}
+    bound = {renames.get(name, name) for name in bound}
     stores: dict[str, set[int]] = {name: {0} for name in bound}
     loads: list[tuple[str, int]] = []
 
     def visit(node: ast.AST, scope: int) -> None:
         scope = id(node) if id(node) in guard_ids else scope
         if isinstance(node, ast.Name):
+            name = renames.get(node.id, node.id)
             if isinstance(node.ctx, ast.Store):
-                stores.setdefault(node.id, set()).add(scope)
+                stores.setdefault(name, set()).add(scope)
             else:
-                loads.append((node.id, scope))
+                loads.append((name, scope))
         for child in ast.iter_child_nodes(node):
             visit(child, scope)
 
     for statement in body:
         visit(statement, 0)
-    return all(name not in stores or stores[name] & {0, scope} for name, scope in loads)
+    for name, scope in loads:
+        scopes = stores.get(name)
+        # Bound outside every guard or by its own; a guard reading what
+        # another guard binds reads a name Triton does not carry past that
+        # guard's ``if``, whatever binds it later outside the guards.
+        if scopes is not None and (
+            not scopes & {0, scope} or (scope != 0 and scopes - {0, scope})
+        ):
+            return False
+    # A guard may not run: a name it binds that is read outside it must be
+    # bound on every path that skips the guards.
+    guarded = {name for name, scopes in stores.items() if scopes - {0}}
+    return not guarded or not (
+        _free_reads(body, frozenset(bound), frozenset(guard_ids), renames) & guarded
+    )
 
 
 def emit_cross_loop_schedule(
@@ -2754,6 +2866,9 @@ def emit_cross_loop_schedule(
 
     dispatch_ticket: str | None = None
     peer_launch = ""
+    # This launch's announcement (before the first task loop) and the hold
+    # (before the first inband scatter store's block).
+    entry_announce: list[ast.stmt] = []
     entry_gate: list[ast.stmt] = []
     if not uses_packet_dispatch:
         assert state_arg is not None
@@ -2780,8 +2895,8 @@ def emit_cross_loop_schedule(
                 statement_from_string(f"{peer.epoch} = tl.load({peer_launch}) + 1")
             )
             if peer.scatters:
-                # Read the hold flag now; its wait runs once the first loop's
-                # prologue loads are in flight.
+                # Read the hold flag now; its wait runs where the first scatter
+                # store's block starts.
                 held = device_function.new_var("tile_dependency_peer_held", dce=False)
                 result.append(
                     statement_from_string(
@@ -2789,9 +2904,14 @@ def emit_cross_loop_schedule(
                         f" == {peer.epoch}"
                     )
                 )
-                # Announce this launch, then wait out last launch's reads of rows
-                # no task wrote, which this launch may now overwrite.
-                entry_gate = [
+                # Announce this launch where the first root's block starts;
+                # before the first scatter store's block, wait out last
+                # launch's reads of rows no task wrote, which this launch's
+                # scatters may now overwrite.  Until then the roots write no
+                # scatter row, so their loads need not wait; nor do partitions
+                # that access none of the scattered allocations (the wait
+                # covers those).
+                entry_announce = [
                     create(
                         ast.If,
                         test=expr_from_string(f"{worker} == 0"),
@@ -2805,12 +2925,26 @@ def emit_cross_loop_schedule(
                         ],
                         orelse=[],
                     ),
-                    _bound_wait(
-                        device_function,
-                        f"helion_dist_utils._hold_after_fallback({peer.state}, "
-                        f"{peer.started}, {world_size}, {peer.epoch}, {held})",
-                    ),
                 ]
+                assert dependency_graph is not None
+                scattered = frozenset(
+                    allocation
+                    for access_id, allocation in _access_allocations().items()
+                    if dependency_graph.accesses[access_id].allocation_id
+                    in peer.scatters
+                )
+                assert scattered, "an inband scatter allocation has its store"
+                entry_gate = _covering(
+                    device_function,
+                    [
+                        _bound_wait(
+                            device_function,
+                            f"helion_dist_utils._hold_after_fallback({peer.state}, "
+                            f"{peer.started}, {world_size}, {peer.epoch}, {held})",
+                        )
+                    ],
+                    scattered,
+                )
     else:
         assert dispatch_ticket_arg is not None
         raw_dispatch_ticket = device_function.new_var(
@@ -3161,6 +3295,12 @@ def emit_cross_loop_schedule(
                 for edge in dependency_graph.edges
                 if edge.producer_root == root
             }
+            # (A hint load's later writers no longer wait for it: no edge.)
+            | {
+                allocation_id
+                for hint_root, allocation_id in dependency_graph.unordered_hint_reads
+                if hint_root == root
+            }
             | {
                 edge.allocation_id
                 for edge in dependency_graph.edges
@@ -3283,7 +3423,10 @@ def emit_cross_loop_schedule(
                 frozenset(reachable),
                 guards,
             )
-            return rewritten if _dry_pass_binds(rewritten, guards, bound) else None
+            binds = _dry_pass_binds(
+                rewritten, guards, bound, device_function.variable_renames()
+            )
+            return rewritten if binds else None
 
         helper_bodies = {
             name: rewrite(helpers[name][1], set(helpers[name][0])) for name in reachable
@@ -4929,9 +5072,33 @@ def emit_cross_loop_schedule(
 
     if not uses_packet_dispatch:
         assert state_arg is not None
-        for root in static_pipeline_plan.resident_roots:
+        blocks: dict[int, list[ast.stmt]] = {}
+        resident_roots = static_pipeline_plan.resident_roots
+        # A continuation root's tasks run in the block of whichever producer
+        # arrives last.
+        hosts: dict[int, set[int]] = {}
+        for plan in static_pipeline_plan.readiness_counters:
+            if (consumer := plan.continuation_consumer) is not None:
+                hosts.setdefault(consumer.consumer_root, set()).update(
+                    producer.producer_root for producer in plan.producers
+                )
+
+        def host(root: int) -> int:
+            """The earliest block that may run ``root``'s tasks (blocks follow
+            root order)."""
+            return min(map(host, hosts[root])) if root in hosts else root
+
+        gate_root = (
+            min(map(host, peer.scatter_roots), default=None)
+            if peer is not None
+            else None
+        )
+        for root in resident_roots:
             body = static_root_body(root)
-            # The gate precedes the first task loop, after its hoisted loads.
+            # The gates precede the first task loop, after the loads hoisted
+            # above it, at kernel scope (a root on fewer workers than the
+            # launch has its loop inside the membership test: the gates open
+            # its block).
             first = next(
                 (
                     i
@@ -4940,9 +5107,31 @@ def emit_cross_loop_schedule(
                 ),
                 0,
             )
-            result.extend([*body[:first], *entry_gate, *body[first:]])
-            entry_gate = []
-        assert not entry_gate, "inband scatters need a resident root"
+            gates = [
+                *(entry_announce if root == resident_roots[0] else ()),
+                *(entry_gate if root == gate_root else ()),
+            ]
+            blocks[root] = [*body[:first], *gates, *body[first:]]
+        assert not entry_gate or gate_root in blocks, (
+            "inband scatters need a resident root"
+        )
+        # A trigger between loops (``hl.pdl_launch_dependents()``): each worker
+        # lets the next launch start once it reaches the root's block (or the
+        # first resident one after it), at kernel scope so that every worker
+        # does, member or not.
+        env = CompileEnvironment.current()
+        trigger_root = (
+            None
+            if env.pdl_trigger_root is None
+            else next((r for r in resident_roots if r >= env.pdl_trigger_root), None)
+        )
+        if trigger_root is not None:
+            blocks[trigger_root].insert(
+                0,
+                statement_from_string(env.backend.pdl_instruction("launch_dependents")),
+            )
+            device_function.pdl_trigger_placed = True
+        result.extend(statement for block in blocks.values() for statement in block)
         _reuse_guard_values(result, guard_statements)
         writes: list[ast.stmt] = [
             statement_from_string(f"tl.store({state_arg} + {worker}, {epoch_var})")

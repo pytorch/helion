@@ -329,7 +329,8 @@ class SyncRole:
     # megakernel_timeline stamp, which orders nothing.
     kind: str
     # A wait's covered obligations: the allocations whose reads it orders
-    # (None: every read).
+    # (None: every read; one no tensor argument names makes it order every
+    # read too, ``gluon_ring._orders``).
     covers: frozenset[int] | None = None
     # A covering wait that also orders its root's barrier publication (whose
     # waiters rely on it transitively): the publishing partition keeps it.
@@ -556,6 +557,10 @@ class DeviceFunction:
         # The scheduler's end-of-launch rewrites of the launch state it reads
         # (the "launch" sync roles), in program order.
         self.launch_writes: list[ast.stmt] = []
+        # Whether the body runs the trigger ``hl.pdl_launch_dependents()``
+        # placed between loops (``CompileEnvironment.pdl_trigger_root``) rather
+        # than the exit.
+        self.pdl_trigger_placed = False
         self.ring: RingLowering | None = None
         env = CompileEnvironment.current()
         if env.backend_name == "gluon" and not env.ring_disabled:
@@ -882,6 +887,11 @@ class DeviceFunction:
     def variable_aliases(self, name: str) -> tuple[str, ...]:
         return tuple(self._variable_renames.get(name, [name]))
 
+    def variable_renames(self) -> dict[str, str]:
+        """Each merged variable name -> the name the final rename emits it as
+        (the first of its group)."""
+        return {name: aliases[0] for name, aliases in self._variable_renames.items()}
+
     @property
     def cute_state(self) -> CuteDeviceFunctionState:
         return cast("CuteDeviceFunctionState", self.backend_state)
@@ -1142,6 +1152,13 @@ class DeviceFunction:
             statement_from_string(barrier),
             *self.async_load_fence(),
         ]
+
+    def cta_read_barrier(self) -> list[ast.stmt]:
+        """A barrier after which a thread may overwrite what the others
+        loaded or stored with plain accesses: bar.sync completes those, and
+        the proxy fence orders them before a later TMA write.  A TMA store
+        among them needs ``async_store_drain`` first."""
+        return [statement_from_string("tl.debug_barrier()"), *self.async_load_fence()]
 
     def note_tma_store(self, *, warp_specialized: bool) -> None:
         """Record a TMA global store or reduction for async_store_drain."""
@@ -1550,9 +1567,10 @@ class DeviceFunction:
                 for op in env.pdl_entry
             ],
         ]
-        exit_ = [
-            statement_from_string(backend.pdl_instruction(op)) for op in env.pdl_exit
-        ]
+        exit_ops = list(env.pdl_exit)
+        if self.pdl_trigger_placed:
+            exit_ops.remove("launch_dependents")
+        exit_ = [statement_from_string(backend.pdl_instruction(op)) for op in exit_ops]
         # A backend that places the markers itself takes them in the body.
         in_body = backend.places_pdl_markers
         kernel_body: list[ast.stmt] = cast(
@@ -1590,7 +1608,7 @@ class DeviceFunction:
                 decorator_list=decorators,
                 type_params=[],
             ),
-            {k: v[0] for k, v in self._variable_renames.items()},
+            self.variable_renames(),
         )
         trailing = backend.finalize_kernel_def(definition, prefix, body_context)
         definition.body = backend.pipeline_loops(definition.body, self)
@@ -1780,9 +1798,7 @@ class DeviceFunction:
         Remove variables that are not used in the function body.
         """
 
-        rename_groups = {
-            name: aliases[0] for name, aliases in self._variable_renames.items()
-        }
+        rename_groups = self.variable_renames()
         rw = ReadWrites.from_list([*self.preamble, *self.body])
         while True:
             # An unchanged body reads and writes exactly what ``rw`` recorded,
@@ -1942,7 +1958,7 @@ class DeviceFunction:
             if name not in existing_module_assignments
         ]
         helpers.extend(self.helper_manager.codegen_helper_functions())
-        renames = {name: values[0] for name, values in self._variable_renames.items()}
+        renames = self.variable_renames()
         argument_by_name = {argument.name: argument for argument in self.arguments}
         decorator = CompileEnvironment.current().backend.helper_decorator
         for name, argument_names, body, noinline in self.triton_outlined_helpers:

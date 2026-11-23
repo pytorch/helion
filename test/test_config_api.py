@@ -92,6 +92,7 @@ from helion._compiler.cute.tcgen05_constants import (
 )
 from helion._compiler.cute.tcgen05_constants import tcgen05_grouped_worklist_smem_bytes
 from helion._compiler.pallas.backend import PallasBackend
+from helion._compiler.triton.backend import GluonBackend
 from helion._compiler.triton.backend import TritonBackend
 from helion._testing import TestCase
 from helion._testing import cpu_render_target
@@ -904,6 +905,37 @@ class TestConfigAPI(TestCase):
                 spec.normalize(
                     helion.Config.from_dict({"cross_loop_pipeline": "unknown"})
                 )
+
+    def test_retired_pipeline_drops_a_saved_value(self) -> None:
+        """A kernel whose only cross-loop dependencies were a prefetch-only
+        root's loads offers no cross_loop_pipeline: a config saved before
+        still normalizes, without the key and with a warning."""
+        with patch("helion._compat.is_hip", return_value=False):
+            spec = ConfigSpec(backend=TritonBackend())
+            spec.cross_loop_pipeline_retired = True
+            config = helion.Config(
+                cross_loop_pipeline="static", pid_type="persistent_blocked"
+            )
+            with self.assertLogs("helion.autotuner.config_spec", "WARNING") as logs:
+                spec.normalize(config)
+            self.assertNotIn("cross_loop_pipeline", config)
+            self.assertIn(
+                "Ignoring cross_loop_pipeline='static'", "\n".join(logs.output)
+            )
+            # On Gluon a saved cross_loop_tmem_prefetch, whose candidates exist
+            # only under the pipeline, goes with it.
+            spec = ConfigSpec(backend=GluonBackend())
+            spec.cross_loop_pipeline_retired = True
+            config = helion.Config(
+                cross_loop_pipeline="dynamic",
+                cross_loop_tmem_prefetch=[True],
+                pid_type="persistent_blocked",
+            )
+            with self.assertLogs("helion.autotuner.config_spec", "WARNING") as logs:
+                spec.normalize(config)
+            self.assertNotIn("cross_loop_pipeline", config)
+            self.assertEqual(config.get("cross_loop_tmem_prefetch", []), [])
+            self.assertIn("and its cross_loop_tmem_prefetch", "\n".join(logs.output))
 
     def test_legacy_cross_loop_schedule_normalizes_to_pipeline(self) -> None:
         with patch("helion._compat.is_hip", return_value=False):

@@ -65,7 +65,17 @@ _EVICTION_POLICY_MAP = {
 
 @_decorators.codegen(store, "triton")
 def _(state: CodegenState) -> ast.AST:
+    # A load or a store of this tensor earlier in the same loop body or in an
+    # earlier iteration, or through device pointers, followed by this store
+    # is a cross-thread write-after-read or write-after-write on global
+    # memory; emit a barrier so every thread has read and stored before the
+    # overwrite (see mark_intra_loop_raw_barriers).
+    from ..loop_dependency_checker import emit_intra_loop_raw_barrier
+
     tensor = state.proxy_arg(0)
+    emit_intra_loop_raw_barrier(
+        state, tensor if isinstance(tensor, torch.Tensor) else None
+    )
     subscript = state.proxy_arg(1)
     assert isinstance(subscript, (list, tuple))
     value = state.ast_arg(2)
@@ -140,15 +150,16 @@ def _(state: CodegenState) -> ast.AST:
 
 @_decorators.codegen(load, "triton")
 def _(state: CodegenState) -> ast.AST | SharedValue:
-    # A store or an atomic to this tensor earlier in the same loop body followed
-    # by this load is a cross-thread read-after-write on global memory; emit a
-    # barrier so the write is visible before the read (see
-    # mark_intra_loop_raw_barriers).
+    # A store or an atomic that may reach this load, earlier in the same loop
+    # body or in an earlier iteration, or through device pointers, is a
+    # cross-thread read-after-write on global memory; emit a barrier so the
+    # write is visible before the read (see mark_intra_loop_raw_barriers).
     from ..loop_dependency_checker import emit_intra_loop_raw_barrier
 
-    emit_intra_loop_raw_barrier(state)
-
     tensor = state.proxy_arg(0)
+    emit_intra_loop_raw_barrier(
+        state, tensor if isinstance(tensor, torch.Tensor) else None
+    )
     subscript = state.proxy_arg(1)
     assert isinstance(subscript, (list, tuple))
     ast_subscript = state.ast_args[1]

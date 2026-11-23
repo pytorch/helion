@@ -416,8 +416,8 @@ class ForLoopGraphInfo(NodeArgsGraphInfo):
     block_ids: list[int]
     # Precomputed by GenerateAST._compute_inter_loop_barriers: True iff a
     # tl.debug_barrier() must be emitted immediately before this for-loop's
-    # outer prefix to make global writes from the previous sibling for-loop
-    # in this scope visible.  Not copied across graph copies; recomputed.
+    # outer prefix to order the accesses of the previous sibling for-loops in
+    # this scope before its own.  Not copied across graph copies; recomputed.
     needs_barrier_before: bool = False
 
     @property
@@ -4534,14 +4534,17 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
         if warp_specialize_specs:
             from .loop_dependency_checker import intra_loop_raw_reread_block_ids
 
-            # A loop that stores and then re-reads the same storage cannot be
-            # warp-specialized (see intra_loop_raw_reread_block_ids); its
-            # slot stays in the config space pinned to None.
+            # A loop that stores and then re-reads the same storage (or reads
+            # and then overwrites it) cannot be warp-specialized (see
+            # intra_loop_raw_reread_block_ids); its slot stays in the config
+            # space pinned to None.
             reread_block_ids = intra_loop_raw_reread_block_ids(
                 device_ir.graphs,
                 device_ir.root_ids,
                 device_ir.grid_block_ids,
                 atomics=backend.intra_loop_barriers_order_atomics,
+                carries=backend.intra_loop_barriers_carry_iterations,
+                reads=backend.intra_loop_barriers_order_reads,
             )
             for spec in warp_specialize_specs:
                 if reread_block_ids.intersection(spec.block_ids):
@@ -4650,6 +4653,11 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
                 visitor.root_nodes,
                 device_ir.tile_dependency_graph,
                 source_phase_starts,
+            )
+            # Dropped hint edges were the kernel's only dependencies.
+            config_spec.cross_loop_pipeline_retired = (
+                bool(device_ir.tile_dependency_graph.unordered_hint_reads)
+                and not device_ir.implicit_dependency_starts
             )
             if device_ir.implicit_dependency_starts and not (
                 env.backend.lower_dependency_phases_as_ordered_launches(func, device_ir)
