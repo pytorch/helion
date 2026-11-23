@@ -188,6 +188,7 @@ class Config(Mapping[str, object]):
         cute_tail_peel: bool | None = None,
         cute_guarded_lanes: bool | None = None,
         cute_fmnmx_extrema: bool | None = None,
+        cute_predicated_element_loads: bool | None = None,
         cute_store_packet_tiers: bool | None = None,
         cute_defer_tile_reduce: bool | None = None,
         cute_staged_store: bool | None = None,
@@ -474,6 +475,30 @@ class Config(Mapping[str, object]):
                 pointwise kernels (no reduction, matmul or atomic) with an
                 fp32 ``torch.maximum`` or ``torch.minimum`` of two tensors,
                 and elsewhere rejected (an explicit False is dropped).
+            cute_predicated_element_loads: Load a single element under a
+                mask (a gathered or computed coordinate with an
+                ``extra_mask``) with one predicated instruction instead of a
+                load inside a conditional, which compiles to a branch around
+                the load.  Where the load's only reader is a select under the
+                same mask against a constant the element type holds exactly
+                (``torch.where(mask, hl.load(x, [...], extra_mask=mask),
+                -inf)``, also through widening casts), the load leaves that
+                constant where the mask is false and the select is dropped.
+                Every stored value is computed as before from the same
+                elements; without the selects an fp32 chain over widened
+                half-precision elements can run in half-precision
+                instructions, so which NaN (its sign and payload bits) a NaN
+                result is can differ, as under ``cute_guarded_lanes``.  A
+                masked load whose address is not plain arithmetic, or whose
+                element is not a 2-, 4- or 8-byte float or signed integer
+                (a byte, a bool, an unsigned integer), keeps its
+                conditional.  Off by default; offered to the autotuner on
+                pointwise kernels (no reduction, matmul or atomic) with an
+                ``hl.load`` under an ``extra_mask`` whose last subscript is
+                a scaled or gathered coordinate (not a tile or a tile
+                shifted by a constant, nor a row offset plus a tile's index
+                into a tensor that vector lanes load in packets), and
+                elsewhere rejected (an explicit False is dropped).
             cute_store_packet_tiers: Store a vector lane loop's elements in
                 narrower packets where a row fails the full packet's
                 alignment check at run time (an output whose row stride is
@@ -784,6 +809,7 @@ class Config(Mapping[str, object]):
             "cute_tail_peel": cute_tail_peel,
             "cute_guarded_lanes": cute_guarded_lanes,
             "cute_fmnmx_extrema": cute_fmnmx_extrema,
+            "cute_predicated_element_loads": cute_predicated_element_loads,
             "cute_store_packet_tiers": cute_store_packet_tiers,
             "cute_defer_tile_reduce": cute_defer_tile_reduce,
             "cute_staged_store": cute_staged_store,

@@ -1,14 +1,31 @@
 """Kernels shared by the ``cute_guarded_lanes`` / ``cute_fmnmx_extrema`` tests
 (``test_cute_guarded_lanes.py`` on CPU, ``test_cute_guarded_lanes_cuda.py``
 on the GPU): windows over a channels-last activation, whose loads go through
-computed coordinates or a padding ``extra_mask``."""
+computed coordinates or a padding ``extra_mask``, and the filter for the
+packet tile seeds of their searches."""
 
 from __future__ import annotations
+
+from typing import TYPE_CHECKING
 
 import torch
 
 import helion
 import helion.language as hl
+
+if TYPE_CHECKING:
+    from helion.autotuner.config_spec import ConfigSpec
+
+
+def packet_tile_seeds(spec: ConfigSpec) -> list[dict[str, object]]:
+    """The compiler seeds of ``spec`` that turn ``cute_guarded_lanes`` on, as
+    config dicts: the N-D packet tile seeds of the kernels these tests
+    bind."""
+    return [
+        seed.config
+        for seed in spec.compiler_seed_configs
+        if seed.config.get("cute_guarded_lanes") is True
+    ]
 
 
 @helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
@@ -26,6 +43,37 @@ def window_max(x: torch.Tensor) -> torch.Tensor:
             value = x[row + offset // 2, col + offset % 2, tile_c].to(torch.float32)
             best = torch.maximum(best, value)
         out[tile_h, tile_w, tile_c] = best.to(out.dtype)
+    return out
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def window_max_into(x: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
+    """``window_max`` of ``x`` written to ``out``, a ``[H // 2, W // 2, C]``
+    view in the caller's layout: a permuted view of a channel-first buffer
+    has another dim than the channels contiguous."""
+    out_h, out_w, channels = out.shape
+    for tile_h, tile_w, tile_c in hl.tile([out_h, out_w, channels]):
+        row = (tile_h.index * 2)[:, None]
+        col = (tile_w.index * 2)[None, :]
+        best = x[row, col, tile_c].to(torch.float32)
+        for offset in hl.static_range(1, 4):
+            value = x[row + offset // 2, col + offset % 2, tile_c].to(torch.float32)
+            best = torch.maximum(best, value)
+        out[tile_h, tile_w, tile_c] = best.to(out.dtype)
+    return out
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def neighbor_max_into(x: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
+    """The maxima of each element of a ``[H, W + 1, C]`` activation and its
+    neighbor along W, written to ``out``, a ``[H, W, C]`` view in the
+    caller's layout: a stride-1 window whose second tap is the tile's index
+    plus one, a subscript that keeps its tile."""
+    out_h, out_w, channels = out.shape
+    for tile_h, tile_w, tile_c in hl.tile([out_h, out_w, channels]):
+        left = x[tile_h, tile_w, tile_c].to(torch.float32)
+        right = x[tile_h, tile_w.index + 1, tile_c].to(torch.float32)
+        out[tile_h, tile_w, tile_c] = torch.maximum(left, right).to(out.dtype)
     return out
 
 

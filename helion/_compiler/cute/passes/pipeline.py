@@ -1580,6 +1580,23 @@ def _element_load_hints(s: _KernelDefState) -> bool:
     return s.ctx.config.cute_scalar_load_hints or s.ctx.config.cute_narrow_load_hints
 
 
+def _predicate_element_loads(s: _KernelDefState) -> None:
+    from ..predicated_element_loads import predicate_element_loads
+
+    renamed = s.ctx.rename_groups
+    s.definition.body = predicate_element_loads(
+        s.definition,
+        # Shared and register pointers are no global elements.
+        {
+            renamed.get(argument.name, argument.name): argument.fake_value.dtype
+            for argument in s.param_args
+            if isinstance(argument, TensorArg)
+            and not isinstance(argument, TensorDescriptorArg)
+        },
+        s.fn.cute_state.element_load_hints,
+    )
+
+
 def _pack_half_extremum_folds(s: _KernelDefState) -> None:
     from ..half_extremum_folds import pack_half_extremum_folds
 
@@ -2137,11 +2154,24 @@ KERNEL_DEF_PASSES: tuple[KernelDefPass, ...] = (
         requires=(RENAMED,),
     ),
     KernelDefPass(
+        "predicate_element_loads",
+        _config_flag("cute_predicated_element_loads"),
+        _predicate_element_loads,
+        # After ``guard_lanes``: a masked element load's test is then the
+        # mask the program gave it wherever its store's guard implies the
+        # tile masks and bounds, which is the test of the select the load's
+        # fill comes from.  Before ``hint_element_loads``, whose predicated
+        # form has no fill: a load taken here carries the policy that pass
+        # would give it.
+        requires=(RENAMED,),
+    ),
+    KernelDefPass(
         "hint_element_loads",
         _element_load_hints,
         _hint_element_loads,
         # Last, after every pass that reads, moves or merges an element load
-        # (the staged store's proof reads them, ``guard_lanes`` moves them):
+        # (the staged store's proof reads them, ``guard_lanes`` moves them,
+        # ``predicate_element_loads`` takes the masked ones it can prove):
         # the loads still plain here are the ones that take a hint.  A hint
         # changes no value and no store, and the staged image's loads name
         # no tensor parameter.

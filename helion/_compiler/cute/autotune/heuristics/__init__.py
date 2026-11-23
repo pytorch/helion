@@ -693,6 +693,56 @@ def register_guarded_lanes_coverage(env: CompileEnvironment) -> None:
     )
 
 
+def register_predicated_element_loads_coverage(env: CompileEnvironment) -> None:
+    """Cover ``cute_predicated_element_loads``: by the compiler seeds that
+    set it, or else on the first seeds that do not.
+
+    The knob is off by default, so every seed renders as before.  It is
+    offered where a load under an ``extra_mask`` gathers single elements
+    along its tensor's last dim at every config
+    (``predicated_element_loads_offered``), so whatever a seed's tiles, the
+    knob loads those elements predicated and changes its code (but for a
+    seed whose masked loads all carry a cache policy and take no fill, and
+    from whose masks the knob drops no bound: ``hint_element_loads``
+    predicates those with or without the knob.  Where such a load's mask
+    states its gather's bound and ``cute_guarded_lanes`` has not left that
+    term out already, the knob does, so the witness is code of its own).
+
+    The N-D gather tile seeds set the knob themselves
+    (``CutePointwiseVecHeuristic._gather_tile_seed_configs``), at tiles
+    where the masked taps are a thread's whole cost.  Where a kernel has
+    them the group takes no witness: the tile family's own seeds of such a
+    kernel walk whole rows per thread and read several times slower than
+    the gather tiles (22.6 against 9.5 us on the padded max pooling the
+    seeds were measured on), so a witness there would time the knob where
+    it cannot win.  The group still owns the knob, which keeps it off in
+    the random part of the initial population; the search flips it from the
+    seeds.  A kernel offered the knob without gather tiles (a direct load of
+    the row beside the gather) gets a witness on each of its first seeds,
+    an extra candidate measured like any other.  Not offered to a kernel
+    without such a load (``cute_flat_fields``), where nothing is
+    registered.
+    """
+    key = "cute_predicated_element_loads"
+    spec = env.config_spec
+    if key not in spec._flat_fields():
+        return
+    # The canonical seeds, once: to see whether one carries the knob, and
+    # as the witnesses' candidates (the helper's default would canonicalize
+    # them a second time).
+    seeds = [
+        seed for _flat, seed in spec.create_config_generation().seed_flat_config_pairs()
+    ]
+    seeded = any(seed.config.get(key) is True for seed in seeds)
+    _register_knob_witnesses(
+        env,
+        key=key,
+        mechanism="cute.predicated_element_loads",
+        candidates=[] if seeded else seeds,
+        own_without_witnesses=seeded,
+    )
+
+
 def register_coverage_groups(env: CompileEnvironment, device_ir: DeviceIR) -> None:
     """Declare independent coverage after every ordinary field is finalized.
 
@@ -995,6 +1045,7 @@ def register_coverage_groups(env: CompileEnvironment, device_ir: DeviceIR) -> No
     register_defer_tile_reduce_coverage(env)
     register_tail_peel_coverage(env)
     register_guarded_lanes_coverage(env)
+    register_predicated_element_loads_coverage(env)
     register_store_packet_tiers_coverage(env)
 
 

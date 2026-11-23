@@ -189,8 +189,10 @@ from ..search_surface import enable_cute_topk_search
 from ..search_surface import extremum_packet_loads
 from ..search_surface import fmnmx_extrema_offered
 from ..search_surface import guarded_lanes_offered
+from ..search_surface import loads_gather_along
 from ..search_surface import loads_take_packets
 from ..search_surface import packet_tile_storage_order
+from ..search_surface import predicated_element_loads_offered
 
 log = logging.getLogger(__name__)
 
@@ -10632,13 +10634,20 @@ class CutePointwiseVecHeuristic(AutotunerHeuristic):
         if spec.kernel_grid_fact is not None and len(spec.kernel_grid_fact.roots) > 1:
             return cls._multi_root_seed_configs(env)
         # The tile seeds keep their order; a gather stored along another
-        # tile adds its register tiles after them.
+        # tile adds its register tiles after them, and a kernel whose loads
+        # all gather along its stride-1 axis its one-element tiles: those
+        # take no packets, so they are planted whether or not the tile
+        # family, whose packets must divide the extent, has any seed.
         seeds = cls._tile_seed_configs(env, device_ir)
-        seeds.extend(
-            seed
-            for seed in cls._lane_gather_seed_configs(env, device_ir)
-            if all(seed.config != previous.config for previous in seeds)
-        )
+        for family in (
+            cls._lane_gather_seed_configs(env, device_ir),
+            cls._gather_tile_seed_configs(env),
+        ):
+            seeds.extend(
+                seed
+                for seed in family
+                if all(seed.config != previous.config for previous in seeds)
+            )
         return seeds
 
     # The register tile of a flattened gather stored along another tile: the
@@ -10823,6 +10832,121 @@ class CutePointwiseVecHeuristic(AutotunerHeuristic):
             if spec.cute_proven_bounds_enabled:
                 seed["cute_proven_bounds"] = True
             seeds.append(Config.from_dict(seed))
+        return seeds
+
+    # N-D gather tile seed: the threads per CTA, and the most of them along
+    # the stride-1 axis (two warps).
+    GATHER_TILE_THREADS = 256
+    GATHER_TILE_ROW_THREADS = 64
+
+    @classmethod
+    def _gather_tile_seed_configs(cls, env: CompileEnvironment) -> list[Config]:
+        """One element per thread, a run of the stride-1 axis per warp.
+
+        A kernel whose loads gather along the stride-1 axis of its store (a
+        strided or padded window over an NCHW image: ``x[tile_p, 2 * h - 1 +
+        i, 2 * w - 1 + j]``) loads single elements whatever its vector
+        widths, so the primary's packets per thread only buy scalar loads
+        that are several elements apart: a warp's load instruction then
+        spans that many times the sectors, and on the pool below the load
+        unit, not the instruction count, bounds the kernel.  Here every
+        thread takes one output element, the threads of thread x walk the
+        stride-1 axis (the smallest power of two that covers the row, at
+        most ``GATHER_TILE_ROW_THREADS``, so a warp's loads of one tap are
+        one contiguous run of a row), and the rest of the CTA's
+        ``GATHER_TILE_THREADS`` threads take one element each of the
+        outermost storage axis (independent streams); the axes between keep
+        a tile of one and the loop order is the storage order.  The sibling
+        halves the run and doubles the streams.
+
+        The seeds carry ``cute_predicated_element_loads``, and
+        ``cute_guarded_lanes`` and ``cute_fmnmx_extrema`` where the kernel
+        is offered them: with one element per thread the masked taps are the
+        whole cost of a thread, and the family is seeded where their
+        predicated form applies (``predicated_element_loads_offered``).
+        Planted where every load along the stride-1 axis gathers there
+        (``loads_gather_along``; a kernel with a direct load of the row
+        streams it in packets and keeps its packet seeds) and one store lays
+        out all the tiles, at every extent of that axis: a thread takes one
+        element, so nothing has to divide the row (the tile family's
+        packets must, and has no seed for a row of odd length).
+
+        ResNet's padded 3x3 stride-2 max pooling over ``[512, 112, 112]``
+        bf16 (better-benchmark's pointwise_ef561a2def29), kernel time in its
+        port behind the BatchNorm kernel that writes its input, interleaved
+        on B200: 6.8 to 6.9 us at tiles of ``[4, 1, 64]`` with these knobs
+        and 8.0 to 8.5 us at the same tiles without them, against 7.2 us at
+        the best tiles without the predicated loads (four elements per
+        thread, guarded lanes and fmnmx extrema on).  Alone with its input
+        flushed from L2, which is how a search times a kernel, tiles of two
+        rows and two columns per thread read lower with the same knobs (8.1
+        against 9.5 us), so a search explores from these seeds rather than
+        keeping them.
+        """
+        spec = env.config_spec
+        candidates = [block.block_id for block in spec.block_sizes]
+        if not predicated_element_loads_offered(spec):
+            return []
+        # The tiles from the stride-1 axis outward, as the stores lay them
+        # out: the order with one of them as that axis.
+        storage = next(
+            (
+                order
+                for block in candidates
+                if (order := packet_tile_storage_order(spec, candidates, block))
+                is not None
+            ),
+            None,
+        )
+        if (
+            storage is None
+            or len(spec.loop_orders) != 1
+            or not loads_gather_along(spec, storage[0])
+        ):
+            return []
+        vec_block = storage[0]
+        order_spec = spec.loop_orders[0]
+        threaded = set(spec.num_threads.valid_block_ids())
+        if (
+            set(order_spec.block_ids) != set(candidates)
+            or not {
+                storage[0],
+                storage[-1],
+            }
+            <= threaded
+        ):
+            return []
+        fragments = {item.block_id: item._fragment(spec) for item in spec.block_sizes}
+        extent = spec.block_sizes.block_id_lookup(vec_block).size_hint
+        run = min(cls.GATHER_TILE_ROW_THREADS, 1 << max(extent - 1, 0).bit_length())
+        ids = list(order_spec.block_ids)
+        knobs: dict[str, Any] = {"cute_predicated_element_loads": True}
+        if guarded_lanes_offered(spec):
+            knobs["cute_guarded_lanes"] = True
+        if fmnmx_extrema_offered(spec):
+            knobs["cute_fmnmx_extrema"] = True
+        seeds: list[Config] = []
+        for row in dict.fromkeys((run, max(run // 2, 1))):
+            streams = min(cls.GATHER_TILE_THREADS // row, fragments[storage[-1]].high)
+            if not fragments[vec_block].low <= row <= fragments[vec_block].high:
+                continue
+            threads = {vec_block: row, storage[-1]: streams}
+            seeds.append(
+                Config.from_dict(
+                    {
+                        "block_sizes": _seq_config_list(
+                            spec.block_sizes,
+                            {**dict.fromkeys(candidates, 1), **threads},
+                        ),
+                        "num_threads": _seq_config_list(spec.num_threads, threads),
+                        "cute_vector_widths": _seq_config_list(
+                            spec.cute_vector_widths, {}
+                        ),
+                        "loop_orders": [[ids.index(block_id) for block_id in storage]],
+                        **knobs,
+                    }
+                )
+            )
         return seeds
 
     @classmethod
@@ -11177,6 +11301,65 @@ class CutePointwiseVecHeuristic(AutotunerHeuristic):
         search that meets these tiles only without a minimum may find one
         by mutating another tile and stay there.
 
+        A window may also change the layout: the taps of a pooling window
+        over a channels-last activation, stored into a channel-first buffer
+        whose stride-1 axis is the image row.  The loads still take their
+        packets along the channels, so a lane's values are stored one
+        element each whatever the tiles, and which elements one store
+        instruction of a warp writes is the thread layout's to choose.
+        Where the stores agree on such a layout and the loads gather for
+        them (``packet_tile_storage_order`` with
+        ``layout_changing_gathers``), the same shapes are seeded with the
+        packet threads on thread x and the other tiles behind them in the
+        stores' order: the threads that fill the warp then run along the
+        stores' stride-1 axis, and a store instruction writes one run of
+        consecutive elements per packet thread (four runs of eight at four
+        packet threads) where a warp filled along another axis writes 32
+        elements on as many lines.  A 3x3 stride-2 max pooling of
+        ``[128, 35, 35, 288]`` bf16 into 288 of the channels of a
+        ``[128, 768, 17, 17]`` buffer (better-benchmark's
+        pointwise_06377502b8f5), kernel time in its port on B200: 27 to 30
+        us at tiles of ``[1, 1, 32, 32]`` (the image row on thread y)
+        against 48 to 51 us at the pick of a search of 577 configs, which
+        timed the packet threads on thread x in 23 of them and never under
+        ``cute_guarded_lanes``.
+
+        The loads gather (``gathers_for_stores``) where more of them run
+        along the tiles than the kernel has stores of the tiles, the taps of
+        a window with fewer outputs than taps however their coordinates are
+        written, or where one of them reaches a tile through a computed
+        coordinate (a strided window, a subsample, a copy through a view of
+        a tile's index).  Stores through computed coordinates count as
+        stores.  What is left has one load of the tiles themselves per
+        store, a copy, and it is not seeded here:
+        ``CuteTransposedStoreSeedsHeuristic`` reads the tiles of such a load
+        and seeds the layouts that pack the stores, and one packet load per
+        eight stored elements does not pay for scalar stores.  Timed on
+        B200s with 288 bf16 channels into channel-first ``[288, 8960, 17]``
+        buffers (one input set, two processes per GPU), these seeds against
+        the best other compiler seed of the kernel:
+
+        - a 3x3 stride-1 max window written ``tile.index + i``: 99 to 113
+          us against 291, a transposed-store seed (that family reads the
+          tile of ``tile.index + i`` and takes the window for a copy);
+        - the maxima of every two image rows, ``x[2h]`` and ``x[2h + 1]``,
+          a window along H alone (W, the stores' stride-1 tile, is read
+          through its tile): 94 to 98 us against 406 to 422;
+        - the sum of two activations under a row mask: 94 to 100 us against
+          285 to 295;
+        - every other image row, one load: 82 to 84 us against 379 to 394;
+        - two or three taps written ``tile.index + i``, which the
+          transposed-store family seeds too: two and three along the image
+          row 85 to 88 and 88 to 91 us, behind that family's 60 to 62 and
+          76 to 78, and an image row and the next 84 to 88 behind 60 to 62,
+          so such a search starts from both families;
+        - one load of the tiles per store, seeded for the measurement only:
+          a copy one column over (``tile.index + 1``) 84 to 86 us against
+          the 50 to 52 of its transposed-store seed, two such copies in one
+          kernel 162 to 173 against 95 to 100, and the maximum and the
+          minimum of two neighbors, to a buffer each, 160 to 168 against
+          132 to 138.
+
         The minimum is a twin's, not the seed's own, and only the packets an
         extremum folds itself count: a lane whose packets reach the extremum
         through other arithmetic, or that has no extremum (an average
@@ -11197,7 +11380,11 @@ class CutePointwiseVecHeuristic(AutotunerHeuristic):
             cls.PACKET_TILE_PACKET_BYTES,
             cls.PACKET_TILE_THREADS,
         )
-        storage = packet_tile_storage_order(spec, candidates, vec_block)
+        # The packet block, then the other tiles as the stores lay them out:
+        # the storage order where the packets are the stores' stride-1 axis.
+        storage = packet_tile_storage_order(
+            spec, candidates, vec_block, layout_changing_gathers=True
+        )
         if (
             layout is None
             or storage is None

@@ -108,6 +108,7 @@ from .emitters.memory_access import _cute_tensor_dim_size_expr
 from .emitters.memory_access import _cute_unique_graph_block_id
 from .emitters.memory_access import _matching_block_ids
 from .emitters.memory_access import _maybe_codegen_cute_packed_affine_lhs_load
+from .gathered_bounds import mask_bounded_gather_positions
 from .gathered_bounds import proven_gather_positions
 from .indexing import CUTE_SCALAR_LOAD_SITE_META
 from .indexing import CuteScalarLoadSite
@@ -3326,6 +3327,10 @@ def _load_access_site(
         if state.config.config.get("cute_guarded_lanes") is True
         else frozenset()
     )
+    # Under ``cute_predicated_element_loads`` neither does one whose bound
+    # the load's own ``extra_mask`` states.
+    if state.config.config.get("cute_predicated_element_loads") is True:
+        proven_index_bounds |= mask_bounded_gather_positions(state, tensor, subscript)
     mask_expr = _cute_resolved_load_mask(
         state, tensor, subscript, index_exprs, extra_mask, proven_index_bounds
     )

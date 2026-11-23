@@ -102,6 +102,7 @@ from ._ast_pass_utils import assigned_name
 from ._ast_pass_utils import call_path_str
 from ._ast_pass_utils import dealias_shared_nodes
 from ._ast_pass_utils import is_constexpr_range
+from ._ast_pass_utils import loop_target_names
 from ._ast_pass_utils import statement_lists
 from .packet_access import match_packet_access
 from .persistent_branch_vec import _and_terms
@@ -218,30 +219,21 @@ def _pure_statement(stmt: ast.stmt) -> bool:
 
 
 def _loop_target_names(loop: ast.For) -> list[ast.Name]:
-    """The names a loop binds as its target, whatever their context: a
-    generated loop target may lack its ``Store`` context."""
+    """The names a loop binds as its own target, whatever their context: a
+    generated loop target may lack its ``Store`` context.  (The shared
+    ``loop_target_names`` adds the targets of the loops nested in it.)"""
     return [node for node in ast.walk(loop.target) if isinstance(node, ast.Name)]
-
-
-def _loop_targets(stmt: ast.AST) -> set[int]:
-    """The ``id`` of every name node under ``stmt`` that is a loop's target."""
-    return {
-        id(name)
-        for node in ast.walk(stmt)
-        if isinstance(node, ast.For)
-        for name in _loop_target_names(node)
-    }
 
 
 def _assigned(stmt: ast.AST) -> Counter[str]:
     """How often each name is bound under ``stmt``: stores, loop targets
-    (``_loop_target_names``) and appends, which give the list they extend a
+    (``loop_target_names``) and appends, which give the list they extend a
     new value as an assignment would."""
     counts: Counter[str] = Counter()
-    targets = _loop_targets(stmt)
+    loop_targets = loop_target_names(stmt)
+    targets = {id(name) for name in loop_targets}
+    counts.update(name.id for name in loop_targets)
     for node in ast.walk(stmt):
-        if isinstance(node, ast.For):
-            counts.update(name.id for name in _loop_target_names(node))
         appended = _appended_list(node)
         if appended is not None:
             counts[appended] += 1
@@ -258,7 +250,7 @@ def _assigned(stmt: ast.AST) -> Counter[str]:
 def _read(stmt: ast.AST) -> Counter[str]:
     """How often each name is read under ``stmt``; a loop's target is bound,
     not read, whatever its context."""
-    targets = _loop_targets(stmt)
+    targets = {id(name) for name in loop_target_names(stmt)}
     return Counter(
         node.id
         for node in ast.walk(stmt)

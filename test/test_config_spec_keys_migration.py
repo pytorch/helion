@@ -126,7 +126,7 @@ _BASE_VALID_KEYS = """
     cute_mma_dag_store cute_mma_dag_v_lag
     cute_mma_dag_warps
     cute_mma_f32_conversion cute_narrow_load_hints cute_packet_prefetch cute_pair_lane_math cute_pdl cute_pdl_capture_overlap cute_pdl_release
-    cute_pointwise_pid_type cute_proven_bounds cute_radix_boundary_early_exit
+    cute_pointwise_pid_type cute_predicated_element_loads cute_proven_bounds cute_radix_boundary_early_exit
     cute_radix_cached_payload_inverse cute_radix_candidate_capacity
     cute_radix_candidate_key_cache cute_radix_cluster_ctas cute_radix_defer_output
     cute_radix_histogram_mode cute_radix_packet_bits cute_radix_partial_scan
@@ -300,7 +300,7 @@ _BASE_BACKEND_SPECIFIC_KEYS = """
     cute_mma_dag_store cute_mma_dag_v_lag
     cute_mma_dag_warps
     cute_mma_f32_conversion cute_narrow_load_hints cute_packet_prefetch cute_pair_lane_math cute_pdl cute_pdl_capture_overlap cute_pdl_release
-    cute_pointwise_pid_type cute_proven_bounds cute_radix_boundary_early_exit
+    cute_pointwise_pid_type cute_predicated_element_loads cute_proven_bounds cute_radix_boundary_early_exit
     cute_radix_cached_payload_inverse cute_radix_candidate_capacity
     cute_radix_candidate_key_cache cute_radix_cluster_ctas cute_radix_defer_output
     cute_radix_histogram_mode cute_radix_packet_bits cute_radix_partial_scan
@@ -412,7 +412,7 @@ _BASE_CUTE_IMPLICIT_DEFAULT_KEYS = """
     cute_host_paired_sum cute_independent_reduction cute_integer_loop_reduction
     cute_lane_unroll cute_materialized_operand_schedule cute_materialized_schedule
     cute_narrow_load_hints cute_packet_prefetch cute_pair_lane_math cute_pdl cute_pdl_capture_overlap cute_pdl_release cute_pointwise_pid_type
-    cute_proven_bounds cute_radix_boundary_early_exit
+    cute_predicated_element_loads cute_proven_bounds cute_radix_boundary_early_exit
     cute_radix_cached_payload_inverse cute_radix_candidate_capacity
     cute_radix_candidate_key_cache cute_radix_cluster_ctas cute_radix_defer_output
     cute_radix_histogram_mode cute_radix_packet_bits cute_radix_partial_scan
@@ -534,7 +534,7 @@ _BASE_CUTE_ACCEPTED = """
     cute_mma_dag_store cute_mma_dag_v_lag
     cute_mma_dag_warps
     cute_mma_f32_conversion cute_narrow_load_hints cute_packet_prefetch cute_pair_lane_math cute_pdl cute_pdl_capture_overlap cute_pdl_release
-    cute_pointwise_pid_type cute_proven_bounds cute_radix_boundary_early_exit
+    cute_pointwise_pid_type cute_predicated_element_loads cute_proven_bounds cute_radix_boundary_early_exit
     cute_radix_cached_payload_inverse cute_radix_candidate_capacity
     cute_radix_candidate_key_cache cute_radix_cluster_ctas cute_radix_defer_output
     cute_radix_histogram_mode cute_radix_packet_bits cute_radix_partial_scan

@@ -102,6 +102,9 @@ KERNEL_DEF_PASS_NAMES = [
     "select_native_warp_reductions",
     "stage_cta_stores",
     "guard_lanes",
+    # Ahead of the hints: the masked element loads of
+    # ``cute_predicated_element_loads``.
+    "predicate_element_loads",
     # After the table: the element hints of ``cute_scalar_load_hints``, on
     # the loads every earlier pass left plain.
     "hint_element_loads",

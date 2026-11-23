@@ -1425,6 +1425,15 @@ def _normalize_cute_vector_reductions(
             raise InvalidConfig(f"{key} requires cute_register_row")
 
 
+def predicated_element_loads_offered(config_spec: ConfigSpec) -> bool:
+    """Whether ``cute_predicated_element_loads`` is offered: a pointwise
+    kernel with a load under an ``extra_mask`` that gathers single elements
+    along its tensor's last dim at every config, through a scaled or loaded
+    coordinate (``predicated_element_loads.has_masked_gather_sites``).
+    Structure only."""
+    return config_spec.cute_masked_gather_sites and bool(config_spec.pointwise_facts)
+
+
 def guarded_lanes_offered(config_spec: ConfigSpec) -> bool:
     """Whether ``cute_guarded_lanes`` is offered: a pointwise kernel (no
     reduction, matmul or atomic: the kernels the knob was measured on) with
@@ -1440,6 +1449,26 @@ def fmnmx_extrema_offered(config_spec: ConfigSpec) -> bool:
     return config_spec.cute_fmnmx_extrema_sites and bool(config_spec.pointwise_facts)
 
 
+def _reads_along(access: MemoryOpFact, block: int) -> list[bool]:
+    """The subscripts of a load that run along ``block``'s axis, in order:
+    True for the block's tile itself at the load's stride-1 position, False
+    for one that gathers along the axis (a scaled coordinate, or the tile
+    on another dim than the stride-1 one).  One load can have both
+    (``x[tile, tile]`` over a square): ``_reads_packets`` takes it for a
+    gather, ``loads_gather_along`` for a direct load."""
+    return [
+        tile == block and stride == 1 and scale == 1
+        for tile, affine, stride, scale in zip(
+            access.subscript_block_ids,
+            access.subscript_affine_block_ids,
+            access.subscript_strides,
+            access.subscript_index_scales,
+            strict=False,
+        )
+        if block in (tile, affine)
+    ]
+
+
 def _reads_packets(access: MemoryOpFact, packet_block: int) -> bool | None:
     """How a load reads ``packet_block``'s axis: True for the block's tile
     itself at the load's stride-1 position (the threads of a vector lane
@@ -1447,16 +1476,8 @@ def _reads_packets(access: MemoryOpFact, packet_block: int) -> bool | None:
     None for one that gathers along it (a window over the contiguous dim, a
     scaled coordinate), which reads scalars, one per lane."""
     direct = False
-    for block, affine, stride, scale in zip(
-        access.subscript_block_ids,
-        access.subscript_affine_block_ids,
-        access.subscript_strides,
-        access.subscript_index_scales,
-        strict=False,
-    ):
-        if packet_block not in (block, affine):
-            continue
-        if block != packet_block or stride != 1 or scale != 1:
+    for itself in _reads_along(access, packet_block):
+        if not itself:
             return None
         direct = True
     return direct
@@ -1516,12 +1537,23 @@ def extremum_packet_loads(device_ir: DeviceIR, packet_block: int) -> int:
 
 
 def packet_tile_storage_order(
-    config_spec: ConfigSpec, blocks: Sequence[int], packet_block: int
+    config_spec: ConfigSpec,
+    blocks: Sequence[int],
+    packet_block: int,
+    *,
+    layout_changing_gathers: bool = False,
 ) -> list[int] | None:
     """The tile ``blocks`` from the stride-1 axis outward, as every store
     that indexes all of them lays them out (by ascending stride); None
     without such a store, or when two disagree or ``packet_block`` is not the
-    stride-1 axis of one."""
+    stride-1 axis of one.
+
+    ``layout_changing_gathers`` also orders the tiles of stores that agree
+    on a layout with another tile at stride 1, where the loads gather for
+    them (``gathers_for_stores``: the taps of a pooling window over a
+    channels-last activation, stored channel-first) and do not feed a copy.
+    The order is then ``packet_block`` followed by the other tiles as the
+    stores lay them out."""
     found: list[int] | None = None
     for access in config_spec.memory_op_facts:
         indexed = access.subscript_block_ids
@@ -1538,12 +1570,94 @@ def packet_tile_storage_order(
         if (
             strides[0] != 1
             or len(set(strides)) != len(strides)
-            or order[0] != packet_block
             or (found is not None and found != order)
         ):
             return None
         found = order
-    return found
+    if found is None or found[0] == packet_block:
+        return found
+    if not layout_changing_gathers or not gathers_for_stores(config_spec, found):
+        return None
+    return [packet_block, *(block for block in found if block != packet_block)]
+
+
+def gathers_for_stores(config_spec: ConfigSpec, order: Sequence[int]) -> bool:
+    """Whether the loads of a kernel gather for its stores, which lay the
+    tiles out as ``order`` (``packet_tile_storage_order``), where a copy has
+    one load per store.  Loads and stores are counted on one measure: those
+    that run along every tile of ``order``, each through the tile itself or
+    through a coordinate computed from the tile's index (an affine block in
+    the fact).  A bias along the channels and a mask of the rows do not,
+    and neither does a load or a store through an index tensor that is
+    itself loaded, which has no affine block.  Either makes the loads a
+    gather:
+
+    - one of them reaches a tile through a computed coordinate, an affine
+      block without a tile of its own in its fact: the taps of a strided
+      window, a subsample, and a lone such load too, a copy through a
+      shifted or reshaped tile index.  The seeds that serve copies
+      (``CuteTransposedStoreSeedsHeuristic``) read the tiles of a load and
+      have none to read there.  Which coordinates keep their tile is the
+      fact's to say and not this test's: today a tile's index plus a
+      constant does (``add_tile_with_offset_metadata``), and
+      ``2 * tile.index + j``, ``tile.index - 1`` and ``tile.index[:, None]``
+      do not;
+    - there are more of them than stores, counted over the kernel and not
+      per stored element: the taps of a window with fewer outputs than
+      taps, the operands of a sum.  A window that stores as many outputs as
+      it has taps (the maximum and the minimum of a pair, to a buffer each)
+      has a copy's loads per store and is left to the copies' seeds, as two
+      copies in one kernel are, also where one of them is stored through a
+      coordinate computed from a tile's index.
+
+    False as well where a store through such a coordinate lays the tiles
+    out in another order than ``order``: the stores then have no one layout
+    for the threads to follow.
+
+    A known over-seed: a copy stored through a loaded index
+    (``out[rows[tile], ...]``) beside another copy.  That store is not
+    counted and its load is, two loads for one store, so the kernel reads
+    as a gather and is seeded.  Structure only, no extents."""
+    along = [
+        access
+        for access in config_spec.memory_op_facts
+        if set(access.subscript_affine_block_ids) == set(order)
+    ]
+    taps = [access for access in along if access.kind == "load"]
+    stores = [access for access in along if access.kind == "store"]
+    for access in stores:
+        # Every block here is one of ``order``'s: none is None.
+        by_stride = sorted(
+            zip(
+                access.subscript_strides,
+                access.subscript_affine_block_ids,
+                strict=False,
+            )
+        )
+        if [block for _, block in by_stride] != list(order):
+            return False
+    return len(taps) > len(stores) or any(
+        None in access.subscript_block_ids for access in taps
+    )
+
+
+def loads_gather_along(config_spec: ConfigSpec, block: int) -> bool:
+    """Whether every load that runs along ``block`` gathers there (a scaled
+    or offset coordinate of the tile, or the tile on a dim that is not the
+    load's stride-1 one) and at least one does: none reads the tile itself
+    at its stride-1 position, the direct loads of ``loads_take_packets``.
+    A kernel with one direct load of the tile beside its gathers (a padded
+    copy next to a gathered operand) streams that load in packets and is
+    not such a kernel."""
+    gathers = False
+    for access in config_spec.memory_op_facts:
+        if access.kind != "load":
+            continue
+        for itself in _reads_along(access, block):
+            if itself:
+                return False
+            gathers = True
+    return gathers
 
 
 def _normalize_gated_boolean(
@@ -3294,6 +3408,20 @@ def normalize_knobs(
     )
     _normalize_gated_boolean(
         config,
+        "cute_predicated_element_loads",
+        enabled=predicated_element_loads_offered(config_spec),
+        requirement=(
+            "an hl.load under an extra_mask whose last subscript is a scaled "
+            "or gathered coordinate (not a tile or a tile shifted by a "
+            "constant, nor a row offset plus a tile's index into a tensor "
+            "that vector lanes load in packets), in a pointwise kernel (no "
+            "reduction, matmul or atomic)"
+        ),
+        fix_invalid=fix_invalid,
+        fill=False,
+    )
+    _normalize_gated_boolean(
+        config,
         "cute_store_packet_tiers",
         enabled=bool(config_spec.cute_store_tier_blocks),
         requirement=(
@@ -3517,15 +3645,19 @@ def _lead_threads_with_the_packet_axis(
     more than 64 threads on z, ``MAX_THREAD_BLOCK_DIMS``): the launch would
     be refused, and the config as generated may be launchable.
 
-    The rule covers the tiles the N-D packet tile seeds lay out
-    (``CutePointwiseVecHeuristic._packet_tile_seeds``): the loads along the
-    packet block take packets (``loads_take_packets``) and a store lays out
-    the loop's blocks with the packet block at stride 1
+    The rule covers the tiles the N-D packet tile seeds lay out in storage
+    order (``CutePointwiseVecHeuristic._packet_tile_seeds``): the loads
+    along the packet block take packets (``loads_take_packets``) and a store
+    lays out the loop's blocks with the packet block at stride 1
     (``packet_tile_storage_order``).  Any other kernel the knob is offered
     to keeps its loop orders, and so the search's whole range of thread
-    layouts under the knob.  A config a user or a saved search pinned is
-    left as it is (``fix_invalid`` only), and so is a config without the
-    knob, whose compute-bound code preferred the other layouts.
+    layouts under the knob: a transposed store, and a window that changes
+    the layout, whose packet tile the seeds plant with the packet threads on
+    thread x (two searches of such a pooling from those seeds, one of them
+    with this rule extended to it, ended on the same time).  A config a
+    user or a saved search pinned is left as it is (``fix_invalid`` only),
+    and so is a config without the knob, whose compute-bound code preferred
+    the other layouts.
     """
     if config.get("cute_guarded_lanes") is not True or not guarded_lanes_offered(
         config_spec
@@ -4672,6 +4804,14 @@ def cute_flat_fields(
             # compares and a select; the same values but for the sign of a
             # zero where zeros of both signs meet.
             fields["cute_fmnmx_extrema"] = BooleanFragment()
+        if predicated_element_loads_offered(config_spec):
+            # A masked element load as one predicated instruction instead of
+            # a load inside a conditional, with the constant of the select
+            # it feeds as its masked-off value where that is proven; the
+            # same values but for the sign and payload bits of a NaN.  A
+            # config whose masked loads are all packets renders its code
+            # without the knob.
+            fields["cute_predicated_element_loads"] = BooleanFragment()
         if config_spec.cute_store_tier_blocks:
             # A lane loop's stores in narrower packets where a row fails the
             # full packet's alignment guard, instead of the scalar loop;
