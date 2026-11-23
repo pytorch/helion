@@ -15,27 +15,38 @@ as PyTorch operations over tiles; the compiler derives a configuration
 space for each kernel and hardware target and autotunes it, so the same
 kernel adapts across input shapes and hardware targets.
 
-Helion generates kernels through one of several backends. Select one with
-the `HELION_BACKEND` environment variable or the `backend=` argument of
-`@helion.kernel`:
+## Backends
 
-* [Triton] (default): `HELION_BACKEND=triton`
-* [TileIR](#tileir-backend), for NVIDIA Blackwell GPUs: `HELION_BACKEND=tileir` (also set `ENABLE_TILE=1`)
-* [CuTe DSL](#cute-backend-cuda-13), for NVIDIA Blackwell GPUs: `HELION_BACKEND=cute`
-* [Gluon], for NVIDIA Blackwell (sm_10x) GPUs (experimental): `HELION_BACKEND=gluon` (needs Triton >= 3.8)
-* [Pallas], for Google TPUs: `HELION_BACKEND=pallas`
-* Metal, for Apple GPUs (experimental): `HELION_BACKEND=metal`
-* FlyDSL, for AMD GPUs (experimental): `HELION_BACKEND=flydsl`
+**On NVIDIA B200 or B300, set `HELION_BACKEND=cute` for better performance.**
+Use PyTorch built with CUDA 13 or later and install the
+[CuTe dependencies](#cute-backend-cuda-13).
 
-```python
-@helion.kernel(backend="cute")
-def my_kernel(x: torch.Tensor) -> torch.Tensor:
-    ...
-```
+Helion supports the following code generation backends. These status labels
+refer to Helion's integration with each compiler.
+
+<!-- backend-table-start -->
+
+| Backend (`HELION_BACKEND`) | Status | Hardware and when to choose it |
+| --- | --- | --- |
+| **Triton** (`triton`, default) | Stable | General-purpose GPU backend for NVIDIA and AMD; other targets require a compatible Triton distribution. |
+| **CuTe DSL** (`cute`) | Beta | NVIDIA GPUs, with Blackwell-focused optimizations. Recommended for B200/B300 performance; requires CUDA 13+ PyTorch and the pinned CuTe dependencies. |
+| **TileIR** (`tileir`) | Stable | NVIDIA Blackwell (compute capability 10.x or 12.x), through Triton-to-tile-IR. Requires its Triton distribution and `ENABLE_TILE=1`. |
+| **Pallas** (`pallas`) | Beta | Google TPUs through JAX/Pallas. CPU interpret mode is available for development. |
+| **Gluon** (`gluon`) | Experimental | NVIDIA Blackwell (compute capability 10.x), using Triton's Gluon compiler. Requires Triton 3.8+. |
+| **Metal** (`metal`) | Experimental | Apple GPUs through Metal Shading Language, using PyTorch MPS tensors on macOS. |
+| **FlyDSL** (`flydsl`) | Experimental | AMD GPUs through FlyDSL and ROCm; requires the separate `flydsl` package. |
+
+<!-- backend-table-end -->
+
+Select a backend with `HELION_BACKEND` before importing your kernels, or use
+`@helion.kernel(backend="cute")` for a per-kernel choice. The decorator
+argument takes precedence; Triton remains the default. Helion autotunes
+within the selected backend, so retune when switching backends or hardware.
+
+See the [Backend Guide](docs/backends.md) for status definitions, setup,
+limitations and guidance on choosing a backend.
 
 [Triton]: https://github.com/triton-lang/triton
-[Gluon]: https://github.com/triton-lang/triton/tree/main/python/tutorials/gluon
-[Pallas]: https://docs.jax.dev/en/latest/pallas/index.html
 
 The name *Helion* refers to the nucleus of a helium-3 atom, while *Triton*
 refers to hydrogen-3.
@@ -109,8 +120,8 @@ the CPU. It is typically used for tasks like allocating output tensors
 and performing shape computations.
 
 The code inside the `for` loops is compiled by the selected backend
-(Triton by default) into a single GPU kernel.  A single Helion kernel is
-always compiled to exactly one GPU kernel.
+(Triton by default) into device code. A Helion kernel can use one or more
+device launches, depending on its operations and the backend.
 
 The `hl.tile` function subdivides the iteration space (in this case `m` by
 `n`) into tiles. These tiles are executed in parallel on the GPU. Tiling
@@ -323,7 +334,8 @@ For detailed documentation, see the [TileIR Backend Guide](docs/tileir_backend.m
 
 ## CuTe Backend (CUDA 13+)
 
-Helion has a beta [CUTLASS CuTe DSL](https://github.com/NVIDIA/cutlass) backend that lowers kernels through CuTe instead of Triton.
+Helion has a beta [CUTLASS CuTe DSL](https://github.com/NVIDIA/cutlass) backend.
+**We recommend it on NVIDIA B200/B300 for better performance.**
 
 **Requirements:** PyTorch must be built against **CUDA 13 or later** (`torch.version.cuda >= "13"`). The backend will refuse to launch on older CUDA builds.
 
@@ -379,12 +391,14 @@ for DEBUG-level logs. Alternatively, you can specify logging for specific module
 
 ## Requirements
 
-Helion currently targets Linux systems and requires a recent Python and PyTorch environment:
+The NVIDIA and AMD backends target Linux and require a recent Python and
+PyTorch environment. The experimental Metal backend targets macOS; see the
+[Backend Guide](docs/backends.md) for platform-specific requirements.
 
-- Linux-based OS
+- Linux for NVIDIA/AMD GPUs, or macOS for the experimental Metal backend
 - Python 3.10–3.14
 - [PyTorch] 2.9 or later
-- [Triton] 3.5 or later
+- [Triton] 3.5 or later for the default backend
   *(Older versions may work, but will lack support for features like
   TMA on Hopper/Blackwell GPUs and may exhibit lower performance.)*
 - [Triton-to-tile-IR](https://github.com/triton-lang/Triton-to-tile-IR) *(Optional)* 3.5 or later

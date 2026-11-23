@@ -2,6 +2,11 @@
 
 ## Overview
 
+TileIR is a **stable** Helion backend for NVIDIA Blackwell. For B200/B300,
+we recommend trying `HELION_BACKEND=cute` for better performance; see
+{doc}`backends` for the alternatives and their requirements. TileIR remains
+an option for evaluating the CUDA Tile IR compiler.
+
 The CUDA Tile IR backend enables Helion to generate optimized code using the [Triton-to-tile-IR backend](https://github.com/triton-lang/Triton-to-tile-IR), a bridge tool that allows users to use the Triton DSL for developing and compiling operators targeting the [CUDA Tile IR](https://docs.nvidia.com/cuda/tile-ir/latest/index.html) backend. This integration includes performance tuning configuration adjustments tailored for the Triton-to-tile-IR bridge, generating kernels with better performance and improving the efficiency of the autotuning process.
 
 ## Requirements
@@ -155,9 +160,9 @@ Kernels using these operations should not be compiled with the TileIR backend.
 
 ## Summary Table
 
-| Feature | TileIR Backend | Standard Backend |
+| Feature | TileIR Backend | Triton Backend |
 |---------|---------------|------------------|
-| **Hardware** | SM100/SM120 (compute capability 10.x, 12.x) | All CUDA GPUs |
+| **Hardware** | Blackwell (compute capability 10.x, 12.x) | Triton-supported NVIDIA and AMD GPUs |
 | **Environment** | `ENABLE_TILE=1` and `HELION_BACKEND=tileir` required | No special env var |
 | **num_ctas** | ✅ Supported | ❌ Not available |
 | **occupancy** | ✅ Supported | ❌ Not available |

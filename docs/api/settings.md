@@ -44,24 +44,39 @@ time). One can modify Kernel.settings to change settings
 for an already defined kernel.
 ```
 
+## Backend Selection
+
+```{eval-rst}
+.. autoattribute:: Settings.backend
+```
+
+Use `HELION_BACKEND=cute` or `@helion.kernel(backend="cute")` to select CuTe.
+We recommend it on NVIDIA B200/B300 for better performance, with CUDA 13+
+PyTorch and the CuTe dependencies installed. Triton remains the default.
+The decorator argument overrides the environment variable, which is read
+when the kernel is defined. Backend selection is not autotuned.
+
+See {doc}`../backends` for all supported backends, their status and requirements.
+
 ## Configuration Examples
 
 ### Using Environment Variables
 
 ```bash
-env HELION_PRINT_OUTPUT_CODE=1  HELION_AUTOTUNE_EFFORT=none my_kernel.py
+HELION_PRINT_OUTPUT_CODE=1 HELION_AUTOTUNE_EFFORT=none python my_kernel.py
 ```
 
 ### Using Decorator Arguments
 
 ```python
 import logging
+import torch
 import helion
 import helion.language as hl
 
 @helion.kernel(
     autotune_effort="none",           # Skip autotuning
-    print_output_code=True,            # Debug: show generated Triton code
+    print_output_code=True,            # Debug: show generated code
     print_repro=True,                  # Debug: show Helion kernel code, config, and caller code as a standalone repro script
 )
 def my_kernel(x: torch.Tensor) -> torch.Tensor:
@@ -455,7 +470,7 @@ See :class:`helion.autotuner.LocalAutotuneCache` for details on cache keys and b
 ```{eval-rst}
 .. autoattribute:: Settings.print_output_code
 
-   Print generated Triton code to stderr. Default is ``False``. Controlled by ``HELION_PRINT_OUTPUT_CODE=1``.
+   Print generated code to stderr. Default is ``False``. Controlled by ``HELION_PRINT_OUTPUT_CODE=1``.
 
 .. autoattribute:: Settings.print_repro
 
@@ -463,7 +478,7 @@ See :class:`helion.autotuner.LocalAutotuneCache` for details on cache keys and b
 
 .. autoattribute:: Settings.output_origin_lines
 
-   Annotate generated Triton code with ``# src[<file>:<line>]`` comments indicating the originating Helion statements.
+   Annotate generated code with ``# src[<file>:<line>]`` comments indicating the originating Helion statements.
    Default is ``True``. Controlled by ``HELION_OUTPUT_ORIGIN_LINES`` (set to ``0`` to disable).
 
 .. autoattribute:: Settings.ignore_warnings
@@ -550,6 +565,7 @@ Built-in values for ``HELION_AUTOTUNER`` include ``"LFBOTreeSearch"`` (default),
 
 | Environment Variable | Maps To | Description |
 |----------------------|---------|-------------|
+| ``HELION_BACKEND`` | ``backend`` | Code generation backend (default ``triton``). Set before defining kernels; an explicit ``backend=`` wins. CuTe is recommended on B200/B300 and requires CUDA 13+ PyTorch and the CuTe dependencies. See {doc}`../backends` for supported values, status and requirements. |
 | ``TRITON_F32_DEFAULT`` | ``dot_precision`` | Sets default floating-point precision for Triton dot products (``"tf32"``, ``"tf32x3"``, ``"ieee"``). This variable does not apply to the Pallas backend. |
 | ``JAX_DEFAULT_MATMUL_PRECISION`` | ``dot_precision`` | Accepts JAX matmul precision values for Pallas dot products (``"default"``, ``"high"``, ``"highest"``, etc., mapped to Helion ``DotPrecision``). On TPU these values emit Pallas default precision. This variable does not apply to the Triton backend. |
 | ``HELION_INDEX_DTYPE`` | ``index_dtype`` | Choose the index dtype (accepts any ``torch.<dtype>`` name, e.g. ``int64``), or set to ``auto``/unset to allow Helion to pick ``int32`` vs ``int64`` based on input sizes. |
@@ -598,15 +614,14 @@ Built-in values for ``HELION_AUTOTUNER`` include ``"LFBOTreeSearch"`` (default),
 | ``HELION_REMOTE_CACHE_BACKEND`` | (used by ``RemoteAutotuneCache`` and warm-start) | Fully-qualified class path to a ``RemoteCacheBackend`` subclass (e.g. ``mypackage.cache.RedisBackend``); enables remote read-through/write-through caching and, when the backend overrides ``list()``, remote warm-start lookups for ``from_best_available`` / ``helion.from_cache``. |
 | ``HELION_BENCHMARK_CUDAGRAPH`` | (benchmarking) | Wrap ``run_example``'s timing loop in CUDA-graph capture/replay so launch overhead is amortized for both helion and the torch baseline. Defaults on inside ``run_example``, off elsewhere. Set ``0`` to opt out; ``1`` to enable globally. Capture silently falls back to non-CG if unavailable (HIP, no CUDA, nested capture). Note: ``=1`` globally also applies during autotune, which is counterproductive — each of thousands of configs triggers a fresh capture (warmup + sync per config, no reuse across configs since launch parameters differ), captured graphs accumulate memory pool allocations, and many configs raise on capture due to shape/stride differences across the search space. Prefer leaving unset (default off in autotune, on in ``run_example``). When it is on, kernels whose single replay takes under 64 us are timed as one captured graph holding several flushed calls minus a graph of the same flushes, because a lone replay carries the graph launch latency (4-6 us on B200, in ~2 us steps) and would read the same value for every short kernel. |
 | ``HELION_BENCHMARK_GRAPH_WARMUP`` | (benchmarking) | Before the first CUDA graph a benchmark captures, drive the process into its steady graph-dispatch state (16 eager launches on side streams, kept alive; ``steady_graph_dispatch``). A fresh process replays graphs with shorter inter-kernel gaps until it has launched about ten kernels on non-default streams, then every graph of the process replays slower for its lifetime, so without the warm-up the first candidates are ranked in one state and the rest in another. Runs once per device per process; a warm-up that cannot run is skipped (and retried at the next capture), never fatal. Defaults on; set ``0`` to measure the fast state itself (the example catalogue drivers pass this variable through to their workers). Any other value logs a warning and keeps the default. |
-| ``HELION_PRINT_OUTPUT_CODE`` | ``print_output_code`` | Print generated Triton code to stderr for inspection. |
+| ``HELION_PRINT_OUTPUT_CODE`` | ``print_output_code`` | Print generated code to stderr for inspection. |
 | ``HELION_PRINT_REPRO`` | ``print_repro`` | Print Helion kernel code, config, and caller code to stderr as a standalone repro script. |
-| ``HELION_OUTPUT_ORIGIN_LINES`` | ``output_origin_lines`` | Include ``# src[...]`` comments in generated Triton code; set to ``0`` to disable. |
+| ``HELION_OUTPUT_ORIGIN_LINES`` | ``output_origin_lines`` | Include ``# src[...]`` comments in generated code; set to ``0`` to disable. |
 | ``HELION_IGNORE_WARNINGS`` | ``ignore_warnings`` | Comma-separated warning names defined in ``helion.exc`` to suppress. |
 | ``HELION_ALLOW_WARP_SPECIALIZE`` | ``allow_warp_specialize`` | Permit warp-specialized code generation for ``tl.range``. |
 | ``HELION_DEBUG_DTYPE_ASSERTS`` | ``debug_dtype_asserts`` | Inject dtype assertions after each lowering step. |
 | ``HELION_INTERPRET`` | ``ref_mode`` | Run kernels through the reference interpreter when set to ``1`` (maps to ``RefMode.EAGER``). |
 | ``HELION_AUTOTUNER`` | ``default_autotuner_fn`` | Select which autotuner implementation to instantiate. Default is ``"LFBOTreeSearch"``. Other options: ``"LFBOPatternSearch"``, ``"DESurrogateHybrid"``, ``"PatternSearch"``, ``"DifferentialEvolutionSearch"``, ``"FiniteSearch"``, ``"RandomSearch"``, ``"LLMGuidedSearch"``, ``"LLMSeededSearch"``, ``"LLMSeededLFBOTreeSearch"``. See :doc:`autotuner` for LLM configuration. |
-| ``HELION_BACKEND`` | ``backend`` | Code generation backend (``"triton"`` (default), ``"pallas"``, ``"cute"``, ``"tileir"``, ``"gluon"``, ``"metal"``, ``"flydsl"``; the last three experimental). ``"cute"`` requires PyTorch built against CUDA 13 or later; ``"tileir"`` requires ``ENABLE_TILE=1``; ``"gluon"`` requires a compute capability 10.x GPU and Triton 3.8 or later. |
 
 ## See Also
 

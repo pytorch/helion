@@ -1,5 +1,8 @@
 # Backend API (experimental)
 
+To choose an existing backend, see {doc}`../backends`. This page is for
+authors implementing a backend.
+
 `helion.backend_api` is the interface for codegen backends that live outside
 the Helion repository. A backend subclasses `helion.backend_api.Backend`
 and imports Helion internals only from this module.

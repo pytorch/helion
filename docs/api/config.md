@@ -33,6 +33,12 @@ The `Config` class represents kernel optimization parameters that control how He
 
 Configs are typically discovered automatically through autotuning, but can also be manually specified for more control.
 
+Choose the backend with `backend=` or `HELION_BACKEND` before tuning; it is
+a {doc}`settings` choice, not a `Config` parameter. Config keys and their
+meaning can differ between backends. Retune for the selected backend and
+hardware instead of reusing another backend's explicit configs. See
+{doc}`../backends` for status and selection guidance.
+
 ## Configuration Parameters
 
 ### Block Sizes and Resources

@@ -4,6 +4,7 @@ from types import SimpleNamespace
 from typing import cast
 import unittest
 from unittest import mock
+import warnings
 
 import pytest
 import torch
@@ -27,8 +28,88 @@ from helion.language._decorators import APIFunc
 from helion.language._decorators import BackendDispatchTable
 from helion.language._decorators import api
 from helion.language._decorators import codegen
+from helion.runtime.settings import Settings
 
 pytestmark = pytest.mark.cpu_only
+
+
+class TestBackendRecommendations(unittest.TestCase):
+    def setUp(self) -> None:
+        super().setUp()
+        # Exercise warn_once without consuming warnings in unrelated tests.
+        patcher = mock.patch("torch._dynamo.utils.warn_once_cache", set())
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_blackwell_recommendation(self) -> None:
+        # Two hardware generations, plus the three alternative NVIDIA backends.
+        for capability in ((10, 0), (10, 3)):
+            for selected in ("triton", "tileir", "gluon"):
+                with (
+                    self.subTest(capability=capability, selected=selected),
+                    mock.patch("torch._dynamo.utils.warn_once_cache", set()),
+                    mock.patch("torch.version.hip", None),
+                    mock.patch(
+                        "helion._compat.target_device_capability",
+                        return_value=capability,
+                    ) as probe,
+                    warnings.catch_warnings(record=True) as caught,
+                ):
+                    warnings.simplefilter("always")
+                    backend = backend_registry.get_backend(selected)
+                    device = torch.device("cuda:1")
+                    for _ in range(2):
+                        backend_registry.warn_backend_recommendations(backend, device)
+                    self.assertEqual(len(caught), 1)
+                    message = str(caught[0].message)
+                    self.assertIn("HELION_BACKEND=cute", message)
+                    self.assertIn("better performance", message)
+                    self.assertIn("CUDA 13", message)
+                    probe.assert_called_with(device)
+
+    def test_other_hardware_is_quiet(self) -> None:
+        for capability in (None, (8, 0), (9, 0), (12, 0)):
+            with (
+                self.subTest(capability=capability),
+                mock.patch("torch.version.hip", None),
+                mock.patch(
+                    "helion._compat.target_device_capability", return_value=capability
+                ),
+                warnings.catch_warnings(record=True) as caught,
+            ):
+                warnings.simplefilter("always")
+                backend_registry.warn_backend_recommendations(
+                    backend_registry.get_backend("triton"), torch.device("cuda:0")
+                )
+                self.assertEqual(caught, [])
+
+    def test_cute_and_non_cuda_targets_do_not_probe_cuda(self) -> None:
+        for selected, device, hip in (
+            ("cute", "cuda:0", None),
+            ("triton", "cpu", None),
+            ("metal", "mps", None),
+            ("triton", "cuda:0", "7.2"),
+        ):
+            with (
+                self.subTest(selected=selected, device=device, hip=hip),
+                mock.patch("torch.version.hip", hip),
+                mock.patch("helion._compat.target_device_capability") as probe,
+                warnings.catch_warnings(record=True) as caught,
+            ):
+                warnings.simplefilter("always")
+                backend_registry.warn_backend_recommendations(
+                    backend_registry.get_backend(selected), torch.device(device)
+                )
+                probe.assert_not_called()
+                self.assertEqual(caught, [])
+
+    def test_compile_environment_checks_selected_backend_and_target(self) -> None:
+        device = torch.device("cpu")
+        with mock.patch(
+            "helion._compiler.compile_environment.warn_backend_recommendations"
+        ) as recommend:
+            env = CompileEnvironment(device, Settings(backend="triton"))
+        recommend.assert_called_once_with(env.backend, device)
 
 
 class TestBackendRegistry(unittest.TestCase):
