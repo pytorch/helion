@@ -56,7 +56,9 @@ at both.
   implementation (Unwritten outputs, below). `--configs-dir RUN/configs`
   also checks each port pinned to the pick of a campaign.
 - `autotune.py`: cold full autotune of one port on one backend; records each
-  kernel's winning `@helion.kernel(...)` decorator.
+  kernel's winning `@helion.kernel(...)` decorator. On the CuTe backend a
+  kernel that the port runs behind earlier kernels is tuned behind them (How
+  a port is tuned, below).
 - `bench.py`: time Inductor (default, coordinate descent, and the options of
   `mode="max-autotune"`; the comparison is against the fastest), the repro's
   hand-written Triton oracle, both Helion backends and a memcopy
@@ -66,18 +68,22 @@ at both.
   a job during which another process computed on its GPU runs again
   (`--retry-contaminated`). `--configs-from` benches another run's picks,
   `--seeds-from` searches from another run's random seeds, `--bench-repeats`
-  benches every point in several fresh processes (Baseline, below), and
-  every search's per-config log is kept under the run's `logs/search`.
+  benches every point in several fresh processes (Baseline, below),
+  `--regime` names one tuning regime for both backends (`alone` tunes every
+  kernel alone as the runs before the port regime did), and every search's
+  per-config log is kept under the run's `logs/search`.
 - `plan_run.py`: plan a campaign from earlier runs' records: every CuTe
   autotune, the Triton autotunes whose earlier records cannot be reused
-  (contaminated, unsampled, or no longer generating the code they were
-  tuned as), every bench, and the GPU-hours they should take.
+  (contaminated, unsampled, tuned in another regime than the run's, or no
+  longer generating the code they were tuned as), every bench, and the
+  GPU-hours they should take.
 - `report.py`: summarize a campaign: geomean, time-weighted and
   model-weighted speedups over Inductor with and without the T5 outlier,
   per-family rows, %SOL, Helion-Triton, and each kernel next to a
   `--baseline` run, with how many of the run's autotunes searched from that
   run's seeds; contaminated and unsampled records are listed and left out
-  of the aggregates.
+  of the aggregates, and a section says how many kernels were tuned behind
+  the earlier kernels of their port.
 - `audit_activity.py`: list a run's records whose activity samples do not
   cover their jobs (no samples, too many failed ones, a long stretch without
   one, or a sampling thread that died), with the numbers it went by.
@@ -109,6 +115,90 @@ an even number of rounds (6 by default). Records made before that took the
 median of 5 cold rounds, a forward-order reading, and the minimum over all
 bb rounds: `report.py --rebalance` recomputes their timings from the
 recorded rounds.
+
+What ran right before a batch matters by implementation, and the two orders
+give an implementation its two listing neighbours as predecessors and no
+other, at two mirror places of the round. Measured on B200s with a test
+build of `bench.py` that ran, after every round, one more in the next order
+of a design in which each implementation takes every place once and runs
+right behind every other one once (a Williams design), on the same inputs,
+with the study's six implementations (the three Inductor compiles, the
+oracle, `helion_cute`, the memcopy) in fresh processes of ten ports:
+
+- no place of a round reads high or low for every implementation: fitted
+  with each implementation's own time and what its predecessor adds, the
+  places differ by at most 0.15 us a call (five ports of 7 to 17 us, 21
+  processes);
+- the batch right behind `helion_cute`'s read higher on three of the seven
+  ports under 33 us, by 0.6 us a call on average over the implementations
+  behind it (pointwise_03afed5ec8e9, var_mean_c3ea8f7ce5c6 and
+  pointwise_04d85912d998: 0.61, 0.67 and 0.62 us in `cold_us`, 0.75, 0.66
+  and 0.45 us in `rot_us`; up to 1.0 us for one implementation), and by
+  less than 0.15 us in `cold_us` and 0.3 us in `rot_us` on the other four.
+  Why those three ports is open: all seven picks load some input with an
+  `l2_last` or `l1_l2_last` hint;
+- `helion_cute`'s own reading follows its place in the round, not what ran
+  before it. Against its mean over the design's six rounds it read, on
+  those three ports, 0.1 to 0.4 us higher in the second place (behind the
+  oracle in the design, behind the memcopy in the listing's reverse
+  rounds: the same within 0.2 us), 0.1 to 0.5 us lower in the fifth
+  (behind `inductor_max` in the design, behind the oracle in the listing's
+  forward rounds: the same within 0.15 us) and 0.4 us lower in the last,
+  behind the memcopy; on pointwise_ef561a2def29 the other way round (0.3
+  to 0.5 us lower second, 0.5 us higher fifth). The listing's two places
+  for it mirror each other, and their mean is within 0.05 us of the mean
+  of the six on all four ports;
+- single rounds of other pairs differ by up to 1 us; a pair has one round
+  of the design, which does not tell its predecessor from its place;
+- `bb_us` shows none of it: every implementation is timed alone there.
+
+In the listing order of `common.ALL_IMPLS`, and in the study's (the same
+without `helion_triton`), what runs right behind a Helion port is the
+memcopy, the oracle or the other port, never an Inductor compile. In the
+study's the port itself runs fifth, behind the oracle, and second, behind
+the memcopy, and its timing comes out as in the balanced rounds of the same
+process, where it takes every place and runs behind every implementation
+once: +0.08 +- 0.13% (the listing's rounds over the balanced ones, 32
+processes of the ten ports, 7 to 130 us; by port from -0.5% to +0.5%, +0.3
+and -0.5% on the first two ports above), so neither those places nor those
+predecessors favour it on average. The fastest Inductor compile over it
+comes out the same as well: -0.33 +- 0.17% (by port from -1.3% to +0.3%). If
+anything the listing's rounds read the ratio lower, so the rounds stay as
+they are, and a ratio that is to compare with the study's keeps that
+listing: an Inductor compile listed next to a Helion port, or a set without
+the oracle between them, puts that compile right behind the port in half its
+rounds. Without the oracle and the memcopy, `inductor_max` read 1.0 and 0.4
+us higher in its reverse rounds on the first two ports above and the ratio
+2% higher (two processes each). A port listed last is followed by the first
+implementation of the order, at the start of the next sample; where the
+round times batches (ports whose fastest implementation takes under 64 us a
+call) the flush-only graph runs between them: `inductor` read 0.08 and 0.25
+us higher in those rounds on the same two ports (two processes each), where
+it read 0.9 and 1.1 us higher right behind the port, and the flush-only
+graph itself took the same time behind the port's batch as behind the
+others'. A longer port is timed replay by replay, each behind a flush of its
+own, so the first implementation follows the port there as any neighbour in
+the order does (what a port leaves was measured on batched ports only, and
+seen on three of 7 to 17 us). `bench.py` records what ran right behind each
+Helion port in the rounds of each order (`behind_helion`), and warns, with
+the compiles named in the record (`carryover_risk`), when a listing puts an
+Inductor compile there or first in an order that the port ends. An aggregate
+of several processes keeps each process's followers
+(`behind_helion_per_process`) and every such compile, and `report.py` lists
+the benches that have one ("Inductor compiles behind a Helion port").
+
+Several Helion ports listed side by side (variants of one port) are not
+interchangeable slots either. One record loaded four times, in the three
+Inductor slots and its own (three ports of 7 to 12 us, 15 processes), read
+1.3 +- 0.3% lower in its own slot than in the other three with these
+rounds, 0.9 +- 0.3% lower with balanced ones and the same with fresh timed
+inputs before every round on top, up to 4% apart across the four slots of
+one port, the same way in 5 of 5 processes. The default Inductor compile
+timed in the same four slots did not (-0.3 +- 0.3% with either rounds). So
+neither the round order nor where the inputs lie decides it, and what does
+is open (`bb_us`, which no predecessor moves, has slot differences too, up
+to 5.6%). Compare variants over several processes, with each variant in
+every slot equally often.
 
 `bench.py` also records `kernel_us`, the device time of the kernels one
 replay launches, from a profile of back-to-back replays (L2-warm), with each
@@ -236,6 +326,153 @@ Throughput is reported against better-benchmark's effective byte count
 (`byte_accounting.count_bytes_effective`: unique inputs read plus outputs
 written).
 
+## How a port is tuned
+
+`autotune.py` runs the port once; every kernel searches at its first call,
+in launch order, on the tensors the port hands it. A search times a
+candidate's own run time after an L2 flush (the Timers above). That is how
+the bench runs a port's first kernel: `cold_us` flushes once, before the
+port. A later kernel runs behind the kernels before it, which have just
+written or read its operands: they are in L2, wholly when they fit (126.5 MiB
+on a B200) and their tail when they do not, and the lines the flush dirtied
+are partly gone. A kernel's tiles and layouts can rank in opposite orders in
+the two states. On pointwise_ef561a2def29 (BatchNorm+ReLU, then a padded 3x3
+max pool over the 12.8 MB it wrote), 19 configs of the pool timed alone and
+timed in the port rank in opposite orders (rank correlation -0.81), and the
+config that reads fastest alone is 10% behind the port's fastest. On
+sum_2ba0992ca00b (column sums over the 201 MB a GELU backward wrote) the
+correlation over 15 configs is -0.58 and the fastest alone is 6% behind.
+
+So a kernel that runs behind earlier kernel calls of its port is tuned behind
+them (`--regime port`, the CuTe backend's default). The search's benchmark
+worker runs those calls, each at the config it was just tuned to and on the
+port's own tensors, between the L2 flush and every timed call of a
+candidate, and hands the candidate what they produced
+(`common.kernels_in_sequence`, through the autotuner's internal
+`helion.autotuner.benchmark_prelude`). The reading stays the candidate's own
+time: an event pair starts after the earlier kernels have run, and the CUDA
+activity trace reads only the kernels behind a marker launched after them.
+Every earlier call is replayed, whether or not its output feeds the kernel,
+because what it read and wrote is in L2 too. The port's first kernel has
+nothing before it and is timed alone.
+
+Measured on a B200 with the CuTe backend (cold searches of the later kernels
+with the campaign's seeds, the first kernels pinned; each port then benched
+in 5 fresh processes with the old and the new picks pinned in the same
+process; `cold_us` against the fastest Inductor compile, median [range]; the
+gain is the old picks' time over the new picks', paired per process):
+
+```text
+point                       later kernels                           picks tuned alone      tuned in the port      gain
+pointwise_ef561a2def29      max_pool_padded                         1.049 [1.039..1.074]   1.138 [1.124..1.156]   1.082 [1.062..1.101]
+sum_2ba0992ca00b            column_partial_sums, sum_partials       0.985 [0.984..1.000]   1.025 [1.024..1.043]   1.040 [1.040..1.044]
+pointwise_b0a24575ebc9      max_pool                                1.024 [1.017..1.034]   1.028 [1.017..1.034]   1.000 [1.000..1.005]
+sum_sum_sum_907cbb3d9f19    sum_gradient_partials, select_scatter   1.295 [1.179..1.309]   1.287 [1.165..1.307]   0.993 [0.986..1.000]
+```
+
+The first port gains 8 to 11%. A bench times every implementation in a slot
+of its own (its own copies of the inputs, its own neighbours in the round
+order), and the slots are not alike for a port this short: its new picks,
+pinned a second time in the same five processes, read 10.53 us where the
+first slot read 10.81 us (gain 1.112 [1.098..1.138] against 1.082). Its
+`rot_us` gains 5.0% [4.0..5.6]. The third port's max pool reads 354 MB, far
+more than L2 holds, and takes 68 us: the two ways of timing pick alike
+there. The fourth port is a control (LayerNorm backward, far above Inductor
+either way), and it loses 0.7%: its new picks read 79.9 us in some rounds
+and 81.9 us in others, one step of the bench's event clock, where the picks
+tuned alone read 79.8 us in every round (the same new picks in a second
+slot: 0.992 [0.987..1.000]). The loss is not explained further.
+
+A second control, amax_sum_sum_c94a0970300f, was measured on an earlier
+revision of the regime, whose final selections did not yet start with the
+sweep of pinned L2 lines (the autotuner's `benchmark_prelude` says why they
+do): level (0.998 [0.996..0.999]). That revision's picks for the control
+above lost 2.5% in the processes of the table (0.975 [0.975..0.975]; 1.4%
+and 3.6% in two more benches). Its final selection picked the scatter
+kernel without evict-last load hints, where the searches alone, and now the
+port regime's, pick them. That is one search each: the difference may be
+the sweep, which keeps one finalist's hinted lines from serving the next
+finalist's window, or the spread between searches.
+
+The readings a search takes behind the earlier kernels rank a kernel's
+configs as the port does, where the readings alone rank them backwards:
+rank correlation +0.83 against -0.81 over 19 configs of the max pool of
+pointwise_ef561a2def29 (the config that reads fastest behind costs the port
+1.9%, the one fastest alone 10.0%; the eight configs of the winning tile
+shape are within 0.2 us of each other in the port), and +0.78 against -0.58
+over 15 configs of the column sums of sum_2ba0992ca00b (0.7% and 6.2%). A
+later kernel that reads only inputs no earlier kernel touched reads alike
+either way: 109.2 us [108.3..111.2] alone and 110.3 us [109.0..111.5] behind
+the three calls before it, six windows each (softmax_dropout_bwd of
+sum_sum_sum_d2c97d17f3dc, over 370 MB).
+
+What the record says, and what follows from it:
+
+- `regime` is the record's (`port`, or `alone`: Triton's default, and
+  either backend's under `--regime alone`), and `regimes` names, per kernel,
+  how its search was timed (`regime`), why (`reason`), the kernels launched
+  before it (`behind`) and, from the search's own final selection, how many
+  earlier calls each timed call ran behind (`prelude_steps`). Every search
+  that has a final selection is held to the kernel call it ran in (the
+  search's metrics name it, `port_call`): one that ran another number of
+  earlier calls than its call was given fails the record. A bench record
+  names the regime of the autotune record it pinned (`autotune_regime`,
+  `autotune_regimes`), and `report.py` counts each backend's kernels of each
+  kind and lists the kernels that a record in the port regime tuned alone
+  (Tuning regime).
+- Triton ports keep the old regime (`alone`) unless `--regime port` is
+  given: a Triton search reads every candidate between two CUDA events,
+  and no Triton port was measured in the port regime (behind earlier
+  kernels such a reading is coarse for a short kernel: the 6 us max pool
+  above read 18 to 19 us in 2 us steps, rank correlation -0.12 with the
+  port). A comparison of the two backends therefore tunes them in
+  different regimes; `--regime` names one for both.
+- A record made before the regime existed names none and counts as `alone`:
+  every one of its kernels was timed alone. It still benches. `plan_run.py`
+  reuses a Triton record of a port with several kernels only for a run
+  whose Triton autotunes run in the record's regime (by default they do:
+  `alone`), and `campaign.py --regime alone` repeats the old regime on
+  both backends for a comparison with an earlier run. Give `plan_run.py`
+  and the campaign of its run the same `--regime`: the plan names the
+  regime it reused Triton records for, and `campaign.py` refuses to run in
+  another.
+- A kernel is tuned alone, with the reason in the record, when it is the
+  port's first call, or when one of its arguments views an earlier kernel's
+  output as another dtype (the sequence follows tensors by their storage,
+  not their bits). So is every kernel after that one: the call that read
+  the view cannot be replayed on what the earlier kernels make. A kernel
+  that `forward` reaches other than through its module-level name is not
+  followed at all: the port regime fails such a record (the kernels after
+  it would be tuned behind preludes without its calls); under `--regime
+  alone` it is tuned as every kernel is and has no entry in `regimes`.
+- A kernel that the port calls several times searches at its first call,
+  behind the calls before that one; its later calls are replayed for the
+  kernels after them.
+- Only kernel calls are replayed. A tensor that host code makes between two
+  kernels (the `torch.sort` of pointwise_59acdb823e92) is a constant of the
+  later kernels' searches: they read it flushed, as they would tuned alone,
+  although the port has just written it, and the record does not tell such
+  an operand from a port input. A buffer the port allocates and an earlier
+  kernel fills is filled again before every timed call.
+- The inputs are the search's for its whole length: a kernel that writes
+  one in place (BatchNorm's running statistics) leaves it written for the
+  next timed call, as the bench's replays of the port do.
+- The port regime needs the searches' default timers: a job environment
+  that sets `HELION_BENCHMARK_CUDAGRAPH=1`, or an L2 regime that does not
+  flush before every call (`HELION_AUTOTUNE_L2_FLUSH`,
+  `HELION_AUTOTUNE_FINAL_L2_FLUSH`, `HELION_AUTOTUNE_TARGET_REGIME`), fails
+  the autotune of a port with several kernels with the autotuner's error.
+  `--regime alone` takes them as before: it gives no search a prelude, so
+  every search is made and timed as it was before the regime existed (two
+  searches from one seed still differ by their readings).
+- The earlier kernels run before every timed call, so a search's wall time
+  grows by their run time per timed call. The searches above took about as
+  long as earlier searches of the same kernels alone: 462 s against 399 s
+  for the max pool of pointwise_ef561a2def29 (440 configs against 346), 616
+  s against 696 s for the two kernels of sum_2ba0992ca00b, 575 s against
+  542 s for the two of sum_sum_sum_907cbb3d9f19, 435 s against 570 s for
+  the max pool of pointwise_b0a24575ebc9.
+
 ## Baseline: several bench processes
 
 One bench process is one sample of a point, of the Inductor side most of
@@ -264,8 +501,10 @@ comparison near parity is about:
   buffers where the allocation order puts them, the CuTe port read 10.65 us
   listed fourth (ratio to Inductor 1.023 [1.023..1.036], three processes)
   and 11.42 us listed second (0.954 [0.952..0.968]). What ran before a
-  kernel is not the cause: the batched graph of each implementation took the
-  same time after every other implementation's (within 0.1 us a call).
+  kernel was not the cause there: the batched graph of each implementation
+  took the same time after every other implementation's (within 0.1 us a
+  call, with the picks of that time; with a later campaign's the batch
+  right behind the port's read up to 1 us higher on this port, see Timers).
   `bench.py` therefore draws the placement: before each implementation's
   timed inputs and before the timers it releases the allocator's cached
   blocks and holds a block of a random number of 2 MiB pages (1 to 128),
@@ -318,6 +557,42 @@ compiles stands for Inductor in that process, and the fastest of them all
 in the others (the report lists such points under "Inductor compiles
 missing from a process"). A process without any compile leaves the point
 without a ratio.
+
+The fastest of several compiles is a minimum of noisy readings, and it reads
+low where the compiles are close: in the processes of one campaign whose
+three compiles ended on the same kernel configs, it read 1.5% under the mean
+of the three for ports under 20 us (19 of 48 processes) and 0.3% for larger
+ones. The ratio above stays the one the goal is stated in. Beside it every
+bench record holds a de-biased baseline for `cold_us` and `rot_us`
+(`fastest_inductor`, `common.fastest_inductor`: the compiles that ended on
+the same code pooled round by round, and the fastest distinct one chosen on
+other rounds than it is timed on; an aggregate holds each process's,
+`fastest_inductor_per_process`; `bb_us`, a minimum over every replay by
+design, has none). Timed against the same compile in a fourth slot of the
+process, the fastest of three slots read 0.60% low and the three pooled
+0.19% high (+- 0.34, 15 processes of three ports of 7 to 12 us); choosing on
+other rounds takes off only what the rounds' noise adds (under a third of it
+there), since a compile's luck in a process holds through its rounds, so
+distinct compiles that are equally fast keep most of the bias. The report
+shows the port's speedup over the de-biased baseline in columns of their own
+(`cute/ind de-biased`, and `cute/ind rot de-biased` beside the `rot_us`
+speedup), with the count of kernels whose two speedups lie more than 0.5%
+apart: 9 of the 62 points of that campaign in `cold_us` (7 of its 16 under
+20 us), by up to 2.3%, all of them upwards, and 4 of 39 in `rot_us`.
+`report.py` takes the figure from the rounds of records made before it was
+stored, and for an aggregate made before from its processes' records while
+they are the ones it was made of (their digests), so such runs show it too.
+A record with a compile that does not name its kernels' configs has none
+(`inductor_configs`: missing in a record made before `bench.py` noted them,
+empty for a compile that launches no Triton kernel): which compiles are one
+code is then unknown, and without the pooling it would keep most of the bias
+under this name. Nor has one whose timings are not the order-balanced ones,
+until `report.py --rebalance` recomputes them: its `cold_us` is another
+statistic of the rounds than the figure. Compiles are one code when their
+kernels' entries agree in all but who found the config, the binary's hash
+in Triton's cache included (`cache_hash`, the same in every process for the
+same code); a record made before its entries named the hash is compared by
+the rest alone.
 
 The ratio of the medians is not that number, and is not used: the fastest
 compile is another one from process to process, so the median of each
@@ -382,6 +657,176 @@ picks (the two U-Net ports, pointwise_457ec7dce9c1 and
 pointwise_87cb1a76ed86, to the picks of a search of their concatenation
 kernel alone). `check_port.py --configs-dir RUN/configs` repeats it for a
 run's picks.
+
+## Other Triton builds: fbtriton and Tile IR
+
+The Inductor side of a bench is whatever the Triton of the bench's
+environment compiles Inductor's kernels to. A baseline is the same benches
+in another environment, with the same Inductor and another Triton build or
+another path through one:
+
+- fbtriton (https://github.com/facebookexperimental/triton) with
+  `TRITON_USE_META_WS=1`, the switch of Meta's warp specialization. It
+  specializes no kernel of the study's 150 points: Inductor marks a loop
+  for it only in its matmul templates, and a compile census of the points'
+  Inductor kernels (529 kernel configs, the switch off and on) finds no
+  warp-specialized loop in either state. There the switch changes the
+  code in substance only for the mix-order reductions of 11 points (ten
+  sum_sum_sum points and sum_sum_2cd99e5eb23e), whose pipelined loop gets
+  a peeled epilogue (1.6 to 2.6 times the instructions); of the other
+  compiles 391 are identical, 125 hold the same instructions in another
+  order and 2 differ in a few instructions. What the baseline shows
+  elsewhere is fbtriton's own code generation, which differs from stock
+  Triton's in every compile of a sample (192 compiles of 51 points);
+- the Triton-to-tile-IR fork (https://github.com/triton-lang/Triton-to-tile-IR)
+  with `ENABLE_TILE=1`, its CUDA Tile IR backend. "Tile IR" in the study
+  is the fork's main (1dd8e2f2: Triton 3.9.0 base, CUDA Tile IR 13.4), not
+  the older pin of Helion's CI (0d9283bf: Triton 3.6 base). Under either,
+  Inductor's kernels compile only with
+  `TORCHINDUCTOR_USE_STATIC_CUDA_LAUNCHER=0` (A baseline run, below), and
+  one of the 150 points has no Tile IR kernel: the SELU kernel of
+  pointwise_b6d762cd3d81 calls `libdevice.expm1`, which the backend does
+  not lower.
+
+Both switches are environment variables that the wrong Triton ignores, and
+Inductor's FX-graph cache does not key on either, so nothing in a timing
+says which compiler made it. The harness therefore records the build and
+refuses to run where the switch cannot hold:
+
+- Every bench record names its Triton (`triton_backend`,
+  `common.triton_backend`): the distribution that provides the `triton`
+  package (`triton`, `fbtriton`, the fork's `triton` or `triton_tileir`;
+  where several claim the package, one installed over another, the one
+  whose record of `libtriton.so` is the installed file's) with its version
+  and commit, the values of the two switches and what the build makes of
+  them (`meta_ws`, `tile`), the other `TRITON_*`, `TILEIR_*` and
+  `TORCHINDUCTOR_*` variables that are set, whether Inductor launches the
+  kernels itself (`static_cuda_launcher`), and a name: `stock`, `fbtriton`,
+  `fbtriton+meta_ws`, `tileir`, or `tileir-fork-ptx` for the fork with its
+  switch off. `versions.triton` is that distribution's version (it was
+  None under fbtriton, whose distribution is not named triton).
+- A bench started with a switch that cannot be in effect ends before it
+  compiles anything, with an error record that says why
+  (`bench.preflight`, `common.check_triton_switches`): `TRITON_USE_META_WS`
+  under a Triton without the knob (`knobs.nvidia.use_meta_ws`: anything but
+  fbtriton), `ENABLE_TILE` or `TRITON_DEFAULT_BACKEND=tileir` under a
+  Triton without a Tile IR backend, or a value the build does not read as
+  on (the fork reads `ENABLE_TILE=1` only). And with Tile IR in effect, by
+  `ENABLE_TILE=1` or by `TRITON_DEFAULT_BACKEND=tileir`, which the fork's
+  main reads first: a missing `tileiras`, or
+  `TRITON_TILEIR_RUNTIME_FALLBACK=1`, which reruns a kernel through PTX
+  when its Tile IR launch raises.
+- Cache directories are one build's and one switch state's
+  (`common.claim_caches`). Triton keys its kernel cache on
+  `TRITON_USE_META_WS` and on the backend, but a run with the switch on
+  that finds the Inductor cache of a run with it off compiles nothing and
+  launches that run's cubins (measured with fbtriton). A bench with a
+  switch in effect takes only directories (`TORCHINDUCTOR_CACHE_DIR`,
+  `TRITON_CACHE_DIR`) that hold no kernels (the launcher modules that a
+  Triton build keeps in its cache, which the fork builds as it is
+  imported, are none) or that benches of the same build, switches and
+  variables filled, and leaves a stamp there (`bb_triton_backend.json`);
+  any bench refuses a directory with another stamp. `campaign.py` gives
+  every job empty directories of its own for Triton, Inductor, Helion, the
+  CuTe DSL and the CUDA compute cache (`campaign.job_env`), whatever the
+  environment names, and passes the switches through; the record lists
+  the two it used (`cache_directories`).
+- The kernels a compile launches are checked once they exist
+  (`common.artifact_issue`): each launcher's entry in `inductor_configs`
+  carries what Triton's cache holds of the binary it launches (`artifact`:
+  the backend it was compiled for, `cuda` or `tileir`; the Triton version
+  that compiled it; the `TRITON_USE_META_WS` it was compiled under, which
+  Triton writes into a kernel's metadata; the kinds of files beside it),
+  and each kernel's entry the Triton build and backend that Inductor
+  generated it for (`backend_hash`, which Inductor writes into a kernel's
+  source: a kernel from its FX-graph cache names the run that filled it).
+  A binary of another Triton, of the PTX path under `ENABLE_TILE=1`, or
+  without the warp-specialization variable under `TRITON_USE_META_WS=1` is
+  an error of that Inductor compile, not a timing. So is the reverse, in
+  a run without a switch (stock Triton, or a baseline's control: fbtriton
+  or the fork with the switch off): a binary compiled through Tile IR or
+  under `TRITON_USE_META_WS`. The Triton version alone does not tell the
+  builds apart, since the fork's main and stock Triton both call
+  themselves 3.9.0 and a kernel's metadata names nothing else; the
+  kernel's `backend_hash` against the process's own
+  (`common.inductor_backend_hash`: Triton's key over its installed files,
+  and the backend's) does. Where the refused compile is the default one,
+  the numerics gate of the process has no anchor, as where the default
+  compile fails: no implementation is judged by the other build's kernel
+  or timed. The default compile is held to this before the gate is first
+  anchored on it, also where a bench's listing leaves `inductor` out or
+  has another implementation before it.
+- A run directory holds the benches of one build and switch state
+  (`<run>/triton_backend.json`, written by the first campaign that benches
+  into it): a campaign started with another one, a restart from a shell
+  without the baseline's environment say, stops before it changes anything.
+  A directory without that file is judged by its bench records: one that
+  names its build (`triton_backend`: a bench by hand, or a run whose file
+  went) must be of the campaign's build and switch state; one that names
+  none was made before records did and is taken for stock Triton's, so
+  only a campaign with stock Triton goes on beside it, not fbtriton or
+  the fork, with the switch or without.
+- These are the guards of `bench.py` and `campaign.py`. The other scripts
+  that compile Inductor's kernels (`check_port.py`, `autotune.py`,
+  `ncu_profile.py`, `inductor_code.py`) have none: under another Triton
+  build or switch, give them cache directories of that build and switch
+  state alone.
+
+### A baseline run
+
+A baseline run benches the picks of a finished (or running) main run in the
+baseline's environment, with nothing autotuned:
+
+```bash
+source BASELINE-env.sh   # the environment's python first on PATH, the switch
+S=benchmarks/cute/better_benchmark
+scripts/gpu_board.py run --gpus $G --purpose "better-benchmark BASELINE" -- \
+    python $S/campaign.py --selection $S/selection.json --run-dir RUN-BASELINE \
+    --backends cute --configs-from RUN/configs --phases bench --bench-repeats 3 \
+    --bench-impls inductor,inductor_cd,inductor_max,oracle,helion_cute,memcopy \
+    --gpus $G
+```
+
+The listing is the main run's, oracle included (the default of
+`--configs-from` with `--backends cute`), so that every implementation is
+timed in the slot and between the neighbours it has in the main run's
+rounds: only the oracle and the memory copy run right behind Helion+CuTe
+there, never an Inductor compile.
+
+The campaign starts its jobs with the interpreter it was started with, from
+the Helion checkout that holds `campaign.py`; use the tree that autotuned
+RUN's picks, so that they generate the code that was measured (each
+record's `code_matches_autotune`). The environment needs:
+
+- a Python the Triton build has a wheel for, and a PyTorch whose Inductor is
+  the main run's (compare `torch/_inductor` of the two; the records name
+  `versions.torch_git`), so that only the Triton compiler differs;
+- the Triton build, and for Tile IR its assembler (`tileiras`, found
+  through `TRITON_TILEIRAS_PATH` or bundled with the fork) and
+  `TORCHINDUCTOR_USE_STATIC_CUDA_LAUNCHER=0`: with Inductor's own launcher
+  every compile fails under `ENABLE_TILE=1` (`'KernelMetadata' object has
+  no attribute 'shared'`), on the fork's main as at the pin of Helion's
+  CI, so the kernels are launched through the fork's launcher;
+- Helion's dependencies (those of `pyproject.toml`) and, for Helion+CuTe
+  in the same process, `nvidia-cutlass-dsl` at the main run's version
+  installed by the steps of `scripts/install_cute.sh`. Helion itself is not
+  installed;
+- the better-benchmark checkout (`BETTER_BENCHMARK_ROOT`).
+
+Where Helion+CuTe cannot run in an environment, bench the same listing
+without the port and without `--configs-from`
+(`--phases bench --bench-impls inductor,inductor_cd,inductor_max,oracle,memcopy`).
+
+A baseline's kernel that fails to compile, or fails the gate, is an error
+or a `FAIL` of that Inductor compile in the record, like any other. Two
+things differ from a stock run. The numerics gate anchors on the process's
+own default Inductor compile, so that compile fails it only where its
+output is not finite where the reference is, whatever else the baseline's
+Triton made of it, and a port is judged against that compile's error. And
+where the default compile does not compile (`libdevice.expm1` has no Tile
+IR lowering: the SELU kernel of pointwise_b6d762cd3d81) or is refused,
+nothing in that process can be gated, so the record has no Helion+CuTe
+timing either.
 
 ## How to reproduce
 

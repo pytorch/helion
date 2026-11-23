@@ -4,6 +4,7 @@ import argparse
 import contextlib
 import gc
 import hashlib
+import importlib.metadata
 import itertools
 import json
 import math
@@ -46,6 +47,7 @@ from torch.utils._python_dispatch import TorchDispatchMode
 import helion
 from helion._testing import DEVICE
 from helion._testing import skipIfNotCUDA
+from helion.autotuner import benchmark_prelude
 from helion.autotuner import benchmarking
 import helion.runtime
 
@@ -1014,7 +1016,7 @@ def tie_order_repro(monkeypatch: pytest.MonkeyPatch) -> list[str]:
     monkeypatch.setattr(common, "flatten_outputs", list)
     monkeypatch.setattr(common, "compile_inductor", compile_inductor)
     monkeypatch.setattr(common, "gpu_info", dict)
-    monkeypatch.setattr(common, "versions", dict)
+    monkeypatch.setattr(common, "versions", lambda triton=None: {})
     monkeypatch.setattr(torch.cuda, "set_device", lambda index: None)
     monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
     return compiles
@@ -1068,7 +1070,7 @@ def test_an_autotune_record_names_the_outputs_it_judged_against_inductor(
         )
         tie_order_repro.clear()
         job = argparse.Namespace(
-            repro_id="r", shape="s", backend="cute", rtol=2e-2, atol=2e-2
+            repro_id="r", shape="s", backend="cute", rtol=2e-2, atol=2e-2, regime=None
         )
         return autotune.run(job)
 
@@ -1133,7 +1135,8 @@ def test_a_bench_record_names_the_outputs_it_judged_against_inductor(
             rotate_inputs=0,
             placement_seed=None,
             fixed_placement=True,
-        )
+        ),
+        None,
     )
     assert record["status"] == "ok" and timed == impls[:4]
     entries = record["impls"]
@@ -1158,6 +1161,177 @@ def test_a_bench_record_names_the_outputs_it_judged_against_inductor(
     # Where each timed implementation's inputs lie: one storage each.
     assert list(placement["timed_inputs"]) == impls[:4]
     assert all(len(addresses) == 1 for addresses in placement["timed_inputs"].values())
+    # What ran right behind the timed port in the rounds of each order: the
+    # oracle, and nothing where the port ends the order: the next sample
+    # starts there, with the default compile.
+    assert record["behind_helion"] == {
+        "forward": {"helion_triton": None},
+        "reverse": {"helion_triton": "oracle"},
+    }
+    assert record["carryover_risk"] == [
+        "inductor behind helion_triton at the start of the next sample in forward rounds"
+    ]
+    # No baseline two ways here: the stand-ins launch no kernel, so which
+    # compiles are one code is not known.
+    assert record["fastest_inductor"] is None
+
+
+def test_only_the_standard_listing_keeps_inductor_from_behind_a_port() -> None:
+    # common.ALL_IMPLS: the memcopy and the oracle follow the ports, and the
+    # two ports each other.
+    listing = list(common.ALL_IMPLS)
+    assert bench.behind_helion(listing) == {
+        "forward": {"helion_triton": "helion_cute", "helion_cute": "memcopy"},
+        "reverse": {"helion_cute": "helion_triton", "helion_triton": "oracle"},
+    }
+    assert bench.carryover_risk(listing) == []
+    study = [*common.INDUCTOR_IMPLS, "oracle", "helion_cute", "memcopy"]
+    assert bench.carryover_risk(study) == []
+    # Without the oracle, or with the port listed among the compiles.
+    assert bench.carryover_risk([*common.INDUCTOR_IMPLS, "helion_cute", "memcopy"]) == [
+        "inductor_max behind helion_cute in reverse rounds"
+    ]
+    assert bench.carryover_risk(["inductor", "helion_cute", "inductor_cd"]) == [
+        "inductor_cd behind helion_cute in forward rounds",
+        "inductor behind helion_cute in reverse rounds",
+    ]
+    # A port that is last in an order has the first of the order behind
+    # it, at the start of the next sample: the study's set without the
+    # memcopy puts the default compile there.
+    assert bench.behind_helion(["helion_cute", "inductor"]) == {
+        "forward": {"helion_cute": "inductor"},
+        "reverse": {"helion_cute": None},
+    }
+    assert bench.carryover_risk(["helion_cute", "inductor"]) == [
+        "inductor behind helion_cute in forward rounds",
+        "inductor behind helion_cute at the start of the next sample in reverse rounds",
+    ]
+    assert bench.carryover_risk([*common.INDUCTOR_IMPLS, "oracle", "helion_cute"]) == [
+        "inductor behind helion_cute at the start of the next sample in forward rounds"
+    ]
+    # Not an Inductor compile there: no risk.
+    assert bench.carryover_risk(["oracle", "inductor", "memcopy", "helion_cute"]) == []
+    assert bench.carryover_risk(["helion_cute"]) == []
+
+
+def test_bench_warns_of_an_inductor_compile_behind_a_port(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    # The study's listing: both fields in the record, nothing to warn of.
+    study = [*common.INDUCTOR_IMPLS, "oracle", "helion_cute", "memcopy"]
+    record: dict[str, Any] = {}
+    bench.note_carryover(record, study)
+    assert record == {
+        "behind_helion": {
+            "forward": {"helion_cute": "memcopy"},
+            "reverse": {"helion_cute": "oracle"},
+        },
+        "carryover_risk": [],
+    }
+    assert capsys.readouterr().err == ""
+    # Without the oracle between them an Inductor compile runs right behind
+    # the port in every round of one order: the record names it, and so
+    # does the log, once.
+    bench.note_carryover(record, [*common.INDUCTOR_IMPLS, "helion_cute", "memcopy"])
+    assert record["behind_helion"]["reverse"] == {"helion_cute": "inductor_max"}
+    assert record["carryover_risk"] == [
+        "inductor_max behind helion_cute in reverse rounds"
+    ]
+    warned = capsys.readouterr().err
+    assert warned.count("[carryover] inductor_max behind helion_cute in reverse") == 1
+    assert "List the oracle between the Inductor compiles and the Helion" in warned
+    # The rounds are over the implementations that were timed: one whose
+    # graph could not be captured is in none, and its neighbours close up.
+    timings = {impl: {"cold_us": 10.0} for impl in study}
+    timings["oracle"] = {"timing_error": "Traceback ..."}
+    timed = bench.timed_implementations(timings)
+    assert timed == [*common.INDUCTOR_IMPLS, "helion_cute", "memcopy"]
+    bench.note_carryover(record, timed)
+    assert record["behind_helion"] == {
+        "forward": {"helion_cute": "memcopy"},
+        "reverse": {"helion_cute": "inductor_max"},
+    }
+    assert record["carryover_risk"] == [
+        "inductor_max behind helion_cute in reverse rounds"
+    ]
+    assert capsys.readouterr().err.count("[carryover]") == 1
+
+
+def test_an_aggregate_keeps_what_ran_behind_a_port(tmp_path: Path) -> None:
+    # Three processes of the study's listing. The second could not capture
+    # its oracle, so there inductor_max ran right behind the port in the
+    # reverse rounds: the aggregate keeps each process's followers and
+    # names the compile.
+    processes = _three_processes(tmp_path)
+    names = list(processes)
+    digests = dict.fromkeys(names, "")
+    study = [*common.INDUCTOR_IMPLS, "oracle", "helion_cute", "memcopy"]
+    whole: dict[str, Any] = {}
+    bench.note_carryover(whole, study)
+    without: dict[str, Any] = {}
+    bench.note_carryover(without, [impl for impl in study if impl != "oracle"])
+    risk = "inductor_max behind helion_cute in reverse rounds"
+    assert whole["carryover_risk"] == [] and without["carryover_risk"] == [risk]
+    for name, fields in zip(names, (whole, without, whole), strict=True):
+        processes[name].update(fields)  # type: ignore[attr-defined]
+    record = common.aggregate_bench_records(processes, digests)  # type: ignore[arg-type]
+    assert record["behind_helion_per_process"] == [
+        whole["behind_helion"],
+        without["behind_helion"],
+        whole["behind_helion"],
+    ]
+    assert "behind_helion" not in record
+    assert record["carryover_risk"] == [risk]
+    # A first process recorded before the fields hides no later one's.
+    del processes[names[0]]["behind_helion"], processes[names[0]]["carryover_risk"]  # type: ignore[attr-defined]
+    record = common.aggregate_bench_records(processes, digests)  # type: ignore[arg-type]
+    assert record["behind_helion_per_process"] == [
+        None,
+        without["behind_helion"],
+        whole["behind_helion"],
+    ]
+    assert record["carryover_risk"] == [risk]
+    # Processes that all predate the fields leave the aggregate without.
+    for name in names[1:]:
+        del processes[name]["behind_helion"], processes[name]["carryover_risk"]  # type: ignore[attr-defined]
+    record = common.aggregate_bench_records(processes, digests)  # type: ignore[arg-type]
+    assert "behind_helion_per_process" not in record
+    assert "carryover_risk" not in record
+
+
+def test_the_report_lists_the_benches_with_a_compile_behind_a_port(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Two points benched in one process each: one with the study's
+    # neighbours, one whose listing put inductor_max right behind the port.
+    run = tmp_path / "run"
+    risk = "inductor_max behind helion_cute in reverse rounds"
+    for shape, risks in (("s1", []), ("s2", [risk])):
+        _toy_bench(
+            run, "sum_000000000001", shape, {"inductor": 50.0, "helion_cute": 25.0}
+        )
+        _toy_tuned(run, "sum_000000000001", shape, "cute")
+        path = common.bench_record_path(run / "bench", "sum_000000000001", shape)
+        record = json.loads(path.read_text())
+        record["carryover_risk"] = risks
+        path.write_text(json.dumps(record))
+    monkeypatch.setattr(sys, "argv", ["report.py", str(run)])
+    report.main()
+    result = json.loads((run / "report.json").read_text())
+    rows = {row["shape"]: row for row in result["rows"]["cold_us"]}
+    assert rows["s1"]["carryover_risk"] == [] and rows["s2"]["carryover_risk"] == [risk]
+    text = (run / "report.md").read_text()
+    assert "## Inductor compiles behind a Helion port\n" in text
+    assert f"\n- sum_000000000001[s2]: {risk}\n" in text
+    assert "- sum_000000000001[s1]:" not in text
+    # A run without such a bench has no such section: records made before
+    # the field, and those of the study's listing.
+    path = common.bench_record_path(run / "bench", "sum_000000000001", "s2")
+    record = json.loads(path.read_text())
+    del record["carryover_risk"]
+    path.write_text(json.dumps(record))
+    report.main()
+    assert "behind a Helion port" not in (run / "report.md").read_text()
 
 
 def _unwritten(
@@ -1460,7 +1634,8 @@ def test_bench_does_not_time_an_implementation_that_skips_part_of_its_output(
             rotate_inputs=0,
             placement_seed=None,
             fixed_placement=True,
-        )
+        ),
+        None,
     )
     assert record["status"] == "ok" and timed == ["helion_triton"]
     entries = record["impls"]
@@ -1496,7 +1671,7 @@ def test_an_autotune_fails_a_pick_that_skips_part_of_its_output(
         monkeypatch.setattr(common, "load_port", load_port)
         filled_memory.clear()
         job = argparse.Namespace(
-            repro_id="r", shape="s", backend="cute", rtol=2e-2, atol=2e-2
+            repro_id="r", shape="s", backend="cute", rtol=2e-2, atol=2e-2, regime=None
         )
         return autotune.run(job)
 
@@ -1506,6 +1681,477 @@ def test_an_autotune_fails_a_pick_that_skips_part_of_its_output(
     assert filled_memory == [common.POISON_BYTE, common.POISON_RECHECK_BYTE]
     record = tuned(slice(0, 0))
     assert record["status"] == "ok" and filled_memory == [common.POISON_BYTE]
+
+
+class _SequencedKernel:
+    """A stand-in for one ``helion.Kernel`` of a port: it records the
+    prelude its call would be tuned behind (the one a search started inside
+    the call reads) and hands out a compiled function of its own."""
+
+    def __init__(
+        self,
+        fn: Callable[..., object],
+        seen: list[tuple[str, benchmark_prelude.BenchmarkPrelude | None]],
+    ) -> None:
+        self.fn = fn
+        self.seen = seen
+        self.compiled = lambda *args: fn(*args)
+        # how often the harness asked for the function the call ran with
+        self.bound = 0
+        # the kernel call the harness named during each call
+        self.calls: list[dict[str, object] | None] = []
+
+    def normalize_args(self, *args: object, **kwargs: object) -> tuple[object, ...]:
+        assert not kwargs
+        return args
+
+    def bind(self, args: tuple[object, ...]) -> types.SimpleNamespace:
+        self.bound += 1
+        return types.SimpleNamespace(compile_config=lambda allow_print: self.compiled)
+
+    def __call__(self, *args: object) -> object:
+        self.seen.append((self.fn.__name__, benchmark_prelude.active_prelude()))
+        # (what a search started here would be noted with)
+        self.calls.append(common.searching_call.get())
+        return self.fn(*args)
+
+
+def _sequenced_port(
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[types.SimpleNamespace, list, dict[str, _SequencedKernel]]:
+    """A port of three kernels: ``partials`` reads the input, ``column_sum``
+    runs twice on views of what it wrote, and ``scale`` reads the input and
+    both sums."""
+    seen: list[tuple[str, benchmark_prelude.BenchmarkPrelude | None]] = []
+
+    def partials(x: torch.Tensor) -> torch.Tensor:
+        return x.reshape(2, 2, 3).sum(dim=1)
+
+    def column_sum(rows: torch.Tensor) -> torch.Tensor:
+        return rows.sum()
+
+    def scale(x: torch.Tensor, first: torch.Tensor, second: torch.Tensor) -> object:
+        return x * (first + second)
+
+    kernels = {
+        fn.__name__: _SequencedKernel(fn, seen) for fn in (partials, column_sum, scale)
+    }
+    port = types.SimpleNamespace(**kernels)
+
+    def forward(inputs: list[torch.Tensor]) -> tuple[object, ...]:
+        (x,) = inputs
+        rows = port.partials(x)
+        return (port.scale(x, port.column_sum(rows[0]), port.column_sum(rows[1])),)
+
+    port.forward = forward
+    monkeypatch.setattr(
+        common,
+        "port_kernels",
+        lambda module: {
+            name: value
+            for name, value in vars(module).items()
+            if isinstance(value, _SequencedKernel)
+        },
+    )
+    return port, seen, kernels
+
+
+def test_a_ports_later_kernels_are_tuned_behind_the_earlier_ones(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    port, seen, kernels = _sequenced_port(monkeypatch)
+    x = torch.arange(12.0)
+    regimes: dict[str, dict[str, object]] = {}
+    with common.kernels_in_sequence(port, "port", regimes):
+        assert port.partials is not kernels["partials"]
+        (out,) = port.forward([x])
+    assert torch.equal(out, x * 66.0)
+    # The block over, the module holds its kernels again.
+    assert {name: getattr(port, name) for name in kernels} == kernels
+    names = [name for name, _prelude in seen]
+    assert names == ["partials", "column_sum", "column_sum", "scale"]
+    preludes = [prelude for _name, prelude in seen]
+    # The port's first kernel call has nothing before it: timed alone.
+    assert preludes[0] is None
+    # Every later call is given the calls before it, at the functions they
+    # ran with, and its own arguments as views of what those calls made.
+    first = preludes[1]
+    assert first is not None
+    assert [step.fn for step in first.steps] == [kernels["partials"].compiled]
+    assert first.steps[0].args == (x,)
+    assert first.args == (benchmark_prelude.PreludeOutput(0, 0, (3,), (1,), 0),)
+    last = preludes[3]
+    assert last is not None
+    assert [step.fn for step in last.steps] == [
+        kernels["partials"].compiled,
+        kernels["column_sum"].compiled,
+        kernels["column_sum"].compiled,
+    ]
+    assert last.steps[2].args == (benchmark_prelude.PreludeOutput(0, 0, (3,), (1,), 3),)
+    assert last.args[0] is x
+    assert last.args[1:] == (
+        benchmark_prelude.PreludeOutput(1, 0, (), (), 0),
+        benchmark_prelude.PreludeOutput(2, 0, (), (), 0),
+    )
+    # Run as the benchmark worker runs it, the prelude hands the kernel
+    # what the port handed it.
+    loaded = last.loaded()
+    loaded.run()
+    assert torch.equal(loaded.timed(kernels["scale"].compiled)(), out)
+    # The record says how each kernel's first call, the one that searches,
+    # was treated.
+    assert regimes == {
+        "partials": {
+            "regime": "alone",
+            "behind": [],
+            "reason": "the port's first kernel call: nothing runs before it",
+        },
+        "column_sum": {
+            "regime": "port",
+            "behind": ["partials"],
+            "reason": "runs behind 1 earlier kernel call(s) of the port",
+        },
+        "scale": {
+            "regime": "port",
+            "behind": ["partials", "column_sum", "column_sum"],
+            "reason": "runs behind 3 earlier kernel call(s) of the port",
+        },
+    }
+    # During every call the harness names it, by the port's name for the
+    # kernel, for the search it may start: also a kernel's second call.
+    assert kernels["partials"].calls == [
+        {"kernel": "partials", "regime": "alone", "behind": 0}
+    ]
+    assert kernels["column_sum"].calls == [
+        {"kernel": "column_sum", "regime": "port", "behind": 1},
+        {"kernel": "column_sum", "regime": "port", "behind": 2},
+    ]
+    assert kernels["scale"].calls == [
+        {"kernel": "scale", "regime": "port", "behind": 3}
+    ]
+    assert common.searching_call.get() is None
+
+
+def test_the_regime_alone_tunes_every_kernel_alone(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    port, seen, kernels = _sequenced_port(monkeypatch)
+    regimes: dict[str, dict[str, object]] = {}
+    with common.kernels_in_sequence(port, "alone", regimes):
+        port.forward([torch.arange(12.0)])
+    assert [prelude for _name, prelude in seen] == [None] * 4
+    assert {name: entry["regime"] for name, entry in regimes.items()} == dict.fromkeys(
+        kernels, "alone"
+    )
+    assert regimes["scale"]["reason"] == "--regime alone"
+    assert regimes["scale"]["behind"] == ["partials", "column_sum", "column_sum"]
+    assert regimes["partials"]["reason"].startswith("the port's first kernel call")
+    assert kernels["scale"].calls == [
+        {"kernel": "scale", "regime": "alone", "behind": 3}
+    ]
+    # Nothing of a call is kept or asked of the kernels: they run and
+    # search as outside the block.
+    assert [kernel.bound for kernel in kernels.values()] == [0, 0, 0]
+    with (
+        pytest.raises(ValueError, match="regime 'resident'"),
+        common.kernels_in_sequence(port, "resident", {}),
+    ):
+        pass
+
+
+def test_a_kernel_without_a_prelude_is_tuned_alone_and_the_port_restored(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    port, seen, kernels = _sequenced_port(monkeypatch)
+
+    def forward(inputs: list[torch.Tensor]) -> object:
+        (x,) = inputs
+        rows = port.partials(x)
+        # A kernel that reads an earlier output as another dtype has no
+        # prelude (the sequence follows tensors, not their bits), and
+        # neither has a kernel after it: that call cannot be replayed.
+        port.column_sum(rows.view(torch.int32))
+        port.scale(x, rows[0, 0], rows[1, 0])
+        raise RuntimeError("the port failed")
+
+    port.forward = forward
+    regimes: dict[str, dict[str, object]] = {}
+    with (
+        pytest.raises(RuntimeError, match="the port failed"),
+        common.kernels_in_sequence(port, "port", regimes),
+    ):
+        port.forward([torch.arange(12.0)])
+    assert seen[1] == ("column_sum", None)
+    assert regimes["column_sum"]["regime"] == "alone"
+    assert str(regimes["column_sum"]["reason"]).startswith(
+        "no prelude: an argument views the torch.float32 output"
+    )
+    assert seen[2] == ("scale", None)
+    assert regimes["scale"]["regime"] == "alone"
+    assert regimes["scale"]["behind"] == ["partials", "column_sum"]
+    assert str(regimes["scale"]["reason"]).startswith(
+        "no prelude: an earlier kernel call read the torch.float32 output"
+    )
+    assert {name: getattr(port, name) for name in kernels} == kernels
+
+
+def test_an_autotune_record_names_how_each_kernel_was_tuned(
+    tie_order_repro: list[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    port, seen, _kernels = _sequenced_port(monkeypatch)
+    monkeypatch.setattr(common, "make_inputs", lambda *args, **kw: [torch.arange(12.0)])
+    monkeypatch.setattr(
+        common,
+        "load_repro_module",
+        lambda repro_id: types.SimpleNamespace(
+            Repro=lambda: lambda x: (x * 66.0,)  # what the port computes
+        ),
+    )
+    monkeypatch.setattr(common, "stochastic_outputs", lambda *args: set())
+    monkeypatch.setattr(common, "inductor_outputs", lambda *args: None)
+    monkeypatch.setattr(common, "load_port", lambda *args, **kwargs: port)
+    monkeypatch.setattr(
+        common, "bound_kernel_records", lambda port: _toy_kernels("cute")
+    )
+    monkeypatch.setattr(common, "pin_roundtrip", lambda port, kernels: {"k": True})
+    monkeypatch.setattr(
+        common,
+        "forward_on_poisoned_memory",
+        lambda port, *args: port.forward([torch.arange(12.0)]),
+    )
+    monkeypatch.setattr(common, "check_written", lambda outputs, rerun: None)
+    hooks: list[Callable[[object], None]] = []
+    monkeypatch.setattr(autotune, "register_post_autotune_hook", hooks.append)
+
+    def tuned(backend: str = "cute", regime: str | None = None) -> dict[str, object]:
+        seen.clear()
+        job = argparse.Namespace(
+            repro_id="r",
+            shape="s",
+            backend=backend,
+            rtol=2e-2,
+            atol=2e-2,
+            regime=regime,
+        )
+        return autotune.run(job)
+
+    # The CuTe backend's default regime: every kernel behind the port's
+    # earlier ones.
+    record = tuned()
+    assert record["status"] == "ok", record.get("error")
+    assert record["regime"] == "port"
+    assert {name: entry["regime"] for name, entry in record["regimes"].items()} == {
+        "partials": "alone",
+        "column_sum": "port",
+        "scale": "port",
+    }
+    assert [prelude is not None for _name, prelude in seen[:4]] == [
+        False,
+        True,
+        True,
+        True,
+    ]
+    # The old one, for a comparison with records made before.
+    record = tuned(regime="alone")
+    assert record["status"] == "ok" and record["regime"] == "alone"
+    assert all(entry["regime"] == "alone" for entry in record["regimes"].values())
+    assert all(prelude is None for _name, prelude in seen)
+    # It is Triton's default (its event-timed searches were not measured
+    # behind earlier kernels), and the flag names one regime for either.
+    assert common.default_regime("cute") == "port"
+    assert common.default_regime("triton") == "alone"
+    assert record["regimes"]["scale"]["reason"] == "--regime alone"
+    triton = tuned(backend="triton")
+    assert triton["status"] == "ok" and triton["regime"] == "alone"
+    assert all(prelude is None for _name, prelude in seen)
+    # (the reason says who chose: no flag was given)
+    assert triton["regimes"]["scale"]["reason"] == (
+        "the triton backend's default regime"
+    )
+    forced = tuned(backend="triton", regime="port")
+    assert forced["regime"] == "port" and seen[1][1] is not None
+    # A bench names the regime of the record it pinned, also of one made
+    # before records named any.
+    fields = common.timed_record_fields(record)
+    assert fields["autotune_regime"] == "alone"
+    assert fields["autotune_regimes"] == dict.fromkeys(record["regimes"], "alone")
+    assert common.record_regime({"kernels": {}}) == "alone"
+    # A kernel that forward runs other than through its name in the port's
+    # module is not followed: the kernels after it would be tuned behind
+    # preludes without its calls, so the port regime fails the record.
+    toy = _toy_kernels("cute")["k"]
+    monkeypatch.setattr(
+        common,
+        "bound_kernel_records",
+        lambda port: dict.fromkeys(("partials", "column_sum", "scale"), toy),
+    )
+    assert tuned()["status"] == "ok"
+    aliased = port.partials
+
+    def forward(inputs: list[torch.Tensor]) -> tuple[object, ...]:
+        (x,) = inputs
+        rows = aliased(x)
+        return (port.scale(x, port.column_sum(rows[0]), port.column_sum(rows[1])),)
+
+    port.forward = forward
+    failed = tuned()
+    assert failed["status"] == "error"
+    assert "forward ran ['partials'] other than through" in failed["error"]
+    # (tuned alone, nothing depends on the calls before a kernel)
+    assert tuned(regime="alone")["status"] == "ok"
+
+
+def test_a_search_must_have_run_the_prelude_its_call_was_given() -> None:
+    def regimes() -> dict[str, dict[str, object]]:
+        return {
+            "first": {"regime": "alone", "behind": []},
+            "second": {"regime": "port", "behind": ["first"]},
+            "third": {"regime": "alone", "behind": ["first", "second"]},
+        }
+
+    def metrics(
+        kernel: str, regime: str, behind: int, **selection: object
+    ) -> dict[str, object]:
+        # A search's metrics name its kernel by its function, which several
+        # kernels of a port may share; ``port_call`` is the call it ran in.
+        return {
+            "kernel_name": "_shared_function",
+            "port_call": {"kernel": kernel, "regime": regime, "behind": behind},
+            "final_selection": selection,
+        }
+
+    # What each search's final selection says it ran between the flush and
+    # the timed calls goes into the record ...
+    searched = autotune.searched_regimes(
+        regimes(),
+        [
+            metrics("first", "alone", 0, rounds=4),
+            metrics("second", "port", 1, prelude_steps=1),
+            # (no final selection: a quick search, or too few finalists)
+            {**metrics("third", "alone", 2), "final_selection": None},
+            # (a search outside the port's forward names no call)
+            {"kernel_name": "elsewhere", "final_selection": {"prelude_steps": 2}},
+        ],
+    )
+    assert searched["first"]["prelude_steps"] == 0
+    assert searched["second"]["prelude_steps"] == 1
+    assert "prelude_steps" not in searched["third"]
+    # ... and a search that ran another prelude than its call was given, or
+    # none, fails the record.
+    with pytest.raises(RuntimeError, match="second was to be tuned behind 1"):
+        autotune.searched_regimes(regimes(), [metrics("second", "port", 1, rounds=4)])
+    with pytest.raises(RuntimeError, match="third was to be tuned behind 0"):
+        autotune.searched_regimes(
+            regimes(), [metrics("third", "alone", 2, prelude_steps=2)]
+        )
+    # Every search is held to its own call. A kernel called with a second
+    # signature searches again, behind more calls, whether or not its first
+    # search had a final selection; the entry keeps the first count.
+    for first in ({"prelude_steps": 1}, None):
+        searched = autotune.searched_regimes(
+            regimes(),
+            [
+                {**metrics("second", "port", 1), "final_selection": first},
+                metrics("second", "port", 3, prelude_steps=3),
+            ],
+        )
+        assert searched["second"]["prelude_steps"] == (1 if first else 3)
+    with pytest.raises(RuntimeError, match="second was to be tuned behind 3"):
+        autotune.searched_regimes(
+            regimes(),
+            [
+                metrics("second", "port", 1, prelude_steps=1),
+                metrics("second", "port", 3, prelude_steps=1),
+            ],
+        )
+
+
+def test_the_report_says_how_the_runs_kernels_were_tuned() -> None:
+    def record(
+        point: str, backend: str = "cute", **fields: object
+    ) -> dict[str, object]:
+        return {
+            "repro": point,
+            "shape": "s",
+            "backend": backend,
+            "kernels": {"a": {}, "b": {}},
+            **fields,
+        }
+
+    behind = {"regime": "port", "behind": ["a"], "reason": "runs behind 1"}
+    alone = {"regime": "alone", "behind": [], "reason": "first"}
+    refused = {"regime": "alone", "behind": ["a"], "reason": "no prelude: a view"}
+    default = {
+        "regime": "alone",
+        "behind": ["a"],
+        "reason": "the triton backend's default regime",
+    }
+    found = report.tuning_regimes(
+        [
+            record("p1", regime="port", regimes={"a": alone, "b": behind}),
+            record("p2", regime="port", regimes={"a": alone, "b": refused}),
+            # a record made before autotune.py named a regime
+            record("p3"),
+            record("p4", provisional=True),
+            # a Triton record in its backend's default regime: every later
+            # kernel is tuned alone, which is the record's regime and no
+            # exception within it
+            record("p1", "triton", regime="alone", regimes={"a": alone, "b": default}),
+        ]
+    )
+    assert found == {
+        "records": {"cute": {"port": 2, "alone": 1}, "triton": {"alone": 1}},
+        "kernels": {
+            "cute": {"port": 1, "alone": 3, "unrecorded": 2},
+            "triton": {"port": 0, "alone": 2, "unrecorded": 0},
+        },
+        "later_alone": {"p2__s__cute.b": "no prelude: a view"},
+    }
+    text = "\n".join(report.tuning_regime_lines(found))
+    assert "## Tuning regime" in text
+    assert (
+        "- cute: 1 record(s) `alone`, 2 record(s) `port`. Kernels: 1 tuned behind"
+        in text
+    )
+    assert "2 in records that name no regime (tuned alone)" in text
+    assert "- triton: 1 record(s) `alone`. Kernels: 0 tuned behind" in text
+    assert "- p2__s__cute.b: no prelude: a view" in text
+    assert "triton.b" not in text
+    assert report.tuning_regime_lines(report.tuning_regimes([])) == []
+
+
+def test_a_run_plan_reuses_a_several_kernel_record_only_in_its_regime(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(common, "activity_issue", lambda record, reuse: None)
+
+    def reason(
+        kernels: int, regime: str | None, tuned: str | None = None
+    ) -> str | None:
+        record: dict[str, object] = {"kernels": dict.fromkeys(range(kernels))}
+        if tuned is not None:
+            record["regime"] = tuned
+        return plan_run.triton_reuse(
+            Path("unused"),
+            record,
+            reuse_unsampled=False,
+            pin_check=False,
+            regime=regime,
+        )
+
+    # (with the pin check off every record is autotuned: the reason given
+    # is the first that holds)
+    unchecked = "pinned code not checked"
+    assert reason(2, "port") == "tuned in the regime 'alone', not 'port'"
+    assert reason(2, "port", tuned="port") == unchecked
+    assert reason(2, "alone") == unchecked
+    assert reason(2, "alone", tuned="port") == "tuned in the regime 'port', not 'alone'"
+    # A port with one kernel is tuned alone in every regime.
+    assert reason(1, "port") == unchecked
+    # Unnamed, the run's Triton autotunes run in Triton's default regime,
+    # alone: the records of earlier runs stand.
+    assert reason(2, None) == unchecked
+    assert reason(2, None, tuned="port") == "tuned in the regime 'port', not 'alone'"
 
 
 def test_a_call_that_takes_fresh_memory_runs_again_or_cannot_be_judged(
@@ -1764,19 +2410,54 @@ def _triton_kernel(
         if tuned:
             config.found_by_coordesc = True
         launchers.append(
-            types.SimpleNamespace(config=config, n_regs=40, n_spills=0, shared=512)
+            types.SimpleNamespace(
+                config=config,
+                n_regs=40,
+                n_spills=0,
+                shared=512,
+                cache_hash=f"{name}-{len(launchers)}".upper(),
+            )
         )
     return types.SimpleNamespace(
         inductor_meta=meta,
+        triton_meta={"device": 0},
         fn=types.SimpleNamespace(__name__=name),
         launchers=launchers,
     )
 
 
-def test_a_bench_record_names_the_config_each_inductor_kernel_ended_on() -> None:
+def _toy_triton_cache(
+    cache: Path, key: str, name: str, backend: str = "cuda", **metadata: str
+) -> None:
+    """An entry of a Triton cache directory as ``triton.compile`` leaves it:
+    the kernel's metadata, its group file and a file per stage."""
+    entry = cache / key
+    entry.mkdir(parents=True)
+    target = {"backend": backend, "arch": 100, "warp_size": 32}
+    (entry / f"{name}.json").write_text(json.dumps({"target": target, **metadata}))
+    (entry / f"__grp__{name}.json").write_text(json.dumps({"child_paths": {}}))
+    for kind in (
+        ("ttir", "tileir", "cubin") if backend == "tileir" else ("ptx", "cubin")
+    ):
+        (entry / f"{name}.{kind}").write_text("")
+
+
+def test_a_bench_record_names_the_config_each_inductor_kernel_ended_on(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The binary behind the first kernel's launcher, in Triton's cache; the
+    # cache holds none of the others'.
+    monkeypatch.setenv("TRITON_CACHE_DIR", str(tmp_path))
+    _toy_triton_cache(
+        tmp_path, "TRITON_POI_0-0", "triton_poi_fused_add_0", triton_version="3.9.0"
+    )
     pointwise = _triton_kernel(
         "triton_poi_0",
-        {"kernel_name": "triton_poi_fused_add_0", "grid_type": "Grid1D"},
+        {
+            "kernel_name": "triton_poi_fused_add_0",
+            "grid_type": "Grid1D",
+            "backend_hash": "37875C9E2A70",
+        },
         ({"XBLOCK": 2048}, 2, True),
     )
     # A mix-order reduction: its split size is a block size of the config
@@ -1795,6 +2476,8 @@ def test_a_bench_record_names_the_config_each_inductor_kernel_ended_on() -> None
     assert first == {
         "name": "triton_poi_fused_add_0",
         "grid_type": "Grid1D",
+        # The Triton build and backend Inductor generated the kernel for.
+        "backend_hash": "37875C9E2A70",
         "block_sizes": {"XBLOCK": 2048},
         "num_warps": 2,
         "num_stages": 1,
@@ -1802,7 +2485,16 @@ def test_a_bench_record_names_the_config_each_inductor_kernel_ended_on() -> None
         "n_regs": 40,
         "n_spills": 0,
         "shared": 512,
+        "artifact": {
+            "backend": "cuda",
+            "triton_version": "3.9.0",
+            "meta_ws": None,
+            "kinds": ["cubin", "ptx"],
+        },
+        # The binary's name in Triton's cache.
+        "cache_hash": "TRITON_POI_0-0",
     }
+    assert second["artifact"] is None and second["backend_hash"] is None
     assert second["name"] == "triton_per_1" and second["rsplit_size"] == 16
     assert second["block_sizes"]["RSPLIT_SIZE"] == 16
     assert second["num_warps"] == 8 and not second["found_by_coordesc"]
@@ -1970,12 +2662,12 @@ def test_bench_draws_a_fresh_placement_unless_told(
 
     monkeypatch.setattr(bench, "Placement", Placement)
     monkeypatch.setattr(common, "gpu_info", dict)
-    monkeypatch.setattr(common, "versions", dict)
+    monkeypatch.setattr(common, "versions", lambda triton=None: {})
 
     def run(**placement: object) -> None:
         args = argparse.Namespace(repro_id="r", shape="s", impls="", **placement)
         with pytest.raises(RuntimeError, match="stop here"):
-            bench.run(args)
+            bench.run(args, None)
 
     run(placement_seed=None, fixed_placement=True)
     run(placement_seed=11, fixed_placement=False)
@@ -2385,6 +3077,182 @@ def test_order_balanced_averages_each_orders_statistic() -> None:
     assert common.order_balanced([4.0], statistics.median) == (4.0, [4.0])
 
 
+def _compile(
+    rounds: list[float], xblock: int = 1, **fields: object
+) -> dict[str, object]:
+    """An Inductor compile's entry in a bench record: its cold rounds, the
+    timing bench.py takes of them, and the config of its one kernel."""
+    return {
+        "status": "ok",
+        "numerics_pass": True,
+        "inductor_configs": [
+            {"name": "k", "block_sizes": {"XBLOCK": xblock}, "num_warps": 1}
+        ],
+        "cold_us": common.order_balanced(rounds, statistics.median)[0],
+        "cold_order_medians_us": common.order_balanced(rounds, statistics.median)[1],
+        "cold_runs_us": rounds,
+        **fields,
+    }
+
+
+def test_debiased_fastest_chooses_on_other_rounds_than_it_times() -> None:
+    steady = [10.0] * 6
+    # One candidate: its own value, bench.py's statistic of the rounds.
+    assert common.debiased_fastest([[9.8, 10.4, 10.0, 10.2, 10.2, 10.6]]) == (
+        pytest.approx(10.2)
+    )
+    # A candidate that two pairs of rounds read fastest and the third slow:
+    # the minimum of the two values is its 9.5, but the rounds that choose
+    # it are not the rounds that time it.
+    lucky = [9.5, 9.5, 9.5, 9.5, 12.0, 12.0]
+    assert common.order_balanced(lucky, statistics.median)[0] == 9.5
+    assert common.debiased_fastest([steady, lucky]) == pytest.approx(10.0)
+    assert common.debiased_fastest([lucky, steady]) == pytest.approx(10.0)
+    # A candidate that every round reads faster is the fastest either way.
+    faster = [9.0, 9.2, 9.0, 9.2, 9.0, 9.2]
+    assert common.debiased_fastest([steady, faster]) == pytest.approx(9.1)
+    # Rounds for a single pair: nothing to choose on, the fastest's value.
+    assert common.debiased_fastest([[10.0, 10.0], [9.0, 9.4]]) == pytest.approx(9.2)
+
+
+def test_fastest_inductor_pools_the_compiles_that_ended_on_one_code() -> None:
+    # Three compiles of one code, 10 us in every round but for 0.2 us of
+    # noise that falls elsewhere for each: the fastest reads 9.8, the three
+    # together 10.
+    impls = {
+        "inductor": _compile([9.8, 9.8, 10.0, 10.0, 10.2, 10.2]),
+        "inductor_cd": _compile(
+            [10.2, 10.2, 10.4, 10.4, 10.0, 10.0],
+            inductor_configs=[
+                {
+                    "name": "k",
+                    "block_sizes": {"XBLOCK": 1},
+                    "num_warps": 1,
+                    # Who found a config does not make it another code.
+                    "found_by_coordesc": True,
+                }
+            ],
+        ),
+        "inductor_max": _compile([10.0, 10.0, 9.6, 9.6, 9.8, 9.8]),
+        "helion_cute": {"status": "ok", "cold_us": 10.0, "cold_runs_us": [10.0] * 6},
+    }
+    assert [impls[impl]["cold_us"] for impl in common.INDUCTOR_IMPLS] == [
+        pytest.approx(value) for value in (10.0, 10.2, 9.8)
+    ]
+    assert common.fastest_inductor(impls) == {
+        "same_code": [["inductor", "inductor_cd", "inductor_max"]],
+        "cold_us": {"headline": pytest.approx(9.8), "debiased": pytest.approx(10.0)},
+    }
+    # Another code is another candidate; the two of one code stay pooled.
+    impls["inductor_cd"] = _compile([9.0] * 6, xblock=2)
+    assert common.fastest_inductor(impls) == {
+        "same_code": [["inductor", "inductor_max"], ["inductor_cd"]],
+        "cold_us": {"headline": pytest.approx(9.0), "debiased": pytest.approx(9.0)},
+    }
+    # A compile that failed its gate is no baseline, as in the headline.
+    impls["inductor_cd"]["numerics_pass"] = False
+    assert common.fastest_inductor(impls) == {
+        "same_code": [["inductor", "inductor_max"]],
+        "cold_us": {"headline": pytest.approx(9.8), "debiased": pytest.approx(9.9)},
+    }
+    # Both cold timers, where the compiles have them; one that only some
+    # of them have is of those, as its headline is. bb_us, a minimum by
+    # design, gets no such figure.
+    for impl, bb in (("inductor", [14.0, 14.4] * 3), ("inductor_max", [14.2] * 6)):
+        impls[impl].update(bb_us=min(bb), bb_runs_us=bb, bb_order_mins_us=[min(bb)] * 2)
+    rot = {
+        "rot_us": 11.0,
+        "rot_runs_us": [11.0] * 6,
+        "rot_order_medians_us": [11.0] * 2,
+    }
+    impls["inductor"].update(rot)
+    found = common.fastest_inductor(impls)
+    assert found is not None and sorted(found) == ["cold_us", "rot_us", "same_code"]
+    assert found["rot_us"] == {"headline": 11.0, "debiased": 11.0}
+    for field in rot:
+        del impls["inductor"][field]
+    # A compile without a finite, positive timing is not among those the
+    # headline is the fastest of, nor here.
+    lost = {
+        "inductor": _compile([10.0] * 6),
+        "inductor_cd": _compile([9.0] * 6, xblock=2, cold_us=math.inf),
+    }
+    assert common.fastest_inductor(lost) == {
+        "same_code": [["inductor"], ["inductor_cd"]],
+        "cold_us": {"headline": 10.0, "debiased": 10.0},
+    }
+    # A record made before the order-balanced timings: its cold_us is the
+    # median of five rounds, another statistic than the figure's, so it has
+    # none until its timings are recomputed (report.py --rebalance).
+    rounds = [10.0, 11.0, 10.0, 11.0, 10.0]
+    legacy: dict[str, Any] = {
+        "repro": "sum_000000000001",
+        "shape": "s1",
+        "impls": {
+            "inductor": _compile(rounds, cold_us=statistics.median(rounds)),
+            "helion_cute": {"status": "ok", "cold_us": 10.0, "cold_runs_us": rounds},
+        },
+    }
+    del legacy["impls"]["inductor"]["cold_order_medians_us"]
+    assert common.fastest_inductor(legacy["impls"]) == {"same_code": [["inductor"]]}
+    assert report.summarize(legacy, "cold_us")["cute_vs_inductor_debiased"] is None
+    rebalanced = report.rebalance(legacy)
+    assert rebalanced["impls"]["helion_cute"]["cold_us"] == 10.5
+    assert common.fastest_inductor(rebalanced["impls"]) == {
+        "same_code": [["inductor"]],
+        "cold_us": {"headline": 10.5, "debiased": 10.5},
+    }
+    assert report.summarize(rebalanced, "cold_us")["cute_vs_inductor_debiased"] == 1.0
+    # Compiles that do not name their kernels' configs (records made before
+    # bench.py noted them): which are one code is unknown, and without the
+    # pooling the figure would keep most of the bias, so there is none.
+    del impls["inductor_max"]["inductor_configs"]
+    assert common.fastest_inductor(impls) is None
+    impls["inductor_max"]["inductor_configs"] = []
+    assert common.fastest_inductor(impls) is None
+    # No usable compile, no baseline.
+    assert common.fastest_inductor({"helion_cute": impls["helion_cute"]}) is None
+
+
+def test_fastest_inductor_holds_two_binaries_apart_by_their_hash() -> None:
+    # Three compiles whose kernels agree in all that a record said of them
+    # before it named each binary (cache_hash, Triton's hash of what it
+    # compiled): such a record's compiles are one code, as before.
+    rounds = {
+        "inductor": [9.8, 9.8, 10.0, 10.0, 10.2, 10.2],
+        "inductor_cd": [10.2, 10.2, 10.4, 10.4, 10.0, 10.0],
+        "inductor_max": [10.0, 10.0, 9.6, 9.6, 9.8, 9.8],
+    }
+    kernel = {"name": "k", "block_sizes": {"XBLOCK": 1}, "num_warps": 1, "n_regs": 40}
+
+    def found(**hashes: str) -> dict[str, Any] | None:
+        return common.fastest_inductor(
+            {
+                impl: _compile(
+                    readings,
+                    inductor_configs=[
+                        {**kernel, "cache_hash": hashes[impl]} if hashes else kernel
+                    ],
+                )
+                for impl, readings in rounds.items()
+            }
+        )
+
+    pooled = {
+        "same_code": [["inductor", "inductor_cd", "inductor_max"]],
+        "cold_us": {"headline": pytest.approx(9.8), "debiased": pytest.approx(10.0)},
+    }
+    assert found() == pooled
+    # One binary under the three compiles is one code as well.
+    assert found(inductor="A", inductor_cd="A", inductor_max="A") == pooled
+    # Another binary with the same config and resource counts is another
+    # candidate: its timings are not averaged with the other two's.
+    assert found(inductor="A", inductor_cd="A", inductor_max="B") == {
+        "same_code": [["inductor", "inductor_cd"], ["inductor_max"]],
+        "cold_us": {"headline": pytest.approx(9.8), "debiased": pytest.approx(9.8)},
+    }
+
+
 def test_bench_takes_only_positive_even_round_counts(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -2520,7 +3388,7 @@ def test_bench_rotates_inputs_only_on_request(
     timed = {"status": "ok", "bb_us": 12.0, "cold_us": 9.5}
     seen: list[tuple[int, float]] = []
 
-    def run(args: object) -> dict[str, object]:
+    def run(args: object, backend: object) -> dict[str, object]:
         count = args.rotate_inputs  # pyrefly: ignore[missing-attribute]
         seen.append((count, args.rotate_max_l2))  # pyrefly: ignore[missing-attribute]
         record: dict[str, object] = {
@@ -2536,6 +3404,8 @@ def test_bench_rotates_inputs_only_on_request(
         return record
 
     monkeypatch.setattr(bench, "run", run)
+    # The checks before a bench compiles have tests of their own.
+    monkeypatch.setattr(bench, "preflight", lambda backend: {})
     monkeypatch.setenv("BB_FOREIGN_ACTIVITY", "0")
     out = tmp_path / "record.json"
     argv = ["bench.py", "r", "--configs-dir", "c", "--output", str(out)]
@@ -2548,6 +3418,7 @@ def test_bench_rotates_inputs_only_on_request(
         "shape": "s1",
         "impls": {"inductor": timed, "oracle": {"status": "error"}},
         "foreign_gpu_activity": None,
+        "cache_directories": {},
     }
     monkeypatch.setattr(sys, "argv", [*argv, "--rotate-inputs", "8"])
     bench.main()
@@ -2558,6 +3429,600 @@ def test_bench_rotates_inputs_only_on_request(
     bench.main()
     assert capsys.readouterr().out == summary + "rot_us skipped: too large\n"
     assert seen == [(0, bench.ROTATE_MAX_L2_MULTIPLE), (8, 2.0), (4, 1.0)]
+
+
+def _toy_backend(name: str = "stock", **fields: object) -> dict[str, object]:
+    """What ``common.triton_backend`` says of a Triton build: stock Triton,
+    ``fbtriton`` (with ``+meta_ws``: its switch in effect) or the Tile IR
+    fork (``tileir``; ``tileir-fork-ptx`` with its switch off)."""
+    fbtriton = name.startswith("fbtriton")
+    fork = name.startswith("tileir")
+    version = "3.9.0.dev20261113+fb.git305df91c" if fbtriton else "3.9.0"
+    backend: dict[str, object] = {
+        "name": name,
+        "distribution": "fbtriton" if fbtriton else "triton",
+        "distribution_version": version.split("+")[0] + ("" if fbtriton else "+gitb7d"),
+        "version": version,
+        "switches": {
+            "TRITON_USE_META_WS": "1" if name == "fbtriton+meta_ws" else None,
+            "ENABLE_TILE": "1" if name == "tileir" else None,
+        },
+        "has_meta_ws": fbtriton,
+        "meta_ws": name == "fbtriton+meta_ws",
+        "has_tileir": fork,
+        "tile": name == "tileir",
+        "tileiras": sys.executable if fork else None,
+        "tileiras_error": None,
+        "environment": {},
+        "static_cuda_launcher": not fork,
+    }
+    backend.update(fields)
+    return backend
+
+
+def _switches(monkeypatch: pytest.MonkeyPatch, **values: str) -> None:
+    """Only these of the switch variables in the environment."""
+    others = ("TRITON_TILEIR_RUNTIME_FALLBACK", "TRITON_DEFAULT_BACKEND")
+    for name in (*common.TRITON_SWITCHES, *others):
+        monkeypatch.delenv(name, raising=False)
+    for name, value in values.items():
+        monkeypatch.setenv(name, value)
+
+
+def test_a_switch_that_cannot_be_in_effect_stops_the_run(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # No switch asked for: any build passes, also none at all. A spelling
+    # of off asks for nothing.
+    _switches(monkeypatch)
+    for backend in (None, _toy_backend(), _toy_backend("fbtriton")):
+        common.check_triton_switches(backend)
+    _switches(monkeypatch, TRITON_USE_META_WS="0", ENABLE_TILE="false")
+    common.check_triton_switches(_toy_backend())
+    # Meta's warp specialization: only fbtriton has the knob. Stock Triton
+    # and the Tile IR fork would compile as without the variable.
+    _switches(monkeypatch, TRITON_USE_META_WS="1")
+    common.check_triton_switches(_toy_backend("fbtriton+meta_ws"))
+    with pytest.raises(common.TritonSwitchError, match="no Triton is installed"):
+        common.check_triton_switches(None)
+    for backend in (_toy_backend(), _toy_backend("tileir-fork-ptx")):
+        with pytest.raises(
+            common.TritonSwitchError,
+            match="TRITON_USE_META_WS=1 is set.*no Meta warp specialization",
+        ):
+            common.check_triton_switches(backend)
+    with pytest.raises(common.TritonSwitchError, match="does not read that value"):
+        common.check_triton_switches(_toy_backend("fbtriton"))
+    # Tile IR: only the fork has the backend, it reads ENABLE_TILE=1 alone,
+    # needs its assembler, and must not fall back to PTX at launch.
+    _switches(monkeypatch, ENABLE_TILE="1")
+    common.check_triton_switches(_toy_backend("tileir"))
+    for backend in (_toy_backend(), _toy_backend("fbtriton")):
+        with pytest.raises(common.TritonSwitchError, match="no Tile IR backend"):
+            common.check_triton_switches(backend)
+    with pytest.raises(common.TritonSwitchError, match="assembler is missing"):
+        common.check_triton_switches(_toy_backend("tileir", tileiras=None))
+    with pytest.raises(common.TritonSwitchError, match="assembler is missing"):
+        common.check_triton_switches(_toy_backend("tileir", tileiras="/no/tileiras"))
+    monkeypatch.setenv("TRITON_TILEIR_RUNTIME_FALLBACK", "1")
+    with pytest.raises(common.TritonSwitchError, match="through PTX instead"):
+        common.check_triton_switches(_toy_backend("tileir"))
+    _switches(monkeypatch, ENABLE_TILE="true")
+    with pytest.raises(common.TritonSwitchError, match="does not select its Tile"):
+        common.check_triton_switches(_toy_backend("tileir-fork-ptx"))
+    # Tile IR in effect without ENABLE_TILE (the fork's main reads
+    # TRITON_DEFAULT_BACKEND first): the same two checks of a run through it.
+    _switches(monkeypatch)
+    monkeypatch.setenv("TRITON_DEFAULT_BACKEND", "tileir")
+    common.check_triton_switches(_toy_backend("tileir"))
+    lost = _toy_backend("tileir", tileiras=None, tileiras_error="tileiras not found")
+    with pytest.raises(
+        common.TritonSwitchError,
+        match=r"in effect \(TRITON_DEFAULT_BACKEND=tileir\).*tileiras not found",
+    ):
+        common.check_triton_switches(lost)
+    monkeypatch.setenv("TRITON_TILEIR_RUNTIME_FALLBACK", "1")
+    with pytest.raises(common.TritonSwitchError, match="through PTX instead"):
+        common.check_triton_switches(_toy_backend("tileir"))
+    # The fork with its backend not selected is not held to them.
+    common.check_triton_switches(_toy_backend("tileir-fork-ptx", tileiras=None))
+    # A build without the backend has nothing to select.
+    for backend in (_toy_backend(), _toy_backend("fbtriton")):
+        with pytest.raises(
+            common.TritonSwitchError, match="no Tile IR backend to select"
+        ):
+            common.check_triton_switches(backend)
+
+
+def test_the_record_names_the_distribution_that_provides_triton(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    triton = pytest.importorskip("triton")
+    backend = common.triton_backend()
+    assert backend is not None and backend["version"] == triton.__version__
+    assert backend["distribution"] in backend["distributions"]
+    assert common.versions()["triton"] == backend["distribution_version"]
+    assert set(backend["switches"]) == set(common.TRITON_SWITCHES)
+    assert not any(name.endswith("_CACHE_DIR") for name in backend["environment"])
+    assert common.triton_identity(backend)["name"] == backend["name"]
+    # fbtriton installed over the triton that torch requires: both
+    # distributions claim the package. Where neither records the size of
+    # its library, the version tells whose it is.
+    versions = {"triton": "3.9.0+gitb7ddcf86", "fbtriton": "3.9.0.dev20261113"}
+    monkeypatch.setattr(
+        importlib.metadata,
+        "packages_distributions",
+        lambda: {"triton": ["triton", "fbtriton", "triton"]},
+    )
+    monkeypatch.setattr(importlib.metadata, "version", versions.__getitem__)
+    monkeypatch.setattr(importlib.metadata, "files", lambda name: None)
+    monkeypatch.setattr(triton, "__version__", "3.9.0.dev20261113+fb.git305df91c")
+    backend = common.triton_backend()
+    assert backend is not None and backend["distributions"] == versions
+    assert backend["distribution"] == "fbtriton"
+    assert backend["distribution_version"] == "3.9.0.dev20261113"
+    assert backend["commit"] == "305df91c"
+    # The fork's main as triton_tileir over that triton: both versions
+    # start triton.__version__, 3.9.0, alike, and the one whose record of
+    # the library is the installed file's size is the build, whichever
+    # was installed last.
+    library = tmp_path / "libtriton.so"
+    sizes = {"triton": 5, "triton_tileir": 9}
+    versions = {"triton": "3.9.0+gitb7ddcf86", "triton_tileir": "3.9.0+git1dd8e2f2"}
+
+    def files(name: str) -> list[types.SimpleNamespace]:
+        other = types.SimpleNamespace(name="__init__.py", size=1, locate=lambda: "")
+        recorded = types.SimpleNamespace(
+            name="libtriton.so", size=sizes[name], locate=lambda: str(library)
+        )
+        return [other, recorded]
+
+    monkeypatch.setattr(importlib.metadata, "files", files)
+    monkeypatch.setattr(importlib.metadata, "version", versions.__getitem__)
+    monkeypatch.setattr(triton, "__version__", "3.9.0")
+    for order in (["triton", "triton_tileir"], ["triton_tileir", "triton"]):
+        monkeypatch.setattr(
+            importlib.metadata,
+            "packages_distributions",
+            lambda order=order: {"triton": order},
+        )
+        for installed, commit in (
+            ("triton_tileir", "1dd8e2f2"),
+            ("triton", "b7ddcf86"),
+        ):
+            library.write_bytes(b"x" * sizes[installed])
+            backend = common.triton_backend()
+            assert backend is not None and backend["distribution"] == installed
+            assert backend["distribution_version"] == versions[installed]
+            assert backend["commit"] == commit
+            assert common.triton_identity(backend)["distribution"] == installed
+    # The fork's main names itself triton_tileir; stock Triton's version
+    # carries the commit only in the distribution's.
+    versions = {"triton_tileir": "3.9.0+git1dd8e2f2"}
+    monkeypatch.setattr(
+        importlib.metadata, "packages_distributions", lambda: {"triton": [*versions]}
+    )
+    monkeypatch.setattr(importlib.metadata, "version", versions.__getitem__)
+    monkeypatch.setattr(triton, "__version__", "3.9.0")
+    backend = common.triton_backend()
+    assert backend is not None and backend["distribution"] == "triton_tileir"
+    assert backend["commit"] == "1dd8e2f2"
+
+
+def test_a_switched_run_takes_only_cache_directories_of_its_own(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    inductor, triton_cache = tmp_path / "inductor", tmp_path / "triton"
+    monkeypatch.setenv("TORCHINDUCTOR_CACHE_DIR", str(inductor))
+    monkeypatch.setenv("TRITON_CACHE_DIR", str(triton_cache))
+    directories = {
+        "TORCHINDUCTOR_CACHE_DIR": str(inductor),
+        "TRITON_CACHE_DIR": str(triton_cache),
+    }
+    stamps = [inductor / common.CACHE_STAMP, triton_cache / common.CACHE_STAMP]
+    # A run without a switch leaves no stamp, in empty directories or in
+    # ones it has filled.
+    assert common.claim_caches(_toy_backend("fbtriton")) == directories
+    assert not inductor.exists() and not triton_cache.exists()
+    (inductor / "fxgraph").mkdir(parents=True)
+    assert common.claim_caches(_toy_backend("fbtriton")) == directories
+    assert not any(stamp.exists() for stamp in stamps)
+    # A run with the switch on would be handed that run's cubins by
+    # Inductor's FX-graph cache: it takes no directory it cannot tell.
+    switched = _toy_backend("fbtriton+meta_ws")
+    with pytest.raises(common.TritonSwitchError, match="TORCHINDUCTOR_CACHE_DIR"):
+        common.claim_caches(switched)
+    (inductor / "fxgraph").rmdir()
+    # So with a kernel in Triton's cache; the launcher modules that a Triton
+    # build leaves there as it is imported are no kernels. The bench that is
+    # refused leaves no stamp in the Inductor directory, which it could have
+    # taken: a run without the switch still goes there.
+    (triton_cache / "DRIVER").mkdir(parents=True)
+    (triton_cache / "DRIVER" / "tileir_utils.so").write_text("")
+    _toy_triton_cache(triton_cache, "KEY", "k")
+    with pytest.raises(common.TritonSwitchError, match="TRITON_CACHE_DIR"):
+        common.claim_caches(switched)
+    assert not any(stamp.exists() for stamp in stamps)
+    assert common.claim_caches(_toy_backend("fbtriton")) == directories
+    for path in sorted((triton_cache / "KEY").iterdir()):
+        path.unlink()
+    (triton_cache / "KEY").rmdir()
+    assert common.claim_caches(switched) == directories
+    identity = common.triton_identity(switched)
+    assert [json.loads(stamp.read_text()) for stamp in stamps] == [identity] * 2
+    # Its own directories again, filled: the same build and switch state.
+    (inductor / "fxgraph").mkdir()
+    _toy_triton_cache(triton_cache, "KEY", "k")
+    assert common.claim_caches(switched) == directories
+    # Any other build or switch state is refused there, switched or not.
+    for other in ("fbtriton", "stock", "tileir"):
+        with pytest.raises(common.TritonSwitchError, match="another Triton build"):
+            common.claim_caches(_toy_backend(other))
+    with pytest.raises(common.TritonSwitchError, match="another Triton build"):
+        common.claim_caches(
+            _toy_backend("fbtriton+meta_ws", environment={"TRITON_DEBUG": "1"})
+        )
+    # Without TRITON_CACHE_DIR Inductor keeps Triton's cache inside its own.
+    monkeypatch.delenv("TRITON_CACHE_DIR")
+    assert common.claim_caches(switched) == {"TORCHINDUCTOR_CACHE_DIR": str(inductor)}
+    nested = tmp_path / "nested"
+    monkeypatch.setenv("TORCHINDUCTOR_CACHE_DIR", str(nested))
+    (nested / "triton" / "0" / "DRIVER").mkdir(parents=True)
+    (nested / "triton" / "0" / "DRIVER" / "cuda_utils.so").write_text("")
+    common.claim_caches(_toy_backend("tileir"))
+    (nested / common.CACHE_STAMP).unlink()
+    _toy_triton_cache(nested / "triton" / "0", "KEY", "k")
+    with pytest.raises(common.TritonSwitchError, match="names no Triton build"):
+        common.claim_caches(_toy_backend("tileir"))
+    # Benches started at once on one fresh directory: a process leaves its
+    # stamp only where none stands, and is held against the one that does.
+    raced = tmp_path / "raced"
+    monkeypatch.setenv("TORCHINDUCTOR_CACHE_DIR", str(raced))
+    # (The file that another process is leaving its stamp from is no kernel.)
+    raced.mkdir()
+    beside_file = raced / f"{common.CACHE_STAMP}.1.tmp"
+    beside_file.write_text("{")
+    common.claim_caches(_toy_backend("tileir"))
+    beside_file.unlink()
+    (raced / common.CACHE_STAMP).unlink()
+    left: list[dict[str, object] | None] = []
+
+    def beside(variable: str, path: Path) -> bool:
+        """Another process leaves its stamp while this one looks."""
+        path.mkdir(parents=True, exist_ok=True)
+        (path / common.CACHE_STAMP).write_text(json.dumps(left[-1]))
+        return False
+
+    monkeypatch.setattr(common, "_holds_kernels", beside)
+    left.append(common.triton_identity(_toy_backend("tileir")))
+    common.claim_caches(_toy_backend("tileir"))
+    (raced / common.CACHE_STAMP).unlink()
+    left.append(identity)
+    with pytest.raises(common.TritonSwitchError, match="another Triton build"):
+        common.claim_caches(_toy_backend("tileir"))
+    assert json.loads((raced / common.CACHE_STAMP).read_text()) == identity
+    assert [entry.name for entry in raced.iterdir()] == [common.CACHE_STAMP]
+
+
+def test_a_launched_kernel_must_be_the_builds_own_through_its_switch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # What Triton's cache holds of four launched binaries: fbtriton's with
+    # and without its switch, a Tile IR kernel and stock Triton's.
+    fb = "3.9.0.dev20261113+fb.git305df91c"
+    monkeypatch.setenv("TRITON_CACHE_DIR", str(tmp_path))
+    _toy_triton_cache(
+        tmp_path, "WS1", "k", triton_version=fb, TRITON_USE_META_WS="true"
+    )
+    _toy_triton_cache(tmp_path, "WS0", "k", triton_version=fb)
+    _toy_triton_cache(tmp_path, "TILE", "k", backend="tileir", triton_version="3.9.0")
+    _toy_triton_cache(tmp_path, "PTX", "k", triton_version="3.9.0")
+    assert common.compiled_artifact(0, "WS1") == {
+        "backend": "cuda",
+        "triton_version": fb,
+        "meta_ws": "true",
+        "kinds": ["cubin", "ptx"],
+    }
+    assert common.compiled_artifact(0, "TILE") == {
+        "backend": "tileir",
+        "triton_version": "3.9.0",
+        "meta_ws": None,
+        "kinds": ["cubin", "tileir", "ttir"],
+    }
+    assert common.compiled_artifact(0, "ABSENT") is None
+
+    def launched(*keys: str) -> list[dict[str, object]]:
+        """A compile's kernels by the cache keys of their binaries; the
+        last has not settled on one launcher."""
+        configs = [
+            {"name": f"triton_{key}", "artifact": common.compiled_artifact(0, key)}
+            for key in keys
+        ]
+        *settled, last = configs
+        return [*settled, {"name": last["name"], "launchers": [last]}]
+
+    switched, off = _toy_backend("fbtriton+meta_ws"), _toy_backend("fbtriton")
+    tile, ptx = _toy_backend("tileir"), _toy_backend("tileir-fork-ptx")
+    stock = _toy_backend()
+    assert common.artifact_issue(None, launched("WS0")) is None
+    assert common.artifact_issue(switched, []) is None
+    for backend, keys in (
+        (switched, ("WS1", "WS1")),
+        (off, ("WS0", "WS0")),
+        (tile, ("TILE",)),
+        (ptx, ("PTX",)),
+        (stock, ("PTX", "ABSENT")),
+    ):
+        assert common.artifact_issue(backend, launched(*keys)) is None
+    # The cached kernel of a run without the switch, as Inductor's
+    # FX-graph cache hands it back; of another Triton; of the PTX path.
+    assert "without TRITON_USE_META_WS" in common.artifact_issue(
+        switched, launched("WS1", "WS0")
+    )
+    assert "Triton 3.9.0 compiled" in common.artifact_issue(switched, launched("PTX"))
+    assert f"Triton {fb} compiled" in common.artifact_issue(stock, launched("WS0"))
+    assert "not through Tile IR" in common.artifact_issue(tile, launched("PTX"))
+    # The other way round: a run without a switch, stock Triton or the
+    # control of a baseline, that launches a kernel compiled under one.
+    assert "compiled under TRITON_USE_META_WS=true, which is not in effect" in (
+        common.artifact_issue(off, launched("WS0", "WS1"))
+    )
+    for backend in (ptx, stock):
+        issue = common.artifact_issue(backend, launched("PTX", "TILE"))
+        assert issue is not None and issue.startswith(
+            "triton_TILE launches a binary compiled through Tile IR, and "
+            "ENABLE_TILE is not in effect"
+        )
+    # With a switch in effect, a binary the cache cannot tell is no proof.
+    for backend in (switched, tile):
+        issue = common.artifact_issue(backend, launched("ABSENT"))
+        assert issue is not None and "holds no metadata" in issue
+    # Stock Triton 3.9.0 and the Tile IR fork's main both call themselves
+    # 3.9.0, and Triton's metadata of a kernel names no other version: the
+    # build is told by Inductor's hash of it, which every kernel it
+    # generates carries and this process computes for its own.
+    ours, theirs = "A" * 64, "B" * 64
+    asked: list[str] = []
+    monkeypatch.setattr(
+        common, "inductor_backend_hash", lambda: asked.append(ours) or ours
+    )
+
+    def generated(*hashes: str | None) -> list[dict[str, object]]:
+        return [
+            {"backend_hash": named, **kernel}
+            for named, kernel in zip(hashes, launched("PTX", "PTX"), strict=True)
+        ]
+
+    for backend in (stock, ptx):
+        assert common.artifact_issue(backend, generated(ours, ours)) is None
+        issue = common.artifact_issue(backend, generated(ours, theirs))
+        assert issue == (
+            "triton_PTX was generated for another Triton build or backend than "
+            "this process's triton 3.9.0+gitb7d (Inductor's backend_hash "
+            "BBBBBBBBBBBB, here AAAAAAAAAAAA)"
+        )
+    # A kernel of an Inductor that names no build is not compared, and the
+    # process's own is asked (of the device's driver) only for one that does.
+    assert common.artifact_issue(stock, generated(None, ours)) is None
+    asked.clear()
+    assert common.artifact_issue(stock, generated(None, None)) is None
+    assert common.artifact_issue(stock, launched("PTX")) is None and not asked
+
+
+def test_a_compile_that_launches_another_switch_states_kernel_is_not_timed(
+    tie_order_repro: list[str], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # fbtriton with its switch on, in a process whose coordinate-descent
+    # compile came back from Inductor's cache with the binary of a run
+    # without the switch: that compile is an error, the default one counts.
+    # Its max-autotune compile came back with a kernel that Inductor
+    # generated for another Triton build: an error as well.
+    fb = "3.9.0.dev20261113+fb.git305df91c"
+    compiled = {"backend": "cuda", "triton_version": fb, "kinds": ["cubin", "ptx"]}
+    ours = "5DC21BC92D29" + "0" * 52
+    kernels = [
+        {"backend_hash": ours, "artifact": {**compiled, "meta_ws": "true"}},
+        {"backend_hash": ours, "artifact": {**compiled, "meta_ws": None}},
+        {"backend_hash": "37875C9E2A70", "artifact": {**compiled, "meta_ws": "true"}},
+    ]
+    monkeypatch.setattr(
+        common,
+        "inductor_kernel_configs",
+        lambda launched: [{"name": "triton_k", **kernels.pop(0)}],
+    )
+    monkeypatch.setattr(common, "inductor_backend_hash", lambda: ours)
+    accounting = types.SimpleNamespace(count_bytes_effective=lambda *args: 24)
+    monkeypatch.setitem(sys.modules, "byte_accounting", accounting)
+    monkeypatch.setattr(bench, "_replayed", lambda call, fresh_inputs: call)
+    monkeypatch.setattr(common, "foreign_gpu_processes", list)
+    monkeypatch.setattr(common, "gpu_temperature", lambda: None)
+    timed: list[str] = []
+
+    def time_impls(
+        fns: dict[str, Callable[[], object]], **rounds: int
+    ) -> dict[str, dict[str, float]]:
+        timed.extend(fns)
+        return {impl: {"bb_us": 2.0, "cold_us": 1.0} for impl in fns}
+
+    monkeypatch.setattr(bench, "time_impls", time_impls)
+    args = argparse.Namespace(
+        repro_id="r",
+        shape="s",
+        impls="inductor,inductor_cd,inductor_max",
+        configs_dir=tmp_path,
+        rounds=2,
+        rep_ms=1,
+        cold_rounds=2,
+        rotate_inputs=0,
+        placement_seed=None,
+        fixed_placement=True,
+    )
+    record = bench.run(args, _toy_backend("fbtriton+meta_ws"))
+    assert record["status"] == "ok" and timed == ["inductor"]
+    assert record["triton_backend"]["name"] == "fbtriton+meta_ws"
+    entries = record["impls"]
+    assert entries["inductor"]["status"] == "ok"
+    assert entries["inductor"]["inductor_configs"][0]["artifact"]["meta_ws"] == "true"
+    tuned = entries["inductor_cd"]
+    assert tuned["status"] == "error" and "cold_us" not in tuned
+    assert (
+        tuned["error"]
+        .rstrip()
+        .endswith(
+            "TritonSwitchError: triton_k launches a binary compiled without "
+            "TRITON_USE_META_WS"
+        )
+    )
+    # The entry still names what it launched.
+    assert tuned["inductor_configs"][0]["artifact"]["meta_ws"] is None
+    foreign = entries["inductor_max"]
+    assert foreign["status"] == "error" and "cold_us" not in foreign
+    assert (
+        foreign["error"]
+        .rstrip()
+        .endswith(
+            "TritonSwitchError: triton_k was generated for another Triton build "
+            "or backend than this process's fbtriton 3.9.0.dev20261113 "
+            "(Inductor's backend_hash 37875C9E2A70, here 5DC21BC92D29)"
+        )
+    )
+    assert foreign["inductor_configs"][0]["backend_hash"] == "37875C9E2A70"
+    # A default compile that is refused anchors nothing: the compile after
+    # it launches its own build's kernel and is not judged by the other
+    # switch state's, so nothing of the process is timed.
+    kernels[:] = [
+        {"backend_hash": ours, "artifact": {**compiled, "meta_ws": None}},
+        {"backend_hash": ours, "artifact": {**compiled, "meta_ws": "true"}},
+    ]
+    timed.clear()
+    args.impls = "inductor,inductor_cd"
+    entries = bench.run(args, _toy_backend("fbtriton+meta_ws"))["impls"]
+    assert timed == [] and entries["inductor"]["status"] == "error"
+    after = entries["inductor_cd"]
+    assert after["status"] == "error" and "cold_us" not in after
+    assert after["inductor_configs"][0]["artifact"]["meta_ws"] == "true"
+    assert (
+        after["error"]
+        .rstrip()
+        .endswith(
+            "TritonSwitchError: the numerics gate has no anchor: the default "
+            "Inductor compile was refused (triton_k launches a binary compiled "
+            "without TRITON_USE_META_WS)"
+        )
+    )
+    # The anchor is held to its build before the gate is first built on
+    # it, whatever the listing: with the default compile left out, or
+    # listed behind the compile that needs the gate first. The tuned
+    # compile's own kernel is this build's each time.
+    no_anchor = after["error"].rstrip().splitlines()[-1]
+    for listing in ("inductor_cd", "inductor_cd,inductor"):
+        kernels[:] = [
+            {"backend_hash": ours, "artifact": {**compiled, "meta_ws": "true"}},
+            {"backend_hash": ours, "artifact": {**compiled, "meta_ws": None}},
+            {"backend_hash": ours, "artifact": {**compiled, "meta_ws": None}},
+        ]
+        timed.clear()
+        args.impls = listing
+        entries = bench.run(args, _toy_backend("fbtriton+meta_ws"))["impls"]
+        assert timed == [] and list(entries) == listing.split(",")
+        assert entries["inductor_cd"]["status"] == "error"
+        assert entries["inductor_cd"]["error"].rstrip().splitlines()[-1] == no_anchor
+        if "inductor" in entries:
+            assert (
+                entries["inductor"]["error"]
+                .rstrip()
+                .endswith(
+                    "TritonSwitchError: triton_k launches a binary compiled without "
+                    "TRITON_USE_META_WS"
+                )
+            )
+    # An anchor of this build: the compile is judged by it and timed.
+    kernels[:] = [
+        {"backend_hash": ours, "artifact": {**compiled, "meta_ws": "true"}}
+    ] * 2
+    timed.clear()
+    args.impls = "inductor_cd"
+    entries = bench.run(args, _toy_backend("fbtriton+meta_ws"))["impls"]
+    assert timed == ["inductor_cd"] and entries["inductor_cd"]["status"] == "ok"
+    assert kernels == []
+
+
+def test_a_bench_fails_before_it_compiles_when_its_switch_cannot_hold(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    # TRITON_USE_META_WS=1 with stock Triton installed: the bench would
+    # time stock kernels as fbtriton's. It ends before run, with a record
+    # that says why it has no timings.
+    _switches(monkeypatch, TRITON_USE_META_WS="1")
+    monkeypatch.setattr(common, "triton_backend", _toy_backend)
+    monkeypatch.setattr(common, "versions", lambda triton=None: {})
+    monkeypatch.setattr(common, "gpu_info", lambda: {"uuid": "GPU-a"})
+    monkeypatch.setattr(
+        bench, "run", lambda args, backend: pytest.fail("the bench ran")
+    )
+    monkeypatch.setenv("TORCHINDUCTOR_CACHE_DIR", str(tmp_path / "inductor"))
+    out = tmp_path / "record.json"
+    argv = [
+        "bench.py",
+        "r",
+        "--shape",
+        "s1",
+        "--configs-dir",
+        "c",
+        "--output",
+        str(out),
+    ]
+    monkeypatch.setattr(sys, "argv", argv)
+    with pytest.raises(SystemExit) as exit_info:
+        bench.main()
+    assert exit_info.value.code == 1
+    record = json.loads(out.read_text())
+    assert record["status"] == "error" and record["impls"] == {}
+    assert (record["repro"], record["shape"]) == ("r", "s1")
+    assert record["gpu"] == {"uuid": "GPU-a"} and record["versions"] == {}
+    assert record["error"].startswith("TritonSwitchError: TRITON_USE_META_WS=1 is set")
+    assert record["triton_backend"]["name"] == "stock"
+    assert "no Meta warp specialization" in capsys.readouterr().err
+    # Without --shape the record names the point a bench would have run.
+    monkeypatch.setattr(common, "default_shape", lambda repro: f"{repro}-default")
+    monkeypatch.setattr(sys, "argv", [*argv[:2], *argv[4:]])
+    with pytest.raises(SystemExit):
+        bench.main()
+    assert json.loads(out.read_text())["shape"] == "r-default"
+    monkeypatch.setattr(sys, "argv", argv)
+    # So does a bench in a cache directory that another switch state filled.
+    monkeypatch.setattr(
+        common, "triton_backend", lambda: _toy_backend("fbtriton+meta_ws")
+    )
+    (tmp_path / "inductor" / "fxgraph").mkdir(parents=True)
+    with pytest.raises(SystemExit):
+        bench.main()
+    assert "is not empty" in json.loads(out.read_text())["error"]
+    # In directories of its own it runs, and the record names them. The
+    # build is asked once, and the run gets what the checks went by.
+    (tmp_path / "inductor" / "fxgraph").rmdir()
+    asked: list[dict[str, object]] = []
+    ran: list[object] = []
+
+    def triton_backend() -> dict[str, object]:
+        asked.append(_toy_backend("fbtriton+meta_ws"))
+        return asked[-1]
+
+    def run(args: object, backend: object) -> dict[str, object]:
+        ran.append(backend)
+        return {"status": "ok", "shape": "s1", "impls": {}}
+
+    monkeypatch.setattr(common, "triton_backend", triton_backend)
+    monkeypatch.setattr(bench, "run", run)
+    monkeypatch.setenv("BB_FOREIGN_ACTIVITY", "0")
+    monkeypatch.delenv("TRITON_CACHE_DIR", raising=False)
+    bench.main()
+    assert json.loads(out.read_text())["cache_directories"] == {
+        "TORCHINDUCTOR_CACHE_DIR": str(tmp_path / "inductor")
+    }
+    assert len(asked) == 1 and ran[0] is asked[0]
 
 
 # A B200: ``torch.cuda.get_device_properties(0).L2_cache_size`` and its
@@ -2893,6 +4358,9 @@ def test_a_ports_bench_entry_names_its_autotune_record_before_the_port_loads(
         "autotune_code_sha256": {"k": "cute-1"},
         "autotune_provisional": False,
         "autotune_reused_from": None,
+        # (a record made before autotune.py named a regime: tuned alone)
+        "autotune_regime": "alone",
+        "autotune_regimes": {},
     }
     info: dict[str, object] = {"status": "error"}
     with pytest.raises(helion.exc.InvalidConfig):
@@ -3268,11 +4736,27 @@ def _stub_campaign(
     gpu_uuid: Callable[[str], str | None] | None = None,
     busy_uuids: Callable[[], set[str] | None] | None = None,
     gpu_source: tuple[str, ...] = ("--gpus", "0,1"),
+    triton: str | None = "stock",
+    switches: dict[str, str] | None = None,
 ) -> tuple[Path, list[dict[str, object]]]:
     """Run ``campaign.py`` with stub jobs on GPUs 0 and 1 (or ``gpu_source``)
     into ``tmp_path / "run"`` (nvidia-smi stubbed: each GPU's UUID
     ``GPU-<i>`` and none busy, unless ``gpu_uuid`` and ``busy_uuids`` say
-    otherwise); the run directory and this run's events."""
+    otherwise); the run directory and this run's events.
+
+    The campaign sees the Triton build ``triton`` (a ``_toy_backend`` by
+    name; None for an environment without a Triton) and that build's
+    switches in the environment, or ``switches``: what the lane's own
+    environment sets (``ENABLE_TILE=1`` on CI's Tile IR job) does not make
+    a toy run directory a baseline's."""
+    build = None if triton is None else _toy_backend(triton)
+    monkeypatch.setattr(common, "triton_backend", lambda: build)
+    if switches is None:
+        asked = (
+            {} if build is None else cast("dict[str, str | None]", build["switches"])
+        )
+        switches = {name: value for name, value in asked.items() if value}
+    _switches(monkeypatch, **switches)
     jobs = tmp_path / "jobs"
     jobs.mkdir(exist_ok=True)
     for script in ("autotune.py", "bench.py"):
@@ -3605,6 +5089,7 @@ def test_a_run_plan_reuses_clean_triton_records_whose_pinned_code_holds(
     calls: list[str] = []
     monkeypatch.setattr(plan_run, "pinned_code_matches", _toy_pins(calls))
     result = plan_run.plan(selection, [run5, run3])
+    assert result["triton_regime"] == "alone"
     assert result["reuse"] == [
         {
             "repro": "sum_000000000001",
@@ -3649,6 +5134,8 @@ def test_a_run_plan_reuses_clean_triton_records_whose_pinned_code_holds(
     calls.clear()
     result = plan_run.plan(selection, [run5, run3], pin_check=False)
     assert result["reuse"] == [] and calls == []
+    named = plan_run.plan(selection, [run5, run3], pin_check=False, regime="port")
+    assert named["triton_regime"] == "port" and calls == []
     reasons = [
         job["reason"] for job in result["autotune"] if job["backend"] == "triton"
     ]
@@ -3739,6 +5226,34 @@ def test_a_campaign_on_a_written_plan_runs_exactly_its_jobs(
     )
     started = [event["job"] for event in events if event["kind"] == "job_start"]
     assert sorted(started) == sorted(expected) and len(started) == 17
+    # The plan names the regime it reused Triton records for (unnamed:
+    # Triton's default), and a campaign that would tune Triton ports in
+    # another one is refused: the copies would stand for the wrong regime.
+    assert planned["triton_regime"] == "alone"
+    with pytest.raises(SystemExit):
+        _stub_campaign(
+            tmp_path,
+            monkeypatch,
+            {},
+            "--regime",
+            "port",
+            kernels=selection["kernels"],
+            backends="cute,triton",
+        )
+    assert "reused earlier Triton records for the regime 'alone'" in (
+        capsys.readouterr().err
+    )
+    # (a campaign that tunes no Triton port takes any regime: the CuTe
+    # phase of a run planned in two phases)
+    _stub_campaign(
+        tmp_path,
+        monkeypatch,
+        {},
+        "--regime",
+        "port",
+        kernels=selection["kernels"],
+        backends="cute",
+    )
     # Planning into it again would leave the copies standing for jobs.
     monkeypatch.setattr(sys, "argv", argv)
     with pytest.raises(SystemExit):
@@ -3796,6 +5311,174 @@ def test_a_campaign_on_another_runs_picks_only_benches(
             "bench",
         )
     assert "this run's own configs" in capsys.readouterr().err
+
+
+def test_a_campaigns_jobs_inherit_the_switch_and_get_caches_of_their_own(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A baseline's environment script exports the switch and names cache
+    # directories; every job compiles under the switch, in its own.
+    _switches(monkeypatch, TRITON_USE_META_WS="1")
+    monkeypatch.setenv("TRITON_CACHE_DIR", "/shared/triton")
+    monkeypatch.setenv("TORCHINDUCTOR_CACHE_DIR", "/shared/inductor")
+    monkeypatch.setenv("TORCHINDUCTOR_USE_STATIC_CUDA_LAUNCHER", "0")
+    monkeypatch.setenv("HELION_BACKEND", "tileir")
+    env = campaign.job_env("3", tmp_path, 7, "marker")
+    assert env["TRITON_USE_META_WS"] == "1"
+    assert env["TORCHINDUCTOR_USE_STATIC_CUDA_LAUNCHER"] == "0"
+    assert env["TRITON_CACHE_DIR"] == str(tmp_path / "triton")
+    assert env["TORCHINDUCTOR_CACHE_DIR"] == str(tmp_path / "inductor")
+    assert "HELION_BACKEND" not in env and env["CUDA_VISIBLE_DEVICES"] == "3"
+
+
+@pytest.mark.slow
+@_requires_proc
+def test_a_baseline_run_keeps_a_run_directory_to_one_triton_build(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # The main run's CuTe pick, benched again under fbtriton with its
+    # switch on, in two processes, into a run directory of its own.
+    main = tmp_path / "main"
+    _toy_tuned(main, "sum_000000000001", "s1", "cute")
+    impls = "inductor,inductor_cd,inductor_max,helion_cute,memcopy"
+    flags = ("--configs-from", str(main / "configs"), "--phases", "bench")
+    flags += ("--bench-repeats", "2", "--bench-impls", impls)
+
+    def baseline(triton: str) -> tuple[Path, list[dict[str, object]]]:
+        return _stub_campaign(
+            tmp_path, monkeypatch, {}, *flags, backends="cute", triton=triton
+        )
+
+    run, events = baseline("fbtriton+meta_ws")
+    start = next(e for e in events if e["kind"] == "campaign_start")
+    assert start["triton_backend"]["name"] == "fbtriton+meta_ws"
+    assert start["python"] == sys.executable
+    stamp = run / campaign.RUN_BACKEND
+    assert json.loads(stamp.read_text()) == common.triton_identity(
+        _toy_backend("fbtriton+meta_ws")
+    )
+    aggregate = json.loads((run / "bench" / "sum_000000000001__s1.json").read_text())
+    assert list(aggregate["impls"]) == impls.split(",")
+    assert aggregate["impls"]["helion_cute"]["status"] == "ok"
+    kept = {path: path.stat().st_mtime_ns for path in run.rglob("*") if path.is_file()}
+    # Started again in that environment, nothing is left to run.
+    _, events = baseline("fbtriton+meta_ws")
+    assert not [e for e in events if e["kind"] == "job_start"]
+    # Started again from a shell without the baseline's environment (stock
+    # Triton, no switch), or with the switch off, it would add stock
+    # records to the baseline's: it stops before it changes anything.
+    for other in ("stock", "fbtriton"):
+        with pytest.raises(SystemExit):
+            baseline(other)
+        assert "another Triton build or switch state" in capsys.readouterr().err
+    events_log = run / "campaign.jsonl"
+    assert {
+        path: path.stat().st_mtime_ns
+        for path in run.rglob("*")
+        if path.is_file() and path != events_log
+    } == {path: mtime for path, mtime in kept.items() if path != events_log}
+    # A campaign of another build that started in a fresh directory beside
+    # this one left its stamp first: this one stops, and that stamp stands.
+    (tmp_path / "raced").mkdir()
+    theirs = common.triton_identity(_toy_backend("stock"))
+    leave = common.leave_stamp
+
+    def beside(stamp: Path, identity: dict[str, object]) -> None:
+        leave(stamp, theirs)
+        leave(stamp, identity)
+
+    monkeypatch.setattr(common, "leave_stamp", beside)
+    with pytest.raises(SystemExit):
+        _stub_campaign(
+            tmp_path / "raced",
+            monkeypatch,
+            {},
+            *flags,
+            backends="cute",
+            triton="fbtriton+meta_ws",
+        )
+    assert "another Triton build or switch state" in capsys.readouterr().err
+    raced = tmp_path / "raced" / "run"
+    assert json.loads((raced / campaign.RUN_BACKEND).read_text()) == theirs
+    assert not list((raced / "bench").iterdir())
+    monkeypatch.setattr(common, "leave_stamp", leave)
+    # A switch that the interpreter's Triton cannot put in effect stops a
+    # campaign before it makes its run directory.
+    (tmp_path / "tile").mkdir()
+    with pytest.raises(SystemExit):
+        _stub_campaign(
+            tmp_path / "tile",
+            monkeypatch,
+            {},
+            "--phases",
+            "bench",
+            switches={"ENABLE_TILE": "1"},
+        )
+    assert "no Tile IR backend" in capsys.readouterr().err
+    assert not (tmp_path / "tile" / "run").exists()
+
+
+@pytest.mark.slow
+@_requires_proc
+def test_a_baseline_without_helion_benches_the_listing_without_the_port(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # An environment in which Helion+CuTe cannot run: no picks are copied
+    # and the benches time the main run's listing without the port.
+    impls = "inductor,inductor_cd,inductor_max,oracle,memcopy"
+    flags = ("--phases", "bench", "--bench-impls", impls)
+
+    def bench(triton: str | None) -> list[dict[str, object]]:
+        _, events = _stub_campaign(
+            tmp_path, monkeypatch, {}, *flags, backends="cute", triton=triton
+        )
+        return events
+
+    tile = "tileir"
+    run = tmp_path / "run"
+    assert [e["job"] for e in bench(tile) if e["kind"] == "job_start"] == [
+        "bench:sum_000000000001__s1"
+    ]
+    record = json.loads((run / "bench" / "sum_000000000001__s1.json").read_text())
+    assert list(record["impls"]) == impls.split(",")
+    assert list((run / "configs").iterdir()) == []
+    # The record stands: a restart benches nothing.
+    assert not [e for e in bench(tile) if e["kind"] == "job_start"]
+    # A run directory with bench records that names no build (made before
+    # the campaign named it) is a stock run's: a baseline takes another,
+    # and so does a baseline's control with its switch off.
+    (run / campaign.RUN_BACKEND).unlink()
+    for other in (tile, "fbtriton+meta_ws", "fbtriton", "tileir-fork-ptx"):
+        with pytest.raises(SystemExit):
+            bench(other)
+        assert "does not name the Triton build" in capsys.readouterr().err
+        assert not (run / campaign.RUN_BACKEND).exists()
+    # A campaign without a switch goes on in it and names its build there;
+    # so does one in an environment without a Triton, which restarts.
+    for stock in ("stock", None):
+        (run / campaign.RUN_BACKEND).unlink(missing_ok=True)
+        for _start in range(2):
+            bench(stock)
+        assert json.loads((run / campaign.RUN_BACKEND).read_text()) == (
+            {} if stock is None else common.triton_identity(_toy_backend(stock))
+        )
+    # A record that names its build (a bench by hand, or a run whose stamp
+    # went) says whose it is: only that build's campaign goes on beside it.
+    (run / campaign.RUN_BACKEND).unlink()
+    control = _toy_backend("fbtriton")
+    _add_fields(run, "sum_000000000001", "s1", triton_backend=control)
+    for other in ("stock", None, tile, "fbtriton+meta_ws"):
+        with pytest.raises(SystemExit):
+            bench(other)
+        error = capsys.readouterr().err
+        assert (
+            "__s1.json is of another Triton build or switch state (fbtriton: " in error
+        )
+        assert not (run / campaign.RUN_BACKEND).exists()
+    assert not [e for e in bench("fbtriton") if e["kind"] == "job_start"]
+    assert json.loads(
+        (run / campaign.RUN_BACKEND).read_text()
+    ) == common.triton_identity(control)
 
 
 @pytest.mark.slow
@@ -4499,7 +6182,7 @@ def test_an_autotune_record_names_its_seed_and_the_run_it_was_taken_from(
         raise RuntimeError("no device for this test")
 
     monkeypatch.setattr(torch.cuda, "set_device", no_device)
-    job = argparse.Namespace(repro_id=point[0], shape="s1", backend="cute")
+    job = argparse.Namespace(repro_id=point[0], shape="s1", backend="cute", regime=None)
     failed = autotune.run(job)
     assert failed["status"] == "error" and "no device for this test" in failed["error"]
     assert failed["env"] == record["env"] and failed["seed_from"] == "/runs/before"
@@ -5570,6 +7253,109 @@ def test_the_report_takes_a_repeated_benchs_ratio_process_by_process(
     )
 
 
+def test_the_report_shows_the_debiased_baseline_beside_the_headline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Two processes whose two compiles ended on one code (_toy_process: one
+    # pick per process) and read 100 us but for noise that falls the other
+    # way for each (98 and 102 us): the headline takes the luckier compile,
+    # the de-biased baseline the two together. The port takes 100 us. By
+    # rot_us the two compiles read alike, 99 us.
+    run = tmp_path / "run"
+    lucky = [98.0, 98.0, 100.0, 100.0, 96.0, 96.0]
+    unlucky = [200.0 - value for value in lucky]
+    rotated = {
+        "rot_us": 99.0,
+        "rot_order_medians_us": [99.0, 99.0],
+        "rot_runs_us": [99.0] * 6,
+    }
+    processes = {
+        f"sum_000000000001__s1.r{repeat}.json": _toy_process(
+            run,
+            repeat,
+            {"inductor": 98.0, "inductor_cd": 102.0, "helion_cute": 100.0},
+            inductor={
+                "cold_order_medians_us": [98.0, 98.0],
+                "cold_runs_us": lucky,
+                **rotated,
+            },
+            inductor_cd={
+                "cold_order_medians_us": [102.0, 102.0],
+                "cold_runs_us": unlucky,
+                **rotated,
+            },
+            helion_cute={"rot_us": 110.0},
+        )
+        for repeat in (1, 2)
+    }
+    digests = {
+        name: hashlib.sha256((run / "bench" / name).read_bytes()).hexdigest()
+        for name in processes
+    }
+    aggregate = common.aggregate_bench_records(processes, digests)  # type: ignore[arg-type]
+    both = {"headline": 98.0, "debiased": pytest.approx(100.0)}
+    same = [["inductor", "inductor_cd"]]
+    alike = {"headline": 99.0, "debiased": 99.0}
+    assert (
+        aggregate["fastest_inductor_per_process"]
+        == [{"same_code": same, "cold_us": both, "rot_us": alike}] * 2
+    )
+    assert "fastest_inductor" not in aggregate
+    row = report.summarize(aggregate, "cold_us")
+    assert row["inductor"] == 98.0 and row["inductor_debiased"] == pytest.approx(100.0)
+    assert row["cute_vs_inductor"] == pytest.approx(0.98)
+    assert row["cute_vs_inductor_debiased"] == pytest.approx(1.0)
+    # A record of one process made before bench.py stored the figure holds
+    # the rounds to take it from; bb_us has none.
+    single = dict(processes["sum_000000000001__s1.r1.json"])
+    assert "fastest_inductor" not in single
+    assert report.summarize(single, "cold_us")["cute_vs_inductor_debiased"] == (
+        pytest.approx(1.0)
+    )
+    assert report.summarize(single, "bb_us")["cute_vs_inductor_debiased"] is None
+    # So does an aggregate made before, from its processes' records beside
+    # it, while they are the records it was made of: the report shows both
+    # speedups and says how many lie apart.
+    del aggregate["fastest_inductor_per_process"]
+    out = common.bench_record_path(run / "bench", "sum_000000000001", "s1")
+    out.write_text(json.dumps(aggregate))
+    _toy_tuned(run, "sum_000000000001", "s1", "cute")
+    assert report.debiased_baseline(aggregate, "cold_us") == [None, None]
+    # A process's record that was written again since holds other readings
+    # than the headline's: no figure from it.
+    again = run / "bench" / "sum_000000000001__s1.r2.json"
+    kept = again.read_bytes()
+    again.write_bytes(kept + b"\n")
+    report.with_fastest_inductor(aggregate, out)
+    assert "fastest_inductor_per_process" not in aggregate
+    again.unlink()
+    report.with_fastest_inductor(aggregate, out)
+    assert report.debiased_baseline(aggregate, "cold_us") == [None, None]
+    again.write_bytes(kept)
+    report.with_fastest_inductor(aggregate, out)
+    assert report.debiased_baseline(aggregate, "cold_us") == [pytest.approx(100.0)] * 2
+    monkeypatch.setattr(sys, "argv", ["report.py", str(run)])
+    report.main()
+    text = (run / "report.md").read_text()
+    assert (
+        "| inductor | helion-cute | cute/ind | cute/ind de-biased "
+        "| cute/ind per process (n) | cute/ind rot | cute/ind rot de-biased |"
+    ) in text
+    assert (
+        "| 98.00 | 100.00 | 0.980 | 1.000 | 0.980..0.980 (2) | 0.900 | 0.900 |"
+    ) in text
+    assert (
+        "CuTe/ind geomean 1.000 over 1 kernels, 0.980 by the headline over the "
+        "same; 1 of them differ by more than 0.5%."
+    ) in text
+    assert (
+        "The same by `rot_us`: CuTe/ind geomean 0.900 over 1 kernels, 0.900 by "
+        "the headline over the same; 0 of them differ by more than 0.5%."
+    ) in text
+    # The bb table of the same report has no such column.
+    assert text.count("| cute/ind de-biased |") == 1
+
+
 def test_an_inductor_compile_that_failed_in_one_process_leaves_only_that_baseline(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -6376,3 +8162,30 @@ def test_the_max_autotune_compile_counts_in_each_process_of_a_repeated_bench(
         "- sum_000000000001[s1] inductor_max: not usable in 1 of 3 bench "
         f"processes ({names[2]})\n"
     ) in text
+
+
+def test_a_runs_report_names_the_triton_build_of_its_records(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    run = tmp_path / "run"
+    _toy_bench(run, "sum_000000000001", "s1", {"inductor": 2.0, "helion_cute": 1.0})
+    _toy_tuned(run, "sum_000000000001", "s1", "cute")
+    monkeypatch.setattr(sys, "argv", ["report.py", str(run)])
+    report.main()
+    # A record made before bench.py named the build: the version alone.
+    assert "torch None, triton None, cutlass-dsl" in capsys.readouterr().out
+    _add_fields(
+        run,
+        "sum_000000000001",
+        "s1",
+        versions={"triton": "3.9.0.dev20261113"},
+        triton_backend=_toy_backend("fbtriton+meta_ws"),
+    )
+    report.main()
+    assert (
+        "triton 3.9.0.dev20261113 (fbtriton+meta_ws: fbtriton 3.9.0.dev20261113, "
+        "TRITON_USE_META_WS=1), cutlass-dsl"
+    ) in capsys.readouterr().out
+    assert common.triton_label(_toy_backend("tileir")) == (
+        "tileir: triton 3.9.0+gitb7d, ENABLE_TILE=1, Inductor's launcher off"
+    )

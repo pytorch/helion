@@ -172,6 +172,27 @@ another N than their records have, or where the pass on N sets failed, it
 starts nothing for them and names them in a ``rotate_inputs_not_added``
 event (``--rebench`` runs them again).
 
+A baseline run is this with another environment's Python: the picks of a
+main run, benched beside the Inductor kernels that another Triton build
+compiles (fbtriton with ``TRITON_USE_META_WS=1``, the Triton-to-tile-IR
+fork with ``ENABLE_TILE=1``; the README's Other Triton builds says what the
+environment must contain). The jobs run under the interpreter that started
+the campaign and inherit its environment, the switches among it, each with
+empty cache directories of its own (``job_env``). The campaign names its
+Triton build and switches in the ``campaign_start`` event and, when it
+benches, in ``<run>/triton_backend.json`` (``RUN_BACKEND``): it stops
+before changing anything when a switch cannot be in effect
+(``common.check_triton_switches``) or when the run directory's benches are
+another build's or switch state's, so a restart from a shell without the
+baseline's environment adds no stock record to a baseline's run. A
+baseline run keeps the main run's listing of implementations, the default
+with ``--configs-from`` and ``--backends cute``
+(``inductor,inductor_cd,inductor_max,oracle,helion_cute,memcopy``), so that
+each is timed in the slot and between the neighbours it has in the main
+run's rounds. Where Helion cannot run in an environment, ``--phases bench
+--bench-impls inductor,inductor_cd,inductor_max,oracle,memcopy`` without
+``--configs-from`` benches that listing without the port.
+
 ``--seeds-from RUN`` pairs this run's searches with another run's, for a
 before/after comparison of two trees. On a large kernel the pick of a cold
 autotune follows the initial population its random seed draws: one seed
@@ -638,6 +659,66 @@ def job_env(
 # before the entry went): the entries of the selected records are then
 # those of the copies the run holds (``ConfigCopies.entries``).
 COPIED_CONFIGS = common.COPIED_CONFIGS
+# The Triton build and switch state whose benches a run directory holds
+# (``common.triton_identity``), written by the first campaign that benches
+# into it: a campaign started with another one stops before it changes
+# anything, so the records of a baseline run (fbtriton with
+# ``TRITON_USE_META_WS=1``, the Tile IR fork with ``ENABLE_TILE=1``) are
+# never mixed with a stock run's, also not by a restart from a shell
+# without the baseline's environment.
+RUN_BACKEND = "triton_backend.json"
+
+
+def foreign_run(run_dir: Path, backend: dict[str, Any] | None) -> str | None:
+    """Why a campaign of the Triton build ``backend``
+    (``common.triton_backend``) may not bench into ``run_dir``, or None:
+    the benches of one run directory are one build's in one switch state.
+
+    The directory's stamp (``RUN_BACKEND``) says whose it is. Without one,
+    the bench records that are there do: one that names its build
+    (``bench.py``'s ``triton_backend``: a bench by hand, or a run whose
+    stamp went) must name this campaign's, and one that names none is from
+    before records did and is taken for stock Triton's, so that no other
+    build goes on beside it, with its switch or as a baseline's control
+    without."""
+    # (Without a Triton the identity is empty.)
+    here = common.triton_identity(backend) or {}
+    stamp = run_dir / RUN_BACKEND
+    if stamp.exists():
+        standing = json.loads(stamp.read_text())
+        if standing == here:
+            return None
+        differs = sorted(
+            key for key in {*standing, *here} if standing.get(key) != here.get(key)
+        )
+        return (
+            f"{stamp} names another Triton build or switch state than this "
+            f"campaign's ({', '.join(differs)}: "
+            f"{[standing.get(key) for key in differs]} there, "
+            f"{[here.get(key) for key in differs]} here): the benches of one "
+            "run directory are one baseline's; give this one a --run-dir of "
+            "its own"
+        )
+    for path in sorted((run_dir / "bench").glob("*.json")):
+        record = json.loads(path.read_text())
+        if "triton_backend" in record:
+            theirs = common.triton_identity(record["triton_backend"]) or {}
+            if theirs != here:
+                return (
+                    f"{path} is of another Triton build or switch state "
+                    f"({common.triton_label(theirs)}) than this campaign's, and "
+                    f"{run_dir} names none ({RUN_BACKEND}): the benches of one "
+                    "run directory are one baseline's; give this one a "
+                    "--run-dir of its own"
+                )
+        elif backend is not None and backend["name"] != "stock":
+            return (
+                f"{run_dir} holds bench records and does not name the Triton "
+                f"build that made them ({RUN_BACKEND}): they are taken for "
+                f"stock Triton's, and a run with {backend['name']} needs a "
+                "--run-dir of its own"
+            )
+    return None
 
 
 class ConfigCopies(NamedTuple):
@@ -731,6 +812,17 @@ def main() -> None:
     parser.add_argument("--only", nargs="*", default=None, help="repro ids")
     parser.add_argument("--retune", action="store_true")
     parser.add_argument("--rebench", action="store_true")
+    parser.add_argument(
+        "--regime",
+        choices=common.REGIMES,
+        default=None,
+        help="how the autotunes of both backends time their candidates "
+        "(autotune.py --regime): 'port' times a kernel that runs behind "
+        "earlier kernels of its port behind those kernels; 'alone' times "
+        "every kernel alone after an L2 flush, as the runs before the regime "
+        "existed did, for a comparison with one of them (default: each "
+        "backend's own, port for cute and alone for triton)",
+    )
     parser.add_argument("--autotune-timeout-s", type=float, default=4 * 3600)
     parser.add_argument("--bench-timeout-s", type=float, default=3600)
     parser.add_argument(
@@ -806,6 +898,22 @@ def main() -> None:
     phases = set(args.phases.split(","))
     run_dir = args.run_dir.resolve()
     configs_dir = run_dir / "configs"
+    # A plan (plan_run.py --write) copied into this run the earlier Triton
+    # records it reused, for the regime it was made for. The campaign takes
+    # such copies as finished autotunes, so its Triton autotunes must run in
+    # that regime too (a plan written before plans named one reused records
+    # tuned alone). A campaign that tunes no Triton port takes any regime.
+    plan_path = run_dir / "plan.json"
+    if plan_path.exists() and "triton" in backends and "autotune" in phases:
+        planned = json.loads(plan_path.read_text()).get("triton_regime", "alone")
+        triton_regime = args.regime or common.default_regime("triton")
+        if planned != triton_regime:
+            parser.error(
+                f"--regime: the plan of this run ({plan_path}) reused earlier "
+                f"Triton records for the regime {planned!r}, and this campaign "
+                f"would tune Triton ports in {triton_regime!r}; plan the run "
+                "again with plan_run.py --regime, or run in the plan's regime"
+            )
     # The implementations the benches time (bench.py --impls; None: all).
     bench_impls: str | None = args.bench_impls or None
     # --configs-from: the names of the selected records, what to do about
@@ -918,6 +1026,18 @@ def main() -> None:
             )
     if args.rotate_inputs < 0 or args.rotate_inputs == 1:
         parser.error(f"--rotate-inputs {args.rotate_inputs}: at least 2 input sets")
+    # The Triton build of this interpreter, which runs the jobs, and the
+    # switches the jobs inherit (common.TRITON_SWITCHES). A switch that
+    # cannot be in effect stops the campaign here, and so does a run
+    # directory whose benches another build or switch state made: its
+    # records, and the aggregates of its repeats, are one baseline's.
+    triton_backend = common.triton_backend()
+    try:
+        common.check_triton_switches(triton_backend)
+    except common.TritonSwitchError as error:
+        parser.error(str(error))
+    if "bench" in phases and (issue := foreign_run(run_dir, triton_backend)):
+        parser.error(issue)
     if args.bench_repeats < 1:
         parser.error(f"--bench-repeats {args.bench_repeats}: at least 1 process")
     # The repeats of a point's bench (None: its one bench, as without the
@@ -929,6 +1049,15 @@ def main() -> None:
     logs_dir = run_dir / "logs"
     for d in (configs_dir, bench_dir, logs_dir / "autotune", logs_dir / "bench"):
         d.mkdir(parents=True, exist_ok=True)
+    if "bench" in phases:
+        # Left only where none stands, and held against the one that does:
+        # another campaign may have started in the directory meanwhile.
+        if not (run_dir / RUN_BACKEND).exists():
+            common.leave_stamp(
+                run_dir / RUN_BACKEND, common.triton_identity(triton_backend) or {}
+            )
+        if issue := foreign_run(run_dir, triton_backend):
+            parser.error(issue)
 
     def config_file(repro: str, shape: str, backend: str) -> Path:
         return common.config_record_path(configs_dir, repro, shape, backend)
@@ -1409,6 +1538,8 @@ def main() -> None:
                 job.shape,
                 "--backend",
                 job.backend,
+                # (unnamed: autotune.py's default for the backend)
+                *(["--regime", args.regime] if args.regime else []),
                 "--output",
                 str(out),
             ]
@@ -1651,7 +1782,14 @@ def main() -> None:
             )
         return problems
 
-    event(kind="campaign_start", jobs=len(pending), gpus=gpus, run_dir=str(run_dir))
+    event(
+        kind="campaign_start",
+        jobs=len(pending),
+        gpus=gpus,
+        run_dir=str(run_dir),
+        python=sys.executable,
+        triton_backend=triton_backend,
+    )
     error: BaseException | None = None
     try:
         schedule()
