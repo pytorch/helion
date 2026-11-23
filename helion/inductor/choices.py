@@ -110,6 +110,13 @@ MIN_SPLIT_RUN = 32
 # double.
 MIN_LAYOUT_SPLIT_VALUES = 2**20
 
+# The most chunks a layout split takes where no count of them is within a
+# factor of 2 of Inductor's split, as a multiple of that split
+# (HelionChoices.split_runs()): the reduction over the partials, which
+# Inductor does not split again (create_multilayer_helper()), reads that many
+# per output.
+MAX_SPLIT_RUNS_OVERSHOOT = 16
+
 
 def contiguous_run(value: torch.Tensor, dims: Sequence[int]) -> int:
     """The number of values in `value`'s last reduced `dims`, by dim index,
@@ -443,26 +450,11 @@ class HelionChoices(InductorChoices):
         )
         if device.type != "cuda" or inductor_config.cuda_backend != "helion":
             return split
-        layout = HelionChoices.layout_split(reduction_numel_hint, numel_hint)
+        layout = HelionChoices.layout_split(reduction_numel_hint, numel_hint, split)
         if layout is not None and (
             split > 1 or reduction_numel_hint * numel_hint >= MIN_LAYOUT_SPLIT_VALUES
         ):
-            if split <= layout:
-                return layout
-            # Fewer runs than Inductor's chunks, which it counts to fill the
-            # GPU: each run cut into k chunks, k a divisor of the run, so that
-            # the chunks number about Inductor's and each stays in one run, a
-            # tile of a view all the same. x.mean((0, 2, 3)) of an NCHW
-            # [8, 32, 256, 256], 8 runs of 65536 per channel, takes Inductor's
-            # 16 chunks as 2 per run,
-            #     for tile_z, tile_y, tile_x in hl.tile([32, 8, 2]):
-            #         for tile_r in hl.tile(32768):
-            #             tmp0 = in0[tile_z, tile_y, tile_x, tile_r]
-            # 26 us on a B200 (quick autotune), where one chunk per run,
-            # hl.tile([32, 8]) over runs of 65536, took 53 us.
-            run = reduction_numel_hint // layout
-            pieces = [d for d in sympy.divisors(run) if layout * d <= 2 * split]
-            return layout * min(pieces, key=lambda d: abs(layout * d - split))
+            return layout
         if split <= 1 or reduction_numel_hint % split == 0:
             return split
         divisors = [
@@ -473,7 +465,7 @@ class HelionChoices(InductorChoices):
         return min(divisors, key=lambda d: abs(d - split), default=split)
 
     @staticmethod
-    def layout_split(reduction_numel: int, numel: int) -> int | None:
+    def layout_split(reduction_numel: int, numel: int, split: int) -> int | None:
         """The split of the reduction V.graph.current_node lowers into chunks
         of one contiguous run of its input each (contiguous_run()), as
         Inductor asks whether to split it: sum, var_mean and the like over N,
@@ -492,10 +484,18 @@ class HelionChoices(InductorChoices):
         split is asked of whether Inductor would split (Helion cannot reduce
         over N and H * W apart in one kernel; reduction_split_factor() takes
         it where Inductor would not only for MIN_LAYOUT_SPLIT_VALUES values
-        or more), but not of the second reduction, over the partials, nor of another reduction than the
-        node's own: None then, and when the run is the whole reduction (a
-        contiguous rdim), shorter than MIN_SPLIT_RUN, or the input's layout is
-        not static."""
+        or more), but not of the second reduction, over the partials, nor of
+        another reduction than the node's own: None then, and when the run is
+        the whole reduction (a contiguous rdim), shorter than MIN_SPLIT_RUN,
+        or the input's layout is not static.
+
+        Where Inductor's `split` asks for more chunks than there are runs,
+        each run is cut into equal pieces (split_runs()): the first kernel
+        then has about Inductor's parallelism, and each chunk is still one
+        contiguous piece of a run, a tile of a view. The sum over N and W of
+        [4, 128, 23212], whose 4 runs per channel Inductor would split in 7,
+        is split in 8 chunks of 11606: 1024 rdims for the first kernel where
+        512 rdims of 23212 left the 152 SMs of a GB300 half idle."""
         node = V.graph.current_node
         if node is None or node.op != "call_function" or isinstance(node.target, str):
             return None
@@ -523,7 +523,51 @@ class HelionChoices(InductorChoices):
             or not MIN_SPLIT_RUN <= run < rnumel
         ):
             return None
-        return rnumel // run
+        return HelionChoices.split_runs(rnumel // run, run, split)
+
+    @staticmethod
+    def split_runs(runs: int, run: int, split: int) -> int:
+        """The number of chunks of a layout split of `runs` contiguous runs
+        of `run` values each, where Inductor's split asks for `split` chunks:
+        the runs as they are when there are as many, else each run cut into
+        k equal pieces (k a divisor of the run that leaves MIN_SPLIT_RUN
+        values or more per piece), so that no chunk crosses a run and the
+        first kernel reads the chunks as a tile of a view. Of the counts of
+        chunks that gives:
+
+        - the nearest to `split` within a factor of 2 of it, the window
+          reduction_split_factor() also moves Inductor's split within to
+          divide an rdim: x.mean((0, 2, 3)) of an NCHW [8, 32, 256, 256],
+          8 runs of 65536 per channel, takes Inductor's 16 chunks as 2 per
+          run (26 us on a B200, quick autotune, where one chunk per run took
+          53 us); 4 runs of 23212 = 4 * 7 * 829 at a split of 64 take 56
+          chunks of 1658, not 112. The nearest can lie below `split` and,
+          before sm100, leave chunks that Inductor splits again (4 runs of
+          20000 at a split of 10 take 8 chunks of 10000, past its 8192
+          threshold for their 64 outputs), as reduction_split_factor()'s
+          pieces did before this rule;
+        - where the run's divisors skip that window, the fewest that reach
+          `split`, up to MAX_SPLIT_RUNS_OVERSHOOT times it: the sum over N
+          and W of a bf16 [4, 8, 371372] (better-benchmark's
+          sum_a200e61c94a5), 4 runs of 371372 = 4 * 227 * 409 per channel at
+          Inductor's split of 76, takes 908 chunks of 1636, two kernels with
+          no division (4.8 us for the first on a GB300). The most below the
+          window, 16 chunks of 92843, leave chunks Inductor splits again, in
+          5 of 18569 under a tail mask, read through // and % of a flat view,
+          with a third kernel (13.0 us for the first);
+        - else the most up to twice `split`: 3 runs of 3165152 = 2**5 * 98911
+          at a split of 203 take 96 chunks, not 296733 of 32 values, whose
+          partials the second kernel would read 296733 per output."""
+        if runs >= split:
+            return runs
+        counts = [runs * k for k in sympy.divisors(run) if run // k >= MIN_SPLIT_RUN]
+        near = [c for c in counts if split <= 2 * c <= 4 * split]
+        if near:
+            return min(near, key=lambda c: abs(c - split))
+        above = [c for c in counts if split <= c <= MAX_SPLIT_RUNS_OVERSHOOT * split]
+        if above:
+            return min(above)
+        return max(c for c in counts if c <= 2 * split)
 
     def uuid(self) -> None:
         # The FX graph cache key already holds what these choices read:

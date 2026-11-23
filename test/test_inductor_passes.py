@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import functools
 import pathlib
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
@@ -10,6 +11,7 @@ import torch
 from torch._inductor import config
 from torch._inductor.custom_graph_pass import CustomGraphModulePass
 from torch._inductor.decomposition import select_decomp_table
+from torch._inductor.virtualized import V
 from torch.fx.experimental.proxy_tensor import make_fx
 from torch.utils import _pytree as pytree
 
@@ -21,6 +23,7 @@ if not requires_torch_version("2.16"):
 
 import helion.inductor
 from helion.inductor import config as helion_config
+from helion.inductor.choices import HelionChoices
 from helion.inductor.fx_passes import post_grad
 from helion.inductor.fx_passes.cat_reductions import pointwise
 from helion.inductor.fx_passes.cat_reductions import split_cat_reductions
@@ -408,6 +411,58 @@ class TestCatReductions(TestCase):
         ):
             gm = make_fx(fn, tracing_mode="fake")(a, b)
             self.assertFalse(split_cat_reductions(gm.graph, devices=("cpu",)))
+
+
+class TestLayoutSplit(TestCase):
+    def test_split_runs(self):
+        # The chunks of a layout split of runs contiguous runs where
+        # Inductor's split asks for split chunks (HelionChoices.split_runs()).
+        split_runs = HelionChoices.split_runs
+        # As many runs as Inductor's chunks: the runs.
+        self.assertEqual(split_runs(32, 3136, 4), 32)
+        # The count nearest to the split within a factor of 2: 8 runs of
+        # 65536 at 16 in 2 pieces each; 4 runs of 23212 = 4 * 7 * 829 at 7 in
+        # 2, and at 64 in 14 (56 chunks), not 28 (112).
+        self.assertEqual(split_runs(8, 65536, 16), 16)
+        self.assertEqual(split_runs(4, 23212, 7), 8)
+        self.assertEqual(split_runs(4, 23212, 64), 56)
+        # A run whose divisors skip the window: the fewest chunks that reach
+        # the split, 4 runs of 371372 = 4 * 227 * 409 at 76 in 227 pieces each
+        # (better-benchmark's sum_a200e61c94a5) and of 94828 = 4 * 151 * 157
+        # at 47 in 151, where 4 pieces each would leave chunks that Inductor
+        # splits again.
+        self.assertEqual(split_runs(4, 371372, 76), 908)
+        self.assertEqual(split_runs(4, 94828, 47), 604)
+        # Not past MAX_SPLIT_RUNS_OVERSHOOT times the split: 3 runs of
+        # 3165152 = 2**5 * 98911 at 203 would take 296733 chunks of 32
+        # values, whose partials the second kernel reads 296733 per output;
+        # they take the most chunks up to twice the split, 96.
+        self.assertEqual(split_runs(3, 3165152, 203), 96)
+        # None reaches the split (20014 = 2 * 10007, whose 10007 pieces would
+        # be shorter than MIN_SPLIT_RUN): the most there are.
+        self.assertEqual(split_runs(4, 20014, 64), 8)
+        self.assertEqual(split_runs(2, 40, 64), 2)
+
+    def test_layout_split_of_the_node(self):
+        # layout_split() of the sum over N and W of a bf16 [4, 8, 94828] that
+        # V.graph.current_node lowers: its 4 runs of W per channel, cut in
+        # 151 pieces each at Inductor's split of 47. A transposed input,
+        # whose W is not contiguous, keeps Inductor's split (None).
+        def sums(x):
+            return x.sum([0, 2]), x.permute(2, 1, 0).sum([0, 2])
+
+        x = torch.empty(4, 8, 94828, dtype=torch.bfloat16)
+        gm = make_fx(sums, tracing_mode="fake")(x)
+        contiguous, transposed = [
+            n for n in gm.graph.nodes if n.target is torch.ops.aten.sum.dim_IntList
+        ]
+        with V.set_graph_handler(SimpleNamespace(current_node=contiguous)):
+            self.assertEqual(HelionChoices.layout_split(4 * 94828, 8, 47), 604)
+            self.assertEqual(HelionChoices.layout_split(4 * 94828, 8, 1), 4)
+            # Another reduction than the node's own: the partials' sum.
+            self.assertIsNone(HelionChoices.layout_split(604, 8, 1))
+        with V.set_graph_handler(SimpleNamespace(current_node=transposed)):
+            self.assertIsNone(HelionChoices.layout_split(4 * 94828, 8, 47))
 
 
 if __name__ == "__main__":

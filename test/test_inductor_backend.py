@@ -1766,6 +1766,22 @@ def kernel(in0: torch.Tensor, out0: torch.Tensor, out1: torch.Tensor) -> None:
         small = torch.randn(2, 64, 8, 8, device=DEVICE)
         self.assertEqual(len(self.compile(lambda x: x.sum([0, 2, 3]), small)), 1)
 
+    def test_layout_split_pieces(self):
+        # A run whose divisors skip the window around Inductor's split
+        # (HelionChoices.split_runs()): the sum over N and W of a bf16
+        # [4, 8, 94828], 4 runs of 94828 = 4 * 151 * 157 per channel at a
+        # split of 47 (on GB300, H100 and A10G alike), is cut in 151 pieces of
+        # 628 per run, each chunk a contiguous piece of a run read as a tile
+        # of a view, in two kernels, where 4 pieces of 23707 per run would
+        # leave 128 chunks of 23707: fewer than a GB300 has SMs, and chunks
+        # that Inductor splits again, through // and %, before sm100 (the
+        # shape of better-benchmark's sum_a200e61c94a5, whose 128 chunks of
+        # 92843 it splits again on any GPU).
+        x = torch.randn(4, 8, 94828, device=DEVICE, dtype=torch.bfloat16)
+        first, second = self.compile(lambda x: x.sum([0, 2]), x, tol=2e-2)
+        self.assertIn("for tile_z, tile_y, tile_x in hl.tile([8, 4, 151]):", first)
+        self.assertNotIn("//", first)
+
     @parametrize("case", ["persistent", "looped"])
     def test_outer_reductions(self, case):
         # Reductions over the outer dim of [1000, 100] (Inductor's hint OUTER),
