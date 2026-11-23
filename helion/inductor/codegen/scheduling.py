@@ -211,7 +211,7 @@ class HelionScheduling(SIMDScheduling):
     @classmethod
     def get_backend_features(cls, device: torch.device) -> OrderedSet[BackendFeature]:
         # Only what HelionKernel emits: in-place buffers, where an output takes
-        # over the storage of an input of the kernel (call_args()). Without
+        # over the storage of an input of the kernel (kernel_params()). Without
         # the others, Inductor lowers scan, sort, bucketize and the like to
         # aten kernels rather than to ops Helion lacks.
         return OrderedSet([BackendFeature.INPLACE_BUFFERS])
