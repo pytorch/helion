@@ -42,6 +42,7 @@ from .overrides import HelionOverrides
 from .overrides import HelionPrinter
 from .overrides import number_constant
 from .overrides import upcast_compute_type
+from .sequence import note_call
 from .tiling import UNROLLED_RDIM_MAX
 from .tiling import contiguous_reads
 from .tiling import static_int
@@ -1408,6 +1409,7 @@ class HelionKernel(SIMDKernel[CSEVariable]):
             )
             args.append(f"{workspace.outer_name}.view{dims}")
         wrapper.writeline(wrapper.wrap_kernel_call(name, args))
+        note_call(wrapper, name, args)
         if deallocate_ws:
             self.deallocate_workspaces()
 

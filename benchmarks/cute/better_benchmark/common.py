@@ -789,6 +789,7 @@ def load_inductor_pretuned(
     decorators each pin a config: under HELION_FORCE_AUTOTUNE=0, so that none
     searches again in a process that forces autotuning (campaign.py's)."""
     import helion
+    from helion.inductor.kernel_sequence import SequencedKernel
 
     path = path or inductor_pretuned_path(repro_id)
     if not path.exists():
@@ -805,6 +806,10 @@ def load_inductor_pretuned(
             "regenerate it with inductor_pretuned.py --shape"
         )
     for kernel_name, kernel in vars(module).items():
+        # (helion.inductor's code wraps each kernel for its first call,
+        # helion_in_sequence: the wrapper holds the kernel)
+        if isinstance(kernel, SequencedKernel):
+            kernel = kernel.kernel
         if isinstance(kernel, helion.Kernel) and (
             len(kernel.configs) != 1 or kernel.settings.force_autotune
         ):

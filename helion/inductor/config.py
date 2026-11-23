@@ -41,6 +41,9 @@ autotune_effort: Literal["none", "quick", "full"] = _env_get_literal(
 # Helion's fast_math: approximate fp32 division, exp, erf and rsqrt. Off, as in
 # Triton kernels, leaves Helion's default, which HELION_FAST_MATH=1 turns on.
 fast_math: bool = False
+# Tune each kernel of a graph behind the kernel that runs before it, in the
+# state of L2 it runs in (helion.inductor.kernel_sequence).
+tune_in_sequence: bool = True
 
 
 def _source_files() -> list[pathlib.Path]:

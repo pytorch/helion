@@ -2819,6 +2819,8 @@ def test_every_selected_point_has_pinned_inductor_code(
     # three extras (the next 99 have none yet), which loads at that point's
     # shape on CPU with every Helion kernel pinned to one config
     # (common.load_inductor_pretuned), and has bench.py's entry.
+    from helion.inductor.kernel_sequence import SequencedKernel
+
     kernels = [
         k
         for k in json.loads(common.SELECTION_PATH.read_text())["kernels"]
@@ -2842,7 +2844,12 @@ def test_every_selected_point_has_pinned_inductor_code(
                 raise
             pytest.skip(f"{kernel['repro']}: written for another torch ({error})")
         assert callable(module.forward), kernel["repro"]
-        assert any(isinstance(v, helion.Kernel) for v in vars(module).values())
+        # (a module of helion.inductor's tune_in_sequence wraps its kernels
+        # until their first call: helion.inductor.kernel_sequence)
+        assert any(
+            isinstance(v.kernel if isinstance(v, SequencedKernel) else v, helion.Kernel)
+            for v in vars(module).values()
+        )
 
 
 _OUTPUT_MODULE = '''\
@@ -2861,17 +2868,23 @@ import helion
 def kernel(in0, out0):
     out0[1] = in0[1]
 """
+helion_fused_b_1 = PyCodeCache.load(helion_fused_b_1_source, '0123456789abcdef').kernel
 '''
 
 
 def test_inductor_pretuned_pins_the_decorator_of_each_kernel_source() -> None:
     # Only the decorator line of each source string changes, to the one the
-    # kernel's own source picks.
-    def decorator_of(source: str) -> str:
+    # kernel's own source picks; decorator_of gets the key the module loads
+    # it under (a kernel tuned behind the one before it has its own).
+    extras: list[str] = []
+
+    def decorator_of(source: str, extra: str) -> str:
+        extras.append(extra)
         return f"@helion.kernel(config=C{int('out0[1]' in source)})"
 
     code, count = inductor_pretuned.pin(_OUTPUT_MODULE, decorator_of)
     assert count == 2
+    assert extras == ["", "0123456789abcdef"]
     assert code == _OUTPUT_MODULE.replace(
         '@helion.kernel(backend="cute", static_shapes=True, autotune_effort="full")',
         "@helion.kernel(config=C0)",
@@ -2921,7 +2934,7 @@ def test_inductor_pretuned_reads_the_kernel_source_unescaped() -> None:
     module = f'helion_k_0_source = """\\\n{literal}"""\n'
     seen: list[str] = []
 
-    def decorator_of(text: str) -> str:
+    def decorator_of(text: str, extra: str) -> str:
         seen.append(text)
         return '@helion.kernel(backend="cute", config="x\\y")'
 
@@ -3011,6 +3024,27 @@ def test_pinned_inductor_code_of_another_shape_is_refused(tmp_path: Path) -> Non
     assert common.load_inductor_pretuned("sum_000000000001", "s1", path).SHAPE == "s1"
     with pytest.raises(ValueError, match="generated at shape s1, not s2"):
         common.load_inductor_pretuned("sum_000000000001", "s2", path)
+
+
+@needs_helion_inductor
+def test_a_sequenced_kernel_of_pinned_inductor_code_must_be_pinned(
+    tmp_path: Path,
+) -> None:
+    # helion.inductor's code wraps each kernel for its first call
+    # (helion_in_sequence): the pin check reads the kernel in the wrapper.
+    path = tmp_path / "sum_000000000001.py"
+    path.write_text(
+        "import helion\n"
+        "from helion.inductor.kernel_sequence import in_sequence as helion_in_sequence\n"
+        f"REPRO = 'sum_000000000001'\nSHAPE = 's1'\n"
+        f"SOURCE_HASH = {common.inductor_source_hash()!r}\n"
+        "@helion.kernel(backend='triton')\n"
+        "def k(x):\n"
+        "    return x\n"
+        "k = helion_in_sequence(k, globals(), 'k')\n"
+    )
+    with pytest.raises(RuntimeError, match="k is not pinned to one config"):
+        common.load_inductor_pretuned("sum_000000000001", "s1", path)
 
 
 @needs_helion_inductor

@@ -3,7 +3,9 @@ from __future__ import annotations
 import functools
 import importlib
 import inspect
+import os
 import re
+import tempfile
 import unittest
 from unittest.mock import patch
 
@@ -43,8 +45,10 @@ if not requires_torch_version("2.16"):
 from torch._inductor.choices import registered_inductor_choices
 
 import helion
+from helion.autotuner.benchmark_provider import LocalBenchmarkProvider
 import helion.inductor
 from helion.inductor import config as helion_config
+from helion.inductor import kernel_sequence
 from helion.inductor.codegen.kernel import exact_cast
 import helion.language as hl
 
@@ -1800,6 +1804,105 @@ def kernel(in0: torch.Tensor, out0: torch.Tensor, out1: torch.Tensor) -> None:
         (source,) = self.compile(lambda x: x.sum(0), x, tol=1e-4)
         self.assertIn("tmp0 = in0[:, tile_x]", source)
         self.assertIn("torch.sum(tmp0, -2)", source)
+
+    @skipIfRefEager("reference mode sequences nothing: it searches no config")
+    def test_kernels_tuned_in_sequence(self):
+        # The two kernels of a split sum over y: the second one's first call
+        # is timed behind the first's (helion.inductor.kernel_sequence),
+        #     helion_fused_sum_1 = PyCodeCache.load(helion_fused_sum_1_source, "<key>").kernel
+        #     helion_fused_sum_1 = helion_in_sequence(
+        #         helion_fused_sum_1, globals(), "helion_fused_sum_1", after="helion_fused_sum_0"
+        #     )
+        preludes = []
+        timed_behind = kernel_sequence.timed_behind
+        self.enterContext(
+            patch.object(
+                kernel_sequence,
+                "timed_behind",
+                lambda prelude: preludes.append(prelude) or timed_behind(prelude),
+            )
+        )
+        # The sequence on Triton, whose searches read CUDA events and so tune
+        # alone (times_short_kernels, which test_inductor_kernel_sequence.py
+        # checks): taken as if they read the trace, as CuTe's do.
+        self.enterContext(
+            patch.object(kernel_sequence, "times_short_kernels", lambda bound: True)
+        )
+        self.enterContext(config.patch({"triton.mix_order_reduction": True}))
+        x = torch.randn(100000, 96, device=DEVICE)
+        self.assertEqual(len(self.compile(lambda x: x.sum(0), x, tol=1e-3)), 2)
+        # The second kernel names the first, whose call is just before its
+        # (helion.inductor.codegen.sequence); the first names none.
+        definitions = re.findall(
+            r'(\w+) = helion_in_sequence\(\1, globals\(\), "\1", after=([^)]*)\)',
+            self.code,
+        )
+        self.assertEqual(len(definitions), 2)
+        (first, first_after), (second, second_after) = definitions
+        self.assertEqual((first_after, second_after), ("None", repr(first)))
+        # The second loads a module of its own, under the first's source.
+        self.assertIn(f"{first} = PyCodeCache.load({first}_source).kernel", self.code)
+        self.assertRegex(
+            self.code,
+            rf"{second} = PyCodeCache.load\({second}_source, '[0-9a-f]{{16}}'\).kernel",
+        )
+        self.assertEqual([prelude is None for prelude in preludes], [True, False])
+        self.assertEqual(len(preludes[1].steps), 1)
+        # Off, the kernels are called as they are loaded.
+        with helion_config.patch(tune_in_sequence=False):
+            torch._dynamo.reset()
+            self.compile(lambda x: x.sum(0), x, tol=1e-3)
+        self.assertNotIn("helion_in_sequence", self.code)
+
+    @pytest.mark.slow
+    @skipIfRefEager("reference mode sequences nothing: it searches no config")
+    def test_kernels_searched_in_sequence_cache_under_their_prelude(self):
+        # Quick searches of the split sum over y's two kernels: the
+        # benchmark jobs of the second carry the first kernel's call as their
+        # prelude, and the generated module, loaded again, finds both winners
+        # in the autotune cache (the second under its prelude's key) and
+        # searches nothing.
+        jobs = []
+        run_job = LocalBenchmarkProvider._run_subprocess_benchmark_job
+
+        def recorded(provider, *args, **kwargs):
+            jobs.append(provider._prelude_path is not None)
+            return run_job(provider, *args, **kwargs)
+
+        environ = {
+            name: value
+            for name, value in os.environ.items()
+            # a regime without a flush per call refuses a prelude
+            if name
+            not in (
+                "HELION_AUTOTUNE_L2_FLUSH",
+                "HELION_AUTOTUNE_FINAL_L2_FLUSH",
+                "HELION_AUTOTUNE_TARGET_REGIME",
+            )
+        }
+        environ["HELION_CACHE_DIR"] = self.enterContext(tempfile.TemporaryDirectory())
+        self.enterContext(patch.dict(os.environ, environ, clear=True))
+        self.enterContext(
+            patch.object(
+                LocalBenchmarkProvider, "_run_subprocess_benchmark_job", recorded
+            )
+        )
+        # As in test_kernels_tuned_in_sequence: the sequence on Triton.
+        self.enterContext(
+            patch.object(kernel_sequence, "times_short_kernels", lambda bound: True)
+        )
+        self.enterContext(config.patch({"triton.mix_order_reduction": True}))
+        self.enterContext(helion_config.patch(autotune_effort="quick"))
+        x = torch.randn(100000, 96, device=DEVICE)
+        self.assertEqual(len(self.compile(lambda x: x.sum(0), x, tol=1e-3)), 2)
+        self.assertIn(False, jobs)
+        self.assertIn(True, jobs)
+        jobs.clear()
+        torch._dynamo.reset()
+        PyCodeCache.cache_clear()
+        with fresh_cache():
+            self.compile(lambda x: x.sum(0), x, tol=1e-3)
+        self.assertEqual(jobs, [])
 
     def test_split_reduction_chunks(self):
         # Inductor cuts x.sum(0), an rdim of 100000, into chunks by a
