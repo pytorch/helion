@@ -2385,9 +2385,11 @@ class Backend(abc.ABC):
         return False
 
     def reflattens_pointwise_tiles(self) -> bool:
-        """Whether a flatten-loop spec a partial-block access disables stays a
-        candidate (``ConfigSpec.cute_reflatten_candidates``) for the device-IR
-        analysis to re-register once the kernel proves pointwise."""
+        """Whether a flatten-loop spec that a partial-block access or a
+        tile.index read disables stays a candidate
+        (``ConfigSpec.cute_reflatten_candidates``) for the device-IR analysis
+        to re-register once the kernel proves pointwise: the backend decodes
+        a flattened tile's per-dim indices per element."""
         return False
 
     def tunes_lane_vector_widths(self) -> bool:

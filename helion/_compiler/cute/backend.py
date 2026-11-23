@@ -5549,6 +5549,19 @@ class CuteBackend(Backend):
         return True
 
     def reflattens_pointwise_tiles(self) -> bool:
+        # A flattened tile decodes each element's per-dim indices from its
+        # flat offset, so a partial access and a tile.index read stay per
+        # element.  The zero pad of [512, 23212] bf16 rows to 23923 columns,
+        # read at -355 + tile_x.index + 23212*tile_y.index, flattened with
+        # 8-wide packets:
+        #     for vec_lane_0_1 in cutlass.range_constexpr(8):
+        #         offsets_0_1 = lane_base_0_1 + cutlass.Int32(vec_lane_0_1)
+        #         indices_1 = offsets_0_1 % 23923   # tile_x.index
+        #         indices_0 = offsets_0_1 // 23923  # tile_y.index
+        #         ...  # the element's read, if 355 <= indices_1 < 23567
+        #     _cute_store_u16_vec(out0.iterator + cutlass.Int32(lane_base_0_1), ...)
+        # stores a packet at a time, where its [4, 256] tiles store element
+        # by element: rows of 23923 bf16 are not 16-byte aligned.
         return True
 
     def reduces_every_dim_one_at_a_time(self) -> bool:

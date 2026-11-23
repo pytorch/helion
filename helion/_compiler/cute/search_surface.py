@@ -1089,8 +1089,15 @@ def restore_pointwise_flatten_choices(
     # Not for a kernel that may re-bind a tile dim to another block (a
     # blockwise transpose, a right-aligned lower-rank operand): its
     # exchange pairs elements within the unflattened per-block tile.  Nor
-    # for a loop whose block size sizes an ``hl.arange``: it counts
-    # positions in a rectangular tile.
+    # for a loop whose block size sizes an ``hl.arange``, nor, deferred by
+    # tile.index, one whose tile.index an ``hl.split``, ``hl.join`` or
+    # element-moving reshape takes: they count or exchange positions in a
+    # rectangular tile (rectangular_tile_block_ids).  A loop that reads
+    # tile.block_size as a value comes back pinned (pin_unflattened_loops
+    # pinned its candidate), so a config saved with its slot still loads.
+    from .cute_reshape import kernel_may_rebind_block_ids
+    from .cute_reshape import rectangular_tile_block_ids
+
     env = CompileEnvironment.current()
     spec = env.config_spec
     if (
@@ -1098,16 +1105,20 @@ def restore_pointwise_flatten_choices(
         and not len(spec.flatten_loops)
         and spec.cute_reflatten_candidates
     ):
-        from .cute_reshape import block_size_arange_block_ids
-        from .cute_reshape import kernel_may_rebind_block_ids
-
         if not kernel_may_rebind_block_ids(device_ir.graphs):
-            arange_block_ids = block_size_arange_block_ids(device_ir.graphs)
+            # The choices that tile.index deferred also keep off its
+            # exchanges (rectangular_tile_block_ids).
+            rectangular: dict[bool, set[int]] = {}
             for fspec in sorted(
                 spec.cute_reflatten_candidates, key=lambda f: f.block_ids[0]
             ):
+                exchanges = spec.reads_tile_index(fspec)
+                if exchanges not in rectangular:
+                    rectangular[exchanges] = rectangular_tile_block_ids(
+                        device_ir.graphs, exchanges=exchanges
+                    )
                 if not any(
-                    env.canonical_block_id(block_id) in arange_block_ids
+                    env.canonical_block_id(block_id) in rectangular[exchanges]
                     for block_id in fspec.block_ids
                 ):
                     spec.flatten_loops.append(fspec)
