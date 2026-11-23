@@ -45,7 +45,6 @@ from .fragment_mma import LANE_PREAMBLE
 from .fragment_mma import SIMDGROUP
 from .fragment_mma import SPLIT_BUFFER
 from .fragment_mma import is_fragment_acc
-from .fragment_mma import kernel_constants
 from .lane_fold import MSL_SCALAR_BYTES
 from .lane_fold import jam_lanes_into_loops
 from .lane_fold import unroll_lane_folds
@@ -60,6 +59,7 @@ from .msl_reduction import GROUP_PATHS
 from .msl_reduction import REDUCTION_INCLUDES
 from .msl_reduction import REDUCTION_NAMESPACE
 from .msl_reduction import REDUCTION_PREAMBLE
+from .operand_elements import kernel_constants
 from .reduction import LAUNCH_DIM_VARS
 from .reduction import RED_SITE_GLOBAL_PREFIX
 from .reduction import TG_BUFFER_GLOBAL_PREFIX

@@ -19,7 +19,7 @@ from helion._compiler.metal.affine_fold import remainder
 from helion._compiler.metal.affine_fold import render
 from helion._compiler.metal.fragment_mma import _assigned_from
 from helion._compiler.metal.fragment_mma import _early_load
-from helion._compiler.metal.fragment_mma import kernel_constants
+from helion._compiler.metal.operand_elements import kernel_constants
 from helion._testing import skipUnlessBackends
 
 # Metal codegen only: other backends' CPU lanes skip the module.

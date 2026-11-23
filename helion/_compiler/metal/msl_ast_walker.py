@@ -34,7 +34,6 @@ from ... import exc
 from .fragment_mma import FRAGMENT_SLOT
 from .fragment_mma import SIMDGROUP
 from .fragment_mma import EarlyLoad
-from .fragment_mma import FragmentElement
 from .fragment_mma import emit_fragment_acc
 from .fragment_mma import emit_fragment_run
 from .fragment_mma import emit_split_combine
@@ -54,6 +53,8 @@ from .msl_reduction import REDUCTION_NAMESPACE
 
 if TYPE_CHECKING:
     from collections.abc import Callable
+
+    from .operand_elements import ElementBody
 
 
 @dataclasses.dataclass
@@ -91,7 +92,7 @@ class EmitState:
     fragments: dict[str, tuple[int, int, int]] = dataclasses.field(default_factory=dict)
     #: The kernel's names that are constants, which a fragment run folds its
     #: elements' index arithmetic over and tabulates their decodes with
-    #: (``fragment_mma``'s ``kernel_constants``).
+    #: (``operand_elements.kernel_constants``).
     constants: dict[str, int | float] = dataclasses.field(default_factory=dict)
     #: Each ``constant`` table (``tabulate``) by its element type and
     #: entries, to its name; the kernel's source declares them.
@@ -109,7 +110,7 @@ class EmitState:
         tuple[
             str,
             dict[EarlyLoad, str],
-            dict[tuple[int, int, int], FragmentElement],
+            dict[tuple[int, int, int], ElementBody],
         ],
     ] = dataclasses.field(default_factory=dict)
     #: How many prefetch registers the kernel has named, which keeps their

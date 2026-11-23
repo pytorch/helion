@@ -159,6 +159,8 @@ ELEMENTS = "_helion_mpp_elements"
 FRAG_RUN = "_helion_mpp_fragments"
 FRAG_A = "_helion_mpp_frag_a"
 FRAG_B = "_helion_mpp_frag_b"
+#: The runs whose element statements fold per element (``operand_elements``).
+ELEMENT_RUNS = (FRAG_RUN,)
 _ELEMENT_LOOPS = (ELEMENTS, FRAG_RUN, FRAG_A, FRAG_B)
 BIND = "_helion_mpp_bind"
 STAGE = "_helion_mpp_stage"
