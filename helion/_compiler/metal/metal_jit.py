@@ -47,6 +47,7 @@ from .fragment_mma import is_fragment_acc
 from .lane_fold import MSL_SCALAR_BYTES
 from .lane_fold import jam_lanes_into_loops
 from .lane_fold import unroll_lane_folds
+from .masked_branch import branch_masked_steps
 from .mpp_matmul import ACC
 from .mpp_matmul import REG_RUN
 from .mpp_matmul import RUN
@@ -298,6 +299,7 @@ def _generate_msl(
         },
     )
     shared = _shared_storage(args)
+    body_stmts = branch_masked_steps(body_stmts)
     body_stmts = select_masked_loads(
         body_stmts,
         frozenset(

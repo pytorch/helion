@@ -44,6 +44,7 @@ from .lane_fold import BF16_CAST
 from .lane_fold import LANE_PUT
 from .lane_fold import load_mask_other
 from .lane_fold import tl_load
+from .lane_fold import tl_store
 from .mpp_matmul import ACC_SEED
 from .mpp_matmul import FRAG_RUN
 from .mpp_matmul import REG_RUN
@@ -184,17 +185,6 @@ class EmitState:
 # ---------------------------------------------------------------------------
 
 
-def _is_tl_store_call(node: ast.AST) -> bool:
-    """Return True if *node* is a ``tl.store(...)`` call."""
-    return (
-        isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Attribute)
-        and isinstance(node.func.value, ast.Name)
-        and node.func.value.id == "tl"
-        and node.func.attr == "store"
-    )
-
-
 def _emit_tl_store(
     node: ast.Call,
     parts: list[str],
@@ -287,7 +277,7 @@ def _emit_stmts(
         elif isinstance(stmt, ast.Expr):
             call = stmt.value
             # tl.store(ptr + offset, val, mask) → if (mask) { *(ptr+offset) = val; }
-            if _is_tl_store_call(call):
+            if tl_store(call) is not None:
                 assert isinstance(call, ast.Call)
                 _emit_tl_store(call, parts, indent, subs, state.split)
             elif _is_call_to(call, LANE_PUT):
