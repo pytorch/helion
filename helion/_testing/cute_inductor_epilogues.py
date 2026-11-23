@@ -1,7 +1,9 @@
-"""Inductor's pointwise GEMM epilogues, written the way its Helion lowering emits them.
+"""Inductor's pointwise GEMM epilogues, written the way its Helion lowering emitted them.
 
 Each ``*_mm_into`` kernel stores ``epilogue(acc)`` of ``acc = a @ b``, most
-with Inductor's spelling: constants are 0-d ``hl.full`` tensors, masks are
+with the spelling helion.inductor used while its constants were 0-d
+``hl.full`` tensors (it now writes float32 constants as Python numbers, as
+``half_bias_number`` does): constants are 0-d ``hl.full`` tensors, masks are
 ``.to(torch.bool)`` conversions, and a repeated operand (``y * y``) reaches the
 device IR as ``mul(y, y)``. Some literal ``where`` forms instead
 write Python numbers, which trace as ``aten.scalar_tensor``, and raw boolean
@@ -33,6 +35,22 @@ def half_bias_mm_into(
         for inner in hl.tile(k):
             acc = torch.addmm(acc, a[rows, inner], b[inner, cols])
         half = hl.full([], 0.5, dtype=torch.float32)
+        out[rows, cols] = ((bias[cols].to(torch.float32) + acc) * half).to(out.dtype)
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def half_bias_number_mm_into(
+    a: torch.Tensor, b: torch.Tensor, bias: torch.Tensor, out: torch.Tensor
+) -> None:
+    """``(x @ w + bias) * 0.5`` with the constant a Python number, as
+    helion.inductor writes float32 constants."""
+    m, k = a.shape
+    n = b.shape[1]
+    for rows, cols in hl.tile((m, n)):
+        acc = hl.zeros((rows, cols), dtype=torch.float32)
+        for inner in hl.tile(k):
+            acc = torch.addmm(acc, a[rows, inner], b[inner, cols])
+        half = 0.5
         out[rows, cols] = ((bias[cols].to(torch.float32) + acc) * half).to(out.dtype)
 
 
@@ -453,6 +471,13 @@ INDUCTOR_EPILOGUES: tuple[InductorEpilogue, ...] = (
     InductorEpilogue(
         "half_bias",
         half_bias_mm_into,
+        ("row",),
+        lambda acc, bias: (bias.float() + acc) * 0.5,
+        r"= tcgen05_chain_step(?:_\d+)* \* 0\.5$",
+    ),
+    InductorEpilogue(
+        "half_bias_number",
+        half_bias_number_mm_into,
         ("row",),
         lambda acc, bias: (bias.float() + acc) * 0.5,
         r"= tcgen05_chain_step(?:_\d+)* \* 0\.5$",

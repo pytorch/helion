@@ -36,6 +36,12 @@ def upcast_compute_type(dtype: torch.dtype) -> torch.dtype:
     return dtype
 
 
+def number_constant(value: object, dtype: torch.dtype) -> bool:
+    """Whether HelionOverrides.constant() writes ops.constant(value, dtype) as a
+    Python number: a float32 one (bf16 and fp16 compute in float32)."""
+    return upcast_compute_type(dtype) == torch.float32 and not isinstance(value, bool)
+
+
 class HelionPrinter(PythonPrinter):
     """Prints Min/Max over tile index tensors as torch.minimum/maximum."""
 
@@ -66,7 +72,21 @@ class HelionOverrides(OpOverrides):
 
     @staticmethod
     def constant(value: bool | float, dtype: torch.dtype) -> str:
-        # A 0-d tensor, since torch.minimum/maximum take no Python scalar.
+        """A float32 constant is a Python float, as in a Helion kernel written
+        by hand, which the Helion compiler's rewrites take for one: of the
+        threshold of a dropout mask, rand > 0.1 compares the random words
+        against one integer cutoff, where with a 0-d tensor each element
+        converts its word to fp32 and compares.  A Python float and a 0-d
+        tensor promote alike against a tensor of the same dtype category (a
+        bf16 x + 1.0 stays bf16), which is all Inductor's ops mix (it casts
+        their operands to one dtype first).  An op that takes no Python
+        scalar (torch.maximum(x, 0.0), a store, a cast) gets it as a 0-d
+        tensor (HelionKernel.as_tensor()).  Other constants stay 0-d tensors
+        of their dtype: hl.full([], 4, dtype=torch.int64), and a float64 one,
+        whose printed number would share the CSE entry of the same float32
+        constant."""
+        if number_constant(value, dtype):
+            return constant_repr(float(value))
         dtype = upcast_compute_type(dtype)
         return f"hl.full([], {constant_repr(value)}, dtype={dtype})"
 
