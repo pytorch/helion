@@ -24,6 +24,8 @@ from helion._testing.guarded_lane_kernels import masked_accumulate
 from helion._testing.guarded_lane_kernels import padded_and_transposed
 from helion._testing.guarded_lane_kernels import padded_sum
 from helion._testing.guarded_lane_kernels import padded_sum_reference
+from helion._testing.guarded_lane_kernels import pooled_max
+from helion._testing.guarded_lane_kernels import pooled_max_reference
 from helion._testing.guarded_lane_kernels import window_max
 from helion._testing.guarded_lane_kernels import window_max_reference
 
@@ -193,6 +195,53 @@ def test_fp16_window_maxima_under_the_store_guard_match_eager() -> None:
     for knobs in _KNOBS:
         actual = _kernel(window_max, _PACKETS, knobs)(x)  # type: ignore[operator]
         _assert_same_values(actual, expected, knobs)
+
+
+def _pooled_input(case: str) -> torch.Tensor:
+    """A ``[35, 39, C]`` activation with NaNs and infinities (17 x 19
+    outputs of a 3x3 window: partial tiles of four on H and W): contiguous
+    with 64 channels (eight 16-byte bf16 packets a row), in fp32, with 24
+    channels (three packets, a tile of one), five elements into its storage
+    (no packet starts on a 16-byte boundary), or every other row of a
+    taller one."""
+    if case == "fp32":
+        return _activation((35, 39, 64), specials=True, dtype=torch.float32)
+    if case == "three_packets":
+        return _activation((35, 39, 24), specials=True)
+    if case == "offset":
+        return _activation((35 * 39 * 64 + 5,), specials=True)[5:].view(35, 39, 64)
+    if case == "strided":
+        return _activation((70, 39, 64), specials=True)[::2]
+    assert case == "bf16"
+    return _activation((35, 39, 64), specials=True)
+
+
+@pytest.mark.parametrize("case", ["bf16", "fp32", "three_packets", "offset", "strided"])
+def test_pooled_maxima_at_the_seeded_cta_minimum_match_eager(case: str) -> None:
+    """The packet tile seed that names ``cute_min_blocks_per_mp``, taken
+    from the kernel's own seeds: a 3x3 max pooling, whose lanes fold nine
+    packets, stores eager's values at it, and with the minimum raised to 4."""
+    x = _pooled_input(case)
+    expected = pooled_max_reference(x, 3, 3)
+    assert torch.isnan(expected).any() and torch.isinf(expected).any()
+    spec = (
+        helion.kernel(
+            pooled_max.fn, backend="cute", static_shapes=True, autotune_effort="full"
+        )
+        .bind((x, 3, 3))
+        .config_spec
+    )
+    [twin] = [
+        seed.config
+        for seed in spec.compiler_seed_configs
+        if seed.config.get("cute_guarded_lanes") is True
+        and "cute_min_blocks_per_mp" in seed.config
+    ]
+    assert twin["cute_min_blocks_per_mp"] == 1
+    for minimum in (1, 4) if case == "bf16" else (1,):
+        config = {**twin, "cute_min_blocks_per_mp": minimum}
+        actual = _kernel(pooled_max, config, "off")(x, 3, 3)  # type: ignore[operator]
+        _assert_same_values(actual, expected, f"{case}, minimum {minimum}")
 
 
 @pytest.mark.parametrize("view", ["offset", "strided", "permuted"])

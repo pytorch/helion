@@ -73,6 +73,7 @@ from .launch_shape import plan_owned_launch
 from .math_templates import SIGMOID_TEMPLATE
 from .math_templates import argreduce_candidate_expr
 from .math_templates import nan_extremum_expr
+from .packet_flush_names import streaming_store_rendered
 from .pdl_release import ZERO_FILL_KERNEL_PREFIX
 from .pdl_release import generic_release_rendered
 from .pdl_release import spread_rendered
@@ -1489,14 +1490,42 @@ class CuteBackend(Backend):
         ranking by the release there would break ties between unrelated
         knobs (matmul backward s2: a clc-persistent finalist 0.5% behind in
         the autotuner's regime, 7% behind in the catalogue's).  A config
-        without the knob ranks last without a render.
+        without the knob ranks 2, and is rendered only for the store policy
+        below.
+
+        Behind all of these come the kernels that flush a packet with the
+        streaming store policy (``cute_store_policy='streaming'``,
+        ``st.global.cs``): three ranks back, so the ranks 0 to 2 are those of
+        kernels that store with the default policy.  The policy marks the
+        output's lines evict-first at L1 and L2.  The kernel's own isolated
+        timing reads that as a tie wherever the output displaces nothing the
+        kernel reads again, and the next kernel of the real call sequence
+        pays for it when it reads that output, which a default store would
+        have left in L2.  A displaced output costs its reader in proportion
+        to its size and a missed early launch at most one launch overlap,
+        so the store ranks before the release.  Whether a config flushes
+        such a packet is read off its module as well
+        (``streaming_store_rendered``): on scalar stores, narrower packets
+        and staged stores the policy renders nothing.  A config with the
+        default policy is never rendered for it.
+
+        The direction is fixed, so this is a tie break with a bounded loss
+        and not a claim that default stores are faster: it acts only
+        between finalists the selection's windows read within the
+        tolerance, where a kernel gives up at most that share of its own
+        time.
         """
-        if config.config.get("cute_pdl") is not True:
+        streaming = config.config.get("cute_store_policy") == "streaming"
+        releasing = config.config.get("cute_pdl") is True
+        if not streaming and not releasing:
             return 2
         rendered = source()
-        if not generic_release_rendered(rendered):
-            return 2
-        return 0 if spread_rendered(rendered) else 1
+        rank = 2
+        if releasing and generic_release_rendered(rendered):
+            rank = 0 if spread_rendered(rendered) else 1
+        if streaming and streaming_store_rendered(rendered):
+            rank += 3
+        return rank
 
     def build_standalone_code(
         self,

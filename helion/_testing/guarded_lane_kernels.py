@@ -40,6 +40,44 @@ def window_max_reference(x: torch.Tensor) -> torch.Tensor:
 
 
 @helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def pooled_max(x: torch.Tensor, kernel_h: int, kernel_w: int) -> torch.Tensor:
+    """``kernel_h`` x ``kernel_w`` max pooling, stride 2 and no padding, of a
+    ``[H, W, C]`` activation: one fp32 maximum of ``kernel_h * kernel_w``
+    loads per output element."""
+    kernel_h = hl.specialize(kernel_h)
+    kernel_w = hl.specialize(kernel_w)
+    height, width, channels = x.shape
+    out_h = (height - kernel_h) // 2 + 1
+    out_w = (width - kernel_w) // 2 + 1
+    out = torch.empty([out_h, out_w, channels], dtype=x.dtype, device=x.device)
+    for tile_h, tile_w, tile_c in hl.tile([out_h, out_w, channels]):
+        row = (tile_h.index * 2)[:, None]
+        col = (tile_w.index * 2)[None, :]
+        best = x[row, col, tile_c].to(torch.float32)
+        for offset in hl.static_range(1, kernel_h * kernel_w):
+            i = offset // kernel_w
+            j = offset % kernel_w
+            value = x[row + i, col + j, tile_c].to(torch.float32)
+            best = torch.maximum(best, value)
+        out[tile_h, tile_w, tile_c] = best.to(out.dtype)
+    return out
+
+
+def pooled_max_reference(x: torch.Tensor, kernel_h: int, kernel_w: int) -> torch.Tensor:
+    """``pooled_max`` in eager PyTorch (fp32 maxima of the same elements)."""
+    height, width, _ = x.shape
+    out_h = (height - kernel_h) // 2 + 1
+    out_w = (width - kernel_w) // 2 + 1
+    value = x.to(torch.float32)
+    best = value[0 : 2 * out_h - 1 : 2, 0 : 2 * out_w - 1 : 2]
+    for offset in range(1, kernel_h * kernel_w):
+        i, j = divmod(offset, kernel_w)
+        tap = value[i : i + 2 * out_h - 1 : 2, j : j + 2 * out_w - 1 : 2]
+        best = torch.maximum(best, tap)
+    return best.to(x.dtype)
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
 def padded_sum(x: torch.Tensor) -> torch.Tensor:
     """Each element of a ``[H, W, C]`` activation plus its upper and lower
     neighbours, the rows past the image reading as zero."""

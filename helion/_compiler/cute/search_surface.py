@@ -277,7 +277,10 @@ def register_search_surface(device_ir: DeviceIR, config_spec: ConfigSpec) -> Non
     # leaves, and the lanes it aligns every row to, are recorded beside the
     # blocks, for the config normalization.
     from .store_packet_layout import aligned_row_multiples
+    from .store_packet_layout import new_axis_stores
+    from .store_packet_layout import sliced_store_dims
     from .store_packet_layout import store_packet_lane_limits
+    from .store_packet_layout import unaligned_store_tensors
     from .store_tier_blocks import store_tier_blocks
 
     config_spec.cute_store_tier_blocks = (
@@ -294,6 +297,20 @@ def register_search_surface(device_ir: DeviceIR, config_spec: ConfigSpec) -> Non
         {}
         if config_spec.matmul_facts
         else aligned_row_multiples(device_ir, config_spec)
+    )
+    # The stored tensors whose base no 16-byte packet lands on: the store
+    # policy (``cute_store_policy``) renames no flush into them.  The store
+    # subscripts that are slices, whose lanes are no tile's.  And whether a
+    # store has a ``None`` subscript, behind which the store facts do not
+    # say whose lanes a flush holds.
+    config_spec.cute_unaligned_store_tensors = (
+        frozenset() if config_spec.matmul_facts else unaligned_store_tensors(device_ir)
+    )
+    config_spec.cute_sliced_store_dims = (
+        frozenset() if config_spec.matmul_facts else sliced_store_dims(device_ir)
+    )
+    config_spec.cute_new_axis_stores = not config_spec.matmul_facts and new_axis_stores(
+        device_ir
     )
     # A device loop whose reductions over its own tile are all sums added to
     # a value it carries: combining the sums' threads once after the loop is

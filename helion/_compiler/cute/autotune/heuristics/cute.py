@@ -186,6 +186,7 @@ from ..search_surface import enable_cute_gdn_recurrence_search
 from ..search_surface import enable_cute_packet_prefetch
 from ..search_surface import enable_cute_proven_bounds
 from ..search_surface import enable_cute_topk_search
+from ..search_surface import extremum_packet_loads
 from ..search_surface import fmnmx_extrema_offered
 from ..search_surface import guarded_lanes_offered
 from ..search_surface import loads_take_packets
@@ -11091,19 +11092,25 @@ class CutePointwiseVecHeuristic(AutotunerHeuristic):
                 if not seed.config.get("cute_rng_packet", False)
             )
         # Last, so the families above keep their seeds and their order.
-        seeds.extend(cls._packet_tile_seeds(env, fact, candidates, vec_block))
+        seeds.extend(
+            cls._packet_tile_seeds(env, device_ir, fact, candidates, vec_block)
+        )
         return seeds
 
     # N-D packet tile seed: the bytes of a lane's packet and the threads per
-    # CTA and per warp.
+    # CTA and per warp; the CTAs-per-SM minimum of the twin, and the packets
+    # an extremum has to fold for it (``_packet_tile_seeds``).
     PACKET_TILE_PACKET_BYTES = 16
     PACKET_TILE_THREADS = 128
     PACKET_TILE_WARP = 32
+    PACKET_TILE_MIN_CTAS_PER_SM = 1
+    PACKET_TILE_MIN_CTAS_LOADS = 8
 
     @classmethod
     def _packet_tile_seeds(
         cls,
         env: CompileEnvironment,
+        device_ir: DeviceIR,
         fact: PointwiseElementwiseFact,
         candidates: list[int],
         vec_block: int,
@@ -11142,6 +11149,42 @@ class CutePointwiseVecHeuristic(AutotunerHeuristic):
         ``raise_grid_block_minimums`` puts under the search's block sizes
         where the grid is large, so the search reaches them through the
         seeds.
+
+        Where one fp32 extremum folds ``PACKET_TILE_MIN_CTAS_LOADS`` packets
+        of a lane or more (``extremum_packet_loads``: the nine taps of that
+        pool) the first shape is seeded once more with
+        ``cute_min_blocks_per_mp`` named, as the wide-row and broadcast-hoist
+        seeds name it.  The taps are independent loads, and whether a lane
+        has them all in flight is ptxas's choice.  Compiled for sm_100a at
+        these tiles (bf16, fp16 and fp32 lanes; windows of one, two and
+        three rows; 24, 64 and 192 channels):
+
+        - up to five packet loads, the minimum changes nothing: the kernel's
+          code is the seed's, byte for byte;
+        - six and seven are issued together with or without it;
+        - from eight on, ptxas left without a minimum issues five to seven
+          of the loads, folds them and issues the rest (31 to 40 registers);
+          with a minimum of 1 it issues them all before the first extremum
+          (40 registers at eight loads, 44 to 48 at nine, 56 at twelve), and
+          on that pool it does the same at 2, 3 and 4.
+
+        So the twin is another kernel from eight packets on, and below that
+        a duplicate of the seed, which is not seeded.  The extrema of
+        widened half lanes assemble to packed half-precision instructions, a
+        few per tap, so such a lane does little besides wait for its loads:
+        that pool, flushed per call and without load hints, runs 2.0 us of
+        70 faster with the minimum at equal tiles.  It is seeded because a
+        search that meets these tiles only without a minimum may find one
+        by mutating another tile and stay there.
+
+        The minimum is a twin's, not the seed's own, and only the packets an
+        extremum folds itself count: a lane whose packets reach the extremum
+        through other arithmetic, or that has no extremum (an average
+        pooling's sum), gets no twin, because there the split is often the
+        faster code: the 3x3 average pooling of pointwise_2fd75199c31d (nine
+        masked taps, a sum and a count division per lane) runs 33.5 us
+        without a minimum (40 registers, 12 CTAs per SM) and 35.4 with one
+        (48 registers, 10 CTAs).
         """
         spec = env.config_spec
         if not guarded_lanes_offered(spec) or len(candidates) < 2:
@@ -11213,6 +11256,20 @@ class CutePointwiseVecHeuristic(AutotunerHeuristic):
                         | {"load_eviction_policies": ["l2_last"] * n_evict}
                     )
                 )
+        folded = extremum_packet_loads(device_ir, vec_block)
+        if folded >= cls.PACKET_TILE_MIN_CTAS_LOADS and spec.supports_config_key(
+            "cute_min_blocks_per_mp"
+        ):
+            # An extremum of enough packets that ptxas splits their loads:
+            # the first shape again with the register budget to issue them
+            # together (docstring).  Last, so the seeds above keep their
+            # places.
+            seeds.append(
+                Config.from_dict(
+                    deepcopy(seeds[0].config)
+                    | {"cute_min_blocks_per_mp": cls.PACKET_TILE_MIN_CTAS_PER_SM}
+                )
+            )
         return seeds
 
     # Component-packet seeds: the threads per CTA of each.  Their dtypes are

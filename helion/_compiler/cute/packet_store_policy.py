@@ -14,6 +14,128 @@ from .persistent_branch_vec import PACKET_STORE_BYTES
 if TYPE_CHECKING:
     from collections.abc import Set as AbstractSet
 
+    from ...autotuner.config_spec import ConfigSpec
+
+# The narrowest packet a policy applies to (``lower_packet_store_policy``).
+POLICY_PACKET_BYTES = 16
+# The widest component packet (``memory_ops._cute_component_store_ctx``: one
+# vector store of the widest kind a target has).
+COMPONENT_PACKET_MAX_BYTES = 32
+
+
+def store_policy_reaches_a_packet(
+    config_spec: ConfigSpec, vector_widths: list[object]
+) -> bool:
+    """Whether a config with these ``cute_vector_widths`` may flush a packet
+    that ``cute_store_policy`` applies to.
+
+    ``lower_packet_store_policy`` renames the global packet flushes of 16
+    bytes and splits those of 32; a narrower flush and a scalar store are the
+    same code under every policy.  A flush writes vector lanes along the
+    stored tensor's stride-1 dim (``memory_ops._cute_vector_load_ctx``:
+    ``lane_on_stride1``), as many as the vector width of the block the lanes
+    belong to: the tile strategy's (``LaneLoopContext.vec_width``, a flattened
+    tile's last block) or the reduction strategy's
+    (``_cute_reduction_vec_width``), which both read the block's
+    ``cute_vector_widths`` entry.  Where a tile indexes the stride-1 dim, the
+    lanes are that tile's block's; where a full slice or a computed index
+    does, any block may lend them, and the config's widest vector stands for
+    it.  A component packet (``memory_ops._cute_component_store_ctx``) is the
+    one flush with lanes on another dim: a tile on a dim whose every element
+    holds ``stride`` contiguous ones (``out[tile, c]`` on ``[elements, K]``)
+    stores the ``K`` components of its vector lanes together, ``width * K``
+    elements in one store of at most 32 bytes.  So a config whose stores all
+    have fewer than 16 bytes of lanes on their stride-1 dim, and no such
+    component packet of 16 bytes or more, stores nothing the policy changes,
+    whatever its threads, alignment and masks: the answer is False, and
+    config normalization makes the policy the default one
+    (``search_surface._normalize_cute_lane_knobs``).
+
+    Two facts of the stores narrow this.  A slice on the stride-1 dim
+    (``out[tile_s, tile_r, :]``, the row a reduction's lanes store;
+    ``cute_sliced_store_dims``) has the lanes of the slice's block, which is
+    never an ``hl.tile`` block: the widest vector of the other blocks stands
+    for it, whatever the tiles' widths are.  The block is not read off the
+    store, because a partial slice (``out[tile, :half]``) runs on a block of
+    its own and not on the dim's (``MemoryOpFact.indexed_block_ids``); a
+    computed index (``out[row, col.index * 1]``) stores the lanes of the
+    tile it reads and keeps the widest of all.  And a tensor whose base is
+    on no 16-byte boundary (``cute_unaligned_store_tensors``: an output view
+    that starts off it in its storage) is stored in no 16-byte packet at any
+    width.
+
+    The answer is True, leaving the policy to the pass, wherever this does
+    not describe the stores: a kernel with a matmul (its epilogues store
+    packets of their own), a kernel with a store under a new axis
+    (``cute_new_axis_stores``: behind the ``None`` of ``out[None, tile_m,
+    tile_n]`` the positions of the store's fact are a dim off) and a config
+    spec without store facts (no kernel filled it in).  A stride-1 dim
+    indexed by an integer has no lanes.
+    """
+    if config_spec.matmul_facts:
+        return True
+    if config_spec.cute_new_axis_stores:
+        return True
+    stores = [fact for fact in config_spec.memory_op_facts if fact.kind == "store"]
+    if not stores:
+        return True
+    widest = max(
+        (width for width in vector_widths if isinstance(width, int)), default=1
+    )
+    # The widest vector a slice may run in: of the blocks that are not tiles.
+    tiles = {item.block_id for item in config_spec.block_sizes}
+    slice_widths = [
+        config_spec.cute_vector_widths.config_get(vector_widths, block_id, 1)
+        for block_id in config_spec.cute_vector_widths.valid_block_ids()
+        if block_id not in tiles
+    ]
+    known = [width for width in slice_widths if isinstance(width, int)]
+    widest_slice = max(known) if known and len(known) == len(slice_widths) else widest
+    sliced = config_spec.cute_sliced_store_dims
+    for fact in stores:
+        if fact.dtype is None:
+            # A stack tensor: not a global store.
+            continue
+        if fact.tensor_name in config_spec.cute_unaligned_store_tensors:
+            continue
+        for position, stride in enumerate(fact.subscript_strides):
+            block_id = fact.subscript_block_ids[position]
+            if stride != 1:
+                # The lane dim of a component packet: a tile's lanes, each
+                # with the ``stride`` elements behind it.
+                if block_id is None:
+                    continue
+                lanes = config_spec.cute_vector_widths.config_get(
+                    vector_widths, block_id, 1
+                )
+                if not isinstance(lanes, int) or (
+                    lanes > 1
+                    and POLICY_PACKET_BYTES
+                    <= lanes * stride * fact.dtype.itemsize
+                    <= COMPONENT_PACKET_MAX_BYTES
+                ):
+                    return True
+                continue
+            if block_id is not None:
+                width = config_spec.cute_vector_widths.config_get(
+                    vector_widths, block_id, 1
+                )
+            elif (
+                fact.indexed_block_ids[position] is not None
+                and (fact.tensor_name, position) in sliced
+            ):
+                # A slice of a dim that has a block.
+                width = widest_slice
+            else:
+                # A computed index: the lanes of any block it reads.
+                width = widest
+            if (
+                not isinstance(width, int)
+                or width * fact.dtype.itemsize >= POLICY_PACKET_BYTES
+            ):
+                return True
+    return False
+
 
 def _store_call(statement: ast.stmt) -> tuple[ast.Call, str, int | None] | None:
     """``(call, collector, lanes)`` of a plain packet flush statement.
