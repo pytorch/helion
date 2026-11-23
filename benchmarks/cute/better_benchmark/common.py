@@ -31,6 +31,7 @@ import gc
 import hashlib
 import importlib.metadata
 import importlib.util
+import io
 import json
 import math
 import os
@@ -42,6 +43,7 @@ import subprocess
 import sys
 import threading
 import time
+import tokenize
 from typing import TYPE_CHECKING
 from typing import Any
 from typing import Callable
@@ -895,21 +897,36 @@ def load_autotuned_port(
 
 def per_kernel(kernels: dict[str, dict[str, Any]], field: str) -> dict[str, Any]:
     """``field`` of each kernel of an autotune record (its ``kernels``), by
-    the kernel's name: ``decorator``, what the kernel is pinned to, or
-    ``code_sha256``, the digest of the code it then generates."""
+    the kernel's name: ``decorator``, what the kernel is pinned to, or a
+    digest of the code it then generates (``code_sha256`` and, in the
+    records that hold it, ``code_nosrc_sha256``: ``code_digests``)."""
     return {name: kernel[field] for name, kernel in kernels.items()}
+
+
+def holds_nosrc_digests(kernels: dict[str, dict[str, Any]]) -> bool:
+    """Whether every kernel of an autotune record (its ``kernels``) holds
+    the digest of its code without source-line comments
+    (``code_nosrc_sha256``): none of a record made before
+    ``bound_kernel_records`` recorded it does."""
+    return all("code_nosrc_sha256" in kernel for kernel in kernels.values())
 
 
 def timed_record_fields(tuned: dict[str, Any]) -> dict[str, Any]:
     """The fields with which a bench record names the autotune record
-    ``tuned`` that a port's timing pinned: its kernels' code digests,
-    whether it was provisional or reused, and the regime its searches timed
-    their candidates in (the record's, and each kernel's where the record
-    says).  An autotune that runs after the
-    bench replaces the record, and ``report.py`` counts the timing only while
-    the record holds the same kernels."""
+    ``tuned`` that a port's timing pinned: its kernels' code digests
+    (``autotune_code_sha256``, and ``autotune_code_nosrc_sha256`` where the
+    record holds those: ``holds_nosrc_digests``), whether it was provisional
+    or reused, and the regime its searches timed their candidates in (the
+    record's, and each kernel's where the record says).  An autotune that
+    runs after the bench replaces the record, and ``report.py`` counts the
+    timing only while the record holds the same kernels
+    (``timed_kernels_held``)."""
+    kernels = tuned["kernels"]
+    digests = {"autotune_code_sha256": per_kernel(kernels, "code_sha256")}
+    if holds_nosrc_digests(kernels):
+        digests["autotune_code_nosrc_sha256"] = per_kernel(kernels, "code_nosrc_sha256")
     return {
-        "autotune_code_sha256": per_kernel(tuned["kernels"], "code_sha256"),
+        **digests,
         "autotune_provisional": bool(tuned.get("provisional")),
         "autotune_reused_from": tuned.get("reused_from"),
         # How the record's searches timed their candidates (``REGIMES``),
@@ -925,8 +942,16 @@ def timed_kernels_held(info: dict[str, Any], tuned: dict[str, Any] | None) -> bo
     """Whether the autotune record ``tuned`` (None: the point has no ok one)
     holds the kernels that a port's entry in a bench record, ``info``, was
     timed on: by their code digests (``timed_record_fields``), or, for an
-    entry made before ``bench.py`` recorded those, by their decorators."""
+    entry made before ``bench.py`` recorded those, by their decorators.
+    The digests without source-line comments decide where the entry and the
+    record both hold them, so a record that an autotune of the same
+    statements replaced still holds the kernels; the digests of the whole
+    text, which both then hold, decide otherwise."""
     kernels = (tuned or {}).get("kernels", {})
+    if "autotune_code_nosrc_sha256" in info and holds_nosrc_digests(kernels):
+        return info["autotune_code_nosrc_sha256"] == per_kernel(
+            kernels, "code_nosrc_sha256"
+        )
     if "autotune_code_sha256" in info:
         return info["autotune_code_sha256"] == per_kernel(kernels, "code_sha256")
     return info.get("decorators") == per_kernel(kernels, "decorator")
@@ -1132,18 +1157,85 @@ def generated_code(bound: Any) -> str:
     return Path(path).read_text() if path else bound.to_code(bound._config)
 
 
-def code_digests(module: types.ModuleType) -> dict[str, str]:
-    """``{kernel: sha256 of its generated code}`` for a port's kernels."""
+# How Helion's printer begins a source-line comment, a line that quotes the
+# kernel's source above the statements generated from it:
+# ``# src[<file>:<line>]: <text>`` (``_LocationAnnotatingOutputLines`` in
+# ``helion/_compiler/ast_extension.py``).
+SOURCE_COMMENT = "# src["
+
+
+def without_source_comments(code: str) -> str:
+    """Generated module ``code`` without its source-line comments
+    (``SOURCE_COMMENT``), every other character as it is.
+
+    The comments name the port's file and line and quote the line, so they
+    change with a comment in the port or a line added above a kernel, where
+    the statements that run stay the same.
+
+    A line goes only when Python's tokenizer reads a comment on it that
+    begins that way and stands between two logical lines: after the end of
+    a statement or of a block's header, or at the start of the module,
+    which is where the printer writes them. Such a comment has its line to
+    itself (code before it would be of a logical line that has not ended),
+    and Python ignores a comment line there, so no code goes with it and
+    the lines around it read as they did. What stays: a line that reads the
+    same inside a string literal, which is part of a string token and no
+    comment; a comment behind code, which comes before its logical line's
+    end; and a comment inside a logical line that spans lines, between
+    brackets, in a replacement field of an f-string (where its line break
+    can be part of the value) or behind a line that holds a backslash
+    alone, which joins the comment's line to itself (without the comment
+    it would join the next line, at its own indentation).
+
+    A text with a carriage return other than in a line's CRLF ending is
+    returned whole: Python ends a line at one, the lines read here end at
+    the line feed alone, and the line of a comment would take the code
+    behind the carriage return with it. The printer writes none."""
+    if "\r" in code.replace("\r\n", "\n"):
+        return code
+    lines = io.StringIO(code).readlines()
+    comments: set[int] = set()
+    between_logical_lines = True
+    for token in tokenize.generate_tokens(io.StringIO(code).readline):
+        if token.type == tokenize.COMMENT:
+            row = token.start[0]
+            if (
+                between_logical_lines
+                and token.string.startswith(SOURCE_COMMENT)
+                # A backslash alone on the line before is no token, and
+                # the logical line it starts takes in this line.
+                and (row == 1 or lines[row - 2].strip() != "\\")
+            ):
+                comments.add(row)
+        elif token.type != tokenize.NL:
+            # NEWLINE ends a logical line; any other token but NL (the end
+            # of a blank line, of a comment's line or of a line inside
+            # brackets) is of the next one, or ends the module.
+            between_logical_lines = token.type == tokenize.NEWLINE
+    return "".join(line for row, line in enumerate(lines, 1) if row not in comments)
+
+
+def code_digests(module: types.ModuleType) -> dict[str, dict[str, str]]:
+    """The digests of the code each kernel of a port generated, by kernel:
+    ``code_sha256`` of the module's whole text and ``code_nosrc_sha256`` of
+    the text ``without_source_comments``."""
     out = {}
     for name, kernel in port_kernels(module).items():
         code = generated_code(_bound_kernel(name, kernel))
-        out[name] = hashlib.sha256(code.encode()).hexdigest()
+        texts = {
+            "code_sha256": code,
+            "code_nosrc_sha256": without_source_comments(code),
+        }
+        out[name] = {
+            field: hashlib.sha256(text.encode()).hexdigest()
+            for field, text in texts.items()
+        }
     return out
 
 
 def bound_kernel_records(module: types.ModuleType) -> dict[str, dict[str, Any]]:
-    """The tuned decorator, config and generated-code digest of every kernel
-    a port's ``forward`` bound."""
+    """The tuned decorator, config and generated-code digests
+    (``code_digests``) of every kernel a port's ``forward`` bound."""
     digests = code_digests(module)
     records: dict[str, dict[str, Any]] = {}
     for name, kernel in port_kernels(module).items():
@@ -1151,17 +1243,34 @@ def bound_kernel_records(module: types.ModuleType) -> dict[str, dict[str, Any]]:
         records[name] = {
             "decorator": bound.format_kernel_decorator(bound._config, bound.settings),
             "config": bound._config.to_json(),
-            "code_sha256": digests[name],
+            **digests[name],
         }
     return records
+
+
+def pinning_digest(kernel: dict[str, Any]) -> str:
+    """The digest by which a kernel's entry in an autotune record (its
+    ``kernels``) pins the kernel's code: ``code_nosrc_sha256``, so that the
+    record holds while the port's edits change no generated statement, or,
+    for an entry made before ``bound_kernel_records`` recorded that one, the
+    only digest it holds: ``code_sha256``, of the whole text, by which such
+    an entry was compared when it was made. An entry with both is compared
+    by ``code_nosrc_sha256`` alone: its ``code_sha256`` is for the reader
+    and for a harness from before this digest, and is not consulted."""
+    return "code_nosrc_sha256" if "code_nosrc_sha256" in kernel else "code_sha256"
 
 
 def pin_roundtrip(
     module: types.ModuleType, records: dict[str, dict[str, Any]]
 ) -> dict[str, bool]:
-    """Whether each kernel of a pinned port generates the recorded code."""
+    """Whether each kernel of a pinned port generates the recorded code, by
+    the digest its record pins it by (``pinning_digest``)."""
     digests = code_digests(module)
-    return {name: digests.get(name) == r["code_sha256"] for name, r in records.items()}
+    held = {}
+    for name, record in records.items():
+        field = pinning_digest(record)
+        held[name] = name in digests and digests[name][field] == record[field]
+    return held
 
 
 def order_balanced(

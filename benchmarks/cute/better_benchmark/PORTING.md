@@ -8,7 +8,15 @@ the same work as Inductor's kernels, so follow these rules. Each port is
 self-contained: it repeats the kernels it shares with other ports (the online
 softmax statistics, the BatchNorm Welford partials), so that a port reads
 alone and a change to one port leaves the others' generated code, and the
-autotune records pinned to it, alone.
+autotune records pinned to it, alone. A port's own records hold through
+edits that change none of its generated statements: a pin compares the
+generated code without the lines that quote the port's source (README, What
+a pin compares), so a reworded comment or a line added above a kernel
+leaves them standing, and any edit that changes the generated code needs a
+new autotune. That holds for the records with the digest of the code
+without those lines (`code_nosrc_sha256`). A record made before autotune
+records held it is compared by the whole text, and goes stale with such an
+edit as well until its point is autotuned again.
 
 ## Steps
 

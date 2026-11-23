@@ -16,10 +16,13 @@ implementation is left out of every comparison and aggregate when it failed
 its run or the anchored numerics gate (``FAIL`` in the numerics column),
 or, for a Helion port, when its pinned kernels no longer generate the code
 the autotune measured (``stale``: ``code_matches_autotune`` is false, so the
-timing is not of the tuned kernels). One exception, in a record of several
-processes: an Inductor compile that failed in some of them (``FAIL`` in the
-column as well) still stands in the baseline of the processes in which it
-ran and passed (``impl_times``), and the report lists it.
+timing is not of the tuned kernels; the source-line comments of the code do
+not count, except for an autotune record made before records held the
+digest without them: ``common.pin_roundtrip``). One exception, in a record
+of several processes: an Inductor compile that failed in some of them
+(``FAIL`` in the column as well) still stands in the baseline of the
+processes in which it ran and passed (``impl_times``), and the report lists
+it.
 
 The aggregates count only records whose foreign GPU activity was sampled
 and clean (``common.activity_issue``): a bench record during which a
@@ -29,8 +32,10 @@ record leaves out its port (``--include-unsampled`` counts the records made
 before the sampling existed, which have no samples at all; never one whose
 samples miss its job). The report lists these records. A port's timing counts
 only while its point's autotune record holds the kernels ``bench.py``
-pinned (``autotune_code_sha256``; records made before name their
-decorators only): a port timed on a provisional config (an earlier run's,
+pinned (``autotune_code_nosrc_sha256`` where the entry and the record hold
+the digests without source-line comments, else ``autotune_code_sha256``;
+records made before name their decorators only): a port timed on a
+provisional config (an earlier run's,
 standing in until the port's own autotune has run: ``plan_run.py
 --provisional-triton``), or on a record that an autotune has replaced since
 or removes while it runs, shows its numbers, even when that config now
@@ -402,7 +407,8 @@ def timed_record_issue(
     """Why a port's timing (``info``, its entry in a bench record) is not of
     its point's current autotune record (``config``; None when the point has
     no ok one), or None when it is. ``bench.py`` records the code digests of
-    the record it pinned (records made before name its decorators only); an
+    the record it pinned (``common.timed_kernels_held`` says which digests
+    decide; records made before name its decorators only); an
     autotune that runs after the bench (phase 2 of a run on provisional
     configs) moves that record aside while it runs and replaces it if it
     succeeds."""

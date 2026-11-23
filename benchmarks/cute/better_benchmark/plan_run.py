@@ -14,8 +14,9 @@ newest first) when
   made before records named a regime was tuned alone), and
 - its pinned kernels still generate the code they were tuned as, at this
   tree (``common.pin_roundtrip`` after one forward of the pinned port, as
-  ``bench.py`` checks it; this needs a GPU, and ``--no-pin-check`` reuses
-  nothing);
+  ``bench.py`` checks it: the comments that quote the port's source do not
+  count, except for a record made before records held the digest without
+  them; this needs a GPU, and ``--no-pin-check`` reuses nothing);
 
 any other Triton point, one whose config this tree rejects included, is
 autotuned again.  Every point is benched.  Run it on a GPU of your own::
