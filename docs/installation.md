@@ -186,7 +186,7 @@ Install the pinned CuTe DSL release with:
 
 ```bash
 pip install -e '.[cute]'
-# or, equivalently, the helper that also handles the libs-cu13 reinstall ordering:
+# or, equivalently, the helper for this checkout's pinned version:
 ./scripts/install_cute.sh
 ```
 

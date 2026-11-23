@@ -41,19 +41,28 @@ def test_offline_target_preserves_sdk_architecture_without_probing(
         ) as probe,
     ):
         module = ir.Module.create()
-        original_key = dsl.get_module_hash(module, "offline_target_probe")
+        # CuTe 4.8 resolves the lazy architecture when hashing. Only compare
+        # keys outside cpu_target when an architecture was already cached;
+        # the uncached case must preserve None without triggering that probe.
+        original_key = (
+            dsl.get_module_hash(module, "offline_target_probe")
+            if cached_arch is not None
+            else None
+        )
         with expected, cpu_target(forbid_native=False):
             assert environment.arch == "sm_100a"
             assert vars(environment)["_arch"] == "sm_100a"
             target_key = dsl.get_module_hash(module, "offline_target_probe")
-            assert target_key != original_key
+            if original_key is not None:
+                assert target_key != original_key
             with cpu_target(forbid_native=False):
                 assert environment.arch == "sm_100a"
                 assert dsl.get_module_hash(module, "offline_target_probe") == target_key
             assert environment.arch == "sm_100a"
             if body_fails:
                 raise RuntimeError("context exit")
-        assert dsl.get_module_hash(module, "offline_target_probe") == original_key
+        if original_key is not None:
+            assert dsl.get_module_hash(module, "offline_target_probe") == original_key
         probe.assert_not_called()
     assert vars(environment) == before
     assert inspect.getattr_static(EnvironmentVarManager, "arch") is descriptor

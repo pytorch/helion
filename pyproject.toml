@@ -44,7 +44,9 @@ dev = [
 # truth — keep these extras in sync with that pin, and prefer
 # scripts/install_cute.sh in CI/dev environments.
 cute = [
-    "nvidia-cutlass-dsl[cu13]==4.7.0",
+    "nvidia-cutlass-dsl[cu13]==4.8.1",
+    # SASS validation needs nvdisasm, now optional in the DSL libraries.
+    "nvidia-cutlass-dsl-libs-base[sass]==4.8.1",
     "apache-tvm-ffi",
 ]
 pallas-tpu = [
@@ -204,6 +206,12 @@ filterwarnings = [
   "ignore:cute.arch.exp2 is deprecated:DeprecationWarning",
   "ignore:FastDivmodDivisor is deprecated:DeprecationWarning",
   "ignore:Migrated to examples/CuTeDSL/helpers:DeprecationWarning",
+  'ignore:cutlass\.utils(\.[a-z_]+)?\.SmemAllocator is deprecated:DeprecationWarning',
+  'ignore:cutlass\.utils(\.[a-z_]+)?\.TmemAllocator is deprecated:DeprecationWarning',
+  'ignore:cutlass\.utils(\.[a-z_]+)?\.TensorMapManager is deprecated:DeprecationWarning',
+  'ignore:cutlass\.utils(\.[a-z_]+)?\.get_num_tmem_alloc_cols is deprecated:DeprecationWarning',
+  'ignore:cutlass\.utils(\.[a-z_]+)?\.LayoutEnum is deprecated:DeprecationWarning',
+  'ignore:cutlass\.utils(\.[a-z_]+)?\.TensorMapUpdateMode is deprecated:DeprecationWarning',
 ]
 # artifacts/ and inductor_artifacts/ (the hillclimb skills' scratch) hold
 # gitignored benchmark and probe outputs, some of them named test_*.py with
@@ -247,6 +255,9 @@ project-excludes = [
 ]
 python-version = "3.10"
 search-path = ["../pytorch"]
+# CuTe 4.8 generates this module's Array-aware math wrappers through globals();
+# its runtime exports have no static declarations, like its MLIR bindings.
+replace-imports-with-any = ["cutlass.cute.math"]
 # MLX only installs on macOS; benchmarks/metal imports it as an optional
 # baseline provider.
 ignore-missing-imports = ["mlx", "mlx.*"]

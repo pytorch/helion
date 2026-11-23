@@ -34,6 +34,8 @@ from helion._compiler.cute.attention_plan import dense_score_plan
 from helion._compiler.cute.flash_policy import get_flash_target_policy
 from helion._testing.cute_aux import flash_env
 
+pytestmark = pytest.mark.cpu_only
+
 if TYPE_CHECKING:
     from collections.abc import Callable
 
@@ -580,6 +582,13 @@ def _run_correction_epilogue(
 ) -> list[tuple[object, ...]]:
     def run(tracer: _Tracer) -> None:
         with (
+            # Both entry points trace the helper's Python body with mock
+            # tensors; do not pass those mocks through CuTe's DSL wrapper.
+            patch.object(
+                _rt,
+                "fa4_correction_epilogue_to_smem_scoped",
+                _rt.fa4_correction_epilogue_to_smem_scoped.__wrapped__,
+            ),
             patch.object(
                 _rt.sm100_utils_flash,
                 "get_tmem_load_op",
@@ -630,7 +639,7 @@ def _run_correction_epilogue(
                     **flags,
                 )
             else:
-                _rt.fa4_correction_epilogue_to_smem_scoped.__wrapped__(
+                _rt.fa4_correction_epilogue_to_smem_scoped(
                     MagicMock(), MagicMock(), MagicMock(), 0, 0.5, 64, 16, None, **flags
                 )
 
