@@ -6,6 +6,10 @@ The weights are packed outside timing:
   (``int4_gemm_tritonbench``): two int4 values per int8 along K, row 2i in
   the low nibble, row-major [K/2, N].  Torch eager is the example's
   ``reference_matmul_bf16_int4``, which unpacks them for a bf16 matmul.
+  Helion runs the example's kernel, and at up to ``GEMV_MAX_ROWS`` rows (1)
+  this package's GEMV with MLX's decode (``_int4_gemv``), which reads the
+  same weights as int32 words (a zero-copy view, made per call); MLX too
+  runs a matrix-vector kernel at a few rows.
 - MLX gets its native 4-bit format (``w + 8`` with scale 1 and bias -8), the
   layout ``mx.quantized_matmul`` reads.
 
@@ -21,6 +25,8 @@ from typing import TYPE_CHECKING
 import numpy as np
 import torch
 
+from ._int4_gemv import GEMV_MAX_ROWS
+from ._int4_gemv import int4_gemv
 from helion._testing import import_example
 
 _examples_int4_gemm = import_example("int4_gemm")
@@ -33,7 +39,7 @@ if TYPE_CHECKING:
     from ..manifest import Case
 
 MODE = "fwd"
-HELION_KERNELS = (matmul_bf16_int4,)
+HELION_KERNELS = (matmul_bf16_int4, int4_gemv)
 GROUP = 64  # quantization group of the MLX format (scale 1)
 
 
@@ -76,10 +82,21 @@ def eager(
     return reference_matmul_bf16_int4(x.reshape(-1, x.shape[-1]), w_packed)
 
 
+def _rows(x: torch.Tensor) -> int:
+    return x.numel() // x.shape[-1]
+
+
+def helion_kernels(x: torch.Tensor, *rest: torch.Tensor) -> tuple[object, ...]:
+    return (int4_gemv,) if _rows(x) <= GEMV_MAX_ROWS else (matmul_bf16_int4,)
+
+
 def helion(
     x: torch.Tensor, w_packed: torch.Tensor, *mlx_only: torch.Tensor
 ) -> torch.Tensor:
-    return matmul_bf16_int4(x.reshape(-1, x.shape[-1]), w_packed)
+    x2d = x.reshape(-1, x.shape[-1])
+    if _rows(x) <= GEMV_MAX_ROWS:
+        return int4_gemv(x2d, w_packed.view(torch.int32))
+    return matmul_bf16_int4(x2d, w_packed)
 
 
 def mlx(

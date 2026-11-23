@@ -306,7 +306,10 @@ def _build_and_check(
             "kernels": kernels,
             "config_source": _config_source(kernels, _helion_cache_files() - cache),
         }
-        missing = {k.name for k in op.HELION_KERNELS} - {k["kernel"] for k in kernels}
+        ran = op.HELION_KERNELS
+        if hasattr(op, "helion_kernels"):
+            ran = op.helion_kernels(*host.values())
+        missing = {k.name for k in ran} - {k["kernel"] for k in kernels}
         other = sorted({k["backend"] for k in kernels} - {"metal"})
         if not kernels or missing or other:
             record.update(

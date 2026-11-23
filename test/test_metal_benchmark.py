@@ -732,7 +732,11 @@ _TINY_ROWS = {
     "rope": [{"hidden": 256, "T": 16}],
     "gemm": [{"M": 32, "N": 16, "K": 64}],
     "grouped_gemm": [{"G": 2, "N": 32}],
-    "int4_gemm": [{"B": 1, "L": 2, "K": 128, "N": 64}],
+    # One row runs the benchmark's GEMV (``_int4_gemv``), two the example.
+    "int4_gemm": [
+        {"B": 1, "L": 1, "K": 128, "N": 64},
+        {"B": 1, "L": 2, "K": 128, "N": 64},
+    ],
     "flash_attention": [{"B": 1, "H": 2, "S": 32, "D": 64}],
     "gdn_fwd_h": [{"B": 1, "H": 2, "T": 128, "chunk": 64, "K": 64, "V": 64}],
     "mamba2_chunk_state": [

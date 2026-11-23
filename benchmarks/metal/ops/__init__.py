@@ -16,16 +16,20 @@ positionally in the order ``inputs`` returns them:
 ``helion`` and ``mlx`` are forwards; the harness differentiates them with
 respect to ``GRAD_WRT`` for the cotangent input ``dy``, and its ``reference``
 returns the gradients directly.  ``HELION_KERNELS`` lists the Helion kernels
-``helion`` runs.
+``helion`` runs; an operator that picks among them by its inputs defines
+``helion_kernels(*inputs)``, the ones it runs for those inputs, which the
+harness checks all ran.
 
 Deliberate differences from the dashboard: forward inputs do not require
 grad (TritonBench's do, which adds autograd bookkeeping to eager calls);
 ``eager`` is the example's baseline rather than TritonBench's (e.g. softmax's
 is ``F.softmax`` where TritonBench's ``naive_softmax`` is hand-written); and
 every kernel uses the same timing budgets, where ``benchmarks/run.py`` raises
-gemm's ``--rep`` to 3000 ms; and grouped_gemm's ``helion`` runs a kernel of
+gemm's ``--rep`` to 3000 ms; grouped_gemm's ``helion`` runs a kernel of
 this package (``_grouped_gemm_grid``) rather than the example's, so that its
-config chooses the launch (see ``grouped_gemm.py``).
+config chooses the launch (see ``grouped_gemm.py``); and int4_gemm's runs
+one (``_int4_gemv``) at one row, which decodes the weights the way MLX
+does (see ``int4_gemm.py``).
 """
 
 from __future__ import annotations
