@@ -17,10 +17,18 @@ import ast
 from unittest.mock import patch
 
 import pytest
+import torch
 
+import helion
 from helion._compiler import tile_strategy
+from helion._compiler.cute.autotune.heuristics.cute_row_packets import (
+    CuteLaneSplitRowHeuristic,
+)
 from helion._compiler.cute.lane_loops import split
 from helion._testing import skipUnlessBackends
+from helion._testing.cute_codegen import cpu_bind
+from helion._testing.cute_codegen import cpu_target
+from helion._testing.cute_row_seed_kernels import masked_softmax_backward_rows
 
 pytestmark = [pytest.mark.cpu_only, skipUnlessBackends(["cute"])]
 
@@ -141,6 +149,48 @@ def test_register_reloads_read_the_accumulate_pass_values() -> None:
         assert recomputed not in second, second
     ahead = [ast.unparse(s) for s in body[: body.index(accumulate)]]
     assert "v_2_lane_stash = []" in ahead and "v_3_lane_stash = []" in ahead
+
+
+def _rendered_lane_split_seed(reloads: str) -> str:
+    """A lane split rows seed of ``masked_softmax_backward_rows`` (rows of
+    128 keys) under ``cute_reduction_reloads`` ``reloads``, rendered on CPU
+    through the config gate itself (``split._reloads_in_registers``)."""
+    bf16, fp32, flag = torch.bfloat16, torch.float32, torch.bool
+    args = tuple(
+        torch.empty(shape, dtype=dtype)
+        for shape, dtype in (
+            ((4, 2, 128, 128), bf16),
+            ((4, 2, 128, 128), flag),
+            ((4, 2, 128, 128), bf16),
+            ((4, 2, 128), fp32),
+            ((4, 2, 128), fp32),
+            ((4, 128, 128), flag),
+            ((4, 2, 128, 128), bf16),
+        )
+    )
+    kernel = helion.kernel(
+        masked_softmax_backward_rows,
+        backend="cute",
+        static_shapes=True,
+        ignore_warnings=[helion.exc.FastMathUnused],
+    )
+    with cpu_target():
+        bound = cpu_bind(kernel, args)
+        seed = CuteLaneSplitRowHeuristic.get_seed_configs(
+            bound.env, bound.host_function.device_ir
+        )[0]
+        values = dict(seed.config)
+        values["cute_reduction_reloads"] = [reloads] * len(
+            bound.config_spec.cute_reduction_reloads.valid_block_ids()
+        )
+        return bound.to_code(helion.Config(**values))
+
+
+def test_the_reload_mode_of_the_config_decides_the_passes() -> None:
+    """Unpatched: the same seed keeps the consume pass's values in a stash
+    under register reloads and reruns their producers under the default."""
+    assert "_lane_stash" in _rendered_lane_split_seed("register")
+    assert "_lane_stash" not in _rendered_lane_split_seed("auto")
 
 
 def test_a_frontier_name_assigned_twice_gets_no_stash() -> None:

@@ -21,6 +21,12 @@ from helion._compiler.cute.autotune.heuristics.cute_row_packets import (
     CuteFlooredWarpRowHeuristic,
 )
 from helion._compiler.cute.autotune.heuristics.cute_row_packets import (
+    CuteLaneSplitRowHeuristic,
+)
+from helion._compiler.cute.autotune.heuristics.cute_row_packets import (
+    CuteMaskedTailRowHeuristic,
+)
+from helion._compiler.cute.autotune.heuristics.cute_row_packets import (
     CuteSliceSweepPacketHeuristic,
 )
 from helion._compiler.cute.autotune.heuristics.cute_row_packets import (
@@ -39,11 +45,13 @@ from helion._compiler.cute.autotune.heuristics.cute_row_packets import (
 from helion._testing.cute_codegen import cpu_bind
 from helion._testing.cute_codegen import cpu_target
 from helion._testing.cute_row_seed_kernels import grid_first_elements_then_row_norm
+from helion._testing.cute_row_seed_kernels import masked_softmax_backward_rows
 from helion._testing.cute_row_seed_kernels import row_and_half_norms
 from helion._testing.cute_row_seed_kernels import row_norm_then_tiled_columns
 from helion._testing.cute_row_seed_kernels import rows_over_two_sums
 from helion._testing.cute_row_seed_kernels import softmax_rows
 from helion._testing.cute_row_seed_kernels import softmax_rows_inner_block_size_first
+from helion._testing.cute_row_seed_kernels import softmax_rows_over_two_tiles
 from helion._testing.registered_reduction import registered_scale_sum
 import helion.language as hl
 from helion.runtime.config import Config
@@ -59,6 +67,7 @@ pytestmark = pytest.mark.cpu_only
 ROW_HEURISTICS = (
     CuteFlooredWarpRowHeuristic,
     CuteSubwarpRowHeuristic,
+    CuteMaskedTailRowHeuristic,
     CuteSliceSweepPacketHeuristic,
 )
 
@@ -545,7 +554,9 @@ def _seeds(
     heuristic: type[
         CuteSubwarpRowHeuristic
         | CuteFlooredWarpRowHeuristic
+        | CuteMaskedTailRowHeuristic
         | CuteSliceSweepPacketHeuristic
+        | CuteLaneSplitRowHeuristic
     ],
     bound: BoundKernel,
 ) -> list[Config]:
@@ -714,11 +725,11 @@ def test_cta_holds_a_warp_of_threads_and_no_more_than_it_launches() -> None:
     assert "block=(8, 128, 1)" in _render(many, seeds[0])
 
 
-def test_one_row_plan_serves_the_three_families(
+def test_one_row_plan_serves_the_four_families(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     # The warp rows above the floor and their twins with packets on the
-    # quarter rows: two of the three families, in the order they are
+    # quarter rows: two of the four families, in the order they are
     # appended.
     shapes = [(25216, 256)]
     bound = _bound(rmsnorm_first_quarter, *shapes)
@@ -728,7 +739,7 @@ def test_one_row_plan_serves_the_three_families(
         (heuristic.name, heuristic.get_seed_configs(env, device_ir))
         for heuristic in ROW_HEURISTICS
     ]
-    assert [len(seeds) for _, seeds in families] == [2, 0, 2]
+    assert [len(seeds) for _, seeds in families] == [2, 0, 0, 2]
     assert bound.config_spec.autotuner_heuristics[-2:] == [
         CuteFlooredWarpRowHeuristic.name,
         CuteSliceSweepPacketHeuristic.name,
@@ -959,6 +970,104 @@ def test_a_thread_walks_at_most_sixteen_packets() -> None:
         assert CuteSubwarpRowHeuristic.name not in wide.config_spec.autotuner_heuristics
 
 
+def test_rows_no_packet_tiles_take_trips_of_packets() -> None:
+    # 196 bf16 elements are 24.5 16-byte packets and 49 8-byte ones: no
+    # power-of-two thread count tiles them, so the subwarp rows decline.
+    # The row takes 8-byte packets on 16 threads, a trip of 64 elements,
+    # three trips plus one packet; 8 rows per CTA.
+    bound = _layernorm(2048, 196)
+    spec = bound.config_spec
+    assert _seeds(CuteSubwarpRowHeuristic, bound) == []
+    (seed,) = _seeds(CuteMaskedTailRowHeuristic, bound)
+    assert CuteMaskedTailRowHeuristic.name in spec.autotuner_heuristics
+    values = seed.config
+    assert values["block_sizes"] == [8]
+    assert values["num_threads"] == [8, 16]
+    assert values["reduction_loops"] == [64]
+    assert spec.cute_vector_widths.config_get(values["cute_vector_widths"], 1) == 4
+    code = _render(bound, seed)
+    assert "block=(16, 8, 1)" in code
+    # Over two tile axes the rows' axis also leads the CTA order: a second
+    # seed, the first with the reversed loop order.
+    over_tiles = _bound(softmax_rows_over_two_tiles, (32, 64, 196))
+    first, reversed_order = _seeds(CuteMaskedTailRowHeuristic, over_tiles)
+    assert first.config["block_sizes"] == [1, 8]
+    assert "loop_orders" not in first.config
+    assert reversed_order.config == {**first.config, "loop_orders": [[1, 0]]}
+
+
+def _softmax_backward(rows: int, keys: int) -> BoundKernel:
+    """``masked_softmax_backward_rows`` over [4, 2, rows] rows of ``keys``,
+    bound on CPU."""
+    bf16, fp32, flag = torch.bfloat16, torch.float32, torch.bool
+    args = tuple(
+        torch.empty(shape, dtype=dtype)
+        for shape, dtype in (
+            ((4, 2, rows, keys), bf16),
+            ((4, 2, rows, keys), flag),
+            ((4, 2, rows, keys), bf16),
+            ((4, 2, rows), fp32),
+            ((4, 2, rows), fp32),
+            ((4, rows, keys), flag),
+            ((4, 2, rows, keys), bf16),
+        )
+    )
+    kernel = helion.kernel(
+        masked_softmax_backward_rows,
+        backend="cute",
+        static_shapes=True,
+        autotune_effort="full",
+        ignore_warnings=[helion.exc.FastMathUnused],
+    )
+    with cpu_target():
+        return cpu_bind(kernel, args)
+
+
+def test_lane_split_rows_take_rows_of_threads() -> None:
+    # A softmax backward's rows of 128 keys: no reduction loop, so no other
+    # row family seeds them.  8 rows of the innermost tile axis per CTA, with
+    # 16 threads of 2-element packets on the row (4 trips of 32) and with 8
+    # threads of 8-element packets (2 trips of 64).
+    bound = _softmax_backward(128, 128)
+    spec = bound.config_spec
+    assert not spec.reduction_loops
+    for heuristic in ROW_HEURISTICS:
+        assert _seeds(heuristic, bound) == []
+    seeds = _seeds(CuteLaneSplitRowHeuristic, bound)
+    assert CuteLaneSplitRowHeuristic.name in spec.autotuner_heuristics
+    (row,) = spec.reduction_block_ids
+    assert _values(seeds, "block_sizes") == [[1, 1, 8], [1, 1, 8]]
+    assert [
+        spec.num_threads.config_get(seed.config["num_threads"], row) for seed in seeds
+    ] == [16, 8]
+    assert [
+        spec.cute_vector_widths.config_get(seed.config["cute_vector_widths"], row)
+        for seed in seeds
+    ] == [2, 8]
+    # Rows of 512 keys take both layouts (16 packets of 2 per thread at
+    # most); rows of 4096 would give each thread 128 or 64 packets, past the
+    # subwarp rows' MAX_THREAD_PACKETS, and take none.
+    assert len(_seeds(CuteLaneSplitRowHeuristic, _softmax_backward(16, 512))) == 2
+    assert _seeds(CuteLaneSplitRowHeuristic, _softmax_backward(16, 4096)) == []
+    # A row that a reduction loop rolls is the row plan's: rows of 96 keys
+    # (whose kernel has the loop) and the LayerNorm's.
+    rolled = _softmax_backward(128, 96)
+    assert rolled.config_spec.reduction_loops
+    assert _seeds(CuteLaneSplitRowHeuristic, rolled) == []
+    assert _seeds(CuteLaneSplitRowHeuristic, _layernorm(2048, 196)) == []
+
+
+def test_rows_a_packet_tiles_take_no_trips() -> None:
+    # 192 elements are 24 packets on 8 threads: the subwarp rows'.  49 are
+    # no whole packets at any width, 4000 are 16 trips of 128 and more.
+    # 1600 are 8 threads of 25 packets, past the subwarp rows' cap: no
+    # subwarp seed, and no masked-tail one either.
+    for hidden, subwarp in ((192, True), (49, False), (4000, False), (1600, False)):
+        bound = _layernorm(2048, hidden)
+        assert bool(_seeds(CuteSubwarpRowHeuristic, bound)) == subwarp, hidden
+        assert _seeds(CuteMaskedTailRowHeuristic, bound) == [], hidden
+
+
 # Row kernels beyond the residual LayerNorm and the rotated RMSNorm, one case
 # per structure and family: every seed a family emits for them is rendered
 # (``_seeds``).  The values are the fired families' seed counts.
@@ -1030,6 +1139,7 @@ def test_seeds_render_on_other_row_kernels(
         for label, heuristic in (
             ("floored", CuteFlooredWarpRowHeuristic),
             ("subwarp", CuteSubwarpRowHeuristic),
+            ("masked tail", CuteMaskedTailRowHeuristic),
             ("twins", CuteSliceSweepPacketHeuristic),
         )
     }

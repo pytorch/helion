@@ -877,7 +877,7 @@ def _is_row_reduction_over_tiles(env: CompileEnvironment) -> bool:
 
 
 def _row_tile_groups(
-    env: CompileEnvironment, device_ir: DeviceIR
+    env: CompileEnvironment, device_ir: DeviceIR, row: int | None = None
 ) -> list[list[int]] | None:
     """The block sizes that tile the rows of the kernel's reduction loop, or
     ``None`` when the row heuristics' layouts do not fit the kernel.  One
@@ -920,7 +920,8 @@ def _row_tile_groups(
     grid = spec.kernel_grid_fact
     fact = spec.reduction_kernel_fact
     reductions = fact.reductions if fact is not None else ()
-    row = spec.reduction_loops[0].block_id
+    if row is None:
+        row = spec.reduction_loops[0].block_id
     if grid is None or any(descriptor.block_id != row for descriptor in reductions):
         return None
     block_sizes = spec.block_sizes.valid_block_ids()
@@ -954,12 +955,15 @@ def _row_tile_groups(
     return groups
 
 
-def _row_tile_axes(env: CompileEnvironment, device_ir: DeviceIR) -> list[int] | None:
+def _row_tile_axes(
+    env: CompileEnvironment, device_ir: DeviceIR, row: int | None = None
+) -> list[int] | None:
     """The tile axes of the rows, outermost first, when the row loops that
     have block sizes all have the same ones (``_row_tile_groups``), else
     ``None``.  The layouts that put several rows in a CTA read it: they give
-    the innermost of these axes their rows, which is one axis only here."""
-    groups = _row_tile_groups(env, device_ir)
+    the innermost of these axes their rows, which is one axis only here.
+    ``row``: the reduced block, when the kernel has no reduction loop."""
+    groups = _row_tile_groups(env, device_ir, row)
     return groups[0] if groups is not None and len(groups) == 1 else None
 
 
