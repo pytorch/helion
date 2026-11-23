@@ -138,6 +138,10 @@ class MetalKernelFacts:
     #: the staged tile), the staged operand's other side, and K
     #: (``staged_matmul_heuristic``).
     staged_matmuls: tuple[tuple[int, int, int], ...] = ()
+    #: Whether MPP plans the kernel's matmuls staging none of their operands
+    #: in threadgroup tiles, whose memory a large tile would overflow
+    #: (``mpp_matmul_heuristic``).
+    mpp_unstaged: bool = False
     #: The K-loop matmuls the fragment lowering takes: ``(m, n, k)`` blocks
     #: of each (``fragment_matmul_heuristic``).
     fragment_blocks: tuple[tuple[int, int, int], ...] = ()
