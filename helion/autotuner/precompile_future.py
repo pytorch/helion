@@ -28,6 +28,7 @@ import uuid
 from .. import exc
 from ..runtime.precompile_shim import already_compiled
 from ..runtime.precompile_shim import already_compiled_fail
+from ..runtime.precompile_shim import cached_compile_failure_error
 from ..runtime.precompile_shim import make_precompiler
 from .benchmarking import clear_jit_fast_path_caches
 from .benchmarking import synchronize_device
@@ -368,15 +369,6 @@ def _detach_error(error: BaseException) -> None:
         if isinstance(node.__context__, _ExtractedLaunchArgs):
             node.__context__ = None
         pending += [link for link in (node.__cause__, node.__context__) if link]
-
-
-def cached_compile_failure_error() -> RuntimeError:
-    """Why a kernel an earlier compile in this process cached but could not
-    load (``already_compiled_fail``) fails again: the precompile phase and the
-    in-process compile report the same error."""
-    return RuntimeError(
-        "an earlier compile of this kernel in this process could not load it"
-    )
 
 
 def _write_error_result(

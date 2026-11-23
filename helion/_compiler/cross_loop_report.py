@@ -207,7 +207,7 @@ def log_schedule(
     for edge in graph.edges:
         pair = edge.producer_root, edge.consumer_root
         transports = {graph.transport(d) for d in edge.access_dependencies}
-        how = orders.get(pair, set()) | (transports & {"inband", "tagged"})
+        how = orders.get(pair, set()) | (transports & {"cluster", "inband", "tagged"})
         lines.append(
             f"  root {edge.producer_root} -> root {edge.consumer_root}"
             f" ({', '.join(sorted(edge.tensor_names)) or 'a tensor'}): "

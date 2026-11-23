@@ -48,6 +48,7 @@ from helion.autotuner.precompile_future import _run_kernel_in_subprocess_fork
 from helion.autotuner.precompile_future import _run_kernel_in_subprocess_spawn
 from helion.runtime.config import Config
 from helion.runtime.precompile_shim import _device_probe_values
+from helion.runtime.precompile_shim import _get_helion_compilation_success
 from helion.runtime.precompile_shim import _set_helion_compilation_success
 from helion.runtime.precompile_shim import make_precompiler
 from helion.runtime.settings import Settings
@@ -370,6 +371,58 @@ class TestPrecompileShim(unittest.TestCase):
         compiled_kernel = fn.compile.return_value
         self.assertIs(kernel_cache["cache-key"], compiled_kernel)
         compiled_kernel._init_handles.assert_called_once_with()
+
+    def test_compile_keeps_a_kernel_cached_meanwhile(self) -> None:
+        """A kernel another thread cached between the precompile's cache
+        lookup and its compile stays cached (a patched launch may be about to
+        launch it), and so does its status: a failed one raises as a cached
+        failure does, and stays failed."""
+        for status in (True, False):
+            with self.subTest(status=status):
+                fn = _jit_function()
+                kernel_cache = fn.device_caches[0][0]
+                cached = Mock()
+                _set_helion_compilation_success(cached, status)
+                with _precompiler_launch():
+                    precompile = make_precompiler(fn, Config(), Mock())(object())
+                    kernel_cache["cache-key"] = cached
+                    if status:
+                        self.assertIs(precompile(in_child_process=False), True)
+                    else:
+                        with self.assertRaisesRegex(
+                            RuntimeError, "an earlier compile of this kernel"
+                        ):
+                            precompile(in_child_process=False)
+                fn.compile.assert_called_once()
+                self.assertIs(kernel_cache["cache-key"], cached)
+                self.assertIs(_get_helion_compilation_success(cached), status)
+                cached._init_handles.assert_not_called()
+
+    def test_compile_loads_before_publishing(self) -> None:
+        """The in-process compile loads the kernel's handles before it caches
+        the kernel, so a patched launch that finds it reads its function; a
+        kernel that fails to load is cached as failed."""
+        for loads in (True, False):
+            with self.subTest(loads=loads):
+                fn = _jit_function()
+                kernel_cache = fn.device_caches[0][0]
+                compiled_kernel = fn.compile.return_value
+
+                def init_handles(cache: dict = kernel_cache, ok: bool = loads) -> None:
+                    self.assertNotIn("cache-key", cache)
+                    if not ok:
+                        raise RuntimeError("out of resources")
+
+                compiled_kernel._init_handles.side_effect = init_handles
+                with _precompiler_launch():
+                    precompile = make_precompiler(fn, Config(), Mock())(object())
+                    if loads:
+                        self.assertIs(precompile(in_child_process=False), True)
+                    else:
+                        with self.assertRaisesRegex(RuntimeError, "out of resources"):
+                            precompile(in_child_process=False)
+                self.assertIs(kernel_cache["cache-key"], compiled_kernel)
+                self.assertIs(_get_helion_compilation_success(compiled_kernel), loads)
 
     def test_device_discovery_unwraps_tensor_descriptors(self) -> None:
         # A launch whose tensors all travel as tensor descriptors (every

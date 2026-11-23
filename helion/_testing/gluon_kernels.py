@@ -201,3 +201,73 @@ def scale_then_nested_wx(
             inner_out[tile_n, tile_m] = inner
         out[tile_n, tile_m] = acc
     return out, inner_out
+
+
+@helion.kernel(static_shapes=True, backend="gluon")
+def split_k_parts(
+    x: torch.Tensor, w4: torch.Tensor, part: torch.Tensor
+) -> torch.Tensor:
+    """Split K: the tasks of one block of 64 rows write their parts
+    (``part``), the next root sums them.  ``w4``: [n / 64, k / 128, 64, 128]."""
+    t, k = x.size()
+    blocks, steps, rows, block_k = w4.size()
+    splits = part.size(0)
+    out = torch.empty([t, blocks * rows], dtype=torch.float32, device=x.device)
+    out3 = out.view(t, blocks, rows)
+    part4 = part.view(splits, t, blocks, rows)
+    x3 = x.view(t, steps, block_k)
+    k_len = k // splits
+    for tile_s, tile_b in hl.tile([splits, blocks], block_size=[1, 1]):
+        acc = hl.zeros([rows, t], dtype=torch.float32)
+        for tile_k in hl.tile(k_len, block_size=block_k):
+            kb = (tile_s.begin * k_len + tile_k.begin) // block_k
+            w_k = hl.load(
+                w4,
+                [
+                    tile_b.id + hl.zeros([], dtype=torch.int32),
+                    kb + hl.zeros([], dtype=torch.int32),
+                    slice(None),
+                    slice(None),
+                ],
+            )
+            acc = hl.dot(w_k, x3[:, kb, :].permute(1, 0), acc=acc)
+        part4[tile_s.begin, :, tile_b.begin, :] = acc.permute(1, 0)
+    for tile_c in hl.tile(blocks, block_size=1):
+        out3[:, tile_c.begin, :] = torch.sum(part4[:, :, tile_c.begin, :], dim=0)
+    return out
+
+
+@helion.kernel(static_shapes=True, backend="gluon")
+def crossed_parts(x: torch.Tensor, p: torch.Tensor, q: torch.Tensor) -> torch.Tensor:
+    """Two parts from one root, transposed: the tasks of one ``c`` write
+    ``p[:, c]`` along the first task axis and ``q[:, c]`` along the second."""
+    a_n, b_n, n = x.size()
+    out = torch.empty([b_n, n], dtype=torch.float32, device=x.device)
+    for tile_a, tile_b in hl.tile([a_n, b_n], block_size=[1, 1]):
+        v = x[tile_a.begin, tile_b.begin, :].to(torch.float32)
+        p[tile_a.begin, tile_b.begin, :] = v
+        q[tile_b.begin, tile_a.begin, :] = v * 2
+    for tile_c in hl.tile(b_n, block_size=1):
+        c = tile_c.begin
+        out[c, :] = p[:, c, :].sum(0) + q[:, c, :].sum(0)
+    return out
+
+
+@helion.kernel(static_shapes=True, backend="gluon")
+def split_k_gemv(x: torch.Tensor, w: torch.Tensor, part: torch.Tensor) -> torch.Tensor:
+    """Split K over output tiles of a tuned width, the split the slower task
+    axis: each task writes its part (``part``), the next root sums a tile's.
+    ``block_sizes``: the parts' tile, their K step and the sum's tile."""
+    t, k = x.size()
+    n = w.size(0)
+    splits = part.size(0)
+    out = torch.empty([t, n], dtype=torch.float32, device=x.device)
+    k_len = k // splits
+    for tile_n, tile_s in hl.tile([n, splits], block_size=[None, 1]):
+        acc = hl.zeros([tile_n, t], dtype=torch.float32)
+        for tile_k in hl.tile(tile_s.begin * k_len, tile_s.begin * k_len + k_len):
+            acc = hl.dot(w[tile_n, tile_k], x[:, tile_k].permute(1, 0), acc=acc)
+        part[tile_s.begin, :, tile_n] = acc.permute(1, 0)
+    for tile_c in hl.tile(n):
+        out[:, tile_c] = part[:, :, tile_c].sum(0)
+    return out

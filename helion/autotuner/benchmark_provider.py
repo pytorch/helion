@@ -41,6 +41,7 @@ from ..runtime.config_cache import ConfigSet
 from ..runtime.config_cache import _stored_config
 from ..runtime.precompile_shim import already_compiled
 from ..runtime.precompile_shim import already_compiled_fail
+from ..runtime.precompile_shim import cached_compile_failure_error
 from ..runtime.precompile_shim import make_precompiler
 from ..runtime.settings import _env_get_bool
 from .accuracy import assert_close as _assert_close
@@ -100,7 +101,6 @@ from .precompile_future import PrecompileContext
 from .precompile_future import PrecompileFuture
 from .precompile_future import _ExtractedLaunchArgs
 from .precompile_future import _serialize_compiled_fn
-from .precompile_future import cached_compile_failure_error
 from .progress_bar import iter_with_progress
 from .render_pool import DEFAULT_MAX_JOBS as _RENDER_POOL_DEFAULT_MAX_JOBS
 from .render_pool import CudaDeviceFacts

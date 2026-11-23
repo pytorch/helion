@@ -25,6 +25,13 @@ from .ast_extension import create
 from .ast_extension import expr_from_string
 from .ast_extension import statement_from_string
 from .compile_environment import CompileEnvironment
+from .cross_loop_dsmem import CLUSTER_FLAG
+from .cross_loop_dsmem import CLUSTER_READY
+from .cross_loop_dsmem import check_dispatch
+from .cross_loop_dsmem import config_fallback
+from .cross_loop_dsmem import dsmem_transports
+from .cross_loop_dsmem import dsmem_worker_count
+from .cross_loop_dsmem import split_task
 from .cross_loop_report import RootNames
 from .cross_loop_report import log_root_barriers
 from .cross_loop_report import log_schedule
@@ -1058,15 +1065,19 @@ def tagged_allocations(device_function: DeviceFunction) -> frozenset[int]:
 
 
 def tagged_codegen_graph(device_function: DeviceFunction) -> TileDependencyGraph | None:
-    """The dependency graph whose transport is "tagged" for the enabled ones."""
+    """The dependency graph whose transport is "tagged" (or "cluster") for the
+    allocations this config enables."""
     if device_function.codegen_dependency_graph is None:
         graph = HostFunction.current().device_ir.tile_dependency_graph
         if graph is None:
             return None
         tagged = tagged_allocations(device_function)
+        cluster = frozenset(dsmem_transports(device_function))
         device_function.codegen_dependency_graph = (
-            dataclasses.replace(graph, tagged_allocation_ids=tagged)
-            if tagged
+            dataclasses.replace(
+                graph, tagged_allocation_ids=tagged, dsmem_allocation_ids=cluster
+            )
+            if tagged or cluster
             else graph
         )
     return device_function.codegen_dependency_graph
@@ -1514,9 +1525,10 @@ def _presence_layout(
 
 
 def _worker_count(device_function: DeviceFunction) -> int:
-    return CompileEnvironment.current().config_spec.num_sm * cast(
-        "int", device_function.config.get("num_sm_multiplier", 1)
+    num_sm = dsmem_worker_count(
+        device_function, CompileEnvironment.current().config_spec.num_sm
     )
+    return num_sm * cast("int", device_function.config.get("num_sm_multiplier", 1))
 
 
 def _scatter_layout(
@@ -1622,7 +1634,8 @@ def _outline_cross_loop_region(
     # Warp specialization (Triton's, or the ring kernel's partitions) changes
     # kernel-wide thread participation. Keep scheduler helpers inline so Triton
     # lowers their explicit and implicit barriers for the caller's active warp
-    # group rather than the physical CTA.
+    # group rather than the physical CTA; and a region with dsmem ops, whose
+    # shared memory is a symbol of the kernel's scope.
     config = device_function.config
     helper_name, arguments = device_function.register_triton_outlined_helper(
         name_hint,
@@ -1632,9 +1645,41 @@ def _outline_cross_loop_region(
         and not (
             any(CompileEnvironment.current().backend.range_warp_specializes(config))
             or device_function.ring is not None
+            or _calls_cluster_ops(device_function, body)
         ),
     )
     return statement_from_string(f"{helper_name}({', '.join(arguments)})")
+
+
+def _calls_cluster_ops(device_function: DeviceFunction, body: list[ast.stmt]) -> bool:
+    """Whether ``body`` calls a dsmem op (``_helion_gluon.cluster_*``), also
+    through an outlined helper it calls."""
+    helpers = {
+        name: helper_body
+        for name, _, helper_body, _ in device_function.triton_outlined_helpers
+    }
+    seen: set[str] = set()
+    pending = [body]
+    while pending:
+        for node in (n for s in pending.pop() for n in ast.walk(s)):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            if (
+                isinstance(func, ast.Attribute)
+                and isinstance(func.value, ast.Name)
+                and func.value.id == "_helion_gluon"
+                and func.attr.startswith("cluster_")
+            ):
+                return True
+            if (
+                isinstance(func, ast.Name)
+                and func.id in helpers
+                and func.id not in seen
+            ):
+                seen.add(func.id)
+                pending.append(list(helpers[func.id]))
+    return False
 
 
 def _outline_opaque_tile_body(
@@ -2453,6 +2498,7 @@ def emit_cross_loop_schedule(
     pipeline = device_function.config.cross_loop_pipeline
     dependency_graph = tagged_codegen_graph(device_function)
     assert dependency_graph is not None
+    clusters = dsmem_transports(device_function)
     if dependency_graph.crosses_ranks() and pipeline == "barrier":
         raise AssertionError("cross-rank tile dependencies cannot use 'barrier'")
     if pipeline == "barrier":
@@ -2945,6 +2991,18 @@ def emit_cross_loop_schedule(
             *([] if timeline is None else timeline.setup(epoch_var, worker)),
         ]
         device_function.sync_roles[epoch_var] = SyncRole("launch")
+        if clusters:
+            # Rank 0's barriers (armed at entry) are this launch's once its
+            # flag holds the launch's epoch, tagged with this kernel's state,
+            # and its cluster's id (the ring moves this after its read).
+            device_function.sync_roles[CLUSTER_FLAG] = SyncRole("cluster")
+            device_function.sync_roles[CLUSTER_READY] = SyncRole("cluster")
+            result.append(
+                statement_from_string(
+                    f"{CLUSTER_FLAG} = _helion_gluon.cluster_flag("
+                    f"{epoch_var}, {state_arg})"
+                )
+            )
         if peer is not None:
             device_function.sync_roles[peer.epoch] = SyncRole("launch")
             # uint64 so peer targets never wrap.  Every worker counts its own
@@ -3423,6 +3481,37 @@ def emit_cross_loop_schedule(
             guarded_extents[root] = extent
             if _all_names(extent.hoisted) & settled & access_names[True]:
                 settled_extents.add(root)
+    if clusters and (uses_packet_dispatch or static_pipeline_plan.continuation_roots):
+        # Of the whole config: every entry goes off at once.
+        raise config_fallback(
+            clusters,
+            "C2: packet dispatch" if uses_packet_dispatch else "C2: continuations",
+        )
+    for transport in clusters.values():
+        for root in (transport.store.root, transport.load.root):
+            unfit = (
+                "not resident"
+                if root not in static_pipeline_plan.resident_roots
+                else "a guarded extent"
+                if root in guarded_extents
+                else "claimed tasks"
+                if root in claim_indices
+                else "L2 grouping"
+                if isinstance(owner.cases[root], L2GroupingProgramIDs)
+                else "reordered tasks"
+                if static_pipeline_plan.execution_orders[root] != root_task_orders[root]
+                or root in scheduled_task_roots
+                else None
+            )
+            if unfit is not None:
+                raise transport.fallback(f"C2: root {root}: {unfit}")
+    split_multipliers = check_dispatch(
+        clusters,
+        config=device_function.config,
+        domains=root_domains,
+        geometries=case_geometries,
+        workers=launch_worker_count,
+    )
     if tagged := dependency_graph.tagged_allocation_ids:
         failure = tagged_coverage_failure(dependency_graph, tagged, guarded_extents)
         if failure is not None:
@@ -4275,6 +4364,15 @@ def emit_cross_loop_schedule(
         placed like the covered readiness waits.  ``root_arrival``: the
         worker's root-barrier arrival, made with its last task's arrivals."""
         body: list[ast.stmt] = []
+        if root in dsmem_producers:
+            # Before any send, rank 0's barriers are this launch's.
+            assert state_arg is not None
+            body.append(
+                statement_from_string(
+                    f"{CLUSTER_READY} = _helion_gluon.cluster_ready("
+                    f"{epoch_var}, {state_arg})"
+                )
+            )
         extent = guarded_extents.get(root)
         root_body = case_bodies[root] if extent is None else extent.body
         has_task_scheduling = root in nested_loop_counters_by_consumer
@@ -4658,7 +4756,38 @@ def emit_cross_loop_schedule(
         run.append(resident)
         lanes_end = root_lane_origins[resident] + tasks
 
+    dsmem_producers = {t.store.root: t for t in clusters.values()}
+    dsmem_consumers = {t.load.root: t for t in clusters.values()}
+
     def root_lane(root: int) -> str:
+        if (transport := dsmem_producers.get(root)) is not None:
+            # The key of the lane rank 0 of the worker's cluster would take
+            # (that lane over the cluster size), and the worker's rank on the
+            # split axis: one cluster runs the tasks of one key (a bijection,
+            # single wave).
+            size = transport.size
+            leader = f"(({worker}) // {size} * {size})"
+            return (
+                "("
+                + split_task(
+                    f"({rotated_lane(root, leader)}) // {size}",
+                    f"({worker}) % {size}",
+                    size,
+                    split_multipliers[transport.allocation_id],
+                )
+                + ")"
+            )
+        if (transport := dsmem_consumers.get(root)) is not None:
+            # Rank 0 takes the key whose producer tasks its cluster runs.
+            size = transport.size
+            return (
+                f"tl.where(({worker}) % {size} == 0, "
+                f"({rotated_lane(transport.store.root, worker)}) // {size}, "
+                f"{launch_worker_count})"
+            )
+        return rotated_lane(root, worker)
+
+    def rotated_lane(root: int, worker: str) -> str:
         # A root begins mid-wave, where the earlier roots' live tasks end
         # (without packing, only trailing roots): rotate workers onto its
         # lanes. Waves and slots stay the plan's; only a lane's worker moves.
