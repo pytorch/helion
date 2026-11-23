@@ -763,6 +763,14 @@ def ok_records(run_dir: Path, kind: str) -> dict[Path, dict[str, Any]]:
         record = json.loads(path.read_text())
         if record.get("status") == "ok":
             found[path] = record
+    if (
+        kind == "bench"
+        and len(timers := set(map(common.cold_timer, found.values()))) > 1
+    ):
+        # (README: compare records within one cold_timer)
+        raise ValueError(
+            f"{run_dir}: bench records of different cold timers {sorted(timers)}"
+        )
     return found
 
 
@@ -1201,6 +1209,18 @@ def main() -> None:
     baseline_name = None
     pairing = None
     if args.baseline is not None:
+        # (README: compare records within one cold_timer; ok_records holds
+        # each run to one)
+        timers = {
+            common.cold_timer(record)
+            for run in (args.run_dir, args.baseline)
+            for record in ok_records(run, "bench").values()
+        }
+        if len(timers) > 1:
+            raise SystemExit(
+                f"--baseline {args.baseline} and {args.run_dir} timed cold_us "
+                f"with different cold timers {sorted(timers)}"
+            )
         baseline_name = args.baseline.name
         pairing = seed_pairing(args.run_dir, args.baseline)
         lines += seed_pairing_lines(pairing, baseline_name)

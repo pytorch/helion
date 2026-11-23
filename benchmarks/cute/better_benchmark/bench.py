@@ -61,7 +61,13 @@ even:
   (``cold_order_medians_us``), averaged. ``cold_runs_us``
   keeps every round; ``report.py --rebalance`` recomputes both timings from
   the rounds of records made before (whose ``cold_us`` was the median of 5
-  rounds, a forward-order reading).
+  rounds, a forward-order reading). With ``--cold-timer trace`` (the record's
+  ``cold_timer``), a round is instead a window of ``COLD_REPEAT`` flushed
+  calls of each implementation's graph, timed by ``do_bench``'s kernel timer
+  (each call's span read from the CUDA activity trace). Each flush is
+  followed by the sweep that displaces the L2 lines earlier calls loaded or
+  stored with an evict-last hint (``ReleaseL2Pins``), so no call reads what
+  an earlier one pinned, and nothing is subtracted (README, Timers).
 - ``kernel_us``: summed device time of the kernels one replay launches
   (torch.profiler; back-to-back replays, so L2-warm), with per-kernel names
   and times (``kernels``). A kernel's time is its step, the end of its
@@ -69,8 +75,10 @@ even:
   (``kernel_steps``): the spans of dependent launches overlap, and their
   sum counted the overlap twice. ``kernel_span_us`` and each kernel's
   ``span_us`` keep the spans.
-- ``rot_us`` (only with ``--rotate-inputs N``): ``cold_us``'s regime on
-  inputs no earlier call left in L2. ``cold_us`` replays every call on the
+- ``rot_us`` (only with ``--rotate-inputs N``): the events timer's regime
+  (``--cold-timer events``, which it keeps under ``trace`` too, where
+  ``cold_us`` releases the pinned lines itself) on inputs no earlier call
+  left in L2. ``cold_us`` replays every call on the
   same input tensors, and lines loaded with an ``L2::evict_last`` hint
   (Triton's ``eviction_policy="evict_last"``, which Inductor emits on the
   operands it expects to read again; CuTe's ``l2_last`` load policies) stay
@@ -81,11 +89,11 @@ even:
   the next set] minus a graph of the N flushes (``rotating_bench``), in
   ``--cold-rounds`` rounds that alternate the order like ``cold_us``'s:
   ``rot_runs_us``, ``rot_order_medians_us`` and ``rot_sets`` go with it. A
-  cross-check for ``cold_us``, not a proof of coldness (see the README);
-  only for ports whose inputs are small enough for hinted lines to matter
-  and for N sets per implementation to fit, and that ``cold_us`` times in
-  batches too (``rotation_skip_reason``; the record's ``rotate_inputs`` says
-  what was decided and why).
+  cross-check for the events timer's ``cold_us``, not a proof of coldness
+  (see the README); only for ports whose inputs are small enough for hinted
+  lines to matter and for N sets per implementation to fit, and that the
+  events timer times in batches too (``rotation_skip_reason``; the record's
+  ``rotate_inputs`` says what was decided and why).
 
 The record says what ran right behind each batch of Helion code (a port's,
 or helion.inductor's: ``common.runs_helion_code``) in the rounds of each
@@ -201,7 +209,11 @@ from helion.autotuner.benchmarking import _BATCHED_REPLAY_BELOW_US
 from helion.autotuner.benchmarking import _batched_flushed_replays
 from helion.autotuner.benchmarking import _make_l2_cache_clearer
 from helion.autotuner.benchmarking import _positive_median
+from helion.autotuner.benchmarking import _release_l2_pins
+from helion.autotuner.benchmarking import do_bench as benchmark_do_bench
 from helion.autotuner.benchmarking import interleaved_bench
+from helion.autotuner.benchmarking import kernel_timer_unready_reason
+from helion.autotuner.benchmarking import prelude_trace_unready_reason
 from helion.autotuner.benchmarking import steady_graph_dispatch
 from helion.autotuner.metrics import register_post_autotune_hook
 from helion.autotuner.metrics import remove_post_autotune_hook
@@ -416,6 +428,95 @@ def do_bench(fn: Callable[[], object], **kwargs: object) -> object:
     return triton_do_bench(fn, **kwargs)
 
 
+# ``--cold-timer``: ``events`` times ``cold_us`` with ``interleaved_bench``
+# (``cold_round``), ``trace`` with ``do_bench``'s kernel timer behind the
+# release of pinned L2 lines (``cold_trace_round``).
+COLD_TIMERS = common.COLD_TIMERS
+
+
+class ReleaseL2Pins:
+    """The ``do_bench`` prelude of ``--cold-timer trace``: after every L2
+    flush, the sweep that displaces the lines earlier calls loaded or stored
+    with an evict-last hint (``benchmarking._release_l2_pins``).
+
+    The 256 MB flush writes ordinary lines, which leave those in L2, so in
+    ``cold_us``'s events regime an implementation that hints its accesses
+    reads part of its inputs warm on the next call. A hint also costs the
+    next call of the same graph: on a GB300 the Demucs graph of
+    sum_1e8a518eb72e_aa121e37, whose last kernel stores 24.5 MB with
+    ``l2_evict_last``, took 13.6 us instead of 8.3 us in its first kernel.
+    Neither happens where a model's other kernels run between two calls of a
+    graph. The kernel timer leaves the sweep out of a reading as it leaves
+    the flush out: a call's reading is the span of its own kernels.
+
+    The sweep leaves L2 full of clean lines of its own buffer, where a plain
+    flush leaves dirty ones that the timed call writes back as it evicts
+    them, so a streaming call reads faster than behind a flush alone: on a
+    GB300, a 64 MB copy read 18.1 us against 23.2 us (and 20.9 us back to
+    back, where each copy writes back the last one's output). Every
+    implementation gets the same clean L2, and with it its hints are nearly
+    neutral, as they are in a model: a Triton add over 32 MB of fp32 read
+    8.6 us with evict-last loads and 8.9 us without (behind a plain flush:
+    10.9 and 11.6 us; over 4 MB, 2.4 and 3.3 us, the hinted one reading its
+    inputs warm). Two other orders were measured and not taken: a second
+    flush after the sweep leaves the buffer's lines pinned and dirty, which
+    costs a hinted call (15.5 us against 11.8 us for the 32 MB add); and
+    subtracting a flush-only graph of [flush; sweep] from batches of
+    [flush; sweep; call] (the events regime with the sweep) read the hinted
+    adds 0.5-0.9 us under the kernel timer's span, and the unhinted ones
+    within 0.2 us."""
+
+    def __init__(self) -> None:
+        self.buffer = _make_l2_cache_buffer()
+
+    def run(self) -> None:
+        _release_l2_pins(self.buffer)
+
+
+def _make_l2_cache_buffer() -> torch.Tensor:
+    """A buffer of the flush's size (``_release_l2_pins`` sweeps one twice
+    the L2), imported when first called like ``do_bench``."""
+    from triton import runtime
+
+    return runtime.driver.active.get_empty_cache_for_benchmark()  # pyrefly: ignore
+
+
+def cold_trace_prelude() -> ReleaseL2Pins:
+    """The prelude of ``--cold-timer trace``, once ``do_bench`` is known to
+    read its windows from the CUDA activity trace: where it cannot, it would
+    time each call between CUDA events after the flush and the sweep, launch
+    latency included, a reading on another scale than the trace's spans."""
+    prelude = ReleaseL2Pins()
+    reason = kernel_timer_unready_reason() or prelude_trace_unready_reason(prelude)
+    if reason is not None:
+        raise RuntimeError(f"--cold-timer trace needs the kernel timer: {reason}")
+    return prelude
+
+
+def cold_trace_round(
+    replays: list[Callable[[], object]], prelude: ReleaseL2Pins
+) -> list[float]:
+    """One round of ``cold_us`` with ``--cold-timer trace``: per replay, the
+    median span of ``COLD_REPEAT`` calls, each behind an L2 flush and the
+    release of the lines earlier calls pinned, in milliseconds."""
+    return [
+        float(
+            cast(
+                "float",
+                benchmark_do_bench(
+                    replay,
+                    fixed_repetitions=COLD_REPEAT,
+                    return_mode="median",
+                    l2_flush_mode="call",
+                    trace_kernel_durations=True,
+                    prelude=prelude,
+                ),
+            )
+        )
+        for replay in replays
+    ]
+
+
 def cold_round(fns: list[Callable[[], Any]]) -> list[float]:
     """One round of ``cold_us``: the per-call time of each of ``fns`` in
     milliseconds, by ``interleaved_bench`` on CUDA graphs with the L2 flushed
@@ -553,9 +654,11 @@ def time_impls(
     rounds: int,
     rep_ms: int,
     cold_rounds: int,
+    cold_timer: str = "events",
 ) -> dict[str, dict[str, Any]]:
     """Time ``fns`` with both timers; an implementation that cannot be
-    warmed up or captured is reported with an error, the others still run."""
+    warmed up or captured is reported with an error, the others still run.
+    ``cold_timer`` (``COLD_TIMERS``) says how ``cold_us``'s rounds time."""
     out: dict[str, dict[str, Any]] = {name: {} for name in fns}
     note = steady_graph_dispatch()
     graphs = {}
@@ -584,9 +687,19 @@ def time_impls(
     bb_runs = alternating_rounds(
         names, rounds, lambda order: [bb_ms(name) for name in order]
     )
-    cold_runs = alternating_rounds(
-        names, cold_rounds, lambda order: cold_round([fns[name] for name in order])
-    )
+    if cold_timer == "trace":
+        prelude = cold_trace_prelude()
+        cold_runs = alternating_rounds(
+            names,
+            cold_rounds,
+            lambda order: cold_trace_round(
+                [graphs[name].replay for name in order], prelude
+            ),
+        )
+    else:
+        cold_runs = alternating_rounds(
+            names, cold_rounds, lambda order: cold_round([fns[name] for name in order])
+        )
     for name in names:
         bb_us, bb_order = common.order_balanced(bb_runs[name], min)
         out[name].update(
@@ -714,8 +827,8 @@ def rotation_skip_reason(
         return (
             f"the fastest implementation, {fastest_impl}, takes "
             f"{fastest_us:.1f} us a call: from "
-            f"{ROTATE_BELOW_US:g} us cold_us times single replays, not the "
-            "batches of flushed calls that rot_us would time"
+            f"{ROTATE_BELOW_US:g} us the events cold_us times single replays, "
+            "not the batches of flushed calls that rot_us would time"
         )
     budget = ROTATE_MEMORY_FRACTION * free_bytes
     if sets_bytes > budget:
@@ -863,6 +976,16 @@ def rotate_inputs(
         "status": "error",
     }
     record["rotate_inputs"] = decision
+    if args.cold_timer == "trace":
+        # rot_us is the events timer's regime, and its gate is that timer's
+        # (rotation_skip_reason): it has no events cold_us to cross-check
+        # in a record timed by the trace.
+        decision.update(
+            status="skipped",
+            skipped="rot_us cross-checks the events timer's cold_us, and this "
+            "record's cold_us is the trace timer's (--cold-timer trace)",
+        )
+        return
     # Everything that can fail from here on is inside the try, the device
     # queries included: the record keeps the timings it has.
     try:
@@ -1193,12 +1316,14 @@ def run(args: argparse.Namespace, backend: dict[str, Any] | None) -> dict[str, A
         gc.collect()
         placement.shift()
         record["placement"] = placement.record()
+        record["cold_timer"] = args.cold_timer
         with torch.no_grad(), common.gc_paused():
             timings = time_impls(
                 fns,
                 rounds=args.rounds,
                 rep_ms=args.rep_ms,
                 cold_rounds=args.cold_rounds,
+                cold_timer=args.cold_timer,
             )
         for impl, values in timings.items():
             info = record["impls"][impl]
@@ -1214,7 +1339,11 @@ def run(args: argparse.Namespace, backend: dict[str, Any] | None) -> dict[str, A
         # The rounds were over these: what ran right behind each Helion
         # port among them (README, Timers), and what the rotating pass times.
         timed = timed_implementations(timings)
-        note_carryover(record, timed)
+        if args.cold_timer == "events":
+            # Under the trace each implementation gets a window of its own
+            # flushed and swept calls, where only the first follows another
+            # implementation and the median drops it: nothing carries over.
+            note_carryover(record, timed)
         if args.rotate_inputs:
             # After the other timers, which thus run as they do without it.
             rotate_inputs(
@@ -1253,6 +1382,15 @@ def main() -> None:
     parser.add_argument("--rounds", type=int, default=6)
     parser.add_argument("--rep-ms", type=int, default=200)
     parser.add_argument("--cold-rounds", type=int, default=6)
+    parser.add_argument(
+        "--cold-timer",
+        choices=COLD_TIMERS,
+        default=COLD_TIMERS[0],
+        help="how cold_us's rounds time: events, interleaved_bench with the "
+        "flush subtracted (the default, as in earlier records); trace, "
+        "do_bench's kernel timer with the L2 lines earlier calls pinned with "
+        "evict-last hints released before every call (ReleaseL2Pins)",
+    )
     # One or the other: a seed with --fixed-placement would draw nothing.
     placed = parser.add_mutually_exclusive_group()
     placed.add_argument(
