@@ -52,12 +52,15 @@ def nan_extremum_expr(
     Int16 extremum of a chain is taken over unsigned keys: flipping the sign
     bit maps the signed order onto the unsigned one exactly (``a < b`` iff
     ``a ^ SIGN < b ^ SIGN`` as unsigned values), and the flips between
-    consecutive links cancel.  Int8 keeps the plain form: ptxas sign-extends
-    each negation before the packed 16-bit instruction, its extrema of
-    negated values are right at every layout measured, and the keys would
-    slow it down.  Unsigned integers (their chains keep every negation),
-    64-bit integers (a compare and a select) and the floats keep the forms
-    above too.
+    consecutive links cancel.  The elementwise lowering of ``torch.maximum``
+    / ``torch.minimum`` and of the clamps passes ``chain_dtype`` for the
+    links of a chain of such extrema, which one expression can form too
+    (``handler_ops._in_extremum_chain``).  Int8 keeps the plain form: ptxas
+    sign-extends each negation before the packed 16-bit instruction, its
+    extrema of negated values are right at every layout measured, and the
+    keys would slow it down.  Unsigned integers (their chains keep every
+    negation), 64-bit integers (a compare and a select) and the floats keep
+    the forms above too.
     """
     assert reduction_type in ("max", "min")
     if float32:

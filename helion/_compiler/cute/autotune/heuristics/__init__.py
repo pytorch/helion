@@ -641,6 +641,53 @@ def register_uniform_lane_compares_coverage(env: CompileEnvironment) -> None:
     )
 
 
+def register_guarded_lanes_coverage(env: CompileEnvironment) -> None:
+    """Cover ``cute_guarded_lanes`` and ``cute_fmnmx_extrema`` on the first
+    compiler seeds that do not set them and that they change.
+
+    Both knobs are off by default, so every seed renders as before; each
+    witness is an extra candidate, measured like any other.  Under
+    ``cute_fmnmx_extrema`` a seed's fp32 maxima and minima are single
+    instructions, whatever its tiles.  Under ``cute_guarded_lanes`` a seed's
+    lanes run under their stores' guard, so a carrier has a store to guard:
+    a tile that does not divide its extent (a seed whose tiles all divide
+    theirs masks nothing, and most such seeds render the same code with the
+    knob; the search still samples it there).  Whether the knob changes a
+    carrier's code beyond that is decided load by load in the lowering (a
+    packet that loads predicated, a bound the tile masks imply, a store
+    whose guard is known ahead of its lanes), not by the seed's shape: a
+    witness that renders its carrier's code is a source alias, which the
+    search drops once it is rendered, ahead of the DSL compile and the
+    timing.  The N-D packet tile seeds set both knobs themselves
+    (``CutePointwiseVecHeuristic._packet_tile_seeds``) and need no witness.
+    Neither knob is offered to a kernel without its sites
+    (``cute_flat_fields``), where nothing is registered.
+    """
+    spec = env.config_spec
+    blocks = [block.block_id for block in spec.block_sizes]
+
+    def has_partial_tile(seed: Config) -> bool:
+        return any(
+            isinstance(extent, int) and isinstance(tile, int) and extent % tile != 0
+            for extent, tile, _threads, _width in _block_layouts(env, seed, blocks)
+        )
+
+    _register_knob_witnesses(
+        env,
+        key="cute_guarded_lanes",
+        mechanism="cute.guarded_lanes",
+        carries=lambda seed: (
+            seed.config.get("cute_guarded_lanes") is not True and has_partial_tile(seed)
+        ),
+    )
+    _register_knob_witnesses(
+        env,
+        key="cute_fmnmx_extrema",
+        mechanism="cute.fmnmx_extrema",
+        carries=lambda seed: seed.config.get("cute_fmnmx_extrema") is not True,
+    )
+
+
 def register_coverage_groups(env: CompileEnvironment, device_ir: DeviceIR) -> None:
     """Declare independent coverage after every ordinary field is finalized.
 
@@ -942,6 +989,7 @@ def register_coverage_groups(env: CompileEnvironment, device_ir: DeviceIR) -> No
     # Before the tail peel's: its witnesses of sunk nests ride on these.
     register_defer_tile_reduce_coverage(env)
     register_tail_peel_coverage(env)
+    register_guarded_lanes_coverage(env)
 
 
 def register_bool_byte_packets_coverage(env: CompileEnvironment) -> None:

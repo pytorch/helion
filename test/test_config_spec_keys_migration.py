@@ -92,7 +92,8 @@ _BASE_VALID_KEYS = """
     cute_flash_stat_transport cute_flash_tensor_4d_tma cute_flash_topology
     cute_flash_uneven_kv_ring cute_flash_use_2cta cute_flash_wait_hint
     cute_flash_ws_k_stage_extra cute_flash_ws_loader_warp cute_flash_ws_mask_phases
-    cute_flash_ws_one_pass cute_fp32_dot cute_fragment_atomic_aggregation
+    cute_flash_ws_one_pass cute_fmnmx_extrema cute_fp32_dot
+    cute_fragment_atomic_aggregation
     cute_fragment_atomic_consumer_fusion cute_fragment_batched_loads
     cute_fragment_bounded_gather cute_fragment_cta_topk cute_fragment_half_mma
     cute_fragment_integer_atomic_epochs cute_fragment_local_atomic_registers
@@ -111,6 +112,7 @@ _BASE_VALID_KEYS = """
     cute_grid_lane_jam
     cute_grouped_ab_stages cute_grouped_ctas_per_sm cute_grouped_descriptor_policy
     cute_grouped_prefix_scan cute_grouped_rna_block_k cute_grouped_rna_warps
+    cute_guarded_lanes
     cute_host_paired_sum cute_independent_reduction cute_integer_loop_reduction
     cute_lane_layouts cute_lane_unroll cute_materialized_operand_schedule
     cute_materialized_schedule cute_matmul_family cute_min_blocks_per_mp
@@ -264,7 +266,8 @@ _BASE_BACKEND_SPECIFIC_KEYS = """
     cute_flash_stat_transport cute_flash_tensor_4d_tma cute_flash_topology
     cute_flash_uneven_kv_ring cute_flash_use_2cta cute_flash_wait_hint
     cute_flash_ws_k_stage_extra cute_flash_ws_loader_warp cute_flash_ws_mask_phases
-    cute_flash_ws_one_pass cute_fp32_dot cute_fragment_atomic_aggregation
+    cute_flash_ws_one_pass cute_fmnmx_extrema cute_fp32_dot
+    cute_fragment_atomic_aggregation
     cute_fragment_atomic_consumer_fusion cute_fragment_batched_loads
     cute_fragment_bounded_gather cute_fragment_cta_topk cute_fragment_half_mma
     cute_fragment_integer_atomic_epochs cute_fragment_local_atomic_registers
@@ -283,6 +286,7 @@ _BASE_BACKEND_SPECIFIC_KEYS = """
     cute_grid_lane_jam
     cute_grouped_ab_stages cute_grouped_ctas_per_sm cute_grouped_descriptor_policy
     cute_grouped_prefix_scan cute_grouped_rna_block_k cute_grouped_rna_warps
+    cute_guarded_lanes
     cute_host_paired_sum cute_independent_reduction cute_integer_loop_reduction
     cute_lane_layouts cute_lane_unroll cute_materialized_operand_schedule
     cute_materialized_schedule cute_matmul_family cute_min_blocks_per_mp
@@ -389,7 +393,7 @@ _BASE_CUTE_IMPLICIT_DEFAULT_KEYS = """
     cute_collective_recipe cute_collective_stages cute_collective_static_layouts
     cute_collective_tmem_a cute_collective_tmem_seed cute_compiler_pipeline cute_defer_tile_reduce
     cute_exact_div_form
-    cute_fp32_dot cute_fragment_atomic_aggregation
+    cute_fmnmx_extrema cute_fp32_dot cute_fragment_atomic_aggregation
     cute_fragment_atomic_consumer_fusion cute_fragment_batched_loads
     cute_fragment_bounded_gather cute_fragment_cta_topk cute_fragment_half_mma
     cute_fragment_integer_atomic_epochs cute_fragment_local_atomic_registers
@@ -404,6 +408,7 @@ _BASE_CUTE_IMPLICIT_DEFAULT_KEYS = """
     cute_fragment_warp_producer_regions cute_fragment_warp_results
     cute_fragment_warp_scan cute_gathered_mma_n cute_gathered_mma_stages
     cute_grid_lane_jam
+    cute_guarded_lanes
     cute_host_paired_sum cute_independent_reduction cute_integer_loop_reduction
     cute_lane_unroll cute_materialized_operand_schedule cute_materialized_schedule
     cute_narrow_load_hints cute_packet_prefetch cute_pair_lane_math cute_pdl cute_pdl_capture_overlap cute_pdl_release cute_pointwise_pid_type
@@ -495,7 +500,8 @@ _BASE_CUTE_ACCEPTED = """
     cute_flash_stat_transport cute_flash_tensor_4d_tma cute_flash_topology
     cute_flash_uneven_kv_ring cute_flash_use_2cta cute_flash_wait_hint
     cute_flash_ws_k_stage_extra cute_flash_ws_loader_warp cute_flash_ws_mask_phases
-    cute_flash_ws_one_pass cute_fp32_dot cute_fragment_atomic_aggregation
+    cute_flash_ws_one_pass cute_fmnmx_extrema cute_fp32_dot
+    cute_fragment_atomic_aggregation
     cute_fragment_atomic_consumer_fusion cute_fragment_batched_loads
     cute_fragment_bounded_gather cute_fragment_cta_topk cute_fragment_half_mma
     cute_fragment_integer_atomic_epochs cute_fragment_local_atomic_registers
@@ -514,6 +520,7 @@ _BASE_CUTE_ACCEPTED = """
     cute_grid_lane_jam
     cute_grouped_ab_stages cute_grouped_ctas_per_sm cute_grouped_descriptor_policy
     cute_grouped_prefix_scan cute_grouped_rna_block_k cute_grouped_rna_warps
+    cute_guarded_lanes
     cute_host_paired_sum cute_independent_reduction cute_integer_loop_reduction
     cute_lane_layouts cute_lane_unroll cute_materialized_operand_schedule
     cute_materialized_schedule cute_matmul_family cute_min_blocks_per_mp

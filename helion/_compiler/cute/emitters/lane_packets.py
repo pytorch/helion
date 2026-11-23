@@ -7,7 +7,9 @@ reads and writes its tensors one vector transaction per lane group:
 above it, whose lanes the body extracts with ``_cute_unroll_vec_extract``, or
 a compile-time list the body appends to and one ``_cute_store_u16_vec`` /
 ``_cute_store_u32_vec`` flush after it.  A ``GuardBuilder`` decides what
-predicates a whole packet and where a masked-off thread points instead: the
+predicates a whole packet and where a masked-off thread points instead (or,
+for a ``predicated`` packet, that the load itself is predicated and leaves
+zeros, ``masked_packet_load_expr``): the
 tile lane's guard (``TilePacketGuard``: the uniform mask terms and the
 per-thread bound unless the tile provably covers the extent) and the rolled
 reduction's (``cute/memory_ops._cute_register_unroll_vec_hoist``: the non-lane
@@ -32,8 +34,10 @@ import torch
 
 from ...ast_extension import statement_from_string
 from ...compile_environment import CompileEnvironment
+from ..cache_policy_loads import MASKED_PACKET_LOAD_HELPERS
 from ..cache_policy_loads import CachePolicy
 from ..cache_policy_loads import hint_wide_packets
+from ..packet_access import render_masked_packet_load
 from ..packet_access import render_packet_load
 from .memory_access import _cute_scalar_pointer_expr
 
@@ -172,6 +176,54 @@ def _cute_unroll_vec_load_expr(
             vec_width * dtype.itemsize, wide_packets=wide_packets
         ),
         kwargs=policy.load_kwargs,
+    )
+
+
+# The dtypes whose packet lanes ``LanePacketEmitter.hoist_load`` may take
+# from a predicated load with no select behind them: the integer-carrier
+# dtypes but fp16.  A predicated load returns its packet as 32-bit words
+# (``masked_packet_load``), so an odd 16-bit lane is the upper half of a
+# word: ``shr.u32 word, 16`` in the PTX where the lane's first use is in
+# another basic block than the load (NVVM sinks the last compare of a
+# lane's maximum under the guard of the store it feeds).  ptxas (13.3.27,
+# which the DSL embeds, and 13.4.59 alike) then widens the wrong half:
+# ``cvt.f32.f16`` of the shifted word assembles to ``HADD2.F32`` of the
+# *lower* half of the loaded word, and the lane computes on its neighbour's
+# value (with the shift in the block of its use the same PTX assembles to
+# the upper half).  A bf16 lane widens by a shift of the shifted register,
+# which is assembled as written, and int16 lanes convert correctly at every
+# packet width (``test_cute_guarded_lanes_cuda``); a plain vector load
+# splits its words in the block of the load with PTX's packed ``mov``,
+# without a shift.  So the emitter gives an fp16 packet the anchored load
+# and the lane selects it has without ``cute_guarded_lanes``.  The
+# ``guard_lanes`` pass may still move that load under its stores' guard and
+# drop the selects the guard implies: the lanes are then those of a plain
+# vector load, never of a predicated one.
+PREDICATED_LANE_DTYPES: frozenset[torch.dtype] = frozenset(
+    _CUTE_VECTOR_UNROLL_DTYPES
+) - {torch.float16}
+
+
+def masked_packet_load_expr(
+    pointer: str, guard: str, dtype: torch.dtype, vec_width: int, eviction_suffix: str
+) -> str:
+    """``_cute_load_vNb_if(ptr, guard, vec_type[, priority])``: the packet when
+    ``guard`` holds, zeros otherwise (``masked_packet_load``), for a packet
+    of 4 to 64 bytes of an integer-carrier dtype.
+
+    The cache hint of the site is kept: its L1 eviction priority
+    (``'evict_first'`` / ``'evict_last'``), the streaming ``cop='cs'``, or its
+    L2 policy family, which the predicated load carries as a ``createpolicy``
+    descriptor like the unpredicated L2 helpers (at every width, the 32-byte
+    one too without ``cute_wide_packet_hints``).
+    """
+    return render_masked_packet_load(
+        MASKED_PACKET_LOAD_HELPERS[vec_width * dtype.itemsize],
+        pointer,
+        guard,
+        vec_width,
+        _cute_unroll_vec_elem_type(dtype),
+        CachePolicy.from_suffix(eviction_suffix).masked_priority,
     )
 
 
@@ -404,12 +456,21 @@ class LanePacketEmitter:
         guard: GuardBuilder,
         var_prefix: str,
         wide_packets: bool = False,
+        predicated: bool = False,
     ) -> tuple[str, ast.stmt | None]:
         """Place the packet load of ``(tensor_name, base_ptr_expr, cache_tag)``
         above the V-loop, or reuse the one already placed.
 
         Returns the packet variable and the hoist statement (None when the
         packet was already placed).  The guard is built only for a new packet.
+
+        A ``predicated`` packet with a guard predicate is one predicated load
+        that leaves zeros where the predicate fails
+        (``masked_packet_load_expr``), instead of an unconditional load from
+        the anchor: the caller's ``cache_tag`` tells the two forms of one
+        packet apart, and ``CuteLaneState.zero_filled_packets`` records the
+        packets that read as zeros where masked off, each with its
+        unpredicated load.
         """
         context = self.context
         lane_body = context.lane_body
@@ -422,10 +483,32 @@ class LanePacketEmitter:
             f"{var_prefix}{len(context.vec_loads)}", dce=False
         )
         context.vec_loads[cache_key] = (hoist_var, dtype)
-        pointer = guard.build().pointer(base_ptr_expr)
-        load_expr = _cute_unroll_vec_load_expr(
-            pointer, dtype, vec_width, eviction_suffix, wide_packets=wide_packets
-        )
+        packet_guard = guard.build()
+        if predicated and packet_guard.predicate is not None:
+            load_expr = masked_packet_load_expr(
+                base_ptr_expr,
+                packet_guard.predicate,
+                dtype,
+                vec_width,
+                eviction_suffix,
+            )
+            state.device_function.cute_state.lanes.zero_filled_packets[hoist_var] = (
+                _cute_unroll_vec_load_expr(
+                    "{pointer}",
+                    dtype,
+                    vec_width,
+                    eviction_suffix,
+                    wide_packets=wide_packets,
+                )
+            )
+        else:
+            load_expr = _cute_unroll_vec_load_expr(
+                packet_guard.pointer(base_ptr_expr),
+                dtype,
+                vec_width,
+                eviction_suffix,
+                wide_packets=wide_packets,
+            )
         hoist_stmt = statement_from_string(f"{hoist_var} = {load_expr}")
         # Insert the hoist just BEFORE the constexpr V-loop.
         lane_body.insert(context.vloop_position(), hoist_stmt)
@@ -833,16 +916,20 @@ def _cute_register_tile_unroll_vec_hoist(
     lane_base_expr: str | None = None,
     rows_at_lane_base: bool = False,
     flat_rows: FlatRowPacket | None = None,
-) -> str:
+    predicated: bool = False,
+) -> tuple[str, bool]:
     """Tile-loop variant of ``_cute_register_unroll_vec_hoist`` for the
     per-thread tile strategies' lane loops.
 
     Splices a single ``cute.arch.load(base_ptr, <elem>x V)`` into the
     outer-lane body (above the constexpr V-loop) and returns the
     per-element extract expression so the existing scalar pipeline keeps
-    working.  bf16/fp16 load as ``Uint16`` and bitcast; the byte dtypes load
-    ``vec_width`` bytes as one packed integer, whose bytes an fp8 consumer
-    decodes downstream, int8 bitcasts back and bool compares against zero.
+    working, and whether the packet reads as zeros where its guard fails (a
+    ``predicated`` packet with a guard, ``LanePacketEmitter.hoist_load``:
+    its lanes then need no select against the mask).  bf16/fp16 load as
+    ``Uint16`` and bitcast; the byte dtypes load ``vec_width`` bytes as one
+    packed integer, whose bytes an fp8 consumer decodes downstream, int8
+    bitcasts back and bool compares against zero.
 
     ``uniform_mask`` carries the mask terms other than the lane mask (an
     outer tile mask, the bound of a gathered row coordinate, an
@@ -882,7 +969,8 @@ def _cute_register_tile_unroll_vec_hoist(
         base_ptr_expr=base_ptr_expr,
         vec_width=vec_width,
         eviction_suffix=eviction_suffix,
-        cache_tag=uniform_mask,
+        # The anchored and the predicated load of one packet are two packets.
+        cache_tag=f"if {uniform_mask}" if predicated else uniform_mask,
         guard=TilePacketGuard(
             state,
             strategy,
@@ -896,6 +984,7 @@ def _cute_register_tile_unroll_vec_hoist(
         ),
         var_prefix=f"_tile_unroll_vec_{context.block_id}_",
         wide_packets=hint_wide_packets(state.config.cute_wide_packet_hints),
+        predicated=predicated,
     )
     if (
         tensor.dtype is torch.int8
@@ -914,4 +1003,10 @@ def _cute_register_tile_unroll_vec_hoist(
             mask_expr,
             signed_byte_site,
         )
-    return _cute_unroll_vec_extract(hoist_var, vec_lane_var, tensor.dtype)
+    zero_filled = (
+        hoist_var in state.device_function.cute_state.lanes.zero_filled_packets
+    )
+    return (
+        _cute_unroll_vec_extract(hoist_var, vec_lane_var, tensor.dtype),
+        zero_filled,
+    )

@@ -157,6 +157,70 @@ def test_a_partial_last_tile_keeps_its_direct_stores() -> None:
     assert ast.unparse(flush).count("cute.arch.store(out.iterator") == 3
 
 
+def _lanes_under_a_staged_store(code: str) -> int:
+    """The ``if`` statements of the kernel that end in a store into the
+    staged image and hold the statements that compute its value."""
+    return sum(
+        isinstance(node, ast.If)
+        and len(node.body) > 1
+        and isinstance(node.body[-1], ast.Expr)
+        and "(_cta_stage + (" in ast.unparse(node.body[-1])
+        for node in ast.walk(ast.parse(code))
+    )
+
+
+def test_guarded_lanes_keep_the_staged_form() -> None:
+    # ``stage_cta_stores`` runs before ``guard_lanes``: the proof takes a
+    # store alone under its mask, so lanes moved under that mask first would
+    # leave the kernel with its direct stores, and ``cute_guarded_lanes``
+    # would switch the staged form off.  A staged store is a store under the
+    # same mask: the gather's lanes move under it.
+    args = (_windows(), 3, 1)
+    staged = _code(sliding_windows, args, _TILE)
+    both = _code(sliding_windows, args, _TILE | {"cute_guarded_lanes": True})
+    assert _lanes_under_a_staged_store(staged) == 0
+    # One per window slot of the per-thread lane loop.
+    assert _lanes_under_a_staged_store(both) == 3
+    # The same image, barrier and flush, and no direct store.
+    assert both.count("cute.arch.sync_threads()") == 1
+    assert both.count("cute.arch.store(out.iterator") == staged.count(
+        "cute.arch.store(out.iterator"
+    )
+    assert _direct_stores(both) == 0
+    # A store the staged form split by CTA is no group of stores: with a
+    # partial last tile the lanes stay ahead of it and the kernel still
+    # stages.
+    args = (_windows(1, 9, 16), 3, 1)
+    partial = _code(sliding_windows, args, _TILE | {"cute_guarded_lanes": True})
+    assert "_cta_stage_full" in partial
+    assert _lanes_under_a_staged_store(partial) == 0
+    assert _direct_stores(partial) == 4
+    # ``hint_element_loads`` runs after both: the element load that moved
+    # under the staged store's mask takes its cache hint there (a hinted
+    # helper ahead of ``guard_lanes`` would end the run that moves).
+    args = (torch.empty(2, 8, 16), 3, 1)
+    hinted = _code(
+        sliding_windows,
+        args,
+        _SCALAR
+        | {
+            "cute_staged_store": True,
+            "cute_guarded_lanes": True,
+            "cute_scalar_load_hints": True,
+            "load_eviction_policies": ["l2_last"]
+            * _spec(sliding_windows, args).load_eviction_policies.length,
+        },
+    )
+    assert _lanes_under_a_staged_store(hinted) == 1
+    (guard,) = [
+        node
+        for node in ast.walk(ast.parse(hinted))
+        if isinstance(node, ast.If) and "(_cta_stage + (" in ast.unparse(node.body[-1])
+    ]
+    assert ast.unparse(guard).count("_cute_element_policy_load_if(flat.iterator") == 1
+    assert hinted.count(".load()") == 0
+
+
 def _declines(
     kernel: Kernel[Any],
     args: tuple[object, ...],

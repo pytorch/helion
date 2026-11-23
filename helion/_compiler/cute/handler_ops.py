@@ -14,17 +14,40 @@ import ast
 from typing import TYPE_CHECKING
 
 import torch
+from torch._inductor.virtualized import V
 
+from ...language import _tracing_ops
 from ..ast_extension import expr_from_string
 from ..backend import HandlerOpOverrides
 from ..compile_environment import CompileEnvironment
 from ..device_function import DeviceFunction
 from ..host_function import HostFunction
 from ..inductor_lowering import _unpack_opsvalue
+from .math_templates import nan_extremum_expr
 from .state import cute_codegen_state
 
 if TYPE_CHECKING:
+    from ..device_ir import DeviceIR
     from ..inductor_lowering import GenerateASTFromInductor
+
+
+# The pointwise ops that lower to an extremum of two computed values (a
+# ``relu`` or a ``clamp`` against constants is one instruction either way).
+_TRACED_EXTREMA = frozenset(
+    {torch.ops.aten.maximum.default, torch.ops.aten.minimum.default}
+)
+# The pointwise ops that take one extremum per element, and which: the links
+# a chain of extrema is made of (``_in_extremum_chain``).  ``torch.clamp``
+# traces as a ``clamp_min`` under a ``clamp_max``.
+_EXTREMUM_KINDS: dict[object, str] = {
+    torch.ops.aten.maximum.default: "max",
+    torch.ops.aten.clamp_min.default: "max",
+    torch.ops.aten.clamp_min.Tensor: "max",
+    torch.ops.aten.relu.default: "max",
+    torch.ops.aten.minimum.default: "min",
+    torch.ops.aten.clamp_max.default: "min",
+    torch.ops.aten.clamp_max.Tensor: "min",
+}
 
 
 class CuteHandlerOpOverrides(HandlerOpOverrides):
@@ -120,32 +143,102 @@ class CuteHandlerOpOverrides(HandlerOpOverrides):
     def maximum(
         self, handler: GenerateASTFromInductor, a: object, b: object
     ) -> str | None:
-        dtype = handler._expected_tensor_dtype()
-        if dtype is not None:
-            a = handler._create_cast_expr(a, dtype)
-            b = handler._create_cast_expr(b, dtype)
-        return handler._lift(
-            expr_from_string(
-                "cute.math.max({a}, {b}, propagate_nan=True)",
-                a=handler._to_ast(a),
-                b=handler._to_ast(b),
-            )
-        )
+        return _nan_extremum(handler, "max", a, b)
 
     def minimum(
         self, handler: GenerateASTFromInductor, a: object, b: object
     ) -> str | None:
-        dtype = handler._expected_tensor_dtype()
-        if dtype is not None:
-            a = handler._create_cast_expr(a, dtype)
-            b = handler._create_cast_expr(b, dtype)
-        return handler._lift(
-            expr_from_string(
-                "cute.math.min({a}, {b}, propagate_nan=True)",
-                a=handler._to_ast(a),
-                b=handler._to_ast(b),
-            )
+        return _nan_extremum(handler, "min", a, b)
+
+
+def _in_extremum_chain(kind: str) -> bool:
+    """Whether the ``max`` / ``min`` (``kind``) the current FX node lowers to
+    is a link of a chain of extrema of that kind.
+
+    ptxas (CUDA 13.3) fuses two signed Int32 or Int16 maxima (or minima) of
+    three values into one three-operand instruction and loses the negation
+    of one operand, so the links of such a chain compare unsigned keys
+    (``math_templates.nan_extremum_expr``).  A link is the node of a maximum
+    (``torch.maximum``, a lower ``clamp`` bound, a ``relu``) that takes the
+    result of another maximum as an operand, or whose result another maximum
+    takes; the same for minima (``torch.minimum``, an upper ``clamp``
+    bound).  That is every node of the chain, however long, whether or not
+    the source names the value between two of them.  A node that
+    accumulates into a value its loop body takes in and hands back
+    (``acc = torch.maximum(acc, x)`` per trip) is a link too: its trips
+    chain.
+
+    Every other extremum keeps the plain form, which the matmul lowerings
+    read back from the index statements of their kernels: a single extremum,
+    a maximum of a minimum (``torch.clamp`` with both bounds is one) and a
+    minimum of a maximum were right at every layout measured.
+    """
+    node = V.current_node
+    if node is None or _EXTREMUM_KINDS.get(node.target) != kind:
+        return False
+
+    def link(other: object) -> bool:
+        return _EXTREMUM_KINDS.get(getattr(other, "target", None)) == kind
+
+    if any(link(arg) for arg in node.args) or any(link(user) for user in node.users):
+        return True
+    return any(
+        getattr(arg, "target", None) is _tracing_ops._new_var for arg in node.args
+    ) and any(user.op == "output" for user in node.users)
+
+
+def _nan_extremum(
+    handler: GenerateASTFromInductor, kind: str, a: object, b: object
+) -> str | None:
+    """``torch.maximum`` / ``torch.minimum`` of two values of the op's dtype.
+
+    Under ``cute_fmnmx_extrema`` an fp32 extremum is the one-instruction
+    NaN-propagating form (``math_templates.nan_extremum_expr``, as the
+    reductions use): besides saving two compares and a select per element,
+    it is the form ptxas folds into packed half-precision extrema when both
+    operands are widened bf16 / fp16 lanes.  It orders ``-0.0`` below
+    ``+0.0`` (IEEE 754-2019 maximum / minimum), where the compare-and-select
+    form returns one of its operands by position.
+
+    The extrema of one expression (``torch.maximum(torch.maximum(a, b), c)``)
+    form a chain as a reduction's do: a link of one gets the op's CuTe dtype,
+    with which the helper takes an Int32 or Int16 extremum over unsigned
+    keys (``_in_extremum_chain``).
+    """
+    dtype = handler._expected_tensor_dtype()
+    chain_dtype = None
+    if dtype is not None:
+        a = handler._create_cast_expr(a, dtype)
+        b = handler._create_cast_expr(b, dtype)
+        if _in_extremum_chain(kind):
+            chain_dtype = CompileEnvironment.current().backend.dtype_str(dtype)
+    float32 = (
+        dtype is torch.float32
+        and handler.cg.device_function.config.config.get("cute_fmnmx_extrema") is True
+    )
+    return handler._lift(
+        expr_from_string(
+            nan_extremum_expr(
+                kind, "{a}", "{b}", float32=float32, chain_dtype=chain_dtype
+            ),
+            a=handler._to_ast(a),
+            b=handler._to_ast(b),
         )
+    )
+
+
+def has_fp32_extrema(device_ir: DeviceIR) -> bool:
+    """Whether the kernel traces an fp32 ``torch.maximum`` / ``minimum``:
+    what offers ``cute_fmnmx_extrema`` to the autotuner.  Structure only, no
+    extents."""
+    return any(
+        node.op == "call_function"
+        and node.target in _TRACED_EXTREMA
+        and isinstance(value := node.meta.get("val"), torch.Tensor)
+        and value.dtype is torch.float32
+        for info in device_ir.graphs
+        for node in info.graph.nodes
+    )
 
 
 def integer_to_float_expr(

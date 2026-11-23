@@ -1129,6 +1129,15 @@ class ConfigSpec:
         # ``cute_exact_div_form`` is tunable.
         self.cute_exact_division_sites = False
         self.cute_pair_lane_math_sites = False
+        # Set by DeviceIR analysis: a load through a computed or gathered
+        # coordinate or with an ``extra_mask``
+        # (``guarded_lanes.has_guarded_lane_sites``), so
+        # ``cute_guarded_lanes`` is tunable at every extent.
+        self.cute_guarded_lane_sites = False
+        # Set by DeviceIR analysis: an fp32 ``torch.maximum`` / ``minimum``
+        # of two tensors (``handler_ops.has_fp32_extrema``), so
+        # ``cute_fmnmx_extrema`` is tunable.
+        self.cute_fmnmx_extrema_sites = False
         self.cute_scaled_mma_available = False
         self.cute_mxfp8_fused_scales_available = False
         self.cute_mxfp8_sf_tma_available = False
