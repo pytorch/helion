@@ -24,14 +24,18 @@ from .fuse_two_pass_loads import _store_tensor_roots
 from .fuse_two_pass_loads import _tensor_arg_roots
 from .lane_loops.markers import _HELION_LANE_REDUCE_MARKER
 from .lane_loops.markers import _is_lane_reduce_marker_assign
+from .lane_loops.markers import _literal_lane_loop_extent
 from .lane_loops.markers import _static_lane_loop_extent
 from .lane_loops.owner_guards import _is_atomic_call
 from .lane_loops.owner_guards import _is_isolated_store_statement
 from .lane_loops.owner_guards import _memory_write_calls
 from .lane_loops.owner_guards import _store_enclosing_predicates
+from .packet_access import PERSISTENT_BRANCH_VEC_LOAD
+from .packet_access import PERSISTENT_BRANCH_VEC_STORE
 from .persistent_branch_vec import _binding_write_roots
 from .persistent_branch_vec import _definition_snapshots
 from .persistent_branch_vec import _freeze_definition
+from .persistent_branch_vec import _marker_call
 from .persistent_branch_vec import _memory_address_definition_snapshots
 from .persistent_branch_vec import _memory_load_calls
 from .persistent_branch_vec import _plain_scalar_load_pointer
@@ -728,7 +732,35 @@ def _reads_no_memory(node: ast.Subscript) -> bool:
     )
 
 
-def _unclassified_accesses(node: ast.AST, *, writes: bool) -> list[None]:
+def _marker_fallback_loads(node: ast.AST) -> list[ast.Call]:
+    """The scalar loads the vectorizer's load markers in ``node`` carry as
+    their fallback (``PTR.load()``, or ``cute.arch.load(PTR, dtype, ...)``
+    with a cache hint) that read the marker's own address: the element the
+    marker loads, not an access of its own."""
+
+    def pointer(call: ast.Call) -> ast.expr | None:
+        if call_path_str(call.func) == "cute.arch.load" and call.args:
+            return call.args[0]
+        return _plain_scalar_load_pointer(call)
+
+    result: list[ast.Call] = []
+    for marker in _memory_load_calls(node):
+        if _marker_call(marker, PERSISTENT_BRANCH_VEC_LOAD, 6) is None:
+            continue
+        address = ast.dump(marker.args[4])
+        result.extend(
+            child
+            for child in ast.walk(marker.args[5])
+            if isinstance(child, ast.Call)
+            and (loaded := pointer(child)) is not None
+            and ast.dump(loaded) == address
+        )
+    return result
+
+
+def _unclassified_accesses(
+    node: ast.AST, *, writes: bool, marker_fallbacks: bool = False
+) -> list[None]:
     """An access of any tensor (``None``) for each access in ``node`` the
     passes cannot resolve to tensors: a call that is no load or write they
     collect (``_memory_load_calls``, ``_write_calls``) and not proven free of
@@ -737,8 +769,17 @@ def _unclassified_accesses(node: ast.AST, *, writes: bool) -> list[None]:
     ranges and lane-reduce markers aside), which may read and write any
     memory (an impure ``hl.inline_asm_elementwise``, a packet load helper),
     and a subscript read (with ``writes``, write) whose base is no name
-    (``aliases[0][col]``) unless it reads metadata."""
+    (``aliases[0][col]``) unless it reads metadata.
+
+    The scalar fallback of a load marker (``_marker_fallback_loads``) counts
+    as such an access unless ``marker_fallbacks`` says the caller resolves it
+    with its marker.  The passes of the two-nest interchange do not, so they
+    decline a vector row's nest that leaves a store in the first pass, and
+    ``serial_loop_outside_lanes_keeps_memory`` proves the single nest that
+    takes it."""
     known = {id(call) for call in [*_memory_load_calls(node), *_write_calls(node)]}
+    if marker_fallbacks:
+        known.update(id(call) for call in _marker_fallback_loads(node))
     context = ast.Store if writes else ast.Load
     result: list[None] = []
     for child in ast.walk(node):
@@ -790,13 +831,15 @@ def _resolved_access_roots(
     *,
     writes: bool,
     unchecked: set[str],
+    marker_fallbacks: bool = False,
 ) -> list[list[frozenset[str] | None]]:
     """For each of ``statements``, the tensors each of its loads (or, with
     ``writes``, each of its memory writes) may access, ``None`` for one that
     may access any, then its subscript accesses of tensor arguments (of the
     alias-checked ``tensor_names``, or of the ``unchecked`` ones, which may
     access any) and last the accesses it makes that the passes cannot
-    resolve (``_unclassified_accesses``).
+    resolve (``_unclassified_accesses``, to which ``marker_fallbacks``
+    goes).
 
     An address that names no tensor argument itself (``pointer.load()`` after
     ``pointer = output.iterator + lane``) is resolved through the
@@ -847,7 +890,9 @@ def _resolved_access_roots(
             roots = subscript_roots(name)
             if roots != frozenset():
                 accesses.append(roots)
-        accesses += _unclassified_accesses(statement, writes=writes)
+        accesses += _unclassified_accesses(
+            statement, writes=writes, marker_fallbacks=marker_fallbacks
+        )
         result.append(accesses)
     return result
 
@@ -1302,6 +1347,177 @@ def _reads_only_its_own_element(
     return _instances_never_meet(
         serial_form[0], serial_span, lane_form[0], lane_extent - 1
     )
+
+
+def _reordered_instances_never_meet(
+    serial_step: int, serial_span: int, lane_step: int, lane_span: int
+) -> bool:
+    """Whether no two instances of a store at offset ``serial_step * serial +
+    lane_step * lane + C`` that differ in both variables write one element
+    (the conventions of ``_instances_never_meet``).  Those are the instances
+    an interchange of the lane loop and the serial loop reorders: two in one
+    lane, or in one serial iteration, keep their order."""
+    serial_moves = serial_step % _OFFSET_MODULUS != 0
+    lane_moves = lane_step % _OFFSET_MODULUS != 0
+    if serial_moves and lane_moves:
+        return _instances_never_meet(serial_step, serial_span, lane_step, lane_span)
+    if serial_span == 0 or lane_span == 0:
+        return True
+    # The element moves with one variable at most.  When it moves with one,
+    # two instances on an element share that variable's value, provided its
+    # offsets do not wrap around to meet.
+    if serial_moves:
+        return _instances_never_meet(serial_step, serial_span, 0, 0)
+    return lane_moves and _instances_never_meet(0, 0, lane_step, lane_span)
+
+
+def _one_element_store_pointer(call: ast.Call) -> ast.expr | None:
+    """The address of a write of one element: a scalar ``PTR.store(value)``,
+    or the persistent vectorizer's store marker, which holds one lane's
+    element until the lanes' markers are packed.  ``None`` for any other
+    write: a packet flush, a vector reduction into memory or an atomic
+    writes a span from its address or has no proof here."""
+    marker = _marker_call(call, PERSISTENT_BRANCH_VEC_STORE, 6)
+    if marker is not None:
+        return marker.args[3]
+    return _plain_scalar_store_pointer(call)
+
+
+def serial_loop_outside_lanes_keeps_memory(
+    lane_loop: ast.For,
+    serial_loop: ast.For,
+    proven_disjoint_tensor_pairs: set[frozenset[str]],
+    protected_names: set[str],
+    proven_tensor_stride_values: Mapping[tuple[str, int], int],
+    constexpr_value: Callable[[str], int | None] | None = None,
+) -> str | None:
+    """Why running ``serial_loop`` outside ``lane_loop`` may change what the
+    nest loads or leaves in memory, ``None`` when it provably does not.
+
+    ``for LANE: PREFIX; for SERIAL: BODY; SUFFIX`` runs each lane's whole
+    serial loop before the next lane's.  With the serial loop outside, every
+    lane runs one serial iteration before any runs the next, the prefix
+    statements a lane needs are rerun there and the suffix follows the whole
+    serial loop.  That keeps every loaded value and the final contents of
+    memory when
+
+    * no load of the nest may read a tensor the nest writes (addresses
+      resolved through the definitions reaching them,
+      ``_resolved_access_roots``; a load marker's scalar fallback with its
+      marker), so every load reads what the nest started from in either
+      order, a rerun prefix load included, and
+    * no two writes that change their order may reach one element: the
+      prefix writes nothing; a write of the serial body and one of the
+      suffix, or two statements of the serial body, reach no common tensor
+      (two suffix statements keep their order); and each statement of the
+      serial body that writes holds one store, of one element
+      (``_one_element_store_pointer``), whose address, with the definitions
+      reaching it inlined, is one expression over a single tensor, immutable
+      values and the two loop variables, integer-affine in each, so that two
+      instances differing in both variables never share an element
+      (``_reordered_instances_never_meet``).  A store that writes a span
+      from its address (a packet flush) is declined: only start addresses
+      are compared.
+
+    Atomics are the caller's to exclude.  This is one thread's program: the
+    barrier pass declines a body with lane reduction markers whose threads
+    could race on a tensor (``lane_loops/barriers.py``).
+    """
+    pairs = proven_disjoint_tensor_pairs
+    tensor_names, unchecked = _nest_tensor_names([lane_loop], protected_names)
+    flat, unstable = _first_nest_flat(lane_loop, serial_loop, protected_names)
+    reads, writes = (
+        _resolved_access_roots(
+            flat,
+            unstable,
+            tensor_names,
+            writes=written,
+            unchecked=unchecked,
+            marker_fallbacks=True,
+        )
+        for written in (False, True)
+    )
+    if _any_may_alias(
+        (roots for accesses in reads for roots in accesses),
+        (roots for accesses in writes for roots in accesses),
+        pairs,
+    ):
+        return "a load may read a tensor the nest writes"
+    body = list(serial_loop.body)
+    prefix_size = lane_loop.body.index(serial_loop)
+    body_writes = writes[prefix_size : prefix_size + len(body)]
+    suffix_writes = [
+        roots for accesses in writes[prefix_size + len(body) :] for roots in accesses
+    ]
+    if any(writes[:prefix_size]):
+        return "the lane loop's prefix writes memory"
+    if _any_may_alias(
+        (roots for accesses in body_writes for roots in accesses), suffix_writes, pairs
+    ) or any(
+        _any_may_alias(first, second, pairs)
+        for index, first in enumerate(body_writes)
+        for second in body_writes[index + 1 :]
+    ):
+        return "two stores may reach one tensor in another order"
+    if not any(body_writes):
+        return None
+    looped = flat[: prefix_size + len(body)]
+    snapshots = _memory_address_definition_snapshots(looped)
+    lane_extent = _literal_lane_loop_extent(lane_loop)
+    mutable_names = _binding_write_roots(lane_loop)
+    serial_span = _serial_span(
+        serial_loop,
+        cast("list[ast.stmt]", lane_loop.body[:prefix_size]),
+        mutable_names,
+        protected_names,
+        constexpr_value,
+    )
+    if (
+        snapshots is None
+        or lane_extent is None
+        or serial_span is None
+        or not isinstance(lane_loop.target, ast.Name)
+        or not isinstance(serial_loop.target, ast.Name)
+    ):
+        return "the serial loop's stores have no known addresses"
+    loop_names = {lane_loop.target.id, serial_loop.target.id}
+    for index, statement in enumerate(body):
+        if not body_writes[index]:
+            continue
+        calls = _write_calls(statement)
+        if len(calls) != 1:
+            return "a store of the serial loop has no known address"
+        pointer = _one_element_store_pointer(calls[0])
+        if pointer is None:
+            return "a store of the serial loop may write more than one element"
+        # The definitions reaching the statement describe its store only when
+        # nothing in it rebinds a name ahead of the store.
+        if (
+            _binding_write_roots(statement)
+            or _dependency_names(cast("list[ast.AST]", looped), _reads(pointer))
+            & unstable[prefix_size]
+        ):
+            return "a store of the serial loop has no known address"
+        address = _freeze_definition(pointer, snapshots[prefix_size + index])
+        if (
+            address is None
+            or _single_tensor_iterator_root(address) is None
+            or not _coordinate_expression(address, mutable_names, loop_names)
+        ):
+            return "a store of the serial loop has no known address"
+        lane_form = _pointer_integer_affine_form(
+            address, lane_loop.target.id, proven_tensor_stride_values, set(), "store"
+        )
+        serial_form = _pointer_integer_affine_form(
+            address, serial_loop.target.id, proven_tensor_stride_values, set(), "store"
+        )
+        if lane_form is None or serial_form is None:
+            return "a store of the serial loop has no affine address"
+        if not _reordered_instances_never_meet(
+            serial_form[0], serial_span, lane_form[0], lane_extent - 1
+        ):
+            return "a store of the serial loop may write one element twice"
+    return None
 
 
 def drop_read_back_partial_stores(

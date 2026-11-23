@@ -238,9 +238,10 @@ def register_search_surface(device_ir: DeviceIR, config_spec: ConfigSpec) -> Non
         config_spec.target_device_capability == (10, 0)
         and any(has_signed_byte_field(info.graph) for info in device_ir.graphs)
     )
-    # The reductions that may roll along a bool row a load reads: their byte
-    # packets are tunable (``cute_bool_byte_packets``), not in a kernel with
-    # a matmul (its facts are recorded by now).
+    # The reductions that may roll along a bool row a load reads, and the
+    # persistent rows without a ``reduction_loops`` slot that read one: their
+    # byte packets are tunable (``cute_bool_byte_packets``), not in a kernel
+    # with a matmul (its facts are recorded by now).
     from .memory_ops import bool_reduction_row_blocks
 
     config_spec.cute_bool_byte_packet_blocks = (
@@ -930,19 +931,24 @@ def record_tile_loop_facts(
     func: HostFunction | None, device_ir: DeviceIR, analysis: DeviceIRAnalysis | None
 ) -> None:
     """After the structural analysis: tile loop paths, the reduction blocks
-    on each and the path of each tile strategy, boundary-only grid blocks,
+    on each, the blocks reduced inside their innermost loops and the path of
+    each tile strategy, boundary-only grid blocks,
     the sizes of the paths' fixed blocks, the loops the planner never
     flattens and whether an fp32 dot is exact on this target."""
     env = CompileEnvironment.current()
     config_spec = env.config_spec
     from ..per_thread_planning import tile_loop_keeps_nd_layout
     from .loop_nesting import boundary_only_grid_blocks
+    from .loop_nesting import innermost_loop_reduction_blocks
     from .loop_nesting import tile_loop_facts
 
     path_reductions, strategy_paths = tile_loop_facts(
         env, device_ir, device_ir.graphs, config_spec.reduction_block_ids
     )
     config_spec.cute_tile_loop_path_reductions = path_reductions
+    config_spec.cute_innermost_loop_reduction_blocks = innermost_loop_reduction_blocks(
+        device_ir, device_ir.graphs
+    )
     config_spec.cute_tile_strategy_paths = strategy_paths
     fixed = {
         block_id: source.value

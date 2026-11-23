@@ -191,6 +191,7 @@
  "test/test_cute_iota_config_coordinates.py": 3.6,
  "test/test_cute_iota_symbolic_hints.py": 0.4,
  "test/test_cute_jam_grid_lanes_cuda.py": 7.6,
+ "test/test_cute_lane_carry_nest.py": 72.7,
  "test/test_cute_lane_fold_reductions.py": 14.0,
  "test/test_cute_lane_inline_asm_effects_gpu.py": 0.4,
  "test/test_cute_lane_invariant_atomics.py": 7.8,

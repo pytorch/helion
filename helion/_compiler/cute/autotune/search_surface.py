@@ -90,10 +90,12 @@ from ..pdl_release import CUTE_PDL_CAPTURE_RELEASE_CHOICES
 from ..pdl_release import CUTE_PDL_RELEASE_CHOICES
 from ..pdl_release import CUTE_PDL_RELEASE_DEFAULT
 from ..pdl_release import CUTE_PDL_SPREAD_KEY
+from ..reduction_lanes import THREADED_SEQUENCES
 from ..reduction_lanes import WARP_THREADS
 from ..reduction_lanes import fit_reduction_threads
 from ..reduction_lanes import fits_row_packets
 from ..reduction_lanes import looped_reduction_lanes
+from ..reduction_lanes import sequence_tile_holds_warp_lanes
 from ..reduction_lanes import synthetic_reduction_lanes
 from ..reduction_lanes import tiled_row_threads
 from ..reduction_lanes import whole_vector_lanes
@@ -1687,21 +1689,22 @@ def _normalize_cute_bool_byte_packets(
     config_spec: ConfigSpec, config: dict[str, object], *, fix_invalid: bool
 ) -> None:
     """``cute_bool_byte_packets`` is a boolean, absent meaning False, that the
-    search surface offers only where a reduction ``reduction_loops`` may roll
-    reads a bool tensor along its dim (``cute_bool_byte_packet_blocks``);
-    elsewhere an explicit False (a config tuned for another binding) is
-    dropped and True is an error unless ``fix_invalid``.  An absent knob
-    stays absent, so a config without it (a compiler seed) normalizes to
-    itself.  ``_normalize_cute_lane_knobs`` turns the knob off in a config
-    that rolls none of those reductions at a byte packet's width."""
+    search surface offers only where a reduction ``reduction_loops`` may
+    roll, or a persistent row without a slot there, reads a bool tensor
+    along its dim (``cute_bool_byte_packet_blocks``); elsewhere an explicit
+    False (a config tuned for another binding) is dropped and True is an
+    error unless ``fix_invalid``.  An absent knob stays absent, so a config
+    without it (a compiler seed) normalizes to itself.
+    ``_normalize_cute_lane_knobs`` turns the knob off in a config that runs
+    none of those reductions at a byte packet's width."""
     key = "cute_bool_byte_packets"
     if key not in config:
         return
     if not config_spec.cute_bool_byte_packet_blocks:
         if config[key] is not False and not fix_invalid:
             raise InvalidConfig(
-                f"{key} requires a rollable reduction reading a bool tensor "
-                "along its dim"
+                f"{key} requires a rollable reduction, or a persistent row of "
+                "vectors, reading a bool tensor along its dim"
             )
         del config[key]
         return
@@ -1984,6 +1987,58 @@ def cute_lone_row_reduction(
     return row_spec.block_id, reduction_block_id
 
 
+def cute_lane_carry_row(config_spec: ConfigSpec) -> tuple[tuple[int, ...], int] | None:
+    """``(tile_block_ids, reduction_block_id)`` of a kernel with no matmul
+    whose one reduction runs along a row of static length that no
+    ``reduction_loops`` slot may roll (it always runs persistent) under two or
+    more tile axes, one block each, nested in one loop path (the tile blocks
+    outermost first), and is reduced inside the path's innermost loop
+    (``cute_innermost_loop_reduction_blocks``): the structure of a row
+    reduced inside a device loop, as where per-column partials are carried
+    over the loop's rows (a mix-order reduction).  Every block has a
+    ``num_threads`` entry and the row a ``cute_vector_widths`` one, and no
+    ``hl.reduce`` reduces it; else None.  A kernel of the same blocks that
+    reduces the row only behind its device loop (values carried over the
+    loop, summed after it) does not match: its row's lanes sit around no
+    row loop.  Whether the loop carries a value is not part of the
+    structure: a loop that only reduces and stores its rows matches too,
+    though the lowering this structure is searched for
+    (``lane_loops/split.py``, ``_lane_carry_nest``) takes lanes that carry
+    one.
+
+    Only the kernel's structure decides (and whether its shapes are static),
+    never its extents: the knobs opened on it keep the search space
+    (``structural_fingerprint``) the same across shapes, which
+    ``autotune_multi`` requires.
+    """
+    if (
+        config_spec.matmul_facts
+        or config_spec.reduction_loops
+        or len(config_spec.block_sizes) < 2
+        or len(config_spec.reduction_block_ids) != 1
+        or any(len(item.block_ids) != 1 for item in config_spec.block_sizes)
+        or len(config_spec.cute_tile_loop_paths) != 1
+    ):
+        return None
+    (reduction_block_id,) = config_spec.reduction_block_ids
+    (path,) = config_spec.cute_tile_loop_paths
+    tile_block_ids = tuple(block_id for level in path for block_id in level)
+    threaded = config_spec.num_threads.valid_block_ids()
+    if (
+        any(len(level) != 1 for level in path)
+        or sorted(tile_block_ids)
+        != sorted(item.block_id for item in config_spec.block_sizes)
+        or reduction_block_id not in config_spec.cute_innermost_loop_reduction_blocks
+        or reduction_block_id not in config_spec.cute_static_reduction_extents
+        or reduction_block_id not in threaded
+        or reduction_block_id not in config_spec.cute_vector_widths.valid_block_ids()
+        or reduction_block_id in config_spec.cute_user_reduce_block_ids
+        or any(block_id not in threaded for block_id in tile_block_ids)
+    ):
+        return None
+    return tile_block_ids, reduction_block_id
+
+
 def _normalize_cute_lane_knobs(
     config_spec: ConfigSpec, config: dict[str, object]
 ) -> None:
@@ -1992,8 +2047,16 @@ def _normalize_cute_lane_knobs(
     runs unpadded, ``cute_lane_unroll`` to the lane loops of a sunk vector
     nest or, without sinking, to the lane loops the config forms
     (``cute/unroll_lane_loads.py``) and ``cute_bool_byte_packets`` to a bool
-    row a looped reduction loads at a byte packet's width
+    row a looped reduction, or a persistent vector row without a
+    ``reduction_loops`` slot, loads at a byte packet's width
     (``_rolls_a_byte_packet_row``); each is off when the config has none.
+    A threaded ``cute_reduction_sequence`` (``reload``, ``resident``) runs
+    ``scalar`` where no tile of the config can hold its lanes
+    (``_cute_sequence_tile_holds_warp_lanes``).  On a row under a device
+    loop the loop's one-thread tile loses its vector width under a vector
+    row (``_normalize_cute_carry_row_tile_vector``) and
+    ``cute_lane_unroll`` the values past what the tiles' lane loops take
+    (``_cute_carry_row_lane_unroll``).
 
     They follow the reduction loops and threads, which ``ConfigSpec.normalize``
     settles before this runs (the sequences and their defaults, the
@@ -2007,52 +2070,172 @@ def _normalize_cute_lane_knobs(
             plan.unpadded for plan in plans
         ):
             config["cute_unpadded_rows"] = False
-    if (
-        config.get("cute_lane_unroll", 1) != 1
-        and not config.get("cute_vloop_sink")
-        and not _cute_config_forms_lane_loop(config_spec, config)
-    ):
-        config["cute_lane_unroll"] = 1
+    _normalize_cute_carry_row_tile_vector(config_spec, config)
+    unroll = config.get("cute_lane_unroll", 1)
+    if unroll != 1 and not config.get("cute_vloop_sink"):
+        if not _cute_config_forms_lane_loop(config_spec, config):
+            config["cute_lane_unroll"] = 1
+        elif type(unroll) is int:
+            config["cute_lane_unroll"] = _cute_carry_row_lane_unroll(
+                config_spec, config, unroll
+            )
     if config.get("cute_bool_byte_packets") and not _rolls_a_byte_packet_row(
         config_spec, config
     ):
         config["cute_bool_byte_packets"] = False
+    if config.get(
+        "cute_reduction_sequence"
+    ) in THREADED_SEQUENCES and not _cute_sequence_tile_holds_warp_lanes(
+        config_spec, config
+    ):
+        config["cute_reduction_sequence"] = "scalar"
+
+
+def _normalize_cute_carry_row_tile_vector(
+    config_spec: ConfigSpec, config: dict[str, object]
+) -> None:
+    """Drop the vector width of the device loop's tile under a vector row
+    (``cute_lane_carry_row``) where the tile runs on one thread.
+
+    The tile's rows are then a lane loop of the one thread, which runs as a
+    serial loop of rows under the row's vector lanes
+    (``lane_loops/tile_trips.py``).  A vector width that divides the tile
+    makes its lanes a trace-time loop of rows instead, which no pass runs
+    under them ("reduction marker is nested in a different lane owner"),
+    and any other width changes nothing: the config compiles what the width
+    1 does, or nothing.  The row's lanes are whole vectors
+    (``_CuteReductionPlan.row_width``) once the unpadded layout is decided;
+    scalar lanes or a thread per element keep the tile's width, which a
+    vector of rows under them may take.
+    """
+    blocks = cute_lane_carry_row(config_spec)
+    if blocks is None:
+        return
+    tiles, reduction_block_id = blocks
+    tile_block_id = tiles[-1]
+    widths = config.get("cute_vector_widths")
+    if (
+        not isinstance(widths, list)
+        or tile_block_id not in config_spec.cute_vector_widths.valid_block_ids()
+    ):
+        return
+    index = config_spec.cute_vector_widths.block_id_to_index(tile_block_id)
+    threads = config_spec.num_threads.config_get(
+        cast("list[int]", config.get("num_threads", []) or []), tile_block_id, 0
+    )
+    if (
+        widths[index] != 1
+        and threads == 1
+        and any(
+            plan.block_id == reduction_block_id and plan.row_width > 1
+            for plan in _cute_reduction_plans(config_spec, config)
+        )
+    ):
+        config["cute_vector_widths"] = [
+            1 if position == index else width for position, width in enumerate(widths)
+        ]
+
+
+def _cute_sequence_tile_holds_warp_lanes(
+    config_spec: ConfigSpec, config: Mapping[str, object]
+) -> bool:
+    """Whether some tile a reduction sequence runs on
+    (``cute_sequence_reduction_blocks``) is large enough for the threaded
+    sequences at the block sizes of the normalized ``config``
+    (``sequence_tile_holds_warp_lanes``); a block without a block size of
+    its own counts as large enough."""
+    bs_list = cast("list[int]", config.get("block_sizes", []) or [])
+    sized = config_spec.block_sizes.valid_block_ids()
+    return sequence_tile_holds_warp_lanes(
+        config_spec.block_sizes.config_get(bs_list, block_id, 1)
+        if block_id in sized
+        else None
+        for block_id in config_spec.cute_sequence_reduction_blocks
+    )
 
 
 def _rolls_a_byte_packet_row(
     config_spec: ConfigSpec, config: Mapping[str, object]
 ) -> bool:
-    """Whether ``config`` rolls one of the reductions along a bool row
+    """Whether ``config`` runs one of the reductions along a bool row
     (``cute_bool_byte_packet_blocks``) in lanes of a width one packed integer
     holds (``_CUTE_BYTE_PACKET_WIDTHS``): where ``cute_bool_byte_packets``
     takes effect.  The width is the one the lanes take with the fitted
-    threads (``_CuteReductionPlan.rolled_width``), not the requested
-    ``cute_vector_widths`` entry: lanes of one element, where the threads
-    cover the chunk or the width does not divide each thread's elements,
-    load no packet."""
+    threads (``_CuteReductionPlan.rolled_width`` of a looped reduction,
+    ``row_width`` of a persistent row without a ``reduction_loops`` slot),
+    not the requested ``cute_vector_widths`` entry: lanes of one element,
+    where the threads cover the chunk or the width does not divide each
+    thread's elements, load no packet."""
     blocks = config_spec.cute_bool_byte_packet_blocks
     return any(
-        plan.block_id in blocks and plan.rolled_width in _CUTE_BYTE_PACKET_WIDTHS
+        plan.block_id in blocks
+        and (
+            plan.rolled_width in _CUTE_BYTE_PACKET_WIDTHS
+            or plan.row_width in _CUTE_BYTE_PACKET_WIDTHS
+        )
         for plan in _cute_reduction_plans(config_spec, config)
     )
+
+
+def _cute_tile_lane_loops(
+    config_spec: ConfigSpec, config: Mapping[str, object]
+) -> list[int]:
+    """The lanes of each per-thread lane loop the tile axes of the normalized
+    ``config`` get: a tile axis (of the grid or of a device loop) with an
+    explicit thread count below its static block size that divides it (the
+    condition ``PerThreadNDTileStrategy`` allocates a lane variable on)
+    walks ``block size / threads`` lanes per thread."""
+    nt_list = cast("list[int]", config.get("num_threads", []) or [])
+    bs_list = cast("list[int]", config.get("block_sizes", []) or [])
+    lanes: list[int] = []
+    for block_id in config_spec.num_threads.valid_block_ids():
+        nt = config_spec.num_threads.config_get(nt_list, block_id, 0)
+        bs = config_spec.block_sizes.config_get(bs_list, block_id, 1)
+        if isinstance(nt, int) and isinstance(bs, int) and 0 < nt < bs and bs % nt == 0:
+            lanes.append(bs // nt)
+    return lanes
 
 
 def _cute_config_forms_lane_loop(
     config_spec: ConfigSpec, config: Mapping[str, object]
 ) -> bool:
     """Whether some axis of the normalized ``config`` gets a per-thread
-    lane loop the unroll may take: a tile axis (of the grid or of a device
-    loop) with an explicit thread count below its static block size that
-    divides it (the condition ``PerThreadNDTileStrategy`` allocates a lane
-    variable on), or a reduction (``_cute_reduction_plans``)."""
-    nt_list = cast("list[int]", config.get("num_threads", []) or [])
-    bs_list = cast("list[int]", config.get("block_sizes", []) or [])
-    for block_id in config_spec.num_threads.valid_block_ids():
-        nt = config_spec.num_threads.config_get(nt_list, block_id, 0)
-        bs = config_spec.block_sizes.config_get(bs_list, block_id, 1)
-        if isinstance(nt, int) and isinstance(bs, int) and 0 < nt < bs and bs % nt == 0:
-            return True
-    return any(plan.lane_loop for plan in _cute_reduction_plans(config_spec, config))
+    lane loop the unroll may take: a tile axis (``_cute_tile_lane_loops``)
+    or a reduction (``_cute_reduction_plans``)."""
+    return bool(_cute_tile_lane_loops(config_spec, config)) or any(
+        plan.lane_loop for plan in _cute_reduction_plans(config_spec, config)
+    )
+
+
+def _cute_carry_row_lane_unroll(
+    config_spec: ConfigSpec, config: Mapping[str, object], unroll: int
+) -> int:
+    """The ``cute_lane_unroll`` value that compiles what ``unroll`` does on
+    a row under a device loop (``cute_lane_carry_row``) whose reduction
+    forms no lane loop of its own in the normalized ``config`` (a vector
+    row, a thread per element); ``unroll`` anywhere else.
+
+    The lane loops are then those of the tile axes
+    (``_cute_tile_lane_loops``): the rows of the device loop's tile on one
+    thread (``lane_loops/tile_trips.py``), the grid tile's.  The unroll
+    takes, per loop, the largest factor within the knob that divides the
+    loop's lanes (``unroll_lane_loads._unroll_factor``), so a larger value
+    compiles the same code: 16 on a tile of two rows is 2.  The structure
+    that opens the knob to the search at every extent
+    (``cute_flat_fields``) would otherwise time those duplicates.
+    """
+    lanes = _cute_tile_lane_loops(config_spec, config)
+    if (
+        not lanes
+        or cute_lane_carry_row(config_spec) is None
+        or any(plan.lane_loop for plan in _cute_reduction_plans(config_spec, config))
+    ):
+        return unroll
+    return max(
+        choice
+        for choice in _CUTE_LANE_UNROLL_CHOICES
+        if choice <= unroll and any(count % choice == 0 for count in lanes)
+    )
 
 
 class _CuteReductionPlan(NamedTuple):
@@ -2072,6 +2255,11 @@ class _CuteReductionPlan(NamedTuple):
     # The threads the reduction runs on: the requested count once the budget,
     # the lane tiling and the one-warp rule of a lane-loop row have lowered it.
     threads: int
+    # The vector width of a persistent row without a ``reduction_loops`` slot
+    # whose lanes are whole vectors (a constexpr loop: one vector per thread,
+    # unpadded or not, or several), 1 for scalar lanes and for a row with a
+    # slot, rolled or not.
+    row_width: int
 
 
 def _cute_reduction_plans(
@@ -2114,7 +2302,8 @@ def _cute_reduction_plans(
     (``supports_resident_threads``): the emitter refuses an unpadded row in
     either place (``_unpadded_lanes``).  The search never meets the first,
     as it opens ``cute_unpadded_rows`` only on a lone row
-    (``cute_lone_row_reduction``).
+    (``cute_lone_row_reduction``) and on the one row under a device loop
+    (``cute_lane_carry_row``), which have no other block to run on.
     """
     nt_list = cast("list[int]", config.get("num_threads", []) or [])
     rl_list = cast("list[int | None]", config.get("reduction_loops", []) or [])
@@ -2161,6 +2350,7 @@ def _cute_reduction_plans(
         unpadded = exact and threads == requested
         lane_loop = False
         rolled_width = 1
+        row_width = vec if unpadded else 1
         if chunk is not None:
             lanes, rolled_width = looped_reduction_lanes(chunk, threads, vec)
             lane_loop = _unrollable_lanes(lanes)
@@ -2219,6 +2409,10 @@ def _cute_reduction_plans(
                     # knob that count is even, as the padded one is: both
                     # form a lane loop.
                     lane_loop = _unrollable_lanes(lanes)
+                else:
+                    row_width = vec
+            else:
+                row_width = vec
         plans.append(
             _CuteReductionPlan(
                 block_id,
@@ -2227,6 +2421,7 @@ def _cute_reduction_plans(
                 lane_loop,
                 rolled_width,
                 threads,
+                1 if block_id in rolled else row_width,
             )
         )
         others *= threads
@@ -4274,6 +4469,7 @@ def cute_flat_fields(
             fields["cute_warp_aggregated_atomics"] = BooleanFragment()
         if config_spec.cute_privatize_atomics_enabled:
             fields["cute_privatize_atomics"] = BooleanFragment()
+        carry_row = cute_lane_carry_row(config_spec) is not None
         if len(config_spec.cute_lane_layouts) > 0 and not config_spec.matmul_facts:
             # The kernel's structure opens it, not its seeds: a max, a min or
             # an ``any`` the knob reduces natively (``cute_native_redux_sites``),
@@ -4324,10 +4520,14 @@ def cute_flat_fields(
             if (
                 cute_lone_row_reduction(config_spec, config_spec.cute_vector_widths)
                 is not None
+                or carry_row
             ):
                 # Its seeds plant only where whole warps cover the row; the
                 # kernel's structure opens it, as for ``cute_lane_unroll``,
-                # so the search space is the same at every extent.
+                # so the search space is the same at every extent: a lone
+                # row, or a row under a device loop whose lanes carry values
+                # through it (``cute_lane_carry_row``; the vector row of
+                # ``CuteLaneCarryRowHeuristic``).
                 fields["cute_unpadded_rows"] = EnumFragment(
                     (False, True), search_choices=(False, True)
                 )
@@ -4378,13 +4578,18 @@ def cute_flat_fields(
             # A lone persistent row walks synthetic lanes at many extents
             # and threads (``CutePersistentLaneUnrollHeuristic`` seeds the
             # masked ones): its kernel structure opens the knob, so the
-            # search space is the same at every extent.
+            # search space is the same at every extent.  So does a row under
+            # a device loop (``cute_lane_carry_row``): a tile of the loop on
+            # one thread is a lane loop of rows, whose loads the unroll
+            # issues ahead of the first row's reductions
+            # (``lane_loops/tile_trips.py``).
             fields["cute_lane_unroll"] = EnumFragment(
                 _CUTE_LANE_UNROLL_CHOICES,
                 search_choices=_CUTE_LANE_UNROLL_CHOICES
                 if sink_open
                 or unroll_seeded
                 or cute_lone_row_reduction(config_spec) is not None
+                or carry_row
                 else (1,),
             )
         # A launch attribute plus one wait, live on every kernel of

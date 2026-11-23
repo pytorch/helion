@@ -173,6 +173,7 @@ from .cute_host_paired_sum import add_host_sum_seeds
 from .cute_integer_loop_reduction import CuteIntegerLoopReductionHeuristic
 from .cute_integer_loop_reduction import register_integer_loop_reduction_coverage
 from .cute_l2_row_swizzle import register_l2_row_swizzle_coverage
+from .cute_lane_carry_rows import CuteLaneCarryRowHeuristic
 from .cute_lane_unrolled_warp_rows import CuteLaneUnrolledWarpRowsHeuristic
 from .cute_lane_unrolled_warp_rows import lane_unrolled_warp_rows_seed_configs
 from .cute_launch_bounds import CutePointwiseMinBlocksHeuristic
@@ -328,6 +329,7 @@ _CUTE_HEURISTIC_CLASSES: tuple[AutotunerHeuristicType, ...] = (
     CuteStridedReductionHeuristic,
     CutePrivatizeAtomicsHeuristic,
     CuteTransposedStoreSeedsHeuristic,
+    CuteLaneCarryRowHeuristic,
 )
 
 
@@ -944,13 +946,14 @@ def register_coverage_groups(env: CompileEnvironment, device_ir: DeviceIR) -> No
 
 def register_bool_byte_packets_coverage(env: CompileEnvironment) -> None:
     """Cover ``cute_bool_byte_packets`` on the first compiler seeds whose
-    looped reductions can take a bool row's byte packets.
+    looped reductions or persistent vector rows can take a bool row's byte
+    packets.
 
     The knob is off by default, so every seed renders as before.  The
     witnesses are extra candidates, measured like any other: the packets win
     where no later sweep reloads the row from memory (a single sweep, or
     register reloads) and can lose where one reloads it from L2 (the cheaper
-    first sweep leaves less of the row there).  A carrier rolls a reduction
+    first sweep leaves less of the row there).  A carrier runs a reduction
     along the bool row at a vector width one packed integer holds
     (``_rolls_a_byte_packet_row``).
     """

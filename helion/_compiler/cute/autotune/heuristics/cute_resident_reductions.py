@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 import dataclasses
+import itertools
 import logging
 from typing import TYPE_CHECKING
 from typing import cast
@@ -17,6 +18,10 @@ from ....autotuner_heuristics.registry import AutotunerHeuristic
 from ...loop_nesting import tile_loop_paths
 from ...thread_budget import MAX_THREADS_PER_BLOCK
 from .cute import _seq_config_list
+from .cute_nest_storage import host_tensor_accesses
+from .cute_nest_storage import inputs
+from .cute_nest_storage import proven_apart
+from .cute_nest_storage import reduces
 
 if TYPE_CHECKING:
     from .....autotuner.config_spec import ConfigSpec
@@ -258,18 +263,89 @@ class CuteResidentReductionHeuristic(AutotunerHeuristic):
                 coarse.drop_occupancy_floor()
         return cls.CACHE_SPECIALIZATION_FACTS
 
+    @staticmethod
+    def _admits_rows(
+        env: CompileEnvironment, device_ir: DeviceIR, plan: _ResidentPlan
+    ) -> bool:
+        """What the device IR shows of the stores and carries the resident
+        lowering proves whatever the config (``resident_reductions._plan``):
+
+        * The row loop holds exactly one store.  The lowering rematerializes
+          one row output per row: a row loop that stores two tensors (an
+          fp32 and a bf16 gradient, a row's two sums) or none is declined.
+        * Every store of the kernel, the row's and those after its loop,
+          writes a slice of features: a row sum stored once per row has no
+          feature vector to rematerialize.
+        * Every stored tensor is proven apart from every loaded one and
+          from the tensor of every other store (two partials stored into
+          the halves of one workspace are not), by the storage rule the
+          lowering applies (``cute_nest_storage.proven_apart``).
+        * No value the row loop carries is computed from a reduction along
+          the row: the schedule moves the reductions against the carries.
+
+        Where one of them fails every seed of the resident families ends in
+        "resident reduction could not prove rectangular independent FP32
+        carries", so none is planted.  The knobs stay searchable on the
+        plan's structure.
+        """
+        from ....device_ir import ForLoopGraphInfo
+
+        accesses = host_tensor_accesses(device_ir)
+        if accesses is None:
+            return False
+        rows = [
+            info
+            for info in device_ir.graphs
+            if isinstance(info, ForLoopGraphInfo) and plan.row_block in info.block_ids
+        ]
+        row_graphs = {info.graph_id for info in rows}
+        stored = [name for _graph, name, _node in accesses.stores]
+        if sum(
+            graph in row_graphs for graph, _name, _node in accesses.stores
+        ) != 1 or not all(
+            any(isinstance(entry, slice) for entry in cast("list", node.args[1]))
+            for _graph, _name, node in accesses.stores
+        ):
+            return False
+        # No tensor is apart from itself: two stores of one fail here.
+        apart = proven_apart(env, device_ir, accesses.tensors)
+        if apart is None or not all(
+            frozenset(pair) in apart
+            for pair in (
+                *itertools.product(accesses.loaded, stored),
+                *itertools.combinations(stored, 2),
+            )
+        ):
+            return False
+        feature = env.block_sizes[plan.reduction_block].symbol()
+        for info in rows:
+            nodes = list(info.graph.nodes)
+            reductions = {
+                node for node in nodes if reduces(node, feature, plan.features)
+            }
+            if any(
+                isinstance(value, torch.fx.Node) and inputs(value) & reductions
+                for node in nodes
+                if node.op == "output"
+                for value in cast("list[object]", node.args[0])
+            ):
+                return False
+        return True
+
     @classmethod
     def _seeds_resident(cls, env: CompileEnvironment, device_ir: DeviceIR) -> bool:
-        """Whether a resident family seeds a row loop over a dim of its own:
-        the base seeds, which the depth seeds follow (the serial output
-        carrier needs a feature width the base seeds tile too, and the
-        serial-row family offers none in this form).  No seed is planted
-        with autotuner heuristics disabled, nor by a seed generator that
-        fails (``compiler_seed_configs`` logs and skips it)."""
+        """Whether a resident family's lattice has a seed for a row loop
+        over a dim of its own: the base seeds, which the depth seeds follow
+        (the serial output carrier needs a feature width the base seeds tile
+        too, and the serial-row family offers none in this form), whether
+        the kernel lets them be planted or not (``_admits_rows``): the
+        coarse tile they schedule is searched either way.  No seed is
+        planted with autotuner heuristics disabled, nor by a seed generator
+        that fails (``compiler_seed_configs`` logs and skips it)."""
         if env.settings.disable_autotuner_heuristics:
             return False
         try:
-            return bool(cls.get_seed_configs(env, device_ir))
+            return bool(cls._seed_configs(env, device_ir, with_vector_rows=True))
         except Exception:
             log.debug(
                 "%s failed while probing its seeds; the occupancy floor stays",
@@ -293,6 +369,9 @@ class CuteResidentReductionHeuristic(AutotunerHeuristic):
     def get_seed_configs(
         cls, env: CompileEnvironment, device_ir: DeviceIR
     ) -> list[Config] | None:
+        plan = cls._plan(env, device_ir)
+        if plan is None or not cls._admits_rows(env, device_ir, plan):
+            return None
         return cls._seed_configs(env, device_ir, with_vector_rows=True)
 
     @classmethod
@@ -397,7 +476,7 @@ class CuteResidentReductionHeuristic(AutotunerHeuristic):
         overlays and serial-row seeds; they never replace the default.
         """
         plan = cls._plan(env, device_ir)
-        if plan is None:
+        if plan is None or not cls._admits_rows(env, device_ir, plan):
             return []
         spec = env.config_spec
         if not _plan_blocks(spec, plan):
@@ -476,7 +555,11 @@ class CuteResidentReductionHeuristic(AutotunerHeuristic):
         its primary producer and every existing compiler seed in order.
         """
         plan = cls._plan(env, device_ir)
-        if plan is None or not 32 <= plan.features <= MAX_THREADS_PER_BLOCK:
+        if (
+            plan is None
+            or not 32 <= plan.features <= MAX_THREADS_PER_BLOCK
+            or not cls._admits_rows(env, device_ir, plan)
+        ):
             return []
         spec = env.config_spec
         if not _plan_blocks(spec, plan) or not _rows_subdivide_coarse(spec, plan):
@@ -543,7 +626,7 @@ class CuteResidentReductionHeuristic(AutotunerHeuristic):
         and the terminal product. This carrier never replaces an old seed.
         """
         plan = cls._plan(env, device_ir)
-        if plan is None:
+        if plan is None or not cls._admits_rows(env, device_ir, plan):
             return None
         spec = env.config_spec
         if (

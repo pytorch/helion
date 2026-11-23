@@ -103,6 +103,7 @@ from ...mma_support import cute_fp32_dot_uses_tf32
 from ...packed_matmul import contraction_axis_for_fact
 from ...pdl_release import CUTE_PDL_SPREAD_KEY
 from ...reduction_lanes import WARP_THREADS
+from ...reduction_lanes import fit_reduction_threads
 from ...reduction_lanes import walks_live_lanes
 from ...register_tile_admission import register_tile_reduction_levels
 from ...staged_stores import INDEX_LIMIT
@@ -174,6 +175,7 @@ from ..config_keys import _cute_chunk_recurrence_config_is_safe
 from ..flash_surface import cute_flash_gated_seed_configs
 from ..flash_surface import cute_flash_seed_configs
 from ..flash_surface import pdl_searched
+from ..search_surface import cute_lane_carry_row
 from ..search_surface import cute_lone_row_reduction
 from ..search_surface import enable_cute_affine_scan_search
 from ..search_surface import enable_cute_async_load_pipeline
@@ -2757,6 +2759,23 @@ class CutePersistentUnpaddedRowsHeuristic(AutotunerHeuristic):
         return seeds
 
 
+def _row_lanes_hold_tile(spec: ConfigSpec, tile_threads: int) -> bool:
+    """Whether a persistent row under a device loop (``cute_lane_carry_row``)
+    would walk synthetic lanes beside ``tile_threads`` threads on the loop's
+    tile: a thread per element of its padded extent does not fit the CTA
+    with them.  The row's lane loop then sits around the device loop and the
+    tile's own lane loop, where the owner validation refuses the row's
+    reductions ("reduction marker is nested in a different lane owner"), so
+    a seed that puts a vector of the tile on several threads never compiles
+    there."""
+    blocks = cute_lane_carry_row(spec)
+    if blocks is None:
+        return False
+    padded = next_power_of_2(spec.cute_static_reduction_extents[blocks[1]])
+    budget = cast("int", spec.max_reduction_threads)
+    return fit_reduction_threads(min(padded, budget), tile_threads) < padded
+
+
 class CuteTileVecHeuristic(AutotunerHeuristic):
     """Seed config for canonical tile kernels (softmax_two_pass etc.)
     that drive their own explicit tile loop over the reduction axis.
@@ -2807,8 +2826,18 @@ class CuteTileVecHeuristic(AutotunerHeuristic):
     def get_seed_configs(
         cls, env: CompileEnvironment, device_ir: DeviceIR
     ) -> list[Config]:
+        # The lane-carry family imports this module.
+        from .cute_lane_carry_rows import CuteLaneCarryRowHeuristic
+
         axis = _cute_tile_vector_axis(env, device_ir)
-        if axis is None:
+        if axis is None or CuteLaneCarryRowHeuristic.is_eligible(env, device_ir):
+            # The inner tile is a device loop of rows that carries values
+            # beside a row's reduction: the lane-carry family seeds that
+            # nest, several rows per thread included, in the form its
+            # lowering proves.  A vector of the rows on one thread is
+            # proven for some row bodies only ("vector lane reduction has
+            # no complete scalar ownership proof" for the others), and
+            # beside lanes of the row for none (``_row_lanes_hold_tile``).
             return []
         outer_block_id, inner_block_id, vec, _extent = axis
         spec = env.config_spec
@@ -2827,6 +2856,9 @@ class CuteTileVecHeuristic(AutotunerHeuristic):
             shapes.append((cls.WIDE_BLOCK, cls.WIDE_THREADS))
         seeds: list[Config] = []
         for block, threads in shapes:
+            if _row_lanes_hold_tile(spec, threads):
+                # A row reduced under the tile's loop, with nothing carried.
+                continue
             seed: dict[str, Any] = {
                 "block_sizes": _seq_config_list(
                     spec.block_sizes, {outer_block_id: 1, inner_block_id: block}
@@ -5471,6 +5503,11 @@ class CuteDelinearizedRowReductionHeuristic(AutotunerHeuristic):
         chunk = max(fragment.low, min(cls.THREADS * vec * cls.UNROLL, fragment.high))
         vec = max(1, min(vec, chunk // cls.UNROLL))
         threads = max(1, min(cls.THREADS, chunk // (vec * cls.UNROLL)))
+        if _row_lanes_hold_tile(spec, threads):
+            # The loop also reduces a row under it whose lanes would sit
+            # around the tile's: the seed never compiles there, and the
+            # row's structure keeps ``cute_lane_unroll`` searchable.
+            return None
         others = {
             item.block_id: 1
             for item in spec.block_sizes
