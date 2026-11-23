@@ -14,6 +14,8 @@ from torch._inductor.codegen.triton import TritonScheduling
 from torch._inductor.ir import Reduction
 from torch._inductor.ops_handler import OpsHandler
 from torch._inductor.scheduler import BaseSchedulerNode
+from torch._inductor.scheduler import FusedMixOrderReductions
+from torch._inductor.scheduler import MixOrderReduction
 from torch._inductor.utils import get_fused_kernel_name
 from torch._inductor.virtualized import V
 from torch.utils._ordered_set import OrderedSet
@@ -22,6 +24,8 @@ from torch.utils._sympy.functions import Where
 from ..._compiler._inductor.template_buffer import HelionTemplateBuffer
 from ..._compiler.backend_registry import get_backend
 from .. import config as helion_config
+from ..choices import HelionChoices
+from ..support import mix_order_split
 from ..support import numerics_modes
 from ..support import python_wrapper
 from .kernel import ARG_REDUCTIONS
@@ -32,6 +36,7 @@ from .overrides import HelionOverrides
 from .tiling import natural_tiling
 
 if TYPE_CHECKING:
+    from collections.abc import Iterable
     from collections.abc import Sequence
 
     import torch
@@ -39,6 +44,7 @@ if TYPE_CHECKING:
     from torch._inductor.codegen.simd import SIMDKernel
     from torch._inductor.codegen.simd_kernel_features import SIMDKernelFeatures
     from torch._inductor.ir import ComputedBuffer
+    from torch._inductor.scheduler import FusedSchedulerNode
     from torch._inductor.scheduler import Scheduler
     from torch._inductor.scheduler import SchedulerNode
     from torch._inductor.tiling_utils import CoalesceVarAnalysis
@@ -178,6 +184,17 @@ def unsupported(node: SchedulerNode) -> list[str]:
     return missing
 
 
+def check_supported(nodes: Iterable[BaseSchedulerNode]) -> None:
+    """Raises Unsupported for a C++ or FX wrapper, or for what one of `nodes`
+    uses that HelionKernel does not support (unsupported())."""
+    if not python_wrapper():
+        raise Unsupported("cpp_wrapper" if V.graph.cpp_wrapper else "fx_wrapper")
+    if missing := OrderedSet(
+        name for node in nodes for name in unsupported(cast("SchedulerNode", node))
+    ):
+        raise Unsupported(", ".join(missing))
+
+
 class HelionScheduling(SIMDScheduling):
     """Inductor's CUDA scheduling for cuda_backend "helion", as HalideScheduling
     is for "halide": every kernel is a Helion kernel, and a kernel HelionKernel
@@ -219,7 +236,7 @@ class HelionScheduling(SIMDScheduling):
 
             1536*r + 497664*tile_y.index + tile_x.index
 
-        a tile of a [128, 1536, 324] view, which the kernel subscripts by its
+        a tile of a [128, 324, 1536] view, which the kernel subscripts by its
         tiles. Helion lowers the // and % of a reshaped index with sign
         corrections (it no longer knows the index is non-negative), and the
         backend does not see that consecutive tile_x are consecutive addresses,
@@ -275,14 +292,7 @@ class HelionScheduling(SIMDScheduling):
     def codegen_node_schedule(
         self, kernel_features: SIMDKernelFeatures
     ) -> SIMDKernel[Any] | MultiKernel:
-        if not python_wrapper():
-            raise Unsupported("cpp_wrapper" if V.graph.cpp_wrapper else "fx_wrapper")
-        if missing := OrderedSet(
-            name
-            for node in kernel_features.scheduler_nodes()
-            for name in unsupported(node)
-        ):
-            raise Unsupported(", ".join(missing))
+        check_supported(kernel_features.scheduler_nodes())
         return super().codegen_node_schedule(kernel_features)
 
     def can_fuse(self, node1: BaseSchedulerNode, node2: BaseSchedulerNode) -> bool:
@@ -299,7 +309,6 @@ class HelionScheduling(SIMDScheduling):
             return super().can_fuse(node1, node2)
 
     can_fuse_vertical = can_fuse
-    can_fuse_horizontal = can_fuse
 
     def _native_matmul_row_epilogue_can_fuse(
         self, node1: BaseSchedulerNode, node2: BaseSchedulerNode
@@ -310,6 +319,53 @@ class HelionScheduling(SIMDScheduling):
         # iteration_ranges_codegen_header". Unfused, the dot and the sum are
         # Helion kernels of their own.
         return False
+
+    def can_fuse_horizontal(
+        self, node1: BaseSchedulerNode, node2: BaseSchedulerNode
+    ) -> bool:
+        # SIMDScheduling asks MixOrderReduction, which takes Triton kernels only.
+        return HelionChoices.mix_order_reductions(node1, node2) or self.can_fuse(
+            node1, node2
+        )
+
+    def fuse(
+        self, node1: BaseSchedulerNode, node2: BaseSchedulerNode
+    ) -> FusedSchedulerNode:
+        if HelionChoices.mix_order_reductions(node1, node2):
+            return FusedMixOrderReductions(node1, node2)
+        return super().fuse(node1, node2)
+
+    def codegen_mix_order_reduction(self, node: FusedMixOrderReductions) -> None:
+        """One Helion kernel for a mix-order pair, reductions over r and over x
+        of one [x, r] array (HelionChoices.mix_order_reductions()):
+        SIMDScheduling's codegen, with Helion's split of x (mix_order_split(),
+        a divisor of x, whose view [splits, split, r] the kernel indexes) in
+        place of its search over powers of two. The kernel tiles the splits
+        (tile_y) and loops over the x of a split (tile_x), reading each rdim as
+        one block; it sums the terms of the reduction over x across its split
+        into a partial, which it writes to a workspace that the wrapper reduces
+        over the splits. For RMSNorm's
+        backward over [1152000, 512]:
+            for tile_y in hl.tile(9000):
+                rdim = hl.zeros([tile_y, 512]).size(1)
+                part0 = hl.zeros([tile_y, rdim], dtype=torch.float32)
+                for tile_x in hl.tile(128):
+                    tmp3 = in2[tile_y, tile_x, :].to(torch.float32)
+                    ...
+                    out0[tile_y, tile_x, :] = tmp20.to(torch.bfloat16)
+                    part0 = part0 + torch.sum(tmp25, 1)
+                ws[0, tile_y, :] = part0
+        and then
+            buf3 = workspace_0[0 : 4608000].view(9000, 512).sum(dim=0).view([512])"""
+        check_supported(node.get_nodes())
+        numel, _ = MixOrderReduction.get_numel_rnumel(node.node1)
+        device = node.node1.get_device()
+        assert device is not None
+        split = mix_order_split(int(numel), device)
+        if split is None:
+            raise AssertionError(f"no split of an x of {numel}")
+        with config.patch({"triton.mix_order_reduction_split_size": split}):
+            super().codegen_mix_order_reduction(node)
 
     def codegen_template(
         self,

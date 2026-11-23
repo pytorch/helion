@@ -49,7 +49,15 @@ def static_int(value: object) -> int | None:
 
 
 def accesses(
-    node_schedule: list[NodeScheduleEntry], numel: int, rnumel: int
+    node_schedule: list[NodeScheduleEntry],
+    numel: int,
+    rnumel: int,
+    kinds: Sequence[MemoryUsageType] = (
+        MemoryUsageType.LOAD,
+        MemoryUsageType.STORE,
+        MemoryUsageType.STORE_REDUCTION,
+        MemoryUsageType.INDEX_EXPR,
+    ),
 ) -> list[Access] | None:
     """The loads and stores of the kernel's nodes, or None if a size is not a
     constant. Each index is read from the node's loop body, over all its loop
@@ -77,12 +85,7 @@ def accesses(
         for var, size in reversed([*zip(variables, sizes, strict=True)]):
             spans[var] = (step, size)  # pyrefly: ignore [unsupported-operation]
             step *= size  # pyrefly: ignore [unsupported-operation]
-        for kind in (
-            MemoryUsageType.LOAD,
-            MemoryUsageType.STORE,
-            MemoryUsageType.STORE_REDUCTION,
-            MemoryUsageType.INDEX_EXPR,
-        ):
+        for kind in kinds:
             for entry in body.memory_usage[kind]:
                 # Identity(x), which Inductor writes to keep a term from being
                 # simplified, is x.
@@ -100,6 +103,41 @@ def accesses(
                 )
                 result.append(Access(index, spans, covered * itemsize))
     return result
+
+
+def contiguous_reads(
+    node_schedule: list[NodeScheduleEntry], numel: int, rnumel: int
+) -> tuple[int, int] | None:
+    """The bytes the kernel's loads read with a unit stride along a reduction
+    variable, and along a pointwise variable only, of the loads that read along
+    the reduction, gathers included: Inductor's tiling scores leave out an
+    indirect load, as w[i], the rdim of F.embedding(i, w).sum(-1), read at
+    1024*tmp1 + r, which counts along the reduction here. A load's bytes are
+    its distinct elements: an operand broadcast over a pointwise dim, w[r]
+    beside x[y, r], reads its R elements, not one per element of the space
+    it is broadcast over. None if a size is not a constant."""
+    found = accesses(node_schedule, numel, rnumel, kinds=(MemoryUsageType.LOAD,))
+    if found is None:
+        return None
+    along_r = along_x = 0
+    for access in found:
+        index = sympy.expand(access.index)
+        variables = [var for var in index.free_symbols if var in access.spans]
+        if not any(access.spans[var][0] < rnumel for var in variables):
+            continue
+        unit = [
+            var
+            for var in variables
+            if access.spans[var][1] > 1 and index.coeff(var) == 1
+        ]
+        covered = math.prod(size for _, size in access.spans.values())
+        weight = access.weight // covered
+        weight *= math.prod(access.spans[var][1] for var in variables)
+        if any(access.spans[var][0] < rnumel for var in unit):
+            along_r += weight
+        elif unit:
+            along_x += weight
+    return along_r, along_x
 
 
 def boundaries(access: Access) -> Iterable[int]:
@@ -200,7 +238,8 @@ def natural_tiling(
     non-affine. The mean over H and W of a channels-last [128, 1536, 18, 18]
     tensor reads x at 1536*r + 497664*(x // 1536) + x % 1536 over x of 196608
     and r of 324 elements: the dims [128, 1536] and [324], over which it reads
-    in0[tile_y, tile_x, :] (an rdim of 324, one block)."""
+    in0[tile_y, tile_r, tile_x], an outer reduction (in0[tile_y, :, tile_x] in
+    one block)."""
     numel_int, rnumel_int = static_int(numel), static_int(reduction_numel)
     if numel_int is None or rnumel_int is None:
         return None

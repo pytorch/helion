@@ -14,6 +14,7 @@ from torch._inductor.codegen.common import CSEProxy
 from torch._inductor.codegen.common import CSEVariable
 from torch._inductor.codegen.common import DeferredLine
 from torch._inductor.codegen.common import TensorArg
+from torch._inductor.codegen.simd import PartialAccumulate
 from torch._inductor.codegen.simd import SIMDKernel
 from torch._inductor.codegen.simd import constant_repr
 from torch._inductor.dtype_propagation import DtypePropagationOpsHandler
@@ -22,7 +23,7 @@ from torch._inductor.ir import IRNode
 from torch._inductor.ir import MutationLayoutSHOULDREMOVE
 from torch._inductor.ir import Reduction
 from torch._inductor.ir import ReinterpretView
-from torch._inductor.runtime.runtime_utils import next_power_of_2
+from torch._inductor.runtime.hints import ReductionHint
 from torch._inductor.shape_propagation import ShapePropagationOpsHandler
 from torch._inductor.utils import IndentedBuffer
 from torch._inductor.utils import sympy_subs
@@ -32,9 +33,12 @@ from torch.utils._sympy.value_ranges import ValueRanges
 from torch.utils._sympy.value_ranges import bound_sympy
 
 from .. import config as helion_config
+from ..support import names_rdim
 from .overrides import HelionOverrides
 from .overrides import HelionPrinter
 from .overrides import upcast_compute_type
+from .tiling import contiguous_reads
+from .tiling import static_int
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -72,20 +76,6 @@ REDUCTIONS = OrderedSet(
         *ARG_REDUCTIONS,
     ]
 )
-
-
-def names_rdim(rnumel: sympy.Expr) -> bool:
-    """Whether HelionKernel.rdim_code() can name an rdim of `rnumel` elements,
-    so that its reduction can be persistent. Not for an rdim of fewer
-    than 16 that is not a power of two: Helion sizes a factory's dim of under
-    16 by its value, so hl.zeros([tile_x, 12]).size(1) is 12 rather than the
-    reduction dim of in0[tile_x, :], and hl.arange(12) beside the slice fails
-    with "Attempting to broadcast a dimension of length 12". Such an rdim keeps
-    a loop over tile_r, of one block."""
-    if not rnumel.is_Integer:
-        return False
-    size = int(rnumel)
-    return size >= 16 or size == next_power_of_2(size)
 
 
 def accumulator_dtype(dtype: torch.dtype) -> torch.dtype:
@@ -252,6 +242,10 @@ class HelionKernel(SIMDKernel[CSEVariable]):
     stores subscript tensors by tile, e.g. in0[tile_y, tile_r], or in0[tile_y, :]
     for the whole row; Helion picks block sizes and masks partial tiles."""
 
+    # SIMDScheduling's mix-order codegen reads a Triton kernel's fixed config
+    # (codegen_mix_order_reduction()); Helion's autotuner picks the kernel's.
+    fixed_config = None
+
     overrides = HelionOverrides  # type: ignore[assignment]
 
     @staticmethod
@@ -264,14 +258,28 @@ class HelionKernel(SIMDKernel[CSEVariable]):
         super().__init__(tiling, **kwargs)
         self.outer_vars: OrderedSet[CSEVariable] = OrderedSet()
         # A matmul orders r0_ before x so dot operands read [y, r0_] and [r0_, x].
-        matmul = self.is_native_matmul
-        order = ("z0_", "y", "r0_", "x") if matmul else ("z0_", "y", "x", "r0_")
+        # So does an outer reduction, whose x is contiguous in memory and r0_
+        # strided, so that a tile's last dim is the contiguous one, as in the
+        # first kernel of a split var_mean over the first dim of a [401408, 144]:
+        #     tmp0 = in0[tile_y, tile_r, tile_x]          # x of stride 1
+        #     tmp7 = torch.sum(tmp6, -2)
+        # where in0[tile_y, tile_x, tile_r] puts the dim of stride 144 last,
+        # and the autotuner must find lanes and vectors along a dim that is not.
+        outer = self.inside_reduction and self.reads_strided_rdim()
+        order = (
+            ("z0_", "y", "r0_", "x")
+            if self.is_native_matmul or outer
+            else ("z0_", "y", "x", "r0_")
+        )
         self.axes = tuple(axis for axis in order if axis in self.numels)
         self.outer_axes = tuple(axis for axis in self.axes if axis != "r0_")
         roots = {tree.prefix: tree for tree in self.range_trees}
         self.symbols = {axis: roots[axis].index_sym() for axis in self.axes}
+        # Each tile's extent: the axis's numel, but for a split x
+        # (split_x()).
+        self.extents = {axis: self.numels[axis] for axis in self.axes}
         self.tile_ranges: dict[sympy.Expr, sympy.Expr] = {
-            self.symbols[axis]: self.numels[axis] for axis in self.axes
+            self.symbols[axis]: self.extents[axis] for axis in self.axes
         }
         self.arguments: dict[tuple[Any, ...], HelionTensorArg] = {}
         # One buffer, so that a masked load follows the computation of its mask.
@@ -296,11 +304,48 @@ class HelionKernel(SIMDKernel[CSEVariable]):
         self.indirect: dict[sympy.Symbol, CSEVariable] = {}
 
     def __enter__(self) -> Self:
+        if self.mix_order_reduction and "y" not in self.symbols:
+            self.split_x()
         super().__enter__()
         self.exit_stack.enter_context(
             V.set_ops_handler(HelionCSEProxy(self, HelionOverrides()))
         )
         return self
+
+    def split_x(self) -> None:
+        """Tile x of a mix-order reduction (HelionScheduling.
+        codegen_mix_order_reduction()) as splits of rsplit_size: tile_y over
+        the splits, on the grid, and tile_x over the x of a split, in a loop.
+        Index x is x % split of split x // split, so an index reads
+        x = split * tile_y + tile_x (tile_index()): the rdim at x of an [x, r]
+        tensor is in0[tile_y, tile_x, :], in its [splits, split, r] view."""
+        xnumel, split = self.numels["x"], self.rsplit_size
+        if xnumel % split:
+            raise AssertionError(f"a split of {split} does not divide x of {xnumel}")
+        self.axes = ("y", "x", "r0_")
+        self.outer_axes = ("y", "x")
+        self.symbols["y"] = sympy.Symbol("ysplit", integer=True, nonnegative=True)
+        self.extents = {
+            "y": xnumel // split,
+            "x": sympy.Integer(split),
+            "r0_": self.numels["r0_"],
+        }
+        self.tile_ranges = {self.symbols[a]: self.extents[a] for a in self.axes}
+
+    def partial_accumulate(
+        self,
+        name: str,
+        reduction_type: ReductionType,
+        value: CSEVariable,
+        extra_meta: dict[str, Any],
+    ) -> None:
+        """A term of a mix-order pair's reduction over x, which codegen_kernel()
+        reduces over the x of each split."""
+        if reduction_type not in ("sum", "prod"):
+            raise AssertionError(f"a reduction over x of {reduction_type}")
+        self.saved_partial_accumulate.append(
+            PartialAccumulate(name, reduction_type, value)
+        )
 
     @property
     def in_reduction(self) -> bool:
@@ -342,6 +387,30 @@ class HelionKernel(SIMDKernel[CSEVariable]):
                 self.cooperative_reduction,
             )
         )
+
+    def reads_strided_rdim(self) -> bool:
+        """Whether the reduction is an outer one, whose rdims are strided and
+        whose pointwise dims are contiguous: Inductor's hint says so (OUTER,
+        OUTER_TINY), or, for the hint DEFAULT that Inductor gives a reduction
+        with an x too large to split, its loads read more bytes with a unit
+        stride along a pointwise dim than along r0_ (contiguous_reads()), as
+        Inductor's num_splits() decides from their strides: the sum over y of a
+        [16384, 30522] gradient (a bias's), but not F.embedding(i, w).sum(-1),
+        whose gathered rdims of w are contiguous along r0_."""
+        hint = self.features.get_reduction_hint()
+        if hint in (ReductionHint.OUTER, ReductionHint.OUTER_TINY):
+            return True
+        if hint != ReductionHint.DEFAULT:
+            return False
+        numel = static_int(self.features.numel)
+        rnumel = static_int(self.features.reduction_numel)
+        if numel is None or rnumel is None:
+            return False
+        found = contiguous_reads(self.features.node_schedule, numel, rnumel)
+        if found is None:
+            return False
+        along_r, along_x = found
+        return along_r < along_x
 
     def dim_code(self, dim: object) -> str:
         """A dim of a value's shape, as code: in a persistent reduction tile_r
@@ -409,7 +478,8 @@ class HelionKernel(SIMDKernel[CSEVariable]):
 
     def value_shape(self, axes: Iterable[str]) -> TileShape:
         """Shape of a value over `axes`: their tiles in the kernel's axis order,
-        (z, y, r0_, x) with a dot and (z, y, x, r0_) without. A value holds only
+        (z, y, r0_, x) with a dot or an outer reduction (reads_strided_rdim())
+        and (z, y, x, r0_) without. A value holds only
         its own tiles, since an r0_-only value in a matmul's K loop is [tile_r]
         next to [tile_y, tile_r] but [tile_r, 1] next to [tile_r, tile_x];
         align_args() reshapes values as ops combine them."""
@@ -476,6 +546,13 @@ class HelionKernel(SIMDKernel[CSEVariable]):
             if symbol in self.range_tree_nodes
         }
         index = sympy.expand(sympy_subs(index, entries))
+        if "y" in self.symbols and self.mix_order_reduction:
+            # Split x (split_x()): index x is tile_x of split tile_y.
+            x = self.symbols["x"]
+            index = sympy.expand(
+                # pyrefly: ignore [unsupported-operation]
+                index.xreplace({x: self.extents["x"] * self.symbols["y"] + x})
+            )
         return V.graph.sizevars.simplify_with_ranges(index, self.tile_ranges)
 
     def tensor_arg(self, operand: IRNode, *, output: bool = False) -> HelionTensorArg:
@@ -502,7 +579,7 @@ class HelionKernel(SIMDKernel[CSEVariable]):
         in those tiles and the view stays inside the storage."""
         layout = buffer.get_layout()
         expanded = sympy.expand(index)
-        sizes = [self.numels[axis] for axis in axes]
+        sizes = [self.extents[axis] for axis in axes]
         strides = [expanded.coeff(self.symbols[axis]) for axis in axes]
         offset = expanded.xreplace({self.symbols[axis]: 0 for axis in self.axes})
         if not all(
@@ -566,7 +643,7 @@ class HelionKernel(SIMDKernel[CSEVariable]):
             return
         size, rest = sizes[0], sizes[1:]
         if axes and V.graph.sizevars.statically_known_equals(
-            size, self.numels[axes[0]]
+            size, self.extents[axes[0]]
         ):
             for dims in self.dim_assignments(rest, axes[1:]):
                 yield (axes[0], *dims)
@@ -703,16 +780,24 @@ class HelionKernel(SIMDKernel[CSEVariable]):
             settings += ', cute_rng_stream="word0"'
         code.writeline(f"@helion.kernel({settings})")
         names = self.kernel_arg_names()
-        signature = ", ".join(f"{name}: torch.Tensor" for name in names.values())
+        params = [*names.values()]
+        if self.mix_order_reduction:
+            # The [partials, splits, r] workspace of the partials of the
+            # reduction over x (codegen_split_x()).
+            params.append("ws")
+        signature = ", ".join(f"{name}: torch.Tensor" for name in params)
         code.writeline(f"def kernel({signature}) -> None:")
         with code.indent():
-            tiles = ", ".join(TILE_NAMES[axis] for axis in self.outer_axes)
-            sizes = ", ".join(str(self.numels[axis]) for axis in self.outer_axes)
-            sizes = sizes if len(self.outer_axes) == 1 else f"[{sizes}]"
-            code.writeline(f"for {tiles} in hl.tile({sizes}):")
-            with code.indent():
-                self.codegen_rdim(code, TILE_NAMES[self.outer_axes[-1]])
-                code.splice(self.body)
+            if self.mix_order_reduction:
+                self.codegen_split_x(code)
+            else:
+                tiles = ", ".join(TILE_NAMES[axis] for axis in self.outer_axes)
+                sizes = ", ".join(str(self.extents[axis]) for axis in self.outer_axes)
+                sizes = sizes if len(self.outer_axes) == 1 else f"[{sizes}]"
+                code.writeline(f"for {tiles} in hl.tile({sizes}):")
+                with code.indent():
+                    self.codegen_rdim(code, TILE_NAMES[self.outer_axes[-1]])
+                    code.splice(self.body)
         return re.sub(r"__arg\d+__", lambda ref: names[ref[0]], code.getvalue())
 
     def codegen_rdim(self, code: IndentedBuffer, tile: str) -> None:
@@ -720,17 +805,61 @@ class HelionKernel(SIMDKernel[CSEVariable]):
         elements, the dim of the first full rdim the kernel reads, as in rdim =
         in0[tile_x, :].size(1), whose load Helion drops as only its size is
         used; else the dim of a factory beside `tile`, hl.zeros([tile_x,
-        300]).size(1), which the rdim shares but Helion cannot roll."""
+        300]).size(1), which the rdim shares but Helion cannot roll. A mix-order
+        kernel defines rdim outside its loop over tile_x, where an rdim of an
+        operand has no tile_x to read it at."""
         if not self.uses_rdim:
             return
         rolled = self.numels["r0_"] > UNROLLED_RDIM_MAX
-        if self.rdim_anchor is not None and rolled:
+        if self.rdim_anchor is not None and not self.mix_order_reduction and rolled:
             ref, coordinates = self.rdim_anchor
             dim = coordinates.index(":")
             code.writeline(f"rdim = {ref}[{', '.join(coordinates)}].size({dim})")
         else:
             size = self.numels["r0_"]
             code.writeline(f"rdim = hl.zeros([{tile}, {size}]).size(1)")
+
+    def codegen_split_x(self, code: IndentedBuffer) -> None:
+        """The loops of a mix-order reduction (split_x()): the body over the x
+        of each split, and the terms of the reduction over x (one partial per
+        partial_accumulate()) summed over them, as for RMSNorm's backward:
+            for tile_y in hl.tile(9000):
+                rdim = hl.zeros([tile_y, 512]).size(1)
+                part0 = hl.zeros([tile_y, rdim], dtype=torch.float32)
+                for tile_x in hl.tile(128):
+                    ...
+                    part0 = part0 + torch.sum(tmp25, 1)
+                ws[0, tile_y, :] = part0
+        Helion reduces only the x a partial tile_x holds: torch.sum over a
+        tile's dim masks the lanes past its end."""
+        rdim = self.rdim_code()  # before codegen_rdim(), as it can name rdim
+        shape = self.value_shape(["y", "x", "r0_"])
+        code.writeline(f"for tile_y in hl.tile({self.extents['y']}):")
+        with code.indent():
+            self.codegen_rdim(code, "tile_y")
+            for index, partial in enumerate(self.saved_partial_accumulate):
+                if partial.reduction_type == "sum":
+                    line = f"hl.zeros([tile_y, {rdim}], dtype=torch.float32)"
+                else:
+                    line = f"hl.full([tile_y, {rdim}], 1.0, dtype=torch.float32)"
+                code.writeline(f"part{index} = {line}")
+            code.writeline(f"for tile_x in hl.tile({self.extents['x']}):")
+            with code.indent():
+                code.splice(self.body)
+                for index, partial in enumerate(self.saved_partial_accumulate):
+                    value = partial.value
+                    term = self.align(value, shape)
+                    if tuple(value.shape or ()) != shape:
+                        term = f"{term}.expand({self.dims_code(shape)})"
+                    if value.dtype != torch.float32:
+                        term = f"{term}.to(torch.float32)"
+                    fn = REDUCTION_FUNCTIONS[partial.reduction_type]
+                    combine = "+" if partial.reduction_type == "sum" else "*"
+                    code.writeline(
+                        f"part{index} = part{index} {combine} torch.{fn}({term}, 1)"
+                    )
+            for index in range(len(self.saved_partial_accumulate)):
+                code.writeline(f"ws[{index}, tile_y, :] = part{index}")
 
     def kernel_args(self) -> list[HelionTensorArg]:
         """Inputs, then outputs whose stores were not removed."""
@@ -793,7 +922,21 @@ class HelionKernel(SIMDKernel[CSEVariable]):
         self, name: str, node: IRNode | None = None, deallocate_ws: bool = True
     ) -> None:
         wrapper = V.graph.wrapper_code
-        wrapper.writeline(wrapper.wrap_kernel_call(name, self.call_args()))
+        args = self.call_args()
+        for workspace in self.args.workspace_args:
+            wrapper.generate_workspace_allocation(workspace)
+        if self.mix_order_reduction:
+            # The workspace as [partials, splits, r] (codegen_split_x()).
+            (workspace,) = self.args.workspace_args
+            dims = (
+                len(self.saved_partial_accumulate),
+                self.extents["y"],
+                self.numels["r0_"],
+            )
+            args.append(f"{workspace.outer_name}.view{dims}")
+        wrapper.writeline(wrapper.wrap_kernel_call(name, args))
+        if deallocate_ws:
+            self.deallocate_workspaces()
 
     def load(self, name: str, index: sympy.Expr) -> CSEVariable:
         if name in self.outer_stores:
@@ -932,7 +1075,7 @@ class HelionKernel(SIMDKernel[CSEVariable]):
         # tensor, so an index that reads one always widens: in
         # ((tile_x.index + 4*tmp0) % 100) with tmp0 = 2**29, the sum would wrap.
         ranges = {
-            self.symbols[axis]: ValueRanges(0, self.numels[axis] - 1) for axis in axes
+            self.symbols[axis]: ValueRanges(0, self.extents[axis] - 1) for axis in axes
         }
         # The terms without a value are summed in int32 before the value's term
         # joins: bound their sum too.
@@ -972,7 +1115,7 @@ class HelionKernel(SIMDKernel[CSEVariable]):
     def in_range(self, buffer: IRNode, index: sympy.Expr) -> bool:
         """Whether a direct `index` is within `buffer`'s storage on every lane."""
         ranges = {
-            symbol: ValueRanges(0, self.numels[axis] - 1)
+            symbol: ValueRanges(0, self.extents[axis] - 1)
             for axis, symbol in self.symbols.items()
         }
         bound = bound_sympy(index, ranges)
@@ -1183,8 +1326,10 @@ class HelionKernel(SIMDKernel[CSEVariable]):
     ) -> tuple[str, TileShape]:
         """torch.<fn> of a block of `value` over tile_r, e.g. torch.sum(tmp0, -1),
         for an accumulator of `dtype`, and its shape."""
-        # Reduce tile_r wherever the axis order puts it: last without a dot, before
-        # tile_x in a matmul's K loop, as in (a @ b, (a[:, :, None] * b[None]).sum(1)):
+        # Reduce tile_r wherever the axis order puts it: last without a dot or an
+        # outer reduction, before tile_x in an outer reduction (torch.sum(tmp0,
+        # -2) of in0[tile_y, tile_r, tile_x]) and in a matmul's K loop, as in
+        # (a @ b, (a[:, :, None] * b[None]).sum(1)):
         #     acc = torch.addmm(acc, tmp0, tmp1)
         #     tmp3 = tmp2 * tmp1                     # [tile_y, tile_r, tile_x]
         #     acc1 = acc1 + torch.sum(tmp3, -2)
