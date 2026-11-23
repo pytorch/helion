@@ -106,36 +106,85 @@ def _native_config() -> helion.Config:
     )
 
 
+def _reciprocals(source: str) -> list[tuple[ast.Call, bool]]:
+    """Every ``cute.math.rcp`` call of ``source`` and whether the call is the
+    left factor of a product with ``0.25``."""
+    tree = ast.parse(source)
+    scaled_back = {
+        id(node.left)
+        for node in ast.walk(tree)
+        if isinstance(node, ast.BinOp)
+        and isinstance(node.op, ast.Mult)
+        and isinstance(node.right, ast.Constant)
+        and node.right.value == 0.25
+    }
+    return [
+        (node, id(node) in scaled_back)
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call) and ast.unparse(node.func) == "cute.math.rcp"
+    ]
+
+
+def _exponent_signature(exponent: ast.expr) -> tuple[object, ...]:
+    assert isinstance(exponent, ast.Call)
+    assert ast.unparse(exponent.func) == "cute.math.exp2"
+    product = exponent.args[0]
+    assert isinstance(product, ast.BinOp) and isinstance(product.op, ast.Mult)
+    assert isinstance(product.right, ast.UnaryOp)
+    assert isinstance(product.right.op, ast.USub)
+    return (
+        ast.literal_eval(product.right),
+        tuple((item.arg, ast.literal_eval(item.value)) for item in exponent.keywords),
+    )
+
+
 def _sigmoid_signatures(source: str) -> list[tuple[object, ...]]:
+    """The sigmoid of every reciprocal in ``source``, each of which must be
+    the scaled form ``rcp(exp2(...) * 0.25 + 0.25, ...) * 0.25``: the
+    reciprocal of a quarter of the denominator is a normal number wherever
+    the sigmoid is subnormal, so ``ftz`` flushes nothing."""
     signatures: list[tuple[object, ...]] = []
-    for node in ast.walk(ast.parse(source)):
-        if not isinstance(node, ast.Call) or ast.unparse(node.func) != "cute.math.rcp":
-            continue
+    for node, scaled_back in _reciprocals(source):
+        assert scaled_back, ast.unparse(node)
         assert len(node.args) == 1
         denominator = node.args[0]
         assert isinstance(denominator, ast.BinOp)
         assert isinstance(denominator.op, ast.Add)
-        assert ast.literal_eval(denominator.left) == 1.0
-        exponent = denominator.right
-        assert isinstance(exponent, ast.Call)
-        assert ast.unparse(exponent.func) == "cute.math.exp2"
-        product = exponent.args[0]
-        assert isinstance(product, ast.BinOp) and isinstance(product.op, ast.Mult)
-        assert isinstance(product.right, ast.UnaryOp)
-        assert isinstance(product.right.op, ast.USub)
+        assert ast.literal_eval(denominator.right) == 0.25
+        quarter = denominator.left
+        assert isinstance(quarter, ast.BinOp) and isinstance(quarter.op, ast.Mult)
+        assert ast.literal_eval(quarter.right) == 0.25
         signatures.append(
             (
-                ast.literal_eval(product.right),
+                *_exponent_signature(quarter.left),
                 tuple(
                     (item.arg, ast.literal_eval(item.value)) for item in node.keywords
-                ),
-                tuple(
-                    (item.arg, ast.literal_eval(item.value))
-                    for item in exponent.keywords
                 ),
             )
         )
     return signatures
+
+
+def _flushing_logistic_reciprocals(source: str) -> int:
+    """How many reciprocals of ``source`` are the bare ``rcp.approx.ftz`` of
+    ``1 + exp2(...)``, which is 0 where the sigmoid is subnormal: the
+    ``fast_math`` quotient's reciprocal, never a sigmoid's."""
+    count = 0
+    for node, scaled_back in _reciprocals(source):
+        denominator = node.args[0]
+        if (
+            isinstance(denominator, ast.BinOp)
+            and isinstance(denominator.op, ast.Add)
+            and isinstance(denominator.left, ast.Constant)
+            and denominator.left.value == 1.0
+        ):
+            assert not scaled_back
+            assert ("ftz", True) in [
+                (item.arg, ast.literal_eval(item.value)) for item in node.keywords
+            ]
+            _exponent_signature(denominator.right)
+            count += 1
+    return count
 
 
 @pytest.mark.parametrize("dtype", (torch.float16, torch.bfloat16))
@@ -168,10 +217,13 @@ def test_native_and_pointwise_sigmoid_share_the_same_math(
         fast_math=fast_math,
     )._bind_isolated(pointwise_args)
     pointwise_source = pointwise.to_code(helion.Config(block_sizes=[128]))
+    # One sigmoid with and without ``fast_math``: every reciprocal is the
+    # scaled one, which keeps a subnormal result as Triton's ``tl.sigmoid``
+    # does (``_sigmoid_signatures`` rejects the bare flushing reciprocal).
     expected = (
         -1.4426950408889634,
-        (("approx", True), ("ftz", True)),
         (("fastmath", True),),
+        (("approx", True), ("ftz", True)),
     )
     native_signatures = _sigmoid_signatures(native_source)
     pointwise_signatures = _sigmoid_signatures(pointwise_source)
@@ -182,6 +234,76 @@ def test_native_and_pointwise_sigmoid_share_the_same_math(
     assert "1.0 /" not in native_source
     cast = "cutlass.Float16" if dtype is torch.float16 else "cutlass.BFloat16"
     assert f".to({cast}).to(cutlass.Float32)" in native_source
+
+
+def _fragment_sigmoid(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    """A sigmoid of every other output column: an epilogue the generic
+    fragment renderer lowers."""
+    m, k = x.size()
+    h, _, d = weight.size()
+    out = torch.empty([h, m, d], dtype=x.dtype, device=x.device)
+    for tile_h, tile_m, tile_d in hl.tile([h, m, d]):
+        acc = hl.zeros([tile_h, tile_m, tile_d], dtype=torch.float32)
+        for tile_k in hl.tile(k):
+            acc = hl.dot(x[tile_m, tile_k], weight[tile_h, tile_k, tile_d], acc=acc)
+        pairs = acc.view(
+            tile_h.block_size, tile_m.block_size, tile_d.block_size // 2, 2
+        )
+        left, right = hl.split(pairs)
+        out[tile_h, tile_m, tile_d] = (
+            hl.join(torch.sigmoid(left), right)
+            .view(tile_h.block_size, tile_m.block_size, tile_d.block_size)
+            .to(x.dtype)
+        )
+    return out
+
+
+@pytest.mark.parametrize("fast_math", (False, True))
+def test_fragment_epilogue_sigmoid_is_the_pointwise_sigmoid(
+    cpu_b200: None, fast_math: bool
+) -> None:
+    # The fragment renderer lowers an fp32 sigmoid as the pointwise lowering
+    # does, with and without ``fast_math``.  A bare flushing reciprocal, 0
+    # where the sigmoid is subnormal, would make the fused epilogue differ
+    # from the configs that do not fuse it.
+    args = (
+        torch.empty([128, 64], dtype=torch.bfloat16),
+        torch.empty([1, 64, 64], dtype=torch.bfloat16),
+    )
+    bound = helion.kernel(
+        _fragment_sigmoid,
+        backend="cute",
+        autotune_effort="none",
+        static_shapes=True,
+        fast_math=fast_math,
+    )._bind_isolated(args)
+    bound.env.config_spec.tcgen05.search_enabled = True
+    source = bound.to_code(
+        helion.Config(
+            block_sizes=[1, 128, 64, 32],
+            loop_orders=[[0, 1, 2]],
+            num_warps=8,
+            pid_type="persistent_interleaved",
+            tcgen05_cluster_m=1,
+            tcgen05_ab_stages=2,
+            tcgen05_acc_stages=2,
+            tcgen05_c_stages=2,
+            tcgen05_num_epi_warps=4,
+        )
+    )
+    assert "for tcgen05_epi_position" in source
+    signatures = _sigmoid_signatures(source)
+    assert signatures
+    assert all(
+        item
+        == (
+            -1.4426950408889634,
+            (("fastmath", True),),
+            (("approx", True), ("ftz", True)),
+        )
+        for item in signatures
+    )
+    assert "_cute_sigmoid_approx_ftz_f32" not in source
 
 
 def test_a_rank0_scale_takes_the_carriers_dtype_first(cpu_b200: None) -> None:
@@ -430,7 +552,9 @@ def test_native_and_pointwise_silu_compute_the_same_math(
     under ``fast_math`` the approximate quotient of ``ex2.approx``.  Both
     sources run on CPU stand-ins for the DSL math, so a form that rounds
     differently (a reciprocal then a product, ``exp`` for ``exp2(x * log2
-    e)``, a denormal sigmoid kept at -88) fails here; the GPU check is
+    e)``) fails here.  At -88 the sigmoid is subnormal: the sigmoid form
+    keeps it, in either setting, and the ``fast_math`` quotient flushes it,
+    as ``div.approx.ftz`` does.  The GPU check is
     ``test_tcgen05_fused_silu_matches_the_pointwise_lowering``."""
     x = torch.empty((128, 64), dtype=torch.bfloat16)
     y = torch.empty((64, 128), dtype=torch.bfloat16)
@@ -499,3 +623,14 @@ def test_native_and_pointwise_silu_compute_the_same_math(
         np.testing.assert_array_equal(
             fused_values.view(np.int32), unfused_values.view(np.int32)
         )
+    # values[:2] are -88 and -87.5, where 1 + exp(-x) is above 2**126.
+    division, product = fused
+    tiny = np.finfo(np.float32).tiny
+    assert np.all((product[:2] < 0) & (product[:2] > -128 * tiny))
+    assert np.all(division[:2] == 0) if fast_math else np.all(division[:2] < 0)
+    # The flushing reciprocal is the ``fast_math`` quotient's only (the
+    # pointwise quotient is a ``cute.math.div`` there).
+    assert _flushing_logistic_reciprocals(native_source) == int(fast_math)
+    assert _flushing_logistic_reciprocals(pointwise_source) == 0
+    assert len(_reciprocals(native_source)) == 1 + int(fast_math)
+    assert len(_reciprocals(pointwise_source)) == 1

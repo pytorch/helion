@@ -183,6 +183,48 @@ def _cute_scalar_combine(reduction_type: str) -> object:
     return _resolve_ops(reduction_type)[1]
 
 
+def _folds_as_tree(combine: object, dtype: type) -> bool:
+    """Whether a short fold of ``dtype`` partials by ``combine`` takes the
+    tree order of ``_cute_tree_fold`` instead of a left-to-right chain: a
+    float sum.  Its result depends on the association, and the tree is the
+    one the two-stage form (the same reduce from 9 warps on, or with several
+    groups in a CTA) and Triton's cross-warp stage have, so a sum is the
+    same in the serial form, the two-stage form and the cluster exchange.
+    (The register tile's column reduce keeps its own orders, a chain over
+    the warps at ``pre == 1``: ``_cute_grouped_reduce_shared_columns``.)
+    Neither order is the more accurate one on every input.  With partials
+    of similar magnitude, which sums over equal shares of a group's elements
+    usually are, a chain's running total reaches the result's magnitude
+    after two partials and most of its adds round at the result's last
+    place, where the tree's last add alone does.  With partials that grow
+    in warp order the chain is the better order (it adds the small ones
+    before the large).  The other combines keep their chain: an integer
+    sum, ``any`` and the NaN-propagating fp32 extrema give the same bits in
+    any order, and a product or a compare-select extremum (the sign of a
+    zero) is left as it was."""
+    return combine is operator.add and dtype.is_float
+
+
+def _cute_tree_fold(values: list, combine: object) -> cute.Numeric:
+    """Fold ``values`` (at most 32) as a descending butterfly over their
+    indices does (offsets 16, 8, 4, 2, 1; partner second): the association
+    of the two-stage form's second stage (``_cute_warp_tree_fold`` and
+    ``_cute_warp_tree_fold_strided_siblings`` fold their 32 lanes through
+    this function) without its identity lanes, and of the cross-warp stage
+    of Triton's reductions.  ``len(values) - 1`` combines, as a chain has,
+    ``ceil(log2)`` deep."""
+    values = list(values)
+    count = len(values)
+    # The butterfly starts at offset 16: a 33rd value would never be folded.
+    assert count <= 32, count
+    offset = 16
+    while offset:
+        for i in range(min(offset, count - offset)):
+            values[i] = combine(values[i], values[i + offset])
+        offset //= 2
+    return values[0]
+
+
 @cute.jit
 def _cute_grouped_reduce_warp_body(
     input_value: cute.Numeric,
@@ -326,7 +368,9 @@ def _cute_grouped_reduce_shared_two_stage_body(
 
 # Serial cross-warp combine for whole-CTA groups with few warps: warp
 # reduce, lane 0 of each warp writes its partial to SMEM, one sync, then
-# EVERY thread folds the ``warps`` partials serially.  Compared with the
+# EVERY thread folds the ``warps`` partials itself: a float sum in the
+# two-stage form's tree order, any other combine in warp order
+# (``_cute_fold_warp_partials``).  Compared with the
 # two-stage form this drops the second warp shuffle reduce and its guards
 # (~5 SHFL + WARPSYNC per site) and the result is a fold over SMEM loads,
 # which anchors the scheduler the same way (a shuffle-produced reduction
@@ -737,10 +781,7 @@ def _cute_warp_tree_fold(
             values.append(_smem_read(smem, base + w * stride, dtype))
         else:
             values.append(identity)
-    for shift in cutlass.range_constexpr(4, -1, -1):
-        for i in cutlass.range_constexpr(1 << shift):
-            values[i] = combine(values[i], values[i + (1 << shift)])
-    return values[0]
+    return _cute_tree_fold(values, combine)
 
 
 @cute.jit
@@ -755,14 +796,24 @@ def _cute_fold_warp_partials(
     serial: cutlass.Constexpr[bool],
 ) -> cute.Numeric:
     """Fold the ``count`` warp partials ``smem[base + w * stride]`` as the
-    form ``_cute_grouped_reduce_shared_two_stage`` dispatches to does: in warp
-    order for the serial form (``use_serial_block_reduce``), else in the
-    two-stage form's tree order (``_cute_warp_tree_fold``)."""
+    form ``_cute_grouped_reduce_shared_two_stage`` dispatches to does.  The
+    two-stage form folds in its tree order (``_cute_warp_tree_fold``).  The
+    serial form (``use_serial_block_reduce``) folds a float sum in the same
+    tree order without the identity lanes (``_folds_as_tree``), so the two
+    forms differ for it only in the sign of a zero sum of ``-0.0`` partials,
+    which an identity lane turns into ``+0.0``; any other combine it folds
+    in warp order."""
     if cutlass.const_expr(serial):
         dtype = type(identity)
-        total = _smem_read(smem, base, dtype)
-        for w in cutlass.range_constexpr(1, count):
-            total = combine(total, _smem_read(smem, base + w * stride, dtype))
+        if cutlass.const_expr(_folds_as_tree(combine, dtype)):
+            partials = []
+            for w in cutlass.range_constexpr(count):
+                partials.append(_smem_read(smem, base + w * stride, dtype))
+            total = _cute_tree_fold(partials, combine)
+        else:
+            total = _smem_read(smem, base, dtype)
+            for w in cutlass.range_constexpr(1, count):
+                total = combine(total, _smem_read(smem, base + w * stride, dtype))
     else:
         total = _cute_warp_tree_fold(
             smem, base, combine, identity, stride=stride, count=count
@@ -837,10 +888,7 @@ def _cute_warp_tree_fold_strided_siblings(
             values.append(value if held else identity)
         else:
             values.append(identity)
-    for shift in cutlass.range_constexpr(4, -1, -1):
-        for i in cutlass.range_constexpr(1 << shift):
-            values[i] = combine(values[i], values[i + (1 << shift)])
-    return values[0]
+    return _cute_tree_fold(values, combine)
 
 
 @cute.jit
@@ -1169,8 +1217,10 @@ def _cute_grouped_reduce_cluster_body(
     Every warp's partial is warp-reduced, then pushed into EVERY peer CTA's
     SMEM receive buffer with ``st.async`` + an mbarrier transaction count;
     after the mbarrier wait each CTA folds all ``warps * cluster_n``
-    partials locally.  Small exchanges use a serial fold; larger exchanges
-    distribute the slots over warp lanes and finish with a warp reduction.
+    partials locally.  Small exchanges fold them in every thread (a sum in
+    the tree order of ``_cute_tree_fold``, an extremum in slot order); larger
+    exchanges distribute the slots over warp lanes and finish with a warp
+    reduction.
     Each (textual) call site must execute exactly once per kernel — the
     mbarrier is single-phase.
 
@@ -1205,6 +1255,12 @@ def _cute_grouped_reduce_cluster_body(
     cute.arch.mbarrier_wait(mbar, phase=0)
     result = identity
     if cutlass.const_expr(slots <= 8):
+        if cutlass.const_expr(_folds_as_tree(combine, type(identity))):
+            partials = []
+            for i in cutlass.range_constexpr(slots):
+                partials.append(buf[i])
+            # The identity goes in last, as exact as it went in first.
+            return combine(result, _cute_tree_fold(partials, combine))
         for i in cutlass.range_constexpr(slots):
             result = combine(result, buf[i])
         return result

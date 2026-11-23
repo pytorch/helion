@@ -12,8 +12,8 @@ so does one to the CPU-side sizes there (``shared_columns_elements``).
 
 from __future__ import annotations
 
-# Above this many warps the serial fold's per-thread chain outgrows the
-# two-stage form's constant shuffle cost.
+# Above this many warps the serial form's per-thread fold (one load and one
+# combine per warp) outgrows the two-stage form's constant shuffle cost.
 _SERIAL_MAX_WARPS = 8
 
 

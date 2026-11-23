@@ -17,11 +17,13 @@ Covers both strategies (``PerThreadNDTileStrategy`` for N-D tiles,
 
 from __future__ import annotations
 
+from fractions import Fraction
 from typing import cast
 import unittest
 
 import pytest
 import torch
+import torch._inductor.inductor_prims  # noqa: F401  (registers prims.fma)
 from torch._inductor.utils import fresh_cache
 from torch._inductor.utils import run_and_get_code
 
@@ -137,6 +139,36 @@ def _sigmoid1d(x: torch.Tensor) -> torch.Tensor:
     for tile in hl.tile(out.size()):
         out[tile] = torch.sigmoid(x[tile])
     return out
+
+
+def _negated_fma(
+    x: torch.Tensor, y: torch.Tensor, a: torch.Tensor, b: torch.Tensor
+) -> torch.Tensor:
+    # The softmax backward's shape: fma(-p, total, grad * p).
+    out = torch.empty_like(x)
+    for tile in hl.tile(out.size()):
+        out[tile] = torch.ops.prims.fma(-x[tile], y[tile], a[tile] * b[tile])
+    return out
+
+
+def _addcmul1d(x: torch.Tensor, y: torch.Tensor, z: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tile in hl.tile(out.size()):
+        out[tile] = torch.addcmul(x[tile], y[tile], z[tile])
+    return out
+
+
+def _add_scalar_alpha1d(x: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tile in hl.tile(out.size()):
+        out[tile] = torch.add(x[tile], 2.5, alpha=0.3)
+    return out
+
+
+def _add_in_place1d(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    for tile in hl.tile(x.size()):
+        x[tile] = x[tile].add_(y[tile], alpha=2.0)
+    return x
 
 
 @helion.kernel(backend="cute", static_shapes=True, fast_math=True)
@@ -976,10 +1008,10 @@ class TestCutePointwiseVec(TestCase):
 
     def test_default_sigmoid_rcp_approx(self) -> None:
         """Default (no fast_math) sigmoid lowers through the triton-parity
-        RCP.APPROX + EX2.APPROX sequence: same accuracy class as the branchy
+        EX2.APPROX + RCP.APPROX sequence: same accuracy class as the branchy
         IEEE-div form it replaces (both are dominated by the x*log2e
-        argument rounding; max 64 ulp / mean 3.5 ulp vs fp64 on [-87, 87])
-        and ~20% faster on fp16 streams.  Specials must be preserved."""
+        argument rounding; max 64 ulp / mean 3.5 ulp vs fp64 on [-87, 87]).
+        Specials must be preserved."""
         x = torch.randn(2**14, device=DEVICE, dtype=torch.float16)
         code, out = code_and_output(_sigmoid1d, (x,), block_sizes=[1024])
         self.assertIn("cute.math.rcp", code)
@@ -994,6 +1026,161 @@ class TestCutePointwiseVec(TestCase):
         )
         _, out32 = code_and_output(_sigmoid1d, (xs,), block_sizes=[8])
         torch.testing.assert_close(out32, torch.sigmoid(xs), equal_nan=True)
+
+    def test_sigmoid_has_the_triton_backends_bits(self) -> None:
+        """``torch.sigmoid`` returns what the Triton backend's ``tl.sigmoid``
+        returns, bit for bit, also where the result is subnormal: arguments
+        in about (-88.72, -87.34), where the reciprocal of ``1 + exp(-x)``
+        underflows and a bare ``rcp.approx.ftz`` returns 0."""
+        special = [0.0, -0.0, float("inf"), float("-inf"), float("nan"), 88.0, -88.0]
+        torch.manual_seed(0)
+        values = torch.cat(
+            [
+                torch.linspace(-104.0, -86.0, 4096 - len(special)),
+                # Ordinary arguments, where the scaled reciprocal's equality
+                # with the unscaled one is the hardware's and not Triton's
+                # own sequence.
+                torch.linspace(-30.0, 30.0, 4096),
+                torch.randn(4096),
+                torch.tensor(special),
+            ]
+        )
+        for dtype in (torch.float32, torch.bfloat16):
+            with self.subTest(dtype=dtype):
+                x = values.to(device=DEVICE, dtype=dtype)
+                _, out = code_and_output(_sigmoid1d, (x,), block_sizes=[1024])
+                reference = helion.kernel(
+                    _sigmoid1d.fn,
+                    backend="triton",
+                    static_shapes=True,
+                    config=helion.Config(block_sizes=[1024]),
+                )(x)
+                bits = torch.int32 if dtype is torch.float32 else torch.int16
+                nan = torch.isnan(reference)
+                self.assertTrue(torch.equal(torch.isnan(out), nan))
+                torch.testing.assert_close(
+                    out[~nan].view(bits), reference[~nan].view(bits), rtol=0, atol=0
+                )
+                # The test has its subject: a subnormal sigmoid of -88.
+                at_minus_88 = float(out[-1])
+                self.assertGreater(at_minus_88, 0.0)
+                self.assertLess(at_minus_88, float(torch.finfo(torch.float32).tiny))
+
+    def test_fma_rounds_once_and_fuses_its_own_product(self) -> None:
+        """``prims.fma(-x, y, a * b)`` with ``a = x`` and ``b = y``: the
+        products are equal, so the graph's op, which rounds ``a * b`` and
+        fuses ``-x * y``, returns minus the rounding error of the product
+        exactly.  Separate products and a sum return 0, and fusing the
+        addend's product instead returns the error with the other sign."""
+        torch.manual_seed(0)
+        for dtype in (torch.float32, torch.float64):
+            with self.subTest(dtype=dtype):
+                x = torch.randn(1024, device=DEVICE, dtype=dtype)
+                y = torch.randn(1024, device=DEVICE, dtype=dtype)
+                kernel = helion.kernel(_negated_fma, backend="cute", static_shapes=True)
+                code, out = code_and_output(
+                    kernel, (x, y, x.clone(), y.clone()), block_sizes=[256]
+                )
+                rounded = (x * y).tolist()
+                expected = [
+                    float(Fraction(r) - Fraction(a) * Fraction(b))
+                    for r, a, b in zip(rounded, x.tolist(), y.tolist(), strict=True)
+                ]
+                expected_tensor = torch.tensor(expected, device=DEVICE, dtype=dtype)
+                self.assertGreater(int((expected_tensor != 0).sum()), 900)
+                torch.testing.assert_close(out, expected_tensor, rtol=0, atol=0)
+                self.assertIn("cute.math.fma(", code)
+
+    def test_half_precision_addcmul_rounds_once(self) -> None:
+        """``torch.addcmul`` of bf16 or fp16 tensors returns the 16-bit value
+        nearest the exact ``x + y * z``, as the Triton backend's ``tl.fma``
+        of 16-bit operands does: the product and sum in the dtype are one
+        16-bit fma.  The fp32 fma of the widened operands rounded to the
+        dtype (``cute.math.fma``, Inductor, eager CUDA) rounds twice: with
+        an addend far below the product it misses where the product is
+        halfway between two 16-bit values."""
+        torch.manual_seed(0)
+        count = 2**20
+        for dtype in (torch.bfloat16, torch.float16):
+            with self.subTest(dtype=dtype):
+                x = (torch.randn(count, device=DEVICE) * 2.0**-22).to(dtype)
+                y = torch.randn(count, device=DEVICE).to(dtype)
+                z = torch.randn(count, device=DEVICE).to(dtype)
+                kernel = helion.kernel(_addcmul1d, backend="cute", static_shapes=True)
+                code, out = code_and_output(kernel, (x, y, z), block_sizes=[1024])
+                reference = helion.kernel(
+                    _addcmul1d,
+                    backend="triton",
+                    static_shapes=True,
+                    config=helion.Config(block_sizes=[1024]),
+                )(x, y, z)
+                bits = out.view(torch.int16)
+                torch.testing.assert_close(
+                    bits, reference.view(torch.int16), rtol=0, atol=0
+                )
+                # The product (at most 22 bits) and the sum are exact in
+                # float64 for these operands.
+                exact = x.double() + y.double() * z.double()
+                error = (out.double() - exact).abs()
+                nonzero = out != 0
+                for step in (1, -1):
+                    neighbor = (bits + step).view(dtype).double()
+                    self.assertTrue(
+                        bool((error <= (neighbor - exact).abs())[nonzero].all())
+                    )
+                # The test has its subject: rounding the fp32 fma's value
+                # again gives another result in some elements.
+                twice = exact.float().to(dtype)
+                self.assertGreater(int((twice != out).sum()), 8)
+                self.assertNotIn("cute.math.fma(", code)
+
+    def test_python_scalar_product_is_folded_in_fp32_and_fused_in_fp64(self) -> None:
+        """``torch.add(x, 2.5, alpha=0.3)`` in fp32 is ``x + 0.75``, rounded
+        once: the scalars multiply in double precision when the kernel is
+        traced.  An fma would multiply by ``alpha`` rounded to fp32 and
+        return ``x + 0.75000003``, eager CUDA's result, which is another
+        value in about half of the elements.  In fp64 neither scalar is
+        rounded and the result is the fma, the exact ``x + alpha * 2.5``
+        rounded once: the folded sum adds the double product 0.75, which is
+        2.8e-17 above ``alpha * 2.5``, and is another value in about a third
+        of the elements."""
+        torch.manual_seed(0)
+        for dtype in (torch.float32, torch.float64):
+            with self.subTest(dtype=dtype):
+                x = torch.randn(4096, device=DEVICE, dtype=dtype)
+                kernel = helion.kernel(
+                    _add_scalar_alpha1d, backend="cute", static_shapes=True
+                )
+                code, out = code_and_output(kernel, (x,), block_sizes=[1024])
+                folded = x + 0.75
+                if dtype is torch.float32:
+                    torch.testing.assert_close(out, folded, rtol=0, atol=0)
+                    self.assertNotIn("cute.math.fma(", code)
+                    continue
+                product = Fraction(2.5) * Fraction(0.3)
+                fused = torch.tensor(
+                    [float(Fraction(value) + product) for value in x.tolist()],
+                    device=DEVICE,
+                    dtype=dtype,
+                )
+                self.assertGreater(int((fused != folded).sum()), 512)
+                torch.testing.assert_close(out, fused, rtol=0, atol=0)
+                self.assertIn("cute.math.fma(", code)
+
+    def test_in_place_add_computes_in_the_wider_operands_dtype(self) -> None:
+        """``x.add_(y, alpha=2.0)`` with an fp32 ``x`` and an fp64 ``y`` is
+        an fp64 fma whose result is rounded to fp32, as eager computes it.
+        With ``x = -2`` and ``y = 1 + k * 2**-30`` that is ``k * 2**-29``;
+        an fp32 fma rounds ``y`` to 1 first and returns 0."""
+        steps = torch.arange(1, 65, device=DEVICE, dtype=torch.float64)
+        y = 1.0 + steps * 2.0**-30
+        x = torch.full([64], -2.0, device=DEVICE)
+        kernel = helion.kernel(_add_in_place1d, backend="cute", static_shapes=True)
+        code, out = code_and_output(kernel, (x, y), block_sizes=[32])
+        expected = (steps * 2.0**-29).to(torch.float32)
+        self.assertTrue(bool((y.to(torch.float32) == 1.0).all()))
+        torch.testing.assert_close(out, expected, rtol=0, atol=0)
+        self.assertIn("cute.math.fma(cutlass.Float64(", code)
 
     def test_unsigned_loads_keep_their_unsigned_type(self) -> None:
         """A plain ``(ptr).load()`` of a uint8 / uint32 element yields the

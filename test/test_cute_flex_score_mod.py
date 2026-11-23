@@ -2482,7 +2482,11 @@ class TestCuteFlexScoreMod(TestCase):
     def test_sigmoid_and_log_use_backend_overrides(self) -> None:
         case = next(c for c in _CASES if c.name == "sigmoid_act")
         code, _plan_, _tables, _values = _render_case(case, with_tail=False)
-        self.assertIn("cute.math.rcp(1.0 + cute.math.exp2(", code.chunk_body)
+        self.assertIn(" = cute.math.rcp(cute.math.exp2(", code.chunk_body)
+        self.assertIn(
+            "fastmath=True) * 0.25 + 0.25, approx=True, ftz=True) * 0.25\n",
+            code.chunk_body,
+        )
         self.assertIn("cute.math.log(", code.chunk_body)
         self.assertNotIn(
             "cute.math.log(v_", code.chunk_body.replace("cute.math.log(v_", "LOG(", 0)

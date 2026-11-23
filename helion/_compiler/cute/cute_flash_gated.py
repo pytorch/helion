@@ -3323,9 +3323,9 @@ class _GatedEmitter:
         elif op == "exp2":
             expr = self._exp2(x, ftz_exact=self._exp_feeds_add_one(node))
         elif op == "sigmoid":
-            # The pointwise lowering's sigmoid (rcp.approx.ftz of ex2.approx.ftz
-            # with or without fast_math), so the configs this body declines
-            # compute the same gate.
+            # The pointwise lowering's sigmoid (``SIGMOID_TEMPLATE``, with or
+            # without fast_math), so the configs this body declines compute
+            # the same gate.
             expr = _Value(SIGMOID_TEMPLATE.format(x=x.expr), "f", vec)
         elif op == "tanh":
             expr = _Value(f"cute.math.tanh({x.expr})", "f", vec)
