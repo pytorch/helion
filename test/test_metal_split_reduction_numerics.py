@@ -32,13 +32,15 @@ pytestmark = [
 )
 class TestSplitReductionNumerics(unittest.TestCase):
     def test_seeds_match_reference(self) -> None:
-        """Every seed at 1, 3 and 4 rows (3: a row block of 4 over 3 rows,
-        its fourth row masked)."""
-        for m in (1, 3, 4):
-            args = split_gemv_args(m, 256, 2048, "mps")
+        """Every seed at 1 to 4 rows (3: a row block of 4 over 3 rows, its
+        fourth row masked), over K = 2080 = 8 * 256 + 32: the K seed's last
+        step, at 1 and 2 rows, runs 32 of its 256 threads
+        (``masked_branch``)."""
+        for m in (1, 2, 3, 4):
+            args = split_gemv_args(m, 256, 2080, "mps")
             ref = split_gemv_reference(args)
             seeds = heuristic_seeds(MetalSplitReductionHeuristic, split_gemv.bind(args))
-            self.assertEqual(len(seeds), 2)
+            self.assertEqual(len(seeds), 3 if m <= 2 else 2)
             for config in seeds:
                 with self.subTest(m=m, config=config):
                     out, _, _ = run_with_msl(split_gemv, args, config)
