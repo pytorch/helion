@@ -38,3 +38,56 @@ def inner_tiled_mm(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
                 acc = torch.addmm(acc, x[tm, tk] * 2, y[tk, tn])
             out[tm, tn] = acc
     return out
+
+
+@helion.kernel(backend="metal", static_shapes=True)
+def dequant_forms_mm(
+    x: torch.Tensor,
+    w: torch.Tensor,
+    scales: torch.Tensor,
+    biases: torch.Tensor,
+    form: hl.constexpr,
+) -> torch.Tensor:
+    """x @ W.T for 4-bit codes in int16 words (``metal_fragment.affine_mm``'s
+    format, groups of 32) dequantized four ways (``form``): ``promoted``,
+    its fp16 scale and bias promoted by the float32 codes; ``half``, all of
+    it in fp16, the weight already half; ``bf16_product``, the product
+    rounded to bf16; ``negative_group``, the group index ``k // -32 + 9``,
+    which isn't constant over an aligned tile."""
+    m, k = x.size()
+    n, _ = w.size()
+    out = torch.empty([m, n], dtype=F32, device=x.device)
+    for tile_m, tile_n in hl.tile([m, n]):
+        acc = hl.zeros([tile_m, tile_n], dtype=F32)
+        for tile_k in hl.tile(k):
+            bit = tile_k.index * 4
+            q = (w[tile_n, bit // 16].to(torch.int32) >> (bit % 16)[None, :]) & 15
+            if form == "negative_group":
+                grp = tile_k.index // -32 + 9
+            else:
+                grp = tile_k.index // 32
+            if form == "half":
+                deq = q.to(torch.float16) * scales[tile_n, grp] + biases[tile_n, grp]
+                acc = torch.addmm(acc, x[tile_m, tile_k], deq.T)
+            else:
+                if form == "bf16_product":
+                    deq = (
+                        q.to(torch.bfloat16) * scales[tile_n, grp].to(torch.bfloat16)
+                    ).to(F32) + biases[tile_n, grp].to(F32)
+                else:
+                    deq = q.to(F32) * scales[tile_n, grp] + biases[tile_n, grp]
+                acc = torch.addmm(acc, x[tile_m, tile_k].to(F32), deq.T)
+        out[tile_m, tile_n] = acc
+    return out
+
+
+def dequant_reference(
+    x: torch.Tensor, w: torch.Tensor, scales: torch.Tensor, biases: torch.Tensor
+) -> torch.Tensor:
+    """:func:`dequant_forms_mm`'s ``promoted`` form in float64 on the CPU."""
+    x, w, scales, biases = (t.cpu() for t in (x, w, scales, biases))
+    bit = torch.arange(x.size(1)) * 4
+    codes = ((w.to(torch.int64) & 0xFFFF)[:, bit // 16] >> (bit % 16)) & 15
+    grp = torch.arange(x.size(1)) // 32
+    deq = codes.double() * scales.double()[:, grp] + biases.double()[:, grp]
+    return x.double() @ deq.T

@@ -164,13 +164,23 @@ FRAG_B = "_helion_mpp_frag_b"
 #: An MPP op whose computed operands are cooperative tensors each lane fills
 #: in registers (``mpp_registers``): the loop over its K tile's steps, and
 #: in it the loops over the elements each lane holds of its left and right
-#: inputs.
+#: inputs, and, under an affine split, of the destination.
 REG_RUN = "_helion_mpp_registers"
 REG_A = "_helion_mpp_reg_a"
 REG_B = "_helion_mpp_reg_b"
+REG_EPILOGUE = "_helion_mpp_reg_epilogue"
 #: The runs whose element statements fold per element (``operand_elements``).
 ELEMENT_RUNS = (FRAG_RUN, REG_RUN)
-_ELEMENT_LOOPS = (ELEMENTS, FRAG_RUN, FRAG_A, FRAG_B, REG_RUN, REG_A, REG_B)
+_ELEMENT_LOOPS = (
+    ELEMENTS,
+    FRAG_RUN,
+    FRAG_A,
+    FRAG_B,
+    REG_RUN,
+    REG_A,
+    REG_B,
+    REG_EPILOGUE,
+)
 BIND = "_helion_mpp_bind"
 STAGE = "_helion_mpp_stage"
 MAT = "_helion_mpp_materialize"
@@ -3896,7 +3906,11 @@ def _staged_args(
 
 
 def _codegen_matmul(
-    cg: GenerateAST, node: Node, acc: object, values: tuple[object, object]
+    cg: GenerateAST,
+    node: Node,
+    acc: object,
+    values: tuple[object, object],
+    env: Mapping[Node, object],
 ) -> ast.AST:
     group = current_plan().by_matmul[node]
     _check_threads(cg, group)
@@ -3915,7 +3929,7 @@ def _codegen_matmul(
     spec = current_plan().register_specs.get(group.gid)
     if spec is not None:
         assert registers is not None
-        return registers.codegen_run(cg, group, acc, values, spec)
+        return registers.codegen_run(cg, group, acc, values, env, spec)
     tiles: list[int] = []
     tile_dims: list[str] = []
     parts: list[list[str]] = []
@@ -4041,7 +4055,11 @@ def _codegen_aten_matmul(ctx: LoweringContext, node: Node) -> object:
             )
         )
     return _codegen_matmul(
-        cg, node, None if acc is None else ctx.env[acc], (ctx.env[lhs], ctx.env[rhs])
+        cg,
+        node,
+        None if acc is None else ctx.env[acc],
+        (ctx.env[lhs], ctx.env[rhs]),
+        ctx.env,
     )
 
 
@@ -4058,7 +4076,7 @@ def codegen_dot_metal(state: CodegenState) -> ast.AST:
     cg = state.codegen
     assert isinstance(cg, GenerateAST)
     lhs, rhs, acc = state.ast_args[0], state.ast_args[1], state.ast_args[2]
-    return _codegen_matmul(cg, node, acc, (lhs, rhs))
+    return _codegen_matmul(cg, node, acc, (lhs, rhs), state.env)
 
 
 # MSL assembly: element loops for stores of cooperative values.

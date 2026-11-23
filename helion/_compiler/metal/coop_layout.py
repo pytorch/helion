@@ -36,6 +36,7 @@ import dataclasses
 import functools
 import itertools
 import math
+import re
 from typing import TYPE_CHECKING
 
 import torch
@@ -275,6 +276,45 @@ def probe(atom: Atom) -> Layout:
             )
         operands.append(tuple(lanes))
     return Layout(*operands)
+
+
+#: Whether an Apple GPU family's matrix units run ``matmul2d`` on half
+#: inputs over twice as fast as on float, the affine split's break-even
+#: (``mpp_registers.affine_split_enabled``: two half ops replace one
+#: half-by-float op).  The M1 to M4 run both at their ``simdgroup_matrix``
+#: rate (15.89 vs 15.85 TFLOP/s measured on an M4 Max).  The M5's neural
+#: accelerators are taken to, unmeasured here: the generation MLX gates its
+#: kernels for them on (``metal::is_nax_available``, architecture
+#: generation 17).  A family not listed is off.
+FAST_HALF_FAMILIES = {
+    "M1": False,
+    "M2": False,
+    "M3": False,
+    "M4": False,
+    "M5": True,
+}
+
+
+def gpu_family() -> str | None:
+    """The Apple GPU family of this process's Metal device, ``"M4"`` for an
+    ``"Apple M4 Max"``, or None when its name gives none (a paravirtual
+    device)."""
+    name = torch._C._mps_get_name()  # type: ignore[attr-defined]
+    match = re.match(r"Apple (M\d+)\b", name)
+    return match.group(1) if match else None
+
+
+def fast_half_inputs() -> bool:
+    """Whether this process's Metal GPU runs ``matmul2d`` on half inputs
+    over twice as fast as on float (:data:`FAST_HALF_FAMILIES`), on macOS
+    26.2 or newer, which MLX requires for its kernels on the M5's neural
+    accelerators."""
+    family = gpu_family()
+    return (
+        family is not None
+        and FAST_HALF_FAMILIES.get(family, False)
+        and torch.backends.mps.is_macos_or_newer(26, 2)
+    )
 
 
 def layout(atom: Atom, on_gpu: bool) -> Layout:
