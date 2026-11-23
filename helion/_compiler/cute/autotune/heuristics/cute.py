@@ -58,6 +58,9 @@ from ....compile_environment import _to_sympy
 from ....loop_dependency_checker import _storage_ids
 from ....loop_dependency_checker import graph_memory_access_storage_ids
 from ....loop_dependency_checker import intra_loop_raw_reread_block_ids
+from ....loop_dependency_checker import memory_write_target
+from ....loop_dependency_checker import opaque_access_target
+from ....loop_dependency_checker import reaches_through_pointers
 from ....runtime_tensor_guards import tensor_pairs_with_proven_disjoint_storage
 from ....utils import compute_slice_size
 from ....utils import normalize_slice
@@ -1469,6 +1472,107 @@ def _register_tile_lane_split_orders_memory(
             ):
                 return True
     return False
+
+
+def lane_rows_stay_in_registers(env: CompileEnvironment, device_ir: DeviceIR) -> bool:
+    """Whether no two memory accesses of the kernel can need an order across
+    the threads of a row held in registers on vector lanes
+    (``ConfigSpec.cute_register_lane_rows``).
+
+    Such a row's lane loop is split into passes around the reduction, and a
+    thread barrier has no place between the per-lane statements of a pass
+    (``cute/lane_loops/split.py`` and ``cute/lane_loops/barriers.py`` refuse
+    it), so a kernel that needs one is refused in that layout where its
+    rolled rows, which walk the row trip by trip, compile.  The barrier
+    analysis reads the generated statements; this reads the device IR and
+    fails closed.  It holds when the kernel has a rollable reduction, every
+    storage the kernel writes is touched by atomics alone (the barrier
+    analysis orders no two atomics) or by one store of the grid body and
+    nothing else, and every tensor the kernel writes is proven apart from
+    every other tensor its device code names
+    (``tensor_pairs_with_proven_disjoint_storage``, the proof the lane split
+    asks: it orders no read and write of tensors that may alias).
+
+    Anything else keeps the row rolled: an atomic beside another kind of
+    access of its tensor, an op that may reach memory through its arguments
+    (``opaque_access_target``), a stack tensor, a store under a device loop
+    or a branch (a loop repeats it, a branch hides it), a second access of a
+    stored tensor (a workspace row written before the reduction and read
+    back after it; ``out[tile, 0] = s`` beside ``out[tile, :] = ...``, whose
+    threads race on one element; also a row read and written in place,
+    which the barrier analysis proves to stay in its thread for some forms
+    of the load only: not for one with a cache hint), and a written tensor
+    beside another that may share its memory: a view of it (``out =
+    x.view_as(x)``) or a second argument on its buffer (``x = buffer[:n]``
+    and ``out = buffer[n:]``; two arguments are apart only by the storage
+    spans of the inputs the kernel is bound with, read here from the example
+    inputs because the binding has not recorded its facts yet).  The graphs
+    of the rolled reductions repeat the grid body's statements for the
+    rolled form and are not read.
+    """
+    # Imported here: device_ir imports the backends while it is initialized.
+    from ....device_ir import ReductionLoopGraphInfo
+    from ....host_function import HostFunction
+
+    spec = env.config_spec
+    graphs = device_ir.graphs
+    if not spec.reduction_loops:
+        return False
+    roots = set(device_ir.root_ids)
+    origins = HostFunction.current().tensor_to_origin
+    # Storage -> its loads and stores, each with whether it is in a grid body.
+    accesses: dict[int, list[tuple[torch.fx.Node, bool]]] = {}
+    stored: set[int] = set()
+    atomic: set[int] = set()
+    # The host tensors the device code names, and those a memory op writes.
+    tensors: dict[int, torch.Tensor] = {}
+    written: set[int] = set()
+    for info in graphs:
+        if isinstance(info, ReductionLoopGraphInfo):
+            continue
+        for node in info.graph.nodes:
+            named = node_tensor(node)
+            if named is not None and named in origins:
+                tensors[id(named)] = named
+            if node.op != "call_function":
+                continue
+            if opaque_access_target(node) is not None:
+                return False
+            if node.target is language_load:
+                target = node.args[0]
+            elif (target := memory_write_target(node)) is None:
+                continue
+            if reaches_through_pointers(target):
+                return False
+            if node.target is not language_load:
+                tensor = node_tensor(target)
+                if tensor not in origins:
+                    # No proof for a write to something the host function
+                    # does not know as a tensor.
+                    return False
+                written.add(id(tensor))
+            storages = _storage_ids(graphs, info.graph_id, target)
+            if node.target not in (language_load, language_store):
+                atomic |= storages
+                continue
+            for storage in storages:
+                accesses.setdefault(storage, []).append((node, info.graph_id in roots))
+            if node.target is language_store:
+                stored |= storages
+    if not atomic.isdisjoint(accesses):
+        return False
+    # One store of the grid body and nothing else.
+    for storage in stored:
+        if [in_grid_body for _node, in_grid_body in accesses[storage]] != [True]:
+            return False
+    # Two arguments can be views of one buffer, which no storage id shows.
+    apart = tensor_pairs_with_proven_disjoint_storage(env, tensors, allow_unbound=True)
+    return all(
+        frozenset((write, other)) in apart
+        for write in written
+        for other in tensors
+        if other != write
+    )
 
 
 class CuteRegisterTileHeuristic(AutotunerHeuristic):

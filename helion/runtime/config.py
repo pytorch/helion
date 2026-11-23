@@ -189,6 +189,8 @@ class Config(Mapping[str, object]):
         cute_defer_tile_reduce: bool | None = None,
         cute_staged_store: bool | None = None,
         cute_wide_packet_hints: bool | None = None,
+        cute_scalar_load_hints: bool | None = None,
+        cute_narrow_load_hints: bool | None = None,
         cute_pdl: bool | None = None,
         cute_pdl_capture_overlap: bool | None = None,
         cute_pdl_release: CutePdlReleaseLiteral | None = None,
@@ -338,9 +340,20 @@ class Config(Mapping[str, object]):
                 looped reductions whose chunk spans more than one vector per
                 thread and of persistent reduction rows their threads do not
                 cover; kernels where no loop takes it generate exactly the
-                knob-off code. With the loads apart from the arithmetic, LLVM
-                may contract into one FMA a float multiply and add that the
-                knob-off code rounds separately (a product feeding an add
+                knob-off code. A persistent row whose explicit thread count,
+                at most a warp, walks its static extent in whole lanes keeps
+                that layout under the knob beside a tile axis of several rows
+                per CTA (the rows in registers), in a kernel none of whose
+                memory accesses can need an order across threads. That test
+                is conservative: a tensor the kernel writes must be touched
+                by that one store only or by atomics alone, and must share
+                no buffer with another tensor the kernel accesses (a row
+                written in place rolls). Without the knob, with more threads,
+                under cute_vloop_sink or in any other kernel, such a row is
+                rolled in chunks of the threads the tile leaves. With the loads
+                apart from the arithmetic, LLVM may contract into one FMA a
+                float multiply and add that the knob-off code rounds
+                separately (a product feeding an add
                 whose other operand is a masked load stays in that load's
                 branch there), so float results can round differently, and so
                 can values computed from them (a comparison, an integer cast,
@@ -471,7 +484,29 @@ class Config(Mapping[str, object]):
                 (``cute_vector_widths`` 8 for fp32, 16 for bf16/fp16) through
                 one 256-bit cache-hinted load; SM100+ with CUDA 13 or newer,
                 elsewhere inert. Off by default: a hinted 32-byte packet then
-                loads without the hint, as it always has.
+                loads without the hint, as it always has. The autotuner sets
+                it on every config it tries that names one of those policies.
+            cute_scalar_load_hints: Carry ``load_eviction_policies`` onto the
+                CuTe loads of single 4- and 8-byte elements (a gather, a lane
+                on a strided dim) in full: the element loads of a tensor take
+                the first ``l2_last`` / ``l1_l2_first`` / ``l1_l2_last`` its
+                load slots name, and a hinted element load under a mask
+                becomes one predicated load. Off by default: an L2 policy
+                then reaches packets only and a masked hinted element keeps
+                its conditional, as they always have. The autotuner sets it
+                on every config it tries that names a policy an element load
+                takes (any but ``nc_l2_first``).
+            cute_narrow_load_hints: Carry ``load_eviction_policies`` onto the
+                CuTe loads of single 2-byte elements (bf16, fp16, int16): the
+                element loads of such a tensor take the first policy its load
+                slots name (``first`` / ``last`` / ``streaming`` / ``l2_last``
+                / ``l1_l2_first`` / ``l1_l2_last``), a masked one as one
+                predicated load. A tensor one of whose loads spells out its
+                own policy (``hl.load(..., eviction_policy=...)``) takes none.
+                Off by default: those loads then go without a hint, as they
+                always have. The autotuner neither searches nor sets it: the
+                hinted 2-byte load costs instructions of its own and has
+                measured slower than the plain one.
             cute_pdl: Launch the kernel as a programmatic dependent of the
                 previous kernel in the stream: its launch and prologue overlap
                 that kernel's tail and it waits (``griddepcontrol.wait``) ahead
@@ -678,6 +713,8 @@ class Config(Mapping[str, object]):
             "cute_defer_tile_reduce": cute_defer_tile_reduce,
             "cute_staged_store": cute_staged_store,
             "cute_wide_packet_hints": cute_wide_packet_hints,
+            "cute_scalar_load_hints": cute_scalar_load_hints,
+            "cute_narrow_load_hints": cute_narrow_load_hints,
             "cute_pdl": cute_pdl,
             "cute_pdl_capture_overlap": cute_pdl_capture_overlap,
             "cute_pdl_release": cute_pdl_release,
@@ -1021,6 +1058,14 @@ class Config(Mapping[str, object]):
     @property
     def cute_wide_packet_hints(self) -> bool:
         return self.config.get("cute_wide_packet_hints") is True
+
+    @property
+    def cute_scalar_load_hints(self) -> bool:
+        return self.config.get("cute_scalar_load_hints") is True
+
+    @property
+    def cute_narrow_load_hints(self) -> bool:
+        return self.config.get("cute_narrow_load_hints") is True
 
     @property
     def cute_exact_div_form(self) -> CuteExactDivFormLiteral:

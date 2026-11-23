@@ -232,6 +232,18 @@ CUTE_MISC_SCHEDULE_KEYS: tuple[str, ...] = (
     "cute_privatize_atomics",
     "cute_packet_prefetch",
     "cute_wide_packet_hints",
+    "cute_scalar_load_hints",
+    "cute_narrow_load_hints",
+)
+# The knobs that carry ``load_eviction_policies`` onto load forms which
+# dropped them before the knob existed: the L2 policies on 32-byte packets
+# (``cute_wide_packet_hints``) and on 4- and 8-byte element loads, with the
+# predicated form of a masked hinted element (``cute_scalar_load_hints``),
+# and every policy on 2-byte element loads (``cute_narrow_load_hints``).
+CUTE_LOAD_HINT_FORM_KEYS: tuple[str, ...] = (
+    "cute_wide_packet_hints",
+    "cute_scalar_load_hints",
+    "cute_narrow_load_hints",
 )
 # Launch geometry knobs: never implicit defaults (a pinned config keeps them).
 CUTE_LAUNCH_KEYS: tuple[str, ...] = (

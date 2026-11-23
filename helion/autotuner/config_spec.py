@@ -1074,6 +1074,16 @@ class ConfigSpec:
         # see ``cute/register_tile_admission.py``).  Only these may keep a
         # thread count below their extent persistent.
         self.cute_register_tile_reduction_blocks: set[int] = set()
+        # Set by DeviceIR analysis: the kernel has a rollable reduction and
+        # no two of its memory accesses can need an order across threads (no
+        # loop region reads back storage it stores, and a tensor it stores
+        # into is touched by that store only and shares no buffer with
+        # another tensor it accesses).  A row held in
+        # registers on vector lanes has no place for the thread barrier such
+        # an order takes, so only these kernels keep a lane-unrolled row
+        # persistent beside several rows per block or carry row seeds that
+        # do.
+        self.cute_register_lane_rows = False
         self.cute_async_load_pipeline_enabled = False
         self.cute_bf16x2_recurrence_enabled = False
         # Set by DeviceIR analysis: a reduction over a strided full slice

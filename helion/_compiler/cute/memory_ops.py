@@ -58,7 +58,9 @@ from ._ast_pass_utils import assigned_name
 from ._ast_pass_utils import call_path_str
 from ._ast_pass_utils import names_read
 from .cache_policy_loads import CachePolicy
+from .cache_policy_loads import element_load_hint
 from .cache_policy_loads import hint_wide_packets
+from .cache_policy_loads import spelled_hint_excludes_element_hints
 from .cute_epilogue import _ZERO_ARG_TARGETS
 from .cute_epilogue import analyze_tcgen05_aux_only_store_chain
 from .cute_epilogue import analyze_tcgen05_unary_epilogue_chain
@@ -7780,6 +7782,31 @@ def _(state: CodegenState) -> object:
             # 4 bytes (32 under ``cute_wide_packet_hints``).
             cache_policy = CachePolicy.tunable(policy)
     eviction_suffix = cache_policy.suffix
+    element_hints = state.device_function.cute_state.element_load_hints
+    if explicit_policy is not None:
+        # A policy the kernel spells out is its load's alone and no slot's.
+        # Where that load stays a plain load (a 2-byte element), the final
+        # pass cannot tell it from the tensor's other loads, so the tensor
+        # takes no hint, whichever of its loads is lowered first.
+        if spelled_hint_excludes_element_hints(
+            tensor.dtype, narrow_elements=state.config.cute_narrow_load_hints
+        ):
+            element_hints[site.tensor_name] = None
+    elif (
+        element_hint := element_load_hint(
+            tensor.dtype,
+            cache_policy,
+            l2_elements=state.config.cute_scalar_load_hints,
+            narrow_elements=state.config.cute_narrow_load_hints,
+        )
+    ) is not None:
+        # The tensor's element loads that stay plain take the policy after
+        # every pass has run (``hint_element_loads``): the first slot of the
+        # tensor that names one decides.
+        element_hints.setdefault(
+            site.tensor_name,
+            (_cute_scalar_storage_dtype(tensor.dtype), element_hint),
+        )
     if state.fx_node is not None:
         _record_cute_scalar_load_site(
             state,

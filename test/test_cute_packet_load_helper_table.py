@@ -43,6 +43,10 @@ _LIBRARY_IMPORTS = (
     "from helion._compiler.cute.l2_policy import load_v32b_l2_evict_last as _cute_load_l2_evict_last_32b",
     "from helion._compiler.cute.l2_policy import load_v32b_l1_l2_evict_first as _cute_load_l1_l2_evict_first_32b",
     "from helion._compiler.cute.l2_policy import load_v32b_l1_l2_evict_last as _cute_load_l1_l2_evict_last_32b",
+    # Added after the table (``cute_scalar_load_hints``): the last rows, so
+    # the imports of every earlier render keep their order.
+    "from helion._compiler.cute.element_policy_loads import element_policy_load as _cute_element_policy_load",
+    "from helion._compiler.cute.element_policy_loads import element_policy_load_if as _cute_element_policy_load_if",
 )
 # The literal width tables the table replaced.
 _CACHE_LOAD_HELPERS = {
