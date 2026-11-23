@@ -351,7 +351,8 @@ the pull request description.
 
 - Title: `[area] Imperative summary`, at most about 80 characters. Areas in
   use: `cutedsl`, `autotuner`, `compiler`, `runtime`, `language`, `examples`,
-  `testing`, `ci`, `scripts`, `metal`, `pallas`, `triton`, `autodiff`, `benchmarks`, `docs`.
+  `testing`, `ci`, `scripts`, `metal`, `pallas`, `triton`, `autodiff`, `benchmarks`, `docs`,
+  `inductor`.
 - Body: why, then what changed (bullets when there are several things), then a
   `Testing:` paragraph naming the lanes or commands run, the GPUs, the pass and
   fail counts, and anything you could not run. Flag compatibility-relevant
