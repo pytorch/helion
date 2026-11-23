@@ -20,6 +20,7 @@ from __future__ import annotations
 import ast
 import dataclasses
 import enum
+import re
 
 from .reduce_routing import cooperative_column_slots
 
@@ -167,6 +168,70 @@ def int_keyword(call: ast.Call, name: str) -> int | None:
                 return value.value
             return None
     return None
+
+
+def integer_bounds(dtype: str) -> tuple[int, int] | None:
+    """``(lowest, highest)`` of the integer constructor ``dtype``
+    (``cutlass.Int32``, ``cutlass.Uint8``), None for any other dtype."""
+    match = re.fullmatch(r"cutlass\.(Int|Uint)(\d+)", dtype)
+    if match is None:
+        return None
+    bits = int(match.group(2))
+    lowest = 0 if match.group(1) == "Uint" else -(1 << (bits - 1))
+    return lowest, lowest + (1 << bits) - 1
+
+
+def extremum_identity(dtype: str, maximum: bool) -> str | None:
+    """The literal a per-thread fold of the maximum (``maximum``) or minimum
+    of the integer ``dtype`` starts from: the dtype's lowest or highest
+    value.  None for any other dtype, whose fold starts from an infinity,
+    which no integer holds."""
+    bounds = integer_bounds(dtype)
+    if bounds is None:
+        return None
+    return str(bounds[0] if maximum else bounds[1])
+
+
+def extremum_carrier(dtype: str) -> str:
+    """The dtype a per-thread fold holds a maximum or minimum of ``dtype``
+    in: ``dtype`` itself, but for an integer of at most 32 bits the narrower
+    of fp32 and FP64 that holds each of its values exactly.  fp32 represents
+    every integer of magnitude up to 2**24, so it carries the integers of at
+    most 16 bits; FP64 represents them up to 2**53 and carries the 32-bit
+    ones.  The choice is by the dtype's range, the same for a signed and an
+    unsigned integer of one width.  (``cutlass.Boolean`` is no integer here,
+    and a reduction in it is not folded at all.)
+
+    ptxas (CUDA 13.3) fuses a chain of 32-bit integer maxima or minima whose
+    operands are negated into ``VIMNMX3`` and loses one operand's negation:
+    a fold ``acc = max(acc, -x)`` over the four Int32 lanes of a packet took
+    one lane un-negated (``torch.amax(-v)``).  A floating-point fold is never
+    that instruction; the accumulator is converted back to ``dtype`` once,
+    for the cross-thread reduce.  Which operands ptxas folds a negation of
+    is not visible in the generated source, so every such extremum takes the
+    carrier.  fp32 is the hardware maximum (one ``FMNMX`` per element); an
+    FP64 fold is compares and selects, which a B200 does not notice on a
+    32-bit row but which cost a uint8 row 12 to 18% when it had them.  The
+    extremum of a 64-bit integer is compiled to compares and selects as it
+    is and keeps its dtype.
+    """
+    bounds = integer_bounds(dtype)
+    if bounds is None:
+        return dtype
+    magnitude = max(-bounds[0], bounds[1])
+    if magnitude <= 1 << 24:
+        return "cutlass.Float32"
+    if magnitude <= 1 << 53:
+        return "cutlass.Float64"
+    return dtype
+
+
+def is_extremum_carrier(accumulator: str, reduced: str) -> bool:
+    """Whether a fold accumulator of dtype ``accumulator`` is the carrier of
+    the maximum or minimum that its reduce converts it to ``reduced`` for:
+    such an accumulator starts from the identity of ``reduced``
+    (``extremum_identity``), not of its own dtype."""
+    return accumulator != reduced and extremum_carrier(reduced) == accumulator
 
 
 @dataclasses.dataclass(frozen=True)

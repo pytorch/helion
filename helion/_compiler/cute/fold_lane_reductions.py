@@ -110,6 +110,8 @@ from ._ast_pass_utils import loop_extent
 from ._ast_pass_utils import names_read
 from ._ast_pass_utils import reparse_expr
 from .reduce_call import LANE_FOLD_REDUCES
+from .reduce_call import extremum_identity
+from .reduce_call import is_extremum_carrier
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -153,20 +155,23 @@ def _reduce_helper(call: ast.Call) -> str | None:
 
 
 def _canonical_identity(node: ast.expr) -> ast.expr:
-    """``cutlass.Int64(cutlass.Int64(0))`` -> ``cutlass.Int64(0)``: the
-    outermost dtype wrapper around the innermost literal.
+    """``cutlass.Float32(cutlass.Float8E5M2(float('-inf')))`` ->
+    ``cutlass.Float8E5M2(float('-inf'))``: the innermost dtype wrapper around
+    the literal, which is the identity as its emitter wrote and recorded it.
 
-    ``hoist_warp_reduce`` re-wraps a grouped helper's identity when it
-    rewrites the input; the key must survive that.
+    ``hoist_warp_reduce`` wraps a grouped helper's identity when it folds the
+    input in another dtype than the identity's (fp32 for a narrower float);
+    the key must survive that.  An identity it leaves alone is its own
+    canonical form.
     """
-    if not (
+    # ``_unwrap_casts`` returns another node exactly for a conversion.
+    while (
         isinstance(node, ast.Call)
-        and len(node.args) == 1
-        and not node.keywords
-        and ast.unparse(node.func).startswith("cutlass.")
+        and _unwrap_casts(node) is not node
+        and _unwrap_casts(node.args[0]) is not node.args[0]
     ):
-        return node
-    return ast.Call(func=node.func, args=[_unwrap_casts(node.args[0])], keywords=[])
+        node = node.args[0]
+    return node
 
 
 def fold_site_key(call: ast.Call | str) -> str:
@@ -174,9 +179,10 @@ def fold_site_key(call: ast.Call | str) -> str:
 
     ``hoist_warp_reduce`` rewrites the input of the call after it is
     emitted (the per-lane value becomes the ``_helion_vfold_acc_*``
-    accumulator, a grouped helper's identity is re-wrapped in the
-    accumulator dtype), so the key leaves the first argument out and keeps
-    one dtype wrapper on the identity.
+    accumulator or its conversion, a grouped helper's identity is wrapped in
+    the dtype the fold reduces in where that is another), so the key leaves
+    the first argument out and keeps the identity's own dtype wrapper, the
+    innermost one.
     """
     node = ast.parse(call if isinstance(call, str) else ast.unparse(call), mode="eval")
     expression = node.body
@@ -231,6 +237,13 @@ def _identity_init(stmt: ast.stmt, accumulator: str) -> tuple[str, str] | None:
     ):
         return None
     literal = stmt.value.args[0]
+    if (
+        isinstance(literal, ast.UnaryOp)
+        and isinstance(literal.op, ast.USub)
+        and isinstance(literal.operand, ast.Constant)
+    ):
+        # A negative number: the identity of an integer ``max``.
+        literal = literal.operand
     if not (
         isinstance(literal, ast.Constant)
         or (
@@ -241,7 +254,32 @@ def _identity_init(stmt: ast.stmt, accumulator: str) -> tuple[str, str] | None:
         )
     ):
         return None
-    return ast.unparse(stmt.value.func), ast.unparse(literal)
+    return ast.unparse(stmt.value.func), ast.unparse(stmt.value.args[0])
+
+
+def _reduced_dtype(op: str, dtype: str, reduce_input: ast.expr) -> str:
+    """The dtype the reduce of an accumulator of ``dtype`` combines in:
+    ``dtype``, or the integer dtype ``reduce_input`` converts the accumulator
+    to when ``dtype`` is that integer's extremum carrier
+    (``reduce_call.is_extremum_carrier``: ``hoist_warp_reduce`` holds the
+    maximum or minimum of an integer of at most 32 bits in a float)."""
+    if op != "sum" and isinstance(reduce_input, ast.Call):
+        converted = ast.unparse(reduce_input.func)
+        if is_extremum_carrier(dtype, converted):
+            return converted
+    return dtype
+
+
+def _is_identity(op: str, dtype: str, literal: str) -> bool:
+    """Whether ``literal`` is the identity a fold of ``op`` in ``dtype``
+    starts from: an integer extremum starts from the dtype's lowest or
+    highest value (``reduce_call.extremum_identity``, as ``hoist_warp_reduce``
+    writes it), anything else from ``_IDENTITY_LITERALS``."""
+    if op != "sum":
+        identity = extremum_identity(dtype, op == "max")
+        if identity is not None:
+            return literal == identity
+    return literal in _IDENTITY_LITERALS[op]
 
 
 def _constexpr_extent(loop: ast.For) -> int | None:
@@ -844,16 +882,19 @@ class _LaneFolder:
                     "not initialized to the identity once per lane"
                 )
             dtype, literal = inits[0]
-            if literal not in _IDENTITY_LITERALS[op]:
+            # An accumulator held in a carrier starts from the identity of
+            # the dtype it is converted to for the reduce.
+            reduced = _reduced_dtype(op, dtype, call.args[0])
+            if not _is_identity(op, reduced, literal):
                 raise _reject(
                     f"{accumulator} starts from {literal}, not the identity of {op!r}"
                 )
             if identity is not None and (
                 not isinstance(identity, ast.Call)
-                or ast.unparse(identity.func) != dtype
+                or ast.unparse(identity.func) != reduced
             ):
                 raise _reject(
-                    f"the identity of the reduction in {lane} is not a {dtype}"
+                    f"the identity of the reduction in {lane} is not a {reduced}"
                 )
             if (
                 any(

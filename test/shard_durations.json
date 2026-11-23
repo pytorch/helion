@@ -140,6 +140,7 @@
  "test/test_cute_flatten_nested_reductions.py": 9.5,
  "test/test_cute_flattened_grouped_prefix.py": 0.8,
  "test/test_cute_flex_attention_gpu.py": 209.8,
+ "test/test_cute_fold_accumulator_dtype_cuda.py": 41.8,
  "test/test_cute_fold_one_hot_reductions.py": 9.6,
  "test/test_cute_folded_attention_gpu.py": 5.4,
  "test/test_cute_fp32_dot.py": 4.0,

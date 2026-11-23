@@ -688,6 +688,7 @@ def _hoist_warp_reduce_from_vloop(s: _DeviceBodyState) -> None:
 
     s.kernel_body = hoist_warp_reduce_from_vloop(
         s.kernel_body,
+        reduce_input_dtypes=s.fn.cute_state.lanes.reduce_input_dtypes,
         running_sum_accumulators=s.fn.cute_state.lanes.matmul_running_sums,
         rename_groups=s.ctx.rename_groups,
         unfoldable_vec_lanes=s.fn.cute_state.lanes.unfoldable_vec_lanes,

@@ -4387,6 +4387,20 @@ class CuteBackend(Backend):
     def reduction_threads_hint(self, block_size_var: str | None = None) -> int | None:
         return self._threads_for_block_size_var(block_size_var)
 
+    def _record_reduce_input_dtype(self, input_name: str, dtype: torch.dtype) -> None:
+        """Record that the direct warp reduction of ``input_name`` combines in
+        ``dtype`` (``CuteLaneState.reduce_input_dtypes``): the call text
+        carries no dtype for the passes that fold its input.  Every reduction
+        ``reduction_expr`` writes for a caller that passes a dtype is recorded
+        under the text it reduces, a name or an expression (an argmax's index
+        candidate); the fold looks up the names of the calls it folds."""
+        from ..device_function import DeviceFunction
+
+        recorded = DeviceFunction.current().cute_state.lanes.reduce_input_dtypes
+        dtype_str = self.dtype_str(dtype)
+        if recorded.setdefault(input_name, dtype_str) != dtype_str:
+            recorded[input_name] = None
+
     def reduction_expr(
         self,
         input_name: str,
@@ -4397,6 +4411,8 @@ class CuteBackend(Backend):
         threads_in_group: int | None = None,
         dtype: torch.dtype | None = None,
     ) -> str:
+        if dtype is not None:
+            self._record_reduce_input_dtype(input_name, dtype)
         threads = (
             threads_in_group
             if threads_in_group is not None
@@ -4462,6 +4478,7 @@ class CuteBackend(Backend):
             dim,
             block_size_var=block_size_var,
             threads_in_group=threads_in_group,
+            dtype=dtype,
         )
         index_dtype_str = self.index_type_str(index_dtype)
         max_index = self.cast_expr(repr(torch.iinfo(index_dtype).max), index_dtype_str)
@@ -4474,6 +4491,7 @@ class CuteBackend(Backend):
             dim,
             block_size_var=block_size_var,
             threads_in_group=threads_in_group,
+            dtype=index_dtype,
         )
         return self.cast_expr(reduced_index, self.dtype_str(output_dtype))
 

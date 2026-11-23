@@ -7,7 +7,10 @@ fuses a chain of int32 or int16 maxima or minima, which is what a thread's
 accumulate over its elements is.  An argmin over column tiles has such a
 chain of indices, which are never negations.  The last kernels have a chain
 without a reduction: the maximum and the minimum of three negated rows of a
-register region.  ``adversarial_rows`` builds the input of the row kernels."""
+register region.  ``adversarial_rows`` builds the input of the row kernels.
+The tests of the vector-lane fold (``test_cute_fold_accumulator_dtype.py``
+and its ``_cuda`` module) run ``row_maxima_of_negated`` and
+``row_minima_of_negated`` on those rows too."""
 
 from __future__ import annotations
 
