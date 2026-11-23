@@ -49,7 +49,10 @@ from .lane_fold import MSL_SCALAR_BYTES
 from .lane_fold import jam_lanes_into_loops
 from .lane_fold import unroll_lane_folds
 from .mpp_matmul import ACC
+from .mpp_matmul import REG_RUN
 from .mpp_matmul import RUN
+from .mpp_registers import LANE as REGISTER_LANE
+from .mpp_registers import REGISTER_LOWERING
 from .msl_ast_walker import MASKED_LOAD
 from .msl_ast_walker import MASKED_LOAD_PREAMBLE
 from .msl_ast_walker import EmitState
@@ -258,6 +261,7 @@ def _generate_msl(
         ),
         layout,
         FRAGMENT_LOWERING,
+        REGISTER_LOWERING,
     )
     body_stmts = jam_lanes_into_loops(unroll_lane_folds(body_stmts, names_read))
     msl_parts: list[str] = [
@@ -307,7 +311,7 @@ def _generate_msl(
     if uses_reductions:
         msl_parts.extend(REDUCTION_INCLUDES)
         msl_parts.extend(("", REDUCTION_PREAMBLE))
-    uses_mpp, uses_fragments = _matmul_kinds(body_stmts)
+    uses_mpp, uses_fragments, uses_registers = _matmul_kinds(body_stmts)
     if uses_fragments:
         msl_parts.append("#include <metal_simdgroup_matrix>")
     if uses_mpp:
@@ -331,9 +335,11 @@ def _generate_msl(
                 "using namespace mpp::tensor_ops;",
             ]
         )
-    if ROUND in referenced or BF16_CAST in referenced:
+    # A register run writes its bfloat operands' elements through BF16_CAST
+    # (``msl_ast_walker``'s put).
+    if ROUND in referenced or BF16_CAST in referenced or uses_registers:
         msl_parts.append(ROUND_PREAMBLE)
-    if BF16_CAST in referenced:
+    if BF16_CAST in referenced or uses_registers:
         msl_parts.append(BF16_CAST_PREAMBLE)
     if any(
         isinstance(node, ast.Name) and node.id == MASKED_LOAD
@@ -376,6 +382,8 @@ def _generate_msl(
         params.append("uint3 tid [[thread_position_in_threadgroup]]")
     if uses_fragments:
         params.append(f"uint {LANE} [[thread_index_in_simdgroup]]")
+    if uses_registers:
+        params.append(f"uint {REGISTER_LANE} [[thread_index_in_simdgroup]]")
     if split > 1:
         # The same integer type as the other position attributes.
         params.append(f"uint {SIMDGROUP} [[simdgroup_index_in_threadgroup]]")
@@ -429,12 +437,21 @@ def _generate_msl(
             *reduction_sites,
             *(name for name, _, _ in threadgroup_buffers),
         },
-        constants=kernel_constants(body_stmts) if uses_fragments else {},
+        constants=(
+            kernel_constants(body_stmts) if uses_fragments or uses_registers else {}
+        ),
         split=split,
+        # Register operands' layouts are probed where the kernel runs
+        # (``coop_layout``).
+        on_gpu=any(
+            isinstance(arg, torch.Tensor) and arg.device.type == "mps" for arg in args
+        ),
     )
 
     body_at = len(msl_parts)
     _emit_stmts(body_stmts, msl_parts, indent=4, state=state)
+    # The lane bases of the register operands' layouts.
+    msl_parts[body_at:body_at] = [f"    {line}" for line in state.lane_decls]
     if state.split_slots:
         # ``fragment_mma._split`` kept it within the threadgroup memory.
         assert (
@@ -468,12 +485,13 @@ def _constexpr_decl(name: str, value: object) -> str:
     raise exc.BackendUnsupported("metal", f"kernel argument type: {type(value)}")
 
 
-def _matmul_kinds(body_stmts: list[ast.stmt]) -> tuple[bool, bool]:
-    """Whether the body needs MPP's ``matmul2d`` and whether it has fragment
+def _matmul_kinds(body_stmts: list[ast.stmt]) -> tuple[bool, bool, bool]:
+    """Whether the body needs MPP's ``matmul2d``, whether it has fragment
     groups (``fragment_mma``), each of which declares its accumulator with a
-    ``fragment`` keyword.  The planner lowers all of a kernel's groups one
+    ``fragment`` keyword, and whether it has register runs
+    (``mpp_registers``).  The planner lowers all of a kernel's groups one
     way, so MPP markers with no fragment group are ``matmul2d``'s."""
-    markers = fragments = False
+    markers = fragments = registers = False
     for node in ast.walk(ast.Module(body=body_stmts, type_ignores=[])):
         if not isinstance(node, ast.Call):
             continue
@@ -481,7 +499,8 @@ def _matmul_kinds(body_stmts: list[ast.stmt]) -> tuple[bool, bool]:
         if isinstance(func, ast.Name) and func.id.startswith("_helion_mpp_"):
             markers = True
             fragments |= func.id == ACC and is_fragment_acc(node)
-    return markers and not fragments, fragments
+            registers |= func.id == REG_RUN
+    return markers and not fragments, fragments, registers
 
 
 def _fragment_split(body_stmts: list[ast.stmt]) -> int:

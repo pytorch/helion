@@ -1,0 +1,817 @@
+"""MPP matmuls whose computed operands are cooperative tensors in registers.
+
+``metal_matmul="mpp"`` gives each matmul operand to ``matmul2d`` one of
+three ways.  A device view is a tensor handle the op reads.  A computed
+operand (a dequantized weight, a widened activation) is otherwise staged:
+every K tile, the threads write it into a threadgroup tile, barrier, run
+the op on the tile, barrier.  When the launch is one SIMD group, the op
+runs at ``execution_simdgroup`` scope, the only scope whose inputs may be
+cooperative tensors ("Input cooperative tensors require a single SIMD
+group", MPPTensorOpsMatMul2dImpl.h), and staging buys nothing but
+threadgroup traffic and two barriers per K tile.  So a computed operand
+the lanes can recompute at any element (``OperandRecomputable``) is built
+in registers instead (:func:`register_run_spec`): per step of the K tile,
+each lane writes its elements of the op's left or right input cooperative
+tensor, re-running the Scalar statements that compute each element with
+the thread and lanes that hold it in the Scalar layout bound, as a
+fragment element is computed (``operand_elements``), and the op runs on
+them.  The accumulator and its element loops (stores, updates,
+epilogues) are the MPP lowering's.  A launch of more SIMD groups keeps
+staging: they share each tile, which one decode serves.
+
+Which elements a lane holds is the op's layout, probed on the GPU that runs
+the kernel and factored into lane bases plus constants (``coop_layout``),
+so each element's index arithmetic folds as a fragment element's does.
+
+An activation widened from a 16-bit load (``x.to(float32)``) beside a
+register operand is read as a device view of the 16-bit tensor when that
+lets the op take fewer rows: with two cooperative inputs MPP takes M, N
+and K of 16 or 32 only, one of them 32, while one cooperative input
+leaves M a multiple of 8, so a decode of 8 rows or fewer isn't padded to
+16.  A device view is read in K order, so beside one the register
+operand's elements are too; between two register operands the K
+positions are relabelled so each lane's elements of a row are adjacent
+(``coop_layout.k_order``), which a view is read as when the GPU's layout
+already keeps them adjacent.
+"""
+
+from __future__ import annotations
+
+import ast
+import dataclasses
+import math
+from typing import TYPE_CHECKING
+from typing import cast
+
+import torch
+
+from ...language.memory_ops import load
+from ..ast_extension import expr_from_string
+from ..compile_environment import CompileEnvironment
+from ._constants import SIMD_WIDTH
+from .affine_fold import Fact
+from .coop_layout import INVALID
+from .coop_layout import Atom
+from .coop_layout import base_fact
+from .coop_layout import factor
+from .coop_layout import k_order
+from .coop_layout import lane_bits
+from .coop_layout import lane_expr
+from .coop_layout import layout
+from .coop_layout import op_position
+from .lane_fold import round_bf16_casts
+from .mpp_matmul import MAX_OP_TILE
+from .mpp_matmul import PUT
+from .mpp_matmul import REG_A
+from .mpp_matmul import REG_B
+from .mpp_matmul import REG_RUN
+from .mpp_matmul import RUN
+from .mpp_matmul import WIDENING
+from .mpp_matmul import Graphs
+from .mpp_matmul import MppGroup
+from .mpp_matmul import MppPlan
+from .mpp_matmul import call_name
+from .mpp_matmul import current_plan
+from .mpp_matmul import group_sides
+from .mpp_matmul import matmul_operands
+from .mpp_matmul import names_read
+from .mpp_matmul import op_dims
+from .mpp_matmul import static_tile
+from .mpp_matmul import storage_key
+from .mpp_matmul import transposed_view
+from .mpp_matmul import view_args
+from .mpp_matmul import view_span
+from .mpp_matmul import virtual_thread
+from .operand_elements import OperandRecomputable
+from .operand_elements import clamp_past_end
+from .operand_elements import element_body
+from .operand_elements import keyword
+from .operand_elements import offset_fact
+from .operand_elements import parse_expr
+from .operand_elements import src
+from .operand_elements import static_int
+from .operand_elements import tile_mask
+from .operand_elements import tiles_in_range
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
+    from collections.abc import Mapping
+
+    from torch.fx.node import Node
+
+    from ..generate_ast import GenerateAST
+    from .coop_layout import Coords
+    from .mpp_matmul import View
+    from .msl_ast_walker import EmitState
+
+#: The lane's index in its SIMD group, a kernel parameter of a kernel with
+#: register operands (``metal_jit``).
+LANE = "_mpp_lane"
+#: Most steps in a K tile: they are unrolled, each element's statements
+#: folded, so the source grows with them.  A bound on the code, not a
+#: hardware limit: a K tile past it is staged.
+MAX_STEPS = 16
+
+
+@dataclasses.dataclass(frozen=True)
+class RegisterRun:
+    """How a group's op takes its operands in registers: the op, each
+    side's kind (``"reg"``, a cooperative tensor built in registers, or
+    ``"view"``, a device view), its K tile's steps, and whether the K
+    positions are relabelled across steps (two register operands)."""
+
+    atom: Atom
+    sides: tuple[str, str]
+    steps: int
+    interleave: bool
+
+
+def _narrow_dtype(node: Node, dtype: torch.dtype) -> torch.dtype:
+    """The 16-bit float type a value of ``dtype`` holds exactly, a tensor's
+    of that type or one widened from it (``x.to(float32)``); else
+    ``dtype``."""
+    narrow = (torch.float16, torch.bfloat16)
+    while dtype not in narrow and node.target in WIDENING:
+        source = node.args[0]
+        if not isinstance(source, torch.fx.Node):
+            break
+        val = source.meta.get("val")
+        if not isinstance(val, torch.Tensor) or val.dtype.itemsize >= dtype.itemsize:
+            break
+        node, dtype = source, val.dtype
+    return dtype
+
+
+def _coop_type(group: MppGroup, side: int) -> str:
+    """The MSL element type of a register operand's cooperative tensor: half
+    or bfloat where its values are exactly one, else float.  Each element
+    holds the operand's value unrounded either way."""
+    operand = (group.lhs, group.rhs)[side]
+    node = matmul_operands(group.matmul)[1 + side]
+    assert node is not None
+    dtype = _narrow_dtype(node, operand.dtype)
+    if dtype not in (torch.float16, torch.bfloat16):
+        dtype = torch.float32
+    return CompileEnvironment.current().backend.dtype_str(dtype)
+
+
+def _on_gpu() -> bool:
+    """Whether the kernel runs on the GPU here: its layouts are then probed
+    there."""
+    return CompileEnvironment.current().device.type == "mps"
+
+
+def register_run_spec(cg: GenerateAST, group: MppGroup) -> RegisterRun | None:
+    """How the group's op takes its operands in registers, or None for the
+    MPP lowering's views and staged tiles: when the launch is one SIMD
+    group, an operand is a device view or a computed operand the lanes can
+    recompute at any element (``registers``, set by
+    :func:`check_register_operands`), at least one is the latter, and the
+    op fits ``matmul2d`` with cooperative inputs.
+
+    The op covers the tile: with two cooperative inputs its M, N and K are
+    16 or 32 and one of them 32; with one, M and N are the MPP op's
+    (``op_dims``) and K 16.  A widened activation beside a register operand
+    is a device view when the two-input op would pad the tile's rows or
+    columns (a decode of 8 rows or fewer) or the GPU's layout keeps each
+    lane's K positions of a row adjacent in order (the M5's); else it is
+    built in registers too, in the relabelled K order.  On an M4 at 8 rows
+    the two tie: 8-row ops reading x as a view ran 12-15% faster than
+    16-row ops with x in registers on the o, gate_up and lm_head
+    projections and 8-20% slower on q/og and down, whose long K loops read
+    a word of packed codes per element of a row in K order."""
+    plan = current_plan()
+    if plan.registers is None:
+        return None
+    if math.prod(cg.launch_thread_axis_sizes().values()) != SIMD_WIDTH:
+        return None
+    if (
+        group.fold is not None
+        or group.product is not None
+        or group.batch_block is not None
+        or group.k_factor != 1
+        or not group.lhs.dtype.is_floating_point
+    ):
+        return None
+    block_m, block_n, k = static_tile(cg, (group.m_block, group.n_block, group.k_block))
+    kinds: list[str] = []
+    for operand, tile in ((group.lhs, (block_m, k)), (group.rhs, (k, block_n))):
+        if operand.view is not None:
+            if not _view_fits(operand.view, tile):
+                # Staged, the view is refused as before (_codegen_matmul).
+                return None
+            kinds.append("view")
+        elif operand.registers:
+            widened = operand.widened is not None and _view_fits(operand.widened, tile)
+            kinds.append("widened" if widened else "reg")
+        else:
+            return None
+    if "reg" not in kinds and "widened" not in kinds:
+        return None
+    m, n = op_dims(group, block_m, block_n)
+    backend = CompileEnvironment.current().backend
+
+    def atom_of(sides: tuple[str, str]) -> Atom | None:
+        types: list[str] = []
+        flags: list[bool] = []
+        for side, (operand, kind) in enumerate(
+            zip((group.lhs, group.rhs), sides, strict=True)
+        ):
+            if kind == "view":
+                view = operand.view if operand.view is not None else operand.widened
+                assert view is not None
+                types.append(backend.dtype_str(view.tensor.dtype))
+                flags.append(transposed_view(view))
+            else:
+                types.append(_coop_type(group, side))
+                flags.append(side == 1)
+        if types[0] != types[1] and "float" not in types:
+            # Two 16-bit types: the register sides take float.
+            types = [
+                t if kind == "view" else "float"
+                for t, kind in zip(types, sides, strict=True)
+            ]
+        if sides == ("reg", "reg"):
+            am, an = (16 if s <= 16 else 32 if s <= 32 else 0 for s in (m, n))
+            if not am or not an or am > block_m or an > block_n:
+                return None
+            ak = 32 if (am, an) == (16, 16) else 16
+        else:
+            am, an, ak = m, n, 16
+            if am % 8 or an % 8 or (am % 16 and an % 16):
+                return None
+            if am > MAX_OP_TILE[0] or an > MAX_OP_TILE[1]:
+                return None
+        if k % ak or k // ak > MAX_STEPS:
+            return None
+        return Atom(
+            am,
+            an,
+            ak,
+            types[0],
+            types[1],
+            "float",
+            sides[0] == "view",
+            sides[1] == "view",
+            flags[0],
+            flags[1],
+        )
+
+    sides = cast("tuple[str, str]", tuple(kinds))
+    built = sides
+    if "widened" in kinds:
+        # A widened operand read as a view, the rhs taking registers if both
+        # are; or built in registers.
+        read = cast(
+            "tuple[str, str]",
+            tuple("view" if kind == "widened" else kind for kind in kinds),
+        )
+        if read == ("view", "view"):
+            read = ("view", "reg") if kinds[1] == "widened" else ("reg", "view")
+        built = cast(
+            "tuple[str, str]",
+            tuple("reg" if kind == "widened" else kind for kind in kinds),
+        )
+        sides = read
+        if built == ("reg", "reg") and read != built:
+            both = atom_of(built)
+            if (
+                both is not None
+                and (both.m, both.n) == (m, n)
+                and k_order(layout(both, _on_gpu()), both.k) != tuple(range(both.k))
+            ):
+                sides = built
+    atom = atom_of(sides)
+    if atom is None and sides != built:
+        # The view's op doesn't fit (too many steps of its K): the op with
+        # both operands in registers may.
+        sides = built
+        atom = atom_of(sides)
+    if atom is None:
+        return None
+    return RegisterRun(atom, sides, k // atom.k, sides == ("reg", "reg"))
+
+
+def _view_fits(view: View, tile: tuple[int, int]) -> bool:
+    """Whether a device view's handles over an operand's ``tile`` stay
+    within the int32 offsets MPP tensor handles index with, as the staged
+    path requires of a view (``mpp_matmul._codegen_matmul``): each K
+    step's handle covers part of the tile."""
+    return view_span(view, tile) < 2**31
+
+
+def check_register_operands(group: MppGroup, plan: MppPlan, graphs: Graphs) -> None:
+    """Mark the group's computed operands a lane can recompute at any
+    element, over its M or N block and K (``OperandRecomputable``), from
+    no load of a tensor the kernel writes (which a lane would re-run at the
+    op, after a write the Scalar load preceded): staged at the op from the
+    Scalar layout, not from another group's elements nor hoisted.  An
+    operand widened from a view of a tensor the kernel writes isn't marked,
+    so it stays staged: the op would read the view at the op."""
+    _, lhs, rhs = matmul_operands(group.matmul)
+    for operand, node, block in (
+        (group.lhs, lhs, group.m_block),
+        (group.rhs, rhs, group.n_block),
+    ):
+        if (
+            not operand.staged
+            or operand.elements is not None
+            or operand.hoist is not None
+            or group.k_factor != 1
+        ):
+            continue
+        recomputable = OperandRecomputable(group, graphs, {block, group.k_block})
+        if not recomputable(node):
+            continue
+        loads = [ld for ld in recomputable.nodes(node) if ld.target is load]
+        if any(storage_key(ld) in plan.written for ld in loads):
+            continue
+        operand.registers = True
+
+
+# Codegen.
+
+
+def register_acc_keywords(spec: RegisterRun) -> str:
+    """The ``registers`` keyword of a register group's ``_helion_mpp_acc``:
+    its op (:class:`~coop_layout.Atom`'s fields)."""
+    return f", registers={dataclasses.astuple(spec.atom)!r}"
+
+
+def codegen_register_run(
+    cg: GenerateAST,
+    group: MppGroup,
+    acc: ast.Name,
+    values: tuple[object, object],
+    spec: RegisterRun,
+) -> ast.AST:
+    """``_helion_mpp_run(acc, gid, lhs..., rhs..., registers=[lhs, rhs],
+    ...)`` of a register group: a register operand as the name of its
+    value, cast to the operand's dtype, with ``("reg", bindings, past)``,
+    the bindings making a lane act as the thread holding the element at
+    ``(_e_m or _e_n, _e_k)`` and ``past`` the M or N tile's mask, index and
+    offset when the mask is live (``tile_mask``), for its loads past the
+    tile's loop end; a device view as its nine run arguments
+    (``view_args``) with ``("view", live)``, ``live`` whether each dim is
+    live by construction.  ``steps`` is the K tile's steps, ``interleave``
+    whether they relabel K, ``k_live`` the tile's live length, which masks
+    a register operand's K tail and cuts a view's last steps (None when
+    every tile is whole), and ``facts`` the tile offsets' ``(offset,
+    multiple, least)``."""
+    backend = CompileEnvironment.current().backend
+    k = static_tile(cg, (group.k_block,))[0]
+    parts: list[str] = []
+    anchors: list[tuple[int, str | None]] = []
+    outers: list[str] = []
+    sides: list[str] = []
+    for (operand, blocks, k_pos), value, e, kind in zip(
+        group_sides(group), values, ("_e_m", "_e_n"), spec.sides, strict=True
+    ):
+        if kind == "reg":
+            assert isinstance(value, ast.AST)
+            name = cg.lift(backend.cast_ast(value, operand.dtype), prefix="_mpp_rv")
+            binds = virtual_thread(
+                cg, ((blocks[1 - k_pos], e), (group.k_block, "_e_k"))
+            )
+            past = tile_mask(cg, blocks[1 - k_pos])
+            parts.append(name.id)
+            outers.append("[]")
+            sides.append(f"('reg', [{', '.join(binds)}], {past!r})")
+            continue
+        view = operand.view if operand.view is not None else operand.widened
+        assert view is not None
+        op_parts, op_anchors, live, view_outer = view_args(
+            cg, view, group.k_block, value
+        )
+        anchors += [(2 + len(parts) + i, a) for i, a in op_anchors]
+        parts += op_parts
+        outers.append(
+            "["
+            + "".join(f"({x}, {s}, {st}, {a}), " for x, s, st, a in view_outer)
+            + "]"
+        )
+        sides.append(f"('view', {[bool(f) for f in live]!r})")
+    info = cg.active_device_loops[group.k_block][-1].block_id_to_info[group.k_block]
+    k_live = "None"
+    if not tiles_in_range(cg, group.k_block, k, static_int(info.end_expr)):
+        k_live = f"{info.end_var_name} - {cg.offset_var(group.k_block)}"
+    facts = [
+        fact
+        for block in (group.m_block, group.n_block, group.k_block)
+        if (fact := offset_fact(cg, block)) is not None
+    ]
+    anchor_list = ", ".join(f"({p}, {a})" for p, a in anchors)
+    return expr_from_string(
+        f"{RUN}({acc.id}, {group.gid}, {', '.join(parts)}, "
+        f"anchors=[{anchor_list}], outer=[{', '.join(outers)}], "
+        f"registers=[{', '.join(sides)}], steps={spec.steps}, "
+        f"interleave={spec.interleave}, k_live={k_live}, facts={facts!r})"
+    )
+
+
+def run_binds(call: ast.Call) -> list[list[ast.Tuple]]:
+    """A ``_helion_mpp_run``'s bindings of each register operand; ``[]`` for
+    a run without register operands."""
+    sides = keyword(call, "registers")
+    if sides is None:
+        return []
+    assert isinstance(sides, ast.List)
+    out: list[list[ast.Tuple]] = []
+    for side in sides.elts:
+        assert isinstance(side, ast.Tuple)
+        kind = ast.literal_eval(side.elts[0])
+        if kind == "reg":
+            binds = side.elts[1]
+            assert isinstance(binds, ast.List)
+            out.append(cast("list[ast.Tuple]", binds.elts))
+    return out
+
+
+# MSL assembly: elementize.
+
+
+def register_run(
+    call: ast.Call,
+    acc_call: ast.Call,
+    rerun: Callable[[Mapping[str, ast.expr], set[str], list[ast.AST]], list[ast.stmt]],
+) -> ast.For:
+    """The loop that replaces a register run ``call`` (after
+    ``_Copies.rewrite_run``): over the K tile's steps
+    (:func:`emit_register_run`), the loop over the elements each lane holds
+    of each register operand's cooperative tensor, writing its value at the
+    element: its value's name with the Scalar statements it reads re-run by
+    ``rerun(binds, reads, checked)`` under its bindings, their loads past
+    the M or N tile's loop end reading the tile's first position
+    (``clamp_past_end``), 0 past the K tile's live length."""
+    sides = keyword(call, "registers")
+    k_live = keyword(call, "k_live")
+    assert isinstance(sides, ast.List)
+    live = not (isinstance(k_live, ast.Constant) and k_live.value is None)
+    pos = 2
+    loops: list[ast.stmt] = []
+
+    def element_loop(marker: str, stmts: list[ast.stmt]) -> ast.For:
+        return ast.For(
+            ast.Name("_it", ast.Store()),
+            ast.Call(ast.Name(marker, ast.Load()), [], []),
+            stmts,
+            [],
+        )
+
+    # The run's call keeps the views' arguments; a register operand's value
+    # lives in the element loops alone, so the cooperative statement reads
+    # no per-lane name.
+    args = list(call.args)
+    for i, side in enumerate(sides.elts):
+        assert isinstance(side, ast.Tuple)
+        if ast.literal_eval(side.elts[0]) == "view":
+            pos += 9
+            continue
+        binds_list = side.elts[1]
+        assert isinstance(binds_list, ast.List)
+        binds = {
+            cast("str", ast.literal_eval(cast("ast.Tuple", b).elts[0])): cast(
+                "ast.Tuple", b
+            ).elts[1]
+            for b in binds_list.elts
+        }
+        past = ast.literal_eval(side.elts[2])
+        source = call.args[pos]
+        args[pos] = ast.Constant(None)
+        pos += 1
+        value = parse_expr(f"static_cast(float, {src(source)})")
+        if live:
+            assert k_live is not None
+            value = parse_expr(f"({src(value)} if _e_k < {src(k_live)} else 0.0)")
+        put = ast.Expr(ast.Call(ast.Name(PUT, ast.Load()), [value], []))
+        stmts = rerun(binds, names_read(put), [value])
+        if past is not None:
+            mask, index, offset = past
+            position = "_e_m" if i == 0 else "_e_n"
+            stmts = clamp_past_end(stmts, mask, index, offset, binds, position)
+        # Conversions to bfloat round as lane copies' do (BF16_CAST).
+        loops.append(
+            element_loop(REG_A if i == 0 else REG_B, round_bf16_casts([*stmts, put]))
+        )
+    assert pos == len(call.args)
+    loop = ast.For(
+        ast.Name("_it", ast.Store()),
+        ast.Call(ast.Name(REG_RUN, ast.Load()), args, list(call.keywords)),
+        loops,
+        [],
+    )
+    ast.fix_missing_locations(loop)
+    return loop
+
+
+# MSL emission (msl_ast_walker).
+
+
+def register_atom(call: ast.Call) -> Atom | None:
+    """The op of a ``_helion_mpp_acc`` that declares a register group's
+    accumulator (:func:`register_acc_keywords`), else None."""
+    spec = keyword(call, "registers")
+    return None if spec is None else Atom(*ast.literal_eval(spec))
+
+
+#: One coordinate of an element a lane holds: its lane's base (a name the
+#: kernel's preamble declares, None for 0) plus a constant.
+Coord = tuple["str | None", int]
+
+
+@dataclasses.dataclass(frozen=True)
+class CoopLanes:
+    """Where the elements a lane holds of one cooperative tensor lie
+    (``coop_layout``): each one's row and column, and, where some element
+    isn't valid on some lane, each one's validity, a name the preamble
+    declares."""
+
+    rows: tuple[Coord, ...]
+    cols: tuple[Coord, ...]
+    valid: tuple[str, ...] | None = None
+
+
+def _lane_name(state: EmitState, base: tuple[int, ...]) -> str:
+    """The preamble's name of a lane base, ``base[lane]``: the sum of the
+    weights of the lane index's bits where it is one (``coop_layout``), else
+    read from a table; and its fact."""
+    name = state.lane_names.get(base)
+    if name is not None:
+        return name
+    name = state.lane_names[base] = f"_mrl{len(state.lane_names)}"
+    weights = lane_bits(base)
+    if weights is not None:
+        value = lane_expr(LANE, weights)
+    else:
+        table = state.tables.setdefault(
+            ("short", tuple(map(str, base))), f"_mrl_table{len(state.tables)}"
+        )
+        value = f"{table}[{LANE}]"
+    state.lane_decls.append(f"const short {name} = {value};")
+    state.lane_facts[name] = base_fact(base)
+    return name
+
+
+def operand_lanes(
+    state: EmitState, atom: Atom, operand: str, interleave: bool = False
+) -> CoopLanes:
+    """The elements a lane holds of ``atom``'s ``operand`` tensor: its
+    layout probed on the GPU that runs the kernel (the M4's otherwise),
+    each coordinate a lane base plus a constant where that is exact; else
+    each element's coordinates, read from the op at run time into names the
+    preamble declares (correct, but they fold over nothing but their
+    range).  Under ``interleave`` an input's K positions are relabelled
+    (``coop_layout.k_order``)."""
+    key = (atom, operand, interleave)
+    cached = state.lanes.get(key)
+    if cached is not None:
+        return cached
+    probed = layout(atom, state.on_gpu)
+    coords = probed.of(operand)
+    if interleave and operand != "dest":
+        coords = _relabelled(coords, k_order(probed, atom.k), operand)
+    rows, cols = (factor(coords, d) for d in (0, 1))
+    if rows is not None and cols is not None:
+        out = []
+        for f in (rows, cols):
+            name = None if f.constant() else _lane_name(state, f.base)
+            out.append(tuple((name, o) for o in f.offset))
+        lanes = CoopLanes(out[0], out[1])
+    else:
+        lanes = _runtime_lanes(state, atom, operand, len(coords[0]))
+    state.lanes[key] = lanes
+    return lanes
+
+
+def _relabelled(coords: Coords, order: tuple[int, ...], operand: str) -> Coords:
+    """An input's ``coords`` with its K positions relabelled by ``order``
+    (``coop_layout.k_order``): the left input's columns, the right's rows."""
+    d = 1 if operand == "left" else 0
+    return tuple(
+        tuple(
+            e if e == INVALID else (e[0], order[e[1]]) if d else (order[e[0]], e[1])
+            for e in lane
+        )
+        for lane in coords
+    )
+
+
+def _relabels(state: EmitState, atom: Atom) -> bool:
+    """Whether a run's two register inputs relabel their K positions
+    (``coop_layout.k_order``): only when both inputs' relabelled
+    coordinates factor, since an input whose coordinates are read at run
+    time (:func:`_runtime_lanes`) keeps the op's K order, which the other
+    must then keep too."""
+    probed = layout(atom, state.on_gpu)
+    order = k_order(probed, atom.k)
+    for operand in ("left", "right"):
+        coords = _relabelled(probed.of(operand), order, operand)
+        if factor(coords, 0) is None or factor(coords, 1) is None:
+            return False
+    return True
+
+
+def _runtime_lanes(state: EmitState, atom: Atom, operand: str, count: int) -> CoopLanes:
+    """Each of the ``count`` elements' coordinates and validity read in the
+    preamble from a cooperative tensor of ``atom``'s ``operand``."""
+    j = len(state.lanes)
+    op, tensor = f"_mrl_op{j}", f"_mrl_t{j}"
+    extents = {
+        "left": (atom.m, atom.k),
+        "right": (atom.k, atom.n),
+        "dest": (atom.m, atom.n),
+    }[operand]
+    # get_multidimensional_index lists the operand's innermost dimension
+    # first: which of its indices each coordinate is.
+    index_of = op_position(atom, operand, (0, 1))
+    state.lane_decls += [
+        f"{atom.op_type()} {op};",
+        f"auto {tensor} = {atom.tensor(op, operand)};",
+    ]
+    rows: list[Coord] = []
+    cols: list[Coord] = []
+    valid: list[str] = []
+    for e in range(count):
+        names = []
+        for d in (0, 1):
+            name = f"_mrl{j}_{'rc'[d]}{e}"
+            state.lane_decls.append(
+                f"const short {name} = (short){tensor}.get_multidimensional_index("
+                f"(ushort){e})[{index_of[d]}];"
+            )
+            state.lane_facts[name] = Fact(1, 0, extents[d] - 1)
+            names.append(name)
+        rows.append((names[0], 0))
+        cols.append((names[1], 0))
+        valid.append(f"_mrl{j}_v{e}")
+        state.lane_decls.append(
+            f"const bool {valid[-1]} = {tensor}.is_valid_element((ushort){e});"
+        )
+    return CoopLanes(tuple(rows), tuple(cols), tuple(valid))
+
+
+def _at(const: int, coord: Coord, scale: int = 1) -> str:
+    """``scale * (base + offset) + const`` of an element's coordinate."""
+    base, offset = coord
+    value = str(const + scale * offset)
+    if base is None:
+        return value
+    return f"{value} + {base}" if scale == 1 else f"{value} + {scale} * {base}"
+
+
+def emit_register_run(
+    stmt: ast.For,
+    parts: list[str],
+    indent: int,
+    state: EmitState,
+    emit_body: Callable[[list[ast.stmt], list[str], int, EmitState], None],
+    coop_view: Callable[..., tuple[list[str], list[str], str]],
+) -> None:
+    """A register run's loop (:func:`register_run`): per step of the K tile,
+    in a block of its own with the step ``_fs`` a constant, each register
+    operand's cooperative tensor, every lane writing its elements, each
+    element's position bound and its statements folded over it
+    (``operand_elements.element_body``), and each device view's handle of
+    the step's K, then the op.  Op K position ``kappa`` of step ``s`` is K
+    position ``steps * order[kappa] + s`` of the tile between two register
+    operands (``coop_layout.k_order``: a lane's elements of a row over the
+    steps are then one run of adjacent K positions, a few words of packed
+    codes), and ``s * K + kappa`` beside a view, which the op reads in
+    order; a view's step past the tile's live K is skipped."""
+    pad = " " * indent
+    inner = pad + "    "
+    call = stmt.iter
+    assert isinstance(call, ast.Call)
+    acc = call.args[0]
+    assert isinstance(acc, ast.Name)
+    root = state.coop[acc.id]
+    atom = state.register_atoms[root]
+    gid = state.coop_group[root][0]
+    op = f"_mpp_op_{gid}"
+    sides_kw = keyword(call, "registers")
+    outers = keyword(call, "outer")
+    assert isinstance(sides_kw, ast.List) and isinstance(outers, ast.List)
+    steps = cast("int", ast.literal_eval(cast("ast.expr", keyword(call, "steps"))))
+    k_live = keyword(call, "k_live")
+    # Every K tile whole: no view's step runs past the tile's live K.
+    whole = isinstance(k_live, ast.Constant) and k_live.value is None
+    interleave = bool(
+        ast.literal_eval(cast("ast.expr", keyword(call, "interleave")))
+    ) and _relabels(state, atom)
+    facts = dict(state.lane_facts)
+    for name, multiple, least in ast.literal_eval(
+        cast("ast.expr", keyword(call, "facts"))
+    ):
+        facts[name] = Fact(multiple, least)
+    loops = {
+        call_name(loop.iter): loop for loop in stmt.body if isinstance(loop, ast.For)
+    }
+    # Each side: ("reg", lanes, element loop) or ("view", run args, live, outer).
+    pos = 2
+    sides: list[tuple[object, ...]] = []
+    for i, side in enumerate(sides_kw.elts):
+        assert isinstance(side, ast.Tuple)
+        operand = ("left", "right")[i]
+        if ast.literal_eval(side.elts[0]) == "reg":
+            lanes = operand_lanes(state, atom, operand, interleave)
+            facts.update(state.lane_facts)
+            sides.append(("reg", lanes, loops[REG_A if i == 0 else REG_B]))
+            pos += 1
+        else:
+            live = tuple(ast.literal_eval(side.elts[1]))
+            outer = outers.elts[i]
+            assert isinstance(outer, ast.List)
+            sides.append(("view", call.args[pos : pos + 9], live, outer.elts))
+            pos += 9
+    names = ["_mr_a", "_mr_b"]
+    saved = state.put, state.put_type
+    for step in range(steps):
+        lines = [f"{pad}{{", f"{inner}constexpr short _fs = {step};"]
+        live_terms: list[str] = []
+        for i, side in enumerate(sides):
+            operand = ("left", "right")[i]
+            if side[0] == "reg":
+                lanes, loop = cast("tuple[CoopLanes, ast.For]", side[1:])
+                lines.append(f"{inner}auto {names[i]} = {atom.tensor(op, operand)};")
+                state.put_type = (atom.left, atom.right)[i]
+                for e in range(len(lanes.rows)):
+                    row, col = lanes.rows[e], lanes.cols[e]
+                    k_coord = col if i == 0 else row
+                    if interleave:
+                        k_pos = f"{_at(0, k_coord, steps)} + _fs"
+                    else:
+                        k_pos = f"{atom.k} * _fs + {_at(0, k_coord)}"
+                    if i == 0:
+                        decls = (f"_e_m = {_at(0, row)}", f"_e_k = {k_pos}")
+                    else:
+                        decls = (f"_e_k = {k_pos}", f"_e_n = {_at(0, col)}")
+                    state.put = f"{names[i]}[{e}]"
+                    element = [
+                        f"{inner}{{",
+                        *(f"{inner}    int {decl};" for decl in decls),
+                    ]
+                    body, _, _ = element_body(loop, decls, step, e, facts, 0, state)
+                    if lanes.valid is not None:
+                        element.append(f"{inner}    if ({lanes.valid[e]}) {{")
+                        with state.isolated_scope():
+                            emit_body(body, element, len(inner) + 8, state)
+                        element.append(f"{inner}    }} else {state.put} = 0;")
+                    else:
+                        with state.isolated_scope():
+                            emit_body(body, element, len(inner) + 4, state)
+                    lines += [*element, f"{inner}}}"]
+            else:
+                args, live, outer = cast(
+                    "tuple[list[ast.expr], tuple[bool, bool], list[ast.expr]]", side[1:]
+                )
+                blocks = (atom.m, atom.k) if i == 0 else (atom.k, atom.n)
+                k_dim = 1 if i == 0 else 0
+                dtype = (atom.left, atom.right)[i]
+                decls_v, live_v, handle = coop_view(
+                    args,
+                    dtype,
+                    f"_mpp_{'ab'[i]}",
+                    live,
+                    blocks,
+                    outer,
+                    k_dim,
+                    str(atom.k * step),
+                    k_tail=not whole,
+                )
+                names[i] = f"_mpp_{'ab'[i]}"
+                lines += [f"{inner}{line}" for line in decls_v]
+                live_terms += live_v
+                lines.append(f"{inner}{handle}")
+        runs = [f"{op}.run({names[0]}, {names[1]}, {acc.id});"]
+        if live_terms:
+            # A view's step past the tile's live K adds nothing; every term
+            # is uniform over the SIMD group.
+            lines += [
+                f"{inner}if ({' && '.join(live_terms)}) {{",
+                *(f"{inner}    {run}" for run in runs),
+                f"{inner}}}",
+            ]
+        else:
+            lines += [f"{inner}{run}" for run in runs]
+        parts += [*lines, f"{pad}}}"]
+    state.put, state.put_type = saved
+
+
+class RegisterLowering:
+    """What :mod:`mpp_matmul` calls to build a group's computed operands in
+    registers: the planner's check, the decision and the accumulator's
+    keywords, the op's codegen and its loops in ``elementize``.
+    ``MetalBackend`` gives it to the planner under an MPP config (codegen
+    then takes it where the launch is one SIMD group) and ``metal_jit`` to
+    ``elementize``, so :mod:`mpp_matmul`, which this module builds on,
+    doesn't import it."""
+
+    check_group = staticmethod(check_register_operands)
+    spec = staticmethod(register_run_spec)
+    acc_keywords = staticmethod(register_acc_keywords)
+    codegen_run = staticmethod(codegen_register_run)
+    run = staticmethod(register_run)
+    run_binds = staticmethod(run_binds)
+
+
+REGISTER_LOWERING = RegisterLowering()
