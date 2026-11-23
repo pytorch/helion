@@ -7822,8 +7822,10 @@ def _tile_masks(code: str) -> list[str]:
 @_requires_darwin
 class TestMetalTileMaskElision(unittest.TestCase):
     """A tile whose block divides its extent drops its bounds mask when the
-    launch is uniform: every thread axis of every strategy has one extent,
-    and no MPP op or free ``hl.arange`` claims threads of its own."""
+    launch runs exactly its threads on its axis (``mask_elision``), and no
+    free ``hl.arange`` claims threads of its own.  A kernel with MPP ops, or
+    whose launch refutes the dispatch's plan, takes the uniform rule: every
+    thread axis of every strategy has one extent."""
 
     def test_welford_drops_every_mask(self) -> None:
         weight, bias, x = _welford_args(64, 1024, torch.bfloat16)
@@ -7906,9 +7908,9 @@ class TestMetalTileMaskElision(unittest.TestCase):
             rtol=1e-3,
         )
 
-    def test_reduction_with_its_own_thread_count_keeps_tile_masks(self) -> None:
-        """The 64-thread reduction over the row shares the launch with the
-        tile's 4- or 16-thread axes."""
+    def test_reduction_with_its_own_thread_count_drops_tile_masks(self) -> None:
+        """The 64-thread reduction over the row has its own axis, and the
+        launch runs the tile's 4 or 16 threads on each of the others."""
         x = torch.randn(16, 16, 64, device=DEVICE)
         bound = center_last.bind((x,))
         expected = x.cpu().double() - x.cpu().double().mean(-1, keepdim=True)
@@ -7917,9 +7919,7 @@ class TestMetalTileMaskElision(unittest.TestCase):
             bound.config_spec.default_config(),
         ):
             with self.subTest(config=config):
-                self.assertEqual(
-                    _tile_masks(bound.to_code(config)), ["mask_0", "mask_1"]
-                )
+                self.assertEqual(_tile_masks(bound.to_code(config)), [])
                 torch.testing.assert_close(
                     bound.compile_config(config)(x).cpu().double(), expected
                 )
@@ -10771,8 +10771,8 @@ class TestMetalLaneJam(unittest.TestCase):
         )
         self.assertRegex(code, r"for lane_\d+ in range\(4\)")
         self.assertNotIn("for (int lane_", msl)
-        self.assertEqual(msl.count("_helion_masked(w["), 1)
-        self.assertEqual(msl.count("_helion_masked(x["), 4)
+        self.assertEqual(len(re.findall(r"\bw\[", msl)), 1)
+        self.assertEqual(len(re.findall(r"\bx\[", msl)), 4)
 
     def test_lane_independent_carry(self) -> None:
         """A carry every lane adds a lane-independent value to keeps its
