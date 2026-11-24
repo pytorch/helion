@@ -845,8 +845,10 @@ def test_a_provider_takes_a_prelude_with_the_default_worker_and_regimes(
 ) -> None:
     _provider(monkeypatch)._check_benchmark_prelude()
     # The trace-timed final selection of a backend, and one on CUDA events.
+    provider = _provider(monkeypatch)
     monkeypatch.setenv("HELION_AUTOTUNE_FINAL_L2_FLUSH", "1")
-    _provider(monkeypatch)._check_benchmark_prelude()
+    assert benchmarking.final_selection_l2_flush_mode("kernel") == "call"
+    provider._check_benchmark_prelude()
 
 
 @pytest.mark.parametrize(
