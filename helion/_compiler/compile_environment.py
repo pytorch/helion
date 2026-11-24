@@ -52,6 +52,7 @@ from .._utils import triton_is_available
 from ..language.constexpr import ConstExpr
 from .backend import BackendState
 from .backend_registry import get_backend
+from .backend_registry import warn_backend_recommendations
 from .fake_tensor import create_fake_tensor_mode
 from .source_location import SourceLocation
 from .source_location import current_location
@@ -769,6 +770,7 @@ class CompileEnvironment:
             warn_once(
                 f"The '{self._backend.name}' backend is experimental and may have limited functionality.",
             )
+        warn_backend_recommendations(self._backend, device)
         # For dynamic kernels, keep 0/1 tensor dimensions symbolic so a kernel
         # first seen with size 0 or 1 can be reused for larger sizes.
         self.shape_env = _GuardedShapeEnv(

@@ -106,7 +106,7 @@ requests, `git push` to any branch, landing or merging, and `git reset --hard`,
   prefer an additive change with a deprecation path, and update docs and
   examples with it.
 - `Config` options: adding options is fine for every backend, and the options
-  of experimental backends such as CuTe may change as their design evolves.
+  of non-stable backends such as CuTe may change as their design evolves.
   Triton configs are a compatibility surface: configs saved by older versions
   (autotune caches, pretuned kernels, configs pasted into user code) must keep
   loading and working on newer versions. A new Triton option needs a default

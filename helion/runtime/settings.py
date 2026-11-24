@@ -748,12 +748,16 @@ class Settings(_Settings):
     __slots__ = {
         "backend": (
             "Code generation backend. One of 'triton' (default), 'gluon' "
-            "(experimental: Triton's lowering compiled as Gluon; compute "
+            "(Triton's lowering compiled as Gluon; compute "
             "capability 10.x and Triton >= 3.8), 'tileir' (CUDA Tile IR; "
             "set ENABLE_TILE=1), 'pallas' (JAX/Pallas), 'cute' (CUTLASS "
-            "CuTe DSL), 'metal' (experimental: Apple Metal MSL), or 'flydsl' "
-            "(experimental: AMD FlyDSL). "
-            "Set HELION_BACKEND=<backend> to override."
+            "CuTe DSL; recommended on NVIDIA B200/B300 for better performance, "
+            "requires CUDA 13+ PyTorch and CuTe dependencies), "
+            "'metal' (Apple Metal MSL), or 'flydsl' (AMD FlyDSL). "
+            "Set HELION_BACKEND=<backend> to change the default; "
+            "an explicit backend= takes precedence. "
+            "For backend status and selection guidance, see "
+            "https://helionlang.com/backends.html."
         ),
         "ignore_warnings": (
             "Subtypes of exc.BaseWarning to ignore when compiling. "
@@ -1089,7 +1093,7 @@ class Settings(_Settings):
             "the paths written."
         ),
         "output_origin_lines": (
-            "If True, annotate generated Triton code with source-origin comments. "
+            "If True, annotate generated code with source-origin comments. "
             "Set HELION_OUTPUT_ORIGIN_LINES=0 to disable."
         ),
         "force_autotune": (

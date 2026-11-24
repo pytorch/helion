@@ -4310,12 +4310,12 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
 
     def get_cached_path(self, config: ConfigLike | None = None) -> str | None:
         """
-        Get the file path of the generated Triton code for a specific configuration.
+        Get the file path of the generated code for a specific configuration.
 
         Args:
             config: The configuration to get the file path for.
         Returns:
-            str | None: The file path of the generated Triton code, or None if not found.
+            str | None: The file path of the generated code, or None if not found.
         """
         if config is None:
             config = self._require_implicit_config()

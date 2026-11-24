@@ -334,6 +334,14 @@ class Backend(abc.ABC):
         """Maturity of this backend; experimental backends emit a warning."""
         return BackendState.EXPERIMENTAL
 
+    def device_recommendation(self, device: torch.device) -> str | None:
+        """Advice to show when another backend is selected for this device.
+
+        Called without validating or initializing this backend's dependencies.
+        Return None unless this backend is recommended for the target hardware.
+        """
+        return None
+
     def unsupported(self, detail: str) -> exc.BackendUnsupported:
         """The ``BackendUnsupported`` this backend raises for ``detail``.
 

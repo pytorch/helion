@@ -2,6 +2,10 @@
 
 The `helion.language` module contains the core DSL constructs for writing GPU kernels.
 
+Operation and dtype coverage depends on the selected backend. Inline Triton
+code and target-specific assembly are not portable across all backends; see
+{doc}`../backends` when choosing a target or porting a kernel.
+
 ## Loop Constructs
 
 ### tile()
@@ -411,4 +415,4 @@ For integer `cumsum` on Pallas, supply an explicit supported dtype such as
 .. autofunction:: dot_scaled
 ```
 
-`dot_scaled()` performs block-scaled matrix multiplication using low-precision formats (e.g., `e2m1`, `e4m3`, `e5m2`). Each input matrix has an associated per-block scale tensor and format string. This maps to Triton's `tl.dot_scaled` for hardware-accelerated scaled dot products on supported architectures.
+`dot_scaled()` performs block-scaled matrix multiplication using low-precision formats (e.g., `e2m1`, `e4m3`, `e5m2`). Each input matrix has an associated per-block scale tensor and format string. The lowering depends on the backend: for example, Triton uses `tl.dot_scaled`, while CuTe uses its own block-scaled matrix instructions. Supported formats and layouts depend on the backend and hardware.

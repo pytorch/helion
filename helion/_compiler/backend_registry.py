@@ -11,6 +11,8 @@ import threading
 import types
 from typing import TYPE_CHECKING
 
+from torch._dynamo.utils import warn_once
+
 from .cute.backend import CuteBackend
 from .flydsl.backend import FlyDSLBackend
 from .metal.backend import MetalBackend
@@ -20,6 +22,8 @@ from .triton.backend import TileIRBackend
 from .triton.backend import TritonBackend
 
 if TYPE_CHECKING:
+    import torch
+
     from ..autotuner.search_surface import BackendSearchSurface
     from .backend import Backend
 
@@ -234,6 +238,15 @@ def get_backend(name: str) -> Backend:
 def list_backends() -> list[str]:
     """Return the names of all registered backends."""
     return list(_REGISTRY.keys())
+
+
+def warn_backend_recommendations(selected: Backend, device: torch.device) -> None:
+    """Warn once about hardware recommendations without changing selection."""
+    for name in list_backends():
+        if name != selected.name:
+            recommendation = get_backend(name).device_recommendation(device)
+            if recommendation is not None:
+                warn_once(recommendation)
 
 
 def all_reserved_launch_param_names() -> frozenset[str]:
