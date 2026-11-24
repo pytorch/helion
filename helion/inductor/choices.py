@@ -15,14 +15,19 @@ from torch._inductor.ir import ComputedBuffer
 from torch._inductor.ir import Pointwise
 from torch._inductor.ir import StorageBox
 from torch._inductor.ir import TensorBox
+from torch._inductor.scheduler import BaseSchedulerNode
 from torch._inductor.scheduler import FusedMixOrderReductions
 from torch._inductor.scheduler import MixOrderReduction
+from torch._inductor.scheduler import SchedulerNode
 from torch._inductor.utils import sympy_product
 from torch._inductor.virtualized import V
 from torch.fx.operator_schemas import normalize_function
 from torch.utils._ordered_set import OrderedSet
 
 from . import config
+from .codegen.kernel import RDIM_SEGMENT_MIN
+from .codegen.kernel import RDIM_SEGMENTS_MAX
+from .codegen.tiling import UNROLLED_RDIM_MAX
 from .support import MATMUL_DTYPES
 from .support import mix_order_split
 from .support import names_rdim
@@ -34,7 +39,6 @@ if TYPE_CHECKING:
 
     from torch._inductor.codegen.simd_kernel_features import SIMDKernelFeatures
     from torch._inductor.ir import IRNode
-    from torch._inductor.scheduler import BaseSchedulerNode
     from torch._inductor.scheduler import Scheduler
 
 
@@ -162,6 +166,144 @@ def is_pad(node: IRNode) -> bool:
         isinstance(pointwise, Pointwise)
         and "masked" in pointwise.inner_fn_opcount().used_ops
         and len(pointwise.get_read_names()) == 1
+    )
+
+
+def masked_loads(sn: BaseSchedulerNode) -> int:
+    """How many masked subblocks (ops.masked(): a cat's parts, a pad's
+    source) the body of pointwise node `sn` has; 0 for any other node."""
+    if not (isinstance(sn, SchedulerNode) and sn._body is not None):
+        return 0
+    return 0 if sn.is_reduction() else len(sn._body.subblocks)
+
+
+def loads_under_mask(node: BaseSchedulerNode) -> bool:
+    """Whether a pointwise node of `node` loads under a mask: a cat's parts or
+    a pad's source, the masked subblocks of its body."""
+    return any(masked_loads(sn) for sn in node.get_nodes())
+
+
+# The comparisons of an Inductor loop body (its op_counts).
+COMPARISONS = ("lt", "le", "gt", "ge", "eq", "ne")
+
+
+def segments_masked_parts(node: BaseSchedulerNode) -> bool:
+    """Whether `node` is a pointwise node, or a group of them, with one
+    member that loads under a mask (loads_under_mask()), computing one cat
+    whose parts are all it loads under a mask: 2 to RDIM_SEGMENTS_MAX equal
+    parts of RDIM_SEGMENT_MIN or more elements along one dim, a masked
+    subblock each (Inductor's pointwise_cat()), which the kernel of `node`
+    emits as segments of that dim whose loads carry no mask
+    (HelionKernel.pointwise_segments()). That kernel cuts an axis at every
+    comparison of an index with an integer in any member
+    (HelionKernel.note_predicate()), and gets no segments when another
+    comparison cuts a second axis, when two cats cut theirs where the cuts
+    leave unequal segments, or when the cat is read through a gather. So the
+    cat's own masks, a >= and a < per part as pointwise_cat() builds them,
+    must be all the members compare, and none may index indirectly: z =
+    torch.where(w < 4608, cat, 0) over a W index w fuses as before, in the
+    cat's node or beside it. The count is deliberately conservative: a
+    comparison of values (a ReLU backward's <=) keeps the veto off as well,
+    and its cat fuses as before. A pad, a cat of unequal parts and other
+    masked loads keep their masks in a kernel of their own too."""
+    members = node.get_nodes()
+    if any(sn.is_reduction() for sn in members):
+        # A group that holds a reduction shares the first kernel's chunks,
+        # past UNROLLED_RDIM_MAX, where no reduction kernel emits segments.
+        return False
+    cats = [sn for sn in members if masked_loads(sn)]
+    if len(cats) != 1:
+        return False
+    (sn,) = cats
+    masked = masked_loads(sn)
+    bodies = [m._body for m in members if isinstance(m, SchedulerNode)]
+    if (
+        len(bodies) != len(members)
+        or sn.node is None
+        or any(body is None or body.indirect_vars for body in bodies)
+        or sum(body.op_counts[op] for body in bodies if body for op in COMPARISONS)
+        != 2 * masked
+    ):
+        return False
+    origins = [
+        origin
+        for origin in sn.node.get_origins()
+        if origin.target is torch.ops.aten.cat.default
+    ]
+    if len(origins) != 1:
+        return False
+    cat = origins[0]
+    parts = cat.args[0]
+    dim = cat.args[1] if len(cat.args) > 1 else cat.kwargs.get("dim", 0)
+    if not isinstance(parts, (list, tuple)) or not isinstance(dim, int):
+        return False
+    # A symbolic size (a SymInt, which does not hash) is no length.
+    sizes = OrderedSet(
+        size
+        if isinstance(part, torch.fx.Node)
+        and isinstance(value := part.meta.get("val"), torch.Tensor)
+        and value.dim() > 0
+        and isinstance(size := value.shape[dim % value.dim()], int)
+        else None
+        for part in parts
+    )
+    return (
+        masked == len(parts)
+        and 2 <= len(parts) <= RDIM_SEGMENTS_MAX
+        and len(sizes) == 1
+        and isinstance(size := next(iter(sizes)), int)
+        and size >= RDIM_SEGMENT_MIN
+    )
+
+
+def looped_split_first_kernel(node: BaseSchedulerNode) -> bool:
+    """Whether `node` holds the first kernel of a split reduction (Inductor's
+    _split_size) whose chunks are longer than UNROLLED_RDIM_MAX values. Such
+    a kernel keeps Triton's rule (HelionChoices.should_use_persistent_reduction()),
+    under which it loops over chunks that long whatever its reduction hint.
+    The rule loops over shorter chunks too for a hint other than INNER (past
+    64 values): those first kernels are not held here."""
+    return any(
+        isinstance(sn, SchedulerNode)
+        and isinstance(sn.node, ComputedBuffer)
+        and sn.node._split_size is not None
+        and V.graph.sizevars.statically_known_gt(
+            sympy_product(sn.node.get_reduction_size()), UNROLLED_RDIM_MAX
+        )
+        for sn in node.get_nodes()
+    )
+
+
+def masked_into_looped_split(
+    node1: BaseSchedulerNode, node2: BaseSchedulerNode
+) -> bool:
+    """Whether fusing node1 and node2 puts the cat of equal parts a pointwise
+    node computes under masks (segments_masked_parts()) into a split's first
+    kernel that loops over its chunks (looped_split_first_kernel()). The
+    pointwise kernel emits a cat's equal parts as segments of their axis,
+    whose loads carry no mask and serve every part
+    (HelionScheduling.with_pointwise_segments()); the loop
+    evaluates each part's masked loads per element, and each part's own:
+    sum_9680481803dd's GLU backward, the cat of two [4, 64, 95696] halves
+    computed from three inputs and its sum over N and W, took 100.9 us in one
+    kernel over 512 runs of 95696, against 40.3 us for the cat's kernel and
+    11.0 us for the split's first kernel reading its output (GB300). A
+    persistent first kernel, of chunks of up to UNROLLED_RDIM_MAX, emits the
+    parts as segments too: sum_456bcf55ec29's cat of two [4, 1024, 372]
+    halves stays in its split's first kernel. A pad's source, or a cat of
+    unequal parts, keeps its masked loads in a kernel of its own as well, and
+    fuses: the loop then saves the pass that reads its output back."""
+    # HelionChoices handles every compile once helion.inductor is imported:
+    # stock Inductor keeps its fusion.
+    device = node1.get_device()
+    if not (
+        device is not None
+        and device.type == "cuda"
+        and inductor_config.cuda_backend == "helion"
+    ):
+        return False
+    return (segments_masked_parts(node1) and looped_split_first_kernel(node2)) or (
+        segments_masked_parts(node2) and looped_split_first_kernel(node1)
     )
 
 
@@ -374,7 +516,11 @@ class HelionChoices(InductorChoices):
         """InductorChoices.can_fuse(), which declines nodes that share no data
         by its count: a mix-order pair (mix_order_reductions()) reads a common
         buffer along different dims, which the count misses. It counts for the
-        pair the elements of its array, as Inductor counts its Triton pairs."""
+        pair the elements of its array, as Inductor counts its Triton pairs. A
+        pointwise node computing a cat of equal parts stays out of a split's
+        first kernel that loops over its chunks (masked_into_looped_split())."""
+        if masked_into_looped_split(node1, node2):
+            return False
         if HelionChoices.mix_order_reductions(node1, node2):
             shared_data_score = max(
                 shared_data_score, MixOrderReduction.get_fusion_score(node1, node2)

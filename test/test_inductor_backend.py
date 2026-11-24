@@ -42,13 +42,16 @@ if not requires_torch_version("2.16"):
     pytest.skip("helion.inductor needs torch 2.16", allow_module_level=True)
 
 # After the check: torch 2.13 and 2.14 do not have it.
+from torch._inductor.choices import register_inductor_choices
 from torch._inductor.choices import registered_inductor_choices
+from torch._inductor.choices import unregister_inductor_choices
 
 import helion
 from helion.autotuner.benchmark_provider import LocalBenchmarkProvider
 import helion.inductor
 from helion.inductor import config as helion_config
 from helion.inductor import kernel_sequence
+from helion.inductor.choices import HelionChoices
 from helion.inductor.codegen.kernel import exact_cast
 import helion.language as hl
 
@@ -62,6 +65,18 @@ needs_native_matmul = unittest.skipUnless(
     "use_native_matmul" in vars(InductorChoices),
     "torch without InductorChoices.use_native_matmul",
 )
+
+
+def glu_backward_cat(a0, a1, a2, dtype=torch.bfloat16):
+    """A GLU backward's output as better-benchmark's sum_9680481803dd stores
+    it, the cat of two halves of a0's channels computed from three inputs,
+    stored in `dtype`, and its sum over N and W."""
+    c = a0.size(1)
+    add = (a0 + a1).float()
+    sig = torch.sigmoid(a2[:, c:].float())
+    m2 = (1.0 - sig) * sig * a2[:, :c].float() * add
+    y = torch.cat([sig * add, m2], 1).to(dtype)
+    return y, y.sum([0, 2]).float()
 
 
 def randn(*shape, dtype=torch.bfloat16):
@@ -1809,6 +1824,116 @@ def kernel(in0: torch.Tensor, out0: torch.Tensor, out1: torch.Tensor) -> None:
                 self.assertRegex(
                     source, rf"in0\[(tile_y, tile_r|{coordinate}), tile_x\]"
                 )
+
+    def test_masked_producer_keeps_its_kernel(self):
+        # A GLU backward's cat of two [4, 16, 9216] halves and its sum over N
+        # and W, which Inductor splits in 5 for its 32 outputs: in its 4 runs
+        # of 9216 (reduction_split_factor()), whose first kernel loops over
+        # them and would take the cat by Inductor's own fusion, the loops
+        # being the cat's, to evaluate both halves' masked loads per element.
+        # The cat keeps its kernel, which emits its halves as segments (a
+        # tile of 16 of the 32 channels), and the split's first kernel reads
+        # its output (masked_into_looped_split()).
+        self.enterContext(config.patch({"triton.mix_order_reduction": True}))
+        a0, a1, a2 = (
+            torch.randn(4, c, 9216, device=DEVICE, dtype=torch.bfloat16)
+            for c in (16, 16, 32)
+        )
+        sources = self.compile(glu_backward_cat, a0, a1, a2, tol=2e-2)
+        self.assertEqual(len(sources), 3)
+        self.assertIn("hl.tile([4, 16, 9216])", sources[0])
+        (reduction,) = [source for source in sources if "acc" in source]
+        self.assertNotIn("extra_mask", reduction)
+        self.assertNotIn("in2", reduction)
+        # A pad's source, a cat of unequal parts, and a cat of equal parts
+        # whose kernel compares another index too (a where over W, which
+        # cuts a second axis: no segments), keep their masked loads in a
+        # kernel of their own too: they fuse into the split's first kernel,
+        # which then reads no output of theirs back.
+
+        def pad_sum(x, g):
+            y = g * F.pad(x, (0, 1))
+            return y, y.sum([0, 2]).float()
+
+        def unequal_cat_sum(a, b):
+            y = torch.cat([a * 2, b * 3], 1)
+            return y, y.sum([0, 2]).float()
+
+        def cat_where_sum(a, b):
+            y = torch.cat([a * 2, b * 3], 1)
+            w = torch.arange(y.size(2), device=y.device)
+            z = torch.where(w < 4608, y, 0.0)
+            return z, z.sum([0, 2]).float()
+
+        def cat_beside_where_sum(a, b):
+            # The cat returned too, so a node of its own beside the where's.
+            y = torch.cat([a * 2, b * 3], 1)
+            w = torch.arange(y.size(2), device=y.device)
+            z = torch.where(w < 4608, y, 0.0)
+            return y, z, z.sum([0, 2]).float()
+
+        for fn, shapes in (
+            (pad_sum, ((4, 16, 9215), (4, 16, 9216))),
+            (unequal_cat_sum, ((4, 20, 9216), (4, 12, 9216))),
+            (cat_where_sum, ((4, 16, 9216), (4, 16, 9216))),
+            (cat_beside_where_sum, ((4, 16, 9216), (4, 16, 9216))),
+        ):
+            args = [torch.randn(*shape, device=DEVICE) for shape in shapes]
+            first, *_ = self.compile(fn, *args, tol=1e-3)
+            self.assertIn("extra_mask", first, fn.__name__)
+            self.assertIn("acc = acc + torch.sum(", first, fn.__name__)
+        # Halves of [4, 256, 768], 2**20 values or more, which the layout
+        # split cuts in their runs of 768 on every GPU: a persistent first
+        # kernel, which keeps the cat with the sum that reads the GLU's
+        # inputs (an fp32 y: the fused sum reads y unrounded, where eager
+        # would sum a bf16 y rounded).
+        a0, a1, a2 = (torch.randn(4, c, 768, device=DEVICE) for c in (256, 256, 512))
+        fp32_cat = functools.partial(glu_backward_cat, dtype=torch.float32)
+        sources = self.compile(fp32_cat, a0, a1, a2, tol=1e-3)
+        self.assertEqual(
+            len(
+                [
+                    source
+                    for source in sources
+                    if "torch.sum" in source and "in2" in source
+                ]
+            ),
+            1,
+        )
+
+    def test_masked_producer_veto_keeps_stock_fusion(self):
+        # HelionChoices handles every compile once helion.inductor is
+        # imported: with cuda_backend "triton", the cat of two [16, 65536]
+        # halves (parts the veto takes: segments_masked_parts()) fuses into
+        # the first kernel of its split sum, chunks longer than
+        # UNROLLED_RDIM_MAX, as stock Inductor's does with HelionChoices
+        # unregistered: two kernels, where the veto without its backend
+        # check makes three. Both compiles return eager's values.
+        self.enterContext(config.patch({"triton.mix_order_reduction": True}))
+        a, b = (torch.randn(16, 65536, device=DEVICE) for _ in range(2))
+
+        def fn(a, b):
+            y = torch.cat([a * 2, b * 3], 0)
+            return y, y.sum(1)
+
+        expected = fn(a, b)
+
+        def triton_kernels():
+            torch._dynamo.reset()
+            with config.patch({"cuda_backend": "triton", "force_disable_caches": True}):
+                result, codes = run_and_get_code(torch.compile(fn), a, b)
+            self.assertEqual(result, expected, atol=1e-3, rtol=1e-3)
+            return re.findall(r"def (triton_\w+)\(", "\n".join(codes))
+
+        registered = triton_kernels()
+        unregister_inductor_choices("helion")
+        try:
+            stock = triton_kernels()
+        finally:
+            register_inductor_choices("helion", HelionChoices)
+        self.assertEqual(registered, stock)
+        self.assertEqual(len(stock), 2)
+        self.assertIn("cat", stock[0])
 
     def test_outer_sum(self):
         # A sum over y with an x too large to split, which Inductor hints
