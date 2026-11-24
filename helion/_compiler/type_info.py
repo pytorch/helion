@@ -67,6 +67,7 @@ from .compile_environment import _symint_free_symbols
 from .compile_environment import compute_symbolic_min_max
 from .compile_environment import warning
 from .container_identity import record_opaque_container_result
+from .device_assertion import device_assertion_context
 from .device_function import contains_only_block_size_symbols
 from .fragment_call import guard_fragment_call_input
 from .host_function import HostFunction
@@ -2123,7 +2124,7 @@ class CallableType(LiteralType):
                         ),
                     )
                     if origin.is_host()
-                    else contextlib.nullcontext()
+                    else device_assertion_context(self.value, proxy_args, proxy_kwargs)
                 ):
                     result = _CheckForIndexCalls.retry_call(
                         self.value, proxy_args, proxy_kwargs

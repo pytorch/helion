@@ -97,6 +97,13 @@ if TYPE_CHECKING:
 # ---------------------------------------------------------------------------
 
 
+@dataclasses.dataclass(frozen=True)
+class CuteSearchFacts:
+    """Facts collected from the completed IR for both search and code generation."""
+
+    has_scalar_fragment_assertion: bool
+
+
 @dataclasses.dataclass
 class CuteEnvState:
     """``CompileEnvironment.backend_state`` of the CuTe backend."""

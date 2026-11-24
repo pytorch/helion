@@ -34,6 +34,7 @@ from .register_loads import host_load_is_readonly
 from .register_loads import lane_private_load
 from .register_snapshots import SnapshotBinding
 from .register_snapshots import snapshot_logical_shape
+from .scalar_fragment_assertion import check_host_subscripts
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -612,13 +613,20 @@ class FragmentMemoryEmitter(FragmentContext):
         *,
         defer_load: bool = False,
     ) -> object:
+        indices = cast("list[object]", node.args[1])
+        tensor = values[cast("Node", node.args[0])]
+        if self.checked_root and isinstance(tensor, HostTensor):
+            check_host_subscripts(
+                self,
+                indices,
+                tensor.value.shape,
+                unmasked_read=not store and node.args[2] is None,
+            )
         if store and node in self.direct_stores:
             # Written by the tf32 mma lanes of the dot it stores.
             return None
         if deferred_updates is not None:
             values = dict(values)
-        tensor = values[cast("Node", node.args[0])]
-        indices = cast("list[object]", node.args[1])
         output = (
             cast("torch.Tensor", cast("Node", node.args[0]).meta["val"])
             if store
@@ -793,6 +801,10 @@ class FragmentMemoryEmitter(FragmentContext):
                 )
                 return None
             value = _resolve(node.args[2], values)
+            if self.checked_root and isinstance(
+                value, (int, float, torch.SymInt, torch.SymFloat)
+            ):
+                value = self.value_scalar(value, assignment_dtype=tensor.value.dtype)
 
             def write(coords: tuple[str, ...]) -> None:
                 pointer, mask = address(coords)

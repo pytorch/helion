@@ -149,6 +149,7 @@
  "test/test_cute_fp8_integer_conversion.py": 2.8,
  "test/test_cute_fp8_vector_store.py": 14.3,
  "test/test_cute_fragment_arena_gpu.py": 4.0,
+ "test/test_cute_fragment_assertion.py": 4.2,
  "test/test_cute_fragment_direct_store.py": 12.1,
  "test/test_cute_fragment_epilogue.py": 2.7,
  "test/test_cute_fragment_half_mma.py": 3.1,

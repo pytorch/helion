@@ -13819,6 +13819,7 @@ class TestCuteLowerings(unittest.TestCase):
             "out = load(x)",
         )
 
+    @pytest.mark.cpu_only
     def test_create_loop_strategy_preserves_auto_threads_for_mma_candidate(
         self,
     ) -> None:
@@ -13842,17 +13843,7 @@ class TestCuteLowerings(unittest.TestCase):
                 _FakeBlockSize(8, block_id=1),
                 _FakeBlockSize(16, block_id=2, reduction=True),
             ],
-            config_spec=SimpleNamespace(
-                cute_attention_generic_fallback_enabled=False,
-                cute_flash_bwd_search_enabled=False,
-                cute_flash_gated_search_enabled=False,
-                num_threads=SimpleNamespace(config_get=lambda *args: 0),
-                loop_orders=SimpleNamespace(
-                    config_get=lambda *args: None,
-                    config_get_for_tile=lambda *args: None,
-                ),
-                l2_groupings=SimpleNamespace(config_get=lambda *args: 1),
-            ),
+            config_spec=ConfigSpec(backend=backend, target_device_capability=(10, 0)),
         )
         # The planner reads the matmul family key through ``Config.get``
         # (``warp_mma`` takes its own detector); the fake config carries no

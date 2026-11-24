@@ -17,7 +17,9 @@ from helion._compiler.aten_lowering import Lowering
 from helion._compiler.triton.backend import TritonBackend
 from helion._testing import RefEagerTestDisabled
 from helion._testing import TestCase
+from helion._testing import skipIfCute
 from helion._testing import skipIfNotTriton
+from helion._testing import skipUnlessBackends
 from helion._testing.cute_codegen import cpu_bind
 from helion._testing.cute_codegen import cuda_metadata_trace
 from helion._testing.distributed_kernels import fake_group as fake_group
@@ -91,6 +93,16 @@ def _assert_in_device_loop(x: torch.Tensor, with_message: hl.constexpr) -> torch
 
 
 class TestDeviceAssertions(RefEagerTestDisabled, TestCase):
+    @skipUnlessBackends(["cute"])
+    def test_cute_device_assertion_overloads(self):
+        kernel = helion.kernel(_assert_in_device_loop.fn, static_shapes=True)
+        for form in (False, True):
+            with self.subTest(with_message=form):
+                bound = cpu_bind(kernel, (torch.ones(16), form))
+                code = bound.to_code(helion.Config(block_sizes=[16]))
+                self.assertIn("call __assertfail,", code)
+
+    @skipIfCute("CuTe lowers assertions in ordinary fragments")
     def test_unsupported_device_assertion(self):
         # An inherited no-op must not erase either spelling before FX tracing.
         decompositions = dict(device_ir.select_decomp_table())
@@ -136,6 +148,48 @@ class TestDeviceAssertions(RefEagerTestDisabled, TestCase):
             code = bound.to_code(bound.config_spec.default_config())
         self.assertIn("tl.device_assert(", code)
         self.assertIn("backend default overload", code)
+
+    @skipIfNotTriton("uses a native Triton assertion lowering")
+    def test_literal_device_assertion_keeps_its_value_and_branch(self):
+        @helion.kernel(static_shapes=True)
+        def guarded(x, out, form: hl.constexpr):
+            for tile in hl.tile(x.size(0)):
+                if x[tile].sum() < 0:
+                    if form == "default":
+                        torch._assert_async(torch.tensor(False))
+                    elif form == "message":
+                        torch.ops.aten._assert_async.msg(
+                            self=torch.tensor(False), assert_msg="negative"
+                        )
+                    elif form == "shape":
+                        torch._assert_async(torch.tensor([False, True]), "bad shape")
+                    else:
+                        torch._assert_async(torch.tensor(False), 3)
+                out[tile] = x[tile]
+
+        x = torch.ones(4)
+        with _native_assertions():
+            for form in ("default", "message"):
+                bound = cpu_bind(guarded, (x, torch.empty_like(x), form))
+                graph = ast.parse(bound.to_code(helion.Config(block_sizes=[4])))
+                (branch,) = (
+                    n
+                    for n in ast.walk(graph)
+                    if isinstance(n, ast.If) and "tl.device_assert" in ast.unparse(n)
+                )
+                source = ast.unparse(branch.body)
+                self.assertIn("False", source)
+                self.assertIn(f"backend {form} overload", source)
+        # On a backend without native support, the literal still reaches the
+        # same unsupported-lowering diagnostic as a runtime predicate.
+        with self.assertRaisesRegex(helion.exc.BackendUnsupported, "_assert_async"):
+            cpu_bind(guarded, (x, torch.empty_like(x), "default"))
+        with self.assertRaisesRegex(helion.exc.TorchOpTracingError, "one element"):
+            cpu_bind(guarded, (x, torch.empty_like(x), "shape")).to_code(
+                helion.Config(block_sizes=[4])
+            )
+        with self.assertRaisesRegex(helion.exc.TorchOpTracingError, "str"):
+            cpu_bind(guarded, (x, torch.empty_like(x), "argument"))
 
     def test_unsupported_device_assertion_in_combine(self):
         @helion.kernel()

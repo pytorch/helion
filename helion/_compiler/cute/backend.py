@@ -86,6 +86,7 @@ from .state import cute_env_state
 from .state import new_codegen_state
 from .state import new_device_state
 from .state import new_env_state
+from .target_facts import validate_grid_yz
 from .tcgen05.knobs import launch_epi_warp_groups_knob
 from .tcgen05_constants import TCGEN05_SPLIT_K_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY
@@ -1699,6 +1700,15 @@ class CuteBackend(Backend):
         return None
 
     def transform_launch_grid(self, fn: DeviceFunction, grid_expr: ast.AST) -> ast.AST:
+        from ..program_id import L2GroupingProgramIDs
+        from ..program_id import XYZProgramIDs
+
+        pid = fn.pid
+        if isinstance(pid, L2GroupingProgramIDs):
+            pid = pid.parent_strategy
+        if isinstance(pid, XYZProgramIDs):
+            validate_grid_yz(axis.static_num_pids() for axis in pid.pid_info[1:])
+
         if (
             fn.cute_state.tcgen05.program_id_divisor > 1
             and not fn.cute_state.tcgen05.split_k_applied
@@ -1971,9 +1981,9 @@ class CuteBackend(Backend):
         from .cute_mma_dag import apply_mma_dag_cluster
         from .cute_mma_dag import mma_dag_config_reason
         from .paged_attention_config import paged_attention_config_reason
-        from .pdl_ops import config_conflicts_with_explicit_pdl
+        from .pdl_ops import config_conflicts_with_required_owner
 
-        if config_spec.has_explicit_pdl and config_conflicts_with_explicit_pdl(config):
+        if config_conflicts_with_required_owner(config_spec, config):
             return False
         facts = config_spec.cute_mma_dag_facts
         mode = config.config.get(MMA_DAG_KEY)
@@ -2061,11 +2071,15 @@ class CuteBackend(Backend):
     def pre_inductor_lowering(self, node: torch.fx.Node) -> Lowering | None:
         from ..aten_lowering import sort_lowering
         from .aten_lowering import NumericExtremumLowering
+        from .scalar_fragment_assertion import ScalarFragmentAssertionLowering
         from .static_indexing import StaticIndexLowering
         from .static_indexing import static_tensor_index
         from .uniform_comparison import UniformComparisonLowering
         from .uniform_comparison import match_uniform_float_gt
 
+        if node.target is torch.ops.aten._assert_async.msg:
+            # This impure FX node returns None, not a value for Inductor.
+            return ScalarFragmentAssertionLowering(node)
         if node.target is torch.ops.aten.sort.stable:
             # CuTe's rank/fragment sorting already breaks ties by input index.
             # Keep other backends' existing Inductor stable-sort lowering.
@@ -2703,6 +2717,7 @@ class CuteBackend(Backend):
         from .passes import pdl
         from .passes.pipeline import run_kernel_def_passes
         from .pdl_ops import validate_explicit_launch
+        from .scalar_fragment_assertion import requires_assertion_owner
         from .smem_footprint import check_smem_budget
 
         run_kernel_def_passes(fn_def, prefix, ctx)
@@ -2716,7 +2731,9 @@ class CuteBackend(Backend):
                 "CuTe",
             )
         pdl.insert_spread_pad(fn, fn_def, ctx.constexpr_values)
-        validate_explicit_launch(fn, fn_def)
+        validate_explicit_launch(
+            fn, fn_def, scalar_assertion=requires_assertion_owner()
+        )
         # The final body, the spread pad included: a kernel whose shared
         # memory cannot fit one block fails here, not in libNVVM.
         check_smem_budget(fn_def, ctx.constexpr_values, fn.pid)
@@ -2755,8 +2772,11 @@ class CuteBackend(Backend):
     def kernel_generators(self) -> tuple[KernelGenerator, ...]:
         from .kernel_generators import KERNEL_GENERATORS
         from .pdl_ops import guard_kernel_generators
+        from .scalar_fragment_assertion import requires_assertion_owner
 
-        return guard_kernel_generators(KERNEL_GENERATORS)
+        return guard_kernel_generators(
+            KERNEL_GENERATORS, scalar_assertion=requires_assertion_owner()
+        )
 
     def retry_policy(self) -> RetryPolicy:
         from .kernel_generators import REGENERATION
@@ -2803,19 +2823,23 @@ class CuteBackend(Backend):
         self, env: CompileEnvironment, device_ir: DeviceIR, configs: list[Config]
     ) -> list[Config]:
         from .autotune.heuristics import postprocess_seed_configs
-        from .pdl_ops import config_conflicts_with_explicit_pdl
+        from .pdl_ops import config_conflicts_with_required_owner
+        from .scalar_fragment_assertion import requires_assertion_owner
 
         configs = postprocess_seed_configs(env, device_ir, configs)
-        if env.config_spec.has_explicit_pdl:
+        spec = env.config_spec
+        if spec.has_explicit_pdl or requires_assertion_owner(spec):
             # Promotion precedes this hook; the no-autotuning path consumes
             # that default without calling autotune_config_is_viable.
-            default = env.config_spec.compiler_default_config
-            if default is not None and config_conflicts_with_explicit_pdl(default):
-                env.config_spec.compiler_default_config = None
+            default = spec.compiler_default_config
+            if default is not None and config_conflicts_with_required_owner(
+                spec, default
+            ):
+                spec.compiler_default_config = None
             configs = [
                 config
                 for config in configs
-                if not config_conflicts_with_explicit_pdl(config)
+                if not config_conflicts_with_required_owner(spec, config)
             ]
         return configs
 
@@ -5388,6 +5412,14 @@ class CuteBackend(Backend):
     def validate_codegen_config(
         self, env: CompileEnvironment, device_ir: DeviceIR, config: Config
     ) -> None:
+        from .scalar_fragment_assertion import conflicting_fragment_schedule
+        from .scalar_fragment_assertion import requires_assertion_owner
+
+        if requires_assertion_owner(env.config_spec):
+            if (
+                conflict := conflicting_fragment_schedule(env.config_spec, config)
+            ) is not None:
+                raise exc.InvalidConfig(f"torch._assert_async cannot use {conflict}")
         if config.get("cute_fragment_warp_scan", False):
             from .autotune.heuristics.cute_fragment_warp_scan import (
                 validate_warp_scan_request,
@@ -5546,7 +5578,14 @@ class CuteBackend(Backend):
         self, fn: DeviceFunction, block_ids: list[int], config: Config
     ) -> TileStrategy:
         from ..per_thread_planning import plan_per_thread_loop_strategy
+        from .scalar_fragment_assertion import check_root_widths
+        from .scalar_fragment_assertion import requires_assertion_owner
 
+        if (
+            requires_assertion_owner()
+            and block_ids in fn.codegen.host_function.device_ir.grid_block_ids
+        ):
+            check_root_widths(block_ids, config)
         return plan_per_thread_loop_strategy(self, fn, block_ids, config)
 
     # -- thread layout and lane loops of the tile strategies -------------------

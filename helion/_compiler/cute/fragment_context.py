@@ -61,6 +61,10 @@ from .register_snapshots import SnapshotBinding
 from .register_snapshots import SnapshotOwner
 from .register_snapshots import snapshot_chains
 from .register_snapshots import snapshot_logical_shape
+from .scalar_fragment_assertion import check_literal_assignment
+from .scalar_fragment_assertion import checked_predicate_wide
+from .scalar_fragment_assertion import checked_scalar_wide
+from .scalar_fragment_assertion import requires_assertion_owner
 from .selection.ordered_selection import is_ordered_selection
 from .selection.ordered_selection import ordered_selection_args
 from .warp_results import warp_result_chain
@@ -484,6 +488,8 @@ class FragmentContext:
         # Nested loops may reuse a block ID. Key each interval by its induction variable.
         self.tile_intervals: dict[str, tuple[int, int]] = {}
         self.stride_operands: dict[str, tuple[object, object, object]] = {}
+        self.checked_domains: dict[str, range] = {}
+        self.checked_root = requires_assertion_owner(self.env.config_spec)
         self.allocator = ""
         self.smem_bytes = 0
         self.buffers: list[tuple[str, torch.dtype, int]] = []
@@ -713,6 +719,8 @@ class FragmentContext:
     def sym(self, value: object, *, wide: bool = False) -> str:
         if isinstance(value, str):
             return value
+        if self.checked_root and isinstance(value, torch.SymBool):
+            wide |= checked_predicate_wide(self, value._sympy_())
         if isinstance(value, (torch.SymInt, torch.SymFloat, torch.SymBool)):
             value = value._sympy_()
         if isinstance(value, sympy.Basic):
@@ -766,6 +774,36 @@ class FragmentContext:
             assert math.prod(value.shape) == 1
             return value.read(tuple("0" for _ in value.shape))
         return self.sym(value, wide=wide)
+
+    def value_scalar(
+        self,
+        value: object,
+        tensor_dtypes: tuple[torch.dtype, ...] = (),
+        *,
+        assignment_dtype: torch.dtype | None = None,
+    ) -> str:
+        """Render a value separately from an address or a loop header."""
+        if self.checked_root and assignment_dtype is not None:
+            if isinstance(value, (int, float)):
+                check_literal_assignment(value, assignment_dtype)
+            elif isinstance(value, torch.SymFloat):
+                # A binding hint does not guard later calls; a Python float
+                # kernel argument may even round before the device sees it.
+                raise exc.BackendUnsupported(
+                    "cute",
+                    f"a checked symbolic float assignment not proved to fit {assignment_dtype}",
+                )
+        wide = (
+            self.checked_root
+            and isinstance(value, torch.SymInt)
+            and checked_scalar_wide(
+                self,
+                value._sympy_(),
+                tensor_dtypes,
+                assignment_dtype=assignment_dtype,
+            )
+        )
+        return self.scalar(value, wide=wide)
 
     def host_stride(self, tensor: HostTensor, dim: int) -> str:
         # Fresh wrapper allocations have configured symbolic strides, which

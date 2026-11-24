@@ -42,6 +42,7 @@ from .register_snapshots import SnapshotBinding
 from .register_snapshots import frame_snapshot_recipes
 from .register_snapshots import snapshot_capture_slots
 from .register_snapshots import snapshot_logical_shape
+from .scalar_fragment_assertion import checked_range_domain
 
 
 class FragmentControlFlow(FragmentContext):
@@ -216,6 +217,7 @@ class FragmentControlFlow(FragmentContext):
         body_operands = dict(outer_operands)
         starts: list[str] = []
         axes = []
+        checked_domains: dict[int, range] = {}
         steps: list[str] = []
         index_types: list[str] = []
         guarded_steps: dict[str, int | Literal["dynamic"]] = {}
@@ -250,6 +252,8 @@ class FragmentControlFlow(FragmentContext):
                 else None
             )
             step = tile_size if explicit is None else explicit
+            if self.checked_root:
+                checked_domains[bid] = checked_range_domain(self, begin, end, step)
             index_type, guarded_step = self._range_plan(begin, end, step)
             if finalizer_needs_int64:
                 index_type = "Int64"
@@ -291,6 +295,8 @@ class FragmentControlFlow(FragmentContext):
             self.bounds[bid] = stop
             offset = self.offsets[bid] = self.df.new_var("fragment_tile")
             body_operands[offset] = begin, end, step
+            if bid in checked_domains:
+                self.checked_domains[offset] = checked_domains[bid]
             if guarded_step is not None:
                 guarded_steps[offset] = guarded_step
             if lexical_interval:

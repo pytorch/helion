@@ -146,6 +146,7 @@ class AttentionFlashRootEmitter(RootEmitter):
 
 
 _FRAGMENT_SCHEDULE = "computed_fragment"
+_ASSERTION_SCHEDULE = "scalar_fragment_assertion"
 
 
 @dataclasses.dataclass(frozen=True)
@@ -167,12 +168,17 @@ class ComputedFragmentRootEmitter(RootEmitter):
 
 @dataclasses.dataclass(frozen=True)
 class RequiredComputedFragmentRootEmitter(RootEmitter):
-    """An unmerged full vote cannot fall back to scalar lane code generation."""
+    """An unmerged full vote or scalar assertion needs a complete CTA owner."""
 
     name: str = "required_computed_fragment"
 
     def plan(self, codegen: GenerateAST) -> object | None:
-        if requires_full_reduction_owner(codegen.host_function.device_ir.graphs):
+        from ..scalar_fragment_assertion import requires_assertion_owner
+
+        assertion = requires_assertion_owner()
+        if assertion or requires_full_reduction_owner(
+            codegen.host_function.device_ir.graphs
+        ):
             if (
                 any(
                     isinstance(emitter, PlannedRootEmitter)
@@ -181,10 +187,14 @@ class RequiredComputedFragmentRootEmitter(RootEmitter):
                 )
                 or ATTENTION_FLASH_ROOT.plan(codegen) is not None
             ):
+                if assertion:
+                    raise exc.InvalidConfig(
+                        "torch._assert_async cannot override a planned root"
+                    )
                 raise exc.InvalidConfig(
                     "an unmerged full reduction cannot override a planned root"
                 )
-            return _FRAGMENT_SCHEDULE
+            return _ASSERTION_SCHEDULE if assertion else _FRAGMENT_SCHEDULE
         return None
 
     def emit(self, codegen: GenerateAST, plan: object) -> bool:
@@ -193,6 +203,11 @@ class RequiredComputedFragmentRootEmitter(RootEmitter):
         return _entry("computed_fragment", "codegen_computed_fragment_root")(codegen)
 
     def decline(self, codegen: GenerateAST, plan: object) -> None:
+        if plan == _ASSERTION_SCHEDULE:
+            raise exc.BackendUnsupported(
+                "cute",
+                "torch._assert_async requires a supported complete fragment root",
+            )
         raise exc.InvalidConfig(
             "unmerged full reductions require a supported complete fragment root"
         )

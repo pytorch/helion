@@ -72,6 +72,7 @@ from .compile_environment import warning
 from .container_identity import compare_container_identity
 from .container_identity import record_opaque_container_result
 from .cross_loop_dsmem import dsmem_slab_facts
+from .device_assertion import device_assertion_context
 from .fragment_call import guard_fragment_call_input
 from .fragment_comparison import guard_fragment_comparison
 from .fx_side_effects import is_impure_node
@@ -3876,8 +3877,9 @@ class WalkDeviceAST(NodeVisitor):
                 # stride can be a size expression or lack a host symbol origin.
                 func = functools.partial(_host_tensor_stride, tensor, origin, source)
 
-        # pyrefly: ignore [bad-argument-type]
-        result = _CheckForIndexCalls.retry_call(func, args, kwargs)
+        with device_assertion_context(func, args, kwargs):
+            # pyrefly: ignore [bad-argument-type]
+            result = _CheckForIndexCalls.retry_call(func, args, kwargs)
         if (
             func is tuple
             and len(args) == 1

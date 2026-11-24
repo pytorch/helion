@@ -10,11 +10,16 @@ The `helion.exc` module provides an exception hierarchy for error handling and d
 
 Helion's exception system provides detailed error messages with automatic source location tracking. All exceptions inherit from `Base` and provide formatted error reports that help identify exactly where and why compilation failed.
 
-Helion's built-in backends currently reject `torch._assert_async(predicate)`
-and `torch._assert_async(predicate, message)` in device loops. When a traced
-assertion reaches lowering, it raises `helion.exc.BackendUnsupported`. The
-error can name `aten._assert_async.msg` for either spelling, because Helion
-traces the effect using the message overload. Compilation fails rather than silently removing the check.
+CuTe can lower `torch._assert_async(predicate)` and
+`torch._assert_async(predicate, message)` for a computed rank-zero Boolean
+in supported device fragments. An unsupported CuTe assertion, or a traced
+assertion on a backend without this lowering, raises
+`helion.exc.BackendUnsupported`. The error can name `aten._assert_async.msg`
+for either spelling, because Helion traces the effect using the message
+overload. Compilation fails rather than silently removing the check.
+CuTe embeds the UTF-8 message and its terminating null byte in the
+generated device code. It accepts at most 254 bytes of message text;
+a longer message raises `helion.exc.InvalidAPIUsage` at compile time.
 
 Device assertions are also unsupported in the combine functions passed to
 `hl.reduce` or `hl.associative_scan`: the compiler may discard an unused
