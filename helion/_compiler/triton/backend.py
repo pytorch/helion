@@ -35,6 +35,7 @@ if TYPE_CHECKING:
     from torch._inductor.ops_handler import OpsHandler
 
     from ...autotuner.config_fragment import ConfigSpecFragment
+    from ...autotuner.config_spec import ConfigSpec
     from ...autotuner.llm.profile import LlmPromptProfile
     from ...runtime.config import Config
     from ...runtime.kernel import BoundKernel
@@ -296,6 +297,9 @@ class TritonBackend(Backend):
             fragments.update(get_mtia_tunable_fragments())
 
         return fragments
+
+    def probe_long_autotune_kernels(self, config_spec: ConfigSpec) -> bool:
+        return True
 
     def setup_compile_cache_dir(self, device_index: int) -> None:
         if "TRITON_CACHE_DIR" not in os.environ:
