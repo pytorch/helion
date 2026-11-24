@@ -13,6 +13,7 @@ from torch._inductor import config as inductor_config
 from torch._inductor.choices import FusionScore
 from torch._inductor.choices import InductorChoices
 from torch._inductor.choices import Sortable
+from torch._inductor.codegen.simd_kernel_features import SIMDKernelFeatures
 from torch._inductor.ir import ComputedBuffer
 from torch._inductor.ir import Pointwise
 from torch._inductor.ir import StorageBox
@@ -34,6 +35,8 @@ from torch.utils._sympy.functions import Identity
 from . import config
 from .codegen.kernel import RDIM_SEGMENT_MIN
 from .codegen.kernel import RDIM_SEGMENTS_MAX
+from .codegen.kernel import HelionKernel
+from .codegen.tiling import REDUCTION_RUNS_MAX
 from .codegen.tiling import UNROLLED_RDIM_MAX
 from .support import MATMUL_DTYPES
 from .support import mix_order_split
@@ -44,7 +47,7 @@ from .support import python_wrapper
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
-    from torch._inductor.codegen.simd_kernel_features import SIMDKernelFeatures
+    from torch._inductor.codegen.simd import SIMDScheduling
     from torch._inductor.ir import IRNode
     from torch._inductor.scheduler import Scheduler
 
@@ -120,6 +123,18 @@ MIN_SPLIT_RUN = 32
 # 8], 8192 values, keeps its one kernel, whose launch the second's would
 # double.
 MIN_LAYOUT_SPLIT_VALUES = 2**20
+# The reductions HelionKernel reads as a tile of their runs (rdim_runs()):
+# those whose partials of the runs combine as their blocks' do.
+RUN_REDUCTIONS = OrderedSet(
+    [
+        torch.ops.aten.sum,
+        torch.ops.aten.mean,
+        torch.ops.aten.prod,
+        torch.ops.aten.amax,
+        torch.ops.aten.amin,
+        torch.ops.aten.any,
+    ]
+)
 
 # The most chunks a layout split takes where no count of them is within a
 # factor of 2 of Inductor's split, as a multiple of that split
@@ -666,15 +681,44 @@ def looped_split_first_kernel(node: BaseSchedulerNode) -> bool:
     )
 
 
+def reads_long_runs(node: BaseSchedulerNode) -> bool:
+    """Whether `node` holds reductions whose kernel reads their runs as a
+    tile, runs of more than UNROLLED_RDIM_MAX values that it reads in a loop
+    or in a block Helion rolls, as a looped split's first kernel reads its
+    chunks: HelionKernel.rdim_runs(), asked of the kernel of the nodes of
+    `node` (a kernel with a Welford or an argmax reads the flat rdim)."""
+    if not node.is_reduction() or isinstance(node, FusedMixOrderReductions):
+        return False
+    # masked_into_looped_split() asks on a CUDA device with cuda_backend
+    # "helion": HelionScheduling, a SIMD backend, whose group is the node's
+    # numel and reduction numel.
+    scheduling = cast(
+        "SIMDScheduling", V.graph.scheduler.get_backend(node.get_device())
+    )
+    numel, rnumel = cast("tuple[sympy.Expr, sympy.Expr]", node.group[1])
+    node_schedule = scheduling.generate_node_schedule(node.get_nodes(), numel, rnumel)
+    features = SIMDKernelFeatures(node_schedule, numel, rnumel)
+    runs = HelionKernel.rdim_runs(features)
+    return runs is not None and runs[1] > UNROLLED_RDIM_MAX
+
+
+def loops_over_long_rdim(node: BaseSchedulerNode) -> bool:
+    """Whether `node` holds a reduction kernel that reads chunks or runs of
+    more than UNROLLED_RDIM_MAX values, a split's first kernel
+    (looped_split_first_kernel()) or a reduction over runs
+    (reads_long_runs())."""
+    return looped_split_first_kernel(node) or reads_long_runs(node)
+
+
 def masked_into_looped_split(
     node1: BaseSchedulerNode, node2: BaseSchedulerNode
 ) -> bool:
     """Whether fusing node1 and node2 puts the cat of equal parts a pointwise
-    node computes under masks (segments_masked_parts()) into a split's first
-    kernel that loops over its chunks (looped_split_first_kernel()). The
-    pointwise kernel emits a cat's equal parts as segments of their axis,
-    whose loads carry no mask and serve every part
-    (HelionScheduling.with_pointwise_segments()); the loop
+    node computes under masks (segments_masked_parts()) into a reduction
+    kernel that loops over chunks or runs of more than UNROLLED_RDIM_MAX
+    values (loops_over_long_rdim()). The pointwise kernel emits a cat's
+    equal parts as segments of their axis, whose loads carry no mask and
+    serve every part (HelionScheduling.with_pointwise_segments()); the loop
     evaluates each part's masked loads per element, and each part's own:
     sum_9680481803dd's GLU backward, the cat of two [4, 64, 95696] halves
     computed from three inputs and its sum over N and W, took 100.9 us in one
@@ -682,9 +726,14 @@ def masked_into_looped_split(
     11.0 us for the split's first kernel reading its output (GB300). A
     persistent first kernel, of chunks of up to UNROLLED_RDIM_MAX, emits the
     parts as segments too: sum_456bcf55ec29's cat of two [4, 1024, 372]
-    halves stays in its split's first kernel. A pad's source, or a cat of
-    unequal parts, keeps its masked loads in a kernel of its own as well, and
-    fuses: the loop then saves the pass that reads its output back."""
+    halves stays in its split's first kernel. A reduction over runs reads
+    them the same way: the GLU backward of sum_39ea00f83135, the cat of two
+    [4, 256, 5802] halves and its sum over N and W, took 29.1 us with the cat
+    in the kernel that reads the 4 runs of 5802 of each channel as a tile,
+    where the layout split's first kernel had taken 24.06 us with it. A
+    pad's source, or a cat of unequal parts, keeps its masked loads in a
+    kernel of its own as well, and fuses: the loop then saves the pass that
+    reads its output back."""
     # HelionChoices handles every compile once helion.inductor is imported:
     # stock Inductor keeps its fusion.
     device = node1.get_device()
@@ -694,9 +743,54 @@ def masked_into_looped_split(
         and inductor_config.cuda_backend == "helion"
     ):
         return False
-    return (segments_masked_parts(node1) and looped_split_first_kernel(node2)) or (
-        segments_masked_parts(node2) and looped_split_first_kernel(node1)
+    return (segments_masked_parts(node1) and loops_over_long_rdim(node2)) or (
+        segments_masked_parts(node2) and loops_over_long_rdim(node1)
     )
+
+
+# The aten reductions of a post-grad graph (reads_reduction()).
+REDUCTIONS_OF_GRAPH = OrderedSet(
+    [
+        *RUN_REDUCTIONS,
+        torch.ops.aten.var,
+        torch.ops.aten.var_mean,
+        torch.ops.aten.std,
+        torch.ops.aten.std_mean,
+        torch.ops.aten.max,
+        torch.ops.aten.min,
+        torch.ops.aten.argmax,
+        torch.ops.aten.argmin,
+        torch.ops.aten.logsumexp,
+        torch.ops.prims.var,
+    ]
+)
+# The FX nodes reads_reduction() looks through before it gives up (and
+# answers yes).
+READS_REDUCTION_NODES = 64
+
+
+def reads_reduction(node: torch.fx.Node) -> bool:
+    """Whether FX node `node` computes on the result of a reduction: one
+    among the nodes its inputs are computed from, followed through up to
+    READS_REDUCTION_NODES nodes (a graph that has more counts as one that
+    does)."""
+    seen: OrderedSet[torch.fx.Node] = OrderedSet()
+    stack = list(node.all_input_nodes)
+    while stack:
+        current = stack.pop()
+        if current in seen or current.op != "call_function":
+            continue
+        if len(seen) >= READS_REDUCTION_NODES:
+            return True
+        seen.add(current)
+        target = current.target
+        if (
+            isinstance(target, torch._ops.OpOverload)
+            and target.overloadpacket in REDUCTIONS_OF_GRAPH
+        ):
+            return True
+        stack.extend(current.all_input_nodes)
+    return False
 
 
 class HelionChoices(InductorChoices):
@@ -916,8 +1010,8 @@ class HelionChoices(InductorChoices):
         pointwise node and a reduction that access a buffer in different
         orders share no data either until the pointwise node is reindexed onto
         the reduction's loops (reindex_onto_reduction()). A pointwise node
-        computing a cat of equal parts stays out of a split's first kernel
-        that loops over its chunks (masked_into_looped_split())."""
+        computing a cat of equal parts stays out of a reduction kernel that
+        loops over long chunks or runs (masked_into_looped_split())."""
         if masked_into_looped_split(node1, node2):
             return False
         if HelionChoices.mix_order_reductions(node1, node2):
@@ -999,7 +1093,11 @@ class HelionChoices(InductorChoices):
             return split
         layout = HelionChoices.layout_split(reduction_numel_hint, numel_hint, split)
         if layout is not None and (
-            split > 1 or reduction_numel_hint * numel_hint >= MIN_LAYOUT_SPLIT_VALUES
+            split > 1
+            or (
+                reduction_numel_hint * numel_hint >= MIN_LAYOUT_SPLIT_VALUES
+                and not HelionChoices.reads_runs(layout)
+            )
         ):
             return layout
         if split <= 1 or reduction_numel_hint % split == 0:
@@ -1010,6 +1108,30 @@ class HelionChoices(InductorChoices):
             if max(2, split // 2) <= d <= 2 * split
         ]
         return min(divisors, key=lambda d: abs(d - split), default=split)
+
+    @staticmethod
+    def reads_runs(runs: int) -> bool:
+        """Whether the reduction V.graph.current_node lowers, over `runs` runs
+        of its input (layout_split()), is one HelionKernel reads as a tile of
+        its runs (HelionKernel.rdim_runs()): a sum, mean, prod, amax, amin or
+        any over at most REDUCTION_RUNS_MAX runs. Where Inductor would not
+        split such a reduction, it keeps its one kernel rather than take the
+        layout split: the sum over N and W of a [4, 1024, 364] bf16 tensor
+        beside its masked copy (Demucs's sum_a05c10ed018a) read the runs
+        side by side in one kernel of 2.30 us on a GB300, where the split's
+        two kernels took 1.82 and 1.09 us and a launch. Under the CuTe
+        backend, not one whose input reads another reduction (the sum of (x -
+        x.mean(...)) ** 2, a variance): HelionKernel.rdim_runs() leaves such a
+        kernel to the flat rdim there, and the layout split reads its runs as
+        views."""
+        node = V.graph.current_node
+        return (
+            runs <= REDUCTION_RUNS_MAX
+            and node is not None
+            and isinstance(node.target, torch._ops.OpOverload)
+            and node.target.overloadpacket in RUN_REDUCTIONS
+            and not (config.backend == "cute" and reads_reduction(node))
+        )
 
     @staticmethod
     def layout_split(reduction_numel: int, numel: int, split: int) -> int | None:
@@ -1028,13 +1150,15 @@ class HelionChoices(InductorChoices):
 
         rather than in0[3136*tile_x + 802816*(tile_r.index // 3136) + ...],
         whose division and remainder keep the loads from being vectors. The
-        split is asked of whether Inductor would split (Helion cannot reduce
-        over N and H * W apart in one kernel; reduction_split_factor() takes
-        it where Inductor would not only for MIN_LAYOUT_SPLIT_VALUES values
-        or more), but not of the second reduction, over the partials, nor of
-        another reduction than the node's own: None then, and when the run is
-        the whole reduction (a contiguous rdim), shorter than MIN_SPLIT_RUN,
-        or the input's layout is not static.
+        split is asked of whether Inductor would split (one kernel reduces
+        over N and H * W apart only as a tile of their runs,
+        HelionKernel.rdim_runs(); reduction_split_factor() takes the split
+        where Inductor would not only for MIN_LAYOUT_SPLIT_VALUES values or
+        more, and not where the kernel reads the runs as that tile,
+        reads_runs()), but not of the second reduction, over the partials,
+        nor of another reduction than the node's own: None then, and when the
+        run is the whole reduction (a contiguous rdim), shorter than
+        MIN_SPLIT_RUN, or the input's layout is not static.
 
         Where Inductor's `split` asks for more chunks than there are runs,
         each run is cut into equal pieces (split_runs()): the first kernel

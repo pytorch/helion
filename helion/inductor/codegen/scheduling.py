@@ -537,9 +537,10 @@ class HelionScheduling(SIMDScheduling):
                 return [kernel]
             self.probe(kernel_features, kernel)
             return [self.with_pointwise_segments(kernel, kernel_args, kernel_kwargs)]
+        # One block holds one run where the runs are a tile (HelionKernel.runs).
         long_rdim = "override_persistent_reduction" not in kernel_kwargs and (
             V.graph.sizevars.statically_known_gt(
-                kernel.numels["r0_"], UNROLLED_RDIM_MAX
+                kernel.extents["r0_"], UNROLLED_RDIM_MAX
             )
         )
         group, earlier = self.trailing_nodes(kernel_features.node_schedule)
@@ -637,8 +638,10 @@ class HelionScheduling(SIMDScheduling):
         segments = kernel.rdim_cut_segments(node.get_name() for node in group)
         if segments is None:
             return None
+        # extents: the tile of the runs, where the rdim is one run (rdim_runs()).
         numel = sympy.Mul(
-            kernel.numels["r0_"], *(kernel.numels[axis] for axis in kernel.outer_axes)
+            kernel.extents["r0_"],
+            *(kernel.extents[axis] for axis in kernel.outer_axes),
         )
         earlier_full = OrderedSet(
             name

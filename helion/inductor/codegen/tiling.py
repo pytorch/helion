@@ -47,6 +47,11 @@ UNROLLED_RDIM_MAX = 1024
 # weights (an NCHW BatchNorm's) runs faster tiled, where the weights of a
 # tile_x serve every y: short rdims keep their dims.
 R_INVARIANT_JOIN_MIN = UNROLLED_RDIM_MAX
+# The most runs of an rdim HelionKernel reads as a tile of its outer loop
+# (reduction_runs()), whose one block holds every run: each CTA keeps a
+# partial per run and reduces them at the end, and a block of the runs takes
+# that many threads (or lanes) beside the run's own.
+REDUCTION_RUNS_MAX = 8
 
 
 @dataclasses.dataclass
@@ -246,11 +251,13 @@ def natural_tiling(
     node_schedule: list[NodeScheduleEntry],
     numel: sympy.Expr,
     reduction_numel: sympy.Expr,
+    max_reduction_dims: int = MAX_REDUCTION_DIMS,
 ) -> tuple[list[sympy.Expr], list[sympy.Expr]] | None:
     """The pointwise and reduction dims, outermost first, that split the kernel's
     flat ranges into the dims its tensors are indexed by, so that every load and
     store it can is affine in the tiles' indices; None if a size is not a
-    constant.
+    constant. Past MAX_POINTWISE_DIMS pointwise and `max_reduction_dims`
+    reduction dims, neighbors are joined (reduction_runs() asks for two).
 
     The space is first cut wherever an index divides a variable or takes it
     modulo a size, and where its variables meet. Two neighboring dims are then
@@ -339,7 +346,7 @@ def natural_tiling(
                 join(d)
                 progress = True
                 break
-    for limit, pointwise in ((MAX_POINTWISE_DIMS, True), (MAX_REDUCTION_DIMS, False)):
+    for limit, pointwise in ((MAX_POINTWISE_DIMS, True), (max_reduction_dims, False)):
         while sum((step >= rnumel_int) == pointwise for step, _ in dims) > limit:
             pairs = [
                 d
@@ -358,3 +365,113 @@ def natural_tiling(
         [sympy.Integer(size) for size in pointwise_dims or [numel_int]],
         [sympy.Integer(size) for size in reduction_dims or [rnumel_int]],
     )
+
+
+def broadcast_runs(
+    node_schedule: list[NodeScheduleEntry],
+    numel: sympy.Expr,
+    reduction_numel: sympy.Expr,
+    runs: tuple[int, int],
+) -> bool:
+    """Whether a reduction of the kernel reduces a value that does not vary
+    along the elements of a run or along the runs (reduction_runs(): Q runs of
+    W elements, the flat rdim r = W * q + w), as x[0].expand_as(x).sum([0,
+    2]) reads x at w + W*c, whatever q. Read as the runs' tile, such a value
+    reaches tile_q, or the rdim, by a broadcast alone. A node's value is
+    taken not to vary along w (or q) when every load and index expression of
+    its body reads one element along it, a load of a buffer that a node
+    before it in the kernel writes counting as that node's value (y =
+    x[0].expand_as(x) * 2 stored and summed in one kernel). A gather is read
+    by its own terms with its indirect values held fixed: those come from
+    loads of the same body, which count too, so table[idx] reads one element
+    along q wherever idx does (table[idx][None].expand(4, 64, 128).sum([0,
+    2]), idx of [64, 128]). A node whose sizes are not constants counts as
+    one whose value does not vary."""
+    numel_int, rnumel_int = static_int(numel), static_int(reduction_numel)
+    if numel_int is None or rnumel_int is None:
+        return True
+    _, run = runs
+    # The first element of three values of x, of run 0: against element 1 of the
+    # run (along w), and against element 0 of run 1 (along q).
+    xs = sorted({0, numel_int // 2, numel_int - 1})
+    offsets = ([1] if run > 1 else []) + [run]
+    # Per buffer a node of the kernel writes: whether its value is constant
+    # along each offset.
+    written: dict[str, tuple[bool, ...]] = {}
+    for node in EnableReduction.filter(node_schedule):
+        if not isinstance(node, SchedulerNode):
+            continue
+        body = node._body
+        variables = [*body.iter_vars, *body.reduce_vars]
+        sizes = [static_int(body.var_ranges[var]) for var in variables]
+        if any(size is None for size in sizes):
+            return True
+        spans: dict[sympy.Symbol, tuple[int, int]] = {}
+        step = 1
+        for var, size in reversed([*zip(variables, sizes, strict=True)]):
+            spans[var] = (step, size)  # pyrefly: ignore [unsupported-operation]
+            step *= size  # pyrefly: ignore [unsupported-operation]
+        constant = [True] * len(offsets)
+        for kind in (MemoryUsageType.LOAD, MemoryUsageType.INDEX_EXPR):
+            for entry in body.memory_usage[kind]:
+                if entry.buffer_name in written:
+                    flags = written[entry.buffer_name]
+                    constant = [a and b for a, b in zip(constant, flags, strict=True)]
+                    continue
+                index = body.indexing_exprs[entry.index_name].replace(
+                    Identity, lambda arg: arg
+                )
+                assert isinstance(index, sympy.Expr)
+                constant = [
+                    keep
+                    and all(
+                        _value_at(index, spans, x * rnumel_int)
+                        == _value_at(index, spans, x * rnumel_int + offset)
+                        for x in xs
+                    )
+                    for keep, offset in zip(constant, offsets, strict=True)
+                ]
+        if node.is_reduction() and any(constant):
+            return True
+        for entry in (
+            *body.memory_usage[MemoryUsageType.STORE],
+            *body.memory_usage[MemoryUsageType.STORE_REDUCTION],
+        ):
+            if entry.buffer_name is not None:
+                written[entry.buffer_name] = tuple(constant)
+    return False
+
+
+def _value_at(
+    index: sympy.Expr, spans: dict[sympy.Symbol, tuple[int, int]], flat: int
+) -> object:
+    """`index` at flat position `flat` of the space its variables' `spans`
+    place them in (accesses())."""
+    return index.subs(
+        {var: (flat // step) % size for var, (step, size) in spans.items()}
+    )
+
+
+def reduction_runs(
+    node_schedule: list[NodeScheduleEntry],
+    numel: sympy.Expr,
+    reduction_numel: sympy.Expr,
+) -> tuple[int, int] | None:
+    """The runs a kernel reduces over, (Q, W): Q runs of W elements, when its
+    rdim is two dims (natural_tiling()) whose outer one has 2 to
+    REDUCTION_RUNS_MAX elements, as the sum over N and W of a [4, 1024, 364]
+    tensor reduces 4 runs of 364 elements for each of the 1024 channels.
+    HelionKernel reads the runs as a tile of its outer loop beside one run of
+    the rdim (HelionKernel.rdim_runs()), at an index affine in both where the
+    flat rdim takes // and % of it; None when the rdim is one dim (a
+    contiguous rdim) or has more runs."""
+    dims = natural_tiling(node_schedule, numel, reduction_numel, max_reduction_dims=2)
+    if dims is None:
+        return None
+    _, reduction_dims = dims
+    if len(reduction_dims) != 2:
+        return None
+    runs, run = (static_int(size) for size in reduction_dims)
+    if runs is None or run is None or not 2 <= runs <= REDUCTION_RUNS_MAX:
+        return None
+    return runs, run

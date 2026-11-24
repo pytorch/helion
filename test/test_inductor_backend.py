@@ -806,6 +806,118 @@ class TestInductorCute(InductorBackendTestCase):
         self.assertRegex(first, r"out0\[[^\]]*tile_r[^\]]*\] = ")
         self.assertIn("acc = acc + torch.sum(", first)
 
+    def test_reduction_runs(self):
+        # A sum over N and W whose runs are a tile (HelionKernel.rdim_runs()),
+        # compiled and run by the CuTe backend: the masked bf16 copy of a
+        # [4, 48, 100] slice of a [4, 48, 128] tensor and its channel sums, read in
+        # vectors of the views in0[tile_x, tile_q, tile_r].
+        x = torch.randn(4, 48, 128, device=DEVICE, dtype=torch.bfloat16)[..., :100]
+        mask = torch.rand(4, 48, 100, device=DEVICE) < 0.3
+        s = torch.tensor(0.5, device=DEVICE, dtype=torch.bfloat16)
+
+        def fn(x, mask, s):
+            where = torch.where(mask, s, x)
+            return where, where.sum([0, 2]).float()
+
+        (source,) = self.compile(fn, x, mask, s, tol=1e-2, backend="cute")
+        self.assertIn("for tile_x, tile_q in hl.tile([48, 4], block_size=", source)
+        self.assertRegex(source, r"out0\[tile_x, tile_q, :\] = ")
+        # Runs of 364, whose default config reduces each run in a lane loop
+        # over thread_idx[0] and the 4 runs over thread_idx[1], then stores the
+        # total from one thread.
+        x = torch.randn(4, 48, 364, device=DEVICE, dtype=torch.bfloat16)
+        mask = torch.rand(4, 48, 364, device=DEVICE) < 0.3
+        (source,) = self.compile(fn, x, mask, s, tol=1e-2, backend="cute")
+        self.assertIn("for tile_x, tile_q in hl.tile([48, 4], block_size=", source)
+
+    def test_reduction_runs_masked_block_and_epilogue(self):
+        # Five runs, a block of 8 whose three masked lanes must not join the
+        # reduction: an int32 amax of negative values (a masked 0 would beat
+        # them), an fp32 amin of values of 1 or more and a prod of values near
+        # 1 (a masked 0 would spoil both).
+        cases = (
+            (lambda x: x.amax([0, 2]), torch.randint(-1000, -1, (5, 24, 37)).int(), 0),
+            (lambda x: x.amin([0, 2]), 1 + torch.rand(5, 24, 37), 0),
+            (
+                lambda x: x.permute(1, 0, 2).reshape(24, -1).prod(1),
+                1 + 0.01 * torch.rand(5, 24, 37),
+                1e-4,
+            ),
+        )
+        for reduce, x, tol in cases:
+            (source,) = self.compile(reduce, x.to(DEVICE), tol=tol, backend="cute")
+            self.assertIn("hl.tile([24, 5], block_size=[None, 8])", source)
+        # An epilogue that reads the runs' result per element: x less the
+        # mean over N and W of 3 runs of 700.
+        fn = lambda x: x - x.mean([0, 2], keepdim=True)  # noqa: E731
+        x = torch.randn(3, 16, 700, device=DEVICE)
+        (source,) = self.compile(fn, x, tol=1e-5, backend="cute")
+        self.assertIn("hl.tile([16, 3], block_size=[None, 4])", source)
+
+    def test_reduction_runs_declines_for_cute(self):
+        # Kernels the CuTe lane split cannot take over the runs read the flat
+        # rdim (HelionKernel.rdim_runs()): a reduction that reads another one
+        # (the sum of (x - mean) ** 2 over 4 runs of 364), and a loop over
+        # runs of 12 whose epilogue adds into an input in place.
+        x = torch.randn(4, 64, 364, device=DEVICE)
+
+        def centered_square_sum(x):
+            return ((x - x.mean([0, 2], keepdim=True)) ** 2).sum([0, 2])
+
+        (source,) = self.compile(centered_square_sum, x, tol=1e-3, backend="cute")
+        self.assertNotIn("tile_q", source)
+        x = torch.randn(4, 24, 12, device=DEVICE)
+        o = torch.randn(24, device=DEVICE)
+
+        def add_sums(o, x):
+            o.add_(x.sum([0, 2]))
+            return o
+
+        expected = add_sums(o.clone(), x)
+        (source,) = self.compile(
+            add_sums, o, x, expected=expected, tol=1e-4, backend="cute"
+        )
+        self.assertNotIn("tile_q", source)
+        # Runs of 100, which a kernel can read as one block, in a kernel that
+        # loops anyway (persistent reductions off): the same.
+        x = torch.randn(4, 24, 100, device=DEVICE)
+        with config.patch({"triton.persistent_reductions": False}):
+            expected = add_sums(o.clone(), x)
+            (source,) = self.compile(
+                add_sums, o, x, expected=expected, tol=1e-4, backend="cute"
+            )
+        self.assertNotIn("tile_q", source)
+        # A value broadcast along the runs (x[0] for each of 3 runs of 128),
+        # alone or through a producer stored in the same kernel: no tile of
+        # the runs reduces it (HelionKernel.rdim_runs(), broadcast_runs()).
+        x = torch.randn(3, 16, 128, device=DEVICE)
+
+        def broadcast_product(x):
+            y = x[0].expand_as(x) * 2
+            return y, y.sum([0, 2])
+
+        for fn in (lambda x: x[0].expand_as(x).sum([0, 2]), broadcast_product):
+            sources = self.compile(fn, x, tol=1e-3, backend="cute")
+            self.assertFalse(any("tile_q" in source for source in sources))
+        # A gather broadcast along the runs, table[idx] for each of 4 runs of
+        # 128: read with idx's value held fixed it reads one element along the
+        # runs, as idx does, and no tile of the runs reduces it either.
+        table = torch.randn(1000, device=DEVICE)
+        idx = torch.randint(0, 1000, (64, 128), device=DEVICE)
+
+        def gathered_sum(table, idx):
+            return table[idx][None].expand(4, 64, 128).sum([0, 2])
+
+        with config.patch(assert_indirect_indexing=False):
+            sources = self.compile(gathered_sum, table, idx, tol=1e-3, backend="cute")
+        self.assertFalse(any("tile_q" in source for source in sources))
+        # A variance over runs of 640, 2**20 values or more, whose reductions
+        # one kernel would leave to the flat rdim: the layout split reads the
+        # runs as views (reads_runs()), with no // of the flat rdim.
+        x = torch.randn(4, 512, 640, device=DEVICE)
+        sources = self.compile(centered_square_sum, x, tol=1e-3, backend="cute")
+        self.assertFalse(any("//" in source for source in sources))
+
     def test_unsupported_op(self):
         # Helion's CuTe backend compiles no lgamma.
         x = torch.rand(64, 100, device=DEVICE) + 0.5
@@ -1805,21 +1917,19 @@ def kernel(in0: torch.Tensor, out0: torch.Tensor, out1: torch.Tensor) -> None:
         self.compile(lambda a, b: torch.cat([a, b], -1).sum(-1), a, b)
 
     def test_nchw_reductions(self):
-        # sum and var_mean over N, H and W of an NCHW tensor split into a
-        # chunk per run of H * W contiguous values (HelionChoices.layout_split()):
-        # the first kernel reads each run as an rdim of a view, with no division
-        # or remainder in its index, and the second combines the 8 partials of
-        # each channel. 2M values, past MIN_LAYOUT_SPLIT_VALUES, split whether
-        # or not Inductor would.
+        # var_mean over N, H and W of an NCHW tensor split into a chunk per run
+        # of H * W contiguous values (HelionChoices.layout_split()): the first
+        # kernel reads each run as an rdim of a view, with no division or
+        # remainder in its index, and the second combines the 8 partials of
+        # each channel. 2M values over 8 runs per channel of 64 channels, which
+        # Inductor splits for its few outputs on some GPUs and the layout split
+        # takes from MIN_LAYOUT_SPLIT_VALUES on the others.
         x = torch.randn(8, 64, 64, 64, device=DEVICE)
-        for fn in (
-            lambda x: x.sum([0, 2, 3]),
-            lambda x: torch.var_mean(x, [0, 2, 3], correction=0),
-        ):
-            first, second = self.compile(fn, x, tol=1e-3)
-            self.assertRegex(first, r"in0\[tile_x, (tile_r|:)\]")
-            self.assertNotIn("//", first)
-            self.assertIn("in0[tile_x, :]", second)
+        var_mean = lambda x: torch.var_mean(x, [0, 2, 3], correction=0)  # noqa: E731
+        first, second = self.compile(var_mean, x, tol=1e-3)
+        self.assertRegex(first, r"in0\[tile_x, (tile_r|:)\]")
+        self.assertNotIn("//", first)
+        self.assertIn("in0[tile_x, :]", second)
         # A batch of 2, whose 2 runs per channel Inductor's 16 chunks cut in 8
         # each: chunks within a run, still a tile of a view.
         x = torch.randn(2, 64, 256, 256, device=DEVICE)
@@ -1830,6 +1940,21 @@ def kernel(in0: torch.Tensor, out0: torch.Tensor, out1: torch.Tensor) -> None:
         # a second kernel's would double.
         small = torch.randn(2, 64, 8, 8, device=DEVICE)
         self.assertEqual(len(self.compile(lambda x: x.sum([0, 2, 3]), small)), 1)
+        # A sum over 8 runs per channel of 512 channels, which Inductor splits
+        # on no GPU (as many outputs as twice its SMs): one kernel reads its
+        # runs as a tile (reads_runs()) rather than take the layout split.
+        x = torch.randn(8, 512, 16, 16, device=DEVICE)
+        (source,) = self.compile(lambda x: x.sum([0, 2, 3]), x, tol=1e-3)
+        self.assertIn("in0[tile_x, tile_q, :]", source)
+        # A cat into a var_mean over runs of 1100: a Welford's kernel reads the
+        # flat rdim, not its runs, and keeps the cat (reads_long_runs()).
+        x = torch.randn(2, 128, 1100, device=DEVICE)
+
+        def cat_var_mean(x):
+            y = torch.cat([x * 2, x + 1], 1)
+            return (y, *torch.var_mean(y, [0, 2], correction=0))
+
+        self.assertEqual(len(self.compile(cat_var_mean, x, tol=1e-3)), 1)
 
     def test_layout_split_pieces(self):
         # A run whose divisors skip the window around Inductor's split
@@ -1995,6 +2120,150 @@ def kernel(in0: torch.Tensor, out0: torch.Tensor, out1: torch.Tensor) -> None:
         (source,) = self.compile(lambda x: x.sum(0), x, tol=1e-4)
         self.assertIn("tmp0 = in0[:, tile_x]", source)
         self.assertIn("torch.sum(tmp0, -2)", source)
+
+    @parametrize(
+        "case",
+        # Each a reduction over dims apart in memory whose runs the kernel
+        # reads as a tile (HelionKernel.rdim_runs()): a sum over N and W of a
+        # sliced bf16 [4, 48, 100] (of a [4, 48, 128]) beside its masked copy, a
+        # channel mean over N, H and W of an fp16 NCHW tensor (runs of H * W),
+        # an int32 amax over 5 runs of 37 (sizes that divide no block) of
+        # negative values only, which a masked lane's 0 would beat, an fp32
+        # amin over 5 runs of values of 1 or more, which it would undercut,
+        # and an fp32 prod over the same runs, which it would zero: the
+        # reshape of a permuted x, as torch.prod reduces one dim.
+        ["where_sum", "mean", "amax", "amin", "prod"],
+    )
+    def test_reduction_runs(self, case):
+        if case == "where_sum":
+            x = torch.randn(4, 48, 128, device=DEVICE, dtype=torch.bfloat16)
+            x = x[:, :, :100]
+            mask = torch.rand(4, 48, 100, device=DEVICE) < 0.3
+            s = torch.tensor(0.5, device=DEVICE, dtype=torch.bfloat16)
+
+            def fn(x, mask, s):
+                where = torch.where(mask, s, x)
+                return where, where.sum([0, 2]).float()
+
+            args, x_numel, runs, run, tol = (x, mask, s), 48, 4, 100, 1e-2
+        elif case == "mean":
+            args = (torch.randn(3, 40, 9, 11, device=DEVICE, dtype=torch.float16),)
+            fn = lambda x: x.mean([0, 2, 3])  # noqa: E731
+            x_numel, runs, run, tol = 40, 3, 99, 1e-2
+        elif case == "amax":
+            args = (torch.randint(-1000, -1, (5, 24, 37), device=DEVICE).int(),)
+            fn = lambda x: x.amax([0, 2])  # noqa: E731
+            x_numel, runs, run, tol = 24, 5, 37, 0
+        elif case == "amin":
+            args = (1 + torch.rand(5, 24, 37, device=DEVICE),)
+            fn = lambda x: x.amin([0, 2])  # noqa: E731
+            x_numel, runs, run, tol = 24, 5, 37, 0
+        else:
+            args = (1 + 0.01 * torch.rand(5, 24, 37, device=DEVICE),)
+            fn = lambda x: x.permute(1, 0, 2).reshape(24, -1).prod(1)  # noqa: E731
+            x_numel, runs, run, tol = 24, 5, 37, 1e-4
+        (source,) = self.compile(fn, *args, tol=tol)
+        # One block of the runs, a power of two (8 for 5 runs).
+        block = 1 << (runs - 1).bit_length()
+        self.assertIn(
+            f"for tile_x, tile_q in hl.tile([{x_numel}, {runs}], "
+            f"block_size=[None, {block}]):",
+            source,
+        )
+        # One block of each run, then the runs' partials reduced over tile_q.
+        self.assertRegex(source, r"in\d+\[tile_x, tile_q, :\]")
+        reductions = re.findall(
+            r"torch\.(?:a?(?:sum|max|min)|prod)\(tmp\d+, -1", source
+        )
+        self.assertEqual(len(reductions), 2, source)
+        self.assertNotIn("//", source)
+        self.assertNotIn(f"hl.tile({run})", source)
+
+    def test_reduction_runs_with_epilogue(self):
+        # x - x.mean([0, 2], keepdim=True) over runs of 700, one block of each,
+        # stores each element less the runs' mean; runs of 12, which a block
+        # cannot hold as a named rdim (names_rdim()), loop over tile_r in them
+        # and reduce the accumulator over tile_q after the loop. Nine runs,
+        # past REDUCTION_RUNS_MAX, of a plain sum, and a var_mean, whose
+        # Welford partials have no combine over the runs, read the flat rdim.
+        fn = lambda x: x - x.mean([0, 2], keepdim=True)  # noqa: E731
+        (source,) = self.compile(fn, torch.randn(3, 16, 700, device=DEVICE), tol=1e-5)
+        self.assertIn("hl.tile([16, 3], block_size=[None, 4])", source)
+        self.assertRegex(source, r"out0\[tile_x, tile_q, :\] = ")
+        x = torch.randn(3, 16, 12, device=DEVICE)
+        (source,) = self.compile(lambda x: x.sum([0, 2]), x, tol=1e-5)
+        self.assertIn("for tile_r in hl.tile(12):", source)
+        self.assertIn("torch.sum(acc, -1)", source)
+        x = torch.randn(9, 32, 50, device=DEVICE)
+        (source,) = self.compile(lambda x: x.sum([0, 2]), x, tol=1e-4)
+        self.assertNotIn("tile_q", source)
+        x = torch.randn(3, 32, 700, device=DEVICE)
+        fn = lambda x: torch.var_mean(x, [0, 2])  # noqa: E731
+        (source,) = self.compile(fn, x, tol=1e-4)
+        self.assertNotIn("tile_q", source)
+
+    def test_reduction_runs_atomic_epilogue(self):
+        # Sums over runs (tile_q) that index_put adds into an output after
+        # the reduction, two of them at each place: an atomic store has no
+        # tile of the runs, which are reduced dims, so each sum adds once.
+        x = torch.randn(3, 16, 100, device=DEVICE)
+        out = torch.zeros(8, device=DEVICE)
+
+        def fn(x, out):
+            index = torch.arange(16, device=x.device) % 8
+            return out.index_put((index,), x.sum([0, 2]), accumulate=True)
+
+        sources = self.compile(fn, x, out, tol=1e-4)
+        (source,) = [source for source in sources if "tile_q" in source]
+        self.assertIn("hl.atomic_add(", source)
+
+    def test_reduction_runs_of_a_cat(self):
+        # A GLU backward's cat of two [4, 32, 100] halves and its sum over N
+        # and W, 51200 values that Inductor does not split: the cat's masked
+        # parts beside the sum whose runs are a tile, whichever kernel takes
+        # them.
+        a0, a1, a2 = (
+            torch.randn(4, c, 100, device=DEVICE, dtype=torch.bfloat16)
+            for c in (32, 32, 64)
+        )
+        sources = self.compile(glu_backward_cat, a0, a1, a2, tol=2e-2)
+        self.assertTrue(any("tile_q" in source for source in sources))
+        # Halves of [4, 256, 1100], runs of 1100 past UNROLLED_RDIM_MAX: the
+        # cat keeps its kernel, which emits its halves as segments, and the
+        # kernel over the runs reads its output with no masked load
+        # (masked_into_looped_split()).
+        a0, a1, a2 = (
+            torch.randn(4, c, 1100, device=DEVICE, dtype=torch.bfloat16)
+            for c in (256, 256, 512)
+        )
+        cat, runs = self.compile(glu_backward_cat, a0, a1, a2, tol=2e-2)
+        self.assertNotIn("tile_q", cat)
+        self.assertIn("hl.tile([512, 4], block_size=[None, 4])", runs)
+        self.assertNotIn("extra_mask", runs)
+
+    def test_reduction_runs_kernels(self):
+        # A sum over N and W of [4, 512, 640], 1.3M values, which Inductor
+        # does not split (512 channels fill the GPU): its runs a tile, one
+        # kernel (HelionChoices.reads_runs()), where layout_split() cut it into
+        # a kernel per run and one over the partials. A value that does not
+        # vary by run (x[0] broadcast over N, which shares no read with x's
+        # own sum and gets a kernel of its own) counts each of the 3 copies
+        # (over_tile_r() broadcasts it over tile_q), and an outer reduction,
+        # whose rdim is no run of memory, keeps its flat rdim in the kernels
+        # of the split Inductor takes.
+        x = torch.randn(4, 512, 640, device=DEVICE)
+        (source,) = self.compile(lambda x: x.sum([0, 2]), x, tol=1e-3)
+        self.assertIn("hl.tile([512, 4], block_size=[None, 4])", source)
+        x = torch.randn(3, 16, 128, device=DEVICE)
+        fn = lambda x: (x.sum([0, 2]), x[0].expand_as(x).sum([0, 2]))  # noqa: E731
+        sources = self.compile(fn, x, tol=1e-4)
+        self.assertEqual(len(sources), 2)
+        self.assertTrue(all("tile_q" in source for source in sources))
+        self.assertIn(".expand(tile_x, tile_q, rdim)", sources[1])
+        sources = self.compile(
+            lambda x: x.sum([0, 2]), torch.randn(3, 32, 64, 2, device=DEVICE), tol=1e-4
+        )
+        self.assertFalse(any("tile_q" in source for source in sources))
 
     def test_split_reduction_takes_its_producer(self):
         # A pointwise output that a split reduction sums (an activation's
