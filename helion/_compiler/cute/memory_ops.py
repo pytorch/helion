@@ -6997,10 +6997,16 @@ def _cute_sinkable_tile_wrapper(
     tensor: torch.Tensor,
     subscript: Sequence[object],
     index_exprs: Sequence[str],
+    *,
+    bool_bytes: bool = False,
 ) -> CuteVloopWrapperFact | None:
     """The vectorized grid axis a scalar tile access may join as a packet once
     ``cute/sink_vector_loops.py`` interchanges its V-loop into the loops
     around the access, or None.
+
+    A bool load (``bool_bytes``) joins as one packed integer of its V bytes
+    (``_CUTE_BYTE_PACKET_WIDTHS``), from which each lane extracts its byte and
+    compares it against zero, as its scalar load does.
 
     The access must address that axis at the tensor's stride-1 dim with the
     plain per-element index, and no other dim with it (``out[c, r, c]``), so
@@ -7023,7 +7029,10 @@ def _cute_sinkable_tile_wrapper(
         env.backend.name != "cute"
         or not wrappers
         or not isinstance(state.codegen.current_grid_state, DeviceGridState)
-        or tensor.dtype not in _CUTE_VECTOR_UNROLL_DTYPES
+        or (
+            tensor.dtype not in _CUTE_VECTOR_UNROLL_DTYPES
+            and not (bool_bytes and tensor.dtype is torch.bool)
+        )
         or "None" in index_exprs
     ):
         return None
@@ -7060,6 +7069,10 @@ def _cute_sinkable_tile_wrapper(
     if (
         wrapper is None
         or not wrapper.uniform_vector_mask
+        or (
+            tensor.dtype is torch.bool
+            and wrapper.vec_width not in _CUTE_BYTE_PACKET_WIDTHS
+        )
         or wrapper.vec_width * tensor.dtype.itemsize > _FLAT_GATHER_SINK_MAX_BYTES
         or index_exprs[lane_axis_pos] != wrapper.index_var
         or any(
@@ -7128,7 +7141,9 @@ def _cute_record_sinkable_scalar_load(
     row after interchanging the V-loop into those loops.  The fact is keyed
     by the scalar pointer expression the pass will find in the AST.
     """
-    wrapper = _cute_sinkable_tile_wrapper(state, tensor, subscript, index_exprs)
+    wrapper = _cute_sinkable_tile_wrapper(
+        state, tensor, subscript, index_exprs, bool_bytes=True
+    )
     if wrapper is None:
         return
     from .device_state import CuteVloopLoadFact

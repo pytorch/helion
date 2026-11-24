@@ -1166,6 +1166,77 @@ def test_trace_list_appends_outside_one_segment_are_unsupported() -> None:
     assert check(body("for lane in range(8):", "    other.append(1)"), lists=("vals",))
 
 
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _masked_column_sum(
+    mask: torch.Tensor, x: torch.Tensor, y: torch.Tensor, out: torch.Tensor
+) -> None:
+    # better-benchmark sum_8a2f10cdd825: where(mask, 0, x) stored and summed
+    # over each split's 128 rows.
+    for tile_s, tile_c in hl.tile([mask.size(0), mask.size(2)]):
+        acc = hl.zeros([tile_s, tile_c], dtype=torch.float32)
+        for tile_r in hl.tile(mask.size(1)):
+            v = torch.where(
+                mask[tile_s, tile_r, tile_c],
+                0.0,
+                x[tile_s, tile_r, tile_c].to(torch.float32),
+            )
+            y[tile_s, tile_r, tile_c] = v.to(y.dtype)
+            acc = acc + torch.sum(v, -2)
+        out[tile_s, tile_c] = acc
+
+
+def _masked_column_sum_args(
+    device: str, columns: int = 512, rows: int = 128
+) -> tuple[torch.Tensor, ...]:
+    mask = torch.rand(8, rows, columns, device=device) < 0.3
+    x = torch.randn(8, rows, columns, device=device, dtype=torch.bfloat16)
+    return mask, x, torch.empty_like(x), torch.empty(8, columns, device=device)
+
+
+def _masked_sum_seed(vec: int) -> dict[str, object]:
+    # The column reduction's second seed (CuteColumnReductionHeuristic).
+    return {
+        "block_sizes": [1, 32, 128],
+        "num_threads": [1, 32 // vec, 32],
+        "cute_vector_widths": [1, vec, 1],
+        "cute_lane_layouts": ["blocked", "blocked", "strided"],
+        "cute_vloop_sink": True,
+        "cute_lane_unroll": 8,
+    }
+
+
+@pytest.mark.parametrize(("vec", "word"), [(8, "Uint64"), (4, "Uint32"), (2, "Uint16")])
+def test_sunk_bool_loads_read_byte_packets(cpu_only: None, vec: int, word: str) -> None:
+    # A bool load joins the sunk V-loop as one packed integer of its V bytes,
+    #     _vsink_vec_u0 = cute.arch.load(_vsink_ptr + ..., cutlass.Uint64)
+    #     tmp0 = cutlass.Uint8(_vsink_vec_u0 >> 8 * vec_lane_1 & 255) != cutlass.Uint8(0)
+    # where each lane loaded its own byte before.
+    code = _cpu_code(
+        _masked_column_sum, _masked_column_sum_args("cpu"), **_masked_sum_seed(vec)
+    )
+    assert re.search(rf"cute\.arch\.load\(_vsink_ptr[^\n]*cutlass\.{word}\)", code), (
+        code
+    )
+    assert re.search(r">> 8 \* vec_lane_\d+ & 255\) != cutlass\.Uint8\(0\)", code), code
+
+
+def test_masked_bool_loads_stay_scalar(cpu_only: None) -> None:
+    # An rdim of 100 that the 128-row tile does not fill: the bf16 input
+    # sinks into predicated packets, while the bool, whose packed integer has
+    # no predicated load here, keeps its per-lane loads.  (Refusing the
+    # segment for the bool kept the bf16 input scalar as well.)
+    code = _cpu_code(
+        _masked_column_sum,
+        _masked_column_sum_args("cpu", rows=100),
+        **_masked_sum_seed(8),
+    )
+    assert re.search(r"_vsink_vec\w* = _cute_load_v\w*_if\(", code), code
+    assert not re.search(
+        r"cute\.arch\.load\(_vsink_ptr[^\n]*cutlass\.Uint(64|32)\)", code
+    ), code
+    assert re.search(r"= \(mask\.iterator \+ [^\n]*\.load\(\)", code), code
+
+
 def test_knob_off_keeps_the_original_nest(cpu_only: None) -> None:
     x = torch.empty(4096, 4096, dtype=torch.bfloat16)
     code = _cpu_code(
@@ -4211,6 +4282,58 @@ class TestCuteVloopSink(TestCase):
         torch.testing.assert_close(
             sunk, expected.to(torch.bfloat16), atol=1e-2, rtol=1e-2
         )
+
+    def test_sunk_bool_packets_match_the_scalar_loads(self) -> None:
+        # The byte packets of a bool mask select the same elements as its
+        # per-lane loads: y bitwise, the sums within their rounding.
+        for vec in (8, 4):
+            args = _masked_column_sum_args(DEVICE)
+            mask, x, y, out = args
+            outputs = []
+            for sink in (True, False):
+                code, _ = code_and_output(
+                    _masked_column_sum,
+                    args,
+                    **(_masked_sum_seed(vec) | {"cute_vloop_sink": sink}),
+                )
+                packed = re.search(
+                    r"cute\.arch\.load\([^\n]*cutlass\.Uint(64|32)\)", code
+                )
+                self.assertEqual(packed is not None, sink)
+                outputs.append((y.clone(), out.clone()))
+            (y_sunk, out_sunk), (y_scalar, out_scalar) = outputs
+            expected = torch.where(mask, 0.0, x.float())
+            torch.testing.assert_close(y_sunk, y_scalar, atol=0, rtol=0)
+            torch.testing.assert_close(
+                y_sunk, expected.to(torch.bfloat16), atol=0, rtol=0
+            )
+            torch.testing.assert_close(out_sunk, expected.sum(1), atol=1e-3, rtol=1e-4)
+            torch.testing.assert_close(out_sunk, out_scalar, atol=1e-4, rtol=1e-5)
+
+    def test_guarded_bool_lanes_beside_sunk_packets_match_the_scalar_loads(
+        self,
+    ) -> None:
+        # An rdim of 100 that the 128-row tile does not fill: the bf16 input
+        # sinks as predicated packets while the guarded bool keeps its
+        # per-lane loads.  y bitwise and the sums as the unsunk kernel's.
+        args = _masked_column_sum_args(DEVICE, rows=100)
+        mask, x, y, out = args
+        outputs = []
+        for sink in (True, False):
+            code, _ = code_and_output(
+                _masked_column_sum,
+                args,
+                **(_masked_sum_seed(8) | {"cute_vloop_sink": sink}),
+            )
+            predicated = re.search(r"_vsink_vec\w* = _cute_load_v\w*_if\(", code)
+            self.assertEqual(predicated is not None, sink)
+            outputs.append((y.clone(), out.clone()))
+        (y_sunk, out_sunk), (y_scalar, out_scalar) = outputs
+        expected = torch.where(mask, 0.0, x.float())
+        torch.testing.assert_close(y_sunk, y_scalar, atol=0, rtol=0)
+        torch.testing.assert_close(y_sunk, expected.to(torch.bfloat16), atol=0, rtol=0)
+        torch.testing.assert_close(out_sunk, expected.sum(1), atol=1e-3, rtol=1e-4)
+        torch.testing.assert_close(out_sunk, out_scalar, atol=1e-4, rtol=1e-5)
 
     def _check_channel_affine(self, rows: int, config: dict[str, Any]) -> None:
         args = _channel_affine_args(DEVICE, rows=rows)

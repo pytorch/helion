@@ -106,6 +106,8 @@ from ._ast_pass_utils import statement_lists
 from .cache_policy_loads import hint_wide_packets
 from .emitters.lane_packets import _CUTE_VECTOR_UNROLL_CARRIER
 from .emitters.lane_packets import _CUTE_VECTOR_UNROLL_DTYPES
+from .emitters.lane_packets import _cute_is_byte_packed
+from .emitters.lane_packets import _cute_unroll_vec_extract
 from .emitters.lane_packets import _cute_unroll_vec_load_expr
 from .emitters.lane_packets import masked_packet_load_expr
 from .lane_invariant_division import uniform_load_predicates
@@ -1780,6 +1782,13 @@ class _Sinker:
             # The address or guard differs per lane, or needs a value this
             # segment defines inside its V-loop (before or after the load).
             raise _Unsupported
+        byte_packet = _cute_is_byte_packed(load_fact.dtype)
+        if byte_packet and mask is not None:
+            # A bool packet loads as one packed integer, which has no
+            # predicated form here: a masked bool load keeps its per-lane
+            # load, and the segment's other loads still sink (refusing the
+            # segment kept the bf16 input of an r tail scalar as well).
+            return call
         pointer_text = ast.unparse(vector_pointer)
         guard = ast.unparse(mask) if mask is not None else ""
         key = f"{pointer_text}|{guard}"
@@ -1813,6 +1822,18 @@ class _Sinker:
             pre.append(load_stmt)
             vector_cache[key] = vector_var
             self.vector_loads_emitted += 1
+        if byte_packet:
+            # A bool lane: its byte of the packed integer, which the scalar
+            # load's comparison against zero then reads, as in
+            #     _vsink_vec = cute.arch.load(ptr, cutlass.Uint64)
+            #     tmp0 = cutlass.Uint8((_vsink_vec >> (8 * (vec_lane))) & 0xFF) != cutlass.Uint8(0)
+            # where every lane loaded its byte on its own.
+            return cast(
+                "ast.expr",
+                expr_from_string(
+                    _cute_unroll_vec_extract(vector_var, self.vec_var, load_fact.dtype)
+                ),
+            )
         carrier = _CUTE_VECTOR_UNROLL_CARRIER[load_fact.dtype]
         element = _CUTE_VECTOR_UNROLL_DTYPES[load_fact.dtype]
         return cast(
