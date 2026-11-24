@@ -1333,6 +1333,27 @@ class Backend(abc.ABC):
         """
         return 0
 
+    @classmethod
+    def names_releasing_twins(cls, config_spec: ConfigSpec) -> bool:
+        """Whether ``releasing_twin`` can name a twin for a config of
+        ``config_spec`` (the default: never): the autotuner's final-selection
+        budget counts one more finalist for a followed kernel where it can
+        (``PopulationBasedSearch._twin_survivors``)."""
+        return False
+
+    @classmethod
+    def releasing_twin(cls, config: Config, config_spec: ConfigSpec) -> Config | None:
+        """The twin of ``config`` that releases the kernel's successor in its
+        call sequence early, where ``config`` does not and the search can
+        set it; ``None`` otherwise (the default: no such knob).  A kernel
+        another kernel of its sequence runs right behind times it in its
+        final selection beside its fastest finalist
+        (``PopulationBasedSearch._releasing_twins``), so that the
+        preference band (``finalist_preference``) has the twin to choose.
+        A class method, reached like ``finalist_preference``.
+        """
+        return None
+
     def get_paired_device_micros_bench(
         self,
     ) -> Callable[..., list[tuple[float, float]]] | None:

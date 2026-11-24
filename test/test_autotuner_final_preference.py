@@ -42,6 +42,7 @@ from helion._testing.cute_codegen import cpu_bind
 from helion._testing.cute_codegen import mock_cuda_unavailable
 from helion._testing.cute_vloop_sink_kernels import col_reduce_sum_static
 from helion.autotuner.base_search import PopulationBasedSearch
+from helion.autotuner.effort_profile import FinalSelectionConfig
 from helion.runtime.settings import Settings
 
 # The B200 model with tcgen05 MMA support, CUDA hidden, the inputs traced as
@@ -105,7 +106,13 @@ _OFF = _module(_BODY)
 
 
 def _member(perf: float, source: str = _OFF, **config: object) -> SimpleNamespace:
-    return SimpleNamespace(perf=perf, config=helion.Config(**config), source=source)
+    return SimpleNamespace(
+        perf=perf,
+        perfs=[perf],
+        config=helion.Config(**config),
+        source=source,
+        fn=object(),
+    )
 
 
 def _search(backend: str, members: list[SimpleNamespace] = ()) -> PopulationBasedSearch:  # type: ignore[assignment]
@@ -255,6 +262,43 @@ def test_a_default_store_within_tolerance_wins_over_a_streaming_one() -> None:
         )
         is default
     )
+
+
+@skipUnlessBackends(["cute"])
+def test_a_followed_kernel_prefers_its_release_down_to_a_trace_tick() -> None:
+    # A 5.2 us kernel whose releasing twin reads one trace tick (32 ns) slower,
+    # 0.6% and outside the 0.5% band: alone the faster one stays; a kernel
+    # that another kernel of its sequence runs right behind
+    # (followed_in_sequence) takes the twin, as its successor launches 0.3-2
+    # us earlier behind the release, and so it does two ticks behind (the
+    # band is three).  A twin four ticks behind is no tie.
+    fastest = _member(0.005184, _OFF, block_sizes=[64])
+    twin = _member(0.005216, _ENTRY, block_sizes=[64], cute_pdl=True)
+    two_ticks = _member(0.005248, _ENTRY, block_sizes=[48], cute_pdl=True)
+    far = _member(0.005312, _ENTRY, block_sizes=[32], cute_pdl=True)
+    for followed, live, chosen in (
+        (False, [fastest, twin], fastest),
+        (True, [fastest, twin], twin),
+        (True, [fastest, two_ticks], two_ticks),
+        (True, [fastest, far], fastest),
+    ):
+        search = _search("cute", live)
+        search._followed_in_sequence = followed
+        assert (
+            search._prefer_backend_preference_within_tolerance(fastest, live) is chosen
+        ), (followed, [m.perf for m in live])
+    # An explicit tolerance stands as given: 0 turns the preference off; an
+    # invalid one is ignored (logged), and the followed band applies.
+    for value, chosen in (("0", fastest), ("not-a-number", twin), ("-1", twin)):
+        with patch.dict("os.environ", {_ENV: value}):
+            search = _search("cute", [fastest, twin])
+            search._followed_in_sequence = True
+            assert (
+                search._prefer_backend_preference_within_tolerance(
+                    fastest, [fastest, twin]
+                )
+                is chosen
+            ), value
 
 
 def test_a_finalist_is_rendered_once_however_often_the_backend_reads_it() -> None:
@@ -458,3 +502,176 @@ def test_rendered_kernels_rank_as_their_lowering() -> None:
         search._prefer_backend_preference_within_tolerance(fastest, [fastest, other])
         is fastest
     )
+
+
+@skipUnlessBackends(["cute"])
+def test_cute_names_the_releasing_twin_where_the_search_flips_the_knob() -> None:
+    # A column sum on the CPU stand-in's B200 model: the search flips
+    # cute_pdl, so a config without it has a twin with it at the auto
+    # placement, also where the knob-off config names an inert one (none); a
+    # config with it has none, and neither does any config of a backend
+    # without the knob.
+    with mock_cuda_unavailable():
+        bound = cpu_bind(
+            col_reduce_sum_static, (torch.empty(1024, 1024, dtype=torch.bfloat16),)
+        )
+    spec = bound.config_spec
+    for off in (
+        helion.Config(**_COLUMN_SUM),
+        helion.Config(**_COLUMN_SUM, cute_pdl_release="none"),
+    ):
+        twin = CuteBackend.releasing_twin(off, spec)
+        assert twin is not None
+        assert twin.config == {
+            **off.config,
+            "cute_pdl": True,
+            "cute_pdl_release": "auto",
+        }
+        assert CuteBackend.releasing_twin(twin, spec) is None
+        assert TritonBackend.releasing_twin(off, spec) is None
+
+
+def _twin_search(
+    finalists: list[SimpleNamespace], twin_perf: float, twin_fn: object = None
+) -> PopulationBasedSearch:
+    # A followed kernel's search double whose config generator and benchmark
+    # pass the twin through: it comes back timed at ``twin_perf``.
+    search = _search("cute", finalists)
+    search._followed_in_sequence = True
+    search.config_spec = SimpleNamespace()
+    search._finalist_history_perf = lambda member: member.perf
+    search.config_gen = SimpleNamespace(flatten=lambda config: config)
+
+    def make_unbenchmarked(config: helion.Config) -> SimpleNamespace:
+        # The canonical form the search keeps: a knob-on config holds its
+        # placement (``_normalize_cute_pdl``).
+        canonical = {**config.config}
+        if canonical.get("cute_pdl") is True:
+            canonical.setdefault("cute_pdl_release", "auto")
+        return SimpleNamespace(
+            config=helion.Config(**canonical), perfs=[], perf=float("inf"), fn=None
+        )
+
+    def benchmark_population(members, **_: object) -> None:
+        for member in members:
+            member.perfs.append(twin_perf)
+            member.perf = twin_perf
+            member.fn = twin_fn
+
+    twin_fn = object() if twin_fn is None else twin_fn
+
+    search.make_unbenchmarked = make_unbenchmarked
+    search.benchmark_population = Mock(side_effect=benchmark_population)
+    return search
+
+
+def test_a_followed_kernel_times_the_releasing_twin_of_its_fastest_finalist() -> None:
+    # The finalists of a followed kernel all leave cute_pdl off (the search's
+    # region): the twin of the fastest is compiled, timed and added, so the
+    # preference band can take it; a twin the search timed already joins as
+    # timed, a twin that is a finalist comes back as that finalist (the screen
+    # keeps it), and a backend without the knob adds nothing.
+    fastest = _member(0.002464, block_sizes=[32], num_threads=[8, 16])
+    other = _member(0.002496, block_sizes=[64], num_threads=[8, 16])
+    twin_config = helion.Config(block_sizes=[32], num_threads=[8, 16], cute_pdl=True)
+    canonical = helion.Config(
+        block_sizes=[32], num_threads=[8, 16], cute_pdl=True, cute_pdl_release="auto"
+    )
+    with patch.object(CuteBackend, "releasing_twin", return_value=twin_config):
+        search = _twin_search([fastest, other], 0.002496)
+        (twin,) = search._releasing_twins([fastest, other], {})
+        assert twin.config == canonical and twin.perf == 0.002496
+        search.benchmark_population.assert_called_once()
+        # The search timed that twin already, as its canonical form (the
+        # comparison is made after canonicalizing): it joins the finalists as
+        # the search timed it, and a finalist that is it comes back as that
+        # finalist, which the caller does not add again; neither is timed
+        # again.
+        timed = _member(0.002528, **canonical.config)
+        for known, finalists in (
+            ({canonical: timed}, [fastest, other]),
+            ({}, [fastest, other, timed]),
+        ):
+            search = _twin_search(finalists, 0.002496)
+            (returned,) = search._releasing_twins(finalists, known)
+            assert returned is timed
+            search.benchmark_population.assert_not_called()
+    with patch.object(CuteBackend, "releasing_twin", return_value=None):
+        search = _twin_search([fastest, other], 0.002496)
+        assert search._releasing_twins([fastest, other], {}) == []
+
+
+@skipUnlessBackends(["cute"])
+def test_a_pinned_seed_cannot_undo_a_followed_kernels_release() -> None:
+    # The fastest finalist is a pinned seed without the release, its twin one
+    # tick behind: a followed kernel takes the twin (the pinned rule first,
+    # the preference last); any other kernel keeps the pinned seed.
+    seed = _member(0.005184, _OFF, block_sizes=[64])
+    twin = _member(0.005216, _ENTRY, block_sizes=[64], cute_pdl=True)
+    live = [seed, twin]
+    for followed, chosen in ((True, twin), (False, seed)):
+        search = _search("cute", live)
+        search._followed_in_sequence = followed
+        search._final_rebenchmark_pinned_tolerance = lambda: 0.0
+        assert search._select_finalist(live, {seed.config}) is chosen, followed
+
+
+def test_a_twin_that_is_a_finalists_kernel_adds_nothing() -> None:
+    # The twin's code is a finalist's (the knob changed nothing it renders):
+    # the benchmark settles it as that finalist's kernel, and it is dropped
+    # instead of timing that kernel twice.
+    fastest = _member(0.002464, block_sizes=[32], num_threads=[8, 16])
+    other = _member(0.002496, block_sizes=[64], num_threads=[8, 16])
+    twin_config = helion.Config(block_sizes=[32], num_threads=[8, 16], cute_pdl=True)
+    with patch.object(CuteBackend, "releasing_twin", return_value=twin_config):
+        search = _twin_search([fastest, other], 0.002464, twin_fn=fastest.fn)
+        assert search._releasing_twins([fastest, other], {}) == []
+        search.benchmark_population.assert_called_once()
+
+
+@skipUnlessBackends(["cute"])
+def test_a_pinned_seed_keeps_the_band_measured_from_the_fastest() -> None:
+    # A pinned seed 0.6% behind the fastest finalist wins its tie under a 1%
+    # pinned tolerance; with the preference tolerance set to 0, a releasing
+    # config between the two (behind the fastest) is not taken: the band is
+    # measured from the fastest, not from the seed.
+    fastest = _member(0.005184, _OFF, block_sizes=[64])
+    seed = _member(0.005216, _OFF, block_sizes=[48])
+    releasing = _member(0.005200, _ENTRY, block_sizes=[32], cute_pdl=True)
+    live = [fastest, seed, releasing]
+    with patch.dict("os.environ", {_ENV: "0"}):
+        search = _search("cute", live)
+        search._followed_in_sequence = True
+        search._final_rebenchmark_pinned_tolerance = lambda: 0.01
+        assert search._select_finalist(live, {seed.config}) is seed
+    # A tolerance of 0 turns the preference off: a releasing fastest finalist
+    # does not take the tie back from the pinned seed (the band, measured from
+    # it, would hold it).
+    fastest = _member(0.005184, _ENTRY, block_sizes=[64], cute_pdl=True)
+    live = [fastest, seed]
+    with patch.dict("os.environ", {_ENV: "0"}):
+        search = _search("cute", live)
+        search._followed_in_sequence = True
+        search._final_rebenchmark_pinned_tolerance = lambda: 0.01
+        assert search._select_finalist(live, {seed.config}) is seed
+
+
+def test_the_budget_counts_a_twin_only_where_one_can_exist() -> None:
+    # The rounds keep the pinned seed and the incumbent outside the top_k; a
+    # followed kernel whose backend can name a releasing twin for its spec
+    # keeps its twin too, and only it budgets for one more finalist.
+    policy = FinalSelectionConfig(top_k=4, family_finalists=0)
+    assert policy.finalists(9) == 6
+    assert policy.finalists(9, twins=1) == 7
+    assert policy.estimated_seconds(9, twins=1) > policy.estimated_seconds(9)
+    for backend, followed, names, twins in (
+        ("cute", True, True, 1),
+        ("cute", True, False, 0),
+        ("cute", False, True, 0),
+        ("triton", True, True, 0),
+    ):
+        search = _search(backend)
+        search._followed_in_sequence = followed
+        search.config_spec = SimpleNamespace()
+        with patch.object(CuteBackend, "names_releasing_twins", return_value=names):
+            assert search._twin_survivors() == twins, (backend, followed, names)

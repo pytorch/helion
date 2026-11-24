@@ -54,6 +54,7 @@ from .accuracy import keyable_accuracy_check
 from .benchmark_prelude import BenchmarkPrelude
 from .benchmark_prelude import PreludeSearchFailed
 from .benchmark_prelude import active_prelude
+from .benchmark_prelude import is_followed_in_sequence
 from .benchmark_provider import _COMPILER_SEED_TIMEOUT_RETRY_LIMIT
 from .benchmark_provider import BenchmarkProvider
 from .benchmark_provider import BenchmarkResult
@@ -70,6 +71,7 @@ from .benchmarking import _BENCHMARK_CUDAGRAPH_ENV
 from .benchmarking import _FINAL_L2_FLUSH_ENV
 from .benchmarking import _L2_FLUSH_ENV
 from .benchmarking import _TARGET_REGIME_ENV
+from .benchmarking import KERNEL_TRACE_TICK_US
 from .benchmarking import MirroredBenchmarkTrace
 from .benchmarking import _mirrored_bench_call_layout
 from .benchmarking import _resolve_l2_flush_mode
@@ -202,7 +204,17 @@ _FINAL_REBENCHMARK_MAX_SPREAD_DEFAULT = 1.5
 _FINAL_SELECTION_PREFERENCE_TOLERANCE_ENV = (
     "HELION_AUTOTUNE_FINAL_SELECTION_PREFERENCE_TOLERANCE"
 )
+# For a kernel another kernel of its sequence runs right behind
+# (``benchmark_prelude.followed_in_sequence``), the band is at least
+# ``_FOLLOWED_RELEASE_BAND_TICKS`` ticks of the trace clock
+# (``_followed_band``): the release costs the kernel one or two ticks of its
+# own reading and saves its successor 0.3-2 us of launch gap (a median 0.37
+# us over the 51 G02 train points whose second kernel launches as a
+# dependent).  At 1.5 ticks the twin of sum_00305945ce46_fb7c5a2a's first
+# kernel (2 ticks behind, GB300) stayed out and the graph read 4.16 us
+# against 3.42-3.44 with it.
 _FINAL_SELECTION_PREFERENCE_TOLERANCE_DEFAULT = 0.005
+_FOLLOWED_RELEASE_BAND_TICKS = 3.0
 _REBENCHMARK_TARGET_MS_DEFAULT = 200.0
 _REBENCHMARK_INTERLEAVED_REPEAT_MAX = 20_000
 # The only env override of the harness-grade final selection (full effort):
@@ -504,6 +516,11 @@ class BaseSearch(BaseAutotuner):
     # a search takes every reading in its benchmark worker, as one that
     # reads its candidates from the trace does.
     _benchmark_prelude: BenchmarkPrelude | None = None
+    # Whether another kernel of the sequence runs right behind this search's
+    # kernel (``benchmark_prelude.followed_in_sequence``), read when the
+    # search is made: its final selection breaks ties by the backend's
+    # preference down to the trace clock's resolution.
+    _followed_in_sequence: bool = False
     # The config the search timed the returned kernel under, where it returns
     # a simpler config of that kernel (``_simplified_selected_config``): the
     # trace's trial rows are keyed by this one.
@@ -534,6 +551,7 @@ class BaseSearch(BaseAutotuner):
         self.settings: Settings = kernel.settings
         self._input_bank_count = self.settings.autotune_benchmark_input_banks
         self._benchmark_prelude = active_prelude()
+        self._followed_in_sequence = is_followed_in_sequence()
         if isinstance(self.settings.autotune_config_overrides, StructuralConfig):
             raise StructuralPolicyError(
                 "Policy-bearing autotune overrides must be supplied before "
@@ -2268,15 +2286,27 @@ class PopulationBasedSearch(BaseSearch):
     def _final_selection_shortlist_estimate(self) -> int:
         """Longest shortlist ``final_rebenchmark_best`` can hand the selection:
         the retained ``top_k``, the pinned seeds, the incumbent (appended
-        when a later phase re-timed it above the shortlist's numbers) and
-        the family quota's representatives where the spec names family
-        knobs."""
+        when a later phase re-timed it above the shortlist's numbers), a
+        followed kernel's releasing twin (``_twin_survivors``) and the
+        family quota's representatives where the spec names family knobs."""
         return (
             self._final_rebenchmark_top_k()
             + len(self._pinned_finalist_configs)
             + 1
+            + self._twin_survivors()
             + self._final_selection_sizing_policy().family_finalists
         )
+
+    def _twin_survivors(self) -> int:
+        """1 for a followed kernel whose backend can name a releasing twin
+        for its spec (``Backend.names_releasing_twins``), else 0: the
+        finalist ``_releasing_twins`` may add and the rounds keep."""
+        from .._compiler.backend_registry import get_backend_class
+
+        if not self._followed_in_sequence:
+            return 0
+        backend = get_backend_class(self.settings.backend)
+        return int(backend.names_releasing_twins(self.config_spec))
 
     def _final_selection_family_keys(self) -> tuple[str, ...]:
         """The config knobs whose values pick a distinct kernel body
@@ -2320,7 +2350,10 @@ class PopulationBasedSearch(BaseSearch):
             return 0.0
         policy = self._final_selection_sizing_policy()
         return min(
-            policy.estimated_seconds(self._final_selection_shortlist_estimate()),
+            policy.estimated_seconds(
+                self._final_selection_shortlist_estimate(),
+                twins=self._twin_survivors(),
+            ),
             _FINAL_SELECTION_RESERVE_FRACTION * budget,
         )
 
@@ -2328,7 +2361,9 @@ class PopulationBasedSearch(BaseSearch):
         if not self._final_selection_enabled():
             return 0.0
         smallest = self._final_selection_sizing_policy().budget_ladder()[-1]
-        return smallest.estimated_seconds(self._final_selection_shortlist_estimate())
+        return smallest.estimated_seconds(
+            self._final_selection_shortlist_estimate(), twins=self._twin_survivors()
+        )
 
     def _final_selection_plan(self, shortlist: int) -> FinalSelectionConfig | None:
         """The policy sized to the budget left when the phase starts.
@@ -2342,9 +2377,12 @@ class PopulationBasedSearch(BaseSearch):
         if budget is not None and self._autotune_budget_start is not None:
             remaining = budget - (time.perf_counter() - self._autotune_budget_start)
             sizing = self._final_selection_sizing_policy()
-            plan = sizing.fit_to_seconds(remaining, shortlist)
+            twins = self._twin_survivors()
+            plan = sizing.fit_to_seconds(remaining, shortlist, twins=twins)
             if plan is None:
-                smallest = sizing.budget_ladder()[-1].estimated_seconds(shortlist)
+                smallest = sizing.budget_ladder()[-1].estimated_seconds(
+                    shortlist, twins=twins
+                )
                 self.log(
                     f"Final selection skipped: {remaining:.0f}s of the "
                     f"{budget}s budget remain, less than the {smallest:.0f}s of "
@@ -2354,7 +2392,8 @@ class PopulationBasedSearch(BaseSearch):
             elif plan != sizing:
                 self.log(
                     f"Final selection sized to the {remaining:.0f}s left of the "
-                    f"{budget}s budget: up to {plan.finalists(shortlist)} finalists x "
+                    f"{budget}s budget: up to "
+                    f"{plan.finalists(shortlist, twins=twins)} finalists x "
                     f"{plan.rounds} rounds"
                     + (", no screen" if sizing.screens(shortlist) else "")
                     + (
@@ -4133,17 +4172,39 @@ class PopulationBasedSearch(BaseSearch):
             _FINAL_SELECTION_PREFERENCE_TOLERANCE_DEFAULT,
         )
 
-    def _tolerance_from_env(self, name: str, default: float) -> float:
+    @staticmethod
+    def _followed_band(member: PopulationMember) -> float:
+        """The share of ``member``'s reading that
+        ``_FOLLOWED_RELEASE_BAND_TICKS`` ticks of the trace clock make, the
+        reading taken as milliseconds (0 for a reading that is not finite and
+        positive)."""
+        if not math.isfinite(member.perf) or member.perf <= 0:
+            return 0.0
+        return (
+            _FOLLOWED_RELEASE_BAND_TICKS * KERNEL_TRACE_TICK_US / (member.perf * 1000.0)
+        )
+
+    @staticmethod
+    def _env_tolerance(name: str) -> float | None:
+        """The tolerance ``name`` holds (a finite float of at least 0), None
+        when it is unset or invalid."""
         raw = os.getenv(name)
-        if raw is None:
-            return default
         try:
-            tolerance = float(raw)
+            tolerance = float(raw) if raw is not None else math.nan
         except ValueError:
-            self.log.warning(f"Ignoring invalid {name}={raw!r}; using {default}.")
-            return default
-        if not math.isfinite(tolerance) or tolerance < 0:
-            self.log.warning(f"Ignoring invalid {name}={raw!r}; using {default}.")
+            return None
+        return tolerance if math.isfinite(tolerance) and tolerance >= 0 else None
+
+    def _tolerance_env_is_set(self, name: str) -> bool:
+        """Whether ``name`` holds a tolerance _tolerance_from_env() takes,
+        not only whether it is set."""
+        return self._env_tolerance(name) is not None
+
+    def _tolerance_from_env(self, name: str, default: float) -> float:
+        tolerance = self._env_tolerance(name)
+        if tolerance is None:
+            if (raw := os.getenv(name)) is not None:
+                self.log.warning(f"Ignoring invalid {name}={raw!r}; using {default}.")
             return default
         return tolerance
 
@@ -4195,8 +4256,70 @@ class PopulationBasedSearch(BaseSearch):
             )
         return kept
 
+    def _releasing_twins(
+        self,
+        finalists: Sequence[PopulationMember],
+        known: Mapping[Config, PopulationMember],
+    ) -> list[PopulationMember]:
+        """The releasing twin of the fastest finalist (``Backend.releasing_twin``),
+        timed, for a kernel another kernel of its sequence runs right behind
+        (``_followed_in_sequence``), when the search did not time it already.
+
+        The preference band of such a kernel
+        (``_prefer_backend_preference_within_tolerance``) takes a releasing
+        finalist within ``_FOLLOWED_RELEASE_BAND_TICKS`` ticks of the trace
+        clock of the fastest, but only a finalist: a search that ends in a
+        region of non-releasing configs returns one of them, and the kernel
+        behind it launches late.  The twin is compared with the finalists and
+        the search's timed configs in its canonical form (the search fills
+        every field: a knob-on config keeps its placement): a twin that is a
+        finalist already is returned as that finalist (the caller adds only
+        new members, and the screen keeps the twin either way), and one the
+        search timed joins the finalists without being timed again.  In
+        better-benchmark's sum_00305945ce46_fb7c5a2a (a [128, 4096] bf16
+        kernel ahead of a second one, GB300) the search's finalists sat at
+        2.46-2.53 us, none releasing; the graph read 4.16 us with the fastest
+        of them and 3.42-3.44 us with its releasing twin (3.49 with the config
+        an earlier search had chosen).  One more config to compile and time.
+        """
+        from .._compiler.backend_registry import get_backend_class
+
+        live = [member for member in finalists if math.isfinite(member.perf)]
+        if not live:
+            return []
+        fastest = min(live, key=self._finalist_history_perf)
+        twin = get_backend_class(self.settings.backend).releasing_twin(
+            fastest.config, self.config_spec
+        )
+        if twin is None:
+            return []
+        member = self.make_unbenchmarked(self.config_gen.flatten(twin))
+        if member is None:
+            return []
+        for other in finalists:
+            if _config_key(other.config) == _config_key(member.config):
+                return [other] if math.isfinite(other.perf) else []
+        timed = known.get(member.config)
+        if timed is None:
+            self.benchmark_population(
+                [member], desc="Releasing twin", raise_if_no_viable_config=False
+            )
+            timed = member
+        # A twin whose kernel a finalist holds already (a source alias: the
+        # knob changed nothing in its code) would time that kernel twice.
+        if (
+            not timed.perfs
+            or not math.isfinite(timed.perf)
+            or any(other.fn is timed.fn for other in finalists)
+        ):
+            return []
+        return [timed]
+
     def _prefer_backend_preference_within_tolerance(
-        self, after: PopulationMember, live: Sequence[PopulationMember]
+        self,
+        after: PopulationMember,
+        live: Sequence[PopulationMember],
+        reference: PopulationMember | None = None,
     ) -> PopulationMember:
         """Among the live finalists within the preference tolerance of the
         fastest one, the config the backend ranks first wins
@@ -4240,11 +4363,42 @@ class PopulationBasedSearch(BaseSearch):
         best_rank = preference(after)
         if best_rank == 0:
             return after
+        # The band is measured from ``reference`` (the fastest finalist,
+        # which ``after`` is unless a pinned seed took the tie first,
+        # ``_select_finalist``); a preferred config must rank ahead of after.
+        reference = after if reference is None else reference
         tolerance = self._final_selection_preference_tolerance()
+        followed_band = self._followed_in_sequence and not self._tolerance_env_is_set(
+            _FINAL_SELECTION_PREFERENCE_TOLERANCE_ENV
+        )
+        if followed_band and math.isfinite(reference.perf) and reference.perf > 0:
+            # A kernel that another kernel of its sequence runs right behind
+            # pays for a release it lacks in its successor's launch, which
+            # its own timing cannot see: alone, the releasing twin of a
+            # config reads one tick of the trace clock (32 ns) slower, so
+            # the 0.5% band misses it on every kernel under 6.4 us, while
+            # the successor launches 0.3-2 us earlier behind it.  In
+            # better-benchmark's sum_8a2f10cdd825_c5bb71a2 (a where with a
+            # store and a sum over r, then the sum of its partials, GB300)
+            # the graph read 13.13 us with the first kernel releasing
+            # (13.31 us of kernels) and 14.34-14.57 us without it (12.59-
+            # 12.67 us of kernels).  Within _FOLLOWED_RELEASE_BAND_TICKS
+            # ticks of the trace clock, the preference decides, over the
+            # backend's whole ranking: on CuTe the release, its spread pad and
+            # the store policy, each a cost or saving that only the kernels
+            # around this one see.
+            # An explicit HELION_AUTOTUNE_FINAL_SELECTION_PREFERENCE_TOLERANCE
+            # (0 turns the preference off) stands as given; an invalid one is
+            # ignored, as _tolerance_from_env() logs.
+            tolerance = max(tolerance, self._followed_band(reference))
+        if tolerance <= 0:
+            # Off, also where the band would hold the reference itself: a
+            # pinned seed that took the tie (``after``) keeps it.
+            return after
         band = [
             member
             for member in live
-            if member is not after and member.perf <= after.perf * (1.0 + tolerance)
+            if member is not after and member.perf <= reference.perf * (1.0 + tolerance)
         ]
         preferred = [member for member in band if preference(member) < best_rank]
         if not preferred:
@@ -4254,7 +4408,7 @@ class PopulationBasedSearch(BaseSearch):
             "Final selection preferred a config the backend ranks ahead within "
             f"{tolerance:.2%} of the fastest finalist: "
             f"{self.format_performance(chosen.perf)} vs "
-            f"{self.format_performance(after.perf)}"
+            f"{self.format_performance(reference.perf)}"
         )
         return chosen
 
@@ -4413,13 +4567,22 @@ class PopulationBasedSearch(BaseSearch):
                     policy=self.final_selection,
                 )
             )
-        if len(finalists) < 2:
+        # The search's own pick, before a releasing twin joins.
+        before = min(finalists, key=performance, default=None)
+        twins = (
+            self._releasing_twins(finalists, by_config)
+            if self._followed_in_sequence
+            else []
+        )
+        finalists.extend(
+            twin for twin in twins if not any(twin is other for other in finalists)
+        )
+        if len(finalists) < 2 or before is None:
             live_finalists = [
                 member for member in finalists if math.isfinite(member.perf)
             ]
             return min(live_finalists, key=performance, default=fallback)
 
-        before = min(finalists, key=performance)
         if use_final_selection:
             self._warn_ignored_final_rebenchmark_envs()
             plan = self._final_selection_plan(len(finalists))
@@ -4430,6 +4593,7 @@ class PopulationBasedSearch(BaseSearch):
                 pinned_configs,
                 before if incumbent is None else incumbent,
                 plan,
+                twins=twins,
             )
         else:
             # Finalists have already survived the normal benchmark path. Time
@@ -4442,7 +4606,7 @@ class PopulationBasedSearch(BaseSearch):
             use_isolated = self._final_rebenchmark_use_isolated()
             finalists = self._within_final_rebenchmark_spread(
                 finalists,
-                [*pinned, *([incumbent] if incumbent is not None else [])],
+                [*pinned, *([incumbent] if incumbent is not None else []), *twins],
             )
             if len(finalists) < 2:
                 live_finalists = [
@@ -4463,13 +4627,7 @@ class PopulationBasedSearch(BaseSearch):
             ]
             if not live_finalists:
                 raise exc.NoConfigFound
-            after = self._prefer_pinned_within_tolerance(
-                self._prefer_backend_preference_within_tolerance(
-                    min(live_finalists, key=performance), live_finalists
-                ),
-                live_finalists,
-                pinned_configs,
-            )
+            after = self._select_finalist(live_finalists, pinned_configs)
         if _config_key(after.config) != _config_key(before.config):
             self.log(
                 "Final verification selected a different config: "
@@ -4530,6 +4688,33 @@ class PopulationBasedSearch(BaseSearch):
                 f"{self.format_performance(best)}: " + "; ".join(notes)
             )
         return admitted
+
+    def _select_finalist(
+        self, live: Sequence[PopulationMember], pinned_configs: MutableSet[Config]
+    ) -> PopulationMember:
+        """The fastest of ``live`` after the two tie rules, the backend's
+        preference (``_prefer_backend_preference_within_tolerance``) and the
+        pinned seed's (``_prefer_pinned_within_tolerance``).  A followed
+        kernel takes the pinned seed's first and the preference last, its
+        band still measured from the fastest, so a pinned seed that is the
+        fastest finalist cannot undo the release of its twin
+        (``_releasing_twins``); every other kernel keeps the preference
+        first.  (Under a warm ranking regime, set by environment, the cold
+        tiebreak column, ``_break_tie_by_second_column``, can still pick the
+        seed back: the twin's cold reading cannot see its successor's gain
+        either.)"""
+        fastest = min(live, key=performance)
+        if self._followed_in_sequence:
+            return self._prefer_backend_preference_within_tolerance(
+                self._prefer_pinned_within_tolerance(fastest, live, pinned_configs),
+                live,
+                reference=fastest,
+            )
+        return self._prefer_pinned_within_tolerance(
+            self._prefer_backend_preference_within_tolerance(fastest, live),
+            live,
+            pinned_configs,
+        )
 
     def _prefer_pinned_within_tolerance(
         self,
@@ -4723,12 +4908,14 @@ class PopulationBasedSearch(BaseSearch):
         pinned_configs: MutableSet[Config],
         incumbent: PopulationMember,
         policy: FinalSelectionConfig,
+        twins: Sequence[PopulationMember] = (),
     ) -> PopulationMember:
         """Pick the returned config with interleaved harness-grade windows.
 
         The shortlist is screened once in the sustained clock regime (when it
         is long enough to be worth it), the best ``top_k`` survivors plus the
-        best pinned seed and the ``incumbent`` then run ``rounds`` rounds of
+        best pinned seed, the ``incumbent`` and the releasing ``twins``
+        (``_releasing_twins``) then run ``rounds`` rounds of
         steady windows whose order alternates every round, and the median
         across rounds decides (see ``FinalSelectionConfig``). When the
         selection's L2 regime calls for a second one
@@ -4974,6 +5161,12 @@ class PopulationBasedSearch(BaseSearch):
                 incumbent_index = finalists.index(incumbent)
                 if incumbent_index in alive and incumbent_index not in survivors:
                     survivors.append(incumbent_index)
+                # So does a releasing twin (``_releasing_twins``): it is there
+                # for the preference band, which reads it in the rounds.
+                for twin in twins:
+                    twin_index = finalists.index(twin)
+                    if twin_index in alive and twin_index not in survivors:
+                        survivors.append(twin_index)
                 # The family quota: the best-ranked config of a body the cut
                 # dropped runs the rounds too (the screen is one window, the
                 # rounds a median of four at the sustained clock). The seed
@@ -5172,13 +5365,7 @@ class PopulationBasedSearch(BaseSearch):
         if not live:
             log_selection(None)
             raise exc.NoConfigFound
-        after = self._prefer_pinned_within_tolerance(
-            self._prefer_backend_preference_within_tolerance(
-                min(live, key=performance), live
-            ),
-            live,
-            pinned_configs,
-        )
+        after = self._select_finalist(live, pinned_configs)
 
         # Group eligibility was proved before timing. Keep that invariant
         # explicit when consuming its authoritative second-regime results.
@@ -5207,13 +5394,7 @@ class PopulationBasedSearch(BaseSearch):
                 )
                 live_second = [member for member in timed if math.isfinite(member.perf)]
                 if live_second:
-                    after = self._prefer_pinned_within_tolerance(
-                        self._prefer_backend_preference_within_tolerance(
-                            min(live_second, key=performance), live_second
-                        ),
-                        live_second,
-                        pinned_configs,
-                    )
+                    after = self._select_finalist(live_second, pinned_configs)
                     selected_by = second_regime
             if selected_by != second_regime:
                 self.log.warning(

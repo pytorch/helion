@@ -75,6 +75,7 @@ from .math_templates import SIGMOID_TEMPLATE
 from .math_templates import argreduce_candidate_expr
 from .math_templates import nan_extremum_expr
 from .packet_flush_names import streaming_store_rendered
+from .pdl_release import CUTE_PDL_RELEASE_DEFAULT
 from .pdl_release import ZERO_FILL_KERNEL_PREFIX
 from .pdl_release import generic_release_rendered
 from .pdl_release import spread_rendered
@@ -1461,6 +1462,34 @@ class CuteBackend(Backend):
     """
 
     _pre_inductor_squeeze = True
+
+    @classmethod
+    def names_releasing_twins(cls, config_spec: ConfigSpec) -> bool:
+        """Where the search flips ``cute_pdl`` (``pdl_searched``)."""
+        from .autotune.flash_surface import pdl_searched
+
+        return pdl_searched(config_spec)
+
+    @classmethod
+    def releasing_twin(cls, config: Config, config_spec: ConfigSpec) -> Config | None:
+        """``config`` with ``cute_pdl`` on, where the search flips the knob
+        (``pdl_searched``) and ``config`` leaves it off, at the release
+        placement ``auto`` (``CUTE_PDL_RELEASE_DEFAULT``; an inert placement
+        the knob-off config names, such as ``none``, would release nothing),
+        which releases a kernel without its own wait and release at entry or
+        from its last wave (``finalist_preference`` reads which off the
+        rendered module)."""
+        if config.config.get("cute_pdl") is True or not cls.names_releasing_twins(
+            config_spec
+        ):
+            return None
+        return type(config).from_dict(
+            {
+                **config.config,
+                "cute_pdl": True,
+                "cute_pdl_release": CUTE_PDL_RELEASE_DEFAULT,
+            }
+        )
 
     @classmethod
     def finalist_preference(cls, config: Config, source: Callable[[], str]) -> int:

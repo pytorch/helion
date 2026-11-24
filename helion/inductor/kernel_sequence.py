@@ -47,6 +47,7 @@ from ..autotuner.benchmark_prelude import KernelSequence
 from ..autotuner.benchmark_prelude import PreludeRefused
 from ..autotuner.benchmark_prelude import PreludeSearchFailed
 from ..autotuner.benchmark_prelude import PreludeUnsupported
+from ..autotuner.benchmark_prelude import followed_in_sequence
 from ..autotuner.benchmark_prelude import timed_behind
 from ..autotuner.benchmark_provider import benchmark_prelude_unsupported
 from ..runtime.ref_mode import is_ref_mode_enabled
@@ -145,8 +146,13 @@ class GraphKernels:
                 prelude = sequence.prelude(call_args)
         # The prelude holds what it needs of the call before.
         del last
+        # A kernel that a later kernel's first call is timed behind has a
+        # successor in the graph, whose launch the kernel's release of its
+        # dependents brings forward (followed_in_sequence).
+        wanted = name in self.wanted
+        followed = followed_in_sequence(wanted)
         try:
-            with timed_behind(prelude):
+            with timed_behind(prelude), followed:
                 output = kernel(*args)
         except (PreludeRefused, PreludeSearchFailed) as error:
             # The search could not time behind the call before: the provider
@@ -161,18 +167,15 @@ class GraphKernels:
                 type(error).__name__,
                 error,
             )
-            output = kernel(*args)
+            with followed_in_sequence(wanted):
+                output = kernel(*args)
         self.launched += 1
         # This call is kept for a prelude only while a kernel may still be
         # timed behind it: not when no kernel names it, every kernel has run,
         # or the last one the module defines has. (A kernel that skipped the
         # first run, one in a branch not taken, is tuned alone when it first
         # runs, not behind a call of an earlier run.)
-        if (
-            name in self.wanted
-            and self.launched < self.registered
-            and index < self.registered - 1
-        ):
+        if wanted and self.launched < self.registered and index < self.registered - 1:
             compiled = bound.compile_config(allow_print=False)
             self.last = (name, compiled, tuple(call_args), output)
         return output

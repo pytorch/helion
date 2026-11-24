@@ -22,6 +22,7 @@ from torch._inductor.codegen.wrapper import CommentLine
 from helion.autotuner.benchmark_prelude import PreludeRefused
 from helion.autotuner.benchmark_prelude import PreludeSearchFailed
 from helion.autotuner.benchmark_prelude import active_prelude
+from helion.autotuner.benchmark_prelude import is_followed_in_sequence
 from helion.inductor import kernel_sequence
 from helion.inductor.codegen.scheduling import HelionScheduling
 from helion.inductor.codegen.sequence import module_key
@@ -58,7 +59,8 @@ def timers_take_a_prelude(monkeypatch: pytest.MonkeyPatch) -> None:
 
 class _Kernel:
     """A stand-in for a Helion kernel: its calls note the prelude they are
-    timed behind, and its compiled function is ``fn``."""
+    timed behind and whether a later kernel follows them, and its compiled
+    function is ``fn``."""
 
     def __init__(
         self,
@@ -70,6 +72,7 @@ class _Kernel:
         self.autotuner_fn = autotuner_fn
         self.ref_mode = ref_mode
         self.preludes: list[object] = []
+        self.followed: list[bool] = []
         self.name = getattr(fn, "__name__", "kernel")
 
     def normalize_args(self, *args: object) -> tuple[object, ...]:
@@ -77,6 +80,7 @@ class _Kernel:
 
     def __call__(self, *args: object) -> object:
         self.preludes.append(active_prelude())
+        self.followed.append(is_followed_in_sequence())
         return self.fn(*args)  # pyrefly: ignore [not-callable]
 
     def bind(self, args: tuple[object, ...]) -> SimpleNamespace:
@@ -112,6 +116,12 @@ def test_a_first_call_is_timed_behind_the_call_before() -> None:
     module["second"](buffer, out)  # pyrefly: ignore [not-callable]
     assert torch.equal(out, torch.full([4], 6.0))
     assert first.kernel.preludes == [None]  # pyrefly: ignore [missing-attribute]
+    # The first kernel's search knows a kernel runs right behind it (its
+    # final selection prefers a release of its dependents); the last's does
+    # not, and neither does a search outside the sequence.
+    assert first.kernel.followed == [True]  # pyrefly: ignore [missing-attribute]
+    assert second.kernel.followed == [False]  # pyrefly: ignore [missing-attribute]
+    assert not is_followed_in_sequence()
     (prelude,) = second.kernel.preludes  # pyrefly: ignore [missing-attribute]
     (step,) = prelude.steps
     # The buffer the first call filled is the one the second reads.

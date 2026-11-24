@@ -669,6 +669,27 @@ class TestFinalSelection(TestCase):
             self.assertEqual(row["incumbent"], member is incumbent)
             self.assertFalse(row["screen_family_quota"])
 
+    def test_screen_keeps_a_releasing_twin_already_in_the_shortlist(self) -> None:
+        # A followed kernel's releasing twin that the search had shortlisted
+        # already (``_releasing_twins`` returns that finalist) ranks ninth at
+        # the screen, outside the top four: it still runs the rounds, where the
+        # preference band reads it; the tenth does not.
+        members = [_member(16 * (i + 1), 1.0 + 0.01 * i) for i in range(12)]
+        twin = members[8]
+        truth = {id(member): 1.0 + 0.01 * i for i, member in enumerate(members)}
+        policy = FinalSelectionConfig(
+            top_k=4, rounds=2, screen_rep_ms=200, screen_warmup_ms=50
+        )
+        search = _make_search(members, policy=policy)
+        measurer = _FakeMeasurer(lambda member, window: truth[id(member)])
+        with patch.object(search, "_final_selection_measurer", new=measurer):
+            search._run_final_selection(
+                members, set(), members[0], policy, twins=[twin]
+            )
+        rounds = measurer.measured()[len(members) :]
+        self.assertIn(twin, rounds)
+        self.assertNotIn(members[9], rounds)
+
     def test_screen_records_preserve_dropped_readings_and_failure_stage(self) -> None:
         members = [_member(16 * (i + 1), 0.5 + i) for i in range(8)]
         policy = FinalSelectionConfig(

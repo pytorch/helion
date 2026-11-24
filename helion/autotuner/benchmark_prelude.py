@@ -560,3 +560,28 @@ def timed_behind(prelude: BenchmarkPrelude | None) -> Iterator[None]:
 def active_prelude() -> BenchmarkPrelude | None:
     """The prelude of the enclosing ``timed_behind`` block, None outside."""
     return _active.get()
+
+
+_followed: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "helion_followed_in_sequence", default=False
+)
+
+
+@contextlib.contextmanager
+def followed_in_sequence(followed: bool = True) -> Iterator[None]:
+    """Mark the searches started inside the block as those of a kernel that
+    another kernel of its sequence runs right behind (``KernelSequence``'s
+    harnesses know it), whose final selection then lets the backend's
+    preference break ties down to the trace clock's resolution
+    (``PopulationBasedSearch._prefer_backend_preference_within_tolerance``)."""
+    token = _followed.set(followed)
+    try:
+        yield
+    finally:
+        _followed.reset(token)
+
+
+def is_followed_in_sequence() -> bool:
+    """Whether the enclosing ``followed_in_sequence`` block marks its
+    searches, False outside."""
+    return _followed.get()
