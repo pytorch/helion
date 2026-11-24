@@ -4422,6 +4422,7 @@ class TestHeuristicRegistry(TestCase):
                 "triton_h100_formula_matmul",
                 "triton_h100_multi_matmul",
                 "triton_skinny_gemm",
+                "triton_b200_packed_mxfp8",
                 "triton_b200_formula_matmul",
                 "triton_b200_multi_matmul",
                 "triton_matmul_reduction_epilogue",

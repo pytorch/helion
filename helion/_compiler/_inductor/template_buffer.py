@@ -151,11 +151,11 @@ def inductor_call_facts(
     of the binding's dispatch guards, nor the traced strides of its inputs in
     ``symbolic_strides``.  Tuning a config for the graph sees them too, so it
     times the code the render emits and keeps no config the render would
-    refuse.  A backend whose code reads none of these facts
-    (``Backend.binds_inductor_call_facts``) renders under the binding's own."""
+    refuse.  A binding whose code reads none of these facts
+    (``BoundKernel.reads_inductor_call_facts``) renders under its own."""
     env = bound_kernel.env
     assert symbolic_input_layouts or not symbolic_strides
-    if not env.backend.binds_inductor_call_facts:
+    if not bound_kernel.reads_inductor_call_facts:
         yield
         return
     with (
@@ -459,12 +459,11 @@ class HelionTemplateBuffer(TemplateBuffer):
     def _tunes_on_own_binding(self) -> bool:
         """Whether the lowering tunes through a binding of its own
         (``_tuning_kernel``): its binding is the kernel's cached one, which
-        also serves eager calls, and the backend's code reads facts the
-        render's calls may not hold (``Backend.binds_inductor_call_facts``).
-        Another backend tunes the cached binding itself, for the render and
-        eager calls alike."""
+        also serves eager calls, and its code reads facts the render's calls
+        may not hold (``BoundKernel.reads_inductor_call_facts``).  Another
+        binding is tuned itself, for the render and eager calls alike."""
         bk = self._bound_kernel
-        return bk._cache_managed and bk.env.backend.binds_inductor_call_facts
+        return bk._cache_managed and bk.reads_inductor_call_facts
 
     def _tuning_kernel(self) -> BoundKernel:
         """The bound kernel the lowering tunes on, under ``_call_facts``.
@@ -475,7 +474,7 @@ class HelionTemplateBuffer(TemplateBuffer):
         kernel's cache also serves eager calls: they would run code compiled
         under the render's facts, which are weaker than theirs, and the tuner
         would time code an eager call compiled there instead of the render's.
-        So where the backend's code reads those facts, a cached binding tunes
+        So where the binding's code reads those facts, a cached binding tunes
         through a binding of its own (``_tunes_on_own_binding``)."""
         bk = self._bound_kernel
         if not self._tunes_on_own_binding():
@@ -506,10 +505,10 @@ class HelionTemplateBuffer(TemplateBuffer):
         # A config tuned under the render's facts is cached by them, on disk
         # too (``BoundKernel.extra_cache_key``): one tuned for another render,
         # or for the binding's own calls, may be one this render refuses.  A
-        # backend whose code reads none of them keys by none.
+        # binding whose code reads none of them keys by none.
         facts = (
             (self._symbolic_input_layouts, self._symbolic_strides)
-            if bk.env.backend.binds_inductor_call_facts
+            if bk.reads_inductor_call_facts
             else ()
         )
         if use_fusion_autotune:

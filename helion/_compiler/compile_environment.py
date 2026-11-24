@@ -165,6 +165,10 @@ class TensorDescriptorLayoutGuard:
     memory_op_indices: set[int] = dataclasses.field(default_factory=set)
     atomic_op_indices: set[int] = dataclasses.field(default_factory=set)
     has_derived_block_extent: bool = False
+    # The native packed MXFP8 lowering loads the input through a host
+    # descriptor whatever ``indexing`` says, reading only whether each extent
+    # is empty, one or more (``register_native_packed_mxfp8_guard``).
+    native_packed_mxfp8: bool = False
 
 
 @dataclasses.dataclass
@@ -174,6 +178,9 @@ class TensorDescriptorAlignmentGuard:
     # A prefetch's box form (``prefetch_indexing`` "tensor_descriptor") can
     # read the input: it needs only an aligned base.
     prefetch: bool = False
+    # The native packed MXFP8 lowering loads the input through a host
+    # descriptor whatever ``indexing`` says.
+    native_packed_mxfp8: bool = False
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1206,6 +1213,24 @@ class CompileEnvironment:
             self._symbolic_stride_sources.reset(strides_token)
             self._dispatch_guards_enforced.reset(token)
 
+    @contextlib.contextmanager
+    def binding_call_facts(self) -> typing.Iterator[None]:
+        """Generate code for this binding's own launches: its dispatch guards
+        hold, and its inputs keep their traced strides and the base alignment
+        of its key (undoing ``without_dispatch_guards`` and
+        ``limit_input_alignment``)."""
+        tokens = (
+            self._dispatch_guards_enforced.set(True),
+            self._symbolic_stride_sources.set(frozenset()),
+            self._input_alignment_limit.set(None),
+        )
+        try:
+            yield
+        finally:
+            self._input_alignment_limit.reset(tokens[2])
+            self._symbolic_stride_sources.reset(tokens[1])
+            self._dispatch_guards_enforced.reset(tokens[0])
+
     @property
     def symbolic_stride_sources(self) -> frozenset[Source]:
         """The inputs whose strides vary across the calls the code being
@@ -1377,6 +1402,24 @@ class CompileEnvironment:
             self.tensor_descriptor_alignment_guards.setdefault(
                 (source, False), TensorDescriptorAlignmentGuard()
             ).prefetch = True
+
+    def register_native_packed_mxfp8_guard(self, fake_tensor: torch.Tensor) -> None:
+        """Key the bound kernel on what the native packed MXFP8 lowering
+        reads of an input it loads through a host descriptor, whatever
+        ``indexing`` says (``triton/packed_mxfp8.py``): the base alignment,
+        the layout signature and whether each extent is empty, one or more.
+        The input's memory-op guards are registered first."""
+        source = self.tensor_input_source(fake_tensor)
+        if source is not None and source in self.tensor_descriptor_layout_guards:
+            self.tensor_descriptor_layout_guards[source].native_packed_mxfp8 = True
+        alignment_key = self.tensor_descriptor_alignment_key(fake_tensor)
+        if (
+            alignment_key is not None
+            and alignment_key in self.tensor_descriptor_alignment_guards
+        ):
+            self.tensor_descriptor_alignment_guards[
+                alignment_key
+            ].native_packed_mxfp8 = True
 
     def prefetch_base_is_aligned(self, fake_tensor: torch.Tensor) -> bool | None:
         """Whether every launch of the bound kernel gives a prefetch of

@@ -38,6 +38,8 @@ pretuned_kernels/
 ├── grouped_gemm_deepgemm/            # B200 grouped BF16 vs DeepGEMM + cuBLAS
 ├── nvfp4_gemv/                       # B200 Triton NVFP4 (W4A4 / W4A16) decode GEMV
 ├── nvfp4_gemv_cute/                  # B200 Helion CuTe NVFP4 decode GEMV
+├── mxfp8_gemm/                       # B200 Triton packed MXFP8 dense GEMM
+├── mxfp8_gemm_cute/                  # B200 Helion CuTe packed MXFP8 dense GEMM
 ├── projection_rotary/                # B200 CuTe projection + rotary fragment epilogue
 ├── interleaved_swiglu/               # B200 CuTe projection + compact SwiGLU epilogue
 ├── silu_mul_fp8/                     # ported from vLLM (vllm/kernels/helion/ops)
@@ -80,6 +82,8 @@ At runtime Helion picks the file matching the current GPU.
 | `grouped_gemm_deepgemm` | Eight official DeepGEMM BF16 grouped-NT shapes with deterministic heterogeneous per-group M (B200 CuTe only) | pinned DeepGEMM `m_grouped_bf16_gemm_nt_contiguous` + CUDA's `cublasGemmGroupedBatchedEx` |
 | `nvfp4_gemv` | Decode (M=1) NVFP4 GEMV `(N, K)` weight shapes (Llama-3 / Qwen projections), W4A4 + W4A16 (B200 Triton backend) | NVFP4 dequant reference + vLLM CUTLASS `cutlass_scaled_fp4_mm` |
 | `nvfp4_gemv_cute` | Decode (M=1) NVFP4 GEMV `(N, K)` weight shapes, W4A4 + W4A16, using Helion kernels compiled with the CuTe backend on B200 | NVFP4 dequant reference + vLLM CUTLASS `cutlass_scaled_fp4_mm` |
+| `mxfp8_gemm` | Six decode-to-prefill MXFP8 dense GEMM `(M, N, K)` shapes, M from 1 to 1024, E8M0 scales packed four per int32 word in DeepGEMM's MN-major layout (B200 Triton backend) | `torch._scaled_mm` with `BlockWise1x32` scales (cuBLASLt MXFP8) + DeepGEMM `fp8_gemm_nt` when available |
+| `mxfp8_gemm_cute` | The same shapes and packed scales, using the same kernel compiled with the CuTe backend on B200 | `torch._scaled_mm` with `BlockWise1x32` scales (cuBLASLt MXFP8) + DeepGEMM `fp8_gemm_nt` when available |
 | `projection_rotary` | BF16 `(M=1024, K=4096, heads=32, D=128)` projection with fused bias and adjacent-pair rotary mixing (B200 CuTe only) | eager BF16 projection + rotary composition |
 | `interleaved_swiglu` | BF16 `(M=1024, K=4096, heads=1, packed D=11008)` projection with interleaved gate/value columns (B200 CuTe only) | eager BF16 projection + SwiGLU composition |
 | `silu_mul_fp8` | vLLM `(num_tokens, intermediate)` decode shapes | torch-native silu-and-mul + fp8 quant |

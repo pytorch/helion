@@ -612,6 +612,16 @@ class Backend(abc.ABC):
         """
         return False
 
+    def reads_inductor_call_facts(
+        self, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> bool:
+        """Whether the code generated for the kernel traced as ``device_ir``
+        reads the facts of ``binds_inductor_call_facts``: every kernel of such
+        a backend, and a kernel of another one whose lowering reads them
+        (``BoundKernel.reads_inductor_call_facts``).  Called with ``env``
+        active."""
+        return self.binds_inductor_call_facts
+
     @property
     def supports_inductor_fusion(self) -> bool:
         """Whether generated kernels apply Inductor's prologue/epilogue hooks.
