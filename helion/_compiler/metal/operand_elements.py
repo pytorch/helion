@@ -456,13 +456,14 @@ ElementBody = tuple[list[ast.stmt], dict[str, object], dict[str, Fact]]
 def element_body(
     loop: ast.For,
     decls: tuple[str, ...],
-    step: int,
+    step: int | Affine,
     i: int,
     facts: dict[str, Fact],
     tables: int,
     state: EmitState,
 ) -> ElementBody:
-    """Element ``i`` of step ``step``'s statements, its position bound and
+    """Element ``i`` of step ``step``'s statements (a constant, or the value
+    of a rolled run's step over its chunk index), its position bound and
     folded (``affine_fold``) over the run's facts and the kernel's integer
     constants, and its decodes tabulated (``tabulate``) under the cap
     ``tables``; the affine values of its names; and the facts they fold
@@ -472,7 +473,10 @@ def element_body(
         for name, value in state.constants.items()
         if isinstance(value, int)
     }
-    env |= {"_fs": Affine.of(step), "_fi": Affine.of(i)}
+    env |= {
+        "_fs": step if isinstance(step, Affine) else Affine.of(step),
+        "_fi": Affine.of(i),
+    }
     facts = dict(facts)
     positions = ast.parse("\n".join(decls)).body
     body = fold([*positions, *loop.body], env, facts)[len(positions) :]

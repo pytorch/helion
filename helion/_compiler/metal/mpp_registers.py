@@ -76,6 +76,7 @@ from ..tile_strategy import DeviceLoopState
 from ._constants import MAX_THREADGROUP_MEMORY_BYTES
 from ._constants import MAX_THREADS_PER_THREADGROUP
 from ._constants import SIMD_WIDTH
+from .affine_fold import Affine
 from .affine_fold import Fact
 from .backend import static_extent
 from .bit_windows import find_codes
@@ -157,10 +158,17 @@ LANE = "_mpp_lane"
 #: The threadgroup tile of the grid runs of one type (:func:`_emit_grid`),
 #: suffixed by the type.
 GRID_TILE = "_mst_tile"
-#: Most steps in a K tile: they are unrolled, each element's statements
-#: folded, so the source grows with them.  A bound on the code, not a
-#: hardware limit: a K tile past it is staged.
+#: Most steps in a K tile, each element's statements folded: a grid run
+#: unrolls them all, a run on one SIMD group at most MAX_UNROLLED_STEPS a K
+#: iteration (chunks of them in a loop past it), so the source grows with
+#: them.  A bound on the code, not a hardware limit: a K tile past it is
+#: staged.
 MAX_STEPS = 16
+#: Most steps a K iteration unrolls over its register runs on one SIMD
+#: group: past it a run loops over chunks of its steps
+#: (``emit_register_run``).  A grid run (``_emit_grid``) unrolls all of its
+#: steps, at most MAX_STEPS.
+MAX_UNROLLED_STEPS = 8
 #: Ops the affine split looks through to the rhs's value: they move or mask
 #: its elements.
 _SPLIT_MOVES = (
@@ -1270,6 +1278,17 @@ def _at(const: int, coord: Coord, scale: int = 1) -> str:
     return f"{value} + {base}" if scale == 1 else f"{value} + {scale} * {base}"
 
 
+def unrolled_chunk(steps: int, total: int) -> int:
+    """The steps of a run of ``steps`` that a K iteration whose register runs
+    take ``total`` unrolls together: all of them up to MAX_UNROLLED_STEPS in
+    total, else the largest divisor of ``steps`` within the run's share of
+    them, in proportion to its steps."""
+    if total <= MAX_UNROLLED_STEPS:
+        return steps
+    share = max(1, MAX_UNROLLED_STEPS * steps // total)
+    return max(d for d in range(1, min(steps, share) + 1) if steps % d == 0)
+
+
 def emit_register_run(
     stmt: ast.For,
     parts: list[str],
@@ -1281,7 +1300,8 @@ def emit_register_run(
 ) -> None:
     """A register run's loop (:func:`register_run`): per step of the K tile,
     each register operand's cooperative tensor, every lane writing its
-    elements in a block with the step ``_fs`` a constant, each element's
+    elements in a block with the step ``_fs`` a constant (in a loop over
+    chunks of the steps, the chunk's start plus its place), each element's
     position bound and its statements folded over it
     (``operand_elements.element_body``), and each device view's handle of
     the step's K, then the op.  Each step's operands (``_mr_a1``,
@@ -1396,10 +1416,32 @@ def emit_register_run(
             ),
         ]
         pad, inner = inner, inner + "    "
+    # Every step's code is unrolled, so a K iteration's code grows with its
+    # register runs' steps (a grid run's returned above, every step
+    # unrolled).  Past MAX_UNROLLED_STEPS of them it outgrows what
+    # the GPU caches (on an M5 Max, gate/up at 32 rows over 16 steps a K
+    # tile took 1.5x as long as over 8, one run or two), and each run loops
+    # over chunks of its steps instead (:func:`unrolled_chunk`), each step's
+    # ``_fs`` its chunk's start, a multiple of the chunk, plus its place in it.
+    # Under a K tail a chunk's codes keep their masked reads: the fold can't
+    # bound their words over every chunk, so they take no windows.
+    chunk = unrolled_chunk(steps, state.register_steps or steps)
+    rolled = chunk < steps
+    if rolled:
+        facts["_fc"] = Fact(1, 0, steps // chunk - 1)
     # Each step's operands (``fills``) and its ops (``ops``), in one block.
     fills: list[list[str]] = []
     ops: list[list[str]] = []
-    for step in range(steps):
+    for step in range(chunk):
+        if rolled:
+            fs_value: int | Affine = Affine.term("_fc", chunk) + Affine.of(step)
+            fs_expr = f"_fc * {chunk} + {step}"
+            fs_decl = f"const short _fs = {fs_expr};"
+            k_offset = f"{atom.k} * ({fs_expr})"
+        else:
+            fs_value = step
+            fs_decl = f"constexpr short _fs = {step};"
+            k_offset = str(atom.k * step)
         lines: list[str] = []
         live_terms: list[str] = []
         step_names = ["", ""]
@@ -1411,7 +1453,7 @@ def emit_register_run(
                 lines += [
                     f"{inner}auto {step_names[i]} = {atom.tensor(op, operand)};",
                     f"{inner}{{",
-                    f"{inner}    constexpr short _fs = {step};",
+                    f"{inner}    {fs_decl}",
                 ]
                 state.put_type = (atom.left, atom.right)[i]
                 elements: list[tuple[tuple[str, str], ElementBody]] = []
@@ -1427,7 +1469,7 @@ def emit_register_run(
                     else:
                         decls = (f"_e_k = {k_pos}", f"_e_n = {_at(0, col)}")
                     elements.append(
-                        (decls, element_body(loop, decls, step, e, facts, 0, state))
+                        (decls, element_body(loop, decls, fs_value, e, facts, 0, state))
                     )
                 bodies = [body for _, (body, _, _) in elements]
                 if lanes.valid is None:
@@ -1470,7 +1512,7 @@ def emit_register_run(
                     blocks,
                     outer,
                     k_dim,
-                    str(atom.k * step),
+                    k_offset,
                     k_tail=not whole,
                 )
                 lines += [f"{inner}{line}" for line in decls_v]
@@ -1501,15 +1543,26 @@ def emit_register_run(
     # 8 steps a tile summed wrong on an M5 Max (exact with the ones built
     # fresh each step, or with the steps in order).  Both keep their order.
     ahead = not affine and sum(side[0] == "reg" for side in sides) == 1
-    parts.append(f"{pad}{{")
-    for step in range(steps):
-        parts += fills[step]
+    body_lines: list[str] = []
+    for step in range(chunk):
+        body_lines += fills[step]
         if not ahead:
-            parts += ops[step]
+            body_lines += ops[step]
         elif step:
-            parts += ops[step - 1]
+            body_lines += ops[step - 1]
     if ahead:
-        parts += ops[-1]
+        body_lines += ops[-1]
+    parts.append(f"{pad}{{")
+    if rolled:
+        # Kept rolled: unrolled, the loop would be the code it replaces.
+        parts += [
+            f"{pad}#pragma clang loop unroll(disable)",
+            f"{pad}for (short _fc = 0; _fc < {steps // chunk}; _fc++) {{",
+            *(f"    {line}" for line in body_lines),
+            f"{pad}}}",
+        ]
+    else:
+        parts += body_lines
     parts.append(f"{pad}}}")
     if dest is not None:
         loop = loops[REG_EPILOGUE]

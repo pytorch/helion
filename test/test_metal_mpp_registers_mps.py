@@ -392,6 +392,27 @@ class TestMppRegisters(unittest.TestCase):
         ref = x.cpu().double() @ (y.cpu().double() * 0.5).half().double()
         self._close(out, ref)
 
+    def test_rolled_steps(self) -> None:
+        """Runs past ``MAX_UNROLLED_STEPS`` steps a K iteration, looping over
+        chunks of their steps, against float64: 4- and 6-bit weights over 16
+        steps of one run, and two runs of 8 steps each beside each other."""
+        for bits, group in ((4, 32), (6, 128)):
+            with self.subTest(bits=bits):
+                args = affine_args(bits, group, 32, 256, 1024, DEVICE)
+                out, msl = _run(affine_mm, args, register_config([32, 32, 256]))
+                self.assertIn("for (short _fc = 0; _fc < 2; _fc++)", msl)
+                self._close(out, affine_reference(args))
+        x = torch.randn(32, 512, device=DEVICE).to(torch.float16)
+        y = torch.randn(512, 64, device=DEVICE)
+        z = torch.randn(512, 64, device=DEVICE)
+        x64, y64, z64 = (t.cpu().double() for t in (x, y, z))
+        config = register_config([32, 32, 128], [1, 1, 32], num_warps=2)
+        outs, _, msl = run_with_msl(two_acc_mm, (x, y, z), config, module_key="rolled")
+        self.assertIn("for (short _fc = 0; _fc < 2; _fc++)", msl)
+        a, b = cast("tuple[torch.Tensor, torch.Tensor]", outs)
+        self._close(a, x64 @ (y64 * 0.5))
+        self._close(b, x64 @ (z64 * 0.25))
+
     def test_one_decision(self) -> None:
         """A register run where the launch's thread axes codegen sees differ
         inside the K loop (M and N tiled in a loop of a one-program grid, K's

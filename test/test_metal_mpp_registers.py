@@ -578,12 +578,14 @@ class TestRegisterCodegen(TestCase):
     def test_view_too_deep(self) -> None:
         """Where the view's 8-row op would take too many steps (a K tile of
         512 is 32 steps of 16), x goes into registers beside the weight:
-        the two-register op takes 16 steps of 32."""
+        the two-register op takes 16 steps of 32, in two chunks of 8
+        (``MAX_UNROLLED_STEPS``)."""
         args = affine_args(4, 32, 8, 64, 1024)
         msl = render_msl(affine_mm, args, register_config([16, 16, 512]))
         loop = self._assert_registers(msl)
         self.assertIn("matmul2d_descriptor(16, 16, 32, false, true, false,", msl)
-        self.assertEqual(_runs(loop, "_mr_a", "_mr_b"), list(range(16)))
+        self.assertIn("for (short _fc = 0; _fc < 2; _fc++) {", loop)
+        self.assertEqual(_runs(loop, "_mr_a", "_mr_b"), list(range(8)))
 
     def test_view_tail(self) -> None:
         """Over a K tail a view's step past the tile's live K is skipped."""
@@ -1165,6 +1167,57 @@ class TestCodeWindows(TestCase):
         # bit of a word: five words.
         m4 = {"_mrl0": Fact(1, 0, 7)}
         self.assertEqual(run(6, [0, 48], clamp=383, **m4), [])
+
+
+class TestRolledSteps(TestCase):
+    """A K iteration unrolls at most ``MAX_UNROLLED_STEPS`` steps of its
+    register runs; past it a run loops over chunks of its steps
+    (``mpp_registers.emit_register_run``)."""
+
+    def test_unrolled_chunk(self) -> None:
+        """Up to 8 steps of a K iteration's runs unroll; past them each run
+        unrolls the largest divisor of its steps within its share of 8, in
+        proportion to its steps."""
+        self.assertEqual(
+            [mpp_registers.unrolled_chunk(s, 8) for s in (2, 2, 4)], [2, 2, 4]
+        )
+        self.assertEqual(mpp_registers.unrolled_chunk(16, 16), 8)
+        self.assertEqual(mpp_registers.unrolled_chunk(8, 16), 4)
+        self.assertEqual(mpp_registers.unrolled_chunk(6, 12), 3)
+        self.assertEqual(mpp_registers.unrolled_chunk(4, 32), 1)
+
+    def test_chunks(self) -> None:
+        """Two runs of 4 steps stay unrolled; two runs of 8 loop over two
+        chunks of 4 each, each step's ``_fs`` its chunk's start plus its
+        place; one run of 16 steps loops over two chunks of 8."""
+        x = torch.randn(32, 512).to(torch.float16)
+        y, z = torch.randn(512, 32), torch.randn(512, 32)
+        msl = render_msl(two_acc_mm, (x, y, z), register_config([32, 32, 64]))
+        self.assertNotIn("_fc", msl)
+        msl = render_msl(two_acc_mm, (x, y, z), register_config([32, 32, 128]))
+        self.assertEqual(msl.count("for (short _fc = 0; _fc < 2; _fc++) {"), 2)
+        self.assertIn("const short _fs = _fc * 4 + 3;", msl)
+        self.assertNotIn("_fc * 4 + 4", msl)
+        args = affine_args(4, 32, 32, 64, 1024)
+        msl = render_msl(affine_mm, args, register_config([32, 32, 256]))
+        self.assertEqual(msl.count("#pragma clang loop unroll(disable)"), 1)
+        self.assertIn("const short _fs = _fc * 8 + 7;", msl)
+
+    def test_windows(self) -> None:
+        """A rolled chunk's steps still read their packed codes from windows
+        (``bit_windows``), the chunk index folded into the first code's bit:
+        6-bit codes over 16 steps on an M5's layout (mocked)."""
+        args = affine_args(6, 128, 32, 64, 1024)
+        config = register_config([32, 32, 256], num_warps=4)
+        with mock.patch.object(mpp_registers, "layout", _nax_right):
+            loop = _k_loop(render_msl(affine_mm_f16, args, config))
+        self.assertEqual(loop.count("for (short _fc = 0; _fc < 2; _fc++) {"), 1)
+        self.assertEqual(len(re.findall(r"const uint _mbw\d+ = \(", loop)), 32)
+        self.assertIn(
+            "const int _mbw0_x = (((_fc * 768) + (_mrl0 * 6)) + (offset_2 * 6));", loop
+        )
+        for absent in ("floor_divide", "remainder", "w["):
+            self.assertNotIn(absent, loop)
 
 
 if __name__ == "__main__":
