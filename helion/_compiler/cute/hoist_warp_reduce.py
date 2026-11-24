@@ -47,6 +47,7 @@ from typing import cast
 
 from ... import exc
 from ..ast_extension import statement_from_string
+from ._ast_pass_utils import _is_proven_relocatable_call
 from ._ast_pass_utils import assigned_name
 from ._ast_pass_utils import constexpr_v_loop
 from ._ast_pass_utils import loop_extent
@@ -382,9 +383,52 @@ def _try_hoist_one_vloop(
     all_closures: set[int] = set()
     for c in closures:
         all_closures |= c
-    for i in range(reduce_validate[0][0]):
-        if i in v_dependent and i not in all_closures:
-            return None
+    # The per-element values the V-loop computes for something else than a
+    # reduction ahead of the first one, such as the elements of a store that
+    # follows the loop, run in the first reduction's fold loop, in their
+    # order: a where's result stored and summed,
+    #     v_2 = cutlass.BFloat16(tmp3)
+    #     _tile_store_vals_1_0.append(cutlass.BFloat16(v_2).bitcast(cutlass.Uint16))
+    #     _mask_to = cutlass.Float32(tmp3) if mask_1 else cutlass.Float32(0)
+    #     sum_1 = cutlass.Float32(_cute_grouped_reduce_shared_two_stage(_mask_to, 'sum', ...))
+    # kept its reduction in the V-loop, once per element, and the config
+    # failed in fold_lane_reductions ("reduction in lane_1 is not a plain
+    # assignment of the lane body"). So did a store the vector-loop sink
+    # leaves per element, an r-vectorized copy and sum over r whose output
+    # is not contiguous along r:
+    #     v_1 = cutlass.BFloat16(v_0)
+    #     (out0.iterator + ... + cutlass.Int32(indices_2) * ...).store(cutlass.BFloat16(v_1))
+    #     sum_1 = cutlass.Float32(cute.arch.warp_reduction_sum(v_0, threads_in_group=32))
+    # which runs in the fold loop too, in its order against the element's
+    # loads, when the loop holds one reduction (element_store()). A later
+    # fold loop would load its elements after every store of the first one,
+    # where a buffer Inductor updates in place reads the stored value: with
+    # two reductions, a store keeps the loop.
+    single_reduction = len(reduce_validate) == 1
+    side = [
+        i
+        for i in range(reduce_validate[0][0])
+        if i in v_dependent and i not in all_closures
+    ]
+    if not all(
+        _is_side_computation(body[i]) or (single_reduction and element_store(body[i]))
+        for i in side
+    ):
+        return None
+    # Between two reductions such a statement would run in no fold loop, and
+    # moving it into the next one would reorder its elements against the
+    # first fold loop's (two appends to one list interleave per element):
+    #     a = cutlass.Float32(_v0[vec_lane_1])
+    #     sum_1 = cutlass.Float32(cute.arch.warp_reduction_sum(a, ...))
+    #     _tile_store_vals_1_0.append(cutlass.BFloat16(b).bitcast(cutlass.Uint16))
+    #     sum_2 = cutlass.Float32(cute.arch.warp_reduction_sum(c, ...))
+    # lost the append, and the store after the loop wrote an empty list.  The
+    # loop keeps its per-element reduces.
+    if any(
+        i in v_dependent and i not in all_closures and i not in reduce_stmt_indices
+        for i in range(reduce_validate[0][0] + 1, last_reduce_idx)
+    ):
+        return None
 
     # ---- COMMIT PHASE: build new statements. ----
     new_stmts: list[ast.stmt] = []
@@ -432,6 +476,17 @@ def _try_hoist_one_vloop(
     for c in closures:
         members = (c & v_dependent) - reduce_stmt_indices_in_body
         v_loop_members.append(members)
+    # The side statements run in the first fold loop with the per-element
+    # values they read, which may belong to a later reduction's closure
+    # only: in
+    #     b = cutlass.Float32(_v1[vec_lane_1])
+    #     _tile_store_vals_1_0.append(cutlass.BFloat16(b).bitcast(cutlass.Uint16))
+    #     sum_1 = cutlass.Float32(cute.arch.warp_reduction_sum(a, ...))
+    #     sum_2 = cutlass.Float32(cute.arch.warp_reduction_sum(b, ...))
+    # ``b`` is computed in both fold loops; without it the first one appended
+    # a ``b`` it had not defined yet.
+    side_closure = _compute_dependency_closure(body, set(side)) if side else set()
+    v_loop_members[0] |= (side_closure & v_dependent) - reduce_stmt_indices_in_body
 
     # Compute "scalar emission position" for each scalar stmt: emit after
     # the last reduce idx < stmt_idx (or before all reduces if none).  We
@@ -589,6 +644,67 @@ def _try_hoist_one_vloop(
             new_stmts.append(body_copy[j])
 
     return new_stmts
+
+
+def _is_side_computation(stmt: ast.stmt) -> bool:
+    """Whether ``stmt`` computes a register value (an assignment of a name)
+    or appends one to a trace-time list (``vals.append(...)``), with no call
+    but those proven free of observable effects
+    (``_is_proven_relocatable_call``: conversions, bitcasts, math, loads)."""
+    if isinstance(stmt, ast.Assign):
+        if len(stmt.targets) != 1 or not isinstance(stmt.targets[0], ast.Name):
+            return False
+        value: ast.expr = stmt.value
+    elif (
+        isinstance(stmt, ast.Expr)
+        and isinstance(stmt.value, ast.Call)
+        and isinstance(stmt.value.func, ast.Attribute)
+        and stmt.value.func.attr == "append"
+        and isinstance(stmt.value.func.value, ast.Name)
+        and len(stmt.value.args) == 1
+        and not stmt.value.keywords
+    ):
+        value = stmt.value.args[0]
+    else:
+        return False
+    return all(
+        _is_proven_relocatable_call(node, allow_load=True)
+        for node in ast.walk(value)
+        if isinstance(node, ast.Call)
+    )
+
+
+def element_store(stmt: ast.stmt) -> bool:
+    """Whether ``stmt`` stores one value through a pointer,
+    ``ptr.store(value)``, or does so under a mask, ``if mask: ptr.store(value)``
+    (``else: pass``), with no call in its address, value or mask but those
+    proven free of observable effects (``_is_proven_relocatable_call``)."""
+    if isinstance(stmt, ast.If):
+        if len(stmt.body) != 1 or not all(
+            isinstance(other, ast.Pass) for other in stmt.orelse
+        ):
+            return False
+        if not all(
+            _is_proven_relocatable_call(node, allow_load=True)
+            for node in ast.walk(stmt.test)
+            if isinstance(node, ast.Call)
+        ):
+            return False
+        stmt = stmt.body[0]
+    if not (
+        isinstance(stmt, ast.Expr)
+        and isinstance(store := stmt.value, ast.Call)
+        and isinstance(store.func, ast.Attribute)
+        and store.func.attr == "store"
+        and len(store.args) == 1
+        and not store.keywords
+    ):
+        return False
+    return all(
+        _is_proven_relocatable_call(node, allow_load=True)
+        for node in ast.walk(store)
+        if isinstance(node, ast.Call) and node is not store
+    )
 
 
 def _rewrite_cast_wrapper(rhs: ast.expr, new_dtype: str) -> ast.expr:

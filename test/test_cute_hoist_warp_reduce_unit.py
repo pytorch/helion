@@ -102,6 +102,139 @@ class TestHoistWarpReduceRunningSum(TestCase):
             _run(src, running_sums=set(), input_dtypes={"p": "cutlass.Float32"})
         )
 
+    def test_store_elements_ride_in_the_fold_loop(self) -> None:
+        # A where's result stored after the loop and summed: the elements of
+        # the store are computed in the fold loop, in their order, and the
+        # sum is reduced once after it (it stayed per element, and the config
+        # failed in fold_lane_reductions).
+        src = """
+        _tile_store_vals_1_0 = []
+        for vec_lane_1 in cutlass.range_constexpr(4):
+            tmp3 = cutlass.Float32(s) if m[vec_lane_1] else cutlass.Float32(_v0[vec_lane_1])
+            v_2 = cutlass.BFloat16(tmp3)
+            _tile_store_vals_1_0.append(cutlass.BFloat16(v_2).bitcast(cutlass.Uint16))
+            _mask_to = cutlass.Float32(tmp3)
+            sum_1 = cutlass.Float32(cute.arch.warp_reduction_sum(_mask_to, threads_in_group=32))
+            v_3 = acc + sum_1
+        _cute_store_u16_vec(out0.iterator, _tile_store_vals_1_0)
+        """
+        out = _run(src, input_dtypes={"_mask_to": "cutlass.Float32"})
+        module = ast.parse(out)
+        (loop,) = [n for n in module.body if isinstance(n, ast.For)]
+        body = ast.unparse(loop)
+        self.assertIn("_tile_store_vals_1_0.append(", body)
+        self.assertIn("_helion_vfold_acc_0 = _helion_vfold_acc_0 + ", body)
+        self.assertNotIn("warp_reduction_sum", body)
+        after = ast.unparse(
+            ast.Module(body=module.body[module.body.index(loop) + 1 :], type_ignores=[])
+        )
+        self.assertIn("warp_reduction_sum(_helion_vfold_acc_0", after)
+        self.assertIn("v_3 = acc + sum_1", after)
+
+    def test_store_elements_between_two_reductions_keep_the_loop(self) -> None:
+        # An element appended between two reductions belongs to no fold loop;
+        # hoisted, the append was dropped and the store wrote an empty list.
+        src = """
+        _tile_store_vals_1_0 = []
+        for vec_lane_1 in cutlass.range_constexpr(4):
+            a = cutlass.Float32(_v0[vec_lane_1])
+            sum_1 = cutlass.Float32(cute.arch.warp_reduction_sum(a, threads_in_group=32))
+            b = cutlass.Float32(_v1[vec_lane_1])
+            _tile_store_vals_1_0.append(cutlass.BFloat16(b).bitcast(cutlass.Uint16))
+            c = cutlass.Float32(_v2[vec_lane_1])
+            sum_2 = cutlass.Float32(cute.arch.warp_reduction_sum(c, threads_in_group=32))
+            v_3 = acc + sum_1 + sum_2
+        _cute_store_u16_vec(out0.iterator, _tile_store_vals_1_0)
+        """
+        out = _run(src, input_dtypes={"a": "cutlass.Float32", "c": "cutlass.Float32"})
+        self.assertIn("_tile_store_vals_1_0.append(", out)
+        self.assertNotIn("_helion_vfold_acc", out)
+
+    def test_store_elements_take_their_values_into_the_fold_loop(self) -> None:
+        # The append ahead of both reductions runs in the first fold loop, and
+        # so must the value it stores, which only the second reduction reads:
+        # without it the first loop appended a ``b`` it had not defined.
+        src = """
+        _tile_store_vals_1_0 = []
+        for vec_lane_1 in cutlass.range_constexpr(4):
+            a = cutlass.Float32(_v0[vec_lane_1])
+            b = cutlass.Float32(_v1[vec_lane_1])
+            _tile_store_vals_1_0.append(cutlass.BFloat16(b).bitcast(cutlass.Uint16))
+            sum_1 = cutlass.Float32(cute.arch.warp_reduction_sum(a, threads_in_group=32))
+            sum_2 = cutlass.Float32(cute.arch.warp_reduction_sum(b, threads_in_group=32))
+            v_3 = acc + sum_1 + sum_2
+        _cute_store_u16_vec(out0.iterator, _tile_store_vals_1_0)
+        """
+        out = _run(src, input_dtypes={"a": "cutlass.Float32", "b": "cutlass.Float32"})
+        loops = [n for n in ast.parse(out).body if isinstance(n, ast.For)]
+        self.assertEqual(len(loops), 2)
+        first = [ast.unparse(stmt) for stmt in loops[0].body]
+        append = next(i for i, text in enumerate(first) if ".append(" in text)
+        self.assertIn("b = cutlass.Float32(_v1[vec_lane_1])", first[:append])
+        self.assertNotIn(".append(", ast.unparse(loops[1]))
+
+    def test_element_stores_ride_in_the_fold_loop_of_one_reduction(self) -> None:
+        # An r-vectorized copy and sum over r whose output the sink leaves per
+        # element: the stores, masked or not, run in the fold loop after the
+        # values they store, and the sum is reduced once after it (it stayed
+        # per element, and the config failed in fold_lane_reductions).
+        src = """
+        for vec_lane_1 in cutlass.range_constexpr(4):
+            indices_1 = lane_base_1 + cutlass.Int32(vec_lane_1)
+            mask_1 = indices_1 < 100
+            tmp3 = cutlass.Float32(_v0[vec_lane_1])
+            v_1 = cutlass.BFloat16(tmp3)
+            (out0.iterator + cutlass.Int32(indices_1) * 64).store(cutlass.BFloat16(v_1))
+            if mask_1:
+                (out1.iterator + cutlass.Int32(indices_1) * 64).store(cutlass.Float32(tmp3))
+            else:
+                pass
+            sum_1 = cutlass.Float32(cute.arch.warp_reduction_sum(tmp3, threads_in_group=32))
+            v_3 = acc + sum_1
+        """
+        out = _run(src, input_dtypes={"tmp3": "cutlass.Float32"})
+        module = ast.parse(out)
+        (loop,) = [n for n in module.body if isinstance(n, ast.For)]
+        body = [ast.unparse(stmt) for stmt in loop.body]
+        stores = [i for i, text in enumerate(body) if ".store(" in text]
+        self.assertEqual(len(stores), 2)
+        self.assertLess(body.index("v_1 = cutlass.BFloat16(tmp3)"), stores[0])
+        self.assertTrue(body[stores[1]].startswith("if mask_1:"))
+        self.assertNotIn("warp_reduction_sum", ast.unparse(loop))
+        after = ast.unparse(
+            ast.Module(body=module.body[module.body.index(loop) + 1 :], type_ignores=[])
+        )
+        self.assertIn("warp_reduction_sum(_helion_vfold_acc_0", after)
+        self.assertIn("v_3 = acc + sum_1", after)
+
+    def test_a_store_ahead_of_two_reductions_keeps_the_loop(self) -> None:
+        # The second fold loop would load its elements after every store of
+        # the first: a buffer updated in place would read the stored values.
+        src = """
+        for vec_lane_1 in cutlass.range_constexpr(4):
+            a = cutlass.Float32(_v0[vec_lane_1])
+            (out0.iterator + vec_lane_1).store(cutlass.BFloat16(a))
+            sum_1 = cutlass.Float32(cute.arch.warp_reduction_sum(a, threads_in_group=32))
+            c = cutlass.Float32((in0.iterator + vec_lane_1).load())
+            sum_2 = cutlass.Float32(cute.arch.warp_reduction_sum(c, threads_in_group=32))
+            v_3 = acc + sum_1 + sum_2
+        """
+        out = _run(src, input_dtypes={"a": "cutlass.Float32", "c": "cutlass.Float32"})
+        self.assertNotIn("_helion_vfold_acc", out)
+
+    def test_a_store_with_an_effect_in_its_value_keeps_the_loop(self) -> None:
+        # Only stores whose address, value and mask make no call with an
+        # effect move: an atomic in the stored value keeps the loop.
+        src = """
+        for vec_lane_1 in cutlass.range_constexpr(4):
+            tmp3 = cutlass.Float32(_v0[vec_lane_1])
+            (out0.iterator + vec_lane_1).store(cute.arch.atomic_add(ptr, tmp3))
+            sum_1 = cutlass.Float32(cute.arch.warp_reduction_sum(tmp3, threads_in_group=32))
+            v_3 = acc + sum_1
+        """
+        out = _run(src, input_dtypes={"tmp3": "cutlass.Float32"})
+        self.assertNotIn("_helion_vfold_acc", out)
+
     # ---- (c) loop-carried but unflagged -> untouched ----
 
     def test_loop_carried_rescale_unflagged_untouched(self) -> None:

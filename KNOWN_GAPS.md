@@ -302,24 +302,23 @@ these labelled lines.
 - What is wrong: the pass that runs a vector lane loop's cross-thread reduce
   once per tile does not check the loop's other statements, and a loop it
   leaves alone keeps a per-lane reduce whose result is read as the tile's.
-  Four kernels at `block_sizes [4, 128]`, `num_threads [0, 32]`,
+  Three kernels at `block_sizes [4, 128]`, `num_threads [0, 32]`,
   `cute_vector_widths [1, 4]`. Each is `for tile_m in hl.tile(m):` around
-  `for tile_n in hl.tile(n):` over an fp32 `x` of 16 x 126 (`y` has its
-  shape); below is what follows `v = x[tile_m, tile_n]` in the column loop.
-  `top`, `total` and `count` are per-row values (`hl.full` or `hl.zeros` of
-  `[tile_m]`) that start ahead of the column loop and are stored after it.
+  `for tile_n in hl.tile(n):` over an fp32 `x` of 16 x 126; below is what
+  follows `v = x[tile_m, tile_n]` in the column loop. `total`, `top` and
+  `count` are per-row values (`hl.zeros` of `[tile_m]`) that start ahead of
+  the column loop and are stored after it. (The store and one reduction,
+  `total = v.sum(-1)` alone, fold since the pass runs a loop's stores in its
+  fold loop.)
 
   ```python
-  # the generated code has no store to y
-  top = torch.maximum(top, torch.amax(v, dim=-1))
-  y[tile_m, tile_n] = v * 2
-  total = total + v.sum(-1)
   # the write is placed ahead of the tile's loads
   x[tile_m, 0] = total
   total = total + v.sum(-1)
-  # total, read after the loop, is one lane's sum
+  # total and top, read after the loop, are one lane's
   x[tile_m, tile_n] = v + 1
   total = v.sum(-1)
+  top = v.amax(-1)
   # counts the lanes with a positive element, not the tiles
   count = count + torch.any(v > 0, dim=-1)
   ```

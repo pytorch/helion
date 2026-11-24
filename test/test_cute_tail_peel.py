@@ -47,9 +47,12 @@ _PACKET = "ir.VectorType.get([8], cutlass.Uint16.mlir_type)"
 
 
 def _packet_names(code: str) -> list[str]:
-    """The variables the rendered kernel ``code`` loads packets into."""
+    """The variables the rendered kernel ``code`` loads packets into, directly
+    or from the packet ``pipeline_inner_loads`` prefetched a tile ahead."""
     return re.findall(
-        r"^\s*(_?tail_packet\w*) = cute\.arch\.load\(", code, re.MULTILINE
+        r"^\s*(_?tail_packet\w*) = (?:cute\.arch\.load\(|_pipe_load_\d+$)",
+        code,
+        re.MULTILINE,
     )
 
 

@@ -96,6 +96,7 @@ import os
 
 from ..ast_extension import expr_from_string
 from ..ast_extension import statement_from_string
+from ._ast_pass_utils import _is_proven_relocatable_call
 from ._ast_pass_utils import assigned_name
 from ._ast_pass_utils import names_read
 from .packet_access import match_packet_access
@@ -210,6 +211,44 @@ def _has_memory_access(node: ast.AST) -> bool:
         if isinstance(sub, ast.Attribute) and sub.attr in ("load", "store", "arch"):
             return True
     return False
+
+
+def _register_sibling_names(stmt: ast.stmt) -> set[str] | None:
+    """The names ``stmt`` binds when, beside an outer loop's lane loop, it is
+    an assignment of names that writes no memory: its targets are names or
+    tuples of names (a subscript or attribute target writes a tensor or a
+    register tensor's element) and every call of it is proven free of
+    observable effects, loads and the CTA reduces a V-fold ends with
+    included (``_is_proven_relocatable_call``: an inline asm of declared
+    purity alone, or any unknown helper, is not).  None for any other
+    statement."""
+    targets: list[ast.expr]
+    if isinstance(stmt, ast.Assign):
+        targets = list(stmt.targets)
+    elif isinstance(stmt, (ast.AnnAssign, ast.AugAssign)):
+        targets = [stmt.target]
+    else:
+        return None
+    names: set[str] = set()
+    while targets:
+        target = targets.pop()
+        if isinstance(target, ast.Name):
+            names.add(target.id)
+        elif isinstance(target, (ast.Tuple, ast.List)):
+            targets.extend(target.elts)
+        else:
+            return None
+    if not all(
+        _is_proven_relocatable_call(node, allow_load=True, allow_reduction=True)
+        for node in ast.walk(stmt)
+        if isinstance(node, ast.Call)
+    ):
+        return None
+    return names
+
+
+def _is_register_sibling(stmt: ast.stmt) -> bool:
+    return _register_sibling_names(stmt) is not None
 
 
 class _NameRenamer(ast.NodeTransformer):
@@ -387,8 +426,22 @@ def _try_pipeline_one_outer_loop(
         return None
 
     body = outer_loop.body
-    if not body or not isinstance(body[0], ast.For):
+    # The outer loop holds one inner lane loop.  Beside it may stand
+    # register statements that write no memory, such as the accumulator a
+    # V-fold starts ahead of the lane loop and the reduction it ends with
+    # (hoist_warp_reduce):
+    #     _helion_vfold_acc_0 = cutlass.Float32(0)
+    #     for lane_2 in range(1): ...
+    #     sum_1 = cutlass.Float32(_cute_grouped_reduce_warp(_helion_vfold_acc_0, ...))
+    #     acc = acc + sum_1
+    # The prefetch reads the next tile's addresses only, which they do
+    # not write, and no store of theirs can land where it reads.
+    loops = [stmt for stmt in body if isinstance(stmt, ast.For)]
+    if len(loops) != 1 or not all(
+        stmt is loops[0] or _is_register_sibling(stmt) for stmt in body
+    ):
         return None
+    lane_loop_stmt = loops[0]
 
     # The inner loop must be ``for lane in range(<int>):`` with EXACTLY
     # one iteration.  When the inner lane loop has REPS > 1, the per-iter
@@ -398,7 +451,7 @@ def _try_pipeline_one_outer_loop(
     # snapshot would consume the wrong-outer-iter, wrong-lane prefetch.
     # The common softmax/online-reduction shape has LANE_REPS == 1 so
     # we conservatively skip the rest.
-    inner_match = _looks_like_inner_lane_loop(body[0])
+    inner_match = _looks_like_inner_lane_loop(lane_loop_stmt)
     if inner_match is None:
         return None
     inner_loop, lane_var, lane_reps = inner_match
@@ -457,11 +510,19 @@ def _try_pipeline_one_outer_loop(
         # what they define.
         return None
 
-    # We further require that the outer-loop body is JUST the single
-    # inner lane loop — no sibling statements at the outer level.  This
-    # keeps the rewrite simple (we know exactly where to splice the
-    # snapshot / prefetch).
-    if len(body) != 1:
+    # The siblings must not write what the lane base or the load reads
+    # (the tile variable, a base pointer): the prefetch computes the next
+    # tile's address before they run.  The pass runs before ``ast_rename``,
+    # so the names compare as the rename will collapse them (a sibling's
+    # ``v_1_0`` may become the ``v_1`` the load reads).
+    groups = rename_groups or {}
+    sibling_writes: set[str] = set()
+    for stmt in body:
+        if stmt is not lane_loop_stmt:
+            bound = _register_sibling_names(stmt) or set()
+            sibling_writes |= {groups.get(n, n) for n in bound}
+    address_reads = names_read(load_rhs) | names_read(lane_base_rhs)
+    if sibling_writes & {groups.get(n, n) for n in address_reads}:
         return None
 
     # P19 optional gate: when ``HELION_LOAD_PIPELINE_CARRIED_ONLY=1`` is
@@ -498,8 +559,10 @@ def _try_pipeline_one_outer_loop(
         "HELION_LOAD_PIPELINE_CARRIED_ONLY"
     ) and not os.environ.get("HELION_LOAD_PIPELINE_ALL")
     if _carried_only and outer_scope_names is not None:
+        # The carried write may stand beside the lane loop: a V-fold's
+        # reduction and its ``acc = acc + sum_1`` after it (hoist_warp_reduce).
         if not _has_loop_carried_scalar_write(
-            inner_body, outer_scope_names, rename_groups
+            list(body), outer_scope_names, rename_groups
         ):
             return None
 
