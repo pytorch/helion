@@ -10,6 +10,7 @@ from torch._inductor import config as inductor_config
 from torch._inductor.custom_graph_pass import CustomGraphModulePass
 from torch._inductor.custom_graph_pass import get_hash_for_files
 
+from .cat_reductions import split_cat_reductions
 from .online_softmax import online_softmax_patterns
 
 if TYPE_CHECKING:
@@ -22,7 +23,9 @@ class HelionPostGradPass(CustomGraphModulePass):
     before it (`inner`). With cuda_backend "helion" it rewrites softmax to
     online softmax, as Inductor does for Triton: torch.softmax(x, -1) is then
     one pass over each row for the max and the sum of exps (online_softmax_reduce),
-    and one that writes exp(x - max) / sum, rather than three."""
+    and one that writes exp(x - max) / sum, rather than three. Before that, it
+    splits a reduction over a concatenated dim into the reductions of the
+    parts (split_cat_reductions()), as softmax with attention sinks."""
 
     def __init__(self, inner: CustomGraphModulePass | None) -> None:
         self.inner = inner
@@ -30,14 +33,15 @@ class HelionPostGradPass(CustomGraphModulePass):
     def __call__(self, gm: torch.fx.GraphModule) -> None:
         if self.inner is not None:
             self.inner(gm)
-        # As Inductor applies its replacement, under pattern_matcher too.
+        # As Inductor applies its replacements, under pattern_matcher.
         if not (
-            inductor_config.cuda_backend == "helion"
-            and inductor_config.online_softmax
-            and inductor_config.pattern_matcher
+            inductor_config.cuda_backend == "helion" and inductor_config.pattern_matcher
         ):
             return
-        if online_softmax_patterns().apply(gm.graph):
+        changed = split_cat_reductions(gm.graph)
+        if inductor_config.online_softmax and online_softmax_patterns().apply(gm.graph):
+            changed = True
+        if changed:
             gm.graph.lint()
             gm.recompile()
 
