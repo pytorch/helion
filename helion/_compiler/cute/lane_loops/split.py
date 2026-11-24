@@ -194,7 +194,7 @@ def _split_lane_loop_reductions(
             )
         )
         _update_proven_uniform_names(stmt, proven_uniform)
-        _update_thread_axis_names(stmt, proven_thread_axes)
+        _update_thread_axis_names(stmt, proven_thread_axes, proven_scalar_definitions)
         _update_scalar_definitions(stmt, proven_scalar_definitions, rename_groups)
     return new_body
 

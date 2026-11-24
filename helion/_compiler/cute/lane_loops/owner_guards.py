@@ -27,6 +27,8 @@ from ...ast_extension import statement_from_string
 from .._ast_pass_utils import _is_proven_relocatable_call
 from .._ast_pass_utils import deep_clone
 from ..persistent_branch_vec import PACKET_STORE_BYTES
+from ..reduce_call import ReduceCall
+from ..reduce_call import ReduceScope
 from ..thread_budget import MAX_THREADS_PER_BLOCK
 from .markers import _CUTE_THREAD_VARYING_INTRINSICS
 from .markers import _int_literal
@@ -100,16 +102,76 @@ def _thread_axes_read_by(
     return axes
 
 
+def _grouped_shared_reduce(
+    stmt: ast.AST,
+    scalar_definitions: Mapping[str, ast.AST] | None,
+) -> tuple[ast.expr, frozenset[int]] | None:
+    """The input of a one-group shared-memory reduce assigned by ``stmt``,
+    ``x = _cute_grouped_reduce_shared_two_stage(v, op, identity, lane, ...,
+    pre=P, group_span=S, group_count=1)``, and the thread axes it reduces
+    over: those whose stride in the flattened ``lane`` (a linear expression
+    of ``thread_idx``, or a name ``scalar_definitions`` holds one for) is a
+    multiple of ``pre``. Every thread gets the reduction over the lanes of
+    its residue modulo ``pre``. Where each axis's stride is a multiple or a
+    divisor of ``pre`` (the flattened thread index whose axes below the
+    reduced ones span ``pre``, as the emitters lay it out), the reduced axes
+    do not move that residue and the others do not reach the reduced ones,
+    so the result varies along an axis only where ``v`` does and the axis is
+    not reduced: after the warp reduce over thread_idx[0] of a reduction
+    over runs, the reduce over the 4 runs on thread_idx[1] (pre=32,
+    group_span=128) is uniform across the CTA. None for any other statement,
+    and for a lane with a stride that is neither (thread_idx[1] * 48 at
+    pre=32 mixes residues of both axes) or a negative one, which keeps the
+    conservative provenance. A lane named through a chain of scalar aliases
+    is followed to its definition (_resolve_scalar_definition())."""
+    if not (
+        isinstance(stmt, ast.Assign)
+        and len(stmt.targets) == 1
+        and isinstance(stmt.targets[0], ast.Name)
+        and isinstance(call := stmt.value, ast.Call)
+    ):
+        return None
+    reduce = ReduceCall.parse(call)
+    if (
+        reduce is None
+        or reduce.scope is not ReduceScope.SHARED_TWO_STAGE
+        or reduce.group_count != 1
+    ):
+        return None
+    pre, span = reduce.pre, reduce.group_span
+    if pre is None or span is None or pre <= 0 or span % pre != 0:
+        return None
+    lane = _resolve_scalar_definition(call.args[3], dict(scalar_definitions or {}))
+    if not isinstance(lane, ast.expr) or isinstance(lane, ast.Name):
+        return None
+    strides = _linear_thread_axis_strides(lane)
+    # A negative stride mixes the residues as 48 does; the emitters lay out
+    # none, and the proof does not take one.
+    if strides is None or any(
+        stride < 0 or (stride > 0 and stride % pre != 0 and pre % stride != 0)
+        for stride in strides.values()
+    ):
+        return None
+    reduced = frozenset(
+        axis for axis, stride in strides.items() if stride > 0 and stride % pre == 0
+    )
+    return call.args[0], reduced
+
+
 def _update_thread_axis_names(
     stmt: ast.AST,
     thread_axis_names: dict[str, frozenset[int]],
+    scalar_definitions: Mapping[str, ast.AST] | None = None,
 ) -> None:
     """Track physical-thread provenance through generated scalar assignments.
 
     The lane-reduction post-pass runs after code generation, when logical block
     provenance has otherwise been erased.  Keeping this small dataflow map lets
     the pass distinguish a real sibling output coordinate from a redundant
-    launch coordinate before it emits a memory write.
+    launch coordinate before it emits a memory write. A one-group
+    shared-memory reduce drops the axes it reduces over
+    (_grouped_shared_reduce()), its lane written inline or, through
+    ``scalar_definitions``, as a name.
     """
     from ...ast_read_writes import ReadWrites
 
@@ -123,6 +185,10 @@ def _update_thread_axis_names(
         reduce_axis = _lane_reduce_axis(marker)
         if reduce_axis is not None:
             axes.discard(reduce_axis)
+    grouped = _grouped_shared_reduce(stmt, scalar_definitions)
+    if grouped is not None:
+        value, reduced = grouped
+        axes = _thread_axes_read_by(value, thread_axis_names) - reduced
     frozen_axes = frozenset(axes)
     for name in writes:
         thread_axis_names[name] = frozen_axes
@@ -180,7 +246,7 @@ def _statement_provenance_before(
     for stmt in body:
         thread_axes_before[id(stmt)] = dict(local_thread_axes)
         scalar_defs_before[id(stmt)] = dict(local_scalar_defs)
-        _update_thread_axis_names(stmt, local_thread_axes)
+        _update_thread_axis_names(stmt, local_thread_axes, local_scalar_defs)
         _update_scalar_definitions(stmt, local_scalar_defs, rename_groups)
     return thread_axes_before, scalar_defs_before
 
@@ -984,10 +1050,17 @@ def _validated_owner_store(stmt: ast.AST) -> ast.Call | None:
     # continue through the stricter unique-store validation below.
     memory_calls = _memory_write_calls(stmt)
     memory_call_ids = {id(call) for call in memory_calls}
+    # A discarded call whose calls are all proven pure (a dead
+    # ``cutlass.Float32(0.0)``) has no effect to guard.
     if any(
         isinstance(node, ast.Expr)
         and isinstance(node.value, ast.Call)
         and id(node.value) not in memory_call_ids
+        and not all(
+            _is_proven_relocatable_call(call, allow_load=True)
+            for call in ast.walk(node.value)
+            if isinstance(call, ast.Call)
+        )
         for node in ast.walk(stmt)
     ):
         raise exc.BackendUnsupported(

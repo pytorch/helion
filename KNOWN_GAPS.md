@@ -331,6 +331,44 @@ these labelled lines.
   recognizes, and a model of the lane loop to test it against.
 - Pinned by: none.
 
+## reduction-over-a-broadcast-rdim
+
+- Area: CuTe backend, a persistent reduction whose input does not vary
+  along the rdim (a value broadcast over it, `expand`), at the default
+  config and with `num_threads` given for the rdim alike.
+- What is wrong: the launch keeps no thread for the rdim, while the
+  reduction folds as many consecutive lanes as the rdim has elements, so
+  each row reduces its neighbours' values. helion.inductor's amax over
+  `[0, 2]` of an fp64 `[8, 48, 1]` input broadcast over N (stride 0)
+  emits
+
+  ```python
+  for tile_x in hl.tile(48):
+      rdim = hl.zeros([tile_x, 8]).size(1)
+      tmp0 = in0[tile_x]
+      tmp1 = tmp0.reshape([tile_x, 1]).expand(tile_x, rdim)
+      tmp2 = torch.amax(tmp1, -1)
+      out0[tile_x] = tmp2
+  ```
+
+  which launches `block=(1, 32, 1)`, tile_x on thread axis 1, and reduces
+  with `cute.arch.warp_reduction_max(..., threads_in_group=8)`: 42 of the
+  48 outputs were wrong on GB300. `torch.sum` emits
+  `warp_reduction_sum(..., threads_in_group=8)` the same way.
+- Since: on `main` when the entry was added: the generated CuTe source of
+  the kernel (its launch and its warp reduce) is the same at origin/main
+  29c1bc1f2, the stack's merge base (CPU render at the default config,
+  CuTe DSL 4.8.1; the wrong outputs were measured on a GB300 at an earlier
+  base with that source).
+- Why deferred: the launch drops a reduction's thread axis that no load
+  indexes, while the reduction emitter sizes its fold by the rdim's
+  extent. Making them agree (keep the axis in the launch, or fold in each
+  thread with the broadcast's multiplicity for sums and products) changes
+  the launch planning of every reduction strategy, whose generated code
+  and timing for kernels that work today would need measurements of their
+  own.
+- Pinned by: none.
+
 ## fused-product-drops-carried-binding
 
 - Area: CuTe backend, `fuse_fma`, default configs included.
