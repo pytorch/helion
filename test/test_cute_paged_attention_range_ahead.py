@@ -651,13 +651,16 @@ def test_a_fixed_distance_moves_every_paired_candidate_onto_the_balanced_partiti
     with cpu_render_target(fake_device_sm_count=SMS), banks.env, banks.host_function:
         moves = seed_transfers(spec, {KEY: 96})
         paired = _paired(moves)
-        # 55 seeds on the paired schedule: 43 with one unit per CTA, which
+        # 71 seeds on the paired schedule: 43 with one unit per CTA, which
         # take the balanced partition and its query TMA; 6 that prefetch
         # pages, which are dropped with that partition; 3 with a third page
         # per head, which eight query columns hold on a persistent CTA.
-        # (Four of the 55 repeat the range-ahead seeds with the spare
-        # warp's look.)
-        assert len(paired) == 55
+        # (Four of the 71 repeat the range-ahead seeds with the spare
+        # warp's look, and sixteen more repeat the look's two seeds under
+        # the store hint with the scale operands under the default load
+        # policy, by register split and key clip:
+        # ``test_cute_paged_attention_partition_look``.)
+        assert len(paired) == 71
         assert sum(PARTITION not in seed.config for seed, _moved in paired) == 43
         assert sum(PAGES_KEY in seed.config for seed, _moved in paired) == 6
         assert sum(RING in seed.config for seed, _moved in paired) == 3
@@ -676,29 +679,29 @@ def test_a_fixed_distance_moves_every_paired_candidate_onto_the_balanced_partiti
         assert all(KEY in failure for failure in failures)
         assert forced[0] == paired[0][1]
         # A fixed page count moves every paired seed to one unit per CTA,
-        # the four range-ahead seeds and the look's four among them: their
+        # the four range-ahead seeds and the look's twenty among them: their
         # distance and their tile count name nothing there and go.
         paged = _paired(seed_transfers(spec, {PAGES_KEY: 12}))
-        assert len(paged) == 55
-        assert sum(KEY in seed.config for seed, _moved in paged) == 8
+        assert len(paged) == 71
+        assert sum(KEY in seed.config for seed, _moved in paged) == 24
         for seed, moved in paged:
             assert moved is not None, seed
             assert moved.config[PAGES_KEY] == 12
             assert not any(key in moved.config for key in (PARTITION, TILES, KEY))
-        # Under a fixed tile count the eight seeds with a distance keep it.
+        # Under a fixed tile count the 24 seeds with a distance keep it.
         tiled = _paired(seed_transfers(spec, {TILES: 5}))
-        assert len(tiled) == 55 and all(moved is not None for _seed, moved in tiled)
+        assert len(tiled) == 71 and all(moved is not None for _seed, moved in tiled)
         for seed, moved in tiled:
             assert moved is not None
             assert moved.config.get(KEY) == seed.config.get(KEY)
-        assert sum(KEY in seed.config for seed, _moved in tiled) == 8
+        assert sum(KEY in seed.config for seed, _moved in tiled) == 24
         # An override that takes away what a distance stands on takes it
         # along; a skew is the balanced partition's own.
         for overrides, kept in (
             ({PARTITION: "item"}, 0),
             ({PARTITION: "whole"}, 0),
-            ({SKEW: 1}, 8),
-            ({RING: 3}, 8),
+            ({SKEW: 1}, 24),
+            ({RING: 3}, 24),
         ):
             moved, failures = transferred_seeds(spec, overrides)
             assert moved and not [failure for failure in failures if KEY in failure], (
@@ -707,11 +710,11 @@ def test_a_fixed_distance_moves_every_paired_candidate_onto_the_balanced_partiti
             assert sum(KEY in seed.config for seed in moved) == kept, overrides
     # Forty query columns, where a persistent CTA does not hold a third
     # page per head: the three seeds that name it transfer at the default
-    # depth, and all 55 transfer.
+    # depth, and all 71 transfer.
     wide = stream_bound(WAVES, rows=40, input_banks=2)
     with cpu_render_target(fake_device_sm_count=SMS), wide.env, wide.host_function:
         paired = _paired(seed_transfers(wide.config_spec, {KEY: 96}))
-        assert len(paired) == 55
+        assert len(paired) == 71
         assert sum(RING in seed.config for seed, _moved in paired) == 3
         for seed, moved in paired:
             assert moved is not None, seed

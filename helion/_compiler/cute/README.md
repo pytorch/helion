@@ -1406,7 +1406,76 @@ So a search times it case by case. The seeds give it the start it was
 measured from: on a windowed kernel past one wave each range-ahead seed
 (the reversed walk with a distance and a ring of five tiles, plain and
 under the store hint) follows once more with the look, behind every other
-seed, where the device holds the stage beside the seed's ring.
+seed but the look's own of the next paragraph, where the device holds the
+stage beside the seed's ring.
+
+Those seeds hint their four TMA operands alike, with the leading family's
+`streaming`, as every attention seed hints the four alike. Where `streaming`
+is among the load-policy priorities and each of the four operands (raw K, K
+scales, raw V, V scales) has a policy slot, the look's seeds under the store
+hint (the plain ones where no seed names that hint) follow once more with
+the two scale operands under the default L2 load policy and raw K and raw V
+under `streaming`; that form follows once per other admitted register split;
+and each of those once more with both key clips, where the planner seeds
+both-clip counterparts (the default clips the leading side alone). With two
+distances, four splits and that default these are sixteen seeds, the last of
+the list. They follow the look's seeds and exist nowhere else: not for a
+kernel that is not paired paged attention, a kernel without a window, a grid
+of one wave, or a bind where a TMA operand has no slot.
+
+Measured on a B200 with the SDG eval harness on a 2047-key window: the
+frozen harness on one card with the twelve window cases of the 200- and
+320-request arms in one process, two calls a sample, legs of 15 samples:
+four legs a config for the hint's figures (three for the 0.37 flip and for
+the cases without a window), six for each search's returned config. They
+were taken before the final selection's tie rule covered the paired body's
+streaming output stores (below), with the planner as it is here minus
+these seeds.
+
+- The hint. `streaming` against the default policy on the two scale
+  operands, all else equal, on the searched configs of a full measurement:
+  0.20 to 0.95 us per call more in all twelve cases (320 requests, position
+  0: draft 0.73 +- 0.11, verify 0.44 +- 0.09). The K scales alone at that
+  draft case: 0.22 +- 0.04 less from `streaming` to default on one config,
+  0.37 +- 0.06 more from default to `streaming` on another. A search's own
+  readings (50 ms bank-cycle windows, 96 cold searches, configs that differ
+  in nothing else) put `streaming` 0.49 us above default at 320 requests and
+  0.34 at 200. Without a window the direction reverses: on the twelve
+  full-attention cases of those arms the default costs 8 to 12 timer steps,
+  about 1.5%, on the eleven balanced configs (and 1.6 +- 0.6 us on the one
+  with one unit per CTA). So only seeds of a windowed kernel name it.
+- Splits and clips. The policy is necessary and not sufficient: members of
+  the family with default scale loads read 28% to 77% of their samples on
+  the handwritten kernel's timer step. The forms with the 120/96/96/48 or
+  the 136/80/80/48 split and both key clips read about 0.25 us ahead of the
+  form without them; which split leads differs by session, and at verify
+  position 0 the leading clip reads better than both. So each is a seed, and
+  the search times them.
+- Searches. Cold searches of 320 requests, draft position 0, each returned
+  config judged by six legs: without these seeds 4 of 8 returned a config on
+  the handwritten kernel's step (odds of 57% +- 13 to pass a comparison of
+  two legs a role), with them 10 of 10 (94% +- 3; Fisher's exact test p =
+  0.023; the returned configs read 0.20 us above the handwritten kernel in
+  the mean without the seeds and 0.04 below with them). At verify position
+  0, 6 of 6 with the seeds and 2 of 2 without. Of eight other cases of the
+  four binds, searched once each with the seeds, seven read the timer step
+  of a full measurement's config or better, and one (320 requests, draft
+  position 1023) returned an added seed one step slower (handwritten /
+  Helion 1.034 against 1.051; not repeated).
+- How they work. The added seeds lead generation 0 by about 0.8 us, and the
+  searches stop three to five generations earlier, on one of them or its
+  neighbour. They pin the family; they do not make the final selection rank
+  its members. Generation 0 grows from 88 to 104 configs (about 40 s), and
+  whole searches were not longer (987 s in the mean with the seeds, 1112 s
+  without).
+- Limits. The handwritten kernel itself sits on a timer-step boundary at
+  that draft case (59% of its samples on the lower step; it fails 11% of
+  two-leg comparisons against itself), so parity there passes one such
+  comparison about 94% of the time, not always. Windowed binds on one wave
+  also read `streaming` scale loads slower in the frozen harness (0.02 to
+  0.37 us in the twelve window cases of 128 requests), but a search's
+  readings do not show it (0.003 us) and no seed was measured there: none is
+  seeded.
 
 The paired schedule's `cute_mma_dag_page_order` is the order in which a CTA
 streams a unit's pages. `source`, the default and the meaning of a missing

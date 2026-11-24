@@ -253,7 +253,8 @@ def seeds_ahead_of_the_partition_look(
     """The seeds ahead of those whose spare warp looks for a unit's lowest
     part, which a windowed kernel on a grid of more units than SMs has
     behind every other seed where its search samples the boundary prefetch:
-    the range-ahead seeds once more with that look
+    the range-ahead seeds once more with that look, and behind them the
+    look's forms that load the scale operands under the default policy
     (``test_cute_paged_attention_partition_look`` pins them)."""
     looked = [seed for seed in seeds if "cute_mma_dag_partition_look" in seed.config]
     ahead = seeds[: len(seeds) - len(looked)]

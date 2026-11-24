@@ -199,8 +199,10 @@ def test_a_grid_of_other_ctas_than_the_kernel_was_bound_for_keeps_every_bit():
 
 
 # One compile pair each: a skewed partition (the unit's other parts are
-# found by the walk over CTAs), the seeded combination and its form under
-# the store hint, the look beside the range-ahead role the same warp runs
+# found by the walk over CTAs), the seeded combination, its form under the
+# store hint and its form with both key clips and another register split
+# (the stage reuses the raw K ring behind a loader whose boundary tiles
+# are shifted), the look beside the range-ahead role the same warp runs
 # first, V issued with its K, sleeping waits, a short window, the reference
 # recurrence, five units to four CTAs, the wider panels, whose stage has a
 # row a lane (32 columns) and two rows for eight lanes (40) and whose
@@ -215,6 +217,17 @@ SCHEDULES = {
         SPARE,
         {**WALK, AHEAD: 96, TILES: 5, "cute_store_policy": "l2_evict_last"},
         {"ctas": 100},
+    ),
+    "seeded-split-both-clips": (
+        SPARE,
+        {
+            **WALK,
+            AHEAD: 48,
+            TILES: 5,
+            "cute_mma_dag_key_clip": "both",
+            "cute_mma_dag_register_quotas": "120/96/96/48",
+        },
+        {},
     ),
     "range-ahead": (SPARE, {**BALANCED, AHEAD: 48}, {}),
     "lag0": (SPARE, {**BALANCED, V_LAG: 0}, {}),

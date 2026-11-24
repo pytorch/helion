@@ -21,6 +21,8 @@ from __future__ import annotations
 
 import ast
 import contextlib
+import copy
+import dataclasses
 from fractions import Fraction
 import functools
 import inspect
@@ -45,6 +47,9 @@ from helion._compiler.cute.cute_mma_dag import paged_attention_partition_look_ch
 from helion._compiler.cute.cute_mma_dag import paged_attention_partition_look_fit
 from helion._compiler.cute.paged_attention_config import (
     paged_attention_partition_look_reason,
+)
+from helion._compiler.cute.paged_attention_registers import (
+    MMA_DAG_REGISTER_QUOTAS_CHOICES,
 )
 from helion._compiler.cute.paged_attention_shared_memory import MAIL_WORDS
 from helion._compiler.cute.paged_attention_shared_memory import (
@@ -121,6 +126,10 @@ AHEAD = "cute_mma_dag_boundary_prefetch_ahead"
 TILES = "cute_mma_dag_value_ring_tiles"
 RING = "cute_mma_dag_value_ring"
 SKEW = "cute_mma_dag_partition_skew"
+STORE = "cute_store_policy"
+QUOTAS = "cute_mma_dag_register_quotas"
+CLIP = "cute_mma_dag_key_clip"
+LOADS = "load_eviction_policies"
 # Shared memory one CTA of the modelled B200 may request.
 CAPACITY = 232448
 ONE_WAVE = 128
@@ -433,10 +442,12 @@ def test_the_contract_refuses_the_look_where_the_bind_does_not_hold_it():
         assert named == (unknown if both else reason)
         # A seed is a legal config: the range-ahead seeds count their ring
         # in tiles, so the device without room for both has those seeds
-        # and none with the look.
+        # and none with the look. (With room: the four once more with the
+        # look, and sixteen behind them that load the scale operands under
+        # the default policy.)
         seeds = stream_seeds(bound)
         assert len(_range_ahead(seeds)) == 4
-        assert sum(KEY in seed.config for seed in seeds) == (4 if both else 0)
+        assert sum(KEY in seed.config for seed in seeds) == (20 if both else 0)
     # Beside a ring the CTA does not hold with the stage, the look gives
     # way: 32 query columns hold a third page per head, and the stage
     # beside it, up to a capacity in between.
@@ -530,7 +541,7 @@ def test_a_step_and_a_fixed_override_take_the_balanced_partition():
         assert taken.config == asked.config and taken.config[KEY] == "spare"
         seeds = spec.compiler_seed_configs
         own = [seed for seed in seeds if KEY in seed.config]
-        assert len(own) == 4
+        assert len(own) == 20
         # Seed by seed: every seed on the paired schedule transfers with
         # the look on the balanced partition; the others are refused by
         # the look, and only they.
@@ -588,7 +599,7 @@ def test_a_step_and_a_fixed_override_take_the_balanced_partition():
     with cpu_render_target(fake_device_sm_count=SMS), tight.env, tight.host_function:
         spec = tight.config_spec
         own = [seed for seed in spec.compiler_seed_configs if KEY in seed.config]
-        assert len(own) == 4
+        assert len(own) == 20
         moves = seed_transfers(spec, {RING: 3})
         for seed, moved in moves:
             if seed in own:
@@ -606,17 +617,21 @@ def test_the_range_ahead_seeds_follow_once_more_with_the_look():
     # The reversed walk with a distance and a ring of five tiles, plain and
     # under the store hint, at two distances: the last seeds but the look's.
     assert len(repeated) == 4 and ahead[-4:] == repeated
-    assert [seed.config for seed in seeds[len(ahead) :]] == [
+    # (Behind the four the look's seeds follow that load the scale operands
+    # under the default policy: the next test.)
+    looked = seeds[len(ahead) : len(ahead) + 4]
+    assert [seed.config for seed in looked] == [
         {**seed.config, KEY: "spare"} for seed in repeated
     ]
     assert not any(KEY in seed.config for seed in ahead)
     with cpu_render_target(fake_device_sm_count=SMS), banks.env, banks.host_function:
-        for seed in seeds[len(ahead) :]:
+        for seed in looked:
             strict = banks.config_spec.normalized_config(seed)
             assert strict.config[KEY] == "spare" and strict.config[TILES] == 5
-    keywords = body_keywords(stream_render(banks, seeds[-1]))
+    keywords = body_keywords(stream_render(banks, looked[-1]))
     assert keywords["partition_look"] == "'spare'"
     assert keywords["value_ring_tiles"] == "5"
+    assert keywords["tma_load_hints"] == str(("evict_first",) * 4)
     # The body is told its capacity once, whichever of the ring's two
     # options names it beside the look: counted in the text, since a
     # keyword given twice parses and only fails where the kernel compiles.
@@ -639,6 +654,133 @@ def test_the_range_ahead_seeds_follow_once_more_with_the_look():
         stream_bound(SMS, input_banks=2),
     ):
         assert not any(KEY in seed.config for seed in stream_seeds(bound))
+
+
+def _scales_apart(seeds, slots):
+    """The seeds on the paired schedule that do not hint the TMA operands
+    with a policy slot (``slots``: raw K, K scale, raw V, V scale) alike."""
+    return [
+        seed
+        for seed in seeds
+        if seed.config["cute_mma_dag_pass_warps"] == PAIRED
+        and len({seed.config[LOADS][slot] for slot in slots if slot is not None}) > 1
+    ]
+
+
+def test_the_looks_seeds_follow_with_the_scale_operands_under_the_default_policy():
+    """Every other seed on the paired schedule hints its four TMA operands
+    (raw K, K scale, raw V, V scale) alike. Behind the look's four seeds,
+    its two under the store hint follow with the scale operands under the
+    default load policy and raw K and raw V streaming, once per admitted
+    register split, and each of those once more with both key clips. (The
+    measurements: the package's README.md, where it describes the look's
+    seeds.)"""
+    banks = stream_bound(WAVES, input_banks=2)
+    spec = banks.config_spec
+    attention = _attention(banks)
+    slots = attention.tma_load_slots
+    raw_k, k_scale, raw_v, v_scale = slots
+    assert None not in slots and len(set(slots)) == 4
+    seeds = stream_seeds(banks)
+    ahead = seeds_ahead_of_the_partition_look(seeds)
+    looked, added = seeds[len(ahead) : len(ahead) + 4], seeds[len(ahead) + 4 :]
+    # Sixteen, behind every other seed: the seeds ahead keep their places.
+    assert len(added) == 16 and _scales_apart(seeds, slots) == added
+    for seed in added:
+        policies = seed.config[LOADS]
+        assert (policies[k_scale], policies[v_scale]) == ("", "")
+        assert (policies[raw_k], policies[raw_v]) == ("streaming", "streaming")
+        assert not any(
+            policy for slot, policy in enumerate(policies) if slot not in slots
+        )
+    # The look's seeds under the store hint, one per distance, with those
+    # policies; one per admitted register split, the default left unnamed
+    # as in every seed; and all of them once more with both key clips.
+    hinted = [
+        {**seed.config, LOADS: added[0].config[LOADS]}
+        for seed in looked
+        if seed.config.get(STORE) == "l2_evict_last"
+    ]
+    assert [seed[AHEAD] for seed in hinted] == [48, 96]
+    assert MMA_DAG_REGISTER_QUOTAS_CHOICES == (
+        "144/72/72/48",
+        "136/80/80/48",
+        "136/72/72/48",
+        "120/96/96/48",
+    )
+    assert attention.key_clip_choices[0] == "leading"
+    assert not any(QUOTAS in seed or CLIP in seed for seed in hinted)
+    assert [seed.config for seed in added] == [
+        {**seed, **split, **clip}
+        for clip in ({}, {CLIP: "both"})
+        for split in (
+            {},
+            *({QUOTAS: quotas} for quotas in MMA_DAG_REGISTER_QUOTAS_CHOICES[1:]),
+        )
+        for seed in hinted
+    ]
+    with cpu_render_target(fake_device_sm_count=SMS), banks.env, banks.host_function:
+        # Each is a complete legal config that normalizes to itself, and a
+        # search starts from every seed of the list: none of the sixteen
+        # is another seed's config.
+        for seed in added:
+            strict = spec.normalized_config(seed)
+            assert all(
+                strict.config[key] == value for key, value in seed.config.items()
+            )
+        moved, failures = transferred_seeds(spec, None)
+        assert not failures and len(set(moved)) == len(moved) == len(seeds)
+        assert _scales_apart(moved, slots) == moved[-16:]
+    # One render per form: the scale operands alone, with a register split,
+    # and with a split and both clips.
+    for seed, quotas, clip in (
+        (added[0], None, "leading"),
+        (added[7], "(120, 96, 96, 48)", "leading"),
+        (added[15], "(120, 96, 96, 48)", "both"),
+    ):
+        keywords = body_keywords(stream_render(banks, seed))
+        assert keywords["tma_load_hints"] == str(("evict_first", "", "evict_first", ""))
+        assert keywords.get("register_quotas") == quotas
+        assert keywords["key_clip"] == repr(clip)
+        assert keywords["partition_look"] == "'spare'"
+        assert keywords["store_policy"] == "'l2_evict_last'"
+    # No such seed where the planner has no look seed to repeat: with one
+    # input bank, without a window, on a grid of one wave, or on a device
+    # without room for the look beside the seeds' ring.
+    for bound in (
+        stream_bound(WAVES),
+        stream_bound(WAVES, input_banks=2, window=NO_WINDOW),
+        stream_bound(ONE_WAVE, input_banks=2),
+        stream_bound(SMS, input_banks=2),
+        stream_bound(WAVES, rows=40, input_banks=2, smem_capacity_bytes=220000),
+    ):
+        unhinted = stream_seeds(bound)
+        assert not _scales_apart(unhinted, _attention(bound).tma_load_slots)
+    # And none where a TMA operand has no policy slot: the look's four
+    # seeds, and nothing behind them.
+    facts = spec.cute_mma_dag_facts
+    assert facts is not None
+    for missing in (raw_k, k_scale):
+        fewer_slots = tuple(None if slot == missing else slot for slot in slots)
+        unslotted = copy.copy(spec)
+        unslotted.cute_mma_dag_facts = dataclasses.replace(
+            facts,
+            attention=dataclasses.replace(attention, tma_load_slots=fewer_slots),
+        )
+        fewer = stream_seeds(banks, unslotted)
+        assert len(fewer) == len(seeds) - 16
+        assert sum(KEY in seed.config for seed in fewer) == 4
+        assert not _scales_apart(fewer, fewer_slots)
+    # The both-clip counterparts are the planner's own: where the default
+    # does not clip the leading side alone (no bind with the look's seeds
+    # today: a window gives it that default), the eight forms by register
+    # split follow, and none that names a clip.
+    unclipped = copy.copy(spec)
+    unclipped.cute_mma_dag_facts = dataclasses.replace(
+        facts,
+        attention=dataclasses.replace(attention, key_clip_choices=("off", "trailing")),
+    )
+    assert _scales_apart(stream_seeds(banks, unclipped), slots) == added[:8]
 
 
 def test_the_looks_barriers_and_waits_stand_in_program_order():
