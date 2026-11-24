@@ -2800,7 +2800,10 @@ class LocalBenchmarkProvider(BenchmarkProvider):
             every rank times the same configs and the timing loop's per-config
             collectives pair them."""
             attempted: list[int] = []
-            for i in unit:
+
+            def compile_one(i: int) -> bool:
+                """Generate config ``i``'s code; False once the budget stops
+                the batch."""
                 # Past the budget, a few more candidates still compile while
                 # the search has no successful measurement (streaming times
                 # each at once; with a pool, only while nothing in the batch
@@ -2812,7 +2815,7 @@ class LocalBenchmarkProvider(BenchmarkProvider):
                 )
                 exceeded, stop = self._budget_step_synced(protected=protected)
                 if stop:
-                    break
+                    return False
                 if exceeded:
                     exemptions["compile"] += 1
                 attempted.append(i)
@@ -2915,6 +2918,24 @@ class LocalBenchmarkProvider(BenchmarkProvider):
                         if raise_if_no_viable_config:
                             raise
                         self._no_viable_config_error = e
+                return True
+
+            # With a pool the whole batch's code is generated here, serially,
+            # before the first precompile starts: seconds per config for a
+            # large kernel, so the batch gets a bar of its own. A streamed
+            # unit is one config, which the per-unit bar already reports.
+            with contextlib.closing(
+                iter_with_progress(
+                    unit,
+                    total=len(unit),
+                    description=f"{desc} generating code",
+                    enabled=self.settings.autotune_progress_bar and not streaming,
+                )
+            ) as codegen_progress:
+                for i in codegen_progress:
+                    # A budget stop or an error closes the bar where it is.
+                    if not compile_one(i):
+                        break
 
             # Every rank attempted the same configs (the budget's stop is
             # agreed); code generation can still fail on one rank only (its
