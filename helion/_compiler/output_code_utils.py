@@ -142,6 +142,50 @@ def _check_artifact_helion_namespace(tree: ast.Module) -> None:
         )
 
 
+def _check_artifact_torch_namespace(tree: ast.Module) -> None:
+    # Library registrations are process-local and can extend existing namespaces.
+    # Require direct Torch module references so a registry cannot escape via an alias.
+    registries = {"ops", "_ops", "classes", "_classes"}
+    torch_names = set()
+    parents = {
+        child: node for node in ast.walk(tree) for child in ast.iter_child_nodes(node)
+    }
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.Import, ast.ImportFrom)):
+            continue
+        for alias in node.names:
+            module = alias.name if isinstance(node, ast.Import) else node.module or ""
+            parts = module.split(".")
+            if parts[0] != "torch":
+                continue
+            if (
+                len(parts) > 1
+                and parts[1] in registries
+                or module == "torch"
+                and isinstance(node, ast.ImportFrom)
+                and alias.name in registries
+            ):
+                raise ValueError("artifact source depends on a Torch operator registry")
+            if isinstance(node, ast.Import) and (module == "torch" or not alias.asname):
+                torch_names.add(alias.asname or "torch")
+    for node, parent in parents.items():
+        if (
+            not isinstance(node, ast.Name)
+            or not isinstance(node.ctx, ast.Load)
+            or node.id not in torch_names
+        ):
+            continue
+        if not isinstance(parent, ast.Attribute) or parent.value is not node:
+            raise ValueError(
+                "artifact source uses a Torch operator registry or indirect module access"
+            )
+        attribute: ast.AST | None = parent
+        while isinstance(attribute, ast.Attribute):
+            if attribute.attr in registries:
+                raise ValueError("artifact source depends on a Torch operator registry")
+            attribute = parents.get(attribute)
+
+
 def close_artifact_source(source: str) -> str:
     """Require emitted artifact code to depend only on its declared runtimes.
 
@@ -153,6 +197,7 @@ def close_artifact_source(source: str) -> str:
     """
     tree = ast.parse(source)
     _check_artifact_helion_namespace(tree)
+    _check_artifact_torch_namespace(tree)
     runtime_nodes = _artifact_runtime_nodes(tree)
     source = ast.unparse(tree)
     table = symtable.symtable(source, "<helion-artifact>", "exec")

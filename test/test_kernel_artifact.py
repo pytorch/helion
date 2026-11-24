@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import ast
 import hashlib
-import json
 import os
 from pathlib import Path
 import subprocess
@@ -28,10 +27,10 @@ from helion._testing import skipIfCudaCapabilityLessThan
 from helion._utils import next_power_of_2
 from helion.autotuner import BooleanFragment
 from helion.autotuner import PowerOfTwoFragment
+from helion.experimental import ArtifactCase
+from helion.experimental import export_artifact
+from helion.experimental import load_artifact
 import helion.language as hl
-from helion.runtime.artifact import ArtifactCase
-from helion.runtime.artifact import export_artifact
-from helion.runtime.artifact import load_artifact
 from helion.runtime.kernel import BoundKernel
 from helion.runtime.kernel import KernelCompiler
 from helion.runtime.kernel import PyCodeCache
@@ -67,6 +66,20 @@ def _artifact_live_global(x: torch.Tensor):
     out = torch.empty_like(x)
     for tile in hl.tile(x.size(0)):
         out[tile] = x[tile] + _LIVE_BIAS[tile]
+    return out
+
+
+def _artifact_registered_op(x: torch.Tensor):
+    out = torch.ops.helion_artifact_test.clone(x)
+    for tile in hl.tile(x.size(0)):
+        out[tile] = out[tile] + 1
+    return out
+
+
+def _artifact_indirect_registered_op(x: torch.Tensor):
+    out = torch.functional.torch.ops.helion_artifact_test.clone(x)
+    for tile in hl.tile(x.size(0)):
+        out[tile] = out[tile] + 1
     return out
 
 
@@ -224,7 +237,7 @@ class TestKernelArtifact(RefEagerTestDisabled, TestCase):
         self.y = torch.zeros(16)
         self.config = helion.Config(block_sizes=[32])
 
-    def _export(self, fn=_artifact_add, *, name="program.json", cases=None):
+    def _export(self, fn=_artifact_add, *, name="program.py", cases=None):
         return export_artifact(
             _kernel(fn),
             cases or [ArtifactCase((self.x, self.y), self.config)],
@@ -233,7 +246,7 @@ class TestKernelArtifact(RefEagerTestDisabled, TestCase):
 
     @staticmethod
     def _source(path):
-        return json.loads(path.read_text())["payload"]["source"]
+        return path.read_text().partition("\n")[2]
 
     def test_export_load_preserves_defaults_and_explicit_cases_without_compilation(
         self,
@@ -301,11 +314,11 @@ class TestKernelArtifact(RefEagerTestDisabled, TestCase):
                     self.assertRaisesRegex(ValueError, message),
                 ):
                     self._export(
-                        name="unsupported.json",
+                        name="unsupported.py",
                         cases=[ArtifactCase((self.x, self.y, value), self.config)],
                     )
                 bind.assert_not_called()
-                self.assertFalse((self.root / "unsupported.json").exists())
+                self.assertFalse((self.root / "unsupported.py").exists())
                 with (
                     patch.object(PyCodeCache, "load") as loader,
                     self.assertRaisesRegex(ValueError, message),
@@ -316,15 +329,34 @@ class TestKernelArtifact(RefEagerTestDisabled, TestCase):
     def test_integrity_failure_precedes_source_loading(self):
         path = self._export()
         original = path.read_text()
-        corrupted = original.replace("tl.store(", "tl.load(", 1)
-        self.assertNotEqual(original, corrupted)
-        path.write_text(corrupted)
-        with (
-            patch.object(PyCodeCache, "load") as loader,
-            self.assertRaisesRegex(ValueError, "integrity"),
+        for old, new in (
+            ("tl.store(", "tl.load("),
+            ('"entrypoint":"_artifact_add"', '"entrypoint":"other"'),
         ):
+            corrupted = original.replace(old, new, 1)
+            self.assertNotEqual(original, corrupted)
+            path.write_text(corrupted)
+            with (
+                patch.object(PyCodeCache, "load") as loader,
+                self.assertRaisesRegex(ValueError, "integrity"),
+            ):
+                load_artifact(path)
+            loader.assert_not_called()
+
+    def test_triton_version_comes_from_imported_module(self):
+        triton = types.SimpleNamespace(__version__="3.7.1+git00000001")
+        imports = types.SimpleNamespace(import_module=Mock(return_value=triton))
+        with (
+            patch("helion.experimental.artifact.importlib", imports),
+            patch.object(PyCodeCache, "load") as loader,
+        ):
+            path = self._export()
             load_artifact(path)
-        loader.assert_not_called()
+            imports.import_module.assert_called_with("triton")
+            triton.__version__ = "3.7.1+git00000002"
+            with self.assertRaisesRegex(ValueError, "runtime identity"):
+                load_artifact(path)
+            loader.assert_not_called()
 
     def test_runtime_mismatch_and_changed_factory_defaults_are_rejected(self):
         path = self._export()
@@ -356,14 +388,27 @@ class TestKernelArtifact(RefEagerTestDisabled, TestCase):
                 _artifact_live_global,
                 cases=[ArtifactCase((self.x,), self.config)],
             )
-        self.assertFalse((self.root / "program.json").exists())
+        self.assertFalse((self.root / "program.py").exists())
+
+    def test_registered_host_operator_cannot_be_exported(self):
+        library = torch.library.Library("helion_artifact_test", "FRAGMENT")
+        self.addCleanup(library._destroy)
+        library.define("clone(Tensor x) -> Tensor")
+        library.impl("clone", torch.clone, "CompositeExplicitAutograd")
+        for kernel in (_artifact_registered_op, _artifact_indirect_registered_op):
+            with (
+                self.subTest(kernel=kernel.__name__),
+                self.assertRaisesRegex(ValueError, "Torch operator registry"),
+            ):
+                self._export(kernel, cases=[ArtifactCase((self.x,), self.config)])
+        self.assertFalse((self.root / "program.py").exists())
 
     def test_compiler_configuration_changes_require_a_new_explicit_export(self):
         with inductor_config.patch(use_fast_math=True):
-            fast_path = self._export(_artifact_maximum, name="fast.json")
+            fast_path = self._export(_artifact_maximum, name="fast.py")
         fast_bytes = fast_path.read_bytes()
         with inductor_config.patch(use_fast_math=False):
-            strict_path = self._export(_artifact_maximum, name="strict.json")
+            strict_path = self._export(_artifact_maximum, name="strict.py")
             with (
                 patch.object(
                     KernelCompiler,
@@ -403,7 +448,7 @@ class TestKernelArtifact(RefEagerTestDisabled, TestCase):
                     helion.Config(block_sizes=[16, 32, 32], split_k=1, swap_ab=False),
                 )
             ],
-            self.root / "scaled_mm.json",
+            self.root / "scaled_mm.py",
         )
         source = self._source(path)
         self.assertIn("tl.dot(", source)
@@ -439,9 +484,9 @@ class TestKernelArtifact(RefEagerTestDisabled, TestCase):
                         ),
                     )
                 ],
-                Path(directory) / "scaled_mm.json",
+                Path(directory) / "scaled_mm.py",
             )
-            tree = ast.parse(json.loads(path.read_text())["payload"]["source"])
+            tree = ast.parse(path.read_text())
         wrapper = next(
             node
             for node in tree.body
@@ -482,7 +527,7 @@ class TestKernelArtifactCUDA(RefEagerTestDisabled, TestCase):
             tempfile.TemporaryDirectory() as directory,
             patch.object(BoundKernel, "to_code") as to_code,
         ):
-            destination = Path(directory) / "prefetch.json"
+            destination = Path(directory) / "prefetch.py"
             with self.assertRaisesRegex(
                 ValueError, "Tensor-descriptor indexing and prefetch"
             ):
@@ -509,7 +554,7 @@ class TestKernelArtifactCUDA(RefEagerTestDisabled, TestCase):
                         ),
                     )
                 ],
-                Path(directory) / "scaled_mm.json",
+                Path(directory) / "scaled_mm.py",
             )
             with (
                 patch.object(
@@ -536,7 +581,7 @@ from unittest.mock import patch
 import torch
 from torch._inductor import config as inductor_config
 import helion
-from helion.runtime.artifact import ArtifactCase, export_artifact, load_artifact
+from helion.experimental import ArtifactCase, export_artifact, load_artifact
 from helion.runtime.kernel import BoundKernel, KernelCompiler
 
 phase, fixture_path, destination = sys.argv[1:]
@@ -549,20 +594,20 @@ if phase == "export":
     x = torch.ones(16, device="cuda")
     y = torch.zeros(16, device="cuda")
     config = helion.Config(block_sizes=[32])
-    export_artifact(module._kernel(module._artifact_add), [ArtifactCase((x, y), config), ArtifactCase((x, y), config, {"scale": 3.0})], root / "add.json")
-    export_artifact(module._scaled_mm_kernel(), [ArtifactCase(module._scaled_mm_inputs("cuda"), helion.Config(block_sizes=[16, 32, 32], split_k=1, swap_ab=False))], root / "scaled_mm.json")
+    export_artifact(module._kernel(module._artifact_add), [ArtifactCase((x, y), config), ArtifactCase((x, y), config, {"scale": 3.0})], root / "add.py")
+    export_artifact(module._scaled_mm_kernel(), [ArtifactCase(module._scaled_mm_inputs("cuda"), helion.Config(block_sizes=[16, 32, 32], split_k=1, swap_ab=False))], root / "scaled_mm.py")
     for enabled, name in ((True, "fast"), (False, "strict")):
         with inductor_config.patch(use_fast_math=enabled):
-            export_artifact(module._kernel(module._artifact_maximum), [ArtifactCase((x, y), config)], root / (name + ".json"))
+            export_artifact(module._kernel(module._artifact_maximum), [ArtifactCase((x, y), config)], root / (name + ".py"))
 else:
     assert "artifact_export_fixture" not in sys.modules
     sys.modules["artifact_export_fixture"] = None
     with patch.object(KernelCompiler, "compile", side_effect=AssertionError("artifact load ran frontend")), patch.object(BoundKernel, "to_code", side_effect=AssertionError("artifact load ran codegen")):
-        add = load_artifact(root / "add.json")
-        mm = load_artifact(root / "scaled_mm.json")
+        add = load_artifact(root / "add.py")
+        mm = load_artifact(root / "scaled_mm.py")
         with inductor_config.patch(use_fast_math=False):
-            fast = load_artifact(root / "fast.json")
-            strict = load_artifact(root / "strict.json")
+            fast = load_artifact(root / "fast.py")
+            strict = load_artifact(root / "strict.py")
             nan_x = torch.ones(16, device="cuda")
             nan_y = torch.full((16,), 2.0, device="cuda")
             nan_x[0] = float("nan")

@@ -129,6 +129,21 @@ def test_unbound_global_is_rejected() -> None:
         close_artifact_source("def kernel(x):\n    return x * factor\n")
 
 
+@pytest.mark.parametrize(
+    "body",
+    [
+        "import torch as t\ndef kernel(x):\n    return t.ops.aten.clone(x)",
+        "from torch import ops as registry\ndef kernel(x):\n    return registry.ns.op(x)",
+        "from torch._ops import ops",
+        'import torch\ndef kernel(x):\n    return getattr(torch, "ops").ns.op(x)',
+        "import torch\nt = torch\ndef kernel(x):\n    return t.ops.ns.op(x)",
+    ],
+)
+def test_process_local_torch_operator_registry_is_rejected(body: str) -> None:
+    with pytest.raises(ValueError, match="Torch operator registry"):
+        close_artifact_source(body)
+
+
 def test_native_runtime_shim_remains_closed() -> None:
     source = (
         "from __future__ import annotations\nimport types\n"

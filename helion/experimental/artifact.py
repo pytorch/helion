@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import dataclasses
 import hashlib
-import importlib.metadata
+import importlib
 import inspect
 import json
 import math
@@ -31,18 +31,19 @@ from .._compiler.output_code_utils import close_artifact_source
 from .._utils import indexing_uses_tensor_descriptor
 from ..autotuner.aot_compile import _standalone_call_key
 from ..autotuner.aot_compile import generate_standalone_file
-from .kernel import Kernel
-from .kernel import OutputCodeOptions
+from ..runtime.kernel import Kernel
+from ..runtime.kernel import OutputCodeOptions
 
 if TYPE_CHECKING:
     from collections.abc import Callable
     from collections.abc import Sequence
     import os
 
-    from .kernel import ConfigLike
+    from ..runtime.kernel import ConfigLike
 
 _FORMAT = "helion.explicit-triton-program"
-_VERSION = 1
+_VERSION = 2
+_HEADER = "# Helion artifact: "
 
 
 @dataclasses.dataclass(frozen=True)
@@ -68,9 +69,14 @@ def _check_execution_context() -> None:
 
 def _runtime_identity() -> dict[str, object]:
     try:
-        triton_version = importlib.metadata.version("triton")
-    except importlib.metadata.PackageNotFoundError:
+        triton_version = importlib.import_module("triton").__version__
+    except ModuleNotFoundError as error:
+        if error.name != "triton":
+            raise
         triton_version = None
+    else:
+        if not isinstance(triton_version, str) or not triton_version:
+            raise ValueError("Could not determine the Triton runtime version")
     return {
         "python": list(sys.version_info[:3]),
         "torch": torch.__version__,
@@ -262,7 +268,7 @@ def export_artifact(
     cases: Sequence[ArtifactCase],
     path: str | os.PathLike[str],
 ) -> Path:
-    """Compile explicit static cases and atomically write one trusted program.
+    """Compile explicit static cases and atomically write one trusted Python file.
 
     CPU examples support code generation and contract inspection. Triton
     artifacts require accelerator tensors for execution. Autotuning is never run.
@@ -274,6 +280,9 @@ def export_artifact(
         raise ValueError("Distributed kernels cannot be exported as artifacts")
     if not cases:
         raise ValueError("Artifact export requires at least one explicit case")
+    destination = Path(path)
+    if destination.suffix != ".py":
+        raise ValueError("Artifact path must end in .py")
     signature = _signature_spec(kernel.signature)
     codes: list[str] = []
     dispatch_keys: list[tuple[object, ...]] = []
@@ -329,7 +338,6 @@ def export_artifact(
         contracts.append(
             {"inputs": inputs, "target": target, "config": config.to_json()}
         )
-    destination = Path(path)
     destination.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(
         prefix=".helion-artifact-", dir=destination.parent
@@ -342,19 +350,18 @@ def export_artifact(
             dispatch_keys=dispatch_keys,
         )
         source = close_artifact_source(standalone.read_text())
-    payload = {
-        "format": _FORMAT,
-        "version": _VERSION,
-        "entrypoint": kernel.name,
-        "source": source,
-        "signature": signature,
-        "runtime": _runtime_identity(),
-        "cases": contracts,
-    }
-    envelope = {
-        "payload": payload,
-        "sha256": hashlib.sha256(_canonical_json(payload).encode()).hexdigest(),
-    }
+    manifest = _canonical_json(
+        {
+            "format": _FORMAT,
+            "version": _VERSION,
+            "entrypoint": kernel.name,
+            "signature": signature,
+            "runtime": _runtime_identity(),
+            "cases": contracts,
+        }
+    )
+    content = f"{manifest}\n{source}"
+    digest = hashlib.sha256(content.encode()).hexdigest()
     temporary_path: Path | None = None
     try:
         with tempfile.NamedTemporaryFile(
@@ -365,7 +372,7 @@ def export_artifact(
             delete=False,
         ) as output:
             temporary_path = Path(output.name)
-            output.write(_canonical_json(envelope))
+            output.write(f"{_HEADER}{digest} {content}")
         temporary_path.replace(destination)
     finally:
         if temporary_path is not None:
@@ -422,16 +429,19 @@ class FrozenKernel:
 
 
 def load_artifact(path: str | os.PathLike[str]) -> FrozenKernel:
-    """Load a trusted artifact without importing or recompiling its original kernel."""
+    """Validate a trusted Python artifact before executing its generated code."""
     _check_execution_context()
     try:
-        envelope = json.loads(Path(path).read_text())
-        payload = envelope["payload"]
-        if (
-            envelope["sha256"]
-            != hashlib.sha256(_canonical_json(payload).encode()).hexdigest()
-        ):
+        text = Path(path).read_text(encoding="utf-8")
+        if not text.startswith(_HEADER):
+            raise ValueError("Invalid artifact header")
+        digest, separator, content = text.removeprefix(_HEADER).partition(" ")
+        if not separator or digest != hashlib.sha256(content.encode()).hexdigest():
             raise ValueError("Artifact integrity check failed")
+        manifest, _, source = content.partition("\n")
+        payload = json.loads(manifest)
+        if not isinstance(payload, dict):
+            raise ValueError("Invalid artifact manifest")
         if (
             payload["format"] != _FORMAT
             or type(payload["version"]) is not int
@@ -441,8 +451,7 @@ def load_artifact(path: str | os.PathLike[str]) -> FrozenKernel:
         if payload["runtime"] != _runtime_identity():
             raise ValueError("Artifact runtime identity is incompatible")
         if (
-            not isinstance(payload["source"], str)
-            or not isinstance(payload["entrypoint"], str)
+            not isinstance(payload["entrypoint"], str)
             or not payload["entrypoint"].isidentifier()
         ):
             raise ValueError("Invalid artifact program")
@@ -456,8 +465,8 @@ def load_artifact(path: str | os.PathLike[str]) -> FrozenKernel:
             target = case["target"]
             if target != _target_identity(torch.device(target["device"])):
                 raise ValueError("Artifact target device is incompatible")
-        if close_artifact_source(payload["source"]) != payload["source"]:
+        if close_artifact_source(source) != source:
             raise ValueError("Artifact source is not closed and canonical")
     except (KeyError, TypeError, AttributeError, json.JSONDecodeError) as error:
         raise ValueError("Invalid artifact file") from error
-    return FrozenKernel(payload, signature)
+    return FrozenKernel({**payload, "source": source}, signature)

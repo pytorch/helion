@@ -304,22 +304,24 @@ A CuTe export also changes the entry point's signature and scalars:
   by value, so `kernel.bind(args)` can return a `BoundKernel` created by an
   earlier call with other values.
 
-### Explicit kernel artifacts
+### Experimental explicit kernel artifacts
 
 An explicitly selected artifact can skip Helion's frontend and source generation
 in a new process. Export the input signatures and configurations needed by the
 deployment, then load that file:
 
 ```python
+from helion.experimental import ArtifactCase, export_artifact, load_artifact
+
 # Preparation: compile the selected program and input signatures once.
-helion.export_artifact(
+export_artifact(
     my_kernel,
-    [helion.ArtifactCase(args=(example_input,), config=selected_config)],
-    "my_kernel.json",
+    [ArtifactCase(args=(example_input,), config=selected_config)],
+    "my_kernel.py",
 )
 
 # Deployment: the original kernel function and its module are not required.
-compiled = helion.load_artifact("my_kernel.json")
+compiled = load_artifact("my_kernel.py")
 result = compiled(actual_input)
 ```
 
@@ -329,6 +331,10 @@ does not claim to reproduce a fresh compilation of them. After changing the
 program or its compilation settings, export and select a new artifact. This is
 an explicit deployment decision; ordinary `@helion.kernel` calls do not discover
 or load these files automatically.
+
+Use `@helion.aot_kernel` to tune and select configurations with AOT heuristics.
+Use artifact export after selecting a configuration when deploying an exact
+set of compiled programs and input signatures.
 
 Each case uses a supplied configuration and static tensor shapes. The loader
 checks runtime and device compatibility. Calls must match the exported tensor
@@ -341,14 +347,15 @@ kernels, tensor-descriptor indexing or prefetch, runtime input specialization,
 and NaN or bytes scalar values are unsupported. CPU examples can be exported
 for code inspection; execution requires accelerator tensors.
 
-Unsupported dependencies on the original Python module are rejected at export.
+Unsupported dependencies on the original Python module and references to the
+process-local `torch.ops` registry are rejected at export.
 Exporting a kernel does not precompile Triton's device binaries, so a cold Triton
 cache can still require device compilation.
 
-Artifacts contain executable Python and must come from a trusted producer. The
-digest detects corruption; it does not authenticate the producer or sandbox the
-code. The generated program continues to depend on the checked PyTorch and
-Triton runtime.
+Artifacts are readable Python files with a manifest and digest in the header
+comment. Use `load_artifact` to validate the file and apply the runtime, target
+and input guards. Only load artifacts from a trusted producer. The digest
+detects corruption; it does not authenticate the producer or sandbox the code.
 
 ## Caching and Specialization
 
