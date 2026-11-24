@@ -176,6 +176,30 @@ def _benchmark_status_succeeded(status: str) -> bool:
     return status in _SUCCESSFUL_BENCHMARK_STATUSES
 
 
+def _benchmark_result_has_reading(result: BenchmarkResult) -> bool:
+    """Whether a result of ``benchmark`` holds a reading: a status that
+    succeeded and a finite, positive time. A joint result has a reading
+    only where every shape's result holds one, and an abandoned batch hands
+    on a result without one as a failure (``_abandoned_batch_reading``)."""
+    return (
+        _benchmark_status_succeeded(result.status)
+        and math.isfinite(result.perf)
+        and result.perf > 0
+    )
+
+
+def _abandoned_batch_reading(result: BenchmarkResult) -> IsolatedBenchmarkTiming:
+    """A result of ``benchmark`` in the form of
+    ``BenchmarkWorkerUnkillable.batch_results``: its reading, or the failure
+    of a config without one (a timeout, else an error, as a joint result
+    counts a shape's)."""
+    if result.status == "timeout":
+        return IsolatedBenchmarkFailure("timeout")
+    if _benchmark_result_has_reading(result):
+        return result.perf
+    return IsolatedBenchmarkFailure("error")
+
+
 def _baseline_failure_is_unrecoverable(error: BaseException) -> bool:
     """Whether a baseline attempt failed with an unrecoverable runtime error
     (an illegal instruction, an illegal memory access, ...): the device may
@@ -2720,6 +2744,15 @@ class LocalBenchmarkProvider(BenchmarkProvider):
         ``compile_time`` is the precompile future's wall time with a pool;
         when streaming it is the in-process ``compile_config`` wall time
         (code generation and module load, not a later JIT at first call).
+
+        A benchmark worker that survives its kill ends the batch with
+        ``BenchmarkWorkerUnkillable``. The error names the position of the
+        config that worker was timing (``fn_index``) and carries what the
+        batch knows of each of its configs by then (``batch_results``): the
+        reading or the failure of a config it has settled, the failure of a
+        config whose precompile failed, and ``None`` for every other config.
+        With a pool the batch compiles ahead, so a config after the one
+        under test can be among those that failed.
         """
         self._no_viable_config_error = None
         self.batch_configs_started = 0
@@ -3215,14 +3248,38 @@ class LocalBenchmarkProvider(BenchmarkProvider):
                     source_hash is not None
                     and source_hash in self._compiler_seed_source_hashes
                 )
-                if compiler_seed_source and source_hash is not None:
-                    perf = self._benchmark_function(
-                        config,
-                        fn,
-                        effective_source_hash=source_hash,
-                    )
-                else:
-                    perf = self._benchmark_function(config, fn)
+                try:
+                    if compiler_seed_source and source_hash is not None:
+                        perf = self._benchmark_function(
+                            config,
+                            fn,
+                            effective_source_hash=source_hash,
+                        )
+                    else:
+                        perf = self._benchmark_function(config, fn)
+                except BenchmarkWorkerUnkillable as error:
+                    # the worker that could not be reaped ran this config;
+                    # the batch returns nothing, so what it knows goes
+                    # along: every result it has settled, and the failed
+                    # precompile of a config it has not reached (the loop
+                    # times none of those). With a pool both can be of a
+                    # config after this one.
+                    error.fn_index = result_index
+                    known = [
+                        None
+                        if result.completed_at is None
+                        else _abandoned_batch_reading(result)
+                        for result in results
+                    ]
+                    for later in range(index + 1, len(valid_indices)):
+                        if not is_workings[later]:
+                            known[valid_indices[later]] = IsolatedBenchmarkFailure(
+                                "timeout"
+                                if precompile_status[later] == "timeout"
+                                else "error"
+                            )
+                    error.batch_results = tuple(known)
+                    raise
                 current_accuracy_failure = (
                     deduplicate_sources
                     and len(self._accuracy_failure_config_ids) > accuracy_failure_count
@@ -4251,7 +4308,7 @@ class LocalBenchmarkProvider(BenchmarkProvider):
                 timings.append(None)
                 continue
             if fresh_process and self._benchmark_worker is not None:
-                self._shutdown_isolated_worker(index - 1 if index else None)
+                self._shutdown_isolated_worker(index - 1 if index else None, timings)
             try:
                 try:
                     timing = self._run_subprocess_benchmark_job(
@@ -4268,8 +4325,10 @@ class LocalBenchmarkProvider(BenchmarkProvider):
                         ),
                     )
                 except BenchmarkWorkerUnkillable as error:
-                    # the worker that could not be reaped ran this candidate
+                    # the worker that could not be reaped ran this candidate;
+                    # the batch returns nothing, so what it read goes along
                     error.fn_index = index
+                    error.batch_results = tuple(timings)
                     raise
                 except InputBankMemoryError as error:
                     if args_slot is not None:
@@ -4328,17 +4387,23 @@ class LocalBenchmarkProvider(BenchmarkProvider):
                 timings.append(None if timing is None else float(timing))
             finally:
                 if fresh_process and self._benchmark_worker is not None:
-                    self._shutdown_isolated_worker(index)
+                    self._shutdown_isolated_worker(index, timings)
         return timings
 
-    def _shutdown_isolated_worker(self, fn_index: int | None) -> None:
+    def _shutdown_isolated_worker(
+        self,
+        fn_index: int | None,
+        batch_results: Sequence[IsolatedBenchmarkTiming] = (),
+    ) -> None:
         """Shut the isolated worker down; a worker that cannot be reaped names
-        the batch position of the candidate it last ran."""
+        the batch position of the candidate it last ran and carries
+        ``batch_results``, what that batch has read."""
         assert self._benchmark_worker is not None
         try:
             self._benchmark_worker.shutdown()
         except BenchmarkWorkerUnkillable as error:
             error.fn_index = fn_index
+            error.batch_results = tuple(batch_results)
             raise
         finally:
             self._benchmark_worker = None
@@ -4668,16 +4733,25 @@ class MultiShapeBenchmarkProvider(BenchmarkProvider):
             )
             for child in self.children
         ]
-        child_results = [
-            self._benchmark_child(
-                child,
-                materialized,
-                desc=f"{desc} shape {index + 1}",
-                case_index=index,
-                raise_if_no_viable_config=raise_if_no_viable_config,
-            )
-            for index, child in enumerate(self.children)
-        ]
+        child_results: list[list[BenchmarkResult]] = []
+        for index, child in enumerate(self.children):
+            try:
+                child_results.append(
+                    self._benchmark_child(
+                        child,
+                        materialized,
+                        desc=f"{desc} shape {index + 1}",
+                        case_index=index,
+                        raise_if_no_viable_config=raise_if_no_viable_config,
+                    )
+                )
+            except BenchmarkWorkerUnkillable as error:
+                # The child numbers the batch of its shape; the caller's
+                # batch is the joint one over ``configs``.
+                self._number_abandoned_batch(
+                    error, child_results, valid_indices, len(configs)
+                )
+                raise
         # Child retries can repair an aggregate result from an earlier batch.
         # Consume those repairs before the current row replaces the stored
         # multi-shape measurement for the same materialized config.
@@ -4717,12 +4791,7 @@ class MultiShapeBenchmarkProvider(BenchmarkProvider):
             original = configs[config_index]
             row = [child[child_config_index] for child in child_results]
             timings = [result.perf for result in row]
-            valid = all(
-                _benchmark_status_succeeded(result.status)
-                and math.isfinite(result.perf)
-                and result.perf > 0
-                for result in row
-            )
+            valid = all(_benchmark_result_has_reading(result) for result in row)
             perf = (
                 _aggregate_multi_shape_timings(
                     timings,
@@ -4919,6 +4988,43 @@ class MultiShapeBenchmarkProvider(BenchmarkProvider):
             backend.classify_autotune_exception(error) if backend is not None else None
         ) or classify_triton_exception(error)
         return child.settings.autotune_ignore_errors or action == "debug"
+
+    @staticmethod
+    def _number_abandoned_batch(
+        error: BenchmarkWorkerUnkillable,
+        rows: Sequence[Sequence[BenchmarkResult]],
+        valid_indices: Sequence[int],
+        count: int,
+    ) -> None:
+        """Give ``error``, which ended the batch of one shape, the numbering
+        of the joint batch over ``count`` configs and what that batch read.
+
+        The child numbers the materialized configs, whose positions in the
+        joint batch are ``valid_indices``, and its ``batch_results`` are the
+        readings of its shape; ``rows`` are the results of the shapes before
+        it. A config failed in the joint batch when it failed on a shape, as
+        a timeout when it timed out on one, or when it is invalid for the
+        anchor shape and was not materialized. No other config has a joint
+        reading: the batch did not time every shape.
+        """
+        materialized = set(valid_indices)
+        joint: list[IsolatedBenchmarkTiming] = [
+            None if position in materialized else IsolatedBenchmarkFailure("error")
+            for position in range(count)
+        ]
+        shapes = [
+            *([_abandoned_batch_reading(result) for result in row] for row in rows),
+            error.batch_results,
+        ]
+        for readings in shapes:
+            for position, reading in zip(valid_indices, readings, strict=False):
+                if isinstance(reading, IsolatedBenchmarkFailure) and (
+                    joint[position] is None or reading.status == "timeout"
+                ):
+                    joint[position] = reading
+        if error.fn_index is not None:
+            error.fn_index = valid_indices[error.fn_index]
+        error.batch_results = tuple(joint)
 
     def _record_aggregate_result(
         self,

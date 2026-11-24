@@ -1081,6 +1081,7 @@ def test_mirrored_refinement_uses_complete_worker_cycles(monkeypatch, outcome, f
     search._repeat_for_target_ms = lambda *args: 10
     search._apply_rebenchmark_timings = Mock()
     search._fallback_excluded_configs = set()
+    search.population = list(members)
     monkeypatch.setattr(
         base_search, "mirrored_bench_generic", Mock(side_effect=AssertionError)
     )

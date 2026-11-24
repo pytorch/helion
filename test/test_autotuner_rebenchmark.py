@@ -31,7 +31,11 @@ from helion.autotuner import PatternSearch
 from helion.autotuner import base_search as base_search_module
 from helion.autotuner.base_search import PopulationBasedSearch
 from helion.autotuner.base_search import PopulationMember
+from helion.autotuner.benchmark_provider import IsolatedBenchmarkFailure
 from helion.autotuner.benchmark_provider import LocalBenchmarkProvider
+from helion.autotuner.benchmark_provider import MultiShapeBenchmarkProvider
+from helion.autotuner.benchmark_provider import _MultiShapeAutotuneArgs
+from helion.autotuner.benchmark_worker import BenchmarkTimeout
 from helion.autotuner.benchmark_worker import BenchmarkWorkerUnkillable
 from helion.autotuner.benchmarking import MirroredBenchmarkTrace
 from helion.autotuner.benchmarking import _launches_several_kernels
@@ -39,6 +43,7 @@ from helion.autotuner.benchmarking import _mirrored_bench_call_layout
 from helion.autotuner.effort_profile import AutotuneEffortProfile
 from helion.autotuner.logger import AutotuningLogger
 from helion.autotuner.metrics import AutotuneMetrics
+from helion.autotuner.precompile_future import PrecompileFuture
 import helion.language as hl
 from helion.runtime.settings import Settings
 
@@ -1859,6 +1864,625 @@ class TestAutotunerRebenchmark(AutotunerTestCase):
                 self.assertEqual(
                     search._pinned_finalist_members[config].perfs, original.perfs
                 )
+
+
+# A re-timing batch that ends in a worker that survives its kill returns
+# nothing. The provider hands what the batch read to the error
+# (``BenchmarkWorkerUnkillable.batch_results``) and the search applies its
+# failures (``PopulationBasedSearch._record_abandoned_batch``). The tests run
+# on stand-ins for the worker's job: no kernel is compiled, no device is used.
+
+
+def _batch_provider(job: Callable[..., float]) -> LocalBenchmarkProvider:
+    """A provider whose isolated batches run ``job`` in place of the worker."""
+    provider = LocalBenchmarkProvider.__new__(LocalBenchmarkProvider)
+    provider.settings = Settings(autotune_log_level=logging.CRITICAL)
+    provider.log = Mock()
+    provider.mutated_arg_indices = []
+    provider._autotune_metrics = AutotuneMetrics()
+    provider._subprocess_wrapper_unloadable = False
+    provider._subprocess_benchmark_enabled = lambda: True
+    provider._subprocess_benchmark_uses_wall_clock = lambda: False
+    provider._benchmark_worker = None
+    provider._isolated_candidate_configs = {}
+    provider._run_subprocess_benchmark_job = job
+    provider.invalidate_effective_source_hash = Mock()
+    provider.release_private_argument_copies = Mock()
+    return provider
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("fresh_process", [False, True])
+def test_benchmark_isolated_hands_its_results_to_the_worker_that_survives(
+    fresh_process: bool,
+) -> None:
+    # The first candidate times out, the second hits a sticky CUDA error and
+    # the third is timed. Then the batch ends: under the fourth candidate, or,
+    # with a fresh process per candidate, at the shutdown of the worker that
+    # timed the third.
+    fns = [object(), object(), object(), object()]
+    worker = Mock()
+    worker.shutdown.side_effect = BenchmarkWorkerUnkillable("worker remained alive")
+
+    def job(fn: object, **kwargs: object) -> float:
+        index = fns.index(fn)
+        if index == 0:
+            raise BenchmarkTimeout("timed out")
+        if index == 1:
+            raise RuntimeError("CUDA error: an illegal memory access was encountered")
+        if index == 2:
+            if fresh_process:
+                provider._benchmark_worker = worker
+            return 1.5
+        raise BenchmarkWorkerUnkillable("worker remained alive")
+
+    provider = _batch_provider(job)
+    with pytest.raises(BenchmarkWorkerUnkillable) as caught:
+        provider.benchmark_isolated(fns, warmup=1, rep=1, fresh_process=fresh_process)
+    assert caught.value.fn_index == (2 if fresh_process else 3)
+    assert caught.value.batch_results == (
+        IsolatedBenchmarkFailure("timeout"),
+        IsolatedBenchmarkFailure("error"),
+        1.5,
+    )
+    # An error that no batch raised carries none.
+    assert BenchmarkWorkerUnkillable("worker remained alive").batch_results == ()
+
+
+def _abandoned_batch_search(
+    route: str, flash: bool, *, hang: str = "member", drops_aliases: bool = False
+) -> tuple[PopulationBasedSearch, list[PopulationMember], Callable[[], None]]:
+    """A search whose re-timing along ``route`` ends in a worker that survives
+    its kill, its members, and the call that runs the re-timing.
+
+    The members, by their readings: ``errored`` (the best one) and
+    ``timed_out`` fail in the batch; ``alias`` is another config of
+    ``errored``'s generated code and is not in the batch; ``hung`` is under
+    test when the worker survives its kill (``hang="member"``); ``safe``
+    comes after it. With ``hang="release"`` every member of the batch is
+    timed, and the worker survives its kill when the batch releases the
+    members' private argument copies.
+
+    The search keeps its source aliases: ``alias`` was compiled and timed as
+    a candidate of its own. With ``drops_aliases`` it counts an alias as the
+    kernel it repeats (``_collapses_source_aliases``): ``alias`` holds
+    ``errored``'s compiled function and its reading, and a re-timing times
+    ``errored`` for both.
+    """
+    errored, timed_out, alias, hung, safe = members = [
+        PopulationMember(
+            lambda: None, [perf], (), helion.Config(block_sizes=[block]), status="ok"
+        )
+        for block, perf in ((8, 0.4), (16, 0.5), (32, 0.6), (64, 1.0), (128, 2.0))
+    ]
+    if drops_aliases:
+        alias.fn, alias.status, alias.perfs[:] = errored.fn, "deduplicated", [0.4]
+    batch = [errored, timed_out, hung, safe]
+
+    def job(fn: object, **kwargs: object) -> float:
+        if fn is errored.fn:
+            raise RuntimeError("CUDA error: an illegal memory access was encountered")
+        if fn is timed_out.fn:
+            raise BenchmarkTimeout("timed out")
+        if fn is hung.fn and hang == "member":
+            raise BenchmarkWorkerUnkillable("worker remained alive")
+        return 3.0
+
+    provider = _batch_provider(job)
+    if hang == "release":
+        provider.release_private_argument_copies.side_effect = (
+            BenchmarkWorkerUnkillable("worker remained alive")
+        )
+    provider.private_argument_copies_affordable = lambda count: True
+    provider.settles_source_aliases = lambda: True
+    settings = Settings(
+        autotune_log_level=logging.CRITICAL,
+        autotune_benchmark_input_banks=3 if route == "mirrored" else 1,
+    )
+    search = PopulationBasedSearch.__new__(PopulationBasedSearch)
+    search.settings = settings
+    search.log = AutotuningLogger(settings)
+    search.kernel = SimpleNamespace(env=SimpleNamespace(process_group_name=None))
+    search.config_spec = SimpleNamespace(
+        cute_flash_search_enabled=flash,
+        backend=SimpleNamespace(
+            generated_source_hash=lambda fn: (
+                "shared" if fn in (errored.fn, alias.fn) else None
+            ),
+            collapses_generated_source_aliases=lambda config_spec: drops_aliases,
+        ),
+    )
+    search.benchmark_provider = provider
+    search._input_bank_count = settings.autotune_benchmark_input_banks
+    search._kernels = {}
+    search.population = list(members)
+    search._fallback_excluded_configs = set()
+    search.best_perf_so_far = 0.4
+    search.finishing_rounds = 1
+
+    def retime() -> None:
+        if route == "batch":
+            # one batch of the provider
+            search.rebenchmark(batch)
+        elif route == "private_copies":
+            # one member per batch, each on its own copy of the arguments
+            search.rebenchmark(batch, candidate_private_args=True)
+        elif route == "confirmation":
+            # the batch that confirms in-process timings far below the readings
+            search._confirm_suspicious_rebenchmark_timings(
+                batch, [member.perf / 10 for member in batch], desc="Rebenchmarking"
+            )
+        else:
+            # the sweeps of a search that times bank cycles
+            search.mirrored_rebenchmark(batch, desc="Rebenchmarking")
+
+    return search, members, retime
+
+
+# The four routes run more than one member in the worker through
+# ``benchmark_isolated`` (a multi-shape search's re-timing, the fifth, is
+# below); flash decides whether a failure also invalidates the source aliases.
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("flash", [False, True])
+@pytest.mark.parametrize(
+    "route", ["batch", "private_copies", "confirmation", "mirrored"]
+)
+def test_abandoned_retiming_keeps_its_failures_out_of_the_fallback(
+    route: str, flash: bool
+) -> None:
+    search, members, retime = _abandoned_batch_search(route, flash)
+    errored, timed_out, alias, hung, safe = members
+    search._final_selection_enabled = lambda: True
+    search.run_finishing_phase = lambda best, rounds: retime()
+
+    # The search then keeps the best config it measured that did not fail.
+    selected = search._finalize()
+
+    assert search._fallback_excluded_configs == {
+        errored.config,
+        timed_out.config,
+        hung.config,
+    }
+    invalidate = search.benchmark_provider.invalidate_effective_source_hash
+    if flash:
+        # as when the batch completes: every config of a failed kernel
+        assert selected == safe.config
+        assert [member.perfs for member in members] == [
+            [math.inf],
+            [math.inf],
+            [math.inf],
+            [math.inf],
+            [2.0],
+        ]
+        assert [member.status for member in members] == [
+            "error",
+            "timeout",
+            "error",
+            "timeout",
+            "ok",
+        ]
+        invalidate.assert_called_once_with("shared")
+    else:
+        # The readings stay as they are. The search keeps its source
+        # aliases: the alias has a function and a reading of its own, and no
+        # failure passes on to it outside the flash policy, when the batch
+        # completes or when it is abandoned.
+        assert selected == alias.config
+        assert [member.perfs for member in members] == [
+            [0.4],
+            [0.5],
+            [0.6],
+            [1.0],
+            [2.0],
+        ]
+        assert {member.status for member in members} == {"ok"}
+        invalidate.assert_not_called()
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("kernel", ["errored", "hung"])
+def test_abandoned_retiming_excludes_every_config_of_a_failed_kernel(
+    kernel: str,
+) -> None:
+    # The search drops source aliases: the alias is a kernel of the batch
+    # under another config, with that kernel's compiled function and its
+    # reading, and the re-timing times the member that holds the kernel.
+    search, members, _ = _abandoned_batch_search("batch", False, drops_aliases=True)
+    errored, timed_out, alias, hung, safe = members
+    if kernel == "hung":
+        alias.fn, alias.perfs[:] = hung.fn, [1.0]
+    search._final_selection_enabled = lambda: True
+    search.run_finishing_phase = lambda best, rounds: search._rebenchmark_kernels(
+        members
+    )
+
+    # The alias has the best reading left, of a kernel that failed or hung
+    # the worker: it leaves the fallback with the member that was timed.
+    assert search._finalize() == safe.config
+    assert search._fallback_excluded_configs == {
+        errored.config,
+        timed_out.config,
+        alias.config,
+        hung.config,
+    }
+    assert [member.perfs for member in members] == [
+        [0.4],
+        [0.5],
+        [0.4] if kernel == "errored" else [1.0],
+        [1.0],
+        [2.0],
+    ]
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("route", ["private_copies", "mirrored"])
+def test_retiming_abandoned_at_the_release_of_private_copies_keeps_its_failures(
+    route: str,
+) -> None:
+    # Every member was timed; no member was under test when the worker
+    # survived its kill, so only the two that failed leave the fallback.
+    search, members, retime = _abandoned_batch_search(route, False, hang="release")
+    errored, timed_out, _, _, _ = members
+    with pytest.raises(BenchmarkWorkerUnkillable) as caught:
+        retime()
+    assert caught.value.fn_index is None
+    assert search._fallback_excluded_configs == {errored.config, timed_out.config}
+
+
+@pytest.mark.cpu_only
+def test_abandoned_retiming_promotes_no_evidence_of_one_rank() -> None:
+    # Worker batches do not run where torch.distributed is initialized; an
+    # abort there excludes the config under test, as the final selection's does.
+    search, members, retime = _abandoned_batch_search("batch", True)
+    hung = members[3]
+    with (
+        patch.object(base_search_module.dist, "is_initialized", return_value=True),
+        pytest.raises(BenchmarkWorkerUnkillable),
+    ):
+        retime()
+    assert search._fallback_excluded_configs == {hung.config}
+    assert [member.perfs for member in members] == [[0.4], [0.5], [0.6], [1.0], [2.0]]
+
+
+# The fifth route is the re-timing of a search over several argument sets,
+# which runs every member through ``benchmark`` of each shape's provider. The
+# providers and their batch loops are the real ones here, over stand-ins for
+# the kernel's ``compile_config`` and the worker's job.
+
+
+def _shape_provider(job: Callable[[int], float]) -> LocalBenchmarkProvider:
+    """``_batch_provider`` with what ``benchmark`` reads besides, on a kernel
+    whose configs compile to stand-ins; ``job`` times one by its block size."""
+    provider = _batch_provider(lambda fn, **kwargs: job(fn().block_sizes[0]))
+    provider.settings.autotune_precompile = None
+    provider.settings.autotune_accuracy_check = False
+    provider.settings.autotune_progress_bar = False
+    provider.kernel = SimpleNamespace(
+        compile_config=lambda config, allow_print: lambda: config,
+        format_kernel_decorator=lambda config, settings: "decorator",
+        maybe_log_repro=lambda *args: None,
+        env=SimpleNamespace(process_group_name=None),
+    )
+    provider.config_spec = SimpleNamespace(
+        compiler_seed_timeout_retry_repetitions=None,
+        backend=SimpleNamespace(
+            should_deduplicate_generated_sources=lambda config_spec: False,
+        ),
+    )
+    provider.args = ()
+    provider._effective_source_hashes = set()
+    provider._effective_source_results = {}
+    provider._invalid_effective_source_hashes = set()
+    provider._accuracy_failure_config_ids = []
+    provider._compile_failure_config_ids = []
+    provider._worker_failure_config_ids = []
+    return provider
+
+
+def _sticky_cuda_error() -> RuntimeError:
+    return RuntimeError("CUDA error: an illegal memory access was encountered")
+
+
+@pytest.mark.cpu_only
+def test_benchmark_hands_its_results_to_the_worker_that_survives() -> None:
+    # The first config times out, the second hits a sticky CUDA error, the
+    # third is timed and the fourth reads zero, which is no reading (as in a
+    # joint result). The worker survives its kill under the fifth; the batch
+    # knows nothing of that config and of the sixth, which it did not reach.
+    def job(block: int) -> float:
+        if block == 8:
+            raise BenchmarkTimeout("timed out")
+        if block == 16:
+            raise _sticky_cuda_error()
+        if block == 32:
+            return 1.5
+        if block == 64:
+            return 0.0
+        raise BenchmarkWorkerUnkillable("worker remained alive")
+
+    provider = _shape_provider(job)
+    blocks = (8, 16, 32, 64, 128, 256)
+    with pytest.raises(BenchmarkWorkerUnkillable) as caught:
+        provider.benchmark([helion.Config(block_sizes=[block]) for block in blocks])
+    assert caught.value.fn_index == 4
+    assert caught.value.batch_results == (
+        IsolatedBenchmarkFailure("timeout"),
+        IsolatedBenchmarkFailure("error"),
+        1.5,
+        IsolatedBenchmarkFailure("error"),
+        None,
+        None,
+    )
+
+
+def _pooled_shape_provider(
+    job: Callable[[int], float],
+    *,
+    uncompilable: int | None = None,
+    precompile_timeout: int | None = None,
+    precompile_error: int | None = None,
+) -> LocalBenchmarkProvider:
+    """``_shape_provider`` with a precompile pool: a batch compiles and
+    precompiles all its configs before it times the first. The arguments
+    name configs by block size: ``uncompilable`` fails ``compile_config``,
+    the precompile of ``precompile_timeout`` times out and that of
+    ``precompile_error`` fails."""
+    provider = _shape_provider(job)
+    provider.settings.autotune_precompile = "fork"
+    provider.config_spec.backend.supports_precompile = lambda: True
+    provider.config_spec.backend.classify_autotune_exception = lambda error: "debug"
+    provider._jobs = 1
+
+    def compile_config(
+        config: helion.Config, allow_print: bool
+    ) -> Callable[[], helion.Config]:
+        if config.block_sizes[0] == uncompilable:
+            raise exc.InvalidConfig("does not compile")
+        return lambda: config
+
+    def precompile(config: helion.Config, fn: object) -> PrecompileFuture:
+        block = config.block_sizes[0]
+        future = PrecompileFuture.skip(
+            provider._precompile_context(),
+            config,
+            block not in (precompile_timeout, precompile_error),
+        )
+        if block == precompile_timeout:
+            future.failure_reason = "timeout"
+        return future
+
+    provider.kernel.compile_config = compile_config
+    provider._create_precompile_future = precompile
+    return provider
+
+
+@pytest.mark.cpu_only
+def test_benchmark_hands_on_the_failures_a_pool_knows_ahead() -> None:
+    # The first config is timed and the worker survives its kill under the
+    # second. By then the batch has compiled and precompiled the others: the
+    # third did not compile, the precompile of the fourth timed out and that
+    # of the fifth failed. It knows nothing of the sixth.
+    def job(block: int) -> float:
+        if block == 64:
+            raise BenchmarkWorkerUnkillable("worker remained alive")
+        return 1.5
+
+    provider = _pooled_shape_provider(
+        job, uncompilable=8, precompile_timeout=128, precompile_error=16
+    )
+    blocks = (4, 64, 8, 128, 16, 32)
+    with pytest.raises(BenchmarkWorkerUnkillable) as caught:
+        provider.benchmark([helion.Config(block_sizes=[block]) for block in blocks])
+    assert caught.value.fn_index == 1
+    assert caught.value.batch_results == (
+        1.5,
+        None,
+        IsolatedBenchmarkFailure("error"),
+        IsolatedBenchmarkFailure("timeout"),
+        IsolatedBenchmarkFailure("error"),
+        None,
+    )
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("rejects", [False, True])
+def test_benchmark_batch_numbers_an_abandoned_batch_by_its_configs(
+    rejects: bool,
+) -> None:
+    # ``BaseSearch.benchmark_batch`` gives the provider the configs that pass
+    # its filters: with ``rejects`` not the first, which the user's filter
+    # drops, and not the fourth, which the backend rules out. The second is
+    # timed, the worker survives its kill under the third, and the batch does
+    # not reach the fifth.
+    def job(block: int) -> float:
+        if block == 32:
+            raise BenchmarkWorkerUnkillable("worker remained alive")
+        return 1.5
+
+    search = PopulationBasedSearch.__new__(PopulationBasedSearch)
+    search.settings = Settings(
+        autotune_log_level=logging.CRITICAL,
+        autotune_config_filter=(
+            (lambda config: None if config.block_sizes[0] == 8 else config)
+            if rejects
+            else None
+        ),
+    )
+    search.log = Mock(trace_enabled=False)
+    search.config_spec = SimpleNamespace(
+        backend=SimpleNamespace(
+            autotune_config_is_viable=lambda config_spec, config: (
+                not rejects or config.block_sizes[0] != 64
+            )
+        )
+    )
+    search._search_space_tracker = None
+    search.benchmark_provider = _shape_provider(job)
+    blocks = (8, 16, 32, 64, 128)
+    with pytest.raises(BenchmarkWorkerUnkillable) as caught:
+        search.benchmark_batch([helion.Config(block_sizes=[block]) for block in blocks])
+    # The error numbers the configs the search gave, not the provider's batch
+    # of three. A rejected config is a failure of the batch: one that
+    # completes returns it without a reading.
+    rejected = IsolatedBenchmarkFailure("error")
+    assert caught.value.fn_index == 2
+    assert caught.value.batch_results == (
+        rejected if rejects else 1.5,
+        1.5,
+        None,
+        rejected if rejects else None,
+        None,
+    )
+
+
+def _abandoned_multi_shape_search(
+    flash: bool,
+) -> tuple[PopulationBasedSearch, list[PopulationMember]]:
+    """A search over two shapes whose re-timing of its members ends in a
+    worker that survives its kill, and the members.
+
+    The members, by their readings: ``invalid`` (the best one) no longer
+    materializes for the anchor shape, so no shape times it; ``errored`` hits
+    a sticky CUDA error on the first shape; ``timed_out`` does so too and
+    times out on the second, where ``hung`` is under test when the worker
+    survives its kill; ``safe`` comes after it.
+    """
+    invalid, errored, timed_out, hung, safe = members = [
+        PopulationMember(
+            lambda: None, [perf], (), helion.Config(block_sizes=[block]), status="ok"
+        )
+        for block, perf in ((4, 0.3), (8, 0.4), (16, 0.5), (64, 1.0), (128, 2.0))
+    ]
+
+    def first_shape(block: int) -> float:
+        if block in (8, 16):
+            raise _sticky_cuda_error()
+        return 3.0
+
+    def second_shape(block: int) -> float:
+        if block == 16:
+            raise BenchmarkTimeout("timed out")
+        if block == 64:
+            raise BenchmarkWorkerUnkillable("worker remained alive")
+        return 4.0
+
+    def normalize(config: helion.Config) -> None:
+        if config.block_sizes[0] == 4:
+            raise exc.InvalidConfig("invalid for the anchor shape")
+
+    children = [_shape_provider(first_shape), _shape_provider(second_shape)]
+    provider = MultiShapeBenchmarkProvider.__new__(MultiShapeBenchmarkProvider)
+    provider.config_spec = SimpleNamespace(normalize=normalize)
+    provider.args = _MultiShapeAutotuneArgs(
+        cases=tuple((child.kernel, ()) for child in children),
+        aggregation="max",
+        relative_to=None,
+        cache_tag=None,
+        workload_key=("workload",),
+    )
+    provider.log = Mock()
+    provider.children = children
+    provider._collect_effective_source_repairs = False
+    settings = Settings(autotune_log_level=logging.CRITICAL)
+    search = PopulationBasedSearch.__new__(PopulationBasedSearch)
+    search.settings = settings
+    search.log = AutotuningLogger(settings)
+    search.config_spec = SimpleNamespace(
+        cute_flash_search_enabled=flash,
+        backend=SimpleNamespace(generated_source_hash=lambda fn: None),
+    )
+    search.benchmark_provider = provider
+    search.population = list(members)
+    search._fallback_excluded_configs = set()
+    return search, members
+
+
+@pytest.mark.cpu_only
+def test_abandoned_multi_shape_retiming_names_the_joint_batch() -> None:
+    search, members = _abandoned_multi_shape_search(False)
+    with pytest.raises(BenchmarkWorkerUnkillable) as caught:
+        search.rebenchmark(members)
+    # The second shape's provider numbers the four configs it was given: the
+    # joint batch has ``invalid`` before them, and the first shape's failures.
+    assert caught.value.fn_index == 3
+    assert caught.value.batch_results == (
+        IsolatedBenchmarkFailure("error"),
+        IsolatedBenchmarkFailure("error"),
+        IsolatedBenchmarkFailure("timeout"),
+        None,
+        None,
+    )
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("flash", [False, True])
+def test_abandoned_multi_shape_retiming_keeps_its_failures_out_of_the_fallback(
+    flash: bool,
+) -> None:
+    search, members = _abandoned_multi_shape_search(flash)
+    invalid, errored, timed_out, hung, safe = members
+    # A multi-shape search has no final selection: its single-pass final
+    # verification re-times the finalists.
+    search.final_selection = None
+    search.final_rebenchmark_best = lambda best: search.rebenchmark(members)
+
+    assert search._finalize() == safe.config
+
+    assert search._fallback_excluded_configs == {
+        invalid.config,
+        errored.config,
+        timed_out.config,
+        hung.config,
+    }
+    # A joint re-timing applies no alias policy, also in a flash search: the
+    # members keep their readings.
+    assert [member.perfs for member in members] == [[0.3], [0.4], [0.5], [1.0], [2.0]]
+    assert {member.status for member in members} == {"ok"}
+
+
+@pytest.mark.cpu_only
+def test_abandoned_multi_shape_retiming_keeps_a_failure_known_ahead() -> None:
+    # The first shape's provider compiles ahead. The worker survives its kill
+    # under the first member, the best one; the second no longer compiles
+    # for that shape, which the batch knew before it timed the first.
+    search, members = _abandoned_multi_shape_search(False)
+    _, uncompilable, _, hung, safe = members
+    hung.perfs[:] = [0.1]
+
+    def first_shape(block: int) -> float:
+        if block == 64:
+            raise BenchmarkWorkerUnkillable("worker remained alive")
+        return 3.0
+
+    search.benchmark_provider.children[0] = _pooled_shape_provider(
+        first_shape, uncompilable=8
+    )
+    search.population = retimed = [hung, uncompilable, safe]
+    search.final_selection = None
+    search.final_rebenchmark_best = lambda best: search.rebenchmark(retimed)
+
+    assert search._finalize() == safe.config
+    assert search._fallback_excluded_configs == {hung.config, uncompilable.config}
+
+
+@pytest.mark.cpu_only
+def test_abandoned_multi_shape_retiming_drops_no_aliases() -> None:
+    # A member's function is the anchor shape's. ``safe`` shares it with
+    # ``hung``, whose kernel hung the worker on the second shape. Two configs
+    # are one kernel only where every shape's source agrees, which the
+    # provider of a multi-shape search does not report
+    # (``settles_source_aliases``): the search drops no aliases, whatever
+    # its backend asks for, and ``safe`` stays a candidate of its own.
+    search, members = _abandoned_multi_shape_search(False)
+    hung, safe = members[3:]
+    safe.fn = hung.fn
+    backend = search.config_spec.backend
+    backend.collapses_generated_source_aliases = lambda config_spec: True
+    search.final_selection = None
+    search.final_rebenchmark_best = lambda best: search.rebenchmark(members)
+
+    assert search._finalize() == safe.config
+    assert safe.config not in search._fallback_excluded_configs
 
 
 class TestAutotuneBestOfKSettings(TestCase):
