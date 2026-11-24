@@ -562,3 +562,25 @@ these labelled lines.
   and `test_masked_singleton_tile_applies_each_lane_mask` in
   `test/test_cute_fragment_value_codegen.py` check the compiled rule.
   No test requires the eager discrepancy.
+
+## triton-grid-product-stored-in-int64
+
+- Area: Ordinary CuTe and Triton lowering of a Python grid index used as a
+  stored value.
+- What is wrong: For an Int64 output of shape (1, 2), nest
+  `for i in hl.grid(2, 4)` inside `for r in hl.grid(1)` and store
+  `out[r, i - 2] = i * 2**30`. Eager stores [2147483648, 3221225472].
+  With default indexing, both backends multiply in Int32 and sign-extend
+  the result. Their SM103 programs store [-2147483648, -1073741824].
+  An explicit `index_dtype=torch.int64` still gives those negative values
+  for this nested loop on both backends. For the top-level Triton grid,
+  explicit Int64 indexing does give the eager values. The default Triton
+  interpreter reproduces the top-level wrap but misses the nested one.
+- Since: Pristine main at `229afece6` for both backends; also reproduced
+  on `6e81e9c09` for Triton.
+- Why deferred: Ordinary lowering must distinguish Python index arithmetic
+  used as a value from address arithmetic and explicitly typed tensor math.
+  Correcting it calls for separate coverage of existing configurations and
+  the cost of widening ordinary kernels. This entry concerns unchecked
+  stores only.
+- Pinned by: None.

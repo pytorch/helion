@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ast
 from ctypes import c_int32
+from unittest.mock import patch
 
 import numpy as np
 import pytest
@@ -19,6 +20,7 @@ from helion._testing.cute_fragment_simulator import (
     simulate_independent_fragment as _simulate_independent_fragment,
 )
 import helion.language as hl
+from helion.runtime.ref_mode import RefMode
 
 pytestmark = pytest.mark.cpu_only
 
@@ -348,6 +350,64 @@ def test_slab_offset_and_limit_follow_vector_promotion(pos, index_dtype, mask_dt
             torch.testing.assert_close(out, expected, rtol=0, atol=0)
 
 
+def test_nested_fragment_mean_uses_the_live_tail():
+    @helion.kernel(backend="cute", static_shapes=True)
+    def scan(x, out):
+        for _ in hl.grid(1):
+            for t in hl.tile(3, 16, block_size=4):
+                mean = x[t].mean()
+                out[t] = torch.cumsum(x[t] * 0 + mean, dim=0)
+
+    x = torch.ones(16)
+    expected = torch.full_like(x, -1)
+    with patch.object(scan.settings, "ref_mode", RefMode.EAGER):
+        scan(x, expected)
+    assert expected.tolist() == [-1] * 3 + [1, 2, 3, 4] * 3 + [1]
+    with mock_cuda_unavailable():
+        code = cpu_bind(scan, (x, expected)).to_code(helion.Config(block_sizes=[]))
+    actual = torch.full_like(x, -1)
+    _simulate_independent_fragment(code, {"x": x}, {"out": actual}, 1)
+    torch.testing.assert_close(actual, expected)
+
+
+@pytest.mark.parametrize(
+    "dynamic,index_dtype",
+    [(False, torch.int64), (True, torch.int64), (True, None)],
+    ids=["literals", "device-bounds", "device-bounds-default-index"],
+)
+def test_ordinary_fragment_int64_range_preserves_both_endpoints(dynamic, index_dtype):
+    @helion.kernel(backend="cute", static_shapes=True, index_dtype=index_dtype)
+    def scan(x, out, bounds, dynamic: hl.constexpr):
+        for row in hl.grid(1):
+            if dynamic:
+                start, stop = bounds[row, 0], bounds[row, 1]
+            else:
+                start, stop = 2**32 - 1, 2**32 + 1
+            for i in hl.grid(start, stop):
+                out[row, :] = out[row, :] + torch.cumsum(x[row, :] + i, dim=0)
+
+    x = torch.zeros((1, 4), dtype=torch.int64)
+    expected = torch.zeros_like(x)
+    center = 2**31 if index_dtype is None else 2**32
+    bounds = torch.tensor([[center - 1, center + 1]])
+    with patch.object(scan.settings, "ref_mode", RefMode.EAGER):
+        scan(x, expected, bounds, dynamic)
+    assert expected.tolist() == [[(2 * center - 1) * n for n in range(1, 5)]]
+    with mock_cuda_unavailable():
+        code = cpu_bind(scan, (x, expected, bounds, dynamic)).to_code(
+            helion.Config(block_sizes=[])
+        )
+    actual = torch.zeros_like(x)
+    _simulate_independent_fragment(
+        code,
+        {"x": x, "bounds": bounds},
+        {"out": actual},
+        1,
+        int32=lambda v: (int(v) + 2**31) % 2**32 - 2**31,
+    )
+    torch.testing.assert_close(actual, expected)
+
+
 def test_masked_singleton_tile_applies_each_lane_mask():
     @helion.kernel(backend="cute", static_shapes=True)
     def scan(x, live, out):
@@ -453,3 +513,98 @@ def test_negative_tile_start_broadcasts_all_logically_live_lanes():
     torch.testing.assert_close(
         out[0], torch.arange(2, 9, 2, dtype=x.dtype), rtol=0, atol=0
     )
+
+
+@pytest.mark.parametrize(
+    "kind", ["host", "uint32", "nested", "expression", "signed-unit", "nonunit"]
+)
+def test_fragment_ranges_preserve_unproved_operands(kind):
+    @helion.kernel(backend="cute", static_shapes=True)
+    def scan(x, out, start: int, stop: int, bounds, kind: hl.constexpr):
+        for row in hl.grid(1):
+            if kind == "nested" or kind == "expression":
+                if kind == "nested":
+                    begin, end = bounds[row, 0], bounds[row, 1]
+                else:
+                    begin, end = 2, 4
+                for i in hl.grid(begin, end):
+                    if kind == "expression":
+                        low = i * 2**30
+                    else:
+                        low = i
+                    for j in hl.grid(low, low + 1):
+                        out[row, :] = out[row, :] + torch.cumsum(x[row, :] + j, dim=0)
+            else:
+                if kind == "host":
+                    low, high = start, stop
+                else:
+                    low, high = bounds[row, 0], bounds[row, 1]
+                step = 2 if kind == "nonunit" else 1
+                for j in hl.grid(low, high, step):
+                    out[row, :] = out[row, :] + torch.cumsum(x[row, :] + j, dim=0)
+
+    x = torch.zeros((1, 4), dtype=torch.int64)
+    start, stop = 2**31 - 1, 2**31 + 1
+    if kind in ("nonunit", "signed-unit"):
+        # With a unit stride stop is representable; with stride 2, the final
+        # increment would cross 2**31, even though both endpoints fit Int32.
+        bounds = torch.tensor([[2**31 - 2, 2**31 - 1]], dtype=torch.int32)
+    else:
+        bounds = torch.tensor(
+            [[start, stop]], dtype=torch.uint32 if kind == "uint32" else torch.int64
+        )
+    expected = torch.zeros_like(x)
+    args = x, expected, start, stop, bounds, kind
+    with patch.object(scan.settings, "ref_mode", RefMode.EAGER):
+        scan(*args)
+    total = 5 * 2**30 if kind == "expression" else 2**32 - 1
+    if kind in ("nonunit", "signed-unit"):
+        total = 2**31 - 2
+    assert expected.tolist() == [[total * n for n in range(1, 5)]]
+    with mock_cuda_unavailable():
+        code = cpu_bind(scan, args).to_code(helion.Config(block_sizes=[]))
+    actual = torch.zeros_like(x)
+    _simulate_independent_fragment(
+        code,
+        {"x": x, "bounds": bounds, "start": start, "stop": stop},
+        {"out": actual},
+        1,
+        int32=np.int32,
+    )
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    if kind in ("nonunit", "signed-unit"):
+        (loop,) = (
+            line for line in code.splitlines() if "for fragment_tile in range(" in line
+        )
+        assert (
+            "range(cutlass.Int32(" if kind == "signed-unit" else "range(cutlass.Int64("
+        ) in loop
+    if kind == "expression":
+        # Python's range simulator yields plain integers. Check the native
+        # counter is widened before constructing the nested endpoint.
+        assert "1073741824 * cutlass.Int64(fragment_tile)" in code
+
+
+def test_fragment_iota_uses_the_entire_symbolic_step():
+    @helion.kernel(backend="cute", static_shapes=True)
+    def scan(out):
+        for row in hl.grid(out.size(0)):
+            values = torch.ops.prims.iota.default(
+                3,
+                start=0,
+                step=row + 1,
+                dtype=torch.int64,
+                device=out.device,
+                requires_grad=False,
+            )
+            out[row, :] = torch.cumsum(values, dim=0)
+
+    expected = torch.empty((2, 3), dtype=torch.int64)
+    with patch.object(scan.settings, "ref_mode", RefMode.EAGER):
+        scan(expected)
+    assert expected.tolist() == [[0, 1, 3], [0, 2, 6]]
+    with mock_cuda_unavailable():
+        code = cpu_bind(scan, (expected,)).to_code(helion.Config(block_sizes=[]))
+    actual = torch.full_like(expected, -73)
+    _simulate_independent_fragment(code, {}, {"out": actual}, 2)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)

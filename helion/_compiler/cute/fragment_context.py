@@ -43,6 +43,7 @@ from ..inductor_lowering import size1_reduction_positions
 from ..variable_origin import GridOrigin
 from ..variable_origin import TileBeginOrigin
 from ..variable_origin import TileEndOrigin
+from ..variable_origin import TileExtentOrigin
 from ..variable_origin import TileIdOrigin
 from .dead_zero_atomics import dead_zero_atomic_results
 from .fragment_domain import OwnershipMask
@@ -482,6 +483,7 @@ class FragmentContext:
         self.bounds: dict[int, str] = {}
         # Nested loops may reuse a block ID. Key each interval by its induction variable.
         self.tile_intervals: dict[str, tuple[int, int]] = {}
+        self.stride_operands: dict[str, tuple[object, object, object]] = {}
         self.allocator = ""
         self.smem_bytes = 0
         self.buffers: list[tuple[str, torch.dtype, int]] = []
@@ -726,9 +728,13 @@ class FragmentContext:
                     offset = self.offsets[origin.block_id]
                     # A small loop may have an Int32 counter, but its value in
                     # user arithmetic must widen before evaluating the expression.
-                    if wide:
+                    if wide or self.env.index_dtype == torch.int64:
                         offset = f"cutlass.Int64({offset})"
                     size = self.df.resolved_block_size(origin.block_id)
+                    if isinstance(origin, TileExtentOrigin):
+                        # Nested fragment loops own their lexical end. A partial
+                        # tile contributes only the lanes before that end.
+                        return f"min({size}, ({self.bounds[origin.block_id]}) - ({offset}))"
                     if isinstance(origin, TileIdOrigin):
                         return f"({offset}) // {size}"
                     if isinstance(origin, TileEndOrigin):
