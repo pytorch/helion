@@ -81,7 +81,12 @@ Issues = "https://github.com/pytorch/helion/issues"
 target-version = "py310"
 line-length = 88
 src = ["helion"]
-extend-exclude = ["**/_helion_aot_*.py"]
+# inductor_pretuned/ holds Inductor's generated output modules, written by
+# inductor_pretuned.py and regenerated rather than edited.
+extend-exclude = [
+  "**/_helion_aot_*.py",
+  "benchmarks/cute/better_benchmark/inductor_pretuned/*.py",
+]
 force-exclude = true
 
 [tool.ruff.format]
@@ -244,6 +249,9 @@ project-excludes = [
   # hl.constexpr kernel arguments (Tensor + ConstExpr, int // ConstExpr) in
   # the device code; check_port.py checks every port on both backends.
   "benchmarks/cute/better_benchmark/kernels",
+  # Inductor's generated output modules (inductor_pretuned.py), which import
+  # names the stubs do not export and call their kernels untyped.
+  "benchmarks/cute/better_benchmark/inductor_pretuned",
 ]
 python-version = "3.10"
 search-path = ["../pytorch"]

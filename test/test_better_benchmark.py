@@ -36,6 +36,7 @@ from benchmarks.cute.better_benchmark import campaign
 from benchmarks.cute.better_benchmark import check_port
 from benchmarks.cute.better_benchmark import common
 from benchmarks.cute.better_benchmark import inductor_code
+from benchmarks.cute.better_benchmark import inductor_pretuned
 from benchmarks.cute.better_benchmark import ncu_profile
 from benchmarks.cute.better_benchmark import plan_run
 from benchmarks.cute.better_benchmark import report
@@ -46,7 +47,9 @@ from torch.utils import _pytree as pytree
 from torch.utils._python_dispatch import TorchDispatchMode
 
 import helion
+from helion._compat import requires_torch_version
 from helion._testing import DEVICE
+from helion._testing import _has_cute_dsl
 from helion._testing import cpu_render_target
 from helion._testing import skipIfNotCUDA
 from helion._testing import skipIfRefEagerMark
@@ -1189,6 +1192,19 @@ def test_only_the_standard_listing_keeps_inductor_from_behind_a_port() -> None:
         "forward": {"helion_triton": "helion_cute", "helion_cute": "memcopy"},
         "reverse": {"helion_cute": "helion_triton", "helion_triton": "oracle"},
     }
+    # helion.inductor's code runs Helion kernels too (common.runs_helion_code):
+    # listed after the ports and before the memcopy (README, helion.inductor),
+    # it keeps every Inductor compile from behind Helion code ...
+    pinned = [*listing[:-1], "inductor_helion_pretuned", "memcopy"]
+    assert bench.carryover_risk(pinned) == []
+    # ... and an Inductor compile listed right after it is flagged.
+    assert bench.carryover_risk(["inductor_helion_pretuned", "inductor_cd"]) == [
+        "inductor_cd behind inductor_helion_pretuned in forward rounds",
+        (
+            "inductor_cd behind inductor_helion_pretuned at the start of the next "
+            "sample in reverse rounds"
+        ),
+    ]
     assert bench.carryover_risk(listing) == []
     study = [*common.INDUCTOR_IMPLS, "oracle", "helion_cute", "memcopy"]
     assert bench.carryover_risk(study) == []
@@ -2739,6 +2755,241 @@ def test_every_port_loads_on_both_backends_without_a_config() -> None:
                 assert kernel.settings.static_shapes and not kernel.configs, (
                     f"{point['repro']}.{name} on {backend}"
                 )
+
+
+# helion.inductor (common.inductor_source_hash(), the pinned files) needs the
+# Inductor of torch 2.16; the module's other tests run on older torch.
+needs_helion_inductor = pytest.mark.skipif(
+    not requires_torch_version("2.16"), reason="helion.inductor needs torch 2.16"
+)
+
+
+def test_every_pinned_decorator_writes_fast_math_and_dot_precision() -> None:
+    # The files replay the settings they were written and checked under,
+    # whatever HELION_FAST_MATH or TRITON_F32_DEFAULT a bench sets
+    # (inductor_pretuned.with_settings).
+    decorators = [
+        line
+        for path in sorted(common.INDUCTOR_PRETUNED_DIR.glob("*.py"))
+        for match in inductor_pretuned.SOURCE_RE.finditer(path.read_text())
+        for line in match.group(2).split("\n")
+        if line.startswith("@helion.kernel(")
+    ]
+    assert decorators
+    for line in decorators:
+        assert "fast_math=" in line and "dot_precision=" in line, line[:80]
+
+
+@needs_helion_inductor
+def test_every_selected_point_has_pinned_inductor_code(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # One helion.inductor output module per point of the study's 48 and the
+    # three extras (the next 99 have none yet), which loads at that point's
+    # shape on CPU with every Helion kernel pinned to one config
+    # (common.load_inductor_pretuned), and has bench.py's entry.
+    kernels = [
+        k
+        for k in json.loads(common.SELECTION_PATH.read_text())["kernels"]
+        if k["reason"] != "next model share"
+    ]
+    files = {p.stem for p in common.INDUCTOR_PRETUNED_DIR.glob("*.py")}
+    assert len(kernels) == 51
+    assert sorted(files) == sorted(k["repro"] for k in kernels)
+    if not _has_cute_dsl():
+        pytest.skip("the pinned kernels' decorators are CuTe's")
+    # PyCodeCache writes each kernel's module under the Inductor cache.
+    monkeypatch.setenv("TORCHINDUCTOR_CACHE_DIR", str(tmp_path))
+    for kernel in kernels:
+        try:
+            module = common.load_inductor_pretuned(kernel["repro"], kernel["shape"])
+        except (ImportError, AttributeError) as error:
+            # A torch whose Inductor no longer has a wrapper helper the files
+            # take from torch._C._dynamo.guards (README.md, helion.inductor):
+            # they need regenerating. Any other error is the files' own.
+            if "torch._C._dynamo.guards" not in str(error):
+                raise
+            pytest.skip(f"{kernel['repro']}: written for another torch ({error})")
+        assert callable(module.forward), kernel["repro"]
+        assert any(isinstance(v, helion.Kernel) for v in vars(module).values())
+
+
+_OUTPUT_MODULE = '''\
+helion_fused_a_0_source = """\\
+import helion
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="full")
+def kernel(in0, out0):
+    out0[0] = in0[0]
+"""
+helion_fused_a_0 = PyCodeCache.load(helion_fused_a_0_source).kernel
+helion_fused_b_1_source = """\\
+import helion
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="full")
+def kernel(in0, out0):
+    out0[1] = in0[1]
+"""
+'''
+
+
+def test_inductor_pretuned_pins_the_decorator_of_each_kernel_source() -> None:
+    # Only the decorator line of each source string changes, to the one the
+    # kernel's own source picks.
+    def decorator_of(source: str) -> str:
+        return f"@helion.kernel(config=C{int('out0[1]' in source)})"
+
+    code, count = inductor_pretuned.pin(_OUTPUT_MODULE, decorator_of)
+    assert count == 2
+    assert code == _OUTPUT_MODULE.replace(
+        '@helion.kernel(backend="cute", static_shapes=True, autotune_effort="full")',
+        "@helion.kernel(config=C0)",
+        1,
+    ).replace(
+        '@helion.kernel(backend="cute", static_shapes=True, autotune_effort="full")',
+        "@helion.kernel(config=C1)",
+    )
+
+
+def test_pinned_outputs_compare_bits_and_layout() -> None:
+    # inductor_pretuned.py's check compares the written module's outputs with
+    # the compiled call's bits and layout: -0.0 is not 0.0, a NaN matches a
+    # NaN of its bits, and a transposed copy of equal values is not the same.
+    x = torch.tensor([[0.0, float("nan")], [1.5, -2.0]])
+    assert inductor_pretuned.identical(x, x.clone())
+    assert not inductor_pretuned.identical(x, torch.where(x == 0, -0.0, x))
+    assert not inductor_pretuned.identical(x, x.t().contiguous().t())
+    assert inductor_pretuned.identical(x.bool(), x.clone().bool())
+
+
+def test_pinned_outputs_off_by_their_own_spread_keep_their_layout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # An output the compiled call does not reproduce itself (an atomic
+    # accumulation's order) takes a tolerance on its values, not on its
+    # layout. These outputs are flat lists already, so better-benchmark's
+    # flattening (common.flatten_outputs) is not needed.
+    monkeypatch.setattr(common, "flatten_outputs", list)
+    e = torch.rand(2, 2)
+    out = Path("out.py")
+    inductor_pretuned.check_reproduced(out, [e], [e + 1e-7], [e.clone()])
+    with pytest.raises(RuntimeError, match="does not reproduce the layout"):
+        inductor_pretuned.check_reproduced(
+            out, [e], [e + 1e-7], [e.t().contiguous().t()]
+        )
+
+
+def test_inductor_pretuned_reads_the_kernel_source_unescaped() -> None:
+    # helion.inductor escapes a kernel source's backslashes in its literal;
+    # pin() hands decorator_of the source as Python reads the literal (the
+    # one PyCodeCache loaded) and escapes the decorator it writes back.
+    source = (
+        'import helion\n@helion.kernel(backend="cute")\ndef kernel():\n    s = "a\\b"\n'
+    )
+    literal = source.replace("\\", "\\\\")
+    module = f'helion_k_0_source = """\\\n{literal}"""\n'
+    seen: list[str] = []
+
+    def decorator_of(text: str) -> str:
+        seen.append(text)
+        return '@helion.kernel(backend="cute", config="x\\y")'
+
+    code, count = inductor_pretuned.pin(module, decorator_of)
+    assert (count, seen) == (1, [source])
+    namespace: dict[str, object] = {}
+    exec(code, namespace)
+    assert namespace["helion_k_0_source"] == source.replace(
+        '@helion.kernel(backend="cute")',
+        '@helion.kernel(backend="cute", config="x\\y")',
+    )
+
+
+def test_inductor_pretuned_writes_the_fast_math_and_dot_precision_it_ran_with() -> None:
+    # format_kernel_decorator() leaves out fast_math and dot_precision; the
+    # pinned decorator writes the values the kernel ran with, False and the
+    # default precision included, so that HELION_FAST_MATH at the time of
+    # writing does not decide them for every later bench.
+    decorator = (
+        "@helion.kernel(config=helion.Config(block_sizes=[64]), static_shapes=True)"
+    )
+    ran = helion.Settings(fast_math=True, dot_precision="ieee")
+    assert inductor_pretuned.with_settings(decorator, ran) == (
+        "@helion.kernel(fast_math=True, dot_precision='ieee', "
+        "config=helion.Config(block_sizes=[64]), static_shapes=True)"
+    )
+    ran = helion.Settings(fast_math=False, dot_precision="tf32")
+    assert inductor_pretuned.with_settings(decorator, ran).startswith(
+        "@helion.kernel(fast_math=False, dot_precision='tf32', config="
+    )
+    # A setting the decorator writes already stays as written.
+    written = "@helion.kernel(config=helion.Config(), fast_math=True)"
+    assert inductor_pretuned.with_settings(written, ran) == (
+        "@helion.kernel(dot_precision='tf32', config=helion.Config(), fast_math=True)"
+    )
+
+
+def test_inductor_pretuned_matches_a_config_on_the_kernel_and_its_inputs() -> None:
+    def entry(config: dict[str, object], **fields: str) -> dict[str, object]:
+        key = {"kernel_source_hash": "k", "specialization_key": "s", "hardware": "B200"}
+        key |= {"extra_cache_key": "", "config_spec_hash": "x"} | fields
+        return {"key": {"fields": key}, "config": json.dumps(config)}
+
+    want = {"kernel_source_hash": "k", "specialization_key": "s", "hardware": "B200"}
+    want["extra_cache_key"] = ""
+    # The config spec's hash, which covers the seed configs, may differ.
+    picked = entry({"block_sizes": [4]}, config_spec_hash="other seeds")
+    assert inductor_pretuned.matching_entry([picked], want) is picked
+    for field in ("kernel_source_hash", "specialization_key", "hardware"):
+        assert (
+            inductor_pretuned.matching_entry([entry({}, **{field: "?"})], want) is None
+        )
+    # Two entries of one kernel that pick different configs: no guess.
+    with pytest.raises(ValueError, match="2 different configs"):
+        inductor_pretuned.matching_entry(
+            [entry({"block_sizes": [4]}), entry({"block_sizes": [8]})], want
+        )
+
+
+@needs_helion_inductor
+def test_configs_from_refuses_a_skipped_cache(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # Under HELION_SKIP_CACHE (any value Helion's should_skip_cache() reads as
+    # set, "true" included) no kernel looks its --configs-from entry up, and
+    # each would autotune: inductor_pretuned.py refuses before compiling.
+    monkeypatch.setenv("HELION_SKIP_CACHE", "true")
+    args = argparse.Namespace(
+        repro_id="var_mean_f4578c128d74",
+        shape=None,
+        configs_from=tmp_path,
+        require_configs=False,
+        configs_note=None,
+        output=tmp_path / "out.py",
+    )
+    with pytest.raises(SystemExit, match="HELION_SKIP_CACHE skips its lookups"):
+        inductor_pretuned.write(args)
+
+
+@needs_helion_inductor
+def test_pinned_inductor_code_of_another_shape_is_refused(tmp_path: Path) -> None:
+    path = tmp_path / "sum_000000000001.py"
+    source_hash = common.inductor_source_hash()
+    path.write_text(
+        f"REPRO = 'sum_000000000001'\nSHAPE = 's1'\nSOURCE_HASH = {source_hash!r}\n"
+    )
+    assert common.load_inductor_pretuned("sum_000000000001", "s1", path).SHAPE == "s1"
+    with pytest.raises(ValueError, match="generated at shape s1, not s2"):
+        common.load_inductor_pretuned("sum_000000000001", "s2", path)
+
+
+@needs_helion_inductor
+def test_pinned_inductor_code_of_another_helion_inductor_warns(tmp_path: Path) -> None:
+    # A file written by another helion.inductor (SOURCE_HASH) still loads, with
+    # a warning that its code may not be what helion.inductor generates now.
+    path = tmp_path / "sum_000000000001.py"
+    path.write_text("REPRO = 'sum_000000000001'\nSHAPE = 's1'\nSOURCE_HASH = '0'\n")
+    with pytest.warns(UserWarning, match="holds the code of another helion.inductor"):
+        common.load_inductor_pretuned("sum_000000000001", "s1", path)
 
 
 def test_a_selection_pins_only_a_committed_better_benchmark(
@@ -6065,6 +6316,16 @@ def test_configs_from_benches_only_the_ports_whose_picks_it_takes(
         start(second, "triton", "--bench-impls", "inductor,helion_cute,helion_triton")
     error = capsys.readouterr().err
     assert "--bench-impls names helion_cute, and --backends triton takes no" in error
+    # Nor does it start helion.inductor's own search (inductor_helion), which
+    # no campaign times, nor bench the pinned helion.inductor code, which is
+    # CuTe's, without cute among --backends.
+    with pytest.raises(SystemExit):
+        start(second, "triton", "--bench-impls", "inductor,inductor_helion")
+    assert "names inductor_helion: a campaign job clears" in capsys.readouterr().err
+    with pytest.raises(SystemExit):
+        start(second, "triton", "--bench-impls", "inductor,inductor_helion_pretuned")
+    error = capsys.readouterr().err
+    assert "names inductor_helion_pretuned, the pinned helion.inductor code" in error
     assert kept == {
         path: path.read_bytes() for path in run.rglob("*") if path.is_file()
     }
@@ -6798,6 +7059,8 @@ def test_the_final_tables_count_only_clean_sampled_records(
     _toy_bench(run, t5, "t5", {**times, "memcopy": 20.0})
     times = {"inductor": 100.0, "inductor_cd": 90.0, "helion_cute": 60.0}
     times.update(helion_triton=120.0, oracle=80.0, memcopy=30.0)
+    # The pinned helion.inductor code, timed at s2 only.
+    times.update(inductor_helion_pretuned=45.0)
     # Its gate's float64 reference failed (common.AnchoredGate).
     eager = {"pass": True, "ref_precision": "eager", "ref_fallback": "RuntimeError: x"}
     _toy_bench(run, "sum_000000000002", "s2", times, helion_cute={"anchored": eager})
@@ -6878,6 +7141,9 @@ def test_the_final_tables_count_only_clean_sampled_records(
     assert every["triton_vs_inductor_kernels"] == 3
     assert every["cute_vs_triton"] == pytest.approx(4.0)
     assert every["cute_vs_oracle"] == pytest.approx(80 / 60)
+    assert every["helion_inductor_vs_inductor"] == pytest.approx(90 / 45)
+    assert every["helion_inductor_vs_cute"] == pytest.approx(60 / 45)
+    assert every["helion_inductor_vs_cute_kernels"] == 1
     assert every["baseline"] == {
         "kernels": 1,
         "baseline": pytest.approx(0.5),
@@ -6912,6 +7178,15 @@ def test_the_final_tables_count_only_clean_sampled_records(
         "| 0.500x -> 1.500x (1) | 0.500x -> 1.500x (1) |"
     ) in text
     assert "| sum_000000000002 | s2 | 0.0 | 90.00 | 60.00 | 1.500 | 0.500 |" in text
+    # The pinned helion.inductor code's time, speedup and numerics verdict.
+    assert "| 120.00 | 0.750 | 45.00 | 2.000 | 80.00 |" in text
+    # The opt-in cold compile only where the bench timed it (here nowhere).
+    assert "cute=ok,pretuned=ok |" in text
+    assert "cold=" not in text
+    assert (
+        "| pinned helion.inductor vs Inductor, geomean (kernels) "
+        "| 2.000x (1) | 2.000x (1) |"
+    ) in text
     assert "| bench contaminated |" in text
     assert "| triton autotune no activity samples |" in text
     assert "Autotune records reused from earlier runs (plan_run.py): 1." in text
@@ -7183,10 +7458,10 @@ def test_the_report_adds_rot_us_beside_cold_us_and_changes_nothing_else(
         cells = line.split(" | ")
         if "rot_us" in line or "the same kernels by cold_us" in line:
             continue
-        if line.startswith("| ") and len(cells) == 15:
+        if line.startswith("| ") and len(cells) == 17:
             del cells[6]
         kept.append(" | ".join(cells))
-    kept = "\n".join(kept).replace(f"|{'---|' * 15}", f"|{'---|' * 14}", 1) + "\n"
+    kept = "\n".join(kept).replace(f"|{'---|' * 17}", f"|{'---|' * 16}", 1) + "\n"
     assert kept == plain_text
 
 
@@ -7272,6 +7547,24 @@ def _three_processes(run: Path, **impls: dict[str, object]) -> dict[str, object]
         )
         for repeat, (default, tuned, port) in enumerate(times, start=1)
     }
+
+
+def test_an_aggregate_keeps_an_implementation_every_process_skipped(
+    tmp_path: Path,
+) -> None:
+    # bench.py skips the pinned helion.inductor code at a point without a
+    # file, so in every process of a repeated bench: skipped, not an error.
+    processes = _three_processes(tmp_path)
+    for record in processes.values():
+        record["impls"]["inductor_helion_pretuned"] = {  # type: ignore[index]
+            "status": "skipped",
+            "skipped": "no pinned helion.inductor code at x.py",
+        }
+    names = list(processes)
+    record = common.aggregate_bench_records(processes, dict.fromkeys(names, ""))  # type: ignore[arg-type]
+    pinned = record["impls"]["inductor_helion_pretuned"]
+    assert pinned["status"] == "skipped" and "error" not in pinned
+    assert record["status"] == "ok"
 
 
 def test_an_aggregate_record_takes_medians_and_keeps_every_process(

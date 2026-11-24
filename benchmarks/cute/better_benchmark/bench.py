@@ -24,6 +24,20 @@ Implementations (``--impls``):
   ``common.pin_roundtrip``): the same text but for its source-line
   comments, or the same whole text for a record made before autotune
   records held the digest without them
+- ``inductor_helion_pretuned`` (only when named): helion.inductor's output
+  code for the point (``inductor_pretuned/<repro_id>.py``, written by
+  ``inductor_pretuned.py``),
+  each Helion kernel pinned to the config a full autotune picked for it; the
+  record names the file, where its configs came from and whether its
+  helion.inductor is this tree's (``source_hash``, ``source_hash_matches``).
+  Skipped at a point without such a file: the files cover the study's 48
+  points and the three extras, not the next 99
+- ``inductor_helion`` (only when named): ``torch.compile`` of the repro with
+  helion.inductor's backend (``common.inductor_helion_options()``), each Helion
+  kernel autotuned from scratch on its first call at HELION_AUTOTUNE_EFFORT
+  (full when unset; set HELION_FORCE_AUTOTUNE=1 to search past a warm Helion
+  cache); the record keeps the generated code and each kernel's search
+  (``output_code``, ``autotunes``)
 - ``memcopy``: better-benchmark's speed-of-light proxy, a copy of the repro's
   effective bytes (``byte_accounting.count_bytes_effective``)
 
@@ -73,13 +87,15 @@ even:
   batches too (``rotation_skip_reason``; the record's ``rotate_inputs`` says
   what was decided and why).
 
-The record says what ran right behind each Helion port's batch in the rounds
-of each order (``behind_helion``) and, with a warning, which Inductor
-compiles a listing puts there, or first in an order that a port ends
+The record says what ran right behind each batch of Helion code (a port's,
+or helion.inductor's: ``common.runs_helion_code``) in the rounds of each
+order (``behind_helion``) and, with a warning, which Inductor compiles a
+listing puts there, or first in an order that such a batch ends
 (``carryover_risk``): on some ports the batch right behind a Helion port's
 reads up to a microsecond a call higher than behind anything else (README,
 Timers), and the listing of ``common.ALL_IMPLS`` keeps the oracle, the
-memcopy and the other port there.
+memcopy and the other port there; helion.inductor's code, listed after the
+ports and before the memcopy, keeps it so (README, helion.inductor).
 
 The record also holds the baseline two ways (``fastest_inductor``,
 ``common.fastest_inductor``): the fastest of the Inductor compiles, which
@@ -170,12 +186,14 @@ from typing import Any
 from typing import Callable
 from typing import NamedTuple
 from typing import cast
+from unittest import mock
 
 if __name__ == "__main__":
     sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 
 from benchmarks.cute.better_benchmark import common
 import torch
+from torch._inductor.graph import GraphLowering
 from torch.profiler import ProfilerActivity
 from torch.profiler import profile
 
@@ -185,11 +203,10 @@ from helion.autotuner.benchmarking import _make_l2_cache_clearer
 from helion.autotuner.benchmarking import _positive_median
 from helion.autotuner.benchmarking import interleaved_bench
 from helion.autotuner.benchmarking import steady_graph_dispatch
+from helion.autotuner.metrics import register_post_autotune_hook
+from helion.autotuner.metrics import remove_post_autotune_hook
 
-# Judged by the gate against the default Inductor compile ("inductor"),
-# which the gate judges too: against itself, that fails only an output that
-# is not finite where the reference is (common._anchored_leaf).
-GATED_IMPLS = (*common.INDUCTOR_IMPLS, "oracle", "helion_triton", "helion_cute")
+GATED_IMPLS = common.GATED_IMPLS
 
 # What the rounds of ``cold_us`` and of ``rot_us`` share. Untimed replays run
 # for ``SETTLE_S`` before the timed rounds: the GPU idles while the
@@ -345,6 +362,52 @@ def pinned_port(
     return common.load_port(repro_id, backend, pinned=info["decorators"]), tuned
 
 
+def cold_inductor_helion(
+    info: dict[str, Any],
+    repro_id: str,
+    shape: str,
+    instance: Any,
+    inputs: Callable[[], list[Any]],
+) -> Callable[[list[Any]], Any]:
+    """helion.inductor's compile of the repro, called once: Inductor generates
+    the Helion kernels and each autotunes on its first call. ``info`` gets
+    the compile options, the first call's wall time, the generated code and
+    each kernel's search. The code is caught as Inductor saves it, not with
+    run_and_get_code(), which resets dynamo, so the other implementations'
+    compiles stay (common.compile_inductor)."""
+    compiled = common.compile_inductor(
+        repro_id, shape, instance, impl="inductor_helion"
+    )
+    info["options"] = common.inductor_helion_options()
+    autotunes: list[dict[str, Any]] = []
+    codes: list[str] = []
+
+    def autotuned(metrics: Any) -> None:
+        autotunes.append(metrics.to_dict())
+
+    register_post_autotune_hook(autotuned)
+    started = time.monotonic()
+    try:
+        with (
+            mock.patch.object(GraphLowering, "save_output_code", codes.append),
+            torch.no_grad(),
+        ):
+            compiled(*inputs())
+        torch.cuda.synchronize()
+    finally:
+        remove_post_autotune_hook(autotuned)
+    info["first_call_s"] = round(time.monotonic() - started, 1)
+    code = "\n".join(codes)
+    info["helion_kernels"] = code.count("@helion.kernel(")
+    info["output_code"] = code
+    keys = ("kernel_name", "num_configs_tested", "autotune_time", "best_perf_ms")
+    info["autotunes"] = [
+        {**{k: a.get(k) for k in keys}, "config": a.get("selected_config")}
+        for a in autotunes
+    ]
+    return lambda inp: compiled(*inp)
+
+
 def do_bench(fn: Callable[[], object], **kwargs: object) -> object:
     """``triton.testing.do_bench``, imported when first called: the test
     module imports this one on lanes whose torch build ships no Triton."""
@@ -387,7 +450,8 @@ def alternating_rounds(
 
 
 def behind_helion(names: list[str]) -> dict[str, dict[str, str | None]]:
-    """What runs right behind each Helion port's batch in the rounds of each
+    """What runs right behind each batch of Helion code (a port's, or
+    helion.inductor's: ``common.runs_helion_code``) in the rounds of each
     order, for the implementations ``names`` in listing order:
     ``{"forward": {port: follower}, "reverse": {...}}``, the follower None
     where the port is the last of that order: the first implementation of
@@ -404,7 +468,7 @@ def behind_helion(names: list[str]) -> dict[str, dict[str, str | None]]:
         label: {
             name: order[place + 1] if place + 1 < len(order) else None
             for place, name in enumerate(order)
-            if name.startswith("helion_")
+            if common.runs_helion_code(name)
         }
         for label, order in (("forward", names), ("reverse", names[::-1]))
     }
@@ -412,16 +476,17 @@ def behind_helion(names: list[str]) -> dict[str, dict[str, str | None]]:
 
 def carryover_risk(names: list[str]) -> list[str]:
     """The Inductor compiles that ``names`` lists so that their batch is the
-    next one replayed after a Helion port's in some round: right behind it
-    (``behind_helion``), each as ``"<compile> behind <port> in <order>
-    rounds"``, or, where the port is the last of an order, as the first of
-    that order: ``"<compile> behind <port> at the start of the next sample
-    in <order> rounds"`` (with the flush-only graph of a batched round
-    between them, up to a quarter of what the port leaves was still read:
-    README, Timers). Their readings, and with them the
-    fastest Inductor compile's, can be high by what the port leaves behind.
-    ``common.ALL_IMPLS`` has the oracle between the compiles and the ports
-    and the memcopy last: no risk."""
+    next one replayed after a batch of Helion code (a port's, or
+    helion.inductor's) in some round: right behind it (``behind_helion``),
+    each as ``"<compile> behind <impl> in <order> rounds"``, or, where that
+    code is the last of an order, as the first of that order: ``"<compile>
+    behind <impl> at the start of the next sample in <order> rounds"`` (with
+    the flush-only graph of a batched round between them, up to a quarter of
+    what a port leaves was still read: README, Timers). Their readings, and
+    with them the fastest Inductor compile's, can be high by what that code
+    leaves behind. ``common.ALL_IMPLS`` has the oracle between the compiles
+    and the ports and the memcopy last, and helion.inductor's code listed
+    after the ports and before the memcopy keeps it so: no risk."""
     orders = {"forward": names, "reverse": names[::-1]}
     risks = []
     for label, followers in behind_helion(names).items():
@@ -455,13 +520,15 @@ def note_carryover(record: dict[str, Any], timed: list[str]) -> None:
     record["carryover_risk"] = carryover_risk(timed)
     for risk in record["carryover_risk"]:
         print(
-            f"[carryover] {risk}: a batch right behind a Helion port's can "
-            "read up to 1 us a call high (a quarter of that behind the "
-            "flush-only graph of a batched round), and the fastest Inductor "
-            "compile with it. "
+            f"[carryover] {risk}: a batch right behind Helion code (a "
+            "port's, as the README's Timers section measured, or "
+            "helion.inductor's) can read up to 1 us a call high (a quarter "
+            "of that behind the flush-only graph of a batched round), and "
+            "the fastest Inductor compile with it. "
             "List the oracle between the Inductor compiles and the Helion "
-            "ports and the memcopy last, as common.ALL_IMPLS does (README, "
-            "Timers).",
+            "code and the memcopy last, as common.ALL_IMPLS does, "
+            "helion.inductor's code after the ports (README, Timers and "
+            "helion.inductor).",
             file=sys.stderr,
             flush=True,
         )
@@ -1018,6 +1085,28 @@ def run(args: argparse.Namespace, backend: dict[str, Any] | None) -> dict[str, A
                     call = lambda inp, c=compiled: c(*inp)  # noqa: E731
                 elif impl == "oracle":
                     call = common.load_oracle(args.repro_id, inputs())
+                elif impl == "inductor_helion_pretuned":
+                    path = common.inductor_pretuned_path(args.repro_id)
+                    if not path.exists():
+                        # The files cover the study's 48 points and the three
+                        # extras, not the next 99 (README.md, Layout).
+                        info["status"] = "skipped"
+                        info["skipped"] = f"no pinned helion.inductor code at {path}"
+                        continue
+                    info["pretuned_code"] = str(path)
+                    pretuned = common.load_inductor_pretuned(args.repro_id, shape)
+                    info["configs_from"] = pretuned.CONFIGS_FROM
+                    # Whether the file holds this tree's helion.inductor code
+                    # (load_inductor_pretuned() warns when it does not).
+                    info["source_hash"] = pretuned.SOURCE_HASH
+                    info["source_hash_matches"] = (
+                        common.inductor_source_hash() == pretuned.SOURCE_HASH
+                    )
+                    call = pretuned.forward
+                elif impl == "inductor_helion":
+                    call = cold_inductor_helion(
+                        info, args.repro_id, shape, instance, inputs
+                    )
                 elif impl.startswith("helion_"):
                     port, tuned = pinned_port(
                         info,
@@ -1154,7 +1243,12 @@ def main() -> None:
     )
     parser.add_argument("--configs-dir", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--impls", default=",".join(common.ALL_IMPLS))
+    parser.add_argument(
+        "--impls",
+        default=",".join(common.ALL_IMPLS),
+        help="comma-separated, of common.ALL_IMPLS (the default) and "
+        "common.OPT_IN_IMPLS",
+    )
     # Even round counts: as many rounds in each order (module docstring).
     parser.add_argument("--rounds", type=int, default=6)
     parser.add_argument("--rep-ms", type=int, default=200)
