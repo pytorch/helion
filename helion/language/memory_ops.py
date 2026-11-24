@@ -531,18 +531,18 @@ def prefetch(
     boxes (at most 16).  It needs what a bulk prefetch needs (above), static
     sizes and strides a TMA descriptor accepts, box rows of a multiple of 16
     bytes, index kinds a box describes (scalars, tiles, full slices), a
-    tensor that is a kernel input or a view at its start (not one host code
-    allocates), and PyTorch's native CUDA caching allocator (not
-    cudaMallocAsync); otherwise the prefetch keeps the pointer form, as it
-    does for a call whose tensor has no 16-byte aligned base.  Each distinct
-    tensor (address, shape, strides) and box gets its own 128-byte map,
-    encoded on the launch path; past a per-device cap on the maps no CUDA
-    graph captured, an eager call drops them.  The form suits tensors whose address
-    stays fixed across calls, such as weights.  The autotuner searches
-    ``prefetch_indexing``, and its benchmarks reuse one set of inputs, so
-    they do not see the map a tensor whose address changes every call (an
-    activation) builds each call: give such a prefetch "pointer" in a fixed
-    config.
+    tensor that is a kernel input or a view starting a multiple of 16 bytes
+    past one (not a tensor host code allocates), and PyTorch's native CUDA
+    caching allocator (not cudaMallocAsync); otherwise the prefetch keeps the
+    pointer form, as it does for a call whose tensor has no 16-byte aligned
+    base.  Each distinct tensor (address, shape, strides) and box gets its
+    own 128-byte map, encoded on the launch path; past a per-device cap on
+    the maps no CUDA graph captured, an eager call drops them.  The form
+    suits tensors whose address stays fixed across calls, such as weights.
+    The autotuner searches ``prefetch_indexing``, and its benchmarks reuse
+    one set of inputs, so they do not see the map a tensor whose address
+    changes every call (an activation) builds each call: give such a
+    prefetch "pointer" in a fixed config.
 
     Other targets drop it.
 

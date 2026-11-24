@@ -32,8 +32,6 @@ from .emitter_protocols import KernelTransforms
 from .helper_function import CodegenInterface
 from .inductor_lowering import CodegenState
 from .inductor_lowering import codegen_call_with_graph
-from .loop_dependency_checker import _Pending
-from .loop_dependency_checker import graph_accesses
 from .loop_dependency_checker import mark_intra_loop_raw_barriers
 from .output_header import get_needed_import_lines
 from .program_id import ForEachProgramID
@@ -301,13 +299,13 @@ class GenerateAST(NodeVisitor, CodegenInterface):
         )
         CodegenInterface.__init__(self, self.device_function)
 
-        # Decide once which sibling for-loops need a tl.debug_barrier()
-        # to make global writes visible to subsequent reads (and, with
-        # Backend.intra_loop_barriers_order_reads, to finish reads before
-        # subsequent writes).
-        self._compute_inter_loop_barriers()
-        # Same, for a hazard *within* one loop body.
-        self._compute_intra_loop_barriers()
+        # Decide once which sibling for-loops and which accesses within one
+        # loop body need a CTA barrier before them.
+        mark_intra_loop_raw_barriers(
+            self.codegen_graphs,
+            self.host_function.device_ir.root_ids,
+            CompileEnvironment.current().backend,
+        )
 
     def allow_dead_assignments_owned_by_nodes(self, nodes: tuple[Node, ...]) -> None:
         """Allow liveness-based DCE for assignments from proven pure FX nodes.
@@ -402,77 +400,6 @@ class GenerateAST(NodeVisitor, CodegenInterface):
         if loops := self.active_device_loops[block_idx]:
             return loops[-1].strategy.mask_var(block_idx)
         return None
-
-    def _compute_inter_loop_barriers(self) -> None:
-        """Walk every codegen graph; for each pair of consecutive sibling
-        ``_for_loop`` / ``_for_loop_step`` nodes, set ``needs_barrier_before``
-        on the second loop's ``ForLoopGraphInfo`` when their underlying tensor
-        storages have a RAW dependency (or, with
-        ``Backend.intra_loop_barriers_order_reads``, a WAR one, or a store
-        after a store, a WAW one).
-
-        TileIR shares Triton surface syntax but ``tl.debug_barrier()`` lowers
-        to ``ttg.barrier`` which the TileIR pass pipeline does not legalize,
-        so the analysis is a no-op there.
-        """
-        from ..language._tracing_ops import _for_loop
-        from ..language._tracing_ops import _for_loop_step
-        from .device_ir import ForLoopGraphInfo
-
-        env = CompileEnvironment.current()
-        if not env.backend.supports_inter_loop_barriers:
-            return
-        order_reads = env.backend.intra_loop_barriers_order_reads
-
-        for graph_info in self.codegen_graphs:
-            # Accesses of all prior sibling loops since the last barrier, which
-            # orders everything before it.
-            pending = _Pending()
-            for node in graph_info.graph.nodes:
-                if node.op != "call_function":
-                    continue
-                if node.target not in (_for_loop, _for_loop_step):
-                    continue
-                cur_id = node.args[0]
-                assert isinstance(cur_id, int)
-                cur_info = self.codegen_graphs[cur_id]
-                if not isinstance(cur_info, ForLoopGraphInfo):
-                    continue
-                accesses = graph_accesses(self.codegen_graphs, cur_id)
-                need_barrier = pending.conflicts(accesses, reads=order_reads)
-                cur_info.needs_barrier_before = need_barrier
-                if need_barrier:
-                    # Barrier orders everything before it.
-                    pending.clear()
-                pending.update(accesses if order_reads else accesses.writes())
-
-    def _compute_intra_loop_barriers(self) -> None:
-        """Mark loads that may read what an earlier store of the same body or
-        of an earlier iteration of its loop wrote (also through device pointers
-        or by a snippet), so the Triton ``load`` codegen emits a
-        ``tl.debug_barrier()`` before them (the CuTe ``load`` codegen emits
-        ``cute.arch.sync_threads()``), and with
-        ``Backend.intra_loop_barriers_order_reads`` writes to a tensor an
-        earlier access read or stored (``mark_intra_loop_raw_barriers``).
-
-        TileIR is excluded for the same reason as ``_compute_inter_loop_barriers``:
-        ``tl.debug_barrier()`` lowers to ``ttg.barrier`` which the TileIR pass
-        pipeline does not legalize.
-        """
-
-        backend = CompileEnvironment.current().backend
-        if not backend.supports_intra_loop_barriers(in_divergent_control_flow=False):
-            return
-        mark_intra_loop_raw_barriers(
-            self.codegen_graphs,
-            self.host_function.device_ir.root_ids,
-            mark_in_divergent_control_flow=backend.supports_intra_loop_barriers(
-                in_divergent_control_flow=True
-            ),
-            atomics=backend.intra_loop_barriers_order_atomics,
-            carries=backend.intra_loop_barriers_carry_iterations,
-            reads=backend.intra_loop_barriers_order_reads,
-        )
 
     def ensure_module_statements(self, source: str) -> None:
         """Append the module-level statements of ``source`` (an import or a

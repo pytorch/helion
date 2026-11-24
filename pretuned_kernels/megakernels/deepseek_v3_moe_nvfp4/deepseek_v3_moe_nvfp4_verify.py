@@ -5,8 +5,8 @@ verify step.
 
 ``deepseek_v3_moe_nvfp4``'s boundary and inputs (router projection, grouped
 routing, NVFP4 input quantization, routed and shared experts, final
-accumulation), with every GEMM a swap-AB tcgen05 MMA over TMA-shaped weight
-views: K steps of 512 FP4 values whose E4M3 scales are stored swizzled for
+accumulation), with every expert GEMM a swap-AB tcgen05 MMA over TMA-shaped
+weight views: K steps of 512 FP4 values whose E4M3 scales are stored swizzled for
 tcgen05 (``swizzle_scales``), the token dimension padded to the MMA's N by its
 block size.  Each token is routed on its own: a routed task serves one distinct
 expert of the window (``slots`` = T * top_k bounds their count) for every token
@@ -487,12 +487,18 @@ def deepseek_v3_moe_nvfp4_verify(
 
 # Per-token routing draws for T tokens: same8 routes every token to one set of
 # eight experts; pool picks from 16 experts in four groups; spread gives each
-# token its own two experts in each of four groups.
-VERIFY_ROUTING_CASES = ("same8", "pool", "spread")
+# token its own two experts in each of four groups; decoy is same8 with two
+# strong experts in a fifth group (_DECOYS): their group's top-two sum beats the
+# weakest chosen group's but for their correction bias, and the first beats the
+# weakest chosen expert, so only the top-4-group mask on biased scores keeps
+# them out.
+VERIFY_ROUTING_CASES = ("same8", "pool", "spread", "decoy")
+# The decoys' logits (no other case routes to them; their bias is -0.15).
+_DECOYS = {186: 9.0, 189: 1.5}
 
 
 def _route(case: str, token: int) -> list[int]:
-    if case == "same8":
+    if case in ("same8", "decoy"):
         return [3, 17, 35, 50, 77, 95, 113, 127]
     if case == "pool":
         pool = [g * 32 + e for g in (1, 3, 4, 6) for e in (2, 9, 20, 27)]
@@ -559,12 +565,13 @@ def _allocate_verify(
     shared_w2 = codes(h, inter // 2)
     shared_w2_scale = scales(2, h, inter // 16, -7, 5, 3)[1]
     activation_global_scale = torch.full((1,), 16.0, device=device)
+    correction_bias = (((torch.arange(e, device=device) * 7) % 17) - 8).float() * 0.001
+    correction_bias[list(_DECOYS)] = -0.15
     randn = torch.randn if init else torch.empty
     return {
         "hidden": randn(tokens, h, device=device, dtype=torch.bfloat16),
         "router_weight": torch.empty(e, h, device=device, dtype=torch.bfloat16),
-        "correction_bias": (((torch.arange(e, device=device) * 7) % 17) - 8).float()
-        * 0.001,
+        "correction_bias": correction_bias,
         "native_w13": interleave(w13),
         "native_w13_scale": interleave(w13_scale.view(torch.uint8)).view(e4m3),
         "w2": w2,
@@ -575,8 +582,9 @@ def _allocate_verify(
         )[0],
         "shared_w2": shared_w2,
         "shared_w2_scale": shared_w2_scale,
-        "alpha1": torch.ones(e, device=device),
-        "alpha2": torch.full((e,), 1.0 / 16.0, device=device),
+        # Per expert, so a kernel reading another expert's alphas fails.
+        "alpha1": 0.5 + torch.rand(e, device=device),
+        "alpha2": (0.5 + torch.rand(e, device=device)) / 16.0,
         "shared_alpha1": torch.ones(1, device=device),
         "shared_alpha2": torch.full((1,), 1.0 / 16.0, device=device),
         "input_global_scale": torch.ones(1, device=device),
@@ -597,6 +605,8 @@ def _set_verify_routing(tensors: dict[str, torch.Tensor], case: str) -> None:
     for t in range(tokens):
         for expert, value in zip(_route(case, t), ROUTING_LOGITS, strict=True):
             target[t, expert] = value
+    for expert, value in _DECOYS.items() if case == "decoy" else ():
+        target[:, expert] = value
     weight = target.T @ torch.linalg.solve(hidden @ hidden.T, hidden)
     tensors["router_weight"].copy_(weight.to(torch.bfloat16))
 

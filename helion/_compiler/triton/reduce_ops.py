@@ -56,7 +56,10 @@ def _(state: CodegenState) -> ast.AST | list[ast.AST]:
     )
 
     if is_tuple_input:
-        return _create_tuple_result_expressions(state, reduce_expr)
+        # One bound reduction serves every result.
+        inputs = state.proxy_arg(1)
+        assert isinstance(inputs, (tuple, list))
+        return state.tuple_results(reduce_expr, len(inputs), prefix="reduce_tuple")
     return reduce_expr
 
 
@@ -170,22 +173,3 @@ def _create_reduce_expression(
         # pyrefly: ignore [bad-argument-type]
         dim_value=ast.Constant(value=dim),
     )
-
-
-def _create_tuple_result_expressions(
-    state: CodegenState, reduce_expr: ast.AST
-) -> list[ast.AST]:
-    """Create getitem expressions for tuple results."""
-    from ..ast_extension import expr_from_string
-
-    raw_input = state.ast_args[1]
-    num_elements = len(raw_input) if isinstance(raw_input, tuple) else 2
-
-    return [
-        expr_from_string(
-            "{reduce_result}[{index}]",
-            reduce_result=reduce_expr,
-            index=ast.Constant(value=i),
-        )
-        for i in range(num_elements)
-    ]

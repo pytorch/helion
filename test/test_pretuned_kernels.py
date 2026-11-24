@@ -67,10 +67,11 @@ def _pretuned_kernel_directory(name: str) -> Path:
 
 
 def _require_four_sm100_gpus() -> None:
-    """Skip distributed TP4 pretuned-kernel checks without four local B200s."""
+    """Skip distributed TP4 pretuned-kernel checks without four local SM100-family
+    GPUs (B200 or GB300)."""
     if not is_cuda() or torch.cuda.device_count() < 4:
         pytest.skip("distributed TP4 pretuned kernels require four SM100 GPUs")
-    if any(torch.cuda.get_device_capability(device) != (10, 0) for device in range(4)):
+    if any(torch.cuda.get_device_capability(device)[0] != 10 for device in range(4)):
         pytest.skip("distributed TP4 pretuned kernels require four SM100 GPUs")
 
 
@@ -549,6 +550,8 @@ def test_muse_spark_moe_ep4_compiles() -> None:
 )
 def test_deepseek_v3_tp_megakernels_run_on_four_ranks(name: str) -> None:
     # main() checks every rank's output against the matched references.
+    if not importlib.util.find_spec("vllm"):
+        pytest.skip(f"{name}'s references need vLLM")
     _run_on_four_ranks(name)
 
 
@@ -595,8 +598,8 @@ def test_deepseek_v3_tp_verify_megakernel_checks_on_four_ranks() -> None:
 def test_muse_spark_megakernels_check_on_four_ranks(name: str) -> None:
     if name in ("layer", "lm_head") and not supports_gluon():
         pytest.skip(f"the gluon backend needs {GLUON_REQUIREMENT}")
-    if name.startswith("moe_") and not importlib.util.find_spec("flashinfer"):
-        pytest.skip("the MoE check lays its weights out with FlashInfer")
+    if name != "lm_head" and not importlib.util.find_spec("flashinfer"):
+        pytest.skip("the check lays its expert weights out with FlashInfer")
     # --check runs only the FP64 checks, so sglang is not needed.
     _run_on_four_ranks(
         name, "--check", directory=PRETUNED_KERNELS_DIR / "megakernels" / "muse_spark"

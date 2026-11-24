@@ -9,14 +9,17 @@ post-expert norm, the unpooler shard + all-gather + the post-FFN boundary,
 and the NEXT layer's QKV GEMM. A layer takes its own QKV (from the previous
 layer's launch, or the stock GEMM after a stock layer) and returns the next's.
 
-The kernel family and its measured config are picked per (world, T) by
-``layer_family``:
+The kernel family is picked per (world, T) by ``layer_family``:
 
-- TP4 (world 4, T=8): muse_decode_layer_tp4_t8.py, with
-  muse_decode_layer_tp4_t8.json.
+- TP4 (world 4, T=8): muse_decode_layer_tp4_t8.py.
 - TP8 (world 8, T=8): muse_decode_layer_tp8_t8.py (world-generic), with the
-  EPF2 expert L2 prefetch of a per-layer hot-expert list, and
-  muse_decode_layer_tp8_t8.json.
+  EPF2 expert L2 prefetch of a per-layer hot-expert list.
+
+Each of a family's five images has its own measured config next to the kernel
+(``LayerFamily.config_name``): ``<kernel>.json`` (sliding window),
+``<kernel>_global.json``, ``<kernel>_bf16.json`` (bf16 experts),
+``<kernel>_global_bf16_tail.json`` (final norm) and ``<kernel>_entry.json``
+(the prelude).
 
 Both kernels read their device helpers and host-side shapes from
 _decode_layer.py.
@@ -38,8 +41,8 @@ on one ordered CUDA stream. ``main()`` launches the sliding-window, global,
 bf16-expert and final-norm images on random weights and checks every stage
 against FP64 torch references computed from the kernel's own inputs to that
 stage, then repeat and CUDA-graph replays bitwise, then reports each image's
-cold-L2 graph replay time; ``--check`` skips the timing. The bf16-expert images
-need FlashInfer (their bank is FlashInfer's shuffled bf16 layout)::
+cold-L2 graph replay time; ``--check`` skips the timing. It needs FlashInfer,
+which lays the random checkpoint-order experts out as serving loads them::
 
     PYTHONPATH=. python -m torch.distributed.run --standalone --nproc-per-node=4 \
       pretuned_kernels/megakernels/muse_spark/layer.py [--check]
@@ -49,7 +52,6 @@ from __future__ import annotations
 
 import dataclasses
 import importlib
-import importlib.util
 import inspect
 import json
 import math
@@ -58,6 +60,9 @@ import sys
 from typing import TYPE_CHECKING
 from typing import Any
 
+from pretuned_kernels.megakernels._distributed import _capture
+from pretuned_kernels.megakernels._distributed import _cold_replay_us
+from pretuned_kernels.megakernels._distributed import initialize_group
 from pretuned_kernels.megakernels.muse_spark import _decode_layer as helpers
 from pretuned_kernels.megakernels.muse_spark._common import EXPERT_HIDDEN
 from pretuned_kernels.megakernels.muse_spark._common import HIDDEN
@@ -65,8 +70,9 @@ from pretuned_kernels.megakernels.muse_spark._common import LOG2E
 from pretuned_kernels.megakernels.muse_spark._common import MOE_TOKENS
 from pretuned_kernels.megakernels.muse_spark._common import NUM_EXPERTS as ROUTER_E
 from pretuned_kernels.megakernels.muse_spark._common import TOPK
+from pretuned_kernels.megakernels.muse_spark._common import dequantize_nvfp4
 from pretuned_kernels.megakernels.muse_spark._common import e2m1_values
-from pretuned_kernels.megakernels.muse_spark._common import round_e2m1
+from pretuned_kernels.megakernels.muse_spark._moe import GLOBAL_SCALE_INV
 from pretuned_kernels.megakernels.muse_spark._moe import (
     INTERMEDIATE as EXPERT_INTERMEDIATE,
 )
@@ -74,6 +80,8 @@ from pretuned_kernels.megakernels.muse_spark._moe import Bf16VerifyBank
 from pretuned_kernels.megakernels.muse_spark._moe import Nvfp4VerifyBank
 from pretuned_kernels.megakernels.muse_spark._moe import build_bf16_verify_bank
 from pretuned_kernels.megakernels.muse_spark._moe import build_nvfp4_verify_bank
+from pretuned_kernels.megakernels.muse_spark._moe import flashinfer_layout
+from pretuned_kernels.megakernels.muse_spark._moe import nvfp4_quantize
 import torch
 import torch.distributed as dist
 import torch.distributed._symmetric_memory as symm_mem
@@ -90,7 +98,6 @@ HEAD_DIM = 64
 PAGE_SIZE = 128
 KEY_TILE = 64
 SWA_WINDOW_LEFT = 2047
-GLOBAL_SCALE_INV = 1.0 / (448.0 * 6.0)
 # O-projection weight tile (one 32 KB ring stage).
 O_BM, O_BK = 64, 256
 # Persistent workers, one wave (GB300 measured: 144 of 152 SMs beats all 152).
@@ -151,9 +158,8 @@ class LayerFamily:
     attention_splits: int  # att_ws split dimension
     qkv_splits: int  # the QKV root's K splits; 0 = helpers.parts_for over the SMs
     q_tile: tuple[int, int]  # the next layer's QKV weight tile (rows, K)
-    stacked_router: (
-        bool  # router planes stacked per 64-expert chunk (hi rows, then lo rows)
-    )
+    # Router planes stacked per 64-expert chunk (hi rows, then lo rows).
+    stacked_router: bool
     expert_prefetch: bool  # pf_* operands: the bank as prefetch boxes and the layer's hot-expert list
 
     def config_name(
@@ -170,6 +176,10 @@ class LayerFamily:
         if final_norm and not expert_bf16:
             raise ValueError(
                 "the final-norm image is built only with bf16 experts (the checkpoint's last layer)"
+            )
+        if expert_bf16 and global_attn != final_norm:
+            raise ValueError(
+                "the bf16-expert images are the sliding-window first layer and the global last layer (final norm)"
             )
         base = self.global_config if global_attn else self.config
         if entry:
@@ -244,12 +254,7 @@ def load_config(
         entry=entry,
     )
     with open(os.path.join(os.path.dirname(__file__), name)) as f:
-        config = json.load(f)
-    if config.get("num_stages", 1) < 2:
-        raise RuntimeError(
-            f"{name} must give the Gluon weight ring a depth (num_stages >= 2)"
-        )
-    return config
+        return json.load(f)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -334,7 +339,9 @@ class LayerMkWeights:
     beta: torch.Tensor
     pre_w: torch.Tensor
     wp: torch.Tensor  # prepare_boundary_weights' pooler
-    wr_hi: torch.Tensor  # router bf16 planes; hi + lo = the fp32 router
+    # The router's bf16 hi / lo planes (_router_planes); TP8 family: wr_hi stacks
+    # both (_stacked_router_planes) and the kernel reads only wr_lo's shape
+    wr_hi: torch.Tensor
     wr_lo: torch.Tensor
     q_pre_w: torch.Tensor  # pre-expert norm [He] bf16
     router_bias: torch.Tensor  # [E] fp32
@@ -399,15 +406,15 @@ def prepare_layer_weights(
     o_proj: torch.Tensor,  # [H, KH] bf16, this rank's input columns
     attn_boundary: dict,  # jit_kernel_kwargs() of the attention boundary
     ffn_boundary: dict,  # jit_kernel_kwargs() of the FFN boundary (its pre-norm is the next layer's)
-    prepared_boundary: object,  # prepare_boundary_weights(...)
+    prepared_boundary: BoundaryWeights,  # prepare_boundary_weights(...)
     bank: Nvfp4VerifyBank | Bf16VerifyBank,
     up_alpha: torch.Tensor,  # bf16 experts: ones
     gate_alpha: torch.Tensor,
     out_alpha: torch.Tensor,
     post_expert_norm: torch.Tensor,
     unpooler: torch.Tensor,  # [H, He] bf16, replicated
-    next_qkv: torch.Tensor
-    | None,  # [NQ, H] bf16, the next layer's; None on the model's last layer (final norm)
+    # [NQ, H] bf16, the next layer's; None on the model's last layer (final norm)
+    next_qkv: torch.Tensor | None,
     rank: int,
     world: int,
     expert_bf16: bool = False,
@@ -447,27 +454,21 @@ def prepare_layer_weights(
             0, 2, 1, 3
         )
     prefetch = {}
-    if family.expert_prefetch and expert_bf16:
-        # The bf16 images issue no expert prefetch (their PF roots are dead): unread placeholders.
-        box = torch.zeros(1, 1, 128, 256, dtype=torch.uint8, device=device)
-        prefetch = {
-            "pf_w13": box,
-            "pf_w2": box,
-            "pf_sf": box[0],
-            "pf_list": torch.full(
-                (PF_LIST_SLOTS,), -1, dtype=torch.int32, device=device
-            ),
-        }
-    elif family.expert_prefetch:
-        pf_w13, pf_w2, pf_sf = _module(family.kernel).prefetch_views(
-            weights_g, weights2, bank.scales, up_alpha.numel(), world
-        )
+    if family.expert_prefetch:
+        if expert_bf16:
+            # The bf16 images issue no expert prefetch (their PF roots are dead): unread placeholders.
+            box = torch.zeros(1, 1, 128, 256, dtype=torch.uint8, device=device)
+            pf_w13, pf_w2, pf_sf = box, box, box[0]
+        else:
+            pf_w13, pf_w2, pf_sf = _module(family.kernel).prefetch_views(
+                weights_g, weights2, bank.scales, up_alpha.numel(), world
+            )
         prefetch = {
             "pf_w13": pf_w13,
             "pf_w2": pf_w2,
             "pf_sf": pf_sf,
             "pf_list": torch.full(
-                (PF_LIST_SLOTS,), -1, dtype=torch.int32, device=o_proj.device
+                (PF_LIST_SLOTS,), -1, dtype=torch.int32, device=device
             ),
         }
     return LayerMkWeights(
@@ -527,7 +528,7 @@ def entry_weights(
 
 def _entry_placeholders(
     device: torch.device, dims: LayerDims, tokens: int
-) -> tuple[torch.Tensor, object]:
+) -> tuple[torch.Tensor, AttentionInputs]:
     """The entry image's unread QKV and attention inputs (one page of KV cache): its dead roots' operands."""
     page = torch.zeros(
         1, PAGE_SIZE * dims.kv_width, dtype=torch.float8_e4m3fn, device=device
@@ -551,12 +552,12 @@ def _workspaces(
     family: LayerFamily,
     dims: LayerDims,
     tokens: int,
-    group: object,
+    group: dist.ProcessGroup,
     device: torch.device,
     sms: int,
     expert_bf16: bool,
     final_norm: bool,
-) -> tuple[dict[str, torch.Tensor], object]:
+) -> tuple[dict[str, torch.Tensor], helpers.State]:
     """Everything the kernel reads or writes besides the per-layer weights and per-call tensors, and the MoE
     state."""
     group_name, world, T = group.group_name, dims.world, tokens
@@ -636,7 +637,7 @@ class LayerVerifyMegakernel:
         self,
         *,
         device: torch.device,
-        group: object,
+        group: dist.ProcessGroup,
         scalars: LayerMkScalars,
         tokens: int,
         global_attn: bool = False,
@@ -680,8 +681,6 @@ class LayerVerifyMegakernel:
         module = _module(family.kernel)
         # The launch's arguments, in the kernel's parameter order.
         self._order = tuple(inspect.signature(module.KERNEL).parameters)
-        if entry and "entry" not in self._order:
-            raise ValueError(f"{family.kernel} has no entry image")
         # The entry image reads no QKV and no attention inputs: placeholders its build specializes on.
         self._entry_inputs = (
             _entry_placeholders(device, dims, tokens) if entry else None
@@ -732,12 +731,17 @@ class LayerVerifyMegakernel:
     def _args(
         self,
         *,
-        qkv: torch.Tensor,
+        qkv: torch.Tensor | None,
         stream: torch.Tensor,
         weights: LayerMkWeights,
-        attention: object,
-        outputs: dict[str, torch.Tensor],
-    ) -> list[object]:
+        attention: AttentionInputs | None,
+    ) -> tuple[list[object], dict[str, torch.Tensor]]:
+        """One call's kernel arguments and its outputs (the entry image's QKV and attention inputs are its own
+        placeholders)."""
+        if self._entry_inputs is not None:
+            qkv, attention = self._entry_inputs
+        assert qkv is not None and attention is not None
+        outputs = self._outputs(qkv)
         T, sc, world = self._tokens, self._scalars, self._world
         k_cache, v_cache = attention.k_cache, attention.v_cache
         attn_args = {
@@ -794,7 +798,7 @@ class LayerVerifyMegakernel:
         )
         if "qact" in outputs:
             args["qact"] = outputs["qact"]
-        return [args[n] for n in self._order]
+        return [args[n] for n in self._order], outputs
 
     def __call__(
         self,
@@ -807,18 +811,10 @@ class LayerVerifyMegakernel:
         """Returns (the next layer's QKV [T, NQ] bf16, the new stream [T, H] fp32); the final-norm image returns
         (the final-normed hidden state [T, H] bf16, the new stream); the entry image (layer 0's QKV, layer 0's input
         stream)."""
-        if self._entry:
-            qkv, attention = self._entry_inputs
-        outputs = self._outputs(qkv)
-        self._kernel(
-            *self._args(
-                qkv=qkv,
-                stream=stream,
-                weights=weights,
-                attention=attention,
-                outputs=outputs,
-            )
+        args, outputs = self._args(
+            qkv=qkv, stream=stream, weights=weights, attention=attention
         )
+        self._kernel(*args)
         if self._final_norm:
             return outputs["qact"][: self._tokens].view(self._tokens, HIDDEN), outputs[
                 "stream_next"
@@ -870,46 +866,58 @@ def _gather(t: torch.Tensor) -> list[torch.Tensor]:
     return parts
 
 
-def _e4m3(b: torch.Tensor) -> torch.Tensor:
-    return b.view(torch.float8_e4m3fn).to(F64)
+def _rank_max(t: torch.Tensor) -> torch.Tensor:
+    """``t``'s elementwise max over the ranks, on every rank."""
+    return torch.stack(_gather(t.cuda())).amax(0)
 
 
 class _Report:
     """Per stage, the max |error| relative to the reference's max |value| and
-    the share of elements off by more than ``tol`` of it (max over ranks)."""
+    the share of elements off (max over ranks): beyond ``tol`` of that max, or
+    of their own |value| plus ``floor``, or (``exact``) unequal; an empty stage
+    is all off. A stage fails when more are off than it allows (none unless
+    given)."""
 
     def __init__(self) -> None:
-        self.rows: list[tuple[str, float, float, float]] = []
+        self.rows: list[tuple[str, float, float, str, float]] = []
 
-    def add(self, name: str, got: torch.Tensor, ref: torch.Tensor, tol: float) -> None:
+    def add(
+        self,
+        name: str,
+        got: torch.Tensor,
+        ref: torch.Tensor,
+        tol: float,
+        floor: float | None = None,
+    ) -> None:
+        bound = f"tol {tol:.0e}" + ("" if floor is None else f" |ref| + {floor:.0e}")
         if ref.numel() == 0:  # e.g. no rows where the kernel's routing should have some
-            self.rows.append((name, float("nan"), 1.0, tol))
+            self.rows.append((name, float("nan"), 1.0, bound, 0.0))
             return
         got, ref = got.to(F64), ref.to(F64)
         scale = ref.abs().max().clamp_min(1e-30)
         err = (got - ref).abs()
-        self.rows.append(
-            (
-                name,
-                float(err.max() / scale),
-                # A NaN on either side counts as off.
-                float((~(err <= tol * scale)).double().mean()),
-                tol,
-            )
-        )
+        limit = tol * scale if floor is None else tol * ref.abs() + floor
+        # A NaN on either side counts as off.
+        off = float((~(err <= limit)).double().mean())
+        self.rows.append((name, float(err.max() / scale), off, bound, 0.0))
 
-    def exact(self, name: str, got: torch.Tensor, ref: torch.Tensor) -> None:
-        off = float((got != ref).double().mean())
-        self.rows.append((name, off, off, 0.0))
+    def exact(
+        self, name: str, got: torch.Tensor, ref: torch.Tensor, allowed: float = 0.0
+    ) -> None:
+        off = float((got != ref).double().mean()) if ref.numel() else 1.0
+        bound = "exact" + (f", {allowed:.1%} may differ" if allowed else "")
+        self.rows.append((name, off, off, bound, allowed))
 
-    def finish(self, title: str) -> None:
-        values = torch.tensor([[r[1], r[2]] for r in self.rows], dtype=F64).cuda()
-        worst = torch.stack(_gather(values)).amax(0).tolist()
-        failed = [r[0] for r, (_, off) in zip(self.rows, worst, strict=True) if off > 0]
-        if dist.get_rank() == 0:
+    def finish(self, title: str, verbose: bool) -> None:
+        """Prints the stage table on rank 0 if ``verbose`` or a stage failed."""
+        values = torch.tensor([[r[1], r[2]] for r in self.rows], dtype=F64)
+        worst = _rank_max(values).tolist()
+        rows = list(zip(self.rows, worst, strict=True))
+        failed = [r[0] for r, (_, off) in rows if off > r[4]]
+        if dist.get_rank() == 0 and (verbose or failed):
             print(f"{title}: rel = max |err| / max |ref|, off = elements beyond tol")
-            for (name, _, _, tol), (rel, off) in zip(self.rows, worst, strict=True):
-                print(f"  {name:24s} rel {rel:9.2e}  off {off:7.2%}  (tol {tol:.0e})")
+            for (name, _, _, bound, _), (rel, off) in rows:
+                print(f"  {name:24s} rel {rel:9.2e}  off {off:7.2%}  ({bound})")
         if failed:
             raise AssertionError(f"{title}: stages off their FP64 references: {failed}")
 
@@ -1082,9 +1090,9 @@ def _make_case(
     entry: bool = False,
     init: bool = True,
 ) -> _Case:
-    """An image on random weights (``init=False``: uninitialized ones, enough
-    to bind and generate code; the bf16 bank is then not shuffled, which needs
-    FlashInfer)."""
+    """An image on random weights, its experts laid out by FlashInfer
+    (``init=False``: uninitialized ones, not laid out, enough to bind and
+    generate code)."""
     rank, world = group.rank(), group.size()
     family, dims = layer_family(world, TOKENS), LayerDims.of(world)
 
@@ -1171,34 +1179,35 @@ def _make_case(
         for name in ("up_alpha", "gate_alpha", "out_alpha"):
             t[name] = torch.ones(ROUTER_E, device=device)
     else:
-        # Random e2m1 codes; each expert's block scales one E4M3 value of 0.5,
-        # 1 or 2 (the same for all its blocks, whatever FlashInfer's swizzle),
-        # and per-expert alphas, so a kernel reading another expert's scales or
-        # alphas, or swapping the three alphas, fails.
+        # The rank's expert-TP slices in checkpoint order ([gate; up] W13 rows),
+        # laid out as served: random e2m1 codes, an E4M3 scale of 0.5, 1 or 2
+        # per block and per-expert alphas, so a kernel reading another block's
+        # scale or another expert's alphas, or swapping the three alphas, fails.
         u8 = torch.uint8
         g = torch.Generator(device=device).manual_seed(11 + rank)
         g_e = torch.Generator().manual_seed(13)
 
-        def codes(*shape: int) -> torch.Tensor:
+        def codes(*shape: int, values: int = 256) -> torch.Tensor:
             if not init:
                 return torch.empty(shape, dtype=u8, device=device)
-            return torch.randint(0, 256, shape, dtype=u8, device=device, generator=g)
+            return torch.randint(values, shape, dtype=u8, device=device, generator=g)
 
-        def expert_scales(per_expert: int) -> tuple[torch.Tensor, torch.Tensor]:
-            code = torch.tensor([0x30, 0x38, 0x40], dtype=u8)[
-                torch.randint(3, (ROUTER_E,), generator=g_e)
-            ].to(device)
-            scales = code[:, None].expand(ROUTER_E, per_expert).reshape(-1)
-            e4m3 = torch.float8_e4m3fn
-            return scales.contiguous().view(e4m3), code.view(e4m3).to(torch.float32)
+        def scales(*shape: int) -> torch.Tensor:  # E4M3 0x30, 0x38, 0x40
+            return 0x30 + 8 * codes(*shape, values=3) if init else codes(*shape)
 
-        w13_scale, t["w13_scale"] = expert_scales(2 * il * EXPERT_HIDDEN // 16)
-        w2_scale, t["w2_scale"] = expert_scales(EXPERT_HIDDEN * il // 16)
+        t["w13"] = codes(ROUTER_E, 2 * il, EXPERT_HIDDEN // 2)
+        t["w13_scale"] = scales(ROUTER_E, 2 * il, EXPERT_HIDDEN // 16)
+        t["w2"] = codes(ROUTER_E, EXPERT_HIDDEN, il // 2)
+        t["w2_scale"] = scales(ROUTER_E, EXPERT_HIDDEN, il // 16)
+        laid_out = (t["w13"], t["w13_scale"], t["w2"], t["w2_scale"])
+        if init:  # FlashInfer's gated GEMM takes [w3 (up); w1 (gate)]
+            up_gate = [torch.cat((w[:, il:], w[:, :il]), 1) for w in laid_out[:2]]
+            laid_out = flashinfer_layout(*up_gate, t["w2"], t["w2_scale"])
         bank = build_nvfp4_verify_bank(
-            w13=codes(ROUTER_E, 2 * il, EXPERT_HIDDEN // 2),
-            w13_scale=w13_scale,
-            w2=codes(ROUTER_E, EXPERT_HIDDEN, il // 2),
-            w2_scale=w2_scale,
+            w13=laid_out[0],
+            w13_scale=laid_out[1],
+            w2=laid_out[2],
+            w2_scale=laid_out[3],
             group=group,
         )
         for name in ("up_alpha", "gate_alpha", "out_alpha"):
@@ -1247,27 +1256,6 @@ def _make_case(
     return _Case(global_attn, expert_bf16, final_norm, host, weights, boundary, t)
 
 
-def _launch_args(
-    case: _Case,
-    attention: AttentionInputs | None,
-    qkv: torch.Tensor | None,
-    stream: torch.Tensor,
-) -> list[object]:
-    """The host kernel's arguments for one call (the entry image's QKV and
-    attention inputs are its own placeholders)."""
-    host = case.host
-    if host._entry_inputs is not None:
-        qkv, attention = host._entry_inputs
-    assert qkv is not None and attention is not None
-    return host._args(
-        qkv=qkv,
-        stream=stream,
-        weights=case.weights,
-        attention=attention,
-        outputs=host._outputs(qkv),
-    )
-
-
 def _check_launch(
     case: _Case,
     attention: AttentionInputs,
@@ -1276,25 +1264,29 @@ def _check_launch(
     out: torch.Tensor,
     stream_next: torch.Tensor,
     title: str,
+    verbose: bool,
 ) -> None:
     """Every stage of one launch against FP64 references computed from the
     kernel's own inputs to that stage, so each stage is held to its own
     rounding."""
     rank, world = dist.get_rank(), dist.get_world_size()
     dims, T, H, NE = LayerDims.of(world), TOKENS, HIDDEN, EXPERT_HIDDEN
-    hb, t, w = case.host._buffers, case.tensors, case.weights
+    hb, t = case.host._buffers, case.tensors
     state = case.host._moe_state
     rep = _Report()
     # Attention, the O-projection partial and its all-reduce.
     att, k_rows, v_rows = _attention_reference(qkv, attention, dims, case.global_attn)
     rep.add("attention out", hb["out"][:T], att, 2**-7)
-    # The new tokens' cache rows (FP8: a rounding flip is one FP8 step).
-    loc = attention.cache_loc
-    for name, cache, rows in (
-        ("K", attention.k_cache, k_rows),
-        ("V", attention.v_cache, v_rows),
-    ):
-        rep.add(f"KV store ({name})", cache.view(-1, dims.kv_width)[loc], rows, 2**-2)
+    # The new tokens' cache rows. K (normed and rotated, then FP8) within one
+    # FP8 rounding flip of each element: an E4M3 step is at most 2**-3 of its
+    # value, 2**-9 below the normals. V, the clamped FP8 of the input rows,
+    # exactly.
+    stored = {
+        name: cache.view(-1, dims.kv_width)[attention.cache_loc].to(F64)
+        for name, cache in (("K", attention.k_cache), ("V", attention.v_cache))
+    }
+    rep.add("KV store (K)", stored["K"], k_rows, 2**-3, floor=2**-9)
+    rep.exact("KV store (V)", stored["V"], v_rows)
     o_part = hb["opart"].reshape(T, H)
     rep.add(
         "o_proj partial", o_part, _bf(_f(hb["out"][:T]) @ t["wo"].to(F64).t()), 2**-7
@@ -1323,14 +1315,9 @@ def _check_launch(
     # kernel's x_A / x_B.
     a_f, b_f = _f(act[0]), _f(act[1])
     rstd = torch.stack((post_r, pre_r), 1)
-    hi, lo = w.wr_hi, w.wr_lo
-    if hi.dim() == 4:  # TP8 stacked planes: per 64-expert chunk, 64 hi then 64 lo rows
-        stacked = hi.view(hi.size(0), hi.size(1), 2, 64, hi.size(3))
-        hi, lo = (
-            stacked[:, :, i].reshape(hi.size(0), -1, hi.size(3)) for i in range(2)
-        )
-    w_r = (hi.to(F64) + lo.to(F64)).permute(1, 0, 2).reshape(hi.size(1), -1)
+    # The checkpoint router (the kernel's bf16 hi + lo planes are within 2**-16).
     own_k = slice(rank * H // world, (rank + 1) * H // world)
+    w_r = t["router"][:, own_k].to(F64)
     logit = rstd[:, 1:2] * (
         a_f[:, own_k] @ w_r.t() + rstd[:, 0:1] * (b_f[:, own_k] @ w_r.t())
     )
@@ -1342,6 +1329,9 @@ def _check_launch(
     topk_ids = hb["topk_ids"].long()
     rep.exact("top-8 ids", topk_ids.sort(-1).values, top.sort(-1).values)
     packed = hb["packed"]
+    # The MoE (and its reference below) reads the experts from packed, and the
+    # weights checked next are packed's, in topk_ids' order.
+    rep.exact("packed ids", (packed >> 16).long(), topk_ids)
     selected = torch.gather(score, 1, topk_ids)
     route_w = (
         selected
@@ -1371,6 +1361,7 @@ def _check_launch(
     nw = _f(t["norm_w"])
     local = dims.n_local  # the rank's MoE output columns
     g2 = torch.zeros(T, TOPK, local, dtype=F64, device=row.device)
+    own_rows = slice(rank * local, (rank + 1) * local)  # of W2
     if case.expert_bf16:
         rep.add("expert input (bf16)", hb["x_q"][:T], normed, 2**-7)
         x, il = _f(hb["x_q"][:T]), dims.intermediate
@@ -1384,59 +1375,40 @@ def _check_launch(
             h = _bf(gate / (1.0 + torch.exp(-gate)) * up)
             z_got.append(state.z[j, :T][routed[j]].to(F64))
             z_ref.append(h[routed[j]])
-            rows_out = _bf(h @ down_w.t())[:, rank * local : (rank + 1) * local]
+            rows_out = _bf(_f(state.z[j, :T]) @ down_w[own_rows].t())
             g2[ids == e] = rows_out[(ids == e).nonzero()[:, 0]]
         rep.add("z (gathered, bf16)", torch.cat(z_got), torch.cat(z_ref), 2**-7)
     else:
         x_q, x_sf, x_ts = hb["x_q"][:T], hb["x_sf"][:T], hb["x_ts"][:T].to(F64)
-        codes = e2m1_values(x_q) * _e4m3(x_sf).repeat_interleave(16, -1)
-        rep.add("expert input (deq)", codes * x_ts[:, None], normed, 0.3)
-        token_scale = normed.view(T, -1, 16).abs().amax(-1).amax(-1) * GLOBAL_SCALE_INV
-        rep.add("token scale", x_ts, token_scale, 1e-3)
-        # W13 + SwiGLU from the kernel's expert input (unit block scales), the
-        # NVFP4 requant of z, then W2 on the kernel's own z.
-        logical = (
-            torch.arange(128, device=row.device)
-            .view(4, 4, 8)
-            .permute(0, 2, 1)
-            .reshape(128)
-        )
-        il, fi_tiles, cells = (
-            dims.intermediate,
-            2 * dims.intermediate // 128,
-            local // 128,
-        )
+        # The quant against FlashInfer's recipe on the reference norm (the
+        # kernel's FP32 norm rounds a rare element to bf16 the other way).
+        x_codes, x_scales, token_scale = nvfp4_quantize(normed, GLOBAL_SCALE_INV)
+        rep.add("token scale", x_ts, token_scale[:, 0], 1e-3)
+        rep.exact("expert input codes", e2m1_values(x_q), x_codes, allowed=1e-3)
+        rep.exact("expert input scales", x_sf, x_scales, allowed=1e-3)
+        # W13 + SwiGLU from the kernel's expert input, the NVFP4 requant of z,
+        # then W2 on the kernel's own z, all from the checkpoint-order experts.
+        x, il, slots = dequantize_nvfp4(x_q, x_sf), dims.intermediate, len(distinct)
         ua, ga, oa = (t[n].to(F64) for n in ("up_alpha", "gate_alpha", "out_alpha"))
-        s13, s2 = t["w13_scale"].to(F64), t["w2_scale"].to(F64)
-        z = torch.zeros(len(distinct), T, il, dtype=F64, device=row.device)
+        z = torch.zeros(slots, T, il, dtype=F64, device=row.device)
         for j, e in enumerate(distinct.tolist()):
-            blocks = w.weights_g[
-                e * fi_tiles : (e + 1) * fi_tiles
-            ]  # [fi, K steps, 2, 128, 128 B]
-            w13 = e2m1_values(blocks.permute(0, 3, 1, 2, 4).reshape(fi_tiles, 128, -1))
-            acc = torch.einsum("frk,tk->frt", w13 * s13[e], codes) * x_ts[None, None, :]
-            lg = acc[:, logical].view(fi_tiles, 64, 2, T)
-            up, gate = lg[:, :, 0] * ua[e], lg[:, :, 1] * ga[e]
-            z[j] = (
-                (gate / (1.0 + torch.exp(-gate)) * up).permute(2, 0, 1).reshape(T, il)
+            w13 = dequantize_nvfp4(t["w13"][e], t["w13_scale"][e])
+            acc = x @ w13.t() * x_ts[:, None]
+            gate, up = acc[:, :il] * ga[e], acc[:, il:] * ua[e]
+            z[j] = gate / (1.0 + torch.exp(-gate)) * up
+        z_codes, z_scales = (torch.cat(_gather(r), -1) for r in nvfp4_quantize(z)[:2])
+        z_q, z_sf = state.z[:slots, :T], state.z_scale[:slots, :T]
+        z_got = e2m1_values(z_q)[routed]
+        rep.exact("z codes (gathered)", z_got, z_codes[routed], allowed=1e-3)
+        rep.exact("z scales (gathered)", z_sf[routed], z_scales[routed], allowed=1e-3)
+        z_k = dequantize_nvfp4(z_q, z_sf)
+        for j, e in enumerate(distinct.tolist()):
+            # This rank's W2 rows over every rank's K slice.
+            parts = zip(_gather(t["w2"][e]), _gather(t["w2_scale"][e]), strict=True)
+            w2 = torch.cat(
+                [dequantize_nvfp4(c[own_rows], s[own_rows]) for c, s in parts], 1
             )
-        blocks16 = z.view(len(distinct), T, -1, 16)
-        sf = (blocks16.abs().amax(-1) / 6.0).float().to(torch.float8_e4m3fn).to(F64)
-        mult = torch.where(sf > 0, 1.0 / sf, torch.zeros_like(sf))
-        z_ref = (round_e2m1(blocks16 * mult[..., None]) * sf[..., None]).view(
-            len(distinct), T, il
-        )
-        z_all = torch.cat(_gather(z_ref), -1)
-        z_k = e2m1_values(state.z[: len(distinct), :T])
-        z_k = z_k * _e4m3(state.z_scale[: len(distinct), :T]).repeat_interleave(16, -1)
-        rep.add("z (gathered, deq)", z_k[routed], z_all[routed], 0.3)
-        for j, e in enumerate(distinct.tolist()):
-            cell = w.weights2[
-                e * cells : (e + 1) * cells
-            ]  # [cells, K pairs, 2, 128, 256 B]
-            w2 = e2m1_values(cell.permute(0, 3, 1, 2, 4).reshape(cells, 128, -1))
-            acc2 = torch.einsum("hrk,tk->hrt", w2 * s2[e], z_k[j])
-            rows_out = _bf(acc2[:, logical] * oa[e]).permute(2, 0, 1).reshape(T, local)
+            rows_out = _bf(z_k[j] @ w2.t() * oa[e])
             g2[ids == e] = rows_out[(ids == e).nonzero()[:, 0]]
     # The post-expert norm and the weighted route sum, over every rank's columns.
     g2_parts = _gather(g2)
@@ -1480,7 +1452,7 @@ def _check_launch(
         qa, qb, wq = _bf(g_t * pre_f), _bf(gb_t * pre_f), t["wq"].to(F64)
         qkv_ref = _bf(pre_t[:, None] * (qa @ wq.t() + post_t[:, None] * (qb @ wq.t())))
         rep.add("next qkv", out, qkv_ref, 2**-7)
-    rep.finish(title)
+    rep.finish(title, verbose)
 
 
 def _check_determinism(
@@ -1505,23 +1477,17 @@ def _check_determinism(
     first = {k: v.clone() for k, v in call().items()}
 
     def compare(tag: str, got: dict[str, torch.Tensor]) -> None:
+        # Every rank raises together: one rank leaving would hang the others.
         torch.cuda.synchronize()
-        differ = [k for k, v in first.items() if not torch.equal(got[k], v)]
+        differs = [not torch.equal(got[k], v) for k, v in first.items()]
+        on_any = _rank_max(torch.tensor(differs, dtype=F64)).tolist()
+        differ = [k for k, d in zip(first, on_any, strict=True) if d]
         if differ:
-            raise AssertionError(f"rank {dist.get_rank()}: {tag} differs in {differ}")
+            raise AssertionError(f"{tag} differs in {differ} on some rank")
 
     for _ in range(2):
         compare("a repeated call", call())
-    side = torch.cuda.Stream()
-    side.wait_stream(torch.cuda.current_stream())
-    with torch.cuda.stream(side):
-        call()
-        side.synchronize()
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph, stream=side):
-            replayed = call()
-    torch.cuda.current_stream().wait_stream(side)
-    dist.barrier()
+    graph, replayed = _capture(call)
     for _ in range(3):
         graph.replay()
     compare("a graph replay", replayed)
@@ -1529,21 +1495,12 @@ def _check_determinism(
 
 
 def _cold_l2_us(graph: torch.cuda.CUDAGraph, replays: int = 21) -> float:
-    """Median over replays of the slowest rank's cold-L2 graph replay."""
-    flush = torch.empty(512 << 20, dtype=torch.uint8, device="cuda")
-    times = []
-    for _ in range(replays):
-        flush.zero_()
-        dist.barrier()
-        start = torch.cuda.Event(enable_timing=True)
-        end = torch.cuda.Event(enable_timing=True)
-        start.record()
-        graph.replay()
-        end.record()
-        torch.cuda.synchronize()
-        times.append(start.elapsed_time(end) * 1e3)
-    slowest = torch.stack(_gather(torch.tensor(times, device="cuda"))).amax(0)
-    return float(slowest.median())
+    """Median over replays of the slowest rank's graph replay after a 512 MB L2
+    scrub."""
+    scrub = torch.empty(512 << 20, dtype=torch.uint8, device="cuda")
+    return float(
+        torch.tensor([_cold_replay_us(graph, scrub) for _ in range(replays)]).median()
+    )
 
 
 def _run(
@@ -1552,17 +1509,12 @@ def _run(
     rank, world = group.rank(), group.size()
     device = torch.device("cuda", torch.cuda.current_device())
     cos_sin = _rope_cache(device)
-    have_flashinfer = importlib.util.find_spec("flashinfer") is not None
     results: dict[str, Any] = {}
     # Each image's symmetric buffers stay allocated: torch finds a symmetric
     # handle by address, so a later image's buffer at a freed one's address
     # would get its stale handle.
     hosts: list[LayerVerifyMegakernel] = []
     for name, (global_attn, expert_bf16, final_norm) in IMAGES.items():
-        if expert_bf16 and not have_flashinfer:
-            if verbose and rank == 0:
-                print(f"{name}: skipped (its bf16 bank needs FlashInfer)")
-            continue
         case = _make_case(
             group,
             device,
@@ -1589,6 +1541,7 @@ def _run(
                 out,
                 stream_next,
                 f"TP{world} {name} image, context {seq_len}",
+                verbose,
             )
         graph = _check_determinism(case, attention, qkv, stream)
         if not check_only:
@@ -1607,20 +1560,10 @@ def _run(
 @torch.inference_mode()
 def main(verbose: bool = True, check_only: bool = False) -> dict[str, Any]:
     """Check every image at this world (4 or 8 ranks), then time it."""
-    if not torch.cuda.is_available() or torch.version.hip is not None:
-        raise RuntimeError(
-            "the Muse Spark layer megakernel is pretuned for NVIDIA SM100"
-        )
-    local_rank = int(os.environ["LOCAL_RANK"])
-    torch.cuda.set_device(local_rank)
-    if torch.cuda.get_device_capability()[0] != 10:
-        raise RuntimeError(
-            "the Muse Spark layer megakernel is pretuned for NVIDIA SM100"
-        )
-    dist.init_process_group("nccl", device_id=torch.device("cuda", local_rank))
+    # Not initialize(): TP8 spans two nodes, and the layer's symmetric buffers
+    # keep torch's default backend (initialize() selects NVSHMEM).
+    _, _, group = initialize_group("the Muse Spark layer megakernel")
     try:
-        group = dist.group.WORLD
-        assert group is not None
         layer_family(group.size(), TOKENS)  # a world serving runs
         return _run(group, verbose=verbose, check_only=check_only)
     finally:

@@ -11,6 +11,7 @@ import contextvars
 import dataclasses
 import functools
 import hashlib
+import math
 import threading
 import types
 from typing import TYPE_CHECKING
@@ -610,33 +611,36 @@ tl_namespace.__getattr__ = _tl  # pyrefly: ignore [missing-attribute]
 
 
 # ---- dsmem transports (``cross_loop_dsmem``) ----------------------------------
-# Rank 0 of each launch cluster holds every entry's barrier and slab in
-# ``CLUSTER_SMEM`` (``cluster_entry``).  A producer task polls rank 0's flag for
-# this launch's value (``cluster_ready``), then sends its tile with st.async,
-# whose bytes complete rank 0's barrier (``cluster_send``); the consumer task on
-# rank 0 waits for phase 0 and reads the slab (``cluster_recv``).  Offsets are
-# bytes into ``CLUSTER_SMEM``; a tile moves ``VEC`` contiguous 32-bit elements
-# at once from a layout with no element on two threads.
+# Every CTA of a launch cluster holds every entry's barrier and slab in
+# ``CLUSTER_SMEM`` (``cluster_entry``).  A producer task polls the flags of the
+# ranks it sends to (rank 0; every rank for a per-rank consumer or a
+# replicated slab; its own CTA for a local slab) for this launch's value
+# (``cluster_ready``), then sends its tile with st.async, whose bytes complete
+# those ranks' barriers (``cluster_send``); the consumer task waits for phase 0
+# and reads the slab from its own CTA (``cluster_recv``).  Offsets are bytes
+# into ``CLUSTER_SMEM``; a tile moves ``VEC`` contiguous 32-bit elements at
+# once, one of the ``COPIES`` threads holding an element sending it.
 #
 # The flag is a relaxed store: ``cluster_entry``'s fence.mbarrier_init orders
-# the barriers' init before it, and a send that lands before rank 0 arms its
-# barrier only takes the tx-count negative (the arrival still pending keeps the
-# phase open); a release store would be a GPU-wide fence behind every bulk copy
-# in flight.
+# the barriers' init before it, and a send that lands before the rank it
+# reaches arms its barrier only takes the tx-count negative (the arrival still
+# pending keeps the phase open); a release store would be a GPU-wide fence
+# behind every bulk copy in flight.
 #
 # Shared memory is not cleared between CTAs: a CTA may take the shared memory
 # of one that exited, of another kernel or of this launch (its CTAs need not
 # start together: PDL, other streams).  So every CTA clears its flag as it
-# exits (``cluster_exit``, after its tasks: a cluster's polls of rank 0 all
-# precede the sends rank 0 waits for), and a raised flag a poll finds is its
-# rank 0's.  Against what other kernels leave there, the flag (bytes 0 to 7,
-# one word: the PTX memory model orders a vector access's elements as
-# separate operations) holds a 64-bit hash of the launch epoch, the cluster's
-# linear id and the kernel's launch-state address (splitmix64's finalizer),
-# with its top bit set so it is never the cleared 0: data another kernel left
-# matches it only by chance, about 1 in 2**63 a launch.  (The hardware cluster
-# barrier would need every thread, which a warp-specialized kernel's padding
-# warps never are.)
+# exits (``cluster_exit``), after it has waited for every send to it, in its
+# consumer task or (a replicated slab's, which a CTA may never read) in
+# ``cluster_exit``: each poll of a rank precedes a send that rank waits for,
+# so a raised flag a poll finds is that rank's.  Against what other kernels
+# leave there, the flag (bytes 0 to 7, one word: the PTX memory model orders a
+# vector access's elements as separate operations) holds a 64-bit hash of the
+# launch epoch, the cluster's linear id and the kernel's launch-state address
+# (splitmix64's finalizer), with its top bit set so it is never the cleared 0:
+# data another kernel left matches it only by chance, about 1 in 2**63 a
+# launch.  (The hardware cluster barrier would need every thread, which a
+# warp-specialized kernel's padding warps never are.)
 CLUSTER_SMEM = "helion_cluster_smem"
 _CLUSTER_VALUE = (
     "mov.u32 t, %clusterid.z; mov.u32 u, %nclusterid.y; mov.u32 w, %clusterid.y; "
@@ -654,19 +658,41 @@ _CLUSTER_FLAG = gl.constexpr(
     f"mov.u32 a, {CLUSTER_SMEM}; "
     "@p st.relaxed.cluster.shared::cta.u64 [a], v; mov.u32 $0, 0; }"
 )
-_CLUSTER_EXIT = gl.constexpr(
-    "{ .reg .pred p; .reg .b32 t, a; .reg .b64 z; mov.b64 z, 0; "
-    "mov.u32 t, %tid.x; setp.eq.u32 p, t, 0; "
-    f"mov.u32 a, {CLUSTER_SMEM}; "
-    "@p st.relaxed.cluster.shared::cta.u64 [a], z; mov.u32 $0, $1; }"
-)
-_CLUSTER_READY = gl.constexpr(
-    "{ .reg .pred q; .reg .b32 t, u, w, a; .reg .b64 v, s, c, f; "
-    + _CLUSTER_VALUE
-    + f"mov.u32 a, {CLUSTER_SMEM}; mapa.shared::cluster.u32 a, a, 0; "
-    "HCLR${:uid}: ld.acquire.cluster.shared::cluster.u64 f, [a]; "
-    "setp.ne.u64 q, f, v; @q bra HCLR${:uid}; mov.u32 $0, 0; }"
-)
+
+
+@gluon.constexpr_function
+def _cluster_exit_asm(waits):
+    """Wait for the barriers at byte offsets ``waits`` (comma separated, maybe
+    none) to complete phase 0, then clear the flag (thread 0)."""
+    return (
+        "{ .reg .pred p, w; .reg .b32 t, a; .reg .b64 z; mov.b64 z, 0; "
+        + "".join(
+            f"mov.u32 a, {CLUSTER_SMEM}; add.u32 a, a, {int(offset)}; "
+            f"HCLX{i}_${{:uid}}: mbarrier.try_wait.parity.acquire.cluster"
+            f".shared::cta.b64 w, [a], 0; @!w bra HCLX{i}_${{:uid}}; "
+            for i, offset in enumerate(o for o in str(waits).split(",") if o)
+        )
+        + "mov.u32 t, %tid.x; setp.eq.u32 p, t, 0; "
+        f"mov.u32 a, {CLUSTER_SMEM}; "
+        "@p st.relaxed.cluster.shared::cta.u64 [a], z; mov.u32 $0, $1; }"
+    )
+
+
+@gluon.constexpr_function
+def _cluster_ready_asm(ranks):
+    """Wait for the flags of ranks ``0 .. ranks - 1`` in turn (0: this CTA's)."""
+    return (
+        "{ .reg .pred q; .reg .b32 t, u, w, a; .reg .b64 v, s, c, f; "
+        + _CLUSTER_VALUE
+        + "".join(
+            f"mov.u32 a, {CLUSTER_SMEM}; "
+            + ("" if rank < 0 else f"mapa.shared::cluster.u32 a, a, {rank}; ")
+            + f"HCLR{rank + 1}_${{:uid}}: ld.acquire.cluster.shared::cluster.u64 f, [a]; "
+            f"setp.ne.u64 q, f, v; @q bra HCLR{rank + 1}_${{:uid}}; "
+            for rank in (range(int(ranks)) if int(ranks) else [-1])
+        )
+        + "mov.u32 $0, 0; }"
+    )
 
 
 # Triton keys a compile by what jit code references: a plain function fails.
@@ -724,12 +750,14 @@ def cluster_flag(epoch, state):
 
 
 @gluon.jit
-def cluster_exit():
+def cluster_exit(WAITS: gl.constexpr):
     """Clear the flag (thread 0, at the kernel's end): a CTA that later takes
-    this shared memory finds no raised flag."""
+    this shared memory finds no raised flag.  First the barriers at byte
+    offsets ``WAITS`` (comma separated) complete: the replicated slabs', whose
+    sends reach every CTA, including one that never reads them."""
     gl.inline_asm_elementwise(
         # pyrefly: ignore [bad-argument-type]
-        _CLUSTER_EXIT,
+        _cluster_exit_asm(WAITS),
         "=r,r",
         [gl.program_id(0)],
         dtype=gl.int32,
@@ -739,12 +767,13 @@ def cluster_exit():
 
 
 @gluon.jit
-def cluster_ready(epoch, state):
-    """Wait until rank 0's flag holds this launch's value and this cluster's
-    id; returns the token a send depends on."""
+def cluster_ready(epoch, state, RANKS: gl.constexpr):
+    """Wait until the flags of ranks ``0 .. RANKS - 1`` (the ranks the sends
+    reach; 0: this CTA, for local slabs only) hold this launch's value and
+    this cluster's id; returns the token a send depends on."""
     return gl.inline_asm_elementwise(
         # pyrefly: ignore [bad-argument-type]
-        _CLUSTER_READY,
+        _cluster_ready_asm(RANKS),
         "=r,r,l",
         [epoch.to(gl.int32, bitcast=True), state],
         dtype=gl.int32,
@@ -761,20 +790,27 @@ _cluster_layout_dims = gluon.constexpr_function(cluster_layout)
 def _cluster_layout(shape, vec, num_warps):
     dims = _cluster_layout_dims([int(d) for d in shape], vec, num_warps)
     if dims is None:
-        raise ValueError(
-            f"a dsmem transport cannot move a {shape} tile without duplicates"
-        )
-    per, lanes, warps = dims
+        raise ValueError(f"a dsmem transport cannot move a {shape} tile")
+    per, lanes, warps, _ = dims
     return gl.BlockedLayout(per, lanes, warps, list(reversed(range(len(shape)))))
 
 
 @gluon.constexpr_function
-def _cluster_send_asm(vec, bar):
+def _cluster_send_asm(vec, bar, rank, guarded):
     vals = ", ".join(f"${vec + i}" for i in range(vec))
+    # Guarded: only where the operand after ``ready`` is nonzero.
+    guard = f"setp.ne.u32 p, ${4 * vec}, 0; @p " if guarded else ""
+    # Rank -1: this CTA (its shared::cta addresses are its shared::cluster ones).
+    to = (
+        ""
+        if int(rank) < 0
+        else f"mapa.shared::cluster.u32 a, a, {rank}; "
+        f"mapa.shared::cluster.u32 m, m, {rank}; "
+    )
     return (
-        f"{{ .reg .b32 a, m; mov.u32 a, {CLUSTER_SMEM}; add.u32 a, a, ${2 * vec}; "
-        f"mapa.shared::cluster.u32 a, a, 0; mov.u32 m, {CLUSTER_SMEM}; "
-        f"add.u32 m, m, {bar}; mapa.shared::cluster.u32 m, m, 0; "
+        f"{{ .reg .pred p; .reg .b32 a, m; mov.u32 a, {CLUSTER_SMEM}; "
+        f"add.u32 a, a, ${2 * vec}; "
+        f"mov.u32 m, {CLUSTER_SMEM}; add.u32 m, m, {bar}; {to}{guard}"
         "st.async.shared::cluster.mbarrier::complete_tx::bytes"
         + (
             f".v{vec}.b32 [a], {{{vals}}}, [m]; "
@@ -806,32 +842,77 @@ def _cluster_constraints(vec, inputs):
     return ",".join(["=r"] * vec + ["r"] * (vec * inputs))
 
 
+@gluon.constexpr_function
+def _cluster_copies_shape(copies, shape):
+    """A tile's elements as one dimension, after a dimension of its copies."""
+    return [int(copies), math.prod(int(d) for d in shape)]
+
+
 @gluon.jit
-def cluster_send(value, offsets, ready, BAR: gl.constexpr, VEC: gl.constexpr):
-    """Send ``value`` (32-bit elements) to rank 0's ``CLUSTER_SMEM`` at byte
-    ``offsets``, completing rank 0's barrier at byte ``BAR`` (``ready``:
-    ``cluster_ready``'s token)."""
-    layout: gl.constexpr = _cluster_layout(  # pyrefly: ignore [bad-assignment]
-        value.shape, VEC, gl.num_warps()
-    )
-    words = gl.convert_layout(value, layout).to(gl.int32, bitcast=True)
-    at = gl.convert_layout(offsets, layout)
-    return gl.inline_asm_elementwise(
+def cluster_send(
+    value,
+    offsets,
+    ready,
+    BAR: gl.constexpr,
+    VEC: gl.constexpr,
+    RANK: gl.constexpr,
+    COPIES: gl.constexpr,
+):
+    """Send ``value`` (32-bit elements) to rank ``RANK``'s ``CLUSTER_SMEM``
+    (-1: this CTA's) at byte ``offsets``, completing that rank's barrier at
+    byte ``BAR`` (``ready``: ``cluster_ready``'s token).  A tile whose layout
+    puts each element on ``COPIES`` threads goes as that many copies of it
+    (a leading dimension), only the first of which sends."""
+    if COPIES == 1:
+        layout: gl.constexpr = _cluster_layout(  # pyrefly: ignore [bad-assignment]
+            value.shape, VEC, gl.num_warps()
+        )
+        words = gl.convert_layout(value, layout).to(gl.int32, bitcast=True)
+        at = gl.convert_layout(offsets, layout)
+        return gl.inline_asm_elementwise(
+            # pyrefly: ignore [bad-argument-type]
+            _cluster_send_asm(VEC, BAR, RANK, False),
+            # pyrefly: ignore [bad-argument-type]
+            _cluster_constraints(VEC, 3),
+            [words, at, at * 0 + ready],
+            dtype=gl.int32,
+            is_pure=False,
+            # pyrefly: ignore [bad-argument-type]
+            pack=VEC,
+        )
+    # Not dedented: a constexpr branch's return leaves the code past it compiled.
+    else:  # noqa: RET505
+        shape: gl.constexpr = _cluster_copies_shape(  # pyrefly: ignore [bad-assignment]
+            COPIES, value.shape
+        )
+        layout: gl.constexpr = _cluster_layout(  # pyrefly: ignore [bad-assignment]
+            shape, VEC, gl.num_warps()
+        )
+        # pyrefly: ignore [bad-assignment, bad-argument-type]
+        row: gl.constexpr = gl.SliceLayout(0, layout)
+        words = gl.convert_layout(gl.reshape(value, [shape[1]]), row)
+        at = gl.convert_layout(gl.reshape(offsets, [shape[1]]), row)
         # pyrefly: ignore [bad-argument-type]
-        _cluster_send_asm(VEC, BAR),
-        # pyrefly: ignore [bad-argument-type]
-        _cluster_constraints(VEC, 3),
-        [words, at, at * 0 + ready],
-        dtype=gl.int32,
-        is_pure=False,
-        # pyrefly: ignore [bad-argument-type]
-        pack=VEC,
-    )
+        copy = gl.arange(0, COPIES, layout=gl.SliceLayout(1, layout))
+        first = gl.expand_dims((copy == 0).to(gl.int32), 1)
+        words, first = gl.broadcast(gl.expand_dims(words, 0), first)
+        at, first = gl.broadcast(gl.expand_dims(at, 0), first)
+        return gl.inline_asm_elementwise(
+            # pyrefly: ignore [bad-argument-type]
+            _cluster_send_asm(VEC, BAR, RANK, True),
+            # pyrefly: ignore [bad-argument-type]
+            _cluster_constraints(VEC, 4),
+            [words.to(gl.int32, bitcast=True), at, at * 0 + ready, first],
+            dtype=gl.int32,
+            is_pure=False,
+            # pyrefly: ignore [bad-argument-type]
+            pack=VEC,
+        )
 
 
 @gluon.jit
 def cluster_recv(offsets, DTYPE: gl.constexpr, BAR: gl.constexpr, VEC: gl.constexpr):
-    """Rank 0's slab at byte ``offsets`` once its barrier at byte ``BAR`` has
+    """This CTA's slab at byte ``offsets`` once its barrier at byte ``BAR`` has
     completed phase 0, in ``offsets``' layout."""
     layout: gl.constexpr = _cluster_layout(  # pyrefly: ignore [bad-assignment]
         offsets.shape, VEC, gl.num_warps()

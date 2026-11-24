@@ -21,8 +21,7 @@ from helion._testing import DEVICE
 from helion._testing import cpu_render_target
 from helion._testing import skipIfFn
 from helion._testing import skipIfRefEager
-from helion._testing import skipIfTileIR
-from helion._testing import skipUnlessBackends
+from helion._testing import skipUnlessTritonBarriers
 from helion._testing.triton_codegen import gluon_cpu_codegen
 import helion.language as hl
 from helion.runtime.kernel import _input_tensor_aliases
@@ -30,16 +29,6 @@ from helion.runtime.kernel import _make_prepared_arg_guard
 from helion.runtime.settings import _get_backend
 
 pytestmark = pytest.mark.cpu_only
-
-
-def _triton(test: object) -> object:
-    for skip in (
-        skipUnlessBackends(["triton"]),
-        skipIfTileIR("TileIR runs no barrier walk"),
-        skipIfRefEager("ref-eager mode generates no code"),
-    ):
-        test = skip(test)
-    return test
 
 
 def _store_then_load_argument(scratch: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
@@ -59,7 +48,7 @@ def _call_args(
     return (s, s.view_as(s)) if aliased else (s, other)
 
 
-@_triton
+@skipUnlessTritonBarriers
 def test_the_partition_keys_runtime_overlap() -> None:
     @dataclasses.dataclass
     class Inputs:
@@ -97,7 +86,7 @@ def test_the_partition_keys_runtime_overlap() -> None:
     torch.testing.assert_close(compiled(x, x.view_as(x)), x + x)
 
 
-@_triton
+@skipUnlessTritonBarriers
 def test_the_prepared_guard_checks_overlap_relations() -> None:
     kernel = helion.kernel(_store_then_load_argument, static_shapes=True)
     x = torch.empty(64, 128)
@@ -131,7 +120,7 @@ def test_the_prepared_guard_checks_overlap_relations() -> None:
     assert not same((scratch, other))
 
 
-@_triton
+@skipUnlessTritonBarriers
 @pytest.mark.parametrize("static_shapes", [True, False])
 def test_a_view_of_another_argument_binds_apart_and_orders_its_load(
     static_shapes: bool,
@@ -141,8 +130,10 @@ def test_a_view_of_another_argument_binds_apart_and_orders_its_load(
     # passed twice; two distinct tensors get none and share their binding
     # with two disjoint halves of one storage, row or column halves, under
     # static shapes.  Without them every binding also orders the update of
-    # ``scratch`` (a write after a read) and the second store to ``out`` (a
-    # write after a write), whose strides may map elements together.
+    # ``scratch`` (a write after a read), an argument whose strides may map
+    # elements together; ``out``, allocated from the symbolic sizes, has
+    # strides that nest, so its second store (a write after a write) needs
+    # no barrier.
     kernel = helion.kernel(_store_then_load_argument, static_shapes=static_shapes)
     scratch = torch.randn(64, 128)
     other = torch.randn(64, 128)
@@ -154,7 +145,7 @@ def test_a_view_of_another_argument_binds_apart_and_orders_its_load(
         aliased = kernel.bind(_call_args(scratch, other, aliased=True))
         twice = kernel.bind((scratch, scratch))
         assert len({distinct, aliased, twice}) == 3
-        update = 0 if static_shapes else 2
+        update = 0 if static_shapes else 1
         assert distinct.to_code(config).count("tl.debug_barrier()") == update
         assert aliased.to_code(config).count("tl.debug_barrier()") == update + 1
         assert twice.to_code(config).count("tl.debug_barrier()") == update + 1
@@ -175,7 +166,7 @@ def _store_then_load_with_a_constant(
     return out
 
 
-@_triton
+@skipUnlessTritonBarriers
 def test_a_constexpr_holding_a_tensor_binds() -> None:
     # The key skips the constexpr; its fake holds the tensor unwrapped.
     kernel = helion.kernel(_store_then_load_with_a_constant, static_shapes=True)
@@ -199,7 +190,7 @@ def _store_then_load_a_field(scratch: torch.Tensor, source: _Source) -> torch.Te
     return out
 
 
-@_triton
+@skipUnlessTritonBarriers
 def test_a_view_in_a_named_tuple_binds() -> None:
     # A named tuple's field overlaps the first argument.
     kernel = helion.kernel(_store_then_load_a_field, static_shapes=True)
@@ -230,7 +221,7 @@ def test_gluon_binds_a_view_of_another_argument_apart() -> None:
     assert aliased_code.count("barrier()") > distinct_code.count("barrier()")
 
 
-@_triton
+@skipUnlessTritonBarriers
 def test_a_backend_change_keys_by_the_new_backend_after_reset() -> None:
     # A kernel built for a backend whose walks see no overlap, switched to
     # Triton: reset() drops the old bindings and keys by overlap again.
@@ -247,7 +238,7 @@ def test_a_backend_change_keys_by_the_new_backend_after_reset() -> None:
         assert "tl.debug_barrier()" in aliased.to_code(config)
 
 
-@_triton
+@skipUnlessTritonBarriers
 def test_fake_arguments_bind_by_identity() -> None:
     # Fake tensors have no addresses: a view of another fake argument keys
     # and compiles as a distinct tensor, apart from eager views.
@@ -265,7 +256,7 @@ def test_fake_arguments_bind_by_identity() -> None:
         assert "tl.debug_barrier()" in kernel.bind((fake, fake)).to_code(config)
 
 
-@_triton
+@skipUnlessTritonBarriers
 @pytest.mark.cuda
 def test_eager_calls_keep_the_two_bindings_apart() -> None:
     # The fast key, then the prepared call, in either order.

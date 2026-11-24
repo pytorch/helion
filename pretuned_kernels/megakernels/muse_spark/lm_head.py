@@ -1,7 +1,8 @@
 """Muse Spark spec-decode verify logits (8 or 16 rows) at TP4 or TP8 as one
-persistent Helion megakernel: the vocab-parallel lm head GEMV, the logit scale and
-softcap, and the all-gather of the vocab shards. Replaces the stock FP32-output
-GEMM, logit scale, NCCL all-gather, logits copy and softcap launches.
+Helion megakernel launch (dynamic dispatch, one CTA per G task): the
+vocab-parallel lm head GEMV, the logit scale and softcap, the all-gather of the
+vocab shards and the greedy argmax. Replaces the stock FP32-output GEMM, logit
+scale, NCCL all-gather, logits copy, softcap and argmax launches.
 
 The shard is padded to whole G blocks, so every block lands whole and its words
 travel tagged to every rank as they are produced, when the step needs the
@@ -27,8 +28,8 @@ with system-scope release atomics, which serialize GPU-wide.
 
 Calls and graph replays must occur in identical collective order across ranks
 on one ordered CUDA stream. ``main()`` compares against the sglang default
-(cuBLAS FP32 GEMM, NCCL all-gather, softcap) at TP4; ``--check`` runs only the
-FP64 correctness check::
+(cuBLAS FP32 GEMM, NCCL all-gather, softcap, argmax) at TP4; ``--check`` runs
+only the FP64 correctness check::
 
     NVSHMEM_DISABLE_CUDA_VMM=1 PYTHONPATH=. \
       python -m torch.distributed.run --standalone --nproc-per-node=4 \
@@ -61,9 +62,10 @@ import helion.language as hl
 if TYPE_CHECKING:
     from collections.abc import Callable
 
-# The served 202048-token vocabulary over four ranks: not a whole number of G
-# blocks, so the padded tail is exercised.
-VOCAB_SHARD = 50512
+# The served 202048-token vocabulary; its shard (TP4: 50512 rows, TP8: 25256) is
+# not a whole number of G blocks, so the padded tail is exercised.
+VOCAB = 202048
+VOCAB_SHARD = VOCAB // WORLD_SIZE
 # Compile-time logit scale and softcap; these place the logits at the cap's knee.
 LOGIT_SCALE = 0.75
 LOGIT_CAP = 20.0
@@ -227,12 +229,14 @@ class LmHeadWorkspaces:
 # Symmetric buffers live for the process: torch finds a symmetric-memory handle by
 # address, so a larger buffer at a freed smaller one's address gets its stale handle.
 @functools.cache
-def make_workspaces(tokens: int, group: dist.ProcessGroup) -> LmHeadWorkspaces:
-    """The group's buffers (its vocab shard: the vocabulary over its ranks)."""
-    shard = VOCAB_SHARD * WORLD_SIZE // group.size()
-    padded = math.ceil(shard / G_BLOCK) * G_BLOCK
+def make_workspaces(
+    tokens: int, group: dist.ProcessGroup, device: torch.device | None = None
+) -> LmHeadWorkspaces:
+    """The group's buffers (its vocab shard: the vocabulary over its ranks) on
+    ``device`` (default: the current CUDA device)."""
+    padded = math.ceil(VOCAB // group.size() / G_BLOCK) * G_BLOCK
     blocks = padded // G_BLOCK
-    device = torch.device("cuda", torch.cuda.current_device())
+    device = device or torch.device("cuda", torch.cuda.current_device())
     workspaces = LmHeadWorkspaces(
         shard=symm_mem.empty(tokens, padded, dtype=torch.float32, device=device),
         block_max=torch.empty(tokens, blocks, dtype=torch.float32, device=device),
@@ -325,9 +329,7 @@ def correctness_check(group: dist.ProcessGroup) -> None:
         workspaces = make_workspaces(tokens, group)
         for seed in range(21, 24):
             hidden, weight = make_inputs(seed, group.rank(), tokens)
-            out = torch.full(
-                (tokens, WORLD_SIZE * VOCAB_SHARD), float("nan"), device="cuda"
-            )
+            out = torch.full((tokens, VOCAB), float("nan"), device="cuda")
             workspaces.need_logits.fill_(1)
             launch(hidden, weight, workspaces, out, group)
             _check(out, hidden, weight, workspaces.greedy_ids)
@@ -351,18 +353,21 @@ def use_cudagraph() -> bool:
 def _sglang_default(
     hidden: torch.Tensor, weight: torch.Tensor, group: dist.ProcessGroup
 ) -> Callable[[], torch.Tensor]:
-    """sglang's verify logits: FP32-output GEMM and scale, NCCL all-gather of
-    the vocab shards, rank-major copy and softcap. None of these launch with PDL,
-    in serving either (cuBLAS, NCCL and PyTorch elementwise kernels)."""
+    """sglang's verify logits and greedy tokens: FP32-output GEMM and scale, NCCL
+    all-gather of the vocab shards, rank-major copy, softcap and argmax. None of
+    these launch with PDL, in serving either (cuBLAS, NCCL and PyTorch kernels)."""
     tokens = hidden.size(0)
     gathered = torch.empty(WORLD_SIZE, tokens, VOCAB_SHARD, device="cuda")
+    greedy_ids = torch.empty(tokens, dtype=torch.int64, device="cuda")
 
     def call() -> torch.Tensor:
         logits = torch.mm(hidden, weight.T, out_dtype=torch.float32)
         logits.mul_(LOGIT_SCALE)
         dist.all_gather_into_tensor(gathered, logits, group=group)
-        full = gathered.permute(1, 0, 2).reshape(tokens, WORLD_SIZE * VOCAB_SHARD)
-        return LOGIT_CAP * torch.tanh(full / LOGIT_CAP)
+        full = gathered.permute(1, 0, 2).reshape(tokens, VOCAB)
+        capped = LOGIT_CAP * torch.tanh(full / LOGIT_CAP)
+        torch.argmax(capped, dim=-1, out=greedy_ids)
+        return capped
 
     return call
 
@@ -378,7 +383,7 @@ def _run(
     for tokens in VERIFY_TOKENS:
         hidden, weight = make_inputs(31, rank, tokens)
         workspaces = make_workspaces(tokens, group)
-        out = torch.empty(tokens, WORLD_SIZE * VOCAB_SHARD, device="cuda")
+        out = torch.empty(tokens, VOCAB, device="cuda")
 
         def helion_call(
             hidden: torch.Tensor = hidden,

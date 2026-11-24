@@ -26,6 +26,7 @@ from ...language.memory_ops import load
 from ...language.memory_ops import prefetch
 from ...language.memory_ops import prefetch_is_bulk
 from ...language.memory_ops import store
+from .. import loop_dependency_checker
 from ..ast_extension import statement_from_string
 from ..compile_environment import CUDA_TENSOR_DESCRIPTOR_MAX_BLOCK_SIZE
 from ..compile_environment import CompileEnvironment
@@ -72,10 +73,8 @@ def _(state: CodegenState) -> ast.AST:
     # is a cross-thread write-after-read or write-after-write on global
     # memory; emit a barrier so every thread has read and stored before the
     # overwrite (see mark_intra_loop_raw_barriers).
-    from ..loop_dependency_checker import emit_intra_loop_raw_barrier
-
     tensor = state.proxy_arg(0)
-    emit_intra_loop_raw_barrier(
+    loop_dependency_checker.emit_intra_loop_raw_barrier(
         state, tensor if isinstance(tensor, torch.Tensor) else None
     )
     subscript = state.proxy_arg(1)
@@ -159,10 +158,8 @@ def _(state: CodegenState) -> ast.AST | SharedValue:
     # body or in an earlier iteration, or through device pointers, is a
     # cross-thread read-after-write on global memory; emit a barrier so the
     # write is visible before the read (see mark_intra_loop_raw_barriers).
-    from ..loop_dependency_checker import emit_intra_loop_raw_barrier
-
     tensor = state.proxy_arg(0)
-    emit_intra_loop_raw_barrier(
+    loop_dependency_checker.emit_intra_loop_raw_barrier(
         state, tensor if isinstance(tensor, torch.Tensor) else None
     )
     subscript = state.proxy_arg(1)
@@ -297,9 +294,9 @@ def tensor_prefetch_possible(
     limits (16-byte strides), indexed by scalars (ints, symbols or loaded
     scalars), tiles and full slices, with a base the bound kernel can key
     (``CompileEnvironment.tensor_descriptor_alignment_source``: an input, or
-    a view at its start) and, at a full last-dim slice, a row of boxes
-    ``_tensor_prefetch_box`` accepts whatever the config.  The config decides
-    the box."""
+    a view starting a multiple of 16 bytes past one) and, at a full last-dim
+    slice, a row of boxes ``_tensor_prefetch_box`` accepts whatever the
+    config.  The config decides the box."""
     env = CompileEnvironment.current()
     if (
         not prefetch_is_bulk(tensor, index, has_extra_mask)

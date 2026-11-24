@@ -43,8 +43,9 @@ PICKED = -9223372036854775807
 
 
 def key_index(key: torch.Tensor, count: int) -> torch.Tensor:
-    """The index packed in a ``stable_key`` key's low digits."""
-    return (count - 1 - (key % count + count) % count).to(torch.int32)
+    """The index packed in a ``stable_key`` key's low digits (``%`` is floor
+    modulo, in [0, count) for negative keys too)."""
+    return (count - 1 - key % count).to(torch.int32)
 
 
 def top_k_picks(

@@ -1457,10 +1457,7 @@ def _register_tile_lane_split_orders_memory(
     # those inputs' host origins (``opaque_access_target``).
     with host_function:
         if intra_loop_raw_reread_block_ids(
-            graphs,
-            device_ir.root_ids,
-            device_ir.grid_block_ids,
-            carries=env.backend.intra_loop_barriers_carry_iterations,
+            graphs, device_ir.root_ids, device_ir.grid_block_ids, env.backend
         ):
             return True
         shared: set[int] = set()
