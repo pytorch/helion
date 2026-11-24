@@ -111,6 +111,7 @@ class FragmentControlFlow(FragmentContext):
         # make the loop header refer to a temporary that the body defines.
         starts: list[str] = []
         ends: list[str] = []
+        intervals: dict[int, tuple[object, object]] = {}
         steps: list[str] = []
 
         snapshotted_ranges: set[Node] = set()
@@ -133,17 +134,28 @@ class FragmentControlFlow(FragmentContext):
         ):
             starts.append(range_scalar(begin))
             ends.append(range_scalar(end))
-            step = self.sym(self.df.resolved_block_size(bid))
+            tile_size = self.df.resolved_block_size(bid)
+            step = self.sym(tile_size)
+            explicit = None
             if node.target is _tracing_ops._for_loop_step:
                 explicit = cast("list[object]", node.args[4])[index]
                 if explicit is not None:
                     step = range_scalar(explicit)
             steps.append(step)
+            # These are lexical loop operands, not the enclosing grid bounds.
+            if explicit is None or (
+                type(explicit) is int
+                and type(tile_size) is int
+                and explicit == tile_size
+            ):
+                intervals[bid] = begin, end
         # A later axis can read an outer tile that shares an earlier axis's
         # block ID. Install the new scope only after evaluating every header.
         for bid, stop in zip(graph.block_ids, ends, strict=True):
             self.bounds[bid] = stop
             self.offsets[bid] = self.df.new_var("fragment_tile")
+            if bid in intervals:
+                self.record_tile_interval(bid, *intervals[bid])
         if control_snapshots:
             # Even a zero-trip loop reads its headers on every warp. Complete
             # all those reads before a later store can reuse any source slot.
