@@ -20184,7 +20184,7 @@ class TestCuteTcgen05AuxPipelineCycle2a(unittest.TestCase):
 
 @onlyBackends(["cute"])
 class TestCuteDslCompat(unittest.TestCase):
-    """The cute backend hard-requires the 4.7 CuTe DSL API (enforced up front
+    """The cute backend hard-requires the 4.8.1 CuTe DSL API (enforced up front
     by ``CuteBackend.validate_environment``), so the pipeline emitters render
     the native CuTe calls directly with no per-build workarounds."""
 
@@ -22753,7 +22753,7 @@ class TestPerKiterTmaBuilders(unittest.TestCase):
             ),
             self.assertRaisesRegex(
                 exc.BackendUnsupported,
-                "requires exactly nvidia-cutlass-dsl==4.7.0",
+                "requires exactly nvidia-cutlass-dsl==4.8.1",
             ),
         ):
             build("cutlass.BFloat16")

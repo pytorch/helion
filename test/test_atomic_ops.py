@@ -6772,7 +6772,7 @@ class TestFragmentAtomicAggregationCPU(unittest.TestCase):
                 text = str(emitted)
                 self.assertIn("nvvm.match.sync", text)
                 self.assertIn("nvvm.redux.sync", text)
-                self.assertIn("nvvm.vote.sync  ballot", text)
+                self.assertRegex(text, r"nvvm\.vote\.sync\s+ballot\b")
                 self.assertIn("nvvm.atomicrmw", text)
                 self.assertIn("#nvvm.mem_scope<cta>", text)
 

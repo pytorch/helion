@@ -19835,8 +19835,9 @@ class TestCuteConfigValuePriors(TestCase):
                     self.assertEqual(effective, expected, key)
 
 
+@pytest.mark.cpu_only
 class TestCuteBackendRequirements(TestCase):
-    """The cute backend hard-requires CuTe DSL >= 4.7.0, apache-tvm-ffi, and
+    """The cute backend hard-requires CuTe DSL >= 4.8.1, apache-tvm-ffi, and
     CUDA >= 13, enforced up front via ``CuteBackend.validate_environment``.
     An environment that runs the cute backend's tests (HELION_BACKEND=cute)
     must satisfy the requirements; importing cutlass alone does not imply it.
@@ -19884,22 +19885,24 @@ class TestCuteBackendRequirements(TestCase):
 
         CuteBackend().validate_environment()  # must not raise in this environment
 
-    def test_pre_47_dsl_is_rejected_before_codegen(self) -> None:
+    def test_older_dsl_is_rejected_before_codegen(self) -> None:
         from helion._compiler.cute import cutedsl_compat
 
         self.addCleanup(cutedsl_compat._cute_backend_requirement_error.cache_clear)
         self.addCleanup(cutedsl_compat._installed_cute_dsl_version.cache_clear)
-        cutedsl_compat._cute_backend_requirement_error.cache_clear()
-        cutedsl_compat._installed_cute_dsl_version.cache_clear()
-        with patch.object(
-            cutedsl_compat.importlib.metadata,
-            "version",
-            return_value="4.6.1",
-        ):
-            self.assertEqual(
-                cutedsl_compat._cute_backend_requirement_error(),
-                "the installed CuTe DSL is too old (need >= 4.7.0, found 4.6.1)",
-            )
+        for version in ("4.6.1", "4.7.1", "4.8.0"):
+            with self.subTest(version=version):
+                cutedsl_compat._cute_backend_requirement_error.cache_clear()
+                cutedsl_compat._installed_cute_dsl_version.cache_clear()
+                with patch.object(
+                    cutedsl_compat.importlib.metadata,
+                    "version",
+                    return_value=version,
+                ):
+                    self.assertEqual(
+                        cutedsl_compat._cute_backend_requirement_error(),
+                        f"the installed CuTe DSL is too old (need >= 4.8.1, found {version})",
+                    )
 
     def test_unmet_requirement_raises_with_actionable_message(self) -> None:
         from helion._compiler.cute import cutedsl_compat
@@ -19916,7 +19919,7 @@ class TestCuteBackendRequirements(TestCase):
         message = str(ctx.exception)
         self.assertIn("apache-tvm-ffi package is required (simulated)", message)
         # The fixed tail names all three requirements so the user knows the set.
-        self.assertIn("nvidia-cutlass-dsl >= 4.7.0", message)
+        self.assertIn("nvidia-cutlass-dsl >= 4.8.1", message)
         self.assertIn("CUDA >= 13", message)
 
 
@@ -19932,7 +19935,7 @@ def test_newer_cute_dsl_warns_once_only_for_grouped_runtime_n_fallback(
             patch.object(
                 cutedsl_compat.importlib.metadata,
                 "version",
-                return_value="4.7.1",
+                return_value="4.8.2",
             ) as version_probe,
             caplog.at_level(logging.WARNING, logger=cutedsl_compat.__name__),
         ):
@@ -19953,8 +19956,8 @@ def test_newer_cute_dsl_warns_once_only_for_grouped_runtime_n_fallback(
         in record.getMessage()
     ]
     assert len(matching) == 1
-    assert "4.7.1" in matching[0].getMessage()
-    assert "4.7.0" in matching[0].getMessage()
+    assert "4.8.2" in matching[0].getMessage()
+    assert "4.8.1" in matching[0].getMessage()
     assert "fall back to typed static-width MMA" in matching[0].getMessage()
 
 

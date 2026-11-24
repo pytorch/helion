@@ -522,8 +522,14 @@ def test_actual_SDK_state_wrap_delayed_UMMA_release_and_multi_tile_tail():
             for n in fn.decorator_list
             if isinstance(n, ast.Name) and n.id == "property"
         ]
+
+    class ScalarInt32(int):
+        def __new__(cls, value, **kw):
+            return super().__new__(cls, value)
+
     ns = {
-        "Int32": lambda value, **kw: int(value),
+        "Int32": ScalarInt32,
+        "cutlass": SimpleNamespace(const_expr=bool),
         "if_generate": lambda condition, yes, no, values, types, **kw: (
             yes if condition else no
         )(*values),
