@@ -11,7 +11,8 @@ pinned by ``test/test_cute_ast_pass_utils.py`` against the legacy copies:
   for ``NAME = value``; ``resolve_alias`` follows a rename map to its root.
 * call paths -- ``call_path`` (tuple) and ``call_path_str`` (dotted) of a
   ``Name``/``Attribute`` chain, ``callee_name`` (its last component);
-  ``cutlass_scalar_type`` for ``cutlass.X``.
+  ``cutlass_scalar_type`` for ``cutlass.X``; ``COMPARISON_CALLS``, the
+  comparisons the printer writes as calls (``operator.lt(a, b)``).
 * expressions -- ``same_expr`` (structural equality without positions),
   ``parse_expr`` / ``reparse_expr`` (plain-``ast`` expression clones; use
   ``expr_from_string`` when Helion ``ExtendedAST`` metadata is required),
@@ -205,6 +206,18 @@ def call_path(node: ast.AST) -> tuple[str, ...] | None:
         return None
     path.append(node.id)
     return tuple(reversed(path))
+
+
+# The comparisons the CuTe printer writes as calls, ``operator.lt(a, b)`` for
+# ``a < b``, and the comparison each stands for.
+COMPARISON_CALLS: dict[str, type[ast.cmpop]] = {
+    "operator.lt": ast.Lt,
+    "operator.le": ast.LtE,
+    "operator.gt": ast.Gt,
+    "operator.ge": ast.GtE,
+    "operator.eq": ast.Eq,
+    "operator.ne": ast.NotEq,
+}
 
 
 def call_path_str(node: ast.AST) -> str | None:

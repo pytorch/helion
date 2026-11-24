@@ -16,6 +16,7 @@ import torch
 
 import helion
 from helion._testing import DEVICE
+from helion._testing import code_and_output
 from helion._testing.cute_grid_lane_jam_kernels import HEAD_ROWS_CONFIG
 from helion._testing.cute_grid_lane_jam_kernels import ROW_NORM_CONFIG
 from helion._testing.cute_grid_lane_jam_kernels import SCALAR_ROWS_CONFIG
@@ -30,6 +31,7 @@ from helion._testing.cute_grid_lane_jam_kernels import heads_config
 from helion._testing.cute_grid_lane_jam_kernels import heads_innermost_bias
 from helion._testing.cute_grid_lane_jam_kernels import invariant_rows_over_heads
 from helion._testing.cute_grid_lane_jam_kernels import kept_row_norm
+from helion._testing.cute_grid_lane_jam_kernels import row_dot
 from helion._testing.cute_grid_lane_jam_kernels import row_norm
 from helion._testing.cute_grid_lane_jam_kernels import scale_rows_in_place
 
@@ -303,3 +305,36 @@ def test_jammed_privatized_adds_match_eager() -> None:
         expected[:, head].index_add_(0, buckets.flatten(), total[head].flatten())
     assert torch.equal(results[0], expected.float())
     assert torch.equal(results[1], expected.float())
+
+
+def test_a_one_axis_tile_is_bitwise_the_rolled_lane_loop() -> None:
+    # A one-axis tile's lanes index through a copy of the lane index, which
+    # the jam reads as the index itself, so that the rows load as packets.
+    torch.manual_seed(0)
+    x = torch.randn(64, 512, device=DEVICE, dtype=torch.bfloat16)
+    xt = torch.randn(512, 64, device=DEVICE, dtype=torch.bfloat16).t()
+
+    def run(jam: bool) -> torch.Tensor:
+        kernel = helion.kernel(
+            row_dot,
+            backend="cute",
+            static_shapes=True,
+            config=helion.Config(
+                block_sizes=[8],
+                num_threads=[1, 128],
+                reduction_loops=[512],
+                cute_grid_lane_jam=jam,
+            ),
+        )
+        code, out = code_and_output(kernel, (x, xt))
+        # The jam ran (its packet registers), or the comparison would be of
+        # the rolled loop with itself.
+        assert ("_jam_vec" in code) is jam
+        return out
+
+    expected = run(False)
+    actual = run(True)
+    assert torch.equal(actual, expected)
+    torch.testing.assert_close(
+        actual, (x.float() * xt.float()).sum(-1), rtol=1e-4, atol=1e-3
+    )

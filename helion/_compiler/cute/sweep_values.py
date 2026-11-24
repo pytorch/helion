@@ -46,6 +46,7 @@ from typing import TYPE_CHECKING
 from typing import cast
 
 from ..ast_read_writes import ReadWrites
+from ._ast_pass_utils import COMPARISON_CALLS
 from ._ast_pass_utils import _is_proven_relocatable_call
 from ._ast_pass_utils import assigned_name
 from ._ast_pass_utils import call_path_str
@@ -98,9 +99,6 @@ _BOOLEAN = "cutlass.Boolean"
 # Element types a carried value may have: a fragment of one of them holds the
 # value bit-exactly.
 CACHE_DTYPES = frozenset((_BOOLEAN, *_INT_RANGES, *_FLOATS))
-_COMPARISONS = frozenset(
-    f"operator.{name}" for name in ("lt", "le", "gt", "ge", "eq", "ne")
-)
 _ARITHMETIC = {
     "operator.add": ast.Add(),
     "operator.sub": ast.Sub(),
@@ -575,7 +573,7 @@ class SweepValues:
             )
             return declared if single and declared in CACHE_DTYPES else None
         operand_dtypes = [self._dtype(operand) for operand in (*receiver, *arguments)]
-        if path in _COMPARISONS:
+        if path in COMPARISON_CALLS:
             dsl = any(dtype in CACHE_DTYPES for dtype in operand_dtypes)
             return _BOOLEAN if dsl else None
         if path in _ARITHMETIC and len(arguments) == 2:

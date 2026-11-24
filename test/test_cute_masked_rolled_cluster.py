@@ -19,6 +19,8 @@ from helion._testing.cute_codegen import cpu_bind
 from helion._testing.cute_codegen import forbid_native_compile
 from helion._testing.cute_codegen import mock_cuda_unavailable
 
+pytestmark = pytest.mark.cpu_only
+
 
 def _kernel() -> helion.Kernel:
     return helion.kernel(
@@ -54,7 +56,10 @@ def test_static_cluster_tail_keeps_the_original_bound(columns: int) -> None:
 
 
 @pytest.mark.parametrize("columns", [32000, 65544, 128256, 151936])
-def test_masked_cluster_seed_has_a_vectorized_register_slice(columns: int) -> None:
+def test_masked_cluster_seed_has_a_vectorized_cluster_slice(columns: int) -> None:
+    """The seeds lower to a vectorized cluster slice; a register seed caches it
+    for the later sweeps, a gmem seed reads it again (none at 65544 columns,
+    which 16-element vectors do not divide).  One seed of each kind renders."""
     args = (
         torch.empty((3, columns), dtype=torch.bfloat16),
         torch.empty((columns,), dtype=torch.bfloat16),
@@ -66,14 +71,71 @@ def test_masked_cluster_seed_has_a_vectorized_register_slice(columns: int) -> No
         seeds = CuteMaskedRolledClusterHeuristic.get_seed_configs(
             bound.env, host.device_ir
         )
-        assert seeds
+        first: dict[str, helion.Config] = {}
         for seed in seeds:
-            normalized = bound.config_spec.normalized_config(seed)
-            code = bound.to_code(normalized)
+            first.setdefault(seed.config["cute_reduction_reloads"][0], seed)
+        assert set(first) == ({"register"} if columns % 16 else {"register", "gmem"})
+        for reload, seed in first.items():
+            code = bound.to_code(bound.config_spec.normalized_config(seed))
             assert "_helion_cute_cluster_shape = (1," in code
             assert "cute.arch.load(" in code
             assert f"< {columns}" in code
-            assert "_fuse_cache_0" in code
+            assert ("_fuse_cache_0" in code) == (reload == "register")
+
+
+def test_wide_row_gmem_seed_halves_the_cluster() -> None:
+    """At 262144 bf16 columns the 256-thread register seed takes a cluster of
+    16 (64 elements of the row per thread); its gmem seed sweeps 128 per
+    thread in a cluster of 8, in chunks of two 16-element packets per thread,
+    at four blocks per SM."""
+    columns = 262144
+    args = (
+        torch.empty((3, columns), dtype=torch.bfloat16),
+        torch.empty((columns,), dtype=torch.bfloat16),
+    )
+    with mock_cuda_unavailable(), _target(), forbid_native_compile():
+        bound = cpu_bind(_kernel(), args)
+        host = bound.host_function
+        assert host is not None
+        seeds = CuteMaskedRolledClusterHeuristic.get_seed_configs(
+            bound.env, host.device_ir
+        )
+        # The seeds themselves, without their independent-reduction twins.
+        plain = [
+            seed for seed in seeds if not seed.config.get("cute_independent_reduction")
+        ]
+        shapes: dict[tuple[str, int], tuple[object, ...]] = {}
+        for seed in plain:
+            config = seed.config
+            shapes.setdefault(
+                (config["cute_reduction_reloads"][0], config["num_threads"][1]),
+                (
+                    config["cute_cluster_n"],
+                    config["reduction_loops"][0],
+                    max(config["cute_vector_widths"]),
+                    config["cute_min_blocks_per_mp"],
+                ),
+            )
+        assert shapes[("register", 256)][0] == 16
+        assert {
+            threads: shape
+            for (reload, threads), shape in shapes.items()
+            if reload == "gmem"
+        } == {
+            256: (8, 8192, 16, 4),
+            128: (16, 4096, 16, 8),
+            512: (4, 16384, 16, 2),
+        }
+        (gmem,) = [
+            seed
+            for seed in plain
+            if seed.config["cute_reduction_reloads"] == ["gmem"]
+            and seed.config["num_threads"][1] == 256
+        ]
+        code = bound.to_code(bound.config_spec.normalized_config(gmem))
+    assert "_helion_cute_cluster_shape = (1, 8, 1)" in code
+    assert "cute.arch.load(" in code
+    assert "_fuse_cache_0" not in code
 
 
 @skipUnlessCuteAvailable("requires the supported CuTe DSL")

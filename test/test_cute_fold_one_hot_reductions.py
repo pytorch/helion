@@ -82,6 +82,53 @@ def _ce_backward_flat_sum_fn(
     return out
 
 
+def _inductor_ce_backward_fn(
+    labels: torch.Tensor,
+    numerator: torch.Tensor,
+    denominator: torch.Tensor,
+    grad_in: torch.Tensor,
+    logits: torch.Tensor,
+    lse: torch.Tensor,
+) -> torch.Tensor:
+    """``_ce_backward_fn`` as helion.inductor writes it: ``reshape`` for the
+    inserted dims, a rank-1 iota cast to the labels' dtype and broadcast
+    along the row, ``hl.full`` scalars, and a sum that drops the dim."""
+    rows, vocab = logits.shape
+    out = torch.empty_like(grad_in)
+    for tile_r in hl.tile(rows):
+        label = labels[tile_r]
+        valid = label != hl.full([], -100, dtype=torch.int64)
+        target = torch.where(valid, label, hl.full([], 0, dtype=torch.int64))
+        x = logits[tile_r, :].to(torch.float32)
+        classes = (hl.arange(x.size(1))).to(torch.int64)
+        hit = target.reshape([tile_r, 1]) == classes
+        zero = hl.full([], 0.0, dtype=torch.float32)
+        grad = torch.where(hit, hl.full([], -1.0, dtype=torch.float32), zero)
+        scale = torch.where(valid, numerator[()] / denominator[()], zero)
+        grad = grad * scale.reshape([tile_r, 1])
+        grad_sum = torch.sum(grad, -1)
+        probs = torch.exp(x - lse[tile_r].reshape([tile_r, 1]))
+        total = grad_in[tile_r, :].to(torch.float32) + (
+            grad - probs * grad_sum.reshape([tile_r, 1])
+        )
+        out[tile_r, :] = total.to(out.dtype)
+    return out
+
+
+def _int8_cast_iota_row_fn(labels: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+    """``_labelled_row_fn`` with its iota cast to int8, broadcast along the
+    row."""
+    rows, vocab = x.shape
+    out = torch.empty([rows, vocab], dtype=torch.float32, device=x.device)
+    for tile_r in hl.tile(rows):
+        row = x[tile_r, :].to(torch.float32)
+        classes = hl.arange(row.size(1)).to(torch.int8)
+        hit = labels[tile_r].reshape([tile_r, 1]) == classes
+        grad_sum = torch.sum(torch.where(hit, -1.0, 0.0), dim=-1, keepdim=True)
+        out[tile_r, :] = row + grad_sum
+    return out
+
+
 def _smoothed_sum_fn(labels: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
     """A one-hot row whose misses are not zero (label smoothing): the sum adds
     rounding errors, which no closed form reproduces."""
@@ -298,6 +345,7 @@ def _render(
             id="looped",
         ),
         pytest.param(_ce_backward_flat_sum_fn, {}, id="dropped_dim"),
+        pytest.param(_inductor_ce_backward_fn, {}, id="inductor"),
     ],
 )
 def test_ce_backward_sums_its_one_hot_row_in_closed_form(
@@ -337,6 +385,16 @@ _LABELS = torch.randint(0, 100, (16,))
         ),
         pytest.param(
             _int8_iota_row_fn, (_LABELS, torch.empty(16, 128)), 1, id="int8_iota"
+        ),
+        # So does an iota cast to int8 past 128; one of 128 keeps its values.
+        pytest.param(
+            _int8_cast_iota_row_fn,
+            (_LABELS, torch.empty(16, 512)),
+            0,
+            id="wrapping_cast",
+        ),
+        pytest.param(
+            _int8_cast_iota_row_fn, (_LABELS, torch.empty(16, 128)), 1, id="int8_cast"
         ),
         pytest.param(
             _host_extent_row_fn, (_LABELS, torch.empty(16, 1000)), 1, id="host_extent"
@@ -482,6 +540,7 @@ class TestFoldOneHotReductions(TestCase):
             (_ce_backward_fn, {}),
             (_ce_backward_fn, {"block_sizes": [1], "reduction_loops": [256]}),
             (_ce_backward_flat_sum_fn, {}),
+            (_inductor_ce_backward_fn, {}),
         ):
             settings = {"config": helion.Config(**config)} if config else {}
             folded = _kernel(fn, **settings)

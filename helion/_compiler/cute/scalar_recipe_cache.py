@@ -11,6 +11,7 @@ import ast
 import dataclasses
 from typing import TYPE_CHECKING
 
+from ._ast_pass_utils import COMPARISON_CALLS
 from .scalar_recipe import ScalarRecipe
 from .scalar_recipe import _clone
 from .scalar_recipe import _memory_reads
@@ -139,14 +140,7 @@ class _Dependencies:
             if isinstance(value.func, ast.Attribute) and value.func.attr == "load":
                 source = self.pointer_source(value.func.value)
                 return self.tensor_dtypes.get(source) if source is not None else None
-            if path in {
-                "operator.lt",
-                "operator.le",
-                "operator.gt",
-                "operator.ge",
-                "operator.eq",
-                "operator.ne",
-            }:
+            if path in COMPARISON_CALLS:
                 return "cutlass.Boolean"
         if isinstance(value, ast.Compare):
             return "cutlass.Boolean"
