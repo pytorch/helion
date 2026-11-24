@@ -834,9 +834,10 @@ class PointwiseElementwiseFact(NamedTuple):
       beside it fetches along blocks the rows are picked along
       (``MemoryOpFact.loaded_index_block_ids``): one scale per row does not make the kernel an
       element gather, one weight per column does. The address of a row load waits on another
-      load, and all warps of the program wait with it, so warps beyond the default buy nothing
-      (see ``TritonPointwiseSeedHeuristic._warps_for_sm100``). Unlike the slab fields it also
-      counts a table with fewer elements than the output.
+      load, and all warps of the program wait with it, so the warps a tile's lanes ask for
+      beyond the default buy nothing; a grid too small to fill the device keeps its residency
+      warps (see ``TritonPointwiseSeedHeuristic._warps_for_sm100``). Unlike the slab fields it
+      also counts a table with fewer elements than the output.
     """
 
     total_numel: int

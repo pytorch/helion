@@ -2582,6 +2582,14 @@ class DeviceIRAnalysis:
         row_load = False
         row_block_ids: set[int | None] = set()
         element_block_ids: list[int | None] = []
+        # The rolled alternative of a full slice's loop lists every op a second
+        # time, and a config runs one of the two. The copy reads a subscript
+        # computed outside the loop as a placeholder (KNOWN_GAPS.md,
+        # rolled-graph-subscripts-unresolved), so the widest op is the widest of
+        # the ops outside it.
+        rolled_graph_ids = {
+            graph.graph_id for graph in self.graphs if graph.is_reduction_loop
+        }
         for memory_fact in spec.memory_op_facts:
             if memory_fact.kind == "load" and memory_fact.row_gather is not None:
                 if memory_fact.row_gather:
@@ -2612,7 +2620,8 @@ class DeviceIRAnalysis:
                 ):
                     if block_id is None or block_id not in tiled_ids:
                         op_slab *= max(1, extent)
-            max_op_slab_numel = max(max_op_slab_numel, op_slab)
+            if memory_fact.graph_id not in rolled_graph_ids:
+                max_op_slab_numel = max(max_op_slab_numel, op_slab)
             storage_itemsize = max(storage_itemsize, memory_fact.dtype.itemsize)
             for block_id, stride in zip(
                 memory_fact.subscript_block_ids,

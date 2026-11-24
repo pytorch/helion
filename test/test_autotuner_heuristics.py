@@ -5844,6 +5844,16 @@ def _copy_every_other_row(x: torch.Tensor) -> torch.Tensor:
 
 
 @helion.kernel(backend="triton")
+def _lookup_plus_every_other_row(
+    ids: torch.Tensor, x: torch.Tensor, table: torch.Tensor
+) -> torch.Tensor:
+    out = table.new_empty([ids.size(0), table.size(1)])
+    for tile_t in hl.tile(ids.size(0)):
+        out[tile_t, :] = x[2 * tile_t.index, :] + table[ids[tile_t], :]
+    return out
+
+
+@helion.kernel(backend="triton")
 def _lookup_whole_rows_remapped(
     ids: torch.Tensor, remap: torch.Tensor, table: torch.Tensor
 ) -> torch.Tensor:
@@ -6260,7 +6270,7 @@ class TestPointwiseGatheredSlab(TestCase):
                 torch.bfloat16,
                 {
                     h100: ([2, 1024], None),
-                    b200: ([4, 1024], None),
+                    b200: ([4, 1024], 8),
                     rtx5080: ([2, 1024], None),
                 },
             ),
@@ -6293,7 +6303,7 @@ class TestPointwiseGatheredSlab(TestCase):
                 torch.int8,
                 {
                     h100: ([2, 1024], None),
-                    b200: ([4, 1024], None),
+                    b200: ([4, 1024], 8),
                     rtx5080: ([4, 1024], None),
                 },
             ),
@@ -6311,10 +6321,13 @@ class TestPointwiseGatheredSlab(TestCase):
                 ):
                     self.assertEqual(_pointwise_seed(bound, hardware, num_sm), seed)
 
-    def test_rows_behind_a_loaded_index_keep_the_default_warps_on_b200(self) -> None:
+    def test_rows_behind_a_loaded_index_get_no_lane_warps_on_b200(self) -> None:
         # The address of ``table[ids[tile], ...]`` waits on the ids load, and
-        # every warp of the program waits with it: on sm100 such a kernel keeps
-        # 4 warps where its tile's lanes, or a small grid, would ask for more.
+        # every warp of the program waits with it: on sm100 such a kernel gets
+        # no warps beyond the default 4 from its tile's lanes. A grid too small
+        # to fill the device still gets its residency warps (512 ids leave most
+        # cases below at 8 or 16); "saturated grid" and "few tokens" show both
+        # sides.
         def bf16(*shape: int) -> torch.Tensor:
             return torch.empty(shape, device=DEVICE, dtype=torch.bfloat16)
 
@@ -6326,79 +6339,91 @@ class TestPointwiseGatheredSlab(TestCase):
             # a tile, ``:`` (written or not, also before a new axis), a bounded
             # or stepped slice, ``hl.arange``, a shifted or scaled tile index,
             # one position of it (an int, a grid index).
-            ("tile", _lookup, (ids, bf16(4096, 1536)), True, ([1, 1024], None)),
+            ("tile", _lookup, (ids, bf16(4096, 1536)), True, ([1, 1024], 8)),
             (
                 "whole rows",
                 _lookup_whole_rows,
                 (ids, bf16(4096, 512)),
                 True,
-                ([8], None),
+                ([8], 16),
             ),
             (
                 "rows without a slice",
                 _lookup_rows_without_a_slice,
                 (ids, bf16(4096, 512)),
                 True,
-                ([8], None),
+                ([8], 16),
             ),
             (
                 "trailing new axis",
                 _lookup_trailing_new_axis,
                 (ids, bf16(4096, 1536)),
                 True,
-                ([1, 1024], None),
+                ([1, 1024], 8),
             ),
             (
                 "bounded slice",
                 _lookup_row_prefixes,
                 (ids, bf16(4096, 1024)),
                 True,
-                ([8], None),
+                ([8], 16),
             ),
             (
                 "stepped slice",
                 _lookup_stepped_rows,
                 (ids, bf16(4096, 1024)),
                 True,
-                ([8], None),
+                ([8], 16),
             ),
             (
                 "arange window",
                 _lookup_window,
                 (ids, bf16(4096, 512)),
                 True,
-                ([16], None),
+                ([16], 16),
             ),
             (
                 "shifted tile index",
                 _lookup_shifted_columns,
                 (ids, bf16(4096, 1537)),
                 True,
-                ([1, 1024], None),
+                ([1, 1024], 8),
             ),
             (
                 "scaled tile index",
                 _lookup_every_other_column,
                 (ids, bf16(4096, 3072)),
                 True,
-                ([1, 1024], None),
+                ([1, 1024], 8),
             ),
             (
                 "int on the last dim",
                 _lookup_one_position,
                 (ids, bf16(4096, 1536, 4)),
                 True,
-                ([1, 1024], None),
+                ([1, 1024], 8),
             ),
             (
                 "grid index on the last dim",
                 _lookup_grid_position,
                 (ids, bf16(4096, 1536, 4)),
                 True,
-                ([1, 1024], None),
+                ([1, 1024], 8),
             ),
-            # The cap is on the warps a tile's lanes or a small grid add: three
-            # transcendentals still get their 8.
+            # Both sides of the cap. On a grid that fills the device the lanes of
+            # a [1, 4096] tile ask for 8 warps, which a row lookup does not get
+            # (the column gather below keeps them); 16 tokens of whole rows are
+            # 2 programs, and the residency warps hide the ids load.
+            ("saturated grid", _lookup, (many_ids, x), True, ([1, 4096], None)),
+            (
+                "few tokens",
+                _lookup_whole_rows,
+                (ids[:16], bf16(4096, 768)),
+                True,
+                ([8], 16),
+            ),
+            # The cap is on the warps a tile's lanes add: three transcendentals
+            # still get their 8.
             (
                 "transcendental rows",
                 _lookup_transcendental,
@@ -6414,14 +6439,14 @@ class TestPointwiseGatheredSlab(TestCase):
                 _lookup,
                 (ids, bf16(8192, 1536)[::2]),
                 True,
-                ([1, 1024], None),
+                ([1, 1024], 8),
             ),
             (
                 "column-strided table",
                 _lookup,
                 (ids, bf16(4096, 3072)[:, ::2]),
                 True,
-                ([1, 1024], None),
+                ([1, 1024], 8),
             ),
             (
                 "transposed table",
@@ -6491,35 +6516,35 @@ class TestPointwiseGatheredSlab(TestCase):
                 _lookup_remapped,
                 (ids, torch.zeros_like(many_ids), bf16(4096, 1536)),
                 True,
-                ([1, 1024], None),
+                ([1, 1024], 8),
             ),
             (
                 "one scale per row",
                 _lookup_scaled_rows,
                 (ids, bf16(4096), bf16(4096, 1536)),
                 True,
-                ([1, 1024], None),
+                ([1, 1024], 8),
             ),
             (
                 "whole rows, remapped ids",
                 _lookup_whole_rows_remapped,
                 (ids, torch.zeros_like(many_ids), bf16(4096, 512)),
                 True,
-                ([8], None),
+                ([8], 16),
             ),
             (
                 "whole rows, one scale per row",
                 _lookup_whole_rows_scaled,
                 (ids, bf16(4096), bf16(4096, 512)),
                 True,
-                ([8], None),
+                ([8], 16),
             ),
             (
                 "rows of a tunable width",
                 _lookup_tunable_window,
                 (torch.zeros([64], device=DEVICE, dtype=torch.int32), bf16(8192, 64)),
                 True,
-                ([2], None),
+                ([2], 16),
             ),
             # An element gather that fetches along any other axis may fetch as
             # much as the rows move, and keeps the warps: one weight per column,
@@ -6614,7 +6639,7 @@ class TestPointwiseGatheredSlab(TestCase):
                 _lookup_weighted_by_tile_index,
                 (ids, bf16(1536), bf16(4096, 1536)),
                 True,
-                ([1, 1024], None),
+                ([1, 1024], 8),
             ),
         ]
         for name, kernel, args, rows, seed in cases:
@@ -6667,15 +6692,43 @@ class TestPointwiseGatheredSlab(TestCase):
             ],
             [(512, True), (512, True)],
         )
-        # ... and no gather both times for ``x[2 * tile.index, :]``, whose
-        # slabs and B200 seed are the ones from before the gather accounting.
+        # ... and no gather both times for ``x[2 * tile.index, :]``. Its rolled
+        # copy still reads the placeholder (KNOWN_GAPS.md,
+        # rolled-graph-subscripts-unresolved), so the widest op is taken from
+        # the ops outside the rolled graph: one 96-element row, not the whole
+        # tensor the copy would charge.
         x = torch.empty([8192, 96], device=DEVICE, dtype=torch.bfloat16)
         bound = _copy_every_other_row.bind((x,))
         spec = bound.config_spec
         self.assertEqual({op.gather_numel for op in spec.memory_op_facts}, {None})
         (fact,) = spec.pointwise_facts
-        self.assertEqual((fact.slab_numel, fact.max_op_slab_numel), (576, 786432))
+        self.assertEqual((fact.slab_numel, fact.max_op_slab_numel), (576, 96))
         self.assertEqual(_pointwise_seed(bound, BLACKWELL_HARDWARE, 148), ([32], 16))
+        # The copy itself still reads the placeholder (KNOWN_GAPS.md,
+        # rolled-graph-subscripts-unresolved): no tiled row axis.
+        self.assertEqual(
+            [
+                op.subscript_affine_block_ids
+                for op in spec.memory_op_facts
+                if op.kind == "load"
+            ],
+            [(0, None), (None, None)],
+        )
+        # Narrow rows: the copy would have charged the whole tensor (16384), and
+        # lifted the starvation cap to 16 warps; two elements a row give 8.
+        bound = _copy_every_other_row.bind(
+            (torch.empty([8192, 2], device=DEVICE, dtype=torch.bfloat16),)
+        )
+        self.assertEqual(_pointwise_seed(bound, BLACKWELL_HARDWARE, 148), ([256], 8))
+        # Beside a row lookup the copy would set the warps: two-element rows
+        # give a [256] tile 8 warps, not the 16 its whole tensor would allow.
+        ids = torch.zeros([1024], device=DEVICE, dtype=torch.int32)
+        x = torch.empty([2048, 2], device=DEVICE, dtype=torch.bfloat16)
+        table = torch.empty([1 << 22, 2], device=DEVICE, dtype=torch.bfloat16)
+        bound = _lookup_plus_every_other_row.bind((ids, x, table))
+        (fact,) = bound.config_spec.pointwise_facts
+        self.assertEqual(fact.max_op_slab_numel, 2)
+        self.assertEqual(_pointwise_seed(bound, BLACKWELL_HARDWARE, 148), ([256], 8))
 
     def test_slab_does_not_scale_with_table_rows(self) -> None:
         ids = torch.zeros([16], device=DEVICE, dtype=torch.int32)
