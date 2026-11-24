@@ -909,10 +909,19 @@ class TestInductorBackend(InductorBackendTestCase):
 
     def test_keeps_cuda_custom_pass(self):
         # HelionPostGradPass runs the CUDA pass registered before it first.
+        # _register() also sets the choices handler again, from every
+        # registration and config.inductor_choices_class: under fbtriton that
+        # composes its TLXInductorChoices ahead of HelionChoices, and the tests
+        # after this one would read their rdims of 4096 in a loop,
+        #     for tile_r in hl.tile(4096):
+        #         tmp0 = in0[tile_x, tile_r]
+        # where Helion's choice reads them whole (tmp0 = in0[tile_x, :]), so
+        # the handler is restored.
         custom_pass = object()
         with (
             patch.dict(common.device_codegens),
             patch.dict(common.custom_backend_passes, {"cuda": custom_pass}),
+            V.set_choices_handler(V.choices),
         ):
             helion.inductor._register()
             registered = common.custom_backend_passes["cuda"]
@@ -1502,8 +1511,11 @@ def kernel(in0: torch.Tensor, out0: torch.Tensor, out1: torch.Tensor) -> None:
         # chunk, so the first kernel is a welford_combine over (x, 0, 1), with
         # (0, 0, 0) past the end of R. rows, one block each: rows 0-7 with one
         # value of 2000, as in some channels of LLM activations, whose mean is
-        # as close to eager's as Triton's; rows 8-15 of 1e37, whose sum
-        # overflows; rows 16-23 of 100000000 and 100000008 in turn, whose mean
+        # as close to eager's as Triton's; rows 8-15 of 2**123 (1.1e37), whose
+        # sum overflows, and whose scaled values add up exactly in any order
+        # (of 1e37, they round in the order fbtriton's and ref mode's sums take,
+        # and the deviations from that mean square to inf in the variance);
+        # rows 16-23 of 100000000 and 100000008 in turn, whose mean
         # rounds to 100000000 or 100000008: the deviations 0 and 8 give the
         # variance 32 * 4096 / 4095 as from Inductor's persistent reductions,
         # where eager gives half of it.
@@ -1537,7 +1549,7 @@ def kernel(in0: torch.Tensor, out0: torch.Tensor, out1: torch.Tensor) -> None:
             self.assertTrue(torch.isinf(var).all() and torch.isfinite(mean).all())
             return
         x = torch.randn(24, 4096, device=DEVICE)
-        x[:8, 100], x[8:16], x[16:] = 2000.0, 1e37, 100000000.0
+        x[:8, 100], x[8:16], x[16:] = 2000.0, 2.0**123, 100000000.0
         x[16:, ::2] = 100000008.0
         var, mean = fn(x)
         var[16:] = 32 * 4096 / 4095
@@ -1721,7 +1733,24 @@ def kernel(in0: torch.Tensor, out0: torch.Tensor, out1: torch.Tensor) -> None:
         fn = lambda x: torch.nn.functional.layer_norm(x, (1000,), w, b)  # noqa: E731
         self.assertEqual(len(self.compile(fn, x, expected=expected, tol=2e-2)), 1)
 
-    @parametrize("case", ["rows", "split", "split_empty"])
+    @parametrize(
+        "case",
+        [
+            subtest(
+                "rows",
+                decorators=[
+                    skipIfRefEager(
+                        "ref mode runs each hl.tile as one block over its whole "
+                        "range, not the pinned blocks of 64: the block scale is "
+                        "1 / 963, not 1 / 64, so row 3's mean of 2e19 rounds "
+                        "and its deviations give the variance 4.8e24, not 0"
+                    )
+                ],
+            ),
+            "split",
+            "split_empty",
+        ],
+    )
     @looped
     def test_welford_extremes(self, case):
         # Blocks of tile_r pinned to 64, or 1 for split_empty (by default one
@@ -1833,6 +1862,11 @@ def kernel(in0: torch.Tensor, out0: torch.Tensor, out1: torch.Tensor) -> None:
             (source,) = self.compile(lambda x: torch.var_mean(x, -1), x.double())
         self.assertNotRegex(source, r"hl\.full\(\[\], tmp")
 
+    @skipIfRefEager(
+        "ref mode runs each hl.tile as one block over its whole range, so the "
+        "block scale is 1 / 65536, not the pinned 1 / 64, and x * s is "
+        "subnormal: the mean 4.4e-5 off"
+    )
     def test_welford_small_values(self):
         # A loop over blocks of 64 of rdims of 65536 values of 1.0005e-36: each
         # block is scaled by 1 / 64, its size, so x * s stays normal, where
