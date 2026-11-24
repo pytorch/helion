@@ -802,6 +802,31 @@ def send_layout(shape: Sequence[int], vec: int, num_warps: int) -> tuple[int, in
     return best
 
 
+def cluster_recv_layout(
+    shape: Sequence[int], vec: int, num_warps: int
+) -> tuple[list[int], list[int], list[int]] | None:
+    """The blocked layout a slab is read in: the leading (split) dimension
+    whole in every thread, so the sum over it the combine does takes no data
+    from other threads, and ``vec`` contiguous elements of the last; lanes and
+    warps over the other dimensions, every element on exactly one thread.
+    None when no such layout covers ``shape``."""
+    rank = len(shape)
+    if rank < 2 or shape[-1] % vec:
+        return None
+    per = [shape[0]] + [1] * (rank - 2) + [vec]
+    lanes, warps = [1] * rank, [1] * rank
+    left_lanes, left_warps = 32, num_warps
+    for d in reversed(range(1, rank)):
+        lanes[d] = math.gcd(shape[d] // per[d], left_lanes)
+        left_lanes //= lanes[d]
+    for d in range(1, rank):
+        warps[d] = math.gcd(shape[d] // (per[d] * lanes[d]), left_warps)
+        left_warps //= warps[d]
+    if left_lanes != 1 or left_warps != 1:
+        return None
+    return per, lanes, warps
+
+
 def split_task(key: str, rank: str, size: int, multiplier: int) -> str:
     """The producer task of ``key``'s ``rank``-th part: ``key`` on the axes
     besides the split axis (task order), ``rank`` on the split axis, whose

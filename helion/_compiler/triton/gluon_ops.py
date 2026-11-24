@@ -65,6 +65,7 @@ from ..compile_environment import CompileEnvironment
 from ..cross_loop_codegen import _is_load
 from ..cross_loop_codegen import _is_tl_call
 from ..cross_loop_dsmem import cluster_layout
+from ..cross_loop_dsmem import cluster_recv_layout
 from ..device_function import DeviceFunction
 from ..device_ir import ForLoopGraphInfo
 from ..device_ir import ReductionLoopGraphInfo
@@ -784,6 +785,17 @@ def cluster_ready(epoch, state, RANKS: gl.constexpr):
 
 # The dimensions ``dsmem_transports`` checks the tiles against.
 _cluster_layout_dims = gluon.constexpr_function(cluster_layout)
+_cluster_recv_layout_dims = gluon.constexpr_function(cluster_recv_layout)
+
+
+@gluon.constexpr_function
+def _cluster_recv_layout(shape, vec, num_warps):
+    """The read layout of a slab (``cluster_recv_layout``), else the transport's."""
+    dims = _cluster_recv_layout_dims([int(d) for d in shape], vec, num_warps)
+    if dims is None:
+        return _cluster_layout(shape, vec, num_warps)
+    per, lanes, warps = dims
+    return gl.BlockedLayout(per, lanes, warps, list(reversed(range(len(shape)))))
 
 
 @gluon.constexpr_function
@@ -823,12 +835,19 @@ def _cluster_send_asm(vec, bar, rank, guarded):
 
 
 @gluon.constexpr_function
-def _cluster_recv_asm(vec, bar):
+def _cluster_wait_asm(bar):
+    return (
+        f"{{ .reg .pred w; .reg .b32 b; mov.u32 b, {CLUSTER_SMEM}; add.u32 b, b, {bar}; "
+        "HCLW${:uid}: mbarrier.try_wait.parity.acquire.cluster.shared::cta.b64 w, [b], 0; "
+        "@!w bra HCLW${:uid}; mov.u32 $0, 0; }"
+    )
+
+
+@gluon.constexpr_function
+def _cluster_recv_asm(vec):
     vals = ", ".join(f"${i}" for i in range(vec))
     return (
-        f"{{ .reg .pred w; .reg .b32 a, b; mov.u32 b, {CLUSTER_SMEM}; add.u32 b, b, {bar}; "
-        "HCLW${:uid}: mbarrier.try_wait.parity.acquire.cluster.shared::cta.b64 w, [b], 0; "
-        f"@!w bra HCLW${{:uid}}; mov.u32 a, {CLUSTER_SMEM}; add.u32 a, a, ${vec}; "
+        f"{{ .reg .b32 a; mov.u32 a, {CLUSTER_SMEM}; add.u32 a, a, ${vec}; "
         + (
             f"ld.shared.v{vec}.b32 {{{vals}}}, [a]; }}"
             if vec > 1
@@ -913,23 +932,35 @@ def cluster_send(
 @gluon.jit
 def cluster_recv(offsets, DTYPE: gl.constexpr, BAR: gl.constexpr, VEC: gl.constexpr):
     """This CTA's slab at byte ``offsets`` once its barrier at byte ``BAR`` has
-    completed phase 0, in ``offsets``' layout."""
-    layout: gl.constexpr = _cluster_layout(  # pyrefly: ignore [bad-assignment]
+    completed phase 0, in the read layout (``cluster_recv_layout``: the
+    combine's sum over the split dimension stays in each thread)."""
+    layout: gl.constexpr = _cluster_recv_layout(  # pyrefly: ignore [bad-assignment]
         offsets.shape, VEC, gl.num_warps()
     )
+    # One wait on the barrier, then plain loads: a wait in every packed load
+    # would repeat the cluster-scope acquire per vector.
+    ready = gl.inline_asm_elementwise(
+        # pyrefly: ignore [bad-argument-type]
+        _cluster_wait_asm(BAR),
+        "=r",
+        [],
+        dtype=gl.int32,
+        is_pure=False,
+        pack=1,
+    )
+    at = gl.convert_layout(offsets, layout)
     words = gl.inline_asm_elementwise(
         # pyrefly: ignore [bad-argument-type]
-        _cluster_recv_asm(VEC, BAR),
+        _cluster_recv_asm(VEC),
         # pyrefly: ignore [bad-argument-type]
         _cluster_constraints(VEC, 1),
-        [gl.convert_layout(offsets, layout)],
+        [at + ready * 0],
         dtype=gl.int32,
         is_pure=False,
         # pyrefly: ignore [bad-argument-type]
         pack=VEC,
     )
-    # pyrefly: ignore [bad-argument-type]
-    return gl.convert_layout(words.to(DTYPE, bitcast=True), offsets.type.layout)
+    return words.to(DTYPE, bitcast=True)
 
 
 # ---- single ops ----------------------------------------------------------------
