@@ -421,8 +421,7 @@ these labelled lines.
   with a full slice whose subscripts are computed outside the slice loop,
   and with them the coalescing axes and the CuTe seeds and store policies;
   judging it takes a census and timings of its own on every backend.
-- Pinned by:
-  `test/test_autotuner_heuristics.py::TestPointwiseGatheredSlab::test_rolled_copy_of_an_op_reads_its_index_in_the_enclosing_graph`.
+- Pinned by: `test/test_autotuner_heuristics.py::TestPointwiseGatheredSlab::test_rolled_copy_of_an_op_reads_its_index_in_the_enclosing_graph`.
 
 ## pointwise-seed-grid-axes-uncounted
 
@@ -458,8 +457,7 @@ these labelled lines.
   grid extent at the generic size hint) changes the warps of every sm100
   pointwise kernel with an `hl.grid` axis or a masked tile, the cells the
   sm100 seed was tuned on among them; judging it takes timings of its own.
-- Pinned by:
-  `test/test_autotuner_heuristics.py::TestPointwiseGatheredSlab::test_rows_behind_a_loaded_index_get_no_lane_warps_on_b200`
+- Pinned by: `test/test_autotuner_heuristics.py::TestPointwiseGatheredSlab::test_rows_behind_a_loaded_index_get_no_lane_warps_on_b200`
   (`"grid index on the last dim"`, 768 programs counted for 4 launched).
 
 ## pointwise-seed-tunable-region-lanes
@@ -492,8 +490,7 @@ these labelled lines.
   148 SMs (bind only). The fix waits on that floor for the row axis of
   whole-row tiles, a change of the pointwise seed's tiles on every target
   that needs timings of its own.
-- Pinned by:
-  `test/test_autotuner_heuristics.py::TestPointwiseGatheredSlab::test_rows_behind_a_loaded_index_get_no_lane_warps_on_b200`
+- Pinned by: `test/test_autotuner_heuristics.py::TestPointwiseGatheredSlab::test_rows_behind_a_loaded_index_get_no_lane_warps_on_b200`
   (`"rows of a tunable width"`).
 
 ## pointwise-slab-counts-rolled-copies
@@ -519,6 +516,5 @@ these labelled lines.
   sm100 and sm120 (`[32]` to `[64]` for the kernel above on B200), and
   dropping them from `sfu_ops` moves the warps of every such kernel with a
   transcendental; judging it takes timings of its own.
-- Pinned by:
-  `test/test_autotuner_heuristics.py::TestPointwiseGatheredSlab::test_rolled_copy_of_an_op_reads_its_index_in_the_enclosing_graph`
+- Pinned by: `test/test_autotuner_heuristics.py::TestPointwiseGatheredSlab::test_rolled_copy_of_an_op_reads_its_index_in_the_enclosing_graph`
   (`slab_numel == 576`).
