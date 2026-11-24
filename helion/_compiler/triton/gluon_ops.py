@@ -1197,6 +1197,20 @@ def _scale_put(x, COPY: gl.constexpr, sc):
     ``copied_scale``), else through registers."""
     if COPY:
         tcgen05_copy(x, sc)
+    elif sc.shape[0] < 16:
+        # No 32x32b register layout below 16 rows (an 8-column tile's scales):
+        # store them twice over through a 16-row view; the MMA reads the first.
+        LAYOUT: gl.constexpr = vector_layout(x.shape, x.dtype, gl.num_warps())  # pyrefly: ignore [bad-assignment]
+        if _shared(x.type):
+            v = x.load(LAYOUT)  # pyrefly: ignore [missing-attribute]
+        else:
+            v = gl.convert_layout(x, LAYOUT)
+        ROWS: gl.constexpr = 2 * x.shape[0]  # pyrefly: ignore [bad-assignment]
+        v = gl.reshape(gl.permute(gl.join(v, v), [2, 0, 1]), [ROWS, x.shape[1]])
+        wide = reinterpret(sc, sc.dtype, [ROWS, sc.shape[1]], sc.layout)  # pyrefly: ignore [bad-argument-count]
+        wide.store(gl.convert_layout(v, wide.get_reg_layout()))  # pyrefly: ignore [missing-attribute]
+        if _shared(x.type):
+            fence_async_shared()  # the read ahead of the slot's next TMA write
     elif _shared(x.type):
         sc.store(x.load(sc.get_reg_layout()))  # pyrefly: ignore [missing-attribute]
         fence_async_shared()  # the read ahead of the slot's next TMA write
@@ -1622,10 +1636,23 @@ def tmem_dot_supported(device_function: DeviceFunction, node: torch.fx.Node) -> 
     a_ty, b_ty = _tl_type(a, shapes[0]), _tl_type(b, shapes[1])
     warps = device_function.config.num_warps
     if scaled:
+        # Triton's translator asks N >= 16; tcgen05's block-scaled MMA takes
+        # M = 128 with N a multiple of 8 (an 8-token decode tile).
+        n = shapes[1][1]
         return (
             all(isinstance(node.args[i], torch.fx.Node) for i in _SCALES[dot_scaled])
             and {node.args[i] for i in _FORMATS} <= {"e2m1", "e4m3", "e5m2"}
-            and bool(blackwell_helpers.tl_dot_scaled_mmav5_supported(a_ty, b_ty, warps))
+            and (
+                bool(blackwell_helpers.tl_dot_scaled_mmav5_supported(a_ty, b_ty, warps))
+                or (
+                    n == 8
+                    and bool(
+                        blackwell_helpers.tl_dot_scaled_mmav5_supported(
+                            a_ty, _tl_type(b, [shapes[1][0], 16]), warps
+                        )
+                    )
+                )
+            )
         )
     env = CompileEnvironment.current()
     precision = env.backend.map_dot_precision(env.settings.dot_precision)

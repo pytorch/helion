@@ -252,6 +252,34 @@ def fp4_mm(
 
 
 @helion.kernel(static_shapes=True, backend="gluon")
+def fp4_mm_nt(
+    x: torch.Tensor,
+    x_scale: torch.Tensor,
+    y: torch.Tensor,
+    y_scale: torch.Tensor,
+    block_n: hl.constexpr,
+) -> torch.Tensor:
+    """mxfp4 with both operands K-major; ``block_n`` columns per tile."""
+    m, packed = x.size()
+    n = y.size(0)
+    out = torch.empty([m, n], dtype=torch.float32, device=x.device)
+    for tile_m, tile_n in hl.tile([m, n], block_size=[128, block_n]):
+        acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+        for kk in hl.grid(packed // 64):
+            acc = hl.dot_scaled(
+                x[tile_m, kk * 64 + hl.arange(64)],
+                x_scale[tile_m, kk * 4 + hl.arange(4)],
+                "e2m1",
+                y[tile_n, kk * 64 + hl.arange(64)].T,
+                y_scale[tile_n, kk * 4 + hl.arange(4)],
+                "e2m1",
+                acc=acc,
+            )
+        out[tile_m, tile_n] = acc
+    return out
+
+
+@helion.kernel(static_shapes=True, backend="gluon")
 def fp4_broadcast_mv(
     w: torch.Tensor, w_scale: torch.Tensor, a: torch.Tensor, a_scale: torch.Tensor
 ) -> torch.Tensor:
@@ -897,6 +925,24 @@ class TestGluonRing(TestCase):
         code, out = code_and_output(fp4_mm, args, **RING)
         torch.testing.assert_close(out, expected, atol=0, rtol=0)
         self.assertEqual(code.count("_helion_ring.ring_acquire("), 2)
+
+    @skipUnlessGluon()
+    @skipIfRefEager("checks generated code")
+    def test_dot_scaled_fp4_n8(self) -> None:
+        """tcgen05 takes an 8-column block-scaled tile (Triton's rule asks 16)."""
+        x, y = (
+            torch.randint(0, 256, shape, dtype=torch.uint8, device=DEVICE)
+            for shape in ([128, 256], [16, 256])
+        )
+        x_scale, y_scale = (
+            torch.randint(124, 130, [rows, 16], dtype=torch.uint8, device=DEVICE)
+            for rows in (128, 16)
+        )
+        args = (x, x_scale, y, y_scale)
+        _, expected = code_and_output(fp4_mm_nt, (*args, 16), **RING)
+        code, out = code_and_output(fp4_mm_nt, (*args, 8), **RING)
+        torch.testing.assert_close(out, expected, atol=0, rtol=0)
+        self.assertIn("_helion_gluon.tmem_dot_scaled(", code)
 
     @skipIfRefEager("checks generated code")
     @skipUnlessGluon()
