@@ -208,15 +208,36 @@ def test_a_default_the_compiler_refuses_falls_back_to_the_reference() -> None:
     assert warnings[0].endswith("retrying with the autotuning reference config")
 
 
-def test_an_unrecoverable_runtime_error_from_the_default_stops_the_search() -> None:
-    # An illegal instruction leaves the device in a bad state: no fallback.
+@pytest.mark.parametrize(
+    "message",
+    [
+        # Text from existing runtimes plus both CUDA APIs' names for each
+        # sticky fault must all stop the same in-process search.
+        "CUDA error: an illegal instruction was encountered",
+        "CUDA error: device-side assert triggered",
+        "CUDA_ERROR_ASSERT",
+        "cudaErrorAssert",
+        "CUDA_ERROR_ILLEGAL_ADDRESS",
+        "cudaErrorIllegalAddress",
+        "CUDA_ERROR_ILLEGAL_INSTRUCTION",
+        "cudaErrorIllegalInstruction",
+        "CUDA_ERROR_MISALIGNED_ADDRESS",
+        "cudaErrorMisalignedAddress",
+        "CUDA_ERROR_LAUNCH_FAILED",
+        "cudaErrorLaunchFailure",
+    ],
+)
+def test_an_unrecoverable_runtime_error_from_the_default_stops_the_search(
+    message: str,
+) -> None:
+    # A sticky device error must stop in-process tuning before any fallback.
     spec = _Spec(
         {"block_sizes": [64], "mode": "simt"}, {"block_sizes": [64], "mode": "mma"}
     )
 
     def runs(config: helion.Config) -> bool:
         if config.config["mode"] == "mma":
-            raise RuntimeError("CUDA error: an illegal instruction was encountered")
+            raise RuntimeError(message)
         return True
 
     provider, compiled, warnings = _provider(spec, runs)
@@ -224,7 +245,7 @@ def test_an_unrecoverable_runtime_error_from_the_default_stops_the_search() -> N
         provider._compute_reference_baseline()
     except helion.exc.InvalidConfig as error:
         assert str(error).startswith("Execution default failed while computing")
-        assert "illegal instruction" in str(error.__cause__)
+        assert message in str(error.__cause__)
     else:
         raise AssertionError("the unrecoverable error was swallowed")
     assert [c.config["mode"] for c in compiled] == ["mma"] and not warnings

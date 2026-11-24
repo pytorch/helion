@@ -956,7 +956,10 @@ class Settings(_Settings):
             "(no budget)."
         ),
         "autotune_ignore_errors": (
-            "If True, skip logging and raising autotune errors. "
+            "If True, skip logging and raising recoverable autotune errors. "
+            "An in-process Triton or CuTe candidate with an unrecoverable device "
+            "error (such as a CUDA assertion or illegal memory access) raises "
+            "TritonUnrecoverableRuntimeError even when enabled. "
             "Set HELION_AUTOTUNE_IGNORE_ERRORS=1 to enable globally. The "
             "one-line summary of the initial population (configs measured, "
             "failed, skipped for the budget, and the wall time per config) and "

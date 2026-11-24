@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import ctypes
 import ctypes.util
@@ -10,6 +11,7 @@ import functools
 import logging
 import multiprocessing as mp
 from multiprocessing import connection as mp_connection
+from multiprocessing.reduction import ForkingPickler
 import os
 import signal
 import sys
@@ -19,9 +21,12 @@ from typing import TYPE_CHECKING
 from typing import Callable
 from typing import TypeVar
 
+from .benchmark_prelude import PreludeFailed
 from .benchmarking import steady_graph_dispatch
-from .logger import _UNRECOVERABLE_RUNTIME_ERROR_RE
+from .logger import _remember_worker_message
 from .logger import match_device_out_of_memory
+from .logger import match_unrecoverable_runtime_error
+from .logger import runtime_error_message
 from .process_utils import signal_process_tree
 from .process_utils import start_isolated_process_group
 
@@ -158,21 +163,12 @@ def _worker_loop(connection: Connection, device: int | None) -> None:
             # Tracebacks pin the job's locals (tensors); strip before pickle.
             e.__traceback__ = None
             result = e
+        if isinstance(result, BaseException):
+            result = _WorkerFailure.capture(result)
         try:
             connection.send(result)
         except BrokenPipeError:
             return
-        except Exception:
-            if not isinstance(result, BaseException):
-                raise
-            fallback = BenchmarkSubprocessError(
-                f"worker raised unpickleable "
-                f"{type(result).__module__}.{type(result).__qualname__}: {result}"
-            )
-            try:
-                connection.send(fallback)
-            except BrokenPipeError:
-                return
 
 
 # The phase a ``PhasedJob`` reports once its candidate is compiled and has
@@ -210,7 +206,117 @@ class PhasedJob:
 
 class BenchmarkSubprocessError(Exception):
     """Worker-subprocess failure, distinct from exceptions raised by the
-    user job (which are re-raised verbatim)."""
+    user job."""
+
+
+def _worker_error_name(error: BaseException) -> str:
+    cls = type(error)
+    # Spawn imports a script under a different name in the worker.
+    module = "__main__" if cls.__module__ == "__mp_main__" else cls.__module__
+    return f"{module}.{cls.__qualname__}"
+
+
+@dataclasses.dataclass(frozen=True)
+class _WorkerFailure:
+    # Some SDK errors can be pickled, but their constructor cannot restore
+    # them from Exception.args. Always deliver the worker's own diagnostic.
+    error_type: str
+    message: str
+    sticky: bool
+    payload: bytes | None
+    fallback: type[BaseException]
+
+    @property
+    def diagnostic(self) -> str:
+        return f"{self.error_type}: {self.message}"
+
+    @classmethod
+    def capture(cls, err: BaseException) -> _WorkerFailure:
+        def pickle_error(error: BaseException) -> bytes | None:
+            try:
+                return bytes(ForkingPickler.dumps(error))
+            except Exception:
+                return None
+
+        sticky = False
+        if isinstance(err, Exception):
+            try:
+                message = runtime_error_message(err)
+                sticky = match_unrecoverable_runtime_error(message)
+                payload = pickle_error(err)
+            except BaseException as interrupted:
+                if isinstance(interrupted, Exception):
+                    raise
+                err = interrupted
+            else:
+                return cls(
+                    _worker_error_name(err),
+                    message,
+                    sticky,
+                    payload,
+                    PreludeFailed
+                    if isinstance(err, PreludeFailed)
+                    else RuntimeError
+                    if sticky
+                    else BenchmarkSubprocessError,
+                )
+        # Formatting and pickle reducers are user code. A control exception from
+        # either follows the same path as an interrupt from the job itself.
+        try:
+            payload = pickle_error(err)
+        except BaseException as interrupted:
+            err, payload = interrupted, None
+        control = next(
+            (
+                c
+                for c in (
+                    SystemExit,
+                    KeyboardInterrupt,
+                    GeneratorExit,
+                    asyncio.CancelledError,
+                )
+                if isinstance(err, c)
+            ),
+            BaseException,
+        )
+        return cls(
+            _worker_error_name(err),
+            "",
+            sticky,
+            payload,
+            control,
+        )
+
+    def restore(self) -> BaseException:
+        if self.payload is not None:
+            try:
+                error = ForkingPickler.loads(self.payload)
+                if not issubclass(self.fallback, Exception):
+                    if isinstance(error, self.fallback) and not isinstance(
+                        error, Exception
+                    ):
+                        return error
+                # A reducer may return a different exception. Preserve the
+                # worker's prelude/candidate distinction across the boundary;
+                # a sticky candidate must not restore as an infrastructure
+                # error that the parent would treat as a missing measurement.
+                elif (
+                    isinstance(error, Exception)
+                    and isinstance(error, PreludeFailed)
+                    == (self.fallback is PreludeFailed)
+                    and (
+                        not self.sticky or _worker_error_name(error) == self.error_type
+                    )
+                ):
+                    _remember_worker_message(error, self.message)
+                    return error
+            except Exception:
+                pass
+        # An unrecoverable kernel error is a failed job, not an unavailable
+        # measurement: an isolated finalist must lose its earlier timing.
+        return self.fallback(
+            f"the parent could not restore the worker exception: {self.diagnostic}"
+        )
 
 
 class BenchmarkTimeout(BenchmarkSubprocessError):
@@ -294,8 +400,14 @@ class BenchmarkWorker:
         """Execute ``job`` in the worker.
 
         Raises ``BenchmarkTimeout`` if the job exceeds ``timeout`` seconds,
-        ``BenchmarkWorkerDied`` if the worker crashed, or whatever exception
-        the job raised. Sticky CUDA errors and device out-of-memory errors
+        ``BenchmarkWorkerDied`` if the worker crashed, or the exception rebuilt
+        by unpickling. A non-sticky job exception's reducer may choose a
+        different type. An unrestorable prelude failure
+        remains ``PreludeFailed``, whether sticky or recoverable. Other job
+        failures report ``RuntimeError`` for a sticky fault or
+        ``BenchmarkSubprocessError`` otherwise. An unrestorable control exception
+        still interrupts the caller as its standard control type (or BaseException).
+        Sticky CUDA errors and device out-of-memory errors
         additionally kill the worker so the next call respawns it. If a
         killed worker remains alive, raises ``BenchmarkWorkerUnkillable`` and
         permanently disables this instance.
@@ -440,10 +552,20 @@ class BenchmarkWorker:
             self._kill_if_current(process, connection)
             raise timeout_error()
 
+        if isinstance(result, _WorkerFailure):
+            if result.sticky:
+                # A tensor in the error may need its sender's file descriptor.
+                # Restore it before retiring the worker, even if restore fails.
+                try:
+                    error = result.restore()
+                finally:
+                    self._kill_if_current(process, connection)
+                raise error
+            result = result.restore()
         if isinstance(result, BaseException):
-            if _UNRECOVERABLE_RUNTIME_ERROR_RE.search(str(result)):
-                self._kill_if_current(process, connection)
-            elif match_device_out_of_memory(result):
+            if not isinstance(result, Exception):
+                raise result
+            if match_device_out_of_memory(result):
                 # before this worker's own kill, which may remember it
                 beside_exit = _prune_exiting()
                 retry = may_rerun and (
@@ -456,7 +578,7 @@ class BenchmarkWorker:
                     self._start()
                     raise result
                 if self._log_warning is not None:
-                    first_line = str(result).split("\n", 1)[0]
+                    first_line = runtime_error_message(result).split("\n", 1)[0]
                     cause = (
                         "while a killed worker was still exiting"
                         if beside_exit

@@ -392,7 +392,7 @@ def my_kernel(x: torch.Tensor) -> torch.Tensor:
 
 .. autoattribute:: Settings.autotune_ignore_errors
 
-   Continue autotuning even when candidate configurations raise recoverable runtime errors (for example, GPU out-of-memory). Default is ``False``. Controlled by ``HELION_AUTOTUNE_IGNORE_ERRORS``.
+   Continue autotuning even when candidate configurations raise recoverable runtime errors (for example, GPU out-of-memory). If an in-process candidate encounters an unrecoverable device error, such as a CUDA assertion or illegal memory access, the search raises ``helion.exc.TritonUnrecoverableRuntimeError`` even when this option is enabled. This applies to Triton and CuTe: the device context cannot safely run another candidate. Default is ``False``. Controlled by ``HELION_AUTOTUNE_IGNORE_ERRORS``.
 
 .. autoattribute:: Settings.autotune_accuracy_check
 
