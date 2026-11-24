@@ -198,6 +198,44 @@ def test_seed_skips_bodies_outside_the_register_tile_shape() -> None:
         assert not CuteRegisterTileHeuristic.is_eligible(bound.env, host.device_ir)
 
 
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _narrow_col_sum(x: torch.Tensor, out: torch.Tensor) -> None:
+    for tile_c in hl.tile(x.size(1)):
+        out[tile_c] = torch.sum(x[:, tile_c].to(torch.float32), -2)
+
+
+def test_seed_tiles_narrow_extents_by_a_power_of_two() -> None:
+    # A column sum over 48 bf16 columns (fewer than the eight 8-element vector
+    # threads the seed asks for): the tile is the widest power of two that
+    # divides the extent, 16, not the extent itself, which is no block size.
+    # The seed is the autotune-off default, so the default config must
+    # normalize and render (columns // block CTAs); with block_sizes=[48] it
+    # raised InvalidConfig. A power-of-two extent keeps the whole extent as
+    # its tile.
+    # fp32 columns take 4-element vectors: 20 columns are 5 tiles of 4.
+    bf16, f32 = torch.bfloat16, torch.float32
+    for columns, dtype, block in (
+        (48, bf16, 16),
+        (24, bf16, 8),
+        (32, bf16, 32),
+        (20, f32, 4),
+    ):
+        arguments = (
+            torch.empty((128, columns), dtype=dtype),
+            torch.empty((columns,), dtype=torch.float32),
+        )
+        bound = cpu_bind(_narrow_col_sum, arguments)
+        host = bound.host_function
+        assert host is not None
+        seed = CuteRegisterTileHeuristic.get_seed_config(bound.env, host.device_ir)
+        assert seed is not None
+        assert seed.block_sizes == [block]
+        default = bound.config_spec.default_config()
+        assert default.block_sizes == [block]
+        code = bound.to_code(default)
+        assert f"_launcher(_helion__narrow_col_sum, ({columns // block},)" in code
+
+
 def test_chained_reductions_seed_half_the_lanes_per_level() -> None:
     # One reduction feeding another (two accumulate nests) stashes more of the
     # tile between the combines, so the seed halves the lanes per thread:

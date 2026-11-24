@@ -1668,6 +1668,17 @@ class CuteRegisterTileHeuristic(AutotunerHeuristic):
         if vec <= 1:
             return None
         tile_block = min(int(numel), cls.VECTOR_THREADS * vec)
+        if tile_block == int(numel):
+            # An extent of fewer than VECTOR_THREADS vectors is tiled by the
+            # widest power of two that divides it, as block sizes are powers of
+            # two: a column sum over 48 bf16 columns takes 16 (three tiles of
+            # two vector threads). The extent itself, block_sizes=[48], is no
+            # block size; as the promoted default it failed every config
+            # before the first ran ("config[block_sizes][0] must be a power
+            # of two, got 48").
+            tile_block = prev_power_of_2(tile_block)
+            while tile_block > vec and int(numel) % tile_block:
+                tile_block //= 2
         if tile_block % vec or (int(numel) % tile_block):
             return None
         tile_threads = tile_block // vec
