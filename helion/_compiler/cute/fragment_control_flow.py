@@ -43,6 +43,16 @@ from .register_snapshots import snapshot_logical_shape
 class FragmentControlFlow(FragmentContext):
     """Loops, resident while loops and conditionals over fragments."""
 
+    def _control_scalar(self, value: object, snapshots: dict[int, str]) -> str:
+        """Snapshot a shared-dependent header operand in each lane before the fence."""
+        if not isinstance(value, Fragment) or not self.referenced_buffers((value,)):
+            return self.scalar(value)
+        if (name := snapshots.get(id(value))) is None:
+            name = self.df.new_var("fragment_control")
+            self.emit(f"{name} = {self.scalar(value)}")
+            snapshots[id(value)] = name
+        return name
+
     def loop(self, node: Node, values: dict[Node, object]) -> list[Fragment]:
         graph_id = node.args[0]
         assert isinstance(graph_id, int)
@@ -52,7 +62,7 @@ class FragmentControlFlow(FragmentContext):
             self.df.resolved_block_size(bid) != 1 for bid in graph.block_ids
         ):
             raise exc.InvalidConfig("CTA-local atomics require uniform scalar loops")
-        loop_index_type = "Int32"
+        loop_index_type = "Int64" if self.env.index_dtype == torch.int64 else "Int32"
         if self.local_allocations:
             parent, _slot = control_flow_parent_entries(self.graphs)[graph_id]
             owner = next(info for info in self.graphs if info.graph is parent.graph)
@@ -100,17 +110,18 @@ class FragmentControlFlow(FragmentContext):
         # tensor-derived scalar recipes. Rendering an end inside the body can
         # make the loop header refer to a temporary that the body defines.
         starts: list[str] = []
+        ends: list[str] = []
         steps: list[str] = []
 
-        range_values: list[object] = []
+        snapshotted_ranges: set[Node] = set()
+        control_snapshots: dict[int, str] = {}
 
         def range_scalar(value: object) -> str:
             result = values[value] if isinstance(value, Node) else value
-            # These scalar recipes can read shared storage again in body masks,
-            # extents and loop headers, even when the same value is a copied
-            # mutable capture. Keep their dependencies live through the backedge.
-            range_values.append(result)
-            return self.scalar(result)
+            scalar = self._control_scalar(result, control_snapshots)
+            if isinstance(value, Node) and id(result) in control_snapshots:
+                snapshotted_ranges.add(value)
+            return scalar
 
         for index, (bid, begin, end) in enumerate(
             zip(
@@ -121,36 +132,48 @@ class FragmentControlFlow(FragmentContext):
             )
         ):
             starts.append(range_scalar(begin))
-            self.bounds[bid] = range_scalar(end)
+            ends.append(range_scalar(end))
             step = self.sym(self.df.resolved_block_size(bid))
             if node.target is _tracing_ops._for_loop_step:
                 explicit = cast("list[object]", node.args[4])[index]
                 if explicit is not None:
                     step = range_scalar(explicit)
             steps.append(step)
+        # A later axis can read an outer tile that shares an earlier axis's
+        # block ID. Install the new scope only after evaluating every header.
+        for bid, stop in zip(graph.block_ids, ends, strict=True):
+            self.bounds[bid] = stop
             self.offsets[bid] = self.df.new_var("fragment_tile")
-        # Carry copies above have completed before the loop, including its
-        # zero-trip case. The child uses those copies, not consumed originals.
+        if control_snapshots:
+            # Even a zero-trip loop reads its headers on every warp. Complete
+            # all those reads before a later store can reuse any source slot.
+            self.synchronize()
+        # Headers use registers and mutable captures use their carry copies.
+        # Only independent body captures need the original storage across a backedge.
         captured_nodes = cast("list[Node]", node.args[3])
+        # A range node can also occupy an unused body placeholder. Body masks
+        # already use its register snapshot; only a real FX use needs the input.
+        body_inputs = {
+            placeholder: value
+            for captured, placeholder, value in zip(
+                captured_nodes, placeholders, inner_args, strict=True
+            )
+            if placeholder.users or captured not in snapshotted_ranges
+        }
         with (
             self.cg.set_statements(body),
             self.retired_loop_initials(
                 node,
                 values,
-                {captured_nodes[slot] for slot in copied_slots},
+                snapshotted_ranges | {captured_nodes[slot] for slot in copied_slots},
                 [
-                    *range_values,
-                    *(
-                        value
-                        for slot, value in enumerate(args)
-                        if slot not in copied_slots
-                    ),
+                    value
+                    for slot, value in enumerate(args)
+                    if slot not in copied_slots and placeholders[slot] in body_inputs
                 ],
             ),
         ):
-            results = self.graph(
-                graph.graph, dict(zip(placeholders, inner_args, strict=True))
-            )
+            results = self.graph(graph.graph, body_inputs)
             assert isinstance(results, list)
             # Snapshot every value that reads a carry before writing any carry.
             # Disjoint recipes can write directly: none of their inputs changes
@@ -599,6 +622,21 @@ class FragmentControlFlow(FragmentContext):
             # Descendant fresh epochs require the same per-arm retirement even
             # when an immediate arm owns no allocation itself.
             branch_local = True
+        predicate = node.args[0]
+        proxy = predicate.meta["val"] if isinstance(predicate, Node) else predicate
+        constant = self.df.evaluate_constexpr_condition(proxy)
+        control_snapshots: dict[int, str] = {}
+        test = (
+            repr(constant)
+            if constant is not None
+            else self._control_scalar(
+                values[predicate] if isinstance(predicate, Node) else predicate,
+                control_snapshots,
+            )
+        )
+        if control_snapshots:
+            # A barrier in a branch cannot protect a warp that skips that arm.
+            self.synchronize()
         incoming_pending = self.pending_local_atomics.copy()
         branches: list[list[ast.AST]] = []
         for side in range(2):
@@ -639,16 +677,6 @@ class FragmentControlFlow(FragmentContext):
                     self.copy(source, target)
                 self.held.pop()
             branches.append(body or [ast.Pass()])
-        predicate = node.args[0]
-        proxy = predicate.meta["val"] if isinstance(predicate, Node) else predicate
-        constant = self.df.evaluate_constexpr_condition(proxy)
-        test = (
-            repr(constant)
-            if constant is not None
-            else self.scalar(
-                values[predicate] if isinstance(predicate, Node) else predicate
-            )
-        )
         statement = statement_from_string(f"if {test}:\n    pass")
         assert isinstance(statement, ast.If)
         statement.body = cast("list[ast.stmt]", branches[0])
