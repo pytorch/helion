@@ -6,6 +6,7 @@
 :hidden:
 
 installation
+Backends <backends>
 Examples <./examples/index>
 Tutorials <helion_tutorials>
 api/index
@@ -21,28 +22,22 @@ as PyTorch operations over tiles; the compiler derives a configuration
 space for each kernel and hardware target and autotunes it, so the same
 kernel adapts across input shapes and hardware targets.
 
-Helion generates kernels through one of several backends. Select one with
-the `HELION_BACKEND` environment variable or the `backend=` argument of
-`@helion.kernel`:
+## Backends
 
-* [Triton] (default): `HELION_BACKEND=triton`
-* [TileIR](tileir_backend.md), for NVIDIA Blackwell GPUs: `HELION_BACKEND=tileir` (also set `ENABLE_TILE=1`)
-* [CuTe DSL], for NVIDIA Blackwell GPUs: `HELION_BACKEND=cute`
-* [Gluon], for NVIDIA Blackwell (sm_10x) GPUs (experimental): `HELION_BACKEND=gluon` (needs Triton >= 3.8)
-* [Pallas], for Google TPUs: `HELION_BACKEND=pallas`
-* Metal, for Apple GPUs (experimental): `HELION_BACKEND=metal`
-* FlyDSL, for AMD GPUs (experimental): `HELION_BACKEND=flydsl`
+**On NVIDIA B200 or B300, set `HELION_BACKEND=cute` for better performance.**
+Use PyTorch built with CUDA 13 or later and install the
+{ref}`CuTe dependencies <cute-backend-installation>`.
 
-```python
-@helion.kernel(backend="cute")
-def my_kernel(x: torch.Tensor) -> torch.Tensor:
-    ...
+```{include} ../README.md
+:start-after: <!-- backend-table-start -->
+:end-before: <!-- backend-table-end -->
 ```
 
-[Triton]: https://github.com/triton-lang/triton
-[CuTe DSL]: https://github.com/NVIDIA/cutlass
-[Gluon]: https://github.com/triton-lang/triton/tree/main/python/tutorials/gluon
-[Pallas]: https://docs.jax.dev/en/latest/pallas/index.html
+Select a backend with `HELION_BACKEND` before importing your kernels, or use
+`@helion.kernel(backend="cute")` for a per-kernel choice. The decorator
+argument takes precedence; Triton remains the default. Helion autotunes
+within the selected backend, so retune when switching backends or hardware.
+See {doc}`backends` for status definitions, setup and limitations.
 
 The name *Helion* refers to the nucleus of a helium-3 atom, while *Triton*
 refers to hydrogen-3.
@@ -128,8 +123,8 @@ the CPU. It is typically used for tasks like allocating output tensors
 and performing shape computations.
 
 The code inside the `for` loops is compiled by the selected backend
-(Triton by default) into a single GPU kernel.  A single Helion kernel is
-always compiled to exactly one GPU kernel.
+(Triton by default) into device code. A Helion kernel can use one or more
+device launches, depending on its operations and the backend.
 
 The `hl.tile` function subdivides the iteration space (in this case `m` by
 `n`) into tiles. These tiles are executed in parallel on the GPU. Tiling

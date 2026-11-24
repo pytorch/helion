@@ -373,95 +373,6 @@ def singleton_gate_chain(x: torch.Tensor) -> torch.Tensor:
     static_shapes=True,
     autotune_effort="none",
 )
-def deep_anchor_chains(
-    x: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Twice: a two-root chain on a few workers while a wide root waits on it,
-    then narrow roots reading the wide root's output.  No root runs another's
-    tasks as a continuation (four or eight tasks per row), so lanes pack: each
-    narrow root gets workers of its own after the earlier ones', and its
-    workers ran only the first wide root before the waiting one, whose
-    producers lie two dependency levels deeper (that root's dry-pass anchor).
-    Between the first wide root and its narrow roots, a root of eight tasks
-    per row runs on the chain's workers (roots 1 and 2's, not the narrow
-    roots')."""
-    batch, width = x.size()
-    a = torch.empty_like(x)
-    p = torch.empty((batch, 4), dtype=torch.float32, device=x.device)
-    q = torch.empty((batch, 4), dtype=torch.float32, device=x.device)
-    d = torch.empty_like(x)
-    side = torch.empty((batch, 8), dtype=torch.float32, device=x.device)
-    e = torch.empty((batch, 4), dtype=torch.float32, device=x.device)
-    e2 = torch.empty((batch, 4), dtype=torch.float32, device=x.device)
-    f = torch.empty((batch, 4), dtype=torch.float32, device=x.device)
-    g = torch.empty((batch, 4), dtype=torch.float32, device=x.device)
-    h = torch.empty_like(x)
-    out = torch.empty((batch, 4), dtype=torch.float32, device=x.device)
-    for tile_batch, tile_width in hl.tile([batch, width]):
-        a[tile_batch, tile_width] = x[tile_batch, tile_width] + 1
-    for row, col in hl.tile([batch, 4], block_size=[1, 1]):
-        p[row, col] = torch.sum(a[row, :], dim=-1)[:, None]
-    for row, col in hl.tile([batch, 4], block_size=[1, 1]):
-        q[row, col] = torch.sum(p[row, :], dim=-1)[:, None]
-    for tile_batch, tile_width in hl.tile([batch, width]):
-        d[tile_batch, tile_width] = (
-            a[tile_batch, tile_width] * torch.sum(q[tile_batch, :], dim=-1)[:, None]
-        )
-    for row, col in hl.tile([batch, 8], block_size=[1, 1]):
-        side[row, col] = torch.sum(a[row, :], dim=-1)[:, None]
-    for row, col in hl.tile([batch, 4], block_size=[1, 1]):
-        e[row, col] = torch.sum(d[row, :], dim=-1)[:, None]
-    for row, col in hl.tile([batch, 4], block_size=[1, 1]):
-        e2[row, col] = 2 * torch.sum(d[row, :], dim=-1)[:, None]
-    for row, col in hl.tile([batch, 4], block_size=[1, 1]):
-        f[row, col] = torch.sum(e[row, :], dim=-1)[:, None]
-    for row, col in hl.tile([batch, 4], block_size=[1, 1]):
-        g[row, col] = torch.sum(f[row, :], dim=-1)[:, None]
-    for tile_batch, tile_width in hl.tile([batch, width]):
-        h[tile_batch, tile_width] = (
-            d[tile_batch, tile_width] * torch.sum(g[tile_batch, :], dim=-1)[:, None]
-        )
-    for row, col in hl.tile([batch, 4], block_size=[1, 1]):
-        out[row, col] = torch.sum(h[row, :], dim=-1)[:, None]
-    return out, side, e2
-
-
-@helion.kernel(
-    static_shapes=True,
-    autotune_effort="none",
-)
-def deep_anchor_chain_guarded(
-    x: torch.Tensor, flags: torch.Tensor
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """The first chain of ``deep_anchor_chains`` whose narrow root runs only
-    the tasks a loaded count keeps (a guarded extent)."""
-    batch, width = x.size()
-    a = torch.empty_like(x)
-    p = torch.empty((batch, 4), dtype=torch.float32, device=x.device)
-    q = torch.empty((batch, 4), dtype=torch.float32, device=x.device)
-    d = torch.empty_like(x)
-    e = torch.zeros((batch, 4), dtype=torch.float32, device=x.device)
-    for tile_batch, tile_width in hl.tile([batch, width]):
-        a[tile_batch, tile_width] = x[tile_batch, tile_width] + 1
-    for row, col in hl.tile([batch, 4], block_size=[1, 1]):
-        p[row, col] = torch.sum(a[row, :], dim=-1)[:, None]
-    for row, col in hl.tile([batch, 4], block_size=[1, 1]):
-        q[row, col] = torch.sum(p[row, :], dim=-1)[:, None]
-    for tile_batch, tile_width in hl.tile([batch, width]):
-        d[tile_batch, tile_width] = (
-            a[tile_batch, tile_width] * torch.sum(q[tile_batch, :], dim=-1)[:, None]
-        )
-    for col, row in hl.tile([4, batch], block_size=[1, 1]):
-        live = torch.sum((flags[:] > 0).to(torch.int32))
-        if row.begin < live:
-            e[row, col] = torch.sum(d[row, :], dim=-1)[:, None]
-    return d, e
-
-
-@helion.kernel(
-    static_shapes=True,
-    autotune_effort="none",
-)
 def fixed_block_dense_span_chain(x: torch.Tensor) -> torch.Tensor:
     (n,) = x.size()
     y = torch.empty_like(x)
@@ -1984,6 +1895,11 @@ class TestCrossLoopCodegenHelpers(TestCase):
         ).body
         guards = [body[0], body[2]]
         self.assertFalse(_dry_pass_binds(body, guards, set()))
+        # ``x += v`` reads x too.
+        body = ast.parse(
+            "if live:\n    x = tl.load(p)\ny = 3\nif live:\n    x += tl.load(q)\n"
+        ).body
+        self.assertFalse(_dry_pass_binds(body, [body[0], body[2]], set()))
         body = ast.parse("if live:\n    x = tl.load(p)\n    tl.store(out, x)\n").body
         self.assertTrue(_dry_pass_binds(body, [body[0]], set()))
 
@@ -3846,7 +3762,10 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
                 )
                 expected2 = torch.where(index[:, None] < live2, x * 2, 0)
                 torch.testing.assert_close(out2, expected2)
-                torch.testing.assert_close(total, expected2.sum(0))
+                # (A tree reduction over up to 2 x SMs rows, in another order.)
+                torch.testing.assert_close(
+                    total, expected2.sum(0), rtol=1e-5, atol=1e-4
+                )
         # The second root's lanes start past the first root's live tasks.
         self.assertIn(
             f"({rows} - tl.minimum(tile_dependency_live_tasks, {rows}))", code

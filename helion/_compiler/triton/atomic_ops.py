@@ -24,13 +24,13 @@ from ...language.atomic_ops import atomic_min
 from ...language.atomic_ops import atomic_or
 from ...language.atomic_ops import atomic_xchg
 from ...language.atomic_ops import atomic_xor
+from .. import loop_dependency_checker
 from ..ast_extension import expr_from_string
 from ..ast_extension import statement_from_string
 from ..compile_environment import CompileEnvironment
 from ..host_function import HostFunction
 from ..indexing_strategy import SubscriptIndexing
 from ..loop_dependency_checker import INTRA_LOOP_RAW_BARRIER_META
-from ..loop_dependency_checker import emit_intra_loop_raw_barrier
 
 if TYPE_CHECKING:
     import ast
@@ -56,7 +56,9 @@ def _sync_before(state: CodegenState, target: torch.Tensor) -> None:
         INTRA_LOOP_RAW_BARRIER_META
     ):
         # A release takes the full barrier, which a read barrier is not.
-        emit_intra_loop_raw_barrier(state, target, full=_releases(state))
+        loop_dependency_checker.emit_intra_loop_raw_barrier(
+            state, target, full=_releases(state)
+        )
     else:
         _sync_before_release(state)
 

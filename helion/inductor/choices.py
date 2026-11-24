@@ -1,19 +1,128 @@
 from __future__ import annotations
 
+import dataclasses
+import math
 from typing import TYPE_CHECKING
+from typing import cast
 
 import sympy
+import torch
 from torch._inductor import config as inductor_config
+from torch._inductor.choices import FusionScore
 from torch._inductor.choices import InductorChoices
+from torch._inductor.choices import Sortable
+from torch._inductor.ir import ComputedBuffer
+from torch._inductor.scheduler import FusedMixOrderReductions
+from torch._inductor.scheduler import MixOrderReduction
+from torch._inductor.utils import sympy_product
+from torch._inductor.virtualized import V
+from torch.fx.operator_schemas import normalize_function
+from torch.utils._ordered_set import OrderedSet
 
 from . import config
 from .support import MATMUL_DTYPES
+from .support import mix_order_split
+from .support import names_rdim
 from .support import numerics_modes
 from .support import python_wrapper
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
+
     from torch._inductor.codegen.simd_kernel_features import SIMDKernelFeatures
     from torch._inductor.ir import IRNode
+    from torch._inductor.scheduler import BaseSchedulerNode
+    from torch._inductor.scheduler import Scheduler
+
+
+# The reductions that keep Triton's rule for a persistent rdim
+# (should_use_persistent_reduction()): a matmul's dot, whose K loop accumulates
+# into acc, and those whose loop over tile_r reads each rdim once, combining as
+# it goes, where the rdim written as one block reduces it twice (an argmax's
+# max, then the first index of it: HelionKernel.arg_reduce()).
+LOOPED_REDUCTIONS = OrderedSet(
+    [
+        "dot",
+        "welford_reduce",
+        "welford_combine",
+        "online_softmax_reduce",
+        "argmax",
+        "argmin",
+    ]
+)
+
+# The longest rdim of an online-softmax reduction that the CuTe backend reads as
+# one block all the same, in a kernel that reads each rdim again after it
+# (rereads_softmax_rdim()): its max, its sum of exps and the rest each pass over
+# an rdim the autotuner can keep in registers (cute_reduction_reloads), or in a
+# cluster's, where the loop reads it twice. Rdims of 262144 (a softmax over
+# [8192, 262144] bf16) are the longest measured faster so.
+PERSISTENT_SOFTMAX_RDIM = 2**18
+
+
+def rereads_softmax_rdim(features: SIMDKernelFeatures) -> bool:
+    """Whether a kernel with an online softmax reads each rdim again after it:
+    another reduction over the rdim or a value of each element of it that
+    depends on the softmax's results, as the output of softmax(x, -1) or the
+    sum of it. Its loop then reads the rdim twice, where one block reads it
+    once; a kernel that only reduces the rdim, as cross-entropy's max and
+    log-sum-exp, reads it once either way, and one block of 262144 lanes is
+    slower than the loop for them. So does one that also writes a
+    value of each element the softmax's results do not reach, as the logits
+    y = x * 2 that a cross-entropy of y returns beside its loss: the loop
+    writes it in the pass that reduces the rdim."""
+    total = sympy.Mul(features.numel, features.reduction_numel)
+    nodes = features.scheduler_nodes()
+    # The buffers the softmax's results reach, in kernel order: its own, then
+    # those of the nodes that read one of them.
+    reached = OrderedSet(
+        name
+        for node in nodes
+        if isinstance(node.node, ComputedBuffer)
+        and node.node.get_reduction_type() == "online_softmax_reduce"
+        for name in node.get_buffer_names()
+    )
+    for node in nodes:
+        if not isinstance(node.node, ComputedBuffer) or not any(
+            dep.name in reached for dep in node.read_writes.reads
+        ):
+            continue
+        if node.is_reduction() or V.graph.sizevars.statically_known_equals(
+            sympy_product(node.get_ranges()[0]), total
+        ):
+            return True
+        reached.update(node.get_buffer_names())
+    return False
+
+
+# The shortest contiguous run a split reduction's chunk is made of
+# (HelionChoices.layout_split()): over fewer values, the first kernel's
+# partials cost about what its reductions over r do.
+MIN_SPLIT_RUN = 32
+# The fewest values a reduction that Inductor would not split reads for
+# HelionChoices.layout_split() to split it all the same, which adds a kernel
+# and a workspace: var_mean_42fad's NCHW [32, 128, 28, 28], 3.2M values, went
+# from 0.20x to 0.88x of inductor_cd split, and a BatchNorm over [2, 64, 8,
+# 8], 8192 values, keeps its one kernel, whose launch the second's would
+# double.
+MIN_LAYOUT_SPLIT_VALUES = 2**20
+
+
+def contiguous_run(value: torch.Tensor, dims: Sequence[int]) -> int:
+    """The number of values in `value`'s last reduced `dims`, by dim index,
+    that are one contiguous run of memory: H and W, 3136 values, of an NCHW
+    [32, 256, 56, 56] reduced over N, H and W; 1 when the last reduced dim
+    is not the innermost of memory, as NHWC's C, or of a permuted layout
+    whose dims are not in memory order (x.transpose(2, 3)), which then keeps
+    Inductor's split. Dims of size 1 do not count."""
+    run = 1
+    for dim in sorted({d % value.dim() for d in dims}, reverse=True):
+        if value.shape[dim] == 1:
+            continue
+        if value.stride(dim) != run:
+            break
+        run *= value.shape[dim]
+    return run
 
 
 def static_layout(node: IRNode) -> bool:
@@ -31,9 +140,9 @@ def static_layout(node: IRNode) -> bool:
 
 
 class HelionChoices(InductorChoices):
-    """Inductor's heuristics, except that with cuda_backend "helion" the matmuls a
-    Helion kernel emits are lowered to dot reductions. relu(a @ b + c) is then one
-    Helion kernel:
+    """Inductor's heuristics, with the changes the methods below make for
+    cuda_backend "helion". The first: the matmuls a Helion kernel emits are
+    lowered to dot reductions. relu(a @ b + c) is then one Helion kernel:
 
         helion_fused_add_mm_relu_0(arg0_1, arg1_1, arg2_1, buf1)
 
@@ -76,19 +185,300 @@ class HelionChoices(InductorChoices):
         features: SIMDKernelFeatures, cooperative_reduction: bool
     ) -> bool:
         """Whether a reduction kernel reads each row as one block, as
-        HelionKernel.should_use_persistent_reduction() asks: the hook for a rule
-        of Helion's own, e.g. one that leaves a long row to
-        Config.reduction_loops. For now Triton's rule (an inner reduction of up
-        to 1024 elements, another of up to 64). HelionChoices handles every
-        backend, so such a rule checks cuda_backend, as use_native_matmul()
-        does. The kernel keeps a row it cannot write as one block in a loop,
-        whatever this says (names_row_dim())."""
+        HelionKernel.should_use_persistent_reduction() asks. With cuda_backend
+        "helion" the answer is yes for a kernel of sums, maxes and the like,
+        whatever the rdim's length or stride: the kernel writes the rdim as one
+        block and leaves the choice between reading it whole and a loop over
+        chunks of it to Config.reduction_loops, which the autotuner picks.
+        x.sum(-1) of a [8192, 262144] x:
+
+            for tile_x in hl.tile(8192):
+                tmp0 = in0[tile_x, :]
+                tmp1 = torch.sum(tmp0, -1)
+
+        where the loop Triton's rule asks for (an inner reduction of up to 1024
+        elements, another of up to 64) fixes the loop, its chunk and the
+        reduction of each chunk in the generated code:
+
+            for tile_x in hl.tile(8192):
+                acc = hl.zeros([tile_x], dtype=torch.float32)
+                for tile_r in hl.tile(262144):
+                    tmp0 = in0[tile_x, tile_r]
+                    acc = acc + torch.sum(tmp0, -1)
+
+        A kernel with a matmul keeps Triton's rule, which loops over K, and so
+        does one with a Welford or online-softmax reduction: its loop reads each
+        rdim once, combining as it goes, where an rdim written as one block
+        computes the mean before the variance (and the max before the sum of
+        exps), so a loop over the rdim reads it twice. The first kernel of every
+        split reduction keeps Triton's rule too (Inductor marks it, _split_size,
+        only with config.triton.mix_order_reduction on, its default outside
+        fbcode): its chunks loop, the form measured, as the chunks of 125 of
+        x.sum(0) over [100000, 96] do (reduction_split_factor(),
+        test_split_reduction_loops); a chunk past UNROLLED_RDIM_MAX that no
+        input's full rdim names loops anyway
+        (HelionScheduling.create_kernel_choices()). With the CuTe backend, an
+        online-softmax rdim of up to PERSISTENT_SOFTMAX_RDIM is one block all
+        the same in a kernel that reads
+        each rdim again after it (rereads_softmax_rdim()), which the autotuner can
+        keep in registers across those passes; a kernel that only reduces the
+        rdim, as cross-entropy's, keeps the loop, which reads it once. Other
+        devices and backends keep Triton's rule, and
+        config.triton.persistent_reductions off still asks for loops. The kernel
+        keeps an rdim it cannot write as one block in a loop, whatever this says
+        (names_rdim()), and so does an rdim past UNROLLED_RDIM_MAX that no
+        input's full rdim names (HelionScheduling.create_kernel_choices())."""
+        devices = {
+            device.type
+            for node in features.scheduler_nodes()
+            if (device := node.get_device()) is not None
+        }
+        if (
+            devices == {"cuda"}
+            and inductor_config.cuda_backend == "helion"
+            and inductor_config.triton.persistent_reductions
+            and not cooperative_reduction
+        ):
+            looped = LOOPED_REDUCTIONS
+            if (
+                config.backend == "cute"
+                and V.graph.sizevars.statically_known_leq(
+                    features.reduction_numel, PERSISTENT_SOFTMAX_RDIM
+                )
+                and rereads_softmax_rdim(features)
+            ):
+                looped = looped - OrderedSet(["online_softmax_reduce"])
+            if not any(
+                isinstance(node.node, ComputedBuffer)
+                and (
+                    node.node.get_reduction_type() in looped
+                    or node.node._split_size is not None
+                )
+                for node in features.scheduler_nodes()
+            ):
+                return True
         return InductorChoices.should_use_persistent_reduction(
             features, cooperative_reduction
         )
 
+    @staticmethod
+    def mix_order_reductions(
+        node1: BaseSchedulerNode, node2: BaseSchedulerNode
+    ) -> bool:
+        """Whether, with cuda_backend "helion", node1 and node2 reduce one
+        [x, r] array along both dims, over r at each x and over x at each r,
+        which HelionScheduling fuses into one kernel that reads the array once
+        (codegen_mix_order_reduction()). RMSNorm's backward reads grad and x
+        in its reduction over r, sum(grad * w * x, -1), and in its weight's
+        gradient, sum(grad * x * rstd, 0), over x: unfused, the second reads
+        them again. Inductor's check (MixOrderReduction.can_fuse()), which
+        it applies to its Triton kernels only: sibling reductions that read a
+        common buffer in full, one over a contiguous r of up to 16384, the
+        other a sum or product in a float dtype, over enough data that the
+        second read would not come from L2 (5 * 2**20 elements, with an x of
+        4096 or more), with config.triton.mix_order_reduction on. Helion's
+        conditions: an rdim Helion reads as one block (names_rdim()) and a
+        split of x that divides it (mix_order_split()). Neither node may
+        already be in a mix-order kernel."""
+        device = node1.get_device()
+        if not (
+            node1.is_reduction()
+            and node2.is_reduction()
+            and device is not None
+            and device.type == "cuda"
+            and inductor_config.cuda_backend == "helion"
+            and not any(
+                isinstance(node.scheduler.get_fused_node(n), FusedMixOrderReductions)
+                for node in (node1, node2)
+                for n in node.get_nodes()
+            )
+        ):
+            return False
+        # Inductor's check, whose gate on the Triton backend
+        # (_is_gpu_triton_backend()) is all that keeps it from Helion's
+        # kernels.
+        with inductor_config.patch(cuda_backend="triton"):
+            if not MixOrderReduction.can_fuse(node1, node2):
+                return False
+        contiguous = node1 if MixOrderReduction.is_contiguous_node(node1) else node2
+        xnumel, rnumel = MixOrderReduction.get_numel_rnumel(contiguous)
+        return (
+            isinstance(xnumel, sympy.Integer)
+            and isinstance(rnumel, sympy.Integer)
+            and names_rdim(rnumel)
+            and mix_order_split(int(xnumel), device) is not None
+        )
+
+    @staticmethod
+    def can_fuse(
+        scheduler: Scheduler,
+        node1: BaseSchedulerNode,
+        node2: BaseSchedulerNode,
+        shared_data_score: int,
+    ) -> bool:
+        """InductorChoices.can_fuse(), which declines nodes that share no data
+        by its count: a mix-order pair (mix_order_reductions()) reads a common
+        buffer along different dims, which the count misses. It counts for the
+        pair the elements of its array, as Inductor counts its Triton pairs."""
+        if HelionChoices.mix_order_reductions(node1, node2):
+            shared_data_score = max(
+                shared_data_score, MixOrderReduction.get_fusion_score(node1, node2)
+            )
+        return InductorChoices.can_fuse(scheduler, node1, node2, shared_data_score)
+
+    @staticmethod
+    def can_fuse_horizontal(
+        scheduler: Scheduler,
+        node1: BaseSchedulerNode,
+        node2: BaseSchedulerNode,
+        shared_data_score: int,
+    ) -> bool:
+        """InductorChoices.can_fuse_horizontal(), and a mix-order pair
+        (mix_order_reductions()) whatever the data it shares."""
+        return HelionChoices.mix_order_reductions(
+            node1, node2
+        ) or InductorChoices.can_fuse_horizontal(
+            scheduler, node1, node2, shared_data_score
+        )
+
+    @staticmethod
+    def score_fusion(
+        scheduler: Scheduler, node1: BaseSchedulerNode, node2: BaseSchedulerNode
+    ) -> Sortable:
+        """InductorChoices.score_fusion(), which ranks a mix-order pair
+        (mix_order_reductions()) by the elements of its array, as Inductor
+        ranks its Triton pairs (MixOrderReduction.get_fusion_score()), with
+        the template and node-type scores Inductor gives them. Its
+        buffer-overlap score stays the one InductorChoices computed, where
+        Inductor's score_fusion_memory() gives such a pair 0: it only breaks
+        ties of the memory score."""
+        # InductorChoices.score_fusion() returns a FusionScore, typed Sortable.
+        score = cast(
+            "FusionScore", InductorChoices.score_fusion(scheduler, node1, node2)
+        )
+        if HelionChoices.mix_order_reductions(node1, node2):
+            return dataclasses.replace(
+                score,
+                template_score=1
+                + (node1.is_template() == inductor_config.epilogue_fusion_first),
+                node_type_score=1,
+                memory_score=MixOrderReduction.get_fusion_score(node1, node2),
+            )
+        return score
+
+    def reduction_split_factor(
+        self,
+        device: torch.device,
+        reduction_numel_hint: int,
+        numel_hint: int,
+        inner_reduction: bool,
+    ) -> int:
+        """Inductor's number of chunks for a split reduction, moved to the
+        nearest number, within a factor of 2, that divides the rdim: the first
+        kernel then reads whole chunks, with no mask past the end of the rdim.
+        var_mean over N, H and W of a channels-last [128, 144, 56, 56], an rdim
+        of 401408, in Inductor's 591 chunks of 680 (472 past the end):
+
+            for tile_y, tile_x in hl.tile([591, 144]):
+                for tile_r in hl.tile(680):
+                    tmp3 = hl.load(in0, [tile_x.index.reshape([tile_x, 1])
+                        + 144*(((tile_r.index + 680*tile_y.index.reshape(
+                        [tile_y, 1, 1])) % 401408))], extra_mask=tmp2...)
+
+        and in 512 chunks of 784, a tile of a view of in0 with no mask:
+
+            for tile_y, tile_x in hl.tile([512, 144]):
+                for tile_r in hl.tile(784):
+                    tmp0 = in0[tile_y, tile_r, tile_x]"""
+        split = super().reduction_split_factor(
+            device, reduction_numel_hint, numel_hint, inner_reduction
+        )
+        if device.type != "cuda" or inductor_config.cuda_backend != "helion":
+            return split
+        layout = HelionChoices.layout_split(reduction_numel_hint, numel_hint)
+        if layout is not None and (
+            split > 1 or reduction_numel_hint * numel_hint >= MIN_LAYOUT_SPLIT_VALUES
+        ):
+            if split <= layout:
+                return layout
+            # Fewer runs than Inductor's chunks, which it counts to fill the
+            # GPU: each run cut into k chunks, k a divisor of the run, so that
+            # the chunks number about Inductor's and each stays in one run, a
+            # tile of a view all the same. x.mean((0, 2, 3)) of an NCHW
+            # [8, 32, 256, 256], 8 runs of 65536 per channel, takes Inductor's
+            # 16 chunks as 2 per run,
+            #     for tile_z, tile_y, tile_x in hl.tile([32, 8, 2]):
+            #         for tile_r in hl.tile(32768):
+            #             tmp0 = in0[tile_z, tile_y, tile_x, tile_r]
+            # 26 us on a B200 (quick autotune), where one chunk per run,
+            # hl.tile([32, 8]) over runs of 65536, took 53 us.
+            run = reduction_numel_hint // layout
+            pieces = [d for d in sympy.divisors(run) if layout * d <= 2 * split]
+            return layout * min(pieces, key=lambda d: abs(layout * d - split))
+        if split <= 1 or reduction_numel_hint % split == 0:
+            return split
+        divisors = [
+            d
+            for d in sympy.divisors(reduction_numel_hint)
+            if max(2, split // 2) <= d <= 2 * split
+        ]
+        return min(divisors, key=lambda d: abs(d - split), default=split)
+
+    @staticmethod
+    def layout_split(reduction_numel: int, numel: int) -> int | None:
+        """The split of the reduction V.graph.current_node lowers into chunks
+        of one contiguous run of its input each (contiguous_run()), as
+        Inductor asks whether to split it: sum, var_mean and the like over N,
+        H and W of an NCHW [32, 256, 56, 56] in 32 chunks of H * W. Inductor's
+        split then reduces each run of 3136 values first, a tile of a view of
+        the input, and the 32 partials of each channel after, with its own
+        math (create_multilayer(), split Welford), where its split of the flat
+        reduction index runs its chunks across N. The first kernel reads the
+        runs as the 8192 rdims of a view (N and C, whose strides join):
+
+            for tile_r in hl.tile(3136):
+                tmp0 = in0[tile_x, tile_r].to(torch.float32)
+
+        rather than in0[3136*tile_x + 802816*(tile_r.index // 3136) + ...],
+        whose division and remainder keep the loads from being vectors. The
+        split is asked of whether Inductor would split (Helion cannot reduce
+        over N and H * W apart in one kernel; reduction_split_factor() takes
+        it where Inductor would not only for MIN_LAYOUT_SPLIT_VALUES values
+        or more), but not of the second reduction, over the partials, nor of another reduction than the
+        node's own: None then, and when the run is the whole reduction (a
+        contiguous rdim), shorter than MIN_SPLIT_RUN, or the input's layout is
+        not static."""
+        node = V.graph.current_node
+        if node is None or node.op != "call_function" or isinstance(node.target, str):
+            return None
+        normalized = normalize_function(
+            node.target, node.args, node.kwargs, normalize_to_only_use_kwargs=True
+        )
+        if normalized is None:
+            return None
+        x, dims = normalized.kwargs.get("input"), normalized.kwargs.get("dim")
+        if isinstance(dims, int):
+            dims = [dims]
+        if (
+            not isinstance(x, torch.fx.Node)
+            or not isinstance(value := x.meta.get("val"), torch.Tensor)
+            or not isinstance(dims, (list, tuple))
+            or not dims
+            or not all(isinstance(n, int) for n in (*value.shape, *value.stride()))
+        ):
+            return None
+        rnumel = math.prod(value.shape[d % value.dim()] for d in set(dims))
+        run = contiguous_run(value, dims)
+        if (
+            rnumel != reduction_numel
+            or value.numel() != rnumel * numel
+            or not MIN_SPLIT_RUN <= run < rnumel
+        ):
+            return None
+        return rnumel // run
+
     def uuid(self) -> None:
-        # The FX graph cache key already holds what use_native_matmul() reads:
-        # Inductor's cuda_backend, and helion.inductor.config, which
-        # helion.inductor registers with Inductor.
+        # The FX graph cache key already holds what these choices read:
+        # Inductor's config (cuda_backend, triton.*), and helion.inductor.config,
+        # which helion.inductor registers with Inductor.
         return None

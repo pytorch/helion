@@ -957,6 +957,8 @@ _UNRECOVERABLE_RUNTIME_ERROR_RE: re.Pattern[str] = re.compile(
                 "misaligned address",
                 "unspecified launch failure",
                 "illegal instruction",
+                "UR_RESULT_ERROR_DEVICE_LOST",
+                "ZE_RESULT_ERROR_DEVICE_LOST",
             ],
         )
     ),

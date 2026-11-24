@@ -370,7 +370,7 @@ class MissingEnableTile(BaseError):
 class CuteBackendUnavailable(BaseError):
     message = (
         "The 'cute' backend cannot run in this environment: {0}\n"
-        "The cute backend requires nvidia-cutlass-dsl >= 4.7.0, the "
+        "The cute backend requires nvidia-cutlass-dsl >= 4.8.1, the "
         "apache-tvm-ffi package, and CUDA >= 13."
     )
 

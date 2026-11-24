@@ -23,6 +23,51 @@ if TYPE_CHECKING:
 pytestmark = pytest.mark.cpu_only
 
 
+def test_transposed_s8_load_emits_valid_mlir() -> None:
+    cutlass = pytest.importorskip("cutlass")
+    from cutlass._mlir.dialects import func
+    import cutlass.cute as cute
+
+    from helion._compiler.cute._mlir_compat import ir
+    from helion._compiler.cute._paged_attention_runtime import _load_transposed_s8_16x16
+
+    with ir.Context(), ir.Location.unknown():
+        module = ir.Module.create()
+        with ir.InsertionPoint(module.body):
+            function = func.FuncOp("load_transposed_s8", ([], []))
+        with ir.InsertionPoint(function.add_entry_block()):
+            pointer = cute.make_ptr(
+                cutlass.Int8, 1024, cute.AddressSpace.smem, assumed_align=16
+            )
+            registers = _load_transposed_s8_16x16(pointer)
+            assert len(registers) == 2
+            assert all(str(register.ir_value().type) == "i32" for register in registers)
+            func.ReturnOp([])
+        assert module.operation.verify()
+        assert "nvvm.ldmatrix" in str(module)
+
+
+def test_scaled_s8_conversion_emits_valid_mlir() -> None:
+    cutlass = pytest.importorskip("cutlass")
+    from cutlass._mlir.dialects import func
+
+    from helion._compiler.cute._mlir_compat import ir
+    from helion._compiler.cute._paged_attention_runtime import _scaled_s2f6x2_to_bf16x2
+
+    with ir.Context(), ir.Location.unknown():
+        module = ir.Module.create()
+        with ir.InsertionPoint(module.body):
+            function = func.FuncOp("scaled_s8_conversion", ([], []))
+        with ir.InsertionPoint(function.add_entry_block()):
+            packed = _scaled_s2f6x2_to_bf16x2(
+                cutlass.Int32(0x807F), cutlass.Int32(0x7F7F)
+            )
+            assert str(packed.ir_value().type) == "i32"
+            func.ReturnOp([])
+        assert module.operation.verify()
+        assert "nvvm.convert.s2f6x2.to.bf16x2" in str(module)
+
+
 def _plan(
     width: int = 64,
     *,

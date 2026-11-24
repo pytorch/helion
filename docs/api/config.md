@@ -33,6 +33,12 @@ The `Config` class represents kernel optimization parameters that control how He
 
 Configs are typically discovered automatically through autotuning, but can also be manually specified for more control.
 
+Choose the backend with `backend=` or `HELION_BACKEND` before tuning; it is
+a {doc}`settings` choice, not a `Config` parameter. Config keys and their
+meaning can differ between backends. Retune for the selected backend and
+hardware instead of reusing another backend's explicit configs. See
+{doc}`../backends` for status and selection guidance.
+
 ## Configuration Parameters
 
 ### Block Sizes and Resources
@@ -187,8 +193,9 @@ settings between configurations.
    - ``"tensor_descriptor"``: TMA box prefetches of the tile the subscript describes, from a
      tensor map the host builds (requires Hopper+ GPU); a prefetch keeps the pointer form when a
      box cannot describe it (a gather, an extra mask, box rows not a multiple of 16 bytes), when
-     its tensor is not a kernel input or a view at its start (one host code allocates), under the
-     cudaMallocAsync allocator, and for a call whose tensor has no 16-byte aligned base
+     its tensor is not a kernel input or a view starting a multiple of 16 bytes past one (not a
+     tensor host code allocates), under the cudaMallocAsync allocator, and for a call whose
+     tensor has no 16-byte aligned base
 ```
 
 ### Epilogue Optimization

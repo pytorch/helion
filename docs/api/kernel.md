@@ -19,7 +19,11 @@ A `Kernel` object is typically created via the `@helion.kernel` decorator. It ma
 - **Caching** of compiled kernels
 - **Execution** with automatic argument binding
 
-The kernel compilation process converts Python functions using `helion.language` constructs into optimized Triton GPU kernels.
+The kernel compilation process converts Python functions using
+`helion.language` constructs into device code through the selected backend
+(Triton by default). Choose it with `HELION_BACKEND` or the `backend=`
+decorator argument; the latter takes precedence. See {doc}`../backends` for
+supported backends and hardware recommendations, including CuTe on B200/B300.
 
 ### Host tensor aliases and storage proofs
 
@@ -231,11 +235,12 @@ bound = kernel.bind(args)
 # set a specific configuration
 bound.set_config(helion.Config(block_sizes=[64], num_warps=8))
 
-# generate Triton code for the bound kernel
-triton_code = bound.to_triton_code(config)
-print(triton_code)
+# generate source for the selected backend
+code = bound.to_code(config)
+print(code)
 ```
 
+(standalone-export)=
 ### Standalone Export
 
 Export a kernel with its launcher and helpers so it can run without Helion:
@@ -419,7 +424,7 @@ the explicit configuration from the fresh bound. A callable
 returned directly by `compile_config` remains the compiled program for that
 trace and configuration; it does not perform argument rebinding.
 
-By default (`static_shapes=True`), Helion treats shapes and strides as compile-time constants, baking them into generated Triton code for the best performance. To reuse a single compiled kernel across size variations, set `static_shapes=False`, which instead buckets each dimension as `{0, 1, ≥2}` and allows more inputs to share the same cache entry.
+By default (`static_shapes=True`), Helion treats shapes and strides as compile-time constants, baking them into generated code for the best performance. To reuse a single compiled kernel across size variations, set `static_shapes=False`, which instead buckets each dimension as `{0, 1, ≥2}` and allows more inputs to share the same cache entry.
 
 ```{note}
 Dynamic buckets also track whether any tensor exceeds the ``torch.int32`` indexing limit so that cache entries diverge as soon as large inputs show up. Set ``index_dtype=torch.int64`` on the kernel to avoid this.
@@ -444,9 +449,8 @@ Settings control **how the kernel is compiled** and the development environment:
 ```python
 @helion.kernel(
     # Settings parameters
-    autotune_effort="none",      # Skip autotuning for development
-    autotune_effort="quick",     # Smaller autotuning budget when search is enabled
-    print_output_code=True,       # Debug: show generated Triton code
+    autotune_effort="quick",     # Use "none" to skip autotuning for development
+    print_output_code=True,       # Debug: show generated code
     print_repro=True,             # Debug: show Helion kernel code, config, and caller code as a standalone repro script
     static_shapes=True,           # Compilation optimization strategy
     autotune_log_level=logging.DEBUG  # Verbose autotuning output

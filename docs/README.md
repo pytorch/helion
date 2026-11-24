@@ -8,11 +8,18 @@ This directory contains the Sphinx documentation for the Helion project.
 
 ### Prerequisites
 
-Install the documentation dependencies:
+Use Python **3.11 or newer** for the documentation toolchain. CI builds and
+deploys with Python **3.14**. From the repository root, install the pinned
+documentation dependencies in your active environment:
 
 ```bash
 pip install -e ".[docs]"
 ```
+
+The docs extra pins a compatible set of Sphinx tools. The PyTorch theme
+currently limits Sphinx to 7.2.6, which also constrains Docutils, MyST and
+autodoc-typehints. Upgrade these together when the theme supports a newer
+Sphinx.
 
 ### Building the Documentation
 

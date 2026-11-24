@@ -110,7 +110,7 @@ def _versions(*, driver: str = "590.00") -> dict[str, object]:
         "torch": "2.10.0.dev",
         "torch_cuda": "13.0",
         "triton": "3.6.0",
-        "cutlass_dsl": "4.7.0",
+        "cutlass_dsl": "4.8.1",
         "cuda_driver": driver,
         "cuda_stack": {
             "distribution_versions": dict(common.CUDA_STACK_DISTRIBUTION_VERSIONS),

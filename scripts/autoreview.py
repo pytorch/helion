@@ -207,7 +207,7 @@ Check for:
   fine, and so is keeping a documented lowering that computes what Triton
   computes, such as fp32 `/`, `torch.sigmoid` or the default of
   `dot_precision`). Adding config options, and changing those of
-  experimental backends such as CuTe, is fine.
+  non-stable backends such as CuTe, is fine.
 - Tests against AGENTS.md's "Test Budget Rules": tests that only inspect
   generated source but do not bind on CPU in a `cpu_only` module; parametrize
   grids above 8 cases without a reason or `pairwise`; tests that spawn

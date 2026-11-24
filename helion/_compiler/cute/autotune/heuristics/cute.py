@@ -1457,10 +1457,7 @@ def _register_tile_lane_split_orders_memory(
     # those inputs' host origins (``opaque_access_target``).
     with host_function:
         if intra_loop_raw_reread_block_ids(
-            graphs,
-            device_ir.root_ids,
-            device_ir.grid_block_ids,
-            carries=env.backend.intra_loop_barriers_carry_iterations,
+            graphs, device_ir.root_ids, device_ir.grid_block_ids, env.backend
         ):
             return True
         shared: set[int] = set()
@@ -2637,14 +2634,25 @@ class CutePersistentLaneUnrollHeuristic(AutotunerHeuristic):
 
 
 def _masked_persistent_row(
-    env: CompileEnvironment, row_block_size: int
+    env: CompileEnvironment, row_block_size: int, *, rollable: bool = False
 ) -> tuple[int, int, int] | None:
     """The row and reduction block ids and the row's length, for a kernel
     whose one reduction runs persistent (no ``reduction_loops`` slot may roll
     it, ``cute_lone_row_reduction``) over a static, masked row longer than a
-    warp, beside one tile axis whose block may be ``row_block_size``."""
+    warp, beside one tile axis whose block may be ``row_block_size``.  With
+    ``rollable``, also a row whose one ``reduction_loops`` slot may roll it,
+    which a seed then leaves persistent (``reduction_loops`` None)."""
     spec = env.config_spec
     blocks = cute_lone_row_reduction(spec, spec.cute_reduction_reloads)
+    rolled = False
+    if blocks is None and rollable:
+        blocks = cute_lone_row_reduction(
+            spec,
+            spec.cute_reduction_reloads,
+            spec.cute_vector_widths,
+            rollable=True,
+        )
+        rolled = True
     if blocks is None:
         return None
     row_block_id, reduction_block_id = blocks
@@ -2656,6 +2664,11 @@ def _masked_persistent_row(
         return None
     row_spec = cast("Any", spec.block_sizes[0])
     if not row_spec.min_size <= row_block_size <= row_spec.max_size:
+        return None
+    # A row matched as rollable may take fewer rows per CTA than the
+    # search's floor (25216 rows of 192 exceed the grid budget at one row
+    # per CTA); a persistent row keeps its seeds below it, as before.
+    if rolled and row_block_size < row_spec.autotuner_min:
         return None
     return row_block_id, reduction_block_id, size
 
@@ -2671,16 +2684,19 @@ class CutePersistentUnpaddedRowsHeuristic(AutotunerHeuristic):
     warps per 768-wide row.  The primary seed takes the widest vector the
     row's narrowest loaded element allows (8 for bf16: 96 threads for 768
     columns) that leaves whole warps, the alternate the next narrower one
-    (4: 192 threads); both run one row per CTA with register reloads.  Only
-    a row no ``reduction_loops`` slot may roll is seeded
-    (``_masked_persistent_row``), and no row an ``hl.reduce`` reduces, which
-    keeps its padding (``cute_user_reduce_block_ids``): a rollable row of the
-    same width (a plain softmax over 768 columns) takes the knob too, but no
-    seed offers it the whole-warp thread count, which the search's
-    power-of-two thread counts never reach.  The knob's search choices open
-    on the kernel's structure, not on these seeds.  They only seed: the
-    unpadded row sums in another order and contracts its multiply-adds
-    differently (see ``cute_unpadded_rows`` in ``Config``).
+    (4: 192 threads); both run one row per CTA with register reloads.  A row
+    one ``reduction_loops`` slot may roll is seeded too, persistent
+    (``reduction_loops`` None), where normalization keeps it so (a row within
+    ``reduction_loop_limits``: 1024 elements, 32 for an arg reduction): a
+    LayerNorm over 768 columns with two dropout masks (better-benchmark's
+    mean_var_236af) as one row of 96 threads (three warps) per CTA takes
+    10.9 us against 12.2 us for the one-trip loop over the row the search
+    settled on, which the search's power-of-two thread counts never reach.
+    No row an ``hl.reduce`` reduces is seeded, which keeps its padding
+    (``cute_user_reduce_block_ids``).  The knob's search choices open on the
+    kernel's structure, not on these seeds.  They only seed: the unpadded row
+    sums in another order and contracts its multiply-adds differently (see
+    ``cute_unpadded_rows`` in ``Config``).
     """
 
     name = "cute_persistent_unpadded_rows"
@@ -2699,7 +2715,7 @@ class CutePersistentUnpaddedRowsHeuristic(AutotunerHeuristic):
         spec = env.config_spec
         if not spec.supports_config_key("cute_unpadded_rows"):
             return None
-        row = _masked_persistent_row(env, cls.ROW_BLOCK_SIZE)
+        row = _masked_persistent_row(env, cls.ROW_BLOCK_SIZE, rollable=True)
         if row is None:
             return None
         row_block_id, reduction_block_id, size = row
@@ -2762,7 +2778,20 @@ class CutePersistentUnpaddedRowsHeuristic(AutotunerHeuristic):
                 ),
                 "cute_unpadded_rows": True,
             }
-            seeds.append(Config(**seed))
+            if spec.reduction_loops:
+                seed["reduction_loops"] = [None]
+            config = Config(**seed)
+            # Normalization rolls a persistent slot past its limit
+            # (reduction_loop_limits: 1024 elements on CuTe, 32 for an arg
+            # reduction), and turns the knob off for the loop it makes: the
+            # seed would be a padded loop the search reaches anyway.
+            normalized = spec.normalized_config(config).config
+            if normalized.get("cute_unpadded_rows") is not True:
+                continue
+            seeds.append(config)
+        # Possibly none (a row past the limit): an empty list seeds nothing,
+        # where None would send the framework to get_seed_config(), which
+        # plans the seeds again.
         return seeds
 
 
@@ -5484,10 +5513,7 @@ class CuteDelinearizedRowReductionHeuristic(AutotunerHeuristic):
         reduced_block_id, source, index, dim = match
         spec = env.config_spec
         # A 32-byte vector is one load on SM100+, two 16-byte ones before.
-        capability = spec.target_device_capability
-        packet_bytes = _CUTE_VECTOR_MAX_BYTES * (
-            2 if capability is not None and capability >= (10, 0) else 1
-        )
+        packet_bytes = target_facts.widest_packet_bytes(spec.target_device_capability)
         # A loop that does not start at 0 (``hl.tile(3, rows)``) loads no
         # aligned packet: the lowering needs the lane base a multiple of V.
         vec = (
@@ -6849,11 +6875,13 @@ class CuteReductionLaneJamHeuristic(AutotunerHeuristic):
     def is_eligible(cls, env: CompileEnvironment, device_ir: DeviceIR) -> bool:
         """Also requires a packet the jam can prove (``_packet_lanes``: a
         dynamic shape leaves the lane loop rolled, and the seed's knob would
-        change nothing), an N-D grid tile (the jam takes the lane index as
-        the tile offset plus the lane; a one-axis tile lays out flattened
-        unless the planner keeps it N-D, ``cute_nd_tile_loops``, and its
-        lanes index through an alias of the flattened offset, which the jam
-        keeps rolled), every block size to tile a root grid axis (the seed tiles
+        change nothing), an N-D grid tile (where this seed is measured: a
+        one-axis tile lays out flattened unless the planner keeps it N-D,
+        ``cute_nd_tile_loops``, and its lanes, which index through a copy of
+        the flattened offset, jam when the knob is set
+        (``_read_lane_index_copies``), as CutePrivatizeAtomicsHeuristic's jam
+        seed sets it on a one-axis grid tile), every block
+        size to tile a root grid axis (the seed tiles
         them by its lanes or by 1, which would leave a device loop's block
         one element on one thread) and every block the seed sets to have its
         slots: threads for all, a reload mode for the reduction.  Nor may a
@@ -7013,10 +7041,7 @@ class CuteReductionLaneJamHeuristic(AutotunerHeuristic):
         # whole, twice
         # ``_CUTE_VECTOR_MAX_BYTES`` from sm_100 on: its loads would stay
         # scalar.
-        capability = spec.target_device_capability
-        packet_bytes = _CUTE_VECTOR_MAX_BYTES * (
-            2 if capability is not None and capability >= (10, 0) else 1
-        )
+        packet_bytes = target_facts.widest_packet_bytes(spec.target_device_capability)
         seeds = [primary]
         for width in cls.ALTERNATE_VECTOR_WIDTHS:
             if (
@@ -7278,7 +7303,46 @@ class CuteMaskedRolledClusterHeuristic(AutotunerHeuristic):
     retains the original row bound on its loads and reduction inputs. Seed
     both one wide chunk and several short chunks at the same register
     footprint so the search can compare load scheduling and occupancy.
+
+    Those seeds cache each thread's slice in registers for the later sweeps
+    (``cute_reduction_reloads`` ``register``), so they size the cluster for
+    ``REGISTER_TARGET_ELEMENTS`` elements of the row per thread and drop a
+    seed above ``REGISTER_MAX_ELEMENTS``: a wide row takes a large cluster.
+    Each thread count is also seeded with the later sweeps reading the CTA's
+    slice again from global memory (``gmem``; it is still in L2), with no
+    cache to hold, at ``GMEM_ELEMENTS`` elements per thread, twice the
+    register target and so half the cluster up to the cap of 16 (both are
+    16 at 262144 bf16 columns and 128 threads), in chunks of
+    ``GMEM_PACKETS_PER_CHUNK`` packets per thread of the widest vector load,
+    at ``GMEM_THREADS_PER_SM`` resident threads per SM.  The search cannot
+    reach that point from a register seed one knob at a time: each knob
+    alone is slower.  Measured on B200 (750 W) at better-benchmark's softmax
+    ``amax_sum_7079`` (bf16 ``[8192, 262144]``) in the final selection's
+    steady windows, against the 256-thread register seed's best config
+    (cluster 16, one 16384-element chunk, three blocks per SM):
+
+        + gmem reloads                                  +7.5%
+        + 128 threads                                   +2.5%
+        + eight blocks per SM                           +0.1%
+        + 16-element vectors                            -3.3%
+        256-thread gmem seed (cluster 8, chunks of 8192,
+        four blocks per SM, 16-element vectors), tuned  -6.2%
+
+    That gmem config is slower again with cluster 16 (+19%), with 128 threads
+    and eight blocks per SM (+21%), with 8-element vectors (+4%) or with
+    three blocks per SM (+7%); its 128 elements per thread spill under
+    register reloads (+190%).
     """
+
+    # A register seed's elements of the row per thread: what its cluster is
+    # sized for, and the most a seed keeps.
+    REGISTER_TARGET_ELEMENTS = 64
+    REGISTER_MAX_ELEMENTS = 128
+    # A gmem seed's elements of the row per thread, its chunk's packets per
+    # thread, and its resident threads per SM.
+    GMEM_ELEMENTS = 128
+    GMEM_PACKETS_PER_CHUNK = 2
+    GMEM_THREADS_PER_SM = 1024
 
     name = "cute_masked_rolled_cluster"
     backend = "cute"
@@ -7303,10 +7367,8 @@ class CuteMaskedRolledClusterHeuristic(AutotunerHeuristic):
             return []
         spec = env.config_spec
         reduction = cast("ReductionLoopSpec", spec.reduction_loops[0])
-        if spec.target_device_capability is None or spec.target_device_capability < (
-            9,
-            0,
-        ):
+        capability = spec.target_device_capability
+        if capability is None or capability < (9, 0):
             return []
         numel = env.specialize_expr(env.block_sizes[reduction.block_id].numel)
         if not isinstance(numel, sympy.Integer):
@@ -7314,18 +7376,57 @@ class CuteMaskedRolledClusterHeuristic(AutotunerHeuristic):
         extent = int(numel)
         if extent < 16384:
             return []
-        vec = _cute_tile_seed_vec_width_for_dtype(
-            _cute_tile_inner_block_dtype(env, device_ir, reduction.block_id)
-        )
-        if vec <= 1 or extent % vec:
+        dtype = _cute_tile_inner_block_dtype(env, device_ir, reduction.block_id)
+        vec = _cute_tile_seed_vec_width_for_dtype(dtype)
+        if dtype is None or vec <= 1 or extent % vec:
             return []
         row_block = spec.block_sizes[0].block_id
         sweeps = _rolled_row_sweeps(device_ir)
         scalar_row = _rolled_scalar_row_output(sweeps)
         online_pair = _rolled_online_pair_seedable(env, sweeps)
-        seeds: list[Config] = []
+
+        def make_seed(
+            threads: int,
+            chunk: int,
+            cluster: int,
+            width: int,
+            reload: str,
+            min_blocks: int,
+        ) -> Config:
+            return Config.from_dict(
+                {
+                    "block_sizes": [1],
+                    "num_threads": _seq_config_list(
+                        spec.num_threads,
+                        {row_block: 1, reduction.block_id: threads},
+                    ),
+                    "reduction_loops": [chunk],
+                    "cute_vector_widths": _seq_config_list(
+                        spec.cute_vector_widths, {reduction.block_id: width}
+                    ),
+                    "cute_lane_layouts": _seq_config_list(
+                        spec.cute_lane_layouts,
+                        {reduction.block_id: "strided"},
+                    ),
+                    # One entry per block with a reload slot: a slice swept
+                    # beside the row has one too.
+                    "cute_reduction_reloads": _seq_config_list(
+                        spec.cute_reduction_reloads,
+                        {reduction.block_id: reload},
+                    ),
+                    "cute_cluster_n": cluster,
+                    "cute_cluster_warp_online": online_pair,
+                    "cute_scalar_epilogue": scalar_row,
+                    "cute_min_blocks_per_mp": min_blocks,
+                }
+            )
+
+        def cluster_for(threads: int, elements: int) -> int:
+            return min(16, max(2, next_power_of_2(-(-extent // (threads * elements)))))
+
+        register_seeds: list[Config] = []
         for threads in (256, 128, 512):
-            cluster = min(16, max(2, next_power_of_2(-(-extent // (threads * 64)))))
+            cluster = cluster_for(threads, cls.REGISTER_TARGET_ELEMENTS)
             wide_chunk = next_power_of_2(extent) // cluster
             for chunk in dict.fromkeys((wide_chunk, min(wide_chunk, 4096))):
                 if chunk < threads * vec or (
@@ -7335,39 +7436,44 @@ class CuteMaskedRolledClusterHeuristic(AutotunerHeuristic):
                     continue
                 slice_len = -(-extent // (cluster * chunk)) * chunk
                 elements = slice_len // threads
-                if elements > 128:
+                if elements > cls.REGISTER_MAX_ELEMENTS:
                     continue
-                seeds.append(
-                    Config.from_dict(
-                        {
-                            "block_sizes": [1],
-                            "num_threads": _seq_config_list(
-                                spec.num_threads,
-                                {row_block: 1, reduction.block_id: threads},
-                            ),
-                            "reduction_loops": [chunk],
-                            "cute_vector_widths": _seq_config_list(
-                                spec.cute_vector_widths, {reduction.block_id: vec}
-                            ),
-                            "cute_lane_layouts": _seq_config_list(
-                                spec.cute_lane_layouts,
-                                {reduction.block_id: "strided"},
-                            ),
-                            # One entry per block with a reload slot: a
-                            # slice swept beside the row has one too.
-                            "cute_reduction_reloads": _seq_config_list(
-                                spec.cute_reduction_reloads,
-                                {reduction.block_id: "register"},
-                            ),
-                            "cute_cluster_n": cluster,
-                            "cute_cluster_warp_online": online_pair,
-                            "cute_scalar_epilogue": scalar_row,
-                            "cute_min_blocks_per_mp": 3
-                            if elements > 64
-                            else max(1, 768 // threads),
-                        }
+                register_seeds.append(
+                    make_seed(
+                        threads,
+                        chunk,
+                        cluster,
+                        vec,
+                        "register",
+                        3 if elements > 64 else max(1, 768 // threads),
                     )
                 )
+        # At 262144 bf16 columns: 256 threads in a cluster of 8 with chunks of
+        # 8192 and four blocks per SM, 128 threads in a cluster of 16 with
+        # chunks of 4096 and eight, 512 threads in a cluster of 4 with chunks
+        # of 16384 and two.
+        gmem_seeds: list[Config] = []
+        wide = target_facts.widest_packet_bytes(capability) // dtype.itemsize
+        if extent % wide == 0:
+            for threads in (256, 128, 512):
+                cluster = cluster_for(threads, cls.GMEM_ELEMENTS)
+                chunk = threads * wide * cls.GMEM_PACKETS_PER_CHUNK
+                if chunk * cluster > next_power_of_2(extent) or (
+                    spec.max_reduction_loop is not None
+                    and chunk > spec.max_reduction_loop
+                ):
+                    continue
+                gmem_seeds.append(
+                    make_seed(
+                        threads,
+                        chunk,
+                        cluster,
+                        wide,
+                        "gmem",
+                        max(1, cls.GMEM_THREADS_PER_SM // threads),
+                    )
+                )
+        seeds = [*register_seeds, *gmem_seeds]
         independent = [
             Config.from_dict(
                 deepcopy(seed.config) | {"cute_independent_reduction": True}
@@ -7376,11 +7482,12 @@ class CuteMaskedRolledClusterHeuristic(AutotunerHeuristic):
         ]
         # The register-row lowering (and the scalar epilogue's kept inputs)
         # only act when no later sweep consumes the row; elsewhere these
-        # copies would render the very same kernel as their parents.
+        # copies would render the very same kernel as their parents.  Nor do
+        # they act on a row reloaded from gmem.
         register_rows = (
             [
                 Config.from_dict(deepcopy(seed.config) | {"cute_register_row": True})
-                for seed in seeds
+                for seed in register_seeds
             ]
             if scalar_row
             else []
@@ -7399,11 +7506,13 @@ class CuteMaskedRolledClusterHeuristic(AutotunerHeuristic):
         native_redux = (
             [
                 Config.from_dict(deepcopy(seed.config) | {"cute_warp_fp32_redux": True})
-                for seed in ([*register_rows, *kept_inputs] or seeds)
+                for seed in (
+                    [*register_rows, *kept_inputs, *gmem_seeds]
+                    if register_rows
+                    else seeds
+                )
             ]
-            if has_native_redux_reduction(
-                device_ir, spec.target_device_capability, with_any=False
-            )
+            if has_native_redux_reduction(device_ir, capability, with_any=False)
             else []
         )
         return dedupe_configs(

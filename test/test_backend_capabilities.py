@@ -23,6 +23,7 @@ from helion._compiler.device_ir import IfGraphInfo
 from helion._compiler.device_ir import RootGraphInfo
 from helion._compiler.device_ir import iter_loop_graph_nodes
 from helion._compiler.per_thread_planning import _graph_used_block_ids
+from helion._testing import skipIfRefEagerMark
 from helion._testing.cute_codegen import cpu_bind
 from helion.autotuner.config_spec import BlockSizeSpec
 from helion.autotuner.config_spec import ConfigSpec
@@ -331,6 +332,7 @@ class TestLoopGraphWalker(unittest.TestCase):
 
 
 @pytest.mark.cpu_only
+@skipIfRefEagerMark("reads compiler state, which ref mode does not build")
 def test_used_block_ids_follow_roots_not_barrier_phases() -> None:
     @helion.kernel(backend="triton", static_shapes=True)
     def kernel(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:

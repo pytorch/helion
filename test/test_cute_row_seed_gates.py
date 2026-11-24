@@ -413,7 +413,9 @@ def test_warp_rows_take_the_innermost_tile_axis() -> None:
                 "cute_reduction_wide_chunk": (1, 0),
                 "cute_rolled_row_ladder": (1, 1),
                 "cute_rolled_cluster_ladder": (1, 1),
-                "cute_masked_rolled_cluster": (12, 12),
+                # Six register seeds, three gmem seeds, and each one's
+                # independent-reduction twin.
+                "cute_masked_rolled_cluster": (18, 18),
                 "cute_rolled_row_loads_first": (1, 1),
             },
             id="half row beside a wide row",
@@ -482,10 +484,14 @@ def test_masked_cluster_seeds_fill_every_reload_slot() -> None:
     assert len(spec.cute_reduction_reloads) == 2
     seeds = _seeds(CuteMaskedRolledClusterHeuristic, bound)
     assert seeds
+    modes = []
     for seed in seeds:
         reloads = seed.config["cute_reduction_reloads"]
         assert len(reloads) == 2
-        assert spec.cute_reduction_reloads.config_get(reloads, row) == "register"
+        modes.append(spec.cute_reduction_reloads.config_get(reloads, row))
+    # The register seeds come first, then the gmem seeds.
+    assert set(modes) == {"register", "gmem"}
+    assert modes[0] == "register"
     # The search takes them: a list of one entry did not transfer.
     for seed in (seeds[0], seeds[-1]):
         assert seed in spec.compiler_seed_configs

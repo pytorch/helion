@@ -42,6 +42,7 @@ import torch
 from torch.utils._sympy.symbol import SymT
 from torch.utils._sympy.symbol import symbol_is_type
 
+from ... import _compat
 from ... import exc
 from ..ast_extension import expr_from_string
 from ..ast_extension import statement_from_string
@@ -1612,6 +1613,21 @@ class CuteBackend(Backend):
     @property
     def state(self) -> BackendState:
         return BackendState.BETA
+
+    def device_recommendation(self, device: torch.device) -> str | None:
+        if (
+            device.type == "cuda"
+            and torch.version.hip is None
+            and _compat.target_device_capability(device) in ((10, 0), (10, 3))
+        ):
+            return (
+                "For better performance on NVIDIA B200/B300 GPUs, set "
+                "HELION_BACKEND=cute (or @helion.kernel(backend='cute')). "
+                "The CuTe backend requires PyTorch built with CUDA 13 or later "
+                "and Helion's CuTe dependencies; see "
+                "https://helionlang.com/backends.html."
+            )
+        return None
 
     def reserved_device_names(self) -> frozenset[str]:
         # CuTe treats `_` as a write-only discard binding. Python host

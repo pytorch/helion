@@ -656,14 +656,14 @@ class AccumulatorFact(NamedTuple):
     itemsize: int
 
 
-# A dsmem transport's limits (``cross_loop_dsmem``): rank 0's shared memory
-# opens with a header (the flag, 8 bytes, then one barrier an entry), and every
-# entry's slab together takes at most ``MAX_CLUSTER_SLAB`` bytes after it,
-# leaving the rest of what a CTA may take (227 KB on sm_100) to the kernel's
-# dynamic shared memory (past 48 KB a static array needs a ptxas of CUDA 13,
-# which Triton uses for sm_100 and up); clusters of at most
+# A dsmem transport's limits (``cross_loop_dsmem``): the cluster shared memory
+# every CTA declares opens with a header (the flag, 8 bytes, then one barrier
+# an entry), and every entry's slab together takes at most ``MAX_CLUSTER_SLAB``
+# bytes after it, leaving the rest of what a CTA may take (227 KB on sm_100) to
+# the kernel's dynamic shared memory (past 48 KB a static array needs a ptxas
+# of CUDA 13, which Triton uses for sm_100 and up); clusters of at most
 # ``MAX_CLUSTER_SIZE`` (the launcher's portable limit), one size for every
-# entry.
+# entry but local ones (one CTA's: size 1) and replicated ones (the launch's).
 CLUSTER_SMEM_HEADER = 128
 MAX_DSMEM_ENTRIES = (CLUSTER_SMEM_HEADER - 8) // 8
 
@@ -678,9 +678,9 @@ MAX_CLUSTER_SLAB = 96 * 1024
 
 
 class DsmemLayout:
-    """Rank 0's shared memory for the ``cross_loop_dsmem`` entries taken so
-    far, in candidate order: the header, then each entry's slab, 16-byte
-    aligned.  Normalize and codegen pack entries with it alike."""
+    """A CTA's cluster shared memory for the ``cross_loop_dsmem`` entries
+    taken so far, in candidate order: the header, then each entry's slab,
+    16-byte aligned.  Normalize and codegen pack entries with it alike."""
 
     def __init__(self) -> None:
         self.size: int | None = None
@@ -691,11 +691,11 @@ class DsmemLayout:
         """The limit one more entry (``nbytes`` of slab in clusters of
         ``cluster``) breaks, or None."""
         end = self._buffer() + nbytes - CLUSTER_SMEM_HEADER
-        if not 2 <= cluster <= MAX_CLUSTER_SIZE:
-            return f"clusters of {cluster} (2 to {MAX_CLUSTER_SIZE})"
+        if not 1 <= cluster <= MAX_CLUSTER_SIZE:
+            return f"clusters of {cluster} (1 to {MAX_CLUSTER_SIZE})"
         if self.entries >= MAX_DSMEM_ENTRIES:
             return f"more than {MAX_DSMEM_ENTRIES} entries"
-        if cluster != (self.size or cluster):
+        if cluster > 1 and cluster != (self.size or cluster):
             return f"clusters of {cluster}, unlike an earlier entry's"
         if end > MAX_CLUSTER_SLAB:
             return f"slabs of {end} bytes (at most {MAX_CLUSTER_SLAB})"
@@ -705,7 +705,7 @@ class DsmemLayout:
         """Take one more entry: the offsets of its slab and its barrier."""
         buffer, barrier = self._buffer(), cluster_barrier_offset(self.entries)
         self.size, self.entries, self.offset = (
-            cluster,
+            cluster if cluster > 1 else self.size,
             self.entries + 1,
             buffer + nbytes,
         )
@@ -715,17 +715,31 @@ class DsmemLayout:
         return (self.offset + 15) // 16 * 16
 
 
+def dsmem_replicated(size: int, tasks: Sequence[int | None]) -> bool:
+    """Whether a load of the whole allocation has a replicated slab
+    (``cross_loop_dsmem``; clusters of 1 in ``DsmemLayout``), its consumer
+    root's axes running ``tasks`` each (None: unknown): more than one axis of
+    several tasks, or one of other than ``size`` (else a per-rank consumer's
+    split axis, or one consumer task a key)."""
+    several = [count for count in tasks if count != 1]
+    return len(several) > 1 or (len(several) == 1 and several[0] != size)
+
+
 class DsmemSlabFacts(NamedTuple):
     """A dsmem candidate's slab under a config (``cross_loop_dsmem``): the
-    factors of its elements (the ranges its load reads) and of one producer
-    task's tile (the ranges its store writes), each an integer, a tunable
-    expression (``ConfigValueExpression``) or ``("block", i)``, the config's
+    factors of its elements (the ranges its load reads), of each store's tile
+    (the ranges it writes; a producer task's tile is their sum) and, for a
+    load of the whole allocation, its consumer root's axes (an extent and a
+    block size each), each factor an integer, a tunable expression
+    (``ConfigValueExpression``) or ``("block", i)``, the config's
     ``block_sizes[i]``.  Its 32-bit elements make ``4 * numel`` bytes, in
-    clusters of ``numel // tile``.  ``carried`` is False for a candidate that
-    breaks a rule under every config."""
+    clusters of ``numel // tile``, or of 1 when the axes' task counts make the
+    slab replicated (``dsmem_replicated``).  ``carried`` is False for a
+    candidate that breaks a rule under every config."""
 
     numel: tuple[object, ...]
-    tile: tuple[object, ...]
+    tiles: tuple[tuple[object, ...], ...]
+    axes: tuple[tuple[object, object], ...] | None = None
     carried: bool = True
 
     def evaluate(self, config: dict[str, object]) -> tuple[int, int] | None:
@@ -755,10 +769,22 @@ class DsmemSlabFacts(NamedTuple):
                 total *= value
             return total
 
-        numel, tile = product(self.numel), product(self.tile)
-        if numel is None or tile is None or numel % tile:
+        def tasks(extent: object, block: object) -> int | None:
+            count, size = product((extent,)), product((block,))
+            return None if count is None or size is None else -(-count // size)
+
+        numel, tiles = product(self.numel), [product(tile) for tile in self.tiles]
+        if numel is None or None in tiles:
             return None
-        return numel // tile, 4 * numel
+        tile = sum(t for t in tiles if t is not None)
+        if numel % tile:
+            return None
+        size = numel // tile
+        if self.axes is not None and dsmem_replicated(
+            size, list(itertools.starmap(tasks, self.axes))
+        ):
+            size = 1
+        return size, 4 * numel
 
 
 class PointwiseElementwiseFact(NamedTuple):
@@ -1328,8 +1354,8 @@ class ConfigSpec:
         self.cross_loop_tmem_prefetch: BlockIdSequence[CrossLoopTmemPrefetchSpec] = (
             BlockIdSequence()
         )
-        # One entry per allocation a launch cluster may carry between roots
-        # (TileDependencyGraph.dsmem_candidate_ids, sorted); True carries it so.
+        # One entry per load a launch cluster may carry from its allocation's
+        # stores (TileDependencyGraph.dsmem_candidates); True carries it so.
         self.cross_loop_dsmem = ListOf(BooleanFragment(), length=0)
         # Each candidate's slab facts (``cross_loop_dsmem.dsmem_slab_facts``;
         # None: codegen alone checks it), which ``normalize`` holds to the
@@ -2350,11 +2376,12 @@ class ConfigSpec:
 
     def _normalize_dsmem(self, config: dict[str, object]) -> None:
         """Turn off the ``cross_loop_dsmem`` entries whose slabs break a limit
-        of the config alone (clusters of 2 to ``MAX_CLUSTER_SIZE``, one size
-        for every entry, ``MAX_DSMEM_ENTRIES`` entries, ``MAX_CLUSTER_SLAB``
-        bytes of slabs), in candidate order as codegen takes them, so they
-        never regenerate the kernel.  A candidate without slab facts keeps
-        its entry for codegen to check."""
+        of the config alone (clusters of 1 to ``MAX_CLUSTER_SIZE``, one size
+        for every entry but local and replicated ones, ``MAX_DSMEM_ENTRIES``
+        entries, ``MAX_CLUSTER_SLAB`` bytes of slabs), in candidate order as
+        codegen takes them, so they never regenerate the kernel.  A candidate
+        whose slab has no value here (``DsmemSlabFacts``) keeps its entry for
+        codegen to check, and to count against the later entries' limits."""
         flags = list(cast("list[bool]", config["cross_loop_dsmem"]))
         # Set together from the candidates (``lower_to_device_ir``).
         assert len(self.cross_loop_dsmem_slabs) == len(flags)
@@ -2465,6 +2492,23 @@ class ConfigSpec:
                 else:
                     config[names] = [value]
 
+        # A config saved before the kernel lost its cross-loop dependencies:
+        # its cross_loop_pipeline goes, and cross_loop_tmem_prefetch, whose
+        # candidates exist only under the pipeline (the other pipeline keys
+        # are dropped where they are normalized).
+        if self.cross_loop_pipeline_retired and (
+            saved := {
+                key: config.pop(key)
+                for key in ("cross_loop_pipeline", "cross_loop_tmem_prefetch")
+                if key in config and self.supports_config_key(key)
+            }
+        ):
+            log.warning(
+                "Ignoring %s: this kernel no longer has cross-loop dependencies "
+                "(its prefetch-only roots' loads order no later write)",
+                ", ".join(f"{key}={value!r}" for key, value in saved.items()),
+            )
+
         if (
             "cross_loop_pipeline" in config
             and self.cross_loop_pipeline is None
@@ -2472,23 +2516,6 @@ class ConfigSpec:
         ):
             if _fix_invalid:
                 config.pop("cross_loop_pipeline", None)
-            elif self.cross_loop_pipeline_retired:
-                pipeline = config.pop("cross_loop_pipeline")
-                # Without the pipeline, cross_loop_tmem_prefetch has no
-                # candidates either (the other pipeline keys are dropped where
-                # they are normalized).
-                dropped = ""
-                if self.supports_config_key("cross_loop_tmem_prefetch") and (
-                    config.pop("cross_loop_tmem_prefetch", None) is not None
-                ):
-                    dropped = " and its cross_loop_tmem_prefetch"
-                log.warning(
-                    "Ignoring cross_loop_pipeline=%r%s: this kernel no longer "
-                    "has cross-loop dependencies (its prefetch-only roots' loads "
-                    "order no later write)",
-                    pipeline,
-                    dropped,
-                )
             else:
                 raise InvalidConfig(
                     "cross_loop_pipeline is available only for kernels "

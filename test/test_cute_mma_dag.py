@@ -44,6 +44,7 @@ from helion._compiler.variable_origin import BlockSizeOrigin
 from helion._compiler.variable_origin import DeviceOrigin
 from helion._testing.cute_mma_dag import CPU_DEVICE
 from helion._testing.cute_mma_dag import bind_cpu_gemm as _bind_gemm
+from helion._testing.cute_mma_dag_stored import bmm_stored
 from helion.exc import BackendUnsupported
 from helion.exc import InvalidConfig
 import helion.language as hl
@@ -6544,8 +6545,8 @@ def _head_sum_logits(
 
 
 def _head_scores_stored(q: torch.Tensor, k: torch.Tensor) -> torch.Tensor:
-    """Control: each head's bf16 ``torch.matmul`` stored as it is (the
-    store would read the unrounded fragment)."""
+    """Each head's bf16 ``torch.matmul`` stored as it is: the store rounds
+    the fragment to bf16 as it writes it."""
     M, H, N = q.size(0), hl.specialize(q.size(1)), k.size(0)
     hl.specialize(q.size(2))
     out = torch.empty([M, H, N], dtype=q.dtype, device=q.device)
@@ -6595,14 +6596,53 @@ def test_a_16_bit_matmul_is_a_dot_rounded_where_it_is_read() -> None:
     assert f"cutlass.Int32(md_a{column_base.index} + " in body
 
 
-def test_a_16_bit_matmul_read_as_it_is_stays_simt() -> None:
-    # A store takes the fragment's registers as they are: the unrounded
-    # fp32 product, so the program is not the owner's.
+def test_a_16_bit_matmul_stored_as_it_is_is_a_rounded_dot() -> None:
+    # The store writes the fp32 product to the bf16 out as it rounds it, so
+    # each head's matmul is a dot of the program: its staged snapshot is
+    # cutlass.BFloat16 of the fp32 registers, the rounding a pointwise reader
+    # evaluates.
     q, k = _head_sum_inputs()[:2]
     bound = _bind_fn(_head_scores_stored, (q, k))
+    program = _program(bound)
+    (dot,) = program.dots
+    assert dot.node.target is torch.ops.aten.mm.default
+    assert dag.rounded_dot_dtype(dot.node) is torch.bfloat16
+    (store,) = program.stores
+    assert program.resolve(store.frag) is program.resolve(dot.node)
+    assert bound.config_spec.cute_mma_dag is not None
+    body = _kernel_body(_source(bound, _config(64, 128, warps=4, stages=2)))
+    assert "cutlass.BFloat16(md_c" in body and SIMT_FALLBACK not in body
+
+
+def _chained_matmul(a: torch.Tensor, b: torch.Tensor, c: torch.Tensor) -> torch.Tensor:
+    """A bf16 ``torch.mm`` whose product is the operand of another dot."""
+    out = torch.empty([a.size(0), c.size(1)], dtype=a.dtype, device=a.device)
+    for tile_m in hl.tile(a.size(0)):
+        out[tile_m, :] = torch.mm(torch.mm(a[tile_m, :], b[:, :]), c[:, :])
+    return out
+
+
+def test_a_16_bit_matmul_read_by_another_dot_stays_simt() -> None:
+    # A dot takes its operand's registers as they are: the first product
+    # unrounded, so the program is not the owner's.
+    bf16 = torch.bfloat16
+    a = torch.empty((256, 64), dtype=bf16, device=CPU_DEVICE)
+    b = torch.empty((64, 64), dtype=bf16, device=CPU_DEVICE)
+    c = torch.empty((64, 64), dtype=bf16, device=CPU_DEVICE)
+    bound = _bind_fn(_chained_matmul, (a, b, c))
     with bound.env, bound.host_function:
         assert dag.match_mma_dag(bound.host_function.device_ir.graphs) is None
     assert bound.config_spec.cute_mma_dag is None
+
+
+def test_a_16_bit_bmm_stored_as_it_is_is_a_rounded_dot() -> None:
+    a = torch.empty((192, 128, 64), dtype=torch.bfloat16, device=CPU_DEVICE)
+    b = torch.empty((192, 64, 128), dtype=torch.bfloat16, device=CPU_DEVICE)
+    out = torch.empty((192, 128, 128), dtype=torch.bfloat16, device=CPU_DEVICE)
+    bound = _bind_fn(bmm_stored, (a, b, out))
+    (dot,) = _program(bound).dots
+    assert dot.node.target is torch.ops.aten.bmm.default
+    assert bound.config_spec.cute_mma_dag is not None
 
 
 # --------------------------------------------------------------------------

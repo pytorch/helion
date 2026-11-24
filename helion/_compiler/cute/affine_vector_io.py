@@ -58,6 +58,7 @@ import torch
 from ..ast_extension import iter_statements
 from ..ast_read_writes import ReadWrites
 from ..compile_environment import CompileEnvironment
+from ._ast_pass_utils import COMPARISON_CALLS
 from ._ast_pass_utils import _bound_names
 from .memory_ops import tensor_proven_base_alignment
 from .persistent_branch_vec import _DTYPE_INFO
@@ -113,9 +114,8 @@ _CASTS = frozenset(
     )
 )
 _COORDINATE_CALLS = frozenset(("cute.arch.thread_idx", "cute.arch.block_idx"))
-_COMPARISON_CALLS = frozenset(
-    f"operator.{name}" for name in ("lt", "le", "gt", "ge", "eq", "ne")
-)
+# The names of _ast_pass_utils.COMPARISON_CALLS, for the set unions below.
+_COMPARISON_CALLS = frozenset(COMPARISON_CALLS)
 # Elementwise ``cute.math`` calls, including the fast-math forms the setting
 # rewrites exp/division into (``exp2(fma(x, log2e, -m), fastmath=True)``,
 # ``div(a, b, approx=True, ftz=True)``): all pure, so a body using them still
@@ -772,8 +772,7 @@ class _Vectorizer:
                 # The RNG scalar comparison is still an operator call here;
                 # these are exactly the already supported ast.Compare forms.
                 or bool(self.register_accesses)
-                and ast.unparse(call.func)
-                in {f"operator.{op}" for op in ("lt", "le", "gt", "ge", "eq", "ne")}
+                and ast.unparse(call.func) in _COMPARISON_CALLS
                 and len(call.args) == 2
                 and not call.keywords
             ),

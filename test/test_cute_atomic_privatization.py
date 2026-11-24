@@ -50,6 +50,18 @@ def _bucket_sums(
 
 
 @helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _flat_grad_scatter(
+    grads: torch.Tensor, buckets: torch.Tensor, out: torch.Tensor
+) -> torch.Tensor:
+    """A one-axis tile: ``out[buckets[k]] += grads[:, k].sum(0)``, the flat
+    scatter-add of better-benchmark's sum_sum_sum_d2c97."""
+    for tile in hl.tile(grads.size(1)):
+        total = torch.sum(grads[:, tile].to(torch.float32), dim=0)
+        hl.atomic_add(out, [buckets[tile]], total)
+    return out
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
 def _heads_inner_scatter(
     grads: torch.Tensor, buckets: torch.Tensor, out: torch.Tensor
 ) -> torch.Tensor:
@@ -917,3 +929,14 @@ class TestCuteAtomicPrivatization(TestCase):
         self._assert_the_jam_seed_matches(
             _heads_inner_scatter, grads, buckets, expected
         )
+
+    def test_the_jam_seed_of_a_one_axis_tile_matches_eager(self) -> None:
+        # The lanes of a one-axis tile index through a copy of the lane index,
+        # which the jam reads as the index itself; four buckets give each
+        # thread's lanes cells in common.
+        torch.manual_seed(0)
+        grads = torch.randint(-4, 5, (16, 2048), device=DEVICE).to(torch.bfloat16)
+        buckets = torch.randint(0, 4, (2048,), device=DEVICE) * 7
+        expected = torch.zeros(32, device=DEVICE, dtype=torch.float64)
+        expected.index_add_(0, buckets, grads.double().sum(0))
+        self._assert_the_jam_seed_matches(_flat_grad_scatter, grads, buckets, expected)

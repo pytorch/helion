@@ -162,10 +162,6 @@ def make_precompiler(
                 # patched it to launch next (helion.runtime.triton.launcher's
                 # _patched_launch_lock).
                 cached = kernel_cache.setdefault(key, compiled_kernel)
-                if cached is not compiled_kernel:
-                    if not _get_helion_compilation_success(cached):
-                        raise cached_compile_failure_error()
-                    return True
             except Exception:
                 if not in_child_process and compiled_kernel is not None:
                     _set_helion_compilation_success(compiled_kernel, False)
@@ -179,6 +175,10 @@ def make_precompiler(
                 # (benchmark_provider._triton_compile), which counts, dumps
                 # and logs it.
                 raise
+            if cached is not compiled_kernel and not _get_helion_compilation_success(
+                cached
+            ):
+                raise cached_compile_failure_error()
             return True
 
         return finish_it

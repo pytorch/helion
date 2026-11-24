@@ -395,6 +395,96 @@ def test_the_seeds_offer_the_knob_to_the_search() -> None:
     assert set(field.search_choices) == {False, True}
 
 
+def test_a_rollable_row_is_seeded_unpadded_and_persistent() -> None:
+    # A row whose one reduction_loops slot may roll it, as helion.inductor
+    # writes rows, is seeded unpadded too, as one block (reduction_loops None):
+    # its search's power-of-two thread counts never reach 96.
+    bound = _bind_row("softmax")
+    spec = bound.config_spec
+    (reduction,) = spec.reduction_block_ids
+    assert [loop.block_id for loop in spec.reduction_loops] == [reduction]
+    assert search_surface.cute_lone_row_reduction(spec) is None
+    assert search_surface.cute_lone_row_reduction(
+        spec, spec.cute_reduction_reloads, spec.cute_vector_widths, rollable=True
+    ) == (spec.block_sizes[0].block_id, reduction)
+    layouts = [
+        (
+            seed["reduction_loops"],
+            spec.num_threads.config_get(seed["num_threads"], reduction),
+            spec.cute_vector_widths.config_get(seed["cute_vector_widths"], reduction),
+        )
+        for seed in map(dict, spec.compiler_seed_configs)
+        if seed.get("cute_unpadded_rows") is True
+    ]
+    assert layouts == [([None], 96, 8), ([None], 192, 4)], layouts
+    field = spec._flat_fields()["cute_unpadded_rows"]
+    assert set(field.search_choices) == {False, True}
+
+
+def test_a_persistent_row_is_no_rollable_one() -> None:
+    spec = _bind().config_spec
+    assert not spec.reduction_loops
+    assert search_surface.cute_lone_row_reduction(spec) is not None
+    assert search_surface.cute_lone_row_reduction(spec, rollable=True) is None
+
+
+def test_a_persistent_row_keeps_its_seeds_below_the_search_floor() -> None:
+    # 25216 rows of 768 raise the search's floor of rows per CTA above one;
+    # a persistent row keeps its seeds of one row per CTA, and only a row
+    # matched as rollable declines below the floor.
+    args = (
+        torch.empty(25216, 768, dtype=torch.bfloat16),
+        torch.empty(25216, 768),
+        123,
+    )
+    with mock_cuda_unavailable(), forbid_native_compile():
+        bound = cpu_bind(_dropout_residual_norm, args)
+    spec = bound.config_spec
+    assert cast("Any", spec.block_sizes[0]).autotuner_min > 1
+    seeds = [
+        seed
+        for seed in map(dict, spec.compiler_seed_configs)
+        if seed.get("cute_unpadded_rows") is True
+    ]
+    assert len(seeds) == 2, seeds
+
+
+def _unpadded_seeds(fn: object, *args: torch.Tensor) -> list[dict[str, object]]:
+    bound = helion.kernel(
+        fn,
+        backend="cute",
+        static_shapes=True,
+        autotune_effort="none",
+        ignore_warnings=[exc.FastMathUnused],
+    )
+    with mock_cuda_unavailable(), forbid_native_compile():
+        spec = cpu_bind(bound, args).config_spec
+    return [
+        seed
+        for seed in map(dict, spec.compiler_seed_configs)
+        if seed.get("cute_unpadded_rows") is True
+    ]
+
+
+def test_a_rollable_row_past_the_loop_limit_is_not_seeded() -> None:
+    # Normalization rolls a persistent slot past reduction_loop_limits (1024
+    # elements, 32 for an arg reduction) and turns the knob off for the loop:
+    # neither a softmax over 1536 columns nor an argmax over 768 is seeded.
+    assert _unpadded_seeds(_softmax, torch.empty(19, 1536, dtype=torch.bfloat16)) == []
+    assert _unpadded_seeds(_row_argmax, torch.empty(19, 768)) == []
+
+
+def test_a_rollable_row_declines_below_the_search_floor() -> None:
+    # A softmax over rows of 192 is seeded at one row per CTA (96 threads of
+    # two elements); 25216 such rows raise the search's floor of rows per CTA
+    # to two, where a row matched as rollable takes no seed below it.
+    x = torch.empty(1000, 192, dtype=torch.bfloat16)
+    assert len(_unpadded_seeds(_softmax, x)) == 1
+    assert (
+        _unpadded_seeds(_softmax, torch.empty(25216, 192, dtype=torch.bfloat16)) == []
+    )
+
+
 @functools.cache
 def _outputs(unpadded: bool) -> tuple[torch.Tensor, ...]:
     args = dropout_residual_norm_args(768, DEVICE)

@@ -415,7 +415,7 @@ class NodeArgsGraphInfo(GraphInfo):
 @dataclasses.dataclass
 class ForLoopGraphInfo(NodeArgsGraphInfo):
     block_ids: list[int]
-    # Precomputed by GenerateAST._compute_inter_loop_barriers: True iff a
+    # Precomputed by mark_intra_loop_raw_barriers: True iff a
     # tl.debug_barrier() must be emitted immediately before this for-loop's
     # outer prefix to order the accesses of the previous sibling for-loops in
     # this scope before its own.  Not copied across graph copies; recomputed.
@@ -4539,14 +4539,14 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
             # and then overwrites it) cannot be warp-specialized (see
             # intra_loop_raw_reread_block_ids); its slot stays in the config
             # space pinned to None.
-            reread_block_ids = intra_loop_raw_reread_block_ids(
-                device_ir.graphs,
-                device_ir.root_ids,
-                device_ir.grid_block_ids,
-                atomics=backend.intra_loop_barriers_order_atomics,
-                carries=backend.intra_loop_barriers_carry_iterations,
-                reads=backend.intra_loop_barriers_order_reads,
-            )
+            # The walk reads the IR's task origins (index ranges).
+            with HostFunction.current().lent_device_ir(device_ir):
+                reread_block_ids = intra_loop_raw_reread_block_ids(
+                    device_ir.graphs,
+                    device_ir.root_ids,
+                    device_ir.grid_block_ids,
+                    backend,
+                )
             for spec in warp_specialize_specs:
                 if reread_block_ids.intersection(spec.block_ids):
                     spec.pinned = True
@@ -4716,7 +4716,7 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
                             CrossLoopTmemPrefetchSpec(block_ids)
                         )
                 if config_spec.supports_config_key("cross_loop_dsmem"):
-                    config_spec.cross_loop_dsmem.length = len(graph.dsmem_candidate_ids)
+                    config_spec.cross_loop_dsmem.length = len(graph.dsmem_candidates)
                     config_spec.cross_loop_dsmem_slabs = dsmem_slab_facts(
                         graph, device_ir.root_ids
                     )

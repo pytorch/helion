@@ -29,11 +29,7 @@ def _(state: CodegenState) -> list[ast.AST]:
         "_cute_float4_e2m1fn_x2_to_float32({value})",
         value=state.ast_arg(0),
     )
-    result = state.codegen.lift(call, dce=True, prefix="fp4_pair")
-    return [
-        expr_from_string(f"{result.id}[0]"),
-        expr_from_string(f"{result.id}[1]"),
-    ]
+    return state.tuple_results(call, 2, prefix="fp4_pair")
 
 
 @_decorators.codegen(load_float4_e2m1fn_x16_to_float16, "cute")
@@ -61,8 +57,7 @@ def _(state: CodegenState) -> list[ast.AST]:
         "_cute_float4_e2m1fn_x16_to_float16({value})",
         value=qword,
     )
-    result = state.codegen.lift(call, dce=True, prefix="fp4_lanes")
-    return [expr_from_string(f"{result.id}[{i}]") for i in range(16)]
+    return state.tuple_results(call, 16, prefix="fp4_lanes")
 
 
 @_decorators.codegen(load_bfloat16_x16_to_float16, "cute")
@@ -96,5 +91,4 @@ def _(state: CodegenState) -> list[ast.AST]:
         q2=qwords[2],
         q3=qwords[3],
     )
-    result = state.codegen.lift(call, dce=True, prefix="bf16_lanes")
-    return [expr_from_string(f"{result.id}[{i}]") for i in range(16)]
+    return state.tuple_results(call, 16, prefix="bf16_lanes")

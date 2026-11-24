@@ -15,6 +15,8 @@ from helion._testing.cute_codegen import forbid_native_compile
 from helion._testing.cute_codegen import mock_cuda_unavailable
 import helion.language as hl
 
+pytestmark = pytest.mark.cpu_only
+
 # CuTe's generated launcher resolves kernel annotations and DSL primitives in
 # module globals. Keep these optional imports available there while allowing
 # the pure AST tests in this file to run without the SDK.
@@ -296,16 +298,16 @@ module {{
             "builtin.module(nvvm-attach-target{chip=sm_100},core-to-llvm-prepare,"
             "one-shot-convert-to-llvm{index-bitwidth=64})"
         ).run(module.operation)
-        conversions = [
-            line for line in str(module).splitlines() if "nvvm.cvt.packfloat" in line
-        ]
+        # CuTe 4.8.1 uses nvvm.convert operations. Their pretty printer omits
+        # default rounding/saturation attributes, so inspect the generic form.
+        source = module.operation.get_asm(print_generic_op_form=True)
+        conversion_source = "f16" if source_dtype == "f16" else "f32"
+        conversion_op = f'"nvvm.convert.{conversion_source}x2.to.f8x2"'
+        conversions = [line for line in source.splitlines() if conversion_op in line]
         assert len(conversions) >= 2
         assert all("rn>" in line and "satfinite>" in line for line in conversions)
-        if source_dtype == "f16":
-            assert all(
-                "from = #nvvm.packfloat_type<f16x2>" in line for line in conversions
-            )
-        else:
+        assert all(f"dstTy = {destination_dtype}" in line for line in conversions)
+        if source_dtype == "bf16":
             # Current CUTLASS first widens BF16 exactly to FP32. A later
             # direct-BF16 instruction path must preserve this scalar contract.
             assert "bf16 to f32" in str(module)
@@ -326,6 +328,7 @@ def _convert_rows(
     return output, maxima
 
 
+@pytest.mark.cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @skipUnlessCuteAvailable("requires CuTe DSL")
 @pytest.mark.parametrize("dtype", [torch.float8_e4m3fn, torch.float8_e5m2])
@@ -397,6 +400,7 @@ def test_cuda_fp8_conversion_packets_match_scalar(
     )
 
 
+@pytest.mark.cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @skipUnlessCuteAvailable("requires CuTe DSL")
 @pytest.mark.parametrize("source_dtype", [torch.bfloat16, torch.float16])
@@ -464,6 +468,7 @@ def _quantize_twice(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     return first, second
 
 
+@pytest.mark.cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @skipUnlessCuteAvailable("requires CuTe DSL")
 @pytest.mark.parametrize("vec_width", [2, 4, 8, 16])

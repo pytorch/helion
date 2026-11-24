@@ -52,6 +52,7 @@ from .._utils import triton_is_available
 from ..language.constexpr import ConstExpr
 from .backend import BackendState
 from .backend_registry import get_backend
+from .backend_registry import warn_backend_recommendations
 from .fake_tensor import create_fake_tensor_mode
 from .source_location import SourceLocation
 from .source_location import current_location
@@ -170,7 +171,6 @@ class TensorDescriptorLayoutGuard:
 class TensorDescriptorAlignmentGuard:
     memory_op_indices: set[int] = dataclasses.field(default_factory=set)
     atomic_op_indices: set[int] = dataclasses.field(default_factory=set)
-    requires_zero_storage_offset: bool = False
     # A prefetch's box form (``prefetch_indexing`` "tensor_descriptor") can
     # read the input: it needs only an aligned base.
     prefetch: bool = False
@@ -770,6 +770,7 @@ class CompileEnvironment:
             warn_once(
                 f"The '{self._backend.name}' backend is experimental and may have limited functionality.",
             )
+        warn_backend_recommendations(self._backend, device)
         # For dynamic kernels, keep 0/1 tensor dimensions symbolic so a kernel
         # first seen with size 0 or 1 can be reused for larger sizes.
         self.shape_env = _GuardedShapeEnv(
@@ -812,6 +813,13 @@ class CompileEnvironment:
         # A storage replacement makes both old and new storage ambiguous even
         # before a join is registered, including for ordinary tensor pairs.
         self._invalidated_storage_provenance: set[torch.UntypedStorage] = set()
+        # Fresh allocations whose layout torch builds itself (every fresh
+        # factory but the ``*_strided`` ones), with their layout at allocation
+        # (``allocation_is_non_overlapping``).
+        self._torch_laid_out_allocations: dict[
+            torch.Tensor,
+            tuple[tuple[int | torch.SymInt, ...], tuple[int | torch.SymInt, ...]],
+        ] = {}
         # A host-selected tensor can change layout without changing the input
         # signature. Derived host results must not inherit a representative
         # layout, even when input shapes and strides are otherwise static.
@@ -969,11 +977,12 @@ class CompileEnvironment:
         self.tensor_descriptor_layout_guards: dict[
             Source, TensorDescriptorLayoutGuard
         ] = {}
+        # By ``tensor_descriptor_alignment_key``: one guard for an input's own
+        # accesses and one for the views derived from it.
         self.tensor_descriptor_alignment_guards: dict[
-            Source, TensorDescriptorAlignmentGuard
+            tuple[Source, bool], TensorDescriptorAlignmentGuard
         ] = {}
-        self.bound_tensor_descriptor_alignments: dict[Source, bool] = {}
-        self.bound_prefetch_alignments: dict[Source, bool] = {}
+        self.bound_tensor_descriptor_alignments: dict[tuple[Source, bool], bool] = {}
         self.runtime_input_specializations: dict[str, RuntimeInputSpecialization] = {}
         # Original inputs/proxies are retained only until frontend compilation
         # completes. Identity witnesses never become serialized cache-key data.
@@ -1320,20 +1329,19 @@ class CompileEnvironment:
         # the address rounded down.  Other tensor-descriptor backends retain
         # their existing legality checks and must not acquire this runtime
         # specialization.
-        alignment_source = (
-            self.tensor_descriptor_alignment_source(fake_tensor)
+        alignment_key = (
+            self.tensor_descriptor_alignment_key(fake_tensor)
             if self.backend.uses_triton_compiler and self.device.type in ("cuda", "xpu")
             else None
         )
-        if alignment_source is not None:
+        if alignment_key is not None:
             alignment_guard = self.tensor_descriptor_alignment_guards.setdefault(
-                alignment_source, TensorDescriptorAlignmentGuard()
+                alignment_key, TensorDescriptorAlignmentGuard()
             )
             if memory_op_index is not None:
                 alignment_guard.memory_op_indices.add(memory_op_index)
             if atomic_op_index is not None:
                 alignment_guard.atomic_op_indices.add(atomic_op_index)
-            alignment_guard.requires_zero_storage_offset |= not has_direct_source
 
         if not has_direct_source:
             return
@@ -1362,11 +1370,12 @@ class CompileEnvironment:
     def register_prefetch_alignment_guard(self, fake_tensor: torch.Tensor) -> None:
         """Key the bound kernel on the base alignment of an input a prefetch
         can read as TMA boxes: its tensor map needs a 16-byte aligned base on
-        every launch."""
+        every launch, and nothing else (a prefetch of a view derived from the
+        input too keys the input's own guard)."""
         source = self.tensor_descriptor_alignment_source(fake_tensor)
         if source is not None:
             self.tensor_descriptor_alignment_guards.setdefault(
-                source, TensorDescriptorAlignmentGuard()
+                (source, False), TensorDescriptorAlignmentGuard()
             ).prefetch = True
 
     def prefetch_base_is_aligned(self, fake_tensor: torch.Tensor) -> bool | None:
@@ -1377,13 +1386,13 @@ class CompileEnvironment:
         source = self.tensor_descriptor_alignment_source(fake_tensor)
         if source is None:
             return None
-        return self.bound_prefetch_alignments.get(source)
+        return self.bound_tensor_descriptor_alignments.get((source, False))
 
     def tensor_descriptor_base_is_aligned(self, fake_tensor: torch.Tensor) -> bool:
         """Whether a tensor descriptor can prove its runtime base is 16B aligned."""
-        source = self.tensor_descriptor_alignment_source(fake_tensor)
-        if source in self.bound_tensor_descriptor_alignments:
-            return self.bound_tensor_descriptor_alignments[source]
+        key = self.tensor_descriptor_alignment_key(fake_tensor)
+        if key in self.bound_tensor_descriptor_alignments:
+            return self.bound_tensor_descriptor_alignments[key]
         runtime_value = self.runtime_value_for_tensor(fake_tensor)
         if _concrete_tensor_base_is_aligned(runtime_value):
             return True
@@ -1427,9 +1436,11 @@ class CompileEnvironment:
     def tensor_storage_input_source(self, fake_tensor: torch.Tensor) -> Source | None:
         """Find a unique input owner for a whole-storage runtime predicate.
 
-        Unlike pointer alignment, storage-span disjointness also applies to
-        nonzero-offset views. The caller must still establish its registered,
-        cache-key-backed runtime predicate on the returned input Source.
+        Storage-span disjointness applies to a view at any offset (pointer
+        alignment only to one a multiple of 16 bytes past its owner,
+        ``tensor_descriptor_alignment_source``). The caller must still
+        establish its registered, cache-key-backed runtime predicate on the
+        returned input Source.
         """
         source = self.tensor_input_source(fake_tensor)
         if source is not None and _is_supported_tensor_input_source(source):
@@ -1508,34 +1519,38 @@ class CompileEnvironment:
     ) -> Source | None:
         """Find the input whose base-alignment predicate applies to ``fake_tensor``.
 
-        A zero-offset, statically exact view has the same data pointer as its
-        unique input storage owner.  Layout legality remains a separate proof;
-        this only lets the descriptor reuse that owner's runtime alignment guard.
+        A statically exact view starting a constant multiple of 16 bytes past
+        its unique input storage owner (e.g. a row-block slice of a weight) has
+        a 16-byte aligned base exactly when that owner does.  Layout legality
+        remains a separate proof; this only lets the descriptor reuse that
+        owner's runtime alignment guard.
         """
         owner = self.tensor_alignment_owner(fake_tensor)
-        if owner is None or owner[1] != 0:
+        if owner is None or owner[1] % 16 != 0:
             return None
         return owner[0]
+
+    def tensor_descriptor_alignment_key(
+        self, fake_tensor: torch.Tensor
+    ) -> tuple[Source, bool] | None:
+        """The alignment guard a descriptor of ``fake_tensor`` reuses: its
+        ``tensor_descriptor_alignment_source`` and whether it is a view derived
+        from that input.  Such a view's guard also requires the input at a zero
+        storage offset: there the view's storage offset, which the trace fixes,
+        is its distance past the input."""
+        source = self.tensor_descriptor_alignment_source(fake_tensor)
+        if source is None:
+            return None
+        return source, source != self.tensor_input_source(fake_tensor)
 
     def snapshot_tensor_descriptor_alignments(
         self, root_values: typing.Mapping[str, object]
     ) -> None:
         """Capture descriptor base-alignment facts for this bound kernel."""
         self.bound_tensor_descriptor_alignments = {
-            source: _concrete_tensor_satisfies_alignment_guard(
-                value, guard.requires_zero_storage_offset
-            )
-            for source, guard in self.tensor_descriptor_alignment_guards.items()
-            if (guard.memory_op_indices or guard.atomic_op_indices)
-            and (value := _replay_tensor_input_source(source, root_values)) is not None
-        }
-        # A prefetch needs only the base aligned, whatever a descriptor guard
-        # sharing the input requires.
-        self.bound_prefetch_alignments = {
-            source: _concrete_tensor_base_is_aligned(value)
-            for source, guard in self.tensor_descriptor_alignment_guards.items()
-            if guard.prefetch
-            and (value := _replay_tensor_input_source(source, root_values)) is not None
+            key: _concrete_tensor_satisfies_alignment_guard(value, key[1])
+            for key in self.tensor_descriptor_alignment_guards
+            if (value := _replay_tensor_input_source(key[0], root_values)) is not None
         }
 
     def tensor_input_source(self, fake_tensor: torch.Tensor) -> Source | None:
@@ -1886,6 +1901,33 @@ class CompileEnvironment:
         """
         return fake_tensor.untyped_storage() in self._zero_filled_allocation_storages
 
+    def allocation_is_non_overlapping(self, tensor: torch.Tensor) -> bool:
+        """Whether ``tensor`` is a fresh wrapper allocation whose layout torch
+        builds itself, unchanged since: distinct elements at distinct addresses
+        in every call, whatever its sizes.  ``torch.empty`` / ``zeros`` /
+        ``ones`` / ``full`` / ``new_*`` lay out contiguously (or in a memory
+        format), the ``*_like`` factories, ``clone`` and ``constant_pad_nd``
+        as a permutation of a dense layout (``torch.empty_permuted``), even
+        for a non-dense input; only the ``*_strided`` factories take the
+        caller's strides.  The tensor itself, not a view of its storage, whose
+        metadata may differ."""
+        entry = self._torch_laid_out_allocations.get(tensor)
+        if entry is None:
+            return False
+        if tensor.untyped_storage() in self._invalidated_storage_provenance:
+            return False
+        sizes, strides = entry
+        if len(sizes) != tensor.dim():
+            return False
+        return all(
+            itertools.starmap(
+                self.known_equal,
+                zip(
+                    (*sizes, *strides), (*tensor.size(), *tensor.stride()), strict=True
+                ),
+            )
+        )
+
     def tensor_has_runtime_layout(self, tensor: torch.Tensor) -> bool:
         return tensor.untyped_storage() in self._runtime_layout_storages
 
@@ -2185,6 +2227,11 @@ class CompileEnvironment:
         if result_storage in argument_storages:
             return
         self._fresh_allocation_storages.add(result_storage)
+        if factory not in (torch.empty_strided, torch.Tensor.new_empty_strided):
+            self._torch_laid_out_allocations[result] = (
+                tuple(result.size()),
+                tuple(result.stride()),
+            )
         if _factory_fills_positive_zero(factory, args, kwargs):
             self._zero_filled_allocation_storages.add(result_storage)
         is_exact = False

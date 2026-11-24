@@ -51,11 +51,11 @@ def pdl_launch_dependents() -> None:
     or after the last one to trigger at exit (host loops do not count). Between
     two top level device loops of a kernel whose loops run as one persistent
     megakernel with static or claimed task dispatch, each program triggers at
-    the later loop's block (or the first resident block after it, when that
-    loop's tasks continue an earlier loop's); elsewhere (packet dispatch, the
-    barrier pipeline, no megakernel) such a call triggers at exit. The next
-    kernel's launch then overlaps the rest of this one, while its wait still
-    follows this kernel's end.
+    the later loop's block (or, when that loop's tasks continue an earlier
+    loop's, the first resident block after it, at exit if none follows);
+    elsewhere (packet dispatch, the barrier pipeline, no megakernel) such a call
+    triggers at exit. The next kernel's launch then overlaps the rest of this
+    one, while its wait still follows this kernel's end.
     """
     raise exc.NotInsideKernel
 

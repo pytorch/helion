@@ -18,6 +18,7 @@ from ...language import _decorators
 from ...language.quantized_ops import float4_e2m1fn_x2_to_float32
 from ...language.quantized_ops import load_bfloat16_x16_to_float16
 from ...language.quantized_ops import load_float4_e2m1fn_x16_to_float16
+from .. import loop_dependency_checker
 from ..ast_extension import create
 from ..ast_extension import expr_from_string
 from ..compile_environment import CompileEnvironment
@@ -96,11 +97,7 @@ def _(state: CodegenState) -> list[ast.AST]:
         ],
         keywords=[],
     )
-    result = state.codegen.lift(call, dce=True, prefix="fp4_pair")
-    return [
-        expr_from_string(f"{result.id}[0]"),
-        expr_from_string(f"{result.id}[1]"),
-    ]
+    return state.tuple_results(call, 2, prefix="fp4_pair")
 
 
 _FP4X16_TO_F16_ASM = """
@@ -125,15 +122,13 @@ _FP4X16_TO_F16_ASM = """
 
 @_decorators.codegen(load_float4_e2m1fn_x16_to_float16, "triton")
 def _(state: CodegenState) -> list[ast.AST]:
-    from ..loop_dependency_checker import emit_intra_loop_raw_barrier
-
     storage = state.proxy_arg(0)
     if not isinstance(storage, torch.Tensor):
         raise exc.InvalidAPIUsage(
             "hl.load_float4_e2m1fn_x16_to_float16 expects tensor storage"
         )
     # A store of another thread earlier in its loop may reach it.
-    emit_intra_loop_raw_barrier(state, storage)
+    loop_dependency_checker.emit_intra_loop_raw_barrier(state, storage)
     group_offset = state.ast_arg(1)
     extra_mask = state.ast_args[2]
     base = state.device_function.tensor_arg(storage).name
@@ -173,8 +168,7 @@ def _(state: CodegenState) -> list[ast.AST]:
         ],
         keywords=[],
     )
-    result = state.codegen.lift(call, dce=True, prefix="fp4_lanes")
-    return [expr_from_string(f"{result.id}[{i}]") for i in range(16)]
+    return state.tuple_results(call, 16, prefix="fp4_lanes")
 
 
 _BF16X16_TO_F16_ASM = """
@@ -201,15 +195,13 @@ _BF16X16_TO_F16_ASM = """
 
 @_decorators.codegen(load_bfloat16_x16_to_float16, "triton")
 def _(state: CodegenState) -> list[ast.AST]:
-    from ..loop_dependency_checker import emit_intra_loop_raw_barrier
-
     storage = state.proxy_arg(0)
     if not isinstance(storage, torch.Tensor):
         raise exc.InvalidAPIUsage(
             "hl.load_bfloat16_x16_to_float16 expects tensor storage"
         )
     # A store of another thread earlier in its loop may reach it.
-    emit_intra_loop_raw_barrier(state, storage)
+    loop_dependency_checker.emit_intra_loop_raw_barrier(state, storage)
     group_offset = state.ast_arg(1)
     extra_mask = state.ast_args[2]
     base = state.device_function.tensor_arg(storage).name
@@ -259,5 +251,4 @@ def _(state: CodegenState) -> list[ast.AST]:
         ],
         keywords=[],
     )
-    result = state.codegen.lift(call, dce=True, prefix="bf16_lanes")
-    return [expr_from_string(f"{result.id}[{i}]") for i in range(16)]
+    return state.tuple_results(call, 16, prefix="bf16_lanes")

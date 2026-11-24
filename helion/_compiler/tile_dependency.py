@@ -4737,7 +4737,8 @@ class TileDependencyGraph:
     noncanonical_axes: frozenset[int] = frozenset()
     # Symmetric allocations whose cross-rank dependencies poll tagged data.
     inband_allocation_ids: frozenset[int] = frozenset()
-    # Roots of inband stores whose words every rank's launch polls in full.
+    # Roots of inband stores every task of which each rank's launch waits for
+    # (built and explained where inband_read_roots is computed).
     inband_read_roots: frozenset[int] = frozenset()
     # Inband allocations whose words may travel as Lamport words (_lamport_failure);
     # codegen sends the ones config cross_loop_inband_protocol enables so.
@@ -4747,9 +4748,9 @@ class TileDependencyGraph:
     tagged_candidate_ids: frozenset[int] = frozenset()
     # The candidates this config enables: their dependency is "tagged".
     tagged_allocation_ids: frozenset[int] = frozenset()
-    # The cluster candidates this config carries in launch clusters
-    # (``cross_loop_dsmem``): their dependency is "cluster".
-    dsmem_allocation_ids: frozenset[int] = frozenset()
+    # The loads this config carries in launch clusters (``cross_loop_dsmem``):
+    # their dependencies on their allocations' stores are "cluster".
+    dsmem_load_ids: frozenset[int] = frozenset()
     # (root, allocation id) of each hint load (``TileAccess.hint``) that a
     # later write in its phase overlaps: without hints that write would wait.
     unordered_hint_reads: frozenset[tuple[int, int]] = frozenset()
@@ -4788,7 +4789,10 @@ class TileDependencyGraph:
     def transport(self, dependency: AccessDependency) -> Transport:
         """How the scheduler must order one dependency."""
         producer = self.accesses[dependency.producer_access_id]
-        if producer.allocation_id in self.dsmem_allocation_ids:
+        if (
+            dependency.consumer_access_id in self.dsmem_load_ids
+            and producer.kind == "store"
+        ):
             return "cluster"
         if not _crosses_ranks(producer, self.accesses[dependency.consumer_access_id]):
             return "counter"
@@ -4904,37 +4908,34 @@ class TileDependencyGraph:
         return _scatter_position(self.inband_store(allocation_id))
 
     @property
-    def dsmem_candidate_ids(self) -> tuple[int, ...]:
-        """Allocations a launch cluster may carry from one root to a later one
-        (one ``cross_loop_dsmem`` entry each, in this order): written by one
-        non-atomic store and read by one load in a later root, both on this
-        rank's own copy.  Normalize and codegen check the rest for a
-        config."""
+    def dsmem_candidates(self) -> tuple[tuple[tuple[TileAccess, ...], TileAccess], ...]:
+        """The (stores, load) pairs a launch cluster may carry from one root to
+        a later one (one ``cross_loop_dsmem`` entry each, in this order: by
+        allocation, then load): a load of this rank's own copy, in a root after
+        the one root whose plain stores to this rank's copy are every write of
+        the allocation.  Its other loads keep their counters.  Normalize and
+        codegen check the rest for a config."""
         by_allocation: dict[int, list[TileAccess]] = {}
         for access in self.accesses:
             by_allocation.setdefault(access.allocation_id, []).append(access)
         candidates = []
-        for allocation_id, accesses in sorted(by_allocation.items()):
-            if len(accesses) != 2:
-                continue
-            store, load = sorted(accesses, key=lambda a: a.kind != "store")
+        for _allocation_id, accesses in sorted(by_allocation.items()):
+            stores = tuple(access for access in accesses if access.kind == "store")
             if (
-                store.kind == "store"
-                and load.kind == "load"
-                and store.root < load.root
-                and not store.is_atomic
-                and store.owner_rank is None
-                and load.owner_rank is None
+                not stores
+                or len({store.root for store in stores}) != 1
+                or any(s.is_atomic or s.owner_rank is not None for s in stores)
             ):
-                candidates.append(allocation_id)
+                continue
+            candidates.extend(
+                (stores, load)
+                for load in accesses
+                if load.kind == "load"
+                and not load.hint
+                and load.owner_rank is None
+                and load.root > stores[0].root
+            )
         return tuple(candidates)
-
-    def dsmem_accesses(self, allocation_id: int) -> tuple[TileAccess, TileAccess]:
-        """A cluster candidate's store and load."""
-        accesses = [a for a in self.accesses if a.allocation_id == allocation_id]
-        store = next(a for a in accesses if a.kind == "store")
-        load = next(a for a in accesses if a.kind == "load")
-        return store, load
 
     def crosses_ranks(self) -> bool:
         """Whether any dependency needs a cross-rank transport."""
@@ -4977,7 +4978,7 @@ class TileDependencyGraph:
             edges=edges,
         )
 
-    def rank_digest(self, lamport: tuple[object, ...] = ()) -> str:
+    def rank_digest(self, lamport: tuple[object, ...]) -> str:
         """Hash the facts every rank must agree on; owners and regions may differ,
         so codegen adds the Lamport mailboxes those regions chose."""
         peer = self.peer_counter_graph()
@@ -5027,7 +5028,7 @@ class TileDependencyGraph:
                     }
                 )
             ),
-            *((lamport,) if lamport else ()),
+            lamport,
         )
         return hashlib.sha256(repr(facts).encode()).hexdigest()[:16]
 
@@ -6801,14 +6802,14 @@ def _inband_store_region(store: TileAccess, family: TaskFamily) -> AllocationReg
 
 
 def _surely_read_in_full(
-    store: TileAccess,
     accesses: list[TileAccess],
     task_families: tuple[TaskFamily, ...],
 ) -> bool:
-    """Whether the peer loads of an inband allocation (``store`` writes it)
-    surely read each polled rank's whole buffer: R6 with exact regions in place
-    of bounding intervals.  A region bounds each dimension apart, so a load
-    whose subscripts share a tile axis (a diagonal) does not count."""
+    """Whether the peer loads of an inband allocation surely read each polled
+    rank's whole buffer: R6 with exact regions in place of bounding intervals.
+    A region bounds each dimension apart, so a load whose subscripts share a
+    tile axis (a diagonal) does not count."""
+    store = next(access for access in accesses if access.kind == "store")
     peer_loads = [access for access in accesses if access.owner_rank is not None]
     region = _inband_store_region(store, task_families[store.root])
     return not _misses_a_polled_rank(region, peer_loads, task_families, exact=True)
@@ -6927,11 +6928,7 @@ LAMPORT_KEYS: dict[torch.dtype, int] = {
 }
 
 
-def _lamport_failure(
-    accesses: list[TileAccess],
-    task_families: tuple[TaskFamily, ...],
-    read_in_full: bool,
-) -> str | None:
+def _lamport_failure(accesses: list[TileAccess], read_in_full: bool) -> str | None:
     """Why an inband allocation's words cannot travel as Lamport words, else None.
 
     A reader zeroes the Lamport words it read in the previous launch's slot,
@@ -6942,9 +6939,13 @@ def _lamport_failure(
     store = next(access for access in accesses if access.kind == "store")
     if _scatter_position(store) is not None:
         return "a scatter (its fallback words carry the epoch)"
+    if store.has_explicit_mask:
+        # A slot the gate skipped keeps an older launch's words, unread and
+        # never re-armed.
+        return "a gated store"
     if store.dtype not in LAMPORT_KEYS:
         return f"{store.dtype}: no spare NaN encoding to mean unwritten"
-    if not read_in_full or not _surely_read_in_full(store, accesses, task_families):
+    if not read_in_full:
         return "a rank may not poll every word"
     return None
 
@@ -7301,7 +7302,8 @@ def build_tile_dependency_graph(
         if access.allocation_id in crossing_allocation_ids
         and access.allocation_id not in inband_allocation_ids
     }
-    # R6 covers each polled rank; polls at root on every rank read every task.
+    # R6 covers each polled rank; polls at root on every rank read every task,
+    # and with exact regions every word.
     inband_read_ids = {
         allocation_id
         for allocation_id in inband_allocation_ids
@@ -7318,21 +7320,20 @@ def build_tile_dependency_graph(
             if access.owner_rank is not None
         )
     }
+    read_in_full_ids = {
+        allocation_id
+        for allocation_id in inband_read_ids
+        if _surely_read_in_full(accesses_by_allocation[allocation_id], task_families)
+    }
     inband_read_roots = {
         access.root
-        for allocation_id in inband_read_ids
+        for allocation_id in read_in_full_ids
         for access in accesses_by_allocation[allocation_id]
-        if access.kind == "store"
-        and access.root not in keyed_peer_roots
-        and _surely_read_in_full(
-            access, accesses_by_allocation[allocation_id], task_families
-        )
+        if access.kind == "store" and access.root not in keyed_peer_roots
     }
     lamport_failures = {
         allocation_id: _lamport_failure(
-            accesses_by_allocation[allocation_id],
-            task_families,
-            allocation_id in inband_read_ids,
+            accesses_by_allocation[allocation_id], allocation_id in read_in_full_ids
         )
         for allocation_id in inband_allocation_ids
     }

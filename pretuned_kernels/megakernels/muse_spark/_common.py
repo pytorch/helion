@@ -18,6 +18,7 @@ SIGNAL_PAD_BYTES = 32 * 1024
 # Verify windows the sglang integration serves: DFlash2 draft lengths.
 VERIFY_TOKENS = (8, 16)
 E2M1_VALUES = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
+LOG2E = 1.4426950408889634
 HIDDEN = 8192
 EXPERT_HIDDEN = 4096
 NUM_EXPERTS = 256
@@ -29,8 +30,8 @@ MOE_TOKENS = 16
 
 @dataclasses.dataclass(frozen=True)
 class ExpertInputs:
-    """The MoE megakernel's NVFP4 input slot, which the router megakernel fills:
-    16 activation rows (the first T live, the rest zero) and T route rows."""
+    """The MoE megakernel's NVFP4 input slot, which the router fills: 16
+    activation rows (the first T live, the rest zero) and T route rows."""
 
     fp4: torch.Tensor  # [16, Ne / 2] u8
     scales: torch.Tensor  # [16, Ne / 16] u8 (E4M3 bits)
@@ -146,6 +147,107 @@ def pack_e2m1x2(low: torch.Tensor, high: torch.Tensor) -> torch.Tensor:
     )
 
 
+def _fma(a: torch.Tensor, b: torch.Tensor, c: torch.Tensor) -> torch.Tensor:
+    return hl.inline_asm_elementwise(
+        "fma.rn.f32 $0, $1, $2, $3;",
+        "=f,f,f,f",
+        [a, b, c],
+        dtype=torch.float32,
+        is_pure=True,
+        pack=1,
+    )
+
+
+def _div_full(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    return hl.inline_asm_elementwise(
+        "div.full.f32 $0, $1, $2;",
+        "=f,f,f",
+        [a, b],
+        dtype=torch.float32,
+        is_pure=True,
+        pack=1,
+    )
+
+
+def _max(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    return torch.maximum(a, b)
+
+
+def _columns(value: torch.Tensor, width: int) -> list[torch.Tensor]:
+    """Split the last axis into ``width`` tensors in increasing column order."""
+
+    if width == 1:
+        return [value.reshape(value.shape[:-1])]
+    even, odd = hl.split(value.reshape(*value.shape[:-1], width // 2, 2))
+    out: list[torch.Tensor] = []
+    for e, o in zip(_columns(even, width // 2), _columns(odd, width // 2), strict=True):
+        out.extend((e, o))
+    return out
+
+
+def _chain_sq(cols: list[torch.Tensor]) -> torch.Tensor:
+    """fmaf(v_i, v_i, acc) from acc = 0 in column order (one thread's chain)."""
+
+    acc = cols[0] * cols[0]
+    for col in cols[1:]:
+        acc = _fma(col, col, acc)
+    return acc
+
+
+def _butterfly(value: torch.Tensor, width: int) -> torch.Tensor:
+    """xor-shuffle reduction of the last axis, partner distance width/2 first.
+
+    Each size-2 sum is one commutative add, so the result equals
+    ``warp::reduce_sum<width>`` bit for bit.
+    """
+
+    lead = value.shape[:-1]
+    while width > 1:
+        value = value.reshape(*lead, 2, width // 2).sum(dim=-2)
+        width //= 2
+    return value.reshape(lead)
+
+
+def _pick(values: torch.Tensor, index: int, size: int) -> torch.Tensor:
+    """Scalar ``values[index]`` of a small vector (exact: one nonzero term)."""
+
+    return torch.sum(torch.where(hl.arange(size) == index, values, 0.0), dim=-1)
+
+
+def _route(
+    logits: torch.Tensor,
+    bias: torch.Tensor,
+    experts: torch.Tensor,
+    num_experts: int,
+    router_multiplier: float,
+    route_scale: float,
+    route_eps: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Biased sigmoid, stable top-8 (key desc, id asc), renormalized weights."""
+
+    scaled_logits = logits * router_multiplier
+    expo = exp2_approx_ftz_f32((0.0 - scaled_logits) * LOG2E)
+    score = _div_full(torch.ones_like(expo), expo + 1.0)
+    key = score + bias
+    # Order-preserving key bits (+0.0 folds -0) above the complemented id, so
+    # ties go to the lower id.
+    kbits = (key + 0.0).view(dtype=torch.int32)
+    ordered = torch.where(kbits >= 0, kbits, kbits ^ 0x7FFFFFFF).to(torch.int64)
+    packed_key = (ordered << 32) | (num_experts - 1 - experts).to(torch.int64)
+    # The keys are distinct, so one top-8 selects what eight max rounds would.
+    best8 = torch.topk(packed_key, 8)[0]
+    sel_ids = (num_experts - 1) - (best8 & 0xFFFF).to(torch.int32)
+    sel_scores = torch.sum(
+        torch.where(experts[None, :] == sel_ids[:, None], score[None, :], 0.0), dim=-1
+    )
+    score_sum = _pick(sel_scores, 0, 8) + _pick(sel_scores, 1, 8)
+    for kk in hl.static_range(2, 8):
+        score_sum = score_sum + _pick(sel_scores, kk, 8)
+    zeros8 = hl.zeros([8], dtype=torch.float32)
+    scale = _div_full(zeros8 + route_scale, zeros8 + (score_sum + route_eps))
+    return sel_scores * scale, sel_ids
+
+
 def e2m1_values(packed: torch.Tensor) -> torch.Tensor:
     """FP64 e2m1 values of e2m1x2 bytes ``[..., K / 2]`` (low nibble first)."""
     table = torch.tensor(
@@ -175,12 +277,17 @@ def round_e2m1(x: torch.Tensor) -> torch.Tensor:
     return torch.tensor(E2M1_VALUES, device=x.device)[index] * torch.sign(x)
 
 
+def dequantize_e2m1(values: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
+    """FP64 e2m1 values ``[..., K]`` times their E4M3 16-value block scales
+    ``[..., K / 16]``."""
+    block = scales.view(torch.float8_e4m3fn).to(torch.float64)
+    return (values.unflatten(-1, (-1, 16)) * block[..., None]).flatten(-2)
+
+
 def dequantize_nvfp4(packed: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
     """FP64 values of e2m1x2 bytes ``[..., K / 2]`` with E4M3 16-value block
     scales ``[..., K / 16]`` (low nibble first)."""
-    values = e2m1_values(packed)
-    block = scales.view(torch.float8_e4m3fn).to(torch.float64)
-    return (values.unflatten(-1, (-1, 16)) * block.unsqueeze(-1)).flatten(-2)
+    return dequantize_e2m1(e2m1_values(packed), scales)
 
 
 def relative_rmse_and_cosine(

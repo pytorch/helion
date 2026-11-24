@@ -24,7 +24,7 @@ from packaging.version import Version
 
 log = logging.getLogger(__name__)
 
-# The cute backend hard-requires the CuTe DSL 4.7 API generation, the
+# The cute backend hard-requires the CuTe DSL 4.8.1 API generation, the
 # apache-tvm-ffi package, and CUDA >= 13. ``check_cute_backend_requirements``
 # (wired through ``CuteBackend.validate_environment``) enforces this up front so
 # the rest of the backend can assume the modern APIs unconditionally rather than
@@ -33,7 +33,7 @@ CUTE_MIN_CUDA_VERSION = "13"
 # Central validated CuTe compatibility generation. A bump must revalidate the
 # raw tcgen05 runtime-N PTX fallback in ``cute_mma`` alongside the typed APIs;
 # the pin-consistency test makes every checked-in DSL upgrade pass this line.
-CUTE_VALIDATED_VERSION = Version("4.7.0")
+CUTE_VALIDATED_VERSION = Version("4.8.1")
 CUTE_MIN_VERSION = CUTE_VALIDATED_VERSION
 CUTE_TCGEN05_RUNTIME_N_PTX_VALIDATED_VERSION = CUTE_VALIDATED_VERSION
 L2_EVICT_LAST_STORE_ABI_VERSION = 1
@@ -226,8 +226,8 @@ def emit_producer_tail_tma_umma(
 @lru_cache(maxsize=1)
 def nvdisasm_path() -> str | None:
     """The ``nvdisasm`` binary the SASS checks disassemble with: the one the
-    ``nvidia-cuda-nvdisasm`` wheel ships (a runtime dependency of the CuTe
-    DSL, which dumps SASS through it), else one on ``PATH`` or under
+    ``nvidia-cuda-nvdisasm`` wheel ships (installed by Helion's cute extra
+    and installer through the DSL libraries' SASS extra), else one on ``PATH`` or under
     ``CUDA_HOME``; None when there is none."""
     import os
     import shutil

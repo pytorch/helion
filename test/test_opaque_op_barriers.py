@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import functools
 from typing import TYPE_CHECKING
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -351,8 +352,8 @@ def test_an_add_whose_old_value_is_used_follows_a_barrier() -> None:
 @skipIfRefEager("ref-eager mode builds no device IR")
 def test_a_load_after_an_atomic_rereads_only_where_atomics_count() -> None:
     # The walk behind the marker and the warp-specialization pinning counts
-    # the atomic as a write only with ``atomics``
-    # (``Backend.intra_loop_barriers_order_atomics``: Triton, not CuTe).
+    # the atomic as a write only with
+    # ``Backend.intra_loop_barriers_order_atomics`` (Triton, not CuTe).
     with cpu_render_target():
         bound = cpu_bind(
             helion.kernel(_atomic_then_load_in_one_body, static_shapes=True),
@@ -360,9 +361,13 @@ def test_a_load_after_an_atomic_rereads_only_where_atomics_count() -> None:
         )
     device_ir = bound.host_function.device_ir
     walk = (device_ir.graphs, device_ir.root_ids, device_ir.grid_block_ids)
+    backend = bound.env.backend
     with bound.env, bound.host_function:
-        assert intra_loop_raw_reread_block_ids(*walk, atomics=True)
-        assert not intra_loop_raw_reread_block_ids(*walk, atomics=False)
+        for atomics in (True, False):
+            with patch.object(
+                type(backend), "intra_loop_barriers_order_atomics", atomics
+            ):
+                assert bool(intra_loop_raw_reread_block_ids(*walk, backend)) is atomics
 
 
 @functools.cache

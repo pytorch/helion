@@ -7,11 +7,18 @@ from typing import cast
 
 import sympy
 from torch._inductor import config
+from torch._inductor import metrics
 from torch._inductor.codegen.common import BackendFeature
 from torch._inductor.codegen.simd import SIMDScheduling
+from torch._inductor.codegen.simd_kernel_features import DisableReduction
+from torch._inductor.codegen.simd_kernel_features import EnableReduction
 from torch._inductor.codegen.triton import TritonScheduling
 from torch._inductor.ir import Reduction
 from torch._inductor.ops_handler import OpsHandler
+from torch._inductor.scheduler import BaseSchedulerNode
+from torch._inductor.scheduler import FusedMixOrderReductions
+from torch._inductor.scheduler import MixOrderReduction
+from torch._inductor.scheduler import SchedulerNode
 from torch._inductor.utils import get_fused_kernel_name
 from torch._inductor.virtualized import V
 from torch.utils._ordered_set import OrderedSet
@@ -20,14 +27,19 @@ from torch.utils._sympy.functions import Where
 from ..._compiler._inductor.template_buffer import HelionTemplateBuffer
 from ..._compiler.backend_registry import get_backend
 from .. import config as helion_config
+from ..choices import HelionChoices
+from ..support import mix_order_split
 from ..support import numerics_modes
 from ..support import python_wrapper
 from .kernel import ARG_REDUCTIONS
 from .kernel import REDUCTIONS
+from .kernel import UNROLLED_RDIM_MAX
 from .kernel import HelionKernel
 from .overrides import HelionOverrides
+from .tiling import natural_tiling
 
 if TYPE_CHECKING:
+    from collections.abc import Iterable
     from collections.abc import Sequence
 
     import torch
@@ -35,9 +47,9 @@ if TYPE_CHECKING:
     from torch._inductor.codegen.simd import SIMDKernel
     from torch._inductor.codegen.simd_kernel_features import SIMDKernelFeatures
     from torch._inductor.ir import ComputedBuffer
-    from torch._inductor.scheduler import BaseSchedulerNode
+    from torch._inductor.scheduler import FusedSchedulerNode
     from torch._inductor.scheduler import Scheduler
-    from torch._inductor.scheduler import SchedulerNode
+    from torch._inductor.tiling_utils import CoalesceVarAnalysis
 
 
 # Ops HelionOverrides inherits from OpOverrides that mean the same in a Helion
@@ -174,6 +186,17 @@ def unsupported(node: SchedulerNode) -> list[str]:
     return missing
 
 
+def check_supported(nodes: Iterable[BaseSchedulerNode]) -> None:
+    """Raises Unsupported for a C++ or FX wrapper, or for what one of `nodes`
+    uses that HelionKernel does not support (unsupported())."""
+    if not python_wrapper():
+        raise Unsupported("cpp_wrapper" if V.graph.cpp_wrapper else "fx_wrapper")
+    if missing := OrderedSet(
+        name for node in nodes for name in unsupported(cast("SchedulerNode", node))
+    ):
+        raise Unsupported(", ".join(missing))
+
+
 class HelionScheduling(SIMDScheduling):
     """Inductor's CUDA scheduling for cuda_backend "helion", as HalideScheduling
     is for "halide": every kernel is a Helion kernel, and a kernel HelionKernel
@@ -188,10 +211,58 @@ class HelionScheduling(SIMDScheduling):
     @classmethod
     def get_backend_features(cls, device: torch.device) -> OrderedSet[BackendFeature]:
         # Only what HelionKernel emits: in-place buffers, where an output takes
-        # over the storage of an input of the kernel (call_args()). Without
+        # over the storage of an input of the kernel (kernel_params()). Without
         # the others, Inductor lowers scan, sort, bucketize and the like to
         # aten kernels rather than to ops Helion lacks.
         return OrderedSet([BackendFeature.INPLACE_BUFFERS])
+
+    @classmethod
+    def get_tiling_and_scores(
+        cls,
+        node_schedule: list[Any],
+        numel: sympy.Expr,
+        reduction_numel: sympy.Expr = sympy.S.One,
+        coalesce_analysis: CoalesceVarAnalysis | None = None,
+    ) -> tuple[dict[str, sympy.Expr], dict[str, sympy.Expr] | None]:
+        """The N-D tiling that splits the kernel's flat ranges into the dims its
+        tensors are indexed by (natural_tiling()), if it has more dims than one
+        pointwise and one reduction dim; else Inductor's. Helion tiles N-D
+        natively, and the kernel then indexes its tensors by tile instead of by
+        // and % of a flat index. For the mean over H and W of a channels-last
+        [128, 1536, 18, 18] tensor, the 1-D tiling {"x": 196608, "r0_": 324}
+        reads it at
+
+            1536*r + 497664*(tile_x.index // 1536) + tile_x.index % 1536
+
+        and this one, {"y": 128, "x": 1536, "r0_": 324}, at
+
+            1536*r + 497664*tile_y.index + tile_x.index
+
+        a tile of a [128, 324, 1536] view, which the kernel subscripts by its
+        tiles. Helion lowers the // and % of a reshaped index with sign
+        corrections (it no longer knows the index is non-negative), and the
+        backend does not see that consecutive tile_x are consecutive addresses,
+        so its loads do not vectorize. A schedule with a matmul keeps Inductor's tiling,
+        which follows the dot's dims."""
+        inductor_tiling, scores = super().get_tiling_and_scores(
+            node_schedule, numel, reduction_numel, coalesce_analysis
+        )
+        if not any(
+            isinstance(node, BaseSchedulerNode) and has_dot(node)
+            for node in node_schedule
+        ) and (dims := natural_tiling(node_schedule, numel, reduction_numel)):
+            tiling = cls.create_tiling(*dims)
+            # More than one pointwise dim beside r0_, of Integer sizes.
+            if len(tiling) > 2 and cls.tiling_is_compatible(
+                node_schedule, numel, reduction_numel, tiling
+            ):
+                # Inductor's scores, which say whether the reduction reads
+                # contiguous memory (SIMDKernelFeatures.get_reduction_hint()):
+                # without them an online softmax over rdims of 1001 elements
+                # gets the hint DEFAULT, and Triton's rule (persistent up to 64
+                # elements, not 1024) loops over them twice.
+                return tiling, scores
+        return inductor_tiling, scores
 
     @staticmethod
     def format_kernel_definition(name: str, source: str) -> str:
@@ -223,15 +294,23 @@ class HelionScheduling(SIMDScheduling):
     def codegen_node_schedule(
         self, kernel_features: SIMDKernelFeatures
     ) -> SIMDKernel[Any] | MultiKernel:
-        if not python_wrapper():
-            raise Unsupported("cpp_wrapper" if V.graph.cpp_wrapper else "fx_wrapper")
-        if missing := OrderedSet(
-            name
-            for node in kernel_features.scheduler_nodes()
-            for name in unsupported(node)
-        ):
-            raise Unsupported(", ".join(missing))
+        check_supported(kernel_features.scheduler_nodes())
         return super().codegen_node_schedule(kernel_features)
+
+    def can_fuse(self, node1: BaseSchedulerNode, node2: BaseSchedulerNode) -> bool:
+        """SIMDScheduling.can_fuse() without its check of a pointwise pair's
+        tilings (config.triton.tiling_prevents_pointwise_fusion), which
+        compares each node's tiling, from Inductor's select_tiling()
+        (BaseSchedulerNode.get_tiling()), with the pair's, from
+        natural_tiling() here (get_tiling_and_scores()): y = x.permute(0, 2,
+        3, 1).contiguous() and y * 2, a pair natural_tiling() tiles [8, 1024,
+        64], were two kernels, and y * 2 read y again. natural_tiling() cuts a
+        fused kernel's space wherever any of its nodes' accesses need it, so
+        the pair's tiling serves both nodes."""
+        with config.patch({"triton.tiling_prevents_pointwise_fusion": False}):
+            return super().can_fuse(node1, node2)
+
+    can_fuse_vertical = can_fuse
 
     def _native_matmul_row_epilogue_can_fuse(
         self, node1: BaseSchedulerNode, node2: BaseSchedulerNode
@@ -242,6 +321,53 @@ class HelionScheduling(SIMDScheduling):
         # iteration_ranges_codegen_header". Unfused, the dot and the sum are
         # Helion kernels of their own.
         return False
+
+    def can_fuse_horizontal(
+        self, node1: BaseSchedulerNode, node2: BaseSchedulerNode
+    ) -> bool:
+        # SIMDScheduling asks MixOrderReduction, which takes Triton kernels only.
+        return HelionChoices.mix_order_reductions(node1, node2) or self.can_fuse(
+            node1, node2
+        )
+
+    def fuse(
+        self, node1: BaseSchedulerNode, node2: BaseSchedulerNode
+    ) -> FusedSchedulerNode:
+        if HelionChoices.mix_order_reductions(node1, node2):
+            return FusedMixOrderReductions(node1, node2)
+        return super().fuse(node1, node2)
+
+    def codegen_mix_order_reduction(self, node: FusedMixOrderReductions) -> None:
+        """One Helion kernel for a mix-order pair, reductions over r and over x
+        of one [x, r] array (HelionChoices.mix_order_reductions()):
+        SIMDScheduling's codegen, with Helion's split of x (mix_order_split(),
+        a divisor of x, whose view [splits, split, r] the kernel indexes) in
+        place of its search over powers of two. The kernel tiles the splits
+        (tile_y) and loops over the x of a split (tile_x), reading each rdim as
+        one block; it sums the terms of the reduction over x across its split
+        into a partial, which it writes to a workspace that the wrapper reduces
+        over the splits. For RMSNorm's
+        backward over [1152000, 512]:
+            for tile_y in hl.tile(9000):
+                rdim = hl.zeros([tile_y, 512]).size(1)
+                part0 = hl.zeros([tile_y, rdim], dtype=torch.float32)
+                for tile_x in hl.tile(128):
+                    tmp3 = in2[tile_y, tile_x, :].to(torch.float32)
+                    ...
+                    out0[tile_y, tile_x, :] = tmp20.to(torch.bfloat16)
+                    part0 = part0 + torch.sum(tmp25, 1)
+                ws[0, tile_y, :] = part0
+        and then
+            buf3 = workspace_0[0 : 4608000].view(9000, 512).sum(dim=0).view([512])"""
+        check_supported(node.get_nodes())
+        numel, _ = MixOrderReduction.get_numel_rnumel(node.node1)
+        device = node.node1.get_device()
+        assert device is not None
+        split = mix_order_split(int(numel), device)
+        if split is None:
+            raise AssertionError(f"no split of an x of {numel}")
+        with config.patch({"triton.mix_order_reduction_split_size": split}):
+            super().codegen_mix_order_reduction(node)
 
     def codegen_template(
         self,
@@ -273,10 +399,48 @@ class HelionScheduling(SIMDScheduling):
     def codegen_node_schedule_with_kernel(
         self, node_schedule: list[Any], kernel: SIMDKernel[Any]
     ) -> None:
-        super().codegen_node_schedule_with_kernel(node_schedule, kernel)
+        # The nodes create_kernel_choices() emits over segments of the rdim: all
+        # of them for one segment, then the next (HelionKernel.rdim_segment()),
+        # where a node reads an earlier one's part of the segment through the
+        # CSE store cache. The first runs them; the others run within it.
+        helion_kernel = cast("HelionKernel", kernel)
+        group = [
+            node
+            for node in node_schedule
+            if isinstance(node, SchedulerNode)
+            and node.get_name() in helion_kernel.segment_nodes
+        ]
+        if group:
+            emits = {node: node.codegen for node in group}
+
+            def codegen(index_vars: Any) -> None:  # noqa: ANN401
+                ranges = {group[0]: index_vars}
+                for node in group[1:]:
+                    self._prepare_loop_body(node._body)
+                    ranges[node] = helion_kernel.split_and_set_ranges(node.get_ranges())
+                # Each segment starts from the store cache the group started
+                # with: a node that stores a buffer the group reads (x.add_(...)
+                # of a load of x) would otherwise hand the next segment its own
+                # stored part as x.
+                store_cache = dict(helion_kernel.cse.store_cache)
+                for lo, hi in helion_kernel.segments:
+                    helion_kernel.cse.store_cache.clear()
+                    helion_kernel.cse.store_cache.update(store_cache)
+                    with helion_kernel.rdim_segment(lo, hi):
+                        for node in group:
+                            emits[node](ranges[node])
+
+            setattr(group[0], "codegen", codegen)  # noqa: B010
+            for node in group[1:]:
+                setattr(node, "codegen", lambda index_vars: None)  # noqa: B010
+        try:
+            super().codegen_node_schedule_with_kernel(node_schedule, kernel)
+        finally:
+            for node in group:
+                del node.codegen
         # What only emitting the kernel shows: an indirect index that needs a
         # bounds check (HelionKernel.check_bounds()).
-        if cast("HelionKernel", kernel).needs_bounds_check:
+        if helion_kernel.needs_bounds_check:
             raise Unsupported("check_bounds")
 
     def create_kernel_choices(  # pyrefly: ignore [bad-override]
@@ -288,7 +452,109 @@ class HelionScheduling(SIMDScheduling):
         (tiling,) = kernel_args
         if not HelionKernel.supports_tiling(tiling):
             raise Unsupported(f"tiling {tiling}")
-        return [HelionKernel(*kernel_args, **kernel_kwargs)]
+        kernel = HelionKernel(*kernel_args, **kernel_kwargs)
+        if not kernel.persistent_reduction or kernel.mix_order_reduction:
+            return [kernel]
+        long_rdim = "override_persistent_reduction" not in kernel_kwargs and (
+            V.graph.sizevars.statically_known_gt(
+                kernel.numels["r0_"], UNROLLED_RDIM_MAX
+            )
+        )
+        group, earlier = self.trailing_nodes(kernel_features.node_schedule)
+        # Only a trailing node with a masked part (a cat's or pad's
+        # ops.masked()) can cut the rdim into segments.
+        cuttable = any(node._body.subblocks for node in group)
+        if not long_rdim and not cuttable:
+            return [kernel]
+        # Emitting the body tells what the kernel needs of its rdim.
+        self.codegen_node_schedule_with_kernel(kernel_features.node_schedule, kernel)
+        # The kernel emitted to tell is not the one returned below: take back
+        # the count its Kernel.__init__ added to metrics.generated_kernel_count,
+        # which tests compare with the kernels a graph launches.
+        metrics.generated_kernel_count -= 1
+        if long_rdim and kernel.uses_rdim and kernel.rdim_anchor is None:
+            # An rdim past UNROLLED_RDIM_MAX that the kernel names (rdim) but no
+            # input's full rdim does (HelionKernel.rdim_anchor) has a factory's
+            # dim, which Helion cannot roll: x.flip(-1).sum(-1) over rdims of
+            # 100000 would read each rdim as one block of 131072 lanes. Such a
+            # kernel loops over the rdim, as Triton's rule has it. A gather's
+            # rdim, in1[tmp1, :], needs no rdim name and stays one block.
+            return [
+                HelionKernel(
+                    *kernel_args, **kernel_kwargs, override_persistent_reduction=False
+                )
+            ]
+        # An rdim past UNROLLED_RDIM_MAX keeps its tail in one emission over the
+        # whole rdim, which Helion can roll: a segment's dim is a literal
+        # (HelionKernel.rdim_code()), which it cannot.
+        segmented = (
+            self.rdim_segments(group, earlier, kernel)
+            if cuttable and not long_rdim
+            else None
+        )
+        kernel = HelionKernel(*kernel_args, **kernel_kwargs)
+        if segmented is not None:
+            kernel.segment_nodes, kernel.segments = segmented
+        return [kernel]
+
+    @staticmethod
+    def trailing_nodes(
+        node_schedule: list[Any],
+    ) -> tuple[list[SchedulerNode], list[BaseSchedulerNode]]:
+        """The nodes over the rdim after a persistent reduction's last
+        reduction, which HelionScheduling.rdim_segments() may emit over
+        segments of the rdim, and the nodes before them."""
+        group: list[SchedulerNode] = []
+        earlier: list[BaseSchedulerNode] = []
+        inside = True
+        for node in node_schedule:
+            if node is DisableReduction:
+                inside = False
+            elif node is EnableReduction:
+                inside = True
+            elif isinstance(node, BaseSchedulerNode):
+                if (
+                    isinstance(node, SchedulerNode)
+                    and inside
+                    and not node.is_reduction()
+                ):
+                    group.append(node)
+                else:
+                    earlier.extend(group)
+                    group = []
+                    earlier.append(node)
+        return group, earlier
+
+    @staticmethod
+    def rdim_segments(
+        group: list[SchedulerNode],
+        earlier: list[BaseSchedulerNode],
+        kernel: HelionKernel,
+    ) -> tuple[list[str], list[tuple[int, int]]] | None:
+        """The nodes of a persistent reduction to emit over segments of the
+        rdim (HelionKernel.rdim_segment()), and the segments: the trailing
+        nodes (trailing_nodes()), when their comparisons of the rdim index cut
+        the rdim (rdim_cut_segments()) and none reads an rdim that a node before
+        them writes, whose value is the whole rdim's."""
+        segments = kernel.rdim_cut_segments(node.get_name() for node in group)
+        if segments is None:
+            return None
+        numel = sympy.Mul(
+            kernel.numels["r0_"], *(kernel.numels[axis] for axis in kernel.outer_axes)
+        )
+        earlier_full = OrderedSet(
+            name
+            for node in earlier
+            for name in node.get_buffer_names()
+            if V.graph.sizevars.statically_known_equals(
+                V.graph.get_buffer(name).get_numel(), numel
+            )
+        )
+        if any(
+            dep.name in earlier_full for node in group for dep in node.read_writes.reads
+        ):
+            return None
+        return [node.get_name() for node in group], segments
 
     def define_kernel(
         self, src_code: str, node_schedule: list[Any], kernel: SIMDKernel[Any]
