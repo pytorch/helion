@@ -1034,13 +1034,27 @@ class FragmentCompiler(
         if target is torch.ops.prims.iota.default:
             start = _resolve(node.kwargs.get("start", 0), values)
             step = _resolve(node.kwargs.get("step", 1), values)
+            # Widen the coordinate before multiplication if either the product
+            # or sum could wrap. Common small iotas keep narrow arithmetic.
+            wide = fake.dtype == torch.int64
+            if wide and isinstance(start, int) and isinstance(step, int):
+                last_delta = max(shape[0] - 1, 0) * step
+                wide = not all(
+                    -(1 << 31) <= v < (1 << 31)
+                    for v in (start, step, last_delta, start + last_delta)
+                )
+
+            def iota(coords: tuple[str, ...]) -> str:
+                coord = self.cast(coords[0], torch.int64) if wide else coords[0]
+                return self.cast(
+                    f"({self.scalar(start, wide=wide)}) + ({coord}) * ({self.scalar(step, wide=wide)})",
+                    fake.dtype,
+                )
+
             return Fragment(
                 shape,
                 fake.dtype,
-                lambda coords: self.cast(
-                    f"{self.scalar(start)} + ({coords[0]}) * {self.scalar(step)}",
-                    fake.dtype,
-                ),
+                iota,
                 pure=True,
                 affine=(start, step)
                 if len(shape) == 1

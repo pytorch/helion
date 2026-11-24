@@ -22,6 +22,7 @@ from ..ast_extension import statement_from_string
 from ..host_function import HostFunction
 from ..indexing_strategy import SubscriptIndexing
 from ..variable_origin import GridOrigin
+from .emitters.memory_access import _cute_wrap_negative_index
 from .fragment_context import DirectStoreSink
 from .fragment_context import Fragment
 from .fragment_context import FragmentContext
@@ -44,6 +45,26 @@ if TYPE_CHECKING:
 
 class FragmentMemoryEmitter(FragmentContext):
     """Loads and stores between host tensors and staged fragments."""
+
+    def tile_index_and_mask(
+        self,
+        tensor: HostTensor,
+        dim: int,
+        block: int,
+        coord: str,
+        *,
+        broadcast: bool,
+    ) -> tuple[str, str]:
+        index = f"({self.offsets[block]}) + ({coord})"
+        mask = f"(({index}) < ({self.bounds[block]}))"
+        if broadcast:
+            size = tensor.value.shape[dim]
+            if self.env.known_equal(size, 1):
+                # A bare tile broadcasts a size-one input over its live lanes.
+                # Its logical coordinate can be negative while address zero
+                # is valid. Keep the logical tail and the caller's lane mask.
+                return "0", mask
+        return index, mask
 
     def row_packet_lanes(
         self,
@@ -208,10 +229,8 @@ class FragmentMemoryEmitter(FragmentContext):
 
     def slab_scalar(self, load: ScalarLoad) -> str:
         """The uniform 0-d integer ``load`` (a slab's row offset or limit) as
-        an Int32 read once per CTA ahead of the slabs: zero when its
-        subscript is outside the tensor, like the body's own load of it.
-        (An int64 table value is narrowed: a row index or count of a static
-        extent below 2**31.)"""
+        a register of its promoted operand type. As for the body's own load, an
+        out-of-bounds subscript yields zero."""
         if load in self.slab_scalars:
             return self.slab_scalars[load]
         fake = cast("torch.Tensor", load.node.meta["val"])
@@ -231,30 +250,57 @@ class FragmentMemoryEmitter(FragmentContext):
             or "0"
         )
         name = self.df.new_var("fragment_slab_scalar")
-        self.emit(f"{name} = cutlass.Int32(0)")
+        dtype = self.dtype(load.dtype)
+        self.emit(f"{name} = {dtype}(0)")
         self.emit(
             f"if {self.predicate(masks)}:\n"
-            f"    {name} = cutlass.Int32(({tensor.name}.iterator + ({offset})).load())"
+            f"    {name} = {dtype}(({tensor.name}.iterator + ({offset})).load())"
         )
         self.slab_scalars[load] = name
         return name
 
-    def slab_member(
-        self, node: Node, shape: tuple[int, ...], dtype: torch.dtype
-    ) -> Fragment:
-        """The window *node* as a view of its staged slab."""
+    def slab_member(self, node: Node, original: Fragment) -> Fragment:
+        """The window *node* with the same lane ownership as an ordinary load."""
+        shape, dtype = original.shape, original.dtype
         group = self.slab_plan[node]
         slab = group.fragment
         assert slab is not None, "slabs are staged before the root body"
         start, extent = group.members[node]
+        if extent == 0:
+            # A zero-trip consumer still renders its body after the original
+            # index may have died. Preserve its empty domain without reading.
+            return dataclasses.replace(
+                original, element=lambda _: self.cast("0", dtype)
+            )
         offset = start - group.start
+        # The indexed result can have a padded shape (e.g. four lanes for a
+        # three-element iota). Only the logical coordinates belong to this
+        # member, even if the adjacent member occupies the same slab.
+        logical_shape = tuple(
+            extent
+            if dim == group.window_dim and extent is not None
+            else slab.shape[dim]
+            for dim, (kind, _) in enumerate(group.descriptors)
+            if (
+                extent is not None
+                if dim == group.window_dim
+                else kind not in ("const", "uniform")
+            )
+        )
+        padded = [
+            (axis, logical)
+            for axis, (size, logical) in enumerate(
+                zip(shape, logical_shape, strict=True)
+            )
+            if size > logical
+        ]
 
         def view(coords: tuple[str, ...]) -> str:
             mapped: list[str] = []
             position = 0
             for dim, (kind, _value) in enumerate(group.descriptors):
                 if dim == group.window_dim:
-                    if extent == 0:
+                    if extent is None:
                         # An integer index drops the dimension.
                         mapped.append(str(offset))
                     else:
@@ -266,19 +312,33 @@ class FragmentMemoryEmitter(FragmentContext):
                     mapped.append(coords[position])
                     position += 1
             assert position == len(coords)
-            return slab.read(tuple(mapped))
+            value = slab.read(tuple(mapped))
+            if not padded:
+                return value
+            result = self.df.new_var("fragment_slab_member")
+            self.emit(f"{result} = {self.cast('0', dtype)}")
+            live = self.predicate(
+                [
+                    f"0 <= ({coords[axis]}) and ({coords[axis]}) < {size}"
+                    for axis, size in padded
+                ]
+            )
+            self.emit(f"if {live}:\n    {result} = {value}")
+            return result
 
-        # The view keeps the slab's row order: a cast of it may be read in
-        # place by the mma lanes like the slab itself.
+        # A padded member's read emits its guard at the consumer's coordinate.
+        # Mark it nonresident so a scan materializes its input before the
+        # backedge, while an elementwise sum can read both windows in place.
         return Fragment(
             shape,
             dtype,
             view,
-            True,
+            not padded,
             (slab,),
             slab.storage,
-            cheap=True,
-            physical_row=slab.physical_row,
+            original.logical_domain,
+            cheap=not padded,
+            physical_row=None if padded else slab.physical_row,
         )
 
     def load_slab(self, group: SlabGroup) -> Fragment:
@@ -313,42 +373,70 @@ class FragmentMemoryEmitter(FragmentContext):
         offset_var = None if group.offset is None else self.slab_scalars[group.offset]
         limit_var = None if group.limit is None else self.slab_scalars[group.limit]
 
+        def window_row(start: int, extent: int, lane: str) -> str:
+            # Static windows are proved not to wrap. A device lane is Int32:
+            # widen it *before* adding a start that can cross that range.
+            if start < -(2**31) or start + extent - 1 > 2**31 - 1:
+                return f"cutlass.Int64({start}) + cutlass.Int64({lane})"
+            return f"({start}) + ({lane})"
+
         def address(coords: tuple[str, ...]) -> tuple[str, str]:
             indices: list[str] = []
             masks: list[str] = []
             for dim, (kind, value) in enumerate(group.descriptors):
                 if dim == group.window_dim:
-                    row = f"({group.start}) + ({coords[dim]})"
+                    row = window_row(group.start, group.extent, coords[dim])
                     if offset_var is not None:
                         # A window at a runtime row offset: live below the
                         # limit (in the window's own coordinates) and
                         # inside the tensor; zero past either.
+                        assert group.offset is not None
                         if limit_var is not None:
-                            masks.append(f"(({row}) < ({limit_var}))")
-                        row = f"({offset_var}) + {row}"
-                        masks.append(
-                            f"(({row}) >= 0 and ({row}) < ({self.sym(fake.shape[dim])}))"
+                            assert group.limit is not None
+                            local = self.cast(row, group.limit.dtype)
+                            masks.append(f"(({local}) < ({limit_var}))")
+                        local = self.cast(row, group.offset.dtype)
+                        row = self.cast(
+                            f"({offset_var}) + ({local})", group.offset.dtype
                         )
                     indices.append(row)
                 elif kind == "block":
-                    block = cast("int", value)
-                    expression = f"({self.offsets[block]}) + ({coords[dim]})"
-                    masks.append(f"(({expression}) < ({self.bounds[block]}))")
+                    expression, mask = self.tile_index_and_mask(
+                        tensor,
+                        dim,
+                        cast("int", value),
+                        coords[dim],
+                        broadcast=True,
+                    )
+                    masks.append(mask)
                     indices.append(expression)
                 elif kind == "slice":
                     indices.append(coords[dim])
                 elif kind == "const":
                     indices.append(str(value))
                 elif kind == "uniform":
-                    expression = self.sym(value)
-                    masks.append(
-                        f"(({expression}) >= 0 and ({expression}) < ({self.sym(fake.shape[dim])}))"
-                    )
-                    indices.append(expression)
+                    indices.append(self.sym(value))
                 else:
-                    indices.append(
-                        f"({cast('tuple[int, int]', value)[0]}) + ({coords[dim]})"
+                    start, extent = cast("tuple[int, int]", value)
+                    indices.append(window_row(start, extent, coords[dim]))
+                # Staging can precede a source-level branch. Only omit checks
+                # proved by the slab coordinates or an identical loop bound.
+                if kind == "slice" or (dim == group.window_dim and offset_var is None):
+                    continue
+                if dim != group.window_dim and kind in ("const", "window"):
+                    start, span = (
+                        (cast("int", value), 1)
+                        if kind == "const"
+                        else cast("tuple[int, int]", value)
                     )
+                    size = self.static_extent(fake.shape[dim])
+                    if size is not None and start >= 0 and start + span <= size:
+                        continue
+                index = indices[-1]
+                size_expr = self.sym(fake.shape[dim])
+                masks.append(f"(({index}) >= 0)")
+                if kind != "block" or self.bounds[cast("int", value)] != size_expr:
+                    masks.append(f"(({index}) < ({size_expr}))")
             offset = (
                 " + ".join(
                     f"cutlass.Int64({index}) * cutlass.Int64({self.host_stride(tensor, dim)})"
@@ -578,8 +666,6 @@ class FragmentMemoryEmitter(FragmentContext):
                 logical_domain=lambda coords: tensor.domain(view_coordinates(coords)),
             )
         assert isinstance(tensor, HostTensor)
-        if not store and node in self.slab_plan:
-            return self.slab_member(node, shape, output.dtype)
         index_coordinates = memory_index_coordinates(
             self.env,
             [
@@ -631,8 +717,14 @@ class FragmentMemoryEmitter(FragmentContext):
                         )
                     expression = selected_coordinates(ordinal, coords)[0]
                 elif block is not None:
-                    expression = f"({self.offsets[block]}) + ({selected_coordinates(ordinal, coords)[0]})"
-                    masks.append(f"(({expression}) < ({self.bounds[block]}))")
+                    expression, mask = self.tile_index_and_mask(
+                        tensor,
+                        dim,
+                        block,
+                        selected_coordinates(ordinal, coords)[0],
+                        broadcast=not store,
+                    )
+                    masks.append(mask)
                 elif isinstance(index, Node):
                     value = values[index]
                     if isinstance(value, Fragment) and value.shape:
@@ -655,7 +747,9 @@ class FragmentMemoryEmitter(FragmentContext):
                     else:
                         expression = self.scalar(value)
                 else:
-                    expression = self.scalar(index)
+                    expression = self.scalar(
+                        _cute_wrap_negative_index(index, tensor.value.shape[dim])
+                    )
                 tensor_indices.append(expression)
                 size = self.sym(tensor.value.shape[dim])
                 masks.append(f"(({expression}) >= 0 and ({expression}) < ({size}))")
@@ -798,6 +892,8 @@ class FragmentMemoryEmitter(FragmentContext):
             load,
             logical_domain=logical_domain if index_domains or domain_bounds else None,
         )
+        if node in self.slab_plan:
+            return self.slab_member(node, loaded_fragment)
         if defer_load:
             # A complete owner may consume this same guarded address recipe
             # directly. Retain every index/mask dependency until that read.

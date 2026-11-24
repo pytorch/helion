@@ -21,6 +21,7 @@ from helion._testing.cute_codegen import cpu_bind
 from helion._testing.cute_fragment_index_domains import dot_then_reduce
 from helion._testing.cute_fragment_index_domains import indexed_gemm
 from helion._testing.cute_fragment_index_domains import reshaped_dot_then_max
+import helion.language as hl
 
 pytestmark = pytest.mark.cpu_only
 
@@ -424,3 +425,48 @@ def test_ownership_rendering_preserves_each_predicate(expression: str) -> None:
         names = dict(zip(("a", "b", "c", "choose"), values, strict=True))
         expected = eval(expression, {"__builtins__": {}}, names) and names["c"]
         assert eval(rendered, {"__builtins__": {}}, names) == expected
+
+
+@helion.kernel(backend="cute", static_shapes=True)
+def _literal_row_windows(
+    x, table, out, src: hl.constexpr, dst: hl.constexpr, indirect: hl.constexpr
+):
+    for row in hl.grid(1):
+        cols = hl.arange(4)
+        if indirect:
+            begin = table[src]
+            values = x[row, begin + cols] + x[row, begin + (cols + 2)]
+        else:
+            values = x[src, cols] + x[src, cols + 2]
+        out[dst, :] = torch.cumsum(values + 1, dim=0)
+    return out
+
+
+@pytest.mark.parametrize(
+    ("slab", "indirect"), [(False, False), (True, False), (True, True)]
+)
+def test_literal_fragment_row_addresses_match_positive_coordinates(slab, indirect):
+    x = torch.arange(16, dtype=torch.float32).reshape(2, 8)
+    table = torch.tensor([0, 2], dtype=torch.int32)
+    out = torch.zeros(2, 4)
+
+    def source(src, dst):
+        bound = cpu_bind(_literal_row_windows, (x, table, out, src, dst, indirect))
+        return bound.to_code(
+            helion.Config(block_sizes=[], cute_fragment_slab_loads=slab),
+            output_origin_lines=False,
+        )
+
+    positive = source(1, 0)
+    assert sum(
+        "x.iterator" in line and ".load()" in line for line in positive.splitlines()
+    ) == (1 if slab else 2)
+    if indirect:
+        assert "fragment_slab_scalar" in positive
+    assert source(-1, -2) == positive
+    if slab and not indirect:
+        # A two-row tensor has no row -3. Do not issue an unguarded slab.
+        with pytest.raises(
+            exc.InvalidConfig, match="requires a complete fragment root"
+        ):
+            source(-3, 0)

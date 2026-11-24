@@ -708,7 +708,7 @@ class FragmentContext:
     def shape(self, shape: object) -> tuple[int, ...]:
         return tuple(self.extent(x) for x in cast("tuple[object, ...]", shape))
 
-    def sym(self, value: object) -> str:
+    def sym(self, value: object, *, wide: bool = False) -> str:
         if isinstance(value, str):
             return value
         if isinstance(value, (torch.SymInt, torch.SymFloat, torch.SymBool)):
@@ -718,11 +718,16 @@ class FragmentContext:
 
             def symbol_expression(symbol: sympy.Symbol) -> str:
                 if symbol in self.sym_indices:
-                    return self.sym_indices[symbol]
+                    scalar = self.sym_indices[symbol]
+                    return f"cutlass.Int64({scalar})" if wide else scalar
                 origin_info = HostFunction.current().expr_to_origin.get(symbol)
                 origin = origin_info.origin if origin_info is not None else None
                 if isinstance(origin, GridOrigin) and origin.block_id in self.offsets:
                     offset = self.offsets[origin.block_id]
+                    # A small loop may have an Int32 counter, but its value in
+                    # user arithmetic must widen before evaluating the expression.
+                    if wide:
+                        offset = f"cutlass.Int64({offset})"
                     size = self.df.resolved_block_size(origin.block_id)
                     if isinstance(origin, TileIdOrigin):
                         return f"({offset}) // {size}"
@@ -732,7 +737,8 @@ class FragmentContext:
                         )
                     if type(origin) in (GridOrigin, TileBeginOrigin):
                         return offset
-                return self.df.literal_expr(symbol)
+                scalar = self.df.literal_expr(symbol)
+                return f"cutlass.Int64({scalar})" if wide else scalar
 
             substitutions = {
                 symbol: sympy.Symbol(f"({symbol_expression(symbol)})")
@@ -741,11 +747,11 @@ class FragmentContext:
             return self.env.backend.sympy_printer_expr(value.xreplace(substitutions))
         return self.df.literal_expr(value)
 
-    def scalar(self, value: object) -> str:
+    def scalar(self, value: object, *, wide: bool = False) -> str:
         if isinstance(value, Fragment):
             assert math.prod(value.shape) == 1
             return value.read(tuple("0" for _ in value.shape))
-        return self.sym(value)
+        return self.sym(value, wide=wide)
 
     def host_stride(self, tensor: HostTensor, dim: int) -> str:
         # Fresh wrapper allocations have configured symbolic strides, which

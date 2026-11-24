@@ -47,6 +47,14 @@ for tile in hl.tile(0, 1000, block_size=64):
     pass
 ```
 
+A bare CuTe fragment tile broadcasts an input dimension that is statically
+known to have size one across its live lanes. An explicit lane mask still
+applies to each lane: with four live lanes, an all-true mask and an input
+of one, the sum is four. Eager reference mode slices the input and can
+instead produce one. A store does not broadcast a singleton destination.
+A negative integer literal counts from the end of its dimension; for
+example, `out[-1, :] = row` writes the last row.
+
 **Grid vs Loop Behavior**:
 - When used at the top level of a kernel function, `tile()` becomes the grid of the kernel (parallel blocks)
 - When used nested inside another loop, it becomes a sequential loop within each block

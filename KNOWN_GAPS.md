@@ -542,3 +542,23 @@ these labelled lines.
   transcendental; judging it takes timings of its own.
 - Pinned by: `test/test_autotuner_heuristics.py::TestPointwiseGatheredSlab::test_rolled_copy_of_an_op_reads_its_index_in_the_enclosing_graph`
   (`slab_numel == 576`).
+
+## ref-eager-singleton-tile-load
+
+- Area: Eager reference indexing and CuTe fragment loads of a statically
+  known size-one axis.
+- What is wrong: With `x = torch.ones(1)` and `hl.tile(4, block_size=4)`,
+  the compiled bare-tile load broadcasts across all four live lanes and
+  sums to 4. Eager mode slices the tensor and sums to 1. An explicit
+  all-true lane mask gives the same discrepancy. This does not apply
+  to a coordinate tensor or a store to a singleton destination.
+- Since: Triton and eager already differed on main at `362b7b182`.
+  Ordinary CuTe already broadcast these loads. Computed CuTe fragments
+  now use the same rule when the input extent is provably one.
+- Why deferred: The user chose “Preserve the documented broadcast (4);
+  track the eager mismatch separately.” Changing eager tile slicing and
+  explicit-mask evaluation is a separate change.
+- Pinned by: `test_singleton_tile_broadcast_feeds_fragment_sum_and_scan`
+  and `test_masked_singleton_tile_applies_each_lane_mask` in
+  `test/test_cute_fragment_value_codegen.py` check the compiled rule.
+  No test requires the eager discrepancy.

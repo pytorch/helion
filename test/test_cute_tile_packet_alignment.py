@@ -13,6 +13,7 @@ also requires each complete packet to stay inside its tile interval.
 from __future__ import annotations
 
 import re
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -22,7 +23,9 @@ from helion._testing import skipUnlessBackends
 from helion._testing.cute_codegen import cpu_bind
 from helion._testing.cute_codegen import mock_cuda_unavailable
 from helion._testing.cute_fragment_simulator import simulate_independent_fragment
+from helion._testing.cute_output_addresses import generated_output_address_coverage
 import helion.language as hl
+from helion.runtime.ref_mode import RefMode
 
 pytestmark = [pytest.mark.cpu_only, skipUnlessBackends(["cute"])]
 PACKET = "ir.VectorType.get([8], cutlass.Uint16.mlir_type)"
@@ -369,8 +372,10 @@ def _nested_fragment_scan(x, out, starts, start: hl.constexpr, stop: hl.constexp
 
 
 @helion.kernel(backend="cute", static_shapes=True)
-def _root_fragment_scan(x, out, begin: hl.constexpr, stop: hl.constexpr):
-    for tile in hl.tile(begin, stop):
+def _root_fragment_scan(
+    x, out, begin: hl.constexpr, stop: hl.constexpr, width: hl.constexpr = None
+):
+    for tile in hl.tile(begin, stop, block_size=width):
         out[tile] = torch.cumsum(x[tile] + 1, dim=0)
     return out
 
@@ -439,3 +444,31 @@ def test_fragment_partial_packet_preserves_shifted_scan_canaries(vector):
     expected = torch.full_like(out, -73.0)
     expected[4:9] = torch.tensor([3.0, 6.0, 9.0, 12.0, 3.0])
     torch.testing.assert_close(out, expected, rtol=0, atol=0)
+
+
+def test_fixed_root_scan_matches_configured_tiles_at_both_boundaries() -> None:
+    x = torch.arange(16, dtype=torch.int32)
+    out = torch.full_like(x, -97)
+    args = (x, out, 3, 16)
+    with mock_cuda_unavailable():
+        bound = cpu_bind(_root_fragment_scan, (*args, 4))
+        with patch.object(_root_fragment_scan.settings, "ref_mode", RefMode.EAGER):
+            bound.run_ref(*args, 4)
+        fixed = bound.to_code(helion.Config(block_sizes=[]), output_origin_lines=False)
+        tuned = cpu_bind(_root_fragment_scan, (*args, None)).to_code(
+            helion.Config(block_sizes=[4]), output_origin_lines=False
+        )
+
+    expected = torch.cat(
+        [torch.full((3,), -97), *((tile + 1).cumsum(0) for tile in x[3:].split(4))]
+    )
+    assert torch.equal(out, expected)
+    for code in (fixed, tuned):
+        launch = re.search(
+            r"_launcher\(\w+, \((\d+),\), x, out, block=\((\d+), 1, 1\)\)", code
+        )
+        assert launch is not None
+        blocks, threads = map(int, launch.groups())
+        assert generated_output_address_coverage(
+            code, "out", blocks, threads
+        ) == dict.fromkeys(range(3, 16), 1)
