@@ -299,6 +299,75 @@ def _tile_argmax_over_one(x: torch.Tensor) -> torch.Tensor:
     return out
 
 
+def _tile_plus_block_size(x: torch.Tensor, lookup: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tile_a, tile_b in hl.tile(x.size()):
+        out[tile_a, tile_b] = x[tile_a, tile_b] + tile_b.block_size
+    return out
+
+
+def _tile_plus_lookup(x: torch.Tensor, lookup: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tile_a, tile_b in hl.tile(x.size()):
+        out[tile_a, tile_b] = x[tile_a, tile_b] + lookup[tile_b.block_size // 2]
+    return out
+
+
+def _tile_plus_numel(x: torch.Tensor, lookup: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tile_a, tile_b in hl.tile(x.size()):
+        tile = x[tile_a, tile_b]
+        out[tile_a, tile_b] = tile + tile.numel()
+    return out
+
+
+def _tile_plus_loop_count(x: torch.Tensor, lookup: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tile_a, tile_b in hl.tile(x.size()):
+        acc = x[tile_a, tile_b]
+        for _ in hl.grid(tile_b.block_size):
+            acc = acc + 1
+        out[tile_a, tile_b] = acc
+    return out
+
+
+def _tile_plus_branch_input(x: torch.Tensor, lookup: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tile_a, tile_b in hl.tile(x.size()):
+        half = tile_b.block_size / 2
+        if lookup[0] >= 0:
+            out[tile_a, tile_b] = x[tile_a, tile_b] + half
+    return out
+
+
+def _tile_plus_sliced_sum(x: torch.Tensor, lookup: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tile_a, tile_b in hl.tile(x.size()):
+        out[tile_a, tile_b] = x[tile_a, tile_b] + lookup[tile_b.block_size // 2 :].sum()
+    return out
+
+
+def _tile_reshaped_by_half_its_block(
+    x: torch.Tensor, lookup: torch.Tensor
+) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tile_a, tile_b in hl.tile(x.size()):
+        tile = x[tile_a, tile_b].reshape([tile_a, 2, tile_b.block_size // 2])
+        out[tile_a, tile_b] = tile.reshape([tile_a, tile_b])
+    return out
+
+
+def _tile_regrouped_by_half_its_block(
+    x: torch.Tensor, lookup: torch.Tensor
+) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tile_a, tile_b in hl.tile(x.size()):
+        half = torch.sym_int(tile_b.block_size / 2)
+        tile = x[tile_a, tile_b].reshape([tile_a, 2, half])
+        out[tile_a, tile_b] = tile.reshape([tile_a, tile_b])
+    return out
+
+
 def _two_root_tile_totals(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     first = torch.empty_like(x)
     second = torch.empty_like(x)
@@ -485,6 +554,74 @@ def test_op_along_a_tile_dim_pins_flatten_loops(
         )
         bound.config_spec.normalize(config)
         assert config.flatten_loops == [not p for p in pinned]
+
+
+@pytest.mark.parametrize(
+    ("backend", "fn", "gain"),
+    # Each way of reading a block size on each backend; a lane runs only the
+    # cases of its own backend.
+    [
+        pytest.param(backend, fn, gain, marks=mark)
+        for backend, mark in (("triton", _TRITON), ("cute", _CUTE))
+        for fn, gain in (
+            (_tile_plus_block_size, 16.0),
+            (_tile_plus_lookup, 8.0),
+            (_tile_plus_numel, 64.0),
+            # A loop bound, an input of a branch body and a slice bound.
+            (_tile_plus_loop_count, 16.0),
+            (_tile_plus_branch_input, 8.0),
+            (_tile_plus_sliced_sum, float(sum(range(8, 64)))),
+        )
+    ],
+)
+@helion._testing.skipIfRefEager("requires compiler IR")
+def test_a_block_size_read_as_a_value_pins_flatten_loops(
+    backend: str, fn: Callable[..., torch.Tensor], gain: float, tmp_path, monkeypatch
+) -> None:
+    # A flattened tile's dims share one block size: flattened over [4, 16],
+    # tile_b.block_size would read _BLOCK_SIZE_0_1 and add 64 to every
+    # element, lookup[tile_b.block_size // 2] would read lookup[32], the
+    # numel of a [4, 16] tile would be 64 * 64, hl.grid(tile_b.block_size)
+    # would run 64 times, a branch body would add 64 / 2, and
+    # lookup[tile_b.block_size // 2 :] would start at 32.  The loop stays
+    # unflattened, and a config saved with it flattened still loads,
+    # unflattened.
+    x, lookup = torch.zeros(8, 32), torch.arange(64, dtype=torch.float32)
+    with cpu_target():
+        bound = cpu_bind(
+            helion.kernel(fn, backend=backend, static_shapes=True), (x, lookup)
+        )
+        assert [spec.pinned for spec in bound.config_spec.flatten_loops] == [True]
+        config = helion.Config(block_sizes=[4, 16], flatten_loops=[True])
+        bound.config_spec.normalize(config)
+        assert config.flatten_loops == [False]
+        code = bound.to_code(config)
+    assert "_BLOCK_SIZE_0_1" not in code, code
+    if backend == "triton":
+        out = interpret_triton_selection(
+            code, (x, lookup), tmp_path / "block_size.py", monkeypatch
+        )
+        torch.testing.assert_close(out, torch.full_like(x, gain))
+
+
+@skipUnlessBackends(["cute"])
+@pytest.mark.parametrize(
+    "fn", [_tile_reshaped_by_half_its_block, _tile_regrouped_by_half_its_block]
+)
+@helion._testing.skipIfRefEager("requires compiler IR")
+def test_a_block_size_that_only_shapes_pins_nothing(
+    fn: Callable[..., torch.Tensor],
+) -> None:
+    # tile_b.block_size // 2, and torch.sym_int(tile_b.block_size / 2)
+    # through SymFloat arithmetic, only size a reshape: no value reads the
+    # block size, and the choice CuTe re-offers this pointwise kernel stays
+    # free.
+    with cpu_target():
+        bound = cpu_bind(
+            helion.kernel(fn, backend="cute", static_shapes=True),
+            (torch.zeros(8, 32), torch.zeros(64)),
+        )
+    assert [spec.pinned for spec in bound.config_spec.flatten_loops] == [False]
 
 
 def _consumer_row_first(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
