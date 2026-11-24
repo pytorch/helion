@@ -52,6 +52,7 @@ from ..runtime.structural_policy import require_same_structural_policy
 from .accuracy import effective_fp8_accuracy
 from .accuracy import keyable_accuracy_check
 from .benchmark_prelude import BenchmarkPrelude
+from .benchmark_prelude import PreludeSearchFailed
 from .benchmark_prelude import active_prelude
 from .benchmark_provider import _COMPILER_SEED_TIMEOUT_RETRY_LIMIT
 from .benchmark_provider import BenchmarkProvider
@@ -1324,9 +1325,15 @@ class BaseSearch(BaseAutotuner):
                     # is a deadline (or host) problem, not a kernel without a
                     # working config: say so where the search's caller looks.
                     cascade = self.benchmark_provider.compile_deadline_cascade()
-                    if cascade is None:
-                        raise
-                    raise exc.NoConfigFound(f": {cascade}") from error
+                    if cascade is not None:
+                        raise exc.NoConfigFound(f": {cascade}") from error
+                    # Likewise readings the benchmark prelude took: alone, the
+                    # kernel may find a config (its caller can tune it alone
+                    # then).
+                    behind = self.benchmark_provider.prelude_failure_cascade()
+                    if behind is not None:
+                        raise PreludeSearchFailed(f": {behind}") from error
+                    raise
                 finally:
                     self._finalize_autotune_metrics(best)
             outcome = "ok"
