@@ -74,17 +74,25 @@ checkout a run reads corrupts its results.
 --head` (the last commit) when the change is a complete logical unit; skip it
 for trivial fixes and run it once over the finished stack
 (`scripts/autoreview.py origin/main..HEAD`) before handing a larger project
-back. Fix every finding, classify it as invalid with an explanation in the
-commit message's `Review notes:` paragraph, or defer a pre-existing defect
-whose fix is too large to `KNOWN_GAPS.md` with a `Deferred:` item in that
-paragraph (AGENTS.md, Answering the findings); do not make a change you
-believe is wrong to get a pass. When it passes,
+back. Each finding is labelled a defect or a suggestion. Fix every defect,
+classify it as invalid with an explanation in the commit message's `Review
+notes:` paragraph, or defer a pre-existing defect whose fix is too large to
+`KNOWN_GAPS.md` with a `Deferred:` item in that paragraph (AGENTS.md,
+Answering the findings); do not make a change you believe is wrong to get a
+pass. Suggestions are yours to take or leave. Then continue the same review rather than
+starting a new one: the run ends by naming its session, and
+`scripts/autoreview.py --resume <id> -m "what you changed, and your reply to
+findings you dispute"` runs the next round in the same reviewer sessions,
+which re-read only what changed (AGENTS.md, Continuing a review). When it passes,
 add the `autoreview passed: ...` line it prints as the last line of each commit
 it covered (above any `stack-info:` line; AGENTS.md, Recording the review). If the review
 itself fails, stop and report it; do not substitute your own review. The one
-exception is Codex's `ERROR:` about a missing temporary directory: pass
-`--codex-sandbox workspace-write` when the reviewers will have to run Helion,
-and run a review that ended in that error again with it (AGENTS.md, Code Review). If it
+failure to answer yourself is a round that the run calls half done (one
+reviewer finished, the other failed): run the `--resume` command it prints
+once, without changing the code, and report it if that fails too. The
+reviewers read the change and run nothing: the lanes above are its testing,
+and a finding that reading could not settle names a command for you to run
+(AGENTS.md, Code Review). If it
 warns that only one reviewer (Claude or Codex) is installed, say so to the
 user.
 

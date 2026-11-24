@@ -26,7 +26,8 @@ lives here; step-by-step procedures live in the skills under `.agents/skills/`.
   `scripts/autoreview.py` with Helion's environment Python: activate it or
   use its absolute path. Worktrees have no `.venv` of their own. The scripts'
   `#!/usr/bin/env python3` selects the first `python3` on `PATH`, which may
-  lack the test dependencies.
+  lack the test dependencies; `autoreview.py` points its reviewers at the
+  packages installed for its Python, whose sources they read.
 - Build docs: `make -C docs html` (writes HTML under `site/`)
 
 ## Coding Style & Naming Conventions
@@ -470,49 +471,69 @@ rebase re-runs CI for the whole stack.
 ## Code Review
 
 `scripts/autoreview.py` runs independent Claude and Codex reviewers over a
-change and prints their findings, or `LGTM`: `--head` reviews the last commit,
-no arguments the uncommitted tree, and `origin/main..HEAD` the whole stack. A
-run costs minutes and compute, so use it with judgment: review a logical
-commit when it is complete rather than every intermediate step, and review the
-finished stack once more before handing back a larger project, while the work
-is still in your context. Every finding gets an answer: it is fixed, it is
-classified as invalid with an explanation, or, for a pre-existing defect
-whose fix is too large, it is deferred to `KNOWN_GAPS.md` (Answering the
-findings). The reviewers run Claude `opus` and your configured Codex model,
-both at effort `xhigh`; `--claude-model`, `--claude-effort`, `--codex-model`
-and `--codex-effort` (or `HELION_AUTOREVIEW_*` variables) change that, e.g.
-`--claude-model fable --claude-effort max` for a deeper pass on risky work.
+change and prints their findings, each labelled a defect or a suggestion:
+`--head` reviews the last commit, no arguments the uncommitted tree, and
+`origin/main..HEAD` the whole stack. The review passes when it ends in
+`LGTM`, which it does when it leaves no defect open. A run costs minutes and
+compute, so use it with judgment: review a logical commit when it is complete
+rather than every intermediate step, and review the finished stack once more
+before handing back a larger project, while the work is still in your
+context. Every defect gets an answer: it is fixed, it is classified as
+invalid with an explanation, or, for a pre-existing defect whose fix is too
+large, it is deferred to `KNOWN_GAPS.md`; a suggestion is yours to take or
+leave (Answering the findings). A review is a session of rounds: after you
+have answered a round's defects, `--resume` runs the next round in the same
+reviewer sessions, which review only what changed, instead of starting a new
+review (Continuing a review). The reviewers run Claude `opus` and your
+configured Codex model, both at effort `xhigh`; `--claude-model`,
+`--claude-effort`, `--codex-model` and `--codex-effort` (or
+`HELION_AUTOREVIEW_*` variables) change that, e.g. `--claude-model fable
+--claude-effort max` for a deeper pass on risky work.
 A run that fails (a non-zero exit, a reviewer's `ERROR:` line, a timeout) is a
 broken tool: report it rather than skipping the review or reviewing it
-yourself instead.
-One failure is avoidable. Codex reviews in a read-only sandbox, which has no
-temporary directory, and importing torch needs one: when the reviewers have
-to run Helion to check a change, Codex ends in an `ERROR:` about that
-directory. Pass `--codex-sandbox workspace-write` for such a change (most
-compiler and runtime changes), and run a review that ended in that `ERROR:`
-again with it. The option lets Codex write under the checkout and `/tmp`; it
-is still told to report findings and edit nothing.
-A recognized Codex sandbox startup failure is retried once with the same
-settings. `HELION_AUTOREVIEW_TIMEOUT` applies per attempt, so a retry can take
-twice that timeout plus bounded cleanup.
+yourself instead. The script first does what can be done. A reviewer that
+fails within seconds of its start is started once more. When one reviewer
+fails and the other finishes, the run still fails, but the finished review
+is saved and the run says that the round is half done: run the `--resume`
+command it prints once, with the code and the commit messages as they are,
+and only the failed reviewer runs again. Report the failure if that run
+fails too.
+The reviewers read: the change, the code around it, its history and the
+sources of installed packages. They run nothing (no tests, builds, scripts
+or snippets) and write no files, so Codex's read-only sandbox is all that a
+review needs. Testing stays with you and with CI: run what the change calls
+for (How Much to Test) and name it in the `Testing:` paragraph, which the
+reviewers read as your claim. A finding that reading could not settle says
+so and gives the command that confirms it: run it before you act on the
+finding, and say what it showed in your answer. A command that a reviewer's
+sandbox refuses is no error to it: it goes on reading, and only a change
+that cannot be read ends a review with `ERROR:`.
+`HELION_AUTOREVIEW_TIMEOUT` applies per attempt, so a reviewer that is
+started a second time can take twice that timeout plus bounded cleanup.
 Either reviewer is enough: when only one of the `claude` and `codex` CLIs is
 installed, the script runs that one and prints a `WARNING` saying so. Tell the
 user in your reply that the review ran with one reviewer.
+A review leaves its logs and session under `.logs/autoreview/` and the code
+it reviewed under `refs/autoreview/`; a new review deletes those that were
+last used more than 30 days ago.
 
 ### Answering the findings
 
 The reviewers are often right and sometimes wrong: they see one commit, not
-the rest of the stack or what the user asked for, and a confident finding can
-rest on a misreading. Check each finding before you act on it, then give it
-one of three answers. Do not leave a finding unanswered, and do not make a
-change you believe is wrong to get a pass.
+the rest of the stack or what the user asked for, they read the code without
+running it, and a confident finding can rest on a misreading. Check each
+finding before you act on it. A defect gets one of three answers: do not
+leave one unanswered, and do not make a change you believe is wrong to get a
+pass. A suggestion needs none: take it when it improves the change, which
+needs no further round when it is small, and leave it otherwise. A defect
+that a reviewer called a suggestion is a defect all the same.
 
 - Fixed. Defects are fixed: a wrong result, a crash, a regression, a
   contradiction between code, tests, docs and message, a broken rule of this
   file. That includes defects that predate your change (Fix What You Find),
   unless the fix is too large and the defect is deferred (third answer).
   Small, mechanical fixes folded into the reviewed commit need no second
-  review; bigger ones get another run.
+  review; bigger ones get another round (Continuing a review).
 - Invalid, with an explanation. A finding is invalid when it is wrong (say
   what you checked), when it does not apply (a later commit of the stack
   uses what it calls unused; the behavior is what the user asked for), or
@@ -550,25 +571,80 @@ Review notes:
   origin/main.
 ```
 
-The reviewers read the paragraph on the next run and are told to check each
-item, dropping the finding when the item holds and raising it again, with
-what it gets wrong, when it does not. For a deferral they check the four
+The reviewers read the paragraph in the next round (Continuing a review) and
+in any later review, and are told to check each item, dropping the finding
+when the item holds and raising it again, with what it gets wrong, when it
+does not. For a deferral they check the four
 conditions, and the entry against the code. They read `KNOWN_GAPS.md` in
 every review as well: an entry that the change adds or edits is checked in
 the same way, with or without a note; a listed gap that the change leaves
 as it is is not raised; a change that fixes or narrows a gap has to update
-its entry. So pushing back on a claimed defect takes another run, which has
+its entry. So pushing back on a claimed defect takes another round, which has
 to accept the explanation, and so does a deferral whose entry the commit
 adds or edits: that the fix is too large is your judgement until the
 reviewers have checked it. A deferral that cites an entry the commit's
-parent already holds needs no run when the finding itself says that the
+parent already holds needs no round when the finding itself says that the
 defect predates the change: the entry was checked with the commit that
 added it. When the finding says that the change brings the defect in or
-makes it worse, the deferral pushes back on it and takes a run. A note on a
-suggestion needs none. When the reviewers reject an explanation twice, stop
-and ask the user; that includes a deferral they reject twice. The paragraph
-stays in the message: the pull request's reader sees what the review raised
-and why the code did not change, and later runs do not raise it again.
+makes it worse, the deferral pushes back on it and takes a round. A
+suggestion needs neither a note nor a round. When the reviewers reject an
+explanation twice, stop and ask the user; that includes a deferral they
+reject twice. The paragraph stays in the message: the pull request's reader
+sees what the review raised and why the code did not change, and later
+reviews do not raise it again.
+
+### Continuing a review
+
+A review is a session of several rounds, not a series of first reads. Each
+run saves its session and names it at the end:
+
+```
+autoreview.py: review session 20261124-101500-12345, round 1. After answering ...
+  scripts/autoreview.py --resume 20261124-101500-12345 -m "..."
+```
+
+When you have answered the defects of a round (fixed them in the code,
+recorded the invalid and deferred ones under `Review notes:`), run the next
+round with `--resume <id>` instead of starting a new review. Both reviewers
+continue in their own sessions, with everything they read in the earlier
+rounds. The script tells them which commit they reviewed last and which is
+there now (it pins each round's code under `refs/autoreview/<id>/`, so an
+amend or a rebase does not lose it), and they check their earlier findings
+against your answers and review only what changed. Such a round takes a
+fraction of the time of a first review, and it does not come back with a new
+set of findings about code that did not change.
+
+- `-m "..."` (or `--message-file PATH`, `-` for stdin) sends the reviewers a
+  message with the round: what you changed and where, your reply to a
+  finding you dispute, a question about a finding you do not understand.
+  Both reviewers get it, together with the review you received, which the
+  Codex reviewer has not seen: Claude combines the two. The message is the
+  conversation, not the record: the reviewers treat it as your claims, as
+  they treat the notes, and an invalid or deferred finding still goes into
+  `Review notes:`, which the pull request's reader and any later review
+  see. A message with no change to the code is a round too.
+- The round keeps the session's reviewers, target, models, efforts and
+  Codex sandbox. Give an option again to change a model, an effort or the
+  sandbox, and name the target again when its form changed: `--resume <id>
+  --head` once work that was reviewed uncommitted (no arguments) is
+  committed. The reviewers stay: a round that would leave one out
+  (`--no-codex`, a CLI that is no longer installed) does not start.
+- A round that passes prints the `autoreview passed:` line as a first run
+  does (Recording the review). Its review ends with `LGTM` and may hold
+  suggestions and the reviewers' replies to your message above that line.
+- Start a new review, without `--resume`, for another change (the next
+  commit, the whole stack before handing back), for a change you rewrote
+  rather than fixed, and when the session cannot be continued: the run said
+  that its review cannot be resumed (a target other than the uncommitted
+  work, `--head`, or revisions and ranges has no code that two rounds could
+  compare), the session belongs to another checkout (a worktree continues
+  its own sessions), or the round fails because a reviewer's own session no
+  longer exists (`No conversation found`, `no rollout found`; the sessions
+  and the refs are kept for about 30 days). Starting over in that last case
+  is not working around a broken tool. Any other failure of a resumed round
+  is one, as for a first run; it leaves the saved session as it was, or with
+  the round half done (Code Review), so the same command runs the round
+  again or completes it.
 
 ### Recording the review
 
@@ -579,15 +655,18 @@ line recording a passing review, above any `stack-info:` trailer:
 autoreview passed: claude, codex
 ```
 
-- When a run finds nothing (`LGTM`), `autoreview.py` prints this line, naming
-  the reviewers that actually ran (`autoreview passed: claude` when only Claude
-  was installed). Copy it. Never write the line without a run behind it.
+- When a review ends in `LGTM` (no defect is open; suggestions and replies
+  may stand above that line), `autoreview.py` prints this line, naming the
+  reviewers that actually ran (`autoreview passed: claude` when only Claude
+  was installed). Copy it. Never write the line without a run behind it, and
+  not when an open `[defect]` stands above the `LGTM`: the script warns of
+  that contradiction, and it takes another round.
 - Add it to every commit the passing run covered: `--head` covers the last
   commit, a range such as `origin/main..HEAD` covers each commit in it.
-- A run with findings also counts once every finding is answered (Answering
+- A run with defects also counts once every defect is answered (Answering
   the findings): fixed, with small, mechanical fixes folded in and anything
   bigger reviewed again, or recorded under `Review notes:` as invalid or as
-  deferred to `KNOWN_GAPS.md`, with another run behind every claimed defect
+  deferred to `KNOWN_GAPS.md`, with another round behind every claimed defect
   classified as invalid and every deferral that needs one (that section
   says which). Use the reviewers that ran in it.
 - The line goes stale when its commit changes after the review other than by
