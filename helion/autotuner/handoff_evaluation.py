@@ -37,6 +37,7 @@ from .benchmarking import synchronize_device
 from .handoff_inputs import _clone_inputs
 from .handoff_inputs import _load_inputs
 from .logger import capture_output
+from .logger import runtime_error_message
 from .precompile_future import SerializedCompiledFunction
 from .precompile_future import _load_compiled_fn
 from .precompile_future import _unload_compiled_fn
@@ -592,7 +593,8 @@ def evaluate_handoff(
                 outcome = _CaseOutcome("timeout", error=str(exception))
             except Exception as exception:
                 outcome = _CaseOutcome(
-                    "error", error=f"{type(exception).__qualname__}: {exception}"
+                    "error",
+                    error=f"{type(exception).__qualname__}: {runtime_error_message(exception)}",
                 )
             last_phase = outcome.phase
             if last_phase is None and progress_path.exists():

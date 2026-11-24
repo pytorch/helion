@@ -97,6 +97,7 @@ from .logger import log_candidate_compile_failure
 from .logger import log_generated_triton_code_debug
 from .logger import match_unrecoverable_runtime_error
 from .logger import maybe_dump_triton_failure
+from .logger import runtime_error_message
 from .precompile_future import PrecompileContext
 from .precompile_future import PrecompileFuture
 from .precompile_future import _ExtractedLaunchArgs
@@ -512,7 +513,9 @@ def _categorical_config_values(config: Config) -> list[tuple[str, object]]:
 
 
 def _first_line(error: BaseException, limit: int = 240) -> str:
-    text = f"{type(error).__name__}: {error}".strip().splitlines()
+    text = (
+        f"{type(error).__name__}: {runtime_error_message(error)}".strip().splitlines()
+    )
     first = text[0] if text else type(error).__name__
     return first if len(first) <= limit else first[: limit - 3] + "..."
 
@@ -3555,14 +3558,15 @@ class LocalBenchmarkProvider(BenchmarkProvider):
                 e,
                 captured_output=_captured_output[0] or None,
             )
-            if match_unrecoverable_runtime_error(e):
+            message = runtime_error_message(e)
+            if match_unrecoverable_runtime_error(message):
                 self.kernel.maybe_log_repro(self.log.error, self.args, config)
                 raise exc.TritonUnrecoverableRuntimeError(
-                    reason=str(e),
+                    reason=message,
                     decorator=self.kernel.format_kernel_decorator(
                         config, self.settings
                     ),
-                    error=f"{type(e).__qualname__}: {e}",
+                    error=f"{type(e).__qualname__}: {message}",
                     isolation=self._in_process_benchmark_reason(),
                 ) from e
             _backend = getattr(getattr(self, "config_spec", None), "backend", None)
@@ -3583,7 +3587,7 @@ class LocalBenchmarkProvider(BenchmarkProvider):
                 )
                 self.kernel.maybe_log_repro(self.log.error, self.args, config)
                 raise exc.TritonError(
-                    error=f"{type(e).__qualname__}: {e}",
+                    error=f"{type(e).__qualname__}: {message}",
                     decorator=decorator,
                     code=SUPPRESSED_TRITON_CODE_MSG,
                 ) from e
@@ -3608,7 +3612,7 @@ class LocalBenchmarkProvider(BenchmarkProvider):
                     config,
                     prefix=f"Generated Triton code for {decorator}:",
                 )
-                self.log.debug(f"Benchmarking failed: {type(e).__name__}: {e}")
+                self.log.debug(f"Benchmarking failed: {type(e).__name__}: {message}")
                 self.kernel.maybe_log_repro(self.log.debug, self.args, config)
 
             self._record_compile_failure(config, e)
@@ -3680,7 +3684,9 @@ class LocalBenchmarkProvider(BenchmarkProvider):
             return inf
         except BenchmarkSubprocessError as e:
             # Timeout or unexpected worker exit; skip config and continue.
-            self.log.warning(f"Benchmark subprocess failed for {config!r}: {e}")
+            self.log.warning(
+                f"Benchmark subprocess failed for {config!r}: {runtime_error_message(e)}"
+            )
             if isinstance(e, BenchmarkTimeout):
                 self._warn_timed_out_role(
                     config, e, retried_repetitions=retried_repetitions
@@ -3695,34 +3701,17 @@ class LocalBenchmarkProvider(BenchmarkProvider):
             # gave no reading there: the candidate has none, as one whose
             # job failed in the worker (an event reading would sit on
             # another scale than the readings it is compared with).
-            self.log.warning(f"No reading of {config!r}: {e}")
+            self.log.warning(f"No reading of {config!r}: {runtime_error_message(e)}")
             self._record_worker_failure(config, "error")
             return inf
         except PreludeFailed as e:
             # The prelude's failure, not the candidate's: no reading, and
             # no compile failure charged to the config's values.
-            self.log.warning(f"No reading of {config!r}: {e}")
+            self.log.warning(f"No reading of {config!r}: {runtime_error_message(e)}")
             self._record_worker_failure(config, "error")
             return inf
         except Exception as e:
-            e.__traceback__ = None
-            if match_unrecoverable_runtime_error(e):
-                # Worker is already killed; parent CUDA is unaffected.
-                # Skip this config and continue the search.
-                decorator = self.kernel.format_kernel_decorator(config, self.settings)
-                self.log.warning(
-                    f"Skipping config that triggered an unrecoverable runtime "
-                    f"error in the benchmark subprocess: "
-                    f"{type(e).__qualname__}: {e}\n  Config: {decorator}"
-                )
-                self.kernel.maybe_log_repro(self.log.warning, self.args, config)
-                self._record_compile_failure(config, e)
-                return inf
-            self.log.debug(
-                f"Benchmark subprocess raised for {config!r}: {type(e).__name__}: {e}"
-            )
-            self._record_compile_failure(config, e)
-            return inf
+            return self._skip_subprocess_candidate(config, e, "benchmark")
 
         if self.settings.autotune_accuracy_check:
             try:
@@ -3731,7 +3720,7 @@ class LocalBenchmarkProvider(BenchmarkProvider):
                 raise
             except BenchmarkSubprocessError as e:
                 self.log.warning(
-                    f"Accuracy check subprocess failed for {config!r}: {e}"
+                    f"Accuracy check subprocess failed for {config!r}: {runtime_error_message(e)}"
                 )
                 self._record_worker_failure(
                     config,
@@ -3739,27 +3728,7 @@ class LocalBenchmarkProvider(BenchmarkProvider):
                 )
                 return inf
             except Exception as e:
-                e.__traceback__ = None
-                if match_unrecoverable_runtime_error(e):
-                    # Worker is already killed; parent CUDA is unaffected.
-                    # Skip this config and continue the search.
-                    decorator = self.kernel.format_kernel_decorator(
-                        config, self.settings
-                    )
-                    self.log.warning(
-                        f"Skipping config that triggered an unrecoverable runtime "
-                        f"error in the accuracy check subprocess: "
-                        f"{type(e).__qualname__}: {e}\n  Config: {decorator}"
-                    )
-                    self.kernel.maybe_log_repro(self.log.warning, self.args, config)
-                    self._record_compile_failure(config, e)
-                    return inf
-                self.log.debug(
-                    f"Accuracy check subprocess raised for {config!r}: "
-                    f"{type(e).__name__}: {e}"
-                )
-                self._record_compile_failure(config, e)
-                return inf
+                return self._skip_subprocess_candidate(config, e, "accuracy check")
 
             if accuracy_result is not None:
                 if not accuracy_result.ok:
@@ -3793,20 +3762,21 @@ class LocalBenchmarkProvider(BenchmarkProvider):
                     return inf
             except Exception as e:
                 e.__traceback__ = None
-                if match_unrecoverable_runtime_error(e):
+                message = runtime_error_message(e)
+                if match_unrecoverable_runtime_error(message):
                     # This ran in the parent process, so the IMA poisoned
                     # the parent CUDA context; the search cannot continue.
                     self.kernel.maybe_log_repro(self.log.error, self.args, config)
                     raise exc.TritonUnrecoverableRuntimeError(
-                        reason=str(e),
+                        reason=message,
                         decorator=self.kernel.format_kernel_decorator(
                             config, self.settings
                         ),
-                        error=f"{type(e).__qualname__}: {e}",
+                        error=f"{type(e).__qualname__}: {message}",
                         isolation=self._in_process_benchmark_reason(),
                     ) from e
                 self.log.debug(
-                    f"Accuracy check raised for {config!r}: {type(e).__name__}: {e}"
+                    f"Accuracy check raised for {config!r}: {type(e).__name__}: {message}"
                 )
                 self._record_compile_failure(config, e)
                 return inf
@@ -3816,6 +3786,27 @@ class LocalBenchmarkProvider(BenchmarkProvider):
                 self._clear_jit_fast_path_caches(fn)
 
         return float(latency)
+
+    def _skip_subprocess_candidate(
+        self, config: Config, error: Exception, phase: str
+    ) -> float:
+        error.__traceback__ = None
+        message = runtime_error_message(error)
+        if match_unrecoverable_runtime_error(message):
+            # The worker was retired; the parent's context can continue.
+            decorator = self.kernel.format_kernel_decorator(config, self.settings)
+            self.log.warning(
+                f"Skipping config that triggered an unrecoverable runtime error in the "
+                f"{phase} subprocess: {type(error).__qualname__}: {message}\n  Config: {decorator}"
+            )
+            self.kernel.maybe_log_repro(self.log.warning, self.args, config)
+        else:
+            self.log.debug(
+                f"{phase.capitalize()} subprocess raised for {config!r}: "
+                f"{type(error).__name__}: {message}"
+            )
+        self._record_compile_failure(config, error)
+        return inf
 
     def _run_candidate_benchmark_job(
         self, config: Config, fn: CompiledConfig
@@ -4249,26 +4240,39 @@ class LocalBenchmarkProvider(BenchmarkProvider):
                 except InputBankError:
                     raise
                 except BenchmarkTimeout as e:
-                    self.log.warning(f"{self._isolated_failure_subject(fn, desc)}: {e}")
+                    self.log.warning(
+                        f"{self._isolated_failure_subject(fn, desc)}: {runtime_error_message(e)}"
+                    )
                     self._autotune_metrics.num_isolated_rebenchmark_timeouts += 1
                     timings.append(IsolatedBenchmarkFailure("timeout"))
                     continue
-                except (BenchmarkSubprocessError, KernelTraceUnreadable) as e:
+                except (
+                    BenchmarkSubprocessError,
+                    KernelTraceUnreadable,
+                    PreludeFailed,
+                ) as e:
                     # A compile deadline, a dead worker or a window the trace
                     # could not read: the candidate was measured before, so
                     # its earlier timing is kept.
-                    self.log.warning(f"{self._isolated_failure_subject(fn, desc)}: {e}")
+                    self.log.warning(
+                        f"{self._isolated_failure_subject(fn, desc)}: {runtime_error_message(e)}"
+                    )
                     timing = None
                 except Exception as e:
                     e.__traceback__ = None
-                    if match_unrecoverable_runtime_error(e):
-                        self.log.warning(f"{desc} sticky CUDA error skipped: {e}")
+                    # A restored exception keeps its original type, including
+                    # a possibly broken __str__. Classify and log the same text.
+                    message = runtime_error_message(e)
+                    if match_unrecoverable_runtime_error(message):
+                        self.log.warning(f"{desc} sticky CUDA error skipped: {message}")
                         # The confirmation re-ran a previously accepted candidate in
                         # an isolated worker; a sticky CUDA error means that config is
                         # still unsafe, so remove it from contention.
                         timings.append(IsolatedBenchmarkFailure("error"))
                         continue
-                    self.log.debug(f"{desc} subprocess raised: {type(e).__name__}: {e}")
+                    self.log.debug(
+                        f"{desc} subprocess raised: {type(e).__name__}: {message}"
+                    )
                     timing = None
                 # A wrapper-load failure disables the worker because later
                 # candidates may depend on the same unavailable source module.

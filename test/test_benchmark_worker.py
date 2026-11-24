@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import dataclasses
 import linecache
 import logging
@@ -51,6 +52,8 @@ from helion.autotuner.benchmark_job import AccuracyCheckJob
 from helion.autotuner.benchmark_job import AccuracyCheckResult
 from helion.autotuner.benchmark_job import BenchmarkJob
 from helion.autotuner.benchmark_job import CompiledFunctionLoadError
+from helion.autotuner.benchmark_job import _load_compiled_fn_for_worker
+from helion.autotuner.benchmark_prelude import PreludeFailed
 from helion.autotuner.benchmark_provider import BenchmarkResult
 from helion.autotuner.benchmark_provider import IsolatedBenchmarkFailure
 from helion.autotuner.benchmark_provider import LocalBenchmarkProvider
@@ -70,6 +73,7 @@ from helion.autotuner.kernel_args import load_trusted_kernel_args
 from helion.autotuner.logger import AutotuningLogger
 from helion.autotuner.logger import match_device_out_of_memory
 from helion.autotuner.logger import match_unrecoverable_runtime_error
+from helion.autotuner.logger import runtime_error_message
 from helion.autotuner.metrics import AutotuneMetrics
 from helion.autotuner.precompile_future import SerializedCompiledFunction
 from helion.autotuner.precompile_future import _load_compiled_fn
@@ -161,6 +165,104 @@ class _RaiseKernelTraceUnreadable:
 
     def __call__(self) -> object:
         raise KernelTraceUnreadable(self.message)
+
+
+class _DeviceError(RuntimeError):
+    def __init__(self, code: int, name: str) -> None:
+        # Like CuTe's SDK error, the formatted message in .args does not
+        # contain the two arguments needed to reconstruct this exception.
+        super().__init__(f"{code}: {name}")
+
+
+def _raise_device_assertion() -> None:
+    raise _DeviceError(710, "cudaErrorAssert")
+
+
+def _raise_assertion_with_tensor() -> None:
+    raise RuntimeError("CUDA_ERROR_ASSERT", torch.ones(1))
+
+
+def _raise_prelude_assertion() -> None:
+    raise PreludeFailed("CUDA_ERROR_ASSERT")
+
+
+class _LocalStringError(RuntimeError):
+    def __str__(self) -> str:
+        class LocalMessage(str):
+            __slots__ = ()
+
+            def __format__(self, spec: str) -> str:
+                return "parent-only text"
+
+        return LocalMessage("CUDA_ERROR_ASSERT")
+
+
+def _raise_local_string_assertion() -> None:
+    raise _LocalStringError
+
+
+class _InterruptedReduction(RuntimeError):
+    def __reduce__(self):
+        raise asyncio.CancelledError
+
+
+def _raise_interrupted_reduction() -> None:
+    raise _InterruptedReduction("CUDA_ERROR_ASSERT")
+
+
+class _RestoresAsOrdinaryError(SystemExit):
+    def __reduce__(self):
+        return RuntimeError, ("not a control",)
+
+
+def _raise_wrongly_restored_exit() -> None:
+    raise _RestoresAsOrdinaryError
+
+
+class _CancelledFormatter(RuntimeError):
+    def __str__(self) -> str:
+        raise asyncio.CancelledError
+
+
+def _raise_cancelled_formatter() -> None:
+    raise _CancelledFormatter
+
+
+def _raise_unpickleable_exit() -> None:
+    raise SystemExit(lambda: None)
+
+
+class _UnprintableError(RuntimeError):
+    def __str__(self) -> str:
+        raise ValueError("exception message unavailable")
+
+
+def _raise_unprintable_assertion() -> None:
+    raise _UnprintableError("CUDA_ERROR_ASSERT")
+
+
+class _ProcessLocalError(RuntimeError):
+    def __str__(self) -> str:
+        return self.args[1] if os.getpid() == self.args[0] else self.args[2]
+
+
+def _raise_process_local_assertion() -> None:
+    raise _ProcessLocalError(
+        os.getpid(), "CUDA_ERROR_ASSERT: child status 710", "status 710"
+    )
+
+
+def _raise_parent_only_assertion() -> None:
+    raise _ProcessLocalError(os.getpid(), "status 710", "CUDA_ERROR_ASSERT")
+
+
+class _InterruptedFormatter(RuntimeError):
+    def __str__(self) -> str:
+        raise KeyboardInterrupt
+
+
+def _raise_interrupted_formatter() -> None:
+    raise _InterruptedFormatter
 
 
 @dataclasses.dataclass
@@ -372,6 +474,162 @@ class TestAutotuneDataclassCompatibility(unittest.TestCase):
 # the native lane is also compiling and benchmarking kernels on the same GPU.
 @pytest.mark.cpu_only
 class TestBenchmarkWorkerFailureModes(unittest.TestCase):
+    def test_worker_failure_uses_only_plain_strings_after_formatting_fails(
+        self,
+    ) -> None:
+        class BrokenArgument:
+            def __repr__(self) -> str:
+                raise AssertionError("should not format another argument")
+
+        error = _UnprintableError(BrokenArgument(), "CUDA_ERROR_ASSERT")
+        captured = benchmark_worker_module._WorkerFailure.capture(error)
+        self.assertTrue(captured.sticky)
+        self.assertIn("CUDA_ERROR_ASSERT", captured.diagnostic)
+
+    @pytest.mark.slow
+    def test_spawn_main_exception_restores_in_the_parent_module(self) -> None:
+        # Running a script makes multiprocessing import it as __mp_main__;
+        # the parent must still catch its own JobError after worker retirement.
+        with tempfile.TemporaryDirectory() as tmpdir:
+            script = Path(tmpdir) / "raise_job_error.py"
+            script.write_text(
+                "from helion.autotuner.benchmark_worker import BenchmarkWorker\n"
+                "class JobError(RuntimeError): pass\n"
+                "def fail(): raise JobError('CUDA_ERROR_ASSERT')\n"
+                "if __name__ == '__main__':\n"
+                "    worker = BenchmarkWorker()\n"
+                "    try:\n"
+                "        worker.run(fail, timeout=30)\n"
+                "    except JobError as error:\n"
+                "        assert type(error) is JobError and not worker.alive()\n"
+                "    else:\n"
+                "        raise AssertionError('expected the script-defined JobError')\n"
+                "    finally:\n"
+                "        worker.shutdown()\n"
+            )
+            subprocess.run(
+                [sys.executable, str(script)],
+                check=True,
+                timeout=120,
+                env={**os.environ, "PYTHONPATH": os.pathsep.join(sys.path)},
+            )
+
+    def test_worker_preserves_failure_role_across_pickle_reducers(self) -> None:
+        class CandidateError(RuntimeError):
+            def __reduce__(self):
+                return PreludeFailed, self.args
+
+        class PreludeError(PreludeFailed):
+            def __reduce__(self):
+                return RuntimeError, self.args
+
+        for error, expected in (
+            (CandidateError("CUDA_ERROR_ASSERT"), RuntimeError),
+            (PreludeError("CUDA_ERROR_ASSERT"), PreludeFailed),
+        ):
+            with self.subTest(error=type(error)):
+                captured = benchmark_worker_module._WorkerFailure.capture(error)
+                self.assertTrue(captured.sticky)
+                restored = captured.restore()
+                self.assertIs(type(restored), expected)
+                self.assertIn("CUDA_ERROR_ASSERT", runtime_error_message(restored))
+
+    def test_runtime_error_formatting_preserves_interrupt(self) -> None:
+        with self.assertRaises(KeyboardInterrupt):
+            runtime_error_message(_InterruptedFormatter())
+
+    def test_unprintable_candidate_failure_records_benchmark_and_accuracy(self) -> None:
+        config = Config(indexing="pointer")
+        for phase in ("benchmark", "accuracy"):
+            for message in ("CUDA_ERROR_ASSERT", "bad launch"):
+                with self.subTest(phase=phase, message=message):
+                    provider = LocalBenchmarkProvider.__new__(LocalBenchmarkProvider)
+                    provider.config_spec = SimpleNamespace(
+                        compiler_seed_timeout_retry_repetitions=None
+                    )
+                    provider.settings = Settings(autotune_accuracy_check=True)
+                    provider.log = Mock()
+                    provider.kernel = Mock()
+                    provider.args = []
+                    provider._autotune_metrics = AutotuneMetrics()
+                    provider._compile_failure_config_ids = []
+                    provider._compile_failure_values = None
+                    error = _UnprintableError(message)
+                    with (
+                        patch.object(
+                            provider,
+                            "_run_subprocess_benchmark_job",
+                            return_value=1.0,
+                            side_effect=error if phase == "benchmark" else None,
+                        ),
+                        patch.object(
+                            provider,
+                            "_run_subprocess_accuracy_check_job",
+                            side_effect=error,
+                        ),
+                    ):
+                        result = provider._benchmark_function_subprocess(
+                            config, cast("CompiledConfig", object())
+                        )
+                    self.assertEqual(result, math.inf)
+                    self.assertEqual(provider._autotune_metrics.num_compile_failures, 1)
+                    assert provider._compile_failure_values is not None
+                    self.assertIn(
+                        message,
+                        provider._compile_failure_values[("indexing", "pointer")][1],
+                    )
+
+    def test_setup_failures_keep_unprintable_diagnostics(self) -> None:
+        job = BenchmarkJob.__new__(BenchmarkJob)
+        object.__setattr__(job, "prelude_path", "prelude")
+        for error in (_UnprintableError("CUDA_ERROR_ASSERT"), _LocalStringError()):
+            with (
+                self.subTest(kind=type(error).__name__),
+                patch(
+                    "helion.autotuner.benchmark_job._load_compiled_fn",
+                    side_effect=error,
+                ),
+                self.assertRaisesRegex(CompiledFunctionLoadError, "CUDA_ERROR_ASSERT"),
+            ):
+                _load_compiled_fn_for_worker(Mock())
+            with (
+                patch(
+                    "helion.autotuner.benchmark_job.load_prelude", return_value=Mock()
+                ),
+                patch(
+                    "helion.autotuner.benchmark_job.synchronize_device",
+                    side_effect=error,
+                ),
+                self.assertRaisesRegex(PreludeFailed, "CUDA_ERROR_ASSERT"),
+            ):
+                job._warm_prelude(None)
+
+    def test_sticky_prelude_failure_is_not_charged_to_the_candidate(self) -> None:
+        provider = LocalBenchmarkProvider.__new__(LocalBenchmarkProvider)
+        provider.settings = Settings(autotune_accuracy_check=False)
+        provider.log = Mock()
+        provider.kernel = Mock()
+        provider.args = []
+        provider.config_spec = SimpleNamespace(
+            compiler_seed_timeout_retry_repetitions=None
+        )
+        provider._autotune_metrics = AutotuneMetrics()
+        provider._worker_failure_config_ids = []
+        provider._compile_failure_config_ids = []
+        error = benchmark_worker_module._WorkerFailure.capture(
+            PreludeFailed("CUDA_ERROR_ASSERT")
+        )
+        self.assertTrue(error.sticky)
+        with patch.object(
+            provider, "_run_subprocess_benchmark_job", side_effect=error.restore()
+        ):
+            result = provider._benchmark_function_subprocess(
+                Config(), cast("CompiledConfig", object())
+            )
+        self.assertEqual(result, math.inf)
+        self.assertEqual(provider._autotune_metrics.num_worker_failures, 1)
+        self.assertEqual(provider._autotune_metrics.num_compile_failures, 0)
+
     def test_precompile_worker_starts_isolated_process_group(self) -> None:
         with patch("helion.autotuner.process_utils.os.setsid") as setsid:
             start_isolated_process_group()
@@ -2754,11 +3012,35 @@ class TestBenchmarkWorkerFailureModes(unittest.TestCase):
         # to be killed so the next call spawns a fresh CUDA context.
         worker = BenchmarkWorker()
         try:
-            with self.assertRaises(RuntimeError) as ctx:
-                worker.run(_RaiseRuntimeError("illegal memory access"), timeout=30.0)
-            self.assertIn("illegal memory access", str(ctx.exception))
-            self.assertFalse(worker.alive())
-            self.assertEqual(worker.run(_ReturnValue(42), timeout=30.0), 42)
+            for job, error_type, message in [
+                (
+                    _RaiseRuntimeError("illegal memory access"),
+                    RuntimeError,
+                    "illegal memory access",
+                ),
+                (_raise_assertion_with_tensor, RuntimeError, "CUDA_ERROR_ASSERT"),
+                (
+                    _RaiseRuntimeError("cudaErrorIllegalAddress"),
+                    RuntimeError,
+                    "cudaErrorIllegalAddress",
+                ),
+                (
+                    _raise_device_assertion,
+                    RuntimeError,
+                    "710: cudaErrorAssert",
+                ),
+            ]:
+                with self.subTest(message=message):
+                    previous = worker.run(_ReturnPid(), timeout=30.0)
+                    with self.assertRaisesRegex(error_type, message) as ctx:
+                        worker.run(job, timeout=30.0)
+                    self.assertIs(type(ctx.exception), error_type)
+                    if job is _raise_assertion_with_tensor:
+                        torch.testing.assert_close(ctx.exception.args[1], torch.ones(1))
+                    self.assertFalse(worker.alive())
+                    self.assertNotEqual(
+                        worker.run(_ReturnPid(), timeout=30.0), previous
+                    )
         finally:
             worker.shutdown()
 
@@ -2793,7 +3075,8 @@ class TestBenchmarkWorkerFailureModes(unittest.TestCase):
         try:
             with self.assertRaises(BenchmarkSubprocessError) as ctx:
                 worker.run(_RaiseUnpickleableLocalException(), timeout=30.0)
-            self.assertIn("unpickleable", str(ctx.exception))
+            self.assertIn("could not restore the worker exception", str(ctx.exception))
+            self.assertIn("LocalError: local exception", str(ctx.exception))
             self.assertTrue(worker.alive())
             self.assertEqual(worker.run(_ReturnValue(7), timeout=30.0), 7)
         finally:
@@ -2815,6 +3098,17 @@ class TestBenchmarkWorkerFailureModes(unittest.TestCase):
             self.assertIn("could not split", str(ctx.exception))
             self.assertTrue(worker.alive())
             self.assertEqual(worker.run(_ReturnPid(), timeout=30.0), first_pid)
+            with self.assertRaises(KeyboardInterrupt):
+                worker.run(_raise_interrupted_formatter, timeout=30)
+            with self.assertRaises(asyncio.CancelledError):
+                worker.run(_raise_cancelled_formatter, timeout=30)
+            for job in (_raise_unpickleable_exit, _raise_wrongly_restored_exit):
+                with self.assertRaises(SystemExit):
+                    worker.run(job, timeout=30)
+            self.assertEqual(worker.run(_ReturnPid(), timeout=30), first_pid)
+            with self.assertRaises(asyncio.CancelledError):
+                worker.run(_raise_interrupted_reduction, timeout=30)
+            self.assertFalse(worker.alive())
         finally:
             worker.shutdown()
 
@@ -2929,6 +3223,66 @@ class TestBenchmarkWorkerFailureModes(unittest.TestCase):
 
 @pytest.mark.cpu_only
 class TestSuspiciousRebenchmark(unittest.TestCase):
+    @pytest.mark.slow
+    def test_unrestorable_assertion_retires_the_finalist(self) -> None:
+        provider = LocalBenchmarkProvider.__new__(LocalBenchmarkProvider)
+        provider.settings = Settings(autotune_benchmark_subprocess=True)
+        provider.log = Mock()
+        worker = BenchmarkWorker()
+        try:
+            with (
+                patch.object(
+                    provider, "_subprocess_benchmark_enabled", return_value=True
+                ),
+                patch.object(
+                    provider,
+                    "_run_subprocess_benchmark_job",
+                    side_effect=lambda fn, **kwargs: worker.run(fn, timeout=30),
+                ),
+            ):
+                results = provider.benchmark_isolated(
+                    [
+                        _raise_device_assertion,
+                        _ReturnPid(),
+                        _raise_unprintable_assertion,
+                        _ReturnPid(),
+                        _raise_process_local_assertion,
+                        _raise_parent_only_assertion,
+                        _raise_prelude_assertion,
+                        _raise_local_string_assertion,
+                    ],
+                    warmup=1,
+                    rep=1,
+                )
+            assert results is not None
+            (
+                unrestorable,
+                first_pid,
+                unprintable,
+                next_pid,
+                process_local,
+                parent_only,
+                prelude,
+                local_string,
+            ) = results
+            self.assertIsNone(prelude)
+            self.assertEqual(local_string, IsolatedBenchmarkFailure("error"))
+            self.assertEqual(unrestorable, IsolatedBenchmarkFailure("error"))
+            self.assertEqual(unprintable, IsolatedBenchmarkFailure("error"))
+            self.assertEqual(process_local, IsolatedBenchmarkFailure("error"))
+            self.assertIsNone(parent_only)
+            self.assertIsInstance(first_pid, float)
+            self.assertIsInstance(next_pid, float)
+            self.assertNotEqual(first_pid, next_pid)
+            self.assertTrue(
+                any(
+                    "CUDA_ERROR_ASSERT: child status 710" in call.args[0]
+                    for call in provider.log.warning.call_args_list
+                )
+            )
+        finally:
+            worker.shutdown()
+
     def test_isolated_unkillable_worker_is_fatal(self) -> None:
         provider = LocalBenchmarkProvider.__new__(LocalBenchmarkProvider)
         provider.settings = Settings(autotune_benchmark_subprocess=True)
