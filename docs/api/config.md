@@ -187,8 +187,9 @@ settings between configurations.
    - ``"tensor_descriptor"``: TMA box prefetches of the tile the subscript describes, from a
      tensor map the host builds (requires Hopper+ GPU); a prefetch keeps the pointer form when a
      box cannot describe it (a gather, an extra mask, box rows not a multiple of 16 bytes), when
-     its tensor is not a kernel input or a view at its start (one host code allocates), under the
-     cudaMallocAsync allocator, and for a call whose tensor has no 16-byte aligned base
+     its tensor is not a kernel input or a view starting a multiple of 16 bytes past one (not a
+     tensor host code allocates), under the cudaMallocAsync allocator, and for a call whose
+     tensor has no 16-byte aligned base
 ```
 
 ### Epilogue Optimization

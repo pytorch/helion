@@ -271,34 +271,6 @@ def _accessed_tensor_fake(node: torch.fx.Node) -> torch.Tensor | None:
     return None
 
 
-# Pure functions a launch-uniform predicate may apply (``_launch_uniform_terms``).
-_UNIFORM_OPS = frozenset(
-    (
-        torch.ops.aten.eq.Scalar,
-        torch.ops.aten.eq.Tensor,
-        torch.ops.aten.ne.Scalar,
-        torch.ops.aten.ne.Tensor,
-        torch.ops.aten.lt.Scalar,
-        torch.ops.aten.lt.Tensor,
-        torch.ops.aten.le.Scalar,
-        torch.ops.aten.le.Tensor,
-        torch.ops.aten.gt.Scalar,
-        torch.ops.aten.gt.Tensor,
-        torch.ops.aten.ge.Scalar,
-        torch.ops.aten.ge.Tensor,
-        torch.ops.aten.bitwise_and.Tensor,
-        torch.ops.aten.bitwise_or.Tensor,
-        torch.ops.aten.bitwise_xor.Tensor,
-        torch.ops.aten.bitwise_not.default,
-        torch.ops.aten.logical_and.default,
-        torch.ops.aten.logical_or.default,
-        torch.ops.aten.logical_not.default,
-        torch.ops.prims.convert_element_type.default,
-        operator.and_,
-        operator.or_,
-        operator.invert,
-    )
-)
 _CONJUNCTIONS = (
     torch.ops.aten.bitwise_and.Tensor,
     torch.ops.aten.logical_and.default,
@@ -318,9 +290,10 @@ def _launch_uniform_terms(
     id and reads some data: it is built from constants, one-element loads at
     constant indices of tensors the kernel never writes (``uniform_tensor``
     keys a load's tensor by name and view, None when it may change during the
-    launch), broadcasts and the pure functions of ``_UNIFORM_OPS``. Keys hold
-    only names and numbers, so the rank digest compares them across ranks (a
-    gate built from a rank constant differs there).
+    launch), broadcasts and pointwise ops (``torch.Tag.pointwise``) drawing no
+    random numbers. Keys hold only names and numbers, so the rank digest
+    compares them across ranks (a gate built from a rank constant differs
+    there).
     """
     from ..language import memory_ops
     from ..language import view_ops
@@ -367,7 +340,12 @@ def _launch_uniform_terms(
         result: object | None = None
         if target is view_ops.subscript and len(args) >= 2 and broadcast_only(args[1]):
             result = key(args[0])
-        elif target in _UNIFORM_OPS and not value.kwargs.keys() - {"dtype"}:
+        elif (
+            isinstance(target, torch._ops.OpOverload)
+            and torch.Tag.pointwise in target.tags
+            and torch.Tag.nondeterministic_seeded not in target.tags
+            and not value.kwargs.keys() - {"dtype"}
+        ):
             operands = [key(arg) for arg in args]
             if all(operand is not None for operand in operands):
                 result = (str(target), *operands, value.kwargs.get("dtype"))
@@ -732,8 +710,9 @@ def _subscript_dense_span(
 
     This compact fact preserves the logical tile axis for a contiguous vector
     subscript without materializing its lanes.  It is intentionally narrower
-    than the general affine-index model: one tile-begin symbol, a positive
-    integer scale, and an integer offset.
+    than the general affine-index model: one tile-begin symbol (a grid index
+    is the begin of a tile of its step), a positive integer scale, and an
+    integer offset.
     """
     if not isinstance(subscript, torch.fx.Node):
         return None
@@ -767,13 +746,13 @@ def _subscript_dense_span(
         symbol
         for symbol in base.free_symbols
         if (origin := host.expr_to_origin.get(symbol)) is not None
-        and isinstance(origin.origin, TileBeginOrigin)
+        and type(origin.origin) in (GridOrigin, TileBeginOrigin)
     )
     if len(tile_symbols) != 1:
         return None
     tile_symbol = tile_symbols[0]
     origin = host.expr_to_origin[tile_symbol].origin
-    assert isinstance(origin, TileBeginOrigin)
+    assert isinstance(origin, GridOrigin)
     coefficient = sympy.expand(base).coeff(tile_symbol)
     remainder = env.shape_env.simplify(base - coefficient * tile_symbol)
     if (
@@ -2308,11 +2287,10 @@ class DeviceIRAnalysis:
                 layout_is_symbolically_exact = False
 
                 if fake is not None:
-                    storage = fake.untyped_storage()
-                    # A peer view stands for the local allocation on its owner rank.
-                    allocation = host.compiler_state.peer_views.get(
-                        storage, (storage, None)
-                    )
+                    # A peer view stands for the local allocation on its owner
+                    # rank; an unmapped peer view has none (allocation_id
+                    # stays -1 and the check below rejects the kernel).
+                    allocation = allocation_of(fake)
                     if allocation is not None:
                         storage, owner_rank = allocation
                         allocation_id = allocation_ids.setdefault(

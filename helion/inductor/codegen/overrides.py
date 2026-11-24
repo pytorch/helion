@@ -36,6 +36,12 @@ def upcast_compute_type(dtype: torch.dtype) -> torch.dtype:
     return dtype
 
 
+def number_constant(value: object, dtype: torch.dtype) -> bool:
+    """Whether HelionOverrides.constant() writes ops.constant(value, dtype) as a
+    Python number: a float32 one (bf16 and fp16 compute in float32)."""
+    return upcast_compute_type(dtype) == torch.float32 and not isinstance(value, bool)
+
+
 class HelionPrinter(PythonPrinter):
     """Prints Min/Max over tile index tensors as torch.minimum/maximum."""
 
@@ -66,7 +72,21 @@ class HelionOverrides(OpOverrides):
 
     @staticmethod
     def constant(value: bool | float, dtype: torch.dtype) -> str:
-        # A 0-d tensor, since torch.minimum/maximum take no Python scalar.
+        """A float32 constant is a Python float, as in a Helion kernel written
+        by hand, which the Helion compiler's rewrites take for one: of the
+        threshold of a dropout mask, rand > 0.1 compares the random words
+        against one integer cutoff, where with a 0-d tensor each element
+        converts its word to fp32 and compares.  A Python float and a 0-d
+        tensor promote alike against a tensor of the same dtype category (a
+        bf16 x + 1.0 stays bf16), which is all Inductor's ops mix (it casts
+        their operands to one dtype first).  An op that takes no Python
+        scalar (torch.maximum(x, 0.0), a store, a cast) gets it as a 0-d
+        tensor (HelionKernel.as_tensor()).  Other constants stay 0-d tensors
+        of their dtype: hl.full([], 4, dtype=torch.int64), and a float64 one,
+        whose printed number would share the CSE entry of the same float32
+        constant."""
+        if number_constant(value, dtype):
+            return constant_repr(float(value))
         dtype = upcast_compute_type(dtype)
         return f"hl.full([], {constant_repr(value)}, dtype={dtype})"
 
@@ -144,13 +164,34 @@ class HelionOverrides(OpOverrides):
     def floordiv(a: str, b: str) -> str:
         return f'torch.div({a}, {b}, rounding_mode="floor")'
 
+    @staticmethod
+    # pyrefly: ignore [bad-override]
+    def where(condition: object, a: object, b: object) -> object:
+        """torch.where(condition, a, b), or the value it picks where the tiles'
+        ranges prove `condition` (HelionKernel.proven()), as for the
+        tile_x.index < 100 of
+        (torch.cat([x, y], -1) * 2)[:, :50] over tiles of x < 50 only:
+            tmp13 = torch.where(tmp4, tmp7, tmp12)
+            tmp15 = tmp13 * tmp14
+        becomes tmp12 = tmp5 * tmp11, and the other branch, y's masked load
+        (HelionKernel.masked()), is dead code Helion drops. A Python number
+        picked, as the 0.0 of ops.where(mask, 0.0, x) of a mask proven true,
+        keeps the torch.where: the kernel's CSE takes no number."""
+        if isinstance(condition, CSEVariable):
+            truth = cast("HelionKernel", V.kernel).proven(condition)
+            if truth is not None:
+                picked = a if truth else b
+                if isinstance(picked, (CSEVariable, str)):
+                    return picked
+        return f"torch.where({condition}, {a}, {b})"
+
 
 # Inductor ops that are one torch function of the same arguments, e.g.
 # ops.sinh(x) -> torch.sinh(x) and ops.atan2(y, x) -> torch.atan2(y, x).
 # fmt: off
 TORCH_FUNCTIONS = {
     **{name: f"torch.{name}" for name in [
-        "where", "minimum", "maximum", "logical_and", "logical_or", "logical_not",
+        "minimum", "maximum", "logical_and", "logical_or", "logical_not",
         "logical_xor", "relu", "abs", "sign", "signbit", "isinf", "isnan", "reciprocal",
         "sqrt", "rsqrt", "exp", "exp2", "expm1", "log", "log1p", "log2", "log10",
         "sigmoid", "erf", "erfc", "erfinv", "lgamma", "i0", "sin", "cos", "tan", "sinh",

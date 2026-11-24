@@ -18,7 +18,11 @@ or, for a Helion port, when its pinned kernels no longer generate the code
 the autotune measured (``stale``: ``code_matches_autotune`` is false, so the
 timing is not of the tuned kernels; the source-line comments of the code do
 not count, except for an autotune record made before records held the
-digest without them: ``common.pin_roundtrip``). One exception, in a record
+digest without them: ``common.pin_roundtrip``). The pinned helion.inductor
+code (``inductor_helion_pretuned``) written by another helion.inductor than
+this tree's (``source_hash_matches`` false) is marked ``stale?``, which only
+labels it: its code may still be what helion.inductor generates, so its
+timing stays in. One exception, in a record
 of several processes: an Inductor compile that failed in some of them
 (``FAIL`` in the column as well) still stands in the baseline of the
 processes in which it ran and passed (``impl_times``), and the report lists
@@ -52,12 +56,15 @@ it gives
   same); the geomean fraction of the speed of light (memcopy time over
   kernel time, ``%SOL``) of Inductor and Helion+CuTe on those kernels;
   Helion-Triton's geomean speedup over Inductor and Helion+CuTe's over
-  Helion-Triton and over the oracle, each on the kernels where both count;
+  Helion-Triton and over the oracle, and the pinned helion.inductor code's
+  over Inductor and over Helion+CuTe, each on the kernels where both count;
   and, with ``--baseline``, the earlier run's geomean on the same kernels
   (those its own report would count, records without activity samples
   included: early runs have none);
 - the same per family;
-- a row per kernel, next to the ``--baseline`` run's Helion+CuTe speedup.
+- a row per kernel, with the pinned helion.inductor code's time and speedup
+  over Inductor beside the ports', next to the ``--baseline`` run's
+  Helion+CuTe speedup.
 
 With ``--baseline`` it also says how many of the run's own autotunes
 searched from the random seed of the baseline's autotune of the same port
@@ -138,8 +145,19 @@ if __name__ == "__main__":
 
 from benchmarks.cute.better_benchmark import common
 
-IMPLS = ("inductor", "oracle", "helion_triton", "helion_cute", "memcopy")
+IMPLS = (
+    "inductor",
+    "oracle",
+    "helion_triton",
+    "helion_cute",
+    "inductor_helion_pretuned",
+    "memcopy",
+)
 PORTS = {"helion_cute": "cute", "helion_triton": "triton"}
+# The numerics column names an implementation by its name's last part
+# (cd=, max=, cute=, pretuned=, ...), but for helion.inductor compiled cold:
+# "helion=" would read as a verdict on the ports.
+NUMERICS_LABELS = {"inductor_helion": "cold"}
 # T5's relative-position-bias backward, the selection's longest kernel under
 # Inductor by far: it dominates any time-weighted total.
 OUTLIERS = ["sum_sum_sum_d2c97d17f3dc"]
@@ -181,6 +199,10 @@ def verdict(info: dict[str, Any]) -> str:
         return "FAIL"
     if info.get("code_matches_autotune") is False:
         return "stale"
+    if info.get("source_hash_matches") is False:
+        # Pinned helion.inductor code written by another helion.inductor
+        # (bench.py's source_hash): it may not be the code generated now.
+        return "stale?"
     return {True: "ok", None: "?"}[info.get("numerics_pass")]
 
 
@@ -473,6 +495,11 @@ def summarize(
         "inductor_debiased": debiased_baseline(record, metric),
         "oracle": impl_times(record, "oracle", metric),
         **{impl: impl_times(record, impl, metric, impl in elsewhere) for impl in PORTS},
+        # The pinned helion.inductor code (inductor_pretuned/), which pins its
+        # own configs: no autotune record of the run's applies to it.
+        "inductor_helion_pretuned": impl_times(
+            record, "inductor_helion_pretuned", metric
+        ),
         "memcopy": impl_times(record, "memcopy", metric),
     }
     row: dict[str, Any] = {
@@ -504,6 +531,8 @@ def summarize(
         ("cute_vs_oracle", "helion_cute", "oracle"),
         ("cute_vs_helion_triton", "helion_cute", "helion_triton"),
         ("triton_vs_inductor", "helion_triton", "inductor"),
+        ("helion_inductor_vs_inductor", "inductor_helion_pretuned", "inductor"),
+        ("helion_inductor_vs_cute", "inductor_helion_pretuned", "helion_cute"),
     ):
         row[key], per_process = speedup(impl, base)
         row["speedups"].setdefault(impl, {})[base] = row[key]
@@ -520,7 +549,11 @@ def summarize(
         row["inductor_of_sol"] = row["memcopy"] / row["inductor"]
     row["numerics"] = {
         impl: verdict(record["impls"].get(impl) or {})
-        for impl in (*common.INDUCTOR_IMPLS, "oracle", "helion_triton", "helion_cute")
+        for impl in common.GATED_IMPLS
+        # helion.inductor's code only where the bench timed it: the cold
+        # compile is opt-in, and a point without pinned code skips it.
+        if impl not in common.OPT_IN_IMPLS
+        or (record["impls"].get(impl) or {}).get("status") not in (None, "skipped")
     }
     kernels = {}
     for impl in (*common.INDUCTOR_IMPLS, "helion_cute", "helion_triton"):
@@ -689,6 +722,8 @@ def aggregate(
         ("triton_vs_inductor", "helion_triton", "inductor"),
         ("cute_vs_triton", "helion_cute", "helion_triton"),
         ("cute_vs_oracle", "helion_cute", "oracle"),
+        ("helion_inductor_vs_inductor", "inductor_helion_pretuned", "inductor"),
+        ("helion_inductor_vs_cute", "inductor_helion_pretuned", "helion_cute"),
     ):
         values = [v for row in rows if (v := ratio(row, impl, base)) is not None]
         out[key] = geomean(values)
@@ -944,6 +979,19 @@ def aggregate_lines(
         (
             "Helion+CuTe vs oracle, geomean (kernels)",
             lambda a: times(a["cute_vs_oracle"], a["cute_vs_oracle_kernels"]),
+        ),
+        (
+            "pinned helion.inductor vs Inductor, geomean (kernels)",
+            lambda a: times(
+                a["helion_inductor_vs_inductor"],
+                a["helion_inductor_vs_inductor_kernels"],
+            ),
+        ),
+        (
+            "pinned helion.inductor vs Helion+CuTe, geomean (kernels)",
+            lambda a: times(
+                a["helion_inductor_vs_cute"], a["helion_inductor_vs_cute_kernels"]
+            ),
         ),
     ]
     if any("rot_us" in a for a in columns.values()):
@@ -1233,13 +1281,17 @@ def main() -> None:
                 "| repro | shape | MB | inductor | helion-cute | cute/ind"
                 f"{debiased_column}{spread_column}{rot_column}{baseline_column}"
                 " | helion-triton"
-                " | triton/ind | oracle | memcopy | ind %SOL | cute %SOL | numerics"
+                " | triton/ind | helion.inductor | h.ind/ind | oracle | memcopy"
+                " | ind %SOL | cute %SOL | numerics"
                 " | left out of the aggregates |"
             ),
-            f"|{'---|' * (14 + debiased + repeated + rot_column.count('|') + bool(baseline_column))}",
+            f"|{'---|' * (16 + debiased + repeated + rot_column.count('|') + bool(baseline_column))}",
         ]
         for r in sorted(table, key=lambda r: r["cute_vs_inductor"] or 0):
-            num = ",".join(f"{k.split('_')[-1]}={v}" for k, v in r["numerics"].items())
+            num = ",".join(
+                f"{NUMERICS_LABELS.get(k, k.split('_')[-1])}={v}"
+                for k, v in r["numerics"].items()
+            )
             before = (
                 f" | {fmt(baseline.get((r['repro'], r['shape'])), '.3f')}"
                 if baseline_name
@@ -1271,6 +1323,8 @@ def main() -> None:
                 f" | {fmt(r['inductor'])} | {fmt(r['helion_cute'])}"
                 f" | {fmt(r['cute_vs_inductor'], '.3f')}{other}{spread}{rot}{before}"
                 f" | {fmt(r['helion_triton'])} | {fmt(r['triton_vs_inductor'], '.3f')}"
+                f" | {fmt(r['inductor_helion_pretuned'])}"
+                f" | {fmt(r['helion_inductor_vs_inductor'], '.3f')}"
                 f" | {fmt(r['oracle'])} | {fmt(r['memcopy'])}"
                 f" | {fmt(100 * r['inductor_of_sol'] if r.get('inductor_of_sol') else None, '.0f')}"
                 f" | {fmt(100 * r['cute_of_sol'] if r.get('cute_of_sol') else None, '.0f')}"

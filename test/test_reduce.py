@@ -711,6 +711,9 @@ class TestReduce(RefEagerTestBase, TestCase):
         expected_y = torch.tensor([3.0, 6.0], device=DEVICE)
         torch.testing.assert_close(result_x, expected_x)
         torch.testing.assert_close(result_y, expected_y)
+        if _get_backend() == "triton":
+            # One reduction serves both results.
+            self.assertTrueIfInNormalMode(code.count("tl.reduce(") == 1)
 
     def test_reduce_different_dtypes(self):
         """Test reduce with different tensor dtypes."""

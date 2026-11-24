@@ -14,6 +14,7 @@ import pytest
 import sympy
 import torch
 
+import helion
 from helion import exc
 from helion._compiler import cross_loop_codegen
 from helion._compiler import cross_loop_scheduler
@@ -51,6 +52,7 @@ from helion._testing import skipUnlessBackends
 from helion._testing.cute_codegen import cuda_metadata_trace
 from helion._testing.distributed_kernels import fake_group as fake_group
 from helion._testing.distributed_kernels import scatter_after_local_kernel
+import helion.language as hl
 
 pytestmark = pytest.mark.cpu_only
 
@@ -164,6 +166,32 @@ def test_hold_waits_before_the_first_scatter(fake_group: str) -> None:
     assert announce.start() < local
     hold = body.index("_hold_after_fallback(tile_dependency_peer_state")
     assert local < hold < scatter
+
+
+def _grid_then_tile(x: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    res = torch.empty_like(x)
+    for i in hl.grid(8):
+        span = hl.arange(16) + i * 16
+        out[span] = x[span] + 1
+    for tile in hl.tile(128, block_size=32):
+        res[tile] = out[tile] * 2
+    return res
+
+
+@skipUnlessBackends(["triton"])
+@skipIfTileIR("TileIR does not support barrier operations")
+@skipIfRefEager("tile dependencies are built only in compiled mode")
+def test_a_grid_index_span_keys_its_readers() -> None:
+    """A grid index is the begin of a tile of its step
+    (``_subscript_dense_span``): each tile of 32 continues after the pair of
+    grid tasks that store it, with no root barrier."""
+    config = helion.Config(pid_type="persistent_blocked", cross_loop_pipeline="static")
+    with cuda_metadata_trace():
+        kernel = helion.kernel(_grid_then_tile, static_shapes=True)
+        code = kernel.bind((torch.empty(128),)).to_triton_code(config)
+    assert "tile_dependency_root_barrier" not in code, code
+    assert re.search(r"tile_dependency_continuation_task = .* // 2\n", code), code
 
 
 def _domain(
@@ -1561,6 +1589,17 @@ class TestCrossLoopScheduler(TestCase):
         )
         self.assertEqual(len(counters), 1)
         self.assertEqual(counters[0].uniform_arrival_count(), 1)
+
+    def test_a_phase_barrier_orders_a_hint_load(self) -> None:
+        # A later write waits for no hint load: unordered in its phase, ordered
+        # by the barrier that starts the next.
+        hint = dataclasses.replace(_access(root=0, kind="load", block_id=10), hint=True)
+        store = _access(root=1, kind="store", block_id=20)
+        graph = _dependency_graph([[10], [20]], hint, store)
+        self.assertEqual(graph.edges, ())
+        self.assertEqual(graph.unordered_hint_reads, {(0, 0)})
+        graph = _dependency_graph([[10], [20]], hint, store, root_phases=(0, 1))
+        self.assertEqual(graph.unordered_hint_reads, frozenset())
 
     def test_unproved_mapping_builds_root_barrier_event(self) -> None:
         graph = _dependency_graph(

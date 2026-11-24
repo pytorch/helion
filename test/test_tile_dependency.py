@@ -28,6 +28,7 @@ from helion._compiler.tile_dependency import TileAccess
 from helion._compiler.tile_dependency import TileDependency
 from helion._compiler.tile_dependency import TileDependencyKind
 from helion._compiler.tile_dependency import _access_layout
+from helion._compiler.tile_dependency import _access_region
 from helion._compiler.tile_dependency import _CoordinateRelationPiece
 from helion._compiler.tile_dependency import _interval_hull
 from helion._compiler.tile_dependency import _rectangular_overlap_sources
@@ -1490,6 +1491,24 @@ class TestTileDependency(TestCase):
                 )
 
                 self.assertTrue(allocation_regions_may_overlap(left, right))
+
+    def test_diagonal_region_is_inexact(self) -> None:
+        # x[tile, tile] reads only the diagonal blocks of the box its bounds span.
+        extent = sympy.Integer(16)
+        family = TaskFamily((TaskAxis(10, extent), TaskAxis(11, extent)))
+        for block_ids, exact in (((10, 11), True), ((10, 10), False)):
+            access = _access(
+                0,
+                root=0,
+                kind="load",
+                shape=(16, 16),
+                strides=(16, 1),
+                block_ids=block_ids,
+                scales=(1, 1),
+                offsets=(0, 0),
+            )
+            region = _access_region(access, family)
+            self.assertEqual(region.coordinates_are_exact, exact)
 
     def test_multidimensional_storage_offset_falls_back_to_root(self) -> None:
         plan = build_tile_dependency_graph(

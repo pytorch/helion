@@ -4935,24 +4935,16 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
                 PreparedMetadataSpecializationExtractor(td_layout_extractor)
             )
 
-        for source, guard in sorted(
+        for (source, view), guard in sorted(
             tensor_descriptor_alignment_guards.items(),
             key=lambda item: repr(item[0]),
         ):
-            # Prepared metadata guards do not cover base pointers.  A guard only
-            # a prefetch registered keys its base alone (below).
-            active = bool(
+            # Prepared metadata guards do not cover base pointers: key one when a
+            # candidate config reads the input (``view``: a view derived from
+            # it) through a descriptor, or gives some prefetch the box form.
+            descriptor = bool(
                 guard.memory_op_indices or guard.atomic_op_indices
             ) and guard_is_active(guard)
-            if active:
-                extractors.append(
-                    _TensorDescriptorAlignmentExtractor(
-                        make_extractor(source), guard.requires_zero_storage_offset
-                    )
-                )
-            # A prefetch needs only the base aligned (bound_prefetch_alignments),
-            # whatever storage offset a descriptor sharing the guard requires, and
-            # only when a candidate config gives some prefetch the box form.
             prefetch = guard.prefetch and (
                 candidates is None
                 or any(
@@ -4960,9 +4952,9 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
                     for config, _memory_ops in candidates
                 )
             )
-            if prefetch and (not active or guard.requires_zero_storage_offset):
+            if descriptor or prefetch:
                 extractors.append(
-                    _TensorDescriptorAlignmentExtractor(make_extractor(source), False)
+                    _TensorDescriptorAlignmentExtractor(make_extractor(source), view)
                 )
 
         for key, specialization in sorted(

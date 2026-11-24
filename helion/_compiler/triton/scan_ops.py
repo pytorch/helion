@@ -62,7 +62,10 @@ def _(state: CodegenState) -> ast.AST | list[ast.AST]:
     )
 
     if is_tuple_input:
-        return _create_tuple_result_expressions(state, scan_expr)
+        # One bound scan serves every result.
+        inputs = state.proxy_arg(1)
+        assert isinstance(inputs, (tuple, list))
+        return state.tuple_results(scan_expr, len(inputs), prefix="scan_tuple")
     if valid is not None:
         return expr_from_string("{scan}[0]", scan=scan_expr)
     return scan_expr
@@ -243,18 +246,3 @@ def _create_scan_expression(
         input_tensor=input_tensor,
         dim_value=ast.Constant(value=dim),
     )
-
-
-def _create_tuple_result_expressions(
-    state: CodegenState, scan_expr: ast.AST
-) -> list[ast.AST]:
-    """Create getitem expressions for tuple results."""
-    raw_input = state.ast_args[1]
-    num_elements = len(raw_input) if isinstance(raw_input, tuple) else 2
-
-    return [
-        expr_from_string(
-            "{scan_result}[{index}]", scan_result=scan_expr, index=ast.Constant(value=i)
-        )
-        for i in range(num_elements)
-    ]

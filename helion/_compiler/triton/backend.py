@@ -21,6 +21,7 @@ import torch
 from ... import _compat
 from ... import exc
 from ..ast_extension import expr_from_string
+from ..ast_extension import statement_from_string
 from ..backend import Backend
 from ..backend import BackendState
 from ..backend import HandlerOpOverrides
@@ -35,6 +36,7 @@ if TYPE_CHECKING:
     from torch._inductor.ops_handler import OpsHandler
 
     from ...autotuner.config_fragment import ConfigSpecFragment
+    from ...autotuner.config_spec import ConfigSpec
     from ...autotuner.llm.profile import LlmPromptProfile
     from ...runtime.config import Config
     from ...runtime.kernel import BoundKernel
@@ -296,6 +298,9 @@ class TritonBackend(Backend):
             fragments.update(get_mtia_tunable_fragments())
 
         return fragments
+
+    def probe_long_autotune_kernels(self, config_spec: ConfigSpec) -> bool:
+        return True
 
     def setup_compile_cache_dir(self, device_index: int) -> None:
         if "TRITON_CACHE_DIR" not in os.environ:
@@ -986,8 +991,13 @@ class GluonBackend(TritonBackend):
         statements = finalize_ring(fn_def, ctx)
         transports = dsmem_transports(ctx.device_function)
         if transports and ctx.device_function.ring is None:
-            fn_def.body.insert(0, cluster_entry(transports))
-            fn_def.body.append(cluster_exit())
+            # The barrier orders thread 0's init before every thread's waits
+            # (a ring's ``warp_specialize`` start does).
+            fn_def.body[:0] = [
+                cluster_entry(transports),
+                statement_from_string("tl.debug_barrier()"),
+            ]
+            fn_def.body.append(cluster_exit(transports))
         return [*statements, *trailing]
 
     def pipeline_loops(

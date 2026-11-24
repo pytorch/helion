@@ -27,13 +27,13 @@ from ...language import _decorators
 from ...language.inline_triton_ops import _validate_args
 from ...language.inline_triton_ops import inline_triton
 from ...language.inline_triton_ops import triton_kernel
+from .. import loop_dependency_checker
 from ..ast_extension import convert
 from ..ast_extension import create
 from ..ast_extension import expr_from_string
 from ..ast_extension import statement_from_string
 from ..compile_environment import CompileEnvironment
 from ..host_function import HostFunction
-from ..loop_dependency_checker import emit_intra_loop_raw_barrier
 from ..output_header import SOURCE_MODULE
 
 if TYPE_CHECKING:
@@ -402,7 +402,7 @@ def _emit_output_assertions(
 
 @_decorators.codegen(inline_triton, "triton")
 def _(state: CodegenState) -> ast.AST | list[ast.AST]:
-    emit_intra_loop_raw_barrier(state)
+    loop_dependency_checker.emit_intra_loop_raw_barrier(state)
     triton_source = state.proxy_arg(0)
     args_obj = state.proxy_arg(1)
     output_like = state.proxy_arg(2)
@@ -451,7 +451,7 @@ def _(state: CodegenState) -> ast.AST | list[ast.AST]:
 
 @_decorators.codegen(triton_kernel, "triton")
 def _(state: CodegenState) -> ast.AST | list[ast.AST]:
-    emit_intra_loop_raw_barrier(state)
+    loop_dependency_checker.emit_intra_loop_raw_barrier(state)
     triton_source_or_fn = state.proxy_arg(0)
     args_obj = state.proxy_arg(1)
     output_like = state.proxy_arg(2)

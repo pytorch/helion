@@ -38,6 +38,17 @@ which is the sum bit for bit, case by case of the sweep's terms:
 - ``hit``, the miss and ``scale`` share the sum's dtype, in which both
   forms compute the terms, so the hit term rounds the same in both.
 
+Inductor's Helion code (``helion.inductor``) writes the same row with a
+``reshape`` for each inserted dim, a rank-1 iota that broadcasts along the
+last dim, cast to the compare's dtype, and ``hl.full`` scalars::
+
+    tmp5 = (hl.arange(rdim)).to(torch.int64)
+    tmp7 = target.reshape([tile_x, 1]) == tmp5
+    tmp10 = torch.where(tmp7, hl.full([], -1.0, ...), hl.full([], 0.0, ...))
+    tmp15 = torch.sum(tmp10 * scale.reshape([tile_x, 1]), -1)
+
+which folds the same way.
+
 Only a zero miss value qualifies (any other one sums rounding errors), and
 ``target``, ``hit`` and ``scale`` must be uniform along the reduced dim; the
 iota must count ``0, 1, ..., n - 1``, distinct in its dtype, along the whole
@@ -78,6 +89,8 @@ _WHERE = torch.ops.aten.where.self
 _EQ = torch.ops.aten.eq.Tensor
 _IOTA = torch.ops.prims.iota.default
 _SCALAR = torch.ops.aten.scalar_tensor.default
+_CONVERT = torch.ops.prims.convert_element_type.default
+_VIEWS = (torch.ops.aten.view.default, torch.ops.aten.reshape.default)
 
 
 def _uniform_along(node: object, dim: int, rank: int) -> bool:
@@ -93,7 +106,24 @@ def _uniform_along(node: object, dim: int, rank: int) -> bool:
 
 
 def _zero_scalar(node: object) -> bool:
-    return is_call(node, _SCALAR) and scalar_value(node) == 0
+    """A zero ``aten.scalar_tensor`` (a traced ``0.0``) or 0-d ``hl.full``."""
+    return scalar_value(node, allow_full=True) == 0
+
+
+def _inserts_dim(node: object, source: object, dim: int) -> bool:
+    """Whether ``node``'s shape is ``source``'s with a dim of size 1 inserted
+    at ``dim``, as ``x.reshape([tile_x, 1])`` makes of an ``x`` of
+    ``[tile_x]``."""
+    value, source_value = node_tensor(node), node_tensor(source)
+    if value is None or source_value is None:
+        return False
+    shape, source_shape = list(value.shape), list(source_value.shape)
+    if len(shape) != len(source_shape) + 1 or not 0 <= dim < len(shape):
+        return False
+    env = CompileEnvironment.current()
+    return env.known_equal(shape.pop(dim), 1) and all(
+        starmap(env.known_equal, zip(shape, source_shape, strict=True))
+    )
 
 
 def _reduced_extent(size: object) -> int | None:
@@ -115,22 +145,41 @@ def _reduced_extent(size: object) -> int | None:
 
 def _counting_iota(node: object, dim: int, rank: int, size: object) -> int | None:
     """The static length of the ``iota`` (``0, 1, ...``) that ``node`` views
-    along ``dim`` alone (size 1 along the other dims), counting the whole
-    reduced dim of size ``size``; ``None`` for anything else."""
-    view = binary_pair(node, (view_ops.subscript,))
-    if view is None:
-        return None
-    iota, indices = view
-    if (
-        not is_call(iota, _IOTA)
-        or not isinstance(indices, (list, tuple))
-        or len(indices) != rank
-        or not all(
-            is_full_slice(index) if position == dim else index is None
-            for position, index in enumerate(indices)
-        )
-    ):
-        return None
+    along ``dim`` alone, counting the whole reduced dim of size ``size``:
+    ``iota[None, :]`` (size 1 along the other dims), a rank-1 iota along the
+    last dim, which it broadcasts along, or either cast to an integer dtype
+    that keeps its values distinct (``hl.arange(n).to(torch.int64)``);
+    ``None`` for anything else."""
+    if is_call(node, _CONVERT):
+        assert isinstance(node, torch.fx.Node)
+        value = node_tensor(node)
+        extent = _counting_iota(node.args[0], dim, rank, size)
+        if (
+            extent is None
+            or value is None
+            or value.dtype.is_floating_point
+            or value.dtype is torch.bool
+            or extent - 1 > torch.iinfo(value.dtype).max
+        ):
+            return None
+        return extent
+    if is_call(node, _IOTA) and dim == rank - 1:
+        iota = node
+    else:
+        view = binary_pair(node, (view_ops.subscript,))
+        if view is None:
+            return None
+        iota, indices = view
+        if (
+            not is_call(iota, _IOTA)
+            or not isinstance(indices, (list, tuple))
+            or len(indices) != rank
+            or not all(
+                is_full_slice(index) if position == dim else index is None
+                for position, index in enumerate(indices)
+            )
+        ):
+            return None
     assert isinstance(iota, torch.fx.Node)
     extent = _reduced_extent(size)
     if extent is None:
@@ -219,12 +268,20 @@ def _without_dim(
     node: torch.fx.Node | None, dim: int, rank: int
 ) -> torch.fx.Node | None:
     """``node`` with the reduced dim dropped: a 0-d tensor as is, the source
-    of a view that inserts the dim (``x[:, None]``), else ``None``."""
+    of a view that inserts the dim (``x[:, None]``, ``x.reshape([tile_x,
+    1])``), else ``None``."""
     value = node_tensor(node)
     if value is None:
         return None
     if value.ndim == 0:
         return node
+    if (
+        is_call(node, *_VIEWS)
+        and isinstance(node, torch.fx.Node)
+        and len(node.args) == 2
+        and _inserts_dim(node, node.args[0], dim)
+    ):
+        return cast("torch.fx.Node", node.args[0])
     view = binary_pair(node, (view_ops.subscript,))
     if view is None:
         return None

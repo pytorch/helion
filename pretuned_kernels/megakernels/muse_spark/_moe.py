@@ -1,21 +1,25 @@
-"""Shared pieces of the Muse Spark verify MoE megakernels (TP4 and EP4).
+"""Shared MoE pieces of the Muse Spark megakernels: the EP4 verify MoE
+(moe_ep4.py) and the expert-TP MoE inside the layer megakernels.
 
 Device helpers: the routed-expert table each task decodes its expert from, and
 the FlashInfer TRT-LLM tile layouts, SwiGLU and NVFP4 z quant of R1. Host
-helpers: routing draws, random checkpoint experts in FlashInfer's layout, and
-the FP64 references both megakernels are checked against.
+helpers: routing draws, random checkpoint experts in FlashInfer's layout, the
+FP64 references the EP4 megakernel is checked against, and the layer
+megakernels' expert weight banks.
 """
 
 from __future__ import annotations
 
 import dataclasses
 import operator
+from typing import TYPE_CHECKING
 
 from pretuned_kernels.megakernels.muse_spark._common import EXPERT_HIDDEN
 from pretuned_kernels.megakernels.muse_spark._common import NUM_EXPERTS
 from pretuned_kernels.megakernels.muse_spark._common import TOPK
 from pretuned_kernels.megakernels.muse_spark._common import WORLD_SIZE
 from pretuned_kernels.megakernels.muse_spark._common import ExpertInputs
+from pretuned_kernels.megakernels.muse_spark._common import dequantize_e2m1
 from pretuned_kernels.megakernels.muse_spark._common import dequantize_nvfp4
 from pretuned_kernels.megakernels.muse_spark._common import encode_block_scale
 from pretuned_kernels.megakernels.muse_spark._common import pack_e2m1x2
@@ -26,11 +30,15 @@ import torch.distributed as dist
 
 import helion.language as hl
 
+if TYPE_CHECKING:
+    from collections.abc import Callable
+
 # The MoE runs in the pooled expert space: H here is EXPERT_HIDDEN, not HIDDEN.
 HIDDEN = EXPERT_HIDDEN
 INTERMEDIATE = 4096
 NORM_EPS = 1e-8
-FC2_GLOBAL_SCALE_INV = 1.0 / (448.0 * 6.0)
+# NVFP4's global scale per unit amax: 1 / (E4M3 max x e2m1 max).
+GLOBAL_SCALE_INV = 1.0 / (448.0 * 6.0)
 BF16_MAX = torch.finfo(torch.bfloat16).max
 FP32_MAX = torch.finfo(torch.float32).max
 
@@ -42,6 +50,8 @@ TILE_K = 256  # e2m1x2 bytes per K step
 def _popcount(v: torch.Tensor) -> torch.Tensor:
     """Set bits per int32 lane (SWAR: Triton cannot scan inside a WS loop)."""
 
+    # An operand widened by int64 indexing keeps its low 32 bits.
+    v = v.to(torch.int32)
     v = v - ((v >> 1) & 0x55555555)
     v = (v & 0x33333333) + ((v >> 2) & 0x33333333)
     return (((v + (v >> 4)) & 0x0F0F0F0F) * 0x01010101) >> 24
@@ -76,10 +86,35 @@ def expert_of(
     return (key & 7) * 32 + bit
 
 
-def scale_tile(chunks: torch.Tensor) -> torch.Tensor:
-    """[2, 16, 256] SWIZZLE_32_4_4 bytes of two 128-row tiles -> [256 rows, 32]."""
+def routed_rows(
+    routes: torch.Tensor, expert: torch.Tensor, rows: int, topk: int, slots: int
+) -> torch.Tensor:
+    """[rows] whether each MMA row's token routes to ``expert``."""
 
-    return chunks.reshape(2, 8, 32, 4, 4).permute(0, 3, 2, 1, 4).reshape(256, 32)
+    slot_id = hl.arange(rows)[:, None] * topk + hl.arange(topk)[None, :]
+    live = slot_id < slots
+    ids = hl.load(routes, [slot_id], extra_mask=live) >> 16
+    return torch.sum(((ids == expert) & live).to(torch.int32), dim=-1) > 0
+
+
+def logical_rows128(acc: torch.Tensor) -> torch.Tensor:
+    """[128 physical rows, t] -> logical order of one FI tile."""
+
+    t = acc.size(1)
+    return acc.reshape(4, 4, 8, t).permute(0, 2, 1, 3).reshape(128, t)
+
+
+def scale_tile(chunks: torch.Tensor, tiles: int = 2) -> torch.Tensor:
+    """SWIZZLE_32_4_4 bytes of ``tiles`` 128-row tiles and one K step ([tiles,
+    16, 256], or [16, 256] for one tile) -> [128 * tiles rows, 32]."""
+
+    # A 5-D permute even for one tile: a 4-D one gets Triton's warp
+    # specialization an extra partition.
+    return (
+        chunks.reshape(tiles, 8, 32, 4, 4)
+        .permute(0, 3, 2, 1, 4)
+        .reshape(128 * tiles, 32)
+    )
 
 
 def logical_rows(acc: torch.Tensor) -> torch.Tensor:
@@ -94,11 +129,13 @@ def swiglu(
     row_scale: torch.Tensor,
     up_alpha: torch.Tensor,
     gate_alpha: torch.Tensor,
+    order: Callable[[torch.Tensor], torch.Tensor] = logical_rows,
 ) -> torch.Tensor:
-    """Interleaved (up, gate) rows [256, t] -> SwiGLU [t, 128]."""
+    """Interleaved (up, gate) rows [r, t], put in logical order by ``order``
+    (``logical_rows``: two FI tiles; ``logical_rows128``: one) -> SwiGLU [t, r / 2]."""
 
-    t = acc.size(1)
-    pairs = logical_rows(acc).reshape(128, 2, t).permute(0, 2, 1)
+    rows, t = acc.size(0), acc.size(1)
+    pairs = order(acc).reshape(rows // 2, 2, t).permute(0, 2, 1)
     up_acc, gate_acc = hl.split(pairs)
     up = up_acc * row_scale[None, :] * up_alpha
     gate = gate_acc * row_scale[None, :] * gate_alpha
@@ -107,14 +144,15 @@ def swiglu(
 
 
 def quant_z(act: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """[t, 128] -> (e2m1x2 bytes [t, 64], E4M3 block scale bytes [t, 8])."""
+    """[t, n] -> (e2m1x2 bytes [t, n / 2], E4M3 block scale bytes [t, n / 16])."""
 
     t = act.size(0)
-    blocks = act.reshape(t, 8, 16)
+    nb = act.size(1) // 16
+    blocks = act.reshape(t, nb, 16)
     amax = torch.amax(torch.abs(blocks), dim=-1)
-    fp8, mult = encode_block_scale(hl.full([t, 8], 1.0, dtype=torch.float32), amax)
-    low, high = hl.split((blocks * mult[:, :, None]).reshape(t, 8, 8, 2))
-    zq = pack_e2m1x2(low, high).to(torch.uint8).reshape(t, 64)
+    fp8, mult = encode_block_scale(hl.full([t, nb], 1.0, dtype=torch.float32), amax)
+    low, high = hl.split((blocks * mult[:, :, None]).reshape(t, nb, 8, 2))
+    zq = pack_e2m1x2(low, high).to(torch.uint8).reshape(t, nb * 8)
     return zq, fp8.to(torch.uint8)
 
 
@@ -314,37 +352,47 @@ def make_problem(kinds: tuple[str, ...], tokens: int) -> Problem:
     norm_weight = 1.0 + 0.1 * torch.randn(HIDDEN, device="cuda", generator=g)
     return Problem(
         logical=logical,
-        fc2_scale=amax * FC2_GLOBAL_SCALE_INV,
+        fc2_scale=amax * GLOBAL_SCALE_INV,
         norm_weight=norm_weight.bfloat16(),
         draws=draws,
     )
 
 
+def nvfp4_quantize(
+    act: torch.Tensor, global_scale_inv: float | None = None
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """FlashInfer's NVFP4 recipe in FP32, as encode_block_scale runs it: (e2m1
+    values [..., K], E4M3 block-scale bytes [..., K / 16], token scales
+    [..., 1]), the token scale being the row's max |value| times
+    ``global_scale_inv``, or 1 (None: the global scale is pre-applied)."""
+    blocks = act.float().unflatten(-1, (-1, 16))
+    block_amax = blocks.abs().amax(-1)
+    token_scale = (
+        torch.ones_like(block_amax[..., :1])
+        if global_scale_inv is None
+        else block_amax.amax(-1, keepdim=True) * global_scale_inv
+    )
+    encode = torch.where(token_scale != 0, 1.0 / token_scale, FP32_MAX)
+    fp8 = (encode * (block_amax * (1.0 / 6.0))).clamp(max=448.0)
+    fp8 = fp8.to(torch.float8_e4m3fn)
+    scale = fp8.float()
+    out_scale = torch.where(scale != 0, 1.0 / (scale * (1.0 / encode)), 0.0)
+    values = round_e2m1(blocks * out_scale[..., None]).flatten(-2)
+    return values, fp8.view(torch.uint8), token_scale
+
+
 def _quant_unit(act: torch.Tensor) -> torch.Tensor:
     """NVFP4 with a unit global scale (the FC2 input scale is pre-applied),
     dequantized to FP64: the megakernel's FC2 input."""
-    blocks = act.float().reshape(act.shape[0], -1, 16)
-    fp8 = (blocks.abs().amax(-1) / 6.0).clamp(max=448.0)
-    fp8 = fp8.to(torch.float8_e4m3fn).float()
-    x = blocks * torch.where(fp8 != 0, 1.0 / fp8, 0.0)[..., None]
-    return (round_e2m1(x) * fp8[..., None]).reshape(act.shape).double()
+    return dequantize_e2m1(*nvfp4_quantize(act)[:2])
 
 
 def _quant_full_row(act: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     """FlashInfer's dynamic BF16 -> NVFP4 FC2 requant of full rows (its B=1
     recipe), dequantized: (FP64 values [R, I], FP32 token scales [R])."""
     act = act.clamp(-BF16_MAX, BF16_MAX).bfloat16()
-    blocks = act.float().reshape(act.shape[0], -1, 16)
-    block_amax = blocks.abs().amax(-1)
-    token_scale = block_amax.amax(-1, keepdim=True) * FC2_GLOBAL_SCALE_INV
-    encode = torch.where(token_scale != 0, 1.0 / token_scale, FP32_MAX)
-    fp8 = (encode * (block_amax * (1.0 / 6.0))).clamp(max=448.0)
-    fp8 = fp8.to(torch.float8_e4m3fn).float()
-    out_scale = torch.where(fp8 != 0, 1.0 / (fp8 * (1.0 / encode)), 0.0)
-    values = (round_e2m1(blocks * out_scale[..., None]) * fp8[..., None]).reshape(
-        act.shape
-    )
-    return values.double(), token_scale.view(-1)
+    values, scales, token_scale = nvfp4_quantize(act, GLOBAL_SCALE_INV)
+    return dequantize_e2m1(values, scales), token_scale.view(-1)
 
 
 def references(
@@ -443,3 +491,137 @@ def check(
     dist.all_gather(peers, mine)
     if not all(torch.equal(peer, peers[0]) for peer in peers):
         raise AssertionError(f"rank {rank} {draw.kind}: ranks disagree on y")
+
+
+# The layer megakernels' expert weight banks, built from FlashInfer's TRT-LLM layouts (an NVFP4 bank and the
+# bf16-expert layers' bank): this rank's W13 slices and its H/W rows of W2 over the full K.
+
+
+@dataclasses.dataclass(frozen=True)
+class Nvfp4VerifyBank:
+    """One rank's weight bank and the stock FI W13 views that alias its head."""
+
+    weights: torch.Tensor  # [W13 tiles, K / 512, 256, 256] u8 view of [rows, K / 2]
+    # [W2 cells, K / 1024, 128, 512] u8: 128-row W2 cells, K-pair stages
+    weights2: torch.Tensor
+    scales: torch.Tensor  # [tiles, 2, K / 512 * 16, 256] e4m3
+    w13: torch.Tensor  # [E, 2I / W, H / 2] u8
+    w13_scale: torch.Tensor  # FI-shuffled W13 block scales, flat e4m3
+
+
+def build_nvfp4_verify_bank(
+    *,
+    w13: torch.Tensor,
+    w13_scale: torch.Tensor,
+    w2: torch.Tensor,
+    w2_scale: torch.Tensor,
+    group: dist.ProcessGroup,
+) -> Nvfp4VerifyBank:
+    """Copy this rank's FI W13 into a new bank and append its share of W2 (H/W rows
+    of each expert: a quarter at TP4, an eighth at TP8) over the full K as
+    contiguous tiles, all-to-all'd from every rank's K slice."""
+
+    world = group.size()
+    experts, two_local, packed_k = w13.shape
+    hidden, packed_local = w2.size(1), w2.size(2)
+    share = hidden // world
+    w13_rows, w2_rows = experts * two_local, experts * share
+    device = w13.device
+    bank = torch.empty(w13_rows + w2_rows, packed_k, dtype=torch.uint8, device=device)
+    bank[:w13_rows].copy_(w13.view(torch.uint8).reshape(w13_rows, packed_k))
+    send = (
+        w2.view(torch.uint8)
+        .view(experts, world, share, packed_local)
+        .permute(1, 0, 2, 3)
+        .contiguous()
+    )
+    recv = torch.empty_like(send)
+    dist.all_to_all_single(recv, send, group=group)
+    # W2 cells are [K pairs, 128, 512 B]: one 64 KiB DRAM run per cell and K pair.
+    assert world * packed_local == packed_k, "W2's full K must be W13's K"
+    k_steps = packed_k // TILE_K
+    w2_cells = w2_rows // MMA_M
+    k_pairs = packed_k // (2 * TILE_K)
+    rows2 = recv.permute(1, 2, 0, 3).reshape(w2_cells, MMA_M, k_pairs, 2 * TILE_K)
+    bank[w13_rows:].view(w2_cells, k_pairs, MMA_M, 2 * TILE_K).copy_(
+        rows2.permute(0, 2, 1, 3)
+    )
+    del send, recv, rows2
+
+    # Block scales are contiguous [K steps, 32 * 128] chunks per 128-row tile.
+    sf_bytes = packed_k // 8
+    sbank = torch.empty(
+        (w13_rows + w2_rows) * sf_bytes, dtype=torch.uint8, device=device
+    )
+    sbank[: w13_rows * sf_bytes].copy_(w13_scale.view(torch.uint8).reshape(-1))
+    tile_bytes = MMA_M * packed_local // 8
+    ssend = (
+        w2_scale.view(torch.uint8)
+        .reshape(experts, world, share // MMA_M, tile_bytes)
+        .permute(1, 0, 2, 3)
+        .contiguous()
+    )
+    srecv = torch.empty_like(ssend)
+    dist.all_to_all_single(srecv, ssend, group=group)
+    sbank[w13_rows * sf_bytes :].view(experts, share // MMA_M, world, tile_bytes).copy_(
+        srecv.permute(1, 2, 0, 3)
+    )
+
+    tiles = (w13_rows + w2_rows) // TILE_M
+    w13_tiles = w13_rows // TILE_M
+    e4m3 = torch.float8_e4m3fn
+    return Nvfp4VerifyBank(
+        weights=bank[:w13_rows]
+        .view(w13_tiles, TILE_M, k_steps, TILE_K)
+        .permute(0, 2, 1, 3),
+        weights2=bank[w13_rows:].view(w2_cells, k_pairs, MMA_M, 2 * TILE_K),
+        scales=sbank.view(e4m3).view(tiles, 2, k_steps * 16, TILE_M),
+        w13=bank[:w13_rows].view(experts, two_local, packed_k),
+        w13_scale=sbank[: w13_rows * sf_bytes].view(e4m3),
+    )
+
+
+@dataclasses.dataclass(frozen=True)
+class Bf16VerifyBank:
+    """One rank's bank for the bf16-expert layers: FI's BlockMajorK W13 itself (no copy) and a new W2 region, the
+    rank's H/W rows over the full K as the layer megakernel's 128-row cells (as the NVFP4 bank's W2)."""
+
+    weights: torch.Tensor  # [E, H / 64, 2I / W, 64] bf16: FI's shuffled W13 (aliased)
+    weights2: torch.Tensor  # [W2 cells, K / 256, 128, 256] bf16
+
+
+def build_bf16_verify_bank(
+    *,
+    w13: torch.Tensor,
+    w2: torch.Tensor,
+    group: dist.ProcessGroup,
+    expert_chunk: int = 32,
+) -> Bf16VerifyBank:
+    """``w13`` / ``w2``: FI's shuffled BlockMajorK bf16 experts, [E, H / 64, 2I / W, 64] and [E, I / W / 64, H, 64]
+    (this rank's K slice of W2). Each rank's share of W2 (H/W rows) is all-to-all'd from every rank's K slice,
+    ``expert_chunk`` experts at a time to bound the staging memory."""
+
+    world = group.size()
+    experts, k_blocks, hidden, block = w2.shape
+    local_k = k_blocks * block
+    share = hidden // world
+    cells = share // MMA_M  # per expert
+    k_pairs = local_k * world // (2 * MMA_M)  # 256-column K pairs of 128-column steps
+    weights2 = torch.empty(
+        experts * cells,
+        k_pairs,
+        MMA_M,
+        2 * MMA_M,
+        dtype=torch.bfloat16,
+        device=w2.device,
+    )
+    for e0 in range(0, experts, expert_chunk):
+        n = min(expert_chunk, experts - e0)
+        rows = w2[e0 : e0 + n].permute(0, 2, 1, 3).reshape(n, world, share, local_k)
+        send = rows.permute(1, 0, 2, 3).contiguous()
+        recv = torch.empty_like(send)
+        dist.all_to_all_single(recv, send, group=group)
+        full = recv.permute(1, 2, 0, 3).reshape(n * cells, MMA_M, k_pairs, 2 * MMA_M)
+        weights2[e0 * cells : (e0 + n) * cells].copy_(full.permute(0, 2, 1, 3))
+        del rows, send, recv, full
+    return Bf16VerifyBank(weights=w13, weights2=weights2)

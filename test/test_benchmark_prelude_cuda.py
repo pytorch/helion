@@ -11,6 +11,7 @@ import torch
 
 import helion
 from helion._testing import DEVICE
+from helion._testing import skipIfRefEagerMark
 from helion._testing import skipIfRocm
 from helion.autotuner import benchmarking
 from helion.autotuner.benchmark_prelude import BenchmarkPrelude
@@ -131,6 +132,7 @@ def _scale_rows(x: torch.Tensor, sums: torch.Tensor) -> torch.Tensor:
 
 @pytest.mark.slow
 @skipIfRocm("the benchmark worker's CUDA timers")
+@skipIfRefEagerMark("ref mode runs no autotuner search")
 def test_a_search_inside_timed_behind_times_its_candidates_behind_the_sequence(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -1,6 +1,8 @@
 """Distributed kernels shared by ``test/test_distributed.py`` (they run on
-several GPUs) and ``test/test_gluon_units.py`` (their code generated on CPU
-under a fake process group), and that fake group (``fake_group``)."""
+several GPUs) and the CPU modules that generate their code under a fake process
+group (``test/test_gluon_units.py``, ``test/test_distributed_codegen.py``,
+``test/test_cross_loop_scheduler.py``), and that fake group (``fake_group``,
+``fake_world``)."""
 
 from __future__ import annotations
 
@@ -30,6 +32,17 @@ def fake_group() -> Generator[str, None, None]:
         yield dist.group.WORLD.group_name
     finally:
         dist.destroy_process_group()
+
+
+def fake_world(world: int, *kernels: helion.Kernel) -> str:
+    """Recreate the fake group with ``world`` ranks and reset ``kernels``."""
+    dist.destroy_process_group()
+    dist.init_process_group(backend="fake", store=FakeStore(), rank=0, world_size=world)
+    # The new group reuses the old name, so a cached bind would be stale.
+    for kernel in kernels:
+        kernel.reset()
+    assert dist.group.WORLD is not None
+    return dist.group.WORLD.group_name
 
 
 def remote_views(t: torch.Tensor, group_name: hl.constexpr) -> tuple[torch.Tensor, ...]:
@@ -186,3 +199,50 @@ def pipelined_allreduce_kernel(
                     part = part + peers[r][inner]
                 out[inner] = part
     return out
+
+
+@helion.kernel(autotune_effort="none", static_shapes=True)
+def inband_gated_kernel(
+    symm: torch.Tensor,
+    credit: torch.Tensor,
+    x: torch.Tensor,
+    gate: torch.Tensor,
+    group_name: hl.ProcessGroupName,
+    variant: hl.constexpr,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """``symm`` travels only when ``gate`` is set; ``credit``, polled in full by
+    every rank, gives the mirrors their parity credit."""
+    peers = remote_views(symm, group_name)
+    credit_peers = remote_views(credit, group_name)
+    out = torch.zeros_like(symm)
+    total = torch.zeros_like(credit)
+    for tile in hl.tile(symm.size(0)):
+        # "sum" builds the gate with arithmetic.
+        on = (gate[hl.arange(1)] + 1 if variant == "sum" else gate[hl.arange(1)]) != 0
+        if variant == "tile-mask":
+            last = tile.index < symm.size(0) - 1
+            hl.store(symm, [tile], x[tile], extra_mask=on & last)
+        else:
+            hl.store(symm, [tile], x[tile], extra_mask=on)
+        credit[tile] = x[tile]
+    for tile in hl.tile(symm.size(0)):
+        on = (gate[hl.arange(1)] + 1 if variant == "sum" else gate[hl.arange(1)]) != 0
+        keep = (tile.index < symm.size(0)) & on
+        if variant in ("rank0", "rank1"):
+            # A term built from a rank constant, on the peer loads and the local
+            # store: ranks need not agree on it.
+            keep = keep & (gate[hl.arange(1)] != (2 if variant == "rank0" else 3))
+        acc = hl.zeros([tile], dtype=x.dtype)
+        tot = hl.zeros([tile], dtype=x.dtype)
+        for r in hl.static_range(len(peers)):
+            if variant == "R9":
+                acc = acc + peers[r][tile]
+            else:
+                acc = acc + hl.load(peers[r], [tile], extra_mask=keep)
+            tot = tot + credit_peers[r][tile]
+        hl.store(out, [tile], acc, extra_mask=keep)
+        total[tile] = tot
+        if variant == "written":
+            # A gate the kernel writes may change during the launch.
+            hl.store(gate, [hl.arange(1)], gate[hl.arange(1)])
+    return out, total
