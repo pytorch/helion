@@ -30,6 +30,8 @@ from ..._compiler._inductor.template_buffer import HelionTemplateBuffer
 from ..._compiler.backend_registry import get_backend
 from .. import config as helion_config
 from ..choices import HelionChoices
+from ..choices import fused_reindex
+from ..choices import restore_unfused_reindex
 from ..support import mix_order_split
 from ..support import numerics_modes
 from ..support import python_wrapper
@@ -356,7 +358,17 @@ class HelionScheduling(SIMDScheduling):
     ) -> FusedSchedulerNode:
         if HelionChoices.mix_order_reductions(node1, node2):
             return FusedMixOrderReductions(node1, node2)
-        return super().fuse(node1, node2)
+        fused = super().fuse(node1, node2)
+        fused_reindex(fused)
+        return fused
+
+    def codegen_node(
+        self, node: FusedSchedulerNode | SchedulerNode
+    ) -> SIMDKernel[Any] | MultiKernel | None:
+        # A pointwise node reindexed onto a reduction that did not take it
+        # walks its own loops again (reindex_onto_reduction()).
+        restore_unfused_reindex(node)
+        return super().codegen_node(node)
 
     def codegen_mix_order_reduction(self, node: FusedMixOrderReductions) -> None:
         """One Helion kernel for a mix-order pair, reductions over r and over x

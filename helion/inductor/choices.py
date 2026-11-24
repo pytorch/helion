@@ -3,7 +3,9 @@ from __future__ import annotations
 import dataclasses
 import math
 from typing import TYPE_CHECKING
+from typing import Any
 from typing import cast
+import weakref
 
 import sympy
 import torch
@@ -15,14 +17,19 @@ from torch._inductor.ir import ComputedBuffer
 from torch._inductor.ir import Pointwise
 from torch._inductor.ir import StorageBox
 from torch._inductor.ir import TensorBox
+from torch._inductor.loop_body import MemoryUsageType
 from torch._inductor.scheduler import BaseSchedulerNode
 from torch._inductor.scheduler import FusedMixOrderReductions
+from torch._inductor.scheduler import FusedSchedulerNode
 from torch._inductor.scheduler import MixOrderReduction
 from torch._inductor.scheduler import SchedulerNode
+from torch._inductor.scheduler import refresh_group_node_dependencies
 from torch._inductor.utils import sympy_product
+from torch._inductor.utils import sympy_subs
 from torch._inductor.virtualized import V
 from torch.fx.operator_schemas import normalize_function
 from torch.utils._ordered_set import OrderedSet
+from torch.utils._sympy.functions import Identity
 
 from . import config
 from .codegen.kernel import RDIM_SEGMENT_MIN
@@ -137,6 +144,391 @@ def contiguous_run(value: torch.Tensor, dims: Sequence[int]) -> int:
             break
         run *= value.shape[dim]
     return run
+
+
+def memory_order(
+    index: sympy.Expr, variables: Sequence[sympy.Symbol], ranges: dict[Any, Any]
+) -> list[sympy.Symbol] | None:
+    """`variables` (those of more than one element) in the order of their
+    strides in `index`, outermost first, when `index` lays them out in C order
+    and contiguous, each element once at an offset of 0: 100352*y + c + 64*r
+    over y of 1024, c of 64 and r of 1568 is [y, r, c]. None for any other
+    index: a stride that leaves gaps or overlaps, a // or %, an offset."""
+    index = sympy.expand(index.replace(Identity, lambda arg: arg))
+    index = index.xreplace({v: sympy.S.Zero for v in variables if ranges[v] == 1})
+    kept = [v for v in variables if ranges[v] != 1]
+    if not all(isinstance(ranges[v], (int, sympy.Integer)) for v in kept):
+        return None
+    strides = {v: index.coeff(v) for v in kept}
+    if not all(isinstance(s, sympy.Integer) and s > 0 for s in strides.values()):
+        return None
+    if sympy.expand(index - sum(s * v for v, s in strides.items())) != 0:
+        return None
+    order = sorted(kept, key=lambda v: -strides[v])
+    step = 1
+    for v in reversed(order):
+        if strides[v] != step:
+            return None
+        step *= int(ranges[v])
+    return order
+
+
+def body_indices(node: SchedulerNode, name: str, *, loads: bool) -> list[sympy.Expr]:
+    """The indices at which `node`'s loop body loads (or stores) buffer `name`."""
+    body = node._body
+    kinds = (
+        (MemoryUsageType.LOAD,)
+        if loads
+        else (MemoryUsageType.STORE, MemoryUsageType.STORE_REDUCTION)
+    )
+    return [
+        body.indexing_exprs[entry.index_name]
+        for kind in kinds
+        for entry in body.memory_usage[kind]
+        if entry.buffer_name == name
+    ]
+
+
+def shared_inner_loop(snodes: list[SchedulerNode], name: str) -> int | None:
+    """The position, among the loops of the nodes of a pointwise node all
+    reindexed onto a reduction's loops, of the loop along the contiguous dim
+    of buffer `name`, read from the first node that accesses it; None when
+    none does in a layout of its loops (memory_order())."""
+    for sn in snodes:
+        body = sn._body
+        iter_vars = list(body.iter_vars)
+        shared = [
+            *body_indices(sn, name, loads=False),
+            *body_indices(sn, name, loads=True),
+        ]
+        order = memory_order(shared[0], iter_vars, body.var_ranges) if shared else None
+        if order:
+            return iter_vars.index(order[-1])
+    return None
+
+
+def transposes_onto(node: SchedulerNode, name: str, inner_loop: int) -> bool:
+    """Whether `node`, reindexed onto a reduction's loops, accesses some buffer
+    other than `name` (the buffer the reduction shares) along loop
+    `inner_loop`, the one along the contiguous dim of `name`
+    (shared_inner_loop()), with a stride of more than one element, while
+    another of its loops is the buffer's contiguous dim: a transposing copy.
+    A node of a fused one that does not access `name` itself is checked
+    against the loop of the node that does.
+
+    The [32, 4, 128, 768] copy of sum_35b8acdece58 reads its input contiguous
+    along r (x0[z, y, r, x] at 393216*z + 128*y + r + 512*x) and writes the
+    buffer the split sum over r reads contiguous along x. On its own the copy is
+    a pointwise kernel, which the CuTe backend tiles with a transpose through
+    shared memory (7.6 us on GB300), and the split reads the copy back (3.1
+    us). Fused, the reduction kernel reads x0 512 elements apart along x, one
+    element of each 32-byte sector it fetches, in 18.0 us."""
+    body = node._body
+    iter_vars = list(body.iter_vars)
+    inner = iter_vars[inner_loop]
+    loops = [v for v in iter_vars if body.var_ranges[v] != 1]
+    origin: dict[sympy.Expr, Any] = dict.fromkeys(loops, sympy.S.Zero)
+    for entry in (
+        body.memory_usage[MemoryUsageType.LOAD]
+        + body.memory_usage[MemoryUsageType.STORE]
+    ):
+        if entry.buffer_name == name:
+            continue
+        # The index's step along each loop from the first element: the
+        # input's view's strides, which a // or % of the reindexed loops
+        # (512*p1 + 393216*(p0//4) + ModularIndexing(128*p0 + p2, 1, 512) for
+        # the copy above) keeps from sympy's coefficients.
+        index = body.indexing_exprs[entry.index_name]
+        first = sympy_subs(index, origin)
+        steps = {
+            v: sympy_subs(index, {**origin, v: 1}) - first  # pyrefly: ignore [unsupported-operation]
+            for v in loops
+        }
+        step = steps.get(inner)
+        if (
+            isinstance(step, sympy.Integer)
+            and abs(step) > 1
+            and any(steps[v] == 1 for v in loops if v != inner)
+        ):
+            return True
+    return False
+
+
+def reindex_onto_reduction(
+    scheduler: Scheduler, node1: BaseSchedulerNode, node2: BaseSchedulerNode
+) -> int:
+    """With cuda_backend "helion", reindex a pointwise node onto the loops of
+    a reduction it shares a buffer with, when both access the buffer once per
+    element in different orders, so that the two fuse; the bytes the fusion
+    then saves (Scheduler.score_fusion_memory()), or 0 when it declines. The
+    scheduler asks can_fuse() of every candidate pair, and keeps the loops
+    of a pair it accepts whether or not it fuses it later: a pointwise node
+    that no reduction takes gets its own loops back before it is emitted
+    (restore_unfused_reindex()), where its kernel would otherwise walk the
+    reduction's order, the r of each split innermost.
+
+    The first kernel of a split sum over r reads the [x, r] buffer a pointwise
+    node writes in an order of its own: the SiLU backward that writes the
+    channels-last [128, 64, 112, 112] output y of better-benchmark's
+    sum_4a4493837e6e, whose channel sums Inductor splits in 1024 chunks of
+    1568 elements along r for the 64 channels (c), writes y[p] over a flat p and reads
+    it back at 100352*y + c + 64*r. Inductor fuses a pointwise node into a
+    reduction only where their accesses already match (or match after a
+    permutation of the loops, or after a flat reindex, which keeps the
+    order), so it runs three kernels and reads y back:
+
+        for tile_x in hl.tile(102760448):                    # y = f(x0, x1)
+            out0[tile_x] = tmp8.to(torch.bfloat16)
+        for tile_y, tile_x in hl.tile([1024, 64]):           # partial sums
+            for tile_r in hl.tile(1568):
+                tmp0 = in0[tile_y, tile_r, tile_x].to(torch.float32)
+                acc = acc + torch.sum(tmp0, -2)
+
+    The pointwise node's loops, reindexed to the buffer's dims in memory order
+    ([1024, 1568, 64]) and permuted to the reduction's ([1024, 64, 1568]),
+    write y where the reduction reads it, so the two become one kernel that
+    computes y, stores it and sums it:
+
+        for tile_y, tile_x in hl.tile([1024, 64]):
+            for tile_r in hl.tile(1568):
+                tmp0 = in0[tile_y, tile_r, tile_x].to(torch.float32)
+                ...
+                out0[tile_y, tile_r, tile_x] = tmp8.to(torch.bfloat16)
+                acc = acc + torch.sum(tmp8, -2)
+
+    which reads x0 and x1 and writes y once each, as the separate pointwise
+    kernel does, and no longer reads y.
+
+    Declines unless the pointwise node (or every node of a fused one, all of
+    one iteration) and the reduction, a node of its own, access one buffer as
+    contiguous C-order layouts of all their loops (memory_order()): a
+    pointwise node that writes or reads the buffer once per element in some
+    order of its loops, a reduction that reads it once per element. That is
+    what makes the reindex a bijection between their iterations. A pointwise
+    node that mutates or aliases a buffer keeps its loops too."""
+    device = node1.get_device()
+    if not (
+        device is not None
+        and device.type == "cuda"
+        and inductor_config.cuda_backend == "helion"
+        and node1.is_reduction() != node2.is_reduction()
+    ):
+        return 0
+    pointwise, reduction = (node2, node1) if node1.is_reduction() else (node1, node2)
+    if not isinstance(reduction, SchedulerNode) or reduction._body is None:
+        return 0
+    if not all(isinstance(sn, SchedulerNode) for sn in pointwise.get_nodes()):
+        return 0
+    # Only a reduction that depends on the pointwise node (reads its output,
+    # directly or through other nodes, whose fusion the scheduler's cycle
+    # check then decides) takes it. Two nodes that only read a common input
+    # fuse horizontally, which Inductor decides on its own count of their
+    # shared data (InductorChoices.can_fuse_horizontal()), 0 here: the
+    # reindex would be rolled back.
+    if not pointwise.get_operation_names() & reduction.ancestors:
+        return 0
+    # Only the first kernel of a split takes the pointwise node (Inductor
+    # marks it, _split_size, with config.triton.mix_order_reduction on, its
+    # default outside fbcode): its chunks give the fused kernel a tile_r loop
+    # and the grid of a pointwise kernel. A reduction over its whole rdim in
+    # one kernel keeps its producer apart, whatever reads its result: the GELU
+    # backward and sums over y of better-benchmark's sum_139a3020e8bf over
+    # [2048, 10240] fused into one persistent kernel that loads all of y for
+    # each tile_x (in0[:, tile_x]) of both inputs and took 37.0 us, against
+    # 25.3 us for the pointwise kernel and 5.0 us for the sums over y that
+    # read its output back (GB300).
+    if not (
+        isinstance(reduction.node, ComputedBuffer)
+        and reduction.node._split_size is not None
+    ):
+        return 0
+    # The reindex sticks once the pair passes can_fuse(), which the scheduler
+    # asks of every candidate pair before it picks one: a pointwise node that
+    # reads another pointwise node's output, not yet fused with it, keeps its
+    # loops, which that fusion needs. Reindexed onto a split mean's first
+    # kernel, the SiLU of a BatchNorm's output y = silu(bn(x)) (y read by the
+    # mean) fused with the split instead of with bn, and bn's fp32 output was
+    # stored and read back where y alone, in bf16, had been. Once bn and silu
+    # are one node, its inputs are the graph's or reductions' and the reindex
+    # takes both, when their loops have one size: with
+    # config.loop_ordering_after_fusion off, Inductor fuses pointwise nodes
+    # of one numel that keep loops of different sizes, and such a group keeps
+    # its kernel.
+    for dep in pointwise.unmet_dependencies:
+        # A buffer's defining op is the node that wrote it, never a fused group.
+        producer = scheduler.name_to_buf[dep.name].defining_op
+        if isinstance(producer, SchedulerNode) and not producer.is_reduction():
+            return 0
+    snodes = cast("list[SchedulerNode]", pointwise.get_nodes())
+    if pointwise.has_aliasing_or_mutation() or not all(
+        sn._body is not None and not sn.is_reduction() and sn._sizes == snodes[0]._sizes
+        for sn in snodes
+    ):
+        return 0
+    # A pointwise node that loads under a mask (a cat's inputs, a pad's
+    # source: the masked subblocks of its body) keeps its loops. The q, k and
+    # v that sum_6d68a671ec4a concatenates and permutes before its sums
+    # come from three inputs, each under a mask of the reindexed loops,
+    #     tmp0 = 128*tile_y.index + (tile_r.index + 128*tile_z.index) // 197
+    #     tmp5 = hl.load(in0, [...], extra_mask=tmp0 < 128)
+    # which the CuTe reduction kernel evaluates and loads one element at a
+    # time: 23.5 us fused, against 5.6 us for the pointwise kernel, which
+    # loads its flat tiles in packets, and 3.0 us for the split's first
+    # kernel (GB300). A pad's source in sum_30fd5c612a69 lost 6-19% the
+    # same way.
+    if loads_under_mask(pointwise):
+        return 0
+    body = reduction._body
+    red_vars = [*body.iter_vars, *body.reduce_vars]
+    red_ranges = body.var_ranges
+    total = sympy_product(red_ranges.values())
+    pw_sizes = snodes[0]._sizes
+    if pw_sizes[1] or not V.graph.sizevars.statically_known_equals(
+        sympy_product(pw_sizes[0]), total
+    ):
+        return 0
+    common = sorted(
+        pointwise.read_writes.buffer_names() & reduction.read_writes.buffer_names(),
+        key=lambda name: (
+            -V.graph.sizevars.optimization_hint(
+                V.graph.get_buffer(name).get_numel(), fallback=0
+            )
+        ),
+    )
+    plan = None
+    for name in common:
+        red_indices = body_indices(reduction, name, loads=True)
+        if not red_indices or any(i != red_indices[0] for i in red_indices):
+            continue
+        red_order = memory_order(red_indices[0], red_vars, red_ranges)
+        if red_order is None:
+            continue
+        for sn in snodes:
+            pw_indices = [
+                *body_indices(sn, name, loads=False),
+                *body_indices(sn, name, loads=True),
+            ]
+            if not pw_indices or any(i != pw_indices[0] for i in pw_indices):
+                continue
+            pw_vars = list(sn._body.iter_vars)
+            pw_order = memory_order(pw_indices[0], pw_vars, sn._body.var_ranges)
+            if pw_order is not None:
+                plan = (name, red_order, pw_vars, pw_order)
+                break
+        if plan is not None:
+            break
+    if plan is None:
+        return 0
+    shared, red_order, pw_vars, pw_order = plan
+    states = [(sn, sn.snapshot_loop_state()) for sn in snodes]
+    group = pointwise.group
+
+    def restore() -> int:
+        for sn, state in states:
+            sn.restore_loop_state(state)
+        if isinstance(pointwise, FusedSchedulerNode):
+            pointwise.group = group
+            refresh_group_node_dependencies(pointwise)
+        return 0
+
+    # 1. The pointwise loops in the shared buffer's memory order (loops of one
+    # element first), so that the flat index of the loops is the element's.
+    in_memory_order = [
+        *(i for i, v in enumerate(pw_vars) if v not in pw_order),
+        *(pw_vars.index(v) for v in pw_order),
+    ]
+    # 2. The flat index cut into the reduction's dims, in memory order, and
+    # 3. those dims permuted into the reduction's loop order.
+    red_dims = [red_ranges[v] for v in red_order]
+    red_loops = [v for v in red_vars if red_ranges[v] != 1]
+    to_reduction = [red_order.index(v) for v in red_loops]
+    for sn in snodes:
+        if in_memory_order != sorted(in_memory_order):
+            sn.apply_new_loop_order(in_memory_order)
+        sn.apply_loop_reindexing(red_dims)
+        if to_reduction != sorted(to_reduction):
+            sn.apply_new_loop_order(to_reduction)
+    inner_loop = shared_inner_loop(snodes, shared)
+    if inner_loop is None or any(
+        transposes_onto(sn, shared, inner_loop) for sn in snodes
+    ):
+        return restore()
+    if not inductor_config.loop_ordering_after_fusion:
+        # The reduction's dependencies are normalized then, and the
+        # reindexed ones are not (apply_loop_reindexing()), which
+        # score_fusion_memory() compares exactly; no loop is reordered
+        # later (Scheduler._try_reindex_pointwise_for_reduction() does the
+        # same).
+        for sn in snodes:
+            sn.refresh_dependencies(normalize=True, need_clear_tiling_cache=False)
+    if isinstance(pointwise, FusedSchedulerNode):
+        pointwise.group = snodes[0].group
+        refresh_group_node_dependencies(pointwise)
+    score = scheduler.score_fusion_memory(node1, node2)
+    if score <= 0:
+        return restore()
+    names = frozenset(pointwise.get_operation_names())
+    for sn, state in states:
+        # The loops before the first reindex of the node, kept until a
+        # reduction takes it or its kernel is emitted
+        # (restore_unfused_reindex()).
+        _UNFUSED_REINDEX.setdefault(sn, (names, state))
+    return score
+
+
+# The pointwise nodes reindex_onto_reduction() reindexed: the operation names
+# of the node it reindexed them as (a fused group or the node), and each one's
+# loops before. Neither holds a scheduler node, so an entry no kernel claims
+# goes with its node and its scheduler.
+_UNFUSED_REINDEX: weakref.WeakKeyDictionary[
+    SchedulerNode, tuple[frozenset[str], tuple[Any, ...]]
+] = weakref.WeakKeyDictionary()
+
+
+def fused_reindex(node: BaseSchedulerNode) -> None:
+    """Forget the loops before the reindex of the nodes of `node` when it
+    holds a reduction: they fused as reindexed."""
+    if node.is_reduction():
+        for sn in node.get_nodes():
+            if isinstance(sn, SchedulerNode):
+                _UNFUSED_REINDEX.pop(sn, None)
+
+
+def restore_unfused_reindex(node: BaseSchedulerNode) -> None:
+    """Give the nodes of a pointwise kernel that reindex_onto_reduction()
+    reindexed, and no reduction then took, their own loops back, when the
+    kernel holds the nodes reindexed together and only them, and forget the
+    loops of every node of the kernel: its loops are final once it is
+    emitted. A kernel that fused them with other nodes keeps the loops they
+    fused with."""
+    nodes = [sn for sn in node.get_nodes() if isinstance(sn, SchedulerNode)]
+    entries = [_UNFUSED_REINDEX.pop(sn, None) for sn in nodes]
+    if node.is_reduction() or not entries or any(e is None for e in entries):
+        return
+    names = frozenset(node.get_operation_names())
+    if any(entry[0] != names for entry in entries if entry is not None):
+        return
+    for sn, entry in zip(nodes, entries, strict=True):
+        assert entry is not None
+        sn.restore_loop_state(entry[1])
+    if isinstance(node, FusedSchedulerNode):
+        refresh_group_node_dependencies(node)
+
+
+def holds_reduction_prologue(node: BaseSchedulerNode) -> bool:
+    """Whether `node` holds a pointwise node one of its reductions reads, a
+    producer fused before it (reindex_onto_reduction()): Inductor's
+    mix-order codegen emits every pointwise node of a pair's non-contiguous
+    node after the pair's reductions, as their epilogue
+    (SIMDScheduling._split_mix_order_reduction_epilogue()); the contiguous
+    node's run before them."""
+    nodes = node.get_nodes()
+    reductions = [sn for sn in nodes if sn.is_reduction()]
+    return any(
+        not sn.is_reduction() and sn.get_operation_names() & reduction.ancestors
+        for sn in nodes
+        for reduction in reductions
+    )
 
 
 def static_layout(node: IRNode) -> bool:
@@ -476,7 +868,9 @@ class HelionChoices(InductorChoices):
         4096 or more), with config.triton.mix_order_reduction on. Helion's
         conditions: an rdim Helion reads as one block (names_rdim()) and a
         split of x that divides it (mix_order_split()). Neither node may
-        already be in a mix-order kernel."""
+        already be in a mix-order kernel, nor may the node that is not
+        contiguous (FusedMixOrderReductions' node2) hold a producer of its
+        reductions (holds_reduction_prologue())."""
         device = node1.get_device()
         if not (
             node1.is_reduction()
@@ -498,6 +892,8 @@ class HelionChoices(InductorChoices):
             if not MixOrderReduction.can_fuse(node1, node2):
                 return False
         contiguous = node1 if MixOrderReduction.is_contiguous_node(node1) else node2
+        if holds_reduction_prologue(node2 if contiguous is node1 else node1):
+            return False
         xnumel, rnumel = MixOrderReduction.get_numel_rnumel(contiguous)
         return (
             isinstance(xnumel, sympy.Integer)
@@ -517,14 +913,19 @@ class HelionChoices(InductorChoices):
         by its count: a mix-order pair (mix_order_reductions()) reads a common
         buffer along different dims, which the count misses. It counts for the
         pair the elements of its array, as Inductor counts its Triton pairs. A
-        pointwise node computing a cat of equal parts stays out of a split's
-        first kernel that loops over its chunks (masked_into_looped_split())."""
+        pointwise node and a reduction that access a buffer in different
+        orders share no data either until the pointwise node is reindexed onto
+        the reduction's loops (reindex_onto_reduction()). A pointwise node
+        computing a cat of equal parts stays out of a split's first kernel
+        that loops over its chunks (masked_into_looped_split())."""
         if masked_into_looped_split(node1, node2):
             return False
         if HelionChoices.mix_order_reductions(node1, node2):
             shared_data_score = max(
                 shared_data_score, MixOrderReduction.get_fusion_score(node1, node2)
             )
+        elif shared_data_score == 0:
+            shared_data_score = reindex_onto_reduction(scheduler, node1, node2)
         return InductorChoices.can_fuse(scheduler, node1, node2, shared_data_score)
 
     @staticmethod

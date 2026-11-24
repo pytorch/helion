@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import functools
+import gc
 import importlib
 import inspect
 import os
@@ -49,9 +50,12 @@ from torch._inductor.choices import unregister_inductor_choices
 import helion
 from helion.autotuner.benchmark_provider import LocalBenchmarkProvider
 import helion.inductor
+from helion.inductor import choices as choices_module
 from helion.inductor import config as helion_config
 from helion.inductor import kernel_sequence
+from helion.inductor.choices import _UNFUSED_REINDEX
 from helion.inductor.choices import HelionChoices
+from helion.inductor.codegen import scheduling as scheduling_module
 from helion.inductor.codegen.kernel import exact_cast
 import helion.language as hl
 
@@ -761,6 +765,24 @@ class TestInductorCute(InductorBackendTestCase):
         sources = self.compile(fn, randn(36, 64), randn(72, 136), backend="cute")
         self.assertEqual([bool(DOT_RE.search(s)) for s in sources], [False, True])
         self.assertIn("tmp0 = in0[tile_y, tile_r]", sources[1])
+
+    def test_split_reduction_takes_its_producer(self):
+        # The SiLU backward that a split's first kernel takes
+        # (reindex_onto_reduction()), compiled and run by the CuTe backend:
+        # channels-last bf16 with its channel sums.
+        self.enterContext(config.patch({"triton.mix_order_reduction": True}))
+
+        def silu_backward(g, x):
+            s = torch.sigmoid(x.float())
+            y = (g.float() * s * (1 + x.float() * (1 - s))).to(g.dtype)
+            return y, y.sum([0, 2, 3]).float()
+
+        cl = torch.channels_last
+        args = [randn(8, 32, 28, 28).to(memory_format=cl) for _ in range(2)]
+        first, *rest = self.compile(silu_backward, *args, tol=2e-2, backend="cute")
+        self.assertTrue(rest)
+        self.assertRegex(first, r"out0\[[^\]]*tile_r[^\]]*\] = ")
+        self.assertIn("acc = acc + torch.sum(", first)
 
     def test_unsupported_op(self):
         # Helion's CuTe backend compiles no lgamma.
@@ -1945,6 +1967,322 @@ def kernel(in0: torch.Tensor, out0: torch.Tensor, out1: torch.Tensor) -> None:
         (source,) = self.compile(lambda x: x.sum(0), x, tol=1e-4)
         self.assertIn("tmp0 = in0[:, tile_x]", source)
         self.assertIn("torch.sum(tmp0, -2)", source)
+
+    def test_split_reduction_takes_its_producer(self):
+        # A pointwise output that a split reduction sums (an activation's
+        # backward and its channel sums, a copy and its sums over y) is
+        # computed in the split's first kernel (reindex_onto_reduction()): the
+        # pointwise node's loops follow the y (chunks), r and x the
+        # first kernel reads, which then stores the output and sums it,
+        #     out0[tile_y, tile_r, tile_x] = tmp8.to(torch.bfloat16)
+        #     acc = acc + torch.sum(tmp8, -2)
+        # instead of reading it back from a pointwise kernel of its own.
+        self.enterContext(config.patch({"triton.mix_order_reduction": True}))
+        cl = torch.channels_last
+
+        def silu_backward(g, x):
+            s = torch.sigmoid(x.float())
+            y = (g.float() * s * (1 + x.float() * (1 - s))).to(g.dtype)
+            return y, y.sum([0, 2, 3]).float()
+
+        def y_sum(g, x):
+            y = g * torch.sigmoid(x)
+            y = y.view(-1, y.size(-1))
+            return y, y.sum(0)
+
+        def copy_y_sum(x):
+            y = x.permute(0, 2, 1, 3).contiguous().view(-1, x.size(1) * x.size(3))
+            return y, y.sum(0, dtype=torch.float32)
+
+        def scale_shift(x, w, b):
+            y = (x.float() * w + b).to(x.dtype)
+            return y, y.sum([0, 2, 3], dtype=torch.float32)
+
+        f32 = torch.float32
+        cases = [
+            # channels-last bf16: the split's r runs over images and pixels, its
+            # x over the 32 channels
+            (
+                silu_backward,
+                randn(8, 32, 28, 28).to(memory_format=cl),
+                randn(8, 32, 28, 28).to(memory_format=cl),
+            ),
+            # fp32 [64, 96, 120] viewed as [6144, 120]: an x extent of 120,
+            # which no block divides
+            (y_sum, randn(64, 96, 120, dtype=f32), randn(64, 96, 120, dtype=f32)),
+            # a copy of heads into a new layout, x[b, h, s, d] -> y[b * s,
+            # h * d], contiguous along d on both sides (not a transposing one,
+            # transposes_onto())
+            (copy_y_sum, randn(16, 12, 128, 64)),
+            # a sliced (non-contiguous) channels-last input with 33 pixels along
+            # W, and per-channel fp32 operands broadcast over N, H, W
+            (
+                scale_shift,
+                randn(16, 48, 33, 66).to(memory_format=cl)[..., ::2],
+                randn(1, 48, 1, 1, dtype=f32),
+                randn(1, 48, 1, 1, dtype=f32),
+            ),
+        ]
+        for fn, *args in cases:
+            first, *rest = self.compile(fn, *args, tol=2e-2)
+            self.assertTrue(rest, fn.__name__)
+            self.assertRegex(first, r"out0\[[^\]]*tile_r[^\]]*\] = ")
+            self.assertIn("acc = acc + torch.sum(", first)
+
+    def test_split_reduction_sums_its_producer_unrounded(self):
+        # The split's first kernel sums the producer's fp32 value, which it
+        # stores rounded to bf16, as Inductor keeps the value of any producer
+        # fused with its consumer (config.emulate_precision_casts is off) and
+        # as the float64 reference computes it: y = x + 0.001 of equal numbers
+        # of bf16 1 and -1 rounds to y = x, whose channel sums eager reads as
+        # 0, while every pair adds 0.002 unrounded (6.272 per channel).
+        # compile() checks the outputs against fp32 eager, which does not
+        # round y either.
+        self.enterContext(config.patch({"triton.mix_order_reduction": True}))
+
+        def fn(x):
+            y = x + 0.001
+            return y, y.sum([0, 2, 3], dtype=torch.float32)
+
+        x = torch.ones(8, 32, 28, 28, dtype=torch.bfloat16, device=DEVICE)
+        x[1::2] = -1
+        # tol: the sums of 6272 terms of magnitude 1 run in another order than
+        # eager's; a rounded sum (0) would be off by 6.27.
+        first, *rest = self.compile(
+            fn, x.to(memory_format=torch.channels_last), tol=1e-2
+        )
+        self.assertTrue(rest)
+        self.assertIn("acc = acc + torch.sum(", first)
+
+    def test_split_reduction_keeps_unaligned_producer(self):
+        # An output in the layout of an input whose H and W are swapped
+        # (strides [31360, 1, 40, 1120]), which the split reads with // and %
+        # of its chunk index: the pointwise node keeps its kernel.
+        self.enterContext(config.patch({"triton.mix_order_reduction": True}))
+        f32 = torch.float32
+        a = randn(16, 28, 28, 40, dtype=f32).permute(0, 3, 2, 1)
+        b = randn(16, 40, 28, 28, dtype=f32).to(memory_format=torch.channels_last)
+
+        def fn(a, b):
+            y = a + b
+            return y, y.sum([0, 2, 3])
+
+        first, second, _ = self.compile(fn, a, b, tol=1e-3)
+        self.assertNotIn("acc", first)
+        self.assertIn("acc = acc + torch.sum(", second)
+
+    def test_unsplit_reduction_keeps_its_producer(self):
+        # A sum over y that Inductor does not split (an x of 16384 over a y
+        # of 256) reduces all of y in one kernel, which loads tile_x's whole
+        # slice (in0[:, tile_x]): the GELU backward that writes the summed output
+        # keeps its kernel (only a split's first kernel takes the producer),
+        # as in better-benchmark's sum_139a3020e8bf, also when another
+        # reduction reads the sums over y (the sum of their squares, which
+        # no split's later stage is), and when that reduction is lowered from
+        # an op the sums over y are lowered from too (t, inlined into both).
+        self.enterContext(config.patch({"triton.mix_order_reduction": True}))
+
+        def gelu_backward(g, x):
+            n = g.size(1)
+            xf = x.view(16, -1, n).float()
+            cdf = 0.5 * (1 + torch.erf(xf * 0.7071067811865476))
+            pdf = torch.exp(-0.5 * xf * xf) * 0.3989422804014327
+            y = (g.view(16, -1, n).float() * (cdf + xf * pdf)).to(g.dtype)
+            return y.view(-1, n)
+
+        def y_sums(g, x):
+            y = gelu_backward(g, x)
+            return y, y.t(), y.sum(0, dtype=torch.float32)
+
+        def squared_y_sums(g, x):
+            y = gelu_backward(g, x)
+            return y, y.sum(0, dtype=torch.float32).pow(2).sum()
+
+        def shared_origin_sums(g, x):
+            y = gelu_backward(g, x)
+            t = y * 2.0
+            return y, (t * t.sum(0)).sum()
+
+        # fp32: GELU's erf and exp may round a bf16 y one step off eager's.
+        f32 = torch.float32
+        for fn in (y_sums, squared_y_sums, shared_origin_sums):
+            first, second, *_ = self.compile(
+                fn,
+                randn(256, 16384, dtype=f32),
+                randn(256, 16384, dtype=f32),
+                tol=1e-3,
+            )
+            self.assertNotIn("torch.sum(", first, fn.__name__)
+            self.assertIn("in0[:, tile_x]", second, fn.__name__)
+
+    def test_split_reduction_keeps_masked_producer(self):
+        # A pointwise node that loads under a mask, a pad's source here (a
+        # cat's inputs alike), keeps its kernel: reindexed onto the split, its
+        # masked loads would run one element at a time.
+        self.enterContext(config.patch({"triton.mix_order_reduction": True}))
+        cl = torch.channels_last
+
+        def fn(x, g):
+            y = g * torch.nn.functional.pad(x, (0, 0, 1, 1))
+            return y, y.sum([0, 2, 3], dtype=torch.float32)
+
+        # fp32: a bf16 y is summed unrounded by Inductor and rounded by eager.
+        f32 = torch.float32
+        x = randn(32, 64, 54, 56, dtype=f32).to(memory_format=cl)
+        g = randn(32, 64, 56, 56, dtype=f32).to(memory_format=cl)
+        first, second, _ = self.compile(fn, x, g, tol=1e-3)
+        self.assertNotIn("acc", first)
+        self.assertIn("acc = acc + torch.sum(", second)
+
+    def test_split_reduction_keeps_transposing_producer(self):
+        # A copy that transposes, x[b, c, s] -> y[b * s, c] with x contiguous
+        # along s and y along c, keeps its pointwise kernel (transposes_onto()):
+        # reindexed onto the split, it would read x 512 elements apart along
+        # the c the split's first kernel walks contiguously.
+        self.enterContext(config.patch({"triton.mix_order_reduction": True}))
+
+        def fn(x):
+            y = x.permute(0, 2, 1).contiguous().view(-1, x.size(1))
+            return y, y.sum(0, dtype=torch.float32)
+
+        first, second, _ = self.compile(fn, randn(32, 384, 512), tol=2e-2)
+        self.assertNotIn("acc", first)
+        self.assertIn("acc = acc + torch.sum(", second)
+
+    def test_split_reduction_fused_producer(self):
+        # A pointwise node that reads another pointwise node's output keeps
+        # its loops until the two fuse, and the fused node is reindexed onto
+        # the split whole: a = x * w (returned) and y = silu(a) become one
+        # kernel with the split's first kernel, which stores both and sums y
+        # (two kernels), rather than y alone reindexed and a's kernel apart.
+        self.enterContext(config.patch({"triton.mix_order_reduction": True}))
+        cl = torch.channels_last
+        f32 = torch.float32
+
+        def scaled_silu(x, w):
+            a = x * w
+            y = a * torch.sigmoid(a)
+            return a, y, y.sum([0, 2, 3])
+
+        x = randn(8, 32, 28, 28, dtype=f32).to(memory_format=cl)
+        w = randn(1, 32, 1, 1, dtype=f32)
+        first, second = self.compile(scaled_silu, x, w, tol=1e-3)
+        self.assertEqual(len(re.findall(r"out\d\[[^\]]*tile_r[^\]]*\] = ", first)), 2)
+        self.assertIn("acc = acc + torch.sum(", first)
+
+        # A fused node one of whose nodes transposes keeps its kernel, though
+        # that node does not access the buffer the split reads: t = x
+        # transposed (returned) and y = 2 * t fuse, and the split's first
+        # kernel would read x 512 elements apart (transposes_onto()).
+        def transposed_double(x):
+            t = x.permute(0, 2, 1).contiguous()
+            y = (t * 2).view(-1, x.size(1))
+            return t, y, y.sum(0)
+
+        first, second, _ = self.compile(
+            transposed_double, randn(32, 384, 512, dtype=f32), tol=1e-3
+        )
+        self.assertNotIn("acc", first)
+        self.assertIn("acc = acc + torch.sum(", second)
+
+    def test_split_reduction_unfused_producer_keeps_its_loops(self):
+        # y, which the split's first kernel of y.sum([0, 2, 3]) could take
+        # (reindex_onto_reduction()), stays apart when that kernel fuses with
+        # y.sum(1) as a mix-order pair instead: y's own kernel walks its flat
+        # loop, not the split's r innermost (restore_unfused_reindex()).
+        # The loops the reindex took are held by name and dropped when y's
+        # kernel is emitted: no entry outlives the compile.
+        self.enterContext(config.patch({"triton.mix_order_reduction": True}))
+        cl = torch.channels_last
+        f32 = torch.float32
+        g = randn(32, 64, 56, 56, dtype=f32).to(memory_format=cl)
+        x = randn(32, 64, 56, 56, dtype=f32).to(memory_format=cl)
+
+        def fn(g, x):
+            y = g * torch.sigmoid(x)
+            return y, y.sum([0, 2, 3]), y.sum(1)
+
+        seen = []
+        restore = choices_module.restore_unfused_reindex
+
+        def counting_restore(node):
+            seen.extend(sn for sn in node.get_nodes() if sn in _UNFUSED_REINDEX)
+            restore(node)
+
+        with patch.object(
+            scheduling_module, "restore_unfused_reindex", counting_restore
+        ):
+            first, *_ = self.compile(fn, g, x, tol=1e-3)
+        self.assertRegex(first, r"for tile_x in hl\.tile\(\d+\):")
+        self.assertNotIn("acc", first)
+        self.assertTrue(seen)
+        seen.clear()
+        torch._dynamo.reset()
+        gc.collect()
+        self.assertEqual(len(_UNFUSED_REINDEX), 0)
+
+    def test_mix_order_pair_keeps_a_producer_of_its_contiguous_node(self):
+        # y = x * w fused into y.sum(1), the contiguous reduction: its
+        # producer runs before the pair's reductions, and the pair with
+        # (x * g).sum(0) forms as without the reindex (one mix-order kernel,
+        # its partials in a workspace).
+        self.enterContext(config.patch({"triton.mix_order_reduction": True}))
+        f32 = torch.float32
+        x, g = (randn(8192, 640, dtype=f32) for _ in range(2))
+        w = randn(640, dtype=f32)
+
+        def fn(x, w, g):
+            y = x * w
+            return y, y.sum(1), (x * g).sum(0)
+
+        sources = self.compile(fn, x, w, g, tol=1e-3)
+        self.assertTrue(any("ws[" in source for source in sources))
+
+    def test_split_reduction_producer_beside_mix_order(self):
+        # y = silu(a) reindexed into the split's first kernel of its channel
+        # sums, beside a.sum(1): the fused node holds y, a producer of its
+        # reduction, and pairs with no mix-order kernel, which would emit y
+        # after the kernel that reads it (holds_reduction_prologue()).
+        self.enterContext(config.patch({"triton.mix_order_reduction": True}))
+        cl = torch.channels_last
+        f32 = torch.float32
+        x = randn(32, 64, 56, 56, dtype=f32).to(memory_format=cl)
+        w = randn(1, 64, 1, 1, dtype=f32)
+
+        def fn(x, w):
+            a = x * w
+            t = a.sum(1)
+            y = a * torch.sigmoid(a)
+            return t, y, y.sum([0, 2, 3])
+
+        self.compile(fn, x, w, tol=1e-3)
+
+    def test_split_reduction_takes_its_producer_without_loop_ordering(self):
+        # With config.loop_ordering_after_fusion off (fbcode's default), the
+        # reindexed producer's dependencies are normalized as the split's
+        # are, and the SiLU backward still fuses into the first kernel.
+        self.enterContext(
+            config.patch(
+                {
+                    "triton.mix_order_reduction": True,
+                    "loop_ordering_after_fusion": False,
+                }
+            )
+        )
+        cl = torch.channels_last
+        f32 = torch.float32
+
+        def silu_backward(g, x):
+            s = torch.sigmoid(x)
+            y = g * s * (1 + x * (1 - s))
+            return y, y.sum([0, 2, 3])
+
+        g = randn(8, 32, 28, 28, dtype=f32).to(memory_format=cl)
+        x = randn(8, 32, 28, 28, dtype=f32).to(memory_format=cl)
+        first, *rest = self.compile(silu_backward, g, x, tol=1e-3)
+        self.assertTrue(rest)
+        self.assertRegex(first, r"out0\[[^\]]*tile_r[^\]]*\] = ")
+        self.assertIn("acc = acc + torch.sum(", first)
 
     @skipIfRefEager("reference mode sequences nothing: it searches no config")
     def test_kernels_tuned_in_sequence(self):
