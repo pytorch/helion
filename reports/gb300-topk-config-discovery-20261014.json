@@ -1,0 +1,2984 @@
+{
+  "schema_version": 1,
+  "phase": "accepted_pinned_configuration_metrics",
+  "compiler_PRs": [
+    "https://github.com/pytorch/helion/pull/3982",
+    "https://github.com/pytorch/helion/pull/3983",
+    "https://github.com/pytorch/helion/pull/3984"
+  ],
+  "compiler_base_commit": "cedaa67b59e8bb687bb9234cad9d4fc7e7056bbd",
+  "kernel_library_commit": "a22cf4c1a2947cedccc1c452f6fb250aa049ddd5",
+  "kernel_library_commit_url": "https://github.com/yushangdi/helion-kernel-library/commit/a22cf4c1a2947cedccc1c452f6fb250aa049ddd5",
+  "local_raw_artifact_root": "artifacts/topk-paper-20261013",
+  "input_report_sha256": "7af6bd9d5e2d162d9b51ab55068c5710b33465c9f43c21c00bce39726d964c31",
+  "checker": {
+    "path": "checkers/config-discovery-40-current-v2.txt",
+    "sha256": "853364fb1575ae47c9532c86fc0d9a8764b0db47ce3f22fe638ce1fbfd226357"
+  },
+  "checker_result": "GOAL MET",
+  "checker_scope": "Accepted configuration metrics; cold-full rediscovery deferred",
+  "criteria": {
+    "geomean_min": 1.0,
+    "per_shape_min": 0.99
+  },
+  "aggregates": [
+    {
+      "group": "K04",
+      "count": 10,
+      "accepted_ratio_geomean": 1.0708277056441795,
+      "helion_latency_arithmetic_mean_us": 17.763200122863054,
+      "named_baseline_latency_arithmetic_mean_us": 19.057600386440754,
+      "helion_latency_sum_us": 177.63200122863054,
+      "named_baseline_latency_sum_us": 190.57600386440754,
+      "minimum_accepted_ratio": 1.0020325357148943
+    },
+    {
+      "group": "K05",
+      "count": 24,
+      "accepted_ratio_geomean": 1.1726618952587393,
+      "helion_latency_arithmetic_mean_us": 7.572000050762047,
+      "named_baseline_latency_arithmetic_mean_us": 8.906000109467035,
+      "helion_latency_sum_us": 181.72800121828914,
+      "named_baseline_latency_sum_us": 213.74400262720883,
+      "minimum_accepted_ratio": 0.9972451580807026
+    },
+    {
+      "group": "K06",
+      "count": 6,
+      "accepted_ratio_geomean": 1.4736270658148924,
+      "helion_latency_arithmetic_mean_us": 111.04799993336201,
+      "named_baseline_latency_arithmetic_mean_us": 163.85333177944025,
+      "helion_latency_sum_us": 666.287999600172,
+      "named_baseline_latency_sum_us": 983.1199906766415,
+      "minimum_accepted_ratio": 1.0818632926007983
+    },
+    {
+      "group": "All40",
+      "count": 40,
+      "accepted_ratio_geomean": 1.186292340248844,
+      "helion_latency_arithmetic_mean_us": 25.641200051177293,
+      "named_baseline_latency_arithmetic_mean_us": 34.685999929206446,
+      "helion_latency_sum_us": 1025.6480020470917,
+      "named_baseline_latency_sum_us": 1387.4399971682578,
+      "minimum_accepted_ratio": 0.9972451580807026
+    }
+  ],
+  "source_versions": [
+    {
+      "id": "S01",
+      "content_sha256": "19b6a4e19a550e900b2abf71d59dd6433e623408222dcaa4afd1920849e5d590",
+      "manifest_references": [
+        {
+          "path": "k4/public-c1-confirmation-prep-v1/K04-00/candidate-manifest.json",
+          "file_sha256": "05990fad56b9ddcaf38ba6695ee31e333bc90c47f9bf317d218e68e12edcecd4",
+          "label": "public-c1-confirmation-prep-v1/K04-00"
+        },
+        {
+          "path": "k4/production-radix-public-v1/fixed-config-breadth-v2/T512_C1_B4096_direct/source-manifest.json",
+          "file_sha256": "05990fad56b9ddcaf38ba6695ee31e333bc90c47f9bf317d218e68e12edcecd4",
+          "label": "fixed-config-breadth-v2/T512_C1_B4096_direct"
+        }
+      ]
+    },
+    {
+      "id": "S02",
+      "content_sha256": "a8dce6bb536b4571bdb2c76128fa159c3941f91f34f64e01edf1673bfe932295",
+      "manifest_references": [
+        {
+          "path": "k4/fourflag-small-config-prep-v1/T1024_C1_B4096_all/source-manifest.json",
+          "file_sha256": "723aa2c83cd7c869ad5e3b6e0a453dc4f0b7e931756d2834b88c6e7e231643d0",
+          "label": "fourflag-small-config-prep-v1/T1024_C1_B4096_all"
+        }
+      ]
+    },
+    {
+      "id": "S03",
+      "content_sha256": "be374c91962a20029968a1b7f940fbeb691e0bfd9f31639fcf7cb0e14ee1ec46",
+      "manifest_references": [
+        {
+          "path": "k4/radix-control-breadth-v1/T1024_C4_B4096_P256_U4/source-manifest-v1.json",
+          "file_sha256": "cae1db8cd5b4fc972b862a4bae11325b9be01b147d7be70d223159edc7875164",
+          "label": "radix-control-breadth-v1/T1024_C4_B4096_P256_U4"
+        }
+      ]
+    },
+    {
+      "id": "S04",
+      "content_sha256": "13d22668f69271d7a0d0995f08d7dc4a8e0921a4049800a951c6e24213bb6ed0",
+      "manifest_references": [
+        {
+          "path": "k4/public-c1-confirmation-prep-v1/K04-06/candidate-manifest.json",
+          "file_sha256": "464959bb44439d2ac3142ffa769bfedf15ee04d2f3742fc4037533e738bc3521",
+          "label": "public-c1-confirmation-prep-v1/K04-06"
+        }
+      ]
+    },
+    {
+      "id": "S05",
+      "content_sha256": "c8ae985de34a92c887bda8d1ea2866067b1e68b50cb2978d27a336a05e46512a",
+      "manifest_references": [
+        {
+          "path": "k4/radix-control-breadth-v1/T1024_C4_B4096_P128_U1/source-manifest-v1.json",
+          "file_sha256": "ad5bd3215252400500c4d85b514fad8eadfa990f891590fcac4f8518d26a705f",
+          "label": "radix-control-breadth-v1/T1024_C4_B4096_P128_U1"
+        }
+      ]
+    },
+    {
+      "id": "S06",
+      "content_sha256": "d23c0142f674ce10f557af705821f6d44f38210affa1d7378c94fd1ccb45dd1f",
+      "manifest_references": [
+        {
+          "path": "k4/production-radix-public-inverse-v1/source-manifest-v1.json",
+          "file_sha256": "537620642113e8f37c79dcc4714ce0fde0eeb7953cfaf50106c50834aa60a11a",
+          "label": "production-radix-public-inverse-v1"
+        }
+      ]
+    },
+    {
+      "id": "S07",
+      "content_sha256": "8dc996a4609555eb19505b33c175da401546b51c4b8240a948e0f36dde9c77ac",
+      "manifest_references": [
+        {
+          "path": "k5/snapshots/generic-seeded-v1/manifest.json",
+          "file_sha256": "1f72aaea505bf8d7d57f89d3fe9688d56644be244908bd1b2d547153bb4c71e6",
+          "label": "generic-seeded-v1"
+        }
+      ]
+    },
+    {
+      "id": "S08",
+      "content_sha256": "20aa54b505d69da871fc507bed632f94b08715ce59336552a8705963d0dad391",
+      "manifest_references": [
+        {
+          "path": "k6/snapshots/public-v23-k4-pipeline-v1/manifest.json",
+          "file_sha256": "150944298e0acc7031faf62ec2e612bedf2d2d5c7c81323e294cba0a46c74257",
+          "label": "public-v23-k4-pipeline-v1"
+        }
+      ]
+    },
+    {
+      "id": "S09",
+      "content_sha256": "4ec0e55978bfbae7e2b4b0fe71c20a57cd7e2a6405dfbcde0fd6d571561b93d6",
+      "manifest_references": [
+        {
+          "path": "k6/snapshots/public-v18-v1/manifest.json",
+          "file_sha256": "dd9c9bf8d6fa2c603377a0a70e51031840f8612c41caca4d14bc3caf37e75878",
+          "label": "public-v18-v1"
+        }
+      ]
+    }
+  ],
+  "cases": [
+    {
+      "case": "K04/00",
+      "shape": {
+        "cols": 4096,
+        "distribution": "uniform",
+        "dtype": "float32",
+        "k": 512,
+        "rows": 4
+      },
+      "named_baseline": "flashinfer-radix-filter",
+      "helion_us": 13.679999858140945,
+      "named_baseline_us": 13.75999953597784,
+      "helion_metric_field": "candidate_us",
+      "named_baseline_metric_field": "baseline_us",
+      "accepted_goal_ratio": 1.0058479297270817,
+      "accepted_ratio_basis": "baseline_us/candidate_us",
+      "displayed_latency_ratio": 1.0058479297270817,
+      "config_artifact": {
+        "path": "configs/K04-00-v1.json",
+        "sha256": "b28c29e489694d428a748498e9fba89a14277e7b9c3acb48521f301dff55cf0f"
+      },
+      "raw_summary_or_candidate": {
+        "path": "k4/public-c1-confirmation-prep-v1/K04-00/confirmation-window-v1/summary.json",
+        "sha256": "11d38e81615de19480b310393da2bdd3ede7551f083739cb5ca53f0785cd48c0",
+        "kind": "summary"
+      },
+      "raw_receipts": [
+        {
+          "path": "k4/public-c1-confirmation-prep-v1/K04-00/confirmation-window-v1/00-anchor/result.json",
+          "role": "anchor",
+          "sha256": "b3e6bee52d142e375a06cc246111fc46885ce3c4ff4c838745bd5361d44df83f"
+        },
+        {
+          "path": "k4/public-c1-confirmation-prep-v1/K04-00/confirmation-window-v1/01-A/result.json",
+          "role": "A",
+          "sha256": "3091e503ab6a990b8c6c097abff22edf1c6ef104952359968515719d798ae755"
+        },
+        {
+          "path": "k4/public-c1-confirmation-prep-v1/K04-00/confirmation-window-v1/02-B/result.json",
+          "role": "B",
+          "sha256": "87cd3951410d164b4f226b213974f2f3e41f9dc47dee915ca44e5ba70298ba17"
+        },
+        {
+          "path": "k4/public-c1-confirmation-prep-v1/K04-00/confirmation-window-v1/03-A/result.json",
+          "role": "A",
+          "sha256": "8d808a12ccccd66338cb6082d5ae55b7276b68c09aa473e6043b4eb1483e5fd5"
+        },
+        {
+          "path": "k4/public-c1-confirmation-prep-v1/K04-00/confirmation-window-v1/04-B/result.json",
+          "role": "B",
+          "sha256": "c57a2191800c610331a4769a4d9da75ab3f6a2b0af644d378ef6f24c72b0a81a"
+        },
+        {
+          "path": "k4/public-c1-confirmation-prep-v1/K04-00/confirmation-window-v1/05-anchor/result.json",
+          "role": "anchor",
+          "sha256": "5af4770e5b6c879aff92ad14ca64764bbbdcdaf8ffd1c2b0b34321d753c3de92"
+        }
+      ],
+      "source_version": {
+        "id": "S01",
+        "path": "k4/public-c1-confirmation-prep-v1/K04-00/candidate-manifest.json",
+        "file_sha256": "05990fad56b9ddcaf38ba6695ee31e333bc90c47f9bf317d218e68e12edcecd4",
+        "label": "public-c1-confirmation-prep-v1/K04-00",
+        "content_sha256": "19b6a4e19a550e900b2abf71d59dd6433e623408222dcaa4afd1920849e5d590"
+      },
+      "gpu_uuid": "GPU-d178336e-85b3-e1bf-bbfc-d8f2e2054b65",
+      "evidence_id": "E-K04-00",
+      "stage_provenance": [
+        {
+          "kernel": "top_k_varlen_radix_cute",
+          "family": "top_k_varlen_radix_cute",
+          "source": {
+            "path": "k4/production-radix-public-v1/fixed-config-breadth-v2/T512_C1_B4096_direct/library/helion_kernel_library/_kernels/top_k_varlen/top_k_varlen_radix_cute.py",
+            "sha256": "fc168acd5baa7eb8b1377c4b82f1d61f54ec59fe1894033c7aefe2fa2ee1dac0"
+          },
+          "config_source": {
+            "path": "k4/production-radix-public-v1/fixed-config-breadth-v2/T512_C1_B4096_direct/library/helion_kernel_library/configs/top_k_varlen_radix_cute/nvidia_sm103.json",
+            "sha256": "41c8a60998d71729bbdb9d24d7703ec8bb2034182757c6f77749e8a559e537cb"
+          },
+          "shape_key": "cols=4096; dtype=float32; k=512; rows=4",
+          "configuration_sha256": "d4aed81a1964c17c681fb2ccc4aa4004be61e139c5f996409ccaf690d3c3157c"
+        }
+      ]
+    },
+    {
+      "case": "K04/01",
+      "shape": {
+        "cols": 8192,
+        "distribution": "uniform",
+        "dtype": "float32",
+        "k": 1024,
+        "rows": 8
+      },
+      "named_baseline": "flashinfer-radix-filter",
+      "helion_us": 15.744000673294067,
+      "named_baseline_us": 15.776000916957855,
+      "helion_metric_field": "candidate_us",
+      "named_baseline_metric_field": "baseline_us",
+      "accepted_goal_ratio": 1.0020325357148943,
+      "accepted_ratio_basis": "baseline_us/candidate_us",
+      "displayed_latency_ratio": 1.0020325357148943,
+      "config_artifact": {
+        "path": "configs/K04-01-v1.json",
+        "sha256": "9ed44a67c748d8e84e09b8e949ff05c432237ba155c872a0609d043021177531"
+      },
+      "raw_summary_or_candidate": {
+        "path": "k4/public-fourflag-near-confirm-execution-v1/K04-01/summary.json",
+        "sha256": "3118a976a076324aa23cbbf3a0e87c931b2449fe3f2c440c305e1d34337b3671",
+        "kind": "summary"
+      },
+      "raw_receipts": [
+        {
+          "path": "k4/public-fourflag-near-confirm-execution-v1/K04-01/00-anchor/result.json",
+          "role": "anchor",
+          "sha256": "176aa8f122736c909c70bfd996d0abe037cae484a2636dfa19eaa086366b109a"
+        },
+        {
+          "path": "k4/public-fourflag-near-confirm-execution-v1/K04-01/01-A/result.json",
+          "role": "A",
+          "sha256": "0ff3362a5d55e9be1e361a3e5dc91f8e5d72af34a14f19e5159665a355aad92f"
+        },
+        {
+          "path": "k4/public-fourflag-near-confirm-execution-v1/K04-01/02-B/result.json",
+          "role": "B",
+          "sha256": "9a026f35f72bc180b8119ea1b1d53933c3397d3783df0fd25a577187e0c7f311"
+        },
+        {
+          "path": "k4/public-fourflag-near-confirm-execution-v1/K04-01/03-A/result.json",
+          "role": "A",
+          "sha256": "f2f3893d81839f31db0b0a3e665235eddbd66eb8b483e1e78ccbf27ce3edfaf1"
+        },
+        {
+          "path": "k4/public-fourflag-near-confirm-execution-v1/K04-01/04-B/result.json",
+          "role": "B",
+          "sha256": "3ce14b11479efa5b74442547565f21230c13a9b34fcb5db65b32db7668572404"
+        },
+        {
+          "path": "k4/public-fourflag-near-confirm-execution-v1/K04-01/05-anchor/result.json",
+          "role": "anchor",
+          "sha256": "2abbbacc6715277c7ed7ffc727381dc3c26ea532edd4ec5d6f7ab93fec5e8259"
+        }
+      ],
+      "source_version": {
+        "id": "S02",
+        "path": "k4/fourflag-small-config-prep-v1/T1024_C1_B4096_all/source-manifest.json",
+        "file_sha256": "723aa2c83cd7c869ad5e3b6e0a453dc4f0b7e931756d2834b88c6e7e231643d0",
+        "label": "fourflag-small-config-prep-v1/T1024_C1_B4096_all",
+        "content_sha256": "a8dce6bb536b4571bdb2c76128fa159c3941f91f34f64e01edf1673bfe932295"
+      },
+      "gpu_uuid": "GPU-d178336e-85b3-e1bf-bbfc-d8f2e2054b65",
+      "evidence_id": "E-K04-01",
+      "stage_provenance": [
+        {
+          "kernel": "top_k_varlen_radix_cute",
+          "family": "top_k_varlen_radix_cute",
+          "source": {
+            "path": "k4/fourflag-small-config-prep-v1/T1024_C1_B4096_all/library/helion_kernel_library/_kernels/top_k_varlen/top_k_varlen_radix_cute.py",
+            "sha256": "cb9c4aec7b6189cc8fb843e83792fde084273cec95f5ee0b4e2d5f0c2531cd2f"
+          },
+          "config_source": {
+            "path": "k4/public-fourflag-near-confirm-execution-v1/K04-01/01-A/config-overlay/top_k_varlen_radix_cute/nvidia_sm103.json",
+            "sha256": "c190968a058fbc09152be674eaaa9d8bc3eaf60ae3a431aa28aebde9f177953e"
+          },
+          "shape_key": "cols=8192; dtype=float32; k=1024; rows=8",
+          "configuration_sha256": "c291d38fd2a50956a7fd894097951c3815903c5bf9e5519fefa747d45bf708a9"
+        }
+      ]
+    },
+    {
+      "case": "K04/02",
+      "shape": {
+        "cols": 32768,
+        "distribution": "uniform",
+        "dtype": "float32",
+        "k": 2048,
+        "rows": 16
+      },
+      "named_baseline": "flashinfer-radix-filter",
+      "helion_us": 19.807999953627586,
+      "named_baseline_us": 23.96799996495247,
+      "helion_metric_field": "candidate_us",
+      "named_baseline_metric_field": "baseline_us",
+      "accepted_goal_ratio": 1.2100161561522536,
+      "accepted_ratio_basis": "baseline_us/candidate_us",
+      "displayed_latency_ratio": 1.2100161561522536,
+      "config_artifact": {
+        "path": "configs/K04-02-v1.json",
+        "sha256": "54a76e98401b7f5c9772ff6420b3515cfe99327c8566b30521d355b73f216559"
+      },
+      "raw_summary_or_candidate": {
+        "path": "k4/public-guided-guards-screen-v1/K04-02/far-summary-v1.json",
+        "sha256": "4d7cca24c7c651e123a5d267261326407fad825b8885173045167caffb31e8d4",
+        "kind": "summary"
+      },
+      "raw_receipts": [
+        {
+          "role": "anchor",
+          "path": "k4/public-guided-guards-screen-v1/K04-02/anchor-start/result.json",
+          "sha256": "bf6f6455f3c88a435084e36f5195eb45f143287e826304b7a7f44c4d42c8313b"
+        },
+        {
+          "role": "A",
+          "path": "k4/public-guided-guards-screen-v1/K04-02/T1024_C4_B4096_P256_U4/result.json",
+          "sha256": "41beb17f71d0ab39898753c642e4ffff31315ee1268f8d0107a63fce7bedea0c"
+        },
+        {
+          "role": "anchor",
+          "path": "k4/public-guided-guards-screen-v1/K04-02/anchor-end/result.json",
+          "sha256": "56972ec53e841ab0541b336af02e5a3f9c98d118897315a895f65077bad0dfe6"
+        }
+      ],
+      "source_version": {
+        "id": "S03",
+        "path": "k4/radix-control-breadth-v1/T1024_C4_B4096_P256_U4/source-manifest-v1.json",
+        "file_sha256": "cae1db8cd5b4fc972b862a4bae11325b9be01b147d7be70d223159edc7875164",
+        "label": "radix-control-breadth-v1/T1024_C4_B4096_P256_U4",
+        "content_sha256": "be374c91962a20029968a1b7f940fbeb691e0bfd9f31639fcf7cb0e14ee1ec46"
+      },
+      "gpu_uuid": "GPU-d178336e-85b3-e1bf-bbfc-d8f2e2054b65",
+      "evidence_id": "E-K04-02",
+      "stage_provenance": [
+        {
+          "kernel": "top_k_varlen_radix_cute",
+          "family": "top_k_varlen_radix_cute",
+          "source": {
+            "path": "k4/radix-control-breadth-v1/T1024_C4_B4096_P256_U4/library/helion_kernel_library/_kernels/top_k_varlen/top_k_varlen_radix_cute.py",
+            "sha256": "cb9c4aec7b6189cc8fb843e83792fde084273cec95f5ee0b4e2d5f0c2531cd2f"
+          },
+          "config_source": {
+            "path": "k4/radix-control-breadth-v1/T1024_C4_B4096_P256_U4/library/helion_kernel_library/configs/top_k_varlen_radix_cute/nvidia_sm103.json",
+            "sha256": "c6da0ebd044994fff0e1ee5aa4a3fb0225fc3b731ec3197588b9c6e387224269"
+          },
+          "shape_key": "cols=32768; dtype=float32; k=2048; rows=16",
+          "configuration_sha256": "2e3cb159f8261669ec92a87029f6b79c48bc36aaf1529fd9543d97fe51f07adf"
+        }
+      ]
+    },
+    {
+      "case": "K04/03",
+      "shape": {
+        "cols": 128000,
+        "distribution": "uniform",
+        "dtype": "float32",
+        "k": 2048,
+        "rows": 24
+      },
+      "named_baseline": "flashinfer-radix-filter",
+      "helion_us": 28.00000086426735,
+      "named_baseline_us": 30.09600006043911,
+      "helion_metric_field": "candidate_us",
+      "named_baseline_metric_field": "baseline_us",
+      "accepted_goal_ratio": 1.0748571118384,
+      "accepted_ratio_basis": "baseline_us/candidate_us",
+      "displayed_latency_ratio": 1.0748571118384,
+      "config_artifact": {
+        "path": "configs/K04-03-v1.json",
+        "sha256": "42058ed423e3e7bd1067feef79f63a8f020ac29036d366baa55e50f76efc927d"
+      },
+      "raw_summary_or_candidate": {
+        "path": "k4/public-guided-guards-screen-v1/K04-03/far-summary-v1.json",
+        "sha256": "7286f2327ff3cb286066759f4d195bddcd3be59ccafe61d1994a52d7068ae36d",
+        "kind": "summary"
+      },
+      "raw_receipts": [
+        {
+          "role": "anchor",
+          "path": "k4/public-guided-guards-screen-v1/K04-03/anchor-start/result.json",
+          "sha256": "8f42ae4796e87adb97e18a697e4df4f5af285837cd714b304d3616125d1d79c9"
+        },
+        {
+          "role": "A",
+          "path": "k4/public-guided-guards-screen-v1/K04-03/T1024_C4_B4096_P256_U4/result.json",
+          "sha256": "7e96b1975e73a0d6f9cb0774d1c356022995b2fa48173d954e1884732d123ded"
+        },
+        {
+          "role": "anchor",
+          "path": "k4/public-guided-guards-screen-v1/K04-03/anchor-end/result.json",
+          "sha256": "02ef64a4f5d38841c709965c2ff39c752573e8ca658a051c46199d3a3369dc11"
+        }
+      ],
+      "source_version": {
+        "id": "S03",
+        "path": "k4/radix-control-breadth-v1/T1024_C4_B4096_P256_U4/source-manifest-v1.json",
+        "file_sha256": "cae1db8cd5b4fc972b862a4bae11325b9be01b147d7be70d223159edc7875164",
+        "label": "radix-control-breadth-v1/T1024_C4_B4096_P256_U4",
+        "content_sha256": "be374c91962a20029968a1b7f940fbeb691e0bfd9f31639fcf7cb0e14ee1ec46"
+      },
+      "gpu_uuid": "GPU-d178336e-85b3-e1bf-bbfc-d8f2e2054b65",
+      "evidence_id": "E-K04-03",
+      "stage_provenance": [
+        {
+          "kernel": "top_k_varlen_radix_cute",
+          "family": "top_k_varlen_radix_cute",
+          "source": {
+            "path": "k4/radix-control-breadth-v1/T1024_C4_B4096_P256_U4/library/helion_kernel_library/_kernels/top_k_varlen/top_k_varlen_radix_cute.py",
+            "sha256": "cb9c4aec7b6189cc8fb843e83792fde084273cec95f5ee0b4e2d5f0c2531cd2f"
+          },
+          "config_source": {
+            "path": "k4/radix-control-breadth-v1/T1024_C4_B4096_P256_U4/library/helion_kernel_library/configs/top_k_varlen_radix_cute/nvidia_sm103.json",
+            "sha256": "c6da0ebd044994fff0e1ee5aa4a3fb0225fc3b731ec3197588b9c6e387224269"
+          },
+          "shape_key": "cols=128000; dtype=float32; k=2048; rows=24",
+          "configuration_sha256": "2e3cb159f8261669ec92a87029f6b79c48bc36aaf1529fd9543d97fe51f07adf"
+        }
+      ]
+    },
+    {
+      "case": "K04/04",
+      "shape": {
+        "cols": 8192,
+        "distribution": "ragged",
+        "dtype": "float32",
+        "k": 512,
+        "rows": 8
+      },
+      "named_baseline": "flashinfer-radix-filter",
+      "helion_us": 15.71200042963028,
+      "named_baseline_us": 15.776000916957855,
+      "helion_metric_field": "candidate_us",
+      "named_baseline_metric_field": "baseline_us",
+      "accepted_goal_ratio": 1.004073350660485,
+      "accepted_ratio_basis": "baseline_us/candidate_us",
+      "displayed_latency_ratio": 1.004073350660485,
+      "config_artifact": {
+        "path": "configs/K04-04-v1.json",
+        "sha256": "15a8f69f5ca6855d3a3c2bb111acb78e3fa30732f9005b0f32d545715771b2eb"
+      },
+      "raw_summary_or_candidate": {
+        "path": "k4/public-fourflag-near-confirm-execution-v1/K04-04/summary.json",
+        "sha256": "32c83bc32a0fc23e29dd86a5e3762c79737e13746c60bbdf5c3d9d0e1c58be32",
+        "kind": "summary"
+      },
+      "raw_receipts": [
+        {
+          "path": "k4/public-fourflag-near-confirm-execution-v1/K04-04/00-anchor/result.json",
+          "role": "anchor",
+          "sha256": "7d22b3551d643069918108f025188adc7b4e9eeddeb73736645b7ccaa19fdd62"
+        },
+        {
+          "path": "k4/public-fourflag-near-confirm-execution-v1/K04-04/01-A/result.json",
+          "role": "A",
+          "sha256": "cd55eed023b2465e84b504d7d042f6dbf270a4cc1b93a0ab299498fa74895b20"
+        },
+        {
+          "path": "k4/public-fourflag-near-confirm-execution-v1/K04-04/02-B/result.json",
+          "role": "B",
+          "sha256": "f3ec43981ccde3c5099cd2a786aec7f1d68f30cb63b190537311579721efcf6e"
+        },
+        {
+          "path": "k4/public-fourflag-near-confirm-execution-v1/K04-04/03-A/result.json",
+          "role": "A",
+          "sha256": "e5c39b3c0c26bb87ad503a967b81bca3ffca76a7f1332b6227f04531e85cba09"
+        },
+        {
+          "path": "k4/public-fourflag-near-confirm-execution-v1/K04-04/04-B/result.json",
+          "role": "B",
+          "sha256": "b942300ceef8c445f0933f4e284efe5ee71cebf8b391e37259577479d1d47cfd"
+        },
+        {
+          "path": "k4/public-fourflag-near-confirm-execution-v1/K04-04/05-anchor/result.json",
+          "role": "anchor",
+          "sha256": "0fe02b543a336571bcdcbd4ebe8fe6f4f4a581f7106ff2724e22fc4f0a494cce"
+        }
+      ],
+      "source_version": {
+        "id": "S02",
+        "path": "k4/fourflag-small-config-prep-v1/T1024_C1_B4096_all/source-manifest.json",
+        "file_sha256": "723aa2c83cd7c869ad5e3b6e0a453dc4f0b7e931756d2834b88c6e7e231643d0",
+        "label": "fourflag-small-config-prep-v1/T1024_C1_B4096_all",
+        "content_sha256": "a8dce6bb536b4571bdb2c76128fa159c3941f91f34f64e01edf1673bfe932295"
+      },
+      "gpu_uuid": "GPU-d178336e-85b3-e1bf-bbfc-d8f2e2054b65",
+      "evidence_id": "E-K04-04",
+      "stage_provenance": [
+        {
+          "kernel": "top_k_varlen_radix_cute",
+          "family": "top_k_varlen_radix_cute",
+          "source": {
+            "path": "k4/fourflag-small-config-prep-v1/T1024_C1_B4096_all/library/helion_kernel_library/_kernels/top_k_varlen/top_k_varlen_radix_cute.py",
+            "sha256": "cb9c4aec7b6189cc8fb843e83792fde084273cec95f5ee0b4e2d5f0c2531cd2f"
+          },
+          "config_source": {
+            "path": "k4/public-fourflag-near-confirm-execution-v1/K04-04/01-A/config-overlay/top_k_varlen_radix_cute/nvidia_sm103.json",
+            "sha256": "a63d19e5977b4416be8d743c6fbbad8f5a97f0cbfdc644f55c4ccda865360a73"
+          },
+          "shape_key": "cols=8192; dtype=float32; k=512; rows=8",
+          "configuration_sha256": "c291d38fd2a50956a7fd894097951c3815903c5bf9e5519fefa747d45bf708a9"
+        }
+      ]
+    },
+    {
+      "case": "K04/05",
+      "shape": {
+        "cols": 4096,
+        "distribution": "uniform",
+        "dtype": "bfloat16",
+        "k": 512,
+        "rows": 4
+      },
+      "named_baseline": "flashinfer-radix-filter",
+      "helion_us": 13.60000018030405,
+      "named_baseline_us": 15.776000916957855,
+      "helion_metric_field": "candidate_us",
+      "named_baseline_metric_field": "baseline_us",
+      "accepted_goal_ratio": 1.1600000520444962,
+      "accepted_ratio_basis": "baseline_us/candidate_us",
+      "displayed_latency_ratio": 1.1600000520444962,
+      "config_artifact": {
+        "path": "configs/K04-05-v1.json",
+        "sha256": "bb338477bf1b567c0c3fe5a6b7e8514c7d7c9b6e573f1755bab0d8f74cf2d51b"
+      },
+      "raw_summary_or_candidate": {
+        "path": "k4/public-c1-config-discovery-v2/K04-05/01-T512_C1_B4096_direct/result.json",
+        "sha256": "af102447681dfe148c1b7b00ab32460de7c0947a0eb8ee7eadacfa9c0f51bb3d",
+        "kind": "candidate_receipt"
+      },
+      "raw_receipts": {
+        "00-anchor": {
+          "/data/users/shangdiy/helion-topk-paper-hillclimb-20261013/artifacts/topk-paper-20261013/k4/public-c1-config-discovery-v2/K04-05/00-anchor/result.json": {
+            "copied": "k4/public-c1-confirmation-prep-v1/K04-05/raw/00-anchor/result.json",
+            "sha256": "3ab3962428da649d3644d9aa668949059c7ce05b4bbf1e7f0b6b5a16ca8faf5e"
+          },
+          "/data/users/shangdiy/helion-topk-paper-hillclimb-20261013/artifacts/topk-paper-20261013/k4/public-c1-config-discovery-v2/K04-05/00-anchor/result.campaign.json": {
+            "copied": "k4/public-c1-confirmation-prep-v1/K04-05/raw/00-anchor/result.campaign.json",
+            "sha256": "2fd97df07c1c8cf3714b43d72e6d088b3e64fa678880036412480db30c92e973"
+          },
+          "/data/users/shangdiy/helion-topk-paper-hillclimb-20261013/artifacts/topk-paper-20261013/k4/public-c1-config-discovery-v2/K04-05/00-anchor/result.sha256.json": {
+            "copied": "k4/public-c1-confirmation-prep-v1/K04-05/raw/00-anchor/result.sha256.json",
+            "sha256": "68913b0720c06e8e374eb5fecdfeeeee84f996b724cde48a91180757efc2c0d0"
+          },
+          "/data/users/shangdiy/helion-topk-paper-hillclimb-20261013/artifacts/topk-paper-20261013/k4/public-c1-config-discovery-v2/K04-05-00-anchor.log": {
+            "copied": "k4/public-c1-confirmation-prep-v1/K04-05/raw/00-anchor/K04-05-00-anchor.log",
+            "sha256": "b47c2e24be43f47995c72f40ac8ddf3df5ff69b53210e765f08900ad86f19d73"
+          }
+        },
+        "01-T512_C1_B4096_direct": {
+          "/data/users/shangdiy/helion-topk-paper-hillclimb-20261013/artifacts/topk-paper-20261013/k4/public-c1-config-discovery-v2/K04-05/01-T512_C1_B4096_direct/result.json": {
+            "copied": "k4/public-c1-confirmation-prep-v1/K04-05/raw/01-T512_C1_B4096_direct/result.json",
+            "sha256": "af102447681dfe148c1b7b00ab32460de7c0947a0eb8ee7eadacfa9c0f51bb3d"
+          },
+          "/data/users/shangdiy/helion-topk-paper-hillclimb-20261013/artifacts/topk-paper-20261013/k4/public-c1-config-discovery-v2/K04-05/01-T512_C1_B4096_direct/result.campaign.json": {
+            "copied": "k4/public-c1-confirmation-prep-v1/K04-05/raw/01-T512_C1_B4096_direct/result.campaign.json",
+            "sha256": "c357b0eb92e098b99f5c5e69bebceffad947bc4f3a69d7357ab8f508d09d1a12"
+          },
+          "/data/users/shangdiy/helion-topk-paper-hillclimb-20261013/artifacts/topk-paper-20261013/k4/public-c1-config-discovery-v2/K04-05/01-T512_C1_B4096_direct/result.sha256.json": {
+            "copied": "k4/public-c1-confirmation-prep-v1/K04-05/raw/01-T512_C1_B4096_direct/result.sha256.json",
+            "sha256": "42f817bc9c3fe3dcd14c95282022ffcbdb418fc96b857bfb11dad617005bac27"
+          },
+          "/data/users/shangdiy/helion-topk-paper-hillclimb-20261013/artifacts/topk-paper-20261013/k4/public-c1-config-discovery-v2/K04-05-01-T512_C1_B4096_direct.log": {
+            "copied": "k4/public-c1-confirmation-prep-v1/K04-05/raw/01-T512_C1_B4096_direct/K04-05-01-T512_C1_B4096_direct.log",
+            "sha256": "dd7925d67ff737631dff5d89e73d09d5716f5ae268bc172d4a81e6104fc80d0b"
+          }
+        },
+        "02-T1024_C1_B4096_direct": {
+          "/data/users/shangdiy/helion-topk-paper-hillclimb-20261013/artifacts/topk-paper-20261013/k4/public-c1-config-discovery-v2/K04-05/02-T1024_C1_B4096_direct/result.json": {
+            "copied": "k4/public-c1-confirmation-prep-v1/K04-05/raw/02-T1024_C1_B4096_direct/result.json",
+            "sha256": "081ade8110374936565fea99408083398e1c67a3ef2f5654fbb5ecf9a9cf617c"
+          },
+          "/data/users/shangdiy/helion-topk-paper-hillclimb-20261013/artifacts/topk-paper-20261013/k4/public-c1-config-discovery-v2/K04-05/02-T1024_C1_B4096_direct/result.campaign.json": {
+            "copied": "k4/public-c1-confirmation-prep-v1/K04-05/raw/02-T1024_C1_B4096_direct/result.campaign.json",
+            "sha256": "82fdc7954cba69b02283562ae89d73407e65d12f847d24109b72bf27b6372235"
+          },
+          "/data/users/shangdiy/helion-topk-paper-hillclimb-20261013/artifacts/topk-paper-20261013/k4/public-c1-config-discovery-v2/K04-05/02-T1024_C1_B4096_direct/result.sha256.json": {
+            "copied": "k4/public-c1-confirmation-prep-v1/K04-05/raw/02-T1024_C1_B4096_direct/result.sha256.json",
+            "sha256": "e6571d3794f41336618af4600f302bf391d81e7b9840082af06fbae590cb0519"
+          },
+          "/data/users/shangdiy/helion-topk-paper-hillclimb-20261013/artifacts/topk-paper-20261013/k4/public-c1-config-discovery-v2/K04-05-02-T1024_C1_B4096_direct.log": {
+            "copied": "k4/public-c1-confirmation-prep-v1/K04-05/raw/02-T1024_C1_B4096_direct/K04-05-02-T1024_C1_B4096_direct.log",
+            "sha256": "23a45eb17931ca039ef0a7e316dee7facb7582cf5a4dacf9693c471b954eff00"
+          }
+        },
+        "03-anchor": {
+          "/data/users/shangdiy/helion-topk-paper-hillclimb-20261013/artifacts/topk-paper-20261013/k4/public-c1-config-discovery-v2/K04-05/03-anchor/result.json": {
+            "copied": "k4/public-c1-confirmation-prep-v1/K04-05/raw/03-anchor/result.json",
+            "sha256": "dcc47e70de26237283d892e124af436b0c0018d7ce2113ba3bf1a529131b9fdc"
+          },
+          "/data/users/shangdiy/helion-topk-paper-hillclimb-20261013/artifacts/topk-paper-20261013/k4/public-c1-config-discovery-v2/K04-05/03-anchor/result.campaign.json": {
+            "copied": "k4/public-c1-confirmation-prep-v1/K04-05/raw/03-anchor/result.campaign.json",
+            "sha256": "6e4ab0663e83c0be2db6461933739affbd5532b0d55edd2f09c4fdf453eae08c"
+          },
+          "/data/users/shangdiy/helion-topk-paper-hillclimb-20261013/artifacts/topk-paper-20261013/k4/public-c1-config-discovery-v2/K04-05/03-anchor/result.sha256.json": {
+            "copied": "k4/public-c1-confirmation-prep-v1/K04-05/raw/03-anchor/result.sha256.json",
+            "sha256": "a3e6779a7962928a394fd51d39bfdb29aafc25747eedc41cbed92dacfd566afc"
+          },
+          "/data/users/shangdiy/helion-topk-paper-hillclimb-20261013/artifacts/topk-paper-20261013/k4/public-c1-config-discovery-v2/K04-05-03-anchor.log": {
+            "copied": "k4/public-c1-confirmation-prep-v1/K04-05/raw/03-anchor/K04-05-03-anchor.log",
+            "sha256": "b47c2e24be43f47995c72f40ac8ddf3df5ff69b53210e765f08900ad86f19d73"
+          }
+        }
+      },
+      "source_version": {
+        "id": "S01",
+        "path": "k4/production-radix-public-v1/fixed-config-breadth-v2/T512_C1_B4096_direct/source-manifest.json",
+        "file_sha256": "05990fad56b9ddcaf38ba6695ee31e333bc90c47f9bf317d218e68e12edcecd4",
+        "label": "fixed-config-breadth-v2/T512_C1_B4096_direct",
+        "content_sha256": "19b6a4e19a550e900b2abf71d59dd6433e623408222dcaa4afd1920849e5d590"
+      },
+      "gpu_uuid": "GPU-d178336e-85b3-e1bf-bbfc-d8f2e2054b65",
+      "evidence_id": "E-K04-05",
+      "stage_provenance": [
+        {
+          "kernel": "top_k_varlen_radix_cute",
+          "family": "top_k_varlen_radix_cute",
+          "source": {
+            "path": "k4/production-radix-public-v1/fixed-config-breadth-v2/T512_C1_B4096_direct/library/helion_kernel_library/_kernels/top_k_varlen/top_k_varlen_radix_cute.py",
+            "sha256": "fc168acd5baa7eb8b1377c4b82f1d61f54ec59fe1894033c7aefe2fa2ee1dac0"
+          },
+          "config_source": {
+            "path": "k4/production-radix-public-v1/fixed-config-breadth-v2/T512_C1_B4096_direct/library/helion_kernel_library/configs/top_k_varlen_radix_cute/nvidia_sm103.json",
+            "sha256": "41c8a60998d71729bbdb9d24d7703ec8bb2034182757c6f77749e8a559e537cb"
+          },
+          "shape_key": "cols=4096; dtype=bfloat16; k=512; rows=4",
+          "configuration_sha256": "d4aed81a1964c17c681fb2ccc4aa4004be61e139c5f996409ccaf690d3c3157c"
+        }
+      ]
+    },
+    {
+      "case": "K04/06",
+      "shape": {
+        "cols": 8192,
+        "distribution": "uniform",
+        "dtype": "bfloat16",
+        "k": 1024,
+        "rows": 8
+      },
+      "named_baseline": "flashinfer-radix-filter",
+      "helion_us": 15.728000551462173,
+      "named_baseline_us": 15.792000107467175,
+      "helion_metric_field": "candidate_us",
+      "named_baseline_metric_field": "baseline_us",
+      "accepted_goal_ratio": 1.0040691476195969,
+      "accepted_ratio_basis": "baseline_us/candidate_us",
+      "displayed_latency_ratio": 1.0040691476195969,
+      "config_artifact": {
+        "path": "configs/K04-06-v1.json",
+        "sha256": "47300723e474923a5eb6cedad909e49bb414fc871b76ff63c40c91054f91090b"
+      },
+      "raw_summary_or_candidate": {
+        "path": "k4/public-c1-confirmation-prep-v1/K04-06/confirmation-window-v1/summary.json",
+        "sha256": "a70044e3e13240f8c41b7b0f193e979cfacf2b4a4104316a648b1ac63267abcc",
+        "kind": "summary"
+      },
+      "raw_receipts": [
+        {
+          "path": "k4/public-c1-confirmation-prep-v1/K04-06/confirmation-window-v1/00-anchor/result.json",
+          "role": "anchor",
+          "sha256": "746bce4fa758787d973cfc6baa218482b7c22293c668dc273ac49b80e89ee887"
+        },
+        {
+          "path": "k4/public-c1-confirmation-prep-v1/K04-06/confirmation-window-v1/01-A/result.json",
+          "role": "A",
+          "sha256": "b7dd7eb017c38553f4851321740b5b2ebde85986e86b7e9411e43a5dbc548396"
+        },
+        {
+          "path": "k4/public-c1-confirmation-prep-v1/K04-06/confirmation-window-v1/02-B/result.json",
+          "role": "B",
+          "sha256": "f525a8913cbbf458be611f012ba78d709d9a497254b7d3b86277e1ccbe3c3e3f"
+        },
+        {
+          "path": "k4/public-c1-confirmation-prep-v1/K04-06/confirmation-window-v1/03-A/result.json",
+          "role": "A",
+          "sha256": "b7bdfaa0a499c8aaf5565c36ae2206c5e2e63de7716e94dea9acf71efa30345d"
+        },
+        {
+          "path": "k4/public-c1-confirmation-prep-v1/K04-06/confirmation-window-v1/04-B/result.json",
+          "role": "B",
+          "sha256": "bcda9959e7b7ca9bc00f9c5f83935c896bc45d026d15aeecc5d39340c184bbaa"
+        },
+        {
+          "path": "k4/public-c1-confirmation-prep-v1/K04-06/confirmation-window-v1/05-anchor/result.json",
+          "role": "anchor",
+          "sha256": "b54317d801cc1efd52404486ace6bb5817f38ba857e2f3c280982434466d8011"
+        }
+      ],
+      "source_version": {
+        "id": "S04",
+        "path": "k4/public-c1-confirmation-prep-v1/K04-06/candidate-manifest.json",
+        "file_sha256": "464959bb44439d2ac3142ffa769bfedf15ee04d2f3742fc4037533e738bc3521",
+        "label": "public-c1-confirmation-prep-v1/K04-06",
+        "content_sha256": "13d22668f69271d7a0d0995f08d7dc4a8e0921a4049800a951c6e24213bb6ed0"
+      },
+      "gpu_uuid": "GPU-d178336e-85b3-e1bf-bbfc-d8f2e2054b65",
+      "evidence_id": "E-K04-06",
+      "stage_provenance": [
+        {
+          "kernel": "top_k_varlen_radix_cute",
+          "family": "top_k_varlen_radix_cute",
+          "source": {
+            "path": "k4/production-radix-public-v1/fixed-config-breadth-v2/T1024_C1_B4096_direct/library/helion_kernel_library/_kernels/top_k_varlen/top_k_varlen_radix_cute.py",
+            "sha256": "fc168acd5baa7eb8b1377c4b82f1d61f54ec59fe1894033c7aefe2fa2ee1dac0"
+          },
+          "config_source": {
+            "path": "k4/production-radix-public-v1/fixed-config-breadth-v2/T1024_C1_B4096_direct/library/helion_kernel_library/configs/top_k_varlen_radix_cute/nvidia_sm103.json",
+            "sha256": "5fd85c5c2ed018f2c2a885d81fd1e196470724502021e586e48a87c238ccddaa"
+          },
+          "shape_key": "cols=8192; dtype=bfloat16; k=1024; rows=8",
+          "configuration_sha256": "d181771e77f75a591cdde0185077b95be7d52197bfdefa2d50e0f088dbb6e75c"
+        }
+      ]
+    },
+    {
+      "case": "K04/07",
+      "shape": {
+        "cols": 32768,
+        "distribution": "uniform",
+        "dtype": "bfloat16",
+        "k": 2048,
+        "rows": 16
+      },
+      "named_baseline": "flashinfer-radix-filter",
+      "helion_us": 17.75999926030636,
+      "named_baseline_us": 19.872000440955162,
+      "helion_metric_field": "candidate_us",
+      "named_baseline_metric_field": "baseline_us",
+      "accepted_goal_ratio": 1.1189189903497987,
+      "accepted_ratio_basis": "baseline_us/candidate_us",
+      "displayed_latency_ratio": 1.1189189903497987,
+      "config_artifact": {
+        "path": "configs/K04-07-v1.json",
+        "sha256": "96688e0c0648f7be2204bd06ed52f531f6710285e0f56d5eef1acb21e27f39ef"
+      },
+      "raw_summary_or_candidate": {
+        "path": "k4/public-guided-guards-screen-v1/K04-07/far-summary-v1.json",
+        "sha256": "f8e420863cb605053cc86b143d3c4284a2aa56e77b017498a5a350974fa1a357",
+        "kind": "summary"
+      },
+      "raw_receipts": [
+        {
+          "role": "anchor",
+          "path": "k4/public-guided-guards-screen-v1/K04-07/anchor-start/result.json",
+          "sha256": "17574fb4c8c60c5efb204394b400e122dc15e5e196a81d6dfa9f0b5d0c0f41eb"
+        },
+        {
+          "role": "A",
+          "path": "k4/public-guided-guards-screen-v1/K04-07/T1024_C4_B4096_P128_U1/result.json",
+          "sha256": "c04e2f361f233268fc6ffb72c10921f41d7b9a4c86ffbb0d2cbf62b8a3185f42"
+        },
+        {
+          "role": "anchor",
+          "path": "k4/public-guided-guards-screen-v1/K04-07/anchor-end/result.json",
+          "sha256": "0f4fc8eb3049548d97aa4e6d29dd245919c730139e1206f2608e6ec642e47a9a"
+        }
+      ],
+      "source_version": {
+        "id": "S05",
+        "path": "k4/radix-control-breadth-v1/T1024_C4_B4096_P128_U1/source-manifest-v1.json",
+        "file_sha256": "ad5bd3215252400500c4d85b514fad8eadfa990f891590fcac4f8518d26a705f",
+        "label": "radix-control-breadth-v1/T1024_C4_B4096_P128_U1",
+        "content_sha256": "c8ae985de34a92c887bda8d1ea2866067b1e68b50cb2978d27a336a05e46512a"
+      },
+      "gpu_uuid": "GPU-d178336e-85b3-e1bf-bbfc-d8f2e2054b65",
+      "evidence_id": "E-K04-07",
+      "stage_provenance": [
+        {
+          "kernel": "top_k_varlen_radix_cute",
+          "family": "top_k_varlen_radix_cute",
+          "source": {
+            "path": "k4/radix-control-breadth-v1/T1024_C4_B4096_P128_U1/library/helion_kernel_library/_kernels/top_k_varlen/top_k_varlen_radix_cute.py",
+            "sha256": "cb9c4aec7b6189cc8fb843e83792fde084273cec95f5ee0b4e2d5f0c2531cd2f"
+          },
+          "config_source": {
+            "path": "k4/radix-control-breadth-v1/T1024_C4_B4096_P128_U1/library/helion_kernel_library/configs/top_k_varlen_radix_cute/nvidia_sm103.json",
+            "sha256": "32a90970edd28c4da30b6b37618f2280d84df3dcc43baef43bad9ec4ee25094b"
+          },
+          "shape_key": "cols=32768; dtype=bfloat16; k=2048; rows=16",
+          "configuration_sha256": "45a7c93921315f1a6bccff8fca3ef832dc78b7120427015d379d74db4b3c7633"
+        }
+      ]
+    },
+    {
+      "case": "K04/08",
+      "shape": {
+        "cols": 128000,
+        "distribution": "uniform",
+        "dtype": "bfloat16",
+        "k": 2048,
+        "rows": 24
+      },
+      "named_baseline": "flashinfer-radix-filter",
+      "helion_us": 23.903999477624893,
+      "named_baseline_us": 23.984000086784363,
+      "helion_metric_field": "candidate_us",
+      "named_baseline_metric_field": "baseline_us",
+      "accepted_goal_ratio": 1.0033467457709055,
+      "accepted_ratio_basis": "baseline_us/candidate_us",
+      "displayed_latency_ratio": 1.0033467457709055,
+      "config_artifact": {
+        "path": "configs/K04-08-v1.json",
+        "sha256": "d76feb90d7c683a0cb0d991481c59bd2d2eda196dd95dc8a8ba53b6c1b22c020"
+      },
+      "raw_summary_or_candidate": {
+        "path": "k4/public-production-inverse-K04-08-abab-v1/window/summary.json",
+        "sha256": "527409230dcc34f13ba4f68bfd12113039457f1dcb6a1f443ab556d963570d90",
+        "kind": "summary"
+      },
+      "raw_receipts": [
+        {
+          "path": "k4/public-production-inverse-K04-08-abab-v1/window/00-anchor/result.json",
+          "role": "anchor",
+          "sha256": "223cf7a8c592a988d3404e2dcb7d41e3ea310ea5bc546062d7f164c8352b3220"
+        },
+        {
+          "path": "k4/public-production-inverse-K04-08-abab-v1/window/01-A/result.json",
+          "role": "A",
+          "sha256": "0e9b167f665d3515f764f64faad9f47147942feb1ae58d6cc2f771728372689a"
+        },
+        {
+          "path": "k4/public-production-inverse-K04-08-abab-v1/window/02-B/result.json",
+          "role": "B",
+          "sha256": "72d0884fc1a3e988ad0d9d4668327807229addc62d540dd8ddb1337058387b74"
+        },
+        {
+          "path": "k4/public-production-inverse-K04-08-abab-v1/window/03-A/result.json",
+          "role": "A",
+          "sha256": "6eba43cf83440b094569820ea60816588742520b39ee7207d46fbfdc9bb9bda0"
+        },
+        {
+          "path": "k4/public-production-inverse-K04-08-abab-v1/window/04-B/result.json",
+          "role": "B",
+          "sha256": "ac437451c9fc46d22e0edb13ce2ca06d7f9dc63e375d94c6282e7ec46050b3f8"
+        },
+        {
+          "path": "k4/public-production-inverse-K04-08-abab-v1/window/05-anchor/result.json",
+          "role": "anchor",
+          "sha256": "932d5944c083eb3e72e3d0e3fdaa5211a98d80455fcbeb2114e7bbb79b66bef2"
+        }
+      ],
+      "source_version": {
+        "id": "S06",
+        "path": "k4/production-radix-public-inverse-v1/source-manifest-v1.json",
+        "file_sha256": "537620642113e8f37c79dcc4714ce0fde0eeb7953cfaf50106c50834aa60a11a",
+        "label": "production-radix-public-inverse-v1",
+        "content_sha256": "d23c0142f674ce10f557af705821f6d44f38210affa1d7378c94fd1ccb45dd1f"
+      },
+      "gpu_uuid": "GPU-d178336e-85b3-e1bf-bbfc-d8f2e2054b65",
+      "evidence_id": "E-K04-08",
+      "stage_provenance": [
+        {
+          "kernel": "top_k_varlen_radix_cute",
+          "family": "top_k_varlen_radix_cute",
+          "source": {
+            "path": "k4/production-radix-public-inverse-v1/library/helion_kernel_library/_kernels/top_k_varlen/top_k_varlen_radix_cute.py",
+            "sha256": "cb9c4aec7b6189cc8fb843e83792fde084273cec95f5ee0b4e2d5f0c2531cd2f"
+          },
+          "config_source": {
+            "path": "k4/production-radix-public-inverse-v1/library/helion_kernel_library/configs/top_k_varlen_radix_cute/nvidia_sm103.json",
+            "sha256": "aea4b7ce78522f85d5c0e993f29a733ef9491c4ab1f4cda1ffa7a1a6cb3ee9fa"
+          },
+          "shape_key": "cols=128000; dtype=bfloat16; k=2048; rows=24",
+          "configuration_sha256": "a6c9ece68acf158a42e64cf8a31e4378f28eb8534bc4948f28a43d37ae47edb2"
+        }
+      ]
+    },
+    {
+      "case": "K04/09",
+      "shape": {
+        "cols": 8192,
+        "distribution": "ragged",
+        "dtype": "bfloat16",
+        "k": 512,
+        "rows": 8
+      },
+      "named_baseline": "flashinfer-radix-filter",
+      "helion_us": 13.69599997997284,
+      "named_baseline_us": 15.776000916957855,
+      "helion_metric_field": "candidate_us",
+      "named_baseline_metric_field": "baseline_us",
+      "accepted_goal_ratio": 1.1518692275136189,
+      "accepted_ratio_basis": "baseline_us/candidate_us",
+      "displayed_latency_ratio": 1.1518692275136189,
+      "config_artifact": {
+        "path": "configs/K04-09-v1.json",
+        "sha256": "c02132c4865a069af17b8b0e61decc4b6e53af1d94e55783638530ed52616c39"
+      },
+      "raw_summary_or_candidate": {
+        "path": "k4/public-fourflag-small-screen-v1/K04-09/far-summary-v1.json",
+        "sha256": "e6a8a8f81d49a4adc1c60a9b2d6f0ec3417f631a76fd91bd25c1d681c52a3408",
+        "kind": "summary"
+      },
+      "raw_receipts": [
+        {
+          "role": "anchor",
+          "path": "k4/public-fourflag-small-screen-v1/K04-09/anchor-start/result.json",
+          "sha256": "2fbdbe36b1f4d8faa8966e26733a5e05a446595edec152787de669e40514c89b"
+        },
+        {
+          "role": "A",
+          "path": "k4/public-fourflag-small-screen-v1/K04-09/T1024_C1_B4096_all/result.json",
+          "sha256": "838ca8292a26d1ef07458643ad0563238927dddefd00dbc1ada458d15b29e039"
+        },
+        {
+          "role": "anchor",
+          "path": "k4/public-fourflag-small-screen-v1/K04-09/anchor-end/result.json",
+          "sha256": "5485fb29850baa749b0159957bc160b848d46e6591c893a682ed546ae98cd959"
+        }
+      ],
+      "source_version": {
+        "id": "S02",
+        "path": "k4/fourflag-small-config-prep-v1/T1024_C1_B4096_all/source-manifest.json",
+        "file_sha256": "723aa2c83cd7c869ad5e3b6e0a453dc4f0b7e931756d2834b88c6e7e231643d0",
+        "label": "fourflag-small-config-prep-v1/T1024_C1_B4096_all",
+        "content_sha256": "a8dce6bb536b4571bdb2c76128fa159c3941f91f34f64e01edf1673bfe932295"
+      },
+      "gpu_uuid": "GPU-d178336e-85b3-e1bf-bbfc-d8f2e2054b65",
+      "evidence_id": "E-K04-09",
+      "stage_provenance": [
+        {
+          "kernel": "top_k_varlen_radix_cute",
+          "family": "top_k_varlen_radix_cute",
+          "source": {
+            "path": "k4/fourflag-small-config-prep-v1/T1024_C1_B4096_all/library/helion_kernel_library/_kernels/top_k_varlen/top_k_varlen_radix_cute.py",
+            "sha256": "cb9c4aec7b6189cc8fb843e83792fde084273cec95f5ee0b4e2d5f0c2531cd2f"
+          },
+          "config_source": {
+            "path": "k4/fourflag-small-config-prep-v1/T1024_C1_B4096_all/library/helion_kernel_library/configs/top_k_varlen_radix_cute/nvidia_sm103.json",
+            "sha256": "08148fea01c0579048ddae1e941caf3e7e99cd3a6cbe537c6c9e77db2792677b"
+          },
+          "shape_key": "cols=8192; dtype=bfloat16; k=512; rows=8",
+          "configuration_sha256": "c291d38fd2a50956a7fd894097951c3815903c5bf9e5519fefa747d45bf708a9"
+        }
+      ]
+    },
+    {
+      "case": "K05/00",
+      "shape": {
+        "dtype": "float32",
+        "experts": 8,
+        "k": 2,
+        "m": 1,
+        "renormalize": false
+      },
+      "named_baseline": "sglang-cuda",
+      "helion_us": 5.59999980032444,
+      "named_baseline_us": 7.519999984651804,
+      "helion_metric_field": "candidate_us",
+      "named_baseline_metric_field": "baseline_us_conservative_min",
+      "accepted_goal_ratio": 1.3428571879977795,
+      "accepted_ratio_basis": "baseline_us_conservative_min/candidate_us",
+      "displayed_latency_ratio": 1.3428571879977795,
+      "config_artifact": {
+        "path": "configs/K05-00-v1.json",
+        "sha256": "66dea3e3a96a1ce88183d50ccf3941749087f75e2587e44c9eab93d556e83f9b"
+      },
+      "raw_summary_or_candidate": {
+        "path": "k5/config-discovery-v1/runs/initial-v1/K05-00/summary.json",
+        "sha256": "ad31d150e97b0cce833fe1417381dd1796954639143a2753b8f152f844a1a670",
+        "kind": "summary"
+      },
+      "raw_receipts": [],
+      "source_version": {
+        "id": "S07",
+        "path": "k5/snapshots/generic-seeded-v1/manifest.json",
+        "file_sha256": "1f72aaea505bf8d7d57f89d3fe9688d56644be244908bd1b2d547153bb4c71e6",
+        "label": "generic-seeded-v1",
+        "content_sha256": "8dc996a4609555eb19505b33c175da401546b51c4b8240a948e0f36dde9c77ac"
+      },
+      "gpu_uuid": "GPU-f07565f4-646c-24a4-8ecd-513648cf1ffe",
+      "evidence_id": "E-K05-00",
+      "stage_provenance": [
+        {
+          "kernel": "moe_topk_softmax_cute",
+          "family": "moe_topk_softmax_cute",
+          "shape_key": "dtype=float32; experts=8; k=2; m=1",
+          "configuration_sha256": "7838cba5a4c9de0ea46be8f70cecb5b07992c0828fc955a8f14c5f4218375da8"
+        }
+      ]
+    },
+    {
+      "case": "K05/01",
+      "shape": {
+        "dtype": "float32",
+        "experts": 64,
+        "k": 8,
+        "m": 32,
+        "renormalize": false
+      },
+      "named_baseline": "sglang-cuda",
+      "helion_us": 7.536000106483698,
+      "named_baseline_us": 7.584000006318092,
+      "helion_metric_field": "candidate_us",
+      "named_baseline_metric_field": "baseline_us",
+      "accepted_goal_ratio": 1.0063694133699783,
+      "accepted_ratio_basis": "baseline_us/candidate_us",
+      "displayed_latency_ratio": 1.0063694133699783,
+      "config_artifact": {
+        "path": "configs/K05-01-v1.json",
+        "sha256": "809baa2e55385d081794ec1e3980a384dcf7999857949408a85177d08dd6dea3"
+      },
+      "raw_summary_or_candidate": {
+        "path": "k5/config-discovery-v1/runs/confirm-retry-01-v1/K05-01/summary.json",
+        "sha256": "1365461c850579bda81329a4d01a69a4555bc55fc2014c18a9596c08fc63fa31",
+        "kind": "summary"
+      },
+      "raw_receipts": [],
+      "source_version": {
+        "id": "S07",
+        "path": "k5/snapshots/generic-seeded-v1/manifest.json",
+        "file_sha256": "1f72aaea505bf8d7d57f89d3fe9688d56644be244908bd1b2d547153bb4c71e6",
+        "label": "generic-seeded-v1",
+        "content_sha256": "8dc996a4609555eb19505b33c175da401546b51c4b8240a948e0f36dde9c77ac"
+      },
+      "gpu_uuid": "GPU-f07565f4-646c-24a4-8ecd-513648cf1ffe",
+      "evidence_id": "E-K05-01",
+      "stage_provenance": [
+        {
+          "kernel": "moe_topk_softmax_cute",
+          "family": "moe_topk_softmax_cute",
+          "shape_key": "dtype=float32; experts=64; k=8; m=32",
+          "configuration_sha256": "46c6214745cc51f5642f49eea2f7d9a4b69fd8d9b7a4ad47e0d0675b813d9473"
+        }
+      ]
+    },
+    {
+      "case": "K05/02",
+      "shape": {
+        "dtype": "float32",
+        "experts": 128,
+        "k": 8,
+        "m": 512,
+        "renormalize": false
+      },
+      "named_baseline": "sglang-cuda",
+      "helion_us": 7.536000106483698,
+      "named_baseline_us": 7.536000106483698,
+      "helion_metric_field": "candidate_us",
+      "named_baseline_metric_field": "baseline_us",
+      "accepted_goal_ratio": 1.0,
+      "accepted_ratio_basis": "baseline_us/candidate_us",
+      "displayed_latency_ratio": 1.0,
+      "config_artifact": {
+        "path": "configs/K05-02-v1.json",
+        "sha256": "3a9595dc80c0b08ddb86cd9b9d16d51a776f8b4242646f612968ae523ef0c4e4"
+      },
+      "raw_summary_or_candidate": {
+        "path": "k5/config-discovery-v1/runs/confirm-v1/K05-02/summary.json",
+        "sha256": "c17052721fdb1e2491d125cb4489d22db9d501106994c78aaf1ec6ac63d9b272",
+        "kind": "summary"
+      },
+      "raw_receipts": [],
+      "source_version": {
+        "id": "S07",
+        "path": "k5/snapshots/generic-seeded-v1/manifest.json",
+        "file_sha256": "1f72aaea505bf8d7d57f89d3fe9688d56644be244908bd1b2d547153bb4c71e6",
+        "label": "generic-seeded-v1",
+        "content_sha256": "8dc996a4609555eb19505b33c175da401546b51c4b8240a948e0f36dde9c77ac"
+      },
+      "gpu_uuid": "GPU-f07565f4-646c-24a4-8ecd-513648cf1ffe",
+      "evidence_id": "E-K05-02",
+      "stage_provenance": [
+        {
+          "kernel": "moe_topk_softmax_cute",
+          "family": "moe_topk_softmax_cute",
+          "shape_key": "dtype=float32; experts=128; k=8; m=512",
+          "configuration_sha256": "0c112b7e04c3eed80d9271f415d330a898b796b976e5695d355b0ffbe38d6c2e"
+        }
+      ]
+    },
+    {
+      "case": "K05/03",
+      "shape": {
+        "dtype": "float32",
+        "experts": 256,
+        "k": 8,
+        "m": 4096,
+        "renormalize": false
+      },
+      "named_baseline": "sglang-cuda",
+      "helion_us": 11.615999974310398,
+      "named_baseline_us": 11.58399973064661,
+      "helion_metric_field": "candidate_us",
+      "named_baseline_metric_field": "baseline_us",
+      "accepted_goal_ratio": 0.9972451580807026,
+      "accepted_ratio_basis": "baseline_us/candidate_us",
+      "displayed_latency_ratio": 0.9972451580807026,
+      "config_artifact": {
+        "path": "configs/K05-03-v1.json",
+        "sha256": "6e77599c89a9c724600c33b407d5488bdfe67300283c1219659f8680afe6770f"
+      },
+      "raw_summary_or_candidate": {
+        "path": "k5/config-discovery-v1/runs/confirm-v1/K05-03/summary.json",
+        "sha256": "e44d82244670c9a89c998c7877558243206d88e94f7628546e6ae4b77f03a4c6",
+        "kind": "summary"
+      },
+      "raw_receipts": [],
+      "source_version": {
+        "id": "S07",
+        "path": "k5/snapshots/generic-seeded-v1/manifest.json",
+        "file_sha256": "1f72aaea505bf8d7d57f89d3fe9688d56644be244908bd1b2d547153bb4c71e6",
+        "label": "generic-seeded-v1",
+        "content_sha256": "8dc996a4609555eb19505b33c175da401546b51c4b8240a948e0f36dde9c77ac"
+      },
+      "gpu_uuid": "GPU-f07565f4-646c-24a4-8ecd-513648cf1ffe",
+      "evidence_id": "E-K05-03",
+      "stage_provenance": [
+        {
+          "kernel": "moe_topk_softmax_cute",
+          "family": "moe_topk_softmax_cute",
+          "shape_key": "dtype=float32; experts=256; k=8; m=4096",
+          "configuration_sha256": "21d5c6b89f59cbbc39eb42899527cacad3e737e5d1ca6395748c7769494e7268"
+        }
+      ]
+    },
+    {
+      "case": "K05/04",
+      "shape": {
+        "dtype": "float32",
+        "experts": 512,
+        "k": 10,
+        "m": 4,
+        "renormalize": false
+      },
+      "named_baseline": "sglang-cuda",
+      "helion_us": 7.552000228315592,
+      "named_baseline_us": 9.568000212311745,
+      "helion_metric_field": "candidate_us",
+      "named_baseline_metric_field": "baseline_us_conservative_min",
+      "accepted_goal_ratio": 1.2669491423526882,
+      "accepted_ratio_basis": "baseline_us_conservative_min/candidate_us",
+      "displayed_latency_ratio": 1.2669491423526882,
+      "config_artifact": {
+        "path": "configs/K05-04-v1.json",
+        "sha256": "a4216b0e83fe9509273aad447979ec5aa4d76bcb7dca3b730123eddb14ac4a73"
+      },
+      "raw_summary_or_candidate": {
+        "path": "k5/config-discovery-v1/runs/initial-v1/K05-04/summary.json",
+        "sha256": "45e6be5203bde2dafcbfd2c58ceb793ecce907e1263b5084d2da058ff85b7258",
+        "kind": "summary"
+      },
+      "raw_receipts": [],
+      "source_version": {
+        "id": "S07",
+        "path": "k5/snapshots/generic-seeded-v1/manifest.json",
+        "file_sha256": "1f72aaea505bf8d7d57f89d3fe9688d56644be244908bd1b2d547153bb4c71e6",
+        "label": "generic-seeded-v1",
+        "content_sha256": "8dc996a4609555eb19505b33c175da401546b51c4b8240a948e0f36dde9c77ac"
+      },
+      "gpu_uuid": "GPU-f07565f4-646c-24a4-8ecd-513648cf1ffe",
+      "evidence_id": "E-K05-04",
+      "stage_provenance": [
+        {
+          "kernel": "moe_topk_softmax_cute",
+          "family": "moe_topk_softmax_cute",
+          "shape_key": "dtype=float32; experts=512; k=10; m=4",
+          "configuration_sha256": "5c9750ec9db3026ead13243e6d08c22e2cba339aa81229d1aefee9ccc9de16f3"
+        }
+      ]
+    },
+    {
+      "case": "K05/05",
+      "shape": {
+        "dtype": "float32",
+        "experts": 512,
+        "k": 10,
+        "m": 128,
+        "renormalize": false
+      },
+      "named_baseline": "sglang-cuda",
+      "helion_us": 7.552000228315592,
+      "named_baseline_us": 9.600000455975533,
+      "helion_metric_field": "candidate_us",
+      "named_baseline_metric_field": "baseline_us_conservative_min",
+      "accepted_goal_ratio": 1.2711864626249791,
+      "accepted_ratio_basis": "baseline_us_conservative_min/candidate_us",
+      "displayed_latency_ratio": 1.2711864626249791,
+      "config_artifact": {
+        "path": "configs/K05-05-v1.json",
+        "sha256": "188736d1a3c8acb34da1588aa3b002c53fc513f828e99c2f893e7a9a92479f17"
+      },
+      "raw_summary_or_candidate": {
+        "path": "k5/config-discovery-v1/runs/initial-v1/K05-05/summary.json",
+        "sha256": "2faab7b29e69d19d474d629ba9cd583f5e7e2f1a7db7569fd13500fcf2a6de98",
+        "kind": "summary"
+      },
+      "raw_receipts": [],
+      "source_version": {
+        "id": "S07",
+        "path": "k5/snapshots/generic-seeded-v1/manifest.json",
+        "file_sha256": "1f72aaea505bf8d7d57f89d3fe9688d56644be244908bd1b2d547153bb4c71e6",
+        "label": "generic-seeded-v1",
+        "content_sha256": "8dc996a4609555eb19505b33c175da401546b51c4b8240a948e0f36dde9c77ac"
+      },
+      "gpu_uuid": "GPU-f07565f4-646c-24a4-8ecd-513648cf1ffe",
+      "evidence_id": "E-K05-05",
+      "stage_provenance": [
+        {
+          "kernel": "moe_topk_softmax_cute",
+          "family": "moe_topk_softmax_cute",
+          "shape_key": "dtype=float32; experts=512; k=10; m=128",
+          "configuration_sha256": "0c112b7e04c3eed80d9271f415d330a898b796b976e5695d355b0ffbe38d6c2e"
+        }
+      ]
+    },
+    {
+      "case": "K05/06",
+      "shape": {
+        "dtype": "float32",
+        "experts": 8,
+        "k": 2,
+        "m": 1,
+        "renormalize": true
+      },
+      "named_baseline": "sglang-cuda",
+      "helion_us": 7.519999984651804,
+      "named_baseline_us": 7.536000106483698,
+      "helion_metric_field": "candidate_us",
+      "named_baseline_metric_field": "baseline_us",
+      "accepted_goal_ratio": 1.0021276757798603,
+      "accepted_ratio_basis": "baseline_us/candidate_us",
+      "displayed_latency_ratio": 1.0021276757798603,
+      "config_artifact": {
+        "path": "configs/K05-06-v1.json",
+        "sha256": "c00632ec8483a1a2e312a61ef24e77f434225f115732f643a777069f626358e0"
+      },
+      "raw_summary_or_candidate": {
+        "path": "k5/config-discovery-v1/runs/confirm-retry-03-v1/K05-06/summary.json",
+        "sha256": "f114ec77b0ce6593a099ad4395c09fbde034352f3868f1a21e94fe660cca5208",
+        "kind": "summary"
+      },
+      "raw_receipts": [],
+      "source_version": {
+        "id": "S07",
+        "path": "k5/snapshots/generic-seeded-v1/manifest.json",
+        "file_sha256": "1f72aaea505bf8d7d57f89d3fe9688d56644be244908bd1b2d547153bb4c71e6",
+        "label": "generic-seeded-v1",
+        "content_sha256": "8dc996a4609555eb19505b33c175da401546b51c4b8240a948e0f36dde9c77ac"
+      },
+      "gpu_uuid": "GPU-f07565f4-646c-24a4-8ecd-513648cf1ffe",
+      "evidence_id": "E-K05-06",
+      "stage_provenance": [
+        {
+          "kernel": "moe_topk_softmax_renorm_cute",
+          "family": "moe_topk_softmax_renorm_cute",
+          "shape_key": "dtype=float32; experts=8; k=2; m=1",
+          "configuration_sha256": "d72ac27cc83d705e46a6b1445f1f167551fabe83b1babcccc695338045201d3d"
+        }
+      ]
+    },
+    {
+      "case": "K05/07",
+      "shape": {
+        "dtype": "float32",
+        "experts": 64,
+        "k": 8,
+        "m": 32,
+        "renormalize": true
+      },
+      "named_baseline": "sglang-cuda",
+      "helion_us": 7.488000206649303,
+      "named_baseline_us": 7.712000049650669,
+      "helion_metric_field": "candidate_us",
+      "named_baseline_metric_field": "baseline_us_conservative_min",
+      "accepted_goal_ratio": 1.0299145081222694,
+      "accepted_ratio_basis": "baseline_us_conservative_min/candidate_us",
+      "displayed_latency_ratio": 1.0299145081222694,
+      "config_artifact": {
+        "path": "configs/K05-07-v1.json",
+        "sha256": "265fc1023b7fd738213ee659f11fc260c22e27cf8a698a22132aa65a21ac61af"
+      },
+      "raw_summary_or_candidate": {
+        "path": "k5/config-discovery-v1/runs/initial-v1/K05-07/summary.json",
+        "sha256": "8b7b5d6558a901aa18c266b2370dda94177b0c35ddd914f9d85b0d6638fe74b4",
+        "kind": "summary"
+      },
+      "raw_receipts": [],
+      "source_version": {
+        "id": "S07",
+        "path": "k5/snapshots/generic-seeded-v1/manifest.json",
+        "file_sha256": "1f72aaea505bf8d7d57f89d3fe9688d56644be244908bd1b2d547153bb4c71e6",
+        "label": "generic-seeded-v1",
+        "content_sha256": "8dc996a4609555eb19505b33c175da401546b51c4b8240a948e0f36dde9c77ac"
+      },
+      "gpu_uuid": "GPU-f07565f4-646c-24a4-8ecd-513648cf1ffe",
+      "evidence_id": "E-K05-07",
+      "stage_provenance": [
+        {
+          "kernel": "moe_topk_softmax_renorm_cute",
+          "family": "moe_topk_softmax_renorm_cute",
+          "shape_key": "dtype=float32; experts=64; k=8; m=32",
+          "configuration_sha256": "9d1c6094f06835013a7f17c9e550892c7791f64eaa3443bd3ca0d209b2a03273"
+        }
+      ]
+    },
+    {
+      "case": "K05/08",
+      "shape": {
+        "dtype": "float32",
+        "experts": 128,
+        "k": 8,
+        "m": 512,
+        "renormalize": true
+      },
+      "named_baseline": "sglang-cuda",
+      "helion_us": 7.536000106483698,
+      "named_baseline_us": 7.552000228315592,
+      "helion_metric_field": "candidate_us",
+      "named_baseline_metric_field": "baseline_us",
+      "accepted_goal_ratio": 1.0021231583871832,
+      "accepted_ratio_basis": "baseline_us/candidate_us",
+      "displayed_latency_ratio": 1.0021231583871832,
+      "config_artifact": {
+        "path": "configs/K05-08-v1.json",
+        "sha256": "56df7485068b8e3329f604d126ae8e9682e479657c7ddf8ac06ae63028b45500"
+      },
+      "raw_summary_or_candidate": {
+        "path": "k5/config-discovery-v1/runs/confirm-v1/K05-08/summary.json",
+        "sha256": "add273b705688f55f77635eee3b4db3fb4c64bcdfe1d9392951fb649ef026d52",
+        "kind": "summary"
+      },
+      "raw_receipts": [],
+      "source_version": {
+        "id": "S07",
+        "path": "k5/snapshots/generic-seeded-v1/manifest.json",
+        "file_sha256": "1f72aaea505bf8d7d57f89d3fe9688d56644be244908bd1b2d547153bb4c71e6",
+        "label": "generic-seeded-v1",
+        "content_sha256": "8dc996a4609555eb19505b33c175da401546b51c4b8240a948e0f36dde9c77ac"
+      },
+      "gpu_uuid": "GPU-f07565f4-646c-24a4-8ecd-513648cf1ffe",
+      "evidence_id": "E-K05-08",
+      "stage_provenance": [
+        {
+          "kernel": "moe_topk_softmax_renorm_cute",
+          "family": "moe_topk_softmax_renorm_cute",
+          "shape_key": "dtype=float32; experts=128; k=8; m=512",
+          "configuration_sha256": "6f8389a070d29322bae4cc6d7335fbb8ad76fe15ab2e3b2f0c787bb8df698aea"
+        }
+      ]
+    },
+    {
+      "case": "K05/09",
+      "shape": {
+        "dtype": "float32",
+        "experts": 256,
+        "k": 8,
+        "m": 4096,
+        "renormalize": true
+      },
+      "named_baseline": "sglang-cuda",
+      "helion_us": 9.568000212311745,
+      "named_baseline_us": 11.615999974310398,
+      "helion_metric_field": "candidate_us",
+      "named_baseline_metric_field": "baseline_us_conservative_min",
+      "accepted_goal_ratio": 1.2140467931181025,
+      "accepted_ratio_basis": "baseline_us_conservative_min/candidate_us",
+      "displayed_latency_ratio": 1.2140467931181025,
+      "config_artifact": {
+        "path": "configs/K05-09-v1.json",
+        "sha256": "12e67611123d5e8a0712fe48c05e90afdae93f43264d0934758db0d176fc0a0e"
+      },
+      "raw_summary_or_candidate": {
+        "path": "k5/config-discovery-v1/runs/initial-v1/K05-09/summary.json",
+        "sha256": "8af4753fdfe56a9720879387638ea41127aa6a07e0d9f9259cb786ba65aa58c4",
+        "kind": "summary"
+      },
+      "raw_receipts": [],
+      "source_version": {
+        "id": "S07",
+        "path": "k5/snapshots/generic-seeded-v1/manifest.json",
+        "file_sha256": "1f72aaea505bf8d7d57f89d3fe9688d56644be244908bd1b2d547153bb4c71e6",
+        "label": "generic-seeded-v1",
+        "content_sha256": "8dc996a4609555eb19505b33c175da401546b51c4b8240a948e0f36dde9c77ac"
+      },
+      "gpu_uuid": "GPU-f07565f4-646c-24a4-8ecd-513648cf1ffe",
+      "evidence_id": "E-K05-09",
+      "stage_provenance": [
+        {
+          "kernel": "moe_topk_softmax_renorm_cute",
+          "family": "moe_topk_softmax_renorm_cute",
+          "shape_key": "dtype=float32; experts=256; k=8; m=4096",
+          "configuration_sha256": "9d1c6094f06835013a7f17c9e550892c7791f64eaa3443bd3ca0d209b2a03273"
+        }
+      ]
+    },
+    {
+      "case": "K05/10",
+      "shape": {
+        "dtype": "float32",
+        "experts": 512,
+        "k": 10,
+        "m": 4,
+        "renormalize": true
+      },
+      "named_baseline": "sglang-cuda",
+      "helion_us": 7.552000228315592,
+      "named_baseline_us": 9.568000212311745,
+      "helion_metric_field": "candidate_us",
+      "named_baseline_metric_field": "baseline_us_conservative_min",
+      "accepted_goal_ratio": 1.2669491423526882,
+      "accepted_ratio_basis": "baseline_us_conservative_min/candidate_us",
+      "displayed_latency_ratio": 1.2669491423526882,
+      "config_artifact": {
+        "path": "configs/K05-10-v1.json",
+        "sha256": "954a8e9064de923bf6a00f37c8c9211a2e8373a3d9b58d220b83676979788fd0"
+      },
+      "raw_summary_or_candidate": {
+        "path": "k5/config-discovery-v1/runs/initial-v1/K05-10/summary.json",
+        "sha256": "dde99df62db36748d6a9f7fe1860f2b59f4bfb772e5c9c6a29b640577ed15598",
+        "kind": "summary"
+      },
+      "raw_receipts": [],
+      "source_version": {
+        "id": "S07",
+        "path": "k5/snapshots/generic-seeded-v1/manifest.json",
+        "file_sha256": "1f72aaea505bf8d7d57f89d3fe9688d56644be244908bd1b2d547153bb4c71e6",
+        "label": "generic-seeded-v1",
+        "content_sha256": "8dc996a4609555eb19505b33c175da401546b51c4b8240a948e0f36dde9c77ac"
+      },
+      "gpu_uuid": "GPU-f07565f4-646c-24a4-8ecd-513648cf1ffe",
+      "evidence_id": "E-K05-10",
+      "stage_provenance": [
+        {
+          "kernel": "moe_topk_softmax_renorm_cute",
+          "family": "moe_topk_softmax_renorm_cute",
+          "shape_key": "dtype=float32; experts=512; k=10; m=4",
+          "configuration_sha256": "b5854f8cd2fb1b3c4f5871eec63a2c65b26768a836cba9978807b7a17f09e0dd"
+        }
+      ]
+    },
+    {
+      "case": "K05/11",
+      "shape": {
+        "dtype": "float32",
+        "experts": 512,
+        "k": 10,
+        "m": 128,
+        "renormalize": true
+      },
+      "named_baseline": "sglang-cuda",
+      "helion_us": 8.191999979317188,
+      "named_baseline_us": 9.600000455975533,
+      "helion_metric_field": "candidate_us",
+      "named_baseline_metric_field": "baseline_us_conservative_min",
+      "accepted_goal_ratio": 1.171875058619776,
+      "accepted_ratio_basis": "baseline_us_conservative_min/candidate_us",
+      "displayed_latency_ratio": 1.171875058619776,
+      "config_artifact": {
+        "path": "configs/K05-11-v1.json",
+        "sha256": "0da4a360131dbd8c265a71a1d1d6577cf2382ee1ff11dc8b6f75f7ee1b51442e"
+      },
+      "raw_summary_or_candidate": {
+        "path": "k5/config-discovery-v1/runs/initial-v1/K05-11/summary.json",
+        "sha256": "75f6603faaff867f8aa3c30cec6cdbd655fc02063e596b33661c40f941044f02",
+        "kind": "summary"
+      },
+      "raw_receipts": [],
+      "source_version": {
+        "id": "S07",
+        "path": "k5/snapshots/generic-seeded-v1/manifest.json",
+        "file_sha256": "1f72aaea505bf8d7d57f89d3fe9688d56644be244908bd1b2d547153bb4c71e6",
+        "label": "generic-seeded-v1",
+        "content_sha256": "8dc996a4609555eb19505b33c175da401546b51c4b8240a948e0f36dde9c77ac"
+      },
+      "gpu_uuid": "GPU-f07565f4-646c-24a4-8ecd-513648cf1ffe",
+      "evidence_id": "E-K05-11",
+      "stage_provenance": [
+        {
+          "kernel": "moe_topk_softmax_renorm_cute",
+          "family": "moe_topk_softmax_renorm_cute",
+          "shape_key": "dtype=float32; experts=512; k=10; m=128",
+          "configuration_sha256": "6f8389a070d29322bae4cc6d7335fbb8ad76fe15ab2e3b2f0c787bb8df698aea"
+        }
+      ]
+    },
+    {
+      "case": "K05/12",
+      "shape": {
+        "dtype": "bfloat16",
+        "experts": 8,
+        "k": 2,
+        "m": 1,
+        "renormalize": false
+      },
+      "named_baseline": "sglang-cuda",
+      "helion_us": 5.5680000223219395,
+      "named_baseline_us": 7.519999984651804,
+      "helion_metric_field": "candidate_us",
+      "named_baseline_metric_field": "baseline_us_conservative_min",
+      "accepted_goal_ratio": 1.3505747044727654,
+      "accepted_ratio_basis": "baseline_us_conservative_min/candidate_us",
+      "displayed_latency_ratio": 1.3505747044727654,
+      "config_artifact": {
+        "path": "configs/K05-12-v1.json",
+        "sha256": "3c0d3edc289f83c6b0e9d41defc5af49dcf4a7245ca7b9746c50c885b2490924"
+      },
+      "raw_summary_or_candidate": {
+        "path": "k5/config-discovery-v1/runs/initial-v1/K05-12/summary.json",
+        "sha256": "40bfb06a0f887394d045325dcc016602e20396d8126ac8ec56b42f87839d44cf",
+        "kind": "summary"
+      },
+      "raw_receipts": [],
+      "source_version": {
+        "id": "S07",
+        "path": "k5/snapshots/generic-seeded-v1/manifest.json",
+        "file_sha256": "1f72aaea505bf8d7d57f89d3fe9688d56644be244908bd1b2d547153bb4c71e6",
+        "label": "generic-seeded-v1",
+        "content_sha256": "8dc996a4609555eb19505b33c175da401546b51c4b8240a948e0f36dde9c77ac"
+      },
+      "gpu_uuid": "GPU-f07565f4-646c-24a4-8ecd-513648cf1ffe",
+      "evidence_id": "E-K05-12",
+      "stage_provenance": [
+        {
+          "kernel": "moe_topk_softmax_cute",
+          "family": "moe_topk_softmax_cute",
+          "shape_key": "dtype=bfloat16; experts=8; k=2; m=1",
+          "configuration_sha256": "32314d5aa6b547ec622666242ed3a39245a59a9453abdfe6b9e25923571ff451"
+        }
+      ]
+    },
+    {
+      "case": "K05/13",
+      "shape": {
+        "dtype": "bfloat16",
+        "experts": 64,
+        "k": 8,
+        "m": 32,
+        "renormalize": false
+      },
+      "named_baseline": "sglang-cuda",
+      "helion_us": 7.536000106483698,
+      "named_baseline_us": 7.552000228315592,
+      "helion_metric_field": "candidate_us",
+      "named_baseline_metric_field": "baseline_us",
+      "accepted_goal_ratio": 1.0021231583871832,
+      "accepted_ratio_basis": "baseline_us/candidate_us",
+      "displayed_latency_ratio": 1.0021231583871832,
+      "config_artifact": {
+        "path": "configs/K05-13-v1.json",
+        "sha256": "272a38d3644082988be7b1f54face6c0d0cbbd2882587e01ba5bf54ea7126222"
+      },
+      "raw_summary_or_candidate": {
+        "path": "k5/config-discovery-v1/runs/confirm-v1/K05-13/summary.json",
+        "sha256": "81faa24e033f592300c1657dd7af01262fb2cf975c6acf44b7ec1e6d4c9d645a",
+        "kind": "summary"
+      },
+      "raw_receipts": [],
+      "source_version": {
+        "id": "S07",
+        "path": "k5/snapshots/generic-seeded-v1/manifest.json",
+        "file_sha256": "1f72aaea505bf8d7d57f89d3fe9688d56644be244908bd1b2d547153bb4c71e6",
+        "label": "generic-seeded-v1",
+        "content_sha256": "8dc996a4609555eb19505b33c175da401546b51c4b8240a948e0f36dde9c77ac"
+      },
+      "gpu_uuid": "GPU-f07565f4-646c-24a4-8ecd-513648cf1ffe",
+      "evidence_id": "E-K05-13",
+      "stage_provenance": [
+        {
+          "kernel": "moe_topk_softmax_cute",
+          "family": "moe_topk_softmax_cute",
+          "shape_key": "dtype=bfloat16; experts=64; k=8; m=32",
+          "configuration_sha256": "caee50d99154113658cff274516c21eacdaf3ed6ea1f3320093e0fb0c96ecef2"
+        }
+      ]
+    },
+    {
+      "case": "K05/14",
+      "shape": {
+        "dtype": "bfloat16",
+        "experts": 128,
+        "k": 8,
+        "m": 512,
+        "renormalize": false
+      },
+      "named_baseline": "sglang-cuda",
+      "helion_us": 7.519999984651804,
+      "named_baseline_us": 7.536000106483698,
+      "helion_metric_field": "candidate_us",
+      "named_baseline_metric_field": "baseline_us",
+      "accepted_goal_ratio": 1.0021276757798603,
+      "accepted_ratio_basis": "baseline_us/candidate_us",
+      "displayed_latency_ratio": 1.0021276757798603,
+      "config_artifact": {
+        "path": "configs/K05-14-v1.json",
+        "sha256": "5b5dd9224030518089d9855847b0871043be07e301bd8feced32ef1aded86028"
+      },
+      "raw_summary_or_candidate": {
+        "path": "k5/config-discovery-v1/runs/confirm-v1/K05-14/summary.json",
+        "sha256": "79713d4388b234e89ff24aa2fd78ab1766bb4c10625f63abe39b7a34b77cc801",
+        "kind": "summary"
+      },
+      "raw_receipts": [],
+      "source_version": {
+        "id": "S07",
+        "path": "k5/snapshots/generic-seeded-v1/manifest.json",
+        "file_sha256": "1f72aaea505bf8d7d57f89d3fe9688d56644be244908bd1b2d547153bb4c71e6",
+        "label": "generic-seeded-v1",
+        "content_sha256": "8dc996a4609555eb19505b33c175da401546b51c4b8240a948e0f36dde9c77ac"
+      },
+      "gpu_uuid": "GPU-f07565f4-646c-24a4-8ecd-513648cf1ffe",
+      "evidence_id": "E-K05-14",
+      "stage_provenance": [
+        {
+          "kernel": "moe_topk_softmax_cute",
+          "family": "moe_topk_softmax_cute",
+          "shape_key": "dtype=bfloat16; experts=128; k=8; m=512",
+          "configuration_sha256": "f95bba5a9862d0378672b76c91b6b70f30cbac468394069aa31233aef4322eb6"
+        }
+      ]
+    },
+    {
+      "case": "K05/15",
+      "shape": {
+        "dtype": "bfloat16",
+        "experts": 256,
+        "k": 8,
+        "m": 4096,
+        "renormalize": false
+      },
+      "named_baseline": "sglang-cuda",
+      "helion_us": 7.519999984651804,
+      "named_baseline_us": 11.615999974310398,
+      "helion_metric_field": "candidate_us",
+      "named_baseline_metric_field": "baseline_us_conservative_min",
+      "accepted_goal_ratio": 1.5446808508003276,
+      "accepted_ratio_basis": "baseline_us_conservative_min/candidate_us",
+      "displayed_latency_ratio": 1.5446808508003276,
+      "config_artifact": {
+        "path": "configs/K05-15-v1.json",
+        "sha256": "caf74a4d34db5b7f1d90869363ec9cef01e3c63443da02fe7ab3bb89bb8b150f"
+      },
+      "raw_summary_or_candidate": {
+        "path": "k5/config-discovery-v1/runs/initial-v1/K05-15/summary.json",
+        "sha256": "a62aa5f2e7d40fd338075691611620096a40497c3d6d59998d551993156ac867",
+        "kind": "summary"
+      },
+      "raw_receipts": [],
+      "source_version": {
+        "id": "S07",
+        "path": "k5/snapshots/generic-seeded-v1/manifest.json",
+        "file_sha256": "1f72aaea505bf8d7d57f89d3fe9688d56644be244908bd1b2d547153bb4c71e6",
+        "label": "generic-seeded-v1",
+        "content_sha256": "8dc996a4609555eb19505b33c175da401546b51c4b8240a948e0f36dde9c77ac"
+      },
+      "gpu_uuid": "GPU-f07565f4-646c-24a4-8ecd-513648cf1ffe",
+      "evidence_id": "E-K05-15",
+      "stage_provenance": [
+        {
+          "kernel": "moe_topk_softmax_cute",
+          "family": "moe_topk_softmax_cute",
+          "shape_key": "dtype=bfloat16; experts=256; k=8; m=4096",
+          "configuration_sha256": "f95bba5a9862d0378672b76c91b6b70f30cbac468394069aa31233aef4322eb6"
+        }
+      ]
+    },
+    {
+      "case": "K05/16",
+      "shape": {
+        "dtype": "bfloat16",
+        "experts": 512,
+        "k": 10,
+        "m": 4,
+        "renormalize": false
+      },
+      "named_baseline": "sglang-cuda",
+      "helion_us": 7.519999984651804,
+      "named_baseline_us": 9.535999968647957,
+      "helion_metric_field": "candidate_us",
+      "named_baseline_metric_field": "baseline_us_conservative_min",
+      "accepted_goal_ratio": 1.2680851048019648,
+      "accepted_ratio_basis": "baseline_us_conservative_min/candidate_us",
+      "displayed_latency_ratio": 1.2680851048019648,
+      "config_artifact": {
+        "path": "configs/K05-16-v2.json",
+        "sha256": "102dc118351fc960305d51e3278d5d2315b2af6db9f0ec567b02303a6622cd94"
+      },
+      "raw_summary_or_candidate": {
+        "path": "k5/config-discovery-v1/runs/initial-v1/K05-16/summary.json",
+        "sha256": "23ea80b8519f9a6427c23ede87b40a979e071bd056aa019f9a8dbdc85929bcb2",
+        "kind": "summary"
+      },
+      "raw_receipts": [],
+      "source_version": {
+        "id": "S07",
+        "path": "k5/snapshots/generic-seeded-v1/manifest.json",
+        "file_sha256": "1f72aaea505bf8d7d57f89d3fe9688d56644be244908bd1b2d547153bb4c71e6",
+        "label": "generic-seeded-v1",
+        "content_sha256": "8dc996a4609555eb19505b33c175da401546b51c4b8240a948e0f36dde9c77ac"
+      },
+      "gpu_uuid": "GPU-f07565f4-646c-24a4-8ecd-513648cf1ffe",
+      "evidence_id": "E-K05-16",
+      "stage_provenance": [
+        {
+          "kernel": "moe_topk_softmax_cute",
+          "family": "moe_topk_softmax_cute",
+          "shape_key": "dtype=bfloat16; experts=512; k=10; m=4",
+          "configuration_sha256": "9d8ec45a1f1086f830ee39b52227f03b90769a754fbf4f2b36039ea1d17abb49"
+        }
+      ]
+    },
+    {
+      "case": "K05/17",
+      "shape": {
+        "dtype": "bfloat16",
+        "experts": 512,
+        "k": 10,
+        "m": 128,
+        "renormalize": false
+      },
+      "named_baseline": "sglang-cuda",
+      "helion_us": 7.536000106483698,
+      "named_baseline_us": 9.64799989014864,
+      "helion_metric_field": "candidate_us",
+      "named_baseline_metric_field": "baseline_us",
+      "accepted_goal_ratio": 1.280254744403182,
+      "accepted_ratio_basis": "baseline_us/candidate_us",
+      "displayed_latency_ratio": 1.280254744403182,
+      "config_artifact": {
+        "path": "configs/K05-17-v1.json",
+        "sha256": "5a83f7af6a65d4c2ea6d32d7806306e4f541fb967849a7eb965bf1785f18950c"
+      },
+      "raw_summary_or_candidate": {
+        "path": "k5/config-discovery-v1/runs/confirm-v1/K05-17/summary.json",
+        "sha256": "571a098823a05e090565fa327ea3afb6c297384e8f1f8936d4403f4bec35573d",
+        "kind": "summary"
+      },
+      "raw_receipts": [],
+      "source_version": {
+        "id": "S07",
+        "path": "k5/snapshots/generic-seeded-v1/manifest.json",
+        "file_sha256": "1f72aaea505bf8d7d57f89d3fe9688d56644be244908bd1b2d547153bb4c71e6",
+        "label": "generic-seeded-v1",
+        "content_sha256": "8dc996a4609555eb19505b33c175da401546b51c4b8240a948e0f36dde9c77ac"
+      },
+      "gpu_uuid": "GPU-f07565f4-646c-24a4-8ecd-513648cf1ffe",
+      "evidence_id": "E-K05-17",
+      "stage_provenance": [
+        {
+          "kernel": "moe_topk_softmax_cute",
+          "family": "moe_topk_softmax_cute",
+          "shape_key": "dtype=bfloat16; experts=512; k=10; m=128",
+          "configuration_sha256": "6c53ac437a307f66f1b7bfa3406aca914eb5574242cfb66a254107c0b544168e"
+        }
+      ]
+    },
+    {
+      "case": "K05/18",
+      "shape": {
+        "dtype": "bfloat16",
+        "experts": 8,
+        "k": 2,
+        "m": 1,
+        "renormalize": true
+      },
+      "named_baseline": "sglang-cuda",
+      "helion_us": 5.727999843657017,
+      "named_baseline_us": 7.519999984651804,
+      "helion_metric_field": "candidate_us",
+      "named_baseline_metric_field": "baseline_us_conservative_min",
+      "accepted_goal_ratio": 1.3128491951652521,
+      "accepted_ratio_basis": "baseline_us_conservative_min/candidate_us",
+      "displayed_latency_ratio": 1.3128491951652521,
+      "config_artifact": {
+        "path": "configs/K05-18-v1.json",
+        "sha256": "bce319d12a5a539436ee17589335e5dc2064f38c340a292c28b9d75b0831f6c7"
+      },
+      "raw_summary_or_candidate": {
+        "path": "k5/config-discovery-v1/runs/initial-v1/K05-18/summary.json",
+        "sha256": "f1eda45e3a3cc7eac1d83b0bae0ed843a8c2e2dd5022740aa6388159300bb291",
+        "kind": "summary"
+      },
+      "raw_receipts": [],
+      "source_version": {
+        "id": "S07",
+        "path": "k5/snapshots/generic-seeded-v1/manifest.json",
+        "file_sha256": "1f72aaea505bf8d7d57f89d3fe9688d56644be244908bd1b2d547153bb4c71e6",
+        "label": "generic-seeded-v1",
+        "content_sha256": "8dc996a4609555eb19505b33c175da401546b51c4b8240a948e0f36dde9c77ac"
+      },
+      "gpu_uuid": "GPU-f07565f4-646c-24a4-8ecd-513648cf1ffe",
+      "evidence_id": "E-K05-18",
+      "stage_provenance": [
+        {
+          "kernel": "moe_topk_softmax_renorm_cute",
+          "family": "moe_topk_softmax_renorm_cute",
+          "shape_key": "dtype=bfloat16; experts=8; k=2; m=1",
+          "configuration_sha256": "2c7f9da12fe9f1e0fc38de46abfa16adc2ee267b288c4f804a7c6ab8048e6899"
+        }
+      ]
+    },
+    {
+      "case": "K05/19",
+      "shape": {
+        "dtype": "bfloat16",
+        "experts": 64,
+        "k": 8,
+        "m": 32,
+        "renormalize": true
+      },
+      "named_baseline": "sglang-cuda",
+      "helion_us": 7.536000106483698,
+      "named_baseline_us": 7.536000106483698,
+      "helion_metric_field": "candidate_us",
+      "named_baseline_metric_field": "baseline_us",
+      "accepted_goal_ratio": 1.0,
+      "accepted_ratio_basis": "baseline_us/candidate_us",
+      "displayed_latency_ratio": 1.0,
+      "config_artifact": {
+        "path": "configs/K05-19-v1.json",
+        "sha256": "d844c5308bc845a44c9ef9d09eae7ff286e0786160170dd57c10ddcaab0ae6e2"
+      },
+      "raw_summary_or_candidate": {
+        "path": "k5/config-discovery-v1/runs/confirm-v1/K05-19/summary.json",
+        "sha256": "137c9a0e3ab1848476fae679bddd3cead5eb701539c5f4af46b7969218a9aba0",
+        "kind": "summary"
+      },
+      "raw_receipts": [],
+      "source_version": {
+        "id": "S07",
+        "path": "k5/snapshots/generic-seeded-v1/manifest.json",
+        "file_sha256": "1f72aaea505bf8d7d57f89d3fe9688d56644be244908bd1b2d547153bb4c71e6",
+        "label": "generic-seeded-v1",
+        "content_sha256": "8dc996a4609555eb19505b33c175da401546b51c4b8240a948e0f36dde9c77ac"
+      },
+      "gpu_uuid": "GPU-f07565f4-646c-24a4-8ecd-513648cf1ffe",
+      "evidence_id": "E-K05-19",
+      "stage_provenance": [
+        {
+          "kernel": "moe_topk_softmax_renorm_cute",
+          "family": "moe_topk_softmax_renorm_cute",
+          "shape_key": "dtype=bfloat16; experts=64; k=8; m=32",
+          "configuration_sha256": "adbc280a6a2a7ff0176ca784c9ee18a1d0a228d448e7dee87dc33c701c464d6e"
+        }
+      ]
+    },
+    {
+      "case": "K05/20",
+      "shape": {
+        "dtype": "bfloat16",
+        "experts": 128,
+        "k": 8,
+        "m": 512,
+        "renormalize": true
+      },
+      "named_baseline": "sglang-cuda",
+      "helion_us": 7.455999962985516,
+      "named_baseline_us": 7.520000217482448,
+      "helion_metric_field": "candidate_us",
+      "named_baseline_metric_field": "baseline_us",
+      "accepted_goal_ratio": 1.0085837251629097,
+      "accepted_ratio_basis": "baseline_us/candidate_us",
+      "displayed_latency_ratio": 1.0085837251629097,
+      "config_artifact": {
+        "path": "configs/K05-20-v1.json",
+        "sha256": "3c31421b40f8b948693513088611e0375f6ae63f7ef8dfba0efadb8455acb3cb"
+      },
+      "raw_summary_or_candidate": {
+        "path": "k5/config-discovery-v1/runs/confirm-v1/K05-20/summary.json",
+        "sha256": "ffded942724b53d8aa6b4c3c1a8f4858e5b7f54400d3895d260de56d5927a8d6",
+        "kind": "summary"
+      },
+      "raw_receipts": [],
+      "source_version": {
+        "id": "S07",
+        "path": "k5/snapshots/generic-seeded-v1/manifest.json",
+        "file_sha256": "1f72aaea505bf8d7d57f89d3fe9688d56644be244908bd1b2d547153bb4c71e6",
+        "label": "generic-seeded-v1",
+        "content_sha256": "8dc996a4609555eb19505b33c175da401546b51c4b8240a948e0f36dde9c77ac"
+      },
+      "gpu_uuid": "GPU-f07565f4-646c-24a4-8ecd-513648cf1ffe",
+      "evidence_id": "E-K05-20",
+      "stage_provenance": [
+        {
+          "kernel": "moe_topk_softmax_renorm_cute",
+          "family": "moe_topk_softmax_renorm_cute",
+          "shape_key": "dtype=bfloat16; experts=128; k=8; m=512",
+          "configuration_sha256": "28bd34a438883cfec6f9b1998180e5c54298e8dfd29289f1d5c7feb5df7710c8"
+        }
+      ]
+    },
+    {
+      "case": "K05/21",
+      "shape": {
+        "dtype": "bfloat16",
+        "experts": 256,
+        "k": 8,
+        "m": 4096,
+        "renormalize": true
+      },
+      "named_baseline": "sglang-cuda",
+      "helion_us": 7.519999984651804,
+      "named_baseline_us": 11.615999974310398,
+      "helion_metric_field": "candidate_us",
+      "named_baseline_metric_field": "baseline_us_conservative_min",
+      "accepted_goal_ratio": 1.5446808508003276,
+      "accepted_ratio_basis": "baseline_us_conservative_min/candidate_us",
+      "displayed_latency_ratio": 1.5446808508003276,
+      "config_artifact": {
+        "path": "configs/K05-21-v1.json",
+        "sha256": "b4b4067cb530856288636e85063512669b134bdbd4a6e61887a038795c1621dc"
+      },
+      "raw_summary_or_candidate": {
+        "path": "k5/config-discovery-v1/runs/initial-v1/K05-21/summary.json",
+        "sha256": "6415c2e8d1befa99ac6e7eafe434663ad3652b29767956c01f68c19ecad9a1bf",
+        "kind": "summary"
+      },
+      "raw_receipts": [],
+      "source_version": {
+        "id": "S07",
+        "path": "k5/snapshots/generic-seeded-v1/manifest.json",
+        "file_sha256": "1f72aaea505bf8d7d57f89d3fe9688d56644be244908bd1b2d547153bb4c71e6",
+        "label": "generic-seeded-v1",
+        "content_sha256": "8dc996a4609555eb19505b33c175da401546b51c4b8240a948e0f36dde9c77ac"
+      },
+      "gpu_uuid": "GPU-f07565f4-646c-24a4-8ecd-513648cf1ffe",
+      "evidence_id": "E-K05-21",
+      "stage_provenance": [
+        {
+          "kernel": "moe_topk_softmax_renorm_cute",
+          "family": "moe_topk_softmax_renorm_cute",
+          "shape_key": "dtype=bfloat16; experts=256; k=8; m=4096",
+          "configuration_sha256": "db658f69d3470d632283c9a7d1c719618ecc8fcbe37a19eb7e8d1a3d194f0151"
+        }
+      ]
+    },
+    {
+      "case": "K05/22",
+      "shape": {
+        "dtype": "bfloat16",
+        "experts": 512,
+        "k": 10,
+        "m": 4,
+        "renormalize": true
+      },
+      "named_baseline": "sglang-cuda",
+      "helion_us": 7.519999984651804,
+      "named_baseline_us": 9.568000212311745,
+      "helion_metric_field": "candidate_us",
+      "named_baseline_metric_field": "baseline_us_conservative_min",
+      "accepted_goal_ratio": 1.2723404563616856,
+      "accepted_ratio_basis": "baseline_us_conservative_min/candidate_us",
+      "displayed_latency_ratio": 1.2723404563616856,
+      "config_artifact": {
+        "path": "configs/K05-22-v1.json",
+        "sha256": "41308a8d91c47b0faf51bed194c4cb582e18edfef305b77f4c9780856ee05988"
+      },
+      "raw_summary_or_candidate": {
+        "path": "k5/config-discovery-v1/runs/initial-v1/K05-22/summary.json",
+        "sha256": "7cc4640de2308bbe92a8f80d532e0a5505c6e57443c4fa2a32d7932753ada46c",
+        "kind": "summary"
+      },
+      "raw_receipts": [],
+      "source_version": {
+        "id": "S07",
+        "path": "k5/snapshots/generic-seeded-v1/manifest.json",
+        "file_sha256": "1f72aaea505bf8d7d57f89d3fe9688d56644be244908bd1b2d547153bb4c71e6",
+        "label": "generic-seeded-v1",
+        "content_sha256": "8dc996a4609555eb19505b33c175da401546b51c4b8240a948e0f36dde9c77ac"
+      },
+      "gpu_uuid": "GPU-f07565f4-646c-24a4-8ecd-513648cf1ffe",
+      "evidence_id": "E-K05-22",
+      "stage_provenance": [
+        {
+          "kernel": "moe_topk_softmax_renorm_cute",
+          "family": "moe_topk_softmax_renorm_cute",
+          "shape_key": "dtype=bfloat16; experts=512; k=10; m=4",
+          "configuration_sha256": "042b29a6dcb029d29f74b43ad687b1ae26e87abae7d4e648643b9cf9439cd249"
+        }
+      ]
+    },
+    {
+      "case": "K05/23",
+      "shape": {
+        "dtype": "bfloat16",
+        "experts": 512,
+        "k": 10,
+        "m": 128,
+        "renormalize": true
+      },
+      "named_baseline": "sglang-cuda",
+      "helion_us": 7.519999984651804,
+      "named_baseline_us": 9.600000455975533,
+      "helion_metric_field": "candidate_us",
+      "named_baseline_metric_field": "baseline_us_conservative_min",
+      "accepted_goal_ratio": 1.2765958079214064,
+      "accepted_ratio_basis": "baseline_us_conservative_min/candidate_us",
+      "displayed_latency_ratio": 1.2765958079214064,
+      "config_artifact": {
+        "path": "configs/K05-23-v1.json",
+        "sha256": "ecb2da04fac451901795660b838c0065ee9e4dddeecf5248870fdbebaf07ede4"
+      },
+      "raw_summary_or_candidate": {
+        "path": "k5/config-discovery-v1/runs/initial-v1/K05-23/summary.json",
+        "sha256": "81036f370564691ff6d97703b5c4586a22cd2f5a79cfd7f5f884b465d5ece74f",
+        "kind": "summary"
+      },
+      "raw_receipts": [],
+      "source_version": {
+        "id": "S07",
+        "path": "k5/snapshots/generic-seeded-v1/manifest.json",
+        "file_sha256": "1f72aaea505bf8d7d57f89d3fe9688d56644be244908bd1b2d547153bb4c71e6",
+        "label": "generic-seeded-v1",
+        "content_sha256": "8dc996a4609555eb19505b33c175da401546b51c4b8240a948e0f36dde9c77ac"
+      },
+      "gpu_uuid": "GPU-f07565f4-646c-24a4-8ecd-513648cf1ffe",
+      "evidence_id": "E-K05-23",
+      "stage_provenance": [
+        {
+          "kernel": "moe_topk_softmax_renorm_cute",
+          "family": "moe_topk_softmax_renorm_cute",
+          "shape_key": "dtype=bfloat16; experts=512; k=10; m=128",
+          "configuration_sha256": "28bd34a438883cfec6f9b1998180e5c54298e8dfd29289f1d5c7feb5df7710c8"
+        }
+      ]
+    },
+    {
+      "case": "K06/00",
+      "shape": {
+        "batch": 1,
+        "dtype": "float32",
+        "k": 50,
+        "p": 0.9,
+        "vocab": 32000
+      },
+      "named_baseline": "flashinfer-joint",
+      "helion_us": 35.50400026142597,
+      "named_baseline_us": 40.063999593257904,
+      "helion_metric_field": "candidate_median_us",
+      "named_baseline_metric_field": "named_baseline_median_us",
+      "accepted_goal_ratio": 1.1041482487971102,
+      "accepted_ratio_basis": "conservative_min_FlashInfer_over_max_Helion",
+      "displayed_latency_ratio": 1.1284362127719516,
+      "config_artifact": {
+        "path": "configs/K06-00-v1.json",
+        "sha256": "3f1e2810795bb81c1b864a3f31667da1df75c640a3c1d253ee6e4e987b4b84f4"
+      },
+      "raw_summary_or_candidate": {
+        "path": "k6/public-v23-anchored-v1/K06-00/summary.json",
+        "sha256": "22d7fae98109caf13bc382a12b37b6d7a35c4441413dd89a627ca26e9e33a52e",
+        "kind": "summary"
+      },
+      "raw_receipts": [
+        {
+          "path": "artifacts/topk-paper-20261013/k6/public-v23-anchored-v1/K06-00/00-anchor/result.json",
+          "role": "anchor",
+          "sha256": "e201f0bbae3b0860b6379101b5369022cf0718c4b120af33322f2a30e1a35d4d"
+        },
+        {
+          "path": "artifacts/topk-paper-20261013/k6/public-v23-anchored-v1/K06-00/01-A/result.json",
+          "role": "A",
+          "sha256": "75c53c7ae4f68768f0b616aa3b48603c9b84680320234caef3a4bc6886e75fff"
+        },
+        {
+          "path": "artifacts/topk-paper-20261013/k6/public-v23-anchored-v1/K06-00/02-B/result.json",
+          "role": "B",
+          "sha256": "3da3ad98e9535a5e37c5ab5b6095bafb17a2bea5209bdbc82b68b44f53f11dbc"
+        },
+        {
+          "path": "artifacts/topk-paper-20261013/k6/public-v23-anchored-v1/K06-00/03-A/result.json",
+          "role": "A",
+          "sha256": "72579b01d803725c328a1ed9642059a5cfb2cbec10d22bc95059f59219e11fa5"
+        },
+        {
+          "path": "artifacts/topk-paper-20261013/k6/public-v23-anchored-v1/K06-00/04-B/result.json",
+          "role": "B",
+          "sha256": "490a481c115f36848e19acba1afba73d3e636aa8122e87c40e1fdd17898e2992"
+        },
+        {
+          "path": "artifacts/topk-paper-20261013/k6/public-v23-anchored-v1/K06-00/05-anchor/result.json",
+          "role": "anchor",
+          "sha256": "8577ef99d39afb2d610a5f39972658588e9b7919cc00cb3ba0cf97142adf0380"
+        }
+      ],
+      "source_version": {
+        "id": "S08",
+        "path": "k6/snapshots/public-v23-k4-pipeline-v1/manifest.json",
+        "file_sha256": "150944298e0acc7031faf62ec2e612bedf2d2d5c7c81323e294cba0a46c74257",
+        "label": "public-v23-k4-pipeline-v1",
+        "content_sha256": "20aa54b505d69da871fc507bed632f94b08715ce59336552a8705963d0dad391"
+      },
+      "gpu_uuid": "GPU-f07565f4-646c-24a4-8ecd-513648cf1ffe",
+      "evidence_id": "E-K06-00",
+      "stage_provenance": [
+        {
+          "kernel": "top_k_varlen_radix_cute",
+          "family": "top_k_varlen_radix_cute",
+          "source": {
+            "path": "k6/snapshots/public-v23-k4-pipeline-v1/library/helion_kernel_library/_kernels/top_k_varlen/top_k_varlen_radix_cute.py",
+            "sha256": "cb9c4aec7b6189cc8fb843e83792fde084273cec95f5ee0b4e2d5f0c2531cd2f"
+          },
+          "config_source": {
+            "path": "artifacts/topk-paper-20261013/k6/public-v23-anchored-v1/K06-00/03-A/config-overlay/top_k_varlen_radix_cute/nvidia_sm103.json",
+            "sha256": "00ad1cd234a2c517414a2222effb9263d1024f0a9c6778937911ff15d42825e3"
+          },
+          "shape_key": "cols=32000; dtype=float32; k=50; rows=1",
+          "configuration_sha256": "c6835f549181ed2eabde3c0c96d0f535f436c25e6f892eb4321e32da2a85ec49"
+        },
+        {
+          "kernel": "sampling_kth_cute",
+          "family": "top_k_top_p_sampling_kth_cute",
+          "source": {
+            "path": "k6/snapshots/public-v23-k4-pipeline-v1/library/helion_kernel_library/_kernels/top_k_top_p_sampling/sampling_kth_cute.py",
+            "sha256": "5ce7af88fab165aa75d8b56743cd9084210317b0c2582a71b1c0affd7a21bda3"
+          },
+          "config_source": {
+            "path": "artifacts/topk-paper-20261013/k6/public-v23-anchored-v1/K06-00/03-A/config-overlay/top_k_top_p_sampling_kth_cute/nvidia_sm103.json",
+            "sha256": "9f21140db24c72ce6477e83064c08f205e7c170385e453f85d61eadd4179d74c"
+          },
+          "shape_key": "batch=1; k=50",
+          "configuration_sha256": "b60d11f2f994c728a67b1ffa47673f2aaa83f8a26387a9009a33fc62595ec622"
+        },
+        {
+          "kernel": "sampling_mass_stats_cute",
+          "family": "top_k_top_p_sampling_mass_stats_cute",
+          "source": {
+            "path": "k6/snapshots/public-v23-k4-pipeline-v1/library/helion_kernel_library/_kernels/top_k_top_p_sampling/sampling_mass_stats_cute.py",
+            "sha256": "37c40bf31af7d87e54d6b11475f0fe38d22de2af514e4f653a21e94e0a7f4561"
+          },
+          "config_source": {
+            "path": "artifacts/topk-paper-20261013/k6/public-v23-anchored-v1/K06-00/03-A/config-overlay/top_k_top_p_sampling_mass_stats_cute/nvidia_sm103.json",
+            "sha256": "a6fae9bd52eb2fedf0790f4bc6a32c7643e06110d0a035acc46cfe0c87d8f79e"
+          },
+          "shape_key": "batch=1; vocab=32000",
+          "configuration_sha256": "23eebb83d2b366e95b02b0f8bd7fa231a28571eaf28623983f35522d3e9e4c2e"
+        },
+        {
+          "kind": "torch-rng",
+          "operation": "torch.rand((batch,), device=cuda, dtype=float32)",
+          "source": "byte-fingerprinted public sampling_pipeline_cute.py"
+        },
+        {
+          "kernel": "sampling_fused_draw_cute",
+          "family": "top_k_top_p_sampling_fused_draw_cute",
+          "source": {
+            "path": "k6/snapshots/public-v23-k4-pipeline-v1/library/helion_kernel_library/_kernels/top_k_top_p_sampling/sampling_fused_draw_cute.py",
+            "sha256": "331e2a5e3839b4db0087d4c58379e055a7721f9605302c0b767c34406b3861f4"
+          },
+          "config_source": {
+            "path": "artifacts/topk-paper-20261013/k6/public-v23-anchored-v1/K06-00/03-A/config-overlay/top_k_top_p_sampling_fused_draw_cute/nvidia_sm103.json",
+            "sha256": "7cbf75c8c9deab53cb8dbc326998eee00262b026ed40a2ece3efdc6981be7fb7"
+          },
+          "shape_key": "batch=1; chunk_cols=4096; k=50; parts=8; vocab=32000",
+          "configuration_sha256": "ff49f82971fbb0bbd677f175efad7dc1f1a0a1b31b6564fa5aadb01964e92f7d"
+        }
+      ]
+    },
+    {
+      "case": "K06/01",
+      "shape": {
+        "batch": 19,
+        "dtype": "float32",
+        "k": 50,
+        "p": 0.9,
+        "vocab": 128256
+      },
+      "named_baseline": "flashinfer-joint",
+      "helion_us": 56.47999979555607,
+      "named_baseline_us": 93.34400296211243,
+      "helion_metric_field": "candidate_median_us",
+      "named_baseline_metric_field": "named_baseline_median_us",
+      "accepted_goal_ratio": 1.6526912765579873,
+      "accepted_ratio_basis": "named_baseline_median_us/candidate_median_us",
+      "displayed_latency_ratio": 1.6526912765579873,
+      "config_artifact": {
+        "path": "configs/K06-01-v2.json",
+        "sha256": "61a2f08aedcc2fa0b17726c12fd1dc577dece8de8c68ed743dcfa851855f8e9e"
+      },
+      "raw_summary_or_candidate": {
+        "path": "k6/current-v29-anchored-v1/K06-01/summary.json",
+        "sha256": "feb84cff34edc545d4eaf37954b12e5975490844fbbcbcf902c0aa77c17c4e54",
+        "kind": "summary"
+      },
+      "raw_receipts": [
+        {
+          "path": "k6/current-v29-anchored-v1/K06-01/00-anchor/result.json",
+          "role": "anchor",
+          "sha256": "91fc977c4e151282fbac137c634cd60e3c5bd53a4646a4127608963724e909c9"
+        },
+        {
+          "path": "k6/current-v29-anchored-v1/K06-01/01-A/result.json",
+          "role": "A",
+          "sha256": "3de3eef84187cbd02c535e1cf9977aebfe69c146398c06767fba1de8c25d6267"
+        },
+        {
+          "path": "k6/current-v29-anchored-v1/K06-01/02-B/result.json",
+          "role": "B",
+          "sha256": "9b9c26e359b269afac8a8534bd4e962da287c2ddc1985e60bcb06912ea1eda39"
+        },
+        {
+          "path": "k6/current-v29-anchored-v1/K06-01/03-A/result.json",
+          "role": "A",
+          "sha256": "2eebd25d3663a59eaaf04aa64c2884da6d96575e79011397b9f378d0a731b320"
+        },
+        {
+          "path": "k6/current-v29-anchored-v1/K06-01/04-B/result.json",
+          "role": "B",
+          "sha256": "f71685300dd7adc3f8d9a477597ba94ede1c391d8ad17bd6815b1a6c06af79ff"
+        },
+        {
+          "path": "k6/current-v29-anchored-v1/K06-01/05-anchor/result.json",
+          "role": "anchor",
+          "sha256": "89f8adcbd1b832952812f2e71017bb8e7db3c10dd8c6387e31100e4e476ca043"
+        }
+      ],
+      "source_version": {
+        "id": "S06",
+        "path": "k4/production-radix-public-inverse-v1/source-manifest-v1.json",
+        "file_sha256": "537620642113e8f37c79dcc4714ce0fde0eeb7953cfaf50106c50834aa60a11a",
+        "label": "production-radix-public-inverse-v1",
+        "content_sha256": "d23c0142f674ce10f557af705821f6d44f38210affa1d7378c94fd1ccb45dd1f"
+      },
+      "gpu_uuid": "GPU-f07565f4-646c-24a4-8ecd-513648cf1ffe",
+      "evidence_id": "E-K06-01",
+      "stage_provenance": [
+        {
+          "kernel": "top_k_varlen_radix_cute",
+          "family": "top_k_varlen_radix_cute",
+          "source": {
+            "path": "k4/production-radix-public-inverse-v1/library/helion_kernel_library/_kernels/top_k_varlen/top_k_varlen_radix_cute.py",
+            "sha256": "cb9c4aec7b6189cc8fb843e83792fde084273cec95f5ee0b4e2d5f0c2531cd2f"
+          },
+          "config_source": {
+            "path": "k4/production-radix-public-inverse-v1/library/helion_kernel_library/configs/top_k_varlen_radix_cute/nvidia_sm103.json",
+            "sha256": "aea4b7ce78522f85d5c0e993f29a733ef9491c4ab1f4cda1ffa7a1a6cb3ee9fa"
+          },
+          "shape_key": "cols=128256; dtype=float32; k=50; rows=19",
+          "configuration_sha256": "bcdc5e0413a0a9e1c24e4ae4d283e76e999237b89b47c9a0bd1bade606a3c0b7"
+        },
+        {
+          "kernel": "sampling_kth_cute",
+          "family": "top_k_top_p_sampling_kth_cute",
+          "source": {
+            "path": "k4/production-radix-public-inverse-v1/library/helion_kernel_library/_kernels/top_k_top_p_sampling/sampling_kth_cute.py",
+            "sha256": "4a829d7631b962fc571d6ab846e5eb1c84682dac408a6a83a8dde2f3f229bdd2"
+          },
+          "config_source": {
+            "path": "k4/production-radix-public-inverse-v1/library/helion_kernel_library/configs/top_k_top_p_sampling_kth_cute/nvidia_sm103.json",
+            "sha256": "dfa13f444af40a65a7589b132b8955ce583108e96ca31f28525aeb81f7169d3c"
+          },
+          "shape_key": "batch=19; k=50",
+          "configuration_sha256": "b60d11f2f994c728a67b1ffa47673f2aaa83f8a26387a9009a33fc62595ec622"
+        },
+        {
+          "kernel": "sampling_mass_stats_cute",
+          "family": "top_k_top_p_sampling_mass_stats_cute",
+          "source": {
+            "path": "k4/production-radix-public-inverse-v1/library/helion_kernel_library/_kernels/top_k_top_p_sampling/sampling_mass_stats_cute.py",
+            "sha256": "ca0b6d35dfbbe7ef01be0164d94117a67accb4b64be2f3fea4fed16e8fad7b9b"
+          },
+          "config_source": {
+            "path": "k4/production-radix-public-inverse-v1/library/helion_kernel_library/configs/top_k_top_p_sampling_mass_stats_cute/nvidia_sm103.json",
+            "sha256": "5c9846d9a8d55a2667954d144ffce4f89619aab82f965b1426779c41548151ca"
+          },
+          "shape_key": "batch=19; vocab=128256",
+          "configuration_sha256": "8806f84d3c31ee390ace6a68e374747ebd6a5c061754591b7562cec756ade2ef"
+        },
+        {
+          "kind": "torch-rng",
+          "operation": "torch.rand((batch,), device=cuda, dtype=float32)"
+        },
+        {
+          "kernel": "sampling_fused_draw_cute",
+          "family": "top_k_top_p_sampling_fused_draw_cute",
+          "source": {
+            "path": "k4/production-radix-public-inverse-v1/library/helion_kernel_library/_kernels/top_k_top_p_sampling/sampling_fused_draw_cute.py",
+            "sha256": "331e2a5e3839b4db0087d4c58379e055a7721f9605302c0b767c34406b3861f4"
+          },
+          "config_source": {
+            "path": "k4/production-radix-public-inverse-v1/library/helion_kernel_library/configs/top_k_top_p_sampling_fused_draw_cute/nvidia_sm103.json",
+            "sha256": "98d18d118b62c27599ac2fc06d1d345d498e6296595e9bfb11d164a2a79de6de"
+          },
+          "shape_key": "batch=19; chunk_cols=4096; k=50; parts=32; vocab=128256",
+          "configuration_sha256": "ff49f82971fbb0bbd677f175efad7dc1f1a0a1b31b6564fa5aadb01964e92f7d"
+        }
+      ]
+    },
+    {
+      "case": "K06/02",
+      "shape": {
+        "batch": 99,
+        "dtype": "float32",
+        "k": 50,
+        "p": 0.1,
+        "vocab": 128256
+      },
+      "named_baseline": "flashinfer-joint",
+      "helion_us": 136.32000237703323,
+      "named_baseline_us": 244.91199851036072,
+      "helion_metric_field": "candidate_median_us",
+      "named_baseline_metric_field": "named_baseline_median_us",
+      "accepted_goal_ratio": 1.7965962018764072,
+      "accepted_ratio_basis": "named_baseline_median_us/candidate_median_us",
+      "displayed_latency_ratio": 1.7965962018764072,
+      "config_artifact": {
+        "path": "configs/K06-02-v2.json",
+        "sha256": "66f65c92ff915ff3fb434b5b629357b46e46d098c331cb8b74193735f9641956"
+      },
+      "raw_summary_or_candidate": {
+        "path": "k6/current-v29-anchored-v1/K06-02/summary.json",
+        "sha256": "6601890bb68f97a2891cc1c41edd6a0061363a3153e4221ead75e14f3f9bc62b",
+        "kind": "summary"
+      },
+      "raw_receipts": [
+        {
+          "path": "k6/current-v29-anchored-v1/K06-02/00-anchor/result.json",
+          "role": "anchor",
+          "sha256": "56584f8753dd493d6b6f40b6bd8ff27eb3399e898381b5314e9686fe4aac7605"
+        },
+        {
+          "path": "k6/current-v29-anchored-v1/K06-02/01-A/result.json",
+          "role": "A",
+          "sha256": "6f4697477db8183fe4a79241327ba3f4e3bfb76a107283e89f88570f53d24b66"
+        },
+        {
+          "path": "k6/current-v29-anchored-v1/K06-02/02-B/result.json",
+          "role": "B",
+          "sha256": "c68dd69f11f1186a5b7b6e6d7a0d06fd80429ca6f7b00cd9f9c89dd595a0ab3b"
+        },
+        {
+          "path": "k6/current-v29-anchored-v1/K06-02/03-A/result.json",
+          "role": "A",
+          "sha256": "4124de8cb5be3493aa739131e7001deb27fd341556e4ff4520dbb414c47fdf47"
+        },
+        {
+          "path": "k6/current-v29-anchored-v1/K06-02/04-B/result.json",
+          "role": "B",
+          "sha256": "3f801250927ea173a6d707d60b8d267d7a73f9c0bf0d649d0927765a45c323eb"
+        },
+        {
+          "path": "k6/current-v29-anchored-v1/K06-02/05-anchor/result.json",
+          "role": "anchor",
+          "sha256": "c276f80859546da554cac471ae3df5915d91dc85707bb1dea7cb9339067525b7"
+        }
+      ],
+      "source_version": {
+        "id": "S06",
+        "path": "k4/production-radix-public-inverse-v1/source-manifest-v1.json",
+        "file_sha256": "537620642113e8f37c79dcc4714ce0fde0eeb7953cfaf50106c50834aa60a11a",
+        "label": "production-radix-public-inverse-v1",
+        "content_sha256": "d23c0142f674ce10f557af705821f6d44f38210affa1d7378c94fd1ccb45dd1f"
+      },
+      "gpu_uuid": "GPU-f07565f4-646c-24a4-8ecd-513648cf1ffe",
+      "evidence_id": "E-K06-02",
+      "stage_provenance": [
+        {
+          "kernel": "top_k_varlen_radix_cute",
+          "family": "top_k_varlen_radix_cute",
+          "source": {
+            "path": "k4/production-radix-public-inverse-v1/library/helion_kernel_library/_kernels/top_k_varlen/top_k_varlen_radix_cute.py",
+            "sha256": "cb9c4aec7b6189cc8fb843e83792fde084273cec95f5ee0b4e2d5f0c2531cd2f"
+          },
+          "config_source": {
+            "path": "k4/production-radix-public-inverse-v1/library/helion_kernel_library/configs/top_k_varlen_radix_cute/nvidia_sm103.json",
+            "sha256": "aea4b7ce78522f85d5c0e993f29a733ef9491c4ab1f4cda1ffa7a1a6cb3ee9fa"
+          },
+          "shape_key": "cols=128256; dtype=float32; k=50; rows=99",
+          "configuration_sha256": "bcdc5e0413a0a9e1c24e4ae4d283e76e999237b89b47c9a0bd1bade606a3c0b7"
+        },
+        {
+          "kernel": "sampling_kth_cute",
+          "family": "top_k_top_p_sampling_kth_cute",
+          "source": {
+            "path": "k4/production-radix-public-inverse-v1/library/helion_kernel_library/_kernels/top_k_top_p_sampling/sampling_kth_cute.py",
+            "sha256": "4a829d7631b962fc571d6ab846e5eb1c84682dac408a6a83a8dde2f3f229bdd2"
+          },
+          "config_source": {
+            "path": "k4/production-radix-public-inverse-v1/library/helion_kernel_library/configs/top_k_top_p_sampling_kth_cute/nvidia_sm103.json",
+            "sha256": "dfa13f444af40a65a7589b132b8955ce583108e96ca31f28525aeb81f7169d3c"
+          },
+          "shape_key": "batch=99; k=50",
+          "configuration_sha256": "b60d11f2f994c728a67b1ffa47673f2aaa83f8a26387a9009a33fc62595ec622"
+        },
+        {
+          "kernel": "sampling_mass_stats_cute",
+          "family": "top_k_top_p_sampling_mass_stats_cute",
+          "source": {
+            "path": "k4/production-radix-public-inverse-v1/library/helion_kernel_library/_kernels/top_k_top_p_sampling/sampling_mass_stats_cute.py",
+            "sha256": "ca0b6d35dfbbe7ef01be0164d94117a67accb4b64be2f3fea4fed16e8fad7b9b"
+          },
+          "config_source": {
+            "path": "k4/production-radix-public-inverse-v1/library/helion_kernel_library/configs/top_k_top_p_sampling_mass_stats_cute/nvidia_sm103.json",
+            "sha256": "5c9846d9a8d55a2667954d144ffce4f89619aab82f965b1426779c41548151ca"
+          },
+          "shape_key": "batch=99; vocab=128256",
+          "configuration_sha256": "8806f84d3c31ee390ace6a68e374747ebd6a5c061754591b7562cec756ade2ef"
+        },
+        {
+          "kind": "torch-rng",
+          "operation": "torch.rand((batch,), device=cuda, dtype=float32)"
+        },
+        {
+          "kernel": "sampling_fused_draw_cute",
+          "family": "top_k_top_p_sampling_fused_draw_cute",
+          "source": {
+            "path": "k4/production-radix-public-inverse-v1/library/helion_kernel_library/_kernels/top_k_top_p_sampling/sampling_fused_draw_cute.py",
+            "sha256": "331e2a5e3839b4db0087d4c58379e055a7721f9605302c0b767c34406b3861f4"
+          },
+          "config_source": {
+            "path": "k4/production-radix-public-inverse-v1/library/helion_kernel_library/configs/top_k_top_p_sampling_fused_draw_cute/nvidia_sm103.json",
+            "sha256": "98d18d118b62c27599ac2fc06d1d345d498e6296595e9bfb11d164a2a79de6de"
+          },
+          "shape_key": "batch=99; chunk_cols=4096; k=50; parts=32; vocab=128256",
+          "configuration_sha256": "ff49f82971fbb0bbd677f175efad7dc1f1a0a1b31b6564fa5aadb01964e92f7d"
+        }
+      ]
+    },
+    {
+      "case": "K06/03",
+      "shape": {
+        "batch": 989,
+        "dtype": "float32",
+        "k": 1,
+        "p": 0.9,
+        "vocab": 32000
+      },
+      "named_baseline": "flashinfer-joint",
+      "helion_us": 124.32000041007996,
+      "named_baseline_us": 234.67200249433517,
+      "helion_metric_field": "candidate_median_us",
+      "named_baseline_metric_field": "named_baseline_median_us",
+      "accepted_goal_ratio": 1.8876448014820615,
+      "accepted_ratio_basis": "named_baseline_median_us/candidate_median_us",
+      "displayed_latency_ratio": 1.8876448014820615,
+      "config_artifact": {
+        "path": "configs/K06-03-v1.json",
+        "sha256": "a93eb312e0c1a1f3ba5c7cdcce256e829e61df59231e793b34b5e6f5c6f088ac"
+      },
+      "raw_summary_or_candidate": {
+        "path": "k6/public-v18-anchored-v1/K06-03/summary.json",
+        "sha256": "b81e2b3c5600aa76910b105b0136bd9fc43efd318325345540c1528795b384f7",
+        "kind": "summary"
+      },
+      "raw_receipts": [
+        {
+          "path": "artifacts/topk-paper-20261013/k6/public-v18-anchored-v1/K06-03/00-anchor/result.json",
+          "role": "anchor",
+          "sha256": "78c24762240212d5488456c31e9444d7c1e36f3c47098c70f722bff793430619"
+        },
+        {
+          "path": "artifacts/topk-paper-20261013/k6/public-v18-anchored-v1/K06-03/01-A/result.json",
+          "role": "A",
+          "sha256": "de7c7940402c21edf61960e37adcb024ca944e52b294984aa6550ff8d7749114"
+        },
+        {
+          "path": "artifacts/topk-paper-20261013/k6/public-v18-anchored-v1/K06-03/02-B/result.json",
+          "role": "B",
+          "sha256": "667b96d9316e47c8d613b98cc7e5c82883ceea40c98acaafc52cb5fd498f7505"
+        },
+        {
+          "path": "artifacts/topk-paper-20261013/k6/public-v18-anchored-v1/K06-03/03-A/result.json",
+          "role": "A",
+          "sha256": "60ab4f042b32287893e7adf7f5a209d13576de790aafdab6678016b0913739e6"
+        },
+        {
+          "path": "artifacts/topk-paper-20261013/k6/public-v18-anchored-v1/K06-03/04-B/result.json",
+          "role": "B",
+          "sha256": "382ee6fccb2d4f1c29e7738fce0497bf0a27b8f95916522d31f587c43340cdd7"
+        },
+        {
+          "path": "artifacts/topk-paper-20261013/k6/public-v18-anchored-v1/K06-03/05-anchor/result.json",
+          "role": "anchor",
+          "sha256": "c9ac731a3b8e0b00c72bceb9902bfa02e43331228b217de9d67aa3c4190a42b5"
+        }
+      ],
+      "source_version": {
+        "id": "S09",
+        "path": "k6/snapshots/public-v18-v1/manifest.json",
+        "file_sha256": "dd9c9bf8d6fa2c603377a0a70e51031840f8612c41caca4d14bc3caf37e75878",
+        "label": "public-v18-v1",
+        "content_sha256": "4ec0e55978bfbae7e2b4b0fe71c20a57cd7e2a6405dfbcde0fd6d571561b93d6"
+      },
+      "gpu_uuid": "GPU-f07565f4-646c-24a4-8ecd-513648cf1ffe",
+      "evidence_id": "E-K06-03",
+      "stage_provenance": [
+        {
+          "kernel": "sampling_maximum_stats_cute",
+          "family": "top_k_top_p_sampling_maximum_stats_cute",
+          "source": {
+            "path": "k6/snapshots/public-v18-v1/library/helion_kernel_library/_kernels/top_k_top_p_sampling/sampling_maximum_stats_cute.py",
+            "sha256": "a9bdbd7ae3daf89bf32e9aa551be5b351d03a76c3fce8af0d2af91422a43bf37"
+          },
+          "config_source": {
+            "path": "k6/snapshots/public-v18-v1/library/helion_kernel_library/configs/top_k_top_p_sampling_maximum_stats_cute/nvidia_sm103.json",
+            "sha256": "3c061fea3ecf185172899e355cf0a8c467ebffc1c59e1f7cd12a42fc5add2662"
+          },
+          "shape_key": "batch=989; vocab=32000",
+          "configuration_sha256": "757695497025ac3b66d2d86ad5437d2263fedfe53f0c70de34c3e2a6716cbc54"
+        },
+        {
+          "kind": "torch-rng",
+          "operation": "torch.rand((batch,), device=cuda, dtype=float32)",
+          "source": "byte-fingerprinted public sampling_pipeline_cute.py"
+        },
+        {
+          "kernel": "sampling_maximum_draw_cute",
+          "family": "top_k_top_p_sampling_maximum_draw_cute",
+          "source": {
+            "path": "k6/snapshots/public-v18-v1/library/helion_kernel_library/_kernels/top_k_top_p_sampling/sampling_maximum_draw_cute.py",
+            "sha256": "1663eda771ca3b3ded36197b305c88cbb62a374c96c304438fbeb2c7e13a6952"
+          },
+          "config_source": {
+            "path": "k6/snapshots/public-v18-v1/library/helion_kernel_library/configs/top_k_top_p_sampling_maximum_draw_cute/nvidia_sm103.json",
+            "sha256": "ede071bf521d65194caa27f5b46790285d39b176d0691c056d96d6d719b4357a"
+          },
+          "shape_key": "batch=989; parts=8; vocab=32000",
+          "configuration_sha256": "3a65d3eb3f37039739431441118d7165614c5a7f164c4c8e7fcd410a882dd393"
+        }
+      ]
+    },
+    {
+      "case": "K06/04",
+      "shape": {
+        "batch": 16,
+        "dtype": "float32",
+        "k": 100,
+        "p": 0.9,
+        "vocab": 151936
+      },
+      "named_baseline": "flashinfer-joint",
+      "helion_us": 68.76800209283829,
+      "named_baseline_us": 105.18399998545647,
+      "helion_metric_field": "candidate_median_us",
+      "named_baseline_metric_field": "named_baseline_median_us",
+      "accepted_goal_ratio": 1.5295485805077744,
+      "accepted_ratio_basis": "named_baseline_median_us/candidate_median_us",
+      "displayed_latency_ratio": 1.5295485805077744,
+      "config_artifact": {
+        "path": "configs/K06-04-v2.json",
+        "sha256": "121905481f5bd0f1b42cbcea036887140e3f7990b2c1f1753e046dfeb47fa0cd"
+      },
+      "raw_summary_or_candidate": {
+        "path": "k6/current-v29-anchored-v1/K06-04/summary.json",
+        "sha256": "964bcb8cfc6f4fb89f01a63771adc875ff1d61d9de154ed09ac23e1bc40ff0e8",
+        "kind": "summary"
+      },
+      "raw_receipts": [
+        {
+          "path": "k6/current-v29-anchored-v1/K06-04/00-anchor/result.json",
+          "role": "anchor",
+          "sha256": "cd9918874e4799ce2b6d104835145f586b094ebd549e866c70eb392ac5172da0"
+        },
+        {
+          "path": "k6/current-v29-anchored-v1/K06-04/01-A/result.json",
+          "role": "A",
+          "sha256": "c6cdedf6b21e5a63198fb7f1c2b767cf90d4de73b8f728615c536c92a9633950"
+        },
+        {
+          "path": "k6/current-v29-anchored-v1/K06-04/02-B/result.json",
+          "role": "B",
+          "sha256": "4b0dd60f49d9532604a67de941172d105a2516d8fc1ef51aa105663303834323"
+        },
+        {
+          "path": "k6/current-v29-anchored-v1/K06-04/03-A/result.json",
+          "role": "A",
+          "sha256": "f50e98f4ec5bfa7acc0e721e85a521f120455c4ba98b735cbe82c665d1fcef3c"
+        },
+        {
+          "path": "k6/current-v29-anchored-v1/K06-04/04-B/result.json",
+          "role": "B",
+          "sha256": "650349e2bbdd9f8969fe992378b8c689f24879b4dbbc9826a1ac5d4fbaab13a8"
+        },
+        {
+          "path": "k6/current-v29-anchored-v1/K06-04/05-anchor/result.json",
+          "role": "anchor",
+          "sha256": "95ba828e537b0bebf9c8c5f9d471eeb2be1ad43bc7b9e9da309957bfc3c1d97d"
+        }
+      ],
+      "source_version": {
+        "id": "S06",
+        "path": "k4/production-radix-public-inverse-v1/source-manifest-v1.json",
+        "file_sha256": "537620642113e8f37c79dcc4714ce0fde0eeb7953cfaf50106c50834aa60a11a",
+        "label": "production-radix-public-inverse-v1",
+        "content_sha256": "d23c0142f674ce10f557af705821f6d44f38210affa1d7378c94fd1ccb45dd1f"
+      },
+      "gpu_uuid": "GPU-f07565f4-646c-24a4-8ecd-513648cf1ffe",
+      "evidence_id": "E-K06-04",
+      "stage_provenance": [
+        {
+          "kernel": "top_k_varlen_radix_cute",
+          "family": "top_k_varlen_radix_cute",
+          "source": {
+            "path": "k4/production-radix-public-inverse-v1/library/helion_kernel_library/_kernels/top_k_varlen/top_k_varlen_radix_cute.py",
+            "sha256": "cb9c4aec7b6189cc8fb843e83792fde084273cec95f5ee0b4e2d5f0c2531cd2f"
+          },
+          "config_source": {
+            "path": "k4/production-radix-public-inverse-v1/library/helion_kernel_library/configs/top_k_varlen_radix_cute/nvidia_sm103.json",
+            "sha256": "aea4b7ce78522f85d5c0e993f29a733ef9491c4ab1f4cda1ffa7a1a6cb3ee9fa"
+          },
+          "shape_key": "cols=151936; dtype=float32; k=100; rows=16",
+          "configuration_sha256": "45a7c93921315f1a6bccff8fca3ef832dc78b7120427015d379d74db4b3c7633"
+        },
+        {
+          "kernel": "sampling_kth_cute",
+          "family": "top_k_top_p_sampling_kth_cute",
+          "source": {
+            "path": "k4/production-radix-public-inverse-v1/library/helion_kernel_library/_kernels/top_k_top_p_sampling/sampling_kth_cute.py",
+            "sha256": "4a829d7631b962fc571d6ab846e5eb1c84682dac408a6a83a8dde2f3f229bdd2"
+          },
+          "config_source": {
+            "path": "k4/production-radix-public-inverse-v1/library/helion_kernel_library/configs/top_k_top_p_sampling_kth_cute/nvidia_sm103.json",
+            "sha256": "dfa13f444af40a65a7589b132b8955ce583108e96ca31f28525aeb81f7169d3c"
+          },
+          "shape_key": "batch=16; k=100",
+          "configuration_sha256": "b60d11f2f994c728a67b1ffa47673f2aaa83f8a26387a9009a33fc62595ec622"
+        },
+        {
+          "kernel": "sampling_mass_stats_cute",
+          "family": "top_k_top_p_sampling_mass_stats_cute",
+          "source": {
+            "path": "k4/production-radix-public-inverse-v1/library/helion_kernel_library/_kernels/top_k_top_p_sampling/sampling_mass_stats_cute.py",
+            "sha256": "ca0b6d35dfbbe7ef01be0164d94117a67accb4b64be2f3fea4fed16e8fad7b9b"
+          },
+          "config_source": {
+            "path": "k4/production-radix-public-inverse-v1/library/helion_kernel_library/configs/top_k_top_p_sampling_mass_stats_cute/nvidia_sm103.json",
+            "sha256": "5c9846d9a8d55a2667954d144ffce4f89619aab82f965b1426779c41548151ca"
+          },
+          "shape_key": "batch=16; vocab=151936",
+          "configuration_sha256": "8806f84d3c31ee390ace6a68e374747ebd6a5c061754591b7562cec756ade2ef"
+        },
+        {
+          "kind": "torch-rng",
+          "operation": "torch.rand((batch,), device=cuda, dtype=float32)"
+        },
+        {
+          "kernel": "sampling_fused_draw_cute",
+          "family": "top_k_top_p_sampling_fused_draw_cute",
+          "source": {
+            "path": "k4/production-radix-public-inverse-v1/library/helion_kernel_library/_kernels/top_k_top_p_sampling/sampling_fused_draw_cute.py",
+            "sha256": "331e2a5e3839b4db0087d4c58379e055a7721f9605302c0b767c34406b3861f4"
+          },
+          "config_source": {
+            "path": "k4/production-radix-public-inverse-v1/library/helion_kernel_library/configs/top_k_top_p_sampling_fused_draw_cute/nvidia_sm103.json",
+            "sha256": "98d18d118b62c27599ac2fc06d1d345d498e6296595e9bfb11d164a2a79de6de"
+          },
+          "shape_key": "batch=16; chunk_cols=4096; k=100; parts=38; vocab=151936",
+          "configuration_sha256": "ff49f82971fbb0bbd677f175efad7dc1f1a0a1b31b6564fa5aadb01964e92f7d"
+        }
+      ]
+    },
+    {
+      "case": "K06/05",
+      "shape": {
+        "batch": 128,
+        "dtype": "float32",
+        "k": 1000,
+        "p": 0.5,
+        "vocab": 151936
+      },
+      "named_baseline": "flashinfer-joint",
+      "helion_us": 244.89599466323853,
+      "named_baseline_us": 264.9439871311188,
+      "helion_metric_field": "candidate_median_us",
+      "named_baseline_metric_field": "named_baseline_median_us",
+      "accepted_goal_ratio": 1.0818632926007983,
+      "accepted_ratio_basis": "named_baseline_median_us/candidate_median_us",
+      "displayed_latency_ratio": 1.0818632926007983,
+      "config_artifact": {
+        "path": "configs/K06-05-v2.json",
+        "sha256": "88813a92189e8d5bd915acd88b35b26d92f10063c204a3d9f71542d9585f7584"
+      },
+      "raw_summary_or_candidate": {
+        "path": "k6/current-v29-anchored-v1/K06-05/summary.json",
+        "sha256": "a180fbb96f49f61ca353281a839dc8772287d22f52b38c596f29e30691634ff0",
+        "kind": "summary"
+      },
+      "raw_receipts": [
+        {
+          "path": "k6/current-v29-anchored-v1/K06-05/00-anchor/result.json",
+          "role": "anchor",
+          "sha256": "ba1c94c05046e5050792804d662067e11602175bd4ff32040eddd1b2e23067f9"
+        },
+        {
+          "path": "k6/current-v29-anchored-v1/K06-05/01-A/result.json",
+          "role": "A",
+          "sha256": "a56e8022d31e0e1811d64c769c6782760a84276bde1b863de14013bdbfe6e897"
+        },
+        {
+          "path": "k6/current-v29-anchored-v1/K06-05/02-B/result.json",
+          "role": "B",
+          "sha256": "8971ca80f02141b7856418122371175ce751eabae9e28180d859304d4b39caa7"
+        },
+        {
+          "path": "k6/current-v29-anchored-v1/K06-05/03-A/result.json",
+          "role": "A",
+          "sha256": "12a600743f2be9a564b2857f142f7d434efb541c567d29ad49d093e24de45db5"
+        },
+        {
+          "path": "k6/current-v29-anchored-v1/K06-05/04-B/result.json",
+          "role": "B",
+          "sha256": "f93eed27422e13070b5f316d8592d05f36be26ee7ca84dcd6d286cf1fa55a847"
+        },
+        {
+          "path": "k6/current-v29-anchored-v1/K06-05/05-anchor/result.json",
+          "role": "anchor",
+          "sha256": "a931d45d5a985278687a0b23a77ffbea8ef26f170aef791183c89576dd305fa6"
+        }
+      ],
+      "source_version": {
+        "id": "S06",
+        "path": "k4/production-radix-public-inverse-v1/source-manifest-v1.json",
+        "file_sha256": "537620642113e8f37c79dcc4714ce0fde0eeb7953cfaf50106c50834aa60a11a",
+        "label": "production-radix-public-inverse-v1",
+        "content_sha256": "d23c0142f674ce10f557af705821f6d44f38210affa1d7378c94fd1ccb45dd1f"
+      },
+      "gpu_uuid": "GPU-f07565f4-646c-24a4-8ecd-513648cf1ffe",
+      "evidence_id": "E-K06-05",
+      "stage_provenance": [
+        {
+          "kernel": "top_k_varlen_radix_cute",
+          "family": "top_k_varlen_radix_cute",
+          "source": {
+            "path": "k4/production-radix-public-inverse-v1/library/helion_kernel_library/_kernels/top_k_varlen/top_k_varlen_radix_cute.py",
+            "sha256": "cb9c4aec7b6189cc8fb843e83792fde084273cec95f5ee0b4e2d5f0c2531cd2f"
+          },
+          "config_source": {
+            "path": "k4/production-radix-public-inverse-v1/library/helion_kernel_library/configs/top_k_varlen_radix_cute/nvidia_sm103.json",
+            "sha256": "aea4b7ce78522f85d5c0e993f29a733ef9491c4ab1f4cda1ffa7a1a6cb3ee9fa"
+          },
+          "shape_key": "cols=151936; dtype=float32; k=1000; rows=128",
+          "configuration_sha256": "45a7c93921315f1a6bccff8fca3ef832dc78b7120427015d379d74db4b3c7633"
+        },
+        {
+          "kernel": "sampling_kth_cute",
+          "family": "top_k_top_p_sampling_kth_cute",
+          "source": {
+            "path": "k4/production-radix-public-inverse-v1/library/helion_kernel_library/_kernels/top_k_top_p_sampling/sampling_kth_cute.py",
+            "sha256": "4a829d7631b962fc571d6ab846e5eb1c84682dac408a6a83a8dde2f3f229bdd2"
+          },
+          "config_source": {
+            "path": "k4/production-radix-public-inverse-v1/library/helion_kernel_library/configs/top_k_top_p_sampling_kth_cute/nvidia_sm103.json",
+            "sha256": "dfa13f444af40a65a7589b132b8955ce583108e96ca31f28525aeb81f7169d3c"
+          },
+          "shape_key": "batch=128; k=1000",
+          "configuration_sha256": "07d7ae720955f80cb074bcaf590c7369a40d0e5b53ace6baade69f2b3e8b7c78"
+        },
+        {
+          "kernel": "sampling_mass_stats_cute",
+          "family": "top_k_top_p_sampling_mass_stats_cute",
+          "source": {
+            "path": "k4/production-radix-public-inverse-v1/library/helion_kernel_library/_kernels/top_k_top_p_sampling/sampling_mass_stats_cute.py",
+            "sha256": "ca0b6d35dfbbe7ef01be0164d94117a67accb4b64be2f3fea4fed16e8fad7b9b"
+          },
+          "config_source": {
+            "path": "k4/production-radix-public-inverse-v1/library/helion_kernel_library/configs/top_k_top_p_sampling_mass_stats_cute/nvidia_sm103.json",
+            "sha256": "5c9846d9a8d55a2667954d144ffce4f89619aab82f965b1426779c41548151ca"
+          },
+          "shape_key": "batch=128; vocab=151936",
+          "configuration_sha256": "e9809ebdebff91f300b6a163dfa73db6bb420bc44991c9629a6b1b7d8da88fd6"
+        },
+        {
+          "kind": "torch-rng",
+          "operation": "torch.rand((batch,), device=cuda, dtype=float32)"
+        },
+        {
+          "kernel": "sampling_fused_draw_cute",
+          "family": "top_k_top_p_sampling_fused_draw_cute",
+          "source": {
+            "path": "k4/production-radix-public-inverse-v1/library/helion_kernel_library/_kernels/top_k_top_p_sampling/sampling_fused_draw_cute.py",
+            "sha256": "331e2a5e3839b4db0087d4c58379e055a7721f9605302c0b767c34406b3861f4"
+          },
+          "config_source": {
+            "path": "k4/production-radix-public-inverse-v1/library/helion_kernel_library/configs/top_k_top_p_sampling_fused_draw_cute/nvidia_sm103.json",
+            "sha256": "98d18d118b62c27599ac2fc06d1d345d498e6296595e9bfb11d164a2a79de6de"
+          },
+          "shape_key": "batch=128; chunk_cols=4096; k=1000; parts=38; vocab=151936",
+          "configuration_sha256": "ff49f82971fbb0bbd677f175efad7dc1f1a0a1b31b6564fa5aadb01964e92f7d"
+        }
+      ]
+    }
+  ],
+  "current_K6_audit": {
+    "audit": {
+      "path": "k6/current-v29-final-audit.md",
+      "sha256": "156e5acc6d8ede7d216aebd10953cd9f2192b07659c1b6d05b778ff06d6114b5"
+    },
+    "ledger": {
+      "path": "k6/current-v29-configs-v2/ledger.json",
+      "sha256": "f7c4250c4a183735d89e7752424671a175bce61b95e02751c756b456778c0cfd"
+    },
+    "current_source_bank": "d23c0142f674ce10f557af705821f6d44f38210affa1d7378c94fd1ccb45dd1f",
+    "functional_workers_passed": 36,
+    "all_six_cases_source_and_correctness_passed": true,
+    "new_case00_window_qualified": false,
+    "excluded_case00_FI_drift": 0.012126,
+    "accepted_case00": "v1 conservative ratio retained",
+    "accepted_case03": "v1 source bank and unique-support K1 generator-state proof retained"
+  },
+  "current_rebased_head_performance_revalidated": false,
+  "committed_table_hashes": [
+    {
+      "family": "top_k_varlen_radix_cute",
+      "path": "helion_kernel_library/configs/top_k_varlen_radix_cute/nvidia_sm103.json",
+      "sha256": "e2d690e582b7d0fd6e85bffdc0471636ba05a1bac0120870edd5bc12ca940ef8"
+    },
+    {
+      "family": "moe_topk_softmax_cute",
+      "path": "helion_kernel_library/configs/moe_topk_softmax_cute/nvidia_sm103.json",
+      "sha256": "13763fa0a1309ade2a9190569a6d34a77b6ceb25abab44e0a979edeb3ae032bb"
+    },
+    {
+      "family": "moe_topk_softmax_renorm_cute",
+      "path": "helion_kernel_library/configs/moe_topk_softmax_renorm_cute/nvidia_sm103.json",
+      "sha256": "1bae30eb2c0dcdcf8e8fa45c3528cd81ab9906554d26a4aee3228f8af0549e11"
+    },
+    {
+      "family": "top_k_top_p_sampling_kth_cute",
+      "path": "helion_kernel_library/configs/top_k_top_p_sampling_kth_cute/nvidia_sm103.json",
+      "sha256": "b4e8ac5be5cd63f0ff6e5b4ce408c4ccab359159fb5b0deee2c31fdf5445eaa0"
+    },
+    {
+      "family": "top_k_top_p_sampling_fused_draw_cute",
+      "path": "helion_kernel_library/configs/top_k_top_p_sampling_fused_draw_cute/nvidia_sm103.json",
+      "sha256": "e12978aac10a5b15baf6205145d51b60d1c4cf31c6798abc316b0f821fff3485"
+    },
+    {
+      "family": "top_k_top_p_sampling_mass_stats_cute",
+      "path": "helion_kernel_library/configs/top_k_top_p_sampling_mass_stats_cute/nvidia_sm103.json",
+      "sha256": "807904aeb674c58030a4d210a59057ba20d7c60fd16cbd507c8a829652046427"
+    },
+    {
+      "family": "top_k_top_p_sampling_maximum_stats_cute",
+      "path": "helion_kernel_library/configs/top_k_top_p_sampling_maximum_stats_cute/nvidia_sm103.json",
+      "sha256": "72da6be26a6c9977cd4160c541874027de488f25768370baa991c457b98584da"
+    },
+    {
+      "family": "top_k_top_p_sampling_maximum_draw_cute",
+      "path": "helion_kernel_library/configs/top_k_top_p_sampling_maximum_draw_cute/nvidia_sm103.json",
+      "sha256": "f2f695da1b1dda28d5c9e5be17039ba37eda887b44e8d1180c7cb03fda072293"
+    }
+  ],
+  "config_sync_audit": {
+    "path": "kernel-library-config-metadata-clean-v1/audit-v2.json",
+    "sha256": "0c4ff9a3f0a52afdb277e7a75018cc2a0511c6b504dffc0da9416d6bf7e25be1"
+  },
+  "cleanup": {
+    "summary": {
+      "path": "cleanup-obsolete-experiments-v1/final-summary.json",
+      "sha256": "0a0e5a816739aa1719e1c7ad71360a4e7329f70cdaa827adf32bd2dafcfb203c"
+    },
+    "source_identity": {
+      "path": "cleanup-obsolete-experiments-v1/source-identity.json",
+      "sha256": "c41355b7ae558ecfd36635fc21e6eeaacc6b0221cdd40cd3655ff704ef045470"
+    },
+    "applied_paths": 28,
+    "raw_generated_source_identical_cases": 13,
+    "normalized_config_identical_cases": 13,
+    "host_device_AST_identical_cases": 13,
+    "GPU_calls": 0,
+    "test_suites": 0
+  },
+  "notes": [
+    "Use accepted_goal_ratio for every geometric mean.",
+    "K06/00 retains displayed medians but uses the conservative min-baseline/max-candidate bound for acceptance.",
+    "K05 initial records use baseline_us_conservative_min; confirmation records with only baseline_us retain that stored field.",
+    "Absolute latency arithmetic means weight each listed shape once and do not normalize by batch or elements.",
+    "No before-CuTe cold baseline or cold-autotuner rediscovery result is inferred."
+  ],
+  "current_K6_00_03_supporting_metrics": [
+    {
+      "case": "K06/00",
+      "receipt_path": "k6/current-v29-configs-v2/K06-00/config.json",
+      "receipt_sha256": "c7d5a156533188f127952638a21100e5c8c01087978ce5e4f0e02e82198f7607",
+      "helion_us": 34.03200022876263,
+      "baseline_us": 39.823999628424644,
+      "qualified_new_ratio": null,
+      "baseline_endpoint_anchor_drift": 0.0,
+      "baseline_window_variation": 0.012126109886465342,
+      "used_in_accepted_aggregate": false,
+      "source_bank_sha256": "d23c0142f674ce10f557af705821f6d44f38210affa1d7378c94fd1ccb45dd1f"
+    },
+    {
+      "case": "K06/03",
+      "receipt_path": "k6/current-v29-configs-v2/K06-03/config.json",
+      "receipt_sha256": "727fb22c0c9efb49df52c4f62bf870ec060f263d9a9112200addd0f4b8db01d9",
+      "helion_us": 124.14399906992912,
+      "baseline_us": 234.67200249433517,
+      "qualified_new_ratio": 1.890320951898341,
+      "baseline_endpoint_anchor_drift": 0.0008183368423058113,
+      "baseline_window_variation": 0.0008183368423058113,
+      "used_in_accepted_aggregate": false,
+      "source_bank_sha256": "d23c0142f674ce10f557af705821f6d44f38210affa1d7378c94fd1ccb45dd1f"
+    }
+  ],
+  "environment": {
+    "hardware": "NVIDIA GB300",
+    "gpu_power_limit_w": 1400,
+    "local_physical_gpus": [
+      2,
+      3
+    ],
+    "candidate_cute_dsl": "4.7",
+    "FlashInfer_radix_baseline_cute_dsl": "4.8",
+    "SGLang_version": "0.5.21",
+    "SGLang_kernel_version": "0.4.7",
+    "candidate_fast_math": false,
+    "timer": "Same validated CUDA-event graph with cold-L2 flush outside timed events; V3/V4 byte-identical timer",
+    "timer_source_sha256": "dc78cd2506363251b3b602dd51ade9785c4adafee399f3feb564de3dcd04fb98",
+    "per_row_gpu_UUIDs": "cases[].gpu_uuid",
+    "per_row_versions": "linked accepted config records"
+  },
+  "checker_for_publication": {
+    "path": "report-pr-v1/checker-current.txt",
+    "sha256": "853364fb1575ae47c9532c86fc0d9a8764b0db47ce3f22fe638ce1fbfd226357",
+    "case_count": 40,
+    "result": "GOAL MET",
+    "scope": "stored fixed-config ratios and artifact existence; cold search and current-tree full sweep deferred"
+  },
+  "published_compiler_commits": [
+    "5790d7127183d707afa3d8768ab3eff49f5e5e5a",
+    "af4eff1b321d1acdf49a6d7d36ac810f92e76d0c",
+    "456bbf63374c585a025dcc37b66e2798e22770f8"
+  ],
+  "published_compiler_tree": "97de6ce556e7e6b3af747a5520f63ebb356dbf6a",
+  "full_tests_full_review_cold_search_current_tree_perf": "Manual full review, cold search and target-panel performance revalidation remain deferred; repository CI is tracked separately on the linked PRs.",
+  "repository_CI": {
+    "PRs": [
+      3982,
+      3983,
+      3984,
+      3986
+    ],
+    "status_source": "Latest GitHub checks on each PR",
+    "scope": "Repository checks run separately from the frozen per-shape measurement banks; no new target-panel performance numbers."
+  }
+}
