@@ -74,13 +74,13 @@ REDUCTIONS = OrderedSet(
 )
 
 
-def names_row_dim(rnumel: sympy.Expr) -> bool:
-    """Whether HelionKernel.row_dim() can name the dim of a row of `rnumel`
-    elements, so that its reduction can be persistent. Not for a row of fewer
+def names_rdim(rnumel: sympy.Expr) -> bool:
+    """Whether HelionKernel.rdim_code() can name an rdim of `rnumel` elements,
+    so that its reduction can be persistent. Not for an rdim of fewer
     than 16 that is not a power of two: Helion sizes a factory's dim of under
     16 by its value, so hl.zeros([tile_x, 12]).size(1) is 12 rather than the
     reduction dim of in0[tile_x, :], and hl.arange(12) beside the slice fails
-    with "Attempting to broadcast a dimension of length 12". Such a row keeps
+    with "Attempting to broadcast a dimension of length 12". Such an rdim keeps
     a loop over tile_r, of one block."""
     if not rnumel.is_Integer:
         return False
@@ -233,6 +233,18 @@ class HelionCSEProxy(CSEProxy):
         return value
 
 
+# The longest rdim a kernel that names it (rdim, codegen_rdim()) names by a
+# factory's dim, which Helion cannot roll, so that it stays one block whatever
+# the autotuner tries, as Triton's rule reads an inner reduction's: an rdim of up
+# to 1024 elements fits one block, and leaving its loop to the autotuner
+# (Config.reduction_loops) widens the search, where a quick search can end on a
+# loop over chunks of the rdim: for LayerNorm over Swin's shifted windows,
+# rdims of 256, it picked reduction_loops [16], slower than the rdim as one block. A
+# kernel that does not name its rdim, as a plain sum's in0[tile_x, :], keeps the
+# rdim's reduction_loops slot, at any length.
+UNROLLED_RDIM_MAX = 1024
+
+
 class HelionKernel(SIMDKernel[CSEVariable]):
     """A Helion kernel: pointwise range trees become one hl.tile loop and the
     reduction range tree an inner hl.tile loop, or, in a persistent reduction
@@ -269,8 +281,11 @@ class HelionKernel(SIMDKernel[CSEVariable]):
         self.has_fp32_dot = False
         # Whether the kernel draws random numbers; see rand().
         self.uses_rand = False
-        # Whether a persistent reduction names the row's dim rdim; see row_dim().
+        # Whether a persistent reduction names its rdim (rdim = ...), and the
+        # parameter and subscript of a full rdim it defines rdim by; see
+        # rdim_code() and codegen_rdim().
         self.uses_rdim = False
+        self.rdim_anchor: tuple[str, list[str]] | None = None
         # Dot accumulators and the casts of them that run after the K loop.
         self.dot_results: OrderedSet[CSEVariable] = OrderedSet()
         # Values stored outside the current reduction loop; see disable_reduction().
@@ -300,7 +315,7 @@ class HelionKernel(SIMDKernel[CSEVariable]):
         return self.in_reduction and not self.persistent_reduction
 
     def should_use_persistent_reduction(self) -> bool:
-        """Whether the reduction reads each row as one block (a persistent
+        """Whether the reduction reads each rdim as one block (a persistent
         reduction) instead of in a loop over tile_r. e / e.sum(-1, keepdim=True)
         with e = torch.exp(x - x.amax(-1, keepdim=True)) * 2 and x [64, 300]:
             for tile_x in hl.tile(64):
@@ -314,12 +329,14 @@ class HelionKernel(SIMDKernel[CSEVariable]):
                 out0[tile_x, :] = tmp9
         reads x once and computes the exp once, where three loops over tile_r
         read x in each and compute the exp in the last two. Helion can still roll
-        the row into a loop (Config.reduction_loops)."""
-        # A row that row_dim() cannot name keeps its loop, whatever the
+        the rdim into a loop (Config.reduction_loops), unless a factory's dim
+        names it (rdim_code(): an rdim of up to UNROLLED_RDIM_MAX the kernel
+        names)."""
+        # An rdim that rdim_code() cannot name keeps its loop, whatever the
         # InductorChoices class in use decides.
         return (
             self.inside_reduction
-            and names_row_dim(self.features.reduction_numel)
+            and names_rdim(self.features.reduction_numel)
             and V.choices.should_use_persistent_reduction(
                 self.features.with_tiling_scores(self.tiling_scores),
                 self.cooperative_reduction,
@@ -328,26 +345,25 @@ class HelionKernel(SIMDKernel[CSEVariable]):
 
     def dim_code(self, dim: object) -> str:
         """A dim of a value's shape, as code: in a persistent reduction tile_r
-        is no loop variable but the whole row (row_dim())."""
+        is no loop variable but the whole rdim (rdim_code())."""
         if self.persistent_reduction and str(dim) == "tile_r":
-            return self.row_dim()
+            return self.rdim_code()
         return str(dim)
 
-    def row_dim(self) -> str:
-        """The dim of a whole row, as code, in a persistent reduction: R itself
-        if a power of two, else rdim, the dim of a factory of that size beside
-        a tile (see codegen_kernel()), as with R = 100:
-            rdim = hl.zeros([tile_x, 100]).size(1)
+    def rdim_code(self) -> str:
+        """The dim of a whole rdim, as code, in a persistent reduction: rdim,
+        the dim of an operand's full rdim (codegen_rdim()), as with R = 3000:
+            rdim = in0[tile_x, :].size(1)
             tmp1 = tmp0.reshape([tile_x, 1]).expand(tile_x, rdim)
-        The dim of a full slice of 100 elements, as in in0[tile_x, :], is the
-        reduction dim Helion pads to 128 lanes, which a factory beside a tile
-        shares, but not the literal 100: .expand(tile_x, 100) fails with "The
-        size of tensor a (u1) must match the size of tensor b (100)", and so
-        does hl.arange(100) beside the slice. A power of two is a dim of its own
-        size in both."""
-        size = self.numels["r0_"]
-        if size == next_power_of_2(size):
-            return str(size)
+            tmp5 = (hl.arange(rdim)).to(torch.int64)
+        The literal 3000 is not the dim of in0[tile_x, :], which Helion pads to
+        4096 lanes: .expand(tile_x, 3000) fails with "The size of tensor a (u1)
+        must match the size of tensor b (3000)", and so does hl.arange(3000)
+        beside the slice. A literal power of two, or the dim of a factory,
+        hl.zeros([tile_x, 262144]).size(1), is a dim the rdim shares, but one
+        Helion cannot roll into a loop: with hl.arange(262144) in the kernel,
+        its Config has no reduction_loops, and an rdim of 262144 elements is read
+        as one block whatever the autotuner tries."""
         self.uses_rdim = True
         return "rdim"
 
@@ -403,8 +419,8 @@ class HelionKernel(SIMDKernel[CSEVariable]):
         name = f"{TILE_NAMES[axis]}.index"
         if axis == "r0_" and self.persistent_reduction:
             # The whole row's indices, e.g. for a flat index:
-            #     in1[1024*tile_x.index.reshape([tile_x, 1]) + hl.arange(1024)]
-            name = f"hl.arange({self.row_dim()})"
+            #     in1[1024*tile_x.index.reshape([tile_x, 1]) + hl.arange(rdim)]
+            name = f"hl.arange({self.rdim_code()})"
         axes = scope[scope.index(axis) :]
         if len(axes) == 1:
             return name
@@ -588,12 +604,22 @@ class HelionKernel(SIMDKernel[CSEVariable]):
                 )
                 tiles = tuple(TILE_NAMES[dim] for dim in dims if dim is not None)
                 arg = self.tensor_arg(operand, output=output)
-                return arg, [*map(self.coordinate, tiles)] or ["()"], tiles
+                coordinates = [*map(self.coordinate, tiles)] or ["()"]
+                self.note_rdim(arg, coordinates)
+                return arg, coordinates, tiles
         if (view := self.tiled_view(buffer, index, axes)) is not None:
             tiles = tuple(TILE_NAMES[axis] for axis in axes)
             coordinates = [*map(self.coordinate, tiles)] or ["()"]
-            return self.tensor_arg(view, output=output), coordinates, tiles
+            arg = self.tensor_arg(view, output=output)
+            self.note_rdim(arg, coordinates)
+            return arg, coordinates, tiles
         return self.flat_subscript(buffer, index, axes, output=output)
+
+    def note_rdim(self, arg: HelionTensorArg, coordinates: list[str]) -> None:
+        """Keep the first full rdim of an input (in0[tile_x, :]) as the rdim
+        codegen_rdim() defines rdim by."""
+        if self.rdim_anchor is None and ":" in coordinates and not arg.output:
+            self.rdim_anchor = (arg.ref, coordinates)
 
     def flat_subscript(
         self,
@@ -685,12 +711,26 @@ class HelionKernel(SIMDKernel[CSEVariable]):
             sizes = sizes if len(self.outer_axes) == 1 else f"[{sizes}]"
             code.writeline(f"for {tiles} in hl.tile({sizes}):")
             with code.indent():
-                if self.uses_rdim:
-                    tile = TILE_NAMES[self.outer_axes[-1]]
-                    size = self.numels["r0_"]
-                    code.writeline(f"rdim = hl.zeros([{tile}, {size}]).size(1)")
+                self.codegen_rdim(code, TILE_NAMES[self.outer_axes[-1]])
                 code.splice(self.body)
         return re.sub(r"__arg\d+__", lambda ref: names[ref[0]], code.getvalue())
+
+    def codegen_rdim(self, code: IndentedBuffer, tile: str) -> None:
+        """Define rdim (rdim_code()): for an rdim of more than UNROLLED_RDIM_MAX
+        elements, the dim of the first full rdim the kernel reads, as in rdim =
+        in0[tile_x, :].size(1), whose load Helion drops as only its size is
+        used; else the dim of a factory beside `tile`, hl.zeros([tile_x,
+        300]).size(1), which the rdim shares but Helion cannot roll."""
+        if not self.uses_rdim:
+            return
+        rolled = self.numels["r0_"] > UNROLLED_RDIM_MAX
+        if self.rdim_anchor is not None and rolled:
+            ref, coordinates = self.rdim_anchor
+            dim = coordinates.index(":")
+            code.writeline(f"rdim = {ref}[{', '.join(coordinates)}].size({dim})")
+        else:
+            size = self.numels["r0_"]
+            code.writeline(f"rdim = hl.zeros([{tile}, {size}]).size(1)")
 
     def kernel_args(self) -> list[HelionTensorArg]:
         """Inputs, then outputs whose stores were not removed."""
@@ -810,12 +850,39 @@ class HelionKernel(SIMDKernel[CSEVariable]):
         # Subscripted out0[()], the [tile_x] value fails: "Cannot broadcast Helion
         # ('tile_x',) to ()".
         store_axes = OrderedSet([*self.index_axes(index), *tile_axes(value.shape)])
+        if mode == "atomic_add":
+            # Each element the node iterates over adds once, so an atomic
+            # store has every tile of the node's, also one that neither the
+            # index nor the value has. index_put(out, (arange(n) * 0,),
+            # ones(n), True) adds 1.0 at out[0] n times,
+            #     hl.atomic_add(out0, [tile_x], tmp1)  # tmp1: 1.0, 0-d
+            # where hl.atomic_add(out0, [], tmp1) added it once per tile:
+            # out[0] was 32, not 1024, in blocks of 32.
+            store_axes |= OrderedSet(
+                axis for axis in self.axes if axis != "r0_" or self.in_reduction
+            )
         axes = [axis for axis in self.axes if axis in store_axes]
         arg, coordinates, shape = self.subscript(buffer, index, axes, output=True)
         dtype = buffer.get_dtype()
         cast_suffix = "" if value.dtype == dtype else f".to({dtype})"
         buffer_code = self.compute if self.in_reduction else self.stores
-        value_code = f"{self.align(value, shape)}{cast_suffix}"
+        value_code = self.align(value, shape)
+        value_axes = tile_axes(value.shape)
+        aligned = scope_shape(value_axes, tile_axes(shape))
+        if value_axes and len(aligned) < len(shape):
+            # A value without the store's leading tiles, which align() leaves
+            # out, expanded over them. x.expand(64, 7, 31) * 2 reads x's
+            # stride-0 dim with no tile:
+            #     tmp0 = in0[tile_x]
+            #     out0[tile_y, tile_x] = tmp2
+            # fails with "Expected ndim=2, but got ndim=1", where
+            #     out0[tile_y, tile_x] = tmp2.expand(tile_y, tile_x)
+            # stores tmp2 at every y. A value align() gives the store's rank
+            # stores as it is, as out0[tile_x, :] = tmp3.reshape([tile_x, 1])
+            # does, and so does a 0-d value (out0[tile_x] = tmp1 of tmp1 =
+            # hl.full([], 0.0, ...)): Helion broadcasts both.
+            value_code = f"{value_code}.expand({self.dims_code(shape)})"
+        value_code += cast_suffix
         if mode == "atomic_add":
             # index_put(out, (i,), x, accumulate=True) with i = arange(4) // 2
             # adds x[0] and x[1] to out[0]:
@@ -1338,7 +1405,7 @@ class HelionKernel(SIMDKernel[CSEVariable]):
             if self.persistent_reduction:
                 # The row is one block of R values: hl.full([], 300.0, ...),
                 # rather than the sum of hl.full([], 1.0, ...).expand(rdim),
-                # which would name the row's dim (row_dim()).
+                # which would name the rdim (rdim_code()).
                 weight = ops.constant(float(self.numels["r0_"]), dtype)
             else:
                 # Helion masks the lanes past the end of R, so this counts the

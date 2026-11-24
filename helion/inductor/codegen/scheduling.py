@@ -7,11 +7,13 @@ from typing import cast
 
 import sympy
 from torch._inductor import config
+from torch._inductor import metrics
 from torch._inductor.codegen.common import BackendFeature
 from torch._inductor.codegen.simd import SIMDScheduling
 from torch._inductor.codegen.triton import TritonScheduling
 from torch._inductor.ir import Reduction
 from torch._inductor.ops_handler import OpsHandler
+from torch._inductor.scheduler import BaseSchedulerNode
 from torch._inductor.utils import get_fused_kernel_name
 from torch._inductor.virtualized import V
 from torch.utils._ordered_set import OrderedSet
@@ -24,8 +26,10 @@ from ..support import numerics_modes
 from ..support import python_wrapper
 from .kernel import ARG_REDUCTIONS
 from .kernel import REDUCTIONS
+from .kernel import UNROLLED_RDIM_MAX
 from .kernel import HelionKernel
 from .overrides import HelionOverrides
+from .tiling import natural_tiling
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -35,9 +39,9 @@ if TYPE_CHECKING:
     from torch._inductor.codegen.simd import SIMDKernel
     from torch._inductor.codegen.simd_kernel_features import SIMDKernelFeatures
     from torch._inductor.ir import ComputedBuffer
-    from torch._inductor.scheduler import BaseSchedulerNode
     from torch._inductor.scheduler import Scheduler
     from torch._inductor.scheduler import SchedulerNode
+    from torch._inductor.tiling_utils import CoalesceVarAnalysis
 
 
 # Ops HelionOverrides inherits from OpOverrides that mean the same in a Helion
@@ -193,6 +197,54 @@ class HelionScheduling(SIMDScheduling):
         # aten kernels rather than to ops Helion lacks.
         return OrderedSet([BackendFeature.INPLACE_BUFFERS])
 
+    @classmethod
+    def get_tiling_and_scores(
+        cls,
+        node_schedule: list[Any],
+        numel: sympy.Expr,
+        reduction_numel: sympy.Expr = sympy.S.One,
+        coalesce_analysis: CoalesceVarAnalysis | None = None,
+    ) -> tuple[dict[str, sympy.Expr], dict[str, sympy.Expr] | None]:
+        """The N-D tiling that splits the kernel's flat ranges into the dims its
+        tensors are indexed by (natural_tiling()), if it has more dims than one
+        pointwise and one reduction dim; else Inductor's. Helion tiles N-D
+        natively, and the kernel then indexes its tensors by tile instead of by
+        // and % of a flat index. For the mean over H and W of a channels-last
+        [128, 1536, 18, 18] tensor, the 1-D tiling {"x": 196608, "r0_": 324}
+        reads it at
+
+            1536*r + 497664*(tile_x.index // 1536) + tile_x.index % 1536
+
+        and this one, {"y": 128, "x": 1536, "r0_": 324}, at
+
+            1536*r + 497664*tile_y.index + tile_x.index
+
+        a tile of a [128, 1536, 324] view, which the kernel subscripts by its
+        tiles. Helion lowers the // and % of a reshaped index with sign
+        corrections (it no longer knows the index is non-negative), and the
+        backend does not see that consecutive tile_x are consecutive addresses,
+        so its loads do not vectorize. A schedule with a matmul keeps Inductor's tiling,
+        which follows the dot's dims."""
+        inductor_tiling, scores = super().get_tiling_and_scores(
+            node_schedule, numel, reduction_numel, coalesce_analysis
+        )
+        if not any(
+            isinstance(node, BaseSchedulerNode) and has_dot(node)
+            for node in node_schedule
+        ) and (dims := natural_tiling(node_schedule, numel, reduction_numel)):
+            tiling = cls.create_tiling(*dims)
+            # More than one pointwise dim beside r0_, of Integer sizes.
+            if len(tiling) > 2 and cls.tiling_is_compatible(
+                node_schedule, numel, reduction_numel, tiling
+            ):
+                # Inductor's scores, which say whether the reduction reads
+                # contiguous memory (SIMDKernelFeatures.get_reduction_hint()):
+                # without them an online softmax over rdims of 1001 elements
+                # gets the hint DEFAULT, and Triton's rule (persistent up to 64
+                # elements, not 1024) loops over them twice.
+                return tiling, scores
+        return inductor_tiling, scores
+
     @staticmethod
     def format_kernel_definition(name: str, source: str) -> str:
         escaped = source.replace("\\", "\\\\").replace('"""', '\\"""')
@@ -232,6 +284,22 @@ class HelionScheduling(SIMDScheduling):
         ):
             raise Unsupported(", ".join(missing))
         return super().codegen_node_schedule(kernel_features)
+
+    def can_fuse(self, node1: BaseSchedulerNode, node2: BaseSchedulerNode) -> bool:
+        """SIMDScheduling.can_fuse() without its check of a pointwise pair's
+        tilings (config.triton.tiling_prevents_pointwise_fusion), which
+        compares each node's tiling, from Inductor's select_tiling()
+        (BaseSchedulerNode.get_tiling()), with the pair's, from
+        natural_tiling() here (get_tiling_and_scores()): y = x.permute(0, 2,
+        3, 1).contiguous() and y * 2, a pair natural_tiling() tiles [8, 1024,
+        64], were two kernels, and y * 2 read y again. natural_tiling() cuts a
+        fused kernel's space wherever any of its nodes' accesses need it, so
+        the pair's tiling serves both nodes."""
+        with config.patch({"triton.tiling_prevents_pointwise_fusion": False}):
+            return super().can_fuse(node1, node2)
+
+    can_fuse_vertical = can_fuse
+    can_fuse_horizontal = can_fuse
 
     def _native_matmul_row_epilogue_can_fuse(
         self, node1: BaseSchedulerNode, node2: BaseSchedulerNode
@@ -288,7 +356,36 @@ class HelionScheduling(SIMDScheduling):
         (tiling,) = kernel_args
         if not HelionKernel.supports_tiling(tiling):
             raise Unsupported(f"tiling {tiling}")
-        return [HelionKernel(*kernel_args, **kernel_kwargs)]
+        kernel = HelionKernel(*kernel_args, **kernel_kwargs)
+        if (
+            kernel.persistent_reduction
+            and not kernel.mix_order_reduction
+            and "override_persistent_reduction" not in kernel_kwargs
+            and V.graph.sizevars.statically_known_gt(
+                kernel.numels["r0_"], UNROLLED_RDIM_MAX
+            )
+        ):
+            # An rdim past UNROLLED_RDIM_MAX that the kernel names (rdim) but no
+            # input's full rdim does (HelionKernel.rdim_anchor) has a factory's
+            # dim, which Helion cannot roll: x.flip(-1).sum(-1) over rdims of
+            # 100000 would read each rdim as one block of 131072 lanes.
+            # Emitting the body tells; such a kernel loops over the rdim, as
+            # Triton's rule has it.
+            self.codegen_node_schedule_with_kernel(
+                kernel_features.node_schedule, kernel
+            )
+            # The kernel emitted to tell is not the one returned below: take
+            # back the count its Kernel.__init__ added to
+            # metrics.generated_kernel_count, which tests compare with the
+            # kernels a graph launches.
+            metrics.generated_kernel_count -= 1
+            if kernel.uses_rdim and kernel.rdim_anchor is None:
+                kernel = HelionKernel(
+                    *kernel_args, **kernel_kwargs, override_persistent_reduction=False
+                )
+            else:
+                kernel = HelionKernel(*kernel_args, **kernel_kwargs)
+        return [kernel]
 
     def define_kernel(
         self, src_code: str, node_schedule: list[Any], kernel: SIMDKernel[Any]
