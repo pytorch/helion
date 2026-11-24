@@ -1037,6 +1037,11 @@ def test_the_reviewers_read_and_run_nothing(monkeypatch):
     assert "Still run no tests, builds or scripts" in autoreview.PROMPT_FIX
     assert "these two commands are yours to run" in autoreview.PROMPT_FIX_ADD_SUFFIX
     assert "check and test its changes, which it did not run" in autoreview.FIX_NOTICE
+    # Only defects need an answer, from the fixer as from the author.
+    assert "list of the defects you left" in autoreview.PROMPT_FIX
+    assert "a suggestion that you did not take needs no entry" in autoreview.PROMPT_FIX
+    assert "answer each defect it left" in autoreview.FIX_NOTICE
+    assert "finding it left" not in autoreview.FIX_NOTICE
     # AGENTS.md tells the author the same, and whose the testing is.
     assert "The reviewers read: the change, the code around it" in agents
     assert "They run nothing (no tests, builds, scripts or snippets)" in agents
@@ -1408,6 +1413,7 @@ def test_snapshot_holds_the_worktree_and_leaves_the_checkout_alone(
         "base": base,
         "ref": "refs/autoreview/t/1",
         "omitted": [],
+        "commits": [],
     }
     assert _git(checkout, "rev-parse", "refs/autoreview/t/1") == head
 
@@ -1539,15 +1545,29 @@ def test_old_reviews_are_deleted_after_their_last_use(checkout):
         "refs/autoreview/20260101-000000-1/1",
         "refs/autoreview/20260101-000000-1/2",
         "refs/autoreview/20260102-000000-2/1",
-        # A session of another worktree, which has its logs: by its date.
+        # A session whose logs no worktree has: by the date of its id.
         "refs/autoreview/20260104-000000-4/1",
+        # Sessions of another worktree, which has their logs: one that got a
+        # round yesterday, and one that was last used long ago.
+        "refs/autoreview/20260105-000000-5/1",
+        "refs/autoreview/20260106-000000-6/1",
         "refs/autoreview/20260601-120000-7-2/1",
         "refs/autoreview/20260610-120000-9/1",
         "refs/autoreview/not-a-session/1",
         "refs/heads/20260101-000000-1",
     ):
         _git(checkout, "update-ref", ref, head)
+    other_checkout = checkout.parent / (checkout.name + "-other")
+    _git(checkout, "worktree", "add", "-q", "--detach", str(other_checkout), head)
+    theirs = other_checkout / "logs"
+    logs, mine = theirs, logs
+    in_use = run("20260105-000000-5", old, "session.json")
+    os.utime(in_use / "session.json", (recent, recent))
+    unused = run("20260106-000000-6", old, "session.json")
+    logs = mine
     autoreview.prune_old_reviews(now)
+    # Another worktree's logs are that worktree's to delete.
+    assert in_use.is_dir() and unused.is_dir()
     assert not gone.exists()
     assert active.is_dir() and fresh.is_dir() and other.is_dir()
     assert sorted(path.name for path in logs.iterdir()) == [
@@ -1558,6 +1578,7 @@ def test_old_reviews_are_deleted_after_their_last_use(checkout):
     ]
     assert _git(checkout, "for-each-ref", "--format=%(refname)").splitlines() == [
         "refs/autoreview/20260102-000000-2/1",
+        "refs/autoreview/20260105-000000-5/1",
         "refs/autoreview/20260601-120000-7-2/1",
         "refs/autoreview/20260610-120000-9/1",
         "refs/autoreview/not-a-session/1",
@@ -1565,6 +1586,26 @@ def test_old_reviews_are_deleted_after_their_last_use(checkout):
         "refs/heads/dev",
         "refs/remotes/origin/main",
     ]
+    # When the worktrees cannot be listed, nothing says which sessions the
+    # others still use: the old logs of this checkout go, and no ref does.
+    stale = run("20260107-000000-8", old, "session.json")
+    _git(checkout, "update-ref", "refs/autoreview/20260104-000000-4/1", head)
+    _git(checkout, "update-ref", "refs/autoreview/20260107-000000-8/1", head)
+    real_git = autoreview.git
+
+    def no_worktree_list(*args, **kwargs):
+        if args[:2] == ("worktree", "list"):
+            raise autoreview.ReviewAbort("git worktree failed")
+        return real_git(*args, **kwargs)
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(autoreview, "git", no_worktree_list)
+        autoreview.prune_old_reviews(now)
+    assert not stale.exists()
+    refs = _git(checkout, "for-each-ref", "--format=%(refname)", "refs/autoreview")
+    assert "refs/autoreview/20260104-000000-4/1" in refs.splitlines()
+    assert "refs/autoreview/20260105-000000-5/1" in refs.splitlines()
+    assert "refs/autoreview/20260107-000000-8/1" in refs.splitlines()
     # Without a log directory, or without git, there is nothing to do.
     shutil.rmtree(logs)
     autoreview.prune_old_reviews(now)
@@ -1617,6 +1658,7 @@ def test_resume_continues_both_reviewer_sessions(checkout, scripted):
         "base": base,
         "ref": f"refs/autoreview/{session_id}/1",
         "omitted": [],
+        "commits": [],
         "passed": False,
         "review": "combined findings",
     }
@@ -2188,6 +2230,14 @@ def test_a_failed_resumed_round_leaves_the_session_as_it_was(checkout, scripted)
     assert err.rstrip().endswith(f"\nautoreview.py: {notice}")
     assert "autoreview passed:" not in err and "half done" not in err
     assert _session(checkout, session_id) == saved
+    # One reviewer finishes, and the other's own session is gone: it could
+    # not be run again in this review, so no half of the round is kept, and
+    # the notice says to start a new review.
+    scripted.claude += ["LGTM"]
+    scripted.codex += [autoreview.ReviewAbort("[codex] exit 1: no rollout found")]
+    code, out, err = scripted("--resume", session_id, "-m", "Fixed.")
+    assert code == 2 and err.rstrip().endswith(f"\nautoreview.py: {notice}")
+    assert "half done" not in err and _session(checkout, session_id) == saved
     # The same command again, once the reviewers answer, is round 2 again.
     # A reviewer's own session may hold a review from the failed attempt,
     # which the author never saw: the request names the review that counts.
@@ -2348,6 +2398,95 @@ def test_a_half_done_round_is_only_completed_on_the_same_code(checkout, scripted
     assert "\nOne more look.\n===== END AUTHOR'S MESSAGE =====" in resumed.prompt
     assert out.strip() == "3. [defect] a third"
     assert len(_session(checkout, session_id)["rounds"]) == 3
+
+
+@needs_git
+def test_a_range_that_moves_is_a_change_while_head_stays(checkout, scripted):
+    """A target of revisions pins HEAD, and a branch that it names can move:
+    the commits under review are then another set, although no file and no
+    commit of HEAD changed. A range whose end moves and whose commits stay
+    the same, as `origin/main..HEAD` does after a fetch, has not changed."""
+    head = _git(checkout, "rev-parse", "HEAD")
+    base = _git(checkout, "rev-parse", "HEAD~1")
+    (checkout / "x.py").write_text("a third commit\n")
+    _git(checkout, "commit", "-q", "-am", "[scripts] Third")
+    top = _git(checkout, "rev-parse", "HEAD")
+    _git(checkout, "update-ref", "refs/heads/review-base", head)
+    # What a target names: the commits of its ranges, or its revisions.
+    assert autoreview.target_commits(["review-base..HEAD"]) == [top]
+    assert autoreview.target_commits(["origin/main..HEAD"]) == [top, head]
+    assert autoreview.target_commits(["HEAD", "^review-base"]) == [top]
+    assert autoreview.target_commits(["HEAD~1", "origin/main"]) == [head, base]
+    scripted.claude += ["1. [defect] a finding"]
+    scripted.codex += ["LGTM"]
+    _, _, err = scripted("review-base..HEAD")
+    session_id = _session_id(err)
+    first = _session(checkout, session_id)["rounds"][0]
+    assert first["snapshot"] == top and first["commits"] == [top]
+    # Nothing moved: there is nothing to look at again.
+    code, out, err = scripted("--resume", session_id)
+    assert code == 2 and "nothing has changed since round 1" in err
+    # The base moves, and the range takes in one more commit.
+    _git(checkout, "update-ref", "refs/heads/review-base", base)
+    del scripted.calls[:]
+    scripted.claude += ["2. [defect] in the commit that came in"]
+    scripted.codex += [autoreview.ReviewAbort("[codex] exit 1: service unavailable")]
+    code, out, err = scripted("--resume", session_id)
+    assert code == 2 and "is half done" in err
+    (claude,) = (call for call in scripted.calls if call.name == "claude")
+    assert "Nothing in the repository has changed" not in claude.prompt
+    assert (
+        "HEAD has not moved, but the target names another set of commits than "
+        "last round, because a branch or a tag in it has moved: 1 then, 2 now."
+    ) in claude.prompt
+    # It moves again while the round is half done: the saved review was of
+    # another set of commits, so the round starts over with both reviewers.
+    _git(checkout, "update-ref", "refs/heads/review-base", head)
+    del scripted.calls[:]
+    scripted.claude += ["LGTM"]
+    scripted.codex += ["LGTM"]
+    code, out, err = scripted("--resume", session_id, "-m", "The base is back.")
+    assert code == 0 and "was half done and starts over with both reviewers" in err
+    assert sorted(call.name for call in scripted.calls) == ["claude", "codex"]
+
+    # After a fetch, origin/main is another commit and `origin/main..HEAD`
+    # the same commits: nothing to review again, and a round that is half
+    # done is still the same round.
+    scripted.claude += ["1. [defect] a finding"]
+    scripted.codex += [autoreview.ReviewAbort("[codex] exit 1: service unavailable")]
+    code, out, err = scripted("origin/main..HEAD")
+    assert code == 2 and "round 1 of review session" in err and "half done" in err
+    (path,) = (
+        path
+        for path in (checkout / "logs").glob("*/session.json")
+        if json.loads(path.read_text())["rounds"] == []
+    )
+    stack = json.loads(path.read_text())
+    assert stack["pending"]["commits"] == [top, head]
+    upstream = _git(
+        checkout, "commit-tree", "HEAD^{tree}", "-p", base, "-m", "upstream"
+    )
+    _git(checkout, "update-ref", "refs/remotes/origin/main", upstream)
+    assert autoreview.target_commits(["origin/main..HEAD"]) == [top, head]
+    del scripted.calls[:]
+    scripted.codex += ["LGTM"]
+    code, out, err = scripted("--resume", stack["id"])
+    assert code == 0 and [call.name for call in scripted.calls] == ["codex"]
+    assert "round 1, completed from the review of claude" in err
+    code, out, err = scripted("--resume", stack["id"])
+    assert code == 2 and "nothing has changed since round 1" in err
+    # Once HEAD moves, the diff and the range-diff say what changed; the
+    # sentence about a moved branch would only repeat them.
+    (checkout / "x.py").write_text("amended\n")
+    _git(checkout, "commit", "-q", "-a", "--amend", "--no-edit")
+    del scripted.calls[:]
+    scripted.claude += ["LGTM"]
+    scripted.codex += ["LGTM"]
+    code, out, err = scripted("--resume", stack["id"])
+    assert code == 0
+    for call in scripted.calls:
+        assert "git range-diff" in call.prompt
+        assert "the target names another set of commits" not in call.prompt
 
 
 def test_reviewers_run_side_by_side_until_each_is_done():
