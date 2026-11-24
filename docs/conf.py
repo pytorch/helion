@@ -72,7 +72,7 @@ sphinx_gallery_conf = {
     "gallery_dirs": "examples",  # path to where to save gallery generated output
     "filename_pattern": r".*\.py$",  # Include all Python files
     "ignore_pattern": r"(__init__|utils)\.py",  # Exclude __init__.py files
-    "plot_gallery": "False",
+    "plot_gallery": False,
     "subsection_order": sphinx_gallery.sorting.ExplicitOrder(
         [
             "../examples",

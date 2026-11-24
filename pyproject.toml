@@ -58,21 +58,24 @@ pallas-cpu = [
     "absl-py",
 ]
 docs = [
-    "docutils==0.18.1,<0.21",
-    "linkify-it-py",
-    "myst-parser",
-    "pillow",
-    "pytorch_sphinx_theme2==0.2.0",
+    # Keep this toolchain compatible with pytorch_sphinx_theme2, which caps
+    # Sphinx at 7.2.6 (and consequently Docutils, MyST and autodoc-typehints).
+    # Documentation builds require Python 3.11+; CI uses Python 3.14.
+    "docutils==0.20.1",
+    "linkify-it-py==2.2.0",
+    "myst-parser==4.0.1",
+    "pillow==13.0.0",
+    "pytorch_sphinx_theme2==0.4.13",
     "sphinx==7.2.6",
-    "sphinx-autobuild",
-    "sphinx-autodoc-typehints",
-    "sphinx-design==0.6.1",
-    "sphinx-gallery==0.14.0",
-    "sphinx-sitemap==2.7.1",
-    "sphinxcontrib-mermaid==1.0.0",
-    "sphinxcontrib.katex==0.9.10",
-    "sphinxext-opengraph",
-    "torch"
+    "sphinx-autobuild==2025.8.25",
+    "sphinx-autodoc-typehints==2.0.1",
+    "sphinx-design==0.8.0",
+    "sphinx-gallery==0.22.1",
+    "sphinx-sitemap==2.9.0",
+    "sphinxcontrib-mermaid==2.1.1",
+    "sphinxcontrib.katex==0.9.11",
+    "sphinxext-opengraph==0.13.0",
+    "torch>=2.9"
 ]
 
 [project.urls]
