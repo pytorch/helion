@@ -49,7 +49,7 @@ from helion.inductor.codegen.kernel import exact_cast
 import helion.language as hl
 
 SOURCE_RE = re.compile(r'helion_\w+_source = """\\\n(.*?)"""', re.DOTALL)
-DOT_RE = re.compile(r"torch\.b?addb?mm\(")
+DOT_RE = re.compile(r"torch\.(?:addmm|baddbmm|mm|bmm)\(")
 
 
 # Inductor lowers matmuls natively for a backend through
@@ -345,17 +345,58 @@ def kernel(in0: torch.Tensor, in1: torch.Tensor, in2: torch.Tensor, out0: torch.
         self.check_bmm_epilogue("triton")
 
     def test_persistent_dot(self):
-        # A K of 32 is one block: torch.addmm over in0[tile_y, :] and
-        # in1[:, tile_x], with no loop over tile_r. As in
+        # A K of 32 is one block: one torch.mm of in0[tile_y, :] and
+        # in1[:, tile_x], with no loop over tile_r and no accumulator. As in
         # test_saved_bf16_output, the bf16 product is saved and rounded, here
-        # before the epilogue that reads it.
+        # by torch.mm, and the epilogue reads it in fp32.
         fn = lambda a, b: torch.nn.functional.silu(a @ b)  # noqa: E731
         a, b = randn(64, 32), randn(32, 48).requires_grad_()
         (source,) = self.compile(fn, a, b, expected=fn(a, b), tol=2e-2)
-        self.assertNotIn("for tile_r", source)
-        self.assertIn("tmp0 = in0[tile_y, :]", source)
-        self.assertIn("tmp1 = in1[:, tile_x]", source)
+        self.assertExpectedInline(
+            source,
+            """\
+import torch
+import helion
+import helion.language as hl
+
+@helion.kernel(backend="triton", static_shapes=True, autotune_effort="none")
+def kernel(in0: torch.Tensor, in1: torch.Tensor, out0: torch.Tensor, out1: torch.Tensor) -> None:
+    for tile_y, tile_x in hl.tile([64, 48]):
+        tmp0 = in0[tile_y, :]
+        tmp1 = in1[:, tile_x]
+        tmp2 = torch.mm(tmp0, tmp1)
+        tmp3 = tmp2.to(torch.float32)
+        tmp4 = -tmp3
+        tmp5 = torch.exp(tmp4)
+        tmp6 = 1.0
+        tmp7 = tmp5 + tmp6
+        tmp8 = tmp3 / tmp7
+        out0[tile_y, tile_x] = tmp3.to(torch.bfloat16)
+        out1[tile_y, tile_x] = tmp8.to(torch.bfloat16)
+""",
+        )
+
+    def test_persistent_bmm(self):
+        (source,) = self.compile(torch.bmm, randn(3, 40, 64), randn(3, 64, 136))
+        self.assertIn("tmp2 = torch.bmm(tmp0, tmp1)", source)
+        self.assertIn("out0[tile_z, tile_y, tile_x] = tmp2\n", source)
+        self.assertNotIn("acc", source)
+
+    def test_persistent_out_dtype(self):
+        # An fp32 product of bf16 operands keeps its accumulator: torch.mm of the
+        # bf16 tiles would round it to bf16.
+        fn = lambda a, b: torch.mm(a, b, out_dtype=torch.float32)  # noqa: E731
+        (source,) = self.compile(fn, randn(40, 32), randn(32, 136), tol=1e-3)
         self.assertIn("acc = torch.addmm(acc, tmp0, tmp1)", source)
+        self.assertIn("out0[tile_y, tile_x] = acc\n", source)
+
+    def test_persistent_dot_epilogue_reads_fp32(self):
+        # The epilogue reads the bf16 product in fp32, as it would from memory. In
+        # bf16, + 1000 would round it to a multiple of 4.
+        fn = lambda a, b: (a @ b + 1000) - 1000  # noqa: E731
+        (source,) = self.compile(fn, randn(64, 32), randn(32, 48), tol=2e-2)
+        self.assertIn("tmp2 = torch.mm(tmp0, tmp1)", source)
+        self.assertIn("tmp3 = tmp2.to(torch.float32)", source)
 
     def test_saved_bf16_output(self):
         # silu's backward reads a @ b, so the bf16 product is saved and rounded.
@@ -580,7 +621,7 @@ def kernel(in0: torch.Tensor, in1: torch.Tensor, out0: torch.Tensor, out1: torch
         i = torch.randint(0, 80, (32,), device=DEVICE)
         with config.patch(assert_indirect_indexing=False):
             (source,) = self.compile(lambda a, i, b: a[i] @ b, a, i, b, tol=2e-2)
-        self.assertIn("torch.addmm(", source)
+        self.assertIn("torch.mm(", source)
 
     def test_cudagraph_tree(self):
         def fn(a, b):
@@ -626,6 +667,20 @@ class TestInductorCute(InductorBackendTestCase):
 
     def test_mix_order_reduction(self):
         self.check_mix_order_reduction("cute")
+
+    @needs_native_matmul
+    def test_persistent_dot(self):
+        # K in one block: CuTe gets torch.mm and torch.bmm stored as they are
+        # (test_cute_mma_dag_stored_dot_gpu.py checks that cute_mma_dag runs
+        # them on tensor cores).
+        (source,) = self.compile(
+            torch.mm, randn(128, 64), randn(256, 64).t(), backend="cute"
+        )
+        self.assertIn("tmp2 = torch.mm(tmp0, tmp1)", source)
+        (source,) = self.compile(
+            torch.bmm, randn(4, 128, 64), randn(4, 64, 128), backend="cute"
+        )
+        self.assertIn("tmp2 = torch.bmm(tmp0, tmp1)", source)
 
     def test_unsupported_op(self):
         # Helion's CuTe backend compiles no lgamma.
