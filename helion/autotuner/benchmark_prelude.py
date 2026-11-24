@@ -21,10 +21,13 @@ A *prelude* names the work that precedes the candidate: the earlier kernel
 calls of the sequence, each a compiled function with its arguments.
 ``timed_behind(prelude)`` makes every search started inside it run that work
 between the L2 flush and each timed call of a candidate, and hand the
-candidate the tensors the work produced. The timed quantity stays the
-candidate alone (``benchmarking.do_bench`` says how each timer leaves the
-prelude out). ``KernelSequence`` builds preludes for a harness that runs
-kernels one after another::
+candidate the tensors the work produced. The timed quantity is the time
+the candidate adds behind the work: the trace timer reads it from the end
+of the work's last kernel to the end of the candidate's last kernel, the
+launch gap between them included, which a dependent launch overlaps
+(``benchmarking.KernelSequenceWork``); the event timer leaves the work out
+as it leaves the flush out (``benchmarking.do_bench``). ``KernelSequence``
+builds preludes for a harness that runs kernels one after another::
 
     sequence = KernelSequence()
     for kernel, args in calls:  # args: positional, defaults filled in
@@ -55,8 +58,9 @@ What a prelude's work must be, and what it does to a search:
 
 - The steps launch the same kernels on every run, as compiled kernels on
   fixed arguments do: the trace timer finds a candidate's kernels by the
-  number of events the flush and the work issue before its marker, learned
-  from two runs. Work whose two runs differ has no trace reading
+  number of events the flush and the work issue around its marker (the
+  work behind it for a sequence's, ``benchmarking.KernelSequenceWork``),
+  learned from two runs. Work whose two runs differ has no trace reading
   (``benchmarking.prelude_trace_unready_reason``).
 - The worker holds one copy of the prelude's tensors for the whole search.
   Every run makes the steps' outputs anew, but a tensor the caller gave
@@ -101,6 +105,7 @@ from torch.utils._pytree import tree_flatten
 from torch.utils._pytree import tree_unflatten
 
 from .. import exc
+from .benchmarking import KernelSequenceWork
 from .kernel_args import _input_tree_leaves
 from .kernel_args import _make_portable_args
 from .kernel_args import resolve_portable_args
@@ -203,12 +208,15 @@ def _resolved(
     )
 
 
-class LoadedPrelude:
+class LoadedPrelude(KernelSequenceWork):
     """A prelude ready to run in this process: ``run`` makes the steps'
     calls and keeps the timed call's arguments, ``timed(fn)`` is the timed
     call of a candidate on them. One instance serves every candidate of a
     search (the work does not depend on the candidate), so a timer may key
-    what it learns about the work on the instance."""
+    what it learns about the work on the instance. Its steps are the kernel
+    calls right before the candidate's in the sequence, so the trace timer
+    reads a candidate from the end of their last kernel
+    (``KernelSequenceWork``)."""
 
     def __init__(
         self,

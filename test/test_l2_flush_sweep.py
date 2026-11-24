@@ -447,10 +447,13 @@ def test_traced_windows_read_each_call_behind_the_flush_and_the_sweep(
     split = benchmarking._kernel_trace_samples
 
     def recorded(
-        events: list[benchmarking._TraceEvent], count: int, per_flush: int
+        events: list[benchmarking._TraceEvent],
+        count: int,
+        per_flush: int,
+        work_events: int = 0,
     ) -> list[tuple[int, float]] | None:
         windows.append([event.name for event in events])
-        return split(events, count, per_flush)
+        return split(events, count, per_flush, work_events)
 
     monkeypatch.setattr(benchmarking, "_kernel_trace_samples", recorded)
     x = torch.randn(1 << 20, device=DEVICE)

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import abc
 import contextlib
 import contextvars
 import dataclasses
@@ -490,6 +491,36 @@ class TimedPrelude(Protocol):
     so does better-benchmark's trace timer (``bench.py``'s
     ``ReleaseL2Pins``)."""
 
+    def run(self) -> None: ...
+
+
+class KernelSequenceWork(abc.ABC):
+    """Base of a prelude whose work is the kernel calls that run right
+    before the candidate in its sequence (``benchmark_prelude.LoadedPrelude``).
+
+    The trace timer reads a candidate behind such work from the end of the
+    work's last kernel to the end of the candidate's last kernel: the time
+    the candidate adds to the sequence's span. Its window holds [flush,
+    marker, work, call] per call, so nothing runs between the work and the
+    candidate, as in the sequence. Reading the candidate's own span instead
+    (behind [flush, work, marker]) leaves out the launch gap between the two
+    kernels, and with it what a programmatic dependent launch (CuTe's
+    ``cute_pdl``) saves: better-benchmark sum_7d8e580a55da_a190a59b emits
+    three CuTe kernels (a where with a store and a sum over x, the sum of
+    its partials, and a pad), which read 4.51, 1.76 and 3.78 us alone with
+    or without the knob (+0.03 us with it, one tick of the trace clock),
+    while the three in a row read 14.02 us with the knob on none, 11.46 us
+    with it on the pad, and 9.28 us with it on the last two (GB300,
+    flushed calls, each kernel behind the one before it). Read alone, the
+    knob never wins.
+
+    Other preludes keep the candidate's own span, behind a marker that
+    follows their work: better-benchmark's ``--cold-timer trace`` times a
+    whole graph behind ``ReleaseL2Pins`` (a sweep that completes the flush,
+    not a kernel of the graph's sequence), and its readings must not move.
+    """
+
+    @abc.abstractmethod
     def run(self) -> None: ...
 
 
@@ -1564,13 +1595,21 @@ def _cuda_kernel_events(run: Callable[[], None]) -> list[_TraceEvent]:
 
 
 def _kernel_trace_samples(
-    events: Sequence[_TraceEvent], calls: int, per_flush: int
+    events: Sequence[_TraceEvent],
+    calls: int,
+    per_flush: int,
+    work_events: int = 0,
 ) -> list[tuple[int, float]] | None:
     """Per call of a trace of ``calls`` x [flush, marker, call]: its first
     kernel's start (ns) and its device milliseconds; ``None`` when the trace
     is not that. The marker (``_TRACE_MARKER``, a kernel named for this timer)
     delimits the calls: a call's own fills may share the flush's name and
-    size, and calls may launch different kernels."""
+    size, and calls may launch different kernels.
+
+    With ``work_events``, every call starts with that many events of a
+    sequence's work (``KernelSequenceWork``: [flush, marker, work, call]),
+    and its milliseconds run from the end of the work's last kernel to the
+    end of the call's last kernel."""
     starts = [
         index for index, event in enumerate(events) if event.name == _TRACE_MARKER
     ]
@@ -1589,6 +1628,28 @@ def _kernel_trace_samples(
     calls_events = [
         events[begin + 1 : end] for begin, end in zip(starts, ends, strict=True)
     ]
+    if work_events:
+        if any(len(call) <= work_events for call in calls_events):
+            return None
+        # What the call adds to the span of the work and the call: a
+        # candidate that ended inside the work's tail would add nothing,
+        # and the end of its own last kernel minus the work's would read
+        # below zero.  A candidate waits for the work it reads, so such a
+        # call is no reading.
+        samples = [
+            (
+                call[0].start,
+                (
+                    max(event.end for event in call)
+                    - max(event.end for event in call[:work_events])
+                )
+                / 1e6,
+            )
+            for call in calls_events
+        ]
+        if any(milliseconds <= 0 for _, milliseconds in samples):
+            return None
+        return samples
     # A call's span, first kernel start to last kernel end: summing the
     # kernels would count a dependent launch's (PDL) overlap with its
     # primary twice and drop the gaps between kernels.
@@ -1635,15 +1696,20 @@ def _trace_marker() -> None:
 def _traced_flush_events(
     clear_cache: Callable[[], None],
     di: Any,  # noqa: ANN401
-) -> tuple[int, int]:
-    """The trace events ``clear_cache`` issues before a marker, from a trace
-    of [``clear_cache``, marker] twice, and the events of that trace; zero
-    when the trace is not that (the caller says what follows)."""
+    after: Callable[[], None] | None = None,
+) -> tuple[int, int, int]:
+    """The trace events ``clear_cache`` issues before a marker and those
+    ``after`` issues behind it, from a trace of [``clear_cache``, marker,
+    ``after``] twice, and the events of that trace; zeros when the trace is
+    not that (the caller says what follows), as when events follow a marker
+    without an ``after`` (foreign work on the device)."""
 
     def footprint() -> None:
         for _ in range(2):
             clear_cache()
             _trace_marker()
+            if after is not None:
+                after()
         di.synchronize()
 
     _trace_marker()  # compiled outside the trace
@@ -1652,13 +1718,16 @@ def _traced_flush_events(
         index for index, event in enumerate(events) if event.name == _TRACE_MARKER
     ]
     per_flush = markers[0] if markers else 0
+    behind = (len(events) - 2 * (per_flush + 1)) // 2
     if (
         per_flush > 0
-        and markers == [per_flush, 2 * per_flush + 1]
-        and len(events) == 2 * per_flush + 2
+        and behind >= 0
+        and (after is not None or behind == 0)
+        and markers == [per_flush, 2 * per_flush + 1 + behind]
+        and len(events) == 2 * (per_flush + 1 + behind)
     ):
-        return per_flush, len(events)
-    return 0, len(events)
+        return per_flush, behind, len(events)
+    return 0, 0, len(events)
 
 
 def _learn_flush_trace(
@@ -1674,7 +1743,7 @@ def _learn_flush_trace(
     global _flush_trace, _flush_sweep_trace
     learned = _learned_flush_trace()
     if learned is None:
-        learned, traced = _traced_flush_events(clear_cache, di)
+        learned, _, traced = _traced_flush_events(clear_cache, di)
         if _L2_FLUSH_SWEEP.get():
             _flush_sweep_trace = learned
         else:
@@ -1729,7 +1798,7 @@ def _learn_prelude_flush_trace(
     traces = _prelude_traces()
     events = traces.get(prelude)
     if events is None:
-        events, traced = _traced_flush_events(clear_cache, di)
+        events, _, traced = _traced_flush_events(clear_cache, di)
         traces[prelude] = events
         if events == 0:
             _log.warning(
@@ -1743,14 +1812,71 @@ def _learn_prelude_flush_trace(
     return events
 
 
+# The trace events of a sequence's work after the marker, per prelude
+# (``_learn_sequence_work_trace``; -1 where two runs differ), behind a
+# flush and behind a flush and the sweep (``l2_flush_sweep``).
+_sequence_work_traces: weakref.WeakKeyDictionary[object, int] = (
+    weakref.WeakKeyDictionary()
+)
+_sequence_work_sweep_traces: weakref.WeakKeyDictionary[object, int] = (
+    weakref.WeakKeyDictionary()
+)
+
+
+def _learn_sequence_work_trace(
+    clear_cache: Callable[[], None],
+    di: Any,  # noqa: ANN401
+    prelude: KernelSequenceWork,
+) -> int | None:
+    """The trace events a sequence's work issues (``KernelSequenceWork``),
+    from a trace of [``clear_cache`` (the flush, and the sweep inside an
+    ``l2_flush_sweep`` block that sweeps), marker, work] twice, learned once
+    per prelude (its work is the same for every candidate); ``None`` when
+    the flush has no footprint or the trace is not that (the work differs
+    from run to run, or other work ran on the device)."""
+    per_flush = _learn_flush_trace(clear_cache, di)
+    if per_flush == 0:
+        return None
+    traces = (
+        _sequence_work_sweep_traces if _L2_FLUSH_SWEEP.get() else _sequence_work_traces
+    )
+    learned = traces.get(prelude)
+    if learned is None:
+        flush, work, traced = _traced_flush_events(clear_cache, di, prelude.run)
+        learned = work if flush == per_flush else -1
+        traces[prelude] = learned
+        if learned < 0:
+            _log.warning(
+                "the CUDA activity trace shows %d events for two runs of a "
+                "flush, a marker and a sequence's work, not the same events "
+                "twice (the work differs from run to run, or other work ran "
+                "on the device): windows behind this work have no trace "
+                "reading",
+                traced,
+            )
+    return None if learned < 0 else learned
+
+
 def prelude_trace_unready_reason(prelude: TimedPrelude) -> str | None:
     """Why a process that can trace (``kernel_timer_unready_reason`` is None)
     cannot time windows behind ``prelude`` from the trace, ``None`` when it
     can: the footprint of the flush and the prelude's work is learned here
-    (``_learn_prelude_flush_trace``), and there is none when two runs of the
-    work do not show the same events. ``do_bench`` would then time the window
-    with CUDA events, as it does where the flush has no footprint; the
-    benchmark worker asks first (``BenchmarkJob``) and gives no reading."""
+    (``_learn_prelude_flush_trace``, or ``_learn_sequence_work_trace`` for a
+    sequence's work), and there is none when two runs of the work do not
+    show the same events. ``do_bench`` would then time the window with CUDA
+    events, as it does where the flush has no footprint; the benchmark
+    worker asks first (``BenchmarkJob``) and gives no reading."""
+    if isinstance(prelude, KernelSequenceWork):
+        # (inside an ``l2_flush_sweep`` block the clearer sweeps too)
+        if (
+            _learn_sequence_work_trace(_make_l2_cache_clearer(), torch.cuda, prelude)
+            is None
+        ):
+            return (
+                "the CUDA activity trace of the sequence's work is not the "
+                "same from one run to the next"
+            )
+        return None
     traces = _prelude_traces()
     if prelude not in traces:
         # (inside an ``l2_flush_sweep`` block the clearer sweeps too)
@@ -1835,6 +1961,10 @@ def _do_bench_kernel_durations(
     prelude's work (``do_bench``): its kernels run before the marker, so a
     sample is still the candidate's kernels alone, and the events before a
     marker are learned for the prelude (``_learn_prelude_flush_trace``).
+    Behind a sequence's work (``KernelSequenceWork``) ``clear_cache`` is the
+    flush alone, the work runs after the marker, and a sample runs from the
+    end of the work's last kernel (``_learn_sequence_work_trace`` learns how
+    many events it issues) to the end of the candidate's last kernel.
 
     The per-call flush regime timed by CUDA events reads the flush plus the
     call minus the flush alone. Once the flush's dirty lines and the call's
@@ -1864,13 +1994,20 @@ def _do_bench_kernel_durations(
 
     if not _kernel_timer_preconditions(process_group_name):
         return None
+    work = prelude if isinstance(prelude, KernelSequenceWork) else None
     per_flush = (
         _learn_flush_trace(clear_cache, di)
-        if prelude is None
+        if prelude is None or work is not None
         else _learn_prelude_flush_trace(clear_cache, di, prelude)
     )
     if per_flush == 0:
         return None
+    work_events = 0
+    if work is not None:
+        learned = _learn_sequence_work_trace(clear_cache, di, work)
+        if learned is None:
+            return None
+        work_events = learned
     _trace_marker()  # built for this device outside any trace
 
     def flushed_call() -> None:
@@ -1880,6 +2017,8 @@ def _do_bench_kernel_durations(
                 tensor.grad = None
         clear_cache()
         _trace_marker()
+        if work is not None:
+            work.run()
         benchmark_function()
 
     def summarized(samples: list[float]) -> float | tuple[float, ...]:
@@ -1921,7 +2060,9 @@ def _do_bench_kernel_durations(
             else None
         )
         if first_events is not None and start.elapsed_time(end) >= max(warmup, rep):
-            first_samples = _kernel_trace_samples(first_events, 1, per_flush)
+            first_samples = _kernel_trace_samples(
+                first_events, 1, per_flush, work_events
+            )
             if first_samples is None:
                 return unsplit(first_events, 1)
             return summarized([ms for _start, ms in first_samples])
@@ -1946,7 +2087,7 @@ def _do_bench_kernel_durations(
             di.synchronize()
 
         events = _cuda_kernel_events(timed)
-        traced = _kernel_trace_samples(events, traced_calls, per_flush)
+        traced = _kernel_trace_samples(events, traced_calls, per_flush, work_events)
         if traced is None:
             return unsplit(events, traced_calls)
         # integer nanoseconds: a float sum would round the epoch clock
@@ -2092,15 +2233,17 @@ def _traced_candidate_window(
     no settled call) raises ``KernelTraceUnreadable``: an event reading of it
     would land among the search's trace readings.
     """
-    if (
-        not _kernel_timer_preconditions(process_group_name)
-        or (
-            _learn_flush_trace(clear_cache, di)
-            if prelude is None
-            else _learn_prelude_flush_trace(clear_cache, di, prelude)
-        )
-        == 0
-    ):
+    if not _kernel_timer_preconditions(process_group_name):
+        return None
+    if isinstance(prelude, KernelSequenceWork):
+        # (``clear_cache`` is the flush alone: the work runs after the marker)
+        if _learn_sequence_work_trace(clear_cache, di, prelude) is None:
+            return None
+    elif (
+        _learn_flush_trace(clear_cache, di)
+        if prelude is None
+        else _learn_prelude_flush_trace(clear_cache, di, prelude)
+    ) == 0:
         return None
     if prelude is None:
         # (behind a prelude ``do_bench`` has released them, for every timer)
@@ -2184,16 +2327,21 @@ def do_bench(
         timer flushes L2 before a call, it flushes and then runs the work,
         so the reading leaves the work out exactly as it leaves the flush
         out. A traced window holds [flush, work, marker, call] per call
-        and reads the kernels after the marker. A sample between two events
+        and reads the kernels after the marker; behind a sequence's work
+        (``KernelSequenceWork``) it holds [flush, marker, work, call] and
+        reads from the end of the work's last kernel to the end of the
+        call's, the launch gap between them included. A sample between two events
         starts after both, or when the host records the start event if the
         device has finished the work by then: the flush covers about 50 us
         of host time on a B200, and work that takes the host longer to
         queue than the device to run leaves the device idle at the event,
         so the sample also holds the host's time to launch the call (a
         16 MB add read 8.2 us behind work the device was still running and
-        15.6 us behind sixteen small launches; the trace read 4.4 us behind
-        both). The offset is the launch's, alike for every config of a
-        kernel. A spin on the device after the work removes it but lets the
+        15.6 us behind sixteen small launches; the trace, reading the call's
+        own kernels, read 4.4 us behind both). The trace reading behind a
+        sequence's work, from the end of the work's last kernel, holds that
+        host time too. The offset is the launch's, alike for every config of
+        a kernel. A spin on the device after the work removes it but lets the
         memory system settle, which a kernel that streams cold operands
         then reads (98 us by events against 110 us in the trace for one
         over 370 MB): the timer does not spin, and a search behind a prelude
@@ -2245,6 +2393,9 @@ def do_bench(
             ),
             flush_buffer,
         )
+    # The trace timers take a sequence's work apart from the flush: it runs
+    # after their marker (``KernelSequenceWork``).
+    trace_clear_cache = clear_cache
     if prelude is not None:
         check_prelude_regime(flush_mode)
         if grad_to_none is not None:
@@ -2264,6 +2415,8 @@ def do_bench(
         # tensors (no private copies, ``_release_l2_pins``).
         _release_l2_pins(flush_buffer)
         clear_cache = functools.partial(_flush_then_prelude, clear_cache, prelude)
+        if not isinstance(prelude, KernelSequenceWork):
+            trace_clear_cache = clear_cache
     calls = 1
     flush_replay: Callable[[], None] | None = None
     if benchmark_function is not fn:
@@ -2276,7 +2429,7 @@ def do_bench(
     if flush_mode == "kernel":
         kernel_timing = _do_bench_kernel_durations(
             benchmark_function,
-            clear_cache,
+            trace_clear_cache,
             di,
             warmup=warmup,
             rep=rep,
@@ -2309,7 +2462,7 @@ def do_bench(
         assert flush_buffer is not None
         traced = _traced_candidate_window(
             fn,
-            clear_cache,
+            trace_clear_cache,
             di,
             flush_buffer=flush_buffer,
             warmup=warmup,

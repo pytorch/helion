@@ -432,6 +432,32 @@ def test_do_bench_refuses_a_prelude_in_a_regime_without_a_flush_per_call(
         )
 
 
+def test_events_behind_a_flushs_markers_without_an_after_are_foreign_work(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """[flush, marker] twice learns the flush's events; events behind each
+    marker are another process's work unless the caller issued them there
+    (``after``), and the flush is then learned with them counted apart."""
+    marker = benchmarking._TRACE_MARKER
+    device = SimpleNamespace(synchronize=lambda: None)
+    monkeypatch.setattr(benchmarking, "_trace_marker", lambda: None)
+
+    def trace(*names: str) -> None:
+        monkeypatch.setattr(
+            benchmarking,
+            "_cuda_kernel_events",
+            lambda run: [SimpleNamespace(name=name) for name in names],
+        )
+
+    trace("f", "f", marker, "f", "f", marker)
+    assert benchmarking._traced_flush_events(lambda: None, device) == (2, 0, 6)
+    trace("f", "f", marker, "x", "f", "f", marker, "x")
+    assert benchmarking._traced_flush_events(lambda: None, device) == (0, 0, 8)
+    assert benchmarking._traced_flush_events(
+        lambda: None, device, after=lambda: None
+    ) == (2, 1, 8)
+
+
 def test_a_traced_window_behind_a_prelude_reads_the_candidates_kernels_only(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -505,6 +531,174 @@ def test_a_traced_window_behind_a_prelude_reads_the_candidates_kernels_only(
     assert released == ["buffer"]
     assert candidate_window(behind, work) == pytest.approx(0.007)
     assert released == ["buffer"]
+
+
+def test_a_traced_window_behind_a_sequence_reads_from_the_end_of_its_work(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Behind a sequence's work (``KernelSequenceWork``, what the benchmark
+    worker loads) a window is [flush, marker, work, call] per call, and a
+    sample runs from the end of the work's last kernel to the end of the
+    call's: the launch gap after the work counts, and a call launched as a
+    dependent, which starts under the work's tail, adds only what runs past
+    the work's end. Under the old reading both calls read their own 7 us."""
+    pytest.importorskip("triton")
+    # (name, gap after the previous kernel's end in ns, negative under it,
+    # duration in ns)
+    log: list[tuple[str, int, int]] = []
+
+    def launch(name: str, nanoseconds: int, gap: int = 10) -> Callable[[], None]:
+        return lambda: log.append((name, gap, nanoseconds))
+
+    def traced(run: Callable[[], None]) -> list[benchmarking._TraceEvent]:
+        log.clear()
+        run()
+        events, end = [], 0
+        for name, gap, nanoseconds in log:
+            start = end + gap
+            events.append(benchmarking._TraceEvent(name, start, start + nanoseconds))
+            end = max(end, start + nanoseconds)
+        return events
+
+    monkeypatch.setattr(benchmarking, "_kernel_timer_preconditions", lambda group: True)
+    monkeypatch.setattr(benchmarking, "_flush_trace", None)
+    monkeypatch.setattr(
+        benchmarking, "_trace_marker", launch(benchmarking._TRACE_MARKER, 1)
+    )
+    monkeypatch.setattr(benchmarking, "_cuda_kernel_events", traced)
+    event = SimpleNamespace(record=lambda: None, elapsed_time=lambda end: 1.0)
+    device = SimpleNamespace(
+        Event=lambda enable_timing: event, synchronize=lambda: None
+    )
+    flush = launch("flush", 1_000_000)
+
+    class Work(benchmarking.KernelSequenceWork):
+        def run(self) -> None:
+            log.append(("producer", 10, 500_000))
+            log.append(("producer", 10, 300_000))
+
+    def window(
+        candidate: Callable[[], None], prelude: object, **kwargs: object
+    ) -> object:
+        # (the flush alone: the work runs after the marker)
+        return benchmarking._do_bench_kernel_durations(
+            candidate,
+            flush,
+            device,
+            warmup=0,
+            rep=1,
+            quantiles=None,
+            return_mode="median",
+            fixed_repetitions=3,
+            prelude=prelude,  # pyrefly: ignore[bad-argument-type]
+            **kwargs,  # pyrefly: ignore[bad-argument-type]
+        )
+
+    work = Work()
+    plain = launch("candidate", 7_000, gap=1_000)
+    assert window(plain, work) == pytest.approx(0.008)
+    assert benchmarking._sequence_work_traces[work] == 2
+    # the plain flush's footprint, shared with every other window
+    assert benchmarking._flush_trace == 1
+    dependent = launch("candidate", 7_000, gap=-2_000)
+    assert window(dependent, work) == pytest.approx(0.005)
+    # A window whose calls launch nothing past the work has no reading, and
+    # neither has one whose calls end inside the work's tail: they add
+    # nothing to the span, and their own end minus the work's reads -0.15 ms.
+    for nothing_past in (lambda: None, launch("candidate", 100_000, gap=-250_000)):
+        with pytest.raises(benchmarking.KernelTraceUnreadable):
+            window(nothing_past, work, unreadable_reads_infinite=False)
+
+    # do_bench hands the trace timer the flush alone behind such work, and
+    # the work with the flush behind any other prelude.
+    runtime = pytest.importorskip("triton.runtime")
+    flushes: list[object] = []
+    monkeypatch.setattr(
+        runtime.driver,
+        "_active",
+        SimpleNamespace(
+            get_device_interface=lambda: device,
+            get_empty_cache_for_benchmark=lambda: "buffer",
+            clear_cache=lambda buffer: None,
+        ),
+    )
+    monkeypatch.setattr(benchmarking, "_release_l2_pins", lambda buffer: None)
+    monkeypatch.delenv("HELION_BENCHMARK_CUDAGRAPH", raising=False)
+
+    def recorded(
+        fn: object, clear_cache: object, di: object, **kwargs: object
+    ) -> float:
+        flushes.append(clear_cache)
+        return 1.0
+
+    monkeypatch.setattr(benchmarking, "_do_bench_kernel_durations", recorded)
+    for prelude in (work, LoggedPrelude([])):
+        benchmarking.do_bench(
+            lambda: None,
+            fixed_repetitions=1,
+            pre_warmed=True,
+            l2_flush_mode="kernel",
+            prelude=prelude,  # pyrefly: ignore[bad-argument-type]
+        )
+    alone, behind = flushes
+    # (the flush is the driver's clear_cache on its buffer)
+    assert isinstance(alone, functools.partial) and alone.args == ("buffer",)
+    assert isinstance(behind, functools.partial)
+    assert behind.func is benchmarking._flush_then_prelude
+
+
+def test_sequence_work_that_differs_from_run_to_run_has_no_trace_reading(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The events of a sequence's work after the marker are learned once
+    per prelude; work whose two runs differ has no trace reading."""
+    pytest.importorskip("triton")
+    log: list[str] = []
+
+    def traced(run: Callable[[], None]) -> list[benchmarking._TraceEvent]:
+        log.clear()
+        run()
+        return [
+            benchmarking._TraceEvent(name, index, index + 1)
+            for index, name in enumerate(log)
+        ]
+
+    monkeypatch.setattr(
+        benchmarking, "_trace_marker", lambda: log.append(benchmarking._TRACE_MARKER)
+    )
+    monkeypatch.setattr(benchmarking, "_cuda_kernel_events", traced)
+    monkeypatch.setattr(
+        benchmarking, "_make_l2_cache_clearer", lambda: lambda: log.append("flush")
+    )
+    monkeypatch.setattr(benchmarking, "_flush_trace", None)
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
+
+    class Work(benchmarking.KernelSequenceWork):
+        def __init__(self, launches: list[int]) -> None:
+            self.launches = launches
+
+        def run(self) -> None:
+            log.extend(["producer"] * self.launches.pop(0))
+
+    steady = Work([2, 2])
+    assert benchmarking.prelude_trace_unready_reason(steady) is None
+    assert benchmarking._sequence_work_traces[steady] == 2
+    assert steady not in benchmarking._prelude_flush_traces
+    # (learned once: a second question traces nothing)
+    assert benchmarking.prelude_trace_unready_reason(steady) is None
+    varying = Work([2, 3])
+    reason = benchmarking.prelude_trace_unready_reason(varying)
+    assert reason is not None and "not the same" in reason
+    assert benchmarking._sequence_work_traces[varying] == -1
+
+
+def test_the_worker_loads_a_sequence_s_work() -> None:
+    """The benchmark worker's prelude is the kernel calls before the
+    candidate in its sequence, so the trace timer reads candidates behind
+    it from the end of that work; better-benchmark's ``ReleaseL2Pins``
+    (the sweep its cold timer runs behind) is no such work."""
+    assert issubclass(benchmark_job.LoadedPrelude, benchmarking.KernelSequenceWork)
+    assert not issubclass(LoggedPrelude, benchmarking.KernelSequenceWork)
 
 
 def test_work_that_differs_from_run_to_run_has_no_trace_reading(

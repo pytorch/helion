@@ -28,13 +28,16 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-def _produce(source: torch.Tensor, rounds: int, runs: torch.Tensor) -> torch.Tensor:
-    """Work of a millisecond or two (hundreds of launches over 16 MB), then
-    the tensor the timed call reads: other values on every run, which
-    ``runs`` counts in place."""
-    scratch = source
-    for _ in range(rounds):
-        scratch = scratch * 1.0001
+def _produce(source: torch.Tensor, cycles: int, runs: torch.Tensor) -> torch.Tensor:
+    """Work of a millisecond or so (a spin of ``cycles`` on the device, then
+    launches over 16 MB), then the tensor the timed call reads: other values
+    on every run, which ``runs`` counts in place. The device, not the host,
+    sets the work's pace: behind work the host takes longer to queue than the
+    device to run (hundreds of small launches), the device waits for the
+    timed call's launch, which a reading from the end of a sequence's work
+    counts (``KernelSequenceWork``), as the event timer always does."""
+    torch.cuda._sleep(cycles)
+    scratch = source * 1.0001
     runs += 1
     return scratch + runs
 
@@ -76,7 +79,7 @@ def test_a_preludes_work_stays_out_of_the_reading(
     out = torch.empty(elements, device=DEVICE)
     runs = torch.zeros((), dtype=torch.int64, device=DEVICE)
     prelude = BenchmarkPrelude(
-        (PreludeStep(_produce, (source, 400, runs)),),
+        (PreludeStep(_produce, (source, 2_000_000, runs)),),
         (PreludeOutput(0, 0, (elements,), (1,), 0), out),
     ).loaded()
     prelude.run()

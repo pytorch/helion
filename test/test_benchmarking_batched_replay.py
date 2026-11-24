@@ -483,10 +483,13 @@ def traced_windows(monkeypatch) -> list[int]:
     split = benchmarking._kernel_trace_samples
 
     def recorded(
-        events: list[benchmarking._TraceEvent], count: int, per_flush: int
+        events: list[benchmarking._TraceEvent],
+        count: int,
+        per_flush: int,
+        work_events: int = 0,
     ) -> list[tuple[int, float]] | None:
         windows.append(count)
-        return split(events, count, per_flush)
+        return split(events, count, per_flush, work_events)
 
     monkeypatch.setattr(benchmarking, "_kernel_trace_samples", recorded)
     return windows
@@ -745,7 +748,7 @@ def test_an_unreadable_trace_window_reads_infinite_or_raises(
         monkeypatch.setattr(
             benchmarking,
             "_kernel_trace_samples",
-            lambda events, count, per_flush: [(0, 0.001)] * count,
+            lambda events, count, per_flush, work_events=0: [(0, 0.001)] * count,
         )
     event = SimpleNamespace(record=lambda: None, elapsed_time=lambda end: 1.0)
     device = SimpleNamespace(
