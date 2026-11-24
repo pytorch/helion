@@ -377,6 +377,7 @@
  "test/test_cute_tile_vector_scope.py": 3.6,
  "test/test_cute_topk.py": 579.3,
  "test/test_cute_traced_slice_bounds.py": 2.1,
+ "test/test_cute_transposed_column_seed_cuda.py": 1.5,
  "test/test_cute_transposed_store_seeds.py": 9.5,
  "test/test_cute_uniform_comparison.py": 14.9,
  "test/test_cute_unpadded_rows.py": 10.5,

@@ -4381,6 +4381,7 @@ _CUTE_HEURISTIC_ORDER = (
     "cute_reduction_lane_jam_forwarding",
     "cute_delinearized_row_reduction",
     "cute_lane_carry_row",
+    "cute_transposed_column_reduction",
 )
 
 

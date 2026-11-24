@@ -5578,6 +5578,190 @@ class CuteDelinearizedRowReductionHeuristic(AutotunerHeuristic):
         )
 
 
+class CuteTransposedColumnReductionHeuristic(AutotunerHeuristic):
+    """Seed a device-loop column sum whose input is contiguous along the
+    reduced rows: the copy of a permuted tensor and its sums over the
+    permuted dim, which helion.inductor emits for ``x.permute(...)``'s clone
+    and the sum that follows it::
+
+        for tile_y, tile_x in hl.tile([Y, X]):
+            acc = hl.zeros([tile_y, tile_x], dtype=torch.float32)
+            for tile_r in hl.tile(R):
+                v = x[tile_y, tile_r, tile_x].to(torch.float32)  # x: r stride 1
+                out[tile_y, tile_r, tile_x] = v.to(torch.bfloat16)  # out: x stride 1
+                acc = acc + torch.sum(v, -2)
+            sums[tile_y, tile_x] = acc
+
+    The column heuristics put the column tile on the input's stride-1 dim,
+    which here is the reduced one, so none seeds the kernel, and its fast
+    layout is a narrow corner of the space: a register transpose that reads
+    whole sectors along ``r`` and writes whole sectors along ``x``.  Seed it:
+    ``ROW_THREADS`` threads along the loop tile, each loading one packet of
+    it (32 bytes on SM100+, ``target_facts.widest_packet_bytes``), and
+    ``COLUMN_THREADS`` threads along the column tile, one column each, so a
+    warp's store of a row writes 16 consecutive columns; one element of every
+    other grid axis per CTA.  Measured on GB300 (trace timer) on the first
+    kernels of better-benchmark's sum_3759dcabdc6f_687c0b28 ([32, 128, 1024]
+    bf16, r contiguous) and sum_35b8acdece58_1e7ad64a: 5.22 and 3.71 us,
+    against 6.4-7.3 and 3.5-4.4 us for the configs unseeded searches ended
+    on; its neighbors lose (64-row tiles 8.96 / 5.60 us, 32 columns 8.42 /
+    6.30, 8 columns 6.53 / 4.00, 16-byte packets 9.41 / 5.47).
+
+    The packet halves until the loop's extent, the input's base address and
+    its other strides are multiples of it (``_packet_layout_aligned``), down
+    to one-element lanes, which a loop that does not start at 0 also takes.
+    The tiles clamp to short extents (a power of two that the extent holds).
+    Any reduction of the loop's tile matches (an ``amax`` as well as a sum):
+    the layout is the loads' and the stores', whatever combines the values.
+    """
+
+    name = "cute_transposed_column_reduction"
+    backend = "cute"
+    priority = 104
+    ROW_THREADS = 2
+    COLUMN_THREADS = 16
+    SEED_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
+
+    @classmethod
+    def _match(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> tuple[int, int, torch.Tensor, int] | None:
+        """``(column_block_id, reduced_block_id, source, dim)`` when the
+        kernel's single grid loop holds a single device loop that loads the
+        16/32-bit float ``source`` with the loop's tile on its stride-1 dim
+        ``dim`` and a grid tile, the column, on another dim (the grid tile on
+        the smallest of those strides), and reduces values over the loop's
+        tile that keep the column innermost.  A row sum over the loop's tile (the
+        reduced tile innermost, as in ``x[tile_m, tile_r].sum(-1)``) reads
+        rows already contiguous and is the row heuristics' case."""
+        nest = _device_loop_reduction(env, device_ir)
+        if nest is None:
+            return None
+        grid_blocks, reduced_block_id, calls = nest
+        spec = env.config_spec
+        if not all(
+            {*grid_blocks, reduced_block_id}.issubset(sequence.valid_block_ids())
+            for sequence in (spec.num_threads, spec.cute_vector_widths)
+        ):
+            return None
+        reduced_symbol = _symint_sympy_expr(env.block_sizes[reduced_block_id].var)
+        grid_symbols = {
+            _symint_sympy_expr(env.block_sizes[block_id].var): block_id
+            for block_id in grid_blocks
+        }
+
+        def tile_block(index: object) -> int | None:
+            if not isinstance(index, Node):
+                return None
+            value = index.meta.get("val")
+            if not isinstance(value, torch.SymInt):
+                return None
+            symbol = _symint_sympy_expr(value)
+            if symbol == reduced_symbol:
+                return reduced_block_id
+            return grid_symbols.get(symbol)
+
+        match: tuple[int, int, torch.Tensor, int] | None = None
+        # The innermost dims of the values the loop reduces over its tile:
+        # a column sum keeps a grid tile innermost (``torch.sum(v, -2)`` of a
+        # ``[tile_y, tile_r, tile_x]`` value), a row sum the reduced tile.
+        innermost: set[object] = set()
+        for node in calls:
+            if node.target is language_load:
+                tensor, subscript = _load_operands(node)
+                if not (
+                    match is None
+                    and tensor is not None
+                    and tensor.dtype in cls.SEED_DTYPES
+                    and isinstance(subscript, (list, tuple))
+                    and len(subscript) == tensor.ndim
+                ):
+                    continue
+                blocks = [tile_block(index) for index in subscript]
+                strides = [tensor.stride(dim) for dim in range(tensor.ndim)]
+                if not all(isinstance(stride, int) for stride in strides):
+                    continue
+                lane_dims = [
+                    dim
+                    for dim in range(tensor.ndim)
+                    if blocks[dim] == reduced_block_id and strides[dim] == 1
+                ]
+                columns = sorted(
+                    (cast("int", strides[dim]), cast("int", blocks[dim]))
+                    for dim in range(tensor.ndim)
+                    if blocks[dim] in grid_blocks and cast("int", strides[dim]) > 1
+                )
+                if len(lane_dims) == 1 and columns:
+                    match = (columns[0][1], reduced_block_id, tensor, lane_dims[0])
+                continue
+            sizes = _reduced_sizes(node, reduced_symbol)
+            if sizes:
+                innermost.add(sizes[-1])
+        if match is None:
+            return None
+        column_symbol = _symint_sympy_expr(env.block_sizes[match[0]].var)
+        return match if column_symbol in innermost else None
+
+    @classmethod
+    def is_eligible(cls, env: CompileEnvironment, device_ir: DeviceIR) -> bool:
+        return cls.get_seed_config(env, device_ir) is not None
+
+    @classmethod
+    def get_seed_config(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> Config | None:
+        match = cls._match(env, device_ir)
+        if match is None:
+            return None
+        column_block_id, reduced_block_id, source, dim = match
+        spec = env.config_spec
+        packet_bytes = target_facts.widest_packet_bytes(spec.target_device_capability)
+        vec = max(1, packet_bytes // source.dtype.itemsize)
+        if reduced_block_id in device_ir.noncanonical_task_origin_block_ids:
+            # (``hl.tile(3, rows)``: no lane base is a multiple of a width)
+            vec = 1
+        while vec > 1 and not (
+            env.block_sizes[reduced_block_id].known_multiple(vec)
+            and _packet_layout_aligned(env, source, dim, vec)
+        ):
+            vec //= 2
+        row_fragment = spec.block_sizes.block_id_lookup(reduced_block_id)._fragment(
+            spec
+        )
+        column_fragment = spec.block_sizes.block_id_lookup(column_block_id)._fragment(
+            spec
+        )
+        rows = max(row_fragment.low, min(cls.ROW_THREADS * vec, row_fragment.high))
+        columns = max(
+            column_fragment.low, min(cls.COLUMN_THREADS, column_fragment.high)
+        )
+        vec = max(1, min(vec, rows))
+        others = {
+            item.block_id: 1
+            for item in spec.block_sizes
+            if item.block_id not in (column_block_id, reduced_block_id)
+        }
+        return Config.from_dict(
+            {
+                "block_sizes": _seq_config_list(
+                    spec.block_sizes,
+                    {**others, column_block_id: columns, reduced_block_id: rows},
+                ),
+                "num_threads": _seq_config_list(
+                    spec.num_threads,
+                    {
+                        **others,
+                        column_block_id: columns,
+                        reduced_block_id: max(1, rows // vec),
+                    },
+                ),
+                "cute_vector_widths": _seq_config_list(
+                    spec.cute_vector_widths, {reduced_block_id: vec}
+                ),
+            }
+        )
+
+
 class CuteStridedReductionHeuristic(AutotunerHeuristic):
     """Coalesced seeds for a reduction over a strided full slice beside a
     contiguous grid tile (a channels-last spatial mean or BatchNorm-ReLU pool:

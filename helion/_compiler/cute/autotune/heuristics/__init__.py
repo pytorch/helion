@@ -151,6 +151,7 @@ from .cute import CuteTileVecHeuristic
 from .cute import CuteTileVecWarpPerRowHeuristic
 from .cute import CuteTileVecWarpReduceHeuristic
 from .cute import CuteTopKHeuristic
+from .cute import CuteTransposedColumnReductionHeuristic
 from .cute import grouped_full_coverage_configs
 from .cute import grouped_row_union_carrier
 from .cute import grouped_row_union_cluster4_carrier
@@ -286,6 +287,7 @@ _CUTE_HEURISTIC_CLASSES: tuple[AutotunerHeuristicType, ...] = (
     CuteColumnReductionHeuristic,
     CuteSplitColumnReductionHeuristic,
     CuteDelinearizedRowReductionHeuristic,
+    CuteTransposedColumnReductionHeuristic,
     CuteSiblingRowHeuristic,
     CuteNestedRowHeuristic,
     CuteResidentRowHeuristic,
