@@ -236,13 +236,15 @@ TENSOR_ROUTING_OPS = (
 
 # Ops that keep a prefetching root's loads ordered although they touch no
 # memory: any loop (conservatively: its loads may decide the trip count), a
-# print or breakpoint that shows them.
+# print or breakpoint that shows them, or an assertion that checks them.
 _HINT_BREAKING_OPS = (
     _tracing_ops._for_loop,
     _tracing_ops._for_loop_step,
     _tracing_ops._while_loop,
     hl.device_print,
     hl.breakpoint,
+    torch.ops.aten._assert_async.default,
+    torch.ops.aten._assert_async.msg,
 )
 
 

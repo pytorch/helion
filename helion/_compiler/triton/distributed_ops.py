@@ -2090,8 +2090,30 @@ def _by_group(polls: list[InbandPoll]) -> dict[str, list[InbandPoll]]:
     return groups
 
 
+def _may_assert(node: torch.fx.Node, device_function: DeviceFunction) -> bool:
+    from ..device_ir import codegen_node_order
+    from ..device_ir import control_flow_child_graph_ids
+
+    assertions = (
+        torch.ops.aten._assert_async.default,
+        torch.ops.aten._assert_async.msg,
+    )
+    if node.target in assertions:
+        return True
+    children = control_flow_child_graph_ids(node)
+    return bool(children) and any(
+        child.target in assertions
+        for _, child in codegen_node_order(
+            device_function.codegen.codegen_graphs,
+            children,
+            repeat_conditions=False,
+            unreached=False,
+        )
+    )
+
+
 def flush_inband_polls(cg: CodegenInterface, node: torch.fx.Node) -> None:
-    """Wait on the pending polls of ``node``'s graph once ``node`` reads one.
+    """Wait for pending polls at their first use, a device assertion or graph end.
 
     Outside WS loops, block polls first reload together until a CTA vote finds
     them current. The per-thread spin then covers replicas the vote may skip.
@@ -2100,9 +2122,12 @@ def flush_inband_polls(cg: CodegenInterface, node: torch.fx.Node) -> None:
     polls = [
         poll for poll in device_function.inband_polls if poll.node.graph is node.graph
     ]
+    # A failing assertion in this graph or a nested branch can end the
+    # program before a later consumer forces an earlier wait.
     if not polls or (
         node.op != "output"
         and not any(poll.node in node.all_input_nodes for poll in polls)
+        and not _may_assert(node, device_function)
     ):
         return
     device_function.inband_polls = [

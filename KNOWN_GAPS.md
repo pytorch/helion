@@ -34,6 +34,30 @@ these labelled lines.
 - Why deferred: what a fix would take.
 - Pinned by: the tests that hold the current behavior, or none.
 
+## indirect-memory-effects-in-inline-assembly
+
+- Area: compiler memory dependencies for `hl.inline_asm_elementwise`.
+- What is wrong: an impure assembly snippet can store through addresses
+  loaded from a tensor. The dependency checker treats the loaded addresses
+  as ordinary computed values; it does not record the write. For example,
+  use the store from `test_dead_code_side_effects.py` with operands
+  `[addresses[t], x[t]]` in a 256-element tile, then read
+  `scratch[(t.index + 32) % 256]` into an output. If the addresses point
+  to the corresponding elements of `scratch`, the reader may run before
+  another warp's write. With Triton CPU code generation the assembly was
+  present, but there was no barrier. Replacing the assembly with
+  `scratch[t] = x[t]` emitted a barrier.
+- Since: reproduced on `main` at `a2f18c2d0`.
+- Why deferred: the assembly interface declares purity but has no way to
+  identify the memory read or written by arbitrary register operands. An
+  unknown-memory effect must reach dependency checks, reduction dimension
+  merging and schedule selection. Treating every impure snippet as reading
+  and writing all memory can introduce barriers or rule out schedules for
+  working kernels even when the snippet only inspects a register. This
+  needs its own compatibility and performance evaluation across backends.
+- Pinned by: none. The tests in `test_dead_code_side_effects.py` check that
+  the assembly survives dead-code elimination, not its memory dependencies.
+
 ## ptxas-signed-extrema-chains
 
 - Area: CuTe backend, elementwise integer extrema. The chain rule of
