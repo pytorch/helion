@@ -1,12 +1,24 @@
 # Installation
 
+Choose a backend for your hardware using {doc}`backends`. The steps below
+set up the default Triton backend on Linux; other backends have additional
+requirements.
+
+```{tip}
+On NVIDIA B200 or B300, set `HELION_BACKEND=cute` for better performance.
+Use PyTorch built with CUDA 13 or later and follow the
+{ref}`CuTe setup <cute-backend-installation>` below before running kernels.
+```
+
 ## System Requirements
 
-Helion currently targets Linux systems and requires a recent Python and PyTorch environment:
+Helion requires a recent Python and PyTorch environment compatible with the
+selected backend:
 
 ### Operating System
-- Linux-based OS
-- Other Unix-like systems may work but are not officially supported
+- Linux for the NVIDIA and AMD GPU backends
+- macOS with PyTorch MPS for the experimental Metal backend
+- A compatible TPU environment for Pallas; see {doc}`backends`
 
 ### Python Environment
 - **Python 3.10–3.14**
@@ -14,7 +26,7 @@ Helion currently targets Linux systems and requires a recent Python and PyTorch 
 
 ### Dependencies
 - **[PyTorch](https://github.com/pytorch/pytorch) 2.9 or later**
-- **[Triton](https://github.com/triton-lang/triton) 3.5 or later**
+- **[Triton](https://github.com/triton-lang/triton) 3.5 or later** for the default backend
 
   *Note: Older versions may work, but will lack support for features like TMA on Hopper/Blackwell GPUs and may exhibit lower performance.*
 
@@ -175,6 +187,7 @@ cd docs
 make html
 ```
 
+(cute-backend-installation)=
 ### CuTe Backend (CUDA 13+)
 
 To use the beta [CUTLASS CuTe DSL](https://github.com/NVIDIA/cutlass)
@@ -185,12 +198,24 @@ CUDA builds.
 Install the pinned CuTe DSL release with:
 
 ```bash
+# PyPI installation
+pip install 'helion[cute]'
+
+# From a Helion source checkout
 pip install -e '.[cute]'
-# or, equivalently, the helper that also handles the libs-cu13 reinstall ordering:
+# or, equivalently, the helper for this checkout's pinned version:
 ./scripts/install_cute.sh
+
+# Set before importing modules that define kernels
+export HELION_BACKEND=cute
 ```
 
-### GPU Requirements
+On B200/B300 this is the recommended backend for performance. An explicit
+`@helion.kernel(backend="triton")` overrides the environment variable; remove
+or update that argument when switching. See {doc}`backends` for selection
+rules and the other backends' dependencies.
+
+### Default Triton Backend GPU Requirements
 
 Matches the requirements of [Triton](https://github.com/triton-lang/triton).  At the time of writing:
 * NVIDIA GPUs (Compute Capability 8.0+)
@@ -203,3 +228,4 @@ Once installation is complete:
 
 1. **Check out the {doc}`api/index` for complete API documentation**
 2. **Explore the [examples/](https://github.com/pytorch/helion/tree/main/examples) folder for real-world patterns**
+3. **Read {doc}`backends` before comparing or deploying different backends**

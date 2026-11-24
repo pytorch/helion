@@ -110,11 +110,9 @@ fi
 if command -v uv >/dev/null 2>&1; then
   PIP_INSTALL=(uv pip install)
   PIP_UNINSTALL=(uv pip uninstall)
-  PIP_REINSTALL_NO_DEPS=(uv pip install --reinstall --no-deps)
 else
   PIP_INSTALL=(python -m pip install)
   PIP_UNINSTALL=(python -m pip uninstall -y)
-  PIP_REINSTALL_NO_DEPS=(python -m pip install --force-reinstall --no-deps)
 fi
 
 echo "==> Uninstalling any existing nvidia-cutlass-dsl* packages"
@@ -128,19 +126,8 @@ echo "==> Uninstalling any existing nvidia-cutlass-dsl* packages"
 
 echo "==> Installing nvidia-cutlass-dsl[cu13]==$CUTE_VERSION"
 "${PIP_INSTALL[@]}" \
-  "nvidia-cutlass-dsl[cu13]==$CUTE_VERSION"
-
-# The PyPI nvidia-cutlass-dsl-libs-base and -libs-cu13 wheels ship several
-# Python files (tensor.py, algorithm.py, _nvvm_enum_gen.py, nvvm_wrappers.py,
-# ...) at the same install path with conflicting content. cu13's versions
-# match the cu13 binary; libs-base's versions either reference symbols
-# missing from cu13's arch or use older API signatures. When the resolver
-# lands them in non-deterministic order and libs-base wins on disk, every
-# cute test crashes. Force-reinstall cu13 *with --no-deps* so its files are
-# the last writers on disk.
-echo "==> Reinstalling nvidia-cutlass-dsl-libs-cu13 (no deps) so its files win"
-"${PIP_REINSTALL_NO_DEPS[@]}" \
-  "nvidia-cutlass-dsl-libs-cu13==$CUTE_VERSION"
+  "nvidia-cutlass-dsl[cu13]==$CUTE_VERSION" \
+  "nvidia-cutlass-dsl-libs-base[sass]==$CUTE_VERSION"
 
 echo "==> Installing apache-tvm-ffi (required for tcgen05 TVM FFI launch)"
 "${PIP_INSTALL[@]}" apache-tvm-ffi

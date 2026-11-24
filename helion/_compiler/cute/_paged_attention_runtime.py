@@ -57,6 +57,9 @@ def _scaled_s2f6x2_to_bf16x2(
 ) -> cutlass.Int32:
     """Convert the two low signed bytes using two low UE8M0 scale bytes."""
     source = arith.trunci(T.i16(), values.ir_value(loc=loc, ip=ip), loc=loc, ip=ip)
+    source = llvm.bitcast(
+        cast("Any", ir).VectorType.get([2], T.i8()), source, loc=loc, ip=ip
+    )
     scale = arith.trunci(T.i16(), scales.ir_value(loc=loc, ip=ip), loc=loc, ip=ip)
     result = nvvm.convert_s2f6x2_to_bf16x2(
         cast("Any", ir).VectorType.get([2], cutlass.BFloat16.mlir_type),
@@ -393,12 +396,12 @@ def _load_transposed_s8_16x16(
     """Each lane receives four rows of two columns of a 16 by 16 byte tile."""
     assert pointer.alignment >= 16
     result = nvvm.ldmatrix(
-        cast("Any", llvm).StructType.get_literal([T.i32(), T.i32()]),
         pointer.llvm_ptr,
         2,
         nvvm.MMALayout.col,
         shape=nvvm.LoadShape.M16N16,
         src_format=nvvm.LoadSrcFormat.B8,
+        results=[cast("Any", llvm).StructType.get_literal([T.i32(), T.i32()])],
         loc=loc,
         ip=ip,
     )

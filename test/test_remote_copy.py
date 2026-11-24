@@ -199,6 +199,9 @@ def _remote_copy_with_unrelated_loop_input(
     """Keep an ordinary loop input independent of remote-copy placement."""
     num_steps = hl.specialize(src.size(1))
     for _program in hl.grid(1):
+        # Pallas initializes each rank's destination before entering the body.
+        # A peer must finish that initialization before we send into its buffer.
+        hl.remote_barrier(peers[0, :])
         for step in hl.tile(num_steps, block_size=1):
             copy = hl.make_async_remote_copy(
                 src,

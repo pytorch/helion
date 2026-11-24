@@ -27,16 +27,16 @@ if TYPE_CHECKING:
 _NATIVE_FILE_MARKERS = (".so", ".dylib", ".dll", ".pyd")
 QUACK_REPOSITORY = "https://github.com/Dao-AILab/quack"
 # The pinned post-release source still reports the preceding release version.
-QUACK_PACKAGE_METADATA_VERSION = "0.6.4"
-QUACK_BASE_RELEASE_TAG = "v0.6.4"
-QUACK_COMMIT = "c8ec3170057987da0ec99883736f381ea1937cf3"
+QUACK_PACKAGE_METADATA_VERSION = "0.6.5"
+QUACK_BASE_RELEASE_TAG = "v0.6.5"
+QUACK_COMMIT = "f1ce94e35573eac6bce742c0f1562ab1db15079c"
 QUACK_BENCHMARK_LABEL = (
     f"quack-main@{QUACK_COMMIT[:8]} (post-{QUACK_BASE_RELEASE_TAG}, non-release)"
 )
 QUACK_DEPENDENCY_VERSIONS = {
-    "nvidia-cutlass-dsl": "4.7.0",
-    "apache-tvm-ffi": "0.1.13.post3",
-    "torch-c-dlpack-ext": "0.1.5",
+    "nvidia-cutlass-dsl": "4.8.1",
+    "apache-tvm-ffi": "0.1.16",
+    "numpy": "2.5.5",
     "einops": "0.8.2",
 }
 

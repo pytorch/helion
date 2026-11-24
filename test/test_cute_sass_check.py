@@ -7,6 +7,7 @@ Python: no GPU, no DSL."""
 
 from __future__ import annotations
 
+import importlib.metadata
 import struct
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -358,9 +359,11 @@ def test_disassemble_needs_the_disassembler() -> None:
 
 
 def test_the_bundled_nvdisasm_is_found() -> None:
-    # The CuTe DSL depends on the nvidia-cuda-nvdisasm wheel; where it is
+    # Helion's cute extra installs the nvidia-cuda-nvdisasm wheel; where it is
     # installed the probe finds its binary (the environment this repository
     # tests the cute backend in).
     pytest.importorskip("cutlass")
+    # A system toolkit binary must not hide a missing package dependency.
+    assert importlib.metadata.distribution("nvidia-cuda-nvdisasm").version
     path = cutedsl_compat.nvdisasm_path()
     assert path is not None and path.endswith("nvdisasm")

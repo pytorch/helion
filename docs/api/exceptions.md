@@ -344,7 +344,13 @@ These exceptions occur when Helion language functions are used incorrectly with 
 
 ## Warning Classes
 
-Warnings can be suppressed by including them in the `ignore_warnings` setting:
+The `ignore_warnings` setting controls compiler warning classes. Backend maturity
+warnings and hardware recommendations (such as selecting CuTe on B200/B300)
+are once-per-process Python `UserWarning`s, controlled by Python's warning
+filters instead.
+
+Suppress any of the compiler warning classes below by including it in
+`ignore_warnings`:
 
 ```{eval-rst}
 .. autoclass:: TensorOperationInWrapper
@@ -384,10 +390,10 @@ def my_kernel(x):
         pass
 
 
-# Suppress ALL warnings by using BaseWarning
+# Suppress all compiler warning classes by using BaseWarning
 @helion.kernel(ignore_warnings=[helion.exc.BaseWarning])
 def quiet_kernel(x):
-    # This kernel will suppress all Helion warnings
+    # This kernel will suppress Helion's compiler warning classes
     pass
 ```
 

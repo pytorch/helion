@@ -8,7 +8,15 @@ This set of tutorials is meant to teach you how to use Helion from first princip
 
 ## Setup
 
-First, let's install the necessary dependencies. Helion requires a recent version of PyTorch and a development version of Triton.
+Follow {doc}`installation` to install PyTorch, Helion and the dependencies
+for your chosen backend. See {doc}`backends` for the supported hardware and
+backend status.
+
+On NVIDIA B200/B300, install the CuTe dependencies and set
+`HELION_BACKEND=cute` before defining the tutorial kernels for better
+performance. These examples use CUDA tensors. Their explicit configurations
+are teaching examples; retune for the selected backend and hardware when
+measuring performance.
 
 ```python
 import logging
@@ -18,7 +26,7 @@ import helion.language as hl
 import torch
 from torch import Tensor
 
-# If you set this to info you will see the output Triton Code
+# Set HELION_PRINT_OUTPUT_CODE=1 before defining kernels to see generated code.
 logging.getLogger().setLevel(logging.WARNING)
 ```
 

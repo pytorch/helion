@@ -54,9 +54,9 @@ if TYPE_CHECKING:
 # mirror: ``PipelineTmaUmma.create`` / ``PipelineUmmaAsync.create`` minus the
 # serial warp-0 mbarrier init (``MbarrierArray.__init__``'s fields and
 # validation, the ``_compute_*`` mask helpers, ``_get_thread_arrive_count``,
-# ``MbarrierLayout.V0``, ``register_barrier``).  4.7.1 (what fbcode runs)
-# ships ``cutlass/pipeline`` byte-identical to 4.7.0.
-SPLIT_INIT_VALIDATED_DSL_VERSIONS = frozenset({Version("4.7.0"), Version("4.7.1")})
+# ``MbarrierLayout.V0``, ``register_barrier``). 4.8.1 preserves the mirrored
+# constructors and their barrier initialization surface from 4.7.0.
+SPLIT_INIT_VALIDATED_DSL_VERSIONS = frozenset({Version("4.8.1")})
 # The exact surface the mirror was lifted from: ``MbarrierArray.__init__``'s
 # parameters and the two pipeline dataclasses' field order (positional
 # construction below).

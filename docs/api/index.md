@@ -2,6 +2,9 @@
 
 Complete API documentation for Helion.
 
+For backend choices, status, hardware support and installation requirements,
+start with {doc}`../backends`.
+
 ## Kernel Creation and Control
 
 Everything you need to create and configure Helion kernels using the {func}`helion.kernel` decorator:

@@ -93,7 +93,7 @@ def test_split_init_probe_follows_the_patched_dsl_version():
     assert split_barrier_init_supported() is True
     with patch(
         "helion._compiler.cute.cutedsl_compat._installed_cute_dsl_version",
-        return_value=_CuteDSLVersionProbe(version=Version("4.8.0")),
+        return_value=_CuteDSLVersionProbe(version=Version("4.8.2")),
     ):
         assert rt.split_barrier_init_supported() is False
         assert split_barrier_init_supported() is False

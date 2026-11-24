@@ -25,6 +25,16 @@ tuned configs, which is the recommended approach for production workloads.
 
 ## Run Autotuning Jobs
 
+Select the backend before tuning, and use the same backend in production.
+On NVIDIA B200/B300, we recommend `HELION_BACKEND=cute` for better
+performance, with the {ref}`CuTe dependencies <cute-backend-installation>`
+installed. Set the environment variable before importing your kernel module;
+an explicit `backend=` decorator argument overrides it.
+
+Retune when changing backend or target hardware. Explicit `Config` objects
+may contain backend-specific options, and should not be copied between
+backends as performance presets. See {doc}`backends` for selection guidance.
+
 The simplest way to launch autotuning straight through the kernel call:
 
 ```python
@@ -766,12 +776,12 @@ has shapes baked in, which often provides a performance boost.
 If you need to support multiple input types, bind multiple times with
 representative inputs.
 
-Alternately, you can export Triton source with
-`bound.to_triton_code(small_cfg)` to drop Helion from your serving
-environment altogether, embedding the generated kernel in a custom
-runtime.  The Triton kernels could then be compiled down into PTX/cubins
-to further remove Python from the critical path, but details on this
-are beyond the scope of this document.
+Alternatively, export source for the selected backend with
+`bound.to_code(small_cfg, options=helion.OutputCodeOptions(allow_helion_deps=False))`
+to remove Helion from the serving environment. The exported module still
+needs PyTorch and that backend's runtime dependencies. Supported export paths
+and specialization constraints are described in
+{ref}`standalone-export`.
 
 ## Ahead-of-Time (AOT) Heuristic Tuning
 

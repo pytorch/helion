@@ -69,6 +69,7 @@ from helion.autotuner.benchmarking import do_bench_generic
 from helion.autotuner.kernel_args import load_trusted_kernel_args
 from helion.autotuner.logger import AutotuningLogger
 from helion.autotuner.logger import match_device_out_of_memory
+from helion.autotuner.logger import match_unrecoverable_runtime_error
 from helion.autotuner.metrics import AutotuneMetrics
 from helion.autotuner.precompile_future import SerializedCompiledFunction
 from helion.autotuner.precompile_future import _load_compiled_fn
@@ -2762,6 +2763,21 @@ class TestBenchmarkWorkerFailureModes(unittest.TestCase):
             worker.shutdown()
 
     @pytest.mark.slow
+    def test_xpu_device_lost_kills_worker(self) -> None:
+        message = (
+            "level_zero backend failed with error: 20 (UR_RESULT_ERROR_DEVICE_LOST)"
+        )
+        worker = BenchmarkWorker()
+        try:
+            with self.assertRaises(RuntimeError) as ctx:
+                worker.run(_RaiseRuntimeError(message), timeout=30.0)
+            self.assertIn("UR_RESULT_ERROR_DEVICE_LOST", str(ctx.exception))
+            self.assertFalse(worker.alive())
+            self.assertEqual(worker.run(_ReturnValue(42), timeout=30.0), 42)
+        finally:
+            worker.shutdown()
+
+    @pytest.mark.slow
     def test_worker_crash_raises_died(self) -> None:
         worker = BenchmarkWorker()
         try:
@@ -2892,6 +2908,23 @@ class TestBenchmarkWorkerFailureModes(unittest.TestCase):
             "CUDA error: an illegal memory access was encountered",
         ):
             self.assertFalse(match_device_out_of_memory(RuntimeError(message)), message)
+
+    def test_unrecoverable_runtime_error_matches_xpu_device_lost(self) -> None:
+        for message in (
+            "level_zero backend failed with error: 20 (UR_RESULT_ERROR_DEVICE_LOST)",
+            "ZE_RESULT_ERROR_DEVICE_LOST",
+        ):
+            self.assertTrue(
+                match_unrecoverable_runtime_error(RuntimeError(message)), message
+            )
+        self.assertFalse(
+            match_unrecoverable_runtime_error(
+                RuntimeError(
+                    "Error during Intel kernel launch: level_zero backend failed "
+                    "with error: 40 (UR_RESULT_ERROR_OUT_OF_RESOURCES)"
+                )
+            )
+        )
 
 
 @pytest.mark.cpu_only

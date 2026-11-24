@@ -21,6 +21,7 @@ from helion._compiler.cute.autotune.heuristics import cute as heuristics
 from helion._compiler.cute.autotune.heuristics.cute import (
     CuteTcgen05GroupedWorklistHeuristic,
 )
+from helion._compiler.cute.cutedsl_compat import _cute_backend_requirement_error
 from helion._compiler.cute.cutedsl_compat import _CuteDSLVersionProbe
 from helion._compiler.cute.cutedsl_compat import tcgen05_runtime_n_ptx_compatible
 from helion._compiler.cute.tcgen05_constants import (
@@ -40,6 +41,15 @@ from helion.runtime.cute.launcher import _validate_tcgen05_grouped_device_split_
 SOURCE = "tcgen05_grouped_worklist_source_m_tile"
 MODE = "tcgen05_grouped_mode"
 SHIFTED = "tcgen05_grouped_d_shift"
+
+
+@pytest.fixture
+def isolated_cute_requirement_cache():
+    _cute_backend_requirement_error.cache_clear()
+    try:
+        yield
+    finally:
+        _cute_backend_requirement_error.cache_clear()
 
 
 def _config(cluster_m: int, block_k: int) -> helion.Config:
@@ -159,6 +169,8 @@ def test_source128_launcher_rejects_other_metadata_and_geometry(
 
 
 @pytest.mark.parametrize("metadata_kind", ["offsets", "split_sizes"])
+@pytest.mark.cpu_only
+@pytest.mark.usefixtures("isolated_cute_requirement_cache")
 def test_typed_device_seeds_and_promotion_survive_newer_dsl(
     metadata_kind: str,
 ) -> None:
@@ -178,7 +190,7 @@ def test_typed_device_seeds_and_promotion_survive_newer_dsl(
         mock_cuda_unavailable(),
         patch(
             "helion._compiler.cute.cutedsl_compat._installed_cute_dsl_version",
-            return_value=_CuteDSLVersionProbe(version=Version("4.8.0")),
+            return_value=_CuteDSLVersionProbe(version=Version("4.8.2")),
         ),
     ):
         assert not tcgen05_runtime_n_ptx_compatible()
@@ -246,6 +258,8 @@ def test_source128_seeds_reach_a_cold_full_initial_population() -> None:
             random.setstate(state)
 
 
+@pytest.mark.cpu_only
+@pytest.mark.usefixtures("isolated_cute_requirement_cache")
 def test_external_worklist_retains_the_runtime_n_dsl_gate() -> None:
     kernel = helion.kernel(
         _grouped_worklist_kernel_body,
@@ -264,7 +278,7 @@ def test_external_worklist_retains_the_runtime_n_dsl_gate() -> None:
         mock_cuda_unavailable(),
         patch(
             "helion._compiler.cute.cutedsl_compat._installed_cute_dsl_version",
-            return_value=_CuteDSLVersionProbe(version=Version("4.8.0")),
+            return_value=_CuteDSLVersionProbe(version=Version("4.8.2")),
         ),
     ):
         bound = cpu_bind(kernel, args)

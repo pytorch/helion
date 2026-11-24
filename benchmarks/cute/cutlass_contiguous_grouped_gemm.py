@@ -21,10 +21,10 @@ if TYPE_CHECKING:
 
 CUTLASS_REPOSITORY = "https://github.com/NVIDIA/cutlass"
 # Match Helion's repository-wide, validated CuTe DSL pin.
-CUTLASS_RELEASE_TAG = "v4.7.0"
-CUTLASS_COMMIT = "dcf215af68a2d08d305076c152a06f201728cd53"
-CUTLASS_DSL_VERSION = "4.7.0"
-CUTLASS_OPERATOR_API_VERSION = "0.2.0"
+CUTLASS_RELEASE_TAG = "v4.8.1"
+CUTLASS_COMMIT = "2c85f497547eb441f0fe80bfb0fb2e6f9add1719"
+CUTLASS_DSL_VERSION = "4.8.1"
+CUTLASS_OPERATOR_API_VERSION = "0.3.0"
 CUTLASS_SELECTION_MIN_REPETITIONS = 32
 CUTLASS_SELECTION_CAPTURE_WARMUPS = 2
 CUTLASS_TARGET_SMS = {
@@ -40,7 +40,7 @@ _PINNED_DEPENDENCIES = {
     "nvidia-cutlass-dsl-libs-base": CUTLASS_DSL_VERSION,
     "nvidia-cutlass-dsl-libs-core": CUTLASS_DSL_VERSION,
     "nvidia-cutlass-dsl-libs-cu13": CUTLASS_DSL_VERSION,
-    "apache-tvm-ffi": "0.1.13.post3",
+    "apache-tvm-ffi": "0.1.16",
     "torch-c-dlpack-ext": "0.1.5",
 }
 
