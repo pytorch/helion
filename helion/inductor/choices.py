@@ -12,6 +12,9 @@ from torch._inductor.choices import FusionScore
 from torch._inductor.choices import InductorChoices
 from torch._inductor.choices import Sortable
 from torch._inductor.ir import ComputedBuffer
+from torch._inductor.ir import Pointwise
+from torch._inductor.ir import StorageBox
+from torch._inductor.ir import TensorBox
 from torch._inductor.scheduler import FusedMixOrderReductions
 from torch._inductor.scheduler import MixOrderReduction
 from torch._inductor.utils import sympy_product
@@ -139,6 +142,22 @@ def static_layout(node: IRNode) -> bool:
     return all(isinstance(expr, (int, sympy.Integer)) for expr in exprs)
 
 
+def is_pad(node: IRNode) -> bool:
+    """Whether operand node is itself a pad not yet computed: a
+    TensorBox(StorageBox(Pointwise)) that reads one buffer through ops.masked, as
+    constant_pad_nd lowers to (e.g. the pad that Inductor's pad_mm adds to align a
+    matmul's dim). A pad behind a view, as the view that folds a padded 3-D
+    activation into a Linear's mm, is not recognized and stays inlined."""
+    if not (isinstance(node, TensorBox) and isinstance(node.data, StorageBox)):
+        return False
+    pointwise = node.data.data
+    return (
+        isinstance(pointwise, Pointwise)
+        and "masked" in pointwise.inner_fn_opcount().used_ops
+        and len(pointwise.get_read_names()) == 1
+    )
+
+
 class HelionChoices(InductorChoices):
     """Inductor's heuristics, with the changes the methods below make for
     cuda_backend "helion". The first: the matmuls a Helion kernel emits are
@@ -164,11 +183,14 @@ class HelionChoices(InductorChoices):
         shows still fails: an operand with an indirect load that needs a bounds
         check, as in a[i] @ b with an i of unknown range, or a fused epilogue
         that Helion does not emit, as in a @ b + torch.tensor(2.0) with the
-        scalar on the CPU."""
+        scalar on the CPU.
+
+        With the CuTe backend, it also gives a pad operand (is_pad()) a kernel of
+        its own."""
         device = mat1.get_device_or_error()
         if not (device.type == "cuda" and inductor_config.cuda_backend == "helion"):
             return super().use_native_matmul(mat1, mat2)
-        return (
+        native = (
             config.native_matmul
             and python_wrapper()
             and not numerics_modes()
@@ -179,6 +201,32 @@ class HelionChoices(InductorChoices):
             # native matmul does not take them yet. The sizes are static here.
             and min(int(n) for n in (*mat1.get_size()[-2:], mat2.get_size()[-1])) > 1
         )
+        if native and config.backend == "cute":
+            # A pad is computed by its own kernel, and the dot reads its buffer
+            # as tiles. For a @ b with b [512, 197951] column-major, whose N
+            # pad_mm pads to 197952:
+            #     # helion_fused_mm_0: the pad
+            #     for tile_y, tile_x in hl.tile([512, 197952]):
+            #         ...
+            #         out0[tile_y, tile_x] = tmp12.to(torch.bfloat16)
+            #     # helion_fused_mm_1: the matmul
+            #         tmp1 = in1[tile_r, tile_x]
+            #         acc = torch.addmm(acc, tmp0, tmp1)
+            # Inlined in the dot, each [tile_r, tile_x] tile of the pad is
+            # recomputed for every tile_y, by a masked flat load of b:
+            #     tmp6 = hl.load(in1, [tile_r.index.reshape([tile_r, 1]) + 512*(tile_x.index)], extra_mask=tmp5).to(torch.float32)
+            #     tmp8 = torch.where(tmp5, tmp6, tmp7)
+            #     ...
+            #     acc = torch.addmm(acc, tmp0, tmp14)
+            # which CuTe runs on its SIMT dot: 50.5 ms against 1.0 ms for both
+            # kernels (256 x 197951 x 512 on a B200, default configs). Triton
+            # keeps the pad in the dot, where it costs the mask arithmetic of
+            # loads the dot makes anyway: 125 us, against 486 us for both
+            # kernels, whose pad reads and writes all of b.
+            for operand in (mat1, mat2):
+                if is_pad(operand):
+                    operand.realize()
+        return native
 
     @staticmethod
     def should_use_persistent_reduction(
