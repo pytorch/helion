@@ -2083,21 +2083,46 @@ def kernel(in0: torch.Tensor, out0: torch.Tensor, out1: torch.Tensor) -> None:
         self.assertIn("acc = acc + torch.sum(", first)
 
     def test_split_reduction_keeps_unaligned_producer(self):
-        # An output in the layout of an input whose H and W are swapped
-        # (strides [31360, 1, 40, 1120]), which the split reads with // and %
-        # of its chunk index: the pointwise node keeps its kernel.
+        # A sum over every other W of a returned output, which the split
+        # reads two elements apart: no reindex of the output's loops makes
+        # them the split's, and the pointwise node keeps its kernel.
         self.enterContext(config.patch({"triton.mix_order_reduction": True}))
         f32 = torch.float32
-        a = randn(16, 28, 28, 40, dtype=f32).permute(0, 3, 2, 1)
-        b = randn(16, 40, 28, 28, dtype=f32).to(memory_format=torch.channels_last)
+        a = randn(32, 40, 28, 56, dtype=f32).to(memory_format=torch.channels_last)
+        b = randn(32, 40, 28, 56, dtype=f32).to(memory_format=torch.channels_last)
 
         def fn(a, b):
             y = a + b
-            return y, y.sum([0, 2, 3])
+            return y, y[..., ::2].sum([0, 2, 3])
 
         first, second, _ = self.compile(fn, a, b, tol=1e-3)
         self.assertNotIn("acc", first)
         self.assertIn("acc = acc + torch.sum(", second)
+
+    def test_reduction_in_memory_order(self):
+        # A sum over N, H and W of the returned sum of a channels-last tensor
+        # whose H and W are swapped in memory and another one, reduced over N,
+        # W and H (reduce_in_memory_order()): the split's first kernel reads
+        # the output as tiles, not by // and % of (n, h, w), and
+        # computes, stores and sums it,
+        #     tmp0 = in0[tile_y, tile_r, tile_x].to(torch.float32)
+        #     out0[tile_y, tile_r, tile_x] = tmp2.to(torch.bfloat16)
+        #     acc = acc + torch.sum(tmp2, -2)
+        self.enterContext(config.patch({"triton.mix_order_reduction": True}))
+
+        def fn(a, b):
+            y = a + b
+            return y, y.sum([0, 2, 3]).float()
+
+        cl = torch.channels_last
+        # [64, 48, 14, 14]: a stored as [N, W, H, C], b as [N, H, W, C]
+        a = randn(64, 14, 14, 48).permute(0, 3, 2, 1)
+        b = randn(64, 48, 14, 14).to(memory_format=cl)
+        first, second = self.compile(fn, a, b, tol=2e-2)
+        self.assertIn("in0[tile_y, tile_r, tile_x]", first)
+        self.assertRegex(first, r"out0\[tile_y, tile_r, tile_x\] = ")
+        self.assertIn("acc = acc + torch.sum(", first)
+        self.assertIn("torch.sum(tmp0, -2)", second)
 
     def test_unsplit_reduction_keeps_its_producer(self):
         # A sum over y that Inductor does not split (an x of 16384 over a y

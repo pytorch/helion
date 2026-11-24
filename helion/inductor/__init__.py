@@ -50,6 +50,7 @@ from .codegen.overrides import HelionPrinter
 from .codegen.scheduling import HelionScheduling
 from .codegen.scheduling import Unsupported
 from .fx_passes.post_grad import HelionPostGradPass
+from .lowering import register_lowerings
 
 __all__ = [
     "HelionChoices",
@@ -72,10 +73,11 @@ def _register() -> None:
     """Make "helion" a value of torch._inductor.config.cuda_backend: Inductor's
     CUDA registration maps the others to their schedulings, and has no entry for
     this one. Also registers HelionChoices, helion.inductor.config as the
-    options' "helion." namespace, which puts it in the FX graph cache key, and
+    options' "helion." namespace, which puts it in the FX graph cache key,
     HelionPostGradPass as the CUDA custom backend pass, after any registered
-    before it."""
+    before it, and the user lowerings of helion.inductor.lowering."""
     register_inductor_choices("helion", HelionChoices)
+    register_lowerings()
     common.custom_backend_codegen_configs["helion"] = cast("ConfigModule", config)
     common.init_backend_registration()
     default = common.device_codegens["cuda"]

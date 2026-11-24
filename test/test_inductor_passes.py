@@ -9,6 +9,7 @@ from unittest.mock import patch
 import pytest
 import torch
 from torch._inductor import config
+from torch._inductor import lowering as inductor_lowering
 from torch._inductor.custom_graph_pass import CustomGraphModulePass
 from torch._inductor.decomposition import select_decomp_table
 from torch._inductor.virtualized import V
@@ -28,6 +29,9 @@ from helion.inductor.fx_passes import post_grad
 from helion.inductor.fx_passes.cat_reductions import pointwise
 from helion.inductor.fx_passes.cat_reductions import split_cat_reductions
 from helion.inductor.fx_passes.post_grad import HelionPostGradPass
+from helion.inductor.lowering.reduction_order import REDUCTIONS
+from helion.inductor.lowering.reduction_order import memory_order_permutation
+from helion.inductor.lowering.reduction_order import register_reduction_order_lowerings
 
 pytestmark = pytest.mark.cpu_only
 
@@ -64,6 +68,7 @@ class TestSourceHash(TestCase):
             "fx_passes/cat_reductions.py",
             "fx_passes/online_softmax.py",
             "fx_passes/post_grad.py",
+            "lowering/reduction_order.py",
         }
         self.assertLessEqual(expected, hashed)
 
@@ -93,6 +98,62 @@ class TestPostGradPass(TestCase):
         ):
             HelionPostGradPass(None)(gm)
         self.assertEqual(graphs, [gm.graph])
+
+
+class TestReductionOrder(TestCase):
+    def test_reduced_dims_in_memory_order(self):
+        # The permutation that puts the reduced dims of the input in the order
+        # of their strides, at their own positions: a sum over N, H and W of a
+        # channels-last [128, 160, 28, 28] whose H and W are swapped in memory
+        # (strides [125440, 1, 160, 4480]) reduces over N, W and H.
+        def strided(size, stride):
+            return torch.empty_strided(size, stride, dtype=torch.bfloat16)
+
+        swapped = strided((128, 160, 28, 28), (125440, 1, 160, 4480))
+        self.assertEqual(memory_order_permutation(swapped, [0, 2, 3]), [0, 1, 3, 2])
+        self.assertEqual(memory_order_permutation(swapped, [-1, -2]), [0, 1, 3, 2])
+        # Kept dims stay where they are, whatever their strides: over C and H,
+        # H (stride 160) comes first, then C (stride 1).
+        self.assertEqual(memory_order_permutation(swapped, [1, 2]), [0, 2, 1, 3])
+        # Reduced dims in memory order already: NCHW, channels-last.
+        nchw = strided((128, 160, 28, 28), (125440, 784, 28, 1))
+        self.assertIsNone(memory_order_permutation(nchw, [0, 2, 3]))
+        nhwc = strided((128, 160, 28, 28), (125440, 1, 4480, 160))
+        self.assertIsNone(memory_order_permutation(nhwc, [0, 2, 3]))
+        # A transposed 2-D tensor reduced over every dim (dims None or []).
+        transposed = strided((48, 40), (1, 48))
+        self.assertEqual(memory_order_permutation(transposed, None), [1, 0])
+        self.assertEqual(memory_order_permutation(transposed, []), [1, 0])
+        # aten.any.dims keeps every dim for [] (the others reduce them all):
+        # nothing to permute.
+        self.assertIsNone(
+            memory_order_permutation(transposed, [], empty_reduces_all=False)
+        )
+        self.assertEqual(
+            memory_order_permutation(transposed, None, empty_reduces_all=False), [1, 0]
+        )
+        self.assertEqual(
+            tuple(aten.any.dims(torch.ones(2, 3, dtype=torch.bool), []).shape), (2, 3)
+        )
+        # A dim of one element has no place in memory.
+        single = strided((1, 6, 5), (1, 1, 6))
+        self.assertIsNone(memory_order_permutation(single, [0, 2]))
+        # Three reduced dims, a kept dim between them: [8, 3, 5, 7] stored as
+        # [7, 3, 8, 5].
+        mixed = strided((8, 3, 5, 7), (5, 40, 1, 120))
+        self.assertEqual(memory_order_permutation(mixed, [0, 2, 3]), [3, 1, 0, 2])
+        # A 0-dim tensor, which a sum over dim 0 or -1 reduces too.
+        scalar = torch.tensor(1.0)
+        for dims in ([0], [-1], None):
+            self.assertIsNone(memory_order_permutation(scalar, dims))
+
+    def test_registering_again_keeps_one_wrapper(self):
+        # helion.inductor._register() runs again in tests: a second wrapper
+        # would permute the input twice, which undoes a swap of two dims.
+        before = {op: inductor_lowering.user_lowerings.get(op) for op in REDUCTIONS}
+        register_reduction_order_lowerings()
+        after = {op: inductor_lowering.user_lowerings.get(op) for op in REDUCTIONS}
+        self.assertEqual(after, before)
 
 
 class TestCatReductions(TestCase):
