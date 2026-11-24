@@ -2682,6 +2682,11 @@ def vloop_sink_off_config(config: Config) -> Config:
     unroll of the grid lane loops (``unroll_lane_loads.py``), which
     ``LaneUnrollNotApplied`` switches off in turn where no lane loop takes
     it, so a knob-on config that sinks nothing generates the code of the
-    knob-off config with the same unroll.
+    knob-off config with the same unroll.  ``cute_accumulate_stores`` goes
+    with it: the knob asks for the sink (``sinks_vector_packets``), and on
+    the scalar lanes a failed sink leaves, its stores between one lane's
+    loads and the next one's would keep one load in flight per lane.
     """
-    return Config.from_dict({**config.config, "cute_vloop_sink": False})
+    return Config.from_dict(
+        {**config.config, "cute_vloop_sink": False, "cute_accumulate_stores": False}
+    )

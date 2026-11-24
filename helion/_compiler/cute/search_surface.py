@@ -326,6 +326,14 @@ def register_search_surface(device_ir: DeviceIR, config_spec: ConfigSpec) -> Non
     config_spec.cute_carried_tile_sum_blocks = (
         frozenset() if config_spec.matmul_facts else carried_tile_sum_blocks(device_ir)
     )
+    # An hl.tile loop body that reduces and stores a value that reads none of
+    # its reductions: running the store in the lane split's accumulate pass
+    # is tunable (``cute_accumulate_stores``), not in a kernel with a matmul.
+    from .lane_loops.split import accumulate_store_sites
+
+    config_spec.cute_accumulate_store_sites = (
+        not config_spec.matmul_facts and accumulate_store_sites(device_ir)
+    )
     # A flattened gather along one tile stored along another, in dtypes that
     # have packets: staging the stores in shared memory is tunable
     # (``cute_staged_store``), and so are the gather's packet loads

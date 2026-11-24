@@ -39,6 +39,7 @@
  "test/test_control_flow.py": 7.1,
  "test/test_cross_loop_codegen.py": 2.4,
  "test/test_custom_op.py": 2.2,
+ "test/test_cute_accumulate_stores_cuda.py": 8.2,
  "test/test_cute_affine_pointer_prefix.py": 31.1,
  "test/test_cute_arange_axis_leader_guard.py": 17.0,
  "test/test_cute_arange_index_atomics.py": 11.9,

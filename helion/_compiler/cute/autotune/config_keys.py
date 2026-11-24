@@ -223,6 +223,7 @@ CUTE_MISC_SCHEDULE_KEYS: tuple[str, ...] = (
     "cute_predicated_element_loads",
     "cute_store_packet_tiers",
     "cute_defer_tile_reduce",
+    "cute_accumulate_stores",
     "cute_staged_store",
     "cute_dot_fragment_mma",
     "cute_dot_ring_mma",

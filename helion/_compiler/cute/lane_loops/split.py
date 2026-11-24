@@ -103,6 +103,10 @@ if TYPE_CHECKING:
     from collections.abc import Mapping
     from collections.abc import Sequence
 
+    import torch
+
+    from ...device_ir import DeviceIR
+
 
 def split_lane_loop_reductions(
     body: list[ast.AST],
@@ -1166,6 +1170,61 @@ def _split_one_lane_loop(
     else:
         carry_indices = set()
 
+    marker_dependencies = [
+        (marker, _forward_live_names(body, {marker.result_var}))
+        for _, marker in markers
+    ]
+    thread_axes_before, scalar_defs_before = _statement_provenance_before(
+        body,
+        thread_axis_names,
+        scalar_definitions,
+        rename_groups,
+    )
+    # The stores that read no reduction result join the accumulate pass, with
+    # their producers, instead of the consume pass that would run the
+    # producers a second time (_accumulate_pass_stores()).
+    early_stores = (
+        _accumulate_pass_stores(
+            body,
+            lane_var,
+            markers,
+            [
+                index
+                for index in tail_indices
+                if index not in marker_indices
+                and index not in carry_indices
+                and index not in phase1_index_set
+            ],
+            phase1_index_set,
+            lambda stmt: (
+                not _lane_reduction_owner_exprs_for_statement(
+                    stmt,
+                    markers,
+                    marker_dependencies,
+                    thread_axes_before.get(id(stmt), thread_axis_names),
+                    scalar_defs_before.get(id(stmt), {}),
+                )
+            ),
+            proven_disjoint_tensor_pairs,
+            proven_tensor_stride_values,
+            _static_lane_loop_extent(loop),
+            rename_groups,
+        )
+        if running_sum is None and _accumulate_stores_enabled()
+        else {}
+    )
+    if early_stores:
+        # The knob takes effect only behind sunk packets (it asks for
+        # cute_vloop_sink): marked as shaping the code, a sink that then
+        # fires nowhere regenerates the kernel without either
+        # (VloopSinkNotApplied, vloop_sink_off_config()), instead of keeping
+        # the stores between one scalar lane's loads and the next one's.
+        DeviceFunction.current().cute_state.lanes.vloop_sink_shaped_code = True
+    for index, producers in early_stores.items():
+        phase1_index_set.update(producers)
+        phase1_index_set.add(index)
+    phase1_indices = sorted(phase1_index_set)
+
     prefix: list[ast.AST] = []  # acc init statements (outside the lane loops)
     # Under register reloads (cute_reduction_reloads "register"), the
     # producers of the reductions' inputs that read no lane run once, ahead
@@ -1176,8 +1235,9 @@ def _split_one_lane_loop(
     # were loaded for each of a thread's 4 lanes of the row (the unrolled
     # lanes keep the cache-hinted loads apart); 30.3 -> 28.7 us on a
     # [32, 16, 128, 128] attention-mask softmax backward (GB300).  Only
-    # loads and pure computations move: the accumulate pass stores nothing,
-    # so no access of the loop can change what they read.  A float value
+    # loads and pure computations move, and no access of the loop can change
+    # what they read: the accumulate pass stores only into tensors that no
+    # other access of the loop touches (_accumulate_pass_stores()).  A float value
     # moved out of the loop can let LLVM contract the loop's multiply-adds
     # differently (hoist_lane_invariant_loads moves integers only, to keep
     # every result bit for bit), so the move is the register mode's, which
@@ -1217,7 +1277,9 @@ def _split_one_lane_loop(
     phase2_indices = [
         index
         for index in tail_indices
-        if index not in marker_indices and index not in carry_indices
+        if index not in marker_indices
+        and index not in carry_indices
+        and index not in early_stores
     ]
     phase2_body = [body[index] for index in phase2_indices]
 
@@ -1235,16 +1297,6 @@ def _split_one_lane_loop(
     # the two loops unless the consume loop's accesses order it after them
     # (``_lane_invariant_tail_after_consume``).
     lane_varying_names = _lane_varying_names(phase2_body, lane_var, rename_groups)
-    marker_dependencies = [
-        (marker, _forward_live_names(body, {marker.result_var}))
-        for _, marker in markers
-    ]
-    thread_axes_before, scalar_defs_before = _statement_provenance_before(
-        body,
-        thread_axis_names,
-        scalar_definitions,
-        rename_groups,
-    )
 
     def is_lane_varying(stmt: ast.AST) -> bool:
         return _is_lane_varying_statement(
@@ -1373,6 +1425,237 @@ def _split_one_lane_loop(
         rename_groups,
         running_sum=running_sum,
     )
+    return result
+
+
+def accumulate_store_sites(device_ir: DeviceIR) -> bool:
+    """Whether the body of some ``hl.tile`` device loop of ``device_ir``
+    reduces and stores a value that reads none of its reductions
+    (``out[tile_r, tile_x] = y`` beside ``acc = acc + y.sum(0)``): where
+    ``cute_accumulate_stores`` can move a store (``register_search_surface``
+    offers it to kernels without a matmul).  Structure only: whether the
+    config splits the loop in two passes, and whether the stored tensor is
+    the loop's alone, are the config's and the code's, and where they fail
+    the knob leaves the code as it is.
+
+    A reduction over a whole rdim (a persistent or rolled reduction, outside
+    such a loop) has a stash of its own for the consume pass's values
+    (``cute_reduction_reloads`` "register", ``_stash_lane_frontier()``), and
+    its kernels keep their search space: the knob is not offered there."""
+    from ....language.memory_ops import store
+    from ...device_ir import ForLoopGraphInfo
+    from ...inductor_lowering import ReductionLowering
+
+    for info in device_ir.graphs:
+        # A rolled reduction's loop is a ReductionLoopGraphInfo, a subclass.
+        if type(info) is not ForLoopGraphInfo:
+            continue
+        reduced: set[torch.fx.Node] = set()
+        for node in info.graph.nodes:
+            if isinstance(node.meta.get("lowering"), ReductionLowering) or any(
+                arg in reduced for arg in node.all_input_nodes
+            ):
+                reduced.add(node)
+        if reduced and any(
+            node not in reduced
+            for node in info.graph.find_nodes(op="call_function", target=store)
+        ):
+            return True
+    return False
+
+
+def _accumulate_stores_enabled() -> bool:
+    """Whether the config moves the stores that read no reduction result
+    into the accumulate pass (``cute_accumulate_stores``)."""
+    try:
+        config = DeviceFunction.current().config
+    except NoCurrentFunction:
+        return False
+    return config.config.get("cute_accumulate_stores") is True
+
+
+def _accumulate_pass_stores(
+    body: list[ast.AST],
+    lane_var: str,
+    markers: list[tuple[int, _LaneReduceMarker]],
+    candidates: Sequence[int],
+    phase1_index_set: set[int],
+    unguarded: Callable[[ast.AST], bool],
+    proven_disjoint_tensor_pairs: set[frozenset[str]],
+    proven_tensor_stride_values: dict[tuple[str, int], int],
+    lane_extent: int | None,
+    rename_groups: Mapping[str, str],
+) -> dict[int, list[int]]:
+    """The stores among ``candidates`` (indices into the lane loop ``body``)
+    that the two-pass split runs in its accumulate pass, each with the
+    indices of the producers it adds to that pass.
+
+    A store of a value the loop also reduces, such as a pointwise output and
+    the sum over tile_r of it,
+
+        for tile_r in hl.tile(rows):
+            y = f(x[tile_y, tile_r, tile_x])
+            out0[tile_y, tile_r, tile_x] = y.to(torch.bfloat16)
+            acc = acc + torch.sum(y, -2)
+
+    reads no reduction result, yet the split put it in the consume pass,
+    which ran its producers a second time: ``f`` twice per element, the loads
+    once (fuse_two_pass_loads keeps them in a register table),
+
+        for lane_2 in range(16):            # accumulate
+            load = (in0.iterator + ...).load(); _fuse_cache_0[lane_2] = load
+            v_19 = f(load)
+            sum_1_lane_acc = sum_1_lane_acc + v_19
+        for lane_2 in range(16):            # consume
+            v_19 = f(_fuse_cache_0[lane_2])
+            (out0.iterator + ...).store(cutlass.BFloat16(v_19))
+
+    so a GELU backward's erf and exp ran twice: 34.4 us for the fused
+    store and channel sum of a [128, 256, 24, 24] channels-last bf16 tensor,
+    where the pointwise kernel alone took 23.1 us (GB300).  In the
+    accumulate pass the store runs once per element, in the order the loop
+    had, and the consume pass keeps only what reads a reduction result (here
+    nothing, so it goes):
+
+        for lane_2 in range(16):
+            load = (in0.iterator + ...).load()
+            v_19 = f(load)
+            (out0.iterator + ...).store(cutlass.BFloat16(v_19))
+            sum_1_lane_acc = sum_1_lane_acc + v_19
+
+    A store moves when
+
+    - it is one plain ``.store(value)``, bare or under ``if`` guards, that
+      runs once per lane (it reads the lane) and needs no owner guard;
+    - neither it nor any producer reads a reduction result;
+    - the producers it adds to the accumulate pass are plain assignments that
+      load or compute, and those loads would not be reordered against an
+      aliasing write (``_lane_split_reorders_aliasing_memory``, the check the
+      split makes for the reductions' own producers);
+    - no other access of the loop may touch the stored tensor
+      (``proven_disjoint_tensor_pairs``).  The store then moves ahead of the
+      consume pass's statements of every lane, and no access there can see
+      the difference; within the accumulate pass it keeps its place among
+      the loads and computations of its lane.
+
+    The split asks only under ``cute_accumulate_stores``, off by default: in
+    a rolled scalar lane loop the store then sits between one lane's loads
+    and the next one's, which the compiler cannot hoist above it (it cannot
+    prove they read other memory), and one load per lane is in flight where
+    the accumulate pass of the knob-off code issued them all at once: the
+    scalar config the search had found for the kernel above, 34.3 -> 55.4 us.
+    The sunk vector packets of an unrolled lane loop (``cute_vloop_sink``)
+    are loaded ahead of their lanes' stores, and the search tries the knob on
+    the compiler seeds that sink such packets
+    (``register_accumulate_stores_coverage``).
+    """
+    from ..fuse_two_pass_loads import _is_store_call
+    from ..fuse_two_pass_loads import _store_tensor_roots
+    from ..fuse_two_pass_loads import _tensor_arg_roots
+    from ..persistent_branch_vec import _memory_load_calls
+
+    if not candidates:
+        return {}
+    marker_indices = {index for index, _ in markers}
+    reduced = _forward_live_names(
+        body, {marker.result_var for _, marker in markers}, rename_groups
+    )
+    varying = _lane_varying_names(body, lane_var, rename_groups)
+    tensor_names = {
+        node.value.id
+        for stmt in body
+        for node in ast.walk(stmt)
+        if isinstance(node, ast.Attribute)
+        and node.attr == "iterator"
+        and isinstance(node.value, ast.Name)
+    }
+    # The tensors each statement that loads or writes memory may touch (None:
+    # an address no tensor name resolves).
+    touched = {
+        index: _tensor_arg_roots(stmt, tensor_names)
+        for index, stmt in enumerate(body)
+        if _memory_load_calls(stmt) or _has_side_effect(stmt)
+    }
+
+    def plain_store(stmt: ast.AST) -> ast.Call | None:
+        while isinstance(stmt, ast.If) and not stmt.orelse and len(stmt.body) == 1:
+            stmt = stmt.body[0]
+        if not (isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Call)):
+            return None
+        call = stmt.value
+        if not (
+            _is_store_call(call)
+            and isinstance(call.func, ast.Attribute)
+            and call.func.attr == "store"
+            and len(call.args) == 1
+            and not call.keywords
+        ):
+            return None
+        return call
+
+    result: dict[int, list[int]] = {}
+    for index in candidates:
+        stmt = body[index]
+        store = plain_store(stmt)
+        if store is None or any(
+            isinstance(node, ast.Call)
+            and node is not store
+            and not _is_proven_relocatable_call(node, allow_load=False)
+            for node in ast.walk(stmt)
+        ):
+            continue
+        names = set(ReadWrites.from_ast(stmt).reads)
+        reads = {rename_groups.get(name, name) for name in names}
+        if reads & reduced or not (lane_var in reads or reads & varying):
+            continue
+        roots = _store_tensor_roots(store, tensor_names)
+        if roots is None or any(
+            other != index
+            and tensor_roots_may_alias(roots, other_roots, proven_disjoint_tensor_pairs)
+            for other, other_roots in touched.items()
+        ):
+            continue
+        producers, _ = _backward_slice(body[:index], names, rename_groups)
+        added = [i for i in producers if i not in phase1_index_set]
+        if any(
+            i in marker_indices
+            or not _is_proven_relocatable_assignment(body[i], allow_load=True)
+            for i in added
+        ):
+            continue
+        # The reductions' accumulations follow the accumulate pass's other
+        # statements, so a producer behind a marker that binds the marker's
+        # input again (``v = v * 2.0`` behind ``s = reduce(v)``, for the
+        # store of ``v``) would hand them its binding: on [1, 2, 3, 4] the
+        # sum read 20 instead of 10.  The store stays in the consume pass, as
+        # the lane carries' hand-backs do in the same case.
+        if any(
+            i > marker_index
+            and rename_groups.get(marker.input_name, marker.input_name)
+            in {
+                rename_groups.get(name, name)
+                for name in ReadWrites.from_ast(body[i]).writes
+            }
+            for marker_index, marker in markers
+            for i in added
+        ):
+            continue
+        if any(_memory_load_calls(body[i]) for i in added) and (
+            _lane_split_reorders_aliasing_memory(
+                body,
+                [],
+                proven_disjoint_tensor_pairs,
+                lane_var,
+                lane_extent,
+                proven_tensor_stride_values,
+                additional_inputs=[(index, name) for name in sorted(names)],
+                rename_groups=rename_groups,
+            )
+        ):
+            continue
+        if not unguarded(stmt):
+            continue
+        result[index] = added
     return result
 
 
@@ -3498,7 +3781,10 @@ def _lane_split_reorders_aliasing_memory(
 ) -> bool:
     """Whether splitting the repeated lane loop can reorder an aliasing write.
 
-    A multi-pass lane split omits stores from its accumulation passes.  Writes
+    A multi-pass lane split runs a store in one pass only: the last one, or
+    under ``cute_accumulate_stores`` an accumulation pass for a store that
+    reads no reduction (``_accumulate_pass_stores``, which checks its own
+    aliasing), so it omits the rest from the accumulation passes.  Writes
     on either side of a producer load are barriers: a lexically later write
     executes before the next iteration's load.  The narrow exception is a later
     exact load/store pair with the same injective lane mapping.  Distinct

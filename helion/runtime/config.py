@@ -191,6 +191,7 @@ class Config(Mapping[str, object]):
         cute_predicated_element_loads: bool | None = None,
         cute_store_packet_tiers: bool | None = None,
         cute_defer_tile_reduce: bool | None = None,
+        cute_accumulate_stores: bool | None = None,
         cute_staged_store: bool | None = None,
         cute_wide_packet_hints: bool | None = None,
         cute_scalar_load_hints: bool | None = None,
@@ -551,6 +552,32 @@ class Config(Mapping[str, object]):
                 gives each thread one element of the tile (as many threads as
                 the tile is long) or folds the tile's lanes as vector lanes,
                 the knob leaves the code as it is.
+            cute_accumulate_stores: Run the stores of a reduction's loop
+                that read no reduction result (``out[tile_r, tile_x] = y``
+                beside ``acc = acc + y.sum(0)``) in the pass over a thread's
+                elements that accumulates the reductions, with the values they
+                store, instead of in the pass after the reductions combine,
+                which computes those values a second time.  Each element is
+                then computed once and stored in the order the loop gives it,
+                but a store between one element's loads and the next one's
+                holds the next element's loads behind it (the compiler cannot
+                prove that they read other memory), unless the element loop's
+                loads are issued ahead of it as vector packets.  It therefore
+                takes effect only with ``cute_vloop_sink`` and a vector width
+                of two or more: a searched config without them normalizes it
+                off, and an explicit request is an error.  The stored
+                values are bitwise the same; a sum can differ in its last
+                bits, since a product the knob-off code reads once (in the
+                accumulate pass) contracts into the accumulating add as an
+                FMA, and one the store also reads stays rounded.  Off by
+                default; offered to the autotuner on
+                kernels with a store in the body of an ``hl.tile`` loop that
+                also reduces, whose value reads no reduction of that body, and
+                no matmul, and elsewhere rejected (an explicit False is
+                dropped); a reduction over a whole rdim keeps its consume
+                pass's values in registers with ``cute_reduction_reloads``
+                instead.  A store into a tensor that another access of the
+                loop may touch stays in the later pass.
             cute_staged_store: Write a pointwise kernel's output through a
                 shared-memory image of each block's tile: the threads store
                 their elements into the image, meet at one barrier, and
@@ -812,6 +839,7 @@ class Config(Mapping[str, object]):
             "cute_predicated_element_loads": cute_predicated_element_loads,
             "cute_store_packet_tiers": cute_store_packet_tiers,
             "cute_defer_tile_reduce": cute_defer_tile_reduce,
+            "cute_accumulate_stores": cute_accumulate_stores,
             "cute_staged_store": cute_staged_store,
             "cute_wide_packet_hints": cute_wide_packet_hints,
             "cute_scalar_load_hints": cute_scalar_load_hints,

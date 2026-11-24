@@ -1693,6 +1693,44 @@ def _normalize_gated_boolean(
             raise InvalidConfig(f"{key} must be a boolean, got {value!r}")
 
 
+def sinks_vector_packets(config: Mapping[str, object]) -> bool:
+    """Whether ``config`` sinks a vector loop of packets: ``cute_vloop_sink``
+    with a vector width of two or more, the form ``cute_accumulate_stores``
+    takes effect in (``_normalize_accumulate_stores_sink``) and the seeds its
+    coverage witnesses carry it on (``register_accumulate_stores_coverage``)."""
+    widths = config.get("cute_vector_widths")
+    return (
+        config.get("cute_vloop_sink") is True
+        and isinstance(widths, list)
+        and any(isinstance(width, int) and width >= 2 for width in widths)
+    )
+
+
+def _normalize_accumulate_stores_sink(
+    config: dict[str, object], *, fix_invalid: bool
+) -> None:
+    """``cute_accumulate_stores`` takes effect only with the vector-loop sink
+    (``cute_vloop_sink`` with a vector width of two or more), whose packets
+    the unrolled lanes load ahead of the stores the knob moves.  Without
+    them a store sits between one lane's loads and the next one's and holds
+    those loads behind it, one in flight per lane: a GELU backward's store
+    and channel sum, [128, 256, 24, 24] channels-last bf16 on GB300, read
+    34.3 us knob-off and 55.4 knob-on on its scalar lanes, against 28.7 us
+    knob-on on the sunk packets.  In G02's searches every winner with the
+    knob on had the sink (35 of 50 kernels that offer the knob); knob-on
+    rows without it are candidates the search spends to learn nothing, so
+    they normalize to the knob-off code they lose to, and an explicit
+    request is an error unless ``fix_invalid``."""
+    if config.get("cute_accumulate_stores") is not True or sinks_vector_packets(config):
+        return
+    if not fix_invalid:
+        raise InvalidConfig(
+            "cute_accumulate_stores requires cute_vloop_sink with a vector "
+            "width of two or more"
+        )
+    config["cute_accumulate_stores"] = False
+
+
 def _normalize_cute_pdl(
     config_spec: ConfigSpec, config: dict[str, object], *, fix_invalid: bool
 ) -> None:
@@ -3456,6 +3494,18 @@ def normalize_knobs(
         fix_invalid=fix_invalid,
         fill=False,
     )
+    _normalize_gated_boolean(
+        config,
+        "cute_accumulate_stores",
+        enabled=config_spec.cute_accumulate_store_sites,
+        requirement=(
+            "an hl.tile loop body that reduces and stores a value that reads "
+            "none of its reductions, in a kernel without a matmul"
+        ),
+        fix_invalid=fix_invalid,
+        fill=False,
+    )
+    _normalize_accumulate_stores_sink(config, fix_invalid=fix_invalid)
     _normalize_cute_load_hint_forms(config, fix_invalid=fix_invalid)
     _normalize_cute_pdl(config_spec, config, fix_invalid=fix_invalid)
     _normalize_cute_dot_fragment_mma(config_spec, config, fix_invalid=fix_invalid)
@@ -4845,6 +4895,15 @@ def cute_flat_fields(
             # vector lanes along it) the code stays as it is
             # (``defer_tile_reductions``).
             fields["cute_defer_tile_reduce"] = BooleanFragment()
+        if config_spec.cute_accumulate_store_sites:
+            # The stores that read no reduction result run in the lane
+            # split's accumulate pass: each value computed once, against one
+            # load in flight per lane where no vector packets are issued
+            # ahead (off by default; ``_accumulate_pass_stores``).  Its
+            # coverage group (``register_accumulate_stores_coverage``) keeps
+            # it off in the random initial population and on in witnesses of
+            # the seeds that sink packets.
+            fields["cute_accumulate_stores"] = BooleanFragment()
         if config_spec.cute_exact_division_sites and not config_spec.matmul_facts:
             # How fp32 quotients and square roots are lowered; bitwise
             # identical forms, see ``_normalize_cute_exact_div_form``.

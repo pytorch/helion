@@ -48,7 +48,7 @@ _BASE_VALID_KEYS = """
     cute_collective_copy cute_collective_epilogue cute_collective_mma
     cute_collective_native_seeded cute_collective_operand_packets
     cute_collective_recipe cute_collective_stages cute_collective_static_layouts
-    cute_collective_tmem_a cute_collective_tmem_seed cute_compiler_pipeline cute_defer_tile_reduce
+    cute_collective_tmem_a cute_collective_tmem_seed cute_compiler_pipeline cute_defer_tile_reduce cute_accumulate_stores
     cute_exact_div_form
     cute_flash_bias_form cute_flash_bias_stage cute_flash_bwd_aux_smem
     cute_flash_bwd_bias_fold cute_flash_bwd_ds_tmem cute_flash_bwd_exp2_emu
@@ -224,7 +224,7 @@ _BASE_BACKEND_SPECIFIC_KEYS = """
     cute_collective_copy cute_collective_epilogue cute_collective_mma
     cute_collective_native_seeded cute_collective_operand_packets
     cute_collective_recipe cute_collective_stages cute_collective_static_layouts
-    cute_collective_tmem_a cute_collective_tmem_seed cute_compiler_pipeline cute_defer_tile_reduce
+    cute_collective_tmem_a cute_collective_tmem_seed cute_compiler_pipeline cute_defer_tile_reduce cute_accumulate_stores
     cute_exact_div_form
     cute_flash_bias_form cute_flash_bias_stage cute_flash_bwd_aux_smem
     cute_flash_bwd_bias_fold cute_flash_bwd_ds_tmem cute_flash_bwd_exp2_emu
@@ -395,7 +395,7 @@ _BASE_CUTE_IMPLICIT_DEFAULT_KEYS = """
     cute_collective_copy cute_collective_epilogue cute_collective_mma
     cute_collective_native_seeded cute_collective_operand_packets
     cute_collective_recipe cute_collective_stages cute_collective_static_layouts
-    cute_collective_tmem_a cute_collective_tmem_seed cute_compiler_pipeline cute_defer_tile_reduce
+    cute_collective_tmem_a cute_collective_tmem_seed cute_compiler_pipeline cute_defer_tile_reduce cute_accumulate_stores
     cute_exact_div_form
     cute_fmnmx_extrema cute_fp32_dot cute_fragment_atomic_aggregation
     cute_fragment_atomic_consumer_fusion cute_fragment_batched_loads
@@ -460,7 +460,7 @@ _BASE_CUTE_ACCEPTED = """
     cute_collective_copy cute_collective_epilogue cute_collective_mma
     cute_collective_native_seeded cute_collective_operand_packets
     cute_collective_recipe cute_collective_stages cute_collective_static_layouts
-    cute_collective_tmem_a cute_collective_tmem_seed cute_compiler_pipeline cute_defer_tile_reduce
+    cute_collective_tmem_a cute_collective_tmem_seed cute_compiler_pipeline cute_defer_tile_reduce cute_accumulate_stores
     cute_exact_div_form
     cute_flash_bias_form cute_flash_bias_stage cute_flash_bwd_aux_smem
     cute_flash_bwd_bias_fold cute_flash_bwd_ds_tmem cute_flash_bwd_exp2_emu

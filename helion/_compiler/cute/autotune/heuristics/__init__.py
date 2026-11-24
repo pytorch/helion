@@ -103,6 +103,7 @@ from ..fragment_knobs import register_fragment_warp_results_coverage
 from ..fragment_knobs import register_fragment_warp_scan_coverage
 from ..search_surface import _rolls_a_byte_packet_row
 from ..search_surface import _splittable_store_tier_blocks
+from ..search_surface import sinks_vector_packets
 from .cute import CuteAffineScanHeuristic
 from .cute import CuteAsyncPersistentSubwarpRowsHeuristic
 from .cute import CuteAsyncStateLoadHeuristic
@@ -1073,6 +1074,36 @@ def register_coverage_groups(env: CompileEnvironment, device_ir: DeviceIR) -> No
     register_guarded_lanes_coverage(env)
     register_predicated_element_loads_coverage(env)
     register_store_packet_tiers_coverage(env)
+    register_accumulate_stores_coverage(env)
+
+
+def register_accumulate_stores_coverage(env: CompileEnvironment) -> None:
+    """Cover ``cute_accumulate_stores`` on the first compiler seeds that sink
+    a vector loop of packets (``cute_vloop_sink`` with a vector width of two
+    or more), where the kernel stores a value of a reducing loop body that
+    reads none of its reductions (``cute_accumulate_store_sites``).
+
+    The knob is off by default, so every seed renders as before.  A witness
+    runs the stores in the lane split's accumulate pass: each stored value is
+    computed once instead of again in the consume pass, and the sunk packets
+    of the unrolled lanes are still loaded ahead of their stores (a GELU
+    backward's store and channel sum, [128, 256, 24, 24] channels-last bf16,
+    on the column reduction's second seed: 52.7 -> 28.7 us on GB300).  A seed
+    of scalar lanes carries none: there a store between one lane's loads and
+    the next one's keeps one load in flight per lane (34.3 -> 55.4 us on the
+    same kernel).  The group owns its field even without a witness, so the
+    random initial population keeps the knob off: drawn at random it would be
+    on in scalar rows, where it loses.
+    """
+    if not env.config_spec.cute_accumulate_store_sites:
+        return
+    _register_knob_witnesses(
+        env,
+        key="cute_accumulate_stores",
+        mechanism="cute.accumulate_stores",
+        carries=lambda seed: sinks_vector_packets(seed.config),
+        own_without_witnesses=True,
+    )
 
 
 def register_bool_byte_packets_coverage(env: CompileEnvironment) -> None:

@@ -1331,6 +1331,11 @@ class ConfigSpec:
         # ``cute_defer_tile_reduce`` is tunable when there are any
         # (``carried_tile_sum_blocks``).
         self.cute_carried_tile_sum_blocks: frozenset[int] = frozenset()
+        # Set by DeviceIR analysis: an hl.tile loop body that reduces and
+        # stores a value that reads none of its reductions, in a kernel
+        # without a matmul; ``cute_accumulate_stores`` is tunable
+        # (``accumulate_store_sites``).
+        self.cute_accumulate_store_sites = False
         # Set by DeviceIR analysis: a flattened gather whose lane tile
         # (``index = row + tile.index``) is a tile of a store but not the one
         # on the stored tensor's last dimension, both tensors of a dtype with
