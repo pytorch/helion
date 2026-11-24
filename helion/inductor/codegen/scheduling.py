@@ -116,14 +116,15 @@ def backend_ops(backend: str) -> OrderedSet[str]:
     lgamma, so a CuTe kernel with it would fail to compile with
     NotImplementedError; unsupported() names it instead: "Unsupported: lgamma".
     index_expr, value_expr and masked are HelionKernel code (hl.load, tile
-    indices) rather than torch calls, and rand is hl.rand(...), which CuTe
-    compiles though its op overrides have no rand."""
+    indices) rather than torch calls, rand is hl.rand(...), which CuTe
+    compiles though its op overrides have no rand, and randint64 a helper of
+    torch ops (HelionKernel.randint64())."""
     cls = type(get_backend(backend).inductor_op_overrides())
     torch_calls = OrderedSet(
         name
         for name in vars(HelionOverrides)
         if name in vars(OpsHandler)
-        and name not in ("index_expr", "value_expr", "masked", "rand")
+        and name not in ("index_expr", "value_expr", "masked", "rand", "randint64")
     )
     return HELION_OPS - OrderedSet(
         name for name in torch_calls if getattr(cls, name) is getattr(OpsHandler, name)
@@ -472,9 +473,12 @@ class HelionScheduling(SIMDScheduling):
             for node in group:
                 del node.codegen
         # What only emitting the kernel shows: an indirect index that needs a
-        # bounds check (HelionKernel.check_bounds()).
+        # bounds check (HelionKernel.check_bounds()), an op the kernel cannot
+        # express (HelionKernel.randint64()).
         if helion_kernel.needs_bounds_check:
             raise Unsupported("check_bounds")
+        if helion_kernel.unsupported_ops:
+            raise Unsupported(", ".join(helion_kernel.unsupported_ops))
 
     def _codegen_node_schedule_body(
         self, node_schedule: list[Any], kernel: SIMDKernel[Any]

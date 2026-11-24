@@ -203,6 +203,28 @@ class InductorBackendTestCase(TestCase):
         ):
             torch.compile(fn, fullgraph=True)(*args)
 
+    def check_randint(self, backend):
+        # Stock Inductor's integers, bit for bit (rng.randint64()): ranges of
+        # 2 (a random sign or channel swap) and 44100 (a random shift), the
+        # second added to an int64 input.
+        def fn(x):
+            sign = torch.randint(0, 2, (x.size(0), 1), device=x.device) * 2 - 1
+            shift = torch.randint(0, 44100, x.shape, device=x.device)
+            return sign * x + shift
+
+        x = torch.randint(-50, 50, (64, 1000), device=DEVICE)
+        expected = self.stock_inductor(fn, x)
+        (source,) = self.compile(fn, x, expected=expected, tol=0, backend=backend)
+        self.assertIn("from helion.inductor.codegen.rng import randint64", source)
+        self.assertRegex(source, r"randint64\(tmp\d+, tmp\d+, 0, 44100\)")
+
+        # A range of more than 2**31 integers, whose remainder the helper's
+        # int64 math would overflow, still fails the compile.
+        def wide(x):
+            return x + torch.randint(0, 2**40, x.shape, device=x.device)
+
+        self.assertUnsupported("randint64", wide, x, backend=backend)
+
     def check_bmm_epilogue(self, backend):
         (source,) = self.compile(
             lambda a, b, bias: torch.relu(torch.bmm(a, b)) + bias,
@@ -966,6 +988,9 @@ class TestInductorCute(InductorBackendTestCase):
         )
         self.assertIn('cute_rng_stream="word0"', source)
 
+    def test_randint(self):
+        self.check_randint("cute")
+
     def test_gather(self):
         x = torch.randn(64, 100, device=DEVICE)
         i = torch.randint(0, 100, (64, 10), device=DEVICE)
@@ -992,6 +1017,9 @@ def repeat_kv_case():
 @onlyBackends(["triton"])
 @instantiate_parametrized_tests
 class TestInductorBackend(InductorBackendTestCase):
+    def test_randint(self):
+        self.check_randint("triton")
+
     def test_needs_torch_2_16(self):
         # importlib.reload() stops at the check, so the module keeps its state but
         # the requires_torch_version it rebinds before the check.

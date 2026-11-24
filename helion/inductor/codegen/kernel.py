@@ -446,8 +446,10 @@ class HelionKernel(SIMDKernel[CSEVariable]):
         self.cast_sources: dict[str, CSEVariable] = {}
         self.accumulator_count = 0
         self.has_fp32_dot = False
-        # Whether the kernel draws random numbers; see rand().
+        # Whether the kernel draws random numbers; see rand(), and whether it
+        # draws random integers (randint64()).
         self.uses_rand = False
+        self.uses_randint = False
         # Whether a persistent reduction names its rdim (rdim = ...), and the
         # parameter and subscript of a full rdim it defines rdim by; see
         # rdim_code() and codegen_rdim().
@@ -459,6 +461,10 @@ class HelionKernel(SIMDKernel[CSEVariable]):
         self.outer_stores: dict[str, CSEVariable] = {}
         # Whether an indirect index needs a bounds check; see check_bounds().
         self.needs_bounds_check = False
+        # The ops only emitting the kernel finds it cannot express (randint64
+        # over more than 2**31 integers), which HelionScheduling reports as
+        # Unsupported after the emission; see randint64().
+        self.unsupported_ops: OrderedSet[str] = OrderedSet()
         # The values indices read, by the symbols that stand for them, and the
         # size of the dim each indexes.
         self.indirect: dict[sympy.Symbol, CSEVariable] = {}
@@ -1196,6 +1202,11 @@ class HelionKernel(SIMDKernel[CSEVariable]):
                 "import torch",
                 "import helion",
                 "import helion.language as hl",
+                *(
+                    ["from helion.inductor.codegen.rng import randint64"]
+                    if self.uses_randint
+                    else []
+                ),
                 "",
             ]
         )
@@ -2045,6 +2056,35 @@ class HelionKernel(SIMDKernel[CSEVariable]):
         return (
             f"hl.rand([], seed={seed}, offsets={offset}.to(torch.int64) & 0xFFFFFFFF)"
         )
+
+    def randint64(
+        self,
+        seed: CSEVariable,
+        offset: CSEVariable,
+        low: CSEVariable,
+        high: CSEVariable,
+    ) -> str:
+        """Inductor's ops.randint64, which has no Helion op: the integers in
+        [low, high) that triton_helpers.randint64 draws, from the call of a
+        helper that Helion inlines (rng.randint64()), as for
+        torch.randint(0, 44100, (4, 4), device="cuda"):
+            tmp0 = in0[()]                          # seeds[i] (ops.load_seed)
+            tmp1 = (tile_x.index).to(torch.int32)   # offset
+            tmp4 = randint64(tmp0, tmp1, 0, 44100)
+        with the helper imported by the kernel's module. The bounds are
+        Inductor's index_expr constants; a range past 2**31 integers, whose
+        remainder the helper's int64 math would overflow, or bounds that are
+        not constants, fail the compile with "Unsupported: randint64"."""
+        bounds = [self.symbolic.get(str(value)) for value in (low, high)]
+        lo, hi = (int(b) if isinstance(b, sympy.Integer) else None for b in bounds)
+        if lo is None or hi is None or not 0 < hi - lo <= 2**31:
+            # HelionScheduling fails the kernel with "Unsupported: randint64"
+            # once it is emitted, as for check_bounds(): raising here, inside
+            # the node's codegen, would log "Error in codegen" before the error.
+            self.unsupported_ops.add("randint64")
+            return "0"
+        self.uses_randint = True
+        return f"randint64({seed}, {offset}, {lo}, {hi})"
 
     def reduction_accumulator(
         self, reduction_type: str, src_dtype: torch.dtype, dtype: torch.dtype
