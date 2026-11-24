@@ -90,9 +90,10 @@ def _inductor_ce_backward_fn(
     logits: torch.Tensor,
     lse: torch.Tensor,
 ) -> torch.Tensor:
-    """``_ce_backward_fn`` as helion.inductor writes it: ``reshape`` for the
-    inserted dims, a rank-1 iota cast to the labels' dtype and broadcast
-    along the row, ``hl.full`` scalars, and a sum that drops the dim."""
+    """``_ce_backward_fn`` as helion.inductor wrote it while its constants
+    were ``hl.full`` scalars: ``reshape`` for the inserted dims, a rank-1 iota
+    cast to the labels' dtype and broadcast along the row, and a sum that
+    drops the dim."""
     rows, vocab = logits.shape
     out = torch.empty_like(grad_in)
     for tile_r in hl.tile(rows):
@@ -111,6 +112,41 @@ def _inductor_ce_backward_fn(
         total = grad_in[tile_r, :].to(torch.float32) + (
             grad - probs * grad_sum.reshape([tile_r, 1])
         )
+        out[tile_r, :] = total.to(out.dtype)
+    return out
+
+
+def _inductor_ce_backward_numbers_fn(
+    labels: torch.Tensor,
+    numerator: torch.Tensor,
+    denominator: torch.Tensor,
+    grad_in: torch.Tensor,
+    logits: torch.Tensor,
+    lse: torch.Tensor,
+) -> torch.Tensor:
+    """``_inductor_ce_backward_fn`` as helion.inductor writes it now: the loads
+    first, float32 constants as Python numbers, and the second of a ``where``
+    of two numbers as an ``hl.full`` of it."""
+    rows, vocab = logits.shape
+    out = torch.empty_like(grad_in)
+    for tile_r in hl.tile(rows):
+        label = labels[tile_r]
+        num = numerator[()]
+        den = denominator[()]
+        grad_row = grad_in[tile_r, :].to(torch.float32)
+        x = logits[tile_r, :].to(torch.float32)
+        row_lse = lse[tile_r]
+        valid = label != hl.full([], -100, dtype=torch.int64)
+        target = torch.where(valid, label, hl.full([], 0, dtype=torch.int64))
+        classes = (hl.arange(x.size(1))).to(torch.int64)
+        hit = target.reshape([tile_r, 1]) == classes
+        zero = 0.0
+        grad = torch.where(hit, -1.0, hl.full([], zero, dtype=torch.float32))
+        scale = torch.where(valid, num / den, zero)
+        grad = grad * scale.reshape([tile_r, 1])
+        grad_sum = torch.sum(grad, -1)
+        probs = torch.exp(x - row_lse.reshape([tile_r, 1]))
+        total = grad_row + (grad - probs * grad_sum.reshape([tile_r, 1]))
         out[tile_r, :] = total.to(out.dtype)
     return out
 
@@ -346,6 +382,7 @@ def _render(
         ),
         pytest.param(_ce_backward_flat_sum_fn, {}, id="dropped_dim"),
         pytest.param(_inductor_ce_backward_fn, {}, id="inductor"),
+        pytest.param(_inductor_ce_backward_numbers_fn, {}, id="inductor_numbers"),
     ],
 )
 def test_ce_backward_sums_its_one_hot_row_in_closed_form(
@@ -541,6 +578,7 @@ class TestFoldOneHotReductions(TestCase):
             (_ce_backward_fn, {"block_sizes": [1], "reduction_loops": [256]}),
             (_ce_backward_flat_sum_fn, {}),
             (_inductor_ce_backward_fn, {}),
+            (_inductor_ce_backward_numbers_fn, {}),
         ):
             settings = {"config": helion.Config(**config)} if config else {}
             folded = _kernel(fn, **settings)

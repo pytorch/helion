@@ -7,6 +7,7 @@ import itertools
 import re
 from typing import TYPE_CHECKING
 from typing import Any
+from typing import TypeVar
 from typing import cast
 
 import sympy
@@ -39,9 +40,12 @@ from .. import config as helion_config
 from ..support import names_rdim
 from .overrides import HelionOverrides
 from .overrides import HelionPrinter
+from .overrides import number_constant
 from .overrides import upcast_compute_type
 from .tiling import contiguous_reads
 from .tiling import static_int
+
+_T = TypeVar("_T")
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -122,10 +126,63 @@ class HelionTensorArg:
     output: bool
 
 
+@dataclass(frozen=True)
+class HelionParam:
+    """A parameter of the kernel (HelionKernel.kernel_params())."""
+
+    name: str
+    # What the wrapper passes for it.
+    reference: str
+    # The arguments it holds: one, or an input and an output an in-place
+    # buffer joins.
+    args: tuple[HelionTensorArg, ...]
+
+
+# The ops Inductor writes as Python operators (BasicMathOpsMixin), which take
+# a Python number for an operand: ops.add(x, 0.5) is x + 0.5.
+OPERATOR_OPS = OrderedSet(
+    ["add", "sub", "mul", "truediv", "pow", "eq", "ne", "lt", "le", "gt", "ge", "neg"]
+)
+
+
 class HelionCSEProxy(CSEProxy):
     def _default(self, name: str, args: tuple[Any, ...], kwargs: dict[str, Any]) -> Any:  # noqa: ANN401
-        args = cast("HelionKernel", self.kernel).align_args(args)
+        kernel = cast("HelionKernel", self.kernel)
+        # A Python number (HelionOverrides.constant()) is an operand of an
+        # operator beside a tensor, which rounds it to the tensor's dtype as
+        # eager does. Any other op takes a 0-d tensor of it, as
+        # torch.maximum(x, hl.full([], 0.0, dtype=torch.float32)) does, and so
+        # does an operator of numbers alone, which Python would compute in
+        # doubles (16777217.0 == 16777216.0 is false, in fp32 true), and at
+        # compile time (1.0 / 0.0 raises).
+        if name == "where":
+            condition, a, b = args
+            args = (
+                kernel.as_tensor(condition),
+                a,
+                kernel.as_tensor(b) if kernel.is_number(a) else b,
+            )
+        elif name not in OPERATOR_OPS:
+            args = tuple(map(kernel.as_tensor, args))
+        elif name == "truediv" and kernel.is_number(args[0]):
+            # A number over a tensor: Python would evaluate c / x as
+            # x.__rtruediv__(c), which Helion traces as a reciprocal times c,
+            # inf for 1e-39 / 1e-39 (the reciprocal of 1e-39 overflows
+            # float32), where hl.full([], c, ...) / x divides.
+            args = (kernel.as_tensor(args[0]), *args[1:])
+        elif all(kernel.is_number(arg) for arg in args if isinstance(arg, CSEVariable)):
+            first = next(
+                i for i, arg in enumerate(args) if isinstance(arg, CSEVariable)
+            )
+            args = (*args[:first], kernel.as_tensor(args[first]), *args[first + 1 :])
+        args = kernel.align_args(args)
         result = super()._default(name, args, kwargs)
+        if (
+            isinstance(result, CSEVariable)
+            and name == "constant"
+            and number_constant(*args)
+        ):
+            kernel.numbers.add(result.name)
         # CSEProxy propagates dtypes and shapes only for Inductor's own backends,
         # not for cuda_backend "helion". Without shapes, softmax's sum
         # broadcasts exp(x - max), a [tile_x, tile_r] value, as one without
@@ -168,6 +225,7 @@ class HelionCSEProxy(CSEProxy):
         # access. var's recorded dtype does not say: Inductor records tmp2 as
         # int64, so the cast is unconditional (and free for an int64 var).
         kernel = cast("HelionKernel", self.kernel)
+        var = kernel.as_tensor(var)
         var = kernel.cse.generate(
             kernel.compute,
             f"{var}.to(torch.int64)",
@@ -182,7 +240,11 @@ class HelionCSEProxy(CSEProxy):
         return symbol
 
     def dot(self, x: CSEVariable, y: CSEVariable) -> CSEVariable:
-        return cast("HelionKernel", self.kernel).dot(x, y)
+        kernel = cast("HelionKernel", self.kernel)
+        return kernel.dot(
+            kernel.as_tensor(x),
+            kernel.as_tensor(y),
+        )
 
     def to_dtype(
         self,
@@ -202,9 +264,19 @@ class HelionCSEProxy(CSEProxy):
             # it makes the dot an fp32 one (dot_precision="ieee"). The result is
             # the same: bf16 and fp16 values are exact in fp32 and tf32, and the
             # dot accumulates in fp32 either way.
-            return x
+            return kernel.as_tensor(x)
+        source = kernel.cast_sources.get(x.name)
+        if source is not None and source.dtype == dtype:
+            # A cast back to a value's dtype, through one that holds each of
+            # its values exactly, is the value: any(x.to(torch.int64).to(
+            # torch.bool)) reads the bool x, where each lane would widen to
+            # int64 and back.
+            return source
         if not (kernel.rolled and x in kernel.dot_results):
-            return self._default("to_dtype", (x, dtype), kwargs)
+            value = self._default("to_dtype", (x, dtype), kwargs)
+            if exact_cast(x.dtype, value.dtype):
+                kernel.cast_sources[value.name] = x
+            return value
         # A bf16 matmul output saved for backward is rounded between the dot and
         # its reduction. Emitted in the K loop, the rounding reads the running sum
         # and the store after the loop cannot use it:
@@ -227,6 +299,28 @@ class HelionCSEProxy(CSEProxy):
         # The epilogue then reads value, not out0[tile_y, tile_x] from memory.
         kernel.outer_vars.add(value)
         return value
+
+
+def exact_cast(src: torch.dtype | None, dst: torch.dtype | None) -> bool:
+    """Whether a cast from the bool or integer dtype `src` to `dst` and back is
+    the identity: bool to any dtype but float8_e8m0fnu (whose values are the
+    powers of two: False casts to 2**-127, and back to True), and an integer to
+    a wider integer or to a float whose significand holds it (int8 to
+    bfloat16, int32 to float64). A float `src` is left out: a cast back to
+    bfloat16 or float16 computes in float32 (use_compute_types), which the
+    narrow value would not."""
+    if src is None or dst is None or src == dst or dst.is_complex:
+        return False
+    if src == torch.bool:
+        return dst != torch.float8_e8m0fnu
+    if src.is_floating_point or src.is_complex or dst == torch.bool:
+        return False
+    info = torch.iinfo(src)
+    if dst.is_floating_point:
+        # Integers up to 2 / eps are exact: 256 in bfloat16, 2**24 in float32.
+        return 2 / torch.finfo(dst).eps >= max(-info.min, info.max)
+    target = torch.iinfo(dst)
+    return target.min <= info.min and info.max <= target.max
 
 
 # The segments a persistent rdim is emitted over (HelionKernel.rdim_segment()):
@@ -303,14 +397,18 @@ class HelionKernel(SIMDKernel[CSEVariable]):
             self.symbols[axis]: self.extents[axis] for axis in self.axes
         }
         self.arguments: dict[tuple[Any, ...], HelionTensorArg] = {}
-        # One buffer, so that a masked load follows the computation of its mask.
-        self.loads = self.compute
+        # The CSE variables that hold a Python number (HelionOverrides.constant()),
+        # not a tensor; see as_tensor().
+        self.numbers: OrderedSet[str] = OrderedSet()
         self.load_masks: list[CSEVariable] = []
         # The index or integer each CSE variable of index_expr() or constant()
         # holds, and the bounds on tiles each mask of them proves; see
         # note_predicate().
         self.symbolic: dict[str, sympy.Expr] = {}
         self.predicates: dict[str, list[sympy.Rel]] = {}
+        # The value each cast that keeps every value exactly was cast from
+        # (HelionCSEProxy.to_dtype()).
+        self.cast_sources: dict[str, CSEVariable] = {}
         self.accumulator_count = 0
         self.has_fp32_dot = False
         # Whether the kernel draws random numbers; see rand().
@@ -380,6 +478,7 @@ class HelionKernel(SIMDKernel[CSEVariable]):
         reduces over the x of each split."""
         if reduction_type not in ("sum", "prod"):
             raise AssertionError(f"a reduction over x of {reduction_type}")
+        value = self.as_tensor(value)
         self.saved_partial_accumulate.append(
             PartialAccumulate(name, reduction_type, value)
         )
@@ -1017,7 +1116,7 @@ class HelionKernel(SIMDKernel[CSEVariable]):
         return ctx()
 
     def codegen_body(self) -> None:
-        if not (self.compute or self.stores):
+        if not (self.loads or self.compute or self.stores):
             return
         # A persistent reduction has no loop: one body, so that a value stored
         # and read again in the kernel comes from the CSE store cache, and a
@@ -1025,13 +1124,16 @@ class HelionKernel(SIMDKernel[CSEVariable]):
         if self.rolled:
             self.body.writeline(f"for tile_r in hl.tile({self.numels['r0_']}):")
             with self.body.indent():
+                self.body.splice(self.loads)
                 self.body.splice(self.compute)
             self.body.splice(self.stores)
             # Values from the loop cannot be carried to the next top-level loop.
             self.cse.invalidate(self.outer_vars)
         else:
+            self.body.splice(self.loads)
             self.body.splice(self.compute)
             self.body.splice(self.stores)
+        self.loads.clear()
         self.compute.clear()
         self.stores.clear()
 
@@ -1063,8 +1165,10 @@ class HelionKernel(SIMDKernel[CSEVariable]):
         if self.uses_rand and helion_config.backend == "cute":
             settings += ', cute_rng_stream="word0"'
         code.writeline(f"@helion.kernel({settings})")
-        names = self.kernel_arg_names()
-        params = [*names.values()]
+        kernel_params = self.kernel_params()
+        # The parameter name of each argument's placeholder.
+        names = {arg.ref: param.name for param in kernel_params for arg in param.args}
+        params = [param.name for param in kernel_params]
         if self.mix_order_reduction:
             # The [partials, splits, r] workspace of the partials of the
             # reduction over x (codegen_split_x()).
@@ -1160,22 +1264,37 @@ class HelionKernel(SIMDKernel[CSEVariable]):
         ]
         return sorted(args, key=lambda arg: arg.output)
 
-    def kernel_arg_names(self) -> dict[str, str]:
-        counts: collections.Counter[str] = collections.Counter()
-        names = {}
-        for arg in self.kernel_args():
-            prefix = "out" if arg.output else "in"
-            names[arg.ref] = f"{prefix}{counts[prefix]}"
-            counts[prefix] += 1
-        return names
+    def kernel_params(self) -> list[HelionParam]:
+        """The kernel's parameters, inputs first.
 
-    def call_args(self) -> list[str]:
-        # An input whose storage an output took over is passed as that output.
+        An input whose storage an output took over (an in-place buffer) is
+        passed as that output. Arguments passed the same storage at the same
+        view are one parameter, named in_out0 for an input and an output, as
+        Triton's in_out_ptr0, rather than one each, as for the RMSNorm after a
+        matmul whose output it adds to (buf1 takes over the matmul's buf0):
+            def kernel(in0, in1, in2, out0, out1):
+                tmp1 = in1[tile_x, :]
+                ...
+                out0[tile_x, :] = tmp2.to(torch.bfloat16)
+            kernel(arg2_1, buf1, arg3_1, buf1, buf3)
+        is
+            def kernel(in0, in_out0, in1, out0):
+                tmp1 = in_out0[tile_x, :]
+                ...
+                in_out0[tile_x, :] = tmp2.to(torch.bfloat16)
+            kernel(arg2_1, buf1, arg3_1, buf3)
+        CuTe must assume two parameters alias at any offset, and rejects each
+        config that reduces an rdim over fewer threads than its elements
+        ("synthetic-lane reduction would reorder a potentially aliasing
+        write"): with in1 and out0, only num_threads=[1, 512] (a thread per
+        element of the rdim of 512) compiles; with in_out0, also
+        num_threads=[2, 32] (a warp per rdim), as Triton's kernel reduces it.
+        """
         # Reuse can chain inside one kernel: with buf1 reusing buf0 and buf2
         # reusing buf1, the wrapper runs `buf1 = buf0; del buf0` and
         # `buf2 = buf1; del buf1`, so buf0 is passed as buf2.
         reused = {inp: out for out, inp in self.inplace_update_buffers.items()}
-        args = []
+        groups: dict[tuple[Any, ...], tuple[str, list[HelionTensorArg]]] = {}
         for arg in self.kernel_args():
             operand = arg.operand
             name = operand.get_name()
@@ -1184,12 +1303,33 @@ class HelionKernel(SIMDKernel[CSEVariable]):
             if name != operand.get_name():
                 target = V.graph.get_buffer(name)
                 operand = ReinterpretView(data=target, layout=operand.get_layout())
-            args.append(
+            reference = (
                 operand.codegen_reference()
                 if isinstance(operand, ReinterpretView)
                 else operand.get_name()
             )
-        return args
+            layout = operand.get_layout()
+            view = (
+                name,
+                layout.dtype,
+                tuple(layout.size),
+                tuple(layout.stride),
+                layout.offset,
+            )
+            groups.setdefault(view, (reference, []))[1].append(arg)
+        counts: collections.Counter[str] = collections.Counter()
+        params: list[HelionParam] = []
+        for reference, args in groups.values():
+            kinds = {arg.output for arg in args}
+            prefix = "in_out" if len(kinds) == 2 else "out" if True in kinds else "in"
+            params.append(
+                HelionParam(f"{prefix}{counts[prefix]}", reference, tuple(args))
+            )
+            counts[prefix] += 1
+        return params
+
+    def call_args(self) -> list[str]:
+        return [param.reference for param in self.kernel_params()]
 
     def codegen_nan_check(self) -> None:
         # Check each buffer, as Triton does, not call_args(): a flat operand is
@@ -1255,7 +1395,37 @@ class HelionKernel(SIMDKernel[CSEVariable]):
             mask = self.align(mask, shape)
             indices = "" if coordinates == ["()"] else self.index_list(coordinates)
             line = f"hl.load({arg.ref}, [{indices}], extra_mask={mask}){cast_suffix}"
-        return self.cse.generate(self.loads, line, dtype=dtype, shape=shape)
+        # As Inductor's Triton kernels do (TritonKernel.get_load_buffer()), the
+        # loads that need no computed value come first, then the computation:
+        # a dropout's seeds, tmp0 = in0[()] and tmp5 = in1[()], are read before
+        # the first draw, where CuTe takes a persistent rdim only when no 0-d
+        # load sits between the lanes' statements of a sweep. A masked load
+        # (its mask a computed value) or an indirect one (its index read from
+        # memory) follows that computation.
+        buffer = (
+            self.compute
+            if mask is not None or self.indirect_vars(index)
+            else self.loads
+        )
+        return self.cse.generate(buffer, line, dtype=dtype, shape=shape)
+
+    def is_number(self, value: object) -> bool:
+        """Whether `value` is a CSE variable that holds a Python number."""
+        return isinstance(value, CSEVariable) and value.name in self.numbers
+
+    def as_tensor(self, value: _T) -> _T:
+        """`value`, or for a variable that holds a Python number, a 0-d tensor
+        of it, for an op that takes no Python number:
+            tmp2 = 0.0
+            tmp3 = hl.full([], tmp2, dtype=torch.float32)
+            tmp4 = torch.maximum(tmp1, tmp3)"""
+        if not self.is_number(value):
+            return value
+        assert isinstance(value, CSEVariable) and value.dtype is not None
+        line = f"hl.full([], {value}, dtype={value.dtype})"
+        return cast(
+            "_T", self.cse.generate(self.compute, line, dtype=value.dtype, shape=())
+        )
 
     def store(
         self,
@@ -1266,6 +1436,7 @@ class HelionKernel(SIMDKernel[CSEVariable]):
     ) -> None:
         if mode not in (None, "atomic_add"):
             raise NotImplementedError(f"Helion kernels do not support {mode} stores")
+        value = self.as_tensor(value)
         buffer = V.graph.get_buffer(name)
         layout = buffer.get_layout()
         if isinstance(layout, MutationLayoutSHOULDREMOVE):
@@ -1347,6 +1518,8 @@ class HelionKernel(SIMDKernel[CSEVariable]):
             value = int(index) if index.is_Integer else float(index)
             line = HelionOverrides.constant(value, dtype)
             var = self.cse.generate(self.compute, line, dtype=dtype, shape=())
+            if number_constant(value, dtype):
+                self.numbers.add(var.name)
         else:
             axes = self.index_axes(index)
             var = self.cse.generate(
@@ -1657,7 +1830,7 @@ class HelionKernel(SIMDKernel[CSEVariable]):
             tmp4 = tmp0 < tmp3
             tmp5 = hl.load(in0, [100*tile_y.index.reshape([tile_y, 1])
                 + (tile_x.index)], extra_mask=tmp4)
-            tmp6 = hl.full([], 0.0, dtype=torch.float32)
+            tmp6 = 0.0
             tmp7 = torch.where(tmp4, tmp5, tmp6)
         becomes tmp5 = in0[tile_y, tile_x], with no where."""
         truth = self.proven(mask)
@@ -1743,8 +1916,9 @@ class HelionKernel(SIMDKernel[CSEVariable]):
 
     def dot_operand(self, value: CSEVariable, axes: Sequence[str]) -> CSEVariable:
         """`value` expanded to the matrix tile over `axes`. x @ torch.ones(72, 136)
-        multiplies by a constant, and with the 0-d tmp1 = hl.full([], 1.0, ...),
-        torch.addmm(acc, tmp0, tmp1) fails with "b must be 2D"."""
+        multiplies by a constant, and with its 0-d tensor (HelionCSEProxy.dot()),
+        tmp2 = hl.full([], tmp1, ...) of tmp1 = 1.0, torch.addmm(acc, tmp0, tmp2)
+        fails with "b must be 2D"."""
         tiles = tuple(TILE_NAMES[axis] for axis in axes)
         if tuple(value.shape or ()) == tiles:
             return value
@@ -1762,6 +1936,11 @@ class HelionKernel(SIMDKernel[CSEVariable]):
             return value
         if reduction_type not in REDUCTIONS:
             raise AssertionError(f"Helion kernels do not support {reduction_type}")
+        value = (
+            tuple(self.as_tensor(v) for v in value)
+            if isinstance(value, tuple)
+            else self.as_tensor(value)
+        )
         if isinstance(value, tuple) and reduction_type not in (
             "welford_combine",
             "online_softmax_reduce",
@@ -1941,17 +2120,19 @@ class HelionKernel(SIMDKernel[CSEVariable]):
             tmp3 = torch.amax(tmp0, -1)               # block_max
             ...
             tmp6 = torch.exp(tmp5)
-            tmp8 = torch.where(tmp7, tmp2, tmp6)      # term: x == -inf ? 0 : tmp6
-            tmp9 = torch.sum(tmp8, -1)                # block_sum
-            tmp10 = torch.maximum(acc, tmp3)          # new_max
+            tmp7 = tmp3 == tmp1                       # block_max == -inf, per x
+            tmp8 = tmp7.reshape([tile_x, 1])
+            tmp9 = torch.where(tmp8, tmp2, tmp6)      # term
+            tmp10 = torch.sum(tmp9, -1)               # block_sum
+            tmp11 = torch.maximum(acc, tmp3)          # new_max
             ...
-            tmp14 = torch.exp(tmp13)                  # scale: exp(-|acc - tmp3|)
+            tmp15 = torch.exp(tmp14)                  # scale: exp(-|acc - tmp3|)
             ...
-            tmp20 = torch.where(tmp16, tmp2, tmp19)   # acc_part: acc == -inf ? 0 : ...
+            tmp21 = torch.where(tmp17, tmp2, tmp20)   # acc_part: acc == -inf ? 0 : ...
             ...
-            tmp27 = torch.where(tmp24, tmp25, tmp26)  # new_sum: tmp10 == -inf ? nan : ...
-            acc1 = tmp27
-            acc = tmp10
+            tmp28 = torch.where(tmp25, tmp26, tmp27)  # new_sum: tmp11 == -inf ? nan : ...
+            acc1 = tmp28
+            acc = tmp11
         Of the two rescale factors exp(acc - new_max) and exp(block_max -
         new_max), one is 1 and the other scale, so one exp does. A -inf adds
         nothing: its term is 0, also in a block of only -inf (masked out, the
@@ -1967,9 +2148,18 @@ class HelionKernel(SIMDKernel[CSEVariable]):
         zero = ops.constant(0.0, dtype)
         block_max = self.reduce_block_value("amax", value, dtype)
         exp = ops.exp(ops.sub(value, block_max))
-        term = ops.where(
-            ops.eq(value, neg_inf), zero, ops.mul(weight[0], exp) if weight else exp
-        )
+        if weight:
+            # A partial (max, sum) pair of a split: one of max -inf adds
+            # nothing, also where its sum is nan (a part of an rdim of only -inf).
+            term = ops.where(ops.eq(value, neg_inf), zero, ops.mul(weight[0], exp))
+        else:
+            # Only a block of only -inf needs the 0: elsewhere exp(-inf - m) is
+            # 0 already. One comparison per x of the block, where x == -inf
+            # would compare each element:
+            #     tmp7 = tmp3 == tmp1                 # tmp3: block_max, [tile_x]
+            #     tmp8 = tmp7.reshape([tile_x, 1])
+            #     tmp9 = torch.where(tmp8, tmp2, tmp6)
+            term = ops.where(ops.eq(block_max, neg_inf), zero, exp)
         block_sum = self.reduce_block_value("sum", term, dtype)
         if self.persistent_reduction:
             # The row is one block: its max and sum are the result, with the
@@ -2005,114 +2195,174 @@ class HelionKernel(SIMDKernel[CSEVariable]):
         (the count) of x over tile_r, which var_mean and layer_norm lower to.
         welford_reduce reduces x; welford_combine reduces the (mean, m2, weight)
         partials of a split reduction's first kernel. Each block of tile_r is
-        reduced to its own weight, mean and m2, in sums over the block in
-        registers (the mean, its correction, then m2), and folded into the
-        accumulators acc_mean, acc_m2 and acc_weight as Triton's welford_combine
-        does (Chan et al.), with V.ops.
+        reduced to its own weight, mean and m2, welford_reduce's in two sums
+        over the block in registers (the mean, then the deviations' spread),
+        welford_combine's from its partials (their weights' sum, their weighted
+        mean corrected by their deviations from it, their m2 plus the spread of
+        their means), and folded into the accumulators acc_mean, acc_m2 and
+        acc_weight as Triton's welford_combine does (Chan et al.), with V.ops.
         torch.var_mean(x, -1), with the locals each line comes from:
-            tmp3 = tmp2.expand(tile_r)                  # one
-            tmp4 = torch.sum(tmp3, -1)                  # weight
-            tmp5 = tmp2 / tmp4                          # fraction
-            tmp6 = tmp0 * tmp5
-            tmp7 = torch.sum(tmp6, -1)
+            tmp3 = tmp2 * (tile_r.end - tile_r.begin)   # weight
+            tmp4 = tmp2 / tile_r.block_size             # scale
+            tmp5 = tmp0 * tmp4
+            tmp6 = torch.sum(tmp5, -1)
+            tmp7 = hl.full([], tmp3, dtype=torch.float32)
+            tmp8 = tmp7 * tmp4
+            tmp9 = tmp6 / tmp8                          # mean
+            tmp10 = tmp9.reshape([tile_x, 1])
+            tmp11 = tmp0 - tmp10                        # dev
+            tmp12 = tmp11 * tmp11
+            tmp13 = torch.sum(tmp12, -1)                # m2
+            tmp14 = acc2 + tmp3                         # new_weight
             ...
-            tmp11 = torch.where(tmp10, tmp1, tmp7)      # m0
+            tmp17 = torch.where(tmp15, tmp1, tmp16)     # delta
             ...
-            tmp16 = tmp11 + tmp15                       # mean
-            tmp17 = tmp16.reshape([tile_x, 1])
-            tmp18 = tmp0 - tmp17                        # dev
+            tmp20 = torch.where(tmp18, tmp1, tmp19)     # share
+            tmp21 = tmp17 * tmp20
+            tmp22 = acc + tmp21                         # new_mean
             ...
-            tmp22 = tmp18 - tmp21                       # dev less its mean
-            tmp23 = tmp22 * tmp22                       # spread(dev)
-            tmp24 = torch.sum(tmp23, -1)                # m2
-            tmp25 = acc2 + tmp4                         # new_weight
-            ...
-            tmp28 = torch.where(tmp26, tmp1, tmp27)     # delta
-            ...
-            tmp31 = torch.where(tmp29, tmp1, tmp30)     # share
-            tmp32 = tmp28 * tmp31
-            tmp33 = acc + tmp32                         # new_mean
-            ...
-            acc = tmp33
-            acc1 = tmp38                                # new_m2
-            acc2 = tmp25
+            acc = tmp22
+            acc1 = tmp27                                # new_m2
+            acc2 = tmp14
         A row of inf gets the mean inf, as from Triton's persistent reductions
         (eager and Triton's looped ones give nan): the delta of two equal means
-        is 0, where inf - inf would make it nan. A row of 2e19 gets the
-        variance 0: see the order of the products below. As in any float32
-        Welford, the merge takes each block's rounded mean, so on a row whose
-        spread is below the float32 spacing of its mean the variance depends on
-        the block size: [1e8, 1e8 + 8] * 32 + [1e8 + 8, 1e8 + 16] * 32, of
-        variance 32.25, gives 32.25 in one block of 128, 80.6 in blocks of 64
-        and 124.7 in blocks of 16."""
+        is 0, where inf - inf would make it nan. An rdim of 2e19 in blocks of 64
+        gets the variance 0: see the order of the products below. As in any
+        float32 Welford, the merge takes each block's rounded mean, so on an rdim
+        whose spread is below the float32 spacing of its mean the variance
+        depends on the block size, and a block whose own mean rounds keeps the
+        deviations' mean in its m2, as Inductor's persistent reductions do
+        (welford_reduce_fallback())."""
         ops = V.ops
         zero = ops.constant(0.0, dtype)
 
-        def finite_or_zero(value: CSEVariable) -> CSEVariable:
-            isinf, isnan = ops.isinf(value), ops.isnan(value)
-            return ops.where(ops.logical_or(isinf, isnan), zero, value)
+        def block_sum(
+            term: CSEVariable, empty: CSEVariable | None = None
+        ) -> CSEVariable:
+            total = self.reduce_block_value("sum", term, dtype)
+            return total if empty is None else ops.where(empty, zero, total)
 
-        # The block's weight, each value's share of it (1 / weight for x, w[r] /
-        # weight for a partial r, as w[r] times a mean of 1e37 overflows), and
-        # each value's term of m2 given its deviation from the block's mean.
+        # Two sums over each block, as Inductor's welford_reduce_fallback()
+        # reduces a persistent rdim: the mean, then m2, the deviations' spread.
+        # As there, a mean that rounds leaves the deviations a mean of their
+        # own: of 100000000 and 100000008 in turn, the mean 100000004 rounds to
+        # 100000000, and the deviations 0 and 8 give the variance 32, where
+        # eager gives 16.
+        # The accumulators of a loop: mean, m2 and weight.
+        accumulators = (
+            None
+            if self.persistent_reduction
+            else tuple(self.accumulator(0, dtype) for _ in range(3))
+        )
         if reduction_type == "welford_reduce":
             (value,) = values
+            # A loop's block takes the mean sum(x * s) / (weight * s), s = 1 / B
+            # for B the block size: both products are exact (where x * s stays
+            # normal, as x * (1 / weight) has to), so the mean is
+            # sum(x) / weight, and the scaled sum does not overflow where
+            # sum(x) would (a block of 1e37 sums to inf over 4096 lanes).
+            # sum(x * (1 / weight)) would round each term, and an rdim of 768
+            # values of 100000 get the mean 100000.0078. A persistent rdim takes
+            # Inductor's own sum(x) / weight, as Triton's persistent reductions
+            # and hand-written kernels (torch.mean(x, -1)) do: the scale is one
+            # more multiply per element, 6% of better-benchmark's
+            # var_mean_sum_53c82 (a LayerNorm's statistics, rdims of 512) on
+            # B200 in the CuTe backend, and an rdim whose sum overflows (4096
+            # values of 1e37) gets the mean inf and the variance inf, as from
+            # those, where eager's Welford keeps them finite.
             if self.persistent_reduction:
-                # The row is one block of R values: hl.full([], 300.0, ...),
+                # The rdim is one block of R values: the number 300.0,
                 # rather than the sum of hl.full([], 1.0, ...).expand(rdim),
                 # which would name the rdim (rdim_code()).
-                weight = ops.constant(float(self.numels["r0_"]), dtype)
+                weight = ops.constant(float(int(self.numels["r0_"])), dtype)
+                scale = None
             else:
-                # Helion masks the lanes past the end of R, so this counts the
-                # others.
-                one = self.over_tile_r(ops.constant(1.0, dtype))
-                weight = self.reduce_block_value("sum", one, dtype)
-            fraction = ops.truediv(ops.constant(1.0, dtype), weight)
-            empty = None
-
-            def spread(dev: CSEVariable) -> CSEVariable:
-                return ops.mul(dev, dev)
-
+                # The block's lanes within R (Helion masks the others): a
+                # scalar, where a sum of hl.full([], 1.0, ...).expand(tile_r)
+                # would be one more block sum; B is the block size.
+                one = ops.constant(1.0, dtype)
+                line = f"{one} * (tile_r.end - tile_r.begin)"
+                weight = self.cse.generate(self.compute, line, dtype=dtype, shape=())
+                line = f"{one} / tile_r.block_size"
+                scale = self.cse.generate(self.compute, line, dtype=dtype, shape=())
+                # Where one is a Python number (number_constant(): float32),
+                # both are, which HelionCSEProxy._default divides by a tensor
+                # as 0-d tensors: the merge's share, weight / (acc_weight +
+                # weight), written tmp3 / tmp13, would be Tensor.__rtruediv__,
+                # a reciprocal times the weight, which rounds (1 / 41 * 41 is
+                # 0.99999994): an rdim of 41 values of 3.0 in a block of 64 got
+                # the mean 2.9999998. A float64 one is hl.full([], 1.0, ...),
+                # a 0-d tensor, and so are they.
+                if self.is_number(one):
+                    self.numbers.update((weight.name, scale.name))
+            if scale is None:
+                # A block sum of x that the rdim took before, as of
+                # torch.mean(x, -1) beside torch.var(x, -1), is the Welford
+                # block's too: the CSE hands block_sum(value) that sum's
+                # variable, one sum of x for both, where there were two (and a
+                # sum after it shares the Welford block's). A loop's sums
+                # accumulate in acc lines, which the CSE does not hold: each
+                # keeps its own.
+                mean = ops.truediv(block_sum(value), weight)
+            else:
+                total = block_sum(ops.mul(value, scale))
+                mean = ops.truediv(total, ops.mul(weight, scale))
+            dev = ops.sub(value, mean)
+            m2 = block_sum(ops.mul(dev, dev))
         else:
             value, part_m2, part_weight = values
             weight = self.reduce_block_value("sum", part_weight, dtype)
-            fraction = ops.truediv(part_weight, weight)
             # A block of weight 0, the (0, 0, 0) partials past the end of R in a
-            # masked split, gets the mean and m2 0 rather than 0 / 0.
+            # masked split, gets m2 0 rather than 0 / 0, and the mean 0 or, in a
+            # loop, acc_mean, which the merge below then keeps: its 0 against
+            # an acc_mean of inf would make delta -inf, and -inf * 0 nan.
             empty = ops.eq(weight, zero)
-
-            def spread(dev: CSEVariable) -> CSEVariable:
-                # m2[r] + w[r] * dev^2, the weight first: a partial of weight 0
-                # adds 0, where dev * dev could overflow to inf, and inf * 0 is nan.
-                return ops.add(part_m2, ops.mul(ops.mul(part_weight, dev), dev))
-
-        def weighted_mean(term: CSEVariable) -> CSEVariable:
-            total = self.reduce_block_value("sum", ops.mul(term, fraction), dtype)
-            return total if empty is None else ops.where(empty, zero, total)
-
-        # The mean is m0 + weighted_mean(x - m0), with m0 = weighted_mean(x) (0
-        # if inf or nan): weighted before they are summed, neither sum overflows
-        # where sum(x) / weight would (a row of 1e37 sums to inf over 4096
-        # lanes). The second corrects the rounding of the first, so that equal
-        # values give their value exactly: (c + c + c) / 3 of c = 100553424 is
-        # 100553432, which would make m2 192 rather than 0.
-        m0 = finite_or_zero(weighted_mean(value))
-        mean = ops.add(m0, weighted_mean(ops.sub(value, m0)))
-        # The deviations from the mean, less their own mean, which is not 0 when
-        # the mean rounds: of 100000000 and 100000008 in turn, the mean
-        # 100000004 rounds to 100000000, and the deviations 0 and 8 would give
-        # the variance 32 rather than 16.
-        dev = ops.sub(value, mean)
-        dev = ops.sub(dev, weighted_mean(dev))
-        m2 = self.reduce_block_value("sum", spread(dev), dtype)
-        if self.persistent_reduction:
+            # The mean is the partials' means weighted by w[r] / weight, then
+            # corrected by the weighted deviations from it, as the sum of each
+            # mean times its share rounds. The deviations are of the halves,
+            # m / 2 - first / 2, within float32 where m - first can overflow
+            # (-3e38 from a first pass of 3e38), and their weighted sum s is
+            # added twice, first + s + s. Where the first pass is not finite (a
+            # rdim with an inf) it is the mean. Equal means, as of a constant
+            # rdim's chunks, give that mean itself (their max equals their min),
+            # as Triton's welford_combine gives them (delta 0), where the
+            # weighted sum would round. (An anchor at the largest mean would
+            # make every deviation as large as the spread of the means, and
+            # their rounding with it: one value of 1e5 among 1025 of randn()
+            # moved the mean by 7e-3.)
+            valid = ops.gt(part_weight, zero)
+            neg_inf = ops.constant(float("-inf"), dtype)
+            pos_inf = ops.constant(float("inf"), dtype)
+            top = self.reduce_block_value(
+                "amax", ops.where(valid, value, neg_inf), dtype
+            )
+            bottom = self.reduce_block_value(
+                "amin", ops.where(valid, value, pos_inf), dtype
+            )
+            fraction = ops.truediv(part_weight, weight)
+            first = block_sum(ops.where(valid, ops.mul(value, fraction), zero))
+            half = ops.constant(0.5, dtype)
+            shift = ops.sub(ops.mul(value, half), ops.mul(first, half))
+            shifts = block_sum(ops.where(valid, ops.mul(shift, fraction), zero))
+            corrected = ops.where(
+                ops.logical_or(ops.isinf(first), ops.isnan(first)),
+                first,
+                ops.add(ops.add(first, shifts), shifts),
+            )
+            combined = ops.where(ops.eq(top, bottom), top, corrected)
+            empty_mean = zero if accumulators is None else accumulators[0]
+            mean = ops.where(empty, empty_mean, combined)
+            # m2[r] + w[r] * dev^2, the weight first: a partial of weight 0 adds
+            # 0, where dev * dev could overflow to inf, and inf * 0 is nan.
+            dev = ops.sub(value, mean)
+            spread = ops.add(part_m2, ops.mul(ops.mul(part_weight, dev), dev))
+            m2 = block_sum(spread, empty)
+        if accumulators is None:
             # The row is one block, so its mean, m2 and weight are the result, a
             # two-pass variance as in Triton's persistent reductions, with no
             # accumulators to combine them into.
             return mean, m2, weight
-        acc_mean = self.accumulator(0, dtype)
-        acc_m2 = self.accumulator(0, dtype)
-        acc_weight = self.accumulator(0, dtype)
+        acc_mean, acc_m2, acc_weight = accumulators
         # Triton's welford_combine of the accumulators and the block, with 0 for
         # the difference of two equal means, as inf - inf is nan, and for the
         # share of a new_weight of 0: a split's chunk past the end of R, as in
