@@ -72,8 +72,8 @@ looped = config.patch({"triton.persistent_reductions": False})
 
 def pin_blocks(r_block: int):
     """A patch of helion.kernel that pins each kernel's blocks: 1 for its outer
-    tiles and r_block for tile_r. A split's first kernel tiles its x and
-    chunks of R,
+    tiles and r_block for the tile of its inner loop (tile_r, or a mix-order
+    kernel's tile_x). A split's first kernel tiles its x and chunks of R,
         for tile_y, tile_x in hl.tile([8, 64]):
     its second kernel x alone."""
     kernel = helion.kernel
@@ -180,6 +180,39 @@ class InductorBackendTestCase(TestCase):
         self.assertIn("tmp1 = in1[tile_z, tile_r, tile_x]", source)
         self.assertIn("acc = torch.baddbmm(acc, tmp0, tmp1)", source)
         self.assertIn("out0[tile_z, tile_y, tile_x] = ", source)
+
+    def check_mix_order_reduction(self, backend):
+        """RMSNorm's backward, given rstd: its reduction over r and the reductions
+        over x of its weight's and bias's gradients over [8192, 640] are one
+        kernel, which reads x and g once (HelionScheduling.
+        codegen_mix_order_reduction()): it loops over the x of each split of x,
+        and sums the terms of each reduction over x into a partial, that the
+        wrapper sums over the splits."""
+        # On by default outside fbcode; Inductor marks the split (_split_size)
+        # only with it on.
+        self.enterContext(config.patch({"triton.mix_order_reduction": True}))
+        xnumel, rnumel = 8192, 640
+        x = torch.randn(xnumel, rnumel, device=DEVICE)
+        g = torch.randn(xnumel, rnumel, device=DEVICE)
+        w = torch.randn(rnumel, device=DEVICE)
+        rstd = torch.rand(xnumel, 1, device=DEVICE) + 0.5
+
+        def fn(x, g, w, rstd):
+            gw = g * w
+            dot = (gw * x).sum(-1, keepdim=True)
+            dx = gw * rstd - x * rstd.pow(3) * dot / rnumel
+            # A product over x too, the partial that starts at 1 and
+            # multiplies (codegen_split_x()).
+            return dx, (g * x * rstd).sum(0), g.sum(0), (1 + 1e-4 * g * x).prod(0)
+
+        (source,) = self.compile(fn, x, g, w, rstd, tol=1e-3, backend=backend)
+        self.assertRegex(source, r"for tile_y in hl.tile\(\d+\):")
+        self.assertRegex(source, r"for tile_x in hl.tile\(\d+\):")
+        self.assertIn("in0[tile_y, tile_x, :]", source)
+        self.assertRegex(source, r"part(\d) = part\1 \+ torch\.sum\(")
+        self.assertRegex(source, r"part(\d) = part\1 \* torch\.prod\(")
+        self.assertRegex(source, r"ws\[2, tile_y, :\] = part2")
+        self.assertIn(".sum(dim=0)", self.code)
 
 
 @skipIfNotCUDA()
@@ -552,6 +585,9 @@ class TestInductorCute(InductorBackendTestCase):
     @needs_native_matmul
     def test_bmm_epilogue(self):
         self.check_bmm_epilogue("cute")
+
+    def test_mix_order_reduction(self):
+        self.check_mix_order_reduction("cute")
 
     def test_unsupported_op(self):
         # Helion's CuTe backend compiles no lgamma.
@@ -1171,14 +1207,16 @@ def kernel(in0: torch.Tensor, out0: torch.Tensor) -> None:
         # Tiles over the dims the indexes divide the flat ranges by, with no
         # // or % (natural_tiling()). mean: the mean over H and W of a
         # channels-last x, read at 64*r + 2304*(x // 64) + x % 64 by the
-        # 1-D tiling. broadcast: w[c] beside x[n, c], read at x % 384.
+        # 1-D tiling, an outer reduction, whose contiguous C is the last dim of
+        # the tile. broadcast: w[c] beside x[n, c], read at x % 384.
         # mask: the x and y, x % 100 and x // 100, of a causal mask.
         if case == "mean":
             x = torch.randn(8, 64, 6, 6, device=DEVICE)
             x = x.to(memory_format=torch.channels_last)
             (source,) = self.compile(lambda x: x.mean([2, 3]), x, tol=1e-4)
             self.assertIn("for tile_y, tile_x in hl.tile([8, 64]):", source)
-            self.assertIn("in0[tile_y, tile_x, :]", source)
+            self.assertIn("in0[tile_y, :, tile_x]", source)
+            self.assertIn("torch.sum(tmp0, -2)", source)
         elif case == "broadcast":
             x = torch.randn(32, 384, device=DEVICE)
             w = torch.randn(384, device=DEVICE)
@@ -1195,6 +1233,25 @@ def kernel(in0: torch.Tensor, out0: torch.Tensor) -> None:
             (source,) = self.compile(fn, x)
             self.assertIn("for tile_y, tile_x in hl.tile([100, 100]):", source)
         self.assertNotRegex(source, r"tile_\w\.index[^\n]*(//|%)")
+
+    def test_mix_order_reduction(self):
+        # Pin blocks [1, 8]. The default [32, 16] (A10G, A100) loads [32, 16, 1024]
+        # tiles that take Triton and ptxas over 14 minutes, past CI's 180 s timeout.
+        with pin_blocks(8):
+            self.check_mix_order_reduction("triton")
+
+    def test_mix_order_reduction_off(self):
+        # config.triton.mix_order_reduction off: the sum over x is a kernel of
+        # its own, as for Triton.
+        x, g = (
+            torch.randn(8192, 640, device=DEVICE),
+            torch.randn(8192, 640, device=DEVICE),
+        )
+        with config.patch({"triton.mix_order_reduction": False}):
+            sources = self.compile(
+                lambda x, g: ((g * x).sum(-1), (g * x).sum(0)), x, g, tol=1e-3
+            )
+        self.assertNotIn("ws[", "".join(sources))
 
     @parametrize("op", ["sum", "prod"])
     @looped
@@ -1366,6 +1423,92 @@ def kernel(in0: torch.Tensor, out0: torch.Tensor, out1: torch.Tensor) -> None:
         with V.set_choices_handler(Choices()):
             sources = self.compile(lambda x: torch.var_mean(x, -1), x)
         self.assertEqual(len(sources), 2)
+
+    def test_nchw_reductions(self):
+        # sum and var_mean over N, H and W of an NCHW tensor split into a
+        # chunk per run of H * W contiguous values (HelionChoices.layout_split()):
+        # the first kernel reads each run as an rdim of a view, with no division
+        # or remainder in its index, and the second combines the 8 partials of
+        # each channel. 2M values, past MIN_LAYOUT_SPLIT_VALUES, split whether
+        # or not Inductor would.
+        x = torch.randn(8, 64, 64, 64, device=DEVICE)
+        for fn in (
+            lambda x: x.sum([0, 2, 3]),
+            lambda x: torch.var_mean(x, [0, 2, 3], correction=0),
+        ):
+            first, second = self.compile(fn, x, tol=1e-3)
+            self.assertRegex(first, r"in0\[tile_x, (tile_r|:)\]")
+            self.assertNotIn("//", first)
+            self.assertIn("in0[tile_x, :]", second)
+        # A batch of 2, whose 2 runs per channel Inductor's 16 chunks cut in 8
+        # each: chunks within a run, still a tile of a view.
+        x = torch.randn(2, 64, 256, 256, device=DEVICE)
+        first, _ = self.compile(lambda x: x.mean((0, 2, 3)), x, tol=1e-3)
+        self.assertIn("in0[tile_z, tile_y, tile_x, ", first)
+        self.assertNotIn("//", first)
+        # 8192 values, which Inductor does not split: one kernel, whose launch
+        # a second kernel's would double.
+        small = torch.randn(2, 64, 8, 8, device=DEVICE)
+        self.assertEqual(len(self.compile(lambda x: x.sum([0, 2, 3]), small)), 1)
+
+    @parametrize("case", ["persistent", "looped"])
+    def test_outer_reductions(self, case):
+        # Reductions over the outer dim of [1000, 100] (Inductor's hint OUTER),
+        # whose kernels read rdims of x (reads_strided_rdim()) and reduce the rdim
+        # before tile_x, in one block or a loop over tile_r, as the sums of
+        # test_nchw_reductions: argmax and argmin with a NaN, which keep
+        # Triton's rule (LOOPED_REDUCTIONS: an outer rdim past 64 loops), and
+        # var_mean, amax and prod, which Inductor splits, whose first kernel
+        # reads in0[tile_y, tile_r, tile_x] and whose second combines the
+        # partials.
+        # Inductor marks the split's first kernel (_split_size), which keeps
+        # Triton's rule and loops, only with mix_order_reduction on.
+        self.enterContext(config.patch({"triton.mix_order_reduction": True}))
+        x = torch.randn(1000, 100, device=DEVICE)
+        x[10, 3] = float("nan")
+        rdim = ":" if case == "persistent" else "tile_r"
+        for fn, coordinate in (
+            (lambda x: (torch.argmax(x, 0), torch.argmin(x, 0)), "tile_r"),
+            (lambda x: torch.var_mean(x, 0), rdim),
+            (lambda x: (x.amax(0), x.prod(0).abs().clamp(max=1.0)), rdim),
+        ):
+            with config.patch({"triton.persistent_reductions": case == "persistent"}):
+                sources = self.compile(fn, x, tol=1e-4)
+            for source in sources:
+                self.assertRegex(
+                    source, rf"in0\[(tile_y, tile_r|{coordinate}), tile_x\]"
+                )
+
+    def test_outer_sum(self):
+        # A sum over y with an x too large to split, which Inductor hints
+        # DEFAULT: its loads read more bytes with a unit stride along x than
+        # along r0_ (tiling.contiguous_reads()), so the rdim is the first dim
+        # of the tile and x, of stride 1, the last (reads_strided_rdim()), not
+        # in0[tile_x, :].
+        x = torch.randn(64, 32768, device=DEVICE)
+        (source,) = self.compile(lambda x: x.sum(0), x, tol=1e-4)
+        self.assertIn("tmp0 = in0[:, tile_x]", source)
+        self.assertIn("torch.sum(tmp0, -2)", source)
+
+    def test_split_reduction_chunks(self):
+        # Inductor cuts x.sum(0), an rdim of 100000, into chunks by a
+        # factor of the GPU (782 chunks of 128 on a B200 or an H100), the last
+        # past the end of the rdim, which masks every load of the first
+        # kernel; HelionChoices.reduction_split_factor() picks a divisor of
+        # the rdim near it (800 chunks of 125 there), whose loads are tiles of
+        # a view of x, with x's contiguous dim last (an outer reduction).
+        x = torch.randn(100000, 96, device=DEVICE)
+        # Inductor marks the split (_split_size) only with mix_order_reduction
+        # on, its default outside fbcode.
+        self.enterContext(config.patch({"triton.mix_order_reduction": True}))
+        # The sums of 100000 values, in chunks, differ from eager's by 1e-4.
+        first, _ = self.compile(lambda x: x.sum(0), x, tol=1e-3)
+        chunks = re.search(r"for tile_y, tile_x in hl\.tile\(\[(\d+), 96\]\):", first)
+        chunk = re.search(r"for tile_r in hl\.tile\((\d+)\):", first)
+        assert chunks is not None and chunk is not None, first
+        self.assertEqual(int(chunks.group(1)) * int(chunk.group(1)), 100000)
+        self.assertNotIn("extra_mask", first)
+        self.assertIn("tmp0 = in0[tile_y, tile_r, tile_x]", first)
 
     def test_welford_layer_norm(self):
         # bf16 with its affine epilogue, in one kernel.
