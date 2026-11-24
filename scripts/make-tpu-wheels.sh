@@ -38,7 +38,6 @@ export TORCH_SOURCE=$(python -c "import torch; import os; print(os.path.dirname(
 "$BAZELISK" build -c opt //ci/wheel:torch_tpu_wheel \
   --config=wheel_common \
   --config=no_rbe \
-  --spawn_strategy=sandboxed,local \
   --config=helion_public_caching_readonly \
   --config=local_torch \
   --repo_env=TORCH_SOURCE=$TORCH_SOURCE \
