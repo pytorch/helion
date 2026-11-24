@@ -3688,6 +3688,53 @@ def test_split_column_reduction_heuristic_takes_batched_and_broadcast_sums(
         assert "_vsink_vec" in bound.to_code(spec.normalized_config(sunk[0]))
 
 
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _split_column_store_sum(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    """y = x + 1 stored and summed over the rows of each [z, s] split (a
+    fused producer, its store and Inductor's split channel sum)."""
+    zs, splits, rows, n = x.size()
+    out = torch.empty([zs, splits, n], dtype=torch.float32, device=x.device)
+    for tile_z, tile_s, tile_c in hl.tile([zs, splits, n]):
+        acc = hl.zeros([tile_z, tile_s, tile_c], dtype=torch.float32)
+        for tile_r in hl.tile(rows):
+            v = x[tile_z, tile_s, tile_r, tile_c].to(torch.float32) + 1
+            y[tile_z, tile_s, tile_r, tile_c] = v
+            acc = acc + torch.sum(v, dim=-2)
+        out[tile_z, tile_s, tile_c] = acc
+    return out
+
+
+def test_split_column_reduction_seeds_two_splits_per_thread(cpu_only: None) -> None:
+    """The split axis the loop nest tiles last (s, not z) takes a block of 2
+    as a vector of two in the fourth seed, over 4 column threads of fp32
+    packets and 16 row threads in chunks of 64 rows, when the grid keeps
+    1024 CTAs (64 x 4 x 5 here); it sinks the column vector, and the
+    accumulate-stores witness covers it.  A grid of fewer CTAs (8 x 4 x 5),
+    or a split axis of one element, gets no such seed."""
+    x = torch.empty(64, 8, 96, 80, dtype=torch.float32)
+    bound = cpu_bind(_split_column_store_sum, (x, torch.empty_like(x)))
+    spec = bound.config_spec
+    seed = spec.compiler_seed_configs[3].config
+    assert seed["block_sizes"] == [1, 2, 16, 64]
+    assert seed["num_threads"] == [1, 1, 4, 16]
+    assert seed["cute_vector_widths"] == [1, 2, 4, 1]
+    code = bound.to_code(spec.normalized_config(spec.compiler_seed_configs[3]))
+    assert "_vsink_vec" in code
+    (group,) = [
+        g for g in spec._compiler_coverage_groups if g.key == "cute_accumulate_stores"
+    ]
+    assert any('"block_sizes":[1,2,16,64]' in w._carrier_json for w in group.witnesses)
+    for shape in ((8, 8, 96, 80), (1024, 1, 96, 80)):
+        small = torch.empty(*shape, dtype=torch.float32)
+        declined = cpu_bind(_split_column_store_sum, (small, torch.empty_like(small)))
+        sunk = [
+            s.config["block_sizes"]
+            for s in declined.config_spec.compiler_seed_configs
+            if s.config.get("cute_vloop_sink")
+        ]
+        assert len(sunk) == 3, (shape, sunk)
+
+
 # GPU numerics for grid vector-loop sinking (``cute_vloop_sink``).
 #
 # Partial tiles on both axes, the interleaved (rows above columns) thread

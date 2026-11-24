@@ -5220,6 +5220,9 @@ class CuteSplitColumnReductionHeuristic(_CuteColumnSeedHeuristic):
 
     name = "cute_split_column_reduction"
     priority = 99
+    # The fewest CTAs a grid of two splits per CTA keeps for the two-split
+    # seed: several per SM of a B200 or GB300.
+    TWO_SPLIT_MIN_CTAS = 1024
 
     @classmethod
     def _match(
@@ -5358,6 +5361,62 @@ class CuteSplitColumnReductionHeuristic(_CuteColumnSeedHeuristic):
                     },
                 )
             )
+        # Two splits per thread: the split axis the loop nest tiles last
+        # (Inductor's split of the rows, beside the column tile) at a block
+        # of 2 held as a vector of two, so that each thread walks two
+        # splits' rows at once, over the 4 x 16 threads of chunks of 64
+        # rows, where the grid keeps TWO_SPLIT_MIN_CTAS CTAs or more.
+        # Measured on GB300 (trace timer) for the fused add, two stores and
+        # channel sum of better-benchmark's sum_66751dee67d6 ([128, 8, 392,
+        # 80] fp32 split sums of an H/W-swapped channels-last pair, kernel
+        # 0; 2560 CTAs): 70.1 us with cute_accumulate_stores (its coverage
+        # witness), 68.4 with deferred tile reduce too, where the shapes
+        # above read 109.7-152.3 us with the knob and the best search
+        # configs 64.3-66.0; one split per thread at the same threads 89.9
+        # us, two splits at 8 row threads x 128 rows 80.9 us.  On bf16
+        # split sums of 1024-3072 such CTAs it ranks second or third among
+        # the seeds (sum_3a6aa9bca77f, sum_652074457206, sum_2f4a2365eba8),
+        # on smaller grids it halves an already short grid (sum_4a4493837e6e's
+        # 49 splits x 12 column tiles: 10.4 us, the best seed 4.8 us).
+        inner_split = max(splits, default=None)
+        if inner_split is not None:
+            split_fragment = block_specs[inner_split]._fragment(spec)
+            columns = 4 * vec
+            rows = min(64, whole, reduced_fragment.high)
+            ctas = math.prod(
+                -(-block_specs[block_id].size_hint // tile)
+                for block_id, tile in (
+                    *((b, 2 if b == inner_split else 1) for b in splits),
+                    (column_block_id, columns),
+                )
+            )
+            if (
+                ctas >= cls.TWO_SPLIT_MIN_CTAS
+                and split_fragment.low <= 2 <= split_fragment.high
+                and columns <= column_extent
+                and column_fragment.low <= columns <= column_fragment.high
+                and reduced_fragment.low <= rows
+                and rows >= 16
+            ):
+                seeds.append(
+                    cls._seed(
+                        spec,
+                        column_block_id,
+                        reduced_block_id,
+                        vec,
+                        {
+                            **splits,
+                            inner_split: 2,
+                            column_block_id: columns,
+                            reduced_block_id: rows,
+                        },
+                        {**splits, column_block_id: 4, reduced_block_id: 16},
+                        cute_vector_widths=_seq_config_list(
+                            spec.cute_vector_widths,
+                            {column_block_id: vec, inner_split: 2},
+                        ),
+                    )
+                )
         return dedupe_configs(seeds)
 
 
