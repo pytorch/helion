@@ -21,6 +21,7 @@ import torch
 from ... import _compat
 from ... import exc
 from ..ast_extension import expr_from_string
+from ..ast_extension import statement_from_string
 from ..backend import Backend
 from ..backend import BackendState
 from ..backend import HandlerOpOverrides
@@ -990,8 +991,13 @@ class GluonBackend(TritonBackend):
         statements = finalize_ring(fn_def, ctx)
         transports = dsmem_transports(ctx.device_function)
         if transports and ctx.device_function.ring is None:
-            fn_def.body.insert(0, cluster_entry(transports))
-            fn_def.body.append(cluster_exit())
+            # The barrier orders thread 0's init before every thread's waits
+            # (a ring's ``warp_specialize`` start does).
+            fn_def.body[:0] = [
+                cluster_entry(transports),
+                statement_from_string("tl.debug_barrier()"),
+            ]
+            fn_def.body.append(cluster_exit(transports))
         return [*statements, *trailing]
 
     def pipeline_loops(

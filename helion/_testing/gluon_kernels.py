@@ -238,6 +238,36 @@ def split_k_parts(
 
 
 @helion.kernel(static_shapes=True, backend="gluon")
+def split_k_halves(
+    x: torch.Tensor, w4: torch.Tensor, part: torch.Tensor
+) -> torch.Tensor:
+    """``split_k_parts`` with each task's K range in two halves, stored apart
+    (``part``: [splits, 2, t, n])."""
+    t, k = x.size()
+    blocks, steps, rows, block_k = w4.size()
+    splits = part.size(0)
+    out = torch.empty([t, blocks * rows], dtype=torch.float32, device=x.device)
+    out3 = out.view(t, blocks, rows)
+    part5 = part.view(splits, 2, t, blocks, rows)
+    x3 = x.view(t, steps, block_k)
+    half = k // splits // 2
+    for tile_s, tile_b in hl.tile([splits, blocks], block_size=[1, 1]):
+        low = hl.zeros([rows, t], dtype=torch.float32)
+        high = hl.zeros([rows, t], dtype=torch.float32)
+        for tile_k in hl.tile(half, block_size=block_k):
+            kb = (tile_s.begin * 2 * half + tile_k.begin) // block_k
+            low = hl.dot(w4[tile_b.begin, kb, :, :], x3[:, kb, :].T, acc=low)
+            kh = kb + half // block_k
+            high = hl.dot(w4[tile_b.begin, kh, :, :], x3[:, kh, :].T, acc=high)
+        part5[tile_s.begin, 0, :, tile_b.begin, :] = low.T
+        part5[tile_s.begin, 1, :, tile_b.begin, :] = high.T
+    for tile_c in hl.tile(blocks, block_size=1):
+        halves = torch.sum(part5[:, :, :, tile_c.begin, :], dim=0)
+        out3[:, tile_c.begin, :] = torch.sum(halves, dim=0)
+    return out
+
+
+@helion.kernel(static_shapes=True, backend="gluon")
 def crossed_parts(x: torch.Tensor, p: torch.Tensor, q: torch.Tensor) -> torch.Tensor:
     """Two parts from one root, transposed: the tasks of one ``c`` write
     ``p[:, c]`` along the first task axis and ``q[:, c]`` along the second."""
@@ -250,6 +280,60 @@ def crossed_parts(x: torch.Tensor, p: torch.Tensor, q: torch.Tensor) -> torch.Te
     for tile_c in hl.tile(b_n, block_size=1):
         c = tile_c.begin
         out[c, :] = p[:, c, :].sum(0) + q[:, c, :].sum(0)
+    return out
+
+
+@helion.kernel(static_shapes=True, backend="gluon")
+def gather_rms_norm(
+    x: torch.Tensor, weight: torch.Tensor, partial: torch.Tensor, gathered: torch.Tensor
+) -> torch.Tensor:
+    """An RMSNorm over a row's parts: each part's task writes its sum of
+    squares (``partial``: [rows, parts]) and its values (``gathered``); each
+    part's norm task reads the row's sums and its part's values.
+    ``block_sizes``: both roots' part width."""
+    rows, hidden = x.size()
+    out = torch.empty_like(x)
+    for tile_t, tile_n in hl.tile([rows, hidden], block_size=[1, None]):
+        values = x[tile_t.begin, tile_n] * 2.0
+        partial[tile_t.begin, tile_n.id] = torch.sum(values * values)
+        gathered[tile_t.begin, tile_n] = values
+    for tile_t, tile_n in hl.tile([rows, hidden], block_size=[1, None]):
+        scale = torch.rsqrt(torch.sum(partial[tile_t.begin, :]) / hidden + 1e-6)
+        out[tile_t.begin, tile_n] = (
+            gathered[tile_t.begin, tile_n] * scale * weight[tile_n]
+        )
+    return out
+
+
+@helion.kernel(static_shapes=True, backend="gluon")
+def scaled_gather_rms_norm(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    rows_in: torch.Tensor,
+    table: torch.Tensor,
+    sums: torch.Tensor,
+    partial: torch.Tensor,
+    gathered: torch.Tensor,
+) -> torch.Tensor:
+    """``gather_rms_norm`` times a table's total plus one of its row sums: a
+    first root writes the table (``table``, a row a task from ``rows_in``)
+    and each row's sum (``sums``); every norm task reads the table whole and
+    one sum.  ``block_sizes``: both norm roots' part width."""
+    rows, hidden = x.size()
+    out = torch.empty_like(x)
+    for tile_e in hl.tile(table.size(0), block_size=1):
+        table[tile_e.begin, :] = rows_in[tile_e.begin, :] * 0.5
+        sums[tile_e] = torch.sum(rows_in[tile_e.begin, :])[None]
+    for tile_t, tile_n in hl.tile([rows, hidden], block_size=[1, None]):
+        values = x[tile_t.begin, tile_n] * 2.0
+        partial[tile_t.begin, tile_n.id] = torch.sum(values * values)
+        gathered[tile_t.begin, tile_n] = values
+    for tile_t, tile_n in hl.tile([rows, hidden], block_size=[1, None]):
+        scale = torch.rsqrt(torch.sum(partial[tile_t.begin, :]) / hidden + 1e-6)
+        total = torch.sum(torch.sum(table[:, :], dim=1)) + sums[tile_t.begin % 8]
+        out[tile_t.begin, tile_n] = (
+            gathered[tile_t.begin, tile_n] * scale * weight[tile_n]
+        ) * total
     return out
 
 

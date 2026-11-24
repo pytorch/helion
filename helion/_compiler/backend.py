@@ -425,10 +425,9 @@ class Backend(abc.ABC):
 
     @property
     def intra_loop_barriers_order_flat_loads(self) -> bool:
-        """Whether the barrier walk orders the packed quantized loads
-        (``flat_offset_loads``) as loads of anywhere in their tensor: a
-        pending store's barrier moves to such a load, so only a backend whose
-        packed-load codegen places the barrier the walk marks says True; with
+        """Whether a packed quantized load (``flat_offset_loads``), a read of
+        anywhere in its tensor, takes the barrier
+        ``mark_intra_loop_raw_barriers`` asks for: its codegen places it.  With
         False the hazard stays pending for the next access."""
         return False
 

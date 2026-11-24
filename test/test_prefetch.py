@@ -129,6 +129,22 @@ def box_prefetch_copy(w: torch.Tensor, wp: torch.Tensor) -> torch.Tensor:
     return out
 
 
+@helion.kernel(
+    static_shapes=True,
+    config=helion.Config(block_sizes=[64, 64], prefetch_indexing="tensor_descriptor"),
+)
+def box_prefetch_tail_copy(w: torch.Tensor) -> torch.Tensor:
+    """``box_prefetch_copy`` prefetching a view the kernel builds, 64 rows past
+    ``w``."""
+    wp = w[64:].view(-1, 64, w.size(1))
+    out = torch.empty_like(w)
+    for tile_p in hl.tile(wp.size(0), block_size=1):
+        hl.prefetch(wp, [tile_p.begin, slice(None), slice(None)])
+    for tile_k, tile_n in hl.tile(w.size()):
+        out[tile_k, tile_n] = w[tile_k, tile_n]
+    return out
+
+
 @contextlib.contextmanager
 def _empty_prefetch_maps() -> Iterator[None]:
     """An empty tensor-map cache (``tensor_maps.prefetch_map``) for the block."""
@@ -452,6 +468,27 @@ class TestPrefetch(RefEagerTestDisabled, TestCase):
         self.assertNotIn(_BOX, codes[1])
         self.assertNotIn("prefetch_map(", codes[1])
         self.assertIs(pinned.bind(calls[0]), pinned.bind(calls[1]))
+
+    @skipIfCudaCapabilityLessThan((9, 0), reason="TMA needs sm90")
+    def test_tensor_descriptor_prefetch_of_kernel_view(self) -> None:
+        """A view the kernel builds a multiple of 16 bytes past its input takes
+        the box form, keyed on the input's base alignment alone: an aligned
+        input at a storage offset reuses the bound kernel, and a misaligned one
+        binds another, which keeps the bulk form."""
+        storage = torch.randn([1024 * 256 + 8], device=DEVICE, dtype=torch.bfloat16)
+        aligned, offset, misaligned = (
+            storage[start : start + 1024 * 256].view(1024, 256) for start in (0, 8, 1)
+        )
+        codes = []
+        for w in (aligned, misaligned):
+            torch.testing.assert_close(box_prefetch_tail_copy(w), w, atol=0, rtol=0)
+            codes.append(box_prefetch_tail_copy.bind((w,)).to_code())
+        self.assertIn(_BOX, codes[0])
+        self.assertIn(_BULK, codes[1])
+        self.assertNotIn(_BOX, codes[1])
+        bound = box_prefetch_tail_copy.bind((aligned,))
+        self.assertIs(bound, box_prefetch_tail_copy.bind((offset,)))
+        self.assertIsNot(bound, box_prefetch_tail_copy.bind((misaligned,)))
 
     @skipIfCudaCapabilityLessThan((9, 0), reason="TMA needs sm90")
     def test_prefetch_map_first_built_in_capture(self) -> None:

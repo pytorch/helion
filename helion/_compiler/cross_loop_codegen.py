@@ -28,6 +28,7 @@ from .compile_environment import CompileEnvironment
 from .cross_loop_dsmem import CLUSTER_FLAG
 from .cross_loop_dsmem import CLUSTER_READY
 from .cross_loop_dsmem import check_dispatch
+from .cross_loop_dsmem import check_replicated
 from .cross_loop_dsmem import config_fallback
 from .cross_loop_dsmem import dsmem_transports
 from .cross_loop_dsmem import dsmem_worker_count
@@ -74,6 +75,7 @@ if TYPE_CHECKING:
     from collections.abc import Mapping
     from collections.abc import Sequence
 
+    from .cross_loop_dsmem import DsmemTransport
     from .device_function import DeviceFunction
     from .program_id import ForEachProgramID
     from .program_id import PersistentProgramIDs
@@ -654,9 +656,18 @@ def _write_guard(body: list[ast.stmt]) -> ast.If | None:
 
 
 def _may_write(call: ast.Call) -> bool:
-    """Whether a call may write memory: loads (pointer or descriptor) only read,
-    any other effect may write."""
-    return not _is_load(call) and _effect_kind(call) != "pure"
+    """Whether a call may write memory: loads (pointer or descriptor, or of a
+    dsmem slab) only read, any other effect may write."""
+    return (
+        not _is_load(call)
+        and not _is_cluster_recv(call)
+        and _effect_kind(call) != "pure"
+    )
+
+
+def _is_cluster_recv(call: ast.Call) -> bool:
+    """A dsmem slab read (``gluon_ops.cluster_recv``)."""
+    return _is_tl_call(call, frozenset({"cluster_recv"}), ("_helion_gluon",))
 
 
 def _allocation(tensor: torch.Tensor) -> int:
@@ -1075,7 +1086,7 @@ def tagged_codegen_graph(device_function: DeviceFunction) -> TileDependencyGraph
         cluster = frozenset(dsmem_transports(device_function))
         device_function.codegen_dependency_graph = (
             dataclasses.replace(
-                graph, tagged_allocation_ids=tagged, dsmem_allocation_ids=cluster
+                graph, tagged_allocation_ids=tagged, dsmem_load_ids=cluster
             )
             if tagged or cluster
             else graph
@@ -1721,23 +1732,16 @@ def _triton_root_requires_kernel_scope(
     """
     if target_device_capability is None or target_device_capability[0] < 10:
         return False
-    # Gluon ring sites (``gluon_ring`` / ``gluon_ops`` in generated code) carry
-    # the kernel's ring step and TMEM accumulators.
-    return _calls_module(
-        body,
-        {"tl": {"dot", "dot_scaled"}, "_helion_ring": None, "_helion_gluon": None},
-    )
-
-
-def _calls_module(body: list[ast.stmt], names: dict[str, set[str] | None]) -> bool:
-    """Whether ``body`` calls ``module.<name>`` for a module of ``names`` and one
-    of its names (any name when None)."""
     return any(
         isinstance(node, ast.Call)
         and isinstance(node.func, ast.Attribute)
         and isinstance(node.func.value, ast.Name)
-        and node.func.value.id in names
-        and ((attrs := names[node.func.value.id]) is None or node.func.attr in attrs)
+        and (
+            (node.func.value.id == "tl" and node.func.attr in {"dot", "dot_scaled"})
+            # Gluon ring sites (``gluon_ring`` / ``gluon_ops`` in generated
+            # code) carry the kernel's ring step and TMEM accumulators.
+            or node.func.value.id in {"_helion_ring", "_helion_gluon"}
+        )
         for statement in body
         for node in ast.walk(statement)
     )
@@ -1813,7 +1817,10 @@ def _is_load(node: ast.AST) -> TypeGuard[ast.Call]:
     )
 
 
-def _is_pure_call(node: ast.Call) -> bool:
+def _is_pure_call(node: ast.Call, slabs: frozenset[int] = frozenset()) -> bool:
+    """Whether a call computes only (``slabs``: the barriers of the dsmem
+    slabs complete for the rest of the launch once read, whose receives
+    count)."""
     func = node.func
     if not isinstance(func, ast.Attribute):
         return False
@@ -1822,6 +1829,12 @@ def _is_pure_call(node: ast.Call) -> bool:
     return isinstance(func.value, ast.Name) and (
         func.value.id in ("libdevice", "tl_math")
         or (func.value.id == "tl" and func.attr in _PURE_TL_CALLS)
+        or (
+            _is_cluster_recv(node)
+            and len(node.args) > 2
+            and isinstance(node.args[2], ast.Constant)
+            and node.args[2].value in slabs
+        )
         or (
             func.value.id == "helion_triton_helpers"
             and func.attr in _PURE_HELION_FILL_CALLS
@@ -1838,6 +1851,7 @@ def _guarded_extent(
     variant_names: frozenset[str],
     read_only_tensors: frozenset[str],
     tensor_names: frozenset[str],
+    slabs: frozenset[int] = frozenset(),
 ) -> _GuardedExtent | None:
     """Turn a trailing ``if offset < bound`` on the slowest PID axis into a task count.
 
@@ -1917,7 +1931,7 @@ def _guarded_extent(
             (
                 isinstance(node, ast.Call)
                 and not (compile_time_assert and node is value)
-                and not _is_pure_call(node)
+                and not _is_pure_call(node, slabs)
             )
             or (isinstance(node, ast.Name) and not isinstance(node.ctx, ast.Load))
             for node in ast.walk(value)
@@ -2445,8 +2459,11 @@ def _dry_pass_binds(
     bound: set[str],
     renames: Mapping[str, str] | None = None,
 ) -> bool:
-    """Whether every name a guard binds is read only under that guard (names
-    as ``renames`` maps them, see ``_free_reads``)."""
+    """Whether ``body`` (``bound`` stored on entry) still binds every name it
+    reads when the dry pass skips ``guards``: no guard reads a name another
+    guard binds, and a name a guard binds that is read outside it is bound on
+    every path that skips the guards (names as ``renames`` maps them, see
+    ``_free_reads``; ``x += v`` reads ``x``)."""
     renames = renames or {}
     guard_ids = {id(guard) for guard in guards}
     bound = {renames.get(name, name) for name in bound}
@@ -2455,6 +2472,8 @@ def _dry_pass_binds(
 
     def visit(node: ast.AST, scope: int) -> None:
         scope = id(node) if id(node) in guard_ids else scope
+        if isinstance(node, ast.AugAssign) and isinstance(node.target, ast.Name):
+            loads.append((renames.get(node.target.id, node.target.id), scope))
         if isinstance(node, ast.Name):
             name = renames.get(node.id, node.id)
             if isinstance(node.ctx, ast.Store):
@@ -2536,6 +2555,18 @@ def emit_cross_loop_schedule(
         geometry for geometry in configured_case_geometries if geometry is not None
     )
     worker = typed_program_id(0)
+    # A replicated slab's producer root runs on every cluster, and only cluster
+    # 0's workers arrive on its counters (``cross_loop_dsmem``).
+    replicated_producers = {
+        t.producer_root: t.size for t in clusters.values() if t.replicated
+    }
+
+    def first_cluster(root: int) -> str:
+        """The membership of ``root``'s arrivals (cluster 0's workers for a
+        replicated producer)."""
+        size = replicated_producers.get(root)
+        return "True" if size is None else f"({worker}) < {size}"
+
     epoch_var = device_function.new_var("tile_dependency_epoch", dce=False)
     case_bodies = cast("list[list[ast.stmt]]", owner.case_bodies)
     opaque_case_fingerprints = tuple(_ast_fingerprint(body) for body in case_bodies)
@@ -2992,7 +3023,7 @@ def emit_cross_loop_schedule(
         ]
         device_function.sync_roles[epoch_var] = SyncRole("launch")
         if clusters:
-            # Rank 0's barriers (armed at entry) are this launch's once its
+            # This CTA's barriers (armed at entry) are this launch's once its
             # flag holds the launch's epoch, tagged with this kernel's state,
             # and its cluster's id (the ring moves this after its read).
             device_function.sync_roles[CLUSTER_FLAG] = SyncRole("cluster")
@@ -3120,7 +3151,12 @@ def emit_cross_loop_schedule(
         )
 
     def root_barrier_dependency(root: int) -> tuple[str, str]:
-        arrivals = static_pipeline_plan.root_barrier_arrival_count(root)
+        arrivals = (
+            # Cluster 0's workers, after their task loops.
+            replicated_producers[root]
+            if root in replicated_producers
+            else static_pipeline_plan.root_barrier_arrival_count(root)
+        )
         return (
             root_barrier_counter(root),
             f"tl.cast({epoch_var}, tl.uint32) * tl.cast({arrivals}, tl.uint32)",
@@ -3208,7 +3244,12 @@ def emit_cross_loop_schedule(
     def root_barrier_arrivals(root: int, membership: str = "True") -> list[_Arrival]:
         if root not in root_barrier_indices:
             return []
-        return [_Arrival(root_barrier_counter(root), membership=membership)]
+        return [
+            _Arrival(
+                root_barrier_counter(root),
+                membership=_both(membership, first_cluster(root)),
+            )
+        ]
 
     def root_barrier_publication(root: int, *, synced: bool = False) -> list[ast.stmt]:
         arrivals = root_barrier_arrivals(root)
@@ -3476,6 +3517,8 @@ def emit_cross_loop_schedule(
                 for argument in device_function.arguments
                 if isinstance(argument, TensorArg)
             ),
+            # A replicated slab is every CTA's: its receives may hoist.
+            slabs=frozenset(t.barrier for t in clusters.values() if t.replicated),
         )
         if extent is not None:
             guarded_extents[root] = extent
@@ -3488,10 +3531,15 @@ def emit_cross_loop_schedule(
             "C2: packet dispatch" if uses_packet_dispatch else "C2: continuations",
         )
     for transport in clusters.values():
-        for root in (transport.store.root, transport.load.root):
+        if transport.replicated:
+            check_replicated(transport, dependency_graph)
+        for root in (transport.producer_root, transport.consumer_root):
             unfit = (
                 "not resident"
                 if root not in static_pipeline_plan.resident_roots
+                # A replicated slab is in every CTA: its consumer runs anywhere.
+                else None
+                if transport.replicated and root == transport.consumer_root
                 else "a guarded extent"
                 if root in guarded_extents
                 else "claimed tasks"
@@ -4365,12 +4413,12 @@ def emit_cross_loop_schedule(
         worker's root-barrier arrival, made with its last task's arrivals."""
         body: list[ast.stmt] = []
         if root in dsmem_producers:
-            # Before any send, rank 0's barriers are this launch's.
+            # Before any send, the barriers it reaches are this launch's.
             assert state_arg is not None
             body.append(
                 statement_from_string(
                     f"{CLUSTER_READY} = _helion_gluon.cluster_ready("
-                    f"{epoch_var}, {state_arg})"
+                    f"{epoch_var}, {state_arg}, {dsmem_ready_ranks(root)})"
                 )
             )
         extent = guarded_extents.get(root)
@@ -4643,13 +4691,16 @@ def emit_cross_loop_schedule(
             # continuation, always releases.)
             guard.orelse = _emit_arrivals(
                 device_function,
-                [
-                    part
-                    for plan, producer in producer_counters
-                    for part in emit_readiness_arrivals_from_producer(
-                        plan, producer, scheduled_coordinates
-                    )
-                ],
+                _arrival_parts_under(
+                    [
+                        part
+                        for plan, producer in producer_counters
+                        for part in emit_readiness_arrivals_from_producer(
+                            plan, producer, scheduled_coordinates
+                        )
+                    ],
+                    first_cluster(root),
+                ),
                 "relaxed",
             )
             body = guard.body
@@ -4658,16 +4709,19 @@ def emit_cross_loop_schedule(
         body.extend(
             _emit_arrivals(
                 device_function,
-                [
-                    *(
-                        part
-                        for plan, producer in producer_counters
-                        for part in emit_readiness_arrivals_from_producer(
-                            plan, producer, scheduled_coordinates
-                        )
-                    ),
-                    *([] if root_arrival is None else [root_arrival]),
-                ],
+                _arrival_parts_under(
+                    [
+                        *(
+                            part
+                            for plan, producer in producer_counters
+                            for part in emit_readiness_arrivals_from_producer(
+                                plan, producer, scheduled_coordinates
+                            )
+                        ),
+                        *([] if root_arrival is None else [root_arrival]),
+                    ],
+                    first_cluster(root),
+                ),
                 "release",
             )
         )
@@ -4681,7 +4735,8 @@ def emit_cross_loop_schedule(
         is_single_trip_occurrence = (
             root not in static_pipeline_plan.continuation_roots
             and static_pipeline_plan.execution_orders[root].task_count
-            <= launch_worker_count
+            # A replicated producer's workers step by the cluster size.
+            <= replicated_producers.get(root, launch_worker_count)
         )
         scheduled_wrapper_noinline = (
             not is_single_trip_occurrence
@@ -4756,33 +4811,75 @@ def emit_cross_loop_schedule(
         run.append(resident)
         lanes_end = root_lane_origins[resident] + tasks
 
-    dsmem_producers = {t.store.root: t for t in clusters.values()}
-    dsmem_consumers = {t.load.root: t for t in clusters.values()}
+    # Per root, the transport that gives its lanes: a cluster's over a local
+    # slab's over a replicated slab's (whose consumer runs anywhere).
+    def lanes_rank(t: DsmemTransport) -> tuple[bool, bool]:
+        return not t.replicated, not t.local
+
+    dsmem_producers = {
+        t.producer_root: t for t in sorted(clusters.values(), key=lanes_rank)
+    }
+    dsmem_consumers = {
+        t.consumer_root: t for t in sorted(clusters.values(), key=lanes_rank)
+    }
+
+    def dsmem_ready_ranks(root: int) -> int:
+        """The flags a producer root polls (``cluster_ready``): those of the
+        ranks its transports send to, every rank's (a per-rank consumer's or
+        a replicated slab), rank 0's (1) or its own CTA's (0, a local slab);
+        every rank's for several of these."""
+        sent = [t for t in clusters.values() if t.producer_root == root]
+        needs = {
+            t.size if t.per_rank or t.replicated else int(not t.local) for t in sent
+        }
+        return needs.pop() if len(needs) == 1 else max(t.size for t in sent)
+
+    def cluster_task(transport: DsmemTransport, multiplier: int | None) -> str:
+        """The task, at the worker's rank on a split axis of ``multiplier``,
+        of the key of the lane its cluster's rank 0 would take in the producer
+        root (that lane over the cluster size): one cluster runs the tasks of
+        one key (a bijection, single wave)."""
+        size = transport.size
+        leader = f"(({worker}) // {size} * {size})"
+        assert multiplier is not None
+        return (
+            "("
+            + split_task(
+                f"({rotated_lane(transport.producer_root, leader)}) // {size}",
+                f"({worker}) % {size}",
+                size,
+                multiplier,
+            )
+            + ")"
+        )
 
     def root_lane(root: int) -> str:
-        if (transport := dsmem_producers.get(root)) is not None:
-            # The key of the lane rank 0 of the worker's cluster would take
-            # (that lane over the cluster size), and the worker's rank on the
-            # split axis: one cluster runs the tasks of one key (a bijection,
-            # single wave).
-            size = transport.size
-            leader = f"(({worker}) // {size} * {size})"
-            return (
-                "("
-                + split_task(
-                    f"({rotated_lane(root, leader)}) // {size}",
-                    f"({worker}) % {size}",
-                    size,
-                    split_multipliers[transport.allocation_id],
-                )
-                + ")"
+        if root in replicated_producers:
+            # Every cluster runs every task: rank r the tasks r, r + size, ...
+            return f"({worker}) % {replicated_producers[root]}"
+        if (transport := dsmem_producers.get(root)) is not None and not transport.local:
+            return cluster_task(
+                transport, split_multipliers[transport.load.access_id][0]
             )
-        if (transport := dsmem_consumers.get(root)) is not None:
+        if (transport := dsmem_consumers.get(root)) is not None and (
+            transport.per_rank
+        ):
+            # Every rank takes the consumer task of its key and split coordinate,
+            # as the producer task its worker runs.
+            return cluster_task(
+                transport, split_multipliers[transport.load.access_id][1]
+            )
+        if (transport := dsmem_consumers.get(root)) is not None and transport.local:
+            # The consumer task of the producer task the worker runs.
+            return rotated_lane(transport.producer_root, worker)
+        if (
+            transport := dsmem_consumers.get(root)
+        ) is not None and not transport.replicated:
             # Rank 0 takes the key whose producer tasks its cluster runs.
             size = transport.size
             return (
                 f"tl.where(({worker}) % {size} == 0, "
-                f"({rotated_lane(transport.store.root, worker)}) // {size}, "
+                f"({rotated_lane(transport.producer_root, worker)}) // {size}, "
                 f"{launch_worker_count})"
             )
         return rotated_lane(root, worker)
@@ -4969,7 +5066,14 @@ def emit_cross_loop_schedule(
     def static_root_body(root: int) -> list[ast.stmt]:
         """Lower one resident root from its scalar ownership fold."""
         task_count_value = static_pipeline_plan.execution_orders[root].task_count
-        active_worker_count = min(launch_worker_count, task_count_value)
+        # A replicated producer's tasks run on every worker, a cluster's ranks
+        # apart.
+        task_step = replicated_producers.get(root, launch_worker_count)
+        active_worker_count = (
+            launch_worker_count
+            if root in replicated_producers
+            else min(launch_worker_count, task_count_value)
+        )
         segment_begin = static_pipeline_plan.static_base(root)
         segment_end = segment_begin + task_count_value
         lane = root_lane(root)
@@ -5106,12 +5210,14 @@ def emit_cross_loop_schedule(
         root_arrival = (
             _Arrival(
                 root_barrier_counter(root),
-                membership=f"({strategy.virtual_pid_var}) + {launch_worker_count}"
+                membership=f"({strategy.virtual_pid_var}) + {task_step}"
                 f" >= {segment_stop}",
             )
             if folds_root_arrival(root)
             and root_counters_by_producer.get(root)
             and extent is None
+            # Every worker of cluster 0 arrives (``root_barrier_dependency``).
+            and root not in replicated_producers
             and root not in ws_roots
             and root not in deferred_last_task
             else None
@@ -5189,7 +5295,7 @@ def emit_cross_loop_schedule(
                         block_ids,
                         begin=first_task,
                         end=segment_stop,
-                        step=str(launch_worker_count),
+                        step=str(task_step),
                     )
                 ),
                 body=task_body,

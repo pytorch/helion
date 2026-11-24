@@ -3,8 +3,8 @@ bound with their pinned or measured configs on a modelled B200 (under a fake
 process group for the tensor-parallel ones): the Llama-3.2-1B and Qwen3-8B
 verify layers, the DeepSeek-V3 verify MoE on 1 GPU and at TP4 (which tensors
 stream through the ring), and Muse Spark's served builds (every image of the
-decoder-layer megakernel at TP4 and TP8, the LM head, the expert-TP MoE). Their
-checks run on GPUs in ``test_pretuned_kernels``."""
+decoder-layer megakernel at TP4 and TP8, and the LM head). Their checks run on
+GPUs in ``test_pretuned_kernels``."""
 
 from __future__ import annotations
 
@@ -23,6 +23,7 @@ import torch.distributed._symmetric_memory as symm_mem
 from torch.testing._internal.distributed.fake_pg import FakeStore
 
 from helion._compat import gluon_api_available
+from helion._testing import skipIfRefEagerMark
 from helion._testing.triton_codegen import gluon_cpu_codegen
 from helion.runtime.settings import _get_backend
 
@@ -34,7 +35,10 @@ if TYPE_CHECKING:
 if _get_backend() != "triton":
     raise unittest.SkipTest("the verify megakernels run in the triton lane")
 
-pytestmark = pytest.mark.cpu_only
+pytestmark = [
+    pytest.mark.cpu_only,
+    skipIfRefEagerMark("inspects generated code, which ref mode does not build"),
+]
 
 _needs_gluon = pytest.mark.skipif(
     not gluon_api_available(), reason="the kernel is a native Gluon kernel"
@@ -77,13 +81,6 @@ def _modelled_b200() -> Generator[None, None, None]:
         stack.enter_context(gluon_cpu_codegen())
         stack.enter_context(
             patch("torch.cuda.get_device_properties", return_value=device)
-        )
-        # The driver's cluster occupancy query: every SM, in clusters of any size.
-        stack.enter_context(
-            patch(
-                "helion._compiler.cross_loop_dsmem.get_cluster_capacity",
-                new=lambda device, size: _SMS - _SMS % size,
-            )
         )
         stack.enter_context(patch.object(symm_mem, "empty", _symmetric_empty))
         stack.enter_context(
@@ -145,9 +142,9 @@ _VERIFY_LAYER_RING_TENSORS = {
 
 
 @_needs_gluon
+@pytest.mark.slow  # binds in 20-23 s per layer
 @pytest.mark.parametrize("name", list(_VERIFY_LAYER_RING_TENSORS))
 def test_verify_layer_generates_code(name: str) -> None:
-    # Their checks are slow-tier; this keeps code generation covered.
     module = importlib.import_module(f"pretuned_kernels.megakernels.{name}")
     kernel = getattr(module, name.rpartition(".")[2])
     # Uninitialized inputs: binding and code generation need only shapes.
@@ -305,8 +302,10 @@ def test_layer_megakernel_generates_code(world: int, image: str) -> None:
         # The entry image reads layer 0's bf16 embedding rows.
         dtype = torch.bfloat16 if image == "entry" else torch.float32
         stream = torch.empty(layer.TOKENS, layer.HIDDEN, dtype=dtype)
-        kernel = case.host._kernel
-        code = _generate(kernel, layer._launch_args(case, attention, qkv, stream))
+        args, _ = case.host._args(
+            qkv=qkv, stream=stream, weights=case.weights, attention=attention
+        )
+        code = _generate(case.host._kernel, args)
     assert _ring_tensors(code) == _layer_ring_tensors(world, image)
 
 
@@ -315,29 +314,21 @@ def test_layer_megakernel_generates_code(world: int, image: str) -> None:
 def test_lm_head_generates_code(world: int) -> None:
     from pretuned_kernels.megakernels.muse_spark import lm_head
 
-    tokens, shard = 8, 4 * lm_head.VOCAB_SHARD // world
-    blocks = -(-shard // lm_head.G_BLOCK)
-    f32, i32 = torch.float32, torch.int32
-    with _modelled_ranks(world) as group:
-        args = (
-            torch.empty(tokens, lm_head.HIDDEN, dtype=torch.bfloat16),
-            torch.empty(shard, lm_head.HIDDEN, dtype=torch.bfloat16),
-            torch.empty(tokens, blocks * lm_head.G_BLOCK, dtype=f32),
-            torch.empty(tokens, world, shard, dtype=f32),
-            torch.empty(tokens, blocks, dtype=f32),
-            torch.empty(tokens, blocks, dtype=i32),
-            torch.empty(tokens, dtype=f32),
-            torch.empty(tokens, dtype=i32),
-            torch.ones(1, dtype=i32),
-            torch.empty(tokens, dtype=i32),
-            group.group_name,
-            0,
-            world,
-            lm_head.LOGIT_SCALE,
-            lm_head.LOGIT_CAP,
+    tokens, bf16 = 8, torch.bfloat16
+    kernel = lm_head.muse_spark_lm_head
+    # launch()'s arguments, recorded instead of launched.
+    with (
+        _modelled_ranks(world) as group,
+        patch.object(lm_head, "muse_spark_lm_head") as call,
+    ):
+        lm_head.launch(
+            torch.empty(tokens, lm_head.HIDDEN, dtype=bf16),
+            torch.empty(lm_head.VOCAB // world, lm_head.HIDDEN, dtype=bf16),
+            lm_head.make_workspaces(tokens, group, _CPU),
+            torch.empty(tokens, lm_head.VOCAB),
+            group,
         )
-        kernel = lm_head.muse_spark_lm_head
-        code = _generate(kernel, args)
+        code = _generate(kernel, call.call_args.args)
     # Pointer indexing throughout: no TMA ring and no tensor descriptors.
     assert _ring_tensors(code) == []
     assert not re.findall(r"\b\w+_desc\b", code)

@@ -331,9 +331,9 @@ class SyncRole:
     # exchange (``cross_loop_dsmem``: shared memory and DSMEM only), which
     # orders no global memory either.
     kind: str
-    # A wait's covered obligations: the allocations whose reads it orders
-    # (None: every read; one no tensor argument names makes it order every
-    # read too, ``gluon_ring._orders``).
+    # A wait's covered obligations: the allocations whose accesses, reads or
+    # writes, it orders (``_covering``; None: every access; one no tensor
+    # argument names makes it order every access too, ``gluon_ring._orders``).
     covers: frozenset[int] | None = None
     # A covering wait that also orders its root's barrier publication (whose
     # waiters rely on it transitively): the publishing partition keeps it.
@@ -557,8 +557,8 @@ class DeviceFunction:
         self.triton_outlined_helper_constexprs: dict[str, int] = {}
         # The scheduler's synchronization statements, by the names they assign.
         self.sync_roles: dict[str, SyncRole] = {}
-        # The allocations this config carries in launch clusters, by allocation
-        # (``cross_loop_dsmem.dsmem``; None until first asked).
+        # The loads this config carries in launch clusters, by access id
+        # (``cross_loop_dsmem.dsmem_transports``; None until first asked).
         self.dsmem: dict[int, DsmemTransport] | None = None
         # The scheduler's end-of-launch rewrites of the launch state it reads
         # (the "launch" sync roles), in program order.

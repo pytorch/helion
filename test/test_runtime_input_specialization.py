@@ -1448,6 +1448,12 @@ class TestDerivedInputStorageProvenance(unittest.TestCase):
                 self.assertIsNone(
                     env.tensor_descriptor_alignment_source(x.flatten()[1:])
                 )
+                # A view a multiple of 16 bytes past its owner (a row block)
+                # shares the owner's base alignment.
+                for view in (x[1:], x.flatten()[4:]):
+                    self.assertEqual(
+                        env.tensor_descriptor_alignment_source(view), source
+                    )
                 self.assertIsNone(env.tensor_storage_input_source(x.clone()))
 
     def test_derived_storage_owner_rejects_ambiguity_and_unknown_layout(self) -> None:

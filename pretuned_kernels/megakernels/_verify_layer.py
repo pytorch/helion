@@ -141,6 +141,12 @@ def cache_rows(layer: Layer, tensors: dict[str, torch.Tensor]) -> list[torch.Ten
 
 
 def kernel_args(layer: Layer, tensors: dict[str, torch.Tensor]) -> tuple[object, ...]:
+    # The kernels' attention tasks take all T x (query heads per KV head) rows
+    # at once. Checked here: binding fails at a reshape for any other T, before
+    # an assert in the kernel body would run.
+    tokens = tensors["hidden_states"].size(0)
+    if tokens < 1 or tokens & (tokens - 1):
+        raise ValueError(f"the token count must be a power of two, not {tokens}")
     norms = ("q_weight", "k_weight") if layer.qk_norm else ()
     names = (
         "hidden_states",
@@ -178,7 +184,11 @@ def kernel_args(layer: Layer, tensors: dict[str, torch.Tensor]) -> tuple[object,
 def reference(
     layer: Layer, tensors: dict[str, torch.Tensor]
 ) -> dict[str, torch.Tensor]:
-    """FP32 PyTorch layer (BF16 at the kernel's stored intermediates)."""
+    """FP32 PyTorch layer, rounded to BF16 at the residuals and at every GEMM's
+    input and output but gate/up's. The kernels differ: they normalize the
+    unrounded residual sums, scaling by 1 / rms after the GEMM, and also store
+    gate/up and the new K rows in BF16 (rounding those two here alone moves the
+    reference no closer)."""
     f = torch.float32
     d, eps = layer.head_dim, layer.eps
     q_heads, kv_heads = layer.q_heads, layer.kv_heads

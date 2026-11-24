@@ -26,12 +26,9 @@ from helion._compiler.cross_loop_codegen import _allocation
 from helion._compiler.device_function import SyncRole
 from helion._compiler.loop_dependency_checker import INTRA_LOOP_RAW_BARRIER_META
 from helion._compiler.loop_dependency_checker import emit_intra_loop_raw_barrier
-from helion._compiler.loop_dependency_checker import intra_loop_raw_reread_block_ids
 from helion._compiler.loop_dependency_checker import mark_intra_loop_raw_barriers
 from helion._testing import DEVICE
 from helion._testing import cpu_render_target
-from helion._testing import skipIfRefEager
-from helion._testing import skipIfTileIR
 from helion._testing import skipUnlessTritonBarriers
 from helion._testing.cute_codegen import cpu_bind
 import helion.language as hl
@@ -98,6 +95,16 @@ def _packed_load_after_a_store(x: torch.Tensor, offsets: torch.Tensor) -> torch.
         x[:] = x.new_zeros([128])
         # A packed load reads anywhere in its tensor.
         lanes = hl.load_bfloat16_x16_to_float16(x, offsets[tile])
+        for i in hl.static_range(16):
+            out[tile, i] = lanes[i]
+    return out
+
+
+def _fp4_load_after_a_store(x: torch.Tensor, offsets: torch.Tensor) -> torch.Tensor:
+    out = torch.empty([offsets.size(0), 16], dtype=torch.float16, device=x.device)
+    for tile in hl.tile(offsets.size(0)):
+        x[:] = x.new_zeros([128])
+        lanes = hl.load_float4_e2m1fn_x16_to_float16(x, offsets[tile])
         for i in hl.static_range(16):
             out[tile, i] = lanes[i]
     return out
@@ -192,6 +199,29 @@ def _updates_its_own_tile(x: torch.Tensor) -> torch.Tensor:
     return x
 
 
+def _updates_its_head_block(x: torch.Tensor) -> torch.Tensor:
+    for tile_m, tile_h in hl.tile([x.size(0), 2], block_size=[None, 1]):
+        columns = tile_h.begin * 64 + hl.arange(64)
+        x[tile_m, columns] = x[tile_m, columns] * 2.0
+    return x
+
+
+def _updates_a_block_per_iteration(x: torch.Tensor) -> torch.Tensor:
+    for tile_m in hl.tile(x.size(0)):
+        for tile_n in hl.tile(x.size(1), block_size=16):
+            columns = tile_n.begin + hl.arange(16)
+            x[tile_m, columns] = x[tile_m, columns] * 2.0
+    return x
+
+
+def _updates_a_block_per_grid_index(x: torch.Tensor) -> torch.Tensor:
+    for tile_m in hl.tile(x.size(0)):
+        for h in hl.grid(2):
+            columns = hl.arange(64) + h * 64
+            x[tile_m, columns] = x[tile_m, columns] * 2.0
+    return x
+
+
 def _updates_in_a_loop(x: torch.Tensor) -> torch.Tensor:
     for tile_m in hl.tile(x.size(0), block_size=1):
         for tile_n in hl.tile(x.size(1)):
@@ -217,6 +247,50 @@ def _stores_two_slots(x: torch.Tensor) -> torch.Tensor:
     return x
 
 
+def _stores_slots_through_a_zero_stride(x: torch.Tensor) -> torch.Tensor:
+    for tile_m in hl.tile(x.size(0)):
+        rows = tile_m.index[:, None]
+        # A zero-stride slot index (the broadcast spelling of a constant).
+        zero = rows * 0
+        columns = hl.arange(128)[None, :]
+        hl.store(x, [rows, zero, columns], x.new_ones([tile_m, 128]))
+        hl.store(x, [rows, zero + 1, columns], x.new_zeros([tile_m, 128]))
+    return x
+
+
+def _stores_shifted_column_blocks(x: torch.Tensor) -> torch.Tensor:
+    for tile_m, tile_h in hl.tile([x.size(0), 2], block_size=[None, 1]):
+        # A block per head: the head's offset is in both indices.
+        columns = tile_h.begin * 128 + hl.arange(128)
+        x[tile_m, columns] = x.new_ones([tile_m, 128])
+        x[tile_m, 256 + columns] = x.new_zeros([tile_m, 128])
+    return x
+
+
+def _stores_a_block_past_the_first(x: torch.Tensor) -> torch.Tensor:
+    for tile_m, tile_v in hl.tile([x.size(0), 128], block_size=[None, 16]):
+        x[tile_m, hl.arange(128)] = x.new_ones([tile_m, 128])
+        # The loop runs from 0: its tile begins at 0 or later.
+        x[tile_m, 128 + tile_v.begin + hl.arange(16)] = x.new_zeros([tile_m, 16])
+    return x
+
+
+def _stores_a_block_per_iteration(x: torch.Tensor) -> torch.Tensor:
+    for tile_m in hl.tile(x.size(0)):
+        for tile_n in hl.tile(x.size(1), block_size=16):
+            # The next tile begins past this block.
+            x[tile_m, tile_n.begin + hl.arange(16)] = x.new_ones([tile_m, 16])
+    return x
+
+
+def _stores_a_block_into_the_first(x: torch.Tensor) -> torch.Tensor:
+    for tile_m, tile_v in hl.tile([x.size(0), 128], block_size=[None, 16]):
+        x[tile_m, hl.arange(128)] = x.new_ones([tile_m, 128])
+        # Columns 120 to 127 of the first block, in the first tile.
+        x[tile_m, 120 + tile_v.begin + hl.arange(16)] = x.new_zeros([tile_m, 16])
+    return x
+
+
 def _doubles_one_half_into_the_other(x: torch.Tensor) -> torch.Tensor:
     for tile_m in hl.tile(x.size(0)):
         x[tile_m, 64:128] = x[tile_m, 0:64] * 2.0
@@ -229,6 +303,35 @@ def _stores_its_rows_each_iteration(x: torch.Tensor, y: torch.Tensor) -> torch.T
             # Each iteration overwrites the block the one before stored, from
             # the same threads.
             x[tile_m, 0:64] = y[tile_m, tile_k]
+    return x
+
+
+def _stores_its_tile_each_iteration(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    for tile_m in hl.tile(x.size(0)):
+        for tile_k in hl.tile(x.size(1)):
+            x[tile_m, tile_k] = y[tile_m, tile_k]
+    return x
+
+
+def _stores_a_new_tensor_each_iteration(x: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tile_m in hl.tile(x.size(0)):
+        for tile_k in hl.tile(x.size(1)):
+            out[tile_m, tile_k] = x[tile_m, tile_k] + 1
+    return out
+
+
+def _stores_its_head_blocks_each_iteration(
+    x: torch.Tensor, y: torch.Tensor
+) -> torch.Tensor:
+    for tile_m, tile_h in hl.tile([x.size(0), 2], block_size=[None, 1]):
+        for tile_k in hl.tile(y.size(1)):
+            # The head's offset holds through the loop: each iteration
+            # overwrites the blocks the one before stored, from the same
+            # threads, and neither block meets the other.
+            for i in hl.static_range(2):
+                columns = tile_h.begin * 128 + 64 * i + hl.arange(64)
+                x[tile_m, columns] = y[tile_m, tile_k]
     return x
 
 
@@ -264,6 +367,53 @@ def _sibling_loop_restores(x: torch.Tensor) -> torch.Tensor:
     return x
 
 
+def _sibling_loop_reads_the_next_tiles(x: torch.Tensor) -> torch.Tensor:
+    block = hl.register_block_size(16, 16)
+    out = torch.empty([x.size(0), 32], device=x.device)
+    for tile_m in hl.tile(x.size(0)):
+        for tile_n in hl.tile(64, block_size=block):
+            x[tile_m, tile_n.begin + hl.arange(16)] = x.new_ones([tile_m, 16])
+        # The loops share a block size, so a tile's begin: this loop's tile
+        # at ``b`` reads what the first's at ``b + 16`` and ``b + 32`` stored.
+        for tile_n in hl.tile(64, block_size=block):
+            out[tile_m, :] = x[tile_m, tile_n.begin + 16 + hl.arange(32)]
+    return out
+
+
+def _sibling_loop_reads_a_later_tile(x: torch.Tensor) -> torch.Tensor:
+    block = hl.register_block_size(16, 16)
+    out = torch.empty([x.size(0), 64], device=x.device)
+    for tile_m in hl.tile(x.size(0)):
+        for tile_n in hl.tile(64, block_size=block):
+            x[tile_m, tile_n.begin] = x.new_ones([tile_m])
+        # A finished loop's tile begin is not this loop's: the first loop
+        # stored at every block, so ``b + 16`` may be one of its stores.
+        for tile_n in hl.tile(64, block_size=block):
+            out[tile_m, tile_n.begin] = x[tile_m, tile_n.begin + 16]
+    return out
+
+
+def _sibling_loop_reads_the_other_row(x: torch.Tensor) -> torch.Tensor:
+    out = torch.empty([x.size(0) // 2, x.size(1)], device=x.device)
+    for tile_m in hl.tile(x.size(0) // 2, block_size=1):
+        for tile_n in hl.tile(x.size(1)):
+            x[tile_m.begin * 2, tile_n] = x.new_ones([tile_n])
+        # The root's index holds its value through the finished loop: rows
+        # 2b and 2b + 1 never meet.
+        for tile_n in hl.tile(x.size(1)):
+            out[tile_m.begin, tile_n] = x[tile_m.begin * 2 + 1, tile_n]
+    return out
+
+
+def _reads_the_other_row_after_the_loop(x: torch.Tensor) -> torch.Tensor:
+    out = torch.empty([x.size(0) // 2, x.size(1)], device=x.device)
+    for tile_m, tile_n in hl.tile([x.size(0) // 2, x.size(1)], block_size=[1, None]):
+        for _ in hl.tile(4):
+            x[tile_m.begin * 2, tile_n] = x.new_ones([tile_n])
+        out[tile_m.begin, tile_n] = x[tile_m.begin * 2 + 1, tile_n]
+    return out
+
+
 def _reads_three_then_overwrites_two(
     x: torch.Tensor, y: torch.Tensor, z: torch.Tensor
 ) -> torch.Tensor:
@@ -286,16 +436,28 @@ _ARGS: dict[object, tuple[object, ...]] = {
     _gathers_and_updates: (torch.randn(64), torch.randint(0, 64, [32])),
     _transposes_its_own_tile: (torch.randn(64, 64),),
     _packed_load_after_a_store: (torch.randn(128).bfloat16(), torch.randint(0, 8, [8])),
+    _fp4_load_after_a_store: (
+        torch.randint(0, 256, [128], dtype=torch.uint8),
+        torch.randint(0, 16, [8]),
+    ),
     _reads_what_the_last_iteration_stored: _pair(),
     _writes_a_shifted_view: _pair(),
     _stores_reversed_every_other_iteration: (torch.randn(32, 64), torch.randn(32, 128)),
     _stores_two_slots: (torch.randn(32, 2, 128),),
+    _stores_slots_through_a_zero_stride: (torch.randn(32, 2, 128),),
+    _stores_shifted_column_blocks: (torch.randn(32, 512),),
+    _stores_a_block_past_the_first: (torch.randn(32, 256),),
+    _stores_a_block_into_the_first: (torch.randn(32, 256),),
     _reads_the_slot_the_last_iteration_stored: (
         torch.randn(32, 33),
         torch.randn(32, 32),
     ),
     _stores_windows_that_overlap: (torch.randn(32, 128), torch.randn(32, 4)),
     _stores_its_rows_each_iteration: (torch.randn(128, 128), torch.randn(128, 128)),
+    _stores_its_head_blocks_each_iteration: (
+        torch.randn(32, 256),
+        torch.randn(32, 128),
+    ),
     _stores_its_tile_while_counting: (
         torch.randn(128, 128),
         torch.randn(128, 128),
@@ -355,6 +517,7 @@ def _tma_code(fn: object, indexing: list[str]) -> str:
         (_reads_what_it_overwrote, "tl.store(x", "tl.load(x", ()),
         (_resets_what_it_added_into, "tl.atomic_add(x", "tl.store(x", ()),
         (_packed_load_after_a_store, "tl.store(x", "tl.load(x.to(", ()),
+        (_fp4_load_after_a_store, "tl.store(x", "tl.load(x.to(", ()),
         # Loaded indices may name one element twice; a transpose moves values.
         (_gathers_and_updates, "tl.load(x", "tl.store(x", ()),
         (_transposes_its_own_tile, "tl.load(x", "tl.store(x", ()),
@@ -362,6 +525,7 @@ def _tma_code(fn: object, indexing: list[str]) -> str:
         # element takes both halves to it.
         (_restores_part_of_what_it_stored, "tl.store(x", "tl.store(x", ()),
         (_stores_wrapping_halves, "tl.store(x", "tl.store(x", ()),
+        (_stores_a_block_into_the_first, "tl.store(x", "tl.store(x", ()),
         (
             _stores_the_halves_of_a_row,
             "tl.store(x",
@@ -376,6 +540,14 @@ def _tma_code(fn: object, indexing: list[str]) -> str:
         # Another iteration's loop index, and a window that begins elsewhere.
         (_reads_the_slot_the_last_iteration_stored, None, "tl.load(x", ()),
         (_stores_windows_that_overlap, None, "tl.store(x", ()),
+        # A view whose rows share elements: the next tile's store puts one on
+        # another thread.
+        (
+            _stores_its_tile_each_iteration,
+            None,
+            "tl.store(x",
+            (torch.randn(160).as_strided((32, 128), (1, 1)), torch.randn(32, 128)),
+        ),
     ],
 )
 def test_accesses_that_may_meet_follow_a_barrier(
@@ -388,19 +560,77 @@ def test_accesses_that_may_meet_follow_a_barrier(
     assert barrier < code.index(second, barrier), code
 
 
+def _stores_rows_of_a_zeros_like(x: torch.Tensor) -> torch.Tensor:
+    out = torch.zeros_like(x)
+    for tile_n in hl.tile(x.size(1)):
+        for tile_m in hl.tile(x.size(0)):
+            out[tile_m, tile_n] = x[tile_m, tile_n] * 2
+    return out
+
+
+def _stores_rows_of_an_empty_of_scalar_sizes(
+    x: torch.Tensor, heads: int
+) -> torch.Tensor:
+    out = torch.empty(
+        [x.size(0) // heads, heads, x.size(1)], dtype=x.dtype, device=x.device
+    )
+    for bh in hl.grid(x.size(0)):
+        for tile_m in hl.tile(x.size(1)):
+            out[bh // heads, bh % heads, tile_m] = x[bh, tile_m] * 2
+    return out
+
+
+@skipUnlessTritonBarriers
+@pytest.mark.parametrize(
+    ("fn", "args", "static"),
+    [
+        (_stores_rows_of_a_zeros_like, (torch.randn(32, 128),), False),
+        (_stores_rows_of_an_empty_of_scalar_sizes, (torch.randn(8, 64), 4), True),
+    ],
+)
+def test_a_torch_laid_out_allocation_takes_no_barrier(
+    fn: object, args: tuple[object, ...], static: bool
+) -> None:
+    # torch lays out a fresh allocation itself (``*_like`` as a permutation of
+    # a dense layout, ``empty`` contiguously), so distinct indices name
+    # distinct elements whatever its symbolic sizes or its input's strides.
+    with cpu_render_target():
+        bound = cpu_bind(helion.kernel(fn, static_shapes=static), args)
+        config = bound.config_spec.default_config().config
+        config["block_sizes"] = [16] * len(config["block_sizes"])
+        assert _BARRIER not in bound.to_code(helion.Config(**config))
+
+
 @skipUnlessTritonBarriers
 @pytest.mark.parametrize(
     "fn",
     [
-        # ``x[t] = f(x[t])``, also in a loop over the row's tiles.
+        # ``x[t] = f(x[t])``, also in a loop over the row's tiles, and at a
+        # block of a tile's begin or grid index (one value in an iteration;
+        # the next iteration's block lies past it).
         _updates_its_own_tile,
         _updates_in_a_loop,
+        _updates_its_head_block,
+        _updates_a_block_per_iteration,
+        _updates_a_block_per_grid_index,
         # Indices that never meet: ``hl.arange`` offsets, slots, slices.
         _stores_the_halves_of_a_row,
         _stores_two_slots,
         _doubles_one_half_into_the_other,
-        # The same store each iteration, from the same threads.
+        # A zero-stride slot, a shared symbolic offset, a tile's begin in a
+        # loop from 0, and a block at each tile's begin.
+        _stores_slots_through_a_zero_stride,
+        _stores_shifted_column_blocks,
+        _stores_a_block_past_the_first,
+        _stores_a_block_per_iteration,
+        # The same store each iteration, from the same threads, also at an
+        # offset of an outer loop's index.
         _stores_its_rows_each_iteration,
+        _stores_its_head_blocks_each_iteration,
+        # Rows at the root's index apart from those a finished or sibling
+        # loop stored.
+        _sibling_loop_reads_the_other_row,
+        _reads_the_other_row_after_the_loop,
     ],
 )
 def test_accesses_that_never_meet_take_no_barrier(fn: object) -> None:
@@ -420,7 +650,27 @@ def test_an_update_under_dynamic_shapes_follows_a_barrier() -> None:
 
 
 @skipUnlessTritonBarriers
-@pytest.mark.parametrize("fn", [_sibling_loop_overwrites, _sibling_loop_restores])
+def test_an_allocation_under_dynamic_shapes_takes_no_barrier() -> None:
+    # The wrapper allocates ``out`` from the symbolic sizes: its strides
+    # (s1, 1) nest in every call, so the same store each iteration needs none.
+    with cpu_render_target():
+        bound = cpu_bind(
+            helion.kernel(_stores_a_new_tensor_each_iteration, static_shapes=False),
+            (torch.randn(32, 128),),
+        )
+        assert _BARRIER not in bound.to_code(helion.Config(block_sizes=[1, 16]))
+
+
+@skipUnlessTritonBarriers
+@pytest.mark.parametrize(
+    "fn",
+    [
+        _sibling_loop_overwrites,
+        _sibling_loop_restores,
+        _sibling_loop_reads_the_next_tiles,
+        _sibling_loop_reads_a_later_tile,
+    ],
+)
 def test_a_sibling_loop_follows_one_barrier(fn: object) -> None:
     # One barrier between the loops, not one per iteration of the second.
     kernel = next(
@@ -435,22 +685,21 @@ def test_a_sibling_loop_follows_one_barrier(fn: object) -> None:
     assert _BARRIER not in ast.unparse(loops[1])
 
 
-@skipIfTileIR("TileIR runs no intra-loop barrier walk")
-@skipIfRefEager("ref-eager mode builds no device IR")
+@skipUnlessTritonBarriers
 @pytest.mark.parametrize(
     ("fn", "pinned"), [(_overwrites_in_a_loop, True), (_updates_in_a_loop, False)]
 )
 def test_a_loop_taking_a_barrier_is_not_warp_specialized(
     fn: object, pinned: bool
 ) -> None:
-    # Warp specialization would split the loop's barrier per partition.
-    bound = _bind(fn)
-    device_ir = bound.host_function.device_ir
-    with bound.env, bound.host_function:
-        block_ids = intra_loop_raw_reread_block_ids(
-            device_ir.graphs, device_ir.root_ids, device_ir.grid_block_ids, reads=True
-        )
-    assert bool(block_ids) == pinned
+    # Warp specialization would split the loop's barrier per partition: a
+    # saved config warp-specializing the inner loop loads with that entry
+    # None.  (A CPU binding offers warp specialization as a B200 would.)
+    with patch("helion.language.loops._supports_warp_specialize", return_value=True):
+        spec = _bind(fn).config_spec
+    config = {**spec.default_config().config, "range_warp_specializes": [None, True]}
+    normalized = spec.normalized_config(config)["range_warp_specializes"]
+    assert normalized == [None, None if pinned else True]
 
 
 @skipUnlessTritonBarriers
@@ -487,8 +736,8 @@ def test_a_barrier_fence_covers_what_it_orders() -> None:
     device_ir = bound.host_function.device_ir
     graphs = [info.copy() for info in device_ir.graphs]
     host = bound.host_function
-    with bound.env, host:
-        mark_intra_loop_raw_barriers(graphs, device_ir.root_ids, reads=True)
+    with bound.env as env, host:
+        mark_intra_loop_raw_barriers(graphs, device_ir.root_ids, env.backend)
     (marked,) = (
         node
         for info in graphs

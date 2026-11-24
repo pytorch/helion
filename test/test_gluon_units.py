@@ -40,6 +40,7 @@ from helion._testing.gluon_kernels import scale_then_wx
 from helion._testing.gluon_kernels import scale_then_wx_and_f16_vx
 from helion._testing.gluon_kernels import scale_then_wx_and_nvfp4
 from helion._testing.gluon_kernels import split_k_gemv
+from helion._testing.gluon_kernels import split_k_halves
 from helion._testing.gluon_kernels import split_k_parts
 from helion._testing.triton_codegen import GLUON_RING_CONFIG as _RING
 from helion._testing.triton_codegen import gluon_cpu_codegen
@@ -381,6 +382,103 @@ def _two_split_k_pairs(
     return out, out2
 
 
+@helion.kernel(static_shapes=True, backend="gluon")
+def _scaled_gather_variant(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    rows_in: torch.Tensor,
+    table: torch.Tensor,
+    sums: torch.Tensor,
+    partial: torch.Tensor,
+    gathered: torch.Tensor,
+    variant: hl.constexpr,
+) -> torch.Tensor:
+    """``scaled_gather_rms_norm`` breaking a rule of the table's replicated
+    slab, by ``variant``: the table root stores a row sum twice ("twice") or
+    in a loop ("loop"), stores two ``weight`` elements by indices that name
+    one ("wrapped": 1023 and -1), adds to ``weight`` atomically ("atomic") or
+    reads the table it writes ("reads"); the partial root overwrites what
+    the table root reads ("overwritten"), or writes the table beside its
+    other slabs ("beside", ``table``: [rows, parts]).  "apart" keeps the
+    rules: two ``weight`` elements, ``2 * e`` and ``2 * e + 1``."""
+    rows, hidden = x.size()
+    out = torch.empty_like(x)
+    for tile_e in hl.tile(sums.size(0), block_size=1):
+        if variant != "beside":
+            table[tile_e.begin, :] = rows_in[tile_e.begin, :] * 0.5
+        if variant == "twice":
+            sums[tile_e] = hl.zeros([1], dtype=torch.float32)
+        if variant == "atomic":
+            hl.atomic_add(weight, [tile_e.begin], 1.0)
+        if variant in ("wrapped", "apart"):
+            first, second = (
+                (1023, -1)
+                if variant == "wrapped"
+                else (2 * tile_e.begin, 2 * tile_e.begin + 1)
+            )
+            weight[first] = torch.sum(rows_in[tile_e.begin, :])
+            weight[second] = torch.sum(rows_in[tile_e.begin, :])
+        if variant == "loop":
+            for tile_k in hl.tile(rows_in.size(1), block_size=8):
+                sums[tile_e] = torch.sum(rows_in[tile_e.begin, tile_k])[None]
+        elif variant == "reads":
+            sums[tile_e] = torch.sum(table[tile_e.begin, :])[None]
+        else:
+            sums[tile_e] = torch.sum(rows_in[tile_e.begin, :])[None]
+    for tile_t, tile_n in hl.tile([rows, hidden], block_size=[1, None]):
+        values = x[tile_t.begin, tile_n] * 2.0
+        partial[tile_t.begin, tile_n.id] = torch.sum(values * values)
+        gathered[tile_t.begin, tile_n] = values
+        if variant == "overwritten":
+            rows_in[0, :] = hl.zeros([rows_in.size(1)], dtype=torch.float32)
+        if variant == "beside":
+            table[tile_t.begin, tile_n.id] = torch.sum(values)
+    for tile_t, tile_n in hl.tile([rows, hidden], block_size=[1, None]):
+        scale = torch.rsqrt(torch.sum(partial[tile_t.begin, :]) / hidden + 1e-6)
+        total = torch.sum(torch.sum(table[:, :], dim=1)) + sums[tile_t.begin % 8]
+        out[tile_t.begin, tile_n] = (
+            gathered[tile_t.begin, tile_n] * scale * weight[tile_n]
+        ) * total
+    return out
+
+
+@helion.kernel(static_shapes=True, backend="gluon")
+def _crossed_gather(
+    x: torch.Tensor, p: torch.Tensor, q: torch.Tensor, pinned: hl.constexpr
+) -> torch.Tensor:
+    """``crossed_parts`` read by every task of a root of two axes: task
+    ``(i, j)`` reads ``p[:, j]`` and ``q[:, i]`` whole (per-rank slabs split
+    on different axes), or (``pinned``) ``p[:, 0]``, on neither axis."""
+    a_n, b_n, n = x.size()
+    out = torch.empty_like(x)
+    for tile_a, tile_b in hl.tile([a_n, b_n], block_size=[1, 1]):
+        v = x[tile_a.begin, tile_b.begin, :]
+        p[tile_a.begin, tile_b.begin, :] = v
+        q[tile_b.begin, tile_a.begin, :] = v * 2
+    for tile_i, tile_j in hl.tile([a_n, b_n], block_size=[1, 1]):
+        if pinned:
+            parts = p[:, 0, :]
+        else:
+            parts = p[:, tile_j.begin, :]
+        out[tile_i.begin, tile_j.begin, :] = parts.sum(0) + q[:, tile_i.begin, :].sum(0)
+    return out
+
+
+@helion.kernel(static_shapes=True, backend="gluon")
+def _row_gather(x: torch.Tensor, gathered: torch.Tensor) -> torch.Tensor:
+    """Each part's task of a row stores its part's values (``gathered``), and
+    each part's task of the next root reads the whole row: a per-rank slab of
+    tiles over a dimension the load reads whole."""
+    rows, hidden = x.size()
+    out = torch.empty_like(x)
+    for tile_t, tile_n in hl.tile([rows, hidden], block_size=[1, None]):
+        gathered[tile_t.begin, tile_n] = x[tile_t.begin, tile_n] * 2.0
+    for tile_t, tile_n in hl.tile([rows, hidden], block_size=[1, None]):
+        row = gathered[tile_t.begin, :]
+        out[tile_t.begin, tile_n] = x[tile_t.begin, tile_n] * torch.sum(row)
+    return out
+
+
 def _split_k_inputs(
     t: int = 16, splits: int = 2, part_dtype: torch.dtype = torch.float32
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -459,10 +557,10 @@ class TestDsmem(TestCase):
         self.assertLess(code.index(read), code.index(flag))
         # Every CTA clears its flag last, after the partitions and the
         # launch state's rewrite.
-        self.assertEqual(code.count("cluster_exit()"), 1)
+        self.assertEqual(code.count("cluster_exit('')"), 1)
         shell = code[code.index("\ndef _helion_split_k_parts(") :]
         shell = shell[: shell.index("\ndef split_k_parts(")].strip().splitlines()
-        self.assertEqual(shell[-1].strip(), "_helion_gluon.cluster_exit()")
+        self.assertEqual(shell[-1].strip(), "_helion_gluon.cluster_exit('')")
         self.assertIn("_helion_split_k_parts_finish(", shell[-2])
 
     def test_dsmem_falls_back(self) -> None:
@@ -493,8 +591,7 @@ class TestDsmem(TestCase):
 
     def test_slab_rules_fall_back(self) -> None:
         """C1: parts whose rows overlap (a row stride of 32 under 64-element
-        blocks) and dynamic strides, and C3: a [1, 64] tile (fewer elements
-        than the 128 threads), keep the counter edge."""
+        blocks) and dynamic strides keep the counter edge."""
         x, w4, part = _split_k_inputs()
         overlapping = torch.empty(part.numel()).as_strided(
             part.shape, (part.stride(0), 32, 1)
@@ -510,27 +607,142 @@ class TestDsmem(TestCase):
                 (x, w4, torch.empty([2, 16, 1088])[:, :, :1024]),
                 "C1: a dynamic shape or stride",
             ),
-            (
-                split_k_parts,
-                _split_k_inputs(t=1),
-                "C3: a [1, 64] tile has duplicated elements",
-            ),
         ):
             with self.subTest(reason=reason):
                 self.assertIn(reason, self._fallback(kernel, args, _DSMEM_RING))
+
+    def test_codegen_rules_fall_back(self) -> None:
+        """The C1 and C2 rules codegen checks turn their entries off: a
+        replicated slab's producer root storing an element twice in a task
+        (the zero then the sum: a later cluster's zero could land after
+        cluster 0 arrives; or elements 1023 and -1 of 1024), storing in a
+        loop, adding atomically, reading what it stores or read before a later
+        root's write, or carrying other slabs (whose fallback then leaves no
+        cluster transport); per-rank slabs of one consumer root on different
+        axes; a load that indexes neither of two consumer axes.  The code is
+        the code with the named loads' entries off.  Stores a constant apart
+        (``2 * e`` and ``2 * e + 1``) keep the replicated slab, and a row's
+        tiles that every task of the next root reads whole their per-rank
+        slab."""
+        rows = 32
+        x = torch.empty([rows, 1024])
+        head = (x, torch.empty([1024]), torch.empty([8, 16]))
+        tail = (torch.empty([8]), torch.empty([rows, 4]), torch.empty_like(x))
+        crossed = tuple(torch.empty([2, 2, 512]) for _ in range(3))
+        slabs = ("table", "partial", "gathered")
+        root = "C2: a replicated slab's producer root"
+        config = {
+            "pid_type": "persistent_blocked",
+            "num_sm_multiplier": 1,
+            "num_warps": 4,
+            "cross_loop_pipeline": "static",
+            "block_sizes": [256, 256],
+        }
+        # One case a rule, no grid: (kernel, args, config, the loads carried,
+        # those the code drops, the first fallback's reason; None: none)
+        cases = [
+            (
+                _scaled_gather_variant,
+                (*head, torch.empty([8, 16]), *tail, variant),
+                config,
+                slabs,
+                ("table",),
+                f"table: {reason}",
+            )
+            for variant, reason in (
+                ("twice", f"{root} may store an element twice"),
+                ("wrapped", f"{root} may store an element twice"),
+                ("loop", f"{root} stores in a loop"),
+                ("atomic", "C2: an atomic or cross-rank access"),
+                ("reads", f"{root} reads what it stores"),
+                ("overwritten", "C2: a later root's write"),
+            )
+        ]
+        cases += [
+            (
+                _scaled_gather_variant,
+                (*head, torch.empty([8, 16]), *tail, "apart"),
+                config,
+                slabs,
+                ("table",),
+                None,
+            ),
+            (
+                _row_gather,
+                (x, torch.empty_like(x)),
+                config,
+                ("gathered",),
+                ("gathered",),
+                None,
+            ),
+            (
+                _scaled_gather_variant,
+                (*head, torch.empty([rows, 4]), *tail, "beside"),
+                config,
+                slabs,
+                slabs,
+                "partial: C2: a producer root of replicated and other slabs",
+            ),
+            (
+                _crossed_gather,
+                (*crossed, False),
+                _DSMEM_RING,
+                ("p", "q"),
+                ("q",),
+                "q: C2: per-rank slabs of one consumer root on different axes",
+            ),
+            (
+                _crossed_gather,
+                (*crossed, True),
+                _DSMEM_RING,
+                ("p",),
+                ("p",),
+                "p: C1: consumer root axes the load does not index",
+            ),
+        ]
+        for kernel, args, run, on, off, reason in cases:
+            with self.subTest(reason=reason), gluon_cpu_codegen():
+                bound = kernel.bind(args)
+                graph = bound.host_function.device_ir.tile_dependency_graph
+                names = [load.tensor_name for _, load in graph.dsmem_candidates]
+                carried, kept = (
+                    helion.Config(
+                        **{**run, "cross_loop_dsmem": [n in enabled for n in names]}
+                    )
+                    for enabled in (on, [n for n in on if n not in off])
+                )
+                if reason is None:
+                    with self.assertNoLogs(
+                        "helion._compiler.triton.gluon_ring", "INFO"
+                    ):
+                        code = bound.to_triton_code(carried)
+                    self.assertNotEqual(code, bound.to_triton_code(kept))
+                    continue
+                with self.assertLogs(
+                    "helion._compiler.triton.gluon_ring", "INFO"
+                ) as logs:
+                    code = bound.to_triton_code(carried)
+                first = next(line for line in logs.output if "dsmem fallback" in line)
+                self.assertIn(reason, first)
+                self.assertEqual(code, bound.to_triton_code(kept))
 
     def test_normalize_holds_slab_limits(self) -> None:
         """Normalize turns off the entries whose slabs break a limit of the
         config alone, in candidate order, so they never regenerate the kernel:
         clusters of 16 (more than 8), slabs past ``MAX_CLUSTER_SLAB`` (2 x 256
-        x 64 fp32 parts), and of two pairs of 4 and 2 splits the second (a
-        launch has one cluster size), whose first is carried."""
+        x 64 fp32 parts, or 2 x 2 x 128 x 64 halves from two stores), and of
+        two pairs of 4 and 2 splits the second (a launch has one cluster size),
+        whose first is carried.  A whole table that a root of two axes of
+        several tasks reads is replicated (clusters of 1); with one axis, of
+        the table's 8 producer tasks, per-rank (clusters of 8)."""
         x, w4, part = _split_k_inputs(splits=4)
         pairs = (x, w4, part, torch.empty([2, *part.shape[1:]]))
+        halves = (*_split_k_inputs(t=128)[:2], torch.empty([2, 2, 128, 1024]))
         for kernel, args, flags, expected in (
             (split_k_parts, _split_k_inputs(), [True], [True]),
             (split_k_parts, _split_k_inputs(splits=16), [True], [False]),
             (split_k_parts, _split_k_inputs(t=256), [True], [False]),
+            (split_k_halves, halves, [True], [False]),
             (_two_split_k_pairs, pairs, [True, True], [True, False]),
             (_two_split_k_pairs, pairs, [False, True], [False, True]),
         ):
@@ -547,12 +759,15 @@ class TestDsmem(TestCase):
                             code = bound.to_triton_code(config)
                         self.assertIn("_cluster_size=4", code)
                         self.assertEqual(code.count("cluster_send("), 1)
+        table = DsmemSlabFacts(numel=(8, 16), tiles=((1, 16),), axes=((8, 1), (4, 1)))
+        self.assertEqual(table.evaluate({}), (1, 512))
+        self.assertEqual(table._replace(axes=((8, 1),)).evaluate({}), (8, 512))
 
     def test_normalize_counts_entries_without_slab_facts(self) -> None:
         """An entry whose slab normalize cannot evaluate still takes one of the
         15 entries, so entries past the 15th turn off with or without slab
         facts."""
-        facts = DsmemSlabFacts(numel=(2048,), tile=(1024,))
+        facts = DsmemSlabFacts(numel=(2048,), tiles=((1024,),))
         spec = SimpleNamespace(cross_loop_dsmem_slabs=(None,) * 16 + (facts,))
         config = {"cross_loop_dsmem": [True] * 17}
         ConfigSpec._normalize_dsmem(cast("ConfigSpec", spec), config)
@@ -569,7 +784,9 @@ class TestDsmem(TestCase):
         self.assertIn("cluster_entry(17408, '8192,8192')", code)
         self.assertIn("_cluster_size=2", code)
         for barrier in (8, 16):
-            self.assertEqual(code.count(f"helion_cluster_ready, {barrier}, 4)"), 1)
+            self.assertEqual(
+                code.count(f"helion_cluster_ready, {barrier}, 4, 0, 1)"), 1
+            )
             self.assertEqual(code.count(f"tl.float32, {barrier}, 4)"), 1)
 
     def test_config_wide_rejection_regenerates_once(self) -> None:
@@ -587,23 +804,22 @@ class TestDsmem(TestCase):
             )
         self.assertIn("C2: CUDA cluster occupancy query failed", reason)
 
-    def test_duplicate_tile_falls_back(self) -> None:
+    def test_small_tiles_send_copies(self) -> None:
         """C3 lays out the tile of this config's block sizes, never their
         size hints: parts of 16 x 16 (``block_sizes`` 16) have fewer elements
-        than the 512 threads of 16 warps at any width, so the kernel
-        regenerates with the entry off rather than failing Gluon's layout;
-        16 x 64 parts are carried."""
+        than the 512 threads of 16 warps, so two threads hold each element, of
+        which one sends it; 16 x 64 parts lie on one thread each."""
         args = _gemv_inputs()
         config = {**_DSMEM_RING, "block_sizes": [16, 256, 16], "num_warps": 16}
-        self.assertIn(
-            "C3: a [16, 16] tile has duplicated elements",
-            self._fallback(split_k_gemv, args, config),
-        )
         with gluon_cpu_codegen():
-            code = split_k_gemv.bind(args).to_triton_code(
+            bound = split_k_gemv.bind(args)
+            small = bound.to_triton_code(helion.Config(**config))
+            wide = bound.to_triton_code(
                 helion.Config(**{**config, "block_sizes": [64, 256, 64]})
             )
-        self.assertIn("cluster_send(", code)
+        self.assertIn("cluster_entry(3072, '2048')", small)
+        self.assertRegex(small, r"(?m)cluster_send\(.*, 0, 2\)$")
+        self.assertIn("cluster_entry(9216, '8192')", wide)
 
     def test_each_access_takes_the_widest_width(self) -> None:
         """A send or receive moves the most elements a thread (of 4, 2 and
@@ -615,7 +831,7 @@ class TestDsmem(TestCase):
             code = split_k_gemv.bind(_gemv_inputs()).to_triton_code(
                 helion.Config(**config)
             )
-        self.assertRegex(code, r"(?m)cluster_send\(.*, 2\)$")
+        self.assertRegex(code, r"(?m)cluster_send\(.*, 2, 0, 1\)$")
         self.assertRegex(code, r"(?m)cluster_recv\(.*, 4\)$")
 
     def test_kernel_keys_its_compile(self) -> None:
@@ -636,9 +852,9 @@ class TestDsmem(TestCase):
         self.assertIn("if _NUM_SM != 148:", code)
 
     def test_entry_and_exit_bracket_a_kernel_without_a_ring(self) -> None:
-        """Without a ring, the entry is the kernel's first statement, the flag
-        follows the epoch load, and the exit follows the launch-state store,
-        last."""
+        """Without a ring, the entry is the kernel's first statement, before a
+        CTA barrier, the flag follows the epoch load, and the exit follows the
+        launch-state store, last."""
         config = {
             "num_warps": 4,
             "pid_type": "persistent_blocked",
@@ -658,6 +874,7 @@ class TestDsmem(TestCase):
             if line.strip() and not line.lstrip().startswith("#")
         ]
         self.assertTrue(statements[0].startswith("_helion_gluon.cluster_entry("))
+        self.assertEqual(statements[1], "tl.debug_barrier()")
         epoch = next(
             i
             for i, line in enumerate(statements)
@@ -665,7 +882,7 @@ class TestDsmem(TestCase):
         )
         self.assertTrue(statements[epoch + 1].startswith("helion_cluster_flag = "))
         self.assertTrue(statements[-2].startswith("tl.store(tile_dependency_state"))
-        self.assertEqual(statements[-1], "_helion_gluon.cluster_exit()")
+        self.assertEqual(statements[-1], "_helion_gluon.cluster_exit('')")
 
     def test_even_parts_take_two_elements(self) -> None:
         """A slab two elements wide keeps 8 bytes aligned: its 128 x 2 parts
@@ -678,7 +895,7 @@ class TestDsmem(TestCase):
         config = {**_DSMEM_RING, "block_sizes": [2, 256, 2]}
         with gluon_cpu_codegen():
             code = split_k_gemv.bind(args).to_triton_code(helion.Config(**config))
-        self.assertRegex(code, r"(?m)cluster_send\(.*, 2\)$")
+        self.assertRegex(code, r"(?m)cluster_send\(.*, 2, 0, 1\)$")
         self.assertRegex(code, r"(?m)cluster_recv\(.*, 2\)$")
 
     def test_split_on_any_task_axis(self) -> None:
@@ -740,7 +957,7 @@ class TestDsmem(TestCase):
         receives = [line for line in code.splitlines() if "cluster_recv(" in line]
         self.assertEqual(len(sends), 1)
         self.assertEqual(len(receives), 1)
-        self.assertTrue(sends[0].rstrip().endswith(", 8, 1)"))
+        self.assertTrue(sends[0].rstrip().endswith(", 8, 1, 0, 1)"))
         self.assertTrue(receives[0].rstrip().endswith("tl.float32, 8, 2)"))
 
     def test_configs_share_one_binding(self) -> None:
@@ -748,7 +965,7 @@ class TestDsmem(TestCase):
         another on one binding (as the autotuner does), in either order, give
         the code each gives alone."""
         args = _gemv_inputs()
-        # 16 x 16 parts over 16 warps fall back (C3); the others are carried.
+        # 16 x 16 parts over 16 warps lie on two threads each (C3).
         configs = [
             helion.Config(**{**_DSMEM_RING, "block_sizes": [bn, 256, bn], **extra})
             for bn, extra in ((16, {"num_warps": 16}), (64, {}), (128, {}))
@@ -761,8 +978,8 @@ class TestDsmem(TestCase):
                 codes = {id(c): bound.to_triton_code(c) for c in order}
                 self.assertEqual([codes[id(c)] for c in configs], alone)
                 split_k_gemv.reset()
-        self.assertNotIn("cluster_send", alone[0])
-        self.assertIn("cluster_send", alone[1])
+        self.assertIn("'2048')", alone[0])
+        self.assertIn("'8192')", alone[1])
 
     def test_workers_fit_whole_clusters(self) -> None:
         """With an entry on, the launch takes the SMs whole clusters keep
@@ -1454,10 +1671,10 @@ class TestPartitionWaits(TestCase):
         emitted: list[tuple[object, str]] = []
         emit = loop_dependency_checker.emit_intra_loop_raw_barrier
 
-        def spy(state: object, read: object = None) -> None:
+        def spy(state: object, *args: object, **kwargs: object) -> None:
             roles = state.device_function.sync_roles  # pyrefly: ignore
             before = set(roles)
-            emit(state, read)  # pyrefly: ignore
+            emit(state, *args, **kwargs)  # pyrefly: ignore
             # The load's barrier (the store's orders what other threads read).
             if state.fx_node.target is hl.load:  # pyrefly: ignore
                 emitted.extend((state.device_function, n) for n in set(roles) - before)  # pyrefly: ignore

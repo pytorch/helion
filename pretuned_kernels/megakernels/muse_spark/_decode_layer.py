@@ -7,6 +7,7 @@ splits, and the per-rank symmetric MoE state."""
 
 from __future__ import annotations
 
+from pretuned_kernels.megakernels.muse_spark._common import EXPERT_HIDDEN
 from pretuned_kernels.megakernels.muse_spark._common import LOG2E
 from pretuned_kernels.megakernels.muse_spark._common import MOE_TOKENS
 from pretuned_kernels.megakernels.muse_spark._common import TOPK
@@ -20,6 +21,7 @@ from pretuned_kernels.megakernels.muse_spark._common import exp2_approx_ftz_f32
 from pretuned_kernels.megakernels.muse_spark._common import pack_e2m1x2
 from pretuned_kernels.megakernels.muse_spark._common import rcp_approx_ftz_f32
 from pretuned_kernels.megakernels.muse_spark._common import rsqrt_approx_ftz_f32
+from pretuned_kernels.megakernels.muse_spark._moe import INTERMEDIATE
 from pretuned_kernels.megakernels.muse_spark._moe import MMA_M
 from pretuned_kernels.megakernels.muse_spark._moe import (
     distinct_table as _distinct_table,
@@ -248,16 +250,15 @@ class State:
         group: dist.ProcessGroup,
         *,
         tokens: int,
-        intermediate: int = 4096,
-        hidden: int = 4096,
+        intermediate: int = INTERMEDIATE,
+        hidden: int = EXPERT_HIDDEN,
         expert_bf16: bool = False,
     ) -> None:
         world = group.size()
         local = hidden // world
         slots = tokens * TOPK
-        if (
-            expert_bf16
-        ):  # the bf16-expert images' z: bf16 SwiGLU rows (z_scale stays unread)
+        # The bf16-expert images' z: bf16 SwiGLU rows (z_scale stays unread).
+        if expert_bf16:
             self.z = symm_mem.empty(
                 slots, MOE_TOKENS, intermediate, dtype=torch.bfloat16, device=device
             )

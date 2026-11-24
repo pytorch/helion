@@ -61,6 +61,10 @@
  "num_sm_multiplier": 1,
  "cross_loop_dsmem": [
   false,
+  false,
+  false,
+  false,
+  false,
   true
  ]
 }

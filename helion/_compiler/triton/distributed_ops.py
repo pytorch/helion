@@ -671,9 +671,9 @@ class InbandPoll:
     result: ast.stmt
     scatter: ScatterPoll | None = None
     # The mailbox's Lamport lane width (None: epoch-tagged words) and, if set,
-    # the int64 literal a masked load reads: every lane the unwritten key.
+    # the int64 literal a masked load reads: every lane the key, written zeros.
     lane_bits: int | None = None
-    unwritten: str | None = None
+    masked_word: str | None = None
     # Lamport: the word offset to the previous launch's slot, re-armed (zeroed)
     # once the poll holds this launch's words (PeerState.rearm).
     rearm: str | None = None
@@ -689,7 +689,7 @@ class InbandPoll:
     def load(self, epoch: str) -> ast.stmt:
         # A plain volatile load vectorizes; masked lanes read as current (and
         # as zero elements: a Lamport lane of just the key).
-        current = f"{epoch} << 32" if self.unwritten is None else self.unwritten
+        current = f"{epoch} << 32" if self.masked_word is None else self.masked_word
         mask = "" if self.mask is None else f", {self.mask}, {current}"
         return statement_from_string(
             f"{self.word} = tl.load({self.address}{mask}, volatile=True)"
@@ -722,8 +722,9 @@ def _lane_ones(lane_bits: int) -> int:
     return sum(1 << (lane_bits * i) for i in range(64 // lane_bits))
 
 
-def _unwritten_word(lane_bits: int, dtype: torch.dtype) -> str:
-    """The int64 literal of a word whose every lane holds ``dtype``'s key."""
+def _encoded_zero_word(lane_bits: int, dtype: torch.dtype) -> str:
+    """The int64 literal of a word whose every lane holds ``dtype``'s key: the
+    encoding of written zeros."""
     keys = _lane_ones(lane_bits) * LAMPORT_KEYS[dtype]
     return str(keys - (1 << 64) if keys >> 63 else keys)
 
@@ -1633,9 +1634,7 @@ def inband_load_codegen(state: CodegenState, codegen_load: LoadCodegen) -> LoadC
         if first is not None:
             assert first.source is not None and access.owner_rank is not None
             base = first.base or first.address
-            delta = first.delta + 8 * peer.mailboxes[access.allocation_id].words * (
-                access.owner_rank - first.source
-            )
+            delta = first.delta + 8 * box.words * (access.owner_rank - first.source)
             address = state.codegen.lift(
                 expr_from_string(f"{base} + {delta // 8}"),
                 dce=True,
@@ -1725,9 +1724,9 @@ def inband_load_codegen(state: CodegenState, codegen_load: LoadCodegen) -> LoadC
                 result=statement_from_string(f"{value} = {{result}}", result=result),
                 scatter=fallback,
                 lane_bits=box.lane_bits,
-                unwritten=None
+                masked_word=None
                 if box.lane_bits is None
-                else _unwritten_word(box.lane_bits, dtype),
+                else _encoded_zero_word(box.lane_bits, dtype),
                 rearm=None
                 if box.lane_bits is None
                 else peer.rearm(access.allocation_id),
@@ -1840,16 +1839,18 @@ def _stale(peer_epoch: str, polls: list[InbandPoll]) -> str:
     )
 
 
-def _select(index: str, values: list[int]) -> str:
+def _select(index: str, values: list[int] | list[str]) -> str:
     """``values[index]`` for a runtime ``index``: a constant, an affine term or
-    a chain of selects."""
+    a chain of selects (of names, for strings)."""
     first = values[0]
-    step = values[1] - first if len(values) > 1 else 0
-    if all(value == first + step * i for i, value in enumerate(values)):
-        term = index if step == 1 else f"{step} * {index}"
-        return (
-            str(first) if step == 0 else term if first == 0 else f"({first} + {term})"
-        )
+    if isinstance(first, int):
+        ints = cast("list[int]", values)
+        step = ints[1] - first if len(ints) > 1 else 0
+        if all(value == first + step * i for i, value in enumerate(ints)):
+            if step == 0:
+                return str(first)
+            term = index if step == 1 else f"{step} * {index}"
+            return term if first == 0 else f"({first} + {term})"
     expr = str(first)
     for i, value in enumerate(values[1:], 1):
         expr = f"tl.where({index} == {i}, {value}, {expr})"
@@ -2002,16 +2003,15 @@ def _scatter_synthesize(
     device_function = cg.device_function
     index = device_function.new_var("inband_peer", dce=False)
     tensor = device_function.new_var("inband_tensor", dce=False)
-    select = first.tensor
-    for i, fallback in enumerate(fallbacks[1:], 1):
-        select = f"tl.where({index} == {i}, {fallback.tensor}, {select})"
     words = peer.mailboxes[first.allocation_id].words
     loop = statement_from_string(
         f"for {index} in tl.range({len(family)}, num_stages=1): pass"
     )
     assert isinstance(loop, ast.For)
     loop.body = [
-        statement_from_string(f"{tensor} = {select}"),
+        statement_from_string(
+            f"{tensor} = {_select(index, [f.tensor for f in fallbacks])}"
+        ),
         *_scatter_copy(
             cg,
             peer,

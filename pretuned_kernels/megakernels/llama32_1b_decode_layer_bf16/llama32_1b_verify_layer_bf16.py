@@ -89,10 +89,8 @@ def llama32_1b_verify_layer_bf16(
     # cache); context lengths, positions, block tables, slot mappings and KV
     # data are runtime values.  All four projections read BF16 weights.
     batch_capacity = hidden_states.size(0)
-    # Attention tasks take all T x (query heads per KV head) rows at once.
-    assert batch_capacity & (batch_capacity - 1) == 0, (
-        "the token count must be a power of two"
-    )
+    # Attention tasks take all T x (query heads per KV head) rows at once: T is
+    # a power of two (kernel_args checks it).
     torch._check(residual.size(0) == batch_capacity)
     torch._check(pre_normed.size(0) == batch_capacity)
     torch._check(position.size(0) == batch_capacity)
@@ -486,7 +484,12 @@ def llama32_1b_verify_layer_bf16(
                 attention_split_v = attention_split_kv_halves[
                     attention_split_physical_block, :, attention_split_g, 1, :
                 ]
-                # P is 0 there, but a stale non-finite value would still leak.
+                # Zero the page's rows past the sequence (stale cache values,
+                # possibly non-finite). Where a row sees a key of this split, P
+                # is 0 there, and 0 * NaN is still NaN; where the whole split is
+                # past a row's token, m_ij stays at the mask value and P is
+                # exp2(0) = 1 on every column: a partial the merge weights by 0
+                # (its LSE is the mask value), NaN too unless V is finite.
                 attention_split_v = torch.where(
                     (attention_split_n < attention_split_seq)[:, None],
                     attention_split_v,
@@ -713,7 +716,8 @@ def correctness_check(
 
     The default context lengths give a sequence of fewer cache blocks than
     attention splits (most splits empty), one whose last split is short (63
-    pages over 16 splits) and one whose last block is partly filled.
+    pages over 16 splits) and one whose pages divide evenly into the splits
+    (64); each sequence's last block is partly filled.
     """
     check(LAYER, llama32_1b_verify_layer_bf16, tokens, context_lens)
 

@@ -277,12 +277,17 @@ def round_e2m1(x: torch.Tensor) -> torch.Tensor:
     return torch.tensor(E2M1_VALUES, device=x.device)[index] * torch.sign(x)
 
 
+def dequantize_e2m1(values: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
+    """FP64 e2m1 values ``[..., K]`` times their E4M3 16-value block scales
+    ``[..., K / 16]``."""
+    block = scales.view(torch.float8_e4m3fn).to(torch.float64)
+    return (values.unflatten(-1, (-1, 16)) * block[..., None]).flatten(-2)
+
+
 def dequantize_nvfp4(packed: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
     """FP64 values of e2m1x2 bytes ``[..., K / 2]`` with E4M3 16-value block
     scales ``[..., K / 16]`` (low nibble first)."""
-    values = e2m1_values(packed)
-    block = scales.view(torch.float8_e4m3fn).to(torch.float64)
-    return (values.unflatten(-1, (-1, 16)) * block.unsqueeze(-1)).flatten(-2)
+    return dequantize_e2m1(e2m1_values(packed), scales)
 
 
 def relative_rmse_and_cosine(

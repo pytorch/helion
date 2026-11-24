@@ -80,7 +80,11 @@ _TMA_SLOTS = (
         cross_loop_pipeline="dynamic",
         num_sm_multiplier=1,
         num_stages=4,
-        range_warp_specializes=[True] * 16,
+        # Each root's first loop warp-specializes, except the final norm's.
+        range_warp_specializes=[
+            *(True, None, True, True, None, True, True, None, True),
+            *(None, True, None, True, None, True, True, None),
+        ],
         indexing=[
             "tensor_descriptor" if index in _TMA_SLOTS else "pointer"
             for index in range(128)
@@ -209,6 +213,7 @@ def deepseek_v3_moe_nvfp4_tp_verify(
     # This rank's MoE output in symmetric memory: every rank's communication
     # tasks read it as soon as it is written.
     assert symmetric_partial.size() == (rows, hidden)
+    assert residual.size() == (rows, hidden) and norm_weight.size(0) == hidden
     remote_partials = torch.ops.symm_mem.get_remote_tensors(
         symmetric_partial, group_name
     )
@@ -592,11 +597,32 @@ def deepseek_v3_moe_nvfp4_tp_verify(
     )
 
 
+def _first_shard(tensors: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    """A shard's inputs: each expert's first quarter of the intermediate (W13's
+    first rows, which interleave gate and up, and W2's first columns), the rest
+    shared.  Zeroes the full experts' W13 rows past the shard, so the full
+    experts compute the shard's output."""
+    shard = dict(tensors)
+    w13 = ("native_w13", "native_shared_w13")
+    for key in (*w13, "native_w13_scale", "native_shared_w13_scale"):
+        w = tensors[key]
+        shard[key] = w[..., : w.size(-2) // WORLD_SIZE, :].contiguous()
+    for key in ("w2", "w2_scale", "shared_w2", "shared_w2_scale"):
+        w = tensors[key]
+        shard[key] = w[..., : w.size(-1) // WORLD_SIZE].contiguous()
+    for key in w13:
+        w = tensors[key]
+        w[..., w.size(-2) // WORLD_SIZE :, :] = 0
+    return shard
+
+
 def correctness_check(window_sizes: tuple[int, ...] = (8, 16)) -> None:
-    """Check every rank against the single-GPU verify kernel run on each rank's
-    shard, for every routing case and window size: the routing bit for bit, the
-    residual sum (the shards' outputs summed in rank order, plus the residual)
-    and the RMSNorm output to rounding.  Runs on four ranks::
+    """Check every rank against the single-GPU verify kernel at the full
+    intermediate size its own check covers, on full experts whose rows past
+    the rank's shard are zero, for every routing case and window size: the
+    routing bit for bit, the residual sum (the shards' outputs summed in rank
+    order, plus the residual) and the RMSNorm output to rounding.  Runs on four
+    ranks::
 
         NVSHMEM_DISABLE_CUDA_VMM=1 torchrun --nproc-per-node=4 -m \\
             pretuned_kernels.megakernels.deepseek_v3_moe_nvfp4_tp.deepseek_v3_moe_nvfp4_tp_verify
@@ -608,9 +634,11 @@ def correctness_check(window_sizes: tuple[int, ...] = (8, 16)) -> None:
     )
     try:
         device = torch.device("cuda", local_rank)
-        shape = Shape(intermediate=2048 // WORLD_SIZE)
+        full = Shape()
+        shape = Shape(intermediate=full.intermediate // WORLD_SIZE)
         for tokens in window_sizes:
-            tensors = _allocate_verify(shape, tokens)
+            padded = _allocate_verify(full, tokens)
+            tensors = _first_shard(padded)
             # Distinct shards: scale each rank's down projections.
             tensors["alpha2"].mul_(1.0 + rank / 8.0)
             tensors["shared_alpha2"].mul_(1.0 + rank / 8.0)
@@ -636,7 +664,7 @@ def correctness_check(window_sizes: tuple[int, ...] = (8, 16)) -> None:
                 result = deepseek_v3_moe_nvfp4_tp_verify(
                     *args, residual, norm_weight, partial, group.group_name
                 )
-                single = deepseek_v3_moe_nvfp4_verify(*args)
+                single = deepseek_v3_moe_nvfp4_verify(*_verify_args(padded, full))
                 shards = [torch.empty_like(single[0]) for _ in range(WORLD_SIZE)]
                 dist.all_gather(shards, single[0])
                 summed = torch.zeros_like(single[0], dtype=torch.float32)

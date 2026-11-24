@@ -1710,18 +1710,25 @@ class RingLowering:
             workers.append((min(df.config.num_warps, warps), stores))
             partitions.append(_function(f"{name}_{suffix}", body.args, partition_body))
         if transports := dsmem_transports(df):
-            # A dsmem send or receive lays its tile over ``num_warps`` warps
-            # (C3, ``cross_loop_dsmem``): the body's.
-            for (warps, _), partition in zip(workers, partitions, strict=True):
-                if warps != df.config.num_warps and any(
-                    isinstance(node, ast.Attribute)
-                    and node.attr in ("cluster_send", "cluster_recv")
-                    for node in ast.walk(partition)
-                ):
-                    raise config_fallback(
-                        transports,
-                        f"C3: a send or receive in a ring partition of {warps} warps",
-                    )
+            # A dsmem send lays its tile over ``num_warps`` warps (C3,
+            # ``cross_loop_dsmem``): the body's.  A receive reads its slab in
+            # any partition's layout.  The entries whose sends (by the barrier
+            # each names) sit in a narrower partition go off.
+            barriers = {
+                ast.literal_eval(node.args[3])
+                for (warps, _), partition in zip(workers, partitions, strict=True)
+                if warps != df.config.num_warps
+                for node in ast.walk(partition)
+                if isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "cluster_send"
+            }
+            if barriers:
+                raise config_fallback(
+                    {a: t for a, t in transports.items() if t.barrier in barriers},
+                    f"C3: a send in a ring partition of fewer than {df.config.num_warps}"
+                    " warps",
+                )
         body.body = _without_waits(_without_mma(body.body, mma), df, frozenset())
         functions = [body, *partitions]
         for fn in functions:
@@ -1885,7 +1892,7 @@ class RingLowering:
             setup.append(f"{', '.join(launch_names)}, = {specialize}")  # pyrefly: ignore [unbound-name]
             setup.append(f"{finish.name}({', '.join([*arguments, *launch_names])})")  # pyrefly: ignore [unbound-name]
         if transports:
-            setup.append(ast.unparse(cluster_exit()))
+            setup.append(ast.unparse(cluster_exit(transports)))
         shell = _function(
             name, shell_arguments, list(map(statement_from_string, setup))
         )

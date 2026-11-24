@@ -1,4 +1,4 @@
-"""Shared four-rank setup and timing for distributed pretuned kernels."""
+"""Shared multi-rank setup and timing for distributed pretuned kernels."""
 
 from __future__ import annotations
 
@@ -16,36 +16,49 @@ if TYPE_CHECKING:
 _T = TypeVar("_T")
 
 
-def initialize(
-    *, kernel_name: str, world_size: int, signal_pad_bytes: int
-) -> tuple[int, int, dist.ProcessGroup]:
-    """Initialize the fixed-size local NVSHMEM process group used by a probe."""
+def initialize_group(kernel_name: str) -> tuple[int, int, dist.ProcessGroup]:
+    """Bind this rank to its local SM100 device and initialize the NCCL default
+    process group (any world, over one node or several)."""
     if not torch.cuda.is_available() or torch.version.hip is not None:
         raise RuntimeError(f"{kernel_name} is pretuned only for NVIDIA SM100")
     rank = int(os.environ["RANK"])
     local_rank = int(os.environ["LOCAL_RANK"])
-    actual_world_size = int(os.environ["WORLD_SIZE"])
-    if actual_world_size != world_size:
-        raise RuntimeError(f"{kernel_name} requires TP={world_size}")
-    local_world_size = int(os.environ.get("LOCAL_WORLD_SIZE", actual_world_size))
+    local_world_size = int(os.environ.get("LOCAL_WORLD_SIZE", os.environ["WORLD_SIZE"]))
     visible_devices = torch.cuda.device_count()
-    if local_world_size != world_size or visible_devices < local_world_size:
+    if visible_devices < local_world_size:
         raise RuntimeError(
-            f"{kernel_name} requires {world_size} visible local CUDA devices, "
-            f"but found {visible_devices} for {local_world_size} local ranks"
+            f"{kernel_name} requires {local_world_size} visible local CUDA devices, "
+            f"but found {visible_devices}"
         )
     if not 0 <= local_rank < visible_devices:
         raise RuntimeError(
             f"LOCAL_RANK={local_rank} is outside the {visible_devices} visible devices"
         )
     torch.cuda.set_device(local_rank)
-    if torch.cuda.get_device_capability() != (10, 0):
+    # The SM100 family: B200 (SM 10.0) and GB300 (SM 10.3).
+    if torch.cuda.get_device_capability()[0] != 10:
         raise RuntimeError(f"{kernel_name} is pretuned only for NVIDIA SM100")
     dist.init_process_group("nccl", device_id=torch.device("cuda", local_rank))
+    group = dist.group.WORLD
+    assert group is not None
+    return rank, local_rank, group
+
+
+def initialize(
+    *, kernel_name: str, world_size: int, signal_pad_bytes: int
+) -> tuple[int, int, dist.ProcessGroup]:
+    """Initialize the fixed-size local NVSHMEM process group used by a probe."""
+    actual_world_size = int(os.environ["WORLD_SIZE"])
+    if actual_world_size != world_size:
+        raise RuntimeError(f"{kernel_name} requires TP={world_size}")
+    local_world_size = int(os.environ.get("LOCAL_WORLD_SIZE", actual_world_size))
+    if local_world_size != world_size:
+        raise RuntimeError(
+            f"{kernel_name} requires its {world_size} ranks on one node, "
+            f"but found {local_world_size} local ranks"
+        )
+    rank, local_rank, group = initialize_group(kernel_name)
     try:
-        group = dist.group.WORLD
-        if group is None:
-            raise RuntimeError("default process group was not initialized")
         import torch.distributed._symmetric_memory as symm_mem
 
         symm_mem.set_backend("NVSHMEM")
@@ -90,6 +103,14 @@ def _max_rank_elapsed_us(graph: torch.cuda.CUDAGraph, calls: int) -> float:
     return float(elapsed.item())
 
 
+def _cold_replay_us(graph: torch.cuda.CUDAGraph, cache_scrub: torch.Tensor) -> float:
+    """One replay after zeroing ``cache_scrub`` (an L2 scrub), max over ranks."""
+    cache_scrub.zero_()
+    torch.cuda.synchronize()
+    dist.barrier()
+    return _max_rank_elapsed_us(graph, 1)
+
+
 def benchmark(
     launches: dict[str, Callable[[], _T]],
     *,
@@ -111,10 +132,7 @@ def benchmark(
         order = names if trial % 2 == 0 else tuple(reversed(names))
         for name in order:
             warm_samples[name].append(_max_rank_elapsed_us(captures[name][0], 100))
-            cache_scrub.zero_()
-            torch.cuda.synchronize()
-            dist.barrier()
-            cold_samples[name].append(_max_rank_elapsed_us(captures[name][0], 1))
+            cold_samples[name].append(_cold_replay_us(captures[name][0], cache_scrub))
     return {
         name: (
             float(torch.tensor(warm_samples[name]).median()),
