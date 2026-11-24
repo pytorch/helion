@@ -9,52 +9,22 @@ from __future__ import annotations
 import pytest
 import torch
 
-from test.cute_population_contracts import tcgen05_mma_support
-
 import helion
 from helion import exc
 from helion._testing import DEVICE
 from helion._testing import cpu_render_target
 from helion._testing import skipUnlessBackends
 from helion._testing.cute_codegen import cpu_bind
+from helion._testing.cute_codegen import tcgen05_mma_support
+from helion._testing.cute_fragment_kernels import batched_dot
+from helion._testing.cute_fragment_kernels import chunk_cumsum
 from helion.autotuner.config_fragment import EnumFragment
 import helion.language as hl
 
 KEY = "cute_fp32_dot"
 MMA = "_helion_fragment_mma.mma_tf32("
 
-pytestmark = skipUnlessBackends(["cute"])
-
-
-@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
-def _chunk_cumsum(g: torch.Tensor) -> torch.Tensor:
-    """Prefix sums over the chunk axis as ``L @ g`` (the linear-attention
-    cumsum): a 0/1 operand and a bf16-valued one, exact in tf32."""
-    batches = g.size(0)
-    chunk = hl.specialize(g.size(1))
-    width = g.size(2)
-    out = torch.empty([batches, chunk, width], dtype=torch.float32, device=g.device)
-    for tile_b, tile_d in hl.tile([batches, width], block_size=[1, None]):
-        idx = hl.arange(chunk)
-        ltri = (idx[:, None] >= idx[None, :]).to(torch.float32)
-        lower = ltri[None, :, :].broadcast_to([tile_b, chunk, chunk])  # pyrefly: ignore[no-matching-overload]
-        values = g[tile_b, :, tile_d].to(torch.float32)
-        out[tile_b, :, tile_d] = hl.dot(lower, values)
-    return out
-
-
-@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
-def _batched_dot(x: torch.Tensor, y: torch.Tensor, z: torch.Tensor) -> torch.Tensor:
-    """``x @ y + z`` per batch with fp32 operands and a seeded accumulator."""
-    batches = x.size(0)
-    rows = hl.specialize(x.size(1))
-    cols = hl.specialize(y.size(2))
-    out = torch.empty([batches, rows, cols], dtype=torch.float32, device=x.device)
-    for tile_b in hl.tile(batches, block_size=1):
-        out[tile_b, :, :] = hl.dot(
-            x[tile_b, :, :], y[tile_b, :, :], acc=z[tile_b, :, :]
-        )
-    return out
+pytestmark = [pytest.mark.cpu_only, skipUnlessBackends(["cute"])]
 
 
 @helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
@@ -97,7 +67,7 @@ def _config(bound: object, mode: str, **extra: object) -> helion.Config:
 
 def test_fp32_dot_enum_defaults_to_simt(_cpu_only: None) -> None:
     g = torch.ones(4, 64, 128, dtype=torch.bfloat16)
-    bound = cpu_bind(_chunk_cumsum, (g,))
+    bound = cpu_bind(chunk_cumsum, (g,))
     spec = bound.config_spec
     assert spec.cute_fp32_dot_root_ids
     assert spec.cute_fp32_dot_seed_worthy
@@ -125,7 +95,7 @@ def test_fp32_dot_enum_defaults_to_simt(_cpu_only: None) -> None:
 
 def test_fp32_dot_lowers_the_fragment_dot_through_mma_sync(_cpu_only: None) -> None:
     g = torch.ones(4, 64, 128, dtype=torch.bfloat16)
-    bound = cpu_bind(_chunk_cumsum, (g,))
+    bound = cpu_bind(chunk_cumsum, (g,))
     simt = bound.to_code(_config(bound, "simt"))
     assert "fragment_dot" in simt
     assert MMA not in simt
@@ -145,7 +115,7 @@ def test_fp32_dot_partial_tiles_are_predicated(_cpu_only: None) -> None:
     x = torch.ones(2, 24, 20)
     y = torch.ones(2, 20, 12)
     z = torch.ones(2, 24, 12)
-    bound = cpu_bind(_batched_dot, (x, y, z))
+    bound = cpu_bind(batched_dot, (x, y, z))
     assert bound.config_spec.cute_fp32_dot_root_ids
     # Nothing of a 24 x 12 x 20 dot reaches 64: the field is searchable (the
     # group owns it) but no witness seeds the mode.
@@ -184,7 +154,7 @@ def test_bf16_packet_loads_feed_the_tf32_dot(_cpu_only: None) -> None:
     # bf16 per load) instead of one 2-byte load per element; with the dot on
     # tensor cores that load phase was the kernel's remaining bottleneck.
     g = torch.ones(4, 64, 128, dtype=torch.bfloat16)
-    bound = cpu_bind(_chunk_cumsum, (g,))
+    bound = cpu_bind(chunk_cumsum, (g,))
     assert "cute_fragment_packet_loads" in bound.config_spec._flat_fields()
     code = bound.to_code(_config(bound, "tf32_mma", cute_fragment_packet_loads=True))
     assert MMA in code
@@ -202,6 +172,7 @@ def test_ieee_dot_precision_never_offers_tf32(_cpu_only: None) -> None:
     assert "fragment_dot" in bound.to_code(bound.config_spec.default_config())
 
 
+@pytest.mark.cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize(
     ("threads", "packets"), [(64, False), (128, False), (256, False), (256, True)]
@@ -209,7 +180,7 @@ def test_ieee_dot_precision_never_offers_tf32(_cpu_only: None) -> None:
 def test_cumsum_dot_matches_reference(threads: int, packets: bool) -> None:
     torch.manual_seed(0)
     g = torch.randn(8, 64, 128, device=DEVICE, dtype=torch.bfloat16)
-    bound = _chunk_cumsum.bind((g,))
+    bound = chunk_cumsum.bind((g,))
     config = _config(
         bound,
         "tf32_mma",
@@ -225,6 +196,7 @@ def test_cumsum_dot_matches_reference(threads: int, packets: bool) -> None:
     torch.testing.assert_close(out, expected, rtol=1e-5, atol=1e-5)
 
 
+@pytest.mark.cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize(
     ("rows", "cols", "contraction"),
@@ -237,7 +209,7 @@ def test_batched_dot_with_accumulator_matches_reference(
     x = torch.randn(3, rows, contraction, device=DEVICE)
     y = torch.randn(3, contraction, cols, device=DEVICE)
     z = torch.randn(3, rows, cols, device=DEVICE)
-    bound = _batched_dot.bind((x, y, z))
+    bound = batched_dot.bind((x, y, z))
     config = _config(bound, "tf32_mma")
     assert MMA in bound.to_code(config)
     out = bound.compile_config(config)(x, y, z)

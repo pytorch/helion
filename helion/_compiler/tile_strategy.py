@@ -66,6 +66,7 @@ if TYPE_CHECKING:
     from .inductor_lowering import CodegenState
     from .lane_loop_context import LaneLoopContext
     from .pallas.dma import DmaResources
+    from .type_info import TypeInfo
 
     _T = TypeVar("_T")
     SymIntLike = torch.SymInt | int
@@ -2018,6 +2019,20 @@ class FlattenedTileStrategy(BlockSizeTileStrategy):
             )
         return self._grid_origin_vars[block_idx]
 
+    @staticmethod
+    def _single_root_index() -> TypeInfo | None:
+        from .ast_extension import ExtendedAST
+        from .type_info import IterType
+        from .type_info import SequenceType
+
+        info = ExtendedAST.current()[-1]._type_info
+        if not isinstance(info, IterType):
+            return None
+        if isinstance(info.inner, SequenceType):
+            axes = info.inner.unpack()
+            return axes[0] if len(axes) == 1 else None
+        return info.inner
+
     def _record_grid_origins(
         self,
         state: CodegenState,
@@ -2025,14 +2040,29 @@ class FlattenedTileStrategy(BlockSizeTileStrategy):
         block_size_var: str,
         begins: list[object],
         steps: list[object | None],
+        *,
+        walks_elements: bool = False,
     ) -> None:
+        from .type_info import TileIndexType
+
         if not CompileEnvironment.current().backend.tracks_flat_grid_origins():
             return
         if self.block_size == 1:
             # A singleton flat tile is a singleton Cartesian tile on every
             # axis, including nonzero begins and scalar iteration strides.
             self._grid_origin_vars.update(self.index_vars)
-        elif len(self.block_ids) == 1 and steps[0] in (None, 1):
+        elif len(self.block_ids) == 1 and (
+            steps[0] in (None, 1)
+            or (
+                # A fixed hl.tile width steps between contiguous tiles. An
+                # hl.grid step of the same value strides between scalar indices.
+                walks_elements
+                and type(steps[0]) is int
+                and isinstance(self.block_size, int)
+                and steps[0] == self.block_size
+                and type(self._single_root_index()) is TileIndexType
+            )
+        ):
             block_id = self.block_ids[0]
             origin = self.offset_vars[block_id]
             expression = f"({pid_var}) * ({block_size_var})"
@@ -2275,20 +2305,9 @@ class FlattenedTileStrategy(BlockSizeTileStrategy):
     def codegen_grid(self, state: CodegenState) -> DeviceGridState:
         assert state.ast_args is None
 
-        from .ast_extension import ExtendedAST
         from .type_info import GridIndexType
-        from .type_info import IterType
-        from .type_info import SequenceType
 
-        type_info = ExtendedAST.current()[-1]._type_info
-        scalar_grid_loop = False
-        if isinstance(type_info, IterType):
-            inner = (
-                type_info.inner.unpack()
-                if isinstance(type_info.inner, SequenceType)
-                else [type_info.inner]
-            )
-            scalar_grid_loop = len(inner) == 1 and isinstance(inner[0], GridIndexType)
+        scalar_grid_loop = isinstance(self._single_root_index(), GridIndexType)
 
         if (
             scalar_grid_loop
@@ -2408,7 +2427,15 @@ class FlattenedTileStrategy(BlockSizeTileStrategy):
             pids.shared_pid_var = state.device_function.pid.shared_pid_var
 
         pids.append(PIDInfo(pid_var, block_size_var, total_numel, self.block_ids[0]))
-        self._record_grid_origins(state, pid_var, block_size_var, begins, steps)
+        self._record_grid_origins(
+            state,
+            pid_var,
+            block_size_var,
+            begins,
+            steps,
+            walks_elements=env.backend.flat_strided_tile_walks_elements()
+            and self._uses_thread_axis(),
+        )
 
         # A grid whose block size is 1 need not claim a thread axis: its
         # ``offsets = pid * 1 + thread_idx[axis]`` term is always 0 (launch dim
@@ -4669,7 +4696,9 @@ class PerThreadFlattenedTileStrategy(_LaneContextOwner, FlattenedTileStrategy):
         if isinstance(state.device_function.pid, ForEachProgramID):
             pids.shared_pid_var = state.device_function.pid.shared_pid_var
         pids.append(PIDInfo(pid_var, block_size_var, total_numel, self.block_ids[0]))
-        self._record_grid_origins(state, pid_var, block_size_var, begins, steps)
+        self._record_grid_origins(
+            state, pid_var, block_size_var, begins, steps, walks_elements=True
+        )
         if vec_width > 1 and lane_strided:
             # The strided vec base folds the thread index in itself.
             state.add_statement(f"{offsets_base_var} = {tile_base}")
