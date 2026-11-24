@@ -3109,6 +3109,12 @@ def view_span(view: View, tile: Sequence[int]) -> int:
     return 1 + sum((b - 1) * s for b, s in zip(tile, view.strides, strict=True))
 
 
+def staged_seed(group: MppGroup) -> bool:
+    """Whether the group's accumulator starts from a tile its threads stage
+    (``_mpp_coop``), not from a constant fill."""
+    return group.seed is not None and group.seed.target is _mpp_coop
+
+
 def group_sides(group: MppGroup) -> tuple[tuple[_Operand, tuple[int, int], int], ...]:
     """The lhs and rhs, each with its blocks and the position of K in them."""
     return (

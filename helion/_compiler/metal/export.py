@@ -142,9 +142,10 @@ class MetalLaunch:
         shares storage with another argument, since MLX passes each array as
         its own buffer; a buffer that is not row-contiguous, since the
         kernel indexes it by its strides; and an input of fewer than
-        ``MLX_MAX_CONSTANT_ARRAY_SIZE`` elements that the kernel views as an
-        MPP device tensor, since MLX binds such an input in ``constant``
-        memory, which MPP's views cannot read.
+        ``MLX_MAX_CONSTANT_ARRAY_SIZE`` elements that the kernel reads
+        through a ``device`` pointer (``MSLKernel.device_views``: MPP views
+        and the loads that cast a buffer to one), since MLX binds such an
+        input in ``constant`` memory.
 
         ``init_value`` is MLX's fill for every output, all that reaches the
         kernel of what its outputs held before the launch: None when the
@@ -352,7 +353,7 @@ def _check_mlx_buffers(
         ):
             reason = (
                 f"has {t.numel()} elements, which MLX binds in constant "
-                "memory, but the kernel views it as an MPP device tensor"
+                "memory, but the kernel reads it through a device pointer"
             )
         else:
             continue
