@@ -10209,10 +10209,11 @@ class TestMppBatched(unittest.TestCase):
         ys = torch.randn(3, 64, 40, device=DEVICE)
         self._check(mm_carry_sum, (xs, ys), None, _bmm(xs, ys).sum(0), _ZERO_FILL)
 
-    def test_no_acc_results_materialized(self) -> None:
-        """A result with no acc as another op's seed, or beside another
-        cooperative result in one element-wise op, goes through threadgroup
-        memory."""
+    def test_seed_and_partner_results(self) -> None:
+        """A result with no acc as another op's seed goes through threadgroup
+        memory; beside another op's result of one op type in an element-wise
+        op, its element loop reads the other at its own slot
+        (``mpp_matmul._classify_partner_uses``)."""
         x, p = (torch.randn(48, 64, device=DEVICE) for _ in range(2))
         y, q = (torch.randn(64, 40, device=DEVICE) for _ in range(2))
         ref = _mm(x, y) + _mm(p, q)
@@ -10226,7 +10227,9 @@ class TestMppBatched(unittest.TestCase):
             r"threadgroup float _mpp_seed\w*\[",
             runs=2,
         )
-        self._check(mm2_sum, (x, y, p, q), None, ref, mat, runs=2)
+        self._check(
+            mm2_sum, (x, y, p, q), None, ref, r"\w+\[_ei\]", runs=2, absent=(mat,)
+        )
 
 
 @helion.kernel(**S)
@@ -17643,7 +17646,9 @@ class TestMppTileSharing(unittest.TestCase):
     def test_staged_runs_fence_a_home(self) -> None:
         """A K step that materializes nothing still shares: the ops reading
         its two staged operands fence it, so the second operand takes the
-        first one's tile.  Each run is repeated 20 times."""
+        first one's tile.  The epilogue reads both results at one slot
+        (``mpp_matmul._classify_partner_uses``), so the tile is the kernel's
+        only one.  Each run is repeated 20 times."""
         torch.manual_seed(0)
         x, w1, w2 = (
             torch.randn(shape, device=DEVICE)
@@ -17653,14 +17658,7 @@ class TestMppTileSharing(unittest.TestCase):
         ref = torch.relu(_d(x)) @ _d(w1) - (0.5 * _d(x) + 1.0) @ _d(w2)
         out, _, msl = _run(two_staged, (x, w1, w2), config)
         _close(out, ref)
-        self.assertEqual(
-            _tiles_declared(msl),
-            [
-                ("float", "_mpp_mat", 1024),
-                ("float", "_mpp_mat_1", 1024),
-                ("float", "_mpp_tile", 1024),
-            ],
-        )
+        self.assertEqual(_tiles_declared(msl), [("float", "_mpp_tile", 1024)])
         (k_step,) = re.findall(
             r"\n    for \(int offset_2 .*?\n    \}\n", msl, re.DOTALL
         )

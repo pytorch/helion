@@ -28,6 +28,7 @@ import contextlib
 import copy
 import dataclasses
 import functools
+import re
 from typing import TYPE_CHECKING
 from typing import Iterator
 
@@ -792,6 +793,19 @@ def _emit_for(
         unroll = (
             any(k.arg == "unroll" for k in it.keywords) or root in state.register_atoms
         )
+        # Partners' tensors (``mpp_matmul._classify_partner_uses``) hold the
+        # same element at each slot as this one: read at the loop's.
+        partners = {
+            r
+            for k in it.keywords
+            if k.arg == "partners"
+            for r in ast.literal_eval(k.value)
+        }
+        if partners:
+            assert unroll and root not in state.fragments, root
+            element_subs |= {
+                name: f"{r}[_ei]" for name, r in state.coop.items() if r in partners
+            }
         if root in state.coop_fold:
             # A fold's update reads its product's element at its own slot: the
             # two tensors hold the same element at each index
@@ -958,10 +972,11 @@ def _unrolled_elements(
     body: Callable[[int], list[str]],
 ) -> list[str]:
     """An element loop that runs once per iteration of an enclosing loop (an
-    accumulator's update), or any of a register op's accumulator, whose
-    tensor a loop over its iterator keeps out of registers for the whole
-    kernel, unrolled over a compile-time bound on the
-    thread's element slots: the op's tile over the threadgroup's threads,
+    accumulator's update), any of a register op's accumulator, whose tensor
+    a loop over its iterator keeps out of registers for the whole kernel, or
+    one that reads its partners at its slot
+    (``mpp_matmul._classify_partner_uses``), unrolled over a compile-time
+    bound on the thread's element slots: the op's tile over the threadgroup's threads,
     at least ``_MIN_UNROLLED_ELEMENTS``.  Unrolled, every slot index is a
     constant, so each element stays in its register and the compiler hoists
     the slot's validity and position out of the enclosing loop; a loop over
@@ -1235,6 +1250,10 @@ def _template_name(node: ast.AST) -> str | None:
     return None
 
 
+#: A cooperative tensor's element at an element loop's slot (``t[_ei]``).
+_ELEMENT_AT_SLOT = re.compile(r"\w+\[_ei\]")
+
+
 def _template_arg_to_msl(node: ast.AST, subs: dict[str, str] | None) -> str:
     """A template argument: ``float``, ``metal::half``, ``decltype(a + b)``."""
     if isinstance(node, ast.Attribute):
@@ -1245,9 +1264,11 @@ def _template_arg_to_msl(node: ast.AST, subs: dict[str, str] | None) -> str:
         assert isinstance(node, ast.Call)
         (operand,) = node.args
         inner = _ast_expr_to_msl(operand, subs=subs)
-        # decltype((*_it)) is a reference type; the element value type is
-        # decltype(+(*_it)).
-        return "decltype(+(*_it))" if inner == "(*_it)" else f"decltype({inner})"
+        # An element, (*_it) or a partner's or a product's t[_ei], is a
+        # reference; its value type is decltype(+(*_it)).
+        if inner == "(*_it)" or _ELEMENT_AT_SLOT.fullmatch(inner):
+            return f"decltype(+{inner})"
+        return f"decltype({inner})"
     return _ast_expr_to_msl(node, subs=subs)
 
 

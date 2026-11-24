@@ -272,6 +272,294 @@ def two_acc_mm(
 
 
 @helion.kernel(backend="metal", static_shapes=True)
+def gated_mm(x: torch.Tensor, y: torch.Tensor, z: torch.Tensor) -> torch.Tensor:
+    """silu(g) * u for g = x @ (y / 2) and u = x @ (z / 4), each rounded to
+    x's dtype: two accumulators of one K loop that one element-wise
+    epilogue reads, as a fused gate/up projection's SwiGLU does
+    (``mpp_matmul._classify_partner_uses``)."""
+    m, k = x.size()
+    _, n = y.size()
+    out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+    for tile_m, tile_n in hl.tile([m, n]):
+        a = hl.zeros([tile_m, tile_n], dtype=F32)
+        b = hl.zeros([tile_m, tile_n], dtype=F32)
+        for tile_k in hl.tile(k):
+            xs = x[tile_m, tile_k]
+            a = torch.addmm(a, xs, (y[tile_k, tile_n] * 0.5).to(x.dtype))
+            b = torch.addmm(b, xs, (z[tile_k, tile_n] * 0.25).to(x.dtype))
+        g = a.to(x.dtype)
+        out[tile_m, tile_n] = g * torch.sigmoid(g) * b.to(x.dtype)
+    return out
+
+
+@helion.kernel(backend="metal", static_shapes=True)
+def scaled_gated_mm(
+    x: torch.Tensor, y: torch.Tensor, z: torch.Tensor, v: torch.Tensor
+) -> torch.Tensor:
+    """gated_mm with the gate's product scaled by a row vector s summed over
+    v's rows before the K loop: the first accumulator's element loop reads s
+    staged through threadgroup memory, which a grid run can't take, and the
+    second's doesn't."""
+    m, k = x.size()
+    _, n = y.size()
+    out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+    for tile_m, tile_n in hl.tile([m, n]):
+        s = hl.zeros([tile_n], dtype=F32)
+        for r in hl.grid(v.size(0)):
+            s = s + v[r, tile_n]
+        a = hl.zeros([tile_m, tile_n], dtype=F32)
+        b = hl.zeros([tile_m, tile_n], dtype=F32)
+        for tile_k in hl.tile(k):
+            xs = x[tile_m, tile_k]
+            a = torch.addmm(a, xs, (y[tile_k, tile_n] * 0.5).to(x.dtype))
+            b = torch.addmm(b, xs, (z[tile_k, tile_n] * 0.25).to(x.dtype))
+        g = (a * s[None, :]).to(x.dtype)
+        out[tile_m, tile_n] = g * torch.sigmoid(g) * b.to(x.dtype)
+    return out
+
+
+@helion.kernel(backend="metal", static_shapes=True)
+def affine_gated_mm(
+    x: torch.Tensor,
+    w: torch.Tensor,
+    scales: torch.Tensor,
+    biases: torch.Tensor,
+    z: torch.Tensor,
+) -> torch.Tensor:
+    """silu(g) * u for g = x @ W.T, W 4-bit affine weights in float (the
+    affine split's candidate, :func:`~helion._testing.metal_fragment.affine_mm`)
+    and u = x @ (z / 4) on float operands, which the split doesn't take."""
+    m, k = x.size()
+    n = w.size(0)
+    group = k // scales.size(1)
+    out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+    for tile_m, tile_n in hl.tile([m, n]):
+        a = hl.zeros([tile_m, tile_n], dtype=F32)
+        b = hl.zeros([tile_m, tile_n], dtype=F32)
+        for tile_k in hl.tile(k):
+            bit = tile_k.index * 4
+            q = (
+                (w[tile_n, bit // 16].to(torch.int32) & 0xFFFF) >> (bit % 16)[None, :]
+            ) & 15
+            grp = tile_k.index // group
+            deq = q.to(F32) * scales[tile_n, grp].to(F32) + biases[tile_n, grp].to(F32)
+            xs = x[tile_m, tile_k].to(F32)
+            a = torch.addmm(a, xs, deq.T)
+            b = torch.addmm(b, xs, z[tile_k, tile_n] * 0.25)
+        g = a.to(x.dtype)
+        out[tile_m, tile_n] = g * torch.sigmoid(g) * b.to(x.dtype)
+    return out
+
+
+@helion.kernel(backend="metal", static_shapes=True)
+def narrowed_gated_mm(
+    x: torch.Tensor, y: torch.Tensor, z: torch.Tensor
+) -> torch.Tensor:
+    """gated_mm on float operands, the gate's weight rounded to half first:
+    its register run takes a half input and the up projection's a float
+    one, ops of two types."""
+    m, k = x.size()
+    _, n = y.size()
+    out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+    for tile_m, tile_n in hl.tile([m, n]):
+        a = hl.zeros([tile_m, tile_n], dtype=F32)
+        b = hl.zeros([tile_m, tile_n], dtype=F32)
+        for tile_k in hl.tile(k):
+            xs = x[tile_m, tile_k].to(F32)
+            a = torch.addmm(a, xs, (y[tile_k, tile_n] * 0.5).to(torch.float16).to(F32))
+            b = torch.addmm(b, xs, z[tile_k, tile_n] * 0.25)
+        g = a.to(x.dtype)
+        out[tile_m, tile_n] = g * torch.sigmoid(g) * b.to(x.dtype)
+    return out
+
+
+@helion.kernel(backend="metal", static_shapes=True)
+def apart_mm(
+    x: torch.Tensor,
+    w: torch.Tensor,
+    scales: torch.Tensor,
+    biases: torch.Tensor,
+    z: torch.Tensor,
+    v: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """(x @ W.T) * s and x @ (z / 4), stored apart from one K loop: W 4-bit
+    affine weights in float (the affine split's candidate) and s a row
+    vector summed over v's rows (staged, which a grid run can't take).  The
+    two ops are of one layout key, but no op reads both results."""
+    m, k = x.size()
+    n = w.size(0)
+    group = k // scales.size(1)
+    out_a = torch.empty([m, n], dtype=x.dtype, device=x.device)
+    out_b = torch.empty([m, n], dtype=x.dtype, device=x.device)
+    for tile_m, tile_n in hl.tile([m, n]):
+        s = hl.zeros([tile_n], dtype=F32)
+        for r in hl.grid(v.size(0)):
+            s = s + v[r, tile_n]
+        a = hl.zeros([tile_m, tile_n], dtype=F32)
+        b = hl.zeros([tile_m, tile_n], dtype=F32)
+        for tile_k in hl.tile(k):
+            bit = tile_k.index * 4
+            q = (
+                (w[tile_n, bit // 16].to(torch.int32) & 0xFFFF) >> (bit % 16)[None, :]
+            ) & 15
+            grp = tile_k.index // group
+            deq = q.to(F32) * scales[tile_n, grp].to(F32) + biases[tile_n, grp].to(F32)
+            xs = x[tile_m, tile_k].to(F32)
+            a = torch.addmm(a, xs, deq.T)
+            b = torch.addmm(b, xs, z[tile_k, tile_n] * 0.25)
+        out_a[tile_m, tile_n] = (a * s[None, :]).to(x.dtype)
+        out_b[tile_m, tile_n] = b.to(x.dtype)
+    return out_a, out_b
+
+
+@helion.kernel(backend="metal", static_shapes=True)
+def early_a_mm(x: torch.Tensor, y: torch.Tensor, z: torch.Tensor) -> torch.Tensor:
+    """2 a' + b, a and b two accumulators of one K loop and a' a's value
+    before the tile's update, stored each tile: an op reading the first
+    partner's carry before its op writes it."""
+    m, k = x.size()
+    _, n = y.size()
+    out = torch.empty([m, n], dtype=F32, device=x.device)
+    for tile_m, tile_n in hl.tile([m, n]):
+        a = hl.zeros([tile_m, tile_n], dtype=F32)
+        b = hl.zeros([tile_m, tile_n], dtype=F32)
+        for tile_k in hl.tile(k):
+            t = a * 2.0
+            xs = x[tile_m, tile_k]
+            a = torch.addmm(a, xs, (y[tile_k, tile_n] * 0.5).to(x.dtype))
+            b = torch.addmm(b, xs, (z[tile_k, tile_n] * 0.25).to(x.dtype))
+            out[tile_m, tile_n] = t + b
+    return out
+
+
+@helion.kernel(backend="metal", static_shapes=True)
+def early_b_mm(x: torch.Tensor, y: torch.Tensor, z: torch.Tensor) -> torch.Tensor:
+    """a + 2 b' as :func:`early_a_mm`: an op reading the second partner's
+    carry before its op writes it."""
+    m, k = x.size()
+    _, n = y.size()
+    out = torch.empty([m, n], dtype=F32, device=x.device)
+    for tile_m, tile_n in hl.tile([m, n]):
+        a = hl.zeros([tile_m, tile_n], dtype=F32)
+        b = hl.zeros([tile_m, tile_n], dtype=F32)
+        for tile_k in hl.tile(k):
+            t = b * 2.0
+            xs = x[tile_m, tile_k]
+            a = torch.addmm(a, xs, (y[tile_k, tile_n] * 0.5).to(x.dtype))
+            b = torch.addmm(b, xs, (z[tile_k, tile_n] * 0.25).to(x.dtype))
+            out[tile_m, tile_n] = a + t
+    return out
+
+
+@helion.kernel(backend="metal", static_shapes=True)
+def rewriting_mm(
+    x: torch.Tensor, y: torch.Tensor, z: torch.Tensor, t: torch.Tensor
+) -> torch.Tensor:
+    """a + b * t for two accumulators of one K loop, t zeroed after it is
+    read: an epilogue reading a tensor the kernel then writes."""
+    m, k = x.size()
+    _, n = y.size()
+    out = torch.empty([m, n], dtype=F32, device=x.device)
+    for tile_m, tile_n in hl.tile([m, n]):
+        a = hl.zeros([tile_m, tile_n], dtype=F32)
+        b = hl.zeros([tile_m, tile_n], dtype=F32)
+        for tile_k in hl.tile(k):
+            xs = x[tile_m, tile_k]
+            a = torch.addmm(a, xs, (y[tile_k, tile_n] * 0.5).to(x.dtype))
+            b = torch.addmm(b, xs, (z[tile_k, tile_n] * 0.25).to(x.dtype))
+        scaled = b * t[tile_m, tile_n]
+        t[tile_m, tile_n] = hl.zeros([tile_m, tile_n], dtype=F32)
+        out[tile_m, tile_n] = a + scaled
+    return out
+
+
+@helion.kernel(backend="metal", static_shapes=True)
+def seed_read_mm(
+    x: torch.Tensor, y: torch.Tensor, z: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """a b and a + b0 for two accumulators of one K loop, b's seed b0 a
+    fill of 1 that its op updates in place: an op beside partners that
+    reads one's seed."""
+    m, k = x.size()
+    _, n = y.size()
+    out1 = torch.empty([m, n], dtype=F32, device=x.device)
+    out2 = torch.empty([m, n], dtype=F32, device=x.device)
+    for tile_m, tile_n in hl.tile([m, n]):
+        a = hl.zeros([tile_m, tile_n], dtype=F32)
+        b0 = hl.full([tile_m, tile_n], 1.0, dtype=F32)
+        b = b0
+        for tile_k in hl.tile(k):
+            xs = x[tile_m, tile_k]
+            a = torch.addmm(a, xs, (y[tile_k, tile_n] * 0.5).to(x.dtype))
+            b = torch.addmm(b, xs, (z[tile_k, tile_n] * 0.25).to(x.dtype))
+        out1[tile_m, tile_n] = a * b
+        out2[tile_m, tile_n] = a + b0
+    return out1, out2
+
+
+@helion.kernel(backend="metal", static_shapes=True)
+def seed_join_mm(
+    x: torch.Tensor, y: torch.Tensor, z: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """a b + b0 and a b + (b0 + 1) for two accumulators of one K loop, b's
+    seed b0 a fill of 1: ops reading partners and one's seed, directly or
+    through a value computed from it, which stay apart from them."""
+    m, k = x.size()
+    _, n = y.size()
+    out1 = torch.empty([m, n], dtype=F32, device=x.device)
+    out2 = torch.empty([m, n], dtype=F32, device=x.device)
+    for tile_m, tile_n in hl.tile([m, n]):
+        a = hl.zeros([tile_m, tile_n], dtype=F32)
+        b0 = hl.full([tile_m, tile_n], 1.0, dtype=F32)
+        b = b0
+        for tile_k in hl.tile(k):
+            xs = x[tile_m, tile_k]
+            a = torch.addmm(a, xs, (y[tile_k, tile_n] * 0.5).to(x.dtype))
+            b = torch.addmm(b, xs, (z[tile_k, tile_n] * 0.25).to(x.dtype))
+        out1[tile_m, tile_n] = a * b + b0
+        out2[tile_m, tile_n] = a * b + (b0 + 1.0)
+    return out1, out2
+
+
+@helion.kernel(backend="metal", static_shapes=True)
+def silu_gated_mm(x: torch.Tensor, y: torch.Tensor, z: torch.Tensor) -> torch.Tensor:
+    """silu(g) u in float for g, u = x @ (y / 2), x @ (z / 4), u's op first:
+    the element loop over u reads g at its slot inside silu's casts."""
+    m, k = x.size()
+    _, n = y.size()
+    out = torch.empty([m, n], dtype=F32, device=x.device)
+    for tile_m, tile_n in hl.tile([m, n]):
+        u = hl.zeros([tile_m, tile_n], dtype=F32)
+        g = hl.zeros([tile_m, tile_n], dtype=F32)
+        for tile_k in hl.tile(k):
+            xs = x[tile_m, tile_k]
+            u = torch.addmm(u, xs, (z[tile_k, tile_n] * 0.25).to(x.dtype))
+            g = torch.addmm(g, xs, (y[tile_k, tile_n] * 0.5).to(x.dtype))
+        out[tile_m, tile_n] = torch.nn.functional.silu(g) * u
+    return out
+
+
+@helion.kernel(backend="metal", static_shapes=True)
+def mixed_gated_mm(x: torch.Tensor, y: torch.Tensor, z: torch.Tensor) -> torch.Tensor:
+    """gated_mm with the up projection on float32 operands: ops of two
+    types, whose layouts may differ, so the epilogue reads both results in
+    the Scalar layout."""
+    m, k = x.size()
+    _, n = y.size()
+    out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+    for tile_m, tile_n in hl.tile([m, n]):
+        a = hl.zeros([tile_m, tile_n], dtype=F32)
+        b = hl.zeros([tile_m, tile_n], dtype=F32)
+        for tile_k in hl.tile(k):
+            xs = x[tile_m, tile_k]
+            a = torch.addmm(a, xs, (y[tile_k, tile_n] * 0.5).to(x.dtype))
+            b = torch.addmm(b, xs.to(F32), z[tile_k, tile_n] * 0.25)
+        g = a.to(x.dtype)
+        out[tile_m, tile_n] = g * torch.sigmoid(g) * b.to(x.dtype)
+    return out
+
+
+@helion.kernel(backend="metal", static_shapes=True)
 def rowsum_mm(x: torch.Tensor, y: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
     """(x @ (y / 2)) * s for s the sums of v's rows: a reduction, whose
     threads come from the num_warps budget, beside the matmul."""
