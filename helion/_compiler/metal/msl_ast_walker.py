@@ -44,6 +44,7 @@ from .fragment_mma import prefetch_loads
 from .fragment_mma import split_runs
 from .lane_fold import BF16_CAST
 from .lane_fold import LANE_PUT
+from .lane_fold import MASKED_LOAD
 from .lane_fold import load_mask_other
 from .lane_fold import tl_load
 from .lane_fold import tl_store
@@ -151,14 +152,20 @@ class EmitState:
     #: Whether the kernel runs on the GPU here, which the register operands'
     #: layouts are then probed on (``coop_layout``).
     on_gpu: bool = False
+    #: Each tensor argument's MSL element type, which a register run's
+    #: packed codes are read as (``bit_windows``).
+    tensor_types: dict[str, str] = dataclasses.field(default_factory=dict)
+    #: How many windows of packed codes the kernel has named
+    #: (``bit_windows``), which keeps their names unique.
+    window_count: int = 0
     #: The lane bases of those layouts' elements: each base's values to its
     #: name, the preamble's declarations of them, the facts the fold knows of
     #: them, and each op's operand's elements in terms of them.
     lane_names: dict[tuple[int, ...], str] = dataclasses.field(default_factory=dict)
     lane_decls: list[str] = dataclasses.field(default_factory=list)
     #: The buffers the body reads through a ``device`` pointer: MPP device
-    #: tensors' views (``_coop_view``) and grid runs' staging reads
-    #: (``mpp_registers``).
+    #: tensors' views (``_coop_view``), grid runs' staging reads and packed
+    #: code windows (``mpp_registers``).
     device_views: set[str] = dataclasses.field(default_factory=set)
     lane_facts: dict[str, Fact] = dataclasses.field(default_factory=dict)
     lanes: dict[tuple[Atom, str, bool], CoopLanes] = dataclasses.field(
@@ -1230,7 +1237,6 @@ def _template_arg_to_msl(node: ast.AST, subs: dict[str, str] | None) -> str:
 
 #: ``m ? v : other`` as a call, so ``v`` (a load at a safe index) is
 #: evaluated unconditionally; the result has the conditional's own type.
-MASKED_LOAD = "_helion_masked"
 MASKED_LOAD_PREAMBLE = f"""template <typename T, typename O>
 inline auto {MASKED_LOAD}(T v, bool m, O other) {{
     return m ? v : other;

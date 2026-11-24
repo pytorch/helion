@@ -22,6 +22,7 @@ from helion._testing import skipUnlessBackends
 from helion._testing.metal import run_with_msl
 from helion._testing.metal_fragment import affine_args
 from helion._testing.metal_fragment import affine_mm
+from helion._testing.metal_fragment import affine_mm_f16
 from helion._testing.metal_fragment import affine_reference
 from helion._testing.metal_fragment import k_from_16
 from helion._testing.metal_fragment import nvfp4_rows
@@ -154,6 +155,64 @@ class TestMppRegisters(unittest.TestCase):
             self.assertTrue(view)
         elif "M4" in torch.backends.mps.get_name():  # pyrefly: ignore[missing-attribute]
             self.assertFalse(view)
+
+    def test_code_windows(self) -> None:
+        """Packed codes read from windows of words (``bit_windows``, on an
+        M5's layout) give the elementwise reads' outputs exactly, and
+        float64's of the half-rounded weights within fp16 rounding: 3- to
+        7-bit codes at 16 and 32 rows, K split over 2 to 8 SIMD groups, and
+        a K tail, whose steps that may pass K keep their masked reads."""
+        windows = coop_layout.gpu_family() == "M5"
+        for bits, rows, block, warps, k in (
+            (3, 16, [16, 32, 128], 8, 1024),
+            (5, 32, [32, 32, 64], 2, 1024),
+            (6, 32, [32, 32, 128], 8, 1024),
+            (7, 16, [16, 32, 64], 4, 1024),
+            (6, 16, [16, 32, 128], 4, 1088),
+        ):
+            with self.subTest(bits=bits, rows=rows, k=k):
+                args = affine_args(bits, 64, rows, 96, k, DEVICE)
+                config = register_config(block, num_warps=warps)
+                out, msl = _run(affine_mm_f16, args, config)
+                with mock.patch.object(mpp_registers, "plan_windows", return_value=[]):
+                    plain, _, plain_msl = run_with_msl(
+                        affine_mm_f16, args, config, module_key=f"plain {config!r}"
+                    )
+                windowed = "_mbw" in msl
+                if windows:
+                    # On an M5's layout every run's codes take a window; on
+                    # others only those whose window saves loads do (3-bit
+                    # codes 8 K positions apart on an M4's).
+                    self.assertTrue(windowed)
+                self.assertEqual("_helion_masked(w[" in msl, k != 1024 or not windowed)
+                self.assertNotIn("_mbw", plain_msl)
+                self.assertTrue(torch.equal(out, cast("torch.Tensor", plain)))
+                self._close(out, affine_reference(args, torch.float16))
+
+    def test_word_windows(self) -> None:
+        """Windows over 8-bit words and over 16-bit words a row holds one more
+        of (the next word read unclamped) give the elements' reads' outputs
+        exactly, and float64's of the half-rounded weights within fp16
+        rounding."""
+        windows = coop_layout.gpu_family() == "M5"
+        config = register_config([32, 32, 128], num_warps=8)
+        for bits, words, padded in (
+            (5, torch.uint8, False),
+            (7, torch.uint8, False),
+            (5, torch.int16, True),
+        ):
+            with self.subTest(bits=bits, words=words):
+                args = affine_args(bits, 64, 32, 96, 1024, DEVICE, words, padded)
+                out, msl = _run(affine_mm_f16, args, config)
+                with mock.patch.object(mpp_registers, "plan_windows", return_value=[]):
+                    plain, _, plain_msl = run_with_msl(
+                        affine_mm_f16, args, config, module_key=f"plain {bits} {words}"
+                    )
+                if windows:
+                    self.assertIn("_mbw", msl)
+                self.assertNotIn("_mbw", plain_msl)
+                self.assertTrue(torch.equal(out, cast("torch.Tensor", plain)))
+                self._close(out, affine_reference(args, torch.float16))
 
     def test_split(self) -> None:
         """K loops split over 2 to 16 SIMD groups, with x in registers or

@@ -348,8 +348,9 @@ def codegen_fragment_run(
     (:func:`clamp_past_end`).  ``steps`` is the K tile's MMA steps,
     ``k_live`` its live length, which masks a computed operand's K tail
     (None when every tile is whole), ``facts`` the tile offsets' ``(offset,
-    multiple, least)`` (:func:`offset_fact`), over which the run folds its
-    elements' index arithmetic, ``tables`` the config's
+    multiple, least, most)`` (:func:`offset_fact`), over whose multiple and
+    least the run folds its elements' index arithmetic, ``tables`` the
+    config's
     ``metal_tabulate_max_entries``, ``k_step`` the K loop's offset and
     step when it loads its operands a tile ahead (``range_num_stages=2``),
     else None, and ``split`` the K loop's offset and the SIMD groups that
@@ -781,7 +782,7 @@ def _run_setup(
     a_loop, b_loop = stmt.body
     assert isinstance(a_loop, ast.For) and isinstance(b_loop, ast.For)
     facts = dict(_LANE_FACTS)
-    for name, multiple, least in ast.literal_eval(facts_arg):
+    for name, multiple, least, _ in ast.literal_eval(facts_arg):
         facts[name] = Fact(multiple, least)
     n_steps = ast.literal_eval(steps)
     sides = [

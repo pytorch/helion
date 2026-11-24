@@ -55,6 +55,7 @@ from .fragment_mma import FRAGMENT_LOWERING
 from .fragment_mma import LANE
 from .fragment_mma import LANE_PREAMBLE
 from .fragment_mma import is_fragment_acc
+from .lane_fold import MASKED_LOAD
 from .lane_fold import MSL_SCALAR_BYTES
 from .lane_fold import jam_lanes_into_loops
 from .lane_fold import tl_store
@@ -67,7 +68,6 @@ from .mpp_registers import GRID_TILE
 from .mpp_registers import LANE as REGISTER_LANE
 from .mpp_registers import REGISTER_LOWERING
 from .mpp_registers import grid_tiles
-from .msl_ast_walker import MASKED_LOAD
 from .msl_ast_walker import MASKED_LOAD_PREAMBLE
 from .msl_ast_walker import EmitState
 from .msl_ast_walker import _emit_stmts
@@ -462,10 +462,11 @@ def _generate_msl_kernel(
     body_stmts, threadgroup_buffers = _threadgroup_buffers(
         body_stmts, fn_globals, referenced, reduction_sites, layout
     )
+    tensor_types = {n: DTYPE_TO_METAL[d] for n, d in tensor_dtypes.items()}
     body_stmts = fuse_multiply_adds(
         body_stmts,
         {
-            **{n: DTYPE_TO_METAL[d] for n, d in tensor_dtypes.items()},
+            **tensor_types,
             **{n: dtype for n, dtype, _ in threadgroup_buffers},
             **by_value,
             **{
@@ -611,6 +612,7 @@ def _generate_msl_kernel(
         on_gpu=any(
             isinstance(arg, torch.Tensor) and arg.device.type == "mps" for arg in args
         ),
+        tensor_types=tensor_types,
     )
 
     body: list[str] = []
