@@ -1,0 +1,85 @@
+{
+  "preprocess": {
+    "block_sizes": [
+      8
+    ],
+    "num_threads": [
+      8,
+      8
+    ],
+    "reduction_loops": [
+      null
+    ],
+    "load_eviction_policies": [
+      "l1_l2_last",
+      "l2_last",
+      "l2_last",
+      "",
+      ""
+    ],
+    "cute_independent_reduction": false,
+    "cute_replicated_reduction": false,
+    "cute_vector_packet_unroll": false,
+    "cute_vloop_sink": false,
+    "cute_lane_unroll": 1,
+    "cute_pdl": true,
+    "cute_vector_widths": [
+      1,
+      4
+    ],
+    "cute_lane_layouts": [
+      "blocked",
+      "strided"
+    ],
+    "cute_reduction_reloads": [
+      "gmem"
+    ],
+    "cute_cluster_n": 16,
+    "cute_min_blocks_per_mp": 6
+  },
+  "main": {
+    "block_sizes": [
+      128,
+      128
+    ],
+    "cute_flash_bwd_persistent": 0,
+    "cute_flash_bwd_two_cta": 0,
+    "cute_flash_bwd_exp2_f32": 1,
+    "cute_flash_bwd_mask_form": "bitmask",
+    "cute_flash_bwd_regs": "88/168/88",
+    "cute_flash_bwd_hook_cols": 8,
+    "cute_flash_bwd_hook_pin": 0,
+    "cute_flash_bwd_bias_fold": 1,
+    "cute_flash_bwd_tile_group": 0,
+    "cute_flash_bwd_stats_mma": 0,
+    "cute_flash_bwd_aux_smem": 4096,
+    "cute_flash_bwd_ds_tmem": 1,
+    "cute_flash_bwd_exp2_emu": 4,
+    "cute_min_blocks_per_mp": 1,
+    "cute_collective_mma": false,
+    "cute_collective_native_seeded": false,
+    "cute_collective_tmem_seed": false,
+    "cute_collective_tmem_a": false,
+    "cute_collective_copy": "scalar",
+    "cute_collective_compute": "warp",
+    "cute_vector_widths": [
+      1,
+      1,
+      1,
+      1,
+      1,
+      1
+    ],
+    "cute_lane_layouts": [
+      "blocked",
+      "blocked",
+      "blocked",
+      "blocked",
+      "blocked",
+      "blocked"
+    ],
+    "cute_reduction_reloads": [
+      "auto"
+    ]
+  }
+}

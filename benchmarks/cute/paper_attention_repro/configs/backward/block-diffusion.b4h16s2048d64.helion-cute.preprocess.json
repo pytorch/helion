@@ -1,0 +1,39 @@
+{
+  "block_sizes": [
+    128
+  ],
+  "num_threads": [
+    64,
+    2
+  ],
+  "reduction_loops": [
+    32
+  ],
+  "load_eviction_policies": [
+    "l1_l2_first",
+    "last",
+    "last",
+    "last",
+    "last"
+  ],
+  "cute_independent_reduction": false,
+  "cute_replicated_reduction": false,
+  "cute_vector_packet_unroll": false,
+  "cute_vloop_sink": false,
+  "cute_lane_unroll": 1,
+  "cute_pdl": true,
+  "epilogue_subtile": 2,
+  "cute_vector_widths": [
+    16,
+    2
+  ],
+  "cute_lane_layouts": [
+    "strided",
+    "strided"
+  ],
+  "cute_reduction_reloads": [
+    "gmem"
+  ],
+  "cute_cluster_n": 16,
+  "cute_min_blocks_per_mp": 0
+}
