@@ -1680,6 +1680,57 @@ def _clone_lane_loop_with_body(loop: ast.For, body: list[ast.AST]) -> ast.For:
     return cloned
 
 
+def _known_zero_bound(value: object) -> bool:
+    # Testing a scalar tensor or an unbacked SymInt as a Python bool would
+    # specialize the bound while generating its device program.
+    return isinstance(value, (int, sympy.Integer)) and value == 0
+
+
+def _unsigned_range_bounds(begin: object, end: object) -> bool:
+    bounds = (begin, end)
+    if not any(isinstance(v, torch.Tensor) and v.dtype == torch.uint64 for v in bounds):
+        return False
+    # A UInt64 load uses all 64 bits; a signed endpoint could require a 65th
+    # bit for either the coordinate domain or the distance.
+    for v in bounds:
+        if isinstance(v, torch.Tensor) and v.dtype in (
+            torch.uint8,
+            torch.uint16,
+            torch.uint32,
+            torch.uint64,
+        ):
+            continue
+        if isinstance(v, (int, sympy.Integer)) and 0 <= int(v) < 2**64:
+            continue
+        if isinstance(
+            v, torch.SymInt
+        ) and CompileEnvironment.current().known_nonnegative(_to_sympy(v)):
+            continue
+        raise exc.InvalidConfig("UInt64 range bounds must both be known nonnegative")
+    return True
+
+
+def _root_coordinate(
+    name: str, expression: str, begin: object, end: object, step: object
+) -> str:
+    if not _unsigned_range_bounds(begin, end):
+        return expression
+    backend = CompileEnvironment.current().backend
+    # A positive range never reaches its stop, and a negative range cannot exceed
+    # its start. A loaded UInt64 on the other side may make this range empty.
+    stride = 1 if step is None else step
+    if isinstance(stride, (int, sympy.Integer)):
+        limit = end if stride > 0 else begin
+        if isinstance(limit, (torch.SymInt, torch.Tensor)):
+            if not isinstance(limit, torch.Tensor) or limit.dtype != torch.uint64:
+                return backend.bounded_uint64_grid_expr(expression)
+        elif isinstance(limit, (int, sympy.Integer)) and int(limit) < 2**63 + int(
+            stride > 0
+        ):
+            return backend.bounded_uint64_grid_expr(expression)
+    return backend.unbounded_uint64_grid_expr(name, expression)
+
+
 class BlockSizeTileStrategy(TileStrategy):
     def __init__(
         self,
@@ -1694,6 +1745,188 @@ class BlockSizeTileStrategy(TileStrategy):
         )
         self.block_size = block_size
         self.loop_order = loop_order
+
+    def _range_numel_expr(
+        self,
+        begin: object,
+        end: object,
+        step: object | None,
+        *,
+        root_axes: tuple[Sequence[object], Sequence[object], Sequence[object]]
+        | None = None,
+    ) -> sympy.Expr | str:
+        begin_expr = (
+            _to_sympy(begin)
+            if isinstance(begin, (int, torch.SymInt, sympy.Expr))
+            else None
+        )
+        end_expr = (
+            _to_sympy(end) if isinstance(end, (int, torch.SymInt, sympy.Expr)) else None
+        )
+        diff_expr = (
+            sympy.Add(end_expr, sympy.Mul(-1, begin_expr))
+            if begin_expr is not None and end_expr is not None
+            else None
+        )
+        assert step is None or isinstance(step, (int, torch.SymInt, sympy.Expr))
+        stride = sympy.Integer(1) if step is None else _to_sympy(step)
+        if (
+            root_axes is not None
+            and begin_expr is not None
+            and end_expr is not None
+            and (
+                begin_expr.free_symbols or end_expr.free_symbols or stride.free_symbols
+            )
+            and not (
+                begin_expr == 0 and stride == 1 and isinstance(end_expr, sympy.Symbol)
+            )
+        ):
+
+            def host(axis: tuple[sympy.Expr, sympy.Expr, sympy.Expr]) -> str:
+                lo, hi, st = axis
+                return ", ".join(
+                    (
+                        self.fn.root_grid_operand(lo, "grid_bound"),
+                        self.fn.root_grid_operand(hi, "grid_bound"),
+                        self.fn.root_grid_operand(st, "grid_stride"),
+                    )
+                )
+
+            axis = (begin_expr, end_expr, stride)
+            others = []
+            for b, e, step_arg in zip(*root_axes, strict=True):
+                values = (b, e, 1 if step_arg is None else step_arg)
+                if all(isinstance(v, (int, sympy.Expr, torch.SymInt)) for v in values):
+                    lo, hi, st = (
+                        _to_sympy(cast("int | sympy.Expr | torch.SymInt", v))
+                        for v in values
+                    )
+                    if (lo, hi, st) != axis:
+                        others.append(f"({host((lo, hi, st))})")
+            args = ", ".join((host(axis), *others))
+            return self.fn.host_grid_arg(
+                "grid_length", f"helion.runtime._grid_range_length({args})"
+            )
+        if diff_expr is not None and not stride.free_symbols:
+            count = (
+                diff_expr
+                if stride == 1
+                else sympy.ceiling(sympy.Mul(diff_expr, sympy.Pow(stride, -1)))
+            )
+            # Per-axis range lengths cannot be negative. Flattening an even
+            # number of empty ranges must not turn them into a live block.
+            if CompileEnvironment.current().known_nonnegative(count):
+                return count
+            return sympy.Max(0, count)
+
+        def bound(value: object) -> str:
+            text = self._expr_str(value)
+            if (
+                isinstance(value, torch.Tensor)
+                and value.dtype != torch.int64
+                and not _known_zero_bound(begin)
+            ):
+                # Subtract loaded Int32 operands in the signed coordinate type.
+                backend = CompileEnvironment.current().backend
+                return backend.cast_expr(text, backend.dtype_str(torch.int64))
+            return text
+
+        def narrow_endpoint(value: object) -> bool:
+            if isinstance(value, torch.Tensor):
+                # The difference of two at-most-32-bit integers fits Int64.
+                return value.element_size() <= 4
+            if isinstance(value, (int, sympy.Integer)):
+                return -(2**31) <= int(value) < 2**31
+            return False
+
+        unsigned = _unsigned_range_bounds(begin, end)
+        if unsigned or (
+            not (_known_zero_bound(begin) and isinstance(stride, sympy.Integer))
+            and not (narrow_endpoint(begin) and narrow_endpoint(end))
+        ):
+            # Signed subtraction can wrap before an emptiness test. Compare the
+            # signed endpoints first and subtract in the unsigned domain: a
+            # positive distance can span all 64 bits even when its trip count
+            # fits in a signed index (for example, with stride two).
+            backend = CompileEnvironment.current().backend
+
+            def u64(text: str) -> str:
+                return backend.uint64_expr(text)
+
+            def distance(hi: str, lo: str) -> str:
+                return f"({u64(hi)} - {u64(f'min({hi}, {lo})')})"
+
+            lo, hi = bound(begin), bound(end)
+            if unsigned:
+                lo, hi = u64(self._expr_str(begin)), u64(self._expr_str(end))
+            if isinstance(stride, sympy.Integer):
+                n = distance(hi, lo) if stride > 0 else distance(lo, hi)
+                magnitude = str(abs(int(stride)))
+            else:
+                st = self._expr_str(step)
+                positive = f"(({st}) > 0)"
+                n = backend.where_expr(positive, distance(hi, lo), distance(lo, hi))
+                magnitude = backend.where_expr(
+                    positive, u64(st), f"({u64('0')} - {u64(st)})"
+                )
+            length = (
+                n
+                if magnitude == "1"
+                else f"(({n}) // ({magnitude}) + (({n}) % ({magnitude}) != 0))"
+            )
+            return backend.cast_expr(length, backend.dtype_str(torch.int64))
+
+        delta = f"(({bound(end)}) - ({bound(begin)}))"
+        if stride == 1:
+            return f"max(0, {delta})"
+        step_text = self._expr_str(step)
+        # Divide same-sign values on reached ranges: Python floor division and
+        # a backend's truncating division agree there. Subtract one in the
+        # direction of travel before dividing, without negating a signed minimum.
+        if isinstance(stride, sympy.Integer) and int(stride) > 0:
+            return f"((max(1, {delta}) - 1) // ({step_text}) + ({delta} > 0))"
+        if isinstance(stride, sympy.Integer) and int(stride) < 0:
+            return f"((min(-1, {delta}) + 1) // ({step_text}) + ({delta} < 0))"
+        # For a live stride its sign is unknown. Round a nonempty quotient up
+        # exactly when there is a remainder; an opposite-sign quotient clamps
+        # to zero under either host or device integer division.
+        return (
+            f"max(0, ({delta} // ({step_text})) + "
+            f"((({delta} < 0) == (({step_text}) < 0)) & "
+            f"(({delta} % ({step_text})) != 0)))"
+        )
+
+    def _expr_str(self, value: object) -> str:
+        raise NotImplementedError
+
+    @staticmethod
+    def _root_coordinate_dtype(begin: object, end: object, step: object) -> str:
+        env = CompileEnvironment.current()
+        # Ordinary zero-based grids already use the selected tensor index type.
+        # A shifted or strided grid can cross its boundary even on tiny tensors.
+        if _unsigned_range_bounds(begin, end):
+            return env.backend.root_coordinate_type_str(torch.int64)
+        if _known_zero_bound(begin) and step in (None, 1):
+            return env.index_type()
+        stride = 1 if step is None else step
+        if (
+            isinstance(begin, (int, sympy.Integer))
+            and isinstance(end, (int, sympy.Integer))
+            and isinstance(stride, (int, sympy.Integer))
+            and stride != 0
+        ):
+            coords = range(int(begin), int(end), int(stride))
+            if not coords:
+                return env.index_type()
+            first, last = coords[0], coords[-1]
+            # The physical PID is multiplied before adding the origin.
+            operands = (first, last, last - first, int(stride))
+            for dtype in (env.index_dtype, torch.int64):
+                limits = torch.iinfo(dtype)
+                if all(limits.min <= x <= limits.max for x in operands):
+                    return env.backend.root_coordinate_type_str(dtype)
+            raise exc.InvalidConfig("root grid coordinate arithmetic exceeds Int64")
+        return env.backend.root_coordinate_type_str(torch.int64)
 
     def _reorder(self, block_ids: list[_T]) -> list[_T]:
         if len(block_ids) <= 1:
@@ -1730,7 +1963,7 @@ class BlockSizeTileStrategy(TileStrategy):
         else:
             raise NotImplementedError(f"Unsupported end type: {type(end)}")
 
-        if begin == 0:
+        if _known_zero_bound(begin):
             # Simple case: numel = end
             return end_expr  # type: ignore[return-value]
         if isinstance(begin, torch.Tensor):
@@ -1994,6 +2227,7 @@ class FlattenedTileStrategy(BlockSizeTileStrategy):
         self._mask_var: str | None = self.new_var("mask", dce=True)
         self._offsets_var = self.new_var("offsets", dce=True)
         self._grid_origin_vars: dict[int, str] = {}
+        self._shifted_scalar_axes: set[int] = set()
         # The trip count each block's index is decoded from the flat offset
         # with, recorded by the codegen.
         self.trip_counts: dict[int, sympy.Expr | str] = {}
@@ -2045,6 +2279,12 @@ class FlattenedTileStrategy(BlockSizeTileStrategy):
     ) -> None:
         from .type_info import TileIndexType
 
+        if self.block_size == 1:
+            self._shifted_scalar_axes.update(
+                axis
+                for axis, begin, step in zip(self.block_ids, begins, steps, strict=True)
+                if not _known_zero_bound(begin) or step not in (None, 1)
+            )
         if not CompileEnvironment.current().backend.tracks_flat_grid_origins():
             return
         if self.block_size == 1:
@@ -2066,7 +2306,7 @@ class FlattenedTileStrategy(BlockSizeTileStrategy):
             block_id = self.block_ids[0]
             origin = self.offset_vars[block_id]
             expression = f"({pid_var}) * ({block_size_var})"
-            if begins[0] != 0:
+            if not _known_zero_bound(begins[0]):
                 expression = f"({self._expr_str(begins[0])}) + ({expression})"
             state.add_statement(f"{origin} = {expression}")
             self._grid_origin_vars[block_id] = origin
@@ -2107,52 +2347,33 @@ class FlattenedTileStrategy(BlockSizeTileStrategy):
     def _uses_thread_axis(self) -> bool:
         return not (isinstance(self.block_size, int) and self.block_size == 1)
 
+    def _walks_flat_elements(self) -> bool:
+        return (
+            len(self.block_ids) == 1
+            and self._uses_thread_axis()
+            and CompileEnvironment.current().backend.flat_strided_tile_walks_elements()
+        )
+
     def _numel_str(self, state: CodegenState, value: sympy.Expr | str) -> str:
         if isinstance(value, str):
             return value
         return state.sympy_expr(value)
 
-    def _range_trip_count(
+    def _decode_flat_index(
         self,
-        begin: object,
-        end: object,
-        step: object | None,
-    ) -> sympy.Expr | str:
-        return self._range_numel_expr(begin, end, step)
-
-    def _range_numel_expr(
-        self, begin: object, end: object, step: object | None
-    ) -> sympy.Expr | str:
-        begin_expr = (
-            _to_sympy(begin)
-            if isinstance(begin, (int, torch.SymInt, sympy.Expr))
-            else None
-        )
-        end_expr = (
-            _to_sympy(end) if isinstance(end, (int, torch.SymInt, sympy.Expr)) else None
-        )
-        diff_expr = (
-            sympy.Add(end_expr, sympy.Mul(-1, begin_expr))
-            if begin_expr is not None and end_expr is not None
-            else None
-        )
-        if step is None or step == 1:
-            if diff_expr is not None:
-                return diff_expr
-            return f"(({self._expr_str(end)}) - ({self._expr_str(begin)}))"
-        assert isinstance(step, (int, torch.SymInt, sympy.Expr))
-        step_expr = _to_sympy(step)
-        if getattr(step_expr, "free_symbols", None):
-            return (
-                f"((({self._expr_str(end)}) - ({self._expr_str(begin)})) + "
-                f"({self._expr_str(step)}) - 1) // ({self._expr_str(step)})"
-            )
-        if diff_expr is not None:
-            return sympy.ceiling(sympy.Mul(diff_expr, sympy.Pow(step_expr, -1)))
-        return (
-            f"((({self._expr_str(end)}) - ({self._expr_str(begin)})) + "
-            f"({self._expr_str(step)}) - 1) // ({self._expr_str(step)})"
-        )
+        state: CodegenState,
+        offset: str,
+        preceding: sympy.Expr | str,
+        extent: sympy.Expr | str,
+        wrap: bool,
+    ) -> str:
+        if extent == 0 or preceding == 0:
+            return "0"  # An empty Cartesian product has no coordinate to decode.
+        if preceding != sympy.S.One:
+            offset = f"({offset}) // ({self._numel_str(state, preceding)})"
+        if wrap:
+            offset = f"({offset}) % ({self._numel_str(state, extent)})"
+        return offset
 
     def _expr_str(self, value: object) -> str:
         if isinstance(value, (int, torch.SymInt, sympy.Expr)):
@@ -2243,29 +2464,25 @@ class FlattenedTileStrategy(BlockSizeTileStrategy):
         ):
             # A strided single-block tile on a thread axis may walk the
             # elements of its range rather than its trips.
-            elementwise_tile = (
-                env.backend.flat_strided_tile_walks_elements()
-                and len(block_ids) == 1
-                and self._uses_thread_axis()
-                and step not in (None, 1)
-            )
-            numel = (
-                self._range_numel_expr(begin, end, None)
-                if elementwise_tile
-                else self._range_trip_count(begin, end, step)
+            elementwise_tile = self._walks_flat_elements() and step not in (None, 1)
+            numel = self._range_numel_expr(
+                begin,
+                end,
+                None if elementwise_tile else step,
+                root_axes=(begins, ends, steps) if state.ast_args is None else None,
             )
             self.trip_counts[block_idx] = numel
             block_index_var = self.index_var(block_idx)
-            expr = offsets_var
-            if total_numel != sympy.S.One:
-                expr = f"({expr}) // ({self._numel_str(state, total_numel)})"
-            if i + 1 < len(block_ids):
-                expr = f"({expr}) % ({self._numel_str(state, numel)})"
+            expr = self._decode_flat_index(
+                state, offsets_var, total_numel, numel, i + 1 < len(block_ids)
+            )
             step_expr = self._expr_str(step) if step not in (None, 1) else None
             if step_expr is not None and not elementwise_tile:
                 expr = f"({expr}) * ({step_expr})"
-            if begin != 0:
+            if not _known_zero_bound(begin):
                 expr = f"({self._expr_str(begin)}) + ({expr})"
+            if state.ast_args is None:
+                expr = _root_coordinate(block_index_var, expr, begin, end, step)
             statements.append(statement_from_string(f"{block_index_var} = {expr}"))
             if isinstance(total_numel, str) or isinstance(numel, str):
                 total_numel = (
@@ -2275,7 +2492,11 @@ class FlattenedTileStrategy(BlockSizeTileStrategy):
             else:
                 assert isinstance(total_numel, sympy.Expr)
                 assert isinstance(numel, sympy.Expr)
-                total_numel = sympy.Mul(total_numel, numel)
+                total_numel = (
+                    self.fn.root_grid_product(total_numel, numel)
+                    if state.ast_args is None
+                    else sympy.Mul(total_numel, numel)
+                )
 
         mask_var = self.mask_var(-1)
         if mask_var is not None:
@@ -2309,74 +2530,57 @@ class FlattenedTileStrategy(BlockSizeTileStrategy):
 
         scalar_grid_loop = isinstance(self._single_root_index(), GridIndexType)
 
-        if (
-            scalar_grid_loop
-            and len(self.block_ids) == 1
-            and len(state.proxy_args) == 3
-            and not isinstance(state.proxy_args[0], (list, tuple))
-            and (
-                state.proxy_args[1] is None
-                or not isinstance(state.proxy_args[1], (list, tuple))
-            )
-            and not isinstance(state.proxy_args[2], (list, tuple))
-        ):
-
-            def _range_bound_to_sympy(value: object) -> sympy.Expr:
-                assert isinstance(value, (int, torch.SymInt, sympy.Expr))
-                return _to_sympy(value)
-
-            step = state.proxy_args[2]
+        if scalar_grid_loop and len(self.block_ids) == 1:
+            (begin,), (end,), (step,) = self._extract_root_bounds(state)
             if step not in (None, 1):
                 block_id = self.block_ids[0]
-                if state.proxy_args[1] is None:
-                    begin = 0
-                    end = state.proxy_args[0]
-                else:
-                    begin = state.proxy_args[0]
-                    end = state.proxy_args[1]
-                    if isinstance(begin, (list, tuple)):
-                        assert len(begin) == 1
-                        begin = begin[0]
-                    if isinstance(end, (list, tuple)):
-                        assert len(end) == 1
-                        end = end[0]
-                begin_expr = _range_bound_to_sympy(begin)
-                end_expr = _range_bound_to_sympy(end)
-                step_expr = _range_bound_to_sympy(step)
-                trip_count = (
-                    f"(({state.sympy_expr(end_expr)}) - ({state.sympy_expr(begin_expr)}) + "
-                    f"({state.sympy_expr(step_expr)}) - 1) // ({state.sympy_expr(step_expr)})"
+                trip_count = self._range_numel_expr(
+                    begin, end, step, root_axes=([begin], [end], [step])
                 )
-
                 env = CompileEnvironment.current()
-                dtype = env.index_type()
+                dtype = self._root_coordinate_dtype(begin, end, step)
                 pid_var = state.device_function.new_var("pid_flat", dce=True)
+                coordinate_pid = (
+                    env.backend.cast_expr(pid_var, dtype)
+                    if dtype != env.index_type()
+                    else pid_var
+                )
                 offsets_var = self._offsets_var
                 block_size_var = self.block_size_var(-1)
                 self._setup_block_size_constexpr(state, block_size_var, self.block_size)
                 pids = self.select_pid_strategy()
                 if isinstance(state.device_function.pid, ForEachProgramID):
                     pids.shared_pid_var = state.device_function.pid.shared_pid_var
-                pids.append(PIDInfo(pid_var, block_size_var, trip_count, block_id))
+                pids.append(
+                    PIDInfo(
+                        pid_var,
+                        block_size_var,
+                        trip_count,
+                        block_id,
+                    )
+                )
                 self._record_grid_origins(
-                    state, pid_var, block_size_var, [begin], [step]
+                    state, coordinate_pid, block_size_var, [begin], [step]
                 )
                 state.add_statement(
                     env.backend.arange_expr(
                         offsets_var,
-                        pid_var,
+                        coordinate_pid,
                         block_size_var,
                         dtype,
                         axis=self._flat_thread_axis(),
                     )
                 )
                 index_var = self.index_var(block_id)
+                coordinate = f"({self._expr_str(begin)}) + ({offsets_var}) * ({self._expr_str(step)})"
                 state.add_statement(
-                    f"{index_var} = ({state.sympy_expr(begin_expr)}) + ({offsets_var}) * ({state.sympy_expr(step_expr)})"
+                    f"{index_var} = {_root_coordinate(index_var, coordinate, begin, end, step)}"
                 )
                 mask_var = self.mask_var(-1)
                 if mask_var is not None:
-                    mask_terms = [f"{offsets_var} < ({trip_count})"]
+                    mask_terms = [
+                        f"{offsets_var} < ({self._numel_str(state, trip_count)})"
+                    ]
                     thread_mask = env.backend.thread_in_tile_mask_expr(
                         block_size_var, axis=self._flat_thread_axis()
                     )
@@ -2420,21 +2624,37 @@ class FlattenedTileStrategy(BlockSizeTileStrategy):
         )
         env = CompileEnvironment.current()
         dtype = env.index_type()
+        if any(
+            self._root_coordinate_dtype(b, e, s) != dtype
+            for b, e, s in zip(begins, ends, steps, strict=True)
+        ):
+            dtype = env.backend.root_coordinate_type_str(torch.int64)
 
         pid_var = state.device_function.new_var("pid_flat", dce=True)
+        coordinate_pid = (
+            env.backend.cast_expr(pid_var, dtype)
+            if dtype != env.index_type()
+            else pid_var
+        )
         pids = self.select_pid_strategy()
         if isinstance(state.device_function.pid, ForEachProgramID):
             pids.shared_pid_var = state.device_function.pid.shared_pid_var
 
-        pids.append(PIDInfo(pid_var, block_size_var, total_numel, self.block_ids[0]))
+        pids.append(
+            PIDInfo(
+                pid_var,
+                block_size_var,
+                total_numel,
+                self.block_ids[0],
+            )
+        )
         self._record_grid_origins(
             state,
-            pid_var,
+            coordinate_pid,
             block_size_var,
             begins,
             steps,
-            walks_elements=env.backend.flat_strided_tile_walks_elements()
-            and self._uses_thread_axis(),
+            walks_elements=self._walks_flat_elements(),
         )
 
         # A grid whose block size is 1 need not claim a thread axis: its
@@ -2448,14 +2668,14 @@ class FlattenedTileStrategy(BlockSizeTileStrategy):
         ):
             state.add_statement(
                 statement_from_string(
-                    f"{offsets_var} = ({pid_var}) * ({block_size_var})"
+                    f"{offsets_var} = ({coordinate_pid}) * ({block_size_var})"
                 )
             )
         else:
             state.add_statement(
                 env.backend.arange_expr(
                     offsets_var,
-                    pid_var,
+                    coordinate_pid,
                     block_size_var,
                     dtype,
                     axis=self._flat_thread_axis(),
@@ -2737,40 +2957,6 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
             return [None] * len(self.block_ids)
         return self._normalize_loop_steps(state.proxy_args[2], len(self.block_ids))
 
-    def _range_numel_expr(
-        self, begin: object, end: object, step: object | None
-    ) -> sympy.Expr | str:
-        begin_expr = (
-            _to_sympy(begin)
-            if isinstance(begin, (int, torch.SymInt, sympy.Expr))
-            else None
-        )
-        end_expr = (
-            _to_sympy(end) if isinstance(end, (int, torch.SymInt, sympy.Expr)) else None
-        )
-        diff_expr = (
-            sympy.Add(end_expr, sympy.Mul(-1, begin_expr))
-            if begin_expr is not None and end_expr is not None
-            else None
-        )
-        if step is None or step == 1:
-            if diff_expr is not None:
-                return diff_expr
-            return f"(({self._expr_str(end)}) - ({self._expr_str(begin)}))"
-        assert isinstance(step, (int, torch.SymInt, sympy.Expr))
-        step_expr = _to_sympy(step)
-        if getattr(step_expr, "free_symbols", None):
-            return (
-                f"((({self._expr_str(end)}) - ({self._expr_str(begin)})) + "
-                f"({self._expr_str(step)}) - 1) // ({self._expr_str(step)})"
-            )
-        if diff_expr is not None:
-            return sympy.ceiling(sympy.Mul(diff_expr, sympy.Pow(step_expr, -1)))
-        return (
-            f"((({self._expr_str(end)}) - ({self._expr_str(begin)})) + "
-            f"({self._expr_str(step)}) - 1) // ({self._expr_str(step)})"
-        )
-
     def _expr_str(self, value: object) -> str:
         if isinstance(value, (int, torch.SymInt, sympy.Expr)):
             return self.fn.sympy_expr(_to_sympy(value))
@@ -2820,15 +3006,22 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
                 )
             )
         ):
-            numel = self._range_numel_expr(begin, end, step)
+            numel = self._range_numel_expr(
+                begin, end, step, root_axes=(begins, ends, steps)
+            )
             device_function = state.device_function
-            dtype = env.index_type()
+            dtype = self._root_coordinate_dtype(begin, end, step)
             offset_var = self.offset_var(block_idx)
             index_var = self.index_var(block_idx)
             pid_var = device_function.new_var(f"pid_{i}", dce=True)
 
+            offset_pid = (
+                env.backend.cast_expr(pid_var, dtype)
+                if dtype != env.index_type()
+                else pid_var
+            )
             begin_offset_expr = ""
-            if begin != 0:
+            if not _known_zero_bound(begin):
                 begin_ast = self._to_ast(begin, to_dtype=dtype)
                 begin_offset_expr = (
                     f"{state.codegen.lift(begin_ast, dce=True, prefix='begin').id} + "
@@ -2843,19 +3036,18 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
                 _offset_prefix, step_prefix = env.backend.loop_var_prefixes()
                 step_var = state.codegen.lift(step_ast, dce=True, prefix=step_prefix).id
                 block_size_var = "1"
-                state.add_statement(
-                    f"{offset_var} = {begin_offset_expr}({pid_var}) * {step_var}"
-                )
+                offset = f"{begin_offset_expr}({offset_pid}) * {step_var}"
             elif block_size != 1:
                 block_size_var = self.block_size_var(block_idx)
                 assert block_size_var is not None
                 self._setup_block_size_constexpr(state, block_size_var, block_size)
-                state.add_statement(
-                    f"{offset_var} = {begin_offset_expr}{pid_var} * {block_size_var}"
-                )
+                offset = f"{begin_offset_expr}{offset_pid} * {block_size_var}"
             else:
                 block_size_var = "1"
-                state.add_statement(f"{offset_var} = {begin_offset_expr}{pid_var}")
+                offset = f"{begin_offset_expr}{offset_pid}"
+            state.add_statement(
+                f"{offset_var} = {_root_coordinate(offset_var, offset, begin, end, step)}"
+            )
             axis = thread_axis_offset + thread_axis_map[block_idx]
             # Inactive block_ids never claim a CUDA thread axis (per
             # ``_thread_axis_map``); without the polymorphic
@@ -2897,7 +3089,12 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
             )
             if mask_statement is not None:
                 state.add_statement(mask_statement)
-            pid = PIDInfo(pid_var, block_size_var, numel, block_idx)
+            pid = PIDInfo(
+                pid_var,
+                block_size_var,
+                numel,
+                block_idx,
+            )
             pids.append(pid)
         pids.codegen(state)
         if isinstance(state.device_function.pid, ForEachProgramID):
@@ -3675,16 +3872,23 @@ class PerThreadNDTileStrategy(_LaneContextOwner, NDTileStrategy):
                 )
             )
         ):
-            numel = self._range_numel_expr(begin, end, step)
+            numel = self._range_numel_expr(
+                begin, end, step, root_axes=(begins, ends, steps)
+            )
             device_function = state.device_function
-            dtype = env.index_type()
+            dtype = self._root_coordinate_dtype(begin, end, step)
             offset_var = self.offset_var(block_idx)
             index_var = self.index_var(block_idx)
             pid_var = device_function.new_var(f"pid_{i}", dce=True)
             pack = self._cute_pack_by_block.get(block_idx, 1)
 
+            offset_pid = (
+                env.backend.cast_expr(pid_var, dtype)
+                if dtype != env.index_type()
+                else pid_var
+            )
             begin_offset_expr = ""
-            if begin != 0:
+            if not _known_zero_bound(begin):
                 begin_ast = self._to_ast(begin, to_dtype=dtype)
                 begin_offset_expr = (
                     f"{state.codegen.lift(begin_ast, dce=True, prefix='begin').id} + "
@@ -3699,19 +3903,18 @@ class PerThreadNDTileStrategy(_LaneContextOwner, NDTileStrategy):
                 _offset_prefix, step_prefix = env.backend.loop_var_prefixes()
                 step_var = state.codegen.lift(step_ast, dce=True, prefix=step_prefix).id
                 block_size_var = "1"
-                state.add_statement(
-                    f"{offset_var} = {begin_offset_expr}({pid_var}) * {step_var}"
-                )
+                offset = f"{begin_offset_expr}({offset_pid}) * {step_var}"
             elif block_size != 1:
                 block_size_var = self.block_size_var(block_idx)
                 assert block_size_var is not None
                 self._setup_block_size_constexpr(state, block_size_var, block_size)
-                state.add_statement(
-                    f"{offset_var} = {begin_offset_expr}{pid_var} * {block_size_var}"
-                )
+                offset = f"{begin_offset_expr}{offset_pid} * {block_size_var}"
             else:
                 block_size_var = "1"
-                state.add_statement(f"{offset_var} = {begin_offset_expr}{pid_var}")
+                offset = f"{begin_offset_expr}{offset_pid}"
+            state.add_statement(
+                f"{offset_var} = {_root_coordinate(offset_var, offset, begin, end, step)}"
+            )
 
             elements_per_thread = self._elements_per_thread_for_block(block_idx)
             uses_thread_axis = step in (None, 1) and self._uses_thread_axis_for_block(
@@ -3912,7 +4115,12 @@ class PerThreadNDTileStrategy(_LaneContextOwner, NDTileStrategy):
                     extent=numel,
                     step=None,
                 )
-            pid = PIDInfo(pid_var, block_size_var, numel, block_idx)
+            pid = PIDInfo(
+                pid_var,
+                block_size_var,
+                numel,
+                block_idx,
+            )
             if pack > 1:
                 pid = pid._replace(pack=pack, pack_axis=axis)
             pids.append(pid)
@@ -4548,7 +4756,7 @@ class PerThreadFlattenedTileStrategy(_LaneContextOwner, FlattenedTileStrategy):
         # never flattens, so only a single block can start past zero; its
         # bounds are static here (data-dependent extents take the N-D
         # strategy).
-        assert len(block_ids) == 1 or all(begin == 0 for begin in begins)
+        assert len(block_ids) == 1 or all(_known_zero_bound(begin) for begin in begins)
         begin = _to_sympy(cast("int | torch.SymInt", begins[0]))
 
         if vec_width > 1 and (
@@ -4655,6 +4863,15 @@ class PerThreadFlattenedTileStrategy(_LaneContextOwner, FlattenedTileStrategy):
             )
         for i, block_idx in enumerate(self._reorder(block_ids)):
             numel = env.block_sizes[block_idx].numel
+            # These are lengths of Cartesian axes, not signed factors. Two
+            # reversed intervals must still schedule no work.
+            if len(block_ids) > 1 and not env.known_nonnegative(numel):
+                if HostFunction.current().is_host_scalar_expr(numel):
+                    # A kernel argument can shadow the Python builtin max.
+                    numel = sympy.Piecewise((numel, sympy.Gt(numel, 0)), (0, True))
+                    self.fn.root_grid_operand(numel, "grid_extent")
+                else:
+                    numel = sympy.Max(0, numel)
             self.trip_counts[block_idx] = numel
             block_index_var = self.index_var(block_idx)
             expr = offsets_var
@@ -4663,14 +4880,13 @@ class PerThreadFlattenedTileStrategy(_LaneContextOwner, FlattenedTileStrategy):
                 # chunk base plus the V-lane: the form the V-loop sink
                 # recognizes.
                 expr = sink_index_expr
-            if total_numel != sympy.S.One:
-                expr = f"({expr}) // ({state.sympy_expr(total_numel)})"
-            if i + 1 < len(block_ids):
-                expr = f"({expr}) % ({state.sympy_expr(numel)})"
+            expr = self._decode_flat_index(
+                state, expr, total_numel, numel, i + 1 < len(block_ids)
+            )
             lane_setup_statements.append(
                 statement_from_string(f"{block_index_var} = {expr}")
             )
-            total_numel = total_numel * numel
+            total_numel = self.fn.root_grid_product(total_numel, numel)
 
         mask_var = self.mask_var(-1)
         if mask_var is not None:
@@ -4682,13 +4898,21 @@ class PerThreadFlattenedTileStrategy(_LaneContextOwner, FlattenedTileStrategy):
             lane_setup_statements.append(
                 statement_from_string(
                     f"{mask_var} = {bound_var} < "
-                    f"({state.sympy_expr(begin + total_numel)})"
+                    f"({state.sympy_expr(sympy.Add(begin, total_numel))})"
                 )
             )
 
         pid_var = state.device_function.new_var("pid_flat", dce=True)
-        tile_base = f"({pid_var}) * ({block_size_var})"
-        if begin != 0:
+        coordinate_pid = pid_var
+        if any(
+            self._root_coordinate_dtype(b, e, s) != env.index_type()
+            for b, e, s in zip(begins, ends, steps, strict=True)
+        ):
+            coordinate_pid = env.backend.cast_expr(
+                pid_var, env.backend.root_coordinate_type_str(torch.int64)
+            )
+        tile_base = f"({coordinate_pid}) * ({block_size_var})"
+        if not _known_zero_bound(begin):
             # Parenthesized: consumers splice the base into larger
             # expressions (``tile.id`` divides it by the block size).
             tile_base = f"(({state.sympy_expr(begin)}) + {tile_base})"
@@ -4698,7 +4922,7 @@ class PerThreadFlattenedTileStrategy(_LaneContextOwner, FlattenedTileStrategy):
             pids.shared_pid_var = state.device_function.pid.shared_pid_var
         pids.append(PIDInfo(pid_var, block_size_var, total_numel, self.block_ids[0]))
         self._record_grid_origins(
-            state, pid_var, block_size_var, begins, steps, walks_elements=True
+            state, coordinate_pid, block_size_var, begins, steps, walks_elements=True
         )
         if vec_width > 1 and lane_strided:
             # The strided vec base folds the thread index in itself.
@@ -4771,10 +4995,9 @@ class PerThreadFlattenedTileStrategy(_LaneContextOwner, FlattenedTileStrategy):
             self.trip_counts[block_idx] = numel
             block_index_var = self.index_var(block_idx)
             expr = offsets_var
-            if total_numel != sympy.S.One:
-                expr = f"({expr}) // ({state.sympy_expr(total_numel)})"
-            if i + 1 < len(block_ids):
-                expr = f"({expr}) % ({state.sympy_expr(numel)})"
+            expr = self._decode_flat_index(
+                state, expr, total_numel, numel, i + 1 < len(block_ids)
+            )
             lane_setup_statements.append(
                 statement_from_string(f"{block_index_var} = {expr}")
             )
@@ -4839,6 +5062,8 @@ class PerThreadFlattenedTileStrategy(_LaneContextOwner, FlattenedTileStrategy):
         )
 
     def offset_var(self, block_idx: int) -> str:
+        if block_idx in self._shifted_scalar_axes:
+            return self.index_var(block_idx)
         return self._offsets_var
 
     def supports_index_rank_expansion(self) -> bool:

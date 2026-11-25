@@ -5641,13 +5641,18 @@ def _inner_loop_shares(config_spec: ConfigSpec, default: int) -> dict[int, int]:
     still takes an axis after those of the blocks around and before it in
     each place, so none of those gets a share either.
     """
-    if config_spec.cute_tile_symbolic_fixed_blocks or any(
-        size < 1 for size in config_spec.cute_tile_fixed_block_sizes.values()
+    if (
+        config_spec.cute_tile_symbolic_fixed_blocks
+        or any(size < 1 for size in config_spec.cute_tile_fixed_block_sizes.values())
+        or any(
+            step is None or step <= 0
+            for block_id, step in config_spec.literal_root_grid_steps.items()
+            if block_id in config_spec.cute_tile_fixed_block_sizes
+        )
     ):
-        # Counted as one thread, such a block (``hl.tile(m,
-        # block_size=next_power_of_2(bm))``) would let the shares take the
-        # reduction's threads.  A descending ``hl.grid``'s negative step is
-        # no thread count either.
+        # A symbolic tile width cannot be counted as one thread. Descending
+        # or live scalar grid strides keep the conservative reduction default,
+        # but must never themselves be counted as physical thread widths.
         return {}
     # The budget is CuTe's (``CuteBackend.max_reduction_threads``): never None.
     budget = cast("int", config_spec.max_reduction_threads)

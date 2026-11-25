@@ -24,7 +24,9 @@ from .._compat import use_tileir_tunables
 from .._compiler.ast_extension import ExtendedAST
 from .._compiler.ast_extension import LoopType
 from .._compiler.ast_extension import expr_from_string
+from .._compiler.ast_extension import statement_from_string
 from .._compiler.compile_environment import CompileEnvironment
+from .._compiler.compile_environment import _to_sympy
 from .._compiler.type_info import GridIndexType
 from .._compiler.type_info import IterType
 from .._compiler.type_info import JaggedTileIndexType
@@ -977,8 +979,17 @@ def _(
             has_data_dependent_bounds = True
         if step_part is None:
             step_part = 1
+        # A scalar root maps one trip to one program; its logical stride is
+        # not a thread-block width (it may be live, negative, or enormous).
+        env = CompileEnvironment.current()
+        root = env.typing_root_id is None
         # pyrefly: ignore [bad-argument-type]
-        results.append(GridIndexType.allocate(size, origin, step_part))
+        axis = GridIndexType.allocate(size, origin, 1 if root else step_part)
+        if root:
+            env.config_spec.literal_root_grid_steps[axis.block_id] = (
+                step_part if isinstance(step_part, int) else None
+            )
+        results.append(axis)
 
     _add_config_choices(
         [x.block_id for x in results],
@@ -1001,6 +1012,19 @@ def _(
 
 @_decorators.codegen(grid, "common")
 def _(state: CodegenState) -> ast.AST:
+    # Persistent launches use the SM count and need not evaluate a host
+    # range. Validate its live stride before submitting a device division.
+    steps = state.proxy_args[2]
+    for step in steps if isinstance(steps, (tuple, list)) else (steps,):
+        if isinstance(step, torch.SymInt):
+            host_step = state.device_function.root_grid_operand(
+                _to_sympy(step), "grid_stride"
+            )
+            state.codegen.host_statements.append(
+                statement_from_string(
+                    f'if ({host_step}) == 0: raise ValueError("range() arg 3 must not be zero")'
+                )
+            )
     return _codegen_loop_helper(state)
 
 

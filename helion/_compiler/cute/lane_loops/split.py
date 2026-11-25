@@ -101,6 +101,8 @@ if TYPE_CHECKING:
     from collections.abc import Mapping
     from collections.abc import Sequence
 
+    from ..tile_bounds import SerialRangeFacts
+
 
 def split_lane_loop_reductions(
     body: list[ast.AST],
@@ -3762,7 +3764,7 @@ def interchange_lane_outside_serial_reductions(
     proven_disjoint_tensor_pairs: set[frozenset[str]] | None = None,
     protected_names: set[str] | None = None,
     proven_tensor_stride_values: Mapping[tuple[str, int], int] | None = None,
-    constexpr_value: Callable[[str], int | None] | None = None,
+    range_facts: SerialRangeFacts | None = None,
     rename_groups: Mapping[str, str] | None = None,
     new_var: Callable[[str], str] | None = None,
 ) -> list[ast.AST]:
@@ -3831,7 +3833,7 @@ def interchange_lane_outside_serial_reductions(
                 proven_disjoint_tensor_pairs or set(),
                 protected_names or set(),
                 proven_tensor_stride_values or {},
-                constexpr_value,
+                range_facts,
                 rename_groups or {},
                 new_var,
             )
@@ -3844,7 +3846,7 @@ def _interchange_stmt(
     proven_disjoint_tensor_pairs: set[frozenset[str]],
     protected_names: set[str],
     proven_tensor_stride_values: Mapping[tuple[str, int], int],
-    constexpr_value: Callable[[str], int | None] | None,
+    range_facts: SerialRangeFacts | None,
     rename_groups: Mapping[str, str],
     new_var: Callable[[str], str] | None,
 ) -> list[ast.AST]:
@@ -3859,7 +3861,7 @@ def _interchange_stmt(
                     proven_disjoint_tensor_pairs=proven_disjoint_tensor_pairs,
                     protected_names=protected_names,
                     proven_tensor_stride_values=proven_tensor_stride_values,
-                    constexpr_value=constexpr_value,
+                    range_facts=range_facts,
                     rename_groups=rename_groups,
                     new_var=new_var,
                 ),
@@ -3884,7 +3886,7 @@ def _interchange_stmt(
             proven_disjoint_tensor_pairs,
             protected_names,
             proven_tensor_stride_values,
-            constexpr_value,
+            range_facts,
             rename_groups,
             new_var,
         )
@@ -3911,7 +3913,7 @@ def _interchange_stmt(
             proven_disjoint_tensor_pairs,
             protected_names,
             proven_tensor_stride_values,
-            constexpr_value,
+            range_facts,
             rename_groups,
         )
     except RegisterTileUnsupported:
@@ -3925,7 +3927,7 @@ def _interchange_stmt(
             proven_disjoint_tensor_pairs,
             protected_names,
             proven_tensor_stride_values,
-            constexpr_value,
+            range_facts,
             rename_groups,
             new_var,
         )
@@ -4139,7 +4141,7 @@ def _lane_carry_nest(
     proven_disjoint_tensor_pairs: set[frozenset[str]],
     protected_names: set[str],
     proven_tensor_stride_values: Mapping[tuple[str, int], int],
-    constexpr_value: Callable[[str], int | None] | None,
+    range_facts: SerialRangeFacts | None,
     rename_groups: Mapping[str, str],
     new_var: Callable[[str], str] | None,
     trips: ast.For | None = None,
@@ -4429,7 +4431,7 @@ def _lane_carry_nest(
             proven_disjoint_tensor_pairs,
             protected_names,
             proven_tensor_stride_values,
-            constexpr_value,
+            range_facts,
         )
         if not memory_proven
         else None
@@ -4516,7 +4518,7 @@ def _lane_carry_trip_nest(
     proven_disjoint_tensor_pairs: set[frozenset[str]],
     protected_names: set[str],
     proven_tensor_stride_values: Mapping[tuple[str, int], int],
-    constexpr_value: Callable[[str], int | None] | None,
+    range_facts: SerialRangeFacts | None,
     rename_groups: Mapping[str, str],
     new_var: Callable[[str], str] | None,
 ) -> list[ast.AST] | str | None:
@@ -4550,7 +4552,7 @@ def _lane_carry_trip_nest(
         proven_disjoint_tensor_pairs,
         protected_names,
         proven_tensor_stride_values,
-        constexpr_value,
+        range_facts,
         rename_groups,
         lambda name: name,
     )
@@ -4562,7 +4564,7 @@ def _lane_carry_trip_nest(
         proven_disjoint_tensor_pairs,
         protected_names,
         proven_tensor_stride_values,
-        constexpr_value,
+        range_facts,
         rename_groups,
         new_var,
         trips=trips.trip_loop,
@@ -4577,7 +4579,7 @@ def _lane_carry_trip_nest(
         proven_disjoint_tensor_pairs,
         protected_names,
         proven_tensor_stride_values,
-        constexpr_value,
+        range_facts,
         rename_groups,
         new_var,
         memory_proven=True,
@@ -4595,7 +4597,7 @@ def _interchange_one_lane_loop(
     proven_disjoint_tensor_pairs: set[frozenset[str]],
     protected_names: set[str],
     proven_tensor_stride_values: Mapping[tuple[str, int], int],
-    constexpr_value: Callable[[str], int | None] | None,
+    range_facts: SerialRangeFacts | None,
     rename_groups: Mapping[str, str],
 ) -> list[ast.AST]:
     body: list[ast.AST] = list(loop.body)
@@ -4963,7 +4965,7 @@ def _interchange_one_lane_loop(
         proven_disjoint_tensor_pairs,
         protected_names,
         proven_tensor_stride_values,
-        constexpr_value,
+        range_facts,
         duplicated=[mb_body[index] for index in sorted(duplicated_stores)],
     )
     if any(

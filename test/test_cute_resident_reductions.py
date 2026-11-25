@@ -76,6 +76,7 @@ def _rewrite(
     row_schedule: str = "batched",
     pack_output: bool = False,
     shared_memory_budget: int = 232448,
+    tensor_size_names: frozenset[str] = frozenset(),
 ) -> str:
     counter = itertools.count()
     result = materialize_resident_reductions(
@@ -94,6 +95,7 @@ def _rewrite(
             tensor_strides={},
             tensor_alignments=dict.fromkeys(_TENSORS, alignment),
             constexpr_values={},
+            tensor_size_names=tensor_size_names,
         ),
         options=ResidentReductionOptions(
             group_rows=group_rows,
@@ -313,6 +315,41 @@ def test_resident_keeps_carries_and_masked_output_semantics(
         assert not namespace["uncommitted_copies"]
 
 
+def test_clipped_rows_require_the_same_size_and_signed_start() -> None:
+    # A uniform integer may be negative; it does not grant the tensor-size
+    # proof. A different row start or a reordered comparison is unsafe too.
+    begin = "cutlass.Int32(100)"
+    span = "(row_limit if row_limit < 4 else 4)"
+    last = f"(row_limit - {span})"
+    cap = f"({begin} if {begin} < {last} else {last})"
+    original = (
+        _source(width=4)
+        .replace(
+            "range(cutlass.Int32(0), cutlass.Int32(3))",
+            f"range({begin}, cutlass.Int32({cap} + {span}))",
+        )
+        .replace("cutlass.Int32(row)", f"(cutlass.Int32(row) - {begin})")
+    )
+    sizes = frozenset({"row_limit"})
+    rewritten = _rewrite(
+        original, width=4, group_rows=2, pipelined=True, tensor_size_names=sizes
+    )
+    assert "resident_state" in rewritten
+    for size, rows in ((75, 0), (102, 2), (110, 4)):
+        _assert_grouped_rows_match(original, rewritten, rows, 2, row_limit=size)
+    assert "resident_state" not in _rewrite(original, width=4)
+    assert "resident_state" not in _rewrite(
+        original.replace(f"range({begin},", "range(cutlass.Int32(0),"),
+        width=4,
+        tensor_size_names=sizes,
+    )
+    assert "resident_state" not in _rewrite(
+        original.replace(f"{begin} < {last}", f"{begin} > {last}"),
+        width=4,
+        tensor_size_names=sizes,
+    )
+
+
 @pytest.mark.parametrize(
     "begin,end",
     [
@@ -340,8 +377,13 @@ def test_grouped_rows_keep_int32_endpoint_semantics(
     )
     rewritten = _rewrite(original, width=4, group_rows=group_rows, pipelined=pipelined)
     assert "resident_state" in rewritten
+    _assert_grouped_rows_match(original, rewritten, end - begin, group_rows)
+
+
+def _assert_grouped_rows_match(
+    original: str, rewritten: str, rows: int, group_rows: int, *, row_limit: int = 0
+) -> None:
     results = []
-    rows = end - begin
     for source in (original, rewritten):
         shape = (rows + group_rows, _FEATURES)
         tensors = dict(
@@ -365,6 +407,7 @@ def test_grouped_rows_keep_int32_endpoint_semantics(
             | {
                 "initial": -0.0,
                 "limit": _FEATURES,
+                "row_limit": np.int32(row_limit),
                 # The zero weight makes both reduction inputs zero, so this
                 # reference executes the original serial schedule exactly.
                 "_helion_lane_reduce": lambda value, *args, **kwargs: np.float32(0),

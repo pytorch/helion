@@ -281,10 +281,23 @@ class ProgramIDs(abc.ABC):
         """Check if this is a persistent strategy. Default False."""
         return False
 
+    def _static_empty_coordinates(self) -> list[ast.stmt] | None:
+        if len(self.pid_info) > 1 and any(
+            pid.static_num_pids() == 0 for pid in self.pid_info
+        ):
+            # This root never runs. Its emitted body still has to compile;
+            # decomposing a physical ID would divide by a static zero extent.
+            return [
+                statement_from_string(f"{pid.pid_var} = 0") for pid in self.pid_info
+            ]
+        return None
+
     def _decompose_pid_to_statements(
         self, pid_var: str, state: CodegenState
     ) -> list[ast.stmt]:
         """Generate statements to decompose a single PID variable into multiple PID components."""
+        if (dead := self._static_empty_coordinates()) is not None:
+            return dead
         num_blocks = [
             state.device_function.new_var(f"num_blocks_{i}")
             for i in range(len(self.pid_info[:-1]))
@@ -750,6 +763,9 @@ class L2GroupingProgramIDs(ProgramIDs):
         assert self.parent_strategy is not None
         parent_pids = self.parent_strategy.pid_info
         assert len(parent_pids) >= 2, "L2 grouping requires at least 2 dimensions"
+        if (dead := self.parent_strategy._static_empty_coordinates()) is not None:
+            state.codegen.statements_stack[-1][:0] = dead
+            return
         new_var = state.device_function.new_var
 
         # Apply L2 grouping to the 2 fastest varying dimensions (pid_0, pid_1)

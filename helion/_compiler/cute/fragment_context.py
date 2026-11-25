@@ -732,9 +732,17 @@ class FragmentContext:
                     if isinstance(origin, TileIdOrigin):
                         return f"({offset}) // {size}"
                     if isinstance(origin, TileEndOrigin):
-                        return (
-                            f"min(({offset}) + {size}, {self.bounds[origin.block_id]})"
-                        )
+                        end = self.bounds[origin.block_id]
+                        if type(size) is int and end.removeprefix("-").isdecimal():
+                            i32 = torch.iinfo(torch.int32)
+                            if i32.min <= int(end) <= i32.max - size + 1:
+                                return f"min(({offset}) + {size}, {end})"
+                        # Clip before adding: even at INT64_MIN subtracting
+                        # the width from max(end, 0) remains representable.
+                        stop = f"cutlass.Int64({end})"
+                        ceiling = f"(max({stop}, cutlass.Int64(0)) - {size})"
+                        padded = f"(min(cutlass.Int64({offset}), {ceiling}) + {size})"
+                        return f"min({padded}, {stop})"
                     if type(origin) in (GridOrigin, TileBeginOrigin):
                         return offset
                 scalar = self.df.literal_expr(symbol)

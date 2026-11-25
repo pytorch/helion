@@ -42,6 +42,7 @@ from .tile_strategy import DeviceLoopState
 from .tile_strategy import EmitPipelineLoopState
 from .tile_strategy import ForiLoopState
 from .variable_origin import ArgumentOrigin
+from .variable_origin import TensorSizeOrigin
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -369,6 +370,82 @@ class GenerateAST(NodeVisitor, CodegenInterface):
         return self.active_device_loops[block_idx][-1].strategy.tile_begin_var(
             block_idx
         )
+
+    def tile_end_expr(self, block_idx: int) -> str:
+        """The exclusive tile edge, clipped without overflowing the index type."""
+        df = self.device_function
+        begin = self.tile_begin_var(block_idx)
+        block = df.block_size_var(block_idx) or "1"
+        width = df.resolved_block_size(block_idx)
+        info = self.active_device_loops[block_idx][-1].block_id_to_info[block_idx]
+        masked = self.mask_var(block_idx) is not None
+        end = info.end_var_name
+        # A device loop's end_expr may be its length, not the absolute end
+        # used in code (e.g. tile(4, 64) has length 60). Prove widths from
+        # the emitted bound or the explicitly absolute root-grid end.
+
+        def literal(text: str | None, expr: sympy.Expr | None) -> int | None:
+            if text is not None and text.removeprefix("-").isdecimal():
+                return int(text)
+            return int(expr) if isinstance(expr, sympy.Integer) else None
+
+        lo = literal(info.begin_var_name, info.begin_expr)
+        hi = literal(end, info.grid_end_expr)
+        narrow = torch.iinfo(torch.int32)
+        if (
+            lo is not None
+            and hi is not None
+            and narrow.min <= lo <= hi <= narrow.max
+            and (not masked or (type(width) is int and hi + width - 1 <= narrow.max))
+        ):
+            naive = f"{begin} + {block}"
+            if not masked:
+                return naive
+            assert end is not None
+            return self.backend.minimum_expr(naive, end)
+
+        def minimum(left: str, right: str) -> str:
+            return f"({self.backend.where_expr(f'{left} < {right}', left, right)})"
+
+        if masked and lo == 0 and info.grid_end_expr is not None:
+            origin = self.host_function.expr_to_origin.get(info.grid_end_expr)
+            if origin is not None and isinstance(origin.origin, TensorSizeOrigin):
+                # A root input size and its zero-origin offset are nonnegative.
+                # Cap the width and then the offset, so both the subtraction and
+                # the final sum fit the size's native type, even on a surplus PID.
+                assert end is not None
+                span = minimum(end, block)
+                last = f"({end} - {span})"
+                return f"({minimum(begin, last)} + {span})"
+
+        dtype = self.backend.dtype_str(torch.int64)
+        begin = self.backend.cast_expr(begin, dtype)
+        if not masked:
+            return f"{begin} + {block}"
+        assert end is not None
+        # Both operands must remain signed Int64: a backend's index minimum
+        # can otherwise narrow them back to the ordinary coordinate width.
+
+        if hi is not None and type(width) is int:
+            # Constant-fold the same width-independent clamp used below. A
+            # signed-64 cast may execute at 32 bits on some backends.
+            ceiling = self.backend.cast_expr(str(max(hi, 0) - width), dtype)
+            padded = f"({minimum(begin, ceiling)} + {block})"
+            return (
+                padded
+                if hi >= 0
+                else minimum(padded, self.backend.cast_expr(end, dtype))
+            )
+
+        # Clamp against max(end, 0) - block before adding. The subtraction
+        # fits at any signed width and the padded sum cannot exceed max(end, 0).
+        # For a negative end, the final minimum restores the actual endpoint.
+        stop = self.backend.cast_expr(end, dtype)
+        zero = self.backend.cast_expr("0", dtype)
+        nonnegative = self.backend.where_expr(f"{stop} < {zero}", zero, stop)
+        ceiling = f"(({nonnegative}) - {block})"
+        padded = f"({minimum(begin, ceiling)} + {block})"
+        return minimum(padded, stop)
 
     def index_var(self, block_idx: int) -> str:
         return self.active_device_loops[block_idx][-1].strategy.index_var(block_idx)

@@ -2698,6 +2698,7 @@ class CuteBackend(Backend):
         prefix: list[ast.stmt],
         ctx: DeviceBodyContext,
     ) -> list[ast.stmt]:
+        from ..uint64_grid import narrow_uint64_grid_uses
         from .passes import launch_attributes
         from .passes import pdl
         from .passes.pipeline import run_kernel_def_passes
@@ -2706,6 +2707,14 @@ class CuteBackend(Backend):
 
         run_kernel_def_passes(fn_def, prefix, ctx)
         fn = ctx.device_function
+        if axes := fn.cute_state.root_plans.unbounded_uint64_axes:
+            narrow_uint64_grid_uses(
+                fn_def,
+                axes,
+                lambda v: expr_from_string("cutlass.Int64({v})", v=v),
+                {"_cute_python_mod": 1},
+                "CuTe",
+            )
         pdl.insert_spread_pad(fn, fn_def, ctx.constexpr_values)
         validate_explicit_launch(fn, fn_def)
         # The final body, the spread pad included: a kernel whose shared
@@ -4043,6 +4052,17 @@ class CuteBackend(Backend):
                 return f"(({a}) if ({condition}) else ({b}))"
 
         return HelionCuteDSLOpOverrides()
+
+    def uint64_expr(self, value: str) -> str:
+        # uint64 scalar tensor storage uses a signed carrier, but division of
+        # a range spanning both signed extremes needs real unsigned arithmetic.
+        return f"cutlass.Uint64({value})"
+
+    def unbounded_uint64_grid_expr(self, name: str, value: str) -> str:
+        from ..device_function import DeviceFunction
+
+        DeviceFunction.current().cute_state.root_plans.unbounded_uint64_axes.add(name)
+        return self.uint64_expr(value)
 
     def cast_expr(self, expr_str: str, dtype_str: str) -> str:
         return f"{dtype_str}({expr_str})"

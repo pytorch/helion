@@ -673,6 +673,9 @@ class CuteRootPlans:
     field of this class (checked when the registry is built).
     """
 
+    # Scalar grid origins whose runtime value is not bounded by signed Int64.
+    unbounded_uint64_axes: set[str] = dataclasses.field(default_factory=set)
+
     # Grouped two-phase lowering for structurally proven fixed-token,
     # split-input BF16 rank-1 recurrences.
     fixed_token_rank1_plan: CuteFixedTokenRank1Plan | None = None

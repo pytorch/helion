@@ -24,6 +24,7 @@ def simulate_independent_fragment(
     *,
     int32: Callable[..., object] = int,
     int64: Callable[..., object] = int,
+    uint64: Callable[..., object] = int,
     inline_asm: Callable[..., object] | None = None,
     gather_registers: Callable[..., object] | None = None,
 ) -> dict[str, int]:
@@ -145,7 +146,7 @@ def simulate_independent_fragment(
                 Int32=int32,
                 Int64=int64,
                 Uint32=int,
-                Uint64=int,
+                Uint64=uint64,
                 Boolean=bool,
                 utils=SimpleNamespace(SmemAllocator=Allocator),
             ),

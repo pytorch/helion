@@ -404,25 +404,9 @@ class TileBeginOrigin(GridOrigin):
 @dataclasses.dataclass
 class TileEndOrigin(GridOrigin):
     def host_str(self) -> str:
-        from .compile_environment import CompileEnvironment
         from .device_function import DeviceFunction
 
-        device_fn = DeviceFunction.current()
-        codegen = device_fn.codegen
-        offset = codegen.tile_begin_var(self.block_id)
-        block_size = device_fn.block_size_var(self.block_id) or "1"
-        naive_end = f"{offset} + {block_size}"
-        mask = codegen.mask_var(self.block_id)
-        if mask is None:
-            return naive_end
-        end_var = (
-            codegen.active_device_loops[self.block_id][-1]
-            .block_id_to_info[self.block_id]
-            .end_var_name
-        )
-        assert end_var is not None
-        backend = CompileEnvironment.current().backend
-        return backend.minimum_expr(naive_end, end_var)
+        return DeviceFunction.current().codegen.tile_end_expr(self.block_id)
 
 
 @dataclasses.dataclass

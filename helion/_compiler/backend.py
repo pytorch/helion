@@ -818,6 +818,10 @@ class Backend(abc.ABC):
 
     # -- type strings and the expression printer (scalars, indices, loops) -----
 
+    def root_coordinate_type_str(self, dtype: torch.dtype) -> str:
+        """Signed arithmetic type for an axis with a noncanonical grid range."""
+        return self.dtype_str(dtype)
+
     @abc.abstractmethod
     def dtype_str(self, dtype: torch.dtype) -> str:
         """Convert a torch dtype to a backend-specific type string.
@@ -841,6 +845,19 @@ class Backend(abc.ABC):
         Defaults to dtype_str, but backends may override for special handling.
         """
         return self.dtype_str(index_dtype)
+
+    def uint64_expr(self, value: str) -> str:
+        """Use an unsigned 64-bit arithmetic value for range counts and coordinates."""
+        return self.cast_expr(value, self.dtype_str(torch.uint64))
+
+    def bounded_uint64_grid_expr(self, value: str) -> str:
+        """Render a grid coordinate proved to fit the signed index domain."""
+        return value
+
+    def unbounded_uint64_grid_expr(self, name: str, value: str) -> str:
+        raise exc.InvalidConfig(
+            f"{self.name} cannot represent an unbounded UInt64 grid coordinate"
+        )
 
     def program_id_expr(self, dim: int, *, index_dtype: str) -> str:
         """Expression reading the program id of grid axis ``dim`` as ``index_dtype``."""

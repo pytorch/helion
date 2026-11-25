@@ -938,6 +938,19 @@ def _tile_pattern_code(
         for loop in loops
     ):
         return _ds_expr(state, block_id, tensor=tensor, tensor_dim=tensor_dim)
+
+    # The root BlockSpec transfers a complete tile even though the body uses
+    # ":". An axis that fits in one block is already clamped by the launcher.
+    size = tensor.shape[tensor_dim]
+    width = state.device_function.resolved_block_size(block_id)
+    if (
+        isinstance(width, int)
+        and width > 1
+        and (not isinstance(size, int) or (size > width and size % width != 0))
+    ):
+        from helion.language.memory_ops import _record_pad_info
+
+        _record_pad_info(state, tensor, tensor_dim, block_id)
     return ":"
 
 

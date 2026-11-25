@@ -176,23 +176,7 @@ def _(tile: torch.SymInt) -> torch.SymInt:
 @_decorators.codegen(tile_end, "common")
 def _(state: CodegenState) -> ast.AST:
     index = _disable_flatten_get_tile(state.proxy_arg(0), state)
-    offset_var = state.codegen.tile_begin_var(index)
-    block_size_var = state.device_function.block_size_var(index)
-    if block_size_var is None:
-        block_size_var = "1"
-    naive_exp = f"{offset_var} + {block_size_var}"
-    if state.codegen.mask_var(index) is not None:
-        # if masking is used, we must update the end bound of the last tile
-        end_var = (
-            state.codegen.active_device_loops[index][-1]
-            .block_id_to_info[index]
-            .end_var_name
-        )
-        assert end_var is not None
-        backend = CompileEnvironment.current().backend
-        return expr_from_string(backend.minimum_expr(naive_exp, end_var))
-    # If we don't have a mask, we can simply return the offset + block size
-    return expr_from_string(naive_exp)
+    return expr_from_string(state.codegen.tile_end_expr(index))
 
 
 @_decorators.ref(tile_end)

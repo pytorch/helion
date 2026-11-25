@@ -496,6 +496,11 @@ class MetalBackend(Backend):
             raise exc.BackendUnsupported(self.name, f"dtype: {dtype}")
         return dtype_map[dtype]
 
+    def root_coordinate_type_str(self, dtype: torch.dtype) -> str:
+        # Both physical threadgroup and lane IDs are uint. Even for a small
+        # negative origin, int + uint becomes uint; long represents both.
+        return self.dtype_str(torch.int64)
+
     def acc_type(self, dtype: torch.dtype) -> str:
         if dtype not in self._ACC_TYPE:
             raise exc.BackendUnsupported(self.name, f"acc_type for: {dtype}")

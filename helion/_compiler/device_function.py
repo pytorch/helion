@@ -420,6 +420,7 @@ class DeviceFunction:
         self.arguments: list[Argument] = []
         self.preamble: list[ast.AST] = []
         self.body: list[ast.AST] = []
+        self._host_grid_operands: dict[sympy.Expr, str] = {}
         self._tensor_args: dict[torch.Tensor, TensorArg] = {}
         self._tensor_descriptor_args: dict[
             tuple[torch.Tensor, str, bool | None], TensorDescriptorArg
@@ -511,6 +512,7 @@ class DeviceFunction:
         # Triton/NVSHMEM receive completion is hidden from the frontend. The
         # lowering appends one compiler-managed signal-pad pointer to the kernel
         # signature and assigns one slot per receive-wait descriptor.
+        self.triton_unbounded_uint64_axes: set[str] = set()
         self.triton_remote_copy_signal_arg: str | None = None
         self.triton_remote_copy_signal_dst: str | None = None
         self.triton_remote_copy_signal_slots = 0
@@ -919,7 +921,46 @@ class DeviceFunction:
             )
         self.pid = pid
 
+    def host_grid_arg(self, prefix: str, host_expr: str) -> str:
+        """Pass a Python range operand without repeating its arithmetic on the device."""
+        code = HostFunction.current().fn.__code__
+        host_names = {
+            *code.co_names,
+            *code.co_varnames,
+            *code.co_freevars,
+            *code.co_cellvars,
+        }
+        name = self.new_var(prefix)
+        while name in host_names:
+            name = self.new_var(prefix)
+        self.host_constexpr_def(name, host_expr)
+        self.arguments.append(SymbolArgument(name, name))
+        return name
+
+    def root_grid_operand(self, expr: sympy.Expr, prefix: str) -> str:
+        host = HostFunction.current().sympy_expr(expr, self.config)
+        if isinstance(expr, sympy.Symbol) or not expr.free_symbols:
+            return host
+        if expr not in self._host_grid_operands:
+            self._host_grid_operands[expr] = self.host_grid_arg(prefix, host)
+        return self._host_grid_operands[expr]
+
+    def root_grid_product(self, left: sympy.Expr, right: sympy.Expr) -> sympy.Expr:
+        product = sympy.Mul(left, right)
+        # SymPy can distribute a constant factor and erase the captured extent
+        # from the expression. Preserve host precision for the partial products
+        # used by PID decoding, iteration counts and masks.
+        if (
+            (left in self._host_grid_operands or right in self._host_grid_operands)
+            and product not in self._host_grid_operands
+            and HostFunction.current().is_host_scalar_expr(product)
+        ):
+            self.root_grid_operand(product, "grid_extent")
+        return product
+
     def sympy_expr(self, expr: sympy.Expr) -> str:
+        if expr in self._host_grid_operands:
+            return self._host_grid_operands[expr]
         env = CompileEnvironment.current()
         with contextlib.suppress(Exception):
             expr = env.shape_env.simplify(expr)
@@ -1070,7 +1111,7 @@ class DeviceFunction:
                 "variable: the tile's extent is unknown there",
             )
         begin = self.codegen.tile_begin_var(block_id)
-        clamped = env.backend.minimum_expr(f"{begin} + {block_size}", end)
+        clamped = self.codegen.tile_end_expr(block_id)
         return f"(({clamped}) - {begin})"
 
     def user_sympy_expr(self, expr: sympy.Expr) -> str:

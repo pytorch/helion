@@ -390,6 +390,45 @@ class TileStrategyDispatch:
             self._register_strategy([block_id], strategy)
 
     def codegen_grid(self, state: CodegenState, block_ids: list[int]) -> None:
+        # Every root strategy must see the host value before it renders its
+        # first offset or mask. Some flattened lane loops never ask for an
+        # individual axis trip count.
+        begin_or_end, end_arg = state.proxy_args[:2]
+        begins = (
+            tuple(begin_or_end)
+            if isinstance(begin_or_end, (tuple, list))
+            else (begin_or_end,)
+        )
+        if end_arg is None:
+            ends = begins
+            begins = (0,) * len(ends)
+        else:
+            ends = tuple(end_arg) if isinstance(end_arg, (tuple, list)) else (end_arg,)
+        for begin, end in zip(begins, ends, strict=True):
+            bounds = tuple(
+                _symint_sympy_expr(v) if isinstance(v, torch.SymInt) else v
+                for v in (begin, end)
+            )
+            compound = False
+            for expr in bounds:
+                if (
+                    isinstance(expr, sympy.Expr)
+                    and expr.free_symbols
+                    and not isinstance(expr, sympy.Symbol)
+                ):
+                    state.device_function.root_grid_operand(expr, "grid_bound")
+                    compound = True
+            # Persistent schedulers also render this axis's extent. Simplifying
+            # end - begin can remove both registered endpoints from its expression.
+            lo, hi = bounds
+            if (
+                compound
+                and isinstance(lo, (int, sympy.Expr))
+                and isinstance(hi, (int, sympy.Expr))
+            ):
+                state.device_function.root_grid_operand(
+                    sympy.Add(hi, sympy.Mul(-1, lo)), "grid_extent"
+                )
         strategy = self._root_grid_strategy(state, block_ids)
         state.codegen.active_device_loops.clear()
         grid_state = strategy.codegen_grid(state)

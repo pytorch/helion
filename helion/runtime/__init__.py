@@ -39,6 +39,22 @@ if TYPE_CHECKING:
 log: logging.Logger = logging.getLogger(__name__)
 
 
+def _grid_range_length(
+    begin: int, end: int, step: int, *other_axes: tuple[int, int, int]
+) -> int:
+    """Count on the host before converting to a signed device argument."""
+    if not step:
+        raise ValueError("range() arg 3 must not be zero")
+    count = max(0, -((begin - end) // step))
+    if count >= 2**63:
+        # Python can describe this axis, but a device counter cannot. No
+        # coordinate of an empty Cartesian product ever needs that index.
+        if any(not range(*axis) for axis in other_axes):
+            return 0
+        raise OverflowError("root grid axis length exceeds signed Int64")
+    return count
+
+
 def _timeline_register(meta: TimelineMeta) -> Callable[[torch.Tensor], None]:
     # Imported here: ``python -m helion.runtime.timeline`` runs the module.
     from . import timeline

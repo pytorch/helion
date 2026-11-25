@@ -25,6 +25,7 @@ from helion._compiler.cute.lane_loops.split import (
     interchange_lane_outside_serial_reductions,
 )
 from helion._compiler.cute.lane_loops.split import split_lane_loop_reductions
+from helion._compiler.cute.tile_bounds import SerialRangeFacts
 from helion._testing import DEVICE
 from helion._testing import code_and_output
 from helion._testing import cpu_render_target
@@ -1095,6 +1096,38 @@ def test_an_in_place_update_beside_a_column_sum_matches_eager() -> None:
     torch.testing.assert_close(out, expected, rtol=1e-4, atol=1e-4)
     torch.testing.assert_close(
         sums, x.reshape(sums.size(0), -1, x.size(1)).sum(1), rtol=1e-4, atol=1e-4
+    )
+
+
+def test_clipped_serial_span_requires_native_origin_and_nonnegative_size() -> None:
+    span = "(n if n < 4 else 4)"
+    last = f"(n - {span})"
+    end = f"cutlass.Int32((offset if offset < {last} else {last}) + {span})"
+    loop = ast.parse(f"for row in range(cutlass.Int32(offset), {end}, 2): pass").body[0]
+    assert isinstance(loop, ast.For)
+
+    def distance(offset_is_i32: bool, n_is_size: bool) -> int | None:
+        facts = SerialRangeFacts(
+            int32_names=frozenset({"offset"} if offset_is_i32 else ()),
+            tensor_sizes=frozenset({"n"} if n_is_size else ()),
+        )
+        return _serial_span(loop, [], set(), set(), facts)
+
+    assert distance(True, True) == 3
+    # For offset=2**32 and n=100 the cast begin is zero but the end is 100.
+    # For negative n, adding it to a negative offset may wrap above the begin.
+    assert distance(False, True) is None
+    assert distance(True, False) is None
+
+    # Both factors fit, but their Python product is 2**32. The cast start
+    # wraps to zero while the unclipped value still exceeds n.
+    product = ast.parse(ast.unparse(loop).replace("offset", "(65536 * 65536)")).body[0]
+    assert isinstance(product, ast.For)
+    assert (
+        _serial_span(
+            product, [], set(), set(), SerialRangeFacts(tensor_sizes=frozenset({"n"}))
+        )
+        is None
     )
 
 

@@ -398,6 +398,39 @@ class TritonBackend(Backend):
 
         return triton_acc_type(dtype)
 
+    def bounded_uint64_grid_expr(self, value: str) -> str:
+        # A loaded UInt64 origin otherwise makes a provably small index unsigned.
+        return self.cast_expr(value, self.dtype_str(torch.int64))
+
+    def unbounded_uint64_grid_expr(self, name: str, value: str) -> str:
+        if self.name != "triton":
+            return super().unbounded_uint64_grid_expr(name, value)
+        from ..device_function import DeviceFunction
+
+        DeviceFunction.current().triton_unbounded_uint64_axes.add(name)
+        return self.uint64_expr(value)
+
+    def finalize_kernel_def(
+        self,
+        fn_def: ast.FunctionDef,
+        prefix: list[ast.stmt],
+        ctx: DeviceBodyContext,
+    ) -> list[ast.stmt]:
+        if axes := ctx.device_function.triton_unbounded_uint64_axes:
+            from ..uint64_grid import narrow_uint64_grid_uses
+
+            narrow_uint64_grid_uses(
+                fn_def,
+                axes,
+                lambda v: expr_from_string("tl.cast({v}, tl.int64)", v=v),
+                {
+                    "triton_helpers.div_floor_integer": 2,
+                    "triton_helpers.remainder_integer": 1,
+                },
+                self.name,
+            )
+        return super().finalize_kernel_def(fn_def, prefix, ctx)
+
     def cast_expr(self, expr_str: str, dtype_str: str) -> str:
         return f"tl.cast({expr_str}, {dtype_str})"
 

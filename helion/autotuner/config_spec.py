@@ -1421,6 +1421,9 @@ class ConfigSpec:
         self.max_num_sm_multiplier: int = MAX_NUM_SM_MULTIPLIER
         self.default_num_sm_multiplier: int = backend.default_num_sm_multiplier()
         self.grid_block_ids: list[int] = []
+        # A scalar root runs one logical iteration per program. Its stride
+        # is independent of that width; None denotes a nonliteral stride.
+        self.literal_root_grid_steps: dict[int, int | None] = {}
         # Ordered root grids and nested-graph ownership, independent of any
         # specialized matmul/reduction policy.
         self.kernel_grid_fact: KernelGridFact | None = None
