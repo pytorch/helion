@@ -3423,6 +3423,18 @@ def normalize_knobs(
     )
     _normalize_gated_boolean(
         config,
+        "cute_staged_load",
+        enabled=config_spec.cute_transposed_load_sites,
+        requirement=(
+            "a load contiguous along another hl.tile than a store of the same "
+            "loop, the loaded tensor bf16, fp16, fp32, int16 or int32, in a "
+            "kernel with static shapes and without a matmul"
+        ),
+        fix_invalid=fix_invalid,
+        fill=False,
+    )
+    _normalize_gated_boolean(
+        config,
         "cute_staged_store",
         enabled=config_spec.cute_lane_gather_store_sites,
         requirement=(
@@ -4839,6 +4851,16 @@ def cute_flat_fields(
             # packet and no proven predicate, a shared-memory reduce in a loop
             # with a partial tile) the loop stays whole (``peel_vector_tails``).
             fields["cute_tail_peel"] = BooleanFragment()
+        if config_spec.cute_transposed_load_sites:
+            # A CTA's loads of one tensor read from a shared-memory image of
+            # its footprint, which the CTA fills with 16-byte packets; the
+            # values loaded are unchanged.  Offered where a load runs along
+            # another tile than a store (``transposed_load_sites``), the
+            # layouts where packet stores leave the loads scattered, in a
+            # kernel with static shapes.  Where the generated kernel is not
+            # proven to read a box of rows per block (a masked load, a
+            # gather) the code stays as it is (``staged_loads``).
+            fields["cute_staged_load"] = BooleanFragment()
         if config_spec.cute_lane_gather_store_sites:
             # A CTA's scalar stores staged in shared memory and flushed as
             # 16-byte packets, each warp writing 32 consecutive ones; the

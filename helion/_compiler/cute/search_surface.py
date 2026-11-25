@@ -349,6 +349,15 @@ def register_search_surface(device_ir: DeviceIR, config_spec: ConfigSpec) -> Non
         and not config_spec.matmul_facts
         and bool(lane_gather_stores(env, device_ir))
     )
+    # A load contiguous along another tile than a store of the same graph (a
+    # transposing copy): ``cute_staged_load`` is tunable, at static shapes.
+    from .staged_loads import transposed_load_sites
+
+    config_spec.cute_transposed_load_sites = (
+        env.settings.static_shapes
+        and not config_spec.matmul_facts
+        and transposed_load_sites(env, device_ir)
+    )
     # A max, a min or an ``any`` whose warp reduction ``redux.sync`` takes on
     # this target: ``cute_warp_fp32_redux`` is tunable.
     from .native_warp_reduction import has_native_redux_reduction

@@ -193,6 +193,7 @@ class Config(Mapping[str, object]):
         cute_defer_tile_reduce: bool | None = None,
         cute_accumulate_stores: bool | None = None,
         cute_staged_store: bool | None = None,
+        cute_staged_load: bool | None = None,
         cute_wide_packet_hints: bool | None = None,
         cute_scalar_load_hints: bool | None = None,
         cute_narrow_load_hints: bool | None = None,
@@ -606,6 +607,27 @@ class Config(Mapping[str, object]):
                 another (bf16, fp16, fp32, int16 or int32 tensors), without
                 a matmul, and elsewhere rejected (an explicit False is
                 dropped).
+            cute_staged_load: Read one tensor of a pointwise kernel through a
+                shared-memory image of each block's footprint of it: the
+                block copies the rows it reads into the image as 16-byte
+                packets, each warp reading 32 consecutive packets, meets at
+                one barrier, and each load reads its element from the image
+                (its 16-byte chunks swizzled so a warp's reads spread over
+                the banks; the block's threads may be relabeled so that its
+                stores run along the warp).  For a kernel whose stores are
+                contiguous along one tile and whose loads along another (a
+                transposing copy) this is what lets the loads be packets.
+                The values loaded and computed are those of the knob-off
+                code.  Applied only where the generated kernel is proven to
+                read a box of rows of one input per block, with no masked
+                load and no store into that input; where the proof fails the
+                code is the knob-off code.  One barrier and ``box elements x
+                element size`` bytes of shared memory per block.  Off by
+                default; offered to the autotuner on kernels with static
+                shapes that load a tensor contiguous along another tile than
+                a store (bf16, fp16, fp32, int16 or int32 loads), without a
+                matmul, and elsewhere rejected (an explicit False is
+                dropped).
             cute_wide_packet_hints: Carry the ``l2_last`` / ``l1_l2_first`` /
                 ``l1_l2_last`` load eviction policies onto 32-byte CuTe packets
                 (``cute_vector_widths`` 8 for fp32, 16 for bf16/fp16) through
@@ -844,6 +866,7 @@ class Config(Mapping[str, object]):
             "cute_defer_tile_reduce": cute_defer_tile_reduce,
             "cute_accumulate_stores": cute_accumulate_stores,
             "cute_staged_store": cute_staged_store,
+            "cute_staged_load": cute_staged_load,
             "cute_wide_packet_hints": cute_wide_packet_hints,
             "cute_scalar_load_hints": cute_scalar_load_hints,
             "cute_narrow_load_hints": cute_narrow_load_hints,

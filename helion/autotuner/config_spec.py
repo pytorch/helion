@@ -1345,6 +1345,13 @@ class ConfigSpec:
         # ``cute_vloop_sink`` and ``cute_lane_unroll`` (the gather's packet
         # loads) at every extent (``lane_gather_stores``).
         self.cute_lane_gather_store_sites = False
+        # Set by DeviceIR analysis: a load of a tensor whose stride-1
+        # dimension a tile indexes other than the tile on the stride-1
+        # dimension of a store of the same graph (a transposing copy), the
+        # loaded tensor of a dtype with 16-byte packets, in a kernel with
+        # static shapes and without a matmul: ``cute_staged_load`` is tunable
+        # (``transposed_load_sites``).
+        self.cute_transposed_load_sites = False
         # Set by DeviceIR analysis under ``Settings.cute_exact_division``: an
         # fp32 quotient whose divisor is a scalar or a broadcast row value
         # (``hoist_loop_invariant_recip``'s exact hoist can apply), so

@@ -8,6 +8,7 @@ from .....runtime.config import Config
 from ....autotuner_heuristics.registry import AutotunerHeuristic
 from ...emitters.lane_packets import _CUTE_VECTOR_DTYPES
 from ...flat_gather_lane import _packet_layout_aligned
+from ...target_facts import static_smem_budget
 from ...target_facts import widest_packet_bytes
 from ...transposed_stores import BatchedLayoutStore
 from ...transposed_stores import TransposedStore
@@ -186,7 +187,80 @@ class CuteTransposedStoreSeedsHeuristic(AutotunerHeuristic):
                             )
                             if seed is not None and seed not in seeds:
                                 seeds.append(seed)
+                    seed = cls._staged_load_seed(env, device_ir, batched)
+                    if seed is not None and seed not in seeds:
+                        seeds.append(seed)
         return seeds
+
+    # A batched layout change whose loads ``cute_staged_load`` stages: 16-byte
+    # packets of the store's contiguous tile on ``STAGED_PACKET_THREADS``
+    # threads (a 128-byte row of the output per warp row once the pass
+    # relabels the threads), ``STAGED_ROW_THREADS`` threads along the load's
+    # contiguous tile with ``STAGED_ROW_BYTES`` of it per CTA (a 128-byte image
+    # row), the batch tiles at their smallest block.  On 35b8's
+    # [32, 512, 768] bf16 copy: 5.98 us, against 7.70 us for the best
+    # unstaged search result and 5.4-6.0 us for inductor_cd's.
+    STAGED_PACKET_THREADS = 8
+    STAGED_ROW_THREADS = 16
+    STAGED_ROW_BYTES = 128
+
+    @classmethod
+    def _staged_load_seed(
+        cls, env: CompileEnvironment, device_ir: DeviceIR, store: BatchedLayoutStore
+    ) -> Config | None:
+        """The staged-load seed of a batched layout change, where the config
+        spec offers ``cute_staged_load`` and the store's tile takes 16-byte
+        packets (``_packet``); None elsewhere."""
+        spec = env.config_spec
+        if not spec.supports_config_key("cute_staged_load"):
+            return None
+        if not spec.cute_transposed_load_sites:
+            return None
+        packet = cls._packet(
+            env,
+            device_ir,
+            store.tensor,
+            store.lane_dim,
+            store.contiguous,
+            16,
+            store.masked,
+            store.shifted,
+        )
+        if packet is None:
+            return None
+        load_elements = cls.STAGED_ROW_BYTES // store.load_tensor.dtype.itemsize
+        columns = cls._block_size(
+            spec, store.contiguous, cls.STAGED_PACKET_THREADS * packet
+        )
+        rows = cls._block_size(spec, store.other, load_elements)
+        if (
+            columns % packet
+            or rows % cls.STAGED_ROW_THREADS
+            or columns // packet * cls.STAGED_ROW_THREADS > cls.SEED_CTA_THREADS
+            # The image: the CTA's footprint of the load.
+            or columns * rows * store.load_tensor.dtype.itemsize > static_smem_budget()
+        ):
+            return None
+        sizes = cls._default_block_sizes(spec)
+        sizes.update({store.contiguous: columns, store.other: rows})
+        threads = {
+            store.contiguous: columns // packet,
+            store.other: cls.STAGED_ROW_THREADS,
+        }
+        for block_id in store.batch:
+            sizes[block_id] = cls._block_size(spec, block_id, 1)
+            threads[block_id] = 1
+        blocks = {store.other, store.contiguous, *store.batch}
+        values: dict[str, object] = {
+            "block_sizes": _seq_config_list(spec.block_sizes, sizes),
+            "num_threads": _seq_config_list(spec.num_threads, threads),
+            "cute_vector_widths": _seq_config_list(
+                spec.cute_vector_widths,
+                dict.fromkeys(blocks, 1) | {store.contiguous: packet},
+            ),
+            "cute_staged_load": True,
+        }
+        return Config.from_dict(values)
 
     @staticmethod
     def _stores(env: CompileEnvironment, device_ir: DeviceIR) -> list[TransposedStore]:

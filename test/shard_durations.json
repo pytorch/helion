@@ -350,6 +350,7 @@
  "test/test_cute_split_single_token_rank1_recurrence.py": 29.6,
  "test/test_cute_split_view_consumers.py": 3.7,
  "test/test_cute_stage_aligned_operands.py": 3.1,
+ "test/test_cute_staged_load_cuda.py": 20.7,
  "test/test_cute_staged_store_cuda.py": 47.8,
  "test/test_cute_standalone.py": 7.1,
  "test/test_cute_static_indexing_gpu.py": 4.7,

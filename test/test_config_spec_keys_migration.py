@@ -151,7 +151,8 @@ _BASE_VALID_KEYS = """
     cute_selection_algorithm cute_signed_bitfield_bf16
     cute_simt_mma cute_simt_mma_layout cute_split_k_finalizer_warps
     cute_split_k_partitions cute_split_k_schedule cute_split_k_stages
-    cute_split_k_workspace cute_staged_store cute_store_packet_tiers
+    cute_split_k_workspace cute_staged_load cute_staged_store
+    cute_store_packet_tiers
     cute_store_policy cute_tail_peel cute_tiles_per_block
     cute_topk_coarse_keys cute_topk_defer_value_gathers cute_topk_key_dtype
     cute_topk_key_encoder cute_topk_key_recovery cute_topk_lanes_per_row
@@ -327,7 +328,8 @@ _BASE_BACKEND_SPECIFIC_KEYS = """
     cute_selection_algorithm cute_signed_bitfield_bf16
     cute_simt_mma cute_simt_mma_layout cute_split_k_finalizer_warps
     cute_split_k_partitions cute_split_k_schedule cute_split_k_stages
-    cute_split_k_workspace cute_staged_store cute_store_packet_tiers
+    cute_split_k_workspace cute_staged_load cute_staged_store
+    cute_store_packet_tiers
     cute_store_policy cute_tail_peel cute_tiles_per_block
     cute_topk_coarse_keys cute_topk_defer_value_gathers cute_topk_key_dtype
     cute_topk_key_encoder cute_topk_key_recovery cute_topk_lanes_per_row
@@ -438,7 +440,8 @@ _BASE_CUTE_IMPLICIT_DEFAULT_KEYS = """
     cute_selection_algorithm cute_signed_bitfield_bf16
     cute_simt_mma cute_simt_mma_layout cute_split_k_finalizer_warps
     cute_split_k_partitions cute_split_k_schedule cute_split_k_stages
-    cute_split_k_workspace cute_staged_store cute_store_packet_tiers
+    cute_split_k_workspace cute_staged_load cute_staged_store
+    cute_store_packet_tiers
     cute_store_policy cute_tail_peel cute_topk_coarse_keys
     cute_topk_key_recovery cute_uniform_lane_compares cute_unpadded_rows
     cute_vector_packet_unroll cute_vloop_sink
@@ -563,7 +566,8 @@ _BASE_CUTE_ACCEPTED = """
     cute_selection_algorithm cute_signed_bitfield_bf16
     cute_simt_mma cute_simt_mma_layout cute_split_k_finalizer_warps
     cute_split_k_partitions cute_split_k_schedule cute_split_k_stages
-    cute_split_k_workspace cute_staged_store cute_store_packet_tiers
+    cute_split_k_workspace cute_staged_load cute_staged_store
+    cute_store_packet_tiers
     cute_store_policy cute_tail_peel cute_tiles_per_block
     cute_topk_coarse_keys cute_topk_defer_value_gathers cute_topk_key_dtype
     cute_topk_key_encoder cute_topk_key_recovery cute_topk_lanes_per_row

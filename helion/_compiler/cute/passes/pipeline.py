@@ -65,6 +65,7 @@ from __future__ import annotations
 import ast
 import dataclasses
 from typing import TYPE_CHECKING
+from typing import Any
 from typing import Callable
 from typing import NamedTuple
 from typing import cast
@@ -1666,44 +1667,56 @@ def _guard_lanes(s: _KernelDefState) -> None:
     )
 
 
-def _stage_cta_stores(s: _KernelDefState) -> None:
+def _staged_pass_arguments(s: _KernelDefState) -> dict[str, Any]:
+    """The keyword arguments ``stage_cta_loads`` and ``stage_cta_stores``
+    share: the kernel's tensors and what codegen proved of them."""
     from ..memory_ops import cute_tensor_base_is_aligned
     from ..staged_stores import PACKET_BYTES
-    from ..staged_stores import stage_cta_stores
     from ..target_facts import static_smem_budget
 
     ctx = s.ctx
     renamed = ctx.rename_groups
-    stage_cta_stores(
-        s.definition.body,
-        tensors={
+    return {
+        "tensors": {
             renamed.get(argument.name, argument.name): argument.fake_value
             for argument in s.param_args
             if isinstance(argument, TensorArg)
             and not isinstance(argument, TensorDescriptorArg)
         },
-        base_aligned=lambda tensor: cute_tensor_base_is_aligned(
+        "base_aligned": lambda tensor: cute_tensor_base_is_aligned(
             ctx.env, tensor, PACKET_BYTES
         ),
-        proven_disjoint_tensor_pairs={
+        "proven_disjoint_tensor_pairs": {
             frozenset(renamed.get(name, name) for name in pair)
             for pair in ctx.proven_disjoint_tensor_pairs
         },
-        proven_tensor_stride_values={
+        "proven_tensor_stride_values": {
             (renamed.get(name, name), dim): value
             for (name, dim), value in ctx.proven_tensor_stride_values.items()
         },
-        constexpr_values=ctx.constexpr_values,
-        thread_block_dims=ctx.exact_thread_block_dims,
+        "constexpr_values": ctx.constexpr_values,
+        "thread_block_dims": ctx.exact_thread_block_dims,
         # The launch's block grid, when every extent of it is proven.
-        block_grid_dims=cast("tuple[int, int, int]", ctx.block_grid_dims)
+        "block_grid_dims": cast("tuple[int, int, int]", ctx.block_grid_dims)
         if ctx.exact_grid and None not in ctx.block_grid_dims
         else None,
-        index_type=ctx.env.index_type(),
-        dtype_str=ctx.env.backend.dtype_str,
-        smem_budget=static_smem_budget(),
-        new_var=ctx.new_var,
-    )
+        "index_type": ctx.env.index_type(),
+        "dtype_str": ctx.env.backend.dtype_str,
+        "smem_budget": static_smem_budget(),
+        "new_var": ctx.new_var,
+    }
+
+
+def _stage_cta_loads(s: _KernelDefState) -> None:
+    from ..staged_loads import stage_cta_loads
+
+    stage_cta_loads(s.definition.body, **_staged_pass_arguments(s))
+
+
+def _stage_cta_stores(s: _KernelDefState) -> None:
+    from ..staged_stores import stage_cta_stores
+
+    stage_cta_stores(s.definition.body, **_staged_pass_arguments(s))
 
 
 def _validate_shared_arenas(s: _KernelDefState) -> None:
@@ -2125,6 +2138,15 @@ KERNEL_DEF_PASSES: tuple[KernelDefPass, ...] = (
         _select_native_warp_reductions,
         # Last of the lowerings: every earlier pass recognizes the shuffle
         # reductions by name.
+        requires=(RENAMED,),
+    ),
+    KernelDefPass(
+        "stage_cta_loads",
+        _config_flag("cute_staged_load"),
+        _stage_cta_loads,
+        # Where ``stage_cta_stores`` runs, and before it: its effects proof
+        # takes no barrier or shared memory, so a kernel staged here keeps
+        # its direct stores.
         requires=(RENAMED,),
     ),
     KernelDefPass(
