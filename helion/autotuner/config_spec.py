@@ -1626,6 +1626,10 @@ class ConfigSpec:
         # reduction is an atomic add into an output kept in a dtype with a
         # packed atomic add (``split_k_workspace.atomic_epilogue_admissible``).
         self.cute_split_k_atomic_epilogue_available: bool = False
+        # The tiles and rings the proved schedule's producer takes (the CuTe
+        # backend's ``WorkspaceGeometry``), read by the search's repair of the
+        # workspace knobs; None without a proof.
+        self.cute_split_k_workspace_geometry: object | None = None
         self.cute_materialized_schedule_available: bool = False
         self.cute_materialized_schedule_search_enabled: bool = False
         self.cute_row_matrix_transport_available: bool = False

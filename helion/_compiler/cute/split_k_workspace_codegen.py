@@ -8,6 +8,7 @@ created. The outer host program keeps its original metadata and assertions.
 from __future__ import annotations
 
 import ast
+import copy
 import hashlib
 import symtable
 from typing import TYPE_CHECKING
@@ -169,6 +170,15 @@ def _producer_source(
 
             module = generate_ast(host, config, False)
             plans = child_state.resolved_wrapper_plans
+            if schedule.k_offset:
+                _offset_partition_k_coordinates(module, schedule, plans)
+            units = (
+                schedule.partitions
+                * -(-proof.m // schedule.bm)
+                * -(-proof.n // schedule.bn)
+            )
+            if units > max(1, (child.config_spec.num_sm or 0) // 2):
+                _order_partition_units_output_major(module, schedule, proof)
             if schedule.atomic_epilogue:
                 plans = _rewrite_producer_for_atomic_epilogue(
                     module, proof, schedule, plans
@@ -176,69 +186,214 @@ def _producer_source(
             return _module_source(module), plans
 
 
+def _offset_partition_k_coordinates(
+    module: ast.Module,
+    schedule: SplitKWorkspaceSchedule,
+    plans: list[dict[str, object]],
+) -> None:
+    """Address each partition's K range on the operands as they are.
+
+    The producer is compiled over batch views ``a[p, m, k]`` (a ``[P, M,
+    chunk]`` view of ``[M, K]``), whose partition coordinate its TMA loads
+    take as a third TensorMap mode:
+
+        gA_tma = cute.local_tile(tma_tensor_a, (128, 64, 1), (m_tile, None, cutlass.Int32(indices_0)))
+
+    Where ``P * chunk`` exceeds K (``plain_store_chunk``: K = 20008 in three
+    partitions of 6720) no strided view holds the last partition: its rows
+    would run into the next row's first columns instead of zeros. The host
+    passes ``[1, M, K]`` and ``[1, K, N]`` views instead, and each
+    partition's loads shift their K coordinate by ``partition * chunk``:
+
+        gA_tma = cute.local_tile(cute.domain_offset((0, cutlass.Int32(indices_0) * 6720, 0), tma_tensor_a), (128, 64, 1), (m_tile, None, 0))
+
+    so the TensorMap's own K extent zero-fills the 152 columns of the last
+    partition past K.
+    """
+    kernel_args: list[object] = []
+    for plan in plans:
+        if plan.get("kind") == "tcgen05_ab_tma":
+            kernel_args = cast("list[object]", plan["kernel_args"])
+    if len(kernel_args) != 4:
+        raise exc.BackendUnsupported(
+            "cute", "split-K K-offset partitions expect the A/B TensorMap producer"
+        )
+    tensors = {str(kernel_args[1]), str(kernel_args[3])}
+    rewritten: list[str] = []
+    for node in ast.walk(module):
+        if not (
+            isinstance(node, ast.Call)
+            and ast.unparse(node.func) == "cute.local_tile"
+            and len(node.args) == 3
+            and isinstance(node.args[0], ast.Name)
+            and node.args[0].id in tensors
+            and isinstance(node.args[2], ast.Tuple)
+            and len(node.args[2].elts) == 3
+        ):
+            continue
+        tensor = node.args[0].id
+        m_or_n, k, partition = node.args[2].elts
+        if not (isinstance(k, ast.Constant) and k.value is None):
+            raise exc.BackendUnsupported(
+                "cute", "split-K K-offset partitions expect whole-K operand tiles"
+            )
+        node.args[0] = ast.parse(
+            f"cute.domain_offset((0, ({ast.unparse(partition)}) * {schedule.chunk}, 0), {tensor})",
+            mode="eval",
+        ).body
+        node.args[2] = ast.Tuple(
+            elts=[m_or_n, k, ast.Constant(value=0)], ctx=ast.Load()
+        )
+        rewritten.append(tensor)
+    if sorted(rewritten) != sorted(tensors):
+        raise exc.BackendUnsupported(
+            "cute", "split-K K-offset partitions expect one A and one B operand tile"
+        )
+    ast.fix_missing_locations(module)
+
+
+def _order_partition_units_output_major(
+    module: ast.Module, schedule: SplitKWorkspaceSchedule, proof: SplitKWorkspaceProof
+) -> None:
+    """Hand out a multi-wave producer's work units partition by partition.
+
+    The batched producer decodes its persistent scheduler's linear unit index
+    partition-fastest:
+
+        virtual_pid = (work_tile.tile_idx[0] >> 1) + work_tile.tile_idx[1] * 3 + ...
+        pid_0 = virtual_pid % num_blocks_0      # partition
+        pid_1 = virtual_pid // num_blocks_0 & cutlass.Int32(15)  # M tile
+        pid_2 = virtual_pid // (num_blocks_0 * num_blocks_1)     # N tile
+
+    so the units running together share no operand rows: bf16 4096 x 1536 x
+    128104 in three partitions of 256x256 tiles runs 76 of its 288 units at
+    once, three K slices of 16 M tiles over one N tile, and reads its 1 GB A
+    once per N tile, six times in all. Remapping the index first,
+
+        virtual_pid = virtual_pid // 96 + 3 * (virtual_pid // 6 % 16 + 16 * (virtual_pid % 6))
+
+    hands out partition 0's 96 output tiles N-fastest, then partition 1's:
+    the six N tiles of an M tile read their A slice together (GB300, one CUDA
+    graph over cold inputs, of cuBLAS: 1.029 -> 1.068; 8192 x 768 x 50272 in
+    three partitions 0.902 -> 1.027). A producer of one wave or less (every
+    unit of its own CTA pair) keeps the decode.
+    """
+    partitions = schedule.partitions
+    m_tiles = -(-proof.m // schedule.bm)
+    n_tiles = -(-proof.n // schedule.bn)
+    remap = ast.parse(
+        f"virtual_pid = virtual_pid // {m_tiles * n_tiles} + {partitions} * "
+        f"(virtual_pid // {n_tiles} % {m_tiles} + {m_tiles} * (virtual_pid % {n_tiles}))"
+    ).body[0]
+    remapped = 0
+    for statements in _kernel_statement_lists(module):
+        index = 0
+        while index < len(statements):
+            if assigned_name(statements[index]) == "virtual_pid":
+                statements.insert(index + 1, copy.deepcopy(remap))
+                remapped += 1
+                index += 1
+            index += 1
+    if remapped == 0:
+        raise exc.BackendUnsupported(
+            "cute", "split-K producer ordering expects the persistent unit decode"
+        )
+    ast.fix_missing_locations(module)
+
+
+# Threads per reducer CTA; each owns one 4-wide output vector.
+REDUCER_THREADS = 256
+# The partitions a reducer thread loads before it folds them into its total.
+# One sum over every partition,
+#
+#     converted.store((loaded_0.load() + ... + loaded_127.load()).to(...))
+#
+# keeps 4 * P loaded floats live: 512 at the 128 partitions the atomic split-K
+# proofs seed, past the 255 registers a thread has. Groups of eight keep 32.
+REDUCER_GROUP = 8
+
+
+def _reducer_grid(outputs: int) -> int:
+    """CTAs of the reducer launch over ``outputs`` elements (``_reducer_source``)."""
+    return -(-(outputs // 4) // REDUCER_THREADS)
+
+
 def _reducer_source(
     proof: SplitKWorkspaceProof, schedule: SplitKWorkspaceSchedule
 ) -> str:
-    """Four disjoint partition lanes per output vector and one final cast.
+    """The reducer launch: a thread owns one 4-wide output vector, issues the
+    loads of its partitions before the first addition and stores their sum in
+    the output's dtype. For a 768 x 768 bf16 output of two partitions (147456
+    vectors, 576 CTAs of 256 threads):
 
-    Every partial is loaded exactly once, and every lane issues all of its
-    16-byte loads before the first addition (a running sum would serialize
-    them behind one another: 2.7 us for 2 MB of partials at 16 partitions,
-    4.2 us at 32, against 2.1 / 2.5 with the loads in flight together). The
-    two butterfly additions combine the four FP32 lane sums; only their
-    owner writes the output. The reducer launches as a programmatic
-    dependent of the producer (``_helion_cute_use_pdl``) and waits at entry,
-    so its launch and ramp overlap the producer's tail; the producer and
-    reducer stay ordered launches on the same stream, including graph replay.
-    """
+        cute.arch.griddepcontrol_launch_dependents()
+        cute.arch.griddepcontrol_wait()
+        vector = block * cutlass.Int32(256) + thread
+        output_begin = cute.assume(vector * cutlass.Int32(4), divby=4)
+        cute.copy(load_atom, <partials + 0 + output_begin>, loaded_0)
+        cute.copy(load_atom, <partials + 589824 + output_begin>, loaded_1)
+        converted.store((loaded_0.load() + loaded_1.load()).to(cutlass.BFloat16))
+        cute.copy(store_atom, converted, <out + output_begin>)
+
+    The partitions are summed in order, the bias (if any) added to partition
+    zero first: the fp32 rounding order of the original epilogue.
+
+    It triggers its dependents before it waits for the producer: the next
+    kernel of the stream launches once every reducer CTA is resident, so its
+    prologue runs under the reduction, and its own wait still orders it after
+    the reducer. The schedule on GB300 (CUDA graph over cold inputs, two runs
+    each), the trigger after the wait instead: bf16 768^2 x 8192 in two
+    partitions 11.28-11.37 us against 10.83-10.94 with it first, 384 x 768 x
+    16384 in four 12.92 against 12.55-12.62.
+
+    One vector a thread keeps the grid wide. More vectors a thread (all of
+    their loads in flight together, on fewer CTAs) read 768^2 x 8192 at
+    12.06-12.13 us for two vectors, 13.74-13.88 for four and 15.50-15.75 for
+    eight; spreading one vector's partitions over four lanes (each loading
+    partitions lane, lane + 4, ... and butterfly shuffles combining them)
+    issues one load a thread on a 4608-CTA grid: [4, 768, 768] fp32 partials
+    alone (L2-hot, one launch included) reduce in 3.11 us that way, 1.83 us
+    this way."""
     bias_parameter = ", bias" if proof.bias is not None else ""
-    steps = (schedule.partitions + 3) // 4
     outputs = proof.m * proof.n
-    # Every 128-output block is full when the output size is a multiple of
-    # 128 (the schedule requires m % 128 == 0), and a step's four partition
-    # lanes are all live unless it is a ragged last step.
-    output_guard = (
-        "" if outputs % 128 == 0 else f" and output_begin < cutlass.Int32({outputs})"
-    )
+    vectors = outputs // 4
+    ragged = vectors % REDUCER_THREADS != 0
+    bits = proof.output_dtype.itemsize * 8
+    output_type = cutlass_dtype_name(proof.output_dtype)
     lines = [
         "from __future__ import annotations",
         "import cutlass",
         "import cutlass.cute as cute",
         "@cute.kernel",
         f"def _reduce_partitions(partials, out{bias_parameter}):",
+        "    cute.arch.griddepcontrol_launch_dependents()",
         "    cute.arch.griddepcontrol_wait()",
         "    thread = cutlass.Int32(cute.arch.thread_idx()[0])",
-        "    lane = thread % cutlass.Int32(32)",
-        "    warp = thread // cutlass.Int32(32)",
-        "    partition_lane = lane // cutlass.Int32(8)",
-        "    output_begin = cute.assume(cutlass.Int32(cute.arch.block_idx()[0]) * cutlass.Int32(128) + warp * cutlass.Int32(32) + (lane % cutlass.Int32(8)) * cutlass.Int32(4), divby=4)",
+        "    block = cutlass.Int32(cute.arch.block_idx()[0])",
         "    load_atom = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), cutlass.Float32, num_bits_per_copy=128)",
+        f"    vector = block * cutlass.Int32({REDUCER_THREADS}) + thread",
+        "    output_begin = cute.assume(vector * cutlass.Int32(4), divby=4)",
         *(
-            f"    loaded_{step} = cute.make_rmem_tensor((4,), cutlass.Float32)"
-            for step in range(steps)
+            f"    loaded_{q} = cute.make_rmem_tensor((4,), cutlass.Float32)"
+            for q in range(schedule.partitions)
         ),
     ]
-    for step in range(steps):
-        guard = (
-            f"partition_lane + cutlass.Int32({step * 4}) < cutlass.Int32({schedule.partitions})"
-            if (step + 1) * 4 > schedule.partitions
-            else ""
-        )
-        if output_guard:
-            guard = (guard + output_guard) if guard else output_guard[len(" and ") :]
-        indent = "    "
-        if guard:
-            # A lane without a partition in this step adds zero.
-            lines.extend(
-                (f"    loaded_{step}.fill(cutlass.Float32(0))", f"    if {guard}:")
-            )
-            indent = "        "
-        lines.extend(
-            (
-                f"{indent}source_offset_{step} = cute.assume((partition_lane + cutlass.Int32({step * 4})) * cutlass.Int32({outputs}) + output_begin, divby=4)",
-                f"{indent}cute.copy(load_atom, cute.make_tensor(partials.iterator + source_offset_{step}, cute.make_layout((4,), stride=(1,))), loaded_{step})",
-            )
-        )
+    indent = "    "
+    if ragged:
+        lines.append(f"    if vector < cutlass.Int32({vectors}):")
+        indent = "        "
+    groups = [
+        range(start, min(start + REDUCER_GROUP, schedule.partitions))
+        for start in range(0, schedule.partitions, REDUCER_GROUP)
+    ]
+
+    def loads(group: range) -> list[str]:
+        return [
+            f"{indent}cute.copy(load_atom, cute.make_tensor(partials.iterator + cute.assume(cutlass.Int32({q * outputs}) + output_begin, divby=4), cute.make_layout((4,), stride=(1,))), loaded_{q})"
+            for q in group
+        ]
+
+    lines.extend(loads(groups[0]))
     if proof.bias is not None:
         coordinates = (
             f"(output_begin + element) // {proof.n}",
@@ -250,35 +405,37 @@ def _reducer_source(
                 proof.bias.dimensions, proof.bias.strides, strict=True
             )
         )
-        # Partition zero (step 0 of lane 0) takes the bias before any partial
-        # sum: the fp32 rounding order of the original epilogue.
         lines.extend(
             (
-                f"    if partition_lane == cutlass.Int32(0){output_guard}:",
-                "        for element in cutlass.range_constexpr(4):",
-                f"            bias_scalar = cute.make_tensor(bias.iterator + ({index}), cute.make_layout(1))",
-                "            loaded_0[element] = loaded_0[element] + cutlass.Float32(bias_scalar[0])",
+                f"{indent}for element in cutlass.range_constexpr(4):",
+                f"{indent}    bias_scalar = cute.make_tensor(bias.iterator + ({index}), cute.make_layout(1))",
+                f"{indent}    loaded_0[element] = loaded_0[element] + cutlass.Float32(bias_scalar[0])",
             )
         )
-    bits = proof.output_dtype.itemsize * 8
-    output_type = cutlass_dtype_name(proof.output_dtype)
+    total = " + ".join(f"loaded_{q}.load()" for q in groups[0])
+    if len(groups) > 1:
+        # Past REDUCER_GROUP partitions each group folds into the running
+        # total, in partition order (the same sum as one expression), before
+        # the next group's loads issue:
+        #
+        #     total = loaded_0.load() + ... + loaded_7.load()
+        #     cute.copy(load_atom, <partials + 8 * outputs + output_begin>, loaded_8)
+        #     ...
+        #     total = total + loaded_8.load() + ... + loaded_15.load()
+        lines.append(f"{indent}total = {total}")
+        for group in groups[1:]:
+            lines.extend(loads(group))
+            lines.append(
+                f"{indent}total = total + "
+                + " + ".join(f"loaded_{q}.load()" for q in group)
+            )
+        total = "total"
     lines.extend(
         (
-            "    values = cute.make_rmem_tensor((4,), cutlass.Float32)",
-            "    values.store("
-            + " + ".join(f"loaded_{step}.load()" for step in range(steps))
-            + ")",
-            "    for element in cutlass.range_constexpr(4):",
-            "        value = values[element]",
-            "        value = value + cute.arch.shuffle_sync_bfly(value, 8)",
-            "        value = value + cute.arch.shuffle_sync_bfly(value, 16)",
-            "        values[element] = value",
-            f"    if partition_lane == cutlass.Int32(0){output_guard}:",
-            f"        converted = cute.make_rmem_tensor((4,), {output_type})",
-            f"        converted.store(values.load().to({output_type}))",
-            "        destination = cute.make_tensor(out.iterator + output_begin, cute.make_layout((4,), stride=(1,)))",
-            f"        store_atom = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), {output_type}, num_bits_per_copy={bits * 4})",
-            "        cute.copy(store_atom, converted, destination)",
+            f"{indent}converted = cute.make_rmem_tensor((4,), {output_type})",
+            f"{indent}converted.store(({total}).to({output_type}))",
+            f"{indent}store_atom = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), {output_type}, num_bits_per_copy={bits * 4})",
+            f"{indent}cute.copy(store_atom, converted, cute.make_tensor(out.iterator + output_begin, cute.make_layout((4,), stride=(1,))))",
         )
     )
     return "\n".join(lines) + "\n"
@@ -967,15 +1124,20 @@ def generate_split_k_workspace(
                 ],
             )
             allocation_count += 1
-        elif isinstance(stmt, ast.Return):
+        elif isinstance(stmt, ast.Return) and not proof.argument_output:
             stmt.value = ast.Name(id=proof.output_name, ctx=ast.Load())
-    assert allocation_count == 1
+    # An argument output has no allocation to keep; the reducer writes the
+    # argument itself.
+    assert allocation_count == (0 if proof.argument_output else 1)
     p, chunk = schedule.partitions, schedule.chunk
     a_stride = (chunk * proof.lhs_strides[1], *proof.lhs_strides)
     b_stride = (chunk * proof.rhs_strides[0], *proof.rhs_strides)
+    # K-offset partitions read the operands whole: one batch of all of K
+    # (``_offset_partition_k_coordinates``).
+    views_p, views_k = (1, proof.k) if schedule.k_offset else (p, chunk)
     views = (
-        f"{view_a} = ({proof.lhs_expression}).as_strided(({p}, {proof.m}, {chunk}), {a_stride!r})\n"
-        f"{view_b} = ({proof.rhs_expression}).as_strided(({p}, {chunk}, {proof.n}), {b_stride!r})\n"
+        f"{view_a} = ({proof.lhs_expression}).as_strided(({views_p}, {proof.m}, {views_k}), {a_stride!r})\n"
+        f"{view_b} = ({proof.rhs_expression}).as_strided(({views_p}, {views_k}, {proof.n}), {b_stride!r})\n"
     )
     bias_argument = f", {proof.bias.host_expression}" if proof.bias is not None else ""
     native_kernel = f"{native_module}._helion__native_partition_gemm"
@@ -1004,11 +1166,12 @@ def generate_split_k_workspace(
         ]
         kernels = (native_kernel, fill_kernel)
     else:
+        reducer_grid = _reducer_grid(proof.m * proof.n)
         new_calls = ast.parse(
             f"{partials} = torch.empty(({p}, {proof.m}, {proof.n}), dtype=torch.float32, device=({proof.lhs_expression}).device)\n"
             + views
             + f"{native_module}._native_partition_gemm({view_a}, {view_b}, {partials}, _launcher=_launcher)\n"
-            f"_launcher({reduce_module}._reduce_partitions, ({(proof.m * proof.n + 127) // 128},), {partials}, {proof.output_name}{bias_argument}, block=(128, 1, 1){option})\n"
+            f"_launcher({reduce_module}._reduce_partitions, ({reducer_grid},), {partials}, {proof.output_name}{bias_argument}, block=({REDUCER_THREADS}, 1, 1){option})\n"
         ).body
         kernels = (native_kernel, reduce_kernel)
     index = host.body.index(launch_marker)
@@ -1045,6 +1208,9 @@ def generate_split_k_workspace(
     metadata = {
         "partitions": p,
         "chunk_k": chunk,
+        # (recorded where the partitions run past K, so exact partitions'
+        # modules stay as they were)
+        **({"k_offset": True} if schedule.k_offset else {}),
         "tile": (schedule.bm, schedule.bn, schedule.bk),
         "ab_stages": schedule.stages,
         "partial_dtype": None if schedule.atomic_epilogue else "torch.float32",

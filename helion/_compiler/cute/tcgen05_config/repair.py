@@ -15,6 +15,7 @@ validators enforce; the ``InvalidConfig`` reason texts are pinned by tests.
 from __future__ import annotations
 
 import copy
+import functools
 from typing import TYPE_CHECKING
 from typing import Any
 from typing import cast
@@ -73,6 +74,7 @@ from ..pipeline_smem import one_cta_pipeline_tile_modeled
 from ..split_k_workspace_config import PARTITIONS_KEY
 from ..split_k_workspace_config import STAGES_KEY
 from ..split_k_workspace_config import WORKSPACE_KEY
+from ..split_k_workspace_config import repair_workspace_geometry
 from ..strategies import TCGEN05_BATCH_RASTER_CONFIG_KEY
 from ..strategies import TCGEN05_BATCH_RASTER_SLOWEST
 from ..strategies import TCGEN05_L2_SWIZZLE_SIZE_CONFIG_KEY
@@ -246,6 +248,7 @@ if TYPE_CHECKING:
 
 
 if TYPE_CHECKING:
+    from ..split_k_workspace import WorkspaceGeometry
     from . import CuteTcgen05Config
 
 
@@ -1286,6 +1289,21 @@ def _fix_split_k_workspace_search_config(
         config[STAGES_KEY] = 2
     if PARTITIONS_KEY in config:
         config[PARTITIONS_KEY] = 1
+
+
+def _fix_split_k_workspace_geometry_search_config(
+    state: CuteTcgen05Config, config: dict[str, object]
+) -> None:
+    """A workspace sample runs the tile the projections leave it, which they
+    may have rewritten (``_fix_cluster_m2_search_config`` puts a sampled
+    ``tcgen05_cluster_m=2`` on the 256x256 pair tile): keep it on what the
+    schedule's partition producer runs (``repair_workspace_geometry``)."""
+    spec = state.config_spec
+    geometry = cast("WorkspaceGeometry | None", spec.cute_split_k_workspace_geometry)
+    if geometry is not None:
+        repair_workspace_geometry(
+            config, functools.partial(geometry.max_stages, spec.block_sizes)
+        )
 
 
 def _fix_cluster_m2_search_config(
@@ -4926,6 +4944,9 @@ def _fix_cluster_m1_persistent_search_config(
         state.search_enabled
         and config.get("tcgen05_cluster_m", 1) == 1
         and config.get("pid_type") in {"persistent_blocked", "persistent_interleaved"}
+        # (the split-K workspace schedule's own CTA pair takes 256-row
+        # tiles: ``_fix_cluster_m1_flat_block_m_search_config``)
+        and config.get(WORKSPACE_KEY) is not True
     ):
         return
     config_view = facts._matmul_config_view(state, config)
@@ -5000,6 +5021,14 @@ def _fix_cluster_m1_flat_block_m_search_config(
         and config.get("tcgen05_cluster_m", 1) == 1
         and config.get("pid_type") == "flat"
         and _block_admits(state, 0, TCGEN05_ONE_CTA_MAX_BLOCK_M)
+        # The split-K workspace schedule runs its partitions on a CTA pair of
+        # its own, whose tile the block sizes name (``split_k_workspace.
+        # workspace_tile_max_stages``: 128 or 256 rows); the pid type and
+        # cluster are inert there. Projected to 128 rows, a 256x256 seed ran
+        # 128x256 partitions: bf16 2048x768x20008 in three partitions, 54.7
+        # against 45.7 us per call (GB300, one CUDA graph over cold inputs,
+        # both in one process).
+        and config.get(WORKSPACE_KEY) is not True
     ):
         return
     view = facts._matmul_config_view(state, config)
@@ -6044,6 +6073,9 @@ def fix_search_config(state: CuteTcgen05Config, config: dict[str, object]) -> No
             _fix_search_config_body(state, config)
         _drop_unproved_n_edge_cluster_n(state, config)
         _drop_single_edge_k_tail_cluster_n(state, config)
+        # (a workspace sample the producer cannot run on its projected tile
+        # turns into the plain kernel, which the next pass projects)
+        _fix_split_k_workspace_geometry_search_config(state, config)
         if config == before:
             break
     # These repairs read the repaired pid type, cluster and tile, so they
