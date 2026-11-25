@@ -485,12 +485,16 @@ def element_body(
 
 def kernel_constants(body: list[ast.stmt]) -> dict[str, int | float]:
     """The kernel's constants a run of register elements folds over: names
-    assigned once in the whole kernel, an integer or float literal.  A name
-    assigned anywhere else too (``mpp_matmul.assigned_names``) is not one,
-    whatever the control flow; a run's own statements are folded per
-    element instead."""
+    assigned once in the whole kernel, an integer or float literal or the
+    ``static_cast(int, ...)`` of an integer one that int's 32 bits hold (a
+    scalar the host fixed, such as a module-level int, reaches an index as
+    ``v = static_cast(int, symnode)``; a chain of casts resolves one link per
+    pass).  A name assigned anywhere else too (``mpp_matmul.assigned_names``)
+    is not one, whatever the control flow; a run's own statements are folded
+    per element instead."""
     counts: collections.Counter[str] = collections.Counter()
     literals: dict[str, int | float] = {}
+    casts: dict[str, ast.expr] = {}
     stack: list[ast.AST] = list(body)
     while stack:
         node = stack.pop()
@@ -500,11 +504,37 @@ def kernel_constants(body: list[ast.stmt]) -> dict[str, int | float]:
             isinstance(node, ast.Assign)
             and len(node.targets) == 1
             and isinstance(node.targets[0], ast.Name)
-            and isinstance(node.value, ast.Constant)
-            and isinstance(node.value.value, (int, float))
-            and not isinstance(node.value.value, bool)
         ):
-            literals[node.targets[0].id] = node.value.value
+            name, value = node.targets[0].id, node.value
+            if (
+                isinstance(value, ast.Constant)
+                and isinstance(value.value, (int, float))
+                and not isinstance(value.value, bool)
+            ):
+                literals[name] = value.value
+            elif (
+                isinstance(value, ast.Call)
+                and call_name(value) == "static_cast"
+                and len(value.args) == 2
+                and isinstance(value.args[0], ast.Name)
+                and value.args[0].id == "int"
+            ):
+                casts[name] = value.args[1]
         counts.update(assigned_names(node))
         stack.extend(ast.iter_child_nodes(node))
-    return {name: v for name, v in literals.items() if counts[name] == 1}
+    constants = {name: v for name, v in literals.items() if counts[name] == 1}
+
+    def cast_of(arg: ast.expr) -> object:
+        if isinstance(arg, ast.Constant):
+            return arg.value
+        return constants.get(arg.id) if isinstance(arg, ast.Name) else None
+
+    pending = {name: arg for name, arg in casts.items() if counts[name] == 1}
+    while resolved := {
+        name: const
+        for name, arg in pending.items()
+        if type(const := cast_of(arg)) is int and -(2**31) <= const < 2**31
+    }:
+        constants |= resolved
+        pending = {name: arg for name, arg in pending.items() if name not in resolved}
+    return constants

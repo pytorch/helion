@@ -109,6 +109,31 @@ def dequant_rows(x: torch.Tensor, wq: torch.Tensor, s: torch.Tensor) -> torch.Te
     return out
 
 
+_WORD = 8
+_GROUP = 32
+
+
+@helion.kernel(**S)
+def dequant_rows_named(
+    x: torch.Tensor, wq: torch.Tensor, s: torch.Tensor
+) -> torch.Tensor:
+    """dequant_rows with its word and group sizes as module-level ints."""
+    m = x.size(0)
+    k = hl.specialize(x.size(1))
+    n = hl.specialize(wq.size(0))
+    hl.specialize(x.stride())
+    out = torch.empty([m, n], dtype=F32, device=x.device)
+    for tile_m, tile_n in hl.tile([m, n]):
+        acc = hl.zeros([tile_m, tile_n], dtype=F32)
+        for tile_k in hl.tile(k):
+            words = wq[tile_n, tile_k.index // _WORD]
+            nib = (words >> ((tile_k.index % _WORD) * 4)[None, :]) & 0xF
+            w = (nib.to(F32) - 8.0) * s[tile_n, tile_k.index // _GROUP]
+            acc = torch.addmm(acc, x[tile_m, tile_k], w.T.to(x.dtype))
+        out[tile_m, tile_n] = acc
+    return out
+
+
 @helion.kernel(**S)
 def transposed_views(x: torch.Tensor, yt: torch.Tensor) -> torch.Tensor:
     """hl.dot of views of x and of yt's transpose (no unit stride along N)."""
@@ -361,6 +386,20 @@ class TestFragmentMma(unittest.TestCase):
         )
         self._close(out, ref[:4])
         self.assertRegex(msl, r"\? \(offset_\d+ \+ _e_m\) : offset_\d+\)")
+
+    def test_named_sizes_fold_like_literals(self) -> None:
+        """Module-level int sizes reach the run as constants cast to int
+        (``kernel_constants``), so its index arithmetic folds as with the
+        sizes written in: the same divisions and remainders are left."""
+        args, ref = _quantized("int4", 8, 64, 256)
+        config = fragment_config([16, 16, 64], [1, 1, 512])
+        literal = helion.kernel(dequant_rows.fn, **S)
+        _, literal_msl = _run(literal, args, config)
+        out, msl = _run(dequant_rows_named, args, config)
+        self._close(out, ref)
+        self._assert_fragments(msl, transposed=True)
+        for helper in ("c10::metal::floor_divide", "c10::metal::remainder"):
+            self.assertEqual(msl.count(helper), literal_msl.count(helper), helper)
 
     def test_nvfp4(self) -> None:
         """nvfp4 codes through half bits and a bitcast (view(dtype)), E4M3
