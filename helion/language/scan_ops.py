@@ -113,7 +113,7 @@ def _(
     is_tuple = isinstance(input_tensor, (tuple, list))
     leaves = tuple(input_tensor) if is_tuple else (input_tensor,)
     combine = create_combine_function_wrapper(
-        combine_fn, is_tuple_input=is_tuple, target_format="tuple"
+        combine_fn, input_tensor, target_format="tuple"
     )
 
     scan_dim = dim % leaves[0].ndim
@@ -171,7 +171,7 @@ def _(
     # Extract the function name before wrapping
     original_function_name = extract_helper_function_name(combine_fn)
     combine_fn = create_combine_function_wrapper(
-        combine_fn, is_tuple_input=is_tuple_input, target_format="unpacked"
+        combine_fn, input_tensor, target_format="unpacked"
     )
 
     # Fake inputs in the unpacked format the wrapper takes: every left
