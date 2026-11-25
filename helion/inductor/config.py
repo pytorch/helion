@@ -14,6 +14,8 @@ from typing import Literal
 
 from torch.utils._config_module import install_config_module
 
+from .._compiler.backend_registry import get_backend
+from .._compiler.backend_registry import list_backends
 from ..runtime.settings import _env_get_literal
 from ..runtime.settings import _get_backend
 
@@ -55,8 +57,12 @@ def _source_files() -> list[pathlib.Path]:
 
 
 def _hash_sources() -> str:
-    files = _source_files()
-    return hashlib.sha256(b"".join(path.read_bytes() for path in files)).hexdigest()
+    """The modules of helion.inductor and every registered backend's matmul
+    rules (Backend.inductor_rules_key())."""
+    digest = hashlib.sha256(b"".join(path.read_bytes() for path in _source_files()))
+    for name in sorted(list_backends()):
+        digest.update(get_backend(name).inductor_rules_key().encode())
+    return digest.hexdigest()
 
 
 # The cache key includes private entries too: a graph whose output code another

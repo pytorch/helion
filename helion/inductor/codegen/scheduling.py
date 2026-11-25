@@ -30,6 +30,7 @@ from ..._compiler._inductor.template_buffer import HelionTemplateBuffer
 from ..._compiler.backend_registry import get_backend
 from .. import config as helion_config
 from ..choices import HelionChoices
+from ..support import dot_rows_on_x
 from ..support import mix_order_split
 from ..support import numerics_modes
 from ..support import python_wrapper
@@ -327,7 +328,12 @@ class HelionScheduling(SIMDScheduling):
         3, 1).contiguous() and y * 2, a pair natural_tiling() tiles [8, 1024,
         64], were two kernels, and y * 2 read y again. natural_tiling() cuts a
         fused kernel's space wherever any of its nodes' accesses need it, so
-        the pair's tiling serves both nodes."""
+        the pair's tiling serves both nodes. Two native matmuls whose rows lie
+        on different loop vars (a transposed product beside a plain one) never
+        fuse: a kernel tiles its dots' rows on one axis
+        (HelionKernel.dot_axes())."""
+        if len(dot_rows_on_x(node1) | dot_rows_on_x(node2)) > 1:
+            return False
         with config.patch({"triton.tiling_prevents_pointwise_fusion": False}):
             return super().can_fuse(node1, node2)
 

@@ -238,10 +238,18 @@ def my_kernel(x: torch.Tensor) -> torch.Tensor:
      on the CuTe backend ``tcgen05_split_k`` and the split-K workspace schedule
      (``cute_split_k_workspace`` over a plain GEMM store).
 
-   Warps of one CTA sharing a K loop (their partials summed in fp32 inside the CTA), and a
-   kernel that splits K itself (``hl.atomic_add`` of partial products), keep their
-   reductions.
-   Controlled by ``HELION_SPLIT_K_REDUCTION=accumulator|output|none``.
+   ``torch.compile`` with ``cuda_backend="helion"`` sets it on every generated kernel with a
+   dot of 16-bit operands from ``torch.backends.cuda.matmul``'s reduced-precision flags for
+   that dtype (``allow_bf16_reduced_precision_reduction`` and
+   ``allow_bf16_reduced_precision_reduction_split_k``, or the ``fp16`` pair), as cuBLASLt
+   reads them for the operand type: both ``True`` gives ``"output"``, a ``False``
+   reduced-precision flag gives ``"accumulator"``, and a ``False`` split-K flag gives
+   ``"none"``. Warps of one CTA sharing a K loop (their partials summed in fp32 inside the
+   CTA, as cuBLASLt's no-split-K scheme still slices K inside a threadblock), and a kernel
+   that splits K itself (``hl.atomic_add`` of partial products), keep their reductions.
+   Controlled by ``HELION_SPLIT_K_REDUCTION=accumulator|output|none``, except in the kernels
+   ``torch.compile`` generates with a 16-bit dot, where the value from torch's flags takes
+   precedence.
 
 .. autoattribute:: Settings.cute_flash_env_overrides
 

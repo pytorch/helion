@@ -131,6 +131,8 @@ if TYPE_CHECKING:
     from ..helper_function import CodegenInterface
     from ..host_function import HostFunction
     from ..inductor_lowering import CodegenState
+    from ..inductor_matmul import MatmulFacts
+    from ..inductor_matmul import MatmulPlan
     from ..program_id import ProgramIDs
     from ..reduction_strategy import ReductionEmitter
     from ..reduction_strategy import ReductionStrategy
@@ -3497,6 +3499,16 @@ class CuteBackend(Backend):
                 # output tile (the split index is ``block_idx % divisor``).
                 return f"{index_dtype}(cute.arch.block_idx()[0] // {divisor})"
         return f"{index_dtype}(cute.arch.block_idx()[{dim}])"
+
+    def inductor_matmul_plan(self, facts: MatmulFacts) -> MatmulPlan:
+        from .inductor_plan import matmul_plan
+
+        return matmul_plan(facts)
+
+    def inductor_rules_key(self) -> str:
+        from .inductor_plan import rules_key
+
+        return rules_key()
 
     def inductor_op_overrides(self) -> InductorOpOverrides:
         from torch._inductor.codegen.cutedsl.cutedsl_op_overrides import CuteDSLArg
