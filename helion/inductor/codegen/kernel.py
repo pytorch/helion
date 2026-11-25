@@ -1294,7 +1294,15 @@ class HelionKernel(SIMDKernel[CSEVariable]):
         size = buffer.get_layout().storage_size()
         operand = self.view(buffer, [size], [sympy.S.One], sympy.S.Zero)
         arg = self.tensor_arg(operand, output=output)
-        return arg, [self.index_tensor_expr(index, axes)], self.value_shape(axes)
+        return (
+            arg,
+            [
+                self.index_tensor_expr(
+                    index, axes, vector=16 // buffer.get_dtype().itemsize
+                )
+            ],
+            self.value_shape(axes),
+        )
 
     def disable_reduction(self) -> contextlib.AbstractContextManager[None]:
         outside = super().disable_reduction()
@@ -2001,7 +2009,57 @@ class HelionKernel(SIMDKernel[CSEVariable]):
                     extents[axis] = bound
         return extents
 
-    def index_tensor_expr(self, index: sympy.Expr, axes: Sequence[str]) -> str:
+    def flat_lane(
+        self, index: sympy.Expr, scope: Sequence[str], vector: int
+    ) -> tuple[sympy.Symbol, sympy.Expr] | None:
+        """(lane, rest): the index of the innermost tile of `scope` (not a
+        persistent rdim's arange) that the flat `index` adds once, and the
+        sum of its other terms, when that rest holds no other term of the
+        lane's symbol and is a multiple of `vector` elements; None if no
+        tile is. Where the innermost tile is no bare term of the index
+        (scaled, 16*x + y + ..., or absent), the next tile out that the index
+        adds once is the lane. A value in the rest is not looked into: one
+        read along the lane's tile itself (x + 160*tmp0, tmp0 of [tile_y,
+        tile_x]) is CuTe's to decline. The CuTe backend reads a flat index of
+        the form rest + tile.index, with a rest of whole vectors, as vectors of
+        consecutive elements along that tile (cute/flat_gather_lane.py), and
+        matches the last add only.
+        Started with the lane, the flat gather of the H/W-swapped
+        channels-last operand of better-benchmark's sum_9683f50f2dcf,
+
+            in1[tile_x.index + 160*(tile_r.index.reshape([tile_r, 1]) // 28)
+                + 1120*tile_y.index.reshape([tile_y, 1, 1]) + ...]
+
+        loads one bf16 per lane, where its other operand, in0[tile_z,
+        tile_y, tile_r, tile_x], loads 16 bytes. A rest that is not whole
+        vectors, the -4 + 364*y of a cat's part, keeps the printer's order."""
+        if not isinstance(index, sympy.Add):
+            return None
+        for axis in reversed(scope):
+            if axis == "r0_" and self.persistent_reduction:
+                continue
+            lane = cast("sympy.Symbol", self.symbols[axis])
+            if lane not in index.args:
+                continue
+            rest = sympy.Add(*(term for term in index.args if term != lane))
+            if lane in rest.free_symbols:
+                return None
+            coefficients = rest.as_coefficients_dict().values()
+            if all(
+                isinstance(c, sympy.Integer) and c % vector == 0 for c in coefficients
+            ):
+                return lane, rest
+            return None
+        return None
+
+    def index_tensor_expr(
+        self, index: sympy.Expr, axes: Sequence[str], *, vector: int | None = None
+    ) -> str:
+        """`index` as a tensor expression over the tiles of `axes`. For a flat
+        subscript of elements `vector` to 16 bytes, flat_lane()'s tile is
+        added last: in1[(160*(tile_r.index.reshape([tile_r, 1]) // 28) + ...)
+        + tile_x.index], where the printer's order would start the sum with
+        it, in1[tile_x.index + 160*(...) + ...]."""
         indirect = self.indirect_vars(index)
         values = OrderedSet(indirect)
         symbols = OrderedSet(self.symbols[axis] for axis in axes)
@@ -2025,6 +2083,32 @@ class HelionKernel(SIMDKernel[CSEVariable]):
         ]
         widen = any(not (b.lower >= -(2**31) and b.upper < 2**31) for b in bounds)
         widen |= any(not tile_axes(var.shape) for var in indirect.values())
+        # Int32 terms add modulo 2**32, so a partial sum that wraps is undone
+        # by the terms after it, unless an int64 value's term joins in
+        # between: x - 2**31 - 8*((y + 1) // 2) + 16*tmp0 + 64*((y + 4) // 3)
+        # fits int32, yet -2**31 - 8 wraps before 16*tmp0 promotes it. Widen
+        # where a sum that holds a value, at any depth (a ModularIndexing's
+        # dividend too), has terms without one some partial sum of which, in
+        # some order, could leave int32 (their negative lower bounds summing
+        # below -2**31, or their positive upper bounds to 2**31 or more): then
+        # no order wraps, the printer's nor flat_lane()'s, which sums the terms
+        # other than the lane before the lane joins.
+        if values and not widen:
+            for add in sympy.preorder_traversal(index):
+                if not isinstance(add, sympy.Add) or not add.free_symbols & values:
+                    continue
+                term_bounds = [
+                    bound_sympy(term, ranges)
+                    for term in add.args
+                    if not term.free_symbols & values
+                ]
+                if not (
+                    sum(min(bound.lower, 0) for bound in term_bounds) >= -(2**31)
+                    and sum(max(bound.upper, 0) for bound in term_bounds) < 2**31
+                ):
+                    widen = True
+                    break
+        lane = self.flat_lane(index, scope, vector) if vector else None
         suffix = ".to(torch.int64)" if widen else ""
         replacements = {
             self.symbols[axis]: sympy.Symbol(self.index_tensor(axis, scope) + suffix)
@@ -2040,7 +2124,12 @@ class HelionKernel(SIMDKernel[CSEVariable]):
         shape = self.value_shape(scope)
         for symbol, var in indirect.items():
             replacements[symbol] = sympy.Symbol(self.align(var, shape))
-        expr = HelionPrinter().doprint(index.xreplace(replacements), simplify=False)
+        printer = HelionPrinter()
+        if lane is not None:
+            offset = printer.doprint(lane[1].xreplace(replacements), simplify=False)
+            expr = f"({offset}) + {printer.doprint(lane[0].xreplace(replacements))}"
+        else:
+            expr = printer.doprint(index.xreplace(replacements), simplify=False)
         # Broadcast to the tiles of `axes` the index skips, e.g. those of a store's
         # value or a load's mask: (tile_x.index // 2).expand(tile_y, tile_x), or
         # hl.full([tile_x], 0, dtype=torch.int32) for the index 0.
