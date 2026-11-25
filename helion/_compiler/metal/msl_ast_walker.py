@@ -27,6 +27,7 @@ from collections import Counter
 import contextlib
 import copy
 import dataclasses
+import functools
 from typing import TYPE_CHECKING
 from typing import Iterator
 
@@ -147,6 +148,9 @@ class EmitState:
     #: them, and each op's operand's elements in terms of them.
     lane_names: dict[tuple[int, ...], str] = dataclasses.field(default_factory=dict)
     lane_decls: list[str] = dataclasses.field(default_factory=list)
+    #: The buffers the body views as MPP device tensors (``_coop_view``),
+    #: whose views take a ``device`` pointer.
+    device_views: set[str] = dataclasses.field(default_factory=set)
     lane_facts: dict[str, Fact] = dataclasses.field(default_factory=dict)
     lanes: dict[tuple[Atom, str, bool], CoopLanes] = dataclasses.field(
         default_factory=dict
@@ -498,6 +502,8 @@ def _coop_view(
     k_dim: int | None = None,
     k_shift: str = "0",
     k_tail: bool = True,
+    *,
+    views: set[str],
 ) -> tuple[list[str], list[str], str]:
     """A device view of one tile, from ``tensor, (origin, extent, size,
     stride)`` per dim, and ``(index, size, stride)`` per outer dim, each
@@ -505,7 +511,8 @@ def _coop_view(
     size``.
 
     Returns the 64-bit declarations, the terms that test the view is live,
-    and the handle.  MPP tensor handles index in int32, so the view's origin
+    and the handle.  The buffer it views joins ``views``
+    (``EmitState.device_views``).  MPP tensor handles index in int32, so the view's origin
     is folded into the base pointer in 64 bits and the handle's extents are
     each dim's live length from there, capped at the tile: ``min(e - o, B)``,
     in ``[1, B]`` once the live test passed.  MPP reads rows ``[0, B)`` of the
@@ -523,6 +530,11 @@ def _coop_view(
     extent isn't live; with no K tail (``k_tail`` false) every step is.
     """
     ptr = _ast_expr_to_msl(args[0])
+    root = args[0]
+    while isinstance(root, ast.BinOp):
+        root = root.left
+    if isinstance(root, ast.Name):
+        views.add(root.id)
     decls: list[str] = []
     live: list[str] = []
     origins: list[str] = []
@@ -634,7 +646,11 @@ def _emit_coop_run(
             tile = (tile_dims[2 * i], tile_dims[2 * i + 1])
             outer = outers.elts[i]
             assert isinstance(outer, ast.List)
-            handles.append(_coop_view(args, dtype, var, tile, dims, outer.elts))
+            handles.append(
+                _coop_view(
+                    args, dtype, var, tile, dims, outer.elts, views=state.device_views
+                )
+            )
     (a_decls, a_live, a_handle), (b_decls, b_live, b_handle) = handles
     inner = pad + "    "
     body = [a_handle, b_handle, f"_mpp_op_{gid}.run(_mpp_a, _mpp_b, {src.id});"]
@@ -704,7 +720,7 @@ def _emit_for(
             indent,
             state,
             lambda body, out, ind, st: _emit_stmts(body, out, indent=ind, state=st),
-            _coop_view,
+            functools.partial(_coop_view, views=state.device_views),
         )
         return
 
