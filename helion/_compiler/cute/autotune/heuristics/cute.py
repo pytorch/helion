@@ -4963,6 +4963,62 @@ class _CuteColumnSeedHeuristic(AutotunerHeuristic):
     SEED_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
 
     @classmethod
+    def _shape_seeds(
+        cls,
+        spec: ConfigSpec,
+        plan: tuple[int, int, torch.Tensor],
+        shapes: tuple[tuple[int, int | None, int | None], ...],
+    ) -> list[Config]:
+        """A seed of ``plan``'s column and reduced tiles for each shape
+        ``(column threads, row threads, rows per chunk)`` the tiles'
+        fragments hold, every other block one split: the column tile that
+        many packets wide, the whole loop's rows per chunk for None rows,
+        and ``_column_row_threads`` row threads for None threads."""
+        column_block_id, reduced_block_id, source = plan
+        vec = _cute_tile_seed_vec_width_for_dtype(source.dtype)
+        block_specs = {item.block_id: item for item in spec.block_sizes}
+        column_fragment = block_specs[column_block_id]._fragment(spec)
+        reduced_fragment = block_specs[reduced_block_id]._fragment(spec)
+        column_extent = next_power_of_2(max(1, block_specs[column_block_id].size_hint))
+        whole = next_power_of_2(max(1, block_specs[reduced_block_id].size_hint))
+        splits = {
+            item.block_id: 1
+            for item in spec.block_sizes
+            if item.block_id not in (column_block_id, reduced_block_id)
+        }
+        seeds: list[Config] = []
+        for column_threads, fixed_threads, chunk_rows in shapes:
+            columns = column_threads * vec
+            rows = min(chunk_rows or whole, whole, reduced_fragment.high)
+            row_threads = (
+                _column_row_threads(128, rows)
+                if fixed_threads is None
+                else fixed_threads
+            )
+            if not (
+                columns <= column_extent
+                and column_fragment.low <= columns <= column_fragment.high
+                and reduced_fragment.low <= rows
+                and rows >= row_threads
+            ):
+                continue
+            seeds.append(
+                cls._seed(
+                    spec,
+                    column_block_id,
+                    reduced_block_id,
+                    vec,
+                    {**splits, column_block_id: columns, reduced_block_id: rows},
+                    {
+                        **splits,
+                        column_block_id: column_threads,
+                        reduced_block_id: row_threads,
+                    },
+                )
+            )
+        return seeds
+
+    @classmethod
     def _match(
         cls, env: CompileEnvironment, device_ir: DeviceIR
     ) -> tuple[int, int, torch.Tensor] | None:
@@ -5326,41 +5382,9 @@ class CuteSplitColumnReductionHeuristic(_CuteColumnSeedHeuristic):
         # rows each on the second (65 us).  ``None`` is that whole split per
         # chunk, its 128 row threads halved (``_column_row_threads``) for the
         # rows the chunk gets once clamped.
-        shapes: tuple[tuple[int, int | None, int | None], ...] = (
-            (2, 16, 128),
-            (4, None, None),
-            (4, 8, 128),
+        seeds = cls._shape_seeds(
+            spec, plan, ((2, 16, 128), (4, None, None), (4, 8, 128))
         )
-        seeds: list[Config] = []
-        for column_threads, fixed_threads, chunk_rows in shapes:
-            columns = column_threads * vec
-            rows = min(chunk_rows or whole, whole, reduced_fragment.high)
-            row_threads = (
-                _column_row_threads(128, rows)
-                if fixed_threads is None
-                else fixed_threads
-            )
-            if not (
-                columns <= column_extent
-                and column_fragment.low <= columns <= column_fragment.high
-                and reduced_fragment.low <= rows
-                and rows >= row_threads
-            ):
-                continue
-            seeds.append(
-                cls._seed(
-                    spec,
-                    column_block_id,
-                    reduced_block_id,
-                    vec,
-                    {**splits, column_block_id: columns, reduced_block_id: rows},
-                    {
-                        **splits,
-                        column_block_id: column_threads,
-                        reduced_block_id: row_threads,
-                    },
-                )
-            )
         # Two splits per thread: the split axis the loop nest tiles last
         # (Inductor's split of the rows, beside the column tile) at a block
         # of 2 held as a vector of two, so that each thread walks two
@@ -5418,6 +5442,169 @@ class CuteSplitColumnReductionHeuristic(_CuteColumnSeedHeuristic):
                     )
                 )
         return dedupe_configs(seeds)
+
+
+class CuteGatheredSplitColumnHeuristic(_CuteColumnSeedHeuristic):
+    """Seed a split column reduction whose loop reads its columns through a
+    flat gather contiguous along the column tile (cute/flat_gather_lane.py),
+    which ``cute_vloop_sink`` loads in 16-byte packets as it does a tile: the
+    first kernel of a split sum that helion.inductor reindexes a copy onto,
+    storing every element it gathers. The heads merge of an attention output
+    beside its sum over the rows (better-benchmark's sum_2f4a2365eba8 and
+    sum_76fb9946e296, kernel 0 of [256, 512, 64] bf16)::
+
+        for tile_z, tile_y, tile_x in hl.tile([256, 4, 64]):
+            acc = hl.zeros([tile_z, tile_y, tile_x], dtype=torch.float32)
+            for tile_r in hl.tile(128):
+                tmp0 = in0[
+                    (
+                        64
+                        * (
+                            (
+                                tile_r.index.reshape([tile_r, 1])
+                                + 128 * tile_z.index.reshape([tile_z, 1, 1, 1])
+                            )
+                            % 512
+                        )
+                        + 32768 * tile_y.index.reshape([tile_y, 1, 1])
+                        + 131072 * (tile_z.index.reshape([tile_z, 1, 1, 1]) // 4)
+                    )
+                    + tile_x.index
+                ].to(torch.float32)
+                tmp2 = tmp0 * tmp1
+                out0[tile_z, tile_y, tile_r, tile_x] = tmp2.to(torch.bfloat16)
+                acc = acc + torch.sum(tmp2, -2)
+            out1[tile_z, tile_y, tile_x] = acc
+
+    ``CuteSplitColumnReductionHeuristic`` takes tile loads only, and without
+    a seed the search is a draw: on GB300 its cold searches of the
+    2f4a2365eba8 kernel above ended at 5.3-6.9 us six times in eight and at
+    8.0 and 11.1 us the other two, those of the 76fb9946e296 one at 6.3-8.3
+    us and at 9.7 and 12.6, all on scalar lanes (the search floors the split
+    axis at 4 splits per CTA, ``raise_grid_block_minimums``). Seed one split
+    per CTA, the column tile as 8 threads of 16-byte packets (64 bf16
+    columns), ``ROW_THREADS`` row threads with a strided lane layout over
+    the split's rows (up to ``ROWS`` per chunk), sinking on and the row lane
+    loop unrolled 8 deep, as the column seeds do. Measured on GB300 (trace
+    timer, kernel alone): 6.34 us for the 2f4a2365eba8 kernel and 6.46 for
+    the 76fb9946e296 one, against 7.50 and 8.13 for their best past search
+    configs; the split column heuristic's shapes, 2 or 4 column threads,
+    read 7.3-8.6 us there and up to 17.3 on the other two kernels of the
+    family (sum_2f4a2365eba8_a3cab238: 10.6 us, sum_76fb9946e296_c6b0f684:
+    8.7).
+    """
+
+    name = "cute_gathered_split_column"
+    # After the others (a seed only).
+    priority = 105
+    COLUMN_THREADS = 8
+    ROW_THREADS = 16
+    ROWS = 128
+
+    @classmethod
+    def _match(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> tuple[int, int, torch.Tensor] | None:
+        """``(column_block_id, reduced_block_id, source)`` when the kernel's
+        single grid loop tiles two or more axes, its single device loop
+        reduces the rows of tiles that span every grid axis, no load of it
+        is the split column heuristic's, and it loads the 16/32-bit
+        ``source`` through one gathered index ``row + tile.index`` of a grid
+        tile, the column, on a stride-1 dim."""
+        if CuteSplitColumnReductionHeuristic._match(env, device_ir) is not None:
+            return None
+        nest = _device_loop_reduction(env, device_ir)
+        if nest is None or len(nest[0]) < 2:
+            return None
+        grid_blocks, reduced_block_id, calls = nest
+        if not cls._lane_knobs(env.config_spec, (*grid_blocks, reduced_block_id)):
+            return None
+        grid_symbols = {
+            _symint_sympy_expr(env.block_sizes[block_id].var)
+            for block_id in grid_blocks
+        }
+        reduced_symbol = _symint_sympy_expr(env.block_sizes[reduced_block_id].var)
+        match: tuple[int, int, torch.Tensor] | None = None
+        reduces_rows = False
+        for node in calls:
+            if node.target is language_load:
+                tensor, subscript = _load_operands(node)
+                if (
+                    match is not None
+                    or tensor is None
+                    or tensor.dtype not in cls.SEED_DTYPES
+                    or not isinstance(subscript, (list, tuple))
+                    or len(subscript) != tensor.ndim
+                ):
+                    continue
+                gathers = [
+                    (dim, index)
+                    for dim, index in enumerate(subscript)
+                    if isinstance(index, Node)
+                    and isinstance(index.meta.get("val"), torch.Tensor)
+                ]
+                if len(gathers) != 1:
+                    continue
+                ((dim, index),) = gathers
+                stride = tensor.stride(dim)
+                if not (isinstance(stride, int) and stride == 1):
+                    continue
+                split = flat_gather_lane.match_flat_gather_lane(index, env)
+                if (
+                    split is not None
+                    and split.lane_block_id in grid_blocks
+                    and split.lane_block_id
+                    not in device_ir.noncanonical_task_origin_block_ids
+                ):
+                    match = (split.lane_block_id, reduced_block_id, tensor)
+                continue
+            sizes = _reduced_sizes(node, reduced_symbol)
+            if (
+                sizes is not None
+                and len(sizes) == len(grid_blocks) + 1
+                and set(sizes) - {reduced_symbol} == grid_symbols
+            ):
+                reduces_rows = True
+        return match if reduces_rows else None
+
+    @classmethod
+    def _plan(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> tuple[int, int, torch.Tensor] | None:
+        """The match when sinking can load the gather in packets of the
+        seed's width for this binding (``flat_gather_sink_vec_width``: rows of
+        whole packets, an aligned base, the same width for every gather of the
+        loop) and the column tile's extent is a multiple of the packet: an
+        unsunk V-loop wraps the whole body and repeats its serial work per
+        lane."""
+        match = cls._match(env, device_ir)
+        if match is None:
+            return None
+        column_block_id, reduced_block_id, source = match
+        vec = _cute_tile_seed_vec_width_for_dtype(source.dtype)
+        sunk = flat_gather_lane.flat_gather_sink_vec_width(
+            env, device_ir, {column_block_id}, {reduced_block_id}
+        )
+        # The sink proves one packet width for every gather of the loop (16
+        # bytes of the widest dtype): a seed of other packets would not sink.
+        if sunk != vec or not env.specialized_multiple(
+            env.block_sizes[column_block_id].numel, vec
+        ):
+            return None
+        return match
+
+    @classmethod
+    def get_seed_configs(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> list[Config]:
+        plan = cls._plan(env, device_ir)
+        if plan is None:
+            return []
+        return cls._shape_seeds(
+            env.config_spec,
+            plan,
+            ((cls.COLUMN_THREADS, cls.ROW_THREADS, cls.ROWS),),
+        )
 
 
 class CuteDelinearizedRowReductionHeuristic(AutotunerHeuristic):

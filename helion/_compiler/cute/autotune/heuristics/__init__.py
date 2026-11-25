@@ -116,6 +116,7 @@ from .cute import CuteFixedTokenRank1Heuristic
 from .cute import CuteFlashAttentionHeuristic
 from .cute import CuteFlashGatedAttentionHeuristic
 from .cute import CuteFp8GemmSkinnyMHeuristic
+from .cute import CuteGatheredSplitColumnHeuristic
 from .cute import CuteGdnRecurrenceHeuristic
 from .cute import CuteGridLaneJamHeuristic
 from .cute import CuteMaskedRolledClusterHeuristic
@@ -286,6 +287,7 @@ _CUTE_HEURISTIC_CLASSES: tuple[AutotunerHeuristicType, ...] = (
     CuteGemvRingMmaHeuristic,
     CuteColumnReductionHeuristic,
     CuteSplitColumnReductionHeuristic,
+    CuteGatheredSplitColumnHeuristic,
     CuteDelinearizedRowReductionHeuristic,
     CuteTransposedColumnReductionHeuristic,
     CuteSiblingRowHeuristic,
