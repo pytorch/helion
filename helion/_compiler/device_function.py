@@ -54,6 +54,8 @@ from .variable_origin import TileBeginOrigin
 from .variable_origin import TileExtentOrigin
 
 if TYPE_CHECKING:
+    from collections.abc import Mapping
+
     from ..runtime.config import Config
     from ..runtime.config import IndexingLiteral
     from .cross_loop_codegen import PeerState
@@ -421,9 +423,7 @@ class DeviceFunction:
         self.preamble: list[ast.AST] = []
         self.body: list[ast.AST] = []
         self._tensor_args: dict[torch.Tensor, TensorArg] = {}
-        self._tensor_descriptor_args: dict[
-            tuple[torch.Tensor, str, bool | None], TensorDescriptorArg
-        ] = {}
+        self._tensor_descriptor_args: dict[tuple[object, ...], TensorDescriptorArg] = {}
         self.prefetch_map_args: dict[tuple[torch.Tensor, tuple[int, ...]], str] = {}
         self._expr_args: dict[sympy.Expr, NumericArgument] = {}
         self._constexpr_exprs: set[sympy.Expr] = set()
@@ -1200,6 +1200,7 @@ class DeviceFunction:
         block_size: list[int | torch.SymInt],
         *,
         ring_swizzle: bool | None = None,
+        dynamic_bounds: Mapping[int, ast.AST] | None = None,
     ) -> TensorDescriptorArg:
         """``ring_swizzle`` set: a Gluon host descriptor filling the ring's
         slots (``gluon_ring.ring_descriptor``), swizzled unless it holds scales."""
@@ -1209,7 +1210,23 @@ class DeviceFunction:
         # unswizzled scale slot keeps its own).
         gluon = CompileEnvironment.current().backend_name == "gluon"
         swizzle = True if gluon and ring_swizzle is None else ring_swizzle
-        key = (fake_value, block_size_expr, swizzle)
+        target_stmts = self.preamble
+        key: tuple[object, ...] = (fake_value, block_size_expr, swizzle)
+        if dynamic_bounds:
+            assert not CompileEnvironment.current().backend.host_tensor_descriptors(
+                self.config
+            )
+            target_stmts = (
+                self.codegen.statements_stack[-1]
+                if self.codegen.statements_stack
+                else self.preamble
+            )
+            bounds_key = tuple(
+                (dim, ast.dump(bound_ast))
+                for dim, bound_ast in sorted(dynamic_bounds.items())
+            )
+            key = (fake_value, block_size_expr, swizzle, id(target_stmts), bounds_key)
+
         if key not in self._tensor_descriptor_args:
             origin = host_function.tensor_to_origin[fake_value]
             desc_name = self.new_var(
@@ -1281,24 +1298,32 @@ class DeviceFunction:
                 # Create the regular tensor arg and size/stride args used by
                 # tl.make_tensor_descriptor in each device program.
                 tensor_arg = self.tensor_arg(fake_value)
-                size_args = [
-                    self.tensor_size(fake_value, i) for i in range(fake_value.ndim)
-                ]
+                shape_names: list[str] = []
+                for dim in descriptor_dims:
+                    size_name = self.tensor_size(fake_value, dim).name
+                    if dynamic_bounds and dim in dynamic_bounds:
+                        bound_var = self.new_var("desc_bound")
+                        target_stmts.append(
+                            statement_from_string(
+                                f"{bound_var} = tl.cast(tl.minimum(tl.cast({{val}}, tl.int32), {size_name}), tl.int32)",
+                                val=dynamic_bounds[dim],
+                            )
+                        )
+                        shape_names.append(bound_var)
+                    else:
+                        shape_names.append(size_name)
                 stride_args = [
-                    self.tensor_stride(fake_value, i) for i in range(fake_value.ndim)
+                    self.tensor_stride(fake_value, dim) for dim in descriptor_dims
                 ]
-                if permutation is not None:
-                    size_args = [size_args[i] for i in permutation]
-                    stride_args = [stride_args[i] for i in permutation]
                 # The descriptor permutation above makes the last descriptor
                 # dimension the proven stride-one dimension. Triton checks this
                 # predicate at JIT time, so emit it as a literal even when other
                 # dynamic strides are runtime scalars.
                 stride_args[-1] = StaticShape(1)
-                sizes = ", ".join(arg.name for arg in size_args)
+                sizes = ", ".join(shape_names)
                 strides = ", ".join(arg.name for arg in stride_args)
                 tensor_descriptor_fn_name = get_tensor_descriptor_fn_name()
-                self.preamble.append(
+                target_stmts.append(
                     statement_from_string(
                         f"{desc_name} = {tensor_descriptor_fn_name}({tensor_arg.name}, [{sizes}], [{strides}], [{block_size_expr}])"
                     )
@@ -2123,6 +2148,10 @@ class DeviceFunction:
 
     def __exit__(self, *args: object) -> None:
         tls.functions.pop()
+
+    @staticmethod
+    def has_current() -> bool:
+        return bool(getattr(tls, "functions", None))
 
     @staticmethod
     def current() -> DeviceFunction:

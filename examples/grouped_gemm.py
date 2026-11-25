@@ -142,8 +142,8 @@ def grouped_gemm_jagged_persistent(
     num_workers = helion.runtime.get_num_sm(A_packed.device)
 
     # Define tunable block sizes for M, N dimensions (auto-tuned at runtime)
-    BLOCK_M = hl.register_block_size(32, 128)
-    BLOCK_N = hl.register_block_size(32, 128)
+    BLOCK_M = hl.register_block_size(32, 256)
+    BLOCK_N = hl.register_block_size(32, 256)
     total_M, K = A_packed.shape
     K2, N = B.shape
     assert K == K2
@@ -156,6 +156,11 @@ def grouped_gemm_jagged_persistent(
     )
 
     G = group_offsets.size(0) - 1
+    group_m = hl.register_tunable(
+        "group_m", helion.autotuner.PowerOfTwoFragment(1, 16, 8)
+    )
+    num_n_tiles = helion.cdiv(N, BLOCK_N)
+    num_pid_in_group = group_m * num_n_tiles
 
     for worker_id in hl.grid(num_workers):
         # Persistent thread pattern: each worker processes tiles across all groups
@@ -169,66 +174,62 @@ def grouped_gemm_jagged_persistent(
             if m_size > 0:
                 # Compute tile grid dimensions for current group
                 num_m_tiles = (m_size + BLOCK_M - 1) // BLOCK_M
-                # Calculate number of N tiles (shared across all groups)
-                num_n_tiles = (N + BLOCK_N - 1) // BLOCK_N
                 num_group_tiles = num_m_tiles * num_n_tiles
 
                 # Distribute tiles among workers using strided access pattern
-                for local_tile in hl.grid(num_group_tiles):
-                    tile_in_group = local_tile * num_workers + worker_id
-                    if tile_in_group < num_group_tiles:
-                        # Convert linear tile index to 2D (M, N) tile coordinates
-                        # pyrefly: ignore[unsupported-operation]
-                        m_tile_idx = tile_in_group % num_m_tiles
-                        # pyrefly: ignore[unsupported-operation]
-                        n_tile_idx = tile_in_group // num_m_tiles
+                for tile_in_group in hl.grid(worker_id, num_group_tiles, num_workers):  # pyrefly: ignore[no-matching-overload]
+                    # Convert linear tile index to L2-grouped 2D (M, N) tile coordinates
+                    group_id = tile_in_group // num_pid_in_group
+                    first_pid_m = group_id * group_m
+                    group_size_m = torch.clamp(num_m_tiles - first_pid_m, max=group_m)
+                    pid_in_group = tile_in_group % num_pid_in_group
+                    n_tile_idx = pid_in_group // group_size_m
+                    m_tile_idx = first_pid_m + (
+                        pid_in_group - n_tile_idx * group_size_m
+                    )
 
-                        # Compute global memory indices for current tile
-                        base_row = group_start + m_tile_idx * BLOCK_M
-                        # pyrefly: ignore[unsupported-operation]
-                        base_col = n_tile_idx * BLOCK_N
+                    # Compute global memory indices for current tile
+                    base_row = group_start + m_tile_idx * BLOCK_M
+                    base_col = n_tile_idx * BLOCK_N
 
-                        # Generate row and column index ranges for tile access
-                        row_idx = base_row + hl.arange(BLOCK_M)
-                        col_idx = base_col + hl.arange(BLOCK_N)
+                    # Generate row and column index ranges for tile access
+                    row_idx = base_row + hl.arange(BLOCK_M)
+                    col_idx = base_col + hl.arange(BLOCK_N)
 
-                        # Apply boundary masks to handle partial tiles at edges
-                        rows_valid = row_idx < group_end
-                        cols_valid = col_idx < N
+                    # Apply boundary masks to handle partial tiles at edges
+                    rows_valid = row_idx < group_end
+                    cols_valid = col_idx < N
 
-                        # Initialize FP32 accumulator for numerical precision
-                        acc = hl.zeros([BLOCK_M, BLOCK_N], dtype=torch.float32)
+                    # Initialize FP32 accumulator for numerical precision
+                    acc = hl.zeros([BLOCK_M, BLOCK_N], dtype=torch.float32)
 
-                        # Iterate over K dimension in blocks for matrix multiplication
-                        for k_tile in hl.tile(K):
-                            k_idx = k_tile.index
+                    # Iterate over K dimension in blocks for matrix multiplication
+                    for k_tile in hl.tile(K):
+                        k_idx = k_tile.index
 
-                            # Load tiles from A_packed and B with boundary checking
-                            a_blk = hl.load(
-                                A_packed,
-                                [row_idx, k_idx],
-                                extra_mask=rows_valid[  # pyrefly: ignore[bad-index]
-                                    :, None
-                                ],
-                            )
-                            b_blk = hl.load(
-                                B,
-                                [k_idx, col_idx],
-                                extra_mask=cols_valid[None, :],  # pyrefly: ignore[bad-index]
-                            )
-
-                            # Perform tile-level matrix multiplication and accumulate
-                            acc = torch.addmm(acc, a_blk, b_blk)
-
-                        # Write accumulated result to output with boundary masking
-                        # pyrefly: ignore[bad-index]
-                        valid_2d = rows_valid[:, None] & cols_valid[None, :]
-                        hl.store(
-                            out,
-                            [row_idx, col_idx],
-                            acc.to(out.dtype),
-                            extra_mask=valid_2d,
+                        # Load tiles from A_packed and B with boundary checking
+                        a_blk = hl.load(
+                            A_packed,
+                            [row_idx, k_idx],
+                            extra_mask=rows_valid[:, None],
                         )
+                        b_blk = hl.load(
+                            B,
+                            [k_idx, col_idx],
+                            extra_mask=cols_valid[None, :],
+                        )
+
+                        # Perform tile-level matrix multiplication and accumulate
+                        acc = torch.addmm(acc, a_blk, b_blk)
+
+                    # Write accumulated result to output with boundary masking
+                    valid_2d = rows_valid[:, None] & cols_valid[None, :]
+                    hl.store(
+                        out,
+                        [row_idx, col_idx],
+                        acc.to(out.dtype),
+                        extra_mask=valid_2d,
+                    )
 
     return out
 
