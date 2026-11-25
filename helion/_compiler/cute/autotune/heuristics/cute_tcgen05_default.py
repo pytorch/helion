@@ -69,6 +69,7 @@ from ...tcgen05_constants import TCGEN05_EPI_WARP_GROUPS_CONFIG_KEY
 from ...tcgen05_constants import TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY
 from ...tcgen05_constants import TCGEN05_LONG_N_SWEEP_L2_GROUPING
 from ...tcgen05_constants import TCGEN05_MANY_SMALL_BATCHES
+from ...tcgen05_constants import TCGEN05_ONE_ROW_TILE_BATCHED_BLOCK_N
 from ...tcgen05_constants import TCGEN05_SPLIT_K_CONFIG_KEY
 from ...tcgen05_constants import TCGEN05_SPLIT_K_MIN_SLICE_K_TILES
 from ...tcgen05_constants import TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY
@@ -729,7 +730,8 @@ class CuteTcgen05DefaultTileHeuristic(AutotunerHeuristic):
         whose store merges heads (``radix``: the proved layout and the
         element size): 128 rows (64 where M is not whole in them) by the
         widest of 256, 128, 64 or 32 columns dividing N, else the narrowest
-        power of two holding N up to 128 columns, else 128 (a head merge's:
+        power of two holding N up to 128 columns, else 128 (at most 64 where
+        the search caps N there: ``one_row_tile_narrow_n``; a head merge's:
         the widest tile partitioning its layout whose store boxes sit inside
         its runs, ``RadixStoreLayout.one_cta_tile``), the deepest of 64-,
         32- or 16-deep k-blocks dividing K, else 64 (32 below 64); flat with
@@ -740,9 +742,11 @@ class CuteTcgen05DefaultTileHeuristic(AutotunerHeuristic):
         The base default ran a 64x16 tile; B200, Inductor corpus, of the ATen
         GEMM (many batches of one or two tiles each): 1024 x 256x64x256
         + scale 1.09 (persistent: 1.08), 3072 x 128x64x128 1.35 (1.08),
-        3072 x 64x128x128 1.40 (1.19); eight k-blocks, 64x256 tiles:
-        384 x 64x512x512 flat 1.00 (four AB stages 0.93, two CTAs fit an SM
-        at two), persistent 1.03, 192 x 64x512x512 1.07. A head merge takes
+        3072 x 64x128x128 1.40 (1.19); eight k-blocks, 64x256 tiles over a
+        row-major A (an M-major one takes 64-wide tiles there,
+        ``search_plan.tcgen05_one_row_tile_batched_narrow_n``): 384 x
+        64x512x512 flat 1.00 (four AB stages 0.93, two CTAs fit an SM at
+        two), persistent 1.03, 192 x 64x512x512 1.07. A head merge takes
         it on small grids too, where the 128-row pairs render no radix store
         subtile; a plain narrow GEMM's small grid keeps the pairs' deep rings
         (32 x 128x64x4096: 18.8 us against 31.4 us here)."""
@@ -771,6 +775,9 @@ class CuteTcgen05DefaultTileHeuristic(AutotunerHeuristic):
                 (cols for cols in (256, 128, 64, 32) if n % cols == 0),
                 max(32, 1 << (n - 1).bit_length()) if n <= 128 else 128,
             )
+            if state.one_row_tile_narrow_n:
+                # the search's N ceiling for these products: 64-wide tiles
+                bn = min(bn, TCGEN05_ONE_ROW_TILE_BATCHED_BLOCK_N)
             tile = (bm, bn)
         if tile is None:
             return None

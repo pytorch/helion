@@ -328,9 +328,10 @@ def paired_pipeline_search_enabled(state: CuteTcgen05Config) -> bool:
         )
     m, n, k = cast("tuple[int, int, int]", extents)
     return (
-        m % 128 == 0
-        and n % 64 == 0
-        and k % 64 == 0
+        # a batch of matrices over an M edge, an N edge or a K tail, which the
+        # batched pair's TMA loads zero-fill and its 3-D TMA store clips
+        # (``search_plan.batched_pair128_matrix``)
+        (state.batched_pair128_matrix or (m % 128 == 0 and n % 64 == 0 and k % 64 == 0))
         and _tile_in_fragments(fragments, (128, 64, 64))
     )
 

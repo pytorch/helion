@@ -261,12 +261,15 @@ def test_transposed_head_merge_stages_a_column_major_tile():
 # One case per default regime: the narrow tiles on small and large grids,
 # the wider heads and transposed merge on small grids (where the 128-row pairs
 # render no radix subtile), K and M not whole in 64-deep k-blocks or 128-row
-# tiles.
+# tiles, and batches of one-pair-tile matrices, K whole or ending in a tail,
+# which the batched 128-row pair families take for plain stores.
 @pytest.mark.parametrize(
     ("kernel", "shape", "tile"),
     (
         (head_merge_bmm, {"batch": 2}, [1, 128, 64, 64]),
         (head_merge_bmm, {"batch": 64}, [1, 128, 64, 64]),
+        (head_merge_bmm, {"batch": 128, "m": 128}, [1, 128, 64, 64]),
+        (head_merge_bmm, {"batch": 128, "m": 128, "k": 80}, [1, 128, 64, 16]),
         (
             transposed_head_merge_bmm,
             {"batch": 2, "m": 64, "n": 256, "transposed": True},
@@ -284,6 +287,8 @@ def test_transposed_head_merge_stages_a_column_major_tile():
     ids=(
         "small_grid",
         "many_tiles",
+        "one_pair_tile",
+        "one_pair_tile_k80",
         "transposed",
         "wide_small_grid",
         "transposed_small_grid",
@@ -299,7 +304,9 @@ def test_batched_head_merge_defaults_store_through_the_layout(
     (``RadixStoreLayout.one_cta_tile``), at the deepest k-block dividing K,
     on small grids too (the 128-row pairs' epilogue subtile does not render
     it): before, the small-grid pair, the 64-row tile of K = 96 and of
-    M = 192 refused the store."""
+    M = 192 refused the store, and the batched 128-row pair families
+    (``batched_pair128_matrix``, the one-tile pair projection) took the
+    one-pair-tile matrices' defaults."""
     bound = kernel._bind_isolated(head_merge_args(**shape))
     config = bound.config_spec.default_config()
     assert config.block_sizes == tile

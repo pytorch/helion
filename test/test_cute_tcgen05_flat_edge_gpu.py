@@ -377,6 +377,99 @@ class TestCuteTcgen05FlatEdgeGpu(RefEagerTestDisabled, TestCase):
                 out, expected.to(out.dtype), rtol=1e-2, atol=1e-1
             )
 
+    def test_batched_128_row_pairs_over_an_n_edge_or_k_tail(self) -> None:
+        # The persistent 128-row CTA pairs (each CTA 64 rows) over a batch of
+        # 128-row matrices (the planner's batched_pair128_matrix): N = 80 on
+        # one 128-wide tile a matrix (its MMA columns past N computing zeros
+        # that the 3-D TMA store clips) or on a whole tile and a 16-column
+        # one, and K = 80 over a full and a partial 64-deep k-block, which TMA
+        # zero-fills past each matrix's K. A is K-major and M-major, B K-major
+        # and N-major; the NaN-filled outputs show that every tile is written.
+        for batch, m, n, k, a_m_major, b_k_major, block_n in (
+            (40, 128, 80, 128, False, True, 128),
+            (40, 128, 80, 128, False, True, 64),
+            (40, 128, 80, 128, False, False, 128),
+            (40, 128, 80, 128, True, False, 128),
+            (40, 128, 128, 80, False, True, 128),
+            (40, 128, 128, 80, False, False, 64),
+            (6, 256, 112, 144, False, True, 128),
+        ):
+            if a_m_major:
+                a = torch.randn(batch, k, m, device=DEVICE, dtype=torch.bfloat16)
+                a = a.transpose(1, 2)
+            else:
+                a = torch.randn(batch, m, k, device=DEVICE, dtype=torch.bfloat16)
+            if b_k_major:
+                b = torch.randn(batch, n, k, device=DEVICE, dtype=torch.bfloat16)
+                b = b.transpose(1, 2)
+            else:
+                b = torch.randn(batch, k, n, device=DEVICE, dtype=torch.bfloat16)
+            out = torch.full(
+                (batch, m, n), float("nan"), device=DEVICE, dtype=torch.bfloat16
+            )
+            bound = _bmm_into.bind((a, b, out))
+            config = bound.config_spec.default_config()
+            config.config.update(
+                block_sizes=[1, 128, block_n, 64],
+                pid_type="persistent_blocked",
+                tcgen05_persistence_model="static_persistent",
+                tcgen05_cluster_m=2,
+                tcgen05_cta_group="two",
+                tcgen05_ab_stages=4,
+                tcgen05_batch_raster="batch_slowest",
+            )
+            code = bound.to_code(config)
+            self.assertIn("CtaGroup.TWO", code)
+            self.assertIn("tcgen05_gC3d", code)
+            # every tile on the TMA store, none on the element-wise SIMT one
+            self.assertNotIn("tcgen05_edge_pred", code)
+            bound.set_config(config)
+            bound(a, b, out)
+            torch.testing.assert_close(out, torch.bmm(a, b), rtol=1e-2, atol=1e-1)
+
+    def test_batched_128_row_pairs_over_an_m_edge(self) -> None:
+        # The persistent 128-row CTA pairs over matrices 80 or 96 rows tall
+        # (tcgen05_batched_pair128_m_edge): the second CTA's A rows past M are
+        # zero-filled (the batch is its own tensor-map dim) and its TMA store
+        # clipped there, alone (a M-major, b N-major: attention's
+        # attn.transpose(1, 2) @ v) or beside an N edge and a K tail (a
+        # K-major, b K-major); the NaN-filled outputs show that every tile is
+        # written.
+        for batch, m, n, k, a_m_major, b_k_major in (
+            (40, 80, 128, 128, True, False),
+            (40, 96, 80, 80, False, True),
+        ):
+            if a_m_major:
+                a = torch.randn(batch, k, m, device=DEVICE, dtype=torch.bfloat16)
+                a = a.transpose(1, 2)
+            else:
+                a = torch.randn(batch, m, k, device=DEVICE, dtype=torch.bfloat16)
+            if b_k_major:
+                b = torch.randn(batch, n, k, device=DEVICE, dtype=torch.bfloat16)
+                b = b.transpose(1, 2)
+            else:
+                b = torch.randn(batch, k, n, device=DEVICE, dtype=torch.bfloat16)
+            out = torch.full(
+                (batch, m, n), float("nan"), device=DEVICE, dtype=torch.bfloat16
+            )
+            bound = _bmm_into.bind((a, b, out))
+            config = bound.config_spec.default_config()
+            config.config.update(
+                block_sizes=[1, 128, 128, 64],
+                pid_type="persistent_blocked",
+                tcgen05_persistence_model="static_persistent",
+                tcgen05_cluster_m=2,
+                tcgen05_cta_group="two",
+                tcgen05_ab_stages=4,
+            )
+            code = bound.to_code(config)
+            self.assertIn("CtaGroup.TWO", code)
+            self.assertIn("tcgen05_gC3d", code)
+            self.assertNotIn("tcgen05_edge_pred", code)
+            bound.set_config(config)
+            bound(a, b, out)
+            torch.testing.assert_close(out, torch.bmm(a, b), rtol=1e-2, atol=1e-1)
+
     def test_ragged_batched_unaligned_rows_take_the_scalar_producer(self) -> None:
         # Rows of 481 bf16 in a 484-element stride (968 bytes, not a 16-byte
         # multiple) fail the TMA proof and sit below the staging floor: the

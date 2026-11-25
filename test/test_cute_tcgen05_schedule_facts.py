@@ -41,6 +41,9 @@ from helion._compiler.cute.tcgen05_config import surface
 from helion._compiler.cute.tcgen05_constants import (
     TCGEN05_BATCHED_ONE_K_TILE_SEED_AB_STAGES,
 )
+from helion._compiler.cute.tcgen05_constants import (
+    TCGEN05_BATCHED_ONE_ROW_TILE_SEED_AB_STAGES,
+)
 from helion._compiler.cute.tcgen05_constants import TCGEN05_LARGE_BN_PROOF_BLOCK_SIZES
 from helion._compiler.cute.tcgen05_constants import TCGEN05_LARGE_BN_PROOF_CLUSTER_M
 from helion._compiler.cute.tcgen05_constants import TCGEN05_LARGE_BN_PROOF_CONFIG_KEY
@@ -92,6 +95,7 @@ from helion.runtime.cute.launcher import _append_cute_wrapper_plan
 if TYPE_CHECKING:
     from collections.abc import Iterator
 
+    from helion import Config
     from helion.autotuner.config_spec import ConfigSpec
     from helion.runtime.kernel import BoundKernel
     from helion.runtime.kernel import Kernel
@@ -3165,6 +3169,485 @@ def test_a_batch_of_unaligned_matrices_keeps_one_cta_tiles() -> None:
     assert not pair_seeded(unaligned)
 
 
+def test_a_batch_over_an_n_edge_or_k_tail_searches_the_128_row_pairs() -> None:
+    """A batch of 128-row matrices over an N no 64-wide pair tile divides
+    (bf16 512 x [128, 128] @ [128, 80], b K-major) or a K tail past the first
+    64-deep k-block (512 x [128, 80] @ [80, 128]) searches the persistent
+    128-row CTA pairs (``batched_pair128_matrix``) and seeds them, the N edge
+    on a pair tile as wide as the next power of two (one tile a matrix);
+    before, only the flat one-CTA tiles ran either; a K of three k-blocks
+    keeps its 128-deep K ceiling. An N of one 32-wide tile (over a K tail
+    too), a K under one k-block (48), a ragged M (200) and an auxiliary
+    epilogue (attention scores plus a mask, whose store below one full N tile
+    stays on the SIMT edge store) keep the families they had."""
+    kernel = helion.kernel(batched_gemm, backend="cute", static_shapes=True)
+
+    def spec(m: int, n: int, k: int) -> ConfigSpec:
+        args = (
+            torch.empty((512, m, k), dtype=torch.bfloat16),
+            torch.empty((512, n, k), dtype=torch.bfloat16).transpose(1, 2),
+        )
+        with gb300_target(), forbid_cuda_work():
+            return kernel._bind_isolated(args).config_spec
+
+    def pair128_seeds(config_spec: ConfigSpec) -> set[tuple[int, ...]]:
+        return {
+            tuple(c.config["block_sizes"])
+            for c in config_spec.compiler_seed_configs
+            if c.config.get("tcgen05_cluster_m") == 2
+            and c.config.get("tcgen05_cta_group") == "two"
+        }
+
+    def searches_pairs(config_spec: ConfigSpec) -> bool:
+        fields = surface.optional_fragments(config_spec.tcgen05, for_search=True)
+        return (
+            2 in fields["tcgen05_cluster_m"].choices
+            and "two" in fields["tcgen05_cta_group"].choices
+            and "persistent_blocked" in config_spec.allowed_pid_types
+        )
+
+    n_edge = spec(128, 80, 128)
+    assert searches_pairs(n_edge)
+    assert n_edge.block_sizes[2].max_size == 128
+    # each matrix's N on one 128-wide tile (``batched_pair128_whole_n_tile``),
+    # over two 64-deep k-blocks of K = 128 (``batched_pair128_block_k``)
+    assert pair128_seeds(n_edge) == {(1, 128, 128, 64)}
+    k_tail = spec(128, 128, 80)
+    assert searches_pairs(k_tail)
+    assert k_tail.block_sizes[3].max_size == 64
+    assert pair128_seeds(k_tail) == {(1, 128, 128, 64)}
+    for config_spec, seeded in (
+        (n_edge, pair128_seeds(n_edge)),
+        (k_tail, pair128_seeds(k_tail)),
+    ):
+        # the autotuner's seed transfer keeps every seeded pair (no projection
+        # onto one CTA)
+        transferred = {
+            tuple(normalized.config["block_sizes"])
+            for _flat, normalized in ConfigGeneration(
+                config_spec
+            ).seed_flat_config_pairs()
+            if normalized.config.get("tcgen05_cluster_m") == 2
+            and normalized.config.get("tcgen05_cta_group") == "two"
+        }
+        assert transferred == seeded
+    # a K of three 64-deep k-blocks keeps its 128-deep K ceiling (two
+    # k-blocks, the second partial) beside the pairs
+    deep_k = spec(128, 80, 192)
+    assert searches_pairs(deep_k)
+    assert deep_k.block_sizes[3].max_size == 128
+    for shape in ((128, 32, 128), (128, 32, 80), (128, 128, 48), (200, 80, 128)):
+        config_spec = spec(*shape)
+        assert not searches_pairs(config_spec), shape
+        assert not pair128_seeds(config_spec), shape
+    # (an N under the narrowest pair tile over a K tail keeps the flat tiles)
+    assert spec(128, 32, 80).allowed_pid_types == ("flat",)
+    (a, b, mask, out), _padded = scaled_bmm_args(
+        512, 128, 80, 128, row=80, device=CPU_DEVICE
+    )
+    with gb300_target(), forbid_cuda_work():
+        aux = scaled_bmm_into._bind_isolated((a, b, mask, out)).config_spec
+    assert not pair128_seeds(aux)
+
+
+def test_a_batch_of_matrices_shorter_than_one_pair_tile_searches_the_pairs() -> None:
+    """A batch of matrices more than 64 and fewer than 128 rows tall (bf16
+    512 x [80, 128] @ [128, 128], a M-major and b N-major: attention's
+    attn.transpose(1, 2) @ v) searches the persistent 128-row CTA pairs over
+    the M edge (``tcgen05_batched_pair128_m_edge``) and seeds them on one
+    128-row tile a matrix, which renders on the TMA store (clipped at row
+    80); before, the M search stopped at the 64-row power-of-two floor and
+    only the flat one-CTA tiles ran it, a whole and a partial tile a matrix.
+    A 64-row M (no rows for the pair's second CTA), a 48-row one and an
+    auxiliary epilogue keep the families they had."""
+    kernel = helion.kernel(batched_gemm, backend="cute", static_shapes=True)
+
+    def bind(m: int, n: int = 128, k: int = 128) -> BoundKernel:
+        args = (
+            torch.empty((512, k, m), dtype=torch.bfloat16).transpose(1, 2),
+            torch.empty((512, k, n), dtype=torch.bfloat16),
+        )
+        with gb300_target(), forbid_cuda_work():
+            return kernel._bind_isolated(args)
+
+    def pair128_seeds(config_spec: ConfigSpec) -> set[tuple[int, ...]]:
+        return {
+            tuple(c.config["block_sizes"])
+            for c in config_spec.compiler_seed_configs
+            if c.config.get("tcgen05_cluster_m") == 2
+            and c.config.get("tcgen05_cta_group") == "two"
+        }
+
+    def searches_pairs(config_spec: ConfigSpec) -> bool:
+        fields = surface.optional_fragments(config_spec.tcgen05, for_search=True)
+        return (
+            2 in fields["tcgen05_cluster_m"].choices
+            and "two" in fields["tcgen05_cta_group"].choices
+            and "persistent_blocked" in config_spec.allowed_pid_types
+        )
+
+    bound = bind(80)
+    m_edge = bound.config_spec
+    assert searches_pairs(m_edge)
+    assert m_edge.block_sizes[1].max_size == 128
+    # (two 64-deep k-blocks of K = 128: ``batched_pair128_block_k``)
+    assert pair128_seeds(m_edge) == {(1, 128, 128, 64)}
+    # the autotuner's seed transfer keeps every seeded pair
+    transferred = {
+        tuple(normalized.config["block_sizes"])
+        for _flat, normalized in ConfigGeneration(m_edge).seed_flat_config_pairs()
+        if normalized.config.get("tcgen05_cluster_m") == 2
+        and normalized.config.get("tcgen05_cta_group") == "two"
+    }
+    assert transferred == pair128_seeds(m_edge)
+    config = m_edge.default_config()
+    config.config.update(
+        block_sizes=[1, 128, 128, 64],
+        pid_type="persistent_blocked",
+        tcgen05_persistence_model="static_persistent",
+        tcgen05_cluster_m=2,
+        tcgen05_cta_group="two",
+        tcgen05_ab_stages=8,
+    )
+    with gb300_target(), forbid_cuda_work():
+        code = bound.to_code(config)
+    assert "CtaGroup.TWO" in code
+    assert "tcgen05_gC3d" in code
+    assert "cute.copy(tcgen05_tma_store_atom" in code
+    assert "tcgen05_edge_pred" not in code
+    for m in (96, 112):
+        assert searches_pairs(bind(m).config_spec), m
+    for m in (64, 48):
+        config_spec = bind(m).config_spec
+        assert not searches_pairs(config_spec), m
+        assert not pair128_seeds(config_spec), m
+        assert config_spec.block_sizes[1].max_size == 64, m
+    (a, b, mask, out), _padded = scaled_bmm_args(
+        512, 80, 128, 128, row=128, device=CPU_DEVICE
+    )
+    with gb300_target(), forbid_cuda_work():
+        aux = scaled_bmm_into._bind_isolated((a, b, mask, out)).config_spec
+    assert not pair128_seeds(aux)
+    assert aux.block_sizes[1].max_size == 64
+
+
+def test_a_pair_tile_wider_than_n_stores_through_tma() -> None:
+    """A CTA pair whose N tile is wider than N (no full tile) stores through
+    TMA under a plain epilogue -- the batched 128-row pair over [128, 128] @
+    [128, 80] on its 128-wide tile and a rank-2 4096x80x128 GEMM on an
+    explicit 128x128 pair -- where every element used to go through the
+    predicated SIMT edge store; an auxiliary epilogue (scores * 0.125 + mask)
+    keeps that store below one full tile."""
+    pair = {
+        "pid_type": "persistent_blocked",
+        "tcgen05_persistence_model": "static_persistent",
+        "tcgen05_cluster_m": 2,
+        "tcgen05_cta_group": "two",
+        "tcgen05_ab_stages": 4,
+    }
+
+    def render(bound: BoundKernel, block_sizes: list[int]) -> str:
+        config = bound.config_spec.default_config()
+        config.config.update(block_sizes=block_sizes, **pair)
+        return bound.to_code(config)
+
+    kernel = helion.kernel(batched_gemm, backend="cute", static_shapes=True)
+    with gb300_target(), forbid_cuda_work():
+        batched = render(
+            kernel._bind_isolated(
+                (
+                    torch.empty((40, 128, 128), dtype=torch.bfloat16),
+                    torch.empty((40, 80, 128), dtype=torch.bfloat16).transpose(1, 2),
+                )
+            ),
+            [1, 128, 128, 64],
+        )
+        rank_two = render(
+            plain_mm_into._bind_isolated(bf16_mm_args(4096, 80, 128)), [128, 128, 64]
+        )
+        (a, b, mask, out), _padded = scaled_bmm_args(
+            40, 128, 80, 128, row=80, device=CPU_DEVICE
+        )
+        aux = render(
+            scaled_bmm_into._bind_isolated((a, b, mask, out)), [1, 128, 128, 64]
+        )
+    for code in (batched, rank_two):
+        assert "CtaGroup.TWO" in code
+        assert "cute.copy(tcgen05_tma_store_atom" in code
+        assert "tcgen05_edge_pred" not in code
+    assert "tcgen05_gC3d" in batched
+    assert "CtaGroup.TWO" in aux
+    assert "tcgen05_edge_pred" in aux
+
+
+def test_batched_pairs_over_one_tile_matrices_keep_their_n_whole() -> None:
+    """The 128-row CTA pairs over a batch of matrices whose N one 128-wide
+    pair tile covers (bf16 512 x [128, 128] @ [128, 128], b K-major) are
+    seeded and searched on that width alone, beside four C stages, over
+    64-deep k-blocks: a sampled pair that splits N into two 64-wide tiles over
+    two C stages is projected onto one tile and four C stages, its AB ring
+    refitted (``batched_pair128_whole_n_tile``, ``batched_pair128_c_stages``);
+    one over K whole in a 128-deep k-block takes two 64-deep ones and twice
+    the stages (``batched_pair128_block_k``); and over a K loop of at most
+    three k-blocks a tile it runs one A/B-load warp
+    (``_batched_pair128_short_k_loop``). A batch too small to give every SM
+    pair a matrix (16 matrices) keeps its 64-wide pairs and two C stages, as
+    does a 256-wide N; a 64-wide N (already one tile) takes the four C stages;
+    a K of eight k-blocks keeps its 128-deep k-blocks, its two load warps and
+    its sampled C ring, and matrices two pair tiles tall take N whole beside
+    their sampled C ring (the four C stages were measured over one pair tile
+    a matrix, K <= 128)."""
+    kernel = helion.kernel(batched_gemm, backend="cute", static_shapes=True)
+
+    def spec(batch: int, n: int, k: int = 128, m: int = 128) -> ConfigSpec:
+        args = (
+            torch.empty((batch, m, k), dtype=torch.bfloat16),
+            torch.empty((batch, n, k), dtype=torch.bfloat16).transpose(1, 2),
+        )
+        with gb300_target(), forbid_cuda_work():
+            return kernel._bind_isolated(args).config_spec
+
+    def pairs(config_spec: ConfigSpec) -> list[Config]:
+        return [
+            c
+            for c in config_spec.compiler_seed_configs
+            if c.config.get("tcgen05_cta_group") == "two"
+        ]
+
+    def project(
+        config_spec: ConfigSpec,
+        seed: Config,
+        block_sizes: list[int],
+        ab_stages: int = 16,
+    ) -> dict[str, object]:
+        generation = ConfigGeneration(config_spec)
+        sample = {
+            **seed.config,
+            "block_sizes": block_sizes,
+            "tcgen05_ab_stages": ab_stages,
+            "tcgen05_c_stages": 2,
+            "tcgen05_warp_spec_ab_load_warps": 2,
+        }
+        with gb300_target(), forbid_cuda_work():
+            return generation.unflatten(
+                generation.flatten(helion.Config(**sample))
+            ).config
+
+    batch = spec(512, 128)
+    assert {tuple(c.config["block_sizes"]) for c in pairs(batch)} == {
+        (1, 128, 128, 64),
+    }
+    assert {c.config["tcgen05_c_stages"] for c in pairs(batch)} == {4}
+    projected = project(batch, pairs(batch)[0], [1, 128, 64, 64])
+    assert projected["block_sizes"] == [1, 128, 128, 64]
+    assert projected["tcgen05_cluster_m"] == 2
+    assert projected["tcgen05_ab_stages"] < 16
+    assert projected["tcgen05_c_stages"] == 4
+    assert projected["tcgen05_warp_spec_ab_load_warps"] == 1
+    split = project(batch, pairs(batch)[0], [1, 128, 128, 128], ab_stages=5)
+    assert split["block_sizes"] == [1, 128, 128, 64]
+    assert split["tcgen05_ab_stages"] == 10
+    for config_spec, c_stages in (
+        (spec(16, 128), 2),
+        (spec(512, 64), 4),
+        (spec(512, 256), 2),
+    ):
+        assert (1, 128, 64, 64) in {
+            tuple(c.config["block_sizes"]) for c in pairs(config_spec)
+        }
+        kept = project(config_spec, pairs(config_spec)[0], [1, 128, 64, 64])
+        assert kept["block_sizes"] == [1, 128, 64, 64]
+        assert kept["tcgen05_c_stages"] == c_stages
+    deep_k = spec(512, 128, k=512)
+    kept = project(deep_k, pairs(deep_k)[0], [1, 128, 128, 64])
+    assert kept["tcgen05_warp_spec_ab_load_warps"] == 2
+    assert kept["tcgen05_c_stages"] == 2
+    kept = project(deep_k, pairs(deep_k)[0], [1, 128, 128, 128], ab_stages=4)
+    assert kept["block_sizes"] == [1, 128, 128, 128]
+    assert kept["tcgen05_ab_stages"] == 4
+    tall = spec(512, 128, m=256)
+    for config_spec in (deep_k, tall):
+        assert {
+            c.config["tcgen05_c_stages"]
+            for c in pairs(config_spec)
+            if c.config["block_sizes"][1] == 128
+        } == {2}
+    kept = project(tall, pairs(tall)[0], [1, 128, 64, 64])
+    assert kept["block_sizes"] == [1, 128, 128, 64]
+    assert kept["tcgen05_c_stages"] == 2
+
+
+def test_one_tile_batched_matrices_search_only_the_pairs() -> None:
+    """A batch of matrices each one 128-row CTA pair tile over a K loop of
+    two or more 64-deep k-blocks, in fewer than six waves of one-CTA tiles
+    (``batched_pair128_one_tile_matrices``): the search projects one-CTA
+    samples, flat or persistent, onto the pair, on the family's 64-deep
+    k-blocks and four C stages with an AB ring of four tiles' k-blocks
+    (eight stages over K = 128). bf16 512 x [128, 128] @ [128, 64]
+    (helion.inductor's transposed 512 x 64x128x128: a full-effort pick was
+    the flat one-CTA [1, 128, 64, 64] tile, 19% behind the pair) and 512 x
+    [80, 128] @ [128, 128] (a M-major, its default the flat one-CTA tile).
+    One K tile (K = 64) and 1024 matrices (6.7 waves of one-CTA tiles on 152
+    SMs) keep their one-CTA samples."""
+    kernel = helion.kernel(batched_gemm, backend="cute", static_shapes=True)
+
+    def spec(batch: int, m: int, n: int, k: int) -> ConfigSpec:
+        args = (
+            torch.empty((batch, k, m), dtype=torch.bfloat16).transpose(1, 2),
+            torch.empty((batch, k, n), dtype=torch.bfloat16),
+        )
+        with gb300_target(), forbid_cuda_work():
+            return kernel._bind_isolated(args).config_spec
+
+    def project(config_spec: ConfigSpec, **knobs: object) -> dict[str, object]:
+        generation = ConfigGeneration(config_spec)
+        config = config_spec.default_config()
+        config.config.update(knobs)
+        with gb300_target(), forbid_cuda_work():
+            return generation.unflatten(generation.flatten(config)).config
+
+    one_cta = {
+        "tcgen05_cluster_m": 1,
+        "tcgen05_cta_group": "auto",
+        "tcgen05_ab_stages": 2,
+    }
+    transposed = spec(512, 128, 64, 128)
+    for pid_type in ("flat", "persistent_blocked"):
+        projected = project(
+            transposed, block_sizes=[1, 128, 64, 64], pid_type=pid_type, **one_cta
+        )
+        assert projected["tcgen05_cta_group"] == "two", pid_type
+        assert projected["tcgen05_cluster_m"] == 2, pid_type
+        assert projected["pid_type"] == "persistent_blocked", pid_type
+        assert projected["block_sizes"] == [1, 128, 64, 64], pid_type
+        assert projected["tcgen05_ab_stages"] == 8, pid_type
+        assert projected["tcgen05_c_stages"] == 4, pid_type
+    m_edge = spec(512, 80, 128, 128)
+    default = m_edge.default_config().config
+    assert default["tcgen05_cta_group"] == "two"
+    assert default["block_sizes"] == [1, 128, 128, 64]
+    assert default["tcgen05_ab_stages"] == 8
+    projected = project(m_edge, block_sizes=[1, 128, 128, 128], **one_cta)
+    assert projected["tcgen05_cta_group"] == "two"
+    assert projected["block_sizes"] == [1, 128, 128, 64]
+    assert projected["tcgen05_ab_stages"] == 8
+    for config_spec in (spec(512, 128, 64, 64), spec(1024, 128, 64, 128)):
+        kept = project(
+            config_spec,
+            block_sizes=[1, 128, 64, 64],
+            pid_type="persistent_blocked",
+            **one_cta,
+        )
+        assert kept["tcgen05_cluster_m"] == 1
+        assert kept["tcgen05_cta_group"] != "two"
+
+
+def _pdl_batched_gemm(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    """``batched_gemm`` behind an explicit dependent-launch wait."""
+    batch, m, k = a.shape
+    _, _, n = b.shape
+    out = torch.empty((batch, m, n), dtype=a.dtype, device=a.device)
+    hl.pdl_wait()
+    for tile_b, tile_m, tile_n in hl.tile((batch, m, n)):
+        acc = hl.zeros([tile_b, tile_m, tile_n], dtype=torch.float32)
+        for tile_k in hl.tile(k):
+            acc = torch.baddbmm(
+                acc, a[tile_b, tile_m, tile_k], b[tile_b, tile_k, tile_n]
+            )
+        out[tile_b, tile_m, tile_n] = acc.to(out.dtype)
+    return out
+
+
+def test_one_tile_batched_matrices_keep_one_cta_behind_explicit_pdl() -> None:
+    """A kernel whose explicit ``hl.pdl_wait()`` owns its launch searches one
+    CTA only, so the one-tile pair projection
+    (``batched_pair128_one_tile_matrices``) leaves it alone: bf16 512 x
+    [128, 128] @ [128, 64] keeps a one-CTA default the backend renders, and a
+    flat sample stays one CTA."""
+    kernel = helion.kernel(_pdl_batched_gemm, backend="cute", static_shapes=True)
+    args = (
+        torch.empty((512, 128, 128), dtype=torch.bfloat16),
+        torch.empty((512, 128, 64), dtype=torch.bfloat16),
+    )
+    with gb300_target(), forbid_cuda_work():
+        bound = kernel._bind_isolated(args)
+        config_spec = bound.config_spec
+        assert not repair.batched_pair128_one_tile_matrices(config_spec.tcgen05)
+        default = config_spec.default_config()
+        assert default.config.get("tcgen05_cluster_m", 1) == 1
+        assert default.config.get("tcgen05_cta_group", "auto") != "two"
+        assert bound.env.backend.autotune_config_is_viable(config_spec, default)
+        bound.to_code(default)
+        generation = ConfigGeneration(config_spec)
+        sample = config_spec.default_config()
+        sample.config.update(
+            block_sizes=[1, 128, 64, 64],
+            pid_type="flat",
+            tcgen05_cluster_m=1,
+            tcgen05_cta_group="auto",
+        )
+        projected = generation.unflatten(generation.flatten(sample)).config
+    assert projected.get("tcgen05_cluster_m", 1) == 1
+    assert projected.get("tcgen05_cta_group", "auto") != "two"
+
+
+def _batch_split_bmm(a: torch.Tensor, b: torch.Tensor, out: torch.Tensor) -> None:
+    """``bmm(a, b)`` into a [B // 4, 4, M, N] ``out``, the batch split over
+    its two leading dims: a hierarchical store (``radix_store``) whose
+    destination ends in the matrix's (M, N)."""
+    batch, m, k = a.shape
+    n = b.shape[2]
+    for tile_z, tile_y, tile_x in hl.tile([batch, m, n]):
+        acc = hl.zeros([tile_z, tile_y, tile_x], dtype=torch.float32)
+        for tile_k in hl.tile(k):
+            acc = torch.baddbmm(
+                acc, a[tile_z, tile_y, tile_k], b[tile_z, tile_k, tile_x]
+            )
+        z = tile_z.index.reshape([tile_z, 1, 1])  # pyrefly: ignore[no-matching-overload]
+        y = tile_y.index.reshape([1, tile_y, 1])  # pyrefly: ignore[no-matching-overload]
+        x = tile_x.index.reshape([1, 1, tile_x])  # pyrefly: ignore[no-matching-overload]
+        out[z // 4, z % 4, y, x] = acc.to(out.dtype)
+
+
+def test_one_tile_batched_matrices_keep_one_cta_where_pairs_cannot_run() -> None:
+    """bf16 512 x [128, 128] @ [128, 64] whose A sits one element into its
+    storage (no TMA: the pair's scalar producers refuse a launch of more than
+    one tile) or whose store splits the batch through a hierarchical layout
+    (``radix_store``, which the 128-row pairs do not render, a destination
+    ending in the matrix's (M, N) included) takes no whole-N pair
+    (``batched_pair128_whole_n_tile``), so the one-tile pair projection
+    leaves it alone: each keeps the flat one-CTA default it had before the
+    projection, which renders (the head merge's: ``test_cute_radix_store``)."""
+    storage = torch.empty(512 * 128 * 128 + 1, dtype=torch.bfloat16)
+    b = torch.empty((512, 128, 64), dtype=torch.bfloat16)
+    with gb300_target(), forbid_cuda_work():
+        unaligned = helion.kernel(
+            batched_gemm, backend="cute", static_shapes=True
+        )._bind_isolated((storage[1:].view(512, 128, 128), b))
+        radix = helion.kernel(
+            _batch_split_bmm, backend="cute", static_shapes=True
+        )._bind_isolated(
+            (
+                torch.empty((512, 128, 128), dtype=torch.bfloat16),
+                b,
+                torch.empty((128, 4, 128, 64), dtype=torch.bfloat16),
+            )
+        )
+        for bound in (unaligned, radix):
+            state = bound.config_spec.tcgen05
+            assert repair.batched_pair128_whole_n_tile(state) is None
+            assert not repair.batched_pair128_one_tile_matrices(state)
+            default = bound.config_spec.default_config()
+            assert default.config["pid_type"] == "flat"
+            assert default.config.get("tcgen05_cta_group", "auto") != "two"
+            assert "_helion_tcgen05_persistent_total_tiles" not in bound.to_code(
+                default
+            )
+    assert not unaligned.config_spec.tcgen05.matmul_operands_tma_provable
+    assert radix.config_spec.tcgen05.matmul_radix_store
+    assert radix.config_spec.tcgen05.matmul_output_matches_extents
+
+
 def test_a_batched_one_k_tile_gemm_seeds_the_deep_ring_tile() -> None:
     """A batch of 512 x 512 x 64 GEMMs (K one tile: output-bound) seeds the
     persistent one-CTA 128x64 tile on a six-deep AB ring (seven also fit;
@@ -3211,6 +3694,96 @@ def test_a_batched_one_k_tile_gemm_seeds_the_deep_ring_tile() -> None:
         and config["tcgen05_ab_stages"] == TCGEN05_BATCHED_ONE_K_TILE_SEED_AB_STAGES
         for config in one_cta_persistent(plain)
     )
+
+
+def test_a_batched_one_row_tile_gemm_seeds_the_64x64_deep_ring() -> None:
+    """A batch of 192 GEMMs of 64 x 512 x 512 with A stored M-major (one
+    64-row tile a matrix: memory-bound) seeds the persistent 64x64 tile on a
+    twelve-deep ring of 64-deep k-blocks
+    (``TCGEN05_BATCHED_ONE_ROW_TILE_SEED_AB_STAGES``), with double-buffered
+    accumulators, a four-deep C ring and the batch-fastest raster, beside the
+    default's four-deep 64x64 tile; a batch of fewer than two tiles a SM, an
+    N of one 64-wide tile, a K of two 64-deep k-blocks and a rank-2 GEMM do
+    not."""
+
+    def ring_seeds(bound: BoundKernel) -> list[dict[str, object]]:
+        with bound.env:
+            seed_configs = seeds.autotune_seed_configs(
+                bound.config_spec._cute_tcgen05_config
+            )
+        return [
+            seed.config
+            for seed in seed_configs
+            if seed.config.get("tcgen05_ab_stages")
+            == TCGEN05_BATCHED_ONE_ROW_TILE_SEED_AB_STAGES
+        ]
+
+    def bind(batch: int, n: int, k: int) -> BoundKernel:
+        return helion.kernel(
+            batched_gemm, backend="cute", static_shapes=True
+        )._bind_isolated(
+            (
+                torch.empty((batch, k, 64), dtype=torch.bfloat16).transpose(1, 2),
+                torch.empty((batch, k, n), dtype=torch.bfloat16),
+            )
+        )
+
+    with patch(
+        "helion._compiler.cute.tcgen05.search_plan._cuda_num_sms_or_zero",
+        return_value=148,
+    ):
+        batched = bind(192, 512, 512)
+        # 2 x 8 tiles; one 64-wide tile; two 64-deep k-blocks
+        others = [bind(2, 512, 512), bind(192, 64, 512), bind(192, 512, 128)]
+        plain = plain_mm._bind_isolated(
+            (
+                torch.empty((512, 64), dtype=torch.bfloat16).T,
+                torch.empty((512, 512), dtype=torch.bfloat16),
+            )
+        )
+    # (the default takes the search's 64-wide N ceiling for these products too)
+    assert batched.config_spec.default_config().block_sizes == [1, 64, 64, 64]
+    (seed,) = ring_seeds(batched)
+    assert seed["block_sizes"] == [1, 64, 64, 64]
+    assert seed["pid_type"] == "persistent_interleaved"
+    assert (seed["tcgen05_acc_stages"], seed["tcgen05_c_stages"]) == (2, 4)
+    assert seed["tcgen05_batch_raster"] == "batch_fastest"
+    assert not any(ring_seeds(bound) for bound in (*others, plain))
+
+
+def test_a_batched_one_row_tile_gemm_searches_64_wide_tiles() -> None:
+    """A batch of 192 GEMMs of 64 x 512 x 512 with A stored M-major (one
+    64-row tile a matrix over eight k-blocks) caps the tcgen05 search's N
+    tiles at 64 (tcgen05_one_row_tile_batched_narrow_n: the final selection's
+    per-call timer reads 64x128 tiles ahead of the 64x64 ring that runs ahead
+    of them back to back), and its default takes the 64-wide tile; K = 128
+    (two k-blocks, where the 64x128 tile runs ahead), 128-row matrices and a
+    batch of fewer than two 64x64 tiles a SM keep their 256-wide ceilings."""
+
+    def bind(batch: int, m: int, n: int, k: int) -> BoundKernel:
+        return helion.kernel(
+            batched_gemm, backend="cute", static_shapes=True
+        )._bind_isolated(
+            (
+                torch.empty((batch, k, m), dtype=torch.bfloat16).transpose(1, 2),
+                torch.empty((batch, k, n), dtype=torch.bfloat16),
+            )
+        )
+
+    with patch(
+        "helion._compiler.cute.tcgen05.search_plan._cuda_num_sms_or_zero",
+        return_value=148,
+    ):
+        capped = bind(192, 64, 512, 512)
+        others = [
+            bind(192, 64, 512, 128),
+            bind(192, 128, 512, 512),
+            bind(2, 64, 512, 512),
+        ]
+    assert [block.max_size for block in capped.config_spec.block_sizes][2] == 64
+    assert capped.config_spec.default_config().block_sizes == [1, 64, 64, 64]
+    for bound in others:
+        assert [block.max_size for block in bound.config_spec.block_sizes][2] == 256
 
 
 @helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
