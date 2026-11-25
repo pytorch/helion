@@ -24,11 +24,19 @@ not seen, the kernel:
 5. Compiles via ``torch.mps.compile_shader``
 6. Keeps the kernel function and the positions of its dispatched arguments,
    so a repeat launch is a lookup and a dispatch
+
+``metal_kernel.capture(...)`` takes the same launch and runs steps 1 to 4
+only: it returns the launch's MSL, grid and arguments
+(:class:`~helion._compiler.metal.export.MetalLaunch`) without compiling or
+dispatching anything.
 """
 
 from __future__ import annotations
 
 import ast
+from collections import Counter
+import dataclasses
+import functools
 import inspect
 import textwrap
 import types
@@ -40,6 +48,8 @@ from ... import exc
 from ._constants import DTYPE_TO_METAL
 from ._constants import MAX_THREADGROUP_MEMORY_BYTES
 from .c10_helpers import c10_source
+from .export import MetalArgument
+from .export import MetalLaunch
 from .fma_fusion import fuse_multiply_adds
 from .fragment_mma import FRAGMENT_LOWERING
 from .fragment_mma import LANE
@@ -47,6 +57,7 @@ from .fragment_mma import LANE_PREAMBLE
 from .fragment_mma import is_fragment_acc
 from .lane_fold import MSL_SCALAR_BYTES
 from .lane_fold import jam_lanes_into_loops
+from .lane_fold import tl_store
 from .lane_fold import unroll_lane_folds
 from .masked_branch import branch_masked_steps
 from .mpp_matmul import ACC
@@ -97,6 +108,47 @@ class _MetalKernel:
         self._plans: dict[
             tuple[object, ...], tuple[Callable[..., object], tuple[int, ...]]
         ] = {}
+
+    def capture(
+        self,
+        grid: tuple[int, ...],
+        block_dims: tuple[int, int, int],
+        args: tuple[object, ...],
+        by_value: tuple[int, ...],
+    ) -> MetalLaunch:
+        """The launch :meth:`launch` would dispatch, with the MSL it would
+        compile, as data: nothing is compiled or dispatched."""
+        _check_runtime_scalars(args, by_value)
+        msl = self._msl(args, by_value, block_dims)
+        names = self._param_names
+        written, read = _buffer_access(self._fn_def().body, names)
+        shared = _shared_storage(args)
+        params = {p.name: p for p in msl.params}
+        gx, gy, gz = (*grid, 1, 1)[:3]
+        return MetalLaunch(
+            name=self._name,
+            source=msl.render(),
+            grid=(gx, gy, gz),
+            threadgroup=block_dims,
+            arguments=tuple(
+                MetalArgument(
+                    name=name,
+                    value=arg,
+                    binding=(
+                        "baked"
+                        if name not in params
+                        else "scalar"
+                        if params[name].by_value
+                        else "buffer"
+                    ),
+                    written=name in written,
+                    read=name in read,
+                    shares_storage=i in shared,
+                )
+                for i, (name, arg) in enumerate(zip(names, args, strict=True))
+            ),
+            msl=msl,
+        )
 
     def launch(
         self,
@@ -157,15 +209,9 @@ class _MetalKernel:
 
         Returns the kernel function and the positions of the arguments it
         binds: tensors as buffers and runtime scalars by value, in launch
-        order, which is the order ``_generate_msl`` numbers their slots in.
+        order, which is the order ``_generate_msl_kernel`` numbers their slots in.
         """
-        for i in by_value:
-            if type(args[i]) not in _RUNTIME_SCALAR_TYPES:
-                raise exc.BackendUnsupported(
-                    "metal",
-                    f"runtime scalar argument {i} is a {type(args[i]).__name__}; "
-                    "Metal binds runtime scalars as int or float",
-                )
+        _check_runtime_scalars(args, by_value)
         lib = self._compile(args, by_value, block_dims)
         dispatched = tuple(
             i
@@ -181,16 +227,20 @@ class _MetalKernel:
         block_dims: tuple[int, int, int],
     ) -> object:
         """Translate the function body to MSL for ``args`` and compile it."""
-        source = textwrap.dedent(inspect.getsource(self._fn))
-        fn_def = next(
-            node
-            for node in ast.walk(ast.parse(source))
-            if isinstance(node, ast.FunctionDef)
-        )
-        param_names = [a.arg for a in fn_def.args.args]
-        self.msl_source = _generate_msl(
+        self.msl_source = self._msl(args, by_value, block_dims).render()
+        return torch.mps.compile_shader(self.msl_source)  # type: ignore[attr-defined]
+
+    def _msl(
+        self,
+        args: tuple[object, ...],
+        by_value: tuple[int, ...],
+        block_dims: tuple[int, int, int],
+    ) -> MSLKernel:
+        """Translate the function body to MSL for ``args``."""
+        param_names = self._param_names
+        return _generate_msl_kernel(
             kernel_name=self._name,
-            body_stmts=fn_def.body,
+            body_stmts=self._fn_def().body,
             param_names=param_names,
             args=args,
             fn_globals=self._fn.__globals__,
@@ -199,7 +249,117 @@ class _MetalKernel:
                 param_names[i]: _RUNTIME_SCALAR_TYPES[type(args[i])] for i in by_value
             },
         )
-        return torch.mps.compile_shader(self.msl_source)  # type: ignore[attr-defined]
+
+    def _fn_def(self) -> ast.FunctionDef:
+        """The function's AST, parsed again on each call: the translation
+        rewrites the statements it is given."""
+        return next(
+            node
+            for node in ast.walk(ast.parse(self._source))
+            if isinstance(node, ast.FunctionDef)
+        )
+
+    @functools.cached_property
+    def _source(self) -> str:
+        return textwrap.dedent(inspect.getsource(self._fn))
+
+    @functools.cached_property
+    def _param_names(self) -> list[str]:
+        return [a.arg for a in self._fn_def().args.args]
+
+
+def _check_runtime_scalars(args: tuple[object, ...], by_value: tuple[int, ...]) -> None:
+    for i in by_value:
+        if type(args[i]) not in _RUNTIME_SCALAR_TYPES:
+            raise exc.BackendUnsupported(
+                "metal",
+                f"runtime scalar argument {i} is a {type(args[i]).__name__}; "
+                "Metal binds runtime scalars as int or float",
+            )
+
+
+def _buffer_access(
+    body_stmts: list[ast.stmt], param_names: list[str]
+) -> tuple[set[str], set[str]]:
+    """The parameters the body writes and the ones it reads.  A buffer is
+    written through the base pointer of a ``tl.store(buf + offset, ...)``,
+    the one way the generated code writes one (``msl_ast_walker``); any
+    other use of its name reads it."""
+    params = set(param_names)
+    stores: Counter[str] = Counter()
+    named: Counter[str] = Counter()
+    for node in ast.walk(ast.Module(body=body_stmts, type_ignores=[])):
+        if isinstance(node, ast.Name) and node.id in params:
+            named[node.id] += 1
+        elif (store := tl_store(node)) is not None:
+            ptr = store.args[0]
+            while isinstance(ptr, ast.BinOp):
+                ptr = ptr.left
+            if isinstance(ptr, ast.Name) and ptr.id in params:
+                stores[ptr.id] += 1
+    return set(stores), {name for name in named if named[name] > stores[name]}
+
+
+@dataclasses.dataclass(frozen=True)
+class MSLParam:
+    """A bound kernel parameter: a buffer (``device half* x``) or a runtime
+    scalar bound by value (``constant long& n``)."""
+
+    space: str
+    type: str
+    name: str
+    by_value: bool
+
+    def decl(self) -> str:
+        return f"{self.space} {self.type}{'&' if self.by_value else '*'} {self.name}"
+
+
+@dataclasses.dataclass(frozen=True)
+class MSLKernel:
+    """One kernel's MSL, in the parts that its renderings arrange: the
+    ``kernel void`` torch compiles (:meth:`render`), and the forms other
+    runtimes take (``export.py``)."""
+
+    name: str
+    #: File scope: includes and helpers, then the ``constant`` tables.
+    preamble: tuple[str, ...]
+    tables: tuple[str, ...]
+    #: The bound parameters, in buffer-slot order, then the position
+    #: attributes: ``(type, name, attribute)``.
+    params: tuple[MSLParam, ...]
+    attributes: tuple[tuple[str, str, str], ...]
+    #: ``[[required_threads_per_threadgroup]]``, when the launch fixes it.
+    threads: tuple[int, int, int] | None
+    #: Kernel scope, each line indented by 4: the declarations before the
+    #: body (baked host constants, constexprs), then the threadgroup arrays
+    #: ``(type, name, slots)``, then the body.
+    prologue: tuple[str, ...]
+    scratch: tuple[tuple[str, str, int], ...]
+    body: tuple[str, ...]
+
+    def render(self) -> str:
+        """The complete MSL source of the ``kernel void``."""
+        sig = ",\n    ".join(
+            [
+                *(f"{p.decl()} [[buffer({i})]]" for i, p in enumerate(self.params)),
+                *(f"{t} {n} [[{a}]]" for t, n, a in self.attributes),
+            ]
+        )
+        threads = ""
+        if self.threads is not None:
+            tx, ty, tz = self.threads
+            threads = f"[[required_threads_per_threadgroup({tx}, {ty}, {tz})]] "
+        return "\n".join(
+            [
+                *self.preamble,
+                *self.tables,
+                f"{threads}kernel void {self.name}(\n    {sig}\n) {{",
+                *self.prologue,
+                *(f"    threadgroup {t} {n}[{slots}];" for t, n, slots in self.scratch),
+                *self.body,
+                "}",
+            ]
+        )
 
 
 def _shared_storage(args: tuple[object, ...]) -> frozenset[int]:
@@ -212,7 +372,7 @@ def _shared_storage(args: tuple[object, ...]) -> frozenset[int]:
     return frozenset(i for group in seen.values() if len(group) > 1 for i in group)
 
 
-def _generate_msl(
+def _generate_msl_kernel(
     kernel_name: str,
     body_stmts: list[ast.stmt],
     param_names: list[str],
@@ -220,8 +380,8 @@ def _generate_msl(
     fn_globals: dict[str, object],
     required_threads_per_threadgroup: tuple[int, int, int] | None = None,
     by_value: Mapping[str, str] = _NO_SCALARS,
-) -> str:
-    """Generate complete MSL source from Python AST body and actual args.
+) -> MSLKernel:
+    """Generate a kernel's MSL from Python AST body and actual args.
 
     Infers Metal dtypes and scalar vs tensor distinction directly from
     the args, apart from the ``by_value`` parameters: runtime scalars, each
@@ -354,13 +514,11 @@ def _generate_msl(
         msl_parts.append(MASKED_LOAD_PREAMBLE)
     msl_parts.append("")
 
-    params: list[str] = []
+    params: list[MSLParam] = []
     scalar_preamble: list[str] = []
-    buf_idx = 0
     for name, arg in zip(param_names, args, strict=True):
         if name in by_value:
-            params.append(f"constant {by_value[name]}& {name} [[buffer({buf_idx})]]")
-            buf_idx += 1
+            params.append(MSLParam("constant", by_value[name], name, by_value=True))
             continue
         if not isinstance(arg, torch.Tensor):
             # A host-side constexpr the launcher passes positionally (e.g. a
@@ -371,32 +529,22 @@ def _generate_msl(
             scalar_preamble.append(f"    {_constexpr_decl(name, arg)}")
             continue
         # A 0-dim tensor too: its loads index element 0.
-        metal_dtype = DTYPE_TO_METAL[arg.dtype]
-        params.append(f"device {metal_dtype}* {name} [[buffer({buf_idx})]]")
-        buf_idx += 1
+        params.append(
+            MSLParam("device", DTYPE_TO_METAL[arg.dtype], name, by_value=False)
+        )
 
-    params.append("uint3 tgid [[threadgroup_position_in_grid]]")
+    attributes = [("uint3", "tgid", "threadgroup_position_in_grid")]
     if split == 1:
-        params.append("uint3 tid [[thread_position_in_threadgroup]]")
+        attributes.append(("uint3", "tid", "thread_position_in_threadgroup"))
     if uses_fragments:
-        params.append(f"uint {LANE} [[thread_index_in_simdgroup]]")
+        attributes.append(("uint", LANE, "thread_index_in_simdgroup"))
     if uses_registers:
-        params.append(f"uint {REGISTER_LANE} [[thread_index_in_simdgroup]]")
+        attributes.append(("uint", REGISTER_LANE, "thread_index_in_simdgroup"))
     if split > 1:
         # The same integer type as the other position attributes.
-        params.append(f"uint {SIMDGROUP} [[simdgroup_index_in_threadgroup]]")
-    sig = ",\n    ".join(params)
-    required_threads_attr = ""
-    if required_threads_per_threadgroup is not None:
-        tx, ty, tz = required_threads_per_threadgroup
-        required_threads_attr = (
-            f"[[required_threads_per_threadgroup({tx}, {ty}, {tz})]] "
-        )
-    kernel_at = len(msl_parts)
-    msl_parts.append(
-        f"{required_threads_attr}kernel void {kernel_name}(\n    {sig}\n) {{"
-    )
-    msl_parts.extend(scalar_preamble)
+        attributes.append(("uint", SIMDGROUP, "simdgroup_index_in_threadgroup"))
+    preamble = msl_parts
+    prologue = list(scalar_preamble)
 
     # Declare _BLOCK_SIZE_* constants from module globals
     block_sizes = {
@@ -405,29 +553,29 @@ def _generate_msl(
         if name.startswith("_BLOCK_SIZE_") and isinstance(val, int)
     }
     for name in sorted(block_sizes):
-        msl_parts.append(f"    constexpr int {name} = {block_sizes[name]};")
+        prologue.append(f"    constexpr int {name} = {block_sizes[name]};")
     if layout is not None:
         for name, size in zip(LAUNCH_DIM_VARS, layout, strict=True):
-            msl_parts.append(f"    constexpr uint {name} = {size};")
+            prologue.append(f"    constexpr uint {name} = {size};")
     for site, (path, _) in sorted(reduction_sites.items()):
-        msl_parts.append(f"    constexpr uint {site} = {GROUP_PATHS.index(path)};")
+        prologue.append(f"    constexpr uint {site} = {GROUP_PATHS.index(path)};")
     if uses_fragments:
-        msl_parts.extend(f"    {line}" for line in LANE_PREAMBLE)
+        prologue.extend(f"    {line}" for line in LANE_PREAMBLE)
     if split > 1:
         # Each SIMD group's lanes take the layout's threads, in launch order.
         assert layout is not None
         tx, ty, _ = layout
         lane = LANE if uses_fragments else REGISTER_LANE
-        msl_parts.append(
+        prologue.append(
             f"    const uint3 tid = uint3({lane} % {tx}, ({lane} / {tx}) % {ty}, "
             f"{lane} / {tx * ty});"
         )
 
     # ``threadgroup`` variables are only legal at kernel scope, but a reduction
     # can be emitted from inside a loop body, so their declarations are hoisted
-    # here from the generated ``_METAL_TG_BUF_*`` module globals.
-    for buf_name, buf_dtype, buf_slots in threadgroup_buffers:
-        msl_parts.append(f"    threadgroup {buf_dtype} {buf_name}[{buf_slots}];")
+    # to the kernel's scratch from the generated ``_METAL_TG_BUF_*`` module
+    # globals.
+    scratch = [(dtype, name, slots) for name, dtype, slots in threadgroup_buffers]
 
     state = EmitState(
         declared={
@@ -447,10 +595,10 @@ def _generate_msl(
         ),
     )
 
-    body_at = len(msl_parts)
-    _emit_stmts(body_stmts, msl_parts, indent=4, state=state)
+    body: list[str] = []
+    _emit_stmts(body_stmts, body, indent=4, state=state)
     # The lane bases of the register operands' layouts.
-    msl_parts[body_at:body_at] = [f"    {line}" for line in state.lane_decls]
+    body[:0] = [f"    {line}" for line in state.lane_decls]
     if state.split_slots:
         # ``fragment_mma._split`` and ``mpp_registers.register_split`` kept
         # it within the threadgroup memory.
@@ -458,25 +606,30 @@ def _generate_msl(
             state.split_slots * MSL_SCALAR_BYTES["float"]
             <= MAX_THREADGROUP_MEMORY_BYTES
         )
-        msl_parts.insert(
-            body_at, f"    threadgroup float {SPLIT_BUFFER}[{state.split_slots}];"
-        )
-    msl_parts[kernel_at:kernel_at] = [
-        f"constant {ctype} {name}[{len(entries)}] = {{{', '.join(entries)}}};"
-        for (ctype, entries), name in state.tables.items()
-    ]
-
-    msl_parts.append("}")
+        scratch.append(("float", SPLIT_BUFFER, state.split_slots))
     slots = (c10_at, reduction_at, preamble_at)
-    c10_lines, reduction_lines = c10_source(
-        "\n".join(p for i, p in enumerate(msl_parts) if i not in slots),
-        uses_reductions,
+    kernel = MSLKernel(
+        name=kernel_name,
+        preamble=tuple(p for i, p in enumerate(preamble) if i not in slots),
+        tables=tuple(
+            f"constant {ctype} {name}[{len(entries)}] = {{{', '.join(entries)}}};"
+            for (ctype, entries), name in state.tables.items()
+        ),
+        params=tuple(params),
+        attributes=tuple(attributes),
+        threads=required_threads_per_threadgroup,
+        prologue=tuple(prologue),
+        scratch=tuple(scratch),
+        body=tuple(body),
     )
-    parts: list[str | None] = [*msl_parts]
-    parts[c10_at] = "\n".join(c10_lines) if c10_lines else None
+    c10_lines, reduction_lines = c10_source(kernel.render(), uses_reductions)
+    filled: list[str | None] = [*preamble]
+    filled[c10_at] = "\n".join(c10_lines) if c10_lines else None
     if reduction_at is not None:
-        parts[reduction_at] = "\n".join(reduction_lines) if reduction_lines else None
-    return "\n".join(p for p in parts if p is not None)
+        filled[reduction_at] = "\n".join(reduction_lines) if reduction_lines else None
+    return dataclasses.replace(
+        kernel, preamble=tuple(p for p in filled if p is not None)
+    )
 
 
 def _constexpr_decl(name: str, value: object) -> str:

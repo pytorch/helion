@@ -1,7 +1,7 @@
 """Python AST → MSL C++ statement-level translation functions.
 
 Provides pure functions for converting Python AST nodes to MSL C++ text.
-Used by ``metal_kernel._generate_msl`` to translate the body of a
+Used by ``metal_jit._generate_msl_kernel`` to translate the body of a
 ``@metal_jit`` decorated function into MSL source code.
 
 MetalOverrides (reused from Inductor's MPS codegen) emits MSL expression strings;
