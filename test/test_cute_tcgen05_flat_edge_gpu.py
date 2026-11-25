@@ -234,6 +234,91 @@ class TestCuteTcgen05FlatEdgeGpu(RefEagerTestDisabled, TestCase):
         b = torch.randn(2, 1000, 1000, device=DEVICE, dtype=torch.bfloat16)
         self._check(_bmm, (a, b), torch.bmm(a, b), [1, 128, 256, 64])
 
+    def test_batched_tf32_loads_through_tma(self) -> None:
+        # fp32 batches computed as tf32 run the tcgen05 MMA over their rank-3
+        # TMA tensors (``cute_mma._batched_tf32_tma_operands``): the tf32
+        # products, against an fp64 reference, on the search's one-CTA tiles
+        # (persistent 64x128 over 64-deep fp32 k-blocks, 128x128 over 32-deep
+        # ones beside four C stages, flat 64x128 over partial M and N tiles),
+        # b N-major and K-major, and at the default config. A persistent tile
+        # over partial tiles keeps the SIMT lowering (no TMA). The output
+        # starts NaN, so a tile left unwritten fails.
+        cases = (
+            (64, 128, 128, 128, False, [1, 64, 128, 64], 4, 2, "persistent"),
+            (16, 128, 128, 256, True, [1, 128, 128, 32], 6, 4, "persistent"),
+            (8, 96, 72, 48, False, [1, 64, 128, 32], 4, 2, "flat"),
+            (8, 96, 72, 48, False, [1, 64, 128, 32], 4, 2, "persistent"),
+        )
+        for batch, m, n, k, b_k_major, block_sizes, ab_stages, c_stages, pid in cases:
+            a = torch.randn(batch, m, k, device=DEVICE, dtype=torch.float32)
+            if b_k_major:
+                b = torch.randn(batch, n, k, device=DEVICE).transpose(1, 2)
+            else:
+                b = torch.randn(batch, k, n, device=DEVICE, dtype=torch.float32)
+            expected = torch.bmm(a.double(), b.double()).float()
+            out = torch.full(
+                (batch, m, n), float("nan"), device=DEVICE, dtype=torch.float32
+            )
+            bound = _bmm_into.bind((a, b, out))
+            self.assertTrue(bound.config_spec.tcgen05.search_enabled)
+            config = bound.config_spec.default_config()
+            config.config.update(
+                block_sizes=block_sizes,
+                pid_type="persistent_interleaved" if pid == "persistent" else "flat",
+                tcgen05_persistence_model=(
+                    "static_persistent" if pid == "persistent" else "non_persistent"
+                ),
+                tcgen05_ab_stages=ab_stages,
+                tcgen05_c_stages=c_stages,
+            )
+            tma = pid == "flat" or m % block_sizes[1] == n % block_sizes[2] == 0
+            for candidate, on_tma in (
+                (config, tma),
+                (bound.config_spec.default_config(), True),
+            ):
+                code = bound.to_code(candidate)
+                self.assertEqual(
+                    "'input_dtype': 'cutlass.TFloat32'" in code, on_tma, candidate
+                )
+                self.assertEqual("tma_tensor_a" in code, on_tma, candidate)
+                out.fill_(float("nan"))
+                bound.set_config(candidate)
+                bound(a, b, out)
+                torch.testing.assert_close(out, expected, rtol=2e-2, atol=0.25)
+        # Whole-tile configs whose fp32 tcgen05 lowering is refused (a split
+        # epilogue store) run the exact scalar fallback over the K loop's
+        # lanes, on the generic thread layout and schedule: the default
+        # config, flat 64x32 tiles and persistent 64x128 ones of 4 x 512^3,
+        # where a K loop without lanes summed one k per K tile (relative
+        # error 0.97).
+        a = torch.randn(4, 512, 512, device=DEVICE, dtype=torch.float32)
+        b = torch.randn(4, 512, 512, device=DEVICE, dtype=torch.float32)
+        expected = torch.bmm(a.double(), b.double()).float()
+        out = torch.full_like(expected, float("nan"))
+        bound = _bmm_into.bind((a, b, out))
+        self.assertTrue(bound.config_spec.tcgen05.search_enabled)
+        for update in (
+            {},
+            {
+                "block_sizes": [1, 64, 32, 16],
+                "pid_type": "flat",
+                "tcgen05_persistence_model": "non_persistent",
+            },
+            {
+                "block_sizes": [1, 64, 128, 64],
+                "pid_type": "persistent_interleaved",
+                "tcgen05_persistence_model": "static_persistent",
+            },
+        ):
+            config = bound.config_spec.default_config()
+            config.config.update(update, epilogue_subtile=2)
+            code = bound.to_code(config)
+            self.assertNotIn("cutlass.TFloat32", code, config)
+            out.fill_(float("nan"))
+            bound.set_config(config)
+            bound(a, b, out)
+            torch.testing.assert_close(out, expected, rtol=1e-4, atol=1e-3)
+
     def test_ragged_batched_matrices_run_one_pair_each(self) -> None:
         # One persistent 256x256 CTA pair per ragged matrix (the planner's
         # batched_pair_matrix): TMA zero-fills past each matrix and the 3-D

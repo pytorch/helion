@@ -584,13 +584,22 @@ def default_cute_mma_support(
     warp_f16bf16: bool = True,
     tcgen05_f16bf16: bool = True,
     tcgen05_f8: bool = True,
+    tcgen05_tf32: bool = False,
 ) -> SimpleNamespace:
-    """Return a ``get_cute_mma_support()`` mock with tcgen05-on defaults."""
+    """Return a ``get_cute_mma_support()`` mock with tcgen05-on defaults.
+
+    ``tcgen05_tf32`` defaults off, as the field of ``CuteMmaSupport`` does
+    (the probed record sets it where the DSL builds the tf32 atom): with it,
+    an fp32 dot under ``dot_precision="tf32"`` binds the tcgen05 TF32 MMA
+    (the CTA-pair search and its seeds); without it, the same bind keeps the
+    flat SIMT / warp lowerings.
+    """
     return SimpleNamespace(
         supported_impls=supported_impls,
         warp_f16bf16=warp_f16bf16,
         tcgen05_f16bf16=tcgen05_f16bf16,
         tcgen05_f8=tcgen05_f8,
+        tcgen05_tf32=tcgen05_tf32,
     )
 
 

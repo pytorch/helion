@@ -2116,6 +2116,38 @@ def _one_cta_persistent_parameters(
     return cast("tuple[int, int, int]", (bm, bn, bk))
 
 
+# The K tile, in 16-bit elements, the 256x256 pair seeds take where no proved
+# dense pipeline widened the K block (``cluster_m2_seed_bk_choices``).
+_NATIVE_SEED_BLOCK_K = 128
+
+
+def _four_byte_operands(state: CuteTcgen05Config) -> bool:
+    """Whether the GEMM's operands are 4 bytes wide (fp32 computed as tf32)."""
+    dtype = state.matmul_input_dtype
+    return dtype is not None and dtype.itemsize == 4
+
+
+def seed_block_k(state: CuteTcgen05Config, block_k: int) -> int:
+    """The K tile of a CTA-pair seed whose rings were sized on 16-bit
+    operands (``block_k`` elements of 2 bytes): the same bytes per K step,
+    so a 4-byte (fp32-as-tf32) operand takes half the elements. The seeds'
+    stage counts stay: three 128-deep 16-bit stages hold 192 KiB of the
+    256x256 pair's ring, three 64-deep fp32 ones the same. Taken as
+    written, the fp32 seed is 256x256x128 at two stages, a 256 KiB ring the
+    tcgen05 path refuses, so it lowers to the SIMT fallback:
+
+        for lane_0 in range(32):
+            for lane_1 in range(16):
+                ...
+                tmp0 = (in0.iterator + cutlass.Int32(indices_0) * ...).load()
+
+    (tf32 16384x3072x768 with b K-major: 29 ms; the 256x256x64 three-stage
+    pair it becomes here: 103 us, and its 32-deep six-stage twin, cuBLAS's
+    ``256x256x32 ... 2sm`` tile: 101 us).
+    """
+    return block_k // 2 if _four_byte_operands(state) else block_k
+
+
 def cluster_m2_seed_bk_choices(state: CuteTcgen05Config) -> tuple[int, ...]:
     """Keep the largest legal K seed and earlier/default K geometries.
 
@@ -2123,7 +2155,9 @@ def cluster_m2_seed_bk_choices(state: CuteTcgen05Config) -> tuple[int, ...]:
     configs stay stable. When a proved dense pipeline widened this K
     block, its former native K128 ceiling, which may differ from that
     default, is kept too. Preserve both geometries in the initial
-    population without replacing the expanded-high seed.
+    population without replacing the expanded-high seed. A 4-byte
+    operand's largest K seed stages the bytes of the 16-bit seeds' native
+    K step (``seed_block_k``), within its K block's bounds.
     """
     constraints = state.cluster_m2_search_constraints
     fragments = facts._matmul_block_fragments(state)
@@ -2132,14 +2166,30 @@ def cluster_m2_seed_bk_choices(state: CuteTcgen05Config) -> tuple[int, ...]:
         return ()
     fragment = fragments[2]
     if constraints.allow_edge_k_tail_family:
-        bk = TCGEN05_TWO_CTA_EDGE_K_TAIL_BLOCK_K
-        return (
-            (bk,)
-            if fragment.low <= bk <= fragment.high
-            and repair.cluster_m2_bk_is_valid(bk, constraints)
-            else ()
-        )
+        # The family's K tile, at the 16-bit seeds' bytes first: a 4-byte
+        # operand's 256x256x128 tile at the family's two stages is a 256 KiB
+        # ring, which lowers to the SIMT fallback (tf32 3000x3000x1000), and
+        # its 64-deep tile is one the family admits.
+        for bk in dict.fromkeys(
+            (
+                seed_block_k(state, TCGEN05_TWO_CTA_EDGE_K_TAIL_BLOCK_K),
+                TCGEN05_TWO_CTA_EDGE_K_TAIL_BLOCK_K,
+            )
+        ):
+            if fragment.low <= bk <= fragment.high and repair.cluster_m2_bk_is_valid(
+                bk, constraints
+            ):
+                return (bk,)
+        return ()
     bk = fragment.high
+    if _four_byte_operands(state):
+        # The 16-bit seeds' bytes per K step (their native 128-deep K tile):
+        # a 64-deep 4-byte tile, or a shallower K block whole. A K block
+        # bounded above it (``hl.register_block_size(128, 128)``) keeps its
+        # own floor rather than losing every pair seed.
+        scaled = min(fragment.high, seed_block_k(state, _NATIVE_SEED_BLOCK_K))
+        if scaled >= fragment.low:
+            bk = scaled
     while bk >= fragment.low:
         if repair.cluster_m2_bk_is_valid(bk, constraints):
             break
@@ -2989,7 +3039,7 @@ def _plain_cluster_n2_seed_config(
         return None
     if deep:
         assert bk is None, "deep seeds own their K tile"
-        bk = TCGEN05_TWO_CTA_EDGE_K_TAIL_DEEP_BLOCK_K
+        bk = seed_block_k(state, TCGEN05_TWO_CTA_EDGE_K_TAIL_DEEP_BLOCK_K)
         ab_stages = _two_cta_deep_ab_stages(state, bk)
         if not (
             bk_fragment.low <= bk <= bk_fragment.high
@@ -3055,7 +3105,8 @@ def _plain_cluster_n2_seed_config(
 
 
 def _two_cta_deep_ab_stages(state: CuteTcgen05Config, bk: int) -> int:
-    """AB depth of the deep (bk=64) 256x256 two-CTA seed.
+    """AB depth of the deep (bk=64; bk=32 for 4-byte operands) 256x256
+    two-CTA seed.
 
     nvjet's 64x6 ring for 16-bit operands; fp8 operands halve the
     per-stage SMEM, so the ring goes as deep as the budget admits (12 at
@@ -3306,8 +3357,10 @@ def autotune_seed_configs(state: CuteTcgen05Config) -> list[Config]:
             state, edge_n2_seed_config
         ):
             seeds.append(Config(**edge_n2_seed_config))
+    deep_clc_seed: Config | None = None
     if plain_clc_seed is not None:
-        # Deep-staged bk=64 variant of the plain CLC seed: halving the K
+        # Deep-staged bk=64 variant of the plain CLC seed (bk=32 for 4-byte
+        # operands: ``seed_block_k``): halving the K
         # tile and doubling the AB pipeline depth absorbs UMMA latency on
         # SHORT-K shapes where the per-tile K loop is otherwise too short
         # to hide the drain (fp16 8192x6144x4096: ratio 1.002 vs cuBLAS
@@ -3318,16 +3371,17 @@ def autotune_seed_configs(state: CuteTcgen05Config) -> list[Config]:
         assert deep_view is not None
         blocks, m_index, n_index, k_index = deep_view
         deep_block_sizes = list(blocks)
-        deep_block_sizes[k_index] = 64
+        deep_bk = seed_block_k(state, 64)
+        deep_block_sizes[k_index] = deep_bk
         constraints = state.cluster_m2_search_constraints
         if (
             constraints is not None
-            and repair.cluster_m2_bk_is_valid(64, constraints)
+            and repair.cluster_m2_bk_is_valid(deep_bk, constraints)
             and smem.ab_stages_three_fits(
                 state,
                 bm=cast("int", deep_block_sizes[m_index]),
                 bn=cast("int", deep_block_sizes[n_index]),
-                bk=64,
+                bk=deep_bk,
                 cluster_m=2,
                 ab_stages=6,
             )
@@ -3335,7 +3389,8 @@ def autotune_seed_configs(state: CuteTcgen05Config) -> list[Config]:
             deep_seed_config["block_sizes"] = deep_block_sizes
             deep_seed_config["tcgen05_ab_stages"] = 6
             deep_seed_config["tcgen05_c_stages"] = 2
-            seeds.append(Config(**deep_seed_config))
+            deep_clc_seed = Config(**deep_seed_config)
+            seeds.append(deep_clc_seed)
     plain_cluster_n2_seed = _plain_cluster_n2_seed_config(state)
     if plain_cluster_n2_seed is not None:
         seeds.append(plain_cluster_n2_seed)
@@ -3365,6 +3420,23 @@ def autotune_seed_configs(state: CuteTcgen05Config) -> list[Config]:
             clc_n2_seed_config["tcgen05_cluster_n"] = 2
             clc_n2_seed_config["l2_groupings"] = [TCGEN05_CLUSTER_N2_SEED_L2_GROUPING]
             seeds.append(Config(**clc_n2_seed_config))
+        if deep_clc_seed is not None and _four_byte_operands(state):
+            # The deep CLC seed's own 2x2 twin (its L2 grouping kept), and
+            # with it its fallback-cluster twin (``_fallback_cluster_seed_configs``),
+            # for 4-byte operands, where the 32-deep ring wins in every
+            # cluster form: tf32 16384x3072x768 with b K-major, of cuBLAS
+            # (GB300, CUDA graphs over cold inputs), the CLC 2x2 with
+            # fallback clusters on the 64-deep three-stage ring at
+            # grouping 8 (the twin of the 2x2 seed above) 0.979, on the
+            # 32-deep six-stage ring at grouping 8 0.994-0.999, at 4
+            # 1.003-1.005; the 2x1 pairs' best, 256x256x32 x 6, 0.977-0.982.
+            # The 2x2 seed above keeps the 16-bit seeds' 64-deep ring:
+            #     block_sizes=[256, 256, 64], tcgen05_ab_stages=3, tcgen05_cluster_n=2, l2_groupings=[8]
+            # this one:
+            #     block_sizes=[256, 256, 32], tcgen05_ab_stages=6, tcgen05_cluster_n=2, l2_groupings=[4]
+            deep_clc_n2_seed_config: dict[str, Any] = dict(deep_clc_seed.config)
+            deep_clc_n2_seed_config["tcgen05_cluster_n"] = 2
+            seeds.append(Config(**deep_clc_n2_seed_config))
     # An expanded K ceiling must not evict earlier/default geometries'
     # pipeline/aux placement. Rebuild each family at each K tile so its
     # dependent shared-memory decisions remain valid.

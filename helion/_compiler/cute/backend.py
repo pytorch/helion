@@ -822,6 +822,7 @@ def _detect_specialized_mma_loop(
     from .cute_mma import _mma_tiles_are_static_full
     from .cute_mma import _ragged_batched_tcgen05_config
     from .cute_mma import _tcgen05_cp_async_a_mma_bm
+    from .cute_mma import _tcgen05_fp32_lowering_blocked
     from .cute_mma import analyze_cute_mma_node
     from .cute_mma import ensure_tcgen05_fragment_epilogue_plan
     from .mma_support import cute_fp32_dot_uses_tf32
@@ -970,6 +971,24 @@ def _detect_specialized_mma_loop(
             # emitter raises rather than declining, so this agreement holds.
             return True
         if k_loop_is_subrange:
+            continue
+        if (
+            mma_impl == "tcgen05"
+            and lhs_val.dtype == torch.float32
+            and candidate.operands.has_leading_passthrough
+            and _tcgen05_fp32_lowering_blocked(
+                fn.codegen,
+                node,
+                lhs_operand=candidate.operands.lhs,
+                rhs_operand=candidate.operands.rhs,
+                config=config,
+            )
+        ):
+            # The emitter demotes this fp32 dot to the universal lowering
+            # (``_emit_mma_pipeline``), which declines a batched GEMM: the
+            # scalar fallback that runs instead reads one k per lane, so a
+            # lane-free K loop would sum one k per K tile (an epilogue_subtile
+            # config of fp32 4 x 512^3 bmm).
             continue
         if mma_impl != "universal" and _specialized_mma_root_threads_support_impl(
             mma_impl,

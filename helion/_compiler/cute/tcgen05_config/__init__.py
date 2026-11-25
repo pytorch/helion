@@ -74,6 +74,11 @@ class CuteTcgen05Config:
     def __init__(self, config_spec: ConfigSpec) -> None:
         self.config_spec = config_spec
         self.search_enabled: bool = False
+        # ``register_search_surface`` has planned the search: from then on
+        # ``search_enabled`` and ``matmul_block_ids`` name the GEMM it took,
+        # and a batched fp32 dot it did not take gets no operand analysis
+        # (``cute_mma._batched_tf32_tma_operands``).
+        self.search_planned: bool = False
         self.matmul_block_ids: tuple[int, int, int] | None = None
         # Separate device launches may own independent native contractions.
         # They share pipeline knobs, but never a single matrix-axis projection.
