@@ -22,6 +22,7 @@ from ..backend import Backend
 from ..backend import BackendState
 from ..backend import DeviceIRStage
 from ..backend import _largest_divisor_at_most
+from ._constants import DTYPE_TO_METAL
 from ._constants import MAX_THREAD_AXES
 from ._constants import MAX_THREADS_PER_THREADGROUP
 from ._constants import SIMD_WIDTH
@@ -417,12 +418,6 @@ class MetalBackend(Backend):
             MetalSplitReductionHeuristic,
         )
 
-    @staticmethod
-    def _get_dtype_to_metal() -> dict[torch.dtype, str]:
-        from torch._inductor.codegen.mps import DTYPE_TO_METAL
-
-        return DTYPE_TO_METAL
-
     _ACC_TYPE: ClassVar[dict[torch.dtype, str]] = {
         torch.float16: "float",
         torch.bfloat16: "float",
@@ -491,10 +486,9 @@ class MetalBackend(Backend):
         return BackendState.EXPERIMENTAL
 
     def dtype_str(self, dtype: torch.dtype) -> str:
-        dtype_map = self._get_dtype_to_metal()
-        if dtype not in dtype_map:
+        if dtype not in DTYPE_TO_METAL:
             raise exc.BackendUnsupported(self.name, f"dtype: {dtype}")
-        return dtype_map[dtype]
+        return DTYPE_TO_METAL[dtype]
 
     def acc_type(self, dtype: torch.dtype) -> str:
         if dtype not in self._ACC_TYPE:

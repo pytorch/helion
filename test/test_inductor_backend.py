@@ -932,26 +932,7 @@ class TestInductorBackend(InductorBackendTestCase):
 
     @parametrize(
         "case",
-        [
-            "distinct",
-            "repeated",
-            "rows",
-            *(
-                subtest(
-                    case,
-                    decorators=[
-                        skipIfRefEager(
-                            "ref mode's atomic_add writes the stride-0 view of "
-                            "out[0] with a setitem, which PyTorch refuses: more "
-                            "than one element of the written-to tensor refers to "
-                            "a single memory location (unlanded fix: "
-                            "pytorch/helion#4576; drop this skip with it)"
-                        )
-                    ],
-                )
-                for case in ("one_element", "constant")
-            ),
-        ],
+        ["distinct", "repeated", "rows", "one_element", "constant"],
     )
     def test_atomic_store(self, case):
         # index_put(accumulate=True) at an arange-based index is an atomic_add

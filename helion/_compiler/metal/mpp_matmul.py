@@ -77,7 +77,6 @@ from typing import TypeGuard
 from typing import cast
 
 import torch
-from torch._inductor.codegen.mps import DTYPE_TO_METAL
 from torch._inductor.runtime.runtime_utils import next_power_of_2
 from torch.fx.node import Node
 from torch.multiprocessing.reductions import StorageWeakRef
@@ -108,6 +107,7 @@ from ..variable_origin import GridOrigin
 from ..variable_origin import TileBeginOrigin
 from ..variable_origin import TileIdOrigin
 from . import positional_rebind
+from ._constants import DTYPE_TO_METAL
 from .factored_dims import FactoredValue
 from .factored_dims import factored_size
 from .factored_dims import widened_iota
@@ -5293,7 +5293,7 @@ class _Replicas:
         #: The thread axes each name's value may vary on, over every binding
         #: of the name.  A name the body reads but never binds is a kernel
         #: parameter, a launch constant, ``tgid``, a threadgroup buffer or a
-        #: helper (``metal_jit._generate_msl`` declares nothing else), each
+        #: helper (``metal_jit._generate_msl_kernel`` declares nothing else), each
         #: the same on every thread of the threadgroup.  A name not in the
         #: body at all was made after it, by splicing (a lane jam's
         #: ``t_1__lane0``), and :meth:`reads_axes` lets it vary on every axis.

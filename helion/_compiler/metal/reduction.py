@@ -69,7 +69,7 @@ if TYPE_CHECKING:
     from ..tile_dispatch import TileStrategyDispatch
 
 #: Prefix of the generated module-level globals that carry threadgroup scratch
-#: declarations from codegen to ``metal_jit._generate_msl``.  Mirrors how
+#: declarations from codegen to ``metal_jit._generate_msl_kernel``.  Mirrors how
 #: ``_BLOCK_SIZE_*`` globals reach the same place.
 TG_BUFFER_GLOBAL_PREFIX = "_METAL_TG_BUF_"
 
