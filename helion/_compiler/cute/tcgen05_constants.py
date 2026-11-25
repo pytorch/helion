@@ -229,6 +229,183 @@ TCGEN05_TRANSPOSED_PRODUCT_MIN_GAIN = 1.03
 # of its dependent-launch wait (``cute_mma._tcgen05_operand_l2_prefetch_lines``):
 # 96 KB, what one SM pulls in the ~400 ns its CTA waits for the release.
 TCGEN05_OPERAND_L2_PREFETCH_MAX_LINES = 768
+# The warps of a flat one-CTA kernel that prefetch its CTA's operand footprint
+# ahead of the dependent-launch wait (``cute_mma._build_flat_operand_l2_prefetch``):
+# the epilogue warps, idle until the accumulator is ready.
+TCGEN05_FLAT_L2_PREFETCH_WARPS = 4
+# The shortest K loop, in 64-wide k-blocks, over which a flat one-CTA kernel
+# prefetches its footprint: shorter loops lose to the prefetch, longer ones
+# gain. GB300, bf16, the same flat config without and with the prefetch, of
+# cuBLAS: transposed 128x192xK with b stored [K, N] on 48 CTAs of [64, 8,
+# 128]: K 512 (8 k-blocks) 0.934 -> 0.867, 1000 (16) 0.885 -> 0.943, 2048 (32)
+# 1.081 -> 1.154, 4096 (64) 0.771 -> 0.797; 32x1280x1000 RR (16, 40 CTAs)
+# 0.901 -> 1.020; 128x1000x768 RC (12, 64 CTAs) 0.882 -> 0.874. The persistent
+# one-tile kernel's prefetch (the TMA-load role's) gains over short loops too
+# (bf16 256x512x512 RR, 8 k-blocks: 0.989 -> 1.048) and takes no such floor;
+# issuing the flat kernel's prefetch from its TMA warp or releasing its
+# dependents ahead of the prefetch changes none of these.
+TCGEN05_FLAT_L2_PREFETCH_MIN_K_BLOCKS = 16
+# The lines a one-tile one-CTA CTA prefetches when most of its grid starts
+# early (``tcgen05_one_cta_l2_prefetch_max_lines``).
+TCGEN05_ONE_CTA_L2_PREFETCH_EARLY_GRID_MAX_LINES = 2048
+
+
+def tcgen05_one_cta_l2_prefetch_max_lines(*, work_ctas: int, num_sm: int) -> int:
+    """The most 128-byte lines a one-tile one-CTA CTA L2-prefetches ahead of
+    its dependent-launch wait (``cute_mma._tcgen05_operand_l2_prefetch_lines``,
+    ``cute_mma._build_flat_operand_l2_prefetch``).
+
+    Under a dependent launch the previous call of a ``work_ctas``-CTA grid
+    holds ``work_ctas`` SMs; this call's CTAs start on the other ones as soon
+    as the previous call releases its dependents, a whole kernel ahead of the
+    dependency, and the rest only as SMs free up (~400 ns ahead, the window
+    ``TCGEN05_OPERAND_L2_PREFETCH_MAX_LINES`` is sized for). Where at least
+    half the grid starts early (``3 * work_ctas <= 2 * num_sm``), a CTA
+    prefetches up to ``TCGEN05_ONE_CTA_L2_PREFETCH_EARLY_GRID_MAX_LINES``.
+    GB300 (152 SMs), bf16, CUDA graphs over cold inputs, the same config
+    without and with the prefetch, of cuBLAS: 128x768x768 RR (48 CTAs, 1152
+    lines) 0.982 -> 1.129, 32x1280x960 RC (80, 1080) 0.924 -> 1.037,
+    128x640x1000 RR (80, 1272) 0.934 -> 0.982, 128x768x1000 RR (96, 1272)
+    0.942 -> 0.966, 128x768x768 RC (96, 960) 1.006 -> 1.077; with 128 CTAs
+    (24 start early) 640 lines still gain (256x512x512 RR 0.989 -> 1.048)
+    and 1280 lose (256x512x1024 RR 1.034 -> 1.004, RC 1.011 -> 1.001)."""
+    if num_sm > 0 and 3 * work_ctas <= 2 * num_sm:
+        return TCGEN05_ONE_CTA_L2_PREFETCH_EARLY_GRID_MAX_LINES
+    return TCGEN05_OPERAND_L2_PREFETCH_MAX_LINES
+
+
+# The dependent-launch L2 warm-up (``cute_mma._tcgen05_pdl_l2_warmup_kblocks``):
+# the grid's first CTAs in launch order, which sit on the SMs the previous
+# call (or its last wave) leaves idle, prefetch the grid's first k-blocks of
+# every A and B row. Eight of them: from 24 the burst competes with the
+# previous call's DRAM reads. At most 8192 lines each (~4 us of issue at one
+# line per clock): the release test stops the warm-up when the dependency
+# resolves, so the cap bounds the issue work rather than an overrun into
+# the warming CTA's own epilogue (which cost -12..-15% before that test).
+# At least four 128-byte lines per row (four 64-deep 16-bit k-blocks, two
+# 128-deep ones): fewer keep little of the gain (six keep about half). The
+# bytes warmed count, not the k-blocks they split into: bf16 1500x1536x384 on
+# the 256x128x128 pair (three 2-line k-blocks), CUDA graphs over cold inputs,
+# of cuBLAS: 1.00 -> 1.13 with the warm-up; 4096x512x384 on 128x256x128 1.02 ->
+# 1.18.
+TCGEN05_PDL_L2_WARMUP_CTAS = 8
+TCGEN05_PDL_L2_WARMUP_MAX_LINES_PER_CTA = 8192
+TCGEN05_PDL_L2_WARMUP_MIN_LINES = 4
+# A 128-row CTA pair whose grid leaves this many SMs idle or more warms only
+# rows of at most TCGEN05_PDL_L2_WARMUP_WIDE_MAX_LINES lines over all of K:
+# with 24 idle SMs, K of 512-1280 gains 2-14%, while K of 2048-4096 loses
+# 0.4-2.9% on 128x128 and 128x64 pairs (256-row pairs gain there: 2048x768x3072
+# +2%, 1000x9216x2304 +2%).
+TCGEN05_PDL_L2_WARMUP_WIDE_IDLE_SMS = 16
+TCGEN05_PDL_L2_WARMUP_WIDE_MAX_LINES = 24
+
+
+def tcgen05_last_wave_idle_sms(work_ctas: int, *, num_sm: int) -> int:
+    """The SMs a persistent CTA-pair grid of ``work_ctas`` tile CTAs leaves
+    idle in its last wave, where the next call's first CTAs start while it
+    still runs: one wave leaves ``num_sm - work_ctas``; with more tiles than
+    pairs (``num_sm // 2`` pairs, one tile each per wave) the pairs short of
+    a tile in the last wave exit a tile early. bf16 1000x9216x2304 on the
+    256x256 pair: 144 tiles over 76 pairs, 68 in the second wave, 16 idle
+    SMs."""
+    grid_ctas = min(work_ctas, num_sm // 2 * 2)
+    waves = -(-work_ctas // grid_ctas)
+    return num_sm - (work_ctas - grid_ctas * (waves - 1))
+
+
+def tcgen05_pdl_l2_warmup_cta_rows(m: int, n: int) -> int:
+    """The rows of A and B (counted together, A's first) each of the grid's
+    first ``TCGEN05_PDL_L2_WARMUP_CTAS`` CTAs warms
+    (``cute_mma._build_pdl_l2_warmup``): a contiguous block of
+    ``ceil(rows / CTAS)``."""
+    return -(-(m + n) // TCGEN05_PDL_L2_WARMUP_CTAS)
+
+
+def tcgen05_operand_l2_prefetch_lines(
+    *,
+    k: int,
+    itemsize: int,
+    cta_rows: int,
+    max_lines: int = TCGEN05_OPERAND_L2_PREFETCH_MAX_LINES,
+) -> int:
+    """The 128-byte lines per row a one-tile CTA whose ``cta_rows`` A and B
+    rows are K-major L2-prefetches ahead of its dependent-launch wait
+    (``cute_mma._tcgen05_operand_l2_prefetch_lines``, which has the study):
+    every line of its K extent where its rows hold at most ``max_lines``
+    lines in all (``TCGEN05_OPERAND_L2_PREFETCH_MAX_LINES``, or a one-CTA
+    tile's ``tcgen05_one_cta_l2_prefetch_max_lines``), else none."""
+    lines = -(-k * itemsize // 128)
+    return lines if cta_rows * lines <= max_lines else 0
+
+
+def tcgen05_pdl_l2_warmup_kblocks(
+    *,
+    m: int,
+    n: int,
+    k: int,
+    bk: int,
+    block_m: int,
+    block_n: int,
+    itemsize: int,
+    work_ctas: int,
+    num_sm: int,
+    one_tile_per_cta: bool,
+    ab_stages: int | None = None,
+) -> int:
+    """The k-blocks of every A and B row the first
+    ``TCGEN05_PDL_L2_WARMUP_CTAS`` CTAs of a CTA pair's persistent grid of
+    ``work_ctas`` tile CTAs warm into L2 for an ``m`` x ``n`` x ``k`` GEMM
+    with K-major operands on ``block_m`` x ``block_n`` pairs, 0 for none:
+    the shape's part of ``cute_mma._tcgen05_pdl_l2_warmup_kblocks``, which
+    adds the operand majors and the plan's gates, and which the pair-tile
+    orientation model asks too (``dense_aligned_n``). A ring of ``ab_stages``
+    stages (``None``: one deeper than the warm-up needs). None for:
+
+    - fewer than ``TCGEN05_PDL_L2_WARMUP_CTAS`` work CTAs (each warming CTA
+      takes its own block of ``tcgen05_pdl_l2_warmup_cta_rows`` rows);
+    - a one-tile CTA that prefetches its whole operand footprint itself
+      (``tcgen05_operand_l2_prefetch_lines``);
+    - fewer idle SMs than warming CTAs in the previous call's last wave
+      (``tcgen05_last_wave_idle_sms``), or a ``block_m`` under 256 (the
+      128-row pair) with ``TCGEN05_PDL_L2_WARMUP_WIDE_IDLE_SMS`` idle SMs and
+      rows of more than ``TCGEN05_PDL_L2_WARMUP_WIDE_MAX_LINES`` lines;
+    - a depth under ``TCGEN05_PDL_L2_WARMUP_MIN_LINES`` lines (the bytes
+      warmed per row, whatever ``bk`` splits them into).
+
+    bf16 1000x2048x2304 on 256x112 pairs: as written 76 tiles (152 CTAs)
+    leave none of GB300's 152 SMs idle (0); transposed, 72 leave 8, whose
+    eight CTAs warm the first k-blocks of all 3048 rows, 381 each (9 with
+    the 9-stage ring)."""
+    if work_ctas < TCGEN05_PDL_L2_WARMUP_CTAS:
+        return 0
+    if one_tile_per_cta and tcgen05_operand_l2_prefetch_lines(
+        k=k, itemsize=itemsize, cta_rows=block_m // 2 + block_n // 2
+    ):
+        return 0
+    idle_sms = tcgen05_last_wave_idle_sms(work_ctas, num_sm=num_sm)
+    if idle_sms < TCGEN05_PDL_L2_WARMUP_CTAS:
+        return 0
+    line_elems = 128 // itemsize
+    if bk % line_elems or (
+        idle_sms >= TCGEN05_PDL_L2_WARMUP_WIDE_IDLE_SMS
+        and -(-k // line_elems) > TCGEN05_PDL_L2_WARMUP_WIDE_MAX_LINES
+        and block_m < 256
+    ):
+        return 0
+    kblocks = min(
+        k // bk,
+        TCGEN05_PDL_L2_WARMUP_MAX_LINES_PER_CTA
+        // (tcgen05_pdl_l2_warmup_cta_rows(m, n) * (bk // line_elems)),
+    )
+    if ab_stages is not None:
+        kblocks = min(kblocks, ab_stages)
+    return (
+        kblocks
+        if kblocks * (bk // line_elems) >= TCGEN05_PDL_L2_WARMUP_MIN_LINES
+        else 0
+    )
+
+
 # An N-major B half row of the aligned-N pair must hold whole swizzle atoms
 # of at least this many bytes to be seeded.
 TCGEN05_ALIGNED_N_MN_B_ROW_BYTES = 64
@@ -388,7 +565,11 @@ def tcgen05_fixed_smem_overhead_bytes(
     128 B alignment: 128 B up to eight stages, 256 B up to sixteen), the
     accumulator barriers, the TMEM holding buffer and, on a CTA pair, the
     dealloc mbarrier. Exact for the measured kernels (164 B one-CTA / 172 B
-    two-CTA up to eight AB stages, 292 B / 300 B at nine to sixteen).
+    two-CTA up to eight AB stages, 292 B / 300 B at nine to sixteen). It
+    leaves out the 8 B release mbarrier of the dependent-launch L2 warm-up
+    (``cute_mma._build_pdl_l2_warmup``): the rings, the row stages and the
+    opt-in capacity are whole KiB, and these allocations, that barrier and
+    its alignment padding stay under one KiB, so an arena that fits holds it.
     """
     assert ab_stages > 0 and acc_stages > 0
     assert cluster_m in (1, 2)

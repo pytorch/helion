@@ -190,6 +190,8 @@ from .tcgen05_constants import TCGEN05_EPI_WARP_GROUP_CHOICES
 from .tcgen05_constants import TCGEN05_EPI_WARP_GROUPS_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_EPILOGUE_LAYOUT_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_EPILOGUE_LAYOUT_NORMAL
+from .tcgen05_constants import TCGEN05_FLAT_L2_PREFETCH_MIN_K_BLOCKS
+from .tcgen05_constants import TCGEN05_FLAT_L2_PREFETCH_WARPS
 from .tcgen05_constants import TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_GROUPED_AB_TILE_K_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_GROUPED_FULL_COVERAGE_CONFIG_KEY
@@ -223,6 +225,7 @@ from .tcgen05_constants import TCGEN05_LARGE_BN_PROOF_PROBLEM_SHAPE
 from .tcgen05_constants import TCGEN05_ODD_WIDTH_SUBTILE_N
 from .tcgen05_constants import TCGEN05_ONE_CTA_MAX_BLOCK_M
 from .tcgen05_constants import TCGEN05_OPERAND_L2_PREFETCH_MAX_LINES
+from .tcgen05_constants import TCGEN05_PDL_L2_WARMUP_CTAS
 from .tcgen05_constants import TCGEN05_PLAIN_NARROW_SUBTILE_BLOCK_NS
 from .tcgen05_constants import TCGEN05_PLAIN_NARROW_SUBTILE_N
 from .tcgen05_constants import TCGEN05_RADIX_STORE_BOX_M
@@ -240,6 +243,10 @@ from .tcgen05_constants import resolve_tcgen05_grouped_worklist_mma_profile
 from .tcgen05_constants import tcgen05_ab_smem_bytes_per_cta
 from .tcgen05_constants import tcgen05_grouped_worklist_smem_bytes
 from .tcgen05_constants import tcgen05_grouped_worklist_store_shape
+from .tcgen05_constants import tcgen05_one_cta_l2_prefetch_max_lines
+from .tcgen05_constants import tcgen05_operand_l2_prefetch_lines
+from .tcgen05_constants import tcgen05_pdl_l2_warmup_cta_rows
+from .tcgen05_constants import tcgen05_pdl_l2_warmup_kblocks
 from .tcgen05_constants import tcgen05_plain_narrow_subtile_covers_n
 from .tcgen05_constants import tcgen05_role_launch_n_width
 from .tcgen05_lifecycle import Tcgen05LifecycleContext
@@ -7103,11 +7110,20 @@ def _build_shared_ring_producer(
     return statement_from_string(src)
 
 
-def _tcgen05_operand_l2_prefetch_lines(plan: Tcgen05PipelinePlan) -> int:
-    """The 128-byte lines per operand row a one-tile CTA L2-prefetches ahead
-    of its dependent-launch wait (``_build_operand_l2_prefetch``): every line
-    of its K extent where its A and B rows hold at most
-    ``TCGEN05_OPERAND_L2_PREFETCH_MAX_LINES`` lines in all, else none.
+def _tcgen05_operand_l2_prefetch_lines(
+    plan: Tcgen05PipelinePlan, *, one_cta_max_lines: int
+) -> int:
+    """What a one-tile CTA L2-prefetches ahead of its dependent-launch wait
+    (``_build_operand_l2_prefetch``), 0 for nothing, within a budget of
+    ``TCGEN05_OPERAND_L2_PREFETCH_MAX_LINES`` lines on a CTA pair and
+    ``one_cta_max_lines`` on a one-CTA tile
+    (``tcgen05_one_cta_l2_prefetch_max_lines``). With K-major A and B, the
+    128-byte lines per operand row: every line of the K extent where the
+    CTA's A and B rows hold at most the budget in all. With an M-major A and
+    an N-major B (``_tcgen05_operand_l2_prefetch_lines_mn_major``) or, on a
+    one-CTA tile, mixed majors (``_flat_operand_l2_prefetch_footprint``), the
+    footprint's lines in all where they fit the budget: there the count only
+    says whether to prefetch, and the builder lays the lines out itself.
 
     With the previous grid's CTAs filling the SMs, most of a grid's CTAs
     start ~400 ns before the dependency releases (as SMs free up), and their
@@ -7122,15 +7138,57 @@ def _tcgen05_operand_l2_prefetch_lines(plan: Tcgen05PipelinePlan) -> int:
     1000x1024x1024 (2048) -8%, and so does a partial prefetch of a long K
     (1000x1024x2048, the first 4 lines: -0.8%).
     """
-    if not plan.tcgen05_mma_a_k_major or not plan.tcgen05_mma_b_k_major:
+    # A one-CTA tile takes up to ``one_cta_max_lines``
+    # (``tcgen05_one_cta_l2_prefetch_max_lines``: more where most of its grid
+    # starts early), a pair's CTA ``TCGEN05_OPERAND_L2_PREFETCH_MAX_LINES``.
+    max_lines = (
+        TCGEN05_OPERAND_L2_PREFETCH_MAX_LINES
+        if plan.tcgen05_is_two_cta
+        else one_cta_max_lines
+    )
+    if plan.tcgen05_mma_a_k_major != plan.tcgen05_mma_b_k_major:
+        # Mixed majors (the transposed product of an N-major b: b.T is an
+        # M-major A, a.T a K-major B) prefetch a one-CTA tile's whole
+        # footprint (``_flat_operand_l2_prefetch_footprint``); a pair's take
+        # none.
+        if plan.tcgen05_is_two_cta:
+            return 0
+        footprint = _flat_operand_l2_prefetch_footprint(plan)
+        if footprint is None:
+            return 0
+        lines = _flat_operand_l2_prefetch_lines(footprint, plan.k_total_size)
+        return lines if lines <= max_lines else 0
+    if not plan.tcgen05_mma_a_k_major:
         # An M-major A and an N-major B prefetch along K instead
-        # (``_tcgen05_operand_l2_prefetch_lines_mn_major``); mixed majors
-        # take none.
-        return _tcgen05_operand_l2_prefetch_lines_mn_major(plan)
-    lines = -(-plan.k_total_size * plan.input_dtype.itemsize // 128)
+        # (``_tcgen05_operand_l2_prefetch_lines_mn_major``).
+        return _tcgen05_operand_l2_prefetch_lines_mn_major(plan, max_lines=max_lines)
     pair = 2 if plan.tcgen05_is_two_cta else 1
-    rows = plan.tcgen05_mma_bm // pair + plan.tcgen05_mma_bn // pair
-    return lines if rows * lines <= TCGEN05_OPERAND_L2_PREFETCH_MAX_LINES else 0
+    return tcgen05_operand_l2_prefetch_lines(
+        k=plan.k_total_size,
+        itemsize=plan.input_dtype.itemsize,
+        cta_rows=plan.tcgen05_mma_bm // pair + plan.tcgen05_mma_bn // pair,
+        max_lines=max_lines,
+    )
+
+
+def _operand_source_dim(info: _MmaOperandInfo | None, logical_dim: int) -> int:
+    """The argument layout dim a logical operand dim reads: the operand's own
+    dim, or for an operand transposed inside the kernel the source dim it
+    comes from (``_build_operand_l2_prefetch``)."""
+    order = None if info is None else info.source_to_logical_order
+    return logical_dim if order is None else order[logical_dim]
+
+
+def _l2_prefetch_stmt(tensor: str, index: str, dim: int, offset: str) -> str:
+    """``cute.arch.prefetch`` into L2 of the line at element ``index *
+    stride[dim] + offset`` of argument ``tensor`` (``index`` steps the
+    argument's layout dim ``dim``), the statement every operand L2 prefetch
+    emits."""
+    return (
+        f"cute.arch.prefetch(({tensor}.iterator + {index} * "
+        f"cutlass.Int64({tensor}.layout.stride[{dim}]) + {offset}).llvm_ptr, "
+        "cache_level='L2')"
+    )
 
 
 def _build_operand_l2_prefetch(
@@ -7182,6 +7240,19 @@ def _build_operand_l2_prefetch(
     the previous grid writes after it was prefetched holds that write when
     the loads after the wait read it.
     """
+    if plan.tcgen05_mma_a_k_major != plan.tcgen05_mma_b_k_major:
+        # mixed majors on a one-CTA tile (``_tcgen05_operand_l2_prefetch_lines``)
+        footprint = _flat_operand_l2_prefetch_footprint(plan)
+        assert footprint is not None and not plan.tcgen05_is_two_cta
+        return _build_flat_operand_l2_prefetch(
+            plan,
+            footprint,
+            lane="cute.arch.lane_idx()"
+            + (f" + cutlass.Int32(32) * {load_rank}" if load_rank is not None else ""),
+            threads=32 * load_warps,
+            gate=None,
+            names=names,
+        )
     if not plan.tcgen05_mma_a_k_major:
         return _build_operand_l2_prefetch_mn_major(
             plan, load_warps=load_warps, load_rank=load_rank, names=names
@@ -7215,21 +7286,17 @@ def _build_operand_l2_prefetch(
     # prefetch the first rows' lines over and over.
     analysis = plan.analysis
 
-    def _source_dim(info: _MmaOperandInfo | None, logical_dim: int) -> int:
-        order = None if info is None else info.source_to_logical_order
-        return logical_dim if order is None else order[logical_dim]
-
     for tensor, row_stride, offset, extent, cta_rows in (
         (
             plan.lhs_arg_name,
-            _source_dim(None if analysis is None else analysis.lhs, 0),
+            _operand_source_dim(None if analysis is None else analysis.lhs, 0),
             plan.m_offset_var,
             plan.m_size,
             plan.tcgen05_mma_bm // pair,
         ),
         (
             plan.rhs_arg_name,
-            _source_dim(None if analysis is None else analysis.rhs, 1),
+            _operand_source_dim(None if analysis is None else analysis.rhs, 1),
             plan.n_offset_var,
             plan.n_size,
             plan.tcgen05_mma_bn // pair,
@@ -7244,14 +7311,202 @@ def _build_operand_l2_prefetch(
             f"    {index} = {offset} + {rank} * cutlass.Int32({cta_rows}) + {row}",
             f"    if {row} < cutlass.Int32({cta_rows}) and {index} < cutlass.Int32({extent}):",
             f"        for {k} in cutlass.range_constexpr({lines}):",
-            (
-                f"            cute.arch.prefetch(({tensor}.iterator + {index} * "
-                f"cutlass.Int64({tensor}.layout.stride[{row_stride}]) + "
-                f"cutlass.Int32({line_elems}) * cutlass.Int32({k})).llvm_ptr, "
-                "cache_level='L2')"
+            "            "
+            + _l2_prefetch_stmt(
+                tensor,
+                index,
+                row_stride,
+                f"cutlass.Int32({line_elems}) * cutlass.Int32({k})",
             ),
         ]
     return statement_from_string("if True:\n" + textwrap.indent("\n".join(src), "    "))
+
+
+def _tcgen05_pdl_l2_warmup_kblocks(
+    plan: Tcgen05PipelinePlan, *, work_ctas: int, num_sm: int, one_tile_per_cta: bool
+) -> int:
+    """The k-blocks of every A and B row the grid's first
+    ``TCGEN05_PDL_L2_WARMUP_CTAS`` CTAs warm into L2 while the previous
+    kernel still runs (``_build_pdl_l2_warmup``), 0 for none.
+
+    Under a dependent launch the previous call's CTAs hold their SMs until
+    they exit. A grid whose previous call leaves SMs idle (a one-wave grid
+    throughout, a multi-wave grid in its last wave:
+    ``tcgen05_last_wave_idle_sms``) gets its first CTAs, in launch order,
+    placed on those SMs microseconds before its dependency releases; every
+    other CTA starts as the previous call's CTAs exit and then waits ~1 us on
+    DRAM for its first stages. The warm depth is what the TMA warps issue
+    right after the release (the ring), at most what K holds, and at most
+    ``TCGEN05_PDL_L2_WARMUP_MAX_LINES_PER_CTA`` lines for the busiest
+    warming CTA (each takes ``ceil(rows / CTAS)`` rows). A 128-row pair whose
+    grid leaves ``TCGEN05_PDL_L2_WARMUP_WIDE_IDLE_SMS`` SMs idle or more
+    warms only rows of at most ``TCGEN05_PDL_L2_WARMUP_WIDE_MAX_LINES``
+    lines over all of K (the measured boundary between the short-K gains
+    and the long-K losses of its 128-CTA grids). Only K-major A and B warm:
+    an M-major A and an N-major B (K rows of lines) gain nothing
+    (768x768x2048 CR on GB300: -0.2..+0.4%).
+    """
+    if not (plan.tcgen05_mma_a_k_major and plan.tcgen05_mma_b_k_major):
+        return 0
+    return tcgen05_pdl_l2_warmup_kblocks(
+        m=plan.m_size,
+        n=plan.n_size,
+        k=plan.k_total_size,
+        bk=plan.bk,
+        block_m=plan.tcgen05_mma_bm,
+        block_n=plan.tcgen05_mma_bn,
+        itemsize=plan.input_dtype.itemsize,
+        work_ctas=work_ctas,
+        num_sm=num_sm,
+        one_tile_per_cta=one_tile_per_cta,
+        ab_stages=plan.tcgen05_ab_stage_count_value,
+    )
+
+
+def _build_pdl_l2_warmup(
+    plan: Tcgen05PipelinePlan,
+    *,
+    kblocks: int,
+    warp_idx: str,
+    epi_active: str,
+    epi_warps: int,
+    release: str,
+    names: Callable[[str], str],
+) -> ast.stmt:
+    """The epilogue warps of the grid's first ``TCGEN05_PDL_L2_WARMUP_CTAS``
+    CTAs prefetch the first ``kblocks`` k-blocks of every A and B row into L2
+    (``_tcgen05_pdl_l2_warmup_kblocks``), each CTA its own block of rows.
+    bf16 1000x1024x2048 on the transposed 128x112 pair (A = in0 [1024, 2048],
+    B = in1 [2048, 1000], both K-major; 14 stages; 2024 rows, 253 per CTA)::
+
+        if tcgen05_epi_active:
+            tcgen05_l2_warm_cta = (
+                cutlass.Int32(cute.arch.block_idx()[0])
+                + cutlass.Int32(cute.arch.block_idx()[1])
+                * cutlass.Int32(cute.arch.grid_dim()[0])
+                + ...  # the launch-order (linear) block index
+            )
+            if tcgen05_l2_warm_cta < cutlass.Int32(8):
+                tcgen05_l2_warm_tid = (
+                    cute.arch.lane_idx() + cutlass.Int32(32) * tcgen05_warp_idx
+                )
+                for tcgen05_l2_warm_line in cutlass.range_constexpr(14):
+                    if not cute.arch.mbarrier_test_wait(
+                        tcgen05_l2_warm_release, cutlass.Int32(0)
+                    ):
+                        for tcgen05_l2_warm_j in cutlass.range_constexpr(2):
+                            tcgen05_l2_warm_local = tcgen05_l2_warm_tid + cutlass.Int32(
+                                128
+                            ) * cutlass.Int32(tcgen05_l2_warm_j)
+                            tcgen05_l2_warm_row = (
+                                tcgen05_l2_warm_cta * cutlass.Int32(253)
+                                + tcgen05_l2_warm_local
+                            )
+                            if tcgen05_l2_warm_local < cutlass.Int32(
+                                253
+                            ) and tcgen05_l2_warm_row < cutlass.Int32(1024):
+                                cute.arch.prefetch(
+                                    (
+                                        in0.iterator
+                                        + tcgen05_l2_warm_row
+                                        * cutlass.Int64(in0.layout.stride[0])
+                                        + cutlass.Int32(64)
+                                        * cutlass.Int32(tcgen05_l2_warm_line)
+                                    ).llvm_ptr,
+                                    cache_level="L2",
+                                )
+                            if (
+                                tcgen05_l2_warm_local < cutlass.Int32(253)
+                                and tcgen05_l2_warm_row >= cutlass.Int32(1024)
+                                and tcgen05_l2_warm_row < cutlass.Int32(2024)
+                            ):
+                                cute.arch.prefetch(
+                                    (
+                                        in1.iterator
+                                        + (tcgen05_l2_warm_row - cutlass.Int32(1024))
+                                        * cutlass.Int64(in1.layout.stride[1])
+                                        + ...
+                                    ).llvm_ptr,
+                                    cache_level="L2",
+                                )
+
+    Line by line (each row's first line first), so the lines the TMA warps
+    issue first land first, and only until the dependency releases: each
+    line first tests the release barrier the TMA-load warp arrives on right
+    after its dependent-launch wait (``_pdl_release_arrive``). Without that
+    test a grid whose previous kernel never launches it early (its first
+    CTAs start with every other CTA, after the release) warms while its own
+    loads run and loses up to 10% (1000x1024x1024, 1500x384x1536 on GB300);
+    with it such a grid warms at most the line in flight (-0.9..+0.2%).
+    Emitted after the TMEM-allocation barrier: the MMA warp's
+    ``wait_for_alloc`` never waits on the warming warps, which are otherwise
+    idle until their tile's accumulator is ready. As
+    ``_build_operand_l2_prefetch``, the prefetch is a cache hint: L2 is the
+    point of coherence, so a line the previous grid writes after it was
+    prefetched holds that write when the loads after the wait read it.
+    """
+    line_elems = 128 // plan.input_dtype.itemsize
+    lines = kblocks * plan.bk // line_elems
+    ctas = TCGEN05_PDL_L2_WARMUP_CTAS
+    m = plan.m_size
+    rows = m + plan.n_size
+    cta_rows = tcgen05_pdl_l2_warmup_cta_rows(plan.m_size, plan.n_size)
+    threads = 32 * epi_warps
+    analysis = plan.analysis
+    a_row_dim = _operand_source_dim(None if analysis is None else analysis.lhs, 0)
+    b_row_dim = _operand_source_dim(None if analysis is None else analysis.rhs, 1)
+    cta, tid, k, j, local, row = (
+        names(f"tcgen05_l2_warm_{field}")
+        for field in ("cta", "tid", "line", "j", "local", "row")
+    )
+    line = f"cutlass.Int32({line_elems}) * cutlass.Int32({k})"
+    in_cta = f"{local} < cutlass.Int32({cta_rows}) and " if cta_rows % threads else ""
+    src = [
+        (
+            f"{cta} = cutlass.Int32(cute.arch.block_idx()[0]) + "
+            "cutlass.Int32(cute.arch.block_idx()[1]) * cutlass.Int32(cute.arch.grid_dim()[0]) + "
+            "cutlass.Int32(cute.arch.block_idx()[2]) * cutlass.Int32(cute.arch.grid_dim()[0]) "
+            "* cutlass.Int32(cute.arch.grid_dim()[1])"
+        ),
+        f"if {cta} < cutlass.Int32({ctas}):",
+        f"    {tid} = cute.arch.lane_idx() + cutlass.Int32(32) * {warp_idx}",
+        f"    for {k} in cutlass.range_constexpr({lines}):",
+        f"        if not cute.arch.mbarrier_test_wait({release}, cutlass.Int32(0)):",
+        f"            for {j} in cutlass.range_constexpr({-(-cta_rows // threads)}):",
+        f"                {local} = {tid} + cutlass.Int32({threads}) * cutlass.Int32({j})",
+        f"                {row} = {cta} * cutlass.Int32({cta_rows}) + {local}",
+        f"                if {in_cta}{row} < cutlass.Int32({m}):",
+        f"                    {_l2_prefetch_stmt(plan.lhs_arg_name, row, a_row_dim, line)}",
+        (
+            f"                if {in_cta}{row} >= cutlass.Int32({m}) and "
+            f"{row} < cutlass.Int32({rows}):"
+        ),
+        "                    "
+        + _l2_prefetch_stmt(
+            plan.rhs_arg_name, f"({row} - cutlass.Int32({m}))", b_row_dim, line
+        ),
+    ]
+    return statement_from_string(
+        f"if {epi_active}:\n" + textwrap.indent("\n".join(src), "    ")
+    )
+
+
+def _pdl_release_arrive(
+    release: str, *, producer_state: str, tma_warp: str
+) -> ast.stmt:
+    """The TMA-load warp arrives on the warm-up's release barrier once, right
+    after its first tile's dependent-launch wait (``_build_pdl_l2_warmup``)::
+
+        cute.arch.griddepcontrol_wait()
+        if tcgen05_ab_producer_state.count == cutlass.Int32(0) and tcgen05_tma_warp:
+            with cute.arch.elect_one():
+                cute.arch.mbarrier_arrive(tcgen05_l2_warm_release)
+    """
+    return statement_from_string(
+        f"if {producer_state}.count == cutlass.Int32(0) and {tma_warp}:\n"
+        "    with cute.arch.elect_one():\n"
+        f"        cute.arch.mbarrier_arrive({release})"
+    )
 
 
 def _mn_major_operand_segments(
@@ -7326,17 +7581,18 @@ def _mn_major_operand_segments(
     return tuple(segments)
 
 
-def _tcgen05_operand_l2_prefetch_lines_mn_major(plan: Tcgen05PipelinePlan) -> int:
+def _tcgen05_operand_l2_prefetch_lines_mn_major(
+    plan: Tcgen05PipelinePlan, *, max_lines: int
+) -> int:
     """The 128-byte lines a one-tile CTA with an M-major A and an N-major B
     prefetches into L2 (``_build_operand_l2_prefetch_mn_major``): its whole A
-    and B footprint where that holds at most
-    ``TCGEN05_OPERAND_L2_PREFETCH_MAX_LINES`` lines, else none (the window of
-    ``_tcgen05_operand_l2_prefetch_lines``)."""
+    and B footprint where that holds at most ``max_lines`` lines, else none
+    (the budget of ``_tcgen05_operand_l2_prefetch_lines``)."""
     segments = _mn_major_operand_segments(plan)
     if segments is None:
         return 0
     lines = plan.k_total_size * sum(segment[-1] for segment in segments)
-    return lines if lines <= TCGEN05_OPERAND_L2_PREFETCH_MAX_LINES else 0
+    return lines if lines <= max_lines else 0
 
 
 def _build_operand_l2_prefetch_mn_major(
@@ -7450,13 +7706,240 @@ def _build_operand_l2_prefetch_mn_major(
                 else ":"
             ),
             *(
-                f"        cute.arch.prefetch(({tensor}.iterator + {k} * "
-                f"cutlass.Int64({tensor}.layout.stride[{k_axis}]) + {point}).llvm_ptr, "
-                "cache_level='L2')"
+                "        " + _l2_prefetch_stmt(tensor, k, k_axis, point)
                 for point in points
             ),
         ]
     return statement_from_string("if True:\n" + textwrap.indent("\n".join(src), "    "))
+
+
+@dataclass(frozen=True)
+class _FlatOperandL2Prefetch:
+    """One operand's footprint in the L2 prefetch of a one-CTA CTA that runs
+    one tile (``_flat_operand_l2_prefetch_footprint``; issued by the flat
+    pipeline and, for mixed majors, the persistent one: see
+    ``_build_flat_operand_l2_prefetch``): ``tensor`` is the argument,
+    ``offset`` the CTA's tile offset along its M (A) or N (B) extent of
+    ``extent`` elements. A K-major operand prefetches ``cta_elems`` rows, each
+    stepped by layout dim ``dim``; an MN-major one prefetches, for each K
+    index (stepped by layout dim ``dim``), its ``cta_elems`` contiguous
+    elements. ``elements`` are the element offsets of the 128-byte lines one
+    row (K-major) or one K index's segment (MN-major) touches."""
+
+    tensor: str
+    offset: str
+    extent: int
+    cta_elems: int
+    k_major: bool
+    dim: int
+    elements: tuple[int, ...]
+
+
+def _flat_operand_l2_prefetch_footprint(
+    plan: Tcgen05PipelinePlan,
+) -> tuple[_FlatOperandL2Prefetch, ...] | None:
+    """The lines of A and B a one-CTA CTA running one tile reads, per operand
+    of either major (``_build_flat_operand_l2_prefetch``: the flat pipeline,
+    and the persistent pipeline for mixed majors); ``None`` for an operand
+    transposed inside the kernel (``x[k, m].T``), whose argument strides are
+    in source order.
+
+    A K-major row of ``K * itemsize`` bytes starting ``o`` bytes into a line
+    covers ``ceil((o + K * itemsize) / 128)`` lines: its elements one line
+    apart from its start address all of them but, where rows are not a whole
+    number of lines apart, a last one that only the row's last element
+    addresses. bf16 a [128, 1000] row-major: 2000-byte rows start 0, 80, 32,
+    112, 64, 16, 96, 48 bytes into a line in turn, and those starting more
+    than 48 bytes in reach a 17th line (elements 0, 64, ..., 960 address 16,
+    element 999 the 17th). An MN-major operand's segment of one K index
+    covers its own lines likewise (``_mn_major_operand_segments``)."""
+    analysis = plan.analysis
+    if (
+        analysis is None
+        or analysis.lhs.source_to_logical_order is not None
+        or analysis.rhs.source_to_logical_order is not None
+    ):
+        return None
+    item_bytes = plan.input_dtype.itemsize
+    line_elems = 128 // item_bytes
+    k = plan.k_total_size
+    footprint = []
+    # A is [M, K]: its rows step stride[0] (K-major) or K steps stride[1]
+    # (M-major); B is [K, N]: rows step stride[1] (K-major) or K steps
+    # stride[0] (N-major).
+    for tensor, offset, extent, cta_elems, operand, k_major, row_dim in (
+        (
+            plan.lhs_arg_name,
+            plan.m_offset_var,
+            plan.m_size,
+            plan.tcgen05_mma_bm,
+            analysis.lhs,
+            plan.tcgen05_mma_a_k_major,
+            0,
+        ),
+        (
+            plan.rhs_arg_name,
+            plan.n_offset_var,
+            plan.n_size,
+            plan.tcgen05_mma_bn,
+            analysis.rhs,
+            plan.tcgen05_mma_b_k_major,
+            1,
+        ),
+    ):
+        k_dim = 1 - row_dim
+        stride = operand.logical_fake.stride(row_dim if k_major else k_dim)
+        offset_elems = operand.logical_fake.storage_offset()
+        if type(stride) is not int or type(offset_elems) is not int:
+            return None
+        run = k if k_major else cta_elems
+        elements = list(range(0, run, line_elems))
+        if (
+            (stride * item_bytes) % 128
+            or (offset_elems * item_bytes) % 128
+            or (not k_major and (cta_elems * item_bytes) % 128)
+        ) and run - 1 not in elements:
+            elements.append(run - 1)
+        footprint.append(
+            _FlatOperandL2Prefetch(
+                tensor,
+                offset,
+                extent,
+                cta_elems,
+                k_major,
+                row_dim if k_major else k_dim,
+                tuple(elements),
+            )
+        )
+    return tuple(footprint)
+
+
+def _flat_operand_l2_prefetch_lines(
+    footprint: tuple[_FlatOperandL2Prefetch, ...], k: int
+) -> int:
+    """The 128-byte lines ``footprint`` addresses: rows times lines per row
+    for a K-major operand, K indices times lines per index for an MN-major
+    one."""
+    return sum(
+        (operand.cta_elems if operand.k_major else k) * len(operand.elements)
+        for operand in footprint
+    )
+
+
+def _build_flat_operand_l2_prefetch(
+    plan: Tcgen05PipelinePlan,
+    footprint: tuple[_FlatOperandL2Prefetch, ...],
+    *,
+    lane: str,
+    threads: int,
+    gate: str | None,
+    names: Callable[[str], str],
+) -> ast.stmt:
+    """Prefetch the A and B footprint of a one-CTA CTA that runs one tile into
+    L2 ahead of its dependent-launch wait (``_flat_operand_l2_prefetch_footprint``):
+    ``lane`` and ``threads`` number the issuing threads, ``gate`` selects them.
+    Two pipelines issue it:
+
+    - the flat one-CTA pipeline, whose warps all pass one wait: its epilogue
+      warps, idle until the accumulator is ready (``gate``: the first
+      ``TCGEN05_FLAT_L2_PREFETCH_WARPS`` warps);
+    - the persistent (role-local) one-CTA pipeline for mixed majors: its
+      TMA-load warps ahead of their wait (``_build_operand_l2_prefetch``, no
+      gate).
+
+    bf16 128 x 192 x 1000 with b stored [K, N], transposed (in0 = b.T
+    [192, 1000] M-major, in1 = a.T [1000, 128] K-major), on flat [64, 8, 128]
+    tiles::
+
+        if tcgen05_warp_idx < cutlass.Int32(4):
+            tcgen05_l2_pf_lane = tcgen05_lane_idx + cutlass.Int32(32) * tcgen05_warp_idx
+            tcgen05_l2_pf_point = tile_offset_0 + cutlass.Int32(0)
+            # in0: one line per K index (the CTA's 64 M-contiguous elements)
+            for tcgen05_l2_pf_i in cutlass.range_constexpr(8):
+                tcgen05_l2_pf_k = tcgen05_l2_pf_lane + cutlass.Int32(
+                    128
+                ) * cutlass.Int32(tcgen05_l2_pf_i)
+                if tcgen05_l2_pf_k < cutlass.Int32(
+                    1000
+                ) and tile_offset_0 < cutlass.Int32(192):
+                    cute.arch.prefetch(
+                        (
+                            in0.iterator
+                            + tcgen05_l2_pf_k * cutlass.Int64(in0.layout.stride[1])
+                            + tcgen05_l2_pf_point
+                        ).llvm_ptr,
+                        cache_level="L2",
+                    )
+            # in1: the CTA's 8 rows of 2000 bytes, every 64th element and the
+            # last (rows starting more than 48 bytes into a line reach a 17th)
+            for tcgen05_l2_pf_i_1 in cutlass.range_constexpr(1):
+                tcgen05_l2_pf_row = tcgen05_l2_pf_lane + cutlass.Int32(
+                    128
+                ) * cutlass.Int32(tcgen05_l2_pf_i_1)
+                tcgen05_l2_pf_index = tile_offset_1 + tcgen05_l2_pf_row
+                if tcgen05_l2_pf_row < cutlass.Int32(
+                    8
+                ) and tcgen05_l2_pf_index < cutlass.Int32(128):
+                    cute.arch.prefetch(
+                        (
+                            in1.iterator
+                            + tcgen05_l2_pf_index * cutlass.Int64(in1.layout.stride[1])
+                            + cutlass.Int32(0)
+                        ).llvm_ptr,
+                        cache_level="L2",
+                    )
+                    ...  # elements 64, 128, ..., 960 and 999
+        cute.arch.griddepcontrol_wait()
+
+    The prefetch is a cache hint: L2 is the point of coherence, so a line
+    the previous grid writes after it was prefetched holds that write when
+    the TMA loads after the wait read it."""
+    lane_expr, lane = lane, names("tcgen05_l2_pf_lane")
+    src = [f"{lane} = {lane_expr}"]
+    k = plan.k_total_size
+    for operand in footprint:
+        i = names("tcgen05_l2_pf_i")
+        if operand.k_major:
+            row, index = names("tcgen05_l2_pf_row"), names("tcgen05_l2_pf_index")
+            src += [
+                f"for {i} in cutlass.range_constexpr({-(-operand.cta_elems // threads)}):",
+                f"    {row} = {lane} + cutlass.Int32({threads}) * cutlass.Int32({i})",
+                f"    {index} = {operand.offset} + {row}",
+                f"    if {row} < cutlass.Int32({operand.cta_elems}) and {index} < cutlass.Int32({operand.extent}):",
+                *(
+                    "        "
+                    + _l2_prefetch_stmt(
+                        operand.tensor, index, operand.dim, f"cutlass.Int32({element})"
+                    )
+                    for element in operand.elements
+                ),
+            ]
+            continue
+        # An MN-major segment's lines past its first are clamped to the
+        # operand's extent (a partial last tile reads no address past it).
+        points = []
+        for element in operand.elements:
+            point = names("tcgen05_l2_pf_point")
+            src.append(f"{point} = {operand.offset} + cutlass.Int32({element})")
+            if element:
+                src += [
+                    f"if {point} > cutlass.Int32({operand.extent - 1}):",
+                    f"    {point} = cutlass.Int32({operand.extent - 1})",
+                ]
+            points.append(point)
+        kk = names("tcgen05_l2_pf_k")
+        src += [
+            f"for {i} in cutlass.range_constexpr({-(-k // threads)}):",
+            f"    {kk} = {lane} + cutlass.Int32({threads}) * cutlass.Int32({i})",
+            f"    if {kk} < cutlass.Int32({k}) and {operand.offset} < cutlass.Int32({operand.extent}):",
+            *(
+                "        " + _l2_prefetch_stmt(operand.tensor, kk, operand.dim, point)
+                for point in points
+            ),
+        ]
+    return statement_from_string(
+        f"if {gate or 'True'}:\n" + textwrap.indent("\n".join(src), "    ")
+    )
 
 
 def _build_split_initial_prefetch(
@@ -12957,6 +13440,20 @@ def _emit_mma_pipeline(
                 for init_stmt in tcgen05_deferred_barrier_inits:
                     prefix.append(statement_from_string(init_stmt))
             tcgen05_deferred_barrier_inits.clear()
+            if tcgen05_l2_warm_release is not None:
+                assert warp_idx is not None
+                prefix.append(
+                    statement_from_string(
+                        f"{tcgen05_l2_warm_release} = cute.arch.alloc_smem(cutlass.Int64, 1)"
+                    )
+                )
+                prefix.append(
+                    statement_from_string(
+                        f"if {warp_idx} == cutlass.Int32(0):\n"
+                        "    with cute.arch.elect_one():\n"
+                        f"        cute.arch.mbarrier_init({tcgen05_l2_warm_release}, 1)"
+                    )
+                )
             prefix.append(tcgen05_cluster_init_arrive)
             if tcgen05_alloc_tmem_before_cluster_wait:
                 # The MMA warp's ``tcgen05.alloc`` (cta_group::2: a handshake
@@ -13139,6 +13636,21 @@ def _emit_mma_pipeline(
         if tcgen05_tmem_publication is None:
             tcgen05_tmem_publication = tcgen05_wait_for_alloc
         prefix.append(tcgen05_wait_for_alloc)
+        if tcgen05_pdl_l2_warmup:
+            # After the allocation barrier: the MMA warp's ``wait_for_alloc``
+            # above must not wait for the warming warps.
+            assert warp_idx is not None and tcgen05_l2_warm_release is not None
+            prefix.append(
+                _build_pdl_l2_warmup(
+                    plan,
+                    kblocks=tcgen05_pdl_l2_warmup,
+                    warp_idx=warp_idx,
+                    epi_active=epi_active,
+                    epi_warps=tcgen05_epi_warp_count_value,
+                    release=tcgen05_l2_warm_release,
+                    names=df.new_var,
+                )
+            )
         prefix.append(
             statement_from_string(
                 f"if {plan.tcgen05_plan.exec_active}:\n"
@@ -13438,6 +13950,9 @@ def _emit_mma_pipeline(
     tcgen05_hoist_persistent_tma_role = False
     tcgen05_tma_wait_after_first_acquire = False
     tcgen05_operand_l2_prefetch = 0
+    tcgen05_pdl_l2_warmup = 0
+    tcgen05_flat_l2_prefetch: tuple[_FlatOperandL2Prefetch, ...] | None = None
+    tcgen05_l2_warm_release: str | None = None
     # A/B-load warps sharing the role-local TMA producer
     # (``_build_shared_ring_producer``; ``tcgen05_warp_spec_ab_load_warps``).
     tcgen05_ab_load_warps = 1
@@ -14418,29 +14933,141 @@ def _emit_mma_pipeline(
             and tcgen05_effective_scheduler_warps == 0
             and not plan.tcgen05_grouped_static_persistent
         )
-        # The lines per operand row a one-tile CTA L2-prefetches ahead of its
-        # dependent-launch wait (``_build_operand_l2_prefetch``, emitted with
-        # the role's first stage below), 0 for none: decided here, ahead of
-        # the prefix, because the persistent hoist below depends on it.
-        tcgen05_operand_l2_prefetch = (
-            _tcgen05_operand_l2_prefetch_lines(plan)
-            if tcgen05_tma_wait_after_first_acquire
-            and tcgen05_one_tile_per_cta
+        # A plain 2-D 16-bit GEMM released by its TMA warps' dependent-launch
+        # wait: the kernels whose operand rows the L2 prefetches below address
+        # directly (the one-tile prefetch also needs one tile per CTA).  A
+        # grid of 4-CTA clusters (``tcgen05_cluster_n=2``, A multicast across
+        # the two pairs) of at most one CTA per SM takes them as the pair grid
+        # does, each pair its own tile's rows. bf16 1000x768x128 CR on the
+        # 256x64 2x2 (24 clusters, one tile per CTA), ahead of the TMA warp's
+        # wait:
+        #
+        #     tcgen05_l2_pf_rank = cute.arch.make_warp_uniform(
+        #         cute.arch.block_idx_in_cluster()) & cutlass.Int32(1)
+        #     tcgen05_l2_pf_base = tile_offset_0 + tcgen05_l2_pf_rank * cutlass.Int32(128)
+        #     ...
+        #     cute.arch.griddepcontrol_wait()
+        #
+        # (the rank in the pair, as on the pair grid): back to back over cold
+        # inputs 1.09 of cuBLAS against 0.98 without; 1000x3072x1024 RC's
+        # 256x256 2x2 warms its operands (``_build_pdl_l2_warmup``), 1.02 ->
+        # 1.09.  A 4-CTA grid of more CTAs than SMs takes neither: its last
+        # wave's idle SMs are not the pair grid's (``tcgen05_last_wave_idle_sms``).
+        # The test counts SMs, not co-resident clusters (a driver query the
+        # host makes at launch: ``helion.runtime.get_max_active_clusters``).
+        # A cluster lives inside one GPC, so a B200 co-schedules 33 four-CTA
+        # clusters, not 37: the surplus clusters of a grid between the two
+        # counts run as a later wave, and the next call's first clusters start
+        # on the SMs it leaves idle while it runs, as after a pair grid's last
+        # wave.  Where fewer than two cluster slots stay free (a B200 grid of 32
+        # or 33 clusters), a warming cluster of the next call that finds no
+        # free slot starts only as this call's clusters exit, and the release
+        # test stops its warm-up once the dependency releases.  The prefetches
+        # are cache hints either way.
+        tcgen05_prefetch_shape = (
+            tcgen05_tma_wait_after_first_acquire
             and not plan.knobs.materialized_pdl
             and plan.knobs.int_or(plan.knobs.split_k, 1) == 1
-            and plan.tcgen05_cluster_n == 1
+            and (
+                plan.tcgen05_cluster_n == 1
+                or (
+                    plan.tcgen05_cluster_split_k == 1
+                    and one_shot_work_ctas is not None
+                    and one_shot_work_ctas <= env.config_spec.num_sm
+                )
+            )
             and plan.tcgen05_m_subtile_count == 1
             and not plan.tcgen05_cp_async_a
             and plan.row_union_plan is None
             and plan.tcgen05_grouped_plan is None
             and plan.input_dtype in (torch.bfloat16, torch.float16)
-            # (K-major A and B, or M-major A and N-major B:
-            # ``_tcgen05_operand_l2_prefetch_lines``)
             # (rows of one 2-D operand: a batched GEMM's rows would need its
             # batch offset)
             and (plan.analysis is None or not plan.analysis.has_leading_passthrough)
+        )
+        # The lines per operand row a one-tile CTA L2-prefetches ahead of its
+        # dependent-launch wait (``_build_operand_l2_prefetch``, emitted with
+        # the role's first stage below), 0 for none: decided here, ahead of
+        # the prefix, because the persistent hoist below depends on it.
+        tcgen05_operand_l2_prefetch = (
+            # (K-major A and B, or M-major A and N-major B:
+            # ``_tcgen05_operand_l2_prefetch_lines``)
+            _tcgen05_operand_l2_prefetch_lines(
+                plan,
+                one_cta_max_lines=tcgen05_one_cta_l2_prefetch_max_lines(
+                    work_ctas=cast("int", one_shot_work_ctas),
+                    num_sm=env.config_spec.num_sm,
+                ),
+            )
+            if tcgen05_prefetch_shape and tcgen05_one_tile_per_cta
             else 0
         )
+        # The flat one-CTA kernel's footprint prefetch, ahead of the
+        # dependent-launch wait all of its warps pass
+        # (``_build_flat_operand_l2_prefetch``), ``None`` for none.
+        tcgen05_flat_l2_prefetch = (
+            _flat_operand_l2_prefetch_footprint(plan)
+            if (
+                plan.tcgen05_pdl
+                and not plan.tcgen05_use_role_local_tma_producer
+                and not plan.tcgen05_pid_is_persistent
+                # (``TCGEN05_FLAT_L2_PREFETCH_MIN_K_BLOCKS``: shorter K loops
+                # lose to the prefetch)
+                and -(-plan.k_total_size // 64) >= TCGEN05_FLAT_L2_PREFETCH_MIN_K_BLOCKS
+                and not plan.tcgen05_is_two_cta
+                and not plan.knobs.materialized_pdl
+                and plan.knobs.int_or(plan.knobs.split_k, 1) == 1
+                and plan.tcgen05_cluster_m == 1
+                and plan.tcgen05_cluster_n == 1
+                and plan.tcgen05_m_subtile_count == 1
+                and not plan.tcgen05_cp_async_a
+                and plan.row_union_plan is None
+                and plan.tcgen05_grouped_plan is None
+                and plan.input_dtype in (torch.bfloat16, torch.float16)
+                and (plan.analysis is None or not plan.analysis.has_leading_passthrough)
+                and one_shot_work_ctas is not None
+            )
+            else None
+        )
+        if tcgen05_flat_l2_prefetch is not None and _flat_operand_l2_prefetch_lines(
+            tcgen05_flat_l2_prefetch, plan.k_total_size
+        ) > tcgen05_one_cta_l2_prefetch_max_lines(
+            work_ctas=cast("int", one_shot_work_ctas), num_sm=env.config_spec.num_sm
+        ):
+            tcgen05_flat_l2_prefetch = None
+        # The k-blocks per A and B row the grid's first CTAs warm into L2
+        # from the SMs the previous call leaves idle
+        # (``_tcgen05_pdl_l2_warmup_kblocks``), 0 for none; a CTA that
+        # prefetches its whole operand footprint itself needs none.
+        tcgen05_pdl_l2_warmup = (
+            _tcgen05_pdl_l2_warmup_kblocks(
+                plan,
+                work_ctas=one_shot_work_ctas,
+                num_sm=env.config_spec.num_sm,
+                # (with the one-tile prefetch's footprint check, which keeps
+                # the warm-up from a CTA that prefetches its operands itself)
+                one_tile_per_cta=tcgen05_one_tile_per_cta,
+            )
+            if tcgen05_prefetch_shape
+            and plan.tcgen05_pid_is_persistent
+            and one_shot_work_ctas is not None
+            and plan.tcgen05_is_two_cta
+            and plan.tcgen05_use_cluster_deferred_pipelines
+            # (``one_shot_work_ctas``: the CTAs of all tiles.) Several waves
+            # are counted on the CTA pair's persistent grid of one pair per
+            # two SMs; a one-wave grid launches its tiles whatever the
+            # multiplier.
+            and (
+                plan.knobs.num_sm_multiplier == 1
+                or one_shot_work_ctas <= env.config_spec.num_sm
+            )
+            else 0
+        )
+        if tcgen05_pdl_l2_warmup:
+            # The TMA-load warp arrives on it once its dependent-launch wait
+            # returns; the warm-up stops at the first k-block after that
+            # (``_build_pdl_l2_warmup``).
+            tcgen05_l2_warm_release = df.new_var("tcgen05_l2_warm_release")
         # A CTA that L2-prefetches its operands keeps the prefix join: the
         # prefetch already fills the window before the release, and the hoist
         # only issues it earlier, where the CTAs placed on SMs the previous
@@ -17636,6 +18263,14 @@ def _emit_mma_pipeline(
                                         "cute.arch.griddepcontrol_wait()"
                                     )
                                 )
+                                if tcgen05_l2_warm_release is not None:
+                                    initial_prefetch.append(
+                                        _pdl_release_arrive(
+                                            tcgen05_l2_warm_release,
+                                            producer_state=tma_producer_state,
+                                            tma_warp=tma_warp,
+                                        )
+                                    )
                             tcgen05_shared_ring_emitted = True
                             initial_prefetch.append(
                                 _build_shared_ring_producer(
@@ -17660,6 +18295,17 @@ def _emit_mma_pipeline(
                                 # global accesses follow it in program order.
                                 # (``passes.pdl.pdl_applies`` adds an entry
                                 # wait instead when a global read precedes it.)
+                                if tcgen05_flat_l2_prefetch is not None:
+                                    initial_prefetch.append(
+                                        _build_flat_operand_l2_prefetch(
+                                            plan,
+                                            tcgen05_flat_l2_prefetch,
+                                            lane=f"{lane_idx} + cutlass.Int32(32) * {warp_idx}",
+                                            threads=32 * TCGEN05_FLAT_L2_PREFETCH_WARPS,
+                                            gate=f"{warp_idx} < cutlass.Int32({TCGEN05_FLAT_L2_PREFETCH_WARPS})",
+                                            names=df.new_var,
+                                        )
+                                    )
                                 initial_prefetch.append(
                                     statement_from_string(
                                         "cute.arch.griddepcontrol_wait()"
@@ -17716,6 +18362,14 @@ def _emit_mma_pipeline(
                                     initial_prefetch.append(
                                         "cute.arch.griddepcontrol_wait()"
                                     )
+                                    if tcgen05_l2_warm_release is not None:
+                                        initial_prefetch.append(
+                                            _pdl_release_arrive(
+                                                tcgen05_l2_warm_release,
+                                                producer_state=tma_producer_state,
+                                                tma_warp=tma_warp,
+                                            )
+                                        )
                                     skip_acquire = True
                                 initial_prefetch.append(
                                     _build_initial_prefetch_if(

@@ -361,6 +361,29 @@ def _helion__matmul(a, b, out, tma_atom_a, tma_tensor_a, tma_atom_b, tma_tensor_
         tcgen05_pipeline_init_barrier.arrive_and_wait()
         if tcgen05_tma_initial_full_tile:
             tcgen05_ab_pipeline.producer_acquire(tcgen05_ab_producer_state, True)
+        if True:
+            tcgen05_l2_pf_lane = cute.arch.lane_idx()
+            for tcgen05_l2_pf_i in cutlass.range_constexpr(4):
+                tcgen05_l2_pf_row = tcgen05_l2_pf_lane + cutlass.Int32(32) * cutlass.Int32(tcgen05_l2_pf_i)
+                tcgen05_l2_pf_index = tile_offset_0 + tcgen05_l2_pf_row
+                if tcgen05_l2_pf_row < cutlass.Int32(128) and tcgen05_l2_pf_index < cutlass.Int32(1024):
+                    cute.arch.prefetch((a.iterator + tcgen05_l2_pf_index * cutlass.Int64(a.layout.stride[0]) + cutlass.Int32(0)).llvm_ptr, cache_level='L2')
+                    cute.arch.prefetch((a.iterator + tcgen05_l2_pf_index * cutlass.Int64(a.layout.stride[0]) + cutlass.Int32(64)).llvm_ptr, cache_level='L2')
+                    cute.arch.prefetch((a.iterator + tcgen05_l2_pf_index * cutlass.Int64(a.layout.stride[0]) + cutlass.Int32(128)).llvm_ptr, cache_level='L2')
+                    cute.arch.prefetch((a.iterator + tcgen05_l2_pf_index * cutlass.Int64(a.layout.stride[0]) + cutlass.Int32(192)).llvm_ptr, cache_level='L2')
+                    cute.arch.prefetch((a.iterator + tcgen05_l2_pf_index * cutlass.Int64(a.layout.stride[0]) + cutlass.Int32(256)).llvm_ptr, cache_level='L2')
+                    cute.arch.prefetch((a.iterator + tcgen05_l2_pf_index * cutlass.Int64(a.layout.stride[0]) + cutlass.Int32(320)).llvm_ptr, cache_level='L2')
+                    cute.arch.prefetch((a.iterator + tcgen05_l2_pf_index * cutlass.Int64(a.layout.stride[0]) + cutlass.Int32(384)).llvm_ptr, cache_level='L2')
+                    cute.arch.prefetch((a.iterator + tcgen05_l2_pf_index * cutlass.Int64(a.layout.stride[0]) + cutlass.Int32(448)).llvm_ptr, cache_level='L2')
+            tcgen05_l2_pf_point = tile_offset_1 + cutlass.Int32(0)
+            tcgen05_l2_pf_point_1 = tile_offset_1 + cutlass.Int32(64)
+            if tcgen05_l2_pf_point_1 > cutlass.Int32(1023):
+                tcgen05_l2_pf_point_1 = cutlass.Int32(1023)
+            for tcgen05_l2_pf_i_1 in cutlass.range_constexpr(16):
+                tcgen05_l2_pf_k = tcgen05_l2_pf_lane + cutlass.Int32(32) * cutlass.Int32(tcgen05_l2_pf_i_1)
+                if tcgen05_l2_pf_k < cutlass.Int32(512) and tile_offset_1 < cutlass.Int32(1024):
+                    cute.arch.prefetch((b.iterator + tcgen05_l2_pf_k * cutlass.Int64(b.layout.stride[0]) + tcgen05_l2_pf_point).llvm_ptr, cache_level='L2')
+                    cute.arch.prefetch((b.iterator + tcgen05_l2_pf_k * cutlass.Int64(b.layout.stride[0]) + tcgen05_l2_pf_point_1).llvm_ptr, cache_level='L2')
         cute.arch.griddepcontrol_wait()
         cute.arch.griddepcontrol_launch_dependents()
         if tcgen05_tma_initial_full_tile:
