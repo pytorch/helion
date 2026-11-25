@@ -5293,7 +5293,7 @@ class _Replicas:
         #: The thread axes each name's value may vary on, over every binding
         #: of the name.  A name the body reads but never binds is a kernel
         #: parameter, a launch constant, ``tgid``, a threadgroup buffer or a
-        #: helper (``metal_jit._generate_msl`` declares nothing else), each
+        #: helper (``metal_jit._generate_msl_kernel`` declares nothing else), each
         #: the same on every thread of the threadgroup.  A name not in the
         #: body at all was made after it, by splicing (a lane jam's
         #: ``t_1__lane0``), and :meth:`reads_axes` lets it vary on every axis.

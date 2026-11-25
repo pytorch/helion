@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+import contextvars
 import functools
 import logging
 from typing import TYPE_CHECKING
 
 from .. import _compat as _compat  # ensure Triton compatibility patches run
 from .. import exc
+from .._compiler.metal.export import MetalArgument as MetalArgument
+from .._compiler.metal.export import MetalLaunch as MetalLaunch
+from .._compiler.metal.export import capture_metal_launches as capture_metal_launches
 from .._compiler.metal.metal_launcher import (
     default_metal_launcher as default_metal_launcher,
 )
@@ -120,6 +124,15 @@ def default_launcher(
         raise
 
 
+#: While set, ``get_num_sm`` asks it first: a function of the device, the
+#: reserved SMs and the cluster size that returns the count, or None for the
+#: device's own.  Host code that runs without the device its kernels will
+#: run on sets it (Metal's ``capture_metal_launches``), in its own context.
+_num_sm_override: contextvars.ContextVar[
+    Callable[[torch.device, int, int], int | None] | None
+] = contextvars.ContextVar("helion_num_sm_override", default=None)
+
+
 def get_num_sm(
     device: torch.device, *, reserved_sms: int = 0, cluster_size: int = 1
 ) -> int:
@@ -127,8 +140,14 @@ def get_num_sm(
 
     Adds the CPU (Pallas-interpret) and TPU cases on top of the dependency-free
     GPU helper :func:`helion.runtime.triton.launcher.get_num_sm`. See that
-    function for argument/return semantics.
+    function for argument/return semantics.  ``_num_sm_override`` answers
+    first while set.
     """
+    override = _num_sm_override.get()
+    if override is not None:
+        count = override(device, reserved_sms, cluster_size)
+        if count is not None:
+            return count
     if device.type in ("cpu", "tpu"):
         # The GPU helper checks the cluster size on the other devices.
         _check_cluster_device(device, cluster_size)
