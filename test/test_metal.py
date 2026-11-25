@@ -42,6 +42,7 @@ from helion._testing import skipIfRefEager
 from helion._testing.metal import addmm_k_loop
 from helion._testing.metal import mpp_only
 from helion._testing.metal import run_with_msl
+from helion._testing.metal import scale_by_0dim
 from helion.autotuner.config_generation import ConfigGeneration
 import helion.language as hl
 
@@ -15885,6 +15886,14 @@ class TestMetalConfigFixedScalars(unittest.TestCase):
                 self.assertRaisesRegex(exc.BackendUnsupported, "does not fit an int"),
             ):
                 _constexpr_decl("n", value)
+
+    def test_0dim_tensor_binds_as_a_buffer(self) -> None:
+        """A 0-dim tensor binds as a buffer, which its loads index."""
+        x = torch.randn(64, device=DEVICE)
+        s = torch.tensor(0.5, device=DEVICE)
+        out, _, msl = run_with_msl(scale_by_0dim, (x, s))
+        self.assertIn("device float* s [[buffer(1)]]", msl)
+        torch.testing.assert_close(out, x * 0.5)
 
 
 @helion.kernel(backend="metal", static_shapes=True)
