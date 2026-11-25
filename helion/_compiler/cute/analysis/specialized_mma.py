@@ -264,7 +264,9 @@ def _analyzed_specialized_mma_plan(
     env: CompileEnvironment,
 ) -> _SpecializedMmaPlan | None:
     from ..cute_mma import _choose_mma_impl
+    from ..cute_mma import _is_persistent_pid_config
     from ..cute_mma import _mma_tiles_are_static_full
+    from ..cute_mma import _ragged_batched_tcgen05_config
     from ..cute_mma import _tcgen05_cp_async_a_mma_bm
     from ..cute_mma import analyze_cute_mma_node
     from ..cute_mma import ensure_tcgen05_fragment_epilogue_plan
@@ -283,8 +285,18 @@ def _analyzed_specialized_mma_plan(
     bn = env.block_sizes[root_mn_block_ids[1]].from_config(config)
     if not isinstance(bm, int) or not isinstance(bn, int):
         return None
-    if candidate.operands.has_leading_passthrough and not _mma_tiles_are_static_full(
-        candidate.operands, bm=bm, bn=bn, bk=bk
+    if (
+        candidate.operands.has_leading_passthrough
+        and not _mma_tiles_are_static_full(candidate.operands, bm=bm, bn=bn, bk=bk)
+        # (the persistent pairs over ragged matrices: ``cute_mma``'s
+        # ``_ragged_batched_tcgen05_config``; the flat one-CTA pipeline keeps
+        # its generic thread layout)
+        and not (
+            _is_persistent_pid_config(config)
+            and _ragged_batched_tcgen05_config(
+                config, candidate.operands, bm=bm, bn=bn, bk=bk
+            )
+        )
     ):
         return None
     lhs_val = candidate.operands.lhs.source_fake

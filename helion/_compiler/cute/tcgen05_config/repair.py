@@ -22,7 +22,7 @@ from typing import cast
 import torch
 
 from ....exc import InvalidConfig
-from ..cp_async_operand import TCGEN05_CP_ASYNC_A_BLOCK_K
+from ..cp_async_operand import TCGEN05_CP_ASYNC_A_BLOCK_KS
 from ..cp_async_operand import TCGEN05_CP_ASYNC_A_TILE_M
 from ..cute_epilogue import fanout_pre_wait_stages_rowvec_aux
 from ..cute_warp_mma_gemm import MATMUL_FAMILIES
@@ -893,6 +893,8 @@ def cluster_m2_bk_is_valid(
 ) -> bool:
     if bk <= 0:
         return False
+    if constraints.whole_k:
+        return bk == constraints.static_k
     if constraints.allow_edge_k_tail_family:
         # bk=64 halves the per-stage AB SMEM so a 16-bit edge kernel can
         # run a 5-deep AB pipeline (bf16 5000^3: 948 vs 815 TFLOP/s at the
@@ -1408,6 +1410,10 @@ def _fix_cluster_m2_search_config(
     if not isinstance(bk, int) or isinstance(bk, bool):
         config["tcgen05_cluster_m"] = 1
         return
+    if constraints.whole_k and bk < constraints.static_k:
+        # A sampled pair over a split one-K-tile K keeps the pair on K in
+        # one k-block (``Tcgen05ClusterM2SearchConstraints.whole_k``).
+        block_sizes[k_index] = bk = constraints.static_k
     if not cluster_m2_bk_is_valid(bk, constraints):
         config["tcgen05_cluster_m"] = 1
         return
@@ -4707,16 +4713,21 @@ def cp_async_a_config_ok(
     """Whether ``config`` runs the flat one-CTA kernel whose epilogue warps
     copy A with ``cp.async`` (``cute_mma``'s ``tcgen05_cp_async_a``): one
     CTA per 128-row tile, or per 256-row tile of two 128-row subtiles (in
-    the two accumulator stages, beside a single output store), by 64-deep
-    k-blocks, no cluster, no split K, the default SW128 A stage the
-    copies' views address, and the shared K loop whose epilogue warps
-    issue the refills (a persistent kernel's separate TMA-load role does
-    not)."""
+    the two accumulator stages, beside a single output store), by 16-, 32-
+    or 64-deep k-blocks (``TCGEN05_CP_ASYNC_A_BLOCK_KS``, from the A layout's
+    shallowest, ``cp_async_a_min_block_k``; past the first one when K ends in
+    a tail), no cluster, no split K, the default SW128 A
+    stage the copies' views address, and the shared K loop whose epilogue
+    warps issue the refills (a persistent kernel's separate TMA-load role
+    does not)."""
     view = facts._matmul_config_view(state, dict(config))
     if view is None:
         return False
     blocks, m_index, _n_index, k_index = view
     rows = (TCGEN05_CP_ASYNC_A_TILE_M, 2 * TCGEN05_CP_ASYNC_A_TILE_M)
+    bk = blocks[k_index]
+    extents = state.matmul_compile_time_static_extents
+    k = extents[2] if extents is not None else None
     return (
         config.get("tcgen05_cluster_m", 1) == 1
         and config.get("tcgen05_cluster_n", 1) == 1
@@ -4728,7 +4739,10 @@ def cp_async_a_config_ok(
             blocks[m_index] == TCGEN05_CP_ASYNC_A_TILE_M
             or config.get("tcgen05_acc_stages") in (None, 2)
         )
-        and blocks[k_index] == TCGEN05_CP_ASYNC_A_BLOCK_K
+        and bk in TCGEN05_CP_ASYNC_A_BLOCK_KS
+        and bk >= state.cp_async_a_min_block_k
+        and isinstance(k, int)
+        and (k % bk == 0 or k > bk)
         and config.get(TCGEN05_SPLIT_K_CONFIG_KEY) in (None, 1)
         and config.get(TCGEN05_LAYOUT_OVERRIDES_SWIZZLE_A_KEY) is None
     )
@@ -4757,8 +4771,9 @@ def validate_cp_async_a_config(
         "the kernel's A operand loads through the epilogue warps' cp.async "
         "producer (no TensorMap addresses it; the host left it unstaged), "
         "which runs the flat one-CTA kernel on 128-row tiles (256-row with "
-        "two accumulator stages and one output store) by 64-deep k-blocks, "
-        "without split K, an A swizzle override or a separate TMA producer"
+        "two accumulator stages and one output store) by 16-, 32- or 64-deep "
+        "k-blocks, without split K, an A swizzle override or a separate TMA "
+        "producer"
     )
 
 
@@ -4783,7 +4798,22 @@ def _fix_cp_async_a_search_config(
         and cp_async_a_paired_rows_allowed(state)
         else TCGEN05_CP_ASYNC_A_TILE_M
     )
-    blocks[k_index] = TCGEN05_CP_ASYNC_A_BLOCK_K
+    # the deepest k-block the producer copies within the sampled one
+    # (shallow k-blocks win on short K loops, ``TCGEN05_CP_ASYNC_A_BLOCK_KS``)
+    # that K admits
+    bk = blocks[k_index]
+    extents = state.matmul_compile_time_static_extents
+    k = extents[2] if extents is not None else None
+    depths = [
+        depth
+        for depth in TCGEN05_CP_ASYNC_A_BLOCK_KS
+        if depth >= state.cp_async_a_min_block_k
+        and isinstance(k, int)
+        and (k % depth == 0 or k > depth)
+    ]
+    if depths and bk not in depths:
+        within = [depth for depth in depths if isinstance(bk, int) and depth <= bk]
+        blocks[k_index] = max(within) if within else min(depths)
     if blocks[m_index] == 2 * TCGEN05_CP_ASYNC_A_TILE_M:
         config["tcgen05_acc_stages"] = 2
     config["pid_type"] = "flat"
@@ -5559,8 +5589,7 @@ def normalize_pre_pid_type(
             # (e.g. a unit-sized M); inert defaults are dropped. Values
             # that encode a real tcgen05 strategy still fail loudly — the
             # config cannot be honored and silently changing strategy
-            # could mask a miscompute (see
-            # ``test_batched_two_cta_partial_edge_tiles_projected_onto_one_cta``).
+            # could mask a miscompute.
             if fix_invalid or config[key] == fragment.default():
                 config.pop(key, None)
             else:

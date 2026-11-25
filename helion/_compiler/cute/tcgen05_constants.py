@@ -244,6 +244,15 @@ TCGEN05_TWO_CTA_FP8_SMALL_GRID_BLOCK_M = 128
 TCGEN05_TWO_CTA_FP8_SMALL_GRID_BLOCK_N = 128
 # Best measured seed L2 grouping for the full-tile CtaGroup.TWO row.
 TCGEN05_TWO_CTA_SEED_L2_GROUPING = 4
+# AB stages of the batched one-K-tile seed (``seeds._batched_one_k_tile_seed_configs``,
+# a 128x64 one-CTA tile: one 24 KB stage per tile): the ring six tiles deep,
+# not the seven that also fit. In CUDA graphs over cold inputs the two run alike
+# (bf16 512 x 512x512x64 RC, GB300, of cuBLAS: six 0.988-0.991, seven
+# 0.978-0.987), but the final selection's per-call timing reads the seven-deep
+# ring 6% slower than the six-deep one (55.4 us against 50.9), so a seed of
+# seven lost its finalist slot to a 256x256 pair over 16-deep k-blocks that
+# reads 51.6 per call and runs 55.2 in a graph (0.947).
+TCGEN05_BATCHED_ONE_K_TILE_SEED_AB_STAGES = 6
 # The M-tile grouping of a long N sweep (at least this many N tiles): a walk
 # that groups fewer M tiles re-reads B once per group (bf16 8192x32000x1024 +
 # bias, 125 N tiles, of the ATen GEMM: 0.84 grouped by 2, 0.94 by 8, 0.99 by

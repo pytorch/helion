@@ -206,6 +206,55 @@ def tcgen05_shape_rejected(
     )
 
 
+def batched_pair_matrix(
+    *,
+    itemsize: int,
+    rank3_operand: bool,
+    static_m: int | None,
+    static_n: int | None,
+    static_k: int | None,
+    ab_tma: bool,
+) -> bool:
+    """Whether a batched 16-bit GEMM runs its matrices on the persistent CTA
+    pairs: each matrix taller and wider than a 128 x 128 tile, and either
+    within one 256 x 256 CtaGroup.TWO tile or ragged against it in M or N
+    (however many pair tiles it spans), which the persistent pair schedules
+    run over the whole matrix. TMA zero-fills the A rows and B columns past
+    the matrix, and the pair's 3-D TMA store clips the tiles at each matrix's
+    edges (the batch is its own tensor-map dim). bf16 768 x 200x200x64
+    (ViT-style attention scores): the 256x256 pair 19.9 us against the flat
+    one-CTA 128x128 tiles' 27.2 (2 x 2 tiles per matrix, every one a fresh
+    launch slot) and cuBLAS's 19.9; bf16 64 x 1000x1000x64, 4 x 4 pair tiles
+    a matrix: the full-effort pick ran 27.7 us on the pairs against the flat
+    tiles' 42.8 (cuBLAS 26.2).
+
+    ``ab_tma``: both operands load through TMA (``cute_mma``'s
+    ``batched_ab_tma_provable``), which the pairs need over ragged matrices
+    (``_ragged_batched_pair_config``). bf16 40 x [200, 32] @ [32, 196] has
+    392-byte B rows no TensorMap addresses and too few elements to stage:
+    its pair seed would be the shared scalar-copy kernel, which refuses the
+    double edge (``BackendUnsupported: tcgen05 SIMT edge epilogue
+    double-edge output tiles ...``), so it keeps the flat one-CTA tiles."""
+    return (
+        itemsize == 2
+        and ab_tma
+        and rank3_operand
+        and static_m is not None
+        and static_n is not None
+        and static_k is not None
+        and static_m > 128
+        and static_n > 128
+        and (
+            (
+                static_m <= TCGEN05_TWO_CTA_BLOCK_M
+                and static_n <= TCGEN05_TWO_CTA_BLOCK_N
+            )
+            or static_m % TCGEN05_TWO_CTA_BLOCK_M != 0
+            or static_n % TCGEN05_TWO_CTA_BLOCK_N != 0
+        )
+    )
+
+
 def _one_cta_heights_miss_m(static_m: int) -> bool:
     """Whether no one-CTA tile height (64 or 128 rows) divides M: no
     persistent one-CTA schedule runs it, only the CtaGroup.TWO pairs, whose
@@ -282,6 +331,9 @@ class CuteTcgen05SearchPlan:
     # (``tcgen05_small_n_zero_fills``) over ``min_search_n``, the scalar
     # fallback's block, which stays the floor a provided config keeps.
     small_n_zero_fills: bool = False
+    # ``batched_pair_matrix``: the search reaches the 256 x 256 pair tile
+    # over each ragged matrix of a batch.
+    batched_pair_matrix: bool = False
 
 
 @dataclasses.dataclass(frozen=True)
@@ -310,6 +362,7 @@ def _plan_cute_tcgen05_search_candidate(
     rhs_source: torch.Tensor | None = None,
     operands_permuted: bool = False,
     operand_casts: bool = False,
+    batched_ab_tma: bool = False,
 ) -> _CuteTcgen05SearchPlanningResult:
     """Plan one candidate and retain guards even when the candidate is rejected.
 
@@ -319,6 +372,9 @@ def _plan_cute_tcgen05_search_candidate(
     ``operand_casts`` says an operand is an in-register integer cast only
     the register-MMA family lowers: the candidate is rejected unless that
     family is admitted, and the plan withholds the tcgen05 family.
+    ``batched_ab_tma`` says the tcgen05 pipeline loads both operands of a
+    batched candidate through TMA (``batched_pair_matrix``); without the
+    operand analysis (``plan_cute_tcgen05_search``) it is not proved.
     """
     m, n, k = _dot_dimensions(lhs, rhs)
     env = CompileEnvironment.current()
@@ -471,6 +527,24 @@ def _plan_cute_tcgen05_search_candidate(
     ):
         max_search_m = 512
     max_search_n = max_tcgen05_n
+    pair_matrix = (
+        has_leading_passthrough
+        and env.settings.cute_flat_edge_tma
+        and batched_pair_matrix(
+            itemsize=lhs.dtype.itemsize,
+            rank3_operand=lhs.ndim == 3 or rhs.ndim == 3,
+            static_m=static_m,
+            static_n=static_n,
+            static_k=static_k,
+            ab_tma=batched_ab_tma,
+        )
+    )
+    if pair_matrix:
+        # The power-of-two floors (128 for 200) would split a matrix within
+        # one pair tile into 2 x 2 tiles; the pair's tile covers it whole (a
+        # larger ragged matrix keeps the 256 x 256 ceilings it has).
+        max_tcgen05_m = max_search_m = TCGEN05_TWO_CTA_BLOCK_M
+        max_tcgen05_n = max_search_n = TCGEN05_TWO_CTA_BLOCK_N
     max_search_k = (
         128 if static_k is None else min(128, pow2_floor_at_least(static_k, mma_k))
     )
@@ -582,6 +656,7 @@ def _plan_cute_tcgen05_search_candidate(
                 max_search_k=max_search_k,
             )
         )
+        and not pair_matrix
     ):
         max_search_m = min(max_search_m, 128)
     # A GEMM with fewer 128x128 output tiles than SMs is bound by per-CTA
@@ -666,6 +741,7 @@ def _plan_cute_tcgen05_search_candidate(
             warp_mma_admitted=warp_mma_admitted,
             tcgen05_family_admitted=not operand_casts,
             small_n_zero_fills=small_n_zero_fills,
+            batched_pair_matrix=pair_matrix,
         ),
         required_specialized_vars=frozen_required_specialized_vars,
         guards_complete=True,
@@ -801,6 +877,9 @@ def enable_cute_tcgen05_search(
                 and not has_leading_passthrough
                 and input_dtype.itemsize == 2
             )
+            # a batch of matrices on the CTA pairs (``batched_pair_matrix``),
+            # K whole
+            or (plan.batched_pair_matrix and static_k % max_search_k == 0)
             # both: the pairs' double-edge shape
             or (
                 m_edge
@@ -1054,6 +1133,35 @@ def enable_cute_tcgen05_search(
             # kernels' flat samples to 128 rows
             # (``_fix_cluster_m1_flat_block_m_search_config``).
             max_search_m = min(max_search_m, TCGEN05_ONE_CTA_MAX_BLOCK_M)
+    # A batched 16-bit GEMM whose K is one K tile (64 deep at most) is
+    # output-bound: every tile loads once and stores its whole output. Its
+    # CTA pairs take that K in one k-block. A pair that splits it (bf16 512 x
+    # 512x512x64: block_sizes [1, 256, 256, 16], four 16-deep k-blocks a
+    # tile)
+    #     for tile_r in hl.tile(64):  # _BLOCK_SIZE_3 = 16: four AB stages
+    # issues four TMA stages per tile where one carries the same bytes; the
+    # final selection's per-call timing (an L2 flush before each launch)
+    # reads it 1-8% ahead of the K-whole tiles, but back to back in a CUDA
+    # graph it runs behind them: 512^2 pair over k-blocks of 16 read 51.3 us
+    # and ran 55.2 (0.947 of cuBLAS), the 128x64 one-CTA tile 50.9 / 52.0
+    # (0.993); 256 x 512x512x64 27.3 / 28.0-29.4 against 28.2 / 27.2;
+    # 384 x 512x512x64 39.9 / 42.4 against 38.9 / 39.4 (GB300). With K
+    # whole the pairs read what they run (512^2: 57.0 / 57.3), so the
+    # selection keeps the tile that wins in the graph. One-CTA tiles keep
+    # their k-blocks: 256x512 runs 128x128 over 32-deep k-blocks at 1.056 of
+    # cuBLAS against 0.96 over K whole. A K block size the kernel bounds
+    # below K (``hl.register_block_size(16, 32)`` for K = 64) keeps its pairs
+    # over its own k-blocks.
+    matmul_fragments = facts._matmul_block_fragments(spec.tcgen05)
+    cluster_m2_whole_k = (
+        has_leading_passthrough
+        and input_dtype.itemsize == 2
+        and static_k is not None
+        and static_k == max_search_k
+        and static_k <= TCGEN05_WHOLE_K_TILE_MIN
+        and matmul_fragments is not None
+        and matmul_fragments[2].low <= static_k <= matmul_fragments[2].high
+    )
     surface.narrow_autotune_to_validated_configs(
         spec.tcgen05,
         allow_persistent_pid_types=(
@@ -1067,6 +1175,7 @@ def enable_cute_tcgen05_search(
         allow_cluster_m2_fp8_small_grid=allow_fp8_small_grid_cluster_m2_search,
         allow_cluster_m2_one_wave_tiles=allow_one_wave_cluster_m2_search,
         cluster_m2_one_wave_only=one_wave_only_cluster_m2_search,
+        cluster_m2_whole_k=cluster_m2_whole_k,
         ab_stages_three_dtype_bytes=lhs.dtype.itemsize,
         ab_stages_three_device=lhs.device,
         ab_stages_three_output_dtype_bytes=output_dtype_bytes,
