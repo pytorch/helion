@@ -344,6 +344,331 @@ class TestRefEagerMisc(TestCase):
         torch.testing.assert_close(fn(x), x, rtol=0, atol=0)
 
     @pytest.mark.cpu_only
+    def test_atomics_where_lanes_share_an_element(self):
+        """Lanes that name one element of the target update it in turn, each
+        finding what the lanes before it left, as the compiled atomics do:
+        through a dim of stride 0, whose view a setitem refuses (more than
+        one element of the written-to tensor refers to a single memory
+        location), through strides that overlap, where it keeps one lane's
+        update, and through either beside an index tensor."""
+
+        @helion.kernel(ref_mode=helion.RefMode.EAGER)
+        def add(x: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
+            prev = torch.empty_like(x)
+            for tile_r, tile_c in hl.tile([x.size(0), x.size(1)]):
+                prev[tile_r, tile_c] = hl.atomic_add(
+                    out, [tile_r, tile_c], x[tile_r, tile_c]
+                )
+            return prev
+
+        @helion.kernel(ref_mode=helion.RefMode.EAGER)
+        def max_cas(
+            x: torch.Tensor, top: torch.Tensor, swap: torch.Tensor
+        ) -> torch.Tensor:
+            prev = torch.empty_like(x)
+            for tile_r, tile_c in hl.tile([x.size(0), x.size(1)]):
+                hl.atomic_max(top, [tile_r, tile_c], x[tile_r, tile_c])
+                prev[tile_r, tile_c] = hl.atomic_cas(
+                    swap, [tile_r, tile_c], 0.0, x[tile_r, tile_c]
+                )
+            return prev
+
+        @helion.kernel(ref_mode=helion.RefMode.EAGER)
+        def max_rows(
+            x: torch.Tensor, rows: torch.Tensor, top: torch.Tensor
+        ) -> torch.Tensor:
+            for tile_r, tile_c in hl.tile([x.size(0), x.size(1)]):
+                hl.atomic_max(top, [rows[tile_r], tile_c], x[tile_r, tile_c])
+            return top
+
+        def shared(size: int, stride: tuple[int, int]) -> torch.Tensor:
+            return torch.zeros(size).as_strided((4, 2), stride)
+
+        out = shared(4, (1, 0))
+        prev = add(torch.ones(4, 2), out)
+        torch.testing.assert_close(out[:, 0], torch.full((4,), 2.0), rtol=0, atol=0)
+        torch.testing.assert_close(prev, torch.tensor([[0.0, 1.0]] * 4))
+        out = shared(5, (1, 1))
+        add(torch.ones(4, 2), out)
+        torch.testing.assert_close(
+            out.as_strided((5,), (1,)), torch.tensor([1.0, 2.0, 2.0, 2.0, 1.0])
+        )
+        # atomic_cas swaps on a row's first lane, whose value its second finds.
+        x = torch.tensor([[1.0, 5.0], [6.0, 2.0], [3.0, 7.0], [8.0, 4.0]])
+        top, swap = shared(4, (1, 0)), shared(4, (1, 0))
+        prev = max_cas(x, top, swap)
+        torch.testing.assert_close(top[:, 0], x.amax(1), rtol=0, atol=0)
+        torch.testing.assert_close(swap[:, 0], x[:, 0], rtol=0, atol=0)
+        torch.testing.assert_close(prev, torch.stack([torch.zeros(4), x[:, 0]], 1))
+        top = shared(4, (1, 0))
+        max_rows(x, torch.arange(4), top)
+        torch.testing.assert_close(top[:, 0], x.amax(1), rtol=0, atol=0)
+
+    @pytest.mark.cpu_only
+    def test_atomics_at_an_index_tensor_that_repeats_an_element(self):
+        """At an index tensor that names one element four times, each lane's
+        atomic finds what the lanes before it left: atomic_max keeps the
+        largest value, and atomic_xchg returns the chain of the values it
+        swapped in, where one setitem keeps one lane's value and returns the
+        element's first one to every lane."""
+
+        @helion.kernel(ref_mode=helion.RefMode.EAGER)
+        def at(
+            x: torch.Tensor, index: torch.Tensor, top: torch.Tensor, swap: torch.Tensor
+        ) -> torch.Tensor:
+            prev = torch.empty_like(x)
+            for tile in hl.tile(x.size(0)):
+                hl.atomic_max(top, [index[tile]], x[tile])
+                prev[tile] = hl.atomic_xchg(swap, [index[tile]], x[tile])
+            return prev
+
+        @helion.kernel(ref_mode=helion.RefMode.EAGER)
+        def add_at(
+            x: torch.Tensor, index: torch.Tensor, out: torch.Tensor
+        ) -> torch.Tensor:
+            prev = torch.empty_like(x)
+            for tile in hl.tile(x.size(0)):
+                prev[tile] = hl.atomic_add(out, [index[tile], None], x[tile][:, None])[
+                    :, 0
+                ]
+            return prev
+
+        x = torch.tensor([4.0, 1.0, 3.0, 2.0])
+        top, swap = torch.zeros(1), torch.zeros(1)
+        prev = at(x, torch.zeros(4, dtype=torch.int64), top, swap)
+        torch.testing.assert_close(top, torch.tensor([4.0]), rtol=0, atol=0)
+        torch.testing.assert_close(swap, torch.tensor([2.0]), rtol=0, atol=0)
+        torch.testing.assert_close(prev, torch.tensor([0.0, 4.0, 1.0, 3.0]))
+        # Beside a None, an index tensor's lanes add in turn as well.
+        out = torch.zeros(2)
+        prev = add_at(torch.ones(4), torch.tensor([0, 0, 1, 0]), out)
+        torch.testing.assert_close(out, torch.tensor([3.0, 1.0]), rtol=0, atol=0)
+        torch.testing.assert_close(prev, torch.tensor([0.0, 1.0, 0.0, 2.0]))
+        # A floating add rounds after each lane, as each atomic does: four adds
+        # of 1 to 2**24 each round back to 2**24, where adding their sum, 4,
+        # would not.
+        out = torch.full((1,), 2.0**24)
+        prev = add_at(torch.ones(4), torch.zeros(4, dtype=torch.int64), out)
+        torch.testing.assert_close(out, torch.full((1,), 2.0**24), rtol=0, atol=0)
+        torch.testing.assert_close(prev, torch.full((4,), 2.0**24), rtol=0, atol=0)
+
+    @pytest.mark.cpu_only
+    def test_atomic_index_forms_beside_shared_elements(self):
+        """Index forms beside the shared elements: an index tensor's elements
+        out of range leave their lanes out, the negative ones too, as a
+        subscript store does; a one-element index tensor beside another
+        keeps its dim, as in compiled code; a number and a ``None`` beside the
+        tiles of a view whose rows share an element."""
+
+        @helion.kernel(ref_mode=helion.RefMode.EAGER)
+        def at(x: torch.Tensor, index: torch.Tensor, top: torch.Tensor) -> torch.Tensor:
+            for tile in hl.tile(x.size(0)):
+                hl.atomic_max(top, [index[tile]], x[tile])
+            return top
+
+        @helion.kernel(ref_mode=helion.RefMode.EAGER)
+        def at_row(
+            x: torch.Tensor, rows: torch.Tensor, cols: torch.Tensor, top: torch.Tensor
+        ) -> torch.Tensor:
+            total = torch.empty_like(x[:, 0])
+            for tile_r, tile_c in hl.tile([x.size(0), x.size(1)]):
+                prev = hl.atomic_max(
+                    top, [rows[tile_r], cols[tile_c]], x[tile_r, tile_c]
+                )
+                total[tile_r] = prev.sum(1)
+            return total
+
+        @helion.kernel(ref_mode=helion.RefMode.EAGER)
+        def numbers(
+            x: torch.Tensor, out: torch.Tensor, flat: torch.Tensor
+        ) -> torch.Tensor:
+            prev = torch.empty_like(x)
+            for tile_r, tile_c in hl.tile(x.size()):
+                ones = x[tile_r, tile_c]
+                prev[tile_r, tile_c] = hl.atomic_add(out, [0, tile_r, tile_c], ones)
+                hl.atomic_add(flat, [tile_r, None, tile_c], ones[:, None, :])
+            return prev
+
+        x = torch.tensor([1.0, 2.0, 3.0])
+        out = at(x, torch.tensor([0, 5, 1]), torch.zeros(2))
+        torch.testing.assert_close(out, torch.tensor([1.0, 3.0]), rtol=0, atol=0)
+        out = at(x, torch.tensor([0, -1, 1]), torch.zeros(3))
+        torch.testing.assert_close(out, torch.tensor([1.0, 3.0, 0.0]), rtol=0, atol=0)
+        x = torch.arange(1.0, 9.0).view(1, 8)
+        top = torch.full((2, 8), 1.0)
+        total = at_row(x, torch.tensor([1]), torch.arange(8), top)
+        torch.testing.assert_close(top[1], x[0], rtol=0, atol=0)
+        torch.testing.assert_close(total, torch.tensor([8.0]), rtol=0, atol=0)
+        # A number and a None beside the tiles of a view whose rows share an
+        # element: the lanes of a row still add in turn.
+        base, flat = torch.zeros(4), torch.zeros(4)
+        prev = numbers(
+            torch.ones(4, 3),
+            base.as_strided((2, 4, 3), (0, 1, 0)),
+            flat.as_strided((4, 3), (1, 0)),
+        )
+        torch.testing.assert_close(base, torch.full((4,), 3.0), rtol=0, atol=0)
+        torch.testing.assert_close(flat, torch.full((4,), 3.0), rtol=0, atol=0)
+        expected = torch.tensor([0.0, 1.0, 2.0]).expand(4, 3)
+        torch.testing.assert_close(prev, expected, rtol=0, atol=0)
+
+    @pytest.mark.cpu_only
+    def test_atomic_values_take_the_targets_dtype_and_lanes(self):
+        """The atomics convert their values to the target's dtype, cut them to
+        the lanes where a tile's padded value runs past them (blocks of 4 over
+        a 2 x 3 target), take a bool index tensor as offsets, refuse a float
+        one and take unsigned targets, whether they take the lanes in turn or
+        in one setitem."""
+
+        @helion.kernel(ref_mode=helion.RefMode.EAGER)
+        def max_into(x: torch.Tensor, top: torch.Tensor) -> torch.Tensor:
+            for tile_r, tile_c in hl.tile([x.size(0), x.size(1)]):
+                hl.atomic_max(top, [tile_r, tile_c], x[tile_r, tile_c])
+            return top
+
+        @helion.kernel(ref_mode=helion.RefMode.EAGER, static_shapes=True)
+        def add_ones(out: torch.Tensor) -> torch.Tensor:
+            for row, col in hl.tile(out.size(), block_size=[4, 4]):
+                ones = hl.full([row.block_size, col.block_size], 1.0, out.dtype)
+                hl.atomic_add(out, [row, col], ones)
+            return out
+
+        @helion.kernel(ref_mode=helion.RefMode.EAGER, static_shapes=True)
+        def max_ones(out: torch.Tensor) -> torch.Tensor:
+            for row, col in hl.tile(out.size(), block_size=[4, 4]):
+                ones = hl.full([row.block_size, col.block_size], 1.0, out.dtype)
+                hl.atomic_max(out, [row, col], ones)
+            return out
+
+        @helion.kernel(ref_mode=helion.RefMode.EAGER)
+        def numbers_into(out: torch.Tensor) -> torch.Tensor:
+            for tile in hl.tile(out.size(0)):
+                hl.atomic_and(out, [tile], 0xFFFFFFFF)
+                hl.atomic_max(out, [tile], 2**32 + 1)
+            return out
+
+        @helion.kernel(ref_mode=helion.RefMode.EAGER)
+        def too_long_max(x: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
+            for tile in hl.tile(x.size(0)):
+                hl.atomic_max(out, [tile, slice(None)], x[tile, :])
+            return out
+
+        @helion.kernel(ref_mode=helion.RefMode.EAGER)
+        def too_long_add(x: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
+            for tile in hl.tile(x.size(0)):
+                hl.atomic_add(out, [tile, slice(None)], x[tile, :])
+            return out
+
+        @helion.kernel(ref_mode=helion.RefMode.EAGER)
+        def too_long_at(idx: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
+            for tile in hl.tile(idx.size(0)):
+                hl.atomic_max(out, [idx[tile]], hl.full([3], 1.0, out.dtype))
+            return out
+
+        @helion.kernel(ref_mode=helion.RefMode.EAGER)
+        def cas_at(out: torch.Tensor, expected: torch.Tensor) -> torch.Tensor:
+            for tile in hl.tile(out.size(0)):
+                hl.atomic_cas(out, [tile], expected[tile], 5)
+            return out
+
+        @helion.kernel(ref_mode=helion.RefMode.EAGER)
+        def max_at(
+            x: torch.Tensor, index: torch.Tensor, out: torch.Tensor
+        ) -> torch.Tensor:
+            for tile in hl.tile(x.size(0)):
+                hl.atomic_max(out, [index[tile]], x[tile])
+            return out
+
+        @helion.kernel(ref_mode=helion.RefMode.EAGER)
+        def add_at(
+            x: torch.Tensor, index: torch.Tensor, out: torch.Tensor
+        ) -> torch.Tensor:
+            for tile in hl.tile(x.size(0)):
+                hl.atomic_add(out, [index[tile]], x[tile])
+            return out
+
+        @helion.kernel(ref_mode=helion.RefMode.EAGER)
+        def add_tiles(x: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
+            for tile in hl.tile(x.size(0)):
+                hl.atomic_add(out, [tile], x[tile])
+            return out
+
+        @helion.kernel(ref_mode=helion.RefMode.EAGER)
+        def xchg_at(
+            x: torch.Tensor, index: torch.Tensor, out: torch.Tensor
+        ) -> torch.Tensor:
+            prev = torch.empty_like(x)
+            for tile in hl.tile(x.size(0)):
+                prev[tile] = hl.atomic_xchg(out, [index[tile]], x[tile])
+            return prev
+
+        for dtype, wide in ((torch.float32, torch.float64), (torch.int32, torch.int64)):
+            with self.subTest(dtype=dtype):
+                x = torch.tensor([[1, 5], [6, 2], [3, 7], [8, 4]], dtype=wide)
+                top = torch.zeros(5, dtype=dtype)
+                max_into(x, top.as_strided((4, 2), (1, 1)))
+                expected = torch.tensor([1, 6, 3, 8, 4], dtype=dtype)
+                torch.testing.assert_close(top, expected, rtol=0, atol=0)
+        out = torch.zeros(8)
+        add_ones(out.as_strided((2, 3), (3, 2)))
+        expected = torch.tensor([1.0, 0.0, 1.0, 1.0, 1.0, 1.0, 0.0, 1.0])
+        torch.testing.assert_close(out, expected, rtol=0, atol=0)
+        # The other atomics cut a padded value too, with one setitem or not.
+        for out in (torch.zeros(2, 3), torch.zeros(2).as_strided((2, 3), (1, 0))):
+            with self.subTest(stride=out.stride()):
+                max_ones(out)
+                torch.testing.assert_close(out, torch.ones(2, 3), rtol=0, atol=0)
+        # A value converts to the target's dtype before it meets the element,
+        # whatever the index: 2**32 + 1 is 1 to int32, under 7.
+        wide = torch.full((4, 2), 2**32 + 1, dtype=torch.int64)
+        for out in (
+            torch.full((4, 2), 7, dtype=torch.int32),
+            torch.full((1,), 7, dtype=torch.int32).as_strided((4, 2), (0, 0)),
+        ):
+            with self.subTest(stride=out.stride()):
+                max_into(wide, out)
+                torch.testing.assert_close(out, torch.full_like(out, 7))
+        # So does a Python integer past the target's range: 0xFFFFFFFF is an
+        # int32 -1, and 2**32 + 1 an int32 1.
+        out = torch.full((2,), 7, dtype=torch.int32)
+        numbers_into(out)
+        torch.testing.assert_close(out, torch.full((2,), 7, dtype=torch.int32))
+        # A value that runs past the lanes along a slice, not a tile's
+        # padding, is refused, as compiled code refuses it.
+        for op in (too_long_max, too_long_add):
+            with self.subTest(op=op.fn.__name__), self.assertRaises(RuntimeError):
+                op(torch.ones(2, 3), torch.zeros(2, 2))
+        # Along an index tensor too: a value is cut only along a tile's slice.
+        with self.assertRaises(RuntimeError):
+            too_long_at(torch.arange(2), torch.zeros(4))
+        # The expected value converts too: an int64 2**32 + 1 is an int32 1.
+        ints = torch.tensor([1, 2], dtype=torch.int32)
+        cas_at(ints, torch.tensor([2**32 + 1, 3]))
+        torch.testing.assert_close(ints, torch.tensor([5, 2], dtype=torch.int32))
+        # A float index tensor is refused, as PyTorch refuses it.
+        with self.assertRaises(IndexError):
+            max_at(torch.ones(2), torch.tensor([0.7, 1.9]), torch.zeros(2))
+        # A bool index tensor is the offsets 0 and 1, as compiled code takes it.
+        x = torch.tensor([1.0, 2.0, 3.0, 4.0])
+        out = torch.zeros(4)
+        max_at(x, torch.tensor([True, False, True, True]), out)
+        torch.testing.assert_close(out, torch.tensor([2.0, 4.0, 0.0, 0.0]))
+        # An unsigned target adds, and takes its lanes in turn, as well.
+        three = torch.tensor([1, 2, 3], dtype=torch.uint32)
+        total = add_at(
+            three, torch.tensor([0, 1, 0]), torch.zeros(2, dtype=torch.uint32)
+        )
+        self.assertEqual(total.tolist(), [4, 2])
+        total = add_tiles(three, torch.ones(3, dtype=torch.uint32))
+        self.assertEqual(total.tolist(), [2, 3, 4])
+        top = torch.zeros(1, dtype=torch.uint32)
+        index = torch.zeros(4, dtype=torch.int64)
+        x = torch.tensor([4, 1, 3, 2], dtype=torch.uint32)
+        prev = xchg_at(x, index, top)
+        self.assertEqual(top.tolist(), [2])
+        self.assertEqual(prev.tolist(), [0, 4, 1, 3])
+
+    @pytest.mark.cpu_only
     def test_subscript_store_trims_overrunning_tile(self):
         """A tile that runs past the stored tensor still stores the elements
         inside it when it sits between two index tensors, as it does in a
