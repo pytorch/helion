@@ -2721,7 +2721,6 @@ def test_the_resume_prompt_and_notices_match_agents_md():
 
 
 @needs_git
-@pytest.mark.slow
 def test_resume_round_trip_through_the_clis(checkout, review, monkeypatch, tmp_path):
     old = _git(checkout, "rev-parse", "HEAD")
     code, out, err = review("claude", "codex", args=("--head",), target=(), git=True)
