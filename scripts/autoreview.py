@@ -470,15 +470,16 @@ PROMPT_FIX = (
     "an improvement. Still run "
     "no tests, builds or scripts: the author checks and tests your changes. "
     "Do not make a change that turns out "
-    "to be wrong: leave unfixed a finding that is invalid (AGENTS.md, "
+    "to be wrong: leave unfixed a defect that is invalid (AGENTS.md, "
     '"Answering the findings"). Leave unfixed as well a defect that '
     "origin/main has too and whose fix is too large by the criteria of that "
     "file: whether to defer it is the author's decision, so add no entry to "
     "KNOWN_GAPS.md. An entry that is there you correct or remove when a "
     "finding or one of your fixes shows it to be wrong. End your response "
-    "with a `Review notes:` list of the findings you left, each with its "
-    "explanation, for the author to check and record. If you are unable to "
-    'fix any of the other issues, respond with "ERROR: <1 line reason>" and '
+    "with a `Review notes:` list of the defects you left, each with its "
+    "explanation, for the author to check and record; a suggestion that "
+    "you did not take needs no entry. If you are unable to "
+    'fix any of the other defects, respond with "ERROR: <1 line reason>" and '
     "stop."
 )
 
@@ -525,9 +526,12 @@ def describe_snapshot(snapshot: dict[str, Any], *, current: bool) -> str:
 
 
 def snapshot_changed(old: dict[str, Any], new: dict[str, Any]) -> bool:
-    """Whether two rounds' snapshots differ in what a reviewer would read."""
-    return new["snapshot"] != old["snapshot"] or (new.get("omitted") or []) != (
-        old.get("omitted") or []
+    """Whether two rounds' snapshots differ in what a reviewer would read:
+    the code, a file that is too large for it, or the commits that a target
+    of revisions names, which a moved branch changes while HEAD stays."""
+    return any(
+        (new.get(key) or []) != (old.get(key) or [])
+        for key in ("snapshot", "omitted", "commits")
     )
 
 
@@ -566,6 +570,16 @@ def describe_changes(old: dict[str, Any], new: dict[str, Any]) -> str:
             + "; ".join(
                 f"{kind}: {shlex.join(paths)}" for kind, paths in kinds.items() if paths
             )
+        )
+    if (new.get("commits") or []) != (old.get("commits") or []) and (
+        new["head"] == old["head"]
+    ):
+        # With a new HEAD, the lines below show how the commits changed.
+        lines.append(
+            "HEAD has not moved, but the target names another set of commits "
+            "than last round, because a branch or a tag in it has moved: "
+            f"{len(old.get('commits') or [])} then, "
+            f"{len(new.get('commits') or [])} now."
         )
     if new["head"] != old["head"]:
         old_base, new_base = old.get("base"), new.get("base")
@@ -690,6 +704,17 @@ def fetch_base_objects() -> str | None:
     return None
 
 
+def target_commits(review_args: list[str]) -> list[str]:
+    """The commits that a target of revisions and ranges names: those inside
+    its ranges, or the revisions themselves when it has no range.
+
+    The ends of a range are not enough to tell whether it changed: after a
+    fetch, `origin/main..HEAD` has another end and the same commits."""
+    if any(".." in arg or arg.startswith("^") for arg in review_args):
+        return git("rev-list", *review_args).splitlines()
+    return git("rev-parse", "--revs-only", *review_args).splitlines()
+
+
 def snapshot_kind(head: bool, review_args: list[str]) -> bool | None:
     """How a round with this target is pinned: True for a commit of the
     worktree (no arguments: the uncommitted work), False for HEAD (--head,
@@ -706,7 +731,9 @@ def snapshot_kind(head: bool, review_args: list[str]) -> bool | None:
     return False if names_commits(review_args) else None
 
 
-def take_snapshot(ref: str, *, worktree: bool) -> dict[str, Any]:
+def take_snapshot(
+    ref: str, *, worktree: bool, review_args: list[str] | None = None
+) -> dict[str, Any]:
     """Pin the code a round reviews under `ref` and describe it.
 
     The commit is HEAD, unless `worktree` says that the round reviews the
@@ -720,6 +747,11 @@ def take_snapshot(ref: str, *, worktree: bool) -> dict[str, Any]:
     "omitted" lists them with size and modification time, so that a change
     to one still makes the worktree a different one.
 
+    For a target of revisions and ranges (`review_args`), "commits" lists
+    the commits it names (see target_commits): a branch in such a target can
+    move, and with it the commits under review, while HEAD stays where it
+    is.
+
     Raises ReviewAbort when the checkout cannot be snapshotted: outside a
     git worktree, and for a worktree with an untracked nested repository,
     whose files a commit of this checkout cannot hold."""
@@ -732,6 +764,7 @@ def take_snapshot(ref: str, *, worktree: bool) -> dict[str, Any]:
     if worktree:
         commit, omitted = _worktree_commit(head)
     git("update-ref", ref, commit)
+    commits = target_commits(review_args) if review_args else []
     try:
         base: str | None = git("merge-base", "HEAD", "origin/main")
     except ReviewAbort:
@@ -742,6 +775,7 @@ def take_snapshot(ref: str, *, worktree: bool) -> dict[str, Any]:
         "base": base,
         "ref": ref,
         "omitted": omitted,
+        "commits": commits,
     }
 
 
@@ -818,28 +852,57 @@ def _worktree_commit(head: str) -> tuple[str, list[list[object]]]:
         return commit, omitted
 
 
+def _last_use(run: Path) -> float | None:
+    """When a run's log directory was last written, or None for something
+    that is not one. A session's file is rewritten by every round."""
+    if RUN_NAME.fullmatch(run.name) is None or run.is_symlink():
+        return None
+    try:
+        return max(path.stat().st_mtime for path in (run, *run.iterdir()))
+    except OSError:
+        # Not a directory, or one that another run is deleting.
+        return None
+
+
+def _worktree_logs() -> list[Path] | None:
+    """The review log directory of every worktree of this repository, or
+    None when they cannot be found. The worktrees share the snapshot refs,
+    not the logs."""
+    try:
+        relative = LOGS_BASE.relative_to(REPO_ROOT)
+        listing = git("worktree", "list", "--porcelain")
+    except (ValueError, ReviewAbort):
+        return None
+    return [
+        Path(line.removeprefix("worktree ")) / relative
+        for line in listing.splitlines()
+        if line.startswith("worktree ")
+    ]
+
+
 def prune_old_reviews(now: datetime) -> None:
-    """Delete what reviews left behind more than REVIEW_KEEP_DAYS ago: their
-    log directories, sessions included, and their snapshot refs.
+    """Delete what reviews left behind more than REVIEW_KEEP_DAYS ago: this
+    checkout's log directories, sessions included, and the snapshot refs.
 
     A log directory goes by its last use, so a review that still gets rounds
-    keeps its session, and the refs of a session that is kept stay with it.
-    Worktrees share refs but not log directories: the refs of a session that
-    this checkout does not have go by the date its id starts with."""
-    limit = timedelta(days=REVIEW_KEEP_DAYS)
-    kept = set()
+    keeps its session. The refs are shared by the worktrees: those of a
+    session go when no worktree has used its logs within the limit. A
+    session whose logs no worktree has cannot be continued; its refs go by
+    the date that its id starts with. When the worktrees cannot be listed,
+    nothing says which sessions are in use, and no ref is deleted."""
+    limit = timedelta(days=REVIEW_KEEP_DAYS).total_seconds()
     for run in LOGS_BASE.iterdir() if LOGS_BASE.is_dir() else ():
-        if RUN_NAME.fullmatch(run.name) is None or run.is_symlink():
-            continue
-        try:
-            last_use = max(path.stat().st_mtime for path in (run, *run.iterdir()))
-        except OSError:
-            # Not a directory, or one that another run is deleting.
-            continue
-        if now.timestamp() - last_use > limit.total_seconds():
+        used = _last_use(run)
+        if used is not None and now.timestamp() - used > limit:
             shutil.rmtree(run, ignore_errors=True)
-        else:
-            kept.add(run.name)
+    if (worktree_logs := _worktree_logs()) is None:
+        return
+    used_at: dict[str, float] = {}
+    for logs in worktree_logs:
+        for run in logs.iterdir() if logs.is_dir() else ():
+            used = _last_use(run)
+            if used is not None:
+                used_at[run.name] = max(used, used_at.get(run.name, used))
     try:
         refs = git("for-each-ref", "--format=%(refname)", SNAPSHOT_REFS + "/")
     except ReviewAbort:
@@ -847,11 +910,13 @@ def prune_old_reviews(now: datetime) -> None:
     for ref in refs.splitlines():
         session_id = ref.removeprefix(SNAPSHOT_REFS + "/").partition("/")[0]
         match = RUN_NAME.fullmatch(session_id)
-        if match is None or session_id in kept:
+        if match is None:
             continue
         try:
-            created = datetime.strptime(match.group(1), "%Y%m%d-%H%M%S")
-            if now - created > limit:
+            used = used_at.get(session_id) or (
+                datetime.strptime(match.group(1), "%Y%m%d-%H%M%S").timestamp()
+            )
+            if now.timestamp() - used > limit:
                 git("update-ref", "-d", ref)
         except (ValueError, ReviewAbort):
             continue
@@ -1607,9 +1672,9 @@ DEFECT_ABOVE_PASS_NOTICE = (
     "did not pass: run another round instead of recording the line"
 )
 FIX_NOTICE = (
-    "the fixer's answer to the findings is in {path}; check and test its "
+    "the fixer's answer to the defects is in {path}; check and test its "
     "changes, which it did not run, and "
-    "answer each finding it left: record it as invalid in a `Review notes:` "
+    "answer each defect it left: record it as invalid in a `Review notes:` "
     "paragraph of the commit message, or fix it, or defer a pre-existing "
     "defect whose fix is too large to KNOWN_GAPS.md with a `Deferred:` item "
     'in that paragraph (AGENTS.md, "Answering the findings")'
@@ -1631,6 +1696,8 @@ UNRESUMABLE_NOTICE = (
     "this review cannot be continued with --resume ({reason}); a later round "
     "is a new review"
 )
+# What a reviewer's CLI says when the session to resume no longer exists.
+SESSION_GONE_ERRORS = ("No conversation found", "no rollout found")
 RESUME_FAILED_NOTICE = (
     "round {round} of review session {id} did not complete, and the saved "
     "session is as it was: the same command runs the round again, and tells "
@@ -2104,7 +2171,9 @@ def _review(
             unresumable = UNPINNED_TARGET
         else:
             snapshot = take_snapshot(
-                f"{SNAPSHOT_REFS}/{session_id}/{round_no}", worktree=worktree
+                f"{SNAPSHOT_REFS}/{session_id}/{round_no}",
+                worktree=worktree,
+                review_args=review_args,
             )
     except ReviewAbort as e:
         unresumable = str(e)
@@ -2269,8 +2338,14 @@ def _review(
             unresumable = "Codex printed no session id"
         if failures:
             # Keep the review that was finished: the run that completes the
-            # round runs only the reviewer that failed.
-            if reviews and unresumable is None:
+            # round runs only the reviewer that failed. Not when that one's
+            # own session is gone: it could not be run again in this review.
+            gone = any(
+                marker in str(error)
+                for error in failures.values()
+                for marker in SESSION_GONE_ERRORS
+            )
+            if reviews and unresumable is None and not gone:
                 assert snapshot is not None
                 half = {
                     "round": round_no,
