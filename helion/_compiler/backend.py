@@ -6,6 +6,7 @@ import dataclasses
 import enum
 import functools
 import logging
+import math
 import operator
 import os
 from typing import TYPE_CHECKING
@@ -3066,6 +3067,22 @@ class Backend(abc.ABC):
 
 
 def _largest_divisor_at_most(size: int, limit: int) -> int:
+    # For small limits the descending scan is already bounded.
+    if size and limit > 64:
+        size = abs(size)
+        if limit >= size:
+            return size
+        root = math.isqrt(size)
+        if root < limit:
+            # A large divisor fits only if its smaller partner is at least
+            # ceil(size / limit). Scan those partners once in quotient order.
+            first = (size + limit - 1) // limit
+            for partner in range(first, root + 1):
+                if size % partner == 0:
+                    return size // partner
+            # No partner already checked divides size. The largest remaining
+            # divisor is the first one below that interval.
+            limit = first - 1
     for divisor in range(limit, 0, -1):
         if size % divisor == 0:
             return divisor

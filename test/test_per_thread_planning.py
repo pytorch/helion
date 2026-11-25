@@ -8,11 +8,15 @@ axis active; a loop with a matmul that is no candidate is capped at 256 threads
 and its unobserved axes are demoted.  Metal has no detector of its own and
 relies on the core default (``Backend.per_thread_mma_candidate_loop``), which
 answers from the matmul's operands.
+
+Wide automatic axes also check that the divisor search respects the thread
+budget without scanning the entire tile extent.
 """
 
 from __future__ import annotations
 
 from contextlib import contextmanager
+import math
 import operator
 from types import SimpleNamespace
 from typing import TYPE_CHECKING
@@ -22,6 +26,7 @@ from unittest.mock import patch
 import pytest
 import torch
 
+from helion._compiler import backend as backend_module
 from helion._compiler.compile_environment import BlockSizeInfo
 from helion._compiler.compile_environment import CompileEnvironment
 from helion._compiler.compile_environment import LoopSpecBlockSizeSource
@@ -32,6 +37,7 @@ from helion._compiler.host_function import HostFunction
 from helion._compiler.lane_loop_context import LaneLoopContext
 from helion._compiler.metal.backend import MetalBackend
 from helion._compiler.per_thread_planning import plan_per_thread_loop_strategy
+from helion._compiler.per_thread_planning import shrink_auto_thread_counts
 from helion._compiler.tile_strategy import PerThreadNDTileStrategy
 from helion.autotuner.config_spec import BlockSizeSpec
 from helion.autotuner.config_spec import ConfigSpec
@@ -236,3 +242,36 @@ def test_metal_root_tile_beside_a_tensor_core_k_loop_keeps_the_full_budget() -> 
     a column sum reduces over into a lane loop."""
     assert _plan_root(torch.float32).num_threads == [0, 0]
     assert _plan_root(torch.float64).num_threads == [0, 16]
+
+
+@pytest.mark.cpu_only
+def test_divisor_search_matches_the_descending_search() -> None:
+    for size in range(-130, 131):
+        for limit in range(-2, 140):
+            expected = next((d for d in range(limit, 0, -1) if size % d == 0), 1)
+            assert backend_module._largest_divisor_at_most(size, limit) == expected
+    # A large quotient is found through its partner; a large prime factor
+    # need not have any partner within the thread limit.
+    assert backend_module._largest_divisor_at_most(1023**2, 1024) == 1023
+    assert backend_module._largest_divisor_at_most(3 * 4999, 150) == 3
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(("size", "expected"), [(2**31 - 1, 1), (2**30, 2**29)])
+def test_shrink_wide_automatic_axis_has_bounded_work(size: int, expected: int) -> None:
+    probes = 0
+
+    class CountedSize(int):
+        def __abs__(self) -> int:
+            return self
+
+        def __mod__(self, divisor: int) -> int:
+            nonlocal probes
+            probes += 1
+            assert probes <= math.isqrt(size), "divisor search exceeded its work bound"
+            return super().__mod__(divisor)
+
+    threads = [0]
+    assert shrink_auto_thread_counts([CountedSize(size)], threads, expected) == expected
+    assert probes > 0
+    assert threads == [expected]
