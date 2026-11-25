@@ -1425,9 +1425,10 @@ def epilogue_subtile(
     two-CTA tile (``tcgen05_plain_narrow_subtile``: one output store and no auxiliary
     operand -- a two-output or aux epilogue keeps CuTe's with-source
     (128, 64) subtile there, 64 KiB of C rings for two outputs; the plan
-    also asks for a single static-full-tile store, which every plain
-    kernel the gates see has); otherwise CuTe's with-source rule at the
-    output width, sized for a 32-bit output without store facts.
+    also asks for a single store over static full tiles, or over whole N
+    and K tiles whose partial last M tile the TMA store clips); otherwise
+    CuTe's with-source rule at the output width, sized for a 32-bit output
+    without store facts.
     """
     constraints = state.ab_stages_three_search_constraints
     rowvec_facts = state.rowvec_aux_facts

@@ -371,7 +371,14 @@ def _paired_pipeline_store_subtile_n(
     ``epilogue_subtile`` checks (``_plain_narrow_subtile_facts``) plus the
     static full tiles, row-major output and TMA-store epilogue the plan
     also asks for.  ``None`` keeps ``pipeline_smem_bytes``' with-source
-    tile, the only place that width is computed.
+    tile, the only place that width is computed.  Codegen also renders
+    the 32 columns over a partial last M tile (whole N and K tiles, every
+    tile on the TMA store); pricing it at the with-source tile there
+    overstates its C ring, so the priced AB depth always fits: the same
+    six stages beside two C stages (seven 32 KiB stages leave no room for
+    a C ring either way), one fewer than the (128, 32) ring would leave
+    beside four (five instead of six at bk=64, two instead of three at
+    bk=128).
     """
     configured = epi_subtile_n_knob(config)
     if configured is not None:

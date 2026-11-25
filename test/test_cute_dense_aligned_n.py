@@ -20,6 +20,8 @@ from helion._compiler.cute.dense_aligned_n import ALIGNED_N_CHOICES
 from helion._compiler.cute.dense_aligned_n import carrier_n
 from helion._compiler.cute.dense_aligned_n import dense_aligned_n_defaults
 from helion._compiler.cute.dense_aligned_n import pair_tile_wave_cost
+from helion._compiler.cute.dense_aligned_n import transposed_double_edge_without_pairs
+from helion._compiler.cute.dense_aligned_n import transposed_pair_tile_gain
 from helion._compiler.cute.pipeline_smem import Tcgen05PipelineSmemFacts
 from helion._compiler.cute.pipeline_smem import pipeline_smem_bytes
 from helion._compiler.cute.strategies import tcgen05_two_cta_m128_epilogue_tile_expr
@@ -30,12 +32,15 @@ from helion._compiler.cute.tcgen05_config import surface
 from helion._compiler.cute.tcgen05_schedule_facts import analyze_native_gemm
 from helion._testing import skipUnlessBackends
 from helion._testing.cute_codegen import forbid_cuda_work
+from helion._testing.cute_codegen import kernel_body
 from helion._testing.cute_dense_tcgen05 import aligned_n_bf16_config
 from helion._testing.cute_dense_tcgen05 import bf16_mm_args
+from helion._testing.cute_dense_tcgen05 import bias_mm_into
 from helion._testing.cute_dense_tcgen05 import column_scale_mm_into
 from helion._testing.cute_dense_tcgen05 import gb300_target
 from helion._testing.cute_dense_tcgen05 import output_alias_reading_mm
 from helion._testing.cute_dense_tcgen05 import output_reading_mm
+from helion._testing.cute_dense_tcgen05 import plain_mm
 from helion._testing.cute_dense_tcgen05 import plain_mm_into
 from helion._testing.cute_dense_tcgen05 import scaled_args
 from helion._testing.cute_dense_tcgen05 import scaled_mm
@@ -1029,16 +1034,28 @@ def test_sixteen_bit_pair_n_tails_and_fp32_outputs():
     assert repaired["tcgen05_epi_warp_groups"] == 1
     assert repaired["tcgen05_tile_n"] == 192
     # 3072x1024x6272 (C4_15): one wave of 72 256x192 pairs against one of 48
-    # 256x256 (22% less by the cost model) is seeded; 224 (12%) is not.
+    # 256x256 (22% less by the cost model) is seeded; 224 (12%) is not, and
+    # neither are the widths that are not multiples of 32 (176 and 208, 25%
+    # and 16%). The search, which measures its samples, also tries every
+    # clipped width the model ranks ahead of 256x256.
     x, y, out = bf16_mm_args(3072, 1024, 6272)
     c4_15 = plain_mm_into._bind_isolated((x, y, out.float()))
     assert _seeded_widths(c4_15) == {192}
     assert facts._dense_aligned_n_widths(c4_15.config_spec._cute_tcgen05_config) == (
+        176,
         192,
+        208,
+        224,
+        240,
     )
-    # 2048^3: 64 256x256 pairs fill one wave; every clipped width takes two.
+    # 2048^3: 64 256x256 pairs fill one wave; every clipped width but 240
+    # takes two (72 256x240 pairs still fit the 76 SM pairs, 6% less by the
+    # model: searched, not seeded).
     square = plain_mm_into._bind_isolated(bf16_mm_args(2048, 2048, 2048))
-    assert facts._dense_aligned_n_widths(square.config_spec._cute_tcgen05_config) == ()
+    assert facts._dense_aligned_n_widths(square.config_spec._cute_tcgen05_config) == (
+        240,
+    )
+    assert _seeded_widths(square) == set()
     # A width that divides N is always searched. An fp32 output still prices
     # the with-source subtile (six stages); a 16-bit one keeps the (128, 32)
     # ring and seven.
@@ -1051,11 +1068,11 @@ def test_sixteen_bit_pair_n_tails_and_fp32_outputs():
             plan = facts._dense_aligned_n_plan(state, aligned_n_bf16_config().config)
         assert plan is not None and plan.max_ab_stages == depth
     # 160 columns: a clipped 96-wide tile has as many tiles as the 128-wide
-    # pairs and is not seeded.
-    assert (
-        _seeded_widths(plain_mm_into._bind_isolated(bf16_mm_args(1024, 160, 512)))
-        == set()
-    )
+    # pairs and is not seeded; 160 itself (a 16-bit N between 128 and 256,
+    # carried by the 256-wide N tile) is one whole N tile and is.
+    assert _seeded_widths(
+        plain_mm_into._bind_isolated(bf16_mm_args(1024, 160, 512))
+    ) == {160}
     # The edge schedule needs whole K tiles: N and K tails together leave.
     both = plain_mm_into._bind_isolated(bf16_mm_args(1024, 1024, 544))
     with both.env:
@@ -1065,6 +1082,187 @@ def test_sixteen_bit_pair_n_tails_and_fp32_outputs():
             )
             is None
         )
+
+
+def test_plain_pair_prices_its_allocations_in_kernel_order():
+    # The 224-wide pair's seventh AB stage beside two (128, 32) C stages: the
+    # transposed product of bf16 32768x512x512 (column-major [512, 32768]
+    # output) renders exactly the allocations the measured arena model
+    # prices (``tcgen05_fixed_smem_overhead_bytes``: ptxas lays them out in
+    # reverse), and nothing else: 231 596 of the 232 448-byte opt-in, where
+    # the flat 2 KiB reserve priced 233 616.
+    x, y, out = bf16_mm_args(32768, 512, 512)
+    bound = plain_mm_into._bind_isolated((y.T, x.T, out.T))
+    config = aligned_n_bf16_config(tcgen05_tile_n=224, tcgen05_ab_stages=7)
+    source = bound.to_code(config)
+    allocations = [
+        line.strip().split(" = ")[0]
+        + " "
+        + line.split("alloc_smem(")[1].split(",")[0]
+        + (
+            " align" + line.split("alignment=")[1].rstrip(")")
+            if "alignment=" in line
+            else ""
+        )
+        for line in kernel_body(source).splitlines()
+        if "cute.arch.alloc_smem(" in line
+    ]
+    assert allocations == [
+        "tcgen05_tmem_holding_buf cutlass.Int32",
+        "tcgen05_tmem_dealloc_mbar_ptr cutlass.Int64",
+        "tcgen05_acc_pipeline_barriers cutlass.Int64",
+        "smem_a cutlass.BFloat16 align128",
+        "smem_b cutlass.BFloat16 align128",
+        "tcgen05_ab_pipeline_mbars cutlass.Int64",
+        "tcgen05_sD_ptr cutlass.BFloat16 align1024",
+    ]
+    assert "cutlass.Int32(14))" in source  # 2 x 7 AB barriers
+    facts_ = Tcgen05PipelineSmemFacts(2, 2, 232448, output_column_major=True)
+
+    def priced(*, plain_layout: bool) -> int:
+        return pipeline_smem_bytes(
+            facts_,
+            bm=256,
+            bn=224,
+            bk=64,
+            ab_stages=7,
+            c_stages=2,
+            acc_stages=2,
+            plain_layout=plain_layout,
+        )
+
+    # 16 384 (C ring) + 128 (AB barriers) + 215 040 (AB ring) + 44
+    assert priced(plain_layout=True) == 231596
+    assert priced(plain_layout=False) == 233616
+    ab, _ = wrapper_plans(source)
+    assert ab["ab_stage_count"] == 7
+
+
+def test_sixteen_bit_pair_stores_a_column_major_output():
+    # The transposed product of a tall GEMM: out.T = b.T @ a.T for
+    # bf16 16384x1024x4096 (a row-major, b column-major), whose output is a
+    # column-major [1024, 16384] view. Its pairs run 256 rows of the 1024
+    # and a physical width of the 16384: 224 makes 74 x 4 = 296 tiles, four
+    # waves of the 76 SM pairs (256x256 makes 256 tiles, also four).
+    x, y, out = bf16_mm_args(16384, 1024, 4096)
+    bound = plain_mm_into._bind_isolated((y.T, x.T, out.T))
+    state = bound.config_spec._cute_tcgen05_config
+    dense_facts = state.dense_gemm_facts
+    assert dense_facts is not None and dense_facts.output_column_major
+    assert 224 in facts._dense_aligned_n_widths(state)
+    config = aligned_n_bf16_config(tcgen05_tile_n=224, tcgen05_ab_stages=6)
+    with bound.env:
+        plan = facts._dense_aligned_n_plan(state, config.config)
+        assert plan is not None
+        assert plan.physical_tile == (256, 224, 64)
+        # The column-major store keeps CuTe's with-source (128, 32) tile:
+        # seven 30 KiB stages fit beside it (231 596 of the 232 448-byte
+        # opt-in, ``pipeline_smem_bytes``' ``plain_layout``).
+        assert plan.max_ab_stages == 7 and plan.store_subtile_n is None
+        # The direct store (no D ring) stays row-major only; the search's
+        # repair moves a sampled one to the normal store.
+        direct = aligned_n_bf16_config(
+            tcgen05_tile_n=224, tcgen05_ab_stages=6, tcgen05_c_store_mode="direct"
+        )
+        assert facts._dense_aligned_n_plan(state, direct.config) is None
+        gen = ConfigGeneration(bound.config_spec)
+        for _ in range(100):
+            sample = gen.unflatten(gen.random_flat()).config
+            if sample.get("tcgen05_tile_n"):
+                assert sample.get("tcgen05_c_store_mode", "normal") == "normal"
+    # Where a plain row-major store would take the narrow (128, 32) or the
+    # (128, 48) subtile (192 and 240 over whole tiles of a 3072-wide N), the
+    # column-major one is priced at CuTe's with-source tile, which codegen
+    # renders for it: 192 fits six stages beside its (128, 64) tile, not the
+    # seven the (128, 32) one leaves room for; 240 seven beside its
+    # (128, 16) tile.
+    x, y, out = bf16_mm_args(3072, 1024, 4096)
+    whole = plain_mm_into._bind_isolated((y.T, x.T, out.T))
+    whole_state = whole.config_spec._cute_tcgen05_config
+    with whole.env:
+        for width, stages in ((192, 6), (240, 7)):
+            plan = facts._dense_aligned_n_plan(
+                whole_state,
+                aligned_n_bf16_config(tcgen05_tile_n=width, tcgen05_ab_stages=6).config,
+            )
+            assert plan is not None
+            assert (plan.max_ab_stages, plan.store_subtile_n) == (stages, None)
+        # One N tile per cluster: A multicast is the row-major store's only.
+        assert (
+            facts._dense_aligned_n_plan(
+                whole_state,
+                aligned_n_bf16_config(
+                    tcgen05_tile_n=192, tcgen05_ab_stages=6, tcgen05_cluster_n=2
+                ).config,
+            )
+            is None
+        )
+    source = bound.to_code(config)
+    assert "LayoutEnum.COL_MAJOR" in source
+    ab, d = wrapper_plans(source)
+    assert (ab["bm"], ab["bn"], ab["bk"]) == (256, 224, 64)
+    assert ab["ab_stage_count"] == 6
+    assert (d["bm"], d["bn"]) == (256, 224)
+    assert d.get("d_column_major") is True and d.get("epi_tile_n") is None
+
+
+def test_sixteen_bit_pair_stages_its_last_tile_in_the_drained_a_ring():
+    # A plain row-major 16-bit pair whose width 32 does not divide (176 =
+    # 16 x 11) stores (128, 16) subtiles through a two-stage C ring. Its CTA's
+    # last tile stages all eleven in the A ring, which that tile's MMAs have
+    # drained, when the ring holds the tile (8 x 64 K columns >= 176):
+    #
+    #     if not tcgen05_epi_next_work.is_valid_tile:
+    #         tcgen05_last_sD = cute.make_tensor(cute.recast_ptr(smem_a, ...), ...)
+    #         ...
+    #     else:
+    #         <the C-ring loop>
+    def render(m, n, k, *, transpose=False, **changes):
+        x, y, out = bf16_mm_args(m, n, k)
+        args = (y.T, x.T, out.T) if transpose else (x, y, out)
+        source = plain_mm_into._bind_isolated(args).to_code(
+            aligned_n_bf16_config(**changes)
+        )
+        return source, "if not tcgen05_epi_next_work.is_valid_tile:" in source
+
+    source, staged = render(6272, 1024, 2048, tcgen05_tile_n=176, tcgen05_ab_stages=8)
+    assert staged
+    # The epilogue role looks one tile ahead on its own scheduler.
+    assert "tcgen05_epi_next_work = " in source
+    assert "cute.recast_ptr(smem_a, tcgen05_last_sD_layout.inner" in source
+    # Two stages hold 128 of the 176 columns; the 80-wide pair's five
+    # subtiles, the 48-column (144) and narrow (192 over whole N tiles)
+    # subtiles and the column-major store keep the C ring alone.
+    for shape, changes in (
+        ((6272, 1024, 2048), {"tcgen05_tile_n": 176, "tcgen05_ab_stages": 2}),
+        (
+            (6272, 1024, 2048),
+            {
+                "tcgen05_tile_n": 80,
+                "block_sizes": [256, 128, 64],
+                "tcgen05_ab_stages": 8,
+            },
+        ),
+        ((6144, 1152, 2048), {"tcgen05_tile_n": 144, "tcgen05_ab_stages": 6}),
+        # (a deep C ring leaves 144 on (128, 16) subtiles, still the ring's)
+        (
+            (6144, 1152, 2048),
+            {"tcgen05_tile_n": 144, "tcgen05_ab_stages": 8, "tcgen05_c_stages": 4},
+        ),
+        ((6144, 1152, 2048), {"tcgen05_tile_n": 192, "tcgen05_ab_stages": 6}),
+    ):
+        assert not render(*shape, **changes)[1]
+    assert not render(
+        2112, 1024, 2048, transpose=True, tcgen05_tile_n=176, tcgen05_ab_stages=6
+    )[1]
+    # An epilogue chain (two scalar FP32 scales: no auxiliary descriptor)
+    # keeps the C ring too.
+    a, b, scale_a, scale_b = scaled_args(6272, 1024, 512, mode=0, dtype=torch.bfloat16)
+    source = scaled_mm._bind_isolated((a, b, scale_a, scale_b)).to_code(
+        aligned_n_bf16_config(tcgen05_tile_n=176, tcgen05_ab_stages=8)
+    )
+    assert "CtaGroup.TWO, (256, 176)" in source
+    assert "tcgen05_epi_next_work" not in source
 
 
 def test_sixteen_bit_pair_rings_tails_and_refusals():
@@ -1125,13 +1323,27 @@ def test_sixteen_bit_pair_rings_tails_and_refusals():
             )
             is not None
         )
-    # Each CTA's half of an 80-wide K-major B tile is not whole 16-row atoms.
+    # Each CTA stages 40 rows of an 80-wide K-major B tile, an odd count of
+    # the swizzle's 8-row atoms: the TMA box is the stage-0 ``select`` of the
+    # SMEM layout (``cute.slice_`` aborts on it). The seeds keep the widths
+    # that are multiples of 32; the search also samples 80 and 240.
     odd = plain_mm_into._bind_isolated(bf16_mm_args(8192, 960, 768))
-    with pytest.raises(InvalidConfig, match="tcgen05_tile_n"):
-        odd.to_code(
-            aligned_n_bf16_config(tcgen05_tile_n=80, block_sizes=[256, 128, 64])
-        )
+    source = odd.to_code(
+        aligned_n_bf16_config(tcgen05_tile_n=80, block_sizes=[256, 128, 64])
+    )
+    assert "sB_tma_layout = cute.select(sB_layout, mode=[0, 1, 2])" in source
+    assert "(256, 80)" in source
+    # the host descriptor takes the device's form from the wrapper plan
+    assert "'b_stage_select': True" in source
+    assert "'b_stage_select'" not in odd.to_code(aligned_n_bf16_config())
     assert _seeded_widths(odd) == {96, 160, 192}
+    assert facts._dense_aligned_n_widths(odd.config_spec._cute_tcgen05_config) == (
+        80,
+        96,
+        160,
+        192,
+        240,
+    )
     # MN-major B: each CTA stages half of an N tile as one SMEM row; only the
     # 192-wide pair's 96-column (192-byte) halves keep 64-byte swizzle atoms.
     mn_b = plain_mm_into._bind_isolated(bf16_mm_args(8192, 960, 768, rhs_k_major=False))
@@ -1139,6 +1351,112 @@ def test_sixteen_bit_pair_rings_tails_and_refusals():
     # 960 columns split into five 192-wide tiles: no N pairing.
     with pytest.raises(InvalidConfig, match="tcgen05_tile_n"):
         odd.to_code(aligned_n_bf16_config(tcgen05_cluster_n=2))
+
+
+def test_seeds_compare_only_the_widths_they_take():
+    # bf16 512x5632x2048: 176 divides N, but the seeds take multiples of 32
+    # only, so 176 is no reference of their 15% filter: they keep the clipped
+    # 160 and 192 and the default its 256x160 pair. The search samples the
+    # seeded widths and 176.
+    bound = plain_mm_into._bind_isolated(bf16_mm_args(512, 5632, 2048))
+    state = bound.config_spec._cute_tcgen05_config
+    assert _seeded_widths(bound) == {160, 192}
+    assert bound.config_spec.default_config().config["tcgen05_tile_n"] == 160
+    assert facts._dense_aligned_n_widths(state) == (160, 176, 192)
+
+
+def test_n_major_b_keeps_widths_in_multiples_of_32():
+    # Over an N-major B each CTA stages its half of the N tile as SMEM rows;
+    # the pair keeps widths that are multiples of 32 there.
+    bound = plain_mm_into._bind_isolated(
+        bf16_mm_args(8192, 2304, 768, rhs_k_major=False)
+    )
+    with pytest.raises(InvalidConfig, match="multiple of 32 over an N-major B"):
+        bound.to_code(aligned_n_bf16_config(tcgen05_tile_n=144))
+
+
+def test_odd_width_pairs_store_48_column_subtiles():
+    # A plain 16-bit pair of a width 48 divides and 32 does not stores
+    # (128, 48) subtiles where CuTe's with-source rule halves to (128, 16),
+    # where that C ring fits beside the configured AB ring; a deeper ring
+    # keeps CuTe's tile and its AB depth (144 wide: four 48-wide C stages
+    # leave seven AB stages, four 16-wide ones eight).
+    wide = "tcgen05_store_epi_tile = (cute.make_layout(128), cute.make_layout(48))"
+    cases = (
+        ((1000, 2560, 2048), 144, 2, 8, True),
+        ((1000, 2560, 2048), 144, 4, 7, True),
+        ((1000, 2560, 2048), 144, 4, 8, False),
+        ((4096, 2048, 2048), 240, 2, 6, True),
+        ((1000, 2048, 2560), 112, 2, 9, False),
+        ((6272, 1024, 1024), 176, 2, 8, False),
+    )
+    for shape, width, c_stages, ab_stages, takes_48 in cases:
+        bound = plain_mm_into._bind_isolated(bf16_mm_args(*shape))
+        config = aligned_n_bf16_config(
+            tcgen05_tile_n=width,
+            block_sizes=[256, 128 if width <= 128 else 256, 64],
+            tcgen05_c_stages=c_stages,
+            tcgen05_ab_stages=ab_stages,
+        )
+        state = bound.config_spec._cute_tcgen05_config
+        with bound.env:
+            plan = facts._dense_aligned_n_plan(state, config.config)
+        assert plan is not None
+        assert plan.store_subtile_n == (48 if takes_48 else None)
+        source = bound.to_code(config)
+        assert (wide in source) == takes_48
+        assert ("'epi_tile_n': 48" in source) == takes_48
+    # The ring CuTe's tile leaves stays the plan's limit at four C stages.
+    bound = plain_mm_into._bind_isolated(bf16_mm_args(1000, 2560, 2048))
+    with bound.env:
+        deep = facts._dense_aligned_n_plan(
+            bound.config_spec._cute_tcgen05_config,
+            aligned_n_bf16_config(
+                tcgen05_tile_n=144, tcgen05_c_stages=4, tcgen05_ab_stages=8
+            ).config,
+        )
+    assert deep is not None and deep.max_ab_stages == 8
+
+
+def test_one_cta_tiles_keep_the_stage_slice():
+    # The stage-0 ``select`` is the 2-CTA pair's form for B halves of odd
+    # 8-row atom counts; a one-CTA 64x8 tile (one 8-row atom) keeps the slice.
+    a = torch.empty((4096, 4096), dtype=torch.bfloat16)
+    b = torch.empty((8, 4096), dtype=torch.bfloat16).T
+    bound = plain_mm._bind_isolated((a, b))
+    source = bound.to_code(bound.config_spec.default_config())
+    assert "sB_tma_layout = cute.slice_(sB_layout, (None, None, None, 0))" in source
+
+
+def test_plain_256_wide_pair_takes_the_narrow_subtile_over_an_m_tail():
+    # The 256x256 pair over a partial last M tile: bf16 25216x768x768 is 98.5
+    # 256-row pairs over whole N and K tiles, every tile on the TMA store,
+    # which clips the rows past M. Its plain store takes the (128, 32)
+    # subtile, as the whole tiles of 25344x768x768 do; CuTe's with-source
+    # rule would render (128, 64). Only whole tiles also take the no-unroll
+    # K loop. A partial last N tile or a K tail keeps CuTe's tile.
+    config = helion.Config(
+        block_sizes=[256, 256, 64],
+        pid_type="persistent_interleaved",
+        tcgen05_cluster_m=2,
+        tcgen05_cluster_n=1,
+        tcgen05_ab_stages=6,
+        tcgen05_acc_stages=2,
+        tcgen05_c_stages=2,
+        l2_groupings=[16],
+    )
+    narrow = "tcgen05_epi_tile = (cute.make_layout(128), cute.make_layout(32))"
+    for (m, n, k), takes_subtile, nounroll in (
+        ((25344, 768, 768), True, True),
+        ((25216, 768, 768), True, False),
+        ((25344, 1000, 768), False, False),
+        ((25216, 768, 736), False, False),
+    ):
+        source = plain_mm_into._bind_isolated(bf16_mm_args(m, n, k)).to_code(config)
+        assert (narrow in source) is takes_subtile, (m, n, k)
+        assert ("'epi_tile_n': 32" in source) is takes_subtile, (m, n, k)
+        assert ("compute_epilogue_tile_shape(" in source) is not takes_subtile
+        assert ("unroll=1" in source) is nounroll, (m, n, k)
 
 
 @pytest.mark.parametrize("m", [8192, 8320])
@@ -1199,3 +1517,114 @@ def test_sixteen_bit_pair_row_operands_keep_the_split_store():
     )
     assert "_BLOCK_SIZE_1 = 160" in source
     assert "tcgen05_aux_rowvec_smem" not in source
+
+
+def test_a_short_k_loop_keeps_the_product_as_written() -> None:
+    # bf16 32768x256x256 runs four 64-deep K blocks, no more than the fixed
+    # prologue and epilogue the model charges per tile, so the model does not
+    # rank its orientations (the same 128x256 CTA pair runs 1.04 of cuBLAS
+    # as written and 0.98 transposed on GB300); 8192x512x512 (eight K blocks)
+    # keeps its modeled gain for the transposed product.
+    assert transposed_pair_tile_gain(32768, 256, 256, sm_pairs=76) == 1.0
+    assert transposed_pair_tile_gain(8192, 512, 512, sm_pairs=76) > 1.08
+
+
+def test_a_row_major_pair_under_a_128_row_ceiling_runs_128_rows() -> None:
+    # bf16 25216x192x768: M is ragged for 256-row tiles and N for 128-wide
+    # ones, so the search keeps M tiles of at most 128 rows. N (192) is itself
+    # an aligned width whose carrier (256) is in the N bounds, and the family
+    # runs it on the 128-row pair (64 rows per CTA): one tile per 128 rows
+    # that reads A once (GB300: 1.03 of cuBLAS against 0.93 for the 128-row
+    # pair over N tiles of 128 + 64).
+    bound = plain_mm_into._bind_isolated(bf16_mm_args(25216, 192, 768))
+    state = bound.config_spec._cute_tcgen05_config
+    assert facts._matmul_search_bounds(state)[:2] == ((128, 128), (8, 256))
+    assert facts._dense_aligned_n_block_m(state) == 128
+    seeded = [
+        seed.config
+        for seed in bound.config_spec.compiler_seed_configs
+        if seed.config.get("tcgen05_tile_n") == 192
+    ]
+    assert seeded
+    assert {
+        (
+            tuple(seed["block_sizes"][:3]),
+            seed["tcgen05_cta_group"],
+            seed["tcgen05_ab_stages"],
+        )
+        for seed in seeded
+    } == {((128, 256, 64), "two", 10)}
+    source = bound.to_code(helion.Config(**seeded[0]))
+    assert "CtaGroup.TWO, (128, 192)" in source
+    assert "num_stages=10" in source
+    # Its 64-row C tile stores CuTe's with-source subtile: the plan prices no
+    # narrow subtile and refuses a configured one (codegen would reject it).
+    with bound.env:
+        plan = facts._dense_aligned_n_plan(state, dict(seeded[0]))
+        configured = facts._dense_aligned_n_plan(
+            state, {**seeded[0], "tcgen05_epi_subtile_n": 32}
+        )
+    assert plan is not None and plan.store_subtile_n is None
+    assert configured is None
+    # A wider N under the same ceiling keeps the 256-row family, which the
+    # ceiling excludes: the 128-row pair runs only N that one tile spans.
+    wide = plain_mm_into._bind_isolated(bf16_mm_args(25216, 1120, 768))
+    wide_state = wide.config_spec._cute_tcgen05_config
+    assert facts._matmul_search_bounds(wide_state)[0] == (128, 128)
+    assert facts._dense_aligned_n_widths(wide_state) == ()
+    assert not _seeded_widths(wide)
+    # The transposed product (a column-major output) keeps the 256-row pair,
+    # which the 128-row M ceiling of its 192 rows excludes: its 128-row tile
+    # would store through 16-column rounds.
+    x = torch.empty((192, 768), dtype=torch.bfloat16)
+    y = torch.empty((25216, 768), dtype=torch.bfloat16).T
+    out = torch.empty((25216, 192), dtype=torch.bfloat16).T
+    transposed = plain_mm_into._bind_isolated((x, y, out))
+    assert (
+        facts._dense_aligned_n_block_m(transposed.config_spec._cute_tcgen05_config)
+        == 256
+    )
+    assert not _seeded_widths(transposed)
+
+
+def test_the_default_skips_power_of_two_tiles_wider_than_n() -> None:
+    # bf16 32768x192x192: N's 256-wide aligned carrier also puts the plain
+    # (256, 256) pair in the search. With a bias row (no aligned plan) its N
+    # tile is wider than N, so its TMA store gives way to predicated SIMT
+    # rows (GB300: 73.3 us against the flat (128, 16) default's 24.0); the
+    # autotune-off default keeps the flat tile. The plain GEMM takes the
+    # 256x192 aligned pair (7.0 us against the flat tile's 23.4).
+    x, y, out = bf16_mm_args(32768, 192, 192)
+    bias = torch.empty((192,), dtype=torch.bfloat16)
+    biased = bias_mm_into._bind_isolated((x, y, bias, out)).config_spec
+    assert biased.default_config().config["block_sizes"][:2] == [128, 16]
+    assert biased.default_config().config["pid_type"] == "flat"
+    plain = plain_mm_into._bind_isolated((x, y, out)).config_spec
+    assert plain.default_config().config["block_sizes"][:3] == [256, 256, 64]
+    assert plain.default_config().config["tcgen05_tile_n"] == 192
+
+
+def test_a_transposed_double_edge_off_the_pairs_keeps_the_model_neutral() -> None:
+    # A product ragged in both M and N against the 256x256 pair tile is a
+    # double edge either way round, which the search runs on the 256-row
+    # pairs only where no 64-row one-CTA tile divides its M. bf16
+    # 264x2496x1024: as written M = 264 (4 x 64 + 8) runs them; transposed,
+    # M = 2496 (39 x 64) runs only one-CTA tiles, so the model, which prices
+    # the pairs, keeps it as written (it modeled 1.03).
+    def pairs(args: tuple[torch.Tensor, ...]) -> bool:
+        bound = plain_mm_into._bind_isolated(args)
+        return (
+            bound.config_spec._cute_tcgen05_config.cluster_m2_search_constraints
+            is not None
+        )
+
+    with gb300_target(), forbid_cuda_work():
+        a, b, out = bf16_mm_args(264, 2496, 1024)
+        assert pairs((a, b, out))
+        assert not pairs((b.T, a.T, out.T))
+    assert transposed_double_edge_without_pairs(264, 2496)
+    assert transposed_pair_tile_gain(264, 2496, 1024, sm_pairs=76) == 1.0
+    # Whole pair tiles on either side make no double edge.
+    assert not transposed_double_edge_without_pairs(256, 2496)
+    assert not transposed_double_edge_without_pairs(264, 2560)
+    assert transposed_pair_tile_gain(16384, 1024, 4096, sm_pairs=76) > 1.1

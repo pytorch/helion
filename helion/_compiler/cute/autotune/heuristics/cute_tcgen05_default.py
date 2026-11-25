@@ -1144,6 +1144,13 @@ class CuteTcgen05DefaultTileHeuristic(AutotunerHeuristic):
             if width:
                 bn = width
                 efficiency = _aligned_n_efficiency(cluster_m, bm, width)
+            elif bn > n:
+                # A power-of-two tile wider than N (a 16-bit N between 128
+                # and 256 searches the 256-wide aligned carrier) stores
+                # predicated SIMT rows instead of its TMA box: bf16
+                # 32768x192x192 with a bias row ran its (256, 256) pair at
+                # 73.3 us against the flat (128, 16) tile's 24.0 (GB300).
+                continue
             else:
                 efficiency = _TILE_EFFICIENCY.get((cluster_m, bm, bn))
             if (

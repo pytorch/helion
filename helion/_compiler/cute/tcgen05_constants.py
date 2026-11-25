@@ -136,6 +136,21 @@ TCGEN05_PLAIN_NARROW_SUBTILE_BLOCK_N = 256
 TCGEN05_PLAIN_NARROW_SUBTILE_BLOCK_NS = (192, TCGEN05_PLAIN_NARROW_SUBTILE_BLOCK_N)
 # The C-ring subtile width of that rule: ``(128, 32)`` stages.
 TCGEN05_PLAIN_NARROW_SUBTILE_N = 32
+# Plain 16-bit pairs whose physical width 48 divides and 32 does not (the
+# aligned-N family's 144 and 240) take ``(128, 48)`` subtiles, where CuTe's
+# with-source rule halves its 64-column target down to (128, 16). Measured in
+# ``cute_mma`` next to the decision (``tcgen05_odd_width_subtile``).
+TCGEN05_ODD_WIDTH_SUBTILE_N = 48
+
+
+def tcgen05_odd_width_subtile(width: int) -> bool:
+    """Whether a plain 16-bit pair of physical ``width`` stores (128, 48)
+    subtiles: 144 = 3 x 48, 240 = 5 x 48 (a width 32 divides keeps CuTe's
+    rule, and 112 or 176 have no wider 16-column multiple than the whole
+    tile, which costs AB stages)."""
+    return width % TCGEN05_ODD_WIDTH_SUBTILE_N == 0 and width % 32 != 0
+
+
 # The radix-store admission box, (the 64-row MMA tile's accumulator rows, the
 # plain narrow rule's 32 columns): the pre-filter admits a hierarchical
 # destination whose innermost runs hold whole boxes of it, the smallest
@@ -152,11 +167,34 @@ TCGEN05_RADIX_STORE_BOX_N = TCGEN05_PLAIN_NARROW_SUBTILE_N
 # than ~200 columns are stream-bound. A tile's fixed prologue and epilogue, in
 # 256-wide K blocks (~2.4k cycles measured at 1000x4096x2880). A width that
 # clips its last N tile must save at least the minimum gain over every
-# reference width: the model ranked a clipped 256x224 tile 12% ahead of
-# 256x256 where it measured 13% behind.
+# reference width to be seeded (the autotune-off default picks among the
+# seeds): the model ranked a clipped 256x224 tile 12% ahead of 256x256 where
+# it measured 13% behind (B200, bf16 -> fp32 3072x1024x6272). The search,
+# which measures its samples, tries every clipped width the model ranks ahead
+# of the references: on GB300 the model ranked bf16 1000x4096x2880's clipped
+# 256x224 tile (one wave of 76 pairs) 11% ahead of 256x256 and it measured
+# 10% ahead, and 2048x2560x2560's 256x144 tile (two waves of 72 pairs, as
+# nvjet tiles it) 4% ahead of 256x160, measured 3% ahead.
 TCGEN05_PAIR_TILE_STREAM_RATIO = 0.44
 TCGEN05_PAIR_TILE_FIXED_KBLOCKS = 4.5
 TCGEN05_ALIGNED_N_CLIPPED_MIN_GAIN = 0.15
+TCGEN05_ALIGNED_N_CLIPPED_SEARCH_MIN_GAIN = 0.0
+# The modeled gain (``dense_aligned_n.transposed_pair_tile_gain``) from which
+# helion.inductor lowers a 16-bit matmul as its transposed product. GB300,
+# bf16 RC, cuBLAS time / Helion time, both orientations autotuned in one
+# process (quick), modeled gain: as written / transposed:
+#   0.88 1000x4096x4096 1.03 / 0.95, 0.92 16384x384x768 1.06 / 0.97,
+#   0.97 1000x2880x4096 1.06 / 0.56; 1.00 25344x768x3072 1.01 / 1.02,
+#   1.03 8192x768x768 1.06 / 1.06, 1.04 32768x768x3072 1.00 / 1.00;
+#   1.03 8192x768x3072 1.04 / 1.10, 1.11 8192x1024x1024 0.96 / 1.02;
+# and full effort against 224-wide transposed pairs, modeled 1.11-1.13:
+# 16384x1024x4096 0.92 / 1.04, 8192x1024x4096 0.98 / 1.09, 4096x1024x4096
+# 0.99 / 1.07, 16384x768x3072 0.99 / 1.09, 25088x512x2048 1.03 / 1.11,
+# 25088x512x1024 1.06 / 1.09, 8192x512x2048 1.01 / 1.04, 32768x256x1024
+# 1.00 / 1.02. The model ranks the orientations by wave-quantized pair
+# tiles alone: every loss sits below 1.0, the gains from 1.0 to 1.04 split
+# (ties), and the first clear win is at 1.033.
+TCGEN05_TRANSPOSED_PRODUCT_MIN_GAIN = 1.03
 # An N-major B half row of the aligned-N pair must hold whole swizzle atoms
 # of at least this many bytes to be seeded.
 TCGEN05_ALIGNED_N_MN_B_ROW_BYTES = 64

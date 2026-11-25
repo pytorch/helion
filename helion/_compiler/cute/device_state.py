@@ -322,6 +322,13 @@ class CuteTcgen05StoreValue(_CuteTcgen05OrientationMixin):
     tail_tma_store_atom: str = ""
     tail_tma_store_tensor: str = ""
     role_local_tile_counter: str = ""
+    # The CTA's last output tile stages its subtiles in the drained A ring
+    # (``cute_mma``'s ``tcgen05_last_tile_staging``): the A ring's SMEM pointer
+    # and the work tile one step ahead of the epilogue role's, which the
+    # role's scheduler lookahead binds (the tile is the last when that one is
+    # not valid); "" on every other store.
+    last_tile_smem: str = ""
+    last_tile_next_work: str = ""
     use_role_local_epi: bool = False
     use_tma_store_epilogue: bool = False
     tma_store_full_tiles_only: bool = False

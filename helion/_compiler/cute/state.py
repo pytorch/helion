@@ -339,6 +339,11 @@ class CuteTcgen05State:
     epi_row_prefetches: list[Tcgen05EpiRowPrefetch] = dataclasses.field(
         default_factory=list
     )
+    # The work tile one step ahead of the epilogue role's, which the role's
+    # scheduler lookahead (``scheduler_pids``) binds when the store stages the
+    # CTA's last tile in the drained A ring (``cute_mma``'s
+    # ``tcgen05_last_tile_staging``); "" when no store does.
+    epi_last_tile_next_work: str = ""
     fragment_epilogue_plan: Tcgen05FragmentEpiloguePlan | None = None
     # Rejected proofs are stable for this per-config codegen state. Keep
     # the tile shape in the key so callers cannot accidentally reuse a

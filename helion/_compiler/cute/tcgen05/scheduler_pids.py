@@ -3004,7 +3004,46 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
             # Consumed: the copies exist once, and a loop built any other way
             # leaves them behind for the check after the role loops.
             device_function.cute_state.tcgen05.epi_row_prefetches = []
+        last_tile_next_work = (
+            device_function.cute_state.tcgen05.epi_last_tile_next_work
+            if role_block.role_predicate == self._tcgen05_epi_role_predicate()
+            else ""
+        )
+        if last_tile_next_work:
+            # The store stages the CTA's last tile at once in the drained A
+            # ring (``cute_mma``'s ``tcgen05_last_tile_staging``): a second
+            # scheduler one step ahead names the role's next work tile, and
+            # the tile is the last when that one is not valid. It steps on
+            # every scheduler step, padding slots included, so a padding slot
+            # after the last logical tile only keeps the C-ring loop there.
+            #
+            #     tcgen05_role_local_2_next_sched = StaticPersistentTileScheduler.create(...)
+            #     tcgen05_role_local_2_next_sched.advance_to_next_work()
+            #     while tcgen05_role_local_2_work_tile.is_valid_tile:
+            #         tcgen05_epi_next_work = tcgen05_role_local_2_next_sched.get_current_work()
+            #         tcgen05_role_local_2_next_sched.advance_to_next_work()
+            #         ...  # if not tcgen05_epi_next_work.is_valid_tile: <stage at once>
+            next_sched = device_function.new_var(f"{scheduler_var_prefix}_next_sched")
+            prelude.extend(
+                [
+                    statement_from_string(
+                        f"{next_sched} = "
+                        f"{StaticSchedulerHandle.static_create_expr(sched_params_var)}"
+                    ),
+                    statement_from_string(f"{next_sched}.advance_to_next_work()"),
+                ]
+            )
+            lookahead_per_tile = [
+                statement_from_string(
+                    f"{last_tile_next_work} = {next_sched}.get_current_work()"
+                ),
+                statement_from_string(f"{next_sched}.advance_to_next_work()"),
+                *lookahead_per_tile,
+            ]
+            # Consumed: one epilogue role binds it.
+            device_function.cute_state.tcgen05.epi_last_tile_next_work = ""
         if (plan := self._tcgen05_plan()) is not None and plan.one_shot_role_scheduler:
+            assert not last_tile_next_work
             return RoleItemLoop(
                 role_block.role_predicate, prelude, body=per_tile_body
             ).build()
@@ -3142,8 +3181,7 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
 
         prelude = [
             statement_from_string(
-                f"{sched} = cutlass.utils.StaticPersistentTileScheduler.create("
-                f"{sched_params_var}, cute.arch.block_idx(), cute.arch.grid_dim())"
+                f"{sched} = {StaticSchedulerHandle.static_create_expr(sched_params_var)}"
             ),
             statement_from_string(f"{work} = {sched}.initial_work_tile_info()"),
             statement_from_string(f"{count} = cutlass.Int32(0)"),
@@ -6323,6 +6361,9 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         # for the copies, so one left behind would read stale rows.
         assert not cute_state.tcgen05.epi_row_prefetches, (
             "a staged-row lookahead was not rendered by the epilogue role loop"
+        )
+        assert not cute_state.tcgen05.epi_last_tile_next_work, (
+            "the last-tile staging's lookahead was not rendered by the epilogue role loop"
         )
         # Analyze after building every consumer, then restore the producer's
         # original position before any optional C-input role.

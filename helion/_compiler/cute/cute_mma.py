@@ -151,6 +151,7 @@ from .strategies import tcgen05_explicit_epilogue_tile_expr
 from .strategies import tcgen05_explicit_epilogue_tile_supported
 from .strategies import tcgen05_resolve_epilogue_tile
 from .strategies import tcgen05_smem_layout_expr
+from .strategies import tcgen05_smem_stage_expr
 from .strategies import warp_spec_from_config
 from .tcgen05 import universal_mma
 from .tcgen05.knobs import Tcgen05Knobs
@@ -183,6 +184,7 @@ from .tcgen05_constants import TCGEN05_CONSUMER_REGS_CHOICES
 from .tcgen05_constants import TCGEN05_CONSUMER_REGS_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_CONSUMER_REGS_DEFAULT
 from .tcgen05_constants import TCGEN05_EPI_GROUP_BARRIER_BASE_ID
+from .tcgen05_constants import TCGEN05_EPI_ROUND_SUBTILES_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_EPI_SUBTILE_N_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_EPI_WARP_GROUP_CHOICES
 from .tcgen05_constants import TCGEN05_EPI_WARP_GROUPS_CONFIG_KEY
@@ -218,6 +220,7 @@ from .tcgen05_constants import TCGEN05_LARGE_BN_PROOF_CLUSTER_M
 from .tcgen05_constants import TCGEN05_LARGE_BN_PROOF_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_LARGE_BN_PROOF_PID_TYPE
 from .tcgen05_constants import TCGEN05_LARGE_BN_PROOF_PROBLEM_SHAPE
+from .tcgen05_constants import TCGEN05_ODD_WIDTH_SUBTILE_N
 from .tcgen05_constants import TCGEN05_ONE_CTA_MAX_BLOCK_M
 from .tcgen05_constants import TCGEN05_PLAIN_NARROW_SUBTILE_BLOCK_NS
 from .tcgen05_constants import TCGEN05_PLAIN_NARROW_SUBTILE_N
@@ -1551,6 +1554,35 @@ def _host_function_tma_proof_scope(
                 yield
         finally:
             env.bound_runtime_input_specialization_results = saved
+
+
+def _tcgen05_b_stage_select(plan: Tcgen05PipelinePlan) -> bool:
+    """Whether the plan's staged B layout takes its stage 0 through
+    ``cute.select`` (``tcgen05_smem_stage_expr``): a 16-bit 2-CTA pair whose
+    CTAs each stage half its N width in B rows, a count 16 does not divide.
+
+    Both forms name the same layout. A 16-bit 256x144 pair stages 72 B rows
+    per CTA (an odd count of the 128B swizzle's 8-row atoms), and
+    ``cute.slice_`` aborts the process on that swizzled layout without a
+    message, while ``cute.select`` drops the stage mode::
+
+        sB = make_smem_layout_b(mma, (256, 144, 64), BFloat16, 8, is_k_major=True)
+        # sB:    S<3,4,3> o 0 o ((72,16),1,4,8):((64,1),0,16,4608)
+        cute.slice_(sB, (None, None, None, 0))
+        # SIGABRT
+        cute.select(sB, mode=[0, 1, 2])
+        # S<3,4,3> o 0 o ((72,16),1,4):((64,1),0,16)
+
+    Every other tile keeps the slice it rendered before (16-bit pairs whose
+    CTAs stage whole 16-row groups, FP8 pairs, every one-CTA tile). The
+    device decides; the AB wrapper plan records ``b_stage_select`` for the
+    host's descriptor.
+    """
+    return (
+        plan.tcgen05_is_two_cta
+        and plan.input_dtype.itemsize == 2
+        and plan.tcgen05_mma_bn // 2 % 16 != 0
+    )
 
 
 def _compose_axis_orders(
@@ -12032,6 +12064,10 @@ def _ab_tma_wrapper_plan(
     # remain byte-identical when the physical B operand is MN-major.
     if plan.tcgen05_mma_b_k_major:
         ab_tma_plan["b_k_major"] = True
+    # The device's stage-0 B form (``_tcgen05_b_stage_select``), recorded only
+    # where it selects so other wrapper plans stay byte-identical.
+    if plan.row_profile is None and _tcgen05_b_stage_select(plan):
+        ab_tma_plan["b_stage_select"] = True
     if plan.rhs_rank3_group_expr is not None:
         grouped_operand = "lhs" if plan.tcgen05_nm_orientation else "rhs"
         ab_tma_plan[f"{grouped_operand}_rank3_grouped_nt"] = True
@@ -12694,6 +12730,7 @@ def _emit_mma_pipeline(
     tcgen05_explicit_epi_tile_m: int | None = None
     tcgen05_explicit_epi_tile_n: int | None = None
     tcgen05_explicit_d_store_box_n: int | None = None
+    tcgen05_last_tile_staging_shape = False
     tcgen05_d_store_layout = (
         "cutlass.utils.layout.LayoutEnum.COL_MAJOR"
         if plan.tcgen05_nm_orientation or plan.output_column_major
@@ -13102,13 +13139,27 @@ def _emit_mma_pipeline(
         # 2048x4096x2048 (one tile per pair) 26.8 -> 26.4, within noise. A
         # configured tile wins, aux epilogues keep the promoted rule above,
         # and narrower tiles already take (128, 32) from the default rule.
-        tcgen05_plain_narrow_subtile = (
+        # One 16-bit output through the 256-row pair's role-local TMA-store
+        # epilogue, no auxiliary operand and no configured or promoted
+        # subtile: the stores the plain narrow and odd-width rules below
+        # retile.
+        tcgen05_plain_pair_store = (
             not tcgen05_explicit_epi_tile_configured
             and not tcgen05_promoted_rowvec_subtile
             and not plan.tcgen05_nm_orientation
             and plan.row_union_plan is None
             and plan.tcgen05_grouped_plan is None
             and plan.tcgen05_use_tma_store_epilogue
+            and plan.tcgen05_is_two_cta
+            and not plan.output_column_major
+            and not aux_tensor_descriptors_value
+            and tcgen05_output_stores_value is not None
+            and len(tcgen05_output_stores_value) == 1
+            and plan.input_dtype_str in ("cutlass.Float16", "cutlass.BFloat16")
+            and plan.epi_elem_dtype_str in ("cutlass.Float16", "cutlass.BFloat16")
+        )
+        tcgen05_plain_narrow_subtile = (
+            tcgen05_plain_pair_store
             and (
                 plan.tcgen05_static_full_tiles
                 # The aligned-N family's physical tile stores whole N and K
@@ -13118,14 +13169,31 @@ def _emit_mma_pipeline(
                     and plan.n_size % plan.tcgen05_mma_bn == 0
                     and plan.k_total_size % plan.bk == 0
                 )
+                # So does the 256-wide tile over whole N and K tiles, when
+                # every tile takes the TMA store (the partial-output store,
+                # which clips the rows past M). bf16 25216x768x768 (98.5
+                # 256-row pairs, the last half full) on the 256x256 pair,
+                # six AB stages; CuTe's with-source rule renders
+                #
+                #     tcgen05_epi_tile = compute_epilogue_tile_shape((256, 256), ...)
+                #     # (128, 64): four rounds of 64 columns per tile
+                #
+                # and this rule, as for the whole-tile 25344x768x768,
+                #
+                #     tcgen05_epi_tile = (cute.make_layout(128), cute.make_layout(32))
+                #     # eight rounds of 32 columns
+                #
+                # GB300, both kernels in one process (CUDA graphs over cold
+                # inputs, median of 15 per-round cuBLAS/Helion ratios): 0.966
+                # -> 1.011 and 0.963 -> 1.009 (25344x768x768: 1.006-1.011).
+                # A full/edge split, whose fringe tiles take the predicated
+                # SIMT store, keeps CuTe's tile (not measured).
+                or (
+                    tcgen05_partial_output_tma_store
+                    and plan.n_size % plan.tcgen05_mma_bn == 0
+                    and plan.k_total_size % plan.bk == 0
+                )
             )
-            and plan.tcgen05_is_two_cta
-            and not plan.output_column_major
-            and not aux_tensor_descriptors_value
-            and tcgen05_output_stores_value is not None
-            and len(tcgen05_output_stores_value) == 1
-            and plan.input_dtype_str in ("cutlass.Float16", "cutlass.BFloat16")
-            and plan.epi_elem_dtype_str in ("cutlass.Float16", "cutlass.BFloat16")
             and plan.tcgen05_mma_bn in TCGEN05_PLAIN_NARROW_SUBTILE_BLOCK_NS
             and tcgen05_explicit_epilogue_tile_supported(
                 is_two_cta=plan.tcgen05_is_two_cta,
@@ -13142,6 +13210,69 @@ def _emit_mma_pipeline(
             tcgen05_explicit_epi_tile_m = 128
             tcgen05_explicit_epi_tile_n = TCGEN05_PLAIN_NARROW_SUBTILE_N
             tcgen05_explicit_d_store_box_n = TCGEN05_PLAIN_NARROW_SUBTILE_N
+        # A plain 16-bit pair of a physical width 48 divides and 32 does not
+        # (the aligned-N family's 144 and 240) stores (128, 48) subtiles,
+        # where CuTe's with-source rule halves its 64 columns to (128, 16):
+        #
+        #     tcgen05_epi_tile = (cute.make_layout(128), cute.make_layout(48))
+        #
+        # three or five rounds of T2R, R2S and a TMA store, two epilogue
+        # barriers each, instead of nine or fifteen; the TMA store of one
+        # round stays in flight behind the next round's TMEM load (the whole
+        # 144-wide tile in one round serializes them). Same-process A/B on
+        # GB300, full-effort configs with the subtile alone changed (cuBLAS
+        # time / Helion time, bf16 RC, two C stages): 1000x2560x2048 on the
+        # 256x144 pair, one tile per CTA pair, 0.965 -> 0.994 (its four
+        # 16-wide C stages ran 0.959; four 48-wide ones leave seven AB
+        # stages, 0.957); 2048x2560x2560 (two tiles per pair) 0.982 -> 0.989;
+        # 4096x2560x2560 (four, the epilogue hidden behind the next tile's
+        # mainloop) 0.972 -> 0.971; 4096x2048x2048 on the 256x240 pair
+        # 1.009 -> 1.026. The aligned-N plan prices the same subtile
+        # (``dense_aligned_n_plan``), and its TMA store clips a partial last M
+        # or N tile.
+        tcgen05_odd_width_subtile_taken = (
+            tcgen05_plain_pair_store
+            and not tcgen05_plain_narrow_subtile
+            # the plan priced this C ring (its width and its plain 16-bit
+            # store, ``tcgen05_odd_width_subtile``)
+            and plan.tcgen05_aligned_n_plan is not None
+            and plan.tcgen05_aligned_n_plan.store_subtile_n
+            == TCGEN05_ODD_WIDTH_SUBTILE_N
+            and tcgen05_explicit_epilogue_tile_supported(
+                is_two_cta=plan.tcgen05_is_two_cta,
+                bm=plan.tcgen05_mma_bm,
+                bn=plan.tcgen05_mma_bn,
+                tile_shape=(
+                    128,
+                    TCGEN05_ODD_WIDTH_SUBTILE_N,
+                    TCGEN05_ODD_WIDTH_SUBTILE_N,
+                ),
+            )
+        )
+        if tcgen05_odd_width_subtile_taken:
+            tcgen05_explicit_epi_tile_m = 128
+            tcgen05_explicit_epi_tile_n = TCGEN05_ODD_WIDTH_SUBTILE_N
+            tcgen05_explicit_d_store_box_n = TCGEN05_ODD_WIDTH_SUBTILE_N
+        # A plain 16-bit aligned-width pair whose physical width neither 32
+        # nor 48 divides (112, 176, 208) keeps CuTe's with-source tile, which
+        # halves to 16 columns; its CTA's last output tile stages them all at
+        # once in the drained A ring (``tcgen05_last_tile_staging`` below).
+        # From seven subtiles (112 columns): the 80-wide pair's five are not
+        # measured, and the 256x128 pair's four (128, 32) ones lose; 144 and
+        # 240 keep the ring, which their (128, 48) subtiles take where they
+        # fit and which a deep C ring's (128, 16) ones were not measured on.
+        tcgen05_last_tile_staging_shape = (
+            tcgen05_plain_pair_store
+            and plan.tcgen05_aligned_n_plan is not None
+            and not tcgen05_plain_narrow_subtile
+            and plan.tcgen05_mma_bn % 32 != 0
+            and plan.tcgen05_mma_bn % TCGEN05_ODD_WIDTH_SUBTILE_N != 0
+            and plan.tcgen05_mma_bn >= 112
+            # measured on the 256-row pair, whose CTA stages a 128-row C tile
+            # in the A ring (``tcgen05_last_tile_staging``'s ring bound); the
+            # 128-row aligned pair (64-row C tile) keeps the per-round store
+            and plan.tcgen05_mma_bm == TCGEN05_TWO_CTA_BLOCK_M
+        )
         # A hierarchical (view/permute) destination (``radix_store``) takes TMA
         # store boxes that stay inside the layout's innermost runs, which its
         # admission proved for (64, 32) boxes: with no configured subtile, the
@@ -13157,6 +13288,7 @@ def _emit_mma_pipeline(
             not tcgen05_explicit_epi_tile_configured
             and not tcgen05_promoted_rowvec_subtile
             and not tcgen05_plain_narrow_subtile
+            and not tcgen05_odd_width_subtile_taken
             and plan.tcgen05_use_tma_store_epilogue
             and plan.tcgen05_traced_output_stores is not None
             and any(
@@ -15004,6 +15136,61 @@ def _emit_mma_pipeline(
         if tcgen05_use_tma_store_role_tile_counter
         else ""
     )
+    # The CTA's last output tile stages every epilogue subtile at once in
+    # the A ring, which the tile's MMAs have drained (no TMA load follows
+    # them), instead of cycling the two-stage C ring: one fence, one barrier
+    # and the TMA stores back to back, where the ring pays a C-buffer
+    # acquire and two barriers per 16-column subtile. Generated for the
+    # 256x176 pair (eleven subtiles; ``store_epilogue`` renders the branch,
+    # the epilogue role's scheduler lookahead binds ``tcgen05_epi_next_work``,
+    # the role's next work tile):
+    #
+    #     if not tcgen05_epi_next_work.is_valid_tile:
+    #         tcgen05_last_sD = cute.make_tensor(cute.recast_ptr(smem_a, ...), ...)  # 11 stages
+    #         for _tcgen05_subtile in cutlass.range(tcgen05_subtile_count, unroll_full=True):
+    #             <T2R, convert, R2S into tcgen05_last_sD[_tcgen05_subtile]>
+    #         cute.arch.fence_view_async_shared()
+    #         tcgen05_epilog_sync_barrier.arrive_and_wait()
+    #         <warp 0: eleven TMA stores, one commit>
+    #     else:
+    #         <the C-ring loop>
+    #
+    # The ring cannot widen instead: the eight-stage AB ring of the 256x176
+    # pair leaves room for two 4 KiB C stages only. GB300, cuBLAS time /
+    # Helion time, the same kernel with and without the branch on one GPU
+    # (ABAB): 6272x1024x1024 (two tiles per CTA) 0.933 -> 0.968,
+    # 6272x1024x2048 0.982 -> 0.987, 6272x1024x4096 0.991 -> 0.992; the
+    # 256x112 pair with one tile per CTA 1000x2048x2560 0.962 -> 0.984,
+    # 1000x2048x2304 0.950 -> 0.964. Wider subtiles have few rounds to save:
+    # the 256x128 pair's four (128, 32) ones 0.972 -> 0.967, the 128x128
+    # pair 0.935 -> 0.933. Rendered on the measured epilogue only: one
+    # epilogue warp group storing one subtile per round, no split K, no A
+    # multicast (another CTA's loads into this A ring), and a static
+    # schedule whose next tile the epilogue role computes itself (no CLC,
+    # no scheduler warp).
+    tcgen05_last_tile_staging = (
+        tcgen05_last_tile_staging_shape
+        and bool(tma_store_role_tile_counter)
+        and plan.tcgen05_use_role_local_epi
+        and tcgen05_matmul_plan is not None
+        and tcgen05_matmul_plan.uses_role_local_persistent_body
+        and not tcgen05_matmul_plan.one_shot_role_scheduler
+        and tcgen05_matmul_plan.scheduler_warp_count == 0
+        and tcgen05_matmul_plan.store_warp_count == 0
+        and tcgen05_matmul_plan.c_input_warp_count == 0
+        and tcgen05_matmul_plan.cluster_n == 1
+        and tcgen05_matmul_plan.m_subtile_count == 1
+        and not tcgen05_matmul_plan.is_clc_persistent
+        and tcgen05_epi_warp_groups_value == 1
+        and plan.knobs.int_or(plan.knobs.split_k, 1) == 1
+        and df.config.get(TCGEN05_EPI_ROUND_SUBTILES_CONFIG_KEY, 1) == 1
+        # the A ring holds the CTA's C tile (128 x bn against 128 x bk per
+        # stage); a shorter ring would spill the staged tile past it
+        and plan.tcgen05_ab_stage_count_value * plan.bk >= plan.tcgen05_mma_bn
+    )
+    tcgen05_last_tile_next_work = (
+        df.new_var("tcgen05_epi_next_work") if tcgen05_last_tile_staging else ""
+    )
     tcgen05_frag_a = df.new_var("tcgen05_tCrA")
     tcgen05_frag_b = df.new_var("tcgen05_tCrB")
     mma_stage = df.new_var("mma_stage")
@@ -15262,9 +15449,12 @@ def _emit_mma_pipeline(
             )
             prefix.append(
                 statement_from_string(
-                    f"{tma_smem_b_layout} = cute.select({plan.tcgen05_plan.smem_b_layout}, mode=[0, 1, 2])"
-                    if plan.row_profile is not None
-                    else f"{tma_smem_b_layout} = cute.slice_({plan.tcgen05_plan.smem_b_layout}, (None, None, None, 0))"
+                    f"{tma_smem_b_layout} = "
+                    + tcgen05_smem_stage_expr(
+                        plan.tcgen05_plan.smem_b_layout,
+                        select=plan.row_profile is not None
+                        or _tcgen05_b_stage_select(plan),
+                    )
                 )
             )
             prefix.append(
@@ -17478,6 +17668,8 @@ def _emit_mma_pipeline(
                 tail_tma_store_atom=tail_tma_store_atom,
                 tail_tma_store_tensor=tail_tma_store_tensor,
                 role_local_tile_counter=tma_store_role_tile_counter,
+                last_tile_smem=smem_a_ptr if tcgen05_last_tile_staging else "",
+                last_tile_next_work=tcgen05_last_tile_next_work,
                 use_role_local_epi=plan.tcgen05_use_role_local_epi,
                 use_tma_store_epilogue=plan.tcgen05_use_tma_store_epilogue,
                 tma_store_full_tiles_only=tcgen05_tma_store_full_tiles_only,
