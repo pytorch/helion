@@ -30,12 +30,13 @@ F32 = torch.float32
 
 def _seeds(
     bound: helion.runtime.kernel.BoundKernel,
-) -> list[tuple[list[int], list[int]]]:
-    """The heuristic's seeds' ``(block_sizes, num_threads)``, each on one SIMD
-    group."""
+) -> list[tuple[list[int], list[int], int]]:
+    """The heuristic's seeds' ``(block_sizes, num_threads, num_warps)``."""
     seeds = heuristic_seeds(MetalSplitReductionHeuristic, bound)
-    assert all(c.config["num_warps"] == 1 for c in seeds)
-    return [(c.config["block_sizes"], c.config["num_threads"]) for c in seeds]
+    return [
+        (c.config["block_sizes"], c.config["num_threads"], c.config["num_warps"])
+        for c in seeds
+    ]
 
 
 class TestSplitReductionSeeds(unittest.TestCase):
@@ -44,26 +45,41 @@ class TestSplitReductionSeeds(unittest.TestCase):
         4 or 2 columns per thread; planted at bind through the registry, the
         default config unchanged."""
         bound = split_gemv.bind(split_gemv_args(4, 512, 1024))
-        expected = [([32, 4, 4], [32, 1, 1]), ([32, 4, 2], [32, 1, 1])]
+        expected = [([32, 4, 4], [32, 1, 1], 1), ([32, 4, 2], [32, 1, 1], 1)]
         self.assertEqual(_seeds(bound), expected)
         spec = bound.config_spec
         self.assertIn(MetalSplitReductionHeuristic.name, spec.autotuner_heuristics)
         planted = [
-            (c.config["block_sizes"], c.config["num_threads"])
+            (c.config["block_sizes"], c.config["num_threads"], c.config["num_warps"])
             for c in spec.compiler_seed_configs
         ]
         self.assertEqual(planted, expected)
         self.assertEqual(spec.default_config().config["block_sizes"], [16, 4, 16])
 
     def test_rows_round_up(self) -> None:
-        """3 rows take a row block of 4 (a power of two); 1 row, 1."""
+        """3 rows take a row block of 4 (a power of two)."""
+        bound = split_gemv.bind(split_gemv_args(3, 512, 1024))
+        self.assertEqual([b for b, _, _ in _seeds(bound)], [[32, 4, 4], [32, 4, 2]])
+
+    def test_k_seed(self) -> None:
+        """At 1 row the K seed leads, the pass block on 256 threads (8 SIMD
+        groups) for one column; at 2 rows it comes last; a K of 64 puts it
+        on 64 threads (2 SIMD groups)."""
         self.assertEqual(
-            [b for b, _ in _seeds(split_gemv.bind(split_gemv_args(3, 512, 1024)))],
-            [[32, 4, 4], [32, 4, 2]],
+            _seeds(split_gemv.bind(split_gemv_args(1, 512, 1024))),
+            [
+                ([256, 1, 1], [256, 1, 1], 8),
+                ([32, 1, 4], [32, 1, 1], 1),
+                ([32, 1, 2], [32, 1, 1], 1),
+            ],
         )
         self.assertEqual(
-            [b for b, _ in _seeds(split_gemv.bind(split_gemv_args(1, 512, 1024)))],
-            [[32, 1, 4], [32, 1, 2]],
+            _seeds(split_gemv.bind(split_gemv_args(2, 512, 1024)))[-1],
+            ([256, 2, 1], [256, 1, 1], 8),
+        )
+        self.assertEqual(
+            _seeds(split_gemv.bind(split_gemv_args(1, 512, 64)))[0],
+            ([64, 1, 1], [64, 1, 1], 2),
         )
 
     def test_no_seed(self) -> None:
