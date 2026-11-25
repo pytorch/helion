@@ -2794,7 +2794,11 @@ def test_resume_round_trip_through_the_clis(checkout, review, monkeypatch, tmp_p
         git=True,
     )
     assert code == 2 and not out.strip() and "[codex] non-zero exit 1" in err
-    assert "[codex] failed 0s after its start (exit status 1); starting it once" in err
+    # A real process: how long it took to fail depends on the machine.
+    assert re.search(
+        r"\[codex\] failed \d+s after its start \(exit status 1\); starting it once",
+        err,
+    )
     assert int((tmp_path / "codex-count.txt").read_text()) == 2
     assert "is half done: the review of claude is saved, and codex failed" in err
     assert "autoreview passed:" not in err
