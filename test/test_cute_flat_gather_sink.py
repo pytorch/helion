@@ -38,6 +38,9 @@ if TYPE_CHECKING:
 
 cutlass = pytest.importorskip("cutlass")
 
+# Code-generation checks on CPU; the tests that run a kernel are ``cuda``.
+pytestmark = pytest.mark.cpu_only
+
 
 @pytest.fixture
 def cpu_only() -> Iterator[None]:
@@ -380,6 +383,7 @@ def _jagged_inputs(
     return x, offsets, counts, features
 
 
+@pytest.mark.cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_fold_mask_hoist_matches_the_reference_on_a_jagged_feature_tile() -> None:
     reference_jagged_mean_kernel_pytorch = import_example(
@@ -545,3 +549,205 @@ def test_an_extremum_fold_keeps_its_select(cpu_only: None) -> None:
     code = _code(_jagged_max_kernel, _mean_args(), MEAN_CONFIG)
     assert "_entry" not in code
     assert "float('-inf')" in code
+
+
+@helion.kernel(backend="cute", static_shapes=True)
+def swapped_pair_sum(
+    in0: torch.Tensor, in1: torch.Tensor, out0: torch.Tensor, out1: torch.Tensor
+) -> None:
+    """helion.inductor's split first kernel of a residual add of two
+    channels-last bf16 [4, 32, 7, 4] tensors whose H and W are swapped in
+    memory, with its sum over H and W (better-benchmark's sum_9683f50f2dcf
+    at a small shape): ``in0`` is read as a tile, ``in1`` through the flat
+    index ``row + tile_x.index``, whose row takes ``//`` and ``%`` of the
+    position."""
+    for tile_z, tile_y, tile_x in hl.tile([4, 2, 32]):
+        acc = hl.zeros([tile_z, tile_y, tile_x], dtype=torch.float32)
+        for tile_r in hl.tile(14):
+            tmp0 = in0[tile_z, tile_y, tile_r, tile_x].to(torch.float32)
+            row = (
+                32 * (tile_r.index.reshape([tile_r, 1]) // 7)
+                + 64 * tile_y.index.reshape([tile_y, 1, 1])
+                + 128 * (tile_r.index.reshape([tile_r, 1]) % 7)
+                + 896 * tile_z.index.reshape([tile_z, 1, 1, 1])
+            )
+            tmp1 = in1[row + tile_x.index].to(torch.float32)
+            tmp2 = tmp0 + tmp1
+            out0[tile_z, tile_y, tile_r, tile_x] = tmp2.to(torch.bfloat16)
+            acc = acc + torch.sum(tmp2, -2)
+        out1[tile_z, tile_y, tile_x] = acc
+
+
+SWAPPED_PAIR_CONFIG = {
+    "block_sizes": [1, 2, 32, 16],
+    "num_threads": [1, 1, 4, 8],
+    "loop_orders": [[1, 0, 2]],
+    "cute_vector_widths": [1, 1, 8, 1],
+    "cute_lane_layouts": ["blocked", "blocked", "blocked", "strided"],
+    "cute_vloop_sink": True,
+    "cute_lane_unroll": 8,
+}
+
+
+def _swapped_pair_args(in1_numel: int = 3584) -> tuple[torch.Tensor, ...]:
+    return (
+        torch.empty(4, 2, 14, 32, dtype=torch.bfloat16),
+        torch.empty(in1_numel, dtype=torch.bfloat16),
+        torch.empty(4, 2, 14, 32, dtype=torch.bfloat16),
+        torch.empty(4, 2, 32),
+    )
+
+
+def test_a_gather_whose_row_divides_a_tile_index_loads_packets(
+    cpu_only: None,
+) -> None:
+    # The row's // 7 and % 7 of tile_r keep it in [0, 3552] on every lane,
+    # so the gather's index < 3584 term repeats the tile masks
+    # (gathered_bounds.proven_gather_positions) and goes, and the sink
+    # loads 8 lanes of in1 at once beside in0's packets.
+    code = _code(swapped_pair_sum, _swapped_pair_args(), SWAPPED_PAIR_CONFIG)
+    assert "_cute_load_v16b_if(in1.iterator" in code
+    assert "< 3584" not in code
+
+
+@helion.kernel(backend="cute", static_shapes=True)
+def swapped_pair_sum_unsqueezed(
+    in0: torch.Tensor, in1: torch.Tensor, out0: torch.Tensor, out1: torch.Tensor
+) -> None:
+    """swapped_pair_sum with the unit dims of its indices added by
+    ``unsqueeze`` rather than ``reshape``."""
+    for tile_z, tile_y, tile_x in hl.tile([4, 2, 32]):
+        acc = hl.zeros([tile_z, tile_y, tile_x], dtype=torch.float32)
+        for tile_r in hl.tile(14):
+            tmp0 = in0[tile_z, tile_y, tile_r, tile_x].to(torch.float32)
+            r = tile_r.index.unsqueeze(1)
+            row = (
+                32 * (r // 7)
+                + 64 * tile_y.index.unsqueeze(1).unsqueeze(2)
+                + 128 * (r % 7)
+                + 896 * tile_z.index.unsqueeze(1).unsqueeze(2).unsqueeze(3)
+            )
+            tmp1 = in1[row + tile_x.index].to(torch.float32)
+            tmp2 = tmp0 + tmp1
+            out0[tile_z, tile_y, tile_r, tile_x] = tmp2.to(torch.bfloat16)
+            acc = acc + torch.sum(tmp2, -2)
+        out1[tile_z, tile_y, tile_x] = acc
+
+
+def test_indices_unsqueezed_load_packets_too(cpu_only: None) -> None:
+    # unsqueeze adds unit dims as reshape does: the same bound is proven.
+    code = _code(swapped_pair_sum_unsqueezed, _swapped_pair_args(), SWAPPED_PAIR_CONFIG)
+    assert "_cute_load_v16b_if(in1.iterator" in code
+    assert "< 3584" not in code
+
+
+def test_a_gather_that_may_leave_its_tensor_keeps_its_bound(cpu_only: None) -> None:
+    # One element less: the last lane's index, 3583, is past the tensor, so
+    # the bound stays and the gather keeps its scalar loads.
+    code = _code(swapped_pair_sum, _swapped_pair_args(3583), SWAPPED_PAIR_CONFIG)
+    assert "_cute_load_v16b_if(in1.iterator" not in code
+    assert "< 3583" in code
+
+
+@pytest.mark.cuda
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="runs the kernel")
+def test_a_gather_whose_row_divides_a_tile_index_matches_the_reference() -> None:
+    # The packets of in1 hold the elements the scalar gather reads: the sums
+    # and the stored add match torch on the swapped pair.
+    in0 = torch.randn(4, 2, 14, 32, device=DEVICE, dtype=torch.bfloat16)
+    in1 = torch.randn(3584, device=DEVICE, dtype=torch.bfloat16)
+    out0 = torch.empty_like(in0)
+    out1 = torch.empty(4, 2, 32, device=DEVICE)
+    args = (in0, in1, out0, out1)
+    bound = swapped_pair_sum.bind(args)
+    config = bound.config_spec.normalized_config(
+        helion.Config.from_dict(SWAPPED_PAIR_CONFIG)
+    )
+    assert "_cute_load_v16b_if(in1.iterator" in bound.to_code(config)
+    bound.compile_config(config)(*args)
+    r = torch.arange(14, device=DEVICE)
+    y = torch.arange(2, device=DEVICE)
+    z = torch.arange(4, device=DEVICE)
+    row = (
+        32 * (r[None, None, :] // 7)
+        + 64 * y[None, :, None]
+        + 128 * (r[None, None, :] % 7)
+        + 896 * z[:, None, None]
+    )
+    index = row[..., None] + torch.arange(32, device=DEVICE)
+    expected = in0.float() + in1[index].float()
+    torch.testing.assert_close(out0, expected.to(torch.bfloat16))
+    torch.testing.assert_close(out1, expected.sum(2), rtol=1e-4, atol=1e-4)
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def wide_divisor_pair_sum(
+    in0: torch.Tensor, in1: torch.Tensor, out0: torch.Tensor, out1: torch.Tensor
+) -> None:
+    """``swapped_pair_sum`` whose row divides tile_r by 2**32 + 1, a divisor
+    the int32 index arithmetic wraps to 1: the analysis models no such
+    division, so the gather keeps its bound."""
+    for tile_z, tile_y, tile_x in hl.tile([4, 2, 32]):
+        acc = hl.zeros([tile_z, tile_y, tile_x], dtype=torch.float32)
+        for tile_r in hl.tile(14):
+            tmp0 = in0[tile_z, tile_y, tile_r, tile_x].to(torch.float32)
+            row = (
+                32 * (tile_r.index.reshape([tile_r, 1]) // 4294967297)
+                + 64 * tile_y.index.reshape([tile_y, 1, 1])
+                + 128 * (tile_r.index.reshape([tile_r, 1]) % 7)
+                + 896 * tile_z.index.reshape([tile_z, 1, 1, 1])
+            )
+            tmp1 = in1[row + tile_x.index].to(torch.float32)
+            tmp2 = tmp0 + tmp1
+            out0[tile_z, tile_y, tile_r, tile_x] = tmp2.to(torch.bfloat16)
+            acc = acc + torch.sum(tmp2, -2)
+        out1[tile_z, tile_y, tile_x] = acc
+
+
+def test_a_divisor_past_int32_keeps_the_bound(cpu_only: None) -> None:
+    code = _code(wide_divisor_pair_sum, _swapped_pair_args(3583), SWAPPED_PAIR_CONFIG)
+    assert "< 3583" in code
+    assert "_cute_load_v16b_if(in1.iterator" not in code
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def strided_copy(x: torch.Tensor, out: torch.Tensor) -> None:
+    """A gather at twice the tile's index, which no vector loop sinks."""
+    for tile in hl.tile(out.size(0)):
+        out[tile] = x[tile.index * 2]
+
+
+def test_the_sink_knob_alone_leaves_a_kernel_where_nothing_sinks(
+    cpu_only: None,
+) -> None:
+    # The gather's bound is provable, but nothing sinks: the kernel is
+    # generated again with the knob off, its bound kept.
+    args = (torch.empty(64), torch.empty(32))
+    off = _code(strided_copy, args, {"block_sizes": [32]})
+    on = _code(strided_copy, args, {"block_sizes": [32], "cute_vloop_sink": True})
+    assert "< 64" in off
+    assert on == off
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def gathered_rhs_mm(mask: torch.Tensor, v: torch.Tensor, out: torch.Tensor) -> None:
+    """A matmul whose right operand is gathered through its contraction
+    tile's index."""
+    for tile_k, tile_h in hl.tile([mask.size(1), v.size(1)]):
+        acc = hl.zeros([tile_k, tile_h], dtype=torch.float32)
+        for tile_q in hl.tile(mask.size(0)):
+            acc = acc + mask[tile_q, tile_k].T @ v[tile_q.index * 1, tile_h]
+        out[tile_k, tile_h] = acc.to(out.dtype)
+
+
+def test_the_sink_knob_alone_leaves_a_matmul_where_nothing_sinks(
+    cpu_only: None,
+) -> None:
+    # The gathered operand's bound is provable, but no vector loop sinks in
+    # a matmul: the knob leaves the code as it is.
+    args = tuple(torch.empty(32, 32, dtype=torch.bfloat16) for _ in range(3))
+    off = _code(gathered_rhs_mm, args, {"block_sizes": [16, 16, 16]})
+    on = _code(
+        gathered_rhs_mm, args, {"block_sizes": [16, 16, 16], "cute_vloop_sink": True}
+    )
+    assert on == off

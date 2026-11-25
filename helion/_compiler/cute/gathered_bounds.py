@@ -2,14 +2,14 @@
 load's own ``extra_mask`` states.
 
 Role: general-purpose analysis of the memory lowering
-(``cute_guarded_lanes``, ``cute_predicated_element_loads``).
+(``cute_guarded_lanes``, ``cute_vloop_sink``, ``cute_predicated_element_loads``).
 
 A load through a computed coordinate, ``x[tile_n, tile_h.index * 2 + 1,
 tile_c]``, is masked by the masks of the tiles its coordinates read and by an
 ``index < size`` term of each coordinate (a signed int32 compare; nothing
-checks ``index >= 0``).  Where the coordinate is an affine function of tile
-indices over static extents, its range on the lanes those masks admit is
-known: a tile's index lies in ``[begin, begin + numel)`` wherever the tile's
+checks ``index >= 0``).  Where the coordinate is a function of tile indices
+over static extents that the analysis models (below), its range on the
+lanes those masks admit is known: a tile's index lies in ``[begin, begin + numel)`` wherever the tile's
 mask holds, and on every lane of a tile whose mask the strategy elided.
 When the top of that range is below ``size`` the term repeats the tile masks,
 so the mask of the load goes without it: the packet guard then holds nothing
@@ -22,9 +22,10 @@ term that is true on every lane the other terms admit is left out.
 interval arithmetic, so a coordinate that can pass the dim (``index + 1``
 over the tile's own extent) keeps its term, and so does anything it does not
 model: a symbolic extent, a tile that does not begin at a static position, an
-intermediate that could leave the int32 range, and every operation other than
-``+``, ``-`` and ``*`` of tile indices and integers under ``None`` / ``:``
-views.
+intermediate that could leave the int32 range, a tile index a matmul operand
+re-materializes, and every operation other than ``+``, ``-`` and ``*`` of tile
+indices and integers, floor division and remainder of a nonnegative value by
+a positive int32, under ``None`` / ``:`` views and views that add unit dims.
 
 ``mask_bounded_gather_positions`` finds the term in the program's own mask
 instead (``cute_predicated_element_loads``): a padded window masks each tap
@@ -108,12 +109,13 @@ def _tile_index_interval(
     if block_id is None:
         return None
     # An operand index override or a block remap replaces a tile's index
-    # while a matmul operand is re-materialized, and ``cute_guarded_lanes``
-    # is not offered to a kernel with a matmul (``guarded_lanes_offered``).
-    assert (
-        _cute_index_override(state, block_id) is None
-        and _cute_remap_block_id(state, block_id) == block_id
-    )
+    # while a matmul operand is re-materialized (``cute_vloop_sink`` is open
+    # on fragment-MMA kernels): not modeled.
+    if (
+        _cute_index_override(state, block_id) is not None
+        or _cute_remap_block_id(state, block_id) != block_id
+    ):
+        return None
     loops = state.codegen.active_device_loops.get(block_id)
     if not loops:
         return None
@@ -164,6 +166,31 @@ def _interval(state: CodegenState, value: object, blocks: set[int]) -> _Interval
         if not _is_broadcast_view(value):
             return None
         return _interval(state, value.args[0], blocks)
+    if target in _UNIT_DIM_VIEWS and _adds_unit_dims(value):
+        return _interval(state, value.args[0], blocks)
+    if (
+        target in (torch.ops.aten.div.Tensor_mode, torch.ops.aten.remainder.Scalar)
+        and len(value.args) == 2
+        and type(divisor := value.args[1]) is int
+        and 0 < divisor <= _INT32_MAX
+    ):
+        # Of a nonnegative dividend, where floor and truncating division and
+        # Python's and C's remainder agree.
+        if target is torch.ops.aten.div.Tensor_mode and (
+            value.kwargs != {"rounding_mode": "floor"}
+        ):
+            return None
+        if target is torch.ops.aten.remainder.Scalar and value.kwargs:
+            return None
+        dividend = _interval(state, value.args[0], blocks)
+        if dividend is None or dividend[0] < 0:
+            return None
+        low, high = dividend
+        if target is torch.ops.aten.div.Tensor_mode:
+            return _checked(low // divisor, high // divisor)
+        if high - low < divisor and low % divisor <= high % divisor:
+            return _checked(low % divisor, high % divisor)
+        return _checked(0, divisor - 1)
     if value.kwargs or len(value.args) != 2:
         return None
     if target not in (
@@ -182,6 +209,31 @@ def _interval(state: CodegenState, value: object, blocks: set[int]) -> _Interval
         return _checked(left[0] - right[1], left[1] - right[0])
     products = [a * b for a in left for b in right]
     return _checked(min(products), max(products))
+
+
+# The views that can add unit dims to a tensor (``_adds_unit_dims``).
+_UNIT_DIM_VIEWS = (
+    torch.ops.aten.view.default,
+    torch.ops.aten.reshape.default,
+    torch.ops.aten.unsqueeze.default,
+)
+
+
+def _adds_unit_dims(view: torch.fx.Node) -> bool:
+    """A view of a tensor (``_UNIT_DIM_VIEWS``) to its own shape with unit
+    dims added (``tile.index.reshape([tile, 1])``,
+    ``tile.index.unsqueeze(1)``): every element keeps its value and every
+    tile its dim."""
+    source = view.args[0]
+    before = source.meta.get("val") if isinstance(source, torch.fx.Node) else None
+    after = view.meta.get("val")
+    if not (isinstance(before, torch.Tensor) and isinstance(after, torch.Tensor)):
+        return False
+    kept = [size for size in after.shape if not (isinstance(size, int) and size == 1)]
+    old = [size for size in before.shape if not (isinstance(size, int) and size == 1)]
+    return len(kept) == len(old) and all(
+        a is b or a == b for a, b in zip(kept, old, strict=True)
+    )
 
 
 def proven_gather_positions(

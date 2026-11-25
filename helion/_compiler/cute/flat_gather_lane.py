@@ -195,7 +195,11 @@ def _static_int(
 
 
 def match_flat_gather_lane(
-    index: object, env: CompileEnvironment, *, tile_index_loads: bool = True
+    index: object,
+    env: CompileEnvironment,
+    *,
+    tile_index_loads: bool = True,
+    broadcast_terms: bool = True,
 ) -> FlatGatherLaneSplit | None:
     """Match an integer index tensor ``row + tile_index(block)``.
 
@@ -209,7 +213,9 @@ def match_flat_gather_lane(
     None: callers address the lane with the block's own index.  Without
     ``tile_index_loads`` the views of the tile term are view subscripts
     only, not the ``hl.load`` a root grid tile's ``tile.index[:, None]``
-    traces to.
+    traces to.  Without ``broadcast_terms`` both terms must have the
+    index's rank, where the add otherwise broadcasts a term of lower rank
+    from the right.
     """
     if not isinstance(index, Node) or index.op != "call_function":
         return None
@@ -235,19 +241,25 @@ def match_flat_gather_lane(
         if row_value.dtype not in _INTEGER_DTYPES:
             continue
         ndim = index_value.ndim
-        if lane_value.ndim != ndim or row_value.ndim != ndim:
+        if lane_value.ndim > ndim or row_value.ndim > ndim:
             continue
+        if not broadcast_terms and (lane_value.ndim, row_value.ndim) != (ndim, ndim):
+            continue
+        # The add broadcasts its operands from the right: a 1-D tile index
+        # beside a [tile_z, tile_y, tile_r, 1] row varies along the last dim
+        # (helion.inductor's flat subscripts add the innermost tile's index
+        # unreshaped, HelionKernel.flat_subscript()).
+        lane_shape = (1,) * (ndim - lane_value.ndim) + tuple(lane_value.shape)
+        row_shape = (1,) * (ndim - row_value.ndim) + tuple(row_value.shape)
         lane_dims = [
             dim
             for dim in range(ndim)
-            if not (
-                isinstance(lane_value.shape[dim], int) and lane_value.shape[dim] == 1
-            )
+            if not (isinstance(lane_shape[dim], int) and lane_shape[dim] == 1)
         ]
         if len(lane_dims) != 1:
             continue
         (lane_dim,) = lane_dims
-        row_extent = row_value.shape[lane_dim]
+        row_extent = row_shape[lane_dim]
         if not (isinstance(row_extent, int) and row_extent == 1):
             continue
         return FlatGatherLaneSplit(row=row, lane_block_id=block_id, lane_dim=lane_dim)

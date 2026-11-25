@@ -1088,9 +1088,22 @@ def test_knob_is_offered_on_masked_gathers_along_the_last_dim_only() -> None:
             out[tile_n, tile_k] = hl.load(flat, [offset], extra_mask=inside)
         return out
 
+    @helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+    def flat_rows(x: torch.Tensor) -> torch.Tensor:
+        out = torch.empty([4, 32], dtype=x.dtype, device=x.device)
+        for tile_r, tile_c in hl.tile([4, 32]):
+            row = 13 * tile_r.index.reshape([tile_r, 1])
+            inside = (tile_c.index < 13)[None, :]
+            out[tile_r, tile_c] = hl.load(x, [row + tile_c.index], extra_mask=inside)
+        return out
+
     with mock_cuda_unavailable():
         offered = [
             cpu_bind(padded_window_max, _window((5, 12, 20))),
+            # A masked flat gather that adds a 1-D tile index to a row of
+            # higher rank (helion.inductor's flat subscripts), as offered as
+            # before match_flat_gather_lane() broadcast such terms.
+            cpu_bind(flat_rows, (torch.zeros(60, dtype=torch.bfloat16),)),
             cpu_bind(
                 gathered_or_fill,
                 (torch.zeros(6, 37), torch.zeros(21, dtype=torch.int32), 2.5),

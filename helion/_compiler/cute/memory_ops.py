@@ -3321,13 +3321,21 @@ def _load_access_site(
         inactive_singleton_slice_expr="0",
     )
     regions = _cute_access_regions(state, subscript, tensor)
-    # Under ``cute_guarded_lanes`` a gathered coordinate that the masks of
-    # its tiles keep inside its dim carries no bound of its own.
+    # Under ``cute_guarded_lanes`` and ``cute_vloop_sink`` a gathered
+    # coordinate that the masks of its tiles keep inside its dim carries no
+    # bound of its own (the sink can then load the gather in packets).
+    guarded = state.config.config.get("cute_guarded_lanes") is True
+    sink = state.config.config.get("cute_vloop_sink") is True
     proven_index_bounds = (
         proven_gather_positions(state, tensor, subscript)
-        if state.config.config.get("cute_guarded_lanes") is True
+        if guarded or sink
         else frozenset()
     )
+    if proven_index_bounds and sink and not guarded:
+        # The knob shaped this mask: where nothing sinks, the kernel is
+        # generated again with the knob off, bounds and all
+        # (``VloopSinkNotApplied``).
+        state.device_function.cute_state.lanes.vloop_sink_shaped_code = True
     # Under ``cute_predicated_element_loads`` neither does one whose bound
     # the load's own ``extra_mask`` states.
     if state.config.config.get("cute_predicated_element_loads") is True:

@@ -302,8 +302,11 @@ class Config(Mapping[str, object]):
             cute_vloop_sink: Sink a grid constexpr vector loop into the serial
                 reduction nest it wraps (column sums): one vector load per row,
                 per-lane register accumulators, one grouped cross-thread combine
-                per row tile. Disabled by default. Kernels where nothing can be
-                sunk generate exactly the knob-off code.
+                per row tile. A gathered coordinate that the masks of its tiles
+                keep inside its dim carries no bound of its own, so the sink can
+                load the gather in packets; every lane reads the same element as
+                before. Disabled by default. Kernels where nothing can be sunk
+                generate exactly the knob-off code.
             cute_grid_lane_jam: Interleave the lanes of a grid lane loop into
                 the device loops it wraps: the lanes' copies of each
                 statement run side by side, their loads of consecutive

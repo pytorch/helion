@@ -1048,7 +1048,7 @@ def _gathered_rows(
             + d[(h * 1)[:, None] - (w * 1)[None, :] + 3, tile_c]
             + e[((h + 2147483647) - 2147483647)[:, None], tile_c]
             + f[(h * -1 + 8)[:, None], tile_c]
-            + g[(h % 5)[:, None], tile_c]
+            + g[((h - 4) % 5)[:, None], tile_c]
         )
     return out
 
@@ -1099,7 +1099,9 @@ def test_coordinate_bound_follows_the_range_of_the_coordinate() -> None:
     #     range, where the generated arithmetic wraps;
     #   -h + 8 in [0, 8] against 13 rows: implied (a negative factor swaps
     #     the ends of the range);
-    #   h % 5 against 50 rows: not an operation the analysis models.
+    #   (h - 4) % 5 against 50 rows: a remainder of a dividend that can be
+    #     negative, which the analysis does not model (of a nonnegative one,
+    #     h % 5 is in [0, 4]).
     args = (rows(18), rows(17), rows(10), rows(11), rows(12), rows(13), rows(50))
     config = {"block_sizes": [4, 4, 16], "num_threads": [4, 4, 16]}
     before = _code(_gathered_rows, args, guarded=False, **config)
@@ -1118,6 +1120,37 @@ def test_coordinate_bound_counts_from_the_start_of_the_tile() -> None:
     assert _coordinate_bounds(before) == ["9", "12"]
     after = _code(_rows_of_a_later_tile, args, guarded=True, **config)
     assert _coordinate_bounds(after) == ["9"]
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _divided_rows(a: torch.Tensor, b: torch.Tensor, c: torch.Tensor) -> torch.Tensor:
+    # Rows of three sources (each with its own number of rows, which names
+    # its bound in the code) gathered over a tile of 9 rows through a
+    # remainder and floor divisions.
+    out = torch.empty([9, a.size(1)], dtype=a.dtype, device=a.device)
+    for tile_h, tile_c in hl.tile([9, a.size(1)]):
+        h = tile_h.index
+        out[tile_h, tile_c] = (
+            a[(h + 3) % 16, tile_c]
+            + b[(h - 4) // 2 + 2, tile_c]
+            + c[(h + 4) // 2, tile_c]
+        )
+    return out
+
+
+def test_coordinate_bound_follows_floor_division_and_remainder() -> None:
+    """Of the rows 0..8 of the tile:
+    (h + 3) % 16 of a dividend in [3, 11], which wraps no multiple of 16, is
+      in [3, 11] (not the whole [0, 15]) against 12 rows: implied;
+    (h - 4) // 2 + 2 against 5 rows: a floor division of a dividend that can
+      be negative, which the analysis does not model, keeps its bound;
+    (h + 4) // 2 in [2, 6] against 7 rows: implied."""
+    args = (torch.zeros([12, 16]), torch.zeros([5, 16]), torch.zeros([7, 16]))
+    config = {"block_sizes": [4, 16], "num_threads": [4, 16]}
+    before = _code(_divided_rows, args, guarded=False, **config)
+    assert _coordinate_bounds(before) == ["5", "7", "12"]
+    after = _code(_divided_rows, args, guarded=True, **config)
+    assert _coordinate_bounds(after) == ["5"]
 
 
 def test_coordinate_bound_is_kept_against_a_symbolic_size() -> None:

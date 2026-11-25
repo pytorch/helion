@@ -72,11 +72,11 @@ A hinted one whose fill stays zero is left as it is: ``hint_element_loads``
 makes it the same predicated load with that policy
 (``_cute_element_policy_load_if``) with or without this knob.  The two
 configs are one source only where the knob drops no bound from that load's
-mask either: where the ``extra_mask`` states the gather's bound and
-``cute_guarded_lanes`` has not left the ``index < size`` term out already
-(``gathered_bounds.proven_gather_positions``), the lowering leaves it out
-under the knob (``gathered_bounds.mask_bounded_gather_positions``), so the
-knob's source is a second one and a search times both.
+mask either: where the ``extra_mask`` states the gather's bound and neither
+``cute_guarded_lanes`` nor ``cute_vloop_sink`` has left the ``index < size``
+term out already (``gathered_bounds.proven_gather_positions``), the lowering
+leaves it out under the knob (``gathered_bounds.mask_bounded_gather_positions``),
+so the knob's source is a second one and a search times both.
 """
 
 from __future__ import annotations
@@ -129,10 +129,15 @@ def has_masked_gather_sites(env: CompileEnvironment, device_ir: DeviceIR) -> boo
     such a load takes no packets, so its lanes are single elements under
     that mask, the loads ``predicate_element_loads`` rewrites.  Structure
     only, so ``cute_predicated_element_loads`` is offered at every shape of
-    such a kernel.  A masked load along a tile or a shifted tile
-    (``tile.index - 24``: a padded packet) is left to
-    ``cute_guarded_lanes``, and one that is contiguous along a tile of a
-    flattened gather (an unfold, ``x_flat[tile_n.index[:, None] + C *
+    such a kernel.  Only a row offset and a tile index of the subscript's
+    rank take the offer away (``broadcast_terms=False``): a 1-D tile index
+    added to a row of higher rank (helion.inductor's flat subscripts) keeps
+    it, and with it the search space such kernels had, although
+    ``cute_vloop_sink`` loads that gather in packets as well; the offer
+    costs the search configs to time there, never a value.  A masked load
+    along a tile or a shifted tile (``tile.index - 24``: a padded packet) is
+    left to ``cute_guarded_lanes``, and one that is contiguous along a tile
+    of a flattened gather (an unfold, ``x_flat[tile_n.index[:, None] + C *
     tile_k.index[None, :]]``) to the vector loop that loads it in predicated
     packets (``cute_vloop_sink``): the single-element form only reaches the
     configs of such a kernel that take no packets, which lose to the ones
@@ -159,7 +164,7 @@ def has_masked_gather_sites(env: CompileEnvironment, device_ir: DeviceIR) -> boo
             if (
                 tensor is not None
                 and tensor.dtype in _CUTE_VECTOR_UNROLL_DTYPES
-                and match_flat_gather_lane(last, env) is not None
+                and match_flat_gather_lane(last, env, broadcast_terms=False) is not None
             ):
                 continue
             return True
