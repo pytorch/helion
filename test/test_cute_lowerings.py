@@ -5201,9 +5201,16 @@ class TestCuteLowerings(unittest.TestCase):
             "tcgen05_sched_pipeline_producer_state.index].iterator",
             code,
         )
+        # Each consumer loads its stage of the mailbox whole before testing
+        # it (the release to the leader CTA does not wait for a lane's load).
         self.assertIn(
-            "tcgen05_work_tile_smem[cutlass.Int32(3), "
-            "tcgen05_sched_pipeline_consumer_state.index] != cutlass.Int32(0)",
+            "tcgen05_role_local_0_mailbox = tcgen05_work_tile_smem[None, "
+            "tcgen05_sched_pipeline_consumer_state.index].load()",
+            code,
+        )
+        self.assertIn(
+            "tcgen05_role_local_0_valid = tcgen05_role_local_0_mailbox[3] "
+            "!= cutlass.Int32(0)",
             code,
         )
 
@@ -10317,10 +10324,12 @@ class TestCuteLowerings(unittest.TestCase):
 
         torch.manual_seed(0)
         # Use a problem big enough that both M and N divide by
-        # cluster_m * bm = 512 and cluster_n * bn = 512 respectively.
+        # cluster_m * bm = 512 and cluster_n * bn = 512 respectively, with
+        # more CTAs than SMs (8 x 16 pair tiles, 256 CTAs): a grid of one tile
+        # per CTA runs no scheduler loop and launches every cluster instead.
         args = (
-            torch.randn(1024, 128, device=DEVICE, dtype=torch.bfloat16),
-            torch.randn(128, 1024, device=DEVICE, dtype=torch.bfloat16),
+            torch.randn(2048, 128, device=DEVICE, dtype=torch.bfloat16),
+            torch.randn(128, 4096, device=DEVICE, dtype=torch.bfloat16),
         )
         with patch_cute_mma_support():
             bound = cute_matmul_cluster_n2.bind(args)
@@ -10389,8 +10398,8 @@ class TestCuteLowerings(unittest.TestCase):
             code,
         )
         self.assertIn(
-            "(2, 2, min(((1024 + _BLOCK_SIZE_0 - 1) // _BLOCK_SIZE_0 * 2 + 2 - 1)"
-            " // 2 * (((1024 + _BLOCK_SIZE_1 - 1) // _BLOCK_SIZE_1 + 2 - 1) // 2)"
+            "(2, 2, min(((2048 + _BLOCK_SIZE_0 - 1) // _BLOCK_SIZE_0 * 2 + 2 - 1)"
+            " // 2 * (((4096 + _BLOCK_SIZE_1 - 1) // _BLOCK_SIZE_1 + 2 - 1) // 2)"
             " * 1, _MAX_ACTIVE_CLUSTERS))",
             code,
         )
@@ -20727,6 +20736,7 @@ mailbox[cutlass.Int32(3), producer_state.index] = first
             accumulator_view="nm",
             output_offsets=("tile_offset_0", "tile_offset_1"),
             tma_store_full_tiles_only=True,
+            is_clc_persistent=False,
         )
         splitter._tcgen05_plan = lambda: plan
         splitter._tcgen05_sched_pipeline_plan = lambda: SimpleNamespace(

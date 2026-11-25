@@ -717,9 +717,10 @@ def c_stages_fits(
     # bytes use the ``Tcgen05LayoutStrategy.DEFAULT`` epilogue subtile the
     # role-local codegen allocates, not the (128, 32) EXPLICIT_EPI_TILE
     # direct-entry tile: a 256x256 16-bit tile is ``(128, 64)`` with a
-    # source-C (residual family) but ``(128, 32)`` without one (plain
-    # matmul), since ``compute_epilogue_tile_size`` shrinks N when no C tile
-    # competes for SMEM; ``has_source_c`` carries that distinction.
+    # source-C (residual family) or a column-major output, and ``(128, 32)``
+    # for a plain row-major one, which takes the narrow subtile (``cute_mma``'s
+    # ``tcgen05_plain_narrow_subtile``); ``has_source_c`` and the store
+    # facts' ``output_column_major`` carry that distinction.
     constraints = state.ab_stages_three_search_constraints
     if constraints is None:
         return False
@@ -748,11 +749,30 @@ def c_stages_fits(
     # epilogues), so the ring bytes are charged per store.
     output_bytes = constraints.output_dtype_bytes or constraints.dtype_bytes
     elem_width = output_bytes * 8
+    # A column-major output keeps CuTe's with-source subtile: the plain
+    # narrow rule that stores a row-major 256-wide pair through (128, 32)
+    # subtiles skips it (``cute_mma``'s ``tcgen05_plain_narrow_subtile``), so
+    # out.T = b.T @ a.T on the 256x256 pair renders
+    #
+    #     tcgen05_store_epi_tile = compute_epilogue_tile_shape((256, 256), False,
+    #         LayoutEnum.COL_MAJOR, cutlass.BFloat16, layout_c=LayoutEnum.COL_MAJOR,
+    #         elem_ty_c=cutlass.BFloat16)  # (128, 64): 16 KiB per C stage
+    #
+    # Priced at (128, 32), its four-deep ring is charged 32 KiB of the
+    # 64 KiB it allocates: fp16 4096x2048x4096 as its transpose (out.T
+    # column-major) seeded the M-paired 512x256x64 tile at three 48 KiB AB
+    # stages and four C stages, 208 KiB against the 199 KiB budget; priced
+    # at (128, 64) the seed keeps two C stages (176 KiB). The M-paired
+    # samples' C rings are judged by ``_fix_m_pair_column_major_c_stages_search_config``.
+    pipeline_facts = state.pipeline_smem_facts
+    with_source_tile = has_source_c or (
+        pipeline_facts is not None and pipeline_facts.output_column_major
+    )
     epi_tile_m, epi_tile_n = tcgen05_default_epilogue_tile_size(
         bm,
         bn,
         elem_width_d=elem_width,
-        elem_width_c=elem_width if has_source_c else None,
+        elem_width_c=elem_width if with_source_tile else None,
     )
     c_bytes = tcgen05_c_smem_bytes_per_cta(
         epi_tile_m=epi_tile_m,

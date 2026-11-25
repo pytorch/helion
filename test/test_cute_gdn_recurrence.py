@@ -60,6 +60,7 @@ from helion._testing import code_and_output
 from helion._testing import import_path
 from helion._testing.cute_recurrence_host import gdn_test_wrapper as _gdn_test_wrapper
 from helion._testing.cute_recurrence_host import gdn_wrapper_plan as _wrapper_plan
+from helion._testing.cute_sass import skip_unless_nvdisasm_runs
 from helion._testing.tunable_fragments import load_host_function
 import helion.language as hl
 
@@ -2230,6 +2231,7 @@ def test_gdn_recurrence_wide_token_slices_do_not_spill_cuda(
     spills (``LDL``/``STL``) in the SASS."""
 
     _require_sm100_runtime()
+    skip_unless_nvdisasm_runs()
     result = subprocess.run(
         [
             sys.executable,

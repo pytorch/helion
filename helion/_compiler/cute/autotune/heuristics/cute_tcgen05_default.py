@@ -597,7 +597,8 @@ class CuteTcgen05DefaultTileHeuristic(AutotunerHeuristic):
         least two), splitting K (``tcgen05_split_k``) over a K loop of at
         least ``_SPLIT_K_MIN_K_TILES`` k-blocks into the most slices of at
         least four k-blocks whose CTAs three per SM hold; unsplit over a
-        shorter loop, where no split qualifies, or where the tiles cannot
+        shorter loop, where no split qualifies, on a tile narrower than the
+        tcgen05 MMA's N (``_tcgen05_min_block_n``), or where the tiles cannot
         split (``split_k_tiles_supported``: whole tiles only without the
         flat-edge TMA path). A kernel off the split-K search surface
         (``split_k_search_choices``) keeps the base default. Each axis takes
@@ -644,11 +645,14 @@ class CuteTcgen05DefaultTileHeuristic(AutotunerHeuristic):
             < ab_stages
         ):
             return None
-        # A short K loop, or ragged tiles off the flat-edge TMA path
-        # (``split_k_tiles_supported``), runs the tile unsplit.
+        # A short K loop, a tile narrower than the tcgen05 MMA's N (a
+        # small-N GEMM's scalar fallback, which codegen does not split), or
+        # ragged tiles off the flat-edge TMA path (``split_k_tiles_supported``)
+        # runs the tile unsplit.
         tiles = cdiv(m, bm) * cdiv(n, bn)
         splittable = (
             k_tiles >= _SPLIT_K_MIN_K_TILES
+            and bn >= facts._tcgen05_min_block_n(state)
             and surface.split_k_tiles_supported(state, bm=bm, bn=bn, bk=bk)
         )
         split = max(

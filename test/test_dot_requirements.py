@@ -699,13 +699,17 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
                     [TCGEN05_ONE_CTA_MAX_BLOCK_M, 32, 16],
                 )
 
+        # A flat one-CTA sample above 128 rows rendered the SIMT fallback (no
+        # MMA), so the search projects it to the one-CTA tile height too.
         flat_config = {
             "block_sizes": [256, 32, 16],
             "pid_type": "flat",
             "tcgen05_cluster_m": 1,
         }
         spec.normalize(flat_config, _fix_invalid=True)
-        self.assertEqual(flat_config["block_sizes"][:3], [256, 32, 16])
+        self.assertEqual(
+            flat_config["block_sizes"][:3], [TCGEN05_ONE_CTA_MAX_BLOCK_M, 32, 16]
+        )
 
         two_cta_config = {
             "block_sizes": [256, 32, 16],

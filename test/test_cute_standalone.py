@@ -21,6 +21,7 @@ from helion._testing import import_example
 from helion._testing.cuda_context import clear_current_context
 from helion._testing.cuda_context import current_context
 from helion._testing.cuda_context import on_new_thread
+from helion._testing.cute_sass import hinted_packets_render  # noqa: F401
 import helion.language as hl
 
 attention = import_example("attention")
@@ -222,11 +223,15 @@ def test_constant_guard(tmp_path: Path, scale: float) -> None:
         exported._constant(x, 3.0)
 
 
+@pytest.mark.usefixtures("hinted_packets_render")
 def test_sass_checked_kernels_are_not_exported() -> None:
     # The exported launcher has no SASS verification step
     # (``helion.runtime.cute.sass_check``), so a config whose render needs
     # one -- hinted mma_dag packets, ``_helion_cute_sass_checks`` -- is
     # refused at export; the plain config of the same kernel exports.
+    # ``hinted_packets_render``: a host whose nvdisasm cannot run (GB300)
+    # normalizes the hinted slots to plain packets, so the hinted config
+    # would render without the check and export.
     probes = importlib.import_module("test.test_cute_mma_dag")
     kernel = helion.kernel(
         probes._head_sum_logits_batched,

@@ -67,6 +67,16 @@ def gemm(x: Tensor, w: Tensor) -> Tensor:
     return out
 
 
+def gemm_into(x: Tensor, w: Tensor, out: Tensor) -> None:
+    m, k = x.size()
+    n = w.size(1)
+    for tile_m, tile_n in hl.tile([m, n]):
+        acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+        for tile_k in hl.tile(k):
+            acc = torch.addmm(acc, x[tile_m, tile_k], w[tile_k, tile_n])
+        out[tile_m, tile_n] = acc.to(x.dtype)
+
+
 def two_outputs(x: Tensor, w: Tensor) -> tuple[Tensor, Tensor]:
     m, k = x.size()
     n = w.size(1)
@@ -486,6 +496,40 @@ def test_gpu_pair_fanout_2x2_matches_the_2x1_fanout_bitwise(
         torch.testing.assert_close(out, out_ref, rtol=1e-2, atol=5e-2)
     assert torch.equal(outputs[2][0], outputs[1][0])
     assert torch.equal(outputs[2][1], outputs[1][1])
+
+
+@skipIfNotCUDA()
+@skipIfCudaCapabilityLessThan((10, 0), reason="requires the SM100 family")
+def test_gpu_one_tile_per_cta_2x2_grid_writes_past_the_co_resident_clusters() -> None:
+    """One more 2x2 cluster than the device co-schedules, one tile per CTA (the
+    roles run no scheduler loop) under ``tcgen05_persistent_grid_cap=
+    resident_clusters``: every tile of the NaN-filled output is written (GB300:
+    37 clusters of 256x128 pair tiles over 256x9472, 148 CTAs)."""
+    num_sm = torch.cuda.get_device_properties(DEVICE).multi_processor_count
+    clusters = helion.runtime.get_max_active_clusters(torch.device(DEVICE), 4) + 1
+    if 4 * clusters > num_sm:
+        pytest.skip("every 4-CTA cluster of a one-wave grid is co-resident here")
+    m, n, k = 256, 256 * clusters, 128
+    x, w = _gpu_inputs(m, n, k)
+    out = torch.full((m, n), float("nan"), dtype=torch.float16, device=DEVICE)
+    bound = _kernel(gemm_into)._bind_isolated((x, w, out))
+    config, fn = _compile(
+        bound,
+        block_sizes=[256, 128, 64],
+        tcgen05_cluster_n=2,
+        tcgen05_ab_stages=2,
+        tcgen05_persistent_grid_cap="resident_clusters",
+        **PAIR,
+    )
+    assert config.config["tcgen05_persistent_grid_cap"] == "resident_clusters"
+    # The one-shot roles (no scheduler loop) launch every cluster: a
+    # persistent loop would cover every tile under the cap without the fix.
+    assert "_MAX_ACTIVE_CLUSTERS" not in bound.to_code(config)
+    fn(x, w, out)
+    torch.cuda.synchronize()
+    torch.testing.assert_close(
+        out, (x.float() @ w.float()).to(torch.float16), rtol=1e-2, atol=5e-2
+    )
 
 
 @skipIfNotCUDA()

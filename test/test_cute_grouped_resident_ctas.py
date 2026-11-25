@@ -203,6 +203,8 @@ def _grid_strategy_stub(
         _tcgen05_cluster_m=lambda: cluster_m,
         _tcgen05_cluster_n=lambda: cluster_n,
         _tcgen05_plan=lambda: plan,
+        # (the default cap: ``tcgen05_persistent_grid_cap``)
+        _tcgen05_persistent_grid_cap=lambda: "sm_pairs",
         _tcgen05_max_active_clusters_var=lambda: "_MAX_ACTIVE_CLUSTERS",
         pid_info=(None,) * pid_axes,
         grid_size_expr="_NUM_SM",

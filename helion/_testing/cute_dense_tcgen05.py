@@ -408,6 +408,25 @@ def bf16_mm_args(
     return a, b, torch.empty((m, n), dtype=torch.bfloat16, device=device)
 
 
+def clc_fringe_config(**changes: object) -> helion.Config:
+    """The CLC 256x256 CTA pair (a scheduler warp publishing each work tile to
+    both CTAs' mailboxes)."""
+    return helion.Config.from_dict(
+        {
+            "block_sizes": [256, 256, 64],
+            "pid_type": "persistent_interleaved",
+            "l2_groupings": [4],
+            "cute_pdl": True,
+            "tcgen05_ab_stages": 5,
+            "tcgen05_cluster_m": 2,
+            "tcgen05_persistence_model": "clc_persistent",
+            "tcgen05_strategy": "role_local_with_scheduler",
+            "tcgen05_warp_spec_scheduler_warps": 1,
+        }
+        | changes
+    )
+
+
 def aligned_n_bf16_config(**changes: object) -> helion.Config:
     """The 16-bit aligned-N pair: a 192-wide physical N behind the 256 carrier."""
     return helion.Config.from_dict(

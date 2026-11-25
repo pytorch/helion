@@ -84,6 +84,22 @@ def _make_batched_gemm() -> helion.Kernel:
     return _batched_gemm
 
 
+def _make_gemm_into() -> helion.Kernel:
+    """The product stored into a given output, row- or column-major."""
+
+    @helion.kernel(backend="cute", static_shapes=True)
+    def _gemm_into(x: torch.Tensor, y: torch.Tensor, out: torch.Tensor) -> None:
+        m, k = x.size()
+        _, n = y.size()
+        for tile_m, tile_n in hl.tile([m, n]):
+            acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+            for tile_k in hl.tile(k):
+                acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+            out[tile_m, tile_n] = acc.to(x.dtype)
+
+    return _gemm_into
+
+
 def _bind(kernel: helion.Kernel, args: tuple[torch.Tensor, ...]) -> object:
     """Bind on a 148-SM B200 with its 227 KiB opt-in SMEM, on any host."""
     with (
@@ -189,6 +205,56 @@ class TestCuteTcgen05MPairSeeds(TestCase):
                 has_source_c=False,
             )
         )
+
+    def test_a_column_major_output_prices_the_with_source_c_ring(self) -> None:
+        """fp16 4096x2048x4096, stored row-major and as its transpose.
+
+        A column-major output keeps CuTe's (128, 64) C subtile (the plain
+        narrow rule retiles row-major stores only), 16 KiB per stage where
+        a row-major plain store takes (128, 32): ``c_stages_fits`` charges
+        it so, the deep M-pair seeds keep two C stages beside three 48 KiB
+        AB stages, and a sampled M-paired tile at four AB stages drops its
+        four-deep C ring (a 192 KiB AB ring beside a 64 KiB C ring fails in
+        libNVVM). The row-major product keeps the four-deep rings.
+        """
+        m, n, k = 4096, 2048, 4096
+        x = torch.empty([m, k], dtype=torch.float16)
+        y = torch.empty([n, k], dtype=torch.float16).T
+        out = torch.empty([m, n], dtype=torch.float16)
+        results = {}
+        for label, args in (("row", (x, y, out)), ("col", (y.T, x.T, out.T))):
+            spec = _bind(_make_gemm_into(), args).config_spec
+            tcgen05 = spec._cute_tcgen05_config
+            self.assertEqual(
+                tcgen05.pipeline_smem_facts.output_column_major, label == "col"
+            )
+            deep = [
+                seed for seed in _m_pair_seeds(spec) if seed["block_sizes"][2] == 64
+            ]
+            sample = dict(deep[0])
+            sample["tcgen05_ab_stages"] = 4
+            sample["tcgen05_c_stages"] = 4
+            spec.normalize(sample, _fix_invalid=True)
+            results[label] = (
+                # the 256x256 pair at five 32 KiB AB stages, four C stages
+                smem.c_stages_fits(
+                    tcgen05,
+                    bm=TCGEN05_TWO_CTA_BLOCK_M,
+                    bn=TCGEN05_TWO_CTA_BLOCK_N,
+                    bk=64,
+                    cluster_m=2,
+                    ab_stages=5,
+                    c_stages=4,
+                    has_source_c=False,
+                ),
+                [
+                    (seed["tcgen05_ab_stages"], seed["tcgen05_c_stages"])
+                    for seed in deep
+                ],
+                (sample["tcgen05_ab_stages"], sample["tcgen05_c_stages"]),
+            )
+        self.assertEqual(results["row"], (True, [(3, 4), (3, 4)], (4, 4)))
+        self.assertEqual(results["col"], (False, [(3, 2), (3, 2)], (4, 2)))
 
     def test_gradient_gemms_seed_the_deep_pair_ring(self) -> None:
         """Both 2048x4096x2048 gradient GEMMs (K-major B, M-major A).
