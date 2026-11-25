@@ -37,6 +37,7 @@ from typing import TYPE_CHECKING
 import torch
 
 from ... import exc
+from ._constants import DTYPE_TO_METAL
 from ._constants import MAX_THREADGROUP_MEMORY_BYTES
 from .c10_helpers import c10_source
 from .fma_fusion import fuse_multiply_adds
@@ -226,8 +227,6 @@ def _generate_msl(
     the args, apart from the ``by_value`` parameters: runtime scalars, each
     mapped to the MSL type it binds as.  Reads block sizes from fn_globals.
     """
-    from torch._inductor.codegen.mps import DTYPE_TO_METAL
-
     from .lane_fold import BF16_CAST
     from .mpp_matmul import BF16_CAST_PREAMBLE
     from .mpp_matmul import ROUND

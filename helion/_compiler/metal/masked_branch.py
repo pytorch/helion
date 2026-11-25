@@ -42,8 +42,7 @@ from collections import Counter
 import copy
 import math
 
-from torch._inductor.codegen.mps import DTYPE_TO_METAL
-
+from ._constants import DTYPE_TO_METAL
 from .lane_fold import BF16_CAST
 from .lane_fold import load_mask_other
 from .lane_fold import tl_load

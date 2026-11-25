@@ -77,7 +77,6 @@ from typing import TypeGuard
 from typing import cast
 
 import torch
-from torch._inductor.codegen.mps import DTYPE_TO_METAL
 from torch._inductor.runtime.runtime_utils import next_power_of_2
 from torch.fx.node import Node
 from torch.multiprocessing.reductions import StorageWeakRef
@@ -108,6 +107,7 @@ from ..variable_origin import GridOrigin
 from ..variable_origin import TileBeginOrigin
 from ..variable_origin import TileIdOrigin
 from . import positional_rebind
+from ._constants import DTYPE_TO_METAL
 from .factored_dims import FactoredValue
 from .factored_dims import factored_size
 from .factored_dims import widened_iota
