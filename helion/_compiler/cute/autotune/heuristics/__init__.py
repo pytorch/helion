@@ -24,6 +24,7 @@ from .....autotuner.compiler_coverage import MAX_COMPILER_COVERAGE_CONFIGS
 from .....autotuner.compiler_coverage import CompilerCoverageGroup
 from .....autotuner.compiler_coverage import CoverageDependency
 from .....autotuner.compiler_coverage import CoverageWitness
+from .....autotuner.compiler_coverage import same_value
 from .....exc import InvalidConfig
 from .....runtime.config import Config
 from ....autotuner_heuristics.common import dedupe_configs
@@ -569,9 +570,29 @@ def _register_knob_witnesses(
     generation = spec.create_config_generation()
     if candidates is None:
         candidates = [seed for _flat, seed in generation.seed_flat_config_pairs()]
+    # A group with dependencies holds its carriers to the legacy mode of every
+    # field another group owns but the ones it depends on, and of its own
+    # (CompilerCoverageGroup.validate_dependencies()). A compiler seed may hold
+    # another mode of such a field (cute_uniform_lane_compares on in a row
+    # seed): it carries no witness of this group, instead of failing the
+    # kernel's binding.
+    declared = {entry.key for entry in dependencies}
+    legacy_modes = (
+        [
+            (group.key, group.legacy)
+            for group in spec.compiler_coverage_groups
+            if group.key not in declared
+        ]
+        + [(key, False)]
+        if dependencies
+        else []
+    )
     carriers: list[Config] = []
     for seed in candidates:
-        if not carries(seed):
+        if not carries(seed) or any(
+            not same_value(seed.config.get(field, legacy), legacy)
+            for field, legacy in legacy_modes
+        ):
             continue
         try:
             generation.strict_config_pair(

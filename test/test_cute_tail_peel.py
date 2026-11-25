@@ -983,6 +983,40 @@ def test_a_row_past_the_launch_grid_is_proven_only_with_the_static_grid() -> Non
     assert _peeled(source, grid=(3, 1, 1)) == _peeled(source)
 
 
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _sum_in_masked_chunks(x: torch.Tensor, out: torch.Tensor) -> None:
+    # The first kernel of Inductor's split of a sum of 90033 values (the sum
+    # over N and W of a [3, 1, 30011] tensor) in 11 chunks of 8185, the last
+    # one partial, as helion.inductor emits it.
+    for tile_x in hl.tile(11):
+        acc = hl.zeros([tile_x], dtype=torch.float32)
+        for tile_r in hl.tile(8185):
+            r = tile_r.index + 8185 * tile_x.index.reshape([tile_x, 1])
+            mask = r.to(torch.int32) < hl.full([], 90033, dtype=torch.int32)
+            value = hl.load(x, [r % 90033], extra_mask=mask)
+            acc = acc + torch.sum(torch.where(mask, value, 0.0), -1)
+        out[tile_x] = acc
+
+
+def test_a_deferred_carrier_in_another_groups_mode_carries_no_witness() -> None:
+    # The one witness of cute_defer_tile_reduce rides on a seed with
+    # cute_uniform_lane_compares on, a field another group owns. The tail
+    # peel, which would depend on the deferred combine, holds its carriers to
+    # the legacy mode of every field it does not depend on, so it does not
+    # take that carrier (the binding failed on it), and the kernel's one-warp
+    # seeds carry its witnesses without the dependency.
+    with cpu_render_target(reduction_smem_budget_bytes=232448):
+        spec = cpu_bind(
+            _sum_in_masked_chunks, (torch.empty(90033), torch.empty(11))
+        ).config_spec
+    groups = {group.key: group for group in spec.compiler_coverage_groups}
+    (deferred,) = groups["cute_defer_tile_reduce"].witnesses
+    assert deferred.carrier.config["cute_uniform_lane_compares"] is True
+    peel = groups["cute_tail_peel"]
+    assert not peel.dependencies
+    assert peel.witnesses
+
+
 def test_sunk_witnesses_ride_on_the_deferred_combines() -> None:
     x = torch.empty(4800, 64, dtype=torch.bfloat16)
     with cpu_render_target(reduction_smem_budget_bytes=232448):
