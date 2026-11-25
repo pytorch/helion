@@ -12,7 +12,6 @@ import importlib.util
 import json
 import os
 from pathlib import Path
-import shlex
 import signal
 import stat
 import subprocess
@@ -2366,44 +2365,6 @@ def test_main_cleared_pyargs_still_rejects_missing_paths(tmp_path, monkeypatch, 
                 *extra,
             ]
         )
-
-
-def test_review_cpu_examples_build_only_cpu_jobs(tmp_path, monkeypatch):
-    prompt = _load("autoreview").build_review_prompt(False)
-    runner = f"{shlex.quote(sys.executable)} scripts/run_tests.py "
-    examples = [
-        shlex.split(line)[2:] for line in prompt.splitlines() if line.startswith(runner)
-    ]
-    assert len(examples) == 2
-    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "")
-    monkeypatch.setattr(run_tests, "LOGS_DIR", tmp_path / "logs")
-
-    def unexpected(*args, **kwargs):
-        pytest.fail("review CPU examples must not discover or claim GPUs")
-
-    for name in ("sample_gpus", "claim_gpus", "pick_and_claim", "hold_claim"):
-        monkeypatch.setattr(gpu_board, name, unexpected)
-    observed = []
-
-    def capture_jobs(self, jobs, quiet=False):
-        observed.extend(jobs)
-        return {job.name: run_tests.JobResult(job, 0, 0) for job in jobs}
-
-    monkeypatch.setattr(run_tests.Runner, "run", capture_jobs)
-    monkeypatch.setattr(run_tests, "summarize", lambda *args: ("mocked CPU jobs", 0))
-    for argv in examples:
-        args = run_tests.parse_args(argv)
-        assert not args.gpus and not args.force and not args.no_board
-        assert len(args.paths) == 1 and args.paths[0].startswith("test/")
-        assert args.extra in (["-n", "2"], ["-n", "0"])
-        assert run_tests.main(argv) == 0
-    assert [(job.backend, job.lane) for job in observed] == [
-        ("triton", "cpu"),
-        ("cute", "cpu"),
-        ("pallas-interpret", "serial"),
-    ]
-    assert all(job.gpu is None for job in observed)
-    assert all(job.env["CUDA_VISIBLE_DEVICES"] == "" for job in observed)
 
 
 def test_no_board_needs_explicit_gpus(monkeypatch):

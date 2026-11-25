@@ -161,7 +161,8 @@ done
 Lint, and run the lanes for the files the fixes touched (verify skill). Fixes
 for CI failures and review comments change the commits, so review the changed
 commits again (one `scripts/autoreview.py <first changed>~..HEAD` run covers
-them) and refresh their `autoreview passed: ...` lines, keeping each line above
+them; answer its findings and continue it with `--resume <id>`, AGENTS.md,
+Continuing a review) and refresh their `autoreview passed: ...` lines, keeping each line above
 its `stack-info:` trailer; a commit without a current line is not ready to
 submit. Then, only if something changed since the last submit:
 
