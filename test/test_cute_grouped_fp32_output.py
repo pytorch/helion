@@ -12,35 +12,9 @@ from helion._compiler.cute.tcgen05_constants import tcgen05_grouped_worklist_sme
 from helion._testing import skipUnlessBackends
 from helion._testing.cute_codegen import cpu_bind
 from helion._testing.cute_codegen import mock_cuda_unavailable
-import helion.language as hl
+from helion._testing.cute_grouped_offsets import grouped_fp32_output
 
 pytestmark = pytest.mark.cpu_only
-
-
-@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
-def _grouped_fp32_output(
-    a: torch.Tensor, b: torch.Tensor, offsets: torch.Tensor
-) -> torch.Tensor:
-    m, k = a.shape
-    groups, n, _ = b.shape
-    block_m = hl.register_block_size(256)
-    block_n = hl.register_block_size(128)
-    block_k = hl.register_block_size(64, 128)
-    out = torch.empty((m, n), dtype=torch.float32, device=a.device)
-    for group_tile, rows, columns in hl.tile(
-        [groups, m, n], block_size=[1, block_m, block_n]
-    ):
-        group = group_tile.index.sum()
-        start = offsets[group]
-        length = offsets[group + 1] - offsets[group]
-        row_index = start + rows.index
-        valid = rows.index < length
-        acc = hl.zeros([rows, columns], dtype=torch.float32)
-        for inner in hl.tile(k, block_size=block_k):
-            left = hl.load(a, [row_index, inner], extra_mask=valid[:, None])
-            acc = torch.addmm(acc, left, b[group, columns, inner].T)
-        hl.store(out, [row_index, columns], acc, extra_mask=valid[:, None])
-    return out
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
@@ -54,7 +28,7 @@ def test_grouped_fp32_output_uses_worklist_and_charges_wider_ring(
         torch.tensor([0, 0, 1, 129, 640], dtype=torch.int32),
     )
     with _target(), mock_cuda_unavailable():
-        bound = cpu_bind(_grouped_fp32_output, args)
+        bound = cpu_bind(grouped_fp32_output, args)
         facts = bound.config_spec._cute_tcgen05_config.grouped_worklist_smem_facts
         assert facts is not None and facts.output_dtype_bytes == 4
         config = helion.Config(

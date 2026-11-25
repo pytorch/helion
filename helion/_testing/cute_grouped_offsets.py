@@ -112,3 +112,29 @@ def unsupported_k_loop(
                 acc = acc * 1.0
         hl.store(out, [row_index, columns], acc, extra_mask=valid[:, None])
     return out
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def grouped_fp32_output(
+    a: torch.Tensor, b: torch.Tensor, offsets: torch.Tensor
+) -> torch.Tensor:
+    m, k = a.shape
+    groups, n, _ = b.shape
+    block_m = hl.register_block_size(256)
+    block_n = hl.register_block_size(128)
+    block_k = hl.register_block_size(64, 128)
+    out = torch.empty((m, n), dtype=torch.float32, device=a.device)
+    for group_tile, rows, columns in hl.tile(
+        [groups, m, n], block_size=[1, block_m, block_n]
+    ):
+        group = group_tile.index.sum()
+        start = offsets[group]
+        length = offsets[group + 1] - offsets[group]
+        row_index = start + rows.index
+        valid = rows.index < length
+        acc = hl.zeros([rows, columns], dtype=torch.float32)
+        for inner in hl.tile(k, block_size=block_k):
+            left = hl.load(a, [row_index, inner], extra_mask=valid[:, None])
+            acc = torch.addmm(acc, left, b[group, columns, inner].T)
+        hl.store(out, [row_index, columns], acc, extra_mask=valid[:, None])
+    return out

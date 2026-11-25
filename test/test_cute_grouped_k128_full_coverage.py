@@ -118,7 +118,8 @@ def test_public_k128_complete_inverse_and_unchanged_allocations(
     assert counts == {
         "metadata": 1,
         "flag": 1,
-        "init": 2,
+        # The template copy, its small allocation class and the fence.
+        "init": 3,
         "changed": 1,
         "copy": 1,
         "dense": 1,

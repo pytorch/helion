@@ -9,6 +9,7 @@ import helion
 import cutlass
 import cutlass.cute as cute
 from helion.runtime import default_cute_launcher as _default_cute_launcher
+from helion._compiler.cute.tensormap_alloc_class import select_small_alloc_class as _cute_select_small_alloc_class
 import helion._compiler.cute._tcgen05_prologue_runtime as _helion_tc_pro
 
 _BLOCK_SIZE_1 = 256
@@ -206,6 +207,8 @@ def _helion_grouped_gemm_jagged(group_offsets, A_packed, B, out, tcgen05_grouped
     tcgen05_grouped_d_tensormap_smem_ptr = cute.arch.alloc_smem(cutlass.Int64, cutlass.Int32(16), alignment=128)
     if not tcgen05_grouped_full_coverage:
         tcgen05_grouped_d_tensormap_manager.init_tensormap_from_atom(tcgen05_tma_store_atom, tcgen05_grouped_d_tensormap_smem_ptr, 0)
+    if not tcgen05_grouped_full_coverage:
+        _cute_select_small_alloc_class(tcgen05_grouped_d_tensormap_smem_ptr, 0)
     if not tcgen05_grouped_full_coverage:
         tcgen05_grouped_d_tensormap_manager.fence_tensormap_initialization()
     tcgen05_grouped_d_tensormap_last_group = cutlass.Int32(-1)
@@ -499,6 +502,7 @@ import helion
 import cutlass
 import cutlass.cute as cute
 from helion.runtime import default_cute_launcher as _default_cute_launcher
+from helion._compiler.cute.tensormap_alloc_class import select_small_alloc_class as _cute_select_small_alloc_class
 import helion._compiler.cute._tcgen05_prologue_runtime as _helion_tc_pro
 
 _BLOCK_SIZE_1 = 256
@@ -696,6 +700,8 @@ def _helion_grouped_gemm_jagged(group_offsets, A_packed, B, out, tcgen05_grouped
     tcgen05_grouped_d_tensormap_smem_ptr = cute.arch.alloc_smem(cutlass.Int64, cutlass.Int32(16), alignment=128)
     if not tcgen05_grouped_full_coverage:
         tcgen05_grouped_d_tensormap_manager.init_tensormap_from_atom(tcgen05_tma_store_atom, tcgen05_grouped_d_tensormap_smem_ptr, 0)
+    if not tcgen05_grouped_full_coverage:
+        _cute_select_small_alloc_class(tcgen05_grouped_d_tensormap_smem_ptr, 0)
     if not tcgen05_grouped_full_coverage:
         tcgen05_grouped_d_tensormap_manager.fence_tensormap_initialization()
     tcgen05_grouped_d_tensormap_last_group = cutlass.Int32(-1)
@@ -1315,6 +1321,7 @@ import helion
 import cutlass
 import cutlass.cute as cute
 from helion.runtime import default_cute_launcher as _default_cute_launcher
+from helion._compiler.cute.tensormap_alloc_class import select_small_alloc_class as _cute_select_small_alloc_class
 import helion._compiler.cute._tcgen05_prologue_runtime as _helion_tc_pro
 
 _BLOCK_SIZE_0 = 128
@@ -1420,6 +1427,7 @@ def _helion__rank3_rhs_grouped_nt_with_mn_tails_and_k_sizes(layout, n_sizes, k_s
     tcgen05_grouped_d_tensormap_desc_ptr = tcgen05_grouped_d_tensormap_manager.get_tensormap_ptr(tcgen05_grouped_d_tensormap_ptr, cute.AddressSpace.generic)
     tcgen05_grouped_d_tensormap_smem_ptr = cute.arch.alloc_smem(cutlass.Int64, cutlass.Int32(16), alignment=128)
     tcgen05_grouped_d_tensormap_manager.init_tensormap_from_atom(tcgen05_tma_store_atom, tcgen05_grouped_d_tensormap_smem_ptr, 0)
+    _cute_select_small_alloc_class(tcgen05_grouped_d_tensormap_smem_ptr, 0)
     tcgen05_grouped_d_tensormap_manager.fence_tensormap_initialization()
     tcgen05_grouped_d_tensormap_last_group = cutlass.Int32(-1)
     tcgen05_kernel_desc = type('Tcgen05KernelDesc', (), {'cta_tile_shape_mnk': (128, 64, 64), 'c_layout': cutlass.utils.layout.LayoutEnum.ROW_MAJOR, 'c_dtype': cutlass.Float16, 'acc_dtype': cutlass.Float32, 'epilog_sync_bar_id': cutlass.Int32(2), 'epilogue_warp_id': (cutlass.Int32(0), cutlass.Int32(1), cutlass.Int32(2), cutlass.Int32(3)), 'num_c_stage': cutlass.Int32(2), 'use_2cta_instrs': False})()
@@ -1447,7 +1455,9 @@ def _helion__rank3_rhs_grouped_nt_with_mn_tails_and_k_sizes(layout, n_sizes, k_s
                     if tcgen05_grouped_tensormap_group_changed:
                         if not tcgen05_grouped_tensormap_init_done:
                             tcgen05_grouped_tensormap_manager.init_tensormap_from_atom(tma_atom_a, tcgen05_grouped_tensormap_a_smem_ptr, 5)
+                            _cute_select_small_alloc_class(tcgen05_grouped_tensormap_a_smem_ptr, 5)
                             tcgen05_grouped_tensormap_manager.init_tensormap_from_atom(tma_atom_b, tcgen05_grouped_tensormap_b_smem_ptr, 5)
+                            _cute_select_small_alloc_class(tcgen05_grouped_tensormap_b_smem_ptr, 5)
                             tcgen05_grouped_tensormap_manager.fence_tensormap_initialization()
                             tcgen05_grouped_tensormap_init_done = cutlass.Boolean(True)
                         tcgen05_grouped_tensormap_a_addr = (tcgen05_grouped_direct_pointers.iterator + cutlass.Int32(tcgen05_grouped_metadata_idx) * cutlass.Int32(tcgen05_grouped_direct_pointers.layout.stride[0]) + cutlass.Int32(0) * cutlass.Int32(tcgen05_grouped_direct_pointers.layout.stride[1])).load()
@@ -1499,7 +1509,9 @@ def _helion__rank3_rhs_grouped_nt_with_mn_tails_and_k_sizes(layout, n_sizes, k_s
                     if tcgen05_grouped_tensormap_group_changed:
                         if not tcgen05_grouped_tensormap_init_done:
                             tcgen05_grouped_tensormap_manager.init_tensormap_from_atom(tma_atom_a, tcgen05_grouped_tensormap_a_smem_ptr, 5)
+                            _cute_select_small_alloc_class(tcgen05_grouped_tensormap_a_smem_ptr, 5)
                             tcgen05_grouped_tensormap_manager.init_tensormap_from_atom(tma_atom_b, tcgen05_grouped_tensormap_b_smem_ptr, 5)
+                            _cute_select_small_alloc_class(tcgen05_grouped_tensormap_b_smem_ptr, 5)
                             tcgen05_grouped_tensormap_manager.fence_tensormap_initialization()
                             tcgen05_grouped_tensormap_init_done = cutlass.Boolean(True)
                         tcgen05_grouped_tensormap_a_addr = (tcgen05_grouped_direct_pointers.iterator + cutlass.Int32(tcgen05_grouped_metadata_idx) * cutlass.Int32(tcgen05_grouped_direct_pointers.layout.stride[0]) + cutlass.Int32(0) * cutlass.Int32(tcgen05_grouped_direct_pointers.layout.stride[1])).load()
@@ -1551,7 +1563,9 @@ def _helion__rank3_rhs_grouped_nt_with_mn_tails_and_k_sizes(layout, n_sizes, k_s
                     if tcgen05_grouped_tensormap_group_changed:
                         if not tcgen05_grouped_tensormap_init_done:
                             tcgen05_grouped_tensormap_manager.init_tensormap_from_atom(tma_atom_a, tcgen05_grouped_tensormap_a_smem_ptr, 5)
+                            _cute_select_small_alloc_class(tcgen05_grouped_tensormap_a_smem_ptr, 5)
                             tcgen05_grouped_tensormap_manager.init_tensormap_from_atom(tma_atom_b, tcgen05_grouped_tensormap_b_smem_ptr, 5)
+                            _cute_select_small_alloc_class(tcgen05_grouped_tensormap_b_smem_ptr, 5)
                             tcgen05_grouped_tensormap_manager.fence_tensormap_initialization()
                             tcgen05_grouped_tensormap_init_done = cutlass.Boolean(True)
                         tcgen05_grouped_tensormap_a_addr = (tcgen05_grouped_direct_pointers.iterator + cutlass.Int32(tcgen05_grouped_metadata_idx) * cutlass.Int32(tcgen05_grouped_direct_pointers.layout.stride[0]) + cutlass.Int32(0) * cutlass.Int32(tcgen05_grouped_direct_pointers.layout.stride[1])).load()
@@ -1603,7 +1617,9 @@ def _helion__rank3_rhs_grouped_nt_with_mn_tails_and_k_sizes(layout, n_sizes, k_s
                     if tcgen05_grouped_tensormap_group_changed:
                         if not tcgen05_grouped_tensormap_init_done:
                             tcgen05_grouped_tensormap_manager.init_tensormap_from_atom(tma_atom_a, tcgen05_grouped_tensormap_a_smem_ptr, 5)
+                            _cute_select_small_alloc_class(tcgen05_grouped_tensormap_a_smem_ptr, 5)
                             tcgen05_grouped_tensormap_manager.init_tensormap_from_atom(tma_atom_b, tcgen05_grouped_tensormap_b_smem_ptr, 5)
+                            _cute_select_small_alloc_class(tcgen05_grouped_tensormap_b_smem_ptr, 5)
                             tcgen05_grouped_tensormap_manager.fence_tensormap_initialization()
                             tcgen05_grouped_tensormap_init_done = cutlass.Boolean(True)
                         tcgen05_grouped_tensormap_a_addr = (tcgen05_grouped_direct_pointers.iterator + cutlass.Int32(tcgen05_grouped_metadata_idx) * cutlass.Int32(tcgen05_grouped_direct_pointers.layout.stride[0]) + cutlass.Int32(0) * cutlass.Int32(tcgen05_grouped_direct_pointers.layout.stride[1])).load()
@@ -1657,7 +1673,9 @@ def _helion__rank3_rhs_grouped_nt_with_mn_tails_and_k_sizes(layout, n_sizes, k_s
             if tcgen05_grouped_tensormap_group_changed:
                 if not tcgen05_grouped_tensormap_init_done:
                     tcgen05_grouped_tensormap_manager.init_tensormap_from_atom(tma_atom_a, tcgen05_grouped_tensormap_a_smem_ptr, 5)
+                    _cute_select_small_alloc_class(tcgen05_grouped_tensormap_a_smem_ptr, 5)
                     tcgen05_grouped_tensormap_manager.init_tensormap_from_atom(tma_atom_b, tcgen05_grouped_tensormap_b_smem_ptr, 5)
+                    _cute_select_small_alloc_class(tcgen05_grouped_tensormap_b_smem_ptr, 5)
                     tcgen05_grouped_tensormap_manager.fence_tensormap_initialization()
                     tcgen05_grouped_tensormap_init_done = cutlass.Boolean(True)
                 tcgen05_grouped_tensormap_a_addr = (tcgen05_grouped_direct_pointers.iterator + cutlass.Int32(tcgen05_grouped_metadata_idx) * cutlass.Int32(tcgen05_grouped_direct_pointers.layout.stride[0]) + cutlass.Int32(0) * cutlass.Int32(tcgen05_grouped_direct_pointers.layout.stride[1])).load()
@@ -2664,6 +2682,7 @@ import helion.language as hl
 import cutlass
 import cutlass.cute as cute
 from helion.runtime import default_cute_launcher as _default_cute_launcher
+from helion._compiler.cute.tensormap_alloc_class import select_small_alloc_class as _cute_select_small_alloc_class
 import builtins as _global_source0
 import helion._compiler.cute._tcgen05_prologue_runtime as _helion_tc_pro
 
@@ -2793,6 +2812,7 @@ def _helion__selected_kernel(work_tile_metadata, a_packed, b_grouped, out, work_
     tcgen05_grouped_d_tensormap_desc_ptr = tcgen05_grouped_d_tensormap_manager.get_tensormap_ptr(tcgen05_grouped_d_tensormap_ptr, cute.AddressSpace.generic)
     tcgen05_grouped_d_tensormap_smem_ptr = cute.arch.alloc_smem(cutlass.Int64, cutlass.Int32(16), alignment=128)
     tcgen05_grouped_d_tensormap_manager.init_tensormap_from_atom(tcgen05_tma_store_atom, tcgen05_grouped_d_tensormap_smem_ptr, 0)
+    _cute_select_small_alloc_class(tcgen05_grouped_d_tensormap_smem_ptr, 0)
     tcgen05_grouped_d_tensormap_manager.fence_tensormap_initialization()
     tcgen05_grouped_d_tensormap_last_group = cutlass.Int32(-1)
     tcgen05_kernel_desc = type('Tcgen05KernelDesc', (), {'cta_tile_shape_mnk': (256, 256, 128), 'c_layout': cutlass.utils.layout.LayoutEnum.COL_MAJOR, 'c_dtype': cutlass.BFloat16, 'acc_dtype': cutlass.Float32, 'epilog_sync_bar_id': cutlass.Int32(2), 'epilogue_warp_id': (cutlass.Int32(0), cutlass.Int32(1), cutlass.Int32(2), cutlass.Int32(3)), 'num_c_stage': cutlass.Int32(2), 'use_2cta_instrs': True})()
@@ -2820,7 +2840,9 @@ def _helion__selected_kernel(work_tile_metadata, a_packed, b_grouped, out, work_
             if tcgen05_grouped_tensormap_group_changed:
                 if not tcgen05_grouped_tensormap_init_done:
                     tcgen05_grouped_tensormap_manager.init_tensormap_from_atom(tma_atom_a, tcgen05_grouped_tensormap_a_smem_ptr, 5)
+                    _cute_select_small_alloc_class(tcgen05_grouped_tensormap_a_smem_ptr, 5)
                     tcgen05_grouped_tensormap_manager.init_tensormap_from_atom(tma_atom_b, tcgen05_grouped_tensormap_b_smem_ptr, 5)
+                    _cute_select_small_alloc_class(tcgen05_grouped_tensormap_b_smem_ptr, 5)
                     tcgen05_grouped_tensormap_manager.fence_tensormap_initialization()
                     tcgen05_grouped_tensormap_init_done = cutlass.Boolean(True)
                 tcgen05_grouped_tensormap_a_base = b_grouped.iterator + cutlass.Int32(tcgen05_grouped_group_idx) * cutlass.Int32(b_grouped.layout.stride[0])
@@ -3049,6 +3071,7 @@ import helion.language as hl
 import cutlass
 import cutlass.cute as cute
 from helion.runtime import default_cute_launcher as _default_cute_launcher
+from helion._compiler.cute.tensormap_alloc_class import select_small_alloc_class as _cute_select_small_alloc_class
 import builtins as _global_source0
 import helion._compiler.cute._tcgen05_prologue_runtime as _helion_tc_pro
 
@@ -3187,6 +3210,7 @@ def _helion__selected_kernel(work_tile_metadata, a_packed, b_grouped, out, work_
     tcgen05_grouped_d_tensormap_desc_ptr = tcgen05_grouped_d_tensormap_manager.get_tensormap_ptr(tcgen05_grouped_d_tensormap_ptr, cute.AddressSpace.generic)
     tcgen05_grouped_d_tensormap_smem_ptr = cute.arch.alloc_smem(cutlass.Int64, cutlass.Int32(16), alignment=128)
     tcgen05_grouped_d_tensormap_manager.init_tensormap_from_atom(tcgen05_tma_store_atom, tcgen05_grouped_d_tensormap_smem_ptr, 0)
+    _cute_select_small_alloc_class(tcgen05_grouped_d_tensormap_smem_ptr, 0)
     tcgen05_grouped_d_tensormap_manager.fence_tensormap_initialization()
     tcgen05_grouped_d_tensormap_last_group = cutlass.Int32(-1)
     tcgen05_kernel_desc = type('Tcgen05KernelDesc', (), {'cta_tile_shape_mnk': (256, 256, 128), 'c_layout': cutlass.utils.layout.LayoutEnum.COL_MAJOR, 'c_dtype': cutlass.BFloat16, 'acc_dtype': cutlass.Float32, 'epilog_sync_bar_id': cutlass.Int32(2), 'epilogue_warp_id': (cutlass.Int32(0), cutlass.Int32(1), cutlass.Int32(2), cutlass.Int32(3)), 'num_c_stage': cutlass.Int32(2), 'use_2cta_instrs': True})()
@@ -3218,7 +3242,9 @@ def _helion__selected_kernel(work_tile_metadata, a_packed, b_grouped, out, work_
             if tcgen05_grouped_tensormap_group_changed:
                 if not tcgen05_grouped_tensormap_init_done:
                     tcgen05_grouped_tensormap_manager.init_tensormap_from_atom(tma_atom_a, tcgen05_grouped_tensormap_a_smem_ptr, 5)
+                    _cute_select_small_alloc_class(tcgen05_grouped_tensormap_a_smem_ptr, 5)
                     tcgen05_grouped_tensormap_manager.init_tensormap_from_atom(tma_atom_b, tcgen05_grouped_tensormap_b_smem_ptr, 5)
+                    _cute_select_small_alloc_class(tcgen05_grouped_tensormap_b_smem_ptr, 5)
                     tcgen05_grouped_tensormap_manager.fence_tensormap_initialization()
                     tcgen05_grouped_tensormap_init_done = cutlass.Boolean(True)
                 tcgen05_grouped_tensormap_a_base = b_grouped.iterator + cutlass.Int32(tcgen05_grouped_group_idx) * cutlass.Int32(b_grouped.layout.stride[0])

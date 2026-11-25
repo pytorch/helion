@@ -10,8 +10,9 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from test.test_cute_flat_grouped_ir import _host
-from test.test_cute_flat_grouped_ir import cuda_binding
+from helion._testing.cute_flat_grouped import bound_host_function as _host
+from helion._testing.cute_flat_grouped import cuda_binding
+from helion._testing.cute_flat_grouped import flat_rna_schedule as _schedule
 
 pytest.importorskip("cutlass")
 pytest.importorskip("cutlass.cute")
@@ -33,23 +34,7 @@ from helion._compiler.cute.tcgen05_operand_transform import Tcgen05OperandRolePl
 pytestmark = pytest.mark.cpu_only
 
 if TYPE_CHECKING:
-    from helion._compiler.cute.tcgen05_flat_grouped_plan import FlatGroupedRnaSchedule
     from helion.runtime.kernel import BoundKernel
-
-
-def _schedule(
-    bound: BoundKernel, warps: int = 4, bk: int = 32
-) -> FlatGroupedRnaSchedule | None:
-    proof = prove_flat_grouped_rna(bound.env, _host(bound).device_ir)
-    assert proof is not None
-    return flat_grouped_rna_schedule(
-        bound.env,
-        proof,
-        converter_warps=warps,
-        block_k=bk,
-        ab_stages={32: 6, 64: 3}[bk],
-        shared_capacity=232448,
-    )
 
 
 def _config() -> helion.Config:

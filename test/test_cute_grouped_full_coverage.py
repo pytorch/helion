@@ -159,7 +159,8 @@ def test_full_source_inverse_and_unchanged_wrapper(m: int, n: int, k: int) -> No
     assert counts == {
         "metadata": 1,
         "flag": 1,
-        "init": 2,
+        # The template copy, its small allocation class and the fence.
+        "init": 3,
         "changed": 1,
         "copy": 1,
         "dense": 1,

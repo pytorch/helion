@@ -14,7 +14,6 @@ from test._cute_grouped_gemm_split_sizes import _device_split_sizes_kernel
 
 from .cute_population_contracts import _target
 from .cute_population_contracts import checked_initial_population
-from .test_cute_grouped_fp32_output import _grouped_fp32_output
 import helion
 from helion._compiler.cute import cute_mma
 from helion._compiler.cute.autotune.heuristics import cute as heuristics
@@ -26,6 +25,7 @@ from helion._testing.cute_d_shift_gate import d_shift_proposals
 from helion._testing.cute_grouped_configs import prefix_recipe_args as _args
 from helion._testing.cute_grouped_configs import prefix_recipes as _recipes
 from helion._testing.cute_grouped_offsets import fresh_grouped_offsets_k64 as _kernel
+from helion._testing.cute_grouped_offsets import grouped_fp32_output
 from helion.autotuner.effort_profile import get_effort_profile
 from helion.autotuner.surrogate_pattern_search import LFBOTreeSearch
 from helion.exc import InvalidConfig
@@ -229,7 +229,7 @@ def test_split_sizes_and_different_output_atom_do_not_enter_prefix_recipe() -> N
     )
     with forbid_cuda_work(), _target(), mock_cuda_unavailable():
         split = cpu_bind(_device_split_sizes_kernel, split_args).config_spec
-        output32 = cpu_bind(_grouped_fp32_output, _args()).config_spec
+        output32 = cpu_bind(grouped_fp32_output, _args()).config_spec
         for spec in (split, output32):
             assert not spec._cute_tcgen05_config.grouped_prefix_adaptive_n_supported
             assert not _recipes(spec)

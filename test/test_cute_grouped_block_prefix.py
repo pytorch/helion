@@ -12,11 +12,7 @@ import torch
 
 from test.cute_population_contracts import checked_initial_population
 from test.cute_population_contracts import with_flat_min_blocks_default
-from test.test_cute_flat_grouped_ir import _host
-from test.test_cute_flat_grouped_ir import cuda_binding
-from test.test_cute_flat_grouped_public import _native_source
 from test.test_cute_flat_grouped_public import _runtime_arguments
-from test.test_cute_flat_grouped_public import _source
 from test.test_cute_tma_rn_two_stage import _scalar_prefix_functions
 from test.test_cute_tma_rn_two_stage import low_config
 from test.test_cute_tma_rn_two_stage import low_schedule
@@ -45,6 +41,10 @@ from helion._compiler.cute.tcgen05_storage import NativeSharedStoragePlan
 from helion._compiler.cute.tcgen05_tma_rn import CONVERSION_KEY
 from helion._compiler.cute.tcgen05_tma_rn import TMA_RN
 from helion._compiler.cute.tcgen05_tma_rn import WARP_RAW
+from helion._testing.cute_flat_grouped import bound_host_function as _host
+from helion._testing.cute_flat_grouped import compiled_source as _source
+from helion._testing.cute_flat_grouped import cuda_binding
+from helion._testing.cute_flat_grouped import native_kernel_source as _native_source
 from helion.autotuner.config_generation import ConfigGeneration
 from helion.autotuner.effort_profile import get_effort_profile
 from helion.autotuner.pattern_search import InitialPopulationStrategy

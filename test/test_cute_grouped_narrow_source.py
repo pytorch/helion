@@ -6,8 +6,6 @@ import pytest
 import torch
 
 from .cute_population_contracts import _target
-from .test_cute_grouped_fp32_output import _grouped_fp32_output
-from .test_cute_grouped_grid_multiplier import _config
 import helion
 from helion._compiler.cute.tcgen05_constants import (
     resolve_tcgen05_grouped_worklist_mma_shape,
@@ -16,6 +14,8 @@ from helion._compiler.cute.tcgen05_constants import tcgen05_grouped_worklist_sme
 from helion._compiler.cute.tcgen05_constants import tcgen05_grouped_worklist_store_shape
 from helion._testing.cute_codegen import cpu_bind
 from helion._testing.cute_codegen import mock_cuda_unavailable
+from helion._testing.cute_grouped_configs import grid_multiplier_config as _config
+from helion._testing.cute_grouped_offsets import grouped_fp32_output
 from helion.runtime.cute.launcher import _tcgen05_grouped_device_source_m_tile_supported
 
 pytestmark = pytest.mark.cpu_only
@@ -37,7 +37,7 @@ def test_narrow_grouped_source_keeps_its_extent_through_store(
     config["tcgen05_grouped_worklist_source_m_tile"] = source_rows
     config["tcgen05_warp_register_reallocation"] = False
     with _target(), mock_cuda_unavailable():
-        bound = cpu_bind(_grouped_fp32_output, args)
+        bound = cpu_bind(grouped_fp32_output, args)
         normalized = bound.config_spec.normalized_config(
             helion.Config.from_dict(config)
         )

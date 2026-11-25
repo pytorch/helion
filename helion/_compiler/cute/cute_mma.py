@@ -17648,9 +17648,15 @@ def _emit_mma_pipeline(
                     dynamic_operands = dynamic_operands[1:]
                 if plan.tcgen05_grouped_full_allocation_b:
                     dynamic_operands = dynamic_operands[:-1]
+                # A template is encoded for the whole operand and rewritten
+                # per group: it takes the small allocation class, so that no
+                # group inherits the operand's large one
+                # (``tensormap_alloc_class``).
                 dynamic_init = "".join(
                     f"        {grouped_tensormap_manager}.init_tensormap_from_atom("
                     f"{atom}, {smem_ptr}, {tcgen05_matmul_plan.tma_warp_id})\n"
+                    f"        _cute_select_small_alloc_class("
+                    f"{smem_ptr}, {tcgen05_matmul_plan.tma_warp_id})\n"
                     for atom, smem_ptr, pointer, real, base, base_expr, shape, stride in dynamic_operands
                 )
                 dynamic_views = "".join(

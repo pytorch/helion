@@ -12,7 +12,6 @@ import cutlass
 from cutlass._mlir import ir
 import cutlass.cute as cute
 
-from test.test_cute_flat_grouped_ir import cuda_binding
 from test.test_cute_tma_rn import schedule
 from test.test_cute_tma_rn_two_stage import low_schedule
 
@@ -20,6 +19,7 @@ from helion._compiler.cute.tcgen05_flat_grouped_kernel import (
     render_flat_grouped_rna_kernel,
 )
 from helion._compiler.cute.tcgen05_flat_grouped_plan import flat_grouped_storage
+from helion._testing.cute_flat_grouped import cuda_binding
 
 pytestmark = pytest.mark.cpu_only
 

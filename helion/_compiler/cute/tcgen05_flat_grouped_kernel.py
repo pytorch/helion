@@ -18,8 +18,25 @@ if TYPE_CHECKING:
 
 # The scheduler may overwrite a work record as soon as all warp leaders
 # release it. Broadcast each leader's shared loads before acknowledging reuse.
+#
+# The B and D templates are encoded for the whole row-packed operand and
+# rewritten to one group's rows: they take the small allocation class
+# (``tensormap_alloc_class``). Every lane of the owning warp clears the
+# selector. The lanes' stores are ordered ahead of the template's first
+# rewrite, in which one lane replaces fields of the template
+# (``update_tensormap``): a store of the encoded quadword that landed
+# behind that lane's would put back whatever the rewrite changed in it.
+# The output template is rewritten behind the block's ``sync_threads``;
+# the operand template is rewritten by its own warp right away, so that warp
+# synchronizes behind the clear, once per CTA. The A template is one group's
+# dense block and is only ever rewritten to another block of that extent, so
+# the class the driver encoded for it is valid for every group.
 _KERNEL = """
 from helion._compiler.cute._flash_runtime import ld_volatile_shared_u32
+if __native_wrapped_descriptors:
+    pass
+else:
+    from helion._compiler.cute.tensormap_alloc_class import select_small_alloc_class_every_lane
 
 @cute.jit
 def _helion_warp_work_field(work_tile, index):
@@ -137,6 +154,7 @@ def _helion_native_grouped_rna(offsets, a_packed, b_grouped, bias, out, tcgen05_
         tcgen05_grouped_d_tensormap_desc_ptr = tcgen05_grouped_d_tensormap_manager.get_tensormap_ptr(tcgen05_grouped_d_tensormap_ptr, cute.AddressSpace.generic)
         tcgen05_grouped_d_tensormap_smem_ptr = cute.recast_ptr(tcgen05_storage_pool + __native_rna_offset_d_descriptor, dtype=cutlass.Int64)
         tcgen05_grouped_d_tensormap_manager.init_tensormap_from_atom(tcgen05_tma_store_atom, tcgen05_grouped_d_tensormap_smem_ptr, 0)
+        select_small_alloc_class_every_lane(tcgen05_grouped_d_tensormap_smem_ptr, 0)
         tcgen05_grouped_d_tensormap_manager.fence_tensormap_initialization()
         tcgen05_grouped_d_tensormap_last_group = cutlass.Int32(-1)
     tcgen05_kernel_desc = type('Tcgen05KernelDesc', (), {'cta_tile_shape_mnk': (128, 128, __native_rna_block_k), 'c_layout': cutlass.utils.layout.LayoutEnum.COL_MAJOR, 'c_dtype': cutlass.Float32, 'acc_dtype': cutlass.Float32, 'epilog_sync_bar_id': cutlass.Int32(2), 'epilogue_warp_id': (cutlass.Int32(0), cutlass.Int32(1), cutlass.Int32(2), cutlass.Int32(3)), 'num_c_stage': cutlass.Int32(2), 'use_2cta_instrs': False})()
@@ -194,6 +212,8 @@ def _helion_native_grouped_rna(offsets, a_packed, b_grouped, bias, out, tcgen05_
                     if not tcgen05_grouped_tensormap_init_done:
                         tcgen05_grouped_tensormap_manager.init_tensormap_from_atom(tma_atom_a, tcgen05_grouped_tensormap_a_smem_ptr, 5)
                         tcgen05_grouped_tensormap_manager.init_tensormap_from_atom(tma_atom_b, tcgen05_grouped_tensormap_b_smem_ptr, 5)
+                        select_small_alloc_class_every_lane(tcgen05_grouped_tensormap_b_smem_ptr, 5)
+                        cute.arch.sync_warp()
                         tcgen05_grouped_tensormap_manager.fence_tensormap_initialization()
                         tcgen05_grouped_tensormap_init_done = cutlass.Boolean(True)
                     tcgen05_grouped_tensormap_a_base = b_grouped.iterator + cutlass.Int32(tcgen05_grouped_group_idx) * cutlass.Int32(b_grouped.layout.stride[0])
