@@ -52,6 +52,11 @@ count toward this measurement. It measures the layout and its check, without
 the projections or distributed forward. The original measurements used a
 GB300 (SM103a) and CuTe DSL 4.8.1.
 
+The [W13 and W2 projection workloads](cute/dist_moe/nvfp4_projections.md)
+include the Helion sources and the configurations selected by the separate
+GB300 projection searches. The notes distinguish the original experimental
+compiler from the schedules this checkout supports.
+
 ### TPU / Pallas Benchmarking
 
 `benchmarks/run_tpu.py` runs registered Helion examples on TPU with the Pallas
