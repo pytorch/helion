@@ -848,10 +848,51 @@ def _positive_mean(samples: list[float]) -> float:
     return statistics.mean(positive) if positive else math.inf
 
 
+def _launches_several_kernels(fn: Callable[[], object]) -> bool:
+    """Whether one call of ``fn`` (a generated host function, or a partial of
+    one) launches more than one kernel, as the host function of a multi-stage
+    module that does says in ``_helion_cute_launches`` (the split-K workspace
+    schedule, materialized fission). The kernels it declares in
+    ``_helion_cute_kernels`` are not the count: a bounded cache declares two
+    and launches one of them. Timed eagerly, such a call's span counts the
+    host's gap between its launches whenever the host falls behind the
+    per-call flush; a CUDA graph replay, the form a deployed sequence runs,
+    keeps only the device-side gaps."""
+    target: object = fn
+    while isinstance(target, functools.partial):
+        target = target.func
+    launches = getattr(target, "_helion_cute_launches", 1)
+    return type(launches) is int and launches > 1
+
+
+def _replays_for_launches(fn: Callable[[], object], *, default_cudagraph: bool) -> bool:
+    """Whether a replay of ``fn`` is one that only its several kernels ask for
+    (``_launches_several_kernels``), neither HELION_BENCHMARK_CUDAGRAPH=1 nor
+    the caller asking for every call's replay. ``do_bench`` makes such a replay
+    only for the windows that read it on the scale of its rivals' eager calls:
+    the per-call kernel durations and a search's trace of per-call flushed
+    calls."""
+    return (
+        not default_cudagraph
+        and not _env_get_bool(_BENCHMARK_CUDAGRAPH_ENV, default=False)
+        and _launches_several_kernels(fn)
+    )
+
+
 def _maybe_cudagraph_replay(
-    fn: Callable[[], T], *, default_enabled: bool = False
+    fn: Callable[[], T],
+    *,
+    default_enabled: bool = False,
+    replay_launches: bool = False,
 ) -> Callable[[], T]:
-    if not _env_get_bool(_BENCHMARK_CUDAGRAPH_ENV, default=default_enabled):
+    """``fn`` as a replay of one CUDA graph capturing a call of it when
+    ``HELION_BENCHMARK_CUDAGRAPH`` says so; unset, when ``default_enabled``
+    does or, with ``replay_launches``, the call launches several kernels
+    (``_launches_several_kernels``), else ``fn`` itself."""
+    if not _env_get_bool(
+        _BENCHMARK_CUDAGRAPH_ENV,
+        default=default_enabled or (replay_launches and _launches_several_kernels(fn)),
+    ):
         return fn
 
     reason = _cudagraph_unavailable_reason()
@@ -2174,9 +2215,11 @@ def do_bench(
         earlier work pinned (see ``_traced_candidate_window``; a search that
         settled on the trace timer asks for it for every candidate, with or
         without ``fixed_repetitions``). Other regimes, backward benchmarks,
-        graph replays and processes that cannot trace are timed as without
-        it; a traced window whose trace cannot be read raises
-        ``KernelTraceUnreadable``.
+        graph replays (but the replay of a call that launches several
+        kernels, which this window and the ``kernel`` timer read on its
+        rivals' scale, ``_replays_for_launches``) and processes that cannot
+        trace are timed as without it; a traced window whose trace cannot be
+        read raises ``KernelTraceUnreadable``.
     :param prelude: Work that precedes every timed call (``TimedPrelude``,
         from ``benchmark_prelude``: the kernels that run before ``fn`` in a
         sequence); ``fn`` reads the arguments the work leaves it, and the
@@ -2208,8 +2251,11 @@ def do_bench(
         regimes that flush before every call (``call``, ``kernel``) have a
         place for a prelude; the others raise, and so do a backward
         benchmark and a CUDA graph replay (``HELION_BENCHMARK_CUDAGRAPH``),
-        which would run ``fn`` on the arguments of its capture. None (the
-        default) is a call timed alone: nothing here runs.
+        which would run ``fn`` on the arguments of its capture; a call that
+        launches several kernels (``_launches_several_kernels``), which the
+        trace and ``kernel`` windows read as a replay when it is timed alone,
+        runs eagerly behind a prelude. None (the default) is a call timed
+        alone: nothing here runs.
     """
     from triton import runtime
     from triton.testing import _summarize_statistics
@@ -2221,17 +2267,35 @@ def do_bench(
     if not pre_warmed:
         fn()
     di.synchronize()
-    # Backward benchmarks mutate grad fields between iterations, so keep their
-    # existing launch path.
-    benchmark_function = (
-        fn
-        if grad_to_none is not None
-        else _maybe_cudagraph_replay(fn, default_enabled=default_cudagraph)
-    )
-
     if fixed_repetitions is not None and fixed_repetitions < 1:
         raise ValueError("fixed_repetitions must be at least 1")
     flush_mode = _resolve_l2_flush_mode(l2_flush_mode)
+    # Backward benchmarks mutate grad fields between iterations, so keep their
+    # existing launch path. A call that launches several kernels is replayed
+    # from one CUDA graph only for the windows that read the replay on the
+    # scale of its rivals' eager calls: the per-call kernel durations and a
+    # search's trace of per-call flushed calls. The event timers below read a
+    # replay on another scale (a short one batched, its launch latency
+    # subtracted; the ``replay`` regime's burst unflushed), and behind a
+    # prelude a replay would run the call on the arguments of its capture, not
+    # on the ones the prelude's work has just made: there it runs eagerly.
+    benchmark_function = (
+        fn
+        if grad_to_none is not None
+        else _maybe_cudagraph_replay(
+            fn,
+            default_enabled=default_cudagraph,
+            replay_launches=prelude is None
+            and (
+                flush_mode == "kernel"
+                or (trace_kernel_durations and flush_mode == "call")
+            ),
+        )
+    )
+    launch_replay = benchmark_function is not fn and _replays_for_launches(
+        fn, default_cudagraph=default_cudagraph
+    )
+
     clear_cache: Callable[[], None] = _no_cache_clear
     flush_buffer: torch.Tensor | None = None
     if flush_mode != "off":
@@ -2299,16 +2363,17 @@ def do_bench(
     # estimate runs first. Fixed repetitions are traced as well (the retry
     # of a timed-out seed is compared with the search's other readings). A
     # backward benchmark and a graph replay (batched below when short) keep
-    # their timers.
+    # their timers, except the replay of a call that launches several
+    # kernels, which a search's trace reads like its one-kernel rivals.
     if (
         trace_kernel_durations
         and flush_mode == "call"
         and grad_to_none is None
-        and benchmark_function is fn
+        and (benchmark_function is fn or launch_replay)
     ):
         assert flush_buffer is not None
         traced = _traced_candidate_window(
-            fn,
+            benchmark_function,
             clear_cache,
             di,
             flush_buffer=flush_buffer,
@@ -2323,6 +2388,10 @@ def do_bench(
         )
         if traced is not None:
             return traced
+    if launch_replay:
+        # Neither window read it: the event timers time the call eagerly, as
+        # they time its rivals.
+        benchmark_function = fn
 
     if fixed_repetitions is None and probe_long_kernel:
 

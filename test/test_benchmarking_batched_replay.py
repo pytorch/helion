@@ -864,6 +864,48 @@ def test_search_timer_traces_every_window_it_is_asked_to(
 
 
 @trace_test
+def test_search_trace_reads_the_replay_of_a_multi_launch_call(
+    monkeypatch, traced_windows
+) -> None:
+    """A call that launches several kernels is timed as a CUDA graph replay
+    without being asked (``_launches_several_kernels``: the replay keeps the
+    host's launch gap out of the reading); a search that reads its
+    candidates from the trace reads that replay there, like the eager calls
+    of its one-kernel rivals, not with CUDA events on another scale."""
+    small = torch.randn(64, device=DEVICE)
+
+    def host() -> None:
+        torch.add(small, 1.0)
+        torch.mul(small, 2.0)
+
+    host._helion_cute_launches = 2  # pyrefly: ignore [missing-attribute]
+    host()
+    torch.cuda.synchronize()
+    windows: list[Callable[[], object]] = []
+    window = benchmarking._traced_candidate_window
+
+    def traced(fn: Callable[[], object], *args: object, **kwargs: object) -> object:
+        windows.append(fn)
+        return window(fn, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(benchmarking, "_traced_candidate_window", traced)
+    monkeypatch.delenv("HELION_BENCHMARK_CUDAGRAPH", raising=False)
+    reading = benchmarking.do_bench(
+        host,
+        return_mode="median",
+        warmup=1,
+        rep=20,
+        pre_warmed=True,
+        trace_kernel_durations=True,
+    )
+    assert 0.0 < reading < math.inf  # pyrefly: ignore[unsupported-operation]
+    # the replay, not the eager call, was traced
+    assert len(windows) == 1
+    assert windows[0] is not host
+    assert traced_windows
+
+
+@trace_test
 @pytest.mark.parametrize("probe_long_kernel", [False, True])
 def test_a_traced_window_runs_no_event_estimate_first(
     monkeypatch, traced_windows, probe_long_kernel: bool

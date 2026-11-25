@@ -4,6 +4,7 @@ import ast
 
 import pytest
 import torch
+from torch._inductor.codecache import PyCodeCache
 
 from test.test_cute_epilogue_fanout import cuda_trace  # noqa: F401
 
@@ -14,6 +15,7 @@ from helion._compiler.cute.packed_operand import prove_packed_operand
 from helion._testing import import_example
 from helion._testing import skipUnlessBackends
 from helion._testing.cute_codegen import check_config_compile_options
+from helion.autotuner.benchmarking import _launches_several_kernels
 from helion.autotuner.compiler_coverage import append_compiler_coverage
 
 matmul_bf16_int4 = import_example("int4_gemm").matmul_bf16_int4
@@ -81,6 +83,10 @@ def test_original_packed_operand_reaches_ordinary_codegen(reduction: int) -> Non
         isinstance(node, ast.Name) and node.id == plan.materialized_name
         for node in ast.walk(host_ast)
     )
+    # That one launch replaces the fission host's two stage launches, so the
+    # benchmark timers time the call eagerly, as a one-kernel call
+    # (``_launches_several_kernels`` reads the count the host declares).
+    assert not _launches_several_kernels(getattr(PyCodeCache.load(source), host.name))
     if reduction == 64:
         check_config_compile_options(bound, selected)
 

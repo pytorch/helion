@@ -11034,3 +11034,81 @@ def test_cudagraph_auto_skips_nested_capture(monkeypatch):
         return "nested"
 
     assert benchmarking._maybe_cudagraph_replay(fn) is fn
+
+
+def _two_launch_host(a: object) -> object:
+    return a
+
+
+_two_launch_host._helion_cute_kernels = (object(), object())  # pyrefly: ignore [missing-attribute]
+_two_launch_host._helion_cute_launches = 2  # pyrefly: ignore [missing-attribute]
+
+
+def _two_variant_host(a: object) -> object:
+    return a
+
+
+# A bounded cache declares two kernels and launches one of them.
+_two_variant_host._helion_cute_kernels = (object(), object())  # pyrefly: ignore [missing-attribute]
+
+
+def _one_launch_host(a: object) -> object:
+    return a
+
+
+_one_launch_host._helion_cute_kernels = (object(),)  # pyrefly: ignore [missing-attribute]
+
+
+def test_multi_launch_calls_are_timed_as_graph_replays(monkeypatch) -> None:
+    # A generated host function that launches two kernels on every call (the
+    # split-K workspace schedule's producer and reducer) is timed as a CUDA
+    # graph replay where the caller's window asks for it, so its host launch
+    # gap stays out of the reading; one launch keeps the eager call (a bounded
+    # cache declares two kernels and launches one), and
+    # HELION_BENCHMARK_CUDAGRAPH=0 still opts out.
+    two = functools.partial(_two_launch_host, 1)
+    one = functools.partial(_one_launch_host, 1)
+    variants = functools.partial(_two_variant_host, 1)
+    assert benchmarking._launches_several_kernels(two)
+    assert not benchmarking._launches_several_kernels(one)
+    assert not benchmarking._launches_several_kernels(variants)
+    assert not benchmarking._launches_several_kernels(lambda: None)
+    captured = []
+
+    def replay_of(fn):
+        captured.append(fn)
+        return lambda: "replayed"
+
+    monkeypatch.setattr(benchmarking, "_cudagraph_unavailable_reason", lambda: None)
+    monkeypatch.setattr(benchmarking, "_make_cudagraph_replay", replay_of)
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda: None)
+    monkeypatch.delenv("HELION_BENCHMARK_CUDAGRAPH", raising=False)
+    assert (
+        benchmarking._maybe_cudagraph_replay(two, replay_launches=True)() == "replayed"
+    )
+    assert captured == [two]
+    # only a window that reads the replay like its rivals asks for it
+    assert benchmarking._maybe_cudagraph_replay(two) is two
+    assert benchmarking._maybe_cudagraph_replay(one, replay_launches=True) is one
+    assert (
+        benchmarking._maybe_cudagraph_replay(variants, replay_launches=True) is variants
+    )
+    monkeypatch.setenv("HELION_BENCHMARK_CUDAGRAPH", "0")
+    assert benchmarking._maybe_cudagraph_replay(two, replay_launches=True) is two
+
+
+def test_search_trace_reads_only_the_replays_several_kernels_ask_for(
+    monkeypatch,
+) -> None:
+    # do_bench reads a search's candidate from the trace when its replay is
+    # one the call's several kernels asked for, as it reads the eager calls
+    # of the candidate's one-kernel rivals; a replay the caller or
+    # HELION_BENCHMARK_CUDAGRAPH=1 asked for keeps the batched event timer.
+    two = functools.partial(_two_launch_host, 1)
+    one = functools.partial(_one_launch_host, 1)
+    monkeypatch.delenv("HELION_BENCHMARK_CUDAGRAPH", raising=False)
+    assert benchmarking._replays_for_launches(two, default_cudagraph=False)
+    assert not benchmarking._replays_for_launches(one, default_cudagraph=False)
+    assert not benchmarking._replays_for_launches(two, default_cudagraph=True)
+    monkeypatch.setenv("HELION_BENCHMARK_CUDAGRAPH", "1")
+    assert not benchmarking._replays_for_launches(two, default_cudagraph=False)

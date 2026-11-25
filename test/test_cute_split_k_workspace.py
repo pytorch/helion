@@ -36,6 +36,7 @@ from helion._compiler.cute.split_k_workspace_codegen import (
 from helion._compiler.cute.state import cute_env_state
 from helion._testing import default_cute_mma_support
 from helion._testing import import_example
+from helion.autotuner.benchmarking import _launches_several_kernels
 from helion.autotuner.benchmarking import _make_cudagraph_replay
 from helion.autotuner.config_fragment import PowerOfTwoFragment
 from helion.autotuner.effort_profile import get_effort_profile
@@ -425,6 +426,9 @@ def test_generated_module_name_does_not_shadow_host_bindings(
     ]
     assert len(calls) == 4
     assert len(host._helion_cute_kernels) == 2
+    # both kernels launch on every call: the benchmark timers read the count
+    assert host._helion_cute_launches == 2
+    assert _launches_several_kernels(host)
     assert outputs[0].data_ptr() != outputs[1].data_ptr()
     assert outputs[0].dtype is outputs[1].dtype is torch.float16
     assert calls[0][0][4] is calls[1][0][2]
