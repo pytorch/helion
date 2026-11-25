@@ -9,6 +9,7 @@ from .. import _compat as _compat  # ensure Triton compatibility patches run
 from .. import exc
 from .._compiler.metal.export import MetalArgument as MetalArgument
 from .._compiler.metal.export import MetalLaunch as MetalLaunch
+from .._compiler.metal.export import MLXKernel as MLXKernel
 from .._compiler.metal.export import capture_metal_launches as capture_metal_launches
 from .._compiler.metal.metal_launcher import (
     default_metal_launcher as default_metal_launcher,

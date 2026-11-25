@@ -313,6 +313,17 @@ class MSLParam:
     def decl(self) -> str:
         return f"{self.space} {self.type}{'&' if self.by_value else '*'} {self.name}"
 
+    def baked(self, value: object) -> str:
+        """A by-value scalar's declaration with ``value`` baked in, for a
+        runtime that binds buffers only."""
+        assert self.by_value
+        literal = (
+            _float_literal(float(value))  # type: ignore[arg-type]
+            if self.type == "float"
+            else str(int(value))  # type: ignore[call-overload]
+        )
+        return f"const {self.type} {self.name} = {literal};"
+
 
 @dataclasses.dataclass(frozen=True)
 class MSLKernel:
@@ -336,6 +347,10 @@ class MSLKernel:
     prologue: tuple[str, ...]
     scratch: tuple[tuple[str, str, int], ...]
     body: tuple[str, ...]
+    #: The buffers the body views as MPP device tensors, whose views take a
+    #: ``device`` pointer (a runtime that binds small inputs in ``constant``
+    #: memory, as MLX does, cannot run them).
+    device_views: frozenset[str]
 
     def render(self) -> str:
         """The complete MSL source of the ``kernel void``."""
@@ -621,6 +636,7 @@ def _generate_msl_kernel(
         prologue=tuple(prologue),
         scratch=tuple(scratch),
         body=tuple(body),
+        device_views=frozenset(state.device_views),
     )
     c10_lines, reduction_lines = c10_source(kernel.render(), uses_reductions)
     filled: list[str | None] = [*preamble]

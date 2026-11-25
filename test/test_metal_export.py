@@ -1,7 +1,8 @@
 """A Metal kernel's launches as data (``metal/export.py``): the MSL, grid,
 threadgroup and arguments :func:`helion.runtime.capture_metal_launches`
-records instead of compiling and dispatching them.  Binds CPU tensors
-only."""
+records instead of compiling and dispatching them, and their form for MLX's
+``mx.fast.metal_kernel`` (``MetalLaunch.to_mlx``).  Binds CPU tensors only;
+``test_metal_export_mlx.py`` runs the kernels under MLX."""
 
 from __future__ import annotations
 
@@ -13,11 +14,18 @@ import torch
 
 import helion
 from helion import exc
+from helion._compiler.metal._constants import DTYPE_TO_METAL
 from helion._testing import skipUnlessBackends
+from helion._testing.metal import addmm_k_loop
+from helion._testing.metal import mpp_only
 from helion._testing.metal import scale_by_0dim
 from helion._testing.metal_codegen import launch_dims
 from helion._testing.metal_export import add_one
+from helion._testing.metal_export import position_named
+from helion._testing.metal_export import row_sum
+from helion._testing.metal_export import scatter_even
 from helion._testing.metal_export import shift
+from helion._testing.metal_preamble import erf_of
 import helion.language as hl
 from helion.runtime import capture_metal_launches
 
@@ -37,6 +45,45 @@ def add_into(out: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
     for tile in hl.tile(x.size()):
         out[tile] = out[tile] + x[tile]
     return out
+
+
+@helion.kernel(backend="metal", static_shapes=True, autotune_effort="none")
+def copy_into(out: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+    for tile in hl.tile(x.size()):
+        out[tile] = x[tile]
+    return out
+
+
+@helion.kernel(backend="metal", static_shapes=True, autotune_effort="none")
+def add(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tile in hl.tile(x.size()):
+        out[tile] = x[tile] + y[tile]
+    return out
+
+
+@helion.kernel(backend="metal", static_shapes=True, autotune_effort="none")
+def add_into_fresh(x: torch.Tensor) -> torch.Tensor:
+    """Writes every element of an output the host fills with ``x``."""
+    out = x.clone()
+    for tile in hl.tile(x.size()):
+        out[tile] = x[tile] + 1
+    return out
+
+
+@helion.kernel(backend="metal", static_shapes=True, autotune_effort="none")
+def scatter_even_into(
+    x: torch.Tensor, evens: torch.Tensor, copy: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Writes the even positions of ``evens`` and all of ``copy``."""
+    (n,) = x.shape
+    bm = hl.register_block_size(16, 64)
+    for g in hl.grid((n + bm - 1) // bm):
+        src = g * bm + hl.arange(bm)
+        v = hl.load(x, [src], extra_mask=src < n)
+        hl.store(evens, [2 * src], v, extra_mask=src < n)
+        hl.store(copy, [src], v, extra_mask=src < n)
+    return evens, copy
 
 
 @helion.kernel(
@@ -65,6 +112,28 @@ def add_one_reserving(x: torch.Tensor) -> torch.Tensor:
     out = torch.empty_like(x)
     for tile in hl.tile(x.size()):
         out[tile] = x[tile] + 1
+    return out
+
+
+@helion.kernel(backend="metal", static_shapes=True, autotune_effort="none")
+def add_shaped(
+    x: torch.Tensor, x_shape: torch.Tensor, x_shape__shape: torch.Tensor
+) -> torch.Tensor:
+    """``x_shape`` is named like MLX's parameter for ``x``'s shape, and
+    ``x_shape__shape`` like the one for ``x_shape``'s, once renamed."""
+    out = torch.empty_like(x)
+    for tile in hl.tile(x.size()):
+        out[tile] = x[tile] + x_shape[tile] + x_shape__shape[tile]
+    return out
+
+
+@helion.kernel(backend="metal", static_shapes=True, autotune_effort="none")
+def add_grid(grid_size: torch.Tensor, _helion_T0: torch.Tensor) -> torch.Tensor:
+    """An input named like MLX's ``grid_size`` attribute, and one like the
+    body's first template parameter."""
+    out = torch.empty_like(grid_size)
+    for tile in hl.tile(grid_size.size()):
+        out[tile] = grid_size[tile] + _helion_T0[tile]
     return out
 
 
@@ -205,6 +274,224 @@ class TestCaptureMetalLaunches(unittest.TestCase):
         ):
             capture_metal_launches(add_one, (torch.randn(32),))
         self.assertEqual(compiled, [])
+
+
+class TestToMLX(unittest.TestCase):
+    def test_buffers_become_inputs_and_outputs(self) -> None:
+        x = torch.randn(40, 72)
+        (launch,) = capture_metal_launches(add_one, (x,))
+        k = launch.to_mlx(init_value=None)
+        self.assertEqual((k.input_names, k.output_names), (("x",), ("out",)))
+        self.assertIs(k.inputs[0], x)
+        self.assertEqual(k.output_shapes, ((40, 72),))
+        self.assertEqual(k.output_dtypes, (torch.float32,))
+        gx, gy, gz = launch.grid
+        bx, by, bz = launch.threadgroup
+        self.assertEqual(k.grid, (gx * bx, gy * by, gz * bz))
+        self.assertEqual(k.threadgroup, launch.threadgroup)
+
+    def test_header_is_self_contained(self) -> None:
+        """MLX compiles the header without torch's include path, so it holds
+        the c10 headers a launch includes (for erf, which Helion carries no
+        copy of), and the kernel body as a function the source calls with
+        MLX's attributes."""
+        x = torch.randn(1024)
+        config = erf_of.bind((x,)).config_spec.default_config()
+        (launch,) = capture_metal_launches(erf_of, (x,), config)
+        k = launch.to_mlx(init_value=None)
+        self.assertIn("#include <c10/metal/special_math.h>", launch.source)
+        self.assertNotIn("#include <c10/", k.header)
+        self.assertIn("namespace c10 {", k.header)
+        self.assertIn(f"inline void {launch.name}_body(", k.header)
+        self.assertIn(f"{launch.name}_body(_helion_buffer<float>(x)", k.source)
+        self.assertIn("threadgroup_position_in_grid", k.source)
+        self.assertNotIn("kernel void", k.header + k.source)
+
+    def test_name_follows_what_mlx_compiles(self) -> None:
+        """MLX caches kernels by name: two shapes, or two values of a scalar
+        it bakes in, get two names."""
+        x = torch.randn(64)
+        (a,) = capture_metal_launches(add_one, (x,))
+        (b,) = capture_metal_launches(add_one, (torch.randn(128),))
+        self.assertNotEqual(
+            a.to_mlx(init_value=None).name, b.to_mlx(init_value=None).name
+        )
+        (c,) = capture_metal_launches(shift, (x, 2.0))
+        (d,) = capture_metal_launches(shift, (x, 3.0))
+        self.assertEqual(c.source, d.source)
+        self.assertNotEqual(
+            c.to_mlx(init_value=None).name, d.to_mlx(init_value=None).name
+        )
+        self.assertEqual(a.to_mlx(name="mine", init_value=None).name, "mine")
+
+    def test_scalars_are_baked(self) -> None:
+        """MLX binds arrays only, so a runtime scalar is a constant of the
+        header, and not an input."""
+        x = torch.randn(256)
+        (launch,) = capture_metal_launches(shift, (x, 2.0))
+        k = launch.to_mlx(init_value=None)
+        self.assertEqual(k.input_names, ("x",))
+        self.assertIn("const float f = 2.0;", k.header)
+        (launch,) = capture_metal_launches(shift, (x, float("inf")))
+        self.assertIn(
+            "const float f = INFINITY;", launch.to_mlx(init_value=None).header
+        )
+
+    def test_init_value(self) -> None:
+        """The caller states MLX's one init_value, or takes it from the
+        outputs as captured when they all hold one value: here the zeros of
+        an output the kernel writes only in part."""
+        x = torch.randn(40)
+        (launch,) = capture_metal_launches(scatter_even, (x,))
+        self.assertEqual(launch.to_mlx(init_value="captured").init_value, 0.0)
+        args = (x, torch.full((80,), -1.0), torch.full((40,), -1.0))
+        (launch,) = capture_metal_launches(scatter_even_into, args)
+        self.assertEqual(launch.to_mlx(init_value="captured").init_value, -1.0)
+        self.assertIsNone(launch.to_mlx(init_value=None).init_value)
+        self.assertEqual(launch.to_mlx(init_value=7.0).init_value, 7.0)
+
+    @unittest.skipUnless(
+        torch.uint32 in DTYPE_TO_METAL, "no uint32 under this PyTorch's Metal"
+    )
+    def test_captured_unsigned_fill(self) -> None:
+        """An unsigned output's fill, whose sign bit torch.signbit reads too."""
+        n = torch.arange(40, dtype=torch.int32).to(torch.uint32)
+        fill = (torch.full((80,), 5), torch.full((40,), 5))
+        args = (n, *(t.to(torch.uint32) for t in fill))
+        (launch,) = capture_metal_launches(scatter_even_into, args)
+        self.assertEqual(launch.to_mlx(init_value="captured").init_value, 5.0)
+
+    def test_init_value_refusals(self) -> None:
+        """ "captured" refuses outputs that one float32 init_value cannot
+        reproduce: an output that holds several values (data the kernel
+        keeps, or what torch.empty held: a capture cannot tell them apart;
+        zeros of both signs count as two values), two fills, or an integer
+        float32 does not hold.  A caller that knows the fill states it."""
+        x = torch.randn(40)
+        n = torch.arange(40, dtype=torch.int32)
+        big = 2**24 + 1
+        for kernel, args, reason in (
+            (
+                scatter_even_into,
+                (x, torch.arange(80, dtype=torch.float32), torch.zeros(40)),
+                "several values",
+            ),
+            (add_into_fresh, (torch.randn(64),), "several values"),
+            (
+                scatter_even_into,
+                (x, torch.tensor([0.0, -0.0] * 40), torch.zeros(40)),
+                "several values",
+            ),
+            (
+                scatter_even_into,
+                (x, torch.zeros(80), torch.ones(40)),
+                "one for all outputs",
+            ),
+            (
+                scatter_even_into,
+                (x, torch.zeros(80), torch.full((40,), -0.0)),
+                "one for all outputs",
+            ),
+            (
+                scatter_even_into,
+                (
+                    n,
+                    torch.full((80,), big, dtype=torch.int32),
+                    torch.full((40,), big, dtype=torch.int32),
+                ),
+                "float32",
+            ),
+        ):
+            with self.subTest(kernel=kernel.name, reason=reason):
+                (launch,) = capture_metal_launches(kernel, args)
+                with self.assertRaisesRegex(exc.BackendUnsupported, reason):
+                    launch.to_mlx(init_value="captured")
+                self.assertIsNone(launch.to_mlx(init_value=None).init_value)
+                self.assertEqual(launch.to_mlx(init_value=7.0).init_value, 7.0)
+
+    def test_read_only_inputs_may_share_storage(self) -> None:
+        """MLX passes each array as its own buffer, which only matters for
+        a buffer the kernel writes."""
+        x = torch.randn(64)
+        (launch,) = capture_metal_launches(add, (x, x))
+        self.assertEqual(launch.to_mlx(init_value=None).input_names, ("x", "y"))
+
+    def test_0dim_input(self) -> None:
+        """MLX binds a 0-dim input by reference, which the header's buffer
+        cast takes too."""
+        args = (torch.randn(64), torch.tensor(2.0))
+        (launch,) = capture_metal_launches(scale_by_0dim, args)
+        k = launch.to_mlx(init_value=None)
+        self.assertEqual(k.input_names, ("x", "s"))
+        self.assertEqual(k.inputs[1].shape, ())
+        self.assertIn("_helion_buffer<float>(s)", k.source)
+        self.assertIn("_helion_buffer(const constant P& p)", k.header)
+
+    def test_threadgroup_arrays_stay_in_kernel_scope(self) -> None:
+        """Threadgroup arrays (here a reduction's scratch) are declared in the
+        source, where MLX's kernel scope is, and passed to the body by
+        reference."""
+        (launch,) = capture_metal_launches(row_sum, (torch.randn(16, 256),))
+        k = launch.to_mlx(init_value=None)
+        self.assertTrue(launch.msl.scratch)
+        for dtype, name, slots in launch.msl.scratch:
+            self.assertIn(f"threadgroup {dtype} {name}[{slots}];", k.source)
+            self.assertIn(f"threadgroup {dtype} (&{name})[{slots}]", k.header)
+
+    def test_names_mlx_declares_take_a_suffix(self) -> None:
+        """MLX declares a position attribute, and an input's shape, strides
+        and rank, as parameters of their own names: a buffer of such a name
+        takes a ``_`` suffix in MLX's signature, and keeps its own in the
+        body, renamed again when a renamed buffer's own shape takes a name.
+        The body's template parameters begin as no buffer's name does."""
+        (launch,) = capture_metal_launches(position_named, (torch.arange(64.0),))
+        k = launch.to_mlx(init_value=None)
+        self.assertEqual(k.input_names, ("threadgroup_position_in_grid_",))
+        self.assertIn("_helion_buffer<float>(threadgroup_position_in_grid_)", k.source)
+        self.assertIn(", threadgroup_position_in_grid,", k.source)
+        self.assertIn("_helion_T0 threadgroup_position_in_grid,", k.header)
+        (launch,) = capture_metal_launches(add_shaped, (torch.ones(64),) * 3)
+        k = launch.to_mlx(init_value=None)
+        self.assertEqual(sorted(k.input_names), ["x", "x_shape_", "x_shape__shape_"])
+        (launch,) = capture_metal_launches(add_grid, (torch.ones(64),) * 2)
+        k = launch.to_mlx(init_value=None)
+        self.assertEqual(sorted(k.input_names), ["_helion_T0", "grid_size_"])
+        self.assertNotIn("_helion_T0 _helion_T0", k.header)
+        self.assertIn("typename _helion_T_0", k.header)
+
+    def test_refusals(self) -> None:
+        """What MLX's arrays cannot carry: a buffer read and written (MLX's
+        outputs are fresh), buffers that share storage, and strides."""
+        x = torch.randn(64)
+        for kernel, args, reason in (
+            (double_in_place, (x,), "read and written"),
+            (add_into, (torch.randn(64), x), "read and written"),
+            (copy_into, (x, x), "shares storage"),
+            (add_one, (torch.randn(16, 32).t(),), "strides"),
+        ):
+            with self.subTest(kernel=kernel.name, reason=reason):
+                (launch,) = capture_metal_launches(kernel, args)
+                with self.assertRaisesRegex(exc.BackendUnsupported, reason):
+                    launch.to_mlx(init_value=None)
+        (launch,) = capture_metal_launches(add_one, (torch.randn(64, 2)[:, 0],))
+        with self.assertRaisesRegex(exc.BackendUnsupported, "strides"):
+            launch.to_mlx(init_value=None)
+
+    def test_small_mpp_operand_is_refused(self) -> None:
+        """MLX binds an input of fewer than 8 elements in constant memory,
+        which an MPP device view cannot read: a 2x2 matmul's operands are
+        refused, a 16x16 one's are not."""
+        for size, refused in ((2, True), (16, False)):
+            args = (torch.randn(size, size), torch.randn(size, size))
+            config = mpp_only(addmm_k_loop, args, None)
+            (launch,) = capture_metal_launches(addmm_k_loop, args, config)
+            with self.subTest(size=size):
+                self.assertEqual(launch.msl.device_views, {"x", "y"})
+                if refused:
+                    with self.assertRaisesRegex(exc.BackendUnsupported, "constant"):
+                        launch.to_mlx(init_value=None)
+                else:
+                    launch.to_mlx(init_value=None)
 
 
 if __name__ == "__main__":

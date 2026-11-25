@@ -40,6 +40,28 @@ for launch in launches:
     print([(a.name, a.binding, a.written) for a in launch.arguments])
 ```
 
+`MetalLaunch.to_mlx()` arranges a launch for MLX's `mx.fast.metal_kernel`:
+the buffers the kernel reads become inputs and the ones it writes outputs,
+torch's c10 headers are inlined into the header, runtime scalars are baked
+in, and the grid counts threads. MLX allocates fresh outputs, filled with
+one `init_value` that the caller states: `None` when the kernel writes every
+element of its outputs, else the value of the elements it leaves
+(`"captured"` takes it from the outputs, refusing ones one value cannot
+reproduce).
+
+```python
+import mlx.core as mx
+
+k = launch.to_mlx(init_value=None)  # the kernel writes all of its outputs
+fn = mx.fast.metal_kernel(
+    name=k.name,
+    input_names=list(k.input_names),
+    output_names=list(k.output_names),
+    source=k.source,
+    header=k.header,
+)
+```
+
 ```{eval-rst}
 .. currentmodule:: helion.runtime
 
@@ -49,4 +71,6 @@ for launch in launches:
    :members:
 
 .. autoclass:: MetalArgument
+
+.. autoclass:: MLXKernel
 ```
