@@ -206,18 +206,12 @@ def grouped_gemm_jagged_persistent(
                     # Iterate over K dimension in blocks for matrix multiplication
                     for k_tile in hl.tile(K):
                         k_idx = k_tile.index
-                        # Workaround: emit explicit block_size multiple on stride-1 K
-                        # so Intel XPU Triton enables 2D block I/O + prefetch.
-                        a_k_idx = k_tile.id * k_tile.block_size + hl.arange(
-                            k_tile.block_size
-                        )
-                        k_valid = a_k_idx < K
 
                         # Load tiles from A_packed and B with boundary checking
                         a_blk = hl.load(
                             A_packed,
-                            [row_idx, a_k_idx],
-                            extra_mask=rows_valid[:, None] & k_valid[None, :],
+                            [row_idx, k_idx],
+                            extra_mask=rows_valid[:, None],
                         )
                         b_blk = hl.load(
                             B,
