@@ -438,7 +438,9 @@ def _cluster_grid(
             f"{CLUSTER_LAUNCH_REFUSED}a grid of {grid} does not divide into "
             f"clusters of {cluster_size}"
         )
-    num_warps, num_ctas, shared = compiled_kernel.packed_metadata  # type: ignore[attr-defined]
+    # Builds may pack more after these three (fbtriton: a preferred cluster
+    # shape); they pass through.
+    num_warps, num_ctas, shared, *rest = compiled_kernel.packed_metadata  # type: ignore[attr-defined]
     if num_ctas != 1:
         # A multi-CTA module's program id is its cluster's, not the CTA's.
         raise RuntimeError(
@@ -460,7 +462,7 @@ def _cluster_grid(
             f"{CLUSTER_LAUNCH_REFUSED}{shared} bytes of dynamic shared memory "
             f"beside the static cluster slab exceed the SM's: {error}"
         )
-    compiled_kernel.packed_metadata = (num_warps, cluster_size, shared)  # type: ignore[attr-defined]
+    compiled_kernel.packed_metadata = (num_warps, cluster_size, shared, *rest)  # type: ignore[attr-defined]
     return (grid[0] // cluster_size, *grid[1:])
 
 
@@ -498,14 +500,15 @@ def _fit_tensor_memory(compiled_kernel: object) -> None:
     fit = _tensor_memory_ctas(compiled_kernel.metadata)  # type: ignore[attr-defined]
     if fit is None:
         return
-    num_warps, num_ctas, shared = compiled_kernel.packed_metadata  # type: ignore[attr-defined]
+    num_warps, num_ctas, shared, *rest = compiled_kernel.packed_metadata  # type: ignore[attr-defined]
     # Once a specialization: the launcher also runs during graph capture.
     cache = vars(compiled_kernel).setdefault("_helion_tensor_memory_shared", {})
     if (num_warps, shared) not in cache:
         cache[num_warps, shared] = _tensor_memory_shared(
             compiled_kernel, num_warps, shared, fit
         )
-    compiled_kernel.packed_metadata = (num_warps, num_ctas, cache[num_warps, shared])  # type: ignore[attr-defined]
+    padded = cache[num_warps, shared]
+    compiled_kernel.packed_metadata = (num_warps, num_ctas, padded, *rest)  # type: ignore[attr-defined]
 
 
 def _tensor_memory_shared(
@@ -1002,7 +1005,7 @@ def _validate_resident_program_capacity(
     # partitions').  Cache the exact driver result on the compiled
     # specialization because this wrapper is also called during graph capture.
     function = compiled_kernel.function  # type: ignore[attr-defined]
-    num_warps, _, shared = compiled_kernel.packed_metadata  # type: ignore[attr-defined]
+    num_warps, _, shared, *_ = compiled_kernel.packed_metadata  # type: ignore[attr-defined]
     cache = vars(compiled_kernel).setdefault(
         "_helion_resident_program_capacity_cache", {}
     )

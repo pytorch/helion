@@ -312,16 +312,19 @@ class TestTritonLauncher(unittest.TestCase):
         def launch(columns: int, cluster_size: int) -> tuple[int, int, int]:
             """The CTAs an SM holds by shared memory and runs of the launch,
             and its cohort's capacity."""
+            # Packed as fbtriton packs it: a preferred cluster shape follows,
+            # which the padding passes through.
             compiled = SimpleNamespace(
                 run=None,
                 function=1,
-                packed_metadata=(4, cluster_size, 0),
+                packed_metadata=(4, cluster_size, 0, 2, 1, 1),
                 metadata=SimpleNamespace(
                     tmem_size=columns, target=SimpleNamespace(arch=100)
                 ),
             )
             triton_launcher._fit_tensor_memory(compiled)
             shared = compiled.packed_metadata[2]
+            self.assertEqual(compiled.packed_metadata[3:], (2, 1, 1))
             held = fit_by_shared(static + shared)
             if shared:
                 # The least padding: a byte less holds another CTA; the kernel
