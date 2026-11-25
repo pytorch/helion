@@ -17,7 +17,7 @@ import helion
 from helion import _compat
 from helion._compiler.cute import target_facts
 from helion._compiler.cute.autotune.heuristics.cute import CuteTcgen05ClusterM2Heuristic
-from helion._compiler.cute.pipeline_smem import TCGEN05_SMEM_AWARE_MAX_AB_STAGES
+from helion._compiler.cute.pipeline_smem import TCGEN05_PAIRED_MAX_AB_STAGES
 from helion._compiler.cute.pipeline_smem import pipeline_smem_bytes
 from helion._compiler.cute.strategies import ROLE_LOCAL_MONOLITHIC_DEFAULT_WARP_SPEC
 from helion._compiler.cute.strategies import Tcgen05LayoutOverrides
@@ -810,21 +810,22 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
 
         search_fragments = surface.optional_fragments(spec.tcgen05, for_search=True)
         # The fragment covers both the legacy AB reservation and the explicit
-        # paired-CTA allocation proof. The latter admits up to 16 stages; the
-        # unchanged legacy configs below must still obey their narrower budget.
+        # paired-CTA allocation proof. The latter admits up to the plain 16-bit
+        # pair's cap (17 stages); the unchanged legacy configs below must still
+        # obey their narrower budget.
         self.assertTrue(
             surface.paired_pipeline_search_enabled(spec._cute_tcgen05_config)
         )
         self.assertEqual(
             search_fragments["tcgen05_ab_stages"].high,
-            TCGEN05_SMEM_AWARE_MAX_AB_STAGES,
+            TCGEN05_PAIRED_MAX_AB_STAGES,
         )
         validation_fragments = surface.optional_fragments(
             spec.tcgen05, for_search=False
         )
         self.assertEqual(
             validation_fragments["tcgen05_ab_stages"].high,
-            TCGEN05_SMEM_AWARE_MAX_AB_STAGES,
+            TCGEN05_PAIRED_MAX_AB_STAGES,
         )
 
         # cluster_m=2 256x256x128 ab=3: the canonical 4096^3 fast config —
@@ -936,7 +937,7 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
                 self.assertTrue(paired)
                 self.assertEqual(
                     search["tcgen05_ab_stages"].high,
-                    TCGEN05_SMEM_AWARE_MAX_AB_STAGES,
+                    TCGEN05_PAIRED_MAX_AB_STAGES,
                 )
                 facts = tcfg.pipeline_smem_facts
                 assert facts is not None
@@ -985,7 +986,7 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
             )
             self.assertEqual(
                 search_fragments["tcgen05_ab_stages"].high,
-                TCGEN05_SMEM_AWARE_MAX_AB_STAGES,
+                TCGEN05_PAIRED_MAX_AB_STAGES,
             )
 
     @onlyBackends(["cute"])
@@ -2237,7 +2238,8 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
             # requires scheduler_warps=0.
             spec.normalize(helion.Config(**base, tcgen05_warp_spec_scheduler_warps=1))
         with self.assertRaises(InvalidConfig):
-            spec.normalize(helion.Config(**base, tcgen05_warp_spec_ab_load_warps=2))
+            # one or two A/B-load warps (``cute_mma._build_shared_ring_producer``)
+            spec.normalize(helion.Config(**base, tcgen05_warp_spec_ab_load_warps=3))
         with self.assertRaises(InvalidConfig):
             spec.normalize(helion.Config(**base, tcgen05_warp_spec_mma_warps=2))
 

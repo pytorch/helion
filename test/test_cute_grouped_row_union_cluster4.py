@@ -1339,7 +1339,7 @@ def test_tma_role_hoist_fails_closed_without_exactly_one_role_block():
     with patch.object(
         Tcgen05PersistentProgramIDs,
         "_tcgen05_plan",
-        return_value=SimpleNamespace(tma_warp_id=5),
+        return_value=SimpleNamespace(tma_warp_id=5, ab_load_warp_count=1),
     ):
         setup = [anchor, other, role]
         pids._hoist_tcgen05_tma_role_block(setup, anchor)

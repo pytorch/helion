@@ -20754,6 +20754,7 @@ mailbox[cutlass.Int32(3), producer_state.index] = first
             has_c_input_warp=True,
             has_store_warp=True,
             tma_warp_id=5,
+            ab_load_warp_count=1,
             exec_warp_id=4,
             epi_warp_count=4,
             store_warp_id=7,

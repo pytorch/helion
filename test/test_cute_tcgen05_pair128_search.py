@@ -20,6 +20,12 @@ from test.test_cute_tcgen05_split_k_search import _samples
 from test.test_cute_tcgen05_split_k_search import _sm100_target
 
 import helion
+from helion._compiler.cute.pipeline_smem import TCGEN05_PAIRED_MAX_AB_STAGES
+from helion._compiler.cute.pipeline_smem import TCGEN05_SMEM_AWARE_MAX_AB_STAGES
+from helion._compiler.cute.pipeline_smem import Tcgen05PipelineSmemFacts
+from helion._compiler.cute.pipeline_smem import max_pipeline_ab_stages
+from helion._compiler.cute.pipeline_smem import paired_pipeline_max_ab_stages
+from helion._compiler.cute.pipeline_smem import pipeline_smem_bytes
 from helion._compiler.cute.tcgen05_config import repair
 from helion._compiler.cute.tcgen05_config import seeds
 from helion._testing import skipUnlessBackends
@@ -207,7 +213,14 @@ def test_one_wave_family_runs_128_row_pairs_at_its_deepest_ring() -> None:
             seed
             for seed in seeds.autotune_seed_configs(tcgen05)
             if seed.get("tcgen05_cta_group") == "two"
+            and seed.get("tcgen05_warp_spec_ab_load_warps", 1) == 1
         ]
+        # (each with a twin on two A/B-load warps: test_cute_tcgen05_ab_load_warps)
+        assert [
+            seed.config["block_sizes"][:3]
+            for seed in seeds.autotune_seed_configs(tcgen05)
+            if seed.get("tcgen05_warp_spec_ab_load_warps", 1) == 2
+        ] == [seed.config["block_sizes"][:3] for seed in pair_seeds]
         assert [
             (seed.config["block_sizes"][:3], seed.config["tcgen05_ab_stages"])
             for seed in pair_seeds
@@ -284,7 +297,14 @@ def test_one_wave_family_runs_the_64_wide_pair_on_a_half_empty_grid() -> None:
             seed
             for seed in seeds.autotune_seed_configs(tcgen05)
             if seed.get("tcgen05_cta_group") == "two"
+            and seed.get("tcgen05_warp_spec_ab_load_warps", 1) == 1
         ]
+        # (each with a twin on two A/B-load warps: test_cute_tcgen05_ab_load_warps)
+        assert [
+            seed.config["block_sizes"][:3]
+            for seed in seeds.autotune_seed_configs(tcgen05)
+            if seed.get("tcgen05_warp_spec_ab_load_warps", 1) == 2
+        ] == [seed.config["block_sizes"][:3] for seed in pair_seeds]
         assert [
             (seed.config["block_sizes"][:3], seed.config["tcgen05_ab_stages"])
             for seed in pair_seeds
@@ -324,6 +344,7 @@ def test_a_one_tile_grid_keeps_its_ab_ring_within_the_k_loop() -> None:
             seed
             for seed in seeds.autotune_seed_configs(spec._cute_tcgen05_config)
             if seed.get("tcgen05_cta_group") == "two"
+            and seed.get("tcgen05_warp_spec_ab_load_warps", 1) == 1
         ]
         sample = {
             **copy.deepcopy(seed.config),
@@ -379,6 +400,7 @@ def test_reserved_sms_keep_the_ring_of_a_grid_that_loops() -> None:
             seed
             for seed in seeds.autotune_seed_configs(spec._cute_tcgen05_config)
             if seed.get("tcgen05_cta_group") == "two"
+            and seed.get("tcgen05_warp_spec_ab_load_warps", 1) == 1
         ]
         sample = {
             **copy.deepcopy(seed.config),
@@ -408,9 +430,35 @@ def test_a_one_tile_epi_tma_default_keeps_the_256_row_pair() -> None:
     assert default["tcgen05_ab_stages"] == 3
 
 
+def test_a_cta_pair_ring_fills_shared_memory_to_seventeen_stages() -> None:
+    # The bf16 128x64 pair (64 A rows and 32 B rows of 64 K per CTA, 12 KB a
+    # stage) fits 17 stages beside its two C stages in GB300's 232448 bytes
+    # (227632) and not 18 (239936): the plain pair's cap with 16-bit operands
+    # is that fill.  The one-CTA model keeps 16 where 18 would fit (64x32 at
+    # bk 64).
+    facts = Tcgen05PipelineSmemFacts(2, 2, 232448)
+    pair = {"bm": 128, "bn": 64, "bk": 64, "c_stages": 2, "acc_stages": 2}
+    assert TCGEN05_PAIRED_MAX_AB_STAGES == 17
+    cap = paired_pipeline_max_ab_stages(facts)
+    assert max_pipeline_ab_stages(facts, max_stages=cap, **pair) == 17
+    assert pipeline_smem_bytes(facts, ab_stages=17, **pair) <= 232448
+    assert pipeline_smem_bytes(facts, ab_stages=18, **pair) > 232448
+    # (fp8 pairs, unmeasured at 17, keep 16; so does every caller that does
+    # not ask for the pair's cap)
+    assert paired_pipeline_max_ab_stages(facts._replace(input_dtype_bytes=1)) == 16
+    assert max_pipeline_ab_stages(facts, **pair) == 16
+    one_cta = {"bm": 64, "bn": 32, "bk": 64, "c_stages": 2, "acc_stages": 2}
+    assert max_pipeline_ab_stages(facts, cluster_m=1, max_stages=18, **one_cta) == 18
+    assert (
+        max_pipeline_ab_stages(facts, cluster_m=1, **one_cta)
+        == TCGEN05_SMEM_AWARE_MAX_AB_STAGES
+        == 16
+    )
+
+
 def test_a_normalized_ring_off_the_searched_range_still_encodes() -> None:
     # bf16 1000x512x2880 searches tcgen05_ab_stages over 1..12 plus the
-    # 64-wide pair seed's 16. That seed with a sampled N tile of 128
+    # 64-wide pair seed's 17. That seed with a sampled N tile of 128
     # normalizes to the 128x128 pair at its deepest ring, 13 stages: off
     # the range and not a seed. The pattern search walks its neighbors and
     # the surrogate encodes it (a full-effort autotune of this GEMM died on
@@ -426,9 +474,10 @@ def test_a_normalized_ring_off_the_searched_range_still_encodes() -> None:
             seed
             for seed in seeds.autotune_seed_configs(spec._cute_tcgen05_config)
             if seed.get("tcgen05_cta_group") == "two"
+            and seed.get("tcgen05_warp_spec_ab_load_warps", 1) == 1
         ]
         assert seed.config["block_sizes"][:3] == [128, 64, 64]
-        assert seed.config["tcgen05_ab_stages"] == 16
+        assert seed.config["tcgen05_ab_stages"] == TCGEN05_PAIRED_MAX_AB_STAGES
         sample = {**copy.deepcopy(seed.config), "block_sizes": [128, 128, 64]}
         flat, config = gen.canonicalize_flat(gen.flatten(helion.Config(**sample)))
         assert config.config["tcgen05_cta_group"] == "two"

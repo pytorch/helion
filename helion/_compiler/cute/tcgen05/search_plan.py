@@ -23,6 +23,7 @@ from ....language.matmul_ops import _problem_extent
 from ....language.matmul_ops import _static_dim_value
 from ....language.matmul_ops import _static_problem_extent
 from ...compile_environment import CompileEnvironment
+from ...compile_environment import FixedBlockSizeSource
 from ...compile_environment import _is_supported_tensor_input_source
 from ...compile_environment import _symint_free_symbols
 from ..cute_warp_mma_gemm import WARP_MMA_MIN_BM
@@ -76,6 +77,79 @@ def tcgen05_min_n(dtype: torch.dtype, *, tf32: bool = False) -> int:
     """The narrowest tcgen05 N tile for ``dtype`` operands (tf32's bn >= 32
     floor mirrors ``_mma_impl_matches_problem_shape``)."""
     return 16 if dtype == torch.float8_e4m3fn else (32 if tf32 else 8)
+
+
+def tcgen05_small_n_zero_fills(m: int, n: int, k: int, dtype: torch.dtype) -> bool:
+    """Whether an ``m x n x k`` GEMM whose static ``n`` is below the
+    narrowest tcgen05 N tile runs one zero-filled tile of that width
+    (``_plan_cute_tcgen05_search_candidate``): 16-bit operands of a
+    memory-bound GEMM, ``m`` and ``k`` each at least 128, as a short M runs
+    one zero-filled 64-row tile (``tcgen05_shape_rejected``). The planner
+    asks it for an N of 2 to 4 whose N block may be 8 wide
+    (``_n_block_admits``) and whose scalar-fallback block is narrower
+    than 8 columns (an N of 5 to 7 rounds up to the 8-column tile anyway),
+    and searches that tile where TMA loads B and the kernel's K block can be
+    ``TCGEN05_SMALL_N_MIN_K_BYTES`` deep."""
+    return (
+        n < tcgen05_min_n(dtype)
+        and dtype in (torch.bfloat16, torch.float16)
+        and m >= 128
+        and k >= 128
+    )
+
+
+# The K tile depth, in bytes, the zero-filled 8-column tile of a small N
+# searches from: CuTe refuses an 8-column K-major B stage of 32-byte rows
+# (``cute_mma``: "tcgen05 K-major B TMA with block_n=8 needs block_k *
+# itemsize >= 64").
+TCGEN05_SMALL_N_MIN_K_BYTES = 64
+
+
+def _k_block_reaches(
+    env: CompileEnvironment, k: int | torch.SymInt, minimum: int
+) -> bool:
+    """Whether a matmul's K tile, of size ``k`` (an operand tile's K extent),
+    can be ``minimum`` deep: a K block whose range reaches it (a fixed
+    integer ``block_size=`` at least that, an ``hl.register_block_size``
+    range or the extent's power of two up to it), or a static K taken
+    whole."""
+    block_id = env.get_block_id(k)
+    if block_id is None:
+        static_k = _static_dim_value(env, k)
+        return static_k is not None and static_k >= minimum
+    try:
+        spec = env.config_spec.block_sizes.block_id_lookup(block_id)
+    except KeyError:
+        source = env.block_sizes[block_id].block_size_source
+        return (
+            isinstance(source, FixedBlockSizeSource)
+            and isinstance(source.value, int)
+            and source.value >= minimum
+        )
+    return spec.max_size >= minimum
+
+
+def _n_block_admits(env: CompileEnvironment, n: int | torch.SymInt, width: int) -> bool:
+    """Whether a matmul's N tile, of size ``n`` (an operand tile's N extent),
+    can be ``width`` wide: an N block left to the search, one registered
+    (``hl.register_block_size``) over a range holding ``width``, or one fixed
+    at that integer ``block_size=``. A registered range bounds the search,
+    and the block size may size the kernel's allocations, so a range that
+    leaves ``width`` out (``hl.register_block_size(4, 4)``) keeps its tiles."""
+    block_id = env.get_block_id(n)
+    if block_id is None:
+        return False
+    try:
+        spec = env.config_spec.block_sizes.block_id_lookup(block_id)
+    except KeyError:
+        source = env.block_sizes[block_id].block_size_source
+        return (
+            isinstance(source, FixedBlockSizeSource)
+            and isinstance(source.value, int)
+            and source.value == width
+        )
+    bounds = spec.registered_bounds
+    return bounds is None or bounds[0] <= width <= bounds[1]
 
 
 def tcgen05_shape_rejected(
@@ -204,6 +278,10 @@ class CuteTcgen05SearchPlan:
     # register-MMA family runs the kernel and the search offers that family
     # alone.
     tcgen05_family_admitted: bool = True
+    # True when the search takes a small N's zero-filled tcgen05 tile
+    # (``tcgen05_small_n_zero_fills``) over ``min_search_n``, the scalar
+    # fallback's block, which stays the floor a provided config keeps.
+    small_n_zero_fills: bool = False
 
 
 @dataclasses.dataclass(frozen=True)
@@ -406,6 +484,54 @@ def _plan_cute_tcgen05_search_candidate(
         min_search_n = 1 << (static_n - 1).bit_length()
     else:
         min_search_n = min_tcgen05_n
+    # A 16-bit N of 2 to 4 columns, whose scalar-fallback block above is
+    # narrower than the narrowest tcgen05 N tile (5 to 7 round up to 8
+    # columns anyway), runs one zero-filled 8-column tile on the flat
+    # pipeline, whose edge TMA fills the B rows past N with zeros and whose
+    # store skips the output columns past it, as a short M runs one
+    # zero-filled 64-row tile (``tcgen05_shape_rejected``) -- where the GEMM
+    # is memory-bound, M and K each at least 128. helion.inductor's
+    # transposed GEMV (bf16 4x4096x4096 with a K-major b, out.T = b.T @ a.T,
+    # N = 4): the 8-column tile
+    #     for tile_x, tile_y in hl.tile([4096, 4]):  # [64, 8, 128]: 64 CTAs
+    #         ...
+    #             tmp1 = in1[tile_r, tile_y]  # a.T: an 8 x 128 box, rows 4-7 zero
+    # runs 8.48 us (GB300, 1.06 of cuBLAS's split-K kernel); the scalar
+    # fallback's 4-column block ([64, 4, 16]) runs SIMT, 206 us.
+    # The search and the default take that tile (``enable_cute_tcgen05_search``
+    # raises the N search floor to it and the K one to
+    # ``TCGEN05_SMALL_N_MIN_K_BYTES``) where the kernel's K block reaches
+    # that depth; one that cannot (``hl.register_block_size(16, 16)``) keeps
+    # the scalar fallback's search, its only working tiles. So does a kernel
+    # whose N block cannot be 8 wide (``_n_block_admits``): a registered
+    # range that leaves 8 out (``hl.register_block_size(4, 4)``, a bound on
+    # the search whose value may size the kernel's allocations) or a fixed
+    # ``block_size=`` other than 8. The block floor stays the scalar
+    # fallback's, so a provided config keeps its tiles: a block_n of 2 or 4
+    # runs the SIMT dot it ran before, where raising it to 8 would turn
+    # [64, 4, 16] into the 32-byte K-major B stage CuTe refuses.
+    # Only a B that TMA loads takes the tile (the TensorMap rule on its
+    # static layout, ``stage_aligned_operands._tma_aligned``): an N-major B
+    # of 8-byte rows (x @ w, w (K, 4) row-major) would run it on the scalar
+    # shared-memory producer, which was not measured, and keeps the scalar
+    # fallback. (The fake operands sit at storage offset 0: a base the bound
+    # input misaligns is not visible here and runs the tile on that
+    # producer.)
+    from ..stage_aligned_operands import _tma_aligned
+
+    small_n_zero_fills = (
+        min_search_n < min_tcgen05_n
+        and static_m is not None
+        and static_n is not None
+        and static_k is not None
+        and tcgen05_small_n_zero_fills(static_m, static_n, static_k, lhs.dtype)
+        and not has_leading_passthrough
+        and env.settings.cute_flat_edge_tma
+        and rhs_source is not None
+        and _tma_aligned(rhs_source)
+        and _k_block_reaches(env, k, TCGEN05_SMALL_N_MIN_K_BYTES // lhs.dtype.itemsize)
+        and _n_block_admits(env, n, min_tcgen05_n)
+    )
     leading_work_multiplier = 1
     if has_leading_passthrough:
         leading_operand = lhs if lhs.ndim == 3 else rhs
@@ -539,6 +665,7 @@ def _plan_cute_tcgen05_search_candidate(
             min_search_n=min_search_n,
             warp_mma_admitted=warp_mma_admitted,
             tcgen05_family_admitted=not operand_casts,
+            small_n_zero_fills=small_n_zero_fills,
         ),
         required_specialized_vars=frozen_required_specialized_vars,
         guards_complete=True,
@@ -628,6 +755,8 @@ def enable_cute_tcgen05_search(
     # M whole in one-CTA tiles keeps the one-CTA N-edge family's schedules,
     # and a K tail on both edges is the edge + K-tail family's shape.
     output_edge_shape = False
+    # (whether M is ragged in the search's M tiles)
+    m_edge = False
     # the K tile ceiling before an output edge's whole-K cap below
     flat_max_search_k = max_search_k
     if static_m is not None and static_n is not None and static_k is not None:
@@ -707,6 +836,7 @@ def enable_cute_tcgen05_search(
     if static_m is None or static_n is None or static_k is None:
         allow_whole_k_persistent_pid_types = False
         allow_small_n_persistent_pid_types = False
+        allow_k_tail_persistent_pid_types = False
         allow_full_tile_cluster_m2_search = False
         allow_edge_cluster_m2_search = False
         allow_fp8_small_grid_cluster_m2_search = False
@@ -726,6 +856,20 @@ def enable_cute_tcgen05_search(
             and 0 < static_n < max_search_n
             and static_m % max_search_m == 0
             and static_k % max_search_k == 0
+        )
+        # A 16-bit K tail over whole output tiles runs the persistent one-CTA
+        # kernel, whose role-local producer issues the partial last K tile as
+        # a whole box (``cute_mma``'s ``tcgen05_preserve_tma_for_one_cta_k_tail``);
+        # without it the search ran only flat tiles. helion.inductor's
+        # transposed bf16 128x768x1000 with b stored [K, N] (768 x 128, K =
+        # 7 x 128 + 104), GB300, of cuBLAS: flat [64, 16, 128] 0.900, the same
+        # tile persistent 0.935.
+        allow_k_tail_persistent_pid_types = (
+            static_k % max_search_k != 0
+            and static_m % min(max_search_m, TCGEN05_ONE_CTA_MAX_BLOCK_M) == 0
+            and static_n % max_search_n == 0
+            and lhs.dtype in (torch.bfloat16, torch.float16)
+            and not has_leading_passthrough
         )
         allow_full_tile_cluster_m2_search = (
             allow_whole_k_persistent_pid_types
@@ -761,9 +905,20 @@ def enable_cute_tcgen05_search(
             # the one-wave two-CTA tiles run whole M tiles, or a 16-bit
             # output edge's partial last M tile, which the pair's TMA store
             # clips (bf16 1000x2304x2048: 72 256x128 pairs, one per SM pair,
-            # 0.97 of cuBLAS against 0.77 for the flat one-CTA winner)
+            # 0.97 of cuBLAS against 0.77 for the flat one-CTA winner), and
+            # whole N tiles, or a single N edge's partial last N tile (M
+            # whole in the search's M tiles), which it clips too: the
+            # transposed bf16 1000x1024x2048 (out.T 1024 x 1000) runs 72
+            # pairs of 128x112 (``dense_aligned_n_block_ms``), 0.96 of
+            # cuBLAS, where without this the search ran only the flat
+            # one-CTA pipeline (16 pairs of 256x256 are under the
+            # quarter-wave gate below). ``transposed_pair_tile_gain``
+            # prices that pair on these grids only.
             and (static_m % TCGEN05_TWO_CTA_BLOCK_M == 0 or output_edge_shape)
-            and static_n % min(TCGEN05_TWO_CTA_ONE_WAVE_BLOCK_NS) == 0
+            and (
+                static_n % min(TCGEN05_TWO_CTA_ONE_WAVE_BLOCK_NS) == 0
+                or (output_edge_shape and not m_edge)
+            )
             and plan.leading_work_multiplier
             * -(-static_m // TCGEN05_TWO_CTA_BLOCK_M)
             * -(-static_n // TCGEN05_TWO_CTA_BLOCK_N)
@@ -902,7 +1057,9 @@ def enable_cute_tcgen05_search(
     surface.narrow_autotune_to_validated_configs(
         spec.tcgen05,
         allow_persistent_pid_types=(
-            allow_whole_k_persistent_pid_types or allow_small_n_persistent_pid_types
+            allow_whole_k_persistent_pid_types
+            or allow_small_n_persistent_pid_types
+            or allow_k_tail_persistent_pid_types
         ),
         enable_cluster_m2_search=allow_cluster_m2_search,
         cluster_m2_static_k=static_k if allow_cluster_m2_search else None,
@@ -962,3 +1119,22 @@ def enable_cute_tcgen05_search(
                     block_spec.default_size = max(
                         block_spec._fragment(spec).default(), floor
                     )
+    if plan.small_n_zero_fills:
+        # A small N's zero-filled tile (``_plan_cute_tcgen05_search_candidate``)
+        # raises the search floors only, so the default and the search take
+        # it and a provided config keeps its tiles: the 8-column N tile, past
+        # the N extent's power of two, and the K tiles that feed it a K-major
+        # B (``TCGEN05_SMALL_N_MIN_K_BYTES``; the planner proved the K block
+        # reaches them and the N block's range holds the 8-column tile).
+        for overshoots, shape, search_floor in (
+            (True, plan.n, tcgen05_min_n(lhs.dtype)),
+            (False, plan.k, TCGEN05_SMALL_N_MIN_K_BYTES // lhs.dtype.itemsize),
+        ):
+            block_idx = env.get_block_id(shape)
+            if block_idx is None:
+                continue
+            with contextlib.suppress(KeyError):
+                block_spec = spec.block_sizes.block_id_lookup(block_idx)
+                if overshoots:
+                    block_spec.allow_overshoot(search_floor)
+                block_spec.autotuner_min = max(block_spec.autotuner_min, search_floor)

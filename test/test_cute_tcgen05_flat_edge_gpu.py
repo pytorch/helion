@@ -751,12 +751,18 @@ class TestCuteTcgen05RaggedTwoCtaSearch(RefEagerTestDisabled, TestCase):
         # earlier ones in the C ring: 76 256x112 tiles give most CTAs one
         # (staged) tile, 150 256x176 tiles most CTAs one of each, and 80
         # 256x208 tiles (partial in N) a few CTAs two. The 256x256 pair over
-        # whole N and K tiles stores its clipped tile through (128, 32)
-        # subtiles, as whole tiles do. The output starts as NaN, so a tile
-        # left unstored fails the check.
+        # whole K tiles stores its clipped tiles through (128, 32) subtiles,
+        # as whole tiles do, over a partial last N tile too where its CTAs run
+        # more than one tile over a K loop past the tile's fixed cost (8192 x
+        # 1000 = 32 x 3.9 tiles over eight K blocks), and so does the 256x192
+        # pair (1000 x 4000 = 4 x 20.8) at the seven AB stages that ring
+        # leaves room for: rounds wholly past N store nothing. The output
+        # starts as NaN, so a tile left unstored fails the check.
         cases = (
             ((1000, 2304, 256), [256, 128, 64], 0, "auto", 4),
             ((1000, 2048, 256), [256, 256, 64], 0, "two", 4),
+            ((8192, 1000, 512), [256, 256, 64], 0, "two", 4),
+            ((1000, 4000, 512), [256, 256, 64], 192, "two", 7),
             ((1000, 2048, 256), [256, 128, 64], 112, "two", 4),
             ((1000, 2880, 256), [256, 256, 64], 160, "two", 4),
             ((1000, 2560, 256), [256, 256, 64], 144, "two", 4),
@@ -787,10 +793,10 @@ class TestCuteTcgen05RaggedTwoCtaSearch(RefEagerTestDisabled, TestCase):
             self.assertIn(f"CtaGroup.TWO, (256, {physical})", code)
             if physical // 2 % 16:
                 self.assertIn("sB_tma_layout = cute.select(sB_layout", code)
-            if physical in (144, 240, 256):
+            if physical in (144, 192, 240, 256):
                 self.assertIn(
                     "tcgen05_store_epi_tile = (cute.make_layout(128), "
-                    f"cute.make_layout({32 if physical == 256 else 48}))",
+                    f"cute.make_layout({48 if physical % 32 else 32}))",
                     code,
                 )
             self.assertEqual(
@@ -917,6 +923,179 @@ class TestCuteTcgen05RaggedTwoCtaSearch(RefEagerTestDisabled, TestCase):
             a.float() @ b.float() + residual,
             rtol=1e-3,
             atol=1e-2,
+        )
+
+    def test_two_ab_load_warps_match_torch(self) -> None:
+        # ``tcgen05_warp_spec_ab_load_warps=2``: warps 5 and 6 walk one rolled
+        # K loop and issue alternate k-blocks into the shared AB ring, on the
+        # autotune-off default pairs: one tile per CTA over a partial last M
+        # tile with an odd K-block count (1000x512x2880, 128x64 pair, 45
+        # k-blocks: the warps' shares differ), the 13-stage 128x128 pair
+        # (1000x1024x2048), a K tail the last box zero-fills (8192x240x240,
+        # 128x128 pair) and several tiles per CTA (4096x4096x448, 256 tiles
+        # of 256x256 on 76 SM pairs: the ring state walks on into the next
+        # tile's 7 k-blocks); and one tile per CTA over whole tiles
+        # (1024x1024x2048: the TMA-load role hoisted ahead of the init
+        # rendezvous, which both A/B-load warps join).
+        for m, n, k in (
+            (1000, 512, 2880),
+            (1000, 1024, 2048),
+            (8192, 240, 240),
+            (4096, 4096, 448),
+            (1024, 1024, 2048),
+        ):
+            a = torch.randn(m, k, device=DEVICE, dtype=torch.bfloat16)
+            b = torch.randn(n, k, device=DEVICE, dtype=torch.bfloat16).T
+            out = torch.zeros(m, n, device=DEVICE, dtype=torch.bfloat16)
+            bound = plain_mm_into.bind((a, b, out))
+            values = dict(bound.config_spec.default_config().config)
+            self.assertEqual(values["tcgen05_cluster_m"], 2)
+            values["tcgen05_warp_spec_ab_load_warps"] = 2
+            # (the flat 8-warp role layout keeps one A/B-load warp)
+            values["tcgen05_flat_role_coordinates"] = False
+            config = helion.Config(**values)
+            code = bound.to_code(config)
+            self.assertIn("block=(32, 7, 1)", code)
+            self.assertIn("% cutlass.Int32(2) == tcgen05_ab_load_rank:", code)
+            bound.set_config(config)
+            bound(a, b, out)
+            torch.testing.assert_close(
+                out, (a.float() @ b.float()).to(out.dtype), rtol=1e-2, atol=1e-1
+            )
+        # The aligned width 112 (1000x2048x2304, 256x112 pair: an odd count
+        # of 8-row swizzle atoms per CTA, the stage-0 ``select`` B box).
+        a = torch.randn(1000, 2304, device=DEVICE, dtype=torch.bfloat16)
+        b = torch.randn(2048, 2304, device=DEVICE, dtype=torch.bfloat16).T
+        out = torch.zeros(1000, 2048, device=DEVICE, dtype=torch.bfloat16)
+        bound = plain_mm_into.bind((a, b, out))
+        config = helion.Config(
+            **{
+                **dense_aligned_n_defaults(),
+                "tcgen05_tile_n": 112,
+                "block_sizes": [256, 128, 64],
+                "pid_type": "persistent_interleaved",
+                "tcgen05_ab_stages": 9,
+                "tcgen05_c_stages": 2,
+                "tcgen05_warp_spec_ab_load_warps": 2,
+            }
+        )
+        self.assertIn(
+            "% cutlass.Int32(2) == tcgen05_ab_load_rank:", bound.to_code(config)
+        )
+        bound.set_config(config)
+        bound(a, b, out)
+        torch.testing.assert_close(
+            out, (a.float() @ b.float()).to(out.dtype), rtol=1e-2, atol=1e-1
+        )
+
+    @unittest.skipUnless(_promotes_b200_defaults(), "pins B200 default tiles")
+    def test_seventeen_stage_pair_ring_matches_torch(self) -> None:
+        # The 128x64 bf16 pair's ring fills shared memory at 17 stages
+        # (``TCGEN05_PAIRED_MAX_AB_STAGES``): the autotune-off default of
+        # 1000x512x2880 (45 k-blocks, a partial last M tile), with one and two
+        # A/B-load warps (an odd ring: a warp's slots change every lap), and
+        # an M-major A / N-major B product (768x768x2048, x.T @ y).
+        a = torch.randn(1000, 2880, device=DEVICE, dtype=torch.bfloat16)
+        b = torch.randn(512, 2880, device=DEVICE, dtype=torch.bfloat16).T
+        out = torch.zeros(1000, 512, device=DEVICE, dtype=torch.bfloat16)
+        bound = plain_mm_into.bind((a, b, out))
+        values = dict(bound.config_spec.default_config().config)
+        self.assertEqual(values["block_sizes"][:3], [128, 64, 64])
+        self.assertEqual(values["tcgen05_ab_stages"], 17)
+        for warps in (1, 2):
+            config = helion.Config(
+                **{**values, "tcgen05_warp_spec_ab_load_warps": warps}
+            )
+            self.assertIn("num_stages=17", bound.to_code(config))
+            out.zero_()
+            bound.set_config(config)
+            bound(a, b, out)
+            torch.testing.assert_close(
+                out, (a.float() @ b.float()).to(out.dtype), rtol=1e-2, atol=1e-1
+            )
+        x = torch.randn(2048, 768, device=DEVICE, dtype=torch.bfloat16).T
+        y = torch.randn(2048, 768, device=DEVICE, dtype=torch.bfloat16)
+        out = torch.zeros(768, 768, device=DEVICE, dtype=torch.bfloat16)
+        bound = plain_mm_into.bind((x, y, out))
+        config = helion.Config(
+            **{
+                **dict(bound.config_spec.default_config().config),
+                "block_sizes": [128, 64, 64],
+                "tcgen05_cluster_m": 2,
+                "tcgen05_cta_group": "two",
+                "pid_type": "persistent_interleaved",
+                "tcgen05_ab_stages": 17,
+                "tcgen05_c_stages": 2,
+            }
+        )
+        self.assertIn("num_stages=17", bound.to_code(config))
+        bound.set_config(config)
+        bound(x, y, out)
+        torch.testing.assert_close(
+            out, (x.float() @ y.float()).to(out.dtype), rtol=1e-2, atol=1e-1
+        )
+
+    def test_transposed_product_stages_the_swapped_pairs_last_tile(self) -> None:
+        # helion.inductor's transposed product of a bf16 RC mm, out.T (n x m,
+        # column-major) = b.T @ a.T, on the aligned-N 128x112 pair (each CTA
+        # stages its 64-row C tile in the drained A ring): its autotune-off
+        # default over 1000x1024x2048 (72 pairs, one tile each) with one and
+        # two A/B-load warps, and 2000x1024x2048 (144 tiles on 76 SM pairs:
+        # the ring stores every tile but each CTA's last); and the 256x112
+        # pair over 1000x2048x2304 (72 pairs, a 128-row C tile per CTA).
+        pair = {
+            **dense_aligned_n_defaults(),
+            "tcgen05_tile_n": 112,
+            "pid_type": "persistent_interleaved",
+            "tcgen05_c_stages": 2,
+        }
+        pair128 = {**pair, "block_sizes": [128, 128, 64], "tcgen05_ab_stages": 14}
+        pair256 = {**pair, "block_sizes": [256, 128, 64], "tcgen05_ab_stages": 9}
+        for (m, n, k), warps, explicit in (
+            ((1000, 1024, 2048), 1, None),
+            ((1000, 1024, 2048), 2, None),
+            ((2000, 1024, 2048), 2, pair128),
+            ((1000, 2048, 2304), 1, pair256),
+        ):
+            a = torch.randn(m, k, device=DEVICE, dtype=torch.bfloat16)
+            b = torch.randn(n, k, device=DEVICE, dtype=torch.bfloat16).T
+            out = torch.zeros(m, n, device=DEVICE, dtype=torch.bfloat16)
+            args = (b.T, a.T, out.T)
+            bound = plain_mm_into.bind(args)
+            if explicit is not None:
+                values = dict(explicit)
+            else:
+                values = dict(bound.config_spec.default_config().config)
+                self.assertEqual(values["tcgen05_tile_n"], 112)
+                self.assertEqual(values["block_sizes"][0], 128)
+            values["tcgen05_warp_spec_ab_load_warps"] = warps
+            config = helion.Config(**values)
+            self.assertIn(
+                "if not tcgen05_epi_next_work.is_valid_tile:", bound.to_code(config)
+            )
+            bound.set_config(config)
+            bound(*args)
+            torch.testing.assert_close(
+                out, (a.float() @ b.float()).to(out.dtype), rtol=1e-2, atol=1e-1
+            )
+
+    def test_a_single_n_edge_default_runs_the_aligned_128_row_pair(self) -> None:
+        # A row-major product with one N edge over whole 256-row M tiles takes
+        # the one-wave search and its aligned 128-row pair as the autotune-off
+        # default (4608x224x1024: 72 pairs of 128x112, N 224 = 2 x 112, whose
+        # 144 CTAs fit one wave on a B200's 148 SMs as on GB300's 152; the 152
+        # CTAs of 4864 rows take the 224-wide pair on a B200).
+        a = torch.randn(4608, 1024, device=DEVICE, dtype=torch.bfloat16)
+        b = torch.randn(224, 1024, device=DEVICE, dtype=torch.bfloat16).T
+        out = torch.zeros(4608, 224, device=DEVICE, dtype=torch.bfloat16)
+        bound = plain_mm_into.bind((a, b, out))
+        config = bound.config_spec.default_config()
+        self.assertEqual(config.config["tcgen05_tile_n"], 112)
+        self.assertEqual(config.config["block_sizes"][0], 128)
+        bound.set_config(config)
+        bound(a, b, out)
+        torch.testing.assert_close(
+            out, (a.float() @ b.float()).to(out.dtype), rtol=1e-2, atol=1e-1
         )
 
     def test_the_wide_k_pair_seed_runs_a_k_tail(self) -> None:
@@ -1113,6 +1292,76 @@ def _fp8_bmm(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
             )
         out[tile_b, tile_m, tile_n] = acc.to(torch.bfloat16)
     return out
+
+
+@onlyBackends(["cute"])
+@skipIfNotCUDA()
+class TestCuteTcgen05SkinnyTransposedGpu(RefEagerTestDisabled, TestCase):
+    """helion.inductor's transposed skinny products: out.T = b.T @ a.T, an
+    N-contiguous output, the operands as views of a and b."""
+
+    def test_small_n_runs_one_zero_filled_tile(self) -> None:
+        # A transposed GEMV (N = 4): the default's 8-column tcgen05 tile,
+        # whose edge TMA zero-fills a.T's rows 4-7, over a flat and a
+        # split-K grid.
+        m, n, k = 4, 4096, 1024
+        a = torch.randn(m, k, device=DEVICE, dtype=torch.bfloat16)
+        b = torch.randn(n, k, device=DEVICE, dtype=torch.bfloat16).T
+        # the result row-major, so that out.T is Inductor's (1, n) buffer
+        out = torch.empty(m, n, device=DEVICE, dtype=torch.bfloat16)
+        bound = plain_mm_into.bind((b.T, a.T, out.T))
+        default = bound.config_spec.default_config()
+        self.assertEqual(default.config["block_sizes"][1], 8)
+        for split_k in (1, 4):
+            config = helion.Config(**{**default.config, "tcgen05_split_k": split_k})
+            bound.set_config(config)
+            out.fill_(float("nan"))
+            bound(b.T, a.T, out.T)
+            torch.testing.assert_close(
+                out, (a.float() @ b.float()).to(out.dtype), rtol=1e-2, atol=1e-1
+            )
+
+    def test_persistent_one_cta_k_tail(self) -> None:
+        # A K tail over whole output tiles (K = 1000) on persistent one-CTA
+        # tiles: the role-local producer issues the partial last K tile,
+        # which TMA zero-fills past K; an N-major b (b.T MN-major) and a
+        # K-major one, a 128- and a 256-deep K tile, SIMT and TMA stores, a
+        # plain store and Inductor's addmm epilogue (a bias over the
+        # kernel's N, the result's rows here).
+        m, n, k = 128, 768, 1000
+        a = torch.randn(m, k, device=DEVICE, dtype=torch.bfloat16)
+        bias = torch.randn(m, device=DEVICE, dtype=torch.bfloat16)
+        for b in (
+            torch.randn(k, n, device=DEVICE, dtype=torch.bfloat16),
+            torch.randn(n, k, device=DEVICE, dtype=torch.bfloat16).T,
+        ):
+            # the result row-major, so that out.T is Inductor's (1, n) buffer
+            out = torch.empty(m, n, device=DEVICE, dtype=torch.bfloat16)
+            acc = a.float() @ b.float()
+            for kernel, args, expected in (
+                (plain_mm_into, (b.T, a.T), acc),
+                (bias_mm_into, (b.T, a.T, bias), acc + bias.float()[:, None]),
+            ):
+                bound = kernel.bind((*args, out.T))
+                for bk, stages, store in ((128, 8, "direct"), (256, 4, "normal")):
+                    config = helion.Config(
+                        **{
+                            **bound.config_spec.default_config().config,
+                            "block_sizes": [64, 16, bk],
+                            "pid_type": "persistent_interleaved",
+                            "tcgen05_persistence_model": "static_persistent",
+                            "tcgen05_ab_stages": stages,
+                            "tcgen05_c_store_mode": store,
+                        }
+                    )
+                    code = bound.to_code(config)
+                    self.assertNotIn("_helion_tcgen05_persistent_total_tiles", code)
+                    bound.set_config(config)
+                    out.fill_(float("nan"))
+                    bound(*args, out.T)
+                    torch.testing.assert_close(
+                        out, expected.to(out.dtype), rtol=1e-2, atol=1e-1
+                    )
 
 
 @onlyBackends(["cute"])

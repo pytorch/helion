@@ -29,6 +29,7 @@ from ..epilogue_fanout import FANOUT_CONFIG_KEY
 from ..one_cta_pipeline import one_cta_pipeline_supported
 from ..pipeline_smem import TCGEN05_CTA_GROUP_CONFIG_KEY
 from ..pipeline_smem import max_pipeline_ab_stages
+from ..pipeline_smem import paired_pipeline_max_ab_stages
 from ..strategies import TCGEN05_BATCH_RASTER_CONFIG_KEY
 from ..strategies import TCGEN05_BATCH_RASTER_SLOWEST
 from ..strategies import TCGEN05_L2_SWIZZLE_SIZE_CONFIG_KEY
@@ -41,6 +42,7 @@ from ..strategies import TCGEN05_PERSISTENCE_MODEL_CONFIG_KEY
 from ..strategies import TCGEN05_PERSISTENT_GRID_CAP_CONFIG_KEY
 from ..strategies import TCGEN05_PERSISTENT_GRID_CAP_RESIDENT_CLUSTERS
 from ..strategies import TCGEN05_STRATEGY_CONFIG_KEY
+from ..strategies import TCGEN05_WARP_SPEC_AB_LOAD_WARPS_KEY
 from ..strategies import TCGEN05_WARP_SPEC_C_INPUT_WARPS_KEY
 from ..strategies import TCGEN05_WARP_SPEC_EPI_LOAD_WARPS_KEY
 from ..strategies import TCGEN05_WARP_SPEC_SCHEDULER_WARPS_KEY
@@ -93,6 +95,7 @@ from ..tcgen05_constants import TCGEN05_TWO_CTA_EDGE_K_TAIL_NARROW_BLOCK_N
 from ..tcgen05_constants import TCGEN05_TWO_CTA_EDGE_K_TAIL_NARROW_L2_GROUPING
 from ..tcgen05_constants import TCGEN05_TWO_CTA_EDGE_K_TAIL_SCHEDULER_L2_SWIZZLE_SIZE
 from ..tcgen05_constants import TCGEN05_TWO_CTA_ONE_WAVE_BLOCK_NS
+from ..tcgen05_constants import TCGEN05_TWO_CTA_PAIR128_ONE_WAVE_BLOCK_NS
 from ..tcgen05_constants import TCGEN05_TWO_CTA_SEED_L2_GROUPING
 from ..tcgen05_constants import TCGEN05_TWO_CTA_SEED_PID_TYPE
 from ..tcgen05_constants import tcgen05_direct_entry_stage_tuple_allowed
@@ -372,7 +375,7 @@ def _paired_pipeline_store_subtile_n(
     static full tiles, row-major output and TMA-store epilogue the plan
     also asks for.  ``None`` keeps ``pipeline_smem_bytes``' with-source
     tile, the only place that width is computed.  Codegen also renders
-    the 32 columns over a partial last M tile (whole N and K tiles, every
+    the 32 columns over a partial last M or N tile (whole K tiles, every
     tile on the TMA store); pricing it at the with-source tile there
     overstates its C ring, so the priced AB depth always fits: the same
     six stages beside two C stages (seven 32 KiB stages leave no room for
@@ -775,6 +778,7 @@ def _paired_pipeline_seed_configs(
                             bk=bk,
                             c_stages=2,
                             acc_stages=acc_stages,
+                            max_stages=paired_pipeline_max_ab_stages(pipeline_facts),
                             aux_load_placement=placement,
                             aux_load_mode=aux_mode,
                         )
@@ -923,7 +927,22 @@ def _small_grid_seed_configs(state: CuteTcgen05Config) -> list[Config]:
     while bk >= bk_fragment.low and (k % bk or bk % 16):
         bk //= 2
     if bk < bk_fragment.low or bk < 16:
-        return []
+        # No packet divides K: the persistent one-CTA kernel issues the
+        # partial last K tile as a whole box, which TMA zero-fills past K
+        # (``cute_mma``'s ``tcgen05_preserve_tma_for_one_cta_k_tail``), so
+        # the widest packet runs it. helion.inductor's transposed bf16
+        # 128x768x1000 with b stored [K, N] (768 x 128, K = 7 x 128 + 104)
+        # took only flat tiles without these seeds (0.90 of cuBLAS on
+        # GB300); the seeded persistent [64, 16, 128] tile runs 0.935.
+        bk = bk_fragment.high
+        if (
+            bk < 16
+            or bk % 16
+            # (the K-tail kernel runs rank-2 16-bit GEMMs only)
+            or state.matmul_has_leading_passthrough
+            or state.matmul_input_dtype not in (torch.float16, torch.bfloat16)
+        ):
+            return []
     rowvec_aux_only = (
         state.aux_kernel_detected and not state.exact_shape_aux_kernel_detected
     )
@@ -944,7 +963,8 @@ def _small_grid_seed_configs(state: CuteTcgen05Config) -> list[Config]:
             block_sizes = facts._matmul_seed_block_sizes(state, bm=bm, bn=bn, bk=bk)
             assert block_sizes is not None
             fit = smem.max_ab_stages_that_fit(state, bm=bm, bn=bn, bk=bk, cluster_m=1)
-            stages = max(1, min(k // bk, fit if fit > 0 else 2))
+            # (an AB ring as deep as the K loop, a partial last K tile included)
+            stages = max(1, min(-(-k // bk), fit if fit > 0 else 2))
             seed_config: dict[str, Any] = {
                 "block_sizes": block_sizes,
                 "pid_type": "persistent_interleaved",
@@ -1289,7 +1309,12 @@ def _one_wave_seed_configs(state: CuteTcgen05Config) -> list[Config]:
     seeds: list[Config] = []
 
     def emit(
-        bm: int, bn: int, cluster_m: int, cluster_n: int, cta_group: str = "auto"
+        bm: int,
+        bn: int,
+        cluster_m: int,
+        cluster_n: int,
+        cta_group: str = "auto",
+        ab_load_warps: int = 1,
     ) -> None:
         block_sizes = facts._matmul_seed_block_sizes(state, bm=bm, bn=bn, bk=bk)
         assert block_sizes is not None
@@ -1309,6 +1334,8 @@ def _one_wave_seed_configs(state: CuteTcgen05Config) -> list[Config]:
             "tcgen05_layout_strategy": "default",
             **dict.fromkeys(TCGEN05_LAYOUT_OVERRIDES_KEYS),
         }
+        if ab_load_warps != 1:
+            seed_config[TCGEN05_WARP_SPEC_AB_LOAD_WARPS_KEY] = ab_load_warps
         fit = (
             smem.pair_ab_stage_fit(
                 state, seed_config, bm=bm, bn=bn, bk=bk, cluster_m=cluster_m
@@ -1392,7 +1419,65 @@ def _one_wave_seed_configs(state: CuteTcgen05Config) -> list[Config]:
                 pair128 = (ctas, bn)
         if pair128 is not None and (two_cta is None or pair128[0] >= two_cta[0]):
             emit(128, pair128[1], 2, 1, cta_group="two")
+            if surface.shared_ring_producer_search_enabled(state):
+                # and its twin with two A/B-load warps sharing the ring
+                # (``cute_mma._build_shared_ring_producer``): the pair's
+                # stages carry 12-16 KB per CTA, which one warp issues more
+                # slowly than they arrive (bf16 1000x512x2880, 128x64: 0.86
+                # -> 0.99 of cuBLAS; 1000x1024x1024, 128x128: 0.95 -> 0.96).
+                emit(128, pair128[1], 2, 1, cta_group="two", ab_load_warps=2)
+        elif pair128 is None and n % min(TCGEN05_TWO_CTA_PAIR128_ONE_WAVE_BLOCK_NS):
+            # An N no pair width divides: the aligned-N family's 128-row
+            # pair where it runs one (``dense_aligned_n_block_ms``), at the
+            # searched width whose grid puts the most CTAs on the machine
+            # in one wave, clipping the last N tile, with the plan's deepest
+            # AB ring, and its two-warp twin. cuBLAS's swapped tile for the
+            # transposed bf16 1000x1024x2048 (out.T 1024 x 1000): 72 pairs
+            # of 128x112, fourteen AB stages, 0.96 of cuBLAS against 0.94
+            # for the 64 pairs of 128x128 as written (GB300, in one
+            # process; the search samples no 128-row pair without a seed).
+            aligned = _aligned_n_pair128_one_wave_seed(state)
+            if aligned is not None and (two_cta is None or aligned[0] >= two_cta[0]):
+                seeds.append(Config.from_dict(aligned[1]))
+                if surface.shared_ring_producer_search_enabled(state):
+                    seeds.append(
+                        Config.from_dict(
+                            aligned[1] | {TCGEN05_WARP_SPEC_AB_LOAD_WARPS_KEY: 2}
+                        )
+                    )
     return seeds
+
+
+def _aligned_n_pair128_one_wave_seed(
+    state: CuteTcgen05Config,
+) -> tuple[int, dict[str, Any]] | None:
+    """The aligned-N family's one-wave 128-row pair (``_one_wave_seed_configs``):
+    the searched physical width (``facts._dense_aligned_n_widths``) whose
+    grid of 128-row pair tiles puts the most CTAs on the machine without a
+    second wave, with the plan's deepest AB ring, and that CTA count; None
+    where the family runs no 128-row pair."""
+    extents = state.matmul_compile_time_static_extents
+    pair_m = TCGEN05_TWO_CTA_BLOCK_M // 2
+    if (
+        extents is None
+        or any(value is None for value in extents)
+        or pair_m not in facts._dense_aligned_n_block_ms(state)
+    ):
+        return None
+    m, n, _k = cast("tuple[int, int, int]", extents)
+    batch = state.matmul_leading_work_multiplier
+    best: tuple[int, int] | None = None
+    for width in facts._dense_aligned_n_widths(state):
+        ctas = batch * -(-m // pair_m) * -(-n // width) * 2
+        if ctas <= state.device_sm_count and (best is None or ctas > best[0]):
+            best = (ctas, width)
+    if best is None:
+        return None
+    for values, plan in facts._dense_aligned_n_proved_plans(
+        state, best[1], block_m=pair_m
+    ):
+        return best[0], values | {"tcgen05_ab_stages": plan.max_ab_stages}
+    return None
 
 
 def _multi_tile_two_cta_seed_configs(state: CuteTcgen05Config) -> list[Config]:

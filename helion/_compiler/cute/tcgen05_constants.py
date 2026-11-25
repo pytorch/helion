@@ -179,6 +179,36 @@ TCGEN05_PAIR_TILE_STREAM_RATIO = 0.44
 TCGEN05_PAIR_TILE_FIXED_KBLOCKS = 4.5
 TCGEN05_ALIGNED_N_CLIPPED_MIN_GAIN = 0.15
 TCGEN05_ALIGNED_N_CLIPPED_SEARCH_MIN_GAIN = 0.0
+
+
+def tcgen05_plain_narrow_subtile_covers_n(
+    m: int, n: int, k: int, *, bm: int, bn: int, bk: int, sm_pairs: int
+) -> bool:
+    """Whether the plain narrow ``(128, TCGEN05_PLAIN_NARROW_SUBTILE_N)``
+    subtile takes a ``bm`` x ``bn`` pair tile over an ``m`` x ``n`` x ``k``
+    product: whole N tiles, or a partial last N tile where a tile's epilogue
+    hides behind the next tile's mainloop, so the narrower C ring pays (it
+    leaves the 192-wide pair its seventh AB stage, and its 8 KiB rounds
+    interleave with the mainloop's loads). That takes CTAs with a next tile
+    (more tiles than ``sm_pairs`` CTA pairs) and a K loop longer than the
+    pair tile's fixed prologue and epilogue (``TCGEN05_PAIR_TILE_FIXED_KBLOCKS``
+    K blocks); otherwise the epilogue is on the critical path and twice the
+    rounds cost more than they save. bf16, GB300, the old and new kernel of
+    one config in one process, of cuBLAS: 1000x10240x2560 (216 192-wide
+    tiles, 40 K blocks) 0.970 -> 1.005 at seven AB stages, 4096x8008x2560
+    (512 256-wide tiles) 0.980 -> 0.993; but 4096x1000xK (64 256-wide tiles
+    on 76 pairs, one wave) loses at every K from 64 to 2048 (-0.6..-3.4%),
+    and the batched 768 x 200x200x64 (one K block per 200-of-256-column
+    tile) reads 1.043 -> 0.950. ``m`` and ``n`` are one matrix's: a batched
+    product counts one matrix's tiles, so a batch of 300 200x200x512
+    matrices (300 pair tiles) keeps CuTe's tile too (not measured).
+    """
+    tiles = -(-m // bm) * -(-n // bn)
+    return n % bn == 0 or (
+        k // bk > TCGEN05_PAIR_TILE_FIXED_KBLOCKS and tiles > sm_pairs
+    )
+
+
 # The modeled gain (``dense_aligned_n.transposed_pair_tile_gain``) from which
 # helion.inductor lowers a 16-bit matmul as its transposed product. GB300,
 # bf16 RC, cuBLAS time / Helion time, both orientations autotuned in one
@@ -526,12 +556,15 @@ TCGEN05_REGION_PID_TYPE_CHOICES: tuple[str, ...] = (
     "persistent_blocked",
     "persistent_interleaved",
 )
-# The monolithic role-local schedule every proved tcgen05 family pins: one
-# AB-load (TMA) warp, one MMA warp, four epilogue warps and no scheduler,
+# The monolithic role-local schedule the proved tcgen05 families start from:
+# one AB-load (TMA) warp, one MMA warp, four epilogue warps and no scheduler,
 # C-input, epilogue-load or store warps, static persistent, the default
 # layout.  Each family's surface -- ``one_cta_pipeline_defaults``,
 # ``n_edge_cluster_schedule_defaults``, the two-CTA region projection below,
-# the fanout and row-union admission -- composes its own pins over it.
+# the fanout and row-union admission -- composes its own pins over it.  A
+# plain static GEMM's search also samples two AB-load warps
+# (``surface.shared_ring_producer_search_enabled``), which the aligned-N plan
+# admits.
 TCGEN05_ROLE_LOCAL_SCHEDULE: tuple[tuple[str, object], ...] = (
     ("tcgen05_strategy", "role_local_monolithic"),
     ("tcgen05_persistence_model", "static_persistent"),
