@@ -2298,7 +2298,6 @@ class TestExamples(RefEagerTestBase, TestCase):
                 **config,
             )
 
-    @xfailIfPallas("int4 unpacking not supported on pallas")
     def test_int4_gemm_two_pass(self):
         M, K, N = 256, 512, 256
         mod = import_path(EXAMPLES_DIR / "int4_gemm.py")
