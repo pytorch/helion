@@ -222,6 +222,7 @@ from .tcgen05_constants import TCGEN05_LARGE_BN_PROOF_PID_TYPE
 from .tcgen05_constants import TCGEN05_LARGE_BN_PROOF_PROBLEM_SHAPE
 from .tcgen05_constants import TCGEN05_ODD_WIDTH_SUBTILE_N
 from .tcgen05_constants import TCGEN05_ONE_CTA_MAX_BLOCK_M
+from .tcgen05_constants import TCGEN05_OPERAND_L2_PREFETCH_MAX_LINES
 from .tcgen05_constants import TCGEN05_PLAIN_NARROW_SUBTILE_BLOCK_NS
 from .tcgen05_constants import TCGEN05_PLAIN_NARROW_SUBTILE_N
 from .tcgen05_constants import TCGEN05_RADIX_STORE_BOX_M
@@ -3415,6 +3416,25 @@ def _tcgen05_pid_initializes_epi_role_tile_counter(pid: object) -> bool:
             _tcgen05_pid_initializes_epi_role_tile_counter(case) for case in pid.cases
         )
     return False
+
+
+def _tcgen05_swizzle_pads_schedule(
+    pid: object, *, swizzle: int, cluster_n: int
+) -> bool:
+    """Whether the tcgen05 persistent scheduler of PID strategy ``pid`` pads
+    its dim 1 under an L2 raster swizzle of ``swizzle`` clusters
+    (``Tcgen05PersistentProgramIDs.tcgen05_swizzle_pads_dim1``); a swizzle
+    under any other strategy counts as padding."""
+    from ..program_id import L2GroupingProgramIDs
+    from .tcgen05.scheduler_pids import Tcgen05PersistentProgramIDs
+
+    if swizzle == 1:
+        return False
+    if isinstance(pid, L2GroupingProgramIDs):
+        pid = pid.parent_strategy
+    return not isinstance(
+        pid, Tcgen05PersistentProgramIDs
+    ) or pid.tcgen05_swizzle_pads_dim1(swizzle, cluster_n=cluster_n)
 
 
 def _has_mma_operands(
@@ -7081,6 +7101,362 @@ def _build_shared_ring_producer(
         + emit_pipeline_advance(args.tma_producer_state, indent="        ")
     )
     return statement_from_string(src)
+
+
+def _tcgen05_operand_l2_prefetch_lines(plan: Tcgen05PipelinePlan) -> int:
+    """The 128-byte lines per operand row a one-tile CTA L2-prefetches ahead
+    of its dependent-launch wait (``_build_operand_l2_prefetch``): every line
+    of its K extent where its A and B rows hold at most
+    ``TCGEN05_OPERAND_L2_PREFETCH_MAX_LINES`` lines in all, else none.
+
+    With the previous grid's CTAs filling the SMs, most of a grid's CTAs
+    start ~400 ns before the dependency releases (as SMs free up), and their
+    first loads then wait on DRAM for ~800 ns. Lines prefetched in that
+    window land in L2 instead: one SM pulls ~180 GB/s, so ~72-96 KB per CTA
+    arrive before the release, and a footprint that fits runs its whole K
+    loop from L2 (bf16, GB300, CUDA graphs over cold inputs, in one process
+    against cuBLAS: 1500x384x384, 128x64 pairs with 576 lines per CTA, 0.95
+    -> 1.08; 768x768x384 0.95 -> 1.06; 1500x384x256 +8%, 2000x384x384 +5%).
+    A larger footprint competes with the loads it was meant to precede:
+    1000x1024x512 (1024 lines) -0.4%, 1500x384x768 (1152) -3.6%,
+    1000x1024x1024 (2048) -8%, and so does a partial prefetch of a long K
+    (1000x1024x2048, the first 4 lines: -0.8%).
+    """
+    if not plan.tcgen05_mma_a_k_major or not plan.tcgen05_mma_b_k_major:
+        # An M-major A and an N-major B prefetch along K instead
+        # (``_tcgen05_operand_l2_prefetch_lines_mn_major``); mixed majors
+        # take none.
+        return _tcgen05_operand_l2_prefetch_lines_mn_major(plan)
+    lines = -(-plan.k_total_size * plan.input_dtype.itemsize // 128)
+    pair = 2 if plan.tcgen05_is_two_cta else 1
+    rows = plan.tcgen05_mma_bm // pair + plan.tcgen05_mma_bn // pair
+    return lines if rows * lines <= TCGEN05_OPERAND_L2_PREFETCH_MAX_LINES else 0
+
+
+def _build_operand_l2_prefetch(
+    plan: Tcgen05PipelinePlan,
+    *,
+    lines: int,
+    load_warps: int,
+    load_rank: str | None,
+    names: Callable[[str], str],
+) -> ast.stmt:
+    """The A/B-load warps prefetch the CTA's operand rows into L2
+    (``_tcgen05_operand_l2_prefetch_lines``). bf16 1500x384x384 on the
+    128x64 pair, one A/B-load warp (each CTA 64 A rows and 32 B rows of six
+    lines)::
+
+        tcgen05_l2_pf_rank = cute.arch.make_warp_uniform(
+            cute.arch.block_idx_in_cluster()
+        ) & cutlass.Int32(1)
+        tcgen05_l2_pf_lane = cute.arch.lane_idx()
+        for tcgen05_l2_pf_i in cutlass.range_constexpr(2):
+            tcgen05_l2_pf_row = tcgen05_l2_pf_lane + cutlass.Int32(32) * cutlass.Int32(
+                tcgen05_l2_pf_i
+            )
+            tcgen05_l2_pf_index = (
+                tile_offset_0
+                + tcgen05_l2_pf_rank * cutlass.Int32(64)
+                + tcgen05_l2_pf_row
+            )
+            if tcgen05_l2_pf_row < cutlass.Int32(
+                64
+            ) and tcgen05_l2_pf_index < cutlass.Int32(1500):
+                for tcgen05_l2_pf_k in cutlass.range_constexpr(6):
+                    cute.arch.prefetch(
+                        (
+                            in0.iterator
+                            + tcgen05_l2_pf_index * cutlass.Int64(in0.layout.stride[0])
+                            + cutlass.Int32(64) * cutlass.Int32(tcgen05_l2_pf_k)
+                        ).llvm_ptr,
+                        cache_level="L2",
+                    )
+        ...  # the same over the 32 B rows of in1 ([K, N] K-major: row n at
+        ...  # n * in1.layout.stride[1])
+
+    Each row starts at the operand's own row stride, not at K: a K-major
+    operand may be padded (``a[:, :384]`` of a 1500x512 tensor), where
+    ``index * 384`` would prefetch other rows and the padding.
+
+    The prefetch is a cache hint: L2 is the point of coherence, so a line
+    the previous grid writes after it was prefetched holds that write when
+    the loads after the wait read it.
+    """
+    if not plan.tcgen05_mma_a_k_major:
+        return _build_operand_l2_prefetch_mn_major(
+            plan, load_warps=load_warps, load_rank=load_rank, names=names
+        )
+    pair = 2 if plan.tcgen05_is_two_cta else 1
+    line_elems = 128 // plan.input_dtype.itemsize
+    rank = names("tcgen05_l2_pf_rank")
+    lane = names("tcgen05_l2_pf_lane")
+    threads = 32 * load_warps
+    src = [
+        f"{rank} = "
+        + (
+            "cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster()) & cutlass.Int32(1)"
+            if pair == 2
+            else "cutlass.Int32(0)"
+        ),
+        f"{lane} = cute.arch.lane_idx()"
+        + (f" + cutlass.Int32(32) * {load_rank}" if load_rank is not None else ""),
+    ]
+    # A is [M, K] and B [K, N], each K-major: the row strides are A's
+    # stride[0] and B's stride[1] in the logical order.  The emitted address
+    # reads the argument's layout, whose strides are in source order: an
+    # operand transposed inside the kernel steps its rows by the source dim
+    # its logical row dim comes from.  ``x[inner, rows].T`` with x [384, 1500]
+    # of strides (1, 384) (a K-major A) emits
+    #
+    #     cute.arch.prefetch((x.iterator + tcgen05_l2_pf_index *
+    #         cutlass.Int64(x.layout.stride[1]) + ...
+    #
+    # where ``x.layout.stride[0]`` (1) would step one element per row and
+    # prefetch the first rows' lines over and over.
+    analysis = plan.analysis
+
+    def _source_dim(info: _MmaOperandInfo | None, logical_dim: int) -> int:
+        order = None if info is None else info.source_to_logical_order
+        return logical_dim if order is None else order[logical_dim]
+
+    for tensor, row_stride, offset, extent, cta_rows in (
+        (
+            plan.lhs_arg_name,
+            _source_dim(None if analysis is None else analysis.lhs, 0),
+            plan.m_offset_var,
+            plan.m_size,
+            plan.tcgen05_mma_bm // pair,
+        ),
+        (
+            plan.rhs_arg_name,
+            _source_dim(None if analysis is None else analysis.rhs, 1),
+            plan.n_offset_var,
+            plan.n_size,
+            plan.tcgen05_mma_bn // pair,
+        ),
+    ):
+        i, row, index, k = (
+            names(f"tcgen05_l2_pf_{field}") for field in ("i", "row", "index", "k")
+        )
+        src += [
+            f"for {i} in cutlass.range_constexpr({-(-cta_rows // threads)}):",
+            f"    {row} = {lane} + cutlass.Int32({threads}) * cutlass.Int32({i})",
+            f"    {index} = {offset} + {rank} * cutlass.Int32({cta_rows}) + {row}",
+            f"    if {row} < cutlass.Int32({cta_rows}) and {index} < cutlass.Int32({extent}):",
+            f"        for {k} in cutlass.range_constexpr({lines}):",
+            (
+                f"            cute.arch.prefetch(({tensor}.iterator + {index} * "
+                f"cutlass.Int64({tensor}.layout.stride[{row_stride}]) + "
+                f"cutlass.Int32({line_elems}) * cutlass.Int32({k})).llvm_ptr, "
+                "cache_level='L2')"
+            ),
+        ]
+    return statement_from_string("if True:\n" + textwrap.indent("\n".join(src), "    "))
+
+
+def _mn_major_operand_segments(
+    plan: Tcgen05PipelinePlan,
+) -> tuple[tuple[str, str, int, int, int, int], ...] | None:
+    """Per operand of a GEMM with an M-major A and an N-major B: (tensor,
+    offset var, extent, the CTA's contiguous elements per K index, the
+    layout stride index that steps K, lines per K index), the footprint
+    ``_build_operand_l2_prefetch_mn_major`` prefetches; ``None`` for any
+    other pair of majors.
+
+    The CTA's elements of one K index are contiguous (64 rows of an M-major A
+    column or 64 columns of an N-major B row on a 128-row pair). They cover
+    ``ceil(bytes / 128)`` lines, plus one where the operand's K stride is not
+    a whole number of lines and the segment straddles a line boundary (bf16
+    A [1000, 128] with strides (1, 1000): 2000-byte columns, two lines each).
+    """
+    analysis = plan.analysis
+    if (
+        analysis is None
+        or plan.tcgen05_mma_a_k_major
+        or plan.tcgen05_mma_b_k_major
+        or analysis.lhs.matrix_major != "col"
+        or analysis.rhs.matrix_major != "row"
+        # An operand transposed inside the kernel (``x[k, m].T``): the
+        # emitted address reads the argument's layout, whose strides are in
+        # source order; with x [128, 1000] row-major, ``x.layout.stride[1]``
+        # is 1, so K would step one element instead of 1000 and the
+        # prefetch would pull other lines.
+        or analysis.lhs.source_to_logical_order is not None
+        or analysis.rhs.source_to_logical_order is not None
+    ):
+        return None
+    pair = 2 if plan.tcgen05_is_two_cta else 1
+    item_bytes = plan.input_dtype.itemsize
+    segments = []
+    # (A is [M, K] with M contiguous: K steps its stride[1]; B is [K, N] with
+    # N contiguous: K steps its stride[0])
+    for tensor, offset, extent, cta_elems, operand, k_axis in (
+        (
+            plan.lhs_arg_name,
+            plan.m_offset_var,
+            plan.m_size,
+            plan.tcgen05_mma_bm // pair,
+            analysis.lhs,
+            1,
+        ),
+        (
+            plan.rhs_arg_name,
+            plan.n_offset_var,
+            plan.n_size,
+            plan.tcgen05_mma_bn // pair,
+            analysis.rhs,
+            0,
+        ),
+    ):
+        k_stride = operand.logical_fake.stride(k_axis)
+        offset_elems = operand.logical_fake.storage_offset()
+        cta_bytes = cta_elems * item_bytes
+        lines = -(-cta_bytes // 128)
+        if (
+            type(k_stride) is not int
+            or type(offset_elems) is not int
+            or (k_stride * item_bytes) % 128
+            or (offset_elems * item_bytes) % 128
+            # the pair's second CTA starts cta_bytes into the tile: a 96-byte
+            # segment there spans bytes 96-191, two lines
+            or (pair == 2 and cta_bytes % 128 + cta_bytes > lines * 128)
+        ):
+            lines += 1
+        segments.append((tensor, offset, extent, cta_elems, k_axis, lines))
+    return tuple(segments)
+
+
+def _tcgen05_operand_l2_prefetch_lines_mn_major(plan: Tcgen05PipelinePlan) -> int:
+    """The 128-byte lines a one-tile CTA with an M-major A and an N-major B
+    prefetches into L2 (``_build_operand_l2_prefetch_mn_major``): its whole A
+    and B footprint where that holds at most
+    ``TCGEN05_OPERAND_L2_PREFETCH_MAX_LINES`` lines, else none (the window of
+    ``_tcgen05_operand_l2_prefetch_lines``)."""
+    segments = _mn_major_operand_segments(plan)
+    if segments is None:
+        return 0
+    lines = plan.k_total_size * sum(segment[-1] for segment in segments)
+    return lines if lines <= TCGEN05_OPERAND_L2_PREFETCH_MAX_LINES else 0
+
+
+def _build_operand_l2_prefetch_mn_major(
+    plan: Tcgen05PipelinePlan,
+    *,
+    load_warps: int,
+    load_rank: str | None,
+    names: Callable[[str], str],
+) -> ast.stmt:
+    """``_build_operand_l2_prefetch`` for an M-major A and an N-major B: the
+    A/B-load warps prefetch the CTA's footprint along K, each lane a K index
+    at a time (``_tcgen05_operand_l2_prefetch_lines_mn_major``). bf16
+    1000x768x128 (A [1000, 128] with strides (1, 1000), B [128, 768]
+    row-major) on the 128x128 pair, one A/B-load warp, each CTA 64 A rows and
+    64 B columns of 128 K indices::
+
+        tcgen05_l2_pf_rank = cute.arch.make_warp_uniform(
+            cute.arch.block_idx_in_cluster()
+        ) & cutlass.Int32(1)
+        tcgen05_l2_pf_lane = cute.arch.lane_idx()
+        tcgen05_l2_pf_base = tile_offset_0 + tcgen05_l2_pf_rank * cutlass.Int32(64)
+        # 2000-byte columns: the 64 rows straddle two lines; the second
+        # address is the segment's last row, clamped to the last row 999
+        tcgen05_l2_pf_point0 = tcgen05_l2_pf_base + cutlass.Int32(63)
+        if tcgen05_l2_pf_point0 > cutlass.Int32(999):
+            tcgen05_l2_pf_point0 = cutlass.Int32(999)
+        for tcgen05_l2_pf_i in cutlass.range_constexpr(4):
+            tcgen05_l2_pf_k = tcgen05_l2_pf_lane + cutlass.Int32(32) * cutlass.Int32(
+                tcgen05_l2_pf_i
+            )
+            if tcgen05_l2_pf_base < cutlass.Int32(1000):
+                cute.arch.prefetch(
+                    (
+                        in0.iterator
+                        + tcgen05_l2_pf_k * cutlass.Int64(in0.layout.stride[1])
+                        + tcgen05_l2_pf_base
+                    ).llvm_ptr,
+                    cache_level="L2",
+                )
+                cute.arch.prefetch(
+                    (
+                        in0.iterator
+                        + tcgen05_l2_pf_k * cutlass.Int64(in0.layout.stride[1])
+                        + tcgen05_l2_pf_point0
+                    ).llvm_ptr,
+                    cache_level="L2",
+                )
+        tcgen05_l2_pf_base_1 = tile_offset_1 + tcgen05_l2_pf_rank * cutlass.Int32(64)
+        for tcgen05_l2_pf_i_1 in cutlass.range_constexpr(4):
+            ...  # B: 1536-byte rows, one line per K index
+            if tcgen05_l2_pf_base_1 < cutlass.Int32(768):
+                cute.arch.prefetch(
+                    (
+                        in1.iterator
+                        + tcgen05_l2_pf_k_1 * cutlass.Int64(in1.layout.stride[0])
+                        + tcgen05_l2_pf_base_1
+                    ).llvm_ptr,
+                    cache_level="L2",
+                )
+
+    GB300, CUDA graphs over cold inputs, in one process against stock
+    Inductor (cuBLAS): 1000x768x128 0.967-0.971 -> 1.058. A K index steps
+    the operand's own stride (a padded operand prefetches its own lines).
+    The last element of a segment is clamped to the operand's extent, so no
+    address leaves the operand.
+    """
+    segments = _mn_major_operand_segments(plan)
+    assert segments is not None
+    pair = 2 if plan.tcgen05_is_two_cta else 1
+    line_elems = 128 // plan.input_dtype.itemsize
+    rank = names("tcgen05_l2_pf_rank")
+    lane = names("tcgen05_l2_pf_lane")
+    threads = 32 * load_warps
+    src = [
+        f"{rank} = "
+        + (
+            "cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster()) & cutlass.Int32(1)"
+            if pair == 2
+            else "cutlass.Int32(0)"
+        ),
+        f"{lane} = cute.arch.lane_idx()"
+        + (f" + cutlass.Int32(32) * {load_rank}" if load_rank is not None else ""),
+    ]
+    for tensor, offset, extent, cta_elems, k_axis, lines in segments:
+        base, i, k = (names(f"tcgen05_l2_pf_{field}") for field in ("base", "i", "k"))
+        src.append(f"{base} = {offset} + {rank} * cutlass.Int32({cta_elems})")
+        # Element offsets of the lines one K index touches: one per line from
+        # the segment start, then the segment's last element for the line a
+        # misaligned segment reaches past them; each past the first clamped
+        # to the operand's extent (a partial last tile).
+        aligned_lines = -(-cta_elems * plan.input_dtype.itemsize // 128)
+        offsets = [j * line_elems for j in range(1, aligned_lines)]
+        if lines > aligned_lines:
+            offsets.append(cta_elems - 1)
+        points = [base]
+        for j, element in enumerate(offsets):
+            point = names(f"tcgen05_l2_pf_point{j}")
+            src += [
+                f"{point} = {base} + cutlass.Int32({element})",
+                f"if {point} > cutlass.Int32({extent - 1}):",
+                f"    {point} = cutlass.Int32({extent - 1})",
+            ]
+            points.append(point)
+        src += [
+            f"for {i} in cutlass.range_constexpr({-(-plan.k_total_size // threads)}):",
+            f"    {k} = {lane} + cutlass.Int32({threads}) * cutlass.Int32({i})",
+            f"    if {base} < cutlass.Int32({extent})"
+            + (
+                f" and {k} < cutlass.Int32({plan.k_total_size}):"
+                if plan.k_total_size % threads
+                else ":"
+            ),
+            *(
+                f"        cute.arch.prefetch(({tensor}.iterator + {k} * "
+                f"cutlass.Int64({tensor}.layout.stride[{k_axis}]) + {point}).llvm_ptr, "
+                "cache_level='L2')"
+                for point in points
+            ),
+        ]
+    return statement_from_string("if True:\n" + textwrap.indent("\n".join(src), "    "))
 
 
 def _build_split_initial_prefetch(
@@ -12595,10 +12971,15 @@ def _emit_mma_pipeline(
                 "cutlass.pipeline.pipeline_init_wait("
                 f"cluster_shape_mn={plan.tcgen05_cluster_layout_vmnk})"
             )
-            if tcgen05_hoist_tma_role or tcgen05_hoist_row_union_tma_role:
+            if (
+                tcgen05_hoist_tma_role
+                or tcgen05_hoist_row_union_tma_role
+                or tcgen05_hoist_persistent_tma_role
+            ):
                 # The TMA-load warp's role block is moved right after the
                 # arrive and carries its own wait (ahead of its first stage
-                # on the one-shot kernel; in its role prelude, after the
+                # on the one-shot kernel and, guarded to the first tile, on
+                # the plain persistent kernel; in its role prelude, after the
                 # scheduler setup and ahead of the persistent loop, on the
                 # row-union kernel); every other warp waits here.
                 df.cute_state.tcgen05.tma_role_hoist_anchor = (
@@ -13054,6 +13435,9 @@ def _emit_mma_pipeline(
     tcgen05_free_tmem_in_epilogue = False
     tcgen05_one_shot_role_scheduler = False
     tcgen05_hoist_tma_role = False
+    tcgen05_hoist_persistent_tma_role = False
+    tcgen05_tma_wait_after_first_acquire = False
+    tcgen05_operand_l2_prefetch = 0
     # A/B-load warps sharing the role-local TMA producer
     # (``_build_shared_ring_producer``; ``tcgen05_warp_spec_ab_load_warps``).
     tcgen05_ab_load_warps = 1
@@ -13062,6 +13446,8 @@ def _emit_mma_pipeline(
     tcgen05_ab_load_warp = ""
     tcgen05_shared_ring_k_tiles = 0
     tcgen05_shared_ring_emitted = False
+    # Every CTA of the persistent grid runs at most one output tile.
+    tcgen05_one_tile_per_cta = False
     tcgen05_effective_scheduler_warps = 0
     tcgen05_hoist_row_union_tma_role = False
     tcgen05_output_stores_value: tuple[Node, ...] | None = None
@@ -13904,6 +14290,23 @@ def _emit_mma_pipeline(
         tcgen05_plan_l2_swizzle_size = (
             1 if tcgen05_one_shot_role_scheduler else tcgen05_l2_swizzle_size_value
         )
+        # The grid's tiles fit one wave and the scheduler hands its clusters
+        # no more slots than the grid launches.  A swizzle that does not divide
+        # the scheduler's dim-1 cluster count pads that dim
+        # (``PersistentTileSchedulerParams``) while the static grid launches
+        # only the logical clusters, so some CTAs walk a second slot: bf16
+        # 1500x384x384 on 128x64 pairs at swizzle 4 spreads its 72 tiles over
+        # 12 x 8 slots, and 12 of its 72 clusters run two.
+        tcgen05_one_tile_per_cta = (
+            plan.tcgen05_pid_is_persistent
+            and one_shot_work_ctas is not None
+            and one_shot_work_ctas <= env.config_spec.num_sm
+            and not _tcgen05_swizzle_pads_schedule(
+                df.pid,
+                swizzle=tcgen05_plan_l2_swizzle_size,
+                cluster_n=plan.tcgen05_cluster_n,
+            )
+        )
         # One tile per CTA: the epilogue frees TMEM right after issuing its
         # last subtile's TMA store (the last ``tcgen05.ld`` fence + acc release
         # stay at that subtile) so the dealloc handshake with the MMA warp
@@ -13972,6 +14375,94 @@ def _emit_mma_pipeline(
             and plan.row_union_plan is None
             and plan.tcgen05_grouped_plan is None
             and not plan.knobs.ab_startup_prefill
+        )
+        # The persistent role-local kernel (an edge tile keeps it out of the
+        # one-shot form; a CTA may walk several tiles) hoists the role the
+        # same way on the clustered path, its init wait guarded to the first
+        # tile and placed ahead of that tile's first mbarrier / TMA operation
+        # (1500x384x1536 bf16, 128x64 CTA pair, two A/B-load warps):
+        #
+        #     cutlass.pipeline.pipeline_init_arrive(cluster_shape_mn=..., is_relaxed=True)
+        #     if warp_idx >= 5 and warp_idx < 7:  # the A/B-load role, moved here
+        #         <scheduler setup, TMA partitions of the whole operands>
+        #         while work_tile.is_valid_tile:
+        #             <tile coordinates, operand slices, stage gates>
+        #             if tcgen05_ab_producer_state.count == cutlass.Int32(0):
+        #                 cutlass.pipeline.pipeline_init_wait(cluster_shape_mn=...)
+        #             cute.arch.griddepcontrol_wait()
+        #             <the tile's stages>
+        #     if not tcgen05_ab_load_warp:
+        #         cutlass.pipeline.pipeline_init_wait(cluster_shape_mn=...)
+        #
+        # Without it every warp joins in the prefix and the load warps' ~150 ns
+        # of address math follows the join.  In a one-wave chain of dependent
+        # launches that math sits on the call's critical path: a CTA placed on
+        # an SM the previous call frees last enters ~800 ns after that exit and
+        # reached its PDL wait 384-448 ns later, ~300 ns after the release (per-
+        # call stamps, 144 CTAs).  Hoisted: 1500x384x1536 0.960 -> 0.982 of
+        # cuBLAS, 1000x512x2880 0.980 -> 0.993, 1000x1024x1024 / x2048 (128x112
+        # pairs, transposed) +1.1%.  Joining in the role prelude instead (the
+        # row-union kernels' wait ahead of the persistent loop) leaves the
+        # per-tile coordinate math after the join: about half the gain (0.970,
+        # 0.989, +0.0% / +0.8%).  The guard: the producer state counts every
+        # stage the role issues and the ring continues across tiles, so the
+        # count is 0 exactly at the first tile's first stage; each thread
+        # waits once per ``barrier.cluster.arrive``.
+        #
+        # ``cute_pdl`` on the role-local TMA producer: the role waits for the
+        # previous kernel per tile, after the tile's address math and stage 0's
+        # acquire (the per-tile statements below).
+        tcgen05_tma_wait_after_first_acquire = bool(
+            plan.tcgen05_pdl_launch
+            and plan.tcgen05_use_role_local_tma_producer
+            and tcgen05_effective_scheduler_warps == 0
+            and not plan.tcgen05_grouped_static_persistent
+        )
+        # The lines per operand row a one-tile CTA L2-prefetches ahead of its
+        # dependent-launch wait (``_build_operand_l2_prefetch``, emitted with
+        # the role's first stage below), 0 for none: decided here, ahead of
+        # the prefix, because the persistent hoist below depends on it.
+        tcgen05_operand_l2_prefetch = (
+            _tcgen05_operand_l2_prefetch_lines(plan)
+            if tcgen05_tma_wait_after_first_acquire
+            and tcgen05_one_tile_per_cta
+            and not plan.knobs.materialized_pdl
+            and plan.knobs.int_or(plan.knobs.split_k, 1) == 1
+            and plan.tcgen05_cluster_n == 1
+            and plan.tcgen05_m_subtile_count == 1
+            and not plan.tcgen05_cp_async_a
+            and plan.row_union_plan is None
+            and plan.tcgen05_grouped_plan is None
+            and plan.input_dtype in (torch.bfloat16, torch.float16)
+            # (K-major A and B, or M-major A and N-major B:
+            # ``_tcgen05_operand_l2_prefetch_lines``)
+            # (rows of one 2-D operand: a batched GEMM's rows would need its
+            # batch offset)
+            and (plan.analysis is None or not plan.analysis.has_leading_passthrough)
+            else 0
+        )
+        # A CTA that L2-prefetches its operands keeps the prefix join: the
+        # prefetch already fills the window before the release, and the hoist
+        # only issues it earlier, where the CTAs placed on SMs the previous
+        # grid leaves idle pull their lines while the previous call issues its
+        # first loads.  1000x768x128 CR (96 CTAs, 56 idle SMs, the M-major A /
+        # N-major B prefetch): 2.279 us -> 2.326 us hoisted, 2.375 us with the
+        # prefetch moved ahead of the join; without the prefetch the hoist is
+        # neutral there (2.457 / 2.458 us).  1500x384x384 (8 idle SMs, the
+        # K-major prefetch): neutral (2.358 us).
+        tcgen05_hoist_persistent_tma_role = (
+            plan.tcgen05_use_cluster_deferred_pipelines
+            and not tcgen05_one_shot_role_scheduler
+            and plan.tcgen05_pid_is_persistent
+            and plan.tcgen05_use_role_local_persistent_body
+            and plan.tcgen05_use_role_local_tma_producer
+            and plan.row_union_plan is None
+            and plan.tcgen05_grouped_plan is None
+            and not plan.tcgen05_grouped_static_persistent
+            and tcgen05_effective_scheduler_warps == 0
+            and not plan.knobs.ab_startup_prefill
+            and not plan.knobs.materialized_pdl
+            and not tcgen05_operand_l2_prefetch
         )
         if tcgen05_ab_load_warps > 1:
             # Two A/B-load warps share the role-local TMA producer
@@ -15691,6 +16182,17 @@ def _emit_mma_pipeline(
     tma_pipeline_tx_count = df.new_var("tcgen05_ab_pipeline_tx_count")
     tma_pipeline = df.new_var("tcgen05_ab_pipeline")
     tma_producer_state = df.new_var("tcgen05_ab_producer_state")
+    # ``tcgen05_hoist_persistent_tma_role``: the TMA-load role's cluster join,
+    # once, at its first tile's first stage (the per-tile statements below)
+    # and, for a CTA that ran no tile, ahead of its teardown's producer tail
+    # (``Tcgen05LifecycleContext.tma_role_first_tile_join``).
+    tcgen05_first_tile_join = (
+        f"if {tma_producer_state}.count == cutlass.Int32(0):\n"
+        "    cutlass.pipeline.pipeline_init_wait("
+        f"cluster_shape_mn={plan.tcgen05_cluster_layout_vmnk})"
+        if tcgen05_hoist_persistent_tma_role
+        else ""
+    )
     tma_consumer_state = df.new_var("tcgen05_ab_consumer_state")
     tcgen05_use_tma_store_role_tile_counter = (
         plan.tcgen05_use_tma_store_epilogue
@@ -16971,13 +17473,7 @@ def _emit_mma_pipeline(
                             k_loop_iter.args[1] = cast(
                                 "ast.expr", expr_from_string(tcgen05_split_k_end)
                             )
-                        tcgen05_tma_wait_after_first_acquire = False
-                        if (
-                            plan.tcgen05_pdl_launch
-                            and plan.tcgen05_use_role_local_tma_producer
-                            and tcgen05_effective_scheduler_warps == 0
-                            and not plan.tcgen05_grouped_static_persistent
-                        ):
+                        if tcgen05_tma_wait_after_first_acquire:
                             # ``cute_pdl``: the TMA-load role waits for the
                             # previous kernel here, after the tile's address
                             # math (scheduler step, local tiles, TMA
@@ -17009,7 +17505,6 @@ def _emit_mma_pipeline(
                             # cluster join, grouped_gemm s1 reads 35 ns per
                             # call less (fine timer; neither half alone moves it).
                             df.cute_state.tcgen05.tma_role_wait_per_tile = True
-                            tcgen05_tma_wait_after_first_acquire = True
                         emitted.per_tile_stmt(
                             f"{tma_initial_full_tile} = "
                             + _tcgen05_tma_tile_predicate(
@@ -17119,6 +17614,20 @@ def _emit_mma_pipeline(
                             # The tile's whole producer, on every A/B-load
                             # warp (``_build_shared_ring_producer``); no
                             # unrolled fill and no K-loop clone below.
+                            initial_prefetch.append(
+                                f"{tcgen05_ab_load_rank} = {warp_idx} - "
+                                f"cutlass.Int32({tcgen05_matmul_plan.ab_load_warp_begin})"
+                            )
+                            if tcgen05_operand_l2_prefetch:
+                                initial_prefetch.append(
+                                    _build_operand_l2_prefetch(
+                                        plan,
+                                        lines=tcgen05_operand_l2_prefetch,
+                                        load_warps=tcgen05_ab_load_warps,
+                                        load_rank=tcgen05_ab_load_rank,
+                                        names=df.new_var,
+                                    )
+                                )
                             if tcgen05_tma_wait_after_first_acquire:
                                 # (a statement: the hoisted one-shot role
                                 # inserts its init rendezvous ahead of it)
@@ -17127,10 +17636,6 @@ def _emit_mma_pipeline(
                                         "cute.arch.griddepcontrol_wait()"
                                     )
                                 )
-                            initial_prefetch.append(
-                                f"{tcgen05_ab_load_rank} = {warp_idx} - "
-                                f"cutlass.Int32({tcgen05_matmul_plan.ab_load_warp_begin})"
-                            )
                             tcgen05_shared_ring_emitted = True
                             initial_prefetch.append(
                                 _build_shared_ring_producer(
@@ -17198,6 +17703,16 @@ def _emit_mma_pipeline(
                                                 )
                                             )
                                         )
+                                    if tcgen05_operand_l2_prefetch:
+                                        initial_prefetch.append(
+                                            _build_operand_l2_prefetch(
+                                                plan,
+                                                lines=tcgen05_operand_l2_prefetch,
+                                                load_warps=1,
+                                                load_rank=None,
+                                                names=df.new_var,
+                                            )
+                                        )
                                     initial_prefetch.append(
                                         "cute.arch.griddepcontrol_wait()"
                                     )
@@ -17216,23 +17731,34 @@ def _emit_mma_pipeline(
                                 tcgen05_tma_wait_after_first_acquire
                                 and not initial_stages
                             )
+                        # The hoisted TMA-load role joins the pipeline-init
+                        # rendezvous ahead of its first statement block: after
+                        # its tile math and before its first mbarrier / TMA
+                        # operation (the cluster wait, or the plain path's
+                        # named barrier with warp 0); on the persistent kernel
+                        # once, at the first tile
+                        # (``tcgen05_hoist_persistent_tma_role``).
+                        tma_role_join: str | None = None
                         if tcgen05_hoist_tma_role:
-                            # The hoisted TMA-load role joins the pipeline-init
-                            # rendezvous here (the cluster wait, or the plain
-                            # path's named barrier with warp 0), after its
-                            # tile math and before its first mbarrier / TMA
-                            # operation.
-                            first_prefetch_block = next(
-                                index
-                                for index, item in enumerate(initial_prefetch)
-                                if not isinstance(item, str)
-                            )
-                            initial_prefetch.insert(
-                                first_prefetch_block,
+                            tma_role_join = (
                                 f"{tcgen05_pipeline_init_barrier}.arrive_and_wait()"
                                 if tcgen05_use_merged_pipeline_init
                                 else "cutlass.pipeline.pipeline_init_wait("
-                                f"cluster_shape_mn={plan.tcgen05_cluster_layout_vmnk})",
+                                f"cluster_shape_mn={plan.tcgen05_cluster_layout_vmnk})"
+                            )
+                        elif tcgen05_hoist_persistent_tma_role:
+                            assert (
+                                prefetch_args.tma_producer_state == tma_producer_state
+                            )
+                            tma_role_join = tcgen05_first_tile_join
+                        if tma_role_join is not None:
+                            initial_prefetch.insert(
+                                next(
+                                    index
+                                    for index, item in enumerate(initial_prefetch)
+                                    if not isinstance(item, str)
+                                ),
+                                tma_role_join,
                             )
                         for item in initial_prefetch:
                             if isinstance(item, str):
@@ -18197,6 +18723,7 @@ def _emit_mma_pipeline(
             pdl_release=plan.tcgen05_pdl and plan.tcgen05_use_role_local_mma_exec,
             mma_warp_frees_tmem=tcgen05_mma_warp_frees_tmem,
             exec_acc_tmem_ptr=plan.tcgen05_exec_acc_tmem_ptr,
+            tma_role_first_tile_join=tcgen05_first_tile_join,
         )
         segment_store_m_offset = ""
         segment_store_start = ""

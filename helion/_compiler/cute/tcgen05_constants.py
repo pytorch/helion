@@ -225,6 +225,10 @@ def tcgen05_plain_narrow_subtile_covers_n(
 # tiles alone: every loss sits below 1.0, the gains from 1.0 to 1.04 split
 # (ties), and the first clear win is at 1.033.
 TCGEN05_TRANSPOSED_PRODUCT_MIN_GAIN = 1.03
+# The 128-byte lines of A and B rows a one-tile CTA prefetches into L2 ahead
+# of its dependent-launch wait (``cute_mma._tcgen05_operand_l2_prefetch_lines``):
+# 96 KB, what one SM pulls in the ~400 ns its CTA waits for the release.
+TCGEN05_OPERAND_L2_PREFETCH_MAX_LINES = 768
 # An N-major B half row of the aligned-N pair must hold whole swizzle atoms
 # of at least this many bytes to be seeded.
 TCGEN05_ALIGNED_N_MN_B_ROW_BYTES = 64

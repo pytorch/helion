@@ -17214,9 +17214,13 @@ class TestCuteTcgen05AuxPipelineCycle2a(unittest.TestCase):
 
         self.assertIn("'kind': 'tcgen05_d_tma'", code)
         self.assertIn("cutlass.pipeline.PipelineTmaStore.create", code)
+        # The store ring exists before the epilogue first uses it.  (The
+        # TMA-load role, hoisted ahead of the prefix's cluster join by
+        # ``tcgen05_hoist_persistent_tma_role``, may open its role-local loop
+        # earlier: it never touches the store ring.)
         self.assertLess(
             code.index("cutlass.pipeline.PipelineTmaStore.create"),
-            code.index("while tcgen05_role_local_"),
+            code.index("tcgen05_c_pipeline.producer_"),
         )
         # the full-tile guard covers the residual load only
         self.assertEqual(code.count("tcgen05_full_tile = "), 1, code)

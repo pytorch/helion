@@ -866,29 +866,6 @@ def _helion__matmul(a, b, out, tma_atom_a, tma_tensor_a, tma_atom_b, tma_tensor_
             cute.nvgpu.cpasync.prefetch_descriptor(tcgen05_tma_store_atom)
         _helion_tc_pro.init_pipeline_barriers_pair(tcgen05_warp_idx, 1, tcgen05_ab_pipeline)
     cutlass.pipeline.pipeline_init_arrive(cluster_shape_mn=tcgen05_cluster_layout_vmnk, is_relaxed=True)
-    cutlass.pipeline.pipeline_init_wait(cluster_shape_mn=tcgen05_cluster_layout_vmnk)
-    if tcgen05_epi_active:
-        tcgen05_tmem_allocator.allocate(tcgen05_acc_tmem_cols)
-        tcgen05_tmem_allocator.relinquish_alloc_permit()
-    tcgen05_exec_acc_tmem_ptr = cute.make_ptr(cutlass.Float32, 0, cute.AddressSpace.tmem, assumed_align=16)
-    tcgen05_epi_acc_tmem_ptr = cute.make_ptr(cutlass.Float32, 0, cute.AddressSpace.tmem, assumed_align=16)
-    if tcgen05_exec_active or tcgen05_epi_active:
-        tcgen05_tmem_allocator.wait_for_alloc()
-    if tcgen05_exec_active:
-        tcgen05_exec_acc_tmem_ptr = tcgen05_tmem_allocator.retrieve_ptr(cutlass.Float32)
-    if tcgen05_epi_active:
-        tcgen05_epi_acc_tmem_ptr = tcgen05_tmem_allocator.retrieve_ptr(cutlass.Float32)
-    tcgen05_exec_acc_frag_base = cute.make_tensor(tcgen05_exec_acc_tmem_ptr, acc_frag_base.layout)
-    tcgen05_epi_acc_frag_base = cute.make_tensor(tcgen05_epi_acc_tmem_ptr, acc_frag_base.layout)
-    tcgen05_epilog_sync_barrier = cutlass.pipeline.NamedBarrier(barrier_id=cutlass.Int32(2), num_threads=cutlass.Int32(128))
-    tcgen05_c_pipeline_producer_group = cutlass.pipeline.CooperativeGroup(cutlass.pipeline.Agent.Thread, cutlass.Int32(128))
-    tcgen05_c_pipeline = cutlass.pipeline.PipelineTmaStore.create(num_stages=2, producer_group=tcgen05_c_pipeline_producer_group)
-    tcgen05_kernel_desc = type('Tcgen05KernelDesc', (), {'cta_tile_shape_mnk': (256, 256, 128), 'c_layout': cutlass.utils.layout.LayoutEnum.ROW_MAJOR, 'c_dtype': cutlass.BFloat16, 'acc_dtype': cutlass.Float32, 'epilog_sync_bar_id': cutlass.Int32(2), 'epilogue_warp_id': (cutlass.Int32(0), cutlass.Int32(1), cutlass.Int32(2), cutlass.Int32(3)), 'num_c_stage': cutlass.Int32(2), 'use_2cta_instrs': True})()
-    tcgen05_store_epi_tile = (cute.make_layout(128), cute.make_layout(32))
-    tcgen05_sD_layout = cutlass.utils.blackwell_helpers.make_smem_layout_epi(cutlass.BFloat16, cutlass.utils.layout.LayoutEnum.ROW_MAJOR, tcgen05_store_epi_tile, 2)
-    tcgen05_sD_ptr = cute.arch.alloc_smem(cutlass.BFloat16, cute.cosize(tcgen05_sD_layout.outer), alignment=1024)
-    tcgen05_sD = cute.make_tensor(cute.recast_ptr(tcgen05_sD_ptr, tcgen05_sD_layout.inner, dtype=cutlass.BFloat16), tcgen05_sD_layout.outer)
-    tcgen05_tAcc = cutlass.utils.gemm.sm100.transform_partitioned_tensor_layout(tcgen05_epi_acc_frag_base)
     if cute.arch.make_warp_uniform(cute.arch.warp_idx()) == cutlass.Int32(5):
         tcgen05_role_local_0_tile_sched_params = cutlass.utils.PersistentTileSchedulerParams(((4096 + _BLOCK_SIZE_0 - 1) // _BLOCK_SIZE_0 * 2, (4096 + _BLOCK_SIZE_1 - 1) // _BLOCK_SIZE_1, 1), (2, 1, 1))
         tcgen05_role_local_0_tile_sched = cutlass.utils.StaticPersistentTileScheduler.create(tcgen05_role_local_0_tile_sched_params, cute.arch.block_idx(), cute.arch.grid_dim())
@@ -908,6 +885,8 @@ def _helion__matmul(a, b, out, tma_atom_a, tma_tensor_a, tma_atom_b, tma_tensor_
             tma_gA = tma_gA_all[None, _helion_tc_pro.floordiv_nonneg(tile_offset_0, 256), None]
             tma_gB = tma_gB_all[None, _helion_tc_pro.floordiv_nonneg(tile_offset_1, 256), None]
             tcgen05_tma_initial_full_tile = tile_offset_0 + cutlass.Int32(256) <= cutlass.Int32(4096) and tile_offset_1 + cutlass.Int32(256) <= cutlass.Int32(4096) and (cutlass.Int32(128) <= cutlass.Int32(1024))
+            if tcgen05_ab_producer_state.count == cutlass.Int32(0):
+                cutlass.pipeline.pipeline_init_wait(cluster_shape_mn=tcgen05_cluster_layout_vmnk)
             if tcgen05_tma_initial_full_tile:
                 tcgen05_ab_pipeline.producer_acquire(tcgen05_ab_producer_state)
             cute.arch.griddepcontrol_wait()
@@ -940,6 +919,30 @@ def _helion__matmul(a, b, out, tma_atom_a, tma_tensor_a, tma_atom_b, tma_tensor_
                     tcgen05_ab_producer_state.advance()
             tcgen05_role_local_0_tile_sched.advance_to_next_work()
             tcgen05_role_local_0_work_tile = tcgen05_role_local_0_tile_sched.get_current_work()
+    if not tcgen05_tma_warp:
+        cutlass.pipeline.pipeline_init_wait(cluster_shape_mn=tcgen05_cluster_layout_vmnk)
+    if tcgen05_epi_active:
+        tcgen05_tmem_allocator.allocate(tcgen05_acc_tmem_cols)
+        tcgen05_tmem_allocator.relinquish_alloc_permit()
+    tcgen05_exec_acc_tmem_ptr = cute.make_ptr(cutlass.Float32, 0, cute.AddressSpace.tmem, assumed_align=16)
+    tcgen05_epi_acc_tmem_ptr = cute.make_ptr(cutlass.Float32, 0, cute.AddressSpace.tmem, assumed_align=16)
+    if tcgen05_exec_active or tcgen05_epi_active:
+        tcgen05_tmem_allocator.wait_for_alloc()
+    if tcgen05_exec_active:
+        tcgen05_exec_acc_tmem_ptr = tcgen05_tmem_allocator.retrieve_ptr(cutlass.Float32)
+    if tcgen05_epi_active:
+        tcgen05_epi_acc_tmem_ptr = tcgen05_tmem_allocator.retrieve_ptr(cutlass.Float32)
+    tcgen05_exec_acc_frag_base = cute.make_tensor(tcgen05_exec_acc_tmem_ptr, acc_frag_base.layout)
+    tcgen05_epi_acc_frag_base = cute.make_tensor(tcgen05_epi_acc_tmem_ptr, acc_frag_base.layout)
+    tcgen05_epilog_sync_barrier = cutlass.pipeline.NamedBarrier(barrier_id=cutlass.Int32(2), num_threads=cutlass.Int32(128))
+    tcgen05_c_pipeline_producer_group = cutlass.pipeline.CooperativeGroup(cutlass.pipeline.Agent.Thread, cutlass.Int32(128))
+    tcgen05_c_pipeline = cutlass.pipeline.PipelineTmaStore.create(num_stages=2, producer_group=tcgen05_c_pipeline_producer_group)
+    tcgen05_kernel_desc = type('Tcgen05KernelDesc', (), {'cta_tile_shape_mnk': (256, 256, 128), 'c_layout': cutlass.utils.layout.LayoutEnum.ROW_MAJOR, 'c_dtype': cutlass.BFloat16, 'acc_dtype': cutlass.Float32, 'epilog_sync_bar_id': cutlass.Int32(2), 'epilogue_warp_id': (cutlass.Int32(0), cutlass.Int32(1), cutlass.Int32(2), cutlass.Int32(3)), 'num_c_stage': cutlass.Int32(2), 'use_2cta_instrs': True})()
+    tcgen05_store_epi_tile = (cute.make_layout(128), cute.make_layout(32))
+    tcgen05_sD_layout = cutlass.utils.blackwell_helpers.make_smem_layout_epi(cutlass.BFloat16, cutlass.utils.layout.LayoutEnum.ROW_MAJOR, tcgen05_store_epi_tile, 2)
+    tcgen05_sD_ptr = cute.arch.alloc_smem(cutlass.BFloat16, cute.cosize(tcgen05_sD_layout.outer), alignment=1024)
+    tcgen05_sD = cute.make_tensor(cute.recast_ptr(tcgen05_sD_ptr, tcgen05_sD_layout.inner, dtype=cutlass.BFloat16), tcgen05_sD_layout.outer)
+    tcgen05_tAcc = cutlass.utils.gemm.sm100.transform_partitioned_tensor_layout(tcgen05_epi_acc_frag_base)
     if cute.arch.make_warp_uniform(cute.arch.warp_idx()) == cutlass.Int32(4):
         tcgen05_role_local_1_tile_sched_params = cutlass.utils.PersistentTileSchedulerParams(((4096 + _BLOCK_SIZE_0 - 1) // _BLOCK_SIZE_0 * 2, (4096 + _BLOCK_SIZE_1 - 1) // _BLOCK_SIZE_1, 1), (2, 1, 1))
         tcgen05_role_local_1_tile_sched = cutlass.utils.StaticPersistentTileScheduler.create(tcgen05_role_local_1_tile_sched_params, cute.arch.block_idx(), cute.arch.grid_dim())
@@ -1036,6 +1039,8 @@ def _helion__matmul(a, b, out, tma_atom_a, tma_tensor_a, tma_atom_b, tma_tensor_
             tcgen05_role_local_2_tile_sched.advance_to_next_work()
             tcgen05_role_local_2_work_tile = tcgen05_role_local_2_tile_sched.get_current_work()
     if tcgen05_tma_warp:
+        if tcgen05_ab_producer_state.count == cutlass.Int32(0):
+            cutlass.pipeline.pipeline_init_wait(cluster_shape_mn=tcgen05_cluster_layout_vmnk)
         tcgen05_ab_pipeline.producer_tail(tcgen05_ab_producer_state)
     if tcgen05_exec_active:
         cute.arch.griddepcontrol_launch_dependents()
