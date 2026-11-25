@@ -707,10 +707,86 @@ TCGEN05_EPILOG_SYNC_BARRIER_ID = 2
 # It lies in the 6..9 range of the epilogue warp-group barriers below, which
 # the split-K envelope never allocates (it admits one epilogue warp group).
 TCGEN05_SPLIT_K_BARRIER_ID = 7
-# ``tcgen05_split_k``: CTAs per output tile along K (1 = no split). Every
-# split stores an fp32 partial tile to a launcher-owned workspace and the
-# last arriver reduces them into its TMEM accumulator before the epilogue.
+# ``tcgen05_split_k``: CTAs per output tile along K (1 = no split). On the
+# flat one-CTA kernel every split stores an fp32 partial tile to a
+# launcher-owned workspace and the last arriver reduces them into its TMEM
+# accumulator before the epilogue. On a CtaGroup.TWO kernel with a 4-CTA
+# cluster (``tcgen05_cluster_m=2, tcgen05_cluster_n=2``), ``tcgen05_split_k=2``
+# gives the cluster's two CTA pairs the two K halves of one output tile
+# instead of two N tiles, reduced through DSMEM
+# (``tcgen05_cluster_split_k``).
 TCGEN05_SPLIT_K_CONFIG_KEY = "tcgen05_split_k"
+
+
+def tcgen05_cluster_split_k(config: Mapping[str, object]) -> int:
+    """The K splits of one output tile a config runs on its 4-CTA cluster: 2
+    for ``tcgen05_split_k=2`` on ``tcgen05_cluster_m=2, tcgen05_cluster_n=2``,
+    else 1 (a ``tcgen05_split_k`` above 1 is then the flat grid's split).
+
+    A cluster's two CTA pairs sit on the scheduler's N axis.  With
+    ``tcgen05_cluster_n=2`` alone they take N tiles ``2j`` and ``2j + 1`` and
+    share one A multicast; with the split they take the same output tile,
+    pair 0 the first K half and pair 1 the second, and each adds the other's
+    fp32 partial of half the tile's subtiles (1024x512x4096 bf16 on 128x128
+    pairs, the 32 output tiles' 128 CTAs of GB300's 152 SMs)::
+
+        cluster_n=2:  pair 0 -> tile (i, 2j),  K [0, 4096)
+                      pair 1 -> tile (i, 2j+1), K [0, 4096)
+        split:        pair 0 -> tile (i, j),  K [0, 2048),    stores subtile 0
+                      pair 1 -> tile (i, j),  K [2048, 4096), stores subtile 1
+    """
+    if (
+        config.get(TCGEN05_SPLIT_K_CONFIG_KEY, 1) == 2
+        and config.get("tcgen05_cluster_m", 1) == 2
+        and config.get("tcgen05_cluster_n", 1) == 2
+    ):
+        return 2
+    return 1
+
+
+# K tiles (64 deep) from which the one-wave seeds include the K-split
+# cluster (``seeds._cluster_split_k_seed_exchanges``): its exchange costs about
+# what 40 k-blocks of the 128x64 pair's extra operand traffic do.
+TCGEN05_CLUSTER_SPLIT_K_SEED_MIN_K_TILES = 48
+# The same for the seed exchanging 16-bit partials
+# (``tcgen05_split_k_exchange="output"``), half the bytes: bf16 768x768x2048
+# CR (32 K tiles) on GB300 ran 1.033 of cuBLAS on it against 0.971 with fp32
+# partials (one process; the full-effort unsplit pick read 0.977).
+TCGEN05_CLUSTER_SPLIT_K_OUTPUT_EXCHANGE_SEED_MIN_K_TILES = 32
+
+
+def tcgen05_cluster_split_k_exchange_smem_bytes(
+    *, bm: int, bn: int, itemsize: int = 4
+) -> int:
+    """Per-CTA shared memory of a K-split cluster's partial exchange: the
+    receive buffer of half the CTA's ``bm // 2 x bn`` tile (the partner's
+    half of the epilogue subtiles) in ``itemsize``-byte elements, 128-byte
+    aligned, and its transaction mbarrier.  The 128x128 pair: 64 x 128 / 2
+    x 4 B = 16 KiB of fp32 partials, 8 KiB of 16-bit ones
+    (``tcgen05_split_k_exchange="output"``).
+    """
+    return (bm // 2) * bn * itemsize // 2 + 128
+
+
+# ``tcgen05_split_k_exchange``: the element type a K-split cluster's pairs
+# exchange their partials in (``tcgen05_cluster_split_k``).  "accumulator"
+# sends fp32; "output" rounds them to the 16-bit output dtype first, half the
+# bytes, offered only under ``Settings.split_k_reduction="output"`` (torch's
+# reduced-precision reduction flags, through helion.inductor)::
+#
+#     # "accumulator": 4 fp32 per 16-byte store
+#     _helion_skc.st_async_f32x4(addr, bar, acc[4 * j], ..., acc[4 * j + 3])
+#     # "output": 8 bf16 per 16-byte store, the receiver adds them in fp32
+#     _helion_skc.st_async_b32x4(addr, bar, _helion_skc.pack_bf16x2(acc[8 * j], acc[8 * j + 1]), ...)
+TCGEN05_SPLIT_K_EXCHANGE_CONFIG_KEY = "tcgen05_split_k_exchange"
+TCGEN05_SPLIT_K_EXCHANGE_ACCUMULATOR = "accumulator"
+TCGEN05_SPLIT_K_EXCHANGE_OUTPUT = "output"
+TCGEN05_SPLIT_K_EXCHANGE_CHOICES: tuple[str, ...] = (
+    TCGEN05_SPLIT_K_EXCHANGE_ACCUMULATOR,
+    TCGEN05_SPLIT_K_EXCHANGE_OUTPUT,
+)
+
+
 TCGEN05_SPLIT_K_SEARCH_CHOICES: tuple[int, ...] = (1, 2, 4, 8, 16)
 # K tiles each split-K slice keeps at least (the seeds and the default): a
 # shorter slice loses its AB pipeline.

@@ -1626,6 +1626,10 @@ class ConfigSpec:
         # reduction is an atomic add into an output kept in a dtype with a
         # packed atomic add (``split_k_workspace.atomic_epilogue_admissible``).
         self.cute_split_k_atomic_epilogue_available: bool = False
+        # ``cute_split_k_partials="output"`` (16-bit partials) is offered when
+        # a proved plain GEMM store's 16-bit output may take them
+        # (``split_k_workspace.partials_admissible``).
+        self.cute_split_k_partials_available: bool = False
         # The tiles and rings the proved schedule's producer takes (the CuTe
         # backend's ``WorkspaceGeometry``), read by the search's repair of the
         # workspace knobs; None without a proof.

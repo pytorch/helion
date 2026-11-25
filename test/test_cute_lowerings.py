@@ -20760,6 +20760,8 @@ mailbox[cutlass.Int32(3), producer_state.index] = first
             store_warp_id=7,
             c_input_warp_id=7,
             is_two_cta=two_cta,
+            # (no K split over the cluster: ``tcgen05_cluster_split_k``)
+            cluster_split_k=1,
             sched_stage_count=2 if staged else 1,
             grouped=None,
             row_union=None,

@@ -584,10 +584,13 @@ class SmemArena:
         aux_stages: int = TCGEN05_AUX_STAGE_COUNT_DEFAULT,
         epi_warp_groups: int = 1,
         epi_subtile_n: int | None = None,
+        exchange_bytes: int = 0,
     ) -> int:
-        """Bytes of the launch's rings under this arena's byte model."""
+        """Bytes of the launch's rings under this arena's byte model, plus
+        ``exchange_bytes`` of allocations beside them (a K-split cluster's
+        partial exchange, ``tcgen05_cluster_split_k_exchange_smem_bytes``)."""
         if self.cluster_m == 1:
-            return one_cta_pipeline_smem_bytes(
+            return exchange_bytes + one_cta_pipeline_smem_bytes(
                 self.facts,
                 bm=bm,
                 bn=bn,
@@ -600,7 +603,7 @@ class SmemArena:
                 epi_warp_groups=epi_warp_groups,
                 epi_subtile_n=epi_subtile_n,
             )
-        return pipeline_smem_bytes(
+        return exchange_bytes + pipeline_smem_bytes(
             self.facts,
             bm=bm,
             bn=bn,
@@ -633,6 +636,7 @@ class SmemArena:
         aux_stages: int = TCGEN05_AUX_STAGE_COUNT_DEFAULT,
         epi_warp_groups: int = 1,
         epi_subtile_n: int | None = None,
+        exchange_bytes: int = 0,
     ) -> int:
         """Deepest AB ring in ``1..max_stages`` that fits the capacity, else 0.
 
@@ -654,6 +658,7 @@ class SmemArena:
                 aux_stages=aux_stages,
                 epi_warp_groups=epi_warp_groups,
                 epi_subtile_n=epi_subtile_n,
+                exchange_bytes=exchange_bytes,
             ),
             self.facts.capacity_bytes,
             max_stages=max_stages,
@@ -677,6 +682,7 @@ def max_pipeline_ab_stages(
     aux_stages: int = TCGEN05_AUX_STAGE_COUNT_DEFAULT,
     epi_warp_groups: int = 1,
     epi_subtile_n: int | None = None,
+    exchange_bytes: int = 0,
 ) -> int:
     """Fill shared memory without changing the epilogue or accumulator ring.
 
@@ -697,6 +703,7 @@ def max_pipeline_ab_stages(
         aux_stages=aux_stages,
         epi_warp_groups=epi_warp_groups,
         epi_subtile_n=epi_subtile_n,
+        exchange_bytes=exchange_bytes,
     )
 
 

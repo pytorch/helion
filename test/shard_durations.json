@@ -357,6 +357,7 @@
  "test/test_cute_surplus_thread_reductions.py": 1.8,
  "test/test_cute_tail_peel_cuda.py": 14.0,
  "test/test_cute_tcgen05_atomics.py": 1.5,
+ "test/test_cute_tcgen05_cluster_split_k.py": 30.0,
  "test/test_cute_tcgen05_direct_entry_tma_operands.py": 9.6,
  "test/test_cute_tcgen05_fixed_chain.py": 12.4,
  "test/test_cute_tcgen05_fixed_cost.py": 21.0,

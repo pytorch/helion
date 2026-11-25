@@ -133,6 +133,7 @@ from ..split_k_cluster_config import normalize_cluster_schedule
 from ..split_k_workspace_config import (
     ATOMIC_EPILOGUE_KEY as SPLIT_K_ATOMIC_EPILOGUE_KEY,
 )
+from ..split_k_workspace_config import PARTIALS_KEY as SPLIT_K_PARTIALS_KEY
 from ..split_k_workspace_config import PARTITIONS_KEY as SPLIT_K_PARTITIONS_KEY
 from ..split_k_workspace_config import STAGES_KEY as SPLIT_K_STAGES_KEY
 from ..split_k_workspace_config import WORKSPACE_KEY as SPLIT_K_WORKSPACE_KEY
@@ -3048,6 +3049,7 @@ def _drop_inert_workspace_knobs(config: Config) -> None:
             SPLIT_K_STAGES_KEY,
             SPLIT_K_PARTITIONS_KEY,
             SPLIT_K_ATOMIC_EPILOGUE_KEY,
+            SPLIT_K_PARTIALS_KEY,
         ):
             config.config.pop(key, None)
 
@@ -3205,6 +3207,7 @@ def normalize_knobs(
         fix_invalid=fix_invalid,
         partition_choices=config_spec.cute_split_k_partition_choices,
         atomic_epilogue_available=config_spec.cute_split_k_atomic_epilogue_available,
+        partials_available=config_spec.cute_split_k_partials_available,
     )
     normalize_grouped_rna_config(
         config,
@@ -4889,13 +4892,7 @@ def cute_flat_fields(
         # The split-K workspace proof holds for the atomic example and
         # for plain tcgen05 GEMM stores alike; the latter has no
         # collective ``matmul_facts``, so the knobs live outside them.
-        if config_spec.cute_split_k_workspace_available:
-            fields.update(
-                workspace_search_fields(
-                    config_spec.cute_split_k_partition_choices,
-                    atomic_epilogue_available=config_spec.cute_split_k_atomic_epilogue_available,
-                )
-            )
+        fields.update(workspace_search_fields(config_spec))
         if config_spec.matmul_facts:
             if (
                 config_spec.cute_grouped_rna_k_choices

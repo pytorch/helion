@@ -57,6 +57,7 @@ from ..tcgen05_constants import TCGEN05_SCHED_CONSUMER_WAIT_MODE_WARP_LEADER
 from ..tcgen05_constants import TCGEN05_SCHED_STAGE_COUNT_CONFIG_KEY
 from ..tcgen05_constants import TCGEN05_TWO_CTA_MAX_K_TILES
 from ..tcgen05_constants import Tcgen05GroupedRuntimeTileField
+from ..tcgen05_constants import tcgen05_cluster_split_k
 from ..tcgen05_prologue import inline_floordiv_nonneg_expr
 from ..tcgen05_prologue import inline_mod_nonneg_expr
 from .aux_producer import plan_aux_producer_body
@@ -612,8 +613,29 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         config = DeviceFunction.current().config
         return clamp_cluster_extent(parsed_int_knob(config, CLUSTER_N_KEY, 1))
 
+    def _tcgen05_cluster_split_k(self) -> int:
+        """K splits per output tile on the cluster's N lanes
+        (``tcgen05_cluster_split_k``): the plan's once registered, the
+        config's before (the grouped decode runs ahead of the matmul plan,
+        see ``L2GroupingProgramIDs._decode_cluster_n``), and none outside a
+        device function, as ``_tcgen05_l2_swizzle_size``: the scheduler
+        prelude's builders run from a hand-built layout there
+        (``_tcgen05_persistent_tile_sched_params_args``), whose
+        ``PersistentTileSchedulerParams((16 * 1, 16, 1), (1, 1, 1))`` reads
+        no split, and the config read would raise ``NoCurrentFunction``."""
+        if (plan := self._tcgen05_plan()) is not None:
+            return plan.cluster_split_k
+        try:
+            config = DeviceFunction.current().config
+        except NoCurrentFunction:
+            return 1
+        return tcgen05_cluster_split_k(config)
+
     def decode_cluster_n(self) -> int:
-        return self._tcgen05_cluster_n()
+        # A K-split cluster's N lanes take one output tile (the virtual pid
+        # already collapses them, ``_tcgen05_linear_virtual_pid_expr``), so
+        # the grouped decode sees whole tiles: 1 N tile per cluster box.
+        return self._tcgen05_cluster_n() // self._tcgen05_cluster_split_k()
 
     def _tcgen05_l2_swizzle_size(self) -> int:
         """Return the L2 tile-scheduler swizzle size (Quack ``max_swizzle_size``).
@@ -850,6 +872,16 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
             # collapse back to the logical coordinate when binding
             # virtual_pid for PID decomposition.
             dims[0] = f"({dims[0]}) * {self._tcgen05_cluster_m()}"
+        if (split := self._tcgen05_cluster_split_k()) > 1:
+            # A K-split cluster's two pairs take one output tile: the
+            # scheduler walks ``split`` virtual N tiles per output tile, so
+            # its (2, 2, 1) clusters each cover one tile, and the virtual pid
+            # collapses the pair's lane back (1024x512 on 128x128 tiles):
+            #
+            #     PersistentTileSchedulerParams(((1024 + _BLOCK_SIZE_0 - 1)
+            #         // _BLOCK_SIZE_0 * 2, ((512 + _BLOCK_SIZE_1 - 1)
+            #         // _BLOCK_SIZE_1) * 2, 1), (2, 2, 1))
+            dims[1] = f"({dims[1]}) * {split}"
         # cluster_n>1 leaves the scheduler N dim equal to the logical N
         # tile count; the cluster_shape ``(cluster_m, cluster_n, 1)``
         # passed to ``PersistentTileSchedulerParams`` allocates one
@@ -1109,6 +1141,13 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
 
     def _tcgen05_grid_work_clusters_expr(self, total_clusters: str) -> str:
         """Return the scheduler z dimension for the persistent launch grid."""
+        if self._tcgen05_cluster_split_k() > 1:
+            # A K-split cluster runs one output tile: its pairs exchange the
+            # tile's partials through each other's shared memory, which a
+            # second tile would overwrite before the partner read it.  A grid
+            # of more tiles than co-resident clusters runs them as later
+            # hardware waves.
+            return total_clusters
         if (
             self._tcgen05_cluster_n() > 1
             and self._tcgen05_persistent_grid_cap()
@@ -1180,11 +1219,18 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
             )
         terms: list[str] = []
         axes = self._tcgen05_scheduler_axes()
+        split = self._tcgen05_cluster_split_k()
         for i, _pid in enumerate(self.pid_info):
             tile_dim = axes.index(i)
             coord = f"{work_tile_var}.tile_idx[{tile_dim}]"
             if tile_dim == 0:
                 coord = self._tcgen05_logical_m_coord_expr(coord)
+            elif tile_dim == 1 and split > 1:
+                # Both K splits of a tile decode it (each pair reads its
+                # split from its cluster coordinate, ``cute_mma``).
+                coord = inline_floordiv_nonneg_expr(
+                    coord, f"cutlass.Int32({split})", split
+                )
             if i == 0:
                 terms.append(coord)
                 continue
@@ -1250,9 +1296,21 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
             assert {pid.block_id for pid in self.pid_info} == set(by_block)
             coords = [by_block[pid.block_id] for pid in self.pid_info]
         terms: list[str] = []
+        split = self._tcgen05_cluster_split_k()
+        # The PID axis on the scheduler's dim 1 (N), which a K-split cluster's
+        # pairs share (see ``_tcgen05_linear_virtual_pid_expr``).
+        split_axis = (
+            self._tcgen05_scheduler_axes()[1]
+            if split > 1 and len(self.pid_info) > 1
+            else None
+        )
         for i, coord in enumerate(coords[: len(self.pid_info)]):
             if i == pair_axis and not (plan is not None and plan.row_union is not None):
                 coord = self._tcgen05_logical_m_coord_expr(coord)
+            elif i == split_axis:
+                coord = inline_floordiv_nonneg_expr(
+                    coord, f"cutlass.Int32({split})", split
+                )
             if i == 0:
                 terms.append(coord)
                 continue
@@ -1289,7 +1347,7 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
             return int(str(raw))
 
         l2_group = l2_grouping()
-        cluster_n = self._tcgen05_cluster_n()
+        cluster_n = self.decode_cluster_n()
 
         def grouped_pair_coords(
             pid: str, first: PIDInfo, second: PIDInfo

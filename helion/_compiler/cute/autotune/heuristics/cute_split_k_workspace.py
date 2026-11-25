@@ -12,6 +12,8 @@ from ... import target_facts
 from ...pipeline_smem import Tcgen05PipelineSmemFacts
 from ...pipeline_smem import max_pipeline_ab_stages
 from ...split_k_workspace_config import ATOMIC_EPILOGUE_KEY
+from ...split_k_workspace_config import PARTIALS_KEY
+from ...split_k_workspace_config import PARTIALS_OUTPUT
 from ...split_k_workspace_config import PARTITIONS_KEY
 from ...split_k_workspace_config import STAGES_KEY
 from ...split_k_workspace_config import WORKSPACE_KEY
@@ -56,6 +58,7 @@ class CuteSplitKWorkspaceHeuristic(AutotunerHeuristic):
             return frozenset()
         from ...split_k_workspace import WorkspaceGeometry
         from ...split_k_workspace import atomic_epilogue_admissible
+        from ...split_k_workspace import partials_admissible
         from ...split_k_workspace import plain_store_partition_choices
 
         with device_ir.host_function:
@@ -68,6 +71,9 @@ class CuteSplitKWorkspaceHeuristic(AutotunerHeuristic):
             )
             env.config_spec.cute_split_k_atomic_epilogue_available = (
                 proof is not None and atomic_epilogue_admissible(proof)
+            )
+            env.config_spec.cute_split_k_partials_available = (
+                proof is not None and partials_admissible(proof, env)
             )
             env.config_spec.cute_split_k_workspace_geometry = (
                 WorkspaceGeometry.of(
@@ -211,12 +217,27 @@ class CuteSplitKWorkspaceHeuristic(AutotunerHeuristic):
             )
             if maximum <= 0:
                 continue
+            # Where the 16-bit output may take them (``partials_admissible``:
+            # torch's default reduced-precision split-K flags), the seeds keep
+            # their partials in the output dtype: half the bytes the producer
+            # stores and the reducer loads, the sum still fp32. bf16, GB300,
+            # the same configs with fp32 / bf16 partials, of cuBLAS: 256 x
+            # 512 x 197952 (16 partitions of 256x128) 0.998 / 1.029, 128 x
+            # 512 x 32768 CR (16 of 128x128) 0.971-1.033 / 1.017-1.082,
+            # 256 x 256 x 32768 CR 1.125 / 1.186. fp32 partials stay a
+            # mutation of the knob away.
+            partials = (
+                {PARTIALS_KEY: PARTIALS_OUTPUT}
+                if spec.cute_split_k_partials_available
+                else {}
+            )
             candidates: list[tuple[float, int, Config]] = []
             for variation in variations:
                 candidate = Config.from_dict(
                     base.config
                     | inert
                     | variation
+                    | partials
                     | {
                         "block_sizes": block_sizes,
                         WORKSPACE_KEY: True,

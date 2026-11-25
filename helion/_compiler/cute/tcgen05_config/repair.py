@@ -203,6 +203,8 @@ from ..tcgen05_constants import TCGEN05_SCHED_STAGE_COUNT_CONFIG_KEY
 from ..tcgen05_constants import TCGEN05_SCHED_STAGE_COUNTS
 from ..tcgen05_constants import TCGEN05_SMEM_SMALL_ALLOCATION_ALLOWANCE_BYTES
 from ..tcgen05_constants import TCGEN05_SPLIT_K_CONFIG_KEY
+from ..tcgen05_constants import TCGEN05_SPLIT_K_EXCHANGE_ACCUMULATOR
+from ..tcgen05_constants import TCGEN05_SPLIT_K_EXCHANGE_CONFIG_KEY
 from ..tcgen05_constants import TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY
 from ..tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_M
 from ..tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_N
@@ -225,6 +227,7 @@ from ..tcgen05_constants import TCGEN05_WARP_REGISTER_REALLOCATION_CONFIG_KEY
 from ..tcgen05_constants import resolve_tcgen05_grouped_worklist_mma_profile
 from ..tcgen05_constants import tcgen05_aux_fragment_bytes_per_thread
 from ..tcgen05_constants import tcgen05_aux_prefetch_bytes_per_thread
+from ..tcgen05_constants import tcgen05_cluster_split_k
 from ..tcgen05_constants import tcgen05_direct_entry_stage_tuple_allowed
 from ..tcgen05_constants import tcgen05_grouped_worklist_smem_bytes
 from ..tcgen05_constants import tcgen05_role_launch_n_width
@@ -858,6 +861,8 @@ def _cluster_n2_n_tile_refusal(
         config.get("tcgen05_cluster_n", 1) != 2
         or config.get(TCGEN05_GROUPED_MODE_CONFIG_KEY) is not None
         or config.get(TILE_N_KEY, 0) != 0
+        # A K-split cluster covers one N tile (its lanes split K).
+        or tcgen05_cluster_split_k(config) > 1
     ):
         return None
     extents = state.matmul_compile_time_static_extents
@@ -1166,7 +1171,8 @@ def _normalize_split_k(
 ) -> None:
     """Keep ``tcgen05_split_k`` at 1 unless the sampled config is a flat
     one-CTA GEMM whose K loop has at least ``split`` tiles, on whole tiles
-    or the flat-edge TMA path (``split_k_flat_edge_tma``).
+    or the flat-edge TMA path (``split_k_flat_edge_tma``), or a 4-CTA
+    cluster split ``_cluster_split_k_refusal`` admits.
 
     The strict pass (``fix_invalid=False``) refuses an explicit split on the
     facts it shares with the split-K pipeline's envelope in ``cute_mma``:
@@ -1174,6 +1180,8 @@ def _normalize_split_k(
     (``split_k_plain_body``) and a K loop at least ``split`` tiles deep.
     The pipeline keeps the plan facts the config layer cannot see (the
     one-CTA TMA pipeline, the tile family, one epilogue warp group).
+    Under ``split_k_reduction="none"`` no split is kept (or, strictly,
+    accepted).
     """
     split = config.get(TCGEN05_SPLIT_K_CONFIG_KEY, 1)
     searched = state.search_enabled and bool(surface.split_k_search_choices(state))
@@ -1190,6 +1198,28 @@ def _normalize_split_k(
                 config[TCGEN05_SPLIT_K_CONFIG_KEY] = 1
             else:
                 config.pop(TCGEN05_SPLIT_K_CONFIG_KEY, None)
+        return
+    if state.split_k_reduction == "none":
+        # Off the surface (``split_k_search_choices``): the knob is absent.
+        if not fix_invalid:
+            raise InvalidConfig(
+                f"{TCGEN05_SPLIT_K_CONFIG_KEY}={split} splits the K loop, which "
+                "split_k_reduction='none' disallows"
+            )
+        config.pop(TCGEN05_SPLIT_K_CONFIG_KEY, None)
+        return
+    if tcgen05_cluster_split_k(config) > 1:
+        # The 4-CTA cluster's pairs split the tile's K (``tcgen05_split_k=2``
+        # on ``tcgen05_cluster_m=2, tcgen05_cluster_n=2``).
+        reason = _cluster_split_k_refusal(state, config)
+        if reason is None:
+            return
+        if not fix_invalid:
+            raise InvalidConfig(reason)
+        if searched:
+            config[TCGEN05_SPLIT_K_CONFIG_KEY] = 1
+        else:
+            config.pop(TCGEN05_SPLIT_K_CONFIG_KEY, None)
         return
     if not fix_invalid:
         reason = _split_k_refusal(state, config, split)
@@ -1230,6 +1260,125 @@ def _normalize_split_k(
             config[TCGEN05_SPLIT_K_CONFIG_KEY] = 1
         else:
             config.pop(TCGEN05_SPLIT_K_CONFIG_KEY, None)
+
+
+def _normalize_split_k_exchange(
+    state: CuteTcgen05Config, config: dict[str, object], *, fix_invalid: bool
+) -> None:
+    """Keep ``tcgen05_split_k_exchange="output"`` (the K-split cluster's
+    partials sent rounded to the 16-bit output dtype) only on a cluster split
+    (``tcgen05_cluster_split_k``) where ``surface.split_k_exchange_admitted``:
+    ``split_k_reduction="output"`` and a 16-bit output.  Elsewhere the knob
+    reads "accumulator" on the search surface and is absent off it."""
+    value = config.get(
+        TCGEN05_SPLIT_K_EXCHANGE_CONFIG_KEY, TCGEN05_SPLIT_K_EXCHANGE_ACCUMULATOR
+    )
+    if value == TCGEN05_SPLIT_K_EXCHANGE_ACCUMULATOR:
+        return
+    if not surface.split_k_exchange_admitted(state):
+        reason = (
+            f'{TCGEN05_SPLIT_K_EXCHANGE_CONFIG_KEY}="output" rounds split-K partials '
+            "to the output dtype: it needs split_k_reduction='output' and a 16-bit "
+            "output"
+        )
+    elif tcgen05_cluster_split_k(config) == 1:
+        reason = (
+            f'{TCGEN05_SPLIT_K_EXCHANGE_CONFIG_KEY}="output" applies to '
+            f"{TCGEN05_SPLIT_K_CONFIG_KEY}=2 on tcgen05_cluster_m=2, "
+            "tcgen05_cluster_n=2"
+        )
+    else:
+        return
+    if not fix_invalid:
+        raise InvalidConfig(reason)
+    if state.search_enabled and surface.split_k_exchange_search_enabled(state):
+        config[TCGEN05_SPLIT_K_EXCHANGE_CONFIG_KEY] = (
+            TCGEN05_SPLIT_K_EXCHANGE_ACCUMULATOR
+        )
+    else:
+        config.pop(TCGEN05_SPLIT_K_EXCHANGE_CONFIG_KEY, None)
+
+
+def _cluster_split_k_refusal(
+    state: CuteTcgen05Config, config: dict[str, object]
+) -> str | None:
+    """Why the 4-CTA cluster cannot split the tile's K
+    (``tcgen05_cluster_split_k``), judged from the config keys and the
+    bind-time facts ``cute_mma``'s envelope reads, or ``None``: the
+    role-local persistent CtaGroup.TWO pipeline on the static scheduler with
+    one A/B-load warp and one epilogue warp group storing through the
+    TMA-store epilogue, over a plain unbatched GEMM of whole tiles whose K
+    splits into whole halves."""
+    view = facts._matmul_config_view(state, config)
+    extents = state.matmul_compile_time_static_extents
+    reason = f"{TCGEN05_SPLIT_K_CONFIG_KEY}=2 on a tcgen05_cluster_n=2 cluster needs "
+    if (
+        config.get("pid_type") not in ("persistent_blocked", "persistent_interleaved")
+        or config.get(TCGEN05_PERSISTENCE_MODEL_CONFIG_KEY, "static_persistent")
+        != "static_persistent"
+        or config.get(TCGEN05_L2_SWIZZLE_SIZE_CONFIG_KEY, 1) != 1
+        or any(
+            config.get(key, 0) != 0
+            for key in (
+                TCGEN05_WARP_SPEC_SCHEDULER_WARPS_KEY,
+                TCGEN05_WARP_SPEC_C_INPUT_WARPS_KEY,
+                TCGEN05_WARP_SPEC_STORE_WARPS_KEY,
+            )
+        )
+        or config.get(TCGEN05_WARP_SPEC_AB_LOAD_WARPS_KEY, 1) != 1
+        or config.get(TCGEN05_EPI_WARP_GROUPS_CONFIG_KEY, 1) != 1
+    ):
+        return reason + (
+            "the static persistent scheduler (a persistent pid_type, no "
+            "scheduler, C-input or store warp, tcgen05_l2_swizzle_size=1) with "
+            "one A/B-load warp and one epilogue warp group"
+        )
+    if state.persistent_reserved_sms > 0:
+        # The grid runs one cluster per tile (``Tcgen05PersistentProgramIDs``),
+        # whatever the SMs ``persistent_reserved_sms`` keeps free.
+        return reason + "no reserved SMs (persistent_reserved_sms=0)"
+    if not state.split_k_plain_body or state.matmul_has_leading_passthrough:
+        # A tile body with another side effect would run it on both pairs.
+        return reason + "a plain unbatched GEMM whose only effect is the tile store"
+    if (
+        state.aux_kernel_detected
+        or config.get(TCGEN05_EPI_ROUND_SUBTILES_CONFIG_KEY, 1) != 1
+    ):
+        # The exchange sums the partials ahead of an epilogue over the
+        # accumulator alone (``store_epilogue``'s split-K exchange loop).
+        return reason + (
+            "an epilogue over the accumulator alone (no auxiliary tensor) "
+            "storing one subtile per round"
+        )
+    # The exchange renders in the TMA-store epilogue only, which codegen
+    # takes for TMA-loaded operands and an output a TensorMap addresses
+    # (``matmul_operands_tma_provable``); the search samples the
+    # register-direct store on every plain tcgen05 kernel.
+    if config.get(TCGEN05_C_STORE_MODE_CONFIG_KEY) == TCGEN05_C_STORE_MODE_DIRECT:
+        return reason + (
+            "the TMA-store epilogue its pairs exchange their partials in "
+            f"({TCGEN05_C_STORE_MODE_CONFIG_KEY}={TCGEN05_C_STORE_MODE_NORMAL!r})"
+        )
+    if not state.matmul_operands_tma_provable:
+        return reason + (
+            "TMA-loaded operands and an output a TensorMap addresses (16-byte "
+            "aligned bases and outer strides) for its TMA-store epilogue"
+        )
+    if view is None or extents is None:
+        return reason + "compile-time static extents"
+    blocks, m_index, n_index, k_index = view
+    bm, bn, bk = blocks[m_index], blocks[n_index], blocks[k_index]
+    k = cast("tuple[int, int, int]", extents)[2]
+    if not (
+        type(bm) is int
+        and type(bn) is int
+        and type(bk) is int
+        and isinstance(k, int)
+        and facts._static_full_tiles(state, bm=bm, bn=bn, bk=bk)
+        and k % (2 * bk) == 0
+    ):
+        return reason + "whole tiles and a K that splits into whole halves of block_k"
+    return None
 
 
 def _split_k_refusal(
@@ -1353,6 +1502,9 @@ def _fix_cluster_m2_search_config(
             config.get("tcgen05_cluster_n", 1) == 2
             and not state.matmul_has_leading_passthrough
             and not _one_wave_cluster_n2_is_valid(state, block_sizes[n_index])
+            # (a K-split cluster covers one N tile, any N tile count:
+            # ``tcgen05_cluster_split_k``)
+            and tcgen05_cluster_split_k(config) == 1
         ):
             config["tcgen05_cluster_n"] = 1
         config["pid_type"] = "persistent_blocked"
@@ -1497,8 +1649,10 @@ def _fix_cluster_m2_search_config(
         # One-wave family: a sampled 256 x {128, 64} CtaGroup.TWO tile
         # keeps its narrow N (the 256x256 projection would leave most SMs
         # idle on these shapes).  cluster_n=2 needs an even N tile count.
-        if config.get("tcgen05_cluster_n", 1) == 2 and not (
-            _one_wave_cluster_n2_is_valid(state, block_sizes[n_index])
+        if (
+            config.get("tcgen05_cluster_n", 1) == 2
+            and not _one_wave_cluster_n2_is_valid(state, block_sizes[n_index])
+            and tcgen05_cluster_split_k(config) == 1
         ):
             config["tcgen05_cluster_n"] = 1
         return
@@ -2286,6 +2440,8 @@ def _normalize_persistent_grid_cap(
     live = (
         not state.matmul_has_leading_passthrough
         and config.get("tcgen05_cluster_n", 1) == 2
+        # (a K-split cluster launches one cluster per tile, whatever the cap)
+        and tcgen05_cluster_split_k(config) == 1
         and pid_type in ("persistent_blocked", "persistent_interleaved")
         and config.get(TCGEN05_PERSISTENCE_MODEL_CONFIG_KEY)
         != Tcgen05PersistenceModel.CLC_PERSISTENT.value
@@ -2298,7 +2454,8 @@ def _normalize_persistent_grid_cap(
         raise InvalidConfig(
             f"{TCGEN05_PERSISTENT_GRID_CAP_CONFIG_KEY}={value!r} requires a "
             "plain (non-batched) static-persistent tcgen05 GEMM with "
-            "tcgen05_cluster_n=2"
+            "tcgen05_cluster_n=2 whose two CTA pairs are not split over K "
+            "(tcgen05_split_k=1)"
         )
 
 
@@ -6089,6 +6246,7 @@ def fix_search_config(state: CuteTcgen05Config, config: dict[str, object]) -> No
     _fix_edge_swizzle_search_config(state, config)
     _fix_persistent_grid_cap_search_config(state, config)
     _normalize_split_k(state, config, fix_invalid=True)
+    _normalize_split_k_exchange(state, config, fix_invalid=True)
     _fix_split_k_workspace_search_config(state, config)
     # The L2 swizzle was clamped in ``normalize_pre_pid_type`` against the
     # sampled tile; the projections above may have widened the N tile or
@@ -6451,6 +6609,7 @@ def _fix_persistent_grid_cap_search_config(
         return
     live = (
         config.get("tcgen05_cluster_n", 1) == 2
+        and tcgen05_cluster_split_k(config) == 1
         and config.get("pid_type") in ("persistent_blocked", "persistent_interleaved")
         and config.get(TCGEN05_PERSISTENCE_MODEL_CONFIG_KEY)
         != Tcgen05PersistenceModel.CLC_PERSISTENT.value
@@ -6616,3 +6775,4 @@ def normalize_strategy(
     # ``fix_search_config`` judged a sampled split on the repaired tuple;
     # the strict pass judges an explicit one here, on the same facts.
     _normalize_split_k(state, config, fix_invalid=fix_invalid)
+    _normalize_split_k_exchange(state, config, fix_invalid=fix_invalid)

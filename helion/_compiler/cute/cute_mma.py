@@ -229,6 +229,9 @@ from .tcgen05_constants import TCGEN05_RADIX_STORE_BOX_N
 from .tcgen05_constants import TCGEN05_ROW_LOOKAHEAD_SLOTS
 from .tcgen05_constants import TCGEN05_SPLIT_K_BARRIER_ID
 from .tcgen05_constants import TCGEN05_SPLIT_K_CONFIG_KEY
+from .tcgen05_constants import TCGEN05_SPLIT_K_EXCHANGE_ACCUMULATOR
+from .tcgen05_constants import TCGEN05_SPLIT_K_EXCHANGE_CONFIG_KEY
+from .tcgen05_constants import TCGEN05_SPLIT_K_EXCHANGE_OUTPUT
 from .tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_M
 from .tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_N
 from .tcgen05_constants import TCGEN05_TWO_CTA_EDGE_TMA_STORE_MAX_AB_STAGES
@@ -8389,6 +8392,12 @@ class Tcgen05PipelinePlan:
     tcgen05_sync_before_scalar_fallback: bool
     tcgen05_is_two_cta: bool
     tcgen05_cluster_n: int
+    # ``tcgen05_cluster_split_k``: K splits of one output tile on the
+    # cluster's N lanes (2 or 1).
+    tcgen05_cluster_split_k: int
+    # The 16-bit output dtype a K-split cluster exchanges its partials in
+    # (``tcgen05_split_k_exchange="output"``), or None for fp32.
+    tcgen05_split_k_exchange_dtype: torch.dtype | None
     tcgen05_role_local_m_edge_tma: bool
     tcgen05_role_local_n_edge_tma: bool
     tcgen05_role_local_double_edge_tma: bool
@@ -9977,10 +9986,46 @@ def plan_tcgen05_pipeline(
         tcgen05_cluster_n = 1
     else:
         tcgen05_cluster_n = tcgen05_cluster_n_requested
+    # ``tcgen05_split_k=2`` on the 4-CTA cluster: its two pairs take one
+    # output tile's two K halves (``tcgen05_cluster_split_k``).  The
+    # pipeline's envelope is checked where the plan's facts are complete
+    # (the split-K setup of ``_emit_mma_pipeline``).
+    tcgen05_cluster_split_k = (
+        2
+        if mma_impl == "tcgen05"
+        and tcgen05_cluster_n == 2
+        and knobs.int_or(knobs.split_k, 1) == 2
+        else 1
+    )
+    # ``tcgen05_split_k_exchange="output"``: the pairs send each other their
+    # partials rounded to the 16-bit output dtype (repair admits it under
+    # ``split_k_reduction="output"`` on a 16-bit output only).
+    tcgen05_split_k_exchange_dtype = None
+    if tcgen05_cluster_split_k > 1 and (
+        cg.device_function.config.get(
+            TCGEN05_SPLIT_K_EXCHANGE_CONFIG_KEY, TCGEN05_SPLIT_K_EXCHANGE_ACCUMULATOR
+        )
+        == TCGEN05_SPLIT_K_EXCHANGE_OUTPUT
+    ):
+        if epi_elem_dtype not in (torch.bfloat16, torch.float16):
+            return refused(
+                exc.InvalidConfig(
+                    f'{TCGEN05_SPLIT_K_EXCHANGE_CONFIG_KEY}="output" exchanges a '
+                    "K-split cluster's partials in a 16-bit output dtype, not "
+                    f"{epi_elem_dtype}"
+                )
+            )
+        tcgen05_split_k_exchange_dtype = epi_elem_dtype
     cluster_n_tiles = (
         (m_size + bm - 1) // bm if row_profile is not None else (n_size + bn - 1) // bn
     )
-    if tcgen05_cluster_n > 1 and cluster_n_tiles % tcgen05_cluster_n != 0:
+    # (A K-split cluster covers one N tile: its scheduler counts two virtual
+    # N tiles per tile, an even count for any N.)
+    if (
+        tcgen05_cluster_n > 1
+        and tcgen05_cluster_split_k == 1
+        and cluster_n_tiles % tcgen05_cluster_n != 0
+    ):
         # The CUTLASS persistent scheduler builds its cluster grid with
         # ceil_div and reports work validity at CLUSTER granularity, so
         # when the N tile count is not divisible by cluster_n the padded
@@ -11973,6 +12018,8 @@ def plan_tcgen05_pipeline(
         tcgen05_sync_before_scalar_fallback=tcgen05_sync_before_scalar_fallback,
         tcgen05_is_two_cta=tcgen05_is_two_cta,
         tcgen05_cluster_n=tcgen05_cluster_n,
+        tcgen05_cluster_split_k=tcgen05_cluster_split_k,
+        tcgen05_split_k_exchange_dtype=tcgen05_split_k_exchange_dtype,
         tcgen05_role_local_m_edge_tma=tcgen05_role_local_m_edge_tma,
         tcgen05_role_local_n_edge_tma=tcgen05_role_local_n_edge_tma,
         tcgen05_role_local_double_edge_tma=tcgen05_role_local_double_edge_tma,
@@ -12290,7 +12337,9 @@ def _ab_tma_wrapper_plan(
         "bn": plan.tcgen05_mma_bn,
         "bk": plan.bk,
         "cluster_m": plan.tcgen05_cluster_m,
-        "cluster_n": plan.tcgen05_cluster_n,
+        # The A multicast width: a K-split cluster's pairs load their own A
+        # (the launch keeps the (2, 2, 1) cluster, ``cluster_shape``).
+        "cluster_n": plan.tcgen05_cluster_n // plan.tcgen05_cluster_split_k,
         "ab_stage_count": plan.tcgen05_ab_stage_count_value,
         "input_dtype": plan.input_dtype_str,
         "acc_dtype": plan.acc_dtype_str,
@@ -12920,9 +12969,11 @@ def _emit_mma_pipeline(
     if plan.tcgen05_is_two_cta and plan.tcgen05_cluster_n > 1:
         # V=2 absorbs cluster_m into the cluster_layout_vmnk V dim; the
         # post-V CTAs along M (= cluster_m // V) carry the B multicast,
-        # while cluster_n CTAs along N carry the A multicast.
+        # while cluster_n CTAs along N carry the A multicast (none on a
+        # K-split cluster, whose pairs load their own A: each pair's MMA
+        # alone releases its ring's stages, ``CooperativeGroup(..., 1)``).
         v_for_mcast = 2 if plan.tcgen05_is_two_cta else 1
-        num_mcast_ctas_a = plan.tcgen05_cluster_n
+        num_mcast_ctas_a = plan.tcgen05_cluster_n // plan.tcgen05_cluster_split_k
         num_mcast_ctas_b = max(1, plan.tcgen05_cluster_m // v_for_mcast)
         tcgen05_ab_consumer_arrive_count_value = num_mcast_ctas_a + num_mcast_ctas_b - 1
     else:
@@ -14015,7 +14066,11 @@ def _emit_mma_pipeline(
             bm=plan.tcgen05_mma_bm,
             bn=plan.tcgen05_mma_bn,
             bk=plan.bk,
-            k_tile_count=(plan.k_total_size + plan.bk - 1) // plan.bk,
+            # (the K tiles each CTA's pipeline walks: a K-split cluster's pair
+            # runs half of them)
+            k_tile_count=(plan.k_total_size + plan.bk - 1)
+            // plan.bk
+            // plan.tcgen05_cluster_split_k,
             cluster_m=plan.tcgen05_cluster_m,
             is_two_cta=plan.tcgen05_is_two_cta,
             uses_role_local_persistent_body=plan.tcgen05_use_role_local_persistent_body,
@@ -14045,6 +14100,7 @@ def _emit_mma_pipeline(
             store_warp_count=tcgen05_warp_spec.store_warps,
             persistence_model=tcgen05_persistence_model_for_plan,
             cluster_n=plan.tcgen05_cluster_n,
+            cluster_split_k=plan.tcgen05_cluster_split_k,
             l2_swizzle_size=tcgen05_plan_l2_swizzle_size,
             tma_store_full_tiles_only=tcgen05_tma_store_full_tiles_only,
             m_subtile_count=plan.tcgen05_m_subtile_count,
@@ -14420,6 +14476,9 @@ def _emit_mma_pipeline(
                     tcgen05_use_2cta_instrs=plan.tcgen05_is_two_cta,
                 )
             )
+    # The K-split cluster's exchange buffer and mbarrier (allocated below).
+    tcgen05_split_k_recv = ""
+    tcgen05_split_k_recv_bar = ""
     if plan.mma_impl == "tcgen05":
         assert plan.tcgen05_plan is not None
         if plan.requested_schedule is not None:
@@ -14596,6 +14655,46 @@ def _emit_mma_pipeline(
                 f"        cute.arch.mbarrier_init({plan.tcgen05_plan.tmem_dealloc_mbar_ptr}, 32)"
             )
             tcgen05_deferred_init_warps.add(tcgen05_tmem_allocator_warp)
+        if plan.tcgen05_cluster_split_k > 1:
+            # The K-split cluster's partial exchange: the fp32 buffer the
+            # partner pair stores half this CTA's tile into (64 x 128 / 2
+            # floats on the 128x128 pair) and the mbarrier those stores
+            # complete their bytes on, initialized with the pipelines' so
+            # the cluster rendezvous publishes it before any partner stores
+            # (``split_k_exchange.render_split_k_cluster_exchange``):
+            #
+            #     tcgen05_split_k_recv_bar = cute.arch.alloc_smem(cutlass.Int64, 1)
+            #     tcgen05_split_k_recv = cute.arch.alloc_smem(cutlass.Float32, 4096, alignment=128)
+            #     ...
+            #     cute.arch.mbarrier_init(tcgen05_split_k_recv_bar, 1)
+            #
+            # (``cutlass.BFloat16`` elements, half the bytes, where the pairs
+            # exchange bf16 partials: ``tcgen05_split_k_exchange="output"``)
+            assert warp_idx is not None
+            tcgen05_split_k_recv_bar = df.new_var("tcgen05_split_k_recv_bar")
+            tcgen05_split_k_recv = df.new_var("tcgen05_split_k_recv")
+            prefix.append(
+                statement_from_string(
+                    f"{tcgen05_split_k_recv_bar} = cute.arch.alloc_smem(cutlass.Int64, 1)"
+                )
+            )
+            prefix.append(
+                statement_from_string(
+                    f"{tcgen05_split_k_recv} = cute.arch.alloc_smem("
+                    + (
+                        "cutlass.Float32"
+                        if plan.tcgen05_split_k_exchange_dtype is None
+                        else env.backend.dtype_str(plan.tcgen05_split_k_exchange_dtype)
+                    )
+                    + f", {(plan.tcgen05_mma_bm // 2) * plan.tcgen05_mma_bn // 2}, alignment=128)"
+                )
+            )
+            tcgen05_deferred_barrier_inits.append(
+                f"if {warp_idx} == cutlass.Int32(0):\n"
+                "    with cute.arch.elect_one():\n"
+                f"        cute.arch.mbarrier_init({tcgen05_split_k_recv_bar}, 1)"
+            )
+            tcgen05_deferred_init_warps.add(0)
         prefix.append(
             statement_from_string(
                 f"{plan.tcgen05_plan.acc_pipeline_barriers} = cute.arch.alloc_smem("
@@ -15293,7 +15392,11 @@ def _emit_mma_pipeline(
     # side effect beside the tile store, too few K tiles -- ahead of this
     # gate, which keeps the plan facts.
     tcgen05_split_k_value = plan.knobs.int_or(plan.knobs.split_k, 1)
-    tcgen05_split_k = tcgen05_split_k_value > 1
+    # ``tcgen05_cluster_split_k``: the 4-CTA cluster's two pairs split one
+    # output tile's K (see below); ``tcgen05_split_k`` alone is the flat
+    # grid's split.
+    tcgen05_cluster_split_k = plan.tcgen05_cluster_split_k > 1
+    tcgen05_split_k = tcgen05_split_k_value > 1 and not tcgen05_cluster_split_k
     tcgen05_split_k_idx = df.new_var("tcgen05_split_k_idx")
     tcgen05_split_k_tile = df.new_var("tcgen05_split_k_tile")
     tcgen05_split_k_tile_begin = df.new_var("tcgen05_split_k_tile_begin")
@@ -15330,15 +15433,67 @@ def _emit_mma_pipeline(
         )
     if tcgen05_split_k:
         df.cute_state.tcgen05.split_k_applied = True
-    split_k_offset = f"{tcgen05_split_k_begin} + " if tcgen05_split_k else ""
-    split_k_tile_offset = f"{tcgen05_split_k_tile_begin} + " if tcgen05_split_k else ""
-    split_k_rel = f" - {tcgen05_split_k_begin}" if tcgen05_split_k else ""
+    # The K-split cluster: pair ``p`` of the (2, 2, 1) cluster (its N-lane
+    # coordinate) runs K tiles ``[p * K / 2, (p + 1) * K / 2)`` of the
+    # cluster's output tile and the two exchange half the tile's fp32
+    # partials through shared memory in the epilogue
+    # (``split_k_exchange.render_split_k_cluster_exchange``).  The scheduler
+    # counts two virtual N tiles per output tile and the grid launches one
+    # cluster per tile (``Tcgen05PersistentProgramIDs``).  Validated
+    # envelope: the role-local persistent CtaGroup.TWO pipeline over a plain
+    # rank-2 GEMM of whole tiles with an even K-tile count, one A/B-load
+    # warp, the static scheduler (no scheduler warp, CLC or swizzle) and the
+    # plain TMA-store epilogue of one warp group, the one store body that
+    # renders the exchange: a register-direct store or an output no
+    # TensorMap addresses (``tcgen05_use_tma_store_epilogue`` off) would
+    # leave each pair storing its own half-K sum.
+    if tcgen05_cluster_split_k and not (
+        plan.mma_impl == "tcgen05"
+        and plan.tcgen05_use_tma_pipeline
+        and plan.tcgen05_is_two_cta
+        and plan.tcgen05_use_role_local_persistent_body
+        and plan.tcgen05_use_role_local_tma_producer
+        and plan.tcgen05_use_role_local_epi
+        and tcgen05_matmul_plan is not None
+        and tcgen05_matmul_plan.scheduler_warp_count == 0
+        and tcgen05_matmul_plan.store_warp_count == 0
+        and tcgen05_matmul_plan.c_input_warp_count == 0
+        and not tcgen05_matmul_plan.is_clc_persistent
+        and tcgen05_matmul_plan.l2_swizzle_size == 1
+        and grouped_mode is None
+        and plan.tcgen05_grouped_plan is None
+        and plan.row_union_plan is None
+        and not plan.rhs_rank3_segment_metadata
+        and not plan.tcgen05_nm_orientation
+        and plan.tcgen05_static_full_tiles
+        and (plan.analysis is None or not plan.analysis.has_leading_passthrough)
+        and plan.tcgen05_m_subtile_count == 1
+        and not plan.tcgen05_cp_async_a
+        and not plan.knobs.ab_startup_prefill
+        and not plan.knobs.materialized_pdl
+        and tcgen05_epi_warp_groups_value == 1
+        and plan.tcgen05_use_tma_store_epilogue
+        and plan.k_total_size % (2 * plan.bk) == 0
+    ):
+        raise exc.InvalidConfig(
+            f"{TCGEN05_SPLIT_K_CONFIG_KEY}=2 on a tcgen05_cluster_n=2 cluster "
+            "requires the role-local persistent CtaGroup.TWO pipeline over a "
+            "plain rank-2 GEMM of whole tiles whose K is a multiple of "
+            "2 * block_k, on the static scheduler (no scheduler warp, CLC or "
+            "tcgen05_l2_swizzle_size) with one epilogue warp group and the "
+            "TMA-store epilogue (tcgen05_c_store_mode='normal', an output a "
+            "TensorMap addresses)"
+        )
+    tcgen05_k_slice = tcgen05_split_k or tcgen05_cluster_split_k
+    split_k_offset = f"{tcgen05_split_k_begin} + " if tcgen05_k_slice else ""
+    split_k_tile_offset = f"{tcgen05_split_k_tile_begin} + " if tcgen05_k_slice else ""
+    split_k_rel = f" - {tcgen05_split_k_begin}" if tcgen05_k_slice else ""
     grouped_plan = plan.tcgen05_grouped_plan
     tcgen05_k_bound_expr: str = (
         cast("str", plan.tcgen05_grouped_problem_k)
         if plan.tcgen05_grouped_k_mask is not None
         else tcgen05_split_k_end
-        if tcgen05_split_k
+        if tcgen05_k_slice
         else f"cutlass.Int32({plan.k_total_size})"
     )
 
@@ -16257,6 +16412,20 @@ def _emit_mma_pipeline(
             tcgen05_use_tma_b_mcast_mask = (
                 plan.tcgen05_cluster_m > 1 or plan.tcgen05_is_two_cta
             )
+            # A K-split cluster's pairs load different K halves of the same
+            # A rows, so A is partitioned, masked and multicast like B
+            # (along the cluster's M mode: within the pair) instead of
+            # across the N lanes:
+            #
+            #     # cluster_n=2: one A load fills both pairs' rings
+            #     tma_a_cta_layout = cute.make_layout(cute.slice_(tcgen05_cluster_layout_vmnk, (0, 0, None, 0)).shape)
+            #     tma_a_cta_coord = tcgen05_block_in_cluster_coord_vmnk[2]
+            #     tcgen05_a_mcast_mask = ...create_tma_multicast_mask(..., mcast_mode=2)
+            #     # K split: each pair loads its own half
+            #     tma_a_cta_layout = cute.make_layout(cute.slice_(tcgen05_cluster_layout_vmnk, (0, None, 0, 0)).shape)
+            #     tma_a_cta_coord = tcgen05_block_in_cluster_coord_vmnk[1]
+            #     tcgen05_a_mcast_mask = ...create_tma_multicast_mask(..., mcast_mode=1)
+            tcgen05_a_mode_like_b = plan.tcgen05_cluster_split_k > 1
             if plan.tcgen05_is_two_cta:
                 prefix.append(
                     statement_from_string(
@@ -16264,7 +16433,11 @@ def _emit_mma_pipeline(
                         if plan.row_profile is not None
                         else f"{tma_a_cta_layout} = cute.make_layout("
                         f"cute.slice_({plan.tcgen05_cluster_layout_vmnk}, "
-                        "(0, 0, None, 0)).shape)"
+                        + (
+                            "(0, None, 0, 0)).shape)"
+                            if tcgen05_a_mode_like_b
+                            else "(0, 0, None, 0)).shape)"
+                        )
                     )
                 )
                 prefix.append(
@@ -16299,7 +16472,8 @@ def _emit_mma_pipeline(
                         statement_from_string(
                             f"{tma_a_cta_coord} = 0"
                             if plan.row_profile is not None
-                            else f"{tma_a_cta_coord} = {tma_block_in_cluster_coord_vmnk}[2]"
+                            else f"{tma_a_cta_coord} = {tma_block_in_cluster_coord_vmnk}"
+                            f"[{1 if tcgen05_a_mode_like_b else 2}]"
                         )
                     )
                     prefix.append(
@@ -16307,12 +16481,42 @@ def _emit_mma_pipeline(
                             f"{tma_b_cta_coord} = {tma_block_in_cluster_coord_vmnk}[1]"
                         )
                     )
+                if plan.tcgen05_cluster_split_k > 1:
+                    # Each pair's K half, from its N-lane cluster coordinate
+                    # (fixed for the CTA: the grid runs one cluster per tile);
+                    # every role reads it.  K = 4096 on 64-wide k-blocks:
+                    #
+                    #     tcgen05_split_k_idx = tcgen05_block_in_cluster_coord_vmnk[2]
+                    #     tcgen05_split_k_tile_begin = tcgen05_split_k_idx * cutlass.Int32(32)
+                    #     tcgen05_split_k_begin = tcgen05_split_k_tile_begin * cutlass.Int32(64)
+                    #     tcgen05_split_k_end = tcgen05_split_k_begin + cutlass.Int32(2048)
+                    tcgen05_cluster_split_k_tiles = (
+                        tcgen05_split_k_tiles_total // plan.tcgen05_cluster_split_k
+                    )
+                    prefix.extend(
+                        statement_from_string(line)
+                        for line in (
+                            f"{tcgen05_split_k_idx} = {tma_block_in_cluster_coord_vmnk}[2]",
+                            (
+                                f"{tcgen05_split_k_tile_begin} = {tcgen05_split_k_idx} * "
+                                f"cutlass.Int32({tcgen05_cluster_split_k_tiles})"
+                            ),
+                            (
+                                f"{tcgen05_split_k_begin} = {tcgen05_split_k_tile_begin} * "
+                                f"cutlass.Int32({plan.bk})"
+                            ),
+                            (
+                                f"{tcgen05_split_k_end} = {tcgen05_split_k_begin} + "
+                                f"cutlass.Int32({tcgen05_cluster_split_k_tiles * plan.bk})"
+                            ),
+                        )
+                    )
                 if plan.tcgen05_is_two_cta:
                     prefix.append(
                         statement_from_string(
                             f"{tma_a_mcast_mask} = cute.nvgpu.cpasync.create_tma_multicast_mask("
                             f"{plan.tcgen05_cluster_layout_vmnk}, {tma_block_in_cluster_coord_vmnk}, "
-                            "mcast_mode=2)"
+                            f"mcast_mode={1 if tcgen05_a_mode_like_b else 2})"
                         )
                     )
                 if tcgen05_use_tma_b_mcast_mask:
@@ -16432,6 +16636,15 @@ def _emit_mma_pipeline(
                     )
                 )
             )
+            # A K-split cluster's MMA releases its own pair's stages only: the
+            # other pair loads (and frees) a different K half.  The empty
+            # barriers' arrival mask drops the A-multicast peers (the
+            # cluster's other N lane), ``mcast_mode_mn=(0, 1)``; without it
+            # pair 0's MMA would also arrive on pair 1's empty barriers and
+            # release stages pair 1 has not consumed.
+            tcgen05_ab_mcast_mode_arg = (
+                ", mcast_mode_mn=(0, 1)" if plan.tcgen05_cluster_split_k > 1 else ""
+            )
             if tcgen05_split_barrier_init:
                 prefix.append(
                     statement_from_string(
@@ -16441,7 +16654,8 @@ def _emit_mma_pipeline(
                         f"consumer_group={tma_pipeline_consumer_group}, "
                         f"tx_count={tma_pipeline_tx_count}, "
                         f"barrier_storage={tma_pipeline_mbars}, "
-                        f"cta_layout_vmnk={plan.tcgen05_cluster_layout_vmnk})"
+                        f"cta_layout_vmnk={plan.tcgen05_cluster_layout_vmnk}"
+                        f"{tcgen05_ab_mcast_mode_arg})"
                     )
                 )
                 # The A/B ring holds most of the plan.barriers: its full and empty
@@ -16469,7 +16683,7 @@ def _emit_mma_pipeline(
                         f"tx_count={tma_pipeline_tx_count}, "
                         f"barrier_storage={tma_pipeline_mbars}, "
                         f"cta_layout_vmnk={plan.tcgen05_cluster_layout_vmnk}"
-                        f"{tcgen05_defer_pipeline_sync_arg})"
+                        f"{tcgen05_ab_mcast_mode_arg}{tcgen05_defer_pipeline_sync_arg})"
                     )
                 )
             prefix.append(
@@ -16707,6 +16921,20 @@ def _emit_mma_pipeline(
                             emitted.per_tile_stmt(
                                 tcgen05_clc_throttle_credit,
                                 tma_load=plan.tcgen05_use_role_local_tma_producer,
+                            )
+                        if tcgen05_cluster_split_k:
+                            # Both the TMA-load role's and the MMA role's K
+                            # loops (clones of this header) walk the pair's
+                            # half:
+                            #     for tile_offset_2 in range(tcgen05_split_k_begin, tcgen05_split_k_end, cutlass.Int32(_BLOCK_SIZE_2)):
+                            k_loop_iter = plan.device_loop.for_node.iter
+                            assert isinstance(k_loop_iter, ast.Call)
+                            assert len(k_loop_iter.args) == 3
+                            k_loop_iter.args[0] = cast(
+                                "ast.expr", expr_from_string(tcgen05_split_k_begin)
+                            )
+                            k_loop_iter.args[1] = cast(
+                                "ast.expr", expr_from_string(tcgen05_split_k_end)
                             )
                         if tcgen05_split_k:
                             # The flag slot is CTA-wide shared memory (every
@@ -17611,7 +17839,7 @@ def _emit_mma_pipeline(
                         next_full_tile_src = (
                             f"{plan.m_offset_var} + cutlass.Int32({plan.bm}) <= cutlass.Int32({plan.m_size}) "
                             f"and {plan.n_offset_var} + cutlass.Int32({plan.bn}) <= cutlass.Int32({plan.n_size}) "
-                            f"and {plan.k_offset_var} + cutlass.Int32({plan.bk * (plan.tcgen05_ab_stage_count_value + 1)}) <= {tcgen05_split_k_end if tcgen05_split_k else f'cutlass.Int32({plan.k_total_size})'}"
+                            f"and {plan.k_offset_var} + cutlass.Int32({plan.bk * (plan.tcgen05_ab_stage_count_value + 1)}) <= {tcgen05_split_k_end if tcgen05_k_slice else f'cutlass.Int32({plan.k_total_size})'}"
                         )
                     cg.add_statement(
                         statement_from_string(
@@ -18127,6 +18355,12 @@ def _emit_mma_pipeline(
                 role_local_tile_counter=tma_store_role_tile_counter,
                 last_tile_smem=smem_a_ptr if tcgen05_last_tile_staging else "",
                 last_tile_next_work=tcgen05_last_tile_next_work,
+                split_k_cluster_idx=(
+                    tcgen05_split_k_idx if tcgen05_cluster_split_k else ""
+                ),
+                split_k_cluster_recv=tcgen05_split_k_recv,
+                split_k_cluster_recv_bar=tcgen05_split_k_recv_bar,
+                split_k_cluster_exchange_dtype=plan.tcgen05_split_k_exchange_dtype,
                 use_role_local_epi=plan.tcgen05_use_role_local_epi,
                 use_tma_store_epilogue=plan.tcgen05_use_tma_store_epilogue,
                 tma_store_full_tiles_only=tcgen05_tma_store_full_tiles_only,

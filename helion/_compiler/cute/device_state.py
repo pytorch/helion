@@ -329,6 +329,15 @@ class CuteTcgen05StoreValue(_CuteTcgen05OrientationMixin):
     # not valid); "" on every other store.
     last_tile_smem: str = ""
     last_tile_next_work: str = ""
+    # The K-split cluster's partial exchange (``tcgen05_cluster_split_k``):
+    # the pair's split index, the receive buffer and its transaction mbarrier
+    # (``split_k_exchange.render_split_k_cluster_exchange``); "" on every other
+    # store. The buffer holds fp32 partials, or the 16-bit output dtype's
+    # (``split_k_cluster_exchange_dtype``, ``tcgen05_split_k_exchange="output"``).
+    split_k_cluster_idx: str = ""
+    split_k_cluster_recv: str = ""
+    split_k_cluster_recv_bar: str = ""
+    split_k_cluster_exchange_dtype: torch.dtype | None = None
     use_role_local_epi: bool = False
     use_tma_store_epilogue: bool = False
     tma_store_full_tiles_only: bool = False
@@ -439,6 +448,12 @@ class CuteTcgen05MatmulPlan(_CuteTcgen05OrientationMixin):
     store_warp_count: int = 0
     persistence_model: str = "static_persistent"
     cluster_n: int = 1
+    # K splits per output tile on the cluster's N lanes
+    # (``tcgen05_cluster_split_k``): 2 makes the two CTA pairs of a
+    # ``cluster_n=2`` cluster split one tile's K instead of taking two N
+    # tiles; the scheduler then counts ``cluster_split_k`` virtual N tiles
+    # per output tile.
+    cluster_split_k: int = 1
     l2_swizzle_size: int = 1
     tma_store_full_tiles_only: bool = False
     # M-paired tiles: number of 256-row UMMA subtiles per work tile along M

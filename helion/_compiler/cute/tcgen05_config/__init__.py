@@ -29,6 +29,7 @@ if TYPE_CHECKING:
     from ....autotuner.config_spec import BlockSizeSpec
     from ....autotuner.config_spec import ConfigSpec
     from ....runtime.config import PidTypeLiteral
+    from ....runtime.settings import SplitKReduction
     from ..dense_gemm import DenseGemmFacts
     from ..epilogue_fanout import PairedFanoutPlan
     from ..grouped_prefix_adaptive_n import GroupedPrefixAdaptiveNProfile
@@ -118,6 +119,11 @@ class CuteTcgen05Config:
         # Split-K runs whole tiles or the flat-edge TMA path: the
         # ``cute_flat_edge_tma`` setting, recorded at bind.
         self.split_k_flat_edge_tma: bool = True
+        # The ``split_k_reduction`` setting, recorded at bind: "none" keeps
+        # ``tcgen05_split_k`` off the search, the seeds and the defaults, and
+        # the repair refuses it; "output" offers the cluster split's 16-bit
+        # exchange (``tcgen05_split_k_exchange``).
+        self.split_k_reduction: SplitKReduction = "accumulator"
         # The device program runs an ``hl.atomic_*`` (``DeviceIR.has_atomic_ops``):
         # codegen refuses it beside the CtaGroup.TWO pair's shared tiles
         # (``reject_atomics_beside_warp_roles``). Set at bind.

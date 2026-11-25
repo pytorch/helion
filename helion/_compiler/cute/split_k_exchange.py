@@ -11,6 +11,8 @@ time (the generated code calls it inside the kernel body).
 
 from __future__ import annotations
 
+import ast
+import dataclasses
 from typing import TYPE_CHECKING
 from typing import Any
 from typing import cast
@@ -23,9 +25,13 @@ from ...language import device_print
 from ...language import distributed_ops
 from ...language import inline_asm_ops
 from ...language import memory_ops
+from ..ast_extension import statement_from_string
 
 if TYPE_CHECKING:
     import cutlass.cute as cute
+
+    from ..device_function import DeviceFunction
+    from .tcgen05_epilogue_rounds import Tcgen05EpilogueRoundNames
 
 # ``tcgen05.ld`` op class -> its ``tcgen05.st`` mirror (same datapath shape).
 _STORE_OP_NAMES: dict[str, str] = {
@@ -310,3 +316,223 @@ _SIDE_EFFECT_MODULES = frozenset(
     module.__name__
     for module in (atomic_ops, barrier, device_print, distributed_ops, inline_asm_ops)
 )
+
+
+# The K-split cluster's device helpers (``_split_k_cluster_runtime``), imported
+# once per generated module.
+SPLIT_K_CLUSTER_RUNTIME = "_helion_skc"
+_SPLIT_K_CLUSTER_PREAMBLE = f"import helion._compiler.cute._split_k_cluster_runtime as {SPLIT_K_CLUSTER_RUNTIME}"
+
+
+def split_k_cluster_runtime(device_function: DeviceFunction) -> str:
+    """The alias of the K-split cluster's runtime module, importing it once."""
+    statements = device_function.codegen.module_statements
+    if not any(ast.unparse(stmt) == _SPLIT_K_CLUSTER_PREAMBLE for stmt in statements):
+        statements.append(statement_from_string(_SPLIT_K_CLUSTER_PREAMBLE))
+    return SPLIT_K_CLUSTER_RUNTIME
+
+
+@dataclasses.dataclass(frozen=True)
+class Tcgen05SplitKClusterNames:
+    """Generated-source names of the K-split cluster's exchange, beside the
+    rounds renderer's (``Tcgen05EpilogueRoundNames``): the epilogue thread
+    index, the pair's split index (its N-lane cluster coordinate), the fp32
+    receive buffer, its transaction mbarrier and the runtime alias."""
+
+    rounds: Tcgen05EpilogueRoundNames
+    epi_tidx: str
+    split_idx: str
+    recv: str
+    recv_bar: str
+    runtime: str
+
+
+def render_split_k_cluster_exchange(
+    names: Tcgen05SplitKClusterNames,
+    *,
+    acc_rhs: str,
+    acc_prelude: str,
+    subtile_count: int,
+    device_subtile_count: str,
+    c_stage_count: int,
+    epi_threads: int,
+    half_exchange: str | None = None,
+) -> str:
+    """The TMA-store epilogue of a K-split cluster's output tile
+    (``tcgen05_cluster_split_k``): a reduce-scatter of the two pairs' fp32
+    partials, then the plain store of this pair's half of the subtiles.
+
+    Pair ``p`` (``names.split_idx``) owns subtiles ``[p * h, (p + 1) * h)``
+    of the ``2h`` epilogue subtiles.  Each epilogue thread loads the other
+    pair's subtiles from TMEM and stores its fragment into the partner CTA
+    (cluster rank ``rank ^ 2``: the other pair's CTA holding the same 64
+    rows, whose thread ``t`` owns the same output elements) with
+    ``st.async``, 16 bytes per store, laid out ``[subtile][vector][thread]``
+    so a warp's 32 stores fill 512 contiguous bytes (conflict-free); then it
+    loads its own subtiles, releases the accumulator, waits for the
+    partner's bytes on ``names.recv_bar`` (armed with the expected count
+    before the accumulator wait) and adds them before the identity
+    conversion and the TMA store.  bf16 1024x512x4096 on 128x128 pairs (two
+    64x64 subtiles per CTA, 32 values per thread)::
+
+        if tcgen05_epi_tidx == cutlass.Int32(0):
+            cute.arch.mbarrier_arrive_and_expect_tx(skc_recv_bar, 1 * skc_frag * 128 * 4)
+        tcgen05_acc_pipeline.consumer_wait(tcgen05_acc_consumer_state)
+        for skc_s in cutlass.range_constexpr(1):       # the partner's subtile
+            cute.copy(t2r, tTR_tAcc[None, None, None, skc_theirs + skc_s], tTR_rAcc)
+            for skc_j in cutlass.range_constexpr(skc_frag // 4):
+                _helion_skc.st_async_f32x4(skc_remote_recv + ((skc_s * 8 + skc_j) * 128 + tidx) * 16,
+                                           skc_remote_bar, tTR_rAcc[4 * skc_j], ...)
+        ...load own subtile; release the accumulator...
+        cute.arch.mbarrier_wait(skc_recv_bar, 0)
+        for skc_s in cutlass.range_constexpr(1):       # own subtile: add, store
+            tTR_rAcc[4 * j + e] = skc_own[skc_s][4 * j + e] + skc_recv_view[skc_s, j, tidx, e]
+            ...convert, R2S into the C ring, TMA store of subtile skc_mine + skc_s...
+
+    ``acc_rhs`` converts the carrier (``names.rounds.trs_racc``) once the
+    partials are summed into it, after ``acc_prelude``: the epilogue chain's
+    steps over the accumulator alone (``torch.relu(acc)``), empty for the
+    identity cast.  ``subtile_count`` is the host's count of the plan's
+    subtiles, which the generated code asserts against the layout's
+    (``device_subtile_count``, a trace-time constant), so a disagreement
+    fails the compile instead of leaving subtiles unwritten.
+
+    ``half_exchange`` ("bf16" or "f16", ``tcgen05_split_k_exchange="output"``)
+    sends the partials rounded to the 16-bit output dtype, eight per 16-byte
+    store into a receive buffer of that dtype, half the bytes; the receiver
+    still adds them to its own fp32 partials::
+
+        for skc_j in cutlass.range_constexpr(skc_frag // 8):
+            _helion_skc.st_async_b32x4(
+                skc_remote_recv + ((skc_s * 4 + skc_j) * 128 + tidx) * 16,
+                skc_remote_bar,
+                _helion_skc.pack_bf16x2(tTR_rAcc[8 * skc_j], tTR_rAcc[8 * skc_j + 1]),
+                ...,
+            )
+        ...
+        tTR_rAcc[8 * j + e] = skc_own[skc_s][8 * j + e] + cutlass.Float32(
+            skc_recv_view[skc_s, j, tidx, e]
+        )
+
+    No CTA leaves while the partner may still write into it: each one waits
+    for all the bytes it expects, and the grid runs one tile per cluster
+    (``Tcgen05PersistentProgramIDs``), so a receive buffer and its phase
+    serve one tile and a C buffer is reused only within the tile (subtile
+    ``s`` stages in buffer ``s % c_stage_count``, acquired past the first
+    ``c_stage_count``).
+    """
+    r = names.rounds
+    # (the carrier the conversion reads: in the identity cast itself, or in
+    # the chain's prelude, ``acc_loaded = carrier.load()``)
+    assert r.trs_racc in acc_rhs + acc_prelude, (r.trs_racc, acc_rhs, acc_prelude)
+    if subtile_count % 2:
+        raise exc.BackendUnsupported(
+            "cute",
+            f"tcgen05_split_k=2 on a 4-CTA cluster splits the tile's {subtile_count} "
+            "epilogue subtiles between its two pairs: an even subtile count",
+        )
+    half = subtile_count // 2
+    rt = names.runtime
+    tidx = names.epi_tidx
+    # values per 16-byte store, and their bytes
+    per, itemsize = (8, 2) if half_exchange else (4, 4)
+    vec_stride = per * epi_threads
+    body = [
+        f"assert cutlass.const_expr({device_subtile_count} == {subtile_count})",
+        f"skc_frag = cute.size({r.ttr_racc})",
+        *(
+            # (a thread's fragment in whole 8-value stores)
+            ["assert cutlass.const_expr(skc_frag % 8 == 0)"] if half_exchange else []
+        ),
+        (
+            f"skc_recv_view = cute.make_tensor({names.recv}, cute.make_layout("
+            f"({half}, skc_frag // {per}, {epi_threads}, {per}), "
+            f"stride=((skc_frag // {per}) * {vec_stride}, {vec_stride}, {per}, 1)))"
+        ),
+        f"skc_mine = {names.split_idx} * cutlass.Int32({half})",
+        f"skc_theirs = (cutlass.Int32(1) - {names.split_idx}) * cutlass.Int32({half})",
+        f"if {tidx} == cutlass.Int32(0):",
+        (
+            f"    cute.arch.mbarrier_arrive_and_expect_tx({names.recv_bar}, "
+            f"{half} * skc_frag * {epi_threads} * {itemsize})"
+        ),
+        f"{r.acc_pipeline}.consumer_wait({r.acc_consumer_state})",
+        (
+            "skc_peer = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())"
+            " ^ cutlass.Int32(2)"
+        ),
+        f"skc_remote_recv = {rt}.peer_smem_address({names.recv}, skc_peer)",
+        f"skc_remote_bar = {rt}.peer_smem_address({names.recv_bar}, skc_peer)",
+        f"for skc_s in cutlass.range_constexpr({half}):",
+        f"    {r.ttr_tacc_mn} = {r.ttr_tacc}[(None, None, None, skc_theirs + cutlass.Int32(skc_s))]",
+        f"    cute.copy({r.tiled_copy_t2r}, {r.ttr_tacc_mn}, {r.ttr_racc})",
+        f"    for skc_j in cutlass.range_constexpr(skc_frag // {per}):",
+        (
+            f"        {rt}.{'st_async_b32x4' if half_exchange else 'st_async_f32x4'}("
+            f"skc_remote_recv + ((cutlass.Int32(skc_s) * "
+            f"cutlass.Int32(skc_frag // {per}) + cutlass.Int32(skc_j)) * "
+            f"cutlass.Int32({epi_threads}) + {tidx}) * cutlass.Int32(16), "
+            "skc_remote_bar, "
+            + ", ".join(
+                f"{rt}.pack_{half_exchange}x2({r.ttr_racc}[8 * skc_j + {2 * w}], "
+                f"{r.ttr_racc}[8 * skc_j + {2 * w + 1}])"
+                if half_exchange
+                else f"{r.ttr_racc}[4 * skc_j + {w}]"
+                for w in range(4)
+            )
+            + ")"
+        ),
+        (
+            f"skc_own = [cute.make_rmem_tensor({r.ttr_racc}.shape, cutlass.Float32)"
+            f" for _ in range({half})]"
+        ),
+        f"for skc_s in cutlass.range_constexpr({half}):",
+        (
+            f"    cute.copy({r.tiled_copy_t2r}, {r.ttr_tacc}[(None, None, None, "
+            "skc_mine + cutlass.Int32(skc_s))], skc_own[skc_s])"
+        ),
+        "cute.arch.fence_view_async_tmem_load()",
+        "with cute.arch.elect_one():",
+        f"    {r.acc_pipeline}.consumer_release({r.acc_consumer_state})",
+        f"cute.arch.mbarrier_wait({names.recv_bar}, 0)",
+    ]
+    for subtile in range(half):
+        recv = f"skc_recv_view[{subtile}, skc_j, {tidx}, skc_e]"
+        if half_exchange:
+            recv = f"cutlass.Float32({recv})"
+        if subtile >= c_stage_count:
+            body.extend(
+                [
+                    f"if {r.epi_leader_predicate}:",
+                    f"    {r.c_pipeline}.producer_acquire()",
+                    f"{r.epilog_sync_barrier}.arrive_and_wait()",
+                ]
+            )
+        body.extend(
+            [
+                f"for skc_j in cutlass.range_constexpr(skc_frag // {per}):",
+                f"    for skc_e in cutlass.range_constexpr({per}):",
+                (
+                    f"        {r.ttr_racc}[{per} * skc_j + skc_e] = skc_own[{subtile}][{per} * skc_j + skc_e]"
+                    f" + {recv}"
+                ),
+                *(line for line in acc_prelude.splitlines() if line.strip()),
+                f"{r.acc_vec} = {acc_rhs}",
+                f"{r.trs_rd}.store({r.acc_vec})",
+                # (the plain loop's barrier ahead of the R2S copy, which
+                # publishes the leader's C-buffer acquire; the measured
+                # prototype kept it on every subtile)
+                f"{r.epilog_sync_barrier}.arrive_and_wait()",
+                f"{r.c_buffer} = cutlass.Int32({subtile % c_stage_count})",
+                f"cute.copy({r.tiled_copy_r2s}, {r.trs_rd}, {r.trs_sd}[(None, None, None, {r.c_buffer})])",
+                "cute.arch.fence_view_async_shared()",
+                f"{r.epilog_sync_barrier}.arrive_and_wait()",
+                f"if {r.epi_leader_predicate}:",
+                (
+                    f"    cute.copy({r.tma_store_atom}, {r.bsg_sd}[(None, {r.c_buffer})], "
+                    f"{r.bsg_gd}[(None, skc_mine + cutlass.Int32({subtile}))]{r.tma_desc_arg})"
+                ),
+                f"    {r.c_pipeline}.producer_commit()",
+            ]
+        )
+    return f"if {r.epi_active}:\n" + "".join(f"    {line}\n" for line in body)
