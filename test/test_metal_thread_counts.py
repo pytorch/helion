@@ -5,6 +5,7 @@ tiles past the three thread axes.  Binds CPU tensors only."""
 
 from __future__ import annotations
 
+import math
 from typing import TYPE_CHECKING
 import unittest
 
@@ -15,6 +16,7 @@ import helion
 from helion._compiler.metal.thread_counts import launch_threads
 from helion._compiler.metal.thread_counts import serialize_auto_threads
 from helion._compiler.metal.thread_counts import shrink_tile_threads
+from helion._testing import import_example
 from helion._testing import skipUnlessBackends
 from helion._testing.metal_codegen import launch_dims
 import helion.language as hl
@@ -24,6 +26,11 @@ if TYPE_CHECKING:
 
 # Metal codegen only: other backends' CPU lanes skip the module.
 pytestmark = [pytest.mark.cpu_only, skipUnlessBackends(["metal"])]
+
+
+softmax_two_pass = helion.kernel(
+    import_example("softmax").softmax_two_pass.fn, backend="metal", static_shapes=True
+)
 
 
 @helion.kernel(backend="metal", static_shapes=True)
@@ -194,6 +201,22 @@ class TestThreadCounts(unittest.TestCase):
                     )
                 )
                 self.assertEqual(launch_dims(code), (64, 2, 1))
+
+    def test_nested_explicit_threads_over_threadgroup(self) -> None:
+        """Nested explicit counts multiply with the grid's threads; past
+        Metal's 1024 per threadgroup they shrink, last block first, so the
+        launch fits instead of failing at dispatch (#4627).  A launch that
+        fits keeps its counts."""
+        x = torch.randn(4096, 256, dtype=torch.float16)
+        bound = softmax_two_pass.bind((x,))
+        code = bound.to_code(
+            helion.Config(block_sizes=[256, 32], num_threads=[512, 256], num_warps=4)
+        )
+        self.assertLessEqual(math.prod(launch_dims(code)), 1024)
+        code = bound.to_code(
+            helion.Config(block_sizes=[256, 32], num_threads=[512, 8], num_warps=4)
+        )
+        self.assertEqual(launch_dims(code), (8, 128, 1))
 
 
 if __name__ == "__main__":
