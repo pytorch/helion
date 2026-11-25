@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import ast
 import functools
 import itertools
 import os
+import re
 import tempfile
 import unittest
 from unittest import mock
@@ -24,9 +26,15 @@ from helion._testing import TestCase
 from helion._testing import code_and_output
 from helion._testing import skipIfRefEager
 from helion._testing import skipUnlessGluon
+from helion._testing.gluon_kernels import filled_after_a_lagging_body
+from helion._testing.gluon_kernels import filled_beside_two_dots
 from helion._testing.gluon_kernels import gather_rms_norm
+from helion._testing.gluon_kernels import live_mm_scale_mm
 from helion._testing.gluon_kernels import mm_then_mm
+from helion._testing.gluon_kernels import mm_then_scaled_mm
+from helion._testing.gluon_kernels import scale_then_chunked_wx
 from helion._testing.gluon_kernels import scale_then_nested_wx
+from helion._testing.gluon_kernels import scale_then_normed_wx
 from helion._testing.gluon_kernels import scale_then_two_wx
 from helion._testing.gluon_kernels import scale_then_wx
 from helion._testing.gluon_kernels import scale_then_wx_and_f16_vx
@@ -35,11 +43,13 @@ from helion._testing.gluon_kernels import scaled_gather_rms_norm
 from helion._testing.gluon_kernels import split_k_gemv
 from helion._testing.gluon_kernels import split_k_halves
 from helion._testing.gluon_kernels import split_k_parts
+from helion._testing.gluon_kernels import wx_then_scaled_vx
 from helion._testing.timeline_checks import check_written
 from helion._testing.triton_codegen import GLUON_RING_CONFIG as RING
 from helion._testing.triton_codegen import gluon_tail_ring_config
 import helion.language as hl
 from helion.runtime import timeline
+from helion.runtime.triton import dist_utils
 from helion.runtime.triton.launcher import get_cluster_capacity
 
 
@@ -75,6 +85,32 @@ def mm_times_total(
             # Every task reads the first root whole: one wait serves all of them.
             out[tile_m, tile_n] = acc * torch.sum(part[:])
     return out
+
+
+@helion.kernel(static_shapes=True, backend="gluon")
+def live_barrier_chain(
+    x: torch.Tensor, w: torch.Tensor, rows: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """``x + 1``, the first ``rows`` rows of ``w`` times all of it, then ``x +
+    1`` plus the product's total: root barriers chain the roots, the last one's
+    read of ``x + 1`` relying on the middle one's barrier, which it publishes
+    after waiting on the first one's."""
+    m, n = x.size()
+    r, _ = w.size()
+    act = torch.empty_like(x)
+    out = torch.zeros([r, n], dtype=torch.float32, device=x.device)
+    res = torch.empty_like(x)
+    for tile_m, tile_n in hl.tile([m, n]):
+        act[tile_m, tile_n] = x[tile_m, tile_n] + 1
+    for tile_r in hl.tile(r, block_size=16):
+        if tile_r.begin < rows[0]:
+            weight = w[tile_r, :]
+            out[tile_r, :] = hl.dot(
+                weight, act[:, :].to(torch.bfloat16), out_dtype=torch.float32
+            )
+    for tile_m, tile_n in hl.tile([m, n]):
+        res[tile_m, tile_n] = act[tile_m, tile_n] + torch.sum(out[:, :], dim=[0, 1])
+    return act, out, res
 
 
 @helion.kernel(static_shapes=True, backend="gluon")
@@ -252,6 +288,83 @@ def fp4_mm(
 
 
 @helion.kernel(static_shapes=True, backend="gluon")
+def fp4_rows_by_tokens(
+    w: torch.Tensor, w_scale: torch.Tensor, x: torch.Tensor, x_scale: torch.Tensor
+) -> torch.Tensor:
+    """nvfp4 weight rows times 16 tokens in 512-wide K steps: each 128-row tile's
+    step scales as stored for tcgen05.cp (``w_scale[tile, step]``, [16, 256]
+    viewed [128, 32]), the tokens' as loaded ([16, 32], through registers)."""
+    n, packed = w.size()
+    tokens = x.size(0)
+    steps = packed // 256
+    w_steps = w.view(n, steps, 256)
+    x_steps = x.view(tokens, steps, 256)
+    x_scale_steps = x_scale.view(tokens, steps, 32)
+    out = torch.empty([n, tokens], dtype=torch.float32, device=w.device)
+    for tile in hl.tile(n // 128, block_size=1):
+        acc = hl.zeros([128, tokens], dtype=torch.float32)
+        for step in hl.tile(steps, block_size=1):
+            acc = hl.dot_scaled(
+                w_steps[tile.begin * 128 + hl.arange(128), step.begin, :],
+                w_scale[tile.begin, step.begin, :, :]
+                .reshape(8, 32, 4, 4)
+                .permute(2, 1, 0, 3)
+                .reshape(128, 32),
+                "e2m1",
+                x_steps[:, step.begin, :].T,
+                x_scale_steps[:, step.begin, :],
+                "e2m1",
+                acc=acc,
+            )
+        out[tile.begin * 128 + hl.arange(128), :] = acc
+    return out
+
+
+@functools.cache
+def _fp4_rows_by_tokens_reference() -> tuple[tuple[torch.Tensor, ...], torch.Tensor]:
+    """``fp4_rows_by_tokens`` inputs in 12 K steps, with distinct scales per step
+    and tile, and the one-stage ring's output every deeper ring must reproduce
+    exactly."""
+    e4m3 = torch.float8_e4m3fn
+    n, steps = 768, 12
+    w = torch.randint(0, 256, [n, steps * 256], dtype=torch.uint8, device=DEVICE)
+    x = torch.randint(0, 256, [16, steps * 256], dtype=torch.uint8, device=DEVICE)
+    w_scale = torch.rand([n // 128, steps, 16, 256], device=DEVICE) + 0.5
+    x_scale = torch.rand([16, steps * 32], device=DEVICE) + 0.5
+    args = (w, w_scale.to(e4m3), x, x_scale.to(e4m3))
+    _, expected = code_and_output(fp4_rows_by_tokens, args, **{**RING, "num_stages": 1})
+    return args, expected
+
+
+@helion.kernel(static_shapes=True, backend="gluon")
+def fp4_mm_nt(
+    x: torch.Tensor,
+    x_scale: torch.Tensor,
+    y: torch.Tensor,
+    y_scale: torch.Tensor,
+    block_n: hl.constexpr,
+) -> torch.Tensor:
+    """mxfp4 with both operands K-major; ``block_n`` columns per tile."""
+    m, packed = x.size()
+    n = y.size(0)
+    out = torch.empty([m, n], dtype=torch.float32, device=x.device)
+    for tile_m, tile_n in hl.tile([m, n], block_size=[128, block_n]):
+        acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+        for kk in hl.grid(packed // 64):
+            acc = hl.dot_scaled(
+                x[tile_m, kk * 64 + hl.arange(64)],
+                x_scale[tile_m, kk * 4 + hl.arange(4)],
+                "e2m1",
+                y[tile_n, kk * 64 + hl.arange(64)].T,
+                y_scale[tile_n, kk * 4 + hl.arange(4)],
+                "e2m1",
+                acc=acc,
+            )
+        out[tile_m, tile_n] = acc
+    return out
+
+
+@helion.kernel(static_shapes=True, backend="gluon")
 def fp4_broadcast_mv(
     w: torch.Tensor, w_scale: torch.Tensor, a: torch.Tensor, a_scale: torch.Tensor
 ) -> torch.Tensor:
@@ -318,6 +431,31 @@ def mm_then_scale(
     for tile_r, tile_c in hl.tile([m, n]):
         y[tile_r, tile_c] = out[tile_r, tile_c] * 2 + b[tile_r, tile_c]
     return out, y
+
+
+@helion.kernel(static_shapes=True, backend="gluon")
+def mm_prefetch_mm(
+    x: torch.Tensor, w1: torch.Tensor, w2: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Two dot roots, a code prefetch at entry and one between them."""
+    m, k = x.size()
+    _, n = w1.size()
+    _, p = w2.size()
+    y = torch.empty([m, n], dtype=torch.bfloat16, device=x.device)
+    out = torch.empty([m, p], dtype=torch.float32, device=x.device)
+    hl.prefetch_code()
+    for tile_m, tile_n in hl.tile([m, n]):
+        acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+        for tile_k in hl.tile(k):
+            acc = hl.dot(x[tile_m, tile_k], w1[tile_k, tile_n], acc=acc)
+        y[tile_m, tile_n] = acc.to(torch.bfloat16)
+    hl.prefetch_code()
+    for tile_i, tile_p in hl.tile([m, p]):
+        acc2 = hl.zeros([tile_i, tile_p], dtype=torch.float32)
+        for tile_j in hl.tile(n):
+            acc2 = hl.dot(y[tile_i, tile_j], w2[tile_j, tile_p], acc=acc2)
+        out[tile_i, tile_p] = acc2
+    return y, out
 
 
 @helion.kernel(static_shapes=True, backend="gluon")
@@ -549,6 +687,35 @@ def _replay(run: object, inputs: list[tuple[torch.Tensor, ...]]) -> list[object]
     return results
 
 
+def _live_mm_scale_mm_ref(
+    x: torch.Tensor, y: torch.Tensor, w: torch.Tensor, rows: torch.Tensor
+) -> torch.Tensor:
+    """``live_mm_scale_mm`` in torch (bounds whole row tiles)."""
+    m, n = x.size(0), y.size(1)
+    live, scale_live = (min(max(int(b), 0), m) for b in rows.tolist())
+    h = torch.zeros([m, n], device=x.device)
+    h[:live] = x[:live].float() @ y.float()
+    total = h.view(m, n // 128, 128).sum(-1).sum(-1)
+    scaled = torch.zeros([m, n], device=x.device, dtype=torch.bfloat16)
+    scaled[:scale_live] = (h[:scale_live] * total[:scale_live, None]).bfloat16()
+    out = torch.zeros([m, w.size(1)], device=x.device)
+    out[:live] = scaled[:live].float() @ w.float()
+    return out
+
+
+def _group_tickets(
+    live: list[int], tasks: list[int], lags: list[int], tickets: int
+) -> list[tuple[int, int] | None]:
+    """``_group_ticket``'s (root, task) of each ticket, by enumerating rounds."""
+    keys = [n // a for n, a in zip(live, tasks, strict=True)]
+    order: list[tuple[int, int]] = []
+    for r in range(max(o + k for o, k in zip(lags, keys, strict=True))):
+        for root, (a, o, k) in enumerate(zip(tasks, lags, keys, strict=True)):
+            if 0 <= r - o < k:
+                order.extend((root, (r - o) * a + u) for u in range(a))
+    return [order[t] if t < len(order) else None for t in range(tickets)]
+
+
 def _cluster_workers(splits: int) -> int:
     """The workers a persistent launch in clusters of ``splits`` takes on
     this device: the count the generated host code asks ``get_num_sm`` for."""
@@ -771,6 +938,46 @@ class TestGluonRing(TestCase):
         self.assertIn("_helion_ring.ring_read(", code)
         self.assertRegex(code, r"_helion_gluon\.acc_read\(\w+, \w+, (True|False)\)")
 
+    @skipIfRefEager("checks generated code")
+    @skipUnlessGluon()
+    def test_register_channel_gives_up_slots_to_fit(self) -> None:
+        """A channel a dot reads streams at num_stages, whichever partition issues
+        the dot; one the body only reads into registers streams at num_stages too
+        unless the ring would outgrow the shared memory (less an fp32
+        accumulator tile Triton stages beside it), then gives up slots."""
+        x = torch.randn([512, 1024], device=DEVICE, dtype=torch.bfloat16)
+        y = torch.randn([1024, 256], device=DEVICE, dtype=torch.bfloat16)
+        w = torch.randn([512, 1024], device=DEVICE, dtype=torch.bfloat16)
+        # The body issues the dot: its register read shares the dot's channel.
+        # Warp-specialized, the MMA partition issues it on a channel of its own:
+        # 32 KB slots, 64 KB of accumulator staging beside the ring; a BF16
+        # [128, 64] read (16 KB slots) fits two, an FP8 one (8 KB) all four.
+        for dtype, specialize, want in (
+            (torch.bfloat16, None, [4]),
+            (torch.bfloat16, True, [2, 4]),
+            (torch.float8_e4m3fn, True, [4, 4]),
+        ):
+            with self.subTest(dtype=dtype, range_warp_specializes=specialize):
+                wd = w.to(dtype)
+                expected = x.float() @ y.float() + wd.float().sum(-1, keepdim=True)
+                code, out = code_and_output(
+                    mm_plus_row_sums,
+                    (x, y, wd),
+                    block_sizes=[128, 128, 64],
+                    range_warp_specializes=[None, specialize],
+                    **{**RING, "num_stages": 4},
+                )
+                torch.testing.assert_close(out, expected, atol=1e-2, rtol=1e-2)
+                depths = {
+                    int(c): int(d)
+                    for c, d in re.findall(
+                        r"_helion_ring_S(\d) = tl.constexpr\((\d+)\)", code
+                    )
+                }
+                self.assertEqual(sorted(depths.values()), want)
+                (read,) = set(re.findall(r"ring_read\([^)]*_helion_ring_S(\d),", code))
+                self.assertEqual(depths[int(read)], min(want))
+
     @skipUnlessGluon()
     @skipIfRefEager("checks generated code")
     def test_small_box_slots_stay_aligned(self) -> None:
@@ -831,6 +1038,137 @@ class TestGluonRing(TestCase):
                 self.assertRegex(code, r"stage\([^()]*, tmem_mma, tmem_count, 1\)")
                 self.assertRegex(code, r"tmem_dot\([^\n]*, tmem_mma\)")
                 self.assertEqual("native_kernel(maxnreg=" in code, ctas > 1)
+
+    @skipIfRefEager("checks generated code")
+    @skipUnlessGluon()
+    def test_filled_operand(self) -> None:
+        """An activation the body computes each K step (the first root's output
+        times a vector, in the weight's dtype) fills its slot of the dot's step:
+        the dot issues from the MMA partition, bitwise as the body's MMA of the
+        staged activation (the loop not warp-specialized), across overlapping
+        (PDL) launches."""
+        x = torch.randn([64, 1024], device=DEVICE, dtype=torch.bfloat16)
+        g = torch.rand([1024], device=DEVICE, dtype=torch.bfloat16) + 0.5
+        for dtype in (torch.float8_e4m3fn, torch.bfloat16):
+            with self.subTest(dtype=dtype):
+                w = torch.randn([256, 1024], device=DEVICE).to(dtype)
+                bound = scale_then_normed_wx.bind((x, g, w))
+                ring = gluon_tail_ring_config(bound)
+                code, out = code_and_output(scale_then_normed_wx, (x, g, w), **ring)
+                self.assertIn("_helion_ring.ring_fill(", code)
+                self.assertIn("def _helion_scale_then_normed_wx_mma(", code)
+                self.assertNotIn("_helion_gluon.stage(", code)
+                flags = [None] * len(ring["range_warp_specializes"])
+                staged = bound.compile_config(
+                    helion.Config(**{**ring, "range_warp_specializes": flags})
+                )
+                torch.testing.assert_close(out, staged(x, g, w), atol=0, rtol=0)
+                a = (2 * x.float() * g.float()).to(dtype).float()
+                torch.testing.assert_close(out, w.float() @ a.T, atol=1e-2, rtol=1e-3)
+                inputs = [(x + launch, g, w) for launch in range(4)]
+                filled = bound.compile_config(helion.Config(**ring))
+                for got, args in zip(_replay(filled, inputs), inputs, strict=True):
+                    torch.testing.assert_close(got, staged(*args), atol=0, rtol=0)
+        # A filled group no producer streams: the weight producer arrives for it.
+        w = torch.randn([256, 1024], device=DEVICE, dtype=torch.bfloat16)
+        bound = wx_then_scaled_vx.bind((x, w, w))
+        slots = len(bound.config_spec.range_warp_specialize)
+        config = {**RING, "block_sizes": [128, 32, 64, 64]}
+        code, out = code_and_output(
+            wx_then_scaled_vx,
+            (x, w, w),
+            range_warp_specializes=[True] * slots,
+            **config,
+        )
+        self.assertIn("_helion_ring.ring_fill(", code)
+        self.assertNotIn("def _helion_wx_then_scaled_vx_producer1(", code)
+        staged = bound.compile_config(helion.Config(**config))(x, w, w)
+        torch.testing.assert_close(out, staged, atol=0, rtol=0)
+        # Barrier mode (its phase loops share the roots' statements): one
+        # arrival a step for the filled group.
+        x = torch.randn([128, 1024], device=DEVICE, dtype=torch.bfloat16)
+        w = torch.randn([1024, 128], device=DEVICE, dtype=torch.bfloat16)
+        v = torch.randn([128, 128], device=DEVICE, dtype=torch.bfloat16)
+        base = {**RING, "block_sizes": [128, 128, 64, 128, 64, 64], "num_warps": 4}
+        _, expected = code_and_output(
+            mm_then_scaled_mm, (x, w, v), cross_loop_pipeline="static", **base
+        )
+        slots = len(mm_then_scaled_mm.bind((x, w, v)).config_spec.range_warp_specialize)
+        code, out = code_and_output(
+            mm_then_scaled_mm,
+            (x, w, v),
+            range_warp_specializes=[True] * slots,
+            cross_loop_pipeline="barrier",
+            **base,
+        )
+        self.assertIn("_helion_ring.ring_fill(", code)
+        torch.testing.assert_close(out, expected, atol=0, rtol=0)
+
+    @skipIfRefEager("checks generated code")
+    @skipUnlessGluon()
+    def test_filled_operand_between_other_steps(self) -> None:
+        """Two plain dots step the MMA channel between the body's fills, at a
+        depth of two: the body waits for the slot of each step it passes
+        (``ring_pass``), so it stays within a phase of the MMA's frees; without
+        those waits its fill's parity wait aliases and it overwrites a slot the
+        MMA still reads."""
+        x, y, z = (
+            torch.randn([64, 4096], device=DEVICE, dtype=torch.bfloat16)
+            for _ in range(3)
+        )
+        v, w, u = (
+            torch.randn([1024, 4096], device=DEVICE, dtype=torch.bfloat16)
+            for _ in range(3)
+        )
+        args = (x, y, z, v, w, u)
+        bound = filled_beside_two_dots.bind(args)
+        slots = len(bound.config_spec.range_warp_specialize)
+        config = {**RING, "block_sizes": [128, 32, 64], "num_stages": 2}
+        code, out = code_and_output(
+            filled_beside_two_dots,
+            args,
+            range_warp_specializes=[True] * slots,
+            **config,
+        )
+        self.assertEqual(code.count("_helion_ring.ring_fill("), 1)
+        self.assertEqual(code.count("_helion_ring.ring_pass("), 2)
+        staged = bound.compile_config(helion.Config(**config))(*args)
+        torch.testing.assert_close(out, staged, atol=0, rtol=0)
+        filled = bound.compile_config(
+            helion.Config(**config, range_warp_specializes=[True] * slots)
+        )
+        for _ in range(20):
+            torch.testing.assert_close(filled(*args), staged, atol=0, rtol=0)
+
+    @skipIfRefEager("checks generated code")
+    @skipUnlessGluon()
+    def test_filled_operand_after_a_lagging_body(self) -> None:
+        """The MMA runs a root of TMA steps while the body is still in a
+        body-only root before it, then a root the body fills: the body passes
+        the earlier root's steps a lap or more behind the MMA's frees unless
+        it arrives for them (``ring_pass``); with only the producer arriving
+        there, its parity waits alias and the launch hangs."""
+        # 256 tasks a root: each CTA runs tasks of all three.
+        x = torch.randn([128, 1024], device=DEVICE, dtype=torch.bfloat16)
+        w, v = (
+            torch.randn([16384, 1024], device=DEVICE, dtype=torch.bfloat16)
+            for _ in range(2)
+        )
+        args = (x, w, v)
+        bound = filled_after_a_lagging_body.bind(args)
+        slots = len(bound.config_spec.range_warp_specialize)
+        config = {**RING, "block_sizes": [8, 64, 128, 64, 64, 128, 64, 64]}
+        code, out = code_and_output(
+            filled_after_a_lagging_body,
+            args,
+            range_warp_specializes=[True] * slots,
+            **config,
+        )
+        self.assertIn("_helion_ring.ring_fill(", code)
+        self.assertRegex(code, r"_helion_ring\.ring_pass\([^\n]*, 1\)")
+        staged = bound.compile_config(helion.Config(**config))(*args)
+        for got, expected in zip(out, staged, strict=True):
+            torch.testing.assert_close(got, expected, atol=0, rtol=0)
 
     @skipIfRefEager("checks generated code")
     @skipUnlessGluon()
@@ -897,6 +1235,83 @@ class TestGluonRing(TestCase):
         code, out = code_and_output(fp4_mm, args, **RING)
         torch.testing.assert_close(out, expected, atol=0, rtol=0)
         self.assertEqual(code.count("_helion_ring.ring_acquire("), 2)
+
+    @skipUnlessGluon()
+    @skipIfRefEager("checks generated code")
+    def test_dot_scaled_scales_per_ring_slot(self) -> None:
+        """A ring dot's block scales take a tensor-memory buffer per slot of its
+        channel, which the ring allocates for the kernel (``slot_scales``): the
+        copied weight scale (tcgen05.cp) and the tokens' scale stored from
+        registers alike.  A slot fills again only after the MMA reading it
+        completed, so no step waits for an MMA before writing its scales, and an
+        in-flight MMA's scales are never rewritten (by a cp after an MMA either,
+        which PTX ISA 9.3 does not order): every step's distinct scales count."""
+        args, expected = _fp4_rows_by_tokens_reference()
+        for stages, specialize in ((2, True), (4, True), (3, None)):
+            with self.subTest(num_stages=stages, range_warp_specializes=specialize):
+                code, out = code_and_output(
+                    fp4_rows_by_tokens,
+                    args,
+                    range_warp_specializes=[None, specialize],
+                    **{**RING, "num_stages": stages},
+                )
+                torch.testing.assert_close(out, expected, atol=0, rtol=0)
+                self.assertEqual(
+                    "def _helion_fp4_rows_by_tokens_mma(" in code, bool(specialize)
+                )
+                # One buffer per slot of the channel, for each scale.
+                self.assertEqual(code.count("_helion_gluon.slot_scales("), 2)
+                self.assertRegex(
+                    code,
+                    r"_helion_scales0 = _helion_gluon\.slot_scales\(tl\.float8e4nv, "
+                    r"128, 32, _helion_ring_S\d+\)",
+                )
+                # Under the MMA partition the weight scale is copied (tcgen05.cp),
+                # the tokens' stored from registers.
+                copied = "True, False" if specialize else r"\w+, \w+"
+                self.assertRegex(
+                    code,
+                    rf"_helion_gluon\.tmem_dot_scaled\([^\n]*{copied}, False, "
+                    r"_helion_scales0, _helion_scales1\)",
+                )
+
+    @skipUnlessGluon()
+    @skipIfRefEager("checks generated code")
+    def test_dot_scaled_scales_without_tensor_memory_per_slot(self) -> None:
+        """Without tensor memory for a block-scale buffer per ring slot beside the
+        accumulator rings, the ring's scaled dots allocate their own scales and
+        wait for their MMAs.  A 128-column budget leaves the 4-slot ring's scales
+        ([128, 32] and [32, 32]: 48 columns a slot) no room beside the [128, 16]
+        accumulator ring."""
+        args, expected = _fp4_rows_by_tokens_reference()
+        with mock.patch("helion._compiler.triton.gluon_ring._TMEM_COLUMNS", 128):
+            code, out = code_and_output(
+                fp4_rows_by_tokens,
+                args,
+                range_warp_specializes=[None, True],
+                **{**RING, "num_stages": 4},
+            )
+        torch.testing.assert_close(out, expected, atol=0, rtol=0)
+        self.assertNotIn("_helion_gluon.slot_scales(", code)
+        self.assertIn("_helion_scales0 = None", code)
+
+    @skipUnlessGluon()
+    @skipIfRefEager("checks generated code")
+    def test_dot_scaled_fp4_n8(self) -> None:
+        """tcgen05 takes an 8-column block-scaled tile (Triton's rule asks 16)."""
+        x, y = (
+            torch.randint(0, 256, shape, dtype=torch.uint8, device=DEVICE)
+            for shape in ([128, 256], [16, 256])
+        )
+        x_scale, y_scale = (
+            torch.randint(124, 130, [rows, 16], dtype=torch.uint8, device=DEVICE)
+            for rows in (128, 16)
+        )
+        args = (x, x_scale, y, y_scale)
+        _, expected = code_and_output(fp4_mm_nt, (*args, 16), **RING)
+        code, out = code_and_output(fp4_mm_nt, (*args, 8), **RING)
+        torch.testing.assert_close(out, expected, atol=0, rtol=0)
+        self.assertIn("_helion_gluon.tmem_dot_scaled(", code)
 
     @skipIfRefEager("checks generated code")
     @skipUnlessGluon()
@@ -978,11 +1393,60 @@ class TestGluonRing(TestCase):
                     functions["_helion_scale_then_mm_mma"] if specialize else body
                 )
                 at = prefetching.index(
-                    "prefetch code here" if specialize else "prefetch_code()"
+                    "call.uni helion_prefetch_code_fn_1,"
+                    if specialize
+                    else "helion_prefetch_code.prefetch_code("
                 )
                 self.assertLess(at, prefetching.index("_launch("))
                 self.assertIn("return (tile_dependency_epoch,)", body)
                 self.assertNotIn("def _helion_scale_then_mm_claimer(", code)
+
+    @skipIfRefEager("checks generated code")
+    @skipUnlessGluon()
+    def test_code_prefetch_between_roots_in_mma_partition(self) -> None:
+        """Code prefetches run in the MMA partition and nowhere else: the entry
+        one ahead of the launch-state read (no grid wait to take the place of),
+        the one between two dot roots after the first root's MMAs and before the
+        second's."""
+        x = torch.randn([256, 512], device=DEVICE, dtype=torch.bfloat16)
+        w1 = torch.randn([512, 256], device=DEVICE, dtype=torch.bfloat16)
+        w2 = torch.randn([256, 128], device=DEVICE, dtype=torch.bfloat16)
+        base = {
+            "block_sizes": [128, 64, 64, 128, 64, 64],
+            "pid_type": "persistent_blocked",
+            "num_sm_multiplier": 1,
+            "num_warps": 4,
+            "indexing": "tensor_descriptor",
+        }
+        _, (y_ref, expected) = code_and_output(
+            mm_prefetch_mm, (x, w1, w2), cross_loop_pipeline="static", **base
+        )
+        slots = len(mm_prefetch_mm.bind((x, w1, w2)).config_spec.range_warp_specialize)
+        for pipeline in ("static", "dynamic"):
+            with self.subTest(pipeline=pipeline):
+                code, (y, out) = code_and_output(
+                    mm_prefetch_mm,
+                    (x, w1, w2),
+                    num_stages=2,
+                    range_warp_specializes=[True] * slots,
+                    cross_loop_pipeline=pipeline,
+                    **base,
+                )
+                torch.testing.assert_close(y, y_ref, atol=0, rtol=0)
+                torch.testing.assert_close(out, expected, atol=0, rtol=0)
+                # The MMA partition's one warp calls the prefetch, on every 16th
+                # CTA counted from the last worker (claimed dispatch too).
+                self.assertEqual(code.count("call.uni helion_prefetch_code_fn_"), 2)
+                self.assertNotIn("helion_prefetch_code.prefetch_code(", code)
+                mma = _functions(code)["_helion_mm_prefetch_mm_mma"]
+                entry, at = (
+                    m.start()
+                    for m in re.finditer("call.uni helion_prefetch_code_fn_1,", mma)
+                )
+                self.assertLess(entry, mma.index("_launch("))
+                self.assertLess(mma.index("tmem_dot"), at)
+                self.assertLess(at, mma.rindex("tmem_dot"))
+                self.assertIn("[(tl.num_programs(0) - 1 - tl.program_id(0)).to(", mma)
 
     def _prefetch_case(self, kernel, args: tuple[object, ...]) -> str:
         """Run a prefetching ``scale_then_mm`` variant in a ring and check it
@@ -1259,7 +1723,7 @@ class TestGluonRing(TestCase):
                 self.assertIn("ring_skip(", gated)
                 self.assertIn("ring_put(", gated)
                 # Both groups arrive on every full phase; the skip passes its full.
-                self.assertIn("ring_barriers(_helion_ring_S, 2)", code)
+                self.assertIn("ring_barriers(_helion_ring_S0, 2)", code)
                 self.assertIn("_helion_ring.ring_skip(_helion_ring_full0,", code)
 
     @skipIfRefEager("checks generated code")
@@ -1426,6 +1890,100 @@ class TestGluonRing(TestCase):
 
     @skipIfRefEager("checks generated code")
     @skipUnlessGluon()
+    def test_claim_group_interleaves_keyed_roots(self) -> None:
+        """Claimed roots each waiting on the one before key by key (their row
+        tile) claim one ticket stream (``_group_ticket``) under claim groups: the
+        scaling root's keys a wave of claims behind the matmul's, not after its
+        last claim, and the second matmul's after the first's live keys and a
+        wave behind the scaling root's.  Without groups each root claims its own
+        tasks."""
+        x = torch.randn([128 * 64, 128], device=DEVICE, dtype=torch.bfloat16)
+        y = torch.randn([128, 512], device=DEVICE, dtype=torch.bfloat16)
+        w = torch.randn([512, 512], device=DEVICE, dtype=torch.bfloat16) / 64
+        rows = torch.tensor([48 * 128, 48 * 128], device=DEVICE, dtype=torch.int32)
+        bound = live_mm_scale_mm.bind((x, y, w, rows))
+        ungrouped = helion.Config(
+            **RING, block_sizes=[128, 64, 128, 128, 64], cross_loop_pipeline="dynamic"
+        )
+        code = bound.to_triton_code(ungrouped)
+        self.assertNotIn("helion_dist_utils._group_claim(", code)
+        config = helion.Config(**ungrouped.config, cross_loop_claim_groups=True)
+        with self.assertLogs("helion._compiler.cross_loop_codegen", "INFO") as logs:
+            code = bound.to_triton_code(config)
+        self.assertIn("helion_dist_utils._group_claim(", code)
+        self.assertNotIn("helion_dist_utils._claim(", code)
+        # The scaling root reads ``h_sum`` and ``h`` through the claiming
+        # producer's channel (its ``ring_skip`` steps), so every ticket here
+        # issues a ring step and ``task_pace`` never waits (test_gluon_units'
+        # ``TestClaimGroups`` reads them through plain loads, where it does).
+        self.assertIn("_helion_ring.task_pace(", code)
+        # 64 row keys of 4 matmul tasks: the scaling root lags a wave of the
+        # workers' claims, the second matmul a wave of both roots' behind it
+        # and, at runtime, after the first matmul's live keys (at most 64).
+        match = re.search(r"_group_claim\([^,]+, (\d+),", code)  # the workers
+        assert match is not None
+        workers = int(match[1])
+        lag = min(-(-workers // 4), 64)  # (clamped after the 64 keys)
+        second = min(max(64, lag + -(-workers // (4 + 8))), lag + 64)
+        self.assertIn(
+            "Roots [0, 1, 2] claim one interleaved ticket stream "
+            f"(key lags [0, {lag}, {second}] rounds)",
+            "\n".join(logs.output),
+        )
+        self.assertRegex(
+            code,
+            rf"_group_claim\(.*tl\.minimum\(tl\.maximum\(.* // 4, \d+\), {lag + 64}\)",
+        )
+        # Back to back, each launch takes exactly its live count of claims and
+        # leaves the counter reset: fewer live tasks than workers, none, every
+        # task live (a bound past the last row), and bounds varying apart, one
+        # of them negative (a root with no live task).
+        bounds = [(48, 48), (16, 16), (64, 64), (0, 0), (80, 80), (48, -1), (40, 20)]
+        inputs = [
+            (x, y, w, torch.tensor(b, device=DEVICE, dtype=torch.int32) * 128)
+            for b in bounds
+        ]
+        results = _replay(bound.compile_config(config), inputs)
+        for launch, result in zip(inputs, results, strict=True):
+            # The bf16 scaled rows round apart by an ulp under another sum order.
+            expected = _live_mm_scale_mm_ref(*launch)
+            scale = expected.abs().max().item()
+            torch.testing.assert_close(result, expected, rtol=1e-2, atol=1e-2 * scale)
+
+    @skipUnlessGluon()
+    def test_group_ticket(self) -> None:
+        """``_group_ticket`` maps tickets to (root, task) round by round: root
+        ``i``'s key ``r - rounds[i]`` in round ``r``, roots in order, then the end."""
+
+        @triton.jit
+        def decode(out, n0, n1, n2, n3, n4, END: tl.constexpr):
+            t = tl.program_id(0)
+            coded = dist_utils._group_ticket(
+                t, (n0, n1, n2, n3, n4), (36, 9, 36, 4, 9), (0, 5, 69, 74, 80), END
+            )
+            tl.store(out + t, coded.to(tl.int64))
+
+        end = 5 << 32
+        tasks, lags = [36, 9, 36, 4, 9], [0, 5, 69, 74, 80]
+        for live in (
+            [576, 144, 576, 64, 90],
+            [360, 90, 360, 40, 0],
+            [36, 9, 36, 4, 9],
+            [0, 18, 0, 8, 18],
+            [0, 0, 0, 0, 0],
+        ):
+            with self.subTest(live=live):
+                tickets = sum(live) + 7
+                out = torch.empty([tickets], device=DEVICE, dtype=torch.int64)
+                decode[(tickets,)](out, *live, END=end)
+                expected = [
+                    end if pair is None else pair[0] << 32 | pair[1]
+                    for pair in _group_tickets(live, tasks, lags, tickets)
+                ]
+                self.assertEqual(out.tolist(), expected)
+
+    @skipIfRefEager("checks generated code")
+    @skipUnlessGluon()
     def test_leader_claims(self) -> None:
         """The weight producer steps in every claimed task loop, so it issues the
         claims itself (no claimer partition), each when it is done issuing the
@@ -1586,11 +2144,11 @@ class TestGluonRing(TestCase):
     @skipUnlessGluon()
     def test_cross_loop_tmem_prefetch_loop_shapes(self) -> None:
         """Tails bit for bit as without them: one weight of a stack (a unit
-        leading box dim), two weights in one loop (the first dot takes the
-        tail), a K loop inside another's body (the outer one takes the tail;
+        leading box dim), a chunked view's (a unit inner one), two weights in
+        one loop (the first dot takes the tail), a K loop inside another's body (the outer one takes the tail;
         two accumulator rings, or a nested loop's, leave fewer columns), and an
-        nvfp4 dot's block scales beside a tail (10 tiles: the whole of tensor
-        memory but 16 columns)."""
+        nvfp4 dot's block scales beside a tail (9 tiles: the scales' buffer per
+        ring slot takes 96 columns)."""
         x = torch.randn([32, 1024], device=DEVICE, dtype=torch.bfloat16)
         w = torch.randn([256, 1024], device=DEVICE, dtype=torch.bfloat16)
         ring = gluon_tail_ring_config(scale_then_wx.bind((x, w)))
@@ -1613,12 +2171,15 @@ class TestGluonRing(TestCase):
         nvfp4_ring = gluon_tail_ring_config(
             scale_then_wx_and_nvfp4.bind(nvfp4), task_loop=1
         )
+        chunked = (x, w.view(256, 2, 512))
+        chunked_ring = gluon_tail_ring_config(scale_then_chunked_wx.bind(chunked))
         self._check_tails(
             [
                 (scale_then_ewx, (x, stacked), ring, 1, 14),
+                (scale_then_chunked_wx, chunked, chunked_ring, 1, 8),
                 (scale_then_w13x, (x, w, w3), ring, 1, 0),
                 (scale_then_nested_wx, (x, w, v), nested_ring, 1, 0),
-                (scale_then_wx_and_nvfp4, nvfp4, nvfp4_ring, 1, 10),
+                (scale_then_wx_and_nvfp4, nvfp4, nvfp4_ring, 1, 9),
             ]
         )
 
@@ -1832,6 +2393,58 @@ class TestGluonRing(TestCase):
 
     @skipIfRefEager("checks generated code")
     @skipUnlessGluon()
+    def test_dsmem_masked_tiles(self) -> None:
+        """A row of six parts (a hidden size that is no power of two): the norm
+        tasks read the row's six sums as a masked tile of eight, from the
+        slab where the mask holds (the padding lanes read its first element
+        and take the masked load's zero), in clusters of six; a replicated
+        table of six rows read the same way. Both match the counter edges bit
+        for bit."""
+        rows = _one_wave(6, 8, self)
+        x = torch.randn([rows, 1536], device=DEVICE, dtype=torch.float32)
+        weight = torch.randn([1536], device=DEVICE, dtype=torch.float32)
+        args = (x, weight, torch.zeros([rows, 6], device=DEVICE), torch.zeros_like(x))
+        config = {
+            "pid_type": "persistent_blocked",
+            "num_sm_multiplier": 1,
+            "num_warps": 4,
+            "cross_loop_pipeline": "static",
+            "block_sizes": [256, 256],
+        }
+        _, reference = code_and_output(gather_rms_norm, args, **config)
+        code, out = code_and_output(
+            gather_rms_norm, args, **config, cross_loop_dsmem=[True, True]
+        )
+        self.assertIn("_cluster_size=6", code)
+        for rank in range(6):
+            self.assertRegex(code, rf"(?m)cluster_send\(.*, 8, 1, {rank}, 128\)$")
+        # The sums' receive: under the tile's mask, its padding lanes zero.
+        self.assertRegex(code, r"tl\.where\(mask_\d+, _helion_gluon\.cluster_recv\(")
+        torch.testing.assert_close(out, reference, atol=0, rtol=0)
+        table = torch.randn([6, 16], device=DEVICE, dtype=torch.float32)
+        args = (
+            x,
+            weight,
+            table,
+            torch.zeros_like(table),
+            torch.zeros([6], device=DEVICE),
+            torch.zeros([rows, 6], device=DEVICE),
+            torch.zeros_like(x),
+        )
+        _, reference = code_and_output(scaled_gather_rms_norm, args, **config)
+        code, out = code_and_output(
+            scaled_gather_rms_norm,
+            args,
+            **config,
+            cross_loop_dsmem=[True, False, True, True],
+        )
+        self.assertIn("_cluster_size=6", code)
+        for rank in range(6):
+            self.assertRegex(code, rf"(?m)cluster_send\(.*, 8, 1, {rank}, 8\)$")
+        torch.testing.assert_close(out, reference, atol=0, rtol=0)
+
+    @skipIfRefEager("checks generated code")
+    @skipUnlessGluon()
     def test_dsmem_replicated(self) -> None:
         """A whole table that every task of a root on more CTAs than a
         cluster reads: every cluster runs the table's tasks, each sending its
@@ -1973,6 +2586,73 @@ class TestGluonRing(TestCase):
         self.assertIn("@_helion_gluon.native_kernel", code)
         self.assertIn("gluon_ops import tl_namespace as tl", code)
         self.assertNotIn("@triton.jit", code)
+
+    @skipIfRefEager("checks generated code")
+    @skipUnlessGluon()
+    def test_publishing_root_scopes_barrier_wait(self) -> None:
+        """A guarded root waiting on one root barrier and publishing another
+        waits in each worker's first task, and a worker with no live task once
+        before it publishes: the barrier publication follows the wait in the
+        partition that publishes."""
+        x = torch.randn([64, 64], device=DEVICE, dtype=torch.float32)
+        w = torch.randn([64, 64], device=DEVICE, dtype=torch.bfloat16)
+        # No live task, some of the workers' tasks, every task.
+        for live in (0, 16, 64):
+            with self.subTest(live=live):
+                rows = torch.tensor([live], device=DEVICE, dtype=torch.int32)
+                code, (act, out, res) = code_and_output(
+                    live_barrier_chain,
+                    (x, w, rows),
+                    **RING,
+                    block_sizes=[32, 32, 32, 32],
+                    cross_loop_pipeline="static",
+                )
+                expected = w.float() @ (x + 1).to(torch.bfloat16).float()
+                expected[live:] = 0
+                torch.testing.assert_close(act, x + 1, atol=0, rtol=0)
+                torch.testing.assert_close(out, expected, rtol=1e-4, atol=1e-3)
+                torch.testing.assert_close(
+                    res, x + 1 + expected.sum(), rtol=1e-4, atol=1e-2
+                )
+        body = next(
+            node
+            for node in ast.parse(code).body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "_helion_live_barrier_chain_body"
+        )
+        # The middle root's block: its task loop, the wait of a worker with no
+        # live task, then the publication; no wait at the root's entry.
+        block = next(
+            node.body
+            for node in ast.walk(body)
+            if isinstance(node, ast.If)
+            and any(
+                isinstance(s, ast.For) and "w_desc" in ast.unparse(s) for s in node.body
+            )
+        )
+        steps = {
+            s: "tasks"
+            if isinstance(s, ast.For)
+            else "wait"
+            if "root_barrier_wait" in ast.unparse(s)
+            else "publish"
+            for s in block
+            if isinstance(s, ast.For)
+            or any(
+                text in ast.unparse(s) for text in ("root_barrier_wait", "atomic_add")
+            )
+        }
+        self.assertEqual(list(steps.values()), ["tasks", "wait", "publish"])
+        tasks, no_task_wait, _ = steps
+        assert isinstance(tasks, ast.For) and isinstance(no_task_wait, ast.If)
+        self.assertTrue(ast.unparse(no_task_wait.test).startswith("not "))
+        first = [
+            s
+            for s in tasks.body
+            if isinstance(s, ast.If) and "virtual_pid ==" in ast.unparse(s.test)
+        ]
+        self.assertEqual(len(first), 1)
+        self.assertIn("root_barrier_wait", ast.unparse(first[0]))
 
 
 if __name__ == "__main__":

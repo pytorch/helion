@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import unittest
 
 import torch
@@ -377,6 +378,33 @@ def scan_pair(x: torch.Tensor, idx: torch.Tensor) -> torch.Tensor:
     return out
 
 
+@helion.kernel(static_shapes=True, backend="gluon")
+def log_cumsum(x: torch.Tensor) -> torch.Tensor:
+    (n,) = x.size()
+    out = torch.empty_like(x)
+    for tile in hl.tile(n):
+        out[tile] = torch.cumsum(torch.log(x[tile]), 0)
+    return out
+
+
+@helion.kernel(static_shapes=True, backend="gluon")
+def scores_with_reversed_bias(
+    q: torch.Tensor, k: torch.Tensor, bias: torch.Tensor
+) -> torch.Tensor:
+    """Each row's sum of q @ k.T plus a bf16 bias gathered backwards along the
+    keys (attention's relative-position bias): no contiguity to coalesce."""
+    m = q.size(0)
+    n = k.size(0)
+    out = torch.empty([m], dtype=torch.float32, device=q.device)
+    for tile_m in hl.tile(m, block_size=64):
+        keys = hl.arange(n)
+        scores = hl.dot(q[tile_m, :], k[:, :].permute(1, 0), out_dtype=torch.float32)
+        dist = tile_m.index[:, None] + (n - 1) - keys[None, :]
+        logits = scores + hl.load(bias, [tile_m.index[:, None], dist]).to(torch.float32)
+        out[tile_m] = torch.sum(logits, dim=1)
+    return out
+
+
 def _asm(
     kernel: object, args: tuple[torch.Tensor, ...], **config: object
 ) -> tuple[dict[str, str], torch.Tensor]:
@@ -572,6 +600,26 @@ class TestGluon(TestCase):
                 _, out = code_and_output(nvfp4_mm, (x, x_scale, y, y_scale), **config)
                 torch.testing.assert_close(out, expected, rtol=1e-3, atol=1e-3)
 
+    def test_narrow_operand_converts_before_its_cast(self) -> None:
+        # A bias gathered with no contiguity takes Triton's default layout; where
+        # it meets the dot's tensor-memory layout, its bf16 load converts (the
+        # cast is re-emitted after it), not the fp32 accumulator twice its size,
+        # so the row reduction runs a row per thread.
+        q = torch.randn(64, 128, device=DEVICE, dtype=torch.bfloat16)
+        k = torch.randn(128, 128, device=DEVICE, dtype=torch.bfloat16)
+        bias = torch.randn(64, 256, device=DEVICE, dtype=torch.bfloat16)
+        asm, out = _asm(scores_with_reversed_bias, (q, k, bias), num_stages=1)
+        converts = re.findall(r"ttg\.convert_layout .* -> tensor<(\w+)", asm["ttgir"])
+        self.assertIn("64x128xbf16", converts)
+        self.assertNotIn("64x128xf32", converts)
+        dist = (
+            torch.arange(64, device=DEVICE)[:, None]
+            + 127
+            - torch.arange(128, device=DEVICE)
+        )
+        expected = (q.float() @ k.float().T + bias.gather(1, dist).float()).sum(1)
+        torch.testing.assert_close(out, expected, rtol=1e-3, atol=1e-2)
+
     def test_pipelined_pointer_loads(self) -> None:
         # Pointer loads feeding a dot stream num_stages - 1 steps ahead (cp.async):
         # a tcgen05 dot reads their slots, mma.sync reads them back, and so does
@@ -763,6 +811,14 @@ class TestGluon(TestCase):
         idx = torch.arange(32, device=DEVICE, dtype=torch.int32)
         _, out = code_and_output(scan_pair, (x, idx), block_sizes=[32, 32])
         torch.testing.assert_close(out, torch.cummax(x, 0).values)
+
+    def test_scan_of_unreplayable_auto_value(self) -> None:
+        # A tile smaller than the warps keeps an auto layout, and a log (no
+        # recipe) cannot replay: the scan lays out that value itself.
+        x = torch.rand(64, device=DEVICE) + 0.5
+        _, out = code_and_output(log_cumsum, (x,), block_sizes=[16], num_warps=4)
+        expected = torch.log(x).view(4, 16).cumsum(1).view(-1)
+        torch.testing.assert_close(out, expected)
 
 
 if __name__ == "__main__":

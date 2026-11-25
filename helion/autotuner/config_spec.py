@@ -943,6 +943,7 @@ _BACKEND_GATED_GENERIC_KEYS: frozenset[str] = frozenset(
         "cross_loop_dsmem",
         "cross_loop_inband_protocol",
         "worker_registers",
+        "cross_loop_claim_groups",
         "load_cache_modifiers",
         "store_cache_modifiers",
         "host_tensor_descriptors",
@@ -2690,6 +2691,7 @@ class ConfigSpec:
             "store_cache_modifiers",
             "cross_loop_dsmem",
             "cross_loop_inband_protocol",
+            "cross_loop_claim_groups",
             "indexing",
             "atomic_indexing",
             "prefetch_indexing",
@@ -2849,6 +2851,27 @@ class ConfigSpec:
         dsmem = config.get("cross_loop_dsmem")
         if isinstance(dsmem, list) and any(dsmem):
             self._normalize_dsmem(config)
+        # ``cross_loop_claim_groups`` (a hand override the search never
+        # proposes): consecutive claimed roots claim one ticket stream, a root's
+        # keys a wave of claims behind each earlier member it waits on key by
+        # key, after the live keys of the others it waits on and, with a dot on
+        # the ring, of the roots with one before it
+        # (cross_loop_codegen.claim_group_body).  Only claimed dispatch (dynamic
+        # workers under a ring) forms groups: elsewhere the key is no entry
+        # (and on a ring that falls back at codegen an error, ``finalize_ring``).
+        groups = config.get("cross_loop_claim_groups", False)
+        if not isinstance(groups, bool):
+            if not _fix_invalid:
+                raise InvalidConfig(
+                    f"cross_loop_claim_groups must be a bool, got {groups!r}"
+                )
+            groups = False
+        if (
+            not groups
+            or config.get("cross_loop_pipeline") != "dynamic"
+            or not ring_depth(config, self.backend_name)
+        ):
+            config.pop("cross_loop_claim_groups", None)
         surface.normalize_recurrence_families(self, config, fix_invalid=_fix_invalid)
         surface.normalize_pre_pid_type(self, config, fix_invalid=_fix_invalid)
         indirect_modes = (

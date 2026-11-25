@@ -236,6 +236,88 @@ def _claim(counter, claims, first, end):  # noqa: ANN001, ANN202
 
 
 @triton.jit
+def _group_total(live, key_tasks: tl.constexpr):  # noqa: ANN001, ANN202
+    """A claim group's tickets: each root's whole keys of live tasks."""
+    total = live[0] * 0
+    for i in tl.static_range(len(live)):
+        total += live[i] // key_tasks[i] * key_tasks[i]
+    return total
+
+
+@triton.jit
+def _group_tickets_before(  # noqa: ANN202
+    r,  # noqa: ANN001
+    live,  # noqa: ANN001
+    key_tasks: tl.constexpr,
+    rounds,  # noqa: ANN001
+):
+    """The tickets of a claim group's rounds before round ``r`` (``_group_ticket``)."""
+    tickets = r * 0
+    for i in tl.static_range(len(live)):
+        tickets += key_tasks[i] * tl.minimum(
+            tl.maximum(r - rounds[i], 0), live[i] // key_tasks[i]
+        )
+    return tickets
+
+
+@triton.jit
+def _group_ticket(  # noqa: ANN202
+    ticket,  # noqa: ANN001
+    live,  # noqa: ANN001
+    key_tasks: tl.constexpr,
+    rounds,  # noqa: ANN001
+    end: tl.constexpr,
+):
+    """A claim group's ticket as ``root << 32 | task`` (``end`` past its last).
+
+    Root ``i`` of the group has ``live[i]`` live tasks, ``key_tasks[i]`` a key
+    (its slowest task axis); round ``r`` holds root ``i``'s tasks of key
+    ``r - rounds[i]``, the roots in order, so a consumer's key comes
+    ``rounds[i]`` rounds after its producers' (``rounds[i]`` may follow the
+    live keys)."""
+    t = ticket.to(tl.int32)
+    # The round of the ticket: the last one starting at or before it.
+    lo = t * 0
+    hi = t * 0
+    for i in tl.static_range(len(live)):
+        hi = tl.maximum(hi, rounds[i] + live[i] // key_tasks[i])
+    while hi - lo > 1:
+        mid = (lo + hi) // 2
+        below = _group_tickets_before(mid, live, key_tasks, rounds) <= t
+        lo = tl.where(below, mid, lo)
+        hi = tl.where(below, hi, mid)
+    u = t - _group_tickets_before(lo, live, key_tasks, rounds)
+    root = t * 0 + len(live)
+    task = t * 0
+    for i in tl.static_range(len(live)):
+        j = lo - rounds[i]
+        on = (j >= 0) & (j < live[i] // key_tasks[i])
+        hit = on & (u < key_tasks[i]) & (root == len(live))
+        task = tl.where(hit, j * key_tasks[i] + u, task)
+        root = tl.where(hit, i, root)
+        u = tl.where(on & (root == len(live)), u - key_tasks[i], u)
+    coded = (root.to(tl.uint64) << 32) | task.to(tl.uint64)
+    return tl.where(t < _group_total(live, key_tasks), coded, tl.cast(end, tl.uint64))
+
+
+@triton.jit
+def _group_claim(  # noqa: ANN202
+    counter,  # noqa: ANN001
+    first,  # noqa: ANN001
+    live,  # noqa: ANN001
+    key_tasks: tl.constexpr,
+    rounds,  # noqa: ANN001
+    end: tl.constexpr,
+):
+    """A claim group's next claimed ticket (``_group_ticket``) after the
+    ``first`` static ones; the launch's last claim resets the counter."""
+    ticket = tl.atomic_add(counter, 1, sem="relaxed", scope="gpu")
+    if ticket == _group_total(live, key_tasks) - 1:
+        tl.atomic_xchg(counter, 0, sem="relaxed", scope="gpu")
+    return _group_ticket(ticket + first, live, key_tasks, rounds, end)
+
+
+@triton.jit
 def _hold_after_fallback(  # noqa: ANN202
     state,  # noqa: ANN001
     started,  # noqa: ANN001

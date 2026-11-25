@@ -142,17 +142,6 @@ def pdl_wait_between_loops(x: torch.Tensor) -> torch.Tensor:
 
 
 @helion.kernel(static_shapes=True, autotune_effort="none")
-def prefetch_code_between_loops(x: torch.Tensor) -> torch.Tensor:
-    y = torch.empty_like(x)
-    for tile in hl.tile(x.size(0)):
-        y[tile] = x[tile] + 1
-    hl.prefetch_code()
-    for tile in hl.tile(x.size(0)):
-        y[tile] = y[tile] * 2
-    return y
-
-
-@helion.kernel(static_shapes=True, autotune_effort="none")
 def pdl_trigger_after_host_loop(x: torch.Tensor) -> torch.Tensor:
     y = torch.empty_like(x)
     out = torch.empty_like(x)
@@ -354,9 +343,8 @@ class TestPdl(RefEagerTestBase, TestCase):
             (pdl_wait_under_if, (x, True)),
             (pdl_wait_in_host_loop, (x,)),
             (pdl_two_triggers_between_loops, (x,)),
-            # Between two loops (a megakernel's) they raise too.
+            # Between two loops (a megakernel's) a wait raises too.
             (pdl_wait_between_loops, (x,)),
-            (prefetch_code_between_loops, (x,)),
         ):
             with (
                 self.subTest(kernel=kernel.name),

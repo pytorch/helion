@@ -24,6 +24,7 @@ from torch.testing._internal.distributed.fake_pg import FakeStore
 
 from helion._compat import gluon_api_available
 from helion._testing import skipIfRefEagerMark
+from helion._testing.triton_codegen import SM100_DEVICE_PROPERTIES
 from helion._testing.triton_codegen import gluon_cpu_codegen
 from helion.runtime.settings import _get_backend
 
@@ -74,9 +75,8 @@ def _symmetric_empty(
 def _modelled_b200() -> Generator[None, None, None]:
     """CPU tensors trace as ``cuda:0`` ones of a B200; symmetric buffers are
     plain ones."""
-    device = SimpleNamespace(
-        max_threads_per_multi_processor=2048, multi_processor_count=_SMS
-    )
+    # ``gluon_cpu_codegen``'s sm100 properties, with the B200's SM count.
+    device = SimpleNamespace(**SM100_DEVICE_PROPERTIES, multi_processor_count=_SMS)
     with contextlib.ExitStack() as stack:
         stack.enter_context(gluon_cpu_codegen())
         stack.enter_context(

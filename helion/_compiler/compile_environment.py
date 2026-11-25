@@ -838,6 +838,9 @@ class CompileEnvironment:
         # Set while ``generate_ast`` regenerates a kernel whose gluon ring the
         # lowering rejected (``RingFallback``): the rejection's reason.
         self.ring_disabled: str | None = None
+        # Set while ``generate_ast`` regenerates a kernel whose ring's operand
+        # fills the lowering rejected (``RingFillFallback``): the reason.
+        self.ring_fills_disabled: str | None = None
         self._dispatch_guards_enforced: contextvars.ContextVar[bool] = (
             contextvars.ContextVar(
                 f"helion_dispatch_guards_enforced_{id(self)}",
@@ -1062,8 +1065,10 @@ class CompileEnvironment:
         # The root a trigger between top-level loops precedes (it also stays in
         # ``pdl_exit``, where a kernel that cannot place it runs it).
         self.pdl_trigger_root: int | None = None
-        # hl.prefetch_code(): the kernel prefetches its native code into L2 at entry.
-        self.prefetch_code: bool = False
+        # hl.prefetch_code() calls (on targets whose code it can prefetch), in
+        # source order: None prefetches the kernel's native code into L2 at entry,
+        # a root index where the kernel reaches that top-level loop.
+        self.prefetch_code_sites: list[int | None] = []
 
     def warn_symbolic_fragment_domain(self) -> None:
         """Emit at most once per binding, subject to Python's warning filters."""
