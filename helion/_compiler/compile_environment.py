@@ -943,6 +943,12 @@ class CompileEnvironment:
         # TODO(hinriksnaer): tracing state, not env config. move to CompilerState?
         self.kernel_min_element_bits: int = 32  # smallest dtype bits across all tensors
         self.specialized_vars: set[sympy.Symbol] = set()
+        # The module-level int globals the kernel reads, as (module, name) ->
+        # value, and their symbols -> value.  Generated code reads each value
+        # as a constant (substitute_specialized_globals); the value keys the
+        # binding and is read again on every call (_specialize_extra).
+        self.specialized_globals: dict[tuple[types.ModuleType, str], int] = {}
+        self.specialized_global_symbols: dict[sympy.Basic, int] = {}
         # The specialized_vars that were 1 at this binding. Unlike
         # hl.specialize, they can differ between bindings of one signature,
         # whose dispatch schema the first binding publishes; each stays a
@@ -1288,6 +1294,18 @@ class CompileEnvironment:
             yield
         finally:
             self._debug_shape_rename_override.reset(token)
+
+    def substitute_specialized_globals(self, expr: sympy.Expr) -> sympy.Expr:
+        """``expr`` with the symbols of module int globals replaced by their
+        values (``specialized_global_symbols``), as generated code prints
+        them; analyses keep the symbols."""
+        if subs := {
+            symbol: sympy.Integer(self.specialized_global_symbols[symbol])
+            for symbol in expr.free_symbols & self.specialized_global_symbols.keys()
+        }:
+            # pyrefly: ignore [bad-assignment]
+            expr = expr.xreplace(subs)
+        return expr
 
     def specialize_expr(self, expr: sympy.Expr) -> sympy.Expr:
         """Substitute any specialized vars with their concrete values."""

@@ -8,6 +8,8 @@ from typing import cast
 
 import torch
 from torch._dynamo import variables
+from torch._dynamo.guards import install_guard
+from torch._dynamo.source import AttrSource
 from torch._dynamo.variables.base import VariableTracker
 from torch._dynamo.variables.builder import GuardBuilder
 from torch._dynamo.variables.builder import VariableBuilder
@@ -33,12 +35,14 @@ _SYM_SCALAR_TYPES = (torch.SymInt, torch.SymFloat)
 _HOST_SEMANTIC_FINGERPRINT = "_host_semantic_fingerprint"
 _HOST_SEMANTIC_INPUT_NORMALIZATION = "_host_semantic_input_normalization"
 _REQUIRES_ISOLATED_LOWERING = "_requires_isolated_lowering"
+_SPECIALIZED_GLOBALS = "_specialized_globals"
 
 if TYPE_CHECKING:
     from torch._dynamo.symbolic_convert import InstructionTranslator
     from torch._dynamo.symbolic_convert import InstructionTranslatorBase
 
     from helion._compiler.host_function import HostFunction
+    from helion.runtime.kernel import BoundKernel
 
 
 def _detect_mutated_inputs(body: list[ast.stmt], param_names: set[str]) -> list[str]:
@@ -211,6 +215,14 @@ def infer_output_spec(
     Remaps helion-internal SymInts back to the caller's values so that symbolic
     shape relationships are preserved for external tracers (make_fx, Dynamo).
     """
+    return _infer_output_spec_and_bound(kernel, args)[0]
+
+
+def _infer_output_spec_and_bound(
+    kernel: Kernel,
+    args: tuple[Any, ...],
+) -> tuple[dict[str, Any], BoundKernel]:
+    """``infer_output_spec`` and the isolated binding it analyzed."""
     names = list(kernel.signature.parameters.keys())
     param_tensors = {
         n: v for n, v in zip(names, args, strict=True) if isinstance(v, torch.Tensor)
@@ -223,6 +235,15 @@ def infer_output_spec(
     # The host fingerprint is intentionally conservative rather than a complete
     # serializer for arbitrary Python state, so such bounds lower in isolation.
     requires_isolated_lowering = bool(bound.host_function.global_imports)
+    # The module int globals the lowering compiles as constants: their values
+    # key the captured graph, so a graph lowered with other values (Inductor's
+    # FX graph cache) is not reused for them.
+    specialized_globals = tuple(
+        sorted(
+            (module.__name__, name, value)
+            for (module, name), value in bound.env.specialized_globals.items()
+        )
+    )
 
     flat_leaves, tree_spec, return_value = _get_flat_output(bound.host_function)
     bind_param_tensors = _bind_param_tensors(bound.host_function)
@@ -242,7 +263,8 @@ def infer_output_spec(
             _HOST_SEMANTIC_FINGERPRINT: host_semantic_fingerprint,
             _HOST_SEMANTIC_INPUT_NORMALIZATION: host_semantic_input_normalization,
             _REQUIRES_ISOLATED_LOWERING: requires_isolated_lowering,
-        }
+            _SPECIALIZED_GLOBALS: specialized_globals,
+        }, bound
 
     assert return_value is not None
     _validate_return(bound.host_function.body, return_value, flat_leaves)
@@ -356,7 +378,18 @@ def infer_output_spec(
         _HOST_SEMANTIC_FINGERPRINT: host_semantic_fingerprint,
         _HOST_SEMANTIC_INPUT_NORMALIZATION: host_semantic_input_normalization,
         _REQUIRES_ISOLATED_LOWERING: requires_isolated_lowering,
-    }
+        _SPECIALIZED_GLOBALS: specialized_globals,
+    }, bound
+
+
+def _guard_module_globals(tx: InstructionTranslatorBase, bound: BoundKernel) -> None:
+    """Guard the captured frame on each module int global the binding compiled
+    as a constant (``CompileEnvironment.specialized_globals``).  The graph
+    lowers with those values, so assigning one a new value must retrace it, as
+    an eager call keys the binding on the value instead."""
+    for module, name in bound.env.specialized_globals:
+        source = AttrSource(tx.import_source(module.__name__), name)
+        install_guard(source.make_guard(GuardBuilder.CONSTANT_MATCH))
 
 
 def _unwrap_arg(a: VariableTracker) -> object:
@@ -479,7 +512,8 @@ class HelionKernelVariable(VariableTracker):
             constant_args["__container_specs"] = container_specs
 
         # Emit HOP node into FX graph and unflatten output
-        output_spec = infer_output_spec(self._kernel, bind_args)
+        output_spec, bound = _infer_output_spec_and_bound(self._kernel, bind_args)
+        _guard_module_globals(tx, bound)
         hop_kwargs = {
             "kernel_idx": self._kernel_idx,
             "constant_args": constant_args,

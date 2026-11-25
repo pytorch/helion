@@ -16,6 +16,8 @@ import torch
 from torch.utils._pytree import tree_leaves
 
 import helion
+from helion._compiler._dynamo.variables import torch_compile_captures_kernel_hop
+from helion._testing import _get_backend
 from helion._testing import cpu_render_target
 from helion._testing import onlyBackends
 from helion._testing import skipIfRefEager
@@ -673,6 +675,12 @@ def test_symbolic_nonfragment_callable_remains_dynamic():
         )
 
 
+# Where torch.compile traces a kernel call inline, a module-level int global
+# stays a kernel argument (host_function._specializes_module_ints) and keeps
+# the binding like any other global.
+_SPECIALIZES_MODULE_INTS = torch_compile_captures_kernel_hop(_get_backend())
+
+
 @pytest.mark.parametrize("kind", ["global", "module"])
 @pytest.mark.parametrize("old,new", [(3, 5), (3.5, 5.5), (True, False), (-0.0, 0.0)])
 @onlyBackends(["triton", "cute"])
@@ -690,7 +698,15 @@ def test_literal_global_numeric_metadata_is_snapshotted(kind, old, new):
             assert math.copysign(1, captured.default()) == math.copysign(1, old)
         ast.parse(bound.to_code(bound.config_spec.default_config()))
         namespace["SCALAR"] = new
-        assert kernel.bind(args) is bound
+        if kind == "global" and type(old) is int and _SPECIALIZES_MODULE_INTS:
+            # A module-level int global is a constant of the binding, which
+            # its value keys, so the next bind compiles again; an attribute of
+            # an imported module and the other scalars keep the binding.
+            rebound = kernel.bind(args)
+            assert rebound is not bound
+            assert rebound.config_spec.user_defined_tunables["factor"].default() == new
+        else:
+            assert kernel.bind(args) is bound
         assert captured.default() == old
         fresh = cpu_bind(kernel, args)
         assert fresh.config_spec.user_defined_tunables["factor"].default() == new
@@ -718,7 +734,11 @@ def test_derived_global_expression_keeps_typed_literal_snapshot(
         args = (torch.empty(37), operation)
         bound = kernel.bind(args)
         kernel.fn.__globals__["SCALAR"] = new
-        assert kernel.bind(args) is bound
+        # A module-level int global keys the binding, so a new value compiles
+        # again; a float or bool global is read when the kernel runs, and the
+        # binding keeps the tunable it snapshotted.
+        rebinds = type(old) is int and _SPECIALIZES_MODULE_INTS
+        assert (kernel.bind(args) is bound) is not rebinds
         fresh = cpu_bind(kernel, args)
         for current, expected in ((bound, expected_old), (fresh, expected_new)):
             captured = current.config_spec.user_defined_tunables["factor"]

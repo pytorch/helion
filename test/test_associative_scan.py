@@ -1738,11 +1738,14 @@ def test_ordinary_scan_host_fixed_chunk_generated_values():
     from test.test_cute_computed_fragment import _fragment_host_fixed_chunk_scan
 
     x = (torch.arange(3 * 17).reshape(3, 17) % 7).float()
-    with mock_cuda_unavailable(), _target(), forbid_native_compile():
-        bound = cpu_bind(_fragment_host_fixed_chunk_scan, (x,))
-        source = bound.to_code(bound.config_spec.default_config())
     for chunk_size in (4, 8, 16):
+        # A module-level int is a constant of the generated program, and the
+        # binding keys on its value, so each chunk size binds and generates
+        # a program of its own.
         with patch.object(fragment_tests, "_FRAGMENT_FIXED_CHUNK", chunk_size):
+            with mock_cuda_unavailable(), _target(), forbid_native_compile():
+                bound = cpu_bind(_fragment_host_fixed_chunk_scan, (x,))
+                source = bound.to_code(bound.config_spec.default_config())
             actual = _execute_direct_scan_program(source, (x,))
         torch.testing.assert_close(
             actual, _ordinary_scan_expected(x, "sum", False, chunk_size), rtol=0, atol=0

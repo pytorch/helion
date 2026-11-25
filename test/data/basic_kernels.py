@@ -81,6 +81,13 @@ def add_global_float(x, tile) -> torch.Tensor:
     return x + global_float
 
 
+global_int = 3
+
+
+def add_global_int(x, tile) -> torch.Tensor:
+    return x + global_int
+
+
 def sigmoid_with_torch(x, tile) -> torch.Tensor:
     return torch.sigmoid(x)
 

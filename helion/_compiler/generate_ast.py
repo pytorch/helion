@@ -1144,6 +1144,7 @@ class GenerateAST(NodeVisitor, CodegenInterface):
 
     def visit_Name(self, node: ast.Name) -> ast.AST:
         from .type_info import ConfigFragmentType
+        from .type_info import SymIntType
 
         assert isinstance(node, ExtendedAST)
         if isinstance(node.ctx, ast.Load) and node._type_info is not None:
@@ -1171,6 +1172,20 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                     if type(value) in (torch.dtype, torch.device)
                     else repr(value)
                 )
+            if (
+                isinstance(node._type_info, SymIntType)
+                and (
+                    value
+                    := CompileEnvironment.current().specialized_global_symbols.get(
+                        node._type_info.value._sympy_()
+                    )
+                )
+                is not None
+            ):
+                # A module int global is a constant of the binding, in host code
+                # as in device code (CompileEnvironment.specialized_globals),
+                # so the program reads one value of it however it is reached.
+                return expr_from_string(repr(value))
             if origin.needs_rename():
                 # `x` => `_source_module.x`
                 return expr_from_string(origin.host_str())

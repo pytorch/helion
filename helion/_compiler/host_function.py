@@ -22,6 +22,7 @@ from torch.utils._sympy.reference import PythonReferenceAnalysis
 from torch.utils._sympy.symbol import SymT
 from torch.utils._sympy.symbol import symbol_is_type
 
+from .._compat import supports_torch_compile_fusion
 from . import ast_extension
 from .ast_extension import expr_from_string
 from .ast_extension import statement_from_string
@@ -218,6 +219,18 @@ class CompilerState:
             self.ambiguous_ssa_inputs.update(t.untyped_storage() for t in inputs)
 
 
+def _specializes_module_ints(env: CompileEnvironment) -> bool:
+    """Whether a module-level int global becomes a constant of the binding
+    (``CompileEnvironment.specialized_globals``).  Not where a new value could
+    not compile again: an AOT standalone artifact, or a call Dynamo traces
+    inline down to the launch, which cannot trace binding (builds without
+    Helion's fusion entrypoints; ``torch_compile_captures_kernel_hop`` is
+    False).  There it stays a kernel argument."""
+    return env.settings.autotune_cache != "AOTAutotuneCache" and (
+        supports_torch_compile_fusion() or not env.backend.dynamo_captures_kernel_launch
+    )
+
+
 class HostFunction:
     """Mutable compilation state for a @helion.kernel function.
 
@@ -381,12 +394,46 @@ class HostFunction:
         )
 
     def register_fake(self, obj: object, origin: Origin) -> object:
-        value = CompileEnvironment.current().to_fake(obj, origin)
+        env = CompileEnvironment.current()
+        module = self._global_module(origin) if _specializes_module_ints(env) else None
+        if module is not None:
+            # One value per global in a trace: the kernel body and each helper
+            # register their own read, and one that finds the global assigned
+            # meanwhile (by another thread) takes the int the first recorded,
+            # so the program and the key it is filed under agree.
+            assert isinstance(origin, AttributeOrigin)
+            obj = env.specialized_globals.get((module, origin.key), obj)
+            if type(obj) is not int:
+                module = None
+        value = env.to_fake(obj, origin)
         if isinstance(value, torch.Tensor):
             self.tensor_to_origin[value] = origin
         elif isinstance(value, (torch.SymInt, torch.SymFloat, torch.SymBool)):
-            self.expr_to_origin[value._sympy_()] = SymbolOrigin(origin)
+            symbol = value._sympy_()
+            self.expr_to_origin[symbol] = SymbolOrigin(origin)
+            if module is not None:
+                # A module-level int traces as a symbol, as before, but the
+                # generated code reads its value as a constant rather than a
+                # kernel argument (``x // BLOCK`` divides by a literal), and
+                # its value keys the binding.
+                assert isinstance(origin, AttributeOrigin) and isinstance(obj, int)
+                env.specialized_globals[(module, origin.key)] = obj
+                env.specialized_global_symbols[symbol] = obj
         return value
+
+    def _global_module(self, origin: Origin) -> types.ModuleType | None:
+        """The module whose global ``origin`` reads, or None for any other
+        origin (an argument, a closure cell, an attribute of a global)."""
+        if not (
+            isinstance(origin, AttributeOrigin) and type(origin.value) is GlobalOrigin
+        ):
+            return None
+        alias = origin.value.name
+        for entry in self.global_imports.values():
+            if entry.alias == alias and entry.member is None:
+                module = entry.value
+                return module if isinstance(module, types.ModuleType) else None
+        return None
 
     def __repr__(self) -> str:
         return f"<HostFunction {self.name}>"
@@ -471,7 +518,7 @@ class HostFunction:
         env = CompileEnvironment.current()
         with contextlib.suppress(Exception):
             expr = env.shape_env.simplify(expr)
-        expr = env.specialize_expr(expr)
+        expr = env.substitute_specialized_globals(env.specialize_expr(expr))
         if config is not None:
             resolved = self.resolve_tunable_expr(expr, config)
             if isinstance(resolved, (int, float, bool)):

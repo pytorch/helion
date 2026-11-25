@@ -44,6 +44,7 @@ class _TensorContainer:
 
 
 _RESET_SPECIALIZATION_USES_X = False
+_CAPTURED_INT = 1
 
 
 def _select_reset_specialization_tensor(
@@ -1533,6 +1534,49 @@ class TestPreparedCall(RefEagerTestDisabled, TestCase):
             # A torch.device context is trusted in eager and under capture.
             with torch.device(DEVICE):
                 torch.testing.assert_close(compiled(x), x + 1)
+
+    @onlyBackends(["triton"])
+    @skipIfTileIR("legacy torch.compile rejects TileIR launch options")
+    def test_fullgraph_capture_without_fusion_integration_with_int_global(
+        self,
+    ) -> None:
+        # Without the fusion entrypoints Dynamo traces the call inline, where
+        # no binding can compile for a new value, so a module int global stays
+        # a kernel argument and the captured graph follows a new value.
+        @helion.kernel(
+            static_shapes=True,
+            config=helion.Config(block_sizes=[64]),
+            torch_compile_fusion=False,
+        )
+        def add_global(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.size(0)):
+                out[tile] = x[tile] + _CAPTURED_INT
+            return out
+
+        x = torch.randn(64, device=DEVICE)
+
+        def call(x: torch.Tensor) -> torch.Tensor:
+            return add_global(x)
+
+        with (
+            patch(
+                "helion._compiler._dynamo.variables.supports_torch_compile_fusion",
+                return_value=False,
+            ),
+            patch(
+                "helion._compiler.host_function.supports_torch_compile_fusion",
+                return_value=False,
+            ),
+        ):
+            torch.testing.assert_close(add_global(x), x + 1)
+            bound = add_global.bind((x,))
+            self.assertEqual(bound.env.specialized_globals, {})
+            compiled = torch.compile(call, fullgraph=True)
+            torch.testing.assert_close(compiled(x), x + 1)
+            with patch.dict(globals(), _CAPTURED_INT=3):
+                torch.testing.assert_close(compiled(x), x + 3)
+            torch.testing.assert_close(compiled(x), x + 1)
 
     @onlyBackends(["triton"])
     @skipIfTileIR("legacy torch.compile rejects TileIR launch options")

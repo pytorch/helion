@@ -650,6 +650,18 @@ def k_scale_with_global_var_ref(x):
     return x * GLOBAL_SCALE_FACTOR
 
 
+GLOBAL_INT_DIVISOR = 4
+
+
+@helion.kernel(autotune_effort="none")
+def k_divide_index_by_global_int(x: torch.Tensor) -> torch.Tensor:
+    """Add x's index divided by a module int global, a compile-time constant."""
+    out = torch.empty_like(x)
+    for tile in hl.tile(x.size(0)):
+        out[tile] = x[tile] + (tile.index // GLOBAL_INT_DIVISOR).to(x.dtype)
+    return out
+
+
 @helion.kernel(
     static_shapes=True,
     config=helion.Config(block_sizes=[64]),
@@ -3662,6 +3674,24 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             kernels_ref=[k_scale_with_global_var_ref],
             expected_num_kernels_ref=1,
         )
+
+    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    def test_captured_int_global_retraces_when_assigned(self):
+        """A module int global is a constant of the captured kernel, and the
+        frame is guarded on its value: assigning a new value retraces and
+        lowers the kernel again, as an eager call compiles again."""
+        x = torch.zeros(64, device=DEVICE)
+
+        def expected(divisor: int) -> torch.Tensor:
+            return (torch.arange(64, device=DEVICE) // divisor).to(x.dtype)
+
+        k_divide_index_by_global_int.reset()
+        torch._dynamo.reset()
+        f = torch.compile(lambda x: k_divide_index_by_global_int(x), fullgraph=True)
+        torch.testing.assert_close(f(x), expected(4))
+        with patch.dict(globals(), GLOBAL_INT_DIVISOR=8):
+            torch.testing.assert_close(f(x), expected(8))
+        torch.testing.assert_close(f(x), expected(4))
 
     @requires_fusion_support
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
