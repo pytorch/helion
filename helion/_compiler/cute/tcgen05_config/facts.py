@@ -31,6 +31,7 @@ from ..dense_aligned_n import carrier_n
 from ..dense_aligned_n import dense_aligned_n_block_m
 from ..dense_aligned_n import dense_aligned_n_block_ms
 from ..dense_aligned_n import dense_aligned_n_defaults
+from ..dense_aligned_n import dense_aligned_n_mn_b_width
 from ..dense_aligned_n import dense_aligned_n_plan
 from ..dense_aligned_n import dense_aligned_n_sixteen_bit
 from ..dense_aligned_n import pair_tile_wave_cost
@@ -56,7 +57,6 @@ from ..tcgen05_constants import TCGEN05_ACC_WAIT_PLACEMENT_CONFIG_KEY
 from ..tcgen05_constants import TCGEN05_ACC_WAIT_PLACEMENT_SUBTILE_LOOP
 from ..tcgen05_constants import TCGEN05_ALIGNED_N_CLIPPED_MIN_GAIN
 from ..tcgen05_constants import TCGEN05_ALIGNED_N_CLIPPED_SEARCH_MIN_GAIN
-from ..tcgen05_constants import TCGEN05_ALIGNED_N_MN_B_ROW_BYTES
 from ..tcgen05_constants import TCGEN05_AUX_FRAGMENT_HOIST_CONFIG_KEY
 from ..tcgen05_constants import TCGEN05_AUX_LOAD_MODE_CONFIG_KEY
 from ..tcgen05_constants import TCGEN05_AUX_LOAD_MODE_EPI_TMA
@@ -1076,15 +1076,10 @@ def _dense_aligned_n_proved_plans(
         not state.search_enabled
         or facts is None
         or block_m is None
-        # Each CTA stages half of an N-major B tile as one SMEM row: a
-        # row of fewer than 64-byte swizzle atoms runs the MMA's B reads
-        # at a fraction of their bandwidth (MN-major 8008x2560x4096: the
-        # 160-wide pair 0.74 of cuBLAS against 1.09 at 256; 20008x768x2048
-        # at 96: 0.66 against 0.88). 192 keeps 64-byte atoms.
+        # (an N-major B: whole 64-byte swizzle atoms per CTA half row)
         or (
             not facts.rhs_k_major
-            and (width // 2 * facts.input_dtype.itemsize)
-            % TCGEN05_ALIGNED_N_MN_B_ROW_BYTES
+            and not dense_aligned_n_mn_b_width(width, facts.input_dtype.itemsize)
         )
         # dense_aligned_n_plan needs a physical width that divides N and
         # pair-M tiles that divide M (the 16-bit pair: or whole K tiles,

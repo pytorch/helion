@@ -19,6 +19,8 @@ from helion._compiler.cute import cute_mma
 from helion._compiler.cute.dense_aligned_n import ALIGNED_N_CHOICES
 from helion._compiler.cute.dense_aligned_n import carrier_n
 from helion._compiler.cute.dense_aligned_n import dense_aligned_n_defaults
+from helion._compiler.cute.dense_aligned_n import dense_aligned_n_mn_b_atom_bytes
+from helion._compiler.cute.dense_aligned_n import dense_aligned_n_mn_b_width
 from helion._compiler.cute.dense_aligned_n import pair_tile_wave_cost
 from helion._compiler.cute.dense_aligned_n import transposed_double_edge_without_pairs
 from helion._compiler.cute.dense_aligned_n import transposed_pair_tile_gain
@@ -26,6 +28,21 @@ from helion._compiler.cute.dense_aligned_n import transposed_pair_tile_orientati
 from helion._compiler.cute.pipeline_smem import Tcgen05PipelineSmemFacts
 from helion._compiler.cute.pipeline_smem import pipeline_smem_bytes
 from helion._compiler.cute.strategies import tcgen05_two_cta_m128_epilogue_tile_expr
+from helion._compiler.cute.tcgen05.search_plan import tcgen05_copies_n_major_b
+from helion._compiler.cute.tcgen05.search_plan import (
+    tcgen05_transposes_epilogue_bound_product,
+)
+from helion._compiler.cute.tcgen05.search_plan import (
+    tcgen05_transposes_misaligned_b_rows,
+)
+from helion._compiler.cute.tcgen05.search_plan import (
+    tcgen05_transposes_misaligned_batched_output,
+)
+from helion._compiler.cute.tcgen05.search_plan import tcgen05_transposes_n_edge_b_rows
+from helion._compiler.cute.tcgen05.search_plan import tcgen05_transposes_skinny_product
+from helion._compiler.cute.tcgen05.search_plan import (
+    tcgen05_transposes_wide_tf32_product,
+)
 from helion._compiler.cute.tcgen05_config import facts
 from helion._compiler.cute.tcgen05_config import repair
 from helion._compiler.cute.tcgen05_config import seeds
@@ -33,6 +50,8 @@ from helion._compiler.cute.tcgen05_config import surface
 from helion._compiler.cute.tcgen05_constants import TCGEN05_TRANSPOSED_PRODUCT_MIN_GAIN
 from helion._compiler.cute.tcgen05_constants import tcgen05_last_wave_idle_sms
 from helion._compiler.cute.tcgen05_schedule_facts import analyze_native_gemm
+from helion._testing import default_cute_mma_support
+from helion._testing import patch_cute_mma_support
 from helion._testing import skipUnlessBackends
 from helion._testing.cute_codegen import forbid_cuda_work
 from helion._testing.cute_codegen import kernel_body
@@ -56,6 +75,7 @@ import helion.language as hl
 from helion.runtime.cute.launcher import _append_cute_wrapper_plan
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
     from collections.abc import Iterator
 
 cutlass = pytest.importorskip("cutlass")
@@ -1566,6 +1586,689 @@ def _search_range(bound, block_id: int) -> tuple[int, int, int]:
     block = spec.block_sizes.block_id_lookup(block_id)
     fragment = block._fragment(spec)
     return block.min_size, fragment.low, fragment.high
+
+
+def test_an_n_major_b_runs_transposed_where_its_widths_tile_worse() -> None:
+    # Over an N-major b (stored [K, N]) each CTA of the as-written pair
+    # stages half of b's N tile as one SMEM row, swizzled in the largest atom
+    # dividing its bytes; the pair runs widths of 64-byte atoms or more.
+    assert {
+        width: dense_aligned_n_mn_b_atom_bytes(width, 2)
+        for width in (64, 128, 144, 160, 192, 224, 256)
+    } == {64: 64, 128: 128, 144: 16, 160: 32, 192: 64, 224: 32, 256: 128}
+    assert [
+        width
+        for width in sorted({64, 128, 256, *ALIGNED_N_CHOICES})
+        if dense_aligned_n_mn_b_width(width, 2)
+    ] == [64, 128, 192, 256]
+    # The transposed product reads b.T as its A operand at every width. bf16
+    # 2048x2560x2560: as written 8 x 14 = 112 tiles of 256x192, transposed
+    # 10 x 15 = 150 of 256x144, two waves either way (GB300, of cuBLAS in one
+    # process: 0.85 -> 1.02); a K-major b tiles 256x144 as written too
+    # (8 x 18 tiles) and stays.
+    assert transposed_pair_tile_gain(2048, 2560, 2560, sm_pairs=76) == 1.0
+    assert (
+        transposed_pair_tile_gain(2048, 2560, 2560, sm_pairs=76, b_n_major=True)
+        >= TCGEN05_TRANSPOSED_PRODUCT_MIN_GAIN
+    )
+    # As written 32 x 4 = 128 tiles of 256x192 and transposed 3 x 47 = 141 of
+    # 256x176 are two waves either way: bf16 8192x768x768 transposes over an
+    # N-major b, whose 192-column half rows of 64-byte atoms stream slower
+    # (1.05-1.08 of cuBLAS as written, 1.12 transposed), and stays as
+    # written over a K-major b.
+    assert (
+        transposed_pair_tile_gain(8192, 768, 768, sm_pairs=76, b_n_major=True)
+        >= TCGEN05_TRANSPOSED_PRODUCT_MIN_GAIN
+        > transposed_pair_tile_gain(8192, 768, 768, sm_pairs=76)
+    )
+    # An m or n under one 256-row pair tile, a K loop past the pair's 256 K
+    # blocks of 64, or a grid of 256x256 tiles under one per SM pair is no
+    # orientation the model prices: 128x16384x4096 runs as written on the
+    # 128-row pair (1.16 both ways), 25216x192x768 transposed leaves a
+    # quarter of every tile's rows empty (1.00 as written, 0.96 transposed),
+    # 16384x768x30528 runs the 128-row pair both ways (0.93 as written, 0.87
+    # transposed), 4096x1024x512 (64 tiles) runs 128 256x128 pairs as
+    # written (1.10-1.11 as written, 1.06-1.07 transposed); 4096x4096x16384
+    # (256 K blocks) transposes (1.00 -> 1.10).
+    for m, n, k in (
+        (128, 16384, 4096),
+        (25216, 192, 768),
+        (16384, 768, 30528),
+        (4096, 1024, 512),
+    ):
+        assert transposed_pair_tile_gain(m, n, k, sm_pairs=76, b_n_major=True) == 1.0
+    assert (
+        transposed_pair_tile_gain(4096, 4096, 16384, sm_pairs=76, b_n_major=True)
+        >= TCGEN05_TRANSPOSED_PRODUCT_MIN_GAIN
+    )
+
+
+def test_a_skinny_product_runs_transposed() -> None:
+    # tcgen05_transposes_skinny_product (GB300: 152 SMs, 76 SM pairs) puts a
+    # skinny M on the MMA's N side, which holds as few as 8 columns.
+    def transposes(m: int, n: int, k: int, *, b_n_major: bool) -> bool:
+        return tcgen05_transposes_skinny_product(
+            m,
+            n,
+            k,
+            torch.bfloat16,
+            a_strides=(k, 1),
+            b_strides=(n, 1) if b_n_major else (1, k),
+            num_sms=152,
+        )
+
+    # An N-major b (a Linear's weight stored [K, N]) whose 64-column slabs
+    # give the as-written grid fewer tiles than SM pairs: 2 x 12 = 24, 1 x 64.
+    assert transposes(128, 768, 1000, b_n_major=True)
+    assert transposes(64, 4096, 4096, b_n_major=True)
+    # 2 x 64 = 128 tiles fill the pairs with 64-column slabs as written.
+    assert not transposes(128, 4096, 4096, b_n_major=True)
+    # A K-major b loads 128-byte rows either way: only an M under the one-CTA
+    # tile's 64 rows (zero-filled as written) transposes.
+    assert transposes(32, 1280, 960, b_n_major=False)
+    assert not transposes(128, 768, 768, b_n_major=False)
+    # The warp-MMA family runs 16x768x768 as written (16-row tiles), the SIMT
+    # lowering a product too small for the tcgen05 tiles (40x96x64); a tall
+    # product is not skinny.
+    assert not transposes(16, 768, 768, b_n_major=False)
+    assert not transposes(40, 96, 64, b_n_major=False)
+    assert not transposes(2048, 32, 4096, b_n_major=True)
+    # The rule is the 16-bit families': fp32, int32 and fp8 operands of the
+    # 32x1280x960 it transposes in bf16 stay as written.
+    for dtype in (torch.float32, torch.int32, torch.float8_e4m3fn):
+        assert not tcgen05_transposes_skinny_product(
+            32,
+            1280,
+            960,
+            dtype,
+            a_strides=(960, 1),
+            b_strides=(1, 960),
+            num_sms=152,
+        )
+    # An M under the narrowest tcgen05 N tile is the transposed product's N:
+    # a memory-bound GEMM's zero-filled 8-column tile, or no tcgen05 tile.
+    assert transposes(4, 4096, 4096, b_n_major=False)
+    assert not transposes(4, 4096, 64, b_n_major=False)
+
+    def transposes_over(
+        m: int, n: int, k: int, a_strides: tuple[int, int], b_strides: tuple[int, int]
+    ) -> bool:
+        return tcgen05_transposes_skinny_product(
+            m,
+            n,
+            k,
+            torch.bfloat16,
+            a_strides=a_strides,
+            b_strides=b_strides,
+            num_sms=152,
+        )
+
+    def code(args: tuple[torch.Tensor, ...], block_sizes: list[int]) -> str:
+        bound = plain_mm_into._bind_isolated(args)
+        return bound.to_code(helion.Config(block_sizes=block_sizes))
+
+    # An operand TMA loads neither way round keeps the product as written,
+    # unmeasured either way: a's rows are a.T's transposed (the product's
+    # K-major B), a K-major b's columns b.T's (its K-major A). bf16
+    # 32x768x768 stays on the warp-MMA family over a's rows sliced from
+    # [32, 776] (1552 bytes apart), and as written over those from [32, 772]
+    # (1544 bytes: 24,576 elements, too few to stage) or an overlapping view
+    # of strides (1, 1); 32x1280x960, past the family's latency-bound regime,
+    # transposes over a's rows from [32, 968] as over contiguous ones, but
+    # not over b's columns from [1280, 964] or of strides (1, 1).
+    assert not transposes_over(32, 768, 768, (776, 1), (1, 768))
+    assert not transposes_over(32, 768, 768, (772, 1), (1, 768))
+    assert not transposes_over(32, 768, 768, (1, 1), (1, 768))
+    assert transposes_over(32, 1280, 960, (968, 1), (1, 960))
+    assert not transposes_over(32, 1280, 960, (960, 1), (1, 964))
+    assert not transposes_over(32, 1280, 960, (960, 1), (1, 1))
+    # Rendered: neither orientation of 32x768x768 loads an operand through TMA
+    # over a's rows from [32, 772] (the scalar producers). Over an N-major b's
+    # rows from [256, 772] the transposed 32x768x256 copies b.T, its M-major
+    # A, with cp.async beside a.T's TMA loads, where as written neither loads
+    # through TMA.
+    out = torch.empty((32, 768), dtype=torch.bfloat16)
+    a = torch.randn((32, 772), dtype=torch.bfloat16)[:, :768]
+    b = torch.randn((768, 768), dtype=torch.bfloat16).T
+    for args, block_sizes in (
+        ((a, b, out), [64, 32, 128]),
+        ((b.T, a.T, out.T), [64, 16, 128]),
+    ):
+        rendered = code(args, block_sizes)
+        assert "tma_atom_a" not in rendered and "sA_mma[" in rendered
+    a = torch.randn((32, 256), dtype=torch.bfloat16)
+    b = torch.randn((256, 772), dtype=torch.bfloat16)[:, :768]
+    rendered = code((a, b, out), [64, 32, 64])
+    assert "tma_atom_b" not in rendered and "sA_mma[" in rendered
+    rendered = code((b.T, a.T, out.T), [128, 32, 64])
+    assert "tma_atom_a" not in rendered and "tma_atom_b" in rendered
+    assert "cpasync.CopyG2SOp" in rendered
+    # So such rows decide as the rest of the rule does, which reads the
+    # warp-MMA admission over the real strides, as the planner's does: over
+    # b's rows from [256, 776] (1552 bytes apart) the family runs 32x768x256
+    # as written; from [256, 772] it admits no warp MMA, and the tcgen05 rule
+    # transposes; rows an odd count of elements apart (from [256, 771]),
+    # which cp.async does not copy either, stay as written.
+    for row, expected in ((776, False), (772, True), (771, False)):
+        assert (
+            tcgen05_transposes_skinny_product(
+                32,
+                768,
+                256,
+                torch.bfloat16,
+                a_strides=(256, 1),
+                b_strides=(row, 1),
+                num_sms=152,
+            )
+            is expected
+        )
+
+
+def test_misaligned_b_rows_run_transposed() -> None:
+    # tcgen05_transposes_misaligned_b_rows (GB300: 152 SMs): an N-major b
+    # whose rows straddle 32-byte L2 sectors (n * 2 bytes = 16 mod 32) runs
+    # transposed, where the 2x2 cluster multicasts b.T to two CTA pairs.
+    def transposes(
+        m: int, n: int, *, k: int = 768, b_strides: tuple[int, int] | None = None
+    ) -> bool:
+        return tcgen05_transposes_misaligned_b_rows(
+            m,
+            n,
+            k,
+            torch.bfloat16,
+            a_strides=(k, 1),
+            b_strides=b_strides or (n, 1),
+            num_sms=152,
+        )
+
+    # bf16 [768, 20008] rows: 40016 bytes apart, an odd multiple of 16.
+    assert transposes(2048, 20008)
+    assert transposes(4096, 50264)
+    assert transposes(4096, 128104)
+    # Sector-aligned rows stay as written (N = 20000, 50272: 32-byte multiples).
+    assert not transposes(2048, 20000)
+    assert not transposes(8192, 50272)
+    # The real row stride decides: N = 20000 sliced from 20008-wide rows.
+    assert transposes(2048, 20000, b_strides=(20008, 1))
+    # A K-major b (b.T's rows are K long) is not this rule's.
+    assert not transposes(2048, 20008, b_strides=(1, 768))
+    # The transposed 2x2 cluster pairs m / 256 tiles: 9 for M = 2304; a
+    # ragged M (2040) leaves the transposed product no CTA-pair search
+    # family.
+    assert not transposes(2304, 20008)
+    assert not transposes(2040, 20008)
+    # Under two waves of 2x2 clusters (2 x 152 // 4 = 76): 4 x 9 = 36 clusters.
+    assert not transposes(2048, 2056)
+    # A skinny M is tcgen05_transposes_skinny_product's.
+    assert not transposes(128, 20008)
+    # Rows off TMA's 16-byte alignment (N = 20001: 40002 bytes apart) are
+    # b.T's rows too: no orientation multicasts them.
+    assert not transposes(2048, 20001)
+    # A K the tcgen05 planner rejects runs no pair tiles either way round.
+    assert not transposes(2048, 20008, k=8)
+
+
+def test_a_small_n_major_b_runs_over_a_k_major_copy() -> None:
+    # tcgen05_copies_n_major_b (GB300: 152 SMs): an N-major b whose widths
+    # (128, 192, 256) compute a third more columns than a K-major b's, under
+    # a product of six or more waves of pair tiles, runs over a K-major copy
+    # whose columns TMA can read.
+    def copies(
+        m: int, n: int, k: int = 144, *, b_strides: tuple[int, int] | None = None
+    ) -> bool:
+        return tcgen05_copies_n_major_b(
+            m,
+            n,
+            k,
+            torch.bfloat16,
+            a_strides=(k, 1),
+            b_strides=b_strides or (n, 1),
+            num_sms=152,
+        )
+
+    # N = 288: 384 columns at 128 or 192 as written, 288 at 144 over the copy.
+    assert copies(131072, 288)
+    assert copies(131072, 288, k=1152)
+    # N = 160: 256 columns at 128 (192 and 256 run past N), 160 over the copy.
+    assert copies(131072, 160)
+    # N = 416: 512 columns at 128 or 256, 416 at 208: a quarter more, no copy.
+    assert not copies(131072, 416)
+    # 64 x 2 pair tiles of 256x144: under six waves of 76 SM pairs.
+    assert not copies(16384, 288)
+    # 512 = 2 x 256: the as-written pair tiles N whole over b itself.
+    assert not copies(401408, 512, k=128)
+    # A K-major b needs no copy.
+    assert not copies(131072, 288, b_strides=(1, 144))
+    # A deep K: the copy (b: 1.2 MB) stays small beside the product.
+    assert copies(65536, 288, k=2048)
+    # K = 100: the copy's columns, 200 bytes apart, are off TMA's 16-byte
+    # alignment (b's 576-byte rows are on it).
+    assert not copies(131072, 288, k=100)
+    # A wide product: its N-major widths tile N = 20008 within a few columns.
+    assert not copies(2048, 20008, k=768)
+
+
+def test_n_edge_b_rows_run_transposed() -> None:
+    # tcgen05_transposes_n_edge_b_rows (GB300: 152 SMs): an N-major b whose
+    # N ends in a partial 256-wide pair tile, which no as-written cluster
+    # multicasts, runs transposed with a K loop of 6 to 12 K blocks of 64,
+    # where the 2x2 cluster multicasts b.T to two CTA pairs.
+    def transposes(
+        m: int,
+        n: int,
+        k: int,
+        *,
+        b_strides: tuple[int, int] | None = None,
+        dtype: torch.dtype = torch.bfloat16,
+    ) -> bool:
+        return tcgen05_transposes_n_edge_b_rows(
+            m,
+            n,
+            k,
+            dtype,
+            a_strides=(k, 1),
+            b_strides=b_strides or (n, 1),
+            num_sms=152,
+        )
+
+    # Vocab projections: 30528 = 119 x 256 + 64, 50272 = 196 x 256 + 96.
+    assert transposes(32768, 30528, 512)
+    assert transposes(32768, 30528, 768)
+    assert transposes(16384, 50272, 768)
+    assert transposes(8192, 50272, 384, dtype=torch.float16)
+    # The K-loop window: 2 K blocks run epilogue-bound, 4 and 16 tie.
+    assert not transposes(32768, 30528, 128)
+    assert not transposes(16384, 50272, 256)
+    assert not transposes(16384, 50272, 1024)
+    # A K tail (K = 760) is not this rule's.
+    assert not transposes(16384, 50272, 760)
+    # Whole N tiles (50176 = 196 x 256): the as-written 2x2 cluster pairs
+    # them.
+    assert not transposes(16384, 50176, 768)
+    # Rows that straddle L2 sectors (50264 * 2 bytes = 16 mod 32) are
+    # tcgen05_transposes_misaligned_b_rows's.
+    assert not transposes(16384, 50264, 768)
+    # A K-major b: the partial-N 2x2 family runs it as written.
+    assert not transposes(16384, 50272, 768, b_strides=(1, 768))
+    # The transposed 2x2 cluster pairs m / 256 tiles: 9 for M = 2304.
+    assert not transposes(2304, 50272, 768)
+    # A ragged M (2040) leaves the transposed product a second partial tile
+    # and no CTA-pair search family: as written.
+    assert not transposes(2040, 20032, 512)
+    assert transposes(2048, 20032, 512)
+    # Under two waves of 2x2 clusters (2 x 152 // 4 = 76): 1 x 65 = 65.
+    assert not transposes(512, 16400, 768)
+    # A narrow N (288: two pair tiles, the transposed product would compute
+    # 512 rows) is the K-major copy's.
+    assert not transposes(131072, 288, 576)
+    assert tcgen05_copies_n_major_b(
+        131072,
+        288,
+        576,
+        torch.bfloat16,
+        a_strides=(576, 1),
+        b_strides=(288, 1),
+        num_sms=152,
+    )
+    # fp32 (tf32) products are not this rule's.
+    assert not transposes(16384, 50272, 768, dtype=torch.float32)
+
+
+def test_epilogue_bound_products_run_transposed() -> None:
+    # tcgen05_transposes_epilogue_bound_product (GB300: 152 SMs): a wide
+    # product over a K-major b with at most 8 K blocks of 64, an odd count
+    # of 256-wide N tiles (no as-written 2x2 cluster) and six waves or more
+    # runs transposed, where the column-major output's epilogue stores
+    # 256-byte rows.
+    def transposes(
+        m: int,
+        n: int,
+        k: int,
+        *,
+        b_strides: tuple[int, int] | None = None,
+        dtype: torch.dtype = torch.bfloat16,
+    ) -> bool:
+        return tcgen05_transposes_epilogue_bound_product(
+            m,
+            n,
+            k,
+            dtype,
+            a_strides=(k, 1),
+            b_strides=b_strides or (1, k),
+            num_sms=152,
+        )
+
+    # 977, 257 and 513 N tiles of 256 columns.
+    assert transposes(4096, 250112, 512)
+    assert transposes(4096, 65632, 512)
+    assert transposes(2048, 131200, 128)
+    # An even count runs the as-written 2x2 cluster (126 N tiles).
+    assert not transposes(8192, 32128, 512)
+    assert not transposes(4096, 65536, 512)
+    # A K loop past 8 K blocks stays as written (K = 576, 768): the deeper
+    # the loop, the more of the epilogue it hides.
+    assert not transposes(4096, 250112, 576)
+    assert not transposes(8192, 50432, 768)
+    # A K the tcgen05 planner rejects (a rank-8 LoRA up-projection) runs no
+    # pair tiles either way round.
+    assert not transposes(4096, 11008, 8)
+    # A row-major b, a tall product and an fp32 one are not this rule's.
+    assert not transposes(4096, 250112, 512, b_strides=(250112, 1))
+    assert not transposes(16384, 8448, 512)
+    assert not transposes(4096, 250112, 512, dtype=torch.float32)
+    # Six waves of 76 pairs and up: 16 x 33 = 528 tiles, not 16 x 25 = 400.
+    assert transposes(4096, 8448, 512)
+    assert not transposes(4096, 6400, 512)
+
+
+def test_a_transposed_double_edge_off_the_pairs_stays_as_written() -> None:
+    # A product ragged in both M and N against the 256x256 pair tile is a
+    # double edge either way round, which the search runs on the 256-row
+    # pairs only where no 64-row one-CTA tile divides its M. bf16
+    # 2040x20032x512: as written M = 2040 (31 x 64 + 56) runs them;
+    # transposed, M = 20032 (313 x 64) runs only one-CTA tiles, where 20008
+    # rows (312 x 64 + 40) would keep them.
+    def pairs(args: tuple[torch.Tensor, ...]) -> bool:
+        bound = plain_mm_into._bind_isolated(args)
+        state = bound.config_spec._cute_tcgen05_config
+        return state.cluster_m2_search_constraints is not None
+
+    assert pairs(bf16_mm_args(2040, 20032, 512))
+    assert not pairs(_transposed_args(2040, 20032, 512))
+    assert pairs(_transposed_args(2040, 20008, 512))
+    assert transposed_double_edge_without_pairs(2040, 20032)
+    assert not transposed_double_edge_without_pairs(2040, 20008)
+    # Whole tiles on either side make no double edge (20224 = 79 x 256).
+    assert not transposed_double_edge_without_pairs(2048, 20032)
+    assert not transposed_double_edge_without_pairs(2040, 20224)
+
+    # The epilogue-bound rule transposes 2048x20032x512 (8 K blocks, 79 N
+    # tiles, 632 tiles) and 2040x20008x512, whose transposed double edge
+    # keeps the pairs, but keeps 2040x20032x512 as written.
+    def epilogue_bound(m: int, n: int) -> bool:
+        return tcgen05_transposes_epilogue_bound_product(
+            m,
+            n,
+            512,
+            torch.bfloat16,
+            a_strides=(512, 1),
+            b_strides=(1, 512),
+            num_sms=152,
+        )
+
+    assert epilogue_bound(2048, 20032)
+    assert not epilogue_bound(2040, 20032)
+    assert epilogue_bound(2040, 20008)
+    # So does the orientation model over an N-major b: bf16 2040x2624x2560,
+    # modeled 1.09, runs the pairs as written and only one-CTA tiles
+    # transposed (2624 = 41 x 64 rows).
+    a, b, out = bf16_mm_args(2040, 2624, 2560, rhs_k_major=False)
+    assert pairs((a, b, out))
+    assert not pairs((b.T, a.T, out.T))
+    assert (
+        transposed_pair_tile_gain(2040, 2624, 2560, sm_pairs=76, b_n_major=True) == 1.0
+    )
+
+
+def test_misaligned_batched_outputs_run_transposed() -> None:
+    # tcgen05_transposes_misaligned_batched_output (GB300: 152 SMs): a
+    # batched product over a K-major b with a single K block of 64 whose
+    # output rows straddle 128-byte L2 lines runs transposed, where each
+    # column-major store completes the lines it splits; whole-line rows stay
+    # as written, whatever their count of 256-wide N tiles.
+    def transposes(
+        batch: int, m: int, n: int, k: int, *, b_k_major: bool = True
+    ) -> bool:
+        return tcgen05_transposes_misaligned_batched_output(
+            batch,
+            m,
+            n,
+            k,
+            torch.bfloat16,
+            a_strides=(k, 1),
+            b_strides=(1, k) if b_k_major else (n, 1),
+            num_sms=152,
+        )
+
+    # Rows of 2000, 1488 and 2480 bytes.
+    assert transposes(64, 1000, 1000, 64)
+    assert transposes(116, 744, 744, 64)
+    assert transposes(42, 1240, 1240, 64)
+    # Rows of 2048 and 1536 bytes (4 and 3 N tiles) stay as written.
+    assert not transposes(64, 1024, 1024, 64)
+    assert not transposes(109, 768, 768, 64)
+    # Rows off TMA's 16-byte alignment (3000 bytes) take the SIMT store
+    # either way round.
+    assert not transposes(28, 1500, 1500, 64)
+    # A row-major b, an unbatched product, a K loop of several K blocks
+    # (which hides the epilogue either way round), a tall product and fp32
+    # are not this rule's.
+    assert not transposes(64, 1000, 1000, 64, b_k_major=False)
+    assert not transposes(1, 1000, 1000, 64)
+    assert not transposes(64, 1000, 1000, 128)
+    assert not transposes(64, 2000, 1000, 64)
+    assert not tcgen05_transposes_misaligned_batched_output(
+        64,
+        1000,
+        1000,
+        64,
+        torch.float32,
+        a_strides=(64, 1),
+        b_strides=(1, 64),
+        num_sms=152,
+    )
+    # Six waves of 76 pairs and up: 29 x 16 = 464 tiles, not 28 x 16 = 448.
+    assert transposes(29, 1000, 1000, 64)
+    assert not transposes(28, 1000, 1000, 64)
+
+    # Over ragged matrices the pairs need operands TMA loads as given: a's
+    # rows sliced from [2, 256, 65] (130 bytes apart), or b's columns 130
+    # bytes apart, leave both orientations off them; contiguous operands run
+    # 2 x 1 x 235 = 470 pair tiles.
+    def strided(a_row: int, b_column: int) -> bool:
+        return tcgen05_transposes_misaligned_batched_output(
+            2,
+            256,
+            60008,
+            64,
+            torch.bfloat16,
+            a_strides=(a_row, 1),
+            b_strides=(1, b_column),
+            num_sms=152,
+        )
+
+    assert strided(64, 64)
+    assert not strided(65, 64)
+    assert not strided(64, 65)
+
+
+def test_wide_tf32_products_run_transposed() -> None:
+    # tcgen05_transposes_wide_tf32_product (GB300: 152 SMs): a wide fp32
+    # product computed as tf32 over a row-major a and a K-major b, from 32
+    # rows of 256-row pair tiles and K up to 2048, runs transposed, where the
+    # pair raster's grouped axis is the output's contiguous one.
+    def transposes(
+        m: int,
+        n: int,
+        k: int,
+        *,
+        b_strides: tuple[int, int] | None = None,
+        dtype: torch.dtype = torch.float32,
+    ) -> bool:
+        return tcgen05_transposes_wide_tf32_product(
+            m,
+            n,
+            k,
+            dtype,
+            a_strides=(k, 1),
+            b_strides=b_strides or (1, k),
+            num_sms=152,
+        )
+
+    # Odd and even counts of 256-wide N tiles (125, 128), K 768 to 2048.
+    assert transposes(16384, 32000, 768)
+    assert transposes(16384, 32768, 768)
+    assert transposes(8192, 50272, 768)
+    assert transposes(16384, 32000, 2048)
+    # A tall product (n < m) stays as written: its transpose groups the short
+    # axis.
+    assert not transposes(16384, 3072, 768)
+    assert not transposes(16384, 768, 3072)
+    # 16 rows of pair tiles (m = 4096) tie as written.
+    assert not transposes(4096, 128000, 768)
+    # Past the measured K.
+    assert not transposes(16384, 32000, 4096)
+    # A row-major b and 16-bit operands are not this rule's.
+    assert not transposes(16384, 32000, 768, b_strides=(32000, 1))
+    assert not transposes(16384, 32000, 768, dtype=torch.bfloat16)
+    # Six waves of pairs and up: 32 x 36 = 1152 tiles on GB300's 76 pairs,
+    # under six waves of a 200-pair device's.
+    assert transposes(8192, 9216, 256)
+    assert not tcgen05_transposes_wide_tf32_product(
+        8192,
+        9216,
+        256,
+        torch.float32,
+        a_strides=(256, 1),
+        b_strides=(1, 256),
+        num_sms=400,
+    )
+
+
+def _pair_code(args: tuple[torch.Tensor, ...], block_k: int, **changes: object) -> str:
+    """``plain_mm_into``'s persistent 256x256 CTA pair over ``args``."""
+    config = {
+        "block_sizes": [256, 256, block_k],
+        "l2_groupings": [4],
+        "pid_type": "persistent_interleaved",
+        "tcgen05_cluster_m": 2,
+    }
+    bound = plain_mm_into._bind_isolated(args)
+    return bound.to_code(helion.Config(**(config | changes)))
+
+
+def test_operands_off_tma_alignment_keep_the_pair_rules_as_written() -> None:
+    # Transposed, a's rows are a.T's, the product's K-major B (and a K-major
+    # b's columns b.T's, its K-major A). Either way round an operand off
+    # TMA's 16-byte alignment takes TMA off both, and the persistent CTA
+    # pairs fall back to the scalar producers behind a host guard that
+    # refuses every launch. bf16 512x20008x128 over a's rows sliced from
+    # [512, 129] (258 bytes apart; 65,536 elements, too few to stage), or
+    # over an overlapping view of strides (1, 1), whose two unit strides
+    # fail the TensorMap rule too: the transposed 256x256x64 2x2 config
+    # loads neither operand through TMA, nor does the as-written pair (79 N
+    # tiles, which no 2x2 cluster pairs); over a contiguous a the transposed
+    # 2x2 config loads both.
+    guard = "_helion_tcgen05_persistent_total_tiles"
+    b = torch.randn((128, 20008), dtype=torch.bfloat16)
+    out = torch.empty((512, 20008), dtype=torch.bfloat16)
+    for a in (
+        torch.randn((512, 128), dtype=torch.bfloat16),
+        torch.randn((512, 129), dtype=torch.bfloat16)[:, :128],
+        torch.randn(639, dtype=torch.bfloat16).unfold(0, 128, 1),
+    ):
+        transposed = _pair_code(
+            (b.T, a.T, out.T), 64, tcgen05_ab_stages=6, tcgen05_cluster_n=2
+        )
+        if a.is_contiguous():
+            assert "tma_atom_a" in transposed and guard not in transposed
+            continue
+        as_written = _pair_code((a, b, out), 64, tcgen05_ab_stages=6)
+        for code in (transposed, as_written):
+            assert "tma_atom_a" not in code and "sA_mma[" in code and guard in code
+    # Over tf32 operands no persistent tcgen05 pair lowers at all, either way
+    # round: fp32 8192x32768x16 over a's rows sliced from [8192, 17] (68
+    # bytes apart); over a contiguous a the transposed pair loads both.
+    support = SimpleNamespace(
+        **{**vars(default_cute_mma_support()), "tcgen05_tf32": True}
+    )
+    with patch_cute_mma_support(support):
+        b = torch.randn((32768, 16), dtype=torch.float32).T
+        out = torch.empty((8192, 32768), dtype=torch.float32)
+        a = torch.randn((8192, 16), dtype=torch.float32)
+        assert "tma_atom_a" in _pair_code((b.T, a.T, out.T), 16)
+        a = torch.randn((8192, 17), dtype=torch.float32)[:, :16]
+        for args in ((b.T, a.T, out.T), (a, b, out)):
+            with pytest.raises(BackendUnsupported, match="generic SIMT lowering"):
+                _pair_code(args, 16)
+
+    # So the rules that transpose onto the pairs keep such products as
+    # written (an a_row of 1: the overlapping view's strides (1, 1)); rows on
+    # TMA's alignment that straddle L2 sectors (272 bytes apart) still
+    # transpose.
+    def b_rows(rule: Callable[..., bool], m: int, n: int, k: int, a_row: int) -> bool:
+        return rule(
+            m,
+            n,
+            k,
+            torch.bfloat16,
+            a_strides=(a_row, 1),
+            b_strides=(n, 1),
+            num_sms=152,
+        )
+
+    for a_row, expected in ((128, True), (136, True), (129, False), (1, False)):
+        assert (
+            b_rows(tcgen05_transposes_misaligned_b_rows, 512, 20008, 128, a_row)
+            is expected
+        )
+    # N-edge b rows: 512x20032x384 (six K blocks, 79 N tiles, 79 clusters),
+    # 784-byte rows still transposing.
+    for a_row, expected in ((384, True), (392, True), (385, False), (1, False)):
+        assert (
+            b_rows(tcgen05_transposes_n_edge_b_rows, 512, 20032, 384, a_row) is expected
+        )
+
+    # The K-major-b rules ask b's columns on that alignment too (and one unit
+    # stride per operand: a row or column of 1 is strides (1, 1)).
+    def k_major_b(
+        rule: Callable[..., bool],
+        m: int,
+        n: int,
+        k: int,
+        dtype: torch.dtype,
+        a_row: int,
+        b_column: int,
+    ) -> bool:
+        return rule(
+            m,
+            n,
+            k,
+            dtype,
+            a_strides=(a_row, 1),
+            b_strides=(1, b_column),
+            num_sms=152,
+        )
+
+    # Epilogue-bound: bf16 2048x131200x64 (one K block, 513 N tiles).
+    epilogue_bound = tcgen05_transposes_epilogue_bound_product
+    for a_row, b_column, expected in (
+        (64, 64, True),
+        (72, 72, True),
+        (65, 64, False),
+        (64, 65, False),
+        (1, 64, False),
+        (64, 1, False),
+    ):
+        assert (
+            k_major_b(epilogue_bound, 2048, 131200, 64, torch.bfloat16, a_row, b_column)
+            is expected
+        )
+    # Wide tf32: fp32 8192x32768x16 (32 x 128 pair tiles); 80-byte rows are
+    # on the alignment.
+    wide_tf32 = tcgen05_transposes_wide_tf32_product
+    for a_row, b_column, expected in (
+        (16, 16, True),
+        (20, 20, True),
+        (17, 16, False),
+        (16, 17, False),
+        (1, 16, False),
+        (16, 1, False),
+    ):
+        assert (
+            k_major_b(wide_tf32, 8192, 32768, 16, torch.float32, a_row, b_column)
+            is expected
+        )
 
 
 def test_a_small_n_runs_one_zero_filled_tcgen05_tile() -> None:
