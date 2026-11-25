@@ -7,7 +7,9 @@ op to Inductor's own), as it does wherever it declines."""
 from __future__ import annotations
 
 from .reduction_order import register_reduction_order_lowerings
+from .transposed_pads import register_transposed_pads_lowering
 
 
 def register_lowerings() -> None:
     register_reduction_order_lowerings()
+    register_transposed_pads_lowering()

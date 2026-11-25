@@ -71,6 +71,10 @@ needs_native_matmul = unittest.skipUnless(
 )
 
 
+# The transposed copy of a pad: one load, one store, nothing computed.
+TRANSPOSED_COPY = re.compile(r"tmp0 = in0\[tile_y, tile_x\][^\n]*\n\s+out0\[")
+
+
 def glu_backward_cat(a0, a1, a2, dtype=torch.bfloat16):
     """A GLU backward's output as better-benchmark's sum_9680481803dd stores
     it, the cat of two halves of a0's channels computed from three inputs,
@@ -173,6 +177,7 @@ class InductorBackendTestCase(TestCase):
             expected = fn(*(a.float() if a.dtype in low else a for a in args))
             expected = pytree.tree_map(lambda e, r: e.to(r.dtype), expected, result)
         self.assertEqual(result, expected, atol=tol, rtol=tol)
+        self.result = result
         self.code = "\n".join(codes)
         self.assertNotIn("async_compile.triton(", self.code)
         sources = SOURCE_RE.findall(self.code)
@@ -192,6 +197,42 @@ class InductorBackendTestCase(TestCase):
         torch._dynamo.reset()
         torch.manual_seed(0)
         return result
+
+    def check_transposed_pads(self, case, backend):
+        """A pad and its transpose of a pointwise value Inductor stores for
+        them (helion.inductor.lowering.transposed_pads): the CE backward is
+        computed into the pad, the transpose copies it, and a
+        third kernel writes the fill; a value the graph returns too stays
+        stored, and one kernel pads it twice."""
+        dtype = torch.float32 if case == "fp32_view" else torch.bfloat16
+        shape = (2, 6) if case == "fp32_view" else (12,)
+        v = 37
+        logits = torch.randn(*shape, 40, device=DEVICE, dtype=dtype)[..., :v]
+        grad = torch.randn(*shape, v, device=DEVICE, dtype=dtype)
+        a, b = (torch.rand(*shape, 1, device=DEVICE) for _ in range(2))
+        label = torch.randint(-1, v, shape, device=DEVICE)
+        scale = torch.rand((), device=DEVICE)
+
+        def fn(logits, grad, a, b, label, scale):
+            iota = torch.arange(v, device=label.device)
+            hot = torch.where(iota == label[..., None], -1.0, 0.0)
+            hot = hot * torch.where(label != -1, scale, 0.0)[..., None]
+            s = hot.sum(-1, keepdim=True)
+            g = grad.float() + (hot - torch.exp(logits.float() - a - b) * s)
+            g = g.to(dtype).view(-1, v)
+            padded = (F.pad(g.t(), (0, 0, 0, 3)), F.pad(g, (0, 3)))
+            return (*padded, g) if case == "returned" else padded
+
+        args = (logits, grad, a, b, label, scale)
+        sources = self.compile(fn, *args, tol=2e-2, backend=backend)
+        reduction = next(source for source in sources if "torch.sum(" in source)
+        self.assertEqual(len(re.findall(r"out\d+\[[^\]]*\] = ", reduction)), 1)
+        if case == "returned":
+            self.assertEqual(len(sources), 2)
+        else:
+            self.assertEqual(len(sources), 3)
+            # The transpose: one load, one store, nothing computed.
+            self.assertTrue(any(TRANSPOSED_COPY.search(source) for source in sources))
 
     def assertUnsupported(self, names, fn, *args, backend="triton"):
         """Check that compiling `fn` fails with Unsupported: `names`."""
@@ -917,6 +958,11 @@ class TestInductorCute(InductorBackendTestCase):
         x = torch.randn(4, 512, 640, device=DEVICE)
         sources = self.compile(centered_square_sum, x, tol=1e-3, backend="cute")
         self.assertFalse(any("//" in source for source in sources))
+
+    def test_transposed_pads(self):
+        # The CE backward of a padded vocabulary computed into its pad, and
+        # the pad's transposed copy, compiled and run by the CuTe backend.
+        self.check_transposed_pads("bf16", "cute")
 
     def test_unsupported_op(self):
         # Helion's CuTe backend compiles no lgamma.
@@ -2109,6 +2155,119 @@ def kernel(in0: torch.Tensor, out0: torch.Tensor, out1: torch.Tensor) -> None:
         self.assertEqual(registered, stock)
         self.assertEqual(len(stock), 2)
         self.assertIn("cat", stock[0])
+
+    @parametrize(
+        "case",
+        # The CE backward of a padded vocabulary, whose bf16 gradient Inductor
+        # stores for its pad and transposed pad (it reads more buffers than
+        # realize_reads_threshold): a vocabulary of 37 padded to 40, from
+        # logits sliced out of an rdim of 40; the fp32 gradient computed as
+        # [2, 6, 37] and viewed as [12, 37] before its pads; and a gradient
+        # the graph returns too, which stays stored.
+        ["bf16", "fp32_view", "returned"],
+    )
+    def test_transposed_pads(self, case):
+        self.check_transposed_pads(case, "triton")
+
+    def test_transposed_pads_decline_and_copy(self):
+        # A pad and its transpose of a value six inputs make, which Inductor
+        # stores for them (helion.inductor.lowering.transposed_pads):
+        x = [torch.randn(16, 37, device=DEVICE) for _ in range(6)]
+
+        def value(x):
+            return x[0] + x[1] * x[2] - x[3] / (1 + x[4].abs()) + x[5]
+
+        # a left and right pad comes back from Inductor's lowering
+        # unrealized: it is stored, and the transpose copies it (a copy
+        # Inductor fuses into the pad's kernel), so each input is loaded
+        # once, under the pad's mask, by the kernel that computes the pad,
+        # where a declined lowering loads them unmasked to store the value;
+        def left(*x):
+            z = value(x)
+            return F.pad(z.t(), (0, 0, 1, 2)), F.pad(z, (1, 2))
+
+        sources = self.compile(left, *x, tol=1e-5)
+        self.assertEqual(sum(source.count("hl.load(in0,") for source in sources), 1)
+        self.assertTrue(
+            any(re.search(r"hl\.load\(in5, [^\n]*extra_mask=", s) for s in sources)
+        )
+
+        # the plain pad first in the graph, which Inductor then lowers
+        # first, a right pad (a cat whose part the value is computed into):
+        # the transpose copies the whole stored pad, fill included, where a
+        # declined lowering copies the stored value into each pad's part;
+        def plain_first(*x):
+            z = value(x)
+            pad = F.pad(z, (0, 3))
+            return F.pad(z.t(), (0, 0, 0, 3)), pad
+
+        sources = self.compile(plain_first, *x, tol=1e-5)
+        self.assertTrue(
+            any("hl.tile([40, 16])" in s and TRANSPOSED_COPY.search(s) for s in sources)
+        )
+
+        # fills of either sign: the pads keep their own;
+        def signed(*x):
+            z = value(x)
+            return F.pad(z.t(), (0, 0, 0, 3), value=-0.0), F.pad(z, (0, 3), value=0.0)
+
+        self.compile(signed, *x, tol=1e-5)
+        for r, e in zip(self.result, signed(*x), strict=True):
+            self.assertTrue(torch.equal(torch.signbit(r), torch.signbit(e)))
+
+        # a value Inductor did not store (two reads): the group declines at
+        # whichever pad Inductor lowers first and keeps that answer, so no
+        # pad of it is copied (Inductor computes the cheap value in both);
+        def unstored(*x):
+            z = x[0] + x[1]
+            pad = F.pad(z, (0, 3))
+            return F.pad(z.t(), (0, 0, 0, 3)), pad
+
+        sources = self.compile(unstored, *x, tol=1e-5)
+        self.assertFalse(any(TRANSPOSED_COPY.search(source) for source in sources))
+
+        # pads that only matmuls read, which Inductor would pad in place
+        # (config.inplace_padding): the pad is lowered as a cat, so its fill
+        # is no write into the stored value, and the value is computed once;
+        def matmul_pads(*args):
+            *x, w, h = args
+            z = value(x)
+            return F.pad(z, (0, 3, 0, 0)) @ w, F.pad(z.t(), (0, 0, 0, 3)) @ h
+
+        # the pads Inductor's pad_mm adds for matmuls over a K of 2053.
+        y = [torch.randn(16, 2053, device=DEVICE) for _ in range(6)]
+        w, h = torch.randn(2056, 32, device=DEVICE), torch.randn(16, 32, device=DEVICE)
+        counters.clear()
+        sources = self.compile(matmul_pads, *y, w, h, tol=1e-2)
+        self.assertEqual(counters["inductor"]["inplace_padding"], 0)
+        self.assertEqual(sum("torch.abs" in source for source in sources), 1)
+
+        # a value written in place after a reader (an index_put_ that
+        # reinplacing makes) keeps its write: the pads read the stored value
+        # (an index made in the graph: Helion kernels check no bounds);
+        replacement = torch.full((37,), 100.0, device=DEVICE)
+
+        def written(*args):
+            *x, replacement = args
+            z = value(x)
+            earlier = z * 2
+            index = torch.ones(1, dtype=torch.long, device=replacement.device)
+            z = z.index_put((index,), replacement)
+            return earlier, F.pad(z.t(), (0, 0, 0, 3)), F.pad(z, (0, 3))
+
+        self.compile(written, *x, replacement, tol=1e-5)
+
+        # and a functional scatter (z is read after it, so not in place),
+        # whose lowering stores a copy of its input and writes into it,
+        # keeps its writes too.
+        def scattered(*x):
+            z = value(x)
+            index = torch.zeros(16, 1, dtype=torch.long, device=z.device)
+            scattered = z.scatter(1, index, 100.0)
+            later = z * 2
+            return later, F.pad(scattered.t(), (0, 0, 0, 3)), F.pad(scattered, (0, 3))
+
+        self.compile(scattered, *x, tol=1e-5)
 
     def test_outer_sum(self):
         # A sum over y with an x too large to split, which Inductor hints
