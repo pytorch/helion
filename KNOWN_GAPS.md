@@ -389,3 +389,132 @@ these labelled lines.
   outside the lane loop: a change to how lane loops are built, with the
   CuTe GPU lanes behind it.
 - Pinned by: none.
+
+## rolled-graph-subscripts-unresolved
+
+- Area: `DeviceIRAnalysis.memory_op_facts`
+  (`helion/_compiler/device_ir_analysis.py`), the per-subscript fields
+  (`subscript_affine_block_ids`, `subscript_block_ids`,
+  `subscript_index_scales`) of the ops in the rolled alternative graph of a
+  full slice's loop. The readers of those fields reach it: the coalescing
+  axes of `device_ir.py` (the loop over `memory_op_facts` that picks
+  `coalescing_sensitive` block ids), the CuTe heuristics and store policies
+  (`helion/_compiler/cute/`).
+- What is wrong: in the rolled graph a subscript computed outside the loop
+  is a placeholder, and the fields read the placeholder instead of what the
+  enclosing graph passes in. For
+
+  ```
+  for tile in hl.tile(out.size(0)):
+      out[tile, :] = x[2 * tile.index, :]   # x: [8192, 96] bf16
+  ```
+
+  the load lists `subscript_affine_block_ids == (0, None)` in graph 0 and
+  `(None, None)` in its rolled copy (graph 1), so the copy looks like a
+  full-extent op of the whole tensor (786432 elements against a 96-element
+  row). `pointwise_fact` takes `max_op_slab_numel` from the ops outside
+  rolled graphs, so the seed's starvation cap does not read the copy.
+  Reproduced, bind only, on upstream main at 111948cb.
+- Since: on `main` when the entry was added.
+- Why deferred: resolving the placeholder (as `_placeholder_resolver` does
+  for `gather_numel` and `row_gather`) changes these fields for every kernel
+  with a full slice whose subscripts are computed outside the slice loop,
+  and with them the coalescing axes and the CuTe seeds and store policies;
+  judging it takes a census and timings of its own on every backend.
+- Pinned by: `test/test_autotuner_heuristics.py::TestPointwiseGatheredSlab::test_rolled_copy_of_an_op_reads_its_index_in_the_enclosing_graph`.
+
+## pointwise-seed-grid-axes-uncounted
+
+- Area: the Triton pointwise seed on sm100
+  (`TritonPointwiseSeedHeuristic._warps_for_sm100`,
+  `helion/_compiler/autotuner_heuristics/triton.py`), its residency term,
+  for every kernel with an `hl.grid` axis or a masked last tile, row
+  lookups (`PointwiseElementwiseFact.row_gather`) included.
+- What is wrong: the residency term counts programs as
+  `total_numel // tile_numel`. `total_numel` multiplies the tiled block dims
+  only, so an `hl.grid` axis is left out and a nested `hl.tile` under it, a
+  loop inside the program, is counted as programs; the floor also drops a
+  masked last tile. `max_op_slab_numel` charges a grid axis as untiled
+  fan-out, which lifts the starvation cap. Bind only, B200 model:
+
+  ```
+  for i in hl.grid(ids.size(0)):            # 4096 ids
+      for tile_d in hl.tile(table.size(1)):  # table: [32768, 1024] bf16
+          out[i, tile_d] = table[ids[i], tile_d]
+  ```
+
+  launches 4096 programs; the term counts 1024 // 4 = 256 and the seed is
+  `([4], 16)` (upstream main at 111948cb: `([1], None)`, its tile smaller
+  because main charges the table's rows). `table[ids[tile_t], tile_d]` with
+  6144 ids of a `[12288, 513]` table launches 1536 programs and counts 769:
+  `([4, 1024], 8)` (main: `([2, 1024], None)`). The same count on main
+  gives `([4], 16)` for `x[i, tile_d] * 2` under `hl.grid` over a
+  `[4096, 256]` x.
+- Since: on `main` when the entry was added. The row lookups reach it since
+  the sm100 warps rule caps only their lanes term.
+- Why deferred: reading the launched grid
+  (`TritonH100MatmulHeuristic._launch_grid`, which itself reads a symbolic
+  grid extent at the generic size hint) changes the warps of every sm100
+  pointwise kernel with an `hl.grid` axis or a masked tile, the cells the
+  sm100 seed was tuned on among them; judging it takes timings of its own.
+- Pinned by: `test/test_autotuner_heuristics.py::TestPointwiseGatheredSlab::test_rows_behind_a_loaded_index_get_no_lane_warps_on_b200`
+  (`"grid index on the last dim"`, 768 programs counted for 4 launched).
+
+## pointwise-seed-tunable-region-lanes
+
+- Area: the Triton pointwise seed on sm100
+  (`TritonPointwiseSeedHeuristic._warps_for_sm100`) for a gather whose
+  region is sized by a registered tunable.
+- What is wrong: `gather_numel` is `None` for such a region, so
+  `pointwise_fact` charges the op its untiled extents, the whole table, as
+  `max_op_slab_numel`, and the starvation cap does not bound the warps
+  (the grid is 32 programs, so a row lookup gets the residency warps). For
+
+  ```
+  width = hl.register_tunable("width", PowerOfTwoFragment(1, 64, 8))
+  for tile_t in hl.tile(ids.size(0)):        # 64 ids
+      cols = hl.arange(width)
+      out[tile_t.index[:, None], cols[None, :]] = table[
+          ids[tile_t][:, None], cols[None, :]  # table: [8192, 64] bf16
+      ]
+  ```
+
+  `max_op_slab_numel` is 524288 and the seed is `([2], 16)`: 16 warps for a
+  program of 16 elements at the default width (128 at the widest). Upstream
+  main at 111948cb gives the same seed. Bind only.
+- Since: on `main` when the entry was added.
+- Why deferred: counting the region at the tunable's default
+  (`CompileEnvironment.tunable_default_hint` in `_numel_at_unit_tiles`) is
+  not enough on its own: it also shrinks the slab, and the register-capped
+  `BLOCK_FLOOR` then puts all 64 tokens in one `[64]` tile, one program for
+  148 SMs (bind only). The fix waits on that floor for the row axis of
+  whole-row tiles, a change of the pointwise seed's tiles on every target
+  that needs timings of its own.
+- Pinned by: `test/test_autotuner_heuristics.py::TestPointwiseGatheredSlab::test_rows_behind_a_loaded_index_get_no_lane_warps_on_b200`
+  (`"rows of a tunable width"`).
+
+## pointwise-slab-counts-rolled-copies
+
+- Area: `DeviceIRAnalysis.pointwise_fact`
+  (`helion/_compiler/device_ir_analysis.py`), `slab_numel` and `sfu_ops`,
+  read by the Triton pointwise seed's byte and register budgets and its
+  warps on every target.
+- What is wrong: `memory_op_facts` lists the ops of a full slice's rolled
+  alternative graph next to the originals (one indexing slot each, which is
+  right for the config), and `slab_numel` sums both, though a config runs
+  one of the two. For `out[tile, :] = x[2 * tile.index, :]` (x
+  `[8192, 96]` bf16) the load and store add 288 and their copies 288 more:
+  `slab_numel` is 576, also on upstream main at 111948cb. Every pointwise
+  kernel with a full slice is charged about twice its slab (rope among
+  them). `sfu_ops` walks the rolled graphs too: `torch.cos(torch.sin(
+  table[ids[tile_t], :]))` counts 4 where a config runs 2, which crosses
+  `SFU_W8` (3); 4096 ids of a `[4096, 512]` table get `([8], 8)` on B200,
+  the same on upstream main.
+- Since: on `main` when the entry was added.
+- Why deferred: dropping the copies from the sum halves the slab of every
+  pointwise kernel with a full slice, and with it their tiles on sm90,
+  sm100 and sm120 (`[32]` to `[64]` for the kernel above on B200), and
+  dropping them from `sfu_ops` moves the warps of every such kernel with a
+  transcendental; judging it takes timings of its own.
+- Pinned by: `test/test_autotuner_heuristics.py::TestPointwiseGatheredSlab::test_rolled_copy_of_an_op_reads_its_index_in_the_enclosing_graph`
+  (`slab_numel == 576`).

@@ -4239,9 +4239,24 @@ class TritonPointwiseSeedHeuristic(AutotunerHeuristic):
         that is ``occ_cap`` in ``get_seed_config``, and shrinking the tile instead
         measured worse on every cell tried. The SFU ramp is kept as a floor, since
         transcendental latency is independent of byte traffic.
+
+        The lanes term does not apply to a kernel that loads rows behind a loaded
+        index (``fact.row_gather``: ``table[ids[tile], tile_d]``, however the row is
+        written): the row's address waits on the ``ids`` load and every warp of the
+        program waits with it, so more warps than the default only take resident
+        slots from other programs. It is capped at the default for such a kernel.
+        Measured on B200 against sequential ids (the same), a copy (indifferent)
+        and other ways to write the row (the same); a loaded index on the
+        contiguous dim fetches element by element and keeps its warps. The
+        residency term still applies: on a grid too small to fill the device there
+        are no other programs to take slots from, and the extra warps hide the
+        wait (whole-row lookups over a few dozen tokens are fastest at 16).
         """
         per_thread = cls._elems_per_thread(fact.gather_stride)
         work = cls._pow2_floor(max(1, tile_numel // (32 * per_thread)))
+        # Tile lanes do not pay for a row lookup's warps (see the docstring).
+        if fact.row_gather:
+            work = min(work, cls.DEFAULT_WARPS)
         programs = max(1, fact.total_numel // max(1, tile_numel))
         wave_slots = (
             warp_slots * cls.WAVE_TARGET_NUMERATOR // cls.WAVE_TARGET_DENOMINATOR

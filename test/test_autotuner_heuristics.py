@@ -336,6 +336,7 @@ from helion._testing.cute_codegen import forbid_native_compile
 from helion._testing.cute_codegen import mock_cuda_unavailable
 from helion._testing.cute_flash import memoized_flash_fragments
 from helion.autotuner import IntegerFragment
+from helion.autotuner import PowerOfTwoFragment
 from helion.autotuner.base_cache import BoundKernelInMemoryCacheKey
 from helion.autotuner.base_cache import LooseAutotuneCacheKey
 from helion.autotuner.base_cache import StrictAutotuneCacheKey
@@ -5456,6 +5457,1481 @@ class TestPointwiseComputeItemsize(TestCase):
         fact = self._fact(fp64_intermediate, (x, y))
         self.assertEqual(fact.storage_itemsize, 2)
         self.assertEqual(fact.compute_itemsize, 8)
+
+
+# Kernels of TestPointwiseGatheredSlab. Each indexes a tensor through an index
+# tensor: a gather, or in ``_scatter_rows`` a scatter. Bound, never compiled.
+@helion.kernel(backend="triton")
+def _lookup(ids: torch.Tensor, table: torch.Tensor) -> torch.Tensor:
+    out = table.new_empty([ids.size(0), table.size(1)])
+    for tile_t, tile_d in hl.tile([ids.size(0), table.size(1)]):
+        out[tile_t, tile_d] = table[ids[tile_t], tile_d]
+    return out
+
+
+@helion.kernel(backend="triton")
+def _lookup_scaled(ids: torch.Tensor, table: torch.Tensor) -> torch.Tensor:
+    out = table.new_empty([ids.size(0), table.size(1)])
+    scale = math.sqrt(table.size(1))
+    for tile_t, tile_d in hl.tile([ids.size(0), table.size(1)]):
+        out[tile_t, tile_d] = table[ids[tile_t], tile_d] * scale
+    return out
+
+
+@helion.kernel(backend="triton")
+def _lookup_2d_ids(ids: torch.Tensor, table: torch.Tensor) -> torch.Tensor:
+    batch, seq = ids.size()
+    out = table.new_empty([batch, seq, table.size(1)])
+    for tile_b, tile_s, tile_d in hl.tile([batch, seq, table.size(1)]):
+        out[tile_b, tile_s, tile_d] = table[ids[tile_b, tile_s], tile_d]
+    return out
+
+
+@helion.kernel(backend="triton")
+def _lookup_plus_pos(
+    ids: torch.Tensor, table: torch.Tensor, pos: torch.Tensor
+) -> torch.Tensor:
+    out = table.new_empty([ids.size(0), table.size(1)])
+    for tile_t, tile_d in hl.tile([ids.size(0), table.size(1)]):
+        out[tile_t, tile_d] = table[ids[tile_t], tile_d] + pos[tile_t, tile_d]
+    return out
+
+
+@helion.kernel(backend="triton")
+def _lookup_to_fp32(ids: torch.Tensor, table: torch.Tensor) -> torch.Tensor:
+    out = torch.empty(
+        [ids.size(0), table.size(1)], dtype=torch.float32, device=table.device
+    )
+    for tile_t, tile_d in hl.tile([ids.size(0), table.size(1)]):
+        out[tile_t, tile_d] = table[ids[tile_t], tile_d].to(torch.float32)
+    return out
+
+
+@helion.kernel(backend="triton")
+def _lookup_feature_first(ids: torch.Tensor, table: torch.Tensor) -> torch.Tensor:
+    out = table.new_empty([ids.size(0), table.size(1)])
+    for tile_d, tile_t in hl.tile([table.size(1), ids.size(0)]):
+        out[tile_t, tile_d] = table[ids[tile_t], tile_d]
+    return out
+
+
+@helion.kernel(backend="triton")
+def _lookup_two_tables(
+    ids: torch.Tensor, table: torch.Tensor, other: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    out = table.new_empty([ids.size(0), table.size(1)])
+    out_other = other.new_empty([ids.size(0), other.size(1)])
+    for tile_t, tile_d in hl.tile([ids.size(0), table.size(1)]):
+        out[tile_t, tile_d] = table[ids[tile_t], tile_d]
+        out_other[tile_t, tile_d] = other[ids[tile_t], tile_d]
+    return out, out_other
+
+
+@helion.kernel(backend="triton")
+def _lookup_padded(ids: torch.Tensor, table: torch.Tensor) -> torch.Tensor:
+    out = table.new_empty([ids.size(0), table.size(1)])
+    for tile_t, tile_d in hl.tile([ids.size(0), table.size(1)]):
+        token = ids[tile_t]
+        row = table[token, tile_d]
+        out[tile_t, tile_d] = torch.where(
+            (token == 0)[:, None], torch.zeros_like(row), row
+        )
+    return out
+
+
+@helion.kernel(backend="triton")
+def _lookup_computed_ids(ids: torch.Tensor, table: torch.Tensor) -> torch.Tensor:
+    out = table.new_empty([ids.size(0), table.size(1)])
+    for tile_t, tile_d in hl.tile([ids.size(0), table.size(1)]):
+        out[tile_t, tile_d] = table[ids[tile_t] // 2 + 1, tile_d]
+    return out
+
+
+@helion.kernel(backend="triton")
+def _scatter_rows(
+    ids: torch.Tensor, src: torch.Tensor, out: torch.Tensor
+) -> torch.Tensor:
+    for tile_t, tile_d in hl.tile([ids.size(0), src.size(1)]):
+        out[ids[tile_t], tile_d] = src[tile_t, tile_d]
+    return out
+
+
+@helion.kernel(backend="triton")
+def _lookup_flattened_ids(ids: torch.Tensor, table: torch.Tensor) -> torch.Tensor:
+    batch, seq = ids.size()
+    out = table.new_empty([batch * seq, table.size(1)])
+    for tile_b, tile_s, tile_d in hl.tile([batch, seq, table.size(1)]):
+        flat = ids[tile_b, tile_s].reshape(-1)
+        rows = (tile_b.index[:, None] * seq + tile_s.index[None, :]).reshape(-1)
+        out[rows, tile_d] = table[flat, tile_d]
+    return out
+
+
+@helion.kernel(backend="triton")
+def _lookup_two_ids_per_token(
+    ids: torch.Tensor, more: torch.Tensor, table: torch.Tensor
+) -> torch.Tensor:
+    tokens = ids.size(0)
+    out = table.new_empty([2 * tokens, table.size(1)])
+    for tile_t, tile_d in hl.tile([tokens, table.size(1)]):
+        both = torch.stack([ids[tile_t], more[tile_t]], dim=1).reshape(-1)
+        rows = torch.stack([tile_t.index, tile_t.index + tokens], dim=1).reshape(-1)
+        out[rows, tile_d] = table[both, tile_d]
+    return out
+
+
+@helion.kernel(backend="triton")
+def _lookup_new_axis(ids: torch.Tensor, table: torch.Tensor) -> torch.Tensor:
+    out = table.new_empty([ids.size(0), table.size(1)])
+    for tile_t, tile_d in hl.tile([ids.size(0), table.size(1)]):
+        out[tile_t, tile_d] = table[None, ids[tile_t], tile_d].squeeze(0)
+    return out
+
+
+@helion.kernel(backend="triton")
+def _lookup_row_col_pairs(
+    rows: torch.Tensor, cols: torch.Tensor, x: torch.Tensor
+) -> torch.Tensor:
+    tokens, k = rows.size()
+    out = x.new_empty([tokens, k])
+    for tile_t in hl.tile(tokens):
+        out[tile_t, :] = x[rows[tile_t, :], cols[tile_t, :]]
+    return out
+
+
+@helion.kernel(backend="triton")
+def _lookup_cartesian(
+    rows: torch.Tensor, cols: torch.Tensor, x: torch.Tensor
+) -> torch.Tensor:
+    out = x.new_empty([x.size(0), rows.size(0), cols.size(0)])
+    for tile_t in hl.tile(x.size(0)):
+        out[tile_t, :, :] = x[tile_t, rows[:], cols[:]]
+    return out
+
+
+@helion.kernel(backend="triton")
+def _lookup_bounded_slice(ids: torch.Tensor, table: torch.Tensor) -> torch.Tensor:
+    out = table.new_empty([ids.size(0), 1, table.size(2)])
+    for tile_t, tile_d in hl.tile([ids.size(0), table.size(2)]):
+        out[tile_t, :, tile_d] = table[ids[tile_t], :1, tile_d]
+    return out
+
+
+@helion.kernel(backend="triton")
+def _lookup_scalar_position(ids: torch.Tensor, table: torch.Tensor) -> torch.Tensor:
+    out = table.new_empty([table.size(1), ids.size(0), table.size(2)])
+    for k in hl.grid(table.size(1)):
+        for tile_t, tile_d in hl.tile([ids.size(0), table.size(2)]):
+            out[k, tile_t, tile_d] = table[ids[tile_t], k, tile_d]
+    return out
+
+
+@helion.kernel(backend="triton")
+def _lookup_fixed_feature_block(ids: torch.Tensor, table: torch.Tensor) -> torch.Tensor:
+    out = table.new_empty([ids.size(0), table.size(1)])
+    for tile_d in hl.tile(table.size(1), block_size=4):
+        for tile_t in hl.tile(ids.size(0)):
+            out[tile_t, tile_d] = table[ids[tile_t], tile_d]
+    return out
+
+
+@helion.kernel(backend="triton", static_shapes=False)
+def _middle_column(x: torch.Tensor) -> torch.Tensor:
+    out = x.new_empty([x.size(0)])
+    for tile_m in hl.tile(x.size(0)):
+        out[tile_m] = x[tile_m, x.size(1) // 2]
+    return out
+
+
+@helion.kernel(backend="triton", static_shapes=False)
+def _lookup_dynamic(ids: torch.Tensor, table: torch.Tensor) -> torch.Tensor:
+    out = table.new_empty([ids.size(0), table.size(1)])
+    for tile_t, tile_d in hl.tile([ids.size(0), table.size(1)]):
+        out[tile_t, tile_d] = table[ids[tile_t], tile_d]
+    return out
+
+
+@helion.kernel(backend="triton", static_shapes=False)
+def _lookup_whole_rows_dynamic(ids: torch.Tensor, table: torch.Tensor) -> torch.Tensor:
+    out = table.new_empty([ids.size(0), table.size(1)])
+    for tile_t in hl.tile(ids.size(0)):
+        out[tile_t, :] = table[ids[tile_t], :]
+    return out
+
+
+@helion.kernel(backend="triton")
+def _lookup_tunable_window(ids: torch.Tensor, table: torch.Tensor) -> torch.Tensor:
+    width = hl.register_tunable("width", PowerOfTwoFragment(1, 64, 8))
+    out = torch.zeros_like(table[: ids.size(0)])
+    for tile_t in hl.tile(ids.size(0)):
+        cols = hl.arange(width)
+        out[tile_t.index[:, None], cols[None, :]] = table[
+            ids[tile_t][:, None], cols[None, :]
+        ]
+    return out
+
+
+@helion.kernel(backend="triton")
+def _lookup_columns(x: torch.Tensor, cols: torch.Tensor) -> torch.Tensor:
+    out = x.new_empty([x.size(0), cols.size(0)])
+    for tile_m, tile_n in hl.tile([x.size(0), cols.size(0)]):
+        out[tile_m, tile_n] = x[tile_m, cols[tile_n]]
+    return out
+
+
+@helion.kernel(backend="triton")
+def _lookup_one_position(ids: torch.Tensor, table: torch.Tensor) -> torch.Tensor:
+    out = table.new_empty([ids.size(0), table.size(1)])
+    for tile_t, tile_d in hl.tile([ids.size(0), table.size(1)]):
+        out[tile_t, tile_d] = table[ids[tile_t], tile_d, 3]
+    return out
+
+
+@helion.kernel(backend="triton")
+def _lookup_every_other_column(ids: torch.Tensor, table: torch.Tensor) -> torch.Tensor:
+    out = table.new_empty([ids.size(0), table.size(1) // 2])
+    for tile_t, tile_d in hl.tile([ids.size(0), table.size(1) // 2]):
+        out[tile_t, tile_d] = table[ids[tile_t], 2 * tile_d.index]
+    return out
+
+
+@helion.kernel(backend="triton")
+def _lookup_stepped_rows(ids: torch.Tensor, table: torch.Tensor) -> torch.Tensor:
+    out = table.new_empty([ids.size(0), table.size(1) // 2])
+    for tile_t in hl.tile(ids.size(0)):
+        out[tile_t, :] = table[ids[tile_t], ::2]
+    return out
+
+
+@helion.kernel(backend="triton")
+def _lookup_shifted_columns(ids: torch.Tensor, table: torch.Tensor) -> torch.Tensor:
+    out = table.new_empty([ids.size(0), table.size(1) - 1])
+    for tile_t, tile_d in hl.tile([ids.size(0), table.size(1) - 1]):
+        out[tile_t, tile_d] = table[ids[tile_t], tile_d.index + 1]
+    return out
+
+
+@helion.kernel(backend="triton")
+def _lookup_trailing_new_axis(ids: torch.Tensor, table: torch.Tensor) -> torch.Tensor:
+    out = table.new_empty([ids.size(0), table.size(1)])
+    for tile_t, tile_d in hl.tile([ids.size(0), table.size(1)]):
+        out[tile_t, tile_d] = table[ids[tile_t], tile_d, None].squeeze(2)
+    return out
+
+
+@helion.kernel(backend="triton")
+def _lookup_row_prefixes(ids: torch.Tensor, table: torch.Tensor) -> torch.Tensor:
+    out = table.new_empty([ids.size(0), table.size(1) // 2])
+    for tile_t in hl.tile(ids.size(0)):
+        out[tile_t, :] = table[ids[tile_t], : table.size(1) // 2]
+    return out
+
+
+@helion.kernel(backend="triton")
+def _lookup_window(ids: torch.Tensor, table: torch.Tensor) -> torch.Tensor:
+    out = table.new_empty([ids.size(0), 512])
+    for tile_t in hl.tile(ids.size(0)):
+        cols = hl.arange(512)
+        out[tile_t.index[:, None], cols[None, :]] = table[
+            ids[tile_t][:, None], cols[None, :]
+        ]
+    return out
+
+
+@helion.kernel(backend="triton")
+def _lookup_remapped(
+    ids: torch.Tensor, remap: torch.Tensor, table: torch.Tensor
+) -> torch.Tensor:
+    out = table.new_empty([ids.size(0), table.size(1)])
+    for tile_t, tile_d in hl.tile([ids.size(0), table.size(1)]):
+        out[tile_t, tile_d] = table[remap[ids[tile_t]], tile_d]
+    return out
+
+
+@helion.kernel(backend="triton")
+def _lookup_scaled_rows(
+    ids: torch.Tensor, scales: torch.Tensor, table: torch.Tensor
+) -> torch.Tensor:
+    out = table.new_empty([ids.size(0), table.size(1)])
+    for tile_t, tile_d in hl.tile([ids.size(0), table.size(1)]):
+        rows = ids[tile_t]
+        out[tile_t, tile_d] = table[rows, tile_d] * scales[rows[:, None]]
+    return out
+
+
+@helion.kernel(backend="triton")
+def _lookup_rows_and_tunable_elements(
+    ids: torch.Tensor, table: torch.Tensor, x: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    width = hl.register_tunable("width", PowerOfTwoFragment(1, 64, 8))
+    out = table.new_empty([ids.size(0), table.size(1)])
+    picked = x.new_zeros([ids.size(0), ids.size(1)])
+    for tile_t in hl.tile(ids.size(0)):
+        out[tile_t, :] = table[ids[tile_t, 0], :]
+        picked[tile_t, :width] = x[ids[tile_t, :width]]
+    return out, picked
+
+
+@helion.kernel(backend="triton")
+def _lookup_weighted_columns(
+    ids: torch.Tensor, cols: torch.Tensor, w: torch.Tensor, table: torch.Tensor
+) -> torch.Tensor:
+    out = table.new_empty([ids.size(0), table.size(1)])
+    for tile_t, tile_d in hl.tile([ids.size(0), table.size(1)]):
+        out[tile_t, tile_d] = table[ids[tile_t], tile_d] * w[cols[tile_d]][None, :]
+    return out
+
+
+@helion.kernel(backend="triton")
+def _lookup_new_axis_weighted_columns(
+    ids: torch.Tensor, cols: torch.Tensor, w: torch.Tensor, table: torch.Tensor
+) -> torch.Tensor:
+    out = table.new_empty([ids.size(0), table.size(1)])
+    for tile_t, tile_d in hl.tile([ids.size(0), table.size(1)]):
+        rows = table[None, ids[tile_t], tile_d].squeeze(0)
+        out[tile_t, tile_d] = rows * w[cols[tile_d]][None, :]
+    return out
+
+
+@helion.kernel(backend="triton")
+def _lookup_by_index_weighted_columns(
+    ids: torch.Tensor, cols: torch.Tensor, w: torch.Tensor, table: torch.Tensor
+) -> torch.Tensor:
+    out = table.new_empty([ids.size(0), table.size(1)])
+    for tile_t, tile_d in hl.tile([ids.size(0), table.size(1)]):
+        rows = table[ids[tile_t][:, None], tile_d.index[None, :]]
+        out[tile_t, tile_d] = rows * w[cols[tile_d]][None, :]
+    return out
+
+
+@helion.kernel(backend="triton")
+def _lookup_weighted_columns_grid(
+    ids: torch.Tensor, cols: torch.Tensor, w: torch.Tensor, table: torch.Tensor
+) -> torch.Tensor:
+    out = table.new_empty([ids.size(0), table.size(1)])
+    for i in hl.grid(ids.size(0)):
+        for tile_d in hl.tile(table.size(1)):
+            out[i, tile_d] = table[ids[i], tile_d] * w[cols[tile_d]]
+    return out
+
+
+@helion.kernel(backend="triton")
+def _copy_by_tile_index(x: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tile_b, tile_s, tile_d in hl.tile(x.size()):
+        out[tile_b, tile_s, tile_d] = x[
+            tile_b.index[:, None], tile_s.index[None, :], tile_d
+        ]
+    return out
+
+
+@helion.kernel(backend="triton")
+def _lookup_weighted_by_tile_index(
+    ids: torch.Tensor, w: torch.Tensor, table: torch.Tensor
+) -> torch.Tensor:
+    out = table.new_empty([ids.size(0), table.size(1)])
+    for tile_t, tile_d in hl.tile([ids.size(0), table.size(1)]):
+        out[tile_t, tile_d] = table[ids[tile_t], tile_d] * w[tile_d.index[None, :]]
+    return out
+
+
+@helion.kernel(backend="triton")
+def _copy_every_other_row(x: torch.Tensor) -> torch.Tensor:
+    out = x.new_empty([x.size(0) // 2, x.size(1)])
+    for tile_m in hl.tile(x.size(0) // 2):
+        out[tile_m, :] = x[2 * tile_m.index, :]
+    return out
+
+
+@helion.kernel(backend="triton")
+def _lookup_plus_every_other_row(
+    ids: torch.Tensor, x: torch.Tensor, table: torch.Tensor
+) -> torch.Tensor:
+    out = table.new_empty([ids.size(0), table.size(1)])
+    for tile_t in hl.tile(ids.size(0)):
+        out[tile_t, :] = x[2 * tile_t.index, :] + table[ids[tile_t], :]
+    return out
+
+
+@helion.kernel(backend="triton")
+def _lookup_whole_rows_remapped(
+    ids: torch.Tensor, remap: torch.Tensor, table: torch.Tensor
+) -> torch.Tensor:
+    out = table.new_empty([ids.size(0), table.size(1)])
+    for tile_t in hl.tile(ids.size(0)):
+        out[tile_t, :] = table[remap[ids[tile_t]], :]
+    return out
+
+
+@helion.kernel(backend="triton")
+def _lookup_whole_rows_scaled(
+    ids: torch.Tensor, scales: torch.Tensor, table: torch.Tensor
+) -> torch.Tensor:
+    out = table.new_empty([ids.size(0), table.size(1)])
+    for tile_t in hl.tile(ids.size(0)):
+        rows = ids[tile_t]
+        out[tile_t, :] = table[rows, :] * scales[rows][:, None]
+    return out
+
+
+@helion.kernel(backend="triton")
+def _scale_rows_in_nested_loops(x: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tile_t in hl.tile(x.size(0)):
+        s = scale[tile_t]
+        for tile_d in hl.tile(x.size(1)):
+            out[tile_t, tile_d] = x[tile_t, tile_d] * s[:, None]
+    return out
+
+
+@helion.kernel(backend="triton")
+def _lookup_transcendental(ids: torch.Tensor, table: torch.Tensor) -> torch.Tensor:
+    out = table.new_empty([ids.size(0), table.size(1)])
+    for tile_t, tile_d in hl.tile([ids.size(0), table.size(1)]):
+        out[tile_t, tile_d] = torch.sigmoid(
+            torch.exp(torch.tanh(table[ids[tile_t], tile_d]))
+        )
+    return out
+
+
+@helion.kernel(backend="triton")
+def _copy_weighted_by_ids(
+    x: torch.Tensor, ids: torch.Tensor, w: torch.Tensor
+) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tile_m, tile_n in hl.tile(x.size()):
+        out[tile_m, tile_n] = x[tile_m, tile_n] * w[ids[tile_n]][None, :]
+    return out
+
+
+@helion.kernel(backend="triton")
+def _copy_scaled_by_position(
+    x: torch.Tensor, ids: torch.Tensor, t: torch.Tensor
+) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tile_m, tile_n in hl.tile(x.size()):
+        out[tile_m, tile_n] = x[tile_m, tile_n] * t[ids[tile_m], 3][:, None]
+    return out
+
+
+@helion.kernel(backend="triton")
+def _copy_row_band(x: torch.Tensor) -> torch.Tensor:
+    out = x.new_empty([8, x.size(1)])
+    for tile_d in hl.tile(x.size(1)):
+        rows = hl.arange(8)
+        out[:, tile_d] = x[rows, tile_d]
+    return out
+
+
+@helion.kernel(backend="triton")
+def _lookup_rows_without_a_slice(
+    ids: torch.Tensor, table: torch.Tensor
+) -> torch.Tensor:
+    out = table.new_empty([ids.size(0), table.size(1)])
+    for tile_t in hl.tile(ids.size(0)):
+        out[tile_t, :] = table[ids[tile_t]]
+    return out
+
+
+@helion.kernel(backend="triton")
+def _lookup_grid_position(ids: torch.Tensor, table: torch.Tensor) -> torch.Tensor:
+    out = table.new_empty([table.size(2), ids.size(0), table.size(1)])
+    for k in hl.grid(table.size(2)):
+        for tile_t, tile_d in hl.tile([ids.size(0), table.size(1)]):
+            out[k, tile_t, tile_d] = table[ids[tile_t], tile_d, k]
+    return out
+
+
+@helion.kernel(backend="triton")
+def _lookup_rows_and_columns(
+    rows: torch.Tensor, cols: torch.Tensor, x: torch.Tensor
+) -> torch.Tensor:
+    out = x.new_empty([rows.size(0), cols.size(0)])
+    for tile_m, tile_n in hl.tile([rows.size(0), cols.size(0)]):
+        out[tile_m, tile_n] = x[rows[tile_m], cols[tile_n]]
+    return out
+
+
+@helion.kernel(backend="triton")
+def _lookup_rows_plus_columns(
+    rows: torch.Tensor, cols: torch.Tensor, x: torch.Tensor
+) -> torch.Tensor:
+    out = x.new_empty([rows.size(0), cols.size(0)])
+    for tile_m, tile_n in hl.tile([rows.size(0), cols.size(0)]):
+        out[tile_m, tile_n] = x[rows[tile_m], tile_n] + x[tile_m, cols[tile_n]]
+    return out
+
+
+@helion.kernel(backend="triton")
+def _lookup_rows_and_paired_elements(
+    ids: torch.Tensor, table: torch.Tensor, x: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    out = table.new_empty([ids.size(0), table.size(1)])
+    picked = x.new_empty([ids.size(0)])
+    for tile_t in hl.tile(ids.size(0)):
+        out[tile_t, :] = table[ids[tile_t], :]
+        picked[tile_t] = x[ids[tile_t].reshape(-1, 2)].reshape(-1)
+    return out, picked
+
+
+@helion.kernel(backend="triton")
+def _copy_separated_indexers(
+    plane: torch.Tensor,
+    rows: torch.Tensor,
+    cols: torch.Tensor,
+    x: torch.Tensor,
+    out: torch.Tensor,
+) -> torch.Tensor:
+    for tile_t in hl.tile(rows.size(0)):
+        out[plane[0], rows[tile_t], 0, cols[:]] = x[plane[0], rows[tile_t], 0, cols[:]]
+    return out
+
+
+@helion.kernel(backend="triton")
+def _copy_same_tile_product(
+    rows: torch.Tensor, cols: torch.Tensor, x: torch.Tensor, out: torch.Tensor
+) -> torch.Tensor:
+    for tile_t in hl.tile(rows.size(0)):
+        out[rows[tile_t], cols[tile_t]] = x[rows[tile_t], cols[tile_t]]
+    return out
+
+
+@helion.kernel(backend="triton")
+def _lookup_halved_block(ids: torch.Tensor, table: torch.Tensor) -> torch.Tensor:
+    out = table.new_empty([ids.size(0), table.size(1)])
+    block = hl.register_block_size(2, 16)
+    for tile_t in hl.tile(ids.size(0), block_size=block):
+        pairs = ids[tile_t].reshape(-1, block // 2)
+        out[tile_t, :] = table[pairs].reshape(-1, table.size(1))
+    return out
+
+
+@helion.kernel(backend="triton")
+def _lookup_paired_ids(ids: torch.Tensor, table: torch.Tensor) -> torch.Tensor:
+    out = table.new_empty([ids.size(0), table.size(1)])
+    for tile_t in hl.tile(ids.size(0)):
+        pairs = ids[tile_t].reshape(-1, 2)
+        out[tile_t, :] = table[pairs].reshape(-1, table.size(1))
+    return out
+
+
+@helion.kernel(backend="triton")
+def _lookup_tunable_slice(ids: torch.Tensor, table: torch.Tensor) -> torch.Tensor:
+    width = hl.register_tunable("width", PowerOfTwoFragment(1, 64, 8))
+    out = table.new_zeros([ids.size(0), ids.size(1), table.size(1)])
+    for tile_t in hl.tile(ids.size(0)):
+        out[tile_t, :width, :] = table[ids[tile_t, :width]]
+    return out
+
+
+@helion.kernel(backend="triton")
+def _scatter_row_prefixes(
+    ids: torch.Tensor, src: torch.Tensor, out: torch.Tensor
+) -> torch.Tensor:
+    for tile_t in hl.tile(ids.size(0)):
+        out[ids[tile_t], :128] = src[tile_t, :128]
+    return out
+
+
+@helion.kernel(backend="triton")
+def _scatter_row_col_pairs(
+    rows: torch.Tensor, cols: torch.Tensor, vals: torch.Tensor, out: torch.Tensor
+) -> torch.Tensor:
+    for tile_t in hl.tile(rows.size(0)):
+        out[rows[tile_t, :], cols[tile_t, :]] = vals[tile_t, :]
+    return out
+
+
+@helion.kernel(backend="triton")
+def _scatter_new_axis(
+    ids: torch.Tensor, src: torch.Tensor, out: torch.Tensor
+) -> torch.Tensor:
+    for tile_t, tile_d in hl.tile([ids.size(0), src.size(1)]):
+        out[None, ids[tile_t], tile_d] = src[tile_t, tile_d][None, :, :]
+    return out
+
+
+@helion.kernel(backend="triton")
+def _scatter_fixed_feature_block(
+    ids: torch.Tensor, src: torch.Tensor, out: torch.Tensor
+) -> torch.Tensor:
+    for tile_d in hl.tile(src.size(1), block_size=4):
+        for tile_t in hl.tile(ids.size(0)):
+            out[ids[tile_t], tile_d] = src[tile_t, tile_d]
+    return out
+
+
+@helion.kernel(backend="triton")
+def _scatter_scalar_position(
+    ids: torch.Tensor, src: torch.Tensor, out: torch.Tensor
+) -> torch.Tensor:
+    for k in hl.grid(out.size(1)):
+        for tile_t, tile_d in hl.tile([ids.size(0), src.size(1)]):
+            out[ids[tile_t], k, tile_d] = src[tile_t, tile_d]
+    return out
+
+
+@helion.kernel(backend="triton")
+def _lookup_k_rows(ids: torch.Tensor, table: torch.Tensor) -> torch.Tensor:
+    tokens, k = ids.size()
+    out = table.new_empty([tokens, k, table.size(1)])
+    for tile_t, tile_d in hl.tile([tokens, table.size(1)]):
+        out[tile_t, :, tile_d] = table[ids[tile_t, :], tile_d]
+    return out
+
+
+@helion.kernel(backend="triton")
+def _lookup_whole_rows(ids: torch.Tensor, table: torch.Tensor) -> torch.Tensor:
+    out = table.new_empty([ids.size(0), table.size(1)])
+    for tile_t in hl.tile(ids.size(0)):
+        out[tile_t, :] = table[ids[tile_t], :]
+    return out
+
+
+@helion.kernel(backend="triton")
+def _lookup_fixed_token_block(ids: torch.Tensor, table: torch.Tensor) -> torch.Tensor:
+    out = table.new_empty([ids.size(0), table.size(1)])
+    for tile_t in hl.tile(ids.size(0), block_size=4):
+        for tile_d in hl.tile(table.size(1)):
+            out[tile_t, tile_d] = table[ids[tile_t], tile_d]
+    return out
+
+
+@helion.kernel(backend="triton")
+def _lookup_grid(ids: torch.Tensor, table: torch.Tensor) -> torch.Tensor:
+    out = table.new_empty([ids.size(0), table.size(1)])
+    for i in hl.grid(ids.size(0)):
+        for tile_d in hl.tile(table.size(1)):
+            out[i, tile_d] = table[ids[i], tile_d]
+    return out
+
+
+@helion.kernel(backend="triton")
+def _copy_registered_blocks(x: torch.Tensor) -> torch.Tensor:
+    n = x.size(0)
+    block = hl.register_block_size(4, 16)
+    out = torch.zeros_like(x)
+    for tile_id in hl.grid((n + block - 1) // block):
+        idx = tile_id * block + hl.arange(block)
+        mask = idx < n
+        hl.store(out, [idx], hl.load(x, [idx], extra_mask=mask), extra_mask=mask)
+    return out
+
+
+@helion.kernel(backend="triton")
+def _strided_columns(x: torch.Tensor) -> torch.Tensor:
+    rows, cols = x.size()
+    out = x.new_empty([rows, cols // 2])
+    for tile_m, tile_n in hl.tile([rows, cols // 2]):
+        out[tile_m, tile_n] = x[tile_m, 2 * tile_n.index]
+    return out
+
+
+@functools.cache
+def _gather_case_tensors(
+    tokens: int, features: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    ids = torch.zeros([tokens], device=DEVICE, dtype=torch.int32)
+    table = torch.empty([2 * tokens, features], device=DEVICE, dtype=torch.bfloat16)
+    return ids, table
+
+
+@functools.cache
+def _gather_case(name: str) -> BoundKernel:
+    """One bound kernel per case, shared by the tests of TestPointwiseGatheredSlab.
+
+    The arguments only carry shapes, dtypes and strides: 4096 tokens of an
+    8192x1024 table, with views of that table standing in for further operands.
+    """
+    tokens, features = 4096, 1024
+    ids, table = _gather_case_tensors(tokens, features)
+    cases: dict[str, tuple[helion.Kernel, tuple[torch.Tensor, ...]]] = {
+        "lookup": (_lookup, (ids, table)),
+        "scaled": (_lookup_scaled, (ids, table)),
+        "2-D ids": (_lookup_2d_ids, (ids.view(4, tokens // 4), table)),
+        "flattened 2-D ids": (_lookup_flattened_ids, (ids.view(64, 64), table)),
+        "new-axis subscript": (_lookup_new_axis, (ids, table)),
+        "plus positions": (_lookup_plus_pos, (ids, table, table[:tokens])),
+        "cast to fp32": (_lookup_to_fp32, (ids, table)),
+        "feature-first tiles": (_lookup_feature_first, (ids, table)),
+        "two tables": (_lookup_two_tables, (ids, table, table)),
+        "padding mask": (_lookup_padded, (ids, table)),
+        "computed ids": (_lookup_computed_ids, (ids, table)),
+        "scatter": (_scatter_rows, (ids, table[:tokens], table)),
+        "int16 ids": (_lookup, (ids.to(torch.int16), table)),
+        "strided ids": (_lookup, (ids.repeat(2)[::2], table)),
+        "column-sliced table": (_lookup, (ids, table[:, : features // 2])),
+        "row-strided table": (_lookup, (ids, table[::2])),
+    }
+    kernel, args = cases[name]
+    return kernel.bind(args)
+
+
+def _pointwise_seed(
+    bound: BoundKernel, hardware: HardwareInfo, num_sm: int
+) -> tuple[list[int], int | None]:
+    """The Triton pointwise seed's ``(block_sizes, num_warps)`` on ``hardware``."""
+    heuristic = TritonPointwiseSeedHeuristic
+    assert bound.host_function is not None
+    with (
+        bound.env,
+        patch("helion._hardware.get_hardware_info", return_value=hardware),
+        patch("helion.runtime.get_num_sm", return_value=num_sm),
+        patch.object(heuristic, "warp_slots_per_sm", return_value=64),
+    ):
+        seed = heuristic.get_seed_config(bound.env, bound.host_function.device_ir)
+    return list(seed.block_sizes), seed.config.get("num_warps")
+
+
+@onlyBackends(["triton"])
+@skipIfRefEager("Compiler pointwise facts are not collected in ref eager mode")
+class TestPointwiseGatheredSlab(TestCase):
+    """A gathered op is charged the elements one tiled element reaches through the
+    index tensor, not the gathered tensor's size.
+
+    ``table[ids[tile], tile_d]`` reads one row per id however many rows the table
+    has. Charging it ``rows / tokens`` elements per output element (2374 for 64
+    tokens of a 151936-row table) collapsed the seed tile to ``[1, 8]`` or less.
+    """
+
+    # (slab_numel, max_op_slab_numel) and the B200 seed per kernel (a num_warps of
+    # None is the default 4: only the scatter, which loads no rows through an
+    # index tensor, is given 8 for its 4096-element tile). One case per
+    # way a kernel can differ from the plain lookup without changing what a
+    # gathered row costs: the dataflow around the gather (scaled, cast, masked,
+    # computed ids), further operands (positions, a second table), the tile order
+    # and rank, ids flattened from two tiles, a new-axis subscript before the
+    # ids, a scatter instead of a gather, and the id and table layouts.
+    CASES: tuple[tuple[str, tuple[int, int], tuple[list[int], int | None]], ...] = (
+        ("lookup", (2, 1), ([4, 1024], None)),
+        ("scaled", (2, 1), ([4, 1024], None)),
+        ("2-D ids", (2, 1), ([1, 4, 1024], None)),
+        ("flattened 2-D ids", (2, 1), ([1, 4, 1024], None)),
+        ("new-axis subscript", (2, 1), ([4, 1024], None)),
+        ("plus positions", (3, 1), ([2, 1024], None)),
+        ("cast to fp32", (2, 1), ([2, 1024], None)),
+        ("feature-first tiles", (2, 1), ([1024, 4], None)),
+        ("two tables", (4, 1), ([2, 1024], None)),
+        ("padding mask", (2, 1), ([4, 1024], None)),
+        ("computed ids", (2, 1), ([4, 1024], None)),
+        ("scatter", (2, 1), ([4, 1024], 8)),
+        ("int16 ids", (2, 1), ([4, 1024], None)),
+        ("strided ids", (2, 1), ([4, 1024], None)),
+        ("column-sliced table", (2, 1), ([4, 512], None)),
+        ("row-strided table", (2, 1), ([4, 1024], None)),
+    )
+
+    def test_gathered_op_counts_index_elements(self) -> None:
+        for name, slabs, _seed in self.CASES:
+            with self.subTest(case=name):
+                (fact,) = _gather_case(name).config_spec.pointwise_facts
+                self.assertEqual((fact.slab_numel, fact.max_op_slab_numel), slabs)
+
+    def test_seed_is_not_collapsed(self) -> None:
+        for name, _slabs, seed in self.CASES:
+            with self.subTest(case=name):
+                self.assertEqual(
+                    _pointwise_seed(_gather_case(name), BLACKWELL_HARDWARE, 148), seed
+                )
+
+    def test_lookup_seed_by_shape_dtype_and_device(self) -> None:
+        h100 = (HOPPER_HARDWARE, 132)
+        b200 = (BLACKWELL_HARDWARE, 148)
+        rtx5080 = (RTX5080_HARDWARE, 84)
+        # Decode, a short and a long prompt, a large batch, then PyTorch's default
+        # embedding dtype and a narrow one; each on the three promoted targets.
+        for tokens, rows, features, dtype, expected in (
+            (
+                1,
+                50257,
+                768,
+                torch.bfloat16,
+                {
+                    h100: ([1, 256], None),
+                    b200: ([1, 256], None),
+                    rtx5080: ([1, 256], None),
+                },
+            ),
+            (
+                64,
+                50257,
+                768,
+                torch.bfloat16,
+                {
+                    h100: ([1, 256], None),
+                    b200: ([1, 256], None),
+                    rtx5080: ([1, 256], None),
+                },
+            ),
+            (
+                4096,
+                50257,
+                768,
+                torch.bfloat16,
+                {
+                    h100: ([2, 1024], None),
+                    b200: ([4, 1024], 8),
+                    rtx5080: ([2, 1024], None),
+                },
+            ),
+            (
+                8192,
+                32000,
+                512,
+                torch.bfloat16,
+                {
+                    h100: ([4, 512], None),
+                    b200: ([8, 512], None),
+                    rtx5080: ([4, 512], None),
+                },
+            ),
+            (
+                4096,
+                50257,
+                768,
+                torch.float32,
+                {
+                    h100: ([1, 1024], None),
+                    b200: ([2, 1024], None),
+                    rtx5080: ([1, 1024], None),
+                },
+            ),
+            (
+                4096,
+                50257,
+                768,
+                torch.int8,
+                {
+                    h100: ([2, 1024], None),
+                    b200: ([4, 1024], 8),
+                    rtx5080: ([4, 1024], None),
+                },
+            ),
+        ):
+            ids = torch.zeros([tokens], device=DEVICE, dtype=torch.int32)
+            table = torch.empty([rows, features], device=DEVICE, dtype=dtype)
+            bound = _lookup.bind((ids, table))
+            for (hardware, num_sm), seed in expected.items():
+                with self.subTest(
+                    tokens=tokens,
+                    rows=rows,
+                    features=features,
+                    dtype=dtype,
+                    hardware=hardware.compute_capability,
+                ):
+                    self.assertEqual(_pointwise_seed(bound, hardware, num_sm), seed)
+
+    def test_rows_behind_a_loaded_index_get_no_lane_warps_on_b200(self) -> None:
+        # The address of ``table[ids[tile], ...]`` waits on the ids load, and
+        # every warp of the program waits with it: on sm100 such a kernel gets
+        # no warps beyond the default 4 from its tile's lanes. A grid too small
+        # to fill the device still gets its residency warps (512 ids leave most
+        # cases below at 8 or 16); "saturated grid" and "few tokens" show both
+        # sides.
+        def bf16(*shape: int) -> torch.Tensor:
+            return torch.empty(shape, device=DEVICE, dtype=torch.bfloat16)
+
+        ids = torch.zeros([512], device=DEVICE, dtype=torch.int32)
+        many_ids = torch.zeros([4096], device=DEVICE, dtype=torch.int32)
+        x = bf16(4096, 4096)
+        cases = [
+            # Rows of what the loaded index picks, however the row is written:
+            # a tile, ``:`` (written or not, also before a new axis), a bounded
+            # or stepped slice, ``hl.arange``, a shifted or scaled tile index,
+            # one position of it (an int, a grid index).
+            ("tile", _lookup, (ids, bf16(4096, 1536)), True, ([1, 1024], 8)),
+            (
+                "whole rows",
+                _lookup_whole_rows,
+                (ids, bf16(4096, 512)),
+                True,
+                ([8], 16),
+            ),
+            (
+                "rows without a slice",
+                _lookup_rows_without_a_slice,
+                (ids, bf16(4096, 512)),
+                True,
+                ([8], 16),
+            ),
+            (
+                "trailing new axis",
+                _lookup_trailing_new_axis,
+                (ids, bf16(4096, 1536)),
+                True,
+                ([1, 1024], 8),
+            ),
+            (
+                "bounded slice",
+                _lookup_row_prefixes,
+                (ids, bf16(4096, 1024)),
+                True,
+                ([8], 16),
+            ),
+            (
+                "stepped slice",
+                _lookup_stepped_rows,
+                (ids, bf16(4096, 1024)),
+                True,
+                ([8], 16),
+            ),
+            (
+                "arange window",
+                _lookup_window,
+                (ids, bf16(4096, 512)),
+                True,
+                ([16], 16),
+            ),
+            (
+                "shifted tile index",
+                _lookup_shifted_columns,
+                (ids, bf16(4096, 1537)),
+                True,
+                ([1, 1024], 8),
+            ),
+            (
+                "scaled tile index",
+                _lookup_every_other_column,
+                (ids, bf16(4096, 3072)),
+                True,
+                ([1, 1024], 8),
+            ),
+            (
+                "int on the last dim",
+                _lookup_one_position,
+                (ids, bf16(4096, 1536, 4)),
+                True,
+                ([1, 1024], 8),
+            ),
+            (
+                "grid index on the last dim",
+                _lookup_grid_position,
+                (ids, bf16(4096, 1536, 4)),
+                True,
+                ([1, 1024], 8),
+            ),
+            # Both sides of the cap. On a grid that fills the device the lanes of
+            # a [1, 4096] tile ask for 8 warps, which a row lookup does not get
+            # (the column gather below keeps them); 16 tokens of whole rows are
+            # 2 programs, and the residency warps hide the ids load.
+            ("saturated grid", _lookup, (many_ids, x), True, ([1, 4096], None)),
+            (
+                "few tokens",
+                _lookup_whole_rows,
+                (ids[:16], bf16(4096, 768)),
+                True,
+                ([8], 16),
+            ),
+            # The cap is on the warps a tile's lanes add: three transcendentals
+            # still get their 8.
+            (
+                "transcendental rows",
+                _lookup_transcendental,
+                (many_ids, bf16(8192, 1024)),
+                True,
+                ([4, 1024], 8),
+            ),
+            # The layout decides, not the subscript's position: a row-strided or
+            # column-strided table still gives up rows, while the rows of a
+            # transposed one (or of a single column) are scattered elements.
+            (
+                "row-strided table",
+                _lookup,
+                (ids, bf16(8192, 1536)[::2]),
+                True,
+                ([1, 1024], 8),
+            ),
+            (
+                "column-strided table",
+                _lookup,
+                (ids, bf16(4096, 3072)[:, ::2]),
+                True,
+                ([1, 1024], 8),
+            ),
+            (
+                "transposed table",
+                _lookup,
+                (ids, bf16(1536, 4096).T),
+                False,
+                ([1, 1024], 8),
+            ),
+            ("one-column table", _lookup, (ids, bf16(4096, 1)), False, ([64, 1], 1)),
+            # One element per id is no row either, whatever the layout: one
+            # column of a wider table, a position of each picked row, a strided
+            # 1-D view. The last two keep the 8 warps of the plain stream they
+            # scale, like the same kernel over a contiguous 1-D tensor.
+            (
+                "one column of a wider table",
+                _lookup,
+                (ids, bf16(4096, 512)[:, :1]),
+                False,
+                ([64, 1], 1),
+            ),
+            (
+                "one position per picked row",
+                _copy_scaled_by_position,
+                (x, many_ids, bf16(8192, 8)),
+                False,
+                ([1, 4096], 8),
+            ),
+            (
+                "one weight per column, strided weights",
+                _copy_weighted_by_ids,
+                (x, many_ids, bf16(8192, 8)[:, 0]),
+                False,
+                ([1, 4096], 8),
+            ),
+            (
+                "one weight per column, contiguous weights",
+                _copy_weighted_by_ids,
+                (x, many_ids, bf16(8192)),
+                False,
+                ([1, 4096], 8),
+            ),
+            # A loaded index on the contiguous dim fetches element by element
+            # and keeps its warps: alone, beside a row index in the same
+            # subscript, or in a second load (whose byte budget stops at 2048
+            # elements, which ask for 4 warps anyway).
+            ("columns", _lookup_columns, (x, many_ids), False, ([1, 4096], 8)),
+            (
+                "rows and columns",
+                _lookup_rows_and_columns,
+                (many_ids, many_ids, x),
+                False,
+                ([1, 4096], 8),
+            ),
+            (
+                "rows plus columns",
+                _lookup_rows_plus_columns,
+                (many_ids, many_ids, x),
+                False,
+                ([1, 2048], None),
+            ),
+            # Rows stay rows beside an element gather that fetches once per row
+            # (along the tile the rows are picked along): an id remapped per
+            # row, one scale per row, under a 2-D tile or one tile over the
+            # tokens. Rows of a tunable width are rows too.
+            (
+                "remapped ids",
+                _lookup_remapped,
+                (ids, torch.zeros_like(many_ids), bf16(4096, 1536)),
+                True,
+                ([1, 1024], 8),
+            ),
+            (
+                "one scale per row",
+                _lookup_scaled_rows,
+                (ids, bf16(4096), bf16(4096, 1536)),
+                True,
+                ([1, 1024], 8),
+            ),
+            (
+                "whole rows, remapped ids",
+                _lookup_whole_rows_remapped,
+                (ids, torch.zeros_like(many_ids), bf16(4096, 512)),
+                True,
+                ([8], 16),
+            ),
+            (
+                "whole rows, one scale per row",
+                _lookup_whole_rows_scaled,
+                (ids, bf16(4096), bf16(4096, 512)),
+                True,
+                ([8], 16),
+            ),
+            (
+                "rows of a tunable width",
+                _lookup_tunable_window,
+                (torch.zeros([64], device=DEVICE, dtype=torch.int32), bf16(8192, 64)),
+                True,
+                ([2], 16),
+            ),
+            # An element gather that fetches along any other axis may fetch as
+            # much as the rows move, and keeps the warps: one weight per column,
+            # however the rows or the token loop are written; a tunable count;
+            # ids paired over a 1-D tensor (which gather_numel cannot count).
+            (
+                "one weight per column",
+                _lookup_weighted_columns,
+                (
+                    ids,
+                    torch.zeros([1536], device=DEVICE, dtype=torch.int32),
+                    bf16(4096),
+                    bf16(4096, 1536),
+                ),
+                False,
+                ([1, 1024], 8),
+            ),
+            (
+                "one weight per column, rows after a new axis",
+                _lookup_new_axis_weighted_columns,
+                (
+                    ids,
+                    torch.zeros([1536], device=DEVICE, dtype=torch.int32),
+                    bf16(4096),
+                    bf16(4096, 1536),
+                ),
+                False,
+                ([1, 1024], 8),
+            ),
+            (
+                "one weight per column, rows by tile index",
+                _lookup_by_index_weighted_columns,
+                (
+                    ids,
+                    torch.zeros([1536], device=DEVICE, dtype=torch.int32),
+                    bf16(4096),
+                    bf16(4096, 1536),
+                ),
+                False,
+                ([1, 1024], 8),
+            ),
+            (
+                "one weight per column under hl.grid",
+                _lookup_weighted_columns_grid,
+                (
+                    ids,
+                    torch.zeros([1536], device=DEVICE, dtype=torch.int32),
+                    bf16(4096),
+                    bf16(4096, 1536),
+                ),
+                False,
+                ([32], 16),
+            ),
+            (
+                "rows and elements of a tunable count",
+                _lookup_rows_and_tunable_elements,
+                (
+                    torch.zeros([512, 64], device=DEVICE, dtype=torch.int32),
+                    bf16(4096, 512),
+                    bf16(1 << 20),
+                ),
+                False,
+                None,
+            ),
+            (
+                "rows and an uncounted gather",
+                _lookup_rows_and_paired_elements,
+                (ids, bf16(4096, 512), bf16(1 << 20)),
+                False,
+                ([4], 16),
+            ),
+            # No index is loaded: a computed one (hl.arange, 2 * tile.index, a
+            # subscripted tile.index, which is a load of the index and not of
+            # memory) delays nothing, and beside the rows it changes nothing.
+            ("arange rows", _copy_row_band, (bf16(64, 1 << 18),), False, None),
+            (
+                "scaled tile index alone",
+                _strided_columns,
+                (bf16(2048, 2048),),
+                False,
+                None,
+            ),
+            (
+                "subscripted tile index alone",
+                _copy_by_tile_index,
+                (bf16(64, 64, 2048),),
+                False,
+                ([1, 2, 2048], 8),
+            ),
+            (
+                "rows times a weight read by tile index",
+                _lookup_weighted_by_tile_index,
+                (ids, bf16(1536), bf16(4096, 1536)),
+                True,
+                ([1, 1024], 8),
+            ),
+        ]
+        for name, kernel, args, rows, seed in cases:
+            with self.subTest(case=name):
+                bound = kernel.bind(args)
+                (fact,) = bound.config_spec.pointwise_facts
+                self.assertEqual(fact.row_gather, rows)
+                if seed is not None:
+                    self.assertEqual(
+                        _pointwise_seed(bound, BLACKWELL_HARDWARE, 148), seed
+                    )
+        bound = _lookup_rows_and_paired_elements.bind(
+            (ids, bf16(4096, 512), bf16(1 << 20))
+        )
+        self.assertIn(
+            (None, False),
+            [
+                (op.gather_numel, op.row_gather)
+                for op in bound.config_spec.memory_op_facts
+            ],
+        )
+        # A scatter loads nothing through an index.
+        (fact,) = _gather_case("scatter").config_spec.pointwise_facts
+        self.assertFalse(fact.row_gather)
+
+    def test_size_of_a_loaded_tensor_is_not_a_loaded_index(self) -> None:
+        # In the inner loop the outer tile arrives as the size of a value the
+        # outer loop loaded: a shape, not something read from memory.
+        x = torch.empty([512, 1536], device=DEVICE, dtype=torch.bfloat16)
+        scale = torch.empty([512], device=DEVICE, dtype=torch.bfloat16)
+        spec = _scale_rows_in_nested_loops.bind((x, scale)).config_spec
+        self.assertEqual(
+            [(op.gather_numel, op.row_gather) for op in spec.memory_op_facts],
+            [(None, None)] * 3,
+        )
+
+    def test_rolled_copy_of_an_op_reads_its_index_in_the_enclosing_graph(self) -> None:
+        # A kernel with a full slice lists each load and store twice, once in
+        # the rolled graph of the slice's loop, where a subscript computed
+        # outside it is a placeholder. The copy is what the op is: a row
+        # lookup both times...
+        ids = torch.zeros([512], device=DEVICE, dtype=torch.int32)
+        table = torch.empty([4096, 512], device=DEVICE, dtype=torch.bfloat16)
+        spec = _lookup_whole_rows.bind((ids, table)).config_spec
+        self.assertEqual(
+            [
+                (op.gather_numel, op.row_gather)
+                for op in spec.memory_op_facts
+                if op.row_gather is not None
+            ],
+            [(512, True), (512, True)],
+        )
+        # ... and no gather both times for ``x[2 * tile.index, :]``. Its rolled
+        # copy still reads the placeholder (KNOWN_GAPS.md,
+        # rolled-graph-subscripts-unresolved), so the widest op is taken from
+        # the ops outside the rolled graph: one 96-element row, not the whole
+        # tensor the copy would charge.
+        x = torch.empty([8192, 96], device=DEVICE, dtype=torch.bfloat16)
+        bound = _copy_every_other_row.bind((x,))
+        spec = bound.config_spec
+        self.assertEqual({op.gather_numel for op in spec.memory_op_facts}, {None})
+        (fact,) = spec.pointwise_facts
+        self.assertEqual((fact.slab_numel, fact.max_op_slab_numel), (576, 96))
+        self.assertEqual(_pointwise_seed(bound, BLACKWELL_HARDWARE, 148), ([32], 16))
+        # The copy itself still reads the placeholder (KNOWN_GAPS.md,
+        # rolled-graph-subscripts-unresolved): no tiled row axis.
+        self.assertEqual(
+            [
+                op.subscript_affine_block_ids
+                for op in spec.memory_op_facts
+                if op.kind == "load"
+            ],
+            [(0, None), (None, None)],
+        )
+        # Narrow rows: the copy would have charged the whole tensor (16384), and
+        # lifted the starvation cap to 16 warps; two elements a row give 8.
+        bound = _copy_every_other_row.bind(
+            (torch.empty([8192, 2], device=DEVICE, dtype=torch.bfloat16),)
+        )
+        self.assertEqual(_pointwise_seed(bound, BLACKWELL_HARDWARE, 148), ([256], 8))
+        # Beside a row lookup the copy would set the warps: two-element rows
+        # give a [256] tile 8 warps, not the 16 its whole tensor would allow.
+        ids = torch.zeros([1024], device=DEVICE, dtype=torch.int32)
+        x = torch.empty([2048, 2], device=DEVICE, dtype=torch.bfloat16)
+        table = torch.empty([1 << 22, 2], device=DEVICE, dtype=torch.bfloat16)
+        bound = _lookup_plus_every_other_row.bind((ids, x, table))
+        (fact,) = bound.config_spec.pointwise_facts
+        self.assertEqual(fact.max_op_slab_numel, 2)
+        self.assertEqual(_pointwise_seed(bound, BLACKWELL_HARDWARE, 148), ([256], 8))
+
+    def test_slab_does_not_scale_with_table_rows(self) -> None:
+        ids = torch.zeros([16], device=DEVICE, dtype=torch.int32)
+        for rows in (16, 8192, 65536):
+            with self.subTest(rows=rows):
+                table = torch.empty([rows, 256], device=DEVICE, dtype=torch.bfloat16)
+                spec = _lookup.bind((ids, table)).config_spec
+                # The ids load, the table load and the store.
+                self.assertEqual(
+                    [op.gather_numel for op in spec.memory_op_facts], [None, 1, None]
+                )
+                (fact,) = spec.pointwise_facts
+                self.assertEqual((fact.slab_numel, fact.max_op_slab_numel), (2, 1))
+
+    def test_table_smaller_than_the_output_is_not_counted(self) -> None:
+        # The broadcast-operand rule comes first, as before the gather accounting:
+        # a tensor with fewer elements than the output is not counted, gathered
+        # or not, so only the store counts.
+        ids = torch.zeros([16], device=DEVICE, dtype=torch.int32)
+        table = torch.empty([8, 256], device=DEVICE, dtype=torch.bfloat16)
+        (fact,) = _lookup.bind((ids, table)).config_spec.pointwise_facts
+        self.assertEqual((fact.slab_numel, fact.max_op_slab_numel), (1, 1))
+        # It is a row lookup all the same: the B200 seed keeps the tile from
+        # before the gather accounting, but not its 16 warps.
+        ids = torch.zeros([8192], device=DEVICE, dtype=torch.int32)
+        table = torch.empty([4096, 4096], device=DEVICE, dtype=torch.bfloat16)
+        bound = _lookup.bind((ids, table))
+        (fact,) = bound.config_spec.pointwise_facts
+        self.assertEqual((fact.slab_numel, fact.row_gather), (1, True))
+        self.assertEqual(
+            _pointwise_seed(bound, BLACKWELL_HARDWARE, 148), ([2, 4096], None)
+        )
+
+    def test_region_beyond_the_tiles_fans_out(self) -> None:
+        table = torch.empty([8192, 256], device=DEVICE, dtype=torch.bfloat16)
+        ids = torch.zeros([16], device=DEVICE, dtype=torch.int32)
+        ids_k = ids.view(4, 4).repeat(4, 1)
+        four = torch.zeros([4], device=DEVICE, dtype=torch.int32)
+
+        def table_numel(kernel: helion.Kernel, *args: object) -> int | None:
+            spec = kernel.bind(args).config_spec
+            (numel,) = {op.gather_numel for op in spec.memory_op_facts} - {None}
+            (fact,) = spec.pointwise_facts
+            # The gather is the kernel's widest op. (``slab_numel`` is not pinned
+            # for these kernels: the rolled alternative of a full slice's loop
+            # lists every op twice, which doubles it.)
+            self.assertEqual(fact.max_op_slab_numel, numel)
+            return numel
+
+        # Four ids per token: four rows per tiled element.
+        self.assertEqual(table_numel(_lookup_k_rows, ids_k, table), 4)
+        # Row and column ids of one shape broadcast together: four elements per
+        # token, not four rows times four columns.
+        self.assertEqual(table_numel(_lookup_row_col_pairs, ids_k, ids_k, table), 4)
+        # Two 1-D indexers form a Cartesian product: four rows times four columns.
+        x = torch.empty([16, 32, 32], device=DEVICE, dtype=torch.bfloat16)
+        self.assertEqual(table_numel(_lookup_cartesian, four, four, x), 16)
+        # A full slice beside the gather: one whole 256-wide row per id.
+        self.assertEqual(table_numel(_lookup_whole_rows, ids, table), 256)
+
+        # Two id tensors stacked and flattened to ``2 * tile``: two rows per
+        # token for the gather, and for the store through the same shape.
+        spec = _lookup_two_ids_per_token.bind((ids, ids, table)).config_spec
+        self.assertEqual([op.gather_numel for op in spec.memory_op_facts[-2:]], [2, 2])
+        (fact,) = spec.pointwise_facts
+        self.assertEqual((fact.slab_numel, fact.max_op_slab_numel), (4, 2))
+
+        # An axis the autotuner does not tune counts whole, for the gather as
+        # for the store beside it: 16 token rows each, not the table's 8192; or
+        # 256 features each (plus the ids, as large as the one tuned axis).
+        for kernel, numel, slab in (
+            (_lookup_fixed_token_block, 16, 32),
+            (_lookup_fixed_feature_block, 256, 513),
+        ):
+            with self.subTest(kernel=kernel.name):
+                spec = kernel.bind((ids, table)).config_spec
+                self.assertEqual(
+                    {op.gather_numel for op in spec.memory_op_facts}, {None, numel}
+                )
+                (fact,) = spec.pointwise_facts
+                self.assertEqual(
+                    (fact.slab_numel, fact.max_op_slab_numel), (slab, numel)
+                )
+
+    def test_separated_index_tensors_address_their_own_dims(self) -> None:
+        # A scalar between them keeps index tensors from being grouped: a row per
+        # token times 32 column ids, for the load and for the store.
+        rows = torch.zeros([64], device=DEVICE, dtype=torch.int32)
+        x = torch.empty([4, 128, 3, 256], device=DEVICE, dtype=torch.bfloat16)
+        args = (rows[:2], rows, rows[:32], x, x)
+        spec = _copy_separated_indexers.bind(args).config_spec
+        self.assertEqual(
+            {(op.kind, op.gather_numel) for op in spec.memory_op_facts if op.ndim == 4},
+            {("load", 32), ("store", 32)},
+        )
+
+    def test_region_that_grows_with_the_tile_is_not_counted(self) -> None:
+        # Row and column ids over one tile form a tile-by-tile product: it has
+        # no numel per tile element, so both ops keep the size ratio.
+        rows = torch.zeros([64], device=DEVICE, dtype=torch.int32)
+        x = torch.empty([4096, 4096], device=DEVICE, dtype=torch.bfloat16)
+        spec = _copy_same_tile_product.bind((rows, rows, x, x)).config_spec
+        self.assertEqual({op.gather_numel for op in spec.memory_op_facts}, {None})
+
+    def test_scatter_counts_the_region_of_its_index_list(self) -> None:
+        ids = torch.zeros([16], device=DEVICE, dtype=torch.int32)
+        ids_k = ids.view(4, 4).repeat(4, 1)
+        src = torch.empty([16, 256], device=DEVICE, dtype=torch.bfloat16)
+        out = torch.empty([8192, 256], device=DEVICE, dtype=torch.bfloat16)
+        # A bounded slice (128 of 256 columns per id); row and column ids that
+        # broadcast (four per token); a new axis before the ids; a feature axis
+        # with a fixed block size (whole: 256); a scalar position (one element).
+        for kernel, args, numel in (
+            (_scatter_row_prefixes, (ids, src, out), 128),
+            (_scatter_row_col_pairs, (ids_k, ids_k, src[:, :4], out), 4),
+            (_scatter_new_axis, (ids, src, out), 1),
+            (_scatter_fixed_feature_block, (ids, src, out), 256),
+            (_scatter_scalar_position, (ids, src, out.view(128, 64, 256)), 1),
+        ):
+            with self.subTest(kernel=kernel.name):
+                (store,) = {
+                    op.gather_numel
+                    for op in kernel.bind(args).config_spec.memory_op_facts
+                    if op.kind == "store"
+                }
+                self.assertEqual(store, numel)
+
+    def test_size_that_is_not_polynomial_in_a_tile_is_not_counted(self) -> None:
+        # ``tile // 2`` has no value at a tile of one element: the gather through
+        # ``ids[tile].reshape(-1, 2)`` or ``.reshape(-1, block // 2)`` binds and
+        # keeps the size ratio.
+        ids = torch.zeros([64], device=DEVICE, dtype=torch.int32)
+        table = torch.empty([8192, 256], device=DEVICE, dtype=torch.bfloat16)
+        for kernel in (_lookup_paired_ids, _lookup_halved_block):
+            with self.subTest(kernel=kernel.name):
+                spec = kernel.bind((ids, table)).config_spec
+                self.assertEqual(
+                    {op.gather_numel for op in spec.memory_op_facts}, {None}
+                )
+
+    def test_slice_and_scalar_beside_a_gather_count_what_they_select(self) -> None:
+        # ``table[ids[t], :1, d]`` and ``table[ids[t], k, d]`` read one element
+        # per output element of a [8, 512, 256] table, not its 512-wide axis.
+        ids = torch.zeros([4096], device=DEVICE, dtype=torch.int32)
+        table = torch.empty([8, 512, 256], device=DEVICE, dtype=torch.bfloat16)
+        (fact,) = _lookup_bounded_slice.bind((ids, table)).config_spec.pointwise_facts
+        self.assertEqual((fact.slab_numel, fact.max_op_slab_numel), (2, 1))
+        # ``k`` runs over ``hl.grid``, an axis the autotuner does not tune: the
+        # store's 512 rows of it are the kernel's widest op, not the gather.
+        spec = _lookup_scalar_position.bind((ids, table)).config_spec
+        self.assertEqual({op.gather_numel for op in spec.memory_op_facts}, {None, 1})
+
+    def test_scalar_index_tensor_is_one_element(self) -> None:
+        # ``ids[i]`` under ``hl.grid`` is a 0-d index tensor: one row per element,
+        # beside the store's 16 untuned grid rows.
+        ids = torch.zeros([16], device=DEVICE, dtype=torch.int32)
+        table = torch.empty([8192, 256], device=DEVICE, dtype=torch.bfloat16)
+        spec = _lookup_grid.bind((ids, table)).config_spec
+        self.assertEqual(spec.memory_op_facts[1].gather_numel, 1)
+        (fact,) = spec.pointwise_facts
+        self.assertEqual((fact.slab_numel, fact.max_op_slab_numel), (17, 16))
+
+    def test_dynamic_shapes(self) -> None:
+        ids = torch.zeros([4096], device=DEVICE, dtype=torch.int32)
+        table = torch.empty([8192, 256], device=DEVICE, dtype=torch.bfloat16)
+        (fact,) = _lookup_dynamic.bind((ids, table)).config_spec.pointwise_facts
+        self.assertEqual((fact.slab_numel, fact.max_op_slab_numel), (2, 1))
+        # A full slice of a dynamic dim counts that dim's hint.
+        spec = _lookup_whole_rows_dynamic.bind((ids, table)).config_spec
+        (fact,) = spec.pointwise_facts
+        self.assertEqual(fact.max_op_slab_numel, 256)
+
+    def test_region_sized_by_a_tunable_keeps_the_size_ratio(self) -> None:
+        # ``hl.arange(width)`` of a registered tunable has no size to count before
+        # a config picks one, so the gather through it is not accounted.
+        ids = torch.zeros([64], device=DEVICE, dtype=torch.int32)
+        table = torch.empty([8192, 256], device=DEVICE, dtype=torch.bfloat16)
+        spec = _lookup_tunable_window.bind((ids, table)).config_spec
+        self.assertEqual({op.gather_numel for op in spec.memory_op_facts}, {None})
+        (fact,) = spec.pointwise_facts
+        self.assertEqual(fact.max_op_slab_numel, 8192 * 256)
+        # Nor has ``ids[tile, :width]``, whose reduction dim is sized by it.
+        spec = _lookup_tunable_slice.bind((ids.repeat(64, 1), table)).config_spec
+        self.assertEqual({op.gather_numel for op in spec.memory_op_facts}, {None})
+
+    def test_block_without_a_loop_extent(self) -> None:
+        # A registered block size no ``hl.tile`` iterates has no axis extent; the
+        # gather through ``hl.arange(block)`` still reads one element per element.
+        x = torch.empty([37], device=DEVICE, dtype=torch.float32)
+        spec = _copy_registered_blocks.bind((x,)).config_spec
+        self.assertEqual([op.gather_numel for op in spec.memory_op_facts], [1, 1])
+
+    def test_tile_subscripts_are_not_gathers(self) -> None:
+        # ``2 * tile.index`` is an integer tensor too, but a tile axis resolves it:
+        # the op keeps the tensor-size ratio (x is twice the output).
+        x = torch.empty([64, 512], device=DEVICE, dtype=torch.bfloat16)
+        spec = _strided_columns.bind((x,)).config_spec
+        self.assertEqual([op.gather_numel for op in spec.memory_op_facts], [None, None])
+        (fact,) = spec.pointwise_facts
+        self.assertEqual((fact.slab_numel, fact.max_op_slab_numel), (3, 1))
+        # Nor is a symbolic scalar: no index tensor, no gather.
+        spec = _middle_column.bind((x,)).config_spec
+        self.assertEqual({op.gather_numel for op in spec.memory_op_facts}, {None})
 
 
 class TestPointwiseGatherStride(TestCase):
