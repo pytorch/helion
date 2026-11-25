@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import functools
 import importlib
 import inspect
 import json
@@ -115,6 +116,8 @@ from helion.autotuner.config_spec import LoopOrderSpec
 from helion.autotuner.config_spec import MatmulFact
 from helion.autotuner.config_spec import ReductionLoopSpec
 import helion.language as hl
+from helion.runtime.kernel import BoundKernel
+from helion.runtime.settings import decorator_codegen_settings
 
 pytestmark = pytest.mark.cpu_only
 
@@ -2153,6 +2156,75 @@ class TestFormatKernelDecorator(TestCase):
         decorator = BoundKernel.format_kernel_decorator(None, config, settings)  # type: ignore[arg-type]
 
         self.assertIn("index_dtype=torch.int64", decorator)
+
+    def test_format_kernel_decorator_includes_codegen_settings(self) -> None:
+        """The decorator replays fast_math and dot_precision, set on the kernel
+        or through HELION_FAST_MATH and TRITON_F32_DEFAULT, and a kernel's
+        opt-out from those variables; it leaves them out where both the
+        variables and the platform give the kernel's values (tf32x3 is no
+        platform's default dot precision)."""
+        decorator = functools.partial(
+            BoundKernel.format_kernel_decorator,
+            None,  # pyrefly: ignore[bad-argument-type]
+            helion.Config(block_sizes=[8], num_warps=4),
+        )
+        with patch.dict(os.environ):
+            os.environ.pop("HELION_FAST_MATH", None)
+            os.environ.pop("TRITON_F32_DEFAULT", None)
+            set_on_kernel = helion.Settings(fast_math=True, dot_precision="tf32x3")
+            self.assertIn(
+                "fast_math=True, dot_precision='tf32x3'", decorator(set_on_kernel)
+            )
+            self.assertNotIn("fast_math", decorator(helion.Settings()))
+            self.assertNotIn("dot_precision", decorator(helion.Settings()))
+            os.environ.update(HELION_FAST_MATH="1", TRITON_F32_DEFAULT="tf32x3")
+            self.assertIn(
+                "fast_math=True, dot_precision='tf32x3'", decorator(helion.Settings())
+            )
+            opted_out = helion.Settings(fast_math=False, dot_precision="tf32")
+            printed = decorator(opted_out)
+            self.assertIn("fast_math=False, dot_precision='tf32'", printed)
+            # Values Helion does not parse (Triton takes bf16x3) print the
+            # kernel's settings, where parsing them would fail its call.
+            os.environ.update(HELION_FAST_MATH="sometimes", TRITON_F32_DEFAULT="bf16x3")
+            printed = decorator(opted_out)
+            self.assertIn("fast_math=False, dot_precision='tf32'", printed)
+            os.environ.update(HELION_BACKEND="not_a_backend", TRITON_F32_DEFAULT="ieee")
+            explicit = helion.Settings(
+                backend="triton", fast_math=False, dot_precision="ieee"
+            )
+            self.assertIn("fast_math=False, dot_precision='ieee'", decorator(explicit))
+
+    def test_format_kernel_decorator_platform_dot_precision(self) -> None:
+        """The platform's dot precision, which the decorator leaves out:
+        'ieee' on an AMD GPU without tf32, 'default' on Pallas."""
+        with patch.dict(os.environ):
+            for name in (
+                "HELION_FAST_MATH",
+                "TRITON_F32_DEFAULT",
+                "JAX_DEFAULT_MATMUL_PRECISION",
+            ):
+                os.environ.pop(name, None)
+            with (
+                patch.object(helion.runtime.settings, "is_hip", return_value=True),
+                patch.object(
+                    helion.runtime.settings,
+                    "supports_tf32_precision_on_amd",
+                    return_value=False,
+                ),
+            ):
+                self.assertEqual(
+                    decorator_codegen_settings(helion.Settings(dot_precision="ieee")),
+                    [],
+                )
+                self.assertEqual(
+                    decorator_codegen_settings(helion.Settings(dot_precision="tf32")),
+                    ["dot_precision='tf32'"],
+                )
+            os.environ["HELION_BACKEND"] = "pallas"
+            self.assertEqual(
+                decorator_codegen_settings(helion.Settings(dot_precision="default")), []
+            )
 
 
 @onlyBackends(["triton", "cute"])

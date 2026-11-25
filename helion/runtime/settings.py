@@ -368,14 +368,14 @@ def _get_ref_mode() -> RefMode:
 
 def _get_dot_precision() -> DotPrecision:
     """
-    Gets the dot precision setting from the TRITON_F32_DEFAULT environment variable.
-    Defaults to 'tf32', 'ieee' if rocm and not CDNA.
+    Gets the dot precision setting from the TRITON_F32_DEFAULT environment variable,
+    defaulting to the platform's (_platform_dot_precision()).
     For Pallas, gets the precision setting from the JAX_DEFAULT_MATMUL_PRECISION environment variable, defaulting to 'default'.
     """
     if _get_backend() == "pallas":
         return _env_get_literal(
             "JAX_DEFAULT_MATMUL_PRECISION",
-            cast("DotPrecision", "default"),
+            _platform_dot_precision(),
             mapping={
                 "default": "default",
                 "high": "high",
@@ -386,16 +386,28 @@ def _get_dot_precision() -> DotPrecision:
             },
         )
 
-    if is_hip():
-        default_precision = "tf32" if supports_tf32_precision_on_amd() else "ieee"
-    else:
-        default_precision = "tf32"
-
     return _env_get_literal(
         "TRITON_F32_DEFAULT",
-        cast("DotPrecision", default_precision),
+        _platform_dot_precision(),
         mapping={k: k for k in get_args(DotPrecision)},
     )
+
+
+def _get_fast_math() -> bool:
+    """The fast_math setting from HELION_FAST_MATH, False when unset."""
+    return _env_get_bool("HELION_FAST_MATH", False)
+
+
+def _platform_dot_precision() -> DotPrecision:
+    """The dot precision a kernel takes on this platform without
+    TRITON_F32_DEFAULT or JAX_DEFAULT_MATMUL_PRECISION: 'default' under
+    HELION_BACKEND=pallas, 'ieee' on an AMD GPU without tf32
+    (supports_tf32_precision_on_amd()), else 'tf32'."""
+    if _get_backend() == "pallas":
+        return "default"
+    if is_hip() and not supports_tf32_precision_on_amd():
+        return "ieee"
+    return "tf32"
 
 
 def _get_backend() -> str:
@@ -404,6 +416,43 @@ def _get_backend() -> str:
         "triton",
         mapping={name: name for name in list_backends()},
     )
+
+
+def decorator_codegen_settings(settings: Settings) -> list[str]:
+    """The ``name=value`` parts of a printed ``@helion.kernel`` decorator
+    (``BoundKernel.format_kernel_decorator``) for ``fast_math`` and
+    ``dot_precision``, which change the generated code's numerics: a kernel
+    tuned under ``@helion.kernel(fast_math=True, dot_precision="ieee")``
+    replays with them, where the decorator without them would run exact exp
+    and division and tf32 dots. Each is printed unless it is both the value a
+    kernel takes without HELION_FAST_MATH and TRITON_F32_DEFAULT (``False``,
+    and the platform's dot precision) and the value those variables give it
+    here: the decorator then replays the same with or without them, and one
+    of a kernel that leaves both at their defaults prints as before. A dot
+    precision equal to the platform's is left out where the variables agree:
+    the config is tuned for the platform's GPU anyway."""
+    parts: list[str] = []
+    # The kernel's explicit values make the variables irrelevant to it, and
+    # set_config() prints this decorator on every call: a value Helion does
+    # not parse (TRITON_F32_DEFAULT=bf16x3, which Triton takes) prints the
+    # kernel's setting rather than raise.
+    # None: the variable's value is not one Helion parses.
+    try:
+        fast_math_variable: bool | None = _get_fast_math()
+    except ValueError:
+        fast_math_variable = None
+    if settings.fast_math or fast_math_variable is not False:
+        parts.append(f"fast_math={settings.fast_math}")
+    try:
+        precision_variable: str | None = _get_dot_precision()
+    except ValueError:
+        precision_variable = None
+    precision = settings.dot_precision
+    # The platform's precision reads HELION_BACKEND, which parsed if the
+    # variable did.
+    if precision != precision_variable or precision != _platform_dot_precision():
+        parts.append(f"dot_precision={precision!r}")
+    return parts
 
 
 def is_pallas_interpret() -> bool:
@@ -431,9 +480,7 @@ class _Settings:
     )
     dot_precision: DotPrecision = dataclasses.field(default_factory=_get_dot_precision)
     cute_rng_stream: Literal["auto", "word0", "philox4"] = "word0"
-    fast_math: bool = dataclasses.field(
-        default_factory=functools.partial(_env_get_bool, "HELION_FAST_MATH", False)
-    )
+    fast_math: bool = dataclasses.field(default_factory=_get_fast_math)
     cute_flash_env_overrides: dict[str, str] = dataclasses.field(default_factory=dict)
     static_shapes: bool = dataclasses.field(
         default_factory=functools.partial(_env_get_bool, "HELION_STATIC_SHAPES", True)
