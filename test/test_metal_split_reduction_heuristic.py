@@ -4,42 +4,28 @@ CPU binds; ``test_metal_split_reduction_numerics.py`` runs them."""
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
 import unittest
 
 import pytest
 import torch
 
-import helion
 from helion._compiler.metal.split_reduction_heuristic import (
     MetalSplitReductionHeuristic,
 )
 from helion._testing import skipUnlessBackends
 from helion._testing.metal import heuristic_seeds
+from helion._testing.metal_split import reduced_in_loop
 from helion._testing.metal_split import split_gemv
 from helion._testing.metal_split import split_gemv_args
-import helion.language as hl
+
+if TYPE_CHECKING:
+    import helion
 
 # Metal codegen only: other backends' CPU lanes skip the module.
 pytestmark = [pytest.mark.cpu_only, skipUnlessBackends(["metal"])]
 
 F32 = torch.float32
-
-
-@helion.kernel(backend="metal", static_shapes=True)
-def reduced_in_loop(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
-    """The K chunks summed inside the loop: nothing is reduced after it."""
-    m, k = x.size()
-    n = w.size(0)
-    bk = hl.register_block_size(1, k)
-    out = torch.empty([m, n], dtype=F32, device=x.device)
-    for tile_m, tile_n in hl.tile([m, n]):
-        acc = hl.zeros([tile_m, tile_n], dtype=F32)
-        for tile_k in hl.tile(k, block_size=bk):
-            xk = x[tile_m, tile_k].to(F32)
-            wk = w[tile_n, tile_k].to(F32)
-            acc = acc + (xk.unsqueeze(1) * wk.unsqueeze(0)).sum(2)
-        out[tile_m, tile_n] = acc
-    return out
 
 
 def _seeds(
