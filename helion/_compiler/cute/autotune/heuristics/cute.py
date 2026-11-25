@@ -40,6 +40,8 @@ from ....._utils import prev_power_of_2
 from .....autotuner.config_spec import _CUTE_LANE_UNROLL_CHOICES
 from .....autotuner.config_spec import SIZED_REDUCTION_CATEGORIES
 from .....autotuner.config_spec import get_valid_eviction_policies
+from .....language._gelu_tanh_approx import _gelu_erf
+from .....language._gelu_tanh_approx import _gelu_tanh_approx
 from .....language._tracing_ops import _host_tensor
 from .....language.inline_asm_ops import inline_asm_elementwise
 from .....language.memory_ops import load as language_load
@@ -5062,14 +5064,19 @@ class _CuteColumnSeedHeuristic(AutotunerHeuristic):
         spec: ConfigSpec,
         plan: tuple[int, int, torch.Tensor],
         shapes: tuple[tuple[int, int | None, int | None], ...],
+        vec: int | None = None,
+        **knobs: object,
     ) -> list[Config]:
         """A seed of ``plan``'s column and reduced tiles for each shape
         ``(column threads, row threads, rows per chunk)`` the tiles'
         fragments hold, every other block one split: the column tile that
         many packets wide, the whole loop's rows per chunk for None rows,
-        and ``_column_row_threads`` row threads for None threads."""
+        and ``_column_row_threads`` row threads for None threads.  Packets
+        are 16 bytes unless ``vec`` gives their width in elements; ``knobs``
+        go into every seed."""
         column_block_id, reduced_block_id, source = plan
-        vec = _cute_tile_seed_vec_width_for_dtype(source.dtype)
+        if vec is None:
+            vec = _cute_tile_seed_vec_width_for_dtype(source.dtype)
         block_specs = {item.block_id: item for item in spec.block_sizes}
         column_fragment = block_specs[column_block_id]._fragment(spec)
         reduced_fragment = block_specs[reduced_block_id]._fragment(spec)
@@ -5108,6 +5115,7 @@ class _CuteColumnSeedHeuristic(AutotunerHeuristic):
                         column_block_id: column_threads,
                         reduced_block_id: row_threads,
                     },
+                    **knobs,
                 )
             )
         return seeds
@@ -5365,7 +5373,9 @@ class CuteSplitColumnReductionHeuristic(_CuteColumnSeedHeuristic):
     match takes any such loop nest, so batched column sums (``x[tile_b,
     tile_r, tile_c]`` summed over the rows) and broadcast-sum contractions
     (``torch.sum(a[tm, tk][:, :, None] * b[tk, tn][None, :, :], dim=1)``)
-    get these seeds too; seeds only add configs.
+    get these seeds too; seeds only add configs.  A loop that evaluates erf
+    or tanh (a GELU backward fused into the split's first kernel) also gets
+    a seed of half-width packets with packed fp32 math (``_polynomial_seed``).
     """
 
     name = "cute_split_column_reduction"
@@ -5535,7 +5545,85 @@ class CuteSplitColumnReductionHeuristic(_CuteColumnSeedHeuristic):
                         ),
                     )
                 )
+        polynomial = cls._polynomial_seed(env, device_ir, plan)
+        if polynomial is not None:
+            seeds.append(polynomial)
         return dedupe_configs(seeds)
+
+    # The device-loop targets whose fp32 forms are polynomial evaluations of
+    # a dozen or more instructions per element (``cute.math.erf``,
+    # ``cute.math.tanh``): the aten ops and the single nodes ``F.gelu``
+    # becomes in device code (``helion/language/_gelu_tanh_approx.py``).
+    _POLYNOMIAL_MATH: ClassVar[tuple[object, ...]] = (
+        torch.ops.aten.erf.default,
+        torch.ops.aten.tanh.default,
+        _gelu_erf,
+        _gelu_tanh_approx,
+    )
+
+    @classmethod
+    def _polynomial_seed(
+        cls,
+        env: CompileEnvironment,
+        device_ir: DeviceIR,
+        plan: tuple[int, int, torch.Tensor],
+    ) -> Config | None:
+        """A seed of half-width packets when the split's loop evaluates erf or
+        tanh, as a GELU backward fused into the split's first kernel does::
+
+            for tile_s, tile_c in hl.tile([splits, C]):
+                acc = hl.zeros([tile_s, tile_c], dtype=torch.float32)
+                for tile_r in hl.tile(rows):
+                    x = x_in[tile_s, tile_r, tile_c].to(torch.float32)
+                    y = g[tile_s, tile_r, tile_c] * (
+                        0.5 * (1 + torch.erf(x * 0.7071)) + x * pdf(x)
+                    )
+                    y_out[tile_s, tile_r, tile_c] = y.to(torch.bfloat16)
+                    acc = acc + torch.sum(y, -2)
+
+        Those polynomials, not memory, bound the kernel, and a 16-byte packet
+        holds twice the values each thread keeps live through them.  So: 8-byte
+        packets on 4 column threads, 8 row threads over chunks of 64 rows (a
+        warp per CTA), the column vector sunk and its row loop unrolled 8 deep,
+        and, where the kernel offers them, packed fp32 pairs
+        (``cute_pair_lane_math``), the tile sum combined once
+        (``cute_defer_tile_reduce``) and the stores in the accumulating pass
+        (``cute_accumulate_stores``).
+
+        Measured on GB300 (trace timer, one process) against each kernel's
+        searched config, better-benchmark split sums over 128-row splits:
+        sum_139a3020e8bf_58ff2bc5 ([64, 128, 3072] bf16, the case above) 33.4
+        us against 34.6 (its cold searches land at 33.2-35.5),
+        sum_139a3020e8bf_9448cee8 26.9 against 28.9, sum_139a3020e8bf_63ec809a
+        33.9 against 34.7, sum_281f473c7326_1b161b98 21.6 against 22.1 and the
+        tanh form sum_03788f40c42f_58ff2bc5 40.0 against 45.2.  On the first,
+        16-byte packets read 37.4 us, and the shape without packed pairs 38.3,
+        without the single combine 37.5.  Over splits of 256-512 rows, and for
+        sigmoid or exp loops, it loses (by 9-130%) to configs the search finds
+        itself; seeds only add configs.  Under ``fast_math`` erf and tanh take
+        their approximate forms (and packed pairs are not offered), so the
+        16-byte seeds stand alone.
+        """
+        if env.settings.fast_math:
+            return None
+        nest = _device_loop_reduction(env, device_ir)
+        if nest is None or not any(
+            node.target in cls._POLYNOMIAL_MATH for node in nest[2]
+        ):
+            return None
+        _column_block_id, reduced_block_id, source = plan
+        spec = env.config_spec
+        knobs: dict[str, object] = {}
+        if spec.cute_pair_lane_math_sites:
+            knobs["cute_pair_lane_math"] = True
+        if reduced_block_id in spec.cute_carried_tile_sum_blocks:
+            knobs["cute_defer_tile_reduce"] = True
+        if spec.cute_accumulate_store_sites:
+            knobs["cute_accumulate_stores"] = True
+        # SEED_DTYPES are 16- and 32-bit: a half packet holds 4 or 2.
+        half = _cute_tile_seed_vec_width_for_dtype(source.dtype) // 2
+        seeds = cls._shape_seeds(spec, plan, ((4, 8, 64),), vec=half, **knobs)
+        return seeds[0] if seeds else None
 
 
 class CuteGatheredSplitColumnHeuristic(_CuteColumnSeedHeuristic):

@@ -3735,6 +3735,172 @@ def test_split_column_reduction_seeds_two_splits_per_thread(cpu_only: None) -> N
         assert len(sunk) == 3, (shape, sunk)
 
 
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _split_gelu_backward_erf(
+    x: torch.Tensor, g: torch.Tensor, y: torch.Tensor
+) -> torch.Tensor:
+    """The exact GELU backward stored and summed over the rows of each split:
+    the first kernel of Inductor's split of the gradient's column sum, the
+    pointwise producer fused into it."""
+    splits, rows, n = x.size()
+    out = torch.empty([splits, n], dtype=torch.float32, device=x.device)
+    for tile_s, tile_c in hl.tile([splits, n]):
+        acc = hl.zeros([tile_s, tile_c], dtype=torch.float32)
+        for tile_r in hl.tile(rows):
+            v = x[tile_s, tile_r, tile_c].to(torch.float32)
+            cdf = 0.5 * (1.0 + torch.erf(v * 0.7071067811865476))
+            pdf = torch.exp(v * v * -0.5) * 0.3989422804014327
+            d = g[tile_s, tile_r, tile_c].to(torch.float32) * (cdf + v * pdf)
+            y[tile_s, tile_r, tile_c] = d.to(y.dtype)
+            acc = acc + torch.sum(d, dim=-2)
+        out[tile_s, tile_c] = acc
+    return out
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _split_gelu_backward_tanh(
+    x: torch.Tensor, g: torch.Tensor, y: torch.Tensor
+) -> torch.Tensor:
+    """The tanh-approximated GELU backward, stored and split-summed."""
+    splits, rows, n = x.size()
+    out = torch.empty([splits, n], dtype=torch.float32, device=x.device)
+    for tile_s, tile_c in hl.tile([splits, n]):
+        acc = hl.zeros([tile_s, tile_c], dtype=torch.float32)
+        for tile_r in hl.tile(rows):
+            v = x[tile_s, tile_r, tile_c].to(torch.float32)
+            t = torch.tanh(0.7978845608028654 * (v + 0.044715 * v * v * v))
+            inner = 0.7978845608028654 * (1.0 + 3.0 * 0.044715 * v * v)
+            dt = 0.5 * v * (1.0 - t * t) * inner
+            d = g[tile_s, tile_r, tile_c].to(torch.float32) * (0.5 * (1.0 + t) + dt)
+            y[tile_s, tile_r, tile_c] = d.to(y.dtype)
+            acc = acc + torch.sum(d, dim=-2)
+        out[tile_s, tile_c] = acc
+    return out
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _split_gelu_tanh_forward(
+    x: torch.Tensor, g: torch.Tensor, y: torch.Tensor
+) -> torch.Tensor:
+    """``F.gelu(x, approximate="tanh") * g`` stored and split-summed: device
+    code sees one ``_gelu_tanh_approx`` node, not ``aten.tanh``."""
+    splits, rows, n = x.size()
+    out = torch.empty([splits, n], dtype=torch.float32, device=x.device)
+    for tile_s, tile_c in hl.tile([splits, n]):
+        acc = hl.zeros([tile_s, tile_c], dtype=torch.float32)
+        for tile_r in hl.tile(rows):
+            v = torch.nn.functional.gelu(
+                x[tile_s, tile_r, tile_c].to(torch.float32), approximate="tanh"
+            )
+            d = v * g[tile_s, tile_r, tile_c].to(torch.float32)
+            y[tile_s, tile_r, tile_c] = d.to(y.dtype)
+            acc = acc + torch.sum(d, dim=-2)
+        out[tile_s, tile_c] = acc
+    return out
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _split_silu_backward(
+    x: torch.Tensor, g: torch.Tensor, y: torch.Tensor
+) -> torch.Tensor:
+    """The SiLU backward, stored and split-summed."""
+    splits, rows, n = x.size()
+    out = torch.empty([splits, n], dtype=torch.float32, device=x.device)
+    for tile_s, tile_c in hl.tile([splits, n]):
+        acc = hl.zeros([tile_s, tile_c], dtype=torch.float32)
+        for tile_r in hl.tile(rows):
+            v = x[tile_s, tile_r, tile_c].to(torch.float32)
+            s = torch.sigmoid(v)
+            d = g[tile_s, tile_r, tile_c].to(torch.float32) * s * (1.0 + v * (1.0 - s))
+            y[tile_s, tile_r, tile_c] = d.to(y.dtype)
+            acc = acc + torch.sum(d, dim=-2)
+        out[tile_s, tile_c] = acc
+    return out
+
+
+_POLYNOMIAL_SEED_KNOBS = {
+    "cute_pair_lane_math": True,
+    "cute_defer_tile_reduce": True,
+    "cute_accumulate_stores": True,
+}
+
+
+@pytest.mark.parametrize(
+    ("form", "dtype", "layout"),
+    [
+        # bf16 erf form over 128-row splits (the GELU backward of
+        # better-benchmark's sum_139a3020e8bf_58ff2bc5); 600 columns in
+        # 16-column tiles leave a partial one.
+        ("erf", torch.bfloat16, "contiguous"),
+        # The tanh form, fp32 (8-byte packets of two), over a split view of
+        # [rows, splits, n] storage (non-contiguous splits).
+        ("tanh", torch.float32, "permuted"),
+        # F.gelu's single-node tanh form, bf16.
+        ("gelu_fn", torch.bfloat16, "contiguous"),
+    ],
+)
+def test_erf_and_tanh_split_sums_get_the_half_width_seed(
+    cpu_only: None, form: str, dtype: torch.dtype, layout: str
+) -> None:
+    """A split column sum whose loop evaluates erf or tanh gets one more
+    seed: 8-byte packets on 4 column threads, 8 row threads over chunks of
+    64 rows, the column vector sunk, packed fp32 pairs, the tile sum combined
+    once and the stores in the accumulating pass."""
+    splits, rows, n = (64, 128, 600) if layout == "contiguous" else (16, 96, 256)
+    if layout == "contiguous":
+        x = torch.empty(splits, rows, n, dtype=dtype)
+    else:
+        x = torch.empty(rows, splits, n, dtype=dtype).permute(1, 0, 2)
+    kernel = {
+        "erf": _split_gelu_backward_erf,
+        "tanh": _split_gelu_backward_tanh,
+        "gelu_fn": _split_gelu_tanh_forward,
+    }[form]
+    bound = cpu_bind(kernel, (x, torch.empty_like(x), torch.empty_like(x)))
+    spec = bound.config_spec
+    half = 4 if dtype == torch.bfloat16 else 2
+    (seed,) = [
+        s
+        for s in spec.compiler_seed_configs
+        if s.config.get("cute_vector_widths") == [1, half, 1]
+    ]
+    assert seed.config["block_sizes"] == [1, 4 * half, 64]
+    assert seed.config["num_threads"] == [1, 4, 8]
+    normalized = spec.normalized_config(seed)
+    assert {k: normalized.get(k) for k in _POLYNOMIAL_SEED_KNOBS} == (
+        _POLYNOMIAL_SEED_KNOBS
+    )
+    assert "_vsink_vec" in bound.to_code(normalized)
+
+
+@pytest.mark.parametrize("case", ["sigmoid", "erf_fast_math"])
+def test_split_sums_without_polynomial_math_get_no_half_width_seed(
+    cpu_only: None, case: str
+) -> None:
+    """A SiLU backward's sigmoid is no polynomial of erf's or tanh's cost (it
+    loses with 8-byte packets), and under fast_math erf takes its
+    approximate form: those split sums keep the 16-byte seeds."""
+    x = torch.empty(64, 128, 384, dtype=torch.bfloat16)
+    kernel = (
+        _split_silu_backward
+        if case == "sigmoid"
+        else helion.kernel(
+            _split_gelu_backward_erf.fn,
+            backend="cute",
+            static_shapes=True,
+            autotune_effort="none",
+            fast_math=True,
+        )
+    )
+    bound = cpu_bind(kernel, (x, torch.empty_like(x), torch.empty_like(x)))
+    assert "cute_split_column_reduction" in bound.config_spec.autotuner_heuristics
+    seeds = bound.config_spec.compiler_seed_configs
+    assert seeds
+    assert all(s.config.get("cute_vector_widths", [1, 8, 1])[1] == 8 for s in seeds), [
+        s.config.get("cute_vector_widths") for s in seeds
+    ]
+
+
 # GPU numerics for grid vector-loop sinking (``cute_vloop_sink``).
 #
 # Partial tiles on both axes, the interleaved (rows above columns) thread
@@ -3828,6 +3994,27 @@ class TestCuteVloopSink(TestCase):
             with self.subTest(block_sizes=seed.config["block_sizes"]):
                 out = bound.compile_config(seed)(x, 600)
                 torch.testing.assert_close(out, expected, rtol=1e-4, atol=1e-3)
+
+    def test_half_width_seed_of_a_gelu_backward_split_sum(self) -> None:
+        """The erf form's half-width seed (8-byte packets, packed fp32 pairs,
+        the tile sum combined once, the stores in the accumulating pass)
+        stores and sums what eager computes, over 600 columns in 16-column
+        tiles (a partial last tile)."""
+        x = torch.randn(32, 128, 600, device=DEVICE, dtype=torch.bfloat16)
+        g = torch.randn_like(x)
+        y = torch.empty_like(x)
+        bound = _split_gelu_backward_erf.bind((x, g, y))
+        (seed,) = [
+            s
+            for s in bound.config_spec.compiler_seed_configs
+            if s.config.get("cute_vector_widths") == [1, 4, 1]
+        ]
+        out = bound.compile_config(seed)(x, g, y)
+        v = x.float()
+        cdf = 0.5 * (1.0 + torch.erf(v * 0.7071067811865476))
+        d = g.float() * (cdf + v * torch.exp(v * v * -0.5) * 0.3989422804014327)
+        torch.testing.assert_close(y, d.to(y.dtype), rtol=1e-2, atol=1e-2)
+        torch.testing.assert_close(out, d.sum(1), rtol=1e-4, atol=1e-3)
 
     def test_explicit_eviction_policies_load_the_unhinted_bits(self) -> None:
         """The spellings a predicated packet had no PTX form for (a KeyError
