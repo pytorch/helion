@@ -38,6 +38,7 @@ import torch
 
 from ... import exc
 from ._constants import MAX_THREADGROUP_MEMORY_BYTES
+from .c10_helpers import c10_source
 from .fma_fusion import fuse_multiply_adds
 from .fragment_mma import FRAGMENT_LOWERING
 from .fragment_mma import LANE
@@ -57,7 +58,6 @@ from .msl_ast_walker import EmitState
 from .msl_ast_walker import _emit_stmts
 from .msl_ast_walker import select_masked_loads
 from .msl_reduction import GROUP_PATHS
-from .msl_reduction import REDUCTION_INCLUDES
 from .msl_reduction import REDUCTION_NAMESPACE
 from .msl_reduction import REDUCTION_PREAMBLE
 from .operand_elements import SIMDGROUP
@@ -267,10 +267,13 @@ def _generate_msl(
     body_stmts = jam_lanes_into_loops(unroll_lane_folds(body_stmts, names_read))
     msl_parts: list[str] = [
         "#include <metal_stdlib>",
-        "#include <c10/metal/utils.h>",
-        "#include <c10/metal/special_math.h>",
+        # The c10 helpers the kernel uses, once the rest is known
+        # (``c10_helpers``).
+        "",
         "using namespace metal;",
     ]
+    c10_at = 1
+    reduction_at = preamble_at = None
     referenced = {
         node.id
         for stmt in body_stmts
@@ -310,8 +313,8 @@ def _generate_msl(
     # memory would take writes from all of them.
     assert split == 1 or not (uses_reductions or threadgroup_buffers)
     if uses_reductions:
-        msl_parts.extend(REDUCTION_INCLUDES)
-        msl_parts.extend(("", REDUCTION_PREAMBLE))
+        reduction_at, preamble_at = len(msl_parts), len(msl_parts) + 2
+        msl_parts.extend(("", "", REDUCTION_PREAMBLE))
     uses_mpp, uses_fragments, uses_registers = _matmul_kinds(body_stmts)
     if uses_fragments:
         msl_parts.append("#include <metal_simdgroup_matrix>")
@@ -470,7 +473,16 @@ def _generate_msl(
     ]
 
     msl_parts.append("}")
-    return "\n".join(msl_parts)
+    slots = (c10_at, reduction_at, preamble_at)
+    c10_lines, reduction_lines = c10_source(
+        "\n".join(p for i, p in enumerate(msl_parts) if i not in slots),
+        uses_reductions,
+    )
+    parts: list[str | None] = [*msl_parts]
+    parts[c10_at] = "\n".join(c10_lines) if c10_lines else None
+    if reduction_at is not None:
+        parts[reduction_at] = "\n".join(reduction_lines) if reduction_lines else None
+    return "\n".join(p for p in parts if p is not None)
 
 
 def _constexpr_decl(name: str, value: object) -> str:

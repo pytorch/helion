@@ -7,7 +7,8 @@ AST, so no op needs rewriting into Python syntax.
 
 Overrides:
 - ``_special_unary`` / ``_special_binary``: skip the ``V.kernel.headers``
-  dependency (Helion includes the c10/metal headers unconditionally).
+  dependency (a kernel that calls a c10 special function takes the c10/metal
+  headers, ``c10_helpers``).
 - ``exp`` / ``truediv``: under the kernel's ``fast_math`` setting, take
   ``metal::fast::exp`` and ``metal::fast::divide``, the operations the Triton
   backend makes approximate under the same setting.
@@ -41,8 +42,8 @@ class MetalOverrides(_InductorMetalOverrides):
     """
 
     def _special_unary(self, a: object, name: str) -> str:
-        # Skip V.kernel.headers.add() — Helion includes c10/metal headers
-        # unconditionally in the MSL preamble.
+        # Skip V.kernel.headers.add(): the kernel takes the c10/metal headers
+        # for the call (``c10_helpers``).
         return f"c10::metal::{name}({a})"
 
     def _special_binary(self, a: object, b: object, name: str) -> str:

@@ -1,14 +1,15 @@
 """MSL device-side reduction preamble for the Metal backend.
 
-The heavy lifting is done by Inductor's ``c10/metal/reduction_utils.h``, which
-already ships with PyTorch and is reachable from ``torch.mps.compile_shader``
-(it embeds the ``c10`` headers).  It provides, for every dtype Helion supports:
+The heavy lifting is done by c10's SIMD-group reductions: Helion's copies of
+them (``c10_helpers``), or Inductor's ``c10/metal/reduction_utils.h``, which
+ships with PyTorch and is reachable from ``torch.mps.compile_shader``, for a
+kernel that takes the headers.  They provide:
 
 - ``c10::metal::simd_{sum,prod,max,min}`` -- 32-lane SIMD-group reductions with
-  bfloat upcasting, a ``long`` fallback (Metal has no 64-bit SIMD reduction),
-  and NaN propagation for floating-point min/max.
-- ``c10::metal::simd_arg{min,max}(value, index)`` -- ``simd_ballot``-based
-  index selection returning a ``pair``.
+  bfloat upcasting, a ``long`` fallback in the headers (Metal has no 64-bit
+  SIMD reduction), and NaN propagation for floating-point min/max.
+- ``c10::metal::simd_arg{min,max}(value, index)`` (the headers) --
+  ``simd_ballot``-based index selection returning a ``pair``.
 
 This module wraps those helpers for Helion's needs: leading barriers make
 threadgroup scratch reusable inside device loops, segmented butterflies isolate
@@ -24,8 +25,16 @@ partially populated SIMD group.
 
 from __future__ import annotations
 
-#: ``#include`` lines added to the MSL preamble when a kernel reduces.
+#: ``#include`` lines added to the MSL preamble when a kernel reduces and
+#: takes torch's c10 headers (``c10_helpers``).
 REDUCTION_INCLUDES: tuple[str, ...] = ("#include <c10/metal/reduction_utils.h>",)
+
+#: The ``c10::metal`` helpers ``REDUCTION_PREAMBLE`` calls: the SIMD-group
+#: reductions its macros paste (``simd_##NAME``) for sum, prod, max and min,
+#: ``max``, ``min`` and ``simdgroup_size``.
+REDUCTION_C10 = frozenset(
+    {"simd_sum", "simd_prod", "simd_max", "simd_min", "max", "min", "simdgroup_size"}
+)
 
 #: Reduction kinds that map onto a ``c10::metal::`` primitive.
 SUPPORTED_REDUCTIONS = frozenset({"sum", "prod", "max", "min"})
