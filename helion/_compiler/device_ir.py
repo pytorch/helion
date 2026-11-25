@@ -88,6 +88,8 @@ from .matmul_utils import torch_matmul_replacement
 from .merge_reduction_dims import _MERGE_OPS
 from .merge_reduction_dims import chain_reduction_dims
 from .merge_reduction_dims import merge_reduction_dims
+from .mxfp8 import find_packed_mxfp8
+from .mxfp8 import native_packed_mxfp8_target
 from .node_masking import defer_pallas_load_masks
 from .node_masking import mask_loop_carries
 from .node_masking import remove_unnecessary_masking
@@ -1242,6 +1244,9 @@ class DeviceIR:
         self.task_families: list[TaskFamily] = []
         self.grid_block_ids: list[list[int]] = []
         self.noncanonical_task_origin_block_ids: set[int] = set()
+        # Root-loop axes among those whose begin and step are integer literals
+        # in the int32 range: their indices, ``begin + pid * step``, are int32.
+        self.int32_literal_task_origin_block_ids: set[int] = set()
         # A CuTe codegen view can restrict reduction strategies to one launch.
         # Axis identities and configuration slots remain owned by the full IR.
         self.codegen_active_block_ids: frozenset[int] | None = None
@@ -4017,34 +4022,26 @@ def _literal_sequence_is(
     )
 
 
-def _root_loop_has_canonical_task_origin(
+def _root_loop_begin_and_step(
     iter_expr: ast.expr,
-    rank: int,
-    *,
-    supports_step: bool,
-) -> bool:
-    """Return whether local PIDs map to zero-based, unit-stride coordinates."""
+) -> tuple[ast.expr | None, ast.expr | None] | None:
+    """The begin and step expressions a root loop's ``hl.grid``/``hl.tile``
+    call spells out (None: the default zero begin or unit step), or None
+    when they are not spelled out."""
     if not isinstance(iter_expr, ast.Call) or not iter_expr.args:
-        return False
+        return None
     if any(isinstance(arg, ast.Starred) for arg in iter_expr.args) or any(
         keyword.arg is None for keyword in iter_expr.keywords
     ):
         # ``hl.tile(*ranges)`` or ``hl.grid(n, **options)``: the begin and
         # the step are not spelled out.
-        return False
+        return None
     if len(iter_expr.args) == 1 or (
-        len(iter_expr.args) >= 2
-        and isinstance(iter_expr.args[1], ast.Constant)
-        and iter_expr.args[1].value is None
+        isinstance(iter_expr.args[1], ast.Constant) and iter_expr.args[1].value is None
     ):
-        zero_start = True
+        begin = None
     else:
-        zero_start = _literal_sequence_is(iter_expr.args[0], rank=rank, value=0)
-    if not zero_start:
-        return False
-    if not supports_step:
-        return True
-
+        begin = iter_expr.args[0]
     step = (
         iter_expr.args[2]
         if len(iter_expr.args) >= 3
@@ -4053,7 +4050,48 @@ def _root_loop_has_canonical_task_origin(
             None,
         )
     )
+    return begin, step
+
+
+def _root_loop_has_canonical_task_origin(
+    iter_expr: ast.expr,
+    rank: int,
+    *,
+    supports_step: bool,
+) -> bool:
+    """Return whether local PIDs map to zero-based, unit-stride coordinates."""
+    bounds = _root_loop_begin_and_step(iter_expr)
+    if bounds is None:
+        return False
+    begin, step = bounds
+    if begin is not None and not _literal_sequence_is(begin, rank=rank, value=0):
+        return False
+    if not supports_step:
+        return True
     return step is None or _literal_sequence_is(step, rank=rank, value=1)
+
+
+def _root_loop_int32_literal_axes(iter_expr: ast.expr, rank: int) -> list[int]:
+    """The axes of a root loop whose begin and step are integer literals in
+    the int32 range (or the defaults)."""
+    bounds = _root_loop_begin_and_step(iter_expr)
+    if bounds is None:
+        return []
+
+    def literal(expr: ast.expr | None, axis: int) -> bool:
+        if expr is None:
+            return True
+        assert isinstance(expr, ExtendedAST)
+        info = expr._type_info
+        if isinstance(info, SequenceType):
+            items = info.unpack()
+            info = items[axis] if len(items) == rank else None
+        if not isinstance(info, TypeInfo) or not info.is_literal():
+            return False
+        value = info.as_literal()
+        return type(value) is int and -(2**31) <= value < 2**31
+
+    return [axis for axis in range(rank) if all(literal(expr, axis) for expr in bounds)]
 
 
 class WalkHostAST(NodeVisitor):
@@ -4104,6 +4142,10 @@ class WalkHostAST(NodeVisitor):
             )
             if not canonical_origin:
                 self.device_ir.noncanonical_task_origin_block_ids.update(block_ids)
+                self.device_ir.int32_literal_task_origin_block_ids.update(
+                    block_ids[axis]
+                    for axis in _root_loop_int32_literal_axes(node.iter, len(block_ids))
+                )
             from .tile_dependency import TaskAxis
             from .tile_dependency import TaskFamily
 
@@ -4385,6 +4427,16 @@ def _register_tensor_descriptor_layout_guards(
                 atomic_op_index=slot,
                 has_derived_block_extent=has_derived_block_extent(node),
             )
+    # The native packed MXFP8 lowering loads its dot's operands and scale
+    # words through host descriptors whatever ``indexing`` says.  This is
+    # ``native_packed_mxfp8_kernel``, keeping the match.
+    if (
+        native_packed_mxfp8_target(env)
+        and (found := find_packed_mxfp8(device_ir.graphs)) is not None
+    ):
+        for operand in found[1]:
+            for tensor in (operand.tensor, operand.scale.tensor):
+                env.register_native_packed_mxfp8_guard(tensor)
 
 
 def _root_phases(phases: list[KernelPhase], root_count: int) -> tuple[int, ...]:

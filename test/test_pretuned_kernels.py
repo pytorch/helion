@@ -1194,6 +1194,13 @@ class TestPretunedKernelsCorrectness(TestCase):
             self.skipTest("flash_mla correctness requires FlashInfer.")
         module.correctness_check()
 
+    @skipIfCute("mxfp8_gemm is pinned to backend='triton'; see mxfp8_gemm_cute")
+    def test_mxfp8_gemm(self):
+        if not is_cuda() or torch.cuda.get_device_capability()[0] != 10:
+            self.skipTest("mxfp8_gemm is pretuned for NVIDIA SM100.")
+        module = _import_pretuned_kernel_module("mxfp8_gemm")
+        module.correctness_check()
+
     @pytest.mark.timeout(900)
     @skipIfCute(_PINNED_TO_TRITON)
     def test_deepseek_v3_moe_nvfp4(self):
@@ -1231,6 +1238,23 @@ class TestPretunedKernelsCorrectness(TestCase):
         module = _import_pretuned_kernel_module("deepseek_v3_moe_nvfp4_verify")
         for tokens in _VERIFY_TOKENS:
             module.correctness_check(tokens)
+
+    def test_mxfp8_reference_decodes_e8m0(self) -> None:
+        """The MXFP8 GEMMs' reference reads a scale byte e as 2**(e - 127),
+        and 255 as NaN (E8M0)."""
+        module = _import_pretuned_kernel_module("mxfp8_gemm")
+        ones = torch.ones(1, 32, dtype=torch.float8_e4m3fn)
+        for byte, expected in ((126, 16.0), (128, 64.0), (255, math.nan)):
+            with self.subTest(byte=byte):
+                result = module.reference_mxfp8_gemm(
+                    ones,
+                    ones,
+                    torch.tensor([[byte]], dtype=torch.uint8),
+                    torch.tensor([[127]], dtype=torch.uint8),
+                )
+                torch.testing.assert_close(
+                    result.float(), torch.tensor([[expected]]), equal_nan=True
+                )
 
 
 @onlyBackends(["cute"])
@@ -1276,9 +1300,29 @@ class TestPretunedCuteCodegen(TestCase):
     def test_interleaved_swiglu(self) -> None:
         self._run_tcgen05_fragment_epilogue_correctness("interleaved_swiglu")
 
-    def test_tcgen05_fragment_epilogues_are_registered_for_b200(self) -> None:
+    def test_mxfp8_gemm_cute(self) -> None:
+        if not is_cuda() or torch.cuda.get_device_capability()[0] != 10:
+            self.skipTest("mxfp8_gemm_cute is pretuned for NVIDIA SM100.")
+        module = _import_pretuned_kernel_module("mxfp8_gemm_cute")
+        module.correctness_check()
+
+    def test_mxfp8_gemm_cute_untuned_small_k(self) -> None:
+        """An untuned shape takes the nearest tuned config, which loads its
+        scales through a TMA that cannot map the one scale word per row of
+        a K of at most 128: such a shape gets the config without it."""
+        if not is_cuda() or torch.cuda.get_device_capability()[0] != 10:
+            self.skipTest("mxfp8_gemm_cute is pretuned for NVIDIA SM100.")
+        module = _import_pretuned_kernel_module("mxfp8_gemm_cute")
+        module.correctness_check([(128, 256, 128), (8, 512, 96)])
+
+    def test_b200_kernels_are_registered(self) -> None:
         runner = _import_pretuned_runner()
-        for name in ("projection_rotary", "interleaved_swiglu"):
+        for name in (
+            "projection_rotary",
+            "interleaved_swiglu",
+            "mxfp8_gemm",
+            "mxfp8_gemm_cute",
+        ):
             with self.subTest(name=name):
                 self.assertIn(name, runner.KERNELS)
                 self.assertEqual(runner._supported_hardware(name), {"b200"})

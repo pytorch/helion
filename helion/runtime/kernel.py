@@ -3791,6 +3791,9 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
             None if policy_type is None else policy_type.from_settings(kernel.settings)
         )
 
+        # Whether Inductor renders and tunes this binding under its graph's
+        # facts (``inductor_call_facts``): set from the traced kernel below.
+        self.reads_inductor_call_facts = self._env.backend.binds_inductor_call_facts
         if is_ref_mode_enabled(self.kernel.settings):
             self.fake_args = []  # type: ignore[assignment]
             self.host_function = None  # type: ignore[assignment]
@@ -3859,6 +3862,11 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
                     config = self.env.config_spec.default_config()
                     self.maybe_log_repro(log.warning, args, config=config)
                     raise
+                self.reads_inductor_call_facts = (
+                    self.env.backend.reads_inductor_call_facts(
+                        self.env, self.host_function.device_ir
+                    )
+                )
 
                 if self._cache_managed:
                     if any(
@@ -4892,11 +4900,15 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
                 return CUDA_TENSOR_DESCRIPTOR_MAX_BLOCK_SIZE
             return min(cap, CUDA_TENSOR_DESCRIPTOR_MAX_BLOCK_SIZE)
 
+        # A guard the native packed MXFP8 lowering registers
+        # (``register_native_packed_mxfp8_guard``) is active whatever
+        # ``indexing`` says.
         for source, guard in sorted(
             tensor_descriptor_layout_guards.items(),
             key=lambda item: repr(item[0]),
         ):
-            if not guard_is_active(guard):
+            indexed = guard_is_active(guard)
+            if not indexed and not guard.native_packed_mxfp8:
                 continue
             extract_tensor = make_extractor(source)
 
@@ -4907,7 +4919,11 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
                 ] = extract_tensor,
                 _ndim: int = guard.ndim,
                 _element_size: int = guard.element_size,
-                _extent_cap: int | None = descriptor_extent_cap(guard),
+                # Only the native lowering reads this guard: it keys the
+                # classes empty, one and more, not every block size's.
+                _extent_cap: int | None = (
+                    descriptor_extent_cap(guard) if indexed else 2
+                ),
             ) -> Hashable:
                 tensor = cast("torch.Tensor", _extract_tensor(args))
                 if tensor.ndim != _ndim:
@@ -4941,10 +4957,13 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
         ):
             # Prepared metadata guards do not cover base pointers: key one when a
             # candidate config reads the input (``view``: a view derived from
-            # it) through a descriptor, or gives some prefetch the box form.
-            descriptor = bool(
-                guard.memory_op_indices or guard.atomic_op_indices
-            ) and guard_is_active(guard)
+            # it) through a descriptor, when the native packed MXFP8 lowering
+            # does whatever ``indexing`` says, or when a candidate config gives
+            # some prefetch the box form.
+            descriptor = (
+                bool(guard.memory_op_indices or guard.atomic_op_indices)
+                and guard_is_active(guard)
+            ) or guard.native_packed_mxfp8
             prefetch = guard.prefetch and (
                 candidates is None
                 or any(
