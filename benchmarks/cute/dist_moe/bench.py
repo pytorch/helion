@@ -1,7 +1,8 @@
 """Compare a separate capacity check with one fused into the Dist-MoE route layout.
 
-Run `python benchmarks/cute/dist_moe/bench.py` on one CUDA GPU. Both logical
-ranks run sequentially. Each CUDA graph contains one layout call and its check.
+From the checkout root, run `PYTHONPATH=. python benchmarks/cute/dist_moe/bench.py`
+on one CUDA GPU. Each graph contains one layout call and its check. Timings include
+any gaps between graph launches issued from Python.
 """
 
 from __future__ import annotations
@@ -27,11 +28,10 @@ def inputs(fixture: str) -> tuple[torch.Tensor, torch.Tensor]:
         counts[:, ::2] = 0
         counts[:, 1::2] = 32
     elif fixture == "changed":
+        # Move routes between ranks so their padded receive totals differ.
         delta = torch.arange(32, dtype=torch.int32) % 5 + 1
-        counts[:, 0] += delta
-        counts[:, 1] -= delta
-        counts[:, 6] -= 2 * delta
-        counts[:, 7] += 2 * delta
+        counts[:, :2] += delta[:, None]
+        counts[:, 7] -= 2 * delta
     elif fixture == "empty":
         counts.zero_()
     elif fixture != "balanced":
@@ -134,28 +134,40 @@ def main() -> None:
     if args.windows < 2 or args.windows % 2 or args.replays < 1:
         parser.error("Use an even number of windows >= 2 and at least one replay.")
 
-    for rank in range(WORLD):
-        counts, valid = (t.cuda() for t in inputs("balanced"))
-        separate = capture(counts, valid, rank, fused=False)
-        fused = capture(counts, valid, rank, fused=True)
-        for fixture in ("balanced", "changed", "concentrated", "empty"):
-            cpu_counts, cpu_valid = inputs(fixture)
+    counts, valid = (t.cuda() for t in inputs("balanced"))
+    ranks = [
+        (
+            capture(counts, valid, rank, fused=False),
+            capture(counts, valid, rank, fused=True),
+        )
+        for rank in range(WORLD)
+    ]
+    for fixture in ("balanced", "changed", "concentrated", "empty"):
+        cpu_counts, cpu_valid = inputs(fixture)
+        counts.copy_(cpu_counts)
+        valid.copy_(cpu_valid)
+        for rank, programs in enumerate(ranks):
             expected = reference(cpu_counts, cpu_valid, rank)
-            counts.copy_(cpu_counts)
-            valid.copy_(cpu_valid)
-            for program in (separate, fused):
+            for program in programs:
                 for out in program.outputs:
                     out.fill_(False if out.dtype == torch.bool else -2)
                 program.graph.replay()
                 for actual, want in zip(program.outputs, expected, strict=True):
                     torch.testing.assert_close(actual.cpu(), want, rtol=0, atol=0)
-            if not args.check_only and fixture in ("balanced", "concentrated"):
-                a, b, delta = time_pair(separate, fused, args.windows, args.replays)
-                print(
-                    f"rank={rank} {fixture}: separate={a:.3f} us, fused={b:.3f} us; "
-                    f"median paired fused - separate={delta:+.3f} us (negative favors fused)"
-                )
-        print(f"rank={rank}: both arms matched the CPU reference on all four fixtures")
+    print("Both arms matched the CPU reference on both ranks and all four fixtures")
+    if args.check_only:
+        return
+
+    for rank, (separate, fused) in enumerate(ranks):
+        for fixture in ("balanced", "concentrated"):
+            cpu_counts, cpu_valid = inputs(fixture)
+            counts.copy_(cpu_counts)
+            valid.copy_(cpu_valid)
+            a, b, delta = time_pair(separate, fused, args.windows, args.replays)
+            print(
+                f"rank={rank} {fixture}: separate={a:.3f} us, fused={b:.3f} us; "
+                f"median paired fused - separate={delta:+.3f} us (negative favors fused)"
+            )
 
 
 if __name__ == "__main__":
