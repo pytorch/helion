@@ -37,6 +37,7 @@ from .compile_environment import _has_unbacked
 from .compile_environment import _symint_free_symbols
 from .compile_environment import _symint_sympy_expr
 from .compile_environment import _to_sympy
+from .fx_side_effects import is_effectful_void_op
 from .fx_side_effects import is_impure_node
 from .indexing_strategy import _contiguous_integer_tensor_index
 from .indexing_strategy import is_block_size_index
@@ -236,7 +237,7 @@ TENSOR_ROUTING_OPS = (
 
 # Ops that keep a prefetching root's loads ordered although they touch no
 # memory: any loop (conservatively: its loads may decide the trip count), a
-# print or breakpoint that shows them.
+# print or breakpoint that shows them, or an assertion that checks them.
 _HINT_BREAKING_OPS = (
     _tracing_ops._for_loop,
     _tracing_ops._for_loop_step,
@@ -2164,6 +2165,7 @@ class DeviceIRAnalysis:
                 for node in graph_analysis.nodes:
                     if node.op == "call_function" and (
                         node.target in _HINT_BREAKING_OPS
+                        or is_effectful_void_op(node)
                         or _may_access_memory_unseen(node, host.compiler_state)
                     ):
                         effectful.update(owners)

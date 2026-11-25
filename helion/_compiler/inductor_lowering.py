@@ -150,7 +150,8 @@ def _functional_twins() -> dict[OpOverload, OpOverload]:
     buffer, which fails the ``ComputedBuffer`` check in
     ``prepare_node_lowering`` since PyTorch nightly stopped swinging a realized
     buffer's data pointer onto the new value.  Only pairs Inductor can lower on
-    both sides are mapped; anything else keeps its original lowering.
+    both sides and with an SSA result are mapped. A void mutation has no
+    result for the functional twin to replace.
     """
     from torch._inductor.lowering import lowerings
 
@@ -161,7 +162,7 @@ def _functional_twins() -> dict[OpOverload, OpOverload]:
     }
     twins: dict[OpOverload, OpOverload] = {}
     for (name, overload), op in by_name.items():
-        if name.endswith("_") and not name.endswith("__"):
+        if op._schema.returns and name.endswith("_") and not name.endswith("__"):
             twin = by_name.get((name[:-1], overload))
             if twin is not None:
                 twins[op] = twin
@@ -285,6 +286,15 @@ def prepare_node_lowering(
         else:
             node.meta["lowering"] = aten_lowering_dispatch[node.target](node)
             return
+
+    if (
+        isinstance(node.target, torch._ops.OpOverload)
+        and not node.target._schema.returns
+    ):
+        # Helion's Inductor path below needs result metadata and an output buffer.
+        raise CompileEnvironment.current().backend.unsupported(
+            f"{node.target} in device code"
+        )
 
     if isinstance(
         val := node.meta["val"],

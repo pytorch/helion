@@ -4,12 +4,24 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+import torch
+
 if TYPE_CHECKING:
     from torch.fx import Node
 
 
+def is_effectful_void_op(node: Node) -> bool:
+    """A backend may decompose an assertion to its own effect-only operator."""
+    return (
+        node.op == "call_function"
+        and isinstance(node.target, torch._ops.OpOverload)
+        and not node.target._schema.returns
+        and is_impure_node(node, impure_random=False)
+    )
+
+
 def is_impure_node(node: Node, impure_random: bool = True) -> bool:
-    """Preserve declared inline-asm effects during DCE and graph scheduling.
+    """Preserve device effects during DCE and graph scheduling.
 
     FX recognizes function-level effects, but inline assembly declares its
     effects per call. Helion API tracing normalizes arguments to positional
@@ -19,6 +31,14 @@ def is_impure_node(node: Node, impure_random: bool = True) -> bool:
     # importing; resolve the API target only when analyzing a completed graph.
     from ..language.inline_asm_ops import inline_asm_elementwise
 
-    if node.op == "call_function" and node.target is inline_asm_elementwise:
-        return node.args[4] is not True
+    if node.op == "call_function":
+        if node.target is inline_asm_elementwise:
+            return node.args[4] is not True
+        # These ATen checks have no returned tensor. FX marks the assertion
+        # overload with a message as effectful, but not either of these.
+        if node.target in (
+            torch.ops.aten._assert_async.default,
+            torch.ops.aten._validate_compressed_sparse_indices.default,
+        ):
+            return True
     return node.is_impure(impure_random=impure_random)
