@@ -3088,6 +3088,18 @@ def test_multi_gpu_default_count():
     )
 
 
+def _write_pid_source(path: Path) -> str:
+    """Statements that write the running process's pid to ``path`` for a
+    reader that waits for ``path`` to exist: through a file renamed into
+    place, as ``write_text`` creates ``path`` before it writes the pid, and
+    a process retired in between leaves it empty. Needs ``os`` and ``Path``."""
+    temp = path.with_name(f"{path.name}.tmp")
+    return (
+        f"Path({str(temp)!r}).write_text(str(os.getpid())); "
+        f"os.replace({str(temp)!r}, {str(path)!r})"
+    )
+
+
 @pytest.mark.slow
 @pytest.mark.skipif(sys.platform != "linux", reason="Linux per-job orphan adoption")
 @pytest.mark.parametrize("mode", ["exit", "detached", "cancel", "exception"])
@@ -3106,7 +3118,7 @@ import os, signal, time
 from pathlib import Path
 signal.signal(signal.SIGTERM, signal.SIG_IGN)
 parent = os.getppid()
-Path({str(child_file)!r}).write_text(str(os.getpid()))
+{_write_pid_source(child_file)}
 deadline = time.monotonic() + 20
 while not Path({str(release)!r}).exists() and time.monotonic() < deadline:
     if not Path(f'/proc/{{parent}}').exists():
@@ -3285,7 +3297,7 @@ while not Path({str(child)!r}).exists():
     second = f"""
 import os, time
 from pathlib import Path
-Path({str(child)!r}).write_text(str(os.getpid()))
+{_write_pid_source(child)}
 deadline = time.monotonic() + 20
 while not Path({str(release)!r}).exists() and time.monotonic() < deadline:
     time.sleep(0.01)
@@ -3342,7 +3354,7 @@ def test_runner_log_close_failure_retires_started_job(
     job_log = tmp_path / "close-error.log"
     source = (
         "import os,time; from pathlib import Path; "
-        f"Path({str(pid_file)!r}).write_text(str(os.getpid())); time.sleep(30)"
+        f"{_write_pid_source(pid_file)}; time.sleep(30)"
     )
     job = run_tests.Job(
         "close-error",
