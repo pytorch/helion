@@ -1683,6 +1683,27 @@ def max_ab_stages_that_fit(
     return max(1, min(max_from_budget, hard_cap))
 
 
+def pair_ab_stage_fit(
+    state: CuteTcgen05Config,
+    config: dict[str, object],
+    *,
+    bm: int,
+    bn: int,
+    bk: int,
+    cluster_m: int,
+) -> int:
+    """Deepest AB ring of an explicit CTA pair: the pair's complete
+    allocation proof, which the direct-entry validator enforces
+    (``_paired_pipeline_stage_limit``), and the coarse per-stage model
+    (``max_ab_stages_that_fit``) where the proof does not apply. The
+    coarse model leaves a stage of the 128x128 pair unused: bf16
+    1000x1024x4096 runs 13 stages at 8.3 us, 12 at 8.5."""
+    proof = _paired_pipeline_stage_limit(state, config)
+    if proof is not None:
+        return proof
+    return max_ab_stages_that_fit(state, bm=bm, bn=bn, bk=bk, cluster_m=cluster_m)
+
+
 def epi_tma_ab_stage_limit(
     state: CuteTcgen05Config, config: dict[str, object]
 ) -> int | None:

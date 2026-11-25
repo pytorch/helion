@@ -1237,9 +1237,11 @@ def _one_wave_seed_configs(state: CuteTcgen05Config) -> list[Config]:
     two-CTA tile whose one-tile-per-CTA grid comes closest to the SM
     count without exceeding it, at the narrowest K step the search
     admits, with the deepest AB ring that fits the SMEM budget (no deeper
-    than the K loop).  fp16 1024^3 with a bias epilogue: the seeded
-    2-CTA 256x64x64 ring of 9 runs 6.24 us vs 7.8 for the one-CTA
-    128x64x128 winner the unseeded search found (cuBLAS 5.6).
+    than the K loop), and the 128-row CTA pair where its grid fits one
+    wave with as many CTAs (``repair.plain_pair128_admitted``).  fp16
+    1024^3 with a bias epilogue: the seeded 2-CTA 256x64x64 ring of 9
+    runs 6.24 us vs 7.8 for the one-CTA 128x64x128 winner the unseeded
+    search found (cuBLAS 5.6).
     """
     extents = state.matmul_compile_time_static_extents
     fragments = facts._matmul_block_fragments(state)
@@ -1279,20 +1281,18 @@ def _one_wave_seed_configs(state: CuteTcgen05Config) -> list[Config]:
     )
     seeds: list[Config] = []
 
-    def emit(bm: int, bn: int, cluster_m: int, cluster_n: int) -> None:
+    def emit(
+        bm: int, bn: int, cluster_m: int, cluster_n: int, cta_group: str = "auto"
+    ) -> None:
         block_sizes = facts._matmul_seed_block_sizes(state, bm=bm, bn=bn, bk=bk)
         assert block_sizes is not None
-        fit = smem.max_ab_stages_that_fit(
-            state, bm=bm, bn=bn, bk=bk, cluster_m=cluster_m
-        )
-        stages = max(1, min(k // bk, fit if fit > 0 else 2))
         seed_config: dict[str, Any] = {
             "block_sizes": block_sizes,
             "pid_type": "persistent_interleaved",
-            "tcgen05_cta_group": "auto",
+            "tcgen05_cta_group": cta_group,
             "tcgen05_cluster_m": cluster_m,
             "tcgen05_cluster_n": cluster_n,
-            "tcgen05_ab_stages": stages,
+            "tcgen05_ab_stages": 2,  # set below, from the ring that fits
             "tcgen05_c_stages": 2,
             "tcgen05_acc_stages": 2,
             "l2_groupings": [1],
@@ -1302,6 +1302,17 @@ def _one_wave_seed_configs(state: CuteTcgen05Config) -> list[Config]:
             "tcgen05_layout_strategy": "default",
             **dict.fromkeys(TCGEN05_LAYOUT_OVERRIDES_KEYS),
         }
+        fit = (
+            smem.pair_ab_stage_fit(
+                state, seed_config, bm=bm, bn=bn, bk=bk, cluster_m=cluster_m
+            )
+            if cta_group == "two"
+            else smem.max_ab_stages_that_fit(
+                state, bm=bm, bn=bn, bk=bk, cluster_m=cluster_m
+            )
+        )
+        stages = max(1, min(k // bk, fit if fit > 0 else 2))
+        seed_config["tcgen05_ab_stages"] = stages
         if rowvec_aux_only and smem.rowvec_aux_stage_fits(
             state,
             bm=bm,
@@ -1342,14 +1353,14 @@ def _one_wave_seed_configs(state: CuteTcgen05Config) -> list[Config]:
         constraints is not None
         and constraints.allow_one_wave_tiles
         and repair.cluster_m2_bk_is_valid(bk, constraints)
-        and m % TCGEN05_TWO_CTA_BLOCK_M == 0
+        and (m % TCGEN05_TWO_CTA_BLOCK_M == 0 or state.output_edge_persistent_admitted)
         and in_range(bm_fragment, TCGEN05_TWO_CTA_BLOCK_M)
     ):
         two_cta: tuple[int, int] | None = None
         for bn in TCGEN05_TWO_CTA_ONE_WAVE_BLOCK_NS:
             if n % bn or not in_range(bn_fragment, bn):
                 continue
-            ctas = batch * (m // TCGEN05_TWO_CTA_BLOCK_M) * (n // bn) * 2
+            ctas = batch * -(-m // TCGEN05_TWO_CTA_BLOCK_M) * (n // bn) * 2
             if ctas > sm_count:
                 continue
             if two_cta is None or ctas > two_cta[0]:
@@ -1358,6 +1369,22 @@ def _one_wave_seed_configs(state: CuteTcgen05Config) -> list[Config]:
             emit(TCGEN05_TWO_CTA_BLOCK_M, two_cta[1], 2, 1)
             if repair._one_wave_cluster_n2_is_valid(state, two_cta[1]):
                 emit(TCGEN05_TWO_CTA_BLOCK_M, two_cta[1], 2, 2)
+        # The 128-row pair (each CTA owns 64 rows of the pair tile) at the
+        # width whose grid puts the most CTAs on the machine in one wave,
+        # where that is at least as many as the 256-row tile's: each CTA
+        # streams 64 + bn / 2 operand rows per K step against 128 + bn / 2
+        # (``repair.plain_pair128_widths``: bf16 1000x1024x4096, 64 pairs
+        # either way, 128x128 8.3 us against 256x64 10.2; bf16
+        # 1500x384x384, 72 pairs of 128x64 2.69 us against 36 of 128x128
+        # 2.84; a whole-tile M has these seeds among the paired-pipeline
+        # seeds, ``_paired_pipeline_seed_configs``).
+        pair128: tuple[int, int] | None = None
+        for bn in repair.plain_pair128_widths(state):
+            ctas = batch * -(-m // 128) * -(-n // bn) * 2
+            if ctas <= sm_count and (pair128 is None or ctas > pair128[0]):
+                pair128 = (ctas, bn)
+        if pair128 is not None and (two_cta is None or pair128[0] >= two_cta[0]):
+            emit(128, pair128[1], 2, 1, cta_group="two")
     return seeds
 
 
@@ -2226,12 +2253,12 @@ def _plain_edge_pair128_seed_configs(
     state: CuteTcgen05Config, edge_seed: Config
 ) -> list[Config]:
     """128-row CTA-pair twins of the plain edge seed
-    (``plain_edge_pair128_admitted``). bf16 1000^3 runs the pair at 7.5 us
+    (``plain_pair128_admitted``). bf16 1000^3 runs the pair at 7.5 us
     against the 256-row edge seed's 11.3 and the flat one-CTA winner's 8.4
     (burst timer; cuBLAS, a 2x1-cluster 64x112 kernel, 6.5 us burst and
     7.4 us sustained).
     """
-    if not repair.plain_edge_pair128_admitted(state):
+    if not repair.plain_pair128_admitted(state):
         return []
     fragments = facts._matmul_block_fragments(state)
     assert fragments is not None
@@ -2615,8 +2642,13 @@ def autotune_seed_configs(state: CuteTcgen05Config) -> list[Config]:
         # edge seed's 852 TFLOP/s.
         edge_n2_seed_config: dict[str, Any] = dict(plain_edge_seed.config)
         edge_n2_seed_config["tcgen05_cluster_n"] = 2
-        # A cluster pairs N tiles: an odd static N tile count refuses it.
-        if repair._cluster_n2_n_tile_refusal(state, edge_n2_seed_config) is None:
+        # A cluster pairs N tiles: an odd static N tile count refuses it,
+        # and a single ragged edge with a K tail runs on one N cluster only.
+        if repair._cluster_n2_n_tile_refusal(
+            state, edge_n2_seed_config
+        ) is None and not repair.single_edge_k_tail_cluster_n2(
+            state, edge_n2_seed_config
+        ):
             seeds.append(Config(**edge_n2_seed_config))
     if plain_clc_seed is not None:
         # Deep-staged bk=64 variant of the plain CLC seed: halving the K
@@ -2722,6 +2754,14 @@ def autotune_seed_configs(state: CuteTcgen05Config) -> list[Config]:
                 )
                 if clc_aux_tma_narrow_n_seed is not None:
                     seeds.append(clc_aux_tma_narrow_n_seed)
+    # A seed whose CTAs each run one tile keeps its AB ring within the K
+    # loop, as the search repair keeps a sample's
+    # (``repair.one_tile_ab_stage_cap``): the stages past it only cost the
+    # next launch its overlap.
+    for index, seed in enumerate(seeds):
+        cap = repair.one_tile_ab_stage_cap(state, seed.config)
+        if cap is not None:
+            seeds[index] = Config.from_dict({**seed.config, "tcgen05_ab_stages": cap})
     if surface._pdl_searched(state):
         # Every seed launches as a programmatic dependent where the knob
         # is searched.  The catalogue times a kernel back to back with

@@ -28,6 +28,7 @@ from helion._compiler.cute.autotune.heuristics.cute_tcgen05_schedule import (
 )
 from helion._compiler.cute.dense_gemm import prove_dense_gemm_facts
 from helion._compiler.cute.one_cta_pipeline import prove_one_cta_pipeline_facts
+from helion._compiler.cute.tcgen05.search_plan import tcgen05_shape_rejected
 from helion._compiler.cute.tcgen05_config import _TWO_CTA_PERSISTENT_PID_VETO
 from helion._compiler.cute.tcgen05_config import facts
 from helion._compiler.cute.tcgen05_config import repair
@@ -500,17 +501,81 @@ def test_output_edge_admits_two_cta_pairs_and_flattens_one_cta_partial_tiles() -
     (
         # Ragged M below the 256-row pair tile.
         ((16, 14336, 4096), torch.bfloat16),
-        # Ragged in both M and N.
-        ((3000, 3000, 3072), torch.bfloat16),
+        # Ragged in both M and N with a K tail: the edge + K-tail family.
+        ((3000, 3000, 3000), torch.bfloat16),
+        # Ragged in both M and N over an M whole in 64-row one-CTA tiles: the
+        # one-CTA N-edge family's persistent schedules.
+        ((3008, 3000, 3072), torch.bfloat16),
         # FP8 keeps its exact-tile restoration.
         ((1000, 4096, 2880), torch.float8_e4m3fn),
     ),
 )
-def test_output_edge_admission_excludes_unpaired_and_double_edge_shapes(
+def test_output_edge_admission_excludes_unpaired_and_one_cta_double_edges(
     shape: tuple[int, int, int], dtype: torch.dtype
 ) -> None:
     bound = _plain_bind(*shape, dtype=dtype)
     assert not bound.config_spec._cute_tcgen05_config.output_edge_persistent_admitted
+
+
+def test_output_edge_admits_double_edge_whole_k_pairs() -> None:
+    """bf16 1000x2880x4096 is ragged in both M and N with whole K tiles, and no
+    one-CTA tile height divides M, so no persistent one-CTA schedule runs it:
+    the 256-row pairs take it, their TMA store clipping both edges. On GB300
+    the flat one-CTA winner ran 0.64 of cuBLAS; the default 256x160 pair (one
+    wave of 72 pairs, 160 dividing N) ran 1.03."""
+    bound = _plain_bind(1000, 2880, 4096)
+    state = bound.config_spec._cute_tcgen05_config
+    assert state.output_edge_persistent_admitted
+    assert state.cluster_m2_search_constraints is not None
+    config = bound.config_spec.default_config()
+    assert config.config["tcgen05_cluster_m"] == 2
+    assert config.config["tcgen05_tile_n"] == 160
+    assert "CtaGroup.TWO, (256, 160)" in bound.to_code(config)
+
+
+def test_double_edge_without_pairs_keeps_the_one_cta_m_ceiling() -> None:
+    """bf16 1000x1000x4096 is a double edge of 16 256x256 pairs, under the
+    quarter-wave gate: with no pair to run it, the flat pipeline takes it at
+    the planner's one-CTA M ceiling, which a double edge keeps unless its
+    pairs run it."""
+    bound = _plain_bind(1000, 1000, 4096)
+    state = bound.config_spec._cute_tcgen05_config
+    assert state.cluster_m2_search_constraints is None
+    fragments = facts._matmul_block_fragments(state)
+    assert fragments is not None
+    assert fragments[0].high == 128
+
+
+def test_single_m_edge_without_pairs_keeps_256_rows() -> None:
+    """bf16 1000x128x2880 (four pairs, under the quarter-wave gate) keeps the
+    256-row M ceiling: an M-contiguous A that TMA cannot load (cp.async-A,
+    M = 1002) runs a flat 256-row tile as two 128-row MMAs, and the repair
+    projects a TMA kernel's flat 256-row sample to 128 rows."""
+    k_major_b = torch.empty((128, 2880), dtype=torch.bfloat16).T
+    for lhs, rows in (
+        (torch.empty((1000, 2880), dtype=torch.bfloat16), 128),
+        (torch.empty((2880, 1002), dtype=torch.bfloat16).T, 256),
+    ):
+        bound = plain_mm._bind_isolated((lhs, k_major_b))
+        spec = bound.config_spec
+        state = spec._cute_tcgen05_config
+        assert state.cluster_m2_search_constraints is None
+        fragments = facts._matmul_block_fragments(state)
+        assert fragments is not None
+        assert fragments[0].high == 256
+        config = helion.Config(
+            **{
+                **spec.default_config().config,
+                "block_sizes": [256, 128, 64],
+                "pid_type": "flat",
+                "tcgen05_cluster_m": 1,
+                "tcgen05_cluster_n": 1,
+                "tcgen05_cta_group": "auto",
+            }
+        )
+        spec.normalize(config, _fix_invalid=True)
+        assert config.config["block_sizes"][0] == rows
+        assert "tiled_mma" in bound.to_code(config)
 
 
 def test_flat_one_cta_samples_keep_128_rows() -> None:
@@ -532,6 +597,28 @@ def test_flat_one_cta_samples_keep_128_rows() -> None:
     spec.normalize(config, _fix_invalid=True)
     assert config.config["block_sizes"][0] == 128
     assert "tiled_mma" in bound.to_code(config)
+
+
+def test_one_wave_pairs_run_over_an_output_edge_m() -> None:
+    """bf16 1000x2304x2048: its 36 256x256 pairs are under the quarter-wave
+    gate (152 // 4), but 72 256x128 pairs fill one wave, one per SM pair (the
+    144 CTAs cuBLAS launches), and their TMA store clips the partial last M
+    tile. On GB300 the flat one-CTA winner ran 0.77 of cuBLAS, the seeded
+    256x128 pair 0.97."""
+    bound = _plain_bind(1000, 2304, 2048)
+    state = bound.config_spec._cute_tcgen05_config
+    constraints = state.cluster_m2_search_constraints
+    assert constraints is not None
+    assert constraints.allow_one_wave_tiles and constraints.one_wave_only
+    narrow = [
+        seed
+        for seed in bound.config_spec.compiler_seed_configs
+        if seed.config.get("tcgen05_cluster_m") == 2
+        and seed.config["block_sizes"][:2] == [256, 128]
+        and not seed.config.get("tcgen05_tile_n")
+    ]
+    assert narrow
+    assert "CtaGroup.TWO, (256, 128)" in bound.to_code(narrow[0])
 
 
 def test_n_edge_cluster_n_seeds_take_one_n_cluster() -> None:
@@ -2596,6 +2683,43 @@ def test_few_small_batched_matrices_keep_the_simt_lowering(mma_impl: str) -> Non
     assert "blackwell_helpers.make_trivial_tiled_mma" not in code
 
 
+@pytest.mark.parametrize(
+    ("batch", "m", "n", "k", "rejected"),
+    [
+        (None, 128, 256, 64, False),
+        # a tiny GEMM keeps the SIMT lowering
+        (None, 40, 96, 64, True),
+        # K under one MMA step
+        (None, 4096, 2048, 2, True),
+        # small matrices: a few keep the SIMT lowering, many fill the machine
+        (8, 56, 56, 32, True),
+        (8192, 56, 56, 32, False),
+        (768, 200, 200, 64, False),
+    ],
+)
+def test_shape_rejection_is_the_planners(
+    batch: int | None, m: int, n: int, k: int, rejected: bool
+) -> None:
+    """``tcgen05_shape_rejected``, which helion.inductor asks before it writes
+    a dot's K loop, answers as the planner does for the same problem."""
+    args = (
+        torch.empty((m, k) if batch is None else (batch, m, k), dtype=torch.bfloat16),
+        torch.empty((k, n) if batch is None else (batch, k, n), dtype=torch.bfloat16),
+    )
+    kernel = (
+        plain_mm
+        if batch is None
+        else helion.kernel(batched_gemm, backend="cute", static_shapes=True)
+    )
+    with patch(
+        "helion._compiler.cute.tcgen05.search_plan._cuda_num_sms_or_zero",
+        return_value=148,
+    ):
+        bound = kernel._bind_isolated(args)
+    assert bound.config_spec.tcgen05.search_enabled is not rejected
+    assert tcgen05_shape_rejected(m, n, k, torch.bfloat16, batch=batch) is rejected
+
+
 @helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
 def _five_row_mm(
     a: torch.Tensor,
@@ -2961,8 +3085,8 @@ def _k_tail_bind(m: int, n: int, k: int) -> BoundKernel:
         ((2048, 2560, 8008), True),
         # ragged in both M and N with a K tail: the family's own shapes
         ((3000, 3000, 3000), True),
-        # a single ragged edge with a K tail: outside the validated runtime
-        ((1000, 2560, 8008), False),
+        # a single ragged edge with a K tail: the family's pairs clip it too
+        ((1000, 2560, 8008), True),
         # whole K: the dense families
         ((2048, 2560, 8000), False),
     ),
@@ -3113,7 +3237,9 @@ def test_small_grid_default_takes_the_fewest_waves(m: int, n: int, k: int) -> No
 
 
 # Small grids no 128-row pair serves: a 64-row M (64x4096x4096), K tails
-# (K=1000, 16 k-blocks: unsplit, at three per-SM CTA counts), a K loop
+# under 128-row M (K=1000, 16 k-blocks: unsplit, at two per-SM CTA counts;
+# a single ragged edge with 128 rows or more runs the edge family's pairs,
+# ``test_single_edge_k_tail_runs_the_128_row_pair``), a K loop
 # past the pairs' 256 k-blocks, the 32 k-block minimum's edge (31 unsplit,
 # 32 in four slices) and three CTAs per SM capping 216 tiles at two slices.
 @pytest.mark.parametrize(
@@ -3122,7 +3248,6 @@ def test_small_grid_default_takes_the_fewest_waves(m: int, n: int, k: int) -> No
         (64, 4096, 4096, 4),
         (32, 1280, 1000, 1),
         (128, 4096, 1000, 1),
-        (320, 2048, 1000, 1),
         (256, 512, 32768, 8),
         (64, 4096, 1984, 1),
         (64, 4096, 2048, 4),
@@ -3162,7 +3287,7 @@ def test_small_grid_without_a_pair_splits_k(m: int, n: int, k: int, split: int) 
     (
         (64, 4096, 320, 4, True),
         (64, 4096, 192, 3, True),
-        (1280, 1600, 1000, 4, True),
+        (128, 4096, 1000, 4, True),
         (64, 4096, 4000, 4, False),
     ),
 )
@@ -3202,6 +3327,81 @@ def test_small_grid_split_k_default_edges(
     assert config.config["tcgen05_ab_stages"] == ab_stages
     # (four slices need four k-blocks)
     assert sample["tcgen05_split_k"] == (4 if flat_edge_tma and k >= 4 * 64 else 1)
+
+
+@pytest.mark.parametrize(("m", "n", "k"), ((320, 2048, 1000), (1280, 1600, 1000)))
+def test_single_edge_k_tail_runs_the_128_row_pair(m: int, n: int, k: int) -> None:
+    """One ragged edge (of the 256-row pair) with a 16-bit K tail joins the
+    edge + K-tail family, whose 128-row pair the small-grid default takes
+    (GB300, full-effort autotune, of cuBLAS: 320x2048x1000 0.57 on the flat
+    winner -> 0.71, 1280x1600x1000 0.70 -> 0.99): the role-local producer
+    issues the partial last K tile, which TMA zero-fills."""
+    with patch(
+        "helion._compiler.cute.tcgen05.search_plan._cuda_num_sms_or_zero",
+        return_value=148,
+    ):
+        bound = plain_mm._bind_isolated(
+            (
+                torch.empty((m, k), dtype=torch.bfloat16),
+                torch.empty((k, n), dtype=torch.bfloat16),
+            )
+        )
+        constraints = (
+            bound.config_spec._cute_tcgen05_config.cluster_m2_search_constraints
+        )
+        config = bound.config_spec.default_config()
+        source = bound.to_code(config)
+    assert constraints is not None and constraints.allow_edge_k_tail_family
+    assert config.block_sizes[:2] == [128, 128]
+    assert config.config["tcgen05_cta_group"] == "two"
+    # the producer issues a K tile that starts inside K (``tile_offset_2 +
+    # ... < K``), the partial last one included, not only tiles that end
+    # inside it (``... <= K``)
+    assert f") < cutlass.Int32({k}))" in source
+    assert "_helion_tcgen05_persistent_total_tiles" not in source
+
+
+def test_single_edge_k_tail_pairs_take_one_n_cluster() -> None:
+    """``cute_mma`` runs a single ragged edge's K tail on one N cluster only
+    (``tcgen05_single_edge_k_tail``); a pair on two N clusters there falls
+    back to the guarded path, whose host guard refuses every launch. Over an
+    even count of 256-wide N tiles, an M edge (320x2048x1000) and an N edge
+    (1280x1800x1000) seed no 2x2 cluster, and a sampled one takes one N
+    cluster."""
+    with patch(
+        "helion._compiler.cute.tcgen05.search_plan._cuda_num_sms_or_zero",
+        return_value=148,
+    ):
+        for (m, n, k), render in (
+            ((320, 2048, 1000), True),
+            ((1280, 1800, 1000), False),
+        ):
+            bound = plain_mm._bind_isolated(
+                (
+                    torch.empty((m, k), dtype=torch.bfloat16),
+                    torch.empty((k, n), dtype=torch.bfloat16),
+                )
+            )
+            spec = bound.config_spec
+            state = spec._cute_tcgen05_config
+            constraints = state.cluster_m2_search_constraints
+            assert constraints is not None and constraints.allow_edge_k_tail_family
+            pairs = [
+                seed.config
+                for seed in seeds.autotune_seed_configs(state)
+                if seed.config.get("tcgen05_cluster_m") == 2
+            ]
+            assert pairs
+            assert all(pair.get("tcgen05_cluster_n", 1) == 1 for pair in pairs)
+            edge_seed = seeds._plain_edge_seed_config(state)
+            assert edge_seed is not None
+            config = helion.Config(**{**edge_seed.config, "tcgen05_cluster_n": 2})
+            spec.normalize(config, _fix_invalid=True)
+            assert config.config["tcgen05_cluster_m"] == 2
+            assert config.config["tcgen05_cluster_n"] == 1
+            if render:
+                source = bound.to_code(config)
+                assert "_helion_tcgen05_persistent_total_tiles" not in source
 
 
 @helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
@@ -3721,3 +3921,35 @@ def test_plain_pair_prices_the_narrow_store_subtile() -> None:
     source = bound.to_code(config)
     assert "PipelineTmaStore.create(num_stages=4" in source
     assert "(cute.make_layout(128), cute.make_layout(32))" in source
+
+
+def test_one_wave_pair_count_needs_a_ragged_plain_gemm() -> None:
+    """The one-wave gate counts a 16-bit GEMM's work in 128x64 pair tiles
+    only where the family runs those pairs: a plain epilogue over an M that
+    whole 128-row tiles do not cover. 1500x384x384 (36 tiles of 256x64, 72
+    pairs of 128x64) opens the family; a bias row (an auxiliary operand
+    keeps the 256-row tiles) and a whole-tile M (1536 rows: the
+    paired-pipeline search runs the 128-row pairs) keep the 256-row count,
+    under the quarter wave."""
+
+    def constraints(m: int, *, bias: bool = False):
+        a = torch.empty((m, 384), dtype=torch.bfloat16)
+        b = torch.empty((384, 384), dtype=torch.bfloat16).T
+        out = torch.empty((m, 384), dtype=torch.bfloat16)
+        bound = (
+            bias_mm_into._bind_isolated(
+                (a, b, torch.empty(384, dtype=torch.bfloat16), out)
+            )
+            if bias
+            else plain_mm_into._bind_isolated((a, b, out))
+        )
+        return bound.config_spec._cute_tcgen05_config.cluster_m2_search_constraints
+
+    with patch(
+        "helion._compiler.cute.tcgen05.search_plan._cuda_num_sms_or_zero",
+        return_value=148,
+    ):
+        plain = constraints(1500)
+        assert plain is not None and plain.one_wave_only
+        assert constraints(1536) is None
+        assert constraints(1500, bias=True) is None

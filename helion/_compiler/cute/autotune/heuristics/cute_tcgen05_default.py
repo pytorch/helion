@@ -427,7 +427,10 @@ class CuteTcgen05DefaultTileHeuristic(AutotunerHeuristic):
         """A whole-tile pair's exact-shape auxiliary operands staged through
         the epilogue-issued TMA ring (``epi_tma``), on the widest N tile
         whose AB ring keeps ``_EPI_TMA_MIN_AB_STAGES`` beside it, or ``None``
-        where none does.
+        where none does. A grid whose CTAs each run one tile needs no more
+        than the tile's K loop, where the search repair caps the AB ring
+        (``repair.one_tile_ab_stage_cap``: bf16 2048x2048x192 + residual
+        keeps its 64 256x256 pairs at three stages).
 
         Register (SIMT) loads leave each exact-shape operand's global latency
         on every epilogue subtile. B200, of the ATen GEMM, SIMT -> ``epi_tma``:
@@ -458,12 +461,18 @@ class CuteTcgen05DefaultTileHeuristic(AutotunerHeuristic):
             normalized: dict[str, Any], block_sizes: list[object], min_ab_stages: int
         ) -> bool:
             """Whether the search fixups (``_normalize_epi_tma``) kept the
-            ring and the tile, with ``min_ab_stages`` AB stages beside it."""
+            ring and the tile, with ``min_ab_stages`` AB stages beside it, or
+            the whole K loop where each CTA runs one tile and the repair
+            caps the AB ring there (``repair.one_tile_ab_stage_cap``)."""
+            one_tile_cap = repair.one_tile_ab_stage_cap(
+                state, {**normalized, "tcgen05_ab_stages": min_ab_stages}
+            )
             return (
                 normalized.get(TCGEN05_AUX_LOAD_MODE_CONFIG_KEY)
                 == TCGEN05_AUX_LOAD_MODE_EPI_TMA
                 and normalized["block_sizes"] == block_sizes
-                and cast("int", normalized["tcgen05_ab_stages"]) >= min_ab_stages
+                and cast("int", normalized["tcgen05_ab_stages"])
+                >= (min_ab_stages if one_tile_cap is None else one_tile_cap)
             )
 
         # The narrower pair tile where the 256x256 one keeps too few AB
@@ -537,11 +546,13 @@ class CuteTcgen05DefaultTileHeuristic(AutotunerHeuristic):
         and 1152x1152x1024 37 -> 12 us on the 128x128 pair's two, against
         ATen's 27 and 10.8 us).
 
-        The pairs are the paired-pipeline seeds (and, on the ragged edge
-        family, its 128x128 edge pairs): the allocation proof validates
-        them, not the ``cluster_m=2`` search projection, so the default takes
-        them where the cluster search stays at one CTA, as the autotuner's
-        initial population does. On ties the bias row loaded before the
+        The pairs are the paired-pipeline seeds (and the 128x128 pairs of
+        the ragged edge family and of the one-wave family, whose seed runs
+        bf16 1000x1024x4096 at 8.3 us against cuBLAS's 7.7 on GB300, where
+        the flat base default's 128x16 tile ran 83): the allocation proof
+        validates them, not the ``cluster_m=2`` search projection, so the
+        default takes them where the cluster search stays at one CTA, as the
+        autotuner's initial population does. On ties the bias row loaded before the
         accumulator wait (``pre_acc_wait``) wins: one tile per CTA reads it
         once (128x9216x4096 + bias: 24.1 -> 23.2 us)."""
         state = env.config_spec._cute_tcgen05_config

@@ -47,7 +47,7 @@ TCGEN05_TWO_CTA_MAX_K_TILES = 256
 # shape probed from 1000 to 4160 (bf16 3000^3 45 us against cuBLAS's 45,
 # 1500x2500x3000 47.5 against 118.6, 2048x2048x2050 30.7 against 71.6, all
 # matching torch within bf16 rounding) and, through its 128-row CTA pair
-# (``tcgen05_config.repair.plain_edge_pair128_admitted``), down to 1000^3 (the
+# (``tcgen05_config.repair.plain_pair128_admitted``), down to 1000^3 (the
 # pair 7.2 us burst / 8.2 us sustained against cuBLAS's 6.5 / 7.4 in the
 # interleaved runs; the flat one-CTA winner 8.4 burst). The quarter-wave
 # work gate in ``enable_cute_tcgen05_search`` counts 128x128 tiles for
@@ -89,6 +89,12 @@ TCGEN05_TWO_CTA_DEEP_AB_STAGES = 6
 # in 2x2 clusters with a 64x10 K ring for fp16 1024^3).  Admitted by the
 # search projection and seeded when the 256x256 grid is below the SM count.
 TCGEN05_TWO_CTA_ONE_WAVE_BLOCK_NS = (128, 64)
+# N tiles of the one-wave family's 128-row CTA pair (each CTA owns 64 rows),
+# widest first (``tcgen05_config.repair.plain_pair128_widths``). The 64-wide
+# pair is cuBLAS's tile for the grids the 128-wide one leaves half empty
+# (nvjet ``64x64_64x16_2x2_2cta`` on bf16 1500x384x384: 72 pairs of 128x64,
+# against 36 of 128x128).
+TCGEN05_TWO_CTA_PAIR128_ONE_WAVE_BLOCK_NS = (128, 64)
 # The N tiles the tcgen05 CTA pair (``tcgen05_cluster_m=2`` on the 256-row
 # pair tile) runs its MMA at throughout the backend: the paired pipeline, the
 # materialized two-CTA regions and the cluster_m=2 search projection all take

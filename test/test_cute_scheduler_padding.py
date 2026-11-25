@@ -478,8 +478,8 @@ def test_padding_runtime_cluster_peers(
 
 @pytest.mark.parametrize(
     ("shape", "cluster_n"),
-    [((1024, 1024, 256), 2)],
-    ids=["full-2x2"],
+    [((131072, 144, 288), 1), ((1024, 1024, 256), 2)],
+    ids=["fringe-2x1", "full-2x2"],
 )
 def test_clc_mailbox_is_read_whole_before_its_release_codegen(
     shape: tuple[int, int, int], cluster_n: int
@@ -487,7 +487,8 @@ def test_clc_mailbox_is_read_whole_before_its_release_codegen(
     # The CLC leader's scheduler warp writes each CTA's mailbox with st.async
     # once every lane released the stage; each consumer role loads the whole
     # stage before its valid test, so no release goes out ahead of a pending
-    # mailbox read.
+    # mailbox read (the GPU repro: test_cute_scheduler_mailbox's
+    # test_clc_peer_cta_writes_every_tile_it_reads_from_the_mailbox).
     with cpu_codegen():
         code = plain_mm_into.bind(bf16_mm_args(*shape)).to_code(
             clc_fringe_config(tcgen05_cluster_n=cluster_n)

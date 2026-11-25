@@ -1235,12 +1235,12 @@ def optional_fragments(
             TCGEN05_CTA_GROUP_CHOICES
             if not for_search
             or (paired_search and two_cta_regions)
-            # The ragged edge family's whole 128-row pairs run the 2-CTA
-            # MMA only when asked for explicitly (``auto`` keeps bf16
+            # The 128-row pairs of the edge and one-wave families run the
+            # 2-CTA MMA only when asked for explicitly (``auto`` keeps bf16
             # bm=128 + cluster_m=2 on the CtaGroup.ONE bridge, which the
             # edge epilogues refuse); let the search ask
-            # (``plain_edge_pair128_admitted``).
-            or (two_cta_regions and repair.plain_edge_pair128_admitted(state))
+            # (``plain_pair128_admitted``).
+            or (two_cta_regions and repair.plain_pair128_admitted(state))
             else ("auto",)
         ),
         "tcgen05_cluster_m": EnumFragment(cluster_m_choices),

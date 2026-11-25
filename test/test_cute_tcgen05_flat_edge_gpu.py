@@ -548,8 +548,14 @@ class TestCuteTcgen05RaggedTwoCtaSearch(RefEagerTestDisabled, TestCase):
         # Ragged GEMMs below the old 1024 floor keep the two-CTA edge family
         # in the search once its 128x128 tiles fill a quarter of the SMs;
         # the planner counts those tiles for 16-bit operands, not 256x256
-        # pairs (16 of those at 1000^3).
-        for m, n, k in ((1000, 1000, 1000), (777, 999, 555)):
+        # pairs (16 of those at 1000^3). 1000x1000x3000 runs the deepest
+        # ring the pair's allocation proof admits, which the search
+        # projection takes (13 stages; 46 whole K tiles and a 56-deep tail).
+        for (m, n, k), ab_stages in (
+            ((1000, 1000, 1000), 5),
+            ((777, 999, 555), 5),
+            ((1000, 1000, 3000), 13),
+        ):
             a = torch.randn(m, k, device=DEVICE, dtype=torch.bfloat16)
             b = torch.randn(k, n, device=DEVICE, dtype=torch.bfloat16)
             bound = _gemm.bind((a, b))
@@ -564,16 +570,197 @@ class TestCuteTcgen05RaggedTwoCtaSearch(RefEagerTestDisabled, TestCase):
                 tcgen05_cta_group="two",
                 tcgen05_cluster_m=2,
                 tcgen05_cluster_n=1,
-                tcgen05_ab_stages=5,
+                tcgen05_ab_stages=ab_stages,
                 tcgen05_acc_stages=2,
                 tcgen05_c_stages=2,
                 l2_groupings=[4],
             )
             code = bound.to_code(config)
             self.assertIn("CtaGroup.TWO", code)
+            self.assertIn(f"num_stages={ab_stages}", code)
             bound.set_config(config)
             torch.testing.assert_close(
                 bound(a, b), (a.float() @ b.float()).to(a.dtype), rtol=1e-2, atol=1e-1
+            )
+
+    def test_one_wave_grid_runs_the_128_row_pair(self) -> None:
+        # A one-wave shape (1000 rows clipped, whole N and K tiles) runs the
+        # 128-row pair at the 13-stage ring its seed takes.
+        a = torch.randn(1000, 1024, device=DEVICE, dtype=torch.bfloat16)
+        b = torch.randn(1024, 1024, device=DEVICE, dtype=torch.bfloat16).T
+        out = torch.empty(1000, 1024, device=DEVICE, dtype=torch.bfloat16)
+        bound = plain_mm_into.bind((a, b, out))
+        config = helion.Config(
+            block_sizes=[128, 128, 64],
+            pid_type="persistent_interleaved",
+            tcgen05_cta_group="two",
+            tcgen05_cluster_m=2,
+            tcgen05_cluster_n=1,
+            tcgen05_ab_stages=13,
+            tcgen05_acc_stages=2,
+            tcgen05_c_stages=2,
+            l2_groupings=[1],
+        )
+        code = bound.to_code(config)
+        self.assertIn("CtaGroup.TWO", code)
+        self.assertIn("num_stages=13", code)
+        bound.set_config(config)
+        out.zero_()
+        bound(a, b, out)
+        torch.testing.assert_close(
+            out, (a.float() @ b.float()).to(out.dtype), rtol=1e-2, atol=1e-1
+        )
+
+    @unittest.skipUnless(_promotes_b200_defaults(), "pins B200 default tiles")
+    def test_one_wave_default_runs_the_64_wide_128_row_pair(self) -> None:
+        # bf16 1500x384x384: 36 pairs of 128x128 would leave half the SMs
+        # idle; the autotune-off default runs 72 pairs of 128x64 (144 CTAs,
+        # one wave from 148 SMs up), the last M tile (1500 = 11 x 128 + 92
+        # rows) clipped by the TMA store.
+        a = torch.randn(1500, 384, device=DEVICE, dtype=torch.bfloat16)
+        b = torch.randn(384, 384, device=DEVICE, dtype=torch.bfloat16).T
+        out = torch.empty(1500, 384, device=DEVICE, dtype=torch.bfloat16)
+        bound = plain_mm_into.bind((a, b, out))
+        config = bound.config_spec.default_config()
+        self.assertEqual(config.config["block_sizes"][:3], [128, 64, 64])
+        self.assertEqual(config.config["tcgen05_cta_group"], "two")
+        self.assertIn("CtaGroup.TWO, (128, 64)", bound.to_code(config))
+        bound.set_config(config)
+        out.zero_()
+        bound(a, b, out)
+        torch.testing.assert_close(
+            out, (a.float() @ b.float()).to(out.dtype), rtol=1e-2, atol=1e-1
+        )
+
+    @unittest.skipUnless(_promotes_b200_defaults(), "pins B200 default tiles")
+    def test_single_edge_k_tail_defaults_run_the_128_row_pair(self) -> None:
+        # One ragged output edge with a K tail (240 = 3 x 64 + 48, 1000 =
+        # 15 x 64 + 40): the 128-row pair's producer issues the partial last
+        # K tile as a whole box (zero-filled past K) and the TMA store clips
+        # the edge, over a ragged N (8192x240), a ragged M (240x8192) and a
+        # longer K loop (1280x1600x1000).
+        for m, n, k in ((8192, 240, 240), (240, 8192, 240), (1280, 1600, 1000)):
+            a = torch.randn(m, k, device=DEVICE, dtype=torch.bfloat16)
+            b = torch.randn(n, k, device=DEVICE, dtype=torch.bfloat16).T
+            out = torch.empty(m, n, device=DEVICE, dtype=torch.bfloat16)
+            bound = plain_mm_into.bind((a, b, out))
+            config = bound.config_spec.default_config()
+            self.assertEqual(config.config["tcgen05_cta_group"], "two")
+            self.assertEqual(config.config["block_sizes"][:2], [128, 128])
+            bound.set_config(config)
+            out.zero_()
+            bound(a, b, out)
+            torch.testing.assert_close(
+                out, (a.float() @ b.float()).to(out.dtype), rtol=1e-2, atol=1e-1
+            )
+
+    def test_single_edge_k_tail_runs_the_256_row_pair(self) -> None:
+        # The same single ragged edge with a K tail on the 256-row pair the
+        # edge family projects a sampled two-CTA tile to (each CTA 128 rows,
+        # the edge clipped by the TMA store, the partial last K tile
+        # zero-filled), plain and with a bias row (whose kernels the
+        # 128-row pair does not run).
+        pair = {
+            "pid_type": "persistent_interleaved",
+            "tcgen05_cluster_m": 2,
+            "tcgen05_cluster_n": 1,
+            "tcgen05_acc_stages": 2,
+            "tcgen05_c_stages": 2,
+            "l2_groupings": [1],
+        }
+        for m, n, k in ((8192, 240, 240), (240, 8192, 240)):
+            a = torch.randn(m, k, device=DEVICE, dtype=torch.bfloat16)
+            b = torch.randn(n, k, device=DEVICE, dtype=torch.bfloat16).T
+            bias = torch.randn(n, device=DEVICE, dtype=torch.bfloat16)
+            expected = a.float() @ b.float()
+            for kernel, args, reference, tile, stages in (
+                (plain_mm_into, (a, b), expected, [256, 256, 64], 4),
+                (
+                    bias_mm_into,
+                    (a, b, bias),
+                    expected + bias.float(),
+                    [256, 256, 128],
+                    2,
+                ),
+            ):
+                out = torch.zeros(m, n, device=DEVICE, dtype=torch.bfloat16)
+                bound = kernel.bind((*args, out))
+                config = helion.Config(
+                    block_sizes=tile, tcgen05_ab_stages=stages, **pair
+                )
+                code = bound.to_code(config)
+                self.assertNotIn("_helion_tcgen05_persistent_total_tiles", code)
+                self.assertIn(f"< cutlass.Int32({k}))", code)
+                bound.set_config(config)
+                bound(*args, out)
+                torch.testing.assert_close(
+                    out, reference.to(out.dtype), rtol=1e-2, atol=1e-1
+                )
+
+    def test_output_edge_pairs_clip_the_partial_tiles(self) -> None:
+        # The 16-bit pairs over a partial last M tile (1000 rows: four 256-row
+        # pair tiles, the last clipped by the TMA store): the one-wave 256x128
+        # pair and the 256x160 pair over whole N tiles (2880 = 18 x 160).
+        cases = (
+            ((1000, 2304, 256), [256, 128, 64], 0, "auto"),
+            ((1000, 2880, 256), [256, 256, 64], 160, "two"),
+        )
+        for (m, n, k), block_sizes, width, cta_group in cases:
+            a = torch.randn(m, k, device=DEVICE, dtype=torch.bfloat16)
+            b = torch.randn(n, k, device=DEVICE, dtype=torch.bfloat16).T
+            out = torch.empty(m, n, device=DEVICE, dtype=torch.bfloat16)
+            bound = plain_mm_into.bind((a, b, out))
+            config = helion.Config(
+                block_sizes=block_sizes,
+                pid_type="persistent_interleaved",
+                tcgen05_cta_group=cta_group,
+                tcgen05_cluster_m=2,
+                tcgen05_cluster_n=1,
+                tcgen05_ab_stages=4,
+                tcgen05_acc_stages=2,
+                tcgen05_c_stages=2,
+                tcgen05_l2_swizzle_size=1,
+                l2_groupings=[1],
+                **({"tcgen05_tile_n": width} if width else {}),
+            )
+            code = bound.to_code(config)
+            physical = width or block_sizes[1]
+            self.assertIn(f"CtaGroup.TWO, (256, {physical})", code)
+            bound.set_config(config)
+            out.zero_()
+            bound(a, b, out)
+            torch.testing.assert_close(
+                out, (a.float() @ b.float()).to(out.dtype), rtol=1e-2, atol=1e-1
+            )
+
+    @unittest.skipUnless(_promotes_b200_defaults(), "pins B200 default tiles")
+    def test_double_edge_defaults_run_the_pairs(self) -> None:
+        # Ragged in both M and N with whole K tiles and an M no one-CTA tile
+        # height divides: the autotune-off default is a 256-row pair whose
+        # TMA store clips both edges; plain, with a bias row, and into a
+        # column-major output.
+        m, n, k = 3000, 3000, 3072
+        a = torch.randn(m, k, device=DEVICE, dtype=torch.bfloat16)
+        b = torch.randn(n, k, device=DEVICE, dtype=torch.bfloat16).T
+        bias = torch.randn(n, device=DEVICE, dtype=torch.bfloat16)
+        acc = a.float() @ b.float()
+        row_major = torch.empty(m, n, device=DEVICE, dtype=torch.bfloat16)
+        column_major = torch.empty(n, m, device=DEVICE, dtype=torch.bfloat16).T
+        cases = (
+            (plain_mm_into, (a, b, row_major), acc),
+            (bias_mm_into, (a, b, bias, row_major), acc + bias.float()),
+            (plain_mm_into, (a, b, column_major), acc),
+        )
+        for kernel, args, expected in cases:
+            bound = kernel.bind(args)
+            config = bound.config_spec.default_config()
+            self.assertEqual(config.config["tcgen05_cluster_m"], 2)
+            self.assertIn("CtaGroup.TWO", bound.to_code(config))
+            bound.set_config(config)
+            args[-1].zero_()
+            bound(*args)
+            torch.testing.assert_close(
+                args[-1], expected.to(torch.bfloat16), rtol=1e-2, atol=1e-1
             )
 
     @unittest.skipUnless(_promotes_b200_defaults(), "pins B200 default tiles")
