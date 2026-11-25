@@ -70,6 +70,7 @@ from ..tcgen05_constants import TCGEN05_C_STORE_MODE_DIRECT
 from ..tcgen05_constants import TCGEN05_CLUSTER_N2_SEED_L2_GROUPING
 from ..tcgen05_constants import TCGEN05_CLUSTER_SPLIT_K_OUTPUT_EXCHANGE_SEED_MIN_K_TILES
 from ..tcgen05_constants import TCGEN05_CLUSTER_SPLIT_K_SEED_MIN_K_TILES
+from ..tcgen05_constants import TCGEN05_FALLBACK_CLUSTER_CONFIG_KEY
 from ..tcgen05_constants import TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY
 from ..tcgen05_constants import TCGEN05_GROUPED_MODE_CONFIG_KEY
 from ..tcgen05_constants import TCGEN05_ONE_CTA_MAX_BLOCK_M
@@ -929,6 +930,48 @@ def _paired_pipeline_seed_configs(
                                         aux_mode
                                     )
                                 seeds.append(seed)
+                                split_c_stages = (
+                                    repair.split_n_cluster_c_stages(state)
+                                    if cluster_n == 2
+                                    and (bm, bn, bk)
+                                    == (
+                                        TCGEN05_TWO_CTA_BLOCK_M,
+                                        repair.TCGEN05_SPLIT_N_CLUSTER_BLOCK_N,
+                                        64,
+                                    )
+                                    and aux_mode == TCGEN05_AUX_LOAD_MODE_SIMT
+                                    else None
+                                )
+                                if split_c_stages is not None:
+                                    # The cluster that splits a one-tile N
+                                    # between its pairs also stages two tiles
+                                    # of subtiles, beside the deepest A/B ring
+                                    # that fits (bf16 401408x128x128: nine A/B
+                                    # and four C stages, 0.992-0.995 of cuBLAS
+                                    # against the twin's 0.985).
+                                    split_stages = max_pipeline_ab_stages(
+                                        pipeline_facts,
+                                        bm=bm,
+                                        bn=bn,
+                                        bk=bk,
+                                        c_stages=split_c_stages,
+                                        acc_stages=acc_stages,
+                                        max_stages=paired_pipeline_max_ab_stages(
+                                            pipeline_facts
+                                        ),
+                                        aux_load_placement=placement,
+                                        aux_load_mode=aux_mode,
+                                    )
+                                    if split_stages > 0:
+                                        seeds.append(
+                                            Config.from_dict(
+                                                {
+                                                    **seed.config,
+                                                    "tcgen05_ab_stages": split_stages,
+                                                    "tcgen05_c_stages": split_c_stages,
+                                                }
+                                            )
+                                        )
                                 if (
                                     cluster_n == 2
                                     and len(state.config_spec.l2_groupings) == 1
@@ -2523,6 +2566,53 @@ def _plain_clc_seed_config(
     return Config(**seed_config)
 
 
+def _fallback_cluster_seed_configs(
+    state: CuteTcgen05Config, seeds: list[Config]
+) -> list[Config]:
+    """Twins of the CLC 2x2 seeds launched with their pair as the fallback
+    (``tcgen05_fallback_cluster``) where the grid has a 2x2 slot per four SMs
+    or more: GB300 co-schedules 36 4-CTA clusters, 144 of its 152 SMs, and the
+    GPU forms pairs on the rest; the CLC schedule lets the pairs take tiles at
+    their own pace.  bf16 4096x50264x2048 transposed (1576 2x2 slots, one
+    process, of cuBLAS): the CLC 2x2 0.941, the same with the fallback 0.994;
+    the static 2x2 0.943 and 0.976 (a static schedule hands the slower pairs
+    a slot's share)."""
+    extents = state.matmul_compile_time_static_extents
+    if (
+        not surface.fallback_cluster_search_enabled(state)
+        or state.device_sm_count <= 0
+        or extents is None
+    ):
+        return []
+    m, n, _k = extents
+    twins: list[Config] = []
+    for seed in seeds:
+        config = {**seed.config, TCGEN05_FALLBACK_CLUSTER_CONFIG_KEY: True}
+        view = facts._matmul_config_view(state, config)
+        if (
+            view is None
+            or config.get(TCGEN05_PERSISTENCE_MODEL_CONFIG_KEY)
+            != Tcgen05PersistenceModel.CLC_PERSISTENT.value
+            or repair._fallback_cluster_refusal(state, config) is not None
+        ):
+            continue
+        blocks, m_index, n_index, _k_index = view
+        bm, bn = blocks[m_index], blocks[n_index]
+        if not (
+            type(bm) is int
+            and type(bn) is int
+            and isinstance(m, int)
+            and isinstance(n, int)
+        ):
+            continue
+        # one 2x2 slot per pair tile along M and two tiles along N
+        n_tiles = -(-n // bn)
+        slots = -(-m // bm) * -(-n_tiles // 2)
+        if slots >= state.device_sm_count // 4:
+            twins.append(Config.from_dict(config))
+    return twins
+
+
 def _plain_m_pair_seed_config(state: CuteTcgen05Config) -> Config | None:
     """Autotune seed for block_m=512 M-paired tiles (nvjet's B-reuse).
 
@@ -2933,6 +3023,17 @@ def _plain_cluster_n2_seed_config(
         "tcgen05_cluster_n": 2,
         "tcgen05_num_epi_warps": 4,
         "tcgen05_ab_stages": ab_stages,
+        # Persistent over the device's co-resident 2x2 clusters, as the
+        # paired-pipeline 2x2 twin is: under the pair cap a grid of more
+        # clusters than co-reside launches one 2x2 cluster per SM pair, so
+        # the surplus run as a second hardware wave after the first has
+        # finished all its tiles. bf16 2048x20008x768 transposed (79 x 4 =
+        # 316 clusters on GB300, 36 co-resident): the pair cap launches 76
+        # clusters, 0.70 of cuBLAS; capped at the 36, 1.01 (both at this
+        # seed's L2 grouping of 4).
+        TCGEN05_PERSISTENT_GRID_CAP_CONFIG_KEY: (
+            TCGEN05_PERSISTENT_GRID_CAP_RESIDENT_CLUSTERS
+        ),
     }
     if deep:
         seed_config["tcgen05_c_stages"] = 2
@@ -3248,6 +3349,8 @@ def autotune_seed_configs(state: CuteTcgen05Config) -> list[Config]:
                 deep_cluster_n2_seed.config
             )
             deep_cluster_n1_seed_config["tcgen05_cluster_n"] = 1
+            # (the grid cap is a cluster_n=2 knob)
+            deep_cluster_n1_seed_config.pop(TCGEN05_PERSISTENT_GRID_CAP_CONFIG_KEY)
             seeds.append(Config(**deep_cluster_n1_seed_config))
         if plain_clc_seed is not None:
             # 4-CTA multicast + CLC dynamic persistence (Quack's
@@ -3309,6 +3412,7 @@ def autotune_seed_configs(state: CuteTcgen05Config) -> list[Config]:
                 )
                 if clc_aux_tma_narrow_n_seed is not None:
                     seeds.append(clc_aux_tma_narrow_n_seed)
+    seeds.extend(_fallback_cluster_seed_configs(state, seeds))
     # The deepest one-wave split-K seeds come after every other seed: a
     # search's initial population takes compiler seeds in list order up to
     # its size, so they only fill places no other seed needs.
@@ -3352,7 +3456,13 @@ def dense_aligned_n_search_seed_configs(state: CuteTcgen05Config) -> list[Config
     odd multiple of 16: ``facts._dense_aligned_n_skipped_whole_ranking``).
     bf16 131072x144x288 seeds the clipped 160, whose tiles all store through
     the SIMT epilogue (0.11 of cuBLAS); one full-effort search reached 144
-    by sampling (0.97 at five stages)."""
+    by sampling (0.97 at five stages).
+
+    The M-paired tile (``block_m=512``) seeds the clipped width it ranks
+    first too, at its deepest AB ring: bf16 512x30528x32768 with a [K, N]
+    row-major b runs 137 tiles of 512x224 (1.80 waves of 76 pairs) against
+    120 of 512x256 (1.58), 0.989-1.008 of cuBLAS at four AB stages against
+    0.945-0.962 at three (GB300, each timed alone at the power cap)."""
     block_m = facts._dense_aligned_n_block_m(state)
     if block_m is None or not facts._dense_aligned_n_sixteen_bit(state):
         return []
@@ -3365,7 +3475,21 @@ def dense_aligned_n_search_seed_configs(state: CuteTcgen05Config) -> list[Config
         for _cost, width in ranking:
             if width in seeded:
                 break
-            plans = list(facts._dense_aligned_n_width_plans(state, width, search=True))
+            plans = list(facts._dense_aligned_n_proved_plans(state, width))
+            if plans:
+                found.extend(
+                    Config.from_dict(values | {"tcgen05_ab_stages": plan.max_ab_stages})
+                    for values, plan in plans
+                )
+                break
+    m_pair = 2 * TCGEN05_TWO_CTA_BLOCK_M
+    if m_pair in facts._dense_aligned_n_block_ms(state):
+        for _cost, width in facts._dense_aligned_n_clipped_ranking(
+            state, m_pair, search=True
+        ):
+            plans = list(
+                facts._dense_aligned_n_proved_plans(state, width, block_m=m_pair)
+            )
             if plans:
                 found.extend(
                     Config.from_dict(values | {"tcgen05_ab_stages": plan.max_ab_stages})

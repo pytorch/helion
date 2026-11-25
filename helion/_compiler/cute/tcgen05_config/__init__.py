@@ -275,6 +275,12 @@ class CuteTcgen05Config:
         # (``one_cta_n_edge_partial_output``), so its other partial-tile
         # samples are flattened.
         self.output_edge_persistent_admitted: bool = False
+        # The widest power-of-two N tile dividing N of a 16-bit K-tail GEMM
+        # admitted to the persistent one-CTA schedule over N tiles narrower
+        # than the search's widest (``search_plan``'s
+        # ``allow_k_tail_persistent_pid_types``): its persistent one-CTA
+        # samples are narrowed to it.
+        self.k_tail_persistent_n: int | None = None
         # A batched 16-bit GEMM whose matrices run on the 128-row CTA pairs
         # over an M edge, an N edge or a K tail
         # (``search_plan.batched_pair128_matrix``): the paired pipeline

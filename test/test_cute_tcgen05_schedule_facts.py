@@ -59,6 +59,7 @@ from helion._compiler.cute.tcgen05_schedule_facts import (
     paired_k_tail_schedule_supported,
 )
 from helion._compiler.cute.tcgen05_schedule_facts import prove_full_tile_schedule_facts
+from helion._testing import patch_target_facts
 from helion._testing import skipUnlessBackends
 from helion._testing.cute_aux import rank_two_aux
 from helion._testing.cute_aux import two_residual_aux
@@ -5022,3 +5023,97 @@ def test_one_wave_pair_count_needs_a_ragged_plain_gemm() -> None:
         assert plain is not None and plain.one_wave_only
         assert constraints(1536) is None
         assert constraints(1500, bias=True) is None
+
+
+def test_a_tall_product_over_one_128_wide_n_tile_seeds_the_split_n_cluster() -> None:
+    """A tall bf16 product whose N is one 128-wide tile (401408 x 128, 41
+    waves of 256x64 pair tiles) seeds the 2x2 cluster of 256x64 pairs that
+    splits N between its two pairs with four C stages beside the deepest A/B
+    ring that fits (nine), next to the two-C-stage twin; N over more 64-wide
+    tiles (384, 512) and a short walk (32768 x 128: 3.4 waves) keep only the
+    twin (``repair.split_n_cluster_c_stages``)."""
+
+    def split_seeds(m: int, n: int, k: int) -> list[tuple[int, int]]:
+        with gb300_target(), forbid_cuda_work(), patch_target_facts(num_sm=152):
+            bound = plain_mm_into._bind_isolated(bf16_mm_args(m, n, k))
+            state = bound.config_spec._cute_tcgen05_config
+            return [
+                (seed.config["tcgen05_ab_stages"], seed.config["tcgen05_c_stages"])
+                for seed in seeds.autotune_seed_configs(state)
+                if seed.config.get("tcgen05_cluster_n") == 2
+                and seed.config["block_sizes"] == [256, 64, 64]
+                and not seed.config.get("l2_groupings")
+            ]
+
+    assert split_seeds(401408, 128, 128) == [(10, 2), (9, 4)]
+    for m, n, k in ((401408, 384, 128), (401408, 512, 128), (32768, 128, 128)):
+        assert split_seeds(m, n, k) == [(10, 2)], (m, n, k)
+
+
+def test_k_tail_runs_persistent_over_narrower_whole_n_tiles() -> None:
+    """A 16-bit K tail (K = 56: one 32-deep k-block and a partial one) over an
+    N of 384, three whole 128-wide tiles but one and a half 256-wide ones:
+    the search admits the persistent one-CTA K-tail kernel over the 128-wide
+    tiles and narrows its wider persistent samples to them, which then keep
+    TMA; an N whose widest whole power-of-two tile is narrower (320: 64)
+    stays on flat tiles, and an N of whole 256-wide tiles (512) is
+    admitted as before, without narrowing."""
+
+    def bind(n: int) -> BoundKernel:
+        with gb300_target(), patch_target_facts(num_sm=152):
+            return plain_mm_into._bind_isolated(
+                bf16_mm_args(16384, n, 56, rhs_k_major=False)
+            )
+
+    bound = bind(384)
+    spec = bound.config_spec
+    assert {"persistent_blocked", "persistent_interleaved"} <= set(
+        spec.allowed_pid_types
+    )
+    assert spec._cute_tcgen05_config.k_tail_persistent_n == 128
+    config = helion.Config(
+        **{
+            **spec.default_config().config,
+            "block_sizes": [128, 256, 32],
+            "pid_type": "persistent_interleaved",
+            "tcgen05_persistence_model": "static_persistent",
+            "tcgen05_ab_stages": 3,
+        }
+    )
+    with bound.env:
+        generation = ConfigGeneration(spec)
+        _flat, canonical = generation.canonicalize_flat(generation.flatten(config))
+    assert canonical.config["pid_type"] == "persistent_interleaved"
+    assert canonical.block_sizes == [128, 128, 32]
+    with gb300_target(), patch_target_facts(num_sm=152):
+        code = bound.to_code(canonical)
+    assert "tma_atom_a" in code
+    assert "_helion_tcgen05_persistent_total_tiles" not in code
+
+    flat_only = bind(320).config_spec
+    assert "persistent_interleaved" not in flat_only.allowed_pid_types
+    assert flat_only._cute_tcgen05_config.k_tail_persistent_n is None
+    whole = bind(512).config_spec
+    assert "persistent_interleaved" in whole.allowed_pid_types
+    assert whole._cute_tcgen05_config.k_tail_persistent_n is None
+    # A registered N block size that leaves the 128-wide tile out keeps its
+    # 256 columns, whose persistent K-tail samples would stop at the host
+    # guard: flat tiles only, as before.
+    with gb300_target(), patch_target_facts(num_sm=152):
+        registered = _registered_n_mm_into._bind_isolated(
+            bf16_mm_args(16384, 384, 56, rhs_k_major=False)
+        ).config_spec
+    assert "persistent_interleaved" not in registered.allowed_pid_types
+    assert registered._cute_tcgen05_config.k_tail_persistent_n is None
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _registered_n_mm_into(a: torch.Tensor, b: torch.Tensor, out: torch.Tensor) -> None:
+    m, k = a.shape
+    n = b.shape[1]
+    block_n = hl.register_block_size(256, 256)
+    for rows, cols in hl.tile((m, n), block_size=[None, block_n]):
+        acc = hl.zeros((rows, cols), dtype=torch.float32)
+        for inner in hl.tile(k):
+            acc = torch.addmm(acc, a[rows, inner], b[inner, cols])
+        out[rows, cols] = acc.to(out.dtype)

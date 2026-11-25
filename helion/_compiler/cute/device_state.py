@@ -458,6 +458,11 @@ class CuteTcgen05MatmulPlan(_CuteTcgen05OrientationMixin):
     # tiles; the scheduler then counts ``cluster_split_k`` virtual N tiles
     # per output tile.
     cluster_split_k: int = 1
+    # ``tcgen05_fallback_cluster``: the 4-CTA cluster launches with its pair
+    # as the fallback; both bodies walk this (2, 2, 1) schedule, and a
+    # static grid launches a slot per four SMs instead of per co-resident
+    # 4-CTA cluster.
+    fallback_cluster: bool = False
     l2_swizzle_size: int = 1
     tma_store_full_tiles_only: bool = False
     # M-paired tiles: number of 256-row UMMA subtiles per work tile along M

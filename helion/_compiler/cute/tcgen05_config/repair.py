@@ -159,9 +159,11 @@ from ..tcgen05_constants import TCGEN05_EPI_SUBTILE_N_CONFIG_KEY
 from ..tcgen05_constants import TCGEN05_EPI_WARP_GROUP_CHOICES
 from ..tcgen05_constants import TCGEN05_EPI_WARP_GROUPS_CONFIG_KEY
 from ..tcgen05_constants import TCGEN05_EPI_WARPS_PER_GROUP
+from ..tcgen05_constants import TCGEN05_EPILOGUE_BOUND_MIN_WAVES
 from ..tcgen05_constants import TCGEN05_EPILOGUE_LAYOUT_CONFIG_KEY
 from ..tcgen05_constants import TCGEN05_EPILOGUE_LAYOUT_NORMAL
 from ..tcgen05_constants import TCGEN05_EPILOGUE_LAYOUTS
+from ..tcgen05_constants import TCGEN05_FALLBACK_CLUSTER_CONFIG_KEY
 from ..tcgen05_constants import TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY
 from ..tcgen05_constants import TCGEN05_GROUPED_AB_TILE_K_CONFIG_KEY
 from ..tcgen05_constants import TCGEN05_GROUPED_BALANCED_WORKERS_CONFIG_KEY
@@ -932,30 +934,63 @@ def cluster_m2_bk_is_valid(
 def _m_pair_block_m_is_valid(state: CuteTcgen05Config) -> bool:
     """Whether block_m=512 (M-paired tiles) is admissible for this kernel.
 
-    The codegen envelope is the plain 16-bit full-tile static family:
-    M divisible by 512 with the canonical 256-wide N tile (the fix pass
-    projects bn to 256 and validates bk). Aux kernels and edge families
+    The codegen envelope is the plain 16-bit static family over whole
+    512-row M tiles: M divisible by 512 with the canonical 256-wide N tile
+    (the fix pass projects bn to 256 and validates bk). K may end in a
+    tail (the edge K-tail family's K, ``cluster_m2_bk_is_valid``): the
+    TMA producer issues the partial last K tile of both 256-row A
+    subtiles and of B as whole boxes, zero-filled past K. bf16
+    4096x2048x50264 RR (transposed: 2048 x 4096, K = 785 x 64 + 24):
+    the M-paired 2x2 tile reads B once per two subtiles and A once per
+    two pairs. N may end in a partial last tile too
+    (``_m_pair_n_edge_is_valid``). Aux kernels and a partial last M tile
     keep block_m=256.
     """
     if state.aux_kernel_detected or state.matmul_has_leading_passthrough:
         return False
     constraints = state.cluster_m2_search_constraints
-    if (
-        constraints is None
-        or constraints.allow_edge_k_tail_family
-        or constraints.one_wave_only
-    ):
+    if constraints is None or constraints.one_wave_only:
         return False
     for fact in state.config_spec.matmul_facts:
         if (
             fact.static_m is not None
             and fact.static_m % (2 * TCGEN05_TWO_CTA_BLOCK_M) == 0
             and fact.static_n is not None
-            and fact.static_n % TCGEN05_TWO_CTA_BLOCK_N == 0
+            and (
+                fact.static_n % TCGEN05_TWO_CTA_BLOCK_N == 0
+                or _m_pair_n_edge_is_valid(state, fact.static_m, fact.static_n)
+            )
             and fact.lhs_dtype in (torch.float16, torch.bfloat16)
         ):
             return True
     return False
+
+
+# A partial last N tile takes the M-paired tile where its zero-filled columns
+# are at most this share of the padded N.
+TCGEN05_M_PAIR_N_EDGE_MAX_PAD_FRACTION = 1 / 16
+
+
+def _m_pair_n_edge_is_valid(state: CuteTcgen05Config, m: int, n: int) -> bool:
+    """Whether the M-paired tile (``_m_pair_block_m_is_valid``) runs an
+    ``m x n`` GEMM whose N ends in a partial 256-wide tile: the role-local
+    N-edge producer issues that tile's B box whole, zero-filled past N, and
+    each subtile's TMA store clips it at N (``cute_mma``'s M-paired
+    envelope); a 2x2 sample keeps one pair per cluster there (the partial-N
+    2x2 takes the 256-row pair and K-major operands only). Taken where the
+    tile's B reuse pays: a grid of more 512x256 tiles than CTA pairs, whose
+    padded columns (computed and dropped) are at most
+    ``TCGEN05_M_PAIR_N_EDGE_MAX_PAD_FRACTION`` of N's tiles; a narrow N
+    (bf16 131072x144: 112 of 256 columns) keeps the 256-row pairs. bf16
+    512x30528x32768 with a [K, N] row-major b (120 tiles on 76 pairs, 64
+    columns in the last), GB300, each timed alone at the ~1.36 kW power
+    cap, of cuBLAS: the 256x256 pair 0.925-0.949 (952-986 mJ a call), the
+    M-paired 512x256 tile 0.973-0.983 at four AB stages (918-942 mJ;
+    cuBLAS's 2x2 879-932)."""
+    padded = -(-n // TCGEN05_TWO_CTA_BLOCK_N) * TCGEN05_TWO_CTA_BLOCK_N
+    return padded - n <= (
+        padded * TCGEN05_M_PAIR_N_EDGE_MAX_PAD_FRACTION
+    ) and facts.m_pair_grid_outnumbers_pairs(state, m, n)
 
 
 def batched_pair128_c_stages(state: CuteTcgen05Config) -> int | None:
@@ -1554,6 +1589,65 @@ def _normalize_split_k_exchange(
         config.pop(TCGEN05_SPLIT_K_EXCHANGE_CONFIG_KEY, None)
 
 
+def _fallback_cluster_refusal(
+    state: CuteTcgen05Config, config: dict[str, object]
+) -> str | None:
+    """What a ``tcgen05_fallback_cluster`` config lacks, judged from its keys
+    and the bind-time facts, or ``None``: a CtaGroup.TWO 4-CTA cluster whose
+    pairs take two N tiles, on the persistent pipeline of the static or CLC
+    scheduler, over a plain unbatched GEMM whose epilogue loads no auxiliary
+    tensor (``cute_mma._fallback_cluster_refusal`` judges the rendered plan)."""
+    if not (
+        config.get("tcgen05_cluster_m", 1) == 2
+        and config.get("tcgen05_cluster_n", 1) == 2
+        and config.get(TCGEN05_CTA_GROUP_CONFIG_KEY, "auto") != "one"
+        and tcgen05_cluster_split_k(config) == 1
+    ):
+        return (
+            "a CtaGroup.TWO 4-CTA cluster (tcgen05_cluster_m=2, "
+            "tcgen05_cluster_n=2) whose pairs take two N tiles (no tcgen05_split_k)"
+        )
+    if config.get("pid_type") not in (
+        "persistent_blocked",
+        "persistent_interleaved",
+    ) or config.get(TCGEN05_PERSISTENCE_MODEL_CONFIG_KEY, "static_persistent") not in (
+        Tcgen05PersistenceModel.STATIC_PERSISTENT.value,
+        Tcgen05PersistenceModel.CLC_PERSISTENT.value,
+    ):
+        return "the persistent pipeline on the static or CLC scheduler"
+    if (
+        not surface.fallback_cluster_search_enabled(state)
+        or config.get(TCGEN05_WARP_SPEC_C_INPUT_WARPS_KEY, 0) != 0
+    ):
+        return "a plain unbatched GEMM whose epilogue loads no auxiliary tensor"
+    view = facts._matmul_config_view(state, config)
+    if view is None or view[0][view[1]] != TCGEN05_TWO_CTA_BLOCK_M:
+        # (not the M-paired 512-row tile: two A subtiles per stage)
+        return "the 256-row CTA pair tile (block_m=256)"
+    return None
+
+
+def _normalize_fallback_cluster(
+    state: CuteTcgen05Config, config: dict[str, object], *, fix_invalid: bool
+) -> None:
+    """Keep ``tcgen05_fallback_cluster`` (the 4-CTA cluster launched with
+    its pair as the fallback) where ``_fallback_cluster_refusal`` admits it.
+    Elsewhere the knob reads False on the search surface and is absent off it."""
+    if config.get(TCGEN05_FALLBACK_CLUSTER_CONFIG_KEY) is not True:
+        return
+    refusal = _fallback_cluster_refusal(state, config)
+    if refusal is None:
+        return
+    if not fix_invalid:
+        raise InvalidConfig(
+            f"{TCGEN05_FALLBACK_CLUSTER_CONFIG_KEY}=True needs {refusal}"
+        )
+    if state.search_enabled and surface.fallback_cluster_search_enabled(state):
+        config[TCGEN05_FALLBACK_CLUSTER_CONFIG_KEY] = False
+    else:
+        config.pop(TCGEN05_FALLBACK_CLUSTER_CONFIG_KEY, None)
+
+
 def _cluster_split_k_refusal(
     state: CuteTcgen05Config, config: dict[str, object]
 ) -> str | None:
@@ -1954,11 +2048,9 @@ def _fix_cluster_m2_search_config(
         block_sizes[m_index] = TCGEN05_TWO_CTA_BLOCK_M
         block_sizes[n_index] = TCGEN05_TWO_CTA_NARROW_BLOCK_N
         return
-    if (
-        block_sizes[m_index] == 2 * TCGEN05_TWO_CTA_BLOCK_M
-        and not edge_k_tail_family
-        and _m_pair_block_m_is_valid(state)
-    ):
+    sampled_m_pair = block_sizes[m_index] == 2 * TCGEN05_TWO_CTA_BLOCK_M
+    m_paired = sampled_m_pair and _m_pair_block_m_is_valid(state)
+    if m_paired:
         # Keep the sampled block_m=512 (M-paired tiles) and pin the knob
         # its codegen envelope requires: both TMEM acc stages repurposed
         # as the pair's accumulators. cluster_n stays searchable in
@@ -1973,7 +2065,15 @@ def _fix_cluster_m2_search_config(
     else:
         block_sizes[n_index] = TCGEN05_TWO_CTA_BLOCK_N
     _fix_batched_cluster_n2_search_config(state, config, block_sizes[n_index])
-    if edge_k_tail_family:
+    # The edge family's pins below are the 256-row pair's. An M-paired
+    # tile keeps its sampled rings, tile order (``l2_groupings``, L2
+    # swizzle) and acc-wait / C-acquire placements, as over a whole K: on
+    # 2048x4096x50264 the pair's ``tcgen05_acc_stages=1`` would turn the
+    # 512x256x128 seeds into "block_m=512 (tcgen05 M-paired tiles)
+    # requires ... tcgen05_acc_stages=2", and its five-stage deep ring,
+    # sized for 256 A rows, would replace the 512x256x64 seeds' three
+    # 48 KiB stages.
+    if edge_k_tail_family and not m_paired:
         if (
             not state.aux_kernel_detected
             and not is_narrow_clc_aux_tma
@@ -2842,14 +2942,16 @@ def _normalize_dense_aligned_n(
     if fix_invalid:
         view = facts._matmul_config_view(state, config)
         block_m = facts._dense_aligned_n_block_m(state)
+        m_paired = False
         if view is not None and block_m is not None:
             blocks, mi, ni, ki = view
             blocks = list(blocks)
             # a sampled pair M the family runs stays (the 128-row pair where
-            # ``dense_aligned_n_block_ms`` admits it), any other takes the
-            # default
+            # ``dense_aligned_n_block_ms`` admits it, the M-paired tile), any
+            # other takes the default
             if blocks[mi] not in facts._dense_aligned_n_block_ms(state):
                 blocks[mi] = block_m
+            m_paired = blocks[mi] == 2 * TCGEN05_TWO_CTA_BLOCK_M
             blocks[ni] = carrier_n(width)
             if facts._dense_aligned_n_sixteen_bit(state):
                 blocks[ki] = DENSE_ALIGNED_N_SIXTEEN_BIT_BLOCK_K
@@ -2857,7 +2959,8 @@ def _normalize_dense_aligned_n(
                 blocks[ki] = 64
             config["block_sizes"] = blocks
         acc_stages = config.get("tcgen05_acc_stages", 2)
-        if type(acc_stages) is not int or acc_stages not in (1, 2):
+        # (the M-paired tile holds one subtile in each accumulator stage)
+        if type(acc_stages) is not int or acc_stages not in (1, 2) or m_paired:
             acc_stages = 2
         store_mode = config.get("tcgen05_c_store_mode", "normal")
         dense = state.dense_gemm_facts
@@ -2909,7 +3012,9 @@ def _normalize_dense_aligned_n(
             "unchanged tile bounds; for FP8 whole M and N tiles; for 16-bit "
             "whole K tiles under a partial last M tile, a width that is "
             "a multiple of 32 over an N-major B, the normal (TMA) store and "
-            "one N tile per cluster for a column-major output, an "
+            "one N tile per cluster for a column-major output, for the "
+            "M-paired tile (block_m=512) whole 512-row M tiles of a plain "
+            "GEMM and both accumulator stages, an "
             "epilogue subtile that divides the physical width, and a "
             "persistent pid type (FP32 outputs with a partial last K tile "
             "have none)"
@@ -4902,7 +5007,9 @@ def _is_validated_clc_persistence_search_candidate(
         # cluster_m=2 shape (bm/bn are forced to the 256x256 tile and bk
         # to a valid edge bk by _fix_cluster_m2_search_config).
         if not (
-            _is_validated_cluster_m2_full_tile_search_candidate(state, config)
+            _is_validated_cluster_m2_full_tile_search_candidate(
+                state, config, allow_cluster_n2=True
+            )
             or _is_validated_cluster_m2_edge_search_candidate(state, config)
         ):
             return False
@@ -5328,13 +5435,26 @@ def _is_validated_cluster_m2_edge_search_candidate(
     if config.get("tcgen05_cluster_m") != 2:
         return False
     constraints = state.cluster_m2_search_constraints
-    if constraints is None:
+    if constraints is None or not constraints.allow_edge_k_tail_family:
         return False
-    return constraints.allow_edge_k_tail_family
+    # The M-paired 512-row 2x2 tile keeps its static projection over a K
+    # tail as over a whole K (``_is_validated_cluster_m2_full_tile_search_candidate``):
+    # its CLC run is not part of the validated surface, and on the K-tail
+    # GEMM it reaches (bf16 4096x2048x50264 RR, transposed) the CLC 2x2
+    # measured 0.963 of cuBLAS against the static 2x2's 0.996.
+    config_view = facts._matmul_config_view(state, config)
+    return not (
+        config.get("tcgen05_cluster_n", 1) == 2
+        and config_view is not None
+        and config_view[0][config_view[1]] == 2 * TCGEN05_TWO_CTA_BLOCK_M
+    )
 
 
 def _is_validated_cluster_m2_full_tile_search_candidate(
-    state: CuteTcgen05Config, config: dict[str, object]
+    state: CuteTcgen05Config,
+    config: dict[str, object],
+    *,
+    allow_cluster_n2: bool = False,
 ) -> bool:
     # Cycle 46: full-tile cluster_m=2 candidate gate for aux-TMA admission.
     # After ``_fix_cluster_m2_search_config`` projects a full-tile sample to
@@ -5342,6 +5462,13 @@ def _is_validated_cluster_m2_full_tile_search_candidate(
     # this returns True so aux-TMA stays during the search-time fixup.
     # bk validity is already enforced by ``_fix_cluster_m2_search_config``;
     # we re-check it here so a stale/unprojected config cannot slip through.
+    # The aux-TMA admission is a 2x1 family; the CLC search
+    # (``_is_validated_clc_persistence_search_candidate``) also takes the
+    # 4-CTA cluster of 256-row pairs (``allow_cluster_n2``), whose CLC seed
+    # this gate otherwise projected onto the static schedule.  The M-paired
+    # 512-row 2x2 tile keeps that static projection (no CLC run of it on a
+    # GPU), here and over a K tail
+    # (``_is_validated_cluster_m2_edge_search_candidate``).
     if config.get("tcgen05_cluster_m") != 2:
         return False
     constraints = state.cluster_m2_search_constraints
@@ -5353,7 +5480,7 @@ def _is_validated_cluster_m2_full_tile_search_candidate(
         return False
     if config.get("pid_type") != TCGEN05_TWO_CTA_SEED_PID_TYPE:
         return False
-    if config.get("tcgen05_cluster_n", 1) != 1:
+    if config.get("tcgen05_cluster_n", 1) not in ((1, 2) if allow_cluster_n2 else (1,)):
         return False
     config_view = facts._matmul_config_view(state, config)
     if config_view is None:
@@ -5363,6 +5490,11 @@ def _is_validated_cluster_m2_full_tile_search_candidate(
         TCGEN05_TWO_CTA_BLOCK_M,
         # M-paired tiles: two 256-row subtiles per work tile.
         2 * TCGEN05_TWO_CTA_BLOCK_M,
+    ):
+        return False
+    if (
+        config.get("tcgen05_cluster_n", 1) == 2
+        and block_sizes[m_index] != TCGEN05_TWO_CTA_BLOCK_M
     ):
         return False
     if block_sizes[n_index] != TCGEN05_TWO_CTA_BLOCK_N:
@@ -5416,6 +5548,19 @@ def _fix_cluster_m1_persistent_search_config(
     ):
         # (a kernel whose M range leaves out 128 rows keeps its sampled M)
         block_sizes[m_index] = bm = min(bm, TCGEN05_ONE_CTA_MAX_BLOCK_M)
+    k_tail_n = state.k_tail_persistent_n
+    bn = block_sizes[n_index]
+    if k_tail_n is not None and type(bn) is int and bn > k_tail_n:
+        # A K tail admitted to the persistent schedule over N tiles narrower
+        # than the search's widest (``search_plan``'s
+        # ``allow_k_tail_persistent_pid_types``) runs whole tiles only: bf16
+        # 16384x384x54 sampled at 256 columns leaves a partial last N tile,
+        # on which the K tail drops TMA for the shared scalar body, whose
+        # host guard refuses the launch:
+        #     if _helion_tcgen05_persistent_total_tiles > 1:
+        #         raise RuntimeError('Helion CuTe persistent + tcgen05 currently supports ...')
+        # Narrowed to 128 columns, the sample runs the TMA K-tail kernel.
+        block_sizes[n_index] = k_tail_n
     bn, bk = block_sizes[n_index], block_sizes[k_index]
     if (
         state.output_edge_persistent_admitted
@@ -6517,15 +6662,16 @@ def fix_search_config(state: CuteTcgen05Config, config: dict[str, object]) -> No
     # These repairs read the repaired pid type, cluster and tile, so they
     # run last, on every path of the body (its early returns included:
     # the one-CTA pipeline, the dense-N tile, the materialized chains
-    # and the explicit pair): the persistent grid cap is inert once a
-    # projection drops the cluster to one N tile, an edge or K-tail
-    # sample's swizzle is inert on a flat walk and refused under two
-    # N clusters, and the split-K knobs apply only on the flat one-CTA
-    # family.
+    # and the explicit pair): an edge or K-tail sample's swizzle is inert
+    # on a flat walk and refused under two N clusters, the split-K knobs
+    # apply only on the flat one-CTA family, and the persistent grid cap
+    # is inert once a projection drops the cluster to one N tile, splits
+    # its K or launches it with a fallback (judged after both knobs).
     _fix_edge_swizzle_search_config(state, config)
-    _fix_persistent_grid_cap_search_config(state, config)
     _normalize_split_k(state, config, fix_invalid=True)
     _normalize_split_k_exchange(state, config, fix_invalid=True)
+    _normalize_fallback_cluster(state, config, fix_invalid=True)
+    _fix_persistent_grid_cap_search_config(state, config)
     _fix_split_k_workspace_search_config(state, config)
     # The L2 swizzle was clamped in ``normalize_pre_pid_type`` against the
     # sampled tile; the projections above may have widened the N tile or
@@ -6707,6 +6853,71 @@ def _fix_one_tile_ab_stages_search_config(
     cap = one_tile_ab_stage_cap(state, config)
     if cap is not None:
         config["tcgen05_ab_stages"] = cap
+
+
+# The pair tile width of the 2x2 cluster that splits a one-tile N
+# (``split_n_cluster_c_stages``), and its C stages: two tiles of its CTAs' two
+# (128, 32) subtiles.
+TCGEN05_SPLIT_N_CLUSTER_BLOCK_N = 64
+TCGEN05_SPLIT_N_CLUSTER_C_STAGES = 4
+
+
+def split_n_cluster_c_stages(state: CuteTcgen05Config) -> int | None:
+    """The C ring of a 16-bit tall product whose N is one 128-wide tile,
+    run as a 2x2 cluster of 256x64 CTA pairs: the cluster's two pairs split
+    N, each A tile multicast to both, and each CTA stores a 128x64 tile in
+    two (128, 32) subtiles. The seeds give that cluster's bk=64 ring
+    ``TCGEN05_SPLIT_N_CLUSTER_C_STAGES`` (two tiles' subtiles) beside the
+    deepest A/B ring that fits, where the walk runs at least
+    ``TCGEN05_EPILOGUE_BOUND_MIN_WAVES`` waves of 256x64 pair tiles and the
+    epilogue plain; None where the product is not such a product.
+
+    bf16 401408x128x128 (3136 pair tiles, 41 waves, an output as large as
+    A): the 2x2 twin the paired pipeline seeds keeps two C stages and ten
+    A/B stages, so each tile's first subtile waits until the previous tile's
+    first subtile's TMA store has left shared memory; with four, the
+    epilogue stages the next tile's subtiles at once:
+
+        tcgen05_ab_pipeline = _helion_tc_pro.make_tma_umma_pipeline(num_stages=9, ...)
+        tcgen05_sD_layout = cutlass.utils.blackwell_helpers.make_smem_layout_epi(
+            cutlass.BFloat16, cutlass.utils.layout.LayoutEnum.ROW_MAJOR,
+            tcgen05_store_epi_tile, 4)  # two C stages before
+
+    GB300, of cuBLAS (CUDA graphs over cold inputs, each mode in its own
+    blocks): nine A/B and four C stages 0.992-0.995, ten and two
+    0.985-0.986, eight and two 0.972, six and two 0.905; the 256x128 pair
+    0.971-0.979. The final selection's own timer ranks it ahead too: each
+    call after an L2 flush reads it in 33.97-34.02 us, the two-stage twin in
+    34.53-34.66 and the 256x128 pair in 34.26-34.88, so a seed is enough to
+    bring it within the search's reach. Where N spans more 64-wide
+    tiles the cluster re-reads A for every pair of N tiles and loses whatever
+    its C ring (401408x384x128: 0.65-0.92 against the pick's 0.997;
+    401408x512x128: 0.62-0.87 against 0.984), so the rule takes N of one
+    128-wide tile only; 32768x128x128 (256 pair tiles, 3.4 waves) keeps its
+    seeds.
+    """
+    pipeline_facts = state.pipeline_smem_facts
+    extents = state.matmul_compile_time_static_extents
+    if (
+        not state.search_enabled
+        or pipeline_facts is None
+        or pipeline_facts.input_dtype_bytes != 2
+        or pipeline_facts.has_auxiliary_loads
+        or state.aux_kernel_detected
+        or state.matmul_has_leading_passthrough
+        or extents is None
+        or any(type(value) is not int or value <= 0 for value in extents)
+        or state.device_sm_count <= 0
+    ):
+        return None
+    m, n, _k = cast("tuple[int, int, int]", extents)
+    if n != 2 * TCGEN05_SPLIT_N_CLUSTER_BLOCK_N:
+        return None
+    tiles = 2 * -(-m // TCGEN05_TWO_CTA_BLOCK_M)
+    pairs = (state.device_sm_count - state.persistent_reserved_sms) // 2
+    if tiles < TCGEN05_EPILOGUE_BOUND_MIN_WAVES * pairs:
+        return None
+    return TCGEN05_SPLIT_N_CLUSTER_C_STAGES
 
 
 def _apply_paired_pipeline_surface(
@@ -6932,6 +7143,9 @@ def _fix_persistent_grid_cap_search_config(
     samples, odd N tile counts) or leave a non-persistent walk; the knob
     then has no effect, and two samples differing only in it would be the
     same kernel twice. Keep the search schema's canonical representation.
+    A fallback-cluster launch (``tcgen05_fallback_cluster``) takes a slot
+    per four SMs whatever the cap; strict normalization still accepts an
+    explicit cap beside it.
     """
     if TCGEN05_PERSISTENT_GRID_CAP_CONFIG_KEY not in config:
         return
@@ -6941,6 +7155,7 @@ def _fix_persistent_grid_cap_search_config(
         and config.get("pid_type") in ("persistent_blocked", "persistent_interleaved")
         and config.get(TCGEN05_PERSISTENCE_MODEL_CONFIG_KEY)
         != Tcgen05PersistenceModel.CLC_PERSISTENT.value
+        and config.get(TCGEN05_FALLBACK_CLUSTER_CONFIG_KEY) is not True
     )
     if live:
         return
@@ -7093,14 +7308,16 @@ def normalize_strategy(
         # strict normalization (the autotuner compiled such neighbours of
         # the 256x128 hoist witness and lost them to the strict refusal).
         config[TCGEN05_AUX_FRAGMENT_HOIST_CONFIG_KEY] = False
+    # ``fix_search_config`` judged a sampled split on the repaired tuple;
+    # the strict pass judges an explicit one here, on the same facts.
+    _normalize_split_k(state, config, fix_invalid=fix_invalid)
+    _normalize_split_k_exchange(state, config, fix_invalid=fix_invalid)
+    _normalize_fallback_cluster(state, config, fix_invalid=fix_invalid)
     if fix_invalid:
         # ``_validate_cluster_n_pairs_n_tiles`` above may have dropped a
         # sampled N cluster whose tile count is odd; the persistent grid
         # cap ``fix_search_config`` judged live on that cluster is inert
         # on the final tuple and strict normalization refuses it, so it
-        # is re-judged here (same fixed-point rule as the hoist above).
+        # is re-judged here, after the split and the fallback it reads
+        # (same fixed-point rule as the hoist above).
         _fix_persistent_grid_cap_search_config(state, config)
-    # ``fix_search_config`` judged a sampled split on the repaired tuple;
-    # the strict pass judges an explicit one here, on the same facts.
-    _normalize_split_k(state, config, fix_invalid=fix_invalid)
-    _normalize_split_k_exchange(state, config, fix_invalid=fix_invalid)

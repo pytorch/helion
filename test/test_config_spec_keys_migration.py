@@ -180,7 +180,8 @@ _BASE_VALID_KEYS = """
     tcgen05_clc_query_pacing tcgen05_cluster_m tcgen05_cluster_n
     tcgen05_consumer_regs tcgen05_cta_group tcgen05_cubin_lineinfo
     tcgen05_diagnostic_invalid_output tcgen05_epi_subtile_n tcgen05_epi_warp_groups
-    tcgen05_epilogue_fanout tcgen05_epilogue_layout tcgen05_flat_role_coordinates
+    tcgen05_epilogue_fanout tcgen05_epilogue_layout tcgen05_fallback_cluster
+    tcgen05_flat_role_coordinates
     tcgen05_grouped_ab_tile_k tcgen05_grouped_balanced_workers
     tcgen05_grouped_ctas_per_sm tcgen05_grouped_d_shift
     tcgen05_grouped_dense_row_union tcgen05_grouped_external_direct_pointers
@@ -354,7 +355,8 @@ _BASE_BACKEND_SPECIFIC_KEYS = """
     tcgen05_c_stages tcgen05_c_store_mode tcgen05_clc_query_pacing tcgen05_cluster_m
     tcgen05_cluster_n tcgen05_consumer_regs tcgen05_cta_group tcgen05_cubin_lineinfo
     tcgen05_diagnostic_invalid_output tcgen05_epi_subtile_n tcgen05_epi_warp_groups
-    tcgen05_epilogue_fanout tcgen05_epilogue_layout tcgen05_flat_role_coordinates
+    tcgen05_epilogue_fanout tcgen05_epilogue_layout tcgen05_fallback_cluster
+    tcgen05_flat_role_coordinates
     tcgen05_grouped_ab_tile_k tcgen05_grouped_balanced_workers
     tcgen05_grouped_ctas_per_sm tcgen05_grouped_d_shift
     tcgen05_grouped_dense_row_union tcgen05_grouped_external_direct_pointers
@@ -587,7 +589,8 @@ _BASE_CUTE_ACCEPTED = """
     tcgen05_clc_query_pacing tcgen05_cluster_m tcgen05_cluster_n
     tcgen05_consumer_regs tcgen05_cta_group tcgen05_cubin_lineinfo
     tcgen05_diagnostic_invalid_output tcgen05_epi_subtile_n tcgen05_epi_warp_groups
-    tcgen05_epilogue_fanout tcgen05_epilogue_layout tcgen05_flat_role_coordinates
+    tcgen05_epilogue_fanout tcgen05_epilogue_layout tcgen05_fallback_cluster
+    tcgen05_flat_role_coordinates
     tcgen05_grouped_ab_tile_k tcgen05_grouped_balanced_workers
     tcgen05_grouped_ctas_per_sm tcgen05_grouped_d_shift
     tcgen05_grouped_dense_row_union tcgen05_grouped_external_direct_pointers

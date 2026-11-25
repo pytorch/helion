@@ -31,6 +31,7 @@ from helion._compiler.cute.tcgen05_config import facts
 from helion._compiler.cute.tcgen05_config import repair
 from helion._compiler.cute.tcgen05_config import seeds
 from helion._compiler.cute.tcgen05_config import surface
+from helion._compiler.cute.tcgen05_constants import TCGEN05_FALLBACK_CLUSTER_CONFIG_KEY
 from helion._compiler.cute.tcgen05_constants import TCGEN05_ONE_CTA_MAX_BLOCK_M
 from helion._compiler.cute.tcgen05_constants import TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY
 from helion._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_M
@@ -927,7 +928,16 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
                 ]
                 # Retain every original family and its baseline depth, while
                 # excluding the old deep-AB CLC seed when its budget is absent.
-                self.assertEqual(len(legacy), 6)
+                # Beside them the CLC 2x2 seed's twin launched with its pair
+                # as the fallback cluster (128 2x2 slots, at least one per
+                # four SMs of the device), at the same depth.
+                fallback = [
+                    seed
+                    for seed in legacy
+                    if seed.get(TCGEN05_FALLBACK_CLUSTER_CONFIG_KEY) is True
+                ]
+                self.assertEqual(len(fallback), 1)
+                self.assertEqual(len(legacy) - len(fallback), 6)
                 self.assertNotIn("tcgen05_ab_stages", legacy[0].config)
                 for seed in legacy:
                     self.assertIn(seed.get("tcgen05_ab_stages"), (None, 2))

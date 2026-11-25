@@ -206,6 +206,16 @@ def post_kernel_metadata_statements(
                 f"{fn.name}._helion_cute_cluster_shape = {fn.cute_state.tcgen05.cluster_shape!r}"
             )
         )
+    if fn.cute_state.tcgen05.fallback_cluster_shape is not None:
+        # ``tcgen05_fallback_cluster``: the launcher passes the fallback
+        # cluster beside the preferred one and lets the two bodies share
+        # their shared memory.
+        statements.append(
+            statement_from_string(
+                f"{fn.name}._helion_cute_fallback_cluster_shape = "
+                f"{fn.cute_state.tcgen05.fallback_cluster_shape!r}"
+            )
+        )
     return statements
 
 

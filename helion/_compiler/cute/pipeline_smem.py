@@ -366,13 +366,18 @@ def pipeline_smem_bytes(
     accumulator alone, nothing beside the AB and C rings), whose arena is
     priced as ptxas lays its allocations out
     (``tcgen05_fixed_smem_overhead_bytes``, measured from the cubins)
-    rather than with the flat reserve.
+    rather than with the flat reserve. ``bm=512`` is the M-paired tile: two
+    256-row subtiles, each CTA staging an A ring per subtile beside the one
+    B ring, its epilogue draining both subtiles through the 256-row pair's
+    C ring:
+
+        tcgen05_msub_smem_a = cute.arch.alloc_smem(cutlass.BFloat16, cute.cosize(sA_layout.outer), alignment=128)
     """
     from cutlass.utils.blackwell_helpers import compute_epilogue_tile_size
 
     # Non-power-of-two N widths are the aligned-N family's physical tiles.
     assert bn in (64, 128, 256) or (bn % 16 == 0 and 64 < bn < 256)
-    assert bm in (128, 256) and bk in (64, 128, 256)
+    assert bm in (128, 256, 512) and bk in (64, 128, 256)
     assert facts.input_dtype_bytes in (1, 2)
     assert facts.output_dtype_bytes in (2, 4)
     assert ab_stages > 0 and c_stages in (2, 4) and acc_stages in (1, 2)
@@ -380,7 +385,7 @@ def pipeline_smem_bytes(
     two_cta_m128 = bm == 128
     output_width = facts.output_dtype_bytes * 8
     epi_m, epi_n = compute_epilogue_tile_size(
-        bm // 2 if two_cta_m128 else bm,
+        bm // 2 if two_cta_m128 else min(bm, 256),
         bn,
         two_cta_m128,
         output_width,
