@@ -34,6 +34,44 @@ these labelled lines.
 - Why deferred: what a fix would take.
 - Pinned by: the tests that hold the current behavior, or none.
 
+## ambiguous-multi-input-reduction-callback
+
+- Area: Plain Python callbacks in compiled and eager `hl.reduce` with two
+  or more input tensors. Decorated reduction callbacks use the same layout
+  in both modes.
+- What is wrong: If a plain callback accepts both two operand tuples and all
+  their element tensors, the modes can disagree when the declared parameter
+  count is at least four but differs from twice the number of inputs.
+  Optional positional arguments or `*args` can make both calls valid.
+  For example:
+
+  ```python
+  def combine(left, right, i=0, j=1, *, op=torch.add):
+      return op(left[i], right[i]), op(left[j], right[j])
+
+  # In a kernel, for tile t spanning x = tensor([1, 2, 4, 8]):
+  a, b = hl.reduce(combine, (x[t], x[t] + 1), dim=0)
+  ```
+
+  Eager passes two tuples and produces 15 and 19. The compiler passes
+  four element tensors, binding the last two to `i` and `j`; Triton
+  fails to lower the resulting `aten.index.Tensor`. To request tuples
+  unambiguously, write `def combine(left, right, *, i=0, j=1, op=torch.add)`.
+
+  When both bodies lower, the same ambiguity can silently change the result:
+  `def combine(a, b, c=None, d=None, add=torch.add)` can sum corresponding
+  tuple entries if `c is None` and otherwise return pairwise maxima of
+  `(a, c)` and `(b, d)`. On the same inputs eager returns `(15, 19)`,
+  whereas the compiled result is `(8, 9)`.
+- Since: Both examples reproduced on `main` at `a2f18c2d0`.
+- Why deferred: Choosing one interpretation for signatures that accept
+  both would change the argument types of currently working compiled or
+  eager callbacks. A common convention needs a migration path, such as
+  deprecating the ambiguous signatures before changing their interpretation.
+- Pinned by: The `legacy_options` eager case in
+  `test/test_decorated_tuple_combine.py` preserves the working tuple
+  callback. No test requires the compiled failure.
+
 ## ptxas-signed-extrema-chains
 
 - Area: CuTe backend, elementwise integer extrema. The chain rule of

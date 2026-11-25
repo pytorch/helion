@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import inspect
 import itertools
 import operator
 from typing import TYPE_CHECKING
@@ -17,7 +16,6 @@ from . import _decorators
 if TYPE_CHECKING:
     from .._compiler.helper_function import CombineFunction
     from .._compiler.helper_function import CombineFunctionBasic
-    from .._compiler.helper_function import CombineFunctionTuple
 
 
 __all__ = ["reduce"]
@@ -107,12 +105,12 @@ def _(
     keep_dims: bool = False,
 ) -> torch.Tensor | tuple[torch.Tensor, ...]:
     """Reference implementation of reduce."""
-    from .._compiler.helper_function import extract_helper_function
-
-    # Extract the raw function if it's wrapped in a @helion.kernel decorator
-    combine_fn = extract_helper_function(combine_fn)
+    from .._compiler.helper_function import create_combine_function_wrapper
 
     is_tuple = isinstance(input_tensor, tuple)
+    combine_fn = create_combine_function_wrapper(
+        combine_fn, input_tensor, target_format="tuple", reduction_mode="eager"
+    )
 
     # Normalize inputs to always work with lists
     if not is_tuple:
@@ -144,25 +142,6 @@ def _(
     # Get metadata from first tensor
     first_tensor = input_data[0]
     shape, ndim = first_tensor.shape, first_tensor.ndim
-
-    # Check if unpacked arguments expected (tuple case only)
-    if is_tuple:
-        sig = inspect.signature(combine_fn)
-        num_params = len(sig.parameters)
-        expected_unpacked = 2 * len(input_data)  # All elements unpacked
-
-        if num_params == expected_unpacked:
-            # Wrap unpacked function to accept packed arguments
-            original_fn = cast("CombineFunctionTuple", combine_fn)
-
-            def wrapped_combine_fn2(
-                left_tuple: tuple[torch.Tensor, ...],
-                right_tuple: tuple[torch.Tensor, ...],
-            ) -> tuple[torch.Tensor, ...]:
-                # pyrefly: ignore [bad-return]
-                return original_fn(*left_tuple, *right_tuple)
-
-            combine_fn = wrapped_combine_fn2
 
     # Prepare reduction parameters
     if dim is None:
@@ -296,7 +275,7 @@ def _(
     # Extract the function name before wrapping
     original_function_name = extract_helper_function_name(combine_fn)
     combine_fn = create_combine_function_wrapper(
-        combine_fn, is_tuple_input=is_tuple_input, target_format="tuple"
+        combine_fn, input_tensor, target_format="tuple", reduction_mode="compiled"
     )
 
     # Create fake inputs for the combine function

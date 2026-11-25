@@ -85,74 +85,52 @@ CombineFunction = CombineFunctionBasic | CombineFunctionTuple
 
 def create_combine_function_wrapper(
     combine_fn: CombineFunction,
+    operands: torch.Tensor | tuple[torch.Tensor, ...],
     *,
-    is_tuple_input: bool,
     target_format: Literal["tuple", "unpacked"],
+    reduction_mode: Literal["compiled", "eager"] | None = None,
 ) -> CombineFunction:
-    """
-    Create a wrapper around combine_fn that converts between different combine function formats.
-
-    Args:
-        combine_fn: The original combine function
-        is_tuple_input: Whether the input is a tuple
-        target_format: Either 'tuple' or 'unpacked'. The 'tuple' option expects
-            (left_tuple, right_tuple) inputs, while 'unpacked' expects
-            (left_elem0, left_elem1, ..., right_elem0, right_elem1, ...) inputs
-
-    Returns:
-        A wrapper function that converts between the formats
-    """
-    # Extract the actual function (handles @helion.kernel decorated functions)
+    """Adapt a Python combine to the argument layout used by its caller."""
     actual_fn = extract_helper_function(combine_fn)
+    if not isinstance(operands, (tuple, list)):
+        # FX gets exactly the two operands, including for a callback with
+        # keyword-only defaults or **kwargs.
+        return lambda left, right: actual_fn(left, right)
 
-    # For single tensor inputs, no conversion needed
-    if not is_tuple_input:
-        return actual_fn
-
-    # Inspect the original function signature to determine its format
+    size = len(operands)
     sig = inspect.signature(actual_fn)
-    param_count = len(sig.parameters)
-
-    # Determine the original format based on parameter count
-    # If it has 2 parameters, it's tuple format: (left_tuple, right_tuple)
-    # If it has 4+ parameters, it's unpacked format: (left_elem0, left_elem1, ..., right_elem0, right_elem1, ...)
-    original_format = "tuple" if param_count < 4 else "unpacked"
-
-    # If the original format matches target format, no conversion needed
-    if target_format == original_format:
-        return actual_fn
-    combine_fn = cast("CombineFunctionTuple", combine_fn)
-
-    # Create conversion wrapper
-    if target_format == "tuple" and original_format == "unpacked":
-        # Convert from unpacked to tuple format
-        # Target: (left_tuple, right_tuple)
-        # Original: (left_elem0, left_elem1, ..., right_elem0, right_elem1, ...)
-        def tuple_wrapper(
-            left_tuple: tuple[torch.Tensor, ...], right_tuple: tuple[torch.Tensor, ...]
-        ) -> tuple[torch.Tensor, ...]:
-            return combine_fn(*left_tuple, *right_tuple)
-
-        return tuple_wrapper
-
-    if target_format == "unpacked" and original_format == "tuple":
-        # Convert from tuple to unpacked format
-        # Target: (left_elem0, left_elem1, ..., right_elem0, right_elem1, ...)
-        # Original: (left_tuple, right_tuple)
-        def unpacked_wrapper(*args: torch.Tensor) -> tuple[torch.Tensor, ...]:
-            num_args = len(args)
-            assert (num_args % 2) == 0
-            half = num_args // 2
-            left_tuple = args[:half]
-            right_tuple = args[half:]
-            return combine_fn((*left_tuple,), (*right_tuple,))
-
-        return unpacked_wrapper
-
-    # Should not reach here
-    raise ValueError(
-        f"Unsupported conversion from {original_format} to {target_format}"
+    # Previously, converting a decorated reduction called the Kernel again
+    # and failed. Use its working eager layout on the newly compilable path.
+    # Plain compiled callbacks and scans retain their existing convention.
+    prefer_eager = reduction_mode == "eager" or (
+        reduction_mode == "compiled" and actual_fn is not combine_fn
     )
+    count = len(sig.parameters)
+    flat = count == 2 * size if prefer_eager and size > 1 else count >= 4
+    packed_args = (None, None)
+    flat_args = packed_args * size
+    try:
+        sig.bind(*(flat_args if flat else packed_args))
+    except TypeError:
+        sig.bind(*(packed_args if flat else flat_args))
+        flat = not flat
+
+    # Give FX only the actual operands. Passing the original signature would
+    # also create placeholders for default parameters Python should supply.
+    fn = cast("CombineFunctionTuple", actual_fn)
+    if target_format == "tuple":
+
+        def from_tuples(
+            left: tuple[torch.Tensor, ...], right: tuple[torch.Tensor, ...]
+        ) -> tuple[torch.Tensor, ...]:
+            return fn(*left, *right) if flat else fn(left, right)
+
+        return from_tuples
+
+    def from_flat(*args: torch.Tensor) -> tuple[torch.Tensor, ...]:
+        return fn(*args) if flat else fn(args[:size], args[size:])
+
+    return from_flat
 
 
 class HelperCodegen(CodegenInterface):

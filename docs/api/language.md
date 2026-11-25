@@ -323,6 +323,45 @@ The `Tile` class represents a portion of an iteration space with the following k
 .. autofunction:: reduce
 ```
 
+(tuple-callback-layouts)=
+#### Tuple callback layouts
+
+For a tuple of `n` input tensors, the combine function can take either two
+tuples (`left, right`) or `2*n` element tensors (all left elements, then all
+right elements). If only one call fits the Python signature, Helion uses it.
+
+For two or more inputs, use a signature that accepts only the layout your
+callback expects. Optional positional parameters or `*args` can make both
+layouts fit; with a plain Python callback, an eager reduction can then
+succeed even when the same callback fails to compile. For a pair of tensors, use keyword-only options
+such as `def combine(left, right, *, i=0, j=1)` to receive two tuples.
+To receive the four element tensors, declare four required positional
+parameters.
+
+For a singleton input tuple, both layouts have two operands. A callback
+that accepts them receives tuples with fewer than four declared parameters
+and element tensors with four or more. For example, this callback receives
+two one-element tuples and returns one reduced value:
+
+```python
+def add_one(left, right):
+    return (left[0] + right[0],)
+
+(total,) = hl.reduce(add_one, (values,), dim=0)
+```
+
+Earlier eager reductions did the reverse for some singleton signatures: an
+exactly two-parameter function got element tensors, and a function with
+four or more parameters got tuples. Update the former to index `left[0]`
+and `right[0]` as above. To keep using tuples with configurable options,
+close over those options in a two-parameter function: both singleton
+layouts have two positional arguments, so keyword-only options cannot
+disambiguate them.
+
+For a single tensor passed as `values` instead of `(values,)`, the callback
+receives and returns tensors.
+
+
 ## Scan Operations
 
 `cumsum` and `cumprod` promote integer and boolean inputs to `torch.int64`
@@ -336,6 +375,8 @@ For integer `cumsum` on Pallas, supply an explicit supported dtype such as
 ```{eval-rst}
 .. autofunction:: associative_scan
 ```
+
+For tuple inputs, see {ref}`tuple-callback-layouts`.
 
 ### cumsum()
 
