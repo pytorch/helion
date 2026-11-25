@@ -7,16 +7,31 @@ clamped SwiGLU. W2 multiplies the requantized intermediate and writes BF16 to
 the two destination tensors only where the route belongs to that expert row.
 These kernels are separate from the routing benchmark in `bench.py`.
 
-The source comes from `meta-pytorch/dist_moe`, development commit
+The source comes from `meta-pytorch/dist_moe`, unpublished development commit
 `bcbf4b482f63128d3af8a348b22eb8fea79a891e`:
 `dist_moe/kernels/helion_nvfp4_g8.py` and the two-line scale-address helper in
 `dist_moe/kernels/helion_blockscaled.py`. The routing kernel in
 `layout_kernel.py` is adapted from `dist_moe/kernels/helion_routing_chunks.py`
 at the same commit. The Dist-MoE license is in [LICENSE.dist-moe](LICENSE.dist-moe).
 
+## Call signatures
+
+- `w13(a, w, sa, sw, out, row_scale, post, edges, alpha=None, limit=None)`
+  writes the activated BF16 values into `out` and returns it. Omit both
+  coefficients for ordinary SwiGLU, or pass both as positive finite numbers
+  for clamped SwiGLU. The host wrapper checks this before calling the kernel.
+- `_nvfp4_batched_peer_rows(a, w, sa, sw, row_scale, post, edges, routes,
+  owners, dest0, dest1)` writes the BF16 result to the routed peer slots and
+  returns `(dest0, dest1)`.
+
+In both calls, `a` and `w` hold packed E2M1 values, `sa` and `sw` hold their
+E4M3 block scales, and differences between adjacent `edges` give the live rows
+for each expert. `projection_inputs(role, device)` constructs arguments in
+the required order for a single rank.
+
 ## Render W2 on the public compiler
 
-From a checkout with the CuTe development dependencies installed:
+From the root of a checkout with the CuTe development dependencies installed:
 
 ```sh
 CUDA_VISIBLE_DEVICES="" TRITON_INTERPRET=1 HELION_BACKEND=cute python - <<'PYTHON'
@@ -27,7 +42,7 @@ from helion._compiler.cute.target_facts import GB300
 from helion._testing import cpu_render_target, default_cute_mma_support
 
 args = projection_inputs("w2", "cpu")
-with cpu_render_target(GB300, num_sm=152, matmul_num_sm=152,
+with cpu_render_target(GB300, matmul_num_sm=152,
                        mma_support=default_cute_mma_support(), fake_device_sm_count=152,
                        reduction_smem_budget_bytes=232448):
     bound = kernel.bind(kernel.normalize_args(*args))
@@ -38,8 +53,8 @@ PYTHON
 W2 uses generic lowering here. W13 is supplied as a compiler workload: the
 public backend declines its native block-scaled contraction; generic lowering
 with 16×16 output tiles cannot reshape the gate/up layout consumed by
-`hl.split`. Use the historical compiler and config below to reproduce its
-measured code.
+`hl.split`. Reproducing W13's measured code requires the unpublished Helion
+compiler revision below as well as its winning configuration.
 
 The fixture preserves the measured tensor shapes, strides, and W13 constants
 (`alpha=1.702`, `limit=7.0`). It uses deterministic synthetic values and
@@ -50,11 +65,13 @@ communication, the routing workload, or full-forward timing.
 
 Each projection had its own 48-proposal search. Both ranks selected the
 same W13 configuration and the same W2 configuration. The complete settings
-below are for the measured development compiler
+below are for the unpublished Helion development compiler
 `2c718b26f53c3831b18b3e9074a6cbfaca963575`. The public compiler lacks
 `cute_scaled_accumulator_stages`, `cute_scaled_gated_lane_pairs`,
-`cute_scaled_reuse_row_scale`, and `cute_scaled_warp_route`. No public
-performance result is implied by rendering W2. Using the full settings with
+`cute_scaled_reuse_row_scale`, and `cute_scaled_warp_route`. It also rejects
+two values: `cute_scaled_persistent="shared"` (only booleans are accepted)
+and W13's `cute_scaled_stages=6` (the public NVFP4 choices are 2 through 5).
+Rendering W2 with the public config does not measure its performance. Using the full settings with
 the historical compiler produced these SM103a cubins byte-for-byte for both
 ranks of the recorded full forward (SHA-256):
 

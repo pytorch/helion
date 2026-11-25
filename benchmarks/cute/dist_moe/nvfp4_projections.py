@@ -13,6 +13,7 @@ signatures, the historical GB300 configs, and how to render W2.
 
 from __future__ import annotations
 
+import math
 from typing import Annotated
 
 import torch
@@ -109,6 +110,7 @@ def _nvfp4_g8_batched_gate(
     return out
 
 
+# Dist-MoE used W13's native baseline here; public CuTe can render generic W2.
 @helion.kernel(
     backend="cute",
     static_shapes=True,
@@ -164,6 +166,30 @@ def _nvfp4_batched_peer_rows(
             belongs = (code // slots == peer) & (owners[peer, offset] == tag)
             hl.store(dest, [offset, n], value, extra_mask=live & belongs[:, None])
     return dest0, dest1
+
+
+def w13(
+    a: torch.Tensor,
+    w: torch.Tensor,
+    sa: torch.Tensor,
+    sw: torch.Tensor,
+    out: torch.Tensor,
+    row_scale: torch.Tensor,
+    post: torch.Tensor,
+    edges: torch.Tensor,
+    alpha: float | None = None,
+    limit: float | None = None,
+) -> torch.Tensor:
+    """Run W13 with ordinary SwiGLU or with two positive finite clamp coefficients."""
+    if (alpha is None) != (limit is None) or any(
+        type(v) not in (int, float) or not math.isfinite(v) or v <= 0
+        for v in (alpha, limit)
+        if v is not None
+    ):
+        raise ValueError("Pass both positive finite SwiGLU coefficients or neither")
+    return _nvfp4_g8_batched_gate(
+        a, w, sa, sw, out, row_scale, post, edges, alpha, limit
+    )
 
 
 def projection_inputs(
