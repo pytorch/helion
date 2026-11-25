@@ -21,6 +21,7 @@ from test.test_cute_register_tile_reductions import ROLLED_OWNER
 from test.test_cute_register_tile_reductions import _bind
 
 import helion
+from helion._compiler.autotuner_heuristics import compiler_seed_specialization_facts
 from helion._compiler.autotuner_heuristics import get_heuristics
 from helion._compiler.cute.autotune.heuristics.cute import CuteColumnReductionHeuristic
 from helion._compiler.cute.autotune.heuristics.cute import CuteRegisterTileHeuristic
@@ -37,6 +38,8 @@ pytestmark = [
 
 if TYPE_CHECKING:
     from collections.abc import Callable
+
+    from helion.runtime.kernel import BoundKernel
 
 
 def test_register_tile_heuristic_seeds_the_geometry() -> None:
@@ -236,6 +239,102 @@ def test_seed_tiles_narrow_extents_by_a_power_of_two() -> None:
         assert f"_launcher(_helion__narrow_col_sum, ({columns // block},)" in code
 
 
+def test_a_short_grid_seeds_a_narrower_tile() -> None:
+    # A column sum over 768 bf16 columns: the primary's 64-column tiles (8
+    # vector threads of 8 elements) make 12 CTAs, fewer than half of 148
+    # SMs, so a fourth seed halves the tile and its vectors while the grid
+    # stays that short, down to 2-element vectors: 48 CTAs of 16 columns,
+    # with the same threads and the schedule knobs. 16384 columns (256 CTAs)
+    # get no such seed.
+    for columns, narrow in ((768, (16, 2)), (16384, None)):
+        arguments = (
+            torch.empty((128, columns), dtype=torch.bfloat16),
+            torch.empty((columns,), dtype=torch.float32),
+        )
+        bound = cpu_bind(_narrow_col_sum, arguments)
+        host = bound.host_function
+        assert host is not None
+        seeds = CuteRegisterTileHeuristic.get_seed_configs(bound.env, host.device_ir)
+        assert seeds is not None
+        spec = bound.config_spec
+        (tile,) = spec.block_sizes.valid_block_ids()
+        widths = spec.cute_vector_widths.valid_block_ids()
+        tiles = [
+            (seed.block_sizes[0], seed.config["cute_vector_widths"][widths.index(tile)])
+            for seed in seeds
+        ]
+        if narrow is None:
+            assert len(seeds) == 3, tiles
+            continue
+        assert tiles == [(64, 8), (64, 8), (64, 8), narrow]
+        assert seeds[3].num_threads == seeds[1].num_threads
+        assert seeds[3].config["cute_register_tile_warp_fold"] is True
+        assert seeds[3].config["cute_register_tile_store_first"] is True
+        code = bound.to_code(seeds[3])
+        assert f"_launcher(_helion__narrow_col_sum, ({columns // 16},)" in code
+
+
+def test_the_short_grid_seed_keys_its_binding_on_the_sm_count() -> None:
+    # 4224 bf16 columns make 66 CTAs of 64 columns: not fewer than half of
+    # 132 SMs, fewer than half of 148, where the narrower tile (132 CTAs of
+    # 32 columns, 4-element vectors) joins the seeds. So a binding is keyed
+    # on the device's SM count (CACHE_SPECIALIZATION_FACTS): one made on 132
+    # SMs and reused on 148 would miss the narrower tile.
+    assert compiler_seed_specialization_facts(
+        "cute", ["cute_register_tile"]
+    ) == frozenset({"device_num_sm"})
+    arguments = (
+        torch.empty((128, 4224), dtype=torch.bfloat16),
+        torch.empty((4224,), dtype=torch.float32),
+    )
+    tiles = [
+        _seed_tiles(cpu_bind(_narrow_col_sum, arguments, num_sm=num_sm))
+        for num_sm in (132, 148)
+    ]
+    assert tiles[0] < tiles[1]
+    assert tiles[1] - tiles[0] == {(32, 4)}
+
+
+def _seed_tiles(bound: BoundKernel[object]) -> set[tuple[int, int]]:
+    """The (tile block, vector width) of the binding's compiler seeds that
+    set vector widths, for a kernel of one tiled block."""
+    spec = bound.config_spec
+    (tile,) = spec.block_sizes.valid_block_ids()
+    widths = spec.cute_vector_widths.valid_block_ids()
+    return {
+        (
+            seed.config["block_sizes"][0],
+            seed.config["cute_vector_widths"][widths.index(tile)],
+        )
+        for seed in spec.compiler_seed_configs
+        if "cute_vector_widths" in seed.config
+    }
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _batched_col_sum(x: torch.Tensor, out: torch.Tensor) -> None:
+    for tile_b, tile_c in hl.tile([x.size(0), x.size(2)], block_size=[1, None]):
+        out[tile_b, tile_c] = torch.sum(x[tile_b, :, tile_c].to(torch.float32), -2)
+
+
+def test_a_fixed_tile_counts_its_ctas_in_the_short_grid() -> None:
+    # 32 images of a column sum over 768 bf16 columns, the images a tile of
+    # fixed block 1 (no autotuner block size): the primary's 12 tiles of 64
+    # columns per image make 384 CTAs, more than half of 148 SMs, so no
+    # narrower tile joins the seeds; one image (12 CTAs) gets it.
+    for images, narrow in ((32, False), (1, True)):
+        arguments = (
+            torch.empty((images, 128, 768), dtype=torch.bfloat16),
+            torch.empty((images, 768), dtype=torch.float32),
+        )
+        bound = cpu_bind(_batched_col_sum, arguments)
+        host = bound.host_function
+        assert host is not None
+        seeds = CuteRegisterTileHeuristic.get_seed_configs(bound.env, host.device_ir)
+        assert seeds
+        assert (len(seeds) == 4) == narrow, (images, len(seeds))
+
+
 def test_chained_reductions_seed_half_the_lanes_per_level() -> None:
     # One reduction feeding another (two accumulate nests) stashes more of the
     # tile between the combines, so the seed halves the lanes per thread:
@@ -254,11 +353,14 @@ def test_chained_reductions_seed_half_the_lanes_per_level() -> None:
         block.block_id for block in bound.env.block_sizes if block.reduction
     ]
     thread_ids = spec.num_threads.valid_block_ids()
-    assert [seed.block_sizes for seed in seeds] == [[32], [32], [32]]
+    # The fourth seed is the narrower tile of a short grid (32 CTAs of 32
+    # columns on 148 SMs: 64 of 16, _short_grid_tile).
+    assert [seed.block_sizes for seed in seeds] == [[32], [32], [32], [16]]
     assert [seed.num_threads[thread_ids.index(reduction)] for seed in seeds] == [
         16,
         16,
         32,
+        16,
     ]
     default = spec.default_config()
     assert default.num_threads[thread_ids.index(reduction)] == 16

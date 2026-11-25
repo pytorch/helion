@@ -1628,6 +1628,9 @@ class CuteRegisterTileHeuristic(AutotunerHeuristic):
     backend = "cute"
     priority = 30
     promote_seed_to_default = True
+    # The narrower tile of a short grid depends on the SM count
+    # (_short_grid_tile).
+    CACHE_SPECIALIZATION_FACTS = frozenset({"device_num_sm"})
     VECTOR_THREADS = 8
 
     @classmethod
@@ -1754,7 +1757,9 @@ class CuteRegisterTileHeuristic(AutotunerHeuristic):
     def get_seed_configs(
         cls, env: CompileEnvironment, device_ir: DeviceIR
     ) -> list[Config] | None:
-        """``[primary, primary + schedule knobs, finer tile + schedule knobs]``.
+        """``[primary, primary + schedule knobs, finer tile + schedule knobs,
+        narrower tile + schedule knobs]`` (``_short_grid_tile``: for a grid of
+        fewer CTAs than half the SMs).
 
         The primary stays the autotune-off default.  The alternates make the
         schedule knobs searchable (``_flat_fields`` offers a knob only when a
@@ -1796,7 +1801,96 @@ class CuteRegisterTileHeuristic(AutotunerHeuristic):
                 {tile_block_id: tile_threads, reduction_block_id: finer},
             )
             alternates.append(Config.from_dict(finer_seed))
+        narrow = cls._short_grid_tile(env, device_ir, geometry)
+        if narrow is not None:
+            narrow_block, narrow_vec = narrow
+            narrow_seed = deepcopy(primary.config) | cls.SCHEDULE_KNOBS
+            narrow_seed["block_sizes"] = [
+                narrow_block if block_id == tile_block_id else 1
+                for block_id in spec.block_sizes.valid_block_ids()
+            ]
+            narrow_seed["cute_vector_widths"] = _seq_config_list(
+                spec.cute_vector_widths, {tile_block_id: narrow_vec}
+            )
+            alternates.append(Config.from_dict(narrow_seed))
         return [primary, *alternates]
+
+    @classmethod
+    def _short_grid_tile(
+        cls,
+        env: CompileEnvironment,
+        device_ir: DeviceIR,
+        geometry: tuple[int, int, int, int, int, int],
+    ) -> tuple[int, int] | None:
+        """``(tile block, vector width)`` of a narrower register tile for a
+        grid of fewer CTAs than half the SMs (the tiles of the vectorized
+        block times the CTAs of the grid's other blocks,
+        ``_other_block_ctas()``): the tile and its vectors halved together,
+        the same vector and reduction threads taking half the columns each,
+        while the grid stays that short and the vectors keep two elements or
+        more; None when the tile already fills that many CTAs. The primary's
+        eight vector threads of 16-byte vectors leave a column sum over a few
+        hundred columns a dozen CTAs, too few to fill the GPU."""
+        tile_block_id, tile_block, _tile_threads, _reduction, _threads, vec = geometry
+        num_sm = _device_num_sm(env)
+        if num_sm is None:
+            return None
+        numel = int(env.block_sizes[tile_block_id].numel)
+        other_ctas = _other_block_ctas(env, device_ir, tile_block_id)
+        if other_ctas is None:
+            return None
+        # The primary's tile divides the extent, and so does each half of it:
+        # the tile is its vector threads' packets, of 4 elements or more.
+        block, width = tile_block, vec
+        while numel // block * other_ctas < num_sm // 2 and width > 2:
+            block //= 2
+            width //= 2
+        if block == tile_block:
+            return None
+        return block, width
+
+
+def _device_num_sm(env: CompileEnvironment) -> int | None:
+    """The SM count of the kernel's device, or None where the device has
+    none to report (a CPU bind, a mocked host)."""
+    from .....runtime import get_num_sm
+
+    try:
+        return get_num_sm(env.device)
+    except (AssertionError, NotImplementedError):
+        return None
+
+
+def _other_block_ctas(
+    env: CompileEnvironment, device_ir: DeviceIR, block_id: int
+) -> int | None:
+    """The CTAs of the grid's blocks other than ``block_id``: one per element
+    of each tunable block, as the seeds that tile one block give the others,
+    and one per tile of a block of fixed size (``hl.tile(n, block_size=1)``,
+    which has no autotuner block size). None for a kernel of several root
+    loops, whose launch adds the roots' grids (``ForEachProgramID``)."""
+    if len(device_ir.grid_block_ids) != 1:
+        return None
+    tunable = {item.block_id: item.size_hint for item in env.config_spec.block_sizes}
+    ctas = 1
+    for other in device_ir.grid_block_ids[0]:
+        if other == block_id:
+            continue
+        if other in tunable:
+            ctas *= tunable[other]
+            continue
+        info = env.block_sizes[other]
+        if not isinstance(info.size, (int, torch.SymInt)):
+            continue
+        extent = env.size_hint(info.size)
+        source = info.block_size_source
+        block = (
+            env.size_hint(source.value)
+            if isinstance(source, FixedBlockSizeSource)
+            else 1
+        )
+        ctas *= -(-extent // max(block, 1))
+    return ctas
 
 
 def _cute_tile_seed_vec_width_for_dtype(dtype: torch.dtype | None) -> int:
@@ -6078,6 +6172,7 @@ class CuteStridedReductionHeuristic(AutotunerHeuristic):
     def _narrow_tile_shape(
         cls,
         env: CompileEnvironment,
+        device_ir: DeviceIR,
         tile_block_id: int,
         vec: int,
         tile_threads: int,
@@ -6097,19 +6192,14 @@ class CuteStridedReductionHeuristic(AutotunerHeuristic):
         a chunk stays shorter than the ``rows`` reduced);
         ``(tile threads, reduction threads, rows per chunk, lane unroll)``.
         """
-        from .....runtime import get_num_sm
-
-        try:
-            num_sm = get_num_sm(env.device)
-        except (AssertionError, NotImplementedError):
+        num_sm = _device_num_sm(env)
+        if num_sm is None:
             return None
         spec = env.config_spec
         extent = spec.block_sizes.block_id_lookup(tile_block_id).size_hint
-        other_ctas = math.prod(
-            item.size_hint
-            for item in spec.block_sizes
-            if item.block_id != tile_block_id
-        )
+        other_ctas = _other_block_ctas(env, device_ir, tile_block_id)
+        if other_ctas is None:
+            return None
         target = cls.NARROW_MIN_CTAS_PER_SM * num_sm
         default_columns = tile_threads * vec
         if num_sm <= 0 or other_ctas * -(-extent // default_columns) >= target:
@@ -6462,7 +6552,7 @@ class CuteStridedReductionHeuristic(AutotunerHeuristic):
         # The narrow seed joins when the first seed launches too few CTAs;
         # the one-chunk seed extends the 128-row-chunk shape.
         narrow = cls._narrow_tile_shape(
-            env, tile_block_id, vec, shapes[0][0], rl_spec.size_hint
+            env, device_ir, tile_block_id, vec, shapes[0][0], rl_spec.size_hint
         )
         if narrow is not None:
             shapes.append(narrow)
@@ -11004,13 +11094,8 @@ class CuteTcgen05ClusterM2Heuristic(AutotunerHeuristic):
         fact = facts[0]
         if fact.static_m is None or fact.static_n is None:
             return True
-        from .....runtime import get_num_sm
-
-        try:
-            num_sm = get_num_sm(env.device)
-        except (AssertionError, NotImplementedError):
-            return True
-        if num_sm <= 0:
+        num_sm = _device_num_sm(env)
+        if num_sm is None or num_sm <= 0:
             return True
         clusters = (fact.static_m // TCGEN05_TWO_CTA_FP8_SMALL_GRID_BLOCK_M) * (
             fact.static_n // TCGEN05_TWO_CTA_FP8_SMALL_GRID_BLOCK_N

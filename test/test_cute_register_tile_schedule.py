@@ -328,7 +328,8 @@ def test_seed_alternates_carry_the_knobs_and_the_finer_tile() -> None:
     reduction_threads = [
         seed.num_threads[thread_ids.index(reduction)] for seed in seeds
     ]
-    assert reduction_threads == [8, 8, 16]
+    # The fourth seed is the narrower tile of a short grid (_short_grid_tile).
+    assert reduction_threads == [8, 8, 16, 8]
     for seed in seeds[1:]:
         assert seed.config["cute_register_tile_warp_fold"] is True
         assert seed.config["cute_register_tile_store_first"] is True
@@ -339,7 +340,7 @@ def test_seed_alternates_carry_the_knobs_and_the_finer_tile() -> None:
         for seed in spec.compiler_seed_configs
         if seed.config.get("cute_register_tile_warp_fold") is True
     ]
-    assert len(planted) == 2
+    assert len(planted) == 3
     fields = spec._flat_fields()
     for key in KNOBS:
         assert fields[key].search_choices == (False, True)
@@ -373,9 +374,11 @@ def test_wide_seed_alternates_leave_the_cooperative_fold_to_the_config() -> None
     reduction_threads = [
         seed.num_threads[thread_ids.index(reduction)] for seed in seeds
     ]
-    assert reduction_threads == [16, 16, 32]
+    # The fourth seed is the narrower tile of a short grid (_short_grid_tile).
+    assert reduction_threads == [16, 16, 32, 16]
     assert [seed.config.get("cute_register_tile_warp_fold") for seed in seeds] == [
         None,
+        True,
         True,
         True,
     ]
