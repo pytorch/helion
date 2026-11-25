@@ -1141,9 +1141,41 @@ def gather_square_third(x: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
     return out
 
 
+@helion.kernel(backend="metal", static_shapes=True)
+def fold_rows_down(x: torch.Tensor, step: hl.constexpr) -> torch.Tensor:
+    """``acc = acc / 2 + x[i]`` for i from the last row down to row 0 in
+    steps of ``step``: a descending ``hl.grid``."""
+    m, n = x.size()
+    out = torch.empty([n], dtype=torch.float32, device=x.device)
+    for tile_n in hl.tile(n):
+        acc = hl.zeros([tile_n], dtype=torch.float32)
+        for i in hl.grid(m - 1, -1, step):
+            acc = acc * 0.5 + x[i, tile_n]
+        out[tile_n] = acc
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Tests – index arithmetic
 # ---------------------------------------------------------------------------
+
+
+@_requires_darwin
+class TestMetalDescendingGrid(unittest.TestCase):
+    def test_descending_grid_runs_every_step(self) -> None:
+        """A negative step's loop runs while its index is above the end, as
+        Python's range does: ``offset > end``, not ``offset < end``, which
+        ran no step."""
+        x = torch.randn(7, 64, device=DEVICE)
+        config = helion.Config(block_sizes=[32])
+        for step in (-1, -2):
+            with self.subTest(step=step):
+                out, _, msl = run_with_msl(fold_rows_down, (x, step), config)
+                expected = torch.zeros(64, device=DEVICE)
+                for row in range(6, -1, step):
+                    expected = expected * 0.5 + x[row]
+                torch.testing.assert_close(out, expected)
+                self.assertRegex(msl, r"for \(int (\w+) = 6; \1 > \(-1\);")
 
 
 @_requires_darwin

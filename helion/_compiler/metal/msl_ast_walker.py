@@ -721,6 +721,22 @@ def _emit_coop_run(
         state.declare(name)
 
 
+def _range_condition(var: str, end: str, step: ast.expr | None) -> str:
+    """The C condition of a ``range(start, end, step)`` loop over ``var``, as
+    Python's: ``var > end`` for a negative literal step (a descending
+    ``hl.grid``), else ``var < end`` (a tile loop steps by its block size,
+    which is positive)."""
+    if (
+        isinstance(step, ast.UnaryOp)
+        and isinstance(step.op, ast.USub)
+        and isinstance(step.operand, ast.Constant)
+        and type(step.operand.value) is int
+        and step.operand.value > 0
+    ):
+        return f"{var} > {end}"
+    return f"{var} < {end}"
+
+
 def _emit_for(
     stmt: ast.For,
     parts: list[str],
@@ -918,8 +934,9 @@ def _emit_for(
         state.split_loops.append(loop_var)
     before, top = prefetch_loads(stmt.body, loop_var, end, pad, state)
     parts += before
+    cond = _range_condition(loop_var, end, args[2] if len(args) >= 3 else None)
     parts.append(
-        f"{pad}for (int {loop_var} = {start}; {loop_var} < {end}; {loop_var} += {step}) {{"
+        f"{pad}for (int {loop_var} = {start}; {cond}; {loop_var} += {step}) {{"
     )
     parts += top
     with state.block_scope():
