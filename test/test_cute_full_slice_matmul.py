@@ -346,6 +346,12 @@ def _run_transformed_reference(
         if not isinstance(node, ast.For):
             continue
         assert isinstance(node.iter, ast.Call)
+        if (
+            isinstance(node.iter.func, ast.Attribute)
+            and node.iter.func.attr == "static_range"
+        ):
+            # the rank-1 updates' unrolled K loop takes no block size
+            continue
         if isinstance(node.target, (ast.Tuple, ast.List)):
             value = ast.List(elts=[ast.Constant(8), ast.Constant(16)], ctx=ast.Load())
         else:
@@ -714,3 +720,82 @@ def test_fission_first_stage_gets_its_own_k_loop() -> None:
     with _cpu_target():
         code = bound.to_code(helion.Config(block_sizes=[16, 16, 16, 16, 32, 16]))
     ast.parse(code)
+
+
+def _stored(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    # helion.inductor's persistent-reduction form of a dot whose K is one block
+    out = torch.empty([a.size(0), b.size(1)], dtype=a.dtype, device=a.device)
+    for row, column in hl.tile([a.size(0), b.size(1)]):
+        tmp0 = a[row, :]
+        tmp1 = b[:, column]
+        tmp2 = torch.mm(tmp0, tmp1)
+        out[row, column] = tmp2
+    return out
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("k", [1, 2, 8])
+def test_short_contraction_is_unrolled_rank1_updates(
+    dtype: torch.dtype, k: int
+) -> None:
+    args = _inputs((24, 40, k), dtype)
+    bound = _bind(_stored, args)
+    # no K loop, so no matmul and no K block to tune
+    assert bound.config_spec.matmul_facts == []
+    assert len(bound.config_spec.block_sizes) == 2
+    text = _source(bound)
+    assert f"for _helion_fullslice_k in hl.static_range({k}):" in text
+    assert (
+        "_helion_fullslice_acc = _helion_fullslice_acc + "
+        "a[row, _helion_fullslice_k].to(torch.float32)[:, None] * "
+        "b[_helion_fullslice_k, column].to(torch.float32)[None, :]"
+    ) in text
+    assert "tmp2 = _helion_fullslice_acc.to(a.dtype)" in text
+    assert "torch.addmm" not in text
+    actual = _run_transformed_reference(bound, args)
+    expected = (args[0].float() @ args[1].float()).to(dtype)
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("k", [9, 16])
+def test_longer_contraction_keeps_its_k_loop(k: int) -> None:
+    bound = _bind(_stored, _inputs((24, 40, k)))
+    assert bound.config_spec.matmul_facts[0].k_block_id == 2
+    text = _source(bound)
+    assert "hl.static_range" not in text
+    assert "torch.addmm(_helion_fullslice_acc, a[row, _helion_fullslice_k]" in text
+
+
+def test_rank1_updates_of_a_single_axis_root_take_its_n_tile() -> None:
+    args = _inputs((16, 32, 4))
+    bound = _bind(_single_axis_direct, args)
+    assert _host(bound).device_ir.grid_block_ids == [[0, 1]]
+    assert bound.config_spec.matmul_facts == []
+    text = _source(bound)
+    assert "for row, _helion_fullslice_n in hl.tile([m, b.size(1)])" in text
+    assert "hl.static_range(4)" in text
+    assert "b[_helion_fullslice_k, _helion_fullslice_n]" in text
+    actual = _run_transformed_reference(bound, args)
+    expected = torch.relu((args[0].float() @ args[1].float()).half())
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+
+
+def test_rank1_updates_store_vectors_along_n() -> None:
+    """bf16 [64, 2] @ [2, 256] on a [16, 256] tile, eight outputs a thread:
+    one 16-byte load of each b row, two FMAs an output, one 16-byte store,
+    where the K loop's SIMT body walks a masked 16-step loop per output."""
+    bound = _bind(_stored, _inputs((64, 256, 2), torch.bfloat16))
+    with _cpu_target():
+        code = bound.to_code(
+            helion.Config(
+                block_sizes=[16, 256],
+                num_threads=[16, 32],
+                loop_orders=[[1, 0]],
+                cute_vector_widths=[1, 8],
+            )
+        )
+    ast.parse(code)
+    assert code.count("cute.math.fma(") == 2
+    assert "ir.VectorType.get([8], cutlass.Uint16.mlir_type)" in code
+    assert "_cute_store_u16_vec(out.iterator" in code
+    assert "range(16)" not in code

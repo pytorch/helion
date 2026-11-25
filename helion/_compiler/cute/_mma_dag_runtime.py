@@ -37,6 +37,8 @@ from ._warp_mma_runtime import ldg_v2_f32  # noqa: F401
 from ._warp_mma_runtime import unpack_bf16x2  # noqa: F401
 from .device.ptx import ASM_KW
 from .device.ptx import bits_f32  # noqa: F401
+from .device.ptx import copy_s2g_b16  # noqa: F401
+from .device.ptx import copy_s2g_b32  # noqa: F401
 from .device.ptx import cp_async_4  # noqa: F401
 from .device.ptx import cp_async_16  # noqa: F401
 from .device.ptx import cp_async_16_ca  # noqa: F401
