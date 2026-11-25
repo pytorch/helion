@@ -121,6 +121,12 @@ class Tcgen05ClusterM2SearchConstraints(NamedTuple):
     # FFI direct-entry coordinate, the aux-TMA surface) and a sampled
     # cluster_m=2 candidate that is not a one-wave tile runs on one CTA.
     one_wave_only: bool = False
+    # When True, the edge K-tail family's 64-wide 128-row pairs are the only
+    # reason cluster_m=2 search is on (its 128x128 pairs would not fill a
+    # quarter of the SMs): the family runs those pairs alone
+    # (``repair.plain_pair128_widths``) and any other sampled cluster_m=2
+    # candidate runs on one CTA.
+    edge_pair128_only: bool = False
     # When True, the CTA pairs take K in one k-block (``bk == static_k``): a
     # batched 16-bit GEMM whose K is one 64-deep K tile at most, whose pairs
     # the final selection's per-call timing misranks when they split that K

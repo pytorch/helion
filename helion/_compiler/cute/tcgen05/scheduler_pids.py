@@ -56,6 +56,7 @@ from ..tcgen05_constants import TCGEN05_SCHED_CONSUMER_WAIT_MODE_NORMAL
 from ..tcgen05_constants import TCGEN05_SCHED_CONSUMER_WAIT_MODE_WARP_LEADER
 from ..tcgen05_constants import TCGEN05_SCHED_STAGE_COUNT_CONFIG_KEY
 from ..tcgen05_constants import TCGEN05_TWO_CTA_MAX_K_TILES
+from ..tcgen05_constants import TCGEN05_TWO_CTA_SIXTEEN_BIT_MAX_K_TILES
 from ..tcgen05_constants import Tcgen05GroupedRuntimeTileField
 from ..tcgen05_constants import tcgen05_cluster_split_k
 from ..tcgen05_prologue import inline_floordiv_nonneg_expr
@@ -560,8 +561,6 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
             return None
         return inline_floordiv_nonneg_expr, inline_mod_nonneg_expr
 
-    _VALIDATED_TWO_CTA_MAX_K_TILES: ClassVar[int] = TCGEN05_TWO_CTA_MAX_K_TILES
-
     # One-shot TMA-load role setup split out of the body
     # (``_split_tcgen05_invariant_setup``): the role's prelude.  (A class
     # default: the splitter's unit tests build the object without
@@ -778,7 +777,7 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
             plan is not None
             and plan.is_two_cta
             and plan.uses_role_local_persistent_body
-            and plan.k_tile_count <= self._VALIDATED_TWO_CTA_MAX_K_TILES
+            and plan.k_tile_count <= plan.max_two_cta_k_tiles
         )
 
     def _tcgen05_output_tile_dims_expr(self, *, is_device: bool) -> list[str]:
@@ -1966,12 +1965,17 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
 
     # Error message body for the multi-tile guard. Kept as a class constant so
     # the test pin and the error path stay in sync. ``%d`` is filled in at
-    # runtime with the bound total-tile count.
+    # runtime with the bound total-tile count. The K-tile limit is the
+    # role-local pair's (``CuteTcgen05MatmulPlan.max_two_cta_k_tiles``:
+    # ``tcgen05_two_cta_max_k_tiles`` of the operand dtype).
     _MULTI_TILE_GUARD_MESSAGE: ClassVar[str] = (
         "Helion CuTe persistent + tcgen05 currently supports runtime "
         "execution only for validated single-root static full tiles: "
         "tcgen05_cluster_m=1 or role-local CtaGroup.TWO "
-        "tcgen05_cluster_m=2 with at most 256 K tiles. Partial K/M/N tile "
+        "tcgen05_cluster_m=2 with at most "
+        f"{TCGEN05_TWO_CTA_SIXTEEN_BIT_MAX_K_TILES} K tiles over 16-bit "
+        f"operands ({TCGEN05_TWO_CTA_MAX_K_TILES} over other dtypes). "
+        "Partial K/M/N tile "
         "fallback shapes, CtaGroup.TWO shapes above the validated K-tile "
         "limit, multi-root kernels, and unvalidated cluster_m settings can "
         "produce wrong output, hang, or launch-fail. The kernel was launched "
@@ -1979,8 +1983,8 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         "scheduler set for this path. "
         'Use a non-persistent pid_type (e.g. "flat"), pick a single-root '
         "static-full-tile kernel with tcgen05_cluster_m=1, or pick a "
-        "validated single-root static-full CtaGroup.TWO shape with at most "
-        "256 K tiles."
+        "validated single-root static-full CtaGroup.TWO shape within that "
+        "K-tile limit."
     )
 
     def _emit_host_multi_tile_guard(

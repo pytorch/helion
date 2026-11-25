@@ -40,7 +40,31 @@ TCGEN05_TWO_CTA_EDGE_K_TAIL_NARROW_BLOCK_K = 256
 # CLC + aux-TMA row runs faster with two accumulator stages than the historical
 # edge-family default.
 TCGEN05_TWO_CTA_EDGE_K_TAIL_NARROW_ACC_STAGES = 2
+# The K tiles a CtaGroup.TWO pair loops over (``k_tile_count``) where
+# ``tcgen05_two_cta_max_k_tiles`` sets no deeper bound: the envelope the FP8,
+# grouped, N-edge-cluster and default-heuristic families were validated in.
 TCGEN05_TWO_CTA_MAX_K_TILES = 256
+# A 16-bit dense pair's K-tile bound (the search's cluster_m=2 admission, the
+# aligned-N plan, the role-local runtime). The pair's K loop is a runtime loop
+# whatever its trip count:
+#     for tile_offset_2 in range(cutlass.Int32(0), cutlass.Int32(50272), cutlass.Int32(_BLOCK_SIZE_2)):
+# so the bound only covers what has been measured: twice the deepest GEMM
+# timed (4096x1536x128104: 2002 tiles of 64). At 256 tiles (K = 16384 at
+# bk = 64) every deeper GEMM ran one-CTA tiles: GB300, bf16, full-effort
+# autotune, of stock Inductor (cuBLAS), one-CTA -> pair: 4096x1536x128104
+# 0.63 -> 0.98, 8192x768x50272 0.75 -> 0.97, 32768x512x30528 0.90 -> 1.07,
+# 16384x768x30528 0.93 -> 1.11, 32768x768x30528 0.93 -> 1.12.
+TCGEN05_TWO_CTA_SIXTEEN_BIT_MAX_K_TILES = 4096
+
+
+def tcgen05_two_cta_max_k_tiles(itemsize: int) -> int:
+    """The K tiles a dense CtaGroup.TWO pair over operands of ``itemsize``
+    bytes loops over at most (16-bit: ``TCGEN05_TWO_CTA_SIXTEEN_BIT_MAX_K_TILES``)."""
+    if itemsize == 2:
+        return TCGEN05_TWO_CTA_SIXTEEN_BIT_MAX_K_TILES
+    return TCGEN05_TWO_CTA_MAX_K_TILES
+
+
 # The edge + K-tail CtaGroup.TWO search family (ragged M with ragged N, or a
 # 16-bit K tail on whole tiles; ``enable_cute_tcgen05_search``): originally
 # validated on large square-ish GEMMs (5000^3), it holds on every ragged
@@ -95,6 +119,21 @@ TCGEN05_TWO_CTA_ONE_WAVE_BLOCK_NS = (128, 64)
 # (nvjet ``64x64_64x16_2x2_2cta`` on bf16 1500x384x384: 72 pairs of 128x64,
 # against 36 of 128x128).
 TCGEN05_TWO_CTA_PAIR128_ONE_WAVE_BLOCK_NS = (128, 64)
+
+
+def tcgen05_edge_pair128_narrow_width_fits(*, rows: int, n: int, num_sms: int) -> bool:
+    """Whether the edge K-tail family's 128-row CTA pairs also run the
+    narrowest one-wave width (``TCGEN05_TWO_CTA_PAIR128_ONE_WAVE_BLOCK_NS``,
+    64; ``repair.plain_pair128_widths``): ``n`` whole 64-wide N tiles whose
+    grid of ``rows`` 128-row pair rows holds at most one CTA per SM, as the
+    one-wave family's 64-wide pair. bf16 128x4096x1000 with b stored [K, N]
+    (K = 15 x 64 + 40): 64 pairs of 128x64 (128 CTAs) in one wave, where the
+    128x128 pair puts 64 CTAs on GB300's 152 SMs; bf16 1000x1024x1000 would
+    take 128 pairs of 128x64, two waves, and keeps the 128x128 pair."""
+    narrow = min(TCGEN05_TWO_CTA_PAIR128_ONE_WAVE_BLOCK_NS)
+    return num_sms > 0 and n % narrow == 0 and 2 * rows * (n // narrow) <= num_sms
+
+
 # The N tiles the tcgen05 CTA pair (``tcgen05_cluster_m=2`` on the 256-row
 # pair tile) runs its MMA at throughout the backend: the paired pipeline, the
 # materialized two-CTA regions and the cluster_m=2 search projection all take
@@ -225,6 +264,13 @@ def tcgen05_plain_narrow_subtile_covers_n(
 # tiles alone: every loss sits below 1.0, the gains from 1.0 to 1.04 split
 # (ties), and the first clear win is at 1.033.
 TCGEN05_TRANSPOSED_PRODUCT_MIN_GAIN = 1.03
+# The most K blocks (64 deep, the last one partial) of a one-wave GEMM of a
+# row-major a whose rows straddle L2 sectors and an N-major b that
+# ``search_plan.tcgen05_transposes_misaligned_a_rows`` prices on its 128-row
+# pairs in both orientations. Its measurements are at 16 (bf16 K = 1000,
+# both orientations autotuned on GB300); it takes K loops up to twice that,
+# and longer ones, which nothing measured, stay as written.
+TCGEN05_N_MAJOR_B_ONE_WAVE_MAX_K_BLOCKS = 32
 # The 128-byte lines of A and B rows a one-tile CTA prefetches into L2 ahead
 # of its dependent-launch wait (``cute_mma._tcgen05_operand_l2_prefetch_lines``):
 # 96 KB, what one SM pulls in the ~400 ns its CTA waits for the release.
@@ -248,6 +294,55 @@ TCGEN05_FLAT_L2_PREFETCH_MIN_K_BLOCKS = 16
 # The lines a one-tile one-CTA CTA prefetches when most of its grid starts
 # early (``tcgen05_one_cta_l2_prefetch_max_lines``).
 TCGEN05_ONE_CTA_L2_PREFETCH_EARLY_GRID_MAX_LINES = 2048
+# The widest CTA pair tile (``tcgen05_mma_bn``) whose CTAs L2-prefetch a
+# mixed-major one-tile footprint past the pair window
+# (``TCGEN05_OPERAND_L2_PREFETCH_MAX_LINES``), up to
+# ``TCGEN05_ONE_CTA_L2_PREFETCH_EARLY_GRID_MAX_LINES``
+# (``cute_mma._tcgen05_operand_l2_prefetch_lines``). The 64-wide pairs gain
+# up to 1544 lines per CTA (there). A wider pair's CTA, more rows of B, keeps
+# the window: the transposed bf16 512x1280x1000 (a's rows 2000 bytes apart)
+# on 60 pairs of 128x96, each CTA 1000 lines of b.T and 48 rows of a.T of 17
+# lines (1816), runs 0.904 of cuBLAS without the prefetch and 0.822 with it,
+# and on 70 pairs of 128x80 (1680 lines) 0.910 and 0.809 (GB300, CUDA graphs
+# over cold inputs, the same config back to back).
+TCGEN05_MIXED_MAJOR_PAIR_L2_PREFETCH_MAX_BN = 64
+
+
+def tcgen05_transposed_pair_prefetch_fits(
+    m: int,
+    n: int,
+    k: int,
+    *,
+    itemsize: int,
+    a_row_bytes: int,
+    b_row_bytes: int,
+    num_sms: int,
+    a_offset_bytes: int = 0,
+    b_offset_bytes: int = 0,
+) -> bool:
+    """Whether the transposed product (out.T = b.T @ a.T) of a skinny
+    ``m x n x k`` product with an N-major b runs a one-wave grid of 128x64
+    CTA pairs (``cdiv(n, 128)`` pair rows by ``cdiv(m, 64)`` columns) whose
+    CTAs' operand footprint fits the 64-wide mixed-major pair's L2 prefetch
+    (``cute_mma._tcgen05_operand_l2_prefetch_lines``: up to
+    ``TCGEN05_ONE_CTA_L2_PREFETCH_EARLY_GRID_MAX_LINES``, within
+    ``TCGEN05_MIXED_MAJOR_PAIR_L2_PREFETCH_MAX_BN``), counted as
+    ``cute_mma._flat_operand_l2_prefetch_footprint`` counts it: the CTA's 64
+    M-contiguous elements of b.T at every K index, one line where b's rows
+    (``b_row_bytes`` apart, from ``b_offset_bytes``) start on line
+    boundaries and two where they do not, and its 32 rows of a.T, one more
+    line each where a's rows are not whole lines apart. bf16 128x3072x1024:
+    48 pairs, 1024 + 32 x 16 = 1536 lines; with b sliced from [1024, 3080]
+    (rows 6160 bytes apart), 2 x 1024 + 32 x 16 = 2560, past the cap."""
+    pairs = -(-n // 128) * -(-m // 64)
+    if num_sms <= 0 or 2 * pairs > num_sms:
+        return False
+    b_lines = 1 if b_row_bytes % 128 == 0 and b_offset_bytes % 128 == 0 else 2
+    a_lines = -(-(k * itemsize) // 128) + (
+        1 if a_row_bytes % 128 or a_offset_bytes % 128 else 0
+    )
+    lines = k * b_lines + 32 * a_lines
+    return lines <= TCGEN05_ONE_CTA_L2_PREFETCH_EARLY_GRID_MAX_LINES
 
 
 def tcgen05_one_cta_l2_prefetch_max_lines(*, work_ctas: int, num_sm: int) -> int:

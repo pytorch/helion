@@ -1082,16 +1082,17 @@ def _dense_aligned_n_proved_plans(
             and not dense_aligned_n_mn_b_width(width, facts.input_dtype.itemsize)
         )
         # dense_aligned_n_plan needs a physical width that divides N and
-        # pair-M tiles that divide M (the 16-bit pair: or whole K tiles,
-        # its TMA store clipping the partial last tiles); skip widths
-        # that cannot qualify.
+        # pair-M tiles that divide M (the 16-bit pair: its TMA store clips
+        # a partial last N tile, and a partial last M tile over whole K
+        # tiles); skip widths that cannot qualify.
         or (
-            (facts.shape[0] % block_m or facts.shape[1] % width)
+            facts.shape[0] % block_m
             and not (
                 sixteen_bit
                 and facts.shape[2] % DENSE_ALIGNED_N_SIXTEEN_BIT_BLOCK_K == 0
             )
         )
+        or (facts.shape[1] % width and not sixteen_bit)
         or not _tcgen05_mma_impl_allowed()
     ):
         return
@@ -1173,6 +1174,29 @@ def _dense_aligned_n_clipped_widths(
     cached = state._dense_aligned_n_clipped_cache.get(search)
     if cached is not None and cached[0] == key:
         return cached[1]
+    widths = frozenset(
+        width
+        for block_m in (
+            _dense_aligned_n_block_ms(state) if search else (default_block_m,)
+        )
+        for _cost, width in _dense_aligned_n_clipped_ranking(
+            state, block_m, search=search
+        )
+    )
+    state._dense_aligned_n_clipped_cache[search] = (key, widths)
+    return widths
+
+
+def _dense_aligned_n_clipped_ranking(
+    state: CuteTcgen05Config, block_m: int, *, search: bool
+) -> list[tuple[float, int]]:
+    """``(pair_tile_wave_cost, width)`` of the clipped widths a ``block_m``-row
+    pair ranks ahead of every reference (``_dense_aligned_n_clipped_widths``),
+    the best first."""
+    facts = state.dense_gemm_facts
+    bounds = _dense_aligned_n_bounds(state)
+    if facts is None or bounds is None:
+        return []
     min_gain = (
         TCGEN05_ALIGNED_N_CLIPPED_SEARCH_MIN_GAIN
         if search
@@ -1181,29 +1205,84 @@ def _dense_aligned_n_clipped_widths(
     m, n, k = facts.shape
     sm_pairs = _sm_pairs(state)
     low, high = bounds[1]
-    widths: frozenset[int] = frozenset()
-    for block_m in _dense_aligned_n_block_ms(state) if search else (default_block_m,):
 
-        def cost(width: int, block_m: int = block_m) -> float:
-            return pair_tile_wave_cost(
-                m, n, k, width=width, block_m=block_m, sm_pairs=sm_pairs
-            )
+    def cost(width: int) -> float:
+        return pair_tile_wave_cost(
+            m, n, k, width=width, block_m=block_m, sm_pairs=sm_pairs
+        )
 
-        references = [w for w in (64, 128, TCGEN05_TWO_CTA_BLOCK_N) if low <= w <= high]
-        candidates = [
-            width
-            for width in ALIGNED_N_CHOICES
-            if (search or _dense_aligned_n_seedable(state, width))
-            and _dense_aligned_n_proved(state, width, block_m=block_m)
-        ]
-        references.extend(width for width in candidates if n % width == 0)
-        if references:
-            limit = (1.0 - min_gain) * min(map(cost, references))
-            widths |= {
-                width for width in candidates if n % width and cost(width) <= limit
-            }
-    state._dense_aligned_n_clipped_cache[search] = (key, widths)
-    return widths
+    references = [w for w in (64, 128, TCGEN05_TWO_CTA_BLOCK_N) if low <= w <= high]
+    candidates = [
+        width
+        for width in ALIGNED_N_CHOICES
+        if (search or _dense_aligned_n_seedable(state, width))
+        and _dense_aligned_n_proved(state, width, block_m=block_m)
+    ]
+    references.extend(width for width in candidates if n % width == 0)
+    if not references:
+        return []
+    limit = (1.0 - min_gain) * min(map(cost, references))
+    return sorted(
+        (cost(width), width)
+        for width in candidates
+        if n % width and cost(width) <= limit
+    )
+
+
+def _dense_aligned_n_skipped_whole_ranking(
+    state: CuteTcgen05Config, block_m: int
+) -> list[tuple[float, int]]:
+    """``(pair_tile_wave_cost, width)`` of the widths that tile N whole but
+    that the seeds skip (``_dense_aligned_n_seedable``: the 16-bit pair's
+    odd multiples of 16), which a ``block_m``-row pair ranks ahead of every
+    width the seeds may take, the best first.
+
+    A width past N leaves every tile a fringe tile, which stores through
+    the predicated SIMT epilogue instead of the TMA box, so the seeds' own
+    best width there is the slowest the search can sample. bf16
+    131072x144x288 seeds the clipped 160 (512 tiles of 256x160 over a
+    144-column output), and 144, the one width that tiles N whole, only the
+    search samples:
+
+        tcgen05_simt_atom = cute.make_copy_atom(cute.nvgpu.CopyR2GOp(), cutlass.BFloat16, num_bits_per_copy=tcgen05_num_bits, ...)
+        # (160 wide: one predicated 16-bit store per element; 144 wide: the
+        # (128, 48) subtiles' TMA stores)
+
+    GB300, of cuBLAS: 0.11 at 160 columns, 1.01-1.02 at 144."""
+    facts = state.dense_gemm_facts
+    bounds = _dense_aligned_n_bounds(state)
+    if facts is None or bounds is None:
+        return []
+    m, n, k = facts.shape
+    sm_pairs = _sm_pairs(state)
+    low, high = bounds[1]
+
+    def cost(width: int) -> float:
+        return pair_tile_wave_cost(
+            m, n, k, width=width, block_m=block_m, sm_pairs=sm_pairs
+        )
+
+    seedable = [
+        width
+        for width in ALIGNED_N_CHOICES
+        if _dense_aligned_n_seedable(state, width)
+        and _dense_aligned_n_proved(state, width, block_m=block_m)
+    ]
+    references = [
+        *(w for w in (64, 128, TCGEN05_TWO_CTA_BLOCK_N) if low <= w <= high),
+        *seedable,
+    ]
+    if not references:
+        return []
+    limit = min(map(cost, references))
+    return sorted(
+        (cost(width), width)
+        for width in ALIGNED_N_CHOICES
+        if n % width == 0
+        and not _dense_aligned_n_seedable(state, width)
+        and cost(width) < limit
+        and _dense_aligned_n_proved(state, width, block_m=block_m)
+    )
 
 
 def _dense_aligned_n_proved(

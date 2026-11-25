@@ -24,6 +24,7 @@ from .state import CuteFlashState
 from .state import CuteLaneState
 from .state import CuteRootPlans
 from .state import CuteTcgen05State
+from .tcgen05_constants import TCGEN05_TWO_CTA_MAX_K_TILES
 
 if TYPE_CHECKING:
     import ast
@@ -424,6 +425,9 @@ class CuteTcgen05MatmulPlan(_CuteTcgen05OrientationMixin):
     # with the MMA and epilogue roles after PID remapping.
     output_offsets: tuple[str, str] | None = None
     ab_load_warp_count: int = 1
+    # The K tiles the role-local pair runs (``tcgen05_two_cta_max_k_tiles`` of
+    # the operand dtype).
+    max_two_cta_k_tiles: int = TCGEN05_TWO_CTA_MAX_K_TILES
     one_shot_role_scheduler: bool = False
     # Dedicated scheduler warp count for ROLE_LOCAL_WITH_SCHEDULER. Default
     # zero keeps MONOLITHIC's historical role IDs; one adds a scheduler warp

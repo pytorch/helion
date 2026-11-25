@@ -229,6 +229,7 @@ from ..tcgen05_constants import tcgen05_aux_fragment_bytes_per_thread
 from ..tcgen05_constants import tcgen05_aux_prefetch_bytes_per_thread
 from ..tcgen05_constants import tcgen05_cluster_split_k
 from ..tcgen05_constants import tcgen05_direct_entry_stage_tuple_allowed
+from ..tcgen05_constants import tcgen05_edge_pair128_narrow_width_fits
 from ..tcgen05_constants import tcgen05_grouped_worklist_smem_bytes
 from ..tcgen05_constants import tcgen05_role_launch_n_width
 from ..tcgen05_constants import tcgen05_rowvec_stage_smem_bytes
@@ -466,9 +467,10 @@ def _validate_cta_group_config(
                 return
             raise InvalidConfig(
                 "tcgen05_cta_group='two' runs tcgen05_cluster_n=2 (the 2x2 "
-                "multicast cluster) only with a row-major output and, on a "
-                "batched GEMM, whole N-tile pairs on the plain raster "
-                "(l2_groupings of 1 and no L2 swizzle)"
+                "multicast cluster) only with a row-major output or on the "
+                "64-wide 128-row pair of a 16-bit GEMM without auxiliary "
+                "loads and, on a batched GEMM, whole N-tile pairs on the plain "
+                "raster (l2_groupings of 1 and no L2 swizzle)"
             )
     if fix_invalid:
         # A batched cluster_n=2 sample whose N tiles do not pair keeps
@@ -975,8 +977,15 @@ def plain_pair128_widths(state: CuteTcgen05Config) -> tuple[int, ...]:
     """The N tiles of the 128-row CTA pairs ``plain_pair128_admitted``
     admits, widest first; empty when it admits none.
 
-    The edge K-tail family runs the 128 x 128 pair. The one-wave family
-    runs whole N tiles of the widths of
+    The edge K-tail family runs the 128 x 128 pair, and the 64-wide pair
+    where a one-wave grid of them fits (``tcgen05_edge_pair128_narrow_width_fits``),
+    alone where the 128 x 128 pairs' grid sits under the quarter-wave gate:
+    cuBLAS's swapped 64x64 2-CTA tile in 2x2 clusters for bf16 128x4096x1000
+    with b stored [K, N] (64 pairs of 128x64), which the search ran no pair
+    for (the 128x128 pair's 32 tiles sit under the quarter-wave gate): the
+    one-CTA [64, 128, 64] pick ran 0.78 of cuBLAS, the 64-wide pair in its
+    2x2 cluster 1.02 (GB300, CUDA graphs over cold inputs). The one-wave
+    family runs whole N tiles of the widths of
     ``TCGEN05_TWO_CTA_PAIR128_ONE_WAVE_BLOCK_NS`` (128 and 64): the
     64-wide pair is the tile for grids the 128-wide pair leaves half
     empty, admitted where its grid fits one wave. bf16 1500x384x384 on
@@ -1015,7 +1024,23 @@ def plain_pair128_widths(state: CuteTcgen05Config) -> tuple[int, ...]:
         # and the 256x256 projection cover it.
         return ()
     if constraints.allow_edge_k_tail_family:
-        widths: tuple[int, ...] = (TCGEN05_TWO_CTA_EDGE_PAIR128_BLOCK,)
+        narrow = min(TCGEN05_TWO_CTA_PAIR128_ONE_WAVE_BLOCK_NS)
+        if constraints.edge_pair128_only:
+            # The 128x128 pairs' own grid sits under the planner's quarter-wave
+            # gate, which admits the family for its 64-wide pairs alone
+            # (``search_plan.enable_cute_tcgen05_search``). bf16 128x3072x1000
+            # with b stored [K, N], of cuBLAS: 24 pairs of 128x128 (48 CTAs)
+            # 0.83, the pick of both final selections that kept them; 48 pairs
+            # of 128x64 in 2x2 clusters 1.00-1.02.
+            widths: tuple[int, ...] = (narrow,)
+        else:
+            widths = (TCGEN05_TWO_CTA_EDGE_PAIR128_BLOCK,)
+            if tcgen05_edge_pair128_narrow_width_fits(
+                rows=state.matmul_leading_work_multiplier * -(-m // 128),
+                n=n,
+                num_sms=state.device_sm_count,
+            ):
+                widths = (*widths, narrow)
     elif surface.paired_pipeline_search_enabled(state) or not _pair128_block_ks(
         state,
         (
@@ -1102,10 +1127,11 @@ def _project_pair128_search_config(
     """Project a sampled explicit CTA pair (``tcgen05_cta_group="two"``)
     on a ``bm <= 128`` tile of a family that admits 128-row pairs onto a
     validated 128-row pair tile: the sampled N tile where the family runs
-    it (``plain_pair128_widths``), else its widest; one N tile per CTA (no
-    N multicast), a K tile the family admits and an AB depth that fits the
-    pair's SMEM. False when the pair is not admitted, no K tile qualifies,
-    or the sample is a 256-row tile, which keeps the 256-row projections.
+    it (``plain_pair128_widths``), else its widest; one N tile per pair (no N
+    multicast) but for the 64-wide pair's sampled 2x2 cluster, a K tile the
+    family admits and an AB depth that fits the pair's SMEM. False when the
+    pair is not admitted, no K tile qualifies, or the sample is a 256-row
+    tile, which keeps the 256-row projections.
     """
     widths = plain_pair128_widths(state)
     if not widths:
@@ -1148,7 +1174,21 @@ def _project_pair128_search_config(
     block_sizes[n_index] = bn
     block_sizes[k_index] = bk
     config["tcgen05_cluster_m"] = 2
-    config["tcgen05_cluster_n"] = 1
+    # The edge K-tail family's 64-wide pair keeps a sampled 2x2 cluster (A
+    # multicast across the two pairs of a cluster) where its N tiles pair; the
+    # paired pipeline admits it or the config's own repair drops it
+    # (``seeds._paired_pipeline_parameters``). Each CTA streams half its A rows
+    # per K step: bf16 128x4096x1000 with b stored [K, N] on 64 pairs of
+    # 128x64, of cuBLAS (nvjet 64x64 2-CTA tiles in 2x2 clusters): 0.76 on 2x1
+    # clusters, 1.02 on 2x2. The 128-wide pair, and the whole-K one-wave
+    # family, keep one N tile per pair, as measured.
+    if not (
+        constraints.allow_edge_k_tail_family
+        and bn < 128
+        and config.get("tcgen05_cluster_n", 1) == 2
+        and _one_wave_cluster_n2_is_valid(state, bn)
+    ):
+        config["tcgen05_cluster_n"] = 1
     config["tcgen05_acc_stages"] = 2
     config["pid_type"] = TCGEN05_TWO_CTA_SEED_PID_TYPE
     fit = smem.pair_ab_stage_fit(state, config, bm=128, bn=bn, bk=bk, cluster_m=2)
@@ -1605,6 +1645,12 @@ def _fix_cluster_m2_search_config(
         # GEMM, ``plain_pair128_widths``): the sampled explicit pair keeps
         # its 128-row tile at a width the family runs instead of the
         # 256-row projections below (the one-wave tiles, the 256x256 pair).
+        return
+    if constraints.edge_pair128_only:
+        # The edge family's 64-wide pairs are the only two-CTA geometry
+        # admitted on this shape (its 128x128 and 256x256 grids would idle
+        # most SMs); any other sample keeps its tile on one CTA.
+        config["tcgen05_cluster_m"] = 1
         return
     # fp8 small-grid family: a sampled bm<=128 routes to the fp8-validated
     # per-CTA 64xbn 2-CTA tile (bm=128/bn=128) instead of the bm=256 full
@@ -2628,7 +2674,7 @@ def _normalize_dense_aligned_n(
         raise InvalidConfig(
             "tcgen05_tile_n requires a proved dense paired GEMM (dense_aligned_n_plan): "
             "unchanged tile bounds; for FP8 whole M and N tiles; for 16-bit "
-            "whole K tiles under a partial last M or N tile, a width that is "
+            "whole K tiles under a partial last M tile, a width that is "
             "a multiple of 32 over an N-major B, the normal (TMA) store and "
             "one N tile per cluster for a column-major output, an "
             "epilogue subtile that divides the physical width, and a "
