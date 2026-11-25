@@ -144,3 +144,12 @@ def mpp_only(
     if config is None:
         config = kernel.bind(args).config_spec.default_config()
     return helion.Config.from_dict({"metal_matmul": "mpp", **config.config})
+
+
+@helion.kernel(backend="metal", static_shapes=True, autotune_effort="none")
+def scale_by_0dim(x: torch.Tensor, s: torch.Tensor) -> torch.Tensor:
+    """``x * s`` for a 0-dim ``s``, which binds as a buffer."""
+    out = torch.empty_like(x)
+    for tile in hl.tile(x.size(0)):
+        out[tile] = x[tile] * s[()]
+    return out

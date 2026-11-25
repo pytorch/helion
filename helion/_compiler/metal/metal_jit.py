@@ -370,16 +370,9 @@ def _generate_msl(
             # one recompiles rather than reusing a stale shader.
             scalar_preamble.append(f"    {_constexpr_decl(name, arg)}")
             continue
+        # A 0-dim tensor too: its loads index element 0.
         metal_dtype = DTYPE_TO_METAL[arg.dtype]
-        is_scalar = arg.ndim == 0
-        if is_scalar:
-            buf_param = f"_buf_{name}"
-            params.append(
-                f"device const {metal_dtype}* {buf_param} [[buffer({buf_idx})]]"
-            )
-            scalar_preamble.append(f"    {metal_dtype} {name} = {buf_param}[0];")
-        else:
-            params.append(f"device {metal_dtype}* {name} [[buffer({buf_idx})]]")
+        params.append(f"device {metal_dtype}* {name} [[buffer({buf_idx})]]")
         buf_idx += 1
 
     params.append("uint3 tgid [[threadgroup_position_in_grid]]")
@@ -497,8 +490,18 @@ def _constexpr_decl(name: str, value: object) -> str:
             )
         return f"constexpr int {name} = {value};"
     if isinstance(value, float):
-        return f"constexpr float {name} = {value!r};"
+        return f"constexpr float {name} = {_float_literal(value)};"
     raise exc.BackendUnsupported("metal", f"kernel argument type: {type(value)}")
+
+
+def _float_literal(value: float) -> str:
+    """``value`` as an MSL float: ``repr`` but for infinities and NaN, which
+    MSL spells with macros."""
+    if value != value:
+        return "NAN"
+    if value in (float("inf"), float("-inf")):
+        return "INFINITY" if value > 0 else "-INFINITY"
+    return repr(value)
 
 
 def _matmul_kinds(body_stmts: list[ast.stmt]) -> tuple[bool, bool, bool]:
