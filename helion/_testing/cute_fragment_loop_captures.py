@@ -29,14 +29,31 @@ def loop_scans(
 
 
 @helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
-def loop_tensor_bound(x: torch.Tensor, counts: torch.Tensor) -> torch.Tensor:
+def loop_tensor_bound(
+    x: torch.Tensor, counts: torch.Tensor, bound_use: str = "carry"
+) -> torch.Tensor:
     out = torch.empty_like(x)
     for row in hl.tile(x.size(0), block_size=1):
         state = torch.cumsum(x[row, :], dim=-1)
         bound = torch.sum(counts[hl.arange(counts.numel())])
-        for tile in hl.tile(bound, block_size=4):
-            increment = torch.sum(x[row, tile], dim=-1, keepdim=True)
-            state = torch.cumsum(state + increment + bound.to(torch.float32), dim=-1)
-            bound = bound + 1
+        if bound_use == "carry":
+            for tile in hl.tile(bound, block_size=4):
+                increment = torch.sum(x[row, tile], dim=-1, keepdim=True)
+                state = torch.cumsum(
+                    state + increment + bound.to(torch.float32), dim=-1
+                )
+                bound = bound + 1
+        elif bound_use == "range":
+            for tile in hl.tile(bound, block_size=4):
+                increment = torch.sum(x[row, tile], dim=-1, keepdim=True)
+                state = torch.cumsum(state + increment, dim=-1)
+        else:
+            # A syntactic use or assignment can add a capture, even when its
+            # constexpr branch is disabled. Keep the three actual loop ABIs distinct.
+            for tile in hl.tile(bound, block_size=4):
+                increment = torch.sum(x[row, tile], dim=-1, keepdim=True)
+                state = torch.cumsum(
+                    state + increment + bound.to(torch.float32), dim=-1
+                )
         out[row, :] = state
     return out

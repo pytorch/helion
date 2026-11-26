@@ -124,7 +124,8 @@ def test_loop_retirement_requires_its_active_parent_scope():
         pytest.fail("an inconsistent internal scope must not be lowered")
 
 
-def test_mutable_tensor_bound_stays_live_through_loop_masks():
+@pytest.mark.parametrize("bound_use", ["range", "carry", "readonly"])
+def test_only_independently_read_bounds_remain_live_in_loop_body(bound_use):
     observations = []
     original = FragmentContext.retired_loop_initials
 
@@ -142,7 +143,13 @@ def test_mutable_tensor_bound_stays_live_through_loop_masks():
                 )
                 self.manager = original(context, node, values, copied, readonly)
                 self.manager.__enter__()
-                observations.append((self.range_buffers, context.live_buffers()))
+                observations.append(
+                    (
+                        self.range_buffers,
+                        context.live_buffers(),
+                        context.referenced_buffers(readonly),
+                    )
+                )
 
             def __exit__(self, *args):
                 return self.manager.__exit__(*args)
@@ -155,11 +162,28 @@ def test_mutable_tensor_bound_stays_live_through_loop_masks():
     ):
         bound = cpu_bind(
             loop_tensor_bound,
-            (torch.ones(1, 17), torch.tensor([2, 3, 0, 0], dtype=torch.int64)),
+            (
+                torch.ones(1, 17),
+                torch.tensor([2, 3, 0, 0], dtype=torch.int64),
+                bound_use,
+            ),
         )
         source = bound.to_code(bound.config_spec.default_config())
     assert len(observations) == 1
-    range_buffers, live_buffers = observations[0]
+    range_buffers, live_buffers, readonly_buffers = observations[0]
     assert range_buffers, "the loop bound must actually use resident storage"
-    assert range_buffers <= live_buffers
-    assert "fragment_tile" in source
+    if bound_use == "readonly":
+        assert range_buffers <= readonly_buffers <= live_buffers
+    else:
+        assert range_buffers.isdisjoint(live_buffers)
+    (loop,) = (
+        n
+        for n in ast.walk(ast.parse(source))
+        if isinstance(n, ast.For)
+        and isinstance(n.target, ast.Name)
+        and n.target.id.startswith("fragment_tile")
+    )
+    assert any(
+        isinstance(n, ast.Name) and n.id.startswith("fragment_control")
+        for n in ast.walk(loop.iter)
+    )

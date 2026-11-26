@@ -969,11 +969,11 @@ class FragmentContext:
         copied: set[Node],
         readonly: list[object],
     ) -> Generator[None, None, None]:
-        """Retire last-use initial values after their synchronized carry copy.
+        """Retire last-use operands after a synchronized carry copy or header snapshot.
 
-        Only a copied initial may leave the parent scope. Readonly captures
-        stay pinned across every backedge, including after their final use
-        within one iteration. Other parent aliases and later uses remain live.
+        Readonly captures stay pinned across every backedge, including after
+        their final use within one iteration. Other parent aliases and later
+        uses remain live.
         """
         assert self.scopes and self.scopes[-1] is values
         assert len(self.scope_uses) == len(self.scopes)
