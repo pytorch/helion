@@ -17,6 +17,7 @@ from helion._compiler.cute.fragment_domain import ownership_terms
 from helion._compiler.cute.fragment_domain import project_contracted_ownership
 from helion._compiler.cute.fragment_domain import render_ownership
 from helion._compiler.cute.fragment_dot import _dot_output_domain
+from helion._testing import skipIfRefEager
 from helion._testing.cute_codegen import cpu_bind
 from helion._testing.cute_fragment_index_domains import dot_then_reduce
 from helion._testing.cute_fragment_index_domains import indexed_gemm
@@ -24,6 +25,31 @@ from helion._testing.cute_fragment_index_domains import reshaped_dot_then_max
 import helion.language as hl
 
 pytestmark = pytest.mark.cpu_only
+
+
+@skipIfRefEager("checks split-view coordinates during code generation")
+def test_ungrouped_split_index_compares_the_result_row() -> None:
+    @helion.kernel(static_shapes=True, backend="cute")
+    def gather(
+        x: torch.Tensor, indices: torch.Tensor, selector: torch.Tensor
+    ) -> torch.Tensor:
+        out = x.new_empty((indices.numel() // 2, x.size(1)))
+        for tile in hl.tile(indices.numel(), block_size=32):
+            idx, _ = hl.split(indices[tile].reshape(2, 16).permute(1, 0))
+            rows = x[idx[:, None], :, selector[0]]
+            out[tile.begin // 2 + hl.arange(16), :] = rows
+        return out
+
+    bound = cpu_bind(
+        gather,
+        (torch.empty(32, 8, 2), torch.arange(32), torch.zeros(1, dtype=torch.int64)),
+    )
+    # The slice separates the two tensor indices. The singleton in idx[:, None]
+    # contributes no result dim, so the split index and the loaded rows meet at 0.
+    with pytest.raises(
+        exc.BackendUnsupported, match="at position 0 with different lane coordinates"
+    ):
+        bound.to_code(helion.Config(block_sizes=[]))
 
 
 def test_indexed_storage_retains_the_global_tile_bound() -> None:

@@ -69,6 +69,7 @@ from helion._testing.cute_affine_vector_model import Pointer as _Pointer
 from helion._testing.cute_codegen import cpu_bind
 from helion._testing.cute_codegen import forbid_native_compile
 from helion._testing.cute_codegen import mock_cuda_unavailable
+from helion._testing.cute_thread_simulator import execute_pointwise_thread_program
 import helion.language as hl
 
 layer_norm_bwd = import_example("layer_norm").layer_norm_bwd
@@ -2578,8 +2579,6 @@ def _tile_id_scalar_copy(x: torch.Tensor, weights: torch.Tensor):
 
 @pytest.mark.parametrize("complete", [False, True])
 def test_tile_id_source_load_keeps_uniform_value_with_store_owner_masks(complete):
-    from test.test_indexing import _execute_pointwise_thread_program
-
     from helion._compiler.backend_registry import repair_backend_codegen
     from helion._compiler.cute import memory_ops as cute_memory_ops
     from helion._compiler.cute.emitters import memory_access
@@ -2616,7 +2615,7 @@ def test_tile_id_source_load_keeps_uniform_value_with_store_owner_masks(complete
     assert reads and writes
     assert all(mask is None or "mask_1" not in mask for mask in reads)
     assert any(("mask_1" in (mask or "")) != complete for mask in writes)
-    actual, _launches = _execute_pointwise_thread_program(source, (x, weights))
+    actual, _launches = execute_pointwise_thread_program(source, (x, weights))
     torch.testing.assert_close(actual, weights, rtol=0, atol=0)
 
 

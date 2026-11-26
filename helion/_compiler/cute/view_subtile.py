@@ -738,38 +738,29 @@ def _subscript_slots(
         if isinstance(entry, torch.fx.Node)
         and isinstance(entry.meta.get("val"), torch.Tensor)
     ]
-    broadcast = env.should_broadcast_tensor_indexers(
-        [fake(entry) for entry in subscript]
-    )
-    shape = (
-        torch.broadcast_shapes(*(indexer.meta["val"].shape for indexer in indexers))
-        if broadcast
-        else ()
-    )
+    group = env.tensor_indexer_broadcast_group([fake(entry) for entry in subscript])
     slots: list[_Slot] = []
-    for entry in subscript:
+    for position, entry in enumerate(subscript):
         value = fake(entry)
         if entry is None:
             slots.append(_Slot("unit"))
         elif isinstance(value, torch.Tensor):
             assert isinstance(entry, torch.fx.Node)
-            if not broadcast:
+            if group is None:
+                for dim in env.tensor_indexer_dim_sources(value):
+                    if dim is None:
+                        if any(env.size_hint(size) != 1 for size in value.shape):
+                            # Several input dims collapsed into one block: it
+                            # has no single lane coordinate to compare.
+                            return None
+                        slots.append(_Slot("index"))
+                    else:
+                        slots.append(_Slot("index", ((entry, dim),)))
+            elif position == group[0]:
                 slots.extend(
-                    _Slot("index", ((entry, dim),)) for dim in range(value.ndim)
+                    _Slot("index", tuple((indexers[i], dim) for i, dim in sources))
+                    for sources in env.tensor_indexer_broadcast_sources(group[1])
                 )
-            elif entry is indexers[0]:
-                for position in range(len(shape)):
-                    slots.append(
-                        _Slot(
-                            "index",
-                            tuple(
-                                (indexer, position - offset)
-                                for indexer in indexers
-                                if position
-                                >= (offset := len(shape) - indexer.meta["val"].ndim)
-                            ),
-                        )
-                    )
         elif isinstance(value, torch.SymInt):
             offset_info = (
                 entry.meta.get("tile_with_offset")

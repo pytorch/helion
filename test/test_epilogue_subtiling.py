@@ -14,6 +14,7 @@ from helion._testing import skipIfCute
 from helion._testing import skipIfRefEager
 from helion._testing import skipIfXPU
 from helion._testing import skipUnlessTensorDescriptor
+from helion._testing.triton_codegen import descriptor_coordinates
 from helion.autotuner.config_fragment import EnumFragment
 from helion.autotuner.config_fragment import PowerOfTwoFragment
 import helion.language as hl
@@ -627,7 +628,8 @@ class TestEpilogueSubtiling(TestCase):
         )
         torch.testing.assert_close(output, args[0] * 2.0)
         _assert_descriptor_atomic_codegen(self, code, 4)
-        self.assertIn("_desc.atomic_add([offset_0, 32]", code)
+        coords = descriptor_coordinates(code, "atomic_add")
+        self.assertIn(("offset_0", "32"), coords)
 
     @skipIfCute(_DESCRIPTOR_SPLIT_REASON)
     @skipIfRefEager("test checks generated backend code")
@@ -649,8 +651,12 @@ class TestEpilogueSubtiling(TestCase):
             output, args[0] @ args[1] + args[2], atol=1e-1, rtol=1e-2
         )
         _assert_descriptor_store_codegen(self, code, 2)
-        self.assertIn("_desc.store([offset_0, offset_1 + 0]", code)
-        self.assertIn("_desc.store([offset_0, offset_1 + _BLOCK_SIZE_1 // 2]", code)
+        coords = descriptor_coordinates(code, "store")
+        self.assertIn(("offset_0", "offset_1 + 0"), coords)
+        self.assertIn(
+            ("offset_0", "offset_1 + _BLOCK_SIZE_1 // 2"),
+            coords,
+        )
 
     @skipIfCute(_DESCRIPTOR_SPLIT_REASON)
     @skipIfRefEager("test checks generated backend code")
@@ -667,9 +673,13 @@ class TestEpilogueSubtiling(TestCase):
         torch.testing.assert_close(output[0], args[0] * 2.0)
         torch.testing.assert_close(output[1], args[0] * 3.0 + 1.0)
         _assert_descriptor_store_codegen(self, code, 4)
-        self.assertIn("_desc.store([offset_0, 0]", code)
-        self.assertIn("_desc.store([offset_0, 64]", code)
-        self.assertNotIn("_desc.store([offset_0 + _BLOCK_SIZE_0 // 2, 0]", code)
+        coords = descriptor_coordinates(code, "store")
+        self.assertIn(("offset_0", "0"), coords)
+        self.assertIn(("offset_0", "64"), coords)
+        self.assertNotIn(
+            ("offset_0 + _BLOCK_SIZE_0 // 2", "0"),
+            coords,
+        )
 
     @skipIfCute(_DESCRIPTOR_SPLIT_REASON)
     @skipIfRefEager("test checks generated backend code")
@@ -688,10 +698,14 @@ class TestEpilogueSubtiling(TestCase):
         _assert_descriptor_store_codegen(
             self, code, descriptor_store_count=2, pointer_store_count=2
         )
-        self.assertIn("_desc.store([offset_0, 0]", code)
-        self.assertIn("_desc.store([offset_0, 64]", code)
+        coords = descriptor_coordinates(code, "store")
+        self.assertIn(("offset_0", "0"), coords)
+        self.assertIn(("offset_0", "64"), coords)
         self.assertIn("tl.store(out_pointer + ((offset_0 +", code)
-        self.assertNotIn("_desc.store([offset_0 + _BLOCK_SIZE_0 // 2, 0]", code)
+        self.assertNotIn(
+            ("offset_0 + _BLOCK_SIZE_0 // 2", "0"),
+            coords,
+        )
 
     @skipIfRefEager("test checks generated backend code")
     def test_atomic_add_with_return_value_is_not_epilogue_subtiled(self):
@@ -753,8 +767,12 @@ class TestEpilogueSubtiling(TestCase):
             output, args[2].T * (args[0] @ args[1]), atol=1e-1, rtol=1e-2
         )
         _assert_descriptor_store_codegen(self, code, 2)
-        self.assertIn("_desc.store([offset_0, offset_1 + 0]", code)
-        self.assertIn("_desc.store([offset_0, offset_1 + _BLOCK_SIZE_1 // 2]", code)
+        coords = descriptor_coordinates(code, "store")
+        self.assertIn(("offset_0", "offset_1 + 0"), coords)
+        self.assertIn(
+            ("offset_0", "offset_1 + _BLOCK_SIZE_1 // 2"),
+            coords,
+        )
 
     @onlyBackends("triton")
     @skipIfRefEager("test checks generated backend code")
@@ -793,8 +811,12 @@ class TestEpilogueSubtiling(TestCase):
         )
         torch.testing.assert_close(output, (args[0] @ args[1]).T, atol=1e-1, rtol=1e-2)
         _assert_descriptor_store_codegen(self, code, 2)
-        self.assertIn("_desc.store([offset_1 + 0, offset_0]", code)
-        self.assertIn("_desc.store([offset_1 + _BLOCK_SIZE_1 // 2, offset_0]", code)
+        coords = descriptor_coordinates(code, "store")
+        self.assertIn(("offset_1 + 0", "offset_0"), coords)
+        self.assertIn(
+            ("offset_1 + _BLOCK_SIZE_1 // 2", "offset_0"),
+            coords,
+        )
 
     @onlyBackends("triton")
     @skipIfRefEager("test checks generated backend code")

@@ -321,9 +321,10 @@ def test_fp32_alignment_is_in_bytes_and_casts_cannot_narrow() -> None:
     assert _plan(source.replace("Float32", "Float16"), dtype="cutlass.Float32") is None
 
 
-def test_equal_inactive_endpoints_preserve_valid_middle_lanes() -> None:
+@pytest.mark.parametrize("bounds", ["2 < k < 5", "(2 < k) & (k < 5)"])
+def test_equal_inactive_endpoints_preserve_valid_middle_lanes(bounds: str) -> None:
     plan = _plan(
-        "value = (A.iterator + 24 + k).load() if 2 < k < 5 else cutlass.Float16(0)"
+        f"value = (A.iterator + 24 + k).load() if {bounds} else cutlass.Float16(0)"
     )
     assert plan is not None
     output, loads, _index_loads, copies = _evaluate_copy(plan, origin=0, k=0, limit=24)
@@ -353,6 +354,8 @@ def test_invariant_numeric_predicate_keeps_truthiness(predicate: int) -> None:
         "row = (indices.iterator + k).load()\nvalue = (A.iterator + row * 24 + k).load()",
         "value = (A.iterator + k).load() if k != 3 else cutlass.Float16(0)",
         "value = (A.iterator + k).load() if k < 2 or k >= 5 else cutlass.Float16(0)",
+        "value = (A.iterator + k).load() if ((k >= 0) & flag) & (k < limit) else cutlass.Float16(0)",
+        "value = (A.iterator + k).load() if ((k < 2) | (k >= 5)) & (k < limit) else cutlass.Float16(0)",
         "value = (A.iterator + k).load() if k + 3 < limit else cutlass.Float16(0)",
         "value = (A.iterator + k).load(volatile=True)",
         "value = unknown((A.iterator + k).load())",

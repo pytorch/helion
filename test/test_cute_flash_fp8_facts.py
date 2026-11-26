@@ -256,7 +256,7 @@ def dot_attention_grid_step2(
     q: torch.Tensor, k: torch.Tensor, v: torch.Tensor
 ) -> torch.Tensor:
     """``dot_attention_grid`` over every other batch head: a grid axis of
-    step 2 is not a unit block, so its index is not a scalar batch index."""
+    step 2 skips batch heads, which the fused body cannot do."""
     batch_heads = q.size(0)
     seq_len = q.size(1)
     head_dim = q.size(2)
@@ -815,16 +815,19 @@ def test_output_plan_standard_example_unchanged() -> None:
 # The scalar batch index: a unit block, and the root's (review fixes N1/N2).
 # ---------------------------------------------------------------------------
 def test_scalar_batch_index_requires_a_unit_block() -> None:
-    """``tile.begin`` of an autotuned batch tile and the index of a grid axis
-    with step 2 address one row of a wider tile: neither is a scalar batch
-    index, so the body is not an attention body."""
+    """A batch tile must be pinned to one row, and the root must visit
+    consecutive batch heads for the fused kernel to implement the loop."""
     q, k, v = _qkv(torch.bfloat16)
     bound = _bind(dot_attention_nonunit_batch_tile, (q, k, v))
     assert bound.host_function.device_ir.grid_block_ids == [[0, 1]]
     assert _pattern(bound) is None
     assert _surface(bound) is None
     assert not bound.config_spec.cute_flash_search_enabled
-    assert _pattern(_bind(dot_attention_grid_step2, (q, k, v))) is None
+    strided = _bind(dot_attention_grid_step2, (q, k, v))
+    # Each program still reads one batch head; the grid skips every other one.
+    assert _pattern(strided) is not None
+    assert _surface(strided) is None
+    assert not strided.config_spec.cute_flash_search_enabled
 
 
 def test_scalar_batch_block_is_recorded() -> None:

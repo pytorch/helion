@@ -490,6 +490,15 @@ class MetalBackend(Backend):
             raise exc.BackendUnsupported(self.name, f"dtype: {dtype}")
         return DTYPE_TO_METAL[dtype]
 
+    def scalar_tensor_index_expr(self, tensor_name: str) -> str:
+        # An earlier store through a view can change the index after shader entry.
+        return f"{tensor_name}[0]"
+
+    def root_coordinate_type_str(self, dtype: torch.dtype) -> str:
+        # Both physical threadgroup and lane IDs are uint. Even for a small
+        # negative origin, int + uint becomes uint; long represents both.
+        return self.dtype_str(torch.int64)
+
     def acc_type(self, dtype: torch.dtype) -> str:
         if dtype not in self._ACC_TYPE:
             raise exc.BackendUnsupported(self.name, f"acc_type for: {dtype}")

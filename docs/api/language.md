@@ -53,6 +53,46 @@ applies to each lane: with four live lanes, an all-true mask and input
 `torch.ones(1)`, the sum is four. Eager reference mode slices the input and can
 instead produce one. This rule describes loads.
 
+A shifted or strided root grid counts the coordinates reachable on each axis.
+A literal zero stride raises `helion.exc.InvalidAPIUsage` when the kernel is
+bound. A zero host scalar stride raises `ValueError` before launch; a zero
+device tensor stride signals a device error.
+The persistent scheduler uses signed 64-bit counts, including products of axes
+and sums of roots. A static grid with `2**63` or more programs is rejected
+at compile time. A host-computed count that large raises `OverflowError`
+before launch (an empty Cartesian product needs no programs). When the bounds are
+device tensors, Triton and CuTe signal a device error instead of reading the
+tensors back to the host. Triton emits an assertion with a diagnostic;
+CuTe emits a device trap without message text. Neither requires debug mode.
+
+Each persistent worker reads a device tensor bound before visiting its own
+root tiles. Writing the bound while another worker might still read it is
+an unsupported data race. Keep shared bounds unchanged until the grid finishes.
+
+A root tile with a loaded `uint64` stop still uses signed vector
+indices: a reached tile may end at `2**63`, but a stop above that boundary
+signals a device error. An empty range needs no such check. Scalar `hl.grid`
+retains its separate support for unsigned coordinates. On TileIR,
+requesting a coordinate such as `tile.end` that may need the full
+`uint64` range raises `helion.exc.InvalidConfig` at compile time.
+
+Runtime Python bounds (including plain zero-origin tile stops and expressions such as
+`n + 5`) must also fit signed 64 bits for a live range. An unrepresentable
+bound raises `OverflowError` before launch, even when the trip count is small.
+If a tensor supplies the other endpoint, the host still checks its own bound
+without reading the device tensor back. For an empty Cartesian product, an
+out-of-range Python bound can be ignored only if the generated launch no longer
+passes it or an unrepresentable value derived from it to the device. Otherwise
+the host raises `OverflowError` before converting that integer. A runtime
+Python stride passed to the device must also fit signed 64 bits; this
+applies even when a device tensor supplies an endpoint.
+
+For a flattened multidimensional grid, the product of the axis lengths must
+also fit signed 64-bit arithmetic **before** dividing by the number of elements
+per tile. For example, flattening axes of lengths `2**31` and `2**32` is
+unsupported even with 256 elements per tile: the grid has `2**55` programs,
+but its element count is `2**63`.
+
 **Grid vs Loop Behavior**:
 - When used at the top level of a kernel function, `tile()` becomes the grid of the kernel (parallel blocks)
 - When used nested inside another loop, it becomes a sequential loop within each block
@@ -360,6 +400,11 @@ For integer `cumsum` on Pallas, supply an explicit supported dtype such as
 
 ### tile_index()
 
+On CuTe, `tile.index` uses at least `torch.int32` when the configured index
+dtype is an 8- or 16-bit integer. This lets a tile cross that dtype's limit
+without wrapping its physical coordinates. It does not change the dtype of
+a tensor loaded from memory.
+
 ```{eval-rst}
 .. autofunction:: tile_index
 ```
@@ -371,6 +416,10 @@ For integer `cumsum` on Pallas, supply an explicit supported dtype such as
 ```
 
 ### tile_end()
+
+The exclusive edge can require a wider integer type than `tile.index`.
+In particular, a ragged CuTe tile can return a signed 64-bit edge even when
+its input uses 32-bit indexing.
 
 ```{eval-rst}
 .. autofunction:: tile_end

@@ -4878,7 +4878,7 @@ class Tcgen05MmaDagEmitter(MmaDagEmitterBase):
         for i, info in enumerate(infos):
             value = nxt
             if i:
-                value = f"({value}) // ({' * '.join(counts[:i])})"
+                value = f"({value}) // ({pid.device_product(counts[:i], infos[:i])})"
             if i + 1 < len(infos):
                 value = f"({value}) % ({counts[i]})"
             if info.block_size_var != "1":

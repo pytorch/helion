@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING
 from typing import cast
 from unittest.mock import patch
 
+import numpy as np
 import pytest
 import torch
 from torch._subclasses.fake_tensor import FakeTensorMode
@@ -18,9 +19,14 @@ from helion._compiler.compile_environment import CompileEnvironment
 from helion._compiler.cute.emitters.memory_access import _cute_combined_mask
 from helion._compiler.cute.memory_ops import _cute_stack_tensor_mask_expr
 from helion._compiler.cute.state import CuteCodegenState
+from helion._testing import cpu_render_target
 from helion._testing import import_example
+from helion._testing import skipIfRefEager
 from helion._testing.cute_codegen import cpu_bind
 from helion._testing.cute_codegen import mock_cuda_unavailable
+from helion._testing.cute_fragment_simulator import simulate_independent_fragment
+from helion._testing.cute_thread_simulator import execute_pointwise_thread_program
+import helion.language as hl
 
 pytestmark = pytest.mark.cpu_only
 
@@ -281,3 +287,141 @@ def test_scalar_jagged_reduction_tail_ignores_backing_storage() -> None:
     assert len({output.data_ptr() for output in outputs}) == len(outputs)
     for output in outputs:
         torch.testing.assert_close(output, expected, rtol=2e-4, atol=2e-4)
+
+
+@skipIfRefEager("checks compile-time rejection")
+@pytest.mark.parametrize("value", [1.75, 1 + 2j, True])
+@pytest.mark.parametrize("local", [False, True])
+def test_direct_scalar_index_requires_integer_dtype(value: object, local: bool) -> None:
+    @helion.kernel(backend="cute", static_shapes=True)
+    def gather(x, index, out, local: hl.constexpr):
+        for col in hl.tile(out.size(0), block_size=1):
+            if local:
+                p = index
+                out[col] = hl.load(x, [p, col])
+            else:
+                out[col] = hl.load(x, [index, col])
+
+    index = torch.tensor(value)
+    with (
+        cpu_render_target(),
+        pytest.raises(
+            helion.exc.InvalidIndexingType, match="must have an integer dtype"
+        ),
+    ):
+        cpu_bind(
+            gather, (torch.tensor([[10.0], [20.0]]), index, torch.empty(1), local)
+        ).to_code(helion.Config(block_sizes=[]))
+
+
+@skipIfRefEager("executes generated CuTe")
+@pytest.mark.parametrize("dtype", [torch.int64, torch.uint64])
+def test_scalar_index_reads_its_buffer_after_an_alias_store(dtype: torch.dtype) -> None:
+    @helion.kernel(backend="cute", static_shapes=True)
+    def gather(x, plane, alias, out):
+        for col in hl.tile(1, block_size=1):
+            p = plane
+            before = hl.load(x, [plane, col])
+            alias[0] = 1
+            out[col] = before + hl.load(x, [p, col])
+
+    x = torch.tensor([[10.0], [20.0]])
+    plane = torch.tensor(0, dtype=dtype)
+    alias = plane.view(1)
+    out = torch.empty(1)
+    with cpu_render_target():
+        code = cpu_bind(gather, (x, plane, alias, out)).to_code(
+            helion.Config(block_sizes=[])
+        )
+    # The launcher marshals a scalar as a one-element view. NumPy and the
+    # writable alias share the same CPU storage in the generated program.
+    unsigned = dtype == torch.uint64
+    inputs = [0, 1, 2, 2**32, 2**32 + 1]
+    inputs.extend([2**63, 2**64 - 1] if unsigned else [-1, -(2**32), -(2**63)])
+    for initial in inputs:
+        alias.numpy()[0] = initial
+        simulate_independent_fragment(
+            code,
+            {"x": x, "plane": alias.numpy(), "alias": alias},
+            {"out": out},
+            1,
+            int32=np.int32,
+            int64=np.int64,
+            uint64=np.uint64,
+        )
+        assert out.item() == 20 + (x[initial, 0].item() if 0 <= initial < 2 else 0)
+
+
+@skipIfRefEager("executes generated CuTe")
+@pytest.mark.parametrize("dtype", [torch.int64, torch.uint64])
+def test_direct_scalar_bounds_guard_stores_and_atomics(dtype: torch.dtype) -> None:
+    @helion.kernel(backend="cute", static_shapes=True)
+    def update(x, plane):
+        for _ in hl.grid(1):
+            hl.store(x, [plane], 3.0)
+            hl.atomic_add(x, [plane], 4.0)
+
+    x = torch.empty(2)
+    plane = torch.tensor(0, dtype=dtype)
+    with cpu_render_target():
+        code = cpu_bind(update, (x, plane)).to_code(helion.Config(block_sizes=[]))
+    scalar = plane.view(1).numpy()
+    for index in [
+        0,
+        1,
+        2,
+        2**32,
+        2**32 + 1,
+        2**64 - 1 if dtype == torch.uint64 else -1,
+    ]:
+        scalar[0] = index
+        x.fill_(11.0)
+        simulate_independent_fragment(
+            code,
+            {"plane": scalar},
+            {"x": x},
+            1,
+            int32=np.int32,
+            int64=np.int64,
+            uint64=np.uint64,
+        )
+        assert x.tolist() == [7.0 if i == index else 11.0 for i in range(2)]
+
+
+@skipIfRefEager("executes generated CuTe")
+def test_repeated_rank_two_index_has_one_pair_of_output_coordinates() -> None:
+    @helion.kernel(backend="cute", static_shapes=True)
+    def diagonal(x, ids, out):
+        for row, col in hl.tile(out.shape):
+            idx = ids[row, col]
+            out[row, col] = x[idx, idx]
+        return out
+
+    ids = torch.tensor([[6, 3, 1, 7], [0, 5, 2, 4]])
+    x = torch.arange(64.0).reshape(8, 8)
+    args = (x, ids, torch.empty(2, 4))
+    with cpu_render_target():
+        code = cpu_bind(diagonal, args).to_code(helion.Config(block_sizes=[2, 4]))
+    result, _ = execute_pointwise_thread_program(code, args)
+    torch.testing.assert_close(result, x[ids, ids])
+
+    @helion.kernel(backend="cute", static_shapes=True)
+    def split_diagonal(x, ids, out):
+        for row in hl.tile(ids.size(0)):
+            half = ids.size(1) // 2
+            idx, _ = hl.split(ids[row, :].reshape([row, 2, half]).permute(0, 2, 1))
+            out[row, :] = x[idx, idx]
+
+    # A split index and a regular result use different lane coordinates for
+    # columns. The conflict is on the second axis of the rank-two gather.
+    with (
+        cpu_render_target(),
+        pytest.raises(
+            helion.exc.BackendUnsupported,
+            match="at position 1 with different lane coordinates",
+        ),
+    ):
+        cpu_bind(
+            split_diagonal,
+            (x, torch.zeros(8, 16, dtype=torch.int64), torch.empty(8, 8)),
+        ).to_code(helion.Config(block_sizes=[8]))

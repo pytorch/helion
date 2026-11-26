@@ -42,6 +42,7 @@ from .tile_strategy import DeviceLoopState
 from .tile_strategy import EmitPipelineLoopState
 from .tile_strategy import ForiLoopState
 from .variable_origin import ArgumentOrigin
+from .variable_origin import TensorSizeOrigin
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -369,6 +370,136 @@ class GenerateAST(NodeVisitor, CodegenInterface):
         return self.active_device_loops[block_idx][-1].strategy.tile_begin_var(
             block_idx
         )
+
+    def unsigned_tile_edge(self, block_idx: int, *, extent: bool) -> str | None:
+        """Unsigned endpoint, or its signed block-bounded distance from the origin."""
+        loops = self.active_device_loops.get(block_idx)
+        owner = loops[-1] if loops else self.current_grid_state
+        if owner is None or block_idx not in owner.block_id_to_info:
+            return None
+        info = owner.block_id_to_info[block_idx]
+        end = info.end_var_name
+        literal = (
+            int(info.grid_end_expr)
+            if isinstance(info.grid_end_expr, sympy.Integer)
+            else int(end)
+            if end is not None and end.isdecimal()
+            else None
+        )
+        if not info.unsigned_grid_end and (literal is None or literal < 2**63):
+            return None
+        if literal is not None and literal >= 2**64:
+            raise exc.InvalidConfig("exclusive tile.end exceeds UInt64")
+        assert end is not None
+        u64 = self.backend.uint64_expr
+        first = u64(self.tile_begin_var(block_idx))
+        stop = u64(str(literal) if literal is not None else end)
+        span = u64(self.device_function.block_size_var(block_idx) or "1")
+        remaining = f"(({stop}) - ({first}))"
+        fits = f"(({first}) <= ({stop})) & (({remaining}) >= ({span}))"
+        if extent:
+            # This quantity is at most the block width even when the exclusive
+            # edge itself needs UInt64. Do not expose its subtraction to users.
+            tail = self.backend.where_expr(f"({first}) < ({stop})", remaining, u64("0"))
+            count = self.backend.where_expr(fits, span, tail)
+            return self.backend.cast_expr(count, self.backend.dtype_str(torch.int64))
+        edge = self.backend.where_expr(fits, f"({first}) + ({span})", stop)
+        name = self.tmpvar(dce=True, prefix="wide_tile_end")
+        self.add_statement(
+            f"{name} = {self.backend.unbounded_uint64_grid_expr(name, edge)}"
+        )
+        return name
+
+    def tile_end_expr(self, block_idx: int) -> str:
+        """The exclusive tile edge, clipped without overflowing the index type."""
+        df = self.device_function
+        begin = self.tile_begin_var(block_idx)
+        block = df.block_size_var(block_idx) or "1"
+        width = df.resolved_block_size(block_idx)
+        loops = self.active_device_loops.get(block_idx)
+        owner = loops[-1] if loops else self.current_grid_state
+        if owner is None or block_idx not in owner.block_id_to_info:
+            return f"{begin} + {block}"
+        info = owner.block_id_to_info[block_idx]
+        masked = owner.strategy.mask_var(block_idx) is not None
+        if self.backend.native_nested_tile_bounds and isinstance(
+            owner, DeviceLoopState
+        ):
+            # A nested loop uses its native counter and clips its final tile to
+            # its own stop. Root grids may need the wider physical edges below.
+            edge = f"{begin} + {block}"
+            if masked:
+                assert info.end_var_name is not None
+                return self.backend.minimum_expr(edge, info.end_var_name)
+            return edge
+        end = info.end_var_name
+        # A device loop's end_expr may be its length, not the absolute end
+        # used in code (e.g. tile(4, 64) has length 60). Prove widths from
+        # the emitted bound or the explicitly absolute root-grid end.
+
+        def literal(text: str | None, expr: sympy.Expr | None) -> int | None:
+            if text is not None and text.removeprefix("-").isdecimal():
+                return int(text)
+            return int(expr) if isinstance(expr, sympy.Integer) else None
+
+        lo = literal(info.begin_var_name, info.begin_expr)
+        hi = literal(end, info.grid_end_expr)
+        if unsigned := self.unsigned_tile_edge(block_idx, extent=False):
+            return unsigned
+        narrow = torch.iinfo(torch.int32)
+        if (
+            lo is not None
+            and hi is not None
+            and narrow.min <= lo <= hi <= narrow.max
+            and (not masked or (type(width) is int and hi + width - 1 <= narrow.max))
+        ):
+            naive = f"{begin} + {block}"
+            if not masked:
+                return naive
+            assert end is not None
+            return self.backend.minimum_expr(naive, end)
+
+        minimum = self.backend.tile_edge_minimum
+
+        if masked and lo == 0 and info.grid_end_expr is not None:
+            origin = self.host_function.expr_to_origin.get(info.grid_end_expr)
+            if origin is not None and isinstance(origin.origin, TensorSizeOrigin):
+                # A root input size and its zero-origin offset are nonnegative.
+                # Cap the width and then the offset, so both the subtraction and
+                # the final sum fit the size's native type, even on a surplus PID.
+                assert end is not None
+                span = minimum(end, block)
+                last = f"({end} - {span})"
+                return f"({minimum(begin, last)} + {span})"
+
+        dtype = self.backend.dtype_str(torch.int64)
+        begin = self.backend.cast_expr(begin, dtype)
+        if not masked:
+            return f"{begin} + {block}"
+        assert end is not None
+        # Both operands must remain signed Int64: a backend's index minimum
+        # can otherwise narrow them back to the ordinary coordinate width.
+
+        if hi is not None and type(width) is int:
+            # Constant-fold the same width-independent clamp used below. A
+            # signed-64 cast may execute at 32 bits on some backends.
+            ceiling = self.backend.cast_expr(str(max(hi, 0) - width), dtype)
+            padded = f"({minimum(begin, ceiling)} + {block})"
+            return (
+                padded
+                if hi >= 0
+                else minimum(padded, self.backend.cast_expr(end, dtype))
+            )
+
+        # Clamp against max(end, 0) - block before adding. The subtraction
+        # fits at any signed width and the padded sum cannot exceed max(end, 0).
+        # For a negative end, the final minimum restores the actual endpoint.
+        stop = self.backend.cast_expr(end, dtype)
+        zero = self.backend.cast_expr("0", dtype)
+        nonnegative = self.backend.where_expr(f"{stop} < {zero}", zero, stop)
+        ceiling = f"(({nonnegative}) - {block})"
+        padded = f"({minimum(begin, ceiling)} + {block})"
+        return minimum(padded, stop)
 
     def index_var(self, block_idx: int) -> str:
         return self.active_device_loops[block_idx][-1].strategy.index_var(block_idx)

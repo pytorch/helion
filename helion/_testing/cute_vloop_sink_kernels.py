@@ -204,7 +204,9 @@ def _col_reduce_sum_gather_then_atomic_fn(
     block_m = hl.register_block_size(m)
     block_n = hl.register_block_size(n)
     for tile_n in hl.tile(n, block_size=block_n):
-        before = torch.gather(count[tile_n], 0, tile_n.index.to(torch.int64))
+        before = torch.gather(
+            count[tile_n], 0, hl.arange(tile_n.block_size).to(torch.int64)
+        )
         hl.atomic_add(count, [tile_n], hl.full([tile_n], 1.0, dtype=torch.float32))
         acc = hl.zeros([tile_n], dtype=torch.float32)
         for tile_m in hl.tile(m, block_size=block_m):

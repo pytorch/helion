@@ -545,14 +545,16 @@ class TestPallasJaggedCarryBmm(TestCase):
 
         seq_offsets = torch.tensor([0, 13, 25], dtype=torch.int32, device=DEVICE)
         jagged = torch.randn((25, 128), dtype=torch.bfloat16, device=DEVICE)
-        code, out = code_and_output(
-            jagged_scale_dyn,
-            (seq_offsets, jagged, dynamic_cols),
-            block_sizes=[16, 128],
-            pallas_loop_type=loop_type,
+        compiled = jagged_scale_dyn.bind(
+            (seq_offsets, jagged, dynamic_cols)
+        ).compile_config(
+            helion.Config(block_sizes=[16, 128], pallas_loop_type=loop_type)
         )
-        self.assertIn("(B,)", code)
-        torch.testing.assert_close(out, jagged * 2)
+        # A warmed wrapper must derive its work count from the live offset
+        # table. A constant two-group grid would leave the last rows untouched.
+        for offsets in (seq_offsets, seq_offsets.new_tensor([0, 7, 13, 25])):
+            out = compiled(offsets, jagged, dynamic_cols)
+            torch.testing.assert_close(out, jagged * 2)
 
     @parametrize(
         "case",

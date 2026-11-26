@@ -283,6 +283,9 @@ class FlyDSLBackend(Backend):
         return [f"_num_threads={n_threads}"]
 
     def cast_expr(self, expr_str: str, dtype_str: str) -> str:
+        # A folded index bound is a Python integer, not a FlyDSL value with .to().
+        if expr_str.removeprefix("-").isdecimal():
+            return f"{dtype_str}({expr_str})"
         return f"{expr_str}.to({dtype_str})"
 
     def cast_scalar_ast(self, x: ast.AST, target_dtype: torch.dtype) -> ast.AST:

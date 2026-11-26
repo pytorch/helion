@@ -24,7 +24,10 @@ from .._compat import use_tileir_tunables
 from .._compiler.ast_extension import ExtendedAST
 from .._compiler.ast_extension import LoopType
 from .._compiler.ast_extension import expr_from_string
+from .._compiler.ast_extension import statement_from_string
 from .._compiler.compile_environment import CompileEnvironment
+from .._compiler.compile_environment import _to_sympy
+from .._compiler.host_function import HostFunction
 from .._compiler.type_info import GridIndexType
 from .._compiler.type_info import IterType
 from .._compiler.type_info import JaggedTileIndexType
@@ -252,25 +255,20 @@ def _allow_static_range(begin: object, end: object, step: object) -> bool:
     1) The ranges are statically known at compile time.
     2) The range is small enough to be unrolled without blowing up the compile time.
     """
-    if begin is None:
-        begin = 0
-    elif not isinstance(begin, int):
+    if isinstance(step, int) and step == 0:
+        raise exc.InvalidAPIUsage("range() arg 3 must not be zero")
+    begin = 0 if begin is None else begin
+    step = 1 if step is None else step
+    if (
+        not isinstance(begin, int)
+        or not isinstance(end, int)
+        or not isinstance(step, int)
+    ):
         return False
-
-    if not isinstance(end, int):
-        return False
-
-    if step is None:
-        count = end - begin
-    elif isinstance(step, int):
-        # Use integer math to avoid Triton constexpr types
-        # Compute ceil((end - begin) / step)
-        delta = end - begin
-        count = (delta + step - 1) // step
-    else:
-        return False
-    # Unrolling a long static range leads to compile timeouts
-    return count <= 8
+    # Each eligible loop owns a positional static_ranges slot in saved Triton
+    # configs. Keep the historical cutoff, including its conservative bound
+    # for negative steps. Python integer arithmetic cannot overflow here.
+    return (end - begin + step - 1) // step <= 8
 
 
 def _normalize_begin_end(
@@ -813,7 +811,8 @@ def _codegen_loop_helper(
 
     if loop_type == LoopType.GRID:
         block_ids = [t.block_id for t in indices]
-        state.tile_strategy.codegen_grid(state, block_ids)
+        step = state.proxy_args[2] if isinstance(indices[0], GridIndexType) else None
+        state.tile_strategy.codegen_grid(state, block_ids, step)
         return expr_from_string("None")
     raise AssertionError(f"Expected loop type: {loop_type}")
 
@@ -975,10 +974,27 @@ def _(
         if isinstance(size, torch.Tensor):
             size = None  # data dependent size
             has_data_dependent_bounds = True
+        if isinstance(step_part, torch.Tensor):
+            if (
+                step_part.ndim != 0
+                or step_part.is_floating_point()
+                or step_part.is_complex()
+            ):
+                raise exc.IncorrectTileUsage("hl.grid step must be a scalar integer")
+            has_data_dependent_bounds = True
         if step_part is None:
             step_part = 1
+        # A scalar root maps one trip to one program; its logical stride is
+        # not a thread-block width (it may be live, negative, or enormous).
+        env = CompileEnvironment.current()
+        root = env.typing_root_id is None
         # pyrefly: ignore [bad-argument-type]
-        results.append(GridIndexType.allocate(size, origin, step_part))
+        axis = GridIndexType.allocate(size, origin, 1 if root else step_part)
+        if root:
+            env.config_spec.literal_root_grid_steps[axis.block_id] = (
+                step_part if isinstance(step_part, int) else None
+            )
+        results.append(axis)
 
     _add_config_choices(
         [x.block_id for x in results],
@@ -1001,6 +1017,22 @@ def _(
 
 @_decorators.codegen(grid, "common")
 def _(state: CodegenState) -> ast.AST:
+    # Persistent launches use the SM count and need not evaluate a host
+    # range. Validate its live stride before submitting a device division.
+    steps = state.proxy_args[2]
+    for step in steps if isinstance(steps, (tuple, list)) else (steps,):
+        if isinstance(step, torch.SymInt):
+            host_step = state.device_function.root_grid_operand(
+                _to_sympy(step), "grid_stride"
+            )
+            error = HostFunction.current().import_from_module(
+                vars(builtins), "ValueError"
+            )
+            state.codegen.host_statements.append(
+                statement_from_string(
+                    f'if ({host_step}) == 0: raise {error.host_str()}("range() arg 3 must not be zero")'
+                )
+            )
     return _codegen_loop_helper(state)
 
 

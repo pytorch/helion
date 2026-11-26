@@ -1,8 +1,13 @@
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 import torch
 import triton
 import triton.language as tl
+
+if TYPE_CHECKING:
+    from triton.language.semantic import TritonSemantic
 
 __all__ = [
     "integer_full",
@@ -10,6 +15,17 @@ __all__ = [
     "min_propagate_nan",
     "triton_wait_signal",
 ]
+
+
+@tl.core.builtin
+def device_error(
+    message: tl.constexpr, _semantic: TritonSemantic | None = None
+) -> None:
+    # A failed precondition must stop the program even with TRITON_DEBUG off.
+    assert _semantic is not None
+    _semantic.builder.create_assert(
+        _semantic.to_tensor(False).handle, tl.constexpr(message).value
+    )
 
 
 @triton.jit

@@ -12,6 +12,7 @@ from helion._compiler.cute.launch_shape import live_grid_thread_dims
 from helion._testing import DEVICE
 from helion._testing import skipUnlessBackends
 from helion._testing.cute_aux import cpu_codegen
+from helion._testing.cute_thread_simulator import execute_pointwise_thread_program
 import helion.language as hl
 
 pytestmark = skipUnlessBackends(["cute"])
@@ -236,8 +237,6 @@ def test_explicit_launch_metadata_ignores_expression_spelling_and_dead_names() -
 
 
 def test_live_free_axis_is_not_dropped() -> None:
-    from .test_indexing import _execute_pointwise_thread_program
-
     x = torch.arange(65 * 32, dtype=torch.float32).reshape(65, 32)
     args = (x,)
     blocked = _code(_free_axis_copy, args, _config("free", "blocked"))
@@ -252,7 +251,7 @@ def test_live_free_axis_is_not_dropped() -> None:
     expected = x + torch.arange(65)[:, None]
     snapshot = x.clone()
     for source in (blocked, strided):
-        actual, _ = _execute_pointwise_thread_program(source, args)
+        actual, _ = execute_pointwise_thread_program(source, args)
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
         torch.testing.assert_close(x, snapshot, rtol=0, atol=0)
 

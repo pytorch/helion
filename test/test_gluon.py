@@ -19,6 +19,7 @@ from helion._testing import skipIfRefEager
 from helion._testing import skipUnlessGluon
 from helion._testing.gluon_kernels import dot_mm
 from helion._testing.gluon_kernels import nvfp4_mm
+from helion._testing.gluon_kernels import split_k_mm
 import helion.language as hl
 
 
@@ -130,19 +131,6 @@ def gather_mv(w: torch.Tensor, idx: torch.Tensor, x: torch.Tensor) -> torch.Tens
         for tile_k in hl.tile(s):
             acc = hl.dot(w[rows * s + tile.index % s, tile_k], x[tile_k, :], acc=acc)
         out[tile, :] = acc
-    return out
-
-
-@helion.kernel(static_shapes=True, backend="gluon")
-def split_k_mm(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-    m, k = x.size()
-    _, n = y.size()
-    out = torch.zeros([m, n], dtype=torch.float32, device=x.device)
-    for tile_m, tile_n, outer_k in hl.tile([m, n, k], block_size=[None, None, 256]):
-        acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
-        for inner_k in hl.tile(outer_k.begin, outer_k.end):
-            acc = torch.addmm(acc, x[tile_m, inner_k], y[inner_k, tile_n])
-        hl.atomic_add(out, [tile_m, tile_n], acc)
     return out
 
 
@@ -392,6 +380,29 @@ def _asm(
 @skipUnlessGluon()
 @skipIfRefEager("gluon codegen")
 class TestGluon(TestCase):
+    def test_nested_tile_keeps_four_writes_above_uint32(self) -> None:
+        @helion.kernel(
+            backend="gluon",
+            index_dtype=torch.int32,
+            config=helion.Config(block_sizes=[]),
+        )
+        def mark(out: torch.Tensor, bounds: torch.Tensor) -> None:
+            for row in hl.grid(out.size(0)):
+                for tile in hl.tile(bounds[0], bounds[1], block_size=4):
+                    out[row, 1 + (tile.index & 3)] = row + tile.end
+
+        bounds = torch.tensor([2**32, 2**32 + 4], device=DEVICE, dtype=torch.int64)
+        out = torch.full((2, 6), -73, device=DEVICE, dtype=torch.int32)
+        mark(out, bounds)
+        self.assertEqual(out.tolist(), [[-73, 4, 4, 4, 4, -73], [-73, 5, 5, 5, 5, -73]])
+
+        bounds.copy_(torch.tensor([1, 3], device=DEVICE))
+        out.fill_(-73)
+        mark(out, bounds)
+        self.assertEqual(
+            out.tolist(), [[-73, -73, 3, 3, -73, -73], [-73, -73, 4, 4, -73, -73]]
+        )
+
     def test_loop_unroll(self) -> None:
         # 7 inner steps unrolled by 3 (two unrolled steps and a remainder); the
         # persistent loop unrolled by 2 leaves some programs no row at all.
@@ -405,11 +416,11 @@ class TestGluon(TestCase):
             torch.testing.assert_close(out, x.sum(-1))
 
     def test_scalar_index_expand_dims(self) -> None:
-        # A loaded scalar index broadcast as s[:, None] (Triton splats it to [1]).
+        # The scalar's stride broadcasts across the two tile axes in the pointer sum.
         state = torch.randn(5, 3, 32, 64, device=DEVICE)
         idx = torch.tensor([4, 0, 2], device=DEVICE, dtype=torch.int32)
         code, out = code_and_output(pick_rows, (state, idx), block_sizes=[1, 16])
-        self.assertIn("[:, None] * 6144", code)
+        self.assertRegex(code, r"\b\w+ \* 6144\b")
         torch.testing.assert_close(out, (state[idx.long()] * 2).reshape(9, 32, 64))
 
     def test_matmul_configs(self) -> None:

@@ -205,6 +205,27 @@ def test_unaligned_dynamic_bound_keeps_every_partial_tail(kind: str) -> None:
             _exercise(plan, original, predicate, {"k": k, "limit": limit})
 
 
+def test_shifted_tile_keeps_active_middle_lanes() -> None:
+    predicate = "(k >= lower) & (k < upper)"
+    plan, original = _plan(predicate)
+    # Both endpoints of the first eight-lane packet are masked out. Do not
+    # zero-fill the packet: only the middle lanes may be read.
+    assert _exercise(plan, original, predicate, {"k": 0, "lower": 2, "upper": 6}) == 0
+    assert _exercise(plan, original, predicate, {"k": 8, "lower": 2, "upper": 16}) == 1
+
+
+def test_shifted_tile_retains_the_range_and_tile_lower_bounds() -> None:
+    predicate = "(k >= lower) & (k >= origin) & (k < upper)"
+    plan, original = _plan(predicate)
+    # Either lower bound may exclude the first lanes. With the last lanes
+    # excluded too, read precisely the live middle through the scalar path.
+    for lower, origin in ((2, 0), (0, 2)):
+        bounds = {"k": 0, "lower": lower, "origin": origin, "upper": 6}
+        assert _exercise(plan, original, predicate, bounds) == 0
+    bounds = {"k": 8, "lower": 2, "origin": 8, "upper": 16}
+    assert _exercise(plan, original, predicate, bounds) == 1
+
+
 @pytest.mark.parametrize("kind", ["generic", "chain"])
 def test_integer_constexpr_bound_and_compound_mask(kind: str) -> None:
     predicate = (

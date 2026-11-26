@@ -22,8 +22,11 @@ def simulate_independent_fragment(
     outputs: Mapping[str, object],
     blocks: int,
     *,
+    thread: tuple[int, int, int] = (0, 0, 0),
+    block_y: int = 0,
     int32: Callable[..., object] = int,
     int64: Callable[..., object] = int,
+    uint64: Callable[..., object] = int,
     inline_asm: Callable[..., object] | None = None,
     gather_registers: Callable[..., object] | None = None,
 ) -> dict[str, int]:
@@ -50,6 +53,10 @@ def simulate_independent_fragment(
                 storage_offset=0,
             )
 
+        @property
+        def llvm_ptr(self) -> Pointer:
+            return self
+
         def align(self, alignment: int) -> Pointer:
             assert (
                 self.tensor.data_ptr() + self.offset * self.tensor.element_size()
@@ -68,6 +75,12 @@ def simulate_independent_fragment(
             offset = self.tensor.storage_offset() + self.offset
             assert 0 <= offset < storage.numel()
             storage[offset] = value.item() if isinstance(value, np.generic) else value
+
+    def atomic_add(ptr: Pointer, *, val: float, sem: str) -> object:
+        previous = ptr.load()
+        assert isinstance(previous, (float, int))
+        ptr.store(previous + val)
+        return previous
 
     class Shared:
         def __init__(self, dtype: type, shape: tuple[int, ...]) -> None:
@@ -131,7 +144,12 @@ def simulate_independent_fragment(
     )
     function.decorator_list = []
     SerialElements().visit(function)
-    constants = [node for node in tree.body if isinstance(node, ast.Assign)]
+    constants = [
+        node
+        for node in tree.body
+        if isinstance(node, ast.Assign)
+        and all(isinstance(target, ast.Name) for target in node.targets)
+    ]
     for block in range(blocks):
         environment: dict[str, object] = {
             "operator": operator,
@@ -141,11 +159,12 @@ def simulate_independent_fragment(
                 Float16=np.float16,
                 Float32=np.float32,
                 Float64=np.float64,
+                Int8=np.int8,
                 Int16=np.int16,
                 Int32=int32,
                 Int64=int64,
                 Uint32=int,
-                Uint64=int,
+                Uint64=uint64,
                 Boolean=bool,
                 utils=SimpleNamespace(SmemAllocator=Allocator),
             ),
@@ -160,6 +179,9 @@ def simulate_independent_fragment(
                     tanh=np.tanh,
                 ),
                 make_layout=lambda shape: shape,
+                crd2idx=lambda coords, layout: sum(
+                    i * stride for i, stride in zip(coords, layout.stride, strict=True)
+                ),
                 make_rmem_tensor=lambda layout, dtype: Shared(dtype, layout),
                 make_tensor=lambda iterator, layout: SimpleNamespace(
                     iterator=iterator, layout=layout
@@ -168,9 +190,10 @@ def simulate_independent_fragment(
                 nvgpu=SimpleNamespace(CopyUniversalOp=lambda: None),
                 copy=copy_packet,
                 arch=SimpleNamespace(
-                    thread_idx=lambda: (0, 0, 0),
-                    block_idx=lambda block=block: (block, 0, 0),
+                    thread_idx=lambda: thread,
+                    block_idx=lambda block=block: (block, block_y, 0),
                     sync_threads=lambda: None,
+                    atomic_add=atomic_add,
                     fmax=lambda a, b, nan=False: (
                         np.maximum(a, b) if nan else np.fmax(a, b)
                     ),

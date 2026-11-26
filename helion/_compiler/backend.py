@@ -726,6 +726,11 @@ class Backend(abc.ABC):
         return False
 
     @property
+    def native_nested_tile_bounds(self) -> bool:
+        """Whether nested tiles use the native range's counter, upper mask and edge."""
+        return False
+
+    @property
     def compiler_pipelines_ranges(self) -> bool:
         """Whether the compiler software-pipelines ``tl.range`` loops by their
         ``num_stages`` (Triton's), issuing an iteration's loads ahead of the
@@ -828,6 +833,10 @@ class Backend(abc.ABC):
 
     # -- type strings and the expression printer (scalars, indices, loops) -----
 
+    def root_coordinate_type_str(self, dtype: torch.dtype) -> str:
+        """Signed arithmetic type for an axis with a noncanonical grid range."""
+        return self.dtype_str(dtype)
+
     @abc.abstractmethod
     def dtype_str(self, dtype: torch.dtype) -> str:
         """Convert a torch dtype to a backend-specific type string.
@@ -845,12 +854,31 @@ class Backend(abc.ABC):
         """
         ...
 
+    def tile_index_dtype(
+        self, index_dtype: torch.dtype, *, serial_device_lane: bool = False
+    ) -> torch.dtype:
+        """The tensor dtype of a physical tile coordinate."""
+        return index_dtype
+
     def index_type_str(self, index_dtype: torch.dtype) -> str:
         """Get the index type string for the given dtype.
 
         Defaults to dtype_str, but backends may override for special handling.
         """
-        return self.dtype_str(index_dtype)
+        return self.dtype_str(self.tile_index_dtype(index_dtype))
+
+    def uint64_expr(self, value: str) -> str:
+        """Use an unsigned 64-bit arithmetic value for range counts and coordinates."""
+        return self.cast_expr(value, self.dtype_str(torch.uint64))
+
+    def bounded_uint64_grid_expr(self, value: str) -> str:
+        """Render a grid coordinate proved to fit the signed index domain."""
+        return value
+
+    def unbounded_uint64_grid_expr(self, name: str, value: str) -> str:
+        raise exc.InvalidConfig(
+            f"{self.name} cannot represent an unbounded UInt64 grid coordinate"
+        )
 
     def program_id_expr(self, dim: int, *, index_dtype: str) -> str:
         """Expression reading the program id of grid axis ``dim`` as ``index_dtype``."""
@@ -890,6 +918,15 @@ class Backend(abc.ABC):
         """Generate a backend-specific range expression, or None to use the default."""
         return None
 
+    def device_error_stmt(self, message: str) -> str:
+        raise exc.BackendUnsupported(self.name, "checking a device precondition")
+
+    def persistent_range_str(
+        self, begin: str, end: str, step: str | None
+    ) -> str | None:
+        """A device range which preserves a possibly wide persistent PID bound."""
+        return None
+
     def arange_expr(
         self,
         offsets_var: str,
@@ -917,6 +954,10 @@ class Backend(abc.ABC):
     def scalar_load_expr(self, tensor_name: str, index_expr: str | None = None) -> str:
         """Load scalar value from a tensor argument."""
         raise exc.BackendUnsupported(self.name, "scalar load")
+
+    def scalar_tensor_index_expr(self, tensor_name: str) -> str:
+        """Read a rank-zero tensor argument at a memory indexing operation."""
+        return self.scalar_load_expr(tensor_name)
 
     def ast_to_dtype_expr(self, expr_str: str, dtype_str: str) -> str:
         """Generate dtype conversion expression for AST values."""
@@ -1516,6 +1557,10 @@ class Backend(abc.ABC):
     def where_expr(self, mask: str, true_val: str, false_val: str) -> str:
         """Generate a backend-specific conditional select expression."""
         raise exc.BackendUnsupported(self.name, "where")
+
+    def tile_edge_minimum(self, left: str, right: str) -> str:
+        """Clamp a tile edge without narrowing either signed operand."""
+        return f"({self.where_expr(f'{left} < {right}', left, right)})"
 
     def mask_padded_range_lanes(
         self, value: str, length: int, dim: int, ndim: int, identity: str
@@ -2593,6 +2638,10 @@ class Backend(abc.ABC):
         complete, before ``codegen_function_def``: deferred checks and the
         device-side additions that depend on the whole body."""
         return None
+
+    def nd_device_loop_args(self, state: CodegenState) -> list[object]:
+        """Operands used for both the native range and its tile masks."""
+        return state.ast_args
 
     def prepare_device_loop(
         self,

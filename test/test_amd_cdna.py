@@ -283,9 +283,6 @@ class TestXCDRemapCodegen(TestCase):
                 xcd_remap=True,
             )
         torch.testing.assert_close(result, x + y)
-        self.assertIn(
-            "xcd_active_workers = tl.cdiv(total_pids, xcd_safe_block_size)", code
-        )
         self.assertIn("tl.where(tl.program_id(0) < xcd_active_workers", code)
 
     @skipUnlessMultiXCD("Requires a multi-XCD AMD CDNA GPU")

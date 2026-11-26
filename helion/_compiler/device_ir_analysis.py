@@ -502,11 +502,10 @@ def _indexed_region_sizes(
     index = cast(
         "list[object]", torch.fx.map_arg(index_list, lambda node: node.meta["val"])
     )
-    tensors = [k for k in index if isinstance(k, torch.Tensor)]
-    broadcast = env.should_broadcast_tensor_indexers(index)
+    group = env.tensor_indexer_broadcast_group(index)
     sizes: list[int | torch.SymInt] = []
     dims = iter(tensor.shape)
-    for k in index:
+    for position, k in enumerate(index):
         if k is None:
             continue  # A new axis of size one: it addresses no dim of the tensor.
         size = next(dims)
@@ -516,10 +515,10 @@ def _indexed_region_sizes(
             # Adjacent index tensors address one group of dims (the Cartesian
             # product of 1-D ones, else their broadcast); index tensors that
             # something else separates each address their own.
-            if not broadcast:
+            if group is None:
                 sizes.extend(env.tensor_indexer_dims(k))
-            elif k is tensors[0]:
-                sizes.extend(env.tensor_indexer_broadcast_shape(tensors))
+            elif position == group[0]:
+                sizes.extend(env.tensor_indexer_broadcast_shape(group[1]))
         elif isinstance(k, torch.SymInt) and is_block_size_index(k):
             sizes.append(k)
         # Else a scalar (an int, a symbolic value, a grid index): one element
@@ -608,6 +607,8 @@ def _scalar_subscript_affine(
                     type(origin) in (GridOrigin, TileBeginOrigin)
                     and isinstance(source, FixedBlockSizeSource)
                     and env.known_equal(source.value, 1)
+                    and env.config_spec.literal_root_grid_steps.get(origin.block_id, 1)
+                    == 1
                 )
             ):
                 return origin.block_id, 1, int(offset), type(origin) is TileIdOrigin
@@ -763,6 +764,10 @@ def _subscript_dense_span(
     ):
         return None
     axis = origin.block_id
+    # Scalar root grids always occupy one physical lane, even when their
+    # logical coordinates advance by a larger (or runtime) stride.
+    if env.config_spec.literal_root_grid_steps.get(axis, 1) != 1:
+        return None
     info = env.block_sizes[env.canonical_block_id(axis)]
     # A fixed block size keeps a symbolic var, but arange(value * scale) traces
     # as a constant extent; accept either spelling.

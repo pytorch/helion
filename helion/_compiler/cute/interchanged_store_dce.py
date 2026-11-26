@@ -43,6 +43,8 @@ from .persistent_branch_vec import _plain_scalar_store_pointer
 from .persistent_branch_vec import _pointer_integer_affine_form
 from .persistent_branch_vec import _single_tensor_iterator_root
 from .pure_lane_packets import is_pure_inline_asm_call
+from .tile_bounds import SerialRangeFacts
+from .tile_bounds import clipped_tile_width
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -1097,7 +1099,7 @@ def _serial_span(
     prefix: list[ast.stmt],
     mutable_names: set[str],
     protected_names: set[str],
-    constexpr_value: Callable[[str], int | None] | None,
+    range_facts: SerialRangeFacts | None,
 ) -> int | None:
     """The largest difference between two values of ``serial_loop``'s
     variable across all lanes, from its ``range`` bounds as they stand after
@@ -1155,14 +1157,21 @@ def _serial_span(
 
     class _Constexprs(ast.NodeTransformer):
         def visit_Name(self, node: ast.Name) -> ast.expr:
-            value = None if constexpr_value is None else constexpr_value(node.id)
+            value = (
+                None
+                if range_facts is None or range_facts.constexpr is None
+                else range_facts.constexpr(node.id)
+            )
             return node if value is None else ast.Constant(value)
+
+    def resolve(expression: ast.expr) -> ast.expr:
+        return _Constexprs().visit(cast("ast.expr", clone_ast(expression)))
 
     def constant(expression: ast.expr) -> int | None:
         """``expression``'s value when it is a known integer."""
         # The bounds read no loop variable, so there is none to track.
         form = _pointer_integer_affine_form(
-            _Constexprs().visit(cast("ast.expr", clone_ast(expression))),
+            resolve(expression),
             "",
             {},
             set(),
@@ -1188,6 +1197,7 @@ def _serial_span(
         cast("ast.expr", _KeptConstants().visit(cast("ast.expr", clone_ast(bound))))
         for bound in (begin, end)
     )
+    original_begin, original_end = begin, end
     casts: list[str] = []
     while (
         cast_path := _narrowing_cast(begin)
@@ -1254,6 +1264,15 @@ def _serial_span(
     # ``n``).
     if step_value is None or step_value <= 0:
         return None
+    if range_facts is not None and range_facts.tensor_sizes:
+        width = clipped_tile_width(
+            resolve(original_begin),
+            resolve(original_end),
+            range_facts.tensor_sizes,
+            range_facts.int32_names,
+        )
+        if width is not None:
+            return width - 1
     arms = _min_arms(end)
     if wrapped and not all(_narrowing_cast(arm) in _CASTS_MOD_2_32 for arm in arms):
         return None
@@ -1389,7 +1408,7 @@ def serial_loop_outside_lanes_keeps_memory(
     proven_disjoint_tensor_pairs: set[frozenset[str]],
     protected_names: set[str],
     proven_tensor_stride_values: Mapping[tuple[str, int], int],
-    constexpr_value: Callable[[str], int | None] | None = None,
+    range_facts: SerialRangeFacts | None = None,
 ) -> str | None:
     """Why running ``serial_loop`` outside ``lane_loop`` may change what the
     nest loads or leaves in memory, ``None`` when it provably does not.
@@ -1470,7 +1489,7 @@ def serial_loop_outside_lanes_keeps_memory(
         cast("list[ast.stmt]", lane_loop.body[:prefix_size]),
         mutable_names,
         protected_names,
-        constexpr_value,
+        range_facts,
     )
     if (
         snapshots is None
@@ -1528,7 +1547,7 @@ def drop_read_back_partial_stores(
     proven_disjoint_tensor_pairs: set[frozenset[str]],
     protected_names: set[str],
     proven_tensor_stride_values: Mapping[tuple[str, int], int],
-    constexpr_value: Callable[[str], int | None] | None = None,
+    range_facts: SerialRangeFacts | None = None,
     duplicated: Iterable[ast.AST] = (),
 ) -> None:
     """Drop the first pass's stores whose value a load reads back out of order.
@@ -1561,7 +1580,7 @@ def drop_read_back_partial_stores(
     reading only its own instance's element: any other would see the
     starting value where the tile program sees a complete one.  Raises
     ``BackendUnsupported`` for a store that cannot be dropped and for such a
-    load: the nest is declined.  ``constexpr_value`` resolves the constexprs
+    load: the nest is declined.  ``range_facts`` resolves the constexprs
     bounding the serial loop (``DeviceFunction.resolved_int_constexpr``).
     """
     body = list(serial_loop.body)
@@ -1607,7 +1626,7 @@ def drop_read_back_partial_stores(
     # A ``range`` gives the serial variable a distinct value per iteration,
     # those of all lanes at most ``serial_span`` apart.
     serial_span = _serial_span(
-        serial_loop, prefix, mutable_names, protected_names, constexpr_value
+        serial_loop, prefix, mutable_names, protected_names, range_facts
     )
     body_unstable = unstable[len(prefix)]
 

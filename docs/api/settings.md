@@ -96,9 +96,12 @@ def my_kernel(x: torch.Tensor) -> torch.Tensor:
 
 .. autoattribute:: Settings.index_dtype
 
-   The data type used for index variables in generated code. By default Helion auto-selects
-   between ``torch.int32`` and ``torch.int64`` based on whether any input tensor exceeds
-   ``torch.iinfo(torch.int32).max`` elements. Override via ``HELION_INDEX_DTYPE=<dtype>``
+   The data type used for index variables in generated code. By default Helion uses
+   ``torch.int64`` when an input tensor's element count or any individual dimension
+   exceeds ``torch.iinfo(torch.int32).max``. An empty tensor's dimensions still count:
+   its size can supply an independent grid axis. An explicitly narrow index type
+   still rejects excess elements, but an empty input keeps the selected storage
+   index type and can supply a wider grid coordinate. Override via ``HELION_INDEX_DTYPE=<dtype>``
    (or set it to ``auto`` to keep the automatic behavior).
 
 .. autoattribute:: Settings.dot_precision

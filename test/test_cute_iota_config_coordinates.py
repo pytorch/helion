@@ -7,6 +7,7 @@ import itertools
 import operator
 from types import SimpleNamespace
 from typing import TYPE_CHECKING
+from unittest.mock import Mock
 from unittest.mock import patch
 
 import numpy as np
@@ -179,8 +180,13 @@ def _interpret_scalar_kernel(
     kernel.decorator_list = []
     constants = [node for node in module.body if isinstance(node, ast.Assign)]
     arch = SimpleNamespace(thread_idx=lambda: (0, 0, 0), block_idx=lambda: (0, 0, 0))
+    launcher = Mock()
     namespace = {
+        "torch": torch,
+        "helion": helion,
+        "_default_cute_launcher": launcher,
         "cutlass": SimpleNamespace(
+            Int64=np.int64,
             Int32=np.int32,
             Int8=np.int8,
             Float32=np.float32,
@@ -189,26 +195,24 @@ def _interpret_scalar_kernel(
         "cute": SimpleNamespace(arch=arch),
         "operator": operator,
     }
+    wrapper = next(
+        node for node in reversed(module.body) if isinstance(node, ast.FunctionDef)
+    )
     exec(
         compile(
-            ast.Module(body=[*constants, kernel], type_ignores=[]),
+            ast.Module(body=[*constants, kernel, wrapper], type_ignores=[]),
             "<scalar CuTe oracle>",
             "exec",
         ),
         namespace,
     )
-    tensor_map = dict(zip(names, map(_Tensor, inputs), strict=True))
-    launch = next(
-        node
-        for node in ast.walk(module)
-        if isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Name)
-        and node.func.id == "_launcher"
-    )
-    block_node = next(kw.value for kw in launch.keywords if kw.arg == "block")
-    block = ast.literal_eval(block_node)
+    tensors = dict(zip(names, inputs, strict=True))
+    namespace[wrapper.name](*(tensors[arg.arg] for arg in wrapper.args.args))
+    launcher.assert_called_once()
+    grid = launcher.call_args.args[1]
+    block = launcher.call_args.kwargs["block"]
     assert block[1:] == (1, 1), "unexpected independent coordinate or reduction axis"
-    grid = eval(compile(ast.Expression(launch.args[1]), "<grid>", "eval"), namespace)
+    tensor_map = {name: _Tensor(value) for name, value in tensors.items()}
     function = namespace[kernel.name]
     parameters = [tensor_map[arg.arg] for arg in kernel.args.args]
     for cta in range(grid[0]):

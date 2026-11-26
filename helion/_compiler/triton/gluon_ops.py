@@ -351,6 +351,16 @@ def _loaded(x: Any, _semantic: Any) -> Any:
     return x.load(layout, _semantic=_semantic)
 
 
+@gl_builtin
+def load_branch(x: Any, _semantic: Any = None) -> Any:
+    """Choose the same register layout for each outcome of a guarded load."""
+    x = _loaded(x, _semantic)
+    if not x.type.is_block():
+        return x
+    layout = vector_layout(x.shape, x.dtype, _semantic._warps())
+    return _semantic.convert_layout(x, layout)
+
+
 def _slot_aware(op: Any, unchanged: Any) -> Any:
     """``tl.<op>``: a slot the op leaves as is (``unchanged``) is itself, else the
     op reads it first (``_loaded``)."""
@@ -1485,6 +1495,23 @@ def plan_load(
     for call in ast.walk(value):
         if _is_load(call) and isinstance(call, ExtendedAST):
             call._plan = plan
+        if isinstance(call, ast.IfExp) and any(
+            _is_tl_call(part, frozenset(["load_tensor_descriptor"]))
+            for part in ast.walk(call)
+        ):
+            # A descriptor result has a concrete layout; its pointer fallback
+            # and out-of-bounds zero can instead have an AutoLayout. A dynamic
+            # Triton ternary requires the branch types to be identical.
+            for field in ("body", "orelse"):
+                branch = getattr(call, field)
+                if not isinstance(branch, ast.IfExp):
+                    setattr(
+                        call,
+                        field,
+                        expr_from_string(
+                            f"{ALIAS}.load_branch({{value}})", value=branch
+                        ),
+                    )
     if _is_tl_call(value, frozenset(["load_tensor_descriptor"])) and plan:
         if plan[0] is not None:
             value.keywords.append(ast.keyword("TRANSPOSED", ast.Constant(plan[0])))

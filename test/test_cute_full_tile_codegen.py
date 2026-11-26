@@ -6,6 +6,7 @@ import json
 import random
 from unittest.mock import patch
 
+import numpy as np
 import pytest
 import torch
 
@@ -23,6 +24,8 @@ from helion._compiler.rng_utils import philox_rand_ref
 from helion._testing import cpu_render_target
 from helion._testing import import_example
 from helion._testing.cute_codegen import cpu_bind
+from helion._testing.cute_codegen import load_generated_module
+from helion._testing.cute_fragment_simulator import simulate_independent_fragment
 from helion.autotuner.config_generation import ConfigGeneration
 from helion.autotuner.effort_profile import get_effort_profile
 from helion.autotuner.pattern_search import InitialPopulationStrategy
@@ -59,6 +62,71 @@ def _functions(source):
     return [
         node for node in ast.parse(source).body if isinstance(node, ast.FunctionDef)
     ]
+
+
+def test_padded_nested_tile_does_not_store_wrapped_indices():
+    @helion.kernel(backend="cute", static_shapes=True)
+    def mark(out):
+        for row in hl.grid(out.size(0)):
+            for t in hl.tile(2**31 - 2, 2**31 - 1, block_size=4):
+                out[row, t.index % 4] = 1
+
+    out = torch.zeros(2, 4)
+    source = cpu_bind(mark, (out,)).to_code(helion.Config(block_sizes=[]))
+    # All four destinations exist, including the ones a wrapped Int32 would select.
+    with np.errstate(over="ignore"):
+        for lane in range(4):
+            simulate_independent_fragment(
+                source, {}, {"out": out}, 2, thread=(lane, 0, 0), int32=np.int32
+            )
+    assert out.tolist() == [[0, 0, 1, 0], [0, 0, 1, 0]]
+
+
+@pytest.mark.parametrize(
+    ("width", "threads", "cluster", "dtype"),
+    [(4, 1, 1, torch.int64), (128, 32, 2, torch.int32)],
+)
+def test_padded_serial_and_cluster_lanes_store_only_live_columns(
+    width, threads, cluster, dtype, tmp_path
+):
+    @helion.kernel(backend="cute", static_shapes=True, index_dtype=dtype)
+    def mark(out, width: hl.constexpr):
+        block = hl.register_block_size(width, width)
+        for row in hl.grid(out.size(0)):
+            for tile in hl.tile(2**31 - 3, 2**31 - 1, block_size=block):
+                out[row, tile.index & (width - 1)] = 1
+
+    out = torch.zeros(2, width)
+    source = cpu_bind(mark, (out, width)).to_code(
+        helion.Config(
+            block_sizes=[width], num_threads=[threads], cute_cluster_n=cluster
+        )
+    )
+    path = tmp_path / "mark.py"
+    path.write_text(source)
+    launches = []
+    load_generated_module(path).mark(
+        out,
+        width,
+        _launcher=lambda _, grid, *args, block: launches.append((grid, block)),
+    )
+    assert launches == [((2,) if cluster == 1 else (2, 2), (threads, 1, 1))]
+    with np.errstate(over="ignore"):
+        for rank in range(cluster):
+            for thread in range(threads):
+                simulate_independent_fragment(
+                    source,
+                    {},
+                    {"out": out},
+                    2,
+                    thread=(thread, 0, 0),
+                    block_y=rank,
+                    int32=np.int32,
+                    int64=np.int64,
+                )
+    expected = torch.zeros_like(out)
+    expected[:, -3:-1] = 1
+    torch.testing.assert_close(out, expected)
 
 
 def _body_dump(body):
@@ -133,8 +201,8 @@ def test_original_dropout_host_abi_and_fallback_are_unchanged(
     ).body
     assert ast.dump(uniform) == ast.dump(expected_uniform)
     assert ast.dump(comparisons[0]) == ast.dump(uniform)
-    # The only new scalar expression is lossless widening of the proved
-    # nonnegative index. All Philox rounds and floating-point expressions,
+    # The only new scalar expressions widen the proven nonnegative PID
+    # and element index. All Philox rounds and floating-point expressions,
     # including the full runtime seed/probability/scale, remain unchanged.
     original_values = {
         ast.dump(node)
@@ -147,30 +215,34 @@ def test_original_dropout_host_abi_and_fallback_are_unchanged(
         for node in ast.walk(statement)
         if isinstance(node, ast.Assign) and ast.dump(node) not in original_values
     ]
-    parameters = {arg.arg for arg in control_device.args.args}
-    original_index_casts = {
-        ast.dump(node): node
-        for node in ast.walk(control_device)
-        if isinstance(node, ast.Assign)
-        and isinstance(node.value, ast.Call)
-        and ast.unparse(node.value.func) == "cutlass.Int64"
-        and len(node.value.args) == 1
-        and isinstance(node.value.args[0], ast.Name)
-        and node.value.args[0].id not in parameters
-    }
-    assert len(original_index_casts) == 1
-    widened = deepcopy(next(iter(original_index_casts.values())))
-    assert isinstance(widened.value, ast.Call)
-    widened.value.args[0] = ast.parse(
-        f"cutlass.Uint32({ast.unparse(widened.value.args[0])})", mode="eval"
-    ).body
-    assert sum(ast.dump(node) == ast.dump(widened) for node in changed) == 1
-    assert all(
-        isinstance(node.value, ast.Constant)
-        and node.value.value is True
-        or ast.dump(node) == ast.dump(widened)
+    # Compare entire assignments so offset arithmetic and RNG inputs stay
+    # identical to the fallback apart from these exact zero extensions.
+    expected_changes = set()
+    for statement in ast.walk(control_device):
+        if not isinstance(statement, ast.Assign):
+            continue
+        widened = deepcopy(statement)
+        modified = False
+        for call in ast.walk(widened.value):
+            if (
+                isinstance(call, ast.Call)
+                and ast.unparse(call.func) == "cutlass.Int64"
+                and len(call.args) == 1
+                and isinstance(call.args[0], ast.Name)
+                and call.args[0].id in {"pid_flat", "indices_0"}
+            ):
+                call.args[0] = ast.parse(
+                    f"cutlass.Uint32({call.args[0].id})", mode="eval"
+                ).body
+                modified = True
+        if modified:
+            expected_changes.add(ast.dump(widened))
+    assert len(expected_changes) == 2
+    assert {
+        ast.dump(node)
         for node in changed
-    )
+        if not (isinstance(node.value, ast.Constant) and node.value.value is True)
+    } == expected_changes
     assert "seed" in fast and "_uniform_cutoff(p)" in fast and " * scale" in fast
 
 
@@ -200,10 +272,10 @@ def test_typed_loads_and_output_conversions_are_preserved(dtype):
         and node.func.value.id == "cutlass"
         and node.func.attr in {"Float16", "BFloat16", "Float32", "Int64"}
     }
-    widened = ast.dump(
-        ast.parse("cutlass.Int64(cutlass.Uint32(indices_0))", mode="eval").body
-    )
-    assert kept_calls - original_calls == {widened}
+    assert kept_calls - original_calls == {
+        ast.dump(ast.parse(f"cutlass.Int64(cutlass.Uint32({name}))", mode="eval").body)
+        for name in ("pid_flat", "indices_0")
+    }
 
 
 @pytest.mark.parametrize("stride", [2, 3])

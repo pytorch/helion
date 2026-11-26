@@ -22,6 +22,7 @@ launch wrappers can instead implement ``Backend.build_standalone_code``.
 from __future__ import annotations
 
 import ast
+import inspect
 from typing import TYPE_CHECKING
 from typing import Any
 
@@ -140,6 +141,12 @@ def _raise_needs_helion(kernel_name: str) -> None:
     )
 
 
+def dependency_free_runtime_names(info: LauncherInfo) -> list[str]:
+    return dedupe_preserve_order(
+        [*info.runtime_helper_names, info.launcher_symbol, "_grid_range_length"]
+    )
+
+
 def _runtime_shim_statements(info: LauncherInfo) -> list[ast.stmt]:
     """The dependency-free launcher inlined as a local ``helion.runtime`` shim,
     returned as AST statements to prepend to the module body.
@@ -150,16 +157,19 @@ def _runtime_shim_statements(info: LauncherInfo) -> list[ast.stmt]:
     could clash with the generated kernel, and re-exported as ``helion.runtime``
     so the body's verbatim ``helion.runtime.<fn>(...)`` calls resolve against it.
     """
-    exports = dedupe_preserve_order([*info.runtime_helper_names, info.launcher_symbol])
+    from ..runtime import _grid_range_length
+
     module = ast.parse(
         "helion = types.SimpleNamespace(runtime=_make_helion_runtime())\n"
         f"{info.launcher_alias} = helion.runtime.{info.launcher_symbol}\n"
     )
     return [
         *private_module_statements(
-            read_launcher_source(info.launcher_module),
+            read_launcher_source(info.launcher_module)
+            + "\nfrom builtins import OverflowError, ValueError, any, max, range\n"
+            + inspect.getsource(_grid_range_length),
             "_make_helion_runtime",
-            exports,
+            dependency_free_runtime_names(info),
             doc=_SHIM_DOC,
         ),
         *module.body,

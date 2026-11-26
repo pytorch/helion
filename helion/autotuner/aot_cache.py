@@ -39,6 +39,7 @@ from typing import Any
 from typing import ClassVar
 from typing import Literal
 from typing import cast
+import weakref
 
 import torch
 
@@ -53,6 +54,7 @@ from ..runtime.kernel import _BoolValueKey
 from ..runtime.kernel import _FloatValueKey
 from ..runtime.kernel import _FragmentSetValueKey
 from ..runtime.kernel import _FragmentValueKey
+from ..runtime.kernel import _resolve_index_widths
 from ..runtime.structural_policy import StructuralConfig
 from ..runtime.structural_policy import StructuralPolicyError
 from ..runtime.structural_policy import bound_structural_policy
@@ -78,6 +80,7 @@ if TYPE_CHECKING:
     from collections.abc import Sequence
     from typing import Callable
 
+    from ..runtime.kernel import BoundKernel
     from ..runtime.structural_policy import StructuralPolicy
     from .aot_structural_export import GuardedCallKey
     from .base_search import BaseSearch
@@ -383,8 +386,22 @@ class AOTAutotuneCache(AutotuneCacheBase):
         ]
     ] = {}
     _compiled_kernel_variants_lock: ClassVar[Any] = threading.RLock()
+    # Keep the last ordinary dynamic table, even while a static file is
+    # published at its path. Do not keep the actual bound kernel alive.
+    _ordinary_dynamic_children: ClassVar[
+        dict[
+            Path,
+            tuple[
+                weakref.ReferenceType[BoundKernel], tuple[object, ...], dict[int, str]
+            ],
+        ]
+    ] = {}
     _policy_dynamic_variants: ClassVar[
-        dict[tuple[str, ...], dict[tuple[object, ...], tuple[str, ...]]]
+        dict[tuple[str | bool, ...], dict[tuple[object, ...], tuple[str, ...]]]
+    ] = {}
+    _standalone_export_owners: ClassVar[dict[Path, tuple[str | bool, ...]]] = {}
+    _dynamic_export_contracts: ClassVar[
+        dict[Path, tuple[int | None, tuple[str, str] | None]]
     ] = {}
 
     @classmethod
@@ -396,7 +413,10 @@ class AOTAutotuneCache(AutotuneCacheBase):
         cls._compiled_kernels.clear()
         with cls._compiled_kernel_variants_lock:
             cls._compiled_kernel_variants.clear()
+            cls._ordinary_dynamic_children.clear()
             cls._policy_dynamic_variants.clear()
+            cls._standalone_export_owners.clear()
+            cls._dynamic_export_contracts.clear()
         clear_heuristic_cache()  # Clear module-level cache
         cls._mode_announced.clear()
         log.debug("Cleared AOTAutotuneCache caches")
@@ -868,7 +888,10 @@ class AOTAutotuneCache(AutotuneCacheBase):
         )
 
     def _get_heuristic_config(
-        self, args: Sequence[object] | None = None
+        self,
+        args: Sequence[object] | None = None,
+        *,
+        snapshot: tuple[Path, bytes] | None = None,
     ) -> Config | None:
         """
         Use the heuristic to select a config.
@@ -881,7 +904,9 @@ class AOTAutotuneCache(AutotuneCacheBase):
         For CUDA/ROCm, if heuristics for the current compute capability aren't found,
         we try older compatible architectures (e.g., sm80 heuristics on sm90 hardware).
         """
-        heuristic_file = self._find_heuristic_file()
+        heuristic_file = (
+            self._find_heuristic_file() if snapshot is None else snapshot[0]
+        )
         if heuristic_file is None:
             return None
 
@@ -900,12 +925,15 @@ class AOTAutotuneCache(AutotuneCacheBase):
         # Check if we already have a cached result for this kernel+shape
         policy = bound_structural_policy(self.kernel)
         cache_key = (kernel_source_file, kernel_name, shape_hash)
-        if policy is not None:
+        source = snapshot[1] if snapshot is not None else None
+        if policy is not None or source is not None:
+            if source is None:
+                source = heuristic_file.read_bytes()
             cache_key = (
                 *cache_key,
-                policy.identity(),
+                policy.identity() if policy is not None else "",
                 str(heuristic_file.resolve()),
-                hashlib.sha256(heuristic_file.read_bytes()).hexdigest(),
+                hashlib.sha256(source).hexdigest(),
             )
         if cache_key in AOTAutotuneCache._heuristic_results:
             log.debug(
@@ -921,7 +949,7 @@ class AOTAutotuneCache(AutotuneCacheBase):
             return result
 
         try:
-            module = self._load_heuristic_module(heuristic_file, policy)
+            module = self._load_heuristic_module(heuristic_file, policy, source)
             if module is None:
                 return None
 
@@ -973,11 +1001,12 @@ class AOTAutotuneCache(AutotuneCacheBase):
 
     @classmethod
     def _load_heuristic_module(
-        cls, path: Path, policy: StructuralPolicy | None
+        cls, path: Path, policy: StructuralPolicy | None, source: bytes | None = None
     ) -> types.ModuleType | None:
         key: Path | tuple[Path, str] = path
-        if policy is not None:
-            source = path.read_bytes()
+        if source is not None or policy is not None:
+            if source is None:
+                source = path.read_bytes()
             key = (path, hashlib.sha256(source).hexdigest())
             if key not in cls._heuristic_modules:
                 module = load_policy_module(path, source)
@@ -1015,7 +1044,10 @@ class AOTAutotuneCache(AutotuneCacheBase):
             return
 
         policy = bound_structural_policy(self.kernel)
-        module = self._load_heuristic_module(heuristic_file, policy)
+        # Read once: the chosen children, the ownership key, and the emitted
+        # selector must all describe the same model, even if it is replaced.
+        model_source = heuristic_file.read_bytes()
+        module = self._load_heuristic_module(heuristic_file, policy, model_source)
         if module is None:
             return
         records = model_configs(module, kernel_name, policy)
@@ -1029,7 +1061,9 @@ class AOTAutotuneCache(AutotuneCacheBase):
             else getattr(module, "CONFIGS", None)
         )
         if configs_list is None and policy is None:
-            configs_list = self._parse_configs_from_autotune(module, kernel_name)
+            configs_list = self._parse_configs_from_autotune(
+                module, kernel_name, model_source
+            )
 
         if self.kernel.settings.static_shapes:
             # Static dispatch already keys exact shape and stride. Enable the two
@@ -1050,6 +1084,7 @@ class AOTAutotuneCache(AutotuneCacheBase):
                 heuristic_file,
                 kernel_name,
                 tensor_descriptor_guards=tensor_descriptor_guards,
+                model_source=model_source,
             )
             return
 
@@ -1073,41 +1108,132 @@ class AOTAutotuneCache(AutotuneCacheBase):
                     "indexing; use pointer or block-pointer indexing"
                 )
 
-        compile_key: str | tuple[str, ...] = kernel_name
+        args = tuple(self.args)
+        env = self.kernel.env
+        dtype = self.kernel.settings.index_dtype
+        index_limit = None if dtype is None else torch.iinfo(dtype).max
+        expected_width = (
+            int(env.index_dtype is torch.int64)
+            if dtype is None
+            else int(env.wide_empty_grid)
+        )
+        if _resolve_index_widths(self.kernel.settings, args) != (
+            env.index_dtype,
+            env.wide_empty_grid,
+        ):
+            raise exc.InvalidAPIUsage(
+                "Dynamic standalone inputs no longer match the index width of the bound kernel"
+            )
+        source = Path(self.kernel.kernel.__code__.co_filename)
+        if policy is not None:
+            source = source.resolve()
+        output_path = policy_path(
+            source.with_name(f"{source.stem}_{kernel_name}_standalone.py")
+            if source.is_file() or policy is None
+            else self.data_dir / f"{kernel_name}_standalone.py",
+            policy,
+        )
+        # Atomic publication replaces this directory entry, not its symlink target.
+        output_path = output_path.parent.resolve() / output_path.name
+        compile_key: str | tuple[str, ...] = (str(output_path), kernel_name)
+        key_source = None
+        user_key = getattr(self.kernel.kernel, "_aot_user_key", None)
+        if user_key is not None and (policy is not None or len(configs) > 1):
+            from .aot_structural_export import _user_key_source
+
+            key_source = _user_key_source(user_key)
+        call_keys = None
+        source_digest = None
         if policy is not None:
             from .aot_structural_export import _export_call_key
             from .aot_structural_export import export_runtime_guards
 
-            source_path = Path(self.kernel.kernel.__code__.co_filename)
-            guards, guard_key = export_runtime_guards(self.kernel, tuple(self.args))
+            source_digest = hashlib.sha256(
+                source.read_bytes()
+                if source.is_file()
+                else marshal.dumps(self.kernel.kernel.__code__)
+            ).hexdigest()
+            guards, guard_key = export_runtime_guards(self.kernel, args)
+            observed_widths: list[int] = []
+            call_keys = (
+                _export_call_key(args),
+                _export_call_key(
+                    args, dynamic=True, index_limit=index_limit, widths=observed_widths
+                ),
+            )
+            if max(observed_widths, default=0) != expected_width:
+                raise exc.InvalidAPIUsage(
+                    "Standalone signature index width disagrees with the bound kernel"
+                )
             compile_key = (
                 self.kernel.kernel.__code__.co_filename,
                 kernel_name,
-                str(self.data_dir.resolve()),
+                str(output_path),
                 self.hardware_id,
                 policy.identity(),
-                hashlib.sha256(
-                    source_path.read_bytes()
-                    if source_path.is_file()
-                    else marshal.dumps(self.kernel.kernel.__code__)
-                ).hexdigest(),
-                hashlib.sha256(heuristic_file.read_bytes()).hexdigest(),
+                source_digest,
+                hashlib.sha256(model_source).hexdigest(),
                 self.kernel.config_spec.cache_fingerprint_hash(),
-                repr(_export_call_key(tuple(self.args))),
+                str(self.kernel.settings.index_dtype),
+                repr(call_keys[0]),
                 repr((guards, guard_key)),
             )
-        if compile_key in AOTAutotuneCache._compiled_kernels:
-            return
-        if policy is None:
-            AOTAutotuneCache._compiled_kernels.add(compile_key)
+        ordinary_identity: tuple[object, ...] = ()
+        saved_codes: dict[int, str] = {}
+        initial_facts = ()
+        with self._compiled_kernel_variants_lock:
+            self._check_dynamic_export_contract(output_path, index_limit, key_source)
+            if policy is not None:
+                if compile_key in self._compiled_kernels:
+                    return
+            else:
+                from .aot_structural_export import export_specialized_input_facts
+
+                initial_facts = export_specialized_input_facts(self.kernel, args)
+                ordinary_identity = (
+                    hashlib.sha256(model_source).digest(),
+                    hashlib.sha256(source.read_bytes()).digest()
+                    if source.is_file()
+                    else None,
+                    self.hardware_id,
+                    index_limit,
+                    expected_width,
+                    key_source,
+                    initial_facts,
+                )
+                old = self._ordinary_dynamic_children.get(output_path)
+                if (
+                    old is not None
+                    and old[0]() is self.kernel
+                    and old[1] == ordinary_identity
+                ):
+                    saved_codes = old[2]
+                    if (
+                        len(saved_codes) == len(configs)
+                        and self._standalone_export_owners.get(output_path)
+                        == compile_key
+                    ):
+                        return
 
         # -- generate Triton code for each config --------------------------
+        if not configs:
+            raise exc.InvalidAPIUsage(
+                "Dynamic standalone model has no configs to compile"
+            )
         triton_codes: list[str] = []
+        compiled_any = False
+        failed: set[int] = set()
         for i, config in enumerate(configs):
+            if i in saved_codes:
+                triton_codes.append(saved_codes[i])
+                compiled_any = True
+                continue
             try:
                 triton_codes.append(self.kernel.to_triton_code(config))
+                compiled_any = True
             except Exception:
-                if policy is not None:
+                failed.add(i)
+                if policy is not None or (not compiled_any and i == len(configs) - 1):
                     raise
                 log.warning(
                     "Config %d failed to compile for '%s'",
@@ -1120,28 +1246,121 @@ class AOTAutotuneCache(AutotuneCacheBase):
                     f"    raise RuntimeError('Config {i} failed to compile')\n"
                 )
 
+        if self.kernel.settings.index_dtype != dtype:
+            raise exc.InvalidAPIUsage(
+                "Standalone index dtype changed during code generation"
+            )
         # -- emit standalone file -------------------------------------------
         from .aot_compile import generate_standalone_file
 
         if policy is not None:
-            self._compile_policy_dynamic(heuristic_file, triton_codes, policy)
+            assert call_keys is not None and source_digest is not None
+            self._compile_policy_dynamic(
+                model_source,
+                source_digest,
+                triton_codes,
+                policy,
+                call_keys,
+                output_path,
+                index_limit,
+                key_source,
+            )
             AOTAutotuneCache._compiled_kernels.add(compile_key)
             return
-        out_path = generate_standalone_file(
-            kernel_name=kernel_name,
-            triton_codes=triton_codes,
-            heuristic_code=heuristic_file.read_text(),
-            output_dir=self.data_dir,
-            kernel_source_file=self.kernel.kernel.__code__.co_filename,
-        )
-        AOTAutotuneCache._compiled_kernels.add(compile_key)
+        from .aot_structural_export import export_specialized_input_facts
+
+        specialized_input_facts = export_specialized_input_facts(self.kernel, args)
+        if saved_codes and specialized_input_facts != initial_facts:
+            raise exc.InvalidAPIUsage(
+                "Standalone specialization changed during compilation"
+            )
+        ordinary_identity = (*ordinary_identity[:-1], specialized_input_facts)
+        with self._compiled_kernel_variants_lock:
+            self._check_dynamic_export_contract(output_path, index_limit, key_source)
+            previous = self._ordinary_dynamic_children.get(output_path)
+            active = self._standalone_export_owners.get(output_path) == compile_key
+            if previous is not None:
+                binding_ref, old_identity, old_codes = previous
+                if binding_ref() is self.kernel and old_identity == ordinary_identity:
+                    if active and len(old_codes) == len(configs):
+                        return
+                    for index in failed.intersection(old_codes):
+                        triton_codes[index] = old_codes[index]
+                        failed.remove(index)
+                elif active and failed:
+                    raise exc.InvalidAPIUsage(
+                        "Cannot replace an active standalone file with an incompatible partial binding or model"
+                    )
+            out_path = generate_standalone_file(
+                kernel_name=kernel_name,
+                index_limit=index_limit,
+                expected_width=expected_width,
+                specialized_input_facts=specialized_input_facts,
+                triton_codes=triton_codes,
+                _key_source=key_source,
+                heuristic_code=model_source.decode(),
+                output_dir=self.data_dir,
+                kernel_source_file=self.kernel.kernel.__code__.co_filename,
+            )
+            self._standalone_export_owners[output_path] = (
+                str(output_path),
+                kernel_name,
+            )
+            self._dynamic_export_contracts[output_path] = (index_limit, key_source)
+            self._ordinary_dynamic_children[output_path] = (
+                weakref.ref(self.kernel),
+                ordinary_identity,
+                {i: code for i, code in enumerate(triton_codes) if i not in failed},
+            )
+            if not failed:
+                AOTAutotuneCache._compiled_kernels.add(compile_key)
         print(f"[AOT] Standalone: {out_path}", file=sys.stderr)
+
+    @classmethod
+    def _check_dynamic_export_contract(
+        cls, path: Path, index_limit: int | None, key_source: tuple[str, str] | None
+    ) -> None:
+        previous = cls._dynamic_export_contracts.get(path)
+        if previous is None:
+            return
+        if previous[0] != index_limit:
+            raise StructuralPolicyError(
+                "Dynamic standalone variants must use the same index dtype"
+            )
+        if previous[1] != key_source:
+            raise StructuralPolicyError(
+                "Dynamic standalone variants must use the same custom key"
+            )
+
+    @classmethod
+    def _may_publish_structural_variant(
+        cls,
+        path: Path,
+        key: tuple[str | bool, ...],
+        unchanged: Callable[[tuple[str | bool, ...]], bool],
+    ) -> bool:
+        owner = cls._standalone_export_owners.get(path)
+        if owner is None or owner == key:
+            return True
+        # A source-only revision can recompile and verify an existing
+        # signature. It cannot install a new table over another binding.
+        if owner[:-1] == key[:-1] and unchanged(owner):
+            return False
+        raise StructuralPolicyError(
+            "A different heuristic model, kernel source, hardware, or export mode "
+            "already owns this standalone file"
+        )
 
     def _compile_policy_dynamic(
         self,
-        heuristic_file: Path,
+        model_source: bytes,
+        source_digest: str,
         codes: list[str],
         policy: StructuralPolicy,
+        call_keys: tuple[tuple[object, ...], tuple[object, ...]],
+        output_path: Path,
+        index_limit: int | None,
+        key_source: tuple[str, str] | None,
     ) -> None:
         from ..language.constexpr import ConstExpr
         from .aot_compile import generate_standalone_file
@@ -1151,18 +1370,30 @@ class AOTAutotuneCache(AutotuneCacheBase):
         code_object = self.kernel.kernel.__code__
         source_path = Path(code_object.co_filename).resolve()
         source_file = str(source_path) if source_path.is_file() else None
-        source_digest = hashlib.sha256(
-            source_path.read_bytes() if source_file else marshal.dumps(code_object)
-        ).hexdigest()
+        if (
+            source_digest
+            != hashlib.sha256(
+                source_path.read_bytes() if source_file else marshal.dumps(code_object)
+            ).hexdigest()
+        ):
+            raise StructuralPolicyError(
+                "Kernel source changed during standalone compilation"
+            )
         guards, guard_key = export_runtime_guards(self.kernel, tuple(self.args))
+        if _export_call_key(tuple(self.args)) != call_keys[0]:
+            raise exc.InvalidAPIUsage(
+                "Dynamic standalone inputs changed during code generation"
+            )
+        model_digest = hashlib.sha256(model_source).hexdigest()
         key = (
+            "dynamic",
             str(source_path),
             self.kernel.kernel.name,
-            str(self.data_dir.resolve()),
+            str(output_path),
             self.hardware_id,
             policy.identity(),
+            model_digest,
             source_digest,
-            hashlib.sha256(heuristic_file.read_bytes()).hexdigest(),
         )
         # Structural rewrites can specialize dimensions even with static_shapes
         # disabled (e.g. operand materialization's hl.specialize(shape)). These
@@ -1179,15 +1410,28 @@ class AOTAutotuneCache(AutotuneCacheBase):
             )
         )
         group = (
-            ("exact", (guards, _export_call_key(tuple(self.args)), guard_key))
+            ("exact", (guards, call_keys[0], guard_key))
             if requires_bound
             else (
                 "dynamic",
-                (guards, _export_call_key(tuple(self.args), dynamic=True), guard_key),
+                (
+                    guards,
+                    call_keys[1],
+                    guard_key,
+                ),
             )
         )
         with self._compiled_kernel_variants_lock:
-            variants = self._policy_dynamic_variants.setdefault(key, {})
+            self._check_dynamic_export_contract(output_path, index_limit, key_source)
+            if not self._may_publish_structural_variant(
+                output_path,
+                key,
+                lambda owner: (
+                    self._policy_dynamic_variants[owner].get(group) == tuple(codes)
+                ),
+            ):
+                return
+            variants = self._policy_dynamic_variants.get(key, {})
             if group in variants:
                 if variants[group] != tuple(codes):
                     raise StructuralPolicyError(
@@ -1207,17 +1451,20 @@ class AOTAutotuneCache(AutotuneCacheBase):
             out_path = generate_standalone_file(
                 kernel_name=self.kernel.kernel.name,
                 triton_codes=flattened,
-                heuristic_code=heuristic_file.read_text(),
+                heuristic_code=model_source.decode(),
                 output_dir=self.data_dir,
                 kernel_source_file=source_file,
                 structural_policy=policy,
                 dynamic_groups=groups,
+                index_limit=index_limit,
                 runtime_guard_plans=tuple(
                     cast("GuardedCallKey", signature[1])[0] for signature in updated
                 ),
-                user_key=getattr(self.kernel.kernel, "_aot_user_key", None),
+                _key_source=key_source,
             )
-            variants[group] = tuple(codes)
+            self._policy_dynamic_variants[key] = updated
+            self._standalone_export_owners[output_path] = key
+            self._dynamic_export_contracts[output_path] = (index_limit, key_source)
         print(f"[AOT] Standalone: {out_path}", file=sys.stderr)
 
     def _compile_current_static_shape(
@@ -1226,10 +1473,17 @@ class AOTAutotuneCache(AutotuneCacheBase):
         kernel_name: str,
         *,
         tensor_descriptor_guards: bool = False,
+        model_source: bytes | None = None,
     ) -> None:
         """Compile one observed static call and update its exact dispatcher."""
         normalized_args = self.kernel.kernel.normalize_args(*self.args)
-        config = self._get_heuristic_config(normalized_args)
+        if model_source is None:
+            config = self._get_heuristic_config(normalized_args)
+            model_source = heuristic_file.read_bytes()
+        else:
+            config = self._get_heuristic_config(
+                normalized_args, snapshot=(heuristic_file, model_source)
+            )
         if config is None:
             log.warning(
                 "No heuristic config for static kernel '%s', skipping standalone compile",
@@ -1241,10 +1495,6 @@ class AOTAutotuneCache(AutotuneCacheBase):
         from .aot_compile import generate_standalone_file
 
         policy = bound_structural_policy(self.kernel)
-        call_key = _standalone_call_key(
-            normalized_args,
-            tensor_descriptor_guards=tensor_descriptor_guards,
-        )
         code_object = self.kernel.kernel.__code__
         source_path = Path(code_object.co_filename).resolve()
         if source_path.is_file():
@@ -1262,19 +1512,27 @@ class AOTAutotuneCache(AutotuneCacheBase):
             kernel_source_file = None
             output_identity = str(
                 policy_path(
-                    (self.data_dir / f"{kernel_name}_standalone.py").resolve(), policy
+                    self.data_dir.resolve() / f"{kernel_name}_standalone.py", policy
                 )
             )
         variants_key = (
             output_identity,
             kernel_name,
             self.hardware_id,
-            hashlib.sha256(heuristic_file.read_bytes()).hexdigest(),
+            hashlib.sha256(model_source).hexdigest(),
             source_digest,
             tensor_descriptor_guards,
         )
         if policy is not None:
-            variants_key = (*variants_key, policy.identity())
+            variants_key = (
+                "static",
+                output_identity,
+                kernel_name,
+                self.hardware_id,
+                policy.identity(),
+                hashlib.sha256(model_source).hexdigest(),
+                source_digest,
+            )
         config_fingerprint = (
             config_artifact_json(config, policy)
             if policy is not None
@@ -1290,20 +1548,62 @@ class AOTAutotuneCache(AutotuneCacheBase):
             raise RuntimeError(
                 f"static standalone variant emitted no code for {kernel_name}"
             )
+        # Use independent tensor metadata for both the binding check and the
+        # dispatcher key. A resize during a classifier must not change the key
+        # after validation. A shallow copy shares storage; memoization preserves
+        # repeated arguments and their descriptor alignment.
+        views: dict[int, torch.Tensor] = {}
+
+        def snapshot(tensor: torch.Tensor) -> torch.Tensor:
+            if id(tensor) not in views:
+                views[id(tensor)] = copy.copy(tensor)
+            return views[id(tensor)]
+
+        normalized_args = torch.utils._pytree.tree_map_only(
+            torch.Tensor, snapshot, normalized_args
+        )
+        # Reuse the recorded custom key without re-running user code.
+        saved = self.kernel._base_spec_key
+        if (
+            self.kernel.kernel._base_specialization_key(
+                normalized_args, custom_key=saved[-1]
+            )
+            != saved
+        ):
+            raise exc.InvalidAPIUsage(
+                "Standalone inputs no longer match the static bound input metadata"
+            )
         export_options: dict[str, Any] = {}
         if policy is not None:
             from .aot_structural_export import _export_call_key
             from .aot_structural_export import export_runtime_guards
 
+            exact_key = _export_call_key(normalized_args)
             guards, guard_key = export_runtime_guards(self.kernel, normalized_args)
-            call_key = (guards, _export_call_key(normalized_args), guard_key)
+            call_key = (guards, exact_key, guard_key)
             export_options = {"structural_policy": policy}
+        else:
+            from .aot_structural_export import export_specialized_input_facts
+
+            export_specialized_input_facts(self.kernel, normalized_args)
+            call_key = _standalone_call_key(
+                normalized_args, tensor_descriptor_guards=tensor_descriptor_guards
+            )
 
         # The compile workflow runs in one process. Serialize concurrent calls
         # in that process so two newly observed signatures cannot each rewrite
         # an incomplete dispatcher. ``generate_standalone_file`` replaces the
         # output atomically, so readers never observe a partial module.
         with AOTAutotuneCache._compiled_kernel_variants_lock:
+            if policy is not None and not self._may_publish_structural_variant(
+                Path(output_identity),
+                variants_key,
+                lambda owner: (
+                    self._compiled_kernel_variants[owner].get(call_key)
+                    == (config_fingerprint, code)
+                ),
+            ):
+                return
             variants = AOTAutotuneCache._compiled_kernel_variants.setdefault(
                 variants_key, {}
             )
@@ -1316,7 +1616,11 @@ class AOTAutotuneCache(AutotuneCacheBase):
                         "specializations; expose value-derived compile-time metadata "
                         "as scalar or container kernel arguments"
                     )
-                return
+                if (
+                    self._standalone_export_owners.get(Path(output_identity))
+                    == variants_key
+                ):
+                    return
 
             updated = {**variants, call_key: (config_fingerprint, code)}
             ordered = sorted(updated.items(), key=lambda item: repr(item[0]))
@@ -1327,7 +1631,7 @@ class AOTAutotuneCache(AutotuneCacheBase):
             out_path = generate_standalone_file(
                 kernel_name=kernel_name,
                 triton_codes=[variant[1][1] for variant in ordered],
-                heuristic_code=heuristic_file.read_text(),
+                heuristic_code=model_source.decode(),
                 output_dir=self.data_dir,
                 kernel_source_file=kernel_source_file,
                 dispatch_keys=[variant[0] for variant in ordered],
@@ -1335,20 +1639,28 @@ class AOTAutotuneCache(AutotuneCacheBase):
                 **export_options,
             )
             variants[call_key] = (config_fingerprint, code)
+            self._standalone_export_owners[Path(output_identity)] = variants_key
+            if policy is None:
+                # The static table just replaced this ordinary dynamic file.
+                self._compiled_kernels.discard((output_identity, kernel_name))
         print(f"[AOT] Standalone: {out_path}", file=sys.stderr)
 
     @staticmethod
     def _parse_configs_from_autotune(
-        module: object, kernel_name: str
+        module: object, kernel_name: str, source: bytes
     ) -> list[dict[str, object]] | None:
         """Extract the ``_C`` config list from ``autotune_<kernel>``."""
         autotune_fn = getattr(module, f"autotune_{kernel_name}", None)
         if autotune_fn is None:
             return None
-        try:
-            src = inspect.getsource(autotune_fn)
-        except OSError:
-            return None
+        # The module and the selector being published came from these bytes.
+        # inspect.getsource() would reopen the model and could see a replacement.
+        lines = source.decode().splitlines(keepends=True)
+        src = "".join(
+            inspect.getblock(
+                lines[inspect.unwrap(autotune_fn).__code__.co_firstlineno - 1 :]
+            )
+        )
         start = src.find("_C = [")
         if start < 0:
             return None

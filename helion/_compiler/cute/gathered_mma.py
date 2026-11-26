@@ -401,7 +401,12 @@ def _direct_load(
     return *pointer, predicate
 
 
-def _integer_recipe(value: ast.expr, tensors: Mapping[str, GatherTensorFacts]) -> bool:
+def _integer_recipe(
+    value: ast.expr,
+    tensors: Mapping[str, GatherTensorFacts],
+    constants: Mapping[str, int],
+    groups: int,
+) -> bool:
     """Admit exact integer/boolean replay without floating-point contraction."""
     integer_calls = {
         "cutlass.Int32",
@@ -462,6 +467,19 @@ def _integer_recipe(value: ast.expr, tensors: Mapping[str, GatherTensorFacts]) -
                 pointer = _pointer_indices(node.func.value, tensors)
                 if pointer is None or tensors[pointer[0]].dtype != "cutlass.Int32":
                     return False
+            elif (
+                ast.unparse(node.func) == "cutlass.Int64"
+                and len(node.args) == 1
+                and not node.keywords
+                and isinstance(group := node.args[0], ast.BinOp)
+                and isinstance(group.op, ast.Mod)
+                and _same(group.left, _expr("cutlass.Int32(cute.arch.block_idx()[0])"))
+                and _integer_constant(group.right, constants) == groups
+            ):
+                # The grid widens its decoded Int32 group before pointer math.
+                # Keep that exact cast when replaying the row; unrelated wide
+                # metadata arithmetic remains outside the integer proof.
+                continue
             elif ast.unparse(node.func) not in integer_calls:
                 return False
         if isinstance(node, ast.BinOp) and isinstance(node.op, (ast.Div, ast.Pow)):
@@ -879,7 +897,7 @@ def analyze_gathered_mma_region(
         for node in ast.walk(row_key)
     ):
         return None
-    if not _integer_recipe(row, tensors):
+    if not _integer_recipe(row, tensors, constants, e_size):
         return None
     if _read_names(row) - (
         set(tensors)
@@ -1021,7 +1039,9 @@ def analyze_gathered_mma_region(
         if len(row_predicates) > 1
         else row_predicates[0]
     )
-    if not _integer_recipe(row_predicate, tensors) or _read_names(row_predicate) - (
+    if not _integer_recipe(row_predicate, tensors, constants, e_size) or _read_names(
+        row_predicate
+    ) - (
         set(tensors)
         | set(constants)
         | _read_names(m_range[1])

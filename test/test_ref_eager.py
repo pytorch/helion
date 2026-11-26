@@ -930,6 +930,20 @@ class TestRefEagerMisc(TestCase):
             expected = x * 2.0
             torch.testing.assert_close(result, expected)
 
+    @pytest.mark.cpu_only
+    def test_tile_count_uses_the_whole_iteration_space(self):
+        @helion.kernel(ref_mode=helion.RefMode.EAGER)
+        def counts(out, lo, hi):
+            for tile in hl.tile(lo, hi, block_size=4):
+                out[(tile.begin - lo) // 4] = tile.count
+
+        for lo, hi in [(0, 9), (2, 10), (-5, 0)]:
+            with self.subTest(lo=lo, hi=hi):
+                count = len(range(lo, hi, 4))
+                out = torch.full((count,), -1)
+                counts(out, lo, hi)
+                self.assertEqual(out.tolist(), [count] * count)
+
     def test_tile_begin_with_block_size_1(self):
         @helion.kernel(ref_mode=helion.RefMode.EAGER)
         def kernel(x: torch.Tensor) -> torch.Tensor:

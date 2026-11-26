@@ -18,6 +18,7 @@ from helion._testing import TestCase
 from helion._testing import _get_backend
 from helion._testing import code_and_output
 from helion._testing import onlyBackends
+from helion._testing import output_only
 from helion._testing import skipIfCute
 from helion._testing import skipIfNotTriton
 from helion._testing import skipIfRefEager
@@ -1616,15 +1617,18 @@ class TestMarkStatic(RefEagerTestBase, TestCase):
         x = torch.randn([320, 640], device=DEVICE)
         torch._dynamo.mark_static(x, -1)
 
-        code, result = code_and_output(fn, (x,), block_sizes=[16, 16])
+        result = output_only(fn, (x,), block_sizes=[16, 16])
         torch.testing.assert_close(result, x * 2)
-        self.assertIn("320", code)  # dim 0 from hl.specialize
-        self.assertIn("640", code)  # dim 1 from mark_static
-
-        # Cache miss: changing externally-specialized dim
-        x2 = torch.randn([320, 128], device=DEVICE)
-        torch._dynamo.mark_static(x2, -1)
-        self.assertIsNot(fn.bind((x,)), fn.bind((x2,)))
+        # The launch may fold both static dimensions into one grid size.
+        # Changing either alone must select a different specialization.
+        bound = fn.bind((x,))
+        for shape in ((160, 640), (320, 128), (320, 640)):
+            other = torch.empty(shape, device=DEVICE)
+            torch._dynamo.mark_static(other, -1)
+            if shape == tuple(x.shape):
+                self.assertIs(fn.bind((other,)), bound)
+            else:
+                self.assertIsNot(fn.bind((other,)), bound)
 
     @skipIfRefEager("specialization_key is not used in ref eager mode")
     def test_specialization_key_includes_hl_specialize(self):

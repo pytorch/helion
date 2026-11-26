@@ -30,6 +30,7 @@ from helion._testing import skipIfNotCUDA
 from helion._testing import skipUnlessBackends
 from helion._testing import skipUnlessTensorDescriptor
 from helion._testing.cute_codegen import cpu_bind
+from helion._testing.triton_codegen import descriptor_coordinates
 import helion.language as hl
 
 if TYPE_CHECKING:
@@ -527,8 +528,10 @@ def test_a_subtiled_store_reads_its_own_descriptor_slot() -> None:
                 indexing=["pointer", "pointer", "tensor_descriptor"],
             )
         )
-    columns = re.findall(r"out_desc\.store\(\[offset_1, offset_0, (\d+)\]", code)
-    assert columns == ["0", "16"], code
+    assert descriptor_coordinates(code, "store", descriptor="out_desc") == [
+        ("offset_1", "offset_0", "0"),
+        ("offset_1", "offset_0", "16"),
+    ], code
 
 
 def _softmax_rows_then_double(x: torch.Tensor) -> torch.Tensor:

@@ -3345,6 +3345,66 @@ class TestPallas(TestCase):
         code = bound.to_code(Config(block_size=256))
         self.assertIn("pl.program_id", code)
 
+    def test_tile_end_dynamic_tail(self) -> None:
+        @helion.kernel(backend="pallas", static_shapes=False)
+        def add_tile_end(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.size(0)):
+                out[tile] = x[tile] + tile.end
+            return out
+
+        for size in (127, 128, 129, 131):
+            x = torch.arange(size, dtype=torch.int32, device=DEVICE)
+            _, actual = code_and_output(add_tile_end, (x,), block_size=128)
+            expected = x.clone()
+            expected[:128] += min(size, 128)
+            expected[128:] += size
+            torch.testing.assert_close(actual, expected)
+
+        # Mosaic can issue a short final DMA on TPU. Physical padding is a
+        # workaround for the CPU interpreter, not part of the native call.
+        native = helion.kernel(
+            backend="pallas", static_shapes=False, pallas_interpret=False
+        )(add_tile_end.fn)
+        native_code = native.bind((x,)).to_code(helion.Config(block_size=128))
+        self.assertNotIn("_ds_pad_dims", native_code)
+
+    def test_tile_end_near_int32_min_with_loaded_start(self) -> None:
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def edges(starts: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
+            for segment in hl.grid(starts.size(0)):
+                for tile in hl.tile(starts[segment], -(2**31) + 2, block_size=4):
+                    out[segment] = tile.end
+            return out
+
+        # Only the first segment enters. The output uses the segment ordinal,
+        # so these large coordinates never index a tensor or a large grid.
+        low = torch.iinfo(torch.int32).min
+        starts = torch.tensor([low, low + 2], dtype=torch.int32, device=DEVICE)
+        out = torch.full_like(starts, -73)
+        _, actual = code_and_output(edges, (starts, out), block_sizes=[])
+        torch.testing.assert_close(
+            actual, torch.tensor([low + 2, -73], device=DEVICE, dtype=torch.int32)
+        )
+
+    def test_tile_end_tensor_segment_bounds(self) -> None:
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def tile_ends(offsets: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
+            for segment in hl.grid(offsets.size(0) - 1):
+                for tile in hl.tile(offsets[segment], offsets[segment + 1]):
+                    out[tile.begin] = out[tile.begin] + tile.end
+            return out
+
+        # Nonaligned starts 1 and 6, an empty segment, and untouched rows.
+        bounds = torch.tensor([1, 6, 6, 9], dtype=torch.int32, device=DEVICE)
+        out = torch.full((10,), -73, dtype=torch.int32, device=DEVICE)
+        _, actual = code_and_output(
+            tile_ends, (bounds, out), block_size=4, pallas_loop_type="fori_loop"
+        )
+        torch.testing.assert_close(
+            actual, out.new_tensor([-73, -68, -73, -73, -73, -67, -64, -73, -73, -73])
+        )
+
     def test_dynamic_scalar_no_recompile(self) -> None:
         """Verify that changing dynamic scalar values does not trigger recompilation."""
         x = torch.randn(1024, device=DEVICE, dtype=torch.float32)

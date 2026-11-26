@@ -540,6 +540,27 @@ def _selects(body: str) -> int:
     return len(re.findall(r" if (?:mask_2|v_\d+)_u\d+ else ", body))
 
 
+def _packet_loop_ast(body: str) -> str:
+    """Ignore only the association of conjunctions guarding a packet load."""
+
+    def terms(value: ast.expr) -> list[ast.expr]:
+        if isinstance(value, ast.BoolOp) and isinstance(value.op, ast.And):
+            return [term for child in value.values for term in terms(child)]
+        return [value]
+
+    tree = ast.parse(body)
+    for call in ast.walk(tree):
+        if (
+            isinstance(call, ast.Call)
+            and isinstance(call.func, ast.Name)
+            and call.func.id == "_cute_load_v16b_if"
+            and isinstance(guard := call.args[1], ast.BoolOp)
+            and isinstance(guard.op, ast.And)
+        ):
+            guard.values = terms(guard)
+    return ast.dump(tree)
+
+
 def test_a_sunk_nest_runs_its_complete_tiles_unmasked() -> None:
     # Eight splits of 600 rows in 128-row tiles: four complete tiles, then
     # 88 rows.  Each thread loads two tensors' rows, eight per tile.
@@ -555,7 +576,7 @@ def test_a_sunk_nest_runs_its_complete_tiles_unmasked() -> None:
     assert _MASKED_PACKET not in complete
     assert complete.count("cute.arch.load(") == 16
     assert _selects(complete) == 0
-    assert partial == whole
+    assert _packet_loop_ast(partial) == _packet_loop_ast(whole)
     assert "_cute_proven_loop_bounds_0_abi_version = 1" in on
 
 

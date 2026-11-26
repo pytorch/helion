@@ -147,6 +147,11 @@ class CuteEnvState:
 class CuteCodegenState:
     """``GenerateAST.backend_state`` of the CuTe backend."""
 
+    # Materialize this precondition only for a generic gather that actually
+    # replays a source address under the corresponding native device range.
+    gather_device_range_guards: dict[
+        int, tuple[ast.AST | None, dict[str, int | None]]
+    ] = dataclasses.field(default_factory=dict)
     wrapper_plans: list[dict[str, object]] = dataclasses.field(default_factory=list)
     uses_matmul: bool = False
     # Count declarations, not False-to-True transitions: an unrelated
@@ -672,6 +677,9 @@ class CuteRootPlans:
     ``PlannedRootEmitter`` entry; every ``PlannedRootEmitter.slot`` names a
     field of this class (checked when the registry is built).
     """
+
+    # Scalar grid origins whose runtime value is not bounded by signed Int64.
+    unbounded_uint64_axes: set[str] = dataclasses.field(default_factory=set)
 
     # Grouped two-phase lowering for structurally proven fixed-token,
     # split-input BF16 rank-1 recurrences.

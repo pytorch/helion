@@ -878,7 +878,7 @@ def test_a_load_after_a_bound_atomic_rejects_the_config(cpu_only: None) -> None:
 
 
 def test_a_gathered_value_is_not_recomputed_after_the_atomic(cpu_only: None) -> None:
-    """``before = gather(count[tile_n], tile_n.index)`` then
+    """``before = gather(count[tile_n], local_lane)`` then
     ``hl.atomic_add(count, [tile_n], 1)``: the gather lowers to
     ``count[i] if mask else 0``, a subscript read with no load call.  Reading
     a kernel tensor argument is a load, so the value is not recomputed after

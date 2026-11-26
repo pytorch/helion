@@ -69,11 +69,37 @@ def _windows(batch: int = 2, seq: int = 8, channels: int = 16) -> torch.Tensor:
     return torch.empty(batch, seq, channels, dtype=torch.bfloat16)
 
 
+def _guard_terms(guard: ast.expr) -> list[str]:
+    """Flatten only `and`, preserving every guard term in evaluation order."""
+    if isinstance(guard, ast.BoolOp) and isinstance(guard.op, ast.And):
+        return [term for child in guard.values for term in _guard_terms(child)]
+    return [ast.unparse(guard)]
+
+
+def _check_window_packets(code: str) -> None:
+    packets = [
+        call
+        for call in ast.walk(ast.parse(code))
+        if isinstance(call, ast.Call)
+        and isinstance(call.func, ast.Name)
+        and call.func.id == "_cute_load_v16b_if"
+    ]
+    assert len(packets) == 4
+    for slot, packet in enumerate(packets):
+        assert ast.unparse(packet.args[0]).startswith("flat.iterator + ")
+        assert _guard_terms(packet.args[1]) == [
+            f"v_11_u{slot}",
+            "lane_base_0 - tile_offset_0 < 256",
+            f"mask_1_u{slot}",
+            f"cutlass.Int32(lane_base_0 + v_15_u{slot}) < 256",
+        ]
+
+
 def test_a_window_gather_loads_one_predicated_packet_per_slot() -> None:
     code = _code(sliding_windows, (_windows(), 3, 1), _TILE)
     # One packet per unrolled slot of the 4-slot tile, issued before the
     # stores; no scalar load is left.
-    assert code.count("_cute_load_v16b_if(flat.iterator") == 4
+    _check_window_packets(code)
     assert ".load()" not in code
     # The gather's address carries the lane tile's index as its own term
     # (``i[:, None]`` on a tile index traces to ``load(tile_index, ...)``).
@@ -81,8 +107,6 @@ def test_a_window_gather_loads_one_predicated_packet_per_slot() -> None:
     # The window mask reads the sequence position of the chunk base, and the
     # gather's own bound compares the base: one value per packet.
     assert "v_1 = lane_base_0 // v_0" in code
-    assert "lane_base_0 - tile_offset_0 < 256" in code
-    assert "(cutlass.Int32(lane_base_0 + v_15_u0) < 256)" in code
     assert "indices_0" not in code[: code.index("for vec_lane_0 in")]
     last_load = code.rindex("_cute_load_v16b_if(")
     assert last_load < code.index("(out.iterator + ")
@@ -569,15 +593,25 @@ def test_only_the_predicates_of_the_packet_loads_compare_the_chunk_base() -> Non
     config = register_tile_config(threads=8, window_block=4, vec=4, staged=False)
     args = (torch.empty(2, 8, 16), torch.empty(256, dtype=torch.float64), 3, 1)
     code = _code(_windows_plus_wide, args, config)
-    assert code.count("_cute_load_v16b_if(flat.iterator") == 4
-    packet = code[code.index("_cute_load_v16b_if(flat.iterator") :].splitlines()[0]
-    assert "lane_base_0 - tile_offset_0 < 256" in packet
-    (scalar,) = [
-        line for line in code.splitlines() if "other_u0 = (wide.iterator" in line
+    _check_window_packets(code)
+    scalars = [
+        select
+        for select in ast.walk(ast.parse(code))
+        if isinstance(select, ast.IfExp)
+        and isinstance(select.body, ast.Call)
+        and isinstance(select.body.func, ast.Attribute)
+        and select.body.func.attr == "load"
+        and ast.unparse(select.body.func.value).startswith("wide.iterator + ")
     ]
-    assert "indices_0_u0 - tile_offset_0 < 256" in scalar
-    assert "(cutlass.Int32(v_16_u0) < 256)" in scalar
-    assert "lane_base_0" not in scalar
+    assert len(scalars) == 4
+    for slot, scalar in enumerate(scalars):
+        assert _guard_terms(scalar.test) == [
+            f"v_11_u{slot}",
+            f"indices_0_u{slot} - tile_offset_0 < 256",
+            f"mask_1_u{slot}",
+            f"cutlass.Int32(v_16_u{slot}) < 256",
+        ]
+        assert "lane_base_0" not in ast.unparse(scalar)
 
 
 # A vector loop of 8 lanes at a base that is a multiple of 8.
