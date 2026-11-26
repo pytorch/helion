@@ -50,6 +50,7 @@ from .codegen.overrides import HelionPrinter
 from .codegen.scheduling import HelionScheduling
 from .codegen.scheduling import Unsupported
 from .fx_passes.post_grad import HelionPostGradPass
+from .lowering import register_bmm
 from .lowering import register_mm
 
 __all__ = [
@@ -79,6 +80,7 @@ def _register() -> None:
     the compile's choices)."""
     register_inductor_choices("helion", HelionChoices)
     register_mm()
+    register_bmm()
     common.custom_backend_codegen_configs["helion"] = cast("ConfigModule", config)
     common.init_backend_registration()
     default = common.device_codegens["cuda"]
