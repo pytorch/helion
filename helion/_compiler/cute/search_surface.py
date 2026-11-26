@@ -694,6 +694,11 @@ def register_search_surface(device_ir: DeviceIR, config_spec: ConfigSpec) -> Non
                     for candidate, _lhs, _rhs, node in mma_candidates
                 },
             )
+    # The tcgen05 search is planned (on, or off as under a flash surface):
+    # from here on a batched fp32 dot the search did not take gets no operand
+    # analysis (``cute_mma._batched_tf32_tma_operands``), so the lowering
+    # that took it before keeps it.
+    config_spec.tcgen05.search_planned = True
 
 
 def detect_collective_knobs(

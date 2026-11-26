@@ -52,6 +52,7 @@ from helion._testing import DEVICE
 from helion._testing import HALF_DTYPE
 from helion._testing import TestCase
 from helion._testing import code_and_output
+from helion._testing import default_cute_mma_support
 from helion._testing import onlyBackends
 from helion._testing import patch_cute_mma_support
 from helion._testing import skipUnlessCuteAvailable
@@ -13436,9 +13437,9 @@ class TestCuteBackend(TestCase):
         configs correctly on the other lowerings: a K-major B narrower than 32
         columns and not a multiple of 16, batched or shared by the batches
         under an M-major A (its 8-column stages need 64-byte k-blocks: N=24
-        raised at the default config), and fp32 operands, row- or
-        column-major (the search's scalar lowering read one k per K tile:
-        relative error 0.97 at 4 x 512x512x512)."""
+        raised at the default config), and fp32 operands under an M-major A
+        (the search's scalar lowering read one k per K tile: relative error
+        0.97 at 4 x 512x512x512)."""
 
         def half(*shape: int) -> torch.Tensor:
             return torch.randn(*shape, device=DEVICE, dtype=HALF_DTYPE)
@@ -13449,13 +13450,6 @@ class TestCuteBackend(TestCase):
             (cute_batched_baddbmm_tcgen05, (x, half(2, 8, 32).transpose(-1, -2))),
             (cute_batched_baddbmm_tcgen05, (x, half(2, 24, 32).transpose(-1, -2))),
             (cute_mixed_rank_batched_dot_tcgen05, (m_major_x, half(8, 32).T)),
-            (
-                cute_batched_baddbmm_tcgen05,
-                (
-                    torch.randn(4, 512, 512, device=DEVICE),
-                    torch.randn(4, 512, 512, device=DEVICE),
-                ),
-            ),
             (
                 cute_batched_baddbmm_tcgen05,
                 (
@@ -13482,6 +13476,29 @@ class TestCuteBackend(TestCase):
                     atol=1e-1,
                     rtol=1e-2,
                 )
+
+    def test_batched_tf32_takes_the_tcgen05_search_with_the_tf32_mma(self) -> None:
+        """fp32 operands under a row-major A, which TMA loads, take the
+        tcgen05 search as tf32 (the default dot precision) on a device with
+        the tcgen05 tf32 MMA, and keep the other lowerings without it; their
+        default config runs correctly either way (4 x 512x512x512, where the
+        search's scalar lowering once read one k per K tile: relative error
+        0.97)."""
+        args = (
+            torch.randn(4, 512, 512, device=DEVICE),
+            torch.randn(4, 512, 512, device=DEVICE),
+        )
+        cute_batched_baddbmm_tcgen05.reset()
+        bound = cute_batched_baddbmm_tcgen05.bind(args)
+        self.assertEqual(
+            bound.config_spec.tcgen05.search_enabled,
+            mma_support.tcgen05_supports_input_dtype(
+                get_cute_mma_support(), torch.float32
+            ),
+        )
+        out = bound.compile_config(bound.config_spec.default_config())(*args)
+        torch.cuda.synchronize()
+        torch.testing.assert_close(out, torch.bmm(*args), atol=1e-1, rtol=1e-2)
 
     def test_mixed_rank_batched_dot_uses_tcgen05(self) -> None:
         support = get_cute_mma_support()
@@ -20036,6 +20053,23 @@ def test_failed_cute_dsl_version_probe_is_shared_and_cached(failure: str) -> Non
         cutedsl_compat._installed_cute_dsl_version.cache_clear()
         cutedsl_compat._cute_backend_requirement_error.cache_clear()
         cutedsl_compat.warn_tcgen05_runtime_n_ptx_fallback.cache_clear()
+
+
+@pytest.mark.cpu_only
+def test_default_mma_support_record_spells_out_tcgen05_tf32() -> None:
+    # The CPU stand-ins' record leaves the tf32 MMA off by default, as
+    # CuteMmaSupport.tcgen05_tf32 defaults, so an fp32 operand takes no
+    # tcgen05 MMA; a tf32 bind asks for it.
+    assert not mma_support.tcgen05_supports_input_dtype(
+        default_cute_mma_support(), torch.float32
+    )
+    assert mma_support.tcgen05_supports_input_dtype(
+        default_cute_mma_support(tcgen05_tf32=True), torch.float32
+    )
+    # The 16-bit atoms do not depend on it.
+    assert mma_support.tcgen05_supports_input_dtype(
+        default_cute_mma_support(), torch.bfloat16
+    )
 
 
 def test_mma_support_probe_is_memoized_and_cleared_by_the_seam() -> None:

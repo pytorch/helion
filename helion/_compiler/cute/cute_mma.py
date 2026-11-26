@@ -4034,12 +4034,15 @@ def _analyze_mma_operands(
 
         rhs_cols = _static_int(env, rhs.matrix_cols) or 16
         if (
-            # Batched fp32 never reaches the tcgen05 MMA
-            # (``_tcgen05_fp32_lowering_blocked``): it leaves the tcgen05
-            # search, whose scalar lowering read one k per K tile, for the
-            # other lowerings (an ``hl.dot`` the register-MMA DAG's tf32
-            # MMAs).
-            lhs.mma_dtype == torch.float32
+            # Batched fp32 reaches the tcgen05 MMA only as tf32 over rank-3
+            # operands its TMA pipeline loads, and only where its search
+            # takes it (``_batched_tf32_tma_operands``); any other batched
+            # fp32 GEMM gets no analysis and keeps the other lowerings (an
+            # ``hl.dot`` the register-MMA DAG's tf32 MMAs).
+            (
+                lhs.mma_dtype == torch.float32
+                and not _batched_tf32_tma_operands(env, lhs, rhs)
+            )
             # A K-major B (batched or shared by the batches) narrower than 32
             # columns and not a multiple of 16 tiles N at 8, and an 8-column
             # K-major B stage needs 64-byte k-blocks (``tcgen05 K-major B TMA
@@ -8762,6 +8765,84 @@ def _mma_output_radix_layout(
     return layout
 
 
+def _batched_tf32_tma_operands(
+    env: CompileEnvironment, lhs: _MmaOperandInfo, rhs: _MmaOperandInfo
+) -> bool:
+    """Whether a batched fp32 GEMM gets an operand analysis, which only the
+    tcgen05 MMA consumes (as tf32). The search planner sees the candidates:
+    rank-3 A and B (``bmm``), a row-major A (the layout
+    ``_tcgen05_fp32_lowering_blocked`` takes), both operands loaded through
+    TMA (``batched_ab_tma_provable``: an fp32 operand only under tf32 dots, a
+    row- or column-major B, both layouts proved TensorMap-aligned), whose
+    descriptors recast them to TFloat32 (``tcgen05_ab_tma``), the tf32 MMA in
+    the device's record, and static extents ``tcgen05_shape_rejected`` keeps.
+    Once the search is planned (``search_planned``), the GEMM it took
+    (``matmul_block_ids``) keeps its analysis alone.
+
+    Every other batched fp32 dot gets no operand analysis, so the lowering
+    that took it before keeps it (the register-MMA DAG's tf32 MMAs for an
+    ``hl.dot``, the collective lowerings otherwise), whatever turned the
+    search down: fp32 8 x [96, 96] @ [96, 96] under
+    ``cute_flat_edge_tma=False`` (its search tiles divide the extents, 32
+    rows, below the 64-row floor), two batched GEMMs in one kernel (two
+    analyses), fp32 8 x [32, 32] @ [32, 32] or a mixed-rank product (a rank-2
+    operand shared by the batches).
+    A whole-tile config whose fp32 tcgen05 lowering
+    ``_tcgen05_fp32_lowering_blocked`` refuses runs the scalar fallback, since
+    the universal lowering declines a batched GEMM: over the K loop's lanes
+    and on the generic thread layout and schedule, flat or persistent, as
+    main ran batched fp32 (``_detect_specialized_mma_loop`` and
+    ``_analyzed_specialized_mma_plan`` ask the same gate)."""
+    # local: ``cute_warp_mma_gemm`` and ``tcgen05.search_plan`` import this
+    # module
+    from .cute_warp_mma_gemm import _static_int
+    from .tcgen05.search_plan import tcgen05_shape_rejected
+
+    state = env.config_spec.tcgen05
+    if state.search_planned and not (
+        state.search_enabled
+        and state.matmul_block_ids is not None
+        and tuple(map(env.canonical_block_id, state.matmul_block_ids))
+        == tuple(
+            map(
+                env.canonical_block_id,
+                (
+                    lhs.matrix_row_block_id,
+                    rhs.matrix_col_block_id,
+                    lhs.matrix_col_block_id,
+                ),
+            )
+        )
+    ):
+        return False
+    if not (
+        lhs.source_fake.ndim == 3
+        and rhs.source_fake.ndim == 3
+        and lhs.matrix_major == "row"
+        and tcgen05_supports_input_dtype(get_cute_mma_support(), torch.float32)
+    ):
+        return False
+    m, k, n = (
+        _static_int(env, size)
+        for size in (lhs.matrix_rows, lhs.matrix_cols, rhs.matrix_cols)
+    )
+    if (
+        m is None
+        or n is None
+        or k is None
+        or tcgen05_shape_rejected(
+            m,
+            n,
+            k,
+            torch.float32,
+            tf32=True,
+            batch=_static_int(env, lhs.source_fake.size(0)),
+        )
+    ):
+        return False
+    return batched_ab_tma_provable(env, _MmaOperandAnalysis(lhs=lhs, rhs=rhs))
+
+
 def _tcgen05_fp32_lowering_blocked(
     cg: GenerateAST,
     node: Node,
@@ -8786,18 +8867,23 @@ def _tcgen05_fp32_lowering_blocked(
     Called by both ``prepare_cute_collective_lane_loop_suppression`` and
     ``_emit_mma_pipeline`` — the two must agree, otherwise suppression would
     drop the index/mask definitions the universal fallback needs (see the
-    mirror-bailout comment in the suppression planner).
+    mirror-bailout comment in the suppression planner). For a batched GEMM
+    ``_detect_specialized_mma_loop`` and ``_analyzed_specialized_mma_plan``
+    ask it too: the universal lowering declines a leading passthrough, and the
+    scalar fallback that runs instead needs the K loop's lanes and the
+    generic root thread layout.
     """
     if not (
         lhs_operand.matrix_major == "row" and rhs_operand.matrix_major in ("row", "col")
     ):
         return True
-    # Batched (leading-passthrough) and grouped/worklist/rank-3 forms are
-    # validated 16-bit/fp8 families only.
+    # Grouped/worklist/rank-3 forms are validated 16-bit/fp8 families only. A
+    # batched (leading-passthrough) GEMM's matrices are plain GEMMs over its
+    # rank-3 TMA tensors, whose descriptors recast to TFloat32 as the rank-2
+    # ones do; the operand analysis admits it only over rank-3 TMA operands
+    # (``_batched_tf32_tma_operands``).
     if (
-        lhs_operand.is_leading_passthrough
-        or rhs_operand.is_leading_passthrough
-        or rhs_operand.rhs_rank3_grouped_nt
+        rhs_operand.rhs_rank3_grouped_nt
         or rhs_operand.rhs_segment_group is not None
         or rhs_operand.rhs_packed_group is not None
         or _tcgen05_grouped_mode(cast("_ConfigLike", config)) is not None

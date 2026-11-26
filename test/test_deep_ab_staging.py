@@ -27,8 +27,9 @@ class TestDeepABStagingHelpers(TestCase):
         # FP16/BF16 (2 bytes) -> 12 stages (the SMEM budget clamps per tile)
         self.assertEqual(smem._get_dtype_ab_stages_hard_cap(2), 12)
 
-        # FP32 (4 bytes) -> 3 stages
-        self.assertEqual(smem._get_dtype_ab_stages_hard_cap(4), 3)
+        # FP32 run as tf32 (4 bytes) -> 12 stages (the SMEM budget clamps per
+        # tile: 256x256x32 two-CTA fits 6)
+        self.assertEqual(smem._get_dtype_ab_stages_hard_cap(4), 12)
 
         # Larger dtypes -> 3 stages (baseline)
         self.assertEqual(smem._get_dtype_ab_stages_hard_cap(8), 3)

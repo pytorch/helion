@@ -1622,7 +1622,15 @@ def _get_dtype_ab_stages_hard_cap(dtype_bytes: int) -> int:
     - FP8 (1 byte): 12 stages - validated on B200, fits 2x bf16
     - FP16/BF16 (2 bytes): 12 stages - the per-CTA SMEM budget decides
       (256x256x64 two-CTA fits 6, 256x64x64 two-CTA fits 9)
-    - FP32 (4 bytes): 3 stages - baseline for larger dtypes
+    - FP32 run as tf32 (4 bytes): 12 stages - the budget decides as for
+      16-bit operands: a 32-deep fp32 K step stages the bytes of a 64-deep
+      16-bit one, so the 256x256 pair fits six 32-deep stages (cuBLAS's
+      tf32 ``256x256x32 ... 2sm`` tile) where the cap of 3 stopped it at
+      three 64-deep ones holding the same 192 KiB. GB300, tf32
+      16384x768x3072 with b K-major, in CUDA graphs over cold inputs, of
+      cuBLAS: 256x256x64 x 3 0.999-1.002, 256x256x32 x 6 1.005-1.013
+      (back to back at the shared clock: 0.958-0.973 -> 1.011-1.017)
+    - larger: 3 stages
 
     Args:
         dtype_bytes: Size of data type in bytes
@@ -1634,9 +1642,8 @@ def _get_dtype_ab_stages_hard_cap(dtype_bytes: int) -> int:
         return 0
     if dtype_bytes == 1:  # FP8
         return 12
-    if dtype_bytes == 2:  # FP16/BF16
+    if dtype_bytes in (2, 4):  # FP16/BF16, FP32 (tf32)
         return 12
-    # FP32 or larger
     return 3
 
 
@@ -1664,22 +1671,23 @@ def max_ab_stages_that_fit(
         bn: Block size in N dimension
         bk: Block size in K dimension
         cluster_m: CTA cluster size (1 or 2)
-        hard_cap: Optional maximum stages override. If None, uses
-            dtype-specific default (12 for FP8, 6 for FP16, 3 for FP32)
+        hard_cap: Optional maximum stages override. If None, uses the
+            dtype-specific default (``_get_dtype_ab_stages_hard_cap``: 12
+            for FP8, FP16/BF16 and FP32 run as tf32, 3 for wider dtypes)
 
     Returns:
         Maximum valid ab_stages in [1, hard_cap], or 0 if constraints
         are unknown or configuration is invalid (e.g., ab_stages=1
         doesn't fit budget).
 
-    Example:
+    Example (GB300's per-CTA budget):
         >>> # FP8 256x256x64 cluster_m=2
         >>> smem.max_ab_stages_that_fit(state, bm=256, bn=256, bk=64, cluster_m=2)
-        8  # FP8 fits 8 stages
+        12  # FP8 fits the cap of 12 stages
 
         >>> # BF16 same tile (2x larger per stage)
         >>> smem.max_ab_stages_that_fit(state, bm=256, bn=256, bk=64, cluster_m=2)
-        4  # BF16 fits only 4 stages
+        6  # BF16 fits 6 stages, as FP32 does at bk=32
     """
     constraints = state.ab_stages_three_search_constraints
     if constraints is None or bm <= 0 or bn <= 0 or bk <= 0:
