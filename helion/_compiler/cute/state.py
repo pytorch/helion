@@ -406,6 +406,16 @@ class CuteTcgen05State:
     epi_role_tile_counter_var: str | None = None
     epi_role_tile_counter_increment_per_tile: bool = True
     cluster_shape: tuple[int, int, int] | None = None
+    # ``tcgen05_fallback_cluster``: the fallback cluster the preferred
+    # ``cluster_shape`` launches with, and the ``cutlass.Constexpr`` body
+    # parameter (``True`` in the fallback body) the cluster-shape-dependent
+    # statements select on (``fallback_cluster_select``).
+    fallback_cluster_shape: tuple[int, int, int] | None = None
+    fallback_cluster_var: str | None = None
+    # The kernel parameters the fallback body receives in place of the
+    # preferred body's (the A/B TMA atoms built without the multicast across
+    # the cluster's N lanes): preferred name -> fallback name.
+    fallback_cluster_twin_args: dict[str, str] = dataclasses.field(default_factory=dict)
     block_shape: tuple[int, int, int] | None = None
     # ``min_blocks_per_mp`` the tcgen05 role launch requires (the
     # epilogue warp groups' 10+-warp block runs without a ``setmaxnreg``

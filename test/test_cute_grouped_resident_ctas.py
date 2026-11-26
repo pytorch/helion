@@ -205,6 +205,8 @@ def _grid_strategy_stub(
         _tcgen05_plan=lambda: plan,
         # (no K-split cluster: ``tcgen05_cluster_split_k``)
         _tcgen05_cluster_split_k=lambda: 1,
+        # (no fallback cluster: ``tcgen05_fallback_cluster``)
+        _tcgen05_fallback_cluster=lambda: False,
         # (the default cap: ``tcgen05_persistent_grid_cap``)
         _tcgen05_persistent_grid_cap=lambda: "sm_pairs",
         _tcgen05_max_active_clusters_var=lambda: "_MAX_ACTIVE_CLUSTERS",

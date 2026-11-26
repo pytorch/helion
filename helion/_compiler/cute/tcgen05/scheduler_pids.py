@@ -38,6 +38,7 @@ from ..cutedsl_compat import emit_pipeline_advance
 from ..emitters.role_item_loop import RoleItemLoop
 from ..emitters.role_item_loop import StaticSchedulerHandle
 from ..emitters.role_item_loop import persistent_tile_scheduler_params_stmt
+from ..fallback_cluster import fallback_cluster_select
 from ..grouped_panel_raster import GROUPED_PANEL_ALTERNATE_KEY
 from ..grouped_panel_raster import GROUPED_PANEL_RATIO_KEY
 from ..state import cute_env_state
@@ -630,6 +631,12 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
             return 1
         return tcgen05_cluster_split_k(config)
 
+    def _tcgen05_fallback_cluster(self) -> bool:
+        """``tcgen05_fallback_cluster``: the 4-CTA cluster launches with its
+        pair as the fallback (the plan's; off before it is registered)."""
+        plan = self._tcgen05_plan()
+        return plan is not None and plan.fallback_cluster
+
     def decode_cluster_n(self) -> int:
         # A K-split cluster's N lanes take one output tile (the virtual pid
         # already collapses them, ``_tcgen05_linear_virtual_pid_expr``), so
@@ -1121,6 +1128,12 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         """
         cluster_m = self._tcgen05_cluster_m()
         cluster_n = self._tcgen05_cluster_n()
+        if self._tcgen05_fallback_cluster():
+            # A launch with a fallback cluster (``tcgen05_fallback_cluster``)
+            # fills every SM: the GPU forms the 4-CTA clusters it co-schedules
+            # and pairs on the SMs left over (GB300: 36 clusters and 4 pairs,
+            # 38 slots of 152 SMs), each pair running its slot's N lane.
+            return f"max(1, ({self.grid_size_expr}) // {cluster_m * cluster_n})"
         if self._tcgen05_batched_cluster_n2():
             return self._tcgen05_whole_cluster_capacity_expr()
         if cluster_m * cluster_n == 1:
@@ -5158,6 +5171,10 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         # CUDA cluster ranks are x-fastest, so peer rank r sits at
         # ``(r % cluster_m, r // cluster_m)`` in the cluster.
         sched_cluster_size = layout.cluster_m * layout.cluster_n
+        # A fallback pair's leader feeds its own two CTAs (``fallback_cluster``).
+        sched_fan_out = fallback_cluster_select(
+            device_function, sched_cluster_size, layout.cluster_m
+        )
         if layout.cluster_m > 1:
             sched_barrier_ptr = device_function.new_var("tcgen05_clc_sched_barrier_ptr")
             sched_peer_rank = device_function.new_var("tcgen05_clc_sched_peer_rank")
@@ -5223,7 +5240,7 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
                     create(
                         ast.If,
                         test=expr_from_string(
-                            f"{sched_peer_rank} < cutlass.Int32({sched_cluster_size})"
+                            f"{sched_peer_rank} < cutlass.Int32({sched_fan_out})"
                         ),
                         body=[
                             *peer_coord_stmts,
@@ -5344,6 +5361,20 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
                     statement_from_string(
                         f"{initial_sched.sched_var}._current_work_linear_idx = "
                         f"{bidz_var}"
+                    ),
+                    *(
+                        # The cancelled unit's N lane: a fallback pair takes
+                        # one lane of a 2x2 slot (``block_idx.y``); a
+                        # 4-CTA cluster's response names lane 0.
+                        [
+                            statement_from_string(
+                                f"{initial_sched.sched_var}.cta_id_in_cluster = ("
+                                f"cutlass.Int32(0), {bidy_var} % cutlass.Int32({layout.cluster_n}), "
+                                "cutlass.Int32(0))"
+                            )
+                        ]
+                        if self._tcgen05_fallback_cluster()
+                        else []
                     ),
                     statement_from_string(
                         f"{next_work_tile_var} = "

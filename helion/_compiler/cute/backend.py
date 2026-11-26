@@ -2716,6 +2716,7 @@ class CuteBackend(Backend):
         ctx: DeviceBodyContext,
     ) -> list[ast.stmt]:
         from ..uint64_grid import narrow_uint64_grid_uses
+        from .fallback_cluster import outline_fallback_cluster_bodies
         from .passes import launch_attributes
         from .passes import pdl
         from .passes.pipeline import run_kernel_def_passes
@@ -2740,6 +2741,9 @@ class CuteBackend(Backend):
         # The final body, the spread pad included: a kernel whose shared
         # memory cannot fit one block fails here, not in libNVVM.
         check_smem_budget(fn_def, ctx.constexpr_values, fn.pid)
+        # One body per cluster shape sharing that shared memory
+        # (``tcgen05_fallback_cluster``).
+        outline_fallback_cluster_bodies(fn, fn_def, prefix)
         statements = launch_attributes.module_statements(fn)
         launch_attributes.project_launch_block(fn)
         return statements

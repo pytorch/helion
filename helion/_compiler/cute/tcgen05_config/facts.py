@@ -951,7 +951,48 @@ def _dense_aligned_n_plan(
         cast("tuple[int, int, int]", (blocks[mi], blocks[ni], blocks[ki])),
         bounds=bounds,
         sm_pairs=_sm_pairs(state),
+        m_paired=_dense_aligned_n_m_pair_envelope(state),
     )
+
+
+def _dense_aligned_n_m_pair_envelope(state: CuteTcgen05Config) -> bool:
+    """Whether the aligned-N plan (``dense_aligned_n_plan``) takes the M-paired
+    tile (``block_m=512``) at all: ``cute_mma``'s M-paired envelope, whole
+    512-row M tiles of a plain 2-D GEMM (the plan checks the 16-bit operands,
+    the plain epilogue and both accumulator stages). An explicit config is
+    valid wherever the envelope holds; which grids the search samples and
+    seeds it on is ``_dense_aligned_n_m_paired``'s."""
+    facts = state.dense_gemm_facts
+    return (
+        facts is not None
+        and not state.aux_kernel_detected
+        and not state.matmul_has_leading_passthrough
+        and facts.shape[0] % (2 * TCGEN05_TWO_CTA_BLOCK_M) == 0
+    )
+
+
+def m_pair_grid_outnumbers_pairs(state: CuteTcgen05Config, m: int, n: int) -> bool:
+    """Whether an ``m x n`` grid of 512x256 M-paired tiles holds more tiles
+    than one wave of CTA pairs (``_sm_pairs``)."""
+    tiles = -(-m // (2 * TCGEN05_TWO_CTA_BLOCK_M)) * -(-n // TCGEN05_TWO_CTA_BLOCK_N)
+    return tiles > _sm_pairs(state)
+
+
+def _dense_aligned_n_m_paired(state: CuteTcgen05Config) -> bool:
+    """Whether the aligned-N family's search samples and seeds the M-paired
+    tile here (``dense_aligned_n_block_ms``): the kernel admits ``block_m=512``
+    and its 512x256 tiles outnumber the CTA pairs, so a narrower width can fill
+    the grid's last wave (bf16 512x30528: 120 tiles on 76 pairs). A grid of
+    fewer tiles than pairs keeps the 256-row pairs' widths, where the M-paired
+    tile's narrow widths would re-read 512 rows of A per few columns of B
+    (bf16 512x5632x2048: 22 tiles)."""
+    from . import repair
+
+    facts = state.dense_gemm_facts
+    if facts is None or not repair._m_pair_block_m_is_valid(state):
+        return False
+    m, n, _k = facts.shape
+    return m_pair_grid_outnumbers_pairs(state, m, n)
 
 
 def _dense_aligned_n_block_m(state: CuteTcgen05Config) -> int | None:
@@ -976,6 +1017,7 @@ def _dense_aligned_n_block_m(state: CuteTcgen05Config) -> int | None:
         n=facts.shape[1],
         output_column_major=facts.output_column_major,
         plain_epilogue=facts.plain_epilogue,
+        m_paired=_dense_aligned_n_m_paired(state),
     )
     return admitted[0] if admitted else dense_aligned_n_block_m(facts.input_dtype)
 
@@ -997,6 +1039,7 @@ def _dense_aligned_n_block_ms(state: CuteTcgen05Config) -> tuple[int, ...]:
             n=facts.shape[1],
             output_column_major=facts.output_column_major,
             plain_epilogue=facts.plain_epilogue,
+            m_paired=_dense_aligned_n_m_paired(state),
         )
         if low <= bm <= high
     )
@@ -1055,6 +1098,21 @@ def _dense_aligned_n_width_plans(
     ):
         return
     yield from _dense_aligned_n_proved_plans(state, width)
+    m_pair = 2 * TCGEN05_TWO_CTA_BLOCK_M
+    if (
+        search
+        and m_pair in _dense_aligned_n_block_ms(state)
+        and any(
+            ranked == width
+            for _cost, ranked in _dense_aligned_n_clipped_ranking(
+                state, m_pair, search=True
+            )
+        )
+    ):
+        # The clipped widths the M-paired tile ranks ahead of its references
+        # are the search's too, also where only that tile proves them (an
+        # N-major B's 32-byte swizzle atoms, ``_dense_aligned_n_proved_plans``).
+        yield from _dense_aligned_n_proved_plans(state, width, block_m=m_pair)
 
 
 def _dense_aligned_n_seedable(state: CuteTcgen05Config, width: int) -> bool:
@@ -1076,9 +1134,14 @@ def _dense_aligned_n_proved_plans(
         not state.search_enabled
         or facts is None
         or block_m is None
-        # (an N-major B: whole 64-byte swizzle atoms per CTA half row)
+        # (an N-major B: whole 64-byte swizzle atoms per CTA half row, but
+        # for the M-paired tile, whose two MMAs read each B stage; bf16
+        # 512x30528x32768 with a [K, N] row-major b, of cuBLAS at the power
+        # cap: 512x224, 32-byte atoms, 0.989-1.008 against 512x256, 128-byte
+        # atoms, 0.973-0.983)
         or (
             not facts.rhs_k_major
+            and block_m != 2 * TCGEN05_TWO_CTA_BLOCK_M
             and not dense_aligned_n_mn_b_width(width, facts.input_dtype.itemsize)
         )
         # dense_aligned_n_plan needs a physical width that divides N and

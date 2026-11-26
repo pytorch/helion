@@ -112,6 +112,7 @@ from ..tcgen05_constants import TCGEN05_EPI_SUBTILE_N_CHOICES
 from ..tcgen05_constants import TCGEN05_EPI_SUBTILE_N_CONFIG_KEY
 from ..tcgen05_constants import TCGEN05_EPI_WARP_GROUP_CHOICES
 from ..tcgen05_constants import TCGEN05_EPI_WARP_GROUPS_CONFIG_KEY
+from ..tcgen05_constants import TCGEN05_FALLBACK_CLUSTER_CONFIG_KEY
 from ..tcgen05_constants import TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY
 from ..tcgen05_constants import TCGEN05_GROUPED_AB_TILE_K_CONFIG_KEY
 from ..tcgen05_constants import TCGEN05_GROUPED_BALANCED_WORKERS_CONFIG_KEY
@@ -547,6 +548,18 @@ def split_k_exchange_search_enabled(state: CuteTcgen05Config) -> bool:
     """``tcgen05_split_k_exchange`` on the search surface: admitted, and the
     cluster's two-way split searched."""
     return split_k_exchange_admitted(state) and 2 in split_k_search_choices(state)
+
+
+def fallback_cluster_search_enabled(state: CuteTcgen05Config) -> bool:
+    """``tcgen05_fallback_cluster`` on the search surface (beside a
+    searched ``tcgen05_cluster_n=2``): a plain unbatched GEMM whose epilogue
+    loads no auxiliary tensor; ``repair._normalize_fallback_cluster`` keeps
+    it on the 4-CTA pair cluster of the persistent pipelines only."""
+    return (
+        not state.matmul_has_leading_passthrough
+        and state.grouped_worklist_smem_facts is None
+        and not state.aux_kernel_detected
+    )
 
 
 def split_k_admissible_choices(state: CuteTcgen05Config) -> tuple[int, ...]:
@@ -1365,6 +1378,13 @@ def optional_fragments(
         fragments[TCGEN05_PERSISTENT_GRID_CAP_CONFIG_KEY] = EnumFragment(
             TCGEN05_PERSISTENT_GRID_CAP_CHOICES
         )
+    if not for_search or (
+        2 in cluster_n_choices and fallback_cluster_search_enabled(state)
+    ):
+        # The 4-CTA pair cluster launched with its pair as the fallback,
+        # filling the SMs its clusters leave over (see
+        # ``TCGEN05_FALLBACK_CLUSTER_CONFIG_KEY``).
+        fragments[TCGEN05_FALLBACK_CLUSTER_CONFIG_KEY] = BooleanFragment()
     if not for_search or state.grouped_full_coverage_eligible:
         fragments[TCGEN05_GROUPED_FULL_COVERAGE_CONFIG_KEY] = EnumFragment(
             TCGEN05_GROUPED_FULL_COVERAGE_MODES

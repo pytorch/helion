@@ -282,22 +282,23 @@ class TestCuteTcgen05MPairSeeds(TestCase):
         y = torch.empty([4096, 4096], dtype=torch.bfloat16)
         self._assert_deep_m_pair_seeds((x, y))
 
+    def test_a_k_tail_seeds_the_deep_pair_ring(self) -> None:
+        """K = 31 x 64 + 32: the TMA producer issues the partial last K tile
+        of both A subtiles and of B as whole boxes, zero-filled past K, so
+        the pair seeds and their search projection are the whole-K ones."""
+        x = torch.empty([2048, 2016], dtype=torch.float16)
+        y = torch.empty([2016, 4096], dtype=torch.float16)
+        self._assert_deep_m_pair_seeds((x, y))
+
     def test_no_deep_pair_seeds_where_the_pair_tile_is_invalid(self) -> None:
-        """Rows not divisible by 512, a 64-misaligned K, an exact-shape
-        epilogue and a batched GEMM keep the seed list as it was."""
+        """Rows not divisible by 512, an exact-shape epilogue and a
+        batched GEMM keep the seed list as it was."""
         cases: list[tuple[helion.Kernel, tuple[torch.Tensor, ...]]] = [
             (
                 _make_plain_gemm(),
                 (
                     torch.empty([1792, 2048], dtype=torch.float16),
                     torch.empty([2048, 2048], dtype=torch.float16),
-                ),
-            ),
-            (
-                _make_plain_gemm(),
-                (
-                    torch.empty([2048, 2016], dtype=torch.float16),
-                    torch.empty([2016, 4096], dtype=torch.float16),
                 ),
             ),
             (

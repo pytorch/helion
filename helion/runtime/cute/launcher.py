@@ -442,6 +442,20 @@ def _create_cute_wrapper(
     cluster_shape = _cute_cluster_shape(cute_kernel, wrapper_plans)
     if cluster_shape is not None:
         launch_suffix += f", cluster={list(cluster_shape)!r}"
+    fallback_cluster_shape = getattr(
+        cast("Any", cute_kernel), "_helion_cute_fallback_cluster_shape", None
+    )
+    if fallback_cluster_shape is not None:
+        # A preferred cluster with a fallback (cudaLaunchAttributePreferredClusterDimension):
+        # the GPU forms the preferred cluster where it fits and the fallback one
+        # elsewhere; the kernel holds one body per shape, whose shared memory
+        # the two branches share:
+        #     .launch(grid=..., cluster=[2, 2, 1], fallback_cluster=[2, 1, 1], smem_merge_branch_allocs=True)
+        assert cluster_shape is not None
+        launch_suffix += (
+            f", fallback_cluster={list(fallback_cluster_shape)!r}"
+            ", smem_merge_branch_allocs=True"
+        )
     preferred_smem_carveout = _cute_preferred_smem_carveout(cute_kernel, wrapper_plans)
     if preferred_smem_carveout is not None:
         launch_suffix += f", preferred_smem_carveout={preferred_smem_carveout}"

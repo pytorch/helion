@@ -81,6 +81,9 @@ from .device_state import Tcgen05Orientation
 from .execution_plans import MatmulExecutionKind
 from .execution_plans import MatmulExecutionPlan
 from .execution_plans import node_matmul_plan
+from .fallback_cluster import enable_fallback_cluster
+from .fallback_cluster import fallback_cluster_select
+from .fallback_cluster import physical_cluster_rank_expr
 from .fragment_epilogue import Tcgen05FragmentEpiloguePlan
 from .fragment_epilogue import _tcgen05_fragment_dtype_supported
 from .fragment_epilogue import _tcgen05_fragment_source_layout_reachable
@@ -243,6 +246,7 @@ from .tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_N
 from .tcgen05_constants import TCGEN05_TWO_CTA_EDGE_TMA_STORE_MAX_AB_STAGES
 from .tcgen05_constants import resolve_tcgen05_grouped_worklist_mma_profile
 from .tcgen05_constants import tcgen05_ab_smem_bytes_per_cta
+from .tcgen05_constants import tcgen05_fallback_cluster_shape
 from .tcgen05_constants import tcgen05_grouped_worklist_smem_bytes
 from .tcgen05_constants import tcgen05_grouped_worklist_store_shape
 from .tcgen05_constants import tcgen05_one_cta_l2_prefetch_max_lines
@@ -254,7 +258,6 @@ from .tcgen05_constants import tcgen05_role_launch_n_width
 from .tcgen05_constants import tcgen05_two_cta_max_k_tiles
 from .tcgen05_lifecycle import Tcgen05LifecycleContext
 from .tcgen05_prologue import floordiv_nonneg_expr
-from .tcgen05_prologue import masked_cluster_rank_expr
 from .tcgen05_prologue import mod_nonneg_expr
 from .tcgen05_prologue import prologue_runtime
 from .tcgen05_prologue import split_barrier_init_supported
@@ -7237,6 +7240,7 @@ def _build_operand_l2_prefetch(
     load_warps: int,
     load_rank: str | None,
     names: Callable[[str], str],
+    fn: DeviceFunction,
 ) -> ast.stmt:
     """The A/B-load warps prefetch the CTA's operand rows into L2
     (``_tcgen05_operand_l2_prefetch_lines``). bf16 1500x384x384 on the
@@ -7311,11 +7315,19 @@ def _build_operand_l2_prefetch(
         )
         if cluster_n_rank is not None:
             # (the cluster's (2, 2) CTA layout: the rank in the pair, then the
-            # pair)
+            # pair.  A fallback body's cluster is one pair, which runs the N
+            # lane ``block_idx.y`` of its 2x2 slot (``fallback_cluster``) and
+            # binds that lane: the slot's two pairs, each loading the A tile
+            # itself, still split its rows between them.)
             rank_src += (
-                f"{cluster_n_rank} = (cute.arch.make_warp_uniform("
-                "cute.arch.block_idx_in_cluster()) >> cutlass.Int32(1)) & "
-                "cutlass.Int32(1)\n"
+                f"{cluster_n_rank} = "
+                + fallback_cluster_select(
+                    fn,
+                    "(cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())"
+                    " >> cutlass.Int32(1)) & cutlass.Int32(1)",
+                    "cutlass.Int32(cute.arch.block_idx()[1]) & cutlass.Int32(1)",
+                )
+                + "\n"
             )
         return statement_from_string(
             "if True:\n" + textwrap.indent(rank_src + ast.unparse(prefetch), "    ")
@@ -7844,10 +7856,11 @@ def _flat_operand_l2_prefetch_footprint(
 
     The two pairs of a 2x2 cluster read one A tile (the multicast shares it),
     so each CTA prefetches half of its A rows, at its pair's rank in the
-    cluster (``cluster_n_rank``): a K-major A's rows once per cluster (an
-    M-major A's half-line segments still share their lines). The as-written
-    bf16 128x3072x1000 with b stored [K, N] on 128x64 pairs in 2x2 clusters,
-    a's 64 rows of the CTA split between the two pairs::
+    cluster (``cluster_n_rank``; a fallback body's pair, at the N lane of its
+    2x2 slot: ``_build_operand_l2_prefetch``): a K-major A's rows once per
+    cluster (an M-major A's half-line segments still share their lines). The
+    as-written bf16 128x3072x1000 with b stored [K, N] on 128x64 pairs in 2x2
+    clusters, a's 64 rows of the CTA split between the two pairs::
 
         tcgen05_l2_pf_rank_n = (
             cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
@@ -9386,6 +9399,9 @@ class Tcgen05PipelinePlan:
     # ``tcgen05_cluster_split_k``: K splits of one output tile on the
     # cluster's N lanes (2 or 1).
     tcgen05_cluster_split_k: int
+    # ``tcgen05_fallback_cluster``: the 4-CTA cluster launches with its pair
+    # (2, 1, 1) as the fallback (``fallback_cluster``).
+    tcgen05_fallback_cluster: bool
     # The 16-bit output dtype a K-split cluster exchanges its partials in
     # (``tcgen05_split_k_exchange="output"``), or None for fp32.
     tcgen05_split_k_exchange_dtype: torch.dtype | None
@@ -10988,6 +11004,15 @@ def plan_tcgen05_pipeline(
         and knobs.int_or(knobs.split_k, 1) == 2
         else 1
     )
+    # ``tcgen05_fallback_cluster``: the 4-CTA cluster launches with its pair
+    # as the fallback; the envelope is checked where the plan's facts are
+    # complete (``_fallback_cluster_refusal``).
+    tcgen05_fallback_cluster = (
+        tcgen05_fallback_cluster_shape(cg.device_function.config) is not None
+        and mma_impl == "tcgen05"
+        and tcgen05_cluster_n == 2
+        and tcgen05_cluster_split_k == 1
+    )
     # ``tcgen05_split_k_exchange="output"``: the pairs send each other their
     # partials rounded to the 16-bit output dtype (repair admits it under
     # ``split_k_reduction="output"`` on a 16-bit output only).
@@ -11209,10 +11234,14 @@ def plan_tcgen05_pipeline(
     )
     if tcgen05_m_subtile_count > 1:
         # M-paired tiles: validated envelope is the plain (no-aux, no
-        # leading passthrough) full-tile static role-local CtaGroup.TWO
-        # family; cluster_n=2 composes (the 2x2 super-tile: A multicast
-        # across the cluster-N pairs on top of the SMEM-shared B within
-        # each pair). Both TMEM accumulator stages are repurposed as the
+        # leading passthrough) role-local CtaGroup.TWO family over whole
+        # 512-row M tiles, N whole or ending in a partial last tile, K whole
+        # or ending in a tail (below); cluster_n=2 composes over whole N
+        # tiles (the 2x2 super-tile: A multicast across the cluster-N pairs
+        # on top of the SMEM-shared B within each pair), while a partial last
+        # N tile keeps one pair per cluster (``tcgen05_n_edge_only`` admits a
+        # 2x2 only through the 256-row pair's N-edge cluster schedule). Both
+        # TMEM accumulator stages are repurposed as the
         # two subtiles' accumulators, so acc_stages must be 2 (the pipeline
         # still double-buffers ACROSS work tiles at the pair granularity
         # via the two stages' phase flips).
@@ -11223,7 +11252,31 @@ def plan_tcgen05_pipeline(
             and tcgen05_is_two_cta
             and tcgen05_cluster_m == 2
             and tcgen05_cluster_n in (1, 2)
-            and tcgen05_static_full_tiles
+            and (
+                tcgen05_static_full_tiles
+                # Whole output tiles over a K tail run the 256-row pair's
+                # role-local producer (``tcgen05_role_local_k_tail_tma``),
+                # which issues the partial last K tile of both A subtiles
+                # and of B as whole boxes that TMA zero-fills past K; on
+                # 2048x4096x50264 (k-block 785 holds 24 of 64 columns):
+                #     tcgen05_tma_next_full_tile = ... and (tile_offset_2 + cutlass.Int32(192) < cutlass.Int32(50264))
+                #     if tcgen05_tma_next_full_tile:
+                #         cute.copy(tma_atom_a, tma_gA[None, tcgen05_tma_k_tile + cutlass.Int32(3)], ...)
+                #         cute.copy(tma_atom_a, tcgen05_msub_tma_gA[None, tcgen05_tma_k_tile + cutlass.Int32(3)], ...)
+                #         cute.copy(tma_atom_b, tma_gB[None, tcgen05_tma_k_tile + cutlass.Int32(3)], ...)
+                or tcgen05_role_local_k_tail_tma
+                # A partial last N tile runs the pair's role-local N-edge
+                # producer, which issues the tile's B box whole (TMA
+                # zero-fills its columns past N) beside both A subtiles, and
+                # each subtile's TMA store clips the tile at N; on the
+                # weight-gradient 512x30528x32768 (the last tile holds 64 of
+                # 256 columns):
+                #     tcgen05_tma_next_full_tile = tile_offset_0 + cutlass.Int32(512) <= cutlass.Int32(512) and tile_offset_1 < cutlass.Int32(30528) and (...)
+                #     ...
+                #     for _tcgen05_msub in cutlass.range(2, unroll_full=True):
+                #         tcgen05_gC = cute.local_tile(tcgen05_tma_store_tensor, (256, 256), (tile_offset_0 // cutlass.Int32(256) + cutlass.Int32(_tcgen05_msub), tile_offset_1 // cutlass.Int32(256)))
+                or tcgen05_role_local_n_edge_tma
+            )
             and tcgen05_use_tma_pipeline
             and tcgen05_pid_is_persistent
             and not env.config_spec.tcgen05.aux_kernel_detected
@@ -11235,11 +11288,14 @@ def plan_tcgen05_pipeline(
                 exc.BackendUnsupported(
                     "cute",
                     "block_m=512 (tcgen05 M-paired tiles) requires the plain "
-                    "16-bit full-tile static persistent CtaGroup.TWO family: "
+                    "16-bit persistent CtaGroup.TWO family over whole 512-row "
+                    "M tiles: "
                     "tcgen05_cluster_m=2, tcgen05_cluster_n in (1, 2), "
-                    "tcgen05_acc_stages=2, M/N/K divisible by "
-                    "block_m/block_n/block_k, TMA pipeline, and no aux/batch "
-                    "operands. Use block_m=256 otherwise.",
+                    "tcgen05_acc_stages=2, M divisible by block_m, N divisible "
+                    "by block_n or a partial last N tile on one pair per "
+                    "cluster, and K whole or a K tail the TMA producer "
+                    "zero-fills, TMA pipeline, and no aux/batch operands. Use "
+                    "block_m=256 otherwise.",
                 )
             )
     # Budget-driven admission for the output-edge TMA-store epilogue's extra
@@ -13030,6 +13086,7 @@ def plan_tcgen05_pipeline(
         tcgen05_is_two_cta=tcgen05_is_two_cta,
         tcgen05_cluster_n=tcgen05_cluster_n,
         tcgen05_cluster_split_k=tcgen05_cluster_split_k,
+        tcgen05_fallback_cluster=tcgen05_fallback_cluster,
         tcgen05_split_k_exchange_dtype=tcgen05_split_k_exchange_dtype,
         tcgen05_role_local_m_edge_tma=tcgen05_role_local_m_edge_tma,
         tcgen05_role_local_n_edge_tma=tcgen05_role_local_n_edge_tma,
@@ -13318,6 +13375,50 @@ def _grouped_static_persistent_wrapper_plan(
             else {}
         ),
     }
+
+
+def _fallback_cluster_refusal(
+    plan: Tcgen05PipelinePlan, matmul_plan: CuteTcgen05MatmulPlan
+) -> str | None:
+    """What a ``tcgen05_fallback_cluster`` kernel lacks, or ``None``: the
+    role-local persistent CtaGroup.TWO pipeline of a plain GEMM on a 4-CTA
+    cluster, static or CLC, TMA-loading one 256-row A subtile per stage, with
+    an epilogue that loads no auxiliary tensor.  Its fallback body differs
+    from the preferred one in the physical cluster only (``fallback_cluster``):
+    the cluster layout behind the pipelines and multicast masks, the CTA rank
+    mask, the A/B ring's release count, the CLC mailbox fan-out and its
+    release count, the N lane that splits the operand L2 prefetch's A rows
+    (``_build_operand_l2_prefetch``), and the A/B TMA atoms."""
+    if not (
+        plan.tcgen05_is_two_cta
+        and plan.tcgen05_cluster_m == 2
+        and plan.tcgen05_cluster_n == 2
+    ):
+        return "a CtaGroup.TWO 4-CTA cluster (tcgen05_cluster_m=2, tcgen05_cluster_n=2)"
+    if (
+        not matmul_plan.uses_role_local_persistent_body
+        or matmul_plan.persistence_model
+        not in (
+            Tcgen05PersistenceModel.STATIC_PERSISTENT.value,
+            Tcgen05PersistenceModel.CLC_PERSISTENT.value,
+        )
+    ):
+        return "the role-local persistent pipeline on the static or CLC scheduler"
+    if (
+        matmul_plan.grouped is not None
+        or matmul_plan.row_union is not None
+        or plan.row_profile is not None
+    ):
+        return "a plain GEMM schedule (no grouped or row-union worklist)"
+    if (
+        plan.tcgen05_cp_async_a
+        or matmul_plan.m_subtile_count != 1
+        or plan.tcgen05_mma_bm != TCGEN05_TWO_CTA_BLOCK_M
+    ):
+        return "TMA loads of one 256-row A subtile per stage"
+    if matmul_plan.c_input_warp_count or matmul_plan.aux_tensor_descriptors:
+        return "an epilogue that loads no auxiliary tensor"
+    return None
 
 
 def _ab_tma_wrapper_plan(
@@ -15372,6 +15473,7 @@ def _emit_mma_pipeline(
             persistence_model=tcgen05_persistence_model_for_plan,
             cluster_n=plan.tcgen05_cluster_n,
             cluster_split_k=plan.tcgen05_cluster_split_k,
+            fallback_cluster=plan.tcgen05_fallback_cluster,
             l2_swizzle_size=tcgen05_plan_l2_swizzle_size,
             tma_store_full_tiles_only=tcgen05_tma_store_full_tiles_only,
             m_subtile_count=plan.tcgen05_m_subtile_count,
@@ -15391,6 +15493,16 @@ def _emit_mma_pipeline(
         )
         candidate_block_shape = tcgen05_matmul_plan.block_shape
         df.cute_state.register_tcgen05_matmul_plan(tcgen05_matmul_plan)
+        if plan.tcgen05_fallback_cluster:
+            fallback_refusal = _fallback_cluster_refusal(plan, tcgen05_matmul_plan)
+            if fallback_refusal is not None:
+                raise exc.BackendUnsupported(
+                    "cute",
+                    f"tcgen05_fallback_cluster needs {fallback_refusal}",
+                )
+            fallback_cluster_shape = tcgen05_fallback_cluster_shape(df.config)
+            assert fallback_cluster_shape is not None
+            enable_fallback_cluster(df, fallback_cluster_shape)
         if (
             candidate_block_shape[0]
             * candidate_block_shape[1]
@@ -15790,10 +15902,18 @@ def _emit_mma_pipeline(
                     f"require {grouped_smem_required} bytes of per-CTA SMEM, "
                     f"exceeding the {grouped_smem_capacity}-byte capacity",
                 )
+        # The physical cluster: a fallback body's pair, ``(2, 1, 1)``
+        # (``fallback_cluster``), carries the pipelines' and multicast
+        # masks' CTA layout; both bodies keep the (2, 2, 1) schedule.
+        tcgen05_physical_cluster = fallback_cluster_select(
+            df,
+            (plan.tcgen05_cluster_m, plan.tcgen05_cluster_n, 1),
+            df.cute_state.tcgen05.fallback_cluster_shape,
+        )
         prefix.append(
             statement_from_string(
                 f"{plan.tcgen05_cluster_layout_vmnk} = cute.tiled_divide("
-                f"cute.make_layout(({plan.tcgen05_cluster_m}, {plan.tcgen05_cluster_n}, 1)), "
+                f"cute.make_layout({tcgen05_physical_cluster}), "
                 f"({plan.tiled_mma}.thr_id.shape,))"
             )
         )
@@ -16169,12 +16289,15 @@ def _emit_mma_pipeline(
             # release does not protect other lanes from stage reuse.
             tcgen05_sched_consumer_thread_count = tcgen05_sched_consumer_role_count * 32
             if tcgen05_matmul_plan.is_clc_persistent and tcgen05_sched_cluster_size > 1:
-                tcgen05_sched_consumer_arrive_count = (
-                    tcgen05_sched_consumer_thread_count * tcgen05_sched_cluster_size
+                # (a fallback pair's CTAs alone release the leader's mailbox)
+                tcgen05_sched_consumer_arrive_count = fallback_cluster_select(
+                    df,
+                    tcgen05_sched_consumer_thread_count * tcgen05_sched_cluster_size,
+                    tcgen05_sched_consumer_thread_count * plan.tcgen05_cluster_m,
                 )
                 tcgen05_sched_consumer_mask_to_leader = True
             else:
-                tcgen05_sched_consumer_arrive_count = (
+                tcgen05_sched_consumer_arrive_count = str(
                     tcgen05_sched_consumer_thread_count
                 )
                 tcgen05_sched_consumer_mask_to_leader = False
@@ -17178,6 +17301,27 @@ def _emit_mma_pipeline(
                     smem_swizzle_b=tcgen05_smem_swizzle_b,
                 )
             )
+            if plan.tcgen05_fallback_cluster:
+                # The fallback body's A/B atoms: a pair loads its own A,
+                # without the multicast across the cluster's N lanes
+                # (``fallback_cluster``).
+                fallback_ab_args = [df.new_var(f"{name}_fb") for name in ab_kernel_args]
+                df.wrapper_only_params.extend(fallback_ab_args)
+                df.cute_state.tcgen05.fallback_cluster_twin_args.update(
+                    zip(ab_kernel_args, fallback_ab_args, strict=True)
+                )
+                fallback_ab_plan = _ab_tma_wrapper_plan(
+                    plan,
+                    matmul_plan=tcgen05_matmul_plan,
+                    tma_atom_a=fallback_ab_args[0],
+                    tma_tensor_a=fallback_ab_args[1],
+                    tma_atom_b=fallback_ab_args[2],
+                    tma_tensor_b=fallback_ab_args[3],
+                    smem_swizzle_a=tcgen05_smem_swizzle_a,
+                    smem_swizzle_b=tcgen05_smem_swizzle_b,
+                )
+                fallback_ab_plan["cluster_n"] = 1
+                cute_codegen_state(cg).wrapper_plans.append(fallback_ab_plan)
             # Prefetch every TMA descriptor the kernel receives as an argument
             # once at kernel entry, mirroring the CUTLASS sm100 kernels and the
             # flash emitter: the TMA-load warp warms the A/B descriptors before
@@ -17737,9 +17881,11 @@ def _emit_mma_pipeline(
                 prefix.append(
                     statement_from_string(
                         f"{tma_cta_rank_in_cluster} = "
-                        + masked_cluster_rank_expr(
+                        + physical_cluster_rank_expr(
+                            df,
                             "cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())",
                             plan.tcgen05_cluster_m * plan.tcgen05_cluster_n,
+                            plan.tcgen05_cluster_m,
                         )
                     )
                 )
@@ -17903,7 +18049,13 @@ def _emit_mma_pipeline(
             prefix.append(
                 statement_from_string(
                     f"{tma_pipeline_consumer_group} = cutlass.pipeline.CooperativeGroup("
-                    f"cutlass.pipeline.Agent.Thread, cutlass.Int32({tcgen05_ab_consumer_arrive_count_value}))"
+                    "cutlass.pipeline.Agent.Thread, cutlass.Int32("
+                    # A fallback pair's MMA alone releases its ring's stages
+                    # (no A multicast from the cluster's other N lane).
+                    + fallback_cluster_select(
+                        df, tcgen05_ab_consumer_arrive_count_value, 1
+                    )
+                    + "))"
                 )
             )
             prefix.append(
@@ -18406,6 +18558,7 @@ def _emit_mma_pipeline(
                                         load_warps=tcgen05_ab_load_warps,
                                         load_rank=tcgen05_ab_load_rank,
                                         names=df.new_var,
+                                        fn=df,
                                     )
                                 )
                             if tcgen05_tma_wait_after_first_acquire:
@@ -18510,6 +18663,7 @@ def _emit_mma_pipeline(
                                                 load_warps=1,
                                                 load_rank=None,
                                                 names=df.new_var,
+                                                fn=df,
                                             )
                                         )
                                     initial_prefetch.append(
@@ -20119,6 +20273,18 @@ def _choose_mma_impl(
         )
         if aligned_n is not None and (bm, bn, bk) == aligned_n.public_tile:
             bm, bn, bk = aligned_n.physical_tile
+        elif (
+            aligned_n is not None
+            and aligned_n.physical_tile[0] == 2 * TCGEN05_TWO_CTA_BLOCK_M
+            and (2 * bm, bn, bk) == aligned_n.physical_tile
+        ):
+            # The M-paired tile's MMA runs its 256-row subtile (``bm`` here,
+            # ``tcgen05_mma_bm`` in ``plan_tcgen05_pipeline``), the plan's
+            # physical tile holds both: block_sizes [512, 256, 64] at
+            # tcgen05_tile_n=224 runs
+            #     tiled_mma = make_trivial_tiled_mma(..., CtaGroup.TWO, (256, 224), ...)
+            #     tcgen05_msub_tiled_mma = make_trivial_tiled_mma(..., CtaGroup.TWO, (256, 224), ...)
+            bm = 2 * bm
     tcgen05_cluster_m = 1
     if config is not None:
         tcgen05_cluster_m = cluster_m_knob(config)
@@ -20580,7 +20746,7 @@ def _emit_sched_pipeline_setup(
     plan: _Tcgen05SchedPipelinePlan,
     *,
     sched_stage_count: int,
-    consumer_arrive_count: int,
+    consumer_arrive_count: int | str,
     cluster_size: int,
     defer_sync: bool,
     producer_arrive_count: int,

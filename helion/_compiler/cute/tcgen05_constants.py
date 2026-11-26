@@ -83,6 +83,11 @@ TCGEN05_TWO_CTA_EDGE_K_TAIL_MIN_DIM = 256
 # keep the persistent and CtaGroup.TWO schedules (``enable_cute_tcgen05_search``);
 # a K no such tile divides is the edge + K-tail family's K tail.
 TCGEN05_WHOLE_K_TILE_MIN = 64
+# The narrowest power-of-two N tile over which the persistent one-CTA K-tail
+# kernel is admitted when N is no multiple of the search's widest N tile
+# (``search_plan``'s ``allow_k_tail_persistent_pid_types``): the measured
+# family's 128 columns (bf16 16384x384x54, N = 3 x 128).
+TCGEN05_K_TAIL_PERSISTENT_MIN_N = 128
 # The tile of the edge family's 128-row CTA pair (each CTA owns 64 rows of a
 # 128 x 128 pair tile); the planner counts a 16-bit edge grid in these.
 TCGEN05_TWO_CTA_EDGE_PAIR128_BLOCK = 128
@@ -547,6 +552,12 @@ TCGEN05_BATCHED_ONE_ROW_TILE_SEED_AB_STAGES = 12
 # N tile ceiling of a batched 16-bit GEMM one 64-row tile tall over a short K
 # loop (``search_plan.tcgen05_one_row_tile_batched_narrow_n``).
 TCGEN05_ONE_ROW_TILE_BATCHED_BLOCK_N = 64
+# The waves of pair tiles from which a persistent grid runs in the steady
+# state, each tile's epilogue beside the next tile's loads: measured from 6.8
+# waves of 256x256 tiles (``search_plan.tcgen05_transposes_epilogue_bound_product``);
+# each rule that asks it counts the waves of its own pair tiles (a K-major copy
+# of b repays itself there, 1.7 waves do not).
+TCGEN05_EPILOGUE_BOUND_MIN_WAVES = 6
 # Waves of the transposed product's 128-row tiles (one a matrix: a CTA pair or
 # one CTA) a batch holds at least before
 # ``search_plan.tcgen05_transposes_skinny_batched_product`` transposes it
@@ -1114,6 +1125,39 @@ TCGEN05_SPLIT_K_EXCHANGE_CHOICES: tuple[str, ...] = (
     TCGEN05_SPLIT_K_EXCHANGE_ACCUMULATOR,
     TCGEN05_SPLIT_K_EXCHANGE_OUTPUT,
 )
+
+
+# ``tcgen05_fallback_cluster``: launch a 4-CTA pair cluster
+# (``tcgen05_cluster_m=2, tcgen05_cluster_n=2``) as the preferred cluster with
+# its pair (2, 1, 1) as the fallback (``cudaLaunchAttributePreferredClusterDimension``).
+# GB300 co-schedules 36 4-CTA clusters (144 of its 152 SMs); the GPU forms
+# pairs on the SMs left over.  The kernel holds one body per cluster shape and
+# both walk the preferred schedule: a pair runs the N lane (``block_idx.y``)
+# of the 2x2 slot it occupies, without the A multicast across the lanes::
+#
+#     @cute.kernel
+#     def _helion_mm(..., tma_atom_a, ..., tma_atom_a_fb, ...):
+#         if cute.experimental.is_preferred_cluster((2, 2, 1)):
+#             _helion_mm_body(..., tma_atom_a, ..., False)
+#         else:
+#             _helion_mm_body(..., tma_atom_a_fb, ..., True)
+#     ...launch(grid=..., cluster=[2, 2, 1], fallback_cluster=[2, 1, 1], smem_merge_branch_allocs=True)
+TCGEN05_FALLBACK_CLUSTER_CONFIG_KEY = "tcgen05_fallback_cluster"
+
+
+def tcgen05_fallback_cluster_shape(
+    config: Mapping[str, object],
+) -> tuple[int, int, int] | None:
+    """The fallback cluster of a ``tcgen05_fallback_cluster`` config: the
+    (2, 1, 1) pair of its 4-CTA cluster, else ``None``."""
+    if (
+        config.get(TCGEN05_FALLBACK_CLUSTER_CONFIG_KEY) is True
+        and config.get("tcgen05_cluster_m", 1) == 2
+        and config.get("tcgen05_cluster_n", 1) == 2
+        and tcgen05_cluster_split_k(config) == 1
+    ):
+        return (2, 1, 1)
+    return None
 
 
 TCGEN05_SPLIT_K_SEARCH_CHOICES: tuple[int, ...] = (1, 2, 4, 8, 16)

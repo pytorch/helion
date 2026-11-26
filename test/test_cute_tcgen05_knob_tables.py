@@ -45,7 +45,7 @@ from helion.exc import InvalidConfig
 # The public tcgen05 Config surface: the 71 keys that existed when the
 # diagnostic set was narrowed, minus the retired axes (the seven invalid-output
 # pipeline-edge modes and the clustered CtaGroup.ONE bridge flag), plus the
-# knobs added since (tcgen05_split_k_exchange).  The
+# knobs added since (tcgen05_split_k_exchange, tcgen05_fallback_cluster).  The
 # classification may move keys between tables; the surface only shrinks by an
 # explicit retirement, which ``test_retired_tcgen05_knobs_are_rejected`` pins.
 _FORMER_SURFACE = frozenset(
@@ -77,6 +77,7 @@ _FORMER_SURFACE = frozenset(
         "tcgen05_epi_warp_groups",
         "tcgen05_epilogue_fanout",
         "tcgen05_epilogue_layout",
+        "tcgen05_fallback_cluster",
         "tcgen05_flat_role_coordinates",
         "tcgen05_grouped_ab_tile_k",
         "tcgen05_grouped_balanced_workers",

@@ -15232,10 +15232,11 @@ class TestCuteBackend(TestCase):
             self.assertEqual(seed["tcgen05_cluster_m"], 2)
             self.assertEqual(seed["tcgen05_aux_load_placement"], "pre_acc_wait")
             self.assertEqual(seed["pid_type"], "persistent_interleaved")
-            self.assertEqual(
-                seed.get("tcgen05_persistent_grid_cap", "sm_pairs"),
-                "resident_clusters" if seed["block_sizes"][1] == 128 else "sm_pairs",
-            )
+            # Every 2x2 seed stays persistent over the co-resident clusters:
+            # the 256x128 seed's 64 clusters exceed what a B200 or GB300
+            # co-schedules (33 or 36), and the 256x256 seeds' 32 fit, so the
+            # cap launches their grids unchanged.
+            self.assertEqual(seed["tcgen05_persistent_grid_cap"], "resident_clusters")
 
     def test_matmul_mma_tcgen05_one_wave_seeds_and_projection(self) -> None:
         """GEMMs whose 256x256 grid idles most SMs seed one-wave tiles.

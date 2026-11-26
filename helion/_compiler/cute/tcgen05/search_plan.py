@@ -38,6 +38,8 @@ from ..dense_aligned_n import transposed_double_edge_without_pairs
 from ..tcgen05_config import facts
 from ..tcgen05_config import surface
 from ..tcgen05_constants import RAGGED_BATCHED_MIN_BLOCK_N
+from ..tcgen05_constants import TCGEN05_EPILOGUE_BOUND_MIN_WAVES
+from ..tcgen05_constants import TCGEN05_K_TAIL_PERSISTENT_MIN_N
 from ..tcgen05_constants import TCGEN05_MANY_SMALL_BATCHES
 from ..tcgen05_constants import TCGEN05_N_MAJOR_B_ONE_WAVE_MAX_K_BLOCKS
 from ..tcgen05_constants import TCGEN05_ONE_CTA_MAX_BLOCK_M
@@ -784,11 +786,6 @@ def tcgen05_transposes_misaligned_a_rows(
 # The longest K loop, in 64-wide K blocks, under which the epilogue bounds a
 # 16-bit 256x256 pair tile (``tcgen05_transposes_epilogue_bound_product``).
 TCGEN05_EPILOGUE_BOUND_MAX_K_BLOCKS = 8
-# The waves of 256x256 pair tiles from which a grid runs in the steady state
-# that rule was measured in (from 6.8 waves up), each tile's epilogue beside
-# the next tile's loads; ``tcgen05_copies_n_major_b`` asks as many waves of
-# its K-major pair tiles, which repay its copy of b (1.7 waves do not).
-TCGEN05_EPILOGUE_BOUND_MIN_WAVES = 6
 
 
 def tcgen05_transposes_epilogue_bound_product(
@@ -2218,14 +2215,37 @@ def enable_cute_tcgen05_search(
         # without it the search ran only flat tiles. helion.inductor's
         # transposed bf16 128x768x1000 with b stored [K, N] (768 x 128, K =
         # 7 x 128 + 104), GB300, of cuBLAS: flat [64, 16, 128] 0.900, the same
-        # tile persistent 0.935.
+        # tile persistent 0.935. The tiles are whole where N is a multiple of
+        # the search's widest N tile, or of a narrower power-of-two tile of at
+        # least 128 columns (``k_tail_persistent_n``), to which the persistent
+        # samples are narrowed (``repair._fix_cluster_m1_persistent_search_config``;
+        # a wider one would drop TMA and stop at the host guard of more than
+        # one partial tile), unless a registered N block size leaves that
+        # tile out (``hl.register_block_size(256, 256)``: the kernel keeps its
+        # 256 columns, which the narrowing would not change). bf16
+        # 16384x384x54 over its copy of a (helion.inductor's
+        # stage_matmul_operand: K = 32 + 22): three 128-wide tiles of N, one
+        # and a half 256-wide ones; flat tiles only, each CTA serializing its
+        # loads, MMA and epilogue, 9.1 us; the search's persistent 128x128
+        # pick 4.9 us (GB300, CUDA graphs over cold inputs; copy and product
+        # 0.63 -> 0.99 of stock Inductor's Triton template).
+        widest_whole_n = static_n & -static_n
+        k_tail_fragments = facts._matmul_block_fragments(spec.tcgen05)
+        narrow_whole_n = (
+            static_n % max_search_n != 0
+            and TCGEN05_K_TAIL_PERSISTENT_MIN_N <= widest_whole_n < max_search_n
+            and k_tail_fragments is not None
+            and k_tail_fragments[1].low <= widest_whole_n <= k_tail_fragments[1].high
+        )
         allow_k_tail_persistent_pid_types = (
             static_k % max_search_k != 0
             and static_m % min(max_search_m, TCGEN05_ONE_CTA_MAX_BLOCK_M) == 0
-            and static_n % max_search_n == 0
+            and (static_n % max_search_n == 0 or narrow_whole_n)
             and lhs.dtype in (torch.bfloat16, torch.float16)
             and not has_leading_passthrough
         )
+        if allow_k_tail_persistent_pid_types and narrow_whole_n:
+            spec._cute_tcgen05_config.k_tail_persistent_n = widest_whole_n
         allow_full_tile_cluster_m2_search = (
             allow_whole_k_persistent_pid_types
             and max_search_m >= TCGEN05_TWO_CTA_BLOCK_M

@@ -67,6 +67,7 @@ def dense_aligned_n_block_ms(
     n: int,
     output_column_major: bool,
     plain_epilogue: bool,
+    m_paired: bool = False,
 ) -> tuple[int, ...]:
     """Every pair M of the family, the default (``dense_aligned_n_block_m``)
     first. A plain 16-bit pair over a row-major output whose N one pair tile
@@ -90,17 +91,28 @@ def dense_aligned_n_block_ms(
     GB300, in one process, two A/B-load warps, of cuBLAS: K=1024 0.950 ->
     0.955, 2048 0.937 -> 0.957, 4096 0.946 -> 0.970 (the 16-column rounds
     0.896 at K=1024, 0.918 at 2048).
+
+    ``m_paired``: the kernel admits the M-paired tile (``block_m=512``, two
+    256-row subtiles of a CTA pair sharing each B stage:
+    ``tcgen05_config.repair._m_pair_block_m_is_valid``), which a plain
+    16-bit pair also runs at the family's widths: a narrower N tile can fill
+    the 512-row tiles' last wave where the 256-wide one leaves it short.
+    bf16 512x30528x32768 with a [K, N] row-major b (a vocabulary
+    projection's weight gradient), GB300, CUDA graphs over cold inputs, each
+    timed alone at the ~1.36 kW power cap, of cuBLAS: 120 M-paired tiles of
+    512x256 (1.58 waves on 76 pairs) 0.973-0.983, 137 of 512x224 (1.80 waves)
+    0.989-1.008 (four AB stages each).
     """
     block_m = dense_aligned_n_block_m(input_dtype)
     if block_m is None:
         return ()
-    if (
-        dense_aligned_n_sixteen_bit(input_dtype)
-        and plain_epilogue
-        and (output_column_major or n <= TCGEN05_TWO_CTA_BLOCK_N)
-    ):
-        return (block_m, TCGEN05_TWO_CTA_BLOCK_M // 2)
-    return (block_m,)
+    block_ms = [block_m]
+    sixteen_bit_plain = dense_aligned_n_sixteen_bit(input_dtype) and plain_epilogue
+    if sixteen_bit_plain and (output_column_major or n <= TCGEN05_TWO_CTA_BLOCK_N):
+        block_ms.append(TCGEN05_TWO_CTA_BLOCK_M // 2)
+    if sixteen_bit_plain and m_paired:
+        block_ms.append(2 * TCGEN05_TWO_CTA_BLOCK_M)
+    return tuple(block_ms)
 
 
 def dense_aligned_n_sixteen_bit(input_dtype: torch.dtype) -> bool:
@@ -600,11 +612,13 @@ def dense_aligned_n_plan(
     *,
     bounds: tuple[tuple[int, int], tuple[int, int], tuple[int, int]],
     sm_pairs: int,
+    m_paired: bool = False,
 ) -> DenseAlignedNPlan | None:
     """Reuse the strict ordinary native multiplicative-epilogue facts.
 
     DenseGemmFacts describes the native graph in the frontend's coordinates;
     this family leaves every auxiliary expression and coordinate view unchanged.
+    ``m_paired``: the kernel admits the M-paired tile (``dense_aligned_n_block_ms``).
     """
     width = config.get(TILE_N_KEY, 0)
     block_ms = (
@@ -615,6 +629,7 @@ def dense_aligned_n_plan(
             n=facts.shape[1],
             output_column_major=facts.output_column_major,
             plain_epilogue=facts.plain_epilogue,
+            m_paired=m_paired,
         )
     )
     if (
@@ -664,8 +679,11 @@ def dense_aligned_n_plan(
         #
         #     tcgen05_tma_next_full_tile = tile_offset_0 + cutlass.Int32(256) <= cutlass.Int32(2048) and tile_offset_1 < cutlass.Int32(4096) and (tile_offset_2 + cutlass.Int32(448) < cutlass.Int32(50264))
         #
-        # A partial last M tile keeps whole K tiles.
+        # A partial last M tile keeps whole K tiles; the M-paired tile takes
+        # whole 512-row tiles and both TMEM accumulator stages (one per
+        # subtile, ``cute_mma``'s M-paired envelope).
         or (m % bm and not (sixteen_bit and k % bk == 0))
+        or (block_m == 2 * TCGEN05_TWO_CTA_BLOCK_M and (m % bm or acc_stages != 2))
         or (n % width and not sixteen_bit)
         or k < bk
         or (k + bk - 1) // bk > tcgen05_two_cta_max_k_tiles(facts.input_dtype.itemsize)

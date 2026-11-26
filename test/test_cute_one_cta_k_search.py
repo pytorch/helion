@@ -387,11 +387,8 @@ def test_clc_twins_keep_high_anchor_and_default_geometry() -> None:
             _, canonical = generator.canonicalize_flat(generator.flatten(seed))
             assert canonical.block_sizes == seed.block_sizes
             cn = seed.config.get("tcgen05_cluster_n", 1)
-            # Existing full-tile CLC validation keeps only cluster_n=1;
-            # the multicast twin retains its static-persistent projection.
-            assert canonical.config["tcgen05_persistence_model"] == (
-                "clc_persistent" if cn == 1 else "static_persistent"
-            )
+            # The 4-CTA multicast twin keeps its CLC schedule too.
+            assert canonical.config["tcgen05_persistence_model"] == "clc_persistent"
             assert canonical.config.get("tcgen05_cluster_n", 1) == cn
     anchor = next(
         seed
