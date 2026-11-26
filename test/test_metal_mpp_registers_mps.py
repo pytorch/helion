@@ -7,7 +7,6 @@ from __future__ import annotations
 
 import re
 import sys
-from typing import TYPE_CHECKING
 from typing import cast
 import unittest
 from unittest import mock
@@ -15,6 +14,7 @@ from unittest import mock
 import pytest
 import torch
 
+import helion
 from helion._compiler.metal import coop_layout
 from helion._compiler.metal import mpp_registers
 from helion._testing import pairwise
@@ -27,20 +27,27 @@ from helion._testing.metal_fragment import affine_reference
 from helion._testing.metal_fragment import k_from_16
 from helion._testing.metal_fragment import nvfp4_rows
 from helion._testing.metal_fragment import seeded_rhs
+from helion._testing.metal_registers import affine_gated_mm
+from helion._testing.metal_registers import apart_mm
 from helion._testing.metal_registers import dequant_forms_mm
 from helion._testing.metal_registers import dequant_reference
+from helion._testing.metal_registers import early_a_mm
+from helion._testing.metal_registers import early_b_mm
 from helion._testing.metal_registers import filled_mm
+from helion._testing.metal_registers import gated_mm
 from helion._testing.metal_registers import inner_tiled_mm
 from helion._testing.metal_registers import inner_tiled_weight_mm
+from helion._testing.metal_registers import narrowed_gated_mm
 from helion._testing.metal_registers import offset_k_mm
 from helion._testing.metal_registers import register_config
+from helion._testing.metal_registers import rewriting_mm
+from helion._testing.metal_registers import scaled_gated_mm
+from helion._testing.metal_registers import seed_join_mm
 from helion._testing.metal_registers import shifted_x_mm
+from helion._testing.metal_registers import silu_gated_mm
 from helion._testing.metal_registers import staged_apart_mm
 from helion._testing.metal_registers import two_acc_mm
 from helion._testing.metal_registers import unread_x
-
-if TYPE_CHECKING:
-    import helion
 
 DEVICE = "mps"
 
@@ -412,6 +419,143 @@ class TestMppRegisters(unittest.TestCase):
         a, b = cast("tuple[torch.Tensor, torch.Tensor]", outs)
         self._close(a, x64 @ (y64 * 0.5))
         self._close(b, x64 @ (z64 * 0.25))
+
+    def test_partners(self) -> None:
+        """An epilogue over two accumulators of one op type, each read at the
+        first's slot (``mpp_matmul._classify_partner_uses``), against float64:
+        in a register run, split over 2 SIMD groups, as a grid run over 4 and
+        on the staged op."""
+        x = torch.randn(32, 256, device=DEVICE).to(torch.float16)
+        y = torch.randn(256, 64, device=DEVICE)
+        z = torch.randn(256, 64, device=DEVICE)
+        x64, y64, z64 = (t.cpu().double() for t in (x, y, z))
+        g = (x64 @ (y64 * 0.5).half().double()).half().double()
+        u = (x64 @ (z64 * 0.25).half().double()).half().double()
+        ref = g * torch.sigmoid(g) * u
+        for name, config in (
+            ("register", register_config([32, 32, 32])),
+            ("split", register_config([32, 32, 32], [1, 1, 32], num_warps=2)),
+            ("grid", register_config([32, 64, 64], [8, 16, 1])),
+            ("staged", helion.Config(block_sizes=[32, 32, 32], num_warps=4)),
+        ):
+            with self.subTest(name):
+                out, msl = _run(gated_mm, (x, y, z), config)
+                self.assertNotIn("_mpp_mat", msl)
+                self.assertIn("b[_ei]", msl)
+                self._close(out, ref, tol=4e-3)
+
+    def test_partners_one_layout(self) -> None:
+        """Partners whose own runs differ take one, against float64: a staged
+        vector on the first under a launch of 4 SIMD groups (both staged)
+        and on one SIMD group (both register runs); the affine split forced
+        on the first's float op (taken by neither).  Register runs of two
+        types aren't partners."""
+        x = torch.randn(32, 256, device=DEVICE).to(torch.float16)
+        y = torch.randn(256, 64, device=DEVICE)
+        z = torch.randn(256, 64, device=DEVICE)
+        v = torch.randn(4, 64, device=DEVICE)
+        x64, y64, z64, v64 = (t.cpu().double() for t in (x, y, z, v))
+        u = (x64 @ (z64 * 0.25).half().double()).half().double()
+        g = ((x64 @ (y64 * 0.5).half().double()) * v64.sum(0)).half().double()
+        ref = g * torch.sigmoid(g) * u
+        for name, config in (
+            ("grid", register_config([32, 64, 64], [8, 16, 1])),
+            ("register", register_config([32, 32, 32])),
+        ):
+            with self.subTest(name):
+                out, msl = _run(scaled_gated_mm, (x, y, z, v), config)
+                self.assertIn("b[_ei]", msl)
+                self._close(out, ref, tol=4e-3)
+        args = affine_args(4, 32, 16, 64, 512, DEVICE)
+        z = torch.randn(512, 64, device=DEVICE)
+        g = affine_reference(args).half().double()
+        u = (args[0].cpu().double() @ (z.cpu().double() * 0.25)).half().double()
+        ref = g * torch.sigmoid(g) * u
+        with mock.patch.object(
+            mpp_registers, "affine_split_enabled", return_value=True
+        ):
+            out, msl = _run(affine_gated_mm, (*args, z), register_config([16, 32, 32]))
+        self.assertNotIn("_mr_ones", msl)
+        self._close(out, ref, tol=4e-3)
+        # Register runs of two types aren't partners: both results are
+        # materialized, the K loop split over two SIMD groups.
+        x = torch.randn(32, 256, device=DEVICE).to(torch.float16)
+        y = torch.randn(256, 32, device=DEVICE)
+        z = torch.randn(256, 32, device=DEVICE)
+        x64, y64, z64 = (t.cpu().double() for t in (x, y, z))
+        g = (x64 @ (y64 * 0.5).half().double()).half().double()
+        u = (x64 @ (z64 * 0.25)).half().double()
+        config = register_config([32, 32, 32], [1, 1, 32], num_warps=2)
+        out, msl = _run(narrowed_gated_mm, (x, y, z), config)
+        self.assertNotIn("[_ei]", msl)
+        self._close(out, g * torch.sigmoid(g) * u, tol=4e-3)
+        # Ops of one key that no op reads together: the first's affine split
+        # beside the second's float op.
+        quant = affine_args(4, 32, 32, 64, 256, DEVICE)
+        z = torch.randn(256, 64, device=DEVICE)
+        v = torch.randn(4, 64, device=DEVICE)
+        config = register_config([32, 32, 32])
+        with mock.patch.object(
+            mpp_registers, "affine_split_enabled", return_value=True
+        ):
+            outs, _, msl = run_with_msl(
+                apart_mm, (*quant, z, v), config, module_key=f"apart {config!r}"
+            )
+        out_a, out_b = cast("tuple[torch.Tensor, torch.Tensor]", outs)
+        self.assertIn("_mr_ones", msl)
+        self.assertNotIn("[_ei]", msl)
+        s64 = v.cpu().double().sum(0)
+        self._close(out_a, (affine_reference(quant) * s64).half().double())
+        u = quant[0].cpu().double() @ (z.cpu().double() * 0.25)
+        self._close(out_b, u.half().double())
+
+    def test_partners_seed_and_casts(self) -> None:
+        """Against float64: a b + b0 and a b + (b0 + 1) beside b's seed of 1
+        (a and b materialized), and silu(g) u in float, g read at u's slot
+        inside silu's casts, on one SIMD group and over 4."""
+        x = torch.randn(32, 64, device=DEVICE).to(torch.float16)
+        y = torch.randn(64, 32, device=DEVICE)
+        z = torch.randn(64, 32, device=DEVICE)
+        x64 = x.cpu().double()
+        g = x64 @ (y.cpu().double() * 0.5).half().double()
+        u = x64 @ (z.cpu().double() * 0.25).half().double()
+        for config in (
+            register_config([32, 32, 32]),
+            helion.Config(block_sizes=[32, 32, 32], num_warps=4),
+        ):
+            with self.subTest(config=config):
+                outs, _, _ = run_with_msl(
+                    seed_join_mm, (x, y, z), config, module_key=f"seed {config!r}"
+                )
+                out1, out2 = cast("tuple[torch.Tensor, torch.Tensor]", outs)
+                self._close(out1, g * (u + 1) + 1)
+                self._close(out2, g * (u + 1) + 2)
+                out, msl = _run(silu_gated_mm, (x, y, z), config)
+                self.assertIn("decltype(+g[_ei])", msl)
+                self._close(out, g * torch.sigmoid(g) * u)
+
+    def test_partners_kept_apart(self) -> None:
+        """Ops of one type kept apart, against float64: a value read from
+        either accumulator's carry before its op writes it, and an epilogue
+        reading a tensor the kernel then zeroes."""
+        x = torch.randn(32, 64, device=DEVICE).to(torch.float16)
+        y = torch.randn(64, 32, device=DEVICE)
+        z = torch.randn(64, 32, device=DEVICE)
+        x64 = x.cpu().double()
+        wy = (y.cpu().double() * 0.5).half().double()
+        wz = (z.cpu().double() * 0.25).half().double()
+        a, b = x64 @ wy, x64 @ wz
+        a0, b0 = x64[:, :32] @ wy[:32], x64[:, :32] @ wz[:32]
+        config = helion.Config(block_sizes=[32, 32, 32], num_warps=4)
+        for kernel, ref in ((early_a_mm, 2 * a0 + b), (early_b_mm, a + 2 * b0)):
+            with self.subTest(kernel.name):
+                out, _ = _run(kernel, (x, y, z), config)
+                self._close(out, ref)
+        t = torch.randn(32, 32, device=DEVICE)
+        t64 = t.cpu().double()
+        out, _ = _run(rewriting_mm, (x, y, z, t), config)
+        self._close(out, a + b * t64)
+        self.assertEqual(int(t.count_nonzero()), 0)
 
     def test_one_decision(self) -> None:
         """A register run where the launch's thread axes codegen sees differ

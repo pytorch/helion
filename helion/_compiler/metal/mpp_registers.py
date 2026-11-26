@@ -409,7 +409,9 @@ def _half_pays() -> bool:
     return _on_gpu() and fast_half_inputs()
 
 
-def register_run_spec(cg: GenerateAST, group: MppGroup) -> RegisterRun | None:
+def register_run_spec(
+    cg: GenerateAST, group: MppGroup, affine: bool = True
+) -> RegisterRun | None:
     """How the group's op takes its operands in registers, or None for the
     MPP lowering's views and staged tiles: when the launch is one SIMD
     group, an operand is a device view or a computed operand the lanes can
@@ -428,7 +430,8 @@ def register_run_spec(cg: GenerateAST, group: MppGroup) -> RegisterRun | None:
     the two tie: 8-row ops reading x as a view ran 12-15% faster than
     16-row ops with x in registers on the o, gate_up and lm_head
     projections and 8-20% slower on q/og and down, whose long K loops read
-    a word of packed codes per element of a row in K order."""
+    a word of packed codes per element of a row in K order.  ``affine``
+    False keeps the op off the affine split."""
     plan = current_plan()
     threads = math.prod(cg.launch_thread_axis_sizes().values())
     if threads != SIMD_WIDTH:
@@ -454,13 +457,12 @@ def register_run_spec(cg: GenerateAST, group: MppGroup) -> RegisterRun | None:
         assert plan.split == 1, group.gid
         return None
     atom, sides = chosen
-    affine = None
-    if _affine_candidate(atom, sides) and affine_split_enabled():
+    parts = None
+    if affine and _affine_candidate(atom, sides) and affine_split_enabled():
         parts = _affine_parts(cg, group)
         if parts is not None:
-            affine = parts
             atom = dataclasses.replace(atom, right="half")
-    return RegisterRun(atom, sides, tile[2] // atom.k, sides == ("reg", "reg"), affine)
+    return RegisterRun(atom, sides, tile[2] // atom.k, sides == ("reg", "reg"), parts)
 
 
 def whole_k_tiles(group: MppGroup, k: int) -> bool:
@@ -778,7 +780,8 @@ def register_split(
         return 1
     env = CompileEnvironment.current()
     # The combine's threadgroup memory per K loop, which loops after one
-    # another reuse (``split_slots``): each loop's accumulators' elements.
+    # another reuse (``split_slots``): each loop's largest accumulator's
+    # elements, which the combine adds one accumulator at a time.
     elements: dict[object, int] = {}
     for group in plan.by_matmul.values():
         tile = [
@@ -807,7 +810,7 @@ def register_split(
         slots = max(_dest_slots(atom, _on_gpu()) for atom in atoms)
         # split_refusal refused groups outside a loop.
         loop = group.levels[0].owner
-        elements[loop] = elements.get(loop, 0) + slots * SIMD_WIDTH
+        elements[loop] = max(elements.get(loop, 0), slots * SIMD_WIDTH)
     most = max(elements.values())
     if (split - 1) * most * MSL_SCALAR_BYTES["float"] > MAX_THREADGROUP_MEMORY_BYTES:
         return 1
@@ -855,6 +858,20 @@ def check_register_operands(group: MppGroup, plan: MppPlan, graphs: Graphs) -> N
         if any(storage_key(ld) in plan.written for ld in loads):
             continue
         operand.registers = True
+
+
+def register_operand_key(
+    group: MppGroup, side: int, graphs: Graphs
+) -> tuple[object, ...]:
+    """What decides how a register run takes a computed operand beside its
+    dtype (``mpp_matmul._operand_key``): the type its cooperative tensor
+    holds (:func:`_coop_type`) and whether the lanes can recompute it
+    (:func:`check_register_operands`)."""
+    node = matmul_operands(group.matmul)[1 + side]
+    assert node is not None
+    block = (group.m_block, group.n_block)[side]
+    recomputable = OperandRecomputable(group, graphs, {block, group.k_block})
+    return (_coop_type(group, side), recomputable(node))
 
 
 # Codegen.
@@ -1809,8 +1826,12 @@ def emit_register_combine(
     """After a K loop the SIMD groups split, add their accumulators (those
     the loop's register ``runs`` update) into the first's
     (``operand_elements.emit_split_adds``), as fragment runs' are: a lane's
-    elements of each destination tensor, each then reset to 0."""
-    held: list[str] = []
+    elements of each destination tensor, each then reset to 0.  One
+    accumulator at a time, through one accumulator's slots: all of them at
+    once took twice the threadgroup memory for two (24 KB for a fused gate/up
+    and SwiGLU's two 32 x 32 tiles over 4 SIMD groups), which limits the
+    threadgroups a core runs."""
+    accs: list[list[str]] = []
     for run in runs:
         assert isinstance(run.iter, ast.Call)
         acc = run.iter.args[0]
@@ -1819,17 +1840,25 @@ def emit_register_combine(
         atom = state.register_atoms[root]
         count = len(operand_lanes(state, atom, "dest").rows)
         elements = [f"{root}[{e}]" for e in range(count)]
-        if elements[0] not in held:
-            held += elements
-    count = len(held)
-    state.split_slots = max(state.split_slots, (state.split - 1) * count * SIMD_WIDTH)
+        if elements not in accs:
+            accs.append(elements)
+    most = max(map(len, accs))
+    state.split_slots = max(state.split_slots, (state.split - 1) * most * SIMD_WIDTH)
+    for elements in accs:
 
-    def slot(simdgroup: str, e: int) -> str:
-        return f"{SPLIT_BUFFER}[({simdgroup} * {count} + {e}) * {SIMD_WIDTH} + {LANE}]"
+        def slot(simdgroup: str, e: int, count: int = len(elements)) -> str:
+            return (
+                f"{SPLIT_BUFFER}[({simdgroup} * {count} + {e}) * {SIMD_WIDTH} + {LANE}]"
+            )
 
-    emit_split_adds(
-        held, [f"{element} = 0.0f;" for element in held], slot, state.split, parts, pad
-    )
+        emit_split_adds(
+            elements,
+            [f"{element} = 0.0f;" for element in elements],
+            slot,
+            state.split,
+            parts,
+            pad,
+        )
 
 
 class RegisterLowering:
@@ -1842,6 +1871,7 @@ class RegisterLowering:
     doesn't import it."""
 
     check_group = staticmethod(check_register_operands)
+    operand_key = staticmethod(register_operand_key)
     spec = staticmethod(register_run_spec)
     acc_keywords = staticmethod(register_acc_keywords)
     codegen_run = staticmethod(codegen_register_run)

@@ -724,8 +724,9 @@ class MetalBackend(Backend):
         # it returns: lend it for the trial only, so a lowering that fails
         # later leaves the HostFunction without a half-built IR.
         with HostFunction.current().lent_device_ir(device_ir):
+            mpp_graphs = [i.copy() for i in device_ir.graphs]
             try:
-                mpp = plan_mpp_matmuls([i.copy() for i in device_ir.graphs], set())
+                mpp = plan_mpp_matmuls(mpp_graphs, set())
             except exc.BackendUnsupported:
                 mpp = None
             fragment_graphs = [i.copy() for i in device_ir.graphs]
@@ -734,6 +735,14 @@ class MetalBackend(Backend):
             except exc.BackendUnsupported:
                 plan = None
             splits = plan is not None and split_refusal(plan, fragment_graphs) is None
+            # Register runs exist under an MPP config only, whose plan decides
+            # whether their K loops split (``mpp_registers.register_split``),
+            # even where the fragment lowering refuses the kernel.
+            register_splits = (
+                mpp is not None
+                and bool(mpp.by_matmul)
+                and split_refusal(mpp, mpp_graphs) is None
+            )
             free = free_arange_blocks()
         # The MPP matmuls that stage an operand per K tile, which the staged
         # matmul heuristic seeds tall tiles for.
@@ -790,6 +799,10 @@ class MetalBackend(Backend):
                         blocks_reduced_after_loop(device_ir) & tunable
                     ),
                 )
+        launch_facts = dataclasses.replace(
+            launch_facts,
+            register_splits=register_splits and bool(launch_facts.thread_loops),
+        )
         config_spec.backend_facts = launch_facts
         if plan is None:
             return
@@ -813,7 +826,6 @@ class MetalBackend(Backend):
                 fragment_matmuls=True,
                 table_sizes=frozenset(table_sizes(inputs)),
                 fragment_splits=splits,
-                register_splits=splits and bool(launch_facts.thread_loops),
                 fragment_blocks=tuple(
                     (g.m_block, g.n_block, g.k_block)
                     for g in plan.by_matmul.values()

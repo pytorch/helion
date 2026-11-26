@@ -130,6 +130,7 @@ from .reduction import alloc_threadgroup_buffer
 
 if TYPE_CHECKING:
     from collections.abc import Callable
+    from collections.abc import Collection
     from collections.abc import Iterator
     from collections.abc import Mapping
     from collections.abc import Sequence
@@ -447,6 +448,9 @@ class MppGroup:
     #: The K loop's carry and its copies, which an element loop may read
     #: before the update or the op writes them (:func:`_before_write`).
     early: set[Node] = dataclasses.field(default_factory=set)
+    #: The carry's aliases and the derived values that read them: only uses
+    #: before the op's write read them (:func:`_classify_uses`).
+    carry_reads: set[Node] = dataclasses.field(default_factory=set)
     #: Values staged as other groups' operands from this group's element
     #: loop, each to those matmuls (:func:`_link_element_staging`).
     stage_uses: dict[Node, set[Node]] = dataclasses.field(default_factory=dict)
@@ -456,6 +460,12 @@ class MppGroup:
     #: A fold's product group, whose op's layout it takes and whose result
     #: its update reads at each element.
     product: MppGroup | None = None
+    #: The groups of this group's layout class that element-wise ops read
+    #: together with it (:func:`_classify_partner_uses`), whose results the
+    #: first one's element loops read at their own index.
+    partners: list[MppGroup] = dataclasses.field(
+        default_factory=list, repr=False, compare=False
+    )
 
     @property
     def acc_dtype(self) -> torch.dtype:
@@ -1217,8 +1227,11 @@ def _plan_matmuls(
             assert fold.seed is not None
             plan.by_seed[fold.seed] = fold
     if plan.by_matmul:
+        if fragment is None:
+            _classify_partner_uses(plan, known)
         _link_element_staging(plan)
         _order_memory(plan, live, known)
+        _prune_partners(plan)
         _unlink_dropped(plan)
         for group in plan.groups():
             _stage_epilogue_vecs(group, plan, known)
@@ -2639,12 +2652,7 @@ def _classify_uses(group: MppGroup, graphs: Graphs) -> None:
             if early and user not in before_write:
                 continue
             if user.target is store:
-                if (
-                    user.args[2] is node
-                    and all(map(recomputable, _seq(user.args[1])))
-                    and recomputable(user.args[3])
-                    and user not in group.stores
-                ):
+                if _admits_store(user, node, recomputable, group.stores):
                     group.stores.append(user)
                 continue
             if _pointwise(user) and _inputs_kept(
@@ -2654,6 +2662,21 @@ def _classify_uses(group: MppGroup, graphs: Graphs) -> None:
                 work.append(user)
                 if early:
                     reads_carry.add(user)
+    group.carry_reads = reads_carry
+
+
+def _admits_store(
+    st: Node, value: Node, recomputable: Recomputable, taken: Collection[Node]
+) -> bool:
+    """Whether an element loop over ``value`` can take the store ``st``: it
+    stores ``value`` itself at an index and a mask recomputable at any
+    element, and no element loop took it (``taken``)."""
+    return (
+        st.args[2] is value
+        and all(map(recomputable, _seq(st.args[1])))
+        and recomputable(st.args[3])
+        and st not in taken
+    )
 
 
 def _carry_aliases(group: MppGroup) -> set[Node]:
@@ -2713,7 +2736,13 @@ def _prune_derived(group: MppGroup) -> None:
     while True:
         coop = group.cur | group.derived | group.early
         stores = [s for s in group.stores if s.args[2] in coop]
+        # A partner's derived value may read this group's at its own index
+        # (:func:`_classify_partner_uses`), and this group's its partners'.
         keep = set(stores) | group.derived
+        shared: set[Node] = set()
+        for partner in group.partners:
+            keep |= partner.derived
+            shared |= partner.cur | partner.derived
         drop = {
             d
             for d in group.derived
@@ -2723,12 +2752,222 @@ def _prune_derived(group: MppGroup) -> None:
                 and u not in group.stage_uses.get(d, ())
                 for u in d.users
             )
-            or not _inputs_kept(d, coop, group)
+            or not _inputs_kept(d, coop | shared, group)
         }
         if not drop and len(stores) == len(group.stores):
             return
         group.derived -= drop
         group.stores = stores
+
+
+def _layout_key(
+    group: MppGroup, plan: MppPlan, graphs: Graphs
+) -> tuple[object, ...] | None:
+    """What decides a group's op type and where it runs: the op's blocks,
+    each operand's (:func:`_operand_key`) and the loop it runs in.  None for
+    a group whose layout another op's is never matched with: a fold or its
+    product (which share theirs, :func:`_plan_fold`), a batched op, a K held
+    as per-thread parts, or an operand without a key."""
+    from ..device_ir import ForLoopGraphInfo
+
+    if (
+        group.fold is not None
+        or group.product is not None
+        or group.batch_block is not None
+        or group.k_factor != 1
+    ):
+        return None
+    loop = _enclosing_loop(group.matmul.graph, graphs)
+    info = None
+    if loop is not None and _tracing_ops.is_for_loop_target(loop.target):
+        info = graphs.info(loop.args[0])
+        assert isinstance(info, ForLoopGraphInfo)
+    keys = []
+    for side in (0, 1):
+        key = _operand_key(group, side, plan, graphs, info)
+        if key is None:
+            return None
+        keys.append(key)
+    owner = group.levels[0].owner if group.levels else group.matmul.graph
+    return (group.m_block, group.n_block, group.k_block, *keys, owner)
+
+
+def _operand_key(
+    group: MppGroup,
+    side: int,
+    plan: MppPlan,
+    graphs: Graphs,
+    loop: ForLoopGraphInfo | None,
+) -> tuple[object, ...] | None:
+    """What decides how the group's op takes an operand, whichever way
+    codegen takes it: a view's dtype, dims and strides (the descriptor's
+    transposes); a computed operand's dtype and widened view, and under
+    register runs what decides theirs (``RegisterLowering.operand_key``).
+    None where a decision the planner makes later could set two operands of
+    one key apart: an operand reading a tensor the kernel writes, which
+    ``_order_memory`` stages and ``check_register_operands`` keeps from
+    registers, or a computed operand that its for loop doesn't recompute
+    from a load in the loop every iteration (:func:`_reloaded`), which
+    ``_hoist_invariant`` and ``_stage_in_float`` stage apart."""
+    operand = (group.lhs, group.rhs)[side]
+    node = matmul_operands(group.matmul)[1 + side]
+    assert node is not None
+    loads: list[Node] = []
+    work, seen = [node], {node}
+    while work:
+        n = graphs.origin(work.pop())
+        if n.target is load:
+            loads.append(n)
+            continue
+        for i in n.all_input_nodes:
+            if i not in seen:
+                seen.add(i)
+                work.append(i)
+    if any(storage_key(ld) in plan.written for ld in loads):
+        return None
+    if operand.view is not None:
+        view = operand.view
+        return (operand.dtype, view.positions, view.strides, operand.few_rows)
+    if (
+        loop is None
+        or not any(graphs.within(ld.graph, loop.graph) for ld in loads)
+        or not _reloaded(node, loop, graphs)
+    ):
+        return None
+    widened = operand.widened
+    key: tuple[object, ...] = (
+        operand.dtype,
+        None
+        if widened is None
+        else (widened.tensor.dtype, widened.positions, widened.strides),
+        operand.few_rows,
+    )
+    if plan.registers is not None:
+        key += plan.registers.operand_key(group, side, graphs)
+    return key
+
+
+def _classify_partner_uses(plan: MppPlan, graphs: Graphs) -> None:
+    """Let an element-wise op read the results of several groups of one layout
+    key (:func:`_layout_key`): ops of one descriptor, scope and element types
+    in one loop, whose destination tensors hold the same element at each
+    index, as a fold's and its product's do (:func:`_plan_fold`).  An element
+    loop over one of them reads the others at its own index (``elementize``,
+    which checks that the ops it emits match).  So the op, and every
+    element-wise op that reads it, joins the derived values of the group of
+    the smallest gid among the groups such ops read together, and their
+    stores its stores: ``silu(gate) * up`` over the gate and up projections
+    of one input needs no materialization of either.  Those groups are
+    partners, which codegen keeps on one run (``_class_spec``); a group of
+    the class that no such op reads keeps its own (:func:`_classify_uses`)."""
+    classes: dict[tuple[object, ...], list[MppGroup]] = {}
+    for group in plan.groups():
+        key = _layout_key(group, plan, graphs)
+        if key is not None:
+            classes.setdefault(key, []).append(group)
+    for members in classes.values():
+        if len(members) < 2:
+            continue
+        first = min(members, key=lambda g: g.gid)
+        recomputable = first.recomputable
+        # A value a member's op updates in place, such as its seed, reaches
+        # the owner's element loop, after every op, only through a snapshot,
+        # as do the values recomputed from it.
+        olds: set[Node] = set().union(*(g.old for g in members))
+        #: Each cooperative value to the groups whose results it is computed
+        #: from.
+        source: dict[Node, frozenset[int]] = {
+            n: frozenset([g.gid])
+            for g in members
+            for n in g.cur | g.derived
+            # The owner's element loop runs after every op's write.
+            if n not in g.carry_reads
+        }
+        stored = {st for g in members for st in g.stores}
+        joined: list[Node] = []
+        #: Each joined store and the value it stores.
+        stores: list[tuple[Node, Node]] = []
+        work = list(source)
+        while work:
+            node = work.pop()
+            for user in node.users:
+                if user in source or user.target is torch.ops.aten.sym_size.int:
+                    continue
+                if user.target is store:
+                    if len(source[node]) > 1 and _admits_store(
+                        user, node, recomputable, stored
+                    ):
+                        stores.append((user, node))
+                        stored.add(user)
+                    continue
+                if not _pointwise(user) or not all(
+                    a in source
+                    or (recomputable(a) and olds.isdisjoint(recomputable.nodes(a)))
+                    or (a not in olds and _vec_input(first, a))
+                    for a in user.all_input_nodes
+                ):
+                    continue
+                gids = frozenset().union(
+                    *(source[a] for a in user.all_input_nodes if a in source)
+                )
+                if len(gids) > 1:
+                    joined.append(user)
+                    source[user] = gids
+                    work.append(user)
+        # Each set of groups that ops read together: its ops join its first
+        # group.
+        for groups in _linked(members, [source[node] for node in joined]):
+            if len(groups) < 2:
+                continue
+            gids = {g.gid for g in groups}
+            owner = min(groups, key=lambda g: g.gid)
+            for group in groups:
+                group.partners = [g for g in groups if g is not group]
+            owner.derived |= {n for n in joined if source[n] <= gids}
+            owner.stores += [st for st, value in stores if source[value] <= gids]
+
+
+def _linked(
+    groups: list[MppGroup], reads: list[frozenset[int]]
+) -> list[list[MppGroup]]:
+    """``groups`` in the sets that ``reads`` link, each read the gids of the
+    groups one op reads together."""
+    link = {g.gid: g.gid for g in groups}
+
+    def root(gid: int) -> int:
+        while link[gid] != gid:
+            gid = link[gid]
+        return gid
+
+    for gids in reads:
+        first, *rest = sorted(gids)
+        for gid in rest:
+            link[root(gid)] = root(first)
+    linked: dict[int, list[MppGroup]] = {}
+    for group in groups:
+        linked.setdefault(root(group.gid), []).append(group)
+    return list(linked.values())
+
+
+def _prune_partners(plan: MppPlan) -> None:
+    """Prune every partner group again until none changes: a value one group
+    drops can be one another group's derived value reads
+    (:func:`_prune_derived`).  Partners whose first group keeps no value
+    read from another's result then part, each keeping its own run."""
+    groups = [g for g in plan.groups() if g.partners]
+    while True:
+        before = [(len(g.derived), len(g.stores)) for g in groups]
+        for group in groups:
+            _prune_derived(group)
+        if before == [(len(g.derived), len(g.stores)) for g in groups]:
+            break
+    for owner in groups:
+        if not owner.partners or owner.gid > min(p.gid for p in owner.partners):
+            continue
+        others = {n for p in owner.partners for n in p.cur | p.derived}
+        if not any(a in others for d in owner.derived for a in d.all_input_nodes):
+            for group in [owner, *owner.partners]:
+                group.partners = []
 
 
 def storage_key(node: Node) -> StorageWeakRef:
@@ -2766,6 +3005,17 @@ def _order_memory(plan: MppPlan, live: list[GraphInfo], graphs: Graphs) -> None:
             for n in recomputable.nodes(a)
             if n.target is load
         ]
+        if group.partners and group.gid < min(p.gid for p in group.partners):
+            # The owner's element loop reruns the partners' derived values
+            # its own read (:func:`_classify_partner_uses`), and their loads.
+            derived_loads += [
+                n
+                for partner in group.partners
+                for d in partner.derived
+                for a in d.all_input_nodes
+                for n in partner.recomputable.nodes(a)
+                if n.target is load
+            ]
         kept: list[Node] = []
         for st in group.stores:
             reloads = derived_loads + [
@@ -2858,6 +3108,10 @@ def _finalize(group: MppGroup, plan: MppPlan, graphs: Graphs) -> None:
     keep = coop | set(group.stores) | set(group.update)
     if group.fold is not None:
         keep |= set(group.fold.update)
+    # A partner's element loop reads this group's result at its own index
+    # (:func:`_classify_partner_uses`), after the op: a value the op updates
+    # in place, such as its seed, reaches it through a snapshot.
+    joined: set[Node] = set().union(*(p.derived for p in group.partners))
     recomputable = group.recomputable
     readers: list[tuple[Node, Node]] = []
     for node in sorted(group.old | group.cur, key=lambda n: n.name):
@@ -2865,6 +3119,7 @@ def _finalize(group: MppGroup, plan: MppPlan, graphs: Graphs) -> None:
             if (
                 (node, user) in group.plumbing
                 or user in keep
+                or (node in group.cur and user in joined)
                 or user in group.stage_uses.get(node, ())
                 or user.target is torch.ops.aten.sym_size.int
                 or (user.op == "output" and not _live_exit(node, user, graphs))
@@ -3266,7 +3521,7 @@ def _acc_expr(
     transposed)`` (``FragmentLowering.acc_keywords``)."""
     lowering = current_plan().fragment
     registers = current_plan().registers
-    spec = None if registers is None else registers.spec(cg, group)
+    spec = None if registers is None else _class_spec(cg, group, registers)
     current_plan().register_specs[group.gid] = spec
     tile = static_tile(cg, (group.m_block, group.n_block, group.k_block))
     tile[2] *= group.k_factor
@@ -3333,6 +3588,37 @@ def _acc_expr(
     )
 
 
+def _class_spec(
+    cg: GenerateAST, group: MppGroup, registers: RegisterLowering
+) -> RegisterRun | None:
+    """The group's register run (``mpp_registers``), or None for the staged
+    op, decided with its layout class's (:func:`_classify_partner_uses`):
+    their element loops read each other's tensors at one index, so their
+    ops take one destination layout, which the op and the SIMD groups over
+    the tile give (``RegisterLowering.acc_keywords``).  The class's key
+    (:func:`_layout_key`) gives its members one op on one SIMD group but for
+    the affine split, which reads an operand's form, and a launch of several
+    SIMD groups takes grid runs for all of them or none
+    (``mpp_registers._grid_run``).  Where their own runs differ, every member
+    takes the run without the affine split; the staged op where even those
+    differ is a safeguard, on a launch of several SIMD groups, which never
+    splits the K loop."""
+    spec = registers.spec(cg, group)
+    if not group.partners:
+        return spec
+
+    def layouts(specs: list[RegisterRun | None]) -> int:
+        return len({None if s is None else registers.acc_keywords(s) for s in specs})
+
+    if layouts([spec, *(registers.spec(cg, p) for p in group.partners)]) == 1:
+        return spec
+    plain = [registers.spec(cg, g, affine=False) for g in (group, *group.partners)]
+    if layouts(plain) == 1:
+        return plain[0]
+    assert current_plan().split == 1, group.gid
+    return None
+
+
 def op_dims(group: MppGroup, block_m: int, block_n: int) -> tuple[int, int]:
     """The op's M and N: each block, cut to its loop's static extent rounded
     up to 8 when one tile covers the loop.
@@ -3351,11 +3637,16 @@ def op_dims(group: MppGroup, block_m: int, block_n: int) -> tuple[int, int]:
     unchanged blocks are left to the caller's check.  A fragment group's op
     is a grid of 8x8 fragments, which needs no such multiple.  A per-tile
     product and its fold are one op, whose layout both tensors share
-    (:func:`_plan_fold`), so a materialization of either keeps both blocks.
+    (:func:`_plan_fold`), so a materialization of either keeps both blocks;
+    so does one of a partner's (:func:`_classify_partner_uses`).
     """
     env = CompileEnvironment.current()
     product = group.product or group
-    mats = product.mats or (product.fold is not None and product.fold.mats)
+    mats = (
+        product.mats
+        or (product.fold is not None and product.fold.mats)
+        or any(partner.mats for partner in group.partners)
+    )
     dims = []
     for block, size in ((group.m_block, block_m), (group.n_block, block_n)):
         extent = env.block_sizes[block].size
@@ -4506,6 +4797,34 @@ def elementize(
                 for i, (a, b) in enumerate(zip(call.args, other.args, strict=True))
                 if i not in (ACC_FILL, ACC_SEED)
             ), (ast.unparse(call), ast.unparse(other))
+    # Each group's tensor to those of its layout class, itself included: the
+    # same op type, so the same element at each index
+    # (``_classify_partner_uses``).  Only the gid, the fill and the seed may
+    # differ.
+    classes: dict[str, frozenset[str]] = {}
+    keyed: dict[str, list[str]] = {}
+    for root, call in groups.items():
+        if root in folds or root in folds.values():
+            continue
+        key = ast.dump(
+            ast.Call(
+                call.func,
+                [
+                    a
+                    for i, a in enumerate(call.args)
+                    if i not in (0, ACC_FILL, ACC_SEED)
+                ],
+                call.keywords,
+            )
+        )
+        keyed.setdefault(key, []).append(root)
+    for roots in keyed.values():
+        for root in roots:
+            classes[root] = frozenset(roots)
+
+    def gid_of(root: str) -> int:
+        return ast.literal_eval(groups[root].args[0])
+
     # A staged vector's tile is written before the element loop that reads
     # it (an update's or a store's) and read only inside it, with a barrier
     # on each side, so its reads exchange nothing at the loop and are re-run
@@ -4601,9 +4920,15 @@ def elementize(
             # A fold's update reads its product's elements at its own.
             roots -= {folds[r] for r in roots if r in folds}
             if len(roots) > 1:
-                raise metal_unsupported(
-                    "an element-wise op on two cooperative MPP results"
+                # Partners' results, whose ops codegen keeps of one type
+                # (``_class_spec``): the element loop runs over the first and
+                # reads the others at its own index.
+                first = min(roots, key=gid_of)
+                assert roots <= classes.get(first, frozenset()), (
+                    "partners' ops of different types",
+                    roots,
                 )
+                roots = {first}
             if t is not None and roots:
                 (derived[t],) = roots
                 seen.append(s)
@@ -4701,7 +5026,24 @@ def elementize(
             # Barriers on each side: after the vector's staging writes, and
             # before the next writes to its tile.
             iter_args.append(ast.Constant(True))
-        keywords = [ast.keyword("unroll", ast.Constant(True))] if unroll else []
+        partners = sorted(
+            {alias[n] for x in loop_body for n in names_read(x) if n in alias}
+            - {root}
+            - set(folds.values())
+        )
+        assert set(partners) <= classes.get(root, frozenset()), (root, partners)
+        keywords = (
+            [ast.keyword("unroll", ast.Constant(True))] if unroll or partners else []
+        )
+        if partners:
+            # The partners are read at the loop's slot index, which only an
+            # unrolled loop has.
+            keywords.append(
+                ast.keyword(
+                    "partners",
+                    ast.Tuple([ast.Constant(r) for r in partners], ast.Load()),
+                )
+            )
         return ast.For(
             target=ast.Name("_it", ast.Store()),
             iter=ast.Call(ast.Name(ELEMENTS, ast.Load()), iter_args, keywords),

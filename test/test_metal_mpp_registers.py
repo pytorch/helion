@@ -31,21 +31,33 @@ from helion._testing.metal_fragment import k_from_16
 from helion._testing.metal_fragment import nvfp4_cpu_args
 from helion._testing.metal_fragment import nvfp4_rows
 from helion._testing.metal_fragment import seeded_rhs
+from helion._testing.metal_registers import affine_gated_mm
+from helion._testing.metal_registers import apart_mm
 from helion._testing.metal_registers import bounded_k_mm
 from helion._testing.metal_registers import copying_mm
 from helion._testing.metal_registers import counted_mm
 from helion._testing.metal_registers import dequant_forms_mm
+from helion._testing.metal_registers import early_a_mm
+from helion._testing.metal_registers import early_b_mm
 from helion._testing.metal_registers import filled_mm
 from helion._testing.metal_registers import free_cols_mm
+from helion._testing.metal_registers import gated_mm
 from helion._testing.metal_registers import inner_tiled_mm
 from helion._testing.metal_registers import inner_tiled_weight_mm
 from helion._testing.metal_registers import long_k_mm
+from helion._testing.metal_registers import mixed_gated_mm
 from helion._testing.metal_registers import mm_and_double
+from helion._testing.metal_registers import narrowed_gated_mm
 from helion._testing.metal_registers import offset_k_mm
 from helion._testing.metal_registers import register_config
+from helion._testing.metal_registers import rewriting_mm
 from helion._testing.metal_registers import row_scaled_mm
 from helion._testing.metal_registers import rowsum_mm
+from helion._testing.metal_registers import scaled_gated_mm
+from helion._testing.metal_registers import seed_join_mm
+from helion._testing.metal_registers import seed_read_mm
 from helion._testing.metal_registers import shifted_x_mm
+from helion._testing.metal_registers import silu_gated_mm
 from helion._testing.metal_registers import staged_apart_mm
 from helion._testing.metal_registers import transposed_out_mm
 from helion._testing.metal_registers import two_acc_mm
@@ -908,19 +920,20 @@ class TestRegisterSplit(TestCase):
 
     def test_fill_and_accumulators(self) -> None:
         """Under a split only the first SIMD group starts from a fill other
-        than 0, and one combine after the K loop adds up each of its
-        accumulators, each at its own slots."""
+        than 0, and after the K loop one combine per accumulator adds it up,
+        each through one accumulator's slots."""
         x = torch.randn(16, 256).to(torch.float16)
         y = torch.randn(256, 32)
         config = register_config([16, 32, 32], num_warps=4)
         msl = render_msl(filled_mm, (x, y), config)
         self.assertIn("acc[_e] = (_frag_sg == 0 ? 0.5f : 0.0f);", msl)
         msl = render_msl(two_acc_mm, (x, y, torch.randn(256, 32)), config)
-        self.assertEqual(msl.count("threadgroup_barrier("), 2)
+        self.assertEqual(msl.count("threadgroup_barrier("), 4)
+        self.assertIn("threadgroup float _frag_split[1536];", msl)
         for line in (
-            "_frag_split[((_frag_sg - 1) * 32 + 0) * 32 + _mpp_lane] = a[0];",
-            "_frag_split[((_frag_sg - 1) * 32 + 16) * 32 + _mpp_lane] = b[0];",
-            "b[15] += _frag_split[(_s * 32 + 31) * 32 + _mpp_lane];",
+            "_frag_split[((_frag_sg - 1) * 16 + 0) * 32 + _mpp_lane] = a[0];",
+            "_frag_split[((_frag_sg - 1) * 16 + 0) * 32 + _mpp_lane] = b[0];",
+            "b[15] += _frag_split[(_s * 16 + 15) * 32 + _mpp_lane];",
         ):
             self.assertIn(line, msl)
 
@@ -1218,6 +1231,180 @@ class TestRolledSteps(TestCase):
         )
         for absent in ("floor_divide", "remainder", "w["):
             self.assertNotIn(absent, loop)
+
+
+class TestPartners(TestCase):
+    """An element-wise epilogue over the results of two ops of one type
+    (``mpp_matmul._classify_partner_uses``)."""
+
+    def _args(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        return (
+            torch.randn(32, 128).to(torch.float16),
+            torch.randn(128, 32),
+            torch.randn(128, 32),
+        )
+
+    def test_read_at_the_slot(self) -> None:
+        """The element loop runs over the first accumulator and reads the
+        second at its own slot, with no materialization: in a register run,
+        unsplit and split over 2 SIMD groups (which the kernel's
+        ``register_splits`` fact allows, though the fragment lowering refuses
+        the kernel), and on the staged op."""
+        for name, config, threads in (
+            ("register", register_config([32, 32, 32]), "(4, 8, 1)"),
+            (
+                "split",
+                register_config([32, 32, 32], [1, 1, 32], num_warps=2),
+                "(32, 1, 2)",
+            ),
+            ("staged", helion.Config(block_sizes=[32, 32, 32], num_warps=4), None),
+        ):
+            with self.subTest(name):
+                msl = render_msl(gated_mm, self._args(), config)
+                self.assertNotIn("_mpp_mat", msl)
+                self.assertIn("static_cast<half>(b[_ei])", msl)
+                if threads is not None:
+                    self.assertIn(f"required_threads_per_threadgroup{threads}", msl)
+        bound = gated_mm.bind(self._args())
+        self.assertTrue(bound.config_spec.backend_facts.register_splits)
+
+    def test_one_layout(self) -> None:
+        """Partners take one run, which keeps their ops of one type: a staged
+        vector on the first keeps both on the staged op on a launch of
+        several SIMD groups (grid runs for all or none), and on one SIMD
+        group both take register runs; where the affine split takes the
+        first's float op, neither takes it."""
+        x = torch.randn(32, 256).to(torch.float16)
+        y, z, v = torch.randn(256, 64), torch.randn(256, 64), torch.randn(4, 64)
+        for name, config, run in (
+            ("grid", register_config([32, 64, 64], [8, 16, 1]), "execution_simdgroups"),
+            ("register", register_config([32, 32, 32]), "execution_simdgroup>"),
+        ):
+            with self.subTest(name):
+                msl = render_msl(scaled_gated_mm, (x, y, z, v), config)
+                self.assertIn("_mpp_vec", msl)
+                self.assertNotIn("_mst_tile", msl)
+                self.assertIn(run, msl)
+                self.assertIn("static_cast<half>(b[_ei])", msl)
+                self.assertNotIn("_mpp_mat", msl)
+        args = (*affine_args(4, 32, 16, 64, 512), torch.randn(512, 64))
+        for name, config in (
+            ("register", register_config([16, 32, 32])),
+            ("split", register_config([16, 32, 32], [1, 1, 32], num_warps=2)),
+        ):
+            with (
+                self.subTest(name),
+                mock.patch.object(
+                    mpp_registers, "affine_split_enabled", return_value=True
+                ),
+            ):
+                msl = render_msl(affine_gated_mm, args, config)
+                self.assertNotIn("_mr_ones", msl)
+                self.assertIn("static_cast<half>(b[_ei])", msl)
+
+    def test_unread_together(self) -> None:
+        """Two ops of one layout key whose results no op reads together aren't
+        partners: the first keeps its affine split beside the second's float
+        op."""
+        args = (
+            *affine_args(4, 32, 32, 64, 256),
+            torch.randn(256, 64),
+            torch.randn(4, 64),
+        )
+        with mock.patch.object(
+            mpp_registers, "affine_split_enabled", return_value=True
+        ):
+            msl = render_msl(apart_mm, args, register_config([32, 32, 32]))
+        self.assertIn("_mr_ones", msl)
+        self.assertNotIn("[_ei]", msl)
+
+    def test_register_types_apart(self) -> None:
+        """Float operands whose register runs take two types (the gate's
+        weight rounded to half) aren't partners: the epilogue reads both
+        results through materializations, on one SIMD group and with the K
+        loop split over two."""
+        x = torch.randn(32, 256).to(torch.float16)
+        y, z = torch.randn(256, 32), torch.randn(256, 32)
+        for config in (
+            register_config([32, 32, 32]),
+            register_config([32, 32, 32], [1, 1, 32], num_warps=2),
+        ):
+            with self.subTest(config=config):
+                msl = render_msl(narrowed_gated_mm, (x, y, z), config)
+                self.assertIn(
+                    "get_right_input_cooperative_tensor<half, half, float>", msl
+                )
+                self.assertIn(
+                    "get_right_input_cooperative_tensor<half, float, float>", msl
+                )
+                self.assertNotIn("[_ei]", msl)
+                self.assertIn("_mpp_mat", msl)
+
+    def test_partner_seed(self) -> None:
+        """A value one partner's op updates in place, its seed, reaches the
+        other's element loop through its snapshot, never the accumulator
+        read at its slot after the op: a + b0 beside a b reads b0's
+        materialization, which an element loop refuses, as before the
+        partners."""
+        x = torch.randn(32, 64).to(torch.float16)
+        y, z = torch.randn(64, 32), torch.randn(64, 32)
+        for config in (
+            register_config([32, 32, 32]),
+            helion.Config(block_sizes=[32, 32, 32], num_warps=4),
+        ):
+            with (
+                self.subTest(config=config),
+                self.assertRaisesRegex(
+                    exc.BackendUnsupported, "materialized MPP result"
+                ),
+            ):
+                render_msl(seed_read_mm, (x, y, z), config)
+
+    def test_seed_beside_partners(self) -> None:
+        """An op reading partners and one's seed, directly or through a value
+        computed from it, stays apart from them (its readers read a and b's
+        materializations: a b + b0, a b + (b0 + 1)), and a partner
+        read at its slot inside a cast takes its value type (decltype(+g[_ei])),
+        not the reference."""
+        x = torch.randn(32, 64).to(torch.float16)
+        y, z = torch.randn(64, 32), torch.randn(64, 32)
+        for config in (
+            register_config([32, 32, 32]),
+            helion.Config(block_sizes=[32, 32, 32], num_warps=4),
+        ):
+            with self.subTest(config=config):
+                msl = render_msl(seed_join_mm, (x, y, z), config)
+                self.assertIn("_mpp_mat", msl)
+                self.assertNotIn("[_ei]", msl)
+                msl = render_msl(silu_gated_mm, (x, y, z), config)
+                self.assertIn("decltype(+g[_ei])", msl)
+                self.assertIsNone(re.search(r"decltype\(\w+\[_ei\]\)", msl))
+
+    def test_kept_apart(self) -> None:
+        """Ops of one type whose results an op reads together stay apart where
+        the owner's element loop, after every op's write, can't evaluate it:
+        a value read from either partner's carry before its op writes it
+        (its snapshot read instead), and an epilogue reading a tensor the
+        kernel writes after it (its results materialized)."""
+        x = torch.randn(32, 64).to(torch.float16)
+        y, z = torch.randn(64, 32), torch.randn(64, 32)
+        config = helion.Config(block_sizes=[32, 32, 32], num_warps=4)
+        for kernel, args in (
+            (early_a_mm, (x, y, z)),
+            (early_b_mm, (x, y, z)),
+            (rewriting_mm, (x, y, z, torch.randn(32, 32))),
+        ):
+            with self.subTest(kernel.name):
+                msl = render_msl(kernel, args, config)
+                self.assertNotIn("[_ei]", msl)
+                self.assertIn("_mpp_mat", msl)
+
+    def test_other_types(self) -> None:
+        """Ops of two types may lay their elements out differently: the
+        epilogue reads both results through materializations."""
+        msl = render_msl(mixed_gated_mm, self._args(), register_config([32, 32, 32]))
+        self.assertIn("_mpp_mat", msl)
+        self.assertNotIn("[_ei])", msl)
 
 
 if __name__ == "__main__":

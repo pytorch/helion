@@ -71,13 +71,15 @@ class MetalKernelFacts:
     #: Whether SIMD groups can split those matmuls' K loops
     #: (``operand_elements.split_refusal``): a fragment config's ``num_warps``.
     fragment_splits: bool = False
-    #: Whether, besides, no free ``hl.arange`` axis takes threads from the
-    #: ``num_warps`` budget and ``thread_loops`` gives the launch, so that
-    #: normalization sees an MPP config's launch as codegen does and, where
-    #: its counts launch one SIMD group, ``num_warps`` changes nothing but
-    #: the SIMD groups splitting its register runs' K loops
-    #: (``mpp_registers.register_split``, which codegen runs only here); a
-    #: reduction, which also would draw on it, refuses the split.
+    #: Whether SIMD groups can split an MPP config's K loops
+    #: (``operand_elements.split_refusal`` over the MPP plan), no free
+    #: ``hl.arange`` axis takes threads from the ``num_warps`` budget and
+    #: ``thread_loops`` gives the launch, so that normalization sees an MPP
+    #: config's launch as codegen does and, where its counts launch one SIMD
+    #: group, ``num_warps`` changes nothing but the SIMD groups splitting its
+    #: register runs' K loops (``mpp_registers.register_split``, which
+    #: codegen runs only here); a reduction, which also would draw on it,
+    #: refuses the split.
     register_splits: bool = False
     #: The tunable tiles of each device loop, the grid's first (empty when it
     #: has none), when the kernel's matmuls lower on MPP's cooperative ops or
