@@ -658,6 +658,46 @@ def rotate_half_case():
     return fn, (x, w, cos, sin)
 
 
+def channel_cat_case():
+    """GhostNet's cat of a passthrough x and relu(bn(y)) along the channels of
+    channels-last tensors, and the mean of the cat over H and W (its
+    squeeze-excitation pool): the cat cuts the channels in two equal parts."""
+    x = torch.randn(64, 32, 8, 8, device=DEVICE).to(memory_format=torch.channels_last)
+    y = torch.randn(64, 32, 8, 8, device=DEVICE).to(memory_format=torch.channels_last)
+    w, b = torch.randn(32, device=DEVICE), torch.randn(32, device=DEVICE)
+
+    def fn(x, y, w, b):
+        out = torch.cat([x, torch.relu(y * w[:, None, None] + b[:, None, None])], 1)
+        return out, out.mean([2, 3])
+
+    return fn, (x, y, w, b)
+
+
+def check_channel_cat_segments(test: InductorBackendTestCase, backend: str) -> None:
+    """The cat's two parts are emitted as segments of the channel axis
+    (HelionKernel.pointwise_segment()): the kernel tiles 32 channels, and
+    reads and writes each part as a tile of its own parameter, with no
+    select between them, where the whole axis of 64 read y flat behind a
+    mask: hl.load(in1, [(-32) + tile_x.index + ...], extra_mask=...)."""
+    fn, args = channel_cat_case()
+    (source,) = test.compile(fn, *args, tol=1e-4, backend=backend)
+    test.assertIn("for tile_y, tile_x in hl.tile([64, 32]):", source)
+    test.assertNotIn("torch.where", source)
+    # The parts' loads and stores are tiles; the unselected part of each
+    # segment keeps a masked load, which nothing reads and Helion drops.
+    test.assertRegex(source, r"tmp\d+ = in\d\[tile_y, :, tile_x\]\n")
+    test.assertEqual(len(re.findall(r"out\d\[tile_y, :, tile_x\] = ", source)), 2)
+    test.assertEqual(len(re.findall(r"out\d\[tile_y, tile_x\] = ", source)), 2)
+    # Parts shorter than RDIM_SEGMENT_MIN stay one tile: torch.stack's four
+    # parts of one element would turn the [1024, 4] tile into four stores of
+    # every fourth element.
+    a, b, c, d = (torch.randn(1024, device=DEVICE) for _ in range(4))
+    (source,) = test.compile(
+        lambda a, b, c, d: torch.stack([a, b, c, d], -1), a, b, c, d, backend=backend
+    )
+    test.assertNotIn("hl.tile([1024, 1])", source)
+
+
 # The CuTe lane, where CuTe DSL is installed, runs this.
 @skipIfNotCUDA()
 @onlyBackends(["cute"])
@@ -840,6 +880,9 @@ class TestInductorCute(InductorBackendTestCase):
         (source,) = self.compile(fn, *args, tol=1e-4, backend="cute")
         self.assertIn("out0[tile_y, tile_x, 0:128] = ", source)
         self.assertIn("out0[tile_y, tile_x, 128:256] = ", source)
+
+    def test_channel_cat_segments(self):
+        check_channel_cat_segments(self, "cute")
 
     @looped
     def test_welford(self):
@@ -2322,6 +2365,9 @@ def kernel(in0: torch.Tensor, out0: torch.Tensor) -> None:
         self.assertIn("out0[tile_y, tile_x, 0:128] = ", source)
         self.assertIn("out0[tile_y, tile_x, 128:256] = ", source)
         self.assertNotIn("rdim", source)
+
+    def test_channel_cat_segments(self):
+        check_channel_cat_segments(self, "triton")
 
     def test_written_before_keeps_the_whole_rdim(self):
         # z = x * 2, an output an earlier node of the kernel writes, which the
