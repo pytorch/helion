@@ -1397,8 +1397,10 @@ class TestMultiShapeSearchOrchestration(unittest.TestCase):
             setup=Mock(),
             cleanup=Mock(),
             # ``NoConfigFound`` asks the provider whether the worker's compile
-            # deadline dropped every candidate (``BenchmarkProvider`` default).
+            # deadline dropped every candidate, or a benchmark prelude took
+            # readings (``BenchmarkProvider`` defaults).
             compile_deadline_cascade=Mock(return_value=None),
+            prelude_failure_cascade=Mock(return_value=None),
         )
         search._prepare = Mock()  # type: ignore[method-assign]
         search._autotune = Mock(  # type: ignore[method-assign]
