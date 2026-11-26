@@ -17,8 +17,10 @@ import torch
 from torch._inductor.utils import triton_type
 from torch._prims_common import compute_required_storage_length
 from torch._prims_common import is_integer_dtype
+import torch.utils._pytree as pytree
 
 from .. import exc
+from .._compat import block_ptr_offsets_must_fit_int32
 from .._compat import fp8_block_ptr_padding_broken
 from .._compat import get_tensor_descriptor_fn_name
 from .._compat import tensor_descriptor_supports_dtype
@@ -1857,13 +1859,34 @@ class BlockPtrIndexingStrategy(IndexingStrategy):
                 eviction_policy,
                 cache_modifier,
             )
-        indexing = BlockedSubscriptIndexing.create(state, fake_tensor, subscript)
+        indexing = BlockedSubscriptIndexing.create(
+            state,
+            fake_tensor,
+            subscript,
+            prove_origins=block_ptr_offsets_must_fit_int32(),
+        )
         if indexing.needs_pointer():
             return PointerIndexingStrategy().codegen_load(
                 state,
                 fake_tensor,
                 subscript,
                 extra_mask,
+                eviction_policy,
+                cache_modifier,
+            )
+        if not indexing.narrows_wide_offsets():
+            # Keep the tensor's bounds, which the block pointer's boundary
+            # check gave, as the descriptor path's fallback does.
+            lanes = indexing.descriptor_lane_mask(state)
+            return PointerIndexingStrategy(wide_offsets=True).codegen_load(
+                state,
+                fake_tensor,
+                subscript,
+                lanes
+                if extra_mask is None
+                else expr_from_string(
+                    "{lanes} & {extra}", lanes=lanes, extra=extra_mask
+                ),
                 eviction_policy,
                 cache_modifier,
             )
@@ -1910,11 +1933,26 @@ class BlockPtrIndexingStrategy(IndexingStrategy):
                 state, fake_tensor, subscript, value, extra_mask, cache_modifier
             )
         indexing = BlockedSubscriptIndexing.create(
-            state, fake_tensor, subscript, for_store=True
+            state,
+            fake_tensor,
+            subscript,
+            for_store=True,
+            prove_origins=block_ptr_offsets_must_fit_int32(),
         )
         if indexing.needs_pointer():
             return PointerIndexingStrategy().codegen_store(
                 state, fake_tensor, subscript, value, extra_mask, cache_modifier
+            )
+        if not indexing.narrows_wide_offsets():
+            # Keep the tensor's bounds, as codegen_load does (extra_mask is
+            # None here).
+            return PointerIndexingStrategy(wide_offsets=True).codegen_store(
+                state,
+                fake_tensor,
+                subscript,
+                value,
+                indexing.descriptor_lane_mask(state),
+                cache_modifier,
             )
         store_value = indexing.reshape_store(state, value)
         store_value = cast_ast(store_value, fake_tensor.dtype)
@@ -3225,6 +3263,9 @@ class BlockedSubscriptIndexing:
     block_shape: list[int | torch.SymInt] = dataclasses.field(default_factory=list)
     reshaped_size: list[int | torch.SymInt] = dataclasses.field(default_factory=list)
     proven_descriptor_axes: set[int] = dataclasses.field(default_factory=set)
+    # Dims whose offset derives from a root block with Int64 coordinates
+    # (TileStrategy.wide_root_blocks); recorded with prove_origins.
+    wide_axes: set[int] = dataclasses.field(default_factory=set)
     aligned_descriptor_axes: set[int] = dataclasses.field(default_factory=set)
     # A tile wider than 1 landed on a size-1 dim, which the block holds as 1
     broadcasts_tile: bool = False
@@ -3274,8 +3315,49 @@ class BlockedSubscriptIndexing:
             [fn.tensor_stride(self.base, i).name for i in range(self.base.ndim)]
         )
         block_shape = state.tile_strategy.shape_str(self.block_shape)
+        # Before Triton 3.8, block pointers take Int32 offsets only: narrow
+        # the offsets of roots with Int64 coordinates, which the caller keeps
+        # only where narrows_wide_offsets shows the cast exact.
+        offsets = "[{}]".format(
+            ", ".join(
+                f"tl.cast({off}, tl.int32)" if dim in self.wide_axes else off
+                for dim, off in enumerate(self.offsets)
+            )
+        )
         return expr_from_string(
-            f"tl.make_block_ptr({name}, [{shape}], [{strides}], {self.offsets_str()}, {block_shape}, {self.order!r})",
+            f"tl.make_block_ptr({name}, [{shape}], [{strides}], {offsets}, {block_shape}, {self.order!r})",
+        )
+
+    def narrows_wide_offsets(self) -> bool:
+        """Whether each offset of a root with Int64 coordinates
+        (``wide_axes``, recorded before Triton 3.8) narrows to Int32 exactly:
+        its origin is proven inside its dim, and the dim fits Int32. Else the
+        caller uses pointer indexing within the tensor's bounds: narrowed, a
+        distant origin of 2**32 would land on element 0."""
+        return all(
+            dim in self.proven_descriptor_axes and self._dim_fits_int32(dim)
+            for dim in self.wide_axes
+        )
+
+    def _dim_fits_int32(self, dim: int) -> bool:
+        """Whether every coordinate inside ``dim`` of the base fits Int32: a
+        size proven below 2**31, or the size of an argument's dim under an
+        Int32 index dtype, which ``_resolve_index_widths`` chooses only when
+        each argument fits (and no wide empty argument widens the grid). The
+        index dtype does not bound other sizes of a tensor the kernel
+        allocates."""
+        size = self.base.size(dim)
+        if _tensor_dimension_fits_int32(size):
+            return True
+        env = CompileEnvironment.current()
+        if env.index_dtype != torch.int32 or env.wide_empty_grid:
+            return False
+        expr = _to_sympy(size)
+        return any(
+            _to_sympy(arg_size) == expr
+            for arg in pytree.tree_leaves(dict(HostFunction.current().params.arguments))
+            if isinstance(arg, torch.Tensor)
+            for arg_size in arg.size()
         )
 
     def tensor_descriptor(self, state: CodegenState) -> str:
@@ -3542,12 +3624,23 @@ class BlockedSubscriptIndexing:
         *,
         for_store: bool = False,
         for_descriptor: bool = False,
+        prove_origins: bool = False,
     ) -> BlockedSubscriptIndexing:
+        """``prove_origins`` records ``proven_descriptor_axes`` for a block
+        pointer too, as a descriptor does (``for_descriptor``)."""
         res = BlockedSubscriptIndexing(
             fake_value,
             reshaped_size=SubscriptIndexing.compute_shape(fake_value, index, state),
         )
         env = CompileEnvironment.current()
+        records_axes = for_descriptor or prove_origins
+
+        def note_wide(block: int) -> None:
+            # The loop that binds the block now: roots sharing a registered
+            # block size are separate strategies.
+            loops = state.codegen.active_device_loops.get(block)
+            if prove_origins and loops and block in loops[-1].strategy.wide_root_blocks:
+                res.wide_axes.add(len(res.offsets))
 
         def is_wide(block_size: int | torch.SymInt, block_id: int) -> bool:
             if env.known_equal(block_size, 1):
@@ -3569,7 +3662,7 @@ class BlockedSubscriptIndexing:
             return env.known_equal(size, 1)
 
         def record_literal(start: int | torch.SymInt) -> None:
-            if not for_descriptor:
+            if not records_axes:
                 return
             dim = len(res.offsets)
             # Descriptor selection excludes empty dimensions, so zero always
@@ -3588,7 +3681,7 @@ class BlockedSubscriptIndexing:
                 res.proven_descriptor_axes.add(dim)
 
         def record_matched_tile(block: int, offset: int | torch.SymInt = 0) -> None:
-            if not for_descriptor:
+            if not records_axes:
                 return
             loops = state.codegen.active_device_loops.get(block)
             if not loops:
@@ -3662,6 +3755,7 @@ class BlockedSubscriptIndexing:
                     fake_value.size(len(res.offsets)), block_id, tile_info.offset
                 ):
                     record_matched_tile(block_id, tile_info.offset)
+                    note_wide(block_id)
                     offset_var = state.codegen.offset_var(block_id)
                     offset_expr = state.device_function.literal_expr(tile_info.offset)
                     res.offsets.append(f"({offset_var} + {offset_expr})")
@@ -3681,6 +3775,7 @@ class BlockedSubscriptIndexing:
                     block_id = _resolve_codegen_block_id(state, origin.block_id)
                     if not is_size_one(fake_value.size(len(res.offsets)), block_id):
                         record_matched_tile(block_id)
+                        note_wide(block_id)
                         res.offsets.append(state.codegen.offset_var(block_id))
                         res.block_shape.append(k)
                     else:
@@ -3696,7 +3791,7 @@ class BlockedSubscriptIndexing:
                     # A bare hl.grid or tile.begin is the defining loop's
                     # origin. Its arithmetic and scalar tensor indices are not.
                     symbol = _symint_expr(k)
-                    if for_descriptor and isinstance(symbol, sympy.Symbol):
+                    if records_axes and isinstance(symbol, sympy.Symbol):
                         source = HostFunction.current().expr_to_origin.get(symbol)
                         origin = source.origin if source is not None else None
                         if type(origin) is GridOrigin or isinstance(
@@ -3705,6 +3800,18 @@ class BlockedSubscriptIndexing:
                             record_matched_tile(
                                 _resolve_codegen_block_id(state, origin.block_id)
                             )
+                    # Arithmetic on a grid index or tile.begin carries its
+                    # root's width, through a temporary too.
+                    if prove_origins and symbol is not None:
+                        for free in symbol.free_symbols:
+                            source = HostFunction.current().expr_to_origin.get(free)
+                            origin = source.origin if source is not None else None
+                            if type(origin) is GridOrigin or isinstance(
+                                origin, TileBeginOrigin
+                            ):
+                                note_wide(
+                                    _resolve_codegen_block_id(state, origin.block_id)
+                                )
                     if (index_ast := _subscript_index_ast(state, n)) is not None:
                         res.offsets.append(
                             state.codegen.lift(index_ast, prefix="index").id
