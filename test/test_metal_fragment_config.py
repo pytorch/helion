@@ -9,12 +9,14 @@ from __future__ import annotations
 import random
 import re
 import unittest
+from unittest import mock
 
 import pytest
 import torch
 
 import helion
 from helion import exc
+from helion._compiler.metal import mpp_support
 from helion._compiler.metal.fragment_mma import _max_offset
 from helion._compiler.metal.search_surface import kernel_facts
 from helion._compiler.metal.search_surface import matmul_choices
@@ -429,6 +431,40 @@ class TestFragmentConfig(unittest.TestCase):
             addmm_k_loop.bind(args).to_code(helion.Config(block_sizes=[16, 16, 16]))
         self.assertIn("on the scalar contraction", str(caught.exception))
         self.assertIsInstance(caught.exception.__cause__, exc.BackendUnsupported)
+
+    def test_fallback_without_mpp(self) -> None:
+        """Before macOS 26 the Metal compiler has no ``<metal_tensor>``: a
+        config without ``metal_matmul`` falls back to fragments, and one
+        that names MPP fails with ``BackendUnsupported`` rather than a
+        shader syntax error at launch."""
+        h = torch.float16
+        deep = (torch.randn(32, 1024, dtype=h), torch.randn(1024, 32, dtype=h))
+        with mock.patch(
+            "helion._compiler.metal.mpp_support.mpp_available",
+            lambda device: False,
+        ):
+            msl = render_msl(
+                addmm_k_loop, deep, helion.Config(block_sizes=[16, 16, 64])
+            )
+            self.assertEqual(_lowering(msl), "fragment")
+            config = helion.Config(block_sizes=[16, 16, 64], metal_matmul="mpp")
+            with self.assertRaisesRegex(
+                exc.BackendUnsupported, "needs macOS 26 or later; use.*fragment"
+            ):
+                render_msl(addmm_k_loop, deep, config)
+
+    def test_mpp_available_follows_macos(self) -> None:
+        """MPS kernels take MPP on macOS 26 or newer, whose Metal compiler
+        ships MPP's headers; CPU-bound kernels never ask."""
+        mps = torch.device("mps")
+        for newer in (False, True):
+            with mock.patch.object(
+                torch.backends.mps, "is_macos_or_newer", return_value=newer
+            ) as is_macos_or_newer:
+                self.assertTrue(mpp_support.mpp_available(torch.device("cpu")))
+                is_macos_or_newer.assert_not_called()
+                self.assertEqual(mpp_support.mpp_available(mps), newer)
+                is_macos_or_newer.assert_called_once_with(26, 0)
 
     def test_threads(self) -> None:
         """The search gives a matmul config a threadgroup its matmuls run
