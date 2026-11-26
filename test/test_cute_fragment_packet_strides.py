@@ -1,4 +1,4 @@
-"""A cloned input's aligned base does not prove contiguous lanes to Inductor."""
+"""Nonnegative coordinates and guarded packet strides on computed-fragment inputs."""
 
 from __future__ import annotations
 
@@ -11,6 +11,10 @@ import helion
 from helion._compiler.compile_environment import tensor_input_sources
 from helion._testing.cute_codegen import cpu_bind
 from helion._testing.cute_codegen import cpu_render_target
+from helion._testing.cute_codegen import forbid_native_compile
+from helion._testing.cute_codegen import mock_cuda_unavailable
+from helion._testing.cute_codegen import tcgen05_target as _target
+from helion._testing.cute_fragment_index_domains import _masked_wide_window
 from helion._testing.cute_fragment_index_domains import nested_windowed_cumsum
 from helion._testing.cute_fragment_index_domains import windowed_cumsum
 import helion.language as hl
@@ -142,3 +146,32 @@ def test_cloned_input_packets_require_guarded_strides(slab: bool) -> None:
             symbolic_strides=tensor_input_sources({"x": x}, [x])
         ):
             assert not has_input_packets(bound.to_code(config))
+
+
+def test_arange_and_positive_offset_do_not_normalize_negative_indices() -> None:
+    with cpu_render_target(fake_device_sm_count=148):
+        bound = cpu_bind(
+            _overlapping_gram, (torch.empty(2, 32, 16, dtype=torch.bfloat16),)
+        )
+        source = bound.to_code(bound.config_spec.default_config())
+    assert "fragment_tensor_index" in source and "ready.iterator" in source
+    assert "fragment_wrapped_index" not in source
+
+
+def test_slab_declines_an_int32_window_wrapped_by_a_folded_displacement() -> None:
+    x = torch.ones(1, 16, 8)
+    out = torch.empty(1, 8, 8)
+    args = (
+        x,
+        torch.tensor([-(2**31)], dtype=torch.int32),
+        torch.tensor([16], dtype=torch.int32),
+        out,
+        torch.int32,
+        2**31 - 1,
+        True,
+    )
+    with mock_cuda_unavailable(), _target(), forbid_native_compile():
+        bound = cpu_bind(_masked_wide_window, args)
+        assert not bound.config_spec.cute_fragment_slab_loads_root_ids
+        source = bound.to_code(bound.config_spec.default_config())
+        assert "fragment_slab_scalar" not in source

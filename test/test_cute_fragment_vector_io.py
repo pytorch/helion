@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 import pytest
 import torch
 
@@ -17,6 +19,9 @@ from helion._testing.cute_fragment_kernels import varlen_anchored_gram
 from helion._testing.cute_fragment_kernels import varlen_contiguous_dim_windows
 from helion._testing.cute_fragment_kernels import varlen_contiguous_inputs
 from helion._testing.cute_fragment_kernels import varlen_gram_inputs
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 VEC = "cute_fragment_vector_io"
 BATCH = "cute_fragment_batched_loads"
@@ -159,6 +164,18 @@ def test_cumsum_row_packets_match_reference(threads: int) -> None:
 # -- windows at a runtime row offset (the varlen anchored gram) ---------------
 
 
+def _masked_token_rows(
+    base: torch.Tensor, limit: torch.Tensor, tokens: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    # Preserve the kernel's 0-d table / nonscalar Int32 window promotion.
+    rows = torch.arange(32, dtype=torch.int32, device=base.device)
+    indices = base.to(torch.result_type(rows, base[0]))[:, None] + rows
+    live = rows < limit.to(torch.result_type(rows, limit[0]))[:, None]
+    return indices.long().clamp(0, tokens - 1), live & (indices >= 0) & (
+        indices < tokens
+    )
+
+
 def _varlen_contiguous_dim_windows_reference(
     x: torch.Tensor, token_base: torch.Tensor, valid_len: torch.Tensor
 ) -> torch.Tensor:
@@ -166,9 +183,7 @@ def _varlen_contiguous_dim_windows_reference(
     end), then ``(2 a)^T b`` over its two 16-column halves."""
     h, d, t = x.shape
     nt = token_base.numel()
-    rows = torch.arange(32, device=x.device)
-    index = (token_base[:, None] + rows[None, :]).clamp(max=t - 1)
-    valid = (rows[None, :] < valid_len[:, None]).to(x.dtype)
+    index, valid = _masked_token_rows(token_base, valid_len, t)
     # [H, NT, D, 32], row h * NT + j
     chunks = x[:, :, index].permute(0, 2, 1, 3) * valid[None, :, None, :]
     chunks = chunks.reshape(h * nt, d, 32)
@@ -189,14 +204,40 @@ def _varlen_anchored_gram_reference(
     sequence's end)."""
     nt = token_base.numel()
     h = q.shape[1]
-    rows = torch.arange(32, device=q.device)
-    index = (token_base[:, None] + rows[None, :]).clamp(max=q.shape[0] - 1)
-    valid = (rows[None, :] < valid_len[:, None]).to(q.dtype)
+    index, valid = _masked_token_rows(token_base, valid_len, q.size(0))
     # [H * NT, 32, D], row h * NT + j
     qc = torch.cat([q[index, head] * valid[:, :, None] for head in range(h)])
     kc = torch.cat([k[index, head] * valid[:, :, None] for head in range(h)])
     assert qc.shape[0] == gc.shape[0] == h * nt
     return anchored_gram_reference(qc, kc, gc, scale)
+
+
+def _check_changed_slab_bounds(
+    args: tuple[object, ...],
+    slab: Callable[..., torch.Tensor],
+    plain: Callable[..., torch.Tensor],
+    reference: Callable[..., torch.Tensor],
+    base: torch.Tensor,
+    limit: torch.Tensor,
+    tokens: int,
+) -> None:
+    def check() -> torch.Tensor:
+        out, baseline = slab(*args), plain(*args)
+        assert isinstance(args[0], torch.Tensor)
+        assert out.dtype == baseline.dtype == args[0].dtype
+        torch.testing.assert_close(out.float(), reference(*args), rtol=2e-2, atol=2e-2)
+        assert torch.equal(
+            out.contiguous().view(torch.uint8), baseline.contiguous().view(torch.uint8)
+        )
+        return out
+
+    before = check()
+    # Reuse the same table addresses and compiled kernels. In the source's
+    # Int32 expressions the first base/limit become -3/26. A second chunk
+    # crosses the physical tensor end before its logical limit.
+    base[:2].copy_(base.new_tensor([2**32 - 3, tokens - 20]))
+    limit[:2].copy_(limit.new_tensor([2**32 + 26, 32]))
+    assert not torch.equal(check(), before)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
@@ -224,17 +265,16 @@ def test_varlen_anchored_gram_slabs_match_reference(
     config = fragment_config(bound, **knobs)
     code = bound.to_code(config)
     assert code.count("fragment_slab_scalar = cutlass.Int32(0)") == 1
-    out = bound.compile_config(config)(*args)
-    torch.cuda.synchronize()
-    expected = _varlen_anchored_gram_reference(*args)
-    torch.testing.assert_close(out.float(), expected, rtol=2e-2, atol=2e-2)
-    # The slabs stage the same scalars the masked windows read: the result
-    # is bitwise that of the plain walk.
-    plain = bound.compile_config(
-        fragment_config(bound, **(knobs | {SLAB: False, VEC: False, BATCH: False}))
-    )(*args)
-    torch.cuda.synchronize()
-    assert torch.equal(out, plain)
+    plain = fragment_config(bound, **(knobs | {SLAB: False, VEC: False, BATCH: False}))
+    _check_changed_slab_bounds(
+        args,
+        bound.compile_config(config),
+        bound.compile_config(plain),
+        _varlen_anchored_gram_reference,
+        args[3],
+        args[4],
+        args[0].size(0),
+    )
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
@@ -248,17 +288,16 @@ def test_varlen_contiguous_dim_slab_matches_reference(vec: bool, batch: bool) ->
     config = fragment_config(bound, **knobs)
     code = bound.to_code(config)
     assert code.count("fragment_slab_scalar = cutlass.Int32(0)") == 1
-    out = bound.compile_config(config)(*args)
-    torch.cuda.synchronize()
-    expected = _varlen_contiguous_dim_windows_reference(*args)
-    torch.testing.assert_close(out, expected, rtol=2e-2, atol=2e-2)
-    # The slab stages the same scalars the masked windows read: bitwise
-    # the plain walk.
-    plain = bound.compile_config(
-        fragment_config(bound, **(knobs | {SLAB: False, VEC: False, BATCH: False}))
-    )(*args)
-    torch.cuda.synchronize()
-    assert torch.equal(out, plain)
+    plain = fragment_config(bound, **(knobs | {SLAB: False, VEC: False, BATCH: False}))
+    _check_changed_slab_bounds(
+        args,
+        bound.compile_config(config),
+        bound.compile_config(plain),
+        _varlen_contiguous_dim_windows_reference,
+        args[1],
+        args[2],
+        args[0].size(-1),
+    )
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")

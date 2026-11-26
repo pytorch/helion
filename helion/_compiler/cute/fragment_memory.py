@@ -16,14 +16,17 @@ from typing import cast
 import sympy
 import torch
 from torch.fx import Node
+from torch.utils._sympy.functions import FloorDiv
 
 from ... import exc
 from ...language import _tracing_ops
 from ..ast_extension import statement_from_string
+from ..device_ir import ForLoopGraphInfo
 from ..host_function import HostFunction
 from ..indexing_strategy import SubscriptIndexing
 from ..variable_origin import GridOrigin
-from .emitters.memory_access import _cute_wrap_negative_index
+from ..variable_origin import TileBeginOrigin
+from .bounded_gather import integer_bounds
 from .fragment_context import DirectStoreSink
 from .fragment_context import Fragment
 from .fragment_context import FragmentContext
@@ -174,6 +177,15 @@ class FragmentMemoryEmitter(FragmentContext):
 
         self.elements((*shape[:-1], shape[-1] // lanes), body)
 
+    def _nested_slab_blocks(self) -> set[int]:
+        # A user-registered ID can belong to both a root and a nested tile.
+        return {
+            axis
+            for graph in HostFunction.current().device_ir.graphs
+            if isinstance(graph, ForLoopGraphInfo)
+            for axis in graph.block_ids
+        }
+
     def stage_slabs(self) -> None:
         """``cute_fragment_slab_loads``: stage every planned slab at the start
         of the root, all loads in flight together, so each member window
@@ -183,17 +195,18 @@ class FragmentMemoryEmitter(FragmentContext):
         for group in self.slab_plan.values():
             if all(group is not other for other in groups):
                 groups.append(group)
+        inner = self._nested_slab_blocks() if groups else set()
         for group in groups:
             fake = cast("torch.Tensor", group.tensor.meta["val"])
             # Only the root's own grid blocks have CTA-uniform offsets here;
             # a window under a device loop's block keeps its own walk.
             staged = all(
-                (kind != "block" or value in self.offsets)
+                (kind != "block" or (value in self.offsets and value not in inner))
                 and (kind != "slice" or self.static_extent(fake.shape[dim]) is not None)
-                and (kind != "uniform" or self.uniform_at_root(value))
+                and (kind != "uniform" or self.uniform_at_root(value, inner))
                 for dim, (kind, value) in enumerate(group.descriptors)
             ) and all(
-                self.uniform_at_root(expr)
+                self.uniform_at_root(expr, inner)
                 for load in (group.offset, group.limit)
                 if load is not None
                 for expr in load.indices
@@ -210,19 +223,65 @@ class FragmentMemoryEmitter(FragmentContext):
             self.held.append(group.fragment)
         self.flush_pending_barrier()
 
-    def uniform_at_root(self, expr: object) -> bool:
+    def uniform_at_root(self, expr: object, inner: set[int]) -> bool:
         """Whether the uniform integer expression ``expr`` is defined at the
         start of the root: its grid symbols are the root's own blocks (a
         device loop's tile symbols are not yet bound there)."""
         if not isinstance(expr, sympy.Expr):
             return False
-        origins = HostFunction.current().expr_to_origin
+        host = HostFunction.current()
+        origins = host.expr_to_origin
         for symbol in expr.free_symbols:
             info = origins.get(symbol)
             origin = info.origin if info is not None else None
-            if isinstance(origin, GridOrigin) and origin.block_id not in self.offsets:
+            if isinstance(origin, GridOrigin) and (
+                origin.block_id not in self.offsets or origin.block_id in inner
+            ):
                 return False
         return True
+
+    def signed_scalar_coordinate(
+        self, value: object, expression: str, extent: int | torch.SymInt
+    ) -> str:
+        # A grid/host scalar keeps Python indexing semantics even with an
+        # explicit extra mask. Tensor coordinates are handled separately.
+        if isinstance(value, torch.SymInt):
+            value = value._sympy_()
+        if isinstance(value, (int, sympy.Integer)):
+            # Fold a negative literal against its axis extent. A symbolic
+            # extent stays symbolic, just as in ordinary scalar indexing.
+            return expression if value >= 0 else self.sym(extent + int(value))
+        size = self.sym(extent)
+        if isinstance(value, sympy.Expr):
+            host = HostFunction.current()
+            noncanonical = host.device_ir.noncanonical_task_origin_block_ids
+            active_grid_symbols = set()
+            for symbol in value.free_symbols:
+                info = host.expr_to_origin.get(symbol)
+                if info is not None and type(info.origin) in (
+                    GridOrigin,
+                    TileBeginOrigin,
+                ):
+                    bid = cast("GridOrigin", info.origin).block_id
+                    if bid in noncanonical:
+                        # A registered block ID can be shared by roots/loops
+                        # with different starts; a canonical sibling proves
+                        # nothing about this signed coordinate.
+                        return self.normalize_signed_index(expression, size)
+                    if bid in self.offsets:
+                        active_grid_symbols.add(symbol)
+            # Positive floor division preserves nonnegativity and cannot
+            # overflow. Avoid extrapolating that to arbitrary integer math.
+            base = value
+            while (
+                isinstance(base, FloorDiv)
+                and isinstance(base.args[1], sympy.Integer)
+                and base.args[1] > 0
+            ):
+                base = base.args[0]
+            if base in active_grid_symbols or self.env.known_nonnegative(value):
+                return expression
+        return self.normalize_signed_index(expression, size)
 
     def slab_scalar(self, load: ScalarLoad) -> str:
         """The uniform 0-d integer ``load`` (a slab's row offset or limit) as
@@ -234,7 +293,10 @@ class FragmentMemoryEmitter(FragmentContext):
         tensor = HostTensor(
             self.df.tensor_arg(fake, prefer_name=load.tensor).name, fake
         )
-        indices = [self.sym(expr) for expr in load.indices]
+        indices = [
+            self.signed_scalar_coordinate(expr, self.sym(expr), fake.shape[dim])
+            for dim, expr in enumerate(load.indices)
+        ]
         masks = [
             f"(({index}) >= 0 and ({index}) < ({self.sym(fake.shape[dim])}))"
             for dim, index in enumerate(indices)
@@ -412,7 +474,11 @@ class FragmentMemoryEmitter(FragmentContext):
                 elif kind == "const":
                     indices.append(str(value))
                 elif kind == "uniform":
-                    indices.append(self.sym(value))
+                    indices.append(
+                        self.signed_scalar_coordinate(
+                            value, self.sym(value), fake.shape[dim]
+                        )
+                    )
                 else:
                     start, extent = cast("tuple[int, int]", value)
                     indices.append(window_row(start, extent, coords[dim]))
@@ -457,7 +523,8 @@ class FragmentMemoryEmitter(FragmentContext):
         strides = static_strides(self.env, fake)
         # The slab's rows are packets when its last dim is the whole
         # contiguous dim, or a static window of it at a packet-aligned start
-        # and extent inside the dim (``hl.arange(D)`` over a D-wide dim).
+        # and extent ending inside the dim. With an aligned negative start,
+        # the lower bound guards whole packets; none can straddle zero.
         # The varying dimension (``("window", None)``: the members' windows
         # along it) is walked element by element, never packed.
         inner_size = self.static_extent(fake.shape[-1])
@@ -531,8 +598,6 @@ class FragmentMemoryEmitter(FragmentContext):
         # value to unmasked out-of-bounds accesses: require a proved range.
         wrap_negative = mask_node is None or not tensor_index
         if wrap_negative:
-            from .bounded_gather import integer_bounds
-
             interval = integer_bounds(index_node, captured_bounds={})
             if interval is None or not -extent <= interval[0] <= interval[1] < extent:
                 raise exc.InvalidConfig(
@@ -563,19 +628,15 @@ class FragmentMemoryEmitter(FragmentContext):
             assert isinstance(branch, ast.If)
             branch.body.clear()
             with self.cg.set_statements(cast("list[ast.AST]", branch.body)):
-                location = self.df.new_var("fragment_local_index")
                 expression = (
                     index.broadcast(coords)
                     if isinstance(index, Fragment)
                     else self.scalar(index)
                 )
                 if wrap_negative:
-                    self.emit(f"{location} = cutlass.Int64({expression})")
-                    self.emit(
-                        f"if {location} < 0:\n"
-                        f"    {location} = {location} + cutlass.Int64({extent})"
-                    )
+                    location = self.normalize_signed_index(expression, str(extent))
                 else:
+                    location = self.df.new_var("fragment_local_index")
                     self.emit(f"{location} = {expression}")
                 valid = [f"0 <= ({location}) and ({location}) < ({extent})"]
                 if isinstance(mask, Fragment):
@@ -670,12 +731,12 @@ class FragmentMemoryEmitter(FragmentContext):
                 logical_domain=lambda coords: tensor.domain(view_coordinates(coords)),
             )
         assert isinstance(tensor, HostTensor)
+        proxies = [
+            index.meta["val"] if isinstance(index, Node) else index for index in indices
+        ]
         index_coordinates = memory_index_coordinates(
             self.env,
-            [
-                index.meta["val"] if isinstance(index, Node) else index
-                for index in indices
-            ],
+            proxies,
             {
                 i: value.shape
                 for i, index in enumerate(indices)
@@ -751,11 +812,18 @@ class FragmentMemoryEmitter(FragmentContext):
                     else:
                         expression = self.scalar(value)
                 else:
-                    expression = self.scalar(
-                        _cute_wrap_negative_index(index, tensor.value.shape[dim])
+                    expression = self.scalar(index)
+                size = self.sym(tensor.value.shape[dim])
+                # Tensor lanes keep their original bounds predicate, including
+                # in a Cartesian product. Only a scalar subscript counts from
+                # the end when it is negative.
+                if block is None and (
+                    type(proxy) is int or isinstance(proxy, torch.SymInt)
+                ):
+                    expression = self.signed_scalar_coordinate(
+                        proxy, expression, tensor.value.shape[dim]
                     )
                 tensor_indices.append(expression)
-                size = self.sym(tensor.value.shape[dim])
                 masks.append(f"(({expression}) >= 0 and ({expression}) < ({size}))")
                 dim += 1
             if isinstance(mask_value, Fragment):
