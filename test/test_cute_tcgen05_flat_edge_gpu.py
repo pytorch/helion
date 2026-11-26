@@ -1178,6 +1178,117 @@ class TestCuteTcgen05RaggedTwoCtaSearch(RefEagerTestDisabled, TestCase):
             out, (x.float() @ y.float()).to(out.dtype), rtol=1e-2, atol=1e-1
         )
 
+    @unittest.skipUnless(_promotes_b200_defaults(), "pins B200 default tiles")
+    def test_l2_warm_up_from_idle_sms_matches_torch(self) -> None:
+        # The grid's first eight CTAs warm the first k-blocks of every A and
+        # B row into L2 from the SMs the grid leaves idle
+        # (``_build_pdl_l2_warmup``): the autotune-off defaults of bf16
+        # 1000x1024x1280 (64 pairs of 128x128) and of 1000x512x1024 reading
+        # the first one's output (64 pairs of 128x64; at 512 its footprint
+        # would take the one-tile prefetch instead), each leaving 20 or more
+        # of the at least 148 SMs idle. One CUDA graph replays three such
+        # pairs over their own inputs and buffers: each dependent launch
+        # starts its first CTAs while the previous kernel still runs, so each
+        # second kernel prefetches its ``mid`` while the first one is still
+        # writing it (NaN-filled before the replay), and the loads after its
+        # dependent-launch wait must read the written values.
+        pairs = 3
+        a = [
+            torch.randn(1000, 1280, device=DEVICE, dtype=torch.bfloat16)
+            for _ in range(pairs)
+        ]
+        b = torch.randn(1024, 1280, device=DEVICE, dtype=torch.bfloat16).T
+        c = torch.randn(512, 1024, device=DEVICE, dtype=torch.bfloat16).T
+        mid = [
+            torch.empty(1000, 1024, device=DEVICE, dtype=torch.bfloat16)
+            for _ in range(pairs)
+        ]
+        out = [
+            torch.empty(1000, 512, device=DEVICE, dtype=torch.bfloat16)
+            for _ in range(pairs)
+        ]
+        first = plain_mm_into.bind((a[0], b, mid[0]))
+        second = plain_mm_into.bind((mid[0], c, out[0]))
+        for bound in (first, second):
+            config = bound.config_spec.default_config()
+            self.assertIn(
+                "tcgen05_l2_warm_cta < cutlass.Int32(8)", bound.to_code(config)
+            )
+            bound.set_config(config)
+        # compile and load both outside the capture
+        first(a[0], b, mid[0])
+        second(mid[0], c, out[0])
+        torch.cuda.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            for i in range(pairs):
+                first(a[i], b, mid[i])
+                second(mid[i], c, out[i])
+        for i in range(pairs):
+            mid[i].fill_(float("nan"))
+            out[i].fill_(float("nan"))
+        torch.cuda.synchronize()
+        graph.replay()
+        torch.cuda.synchronize()
+        for i in range(pairs):
+            expected_mid = (a[i].float() @ b.float()).to(torch.bfloat16)
+            torch.testing.assert_close(mid[i], expected_mid, rtol=1e-2, atol=1e-1)
+            # against the ``mid`` the first kernel wrote (a stale or NaN read
+            # of it would show as whole wrong tiles), not torch's rounding of
+            # it, which the second product would amplify past the tolerance
+            torch.testing.assert_close(
+                out[i],
+                (mid[i].float() @ c.float()).to(torch.bfloat16),
+                rtol=1e-2,
+                atol=1e-1,
+            )
+
+    @unittest.skipUnless(_promotes_b200_defaults(), "pins B200 default tiles")
+    def test_multi_wave_l2_warm_up_matches_torch(self) -> None:
+        # A persistent grid with more tiles than CTA pairs warms from the SMs
+        # its previous call's last wave leaves idle
+        # (``_tcgen05_last_wave_idle_sms``): bf16 2048x3072x768 on the 256x256
+        # pair (96 tiles over 74-76 pairs, so each CTA's release arrive
+        # stays at its first tile), two calls back to back in one CUDA graph
+        # over NaN-filled outputs.
+        a = torch.randn(2048, 768, device=DEVICE, dtype=torch.bfloat16)
+        b = torch.randn(3072, 768, device=DEVICE, dtype=torch.bfloat16).T
+        outs = [
+            torch.empty(2048, 3072, device=DEVICE, dtype=torch.bfloat16)
+            for _ in range(2)
+        ]
+        bound = plain_mm_into.bind((a, b, outs[0]))
+        config = helion.Config(
+            **{
+                **dict(bound.config_spec.default_config().config),
+                "block_sizes": [256, 256, 64],
+                "tcgen05_tile_n": 0,
+                "tcgen05_cluster_m": 2,
+                "tcgen05_cta_group": "two",
+                "pid_type": "persistent_interleaved",
+                "tcgen05_ab_stages": 6,
+            }
+        )
+        code = bound.to_code(config)
+        self.assertIn("_BLOCK_SIZE_1 = 256", code)
+        self.assertIn("tcgen05_l2_warm_cta < cutlass.Int32(8)", code)
+        self.assertIn("advance_to_next_work()", code)
+        bound.set_config(config)
+        bound(a, b, outs[0])
+        torch.cuda.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            for out in outs:
+                bound(a, b, out)
+        for out in outs:
+            out.fill_(float("nan"))
+        torch.cuda.synchronize()
+        graph.replay()
+        torch.cuda.synchronize()
+        expected = (a.float() @ b.float()).to(torch.bfloat16)
+        for out in outs:
+            torch.testing.assert_close(out, expected, rtol=1e-2, atol=1e-1)
+
     def test_one_tile_operand_l2_prefetch_matches_torch(self) -> None:
         # A one-tile CTA whose A and B rows hold at most 768 lines prefetches
         # them into L2 ahead of its dependent-launch wait: 1500x384x384 (a
@@ -1195,7 +1306,8 @@ class TestCuteTcgen05RaggedTwoCtaSearch(RefEagerTestDisabled, TestCase):
             values = dict(bound.config_spec.default_config().config)
             values["tcgen05_warp_spec_ab_load_warps"] = warps
             config = helion.Config(**values)
-            self.assertIn("cute.arch.prefetch(", bound.to_code(config))
+            # (the one-tile prefetch itself, not the L2 warm-up)
+            self.assertIn("tcgen05_l2_pf_", bound.to_code(config))
             bound.set_config(config)
             bound(a, b, out)
             torch.testing.assert_close(
@@ -1223,7 +1335,8 @@ class TestCuteTcgen05RaggedTwoCtaSearch(RefEagerTestDisabled, TestCase):
                 tcgen05_warp_spec_ab_load_warps=warps,
             )
             config = helion.Config(**values)
-            self.assertIn("cute.arch.prefetch(", bound.to_code(config))
+            # (the one-tile prefetch itself, not the L2 warm-up)
+            self.assertIn("tcgen05_l2_pf_", bound.to_code(config))
             bound.set_config(config)
             bound(a, b, out)
             torch.testing.assert_close(
@@ -1557,6 +1670,37 @@ class TestCuteTcgen05SkinnyTransposedGpu(RefEagerTestDisabled, TestCase):
                     torch.testing.assert_close(
                         out, expected.to(out.dtype), rtol=1e-2, atol=1e-1
                     )
+
+    def test_flat_one_cta_tiles_prefetch_their_footprint(self) -> None:
+        # bf16 128x192x1000 with b stored [K, N], transposed onto flat
+        # [64, 8, 128] one-CTA tiles (48 CTAs): the epilogue warps prefetch
+        # each CTA's b.T lines and its 8 rows of a (2000 bytes apart, so a
+        # row starts 0, 80, 32, ... bytes into a line and may reach a 17th
+        # line) into L2 ahead of the dependent-launch wait. With 132 rows of a, the last tile's rows
+        # past them prefetch nothing.
+        for m in (128, 132):
+            n, k = 192, 1000
+            a = torch.randn(m, k, device=DEVICE, dtype=torch.bfloat16)
+            b = torch.randn(k, n, device=DEVICE, dtype=torch.bfloat16)
+            out = torch.empty(m, n, device=DEVICE, dtype=torch.bfloat16)
+            bound = plain_mm_into.bind((b.T, a.T, out.T))
+            config = helion.Config(
+                **{
+                    **bound.config_spec.default_config().config,
+                    "block_sizes": [64, 8, 128],
+                    "pid_type": "flat",
+                    "tcgen05_ab_stages": 8,
+                    "cute_pdl": True,
+                }
+            )
+            code = bound.to_code(config)
+            self.assertIn("cache_level='L2'", code)
+            bound.set_config(config)
+            out.fill_(float("nan"))
+            bound(b.T, a.T, out.T)
+            torch.testing.assert_close(
+                out, (a.float() @ b.float()).to(out.dtype), rtol=1e-2, atol=1e-1
+            )
 
 
 @onlyBackends(["cute"])

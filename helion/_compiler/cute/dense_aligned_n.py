@@ -25,11 +25,13 @@ from .tcgen05_constants import TCGEN05_PAIR_TILE_FIXED_KBLOCKS
 from .tcgen05_constants import TCGEN05_PAIR_TILE_STREAM_RATIO
 from .tcgen05_constants import TCGEN05_PLAIN_NARROW_SUBTILE_BLOCK_NS
 from .tcgen05_constants import TCGEN05_PLAIN_NARROW_SUBTILE_N
+from .tcgen05_constants import TCGEN05_TRANSPOSED_PRODUCT_MIN_GAIN
 from .tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_M
 from .tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_N
 from .tcgen05_constants import TCGEN05_TWO_CTA_MAX_K_TILES
 from .tcgen05_constants import TCGEN05_TWO_CTA_PAIR128_ONE_WAVE_BLOCK_NS
 from .tcgen05_constants import tcgen05_odd_width_subtile
+from .tcgen05_constants import tcgen05_pdl_l2_warmup_kblocks
 from .tcgen05_constants import tcgen05_plain_narrow_subtile_covers_n
 
 if TYPE_CHECKING:
@@ -172,12 +174,53 @@ def transposed_double_edge_without_pairs(m: int, n: int) -> bool:
     )
 
 
-def transposed_pair_tile_gain(m: int, n: int, k: int, *, sm_pairs: int) -> float:
-    """How much faster the 16-bit pair runs an ``m`` x ``n`` x ``k`` GEMM as
-    its transpose (``n`` x ``m`` x ``k``, out.T = b.T @ a.T): the ratio of
+@dataclass(frozen=True)
+class PairTileOrientation:
+    """The pair-tile model's two orientations of a 16-bit GEMM with K-major
+    operands (``transposed_pair_tile_orientation``)."""
+
+    # as written / transposed ``pair_tile_wave_cost`` of each orientation's
+    # best tiling; 1.0 where the model prices neither
+    gain: float
+    # whether the dependent-launch L2 warm-up runs on that best grid of
+    # 256-row pairs (``tcgen05_pdl_l2_warmup_kblocks``: over the SMs its
+    # previous call's last wave leaves idle)
+    written_warms: bool = False
+    transposed_warms: bool = False
+
+    @property
+    def transposes(self) -> bool:
+        """Whether helion.inductor lowers the GEMM as its transposed product
+        (``HelionChoices.transpose_matmul``): a gain of at least
+        ``TCGEN05_TRANSPOSED_PRODUCT_MIN_GAIN``, or a tie the warm-up breaks.
+
+        The model prices a wave by its tiles' K loop, so two grids of one
+        wave tie however many SMs each leaves idle. Under a dependent launch
+        the grid that leaves eight or more idle gets the warm-up: the early
+        CTAs on those SMs pull the first k-blocks into L2 while the previous
+        call runs. bf16 1000x2048x2304: as written 4 x 19 = 76 tiles of
+        256x112 fill GB300's 76 SM pairs; transposed 8 x 9 = 72 leave 8 SMs
+        idle. The same config either way round, in one process, of cuBLAS,
+        back to back: 0.979/0.982 -> 1.002/1.003 (the transposed product
+        without its warm-up 0.986/0.979); x2560 0.980/0.978 -> 1.009/1.013;
+        the two-wave 6272x1024xK on 256x176 (150 tiles leave 4 idle, 144
+        transposed 16) K=1024 0.972/0.973 -> 1.034/1.031, K=2048 0.998/0.998
+        -> 1.035/1.043, K=4096 1.001/0.998 -> 1.011/1.015.
+        """
+        if self.gain >= TCGEN05_TRANSPOSED_PRODUCT_MIN_GAIN:
+            return True
+        return self.gain >= 1.0 and self.transposed_warms and not self.written_warms
+
+
+def transposed_pair_tile_orientation(
+    m: int, n: int, k: int, *, sm_pairs: int
+) -> PairTileOrientation:
+    """How the 16-bit pair runs an ``m`` x ``n`` x ``k`` GEMM as written and
+    as its transpose (``n`` x ``m`` x ``k``, out.T = b.T @ a.T): the ratio of
     the two orientations' best ``pair_tile_wave_cost`` over the pair's
     widths (the power-of-two ones and ``ALIGNED_N_CHOICES``; a width with a
-    partial last tile, or a partial last 256-row tile, needs whole K tiles).
+    partial last tile, or a partial last 256-row tile, needs whole K tiles),
+    and whether the dependent-launch warm-up runs on each best grid.
 
     The pair tiles its M side in 256-row steps and its N side in 16-column
     ones, so a tall output tiles finer transposed. bf16 16384x1024x4096 on
@@ -194,20 +237,20 @@ def transposed_pair_tile_gain(m: int, n: int, k: int, *, sm_pairs: int) -> float
         # product: GB300, the same 128x256x64 CTA pair in one process, of
         # cuBLAS, 1.04 as written and 0.98 transposed (the full-effort
         # transposed picks 0.97-1.00 over four runs).
-        return 1.0
+        return PairTileOrientation(1.0)
     if transposed_double_edge_without_pairs(m, n):
         # The model prices CTA pairs, which the search does not run on a
         # transposed double edge whose M 64-row tiles divide
         # (``transposed_double_edge_without_pairs``): bf16 264x2496x1024,
         # modeled 1.03, runs the pairs as written and only one-CTA tiles
         # transposed (2496 = 39 x 64 rows).
-        return 1.0
+        return PairTileOrientation(1.0)
     widths = (64, 128, TCGEN05_TWO_CTA_BLOCK_N, *ALIGNED_N_CHOICES)
     pair128_m = TCGEN05_TWO_CTA_BLOCK_M // 2
 
-    def pair128_costs(
+    def pair128_tilings(
         rows: int, cols: int, *, output_column_major: bool
-    ) -> list[float]:
+    ) -> list[tuple[int, int]]:
         # The 128-row pairs (each CTA 64 rows) on a grid the 256-row pairs
         # leave short of one pair per SM pair and the 128-row tiles fill to
         # at least a quarter of the SMs (``search_plan``'s gate) within one
@@ -255,43 +298,73 @@ def transposed_pair_tile_gain(m: int, n: int, k: int, *, sm_pairs: int) -> float
         ):
             pair_widths.extend(width for width in ALIGNED_N_CHOICES if width <= cols)
         return [
-            pair_tile_wave_cost(
-                rows, cols, k, width=width, block_m=pair128_m, sm_pairs=sm_pairs
-            )
+            (width, pair128_m)
             for width in pair_widths
             if sm_pairs // 2 <= -(-rows // pair128_m) * -(-cols // width) <= sm_pairs
         ]
 
-    def best(rows: int, cols: int, *, output_column_major: bool) -> float:
+    def best(rows: int, cols: int, *, output_column_major: bool) -> tuple[float, bool]:
+        """The orientation's least cost, and whether the warm-up runs on a
+        256-row pair grid of that cost: the plain pair the search runs either
+        way round, unlike the 128-row pairs priced above (bf16 320x1600x384
+        transposed admits none)."""
         if rows % TCGEN05_TWO_CTA_BLOCK_M and not whole_k:
-            return math.inf
-        return min(
-            (
-                *(
-                    pair_tile_wave_cost(
-                        rows,
-                        cols,
-                        k,
-                        width=width,
-                        block_m=TCGEN05_TWO_CTA_BLOCK_M,
-                        sm_pairs=sm_pairs,
-                    )
-                    for width in widths
-                    if cols % width == 0 or whole_k
-                ),
-                *pair128_costs(rows, cols, output_column_major=output_column_major),
+            return math.inf, False
+        tilings = [
+            *(
+                (width, TCGEN05_TWO_CTA_BLOCK_M)
+                for width in widths
+                if cols % width == 0 or whole_k
             ),
-            default=math.inf,
+            *pair128_tilings(rows, cols, output_column_major=output_column_major),
+        ]
+        if not tilings:
+            return math.inf, False
+        costs = [
+            pair_tile_wave_cost(
+                rows, cols, k, width=width, block_m=block_m, sm_pairs=sm_pairs
+            )
+            for width, block_m in tilings
+        ]
+        cost = min(costs)
+
+        def warms(width: int, block_m: int) -> bool:
+            tiles = -(-rows // block_m) * -(-cols // width)
+            return bool(
+                tcgen05_pdl_l2_warmup_kblocks(
+                    m=rows,
+                    n=cols,
+                    k=k,
+                    bk=DENSE_ALIGNED_N_SIXTEEN_BIT_BLOCK_K,
+                    block_m=block_m,
+                    block_n=width,
+                    itemsize=2,
+                    work_ctas=2 * tiles,
+                    num_sm=2 * sm_pairs,
+                    one_tile_per_cta=tiles <= sm_pairs,
+                )
+            )
+
+        return cost, any(
+            warms(width, block_m)
+            for (width, block_m), tiling_cost in zip(tilings, costs, strict=True)
+            if tiling_cost == cost and block_m == TCGEN05_TWO_CTA_BLOCK_M
         )
 
     # (the transposed product stores out.T, a column-major output)
-    as_written = best(m, n, output_column_major=False)
-    transposed = best(n, m, output_column_major=True)
+    as_written, written_warms = best(m, n, output_column_major=False)
+    transposed, transposed_warms = best(n, m, output_column_major=True)
     if math.inf in (as_written, transposed):
         # an orientation the pair cannot tile (a partial last 256-row tile
         # over a K tail) runs other tiles, which the model does not price
-        return 1.0
-    return as_written / transposed
+        return PairTileOrientation(1.0)
+    return PairTileOrientation(as_written / transposed, written_warms, transposed_warms)
+
+
+def transposed_pair_tile_gain(m: int, n: int, k: int, *, sm_pairs: int) -> float:
+    """How much faster the 16-bit pair runs an ``m`` x ``n`` x ``k`` GEMM as
+    its transpose: ``transposed_pair_tile_orientation``'s gain."""
+    return transposed_pair_tile_orientation(m, n, k, sm_pairs=sm_pairs).gain
 
 
 @dataclass(frozen=True)

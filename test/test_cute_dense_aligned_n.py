@@ -22,6 +22,7 @@ from helion._compiler.cute.dense_aligned_n import dense_aligned_n_defaults
 from helion._compiler.cute.dense_aligned_n import pair_tile_wave_cost
 from helion._compiler.cute.dense_aligned_n import transposed_double_edge_without_pairs
 from helion._compiler.cute.dense_aligned_n import transposed_pair_tile_gain
+from helion._compiler.cute.dense_aligned_n import transposed_pair_tile_orientation
 from helion._compiler.cute.pipeline_smem import Tcgen05PipelineSmemFacts
 from helion._compiler.cute.pipeline_smem import pipeline_smem_bytes
 from helion._compiler.cute.strategies import tcgen05_two_cta_m128_epilogue_tile_expr
@@ -30,6 +31,7 @@ from helion._compiler.cute.tcgen05_config import repair
 from helion._compiler.cute.tcgen05_config import seeds
 from helion._compiler.cute.tcgen05_config import surface
 from helion._compiler.cute.tcgen05_constants import TCGEN05_TRANSPOSED_PRODUCT_MIN_GAIN
+from helion._compiler.cute.tcgen05_constants import tcgen05_last_wave_idle_sms
 from helion._compiler.cute.tcgen05_schedule_facts import analyze_native_gemm
 from helion._testing import skipUnlessBackends
 from helion._testing.cute_codegen import forbid_cuda_work
@@ -1841,6 +1843,52 @@ def test_the_swapped_pair_flips_only_an_n_no_64_column_tile_divides() -> None:
         transposed.config_spec._cute_tcgen05_config.cluster_m2_search_constraints
         is None
     )
+
+
+def test_a_tie_goes_to_the_orientation_the_warm_up_runs_on() -> None:
+    # The model prices a wave by its tiles' K loop: bf16 1000x2048x2304 ties
+    # between 4 x 19 = 76 tiles of 256x112 as written, filling GB300's 76 SM
+    # pairs, and 8 x 9 = 72 transposed, which leave 8 SMs idle for the
+    # dependent-launch L2 warm-up.
+    assert tcgen05_last_wave_idle_sms(2 * 4 * 19, num_sm=152) == 0
+    assert tcgen05_last_wave_idle_sms(2 * 8 * 9, num_sm=152) == 8
+    for m, n, k in ((1000, 2048, 2304), (1000, 2048, 2560)):
+        orientation = transposed_pair_tile_orientation(m, n, k, sm_pairs=76)
+        assert orientation.gain == 1.0
+        assert not orientation.written_warms and orientation.transposed_warms
+        assert orientation.transposes
+    # The previous call's last wave of a multi-wave grid: 6272x1024xK on
+    # 256x176, 150 tiles as written leave 4 SMs idle in the second wave, 144
+    # transposed leave 16.
+    assert tcgen05_last_wave_idle_sms(2 * 25 * 6, num_sm=152) == 4
+    assert tcgen05_last_wave_idle_sms(2 * 4 * 36, num_sm=152) == 16
+    for k in (1024, 2048, 4096):
+        assert transposed_pair_tile_orientation(6272, 1024, k, sm_pairs=76).transposes
+    # Ties where the written grid already warms keep it: 2048x2560x2560
+    # (144 tiles leave 16 SMs idle as written, 150 transposed 4) and
+    # 4096x2560x2560 (both warm).
+    for m, n, k in ((2048, 2560, 2560), (4096, 2560, 2560)):
+        orientation = transposed_pair_tile_orientation(m, n, k, sm_pairs=76)
+        assert orientation.gain == 1.0 and orientation.written_warms
+        assert not orientation.transposes
+    # The warm-up breaks ties only: 1000x4096x2880 warms transposed (64
+    # tiles of 256x256, 24 SMs idle) but tiles worse there (0.89).
+    orientation = transposed_pair_tile_orientation(1000, 4096, 2880, sm_pairs=76)
+    assert orientation.gain < 1.0 and orientation.transposed_warms
+    assert not orientation.transposes
+    # Nor do grids the warm-up never runs on: the 128-row pairs the model
+    # prices transposed for 320x1600x384 (a pair the search does not run
+    # there) and 576x960x320 (72 tiles of 128x64, whose one-tile CTAs
+    # prefetch their 96 rows of 5 lines themselves).
+    for m, n, k in ((320, 1600, 384), (576, 960, 320)):
+        orientation = transposed_pair_tile_orientation(m, n, k, sm_pairs=76)
+        assert not orientation.transposed_warms
+        assert not orientation.transposes
+    # Nor does it decide what the model leaves unpriced: a K loop no longer
+    # than the per-tile fixed charge (32768x256x256, four K blocks).
+    orientation = transposed_pair_tile_orientation(32768, 256, 256, sm_pairs=76)
+    assert orientation.gain == 1.0
+    assert not (orientation.written_warms or orientation.transposes)
 
 
 def test_a_row_major_pair_under_a_128_row_ceiling_runs_128_rows() -> None:
