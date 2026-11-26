@@ -1466,6 +1466,24 @@ class RefEagerTestBase:
         if not self._in_ref_eager_mode:
             super().assertNotIn(member, container, msg)  # type: ignore[misc]
 
+    def assertRegex(
+        self,
+        text: str,
+        expected_regex: str | re.Pattern[str],
+        msg: str | None = None,
+    ) -> None:
+        if not self._in_ref_eager_mode:
+            super().assertRegex(text, expected_regex, msg)  # type: ignore[misc]
+
+    def assertNotRegex(
+        self,
+        text: str,
+        unexpected_regex: str | re.Pattern[str],
+        msg: str | None = None,
+    ) -> None:
+        if not self._in_ref_eager_mode:
+            super().assertNotRegex(text, unexpected_regex, msg)  # type: ignore[misc]
+
     def assertIs(self, expr1: object, expr2: object, msg: str | None = None) -> None:
         if not self._in_ref_eager_mode:
             super().assertIs(expr1, expr2, msg)  # type: ignore[misc]

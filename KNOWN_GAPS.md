@@ -769,3 +769,40 @@ these labelled lines.
 - Pinned by: `test_grid_induction_product_uses_kernel_index_type` in
   `test/test_cute_fragment_loop_captures.py` checks computed-fragment
   index widths; it does not exercise the ordinary nested-store overflow.
+
+## tile-index-traced-narrower-than-widened-root
+
+- Area: `tile.index` of a Triton root grid whose lane coordinates codegen
+  widens to Int64 (`_root_coordinate_dtype` in `tile_strategy.py`: a
+  shifted or strided root that can pass Int32, a root whose end is a
+  loaded Int64, UInt32 or UInt64 tensor or a literal past Int32, or one
+  whose tile width the config does not fix), read under
+  `debug_dtype_asserts`.
+- What is wrong: `tile.index` is traced with the kernel's index dtype
+  (Int32 by default, the fake of `tile_index` in `language/tile_ops.py`),
+  while codegen gives the root's coordinates Int64. With two Int64 outputs
+  of 8 elements and `pid_type="persistent_blocked"`,
+
+      bs = hl.register_block_size(4)
+      for t in hl.tile(0, block_size=bs):
+          out[t.index % 8] = t.index
+      for t in hl.tile(2**31, 2**31 + 2, block_size=bs):
+          other[t.index % 8] = t.index
+
+  stores `other[:2] == [2147483648, 2147483649]`, as eager does, but with
+  `HELION_DEBUG_DTYPE_ASSERTS=1` the second root's index is cast to its
+  traced Int32 (`load_1 = tl.cast(load_1, tl.int32)`) and the stores are
+  `[-2147483648, -2147483647]` (the Triton interpreter on the CPU).
+- Since: #4671 (`92ae27838`), which chose each root's coordinate width
+  apart from the storage index type.
+- Why deferred: the width codegen picks depends on the config (the
+  configured tile width decides whether the last tile's padded lanes pass
+  Int32) and on host size origins, while `tile.index` is traced once,
+  before any config, for a block id that several roots can share (here
+  through one registered block size). Tracing Int64 for every root some
+  config could widen changes the generated code of ordinary shifted roots;
+  a traced dtype per root and config needs the tracer to see codegen's
+  decision.
+- Pinned by: `test_an_empty_root_does_not_narrow_a_later_live_root` in
+  `test/test_cartesian_grid_codegen.py` runs with `debug_dtype_asserts`
+  off and checks the stores above without the asserts.

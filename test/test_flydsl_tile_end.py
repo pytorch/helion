@@ -9,17 +9,21 @@ import torch
 
 import helion
 from helion._testing import cpu_render_target
+from helion._testing import skipIfRefEagerMark
 from helion._testing.cute_codegen import cpu_bind
 import helion.language as hl
 
 pytestmark = pytest.mark.cpu_only
 
 
+@skipIfRefEagerMark("renders FlyDSL source, which ref mode does not build")
 @pytest.mark.parametrize(
     "fixed_end", [False, True], ids=["dynamic-stop", "folded-stop"]
 )
 def test_shifted_tile_end_casts_integer_bounds(fixed_end: bool) -> None:
-    @helion.kernel(backend="flydsl", static_shapes=False)
+    # FlyDSL refuses debug_dtype_asserts (they are Triton checks), which the
+    # dtype-asserts job turns on for every kernel.
+    @helion.kernel(backend="flydsl", static_shapes=False, debug_dtype_asserts=False)
     def shifted(out, fixed_end: hl.constexpr):
         start = out.size(0) - 8 if fixed_end else 1
         stop = 2 if fixed_end else out.size(0)
