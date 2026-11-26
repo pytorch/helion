@@ -433,6 +433,7 @@ def register_search_surface(device_ir: DeviceIR, config_spec: ConfigSpec) -> Non
     else:
         from .cute_mma import _rank3_grouped_root_axes
         from .cute_mma import analyze_cute_mma_node
+        from .cute_mma import batched_ab_tma_provable
         from .cute_mma import tcgen05_fragment_epilogue_source_tiles_reachable
         from .tcgen05.search_plan import _plan_cute_tcgen05_search_candidate
         from .tcgen05.search_plan import enable_cute_tcgen05_search
@@ -537,6 +538,10 @@ def register_search_surface(device_ir: DeviceIR, config_spec: ConfigSpec) -> Non
                     or candidate.operands.rhs.source_to_logical_order is not None
                 ),
                 operand_casts=candidate in cast_candidates,
+                batched_ab_tma=(
+                    candidate.operands.has_leading_passthrough
+                    and batched_ab_tma_provable(env, candidate.operands)
+                ),
             )
             planning_results.append(planning_result)
             search_plan = planning_result.plan

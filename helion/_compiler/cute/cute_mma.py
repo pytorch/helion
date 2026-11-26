@@ -1456,10 +1456,11 @@ def host_function_matmul_operands_tma_provable(
     return True
 
 
-def host_function_cp_async_a_provable(
+def host_function_cp_async_a_layouts(
     env: CompileEnvironment, host_function: HostFunction
-) -> bool:
-    """Whether every MMA reads an A the epilogue warps copy with ``cp.async``.
+) -> tuple[Tcgen05CpAsyncALayout, ...] | None:
+    """The layouts of the A operands every MMA reads through the epilogue
+    warps' ``cp.async`` copies, or ``None`` when some MMA's A is not one.
 
     Each candidate's A fails the TensorMap proof but is an M-contiguous 16-bit
     operand ``tcgen05_cp_async_a_operand_layout`` accepts and its B passes the
@@ -1485,9 +1486,9 @@ def host_function_cp_async_a_provable(
             for info in env.block_sizes
         )
     ):
-        return False
+        return None
     device_ir = host_function.device_ir
-    found = False
+    layouts: list[Tcgen05CpAsyncALayout] = []
     with _host_function_tma_proof_scope(env, host_function):
         for graph_info in device_ir.graphs:
             for node in graph_info.graph.nodes:
@@ -1495,15 +1496,17 @@ def host_function_cp_async_a_provable(
                 if candidate is None:
                     continue
                 lhs, rhs = candidate.operands.lhs, candidate.operands.rhs
-                if (
-                    lhs.matrix_major != "col"
+                layout = (
+                    None
+                    if lhs.matrix_major != "col"
                     or _tcgen05_tma_operand_is_aligned(env, lhs)
                     or not _tcgen05_tma_operand_is_aligned(env, rhs)
-                    or tcgen05_cp_async_a_operand_layout(env, lhs.source_fake) is None
-                ):
-                    return False
-                found = True
-    return found
+                    else tcgen05_cp_async_a_operand_layout(env, lhs.source_fake)
+                )
+                if layout is None:
+                    return None
+                layouts.append(layout)
+    return tuple(layouts) or None
 
 
 def host_function_exact_aux_tma_provable(
@@ -5815,7 +5818,9 @@ def prepare_cute_collective_lane_loop_suppression(
             if (
                 analysis.has_leading_passthrough
                 and not _mma_tiles_are_static_full(analysis, bm=bm, bn=bn, bk=bk)
-                and not _ragged_batched_tcgen05_config(cg.device_function.config, bn)
+                and not _ragged_batched_tcgen05_config(
+                    cg.device_function.config, analysis, bm=bm, bn=bn, bk=bk
+                )
             ):
                 continue
             if not _operand_infos_exclusive_for_mma(lhs_operand, rhs_operand, node):
@@ -7153,8 +7158,16 @@ def _flat_one_cta_tcgen05_config(config: Config) -> bool:
     )
 
 
-def _ragged_batched_tcgen05_config(config: Config, bn: object) -> bool:
-    """Whether a partial-tile batched GEMM may take the flat tcgen05 path.
+def _ragged_batched_tcgen05_config(
+    config: Config,
+    analysis: _MmaOperandAnalysis,
+    *,
+    bm: object,
+    bn: object,
+    bk: object,
+) -> bool:
+    """Whether a partial-tile batched GEMM may take a tcgen05 path: the flat
+    one-CTA pipeline, or the persistent CtaGroup.TWO pairs.
 
     Shared by the planning loop, the specialized-MMA thread layout and the
     emitter: the three must agree, or a tcgen05 launch geometry wraps a
@@ -7165,13 +7178,134 @@ def _ragged_batched_tcgen05_config(config: Config, bn: object) -> bool:
     unaligned row stride below the staging floor) take the one-warp scalar
     SMEM producer on this path, which computes them correctly but slowly
     (``test_ragged_batched_unaligned_rows_take_the_scalar_producer``).
+
+    The persistent pairs run the role-local schedulers over (N tile, M tile,
+    batch) work tiles, the TMA loads zero-fill past each matrix and the 3-D
+    TMA store clips at its edges (the planner's ``batched_pair_matrix``: one
+    256x256 pair over each 200x200 matrix), where
+    ``_ragged_batched_pair_config`` admits them. A persistent one-CTA config
+    keeps the shared work-tile loop, whose host guard refuses more than one
+    partial tile.
     """
-    return (
+    if not (
         CompileEnvironment.current().settings.cute_flat_edge_tma
-        and _flat_one_cta_tcgen05_config(config)
         and isinstance(bn, int)
         and bn >= RAGGED_BATCHED_MIN_BLOCK_N
+    ):
+        return False
+    if _is_persistent_pid_config(config):
+        return _ragged_batched_pair_config(config, analysis, bm=bm, bn=bn, bk=bk)
+    return _flat_one_cta_tcgen05_config(config)
+
+
+def _ragged_batched_pair_config(
+    config: Config,
+    analysis: _MmaOperandAnalysis,
+    *,
+    bm: object,
+    bn: object,
+    bk: object,
+) -> bool:
+    """Whether a persistent config runs a ragged batched GEMM on the CTA
+    pairs' role-local TMA producer: a CtaGroup.TWO tile, A and B loaded
+    through TMA (``_tcgen05_batched_ab_tma``), and K whole or longer than one
+    K tile -- what ``plan_tcgen05_pipeline``'s partial-tile families (M edge,
+    N edge, double edge, K tail) take. A tcgen05_cluster_n=2 cluster (B
+    multicast across a pair of N tiles) also needs whole N-tile pairs and no
+    L2 grouping or swizzle on a batched grid, else ``plan_tcgen05_pipeline``
+    refuses it, and takes a K tail only over whole M tiles (the families'
+    ``tcgen05_single_edge_k_tail`` is a one-N-tile cluster's).
+
+    Any other pair falls back to the shared scalar-copy body. An fp16 bmm
+    [2, 256, 128] @ [2, 128, 300] under block_sizes [1, 256, 256, 64],
+    persistent, tcgen05_cluster_m=2 (B's 600-byte rows fit no TensorMap,
+    and its 76800 elements sit under the staging floor) renders a
+    CtaGroup.TWO kernel whose host guard refuses every launch:
+
+        _helion_tcgen05_persistent_total_tiles = 2 * ((256 + _BLOCK_SIZE_1 - 1) // _BLOCK_SIZE_1) * ((300 + _BLOCK_SIZE_2 - 1) // _BLOCK_SIZE_2)
+        if _helion_tcgen05_persistent_total_tiles > 0:
+            raise RuntimeError('Helion CuTe persistent + tcgen05 currently supports ...')
+
+    A 128-row tcgen05_cluster_m=2 tile (the clustered CtaGroup.ONE family),
+    K = 48 under 64-deep K tiles and, under tcgen05_cluster_n=2, [2, 300,
+    136] @ [2, 136, 512] (an M edge and a K tail) render that guard too.
+    [2, 300, 100] @ [2, 100, 300] (a double edge, 200-byte A rows) fails to
+    compile with ``BackendUnsupported: tcgen05 SIMT edge epilogue double-edge
+    output tiles ...``, and a batched cluster_n=2 under an L2 grouping with
+    ``BackendUnsupported: tcgen05 matmul with a leading passthrough axis
+    supports tcgen05_cluster_n=2 only for whole N-tile pairs ...``. Declined,
+    they keep the generic lowering they had before the pairs ran ragged
+    matrices, which computes them.
+    """
+    knobs = Tcgen05Knobs.from_config(config)
+    if not (
+        int_knob(config, "tcgen05_cluster_m", 1) == 2
+        and isinstance(bm, int)
+        and isinstance(bn, int)
+        and isinstance(bk, int)
+        and _tcgen05_use_2cta_instrs(
+            bm=bm,
+            cluster_m=2,
+            input_dtype=analysis.lhs.logical_fake.dtype,
+            cta_group=knobs.cta_group,
+        )
+    ):
+        return False
+    m_size = int(analysis.lhs.matrix_rows)
+    n_size = int(analysis.rhs.matrix_cols)
+    k_size = int(analysis.lhs.matrix_cols)
+    # A K tail rides the families only past the first K tile
+    # (``tcgen05_has_k_tail``: K > block_k).
+    if k_size % bk != 0 and k_size < bk:
+        return False
+    if cluster_n_knob(config) == 2 and not (
+        n_size % (2 * bn) == 0
+        and l2_swizzle_size_from_config(config) == 1
+        and all(grouping == 1 for grouping in knobs.l2_groupings)
+        and (k_size % bk == 0 or m_size % bm == 0)
+    ):
+        return False
+    return _tcgen05_batched_ab_tma(CompileEnvironment.current(), analysis)
+
+
+def _tcgen05_tma_dtype(dtype: torch.dtype) -> bool:
+    """Whether the tcgen05 TMA producer loads operands of ``dtype``."""
+    return dtype in (
+        torch.float16,
+        torch.bfloat16,
+        torch.float8_e4m3fn,
+    ) or (dtype == torch.float32 and cute_fp32_dot_uses_tf32())
+
+
+def _tcgen05_batched_ab_tma(
+    env: CompileEnvironment, analysis: _MmaOperandAnalysis
+) -> bool:
+    """Whether ``plan_tcgen05_pipeline`` loads both operands of a batched
+    (leading-passthrough) GEMM through TMA, its ``tcgen05_use_tma_pipeline``:
+    a TMA dtype, an A it stages in storage order
+    (``lhs_tma_major_supported``), a row- or column-major B, and both layouts
+    proved TensorMap-aligned."""
+    return (
+        _tcgen05_tma_dtype(analysis.lhs.logical_fake.dtype)
+        and analysis.lhs_tma_major_supported
+        and analysis.rhs.matrix_major in ("row", "col")
+        and _tcgen05_tma_operand_is_aligned(env, analysis.lhs)
+        and _tcgen05_tma_operand_is_aligned(env, analysis.rhs)
     )
+
+
+def batched_ab_tma_provable(
+    env: CompileEnvironment, analysis: _MmaOperandAnalysis
+) -> bool:
+    """``_tcgen05_batched_ab_tma`` at bind time, for the search's
+    ``batched_pair_matrix`` admission (the pairs' seeds and their cluster_m
+    choice), so the search seeds the ragged pairs only where they run. The
+    search surface registers before the runtime records the bound alignment
+    facts codegen reads; prove over the active runtime arguments instead
+    (``_host_function_tma_proof_scope``), as the direct-entry seed gate
+    does."""
+    with _host_function_tma_proof_scope(env, HostFunction.current()):
+        return _tcgen05_batched_ab_tma(env, analysis)
 
 
 def _tcgen05_cp_async_a_config_ok(env: CompileEnvironment, config: Config) -> bool:
@@ -8703,11 +8837,7 @@ def plan_tcgen05_pipeline(
         _dtype_map[epi_elem_dtype] if epi_elem_dtype is not None else input_dtype_str
     )
 
-    _dtype_tma_ok = input_dtype in (
-        torch.float16,
-        torch.bfloat16,
-        torch.float8_e4m3fn,
-    ) or (input_dtype == torch.float32 and cute_fp32_dot_uses_tf32())
+    _dtype_tma_ok = _tcgen05_tma_dtype(input_dtype)
     _lhs_major = lhs_operand.matrix_major
     _rhs_major = rhs_operand.matrix_major
     # A is K-major when its (M, K) storage is K-contiguous (row-major) and
@@ -8724,6 +8854,17 @@ def plan_tcgen05_pipeline(
         and lhs_fake.ndim == 2
         and rhs_fake.ndim == 2
         and not (analysis is not None and analysis.has_leading_passthrough)
+    )
+    # A batched GEMM over rank-3 A and B whose batch axis is the grid's
+    # leading passthrough axis (``bmm``): its matrices are plain GEMMs.
+    batched_gemm = (
+        a_own_order_schedule
+        and analysis is not None
+        and analysis.has_leading_passthrough
+        and analysis.lhs.is_leading_passthrough
+        and analysis.rhs.is_leading_passthrough
+        and lhs_fake.ndim == 3
+        and rhs_fake.ndim == 3
     )
     tcgen05_use_tma_a = _dtype_tma_ok and (
         _lhs_major == "row"
@@ -8749,7 +8890,7 @@ def plan_tcgen05_pipeline(
         and _tcgen05_tma_operand_is_aligned(env, rhs_operand)
     ):
         if (
-            plain_gemm
+            (plain_gemm or batched_gemm)
             and _lhs_major == "col"
             and tcgen05_use_tma_b
             # the producer runs whole tiles or the flat-edge TMA path; without
@@ -9352,11 +9493,16 @@ def plan_tcgen05_pipeline(
         and not mma_tiles_are_static_full
         # Ragged batched tiles run on the flat one-CTA pipeline, which loads
         # them through TMA and stores them with predicated copies
-        # (``tcgen05_flat_edge_tma`` below); the persistent and clustered
-        # batched schedules keep requiring whole tiles.
-        and not _ragged_batched_tcgen05_config(df.config, bn)
+        # (``tcgen05_flat_edge_tma`` below), or on the persistent CTA pairs'
+        # role-local TMA producer, whose 3-D TMA store clips each matrix
+        # (``_ragged_batched_pair_config``); the other persistent and
+        # clustered batched schedules keep requiring whole tiles.
+        and not _ragged_batched_tcgen05_config(df.config, analysis, bm=bm, bn=bn, bk=bk)
     ):
-        return Declined("ragged batched tiles need the flat one-CTA pipeline")
+        return Declined(
+            "ragged batched tiles need the flat one-CTA pipeline or the CTA "
+            "pairs' TMA producer"
+        )
     # A leading-passthrough collective absorbs its serialized K loop. Other
     # non-root lane loops must already have been suppressed by MMA planning;
     # reusing one fragment across their logical iterations is wrong.
@@ -16362,6 +16508,13 @@ def _emit_mma_pipeline(
                     ab_stages=plan.tcgen05_ab_stage_count_value,
                     prefix=df.new_var("tcgen05_cpa"),
                     dtype_str=plan.input_dtype_str,
+                    # a batched A: the tile's matrix (the grid's batch index)
+                    batch_index=(
+                        plan.leading_global
+                        if plan.lhs_operand.is_leading_passthrough
+                        else None
+                    ),
+                    block_k=plan.bk,
                 )
                 prefix.extend(ast.parse("\n".join(tcgen05_cpa_plan.setup_lines())).body)
             _emit_tcgen05_tmem_setup()
@@ -16873,10 +17026,13 @@ def _emit_mma_pipeline(
                                 + textwrap.indent(
                                     "\n".join(
                                         line
+                                        # every k-block starting inside K,
+                                        # a K tail's last one too (as the
+                                        # flat-edge TMA prologue issues B's)
                                         for stage_idx in range(
                                             min(
                                                 plan.tcgen05_ab_stage_count_value,
-                                                plan.k_total_size // plan.bk,
+                                                -(-plan.k_total_size // plan.bk),
                                             )
                                         )
                                         for line in tcgen05_cpa_plan.issue_lines(

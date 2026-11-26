@@ -1268,9 +1268,10 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         Used by the scheduler-backed edge path to publish interior tiles and
         fringe tiles through separate scheduler phases while keeping every
         consumer role on the same tile order within each phase. The predicate
-        must match the consumer's post-L2-remap ``pid_0`` / ``pid_1`` rather
-        than the scheduler's raw tile coordinates; otherwise grouped PID order
-        can send a fringe tile down the full-tile TMA-store path.
+        must match the M and N coordinates the consumers decode from the
+        virtual pid (after the L2 remap) rather than the scheduler's raw tile
+        coordinates; otherwise grouped PID order, or a batch axis, can send a
+        fringe tile down the full-tile TMA-store path.
         """
         assert len(self.pid_info) >= 2, (
             "tcgen05 output full-tile split requires M/N PID dimensions"
@@ -1287,67 +1288,88 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
                 return int(str(raw[0])) if raw else 1
             return int(str(raw))
 
-        # M and N are the trailing two PID axes; any leading axes are
-        # passthrough (batch) that only offset memory (mirrors
-        # ``_specialized_mma_root_mn_block_ids``), so read M/N from the tail
-        # rather than positions 0/1. NOTE: the coord extraction below linearizes
-        # over M/N only. Batched *partial*-tile edge splitting would also need
-        # the leading passthrough factored out of the virtual pid; that is not a
-        # validated path (the multi-tile guard restricts batched 2-CTA to static
-        # full tiles, for which this predicate is true for every tile anyway).
+        l2_group = l2_grouping()
+        cluster_n = self._tcgen05_cluster_n()
+
+        def grouped_pair_coords(
+            pid: str, first: PIDInfo, second: PIDInfo
+        ) -> tuple[str, str]:
+            """The coordinates the consumers decode on the two fastest PID
+            axes from their flattened index ``pid``:
+            ``L2GroupingProgramIDs.codegen``'s grouped decode (cluster-aware
+            under cluster_n > 1), or the plain decomposition."""
+            num_first = first.num_pids_expr(is_device=True)
+            if l2_group > 1 and cluster_n > 1:
+                # Mirror ``L2GroupingProgramIDs.codegen``'s cluster-aware box
+                # decode exactly: the predicate must classify tiles by the same
+                # post-remap coordinates the consumer decodes, or grouped PID
+                # order sends fringe tiles down the full-tile TMA-store path.
+                num_second = second.num_pids_expr(is_device=True)
+                lane = f"((({pid}) // ({num_first})) % cutlass.Int32({cluster_n}))"
+                box_pid = (
+                    f"(((({pid}) // ({num_first})) // cutlass.Int32({cluster_n}))"
+                    f" * ({num_first}) + ({pid}) % ({num_first}))"
+                )
+                num_box = (
+                    f"((({num_second}) + cutlass.Int32({cluster_n - 1}))"
+                    f" // cutlass.Int32({cluster_n}))"
+                )
+                num_pid_in_group = f"cutlass.Int32({l2_group}) * ({num_box})"
+                group_id = f"({box_pid}) // ({num_pid_in_group})"
+                first_pid = f"({group_id}) * cutlass.Int32({l2_group})"
+                group_size = (
+                    f"min(({num_first}) - ({first_pid}), cutlass.Int32({l2_group}))"
+                )
+                first_coord = (
+                    f"({first_pid}) + "
+                    f"((({box_pid}) % ({num_pid_in_group})) % ({group_size}))"
+                )
+                second_coord = (
+                    f"(((({box_pid}) % ({num_pid_in_group})) // ({group_size}))"
+                    f" * cutlass.Int32({cluster_n}) + {lane})"
+                )
+                return first_coord, second_coord
+            if l2_group > 1:
+                num_second = second.num_pids_expr(is_device=True)
+                num_pid_in_group = f"cutlass.Int32({l2_group}) * ({num_second})"
+                group_id = f"({pid}) // ({num_pid_in_group})"
+                first_pid = f"({group_id}) * cutlass.Int32({l2_group})"
+                group_size = (
+                    f"min(({num_first}) - ({first_pid}), cutlass.Int32({l2_group}))"
+                )
+                first_coord = (
+                    f"({first_pid}) + "
+                    f"((({pid}) % ({num_pid_in_group})) % ({group_size}))"
+                )
+                second_coord = f"(({pid}) % ({num_pid_in_group})) // ({group_size})"
+                return first_coord, second_coord
+            return f"({pid}) % ({num_first})", f"({pid}) // ({num_first})"
+
+        # M and N are the trailing two PID axes (mirrors
+        # ``_specialized_mma_root_mn_block_ids``). The consumers' decode works
+        # on PID order: ``L2GroupingProgramIDs.codegen`` groups the two
+        # fastest axes, pid_0 and pid_1, and decomposes a slower one in order
+        # (as the plain decomposition does). On a batched grid, PID order
+        # (batch, m, n), that pair is (batch, m) and N is the slowest axis, so
+        # the batch is decoded out of the virtual pid rather than read as part
+        # of M: [2, 300, 512] on 256x256 CTA pairs would otherwise publish
+        # batch 0's M-fringe tile (virtual pid 2) as a full tile, whose
+        # unguarded auxiliary loads read past the matrix.
         m_pid = self.pid_info[-2]
         n_pid = self.pid_info[-1]
         virtual_pid = self._tcgen05_linear_virtual_pid_expr(work_tile_var)
-        num_pid_m = m_pid.num_pids_expr(is_device=True)
-        l2_group = l2_grouping()
-        cluster_n = self._tcgen05_cluster_n()
-        if l2_group > 1 and cluster_n > 1:
-            # Mirror ``L2GroupingProgramIDs.codegen``'s cluster-aware box
-            # decode exactly: the predicate must classify tiles by the same
-            # post-remap (pid_m, pid_n) the consumer decodes, or grouped PID
-            # order sends fringe tiles down the full-tile TMA-store path.
-            num_pid_n = n_pid.num_pids_expr(is_device=True)
-            lane_n = (
-                f"((({virtual_pid}) // ({num_pid_m})) % cutlass.Int32({cluster_n}))"
+        if self._tcgen05_batched_grid():
+            batch_pid = self.pid_info[0]
+            batch_m_tiles = (
+                f"({batch_pid.num_pids_expr(is_device=True)})"
+                f" * ({m_pid.num_pids_expr(is_device=True)})"
             )
-            box_pid = (
-                f"(((({virtual_pid}) // ({num_pid_m})) // cutlass.Int32({cluster_n}))"
-                f" * ({num_pid_m}) + ({virtual_pid}) % ({num_pid_m}))"
+            _, m_coord = grouped_pair_coords(
+                f"({virtual_pid}) % ({batch_m_tiles})", batch_pid, m_pid
             )
-            num_box_n = (
-                f"((({num_pid_n}) + cutlass.Int32({cluster_n - 1}))"
-                f" // cutlass.Int32({cluster_n}))"
-            )
-            num_pid_in_group = f"cutlass.Int32({l2_group}) * ({num_box_n})"
-            group_id = f"({box_pid}) // ({num_pid_in_group})"
-            first_pid_m = f"({group_id}) * cutlass.Int32({l2_group})"
-            group_size_m = (
-                f"min(({num_pid_m}) - ({first_pid_m}), cutlass.Int32({l2_group}))"
-            )
-            m_coord = (
-                f"({first_pid_m}) + "
-                f"((({box_pid}) % ({num_pid_in_group})) % ({group_size_m}))"
-            )
-            n_coord = (
-                f"(((({box_pid}) % ({num_pid_in_group})) // ({group_size_m}))"
-                f" * cutlass.Int32({cluster_n}) + {lane_n})"
-            )
-        elif l2_group > 1:
-            num_pid_n = n_pid.num_pids_expr(is_device=True)
-            num_pid_in_group = f"cutlass.Int32({l2_group}) * ({num_pid_n})"
-            group_id = f"({virtual_pid}) // ({num_pid_in_group})"
-            first_pid_m = f"({group_id}) * cutlass.Int32({l2_group})"
-            group_size_m = (
-                f"min(({num_pid_m}) - ({first_pid_m}), cutlass.Int32({l2_group}))"
-            )
-            m_coord = (
-                f"({first_pid_m}) + "
-                f"((({virtual_pid}) % ({num_pid_in_group})) % ({group_size_m}))"
-            )
-            n_coord = f"(({virtual_pid}) % ({num_pid_in_group})) // ({group_size_m})"
+            n_coord = f"({virtual_pid}) // ({batch_m_tiles})"
         else:
-            m_coord = f"({virtual_pid}) % ({num_pid_m})"
-            n_coord = f"({virtual_pid}) // ({num_pid_m})"
+            m_coord, n_coord = grouped_pair_coords(virtual_pid, m_pid, n_pid)
 
         m_extent = pid_numel_expr(m_pid)
         n_extent = pid_numel_expr(n_pid)

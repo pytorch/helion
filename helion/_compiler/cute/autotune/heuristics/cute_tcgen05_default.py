@@ -327,6 +327,11 @@ def _promoted_values(seed: Config) -> dict[str, Any]:
     return values
 
 
+# The fewest K rows a short K loop's cp.async-A ring keeps in flight
+# (``_cp_async_a_default``): four 16-deep k-blocks.
+_CP_ASYNC_A_SHORT_K_MIN_ROWS = 64
+
+
 class CuteTcgen05DefaultTileHeuristic(AutotunerHeuristic):
     name = "cute_tcgen05_default_tile"
     backend = "cute"
@@ -395,7 +400,19 @@ class CuteTcgen05DefaultTileHeuristic(AutotunerHeuristic):
         streams all of B, so 30522x128x32768 with ``x.T`` as A read 1.9 GB of
         B beside the 2 GB A on 239 128-row tiles and half that on 120 paired
         ones (0.93 -> 1.00 of the ATen GEMM). The flat SIMT base default ran
-        0.24, the staged (transposing) copy of A 0.54.
+        0.24, the staged (transposing) copy of A 0.54. A batched GEMM counts
+        the tiles of all its matrices, and a K tail rides one more k-block.
+
+        A short K loop keeps about a quarter of it in flight: where the
+        64-deep ring would ask for half the K loop or more at once, the ring
+        holds max(64, K / 4) K rows instead (16-deep k-blocks on four stages
+        at 64 rows). Every one-tile CTA asking for its whole K loop starts its
+        first MMA behind every other CTA's last rows. GB300, bf16 M = 196
+        (392-byte A rows), 256-row tiles, of stock Inductor (Triton), K rows
+        in flight / result: 768 x 196x64x196 64 (bk 16 ab 4) 1.096, 256 (bk
+        64 ab 4) 0.82; 768 x 196x128x196 64 1.052, 256 0.90; 256 x 196x64x512
+        128 (bk 64 ab 2) 1.131, 256 1.054; 128 x 196x64x1024 keeps the
+        deepest ring, 256 rows 1.335 (64: 0.995).
         """
         spec = env.config_spec
         state = spec._cute_tcgen05_config
@@ -404,21 +421,33 @@ class CuteTcgen05DefaultTileHeuristic(AutotunerHeuristic):
             return None
         m, n, k = cast("tuple[int, int, int]", extents)
         bk = TCGEN05_CP_ASYNC_A_BLOCK_K
-        bn = 256 if n > 128 else 128
-        paired_tiles = cdiv(m, 2 * TCGEN05_CP_ASYNC_A_TILE_M) * cdiv(n, bn)
+        # the narrowest power-of-two width covering N up to 128, 256 past it
+        bn = 256 if n > 128 else 128 if n > 64 else 64
+        paired_tiles = (
+            state.matmul_leading_work_multiplier
+            * cdiv(m, 2 * TCGEN05_CP_ASYNC_A_TILE_M)
+            * cdiv(n, bn)
+        )
         bm = (
             2 * TCGEN05_CP_ASYNC_A_TILE_M
             if 4 * paired_tiles >= 3 * state.device_sm_count
             and repair.cp_async_a_paired_rows_allowed(state)
             else TCGEN05_CP_ASYNC_A_TILE_M
         )
-        block_sizes = facts._matmul_seed_block_sizes(state, bm=bm, bn=bn, bk=bk)
         stages = smem.max_ab_stages_that_fit(state, bm=bm, bn=bn, bk=bk, cluster_m=1)
+        ab_stages = min(stages, cdiv(k, bk))
+        if 2 * ab_stages * bk >= k:
+            rows = max(_CP_ASYNC_A_SHORT_K_MIN_ROWS, k // 4)
+            if rows <= _CP_ASYNC_A_SHORT_K_MIN_ROWS:
+                # the shallowest k-block the A layout takes, four of them at 16
+                bk = max(16, state.cp_async_a_min_block_k)
+                ab_stages = max(2, _CP_ASYNC_A_SHORT_K_MIN_ROWS // bk)
+            else:
+                ab_stages = max(2, min(ab_stages, rows // bk))
+        block_sizes = facts._matmul_seed_block_sizes(state, bm=bm, bn=bn, bk=bk)
         if block_sizes is None or stages < 2 or "flat" not in spec.allowed_pid_types:
             return None
-        return _one_cta_config(
-            block_sizes, pid_type="flat", ab_stages=min(stages, k // bk)
-        )
+        return _one_cta_config(block_sizes, pid_type="flat", ab_stages=ab_stages)
 
     @staticmethod
     def _epi_tma_aux_values(

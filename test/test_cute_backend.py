@@ -1145,6 +1145,26 @@ def cute_batched_baddbmm_tcgen05(
 
 
 @helion.kernel(backend="cute")
+def cute_batched_baddbmm_into_tcgen05(
+    x: torch.Tensor,
+    y: torch.Tensor,
+    out: torch.Tensor,
+) -> torch.Tensor:
+    b, m, k = x.size()
+    _, _, n = y.size()
+    for tile_b, tile_m, tile_n in hl.tile([b, m, n]):
+        acc = hl.zeros([tile_b, tile_m, tile_n], dtype=torch.float32)
+        for tile_k in hl.tile(k):
+            acc = torch.baddbmm(
+                acc,
+                x[tile_b, tile_m, tile_k],
+                y[tile_b, tile_k, tile_n],
+            )
+        out[tile_b, tile_m, tile_n] = acc
+    return out
+
+
+@helion.kernel(backend="cute")
 def cute_batched_baddbmm_rowvec_bias_tcgen05(
     x: torch.Tensor,
     y: torch.Tensor,
@@ -13145,11 +13165,23 @@ class TestCuteBackend(TestCase):
 
             # Ragged batched extents run the flat one-CTA pipeline (TMA
             # zero-fills the partial tiles; the SIMT epilogue masks them), so
-            # a shape without a legal full tile still searches tcgen05, with
-            # the two-CTA families withheld.
-            ragged_spec = search_spec(160, 256, 128)
+            # a shape without a legal full tile still searches tcgen05. The
+            # two-CTA families join it where each matrix is taller and wider
+            # than 128 rows and K is whole (the planner's batched_pair_matrix:
+            # one 256x256 CTA pair over a 160 x 256 matrix, two over 300 x
+            # 256), whose role-local TMA producer and 3-D TMA store clip each
+            # matrix's edges (test_cute_tcgen05_flat_edge_gpu.py's
+            # test_ragged_batched_matrices_run_one_pair_each); a matrix 128
+            # columns wide keeps the flat pipeline alone.
+            ragged_spec = search_spec(300, 128, 128)
             self.assertTrue(ragged_spec.tcgen05.search_enabled)
             self.assertEqual(ragged_spec.tcgen05.cluster_m_search_choices, (1,))
+            pair_spec = search_spec(160, 256, 128)
+            self.assertTrue(pair_spec.tcgen05.search_enabled)
+            self.assertEqual(pair_spec.tcgen05.cluster_m_search_choices, (1, 2))
+            pairs_spec = search_spec(300, 256, 128)
+            self.assertTrue(pairs_spec.tcgen05.search_enabled)
+            self.assertEqual(pairs_spec.tcgen05.cluster_m_search_choices, (1, 2))
             # The M ceiling is no longer narrowed to the extent's power-of-two
             # divisor: a 256-row tile over 320 rows is a legal partial tile.
             divisor_spec = search_spec(320, 256, 128)
@@ -13656,55 +13688,63 @@ class TestCuteBackend(TestCase):
         self.assertNotIn("cute.gemm(", code)
         torch.testing.assert_close(out, expected.to(out.dtype), atol=1e-1, rtol=1e-2)
 
-    def test_batched_two_cta_partial_edge_tiles_projected_onto_one_cta(self) -> None:
-        # A batched CtaGroup.TWO matmul with ANY partial tile -- M edge, N
-        # edge, OR a K tail -- must never emit the two-CTA pipeline: the
-        # output-edge scheduler linearizes the virtual pid across the batch
-        # axis and the K-tail reduction is batch-unaware, so both would
-        # silently miscompute (only static full tiles are validated for
-        # batched 2-CTA). The search admits these shapes on the flat one-CTA
-        # ragged pipeline alone, and an explicit cluster_m=2 config is
-        # projected onto it. Each (M, K) x (K, N) below makes exactly one
-        # axis partial vs the 256x256x64 blocks (plus the combined case).
+    def test_batched_two_cta_partial_tiles_run_pairs_only_through_tma(self) -> None:
+        # An explicit CtaGroup.TWO config over a batched GEMM's partial tiles
+        # (an M edge, an N edge, a K tail, or all three vs the 256x256x64
+        # blocks) runs on the persistent CTA pairs where their role-local TMA
+        # producer loads both operands: TMA zero-fills past each matrix, the
+        # role-local schedulers walk (N tile, M tile, batch) work tiles and the
+        # 3-D TMA store clips each matrix (the M edge). Half rows of 300 (N) or
+        # 100 (K) elements are 600 / 200 bytes, which no TensorMap addresses,
+        # and these operands sit under the staging floor: there the pairs would
+        # be the shared scalar-copy kernel, whose host guard refuses every
+        # launch (the double edge does not even compile), so the config keeps
+        # the generic lowering. The search offers the one-CTA tiles alone:
+        # batched_pair_matrix needs both operands TMA-loadable, which the
+        # 600- and 200-byte rows are not, and over 300 x 256 matrices, whose
+        # pairs it admits, two matrices make too few pair tiles to fill a
+        # quarter of the SMs (enable_cute_tcgen05_search's quarter-wave gate).
+        # Outputs start as NaN: a tile left unwritten fails.
         support = get_cute_mma_support()
         if not support.tcgen05_f16bf16:
             self.skipTest("tcgen05 F16/BF16 MMA is not supported on this machine")
 
         config = _batched_tcgen05_two_cta_config()
-        # (M, N, K): M-edge, N-edge, K-tail (M/N full), double-edge + K-tail.
-        partial_shapes = [
-            (300, 256, 128),
-            (256, 300, 128),
-            (256, 256, 100),
-            (300, 300, 100),
+        # (M, N, K, runs on the pairs)
+        cases = [
+            (300, 256, 128, True),
+            (256, 300, 128, False),
+            (256, 256, 100, False),
+            (300, 300, 100, False),
         ]
-
-        def _bmm_args(m: int, n: int, k: int) -> tuple[torch.Tensor, torch.Tensor]:
-            return (
-                torch.randn(2, m, k, device=DEVICE, dtype=HALF_DTYPE),
-                torch.randn(2, k, n, device=DEVICE, dtype=HALF_DTYPE),
+        for m, n, k, pairs in cases:
+            label = f"M={m} N={n} K={k}"
+            x = torch.randn(2, m, k, device=DEVICE, dtype=HALF_DTYPE)
+            y = torch.randn(2, k, n, device=DEVICE, dtype=HALF_DTYPE)
+            out = torch.full(
+                (2, m, n), float("nan"), device=DEVICE, dtype=torch.float32
             )
-
-        for m, n, k in partial_shapes:
-            args = _bmm_args(m, n, k)
             with patch.dict(
                 os.environ, {"HELION_CUTE_MMA_IMPL": "tcgen05"}, clear=False
             ):
-                bound = cute_batched_baddbmm_tcgen05.bind(args)
+                bound = cute_batched_baddbmm_into_tcgen05.bind((x, y, out))
                 self.assertTrue(bound.config_spec.tcgen05.search_enabled)
                 self.assertEqual(
                     bound.config_spec.tcgen05.cluster_m_search_choices, (1,)
                 )
                 code = bound.to_code(config)
-                self.assertNotIn(
-                    "CtaGroup.TWO", code, f"2-CTA partial M={m} N={n} K={k} emitted"
-                )
-                self.assertNotIn("tcgen05_scalar_smem_mbar", code)
+                self.assertEqual("CtaGroup.TWO" in code, pairs, label)
+                self.assertEqual("tcgen05_gC3d" in code, pairs, label)
+                self.assertNotIn("_helion_tcgen05_persistent_total_tiles", code)
                 bound.set_config(config)
-                out = bound(*args)
-                torch.testing.assert_close(
-                    out, torch.bmm(*args).to(out.dtype), rtol=1e-2, atol=1e-1
-                )
+                bound(x, y, out)
+            torch.testing.assert_close(
+                out,
+                torch.bmm(x.float(), y.float()),
+                rtol=1e-2,
+                atol=1e-1,
+                msg=label,
+            )
 
     def test_batched_one_cta_partial_tiles_fall_back_correctly(self) -> None:
         support = get_cute_mma_support()

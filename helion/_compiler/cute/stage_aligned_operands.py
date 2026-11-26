@@ -358,7 +358,7 @@ def _fixes_a_tile_block_size(host: HostFunction) -> bool:
 
 def _matmuls_are_zero_seeded_mmas(host: HostFunction) -> bool:
     """Whether every matmul has the form of an MMA the ``cp.async``
-    producer's proof (``cute_mma.host_function_cp_async_a_provable``)
+    producer's proof (``cute_mma.host_function_cp_async_a_layouts``)
     decodes: a ``torch.addmm``, ``torch.baddbmm`` or ``hl.dot(..., acc=)``
     (``@``, ``torch.mm``, ``torch.matmul`` and an ``hl.dot`` without an
     accumulator take no tcgen05 MMA) whose accumulator is a name bound only
@@ -425,7 +425,7 @@ def _cp_async_lhs_names(
     """Unaligned A operands the tcgen05 kernel copies with ``cp.async``.
 
     The first operand of the kernel's only matmul (the default's gate,
-    ``host_function_cp_async_a_provable``, proves every MMA) when its layout
+    ``host_function_cp_async_a_layouts``, proves every MMA) when its layout
     is one the flat one-CTA kernel's epilogue-warp producer serves
     (``tcgen05_cp_async_a_strided_layout``) on a 16-byte aligned base: the
     bound argument's pointer, whose residue the kernel's cache key records
@@ -434,7 +434,11 @@ def _cp_async_lhs_names(
     storage offset is always zero. Beside a B operand that needs no staging
     and is at most ``CP_ASYNC_MAX_N`` wide:
     staging re-lays out all of A through a transposing copy, which a narrow
-    GEMM reads only once or twice. The producer runs whole tiles or the
+    GEMM reads only once or twice. A batched GEMM (A and B both rank 3)
+    qualifies the same way: bf16 ``bmm(a, b)`` with ``a`` [768, 196, 196]
+    strides (38464, 1, 196) (392-byte K rows) beside ``b`` [768, 196, 64]
+    copied A through PyTorch fill and copy kernels (20 + 97 us on GB300)
+    ahead of a 22 us GEMM. The producer runs whole tiles or the
     flat-edge TMA path (``cute_flat_edge_tma``); without that path A is
     staged.
     """
@@ -463,7 +467,8 @@ def _cp_async_lhs_names(
     bound = env.runtime_value_for_tensor(lhs_tensor)
     if (
         env.settings.cute_flat_edge_tma
-        and rhs_tensor.ndim == 2
+        # a GEMM, or a batched one over matrices of A and B alike
+        and rhs_tensor.ndim == lhs_tensor.ndim
         and isinstance(rhs_tensor.size(-1), int)
         and rhs_tensor.size(-1) <= CP_ASYNC_MAX_N
         and isinstance(bound, torch.Tensor)

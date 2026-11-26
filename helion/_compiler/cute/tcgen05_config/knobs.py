@@ -120,6 +120,11 @@ class Tcgen05ClusterM2SearchConstraints(NamedTuple):
     # FFI direct-entry coordinate, the aux-TMA surface) and a sampled
     # cluster_m=2 candidate that is not a one-wave tile runs on one CTA.
     one_wave_only: bool = False
+    # When True, the CTA pairs take K in one k-block (``bk == static_k``): a
+    # batched 16-bit GEMM whose K is one 64-deep K tile at most, whose pairs
+    # the final selection's per-call timing misranks when they split that K
+    # (``search_plan.enable_cute_tcgen05_search``).
+    whole_k: bool = False
 
 
 class Tcgen05AbStagesThreeSearchConstraints(NamedTuple):

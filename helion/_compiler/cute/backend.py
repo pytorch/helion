@@ -898,14 +898,17 @@ def _detect_specialized_mma_loop(
     if not isinstance(bk, int):
         return False
     # Ragged batched tiles take the flat one-CTA tcgen05 pipeline (TMA
-    # zero-fill, predicated stores); the launch geometry must agree with
-    # ``plan_tcgen05_pipeline``'s admission or the MMA warp never exists.
+    # zero-fill, predicated stores) or the persistent CTA pairs' TMA producer
+    # (``_ragged_batched_tcgen05_config``); the launch geometry must agree
+    # with ``plan_tcgen05_pipeline``'s admission or the MMA warp never exists.
     candidates = [
         (node, candidate)
         for node, candidate in candidates
         if not candidate.operands.has_leading_passthrough
         or _mma_tiles_are_static_full(candidate.operands, bm=bm, bn=bn, bk=bk)
-        or _ragged_batched_tcgen05_config(config, bn)
+        or _ragged_batched_tcgen05_config(
+            config, candidate.operands, bm=bm, bn=bn, bk=bk
+        )
     ]
     if not candidates:
         return False

@@ -437,6 +437,7 @@ def allow_cluster_m2_search(
     allow_fp8_small_grid: bool = False,
     allow_one_wave_tiles: bool = False,
     one_wave_only: bool = False,
+    whole_k: bool = False,
 ) -> None:
     assert static_k > 0, "static_k is required for cluster_m=2 K-cap checks"
     assert max_k_tiles > 0, "cluster_m=2 max K tiles must be positive"
@@ -448,6 +449,7 @@ def allow_cluster_m2_search(
         allow_fp8_small_grid=allow_fp8_small_grid,
         allow_one_wave_tiles=allow_one_wave_tiles,
         one_wave_only=one_wave_only,
+        whole_k=whole_k,
     )
     restrict_cluster_m_search(state, (1, 2))
 
@@ -1024,6 +1026,7 @@ def narrow_autotune_to_validated_configs(
     allow_cluster_m2_fp8_small_grid: bool = False,
     allow_cluster_m2_one_wave_tiles: bool = False,
     cluster_m2_one_wave_only: bool = False,
+    cluster_m2_whole_k: bool = False,
     ab_stages_three_dtype_bytes: int | None = None,
     ab_stages_three_device: torch.device | None = None,
     ab_stages_three_output_dtype_bytes: int | None = None,
@@ -1077,6 +1080,7 @@ def narrow_autotune_to_validated_configs(
             allow_fp8_small_grid=allow_cluster_m2_fp8_small_grid,
             allow_one_wave_tiles=allow_cluster_m2_one_wave_tiles,
             one_wave_only=cluster_m2_one_wave_only,
+            whole_k=cluster_m2_whole_k,
         )
     else:
         restrict_cluster_m_search(state, (1,))

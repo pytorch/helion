@@ -234,6 +234,149 @@ class TestCuteTcgen05FlatEdgeGpu(RefEagerTestDisabled, TestCase):
         b = torch.randn(2, 1000, 1000, device=DEVICE, dtype=torch.bfloat16)
         self._check(_bmm, (a, b), torch.bmm(a, b), [1, 128, 256, 64])
 
+    def test_ragged_batched_matrices_run_one_pair_each(self) -> None:
+        # One persistent 256x256 CTA pair per ragged matrix (the planner's
+        # batched_pair_matrix): TMA zero-fills past each matrix and the 3-D
+        # TMA store clips at its edges, the batch being its own TensorMap
+        # dim. The ragged N keeps CuTe's four (128, 64) rounds rather than
+        # eight (128, 32) ones (``tcgen05_plain_narrow_subtile_covers_n``):
+        # the rule counts one matrix's tiles (one here, not a wave's worth),
+        # and one K block per tile leaves the epilogue the critical path.
+        # 300 matrices give the pairs several tiles each; 192 x 176 has whole
+        # 64-row heights in M and a ragged N.
+        for batch, m, n in ((300, 200, 200), (6, 192, 176)):
+            a = torch.randn(batch, m, 64, device=DEVICE, dtype=torch.bfloat16)
+            b = torch.randn(batch, 64, n, device=DEVICE, dtype=torch.bfloat16)
+            out = torch.full(
+                (batch, m, n), float("nan"), device=DEVICE, dtype=torch.bfloat16
+            )
+            bound = _bmm_into.bind((a, b, out))
+            config = bound.config_spec.default_config()
+            config.config.update(
+                block_sizes=[1, 256, 256, 64],
+                pid_type="persistent_interleaved",
+                tcgen05_persistence_model="static_persistent",
+                tcgen05_cluster_m=2,
+                tcgen05_ab_stages=4,
+            )
+            code = bound.to_code(config)
+            self.assertIn("tcgen05_gC3d", code)
+            self.assertIn("compute_epilogue_tile_shape((256, 256)", code)
+            self.assertNotIn("_helion_tcgen05_persistent_total_tiles", code)
+            bound.set_config(config)
+            bound(a, b, out)
+            torch.testing.assert_close(out, torch.bmm(a, b), rtol=1e-2, atol=1e-1)
+
+    def test_ragged_batched_matrices_run_on_several_pairs(self) -> None:
+        # Ragged matrices larger than one pair (the planner's
+        # batched_pair_matrix past one pair tile): the persistent 256x256
+        # pairs walk every matrix's 4 x 4 (1000 x 1000, B column-major) or
+        # 3 x 3 (600 x 520, B row-major) tiles; the last row and column of
+        # tiles in each matrix load zeros past its edges and the 3-D TMA store
+        # clips them, so no tile writes into the next matrix.
+        for batch, m, n, b_col_major in ((8, 1000, 1000, True), (4, 600, 520, False)):
+            a = torch.randn(batch, m, 64, device=DEVICE, dtype=torch.bfloat16)
+            if b_col_major:
+                b = torch.randn(batch, n, 64, device=DEVICE, dtype=torch.bfloat16)
+                b = b.transpose(1, 2)
+            else:
+                b = torch.randn(batch, 64, n, device=DEVICE, dtype=torch.bfloat16)
+            out = torch.full(
+                (batch, m, n), float("nan"), device=DEVICE, dtype=torch.bfloat16
+            )
+            bound = _bmm_into.bind((a, b, out))
+            config = bound.config_spec.default_config()
+            config.config.update(
+                block_sizes=[1, 256, 256, 64],
+                pid_type="persistent_interleaved",
+                tcgen05_persistence_model="static_persistent",
+                tcgen05_cluster_m=2,
+                tcgen05_ab_stages=6,
+                tcgen05_batch_raster="batch_slowest",
+            )
+            code = bound.to_code(config)
+            self.assertIn("CtaGroup.TWO", code)
+            self.assertIn("tcgen05_gC3d", code)
+            self.assertNotIn("_helion_tcgen05_persistent_total_tiles", code)
+            bound.set_config(config)
+            bound(a, b, out)
+            torch.testing.assert_close(out, torch.bmm(a, b), rtol=1e-2, atol=1e-1)
+
+    def test_ragged_batched_pairs_run_k_tails_and_b_multicast(self) -> None:
+        # The persistent pairs over a batch's K tail (on whole tiles, beside
+        # an M edge, on a double edge) and under a tcgen05_cluster_n=2 B
+        # multicast (a K tail on whole tiles, an M edge): TMA zero-fills K
+        # past each matrix's last k-block and the rows and columns past its
+        # edges, and the 3-D TMA store clips each matrix
+        # (``_ragged_batched_pair_config``). The fp16 operands' rows (K = 128
+        # or 136, N = 256, 304 or 512) are TensorMap-aligned. Outputs start as
+        # NaN.
+        for (batch, m, n, k), cluster_n in (
+            ((2, 256, 512, 136), 2),
+            ((2, 300, 512, 128), 2),
+            ((2, 300, 256, 136), 1),
+            ((2, 300, 304, 136), 1),
+        ):
+            a = torch.randn(batch, m, k, device=DEVICE, dtype=torch.float16)
+            b = torch.randn(batch, k, n, device=DEVICE, dtype=torch.float16)
+            out = torch.full(
+                (batch, m, n), float("nan"), device=DEVICE, dtype=torch.float32
+            )
+            bound = _bmm_into.bind((a, b, out))
+            config = helion.Config(
+                block_sizes=[1, 256, 256, 64],
+                l2_groupings=[1],
+                pid_type="persistent_interleaved",
+                tcgen05_persistence_model="static_persistent",
+                tcgen05_cluster_m=2,
+                tcgen05_cluster_n=cluster_n,
+                tcgen05_ab_stages=2,
+            )
+            code = bound.to_code(config)
+            self.assertIn("CtaGroup.TWO", code)
+            self.assertIn("tcgen05_gC3d", code)
+            self.assertNotIn("_helion_tcgen05_persistent_total_tiles", code)
+            bound.set_config(config)
+            bound(a, b, out)
+            torch.testing.assert_close(
+                out, torch.bmm(a.float(), b.float()), rtol=1e-2, atol=1e-1
+            )
+
+    def test_ragged_batched_pairs_split_full_and_fringe_tiles(self) -> None:
+        # Attention scores over 300-row matrices on the pairs, with the
+        # scheduler warp and auxiliary loads ahead of the accumulator wait:
+        # the scheduler publishes each matrix's interior tiles to the TMA
+        # store and its fringe tiles to the predicated SIMT store, by the
+        # tile the consumers decode (the batch decoded out of the virtual
+        # pid), plain or L2-grouped. The [300, 512] mask is read unguarded on
+        # interior tiles only. Outputs start as NaN.
+        for l2_grouping in (1, 2):
+            (a, b, mask, out), _ = scaled_bmm_args(
+                2, 300, 512, 128, row=512, device=DEVICE
+            )
+            out.fill_(float("nan"))
+            bound = scaled_bmm_into.bind((a, b, mask, out))
+            config = helion.Config(
+                block_sizes=[1, 256, 256, 64],
+                l2_groupings=[l2_grouping],
+                pid_type="persistent_interleaved",
+                tcgen05_persistence_model="static_persistent",
+                tcgen05_cluster_m=2,
+                tcgen05_ab_stages=2,
+                tcgen05_strategy="role_local_with_scheduler",
+                tcgen05_warp_spec_scheduler_warps=1,
+                tcgen05_aux_load_placement="pre_acc_wait",
+            )
+            code = bound.to_code(config)
+            self.assertIn("CtaGroup.TWO", code)
+            self.assertIn("tcgen05_scheduler_warp_full_tile", code)
+            bound.set_config(config)
+            bound(a, b, mask, out)
+            expected = torch.bmm(a.float(), b.float()) * 0.125 + mask.float()
+            torch.testing.assert_close(
+                out, expected.to(out.dtype), rtol=1e-2, atol=1e-1
+            )
+
     def test_ragged_batched_unaligned_rows_take_the_scalar_producer(self) -> None:
         # Rows of 481 bf16 in a 484-element stride (968 bytes, not a 16-byte
         # multiple) fail the TMA proof and sit below the staging floor: the

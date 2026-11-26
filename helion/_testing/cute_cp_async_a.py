@@ -65,3 +65,18 @@ def keyword_addmm_gemm(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
             acc = torch.addmm(input=acc, mat2=b[tile_k, tile_n], mat1=a[tile_m, tile_k])
         out[tile_m, tile_n] = acc
     return out
+
+
+def bmm_into(a: torch.Tensor, b: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
+    """``torch.bmm(a, b)`` into a caller's 16-bit ``out``: helion.inductor's
+    batched K-loop form."""
+    batch, m, k = a.size()
+    _, _, n = b.size()
+    for tile_b, tile_m, tile_n in hl.tile([batch, m, n]):
+        acc = hl.zeros([tile_b, tile_m, tile_n], dtype=torch.float32)
+        for tile_k in hl.tile(k):
+            acc = torch.baddbmm(
+                acc, a[tile_b, tile_m, tile_k], b[tile_b, tile_k, tile_n]
+            )
+        out[tile_b, tile_m, tile_n] = acc.to(out.dtype)
+    return out

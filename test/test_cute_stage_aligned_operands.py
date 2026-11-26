@@ -31,6 +31,7 @@ from helion._testing import default_cute_mma_support
 from helion._testing import onlyBackends
 from helion._testing import patch_cute_mma_support
 from helion._testing import skipIfNotCUDA
+from helion._testing.cute_cp_async_a import bmm_into
 from helion._testing.cute_cp_async_a import gemm_into
 from helion._testing.cute_cp_async_a import keyword_addmm_gemm
 from helion._testing.cute_cp_async_a import residual_gemm
@@ -367,6 +368,166 @@ def test_narrow_gemm_copies_an_m_major_a_with_cp_async() -> None:
         code.count("cp_async_mbarrier_arrive_noinc")
         == 1 + config.config["tcgen05_ab_stages"]
     )
+
+
+def _batched_m_major_args(
+    batch: int, m: int, n: int, k: int, batch_stride: int | None = None
+) -> tuple[torch.Tensor, ...]:
+    # ``x.transpose(1, 2)`` of [batch, k, m] storage: an M-major A whose K rows
+    # are 2 * m bytes apart (attention's ``attn.transpose(1, 2) @ grad``).
+    stride = m * k if batch_stride is None else batch_stride
+    x = torch.empty(batch * stride, dtype=torch.bfloat16, device=CPU_DEVICE)
+    a = x.as_strided((batch, m, k), (stride, 1, m))
+    b = torch.empty((batch, k, n), dtype=torch.bfloat16, device=CPU_DEVICE)
+    out = torch.empty((batch, m, n), dtype=torch.bfloat16, device=CPU_DEVICE)
+    return a, b, out
+
+
+def test_batched_gemm_copies_an_m_major_a_with_cp_async() -> None:
+    # bf16 [8, 196, 196] @ [8, 196, 64] with 392-byte K rows (8 mod 16): no
+    # TensorMap addresses A. The host left it in place (no transposing copy);
+    # the epilogue warps copy each tile's matrix, the base moved by the batch
+    # index:
+    #     tcgen05_cpa_a = cute.make_tensor(cute.make_ptr(cutlass.BFloat16,
+    #         (a.iterator + cutlass.Int64(cutlass.Int32(indices_0))
+    #          * cutlass.Int64(38416)).toint(), ...), ...)
+    bound = _bind(bmm_into, *_batched_m_major_args(8, 196, 64, 196))
+    assert _staging_statements(bound) == []
+    assert bound.config_spec.tcgen05.cp_async_a_provable
+    config = bound.config_spec.default_config()
+    # 8 matrices of two 128-row tiles (16 paired 256-row tiles would leave
+    # most SMs idle), N = 64 wide; the short K loop keeps 64 of its 196 rows
+    # in flight: four 16-deep k-blocks (``_cp_async_a_default``)
+    assert config.config["block_sizes"] == [1, 128, 64, 16]
+    assert config.config["pid_type"] == "flat"
+    assert config.config["tcgen05_ab_stages"] == 4
+    code = bound.to_code(config)
+    assert "constant_pad_nd" not in code
+    assert "'a_cp_async': True" in code
+    assert "tma_atom_a" not in code
+    assert "(a.iterator + cutlass.Int64(cutlass.Int32(indices_0)) * " in code
+    assert "cutlass.Int64(38416)).toint()" in code
+    # Rows k % 2 == 0 start 16-byte aligned, the odd rows 8-byte aligned.
+    for bits in (128, 64):
+        assert f"num_bits_per_copy={bits}" in code
+    # K = 196 = 12 * 16 + 4: each class holds 98 K rows, so every issue
+    # predicates its k-block's 8 class rows on them (the last k-block's rows
+    # past K are zero-filled):
+    #     tcgen05_cpa_0_1_pk[0, _tcgen05_cpa_m, _tcgen05_cpa_k] = (
+    #         tcgen05_cpa_0_1_p[0, _tcgen05_cpa_m, 0]
+    #         and (tcgen05_tma_k_tile + cutlass.Int32(4)) * cutlass.Int32(8)
+    #         + tcgen05_cpa_0_1_c[0, _tcgen05_cpa_m, _tcgen05_cpa_k][1]
+    #         < cutlass.Int32(98))
+    assert "(tcgen05_tma_k_tile + cutlass.Int32(4)) * cutlass.Int32(8) + " in code
+    assert "< cutlass.Int32(98)" in code
+    assert "pred=tcgen05_cpa_0_0_pk)" in code
+    # four k-blocks ahead of the K loop, one refill in it
+    assert code.count("cp_async_mbarrier_arrive_noinc") == 1 + 4
+
+
+@pytest.mark.parametrize(
+    ("k", "block_k", "ab_stages"),
+    # a quarter of the K loop in flight, at least 64 rows; the 128-row
+    # tile's deepest ring (4 stages of 64) holds under half of K = 1024
+    ((196, 16, 4), (512, 64, 2), (1024, 64, 4)),
+)
+def test_short_k_loops_keep_a_quarter_of_k_in_flight(
+    k: int, block_k: int, ab_stages: int
+) -> None:
+    bound = _bind(bmm_into, *_batched_m_major_args(8, 196, 64, k))
+    config = bound.config_spec.default_config().config
+    assert config["block_sizes"] == [1, 128, 64, block_k]
+    assert config["tcgen05_ab_stages"] == ab_stages
+
+
+def test_period_four_rows_take_32_deep_k_blocks_at_least() -> None:
+    # 4084-byte K rows (4 mod 16): four row classes, 16-, 4-, 8- and 4-byte
+    # copies. A 16-deep k-block gives each class 4 rows, under the 16-byte
+    # copy's 8 thread rows, so the shallowest depth is 32: the short K loop's
+    # default keeps its 64 rows in two 32-deep k-blocks, and a 16-deep sample
+    # is projected to 32.
+    x = torch.empty((192, 2042), dtype=torch.bfloat16, device=CPU_DEVICE)
+    b = torch.empty((192, 128), dtype=torch.bfloat16, device=CPU_DEVICE)
+    residual = torch.empty((2042, 128), dtype=torch.float32, device=CPU_DEVICE)
+    bound = _bind(residual_gemm, x.T, b, residual)
+    spec = bound.config_spec
+    assert spec.tcgen05.cp_async_a_provable
+    assert spec.tcgen05.cp_async_a_min_block_k == 32
+    config = spec.default_config().config
+    assert config["block_sizes"] == [128, 128, 32]
+    assert config["tcgen05_ab_stages"] == 2
+    assert "num_bits_per_copy=32" in bound.to_code(helion.Config(**config))
+    values = {**config, "block_sizes": [128, 128, 16]}
+    spec.normalize(values, _fix_invalid=True)
+    assert values["block_sizes"] == [128, 128, 32]
+    with pytest.raises(helion.exc.InvalidConfig, match="cp.async producer"):
+        bound.to_code(helion.Config(**{**config, "block_sizes": [128, 128, 16]}))
+
+
+def test_period_four_rows_under_32_deep_k_stay_staged() -> None:
+    # K = 24 over 32772-byte K rows (4 mod 16): no depth fits (16 under the
+    # 32-deep minimum, 32 and 64 past K with no K tail beyond a first
+    # k-block), so the host stages A and the default config renders.
+    x = torch.empty((24, 16386), dtype=torch.bfloat16, device=CPU_DEVICE)
+    w = torch.empty((24, 64), dtype=torch.bfloat16, device=CPU_DEVICE)
+    out = torch.empty((16386, 64), dtype=torch.bfloat16, device=CPU_DEVICE)
+    bound = _bind(gemm_into, x.T, w, out)
+    assert not bound.config_spec.tcgen05.cp_async_a_provable
+    assert _staging_statements(bound)
+    code = bound.to_code(bound.config_spec.default_config())
+    assert "'a_cp_async': True" not in code
+
+
+def test_cp_async_a_copies_16_and_32_deep_k_blocks() -> None:
+    # The producer copies 16-, 32- or 64-deep k-blocks: a 16-deep one splits
+    # into two classes of 8 rows (``(128, 8)`` class tiles), K = 196 into 13
+    # k-blocks whose class rows run to 98.
+    bound = _bind(bmm_into, *_batched_m_major_args(8, 196, 64, 196))
+    default = bound.config_spec.default_config().config
+    for bk, rows in ((16, 8), (32, 16)):
+        config = helion.Config(
+            **{**default, "block_sizes": [1, 256, 64, bk], "tcgen05_ab_stages": 4}
+        )
+        code = bound.to_code(config)
+        assert "'a_cp_async': True" in code
+        assert f"(128, {rows}), (tile_offset_1 // cutlass.Int32(128)" in code
+        assert f"* cutlass.Int32({rows}) + tcgen05_cpa_0_1_c" in code
+    # A sample's depth stays where the producer copies it and K admits it,
+    # else the deepest within it (8 -> 16, 128 -> 64).
+    for sampled, kept in ((16, 16), (32, 32), (8, 16), (128, 64)):
+        values = {**default, "block_sizes": [1, 128, 64, sampled]}
+        bound.config_spec.normalize(values, _fix_invalid=True)
+        assert values["block_sizes"][3] == kept
+
+
+def test_batched_a_off_a_16_byte_matrix_stride_is_staged() -> None:
+    # Matrices 38420 elements apart (76840 bytes, 8 mod 16): the copies'
+    # 16-byte rows of one matrix would be 8-byte rows of the next, so the
+    # host stages A as before.
+    args = _batched_m_major_args(8, 196, 64, 196, batch_stride=38420)
+    bound = _bind(bmm_into, *args)
+    assert _staging_statements(bound) == [
+        "a = torch.constant_pad_nd(a, [0, 60])[:, :, :196]"
+    ]
+    assert not bound.config_spec.tcgen05.cp_async_a_provable
+
+
+def test_k_tail_zero_fills_the_last_k_block_of_an_m_major_a() -> None:
+    # ``x.T`` of a [1000, 1018] activation: K = 1000 = 15 * 64 + 40, rows in
+    # classes of four (16 class rows a k-block, 250 a class); the copies of
+    # k-block 15 keep its first 10 class rows and zero-fill the other 6.
+    x = torch.empty((1000, 1018), dtype=torch.bfloat16, device=CPU_DEVICE)
+    b = torch.empty((1000, 128), dtype=torch.bfloat16, device=CPU_DEVICE)
+    residual = torch.empty((1018, 128), dtype=torch.float32, device=CPU_DEVICE)
+    bound = _bind(residual_gemm, x.T, b, residual)
+    assert _staging_statements(bound) == []
+    assert bound.config_spec.tcgen05.cp_async_a_provable
+    config = bound.config_spec.default_config()
+    code = bound.to_code(config)
+    assert "* cutlass.Int32(16) + tcgen05_cpa_0_3_c" in code
+    assert "< cutlass.Int32(250)" in code
+    stages = config.config["tcgen05_ab_stages"]
+    assert code.count("cp_async_mbarrier_arrive_noinc") == 1 + min(stages, 16)
 
 
 def test_cp_async_a_pairs_m_subtiles_on_one_b_stage() -> None:
@@ -731,6 +892,7 @@ _skip_without_tcgen05 = pytest.mark.skipif(
 _residual_gemm = helion.kernel(residual_gemm, static_shapes=True)
 _gemm_into = helion.kernel(gemm_into, static_shapes=True)
 _two_output_gemm = helion.kernel(two_output_gemm, static_shapes=True)
+_bmm_into = helion.kernel(bmm_into, static_shapes=True)
 
 
 @pytest.mark.cuda
@@ -842,6 +1004,35 @@ class TestCuteCpAsyncOperandGpu(RefEagerTestDisabled, TestCase):
         bound.set_config(config)
         bound(a, b, out)
         torch.testing.assert_close(out, a.float() @ b.float(), rtol=1e-3, atol=1e-2)
+
+    def test_batched_matrices_with_a_k_tail(self) -> None:
+        # bf16 [8, 196, 196] @ [8, 196, 64], A M-major (392-byte K rows): each
+        # matrix copied from its own base, K = 196 ending 4 rows into the last
+        # k-block (zero-filled past K), on the default (128 rows, 16-deep
+        # k-blocks on four stages), and over 64-deep k-blocks on a 256-row
+        # tile (two subtiles, the second 68 rows inside M) and a 128-row one,
+        # into a NaN-filled output.
+        a = torch.randn(8, 196, 196, device=DEVICE, dtype=torch.bfloat16).transpose(
+            1, 2
+        )
+        b = torch.randn(8, 196, 64, device=DEVICE, dtype=torch.bfloat16)
+        out = torch.empty(8, 196, 64, device=DEVICE, dtype=torch.bfloat16)
+        bound = _bmm_into.bind((a, b, out))
+        default = bound.config_spec.default_config()
+        configs = [default] + [
+            helion.Config(**{**default.config, "block_sizes": [1, block_m, 64, 64]})
+            for block_m in (256, 128)
+        ]
+        for config in configs:
+            code = bound.to_code(config)
+            self.assertNotIn("constant_pad_nd", code)
+            self.assertIn("cp_async_mbarrier_arrive_noinc", code)
+            bound.set_config(config)
+            out.fill_(float("nan"))
+            bound(a, b, out)
+            torch.testing.assert_close(
+                out.float(), torch.bmm(a.float(), b.float()), rtol=2e-2, atol=5e-2
+            )
 
     def test_two_outputs_keep_128_row_tiles(self) -> None:
         # Two output stores: the 128-row tile over 239 M tiles.

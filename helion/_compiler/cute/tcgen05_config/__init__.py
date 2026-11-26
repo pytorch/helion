@@ -148,8 +148,11 @@ class CuteTcgen05Config:
         self.matmul_operands_tma_provable: bool = True
         # Every MMA's A is an unaligned operand the flat one-CTA kernel's
         # epilogue warps copy with ``cp.async`` beside a TMA-legal B
-        # (``host_function_cp_async_a_provable``).
+        # (``host_function_cp_async_a_layouts``).
         self.cp_async_a_provable: bool = False
+        # The shallowest k-block those A's copies take (the deepest of their
+        # layouts' ``Tcgen05CpAsyncALayout.min_block_k``).
+        self.cp_async_a_min_block_k: int = 16
         # Every MMA's A and B pass the TensorMap proof, whatever its output
         # (``host_function_matmul_operands_tma_provable(outputs=False)``).
         self.matmul_inputs_tma_provable: bool = True
