@@ -358,7 +358,13 @@ the pull request description.
   `Testing:` paragraph naming the lanes or commands run, the GPUs, the pass and
   fail counts, and anything you could not run. Flag compatibility-relevant
   changes explicitly (Compatibility guardrails). Write for the reviewer, not as
-  a log of your session.
+  a log of your session. Describe the commit itself and leave out its place
+  in the stack: no position or count ("the ninth of 19 commits", "this stack
+  has 16 commits"), and of another commit no more than this one needs to be
+  understood. Such statements go stale whenever the stack is reshaped, and
+  the review of this commit does not see the others. Where the message has
+  to refer to another commit, as a `Review notes:` item does for the later
+  commit that uses what a finding calls unused, name it by its title.
 - Last line: the review record, `autoreview passed: claude, codex`, naming the
   reviewers that ran in the passing review (Code Review). It sits above the
   `stack-info:` trailer once stack-pr has added one. A commit without it is not
@@ -397,7 +403,8 @@ a duplicate pull request on the next submit). Aim for a stack where
   about 15 commits;
 - no `fixup!` or `WIP` commits remain and every message follows the conventions;
 - every commit ends with its `autoreview passed:` line from a review of its
-  current content, or of each of the commits squashed into it.
+  current code, or of each of the commits squashed into it (Recording the
+  review says which changes keep the line).
 
 ### After the stack is submitted
 
@@ -406,7 +413,8 @@ changes into the commit of the pull request they belong to (`--fixup` and
 `--autosquash`), keep the `stack-info:` trailer as the last line of every
 message, and do not squash pull requests together or reorder them. A commit
 changed beyond folding in fixes for its own review needs a new passing review,
-and its `autoreview passed:` line refreshed, before it is submitted again. Work that
+and its `autoreview passed:` line refreshed, before it is submitted again; a
+change to its message or to comments alone needs none (Recording the review). Work that
 belongs to no existing pull request becomes a new commit at the bottom of the
 stack. Run `stack-pr submit` again only inside the fix-pr-stack skill or when
 the user asks; add `--update-body` when you changed commit messages.
@@ -563,7 +571,7 @@ that holds it and what you checked on `origin/main`.
 ```
 Review notes:
 - Not valid: "make division_dtype private". The CuTe backend imports it
-  in the division commit of this stack.
+  in "[cutedsl] Lower integer division by its dtype".
 - Not valid: "require the Metal checks for printer changes". A new rule
   for contributors; raised with the user instead.
 - Deferred: "an int32 torch.fmax chain of negated values is wrong".
@@ -632,19 +640,40 @@ set of findings about code that did not change.
 - A round that passes prints the `autoreview passed:` line as a first run
   does (Recording the review). Its review ends with `LGTM` and may hold
   suggestions and the reviewers' replies to your message above that line.
+- Any worktree of the repository continues a session: `--resume <id>`
+  finds it in the worktree that ran its last round, moves it to the one the
+  round runs in, and tells the reviewers that the files are read there from
+  now on. So the next round of a commit that was reviewed in a scratch
+  worktree can run wherever the commit is `HEAD` after it was integrated,
+  rebased or amended (`--resume <id> --head`): in that scratch worktree
+  again, in a new one, or in the stack's own worktree when the commit is
+  its tip. For a commit below the tip, a scratch worktree leaves the
+  stack's worktree on its branch and free to edit (Worktrees). The
+  session's file is in the logs of the worktree that ran its last round,
+  so removing that worktree removes the session; run a round elsewhere
+  first when the review is not over.
 - Start a new review, without `--resume`, for another change (the next
   commit, the whole stack before handing back), for a change you rewrote
   rather than fixed, and when the session cannot be continued: the run said
   that its review cannot be resumed (a target other than the uncommitted
   work, `--head`, or revisions and ranges has no code that two rounds could
-  compare), the session belongs to another checkout (a worktree continues
-  its own sessions), or the round fails because a reviewer's own session no
-  longer exists (`No conversation found`, `no rollout found`; the sessions
-  and the refs are kept for about 30 days). Starting over in that last case
-  is not working around a broken tool. Any other failure of a resumed round
-  is one, as for a first run; it leaves the saved session as it was, or with
-  the round half done (Code Review), so the same command runs the round
-  again or completes it.
+  compare), the session belongs to another clone of the repository, or the
+  round fails because a reviewer's own session no longer exists (`No
+  conversation found`, `no rollout found`; the sessions and the refs are
+  kept for about 30 days). Starting over in that last case is not working
+  around a broken tool. Any other failure of a resumed round is one, as for
+  a first run; it leaves the saved session as it was, or with the round
+  half done (Code Review), so the same command runs the round again or
+  completes it.
+- Starting over is also yours to choose when what the reviewers remember
+  would no longer help: so much has changed since the session's last round
+  that little of what they read still stands (a rebase that reworked the
+  commit, a redesign), or the dependencies changed in a major way (a new
+  version of a package that the change builds on, such as the CuTe DSL).
+  A later round reads only what changed in the repository, so a conclusion
+  that the reviewers drew from the old version of an installed package
+  would stand. A new review reads everything again, the installed packages
+  included, at the cost of a first read.
 
 ### Recording the review
 
@@ -669,10 +698,17 @@ autoreview passed: claude, codex
   deferred to `KNOWN_GAPS.md`, with another round behind every claimed defect
   classified as invalid and every deferral that needs one (that section
   says which). Use the reviewers that ran in it.
-- The line goes stale when its commit changes after the review other than by
-  folding in fixes for that review or by a squash that keeps it (next item):
-  new work, a split, a conflict resolution in a rebase, a fix for a CI
-  failure. Remove it and review again.
+- The line goes stale when the code of its commit changes after the review
+  other than by folding in fixes for that review or by a squash that keeps
+  it (last item): new work, a split, a conflict resolution in a rebase, a
+  fix for a defect that something other than the review found (your own
+  tests, a CI failure). Remove it and review again; the session's next
+  round reviews only the change (Continuing a review).
+- The line stays when only the commit message or comments change: a
+  reworded or corrected message, a `Testing:` paragraph brought up to date,
+  a comment made right. Such a change needs no new review. The message and
+  the comments still have to be true: the next review that reads the commit
+  checks them against the code.
 - A squash of commits that each carry the line keeps it, naming only the
   reviewers named in every one of them. When no reviewer is named in all of
   them, or the squash takes in a commit without the line (unless that commit
@@ -684,7 +720,8 @@ autoreview passed: claude, codex
 Do not run it when `HELION_AUTOREVIEW_SESSION` is set: you are then the
 reviewer or fixer it launched. Review only the checkout you work in (`--head`,
 no arguments, or a range); for an older commit, check it out in a worktree and
-run that worktree's own `scripts/autoreview.py --head`.
+run that worktree's own `scripts/autoreview.py --head`. Any worktree continues
+that review later (Continuing a review).
 
 ## Worktrees
 
