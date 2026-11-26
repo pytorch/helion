@@ -56,7 +56,7 @@ _KERNEL_CONFIG = (
 def helion_matmul_w_progress_fp8(
     a: torch.Tensor,  # [M, K] FP8 (full gathered)
     a_shared: torch.Tensor,  # [M//world_size, K] FP8
-    scale_a: torch.Tensor,  # [M//world_size, 1] FP32
+    scale_a: torch.Tensor,  # [M, 1] FP32 (full gathered)
     b: torch.Tensor,  # [K, N] FP8
     scale_b: torch.Tensor,  # [1, N] FP32
     progress: torch.Tensor,
@@ -143,7 +143,8 @@ def copy_engine_all_gather_w_progress(
     assert list(output.shape) == output_shape, "Mismatch in output shape"
     chunks = output.chunk(world_size * splits_per_rank)
 
-    # symm_mem.barrier()
+    # Every rank's input is in its symmetric buffer before any rank reads it
+    symm_mem.barrier()
     backend_stream.wait_stream(torch.cuda.current_stream())  # pyrefly: ignore [missing-attribute]
 
     with torch.cuda.stream(backend_stream):
@@ -162,7 +163,7 @@ def copy_engine_all_gather_w_progress(
                     offset=src_rank * splits_per_rank + split_id,
                     val=1,
                 )
-        # symm_mem.barrier()
+        symm_mem.barrier()
 
     return backend_stream  # pyrefly: ignore [bad-return]
 
@@ -199,11 +200,15 @@ def _helion_all_gather_fp8_matmul_runtime(
     backend_stream = copy_engine_all_gather_w_progress(
         a_out, a_shared_symm, progress, group_name, SPLITS_PER_RANK
     )
+    # Each rank holds the scales of its own rows of A: the kernel reads all
+    # the gathered rows, so it reads the gathered scales.
+    scale_a_out = scale_a.new_empty((scale_a.shape[0] * world_size, *scale_a.shape[1:]))
+    dist.all_gather_into_tensor(scale_a_out, scale_a.contiguous(), group=group_name)
 
     c = helion_matmul_w_progress_fp8(
         a_out,
         a_shared_symm,
-        scale_a,
+        scale_a_out,
         b,
         scale_b,
         progress,
@@ -245,21 +250,31 @@ def reference_ag_matmul(
     world_size: int,
     dist_group: ProcessGroup,
 ) -> torch.Tensor:
-    """Reference implementation using torch.ops.symm_mem.fused_all_gather_matmul."""
+    """Reference implementation using torch.ops.symm_mem.fused_all_gather_scaled_matmul."""
     if dist_group is None:
         raise RuntimeError("No distributed group available")
-    ag_golden, mm_golden = torch.ops.symm_mem.fused_all_gather_scaled_matmul(
-        a_shared,
-        [b],
-        scale_a,
-        [scale_b],
-        gather_dim=0,
-        biases=[None],
-        result_scales=[None],
-        out_dtypes=[torch.bfloat16],
-        use_fast_accum=[False],
-        group_name=dist_group.group_name,
-    )
+    op = torch.ops.symm_mem.fused_all_gather_scaled_matmul
+    kwargs: dict[str, object] = {
+        "gather_dim": 0,
+        "group_name": dist_group.group_name,
+        "biases": [None],
+        "out_dtypes": [torch.bfloat16],
+        "use_fast_accum": [False],
+    }
+    if "scaling_type_a" in {arg.name for arg in op.default._schema.arguments}:
+        # Since pytorch/pytorch#205967 the op takes _scaled_mm_v2 recipes for
+        # each scale (here row-wise, unswizzled) and no result_scales.
+        row_wise = torch.nn.functional.ScalingType.RowWise.value
+        no_swizzle = torch.nn.functional.SwizzleType.NO_SWIZZLE.value
+        kwargs.update(
+            scaling_type_a=row_wise,
+            swizzle_type_a=no_swizzle,
+            scaling_type_b=row_wise,
+            swizzle_type_b=no_swizzle,
+        )
+    else:
+        kwargs["result_scales"] = [None]
+    ag_golden, mm_golden = op(a_shared, [b], scale_a, B_scales=[scale_b], **kwargs)
     return mm_golden[0]
 
 
@@ -286,24 +301,17 @@ def test(M: int, N: int, K: int, world_size: int, device: torch.device) -> None:
     )
     b = b.to(FP8_DTYPE)
 
-    scale_a = (
-        torch.rand((M_per_rank, 1), device=device, dtype=torch.float32) * 0.05 + 0.01
-    )
-    scale_b = torch.rand((1, N), device=device, dtype=torch.float32) * 0.05 + 0.01
-
-    # clamp scales to prevent overflow when converting to BF16 output
-    # in result = (FP8_accumulator * scale_a * scale_b).to(bfloat16)
-    min_val = 1e-4
-    max_val = 100
-    scale_a = scale_a.clamp(min=min_val, max=max_val)
-    scale_b = scale_b.clamp(min=min_val, max=max_val)
+    # Scales near 1 that differ by row and by rank, so that a row read with
+    # another row's scale shows in the bf16 output
+    scale_a = (torch.rand((M_per_rank, 1), device=device) + 0.5) * (dist.get_rank() + 1)
+    scale_b = torch.rand((1, N), device=device) + 0.5
 
     run_example(
         helion_ag_matmul,
         reference_ag_matmul,
         (a_shared, b, scale_a, scale_b, world_size, dist.group.WORLD),
-        rtol=1e-1,
-        atol=1e-1,
+        rtol=2e-2,
+        atol=2e-2,
     )
 
 
