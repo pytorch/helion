@@ -43,6 +43,9 @@ from ..epilogue_fanout import schedule_supported as fanout_schedule_supported
 from ..epilogue_fanout import (
     store_protocol_supported as fanout_store_protocol_supported,
 )
+from ..split_k_exchange import Tcgen05SplitKClusterNames
+from ..split_k_exchange import render_split_k_cluster_exchange
+from ..split_k_exchange import split_k_cluster_runtime
 from ..state import cute_codegen_state
 from ..strategies import tcgen05_explicit_d_store_tile_expr
 from ..strategies import tcgen05_is_two_cta_m128
@@ -77,6 +80,7 @@ from ..tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_N
 from ..tcgen05_constants import tcgen05_ab_smem_bytes_per_cta
 from ..tcgen05_constants import tcgen05_default_epilogue_tile_size
 from ..tcgen05_constants import tcgen05_fixed_smem_overhead_bytes
+from ..tcgen05_constants import tcgen05_grouped_worklist_epilogue_shape
 from ..tcgen05_constants import tcgen05_grouped_worklist_store_shape
 from ..tcgen05_epilogue_rounds import Tcgen05EpilogueRoundNames
 from ..tcgen05_epilogue_rounds import Tcgen05LastTileStagingNames
@@ -5804,6 +5808,77 @@ def _codegen_cute_store_tcgen05_tile(
             acc_release=True,
         )
 
+    def _split_k_cluster_exchange_loop() -> str:
+        """The plain store of a K-split cluster's tile (``cute_mma``'s
+        ``tcgen05_cluster_split_k``): the pairs' partial exchange, then each
+        pair's half of the subtiles
+        (``split_k_exchange.render_split_k_cluster_exchange``)."""
+        # The partials are summed in registers ahead of the epilogue's math,
+        # so any chain over the accumulator alone applies after the sum
+        # (``out = torch.relu(acc).to(torch.bfloat16)``: its prelude runs on
+        # the summed fragment); an auxiliary tensor's per-subtile loads have
+        # no place in the exchange.
+        early_aux_prelude, chain_prelude, acc_rhs = _splice_acc_vec(
+            trs_racc,
+            "",
+            safe_direct_aux_with_full_tile=partial_tma_needs_full_tile_guard,
+            coord_layout="trs",
+        )
+        if (
+            not _plain_round_store()
+            or early_aux_prelude
+            or fragment_epilogue is not None
+            or tcgen05_epi_round_subtiles > 1
+            or tcgen05_value.last_tile_next_work
+        ):
+            raise exc.InvalidConfig(
+                "tcgen05_split_k=2 on a tcgen05_cluster_n=2 cluster needs the plain "
+                "single-output role-local TMA-store epilogue over the accumulator "
+                "alone: no fan-out, auxiliary tensor, fragment epilogue, store warp, "
+                "epilogue rounds or diagnostic placement"
+            )
+        # The plan's subtile: the explicit tile, the 128-row pair's per-CTA
+        # (64, bn) rule or the 256-row pair's (``tcgen05_epi_tile``).
+        epi_tile_m, epi_tile_n = tcgen05_grouped_worklist_epilogue_shape(
+            bm=tcgen05_value.bm,
+            bn=tcgen05_value.bn,
+            cluster_m=2 if tcgen05_is_two_cta else 1,
+            output_dtype_bytes=epi_tile_bits // 8,
+            orientation="mn",
+            explicit_shape=(
+                (tcgen05_value.explicit_epi_tile_m, tcgen05_value.explicit_epi_tile_n)
+                if tcgen05_value.has_explicit_epilogue_tile
+                and tcgen05_value.explicit_epi_tile_m is not None
+                and tcgen05_value.explicit_epi_tile_n is not None
+                else None
+            ),
+        )
+        rows = tcgen05_value.bm // 2 if tcgen05_is_two_cta else tcgen05_value.bm
+        if rows % epi_tile_m or tcgen05_value.bn % epi_tile_n:
+            raise exc.InvalidConfig(
+                "tcgen05_split_k=2 on a tcgen05_cluster_n=2 cluster needs whole "
+                "epilogue subtiles of the CTA tile"
+            )
+        return render_split_k_cluster_exchange(
+            Tcgen05SplitKClusterNames(
+                rounds=_round_names(),
+                epi_tidx=tcgen05_aux_epi_tidx,
+                split_idx=tcgen05_value.split_k_cluster_idx,
+                recv=tcgen05_value.split_k_cluster_recv,
+                recv_bar=tcgen05_value.split_k_cluster_recv_bar,
+                runtime=split_k_cluster_runtime(df),
+            ),
+            acc_rhs=acc_rhs,
+            acc_prelude=chain_prelude,
+            subtile_count=(rows // epi_tile_m) * (tcgen05_value.bn // epi_tile_n),
+            device_subtile_count=subtile_count,
+            c_stage_count=tcgen05_c_stage_count,
+            epi_threads=32 * tcgen05_value.epi_warp_count,
+            half_exchange={torch.bfloat16: "bf16", torch.float16: "f16", None: None}[
+                tcgen05_value.split_k_cluster_exchange_dtype
+            ],
+        )
+
     def _last_tile_staging_loop(default_loop: str) -> str:
         """The plain store with its CTA's last tile staged at once in the
         drained A ring (``cute_mma``'s ``tcgen05_last_tile_staging``)."""
@@ -5847,7 +5922,13 @@ def _codegen_cute_store_tcgen05_tile(
             f"{textwrap.indent(tma_store_default_subtile_body, tma_store_subtile_body_extra_indent)}"
         )
 
-    if fragment_epilogue is not None and fragment_epilogue.changes_shape:
+    if tcgen05_value.split_k_cluster_recv:
+        # First: a K-split cluster's tile is stored by its exchange alone,
+        # which refuses every other store body (the SIMT and direct stores,
+        # a fragment epilogue's compact schedule) instead of letting each
+        # pair store its own half-K sum.
+        tma_store_subtile_loop = _split_k_cluster_exchange_loop()
+    elif fragment_epilogue is not None and fragment_epilogue.changes_shape:
         # The compact SIMT schedule above owns T2R and never instantiates the
         # same-shape TMA renderer. Avoid eagerly formatting that unused body.
         tma_store_subtile_loop = ""

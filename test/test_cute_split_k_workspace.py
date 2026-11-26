@@ -37,6 +37,7 @@ from helion._compiler.cute.split_k_workspace_codegen import (
     _rewrite_producer_for_atomic_epilogue,
 )
 from helion._compiler.cute.state import cute_env_state
+from helion._testing import DEVICE
 from helion._testing import default_cute_mma_support
 from helion._testing import import_example
 from helion._testing import patch_target_facts
@@ -261,6 +262,24 @@ def _plain_store_into_out0(
     in0: torch.Tensor, in1: torch.Tensor, out0: torch.Tensor
 ) -> None:
     # helion.inductor's mm kernel: the output is an argument, nothing returned.
+    for tile_y, tile_x in hl.tile(out0.shape):
+        acc = hl.zeros([tile_y, tile_x], dtype=torch.float32)
+        for tile_r in hl.tile(in0.size(1)):
+            acc = torch.addmm(acc, in0[tile_y, tile_r], in1[tile_r, tile_x])
+        out0[tile_y, tile_x] = acc.to(out0.dtype)
+
+
+@helion.kernel(
+    backend="cute",
+    static_shapes=True,
+    autotune_effort="none",
+    split_k_reduction="output",
+)
+def _plain_store_into_out0_output_partials(
+    in0: torch.Tensor, in1: torch.Tensor, out0: torch.Tensor
+) -> None:
+    # helion.inductor's mm kernel under torch's default reduced-precision
+    # split-K flags (split_k_reduction="output").
     for tile_y, tile_x in hl.tile(out0.shape):
         acc = hl.zeros([tile_y, tile_x], dtype=torch.float32)
         for tile_r in hl.tile(in0.size(1)):
@@ -996,6 +1015,104 @@ def test_column_major_output_bias_indexes_the_swapped_product() -> None:
     assert "(output_begin + element) // 512" in reducer
 
 
+def test_sixteen_bit_partials_follow_split_k_reduction() -> None:
+    # bf16 256 x 256 x 8192 into out0: under split_k_reduction="output" the
+    # schedule may keep its partials in bf16 (cute_split_k_partials="output"),
+    # and every workspace seed does; under the default "accumulator" the knob
+    # is not offered and a config asking for it is invalid.
+    args = _major_args(256, 8192, 256, "k", "n")
+    output = _bind(_plain_store_into_out0_output_partials, args)
+    assert output.config_spec.cute_split_k_partials_available
+    seeds = [
+        seed
+        for seed in output.config_spec.compiler_seed_configs
+        if seed.get("cute_split_k_workspace")
+    ]
+    assert seeds and all(s.get("cute_split_k_partials") == "output" for s in seeds)
+    # ... and keep it through the search's seed transfer (flatten and
+    # canonicalize over the tcgen05 search fields).
+    transferred = [
+        config
+        for _, config in ConfigGeneration(output.config_spec).seed_flat_config_pairs()
+        if config.get("cute_split_k_workspace")
+    ]
+    assert len(transferred) == len(seeds)
+    assert all(c.get("cute_split_k_partials") == "output" for c in transferred)
+    # Inert without the workspace schedule.
+    with pytest.raises(InvalidConfig, match="requires cute_split_k_workspace"):
+        output.config_spec.normalize(
+            helion.Config(
+                block_sizes=[128, 128, 64],
+                cute_split_k_workspace=False,
+                cute_split_k_partials="output",
+            )
+        )
+    # A seed's mutant to one partition is repaired to the plain kernel, knob
+    # dropped, and that config normalizes strictly.
+    repaired = helion.Config(
+        block_sizes=[128, 128, 64],
+        cute_split_k_workspace=True,
+        cute_split_k_partitions=1,
+        cute_split_k_stages=4,
+        cute_split_k_partials="output",
+    ).config
+    output.config_spec.normalize(repaired, _fix_invalid=True)
+    assert repaired["cute_split_k_workspace"] is False
+    assert "cute_split_k_partials" not in repaired
+    output.config_spec.normalize(dict(repaired), _fix_invalid=False)
+    accumulator = _bind(_plain_store_into_out0, args)
+    assert not accumulator.config_spec.cute_split_k_partials_available
+    with pytest.raises(InvalidConfig, match="cute_split_k_partials"):
+        accumulator.config_spec.normalize(
+            helion.Config(
+                block_sizes=[128, 128, 64],
+                cute_split_k_workspace=True,
+                cute_split_k_partitions=4,
+                cute_split_k_stages=4,
+                cute_split_k_partials="output",
+            )
+        )
+
+
+def test_sixteen_bit_partials_round_in_the_producer_and_widen_in_the_reducer() -> None:
+    # The producer stores each partition's fp32 sum rounded to bf16 into
+    # [4, 256, 256] bf16 partials; the reducer loads four of them at a time
+    # (64-bit copies) and adds them in fp32.
+    bound = _bind(
+        _plain_store_into_out0_output_partials, _major_args(256, 8192, 256, "k", "n")
+    )
+    source = bound.to_code(
+        helion.Config(
+            block_sizes=[128, 128, 64],
+            cute_split_k_workspace=True,
+            cute_split_k_partitions=4,
+            cute_split_k_stages=4,
+            cute_split_k_partials="output",
+        )
+    )
+    _producer, reducer = _embedded_sources(source)
+    assert "(4, 256, 256), dtype=torch.bfloat16" in source
+    assert "_native_partition_gemm_rounded(" in source
+    assert "'partial_dtype': 'torch.bfloat16'" in source
+    assert (
+        "cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), cutlass.BFloat16, "
+        "num_bits_per_copy=64)"
+    ) in reducer
+    assert "loaded_3.store(raw_3.load().to(cutlass.Float32))" in reducer
+    # fp32 partials (the knob's default) render as before
+    fp32 = bound.to_code(
+        helion.Config(
+            block_sizes=[128, 128, 64],
+            cute_split_k_workspace=True,
+            cute_split_k_partitions=4,
+            cute_split_k_stages=4,
+        )
+    )
+    assert "(4, 256, 256), dtype=torch.float32" in fp32
+    assert "_native_partition_gemm_rounded" not in fp32
+    assert "raw_0" not in _embedded_sources(fp32)[1]
+
+
 @pytest.mark.parametrize(
     "block_sizes,stages,expected",
     (
@@ -1690,6 +1807,13 @@ def test_atomic_epilogue_is_offered_for_outputs_kept_in_their_dtype() -> None:
     assert twins and len(twins) < len(seeds)
     for twin in twins:
         assert twin["cute_split_k_workspace"] is True
+    # The twins reach the search's population as twins.
+    transferred = [
+        config
+        for _, config in ConfigGeneration(kept.config_spec).seed_flat_config_pairs()
+        if config.get("cute_split_k_atomic_epilogue")
+    ]
+    assert len(transferred) == len(twins)
     # The plain store has no zero-filled destination to add into.
     store = _bind(_plain_store_matmul, _args((128, 16384, 128)))
     assert store.config_spec.cute_split_k_workspace_available
@@ -2282,6 +2406,67 @@ def test_native_split_k_workspace_partials_and_poisoned_graph(case: WorkspaceCas
             )
     finally:
         torch.backends.cuda.matmul.allow_tf32 = previous_tf32
+
+
+@pytest.mark.cuda
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("transposed", (False, True))
+def test_sixteen_bit_partials_reduce_in_fp32(transposed: bool) -> None:
+    # bf16 256 x 8192 x 512 in four partitions with bf16 partials, as written
+    # and as the transposed product (out.T = b.T @ a.T into the column-major
+    # out.T): each partial is its fp32 chunk product rounded to bf16, and
+    # the output is the fp32 sum of those partials, in partition order,
+    # rounded once.
+    if torch.cuda.get_device_capability()[0] != 10:
+        pytest.skip("requires SM100-family")
+    torch.manual_seed(2026112400)
+    m, k, n = 256, 8192, 512
+    a = torch.randn((m, k), dtype=torch.bfloat16, device=DEVICE)
+    b = torch.randn((k, n), dtype=torch.bfloat16, device=DEVICE)
+    out = torch.full((m, n), float("nan"), dtype=torch.bfloat16, device=DEVICE)
+    arguments = (b.T, a.T, out.T) if transposed else (a, b, out)
+    bound = _plain_store_into_out0_output_partials._bind_isolated(arguments)
+    config = helion.Config.from_dict(
+        {
+            "block_sizes": [128, 128, 64],
+            "cute_split_k_workspace": True,
+            "cute_split_k_partitions": 4,
+            "cute_split_k_stages": 4,
+            "cute_split_k_partials": "output",
+        }
+    )
+    assert "dtype=torch.bfloat16, device=" in bound.to_code(config)
+    bound.set_config(config)
+    captured: list[torch.Tensor] = []
+    original_empty = torch.empty
+
+    def capture_empty(*args: Any, **kwargs: Any):
+        result = original_empty(*args, **kwargs)
+        if result.ndim == 3:
+            captured.append(result)
+        return result
+
+    with patch("torch.empty", side_effect=capture_empty):
+        bound(*arguments)
+    (partials,) = captured
+    assert partials.dtype == torch.bfloat16
+    chunk = k // 4
+    expected = torch.stack(
+        [
+            (
+                a[:, i * chunk : (i + 1) * chunk].float()
+                @ b[i * chunk : (i + 1) * chunk].float()
+            )
+            for i in range(4)
+        ]
+    )
+    torch.testing.assert_close(partials.float(), expected, atol=2e-1, rtol=1e-2)
+    torch.testing.assert_close(
+        out, ordered_reduction(partials.float(), None, out.dtype), atol=0, rtol=0
+    )
+    torch.testing.assert_close(
+        out, (a.float() @ b.float()).to(out.dtype), atol=1, rtol=1e-2
+    )
 
 
 ATOMIC_EPILOGUE_CASES = (

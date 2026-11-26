@@ -44,6 +44,9 @@ from .memory_ops import _bound_vec_alignment_signature
 from .pipeline_smem import Tcgen05PipelineSmemFacts
 from .pipeline_smem import max_pipeline_ab_stages
 from .split_k_workspace_config import ATOMIC_EPILOGUE_KEY
+from .split_k_workspace_config import PARTIALS_ACCUMULATOR
+from .split_k_workspace_config import PARTIALS_KEY
+from .split_k_workspace_config import PARTIALS_OUTPUT
 from .split_k_workspace_config import PARTITION_CHOICES
 from .split_k_workspace_config import PARTITIONS_KEY
 from .split_k_workspace_config import STAGES_KEY
@@ -151,6 +154,10 @@ class SplitKWorkspaceSchedule:
     # coordinates by ``partition * chunk``, so the TMA loads zero-fill the
     # last partition past K (``plain_store_chunk``).
     k_offset: bool = False
+    # The dtype the producer stores the partials in and the reducer loads:
+    # fp32, or the 16-bit output dtype (``cute_split_k_partials="output"``,
+    # ``partials_admissible``).
+    partial_dtype: torch.dtype = torch.float32
 
 
 def _is_call(node: object, target: object) -> bool:
@@ -875,10 +882,14 @@ def analyze_split_k_store_reduction(
     out[tile_m, tile_n] = (acc [+ bias[tile_n]]) [.to(out.dtype)]`` over the
     whole K extent, ``out`` a fresh private allocation returned as is, or a
     kernel argument that only the device loop writes
-    (``_argument_store_output``)."""
+    (``_argument_store_output``). None under ``split_k_reduction="none"``:
+    the schedule splits a K loop the kernel runs whole, where a kernel's own
+    atomic split (``analyze_split_k_reduction``) only changes how its
+    partials meet."""
     host = ir.host_function
     if (
         env.backend_name != "cute"
+        or env.settings.split_k_reduction == "none"
         or host is None
         or env._is_distributed
         or cute_env_state(env).fission_plan is not None
@@ -1461,6 +1472,21 @@ def atomic_epilogue_geometry(
     )
 
 
+def partials_admissible(proof: SplitKWorkspaceProof, env: CompileEnvironment) -> bool:
+    """Whether a proved plain GEMM store may keep its partials in its 16-bit
+    output dtype (``cute_split_k_partials="output"``): torch lets cuBLAS
+    reduce bf16 / fp16 split-K partials in the output type
+    (``allow_{bf16,fp16}_reduced_precision_reduction``, which helion.inductor
+    passes as ``Settings.split_k_reduction="output"``); the sum of the
+    partials stays fp32 in the reducer. bf16 256 x 512 x 197952 in 16
+    partitions: 8 MiB of fp32 partials, 4 MiB of bf16 ones."""
+    return (
+        proof.store
+        and env.settings.split_k_reduction == "output"
+        and proof.output_dtype in (torch.float16, torch.bfloat16)
+    )
+
+
 def workspace_tile_max_stages(
     *,
     m: int,
@@ -1540,6 +1566,13 @@ def workspace_schedule(
     )
     if maximum is None or type(stages) is not int or not 1 <= stages <= maximum:
         return None
+    partials = config.get(PARTIALS_KEY, PARTIALS_ACCUMULATOR)
+    if partials == PARTIALS_OUTPUT and partials_admissible(proof, env):
+        partial_dtype = proof.output_dtype
+    elif partials == PARTIALS_ACCUMULATOR:
+        partial_dtype = torch.float32
+    else:
+        return None
     return SplitKWorkspaceSchedule(
         partitions,
         chunk,
@@ -1549,6 +1582,7 @@ def workspace_schedule(
         stages,
         atomic_epilogue=atomic_epilogue,
         k_offset=k_offset,
+        partial_dtype=partial_dtype,
     )
 
 

@@ -49,6 +49,8 @@ from .state import cute_env_state
 from .tcgen05_config import facts
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from ..host_function import HostFunction
     from .split_k_workspace import AtomicEpilogueGeometry
     from .split_k_workspace import SplitKWorkspaceProof
@@ -70,6 +72,35 @@ def _native_partition_gemm(
             )
         partials[partition, row, column] = accumulator
     return partials
+
+
+def _native_partition_gemm_rounded(
+    a: torch.Tensor, b: torch.Tensor, partials: torch.Tensor
+) -> torch.Tensor:
+    # ``_native_partition_gemm`` storing each partition's fp32 sum rounded to
+    # the 16-bit partials (``cute_split_k_partials="output"``)
+    partitions, rows, inner_size = a.shape
+    columns = b.size(2)
+    for partition, row, column in hl.tile(
+        (partitions, rows, columns), block_size=(1, None, None)
+    ):
+        accumulator = hl.zeros([partition, row, column], dtype=torch.float32)
+        for inner in hl.tile(inner_size):
+            accumulator = torch.baddbmm(
+                accumulator, a[partition, row, inner], b[partition, inner, column]
+            )
+        partials[partition, row, column] = accumulator.to(partials.dtype)
+    return partials
+
+
+def _producer_function(
+    schedule: SplitKWorkspaceSchedule,
+) -> Callable[..., torch.Tensor]:
+    """The partition producer the schedule compiles: fp32 partials store the
+    accumulator as it is, 16-bit ones round it to their dtype first."""
+    if schedule.partial_dtype == torch.float32:
+        return _native_partition_gemm
+    return _native_partition_gemm_rounded
 
 
 def _producer_source(
@@ -104,7 +135,7 @@ def _producer_source(
         (
             (partitions, proof.m, proof.n),
             (proof.m * proof.n, proof.n, 1),
-            torch.float32,
+            schedule.partial_dtype,
         ),
     )
     with owner.suspend(), child:
@@ -124,7 +155,7 @@ def _producer_source(
             maybe_skip_dtype_check_in_meta_registrations(),
             patch_inductor_lowerings(),
         ):
-            host = compiler.compile(_native_partition_gemm, list(arguments), {})
+            host = compiler.compile(_producer_function(schedule), list(arguments), {})
         with host:
             candidates = [
                 (node, candidate)
@@ -360,6 +391,11 @@ def _reducer_source(
     ragged = vectors % REDUCER_THREADS != 0
     bits = proof.output_dtype.itemsize * 8
     output_type = cutlass_dtype_name(proof.output_dtype)
+    # 16-bit partials (``cute_split_k_partials="output"``) load four at a time
+    # into ``raw_<q>`` and widen to the fp32 ``loaded_<q>`` the sum reads.
+    sixteen = schedule.partial_dtype != torch.float32
+    partial_type = cutlass_dtype_name(schedule.partial_dtype)
+    partial_bits = schedule.partial_dtype.itemsize * 8 * 4
     lines = [
         "from __future__ import annotations",
         "import cutlass",
@@ -370,12 +406,16 @@ def _reducer_source(
         "    cute.arch.griddepcontrol_wait()",
         "    thread = cutlass.Int32(cute.arch.thread_idx()[0])",
         "    block = cutlass.Int32(cute.arch.block_idx()[0])",
-        "    load_atom = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), cutlass.Float32, num_bits_per_copy=128)",
+        f"    load_atom = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), {partial_type}, num_bits_per_copy={partial_bits})",
         f"    vector = block * cutlass.Int32({REDUCER_THREADS}) + thread",
         "    output_begin = cute.assume(vector * cutlass.Int32(4), divby=4)",
         *(
             f"    loaded_{q} = cute.make_rmem_tensor((4,), cutlass.Float32)"
             for q in range(schedule.partitions)
+        ),
+        *(
+            f"    raw_{q} = cute.make_rmem_tensor((4,), {partial_type})"
+            for q in (range(schedule.partitions) if sixteen else ())
         ),
     ]
     indent = "    "
@@ -389,8 +429,11 @@ def _reducer_source(
 
     def loads(group: range) -> list[str]:
         return [
-            f"{indent}cute.copy(load_atom, cute.make_tensor(partials.iterator + cute.assume(cutlass.Int32({q * outputs}) + output_begin, divby=4), cute.make_layout((4,), stride=(1,))), loaded_{q})"
+            f"{indent}cute.copy(load_atom, cute.make_tensor(partials.iterator + cute.assume(cutlass.Int32({q * outputs}) + output_begin, divby=4), cute.make_layout((4,), stride=(1,))), {'raw' if sixteen else 'loaded'}_{q})"
             for q in group
+        ] + [
+            f"{indent}loaded_{q}.store(raw_{q}.load().to(cutlass.Float32))"
+            for q in (group if sixteen else ())
         ]
 
     lines.extend(loads(groups[0]))
@@ -1140,7 +1183,8 @@ def generate_split_k_workspace(
         f"{view_b} = ({proof.rhs_expression}).as_strided(({views_p}, {views_k}, {proof.n}), {b_stride!r})\n"
     )
     bias_argument = f", {proof.bias.host_expression}" if proof.bias is not None else ""
-    native_kernel = f"{native_module}._helion__native_partition_gemm"
+    producer = _producer_function(schedule).__name__
+    native_kernel = f"{native_module}._helion_{producer}"
     reduce_kernel = f"{reduce_module}._reduce_partitions"
     compile_options = config_compile_options(config)
     option = compile_options_keyword(compile_options)
@@ -1168,9 +1212,9 @@ def generate_split_k_workspace(
     else:
         reducer_grid = _reducer_grid(proof.m * proof.n)
         new_calls = ast.parse(
-            f"{partials} = torch.empty(({p}, {proof.m}, {proof.n}), dtype=torch.float32, device=({proof.lhs_expression}).device)\n"
+            f"{partials} = torch.empty(({p}, {proof.m}, {proof.n}), dtype={torch_dtype_name(schedule.partial_dtype)}, device=({proof.lhs_expression}).device)\n"
             + views
-            + f"{native_module}._native_partition_gemm({view_a}, {view_b}, {partials}, _launcher=_launcher)\n"
+            + f"{native_module}.{producer}({view_a}, {view_b}, {partials}, _launcher=_launcher)\n"
             f"_launcher({reduce_module}._reduce_partitions, ({reducer_grid},), {partials}, {proof.output_name}{bias_argument}, block=({REDUCER_THREADS}, 1, 1){option})\n"
         ).body
         kernels = (native_kernel, reduce_kernel)
@@ -1213,7 +1257,9 @@ def generate_split_k_workspace(
         **({"k_offset": True} if schedule.k_offset else {}),
         "tile": (schedule.bm, schedule.bn, schedule.bk),
         "ab_stages": schedule.stages,
-        "partial_dtype": None if schedule.atomic_epilogue else "torch.float32",
+        "partial_dtype": None
+        if schedule.atomic_epilogue
+        else torch_dtype_name(schedule.partial_dtype),
         "output_dtype": str(proof.output_dtype),
         "bias_partition": 0 if proof.bias is not None else None,
         "epilogue": "atomic" if schedule.atomic_epilogue else "reducer",

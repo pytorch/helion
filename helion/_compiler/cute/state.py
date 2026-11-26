@@ -35,6 +35,7 @@ from typing import TYPE_CHECKING
 from typing import cast
 
 from .tcgen05_constants import TCGEN05_SPLIT_K_CONFIG_KEY
+from .tcgen05_constants import tcgen05_cluster_split_k
 
 if TYPE_CHECKING:
     import ast
@@ -280,11 +281,18 @@ def new_device_state(config: Config) -> CuteDeviceFunctionState:
     ``tcgen05_split_k``: the flat grid holds ``split_k`` CTAs per output tile
     (``block_idx // split_k`` is the tile's program id); the tcgen05 pipeline
     marks the config applied or the launch codegen rejects it
-    (``DeviceFunction.codegen_function_call``).
+    (``DeviceFunction.codegen_function_call``).  A split on the CtaGroup.TWO
+    4-CTA cluster (``tcgen05_cluster_split_k``) keeps one program id per
+    output tile: its splits are the cluster's CTA pairs, which the persistent
+    scheduler places.
     """
     state = new_unseeded_device_state()
     split_k = config.get(TCGEN05_SPLIT_K_CONFIG_KEY, 1)
-    if isinstance(split_k, int) and split_k > 1:
+    if (
+        isinstance(split_k, int)
+        and split_k > 1
+        and tcgen05_cluster_split_k(config) == 1
+    ):
         state.tcgen05.program_id_divisor = split_k
         state.lanes.launch_grid_multiplier = split_k
     return state

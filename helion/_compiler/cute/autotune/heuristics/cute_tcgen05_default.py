@@ -640,8 +640,10 @@ class CuteTcgen05DefaultTileHeuristic(AutotunerHeuristic):
         shorter loop, where no split qualifies, on a tile narrower than the
         tcgen05 MMA's N (``_tcgen05_min_block_n``), or where the tiles cannot
         split (``split_k_tiles_supported``: whole tiles only without the
-        flat-edge TMA path). A kernel off the split-K search surface
-        (``split_k_search_choices``) keeps the base default. Each axis takes
+        flat-edge TMA path). A kernel off the split-K surface
+        (``split_k_admissible_choices``) keeps the base default; under
+        ``split_k_reduction="none"`` (``split_k_search_choices`` empty) the
+        tile runs unsplit. Each axis takes
         the 64 nearest its block-size range (a narrower N its width, a pinned
         K block its depth), and the slices are counted on that tile.
 
@@ -663,10 +665,10 @@ class CuteTcgen05DefaultTileHeuristic(AutotunerHeuristic):
         state = spec._cute_tcgen05_config
         choices = surface.split_k_search_choices(state)
         fragments = facts._matmul_block_fragments(state)
-        # Off the split-K search surface (a body past one plain store, a
-        # leading passthrough axis: ``split_k_search_choices``) the kernel
-        # keeps the base default.
-        if not choices or fragments is None:
+        # Off the split-K surface (a body past one plain store, a leading
+        # passthrough axis: ``split_k_admissible_choices``) the kernel keeps
+        # the base default.
+        if not surface.split_k_admissible_choices(state) or fragments is None:
             return None
         # The slices are counted on the tile that runs: 64 on each axis,
         # within its block-size range (a narrow N tiles at its width).

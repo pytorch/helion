@@ -215,6 +215,34 @@ def my_kernel(x: torch.Tensor) -> torch.Tensor:
    NaN/Inf behavior. Default is ``False``.
    Controlled by ``HELION_FAST_MATH=1``.
 
+.. autoattribute:: Settings.split_k_reduction
+
+   The split-K reductions the compiler may introduce into a dot's K loop, where several
+   CTAs each compute part of K and their partial products meet through memory. A new,
+   additive setting: its default, ``"accumulator"``, keeps the behavior from before it
+   existed.
+
+   - ``"accumulator"`` (default): split-K is searched; the partials are summed in the
+     accumulator dtype (fp32 for floating-point dots).
+   - ``"output"``: as ``"accumulator"``, and a dot with a 16-bit (``bfloat16`` or ``float16``)
+     output may also keep or exchange its partials rounded to that dtype, where a split-K form
+     offers it; the sum itself stays fp32. On the CuTe backend this offers
+     ``tcgen05_split_k_exchange="output"`` on the 4-CTA cluster split (``tcgen05_split_k=2``
+     with ``tcgen05_cluster_m=2, tcgen05_cluster_n=2``): each CTA pair sends its partner the
+     half of the tile it does not store as packed 16-bit values, and the receiver adds them to
+     its own fp32 partials; and ``cute_split_k_partials="output"`` on the split-K workspace
+     schedule over a plain GEMM store: the producer writes each partition's partials rounded
+     to the output dtype, and the reducer widens them to fp32 for the same sum.
+   - ``"none"``: no split-K. The search, the compiler seeds and the defaults offer none, and a
+     config that asks for one is refused (or, while autotuning, repaired to the unsplit loop):
+     on the CuTe backend ``tcgen05_split_k`` and the split-K workspace schedule
+     (``cute_split_k_workspace`` over a plain GEMM store).
+
+   Warps of one CTA sharing a K loop (their partials summed in fp32 inside the CTA), and a
+   kernel that splits K itself (``hl.atomic_add`` of partial products), keep their
+   reductions.
+   Controlled by ``HELION_SPLIT_K_REDUCTION=accumulator|output|none``.
+
 .. autoattribute:: Settings.cute_flash_env_overrides
 
    CuTe flash-attention knob channel: a mapping of ``HELION_CUTE_FLASH_*`` names to
@@ -578,6 +606,7 @@ Built-in values for ``HELION_AUTOTUNER`` include ``"LFBOTreeSearch"`` (default),
 | ``HELION_INDEX_DTYPE`` | ``index_dtype`` | Choose the index dtype (accepts any ``torch.<dtype>`` name, e.g. ``int64``), or set to ``auto``/unset to allow Helion to pick ``int32`` vs ``int64`` based on input sizes. |
 | ``HELION_STATIC_SHAPES`` | ``static_shapes`` | Set to ``0``/``false`` to disable global static shape specialization. |
 | ``HELION_FAST_MATH`` | ``fast_math`` | Set to ``1`` to enable fast math approximations (Helion-level and Inductor-level). May reduce numerical precision and change NaN/Inf behavior. |
+| ``HELION_SPLIT_K_REDUCTION`` | ``split_k_reduction`` | ``accumulator`` (default) allows split-K with partials summed in the accumulator dtype, ``output`` also lets a 16-bit output's partials be kept or exchanged in its dtype, ``none`` disables split-K. |
 | ``HELION_PERSISTENT_RESERVED_SMS`` | ``persistent_reserved_sms`` | Reserve this many streaming multiprocessors when launching persistent kernels (``0`` uses all available SMs). |
 | ``HELION_FORCE_AUTOTUNE`` | ``force_autotune`` | Force the autotuner to run even when explicit configs are provided. The result is saved to the cache. |
 | ``HELION_AUTOTUNE_FORCE_PERSISTENT`` | ``autotune_force_persistent`` | Restrict ``pid_type`` to persistent kernel strategies during config search. |

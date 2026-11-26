@@ -396,10 +396,17 @@ def bf16_mm_args(
     k: int,
     *,
     rhs_k_major: bool = True,
+    lhs_k_major: bool = True,
     device: torch.device | str = "cpu",
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Random 16-bit operands and an argument output for ``plain_mm_into``."""
-    a = torch.randn((m, k), dtype=torch.bfloat16, device=device)
+    """Random 16-bit operands and an argument output for ``plain_mm_into``.
+
+    ``lhs_k_major=False`` gives an M-major A (``x.T`` of a weight gradient)."""
+    a = (
+        torch.randn((m, k), dtype=torch.bfloat16, device=device)
+        if lhs_k_major
+        else torch.randn((k, m), dtype=torch.bfloat16, device=device).T
+    )
     b = (
         torch.randn((n, k), dtype=torch.bfloat16, device=device).T
         if rhs_k_major

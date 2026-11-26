@@ -64,6 +64,8 @@ from ..tcgen05_constants import TCGEN05_ONE_CTA_MAX_BLOCK_M
 from ..tcgen05_constants import TCGEN05_SCHED_STAGE_COUNT_CONFIG_KEY
 from ..tcgen05_constants import TCGEN05_SMEM_ROW_STAGE_CHUNK_BYTES
 from ..tcgen05_constants import TCGEN05_SMEM_SMALL_ALLOCATION_ALLOWANCE_BYTES
+from ..tcgen05_constants import TCGEN05_SPLIT_K_EXCHANGE_CONFIG_KEY
+from ..tcgen05_constants import TCGEN05_SPLIT_K_EXCHANGE_OUTPUT
 from ..tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_M
 from ..tcgen05_constants import TCGEN05_TWO_CTA_SEED_PID_TYPE
 from ..tcgen05_constants import resolve_tcgen05_grouped_worklist_mma_profile
@@ -71,6 +73,8 @@ from ..tcgen05_constants import tcgen05_ab_smem_bytes_per_cta
 from ..tcgen05_constants import tcgen05_aux_ring_smem_bytes_per_cta
 from ..tcgen05_constants import tcgen05_aux_subtile_fragment_bytes_per_thread
 from ..tcgen05_constants import tcgen05_c_smem_bytes_per_cta
+from ..tcgen05_constants import tcgen05_cluster_split_k
+from ..tcgen05_constants import tcgen05_cluster_split_k_exchange_smem_bytes
 from ..tcgen05_constants import tcgen05_default_epilogue_tile_size
 from ..tcgen05_constants import tcgen05_fixed_smem_overhead_bytes
 from ..tcgen05_constants import tcgen05_grouped_worklist_smem_bytes
@@ -93,6 +97,8 @@ from .knobs import TCGEN05_GROUPED_WORKLIST_NM_SHAPE_MISMATCH
 from .knobs import Tcgen05AbStagesThreeSearchConstraints
 
 if TYPE_CHECKING:
+    from collections.abc import Mapping
+
     from ..tcgen05_constants import Tcgen05RowvecAuxFacts
     from . import CuteTcgen05Config
 
@@ -114,6 +120,22 @@ def _one_cta_pipeline_stage_limit(
         c_stages=c_stages,
         acc_stages=acc_stages,
         cluster_m=1,
+    )
+
+
+def split_k_exchange_itemsize(
+    state: CuteTcgen05Config, config: Mapping[str, object]
+) -> int:
+    """Bytes per partial a K-split cluster's receive buffer holds: 2 under
+    ``tcgen05_split_k_exchange="output"`` where the repair keeps it
+    (``surface.split_k_exchange_admitted``, read here so that a stage count
+    judged before the repair never counts on the smaller buffer), else 4."""
+    return (
+        2
+        if config.get(TCGEN05_SPLIT_K_EXCHANGE_CONFIG_KEY)
+        == TCGEN05_SPLIT_K_EXCHANGE_OUTPUT
+        and surface.split_k_exchange_admitted(state)
+        else 4
     )
 
 
@@ -146,6 +168,13 @@ def _paired_pipeline_stage_limit(
         epi_warps=cast("int", config.get("tcgen05_num_epi_warps", 4)),
         aux_load_mode=aux_load_mode_knob(config),
         aux_stages=aux_stages_knob(config),
+        exchange_bytes=(
+            tcgen05_cluster_split_k_exchange_smem_bytes(
+                bm=bm, bn=bn, itemsize=split_k_exchange_itemsize(state, config)
+            )
+            if tcgen05_cluster_split_k(config) > 1
+            else 0
+        ),
     )
 
 

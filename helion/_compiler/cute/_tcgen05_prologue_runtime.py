@@ -233,6 +233,7 @@ def make_tma_umma_pipeline(
     tx_count: object,
     barrier_storage: cute.Pointer,
     cta_layout_vmnk: cute.Layout,
+    mcast_mode_mn: tuple[int, int] = (1, 1),
     name: str = "",
     loc: object = None,
     ip: object = None,
@@ -240,7 +241,9 @@ def make_tma_umma_pipeline(
     """``PipelineTmaUmma.create(..., defer_sync=True)`` without the mbarrier
     inits: pair with :func:`init_pipeline_barriers` and the caller's
     ``pipeline_init_arrive`` / ``pipeline_init_wait``.  The DSL constructor's
-    validation and ``register_barrier`` (profiling) semantics otherwise."""
+    validation and ``register_barrier`` (profiling) semantics otherwise;
+    ``mcast_mode_mn`` is its arrival-mask selector ((A multicast peers, B
+    multicast peers): ``(0, 1)`` leaves out the cluster's other N lane)."""
     storage = barrier_storage.align(min_align=8)
     sync_object_full = _uninitialized_mbarrier_array(
         storage,
@@ -266,7 +269,7 @@ def make_tma_umma_pipeline(
         is_leader_cta = True
     else:
         producer_mask = PipelineTmaUmma._compute_mcast_arrival_mask(
-            cta_layout_vmnk, (1, 1), loc=loc, ip=ip
+            cta_layout_vmnk, mcast_mode_mn, loc=loc, ip=ip
         )
         is_leader_cta = PipelineTmaUmma._compute_is_leader_cta(
             cta_layout_vmnk, loc=loc, ip=ip

@@ -143,6 +143,8 @@ from ..tcgen05_constants import TCGEN05_REGION_PID_TYPE_CHOICES
 from ..tcgen05_constants import TCGEN05_REGION_PID_TYPE_INHERIT
 from ..tcgen05_constants import TCGEN05_REGION_PID_TYPES_CONFIG_KEY
 from ..tcgen05_constants import TCGEN05_SPLIT_K_CONFIG_KEY
+from ..tcgen05_constants import TCGEN05_SPLIT_K_EXCHANGE_CHOICES
+from ..tcgen05_constants import TCGEN05_SPLIT_K_EXCHANGE_CONFIG_KEY
 from ..tcgen05_constants import TCGEN05_SPLIT_K_SEARCH_CHOICES
 from ..tcgen05_constants import TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY
 from ..tcgen05_constants import TCGEN05_TWO_CTA_MAX_K_TILES
@@ -514,6 +516,36 @@ def _pdl_searched(state: CuteTcgen05Config) -> bool:
 
 
 def split_k_search_choices(state: CuteTcgen05Config) -> tuple[int, ...]:
+    """The ``tcgen05_split_k`` values the search, the seeds and the defaults
+    offer: ``split_k_admissible_choices``, or none under
+    ``split_k_reduction="none"`` (torch's reduced-precision split-K flag off,
+    through helion.inductor), where every K loop runs unsplit."""
+    if state.split_k_reduction == "none":
+        return ()
+    return split_k_admissible_choices(state)
+
+
+def split_k_exchange_admitted(state: CuteTcgen05Config) -> bool:
+    """Whether a K-split cluster (``tcgen05_cluster_split_k``) may exchange
+    its partials rounded to the output dtype
+    (``tcgen05_split_k_exchange="output"``): ``split_k_reduction="output"``
+    (torch's default reduced-precision flags, through helion.inductor) and a
+    16-bit output."""
+    facts = state.pipeline_smem_facts
+    return (
+        state.split_k_reduction == "output"
+        and facts is not None
+        and facts.output_dtype_bytes == 2
+    )
+
+
+def split_k_exchange_search_enabled(state: CuteTcgen05Config) -> bool:
+    """``tcgen05_split_k_exchange`` on the search surface: admitted, and the
+    cluster's two-way split searched."""
+    return split_k_exchange_admitted(state) and 2 in split_k_search_choices(state)
+
+
+def split_k_admissible_choices(state: CuteTcgen05Config) -> tuple[int, ...]:
     """The ``tcgen05_split_k`` values the plain GEMM can take: splits no
     deeper than the K loop of the smallest K tile the search admits,
     for an unbatched static-shape GEMM (the pipeline reads the operands
@@ -1280,6 +1312,13 @@ def optional_fragments(
         fragments[TCGEN05_SPLIT_K_CONFIG_KEY] = EnumFragment(
             TCGEN05_SPLIT_K_SEARCH_CHOICES
         )
+    if not for_search or split_k_exchange_search_enabled(state):
+        # The K-split cluster's partials in fp32 or rounded to the 16-bit
+        # output (``_normalize_split_k_exchange`` keeps "output" on a
+        # cluster split under ``split_k_reduction="output"`` only).
+        fragments[TCGEN05_SPLIT_K_EXCHANGE_CONFIG_KEY] = EnumFragment(
+            TCGEN05_SPLIT_K_EXCHANGE_CHOICES
+        )
     if not for_search or state.grouped_ab_k_fusion_supported:
         fragments[TCGEN05_GROUPED_AB_TILE_K_CONFIG_KEY] = EnumFragment((None, 128))
     if not for_search or state.grouped_d_shift_supported:
@@ -2014,10 +2053,7 @@ def flat_fields(
     ):
         fields["loop_orders"] = state.config_spec.loop_orders
     fields.update(optional_fragments(state, for_search=True))
-    if state.config_spec.cute_split_k_workspace_available:
-        fields.update(
-            workspace_search_fields(state.config_spec.cute_split_k_partition_choices)
-        )
+    fields.update(workspace_search_fields(state.config_spec))
     seeds = state.config_spec.compiler_seed_configs
     if isinstance(fragment := fields.get("tcgen05_ab_stages"), IntegerFragment):
         fields["tcgen05_ab_stages"] = _integer_fragment_with_seed_values(

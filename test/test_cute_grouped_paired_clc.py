@@ -254,6 +254,8 @@ def test_linear_records_preserve_all_semantic_pid_orders(order):
     strategy: Any = SimpleNamespace(
         pid_info=axis_decoder.pid_info,
         _tcgen05_plan=lambda: plan,
+        # (no K-split cluster: ``tcgen05_cluster_split_k``)
+        _tcgen05_cluster_split_k=lambda: 1,
         _tcgen05_logical_m_coord_expr=lambda value: f"({value}) // 2",
     )
     expression = (

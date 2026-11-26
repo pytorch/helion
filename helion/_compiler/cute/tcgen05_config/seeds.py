@@ -66,6 +66,8 @@ from ..tcgen05_constants import TCGEN05_BATCHED_ONE_K_TILE_SEED_AB_STAGES
 from ..tcgen05_constants import TCGEN05_C_STORE_MODE_CONFIG_KEY
 from ..tcgen05_constants import TCGEN05_C_STORE_MODE_DIRECT
 from ..tcgen05_constants import TCGEN05_CLUSTER_N2_SEED_L2_GROUPING
+from ..tcgen05_constants import TCGEN05_CLUSTER_SPLIT_K_OUTPUT_EXCHANGE_SEED_MIN_K_TILES
+from ..tcgen05_constants import TCGEN05_CLUSTER_SPLIT_K_SEED_MIN_K_TILES
 from ..tcgen05_constants import TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY
 from ..tcgen05_constants import TCGEN05_GROUPED_MODE_CONFIG_KEY
 from ..tcgen05_constants import TCGEN05_ONE_CTA_MAX_BLOCK_M
@@ -74,6 +76,8 @@ from ..tcgen05_constants import TCGEN05_REGION_PID_TYPE_INHERIT
 from ..tcgen05_constants import TCGEN05_REGION_PID_TYPES_CONFIG_KEY
 from ..tcgen05_constants import TCGEN05_SMALL_GRID_DIRECT_STORE_MAX_BN
 from ..tcgen05_constants import TCGEN05_SPLIT_K_CONFIG_KEY
+from ..tcgen05_constants import TCGEN05_SPLIT_K_EXCHANGE_CONFIG_KEY
+from ..tcgen05_constants import TCGEN05_SPLIT_K_EXCHANGE_OUTPUT
 from ..tcgen05_constants import TCGEN05_SPLIT_K_MIN_SLICE_K_TILES
 from ..tcgen05_constants import TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY
 from ..tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_M
@@ -100,6 +104,7 @@ from ..tcgen05_constants import TCGEN05_TWO_CTA_ONE_WAVE_BLOCK_NS
 from ..tcgen05_constants import TCGEN05_TWO_CTA_PAIR128_ONE_WAVE_BLOCK_NS
 from ..tcgen05_constants import TCGEN05_TWO_CTA_SEED_L2_GROUPING
 from ..tcgen05_constants import TCGEN05_TWO_CTA_SEED_PID_TYPE
+from ..tcgen05_constants import tcgen05_cluster_split_k_exchange_smem_bytes
 from ..tcgen05_constants import tcgen05_direct_entry_stage_tuple_allowed
 from ..tcgen05_constants import tcgen05_rowvec_stage_smem_bytes
 from ..tcgen05_constants import tcgen05_two_cta_edge_k_tail_seed_overrides
@@ -884,6 +889,47 @@ def _paired_pipeline_seed_configs(
                                             }
                                         )
                                     )
+    exchanges = _cluster_split_k_seed_exchanges(state, m=m, n=n, k=k)
+    if exchanges:
+        # The 128x128 pair over a 4-CTA cluster whose two pairs take the
+        # tile's K halves (``tcgen05_cluster_split_k``), at the deepest AB
+        # ring beside its receive buffer (16 KiB of fp32 partials, 8 KiB of
+        # 16-bit ones): one cluster per tile.
+        block_sizes = facts._matmul_seed_block_sizes(state, bm=128, bn=128, bk=64)
+        assert block_sizes is not None
+        for exchange, itemsize in exchanges:
+            stages = max_pipeline_ab_stages(
+                pipeline_facts,
+                bm=128,
+                bn=128,
+                bk=64,
+                c_stages=2,
+                acc_stages=acc_stages,
+                max_stages=paired_pipeline_max_ab_stages(pipeline_facts),
+                exchange_bytes=tcgen05_cluster_split_k_exchange_smem_bytes(
+                    bm=128, bn=128, itemsize=itemsize
+                ),
+            )
+            if stages <= 0:
+                continue
+            seeds.append(
+                Config(
+                    block_sizes=block_sizes,
+                    pid_type=pid,
+                    tcgen05_cta_group="two",
+                    tcgen05_cluster_m=2,
+                    tcgen05_cluster_n=2,
+                    tcgen05_split_k=2,
+                    **exchange,
+                    tcgen05_ab_stages=stages,
+                    tcgen05_c_stages=2,
+                    tcgen05_acc_stages=acc_stages,
+                    tcgen05_persistence_model="static_persistent",
+                    tcgen05_strategy="role_local_monolithic",
+                    tcgen05_layout_strategy="default",
+                    **dict.fromkeys(TCGEN05_LAYOUT_OVERRIDES_KEYS),
+                )
+            )
     return seeds
 
 
@@ -1014,7 +1060,9 @@ def _small_grid_seed_configs(state: CuteTcgen05Config) -> list[Config]:
     return seeds
 
 
-def _split_k_seed_configs(state: CuteTcgen05Config) -> list[Config]:
+def _split_k_seed_configs(
+    state: CuteTcgen05Config, *, deepest_one_wave: bool = False
+) -> list[Config]:
     """Flat one-CTA split-K seeds for problems whose output tiles cannot
     fill the machine (``tcgen05_split_k``, ``split_k_exchange.py``).
 
@@ -1025,6 +1073,13 @@ def _split_k_seed_configs(state: CuteTcgen05Config) -> list[Config]:
     splits that bring the grid to at least one wave while every split
     keeps at least four K tiles, and the ring depth the SMEM budget
     admits for the tile.
+
+    With ``deepest_one_wave`` they take instead, per admitted tile, the
+    deepest such split whose grid still fits in one wave, where the
+    first set lacks it: it leaves SMs idle, but exchanges fewer partials
+    and runs a longer K loop per CTA than the splits that fill the
+    machine. ``autotune_seed_configs`` appends these after every other
+    seed, so they take no initial-population place from another seed.
     """
     extents = state.matmul_compile_time_static_extents
     fragments = facts._matmul_block_fragments(state)
@@ -1063,20 +1118,30 @@ def _split_k_seed_configs(state: CuteTcgen05Config) -> list[Config]:
             ):
                 continue
             k_tiles = -(-k // bk)
-            splits = [
+            sliced = [
                 split
                 for split in choices
                 if k_tiles // split >= TCGEN05_SPLIT_K_MIN_SLICE_K_TILES
-                and tiles * split >= sm_count
-            ][:2]
+            ]
+            splits = [split for split in sliced if tiles * split >= sm_count][:2]
             if not splits:
                 # No split reaches one wave with four tiles per split:
                 # the deepest split that keeps four tiles.
-                splits = [
+                splits = sliced[-1:]
+            if deepest_one_wave:
+                # bf16 64x4096x25088 with b K-major runs its 64 [64, 64,
+                # 128] tiles split two ways (128 CTAs on GB300's 152 SMs)
+                # at 38.9 us, 1.003-1.008 of stock Inductor's cuBLAS
+                # split-K; searches without this seed picked four splits
+                # or found two by sampling, 39.4-40.2.
+                one_wave = [
                     split
-                    for split in choices
-                    if k_tiles // split >= TCGEN05_SPLIT_K_MIN_SLICE_K_TILES
-                ][-1:]
+                    for split in sliced
+                    if sm_count > 0 and tiles * split <= sm_count
+                ]
+                splits = (
+                    one_wave[-1:] if one_wave and one_wave[-1] not in splits else []
+                )
             fit = smem.max_ab_stages_that_fit(state, bm=bm, bn=bn, bk=bk, cluster_m=1)
             block_sizes = facts._matmul_seed_block_sizes(state, bm=bm, bn=bn, bk=bk)
             assert block_sizes is not None
@@ -1539,6 +1604,71 @@ def _one_wave_seed_configs(state: CuteTcgen05Config) -> list[Config]:
                         )
                     )
     return seeds
+
+
+def _cluster_split_k_seed_exchanges(
+    state: CuteTcgen05Config, *, m: int, n: int, k: int
+) -> list[tuple[dict[str, Any], int]]:
+    """The K-split cluster seeds (``tcgen05_split_k=2`` on the 128x128 pair's
+    4-CTA cluster) the paired-pipeline seeds include, as (the exchange's
+    config keys, bytes per exchanged partial): for a plain unbatched 16-bit
+    GEMM with a row-major output and whole 128x128 tiles whose clusters fit
+    one wave of the machine, with no SM reserved (the split launches one
+    cluster per tile) and operands and an output that pass the TensorMap
+    proof (``matmul_operands_tma_provable``: the exchange renders in the
+    TMA-store epilogue only), the fp32 exchange from
+    ``TCGEN05_CLUSTER_SPLIT_K_SEED_MIN_K_TILES`` 64-deep K tiles and, where
+    the search offers it (``split_k_reduction="output"``), the 16-bit one
+    (``tcgen05_split_k_exchange="output"``) from
+    ``TCGEN05_CLUSTER_SPLIT_K_OUTPUT_EXCHANGE_SEED_MIN_K_TILES``.
+
+    The split trades each pair's K loop for an exchange of half its
+    partials: per CTA 2 instead of 3 operand bytes per output and k-block
+    against the 128x64 pair that fills the machine unsplit, and a ~0.6 us
+    reduce-scatter (16 KiB of fp32 partials per CTA through DSMEM) whatever
+    K is.  bf16 CR on GB300, of cuBLAS, full effort (the unsplit pick -> the
+    search's pick with this seed): 1024x512x4096 0.969 -> 1.077, 768x768x8192
+    0.992 -> 1.150; at 32 K tiles the fp32 split ties the unsplit pick
+    (768x768x2048 0.965 either way, one process) where the 16-bit exchange,
+    half the bytes, reads 1.033 (0.971 fp32, one process); past one wave of
+    4-CTA clusters the split loses (1536x1536x4096, 144 tiles: 0.51 against
+    the untuned unsplit pair's 0.60).
+    """
+    pipeline_facts = state.pipeline_smem_facts
+    fragments = facts._matmul_block_fragments(state)
+    if (
+        pipeline_facts is None
+        or fragments is None
+        or pipeline_facts.input_dtype_bytes != 2
+        or pipeline_facts.output_column_major
+        or pipeline_facts.has_auxiliary_loads
+        or state.aux_kernel_detected
+        or not state.split_k_plain_body
+        or state.matmul_has_leading_passthrough
+        or state.matmul_leading_work_multiplier != 1
+        or state.persistent_reserved_sms > 0
+        or not state.matmul_operands_tma_provable
+        or 2 not in surface.split_k_search_choices(state)
+        or not all(
+            fragment.low <= value <= fragment.high
+            for value, fragment in zip((128, 128, 64), fragments, strict=True)
+        )
+        or m % 128
+        or n % 128
+        or k % 128
+        or 4 * (m // 128) * (n // 128) > state.device_sm_count
+    ):
+        return []
+    exchanges: list[tuple[dict[str, Any], int]] = []
+    if k // 64 >= TCGEN05_CLUSTER_SPLIT_K_SEED_MIN_K_TILES:
+        exchanges.append(({}, 4))
+    if (
+        surface.split_k_exchange_search_enabled(state)
+        and k // 64 >= TCGEN05_CLUSTER_SPLIT_K_OUTPUT_EXCHANGE_SEED_MIN_K_TILES
+    ):
+        output = {TCGEN05_SPLIT_K_EXCHANGE_CONFIG_KEY: TCGEN05_SPLIT_K_EXCHANGE_OUTPUT}
+        exchanges.append((output, 2))
+    return exchanges
 
 
 def _aligned_n_pair128_one_wave_seed(
@@ -2940,6 +3070,10 @@ def autotune_seed_configs(state: CuteTcgen05Config) -> list[Config]:
                 )
                 if clc_aux_tma_narrow_n_seed is not None:
                     seeds.append(clc_aux_tma_narrow_n_seed)
+    # The deepest one-wave split-K seeds come after every other seed: a
+    # search's initial population takes compiler seeds in list order up to
+    # its size, so they only fill places no other seed needs.
+    seeds.extend(_split_k_seed_configs(state, deepest_one_wave=True))
     # A seed whose CTAs each run one tile keeps its AB ring within the K
     # loop, as the search repair keeps a sample's
     # (``repair.one_tile_ab_stage_cap``): the stages past it only cost the

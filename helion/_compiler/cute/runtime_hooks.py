@@ -125,6 +125,9 @@ def record_host_structural_facts(
     config_spec.tcgen05.split_k_flat_edge_tma = (
         CompileEnvironment.current().settings.cute_flat_edge_tma
     )
+    config_spec.tcgen05.split_k_reduction = (
+        CompileEnvironment.current().settings.split_k_reduction
+    )
     # Codegen refuses an atomic beside the warp roles
     # (``reject_atomics_beside_warp_roles``); the seeds read this.
     config_spec.tcgen05.kernel_has_atomics = host_function.device_ir.has_atomic_ops()

@@ -4061,6 +4061,11 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
         ]
         if settings.index_dtype is not None:
             parts.append(f"index_dtype={settings.index_dtype}")
+        if settings.split_k_reduction != "accumulator":
+            # The split-K forms a config may take: a printed config replays
+            # under the setting it was chosen under (helion.inductor emits
+            # split_k_reduction="output" under torch's default flags).
+            parts.append(f"split_k_reduction={settings.split_k_reduction!r}")
         # Resolved from the settings' backend: callers pass foreign Settings
         # and ``self`` may be None.
         parts.extend(get_backend(settings.backend).decorator_settings(settings))

@@ -61,6 +61,11 @@ PrecompileMode = Literal["spawn", "fork"] | None
 # How the autotuner compares fp8 outputs against the baseline: dequantized
 # values within one fp8 ulp plus the tolerances, or exact bytes.
 AutotuneFp8Accuracy = Literal["ulp", "bitwise"]
+# The split-K reductions the compiler may introduce into a dot's K loop (CTAs
+# each computing part of K): the partial products summed in the accumulator
+# dtype, also exchanged rounded to a 16-bit output dtype, or no split at all
+# (``Settings.split_k_reduction``).
+SplitKReduction = Literal["accumulator", "output", "none"]
 _TRUE_LITERALS = frozenset({"1", "true", "yes", "on"})
 _FALSE_LITERALS = frozenset({"0", "false", "no", "off"})
 
@@ -434,6 +439,14 @@ class _Settings:
     fast_math: bool = dataclasses.field(
         default_factory=functools.partial(_env_get_bool, "HELION_FAST_MATH", False)
     )
+    split_k_reduction: SplitKReduction = dataclasses.field(
+        default_factory=functools.partial(
+            _env_get_literal,
+            "HELION_SPLIT_K_REDUCTION",
+            cast("SplitKReduction", "accumulator"),
+            mapping={k: k for k in get_args(SplitKReduction)},
+        )
+    )
     cute_flash_env_overrides: dict[str, str] = dataclasses.field(default_factory=dict)
     static_shapes: bool = dataclasses.field(
         default_factory=functools.partial(_env_get_bool, "HELION_STATIC_SHAPES", True)
@@ -786,6 +799,17 @@ class Settings(_Settings):
             "flash-attention polynomial exp2 packets, and Inductor-level). "
             "May reduce numerical precision and change NaN/Inf behavior. "
             "Set HELION_FAST_MATH=1 to enable."
+        ),
+        "split_k_reduction": (
+            "The split-K reductions the compiler may introduce into a dot's K loop: "
+            "several CTAs each computing part of K, their partial products meeting "
+            "through memory. 'accumulator' (default) sums the partials in the "
+            "accumulator dtype (fp32 for floating-point dots); 'output' also lets a "
+            "dot with a 16-bit output keep or exchange its partials rounded to that "
+            "dtype (the sum itself stays fp32); 'none' splits no K loop over CTAs. "
+            "Warps of one CTA sharing a K loop, and a kernel that splits K itself "
+            "(atomic adds of partial products), keep their reductions. "
+            "Set HELION_SPLIT_K_REDUCTION=accumulator|output|none."
         ),
         "cute_flash_env_overrides": (
             "CuTe flash-attention knob channel: HELION_CUTE_FLASH_* variables the "
@@ -1312,6 +1336,13 @@ class Settings(_Settings):
         ):
             raise ValueError(
                 "autotune_benchmark_input_banks must be a positive integer"
+            )
+
+        if self.split_k_reduction not in get_args(SplitKReduction):
+            raise ValueError(
+                "split_k_reduction must be one of "
+                f"{', '.join(get_args(SplitKReduction))}, "
+                f"got {self.split_k_reduction!r}"
             )
 
         if self.autotune_best_of_k < 1:

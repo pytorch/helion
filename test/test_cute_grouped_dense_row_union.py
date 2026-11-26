@@ -483,6 +483,8 @@ def test_pid_mapping_retains_mn_for_every_original_axis_order(shape: tuple) -> N
         strategy = SimpleNamespace(
             pid_info=axis_decoder.pid_info,
             _tcgen05_plan=lambda: plan,
+            # (no K-split cluster: ``tcgen05_cluster_split_k``)
+            _tcgen05_cluster_split_k=lambda: 1,
             _tcgen05_logical_m_coord_expr=lambda value: value,
         )
         expression = (
