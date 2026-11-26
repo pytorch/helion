@@ -50,6 +50,7 @@ if TYPE_CHECKING:
     from collections.abc import Callable
     from collections.abc import Container
     from collections.abc import Iterable
+    from collections.abc import Sequence
 
     from ..autotuner.config_spec import ConfigSpec
     from .compile_environment import CompileEnvironment
@@ -779,23 +780,67 @@ def _affine_shape_matches_fake(
     return True
 
 
-def _affine_subscript_ranges(
+def _affine_index_tensor(
     env: CompileEnvironment,
+    host: HostFunction,
     subscript: object,
-) -> tuple[AffineSubscriptRange, ...] | None:
-    """Recover an exact bounded quasi-affine set for a flattened tensor index.
+) -> _AffineIndexTensor | None:
+    """Model an index value as a small tensor of quasi-affine scalars.
 
-    This handles the common source idiom ``view(-1)[affine_offsets]`` without
-    changing the emitted memory operation.  Only fixed-width tile indices,
-    direct scalar ``tile.id // constant``, static iotas, broadcasting,
-    host-backed nonnegative integer scaling, and addition are accepted.
-    Unsupported expressions decline to the existing root-barrier fallback.
+    Each lane is ``offset + sum(coefficient * coordinate // divisor)`` over the
+    task coordinates of its loop axes.  Only fixed-width tile indices, tile
+    begins and grid indices (``coordinate * block size``), direct scalar
+    ``tile.id // constant``, static iotas, broadcasting, host-backed
+    nonnegative integer scaling, and addition are accepted; anything else is
+    ``None``.
     """
     from ..language import memory_ops
     from ..language import view_ops
     from ..language.tile_ops import tile_index
 
     memo: dict[torch.fx.Node, _AffineIndexTensor | None] = {}
+
+    def tile_scalar(value: object) -> _AffineIndexTensor | None:
+        """A scalar linear in tile begins, grid indices and tile ids."""
+        if isinstance(value, torch.fx.Node):
+            value = value.meta.get("val")
+        if not isinstance(value, torch.SymInt):
+            return None
+        expression = sympy.expand(env.shape_env.simplify(_symint_sympy_expr(value)))
+        terms: dict[int, int] = {}
+        remainder: sympy.Expr = expression
+        for symbol in expression.free_symbols:
+            info = host.expr_to_origin.get(symbol)
+            origin = None if info is None else info.origin
+            coefficient = expression.coeff(symbol)
+            if (
+                type(origin) not in (GridOrigin, TileBeginOrigin, TileIdOrigin)
+                or not isinstance(coefficient, sympy.Integer)
+                or coefficient < 0
+            ):
+                return None
+            assert isinstance(origin, GridOrigin)
+            scale: int | None = 1
+            if type(origin) is not TileIdOrigin:
+                scale = _immovable_extent(env, env.config_spec, origin.block_id)
+            if scale is None:
+                return None
+            terms[origin.block_id] = (
+                terms.get(origin.block_id, 0) + int(coefficient) * scale
+            )
+            remainder = remainder - int(coefficient) * symbol  # pyrefly: ignore [unsupported-operation]
+        remainder = sympy.expand(remainder)
+        if not terms or not isinstance(remainder, sympy.Integer):
+            return None
+        return _AffineIndexTensor(
+            (),
+            (
+                _AffineIndexScalar(
+                    tuple((axis, terms[axis], 1) for axis in sorted(terms)),
+                    remainder,
+                ),
+            ),
+        )
 
     def host_scalar_expression(value: object) -> sympy.Expr | None:
         if type(value) is int:
@@ -812,6 +857,9 @@ def _affine_subscript_ranges(
         return expression
 
     def evaluate(value: object) -> _AffineIndexTensor | None:
+        tile = tile_scalar(value)
+        if tile is not None:
+            return tile
         scalar_expression = host_scalar_expression(value)
         if scalar_expression is not None:
             return _AffineIndexTensor(
@@ -885,6 +933,17 @@ def _affine_subscript_ranges(
                     indexed_shape = _broadcast_only_index_shape(base.shape, index)
                     if indexed_shape is not None:
                         result = _AffineIndexTensor(indexed_shape, base.values)
+        elif target is torch.ops.aten.unsqueeze.default and len(args) == 2:
+            base = evaluate(args[0])
+            dimension = args[1]
+            if base is not None and type(dimension) is int:
+                rank = len(base.shape) + 1
+                if -rank <= dimension < rank:
+                    dimension %= rank
+                    result = _AffineIndexTensor(
+                        (*base.shape[:dimension], 1, *base.shape[dimension:]),
+                        base.values,
+                    )
         elif target is memory_ops.load and args:
             index = args[1] if len(args) >= 2 else None
             extra_mask = args[2] if len(args) >= 3 else value.kwargs.get("extra_mask")
@@ -993,7 +1052,14 @@ def _affine_subscript_ranges(
         memo[value] = result
         return result
 
-    affine = evaluate(subscript)
+    return evaluate(subscript)
+
+
+def _affine_index_ranges(
+    env: CompileEnvironment,
+    affine: _AffineIndexTensor | None,
+) -> tuple[AffineSubscriptRange, ...] | None:
+    """Group an index tensor's lanes into strided ranges per coefficient set."""
     if affine is None or not affine.values:
         return None
     offsets_by_coefficients: dict[
@@ -1072,6 +1138,68 @@ def _affine_subscript_ranges(
                 )
             )
     return tuple(ranges)
+
+
+def _affine_subscript_ranges(
+    env: CompileEnvironment,
+    host: HostFunction,
+    subscript: object,
+) -> tuple[AffineSubscriptRange, ...] | None:
+    """An exact bounded quasi-affine set for a flattened tensor index.
+
+    This handles the common source idiom ``view(-1)[affine_offsets]`` without
+    changing the emitted memory operation; unsupported expressions decline to
+    the existing root-barrier fallback.
+    """
+    return _affine_index_ranges(env, _affine_index_tensor(env, host, subscript))
+
+
+def _subscript_affine_intervals(
+    env: CompileEnvironment,
+    host: HostFunction,
+    index_list: Sequence[object],
+    positions: tuple[int, ...],
+) -> tuple[AffineSubscriptRange | None, ...]:
+    """Per tensor-valued subscript, the one interval of its dimension it indexes.
+
+    A position qualifies when its index tensor is quasi-affine and its lanes
+    form one contiguous range ``begin + sum(coefficient * coordinate)`` of
+    fixed width.  The access is then the box of its positions' intervals only
+    when no two index tensors vary along the same broadcast dimension (two
+    such pair up elementwise); 1-D index tensors each index their own result
+    dimension.
+    """
+    tensors: dict[int, torch.Tensor] = {}
+    for position in positions:
+        item = index_list[position]
+        fake = item.meta.get("val") if isinstance(item, torch.fx.Node) else None
+        if isinstance(fake, torch.Tensor) and fake.ndim > 0:
+            tensors[position] = fake
+    if any(fake.ndim > 1 for fake in tensors.values()):
+        rank = max(fake.ndim for fake in tensors.values())
+        varying = [
+            rank - fake.ndim + dimension
+            for fake in tensors.values()
+            for dimension, size in enumerate(fake.shape)
+            if size != 1
+        ]
+        if len(varying) != len(set(varying)):
+            return (None,) * len(positions)
+    intervals: list[AffineSubscriptRange | None] = []
+    for position in positions:
+        ranges = (
+            _affine_index_ranges(
+                env, _affine_index_tensor(env, host, index_list[position])
+            )
+            if position in tensors
+            else None
+        )
+        if ranges is None or len(ranges) != 1:
+            intervals.append(None)
+            continue
+        terms, begin, end, step = ranges[0]
+        intervals.append((terms, begin, end, 1) if step == 1 else None)
+    return tuple(intervals)
 
 
 def _store_axis_key(
@@ -2093,6 +2221,7 @@ class DeviceIRAnalysis:
                 subscript_is_full_slice: tuple[bool, ...] = ()
                 subscript_static_extents: tuple[int | None, ...] = ()
                 subscript_dense_spans: tuple[tuple[int, int, int] | None, ...] = ()
+                subscript_affine_intervals: tuple[AffineSubscriptRange | None, ...] = ()
                 affine_subscript_ranges = None
                 layout_is_symbolically_exact = False
 
@@ -2165,9 +2294,13 @@ class DeviceIRAnalysis:
                             _subscript_dense_span(env, host, index_list[position])
                             for position in subscript_dims
                         )
+                        subscript_affine_intervals = _subscript_affine_intervals(
+                            env, host, index_list, subscript_dims
+                        )
                         if fake.ndim == 1 and subscript_dims == (0,):
                             affine_subscript_ranges = _affine_subscript_ranges(
                                 env,
+                                host,
                                 index_list[0],
                             )
 
@@ -2221,6 +2354,7 @@ class DeviceIRAnalysis:
                             subscript_is_full_slice=subscript_is_full_slice,
                             subscript_static_extents=subscript_static_extents,
                             subscript_dense_spans=subscript_dense_spans,
+                            subscript_affine_intervals=subscript_affine_intervals,
                             is_atomic=is_atomic,
                             layout_is_symbolically_exact=layout_is_symbolically_exact,
                             graph_node_index=graph_node_index,

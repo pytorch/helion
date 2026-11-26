@@ -948,7 +948,7 @@ class CoordinateRelation:
                     piece.source_bounds_items + piece.target_ranges
                 )
             ):
-                return None
+                return _box_graph_converse(self)
             source_bounds = tuple(
                 # pyrefly: ignore [unsupported-operation]
                 (axis, value, value + 1, 1)
@@ -3425,6 +3425,70 @@ def _dense_point_fiber_inverse(
     return ordinal_by_target.then(order.tasks_by_ordinal)
 
 
+def _box_graph_converse(relation: CoordinateRelation) -> CoordinateRelation | None:
+    """The exact converse of a relation whose pieces are box graphs.
+
+    In a box graph every target range is either one point ``coordinate + c`` of
+    a source axis of its own, or a range no source coordinate moves.  Its
+    converse is again one: the source coordinate is ``t - c`` for ``t`` within
+    the source box shifted by ``c``, a constant range bounds its target axis,
+    and a source axis no target determines spans its box.
+    """
+    coordinates: dict[sympy.Basic, int] = {
+        coordinate_axis_symbol(axis): axis for axis in relation.source_domain.axis_order
+    }
+    target_counts = relation.target_domain.axis_count_expressions
+
+    def inside(axis: int, begin: sympy.Expr, end: sympy.Expr) -> bool:
+        # Ranges past their domain would lean on clipping: not a box graph.
+        return _is_provably_nonnegative(begin, None) and _is_provably_nonnegative(
+            sympy.simplify(target_counts[axis] - end), None
+        )
+
+    pieces = []
+    for piece in relation.pieces:
+        box = {
+            axis: (begin, end, step)
+            for axis, begin, end, step in piece.source_bounds_items
+        }
+        if any(step != 1 for _begin, _end, step in box.values()):
+            return None
+        determined: dict[int, tuple[int, sympy.Expr]] = {}
+        bounds = []
+        for axis, begin, end, step in piece.target_ranges:
+            moving = begin.free_symbols & coordinates.keys()
+            if not moving and not (end.free_symbols & coordinates.keys()):
+                if not inside(axis, begin, end):
+                    return None
+                bounds.append((axis, begin, end, step))
+                continue
+            if step != 1 or len(moving) != 1 or sympy.simplify(end - begin) != 1:  # pyrefly: ignore [unsupported-operation]
+                return None
+            (symbol,) = moving
+            source_axis = coordinates[symbol]
+            offset = sympy.simplify(begin - symbol)  # pyrefly: ignore [unsupported-operation]
+            if source_axis in determined or offset.free_symbols & coordinates.keys():
+                return None
+            determined[source_axis] = (axis, offset)
+            low, high, _step = box[source_axis]
+            if not inside(axis, low + offset, high + offset):
+                return None
+            bounds.append((axis, low + offset, high + offset, 1))
+        ranges = []
+        for axis in relation.source_domain.axis_order:
+            if axis in determined:
+                target_axis, offset = determined[axis]
+                value = coordinate_axis_symbol(target_axis) - offset  # pyrefly: ignore [unsupported-operation]
+                ranges.append((axis, value, value + 1, 1))
+            else:
+                low, high, _step = box[axis]
+                ranges.append((axis, low, high, 1))
+        pieces.append(_CoordinateRelationPiece(tuple(bounds), tuple(ranges)))
+    return CoordinateRelation(
+        relation.target_domain, relation.source_domain, tuple(pieces)
+    )
+
+
 def _source_bounds_are_disjoint(
     left: ConcreteRelationBounds,
     right: ConcreteRelationBounds,
@@ -4643,6 +4707,25 @@ def build_execution_sites(device_ir: DeviceIR) -> tuple[ExecutionSite, ...]:
     return tuple(sites)
 
 
+def _canonical_affine_range(value: AffineSubscriptRange) -> AffineSubscriptRange:
+    coordinate_terms, begin, end, step = value
+    return (
+        tuple(
+            (
+                axis,
+                _integer_expression(
+                    coefficient, description="affine subscript coefficient"
+                ),
+                divisor,
+            )
+            for axis, coefficient, divisor in coordinate_terms
+        ),
+        _integer_expression(begin, description="affine subscript offset"),
+        _integer_expression(end, description="affine subscript offset"),
+        step,
+    )
+
+
 @dataclasses.dataclass(frozen=True)
 class TileAccess:
     """The memory facts needed to prove a cross-root readiness relation."""
@@ -4673,6 +4756,10 @@ class TileAccess:
     # one exact dense span.  Keep that distinct from a genuinely unknown
     # indirect index, which this module must conservatively widen.
     subscript_dense_spans: tuple[tuple[int, int, int] | None, ...] = ()
+    # Per subscript, the one interval of its dimension a quasi-affine index
+    # tensor indexes (``device_ir_analysis._subscript_affine_intervals``), the
+    # access being the box of these intervals.
+    subscript_affine_intervals: tuple[AffineSubscriptRange | None, ...] = ()
     # The rank whose copy of a symmetric allocation a peer view reads or
     # writes; None is this rank's own copy.
     owner_rank: int | None = None
@@ -4712,35 +4799,19 @@ class TileAccess:
                 description="access storage offset",
             ),
         )
+        object.__setattr__(
+            self,
+            "subscript_affine_intervals",
+            tuple(
+                None if interval is None else _canonical_affine_range(interval)
+                for interval in self.subscript_affine_intervals
+            ),
+        )
         if self.affine_subscript_ranges is not None:
             object.__setattr__(
                 self,
                 "affine_subscript_ranges",
-                tuple(
-                    (
-                        tuple(
-                            (
-                                axis,
-                                _integer_expression(
-                                    coefficient,
-                                    description="affine subscript coefficient",
-                                ),
-                                divisor,
-                            )
-                            for axis, coefficient, divisor in coordinate_terms
-                        ),
-                        _integer_expression(
-                            begin,
-                            description="affine subscript offset",
-                        ),
-                        _integer_expression(
-                            end,
-                            description="affine subscript offset",
-                        ),
-                        step,
-                    )
-                    for coordinate_terms, begin, end, step in self.affine_subscript_ranges
-                ),
+                tuple(map(_canonical_affine_range, self.affine_subscript_ranges)),
             )
 
 
@@ -5247,7 +5318,73 @@ def _access_region(
     )
 
 
+def _affine_range_begin(
+    terms: tuple[tuple[int, IntegerExpression, int], ...],
+    begin: IntegerExpression,
+    domain: CoordinateDomain,
+    prove_nonnegative: Callable[[sympy.Expr], bool] | None,
+) -> sympy.Expr | None:
+    """``begin + sum(coefficient * coordinate // divisor)`` on ``domain``."""
+    counts = domain.axis_count_expressions
+    if len({(axis, divisor) for axis, _value, divisor in terms}) != len(terms) or any(
+        axis not in counts
+        or divisor <= 0
+        or not _is_provably_nonnegative(
+            _integer_expression(value, description="affine coefficient"),
+            prove_nonnegative,
+        )
+        for axis, value, divisor in terms
+    ):
+        return None
+    index = _integer_expression(begin, description="affine subscript offset")
+    for axis, coefficient, divisor in terms:
+        coordinate = coordinate_axis_symbol(axis)
+        index += coefficient * (
+            coordinate if divisor == 1 else sympy.floor(coordinate / divisor)  # pyrefly: ignore [unsupported-operation]
+        )
+    return index
+
+
 def _access_interval_expression(
+    access: TileAccess,
+    *,
+    position: int,
+    domain: CoordinateDomain,
+    prove_nonnegative: Callable[[sympy.Expr], bool] | None = None,
+) -> tuple[sympy.Expr, sympy.Expr] | None:
+    """The interval of its dimension subscript ``position`` indexes, as a
+    function of the task coordinates of ``domain``."""
+    interval = _tile_fact_interval(
+        access, position=position, domain=domain, prove_nonnegative=prove_nonnegative
+    )
+    if interval is not None or position >= len(access.subscript_affine_intervals):
+        return interval
+    affine = access.subscript_affine_intervals[position]
+    if affine is None:
+        return None
+    terms, raw_begin, raw_end, _step = affine
+    begin = _affine_range_begin(terms, raw_begin, domain, prove_nonnegative)
+    if begin is None:
+        return None
+    width = sympy.simplify(raw_end - raw_begin)  # pyrefly: ignore [unsupported-operation]
+    size = access.tensor_shape[access.subscript_dims[position]]
+    bounds = _logical_expression_bounds(
+        begin, domain=domain, source_bounds=_full_bounds(domain)
+    )
+    if (
+        bounds is None
+        or not _is_provably_nonnegative(width - 1, prove_nonnegative)
+        or not _is_provably_nonnegative(bounds[0], prove_nonnegative)
+        or not _is_provably_nonnegative(
+            sympy.simplify(size - width - bounds[1]),
+            prove_nonnegative,  # pyrefly: ignore [unsupported-operation]
+        )
+    ):
+        return None
+    return begin, begin + width  # pyrefly: ignore [unsupported-operation]
+
+
+def _tile_fact_interval(
     access: TileAccess,
     *,
     position: int,
@@ -5462,6 +5599,23 @@ def _is_indirect_subscript(access: TileAccess, position: int) -> bool:
     )
 
 
+def access_widens_a_subscript(access: TileAccess) -> bool:
+    """Whether a subscript of ``access`` neither indexes a modeled interval nor
+    is a full slice: its relations take that whole dimension."""
+    return any(
+        not (
+            position < len(access.subscript_is_full_slice)
+            and access.subscript_is_full_slice[position]
+        )
+        and _is_indirect_subscript(access, position)
+        and (
+            position >= len(access.subscript_affine_intervals)
+            or access.subscript_affine_intervals[position] is None
+        )
+        for position in range(len(access.subscript_dims))
+    )
+
+
 def _symbolic_access_map(
     access: TileAccess,
     *,
@@ -5546,30 +5700,17 @@ def _symbolic_access_map(
                 _integer_expression(raw_end, description="affine subscript offset")
                 - offset_begin
             )
+            index = _affine_range_begin(
+                terms, offset_begin, source_domain, prove_nonnegative
+            )
             if (
-                offset_step <= 0
+                index is None
+                or offset_step <= 0
                 or not isinstance(offset_width, sympy.Integer)
                 or int(offset_width) <= 0
                 or int(offset_width) % offset_step != 0
-                or len({(axis, divisor) for axis, _value, divisor in terms})
-                != len(terms)
-                or any(
-                    axis not in counts
-                    or divisor <= 0
-                    or not _is_provably_nonnegative(
-                        _integer_expression(value, description="affine coefficient"),
-                        prove_nonnegative,
-                    )
-                    for axis, value, divisor in terms
-                )
             ):
                 return None
-            index = offset_begin
-            for axis, coefficient, divisor in terms:
-                coordinate = coordinate_axis_symbol(axis)
-                index += coefficient * (
-                    coordinate if divisor == 1 else sympy.floor(coordinate / divisor)  # pyrefly: ignore [unsupported-operation]
-                )
             first = _logical_expression_bounds(
                 index, domain=source_domain, source_bounds=source_bounds
             )
@@ -5827,15 +5968,27 @@ def _rectangular_overlap_sources(
             upper[owner_axis].append(sympy.ceiling((query_end - offset) / stride))
         if disjoint:
             continue
+
+        def simplified(
+            value: sympy.Expr, box: RelationBounds = query_piece.source_bounds_items
+        ) -> sympy.Expr:
+            # On this piece's source box (``floor(a / 8)`` is 0 for ``a < 8``):
+            # rounding left in the bounds would keep the relation from inverting.
+            return _analyze_integer_expression(value, query.source_domain, box, True)[0]
+
         pieces.append(
             _CoordinateRelationPiece(
                 query_piece.source_bounds_items,
                 tuple(
                     (
                         axis,
-                        sympy.Max(*lower[axis]) if lower[axis] else sympy.Integer(0),
                         (
-                            sympy.Min(*upper[axis])
+                            sympy.Max(*map(simplified, lower[axis]))
+                            if lower[axis]
+                            else sympy.Integer(0)
+                        ),
+                        (
+                            sympy.Min(*map(simplified, upper[axis]))
                             if upper[axis]
                             else sympy.sympify(owner_counts[axis])
                         ),
@@ -6722,6 +6875,7 @@ def _rank_invariant(access: TileAccess, family: TaskFamily) -> TileAccess:
         subscript_dense_spans=tuple(
             span if keep else None for keep, span in zip(kept, spans, strict=True)
         ),
+        subscript_affine_intervals=(),
         affine_subscript_ranges=None,
     )
 

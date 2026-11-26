@@ -2901,10 +2901,13 @@ class TestTileDependency(TestCase):
     def test_rectangular_fibers_recognize_only_full_clipped_axes(self) -> None:
         keys = CoordinateDomain.scalar(1, kind="event")
         items = CoordinateDomain.scalar(5, axis=1)
+        # A range inside the item axis has a converse, which counts its fiber
+        # (``CoordinateRelation.converse``); past it, only a full clipped axis
+        # is recognized.
         for begin, end, step, expected_count in (
             (-1, 6, 1, 5),
             (1, 6, 1, None),
-            (0, 4, 1, None),
+            (0, 4, 1, 4),
             (0, 6, 2, None),
         ):
             with self.subTest(begin=begin, end=end, step=step):

@@ -20,6 +20,7 @@ from .tile_dependency import Incidence
 from .tile_dependency import KeyPartition
 from .tile_dependency import TileDependencyGraph
 from .tile_dependency import TileDependencyRelation
+from .tile_dependency import access_widens_a_subscript
 from .tile_dependency import consumer_to_preceding_site_relation
 from .tile_dependency import coordinate_axis_symbol
 from .tile_dependency import instantiate_symbolic_dependencies
@@ -46,6 +47,10 @@ _MAX_SYMBOLIC_RELATION_WORK = 2_000_000
 
 # Why an exact all-to-all dependency gets a root barrier and no counter.
 _ALL_TO_ALL = "every consumer task waits for every producer task (exact)"
+_WIDENED_ALL_TO_ALL = (
+    "every consumer task waits for every producer task: a subscript the analysis "
+    "cannot model is taken as its whole dimension"
+)
 _OUT_OF_BUDGET = "the scheduler's work budget ran out"
 
 
@@ -2020,6 +2025,7 @@ def _build_readiness_events(
     charge: Callable[[int], bool],
     fallback_reasons: dict[DependencyObligation, str] | None = None,
     unkeyed: set[DependencyObligation] | None = None,
+    widened: set[DependencyObligation] | None = None,
 ) -> tuple[ReadinessEvent, ...]:
     """Build canonical readiness events from the dependency graph; records in
     ``fallback_reasons`` why an obligation lost a keyed relation (for those only a
@@ -2034,9 +2040,34 @@ def _build_readiness_events(
     site_by_id = {site.site_id: site for site in dependency_graph.execution_sites}
     reasons: dict[DependencyObligation, str] = {}
     exact: list[TileDependencyRelation] = []
+    accesses = {access.access_id: access for access in dependency_graph.accesses}
+    producer_access_ids = {
+        dependency.dependency_id: dependency.producer_access_id
+        for edge in dependency_graph.edges
+        for dependency in edge.access_dependencies
+    }
     for dependency in symbolic_dependencies:
         incidence = dependency.incidence
         reason = dependency.failure or "no tile incidence"
+        if (
+            widened is not None
+            and incidence is not None
+            and any(
+                access_widens_a_subscript(accesses[access_id])
+                for access_id in (
+                    dependency.consumer_access_id,
+                    producer_access_ids.get(dependency.dependency_id),
+                )
+                if access_id in accesses
+            )
+        ):
+            widened.add(
+                (
+                    dependency.dependency_id,
+                    dependency.producer_site_id,
+                    dependency.consumer_site_id,
+                )
+            )
         if incidence is not None:
             if incidence.items_by_key.source_axes_affecting_targets() is None:
                 reason = (
@@ -3373,6 +3404,7 @@ def build_static_pipeline_plan(
     )
     fallback_reasons: dict[DependencyObligation, str] = {}
     unkeyed: set[DependencyObligation] = set()
+    widened: set[DependencyObligation] = set()
     events = _build_readiness_events(
         dependency_graph,
         root_domains=root_domains,
@@ -3382,6 +3414,7 @@ def build_static_pipeline_plan(
         charge=charge,
         fallback_reasons=fallback_reasons,
         unkeyed=unkeyed,
+        widened=widened,
     )
     readiness_graph = ReadinessGraph(root_domains, events)
     # Why the obligations of events no counter takes have none.
@@ -3573,6 +3606,7 @@ def build_static_pipeline_plan(
             skipped,
             fallback_reasons,
             frozenset(unkeyed),
+            frozenset(widened),
         ),
         peer_edges=peer_edges,
         # Parity and credit already keep in-band roots from reusing live buffers.
@@ -3665,6 +3699,7 @@ def _barrier_reasons(
     skipped: Mapping[DependencyObligation, str],
     fallback_reasons: Mapping[DependencyObligation, str],
     unkeyed: frozenset[DependencyObligation],
+    widened: frozenset[DependencyObligation] = frozenset(),
 ) -> dict[DependencyObligation, str]:
     """Why each obligation a root barrier of ``plan`` orders has no counter.  An
     obligation a candidate counter covered with no skip recorded lost it only to
@@ -3678,6 +3713,9 @@ def _barrier_reasons(
         # no exact all-to-all dependency: its fallback reason says why.
         if reason == _ALL_TO_ALL and obligation in unkeyed:
             return None
+        # Widened by an unmodeled subscript: all-to-all only as far as known.
+        if reason == _ALL_TO_ALL and obligation in widened:
+            return _WIDENED_ALL_TO_ALL
         return reason
 
     return {
