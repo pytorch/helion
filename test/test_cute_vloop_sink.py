@@ -47,6 +47,7 @@ from helion._compiler.cute.cutedsl_compat import readonly_packet_load_supported
 from helion._compiler.cute.fuse_fma import fuse_fma
 from helion._compiler.cute.lane_loops import root_passes
 from helion._compiler.cute.sink_vector_loops import VloopSinkNotApplied
+from helion._compiler.cute.state import CuteRootPlans
 from helion._compiler.cute.state import cute_env_state
 from helion._compiler.reduction_strategy import LoopedReductionStrategy
 from helion._testing import DEVICE
@@ -1562,7 +1563,7 @@ def test_a_capacity_decline_passes_the_layout_refusal_through(cpu_only: None) ->
     and passes through: the kernel is generated again with the default
     layout."""
     bound = cpu_bind(_spatial_mean, (torch.empty(8, 784, 120, dtype=torch.bfloat16),))
-    root_plans = SimpleNamespace(fragment_capacity_decline=(300000, 232448))
+    root_plans = CuteRootPlans(fragment_capacity_decline=(300000, 232448))
     codegen = cast(
         "GenerateAST",
         SimpleNamespace(

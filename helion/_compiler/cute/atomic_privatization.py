@@ -82,6 +82,7 @@ from ..runtime_tensor_guards import tensors_have_proven_disjoint_storage
 from ._ast_pass_utils import body_end_follows_all_tiles
 from .atomic_pointer import cute_coord_pointer_expr
 from .atomic_pointer import cute_coord_tuple
+from .launch_shape import LINEAR_THREAD
 
 if TYPE_CHECKING:
     from ..device_function import DeviceFunction
@@ -331,7 +332,7 @@ def privatize_atomic_targets(codegen: GenerateAST, host: HostFunction) -> None:
                 f"{private} = cute.make_tensor(cute.arch.alloc_smem({dtype.cutlass}, {numel}), {layout})",
                 f"{flat} = cute.make_tensor({private}.iterator, ({numel},))",
                 (
-                    f"for {cell} in range({_LINEAR_THREAD}, {numel}, {_BLOCK_THREADS}):\n"
+                    f"for {cell} in range({LINEAR_THREAD}, {numel}, {_BLOCK_THREADS}):\n"
                     f"    {flat}[{cell}] = {dtype.identity}"
                 ),
             )
@@ -345,7 +346,7 @@ def privatize_atomic_targets(codegen: GenerateAST, host: HostFunction) -> None:
         )
         epilogue.append(
             statement_from_string(
-                f"for {cell} in range({_LINEAR_THREAD}, {numel}, {_BLOCK_THREADS}):\n"
+                f"for {cell} in range({LINEAR_THREAD}, {numel}, {_BLOCK_THREADS}):\n"
                 f"    {value} = {flat}[{cell}]\n"
                 f"    if {dtype.changed.format(value=value)}:\n"
                 f"        cute.arch.atomic_add({pointer}, {value}, sem='relaxed')"
@@ -358,11 +359,6 @@ def privatize_atomic_targets(codegen: GenerateAST, host: HostFunction) -> None:
     fn.body.extend([statement_from_string(barrier), *epilogue])
 
 
-_LINEAR_THREAD = (
-    "cutlass.Int32(cute.arch.thread_idx()[0]) + cutlass.Int32(cute.arch.thread_idx()[1])"
-    " * cutlass.Int32(cute.arch.block_dim()[0]) + cutlass.Int32(cute.arch.thread_idx()[2])"
-    " * cutlass.Int32(cute.arch.block_dim()[0]) * cutlass.Int32(cute.arch.block_dim()[1])"
-)
 _BLOCK_THREADS = (
     "cutlass.Int32(cute.arch.block_dim()[0]) * cutlass.Int32(cute.arch.block_dim()[1])"
     " * cutlass.Int32(cute.arch.block_dim()[2])"

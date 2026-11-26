@@ -26,6 +26,34 @@ def _args(dtype: torch.dtype) -> tuple[torch.Tensor, ...]:
     )
 
 
+def test_complete_fragment_cannot_pack_two_root_tiles_in_one_cta() -> None:
+    with cpu_target():
+        bound = cpu_bind(computed_dot, _args(torch.bfloat16))
+        config = dict(bound.config_spec.default_config()) | {
+            KEY: True,
+            "cute_tiles_per_block": 2,
+        }
+        with pytest.raises(
+            helion.exc.InvalidConfig, match="packed grid tiles cannot share"
+        ):
+            bound.to_code(helion.Config.from_dict(config))
+
+        # The same non-scalar dot also needs the full CTA with implicit MMA.
+        implicit = dict(bound.config_spec.default_config()) | {
+            "cute_tiles_per_block": 2
+        }
+        with pytest.raises(
+            helion.exc.InvalidConfig, match="packed grid tiles cannot share"
+        ):
+            bound.to_code(helion.Config.from_dict(implicit))
+        ordinary = cpu_bind(batched_dot, _args(torch.bfloat16)[:2])
+        scalar = dict(ordinary.config_spec.default_config()) | {
+            "cute_tiles_per_block": 2
+        }
+        packed = ordinary.to_code(helion.Config.from_dict(scalar))
+        assert "fragment_thread =" not in packed
+
+
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 def test_half_mma_is_searchable_and_predicates_partial_tiles(
     dtype: torch.dtype,

@@ -463,14 +463,7 @@ class FragmentDotEmitter(FragmentMemoryEmitter):
             # The store's host tensor (and a size symbol) may follow the dot
             # in graph order; both lower to a value without emitting anything.
             if source.target is _tracing_ops._host_tensor:
-                fake = source.meta["val"]
-                assert isinstance(fake, torch.Tensor)
-                values[source] = HostTensor(
-                    self.df.tensor_arg(
-                        fake, prefer_name=cast("str", source.args[0])
-                    ).name,
-                    fake,
-                )
+                values[source] = self.host_tensor(source)
             elif source.target in (
                 _tracing_ops._get_symnode,
                 torch.ops.aten.sym_size.int,
@@ -550,6 +543,8 @@ class FragmentDotEmitter(FragmentMemoryEmitter):
         contraction: int,
         out_dtype: torch.dtype,
         sink: DirectStoreSink | None = None,
+        *,
+        full_k_fold: bool = False,
     ) -> Fragment:
         """Contract through m16n8k8 TF32 or m16n8k16 FP16/BF16 ``mma.sync``.
 
@@ -616,7 +611,11 @@ class FragmentDotEmitter(FragmentMemoryEmitter):
         # all of the row's column tiles (the words do not depend on the
         # column).  The same mma sequence per output tile: bitwise identical
         # to the tile walk.  A K split keeps the (tile, split) unit walk.
-        row_walk = self.mma_rows and splits == 1
+        # A complete folded K axis can be much wider than an ordinary
+        # configured fragment. Bound both Python code-size and register
+        # lifetimes; the runtime loop keeps the accumulator in registers.
+        roll_steps = full_k_fold and steps // splits > 64
+        row_walk = self.mma_rows and splits == 1 and not roll_steps
         tile = self.df.new_var("fragment_mma_tile")
         # Without a split the warp loop walks tiles directly (the established
         # render); with one it walks (tile, split) units.
@@ -800,8 +799,9 @@ class FragmentDotEmitter(FragmentMemoryEmitter):
                 accs = [self.df.new_var("fragment_mma_c") for _ in slots]
                 init_accumulators(accs, batch, col_base)
                 step = self.df.new_var("fragment_mma_step")
+                range_kind = "range" if roll_steps else "cutlass.range_constexpr"
                 k_loop = statement_from_string(
-                    f"for {step} in cutlass.range_constexpr({steps // splits}):\n    pass"
+                    f"for {step} in {range_kind}({steps // splits}):\n    pass"
                 )
                 assert isinstance(k_loop, ast.For)
                 k_loop.body.clear()

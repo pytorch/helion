@@ -47,6 +47,18 @@ def is_call(node: object, *targets: object) -> bool:
     )
 
 
+def input_closure(output: torch.fx.Node) -> set[torch.fx.Node]:
+    """All FX inputs required to produce one value, including the value itself."""
+    live = {output}
+    pending = [output]
+    while pending:
+        for source in pending.pop().all_input_nodes:
+            if source not in live:
+                live.add(source)
+                pending.append(source)
+    return live
+
+
 def binary_pair(
     node: object, targets: Container[object]
 ) -> tuple[object, object] | None:

@@ -282,3 +282,11 @@ def check_launch_shape(
         if mode.strict:
             raise mismatch
         warning(mismatch)
+
+
+# Linearize a CUDA CTA in physical x, y, z order.
+LINEAR_THREAD = (
+    "cutlass.Int32(cute.arch.thread_idx()[0]) + cutlass.Int32(cute.arch.thread_idx()[1])"
+    " * cutlass.Int32(cute.arch.block_dim()[0]) + cutlass.Int32(cute.arch.thread_idx()[2])"
+    " * cutlass.Int32(cute.arch.block_dim()[0]) * cutlass.Int32(cute.arch.block_dim()[1])"
+)

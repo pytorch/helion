@@ -57,7 +57,7 @@ def _regions(ir: DeviceIR) -> tuple[frozenset[int], ...]:
     return result
 
 
-def _local_boundary(graph: TileDependencyGraph) -> bool:
+def local_phase_boundary(graph: TileDependencyGraph) -> bool:
     return bool(graph.edges) and (
         {(edge.producer_root, edge.consumer_root) for edge in graph.edges} == {(0, 1)}
         and not graph.crosses_ranks()
@@ -99,7 +99,7 @@ def prepare_required_owner_phases(ir: DeviceIR) -> bool:
         root_phases=(0, 0),
         world_size=1,
     )
-    if not _local_boundary(graph):
+    if not local_phase_boundary(graph):
         return False
     state.dependent_phase_plan = DependentPhasePlan(
         tuple(ir.root_ids),
@@ -124,7 +124,7 @@ def confirm_dependency_phases(host: HostFunction, ir: DeviceIR) -> bool:
         and [phase.roots for phase in ir.phases] == [[0], [1]]
         and ir.implicit_dependency_starts == frozenset({1})
         and graph is not None
-        and _local_boundary(graph)
+        and local_phase_boundary(graph)
     ):
         raise exc.BackendUnsupported(
             "cute", "dependent phase proof changed after lowering"
