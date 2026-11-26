@@ -153,8 +153,11 @@ class LoopDimInfo:
     begin_expr: sympy.Expr | None = None
     end_var_name: str | None = None
     end_expr: sympy.Expr | None = None
-    # Absolute end of a root-grid dim; None for device loops.
+    # Absolute end and step from the root grid/tile header, when symbolic.
+    # For scalar grids this is the declared stride; for tiles it is the
+    # positive block width and only its sign establishes emptiness.
     grid_end_expr: sympy.Expr | None = None
+    grid_step_expr: sympy.Expr | None = None
     unsigned_grid_end: bool = False
     # A root's logical axis, before multiple tiles may be packed into one CTA.
     root_axis: PIDInfo | None = None
@@ -1658,18 +1661,30 @@ class TileStrategy:
                     end_expr=end_expr,
                 )
 
-        # Root grid arguments carry the absolute logical bounds.
+        # Preserve the declared range, independent of how trips map to CTAs.
         if state.ast_args is None and len(state.proxy_args) == 3:
-            begin_or_end, end, _ = state.proxy_args
+            begin_or_end, end, step = state.proxy_args
             grid_ends = normalize_dim_values(begin_or_end if end is None else end)
-            for block_id, grid_end in zip(self.block_ids, grid_ends, strict=True):
+            steps = (
+                normalize_dim_values(step)
+                if isinstance(step, (list, tuple, torch.Size))
+                else [step] * len(self.block_ids)
+            )
+            for block_id, grid_end, grid_step in zip(
+                self.block_ids, grid_ends, steps, strict=True
+            ):
+                info = block_id_to_info[block_id]
                 if isinstance(grid_end, (int, torch.SymInt, sympy.Expr)):
-                    block_id_to_info[block_id].grid_end_expr = _to_sympy(grid_end)
+                    info.grid_end_expr = _to_sympy(grid_end)
                 elif (
                     isinstance(grid_end, torch.Tensor)
                     and grid_end.dtype == torch.uint64
                 ):
-                    block_id_to_info[block_id].unsigned_grid_end = True
+                    info.unsigned_grid_end = True
+                if grid_step is None:
+                    grid_step = 1
+                if isinstance(grid_step, (int, torch.SymInt, sympy.Expr)):
+                    info.grid_step_expr = _to_sympy(grid_step)
 
         for axis in root_axes:
             block_id_to_info[axis.block_id].root_axis = axis

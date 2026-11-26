@@ -39,12 +39,17 @@ def _conditional_scan(
 
 @pytest.mark.parametrize("repeat", [False, True], ids=["branch", "zero-trip"])
 def test_shared_control_read_finishes_before_reuse(repeat: bool) -> None:
-    control = torch.zeros(3, dtype=torch.int32 if repeat else torch.bool)
+    # A readonly, uniformly addressed loop bound stays in a register. Make the
+    # control storage writable via a distinct view so this fixture exercises
+    # the shared publication and its barrier on both control-flow paths.
+    storage = torch.zeros(4, dtype=torch.int32 if repeat else torch.bool)
+    control = storage[:3]
+    tail = storage[1:]
     x = torch.ones((3, 32))
     with mock_cuda_unavailable():
         bound = cpu_bind(
             _conditional_scan,
-            (x, control, torch.empty_like(control), torch.empty_like(x), repeat),
+            (x, control, tail, torch.empty_like(x), repeat),
         )
         code = bound.to_code(helion.Config(block_sizes=[]), output_origin_lines=False)
     (kernel,) = [

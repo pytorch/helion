@@ -213,7 +213,7 @@ class SlabGroup:
     """The staged slab, once the root materialized it."""
 
 
-def _uniform_expr(env: CompileEnvironment, proxy: object) -> sympy.Expr | None:
+def uniform_integer_expr(env: CompileEnvironment, proxy: object) -> sympy.Expr | None:
     """``proxy`` as a CTA-uniform integer expression: an int, or a SymInt
     whose symbols are grid tile begins (``tile.begin``), block sizes or host
     values (None: a data-dependent or otherwise unplaceable symbol)."""
@@ -290,7 +290,7 @@ def scalar_load(
             if isinstance(index, Node)
             else _cute_wrap_negative_index(index, fake.shape[dim])
         )
-        expr = _uniform_expr(env, proxy)
+        expr = uniform_integer_expr(env, proxy)
         if expr is None:
             return None
         exprs.append(expr)
@@ -403,7 +403,7 @@ def _describe(
                 and proxy._sympy_() == env.block_sizes[block].var._sympy_()
             ):
                 return ("block", block)
-            expr = _uniform_expr(env, proxy)
+            expr = uniform_integer_expr(env, proxy)
             if expr is not None:
                 return ("uniform", expr)
             return None

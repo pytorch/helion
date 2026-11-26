@@ -2487,6 +2487,10 @@ def codegen_computed_fragment_root(cg: GenerateAST) -> bool:
                 compiler.threads,
             )
         )
+    # A declined owner must not add unused step arguments or reject their
+    # values in the ordinary kernel's host wrapper.
+    cg.host_statements.extend(compiler.host_step_statements)
+    compiler.df.arguments.extend(compiler.host_step_arguments)
     cg.device_function.cute_state.lanes.owned_root_block_dims = (compiler.threads, 1, 1)
     compiler.emit_mma_preamble()
     allocations = compiler.allocations()

@@ -163,6 +163,7 @@ def simulate_independent_fragment(
                 Int16=np.int16,
                 Int32=int32,
                 Int64=int64,
+                Uint8=np.uint8,
                 Uint32=int,
                 Uint64=uint64,
                 Boolean=bool,

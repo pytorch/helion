@@ -43,6 +43,7 @@ from ..inductor_lowering import size1_reduction_positions
 from ..variable_origin import GridOrigin
 from ..variable_origin import TileBeginOrigin
 from ..variable_origin import TileEndOrigin
+from ..variable_origin import TileExtentOrigin
 from ..variable_origin import TileIdOrigin
 from .dead_zero_atomics import dead_zero_atomic_results
 from .fragment_domain import OwnershipMask
@@ -71,6 +72,7 @@ if TYPE_CHECKING:
     from collections.abc import Mapping
     from collections.abc import Sequence
 
+    from ..device_function import SymbolArgument
     from ..device_ir import GraphInfo
     from ..generate_ast import GenerateAST
     from .atomic_consumer_fusion import AtomicConsumerRegion
@@ -482,6 +484,9 @@ class FragmentContext:
         self.bounds: dict[int, str] = {}
         # Nested loops may reuse a block ID. Key each interval by its induction variable.
         self.tile_intervals: dict[str, tuple[int, int]] = {}
+        self.stride_operands: dict[str, tuple[str, str, str]] = {}
+        self.host_step_statements: list[ast.stmt] = []
+        self.host_step_arguments: list[SymbolArgument] = []
         self.allocator = ""
         self.smem_bytes = 0
         self.buffers: list[tuple[str, torch.dtype, int]] = []
@@ -755,11 +760,18 @@ class FragmentContext:
                 origin = origin_info.origin if origin_info is not None else None
                 if isinstance(origin, GridOrigin) and origin.block_id in self.offsets:
                     offset = self.offsets[origin.block_id]
-                    # A small loop may have an Int32 counter, but its value in
-                    # user arithmetic must widen before evaluating the expression.
-                    if wide:
+                    # The loop counter may be narrower than the index dtype
+                    # selected for this expression.
+                    if wide or self.env.index_dtype == torch.int64:
                         offset = f"cutlass.Int64({offset})"
                     size = self.df.resolved_block_size(origin.block_id)
+                    if isinstance(origin, TileExtentOrigin):
+                        # Nested fragment loops own their lexical end. A partial
+                        # tile contributes only the lanes before that end.
+                        return self.tile_live_extent(
+                            origin.block_id,
+                            self.extent(self.env.block_sizes[origin.block_id].var),
+                        )
                     if isinstance(origin, TileIdOrigin):
                         return f"({offset}) // {size}"
                     if isinstance(origin, TileEndOrigin):

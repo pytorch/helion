@@ -18,6 +18,7 @@ import torch
 from torch.fx import Node
 
 from ... import exc
+from ...language import _tracing_ops
 from ..ast_extension import statement_from_string
 from ..host_function import HostFunction
 from ..indexing_strategy import SubscriptIndexing
@@ -29,7 +30,9 @@ from .fragment_context import FragmentContext
 from .fragment_context import HostTensor
 from .fragment_context import _resolve
 from .fragment_indexing import memory_index_coordinates
+from .fragment_slab_loads import uniform_integer_expr
 from .local_atomic import local_indexed_load
+from .register_loads import has_opaque_inline_asm
 from .register_loads import host_load_is_readonly
 from .register_loads import lane_private_load
 from .register_snapshots import SnapshotBinding
@@ -907,6 +910,31 @@ class FragmentMemoryEmitter(FragmentContext):
                 if isinstance(value, Fragment)
             )
             return dataclasses.replace(loaded_fragment, dependencies=dependencies)
+        if (
+            not shape
+            and extra_mask is None
+            and any(
+                user.target in (_tracing_ops._for_loop, _tracing_ops._for_loop_step)
+                and any(
+                    node in cast("list[object]", bounds) for bounds in user.args[1:3]
+                )
+                for user in node.users
+            )
+            and all(
+                uniform_integer_expr(
+                    self.env, index.meta["val"] if isinstance(index, Node) else index
+                )
+                is not None
+                for index in indices
+            )
+            and not has_opaque_inline_asm(self.graphs)
+            and host_load_is_readonly(node, self.env, self.graphs)
+        ):
+            # Every lane reads the same immutable word at this point. Its
+            # register can carry the bound into the loop without a CTA-wide
+            # shared store, barrier, and reload.
+            scalar_bound = load(())
+            return Fragment((), output.dtype, lambda _coords: scalar_bound, True)
         if node in self.snapshot_loads:
             slots = (math.prod(shape) + self.threads - 1) // self.threads
             name = self.df.new_var("fragment_snapshot")
