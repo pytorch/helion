@@ -916,7 +916,7 @@ def format_triton_compile_failure(
         "Triton compile failed. This likely indicates a bug in Triton. "
         "Skipping failing config.\n"
         f"Config: {kernel.format_kernel_decorator(config, kernel.settings)}\n"
-        f"Error: {type(err).__name__}: {err}\n"
+        f"Error: {type(err).__name__}: {runtime_error_message(err)}\n"
         f"{SUPPRESSED_TRITON_CODE_MSG}"
     )
 
@@ -954,11 +954,22 @@ _UNRECOVERABLE_RUNTIME_ERROR_RE: re.Pattern[str] = re.compile(
             re.escape,
             [
                 "illegal memory access",
+                "CUDA_ERROR_ILLEGAL_ADDRESS",
+                "cudaErrorIllegalAddress",
                 "misaligned address",
+                "CUDA_ERROR_MISALIGNED_ADDRESS",
+                "cudaErrorMisalignedAddress",
                 "unspecified launch failure",
+                "CUDA_ERROR_LAUNCH_FAILED",
+                "cudaErrorLaunchFailure",
                 "illegal instruction",
+                "CUDA_ERROR_ILLEGAL_INSTRUCTION",
+                "cudaErrorIllegalInstruction",
                 "UR_RESULT_ERROR_DEVICE_LOST",
                 "ZE_RESULT_ERROR_DEVICE_LOST",
+                "device-side assert triggered",
+                "CUDA_ERROR_ASSERT",
+                "cudaErrorAssert",
             ],
         )
     ),
@@ -966,8 +977,41 @@ _UNRECOVERABLE_RUNTIME_ERROR_RE: re.Pattern[str] = re.compile(
 )
 
 
-def match_unrecoverable_runtime_error(err: BaseException) -> bool:
-    return bool(_UNRECOVERABLE_RUNTIME_ERROR_RE.search(str(err)))
+# A restored SDK exception can print differently outside its worker. Keep its
+# type for normal exception dispatch, and its remote diagnostic for policy.
+_WORKER_MESSAGE = "_helion_benchmark_worker_message"
+
+
+def _exception_attributes(err: BaseException) -> dict[str, object]:
+    # An exception subclass can override __dict__ or forbid setting attributes.
+    return BaseException.__dict__["__dict__"].__get__(err)
+
+
+def _remember_worker_message(err: BaseException, message: str) -> None:
+    _exception_attributes(err)[_WORKER_MESSAGE] = message
+
+
+def runtime_error_message(err: BaseException) -> str:
+    """Read a runtime diagnostic even when an SDK or user formatter raises."""
+    message = _exception_attributes(err).get(_WORKER_MESSAGE)
+    if isinstance(message, str):
+        return str.__str__(message)
+    try:
+        # Copy the text before a user str subclass can override formatting or pickling.
+        return str.__str__(str(err))
+    except Exception:
+        # BaseException's own arguments, without invoking a subclass property
+        # or formatting arbitrary values (which can fail again, e.g. a tensor).
+        args = BaseException.__dict__["args"].__get__(err)
+        return (
+            ", ".join(arg for arg in args if type(arg) is str)
+            or "<message unavailable>"
+        )
+
+
+def match_unrecoverable_runtime_error(err: BaseException | str) -> bool:
+    message = err if isinstance(err, str) else runtime_error_message(err)
+    return bool(_UNRECOVERABLE_RUNTIME_ERROR_RE.search(message))
 
 
 # A device allocation that failed: in PyTorch's caching allocator, the CUDA /
@@ -979,7 +1023,7 @@ _DEVICE_OUT_OF_MEMORY_RE: re.Pattern[str] = re.compile(
 
 def match_device_out_of_memory(err: BaseException) -> bool:
     return isinstance(err, CudaOOMError) or bool(
-        _DEVICE_OUT_OF_MEMORY_RE.search(str(err))
+        _DEVICE_OUT_OF_MEMORY_RE.search(runtime_error_message(err))
     )
 
 
@@ -1021,10 +1065,10 @@ def classify_triton_exception(err: BaseException) -> Literal["raise", "warn", "d
     if isinstance(err, IntelGPUError) or err.__class__.__name__ == "IntelGPUError":
         return "warn"
 
-    msg = str(err)
+    msg = runtime_error_message(err)
     if "PassManager::run failed" in msg:
         return "warn"
-    if _EXPECTED_TRITON_ERRORS_RE.search(msg) or match_unrecoverable_runtime_error(err):
+    if _EXPECTED_TRITON_ERRORS_RE.search(msg) or match_unrecoverable_runtime_error(msg):
         return "debug"
     return "raise"
 
@@ -1138,7 +1182,7 @@ def dump_triton_failure(
     triton_version = getattr(triton, "__version__", "unknown")
 
     error_type = type(err).__qualname__
-    error_msg = str(err)
+    error_msg = runtime_error_message(err)
     if remote_traceback:
         tb_text = remote_traceback
     else:
