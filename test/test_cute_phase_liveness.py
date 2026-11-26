@@ -12,6 +12,11 @@ from helion._testing.cute_phase_liveness import explicit_direct_selection
 from helion._testing.cute_phase_liveness import grouped_selection_after_producer
 from helion._testing.cute_phase_liveness import routed_after_producer
 from helion._testing.cute_phase_liveness import routed_phase_config
+from helion._testing.cute_phase_liveness import row_sum_after_producer
+from helion._testing.cute_phase_liveness import row_sum_phase_config
+from helion._testing.cute_phase_liveness import row_sum_two_outputs
+from helion._testing.cute_phase_liveness import selected_rows_after_producer
+from helion._testing.cute_phase_liveness import selected_rows_config
 from helion._testing.cute_phase_liveness import slice_sum_phases
 
 
@@ -143,3 +148,163 @@ def test_flat_topk_gathers_values_and_payload_on_changed_rows(
             expected = expected + 3
         out.fill_(-55555)
         torch.testing.assert_close(fn(*args), expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("warp", [False, True])
+def test_row_carry_reads_the_previous_phases_published_activation(warp: bool):
+    x = (torch.arange(128, device=DEVICE) % 13 - 6).bfloat16()
+    w = (torch.arange(17 * 128, device=DEVICE).reshape(17, 128) % 11 - 5).bfloat16()
+    out = torch.empty(17, dtype=torch.float32, device=DEVICE)
+    config = row_sum_phase_config()
+    if warp:
+        config = helion.Config.from_dict(
+            dict(config)
+            | {"cute_fragment_reduction": "warp", "block_sizes": [64, 32, 8]}
+        )
+    compiled = row_sum_after_producer.bind((x, w, out, False)).compile_config(config)
+    for _ in range(2):
+        torch.testing.assert_close(
+            compiled(x, w, out, False), w.float() @ (x * 2).float(), rtol=0, atol=0
+        )
+        x.neg_()
+
+
+def test_checked_row_carry_matches_signed_inputs_and_preserves_output_canaries() -> (
+    None
+):
+    rows, k = 8, 16
+    x = (torch.arange(k, device=DEVICE) % 7 - 3).float()
+    w = (torch.arange(rows * k, device=DEVICE).reshape(rows, k) % 11 - 5).float()
+    w[:, 0] = 1
+    sentinels = [torch.full((rows + 2,), -313.0, device=DEVICE) for _ in range(2)]
+    a, b = (storage[1:-1] for storage in sentinels)
+    args = (x, w, a, b, True)
+    bound = row_sum_two_outputs.bind(args)
+    for enabled in (False, True):
+        fn = bound.compile_config(
+            helion.Config(block_sizes=[2, 4], cute_fragment_row_carry=enabled)
+        )
+        for _ in range(2):
+            expected = w @ x
+            fn(*args)
+            torch.testing.assert_close(a, expected, rtol=0, atol=0)
+            torch.testing.assert_close(b, 2 * expected, rtol=0, atol=0)
+            for storage in sentinels:
+                assert storage[0].item() == storage[-1].item() == -313
+                storage.fill_(-313)
+            x.neg_()
+
+
+def test_warp_carry_packets_handle_sliced_weights_and_partial_rows():
+    # Shape and strides match, but a bound kernel may specialize the input
+    # pointer residue. Dispatch each view through the real binding key.
+    rows, k = 17, 512
+    x = (torch.arange(k, device=DEVICE) % 13 - 6).bfloat16()
+    storage = (torch.arange(rows * k + 1, device=DEVICE) % 11 - 5).bfloat16()
+    output = torch.empty(rows, dtype=torch.float32, device=DEVICE)
+    aligned = storage[:-1].view(rows, k)
+    unaligned = storage[1:].view(rows, k)
+    assert aligned.data_ptr() % 16 == 0 and unaligned.data_ptr() % 16 == 2
+    config = helion.Config.from_dict(
+        dict(row_sum_phase_config())
+        | {
+            "block_sizes": [256, 32, 8],
+            "cute_fragment_reduction": "warp",
+            "cute_fragment_vector_io": True,
+        }
+    )
+    for weight in (aligned, unaligned):
+        call = row_sum_after_producer.bind((x, weight, output, False)).compile_config(
+            config
+        )
+        torch.testing.assert_close(
+            call(x, weight, output, False),
+            weight.float() @ (x * 2).float(),
+            rtol=0,
+            atol=0,
+        )
+        x.neg_()
+
+
+def test_warp_row_dot_replays_selected_rows_with_independent_base_alignment():
+    if torch.cuda.get_device_capability(DEVICE) < (8, 0):
+        pytest.skip("BF16 warp MMA requires SM80+")
+    rows, k, banks = 64, 768, 3
+    rng = torch.Generator(device=DEVICE).manual_seed(42)
+    dtype = torch.bfloat16
+    # Small signed integers make every BF16 product and FP32 sum exact,
+    # including both halves of each stripe and all four complete stripes.
+    weights = torch.randint(
+        -6, 7, (banks * rows * k + 1,), device=DEVICE, generator=rng
+    ).to(dtype)
+    x = torch.randint(-7, 8, (k,), device=DEVICE, generator=rng).to(dtype)
+    activation = torch.empty(k + 1, dtype=dtype, device=DEVICE)
+    bank = torch.zeros(1, dtype=torch.int32, device=DEVICE)
+    sentinel = 1234567.0
+    storage = torch.full((rows + 2,), sentinel, device=DEVICE)
+    out = storage[1:-1]
+    for w_offset, v_offset, unroll in (
+        (0, 0, False),
+        (0, 0, True),
+        (1, 0, False),
+        (0, 1, True),
+    ):
+        weight = weights.narrow(0, w_offset, banks * rows * k).view(banks * rows, k)
+        published = activation.narrow(0, v_offset, k)
+        assert weight.data_ptr() % 16 == 2 * w_offset
+        assert published.data_ptr() % 16 == 2 * v_offset
+        args = (x, weight, bank, published, out)
+        config = selected_rows_config(unroll=unroll)
+        call = selected_rows_after_producer.bind(args).compile_config(config)
+        call(*args)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            call(*args)
+        if (w_offset, v_offset, unroll) == (0, 0, False):
+            primary = graph, weight, args
+        for index in (0, banks - 1, -1, banks):
+            bank.fill_(index)
+            x.neg_()
+            published.fill_(float("nan"))
+            out.fill_(float("nan"))
+            graph.replay()
+            expected_x = x.float() * 2
+            if 0 <= index < banks:
+                selected = weight.view(banks, rows, k)[index].float()
+                expected = (selected * expected_x).sum(-1)
+            else:
+                # The DSL indexes the flattened matrix with a tensor of
+                # physical row numbers. Its fragment bounds guard rejects
+                # both negative and past-the-end rows in either half stripe.
+                expected = torch.zeros_like(out)
+            torch.testing.assert_close(out, expected, rtol=0, atol=0)
+            torch.testing.assert_close(published.float(), expected_x, rtol=0, atol=0)
+            assert storage[0].item() == storage[-1].item() == sentinel
+
+    # Two nonzero terms enter distinct MMA instructions. FP32 rounds their
+    # sum to 2**24 + 4: merely grouping exact small integers wouldn't detect
+    # a different instruction-level rounding policy.
+    graph, weight, aligned_args = primary
+    bank.zero_()
+    x.fill_(0.5)
+    weight.zero_()
+    weight[:, 0] = 2**24
+    weight[:, 32] = 3
+    graph.replay()
+    expected = torch.full_like(out, 2**24 + 4)
+    torch.testing.assert_close(out, expected, rtol=0, atol=2)
+    strict = helion.kernel(
+        selected_rows_after_producer.fn,
+        backend="cute",
+        static_shapes=True,
+        fast_math=False,
+        autotune_effort="none",
+    ).bind(aligned_args)
+    assert not strict.config_spec.cute_warp_row_dot_roots
+    strict_floor = helion.Config(
+        block_sizes=[256, 32, 32],
+        pid_type="persistent_interleaved",
+        cross_loop_pipeline="barrier",
+    )
+    strict.compile_config(strict_floor)(*aligned_args)
+    torch.testing.assert_close(out, expected, rtol=0, atol=0)

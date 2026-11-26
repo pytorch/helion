@@ -101,7 +101,7 @@ _BASE_VALID_KEYS = """
     cute_fragment_mma_rows cute_fragment_packet_loads cute_fragment_padded_rows
     cute_in_kernel_grid_init cute_fragment_private_scalar_loops cute_fragment_producer_cache
     cute_fragment_published_scalars cute_fragment_pure_producer_regions
-    cute_fragment_reduction cute_fragment_register_loads
+    cute_fragment_reduction cute_fragment_register_loads cute_fragment_row_carry
     cute_fragment_register_producers cute_fragment_register_snapshots
     cute_fragment_scan cute_fragment_scan_exports cute_fragment_skip_zero_atomics
     cute_fragment_slab_loads cute_fragment_split_k cute_fragment_threads
@@ -162,7 +162,7 @@ _BASE_VALID_KEYS = """
     cute_unpadded_rows
     cute_vector_packet_unroll
     cute_vector_widths cute_vloop_sink cute_warp_aggregated_atomics
-    cute_warp_fp32_redux cute_wide_packet_hints cute_warp_mma_warps epilogue_subtile flatten_loops
+    cute_warp_fp32_redux cute_fragment_compact_rows cute_warp_row_dot cute_warp_row_reductions cute_wide_packet_hints cute_warp_mma_warps epilogue_subtile flatten_loops
     host_tensor_descriptors indexing l2_groupings load_cache_modifiers
     load_eviction_policies loop_orders matrix_instr_nonkdim maxnreg metal_matmul
     metal_tabulate_max_entries num_ctas num_sm_multiplier num_stages num_threads num_warps occupancy
@@ -281,7 +281,7 @@ _BASE_BACKEND_SPECIFIC_KEYS = """
     cute_fragment_mma_rows cute_fragment_packet_loads cute_fragment_padded_rows
     cute_in_kernel_grid_init cute_fragment_private_scalar_loops cute_fragment_producer_cache
     cute_fragment_published_scalars cute_fragment_pure_producer_regions
-    cute_fragment_reduction cute_fragment_register_loads
+    cute_fragment_reduction cute_fragment_register_loads cute_fragment_row_carry
     cute_fragment_register_producers cute_fragment_register_snapshots
     cute_fragment_scan cute_fragment_scan_exports cute_fragment_skip_zero_atomics
     cute_fragment_slab_loads cute_fragment_split_k cute_fragment_threads
@@ -342,7 +342,7 @@ _BASE_BACKEND_SPECIFIC_KEYS = """
     cute_unpadded_rows
     cute_vector_packet_unroll
     cute_vector_widths cute_vloop_sink cute_warp_aggregated_atomics
-    cute_warp_fp32_redux cute_wide_packet_hints cute_warp_mma_warps host_tensor_descriptors
+    cute_warp_fp32_redux cute_fragment_compact_rows cute_warp_row_dot cute_warp_row_reductions cute_wide_packet_hints cute_warp_mma_warps host_tensor_descriptors
     load_cache_modifiers matrix_instr_nonkdim metal_matmul
     metal_tabulate_max_entries num_ctas num_threads occupancy
     pallas_emit_pipeline_group_size pallas_fold_dot_lhs_cast
@@ -413,7 +413,7 @@ _BASE_CUTE_IMPLICIT_DEFAULT_KEYS = """
     cute_fragment_mma_rows cute_fragment_packet_loads cute_fragment_padded_rows
     cute_in_kernel_grid_init cute_fragment_private_scalar_loops cute_fragment_producer_cache
     cute_fragment_published_scalars cute_fragment_pure_producer_regions
-    cute_fragment_reduction cute_fragment_register_loads
+    cute_fragment_reduction cute_fragment_register_loads cute_fragment_row_carry
     cute_fragment_register_producers cute_fragment_register_snapshots
     cute_fragment_scan cute_fragment_scan_exports cute_fragment_skip_zero_atomics
     cute_fragment_slab_loads cute_fragment_split_k cute_fragment_threads
@@ -451,7 +451,7 @@ _BASE_CUTE_IMPLICIT_DEFAULT_KEYS = """
     cute_store_policy cute_tail_peel cute_topk_coarse_keys
     cute_topk_key_recovery cute_uniform_lane_compares cute_unpadded_rows
     cute_vector_packet_unroll cute_vloop_sink
-    cute_warp_aggregated_atomics cute_warp_fp32_redux cute_wide_packet_hints flatten_loops indexing
+    cute_warp_aggregated_atomics cute_warp_fp32_redux cute_fragment_compact_rows cute_warp_row_dot cute_warp_row_reductions cute_wide_packet_hints flatten_loops indexing
     l2_groupings load_eviction_policies loop_orders maxnreg num_sm_multiplier
     num_stages num_warps pid_type range_flattens range_multi_buffers
     range_num_stages range_unroll_factors range_warp_specializes static_ranges
@@ -522,7 +522,7 @@ _BASE_CUTE_ACCEPTED = """
     cute_fragment_mma_rows cute_fragment_packet_loads cute_fragment_padded_rows
     cute_in_kernel_grid_init cute_fragment_private_scalar_loops cute_fragment_producer_cache
     cute_fragment_published_scalars cute_fragment_pure_producer_regions
-    cute_fragment_reduction cute_fragment_register_loads
+    cute_fragment_reduction cute_fragment_register_loads cute_fragment_row_carry
     cute_fragment_register_producers cute_fragment_register_snapshots
     cute_fragment_scan cute_fragment_scan_exports cute_fragment_skip_zero_atomics
     cute_fragment_slab_loads cute_fragment_split_k cute_fragment_threads
@@ -583,7 +583,7 @@ _BASE_CUTE_ACCEPTED = """
     cute_unpadded_rows
     cute_vector_packet_unroll
     cute_vector_widths cute_vloop_sink cute_warp_aggregated_atomics
-    cute_warp_fp32_redux cute_wide_packet_hints cute_warp_mma_warps epilogue_subtile flatten_loops indexing
+    cute_warp_fp32_redux cute_fragment_compact_rows cute_warp_row_dot cute_warp_row_reductions cute_wide_packet_hints cute_warp_mma_warps epilogue_subtile flatten_loops indexing
     l2_groupings load_eviction_policies loop_orders maxnreg num_sm_multiplier
     num_stages num_threads num_warps pallas_internal_scratch pid_type range_flattens
     range_multi_buffers range_num_stages range_unroll_factors range_warp_specializes

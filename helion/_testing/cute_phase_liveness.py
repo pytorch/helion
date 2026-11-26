@@ -157,3 +157,118 @@ def explicit_direct_selection(
                 gathered = gathered + 1
         out[row.begin, group.begin, :] = gathered
     return out
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def row_sum_after_producer(
+    x: torch.Tensor, w: torch.Tensor, out: torch.Tensor, use_previous: hl.constexpr
+) -> torch.Tensor:
+    m, k = w.shape
+    published = torch.empty_like(x)
+    block_k = hl.register_block_size(k)
+    for first in hl.tile(k):
+        published[first] = x[first] * 2
+    for row in hl.tile(m):
+        acc = hl.zeros([row, block_k], dtype=torch.float32)
+        for col in hl.tile(k, block_size=block_k):
+            term = w[row, col].float() * published[col].float()[None, :]
+            if use_previous:
+                term = term + acc
+            acc = acc + term
+        out[row] = torch.sum(acc, dim=-1)
+    return out
+
+
+def row_sum_phase_config() -> helion.Config:
+    return helion.Config(
+        block_sizes=[32, 32, 8],
+        num_threads=[1, 32, 8],
+        pid_type="persistent_interleaved",
+        cross_loop_pipeline="barrier",
+        cute_fragment_row_carry=True,
+    )
+
+
+@helion.kernel(
+    backend="cute", static_shapes=True, autotune_effort="none", fast_math=True
+)
+def selected_rows_after_producer(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bank: torch.Tensor,
+    published: torch.Tensor,
+    out: torch.Tensor,
+) -> torch.Tensor:
+    k, rows = x.size(0), out.size(0)
+    block_k = hl.register_block_size(k)
+    for first in hl.tile(k):
+        published[first] = x[first] * 2
+    for row in hl.tile(rows):
+        selected = bank[0] * rows + row.index
+        acc = hl.zeros([row, block_k], dtype=torch.float32)
+        for col in hl.tile(k, block_size=block_k):
+            matrix = weight[selected, col].float()
+            vector = published[col].float()
+            acc = acc + matrix * vector[None, :]
+        out[row] = torch.sum(acc, dim=-1)
+    return out
+
+
+def selected_rows_config(*, unroll: bool = False) -> helion.Config:
+    return helion.Config.from_dict(
+        dict(row_sum_phase_config())
+        | {
+            "block_sizes": [256, 32, 32],
+            "cute_fragment_reduction": "warp",
+            "cute_fragment_vector_io": True,
+            "cute_warp_row_dot": True,
+            "cute_fragment_unrolled_loops": unroll,
+        }
+    )
+
+
+@helion.kernel(backend="cute", static_shapes=False, autotune_effort="none")
+def nested_row_copy(x: torch.Tensor, out: torch.Tensor) -> None:
+    for row in hl.tile(x.size(0)):
+        for col in hl.tile(x.size(1)):
+            out[row, col] = x[row, col]
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def row_sum_two_outputs(
+    x: torch.Tensor,
+    w: torch.Tensor,
+    a: torch.Tensor,
+    b: torch.Tensor,
+    checked: hl.constexpr,
+) -> None:
+    m, k = w.shape
+    block = hl.register_block_size(k)
+    for row in hl.tile(m):
+        if checked:
+            torch._assert_async(w[row.begin, 0] > 0)
+        acc = hl.zeros([row, block], dtype=torch.float32)
+        for col in hl.tile(k, block_size=block):
+            acc = acc + w[row, col].float() * x[col].float()[None, :]
+        result = torch.sum(acc, dim=-1)
+        a[row] = result
+        b[row] = result * 2
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def row_sum_after_independent_store(
+    x: torch.Tensor,
+    w: torch.Tensor,
+    other: torch.Tensor,
+) -> torch.Tensor:
+    m, k = w.shape
+    out = torch.empty((m,), device=w.device, dtype=torch.float32)
+    block_k = hl.register_block_size(k)
+    for tile in hl.tile(other.size(0)):
+        other[tile] = 0.0
+    for row in hl.tile(m):
+        acc = hl.zeros([row, block_k], dtype=torch.float32)
+        for col in hl.tile(k, block_size=block_k):
+            acc = acc + w[row, col].float() * x[col].float()[None, :]
+        out[row] = torch.sum(acc, dim=-1)
+    return out

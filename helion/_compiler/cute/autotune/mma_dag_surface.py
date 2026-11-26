@@ -479,6 +479,7 @@ def _normalize_cute_register_subblocks(
         "cute_fragment_threads",
         "cute_fragment_mma_rows",
         "cute_fragment_register_loads",
+        "cute_fragment_row_carry",
         "cute_fragment_producer_cache",
         "cute_fragment_warp_scan",
         "cute_fragment_scan",

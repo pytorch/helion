@@ -16,6 +16,7 @@ import torch
 import helion
 from helion import exc
 from helion._compiler import per_thread_planning
+from helion._compiler.cute.autotune.config_keys import COMPACT_ROWS_KEY
 from helion._compiler.cute.pdl_ops import config_conflicts_with_required_owner
 from helion._compiler.cute.split_k_cluster import ClusterKFacts
 from helion._testing import DEVICE
@@ -599,8 +600,18 @@ def test_checked_search_does_not_offer_rejected_generator_families(monkeypatch):
                 "cute_split_k_cluster_facts",
                 ClusterKFacts(32, 64, 4096, (0, 1, 2), 512, 232448),
             )
+            monkeypatch.setattr(spec, "cute_shared_row_carry_structure", True)
             with bound.env:
                 fields = spec._flat_fields()
+                compact = fields[COMPACT_ROWS_KEY]
+                assert compact.search_values() == (
+                    [False] if checked else [False, True]
+                )
+                if checked:
+                    assert isinstance(compact, EnumFragment) and compact.choices == (
+                        False,
+                        True,
+                    )
                 for key in keys:
                     field = fields[key]
                     assert isinstance(field, EnumFragment)

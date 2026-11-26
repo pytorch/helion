@@ -84,6 +84,7 @@
  "test/test_cute_collective_vector_recipe_codegen.py": 70.6,
  "test/test_cute_collective_warp_pipeline.py": 18.0,
  "test/test_cute_collective_warp_tf32.py": 29.9,
+ "test/test_cute_compact_row_carry.py": 2.8,
  "test/test_cute_component_packet_seeds.py": 0.5,
  "test/test_cute_component_packets.py": 14.8,
  "test/test_cute_computed_dot_reference.py": 2.7,

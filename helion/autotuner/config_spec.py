@@ -1659,6 +1659,22 @@ class ConfigSpec:
         self.cute_fragment_cta_requires_flat = False
         self.cute_fragment_warp_topk_requires_flat = False
         self.cute_fragment_warp_reduction_requires_flat = False
+        self.cute_warp_row_reduction_roots: dict[int, tuple[int, int, int, int]] = {}
+        # Flat field presence follows the carry's FX structure. Physical roots
+        # and extents below authorize a choice separately on each binding.
+        self.cute_warp_row_dot_structure = False
+        self.cute_shared_row_carry_structure = False
+        self.cute_warp_row_dot_roots: dict[int, tuple[tuple[int, int], ...]] = {}
+        self.cute_fragment_compact_row_extents: dict[int, int] = {}
+        self.cute_fragment_row_carry_root_ids: frozenset[int] = frozenset()
+        self.cute_fragment_row_carry_unmasked_rows: tuple[tuple[int, int], ...] = ()
+        self.cute_fragment_row_carry_contractions: tuple[tuple[int, int], ...] = ()
+        self.cute_fragment_row_carry_row_axes: frozenset[int] = frozenset()
+        self.cute_fragment_row_carry_packet_tiles: frozenset[tuple[int, int]] = (
+            frozenset()
+        )
+        self.cute_fragment_row_carry_shared: bool = False
+        self.cute_fragment_row_carry_search_enabled = False
         self.cute_fp32_dot_root_ids: frozenset[int] = frozenset()
         self.cute_fp32_dot_search_enabled = False
         self.cute_fragment_half_mma_root_ids: frozenset[int] = frozenset()

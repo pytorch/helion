@@ -117,6 +117,8 @@ from ..ring_mma_dot import RING_STAGE_CHOICES
 from ..ring_mma_dot import RING_STAGES_KEY
 from ..ring_mma_dot import ring_mma_geometry_reason
 from ..ring_mma_dot import ring_mma_smem_budget
+from ..row_carry_stripes import stripe_tiles
+from ..row_carry_terms import can_unroll_carry
 from ..selection.radix_selection_config import ALGORITHM_KEY as RADIX_ALGORITHM_KEY
 from ..selection.radix_selection_config import ALGORITHMS as RADIX_ALGORITHMS
 from ..selection.radix_selection_config import BOOLEAN_KEYS as RADIX_BOOLEAN_KEYS
@@ -170,7 +172,12 @@ from ..tcgen05_tma_rn import WARP_RAW as CUTE_MMA_F32_WARP_RAW
 from ..thread_budget import CUTE_REGISTER_TILE_MAX_ELEMENTS
 from ..thread_budget import MAX_THREAD_BLOCK_DIMS
 from ..unpadded_rows import unpadded_row_layout
+from ..warp_carry_packet import has_carry_packet
+from ..warp_carry_packet import uses_warp_carry
+from ..warp_carry_packet import warp_carry_tile
+from ..warp_row_dot_spec import row_dot_geometry
 from .config_generation_ext import CuteConfigGenerationExtension
+from .config_keys import COMPACT_ROWS_KEY
 from .config_keys import CUTE_AFFINE_SCAN_SCHEDULE_KEY
 from .config_keys import CUTE_CHUNK_PREPARE_SCHEDULE_KEY
 from .config_keys import CUTE_CHUNK_RECURRENCE_DV_PARTITIONS_KEY
@@ -187,6 +194,7 @@ from .config_keys import CUTE_IMPLICIT_DEFAULT_KEYS
 from .config_keys import CUTE_LOAD_HINT_FORM_KEYS
 from .config_keys import CUTE_TOPK_CHOICES
 from .config_keys import GRID_INIT_KEY
+from .config_keys import ROW_DOT_KEY
 from .config_keys import VALID_CUTE_CHUNK_PREPARE_SCHEDULES
 from .config_keys import VALID_CUTE_CHUNK_RECURRENCE_REGISTER_CAPS
 from .config_keys import _cute_chunk_recurrence_config_is_safe
@@ -371,12 +379,26 @@ _FRAGMENT_OPTIONS: dict[str, _FragmentOption] = {
         "a complete fragment root staging a tile whose rows are a multiple of 128 bytes",
     ),
     "cute_fragment_unrolled_loops": _FragmentOption(
-        lambda spec, config: spec.cute_fragment_unrolled_loops_root_ids,
+        lambda spec, config: (
+            spec.cute_fragment_unrolled_loops_root_ids
+            or (
+                spec.cute_fragment_row_carry_root_ids
+                if uses_warp_carry(spec, config)
+                else frozenset()
+            )
+        ),
         "a complete fragment root",
     ),
     "cute_fragment_vector_io": _FragmentOption(
-        lambda spec, config: spec.cute_fragment_vector_io_root_ids,
-        "a complete fragment root moving a 16-byte-packetizable host window",
+        lambda spec, config: (
+            spec.cute_fragment_vector_io_root_ids
+            or (
+                spec.cute_fragment_row_carry_root_ids
+                if has_carry_packet(spec, config)
+                else frozenset()
+            )
+        ),
+        "a complete fragment root or shared warp row carry moving a 16-byte-packetizable host window",
     ),
     "cute_fragment_batched_loads": _FragmentOption(
         lambda spec, config: spec.cute_fragment_batched_loads_root_ids,
@@ -386,13 +408,24 @@ _FRAGMENT_OPTIONS: dict[str, _FragmentOption] = {
         lambda spec, config: spec.cute_fragment_slab_loads_root_ids,
         "a complete fragment root with repeated static windows of one tensor",
     ),
+    "cute_fragment_row_carry": _FragmentOption(
+        lambda spec, config: spec.cute_fragment_row_carry_root_ids,
+        "a pure FP32 row carry consumed by a trailing-axis sum",
+    ),
     "cute_fragment_register_loads": _FragmentOption(
         lambda spec, config: spec.cute_fragment_register_load_root_ids,
         "a supported lane-private fragment load",
     ),
     "cute_fragment_reduction": _FragmentOption(
-        lambda spec, config: spec.cute_fragment_reduction_root_ids,
-        "a supported computed scalar reduction",
+        lambda spec, config: (
+            spec.cute_fragment_reduction_root_ids
+            or (
+                spec.cute_fragment_row_carry_root_ids
+                if uses_warp_carry(spec, config)
+                else frozenset()
+            )
+        ),
+        "a supported computed scalar reduction or a shared row carry using warp reduction",
         ("serial", "warp", "cta", "cta_unroll"),
     ),
     "cute_fp32_dot": _FragmentOption(
@@ -3266,6 +3299,14 @@ def normalize_knobs(
     _normalize_cute_reduction_local_tree(config_spec, config, fix_invalid=fix_invalid)
     _normalize_cute_reduction_row_output(config_spec, config, fix_invalid=fix_invalid)
     _normalize_cute_reduction_sequence(config_spec, config, fix_invalid=fix_invalid)
+    _normalize_gated_boolean(
+        config,
+        "cute_warp_row_reductions",
+        enabled=bool(config_spec.cute_warp_row_reduction_roots),
+        requirement="a pure sum over the contiguous row axis of a multiroot program",
+        fix_invalid=fix_invalid,
+        fill=False,
+    )
     _normalize_cute_host_paired_sum(config_spec, config, fix_invalid=fix_invalid)
     _normalize_fragment_option(
         config_spec, config, "cute_fragment_scan", fix_invalid=fix_invalid
@@ -3375,6 +3416,10 @@ def normalize_knobs(
     _normalize_fragment_option(
         config_spec, config, "cute_fragment_slab_loads", fix_invalid=fix_invalid
     )
+    _normalize_fragment_option(
+        config_spec, config, "cute_fragment_row_carry", fix_invalid=fix_invalid
+    )
+
     _normalize_fragment_option(
         config_spec, config, "cute_fragment_register_loads", fix_invalid=fix_invalid
     )
@@ -3703,6 +3748,88 @@ def normalize_before_sequences(
 def normalize_after_sequences(
     config_spec: ConfigSpec, config: dict[str, object], *, fix_invalid: bool
 ) -> None:
+    # Config accepts nested per-loop block sizes; inspect the flattened tiles.
+    blocks = config.get("block_sizes")
+    if config.get("cute_fragment_row_carry"):
+        if isinstance(blocks, list) and any(
+            isinstance(tile := config_spec.block_sizes.config_get(blocks, axis), int)
+            and (tile <= 0 or extent % tile)
+            for axis, extent in config_spec.cute_fragment_row_carry_contractions
+        ):
+            if fix_invalid:
+                config.pop("cute_fragment_row_carry")
+            else:
+                raise InvalidConfig("row carry needs whole contraction tiles")
+
+    if uses_warp_carry(config_spec, config) and isinstance(blocks, list):
+        from ..fragment_context import UNROLLED_SLOTS
+
+        tiles = {
+            axis: config_spec.block_sizes.config_get(blocks, axis)
+            for axis, _ in config_spec.cute_fragment_row_carry_contractions
+        }
+        warp_tiles = {
+            axis: tile
+            for axis, tile in tiles.items()
+            if isinstance(tile, int) and warp_carry_tile(tile)
+        }
+        if not config_spec.cute_fragment_reduction_root_ids and not warp_tiles:
+            if not fix_invalid:
+                raise InvalidConfig(
+                    f"warp row carry needs between 1 and {UNROLLED_SLOTS} whole warps of columns"
+                )
+            config.pop("cute_fragment_reduction")
+        if (
+            config.get("cute_fragment_unrolled_loops")
+            and not config_spec.cute_fragment_unrolled_loops_root_ids
+            and not any(
+                axis in warp_tiles and can_unroll_carry(extent // warp_tiles[axis])
+                for axis, extent in config_spec.cute_fragment_row_carry_contractions
+            )
+        ):
+            if not fix_invalid:
+                raise InvalidConfig("row carry unrolling needs a short warp K loop")
+            config.pop("cute_fragment_unrolled_loops")
+        if (
+            config.get("cute_fragment_vector_io")
+            and not config_spec.cute_fragment_vector_io_root_ids
+            and not any(
+                tiles.get(axis) == width
+                for axis, width in config_spec.cute_fragment_row_carry_packet_tiles
+            )
+        ):
+            if not fix_invalid:
+                raise InvalidConfig("warp row carry needs one complete packet per lane")
+            config.pop("cute_fragment_vector_io")
+    # Sequence normalization can retire the only owner of a dependent mode.
+    if fix_invalid:
+        for key in (
+            "cute_fragment_reduction",
+            "cute_fragment_vector_io",
+            "cute_fragment_unrolled_loops",
+        ):
+            if key in config:
+                _normalize_fragment_option(config_spec, config, key, fix_invalid=True)
+
+    _normalize_gated_boolean(
+        config,
+        ROW_DOT_KEY,
+        enabled=row_dot_geometry(config_spec, config),
+        requirement="a vectorized SM80-or-later warp row carry of an admitted BF16 dot, "
+        "256 K columns and a positive multiple of 16 output rows",
+        fix_invalid=fix_invalid,
+        fill=False,
+    )
+    _normalize_gated_boolean(
+        config,
+        COMPACT_ROWS_KEY,
+        enabled=bool(stripe_tiles(config_spec, config)),
+        requirement="a shared warp row carry with complete three-quarter row stripes "
+        "and one explicit thread on the row axis",
+        fix_invalid=fix_invalid,
+        fill=False,
+    )
+
     # A persistent reduction with exactly one vector fragment per
     # thread has only one physical assignment, so blocked/strided are
     # identical.  Canonicalize the inactive choice to avoid duplicate
@@ -4516,7 +4643,10 @@ def cute_flat_fields(
         fields["cute_fragment_packet_loads"] = BooleanFragment()
     if config_spec.cute_fragment_padded_rows_search_enabled:
         fields["cute_fragment_padded_rows"] = BooleanFragment()
-    if config_spec.cute_fragment_unrolled_loops_search_enabled:
+    if (
+        config_spec.cute_fragment_unrolled_loops_search_enabled
+        or config_spec.cute_shared_row_carry_structure
+    ):
         fields["cute_fragment_unrolled_loops"] = BooleanFragment()
     # Fragment MMA and tile transport booleans (one statement: this sits at a
     # size past which pyrefly drops its narrowing of the fields below).
@@ -4525,7 +4655,12 @@ def cute_flat_fields(
             key: BooleanFragment()
             for enabled, key in (
                 (
-                    config_spec.cute_fragment_vector_io_search_enabled,
+                    bool(config_spec.cute_warp_row_reduction_roots),
+                    "cute_warp_row_reductions",
+                ),
+                (
+                    config_spec.cute_fragment_vector_io_search_enabled
+                    or config_spec.cute_shared_row_carry_structure,
                     "cute_fragment_vector_io",
                 ),
                 (
@@ -4586,6 +4721,19 @@ def cute_flat_fields(
         fields["cute_fragment_atomic_consumer_fusion"] = BooleanFragment()
     if config_spec.cute_fragment_pure_producer_regions_search_enabled:
         fields["cute_fragment_pure_producer_regions"] = BooleanFragment()
+    if (
+        config_spec.cute_fragment_row_carry_search_enabled
+        or config_spec.cute_shared_row_carry_structure
+    ):
+        fields["cute_fragment_row_carry"] = BooleanFragment()
+    if config_spec.cute_warp_row_dot_structure:
+        fields[ROW_DOT_KEY] = BooleanFragment()
+    if config_spec.cute_shared_row_carry_structure:
+        fields[COMPACT_ROWS_KEY] = (
+            EnumFragment((False, True), search_choices=(False,))
+            if explicit_pdl_or_assertion
+            else BooleanFragment()
+        )
     if config_spec.cute_fragment_register_loads_search_enabled:
         fields["cute_fragment_register_loads"] = BooleanFragment()
     if config_spec.cute_fragment_threads_search_enabled:
@@ -4600,6 +4748,10 @@ def cute_flat_fields(
         fields["cute_fragment_reduction"] = EnumFragment(
             choices=reduction_modes(config_spec)
         )
+    elif config_spec.cute_shared_row_carry_structure:
+        # Flattening compiler seeds drops fields absent from the flat space.
+        # Only these two modes have an owner on a row-only shared launch.
+        fields["cute_fragment_reduction"] = EnumFragment(choices=("serial", "warp"))
     if config_spec.cute_fp32_dot_search_enabled:
         fields["cute_fp32_dot"] = EnumFragment(choices=("simt", "tf32_mma"))
     if config_spec.cute_pointwise_region_block_ids and any(
@@ -5369,7 +5521,8 @@ def cute_flat_fields(
         assert config_spec.cute_mma_dag_pass_warps is not None
         assert config_spec.cute_mma_dag_loads is not None
         assert config_spec.cute_mma_dag_derived is not None
-        assert config_spec.cute_mma_dag_epilogue is not None
+        epilogue_fragment = config_spec.cute_mma_dag_epilogue
+        assert epilogue_fragment is not None
         lookahead_fragment = config_spec.cute_mma_dag_lookahead
         assert lookahead_fragment is not None
         fields[MMA_DAG_WARPS_KEY] = config_spec.cute_mma_dag_warps
@@ -5405,7 +5558,7 @@ def cute_flat_fields(
         if aux_fragment is not None:
             fields[MMA_DAG_AUX_KEY] = aux_fragment
         fields[MMA_DAG_DERIVED_KEY] = config_spec.cute_mma_dag_derived
-        fields[MMA_DAG_EPILOGUE_KEY] = config_spec.cute_mma_dag_epilogue
+        fields[MMA_DAG_EPILOGUE_KEY] = epilogue_fragment
         fields[MMA_DAG_LOOKAHEAD_KEY] = lookahead_fragment
         persistent_fragment = config_spec.cute_mma_dag_persistent
         if persistent_fragment is not None:
@@ -5523,7 +5676,13 @@ def flatten_missing_field_default(
         return True, "off"
     if key == "cute_gathered_page_stages":
         return True, 2
-    if key in ("cute_fragment_private_scalar_loops", GRID_INIT_KEY):
+    if key in (
+        "cute_fragment_private_scalar_loops",
+        GRID_INIT_KEY,
+        "cute_warp_row_reductions",
+        ROW_DOT_KEY,
+        COMPACT_ROWS_KEY,
+    ):
         return True, False
     if key == "cute_fragment_producer_cache":
         return True, False
@@ -5531,6 +5690,7 @@ def flatten_missing_field_default(
         return True, False
     if key in (
         "cute_fragment_register_loads",
+        "cute_fragment_row_carry",
         "cute_fragment_half_mma",
         "cute_gathered_page_pipeline",
         "cute_fragment_warp_scan",

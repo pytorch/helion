@@ -14,6 +14,7 @@ from ...language.pdl_ops import pdl_launch_dependents
 from ...language.pdl_ops import pdl_wait
 from ..ast_extension import expr_from_string
 from ..compile_environment import CompileEnvironment
+from .autotune.config_keys import COMPACT_ROWS_KEY
 from .grouped_row_union import physical_schedule
 from .state import cute_codegen_state
 
@@ -54,6 +55,7 @@ def config_conflicts_with_required_owner(spec: ConfigSpec, config: Config) -> bo
         or config.get("cute_reduction_sequence") in {"bounded", "bounded_layout"}
         or config.get("cute_split_k_schedule") == "cluster8_k4"
         or config.get("cute_split_k_workspace", False)
+        or config.get(COMPACT_ROWS_KEY, False)
     ):
         return True
     if assertion and (

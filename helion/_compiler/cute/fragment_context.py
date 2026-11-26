@@ -589,6 +589,7 @@ class FragmentContext:
             if self.df.config.get("cute_fragment_private_scalar_loops", False)
             else frozenset()
         )
+        self.folded_row_sums: dict[Node, Fragment] = {}
         self.warp_result_nodes: dict[Node, int] = {}
         if self.df.config.get("cute_fragment_warp_results", False):
             for graph in self.graphs:

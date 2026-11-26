@@ -323,7 +323,9 @@ def register_fragment_knob_coverage(
     # A resource candidate may also become a supplemental witness. Its
     # launch must satisfy the same requirement as the primary witness.
     needs_flat = spec.cute_fragment_cta_requires_flat and any(
-        not fragment_option_fits_shared_block(knob.name, value, spec=spec)
+        not fragment_option_fits_shared_block(
+            knob.name, value, spec=spec, config=resource_carrier
+        )
         for value in coverage.witness_values
     )
     if needs_flat and "flat" not in spec.allowed_pid_types:
@@ -1256,6 +1258,135 @@ def _warp_fragment_regions(
     return [*owned, *(region for root, region in shared.items() if root not in seen)]
 
 
+def _row_carry_carrier(ctx: CoverageContext) -> Carrier | None:
+    ordinary = fragment_coverage_carrier(ctx.spec, None)
+    if ordinary is None:
+        return None
+    if not ctx.spec.cute_fragment_row_carry_shared:
+        return Carrier(ordinary)
+    # A shared barrier launch uses one physical CTA shape in every phase.
+    # The flat row-carry walk owns the whole physical thread coordinate,
+    # so its ordinary logical axes cannot require extra x/y reduction lanes.
+    return Carrier(
+        Config.from_dict(
+            ordinary.config | {"num_threads": [1 for _ in ctx.spec.num_threads]}
+        )
+    )
+
+
+def _row_carry_roots(env: CompileEnvironment, ir: DeviceIR) -> RootFacts:
+    from ..computed_fragment import computed_fragment_supported
+    from ..computed_fragment import ordinary_shared_fragment
+    from ..fragment_vector_io import packet_lanes
+    from ..row_carry_stripes import complete_row_extent
+    from ..row_reduction_carry import phase_region
+    from ..row_reduction_carry import row_loop_structure
+    from ..row_reduction_carry import row_phase_reads_are_safe
+    from ..warp_row_dot_spec import admitted_row_dot_loads
+    from ..warp_row_dot_spec import row_dot_structure
+    from ..warp_row_dot_spec import supported_row_dot
+
+    if env.process_group_name is not None:
+        return RootFacts(frozenset())
+    shared = len(ir.root_ids) > 1
+    pipeline = env.config_spec.cross_loop_pipeline
+    if shared and (pipeline is None or "barrier" not in pipeline.choices):
+        # Independent roots have no common barrier launch.
+        return RootFacts(frozenset())
+    roots = set()
+    row_axes: set[int] = set()
+    matched = False
+    contractions: set[tuple[int, int]] = set()
+    unmasked_rows: set[tuple[int, int]] = set()
+    packet_tiles: set[tuple[int, int]] = set()
+    dot_roots: dict[int, list[tuple[int, int]]] = {}
+    compact_extents: dict[int, int] = {}
+    checked_rows: set[int] = set()
+    shared_carry = dot_structure = False
+    for root in ir.root_ids:
+        region = phase_region(ir.graphs, root)
+        plans = []
+        for graph in region:
+            for call in graph.graph.nodes:
+                structure = row_loop_structure(env, call, region)
+                if structure is None:
+                    continue
+                if shared:
+                    shared_carry = True
+                    dot_structure |= row_dot_structure(structure.results)
+                if (plan := structure.bounded(env)) is not None:
+                    plans.append((call, plan))
+        if not plans:
+            continue
+        # Even if the bound buffers now alias, a different input may admit
+        # the same structural row loop; unrelated loops keep dynamic reuse.
+        matched = True
+        if (
+            ordinary_shared_fragment(region)
+            and row_phase_reads_are_safe(env, region, allow_unbound=True)
+            and computed_fragment_supported(
+                env, region, row_carry_owned=True, allow_unbound=True
+            )
+        ):
+            roots.add(root)
+            for call, plan in plans:
+                contractions.add((plan.block_id, plan.end - plan.begin))
+                if plan.unmasked_rows is not None:
+                    unmasked_rows.add(plan.unmasked_rows)
+                for result in plan.results:
+                    for n in result.nodes:
+                        if n.target is not memory_ops.load or not _candidate_window(
+                            env, n
+                        ):
+                            continue
+                        value = n.meta.get("val")
+                        if isinstance(value, torch.Tensor) and (
+                            width := packet_lanes(value.dtype)
+                        ):
+                            tile = width * 32
+                            if (
+                                plan.begin % width == 0
+                                and (plan.end - plan.begin) % tile == 0
+                            ):
+                                packet_tiles.add((plan.block_id, tile))
+                    initial = cast("list[Node]", call.args[3])[result.slot]
+                    shape = cast("torch.Tensor", initial.meta["val"]).shape
+                    if (row := env.resolve_block_id(shape[0])) is not None:
+                        row_axes.add(row)
+                        if shared and row not in checked_rows:
+                            checked_rows.add(row)
+                            extent = complete_row_extent(
+                                env, ir, root, region, row, allow_unbound=True
+                            )
+                            if extent is not None:
+                                compact_extents[row] = extent
+                        if shared and admitted_row_dot_loads(env, plan) is not None:
+                            dot_roots.setdefault(root, []).append((row, plan.block_id))
+    return RootFacts(
+        frozenset(roots),
+        (
+            ("cute_fragment_row_carry_contractions", tuple(sorted(contractions))),
+            ("cute_fragment_row_carry_unmasked_rows", tuple(sorted(unmasked_rows))),
+            ("cute_fragment_row_carry_row_axes", frozenset(row_axes)),
+            (
+                "cute_fragment_row_carry_packet_tiles",
+                frozenset(packet_tiles) if shared else frozenset(),
+            ),
+            ("cute_fragment_row_carry_shared", bool(roots) and shared),
+            ("cute_warp_row_dot_roots", {r: tuple(v) for r, v in dot_roots.items()}),
+            ("cute_fragment_compact_row_extents", compact_extents),
+            ("cute_shared_row_carry_structure", shared_carry),
+            (
+                "cute_warp_row_dot_structure",
+                dot_structure
+                and env.settings.fast_math
+                and supported_row_dot(env.config_spec),
+            ),
+        ),
+        specialized=matched,
+    )
+
+
 def _warp_fragment_reduction_roots(env: CompileEnvironment, ir: DeviceIR) -> RootFacts:
     owned = fragment_regions(ir)
     shared_regions = _shared_warp_regions(env, ir)
@@ -1442,6 +1573,16 @@ PRIVATE_SCALAR_LOOPS = FragmentKnob(
     (fragment_supported, _has_private_scalar_loops),
     root_ids_attr="cute_fragment_private_scalar_loop_root_ids",
     coverage=_BOOLEAN_KEEP_FIELD,
+)
+_ROW_CARRY_PRIORITY = 105
+ROW_CARRY = FragmentKnob(
+    "cute_fragment_row_carry",
+    "row_carry",
+    _ROW_CARRY_PRIORITY,
+    roots=_row_carry_roots,
+    coverage=KnobCoverage(
+        deferred=False, resource=False, carrier=_row_carry_carrier, plan=_stripped_plan
+    ),
 )
 REGISTER_LOADS = FragmentKnob(
     "cute_fragment_register_loads",
@@ -1720,6 +1861,7 @@ FRAGMENT_KNOBS: tuple[FragmentKnob, ...] = (
     REDUCTION,
     PRIVATE_SCALAR_LOOPS,
     REGISTER_LOADS,
+    ROW_CARRY,
     WARP_RESULTS,
     PRODUCER_CACHE,
     WARP_SCAN,
@@ -1766,6 +1908,33 @@ if _UNLISTED_KNOBS:
 CuteFragmentScanHeuristic = fragment_knob_heuristic(SCAN)
 CuteFragmentReductionHeuristic = fragment_knob_heuristic(REDUCTION)
 CuteFragmentPrivateScalarLoopsHeuristic = fragment_knob_heuristic(PRIVATE_SCALAR_LOOPS)
+
+
+class CuteFragmentRowCarryHeuristic(FragmentKnobHeuristic):
+    knob = ROW_CARRY
+    name = ROW_CARRY.name
+    priority = _ROW_CARRY_PRIORITY
+
+    @classmethod
+    def is_eligible(cls, env: CompileEnvironment, device_ir: DeviceIR) -> bool:
+        return bool(env.config_spec.cute_fragment_row_carry_root_ids)
+
+    @classmethod
+    def get_seed_configs(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> list[Config]:
+        from .heuristics.cute_row_reduction_carry import row_carry_seeds
+
+        return row_carry_seeds(env.config_spec)
+
+    @classmethod
+    def get_seed_config(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> Config | None:
+        seeds = cls.get_seed_configs(env, device_ir)
+        return seeds[0] if seeds else None
+
+
 CuteFragmentRegisterLoadsHeuristic = fragment_knob_heuristic(REGISTER_LOADS)
 CuteFragmentWarpResultsHeuristic = fragment_knob_heuristic(WARP_RESULTS)
 CuteFragmentProducerCacheHeuristic = fragment_knob_heuristic(PRODUCER_CACHE)
@@ -1809,6 +1978,7 @@ register_fragment_reduction_coverage = fragment_knob_registrar(REDUCTION)
 register_fragment_private_scalar_loops_coverage = fragment_knob_registrar(
     PRIVATE_SCALAR_LOOPS
 )
+register_fragment_row_carry_coverage = fragment_knob_registrar(ROW_CARRY)
 register_fragment_register_loads_coverage = fragment_knob_registrar(REGISTER_LOADS)
 register_fragment_warp_results_coverage = fragment_knob_registrar(WARP_RESULTS)
 register_fragment_producer_cache_coverage = fragment_knob_registrar(PRODUCER_CACHE)

@@ -680,6 +680,9 @@ class CuteLaneState:
     shared_reduce_launch_block: tuple[int, int, int] | None = None
     # A warp-local fragment consumes, but does not set, the final CTA dimensions.
     shared_fragment_uses_warps: bool = False
+    # Minimum x threads required by the warp-partitioned row sums in this
+    # kernel. Zero means that no row-sum partition was emitted.
+    warp_row_threads: int = 0
     # The static ``block=`` the launcher call was emitted with
     # (``CuteBackend.launcher_keyword_args``, which runs ahead of the
     # kernel definition's codegen); None before that call, and for a

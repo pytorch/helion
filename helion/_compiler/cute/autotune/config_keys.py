@@ -37,6 +37,9 @@ from ..tcgen05_config import CUTE_TCGEN05_TUNABLE_KEYS
 from ..tcgen05_flat_grouped_config import CONFIG_KEYS as GROUPED_RNA_CONFIG_KEYS
 
 GRID_INIT_KEY = "cute_in_kernel_grid_init"
+COMPACT_ROWS_KEY = "cute_fragment_compact_rows"
+ROW_DOT_KEY = "cute_warp_row_dot"
+
 # -- recurrence / scan / top-k families (keys owned by their emitters) --------
 CUTE_CHUNK_RECURRENCE_DV_PARTITIONS_KEY = "cute_chunk_recurrence_dv_partitions"
 CUTE_CHUNK_RECURRENCE_REGISTER_CAP_KEY = "cute_chunk_recurrence_register_cap"
@@ -133,6 +136,8 @@ CUTE_FRAGMENT_KEYS: tuple[str, ...] = (
     "cute_gathered_page_stages",
     "cute_fragment_threads",
     "cute_fragment_register_loads",
+    "cute_fragment_row_carry",
+    COMPACT_ROWS_KEY,
     "cute_fragment_producer_cache",
     "cute_fragment_warp_scan",
     "cute_fragment_topk_network",
@@ -208,6 +213,8 @@ CUTE_MISC_SCHEDULE_KEYS: tuple[str, ...] = (
     "cute_scalar_epilogue_owner_fold",
     "cute_warp_fp32_redux",
     GRID_INIT_KEY,
+    "cute_warp_row_reductions",
+    ROW_DOT_KEY,
     "cute_register_tile_warp_fold",
     "cute_register_tile_cooperative_fold",
     "cute_register_tile_store_first",

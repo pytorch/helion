@@ -57,6 +57,7 @@ GENERATOR_ORDER = (
     "split_k_workspace",
     "materialized_fission",
     "ordered_phases",
+    "compact_carry_rows",
 )
 
 
