@@ -969,10 +969,30 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         if swizzle == 1:
             return None
         cluster_n = self._tcgen05_cluster_n()
+        if not self.tcgen05_swizzle_pads_dim1(swizzle, cluster_n=cluster_n):
+            return None
+        logical_n = self._tcgen05_scheduler_tile_dims_expr(is_device=True)[1]
+        if cluster_n > 1:
+            coord = (
+                f"({coord} // cutlass.Int32({cluster_n})) * cutlass.Int32({cluster_n})"
+            )
+        return f"{coord} < ({logical_n})"
+
+    def tcgen05_swizzle_pads_dim1(self, swizzle: int, *, cluster_n: int) -> bool:
+        """Whether an L2 raster swizzle of ``swizzle`` clusters pads the
+        scheduler's dim 1: ``PersistentTileSchedulerParams`` rounds that dim's
+        cluster count up to a multiple of the swizzle and hands the padding
+        slots out as work (``_tcgen05_swizzle_padding_predicate`` skips them),
+        so a static grid of the logical clusters walks more slots than it has
+        clusters.  False without a swizzle or where the count is static and a
+        multiple of it.  ``cute_mma`` asks before it registers the matmul plan
+        (``tcgen05_one_tile_per_cta``), so the caller passes ``cluster_n``."""
+        if swizzle == 1:
+            return False
         if len(self.pid_info) < 2:
-            static_tiles = 1
+            static_tiles: int | None = 1
         else:
-            pid = self.pid_info[self._tcgen05_scheduler_axes()[1]]
+            pid = self.pid_info[self._tcgen05_scheduler_axes(cluster_n=cluster_n)[1]]
             static_tiles = None
             if isinstance(pid.numel, (int, sympy.Integer)):
                 block_size = (
@@ -984,16 +1004,10 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
                 )
                 if isinstance(block_size, int) and block_size > 0:
                     static_tiles = (int(pid.numel) + block_size - 1) // block_size
-        if static_tiles is not None:
-            clusters = (static_tiles + cluster_n - 1) // cluster_n
-            if clusters % swizzle == 0:
-                return None
-        logical_n = self._tcgen05_scheduler_tile_dims_expr(is_device=True)[1]
-        if cluster_n > 1:
-            coord = (
-                f"({coord} // cutlass.Int32({cluster_n})) * cutlass.Int32({cluster_n})"
-            )
-        return f"{coord} < ({logical_n})"
+        return (
+            static_tiles is None
+            or (static_tiles + cluster_n - 1) // cluster_n % swizzle != 0
+        )
 
     def _tcgen05_guard_logical_work(
         self, work_tile_var: str, body: list[ast.stmt]
@@ -2028,15 +2042,19 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
     ) -> None:
         """Move the TMA-load warp's role block right after ``anchor``.
 
-        ``cute_mma`` decided ``tcgen05_hoist_tma_role`` (one tile per CTA) and
+        ``cute_mma`` decided ``tcgen05_hoist_tma_role`` (one tile per CTA),
+        ``tcgen05_hoist_persistent_tma_role`` or the row-union hoist and
         recorded the anchor: the cluster ``pipeline_init_arrive`` on the
         clustered path, the mbarrier init fence on the plain merged-init path.
         The prefix's init wait (cluster wait or pipeline-init named barrier)
         is guarded to the other warps and the TMA-load role carries its own
-        wait ahead of its first stage.  Everything the role block reads (TMA
-        atoms, SMEM operand tensors, the AB pipeline and its producer state,
-        multicast masks) is defined before the anchor; the TMEM allocation
-        and the other roles follow it unchanged.
+        wait: ahead of its first stage on the one-shot kernel, ahead of its
+        first tile's first stage on the persistent kernel, in its role
+        prelude ahead of the persistent loop on the row-union kernel.
+        Everything the role block reads (TMA atoms, SMEM operand tensors, the
+        AB pipeline and its producer state, multicast masks) is defined
+        before the anchor; the TMEM allocation and the other roles follow it
+        unchanged.
         """
         anchor_index = next(index for index, stmt in enumerate(setup) if stmt is anchor)
         tma_predicate = self._tcgen05_tma_load_role_predicate()

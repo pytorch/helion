@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import dataclasses
+import textwrap
 
 from .cutedsl_compat import emit_producer_tail_tma_umma
 
@@ -68,6 +69,19 @@ class Tcgen05LifecycleContext:
     # per call).  ``exec_acc_tmem_ptr`` is the pointer the MMA warp frees.
     mma_warp_frees_tmem: bool = False
     exec_acc_tmem_ptr: str = ""
+    # ``cute_mma``'s ``tcgen05_hoist_persistent_tma_role``: the guarded
+    # cluster join the TMA-load role runs at its first tile.  A CTA the
+    # scheduler hands only swizzle-padding slots never reaches that tile, so
+    # the TMA warp runs it here, ahead of its tail's empty-barrier waits:
+    #
+    #     if tcgen05_tma_warp:
+    #         if tcgen05_ab_producer_state.count == cutlass.Int32(0):
+    #             cutlass.pipeline.pipeline_init_wait(cluster_shape_mn=...)
+    #         tcgen05_ab_pipeline.producer_tail(tcgen05_ab_producer_state)
+    #
+    # Without it that tail could read an empty barrier before the init that
+    # another warp issued is visible to it (only the join orders the two).
+    tma_role_first_tile_join: str = ""
 
     def _allocator_with_columns_line(self) -> str:
         return (
@@ -124,8 +138,14 @@ class Tcgen05LifecycleContext:
         ):
             post_loop_lines.append(tma_store_pipeline_tail)
         if self.use_tma:
+            late_join = (
+                textwrap.indent(self.tma_role_first_tile_join, "    ") + "\n"
+                if self.tma_role_first_tile_join
+                else ""
+            )
             post_loop_lines.append(
                 f"if {self.tma_warp}:\n"
+                + late_join
                 + emit_producer_tail_tma_umma(
                     self.tma_pipeline,
                     self.tma_producer_state,

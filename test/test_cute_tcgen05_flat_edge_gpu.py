@@ -1178,6 +1178,58 @@ class TestCuteTcgen05RaggedTwoCtaSearch(RefEagerTestDisabled, TestCase):
             out, (x.float() @ y.float()).to(out.dtype), rtol=1e-2, atol=1e-1
         )
 
+    def test_one_tile_operand_l2_prefetch_matches_torch(self) -> None:
+        # A one-tile CTA whose A and B rows hold at most 768 lines prefetches
+        # them into L2 ahead of its dependent-launch wait: 1500x384x384 (a
+        # partial last M tile) and 768x768x384 (whole tiles, the TMA-load role
+        # hoisted), with one and two A/B-load warps, and over padded rows.
+        for (m, n, k), warps, pad in (
+            *itertools.product(((1500, 384, 384), (768, 768, 384)), (1, 2), (0,)),
+            # padded K-major rows: the prefetch reads each operand's stride
+            ((1500, 384, 384), 2, 128),
+        ):
+            a = torch.randn(m, k + pad, device=DEVICE, dtype=torch.bfloat16)[:, :k]
+            b = torch.randn(n, k + pad, device=DEVICE, dtype=torch.bfloat16)[:, :k].T
+            out = torch.zeros(m, n, device=DEVICE, dtype=torch.bfloat16)
+            bound = plain_mm_into.bind((a, b, out))
+            values = dict(bound.config_spec.default_config().config)
+            values["tcgen05_warp_spec_ab_load_warps"] = warps
+            config = helion.Config(**values)
+            self.assertIn("cute.arch.prefetch(", bound.to_code(config))
+            bound.set_config(config)
+            bound(a, b, out)
+            torch.testing.assert_close(
+                out, (a.float() @ b.float()).to(out.dtype), rtol=1e-2, atol=1e-1
+            )
+
+    def test_mn_major_one_tile_operand_l2_prefetch_matches_torch(self) -> None:
+        # The same prefetch along K for an M-major A and an N-major B (a
+        # weight gradient): 1000x768x128 (a partial last M tile; 2000-byte A
+        # columns, two lines each, the last one clamped to row 999) with one
+        # and two A/B-load warps, and 1024x768x128 (line-aligned columns) on
+        # the 128x128 pair.
+        for m, warps in ((1000, 1), (1000, 2), (1024, 1)):
+            a = torch.randn(128, m, device=DEVICE, dtype=torch.bfloat16).T
+            b = torch.randn(128, 768, device=DEVICE, dtype=torch.bfloat16)
+            out = torch.zeros(m, 768, device=DEVICE, dtype=torch.bfloat16)
+            bound = plain_mm_into.bind((a, b, out))
+            values = dict(bound.config_spec.default_config().config)
+            values.update(
+                block_sizes=[128, 128, 64],
+                tcgen05_cluster_m=2,
+                tcgen05_cta_group="two",
+                pid_type="persistent_interleaved",
+                tcgen05_ab_stages=2,
+                tcgen05_warp_spec_ab_load_warps=warps,
+            )
+            config = helion.Config(**values)
+            self.assertIn("cute.arch.prefetch(", bound.to_code(config))
+            bound.set_config(config)
+            bound(a, b, out)
+            torch.testing.assert_close(
+                out, (a.float() @ b.float()).to(out.dtype), rtol=1e-2, atol=1e-1
+            )
+
     def test_transposed_product_stages_the_swapped_pairs_last_tile(self) -> None:
         # helion.inductor's transposed product of a bf16 RC mm, out.T (n x m,
         # column-major) = b.T @ a.T, on the aligned-N 128x112 pair (each CTA
