@@ -8,15 +8,14 @@ from typing import cast
 import pytest
 import torch
 
-from test.test_cute_full_slice_matmul import _bind
-from test.test_cute_materialized_fission import _sources
-
 from helion._compiler.ast_read_writes import dead_assignment_elimination
 from helion._compiler.cute.memory_ops import _pure_epilogue_ancestors
 from helion._compiler.cute.mma_support import CuteMmaSupport
 from helion._compiler.generate_ast import GenerateAST
 from helion._testing import cpu_render_target
 from helion._testing import import_example
+from helion._testing.cute_codegen import bind_full_slice_matmul as _bind
+from helion._testing.cute_codegen import stage_sources as _sources
 from helion._testing.cute_structural_kernels import _se_args
 import helion.language as hl
 from helion.language import memory_ops

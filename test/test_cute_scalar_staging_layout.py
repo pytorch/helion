@@ -3,10 +3,12 @@ from __future__ import annotations
 import pytest
 import torch
 
-from test.test_cute_lowerings import _make_tcgen05_persistent_config
 from test.test_cute_scalar_staging_sync import _native_matmul
 
 from helion._compiler.cute.mma_support import get_cute_mma_support
+from helion._testing.cute_dense_tcgen05 import (
+    make_tcgen05_persistent_config as _make_tcgen05_persistent_config,
+)
 
 CUDA_DEVICE = "cuda"
 

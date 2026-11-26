@@ -31,6 +31,7 @@ from ...program_id import MAX_ACTIVE_CLUSTERS_VAR
 from ...program_id import ForEachProgramID
 from ...program_id import PersistentProgramIDs
 from ...program_id import PIDInfo
+from ...program_id import _bounded_l2_group_width
 from ...program_id import _clone_stmt
 from ...program_id import _prune_dead_side_effect_free_generated_assignments
 from ...program_id import _stmt_name_uses
@@ -1237,34 +1238,19 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
             )
         return coord
 
-    def _tcgen05_linear_virtual_pid_expr(self, work_tile_var: str) -> str:
+    def _tcgen05_linear_virtual_pid_expr(
+        self, work_tile_var: str, count_dtype: str | None
+    ) -> str:
+        slots = [f"{work_tile_var}.tile_idx[{i}]" for i in range(3)]
         plan = self._tcgen05_plan()
         if plan is not None and plan.row_union is not None:
             return self._tcgen05_linear_virtual_pid_from_coords_expr(
-                [f"{work_tile_var}.tile_idx[{i}]" for i in range(3)]
+                slots, count_dtype=count_dtype
             )
-        terms: list[str] = []
-        axes = self._tcgen05_scheduler_axes()
-        split = self._tcgen05_cluster_split_k()
-        for i, _pid in enumerate(self.pid_info):
-            tile_dim = axes.index(i)
-            coord = f"{work_tile_var}.tile_idx[{tile_dim}]"
-            if tile_dim == 0:
-                coord = self._tcgen05_logical_m_coord_expr(coord)
-            elif tile_dim == 1 and split > 1:
-                # Both K splits of a tile decode it (each pair reads its
-                # split from its cluster coordinate, ``cute_mma``).
-                coord = inline_floordiv_nonneg_expr(
-                    coord, f"cutlass.Int32({split})", split
-                )
-            if i == 0:
-                terms.append(coord)
-                continue
-            stride = " * ".join(
-                f"({pid.num_pids_expr(is_device=True)})" for pid in self.pid_info[:i]
-            )
-            terms.append(f"({coord}) * ({stride})")
-        return " + ".join(terms) if terms else "cutlass.Int32(0)"
+        coords, pair_axis = self._tcgen05_mailbox_coord_terms(slots)
+        return self._tcgen05_linear_virtual_pid_from_coords_expr(
+            coords, pair_axis=pair_axis, count_dtype=count_dtype
+        )
 
     def _tcgen05_mailbox_coord_terms(self, slots: list[str]) -> tuple[list[str], int]:
         """Read the scheduler-warp mailbox back as per-PID-axis coordinates.
@@ -1281,7 +1267,7 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         return [slots[axes.index(i)] for i in range(len(self.pid_info))], axes[0]
 
     def _tcgen05_linear_virtual_pid_from_coords_expr(
-        self, coords: list[str], *, pair_axis: int = 0
+        self, coords: list[str], *, count_dtype: str | None, pair_axis: int = 0
     ) -> str:
         """Linearize per-PID-axis scheduler coordinates into the virtual pid.
 
@@ -1289,6 +1275,10 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         whose coordinate counts CtaGroup.TWO CTA slots and is collapsed back
         to the logical tile (``_tcgen05_logical_m_coord_expr``).
         """
+        if count_dtype is not None:
+            # The mailbox transports each coordinate as Int32, but their
+            # flattened product can exceed Int32 even on a legal cluster grid.
+            coords = [f"{count_dtype}({coord})" for coord in coords]
         plan = self._tcgen05_plan()
         if plan is not None and plan.row_union is not None:
             union = plan.row_union
@@ -1341,7 +1331,8 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
                 terms.append(coord)
                 continue
             stride = " * ".join(
-                f"({pid.num_pids_expr(is_device=True)})" for pid in self.pid_info[:i]
+                f"({pid.num_pids_expr(is_device=True, count_dtype=count_dtype)})"
+                for pid in self.pid_info[:i]
             )
             terms.append(f"({coord}) * ({stride})")
         return " + ".join(terms) if terms else "cutlass.Int32(0)"
@@ -1366,13 +1357,9 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
                 return pid.numel
             return DeviceFunction.current().sympy_expr(pid.numel)
 
-        def l2_grouping() -> int:
-            raw = DeviceFunction.current().config.get("l2_groupings", [1])
-            if isinstance(raw, (list, tuple)):
-                return int(str(raw[0])) if raw else 1
-            return int(str(raw))
-
-        l2_group = l2_grouping()
+        l2_group = self.l2_group_size
+        count_dtype = self.grouped_count_dtype(l2_group)
+        integer = count_dtype or "cutlass.Int32"
         cluster_n = self.decode_cluster_n()
 
         def grouped_pair_coords(
@@ -1382,27 +1369,41 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
             axes from their flattened index ``pid``:
             ``L2GroupingProgramIDs.codegen``'s grouped decode (cluster-aware
             under cluster_n > 1), or the plain decomposition."""
-            num_first = first.num_pids_expr(is_device=True)
-            if l2_group > 1 and cluster_n > 1:
+            num_first = first.num_pids_expr(is_device=True, count_dtype=count_dtype)
+            if l2_group <= 1:
+                return f"({pid}) % ({num_first})", f"({pid}) // ({num_first})"
+
+            num_second = second.num_pids_expr(is_device=True, count_dtype=count_dtype)
+            requested_width = min(l2_group, 2**63 - 1)
+            # The consumers group the two fastest PID axes: B/M on a
+            # batched grid, M/N otherwise. Bound before multiplying by the
+            # second count; an enormous group may cover one short first axis.
+            bounded_width = _bounded_l2_group_width(
+                requested_width,
+                num_first,
+                first.static_num_pids(),
+                second.static_num_pids(),
+            )
+            group_width = f"{integer}({bounded_width or requested_width})"
+            if cluster_n > 1:
                 # Mirror ``L2GroupingProgramIDs.codegen``'s cluster-aware box
                 # decode exactly: the predicate must classify tiles by the same
                 # post-remap coordinates the consumer decodes, or grouped PID
                 # order sends fringe tiles down the full-tile TMA-store path.
-                num_second = second.num_pids_expr(is_device=True)
-                lane = f"((({pid}) // ({num_first})) % cutlass.Int32({cluster_n}))"
+                lane = f"((({pid}) // ({num_first})) % {integer}({cluster_n}))"
                 box_pid = (
-                    f"(((({pid}) // ({num_first})) // cutlass.Int32({cluster_n}))"
+                    f"(((({pid}) // ({num_first})) // {integer}({cluster_n}))"
                     f" * ({num_first}) + ({pid}) % ({num_first}))"
                 )
                 num_box = (
-                    f"((({num_second}) + cutlass.Int32({cluster_n - 1}))"
-                    f" // cutlass.Int32({cluster_n}))"
+                    f"((({num_second}) + {integer}({cluster_n - 1}))"
+                    f" // {integer}({cluster_n}))"
                 )
-                num_pid_in_group = f"cutlass.Int32({l2_group}) * ({num_box})"
+                num_pid_in_group = f"{group_width} * ({num_box})"
                 group_id = f"({box_pid}) // ({num_pid_in_group})"
-                first_pid = f"({group_id}) * cutlass.Int32({l2_group})"
+                first_pid = f"({group_id}) * {integer}({requested_width})"
                 group_size = (
-                    f"min(({num_first}) - ({first_pid}), cutlass.Int32({l2_group}))"
+                    f"min(({num_first}) - ({first_pid}), {integer}({requested_width}))"
                 )
                 first_coord = (
                     f"({first_pid}) + "
@@ -1410,24 +1411,20 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
                 )
                 second_coord = (
                     f"(((({box_pid}) % ({num_pid_in_group})) // ({group_size}))"
-                    f" * cutlass.Int32({cluster_n}) + {lane})"
+                    f" * {integer}({cluster_n}) + {lane})"
                 )
                 return first_coord, second_coord
-            if l2_group > 1:
-                num_second = second.num_pids_expr(is_device=True)
-                num_pid_in_group = f"cutlass.Int32({l2_group}) * ({num_second})"
-                group_id = f"({pid}) // ({num_pid_in_group})"
-                first_pid = f"({group_id}) * cutlass.Int32({l2_group})"
-                group_size = (
-                    f"min(({num_first}) - ({first_pid}), cutlass.Int32({l2_group}))"
-                )
-                first_coord = (
-                    f"({first_pid}) + "
-                    f"((({pid}) % ({num_pid_in_group})) % ({group_size}))"
-                )
-                second_coord = f"(({pid}) % ({num_pid_in_group})) // ({group_size})"
-                return first_coord, second_coord
-            return f"({pid}) % ({num_first})", f"({pid}) // ({num_first})"
+            num_pid_in_group = f"{group_width} * ({num_second})"
+            group_id = f"({pid}) // ({num_pid_in_group})"
+            first_pid = f"({group_id}) * {integer}({requested_width})"
+            group_size = (
+                f"min(({num_first}) - ({first_pid}), {integer}({requested_width}))"
+            )
+            first_coord = (
+                f"({first_pid}) + ((({pid}) % ({num_pid_in_group})) % ({group_size}))"
+            )
+            second_coord = f"(({pid}) % ({num_pid_in_group})) // ({group_size})"
+            return first_coord, second_coord
 
         # M and N are the trailing two PID axes (mirrors
         # ``_specialized_mma_root_mn_block_ids``). The consumers' decode works
@@ -1441,12 +1438,12 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         # unguarded auxiliary loads read past the matrix.
         m_pid = self.pid_info[-2]
         n_pid = self.pid_info[-1]
-        virtual_pid = self._tcgen05_linear_virtual_pid_expr(work_tile_var)
+        virtual_pid = self._tcgen05_linear_virtual_pid_expr(work_tile_var, count_dtype)
         if self._tcgen05_batched_grid():
             batch_pid = self.pid_info[0]
             batch_m_tiles = (
-                f"({batch_pid.num_pids_expr(is_device=True)})"
-                f" * ({m_pid.num_pids_expr(is_device=True)})"
+                f"({batch_pid.num_pids_expr(is_device=True, count_dtype=count_dtype)})"
+                f" * ({m_pid.num_pids_expr(is_device=True, count_dtype=count_dtype)})"
             )
             _, m_coord = grouped_pair_coords(
                 f"({virtual_pid}) % ({batch_m_tiles})", batch_pid, m_pid
@@ -1458,11 +1455,8 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         m_extent = pid_numel_expr(m_pid)
         n_extent = pid_numel_expr(n_pid)
         return (
-            f"({m_coord}) * ({m_pid.block_size_var}) "
-            f"+ ({m_pid.block_size_var}) <= ({m_extent}) "
-            "and "
-            f"({n_coord}) * ({n_pid.block_size_var}) "
-            f"+ ({n_pid.block_size_var}) <= ({n_extent})"
+            f"({m_coord}) < (({m_extent}) // ({m_pid.block_size_var})) and "
+            f"({n_coord}) < (({n_extent}) // ({n_pid.block_size_var}))"
         )
 
     def _require_tcgen05_plan(self) -> CuteTcgen05MatmulPlan:
@@ -2460,7 +2454,9 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         )
         coord_terms, pair_axis = self._tcgen05_mailbox_coord_terms(work_tile_coord_vars)
         linear_pid_expr = self._tcgen05_linear_virtual_pid_from_coords_expr(
-            coord_terms, pair_axis=pair_axis
+            coord_terms,
+            pair_axis=pair_axis,
+            count_dtype=self.grouped_count_dtype(self.l2_group_size),
         )
         sched_pipeline_mbars = device_function.new_var("tcgen05_sched_pipeline_mbars")
         sched_pipeline = device_function.new_var("tcgen05_sched_pipeline")
@@ -3097,6 +3093,7 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
                     for i in range(len(self.pid_info))
                 ],
                 pair_axis=axes[0],
+                count_dtype=self.grouped_count_dtype(self.l2_group_size),
             )
 
         per_tile_body: list[ast.stmt] = [
@@ -4199,7 +4196,9 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         ]
         coord_terms, pair_axis = self._tcgen05_mailbox_coord_terms(mailbox_slots)
         linear_pid_expr = self._tcgen05_linear_virtual_pid_from_coords_expr(
-            coord_terms, pair_axis=pair_axis
+            coord_terms,
+            pair_axis=pair_axis,
+            count_dtype=self.grouped_count_dtype(self.l2_group_size),
         )
 
         # Initial wait + valid-flag read happens in the prelude so the
@@ -5659,7 +5658,9 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         ]
         coord_terms, pair_axis = self._tcgen05_mailbox_coord_terms(mailbox_slots)
         linear_pid_expr = self._tcgen05_linear_virtual_pid_from_coords_expr(
-            coord_terms, pair_axis=pair_axis
+            coord_terms,
+            pair_axis=pair_axis,
+            count_dtype=self.grouped_count_dtype(self.l2_group_size),
         )
         sched_coord_0 = coord_terms[0] if len(coord_terms) > 0 else "cutlass.Int32(0)"
         sched_coord_1 = coord_terms[1] if len(coord_terms) > 1 else "cutlass.Int32(0)"

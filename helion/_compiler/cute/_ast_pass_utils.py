@@ -246,6 +246,31 @@ def cutlass_scalar_type(node: ast.AST) -> str | None:
     return path[1]
 
 
+# The side-effect-free scalar callbacks emitted for warp reductions.
+_WARP_COMBINERS = frozenset(
+    ast.dump(ast.parse(f"lambda a, b: {expr}", mode="eval").body)
+    for expr in (
+        "a * b",
+        "a | b",
+        "cute.math.max(a, b, propagate_nan=True)",
+        "cute.math.min(a, b, propagate_nan=True)",
+    )
+)
+
+
+def scalar_warp_combiner(node: ast.AST) -> ast.Lambda | None:
+    """The actual emitted callback, only in its warp-reduction operand."""
+    if (
+        isinstance(node, ast.Call)
+        and call_path_str(node.func) == "cute.arch.warp_reduction"
+        and len(node.args) >= 2
+        and isinstance(combine := node.args[1], ast.Lambda)
+        and ast.dump(combine) in _WARP_COMBINERS
+    ):
+        return combine
+    return None
+
+
 def same_expr(left: ast.AST, right: ast.AST) -> bool:
     """Structural equality ignoring source positions."""
     return ast.dump(left, include_attributes=False) == ast.dump(
@@ -534,7 +559,9 @@ def dealias_shared_nodes(body: list[ast.stmt]) -> None:
     def visit(node: ast.AST) -> None:
         for field, value in ast.iter_fields(node):
             if isinstance(value, list):
-                if id(value) in seen_lists:
+                if type(value) is not list or id(value) in seen_lists:
+                    # FX may put an immutable_list on a call. Do not assign
+                    # to its slots while making each AST occurrence private.
                     value = list(value)
                     setattr(node, field, value)
                 seen_lists.add(id(value))
@@ -1158,6 +1185,13 @@ def _self_addend(stmt: ast.AST, target: str) -> ast.AST | None:
 
 def _canonical_name(name: str, rename_groups: dict[str, str]) -> str:
     return rename_groups.get(name, name)
+
+
+def nontrivial_rename_names(rename_groups: Mapping[str, str]) -> frozenset[str]:
+    """Spellings which a later ast_rename will merge with a different name."""
+    return frozenset(
+        name for old, new in rename_groups.items() if old != new for name in (old, new)
+    )
 
 
 def merged_names(rename_groups: Mapping[str, str]) -> dict[str, frozenset[str]]:

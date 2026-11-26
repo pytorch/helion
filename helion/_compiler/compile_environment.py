@@ -1066,9 +1066,7 @@ class CompileEnvironment:
         # signal-pad clamp is symm-mem-specific and left to
         # restrict_pid_types_for_persistent().
         if settings.autotune_force_persistent:
-            self._disallow_nonpersistent_pid_types(
-                reason="autotune_force_persistent is set"
-            )
+            self.require_persistent(reason="autotune_force_persistent is set")
 
         # TODO(hinriksnaer): tracing flag, not env config. move to CompilerState?
         self.has_barrier: bool = False
@@ -1098,7 +1096,7 @@ class CompileEnvironment:
                 lineno=location.lineno or 0,
             )
 
-    def _disallow_nonpersistent_pid_types(self, reason: str | None = None) -> None:
+    def require_persistent(self, reason: str | None = None) -> None:
         """Restrict the search space to persistent kernels. Idempotent."""
         for pid_type in ("flat", "xyz"):
             self.config_spec.disallow_pid_type(pid_type, reason=reason)
@@ -1139,7 +1137,7 @@ class CompileEnvironment:
         if not uses_symm_mem and not self.has_barrier:
             return
 
-        self._disallow_nonpersistent_pid_types(
+        self.require_persistent(
             reason="a distributed process group is initialized (persistent "
             "kernels required)"
         )

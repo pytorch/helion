@@ -20,17 +20,31 @@ render in ``test_cute_role_local_renders.expected_cute``:
 
 from __future__ import annotations
 
+import ast
+from types import SimpleNamespace
+
+import numpy as np
 import pytest
 import torch
 
 from test.cute_population_contracts import tcgen05_mma_support
 
 import helion
+from helion._compiler.cute.tcgen05_constants import (
+    TCGEN05_ACC_WAIT_PLACEMENT_BEFORE_SUBTILE_LOOP,
+)
+from helion._compiler.cute.tcgen05_constants import (
+    TCGEN05_C_ACQUIRE_PLACEMENT_FIRST_IN_LOOP,
+)
+from helion._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_EDGE_K_TAIL_C_STAGES
 from helion._testing import TestCase
 from helion._testing import cpu_render_target
 from helion._testing import matchesBackends
 from helion._testing import onlyBackends
+from helion._testing import patch_cute_mma_support
 from helion._testing.cute_codegen import cpu_bind
+from helion._testing.cute_dense_tcgen05 import make_bias_residual_gelu_kernel
+from helion._testing.cute_dense_tcgen05 import make_tcgen05_persistent_config
 import helion.language as hl
 
 # Renders on a CPU target: the CPU lane runs them without a GPU.
@@ -246,6 +260,128 @@ class TestRoleLocalRenders(RenderPins):
             MAILBOX_VALID,
             "tcgen05_aux_pipeline = cutlass.pipeline.PipelineTmaAsync.create(",
         )
+
+    def test_scheduler_group_product_can_exceed_int32_on_a_small_grid(self) -> None:
+        # On this 20-by-20 grid, multiplying the requested group by 20 (10
+        # packed) N tiles overflows even Int64. The reached group has 20 rows.
+        kernel = make_bias_residual_gelu_kernel()
+        with torch.device("meta"):
+            args = tuple(
+                torch.empty(shape, dtype=torch.bfloat16)
+                for shape in ((5000, 5000), (5000, 5000), (5000,), (5000, 5000))
+            )
+        with (
+            cpu_render_target(
+                fake_device_sm_count=148,
+                smem_budget_bytes=232448,
+                reduction_smem_budget_bytes=232448,
+            ),
+            patch_cute_mma_support(),
+        ):
+            bound = cpu_bind(kernel, args)
+            for cluster_n in (1, 2):
+                cfg = make_tcgen05_persistent_config(
+                    block_sizes=[256, 256, 128],
+                    l2_groupings=[2**62],
+                    pid_type="persistent_interleaved",
+                    num_warps=4,
+                    tcgen05_cluster_m=2,
+                    tcgen05_cluster_n=cluster_n,
+                    tcgen05_ab_stages=2,
+                    tcgen05_acc_stages=1,
+                    tcgen05_c_stages=TCGEN05_TWO_CTA_EDGE_K_TAIL_C_STAGES,
+                    tcgen05_l2_swizzle_size=1,
+                    tcgen05_acc_wait_placement=TCGEN05_ACC_WAIT_PLACEMENT_BEFORE_SUBTILE_LOOP,
+                    tcgen05_c_acquire_placement=TCGEN05_C_ACQUIRE_PLACEMENT_FIRST_IN_LOOP,
+                    tcgen05_strategy="role_local_with_scheduler",
+                    tcgen05_warp_spec_scheduler_warps=1,
+                    tcgen05_warp_spec_c_input_warps=1,
+                    indexing=["tensor_descriptor"] * bound.config_spec.indexing.length,
+                )
+                program = ast.parse(bound.to_code(cfg))
+                decision = next(
+                    line.value
+                    for line in ast.walk(program)
+                    if isinstance(line, ast.Assign)
+                    and isinstance(line.targets[0], ast.Name)
+                    and line.targets[0].id == "tcgen05_scheduler_warp_full_tile"
+                )
+                check = compile(ast.Expression(decision), "<scheduler-vote>", "eval")
+                work = SimpleNamespace(tile_idx=[])
+                scope = {
+                    "_BLOCK_SIZE_0": 256,
+                    "_BLOCK_SIZE_1": 256,
+                    "cutlass": SimpleNamespace(Int32=np.int32, Int64=np.int64),
+                    "tcgen05_scheduler_warp_work_tile": work,
+                    "min": min,
+                }
+                with np.errstate(over="raise", divide="raise"):
+                    for m in range(20):
+                        for n in range(20):
+                            work.tile_idx = [np.int32(2 * m), np.int32(n), np.int32(0)]
+                            self.assertEqual(
+                                eval(check, {"__builtins__": {}}, scope),
+                                (m + 1) * 256 <= 5000 and (n + 1) * 256 <= 5000,
+                            )
+
+    def test_scheduler_and_mailbox_use_the_same_wide_pid(self) -> None:
+        # The hardware cluster ID fits Int32; flattening its M/N tile can
+        # still overflow. All tensors are metadata-only even at these sizes.
+        cases = (
+            (32768 * 256 - 1, 65538 * 256, 2, 2),
+            (32768 * 256 - 1, 65538 * 256, 1, 2),
+            (2**31 - 1, 512, 1, 1),
+        )
+        types = SimpleNamespace(Int32=np.int32, Int64=np.int64)
+        for m, n, group, cluster_n in cases:
+            with torch.device("meta"):
+                args = _residual_gemm_args(m, n, 128)
+            code = _render(
+                _residual_matmul,
+                args,
+                _config(
+                    **_SCHEDULER_WARP,
+                    **_TWO_CTA,
+                    tcgen05_cluster_n=cluster_n,
+                    tcgen05_acc_stages=1,
+                    tcgen05_warp_spec_c_input_warps=1,
+                    l2_groupings=[group],
+                ),
+            )
+            values = {
+                line.targets[0].id: line.value
+                for line in ast.walk(ast.parse(code))
+                if isinstance(line, ast.Assign)
+                and isinstance(line.targets[0], ast.Name)
+                and line.targets[0].id in ("virtual_pid", SCHEDULER_WARP_FULL_TILE)
+            }
+            mailbox = compile(
+                ast.Expression(values["virtual_pid"]), "<mailbox>", "eval"
+            )
+            full = compile(
+                ast.Expression(values[SCHEDULER_WARP_FULL_TILE]), "<full-tile>", "eval"
+            )
+            if cluster_n == 2:
+                probes = ((0, 65536, 2**31, True),)
+            else:
+                last = m // 256
+                probes = ((last - 1, 0, last - 1, True), (last, 0, last, False))
+            for row, col, pid, is_full in probes:
+                slots = tuple(map(np.int32, (2 * row, col, 0)))
+                scope = {
+                    "cutlass": types,
+                    "_BLOCK_SIZE_0": 256,
+                    "_BLOCK_SIZE_1": 256,
+                    "tcgen05_work_tile_smem": slots,
+                    "tcgen05_scheduler_warp_work_tile": SimpleNamespace(tile_idx=slots),
+                    "min": min,
+                }
+                with (
+                    self.subTest(m=m, n=n, group=group, coord=slots),
+                    np.errstate(over="raise", divide="raise"),
+                ):
+                    self.assertEqual(eval(mailbox, {"__builtins__": {}}, scope), pid)
+                    self.assertEqual(eval(full, {"__builtins__": {}}, scope), is_full)
 
     def test_full_edge_scheduler_split(self) -> None:
         # Output edges with a TMA store for full tiles only: the scheduler warp

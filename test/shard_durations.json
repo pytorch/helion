@@ -341,6 +341,7 @@
  "test/test_cute_single_thread_reduction.py": 16.2,
  "test/test_cute_single_token_rank1_recurrence.py": 32.5,
  "test/test_cute_singleton_reductions.py": 13.0,
+ "test/test_cute_size_derived_range.py": 0.7,
  "test/test_cute_slice_indexing.py": 3.1,
  "test/test_cute_slice_resolver.py": 12.5,
  "test/test_cute_softmax_perf.py": 13.4,

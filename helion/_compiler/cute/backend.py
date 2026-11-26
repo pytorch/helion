@@ -1699,10 +1699,9 @@ class CuteBackend(Backend):
         return True
 
     def barrier_allows_pid_type(self, pid_type: str) -> bool:
-        # CuTe launches the phases in order with ``pid_type="flat"``;
-        # DeviceIR keeps ``flat`` only once it has proved those launches
-        # (``ordered_phases_supported``).
-        return pid_type == "flat"
+        # Flat phases require independent ordered launches. An interleaved
+        # persistent grid instead reassigns workers after each grid barrier.
+        return pid_type in ("flat", "persistent_interleaved")
 
     def local_fetch_add_fake_shape(
         self, target: torch.Tensor, index: list[object]
@@ -2762,6 +2761,15 @@ class CuteBackend(Backend):
         # The final body, the spread pad included: a kernel whose shared
         # memory cannot fit one block fails here, not in libNVVM.
         check_smem_budget(fn_def, ctx.constexpr_values, fn.pid)
+        wide_loops = fn.cute_state.lanes.wide_pid_loops
+        if wide_loops:
+            for node in ast.walk(fn_def):
+                if (
+                    isinstance(node, ast.For)
+                    and isinstance(node.target, ast.Name)
+                    and node.target.id in wide_loops
+                ):
+                    self._lower_wide_pid_loop(node, fn)
         # Inspect the kernel before outlining moves its joins into a helper.
         statements = launch_attributes.module_statements(fn, fn_def)
         # One body per cluster shape sharing that shared memory
@@ -4233,14 +4241,157 @@ class CuteBackend(Backend):
         begin: str | None,
         end: str,
         step: str | None,
-    ) -> str | None:
-        range_args = []
-        if begin is not None:
-            range_args.append(f"cutlass.Int32({begin})")
-        range_args.append(f"cutlass.Int32({end})")
+    ) -> str:
+        return self._typed_range_str(begin, end, step, "cutlass.Int32")
+
+    def pid_extent_expr(self, expr: str, dtype: str) -> str:
+        """Evaluate integer extent arithmetic in the scheduling type, including end - begin.
+
+        Leaves are already-typed bounds (e.g. a scalar tensor load); converting a
+        subscript's value must not change how its independent address is computed.
+        Constants alongside a converted operand retain the SDK's literal folding.
+        """
+
+        cast_type = ast.parse(dtype, mode="eval").body
+
+        def widen(node: ast.expr) -> ast.expr:
+            if isinstance(node, ast.BinOp):
+                node.left, node.right = widen(node.left), widen(node.right)
+            elif isinstance(node, ast.UnaryOp) and isinstance(
+                node.op, (ast.UAdd, ast.USub)
+            ):
+                node.operand = widen(node.operand)
+            elif (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id in {"max", "min", "abs", "_cute_python_mod"}
+            ):
+                node.args = [widen(arg) for arg in node.args]
+            elif not (isinstance(node, ast.Constant) and isinstance(node.value, int)):
+                return ast.Call(cast_type, [node], [])
+            return node
+
+        root = ast.parse(expr, mode="eval").body
+        if isinstance(root, ast.Constant):
+            return self.cast_expr(expr, dtype)
+        return ast.unparse(widen(root))
+
+    def wide_cumulative_program_ids(self, counts: list[str], *, blocked: bool) -> bool:
+        # Tensor address width is selected from individual inputs. Distinct
+        # roots can have more program IDs in aggregate even if every tensor
+        # fits in Int32. Unknown counts must cover that case too.
+        if not counts:
+            return False
+        if not all(s.isdigit() for s in counts):
+            # Dynamic specializations may serve larger extents than the bind
+            # example. The device can also load a count unavailable to the host.
+            return True
+        total = sum(map(int, counts))
+        # A blocked worker's exclusive endpoint may exceed the true total by
+        # almost one grid. If grid <= total the padded end is less than twice
+        # total, otherwise each worker handles at most one legal grid index.
+        return total >= (2**30 if blocked else 2**31)
+
+    def persistent_program_loop(
+        self, loop: ast.For, device_function: DeviceFunction
+    ) -> ast.For:
+        # The SDK rewrites a strided range to max(trips, 0). Its literal
+        # zero is Int32, which cannot join an Int64 dynamic trip count.
+        # Its single-argument range lowers directly to a typed induction.
+        if not (
+            isinstance(loop.iter, ast.Call)
+            and len(loop.iter.args) in (2, 3)
+            and all(
+                isinstance(arg, ast.Call) and ast.unparse(arg.func) == "cutlass.Int64"
+                for arg in loop.iter.args
+            )
+        ):
+            return loop
+        assert isinstance(loop.target, ast.Name)
+        device_function.cute_state.lanes.wide_pid_loops.add(loop.target.id)
+        return loop
+
+    @staticmethod
+    def _lower_wide_pid_loop(loop: ast.For, device_function: DeviceFunction) -> None:
+        # Passes can narrow or remove loops. Only a surviving original
+        # multi-bound Int64 range needs the SDK's relative induction.
+        if not (
+            isinstance(loop.iter, ast.Call)
+            and isinstance(loop.iter.func, ast.Name)
+            and loop.iter.func.id == "range"
+            and len(loop.iter.args) in (2, 3)
+            and all(
+                isinstance(arg, ast.Call) and ast.unparse(arg.func) == "cutlass.Int64"
+                for arg in loop.iter.args
+            )
+        ):
+            return
+        begin, stop, *steps = map(ast.unparse, loop.iter.args)
+        if begin == "cutlass.Int64(0)" and not steps:
+            loop.iter.args = [loop.iter.args[1]]
+            return
+        step = steps[0] if steps else "cutlass.Int64(1)"
+        delta = f"(({stop}) - ({begin}))"
+        # No overrun by the last stride: compute the relative count with
+        # division and remainder, before reconstructing only valid IDs.
+        trips = f"(({delta}) // ({step}) + cutlass.Int64(({delta}) % ({step}) != 0))"
+        assert isinstance(loop.target, ast.Name)
+        relative = device_function.new_var("program_iteration")
+        absolute = loop.target.id
+        loop.target.id = relative
+        loop.iter = ast.parse(
+            f"range(cutlass.Int64(({delta}) > 0) * {trips})", mode="eval"
+        ).body
+        loop.body.insert(
+            0, statement_from_string(f"{absolute} = {begin} + {relative} * {step}")
+        )
+
+    def program_id_range_str(
+        self, begin: str | None, end: str, step: str | None
+    ) -> str:
+        from ..compile_environment import CompileEnvironment
+
+        # A persistent loop carries the absolute program ID into its
+        # dispatch tree. Its bounds and induction must match the phase offsets.
+        from ..device_function import DeviceFunction
+        from ..program_id import ForEachProgramID
+        from ..program_id import L2GroupingProgramIDs
+        from ..program_id import PersistentProgramIDs
+
+        env = CompileEnvironment.current()
+        pid = DeviceFunction.current().pid
+        if isinstance(pid, L2GroupingProgramIDs) and pid.parent_strategy is not None:
+            pid = pid.parent_strategy
+        dtype = env.index_type()
+        if isinstance(pid, ForEachProgramID):
+            counts = [case.total_pids_expr(is_device=True) for case in pid.cases]
+            dtype = pid.device_pid_type(counts)
+            if step is not None and all(c.isdigit() for c in counts):
+                # The same-phase shared strategy also emits a strided loop.
+                if self.wide_cumulative_program_ids(counts, blocked=True):
+                    dtype = self.dtype_str(torch.int64)
+                elif counts:
+                    step = f"min({step}, {max(1, sum(map(int, counts)))})"
+        elif isinstance(pid, PersistentProgramIDs):
+            total = pid.total_pids_expr(is_device=True)
+            # The last positive stride must fit too. Once the total stays
+            # below 2**30, a stride capped to total cannot cross INT32_MAX.
+            # For an overprovisioned grid this changes no productive worker:
+            # every such worker already executes exactly one iteration.
+            if self.wide_cumulative_program_ids([total], blocked=True):
+                dtype = self.dtype_str(torch.int64)
+            elif not pid.is_blocked and step is not None and total.isdigit():
+                step = f"min({step}, {max(1, int(total))})"
+        return self._typed_range_str(begin, end, step, dtype)
+
+    @staticmethod
+    def _typed_range_str(
+        begin: str | None, end: str, step: str | None, dtype: str
+    ) -> str:
+        args = [arg for arg in (begin, end) if arg is not None]
         if step is not None and step != "1":
-            range_args.append(f"cutlass.Int32({step})")
-        return f"range({', '.join(range_args)})"
+            args.append(step)
+        return f"range({', '.join(f'{dtype}({arg})' for arg in args)})"
 
     def device_error_stmt(self, message: str) -> str:
         return (
@@ -4250,10 +4401,9 @@ class CuteBackend(Backend):
         )
 
     def persistent_range_str(self, begin: str, end: str, step: str | None) -> str:
-        # Let the DSL promote the operands to the type of the scheduler bound.
-        # An explicit Int32 cast on the upper bound would turn 2**31 negative.
-        args = [begin, end] if step is None else [begin, end, step]
-        return f"range({', '.join(args)})"
+        # The scheduler requests this hook for a wide count. Mark all
+        # operands so persistent_program_loop also lowers this range safely.
+        return self._typed_range_str(begin, end, step, self.dtype_str(torch.int64))
 
     def arange_expr(
         self,

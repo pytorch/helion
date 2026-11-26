@@ -23,7 +23,8 @@ import math
 from typing import TYPE_CHECKING
 from typing import cast
 
-from .simplify_proven_bounds import _assigned_names
+from ..ast_read_writes import binding_names
+from ..ast_read_writes import target_names
 from .simplify_proven_bounds import _axis_index
 from .simplify_proven_bounds import _call_path
 from .simplify_proven_bounds import _checked_interval
@@ -132,6 +133,8 @@ class _Proof:
     # Also prove ``operator.lt``-style comparisons and replace the reads of
     # names bound to a proven predicate (``_Context.truths``).
     propagate_truths: bool = False
+    # These aliases coalesce only after this pass; never infer their value.
+    opaque_names: frozenset[str] = frozenset()
 
     def symbol(self, key: object, low: int, high: int) -> _Form:
         symbol = self.symbols.setdefault(key, len(self.symbols))
@@ -149,7 +152,7 @@ class _Proof:
                 return _Value(node.value, node.value, _Form(node.value))
             return None
         if isinstance(node, ast.Name):
-            return context.values.get(node.id)
+            return None if node.id in self.opaque_names else context.values.get(node.id)
         axis = _axis_index(node, "thread_idx")
         if axis is not None:
             if self.threads is None:
@@ -354,7 +357,11 @@ class _Proof:
 
             def visit_Name(self, node: ast.Name) -> ast.AST:
                 # ``truths`` is empty without ``propagate_truths``.
-                if isinstance(node.ctx, ast.Load) and node.id in context.truths:
+                if (
+                    isinstance(node.ctx, ast.Load)
+                    and node.id not in proof.opaque_names
+                    and node.id in context.truths
+                ):
                     proof.changed += 1
                     return ast.copy_location(ast.Constant(value=True), node)
                 return node
@@ -401,12 +408,12 @@ class _Proof:
                     # Tuple results (for example packed arithmetic) need no
                     # interval inference, but every rebound name must forget
                     # its previous proof before subsequent predicates are read.
-                    for target in _assigned_names(statement.targets[0]):
+                    for target in target_names(statement.targets[0]):
                         context.forget(target)
             elif isinstance(statement, ast.For):
                 induction = self.loop_value(statement, context)
                 local = context.copy()
-                for name in _assigned_names(statement):
+                for name in binding_names(statement):
                     local.forget(name)
                 if induction is not None:
                     value, symbol, upper = induction
@@ -414,7 +421,7 @@ class _Proof:
                     local.values[statement.target.id] = value
                     local.upper[symbol] = upper
                 statement.body = self.block(statement.body, local)
-                for name in _assigned_names(statement):
+                for name in binding_names(statement):
                     context.forget(name)
                 statement.orelse = self.block(statement.orelse, context.copy())
             elif isinstance(statement, ast.If):
@@ -428,16 +435,16 @@ class _Proof:
                     continue
                 statement.body = self.block(statement.body, context.copy())
                 statement.orelse = self.block(statement.orelse, context.copy())
-                for name in _assigned_names(statement):
+                for name in binding_names(statement):
                     context.forget(name)
             elif isinstance(statement, ast.With):
                 local = context.copy()
                 for item in statement.items:
                     if item.optional_vars is not None:
-                        for name in _assigned_names(item.optional_vars):
+                        for name in target_names(item.optional_vars):
                             local.forget(name)
                 statement.body = self.block(statement.body, local)
-                for name in _assigned_names(statement):
+                for name in binding_names(statement):
                     context.forget(name)
             elif isinstance(statement, ast.Expr):
                 statement.value = self.expression(statement.value, context)
@@ -488,6 +495,7 @@ def simplify_proven_loop_bounds(
     constexpr_values: dict[str, int],
     block_grid_dims: tuple[int, int, int] | None = None,
     propagate_truths: bool = False,
+    opaque_names: frozenset[str] = frozenset(),
 ) -> list[ast.stmt]:
     """Keep unknown arithmetic, partial tiles, and all memory-derived bounds.
 
@@ -517,7 +525,7 @@ def simplify_proven_loop_bounds(
     ):
         return body
     module = ast.Module(body=body, type_ignores=[])
-    if _assigned_names(module) & (set(constexpr_values) | {"cutlass", "cute", "range"}):
+    if binding_names(module) & (set(constexpr_values) | {"cutlass", "cute", "range"}):
         return body
     if not supported_statements(body, with_blocks=True) or any(
         isinstance(
@@ -538,7 +546,10 @@ def simplify_proven_loop_bounds(
     ):
         return body
     proof = _Proof(
-        thread_block_dims, block_grid_dims, propagate_truths=propagate_truths
+        thread_block_dims,
+        block_grid_dims,
+        propagate_truths=propagate_truths,
+        opaque_names=opaque_names,
     )
     context = _Context(
         {

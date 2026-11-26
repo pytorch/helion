@@ -1303,10 +1303,12 @@ def test_tensor_bound_root_checks_step_only_for_live_blocks(tmp_path):
     with patch.object(helion.runtime, "get_num_sm", return_value=1):
         wrapper(x, out, limit, 0, _launcher=capture)
     device = next(n for n in ast.parse(source).body if isinstance(n, ast.FunctionDef))
-    virtual_pid_loop = next(
-        n
-        for n in ast.walk(device)
-        if isinstance(n, ast.For) and ast.unparse(n.target) == "virtual_pid"
+    # A wide persistent launch may reconstruct virtual_pid from a relative
+    # induction variable. The device's active tile loop still owns the check.
+    (virtual_pid_loop,) = (s for s in device.body if isinstance(s, ast.For))
+    assert any(
+        isinstance(n, ast.Name) and n.id == "fragment_host_step"
+        for n in ast.walk(virtual_pid_loop)
     )
     assert "trap;" in ast.unparse(virtual_pid_loop)
 

@@ -14,9 +14,11 @@ from helion._testing import DEVICE
 from helion._testing.split_reduction_kernels import SPLIT_CONFIG
 from helion._testing.split_reduction_kernels import split_column_sums
 from helion._testing.split_reduction_kernels import split_column_sums_reference
+from helion._testing.tail_peel_kernels import PHASE_CONFIG
 from helion._testing.tail_peel_kernels import STATS_CONFIG
 from helion._testing.tail_peel_kernels import online_softmax_stats
 from helion._testing.tail_peel_kernels import padded_rows
+from helion._testing.tail_peel_kernels import phased_tail_rows
 
 
 @pytest.mark.parametrize("pid_type", ["flat", "persistent_blocked"])
@@ -118,3 +120,17 @@ def test_unmasked_sunk_tiles_sum_the_same_rows(
     )
     assert torch.equal(total_on.view(torch.int32), total_off.view(torch.int32))
     torch.testing.assert_close(dot_on, dot_off, rtol=1e-5, atol=1e-4)
+
+
+@pytest.mark.parametrize("pid_type", ["persistent_interleaved", "persistent_blocked"])
+def test_phased_tail_reduces_partial_rows_before_the_barrier(pid_type: str) -> None:
+    # Signed integer BF16 values have an exact FP32 sum. Poison the backing
+    # padding so an unmasked final packet cannot silently add padded values.
+    backing = torch.randint(-4, 5, (8, 1008), device=DEVICE).to(torch.bfloat16)
+    backing[:, 1003:] = float("nan")
+    rows = backing[:, :1003]
+    config = helion.Config(**PHASE_CONFIG, pid_type=pid_type, cute_tail_peel=True)
+    bound = phased_tail_rows.bind((rows,))
+    assert "tail_packet =" in bound.to_code(bound.config_spec.normalized_config(config))
+    actual = bound.compile_config(config)(rows)
+    torch.testing.assert_close(actual, rows.float().sum(1) + 1, atol=0, rtol=0)

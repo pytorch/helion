@@ -12,9 +12,57 @@ from .ast_scoped_rename import rename as _scoped_rename
 
 if TYPE_CHECKING:
     from collections.abc import Callable
+    from collections.abc import Iterator
     from collections.abc import Mapping
 
     _A = TypeVar("_A", bound=ast.AST)
+
+
+def target_leaves(target: ast.AST) -> Iterator[ast.AST]:
+    """The actual lvalues, without their unpacking syntax."""
+    if isinstance(target, (ast.Tuple, ast.List)):
+        for elt in target.elts:
+            yield from target_leaves(elt)
+    elif isinstance(target, ast.Starred):
+        yield from target_leaves(target.value)
+    else:
+        yield target
+
+
+def target_names(target: ast.AST) -> set[str]:
+    """Names an assignment target binds; a subscript or attribute binds none."""
+    return {leaf.id for leaf in target_leaves(target) if isinstance(leaf, ast.Name)}
+
+
+def binding_field(node: ast.AST) -> str | None:
+    """Which child field is an lvalue, even if a generated target has Load context."""
+    if isinstance(node, (ast.Assign, ast.Delete)):
+        return "targets"
+    if isinstance(node, (ast.For, ast.AugAssign, ast.AnnAssign, ast.NamedExpr)):
+        return "target"
+    if isinstance(node, ast.withitem):
+        return "optional_vars"
+    return None
+
+
+def binding_targets(node: ast.AST) -> Iterator[ast.AST]:
+    """The lvalues bound directly by this statement, after unpacking."""
+    field = binding_field(node)
+    if field is not None:
+        targets = getattr(node, field)
+        for target in targets if isinstance(targets, list) else (targets,):
+            if target is not None:
+                yield from target_leaves(target)
+
+
+def binding_names(node: ast.AST) -> set[str]:
+    """Bindings in generated code, including targets without Store context."""
+    result: set[str] = set()
+    for child in ast.walk(node):
+        if isinstance(child, ast.Name) and isinstance(child.ctx, (ast.Store, ast.Del)):
+            result.add(child.id)
+        result.update(t.id for t in binding_targets(child) if isinstance(t, ast.Name))
+    return result
 
 
 HELION_LANE_LOOP_VAR_ATTR = "_helion_lane_loop_var"

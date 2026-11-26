@@ -35,6 +35,7 @@ from helion._compiler.program_id import FlatProgramIDs
 from helion._compiler.program_id import PIDInfo
 from helion._testing import cpu_render_target
 from helion._testing import import_example
+from helion._testing.cute_codegen import cpu_pid_codegen
 from helion.exc import BackendUnsupported
 from helion.exc import InvalidConfig
 
@@ -240,6 +241,7 @@ def test_steady_producer_has_only_remaining_packets(case):
 
 
 @pytest.mark.parametrize("order", list(itertools.permutations((17, 23, 31))))
+@cpu_pid_codegen()
 def test_linear_records_preserve_all_semantic_pid_orders(order):
     groups, m, n = 16, 10240, 1024
     rows = (m + 191) // 192
@@ -259,10 +261,11 @@ def test_linear_records_preserve_all_semantic_pid_orders(order):
         # (no fallback cluster: ``tcgen05_fallback_cluster``)
         _tcgen05_fallback_cluster=lambda: False,
         _tcgen05_logical_m_coord_expr=lambda value: f"({value}) // 2",
+        grouped_count_dtype=axis_decoder.grouped_count_dtype,
     )
     expression = (
         Tcgen05PersistentProgramIDs._tcgen05_linear_virtual_pid_from_coords_expr(
-            strategy, ["unused_m", "unused_n", "record"]
+            strategy, ["unused_m", "unused_n", "record"], count_dtype=None
         )
     )
     if order == (17, 23, 31):
@@ -286,7 +289,7 @@ def test_linear_records_preserve_all_semantic_pid_orders(order):
     for record in range(rows * (n // 256)):
         scope: dict[str, Any] = {
             "record": record,
-            "cutlass": SimpleNamespace(Int32=int),
+            "cutlass": SimpleNamespace(Int32=int, Int64=int),
         }
         exec(code, scope)
         assert (scope["pid_17"], scope["pid_23"], scope["pid_31"]) == (

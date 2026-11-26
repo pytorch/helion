@@ -728,6 +728,7 @@ def _peel_vector_tails(s: _DeviceBodyState) -> None:
         tensor_facts=tensor_facts(s.fn),
         new_var=s.ctx.new_var,
         persistent_loop=persistent_loop(s.fn.pid),
+        rename_groups=s.ctx.rename_groups,
         # The launch's block grid where every extent is proven: a static
         # flat launch's, or an XYZ launch's, whose extents are static or
         # input sizes the cache key fixes (``_block_grid_dims``).
@@ -1215,6 +1216,7 @@ _cluster_warp_online = _config_flag("cute_cluster_warp_online")
 
 
 def _peel_partial_chunks(s: _DeviceBodyState) -> None:
+    from .._ast_pass_utils import nontrivial_rename_names
     from ..peel_partial_chunks import peel_partial_chunks
     from ..vector_reduction_packets import rolled_sums_split_after
 
@@ -1222,6 +1224,7 @@ def _peel_partial_chunks(s: _DeviceBodyState) -> None:
     s.kernel_body = peel_partial_chunks(
         body,
         s.ctx.constexpr_values,
+        opaque_names=nontrivial_rename_names(s.ctx.rename_groups),
         # The rolled sums ``split_rolled_vector_sums`` splits, which it
         # finds in the body the bounds proofs leave.
         keep_whole=rolled_sums_split_after(
@@ -1240,6 +1243,7 @@ def _proven_loop_bounds(s: _DeviceBodyState, body: list[ast.stmt]) -> list[ast.s
     """``body`` after ``simplify_proven_loop_bounds`` with the kernel's facts."""
     from ...program_id import FlatProgramIDs
     from ...program_id import XYZProgramIDs
+    from .._ast_pass_utils import nontrivial_rename_names
     from ..proven_loop_bounds import exact_static_grid
     from ..proven_loop_bounds import simplify_proven_loop_bounds
 
@@ -1267,6 +1271,7 @@ def _proven_loop_bounds(s: _DeviceBodyState, body: list[ast.stmt]) -> list[ast.s
         thread_block_dims=ctx.exact_thread_block_dims,
         constexpr_values=ctx.constexpr_values,
         block_grid_dims=collective_grid,
+        opaque_names=nontrivial_rename_names(ctx.rename_groups),
     )
 
 

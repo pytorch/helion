@@ -1,6 +1,7 @@
 """Kernels and configs shared by the ``cute_tail_peel`` tests: the online
 softmax statistics of a bf16 row whose length is not a multiple of the tile
-(better-benchmark's cross-entropy stats, at test sizes)."""
+(better-benchmark's cross-entropy stats, at test sizes), and a persistent
+row sum followed by a dependent update across a barrier."""
 
 from __future__ import annotations
 
@@ -53,3 +54,27 @@ def padded_rows(
     logits)."""
     stride = -(-vocab // pad) * pad
     return torch.randn(rows, stride, device=device, dtype=torch.bfloat16)[:, :vocab]
+
+
+# One warp reduces the partial row; the second phase updates the scalar.
+PHASE_CONFIG = {
+    "block_sizes": [1, 256, 1],
+    "num_threads": [1, 32, 1],
+    "cute_vector_widths": [8, 8, 1],
+}
+
+
+@helion.kernel(backend="cute", static_shapes=True)
+def phased_tail_rows(x: torch.Tensor) -> torch.Tensor:
+    """Sum each row up to its logical end, then add one in a later phase."""
+    rows, cols = x.shape
+    out = torch.empty((rows,), device=x.device, dtype=torch.float32)
+    for i in hl.tile(rows):
+        acc = hl.zeros([i], dtype=torch.float32)
+        for j in hl.tile(cols):
+            acc = acc + x[i, j].to(torch.float32).sum(-1)
+        out[i] = acc
+    hl.barrier()
+    for i in hl.tile(rows):
+        out[i] = out[i] + 1
+    return out

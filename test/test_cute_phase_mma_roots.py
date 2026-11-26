@@ -29,8 +29,6 @@ import torch
 from test._cute_se_bwd_chains import se_bwd_da_chain
 from test._cute_se_bwd_chains import se_bwd_dx_chain
 from test.cute_population_contracts import with_flat_min_blocks_default
-from test.test_cute_full_slice_matmul import _bind
-from test.test_cute_materialized_fission import _sources
 
 import helion
 from helion._compiler.cute.autotune.heuristics.cute import CuteCollectiveMatmulHeuristic
@@ -48,6 +46,8 @@ from helion._compiler.cute.tcgen05_config import seeds
 from helion._compiler.cute.tcgen05_config import surface
 from helion._testing import cpu_render_target
 from helion._testing import import_example
+from helion._testing.cute_codegen import bind_full_slice_matmul as _bind
+from helion._testing.cute_codegen import stage_sources as _sources
 from helion._testing.cute_structural_kernels import _se_args
 from helion.autotuner.config_fragment import EnumFragment
 from helion.autotuner.config_fragment import IntegerFragment

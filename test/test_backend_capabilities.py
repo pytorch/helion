@@ -91,7 +91,8 @@ class TestCapabilityHooks(unittest.TestCase):
                 for pid_type in ("flat", "xyz", "persistent_interleaved"):
                     self.assertEqual(
                         backend.barrier_allows_pid_type(pid_type),
-                        pid_type == "flat" and name == "cute",
+                        pid_type in ("flat", "persistent_interleaved")
+                        and name == "cute",
                     )
                 self.assertEqual(backend.supports_augmented_assign, name != "cute")
                 self.assertEqual(backend.folds_static_program_counts, name == "cute")

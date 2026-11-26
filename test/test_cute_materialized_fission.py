@@ -3,11 +3,9 @@ from __future__ import annotations
 import ast
 import hashlib
 import inspect
-import operator
 import sys
 from types import SimpleNamespace
 from typing import TYPE_CHECKING
-from typing import cast
 from unittest.mock import Mock
 from unittest.mock import patch
 
@@ -26,9 +24,11 @@ from helion._compiler.cute.target_facts import TargetFacts
 from helion._compiler.device_ir import ForLoopGraphInfo
 from helion._testing import cpu_render_target
 from helion._testing import import_example
+from helion._testing.cute_codegen import _HostModules
 from helion._testing.cute_codegen import compile_reference
 from helion._testing.cute_codegen import reference_host_function
 from helion._testing.cute_codegen import run_cpu_reference
+from helion._testing.cute_codegen import stage_sources as _sources
 from helion._testing.cute_structural_kernels import _se_args
 from helion.autotuner.config_generation import ConfigGeneration
 from helion.autotuner.precompile_future import SerializedCompiledFunction
@@ -434,74 +434,6 @@ def _bind(
     )(kernel.fn)
     with _cpu_target():
         return kernel._bind_isolated(tuple(args))
-
-
-def _sources(source: str) -> list[str]:
-    module = ast.parse(source)
-    return [
-        cast("str", node.value)
-        for stmt in module.body
-        if isinstance(stmt, ast.Assign)
-        and isinstance(stmt.value, ast.Call)
-        and isinstance(stmt.value.func, ast.Attribute)
-        and stmt.value.func.attr == "load"
-        for node in stmt.value.args
-        if isinstance(node, ast.Constant) and isinstance(node.value, str)
-    ]
-
-
-class _HostModules:
-    """Load actual generated host code, replacing device functions with tokens."""
-
-    def __init__(self) -> None:
-        self.sources: list[str] = []
-        self.markers: list[SimpleNamespace] = []
-
-    def load(self, source: str, extra: str = "") -> SimpleNamespace:
-        self.sources.append(source)
-        module = ast.parse(source)
-        namespace: dict[str, object] = {
-            "torch": torch,
-            "operator": operator,
-            "_default_cute_launcher": None,
-            "PyCodeCache": self,
-            "__file__": "<cpu-fission-test>",
-        }
-        stage_hosts = [
-            stmt
-            for stmt in module.body
-            if isinstance(stmt, ast.FunctionDef)
-            and "__region_" in stmt.name
-            and not stmt.name.startswith("_helion_")
-        ]
-        if stage_hosts:
-            assert len(stage_hosts) == 1
-            host = stage_hosts[0]
-            marker = SimpleNamespace(index=len(self.markers))
-            self.markers.append(marker)
-            namespace[f"_helion_{host.name}"] = marker
-            statements = [host]
-        else:
-            statements = [
-                stmt
-                for stmt in module.body
-                if not isinstance(stmt, (ast.Import, ast.ImportFrom))
-            ]
-        statements.insert(
-            0,
-            ast.ImportFrom(
-                module="__future__", names=[ast.alias(name="annotations")], level=0
-            ),
-        )
-        exec(
-            compile(
-                ast.fix_missing_locations(ast.Module(body=statements, type_ignores=[])),
-                "<cpu-fission-test>",
-                "exec",
-            ),
-            namespace,
-        )
-        return SimpleNamespace(**namespace)
 
 
 def _run_reference(

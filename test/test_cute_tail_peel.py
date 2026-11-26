@@ -24,13 +24,17 @@ from helion._compiler.cute.autotune.heuristics import register_tail_peel_coverag
 from helion._compiler.cute.peel_vector_tails import TensorFacts
 from helion._compiler.cute.peel_vector_tails import _Packetizer
 from helion._compiler.cute.peel_vector_tails import peel_vector_tails
+from helion._compiler.program_id import ForEachProgramID
+from helion._compiler.program_id import PersistentPhase
 from helion._testing import cpu_render_target
 from helion._testing.cute_codegen import cpu_bind
 from helion._testing.split_reduction_kernels import SPLIT_CONFIG
 from helion._testing.split_reduction_kernels import split_column_sums
+from helion._testing.tail_peel_kernels import PHASE_CONFIG
 from helion._testing.tail_peel_kernels import STATS_CONFIG
 from helion._testing.tail_peel_kernels import online_softmax_stats
 from helion._testing.tail_peel_kernels import padded_rows
+from helion._testing.tail_peel_kernels import phased_tail_rows
 from helion.autotuner.config_generation import ConfigGeneration
 import helion.language as hl
 
@@ -208,6 +212,24 @@ def test_a_persistent_launch_splits_the_loops_of_each_program_id(pid_type: str) 
     assert code != _code(logits, pid_type=pid_type)
 
 
+@pytest.mark.parametrize("pid_type", ["persistent_interleaved", "persistent_blocked"])
+def test_phase_dispatch_peels_the_complete_tiles_only(pid_type: str) -> None:
+    with cpu_render_target():
+        bound = cpu_bind(phased_tail_rows, (padded_rows(4, 1003, "cpu"),))
+        configs = [
+            helion.Config(**PHASE_CONFIG, pid_type=pid_type, cute_tail_peel=peel)
+            for peel in (False, True)
+        ]
+        stock, peeled = [
+            bound.to_code(bound.config_spec.normalized_config(cfg)) for cfg in configs
+        ]
+    assert "tail_packet =" not in stock
+    assert "tail_packet =" in peeled
+    bounds = _vocab_loops(peeled)
+    assert any("cutlass.Int32(0), cutlass.Int32(768)" in b for b in bounds)
+    assert any("cutlass.Int32(768), cutlass.Int32(1003)" in b for b in bounds)
+
+
 _FACTS = {
     name: TensorFacts(
         dtype="cutlass.BFloat16",
@@ -225,7 +247,14 @@ _LOAD = (
 )
 
 
-def _packets(*body: str, before: tuple[str, ...] = ()) -> int:
+def _packets(
+    *body: str,
+    before: tuple[str, ...] = (),
+    load_targets: bool = False,
+    renamed: frozenset[str] = frozenset(),
+    width: str = "8",
+    constexpr: dict[str, int] | None = None,
+) -> int:
     """The packets the complete tiles' lane loop gets, its lane offset bound
     first, then the statements ``before``, then in the lane loop the lane
     index, the true mask and ``body``."""
@@ -243,9 +272,23 @@ def _packets(*body: str, before: tuple[str, ...] = ()) -> int:
     )
     names = iter(range(100))
     packetizer = _Packetizer(
-        _FACTS, {"tile_offset_1": 256}, {}, lambda name: f"{name}_{next(names)}"
+        _FACTS,
+        {"tile_offset_1": 256},
+        constexpr or {},
+        lambda name: f"{name}_{next(names)}",
+        renamed,
     )
-    packetizer.block(ast.parse(source).body)
+    parsed = ast.parse(
+        source.replace("range_constexpr(8)", f"range_constexpr({width})")
+    )
+    if load_targets:
+        # A generated target need not carry its Python parser context.
+        for statement in ast.walk(parsed):
+            if isinstance(statement, ast.Assign):
+                for target in statement.targets:
+                    if isinstance(target, (ast.Name, ast.Subscript)):
+                        target.ctx = ast.Load()
+    packetizer.block(parsed.body)
     return packetizer.count
 
 
@@ -293,7 +336,112 @@ def test_a_packet_moves_above_its_lane_loop_only_where_nothing_changes_it(
     # stores before the load, which writes nothing itself, and its pointer
     # may read only names bound before the loop, its lane offset and mask
     # unchanged since they were recorded.
-    assert _packets(*before, _LOAD) == packets
+    # A private register fragment is known from its producing allocation,
+    # not from its name. No other reference to the new allocation escaped.
+    pre = ("_helion_vmerge_cache_0 = cute.make_rmem_tensor(8, cutlass.Float32)",)
+    assert _packets(*before, _LOAD, before=pre) == packets
+    assert _packets(*before, _LOAD, before=pre, load_targets=True) == packets
+
+
+def test_packet_store_requires_an_unaliased_register_destination() -> None:
+    store = "scratch[vec_lane_1] = cutlass.BFloat16(1)"
+    fresh = "scratch = cute.make_rmem_tensor(8, cutlass.Float32)"
+    assert _packets(store, _LOAD, before=(fresh,)) == 1
+    for setup in (
+        (),
+        ("scratch = x",),
+        ("a = y", "scratch = a"),
+        (fresh, "alias = scratch"),
+    ):
+        assert _packets(store, _LOAD, before=setup, load_targets=True) == 0
+    assert _packets("scratch = y", store, _LOAD, before=(fresh,)) == 0
+
+
+def test_packet_address_uses_the_list_after_an_append() -> None:
+    load = _LOAD.replace("cutlass.Int32(indices_0)", "cutlass.Int32(rows[-1])")
+    assert _packets(load, before=("rows = [0]",)) == 1
+    for ref in ("rows", "alias"):
+        assert (
+            _packets(f"{ref}.append(1)", load, before=("rows = [0]", "alias = rows"))
+            == 0
+        )
+
+
+def test_packet_load_stays_after_an_augmented_update_of_an_aliased_input() -> None:
+    load = _LOAD.replace("cutlass.Int32(indices_0)", "cutlass.Int32(rows[-1])")
+    before = ("rows = [0]", "alias = rows")
+    assert _packets("alias += [1]", load, before=before) == 0
+    assert (
+        _packets("alias *= 0", load.replace("rows[-1]", "len(rows)"), before=before)
+        == 0
+    )
+    assert (
+        _packets(
+            "alias |= {0: 1}",
+            load.replace("rows[-1]", "rows[0]"),
+            before=("rows = {0: 0}", "alias = rows"),
+        )
+        == 0
+    )
+    # Both operands and every reaching binding of the accumulator are scalar.
+    assert (
+        _packets(
+            "acc += cutlass.Float32(1)",
+            load,
+            before=(*before, "acc = cutlass.Float32(0)"),
+        )
+        == 1
+    )
+    assert _packets("n ^= 1", load, before=(*before, "n = 0")) == 1
+    # A later iteration can see a mutable binding even when the first one
+    # enters with an integer. An unproved RHS may also overload __radd__.
+    assert _packets("acc += 1", load, "acc = rows", before=(*before, "acc = 0")) == 0
+    assert _packets("acc += unknown", load, before=(*before, "acc = 0")) == 0
+
+
+def test_lane_and_address_keep_their_actual_bindings() -> None:
+    rows = _LOAD.replace("indices_0", "len(rows)")
+    assert (
+        _packets(
+            "match rows:\n        case acc: acc *= 0",
+            rows,
+            before=("rows = [0]", "acc = 0"),
+        )
+        == 0
+    )
+    assert (
+        _packets(
+            "acc *= 0",
+            rows,
+            before=("rows = [0]", "acc = 0", "match rows:\n    case acc: pass"),
+        )
+        == 0
+    )
+    assert _packets("vec_lane_1 = 7 - vec_lane_1", _LOAD) == 0
+    assert (
+        _packets(
+            "acc += cutlass.Int32([0 for alias[0] in (1,)][0])",
+            rows.replace("len(rows)", "rows[0]"),
+            before=("rows=[0]", "alias=rows", "acc=0"),
+        )
+        == 0
+    )
+    assert _packets(_LOAD, width="V", constexpr={"V": 8}) == 1
+    assert (
+        _packets(
+            _LOAD,
+            before=("V_next=16",),
+            width="V",
+            constexpr={"V": 8},
+            renamed=frozenset({"V", "V_next"}),
+        )
+        == 0
+    )
+    spellings = frozenset({"row", "row_next"})
+    addr = _LOAD.replace("indices_0", "row_next")
+    assert _packets("row ^= 1", addr, before=("row = 0",), renamed=spellings) == 0
+    assert _packets("row = 1", addr, renamed=spellings) == 0
+    assert _packets("other += -1", _LOAD, before=("other = 1",), renamed=spellings) == 1
 
 
 @pytest.mark.parametrize(
@@ -432,7 +580,7 @@ def test_a_lane_base_bound_again_later_in_its_loop_takes_no_packet() -> None:
 def test_a_definition_a_persistent_loop_binds_again_proves_no_mask() -> None:
     # ``shift`` is 0 for the first virtual program id only: the complete
     # tiles' mask cannot be proven true from it.
-    def split(*, rebound: bool) -> str:
+    def split(*, rebound: bool, shadow: bool = False, phi: bool = False) -> str:
         source = textwrap.dedent(
             f"""
             shift = 0
@@ -444,20 +592,76 @@ def test_a_definition_a_persistent_loop_binds_again_proves_no_mask() -> None:
                         mask_1 = indices_1 + shift < 1003
                         {_LOAD}
             """
-        ) + ("    shift = 300\n" if rebound else "")
+        ) + (f"    {'shift_next' if phi else 'shift'} = 300\n" if rebound else "")
         names = iter(range(100))
         body = peel_vector_tails(
-            ast.parse(source).body,
+            ast.parse(("x = y\n" if shadow else "") + source).body,
             {},
             thread_block_dims=(32, 1, 1),
             tensor_facts=_FACTS,
             new_var=lambda name: f"{name}_{next(names)}",
             persistent_loop="virtual_pid",
+            rename_groups={"shift_next": "shift"} if phi else {},
         )
         return ast.unparse(body)
 
     assert _PACKET in split(rebound=False)
     assert _PACKET not in split(rebound=True)
+    assert _PACKET not in split(rebound=True, phi=True)
+    assert _PACKET not in split(rebound=False, shadow=True)
+
+
+def test_shared_phase_dispatch_does_not_share_a_mask_proof() -> None:
+    # The phase emitter copies the list of roots, not the dispatch tree
+    # nested inside it. These two phases intentionally share the same If.
+    dispatch = ast.parse("if shared_pid < 3: pass").body[0]
+    assert isinstance(dispatch, ast.If)
+    work = ast.parse(
+        textwrap.dedent(f"""
+        for tile_offset_1 in range(0, 1003, 256):
+            lane_base_1 = tile_offset_1 + cutlass.Int32(cute.arch.thread_idx()[0]) * 8
+            for vec_lane_1 in cutlass.range_constexpr(8):
+                indices_1 = lane_base_1 + cutlass.Int32(vec_lane_1)
+                mask_1 = indices_1 + shift < 1003
+                {_LOAD}
+        """)
+    ).body
+    owner = ForEachProgramID("shared_pid")
+    owner.case_bodies = [list(work), [ast.Pass()]]
+    owner.case_branches = [dispatch]
+    owner.codegen_dispatch()
+
+    def phase(start: int) -> ast.For:
+        loop = ast.parse(
+            f"for pid in range(4):\n    if {start} <= pid < {start + 1}: pass"
+        ).body[0]
+        assert isinstance(loop, ast.For)
+        guard = loop.body[0]
+        assert isinstance(guard, ast.If)
+        init = ast.parse("shared_pid = pid").body[0]
+        guard.body = [init, dispatch]
+        PersistentPhase.mark(loop, str(start), str(start + 1), [], init)
+        return loop
+
+    names = iter(range(100))
+    first, second = phase(0), phase(1)
+    proof = PersistentPhase.match(first)
+    assert proof is not None and id(dispatch) in proof.phase.uniform_guards(proof.guard)
+    proof.guard.body.insert(1, ast.parse("shared_pid = lane").body[0])
+    assert id(dispatch) not in proof.phase.uniform_guards(proof.guard)
+    proof.guard.body.pop(1)
+    body = peel_vector_tails(
+        [*ast.parse("shift=0").body, first, *ast.parse("shift=300").body, second],
+        {},
+        thread_block_dims=(32, 1, 1),
+        tensor_facts=_FACTS,
+        new_var=lambda name: f"{name}_{next(names)}",
+        persistent_loop=None,
+    )
+    phases = [stmt for stmt in body if isinstance(stmt, ast.For)]
+    assert len(phases) == 2
+    assert _PACKET in ast.unparse(phases[0])
+    assert _PACKET not in ast.unparse(phases[1])
 
 
 @pytest.mark.parametrize("branch_writes_a_rebound_name", [False, True])
@@ -677,7 +881,12 @@ for lane_1 in range(2):
 """
 
 
-def _peeled(source: str, *, grid: tuple[int, int, int] | None = None) -> str:
+def _peeled(
+    source: str,
+    *,
+    grid: tuple[int, int, int] | None = None,
+    rename_groups: dict[str, str] | None = None,
+) -> str:
     names = iter(range(100))
     return ast.unparse(
         ast.Module(
@@ -689,10 +898,87 @@ def _peeled(source: str, *, grid: tuple[int, int, int] | None = None) -> str:
                 new_var=lambda name: f"{name}_{next(names)}",
                 persistent_loop=None,
                 block_grid_dims=grid,
+                rename_groups=rename_groups,
             ),
             type_ignores=[],
         )
     )
+
+
+def test_sunk_packet_does_not_use_a_pre_rename_mask_value() -> None:
+    source = _SUNK_NEST.replace("shift = 0", "shift = 0\nshift_next = 600")
+    code = _peeled(source, rename_groups={"shift_next": "shift"})
+    assert "cute.arch.load(x.iterator" not in code
+    assert _MASKED_PACKET in code
+
+
+def test_unrelated_scalar_warp_callback_preserves_sunk_packet_prefix() -> None:
+    late = "\nvalue = cute.arch.warp_reduction(arg, lambda a, b: a * b)\n"
+    assert "vec = cute.arch.load(x.iterator" in _peeled(
+        _SUNK_NEST + late + "assert True\n"
+    )
+    assert _packets("assert ready", _LOAD) == 0
+    assert "vec = cute.arch.load(x.iterator" not in _peeled(
+        _SUNK_NEST + late.replace("a * b", "rows.pop()")
+    )
+
+
+def test_runtime_phases_keep_separate_sunk_packet_predicates() -> None:
+    # A runtime phase has no trip certificate. The nested packet unmasker
+    # still visits its dispatch, which the scheduler shares between phases.
+    work = ast.parse(textwrap.dedent(_SUNK_NEST)).body[1:]
+    dispatch = ast.parse("if pid < 3: pass").body[0]
+    assert isinstance(dispatch, ast.If)
+    dispatch.body = work
+
+    def phase() -> ast.For:
+        loop = ast.parse("for pid in range(trips()):\n    if pid < end: pass").body[0]
+        assert isinstance(loop, ast.For)
+        guard = loop.body[0]
+        assert isinstance(guard, ast.If)
+        guard.body = [dispatch]
+        PersistentPhase.mark(loop, "0", "end", [])
+        return loop
+
+    names = iter(range(100))
+    body = peel_vector_tails(
+        [*ast.parse("shift=0").body, phase(), *ast.parse("shift=300").body, phase()],
+        {},
+        thread_block_dims=(2, 16, 1),
+        tensor_facts=_FACTS,
+        new_var=lambda name: f"{name}_{next(names)}",
+        persistent_loop=None,
+    )
+    first, second = [ast.unparse(n) for n in body if isinstance(n, ast.For)]
+    assert "cute.arch.load(x.iterator" in first
+    assert "cute.arch.load(x.iterator" not in second
+    assert _MASKED_PACKET in second
+
+
+def test_conditional_generated_target_invalidates_a_packet_bound() -> None:
+    source = textwrap.dedent(_SUNK_NEST).replace(
+        "shift = 0", "shift = 0\nif flag:\n    shift = 300"
+    )
+    body = ast.parse(source).body
+    branch = body[1]
+    assert isinstance(branch, ast.If)
+    assignment = branch.body[0]
+    assert isinstance(assignment, ast.Assign) and isinstance(
+        assignment.targets[0], ast.Name
+    )
+    assignment.targets[0].ctx = ast.Load()
+    names = iter(range(100))
+    result = peel_vector_tails(
+        body,
+        {},
+        thread_block_dims=(2, 16, 1),
+        tensor_facts=_FACTS,
+        new_var=lambda name: f"{name}_{next(names)}",
+        persistent_loop=None,
+    )
+    source = ast.unparse(ast.Module(body=result, type_ignores=[]))
+    assert "cute.arch.load(x.iterator" not in source
+    assert _MASKED_PACKET in source
 
 
 def test_the_pass_unmasks_a_nested_loops_complete_tiles() -> None:

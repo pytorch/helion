@@ -11,6 +11,7 @@ from __future__ import annotations
 import ast
 
 import pytest
+from torch.fx.immutable_collections import immutable_list
 
 from helion._compiler.ast_extension import expr_from_string
 from helion._compiler.cute._ast_pass_utils import assigned_name
@@ -1798,6 +1799,12 @@ def test_dealias_shared_nodes_copies_repeated_positions_with_their_markers() -> 
         "for lane in range(4):\n    pass\nfor lane in range(4):\n    pass"
     ).body
     assert isinstance(first, ast.For) and isinstance(second, ast.For)
+    # The FX inline-assembly emitter also supplies read-only argument lists
+    # on otherwise unshared nodes; making positions independent must not
+    # assign into that original list.
+    assert isinstance(first.iter, ast.Call)
+    frozen_args = immutable_list(first.iter.args)
+    first.iter.args = frozen_args
     shared = ast.parse("value = (x.iterator + lane).load()").body[0]
     shared.marker = "kept"  # pyrefly: ignore[missing-attribute]
     first.body = second.body = [shared]
@@ -1808,6 +1815,7 @@ def test_dealias_shared_nodes_copies_repeated_positions_with_their_markers() -> 
 
     nodes = [node for stmt in body for node in ast.walk(stmt)]
     assert len({id(node) for node in nodes}) == len(nodes)
+    assert type(first.iter.args) is list and first.iter.args is not frozen_args
     assert first.body is not second.body
     assert first.body[0] is shared
     copy = second.body[0]

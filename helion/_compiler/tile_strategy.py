@@ -1491,11 +1491,15 @@ class TileStrategy:
         begin: str | None = None,
         end: str,
         step: str | None = None,
+        program_ids: bool = False,
     ) -> str:
         env = CompileEnvironment.current()
 
         # Allow backend to override the range expression entirely
-        backend_range = env.backend.range_str(begin, end, step)
+        emit_range = (
+            env.backend.program_id_range_str if program_ids else env.backend.range_str
+        )
+        backend_range = emit_range(begin, end, step)
         if backend_range is not None:
             return backend_range
 

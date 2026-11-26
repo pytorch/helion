@@ -37,6 +37,7 @@ from helion._compiler.program_id import FlatProgramIDs
 from helion._compiler.program_id import PIDInfo
 from helion._testing import cpu_render_target
 from helion._testing import import_example
+from helion._testing.cute_codegen import cpu_pid_codegen
 from helion.autotuner.metrics import AutotuneMetrics
 from helion.exc import BackendUnsupported
 from helion.exc import InvalidConfig
@@ -468,6 +469,7 @@ def test_absent_grouped_flat_overrides_are_not_explicit_none(case: tuple) -> Non
 
 
 @pytest.mark.parametrize("shape", [(4, 640, 128), (8, 2560, 512), (16, 10240, 1024)])
+@cpu_pid_codegen()
 def test_pid_mapping_retains_mn_for_every_original_axis_order(shape: tuple) -> None:
     groups, m, n = shape
     extents = {17: groups, 23: m // 128, 31: n // 64}
@@ -488,10 +490,11 @@ def test_pid_mapping_retains_mn_for_every_original_axis_order(shape: tuple) -> N
             # (no fallback cluster: ``tcgen05_fallback_cluster``)
             _tcgen05_fallback_cluster=lambda: False,
             _tcgen05_logical_m_coord_expr=lambda value: value,
+            grouped_count_dtype=axis_decoder.grouped_count_dtype,
         )
         expression = (
             Tcgen05PersistentProgramIDs._tcgen05_linear_virtual_pid_from_coords_expr(
-                strategy, ["row", "column", "0"]
+                strategy, ["row", "column", "0"], count_dtype=None
             )
         )
         state = SimpleNamespace(
@@ -512,7 +515,7 @@ def test_pid_mapping_retains_mn_for_every_original_axis_order(shape: tuple) -> N
             namespace = {
                 "row": row,
                 "column": column,
-                "cutlass": SimpleNamespace(Int32=int),
+                "cutlass": SimpleNamespace(Int32=int, Int64=int),
             }
             exec(code, namespace)
             assert (namespace["pid_17"], namespace["pid_23"], namespace["pid_31"]) == (
