@@ -34,9 +34,9 @@ from ..support import numerics_modes
 from ..support import python_wrapper
 from .kernel import ARG_REDUCTIONS
 from .kernel import REDUCTIONS
-from .kernel import UNROLLED_RDIM_MAX
 from .kernel import HelionKernel
 from .overrides import HelionOverrides
+from .tiling import UNROLLED_RDIM_MAX
 from .tiling import natural_tiling
 
 if TYPE_CHECKING:

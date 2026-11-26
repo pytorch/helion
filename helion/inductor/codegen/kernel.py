@@ -42,6 +42,7 @@ from .overrides import HelionOverrides
 from .overrides import HelionPrinter
 from .overrides import number_constant
 from .overrides import upcast_compute_type
+from .tiling import UNROLLED_RDIM_MAX
 from .tiling import contiguous_reads
 from .tiling import static_int
 
@@ -381,18 +382,6 @@ def as_less(relation: sympy.Rel) -> tuple[sympy.Basic, sympy.Basic, bool]:
     if isinstance(relation, (sympy.Gt, sympy.Ge)):
         lhs, rhs = rhs, lhs
     return lhs, rhs, isinstance(relation, (sympy.Lt, sympy.Gt))
-
-
-# The longest rdim a kernel that names it (rdim, codegen_rdim()) names by a
-# factory's dim, which Helion cannot roll, so that it stays one block whatever
-# the autotuner tries, as Triton's rule reads an inner reduction's: an rdim of up
-# to 1024 elements fits one block, and leaving its loop to the autotuner
-# (Config.reduction_loops) widens the search, where a quick search can end on a
-# loop over chunks of the rdim: for LayerNorm over Swin's shifted windows,
-# rdims of 256, it picked reduction_loops [16], slower than the rdim as one block. A
-# kernel that does not name its rdim, as a plain sum's in0[tile_x, :], keeps the
-# rdim's reduction_loops slot, at any length.
-UNROLLED_RDIM_MAX = 1024
 
 
 class HelionKernel(SIMDKernel[CSEVariable]):

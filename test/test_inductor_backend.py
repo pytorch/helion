@@ -2369,6 +2369,22 @@ def kernel(in0: torch.Tensor, out0: torch.Tensor) -> None:
     def test_channel_cat_segments(self):
         check_channel_cat_segments(self, "triton")
 
+    def test_long_rdims_join_dims_split_by_r_invariant_reads(self):
+        # An rdim of 2048 over (y, x) = [4, 16], with an r-invariant value of
+        # a [4, 17] tensor sliced [:, 1:], whose dims do not join: y and x are
+        # tiled as one axis of 64 (natural_tiling(), R_INVARIANT_JOIN_MIN),
+        # and the r-invariant value is read flat, once per (y, x).
+        x = torch.randn(4, 16, 2048, device=DEVICE)
+        m = torch.randn(4, 17, device=DEVICE)
+        fn = lambda x, m: (x - m[:, 1:, None]).exp().sum(-1)  # noqa: E731
+        (source,) = self.compile(fn, x, m, tol=1e-4)
+        self.assertIn("for tile_x in hl.tile(64):", source)
+        self.assertRegex(source, r"in\d\[1 \+ 17\*\(tile_x\.index // 16\)")
+        # An rdim of 256 keeps both pointwise dims.
+        x = torch.randn(4, 16, 256, device=DEVICE)
+        (source,) = self.compile(fn, x, m, tol=1e-4)
+        self.assertIn("for tile_y, tile_x in hl.tile([4, 16]):", source)
+
     def test_written_before_keeps_the_whole_rdim(self):
         # z = x * 2, an output an earlier node of the kernel writes, which the
         # trailing nodes read beside a cat: a segment of them would read the
