@@ -1140,6 +1140,7 @@ def test_a_bench_record_names_the_outputs_it_judged_against_inductor(
             rounds=2,
             rep_ms=1,
             cold_rounds=2,
+            cold_timer="events",
             rotate_inputs=0,
             placement_seed=None,
             fixed_placement=True,
@@ -1276,6 +1277,35 @@ def test_bench_warns_of_an_inductor_compile_behind_a_port(
         "inductor_max behind helion_cute in reverse rounds"
     ]
     assert capsys.readouterr().err.count("[carryover]") == 1
+
+
+def test_an_aggregate_keeps_one_cold_timer(tmp_path: Path) -> None:
+    # The aggregate names its processes' cold timer (events for records made
+    # before records named it), and a point whose processes timed cold_us
+    # two ways has no median: the timers read one call apart.
+    processes = _three_processes(tmp_path)
+    digests = dict.fromkeys(processes, "")
+    assert common.aggregate_bench_records(processes, digests)["cold_timer"] == "events"  # type: ignore[arg-type]
+    for record in processes.values():
+        record["cold_timer"] = "trace"  # type: ignore[index]
+    assert common.aggregate_bench_records(processes, digests)["cold_timer"] == "trace"  # type: ignore[arg-type]
+    del next(iter(processes.values()))["cold_timer"]  # type: ignore[attr-defined]
+    with pytest.raises(ValueError, match="different cold timers"):
+        common.aggregate_bench_records(processes, digests)  # type: ignore[arg-type]
+
+
+def test_a_report_refuses_a_run_of_two_cold_timers(tmp_path: Path) -> None:
+    # The bench records of one run directory share their cold timer (a
+    # campaign forwards one to every bench: campaign.py --cold-timer); one
+    # made before records named it was timed by events.
+    bench_dir = tmp_path / "bench"
+    bench_dir.mkdir()
+    for name, timer in (("a__s1.json", "trace"), ("b__s1.json", "trace")):
+        (bench_dir / name).write_text(json.dumps({"status": "ok", "cold_timer": timer}))
+    assert len(report.ok_records(tmp_path, "bench")) == 2
+    (bench_dir / "c__s1.json").write_text(json.dumps({"status": "ok"}))
+    with pytest.raises(ValueError, match="different cold timers"):
+        report.ok_records(tmp_path, "bench")
 
 
 def test_an_aggregate_keeps_what_ran_behind_a_port(tmp_path: Path) -> None:
@@ -1652,6 +1682,7 @@ def test_bench_does_not_time_an_implementation_that_skips_part_of_its_output(
             rounds=2,
             rep_ms=1,
             cold_rounds=2,
+            cold_timer="events",
             rotate_inputs=0,
             placement_seed=None,
             fixed_placement=True,
@@ -2788,6 +2819,8 @@ def test_every_selected_point_has_pinned_inductor_code(
     # three extras (the next 99 have none yet), which loads at that point's
     # shape on CPU with every Helion kernel pinned to one config
     # (common.load_inductor_pretuned), and has bench.py's entry.
+    from helion.inductor.kernel_sequence import SequencedKernel
+
     kernels = [
         k
         for k in json.loads(common.SELECTION_PATH.read_text())["kernels"]
@@ -2811,7 +2844,12 @@ def test_every_selected_point_has_pinned_inductor_code(
                 raise
             pytest.skip(f"{kernel['repro']}: written for another torch ({error})")
         assert callable(module.forward), kernel["repro"]
-        assert any(isinstance(v, helion.Kernel) for v in vars(module).values())
+        # (a module of helion.inductor's tune_in_sequence wraps its kernels
+        # until their first call: helion.inductor.kernel_sequence)
+        assert any(
+            isinstance(v.kernel if isinstance(v, SequencedKernel) else v, helion.Kernel)
+            for v in vars(module).values()
+        )
 
 
 _OUTPUT_MODULE = '''\
@@ -2830,17 +2868,23 @@ import helion
 def kernel(in0, out0):
     out0[1] = in0[1]
 """
+helion_fused_b_1 = PyCodeCache.load(helion_fused_b_1_source, '0123456789abcdef').kernel
 '''
 
 
 def test_inductor_pretuned_pins_the_decorator_of_each_kernel_source() -> None:
     # Only the decorator line of each source string changes, to the one the
-    # kernel's own source picks.
-    def decorator_of(source: str) -> str:
+    # kernel's own source picks; decorator_of gets the key the module loads
+    # it under (a kernel tuned behind the one before it has its own).
+    extras: list[str] = []
+
+    def decorator_of(source: str, extra: str) -> str:
+        extras.append(extra)
         return f"@helion.kernel(config=C{int('out0[1]' in source)})"
 
     code, count = inductor_pretuned.pin(_OUTPUT_MODULE, decorator_of)
     assert count == 2
+    assert extras == ["", "0123456789abcdef"]
     assert code == _OUTPUT_MODULE.replace(
         '@helion.kernel(backend="cute", static_shapes=True, autotune_effort="full")',
         "@helion.kernel(config=C0)",
@@ -2890,7 +2934,7 @@ def test_inductor_pretuned_reads_the_kernel_source_unescaped() -> None:
     module = f'helion_k_0_source = """\\\n{literal}"""\n'
     seen: list[str] = []
 
-    def decorator_of(text: str) -> str:
+    def decorator_of(text: str, extra: str) -> str:
         seen.append(text)
         return '@helion.kernel(backend="cute", config="x\\y")'
 
@@ -2980,6 +3024,27 @@ def test_pinned_inductor_code_of_another_shape_is_refused(tmp_path: Path) -> Non
     assert common.load_inductor_pretuned("sum_000000000001", "s1", path).SHAPE == "s1"
     with pytest.raises(ValueError, match="generated at shape s1, not s2"):
         common.load_inductor_pretuned("sum_000000000001", "s2", path)
+
+
+@needs_helion_inductor
+def test_a_sequenced_kernel_of_pinned_inductor_code_must_be_pinned(
+    tmp_path: Path,
+) -> None:
+    # helion.inductor's code wraps each kernel for its first call
+    # (helion_in_sequence): the pin check reads the kernel in the wrapper.
+    path = tmp_path / "sum_000000000001.py"
+    path.write_text(
+        "import helion\n"
+        "from helion.inductor.kernel_sequence import in_sequence as helion_in_sequence\n"
+        f"REPRO = 'sum_000000000001'\nSHAPE = 's1'\n"
+        f"SOURCE_HASH = {common.inductor_source_hash()!r}\n"
+        "@helion.kernel(backend='triton')\n"
+        "def k(x):\n"
+        "    return x\n"
+        "k = helion_in_sequence(k, globals(), 'k')\n"
+    )
+    with pytest.raises(RuntimeError, match="k is not pinned to one config"):
+        common.load_inductor_pretuned("sum_000000000001", "s1", path)
 
 
 @needs_helion_inductor
@@ -4109,6 +4174,7 @@ def test_a_compile_that_launches_another_switch_states_kernel_is_not_timed(
         rounds=2,
         rep_ms=1,
         cold_rounds=2,
+        cold_timer="events",
         rotate_inputs=0,
         placement_seed=None,
         fixed_placement=True,
@@ -4321,14 +4387,15 @@ def test_rotation_takes_the_small_ports_that_cold_us_times_in_batches() -> None:
     assert reason(201_000_000, max_l2_multiple=1.0).startswith(
         "inputs of 201.0 MB exceed 1 x the 132.6 MB L2 (132.6 MB)"
     )
-    # cold_us times single replays from 64 us for the fastest implementation
-    # (e232's memcopy takes 65.5 us): batches would not be its cross-check.
+    # The events cold_us times single replays from 64 us for the fastest
+    # implementation (e232's memcopy takes 65.5 us): batches would not be its
+    # cross-check.
     assert reason(128_000_000, fastest_us=41.0) == "applies"
     assert reason(201_000_000, fastest_us=63.9) == "applies"
     assert reason(201_000_000, fastest_us=65.5) == (
         "the fastest implementation, memcopy, takes 65.5 us a call: from 64 us "
-        "cold_us times single replays, not the batches of flushed calls that "
-        "rot_us would time"
+        "the events cold_us times single replays, not the batches of flushed "
+        "calls that rot_us would time"
     )
     # Without the memcopy the fastest port decides (bbcd's takes 86 us).
     assert reason(128_000_000, fastest_impl="oracle", fastest_us=86.4).startswith(
@@ -4539,6 +4606,46 @@ def test_each_captured_call_of_a_rotating_batch_reads_a_set_of_its_own(
         assert len(outputs[name]) == (3 + 2 * (1 + 3))
         read = sorted(float(result[0]) for result in outputs[name][-3:])
         assert read == [filled + 1 for filled in value[name]]
+
+
+def test_a_trace_cold_round_times_each_replay_behind_the_pin_release(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # --cold-timer trace: one kernel-timer window of COLD_REPEAT flushed calls
+    # per replay, every flush followed by the prelude that releases pinned
+    # L2 lines, so nothing is subtracted.
+    first, second = (lambda: None), (lambda: None)
+    readings = {first: 0.004, second: 0.006}
+    seen: list[dict[str, object]] = []
+
+    def fake_do_bench(fn: Callable[[], object], **kwargs: object) -> float:
+        seen.append(kwargs)
+        return readings[fn]
+
+    monkeypatch.setattr(bench, "benchmark_do_bench", fake_do_bench)
+    prelude = object.__new__(bench.ReleaseL2Pins)
+    assert bench.cold_trace_round([second, first], prelude) == [0.006, 0.004]
+    window = {
+        "fixed_repetitions": bench.COLD_REPEAT,
+        "return_mode": "median",
+        "l2_flush_mode": "call",
+        "trace_kernel_durations": True,
+        "prelude": prelude,
+    }
+    assert seen == [window, window]
+
+
+@pytest.mark.cuda
+@skipIfNotCUDA()
+def test_a_trace_cold_round_reads_a_graph_from_the_kernel_trace() -> None:
+    source = torch.randn(1 << 20, device=DEVICE)
+    out = torch.empty_like(source)
+    graph, _ = common.capture_graph(lambda: torch.add(source, 1.0, out=out))
+    prelude = bench.cold_trace_prelude()
+    (ms,) = bench.cold_trace_round([graph.replay], prelude)
+    # a 4 MB add reads 2-4 us on a B200 or GB300; anything near zero would
+    # be a reading with the flush or the sweep subtracted
+    assert 0.0005 < ms < 0.1
 
 
 @pytest.mark.cuda
@@ -4929,12 +5036,23 @@ def test_a_pin_holds_through_comment_edits_unless_its_record_has_the_whole_text_
     assert nosrc["statement"] != nosrc["unedited"]
 
 
-def _rotation_args(count: int = 8) -> object:
+def _rotation_args(count: int = 8, cold_timer: str = "events") -> object:
     return types.SimpleNamespace(
         rotate_inputs=count,
         rotate_max_l2=bench.ROTATE_MAX_L2_MULTIPLE,
         cold_rounds=6,
+        cold_timer=cold_timer,
     )
+
+
+def test_the_trace_timer_takes_no_rotating_pass() -> None:
+    # rot_us is the events timer's regime, gated by that timer's batch
+    # threshold: a record timed by the trace has no events cold_us for it to
+    # cross-check, so the pass is skipped, saying why.
+    found: dict[str, Any] = {"impls": {"inductor": {"cold_us": 9.5}}}
+    bench.rotate_inputs(_rotation_args(cold_timer="trace"), found, {}, 7_000_000)
+    assert found["rotate_inputs"]["status"] == "skipped"
+    assert "the trace timer's" in found["rotate_inputs"]["skipped"]
 
 
 def test_the_rotating_pass_records_rot_us_beside_the_other_timings(

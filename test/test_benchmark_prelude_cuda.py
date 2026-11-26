@@ -130,7 +130,10 @@ def _scale_rows(x: torch.Tensor, sums: torch.Tensor) -> torch.Tensor:
     return out
 
 
+# Two real searches, each starting its own benchmark worker, outlast the H100
+# job's 60 s per-test timeout when its four xdist workers share the GPU.
 @pytest.mark.slow
+@pytest.mark.timeout(180)
 @skipIfRocm("the benchmark worker's CUDA timers")
 @skipIfRefEagerMark("ref mode runs no autotuner search")
 def test_a_search_inside_timed_behind_times_its_candidates_behind_the_sequence(

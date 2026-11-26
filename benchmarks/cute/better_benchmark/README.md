@@ -120,6 +120,31 @@ third on request, below):
   64 us (`autotune_short_kernel_below_us`);
   `HELION_AUTOTUNE_FINAL_L2_FLUSH=1` makes it select in this one.
 
+`bench.py --cold-timer trace` (the record's `cold_timer`) times `cold_us`
+another way: in each round, a window of flushed calls of each
+implementation's graph, each call's reading the span of its kernels in the
+CUDA activity trace (`do_bench`'s kernel timer), and every flush followed by
+the sweep that displaces the L2 lines earlier calls loaded or stored with an
+evict-last hint (`bench.ReleaseL2Pins`, `benchmarking._release_l2_pins`).
+
+- Why: those lines survive the 256 MB flush. So in the default regime an
+  implementation that hints its loads reads part of its inputs warm on the
+  next call (Inductor hints by policy; a CuTe search can pick `l2_last`).
+  Pinned stores cost the next call instead: the last kernel of
+  sum_1e8a518eb72e_aa121e37 stored 24.5 MB with `l2_evict_last`, and the
+  graph's first kernel then took 13.6 us instead of 8.3 us on a GB300.
+  Neither happens in a model, where other kernels run between two calls of
+  a graph.
+- What it reads (GB300; `ReleaseL2Pins` has the measurements):
+  - The sweep leaves L2 full of clean lines, so a streaming call no longer
+    writes back the flush's dirty ones: a 64 MB copy read 18.1 us, against
+    23.2 us behind a plain flush.
+  - Hints become nearly neutral: a 32 MB add read 8.6 us with evict-last
+    loads and 8.9 us without.
+- The trace has no flush to subtract. Subtracting a flush-and-sweep graph
+  in the default regime read hinted calls up to 0.9 us low.
+- Compare records within one `cold_timer`.
+
 The rounds alternate the order of the implementations, and a reading depends
 on what ran right before it (by up to a microsecond for a small kernel), so
 each timing is the mean of its forward-order and reverse-order values over

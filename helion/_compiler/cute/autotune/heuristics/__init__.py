@@ -195,6 +195,7 @@ from .cute_register_subblocks import CuteRegisterSubblocksHeuristic
 from .cute_resident_reductions import CuteResidentReductionHeuristic
 from .cute_resident_sequence import CuteResidentSequenceHeuristic
 from .cute_rolled_cluster_packet import CuteRolledClusterPacketHeuristic
+from .cute_row_packets import CuteLaneSplitRowHeuristic
 from .cute_row_packets import row_packet_seed_configs
 from .cute_row_resident import register_row_resident_coverage
 from .cute_row_stream_retention import CuteRowStreamRetentionHeuristic
@@ -511,6 +512,10 @@ def postprocess_seed_configs(
         if row_seeds:
             configs.extend(row_seeds)
             env.config_spec.autotuner_heuristics.append(family)
+    lane_split_rows = CuteLaneSplitRowHeuristic.get_seed_configs(env, device_ir)
+    if lane_split_rows:
+        configs.extend(lane_split_rows)
+        env.config_spec.autotuner_heuristics.append(CuteLaneSplitRowHeuristic.name)
     # The lane-unrolled row at several one-warp rows per CTA.
     warp_rows = lane_unrolled_warp_rows_seed_configs(env, device_ir, configs)
     if warp_rows:

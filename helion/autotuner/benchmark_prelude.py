@@ -91,13 +91,16 @@ import contextlib
 import contextvars
 import dataclasses
 import functools
+import hashlib
 from typing import TYPE_CHECKING
+from typing import Any
 from typing import cast
 
 import torch
 from torch.utils._pytree import tree_flatten
 from torch.utils._pytree import tree_unflatten
 
+from .. import exc
 from .kernel_args import _input_tree_leaves
 from .kernel_args import _make_portable_args
 from .kernel_args import resolve_portable_args
@@ -121,6 +124,22 @@ class PreludeFailed(RuntimeError):
     """A prelude did not load in the benchmark worker, or its work raised
     before the candidate's first call: the failure is the prelude's, not the
     candidate's, whose job has no reading."""
+
+
+class PreludeRefused(exc.InvalidAPIUsage):
+    """A search refused to time its candidates behind its prelude: the
+    provider's checks (``benchmark_prelude_unsupported``, a prelude not of
+    the search's call), or a prelude or arguments that cannot reach the
+    benchmark worker. An ``InvalidAPIUsage``, of its own class for a caller
+    that tunes the kernel alone instead."""
+
+
+class PreludeSearchFailed(exc.NoConfigFound):
+    """A search behind a prelude found no config, and the prelude took
+    readings from it (``PreludeFailed``, or a candidate the benchmark worker
+    could not time behind it): alone, the kernel may find one. A
+    ``NoConfigFound``, of its own class for a caller that tunes the kernel
+    alone instead."""
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -275,6 +294,86 @@ class BenchmarkPrelude:
             ):
                 return f"leaf {index} is {own!r}, the search's {other!r}"
         return None
+
+    def fingerprint(self) -> str | None:
+        """The work's identity for the autotune cache, or None when a step's
+        function has no source to name it by or an argument is neither a
+        tensor nor a plain value (a callback, a stateful object: its type's
+        name would not tell two apart): each step's compiled kernel (the
+        function's name and the code of its module, which spells the config
+        it runs with) and the layout of every argument of the steps and of
+        the timed call, a stand-in by the step, leaf and view it names and a
+        tensor by the order in which its storage first appears, so two calls
+        that share a buffer differ from two that do not. A search timed behind the same work in
+        another process (the same kernels before it, at the same configs,
+        on the same buffers) finds the winner it cached
+        (``local_cache._search_policy_hash``)."""
+        storages: dict[int, int] = {}
+        unknown: list[str] = []
+
+        def layout(args: Sequence[object]) -> list[object]:
+            leaves, spec = tree_flatten(list(args))
+            out: list[object] = [str(spec)]
+            for leaf in leaves:
+                if isinstance(leaf, PreludeOutput):
+                    # (equal views of an output at other offsets read other
+                    # lines of it)
+                    out.append(
+                        (
+                            "output",
+                            leaf.step,
+                            leaf.leaf,
+                            leaf.size,
+                            leaf.stride,
+                            leaf.storage_offset,
+                        )
+                    )
+                elif isinstance(leaf, torch.Tensor):
+                    address = leaf.untyped_storage().data_ptr()
+                    storage = storages.setdefault(address, len(storages))
+                    out.append(
+                        (
+                            "tensor",
+                            storage,
+                            tuple(leaf.shape),
+                            tuple(leaf.stride()),
+                            leaf.storage_offset(),
+                            str(leaf.dtype),
+                        )
+                    )
+                elif leaf is None or isinstance(leaf, (bool, int, float, str)):
+                    out.append(leaf)
+                elif isinstance(leaf, (torch.dtype, torch.device)):
+                    out.append(str(leaf))
+                else:
+                    unknown.append(type(leaf).__qualname__)
+            return out
+
+        parts: list[object] = []
+        for step in self.steps:
+            try:
+                serialized = _serialize_compiled_fn(cast("Any", step.fn))
+            except RuntimeError:
+                # (no source to name it by: a builtin, a nested function)
+                return None
+            # The generated code's comments quote the kernel's source file.
+            code = "\n".join(
+                line
+                for line in serialized.source_code.splitlines()
+                if not line.lstrip().startswith("#")
+            )
+            # (a module may define several functions: the step runs one)
+            parts.append(
+                (
+                    serialized.function_name,
+                    hashlib.sha256(code.encode()).hexdigest(),
+                    layout(step.args),
+                )
+            )
+        parts.append(layout(self.args))
+        if unknown:
+            return None
+        return hashlib.sha256(repr(parts).encode()).hexdigest()
 
     def save(self, path: str) -> None:
         """Write the prelude for the benchmark worker (``load_prelude``): the

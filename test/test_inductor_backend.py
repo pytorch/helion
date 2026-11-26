@@ -3,7 +3,9 @@ from __future__ import annotations
 import functools
 import importlib
 import inspect
+import os
 import re
+import tempfile
 import unittest
 from unittest.mock import patch
 
@@ -43,8 +45,10 @@ if not requires_torch_version("2.16"):
 from torch._inductor.choices import registered_inductor_choices
 
 import helion
+from helion.autotuner.benchmark_provider import LocalBenchmarkProvider
 import helion.inductor
 from helion.inductor import config as helion_config
+from helion.inductor import kernel_sequence
 from helion.inductor.codegen.kernel import exact_cast
 import helion.language as hl
 
@@ -525,7 +529,8 @@ def kernel(in0: torch.Tensor, in1: torch.Tensor, out0: torch.Tensor, out1: torch
         b = randn(72, 136)
         fn, a, lines = {
             # The mask needs tile_y and tile_r, and a [40, 72] view of the [36, 64]
-            # input would leave its storage, so the load is flat.
+            # input would leave its storage, so the load is flat. (With the CuTe
+            # backend, the pad is a kernel of its own: test_pad_prologue.)
             "pad": (
                 lambda a, b: torch.nn.functional.pad(a, (0, 8, 0, 4)) @ b,
                 randn(36, 64),
@@ -657,6 +662,46 @@ def rotate_half_case():
     return fn, (x, w, cos, sin)
 
 
+def channel_cat_case():
+    """GhostNet's cat of a passthrough x and relu(bn(y)) along the channels of
+    channels-last tensors, and the mean of the cat over H and W (its
+    squeeze-excitation pool): the cat cuts the channels in two equal parts."""
+    x = torch.randn(64, 32, 8, 8, device=DEVICE).to(memory_format=torch.channels_last)
+    y = torch.randn(64, 32, 8, 8, device=DEVICE).to(memory_format=torch.channels_last)
+    w, b = torch.randn(32, device=DEVICE), torch.randn(32, device=DEVICE)
+
+    def fn(x, y, w, b):
+        out = torch.cat([x, torch.relu(y * w[:, None, None] + b[:, None, None])], 1)
+        return out, out.mean([2, 3])
+
+    return fn, (x, y, w, b)
+
+
+def check_channel_cat_segments(test: InductorBackendTestCase, backend: str) -> None:
+    """The cat's two parts are emitted as segments of the channel axis
+    (HelionKernel.pointwise_segment()): the kernel tiles 32 channels, and
+    reads and writes each part as a tile of its own parameter, with no
+    select between them, where the whole axis of 64 read y flat behind a
+    mask: hl.load(in1, [(-32) + tile_x.index + ...], extra_mask=...)."""
+    fn, args = channel_cat_case()
+    (source,) = test.compile(fn, *args, tol=1e-4, backend=backend)
+    test.assertIn("for tile_y, tile_x in hl.tile([64, 32]):", source)
+    test.assertNotIn("torch.where", source)
+    # The parts' loads and stores are tiles; the unselected part of each
+    # segment keeps a masked load, which nothing reads and Helion drops.
+    test.assertRegex(source, r"tmp\d+ = in\d\[tile_y, :, tile_x\]\n")
+    test.assertEqual(len(re.findall(r"out\d\[tile_y, :, tile_x\] = ", source)), 2)
+    test.assertEqual(len(re.findall(r"out\d\[tile_y, tile_x\] = ", source)), 2)
+    # Parts shorter than RDIM_SEGMENT_MIN stay one tile: torch.stack's four
+    # parts of one element would turn the [1024, 4] tile into four stores of
+    # every fourth element.
+    a, b, c, d = (torch.randn(1024, device=DEVICE) for _ in range(4))
+    (source,) = test.compile(
+        lambda a, b, c, d: torch.stack([a, b, c, d], -1), a, b, c, d, backend=backend
+    )
+    test.assertNotIn("hl.tile([1024, 1])", source)
+
+
 # The CuTe lane, where CuTe DSL is installed, runs this.
 @skipIfNotCUDA()
 @onlyBackends(["cute"])
@@ -681,6 +726,26 @@ class TestInductorCute(InductorBackendTestCase):
             torch.bmm, randn(4, 128, 64), randn(4, 64, 128), backend="cute"
         )
         self.assertIn("tmp2 = torch.bmm(tmp0, tmp1)", source)
+
+    @needs_native_matmul
+    @config.patch(force_shape_pad=True)
+    def test_padded_operand(self):
+        # pad_mm pads N from 1001 to 1008. The pad is a kernel of its own, and
+        # the dot reads the padded b as tiles, not through b's masked loads.
+        a, b = randn(64, 128), randn(1001, 128).t()
+        sources = self.compile(torch.matmul, a, b, backend="cute")
+        self.assertEqual([bool(DOT_RE.search(s)) for s in sources], [False, True])
+        self.assertIn("tmp1 = in1[tile_r, tile_x]", sources[1])
+        self.assertNotIn("hl.load(", sources[1])
+
+    @needs_native_matmul
+    def test_pad_prologue(self):
+        # F.pad of a is a kernel of its own too (on Triton it stays in the dot:
+        # TestInductorMatmul.test_operand).
+        fn = lambda a, b: torch.nn.functional.pad(a, (0, 8, 0, 4)) @ b  # noqa: E731
+        sources = self.compile(fn, randn(36, 64), randn(72, 136), backend="cute")
+        self.assertEqual([bool(DOT_RE.search(s)) for s in sources], [False, True])
+        self.assertIn("tmp0 = in0[tile_y, tile_r]", sources[1])
 
     def test_unsupported_op(self):
         # Helion's CuTe backend compiles no lgamma.
@@ -820,6 +885,9 @@ class TestInductorCute(InductorBackendTestCase):
         self.assertIn("out0[tile_y, tile_x, 0:128] = ", source)
         self.assertIn("out0[tile_y, tile_x, 128:256] = ", source)
 
+    def test_channel_cat_segments(self):
+        check_channel_cat_segments(self, "cute")
+
     @looped
     def test_welford(self):
         # welford()'s combine emits eq, where and truediv, and the block's weight
@@ -911,26 +979,7 @@ class TestInductorBackend(InductorBackendTestCase):
 
     @parametrize(
         "case",
-        [
-            "distinct",
-            "repeated",
-            "rows",
-            *(
-                subtest(
-                    case,
-                    decorators=[
-                        skipIfRefEager(
-                            "ref mode's atomic_add writes the stride-0 view of "
-                            "out[0] with a setitem, which PyTorch refuses: more "
-                            "than one element of the written-to tensor refers to "
-                            "a single memory location (unlanded fix: "
-                            "pytorch/helion#4576; drop this skip with it)"
-                        )
-                    ],
-                )
-                for case in ("one_element", "constant")
-            ),
-        ],
+        ["distinct", "repeated", "rows", "one_element", "constant"],
     )
     def test_atomic_store(self, case):
         # index_put(accumulate=True) at an arange-based index is an atomic_add
@@ -1756,6 +1805,105 @@ def kernel(in0: torch.Tensor, out0: torch.Tensor, out1: torch.Tensor) -> None:
         self.assertIn("tmp0 = in0[:, tile_x]", source)
         self.assertIn("torch.sum(tmp0, -2)", source)
 
+    @skipIfRefEager("reference mode sequences nothing: it searches no config")
+    def test_kernels_tuned_in_sequence(self):
+        # The two kernels of a split sum over y: the second one's first call
+        # is timed behind the first's (helion.inductor.kernel_sequence),
+        #     helion_fused_sum_1 = PyCodeCache.load(helion_fused_sum_1_source, "<key>").kernel
+        #     helion_fused_sum_1 = helion_in_sequence(
+        #         helion_fused_sum_1, globals(), "helion_fused_sum_1", after="helion_fused_sum_0"
+        #     )
+        preludes = []
+        timed_behind = kernel_sequence.timed_behind
+        self.enterContext(
+            patch.object(
+                kernel_sequence,
+                "timed_behind",
+                lambda prelude: preludes.append(prelude) or timed_behind(prelude),
+            )
+        )
+        # The sequence on Triton, whose searches read CUDA events and so tune
+        # alone (times_short_kernels, which test_inductor_kernel_sequence.py
+        # checks): taken as if they read the trace, as CuTe's do.
+        self.enterContext(
+            patch.object(kernel_sequence, "times_short_kernels", lambda bound: True)
+        )
+        self.enterContext(config.patch({"triton.mix_order_reduction": True}))
+        x = torch.randn(100000, 96, device=DEVICE)
+        self.assertEqual(len(self.compile(lambda x: x.sum(0), x, tol=1e-3)), 2)
+        # The second kernel names the first, whose call is just before its
+        # (helion.inductor.codegen.sequence); the first names none.
+        definitions = re.findall(
+            r'(\w+) = helion_in_sequence\(\1, globals\(\), "\1", after=([^)]*)\)',
+            self.code,
+        )
+        self.assertEqual(len(definitions), 2)
+        (first, first_after), (second, second_after) = definitions
+        self.assertEqual((first_after, second_after), ("None", repr(first)))
+        # The second loads a module of its own, under the first's source.
+        self.assertIn(f"{first} = PyCodeCache.load({first}_source).kernel", self.code)
+        self.assertRegex(
+            self.code,
+            rf"{second} = PyCodeCache.load\({second}_source, '[0-9a-f]{{16}}'\).kernel",
+        )
+        self.assertEqual([prelude is None for prelude in preludes], [True, False])
+        self.assertEqual(len(preludes[1].steps), 1)
+        # Off, the kernels are called as they are loaded.
+        with helion_config.patch(tune_in_sequence=False):
+            torch._dynamo.reset()
+            self.compile(lambda x: x.sum(0), x, tol=1e-3)
+        self.assertNotIn("helion_in_sequence", self.code)
+
+    @pytest.mark.slow
+    @skipIfRefEager("reference mode sequences nothing: it searches no config")
+    def test_kernels_searched_in_sequence_cache_under_their_prelude(self):
+        # Quick searches of the split sum over y's two kernels: the
+        # benchmark jobs of the second carry the first kernel's call as their
+        # prelude, and the generated module, loaded again, finds both winners
+        # in the autotune cache (the second under its prelude's key) and
+        # searches nothing.
+        jobs = []
+        run_job = LocalBenchmarkProvider._run_subprocess_benchmark_job
+
+        def recorded(provider, *args, **kwargs):
+            jobs.append(provider._prelude_path is not None)
+            return run_job(provider, *args, **kwargs)
+
+        environ = {
+            name: value
+            for name, value in os.environ.items()
+            # a regime without a flush per call refuses a prelude
+            if name
+            not in (
+                "HELION_AUTOTUNE_L2_FLUSH",
+                "HELION_AUTOTUNE_FINAL_L2_FLUSH",
+                "HELION_AUTOTUNE_TARGET_REGIME",
+            )
+        }
+        environ["HELION_CACHE_DIR"] = self.enterContext(tempfile.TemporaryDirectory())
+        self.enterContext(patch.dict(os.environ, environ, clear=True))
+        self.enterContext(
+            patch.object(
+                LocalBenchmarkProvider, "_run_subprocess_benchmark_job", recorded
+            )
+        )
+        # As in test_kernels_tuned_in_sequence: the sequence on Triton.
+        self.enterContext(
+            patch.object(kernel_sequence, "times_short_kernels", lambda bound: True)
+        )
+        self.enterContext(config.patch({"triton.mix_order_reduction": True}))
+        self.enterContext(helion_config.patch(autotune_effort="quick"))
+        x = torch.randn(100000, 96, device=DEVICE)
+        self.assertEqual(len(self.compile(lambda x: x.sum(0), x, tol=1e-3)), 2)
+        self.assertIn(False, jobs)
+        self.assertIn(True, jobs)
+        jobs.clear()
+        torch._dynamo.reset()
+        PyCodeCache.cache_clear()
+        with fresh_cache():
+            self.compile(lambda x: x.sum(0), x, tol=1e-3)
+        self.assertEqual(jobs, [])
+
     def test_split_reduction_chunks(self):
         # Inductor cuts x.sum(0), an rdim of 100000, into chunks by a
         # factor of the GPU (782 chunks of 128 on a B200 or an H100), the last
@@ -2320,6 +2468,25 @@ def kernel(in0: torch.Tensor, out0: torch.Tensor) -> None:
         self.assertIn("out0[tile_y, tile_x, 0:128] = ", source)
         self.assertIn("out0[tile_y, tile_x, 128:256] = ", source)
         self.assertNotIn("rdim", source)
+
+    def test_channel_cat_segments(self):
+        check_channel_cat_segments(self, "triton")
+
+    def test_long_rdims_join_dims_split_by_r_invariant_reads(self):
+        # An rdim of 2048 over (y, x) = [4, 16], with an r-invariant value of
+        # a [4, 17] tensor sliced [:, 1:], whose dims do not join: y and x are
+        # tiled as one axis of 64 (natural_tiling(), R_INVARIANT_JOIN_MIN),
+        # and the r-invariant value is read flat, once per (y, x).
+        x = torch.randn(4, 16, 2048, device=DEVICE)
+        m = torch.randn(4, 17, device=DEVICE)
+        fn = lambda x, m: (x - m[:, 1:, None]).exp().sum(-1)  # noqa: E731
+        (source,) = self.compile(fn, x, m, tol=1e-4)
+        self.assertIn("for tile_x in hl.tile(64):", source)
+        self.assertRegex(source, r"in\d\[1 \+ 17\*\(tile_x\.index // 16\)")
+        # An rdim of 256 keeps both pointwise dims.
+        x = torch.randn(4, 16, 256, device=DEVICE)
+        (source,) = self.compile(fn, x, m, tol=1e-4)
+        self.assertIn("for tile_y, tile_x in hl.tile([4, 16]):", source)
 
     def test_written_before_keeps_the_whole_rdim(self):
         # z = x * 2, an output an earlier node of the kernel writes, which the

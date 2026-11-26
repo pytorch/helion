@@ -27,6 +27,7 @@ from helion._compiler.autotuner_heuristics.triton import (
 )
 from helion._compiler.autotuner_heuristics.triton import _batched_static_matmul_fact
 from helion._compiler.autotuner_heuristics.triton import _generalized_static_matmul_fact
+from helion._compiler.autotuner_heuristics.triton import _packed_mxfp8_split_k
 from helion.autotuner.block_id_sequence import BlockIdSequence
 from helion.autotuner.config_fragment import EnumFragment
 from helion.autotuner.config_fragment import IntegerFragment
@@ -108,6 +109,45 @@ def test_arch_formula_front_ends_supply_execution_defaults() -> None:
         assert multi.promote_seed_to_default is True
         assert (("cuda", arch),) == formula.HARDWARE_TARGETS
         assert order.index(formula.__name__) < order.index(multi.__name__)
+
+
+def test_packed_mxfp8_split_k_fills_half_wave_with_valid_scale_tiles() -> None:
+    choices = (1, 2, 4, 8, 16)
+    assert _packed_mxfp8_split_k(1, 1792, 5120, 148, choices) == 8
+    assert _packed_mxfp8_split_k(8, 8192, 1280, 148, choices) == 1
+    assert _packed_mxfp8_split_k(16, 2048, 4096, 148, choices) == 16
+    assert _packed_mxfp8_split_k(32, 5120, 2048, 148, choices) == 4
+    assert _packed_mxfp8_split_k(128, 1792, 5120, 148, choices) == 8
+    assert _packed_mxfp8_split_k(1024, 8192, 1280, 148, choices) == 1
+
+
+def test_packed_mxfp8_split_k_keeps_whole_k_tiles() -> None:
+    # K = 5120 holds 160 groups: 8 partitions of 20 groups split on whole
+    # scale words, but 16-group K tiles would cross their ends; 2 partitions
+    # of 80 groups hold whole tiles.
+    choices = (1, 2, 4, 8, 16)
+    assert _packed_mxfp8_split_k(1, 1792, 5120, 148, choices, block_groups=16) == 2
+
+
+def test_compact_packed_mxfp8_split_k_uses_swapped_output_grid() -> None:
+    choices = (1, 2, 4, 8, 16)
+
+    def split(m: int, n: int, k: int, block_m: int) -> int:
+        return _packed_mxfp8_split_k(
+            m,
+            n,
+            k,
+            148,
+            choices,
+            block_m=block_m,
+            block_n=128,
+            compact_swap=True,
+        )
+
+    assert split(1, 1792, 5120, 16) == 8
+    assert split(8, 8192, 1280, 16) == 1
+    assert split(16, 2048, 4096, 16) == 8
+    assert split(32, 5120, 2048, 32) == 1
 
 
 def test_h100_base_tile_is_unchanged_by_tmem_budget() -> None:

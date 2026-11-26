@@ -303,6 +303,19 @@ def tl_load(node: ast.AST) -> ast.Call | None:
     return None
 
 
+def tl_store(node: ast.AST) -> ast.Call | None:
+    """*node* if it is a ``tl.store`` call: a write of device memory."""
+    if (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and isinstance(node.func.value, ast.Name)
+        and node.func.value.id == "tl"
+        and node.func.attr == "store"
+    ):
+        return node
+    return None
+
+
 def load_mask_other(load: ast.Call) -> tuple[ast.expr, ast.expr | None] | None:
     """The mask and fill value (None if it has none) of
     ``tl.load(ptr, mask, other)``, or None for an unmasked load."""

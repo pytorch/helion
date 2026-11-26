@@ -1187,18 +1187,23 @@ def test_gather_tile_seeds_put_a_row_run_on_thread_x() -> None:
 def test_gather_tile_seeds_do_not_follow_the_packet_family() -> None:
     """A thread of a gather tile takes one element, so nothing has to
     divide the row: the seeds are planted at an odd output width (57, 55,
-    49 columns) and at a width of four, where the tile family, whose
-    packets must divide the extent, has no seed at all; each renders with
-    the taps predicated."""
+    49 columns) and at a width of four, where no tile of the packet family,
+    whose packets must divide the extent, takes packets; each renders with
+    the taps predicated.  At the odd widths the packet family flattens the
+    tile instead (the kernel reads tile.index, whose flatten choice it
+    keeps): those seeds, without the knob, are flattened."""
     with mock_cuda_unavailable():
-        for shape, tiles in (
-            ((64, 113, 113), [[4, 1, 64], [8, 1, 32]]),
-            ((64, 112, 110), [[4, 1, 64], [8, 1, 32]]),
-            ((64, 112, 98), [[4, 1, 64], [8, 1, 32]]),
-            ((64, 7, 7), [[64, 1, 4], [64, 1, 2]]),
+        for shape, tiles, flattened in (
+            ((64, 113, 113), [[4, 1, 64], [8, 1, 32]], True),
+            ((64, 112, 110), [[4, 1, 64], [8, 1, 32]], True),
+            ((64, 112, 98), [[4, 1, 64], [8, 1, 32]], True),
+            ((64, 7, 7), [[64, 1, 4], [64, 1, 2]], False),
         ):
             bound = cpu_bind(padded_window_max, _window(shape))
-            seeds = _seeds(bound)
+            packet_seeds = [seed for seed in _seeds(bound) if not seed.get(_KNOB)]
+            assert bool(packet_seeds) == flattened, shape
+            assert all(seed["flatten_loops"] == [True] for seed in packet_seeds)
+            seeds = [seed for seed in _seeds(bound) if seed.get(_KNOB)]
             assert [seed["block_sizes"] for seed in seeds] == tiles, shape
             for seed in seeds:
                 assert seed[_KNOB] is True

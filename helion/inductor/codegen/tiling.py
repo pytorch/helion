@@ -25,6 +25,28 @@ if TYPE_CHECKING:
 # tile_r (HelionKernel.supports_tiling()).
 MAX_POINTWISE_DIMS = 3
 MAX_REDUCTION_DIMS = 1
+# The longest rdim a kernel that names it (rdim, codegen_rdim()) names by a
+# factory's dim, which Helion cannot roll, so that it stays one block whatever
+# the autotuner tries, as Triton's rule reads an inner reduction's: an rdim of up
+# to 1024 elements fits one block, and leaving its loop to the autotuner
+# (Config.reduction_loops) widens the search, where a quick search can end on a
+# loop over chunks of the rdim: for LayerNorm over Swin's shifted windows,
+# rdims of 256, it picked reduction_loops [16], slower than the rdim as one block. A
+# kernel that does not name its rdim, as a plain sum's in0[tile_x, :], keeps the
+# rdim's reduction_loops slot, at any length (HelionKernel.rdim_code()).
+UNROLLED_RDIM_MAX = 1024
+# The rdim past which natural_tiling() joins pointwise dims that only
+# r-invariant accesses keep apart (an access whose index does not move along r
+# reads one element per pointwise index): UNROLLED_RDIM_MAX, past which an rdim
+# no longer fits one block. A cross-entropy's backward over (y, x) and a long
+# rdim of logits reads each (y, x)'s label from a tensor sliced [:, 1:], whose
+# y and x do not join: tiled as one axis, with the label read at
+# 1 + 513*(x // 512) + x % 512, the CuTe search finds a far faster config (one
+# reduction per CTA, many lanes in flight per thread: cute_lane_unroll opens on
+# a kernel of one tile axis). A short persistent rdim behind per-channel affine
+# weights (an NCHW BatchNorm's) runs faster tiled, where the weights of a
+# tile_x serve every y: short rdims keep their dims.
+R_INVARIANT_JOIN_MIN = UNROLLED_RDIM_MAX
 
 
 @dataclasses.dataclass
@@ -283,11 +305,37 @@ def natural_tiling(
         # A pointwise dim and a reduction dim are never joined.
         return (dims[d][0] >= rnumel_int) == (dims[d + 1][0] >= rnumel_int)
 
+    # (the closure below sees rnumel_int as optional: this is its int)
+    rdim = rnumel_int
+
+    def r_invariant(i: int) -> bool:
+        """Whether affine access i is r-invariant: no stride along a
+        reduction dim, so it reads one element per pointwise index, as the
+        label a cross-entropy reads for each (y, x)."""
+        return all(
+            stride == 0
+            for stride, (step, _) in zip(strides_of[i], dims, strict=True)
+            if step < rdim
+        )
+
+    # Over rdims longer than R_INVARIANT_JOIN_MIN, pointwise dims that only
+    # r-invariant accesses keep apart are joined too: such an access is then
+    # read flat, once per pointwise index, where the kernel's other accesses
+    # read each index's rdim through a tile of one axis. See
+    # R_INVARIANT_JOIN_MIN.
+    join_r_invariant = rnumel_int > R_INVARIANT_JOIN_MIN
     progress = True
     while progress:
         progress = False
         for d in range(len(dims) - 1):
-            if same_kind(d) and all(joinable(d)):
+            if same_kind(d) and (
+                all(joinable(d))
+                or (
+                    join_r_invariant
+                    and dims[d][0] >= rnumel_int
+                    and all(ok or r_invariant(i) for i, ok in enumerate(joinable(d)))
+                )
+            ):
                 join(d)
                 progress = True
                 break

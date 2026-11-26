@@ -25,6 +25,7 @@ from .benchmarking import do_bench
 from .benchmarking import do_bench_cuda_graph
 from .benchmarking import do_bench_generic
 from .benchmarking import kernel_timer_unready_reason
+from .benchmarking import l2_flush_sweep
 from .benchmarking import prelude_trace_unready_reason
 from .benchmarking import steady_graph_dispatch
 from .benchmarking import synchronize_device
@@ -106,6 +107,10 @@ class BenchmarkJob(PhasedJob):
     # ones. None (the default) times the candidate alone on the trusted
     # arguments.
     prelude_path: str | None = None
+    # Follow every L2 flush of the window with the sweep of pinned lines
+    # (``benchmarking.l2_flush_sweep``; the search's
+    # ``autotune_l2_flush_sweep``).
+    l2_flush_sweep: bool = False
 
     def _check_prelude_mode(self) -> None:
         """A prelude needs a timer that flushes before every call and can
@@ -147,7 +152,7 @@ class BenchmarkJob(PhasedJob):
         )
         if self.prelude_path is not None:
             self._check_prelude_mode()
-        with capture_output():
+        with capture_output(), l2_flush_sweep(self.l2_flush_sweep):
             fn = _load_compiled_fn_for_worker(self.fn_spec)
             try:
                 if self.args_slot is None:
@@ -292,12 +297,17 @@ class KernelTimerProbeJob:
     # (``BenchmarkJob.prelude_path``): the trace must then split the
     # prelude's work off a window as well as the flush.
     prelude_path: str | None = None
+    # Whether the search's windows follow every flush with the sweep
+    # (``BenchmarkJob.l2_flush_sweep``): the trace must then split the sweep
+    # off as well, a footprint learned apart from the flush's.
+    l2_flush_sweep: bool = False
 
     def __call__(self) -> str | None:
         """``kernel_timer_unready_reason``, and behind a prelude
         ``prelude_trace_unready_reason``: ``None`` when the worker traces."""
         with (
             capture_output(),
+            l2_flush_sweep(self.l2_flush_sweep),
             torch.cuda.device(self.device)
             if self.device is not None
             else contextlib.nullcontext(),

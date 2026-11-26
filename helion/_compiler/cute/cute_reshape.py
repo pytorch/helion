@@ -31,6 +31,7 @@ from ...language._tracing_ops import _for_loop
 from ...language._tracing_ops import _for_loop_step
 from ...language._tracing_ops import _new_var
 from ...language.memory_ops import store
+from ...language.view_ops import join
 from ...language.view_ops import split
 from ..ast_extension import expr_from_string
 from ..ast_extension import statement_from_string
@@ -2059,31 +2060,61 @@ def _fx_subscript_dims(
     return sizes, block_ids
 
 
-def block_size_arange_block_ids(graphs: Sequence[GraphInfo]) -> set[int]:
-    """Block ids whose block size sizes an ``hl.arange`` in ``graphs``.
+def rectangular_tile_block_ids(
+    graphs: Sequence[GraphInfo], *, exchanges: bool
+) -> set[int]:
+    """Block ids whose block size sizes an op in ``graphs`` that counts or
+    arranges the elements of a rectangular tile of the block, which a
+    flattened tile is not, like the tile attributes that disable flattening
+    (``_disable_flatten_get_tile``):
 
-    Such a range counts positions in a rectangular tile of the block
-    (``hl.arange(tile.block_size)``), which a flattened tile is not, like the
-    other tile attributes that disable flattening (``_disable_flatten_get_tile``).
+    * an ``hl.arange(tile.block_size)`` counts positions in the tile;
+    * with ``exchanges``, an ``hl.split``, an ``hl.join`` or a reshape that
+      does more than add or remove unit dims.  The split exchange keys a
+      flattened tile of loaded values by the same coordinates and refuses
+      the layouts it cannot (``split_exchange.verify_split_smem_exchange``),
+      but a tile.index rearranged that way was not part of what it proves:
+      flattened over [4, 16], ``hl.split(tile_d.index.view(bs // 2, 2))``
+      renders ``split_smem = alloc_smem(Int32, 16)`` at ``offsets_0_1 %
+      _BLOCK_SIZE_0_1 % 16``, which four threads would share.  Callers pass
+      it for the choices that tile.index deferred.
     """
     env = CompileEnvironment.current()
     block_ids: set[int] = set()
-    for graph_info in graphs:
-        for node in graph_info.graph.nodes:
-            if node.op != "call_function" or node.target not in (
-                torch.ops.prims.iota.default,
-                torch.ops.aten.arange.default,
-            ):
+
+    def note(value: object) -> None:
+        for tensor in value if isinstance(value, (tuple, list)) else (value,):
+            if not isinstance(tensor, torch.Tensor):
                 continue
-            value = node.meta.get("val")
-            if not isinstance(value, torch.Tensor):
-                continue
-            for size in value.shape:
+            for size in tensor.shape:
                 if not isinstance(size, torch.SymInt):
                     continue
                 for symbol in size.node.expr.free_symbols:
                     if (block_id := env.get_block_id(symbol)) is not None:
                         block_ids.add(env.canonical_block_id(block_id))
+
+    for graph_info in graphs:
+        for node in graph_info.graph.nodes:
+            if node.op != "call_function":
+                continue
+            value = node.meta.get("val")
+            if node.target in (
+                torch.ops.prims.iota.default,
+                torch.ops.aten.arange.default,
+            ) or (exchanges and node.target in (split, join)):
+                note(value)
+            elif (
+                exchanges
+                and node.target in VIEW_TARGETS
+                and isinstance(node.args[0], Node)
+            ):
+                source = node.args[0].meta.get("val")
+                if isinstance(source, torch.Tensor) and isinstance(value, torch.Tensor):
+                    if [size for size in source.shape if size != 1] != [
+                        size for size in value.shape if size != 1
+                    ]:
+                        note(source)
+                        note(value)
     return block_ids
 
 

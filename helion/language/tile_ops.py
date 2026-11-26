@@ -58,10 +58,11 @@ def tile_index(tile: TileInterface) -> torch.Tensor:
 @_decorators.register_fake(tile_index)
 def _(tile: torch.SymInt) -> torch.Tensor:
     assert isinstance(tile, torch.SymInt)
-    # Disable at TRACE time like the other tile ops: the codegen-time
-    # disable alone runs after device-IR analysis, which is too late for
-    # the cute pointwise flatten re-registration to see it.
-    _disable_flatten_get_tile(tile)
+    # Decide at TRACE time, like the other tile ops: codegen runs after
+    # device-IR analysis, too late for its pointwise flatten re-registration
+    # to see the choice disabled, or (a backend that reflattens pointwise
+    # tiles) deferred (_disable_flatten_get_tile).
+    _disable_flatten_get_tile(tile, per_element=True)
     env = CompileEnvironment.current()
     base = torch.empty([tile], dtype=env.index_dtype, device=env.device)
     return env.new_index_result(base, [tile])
@@ -69,7 +70,7 @@ def _(tile: torch.SymInt) -> torch.Tensor:
 
 @_decorators.codegen(tile_index, "common")
 def _(state: CodegenState) -> ast.AST:
-    index = _disable_flatten_get_tile(state.proxy_arg(0), state)
+    index = _disable_flatten_get_tile(state.proxy_arg(0), state, per_element=True)
     return expr_from_string(state.codegen.index_var(index))
 
 
@@ -123,12 +124,31 @@ def _resolve_tile_block_id(
     return env.resolve_codegen_block_id(index, state.codegen, state.fx_node.graph)
 
 
-def _disable_flatten_get_tile(tile: object, state: CodegenState | None = None) -> int:
-    """Helper to extract tile index from state."""
+def _disable_flatten_get_tile(
+    tile: object, state: CodegenState | None = None, *, per_element: bool = False
+) -> int:
+    """Helper to extract tile index from state.
+
+    ``per_element``: the op gives each element its own index (``tile.index``),
+    where the other ops give the tile one value (``tile.begin``).
+    """
     assert isinstance(tile, torch.SymInt), (type(tile), tile)
     env = CompileEnvironment.current()
     index = _resolve_tile_block_id(tile, state)
     assert index is not None
+    if per_element and env.backend.reflattens_pointwise_tiles():
+        # A backend that re-offers pointwise flatten choices decodes every
+        # element's per-dim indices from the flat offset when it flattens a
+        # tile (its reflattens_pointwise_tiles shows the code), so tile.index
+        # stays the element's own index there.  The choice waits for the
+        # kernel to prove pure pointwise, as that of a partial access does
+        # (update_allow_flattened).  Codegen leaves the spec alone: dropping
+        # the re-offered choice while the first config is generated fails
+        # the next one the search tries with "InvalidConfig: Too many values
+        # for config['flatten_loops'], expected 0, got 1".
+        if state is None:
+            env.config_spec.defer_flatten_loop(index, per_element=True)
+        return index
     # The functions in this file can't be used in flattened loops.
     env.config_spec.flatten_loops.disable_block_id(index)
     # Also drop any cute pointwise re-registration candidate for this loop:

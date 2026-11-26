@@ -42,6 +42,7 @@ from helion._testing import skipIfRefEager
 from helion._testing.metal import addmm_k_loop
 from helion._testing.metal import mpp_only
 from helion._testing.metal import run_with_msl
+from helion._testing.metal import scale_by_0dim
 from helion.autotuner.config_generation import ConfigGeneration
 import helion.language as hl
 
@@ -615,9 +616,9 @@ class TestMetalBoundsMasking(unittest.TestCase):
                 kernel(x[:, 0] if kernel is flat else x)
 
     def test_loop_carry_keeps_a_partial_tiles_fill_values_out(self) -> None:
-        """500 columns end in a 4-column tile of a 16-lane carry: the
-        update's ``torch.exp`` takes 0 in the 12 padded lanes
-        (``_mask_select``), each of which would otherwise add ``exp(0)``."""
+        """500 columns end in a 4-column tile of a 16-lane carry: the 12
+        padded lanes skip the update behind the tile's mask
+        (``masked_branch``), each of which would otherwise add ``exp(0)``."""
         x = torch.randn(64, 500, device=DEVICE)
         result, _, msl = run_with_msl(
             carry_exp_sum, (x,), helion.Config(block_sizes=[16, 4])
@@ -625,8 +626,9 @@ class TestMetalBoundsMasking(unittest.TestCase):
         torch.testing.assert_close(result, torch.exp(x).sum(-1), rtol=1e-4, atol=1e-4)
         self.assertRegex(
             msl,
-            r"_mask_select\w* = \(mask_\d+ \? \w+ : static_cast<float>\(0\)\);",
-            "the operand select not found in generated MSL",
+            r"if \(mask_\d+\) \{\n(?:\s+auto [^\n]*\n)+"
+            r"\s+acc = \(acc_copy_0 \+ _mask_select\);",
+            "the update not found under the tile's mask in generated MSL",
         )
 
 
@@ -2996,7 +2998,9 @@ class TestMetalReductions(unittest.TestCase):
         """
         x = torch.randn(64, 256, device=DEVICE)
         msl = _get_msl(row_sum, (x,))
-        self.assertIn("#include <c10/metal/reduction_utils.h>", msl)
+        # Its SIMD reductions, Helion's copies of c10's (``c10_helpers``).
+        self.assertNotIn("#include <c10/", msl)
+        self.assertRegex(msl[: msl.index("namespace helion_red")], r"\bsimd_sum\b")
         self.assertIn("::c10::metal::simd_##NAME", msl)
         self.assertNotIn("::c10::metal::threadgroup_", msl)
         # A span of 256 takes the cross-SIMD-group tier and its scratch.
@@ -15882,6 +15886,14 @@ class TestMetalConfigFixedScalars(unittest.TestCase):
                 self.assertRaisesRegex(exc.BackendUnsupported, "does not fit an int"),
             ):
                 _constexpr_decl("n", value)
+
+    def test_0dim_tensor_binds_as_a_buffer(self) -> None:
+        """A 0-dim tensor binds as a buffer, which its loads index."""
+        x = torch.randn(64, device=DEVICE)
+        s = torch.tensor(0.5, device=DEVICE)
+        out, _, msl = run_with_msl(scale_by_0dim, (x, s))
+        self.assertIn("device float* s [[buffer(1)]]", msl)
+        torch.testing.assert_close(out, x * 0.5)
 
 
 @helion.kernel(backend="metal", static_shapes=True)

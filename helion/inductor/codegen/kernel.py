@@ -42,6 +42,8 @@ from .overrides import HelionOverrides
 from .overrides import HelionPrinter
 from .overrides import number_constant
 from .overrides import upcast_compute_type
+from .sequence import note_call
+from .tiling import UNROLLED_RDIM_MAX
 from .tiling import contiguous_reads
 from .tiling import static_int
 
@@ -177,6 +179,8 @@ class HelionCSEProxy(CSEProxy):
         # compile time (1.0 / 0.0 raises).
         if name == "where":
             condition, a, b = args
+            if (chosen := kernel.proven_choice(condition, a, b)) is not None:
+                return chosen
             args = (
                 kernel.as_tensor(condition),
                 a,
@@ -363,7 +367,11 @@ def exact_cast(src: torch.dtype | None, dst: torch.dtype | None) -> bool:
 
 
 # The segments a persistent rdim is emitted over (HelionKernel.rdim_segment()):
-# at most this many, each a power of two of at least this many elements.
+# at most this many, each a power of two of at least this many elements; a
+# pointwise axis's segments (pointwise_segment()) are as many and at least as
+# long. Shorter ones turn a dense tile into strided runs: emitted per segment,
+# torch.stack([a, b, c, d], -1) would tile [1024, 1] and store every fourth
+# element four times over, where its [1024, 4] tile stores them in one run.
 RDIM_SEGMENTS_MAX = 4
 RDIM_SEGMENT_MIN = 16
 
@@ -375,18 +383,6 @@ def as_less(relation: sympy.Rel) -> tuple[sympy.Basic, sympy.Basic, bool]:
     if isinstance(relation, (sympy.Gt, sympy.Ge)):
         lhs, rhs = rhs, lhs
     return lhs, rhs, isinstance(relation, (sympy.Lt, sympy.Gt))
-
-
-# The longest rdim a kernel that names it (rdim, codegen_rdim()) names by a
-# factory's dim, which Helion cannot roll, so that it stays one block whatever
-# the autotuner tries, as Triton's rule reads an inner reduction's: an rdim of up
-# to 1024 elements fits one block, and leaving its loop to the autotuner
-# (Config.reduction_loops) widens the search, where a quick search can end on a
-# loop over chunks of the rdim: for LayerNorm over Swin's shifted windows,
-# rdims of 256, it picked reduction_loops [16], slower than the rdim as one block. A
-# kernel that does not name its rdim, as a plain sum's in0[tile_x, :], keeps the
-# rdim's reduction_loops slot, at any length.
-UNROLLED_RDIM_MAX = 1024
 
 
 class HelionKernel(SIMDKernel[CSEVariable]):
@@ -476,6 +472,13 @@ class HelionKernel(SIMDKernel[CSEVariable]):
         self.segments: list[tuple[int, int]] = []
         self.segment: tuple[int, int] | None = None
         self.rdim_extent = 0
+        # The constant cuts that comparisons of a pointwise axis's index make
+        # (a cat's c < 60 along channels), the axis whose equal segments the
+        # kernel emits its whole body over, and the segment's start while it
+        # does; see pointwise_segments() and pointwise_segment().
+        self.axis_cuts: dict[str, OrderedSet[int]] = {}
+        self.axis_segments: tuple[str, list[tuple[int, int]]] | None = None
+        self.axis_segment: tuple[str, int] | None = None
 
     def __enter__(self) -> Self:
         if self.mix_order_reduction and "y" not in self.symbols:
@@ -756,6 +759,14 @@ class HelionKernel(SIMDKernel[CSEVariable]):
             r = self.symbols["r0_"]
             lo = sympy.Integer(self.segment[0])
             index = sympy.expand(index.xreplace({r: sympy.Add(r, lo)}))
+        if self.axis_segment is not None:
+            # Within a segment of a pointwise axis (pointwise_segment()), its
+            # tile counts from the segment's start too.
+            axis, start = self.axis_segment
+            symbol = self.symbols[axis]
+            index = sympy.expand(
+                index.xreplace({symbol: sympy.Add(symbol, sympy.Integer(start))})
+            )
         return V.graph.sizevars.simplify_with_ranges(index, self.tile_ranges)
 
     def tensor_arg(self, operand: IRNode, *, output: bool = False) -> HelionTensorArg:
@@ -1398,6 +1409,7 @@ class HelionKernel(SIMDKernel[CSEVariable]):
             )
             args.append(f"{workspace.outer_name}.view{dims}")
         wrapper.writeline(wrapper.wrap_kernel_call(name, args))
+        note_call(wrapper, name, args)
         if deallocate_ws:
             self.deallocate_workspaces()
 
@@ -1625,6 +1637,7 @@ class HelionKernel(SIMDKernel[CSEVariable]):
                     relation[name](lhs, rhs, evaluate=False)
                 ]
                 self.note_rdim_cut(self.predicates[result.name][0])
+                self.note_axis_cut(self.predicates[result.name][0])
         elif name in ("and_", "logical_and") and len(args) == 2:
             parts = [
                 self.predicates.get(arg.name) if isinstance(arg, CSEVariable) else None
@@ -1653,6 +1666,94 @@ class HelionKernel(SIMDKernel[CSEVariable]):
         extent = self.extents["r0_"]
         if isinstance(extent, (int, sympy.Integer)) and 0 < cut < int(extent):
             self.rdim_cuts.setdefault(node.get_name(), OrderedSet()).add(cut)
+
+    def note_axis_cut(self, relation: sympy.Rel) -> None:
+        """Keep where `relation`, a comparison of a pointwise axis's index with
+        an integer, cuts the axis: c < 60 at 60, the cut of a cat of two
+        [N, 60, H, W] parts along channels (pointwise_segments())."""
+        if self.axis_segment is not None or self.mix_order_reduction:
+            return
+        lhs, rhs, strict = as_less(relation)
+        axis_of = {self.symbols[axis]: axis for axis in self.outer_axes}
+        if lhs in axis_of and isinstance(rhs, sympy.Integer):
+            axis, cut = axis_of[lhs], int(rhs) + (0 if strict else 1)
+        elif rhs in axis_of and isinstance(lhs, sympy.Integer):
+            axis, cut = axis_of[rhs], int(lhs) + (1 if strict else 0)
+        else:
+            return
+        extent = self.extents[axis]
+        if isinstance(extent, (int, sympy.Integer)) and 0 < cut < int(extent):
+            self.axis_cuts.setdefault(axis, OrderedSet()).add(cut)
+
+    def pointwise_segments(self) -> tuple[str, list[tuple[int, int]]] | None:
+        """The pointwise axis and the equal segments of it to emit the whole
+        body over (pointwise_segment()), when the cuts of one axis
+        (note_axis_cut()) make 2 to RDIM_SEGMENTS_MAX segments of one length,
+        at least RDIM_SEGMENT_MIN:
+        the parts of cat([x, relu(bn(y))], 1) of two [512, 60, 28, 28]
+        channels-last parts, cut at 60 of 120 channels. None for cuts on
+        several axes, unequal segments (a pad's 355 and 23567 of 23923), and
+        for a kernel that loops over tile_r, whose loop the body's emissions
+        would share."""
+        if self.rolled_reduction() or len(self.axis_cuts) != 1:
+            return None
+        ((axis, cuts),) = self.axis_cuts.items()
+        extent = self.extents[axis]
+        if not isinstance(extent, (int, sympy.Integer)):
+            return None
+        points = [0, *sorted(cuts), int(extent)]
+        segments = list(itertools.pairwise(points))
+        lengths = {hi - lo for lo, hi in segments}
+        if (
+            not 2 <= len(segments) <= RDIM_SEGMENTS_MAX
+            or len(lengths) != 1
+            or min(lengths) < RDIM_SEGMENT_MIN
+        ):
+            return None
+        return axis, segments
+
+    def rolled_reduction(self) -> bool:
+        """Whether the kernel reduces in a loop over tile_r (not persistent)."""
+        return self.features.is_reduction() and not self.persistent_reduction
+
+    def segment_axis(self, axis: str, segments: list[tuple[int, int]]) -> None:
+        """Emit the kernel over the equal `segments` of pointwise `axis`
+        (pointwise_segments()): its tile spans one segment, and the body is
+        emitted once for each (pointwise_segment())."""
+        length = segments[0][1] - segments[0][0]
+        self.axis_segments = (axis, segments)
+        self.extents[axis] = sympy.Integer(length)
+        self.tile_ranges[self.symbols[axis]] = sympy.Integer(length)
+
+    @contextlib.contextmanager
+    def pointwise_segment(self, start: int) -> Iterator[None]:
+        """Emit within the segment of the segmented axis (segment_axis()) that
+        starts at `start`: its tile counts from `start` (tile_index()), so that
+        the comparisons of a cat's mask are proven (proven()) and its parts are
+        read and written as views of their parameters. For the GhostNet cat
+        of x and relu(bn(y)) along channels and its mean over H and W, the
+        whole channel axis of 120 reads y flat, behind a mask:
+            for tile_y, tile_x in hl.tile([512, 120]):
+                tmp5 = hl.load(in0, [tile_y, slice(None), tile_x], extra_mask=tmp4)
+                tmp11 = hl.load(in1, [(-60) + tile_x.index + 60*hl.arange(rdim)
+                    .reshape([rdim, 1]) + 47040*tile_y.index...], extra_mask=tmp8)
+        and its two segments of 60 read both parts as tiles, the second
+        stored through a view of the output that starts at channel 60:
+            for tile_y, tile_x in hl.tile([512, 60]):
+                tmp0 = in0[tile_y, :, tile_x]
+                out0[tile_y, :, tile_x] = tmp0
+                ...
+                tmp11 = in1[tile_y, :, tile_x].to(torch.float32)
+                ...
+                out2[tile_y, :, tile_x] = tmp21.to(torch.bfloat16)"""
+        assert self.axis_segments is not None
+        axis = self.axis_segments[0]
+        saved = self.axis_segment
+        self.axis_segment = (axis, start)
+        try:
+            yield
+        finally:
+            self.axis_segment = saved
 
     def rdim_cut_segments(self, names: Iterable[str]) -> list[tuple[int, int]] | None:
         """The segments the cuts of the nodes `names` (note_rdim_cut()) make of
@@ -1787,6 +1888,36 @@ class HelionKernel(SIMDKernel[CSEVariable]):
             )
             for axis in axes
         }
+
+    def proven_choice(self, condition: object, a: object, b: object) -> object | None:
+        """The operand torch.where(condition, a, b) takes on every lane when the
+        tiles' ranges prove `condition` (proven()), if it is a value of the
+        where's dtype and shape; else None. Within a cat's segment
+        (pointwise_segment()) the select of the parts,
+            tmp25 = torch.where(tmp4, tmp7, tmp24)
+        with tmp4 = tile_x.index + 60 < 60, false on every lane of the second
+        segment, is the second part's value tmp24, with no select."""
+        if not isinstance(condition, CSEVariable):
+            return None
+        truth = self.proven(condition)
+        if truth is None:
+            return None
+        chosen, other = (a, b) if truth else (b, a)
+        if not isinstance(chosen, CSEVariable) or self.is_number(chosen):
+            return None
+        shapes = {
+            tuple(value.shape or ())
+            for value in (condition, chosen, other)
+            if isinstance(value, CSEVariable) and not self.is_number(value)
+        }
+        widest = max(shapes, key=len)
+        if tuple(chosen.shape or ()) != widest or not all(
+            set(tile_axes(shape)) <= set(tile_axes(widest)) for shape in shapes
+        ):
+            return None
+        if isinstance(other, CSEVariable) and other.dtype != chosen.dtype:
+            return None
+        return chosen
 
     def proven(self, condition: CSEVariable) -> bool | None:
         """Whether the tiles' ranges make `condition` true on every lane (True)

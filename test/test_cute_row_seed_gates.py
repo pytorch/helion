@@ -155,10 +155,11 @@ def _fired(bound: BoundKernel) -> list[str]:
 
 
 def _block_sizes_in_order(
-    env: CompileEnvironment, device_ir: DeviceIR
+    env: CompileEnvironment, device_ir: DeviceIR, row: int | None = None
 ) -> list[list[int]]:
     """What the heuristics took for the rows' tile axes before the gate:
-    every block size, in the order registered."""
+    every block size, in the order registered (whatever block a kernel
+    without a reduction loop reduces, ``row``)."""
     return [list(env.config_spec.block_sizes.valid_block_ids())]
 
 

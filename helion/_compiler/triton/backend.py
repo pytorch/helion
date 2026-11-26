@@ -210,6 +210,30 @@ class TritonBackend(Backend):
     def supports_eager_prepared_call(self) -> bool:
         return True
 
+    def range_warp_specializes(self, config: Config) -> list[bool | None]:
+        specialized = config.range_warp_specializes
+        if any(specialized):
+            from .packed_mxfp8 import render_drops_whole_dot
+
+            # An Inductor render under which the packed MXFP8 dot keeps the
+            # generic loads the binding's own launches replace cannot
+            # warp-specialize their loops.
+            if render_drops_whole_dot(config):
+                return [False if enabled else enabled for enabled in specialized]
+        return specialized
+
+    def reads_inductor_call_facts(
+        self, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> bool:
+        # The native packed MXFP8 lowering's descriptor and pointer forms read
+        # the traced layouts of its operands and scale words, and the
+        # dispatch guards that key them (``triton/packed_mxfp8.py``).
+        from ..mxfp8 import native_packed_mxfp8_kernel
+
+        return super().reads_inductor_call_facts(
+            env, device_ir
+        ) or native_packed_mxfp8_kernel(env, device_ir.graphs)
+
     @property
     def supports_inductor_fusion(self) -> bool:
         return True

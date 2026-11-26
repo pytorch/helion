@@ -181,6 +181,19 @@ of overrun, together at most a quarter of the budget but never less than
 the phase's smallest plan) and the phase is sized to the time left (see
 [Settings](api/settings.md)).
 
+The L2 flush before a timed call writes ordinary lines, so lines that a
+candidate loaded or stored with an evict-last hint survive it, and from its
+second call on a hinted candidate reads part of its operands warm. A kernel
+that runs between other kernels in a model rarely finds those lines again.
+`autotune_l2_flush_sweep=True` (or `HELION_AUTOTUNE_L2_FLUSH_SWEEP=1`)
+follows every flush of the search and the final selection with a sweep that
+displaces such lines, and the readings leave the sweep out as they leave the
+flush out. On a GB300 the searched configs of memory-bound reductions read
+14-33% slower per call flushed without their hints than with them (6.87
+against 5.25 us), and about the same once every flush is followed by the
+sweep. The option is off by default,
+and searches with it keep their winners apart in the autotune cache.
+
 On the CuTe backend many configs generate the same code: they differ only
 in settings the code does not depend on.  A CuTe search does not time a
 candidate whose generated code an earlier candidate of the search already

@@ -427,6 +427,7 @@
  "test/test_jagged_tile_provenance.py": 2.1,
  "test/test_kda_prefill_staged.py": 4.4,
  "test/test_kernel_metadata.py": 9.8,
+ "test/test_l2_flush_sweep.py": 0.1,
  "test/test_literal_dims.py": 1.4,
  "test/test_llm_autotuner.py": 0.5,
  "test/test_logging.py": 0.4,

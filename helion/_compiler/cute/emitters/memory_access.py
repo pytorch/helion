@@ -267,7 +267,9 @@ def _cute_active_local_coord(
     state: CodegenState, block_id: int, *, honor_override: bool = False
 ) -> str | None:
     """The per-lane coordinate of ``block_id`` along its thread axis, or None
-    when no active loop or grid maps the block onto a thread axis.
+    when no active loop or grid maps the block onto a thread axis, or the
+    block is one of a tile flattened over several blocks (whose lanes walk
+    the flat offset, not one block's coordinate).
 
     ``honor_override`` is the mask builder's variant: an operand index
     override (``_cute_index_override``) replaces the block's index by a serial
@@ -277,17 +279,37 @@ def _cute_active_local_coord(
     apart on purpose: unifying them changes the lifted ``tile_begin`` of an
     overridden operand.
     """
+    from ...tile_strategy import PerThreadFlattenedTileStrategy
     from ..cute_reshape import _grid_local_coord_expr
 
     if honor_override and _cute_index_override(state, block_id) is not None:
         return None
     block_id = _cute_remap_block_id(state, block_id)
     loops = state.codegen.active_device_loops.get(block_id)
+    grid_state = state.codegen.current_grid_state
+    strategy = (
+        loops[-1].strategy
+        if loops
+        else grid_state.strategy
+        if grid_state is not None
+        else None
+    )
+    if (
+        isinstance(strategy, PerThreadFlattenedTileStrategy)
+        and len(strategy.block_ids) > 1
+        and block_id in strategy.block_ids
+    ):
+        # A tile flattened over several blocks walks them as one: a thread's
+        # place in it is no coordinate along one of them.  Flattened over
+        # [32, 33] in 64 threads, the coordinate along the rows would read
+        # thread_idx()[0], and ``thread_idx()[0] < 32`` would mask threads
+        # 32 to 63, whose elements are real; the callers fall back to the
+        # element's own index (``indices_0``) less the tile base.
+        return None
     if loops:
         thread_axis = loops[-1].block_thread_axes.get(block_id)
         if thread_axis is not None:
             return _grid_local_coord_expr(state.codegen, block_id, thread_axis)
-    grid_state = state.codegen.current_grid_state
     if grid_state is not None:
         thread_axis = grid_state.block_thread_axes.get(block_id)
         if thread_axis is not None:

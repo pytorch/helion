@@ -612,6 +612,16 @@ class Backend(abc.ABC):
         """
         return False
 
+    def reads_inductor_call_facts(
+        self, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> bool:
+        """Whether the code generated for the kernel traced as ``device_ir``
+        reads the facts of ``binds_inductor_call_facts``: every kernel of such
+        a backend, and a kernel of another one whose lowering reads them
+        (``BoundKernel.reads_inductor_call_facts``).  Called with ``env``
+        active."""
+        return self.binds_inductor_call_facts
+
     @property
     def supports_inductor_fusion(self) -> bool:
         """Whether generated kernels apply Inductor's prologue/epilogue hooks.
@@ -2375,9 +2385,11 @@ class Backend(abc.ABC):
         return False
 
     def reflattens_pointwise_tiles(self) -> bool:
-        """Whether a flatten-loop spec a partial-block access disables stays a
-        candidate (``ConfigSpec.cute_reflatten_candidates``) for the device-IR
-        analysis to re-register once the kernel proves pointwise."""
+        """Whether a flatten-loop spec that a partial-block access or a
+        tile.index read disables stays a candidate
+        (``ConfigSpec.cute_reflatten_candidates``) for the device-IR analysis
+        to re-register once the kernel proves pointwise: the backend decodes
+        a flattened tile's per-dim indices per element."""
         return False
 
     def tunes_lane_vector_widths(self) -> bool:

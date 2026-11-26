@@ -2564,7 +2564,6 @@ class FlattenedTileStrategy(BlockSizeTileStrategy):
                         disable = True
                         break
             if disable:
-                flatten_loops.disable_block_id(block_ids[0])
                 if env.backend.reflattens_pointwise_tiles():
                     # This gate exists for vector-model backends, where a
                     # partial-block access (``bias[tile_n]``) cannot
@@ -2575,9 +2574,9 @@ class FlattenedTileStrategy(BlockSizeTileStrategy):
                     # and let device-IR analysis re-register it once the
                     # PointwiseElementwiseFact (no reductions / matmuls /
                     # accumulators) is known.
-                    cands = env.config_spec.cute_reflatten_candidates
-                    if all(c.block_ids != block_ids for c in cands):
-                        cands.append(spec)
+                    env.config_spec.defer_flatten_loop(block_ids[0], spec=spec)
+                else:
+                    flatten_loops.disable_block_id(block_ids[0])
 
     @staticmethod
     def compacts_tiles(device_ir: DeviceIR) -> bool:

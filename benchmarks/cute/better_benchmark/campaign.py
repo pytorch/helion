@@ -870,6 +870,13 @@ def main() -> None:
         "(bench.py --rotate-inputs: rot_us)",
     )
     parser.add_argument(
+        "--cold-timer",
+        choices=common.COLD_TIMERS,
+        default=None,
+        help="the timer of every bench's cold_us (bench.py --cold-timer; its "
+        "default when unset). Records of one run must share it.",
+    )
+    parser.add_argument(
         "--bench-repeats",
         type=int,
         default=1,
@@ -1456,6 +1463,10 @@ def main() -> None:
                     bench_out, [config_file(repro, shape, b) for b in backends]
                 )
                 and timed_on_current(bench, finished)
+                # (timed by the cold timer this start asks for: the repeats
+                # of one point aggregate under one timer)
+                and common.cold_timer(finished)
+                == (args.cold_timer or common.COLD_TIMERS[0])
             )
             if "bench" in phases:
                 queued = queue(bench, args.rebench or autotune_pending or stale)
@@ -1574,6 +1585,8 @@ def main() -> None:
                 cmd += ["--impls", bench_impls]
             if args.rotate_inputs:
                 cmd += ["--rotate-inputs", str(args.rotate_inputs)]
+            if args.cold_timer is not None:
+                cmd += ["--cold-timer", args.cold_timer]
             fields["failed_autotunes"] = [d for d in job.deps if not done[d]]
         # A rerun's old record must not outlive a rerun that fails or is
         # stopped: a restart would take it for finished and a bench would pin

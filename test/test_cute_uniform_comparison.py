@@ -13,7 +13,9 @@ import torch
 from torch.fx.experimental.proxy_tensor import make_fx
 
 import helion
+from helion import exc
 from helion._compiler.compile_environment import CompileEnvironment
+from helion._compiler.cute import _ast_pass_utils
 from helion._compiler.cute import uniform_comparison
 from helion._compiler.cute.autotune.heuristics.cute import CutePointwiseVecHeuristic
 from helion._compiler.cute.uniform_comparison import UniformComparisonLowering
@@ -447,6 +449,60 @@ def test_pointwise_seed_discovery_is_unchanged():
     with patch.object(uniform_comparison, "match_uniform_float_gt", return_value=None):
         control = seeds()
     assert actual and actual == control
+
+
+@helion.kernel(
+    backend="cute", static_shapes=True, autotune_effort="none", cute_rng_stream="word0"
+)
+def _rms_norm_between_dropouts(
+    seed0: torch.Tensor,
+    x: torch.Tensor,
+    seed1: torch.Tensor,
+    mask: torch.Tensor,
+    out: torch.Tensor,
+) -> None:
+    """T5's RMSNorm between two dropouts, as helion.inductor emits it: both
+    seeds are 0-d loads ahead of the row, and the second dropout's draw
+    follows the row's sum."""
+    for tile_x in hl.tile(x.size(0)):
+        rdim = hl.zeros([tile_x, 512]).size(1)
+        first = seed0[()]
+        row = x[tile_x, :]
+        second = seed1[()]
+        offsets = hl.arange(rdim) + 512 * tile_x.index.reshape([tile_x, 1])
+        keep = hl.rand([], seed=first, offsets=offsets) > 0.1
+        mask[tile_x, :] = keep
+        kept = keep.to(torch.float32) * row
+        rstd = torch.rsqrt(torch.sum(kept * kept, -1) / 512.0 + 1e-6)
+        keep2 = hl.rand([], seed=second, offsets=offsets) > 0.1
+        out[tile_x, :] = keep2.to(torch.float32) * (kept * rstd.reshape([tile_x, 1]))
+
+
+def test_uniform_comparison_marker_does_not_pin_a_lane_split():
+    """The first dropout's ``rand > 0.1`` is ``_helion_uniform_gt(...)`` in
+    the lane loop the row's sum splits; pinned as a call of unknown effects,
+    it kept the second seed's load, ``second = seed1.iterator.load()``, out
+    of the lane-invariant statements between the passes, and every config
+    failed with "a lane-invariant statement is ordered before the
+    accumulate pass of a lane reduction"."""
+    seeds = torch.zeros(2, dtype=torch.int64)
+    args = (
+        seeds[0],
+        torch.empty(64, 512),
+        seeds[1],
+        torch.empty(64, 512, dtype=torch.bool),
+        torch.empty(64, 512),
+    )
+    bound = cpu_bind(_rms_norm_between_dropouts, args)
+    code = bound.to_code(bound.config_spec.default_config())
+    assert "uniform_cutoff(" in code
+    assert "_helion_uniform_gt(" not in code
+    with (
+        patch.object(_ast_pass_utils, "_uniform_comparison_marker", return_value=None),
+        pytest.raises(exc.BackendUnsupported, match="before the accumulate pass"),
+    ):
+        bound = cpu_bind(_rms_norm_between_dropouts, args)
+        bound.to_code(bound.config_spec.default_config())
 
 
 CUDA_DEVICE = "cuda"

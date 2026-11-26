@@ -286,6 +286,7 @@ def _runtime_settings(**overrides: object) -> SimpleNamespace:
         "autotune_baseline_accuracy_check_fn": None,
         "autotune_benchmark_fn": None,
         "autotune_benchmark_input_banks": 1,
+        "autotune_l2_flush_sweep": False,
         "autotune_config_filter": None,
         "autotune_config_overrides": {},
         "autotune_search_acf": [],
@@ -1396,8 +1397,10 @@ class TestMultiShapeSearchOrchestration(unittest.TestCase):
             setup=Mock(),
             cleanup=Mock(),
             # ``NoConfigFound`` asks the provider whether the worker's compile
-            # deadline dropped every candidate (``BenchmarkProvider`` default).
+            # deadline dropped every candidate, or a benchmark prelude took
+            # readings (``BenchmarkProvider`` defaults).
             compile_deadline_cascade=Mock(return_value=None),
+            prelude_failure_cascade=Mock(return_value=None),
         )
         search._prepare = Mock()  # type: ignore[method-assign]
         search._autotune = Mock(  # type: ignore[method-assign]

@@ -85,13 +85,11 @@ def new_var_source(node: torch.fx.Node) -> torch.fx.Node | None:
 
 
 def strip_new_var(node: object) -> object:
-    """``node`` with every ``_new_var`` wrapper removed."""
-    from ....language._tracing_ops import _new_var
+    """``node`` with every ``_new_var`` wrapper removed (the core helper
+    ``node_masking.skip_copies``)."""
+    from ...node_masking import skip_copies
 
-    while is_call(node, _new_var):
-        assert isinstance(node, torch.fx.Node)
-        node = node.args[0]
-    return node
+    return skip_copies(node)
 
 
 def host_tensor_name(node: object) -> str | None:

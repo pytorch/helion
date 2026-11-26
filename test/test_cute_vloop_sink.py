@@ -2226,6 +2226,46 @@ def test_line_per_warp_twins_follow_the_first_load(cpu_only: None) -> None:
     assert all(max(seed["cute_vector_widths"]) == 8 for seed in swapped), swapped
 
 
+def test_short_strided_reductions_get_a_single_thread_line_twin(
+    cpu_only: None,
+) -> None:
+    """A squeeze-excite pool over 49 positions of 960 bf16 channels (rows
+    1920 bytes apart, on line boundaries), the shape of better-benchmark's
+    channels-last BatchNorm-ReLU means: the reduction fits one 64-row chunk,
+    so the last twin gives each thread of a warp along the channels its two
+    columns' 49 rows in lanes of 8, with one reduction thread.  The CTA is
+    that warp, and it combines nothing across threads: no shared memory and
+    no barrier.  81 rows keep the 16-thread twin alone."""
+    x = torch.empty(8, 49, 960, dtype=torch.bfloat16)
+    bound, _, twins = _line_warp_twins(_spatial_mean, (x,))
+    spec = bound.config_spec
+    (reduction,) = spec.reduction_loops.valid_block_ids()
+    single = twins[-1]
+    assert len(twins) == 2, twins
+    assert (
+        single["block_sizes"],
+        spec.num_threads.config_get(single["num_threads"], reduction),
+        spec.cute_vector_widths.config_get(single["cute_vector_widths"], reduction),
+        max(
+            spec.cute_vector_widths.config_get(single["cute_vector_widths"], block)
+            for block in spec.block_sizes.valid_block_ids()
+        ),
+        single["reduction_loops"],
+        single["cute_lane_unroll"],
+    ) == ([1, 64], 1, 8, 2, [64], 1), single
+    code = bound.to_code(spec.normalized_config(helion.Config(**single)))
+    assert "block=(32, 1, 1)" in code, code
+    assert "_cute_load_v4b_if(" in code, code
+    assert _thread_axis_of(code, "lane_base_1") == 0, code
+    assert "smem" not in code and "sync_threads" not in code, code
+    _, _, longer = _line_warp_twins(
+        _spatial_mean, (torch.empty(8, 81, 960, dtype=torch.bfloat16),)
+    )
+    assert [
+        spec.num_threads.config_get(seed["num_threads"], reduction) for seed in longer
+    ] == [16], longer
+
+
 @pytest.mark.parametrize(
     ("args", "twins"),
     [
@@ -2233,9 +2273,10 @@ def test_line_per_warp_twins_follow_the_first_load(cpu_only: None) -> None:
         # sinks.
         pytest.param((torch.empty(8, 196, 768),), 0, id="fp32"),
         # Rows 240 bytes apart start inside a line: a warp's packets would
-        # straddle two lines, shared with the neighboring CTA.
+        # straddle two lines, shared with the neighboring CTA.  49 rows would
+        # get both twins on line boundaries (rows 256 bytes apart).
         pytest.param(
-            (torch.empty(8, 196, 120, dtype=torch.bfloat16),),
+            (torch.empty(8, 49, 120, dtype=torch.bfloat16),),
             0,
             id="rows_inside_a_line",
         ),
@@ -2252,13 +2293,20 @@ def test_line_per_warp_twins_follow_the_first_load(cpu_only: None) -> None:
             0,
             id="tile_under_a_line",
         ),
-        # 32 rows leave the twin's 16 threads two rows each, under its 4-deep
-        # unroll; from 33 rows (one clamped 64-row chunk) the twin fits.
+        # 32 rows leave the 16-thread twin's threads two rows each, under its
+        # 4-deep unroll: the single-thread twin alone.  From 33 rows (one
+        # clamped 64-row chunk) both fit, and past 64 rows the 16-thread twin
+        # alone.
         pytest.param(
-            (torch.empty(8, 32, 768, dtype=torch.bfloat16),), 0, id="short_reduction"
+            (torch.empty(8, 32, 768, dtype=torch.bfloat16),), 1, id="short_reduction"
         ),
         pytest.param(
-            (torch.empty(8, 33, 768, dtype=torch.bfloat16),), 1, id="one_clamped_chunk"
+            (torch.empty(8, 33, 768, dtype=torch.bfloat16),), 2, id="one_clamped_chunk"
+        ),
+        pytest.param(
+            (torch.empty(8, 65, 768, dtype=torch.bfloat16),),
+            1,
+            id="past_single_thread_rows",
         ),
     ],
 )
@@ -2339,7 +2387,8 @@ def test_strided_reduction_heuristic_seeds_every_kernel_of_a_batchnorm_chain(
     ``cute_lane_unroll`` open to the search.  The configs a cold autotune
     found from these seeds ran the chain in 25.3 us, against 32.3 us for
     those found without them (B200).  The two kernels over bf16 rows (1408
-    channels, on line boundaries) each add one line-per-warp twin."""
+    channels, on line boundaries) each add one line-per-warp twin, and the
+    49-row spatial mean a second one with a single reduction thread."""
     partials = torch.empty(49, 1408, dtype=torch.float32)
     channels = torch.empty(1408, dtype=torch.float32)
     for kernel, args, count in (
@@ -2348,7 +2397,7 @@ def test_strided_reduction_heuristic_seeds_every_kernel_of_a_batchnorm_chain(
         (
             _bn_relu_spatial_mean,
             (torch.empty(128, 49, 1408, dtype=torch.bfloat16), channels, channels),
-            4,
+            5,
         ),
     ):
         spec = cpu_bind(kernel, args).config_spec

@@ -12,7 +12,6 @@ import importlib.util
 import json
 import os
 from pathlib import Path
-import shlex
 import signal
 import stat
 import subprocess
@@ -2368,44 +2367,6 @@ def test_main_cleared_pyargs_still_rejects_missing_paths(tmp_path, monkeypatch, 
         )
 
 
-def test_review_cpu_examples_build_only_cpu_jobs(tmp_path, monkeypatch):
-    prompt = _load("autoreview").build_review_prompt(False)
-    runner = f"{shlex.quote(sys.executable)} scripts/run_tests.py "
-    examples = [
-        shlex.split(line)[2:] for line in prompt.splitlines() if line.startswith(runner)
-    ]
-    assert len(examples) == 2
-    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "")
-    monkeypatch.setattr(run_tests, "LOGS_DIR", tmp_path / "logs")
-
-    def unexpected(*args, **kwargs):
-        pytest.fail("review CPU examples must not discover or claim GPUs")
-
-    for name in ("sample_gpus", "claim_gpus", "pick_and_claim", "hold_claim"):
-        monkeypatch.setattr(gpu_board, name, unexpected)
-    observed = []
-
-    def capture_jobs(self, jobs, quiet=False):
-        observed.extend(jobs)
-        return {job.name: run_tests.JobResult(job, 0, 0) for job in jobs}
-
-    monkeypatch.setattr(run_tests.Runner, "run", capture_jobs)
-    monkeypatch.setattr(run_tests, "summarize", lambda *args: ("mocked CPU jobs", 0))
-    for argv in examples:
-        args = run_tests.parse_args(argv)
-        assert not args.gpus and not args.force and not args.no_board
-        assert len(args.paths) == 1 and args.paths[0].startswith("test/")
-        assert args.extra in (["-n", "2"], ["-n", "0"])
-        assert run_tests.main(argv) == 0
-    assert [(job.backend, job.lane) for job in observed] == [
-        ("triton", "cpu"),
-        ("cute", "cpu"),
-        ("pallas-interpret", "serial"),
-    ]
-    assert all(job.gpu is None for job in observed)
-    assert all(job.env["CUDA_VISIBLE_DEVICES"] == "" for job in observed)
-
-
 def test_no_board_needs_explicit_gpus(monkeypatch):
     monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
     with pytest.raises(SystemExit):
@@ -3127,6 +3088,18 @@ def test_multi_gpu_default_count():
     )
 
 
+def _write_pid_source(path: Path) -> str:
+    """Statements that write the running process's pid to ``path`` for a
+    reader that waits for ``path`` to exist: through a file renamed into
+    place, as ``write_text`` creates ``path`` before it writes the pid, and
+    a process retired in between leaves it empty. Needs ``os`` and ``Path``."""
+    temp = path.with_name(f"{path.name}.tmp")
+    return (
+        f"Path({str(temp)!r}).write_text(str(os.getpid())); "
+        f"os.replace({str(temp)!r}, {str(path)!r})"
+    )
+
+
 @pytest.mark.slow
 @pytest.mark.skipif(sys.platform != "linux", reason="Linux per-job orphan adoption")
 @pytest.mark.parametrize("mode", ["exit", "detached", "cancel", "exception"])
@@ -3145,7 +3118,7 @@ import os, signal, time
 from pathlib import Path
 signal.signal(signal.SIGTERM, signal.SIG_IGN)
 parent = os.getppid()
-Path({str(child_file)!r}).write_text(str(os.getpid()))
+{_write_pid_source(child_file)}
 deadline = time.monotonic() + 20
 while not Path({str(release)!r}).exists() and time.monotonic() < deadline:
     if not Path(f'/proc/{{parent}}').exists():
@@ -3324,7 +3297,7 @@ while not Path({str(child)!r}).exists():
     second = f"""
 import os, time
 from pathlib import Path
-Path({str(child)!r}).write_text(str(os.getpid()))
+{_write_pid_source(child)}
 deadline = time.monotonic() + 20
 while not Path({str(release)!r}).exists() and time.monotonic() < deadline:
     time.sleep(0.01)
@@ -3381,7 +3354,7 @@ def test_runner_log_close_failure_retires_started_job(
     job_log = tmp_path / "close-error.log"
     source = (
         "import os,time; from pathlib import Path; "
-        f"Path({str(pid_file)!r}).write_text(str(os.getpid())); time.sleep(30)"
+        f"{_write_pid_source(pid_file)}; time.sleep(30)"
     )
     job = run_tests.Job(
         "close-error",

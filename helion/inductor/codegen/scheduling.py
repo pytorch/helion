@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import functools
 from typing import TYPE_CHECKING
 from typing import Any
@@ -9,6 +10,7 @@ import sympy
 from torch._inductor import config
 from torch._inductor import metrics
 from torch._inductor.codegen.common import BackendFeature
+from torch._inductor.codegen.common import WorkspaceZeroMode
 from torch._inductor.codegen.simd import SIMDScheduling
 from torch._inductor.codegen.simd_kernel_features import DisableReduction
 from torch._inductor.codegen.simd_kernel_features import EnableReduction
@@ -33,9 +35,11 @@ from ..support import numerics_modes
 from ..support import python_wrapper
 from .kernel import ARG_REDUCTIONS
 from .kernel import REDUCTIONS
-from .kernel import UNROLLED_RDIM_MAX
 from .kernel import HelionKernel
 from .overrides import HelionOverrides
+from .sequence import module_key
+from .sequence import predecessor
+from .tiling import UNROLLED_RDIM_MAX
 from .tiling import natural_tiling
 
 if TYPE_CHECKING:
@@ -265,12 +269,29 @@ class HelionScheduling(SIMDScheduling):
         return inductor_tiling, scores
 
     @staticmethod
-    def format_kernel_definition(name: str, source: str) -> str:
+    def format_kernel_definition(
+        name: str, source: str, after: str | None = None, after_key: str = ""
+    ) -> str:
         escaped = source.replace("\\", "\\\\").replace('"""', '\\"""')
-        return (
-            f'{name}_source = """\\\n{escaped}"""\n'
-            f"{name} = PyCodeCache.load({name}_source).kernel"
+        # A kernel tuned behind another loads its module under that kernel's
+        # source (after_key): PyCodeCache gives graphs with the same source
+        # one module and one Kernel, whose config the first graph to call it
+        # selects, so a graph that calls the kernel behind other work must
+        # not get it. In the same graph's code, behind the same kernel, it is
+        # the same module.
+        load = (
+            f"PyCodeCache.load({name}_source{f', {after_key!r}' if after_key else ''})"
         )
+        definition = f'{name}_source = """\\\n{escaped}"""\n{name} = {load}.kernel'
+        if helion_config.tune_in_sequence:
+            # The kernel's first call is tuned behind the first call of
+            # kernel ``after``, the Helion kernel call just before it, or
+            # alone (helion.inductor.codegen.sequence).
+            definition += (
+                f'\n{name} = helion_in_sequence({name}, globals(), "{name}", '
+                f"after={after!r})"
+            )
+        return definition
 
     def generate_node_schedule(
         self,
@@ -443,6 +464,39 @@ class HelionScheduling(SIMDScheduling):
         if helion_kernel.needs_bounds_check:
             raise Unsupported("check_bounds")
 
+    def _codegen_node_schedule_body(
+        self, node_schedule: list[Any], kernel: SIMDKernel[Any]
+    ) -> None:
+        """SIMDScheduling's emission of the node schedule, once for each
+        segment of a segmented pointwise axis (HelionKernel.segment_axis()):
+        every node of the kernel, for the first segment and then the next
+        (HelionKernel.pointwise_segment()). Each segment starts from the store
+        cache the first one started with, as an rdim's segments do, so that a
+        load of a buffer the kernel stores reads its own segment's part."""
+        helion_kernel = cast("HelionKernel", kernel)
+        if helion_kernel.axis_segments is None:
+            super()._codegen_node_schedule_body(node_schedule, kernel)
+            return
+        _, segments = helion_kernel.axis_segments
+        store_cache = dict(helion_kernel.cse.store_cache)
+        for index, (start, _) in enumerate(segments):
+            helion_kernel.cse.store_cache.clear()
+            helion_kernel.cse.store_cache.update(store_cache)
+            with helion_kernel.pointwise_segment(start):
+                if index == 0:
+                    super()._codegen_node_schedule_body(node_schedule, kernel)
+                    continue
+                # The emitting pass of _codegen_node_schedule_body(), whose
+                # indexing pass the first segment ran.
+                with contextlib.ExitStack() as stack:
+                    for node in node_schedule:
+                        if node is DisableReduction:
+                            stack.enter_context(kernel.disable_reduction())
+                        elif node is EnableReduction:
+                            stack.close()
+                        else:
+                            node.codegen(kernel.split_and_set_ranges(node.get_ranges()))
+
     def create_kernel_choices(  # pyrefly: ignore [bad-override]
         self,
         kernel_features: SIMDKernelFeatures,
@@ -453,25 +507,30 @@ class HelionScheduling(SIMDScheduling):
         if not HelionKernel.supports_tiling(tiling):
             raise Unsupported(f"tiling {tiling}")
         kernel = HelionKernel(*kernel_args, **kernel_kwargs)
-        if not kernel.persistent_reduction or kernel.mix_order_reduction:
+        if kernel.mix_order_reduction:
             return [kernel]
+        # Only a node with a masked part (a cat's or pad's ops.masked()) can
+        # cut an axis (HelionKernel.pointwise_segments()) or, trailing a
+        # persistent reduction, its rdim (rdim_segments()) into segments.
+        masked = any(
+            isinstance(node, SchedulerNode) and node._body.subblocks
+            for node in kernel_features.node_schedule
+        )
+        if not kernel.persistent_reduction:
+            if not masked or kernel.rolled_reduction():
+                return [kernel]
+            self.probe(kernel_features, kernel)
+            return [self.with_pointwise_segments(kernel, kernel_args, kernel_kwargs)]
         long_rdim = "override_persistent_reduction" not in kernel_kwargs and (
             V.graph.sizevars.statically_known_gt(
                 kernel.numels["r0_"], UNROLLED_RDIM_MAX
             )
         )
         group, earlier = self.trailing_nodes(kernel_features.node_schedule)
-        # Only a trailing node with a masked part (a cat's or pad's
-        # ops.masked()) can cut the rdim into segments.
         cuttable = any(node._body.subblocks for node in group)
-        if not long_rdim and not cuttable:
+        if not long_rdim and not masked:
             return [kernel]
-        # Emitting the body tells what the kernel needs of its rdim.
-        self.codegen_node_schedule_with_kernel(kernel_features.node_schedule, kernel)
-        # The kernel emitted to tell is not the one returned below: take back
-        # the count its Kernel.__init__ added to metrics.generated_kernel_count,
-        # which tests compare with the kernels a graph launches.
-        metrics.generated_kernel_count -= 1
+        self.probe(kernel_features, kernel)
         if long_rdim and kernel.uses_rdim and kernel.rdim_anchor is None:
             # An rdim past UNROLLED_RDIM_MAX that the kernel names (rdim) but no
             # input's full rdim does (HelionKernel.rdim_anchor) has a factory's
@@ -492,10 +551,33 @@ class HelionScheduling(SIMDScheduling):
             if cuttable and not long_rdim
             else None
         )
+        if segmented is None and not long_rdim:
+            return [self.with_pointwise_segments(kernel, kernel_args, kernel_kwargs)]
         kernel = HelionKernel(*kernel_args, **kernel_kwargs)
         if segmented is not None:
             kernel.segment_nodes, kernel.segments = segmented
         return [kernel]
+
+    def probe(self, kernel_features: SIMDKernelFeatures, kernel: HelionKernel) -> None:
+        """Emit the body into `kernel`, which tells what the kernel needs of its
+        rdim and axes (rdim_anchor, rdim_cuts, axis_cuts)."""
+        self.codegen_node_schedule_with_kernel(kernel_features.node_schedule, kernel)
+        # The kernel emitted to tell is not the one returned: take back the
+        # count its Kernel.__init__ added to metrics.generated_kernel_count,
+        # which tests compare with the kernels a graph launches.
+        metrics.generated_kernel_count -= 1
+
+    @staticmethod
+    def with_pointwise_segments(
+        probe: HelionKernel, kernel_args: list[Any], kernel_kwargs: dict[str, Any]
+    ) -> HelionKernel:
+        """A fresh kernel, emitted over the equal segments of the pointwise
+        axis whose cuts the `probe` saw (HelionKernel.pointwise_segments()),
+        if it saw such cuts."""
+        kernel = HelionKernel(*kernel_args, **kernel_kwargs)
+        if (segments := probe.pointwise_segments()) is not None:
+            kernel.segment_axis(*segments)
+        return kernel
 
     @staticmethod
     def trailing_nodes(
@@ -574,11 +656,38 @@ class HelionScheduling(SIMDScheduling):
         )
         wrapper.src_to_kernel[src_code] = name
         wrapper.add_import_once("from torch._inductor.codecache import PyCodeCache")
+        if helion_config.tune_in_sequence:
+            wrapper.add_import_once(
+                "from helion.inductor.kernel_sequence import "
+                "in_sequence as helion_in_sequence"
+            )
+        after = after_key = None
+        if helion_config.tune_in_sequence and not any(
+            # A workspace the call zeroes first is a memset launched between
+            # the two calls (generate_workspace_allocation writes it before
+            # the call): the kernel is tuned alone.
+            workspace.zero_mode != WorkspaceZeroMode.UNINITIALIZED
+            for workspace in kernel.args.workspace_args
+        ):
+            after = predecessor(wrapper)
+        if after is not None:
+            (after_source,) = (
+                source
+                for source, kernel_name in wrapper.src_to_kernel.items()
+                if kernel_name == after
+            )
+            after_key = module_key(
+                wrapper,
+                name,
+                after,
+                after_source,
+                cast("HelionKernel", kernel).call_args(),
+            )
         # gpu=False keeps it out of the compile-time autotune block, which has
         # no PyCodeCache import.
         wrapper.define_kernel(
             name,
-            self.format_kernel_definition(name, src_code),
+            self.format_kernel_definition(name, src_code, after, after_key or ""),
             gpu=False,
             standalone=True,
         )

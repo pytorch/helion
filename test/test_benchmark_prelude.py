@@ -11,19 +11,26 @@ import importlib.util
 import sys
 from types import SimpleNamespace
 from typing import TYPE_CHECKING
+from unittest.mock import Mock
 
 import pytest
 import torch
 
 from helion import exc
+from helion._testing.benchmark_timers import LoggedPrelude
+from helion._testing.benchmark_timers import stand_in_event_timer
+from helion._testing.benchmark_timers import stand_in_trace
 from helion.autotuner import benchmark_job
 from helion.autotuner import benchmark_provider
 from helion.autotuner import benchmarking
+from helion.autotuner.base_search import BaseSearch
 from helion.autotuner.base_search import PopulationBasedSearch
 from helion.autotuner.benchmark_prelude import BenchmarkPrelude
 from helion.autotuner.benchmark_prelude import KernelSequence
 from helion.autotuner.benchmark_prelude import PreludeFailed
 from helion.autotuner.benchmark_prelude import PreludeOutput
+from helion.autotuner.benchmark_prelude import PreludeRefused
+from helion.autotuner.benchmark_prelude import PreludeSearchFailed
 from helion.autotuner.benchmark_prelude import PreludeStep
 from helion.autotuner.benchmark_prelude import PreludeUnsupported
 from helion.autotuner.benchmark_prelude import active_prelude
@@ -32,6 +39,8 @@ from helion.autotuner.benchmark_prelude import timed_behind
 from helion.autotuner.benchmark_provider import LocalBenchmarkProvider
 from helion.autotuner.local_cache import _hash_search_policy
 from helion.autotuner.local_cache import _search_policy_hash
+from helion.autotuner.logger import AutotuningLogger
+from helion.autotuner.metrics import AutotuneMetrics
 from helion.runtime.settings import Settings
 
 if TYPE_CHECKING:
@@ -310,46 +319,11 @@ def test_timed_behind_names_a_prelude_inside_its_block_only() -> None:
     assert active_prelude() is None
 
 
-class _Prelude:
-    """A prelude as a timer sees one."""
-
-    def __init__(self, log: list[str]) -> None:
-        self.log = log
-
-    def run(self) -> None:
-        self.log.append("prelude")
-
-
 @pytest.fixture
 def event_timer(monkeypatch: pytest.MonkeyPatch) -> list[str]:
     """``do_bench`` on a stand-in Triton driver: the log receives every
-    flush, event record and synchronization."""
-    runtime = pytest.importorskip("triton.runtime")
-    log: list[str] = []
-
-    class Event:
-        def __init__(self, enable_timing: bool) -> None:
-            assert enable_timing
-
-        def record(self) -> None:
-            log.append("event")
-
-        def elapsed_time(self, other: Event) -> float:
-            return 2.0
-
-    interface = SimpleNamespace(Event=Event, synchronize=lambda: log.append("sync"))
-    driver = SimpleNamespace(
-        get_device_interface=lambda: interface,
-        get_empty_cache_for_benchmark=lambda: "buffer",
-        clear_cache=lambda buffer: log.append("flush"),
-    )
-    monkeypatch.setattr(runtime.driver, "_active", driver)
-    monkeypatch.setattr(
-        benchmarking, "_release_l2_pins", lambda buffer: log.append("release")
-    )
-    for name in ("HELION_AUTOTUNE_L2_FLUSH", "HELION_BENCHMARK_CUDAGRAPH"):
-        monkeypatch.delenv(name, raising=False)
-    return log
+    flush, release of pinned lines, event record and synchronization."""
+    return stand_in_event_timer(monkeypatch, sweep="release")
 
 
 def test_do_bench_runs_the_prelude_between_the_flush_and_each_timed_call(
@@ -378,8 +352,8 @@ def test_do_bench_runs_the_prelude_between_the_flush_and_each_timed_call(
         *["flush", "prelude", "event", "call", "event"] * 2,
         "sync",
     ]
-    assert bench(prelude=_Prelude(event_timer)) == behind
-    assert bench(prelude=_Prelude(event_timer), l2_flush_mode="call") == behind
+    assert bench(prelude=LoggedPrelude(event_timer)) == behind
+    assert bench(prelude=LoggedPrelude(event_timer), l2_flush_mode="call") == behind
 
 
 def test_a_long_first_launch_behind_a_prelude_is_not_its_own_sample(
@@ -405,7 +379,7 @@ def test_a_long_first_launch_behind_a_prelude_is_not_its_own_sample(
 
     probe = ["event", "flush", "call", "event", "sync"]
     assert bench() == ["sync", *probe]
-    assert bench(prelude=_Prelude(event_timer)) == [
+    assert bench(prelude=LoggedPrelude(event_timer)) == [
         "sync",
         "release",
         *["event", "flush", "prelude", "call", "event", "sync"],
@@ -429,7 +403,7 @@ def test_do_bench_refuses_a_prelude_through_a_graph_replay(
             lambda: None,
             fixed_repetitions=1,
             pre_warmed=True,
-            prelude=_Prelude(event_timer),
+            prelude=LoggedPrelude(event_timer),
         )
     assert "prelude" not in event_timer and "release" not in event_timer
 
@@ -444,7 +418,7 @@ def test_do_bench_refuses_a_prelude_in_a_regime_without_a_flush_per_call(
             fixed_repetitions=1,
             pre_warmed=True,
             l2_flush_mode=regime,
-            prelude=_Prelude(event_timer),
+            prelude=LoggedPrelude(event_timer),
         )
     # (and a backward benchmark, whose state the prelude would not reset:
     # the regime is not what is wrong there)
@@ -454,7 +428,7 @@ def test_do_bench_refuses_a_prelude_in_a_regime_without_a_flush_per_call(
             fixed_repetitions=1,
             pre_warmed=True,
             grad_to_none=[torch.ones(1)],
-            prelude=_Prelude(event_timer),
+            prelude=LoggedPrelude(event_timer),
         )
 
 
@@ -465,32 +439,9 @@ def test_a_traced_window_behind_a_prelude_reads_the_candidates_kernels_only(
     per call. The events before a marker are learned for the prelude, apart
     from the flush's own footprint, and a sample is the span of the kernels
     after the marker: the candidate's."""
-    pytest.importorskip("triton")
-    log: list[tuple[str, int]] = []
-
-    def launch(name: str, nanoseconds: int) -> Callable[[], None]:
-        return lambda: log.append((name, nanoseconds))
-
-    def traced(run: Callable[[], None]) -> list[benchmarking._TraceEvent]:
-        log.clear()
-        run()
-        events, clock = [], 0
-        for name, nanoseconds in log:
-            events.append(benchmarking._TraceEvent(name, clock, clock + nanoseconds))
-            clock += nanoseconds + 10
-        return events
-
-    monkeypatch.setattr(benchmarking, "_kernel_timer_preconditions", lambda group: True)
-    monkeypatch.setattr(benchmarking, "_flush_trace", None)
-    monkeypatch.setattr(
-        benchmarking, "_trace_marker", launch(benchmarking._TRACE_MARKER, 1)
-    )
-    monkeypatch.setattr(benchmarking, "_cuda_kernel_events", traced)
-    event = SimpleNamespace(record=lambda: None, elapsed_time=lambda end: 1.0)
-    device = SimpleNamespace(
-        Event=lambda enable_timing: event, synchronize=lambda: None
-    )
-    flush = launch("flush", 1_000_000)
+    trace = stand_in_trace(monkeypatch)
+    log, launch, device, flush = trace.log, trace.launch, trace.device, trace.flush
+    traced = benchmarking._cuda_kernel_events
 
     class Work:
         def run(self) -> None:
@@ -833,7 +784,7 @@ def test_a_provider_refuses_a_prelude_in_a_regime_without_a_flush_per_call(
 ) -> None:
     provider = _provider(monkeypatch)
     monkeypatch.setenv(variable, value)
-    with pytest.raises(exc.InvalidAPIUsage, match="must flush per call"):
+    with pytest.raises(PreludeRefused, match="must flush per call"):
         provider._check_benchmark_prelude()
 
 
@@ -849,7 +800,7 @@ def test_a_provider_refuses_a_prelude_it_would_time_outside_the_worker(
     monkeypatch: pytest.MonkeyPatch, settings: dict[str, object]
 ) -> None:
     provider = _provider(monkeypatch, **settings)
-    with pytest.raises(exc.InvalidAPIUsage, match="built-in benchmark worker"):
+    with pytest.raises(PreludeRefused, match="built-in benchmark worker"):
         provider._check_benchmark_prelude()
 
 
@@ -860,19 +811,20 @@ def test_a_provider_refuses_a_prelude_where_its_timers_do_not_reach(
     in this process, and candidates timed as CUDA graph replays."""
     provider = _provider(monkeypatch)
     provider.kernel.env.device = torch.device("cpu")
+    # a PreludeRefused is still the InvalidAPIUsage it was
     with pytest.raises(exc.InvalidAPIUsage, match="NVIDIA device"):
         provider._check_benchmark_prelude()
     provider = _provider(monkeypatch)
     monkeypatch.setattr(torch.version, "hip", "6.4")
-    with pytest.raises(exc.InvalidAPIUsage, match="NVIDIA device"):
+    with pytest.raises(PreludeRefused, match="NVIDIA device"):
         provider._check_benchmark_prelude()
     provider = _provider(monkeypatch)
     provider.config_spec.cute_flash_search_enabled = True
-    with pytest.raises(exc.InvalidAPIUsage, match="in-process refinement"):
+    with pytest.raises(PreludeRefused, match="in-process refinement"):
         provider._check_benchmark_prelude()
     provider = _provider(monkeypatch)
     monkeypatch.setenv("HELION_BENCHMARK_CUDAGRAPH", "1")
-    with pytest.raises(exc.InvalidAPIUsage, match="HELION_BENCHMARK_CUDAGRAPH"):
+    with pytest.raises(PreludeRefused, match="HELION_BENCHMARK_CUDAGRAPH"):
         provider._check_benchmark_prelude()
     monkeypatch.setenv("HELION_BENCHMARK_CUDAGRAPH", "0")
     provider._check_benchmark_prelude()
@@ -891,7 +843,7 @@ def test_a_provider_refuses_a_prelude_of_another_call(
     provider._check_benchmark_prelude()
     for args in ((torch.zeros(3, 2),), (torch.zeros(2, 3), 1.0)):
         provider.args = args
-        with pytest.raises(exc.InvalidAPIUsage, match="not of this search's call"):
+        with pytest.raises(PreludeRefused, match="not of this search's call"):
             provider._check_benchmark_prelude()
 
 
@@ -931,7 +883,7 @@ def test_a_candidate_whose_prelude_failed_has_no_reading(
     warnings: list[str] = []
     provider.log = SimpleNamespace(warning=warnings.append)
     provider._autotune_metrics = SimpleNamespace(
-        num_worker_failures=0, num_compile_failures=0
+        num_worker_failures=0, num_compile_failures=0, num_configs_tested=3
     )
     provider._worker_failure_config_ids = []
     provider._timeout_retry_repetitions = lambda config, source_hash: None
@@ -939,12 +891,53 @@ def test_a_candidate_whose_prelude_failed_has_no_reading(
     def failed(config: object, fn: object) -> float:
         raise PreludeFailed("the benchmark prelude failed: boom")
 
+    assert provider.prelude_failure_cascade() is None
     provider._run_candidate_benchmark_job = failed
     assert provider._benchmark_function_subprocess("config", len) == float("inf")
     assert warnings == ["No reading of 'config': the benchmark prelude failed: boom"]
     # the prelude's failure is not a compile failure of the config
     assert provider._autotune_metrics.num_worker_failures == 1
     assert provider._autotune_metrics.num_compile_failures == 0
+    # a search that ends without a config says the prelude took this reading
+    assert provider.prelude_failure_cascade() == (
+        "1 of the 3 tested configs had no reading because of the benchmark "
+        "prelude they were timed behind"
+    )
+
+
+@pytest.mark.parametrize("took_readings", [False, True])
+def test_a_search_the_prelude_took_readings_from_fails_as_such(
+    took_readings: bool,
+) -> None:
+    """A search that ends without a config raises ``PreludeSearchFailed``
+    (a ``NoConfigFound``) when the prelude took readings from it, so that a
+    caller can tune the kernel alone; otherwise the ``NoConfigFound`` of a
+    kernel without a working config, as alone."""
+
+    def no_config() -> object:
+        raise exc.NoConfigFound
+
+    settings = Settings(autotune_log=False, autotune_log_details=False)
+    search = object.__new__(BaseSearch)
+    search.settings = settings
+    search.log = AutotuningLogger(settings)
+    search.args = ()
+    search.kernel = Mock()
+    search.kernel.get_cached_path.return_value = None
+    search.benchmark_provider = Mock()
+    search.benchmark_provider.compile_deadline_cascade.return_value = None
+    detail = "2 of the 3 tested configs had no reading because of the prelude"
+    search.benchmark_provider.prelude_failure_cascade.return_value = (
+        detail if took_readings else None
+    )
+    search._prepare = Mock()
+    search._autotune_metrics = AutotuneMetrics()
+    search._finalize_autotune_metrics = Mock()
+    search._autotune = no_config
+    with pytest.raises(exc.NoConfigFound) as raised:
+        search.autotune()
+    assert isinstance(raised.value, PreludeSearchFailed) is took_readings
+    assert (detail in str(raised.value)) is took_readings
 
 
 def test_a_provider_hands_its_preludes_file_to_every_worker_job(
@@ -976,7 +969,9 @@ def test_a_provider_hands_its_preludes_file_to_every_worker_job(
     assert not provider.private_argument_copies_affordable(4)
 
 
-def test_a_search_behind_a_prelude_reads_in_the_worker_and_is_not_cached() -> None:
+def test_a_search_behind_a_prelude_reads_in_the_worker(
+    kernels: types.ModuleType,
+) -> None:
     prelude = BenchmarkPrelude((PreludeStep(len, ((),)),), ())
     search = object.__new__(PopulationBasedSearch)
     search._input_bank_count = 1
@@ -1020,9 +1015,55 @@ def test_a_search_behind_a_prelude_reads_in_the_worker_and_is_not_cached() -> No
         return key, stand_in._search_policy_cacheable
 
     # A search without a prelude keeps its key (the one-bank key of every
-    # default search); one behind a prelude gets a key of its own each time
-    # and stays out of the automatic cache.
+    # default search); one behind a prelude whose function has no source to
+    # name it by (a builtin) gets a key of its own each time and stays out
+    # of the automatic cache.
     assert policy(None) == (_hash_search_policy(b""), True)
     assert policy(prelude)[0] != policy(None)[0]
     assert policy(prelude)[0] != policy(prelude)[0]
     assert not policy(prelude)[1]
+    # Behind a step with a source, the key names the step's code and the
+    # layout of the arguments, which buffers they share included: the same
+    # work, with other tensors of the same layout, finds the same key and
+    # stays in the cache; other work, or other layouts, another key.
+    x, y = torch.ones(4, 3), torch.ones(4, 3)
+
+    def behind(step_fn: object, *step_args: object, timed: tuple = ()) -> str:
+        key, cacheable = policy(
+            BenchmarkPrelude((PreludeStep(step_fn, step_args),), timed)
+        )
+        assert cacheable
+        return key
+
+    key = behind(kernels.scale, x, 2.0, timed=(PreludeOutput(0, 0, (4, 3), (3, 1), 0),))
+    assert key not in (policy(None)[0], policy(prelude)[0])
+    assert key == behind(
+        kernels.scale,
+        torch.zeros(4, 3),
+        2.0,
+        timed=(PreludeOutput(0, 0, (4, 3), (3, 1), 0),),
+    )
+    assert key != behind(
+        kernels.pair, x, timed=(PreludeOutput(0, 0, (4, 3), (3, 1), 0),)
+    )
+    assert key != behind(
+        kernels.scale, x.t(), 2.0, timed=(PreludeOutput(0, 0, (4, 3), (3, 1), 0),)
+    )
+    assert behind(kernels.total, x, y, timed=(x,)) != behind(
+        kernels.total, x, x, timed=(x,)
+    )
+    # Another function of the same module with the same layouts is other
+    # work, and so is an equal view of the output at another offset.
+    assert key != behind(
+        kernels.fill, x, 2.0, timed=(PreludeOutput(0, 0, (4, 3), (3, 1), 0),)
+    )
+    assert key != behind(
+        kernels.scale, x, 2.0, timed=(PreludeOutput(0, 0, (4, 3), (3, 1), 3),)
+    )
+    # A callback, or any argument but a tensor or a plain value, gives the
+    # work no identity (two callbacks would share their type's name): such a
+    # prelude stays out of the automatic cache.
+    assert not policy(BenchmarkPrelude((PreludeStep(kernels.scale, (x, len)),), ()))[1]
+    assert behind(kernels.scale, x, torch.float32, timed=(x,)) != behind(
+        kernels.scale, x, torch.bfloat16, timed=(x,)
+    )

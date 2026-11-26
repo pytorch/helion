@@ -13,7 +13,12 @@ these kernels, such as the ``cache_*/helion`` directories of bench runs of
 the kernel's generated source, its input specialization, the GPU and the
 backend's extra cache key. The entry's ``config_spec_hash``, which also covers
 the compiler's seed configs, may differ: a kernel whose code and inputs did
-not change keeps its config across a change of seeds. A kernel that no entry
+not change keeps its config across a change of seeds. So may the search policy
+(``search_policy_hash``), which tells a search behind the kernel before it
+(helion.inductor's ``tune_in_sequence``) from one alone: take the directory
+from one run, or two entries of one kernel can match (refused, as any two
+configs that match one kernel are) or an entry searched alone can pin a kernel
+that runs behind another. A kernel that no entry
 matches autotunes, at HELION_AUTOTUNE_EFFORT (full when unset), unless
 ``--require-configs``. The output module is then written with each kernel's
 decorator pinned to the config the kernel ran with
@@ -62,7 +67,9 @@ if TYPE_CHECKING:
     from helion.runtime.settings import Settings
 
 # One Helion kernel of Inductor's output module: its source string, which the
-# module loads with PyCodeCache.load(<name>_source).kernel.
+# module loads with PyCodeCache.load(<name>_source).kernel, or, a kernel tuned
+# behind the kernel before it, with PyCodeCache.load(<name>_source, '<key>')
+# (helion.inductor.codegen.scheduling: a module per predecessor).
 SOURCE_RE = re.compile(r'^(\w+)_source = """\\\n(.*?)"""$', re.MULTILINE | re.DOTALL)
 # The key fields a pinned config is matched on (LooseAutotuneCacheKey's).
 MATCHED_FIELDS = (
@@ -171,14 +178,15 @@ def configs_from(
 DECORATOR_RE = re.compile(r"^@helion\.kernel\(.*\)$", re.MULTILINE)
 
 
-def pinned_decorator(source: str) -> str:
+def pinned_decorator(source: str, extra: str = "") -> str:
     """The decorator that pins the kernel of ``source``, a Helion kernel
-    module of Inductor's output, to the config it ran with: PyCodeCache
-    hands back the module the output loaded, so its kernel holds the bound
-    kernel of that call. The decorator keeps the kernel's backend."""
+    module of Inductor's output that it loaded under the key ``extra``, to
+    the config it ran with: PyCodeCache hands back the module the output
+    loaded, so its kernel holds the bound kernel of that call. The decorator
+    keeps the kernel's backend."""
     from torch._inductor.codecache import PyCodeCache
 
-    kernel = PyCodeCache.load(source).kernel
+    kernel = PyCodeCache.load(source, extra).kernel
     bound = list(kernel._bound_kernels.values())
     if not bound or bound[0]._config is None:
         raise RuntimeError("a Helion kernel of the output was never called")
@@ -211,11 +219,20 @@ def with_settings(decorator: str, settings: Settings) -> str:
 
 
 def pin(
-    code: str, decorator_of: Callable[[str], str] = pinned_decorator
+    code: str, decorator_of: Callable[[str, str], str] = pinned_decorator
 ) -> tuple[str, int]:
     """``code``, an Inductor output module, with the decorator of each Helion
-    kernel source in it replaced by ``decorator_of(source)``, and how many
+    kernel source in it replaced by ``decorator_of(source, extra)``, ``extra``
+    the key the module loads the source under (SOURCE_RE), and how many
     kernels it pinned."""
+
+    def extra_of(name: str) -> str:
+        load = re.search(
+            rf"^{name} = PyCodeCache\.load\({name}_source(?:, '(\w+)')?\)\.kernel$",
+            code,
+            re.MULTILINE,
+        )
+        return (load.group(1) or "") if load else ""
 
     def replace(match: re.Match[str]) -> str:
         name, text = match.group(1), match.group(2)
@@ -227,7 +244,7 @@ def pin(
         (index,) = [
             i for i, line in enumerate(lines) if line.startswith("@helion.kernel(")
         ]
-        decorator = decorator_of(source)
+        decorator = decorator_of(source, extra_of(name))
         lines[index] = decorator.replace("\\", "\\\\").replace('"""', '\\"""')
         return f'{name}_source = """\\\n' + "\n".join(lines) + '"""'
 

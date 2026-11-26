@@ -3,12 +3,12 @@
 from __future__ import annotations
 
 from typing import TYPE_CHECKING
-from unittest import mock
 
 import torch
 from torch._inductor.codecache import PyCodeCache
 
 import helion
+from helion._compiler.metal.export import record_launches
 import helion.language as hl
 
 if TYPE_CHECKING:
@@ -16,13 +16,6 @@ if TYPE_CHECKING:
 
     from helion._compiler.autotuner_heuristics.registry import AutotunerHeuristic
     from helion.runtime.kernel import BoundKernel
-
-
-class _NoShader:
-    """A compiled library stand-in: every kernel in it launches nothing."""
-
-    def __getattr__(self, name: str) -> object:
-        return lambda *args, **kwargs: None
 
 
 def _load(
@@ -77,30 +70,19 @@ def render_msl(
 ) -> str:
     """The MSL ``kernel`` generates for ``args`` at ``config``, without an
     Apple GPU: its generated module runs on ``args``, CPU tensors whose
-    dtypes and shapes are all the MSL depends on, with
-    ``torch.mps.compile_shader`` stubbed out, so nothing compiles or
-    launches.  A persistent kernel bakes the GPU's core count, which CPU
-    tensors don't have, into its MSL: ``num_sm``.
+    dtypes and shapes are all the MSL depends on, with a launcher that
+    records its launch (``metal.export.record_launches``), so nothing
+    compiles or launches.  A persistent kernel bakes the GPU's core count,
+    which CPU tensors don't have, into its MSL: ``num_sm``.
 
-    The module is loaded under its own key, apart from the one a GPU run of
-    the same code loads (:func:`run_with_msl`): a module's kernel keeps its
-    launch plans by everything but the tensors' device, so a shared module
-    would hand this render's no-op plan to a GPU run, or a GPU run's shader
-    to this render.  The key also holds ``num_sm``, which the generated
-    code doesn't, so each core count renders its own MSL."""
-    module, _, args = _load(kernel, args, config, f"render_msl:{num_sm}")
-    with (
-        mock.patch.object(
-            torch.mps, "compile_shader", lambda source: _NoShader(), create=True
-        ),
-        mock.patch.object(
-            helion.runtime,
-            "get_num_sm",
-            lambda device, *, reserved_sms=0: num_sm - reserved_sms,
-        ),
-    ):
-        getattr(module, kernel.fn.__name__)(*args)
-    return _compiled_msl(module)
+    The module is generated anew, not taken from the bound kernel's compile
+    cache, so a render under a patched heuristic sees the code the patch
+    generates.  Each launch renders its MSL again, so one module serves
+    every core count."""
+    module, _, args = _load(kernel, args, config, "render_msl")
+    entry = getattr(module, kernel.fn.__name__)
+    (launch,) = record_launches(entry, args, num_sm=num_sm)
+    return launch.source
 
 
 def run_with_msl(
@@ -144,3 +126,12 @@ def mpp_only(
     if config is None:
         config = kernel.bind(args).config_spec.default_config()
     return helion.Config.from_dict({"metal_matmul": "mpp", **config.config})
+
+
+@helion.kernel(backend="metal", static_shapes=True, autotune_effort="none")
+def scale_by_0dim(x: torch.Tensor, s: torch.Tensor) -> torch.Tensor:
+    """``x * s`` for a 0-dim ``s``, which binds as a buffer."""
+    out = torch.empty_like(x)
+    for tile in hl.tile(x.size(0)):
+        out[tile] = x[tile] * s[()]
+    return out

@@ -280,6 +280,16 @@ jobs:
           source .venv/bin/activate
           uv pip install 'jax==0.12.0.1' 'jaxlib==0.12.0.1' 'absl-py'
 
+      - name: Install MLX for the Metal export tests
+        if: matrix.backend == 'metal'
+        run: |
+          source .venv/bin/activate
+          # test/test_metal_export_mlx.py runs captured launches under MLX's
+          # fast.metal_kernel; pinned to the MLX whose kernel signature
+          # helion/_compiler/metal/export.py arranges launches for.
+          uv pip install 'mlx==0.32.4'
+          python -c "import mlx.core as mx; print('mlx', mx.__version__)"
+
       - name: Install CUTLASS CuTe DSL
         if: matrix.backend == 'cute'
         run: |

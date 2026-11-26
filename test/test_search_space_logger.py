@@ -711,6 +711,7 @@ def _fake_search(settings: Settings, autotune: Callable[[], Config]) -> BaseSear
     search.kernel.is_cacheable.return_value = False
     search.benchmark_provider = Mock()
     search.benchmark_provider.compile_deadline_cascade.return_value = None
+    search.benchmark_provider.prelude_failure_cascade.return_value = None
     search._prepare = Mock()
     search._search_space_tracker = SearchSpaceTracker(
         _report(dimensions=[_dim("num_warps", 6, [1, 2, 4, 8, 16, 32])])

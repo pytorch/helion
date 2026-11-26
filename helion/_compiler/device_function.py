@@ -386,6 +386,9 @@ def _selects_tma_access(config: Config) -> bool:
     Decided before codegen, since a handoff can be emitted before the access.
     Over-reports: fact slots do not always match codegen's memory-op slots.
     """
+    # mxfp8 imports the language ops, which import this module.
+    from .mxfp8 import native_packed_mxfp8_kernel
+
     env = CompileEnvironment.current()
     capability = env.config_spec.target_device_capability
     if (
@@ -396,9 +399,15 @@ def _selects_tma_access(config: Config) -> bool:
         or capability < (9, 0)
     ):
         return False
-    return indexing_uses_tensor_descriptor(config.atomic_indexing) or (
-        indexing_uses_tensor_descriptor(config.indexing)
-        and any(2 <= fact.ndim <= 5 for fact in env.config_spec.memory_op_facts)
+    return (
+        indexing_uses_tensor_descriptor(config.atomic_indexing)
+        or (
+            indexing_uses_tensor_descriptor(config.indexing)
+            and any(2 <= fact.ndim <= 5 for fact in env.config_spec.memory_op_facts)
+        )
+        # The native packed MXFP8 lowering loads and stores through TMA
+        # whatever ``indexing`` says (``triton/packed_mxfp8.py``).
+        or native_packed_mxfp8_kernel(env, HostFunction.current().device_ir.graphs)
     )
 
 
@@ -415,6 +424,11 @@ class DeviceFunction:
         self.codegen = codegen
         self.has_barrier = CompileEnvironment.current().has_barrier
         self.uses_async_proxy_global = _selects_tma_access(config)
+        # Set when the kernel's packed MXFP8 dot loads every operand and scale
+        # word through a descriptor (``triton/packed_mxfp8.py``), with the
+        # bytes of one stage of its operand ring.
+        self.packed_mxfp8_whole_dot = False
+        self.packed_mxfp8_stage_bytes = 0
         self._async_store_drained = False
         self._tma_store_warp_specialized = False
         self.arguments: list[Argument] = []
@@ -422,7 +436,7 @@ class DeviceFunction:
         self.body: list[ast.AST] = []
         self._tensor_args: dict[torch.Tensor, TensorArg] = {}
         self._tensor_descriptor_args: dict[
-            tuple[torch.Tensor, str, bool | None], TensorDescriptorArg
+            tuple[torch.Tensor, str, bool | None, bool], TensorDescriptorArg
         ] = {}
         self.prefetch_map_args: dict[tuple[torch.Tensor, tuple[int, ...]], str] = {}
         self._expr_args: dict[sympy.Expr, NumericArgument] = {}
@@ -797,7 +811,9 @@ class DeviceFunction:
             return None
         return sublane
 
-    def evaluate_constexpr_condition(self, test: object) -> bool | None:
+    def evaluate_constexpr_condition(
+        self, test: object, *, tunables: bool = False
+    ) -> bool | None:
         """Resolve a control-flow test to a concrete bool for the current config.
 
         Block sizes are symbolic during the (single) frontend pass but become
@@ -806,6 +822,10 @@ class DeviceFunction:
         compile-time constant here, even though it could not be folded earlier.
         Substituting the config's block sizes lets us decide the branch and emit
         only the live side, which is what makes shape-divergent branches legal.
+
+        With ``tunables``, a test reading the config's tunables
+        (``hl.register_tunable``, a ``tl.constexpr`` of the generated code) is
+        decided too, as Triton folds it.
 
         Returns the concrete bool, or ``None`` if the test is not a compile-time
         constant for this config (e.g. it depends on a runtime value).
@@ -824,6 +844,11 @@ class DeviceFunction:
         hf = HostFunction.current()
         subs: dict[sympy.Basic, sympy.Basic] = {}
         for symbol in expr.free_symbols:
+            if tunables and symbol in env.config_value_expressions:
+                subs[symbol] = sympy.Integer(
+                    env.config_value_expressions[symbol].evaluate(self.config)
+                )
+                continue
             origin_info = hf.expr_to_origin.get(symbol)
             if origin_info is None or not isinstance(
                 origin_info.origin, BlockSizeOrigin
@@ -840,13 +865,16 @@ class DeviceFunction:
             return None
         return bool(resolved)
 
-    def constexpr_taken_graph_id(self, if_node: torch.fx.Node) -> int | None:
+    def constexpr_taken_graph_id(
+        self, if_node: torch.fx.Node, *, tunables: bool = False
+    ) -> int | None:
         """The graph id of the side an ``_if`` node takes when its test is a
         constant for this config (``evaluate_constexpr_condition``), or
         ``None`` when the test is decided at runtime."""
         test, if_graph_id, else_graph_id, *_ = if_node.args
         taken = self.evaluate_constexpr_condition(
-            test.meta["val"] if isinstance(test, torch.fx.Node) else test
+            test.meta["val"] if isinstance(test, torch.fx.Node) else test,
+            tunables=tunables,
         )
         if taken is None:
             return None
@@ -1200,6 +1228,7 @@ class DeviceFunction:
         block_size: list[int | torch.SymInt],
         *,
         ring_swizzle: bool | None = None,
+        force_host: bool = False,
     ) -> TensorDescriptorArg:
         """``ring_swizzle`` set: a Gluon host descriptor filling the ring's
         slots (``gluon_ring.ring_descriptor``), swizzled unless it holds scales."""
@@ -1209,7 +1238,11 @@ class DeviceFunction:
         # unswizzled scale slot keeps its own).
         gluon = CompileEnvironment.current().backend_name == "gluon"
         swizzle = True if gluon and ring_swizzle is None else ring_swizzle
-        key = (fake_value, block_size_expr, swizzle)
+        use_host = (
+            force_host
+            or CompileEnvironment.current().backend.host_tensor_descriptors(self.config)
+        )
+        key = (fake_value, block_size_expr, swizzle, use_host)
         if key not in self._tensor_descriptor_args:
             origin = host_function.tensor_to_origin[fake_value]
             desc_name = self.new_var(
@@ -1242,9 +1275,7 @@ class DeviceFunction:
                 permutation if permutation is not None else [*range(fake_value.ndim)]
             )
             assert descriptor_dims[-1] == stride_one_dim
-            if CompileEnvironment.current().backend.host_tensor_descriptors(
-                self.config
-            ):
+            if use_host:
                 tensor_host = origin.host_str()
                 tensor_base = env.backend.tensor_descriptor_host_base(
                     fake_value, tensor_host

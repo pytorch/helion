@@ -877,7 +877,7 @@ def _is_row_reduction_over_tiles(env: CompileEnvironment) -> bool:
 
 
 def _row_tile_groups(
-    env: CompileEnvironment, device_ir: DeviceIR
+    env: CompileEnvironment, device_ir: DeviceIR, row: int | None = None
 ) -> list[list[int]] | None:
     """The block sizes that tile the rows of the kernel's reduction loop, or
     ``None`` when the row heuristics' layouts do not fit the kernel.  One
@@ -920,7 +920,8 @@ def _row_tile_groups(
     grid = spec.kernel_grid_fact
     fact = spec.reduction_kernel_fact
     reductions = fact.reductions if fact is not None else ()
-    row = spec.reduction_loops[0].block_id
+    if row is None:
+        row = spec.reduction_loops[0].block_id
     if grid is None or any(descriptor.block_id != row for descriptor in reductions):
         return None
     block_sizes = spec.block_sizes.valid_block_ids()
@@ -954,12 +955,15 @@ def _row_tile_groups(
     return groups
 
 
-def _row_tile_axes(env: CompileEnvironment, device_ir: DeviceIR) -> list[int] | None:
+def _row_tile_axes(
+    env: CompileEnvironment, device_ir: DeviceIR, row: int | None = None
+) -> list[int] | None:
     """The tile axes of the rows, outermost first, when the row loops that
     have block sizes all have the same ones (``_row_tile_groups``), else
     ``None``.  The layouts that put several rows in a CTA read it: they give
-    the innermost of these axes their rows, which is one axis only here."""
-    groups = _row_tile_groups(env, device_ir)
+    the innermost of these axes their rows, which is one axis only here.
+    ``row``: the reduced block, when the kernel has no reduction loop."""
+    groups = _row_tile_groups(env, device_ir, row)
     return groups[0] if groups is not None and len(groups) == 1 else None
 
 
@@ -5623,6 +5627,11 @@ class CuteStridedReductionHeuristic(AutotunerHeuristic):
     # neighboring CTAs, so it keeps the default policy
     # (``_rows_own_their_lines``).
     STREAM_LINE_BYTES = 128
+    # A reduction of at most this many rows also gets a line-per-warp twin
+    # with one reduction thread, which walks every row of its columns in
+    # lanes of ``SINGLE_THREAD_ROW_LANES`` rows (``_line_warp_shapes``).
+    SINGLE_THREAD_ROWS = 64
+    SINGLE_THREAD_ROW_LANES = 8
 
     @classmethod
     def _narrow_tile_shape(
@@ -5717,7 +5726,8 @@ class CuteStridedReductionHeuristic(AutotunerHeuristic):
         rows: tuple[int, int, int],
         one_chunk: tuple[int, int, int] | None,
         whole: int,
-    ) -> list[tuple[int, int, int, int, int]]:
+        row_lane_choices: Collection[object],
+    ) -> list[tuple[int, int, int, int, int, int]]:
         """Twins of the 16-byte shapes with one L2 line of a row per warp.
 
         The packet is the line's share of a warp's thread
@@ -5731,7 +5741,8 @@ class CuteStridedReductionHeuristic(AutotunerHeuristic):
         from the reduction's length as theirs do.  TorchInductor lays out its
         looped reduction of such an input the same way (two elements a thread,
         a warp a row's line).  ``(tile threads, reduction threads, rows per
-        chunk, lane unroll, vector width)``, none when
+        chunk, lane unroll, vector width, row lanes)`` (row lanes 1 but for
+        the one-thread twin below), none when
 
         - the line's share is no narrower than ``vec`` or under two elements
           (fp32: one element, which nothing sinks); or
@@ -5748,11 +5759,12 @@ class CuteStridedReductionHeuristic(AutotunerHeuristic):
         twins, without a hint on that input (below), and gets none when that
         input's load comes first.
 
-        A reduction too short for a twin's rows gets none: ``whole``, the
-        power of two the chunk is clamped to, holds fewer rows than the
-        twin's reduction threads times its unroll (under 33 rows for the
-        16-thread shape), so what would run is not the twin's shape but a
-        narrower packet of a clamped seed already listed.  The caller drops
+        A reduction too short for a 16-thread twin's rows gets none of those:
+        ``whole``, the power of two the chunk is clamped to, holds fewer rows
+        than the twin's reduction threads times its unroll (under 33 rows
+        for the 16-thread shape), so what would run is not the twin's shape
+        but a narrower packet of a clamped seed already listed.  (The
+        one-thread twin below is for exactly such reductions.)  The caller drops
         a twin wider than the tile's block sizes reach.  The eviction hints
         are the policy helper's at the twin's own block width: a streamed
         input whose one-line rows do not own their line
@@ -5773,6 +5785,27 @@ class CuteStridedReductionHeuristic(AutotunerHeuristic):
         a bf16 BatchNorm input, which load their input twice, ended in this
         layout (3.04 us in its final selection against 3.46 us for the
         16-byte pick of a search without the twin).
+
+        A reduction of at most ``SINGLE_THREAD_ROWS`` rows (one chunk) also
+        gets a twin with one reduction thread: each thread walks every row of
+        its two columns in lanes of ``SINGLE_THREAD_ROW_LANES`` rows, so the
+        CTA combines nothing across threads.  Over such short rows that
+        combine costs more than the reduction threads gain.  Measured on
+        GB300 with the L2 flushed before every call, before any search, on
+        channels-last BatchNorm + activation means of better-benchmark:
+        12.1 us over 49 rows of 960 channels ([512, 49, 960] bf16) against
+        16.9 us for the first 16-byte seed and 21.0 us for the 16-thread
+        twin; 6.1 against 8.7 and 9.5 us over 49 rows of 1280 channels
+        ([128, 49, 1280]); 14.9 against 12.9 and 17.9 us over 49 rows of
+        2304 channels, where the 16-byte seed stays ahead.  Over 81 rows
+        ([128, 81, 2304]) it took 27.7 against 25.6 and 23.3 us, and over
+        196 rows ([128, 196, 1536]) 18.5 against 17.8 and 18.2, so longer
+        reductions do not get it.  The row lanes' width (4, 8 or 16 rows),
+        lane layout, unroll and CTA order changed those times by under 2%;
+        32 or 128 columns per CTA instead of a warp's 64 cost 15-30%.  Of
+        two full searches of the first kernel without the twin, one ended in
+        its layout (10.9 us) and the other at 13.5 us; stock Inductor takes
+        12.3 us.
         """
         itemsize = source.dtype.itemsize
         line_vec = cls.STREAM_LINE_BYTES // (WARP_THREADS * itemsize)
@@ -5781,11 +5814,19 @@ class CuteStridedReductionHeuristic(AutotunerHeuristic):
             2 <= line_vec < vec and cls._strides_multiple_of(env, source, line_elements)
         ):
             return []
-        return [
-            (WARP_THREADS, reduction_threads, chunk, unroll, line_vec)
+        shapes = [
+            (WARP_THREADS, reduction_threads, chunk, unroll, line_vec, 1)
             for reduction_threads, chunk, unroll in filter(None, (rows, one_chunk))
             if min(chunk, whole) >= reduction_threads * unroll
         ]
+        if (
+            whole <= cls.SINGLE_THREAD_ROWS
+            and cls.SINGLE_THREAD_ROW_LANES in row_lane_choices
+        ):
+            shapes.append(
+                (WARP_THREADS, 1, whole, 1, line_vec, cls.SINGLE_THREAD_ROW_LANES)
+            )
+        return shapes
 
     @classmethod
     def _match(
@@ -5999,14 +6040,32 @@ class CuteStridedReductionHeuristic(AutotunerHeuristic):
         )
         if one_chunk is not None:
             shapes.append((base[0], *one_chunk))
+        row_lane_choices = (
+            spec.cute_vector_widths.block_id_lookup(reduction_block_id)
+            ._fragment(spec)
+            .choices
+        )
         packet_shapes = [
-            *((*shape, vec) for shape in shapes),
+            *((*shape, vec, 1) for shape in shapes),
             *cls._line_warp_shapes(
-                env, source, vec, sixteen_thread_rows, one_chunk, whole
+                env,
+                source,
+                vec,
+                sixteen_thread_rows,
+                one_chunk,
+                whole,
+                row_lane_choices,
             ),
         ]
         hint_streams = spec.supports_config_key("load_eviction_policies")
-        for tile_threads, reduction_threads, chunk, unroll, packet in packet_shapes:
+        for (
+            tile_threads,
+            reduction_threads,
+            chunk,
+            unroll,
+            packet,
+            row_lanes,
+        ) in packet_shapes:
             columns = tile_threads * packet
             # A chunk that reaches the reduction's length (a measured shape's
             # over at most 128 rows, the narrow seed's over up to 1024) is
@@ -6044,7 +6103,8 @@ class CuteStridedReductionHeuristic(AutotunerHeuristic):
                     },
                 ),
                 "cute_vector_widths": _seq_config_list(
-                    spec.cute_vector_widths, {tile_block_id: packet}
+                    spec.cute_vector_widths,
+                    {tile_block_id: packet, reduction_block_id: row_lanes},
                 ),
                 "reduction_loops": [chunk],
                 "cute_vloop_sink": True,
@@ -11119,9 +11179,21 @@ class CutePointwiseVecHeuristic(AutotunerHeuristic):
             None,
         )
         fragments = {s.block_id: s._fragment(spec) for s in spec.block_sizes}
+        # A group whose tile.index the kernel reads (helion.inductor's pads
+        # and cats: ``tmp0 = (tile_x.index).to(torch.int64)``) decodes every
+        # element's indices from the flat offset once flattened
+        # (``indices_1 = offsets_0_1_2 % 384``, ``indices_0 = offsets_0_1_2 //
+        # 24576`` beside each packet), where its tiles keep them as tile
+        # indices.  It flattens only where its stride-1 axis takes no packets
+        # (vec <= 1: a pad to rows of 23923 bf16), and a narrow axis that
+        # takes them keeps the tile seeds: given the flattened seeds of a
+        # GhostNet cat over [128, 64, 384], a full search selected a tile
+        # config of 7.0 us on GB300, where one from the tile seeds had
+        # selected 4.6.
+        index_group = flatten_group is not None and spec.reads_tile_index(flatten_group)
         # Flatten when one axis cannot supply a full CTA of vector packets.
         narrow = fragments[vec_block].high < cls.NT * full_vec
-        flatten = vec <= 1 or (flatten_group is not None and narrow)
+        flatten = vec <= 1 or (flatten_group is not None and narrow and not index_group)
         tile_ids = [vec_block]
         if flatten:
             if flatten_group is None:
@@ -11197,7 +11269,12 @@ class CutePointwiseVecHeuristic(AutotunerHeuristic):
             return []
         seeds = [primary]
         base_variants: list[dict[str, Any]] = [primary.config]
-        if not flatten and len(spec.block_sizes) > 1 and flatten_group is not None:
+        if (
+            not flatten
+            and len(spec.block_sizes) > 1
+            and flatten_group is not None
+            and not index_group
+        ):
             flat_seed: dict[str, Any] = deepcopy(primary.config)
             flat_seed["flatten_loops"] = [
                 group is flatten_group for group in spec.flatten_loops

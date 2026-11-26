@@ -70,6 +70,63 @@ back one of the loop's stores counts as reading the stored value and the
 tests of the branches around the store.
 Inner lane loops are rewritten first, so a load an inner loop gives up can
 leave an outer lane loop too.
+
+A load that varies with an inner lane but not with the lane loop around it
+cannot leave its loop, and yet every outer lane repeats it.  A softmax
+backward under a document mask (better-benchmark sum_02fe2c82b1fd) gives each
+thread two rows of 128 keys; for each key it reads the key's position and
+the document id of that position, the same in both rows::
+
+    for vec_lane_2 in cutlass.range_constexpr(2):        # the thread's rows
+        ...
+        for synthetic_lane_3 in cutlass.range_constexpr(8):   # its keys
+            indices_3 = reduction_lane_base_3 + cutlass.Int32(synthetic_lane_3 ...)
+            tmp16 = _cute_scalar_policy_load(in2.iterator + ... indices_3 ..., cutlass.Int64, 'last')
+            ...
+            tmp20 = _cute_element_policy_load_if(in3.iterator + ... tmp19 ..., ..., cutlass.Int64, 'l2_last')
+
+The policy loads are side-effecting inline PTX, so LLVM keeps every copy.
+``_tabulate_inner_loads`` reads them once per key, before the row loop, into
+a table the inner loop indexes by its lane::
+
+    indices_3_lanes = []
+    tmp16_lanes = []
+    tmp20_lanes = []
+    for synthetic_lane_3_table in cutlass.range_constexpr(8):
+        indices_3_by_lane = reduction_lane_base_3 + cutlass.Int32(synthetic_lane_3_table ...)
+        tmp16_by_lane = _cute_scalar_policy_load(in2.iterator + ... indices_3_by_lane ...)
+        ...
+        indices_3_lanes.append(indices_3_by_lane)
+        tmp16_lanes.append(tmp16_by_lane)
+        tmp20_lanes.append(tmp20_by_lane)
+    for vec_lane_2 in cutlass.range_constexpr(2):
+        ...
+        for synthetic_lane_3 in cutlass.range_constexpr(8):
+            indices_3 = indices_3_lanes[synthetic_lane_3]
+            tmp16 = tmp16_lanes[synthetic_lane_3]
+            ...
+
+The table loop walks the lanes with a variable of its own, so the outer
+loop's reads of a name of the inner lane keep their values.  Only the names
+the rows (or code outside the outer loop) still read get a table: an address
+temporary that only the table loads read is computed in the table loop
+alone.
+
+Both loops must run over
+``cutlass.range_constexpr``: the DSL unrolls them at trace time, so the table
+is a list of the traced values and each index a constant.  A statement goes
+in the table when it is a top-level ``name = value`` of the inner loop that
+reads only the inner lane, names the outer loop does not write, the outer
+loop's leading pure integer definitions of such names (copied in front of
+it, ``reduction_lane_base_3`` above) and earlier table statements; when
+``name`` is written once in the inner loop and read there by nothing before
+it; and when ``value`` is integer arithmetic, scalar loads of integer tensors
+(the policy loads among them) and pure calls, as for a moved statement.  The
+outer loop must let every lane run to its end, write memory only through
+kernel tensors its stores name, none of them one a table load reads, and call
+nothing of unknown effect (CTA reductions are known).  The table loads read
+the addresses each outer lane read, with nothing in between writing there,
+and only integers move, so the results are unchanged bit for bit.
 """
 
 from __future__ import annotations
@@ -82,13 +139,16 @@ from ..ast_read_writes import HELION_LANE_LOOP_VAR_ATTR
 from ._ast_pass_utils import _FOLD_DOT_HELPER
 from ._ast_pass_utils import _is_proven_relocatable_call
 from ._ast_pass_utils import call_path_str
+from ._ast_pass_utils import deep_clone
 from ._ast_pass_utils import loop_extent
 from ._ast_pass_utils import name_assignment
 from ._ast_pass_utils import names_read
 from ._ast_pass_utils import names_stored_or_deleted
+from ._ast_pass_utils import rename_names
 from ._ast_pass_utils import resolve_alias
 from ._ast_pass_utils import tensor_roots_may_alias
 from .address_maps import _LOOP_CALLS
+from .cache_policy_loads import PACKET_LOAD_HELPERS
 from .dtypes import CUTLASS_INTEGER_TYPE_NAMES
 from .fuse_two_pass_loads import _is_store_call
 from .fuse_two_pass_loads import _tensor_arg_roots
@@ -172,6 +232,10 @@ class _Context:
         # no longer reach (in front of a top-level loop).
         self.moved: list[ast.stmt] = []
         self._integral_names: set[str] | None = None
+        self._trace_lists: set[str] | None = None
+        # The tables of integers made so far (``doc_lanes``): a name read
+        # from one (``doc = doc_lanes[lane]``) is integral.
+        self.integer_tables: set[str] = set()
 
     def canonical(self, names: set[str]) -> set[str]:
         return {resolve_alias(name, self.rename_groups) for name in names}
@@ -181,6 +245,19 @@ class _Context:
         if self._integral_names is None:
             self._integral_names = _integral_names(self)
         return self._integral_names
+
+    def trace_lists(self) -> set[str]:
+        """``_trace_lists`` of the kernel body and the statements moved out of
+        it (the tables), computed on first use."""
+        if self._trace_lists is None:
+            self._trace_lists = _trace_lists([*self.body, *self.moved])
+        return self._trace_lists
+
+    def forget_derived_names(self) -> None:
+        """Compute ``integral_names`` and ``trace_lists`` again at their next
+        use: a rewrite bound new names (a table's lists among them)."""
+        self._integral_names = None
+        self._trace_lists = None
 
 
 def _integral_names(ctx: _Context) -> set[str]:
@@ -198,6 +275,13 @@ def _integral_names(ctx: _Context) -> set[str]:
         value: ast.expr | None = None
         if isinstance(node, ast.Assign) and len(node.targets) == 1:
             target, value = node.targets[0], node.value
+            if (
+                isinstance(value, ast.Subscript)
+                and isinstance(value.value, ast.Name)
+                and value.value.id in ctx.integer_tables
+            ):
+                # A read of a table of integers (``doc = doc_lanes[lane]``).
+                value = ast.Constant(0)
         elif isinstance(node, ast.AugAssign) and isinstance(node.target, ast.Name):
             target = node.target
             value = ast.BinOp(
@@ -320,11 +404,18 @@ def _write_roots(call: ast.Call, ctx: _Context) -> frozenset[str] | None:
     )
 
 
-def _loop_admits_hoisting(loop: ast.For, ctx: _Context) -> list[frozenset[str]] | None:
+def _loop_admits_hoisting(
+    loop: ast.For, ctx: _Context, *, tables: bool = False
+) -> list[frozenset[str]] | None:
     """The destination roots of ``loop``'s memory writes when every write is
     resolved (``_write_roots``), every call is known and every lane runs the
     whole body, else None.  ``operator.getitem`` is not known: it reads
-    memory that the subscript checks do not see."""
+    memory that the subscript checks do not see.  An append to a trace-time
+    list (a load table, a lane stash: ``_trace_lists``) is known: it writes
+    no memory, so a loop around one whose loads moved to tables still gives
+    up its own invariants.  For an outer loop whose inner loads move to a
+    table (``tables``), policy loads and CTA reductions are known too."""
+    lists = ctx.trace_lists()
     store_roots: list[frozenset[str]] = []
     for node in ast.walk(ast.Module(body=loop.body, type_ignores=[])):
         if isinstance(node, (ast.Break, ast.Continue, ast.Return, ast.Raise)):
@@ -337,9 +428,13 @@ def _loop_admits_hoisting(loop: ast.For, ctx: _Context) -> list[frozenset[str]] 
                     return None
                 store_roots.append(roots)
             elif path == "operator.getitem" or not (
-                _is_proven_relocatable_call(node, allow_load=True)
+                _is_proven_relocatable_call(
+                    node, allow_load=True, allow_reduction=tables
+                )
+                or (tables and _policy_load(node) is not None)
                 or _is_private_store_staging_append(node)
                 or path in _LOOP_CALLS
+                or _trace_list_append(node, lists) is not None
             ):
                 return None
         elif isinstance(node, (ast.Subscript, ast.Attribute)) and isinstance(
@@ -364,6 +459,22 @@ def _float_valued(value: ast.AST) -> bool:
     return False
 
 
+def _loop_writes(loop: ast.For, ctx: _Context) -> dict[str, int]:
+    """Every name ``loop`` writes (its lane variable included), by rename
+    group, with the number of writes.  A register an element store or a
+    staging append writes counts twice: it is never a value that moves, and
+    nothing reading it moves either."""
+    writes: dict[str, int] = {}
+    for node in ast.walk(loop):
+        if isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del)):
+            name = resolve_alias(node.id, ctx.rename_groups)
+            writes[name] = writes.get(name, 0) + 1
+    for root in _mutation_roots(loop):
+        name = resolve_alias(root, ctx.rename_groups)
+        writes[name] = writes.get(name, 0) + 2
+    return writes
+
+
 def _hoist_from_loop(loop: ast.For, ctx: _Context) -> list[ast.stmt]:
     """``loop`` preceded by the statements it gives up (see the module
     docstring), or ``[loop]``."""
@@ -375,18 +486,7 @@ def _hoist_from_loop(loop: ast.For, ctx: _Context) -> list[ast.stmt]:
     store_roots = _loop_admits_hoisting(loop, ctx)
     if store_roots is None:
         return [loop]
-    # Every name the loop writes (its lane variable included), by rename
-    # group, with the number of writes.  A register an element store or a
-    # staging append writes counts twice: it is never a value that moves, and
-    # nothing reading it moves either.
-    writes: dict[str, int] = {}
-    for node in ast.walk(loop):
-        if isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del)):
-            name = resolve_alias(node.id, ctx.rename_groups)
-            writes[name] = writes.get(name, 0) + 1
-    for root in _mutation_roots(loop):
-        name = resolve_alias(root, ctx.rename_groups)
-        writes[name] = writes.get(name, 0) + 2
+    writes = _loop_writes(loop, ctx)
     moved: list[ast.stmt] = []
     moved_names: set[str] = set()
     # The moved statements' targets by source name, as ``_integral`` reads
@@ -550,6 +650,7 @@ def _loop_invariant_names(
 
     mark(loop.body, [])
     body = ast.Module(body=loop.body, type_ignores=[])
+    lists = ctx.trace_lists()
     # The loop's stores, as (where, values, store): a register's group, or
     # the kernel tensors a store call writes (None for a staging append, whose
     # store the loop does not show).
@@ -630,6 +731,16 @@ def _loop_invariant_names(
             record(node.target, node.iter, tests(node))
         elif isinstance(node, ast.NamedExpr):
             record(node.target, node.value, tests(node))
+        elif (appended := _trace_list_append(node, lists)) is not None:
+            # A trace-time list's append writes the list: of a table's
+            # ``doc_lanes.append(doc_by_lane)``, ``doc = doc_lanes[lane]``
+            # reads what was appended, so ``cutlass.Float32(doc) * 0.5``
+            # becomes invariant when the appended values do.
+            assert isinstance(node, ast.Call)
+            group = resolve_alias(appended, ctx.rename_groups)
+            reads_of_writes.setdefault(group, []).append(
+                set().union(*map(reads_of, node.args)) | {group} | tests(node)
+            )
     for read, where, matched in reads_back:
         address = set().union(*map(reads_of, ast.iter_child_nodes(read)))
         if isinstance(where, str):
@@ -850,20 +961,10 @@ def _moves(
     # operand included, are integers, with the names from outside the loop
     # typed by their assignments.
     known = integral | ctx.integral_names()
-    if (
-        _float_valued(value)
-        or any(_memory_subscript(node) for node in ast.walk(value))
-        or not _integral(value, known, ctx.integer_tensors)
-        or not all(
-            _integral(node, known, ctx.integer_tensors)
-            for node in ast.walk(value)
-            if _rounds(node)
-        )
-        or not all(
-            _scalar_load_pointer(node) is not None
-            or _is_proven_relocatable_call(node, allow_load=False)
-            for node in calls
-        )
+    if not _integer_arithmetic(value, known, ctx) or not all(
+        _scalar_load_pointer(node) is not None
+        or _is_proven_relocatable_call(node, allow_load=False)
+        for node in calls
     ):
         return False
     pointers = [
@@ -887,6 +988,446 @@ def _moves(
     return True
 
 
+# The scalar element loads with a cache hint (``_cute_scalar_policy_load``,
+# ``_cute_element_policy_load_if``, ...): inline PTX with side effects, so
+# LLVM keeps every copy.  Their first argument is the address and their dtype
+# argument follows the predicate of the ``_if`` forms.
+_SCALAR_POLICY_LOADS: dict[str, int] = {
+    helper.name: (2 if helper.name.endswith("_if") else 1)
+    for helper in PACKET_LOAD_HELPERS
+    if helper.family == "scalar"
+}
+
+
+def _policy_load(node: ast.AST) -> tuple[ast.expr, ast.expr] | None:
+    """``(address, dtype)`` of a scalar policy load call, else None."""
+    if not (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id in _SCALAR_POLICY_LOADS
+        and len(node.args) > _SCALAR_POLICY_LOADS[node.func.id]
+    ):
+        return None
+    return node.args[0], node.args[_SCALAR_POLICY_LOADS[node.func.id]]
+
+
+def _table_load_pointer(node: ast.AST) -> ast.AST | None:
+    """The address of a scalar load, a policy load included, else None."""
+    if (policy := _policy_load(node)) is not None:
+        return policy[0]
+    return _scalar_load_pointer(node)
+
+
+def _table_integral(value: ast.expr, known: set[str], ctx: _Context) -> bool:
+    """``_integral``, with a policy load of an integer dtype and an
+    ``operator`` comparison of integers counted as integers."""
+    if (policy := _policy_load(value)) is not None:
+        return call_path_str(policy[1]) in CUTLASS_INTEGER_TYPE_NAMES
+    if (
+        isinstance(value, ast.Call)
+        and call_path_str(value.func)
+        in (
+            "operator.eq",
+            "operator.ne",
+            "operator.lt",
+            "operator.le",
+            "operator.gt",
+            "operator.ge",
+        )
+        and len(value.args) == 2
+        and not value.keywords
+    ):
+        return all(_integral(arg, known, ctx.integer_tensors) for arg in value.args)
+    return _integral(value, known, ctx.integer_tensors)
+
+
+def _trace_lists(body: list[ast.stmt]) -> set[str]:
+    """The names bound to a list literal in ``body``: trace-time lists of
+    values (a lane stash), whose ``append`` touches no memory."""
+    return {
+        assignment[0]
+        for node in ast.walk(ast.Module(body=body, type_ignores=[]))
+        if (assignment := name_assignment(node)) is not None
+        and isinstance(assignment[1], ast.List)
+    }
+
+
+def _trace_list_append(node: ast.AST, lists: set[str]) -> str | None:
+    """The list of ``lists`` that ``node`` appends to (``name.append(v)``),
+    else None."""
+    if (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "append"
+        and isinstance(node.func.value, ast.Name)
+        and node.func.value.id in lists
+    ):
+        return node.func.value.id
+    return None
+
+
+def _integer_arithmetic(
+    value: ast.expr, known: set[str], ctx: _Context, *, tables: bool = False
+) -> bool:
+    """Whether ``value`` reads memory through no subscript (a kernel tensor's
+    element, a register through another name, which no address check would
+    see) and is an integer, as is each arithmetic operation in it, an integer
+    conversion's operand included, with the names in ``known`` integral:
+    the terms of every move of this pass (``_moves``, ``_tabulable``,
+    ``_copyable_definition``).  ``tables``: a policy load of an integer
+    dtype and a comparison of integers count (``_table_integral``)."""
+    return (
+        not _float_valued(value)
+        and not any(_memory_subscript(node) for node in ast.walk(value))
+        and (
+            _table_integral(value, known, ctx)
+            if tables
+            else _integral(value, known, ctx.integer_tensors)
+        )
+        and all(
+            _integral(node, known, ctx.integer_tensors)
+            for node in ast.walk(value)
+            if _rounds(node)
+        )
+    )
+
+
+def _tabulable(
+    value: ast.expr,
+    known: set[str],
+    store_roots: list[frozenset[str]],
+    ctx: _Context,
+) -> bool:
+    """Whether ``value`` may be computed once per inner lane in front of the
+    outer loop: integer arithmetic, scalar loads of integer tensors that no
+    store of the outer loop may write, and pure calls (``_moves``'s terms)."""
+    if not _integer_arithmetic(value, known, ctx, tables=True):
+        return False
+    for node in ast.walk(value):
+        if not isinstance(node, ast.Call):
+            continue
+        pointer = _table_load_pointer(node)
+        if pointer is None:
+            if _policy_load(node) is None and not _is_proven_relocatable_call(
+                node, allow_load=False
+            ):
+                return False
+            continue
+        roots = _address_roots(pointer, ctx.tensor_names)
+        if (
+            roots is None
+            or any(root not in ctx.integer_tensors for root in roots)
+            or any(
+                tensor_roots_may_alias(roots, destination, ctx.disjoint)
+                for destination in store_roots
+            )
+        ):
+            return False
+    return True
+
+
+def _copyable_definition(value: ast.expr, known: set[str], ctx: _Context) -> bool:
+    """Whether a leading definition of an outer loop that the tables read
+    may be copied in front of the loop: integer arithmetic over pure calls,
+    ``_tabulable``'s terms without its loads. It reads no memory: copied in
+    front of a loop that stores to ``view``, ``base = cutlass.Int32(view[0])
+    * 2`` would hand every row the value the first row read."""
+    return _integer_arithmetic(value, known, ctx, tables=True) and all(
+        _is_proven_relocatable_call(node, allow_load=False)
+        for node in ast.walk(value)
+        if isinstance(node, ast.Call)
+    )
+
+
+# The most values a loop's load tables keep per thread (_tabulate_inner_loads):
+# inner lanes times tabulated names, summed over the loop's tables.  It counts
+# values, not registers: 32 Int64 values take 64 registers.
+_MAX_TABLE_VALUES = 32
+
+
+def _names_read_outside(body: list[ast.stmt], loop: ast.For) -> set[str]:
+    """The names ``body`` reads outside ``loop``, a statement of it."""
+    reads: set[str] = set()
+    pending: list[ast.AST] = list(body)
+    while pending:
+        node = pending.pop()
+        if node is loop:
+            continue
+        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load):
+            reads.add(node.id)
+        pending.extend(ast.iter_child_nodes(node))
+    return reads
+
+
+def _read_tables(
+    body: list[ast.stmt],
+    kept: Mapping[int, str],
+    lists: Mapping[str, str],
+    lane: str,
+    chain: Collection[int],
+) -> list[ast.stmt]:
+    """``body``, an inner lane loop's, reading the ``kept`` names (by index
+    in ``body``) from their tables ``lists`` at ``lane``, and without the
+    other statements of the ``chain`` (indices), which the tables compute."""
+    out: list[ast.stmt] = []
+    for index, inner in enumerate(body):
+        if index in kept:
+            name = kept[index]
+            out.append(
+                ast.copy_location(
+                    ast.Assign(
+                        targets=[ast.Name(id=name, ctx=ast.Store())],
+                        value=ast.Subscript(
+                            value=ast.Name(id=lists[name], ctx=ast.Load()),
+                            slice=ast.Name(id=lane, ctx=ast.Load()),
+                            ctx=ast.Load(),
+                        ),
+                    ),
+                    inner,
+                )
+            )
+        elif index not in chain:
+            out.append(inner)
+    return out
+
+
+def _tabulate_inner_loads(outer: ast.For, ctx: _Context) -> list[ast.stmt]:
+    """``outer`` preceded by the tables of its inner lane loops' repeated
+    loads (see the module docstring), or ``[outer]``."""
+    if loop_extent(outer, kinds=("constexpr",), minimum=2) is None:
+        return [outer]
+    store_roots = _loop_admits_hoisting(outer, ctx, tables=True)
+    if store_roots is None:
+        return [outer]
+    written = ctx.canonical(names_stored_or_deleted(outer) | _mutation_roots(outer))
+    taken = {
+        node.id
+        for node in ast.walk(ast.Module(body=[*ctx.body, *ctx.moved], type_ignores=[]))
+        if isinstance(node, ast.Name)
+    }
+    known = set(ctx.integral_names())
+    # Names read anywhere but in ``outer`` (after it, or by an enclosing
+    # loop's next iteration): a chain name among them keeps its binding in
+    # the rows, from its table, or ``last_key = key`` after the loop would
+    # read a name the rows no longer bind.
+    read_outside = ctx.canonical(_names_read_outside([*ctx.body, *ctx.moved], outer))
+    prefix: list[ast.stmt] = []
+    prefix_names: set[str] = set()
+    tables: list[ast.stmt] = []
+    # Names the outer body reads before the statement at hand (apart from
+    # each inner loop's own history below): a leading definition copied in
+    # front of the loop must not be one of them (of
+    # ``first = base + row; base = tid * 2``, the copy would hand ``first``
+    # the first iteration's tid * 2 instead of the value base had before).
+    outer_reads: set[str] = set()
+    table_values = 0
+    # The lane variables of the table loops made here, which later table
+    # loops may bind again.
+    table_lanes: set[str] = set()
+    for stmt in outer.body:
+        read_here = ctx.canonical(names_read(stmt))
+        assignment = name_assignment(stmt)
+        if assignment is not None and not tables:
+            name, value = assignment
+            target = resolve_alias(name, ctx.rename_groups)
+            reads = ctx.canonical(names_read(value))
+            if (
+                target not in outer_reads
+                and sum(
+                    1
+                    for node in ast.walk(outer)
+                    if isinstance(node, ast.Name)
+                    and isinstance(node.ctx, ast.Store)
+                    and resolve_alias(node.id, ctx.rename_groups) == target
+                )
+                == 1
+                and all(read not in written or read in prefix_names for read in reads)
+                and _copyable_definition(value, known, ctx)
+            ):
+                prefix.append(stmt)
+                prefix_names.add(target)
+                known.add(name)
+            outer_reads |= read_here
+            continue
+        outer_reads |= read_here
+        if not (
+            isinstance(stmt, ast.For)
+            and isinstance(stmt.target, ast.Name)
+            and (lane_extent := loop_extent(stmt, kinds=("constexpr",), minimum=1))
+            is not None
+        ):
+            continue
+        lane = stmt.target.id
+        inner_writes: dict[str, int] = {}
+        for node in ast.walk(stmt):
+            if isinstance(node, ast.Name) and isinstance(
+                node.ctx, (ast.Store, ast.Del)
+            ):
+                key = resolve_alias(node.id, ctx.rename_groups)
+                inner_writes[key] = inner_writes.get(key, 0) + 1
+        chain: list[tuple[int, str]] = []
+        chain_names: set[str] = set()
+        read_before: set[str] = set()
+        loads = False
+        for index, inner_stmt in enumerate(stmt.body):
+            assignment = name_assignment(inner_stmt)
+            if assignment is not None:
+                name, value = assignment
+                target = resolve_alias(name, ctx.rename_groups)
+                reads = ctx.canonical(names_read(value))
+                if (
+                    inner_writes.get(target) == 1
+                    and target not in read_before
+                    and all(
+                        read == lane
+                        or read in chain_names
+                        or read in prefix_names
+                        or read not in written
+                        for read in reads
+                    )
+                    and _tabulable(value, known | {lane}, store_roots, ctx)
+                ):
+                    chain.append((index, name))
+                    chain_names.add(target)
+                    known.add(name)
+                    loads |= any(
+                        _table_load_pointer(node) is not None
+                        for node in ast.walk(value)
+                    )
+            read_before |= ctx.canonical(names_read(inner_stmt))
+        chain_indices = {index for index, _ in chain}
+        # The names of the chain the rows still read. An address temporary
+        # that only table loads read (``key`` of ``doc = load(seeds + key)``)
+        # goes dead once the loads come from tables: it gets no table and
+        # leaves the row loop, and takes no value of the budget below.
+        read_by_rows = set().union(
+            *(
+                ctx.canonical(names_read(inner))
+                for index, inner in enumerate(stmt.body)
+                if index not in chain_indices
+            ),
+            *(
+                ctx.canonical(names_read(other))
+                for other in outer.body
+                if other is not stmt
+            ),
+            read_outside,
+        )
+        kept = {
+            index: name
+            for index, name in chain
+            if resolve_alias(name, ctx.rename_groups) in read_by_rows
+        }
+        # Every table entry stays live across the whole outer loop: at most
+        # _MAX_TABLE_VALUES of them.
+        if (
+            not loads
+            or not kept
+            or table_values + lane_extent * len(kept) > _MAX_TABLE_VALUES
+        ):
+            continue
+        # Every spelling of a chain name's rename group that the chain reads
+        # (``key_1 = base + lane`` read as ``key``) reads the table loop's
+        # value, and the table loop walks the lanes with a variable of its
+        # own: in front of the row loop, it must not rebind a ``lane`` the
+        # rows read before their inner loop.
+        renames = {name: f"{name}_by_lane" for _, name in chain}
+        by_group = {resolve_alias(name, ctx.rename_groups): name for _, name in chain}
+        for index, _ in chain:
+            for read in names_read(stmt.body[index]):
+                group = resolve_alias(read, ctx.rename_groups)
+                if group in by_group and read not in renames:
+                    renames[read] = renames[by_group[group]]
+        lists = {name: f"{name}_lanes" for name in kept.values()}
+        table_lane = f"{lane}_table"
+        if any(new in taken for new in (*renames.values(), *lists.values())) or (
+            table_lane in taken and table_lane not in table_lanes
+        ):
+            continue
+        renames[lane] = table_lane
+
+        # Read from the tables, the values are the same for every row: as
+        # the existing move asks of what it moves (the module docstring), no
+        # float arithmetic of the rows may become row-invariant through them.
+        # ``cutlass.Float32(doc) * 0.7 + cache[lane]`` over doc =
+        # doc_lanes[lane] would compute one product for both rows, which LLVM
+        # may then round apart from the add it contracted with.
+        trial = deep_clone(outer)
+        trial_inner = trial.body[outer.body.index(stmt)]
+        assert isinstance(trial_inner, ast.For)
+        trial_inner.body = _read_tables(
+            trial_inner.body, kept, lists, lane, chain_indices
+        )
+        if not _only_integers_become_invariant(
+            trial,
+            [],
+            set(lists.values()),
+            set(),
+            _loop_writes(trial, ctx),
+            ctx,
+        ):
+            continue
+        table_values += lane_extent * len(kept)
+        table_body: list[ast.stmt] = [
+            rename_names(deep_clone(stmt.body[index]), renames) for index, _ in chain
+        ]
+        table_body.extend(
+            ast.Expr(
+                value=ast.Call(
+                    func=ast.Attribute(
+                        value=ast.Name(id=lists[name], ctx=ast.Load()),
+                        attr="append",
+                        ctx=ast.Load(),
+                    ),
+                    args=[ast.Name(id=renames[name], ctx=ast.Load())],
+                    keywords=[],
+                )
+            )
+            for name in kept.values()
+        )
+        new_tables: list[ast.stmt] = [
+            ast.Assign(
+                targets=[ast.Name(id=lists[name], ctx=ast.Store())],
+                value=ast.List(elts=[], ctx=ast.Load()),
+            )
+            for name in kept.values()
+        ]
+        new_tables.append(
+            ast.For(
+                target=ast.Name(id=table_lane, ctx=ast.Store()),
+                iter=deep_clone(stmt.iter),
+                body=table_body,
+                orelse=[],
+            )
+        )
+        stmt.body = _read_tables(stmt.body, kept, lists, lane, chain_indices)
+        for table in new_tables:
+            ast.copy_location(table, stmt)
+            ast.fix_missing_locations(table)
+        tables.extend(new_tables)
+        ctx.integer_tables |= set(lists.values())
+        table_lanes.add(table_lane)
+        taken |= set(renames.values()) | set(lists.values())
+    if not tables:
+        return [outer]
+    # The leading definitions the tables read, and the ones those read.
+    needed = set().union(*(ctx.canonical(names_read(table)) for table in tables))
+    used: list[ast.stmt] = []
+    for stmt in reversed(prefix):
+        assignment = name_assignment(stmt)
+        assert assignment is not None
+        if resolve_alias(assignment[0], ctx.rename_groups) in needed:
+            used.insert(0, deep_clone(stmt))
+            needed |= ctx.canonical(names_read(assignment[1]))
+    ast.fix_missing_locations(outer)
+    ctx.moved.extend([*used, *tables])
+    # The tables bind new names (key_by_lane), integral as the names they
+    # stand for: computed again, the integral names include them, so a loop
+    # around the tables can tell their address arithmetic is integer.
+    ctx.forget_derived_names()
+    return [*used, *tables, outer]
+
+
 def _rewrite(body: list[ast.stmt], ctx: _Context) -> list[ast.stmt]:
     result: list[ast.stmt] = []
     for stmt in body:
@@ -897,7 +1438,11 @@ def _rewrite(body: list[ast.stmt], ctx: _Context) -> list[ast.stmt]:
             ):
                 setattr(stmt, field, _rewrite(child, ctx))
         if isinstance(stmt, ast.For):
-            result.extend(_hoist_from_loop(stmt, ctx))
+            hoisted = _hoist_from_loop(stmt, ctx)
+            result.extend(hoisted[:-1])
+            loop = hoisted[-1]
+            assert isinstance(loop, ast.For)
+            result.extend(_tabulate_inner_loads(loop, ctx))
         else:
             result.append(stmt)
     return result

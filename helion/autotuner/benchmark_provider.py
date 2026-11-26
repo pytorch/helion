@@ -60,6 +60,7 @@ from .benchmark_job import KernelTimerProbeJob
 from .benchmark_job import _cuda_device_of
 from .benchmark_prelude import BenchmarkPrelude
 from .benchmark_prelude import PreludeFailed
+from .benchmark_prelude import PreludeRefused
 from .benchmark_prelude import PreludeUnsupported
 from .benchmark_prelude import active_prelude
 from .benchmark_worker import BenchmarkCompileTimeout
@@ -77,6 +78,7 @@ from .benchmarking import do_bench
 from .benchmarking import do_bench_generic
 from .benchmarking import final_selection_l2_flush_mode
 from .benchmarking import final_selection_second_regime
+from .benchmarking import l2_flush_sweep_enabled
 from .benchmarking import synchronize_device
 from .input_banks import InputBankError
 from .input_banks import InputBankMemoryError
@@ -748,6 +750,12 @@ class BenchmarkProvider(abc.ABC):
         its ``NoConfigFound``); None when that is not what happened."""
         return None
 
+    def prelude_failure_cascade(self) -> str | None:
+        """Why a search behind a benchmark prelude found no config when the
+        prelude took readings from it (the detail of its
+        ``PreludeSearchFailed``); None when it took none."""
+        return None
+
     def invalidate_effective_source_hash(self, source_hash: str) -> None:
         """Prevent a failed rebenchmark source from being reused as an alias."""
         return None
@@ -815,6 +823,65 @@ class BenchmarkProvider(abc.ABC):
         ...
 
 
+def benchmark_prelude_unsupported(
+    settings: Settings, config_spec: ConfigSpec, kernel: _AutotunableKernel
+) -> str | None:
+    """Why a search of ``kernel`` (with its ``settings`` and ``config_spec``)
+    cannot time its candidates behind a benchmark prelude, None when it can.
+    Such a search takes every reading in the benchmark worker, between an L2
+    flush and a CUDA event pair or trace marker (``benchmark_prelude``), so
+    the setups that time elsewhere, or without a flush before every call,
+    cannot. The provider refuses a prelude with this reason
+    (``LocalBenchmarkProvider._check_benchmark_prelude``), so a caller can
+    ask first and tune such a kernel alone instead."""
+    backend = config_spec.backend
+    if (
+        settings.autotune_benchmark_input_banks > 1
+        or not settings.autotune_benchmark_subprocess
+        or settings.autotune_benchmark_fn is not None
+        or settings.autotune_handoff
+        # (a wall-clock benchmark worker is a backend's own do_bench too)
+        or backend.get_do_bench() is not None
+        or dist.is_initialized()
+        or kernel.env.device.type != "cuda"
+        or torch.version.hip is not None
+        or not kernel.supports_subprocess_benchmark()
+        # (its terminal refinement times in this process)
+        or config_spec.cute_flash_search_enabled
+    ):
+        return (
+            "a benchmark prelude requires the built-in benchmark worker with "
+            "its CUDA event and trace timers on an NVIDIA device: no rotating "
+            "input banks, custom benchmark callbacks, handoff, distributed "
+            "kernels, wall-clock timing or in-process refinement"
+        )
+    if _env_get_bool(_BENCHMARK_CUDAGRAPH_ENV, default=False):
+        # A replay runs a candidate on the arguments of its capture, not on
+        # the ones the prelude's work has just made.
+        return (
+            "a benchmark prelude cannot be timed through CUDA graph replays "
+            f"({_BENCHMARK_CUDAGRAPH_ENV})"
+        )
+    backend_regime = backend.default_final_selection_regime()
+    final_regime = final_selection_l2_flush_mode(backend_regime)
+    regimes = {
+        "HELION_AUTOTUNE_L2_FLUSH": _resolve_l2_flush_mode(None),
+        "HELION_AUTOTUNE_FINAL_L2_FLUSH": final_regime,
+        "HELION_AUTOTUNE_TARGET_REGIME": final_selection_second_regime(
+            final_regime, backend_regime
+        ),
+    }
+    for variable, regime in regimes.items():
+        if regime is not None and regime not in PRELUDE_REGIMES:
+            return (
+                "a benchmark prelude runs between the L2 flush and every timed "
+                "call, so the search, its final selection and the regime it "
+                f"selects by must flush per call {PRELUDE_REGIMES}; {variable} "
+                f"resolves to {regime!r}"
+            )
+    return None
+
+
 class LocalBenchmarkProvider(BenchmarkProvider):
     """Local single-machine benchmark provider.
 
@@ -852,6 +919,9 @@ class LocalBenchmarkProvider(BenchmarkProvider):
     # of a worker whose first job was one of them (``compile_deadline_cascade``).
     _compile_deadline_failures: int = 0
     _longest_cold_start_seconds: float = 0.0
+    # Candidates that had no reading because of the prelude
+    # (``prelude_failure_cascade``).
+    _prelude_failures: int = 0
     # Set inside ``fresh_source_timings``: every config of a batch is timed,
     # also one whose generated source this provider holds a reading of.
     _fresh_source_timings: bool = False
@@ -1361,6 +1431,15 @@ class LocalBenchmarkProvider(BenchmarkProvider):
                 self._longest_cold_start_seconds, error.cold_start_seconds
             )
         self._record_compile_failure(config, error)
+
+    def prelude_failure_cascade(self) -> str | None:
+        if self._prelude_failures == 0:
+            return None
+        return (
+            f"{self._prelude_failures} of the "
+            f"{self._autotune_metrics.num_configs_tested} tested configs had no "
+            "reading because of the benchmark prelude they were timed behind"
+        )
 
     def compile_deadline_cascade(self) -> str | None:
         tested = self._autotune_metrics.num_configs_tested
@@ -2141,55 +2220,14 @@ class LocalBenchmarkProvider(BenchmarkProvider):
             # they must be the ones this search specialized and checked its
             # candidates on (a block that covers another kernel's search, or
             # arguments not given as the compiled function takes them).
-            raise exc.InvalidAPIUsage(
+            raise PreludeRefused(
                 f"the benchmark prelude is not of this search's call: {mismatch}"
             )
-        settings = self.settings
-        backend = self.config_spec.backend
-        if (
-            self._input_bank_count > 1
-            or not settings.autotune_benchmark_subprocess
-            or settings.autotune_benchmark_fn is not None
-            or settings.autotune_handoff
-            or self._subprocess_benchmark_uses_wall_clock()
-            or backend.get_do_bench() is not None
-            or dist.is_initialized()
-            or self.kernel.env.device.type != "cuda"
-            or torch.version.hip is not None
-            or not self.kernel.supports_subprocess_benchmark()
-            # (its terminal refinement times in this process)
-            or self.config_spec.cute_flash_search_enabled
-        ):
-            raise exc.InvalidAPIUsage(
-                "a benchmark prelude requires the built-in benchmark worker with "
-                "its CUDA event and trace timers on an NVIDIA device: no rotating "
-                "input banks, custom benchmark callbacks, handoff, distributed "
-                "kernels, wall-clock timing or in-process refinement"
-            )
-        if _env_get_bool(_BENCHMARK_CUDAGRAPH_ENV, default=False):
-            # A replay runs a candidate on the arguments of its capture,
-            # not on the ones the prelude's work has just made.
-            raise exc.InvalidAPIUsage(
-                "a benchmark prelude cannot be timed through CUDA graph replays "
-                f"({_BENCHMARK_CUDAGRAPH_ENV})"
-            )
-        backend_regime = backend.default_final_selection_regime()
-        final_regime = final_selection_l2_flush_mode(backend_regime)
-        regimes = {
-            "HELION_AUTOTUNE_L2_FLUSH": _resolve_l2_flush_mode(None),
-            "HELION_AUTOTUNE_FINAL_L2_FLUSH": final_regime,
-            "HELION_AUTOTUNE_TARGET_REGIME": final_selection_second_regime(
-                final_regime, backend_regime
-            ),
-        }
-        for variable, regime in regimes.items():
-            if regime is not None and regime not in PRELUDE_REGIMES:
-                raise exc.InvalidAPIUsage(
-                    "a benchmark prelude runs between the L2 flush and every "
-                    "timed call, so the search, its final selection and the "
-                    f"regime it selects by must flush per call {PRELUDE_REGIMES}; "
-                    f"{variable} resolves to {regime!r}"
-                )
+        reason = benchmark_prelude_unsupported(
+            self.settings, self.config_spec, self.kernel
+        )
+        if reason is not None:
+            raise PreludeRefused(reason)
 
     def setup(self) -> None:
         """Prepare precompile tmpdir and args for spawn mode."""
@@ -2232,7 +2270,7 @@ class LocalBenchmarkProvider(BenchmarkProvider):
             try:
                 self._benchmark_prelude.save(prelude_path)
             except PreludeUnsupported as error:
-                raise exc.InvalidAPIUsage(str(error)) from error
+                raise PreludeRefused(str(error)) from error
             self._prelude_path = prelude_path
             self.log(
                 f"Timing every candidate behind a prelude of "
@@ -2250,7 +2288,7 @@ class LocalBenchmarkProvider(BenchmarkProvider):
                 f"benchmark subprocess boundary: {error}"
             ) from error
         if self._benchmark_prelude is not None:
-            raise exc.InvalidAPIUsage(
+            raise PreludeRefused(
                 "a benchmark prelude requires arguments that can cross the "
                 f"benchmark subprocess boundary: {error}"
             ) from error
@@ -2800,7 +2838,10 @@ class LocalBenchmarkProvider(BenchmarkProvider):
             every rank times the same configs and the timing loop's per-config
             collectives pair them."""
             attempted: list[int] = []
-            for i in unit:
+
+            def compile_one(i: int) -> bool:
+                """Generate config ``i``'s code; False once the budget stops
+                the batch."""
                 # Past the budget, a few more candidates still compile while
                 # the search has no successful measurement (streaming times
                 # each at once; with a pool, only while nothing in the batch
@@ -2812,7 +2853,7 @@ class LocalBenchmarkProvider(BenchmarkProvider):
                 )
                 exceeded, stop = self._budget_step_synced(protected=protected)
                 if stop:
-                    break
+                    return False
                 if exceeded:
                     exemptions["compile"] += 1
                 attempted.append(i)
@@ -2915,6 +2956,24 @@ class LocalBenchmarkProvider(BenchmarkProvider):
                         if raise_if_no_viable_config:
                             raise
                         self._no_viable_config_error = e
+                return True
+
+            # With a pool the whole batch's code is generated here, serially,
+            # before the first precompile starts: seconds per config for a
+            # large kernel, so the batch gets a bar of its own. A streamed
+            # unit is one config, which the per-unit bar already reports.
+            with contextlib.closing(
+                iter_with_progress(
+                    unit,
+                    total=len(unit),
+                    description=f"{desc} generating code",
+                    enabled=self.settings.autotune_progress_bar and not streaming,
+                )
+            ) as codegen_progress:
+                for i in codegen_progress:
+                    # A budget stop or an error closes the bar where it is.
+                    if not compile_one(i):
+                        break
 
             # Every rank attempted the same configs (the budget's stop is
             # agreed); code generation can still fail on one rank only (its
@@ -3378,6 +3437,7 @@ class LocalBenchmarkProvider(BenchmarkProvider):
                 "it, and this search times its candidates behind a prelude"
             )
             self._record_worker_failure(config, "error")
+            self._prelude_failures += 1
             return inf
 
         if self._input_bank_count > 1:
@@ -3682,6 +3742,7 @@ class LocalBenchmarkProvider(BenchmarkProvider):
             # no compile failure charged to the config's values.
             self.log.warning(f"No reading of {config!r}: {e}")
             self._record_worker_failure(config, "error")
+            self._prelude_failures += 1
             return inf
         except Exception as e:
             e.__traceback__ = None
@@ -3905,6 +3966,8 @@ class LocalBenchmarkProvider(BenchmarkProvider):
             l2_flush_mode=l2_flush_mode,
             input_banks=self._input_bank_count,
             prelude_path=self._prelude_path,
+            # (the search's ``autotune_l2_flush_sweep`` block)
+            l2_flush_sweep=l2_flush_sweep_enabled(),
             # the final selection names its windows' regime; the search's
             # candidates and re-timings (no regime named) follow its timer
             trace_kernel_durations=(
@@ -4019,8 +4082,10 @@ class LocalBenchmarkProvider(BenchmarkProvider):
                         KernelTimerProbeJob(
                             None if device is None else device.index,
                             # (behind a prelude the trace must split its
-                            # work off too)
+                            # work off too, and under the search's sweep
+                            # the sweep)
                             prelude_path=self._prelude_path,
+                            l2_flush_sweep=l2_flush_sweep_enabled(),
                         ),
                         timeout=float(self.settings.autotune_benchmark_timeout),
                     )

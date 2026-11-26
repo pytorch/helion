@@ -196,6 +196,16 @@ def _all_or_any_false(values: Sequence[Any]) -> bool | None:
     return True if all(value is True for value in values) else None
 
 
+# ``bench.py --cold-timer``'s timers, its default first (README, Timers).
+COLD_TIMERS = ("events", "trace")
+
+
+def cold_timer(record: dict[str, Any]) -> str:
+    """The timer of a bench record's ``cold_us`` (``bench.py --cold-timer``):
+    the default, ``events``, for a record made before records named it."""
+    return record.get("cold_timer", COLD_TIMERS[0])
+
+
 def aggregate_bench_records(
     processes: dict[str, dict[str, Any]], digests: dict[str, str]
 ) -> dict[str, Any]:
@@ -265,6 +275,14 @@ def aggregate_bench_records(
     names = list(counted)
     records = list(counted.values())
     first = records[0]
+    # A median over processes timed two ways is of neither: the timers read
+    # the same call apart (README: compare records within one cold_timer).
+    timers = {cold_timer(record) for record in records}
+    if len(timers) > 1:
+        raise ValueError(
+            f"the processes of {first.get('repro')} {first.get('shape')} timed "
+            f"cold_us with different cold timers: {sorted(timers)}"
+        )
     out: dict[str, Any] = {
         key: first[key]
         for key in (
@@ -279,6 +297,7 @@ def aggregate_bench_records(
         if key in first
     }
     out["status"] = "ok"
+    out["cold_timer"] = timers.pop()
     out["aggregate"] = {
         "processes": len(records),
         "counted": names,
@@ -770,6 +789,7 @@ def load_inductor_pretuned(
     decorators each pin a config: under HELION_FORCE_AUTOTUNE=0, so that none
     searches again in a process that forces autotuning (campaign.py's)."""
     import helion
+    from helion.inductor.kernel_sequence import SequencedKernel
 
     path = path or inductor_pretuned_path(repro_id)
     if not path.exists():
@@ -786,6 +806,10 @@ def load_inductor_pretuned(
             "regenerate it with inductor_pretuned.py --shape"
         )
     for kernel_name, kernel in vars(module).items():
+        # (helion.inductor's code wraps each kernel for its first call,
+        # helion_in_sequence: the wrapper holds the kernel)
+        if isinstance(kernel, SequencedKernel):
+            kernel = kernel.kernel
         if isinstance(kernel, helion.Kernel) and (
             len(kernel.configs) != 1 or kernel.settings.force_autotune
         ):

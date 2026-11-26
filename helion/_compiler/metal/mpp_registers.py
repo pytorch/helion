@@ -1015,16 +1015,20 @@ def emit_register_run(
     coop_view: Callable[..., tuple[list[str], list[str], str]],
 ) -> None:
     """A register run's loop (:func:`register_run`): per step of the K tile,
-    in a block of its own with the step ``_fs`` a constant, each register
-    operand's cooperative tensor, every lane writing its elements, each
-    element's position bound and its statements folded over it
+    each register operand's cooperative tensor, every lane writing its
+    elements in a block with the step ``_fs`` a constant, each element's
+    position bound and its statements folded over it
     (``operand_elements.element_body``), and each device view's handle of
-    the step's K, then the op.  Op K position ``kappa`` of step ``s`` is K
-    position ``steps * order[kappa] + s`` of the tile between two register
-    operands (``coop_layout.k_order``: a lane's elements of a row over the
-    steps are then one run of adjacent K positions, a few words of packed
-    codes), and ``s * K + kappa`` beside a view, which the op reads in
-    order; a view's step past the tile's live K is skipped.
+    the step's K, then the op.  Each step's operands (``_mr_a1``,
+    ``_mpp_a1``: suffixed by the step) of a run with one register operand
+    are built before the previous step's op runs, so their reads overlap
+    that op rather than wait for it; with two register operands or the
+    affine split the steps keep their order.  Op K position ``kappa`` of step
+    ``s`` is K position ``steps * order[kappa] + s`` of the tile between two
+    register operands (``coop_layout.k_order``: a lane's elements of a row
+    over the steps are then one run of adjacent K positions, a few words of
+    packed codes), and ``s * K + kappa`` beside a view, which the op reads
+    in order; a view's step past the tile's live K is skipped.
 
     Under an affine split the op's destination tensors start from 0 each
     tile and take x times the codes; a right input of ones gives x's row
@@ -1080,7 +1084,6 @@ def emit_register_run(
             assert isinstance(outer, ast.List)
             sides.append(("view", call.args[pos : pos + 9], live, outer.elts))
             pos += 9
-    names = ["_mr_a", "_mr_b"]
     saved = state.put, state.put_type
     dest = None
     if affine:
@@ -1109,14 +1112,23 @@ def emit_register_run(
             ),
         ]
         pad, inner = inner, inner + "    "
+    # Each step's operands (``fills``) and its ops (``ops``), in one block.
+    fills: list[list[str]] = []
+    ops: list[list[str]] = []
     for step in range(steps):
-        lines = [f"{pad}{{", f"{inner}constexpr short _fs = {step};"]
+        lines: list[str] = []
         live_terms: list[str] = []
+        step_names = ["", ""]
         for i, side in enumerate(sides):
             operand = ("left", "right")[i]
             if side[0] == "reg":
                 lanes, loop = cast("tuple[CoopLanes, ast.For]", side[1:])
-                lines.append(f"{inner}auto {names[i]} = {atom.tensor(op, operand)};")
+                step_names[i] = f"_mr_{'ab'[i]}{step}"
+                lines += [
+                    f"{inner}auto {step_names[i]} = {atom.tensor(op, operand)};",
+                    f"{inner}{{",
+                    f"{inner}    constexpr short _fs = {step};",
+                ]
                 state.put_type = (atom.left, atom.right)[i]
                 for e in range(len(lanes.rows)):
                     row, col = lanes.rows[e], lanes.cols[e]
@@ -1129,21 +1141,20 @@ def emit_register_run(
                         decls = (f"_e_m = {_at(0, row)}", f"_e_k = {k_pos}")
                     else:
                         decls = (f"_e_k = {k_pos}", f"_e_n = {_at(0, col)}")
-                    state.put = f"{names[i]}[{e}]"
-                    element = [
-                        f"{inner}{{",
-                        *(f"{inner}    int {decl};" for decl in decls),
-                    ]
+                    state.put = f"{step_names[i]}[{e}]"
+                    el = inner + "    "
+                    element = [f"{el}{{", *(f"{el}    int {decl};" for decl in decls)]
                     body, _, _ = element_body(loop, decls, step, e, facts, 0, state)
                     if lanes.valid is not None:
-                        element.append(f"{inner}    if ({lanes.valid[e]}) {{")
+                        element.append(f"{el}    if ({lanes.valid[e]}) {{")
                         with state.isolated_scope():
-                            emit_body(body, element, len(inner) + 8, state)
-                        element.append(f"{inner}    }} else {state.put} = 0;")
+                            emit_body(body, element, len(el) + 8, state)
+                        element.append(f"{el}    }} else {state.put} = 0;")
                     else:
                         with state.isolated_scope():
-                            emit_body(body, element, len(inner) + 4, state)
-                    lines += [*element, f"{inner}}}"]
+                            emit_body(body, element, len(el) + 4, state)
+                    lines += [*element, f"{el}}}"]
+                lines.append(f"{inner}}}")
             else:
                 args, live, outer = cast(
                     "tuple[list[ast.expr], tuple[bool, bool], list[ast.expr]]", side[1:]
@@ -1151,10 +1162,11 @@ def emit_register_run(
                 blocks = (atom.m, atom.k) if i == 0 else (atom.k, atom.n)
                 k_dim = 1 if i == 0 else 0
                 dtype = (atom.left, atom.right)[i]
+                step_names[i] = f"_mpp_{'ab'[i]}{step}"
                 decls_v, live_v, handle = coop_view(
                     args,
                     dtype,
-                    f"_mpp_{'ab'[i]}",
+                    step_names[i],
                     live,
                     blocks,
                     outer,
@@ -1162,25 +1174,44 @@ def emit_register_run(
                     str(atom.k * step),
                     k_tail=not whole,
                 )
-                names[i] = f"_mpp_{'ab'[i]}"
                 lines += [f"{inner}{line}" for line in decls_v]
                 live_terms += live_v
                 lines.append(f"{inner}{handle}")
         target = "_mr_p" if affine else acc.id
-        runs = [f"{op}.run({names[0]}, {names[1]}, {target});"]
+        runs = [f"{op}.run({step_names[0]}, {step_names[1]}, {target});"]
         if affine:
-            runs.append(f"{op}.run({names[0]}, _mr_ones, _mr_x);")
+            runs.append(f"{op}.run({step_names[0]}, _mr_ones, _mr_x);")
         if live_terms:
             # A view's step past the tile's live K adds nothing; every term
             # is uniform over the SIMD group.
-            lines += [
+            runs = [
                 f"{inner}if ({' && '.join(live_terms)}) {{",
                 *(f"{inner}    {run}" for run in runs),
                 f"{inner}}}",
             ]
         else:
-            lines += [f"{inner}{run}" for run in runs]
-        parts += [*lines, f"{pad}}}"]
+            runs = [f"{inner}{run}" for run in runs]
+        fills.append(lines)
+        ops.append(runs)
+    # A run with one register operand builds each step's operands before the
+    # previous step's ops, which keeps two of its cooperative tensors live.
+    # With both inputs in registers (an M4 at 16 and 32 rows) that is four,
+    # and on an M4 Max it slowed K-split configs at 16 rows by up to 1.8x.
+    # The affine split holds a third right input, its tensor of ones, across
+    # the steps; built ahead beside it, 5- and 6-bit weights at 32 rows with
+    # 8 steps a tile summed wrong on an M5 Max (exact with the ones built
+    # fresh each step, or with the steps in order).  Both keep their order.
+    ahead = not affine and sum(side[0] == "reg" for side in sides) == 1
+    parts.append(f"{pad}{{")
+    for step in range(steps):
+        parts += fills[step]
+        if not ahead:
+            parts += ops[step]
+        elif step:
+            parts += ops[step - 1]
+    if ahead:
+        parts += ops[-1]
+    parts.append(f"{pad}}}")
     if dest is not None:
         loop = loops[REG_EPILOGUE]
         av, pv, xv = _SPLIT_VALUES
