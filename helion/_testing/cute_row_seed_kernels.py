@@ -342,3 +342,37 @@ def row_norm_then_tiled_doubled_rows(
     for tile in hl.tile(x.size(0)):
         doubled[tile, :] = x[tile, :] * 2
     return out, doubled
+
+
+def masked_softmax_backward_rows(
+    grad: torch.Tensor,
+    keep: torch.Tensor,
+    logits: torch.Tensor,
+    row_max: torch.Tensor,
+    row_sum: torch.Tensor,
+    mask: torch.Tensor,
+    out: torch.Tensor,
+) -> torch.Tensor:
+    """An attention softmax's backward over ``[batch, heads, queries]`` rows of
+    keys, as helion.inductor emits it (better-benchmark sum_1eeba9a28a57):
+    dropout-kept gradient times the recomputed probabilities, their row sum,
+    then the gradient swept over the row again, masked.  The lane split
+    reduces and sweeps the row in two passes, and no reduction loop rolls
+    it."""
+    batch, heads, queries = row_max.shape
+    for tile_z, tile_y, tile_x in hl.tile([batch, heads, queries]):
+        # The mask's row as helion.inductor broadcasts it: through the row's
+        # size, which keeps the row out of a reduction loop.
+        rdim = hl.zeros([tile_x, grad.size(3)]).size(1)
+        g = grad[tile_z, tile_y, tile_x, :].to(torch.float32)
+        kept = keep[tile_z, tile_y, tile_x, :].to(torch.float32) * 1.1111111111111112
+        s = logits[tile_z, tile_y, tile_x, :].to(torch.float32)
+        m = row_max[tile_z, tile_y, tile_x][:, :, :, None]
+        d = row_sum[tile_z, tile_y, tile_x][:, :, :, None]
+        p = torch.exp(s - m) / d
+        gp = g * kept * p
+        dx = torch.addcmul(gp, -p, torch.sum(gp, -1, keepdim=True))
+        row_mask = mask[tile_z, tile_x, :]
+        masked = row_mask.reshape([tile_z, 1, tile_x, rdim])  # pyrefly: ignore
+        out[tile_z, tile_y, tile_x, :] = torch.where(masked, 0.0, dx).to(out.dtype)
+    return out

@@ -3,11 +3,14 @@ search's generic population.
 
 ``CuteReductionTileHeuristic`` seeds rows that fill whole warps with one
 16-byte packet per thread, on kernels whose grid admits one row per CTA.
-Three families fall outside it:
+Four families fall outside it:
 
 * a row that is no whole number of warps of packets (128 or 192 bf16
   elements: 16 and 24 packets), which gets the narrow chunk seed alone
   (``CuteSubwarpRowHeuristic``);
+* a row that no packet width tiles in power-of-two threads (196 bf16
+  elements: 49 8-byte packets), which gets no row seed at all
+  (``CuteMaskedTailRowHeuristic``);
 * a row kernel whose grid is too large for one row per CTA
   (``ConfigSpec.raise_grid_block_minimums`` starts the search at two rows or
   more), which gets no reduction seed at all although the warp rows hold
@@ -19,13 +22,16 @@ Three families fall outside it:
   rows of the first family carry and ``CuteSliceSweepPacketHeuristic`` adds
   to the warp rows).
 
-All three read one row plan (``_row_plan``), which is stricter than that
+All four read one row plan (``_row_plan``), which is stricter than that
 heuristic's gate: beside its rows it needs one root grid, packets along the
-row and a CTA of the seeds' rows and threads alone.
+row and a CTA of the seeds' rows and threads alone.  The rows a lane split
+reduces in a kernel without a reduction loop (a softmax backward's rows of
+128 keys) get a fifth family with a plan of its own
+(``CuteLaneSplitRowHeuristic``, ``_lane_split_row_plan``).
 
 All are seeds only: no default changes, and ``postprocess_seed_configs``
 appends them after every other seed (``row_packet_seed_configs``), so the
-existing seed prefixes stay as they were.  The three classes are seed
+existing seed prefixes stay as they were.  The five classes are seed
 families of that postprocessor, not entries of the ranked registry.
 """
 
@@ -39,6 +45,7 @@ from typing import cast
 
 import torch
 
+from .....autotuner.config_spec import SIZED_REDUCTION_CATEGORIES
 from .....runtime.config import Config
 from ....autotuner_heuristics.registry import AutotunerHeuristic
 from ....utils import compute_slice_size
@@ -50,7 +57,9 @@ from .cute import _cute_tile_seed_vec_width_for_dtype
 from .cute import _has_one_sized_reduction_loop
 from .cute import _memory_accesses
 from .cute import _reduction_blocks_of_extent
+from .cute import _reversed_root_loop_orders
 from .cute import _row_tile_axes
+from .cute import _seq_config_list
 
 if TYPE_CHECKING:
     from .....autotuner.config_spec import ReductionLoopSpec
@@ -206,16 +215,30 @@ def _row_plan(env: CompileEnvironment, device_ir: DeviceIR) -> _RowPlan | None:
     spec = env.config_spec
     if not _has_one_sized_reduction_loop(spec) or len(device_ir.grid_block_ids) != 1:
         return None
-    axes = _row_tile_axes(env, device_ir)
+    loop = cast("ReductionLoopSpec", spec.reduction_loops[0])
+    plan = _plan_of_rows(env, device_ir, loop.block_id)
+    if plan is None or loop.pinned or _full_slices_meet(env, device_ir):
+        return None
+    return plan
+
+
+def _plan_of_rows(
+    env: CompileEnvironment, device_ir: DeviceIR, block_id: int
+) -> _RowPlan | None:
+    """The plan of the rows of ``block_id``, the one block the kernel
+    reduces: what ``_row_plan`` and ``_lane_split_row_plan`` both ask of
+    them. The rows are tiled by every block size (``_row_tile_axes``), the
+    outer tile axes admit one block per CTA, no tile loop has a fixed block
+    of more than one, and the row has a static extent and loads as packets
+    walked at stride 1."""
+    spec = env.config_spec
+    axes = _row_tile_axes(env, device_ir, block_id)
     if not axes:
         return None
-    loop = cast("ReductionLoopSpec", spec.reduction_loops[0])
-    block_id = loop.block_id
     row_index = spec.block_sizes.block_id_to_index(axes[-1])
     extent = spec.cute_static_reduction_extents.get(block_id)
     if (
         extent is None
-        or loop.pinned
         or block_id in spec.cute_indexed_reduction_block_ids
         or any(
             spec.block_sizes[outer]._fragment(spec).low > 1
@@ -225,7 +248,6 @@ def _row_plan(env: CompileEnvironment, device_ir: DeviceIR) -> _RowPlan | None:
         or spec.cute_tile_symbolic_fixed_blocks
         or any(size != 1 for size in spec.cute_tile_fixed_block_sizes.values())
         or _row_is_no_run_of_packets(env, device_ir, block_id)
-        or _full_slices_meet(env, device_ir)
     ):
         return None
     vec = _cute_tile_seed_vec_width_for_dtype(
@@ -300,7 +322,7 @@ def slice_packet_entries(
 class _RowPlanFamily(AutotunerHeuristic):
     """A seed family of the row plan.  ``get_seed_configs`` makes the plan
     for a caller that wants one family; ``row_packet_seed_configs`` makes it
-    once for the three."""
+    once for the four."""
 
     backend = "cute"
 
@@ -389,20 +411,30 @@ class CuteSubwarpRowHeuristic(_RowPlanFamily):
     MAX_THREAD_PACKETS = 16
 
     @classmethod
+    def tiling_threads(
+        cls, extent: int, vec: int, packet_bytes: int = 16
+    ) -> int | None:
+        """The power-of-two threads that tile a row of ``extent`` elements,
+        ``vec`` to a 16-byte packet, with ``packet_bytes`` packets (the
+        largest power of two dividing the packet count, at least
+        ``MIN_ROW_THREADS``), or ``None``."""
+        packets, rest = divmod(extent, vec * packet_bytes // 16)
+        threads = packets & -packets
+        if rest or threads < cls.MIN_ROW_THREADS:
+            return None
+        return threads
+
+    @classmethod
     def row_threads(cls, extent: int, vec: int, packet_bytes: int = 16) -> int | None:
         """Threads of a row of ``extent`` elements, ``vec`` to a 16-byte
         packet, loaded as ``packet_bytes`` packets, or ``None`` for a row
-        these seeds do not take."""
+        these seeds do not take: a whole number of warps of packets (the warp
+        rows'), one no packet width tiles, or one whose threads would walk
+        more than ``MAX_THREAD_PACKETS`` packets."""
         if extent % (WARP_THREADS * vec) == 0:
             return None
-        packets, rest = divmod(extent, vec * packet_bytes // 16)
-        # The largest power of two dividing the packet count.
-        threads = packets & -packets
-        if (
-            rest
-            or threads < cls.MIN_ROW_THREADS
-            or extent > threads * vec * cls.MAX_THREAD_PACKETS
-        ):
+        threads = cls.tiling_threads(extent, vec, packet_bytes)
+        if threads is None or extent > threads * vec * cls.MAX_THREAD_PACKETS:
             return None
         return threads
 
@@ -449,6 +481,220 @@ class CuteSubwarpRowHeuristic(_RowPlanFamily):
                         slice_threads=slice_threads,
                         slice_widths=slice_widths,
                     )
+                )
+            )
+        return seeds
+
+
+class CuteMaskedTailRowHeuristic(_RowPlanFamily):
+    """Rows of packets with a partial last trip, for rows that no packet
+    width tiles in power-of-two threads.
+
+    The subwarp rows and the warp rows need a packet count with a
+    power-of-two factor of at least ``MIN_ROW_THREADS``
+    (``CuteSubwarpRowHeuristic.row_threads``).  A row of 196 bf16 elements,
+    the 14x14 plane of an NCHW BatchNorm's channel, is 24.5 16-byte packets
+    and 49 8-byte ones, so neither family seeds it; over the BatchNorm's two
+    tile axes no other row heuristic does either (a row over one tile axis,
+    a layer norm's, gets the reduction tile seeds), and its search starts
+    from random configs alone.  On GB300, seven full searches
+    of a [32, 672] x 196 BatchNorm + hardswish + mean
+    (``hl.tile([32, 672])`` over ``in0[tile_y, tile_x, :]``) ended at 5.0 to
+    5.3 us in five and 6.1 to 6.2 us in two (stock Inductor: 5.5): the five
+    hold 8 or 16 channels per CTA with 8 or 16 threads on the row, the two
+    64 rows with two threads.
+
+    Here the row takes the widest packet that divides it (8 bytes: four
+    elements of 196), ``ROW_THREADS`` threads of one packet each per trip and
+    a rolled loop of such trips (``reduction_loops`` of 64), whose last trip
+    is partial (196 = 3 * 64 + 4: one packet).  A trip of the whole row
+    instead (the subwarp rows' one rolled trip, here 16 threads of three
+    packets and a fourth on one thread) read 11.0 us, and the 64-element
+    trips 6.1 to 6.5 us before any search; the reversed tile order
+    (``_reversed_root_loop_orders``: the rows' axis fastest across CTAs) is
+    the second seed.  Rows per CTA are as for the subwarp rows.
+
+    No seed for a row that a packet width tiles (the other families' rows),
+    a row of odd length (no packets), a row shorter than two trips, or one
+    whose threads would walk more than ``MAX_THREAD_PACKETS`` packets.
+    """
+
+    name = "cute_masked_tail_rows"
+    ROW_THREADS = 16
+
+    @classmethod
+    def plan_seed_configs(
+        cls, env: CompileEnvironment, device_ir: DeviceIR, plan: _RowPlan
+    ) -> list[Config]:
+        spec = env.config_spec
+        subwarp = CuteSubwarpRowHeuristic
+        # A row that a packet width tiles is the other families' (also past
+        # the subwarp rows' packet cap: 1600 bf16 elements, 8 threads of 25
+        # packets), not one of these.
+        if plan.extent % (WARP_THREADS * plan.vec) == 0 or any(
+            subwarp.tiling_threads(plan.extent, plan.vec, packet_bytes) is not None
+            for packet_bytes in subwarp.PACKET_BYTES
+        ):
+            return []
+        # The widest packet, of at most 16 bytes, that divides the row.
+        vec = plan.vec
+        while plan.extent % vec:
+            vec //= 2
+        trip = cls.ROW_THREADS * vec
+        trips = -(-plan.extent // trip)
+        trips_fragment = spec.reduction_loops[0]._fragment(spec)
+        width_choices = (
+            spec.cute_vector_widths.block_id_lookup(plan.block_id)
+            ._fragment(spec)
+            .choices
+        )
+        if (
+            vec < 2
+            or not 2 <= trips <= subwarp.MAX_THREAD_PACKETS
+            or not trips_fragment.low <= trip <= trips_fragment.high
+            or vec not in width_choices
+        ):
+            return []
+        rows_fragment = spec.block_sizes[plan.row_index]._fragment(spec)
+        rows = min(max(subwarp.ROWS_PER_CTA, rows_fragment.low), rows_fragment.high)
+        if not WARP_THREADS <= rows * cls.ROW_THREADS <= MAX_THREADS_PER_BLOCK:
+            return []
+        # A slice beside the row takes at most the row's own packet, here
+        # narrowed to vec elements (slice_packet_entries).
+        slices = slice_packet_entries(
+            env, device_ir, plan.block_id, cls.ROW_THREADS, 16 * vec // plan.vec
+        )
+        if slices is None:
+            return []
+        slice_threads, slice_widths = slices
+        # rolled_rows_seed's one trip: here a trip of ROW_THREADS packets.
+        seed = CuteReductionTileHeuristic.rolled_rows_seed(
+            spec,
+            row_index=plan.row_index,
+            block_id=plan.block_id,
+            extent=trip,
+            rows=rows,
+            threads=cls.ROW_THREADS,
+            vec=vec,
+            slice_threads=slice_threads,
+            slice_widths=slice_widths,
+        )
+        seeds = [Config.from_dict(seed)]
+        loop_orders = _reversed_root_loop_orders(env)
+        if loop_orders is not None:
+            seeds.append(Config.from_dict({**seed, "loop_orders": loop_orders}))
+        return seeds
+
+
+def _lane_split_row_plan(
+    env: CompileEnvironment, device_ir: DeviceIR
+) -> _RowPlan | None:
+    """The row of a kernel that reduces one block it has no reduction loop
+    to roll, when the row loads as packets: a softmax backward's rows, which
+    the lane split reduces in one pass over the row's lanes and sweeps again
+    in a second (``lane_loops.split``).  The structure the row plan
+    (``_row_plan``) asks for, the reduction loop aside: the rows tiled by
+    every block size, one grid, a static extent, the row walked at stride 1,
+    and outer tile axes that admit one block per CTA (``_plan_of_rows``)."""
+    spec = env.config_spec
+    fact = spec.reduction_kernel_fact
+    if (
+        spec.reduction_loops
+        or spec.matmul_facts
+        or fact is None
+        or len(device_ir.grid_block_ids) != 1
+        or len(spec.reduction_block_ids) != 1
+    ):
+        return None
+    (block_id,) = spec.reduction_block_ids
+    if not fact.reductions or any(
+        descriptor.block_id != block_id
+        or descriptor.category not in SIZED_REDUCTION_CATEGORIES
+        for descriptor in fact.reductions
+    ):
+        return None
+    return _plan_of_rows(env, device_ir, block_id)
+
+
+class CuteLaneSplitRowHeuristic(AutotunerHeuristic):
+    """Several rows per CTA for rows that the lane split reduces
+    (``_lane_split_row_plan``), which no other row family seeds: their
+    kernels have no reduction loop.  helion.inductor emits such a kernel for
+    an attention softmax's backward, whose mask it broadcasts over the row
+    through ``rdim = hl.zeros([tile_x, 128]).size(1)``::
+
+        for tile_z, tile_y, tile_x in hl.tile([32, 16, 128]):
+            ...  # p = exp(s - max) / sum over the row of 128 keys
+            tmp39 = torch.sum(tmp38, -1)
+            out0[tile_z, tile_y, tile_x, :] = torch.addcmul(tmp38, -p, tmp39[..., None])
+
+    Searched from random configs alone, such a kernel lands in one of two
+    basins: on GB300 four of five full searches of that one (with a document
+    mask, 128 keys) ended at 17.4-17.7 us with 16 threads of 2-element
+    packets on each of 4 or 8 rows per CTA, and one at 18.8 us with 32
+    threads on 16 rows (stock Inductor: 18.2).  Each row here takes 8 rows of
+    the innermost tile axis per CTA, on 8 threads, and the two layouts
+    ``LAYOUTS`` the searches end in: 16 threads of 4-byte packets (19.9 to
+    20.2 us before any search on that kernel, 35.1 with 16-byte packets on
+    the same threads) and 8 threads of 16-byte packets, the layout the same
+    softmax without the document mask ends in (5.2 us).  Seeded so, four
+    full searches of the first kernel ended at 17.07-17.74 us (two of them
+    seeded with three configs of the 4-byte layout), and the second one's
+    at 5.19-5.36 us, as without the seeds (5.19-5.27)."""
+
+    name = "cute_lane_split_rows"
+    backend = "cute"
+    ROWS_PER_CTA = 8
+    # (threads on the row, bytes of a packet)
+    LAYOUTS = ((16, 4), (8, 16))
+
+    @classmethod
+    def get_seed_configs(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> list[Config]:
+        plan = _lane_split_row_plan(env, device_ir)
+        if plan is None:
+            return []
+        spec = env.config_spec
+        rows_fragment = spec.block_sizes[plan.row_index]._fragment(spec)
+        rows = min(max(cls.ROWS_PER_CTA, rows_fragment.low), rows_fragment.high)
+        row_block = spec.block_sizes[plan.row_index].block_id
+        width_choices = (
+            spec.cute_vector_widths.block_id_lookup(plan.block_id)
+            ._fragment(spec)
+            .choices
+        )
+        seeds: list[Config] = []
+        for threads, packet_bytes in cls.LAYOUTS:
+            vec = plan.vec * packet_bytes // 16
+            if (
+                vec < 1
+                or vec not in width_choices
+                or plan.extent % (threads * vec)
+                # A thread walks at most as many packets of its row as the
+                # subwarp rows let it: rows of 4096 keys would give each of
+                # 16 threads 128 packets, whose register reloads spill.
+                or plan.extent
+                > threads * vec * CuteSubwarpRowHeuristic.MAX_THREAD_PACKETS
+                or not WARP_THREADS <= rows * threads <= MAX_THREADS_PER_BLOCK
+            ):
+                continue
+            block_sizes = [1] * len(spec.block_sizes)
+            block_sizes[plan.row_index] = rows
+            seeds.append(
+                Config.from_dict(
+                    {
+                        "block_sizes": block_sizes,
+                        "num_threads": _seq_config_list(
+                            spec.num_threads, {row_block: rows, plan.block_id: threads}
+                        ),
+                        "cute_vector_widths": _seq_config_list(
+                            spec.cute_vector_widths, {plan.block_id: vec}
+                        ),
+                        **CuteReductionTileHeuristic._row_reload_entries(
+                            spec, plan.block_id
+                        ),
+                    }
                 )
             )
         return seeds
@@ -524,11 +770,11 @@ class CuteSliceSweepPacketHeuristic(_RowPlanFamily):
 def row_packet_seed_configs(
     env: CompileEnvironment, device_ir: DeviceIR
 ) -> list[tuple[str, list[Config]]]:
-    """The seeds of the three families by family name, in the order
+    """The seeds of the four families by family name, in the order
     ``postprocess_seed_configs`` appends them: the warp rows of grids above
     one row per CTA, the rows that are no whole number of warps of packets,
-    then the warp rows with packets on the slices swept beside the row.  One
-    row plan serves the three."""
+    the rows that no packet width tiles, then the warp rows with packets on
+    the slices swept beside the row.  One row plan serves the four."""
     plan = _row_plan(env, device_ir)
     if plan is None:
         return []
@@ -537,6 +783,7 @@ def row_packet_seed_configs(
         for family in (
             CuteFlooredWarpRowHeuristic,
             CuteSubwarpRowHeuristic,
+            CuteMaskedTailRowHeuristic,
             CuteSliceSweepPacketHeuristic,
         )
     ]
