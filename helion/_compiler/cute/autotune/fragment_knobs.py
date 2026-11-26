@@ -897,7 +897,7 @@ def _candidate_window(env: CompileEnvironment, node: Node) -> bool:
     if not isinstance(fake, torch.Tensor) or not fake.ndim:
         return False
     lanes = packet_lanes(fake.dtype)
-    strides = static_strides(fake)
+    strides = static_strides(env, fake)
     if lanes is None or strides is None or strides[-1] != 1:
         return False
     if any(stride % lanes for stride in strides[:-1]):

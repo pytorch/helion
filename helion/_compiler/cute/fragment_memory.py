@@ -454,7 +454,7 @@ class FragmentMemoryEmitter(FragmentContext):
         value = Fragment(slab_shape, fake.dtype, load)
         batched = self.batched_loads and self.warp_producer_recorder is None
         lanes = packet_lanes(fake.dtype)
-        strides = static_strides(fake)
+        strides = static_strides(self.env, fake)
         # The slab's rows are packets when its last dim is the whole
         # contiguous dim, or a static window of it at a packet-aligned start
         # and extent inside the dim (``hl.arange(D)`` over a D-wide dim).

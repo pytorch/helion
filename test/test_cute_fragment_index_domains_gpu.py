@@ -9,6 +9,25 @@ from helion._testing import skipIfNotCUDA
 from helion._testing.cute_fragment_index_domains import dot_then_reduce
 from helion._testing.cute_fragment_index_domains import indexed_gemm
 from helion._testing.cute_fragment_index_domains import reshaped_dot_then_max
+from helion._testing.cute_fragment_index_domains import windowed_cumsum
+
+
+@skipIfNotCUDA()
+@pytest.mark.parametrize(("begin", "end"), [(0, 61), (1, 64), (4, 60)])
+def test_windowed_fragment_packets_preserve_other_columns(begin: int, end: int) -> None:
+    x = torch.arange(2 * 16 * 64, device=DEVICE).reshape(2, 16, 64)
+    x = (x % 11 - 5).float()
+    storage = torch.full((x.numel() + 32,), -123, dtype=x.dtype, device=DEVICE)
+    out = storage[16:-16].view_as(x)
+    args = (x, out, begin, end)
+    bound = windowed_cumsum.bind(args)
+    config = helion.Config.from_dict(
+        dict(bound.config_spec.default_config()) | {"cute_fragment_vector_io": True}
+    )
+    expected = out.clone()
+    expected[..., begin:end] = x[..., begin:end].cumsum(1)
+    assert torch.equal(bound.compile_config(config)(*args), expected)
+    assert (storage[:16] == -123).all() and (storage[-16:] == -123).all()
 
 
 @skipIfNotCUDA()
