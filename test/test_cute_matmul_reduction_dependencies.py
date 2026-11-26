@@ -20,7 +20,7 @@ from helion._compiler.cute.lane_loops.markers import _lane_reduce_marker_expr
 from helion._compiler.cute.lane_loops.split import split_lane_loop_reductions
 from helion._compiler.generate_ast import GenerateAST
 
-pytestmark = pytest.mark.cpu_only
+pytestmark = [pytest.mark.cpu_only, pytest.mark.usefixtures("cute_compile_env")]
 
 
 def _bare_body() -> str:

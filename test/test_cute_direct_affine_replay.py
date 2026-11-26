@@ -49,7 +49,7 @@ from helion._compiler.cute.direct_affine_templates import (
     resolve_direct_affine_templates,
 )
 
-pytestmark = pytest.mark.cpu_only
+pytestmark = [pytest.mark.cpu_only, pytest.mark.usefixtures("cute_compile_env")]
 
 validate_direct_affine_templates = templates_impl._validate_direct_affine_templates
 

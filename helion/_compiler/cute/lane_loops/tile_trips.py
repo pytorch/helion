@@ -73,6 +73,7 @@ from ...ast_extension import expr_from_string
 from ...ast_extension import statement_from_string
 from ...ast_read_writes import HELION_LANE_LOOP_VAR_ATTR
 from ...ast_read_writes import ReadWrites
+from ...compile_environment import backend_unsupported
 from .._ast_pass_utils import _is_proven_relocatable_assignment
 from .._ast_pass_utils import deep_clone
 from .._ast_pass_utils import loop_extent
@@ -86,7 +87,6 @@ from .markers import _find_lane_reduce_call
 from .markers import _is_constexpr_lane_iter
 from .markers import _is_lane_reduce_marker_assign
 from .markers import _LaneReduceMarker
-from .unsupported import lane_loop_unsupported
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -140,7 +140,7 @@ def serialize_tile_lane_trips(
             assert isinstance(node, ast.For)
             reason = _serialize(node, *nest, constexpr_value, rename_groups, new_var)
             if reason is not None:
-                raise lane_loop_unsupported(
+                raise backend_unsupported(
                     f"{NESTED_OWNER_REFUSAL}; the rows of its tile cannot run as "
                     f"a serial loop of the lanes either: {reason}",
                 )

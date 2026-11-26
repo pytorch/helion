@@ -181,6 +181,7 @@ from ...ast_extension import expr_from_string
 from ...ast_extension import statement_from_string
 from ...ast_read_writes import HELION_BLOCK_UNIFORM_ATTR
 from ...ast_read_writes import HELION_RAW_BARRIER_TENSORS_ATTR
+from ...compile_environment import backend_unsupported
 from ..address_maps import AddressMaps
 from ..address_maps import Load
 from ..address_maps import _tighter
@@ -215,7 +216,6 @@ from .statements import _simple_statements
 from .statements import _Statement
 from .statements import _structural_markers
 from .statements import _thread_axis_reads
-from .unsupported import lane_loop_unsupported
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
@@ -1175,7 +1175,7 @@ def add_thread_barriers(
         return (writes or other_writes) and not (first.atomic and second.atomic)
 
     def reject(tensors: Iterable[str]) -> None:
-        raise lane_loop_unsupported(
+        raise backend_unsupported(
             f"threads sharing a tile axis race on {', '.join(sorted(tensors))} "
             "inside a branch, where the barrier ordering them cannot be placed",
         )
@@ -1390,7 +1390,7 @@ def add_thread_barriers(
             - private
         )
         if exposed:
-            raise lane_loop_unsupported(
+            raise backend_unsupported(
                 f"a loop repeated whole once per {', '.join(sorted(variables))} "
                 f"accesses {exposed[0]} in a branch test or a loop header beside "
                 "a store to it, which the lanes' passes interleave in an order "
@@ -1448,7 +1448,7 @@ def add_thread_barriers(
                 and iteration_symbols <= equal
             ):
                 continue
-            raise lane_loop_unsupported(
+            raise backend_unsupported(
                 f"a loop repeated whole once per {', '.join(sorted(variables))} "
                 f"accesses {tensor} in an order the lanes' passes interleave: "
                 f"{ast.unparse(first.node).splitlines()[0][:80]!r} and "
@@ -1534,7 +1534,7 @@ def add_thread_barriers(
         return iterations if len(iterations) == len(variables) else set()
 
     def out_of_order(tensor: str, where: str) -> exc.BackendUnsupported:
-        return lane_loop_unsupported(
+        return backend_unsupported(
             f"an access of {tensor} (gathered, or another lane's or chunk's "
             f"element) may meet another access of it in {where} of a looped "
             "reduction, which no barrier orders as the program does (its load "
@@ -1735,7 +1735,7 @@ def add_thread_barriers(
         if separated(first, second, level) and (sequential or first_only(first, level)):
             continue
         if not sequential:
-            raise lane_loop_unsupported(
+            raise backend_unsupported(
                 f"an access of {', '.join(sorted(tensors))} (gathered, or another "
                 "lane's element) conflicts with another access of it across the "
                 "lanes of one lane loop, which no barrier orders as the program "
@@ -1755,7 +1755,7 @@ def add_thread_barriers(
         placed[id(block)].append(position)
     if placeholders:
         if any(placed[id(block)] for block in blocks):
-            raise lane_loop_unsupported(
+            raise backend_unsupported(
                 "threads sharing a tile axis race on a tensor in a body a later "
                 f"pass rewrites ({', '.join(sorted(placeholders))}), where the "
                 "barrier ordering them cannot be placed",

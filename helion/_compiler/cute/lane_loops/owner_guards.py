@@ -23,6 +23,7 @@ from typing import cast
 from ...ast_extension import create
 from ...ast_extension import expr_from_string
 from ...ast_extension import statement_from_string
+from ...compile_environment import backend_unsupported
 from .._ast_pass_utils import _is_proven_relocatable_call
 from .._ast_pass_utils import deep_clone
 from ..persistent_branch_vec import PACKET_STORE_BYTES
@@ -31,7 +32,6 @@ from .markers import _CUTE_THREAD_VARYING_INTRINSICS
 from .markers import _int_literal
 from .markers import _is_lane_reduce_marker_assign
 from .markers import _LaneReduceMarker
-from .unsupported import lane_loop_unsupported
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
@@ -227,7 +227,7 @@ def _lane_reduce_owner_expr(
             reduce_axis in store_axes.predicate
             and reduce_axis not in store_axes.bounded_zero_safe_predicate
         ):
-            raise lane_loop_unsupported(
+            raise backend_unsupported(
                 "cannot infer unique ownership for a thread-varying store",
             )
     if marker.group_span > 1 and marker.group_lane_expr:
@@ -902,7 +902,7 @@ def _store_thread_axes(
     )
     if atomic_parts is not None:
         if _contains_sync_threads(stmt):
-            raise lane_loop_unsupported(
+            raise backend_unsupported(
                 "cannot predicate a statement containing sync_threads"
             )
         store = memory_calls[0]
@@ -973,7 +973,7 @@ def _store_thread_axes(
 def _validated_owner_store(stmt: ast.AST) -> ast.Call | None:
     """Return the only isolated store, rejecting unsafe ownership rewrites."""
     if _contains_sync_threads(stmt):
-        raise lane_loop_unsupported(
+        raise backend_unsupported(
             "cannot predicate a statement containing sync_threads"
         )
     # A call used as a statement discards its result, so it exists for an
@@ -989,7 +989,7 @@ def _validated_owner_store(stmt: ast.AST) -> ast.Call | None:
         and id(node.value) not in memory_call_ids
         for node in ast.walk(stmt)
     ):
-        raise lane_loop_unsupported(
+        raise backend_unsupported(
             "cannot infer whether a standalone call has side effects"
         )
     if not _has_observable_memory_write(stmt):
@@ -1006,12 +1006,10 @@ def _validated_owner_store(stmt: ast.AST) -> ast.Call | None:
         )
     ]
     if len(memory_calls) != 1 or len(stores) != 1:
-        raise lane_loop_unsupported(
-            "cannot infer unique ownership for this memory write"
-        )
+        raise backend_unsupported("cannot infer unique ownership for this memory write")
     store = stores[0]
     if not _is_isolated_store_statement(stmt, store):
-        raise lane_loop_unsupported(
+        raise backend_unsupported(
             "cannot predicate a compound statement containing a store"
         )
     return store
@@ -1060,11 +1058,11 @@ def _thread_axis_owner_exprs(
         if axis in store_axes.address or axis in store_axes.unique_predicate:
             continue
         if axis in store_axes.value:
-            raise lane_loop_unsupported(
+            raise backend_unsupported(
                 "lane reduction store aliases a value-varying thread axis",
             )
         if axis in store_axes.predicate and axis not in store_axes.zero_safe_predicate:
-            raise lane_loop_unsupported(
+            raise backend_unsupported(
                 "cannot infer unique ownership from a thread predicate"
             )
         predicates.append(f"cutlass.Int32(cute.arch.thread_idx()[{axis}]) == 0")
@@ -1078,7 +1076,7 @@ def _guard_stmt_with_owner(stmt: ast.AST, predicates: list[str]) -> ast.AST:
         return deep_clone(stmt)
     store = _validated_owner_store(stmt)
     if store is None:
-        raise lane_loop_unsupported("owner predicate requires one store")
+        raise backend_unsupported("owner predicate requires one store")
     predicate = " and ".join(f"({expr})" for expr in dict.fromkeys(predicates))
     # The guarded copy keeps the statement's markers and source location
     # (``deep_clone``), as the lane split's other copies do.
@@ -1163,7 +1161,7 @@ def _validated_idempotent_store(stmt: ast.AST) -> ast.Call | None:
         and not _is_proven_relocatable_call(node, allow_load=False)
         for node in ast.walk(stmt)
     ):
-        raise lane_loop_unsupported(
+        raise backend_unsupported(
             "chunk recurrence store contains a call with unknown purity"
         )
     return store

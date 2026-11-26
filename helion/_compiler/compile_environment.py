@@ -79,6 +79,11 @@ PreparedGuardFactory = typing.Callable[
 CUDA_TENSOR_DESCRIPTOR_MAX_BLOCK_SIZE = 256
 
 
+def backend_unsupported(detail: str) -> exc.BackendUnsupported:
+    """The current backend's unsupported exception for ``detail``."""
+    return CompileEnvironment.current().backend.unsupported(detail)
+
+
 @dataclasses.dataclass(eq=False)
 class _ContainerIdentity:
     # Only the frontend owns the original. TypeInfo retains the emptied token.

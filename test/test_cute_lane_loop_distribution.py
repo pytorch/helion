@@ -2344,6 +2344,7 @@ w = smem[indices_1 * 2]
 @pytest.mark.parametrize(
     ("op", "accepted"), [("=", True), ("+=", False)], ids=["store", "update"]
 )
+@pytest.mark.usefixtures("cute_compile_env")
 def test_staging_repeated_by_the_row_loop_is_exact_only_as_a_plain_store(
     op: str, accepted: bool
 ) -> None:
@@ -2375,6 +2376,7 @@ def test_staging_repeated_by_the_row_loop_is_exact_only_as_a_plain_store(
         pytest.param("    column_scale = column_scale * 2.0\n", False, id="carried"),
     ],
 )
+@pytest.mark.usefixtures("cute_compile_env")
 def test_repeated_if_depends_only_on_values_from_before_it(
     branch: str, accepted: bool
 ) -> None:
@@ -2451,6 +2453,7 @@ _REPEATED = "in a loop repeated whole once per lane_0 meets"
         ),
     ],
 )
+@pytest.mark.usefixtures("cute_compile_env")
 def test_device_loop_repeated_by_a_lane_loop_is_checked_inside(
     body: str, rejected: str | None
 ) -> None:
@@ -2653,6 +2656,7 @@ def _gather_body(column: str) -> str:
     return body.replace("column = indices_1 * 1\n", "")
 
 
+@pytest.mark.usefixtures("cute_compile_env")
 def test_gathered_address_rules() -> None:
     # A column index loaded from memory is any thread's; one computed from
     # the thread's own index is its own.  In a lane loop the gather of one
@@ -3085,6 +3089,7 @@ def _single_thread_column_scopes() -> list[LaneScope]:
     ]
 
 
+@pytest.mark.usefixtures("cute_compile_env")
 def test_gathered_lane_conflict_on_a_single_thread_is_rejected() -> None:
     # The lanes of one lane loop run on one thread in loop order while the
     # program runs every lane of the gather before any lane's store: lane 1
@@ -3397,6 +3402,7 @@ _LANE_COORDINATE = "cutlass.Int32(cute.arch.thread_idx()[0])"
         ),
     ],
 )
+@pytest.mark.usefixtures("cute_compile_env")
 def test_staging_loops_owning_their_elements_need_no_barrier(
     flat: str, offset: str, accepted: bool
 ) -> None:
@@ -3932,6 +3938,7 @@ def test_transposed_address_is_another_threads_element() -> None:
         pytest.param("(indices_1 + 1) % 256", True, id="modular"),
     ],
 )
+@pytest.mark.usefixtures("cute_compile_env")
 def test_mapped_lane_conflict_is_rejected(column: str, rejected: bool) -> None:
     # The lanes of one thread run in loop order while the program runs every
     # lane of the load before any lane's store: a load through another
@@ -3978,6 +3985,7 @@ def test_mapped_lane_conflict_is_rejected(column: str, rejected: bool) -> None:
         ),
     ],
 )
+@pytest.mark.usefixtures("cute_compile_env")
 def test_staging_access_of_another_threads_element_is_rejected(probe: str) -> None:
     # After the copy loop, a per-thread store to (or load of) the element
     # of the thread flattened one further, through the modular wrap: the
@@ -4341,6 +4349,7 @@ def _rolled_lanes(
     return items
 
 
+@pytest.mark.usefixtures("cute_compile_env")
 def test_rolled_lanes_reject_a_pair_meeting_in_two_lanes() -> None:
     # A lane's own element is never another lane's: the load and the store
     # need nothing.  A gathered load beside the store may read an element an
@@ -4357,6 +4366,7 @@ def test_rolled_lanes_reject_a_pair_meeting_in_two_lanes() -> None:
         _rolled_lanes(gather + store)
 
 
+@pytest.mark.usefixtures("cute_compile_env")
 def test_rolled_lanes_take_a_value_loaded_per_lane_as_the_lanes_own() -> None:
     # ``shift`` is loaded around the body at an address only the lane
     # variable names, which every thread loads alike: one value within a
@@ -4415,6 +4425,7 @@ def _shifted(load: str, store: str) -> str:
     )
 
 
+@pytest.mark.usefixtures("cute_compile_env")
 def test_rolled_lanes_reject_a_pair_meeting_in_two_chunks_unless_one() -> None:
     # Chunk i stores ``out[rindex_1 + 1024]``, the element chunk i + 1 loads
     # at ``out[rindex_1]``, where the program loads every element before
@@ -4432,6 +4443,7 @@ def test_rolled_lanes_reject_a_pair_meeting_in_two_chunks_unless_one() -> None:
     assert _kinds(items) == ["stmt", "stmt", "sync"], _kinds(items)
 
 
+@pytest.mark.usefixtures("cute_compile_env")
 def test_rolled_lanes_tell_which_chunk_reaches_the_other_first() -> None:
     # Loaded at ``out[rindex_1 + 1024]`` and stored at ``out[rindex_1]``,
     # an element is loaded one chunk before it is stored, as the program
@@ -4821,6 +4833,7 @@ def _repeated_loop_nest(
         ),
     ],
 )
+@pytest.mark.usefixtures("cute_compile_env")
 def test_device_loop_repeated_per_lane_is_checked_through_its_address_mappings(
     body: str, accepted: bool
 ) -> None:
@@ -4842,6 +4855,7 @@ def test_device_loop_repeated_per_lane_is_checked_through_its_address_mappings(
             _repeated_loop_nest(body)
 
 
+@pytest.mark.usefixtures("cute_compile_env")
 def test_helper_call_in_a_device_loop_repeated_per_lane_rejects_the_config() -> None:
     # A call of unknown effects whose operands ignore the lane reads or
     # writes ``x`` again in every pass, between the per-lane stores of the
@@ -4868,6 +4882,7 @@ def test_helper_call_in_a_device_loop_repeated_per_lane_rejects_the_config() -> 
         pytest.param("indices_1 + 8", ([], ["stmt", "sync", "stmt"]), id="next_thread"),
     ],
 )
+@pytest.mark.usefixtures("cute_compile_env")
 def test_vector_lane_forced_equal_is_no_lane_confinement(
     read: str, expected: tuple[list[int], list[str]] | None
 ) -> None:
@@ -4962,6 +4977,7 @@ def test_unknown_values_leave_the_rest_of_the_term_to_the_proof(
         pytest.param("base + indices_0", False, True, id="unscaled_store"),
     ],
 )
+@pytest.mark.usefixtures("cute_compile_env")
 def test_loaded_base_in_a_repeated_device_loop_keeps_the_lane_term(
     column: str, update: bool, accepted: bool
 ) -> None:
@@ -5016,6 +5032,7 @@ _REPEATED_BEGIN = sympy.Symbol("_helion_tile_begin_2_1", integer=True)
 _REPEATED_BLOCK = sympy.Symbol("_BLOCK_SIZE_2", integer=True, positive=True)
 
 
+@pytest.mark.usefixtures("cute_compile_env")
 def test_regions_apart_within_an_iteration_do_not_exempt_a_repeated_loop() -> None:
     # The previous row's element at the next tile's first column beside the
     # tile's store: the recorded regions share the device loop's begin and
@@ -5048,6 +5065,7 @@ def test_regions_apart_within_an_iteration_do_not_exempt_a_repeated_loop() -> No
         _repeated_loop_nest(body, regions)
 
 
+@pytest.mark.usefixtures("cute_compile_env")
 def test_literal_regions_apart_exempt_a_pair_in_a_repeated_loop() -> None:
     # A gathered row read at a column the proof does not know beside the
     # per-lane store of the row's upper half: the terms prove nothing, the
@@ -5073,6 +5091,7 @@ def test_literal_regions_apart_exempt_a_pair_in_a_repeated_loop() -> None:
     assert _repeated_loop_nest(body, regions) == ["stmt"]
 
 
+@pytest.mark.usefixtures("cute_compile_env")
 def test_store_confined_to_an_iteration_of_the_repeated_loop_is_accepted() -> None:
     # Two lanes store one row within an iteration (the tile statement's
     # own duplicate, whichever wins), never across iterations once the
@@ -5307,6 +5326,7 @@ def _flattened_store(stride: int | str, end: int | str | None) -> str:
         ),
     ],
 )
+@pytest.mark.usefixtures("cute_compile_env")
 def test_flattened_store_in_a_repeated_device_loop_is_bounded_by_its_mask(
     stride: int, end: int | None, constants: dict[str, int] | None, accepted: bool
 ) -> None:
@@ -5354,6 +5374,8 @@ _NEXT_COLUMN_READ_THEN_FLATTENED_STORE = (
         ),
     ],
 )
+@pytest.mark.usefixtures("cute_compile_env")
+@pytest.mark.usefixtures("cute_compile_env")
 def test_flattened_store_with_a_dynamic_stride_is_bounded_by_its_mask(
     body: str, accepted: bool
 ) -> None:
@@ -5410,6 +5432,7 @@ _FLATTENED_STORE = f"{_pointer('x', 'indices_0 * 250 + indices_2')}.store(c)\n"
         pytest.param(f"tile_offset_2 + {_LANE_COORDINATE}", id="exact"),
     ],
 )
+@pytest.mark.usefixtures("cute_compile_env")
 def test_branch_around_a_device_loop_bounds_none_of_the_loops_own_indices(
     index: str,
 ) -> None:
@@ -5437,6 +5460,7 @@ def test_branch_around_a_device_loop_bounds_the_index_it_tests() -> None:
     ) == ["stmt"]
 
 
+@pytest.mark.usefixtures("cute_compile_env")
 def test_unbounded_columns_past_the_stride_reject_the_config() -> None:
     # Without the bound, the columns 250 to 315 of one lane's row are the
     # next lane's row's first.
@@ -5591,6 +5615,7 @@ def test_metadata_queries_of_a_tensor_view_are_no_accesses() -> None:
     assert _root_body_kinds(_EPILOGUE_FRAGMENT_SIZING) == ["stmt"]
 
 
+@pytest.mark.usefixtures("cute_compile_env")
 def test_pointer_inside_an_unknown_call_in_a_branch_rejects_the_config() -> None:
     # The tensor's pointer handed to such a call is an access of unknown
     # effects, racing the per-thread load beside it where no barrier can be
@@ -5655,6 +5680,7 @@ _UNIFORM_START = _BLOCK_INDEX + f"start = {_pointer('offsets', 'pid')}.load()\n"
         ),
     ],
 )
+@pytest.mark.usefixtures("cute_compile_env")
 def test_uniform_load_around_the_nest_is_one_value_for_the_lanes(
     definitions: str, accepted: bool
 ) -> None:
@@ -5685,6 +5711,7 @@ _GATHERED_ROWS_DYNAMIC = (
 )
 
 
+@pytest.mark.usefixtures("cute_compile_env")
 def test_uniform_start_rows_with_a_dynamic_stride_are_one_lanes() -> None:
     # The jagged batch with dynamic shapes: the row stride ``K`` is a kernel
     # argument, the column tile's mask bounds the column below it and the
@@ -5858,6 +5885,7 @@ _STRIDE_250_STORE = (
         ),
     ],
 )
+@pytest.mark.usefixtures("cute_compile_env")
 def test_a_mask_the_nest_defines_bounds_the_outer_index_not_the_loops(
     definitions: str, body: str, accepted: bool
 ) -> None:
@@ -5944,6 +5972,8 @@ _NEXT_COLUMN_LOAD = f"{_pointer('x', 'indices_0 * 250 + indices_2 + 1')}.load()"
         ),
     ],
 )
+@pytest.mark.usefixtures("cute_compile_env")
+@pytest.mark.usefixtures("cute_compile_env")
 def test_a_load_in_a_test_or_header_beside_a_store_of_its_tensor_is_rejected(
     body: str,
 ) -> None:

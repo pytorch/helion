@@ -447,6 +447,25 @@ def _cpu_render_marker(request: pytest.FixtureRequest) -> Generator[None, None, 
         yield
 
 
+@pytest.fixture
+def cute_compile_env() -> Generator[None, None, None]:
+    """A CuTe compile environment on CPU, for tests that run the lane-loop
+    passes on bare ASTs: their refusals name the compiling backend
+    (``backend_unsupported``).  ``mock_cuda_unavailable`` lets the CPU lane
+    build it without CUDA."""
+    import torch
+
+    import helion
+    from helion._compiler.compile_environment import CompileEnvironment
+    from helion._testing.cute_codegen import mock_cuda_unavailable
+
+    with (
+        mock_cuda_unavailable(),
+        CompileEnvironment(torch.device("cpu"), helion.Settings(backend="cute")),
+    ):
+        yield
+
+
 def pytest_configure(config: pytest.Config) -> None:
     # xdist workers inherit this environment.  Left alone, OpenMP and OpenBLAS
     # in every worker start a busy-waiting thread per CPU when torch is
