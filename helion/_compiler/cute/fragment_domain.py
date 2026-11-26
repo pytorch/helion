@@ -81,6 +81,39 @@ def render_ownership(mask: OwnershipMask) -> str:
     return mask.expression if isinstance(mask, OwnershipTerm) else mask
 
 
+def selected_ownership(
+    mask: Iterable[OwnershipMask],
+    when_true: tuple[OwnershipTerm, ...],
+    when_false: tuple[OwnershipTerm, ...],
+) -> tuple[OwnershipTerm, ...]:
+    """Describe the selected arm without emitting code at probe coordinates.
+
+    Broadcasting visits this recipe with symbolic coordinate aliases. Keep
+    their provenance until the caller supplies its actual lane indices.
+    """
+    condition = ownership_terms(mask)
+    if not condition:
+        return when_true
+    shared = tuple(term for term in when_true if term in when_false)
+    left = tuple(term for term in when_true if term not in shared)
+    right = tuple(term for term in when_false if term not in shared)
+    if not left and not right:
+        return shared
+
+    def conjunction(terms: tuple[OwnershipTerm, ...]) -> str:
+        return " and ".join(f"({term.expression})" for term in terms) or "True"
+
+    return (
+        *shared,
+        OwnershipTerm(
+            f"(({conjunction(left)}) if ({conjunction(condition)}) else ({conjunction(right)}))",
+            frozenset().union(
+                *(term.coordinates for term in (*condition, *left, *right))
+            ),
+        ),
+    )
+
+
 def rewrite_ownership(
     term: OwnershipTerm,
     values: Mapping[CoordinateOrigin, str],

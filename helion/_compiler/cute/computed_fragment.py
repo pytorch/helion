@@ -47,6 +47,7 @@ from . import target_facts
 from .atomic_consumer_fusion import AtomicConsumerRegion
 from .atomic_consumer_fusion import atomic_consumer_regions
 from .direct_affine_plan import DIRECT_AFFINE_ORDINARY_SCHEDULE
+from .dtypes import masked_select_dtype
 from .fragment_atomics import FragmentAtomicEmitter
 from .fragment_context import Fragment
 from .fragment_context import HostTensor
@@ -55,6 +56,7 @@ from .fragment_context import _loop_carry_slots
 from .fragment_context import _resolve
 from .fragment_context import _static_selection_extent
 from .fragment_control_flow import FragmentControlFlow
+from .fragment_domain import selected_ownership
 from .fragment_dot import FragmentDotEmitter
 from .fragment_expression import FragmentExpression
 from .fragment_scan import FragmentScanEmitter
@@ -1095,19 +1097,28 @@ class FragmentCompiler(
                 dependencies=(source,),
                 logical_domain=source.logical_domain,
             )
-        if target is _tracing_ops._mask_to:
+        if target in (_tracing_ops._mask_to, _tracing_ops._mask_select):
             source_fake = cast("torch.Tensor", cast("Node", node.args[0]).meta["val"])
+            blocks = cast("tuple[int, ...]", args[2]) if len(args) == 3 else None
+            other = args[1]
+            fallback = other if isinstance(other, Fragment) else None
 
-            def masked(coords: tuple[str, ...]) -> str:
-                # A local allocation can have padded physical capacity while
-                # retaining its declared logical domain. Its initialized pad
-                # values are not necessarily neutral for this reduction.
+            def tile_masks(coords: tuple[str, ...]) -> list[OwnershipMask]:
+                # _mask_to fills every invalid lane, including a locally
+                # padded allocation. _mask_select tests only the named loop
+                # tiles: a lane can still hold a valid carry from an earlier
+                # iteration when the last iteration does not visit it.
                 masks: list[OwnershipMask] = (
-                    list(source.domain(coords)) if source.logical_domain else []
+                    list(source.domain(coords))
+                    if blocks is None and source.logical_domain
+                    else []
                 )
                 for coord, size in zip(coords, source_fake.shape, strict=True):
                     bid = self.env.resolve_block_id(size)
-                    if bid is None:
+                    if bid is None or (
+                        blocks is not None
+                        and self.env.canonical_block_id(bid) not in blocks
+                    ):
                         continue
                     if bid in self.offsets:
                         masks.append(self.tile_lane_predicate(bid)(coord))
@@ -1115,15 +1126,38 @@ class FragmentCompiler(
                         masks.append(
                             f"(({coord}) < ({self.sym(self.env.block_sizes[bid].numel)}))"
                         )
-                mask = self.predicate(masks)
-                return f"({self.cast(source.read(coords), fake.dtype)} if {mask} else {self.cast(self.scalar(args[1]), fake.dtype)})"
+                return masks
 
+            def masked(coords: tuple[str, ...]) -> str:
+                alt = (
+                    fallback.broadcast(coords)
+                    if fallback is not None
+                    else self.scalar(other)
+                )
+                dtype = fake.dtype
+                select_dtype = masked_select_dtype(dtype)
+                selected = f"({self.cast(source.read(coords), select_dtype)} if {self.predicate(tile_masks(coords))} else {self.cast(alt, select_dtype)})"
+                return selected if select_dtype == dtype else self.cast(selected, dtype)
+
+            domain = source.logical_domain
+            if fallback is not None and (domain or fallback.logical_domain):
+
+                def selected_domain(
+                    coords: tuple[str, ...],
+                ) -> tuple[OwnershipMask, ...]:
+                    return selected_ownership(
+                        tile_masks(coords),
+                        source.domain(coords),
+                        fallback.broadcast_domain(coords),
+                    )
+
+                domain = selected_domain
             return Fragment(
                 shape,
                 fake.dtype,
                 masked,
-                dependencies=(source,),
-                logical_domain=source.logical_domain,
+                dependencies=(source, fallback) if fallback is not None else (source,),
+                logical_domain=domain,
             )
         tensor_index = static_tensor_index(node)
         if target is view_ops.subscript or tensor_index is not None:
@@ -1697,6 +1731,7 @@ def computed_fragment_supported(
         _tracing_ops._phi,
         _tracing_ops._constant_tensor,
         _tracing_ops._mask_to,
+        _tracing_ops._mask_select,
         _tracing_ops._for_loop,
         _tracing_ops._for_loop_step,
         memory_ops.load,

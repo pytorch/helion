@@ -76,6 +76,11 @@ CUTLASS_INTEGER_TYPE_NAMES = frozenset(
 _CUTLASS_POINTER_DTYPES: dict[torch.dtype, object] | None = None
 
 
+def masked_select_dtype(dtype: torch.dtype) -> torch.dtype:
+    """CuTe cannot select between float8 scalars; FP32 represents each operand exactly."""
+    return torch.float32 if dtype.is_floating_point and dtype.itemsize == 1 else dtype
+
+
 def cutlass_pointer_dtype(dtype: torch.dtype) -> object:
     """The ``cutlass`` element type of a global-memory pointer to ``dtype``."""
     global _CUTLASS_POINTER_DTYPES
