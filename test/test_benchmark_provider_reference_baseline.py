@@ -269,12 +269,67 @@ def test_a_refused_reference_falls_back_to_a_sampled_config() -> None:
         helion.Config(block_sizes=[16], mode="simt"),
         helion.Config(block_sizes=[32], mode="simt", sampled=True),
     ]
-    provider._sampled_baseline_configs = lambda count: sampled  # pyrefly: ignore[bad-assignment]
+    provider._sampled_baseline_configs = lambda count, tried: sampled  # pyrefly: ignore[bad-assignment]
     output, _args = provider._compute_reference_baseline()
     assert [c.config["block_sizes"][0] for c in compiled] == [8, 4, 2, 1, 16, 32]
     assert torch.equal(output, torch.ones(4))
     assert warnings[-1].startswith("Using the sampled config")
     assert "is refused at compile time" in warnings[-1]
+
+
+def test_the_sampled_baseline_configs_try_the_compiler_seeds_first() -> None:
+    # A random point of a search space a backend mostly refuses seldom runs;
+    # the compiler's seeds go first, but for one that already failed, and
+    # random draws fill the rest of the ``count`` attempts.
+    spec = _Spec(
+        {"block_sizes": [8], "mode": "simt"}, {"block_sizes": [8], "mode": "simt"}
+    )
+    provider, _compiled, _warnings = _provider(spec, lambda config: True)
+    seeds = [helion.Config(block_sizes=[s], mode="simt") for s in (2, 4, 8)]
+    random = helion.Config(block_sizes=[64], mode="simt")
+
+    class _Generation:
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            pass
+
+        def seed_flat_config_pairs(self) -> list[tuple[object, helion.Config]]:
+            return [(None, seed) for seed in seeds]
+
+        def random_config(self) -> helion.Config:
+            return random
+
+    with patch("helion.autotuner.config_generation.ConfigGeneration", _Generation):
+        assert list(provider._sampled_baseline_configs(4, [seeds[1]])) == [
+            seeds[0],
+            seeds[2],
+            random,
+            random,
+        ]
+        assert list(provider._sampled_baseline_configs(2, ())) == seeds[:2]
+
+
+def test_a_failing_random_draw_keeps_the_seeds() -> None:
+    # A search space the backend mostly refuses can make ``random_config``
+    # give up (``InvalidConfig``): the seeds before it are still tried.
+    spec = _Spec(
+        {"block_sizes": [8], "mode": "simt"}, {"block_sizes": [8], "mode": "simt"}
+    )
+    provider, _compiled, warnings = _provider(spec, lambda config: True)
+    seeds = [helion.Config(block_sizes=[s], mode="simt") for s in (2, 4)]
+
+    class _Generation:
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            pass
+
+        def seed_flat_config_pairs(self) -> list[tuple[object, helion.Config]]:
+            return [(None, seed) for seed in seeds]
+
+        def random_config(self) -> helion.Config:
+            raise helion.exc.InvalidConfig("no valid config")
+
+    with patch("helion.autotuner.config_generation.ConfigGeneration", _Generation):
+        assert list(provider._sampled_baseline_configs(4, ())) == seeds
+    assert warnings[-1].startswith("No more sampled baseline configs")
 
 
 def test_a_refused_reference_without_a_running_sample_raises() -> None:
@@ -284,7 +339,7 @@ def test_a_refused_reference_without_a_running_sample_raises() -> None:
     provider, compiled, _warnings = _provider(
         spec, lambda config: True, compiles=lambda c: False
     )
-    provider._sampled_baseline_configs = lambda count: [  # pyrefly: ignore[bad-assignment]
+    provider._sampled_baseline_configs = lambda count, tried: [  # pyrefly: ignore[bad-assignment]
         helion.Config(block_sizes=[16], mode="simt")
     ]
     try:
@@ -309,7 +364,7 @@ def test_an_unrecoverable_error_from_a_sampled_config_stops_the_search() -> None
     provider, _compiled, _warnings = _provider(
         spec, runs, compiles=lambda c: c.config.get("sampled") is True
     )
-    provider._sampled_baseline_configs = lambda count: [  # pyrefly: ignore[bad-assignment]
+    provider._sampled_baseline_configs = lambda count, tried: [  # pyrefly: ignore[bad-assignment]
         helion.Config(block_sizes=[16], mode="simt", sampled=True)
     ]
     try:
