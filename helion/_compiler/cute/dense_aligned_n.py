@@ -17,8 +17,10 @@ from .pipeline_smem import deepest_fitting_ab_stages
 from .pipeline_smem import paired_pipeline_max_ab_stages
 from .pipeline_smem import pipeline_smem_bytes
 from .strategies import TCGEN05_LAYOUT_OVERRIDES_KEYS
+from .tcgen05_constants import TCGEN05_ALIGNED_N_MN_B_ROW_BYTES
 from .tcgen05_constants import TCGEN05_EPI_SUBTILE_N_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_EPI_WARP_GROUPS_CONFIG_KEY
+from .tcgen05_constants import TCGEN05_MN_B_64B_ATOM_STREAM_COST
 from .tcgen05_constants import TCGEN05_ODD_WIDTH_SUBTILE_N
 from .tcgen05_constants import TCGEN05_ONE_CTA_MAX_BLOCK_M
 from .tcgen05_constants import TCGEN05_PAIR_TILE_FIXED_KBLOCKS
@@ -106,6 +108,37 @@ def dense_aligned_n_sixteen_bit(input_dtype: torch.dtype) -> bool:
     return input_dtype in (torch.bfloat16, torch.float16)
 
 
+def dense_aligned_n_mn_b_atom_bytes(width: int, itemsize: int) -> int:
+    """The swizzle atom, in bytes, of the SMEM rows each CTA of the pair stages
+    an N-major B in at a ``width``-column tile: the largest of 128, 64 and 32
+    that divides the half row's bytes, as CuTe's ``make_smem_layout_b`` picks
+    it (16: none)."""
+    row_bytes = width // 2 * itemsize
+    return next((atom for atom in (128, 64, 32) if row_bytes % atom == 0), 16)
+
+
+def dense_aligned_n_mn_b_width(width: int, itemsize: int) -> bool:
+    """Whether the pair runs a ``width``-column tile over an N-major B (a
+    [K, N] row-major weight) at full speed: each CTA of the pair stages half
+    of the tile's columns as one SMEM row of B, which must hold whole 64-byte
+    swizzle atoms (``TCGEN05_ALIGNED_N_MN_B_ROW_BYTES``). The bf16 256x160
+    pair's B ring over an N-major B is
+
+        sB_layout = make_smem_layout_b(tiled_mma, (256, 160, 64), BFloat16, 8)
+        # each CTA: 80-column rows of 160 B -> 32-byte swizzle atoms
+
+    where 256 columns stage 256-byte rows (128-byte atoms) and 192 columns
+    192-byte rows (64-byte atoms). GB300, of cuBLAS in one process: bf16
+    2048x2560x2560 with B [K, N] row-major runs the 256x160 pair at 0.76
+    (CUTLASS's dense_gemm_persistent at the same tile 0.77) and 256x192 at
+    0.85; 8008x2560x4096 runs 160 columns at 0.74 and 256 at 1.09,
+    20008x768x2048 96 columns at 0.66 and 256 at 0.88."""
+    return (
+        dense_aligned_n_mn_b_atom_bytes(width, itemsize)
+        >= TCGEN05_ALIGNED_N_MN_B_ROW_BYTES
+    )
+
+
 # The 16-bit pair's short-K families run the deep 64-wide ring.
 DENSE_ALIGNED_N_SIXTEEN_BIT_BLOCK_K = 64
 
@@ -132,7 +165,14 @@ def dense_aligned_n_defaults(
 
 
 def pair_tile_wave_cost(
-    m: int, n: int, k: int, *, width: int, block_m: int, sm_pairs: int
+    m: int,
+    n: int,
+    k: int,
+    *,
+    width: int,
+    block_m: int,
+    sm_pairs: int,
+    stream_cost: float = 1.0,
 ) -> float:
     """Wave-quantized time of a 16-bit pair-tile grid over ``m`` x ``n``
     (arbitrary units: 256-column K-block MMAs). Each of the
@@ -142,7 +182,8 @@ def pair_tile_wave_cost(
     (``TCGEN05_PAIR_TILE_STREAM_RATIO`` x (block_m + width): a narrow tile
     reloads the A tile per N tile), plus a fixed prologue and epilogue
     (``TCGEN05_PAIR_TILE_FIXED_KBLOCKS`` 256-wide K blocks); ``sm_pairs`` tiles
-    run per wave."""
+    run per wave. ``stream_cost`` scales the K blocks' time (an operand
+    layout that slows them: ``TCGEN05_MN_B_64B_ATOM_STREAM_COST``)."""
     tiles = -(-m // block_m) * -(-n // width)
     k_blocks = -(-k // DENSE_ALIGNED_N_SIXTEEN_BIT_BLOCK_K)
     k_block = max(
@@ -150,7 +191,7 @@ def pair_tile_wave_cost(
         TCGEN05_PAIR_TILE_STREAM_RATIO * (block_m + width),
     )
     fixed = TCGEN05_PAIR_TILE_FIXED_KBLOCKS * TCGEN05_TWO_CTA_BLOCK_N
-    return -(-tiles // sm_pairs) * (k_blocks * k_block + fixed)
+    return -(-tiles // sm_pairs) * (k_blocks * k_block * stream_cost + fixed)
 
 
 def transposed_double_edge_without_pairs(m: int, n: int) -> bool:
@@ -176,8 +217,8 @@ def transposed_double_edge_without_pairs(m: int, n: int) -> bool:
 
 @dataclass(frozen=True)
 class PairTileOrientation:
-    """The pair-tile model's two orientations of a 16-bit GEMM with K-major
-    operands (``transposed_pair_tile_orientation``)."""
+    """The pair-tile model's two orientations of a 16-bit GEMM over a K-major
+    a (``transposed_pair_tile_orientation``)."""
 
     # as written / transposed ``pair_tile_wave_cost`` of each orientation's
     # best tiling; 1.0 where the model prices neither
@@ -213,21 +254,73 @@ class PairTileOrientation:
 
 
 def transposed_pair_tile_orientation(
-    m: int, n: int, k: int, *, sm_pairs: int
+    m: int, n: int, k: int, *, sm_pairs: int, b_n_major: bool = False
 ) -> PairTileOrientation:
-    """How the 16-bit pair runs an ``m`` x ``n`` x ``k`` GEMM as written and
-    as its transpose (``n`` x ``m`` x ``k``, out.T = b.T @ a.T): the ratio of
-    the two orientations' best ``pair_tile_wave_cost`` over the pair's
-    widths (the power-of-two ones and ``ALIGNED_N_CHOICES``; a width with a
-    partial last tile, or a partial last 256-row tile, needs whole K tiles),
-    and whether the dependent-launch warm-up runs on each best grid.
+    """How the 16-bit pair runs an ``m`` x ``n`` x ``k`` GEMM over a K-major
+    ``a`` as written and as its transpose (``n`` x ``m`` x ``k``, out.T =
+    b.T @ a.T): the ratio of the two orientations' best
+    ``pair_tile_wave_cost`` over the pair's widths (the power-of-two ones
+    and ``ALIGNED_N_CHOICES``; a width with a partial last tile, or a
+    partial last 256-row tile, needs whole K tiles), and whether the
+    dependent-launch warm-up runs on each best grid.
 
     The pair tiles its M side in 256-row steps and its N side in 16-column
     ones, so a tall output tiles finer transposed. bf16 16384x1024x4096 on
     76 SM pairs: 64 x 4 = 256 tiles of 256x256 (four waves) against 4 x 74
     = 296 tiles of 256x224 transposed (four waves of 7/8 the work): 1.13
     (measured: ``HelionChoices.transpose_matmul``).
+
+    Over an N-major ``b`` (``b_n_major``: b stored [K, N]) the as-written
+    pair runs only the widths whose half rows of B hold whole 64-byte
+    swizzle atoms (``dense_aligned_n_mn_b_width``: 64, 128, 192 and 256
+    columns of bf16), while the transposed product takes every width: its A
+    operand is b.T, whose 128-row CTA slabs stage 256-byte rows whatever the
+    width, and its B operand a.T, K-major. bf16 2048x2560x2560 with b stored
+    [K, N]:
+
+        for tile_y, tile_x in hl.tile([2048, 2560]):  # 8 x 14 = 112 tiles of
+            ...                                       # 256x192: two waves
+            tmp1 = in1[tile_r, tile_x]  # b: 96-column half rows per CTA
+        for tile_x, tile_y in hl.tile([2560, 2048]):  # transposed: 10 x 15 =
+            ...                                       # 150 tiles of 256x144
+            tmp0 = in0[tile_x, tile_r]  # b.T: 128-row slabs, 256-byte rows
+
+    two waves of 3/4 the work: 1.12. GB300, of cuBLAS in one process: 0.85
+    as written (256x192), 1.02 transposed (256x144). A half row of 64-byte
+    atoms (64 or 192 columns) also streams B slower than a K-major B
+    (``TCGEN05_MN_B_64B_ATOM_STREAM_COST``, measured at 192).
     """
+    if b_n_major and (
+        min(m, n) < TCGEN05_TWO_CTA_BLOCK_M
+        or -(-k // DENSE_ALIGNED_N_SIXTEEN_BIT_BLOCK_K) > TCGEN05_TWO_CTA_MAX_K_TILES
+        or -(-m // TCGEN05_TWO_CTA_BLOCK_M) * -(-n // TCGEN05_TWO_CTA_BLOCK_N)
+        < sm_pairs
+    ):
+        # The model prices 256-row pair tiles at the aligned widths in both
+        # orientations, which these products do not run: an m under 256 runs
+        # as written on the 128-row pair or one-CTA tiles
+        # (``tcgen05_transposes_skinny_product`` weighs a skinny m); an n
+        # under 256 leaves rows of every transposed tile empty; and a K loop
+        # past the pair's 256 K blocks of 64 is no aligned-N plan at that
+        # depth (``dense_aligned_n_plan``), where the search runs the 128-row
+        # pair either way; and a grid of 256x256 tiles under one per SM pair
+        # (the one-wave regime ``pair128_tilings`` below prices for a K-major
+        # b) runs one tile per CTA, which a short K loop leaves to the fixed
+        # prologue and epilogue, while the as-written search runs narrower
+        # pairs over two waves. GB300, bf16 with b stored [K, N], both
+        # orientations autotuned at full effort in one process, as written /
+        # transposed of stock Inductor: 128x16384x4096 (modeled 1.47) 1.162 /
+        # 1.153, 128x9216x4096 (1.18) 1.071 / 1.068; 25216x192x768 1.002 /
+        # 0.964, 25216x192x576 0.987 / 0.936; 16384x768x30528 (1.14) 0.925 /
+        # 0.872, 32768x512x30528 (1.14) 0.897 / 0.862, 8192x1024x29056 (1.14)
+        # 0.985 / 0.958, 32768x768x30528 0.937-0.970 / 0.899-0.915; at 256 K
+        # blocks 4096x4096x16384 (1.12) 0.998 / 1.102; 4096x1024x512 (1.09: 64
+        # tiles of 256x256; as written the search runs 128 of 256x128)
+        # 1.104-1.114 / 1.064-1.074. These guards cover an N-major b only:
+        # the K-major rule was measured on its own products (it transposes
+        # the column-major-b twin of 4096x1024x512: 1.112 as written,
+        # 1.056-1.064 transposed).
+        return PairTileOrientation(1.0)
     whole_k = k % DENSE_ALIGNED_N_SIXTEEN_BIT_BLOCK_K == 0
     if -(-k // DENSE_ALIGNED_N_SIXTEEN_BIT_BLOCK_K) <= TCGEN05_PAIR_TILE_FIXED_KBLOCKS:
         # A K loop no longer than the fixed prologue and epilogue charged
@@ -248,8 +341,14 @@ def transposed_pair_tile_orientation(
     widths = (64, 128, TCGEN05_TWO_CTA_BLOCK_N, *ALIGNED_N_CHOICES)
     pair128_m = TCGEN05_TWO_CTA_BLOCK_M // 2
 
+    def stream_cost(width: int, n_major_b: bool) -> float:
+        # (an N-major B half row of 64-byte atoms: 64 or 192 bf16 columns)
+        if n_major_b and dense_aligned_n_mn_b_atom_bytes(width, 2) == 64:
+            return TCGEN05_MN_B_64B_ATOM_STREAM_COST
+        return 1.0
+
     def pair128_tilings(
-        rows: int, cols: int, *, output_column_major: bool
+        rows: int, cols: int, *, output_column_major: bool, n_major_b: bool
     ) -> list[tuple[int, int]]:
         # The 128-row pairs (each CTA 64 rows) on a grid the 256-row pairs
         # leave short of one pair per SM pair and the 128-row tiles fill to
@@ -301,9 +400,12 @@ def transposed_pair_tile_orientation(
             (width, pair128_m)
             for width in pair_widths
             if sm_pairs // 2 <= -(-rows // pair128_m) * -(-cols // width) <= sm_pairs
+            and (not n_major_b or dense_aligned_n_mn_b_width(width, 2))
         ]
 
-    def best(rows: int, cols: int, *, output_column_major: bool) -> tuple[float, bool]:
+    def best(
+        rows: int, cols: int, *, output_column_major: bool, n_major_b: bool
+    ) -> tuple[float, bool]:
         """The orientation's least cost, and whether the warm-up runs on a
         256-row pair grid of that cost: the plain pair the search runs either
         way round, unlike the 128-row pairs priced above (bf16 320x1600x384
@@ -314,15 +416,27 @@ def transposed_pair_tile_orientation(
             *(
                 (width, TCGEN05_TWO_CTA_BLOCK_M)
                 for width in widths
-                if cols % width == 0 or whole_k
+                if (cols % width == 0 or whole_k)
+                and (not n_major_b or dense_aligned_n_mn_b_width(width, 2))
             ),
-            *pair128_tilings(rows, cols, output_column_major=output_column_major),
+            *pair128_tilings(
+                rows,
+                cols,
+                output_column_major=output_column_major,
+                n_major_b=n_major_b,
+            ),
         ]
         if not tilings:
             return math.inf, False
         costs = [
             pair_tile_wave_cost(
-                rows, cols, k, width=width, block_m=block_m, sm_pairs=sm_pairs
+                rows,
+                cols,
+                k,
+                width=width,
+                block_m=block_m,
+                sm_pairs=sm_pairs,
+                stream_cost=stream_cost(width, n_major_b),
             )
             for width, block_m in tilings
         ]
@@ -351,20 +465,31 @@ def transposed_pair_tile_orientation(
             if tiling_cost == cost and block_m == TCGEN05_TWO_CTA_BLOCK_M
         )
 
-    # (the transposed product stores out.T, a column-major output)
-    as_written, written_warms = best(m, n, output_column_major=False)
-    transposed, transposed_warms = best(n, m, output_column_major=True)
+    # (the transposed product stores out.T, a column-major output; its B
+    # operand is a.T, K-major)
+    as_written, written_warms = best(
+        m, n, output_column_major=False, n_major_b=b_n_major
+    )
+    transposed, transposed_warms = best(n, m, output_column_major=True, n_major_b=False)
     if math.inf in (as_written, transposed):
         # an orientation the pair cannot tile (a partial last 256-row tile
         # over a K tail) runs other tiles, which the model does not price
         return PairTileOrientation(1.0)
+    if b_n_major:
+        # Only K-major operands warm (``cute_mma._tcgen05_pdl_l2_warmup_kblocks``):
+        # as written b is an N-major B, and transposed b.T an M-major A.
+        written_warms = transposed_warms = False
     return PairTileOrientation(as_written / transposed, written_warms, transposed_warms)
 
 
-def transposed_pair_tile_gain(m: int, n: int, k: int, *, sm_pairs: int) -> float:
+def transposed_pair_tile_gain(
+    m: int, n: int, k: int, *, sm_pairs: int, b_n_major: bool = False
+) -> float:
     """How much faster the 16-bit pair runs an ``m`` x ``n`` x ``k`` GEMM as
     its transpose: ``transposed_pair_tile_orientation``'s gain."""
-    return transposed_pair_tile_orientation(m, n, k, sm_pairs=sm_pairs).gain
+    return transposed_pair_tile_orientation(
+        m, n, k, sm_pairs=sm_pairs, b_n_major=b_n_major
+    ).gain
 
 
 @dataclass(frozen=True)

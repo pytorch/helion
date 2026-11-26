@@ -409,6 +409,16 @@ def tcgen05_pdl_l2_warmup_kblocks(
 # An N-major B half row of the aligned-N pair must hold whole swizzle atoms
 # of at least this many bytes to be seeded.
 TCGEN05_ALIGNED_N_MN_B_ROW_BYTES = 64
+# The as-written 16-bit pair's K-block time over an N-major B whose half rows
+# hold 64-byte but not 128-byte swizzle atoms (64 or 192 bf16 columns: 32 or
+# 96 per CTA, 64- or 192-byte rows), relative to a K-major B, in the
+# orientation model (``dense_aligned_n.transposed_pair_tile_gain``). GB300,
+# bf16, the same as-written configs on B [K, N] row-major vs column-major,
+# alternating on one GPU, Helion us (RR / RC): 192 columns 2048x3072x768
+# 8.82 / 8.63, 4096x1536x1536 14.84 / 14.57, 8192x768x768 9.12 / 8.97
+# (+1.7..2.2%); 256 and 128 columns (128-byte atoms) within 0.8% either way
+# (64 columns, the same atom, was not measured).
+TCGEN05_MN_B_64B_ATOM_STREAM_COST = 1.02
 # Tall 16-bit aligned-N problems (at least this many 256-row pair rows) also
 # seed the grouped persistent raster at these L2 groupings.
 TCGEN05_ALIGNED_N_TALL_PAIR_ROWS = 64
@@ -1496,6 +1506,7 @@ TCGEN05_LARGE_BN_PROOF_STAGE_CONFIGS = (
 
 # CtaGroup.ONE tcgen05 MMA covers 64/128 M tiles; 256 M tiles are validated only
 # after projecting onto the CtaGroup.TWO path.
+TCGEN05_ONE_CTA_MIN_BLOCK_M = 64
 TCGEN05_ONE_CTA_MAX_BLOCK_M = 128
 
 
