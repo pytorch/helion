@@ -3,6 +3,7 @@ consults before its own (one returning None falls back to them)."""
 
 from __future__ import annotations
 
+from .mm import register_bmm
 from .mm import register_mm
 
-__all__ = ["register_mm"]
+__all__ = ["register_bmm", "register_mm"]

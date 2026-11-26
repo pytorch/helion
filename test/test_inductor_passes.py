@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import contextlib
 import functools
 import pathlib
 from types import SimpleNamespace
+from typing import TYPE_CHECKING
 import unittest
 from unittest.mock import patch
 
@@ -15,16 +17,23 @@ from torch._inductor import ir
 from torch._inductor.custom_graph_pass import CustomGraphModulePass
 from torch._inductor.decomposition import select_decomp_table
 from torch._inductor.graph import GraphLowering
+from torch._inductor.lowering import lowerings
+from torch._inductor.lowering import make_pointwise
+from torch._inductor.utils import fresh_cache
 from torch._inductor.virtualized import V
+from torch._inductor.virtualized import ops as inductor_ops
 from torch.fx.experimental.proxy_tensor import make_fx
 from torch.fx.experimental.symbolic_shapes import DimDynamic
+import torch.nn.functional as F
 from torch.utils import _pytree as pytree
 
 from helion._compat import requires_torch_version
 from helion._compiler import backend_registry
 from helion._compiler.cute import inductor_plan
 from helion._compiler.cute.backend import CuteBackend
+from helion._compiler.inductor_matmul import MatmulFacts
 from helion._testing import TestCase
+from helion._testing import skipIfPallasTpu
 
 if not requires_torch_version("2.16"):
     pytest.skip("helion.inductor needs torch 2.16", allow_module_level=True)
@@ -36,7 +45,14 @@ from helion.inductor.fx_passes import post_grad
 from helion.inductor.fx_passes.cat_reductions import pointwise
 from helion.inductor.fx_passes.cat_reductions import split_cat_reductions
 from helion.inductor.fx_passes.post_grad import HelionPostGradPass
+from helion.inductor.lowering.mm import _computed_in_kernel
+from helion.inductor.lowering.mm import _read_past
+from helion.inductor.lowering.mm import _slices_keep
+from helion.inductor.lowering.mm import _zero_pad_source
 from helion.inductor.support import split_k_reduction
+
+if TYPE_CHECKING:
+    from collections.abc import Iterator
 
 pytestmark = pytest.mark.cpu_only
 
@@ -89,9 +105,11 @@ class TestSourceHash(TestCase):
         rule_modules = {module.__name__ for module in inductor_plan.RULE_MODULES}
         expected = {
             "helion._compiler.cute.cp_async_operand",
+            "helion._compiler.cute.cute_mma_dag",
             "helion._compiler.cute.cute_warp_mma_gemm",
             "helion._compiler.cute.dense_aligned_n",
             "helion._compiler.cute.inductor_plan",
+            "helion._compiler.cute.stage_aligned_operands",
             "helion._compiler.cute.tcgen05.search_plan",
             "helion._compiler.cute.tcgen05_constants",
         }
@@ -628,6 +646,364 @@ class TestTransposeMatmul(TestCase):
         for offset, transposes in ((64, True), (8, False)):
             graph.constants["c"] = storage[offset:][: 1024 * 3072].view(1024, 3072)
             self.assertEqual(self.transposes(graph, c), transposes, offset)
+
+
+def native_mm(mat1: ir.TensorBox, mat2: ir.TensorBox) -> ir.TensorBox:
+    """aten.mm lowered on the CPU as Inductor's native matmul lowers it for
+    the dot of a GPU kernel (kernel/mm.py's tuned_mm): each operand read
+    where it is computed, not stored first as Inductor's CPU mm stores it, and
+    rounded to its dtype, ops.to_dtype(x, dtype, use_compute_types=False); a
+    sum over K of their products in place of the dot. (Back to the compute
+    type after the rounding, which the CPU backend drops where a product
+    rather than a cast reads it.)"""
+
+    def rounded(x: ir.TensorBox) -> ir.TensorBox:
+        dtype = x.get_dtype()
+        return make_pointwise(
+            lambda value: inductor_ops.to_dtype(
+                inductor_ops.to_dtype(value, dtype, use_compute_types=False), dtype
+            )
+        )(x)
+
+    products = lowerings[aten.mul](
+        lowerings[aten.unsqueeze](rounded(mat1), -1),
+        lowerings[aten.unsqueeze](rounded(mat2), 0),
+    )
+    return lowerings[aten.sum](products, [1])
+
+
+# The TPU job's compiles make no pad decisions, with HelionChoices installed or not
+skip_on_tpu = skipIfPallasTpu("Helion's mm lowering makes no pad decisions (#4746)")
+
+
+class TestZeroPadLowering(TestCase):
+    @skip_on_tpu
+    def test_dynamic_pad(self):
+        # A stock compile of an mm over a zero pad reads none of the pad's FX nodes
+        # (HelionChoices.may_rewrite()); where the plan may use it, a pad of a dynamic N
+        # or M is no pad (_zero_pad_source() None), not a failed compile.
+        sources = []
+
+        def read(mat, operand):
+            sources.append(_zero_pad_source(mat, operand))
+            return sources[-1]
+
+        for tcgen05, fn, a_size, b_size in (
+            (False, lambda a, b: a @ F.pad(b, (0, 7)), (8, 16), (16, 9)),
+            (True, lambda a, b: a @ F.pad(b, (0, 7)), (8, 16), (16, 9)),
+            (True, lambda a, b: F.pad(a, (0, 0, 0, 7)) @ b, (9, 16), (16, 8)),
+        ):
+            sources.clear()
+            a, b = torch.randn(a_size), torch.randn(b_size)
+            torch._dynamo.reset()
+            with (
+                fresh_cache(),
+                # (HelionChoices itself: where another plugin registers its own
+                # choices, V.choices composes them and hides HelionChoices')
+                V.set_choices_handler(HelionChoices()),
+                patch.object(HelionChoices, "may_rewrite", return_value=True)
+                if tcgen05
+                else contextlib.nullcontext(),
+                patch("helion.inductor.lowering.mm._zero_pad_source", read),
+            ):
+                result = torch.compile(fn, dynamic=True)(a, b)
+            torch.testing.assert_close(result, fn(a, b))
+            self.assertEqual(sources, [None, None] if tcgen05 else [])
+
+    def test_read_past_slice(self):
+        # Which readers of a slice of the padded product can read past it, into the pad
+        # (_read_past()): the caller of a returned slice or view of it, an as_strided
+        # (also through split's or unsafe_split's views) and a custom op; not ops that
+        # write a new tensor.
+        def product(a, b):
+            return aten.slice.Tensor(torch.mm(a, F.pad(b, (0, 7))), 1, 0, 1001)
+
+        def unsafe_split(x):
+            return aten.unsafe_split(x, 500, 1)[0]
+
+        a, b = torch.randn(64, 128), torch.randn(128, 1001)
+        strided = ((64, 1008), (1008, 1))
+        for fn, read_past in (
+            (lambda a, b: product(a, b).relu(), False),
+            (lambda a, b: product(a, b).t().unsqueeze(0).relu(), False),
+            (lambda a, b: product(a, b).add_(1).relu(), False),
+            (product, True),
+            (lambda a, b: product(a, b).t().unsqueeze(0), True),
+            (lambda a, b: product(a, b).add_(1), True),
+            (lambda a, b: product(a, b).as_strided(*strided).relu(), True),
+            (
+                lambda a, b: product(a, b).t().as_strided((1008, 64), (1, 1008)).relu(),
+                True,
+            ),
+            (
+                lambda a, b: product(a, b).split(500, 1)[0].as_strided(*strided).relu(),
+                True,
+            ),
+            (lambda a, b: unsafe_split(product(a, b)).relu(), False),
+            (
+                lambda a, b: unsafe_split(product(a, b)).as_strided(*strided).relu(),
+                True,
+            ),
+            (lambda a, b: strided_copy(product(a, b), [64, 1008], [1008, 1]), True),
+        ):
+            gm = make_fx(fn, tracing_mode="fake")(a, b)
+            (node,) = gm.graph.find_nodes(op="call_function", target=aten.slice.Tensor)
+            self.assertTrue(_slices_keep(node, 1, 1001, 1008))
+            self.assertEqual(_read_past(node), read_past)
+
+    @contextlib.contextmanager
+    def tcgen05_path(
+        self, *, native: bool = False
+    ) -> Iterator[list[tuple[bool, bool]]]:
+        # Compiles on the CPU as on the tcgen05 path, for operands whose rows TMA loads
+        # and a product kept as written; with native, through a stand-in of the GPU's
+        # native matmul (native_mm()). Yields (exact, answer) of each
+        # pad_matmul_output() call.
+        decisions = []
+        decide = HelionChoices.pad_matmul_output
+
+        def spy(choices, *args, exact):
+            decisions.append((exact, decide(choices, *args, exact=exact)))
+            return decisions[-1][1]
+
+        torch._dynamo.reset()
+        with (
+            fresh_cache(),
+            V.set_choices_handler(HelionChoices()),  # as in test_dynamic_pad
+            helion_config.patch(backend="cute"),
+            patch.object(HelionChoices, "may_rewrite", return_value=True),
+            patch.object(HelionChoices, "_rewritable", return_value=True),
+            patch.object(HelionChoices, "transpose_matmul", return_value=False),
+            patch.object(HelionChoices, "copy_matmul_b", return_value=False),
+            patch.object(HelionChoices, "pad_matmul_output", spy),
+            patch.dict(lowerings, {aten.mm: native_mm})
+            if native
+            else contextlib.nullcontext(),
+        ):
+            yield decisions
+
+    def assert_pad(self, pad, expected):
+        # The pad as eager holds it: NaN where eager's is, +0 (not -0) elsewhere
+        torch.testing.assert_close(pad, expected, equal_nan=True, rtol=0, atol=0)
+        self.assertFalse(torch.signbit(pad.nan_to_num(1.0)).any())
+
+    @skip_on_tpu
+    def test_returned_slice(self):
+        # The caller of a returned slice can view past it, into pad columns that hold
+        # eager's sum(|a| * 0, 1) (_pad_of_product()), whether AOTAutograd returns the
+        # slice or an _unsafe_view of it; an M pad's rows hold sum(|b| * 0, 0).
+        def n_pad(a, b):
+            return torch.mm(a, F.pad(b, (0, 7)))[:, :1001]
+
+        def m_pad(a, b):
+            return torch.mm(F.pad(a, (0, 0, 0, 7)), b)[:1001]
+
+        past = ((64, 7), (1008, 1), 1001)
+        for requires_grad in (False, True):
+            a = torch.randn(64, 128)
+            a[3, 5] = float("inf")
+            a[5] = -a[5].abs() - 1
+            a.requires_grad_(requires_grad)
+            # K-major, as pad_matmul_output() takes the pad's source
+            b = torch.randn(1001, 128, requires_grad=requires_grad).t()
+            with self.tcgen05_path() as decisions:
+                result = torch.compile(n_pad)(a, b).detach()
+            expected = n_pad(a, b).detach()
+            self.assertEqual(decisions, [(True, True)])
+            torch.testing.assert_close(result, expected, equal_nan=True)
+            self.assert_pad(result.as_strided(*past), expected.as_strided(*past))
+            self.assertTrue(result.as_strided(*past)[3].isnan().all())
+
+        a, b = torch.randn(1001, 128), torch.randn(128, 64)
+        b[5, 3] = float("-inf")
+        with self.tcgen05_path() as decisions:
+            result = torch.compile(m_pad)(a, b)
+        expected = m_pad(a, b)
+        self.assertEqual(decisions, [(True, True)])
+        torch.testing.assert_close(result, expected, equal_nan=True)
+        past = ((7, 64), (64, 1), 1001 * 64)
+        self.assert_pad(result.as_strided(*past), expected.as_strided(*past))
+
+    @skip_on_tpu
+    def test_computed_operand(self):
+        # An operand computed in the kernel, a prologue x * 2, is rounded to its dtype
+        # in the exact pad's reduction as in the dot: an fp16 x * 2 that overflows to
+        # inf gives eager's NaN in its pad row.
+        def fn(x, b):
+            return torch.mm(x * 2, F.pad(b, (0, 7)))[:, :1001]
+
+        x = torch.ones(64, 128, dtype=torch.float16)
+        x[3, 5] = 40000
+        b = torch.ones(1001, 128, dtype=torch.float16).t()
+        with self.tcgen05_path(native=True) as decisions:
+            result = torch.compile(fn)(x, b)
+        expected = fn(x, b)
+        self.assertEqual(decisions, [(True, True)])
+        torch.testing.assert_close(result, expected, equal_nan=True)
+        past = ((64, 7), (1008, 1), 1001)
+        self.assert_pad(result.as_strided(*past), expected.as_strided(*past))
+        self.assertTrue(result.as_strided(*past)[3].isnan().all())
+
+    def test_computed_in_kernel(self):
+        # The operands the exact pad's reduction rounds (_computed_in_kernel()): x * 2
+        # inlined or stored by a kernel the reduction may fuse with; not a graph input
+        # or a view of one.
+        graph = GraphLowering(torch.fx.symbolic_trace(lambda x: x + 1))
+        layout = ir.FixedLayout(torch.device("cpu"), torch.float16, [64, 128], [128, 1])
+        with V.set_graph_handler(graph):
+            x = ir.TensorBox.create(ir.InputBuffer(name="x", layout=layout))
+            stored = lowerings[aten.mul](x, 2)
+            stored.realize()
+            for node, computed in (
+                (x, False),
+                (lowerings[aten.permute](x, [1, 0]), False),
+                (lowerings[aten.mul](x, 2), True),
+                (lowerings[aten.permute](lowerings[aten.mul](x, 2), [1, 0]), True),
+                (stored, True),
+            ):
+                self.assertEqual(_computed_in_kernel(node), computed)
+
+    @skip_on_tpu
+    def test_op_reads_past_slice(self):
+        # A custom op may read past the slice it is handed, into the pad (_read_past()).
+        def fn(a, b):
+            product = torch.mm(a, F.pad(b, (0, 7)))[:, :1001]
+            return strided_copy(product, [64, 1008], [1008, 1])
+
+        a, b = torch.randn(64, 128), torch.randn(1001, 128).t()
+        a[3, 5] = float("inf")
+        with self.tcgen05_path() as decisions:
+            result = torch.compile(fn)(a, b)
+        expected = fn(a, b)
+        self.assertEqual(decisions, [(True, True)])
+        torch.testing.assert_close(result[:, :1001], expected[:, :1001], equal_nan=True)
+        self.assert_pad(result[:, 1001:], expected[:, 1001:])
+        self.assertTrue(result[3, 1001:].isnan().all())
+
+    @skip_on_tpu
+    def test_as_strided_reads_eager_layout(self):
+        # An as_strided reads the slice by eager's layout of the padded product, whose
+        # rows comprehensive padding (forced here on the CPU) would widen.
+        def fn(a, b):
+            product = torch.mm(a, F.pad(b, (0, 9)))[:, :1031]
+            return product.as_strided((64, 1040), (1040, 1)) * 2
+
+        a, b = torch.randn(64, 128), torch.randn(1031, 128).t()
+        a[3, 5] = float("inf")
+        with (
+            config.patch(comprehensive_padding=True, disable_padding_cpu=False),
+            self.tcgen05_path() as decisions,
+        ):
+            result = torch.compile(fn)(a, b)
+        self.assertEqual(decisions, [(True, True)])
+        # (a CPU BLAS may round the unpadded product differently)
+        torch.testing.assert_close(
+            result, fn(a, b), equal_nan=True, rtol=1e-4, atol=1e-4
+        )
+
+    @skip_on_tpu
+    def test_slice_read_inside(self):
+        # Where every reader reads within the slice, the pad holds zeros: no reduction
+        # over a.
+        def fn(a, b):
+            return torch.mm(a, F.pad(b, (0, 7)))[:, :1001].relu()
+
+        a, b = torch.randn(64, 128), torch.randn(1001, 128).t()
+        a[3, 5] = float("inf")
+        with self.tcgen05_path() as decisions:
+            result = torch.compile(fn)(a, b)
+        self.assertEqual(decisions, [(False, True)])
+        torch.testing.assert_close(result, fn(a, b), equal_nan=True)
+
+    @skip_on_tpu
+    def test_source_written_before_the_product(self):
+        # A write into the pad's source between the pad and the product: left in
+        # the input's copy_ epilogue, the dot reads the source as the pad did;
+        # made in place before the product (reinplace_inplaceable_ops), into the
+        # source or through an int32 view aliasing it, the rule declines.
+        def fn(a, b, idx, v):
+            padded = F.pad(a, (0, 0, 0, 7))
+            a.index_put_((idx,), v)
+            return torch.mm(padded, b)[:1001]
+
+        def read_first(a, b, idx, v):
+            padded = F.pad(a, (0, 0, 0, 7))
+            edge = padded[:2] * 2
+            a.index_put_((idx,), v)
+            return torch.mm(padded, b)[:1001], edge
+
+        def through_view(a, b, idx, v):
+            padded = F.pad(a, (0, 0, 0, 7))
+            a.view(torch.int32).index_put_((idx,), v)
+            return torch.mm(padded, b)[:1001]
+
+        idx = torch.tensor([0, 3])
+        g = torch.Generator().manual_seed(0)
+        floats = (
+            torch.randn(1001, 128, generator=g),
+            torch.randn(128, 64, generator=g),
+            idx,
+            torch.randn(2, 128, generator=g),
+        )
+        ones = (  # writes pairs of bf16 1.0 into rows of zeros
+            torch.zeros(1001, 128, dtype=torch.bfloat16),
+            torch.ones(128, 64, dtype=torch.bfloat16),
+            idx,
+            torch.full((2, 64), 0x3F803F80, dtype=torch.int32),
+        )
+        no_reorder = {"reorder_for_locality": False}
+        for f, (a, *rest), patches, expected in (
+            (fn, floats, {}, [(True, True)]),
+            (fn, floats, no_reorder, []),
+            (read_first, floats, {}, []),
+            (through_view, ones, no_reorder, []),
+        ):
+            with config.patch(patches), self.tcgen05_path() as decisions:
+                result = torch.compile(f)(a.clone(), *rest)
+            self.assertEqual(decisions, expected)
+            torch.testing.assert_close(result, f(a.clone(), *rest))
+
+    @skip_on_tpu
+    def test_exact_pad_cost(self):
+        # The exact pad's reduction reads a once, the pad kernel it saves copies b: with
+        # a larger than b the rule declines, and the pad kernel's padded b gives eager's
+        # pad columns.
+        def fn(a, b):
+            return torch.mm(a, F.pad(b, (0, 7)))[:, :9]
+
+        a, b = torch.randn(256, 64), torch.randn(9, 64).t()
+        a[3, 5] = float("inf")
+        with self.tcgen05_path() as decisions:
+            result = torch.compile(fn)(a, b)
+        expected = fn(a, b)
+        self.assertEqual(decisions, [(True, False)])
+        torch.testing.assert_close(result, expected, equal_nan=True)
+        past = ((256, 7), (16, 1), 9)
+        self.assert_pad(result.as_strided(*past), expected.as_strided(*past))
+
+
+class TestMatmulPlan(TestCase):
+    def test_broadcast_operand_is_not_staged(self):
+        # A K-major operand expanded along N (a 0 stride) is read as it is, as
+        # the CuTe host staging leaves it: an aligned copy would write every
+        # repeat.
+        facts = {
+            "dtype": torch.bfloat16,
+            "out_dtype": torch.bfloat16,
+            "tf32": False,
+            "major": 10,
+            "sm_count": 152,
+            "m": 4096,
+            "n": 131072,
+            "k": 4096,
+            "a_strides": (4096, 1),
+            "a_offset": 0,
+            "b_offset": 1,
+        }
+        expanded = inductor_plan.matmul_plan(MatmulFacts(**facts, b_strides=(1, 0)))
+        strided = inductor_plan.matmul_plan(MatmulFacts(**facts, b_strides=(1, 4097)))
+        self.assertIsNone(expanded.stage[1])
+        self.assertIsNotNone(strided.stage[1])
 
 
 if __name__ == "__main__":
