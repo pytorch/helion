@@ -685,15 +685,46 @@ class FragmentContext:
         return resolved
 
     def record_tile_interval(self, bid: int, begin: object, end: object) -> None:
-        if (
-            not self.vector_io
-            or not isinstance(begin, (int, torch.SymInt, sympy.Expr))
-            or not isinstance(end, (int, torch.SymInt, sympy.Expr))
+        if not isinstance(begin, (int, torch.SymInt, sympy.Expr)) or not isinstance(
+            end, (int, torch.SymInt, sympy.Expr)
         ):
             return
         start, stop = self.static_extent(begin), self.static_extent(end)
         if start is not None and stop is not None:
             self.tile_intervals[self.offsets[bid]] = (start, stop)
+
+    def _native_tile_bounds(self, block: int) -> bool:
+        """All tile offsets, padded lanes, and remaining distances fit Int32."""
+        interval = self.tile_intervals.get(self.offsets[block])
+        width = self.df.resolved_block_size(block)
+        if interval is None or not isinstance(width, int):
+            return False
+        lo, hi = interval
+        return -(2**31) <= lo <= hi <= 2**31 - width and hi - lo < 2**31
+
+    def tile_lane_predicate(self, block: int) -> Callable[[str], str]:
+        """Capture the lexical tile: inner loops may reuse its registered block ID."""
+        offset, end = self.offsets[block], self.bounds[block]
+        if self._native_tile_bounds(block):
+            return lambda coord: f"(({offset}) + ({coord}) < ({end}))"
+        # A padded lane may overflow even Int64 near the signed limit.
+        wide = f"cutlass.Int64({offset})"
+
+        def predicate(coord: str) -> str:
+            lane = f"cutlass.Int64({coord})"
+            return f"(({wide}) <= {2**63 - 1} - ({lane}) and ({wide}) + ({lane}) < ({end}))"
+
+        return predicate
+
+    def tile_live_extent(self, block: int, capacity: int) -> str:
+        offset, end = self.offsets[block], self.bounds[block]
+        if self._native_tile_bounds(block):
+            return f"min({capacity}, ({end}) - ({offset}))"
+        # Clamp the end to [offset, saturating_add(offset, capacity)]
+        # before subtraction: a signed interval can span more than INT64_MAX.
+        lo, hi = f"cutlass.Int64({offset})", f"cutlass.Int64({end})"
+        limit = f"(min({lo}, {2**63 - 1 - capacity}) + {capacity})"
+        return f"(max({lo}, min({hi}, {limit})) - {lo})"
 
     def static_extent(self, value: object) -> int | None:
         if isinstance(value, int):
@@ -708,7 +739,7 @@ class FragmentContext:
     def shape(self, shape: object) -> tuple[int, ...]:
         return tuple(self.extent(x) for x in cast("tuple[object, ...]", shape))
 
-    def sym(self, value: object) -> str:
+    def sym(self, value: object, *, wide: bool = False) -> str:
         if isinstance(value, str):
             return value
         if isinstance(value, (torch.SymInt, torch.SymFloat, torch.SymBool)):
@@ -718,21 +749,31 @@ class FragmentContext:
 
             def symbol_expression(symbol: sympy.Symbol) -> str:
                 if symbol in self.sym_indices:
-                    return self.sym_indices[symbol]
+                    scalar = self.sym_indices[symbol]
+                    return f"cutlass.Int64({scalar})" if wide else scalar
                 origin_info = HostFunction.current().expr_to_origin.get(symbol)
                 origin = origin_info.origin if origin_info is not None else None
                 if isinstance(origin, GridOrigin) and origin.block_id in self.offsets:
                     offset = self.offsets[origin.block_id]
+                    # A small loop may have an Int32 counter, but its value in
+                    # user arithmetic must widen before evaluating the expression.
+                    if wide:
+                        offset = f"cutlass.Int64({offset})"
                     size = self.df.resolved_block_size(origin.block_id)
                     if isinstance(origin, TileIdOrigin):
                         return f"({offset}) // {size}"
                     if isinstance(origin, TileEndOrigin):
-                        return (
-                            f"min(({offset}) + {size}, {self.bounds[origin.block_id]})"
+                        if self._native_tile_bounds(origin.block_id):
+                            return f"min(({offset}) + {size}, {self.bounds[origin.block_id]})"
+                        extent = self.tile_live_extent(
+                            origin.block_id,
+                            self.extent(self.env.block_sizes[origin.block_id].var),
                         )
+                        return f"(cutlass.Int64({offset}) + ({extent}))"
                     if type(origin) in (GridOrigin, TileBeginOrigin):
                         return offset
-                return self.df.literal_expr(symbol)
+                scalar = self.df.literal_expr(symbol)
+                return f"cutlass.Int64({scalar})" if wide else scalar
 
             substitutions = {
                 symbol: sympy.Symbol(f"({symbol_expression(symbol)})")
@@ -741,11 +782,11 @@ class FragmentContext:
             return self.env.backend.sympy_printer_expr(value.xreplace(substitutions))
         return self.df.literal_expr(value)
 
-    def scalar(self, value: object) -> str:
+    def scalar(self, value: object, *, wide: bool = False) -> str:
         if isinstance(value, Fragment):
             assert math.prod(value.shape) == 1
             return value.read(tuple("0" for _ in value.shape))
-        return self.sym(value)
+        return self.sym(value, wide=wide)
 
     def host_stride(self, tensor: HostTensor, dim: int) -> str:
         # Fresh wrapper allocations have configured symbolic strides, which
@@ -1277,7 +1318,7 @@ class FragmentContext:
         extent = str(capacity)
         if bid is not None:
             if bid in self.offsets:
-                extent = f"min({extent}, ({self.bounds[bid]}) - ({self.offsets[bid]}))"
+                extent = self.tile_live_extent(bid, capacity)
             elif self.env.block_sizes[bid].reduction:
                 extent = f"min({extent}, {self.sym(self.env.block_sizes[bid].numel)})"
         return extent

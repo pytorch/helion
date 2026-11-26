@@ -542,3 +542,50 @@ these labelled lines.
   transcendental; judging it takes timings of its own.
 - Pinned by: `test/test_autotuner_heuristics.py::TestPointwiseGatheredSlab::test_rolled_copy_of_an_op_reads_its_index_in_the_enclosing_graph`
   (`slab_numel == 576`).
+
+## ref-eager-singleton-tile-load
+
+- Area: Eager indexing and Triton and CuTe loads of a statically known
+  size-one axis, including CuTe computed fragments.
+- What is wrong: With `x = torch.ones(1)` and `hl.tile(4, block_size=4)`,
+  the compiled bare-tile load broadcasts across all four live lanes and
+  sums to 4. Eager mode slices the tensor and sums to 1. An explicit
+  all-true lane mask gives the same discrepancy. With an explicit coordinate
+  tensor such as `hl.arange(4)`, Triton and ordinary CuTe can still broadcast
+  a singleton, whereas computed fragments and masked eager loads check
+  physical bounds. Computed-fragment tile stores also check physical bounds.
+- Since: Triton and eager already differed on main at `362b7b182`.
+  Ordinary CuTe already broadcast these loads. Computed CuTe fragments
+  now use the same rule when the input extent is provably one.
+- Why deferred: Matching the documented compiled load requires changing
+  eager tile slicing and explicit-mask evaluation together. It would
+  change the ref-mode results of existing programs; the user asked to
+  keep the documented compiled rule and track the eager change separately.
+- Pinned by: `test_singleton_tile_broadcast_feeds_fragment_sum_and_scan`
+  and `test_masked_singleton_tile_applies_each_lane_mask` in
+  `test/test_cute_fragment_value_codegen.py` check the compiled rule.
+  No test requires the eager discrepancy.
+
+## cute-fragment-captures-across-reused-tile-blocks
+
+- Area: CuTe computed fragments in nested loops using the same
+  `hl.register_block_size`.
+- What is wrong: In a four-lane outer tile, save `ids = outer.index` and
+  `saved_end = outer.end`. In a nested two-lane tile with the same block
+  ID and origin zero, compute `v = ids + inner.begin`, then
+  `out[:] = torch.cumsum(v, dim=0)`, `metrics[0] = v.sum()` and
+  `metrics[1] = saved_end`. CPU replay of the generated CuTe kernel
+  writes `[0, 1, 0, 0]`, 1, and 2 instead of `[0, 1, 3, 6]`, 6, and 4.
+  The fixed contiguous destinations require neither a singleton load nor
+  an indirect store.
+- Since: Present on main at both the stack base `a2f18c2d0` and the
+  current main `29c1bc1f2`: CPU replay returns the same wrong values
+  there, on the parent `ddfc9ec52`, and on the corrected fragment load.
+- Why deferred: Reductions and scans resolve symbolic shape axes against
+  the active block, and scalar bounds can outlive the loop where they
+  were defined. Preserving distinct bindings through symbolic scalar
+  expressions, fragment transformations and nested graph placeholders
+  requires a change to loop provenance beyond fragment-load indexing.
+  A workaround is to use distinct block IDs or to consume the captured
+  value before entering the inner loop.
+- Pinned by: none.

@@ -47,6 +47,12 @@ for tile in hl.tile(0, 1000, block_size=64):
     pass
 ```
 
+When a tile indexes a dimension known to have size one, Triton and CuTe
+broadcast the input value across the live lanes. An explicit lane mask still
+applies to each lane: with four live lanes, an all-true mask and input
+`torch.ones(1)`, the sum is four. Eager reference mode slices the input and can
+instead produce one. This rule describes loads.
+
 **Grid vs Loop Behavior**:
 - When used at the top level of a kernel function, `tile()` becomes the grid of the kernel (parallel blocks)
 - When used nested inside another loop, it becomes a sequential loop within each block
@@ -101,6 +107,9 @@ lets Helion apply the masking implicitly for indices beyond each lane's true len
 ```{eval-rst}
 .. autofunction:: store
 ```
+
+A negative integer literal counts from the end of its dimension; for
+example, `out[-1, :] = row` writes the last row.
 
 ### prefetch()
 

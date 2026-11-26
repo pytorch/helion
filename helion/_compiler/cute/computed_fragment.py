@@ -936,16 +936,14 @@ class FragmentCompiler(
             block_id = self.env.resolve_block_id(args[0])
             assert block_id in self.offsets
             offset = self.offsets[block_id]
-            bound = self.bounds[block_id]
+            lane_mask = self.tile_lane_predicate(block_id)
             return Fragment(
                 self.shape(fake.shape),
                 fake.dtype,
                 lambda coords: self.convert(
                     f"({offset}) + ({coords[0]})", self.env.index_dtype, fake.dtype
                 ),
-                logical_domain=lambda coords: (
-                    f"({offset}) + ({coords[0]}) < ({bound})",
-                ),
+                logical_domain=lambda coords: (lane_mask(coords[0]),),
                 pure=True,
             )
         if target in (torch.ops.aten.fmin.default, torch.ops.aten.fmax.default):
@@ -1034,13 +1032,27 @@ class FragmentCompiler(
         if target is torch.ops.prims.iota.default:
             start = _resolve(node.kwargs.get("start", 0), values)
             step = _resolve(node.kwargs.get("step", 1), values)
+            # Widen the coordinate before multiplication if either the product
+            # or sum could wrap. Common small iotas keep narrow arithmetic.
+            wide = fake.dtype == torch.int64
+            if wide and isinstance(start, int) and isinstance(step, int):
+                last_delta = max(shape[0] - 1, 0) * step
+                wide = not all(
+                    -(1 << 31) <= v < (1 << 31)
+                    for v in (start, step, last_delta, start + last_delta)
+                )
+
+            def iota(coords: tuple[str, ...]) -> str:
+                coord = self.cast(coords[0], torch.int64) if wide else coords[0]
+                return self.cast(
+                    f"({self.scalar(start, wide=wide)}) + ({coord}) * ({self.scalar(step, wide=wide)})",
+                    fake.dtype,
+                )
+
             return Fragment(
                 shape,
                 fake.dtype,
-                lambda coords: self.cast(
-                    f"{self.scalar(start)} + ({coords[0]}) * {self.scalar(step)}",
-                    fake.dtype,
-                ),
+                iota,
                 pure=True,
                 affine=(start, step)
                 if len(shape) == 1
@@ -1082,9 +1094,7 @@ class FragmentCompiler(
                     if bid is None:
                         continue
                     if bid in self.offsets:
-                        masks.append(
-                            f"(({self.offsets[bid]}) + ({coord}) < ({self.bounds[bid]}))"
-                        )
+                        masks.append(self.tile_lane_predicate(bid)(coord))
                     elif self.env.block_sizes[bid].reduction:
                         masks.append(
                             f"(({coord}) < ({self.sym(self.env.block_sizes[bid].numel)}))"
