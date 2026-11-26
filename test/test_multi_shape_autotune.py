@@ -19,6 +19,7 @@ import helion
 from helion import exc
 from helion._compiler.triton.backend import TritonBackend
 from helion._testing import DEVICE
+from helion._testing import onlyOn
 from helion._testing import skipIfRefEager
 from helion.autotuner import PatternSearch
 from helion.autotuner import benchmark_provider as benchmark_provider_module
@@ -1653,7 +1654,7 @@ class TestMultiShapeLLMSeeded(unittest.TestCase):
 
 @pytest.mark.slow
 @pytest.mark.cuda
-@unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
+@onlyOn(["cuda", "rocm", "xpu"])
 @skipIfRefEager("Autotuning requires compilation, not supported in ref eager mode")
 class TestMultiShapeAutotuneIntegration(unittest.TestCase):
     @staticmethod

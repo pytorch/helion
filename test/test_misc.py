@@ -41,6 +41,7 @@ from helion._testing import code_and_output
 from helion._testing import get_test_dot_precision
 from helion._testing import import_path
 from helion._testing import onlyBackends
+from helion._testing import onlyOn
 from helion._testing import skipIfCute
 from helion._testing import skipIfFbTriton
 from helion._testing import skipIfNotCUDA
@@ -1819,7 +1820,7 @@ class TestMisc(RefEagerTestBase, TestCase):
                         mismatched = (result != expected).float().mean().item()
                         self.assertLess(mismatched, 0.05)
 
-    @skipIfNotCUDA()
+    @onlyOn(["cuda", "xpu"])
     def test_gelu_half_subnormal_rounds_like_eager(self):
         # Odd fp16 subnormals cannot represent x / 2 exactly. GELU must keep
         # that prefactor in fp32 and round only its completed result.

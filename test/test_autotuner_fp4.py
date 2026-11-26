@@ -5,7 +5,7 @@ import torch
 
 import helion
 from helion._testing import DEVICE
-from helion._testing import skipIfNotCUDA
+from helion._testing import onlyOn
 from helion._testing import skipIfRefEager
 from helion._testing import skipUnlessBackends
 from helion.autotuner.accuracy import _chunked_assert_close
@@ -63,7 +63,7 @@ def test_packed_fp4_does_not_change_other_leaves_tolerances() -> None:
         assert_close(packed, packed.view(torch.uint8), atol=0.01, rtol=0.01)
 
 
-@skipIfNotCUDA()
+@onlyOn(["cuda", "xpu"])
 @skipUnlessBackends(["triton", "cute"])
 @skipIfRefEager("autotuning compiles candidates; ref mode runs the kernel eagerly")
 def test_autotune_validates_packed_fp4_inputs_without_numeric_cast() -> None:

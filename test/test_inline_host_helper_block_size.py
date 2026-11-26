@@ -25,6 +25,7 @@ from helion._compiler.compile_environment import CompileEnvironment
 from helion._testing import DEVICE
 from helion._testing import cpu_render_target
 from helion._testing import import_example
+from helion._testing import onlyOn
 from helion._testing import skipIfNotCUDA
 from helion._testing import skipIfRefEagerMark
 from helion._testing import skipIfTileIR
@@ -1750,7 +1751,7 @@ def test_cross_loop_split_k_over_a_tunable_split_count() -> None:
 
 
 @pytest.mark.cuda
-@skipIfNotCUDA()
+@onlyOn(["cuda", "xpu"])
 @skipUnlessBackends(["triton"])
 @skipUnlessGluon()
 def test_gluon_cross_loop_split_k_over_a_tunable_split_count() -> None:

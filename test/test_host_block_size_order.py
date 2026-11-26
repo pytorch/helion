@@ -16,6 +16,7 @@ import helion
 from helion import _compat
 from helion import _hardware
 from helion._testing import DEVICE
+from helion._testing import onlyOn
 from helion._testing import patch_target_facts
 from helion._testing import skipIfRefEager
 from helion._testing import skipUnlessBackends
@@ -204,7 +205,7 @@ def test_later_root_reduction_host_dependencies(
 
 
 @skipIfRefEager("requires compiler IR and explicit configurations")
-@pytest.mark.skipif(DEVICE.type != "cuda", reason="requires CUDA")
+@onlyOn(["cuda", "rocm", "xpu"])
 @pytest.mark.parametrize(
     "backend", ["triton", pytest.param("cute", marks=skipUnlessBackends(["cute"]))]
 )
@@ -233,7 +234,7 @@ def test_multi_root_reduction_native(backend: str) -> None:
 
 
 @skipIfRefEager("requires compiler IR and explicit configurations")
-@pytest.mark.skipif(DEVICE.type != "cuda", reason="requires CUDA")
+@onlyOn(["cuda", "rocm", "xpu"])
 def test_gather_after_partial_reduction_native() -> None:
     kernel = helion.kernel(
         backend="triton", static_shapes=True, autotune_effort="none"

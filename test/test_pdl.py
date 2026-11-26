@@ -12,6 +12,7 @@ from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
 from helion._testing import code_and_output
 from helion._testing import onlyBackends
+from helion._testing import onlyOn
 from helion._testing import skipIfCudaCapabilityLessThan
 from helion._testing import skipIfNotCUDA
 from helion._testing import skipIfRefEager
@@ -312,7 +313,7 @@ class TestPdl(RefEagerTestBase, TestCase):
         self.assertEqual(statements[-1], "tl.extra.cuda.gdc_launch_dependents()")
         self.assertEqual(code.count("gdc_launch_dependents()"), 1)
 
-    @skipIfNotCUDA()
+    @onlyOn(["cuda", "xpu"])
     @skipIfRefEager("PDL codegen is unavailable in ref mode")
     def test_ops_do_nothing_before_sm90(self) -> None:
         @helion.kernel(static_shapes=True, autotune_effort="none")

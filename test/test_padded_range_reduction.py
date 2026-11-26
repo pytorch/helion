@@ -416,7 +416,7 @@ def test_a_full_row_sorted_beside_the_range_ranks_all_its_lanes() -> None:
 
 
 @pytest.mark.cuda
-@helion._testing.skipIfNotCUDA()
+@helion._testing.onlyOn(["cuda", "xpu"])
 @onlyBackends(["triton", "cute"])
 def test_half_variance_and_sorted_sum_of_the_range_match_eager() -> None:
     device = helion._testing.DEVICE
@@ -437,7 +437,7 @@ def test_half_variance_and_sorted_sum_of_the_range_match_eager() -> None:
 
 
 @pytest.mark.cuda
-@helion._testing.skipIfNotCUDA()
+@helion._testing.onlyOn(["cuda", "xpu"])
 @onlyBackends(["triton", "cute"])
 def test_a_full_row_sorted_beside_the_range_matches_eager() -> None:
     device = helion._testing.DEVICE
@@ -452,7 +452,7 @@ def test_a_full_row_sorted_beside_the_range_matches_eager() -> None:
 
 
 @pytest.mark.cuda
-@helion._testing.skipIfNotCUDA()
+@helion._testing.onlyOn(["cuda", "xpu"])
 @onlyBackends(["triton", "cute"])
 @pytest.mark.xfail(
     _get_backend() == "triton" and os.environ.get("HELION_INTERPRET") != "1",
@@ -518,7 +518,7 @@ def test_hl_reduce_takes_its_other_past_the_range() -> None:
 
 
 @pytest.mark.cuda
-@helion._testing.skipIfNotCUDA()
+@helion._testing.onlyOn(["cuda", "xpu"])
 @onlyBackends(["triton", "cute"])
 @helion._testing.skipIfRefEager(
     "ref mode's hl.arange has no padding lanes for other to fill"
@@ -585,7 +585,7 @@ def test_hl_reduce_of_a_range_with_its_own_reduction_dim_is_masked_once() -> Non
 
 
 @pytest.mark.cuda
-@helion._testing.skipIfNotCUDA()
+@helion._testing.onlyOn(["cuda", "xpu"])
 @onlyBackends(["triton"])
 def test_hl_reduce_of_a_flattened_tile_matches_eager() -> None:
     x = torch.rand(4, 4, 8, device=helion._testing.DEVICE)
@@ -656,7 +656,7 @@ def test_hl_reduce_fills_the_lanes_past_every_range_before_reducing() -> None:
 
 
 @pytest.mark.cuda
-@helion._testing.skipIfNotCUDA()
+@helion._testing.onlyOn(["cuda", "xpu"])
 @onlyBackends(["triton", "cute"])
 @helion._testing.skipIfRefEager(
     "ref mode's hl.arange has no padding lanes for other to fill"
@@ -703,7 +703,7 @@ def test_a_range_on_another_axis_does_not_pin_the_row() -> None:
 
 
 @pytest.mark.cuda
-@helion._testing.skipIfNotCUDA()
+@helion._testing.onlyOn(["cuda", "xpu"])
 @onlyBackends(["triton", "cute"])
 def test_a_range_on_another_axis_reduces_in_chunks_of_the_row() -> None:
     x = torch.randn(4, 256, device=helion._testing.DEVICE)
@@ -758,7 +758,7 @@ def test_a_range_indexing_another_dim_of_the_load_pins_nothing(
 
 
 @pytest.mark.cuda
-@helion._testing.skipIfNotCUDA()
+@helion._testing.onlyOn(["cuda", "xpu"])
 @onlyBackends(["triton", "cute"])
 @pytest.mark.parametrize(("fn", "shape", "config"), _ROWS_KERNELS, ids=["tile", "grid"])
 @pytest.mark.parametrize("loops", [None, 32])
@@ -811,7 +811,7 @@ def test_hl_reduce_fills_only_the_inputs_that_read_the_range() -> None:
 
 
 @pytest.mark.cuda
-@helion._testing.skipIfNotCUDA()
+@helion._testing.onlyOn(["cuda", "xpu"])
 @onlyBackends(["triton", "cute"])
 @helion._testing.skipIfRefEager(
     "ref mode's hl.arange has no padding lanes for other to fill"

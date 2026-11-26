@@ -24,6 +24,7 @@ import helion
 from helion._testing import DEVICE
 from helion._testing import TestCase
 from helion._testing import onlyBackends
+from helion._testing import onlyOn
 from helion._testing import skipIfRefEager
 from helion._testing.search_harness import mock_kernel
 from helion.autotuner import PatternSearch
@@ -4518,7 +4519,7 @@ def _add(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     return out
 
 
-@unittest.skipUnless(torch.cuda.is_available(), "runs the selection on a CUDA device")
+@onlyOn(["cuda", "rocm", "xpu"])
 @onlyBackends(["triton"])
 class TestFinalSelectionOnDevice(TestCase):
     """test/conftest.py keeps every other test on the single-pass verification

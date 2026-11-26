@@ -199,7 +199,7 @@ def test_triton_reductions_take_their_identity_past_a_padded_range() -> None:
 
 
 @pytest.mark.cuda
-@helion._testing.skipIfNotCUDA()
+@helion._testing.onlyOn(["cuda", "xpu"])
 @helion._testing.onlyBackends(["triton", "cute"])
 def test_padded_range_reductions_count_only_the_range() -> None:
     # Rows of zeros gave a mean of 1.28 (256 / 200) for ``(row + 1.0)``, and
@@ -264,7 +264,7 @@ def test_an_index_loaded_through_a_padded_range_masks_its_lanes() -> None:
 
 
 @pytest.mark.cuda
-@helion._testing.skipIfNotCUDA()
+@helion._testing.onlyOn(["cuda", "xpu"])
 @helion._testing.onlyBackends(["triton", "cute"])
 def test_a_scatter_through_loaded_columns_leaves_the_other_columns() -> None:
     device = helion._testing.DEVICE
@@ -316,7 +316,7 @@ def test_an_index_loaded_before_a_nested_loop_masks_its_lanes_inside_it() -> Non
 
 
 @pytest.mark.cuda
-@helion._testing.skipIfNotCUDA()
+@helion._testing.onlyOn(["cuda", "xpu"])
 @helion._testing.onlyBackends(["triton", "cute"])
 @helion._testing.skipIfRefEager(
     "ref-mode hl.load meshgrids the tile's int32 index with int64 cols"
@@ -518,7 +518,7 @@ def test_an_index_an_if_reassigns_keeps_its_padding(fn) -> None:
 
 
 @pytest.mark.cuda
-@helion._testing.skipIfNotCUDA()
+@helion._testing.onlyOn(["cuda", "xpu"])
 @helion._testing.onlyBackends(["triton", "cute"])
 @helion._testing.skipIfRefEager(
     "ref-mode hl.load meshgrids the tile's int32 index with int64 cols"

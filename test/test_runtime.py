@@ -15,6 +15,7 @@ import torch
 import helion
 from helion._testing import DEVICE
 from helion._testing import onlyBackends
+from helion._testing import onlyOn
 from helion._testing import skipIfFn
 from helion._testing import skipIfRefEager
 from helion._testing import skipIfRocm
@@ -687,7 +688,7 @@ class TestPersistentTritonState(unittest.TestCase):
 
 
 @pytest.mark.cuda
-@unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
+@onlyOn(["cuda", "rocm", "xpu"])
 @unittest.skipIf(triton_launcher.triton is None, "requires Triton")
 @skipIfRocm("tensor memory and the CUDA driver queries are NVIDIA's")
 @skipIfFn(

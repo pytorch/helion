@@ -8,6 +8,7 @@ import torch
 import helion
 from helion._testing import DEVICE
 from helion._testing import import_example
+from helion._testing import onlyOn
 from helion._testing import skipIfNotCUDA
 from helion._testing import skipIfRefEager
 from helion._testing import skipUnlessBackends
@@ -41,7 +42,7 @@ pytestmark = skipUnlessBackends(["triton", "cute"])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("shape", [(1, 4, 2, 128, 64), (2, 3, 1, 33, 128)])
 @pytest.mark.parametrize("broadcast_angles", [False, True])
-@skipIfNotCUDA()
+@onlyOn(["cuda", "xpu"])
 @skipIfRefEager("compiles a pinned config; ref mode runs the kernel eagerly")
 def test_rope_forward_backward_rounding_and_slices(
     dtype: torch.dtype, shape: tuple[int, int, int, int, int], broadcast_angles: bool
@@ -91,7 +92,7 @@ def test_rope_forward_backward_rounding_and_slices(
 @pytest.mark.parametrize(
     "shared_epilogue", [False, pytest.param(True, marks=skipUnlessBackends(["cute"]))]
 )
-@skipIfNotCUDA()
+@onlyOn(["cuda", "xpu"])
 @skipIfRefEager("compiles a pinned config; ref mode runs the kernel eagerly")
 def test_squeeze_excitation_sigmoid_rounds_matmul_input(
     dtype: torch.dtype, shared_epilogue: bool

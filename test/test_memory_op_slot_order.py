@@ -26,7 +26,7 @@ from helion._compiler.device_ir import DeviceIR
 from helion._compiler.device_ir import GraphInfo
 from helion._testing import DEVICE
 from helion._testing import cpu_render_target
-from helion._testing import skipIfNotCUDA
+from helion._testing import onlyOn
 from helion._testing import skipUnlessBackends
 from helion._testing import skipUnlessTensorDescriptor
 from helion._testing.cute_codegen import cpu_bind
@@ -640,7 +640,7 @@ def test_a_rolled_config_keys_on_its_descriptor_layouts() -> None:
 
 
 @pytest.mark.cuda
-@skipIfNotCUDA()
+@onlyOn(["cuda", "xpu"])
 @skipUnlessBackends(["triton"])
 @skipUnlessTensorDescriptor("Tensor descriptor support is required")
 def test_a_rolled_config_keys_on_its_descriptor_alignment() -> None:

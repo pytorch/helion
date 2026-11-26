@@ -13,6 +13,7 @@ import helion
 from helion._compiler.compile_environment import CompileEnvironment
 from helion._compiler.roll_reduction import ReductionRoller
 from helion._testing import DEVICE
+from helion._testing import onlyOn
 from helion._testing import skipIfRefEager
 from helion._testing import skipUnlessBackends
 from helion._testing.triton_codegen import cpu_codegen as cpu_codegen
@@ -81,7 +82,7 @@ def _assert_topk(x, k, largest, values, indices):
     assert torch.equal(values.view(bits), x.view(bits).gather(-1, indices))
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@onlyOn(["cuda", "rocm"])
 @skipUnlessBackends(["triton", "tileir"])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
 @pytest.mark.parametrize("largest", [False, True])
@@ -104,7 +105,7 @@ def test_float_topk_preserves_values_and_valid_indices(case, largest, dtype):
     assert torch.equal(x.view(torch.uint8), before)
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@onlyOn(["cuda", "rocm"])
 @skipUnlessBackends(["triton", "tileir"])
 @pytest.mark.parametrize("largest", [False, True])
 @skipIfRefEager("uses an explicitly compiled dynamic-shape configuration")
@@ -126,7 +127,7 @@ def test_float_topk_dynamic_tails(largest):
         _assert_topk(x, 4, largest, values, indices)
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@onlyOn(["cuda", "rocm"])
 @skipUnlessBackends(["triton", "tileir"])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
 @pytest.mark.parametrize("largest", [False, True])
@@ -152,7 +153,7 @@ def test_float_topk_selection_paths_preserve_payloads(
     _assert_topk(x, k, largest, values, indices)
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@onlyOn(["cuda", "rocm"])
 @skipUnlessBackends(["triton", "tileir"])
 @pytest.mark.parametrize("largest", [False, True])
 @pytest.mark.parametrize(

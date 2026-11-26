@@ -29,8 +29,8 @@ import pytest
 import torch
 
 from helion._testing import DEVICE
+from helion._testing import onlyOn
 from helion._testing import output_only
-from helion._testing import skipIfNotCUDA
 from helion._testing import skipUnlessBackends
 from helion.runtime.settings import _get_backend
 
@@ -420,7 +420,7 @@ def _statistics_of(
     return exact_mean, exact_var, torch.rsqrt(exact_var + _f32(spec.eps))
 
 
-@skipIfNotCUDA()
+@onlyOn(["cuda", "xpu"])
 @pytest.mark.parametrize("repro", list(PORTS))
 def test_every_kernel_stores_the_statistics_of_what_it_read(repro: str) -> None:
     spec = PORTS[repro]
@@ -484,7 +484,7 @@ def test_every_kernel_stores_the_statistics_of_what_it_read(repro: str) -> None:
     _last_level("offset last level", spec, port, partials, everything)
 
 
-@skipIfNotCUDA()
+@onlyOn(["cuda", "xpu"])
 @pytest.mark.parametrize("repro", list(PORTS))
 def test_the_block_moments_are_taken_about_a_pivot(repro: str) -> None:
     # An fp32 activation whose offset is a million times its spread: sums of
@@ -509,7 +509,7 @@ def test_the_block_moments_are_taken_about_a_pivot(repro: str) -> None:
     assert torch.isfinite(partials[0][:2, INFINITY]).all()
 
 
-@skipIfNotCUDA()
+@onlyOn(["cuda", "xpu"])
 @pytest.mark.parametrize("repro", list(PORTS))
 def test_forward_returns_the_graphs_statistics_rounded_once(repro: str) -> None:
     # forward() end to end, on images that give its blocks few rows: every
@@ -550,7 +550,7 @@ def test_forward_returns_the_graphs_statistics_rounded_once(repro: str) -> None:
         assert torch.isnan(statistic[INFINITY])
 
 
-@skipIfNotCUDA()
+@onlyOn(["cuda", "xpu"])
 # The counts for which var_mean_var_mean_5cc92f5d49c1's four blocks of
 # ceil(count / 4) elements leave a block (three of them for one element)
 # past the end.
@@ -580,7 +580,7 @@ def test_a_block_past_the_end_has_no_weight(count: int) -> None:
     _assert_correctly_rounded("rstd", rstd, exact_rstd)
 
 
-@skipIfNotCUDA()
+@onlyOn(["cuda", "xpu"])
 @skipUnlessBackends(["cute"])
 def test_the_looped_kernels_sum_in_fp64_at_a_folding_config() -> None:
     # At these CuTe configs the sums inside the looped kernels' tile loops are
