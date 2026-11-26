@@ -475,8 +475,10 @@ class TimedPrelude(Protocol):
     """Work that runs between the L2 flush and every timed call of a
     candidate (``benchmark_prelude``: the kernels that run before it in a
     sequence). ``run`` does the work and leaves the candidate's call its
-    arguments; the candidate's callable reads them. Internal: the timers
-    take one only from a search's benchmark worker."""
+    arguments; the candidate's callable reads them. Internal to the
+    autotuner and its harnesses: a search's benchmark worker passes one, and
+    so does better-benchmark's trace timer (``bench.py``'s
+    ``ReleaseL2Pins``)."""
 
     def run(self) -> None: ...
 
