@@ -78,34 +78,72 @@ def target(node: torch.fx.Node) -> Callable[..., Any]:
     return cast("Callable[..., Any]", node.target)
 
 
+# The ATen and prims ops that address their operand's storage, not its
+# elements: by sizes, strides and an offset of their own (the as_strided ops,
+# _reshape_alias), by resizing it in place, by making a tensor share it (set_,
+# set), or by returning a copy of the whole storage under the operand's
+# strides and offset (the scatters: select_scatter, slice_scatter and
+# diagonal_scatter, as as_strided_scatter, clone the storage from its element
+# 0, so cat([a, b], -1)[:, 32:].select_scatter(src, 0, 0)
+# .as_strided((4, 32), (40, 1), 0) reads a).
+STORAGE_OPS = frozenset(
+    {
+        aten.as_strided,
+        aten.as_strided_,
+        aten.as_strided_copy,
+        aten.as_strided_scatter,
+        aten.select_scatter,
+        aten.slice_scatter,
+        aten.diagonal_scatter,
+        aten._reshape_alias,
+        aten._reshape_alias_copy,
+        aten.resize_,
+        aten.resize_as_,
+        aten.set_,
+        aten.set,
+        torch.ops.prims.as_strided,
+        torch.ops.prims.as_strided_scatter,
+        torch.ops.prims.resize,
+    }
+)
+
+# The ATen ops whose results alias their input, though their schemas do not
+# mark them as aliasing (so is_view is False).
+UNMARKED_VIEWS = frozenset(
+    {aten._unsafe_view, aten.unsafe_split, aten.unsafe_split_with_sizes}
+)
+
+
 def needs_cat_storage(node: torch.fx.Node) -> bool:
     """Whether the slice `node` must stay a view of the cat's storage, where a
-    part has its own: when what reads it can reach the storage past it,
-    as_strided or as_strided_scatter, directly or through views of `node`, as
-    in cat([a, b], 1)[:, :32].t().as_strided(...), or the caller, when `node`
-    or a view of it is a graph output, which the caller may view past the
-    slice as well, out.as_strided((4, 8), (40, 1), 32) (a slice consumed by an
-    op that writes a new tensor, as .contiguous() does, is not reached past);
-    and when an op writes into it or a view of it, x[:, :32].add_(1), a write
-    the cat's other readers must see. The views of an op with several (split,
-    unbind, chunk) are the getitems of its result."""
+    part has its own: when what reads it, directly or through views of `node`,
+    can reach the storage past it. An ATen or prims op reads the elements of
+    the slice, unless it addresses the storage (STORAGE_OPS), as
+    cat([a, b], 1)[:, :32].t().as_strided(...) does. Any other reader can
+    reach past the slice: an op of another namespace (a custom op, whose body
+    can view its operand as as_strided does), a higher-order op (a user Triton
+    kernel, the subgraphs of torch.cond), and the caller, when `node` or a
+    view of it is a graph output, which the caller may view past the slice as
+    well, out.as_strided((4, 8), (40, 1), 32). The slice also stays when an op
+    writes into it or a view of it, x[:, :32].add_(1), a write the cat's other
+    readers must see. The views of an op with several (split, unbind, chunk)
+    are the getitems of its result."""
     views = [node]
     while views:
         for user in views.pop().users:
+            target = user.target
+            if user.op == "call_function" and target is operator.getitem:
+                views.append(user)
+                continue
             if (
-                user.op == "output"
-                or user.target
-                in (aten.as_strided.default, aten.as_strided_scatter.default)
+                user.op != "call_function"
+                or not isinstance(target, torch._ops.OpOverload)
+                or target.namespace not in ("aten", "prims")
+                or target.overloadpacket in STORAGE_OPS
                 or writes_operand(user)
             ):
                 return True
-            # aten._unsafe_view aliases its input too, though neither is_view
-            # nor its schema says so.
-            if (
-                user.target in (operator.getitem, aten._unsafe_view.default)
-                or isinstance(user.target, torch._ops.OpOverload)
-                and user.target.is_view
-            ):
+            if target.is_view or target.overloadpacket in UNMARKED_VIEWS:
                 views.append(user)
     return False
 

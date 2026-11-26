@@ -92,6 +92,20 @@ class TestPostGradPass(TestCase):
         self.assertEqual(graphs, [gm.graph])
 
 
+@torch.library.custom_op("helion_test_inductor_passes::strided_copy", mutates_args=())
+def strided_copy(x: torch.Tensor, size: list[int], stride: list[int]) -> torch.Tensor:
+    """The elements of x's storage that x.as_strided(size, stride) views,
+    which can lie past x's own: a custom op that reads past its operand."""
+    return x.as_strided(size, stride).clone()
+
+
+@strided_copy.register_fake
+def _strided_copy_fake(
+    x: torch.Tensor, size: list[int], stride: list[int]
+) -> torch.Tensor:
+    return x.new_empty(size)
+
+
 class TestCatReductions(TestCase):
     def split(self, fn, *args):
         """fn traced with Inductor's decompositions, after
@@ -210,11 +224,13 @@ class TestCatReductions(TestCase):
 
         self.assertIn("cat.default", self.split(fn, a, b, c))
 
-    def test_unsafe_view_output(self):
-        # aten._unsafe_view aliases its input, though neither is_view nor its
-        # schema says so: a slice returned through it keeps the cat, whose
-        # storage the caller may read past the slice. (Inductor's decompositions
-        # would trace it as a view: the graph is traced without them.)
+    def test_unmarked_views(self):
+        # aten._unsafe_view and unsafe_split alias their input, though neither
+        # is_view nor their schemas say so: a slice returned through
+        # _unsafe_view keeps the cat, whose storage the caller may read past
+        # the slice, as does one that as_strided reads past through
+        # unsafe_split. (Inductor's decompositions would trace them as views:
+        # the graphs are traced without them.)
         a, b = torch.randn(4, 8), torch.randn(1, 8)
 
         def fn(a, b):
@@ -225,6 +241,15 @@ class TestCatReductions(TestCase):
         self.assertFalse(split_cat_reductions(gm.graph, devices=("cpu",)))
         gm.recompile()
         torch.testing.assert_close(gm(a, b).as_strided((8,), (1,), 32), b[0])
+
+        def split_slice(a, b):
+            x = torch.unsafe_split(torch.cat([a, b], 0)[:4], 4, 1)[1]
+            return x.as_strided((8,), (1,), 32)
+
+        gm = make_fx(split_slice, tracing_mode="fake")(a, b)
+        self.assertFalse(split_cat_reductions(gm.graph, devices=("cpu",)))
+        gm.recompile()
+        torch.testing.assert_close(gm(a, b), b[0])
 
     def test_dynamic_size(self):
         # A cat of dynamic sizes stays.
@@ -288,6 +313,32 @@ class TestCatReductions(TestCase):
             gm.recompile()
             out = pytree.tree_leaves(gm(a, b))[0]
             torch.testing.assert_close(out.as_strided((4, 8), (40, 1), 32), b)
+
+    def test_opaque_reader(self):
+        # A custom op that gets the slice, directly or through a view, and a
+        # higher-order op (torch.cond's subgraphs) can read the storage past
+        # it, b's part of the cat, as strided_copy() and read_past() do: the
+        # cat stays. An ATen op reads only the slice's elements: a copy of a
+        # replaces the slice.
+        def fn(reader, a, b):
+            x = torch.cat([a, b], -1)
+            return x.amax(-1), reader(x[:, :32])
+
+        def read_past(s):
+            return s.as_strided((4, 40), (40, 1)).clone()
+
+        a, b = torch.randn(4, 32), torch.randn(4, 8)
+        for reader in (
+            lambda s: strided_copy(s, [4, 40], [40, 1]),
+            lambda s: strided_copy(s.unsqueeze(0), [4, 40], [40, 1]),
+            lambda s: torch.ops.higher_order.cond(
+                s.sum() > 0, read_past, read_past, (s,)
+            ),
+        ):
+            ops = self.split(functools.partial(fn, reader), a, b)
+            self.assertIn("cat.default", ops)
+        ops = self.split(functools.partial(fn, lambda s: s.unsqueeze(0) * 2), a, b)
+        self.assertNotIn("cat.default", ops)
 
     def test_keyword_dims(self):
         # dim and keepdim given by keyword to a float16 sum and to max.dim.
@@ -373,15 +424,35 @@ class TestCatReductions(TestCase):
                 .unsqueeze(0)
                 .as_strided((4, 8), (40, 1), 32)
             ),
-            # ... or as as_strided_scatter does.
+            # ... or as as_strided_scatter and as_strided_copy do.
             lambda a, b: torch.cat([a, b], 1)[:, :32].as_strided_scatter(
                 b, (4, 8), (40, 1), 32
+            ),
+            lambda a, b: aten.as_strided_copy(
+                torch.cat([a, b], 1)[:, :32], (4, 8), (40, 1), 32
             ),
             # ... or through a getitem of a view op with several results.
             lambda a, b: (
                 torch.cat([a, b], 1)[:, :32]
                 .split(16, 1)[1]
                 .as_strided((4, 8), (40, 1), 32)
+            ),
+            # ... or past a scatter's result, which copies the slice's storage
+            # under its strides: as_strided reads a past b's slice.
+            lambda a, b: (
+                torch.cat([a, b], -1)[:, 32:]
+                .select_scatter(b[0] * 2, 0, 0)
+                .as_strided((4, 32), (40, 1), 0)
+            ),
+            lambda a, b: (
+                torch.cat([a, b], -1)[:, 32:]
+                .slice_scatter(b[:2] * 2, 0, 0, 2)
+                .as_strided((4, 32), (40, 1), 0)
+            ),
+            lambda a, b: (
+                torch.cat([a, b], -1)[:, 32:]
+                .diagonal_scatter(b[0, :4] * 2)
+                .as_strided((4, 32), (40, 1), 0)
             ),
             # Parts of 32 and 24: neither is a quarter of the dim or less.
             lambda a, b: torch.cat([a, torch.cat([b, b, b], -1)], -1).sum(-1),
