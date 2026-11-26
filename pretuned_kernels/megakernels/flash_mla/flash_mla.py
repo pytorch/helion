@@ -219,8 +219,9 @@ def reference(tensors: dict[str, torch.Tensor]) -> torch.Tensor:
     )
     q = tensors["query"][0].float()
     s = torch.einsum("qhd,ld->qhl", q, kv) * MLA_SCALE
-    pos = torch.arange(n, device="cuda")
-    limit = n - (QUERY_TOKENS - 1 - torch.arange(QUERY_TOKENS, device="cuda"))
+    query_len = q.size(0)
+    pos = torch.arange(n, device=q.device)
+    limit = n - query_len + 1 + torch.arange(query_len, device=q.device)
     s = torch.where(pos[None, None, :] < limit[:, None, None], s, float("-inf"))
     return torch.einsum("qhl,ld->qhd", s.softmax(-1), kv[:, :KV_LORA_RANK]).to(
         torch.bfloat16
