@@ -18,6 +18,7 @@ from ... import exc
 from ._ast_pass_utils import _bound_names
 from .compile_options import compile_options_keyword
 from .compile_options import config_compile_options
+from .materialized_fission_codegen import drop_launch_count
 from .row_matrix_transport import ROW_MATRIX_MODE
 from .row_matrix_transport import prove_row_matrix_transport
 from .row_resident import ROW_RESIDENT_KEY
@@ -376,5 +377,8 @@ def generate_row_resident(
         f"from torch._inductor.codecache import PyCodeCache as {code_cache}\n{module_name} = {code_cache}.load({source!r})\n{kernel}._helion_cute_source_hash = {hashlib.sha256(source.encode()).hexdigest()!r}\n"
     ).body
     metadata[0].value = ast.parse(f"({kernel},)", mode="eval").body
+    # One launch replaced the fission host's two stage launches, so the launch
+    # count the benchmark timers read goes too.
+    drop_launch_count(module, func.name)
     env_state.resolved_wrapper_plans = []
     return module

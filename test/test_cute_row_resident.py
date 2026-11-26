@@ -8,6 +8,7 @@ from unittest.mock import patch
 
 import pytest
 import torch
+from torch._inductor.codecache import PyCodeCache
 
 from test.test_cute_epilogue_fanout import _opaque_metadata
 from test.test_cute_epilogue_fanout import cuda_trace  # noqa: F401
@@ -19,6 +20,7 @@ from helion._compiler.cute.row_resident import prove_row_resident
 from helion._compiler.cute.row_resident_codegen import _scalar_epilogue
 from helion._testing import import_example
 from helion._testing.cute_codegen import check_config_compile_options
+from helion.autotuner.benchmarking import _launches_several_kernels
 from helion.exc import InvalidConfig
 import helion.language as hl
 from helion.language import _tracing_ops
@@ -201,9 +203,19 @@ def test_original_and_renamed_materialized_graphs() -> None:
         assert second.stores[1].chain.auxiliary_tensor_loads
         ordinary = bound.config_spec.default_config()
         off = helion.Config.from_dict(ordinary.config | {ROW_RESIDENT_KEY: "off"})
-        assert bound.to_code(ordinary) == bound.to_code(off)
+        ordinary_code = bound.to_code(ordinary)
+        assert ordinary_code == bound.to_code(off)
         assert ROW_RESIDENT_KEY not in bound.config_spec.normalized_config(off).config
-        assert bound.to_code(row_config(bound)) != bound.to_code(ordinary)
+        row_code = bound.to_code(row_config(bound))
+        assert row_code != ordinary_code
+        # The benchmark timers time a call that launches several kernels as a
+        # CUDA graph replay (``_launches_several_kernels``): the ordinary
+        # fission host launches its two stages, the row-resident host one
+        # kernel in their place.
+        assert bound.host_function is not None
+        for code, several in ((ordinary_code, True), (row_code, False)):
+            host = getattr(PyCodeCache.load(code), bound.host_function.name)
+            assert _launches_several_kernels(host) is several
 
 
 def test_actual_effectful_host_metadata_keeps_the_original_path() -> None:

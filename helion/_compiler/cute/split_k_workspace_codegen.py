@@ -1060,6 +1060,9 @@ def generate_split_k_workspace(
             statement_from_string(
                 f"{func.name}._helion_cute_kernels = ({kernels[0]}, {kernels[1]})"
             ),
+            # Both kernels launch on every call (the benchmark timers read the
+            # count: ``benchmarking._launches_several_kernels``).
+            statement_from_string(f"{func.name}._helion_cute_launches = 2"),
             statement_from_string(
                 f"{func.name}._helion_cute_split_k_workspace = {metadata!r}"
             ),

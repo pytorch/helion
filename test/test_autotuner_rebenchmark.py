@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import functools
 import logging
 import math
+import operator
 import os
 from types import SimpleNamespace
 from typing import Callable
@@ -10,6 +12,7 @@ from unittest.mock import Mock
 from unittest.mock import call
 from unittest.mock import patch
 
+import pytest
 import torch
 
 from test._autotuner_test_utils import AutotunerTestCase
@@ -31,6 +34,7 @@ from helion.autotuner.base_search import PopulationMember
 from helion.autotuner.benchmark_provider import LocalBenchmarkProvider
 from helion.autotuner.benchmark_worker import BenchmarkWorkerUnkillable
 from helion.autotuner.benchmarking import MirroredBenchmarkTrace
+from helion.autotuner.benchmarking import _launches_several_kernels
 from helion.autotuner.benchmarking import _mirrored_bench_call_layout
 from helion.autotuner.effort_profile import AutotuneEffortProfile
 from helion.autotuner.logger import AutotuningLogger
@@ -160,6 +164,70 @@ class TestAutotunerRebenchmark(AutotunerTestCase):
                 "clear b",
             ],
         )
+
+    @pytest.mark.cpu_only
+    def test_rebenchmark_callables_keep_the_members_launch_counts(self) -> None:
+        # The timers replay a call that launches several kernels as a CUDA
+        # graph (``_launches_several_kernels`` reads the host function's
+        # ``_helion_cute_launches``), so the re-timings' callables carry the
+        # launch counts of the members they run, and nothing else. A member
+        # callable from user code can have no ``__dict__`` (the external
+        # autotuner's ``compile_fn`` may return a builtin such as
+        # ``operator.add``) or one holding ``functools.wraps``' ``__wrapped__``.
+        settings = Settings(
+            autotune_log_level=logging.CRITICAL,
+            autotune_suspicious_rebenchmark_ratio=0,
+        )
+        search = PopulationBasedSearch.__new__(PopulationBasedSearch)
+        search.settings = settings
+        search.args = (2, 3)
+        search.log = AutotuningLogger(settings)
+        search.best_perf_so_far = 100.0
+        search.benchmark_provider = SimpleNamespace(mutated_arg_indices=[])
+        search.kernel = SimpleNamespace(env=SimpleNamespace(process_group_name=None))
+        search.config_spec = SimpleNamespace(backend=None)
+
+        def two_launch_host(a: int, b: int) -> None:
+            pass
+
+        def one_launch_host(a: int, b: int) -> None:
+            pass
+
+        two_launch_host._helion_cute_launches = 2  # pyrefly: ignore [missing-attribute]
+        one_launch_host._helion_cute_kernels = (object(),)  # pyrefly: ignore [missing-attribute]
+
+        # takes the host's attributes, its launch count among them, and a
+        # ``__wrapped__`` that leads ``inspect.signature`` to the host
+        @functools.wraps(two_launch_host)
+        def decorated_host(a: int, b: int) -> int:
+            return a * b
+
+        timed: list[Callable[[], object]] = []
+        outputs: list[object] = []
+
+        def custom_benchmark_fn(
+            fns: list[Callable[[], object]], *, repeat: int, desc: str | None = None
+        ) -> list[float]:
+            timed.extend(fns)
+            outputs.extend(fn() for fn in fns)
+            return [100.0, 101.0, 102.0, 103.0]
+
+        search.settings.autotune_benchmark_fn = custom_benchmark_fn
+        search.rebenchmark(
+            [
+                PopulationMember(two_launch_host, [100.0], [], helion.Config()),
+                PopulationMember(one_launch_host, [101.0], [], helion.Config()),
+                PopulationMember(operator.add, [102.0], [], helion.Config()),
+                PopulationMember(decorated_host, [103.0], [], helion.Config()),
+            ]
+        )
+        self.assertEqual(outputs, [None, None, 5, 6])
+        self.assertEqual(
+            [_launches_several_kernels(fn) for fn in timed], [True, False, False, True]
+        )
+        # only the count is carried, not the decorated member's ``__wrapped__``
+        self.assertIs(decorated_host.__wrapped__, two_launch_host)  # pyrefly: ignore [missing-attribute]
+        self.assertFalse(any(hasattr(fn, "__wrapped__") for fn in timed))
 
     def test_rebenchmark_bounds_interleaved_wall_clock(self) -> None:
         settings = Settings(

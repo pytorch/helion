@@ -445,7 +445,7 @@ def test_do_bench_refuses_a_prelude_through_a_graph_replay(
     monkeypatch.setattr(
         benchmarking,
         "_maybe_cudagraph_replay",
-        lambda fn, default_enabled=False: lambda: fn(),
+        lambda fn, **_: lambda: fn(),
     )
     with pytest.raises(ValueError, match="CUDA graph replays"):
         benchmarking.do_bench(
@@ -455,6 +455,36 @@ def test_do_bench_refuses_a_prelude_through_a_graph_replay(
             prelude=LoggedPrelude(event_timer),
         )
     assert "prelude" not in event_timer and "release" not in event_timer
+
+
+def test_a_call_of_several_kernels_runs_eagerly_behind_a_prelude(
+    event_timer: list[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A call that launches several kernels (a split-K workspace schedule's
+    producer and reducer) is timed as a graph replay alone; behind a prelude
+    it runs eagerly, on the arguments the prelude's work has just made,
+    instead of raising as an asked-for replay does."""
+    replays: list[object] = []
+
+    def replay_of(fn: object) -> object:
+        replays.append(fn)
+        return lambda: None
+
+    monkeypatch.setattr(benchmarking, "_cudagraph_unavailable_reason", lambda: None)
+    monkeypatch.setattr(benchmarking, "_make_cudagraph_replay", replay_of)
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda: None)
+
+    def host() -> None:
+        event_timer.append("call")
+
+    host._helion_cute_launches = 2  # pyrefly: ignore
+    assert benchmarking._maybe_cudagraph_replay(host, replay_launches=True) is not host
+    replays.clear()
+    benchmarking.do_bench(
+        host, fixed_repetitions=1, pre_warmed=True, prelude=LoggedPrelude(event_timer)
+    )
+    assert replays == []
+    assert event_timer[-6:] == ["flush", "prelude", "event", "call", "event", "sync"]
 
 
 @pytest.mark.parametrize("regime", ["off", "replay"])
@@ -1116,3 +1146,33 @@ def test_a_search_behind_a_prelude_reads_in_the_worker(
     assert behind(kernels.scale, x, torch.float32, timed=(x,)) != behind(
         kernels.scale, x, torch.bfloat16, timed=(x,)
     )
+
+
+@pytest.mark.parametrize("l2_flush_mode", ["call", "replay"])
+def test_a_call_of_several_kernels_runs_eagerly_on_the_event_timers(
+    event_timer: list[str], monkeypatch: pytest.MonkeyPatch, l2_flush_mode: str
+) -> None:
+    """The event timers read a graph replay on another scale than the eager
+    calls of a candidate's rivals (a short replay batched with its launch
+    latency subtracted; the ``replay`` regime's burst unflushed), so a call
+    that launches several kernels is replayed only for the trace and
+    ``kernel`` windows; elsewhere it runs eagerly, as its rivals do."""
+    replays: list[object] = []
+
+    def replay_of(fn: object) -> object:
+        replays.append(fn)
+        return lambda: None
+
+    monkeypatch.setattr(benchmarking, "_cudagraph_unavailable_reason", lambda: None)
+    monkeypatch.setattr(benchmarking, "_make_cudagraph_replay", replay_of)
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda: None)
+
+    def host() -> None:
+        event_timer.append("call")
+
+    host._helion_cute_launches = 2  # pyrefly: ignore
+    benchmarking.do_bench(
+        host, fixed_repetitions=1, pre_warmed=True, l2_flush_mode=l2_flush_mode
+    )
+    assert replays == []
+    assert "call" in event_timer

@@ -5728,6 +5728,19 @@ class PopulationBasedSearch(BaseSearch):
                 else:
                     return run_member()
 
+            # The timers read the host function's launch count
+            # (``_helion_cute_launches``: a call that launches several kernels
+            # is timed as a graph replay where a window reads it like its
+            # rivals) off the callable they are given. Only that attribute is
+            # carried, not the host's name or signature: a member callable
+            # from user code (the external autotuner's ``compile_fn``) may
+            # have no ``__dict__`` (a builtin such as ``operator.add``) or one
+            # holding the ``__wrapped__`` of ``functools.wraps``, which
+            # ``inspect.signature`` would follow. One without the attribute
+            # counts one launch.
+            launches = getattr(member.fn, "_helion_cute_launches", None)
+            if launches is not None:
+                wrapped._helion_cute_launches = launches  # pyrefly: ignore[missing-attribute]
             return wrapped
 
         try:

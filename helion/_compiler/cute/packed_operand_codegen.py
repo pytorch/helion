@@ -17,6 +17,7 @@ from ... import exc
 from .compile_options import compile_options_keyword
 from .compile_options import config_compile_options
 from .full_slice_matmul import _bound_names
+from .materialized_fission_codegen import drop_launch_count
 from .packed_operand import KEY
 from .packed_operand import PackedOperandPlan
 from .packed_operand import prove_packed_operand
@@ -286,5 +287,8 @@ def generate_packed_operand(
         f"{kernel}._helion_cute_source_hash = {hashlib.sha256(source.encode()).hexdigest()!r}\n"
     ).body
     metadata[0].value = ast.parse(f"({kernel},)", mode="eval").body
+    # One launch replaced the fission host's two stage launches, so the launch
+    # count the benchmark timers read goes too.
+    drop_launch_count(module, func.name)
     cute_env_state(env).resolved_wrapper_plans = []
     return module

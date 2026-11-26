@@ -13,6 +13,7 @@ from test.cute_population_contracts import tcgen05_mma_support
 import helion
 from helion._testing import cpu_render_target
 from helion._testing import import_example
+from helion.autotuner.benchmarking import _launches_several_kernels
 from helion.autotuner.precompile_future import _load_compiled_fn
 from helion.autotuner.precompile_future import _serialize_compiled_fn
 from helion.autotuner.precompile_future import _unload_compiled_fn
@@ -177,6 +178,9 @@ def test_conditional_bundle_roundtrip_retains_both_source_hashes():
             kernel._helion_cute_source_hash for kernel in function._helion_cute_kernels
         )
         assert len(before) == 2 and before[0] != before[1]
+        # Two kernels declared, one launched per call: the benchmark timers
+        # time the call eagerly, as they time a one-kernel call.
+        assert not _launches_several_kernels(function)
         digest = hashlib.sha256(source.encode()).hexdigest()
         assert backend.generated_source_hash(function) == digest
         serialized = _serialize_compiled_fn(function)

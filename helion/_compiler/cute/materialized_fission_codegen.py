@@ -697,6 +697,19 @@ def generate_materialized_fission(
         ],
         value=ast.Tuple(elts=kernels, ctx=ast.Load()),
     )
+    # Every stage launches its kernel on every call (the benchmark timers read
+    # the count: ``benchmarking._launches_several_kernels``). A generator that
+    # merges the stage launches into one drops it (``drop_launch_count``).
+    launches = ast.Assign(
+        targets=[
+            ast.Attribute(
+                value=ast.Name(id=func.name, ctx=ast.Load()),
+                attr="_helion_cute_launches",
+                ctx=ast.Store(),
+            )
+        ],
+        value=ast.Constant(value=len(kernels)),
+    )
     result = ast.Module(
         body=[
             *func.codegen_imports(),
@@ -704,6 +717,7 @@ def generate_materialized_fission(
             *module_loads,
             host_def,
             metadata,
+            launches,
             *(
                 [func.codegen_call_function(), emit_main_def()]
                 if emit_repro_caller
@@ -714,6 +728,25 @@ def generate_materialized_fission(
     )
     prepend_missing_imports(result)
     return result
+
+
+def drop_launch_count(module: ast.Module, host_name: str) -> None:
+    """Drop the ``_helion_cute_launches`` assignment that
+    ``generate_materialized_fission`` gives the host function ``host_name``,
+    for a generator that replaces the stage launches of ``module`` with one
+    launch: a host without the count makes one launch per call."""
+    module.body = [
+        stmt
+        for stmt in module.body
+        if not (
+            isinstance(stmt, ast.Assign)
+            and len(stmt.targets) == 1
+            and isinstance(stmt.targets[0], ast.Attribute)
+            and isinstance(stmt.targets[0].value, ast.Name)
+            and stmt.targets[0].value.id == host_name
+            and stmt.targets[0].attr == "_helion_cute_launches"
+        )
+    ]
 
 
 def prepend_missing_imports(module: ast.Module) -> None:
