@@ -15,6 +15,7 @@ from torch.profiler import profile
 from helion._dist_utils import all_ranks_agree
 from helion._testing import DEVICE
 from helion._testing import skipIfRocm
+from helion._testing.benchmark_timers import stand_in_trace
 from helion._testing.benchmark_timers import trace_test
 from helion.autotuner import benchmark_job
 from helion.autotuner import benchmarking
@@ -603,29 +604,49 @@ def test_kernel_timer_resets_gradients_before_every_call(traced_windows) -> None
     assert traced_windows == [3]
 
 
-@trace_test
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    ("first_flush_ns", "next_flush_ns", "expected_ms"),
+    [(8_000, 8_000, 0.007), (65_000, 12_000, math.inf)],
+    ids=["stable-period", "faster-second-window"],
+)
 def test_kernel_timer_resizes_a_window_whose_estimate_ran_long(
+    monkeypatch,
     traced_windows,
+    caplog,
+    first_flush_ns: int,
+    next_flush_ns: int,
+    expected_ms: float,
 ) -> None:
-    """The windows are sized by an estimate; when the calls then run far
-    shorter (here: the estimate's calls sleep), the first session settles
-    too few calls past the traced warmup, and a second one sized by the
-    traced call period times them."""
-    a = torch.randn(64, 64, device=DEVICE)
-    calls = [0]
+    """Resize from the first trace's period. Even the longer second window
+    can end before warmup if its calls arrive much faster."""
+    trace = stand_in_trace(monkeypatch)
+    # The estimate times five calls at 1 ms total; both first traces are
+    # faster. No fixed retry size fits both cases: at 15 us/call it takes
+    # over 130 calls to settle, whereas at 19 us/call 110 calls suffice.
+    first_flush = trace.launch("flush", first_flush_ns)
+    next_flush = trace.launch("flush", next_flush_ns)
 
-    def call() -> None:
-        calls[0] += 1
-        # the setup call and the estimate
-        if calls[0] <= 1 + benchmarking._KERNEL_TIMER_ESTIMATE_CALLS:
-            torch.cuda._sleep(5_000_000)
-        torch.mm(a, a)
+    def flush() -> None:
+        # Learning, estimation and the first window use first_flush; only
+        # the retry sees a window already recorded.
+        (next_flush if traced_windows else first_flush)()
 
-    reading = benchmarking.do_bench(call, warmup=20, rep=20, l2_flush_mode="kernel")
-    assert reading < 1.0  # milliseconds: no sleeping call is timed
-    # a second, longer session sized by the traced call period
+    with caplog.at_level(logging.WARNING, logger=benchmarking.__name__):
+        reading = benchmarking._do_bench_kernel_durations(
+            trace.launch("candidate", 7_000),
+            flush,
+            trace.device,
+            warmup=2,
+            rep=2,
+            quantiles=None,
+            return_mode="median",
+            fixed_repetitions=None,
+        )
     assert len(traced_windows) == 2
     assert traced_windows[1] > traced_windows[0]
+    assert reading == pytest.approx(expected_ms)
+    assert ("traced no settled call" in caplog.text) == math.isinf(expected_ms)
 
 
 @trace_test
