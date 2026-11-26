@@ -144,6 +144,10 @@ class EmitState:
     #: Each grid run's group to its tile's type, rows and K positions
     #: (``mpp_registers._emit_grid``).
     grid_runs: dict[int, tuple[str, int, int]] = dataclasses.field(default_factory=dict)
+    #: The steps of the register runs of the loop being emitted, which share
+    #: each of its iterations' code (``mpp_registers.emit_register_run``); 0
+    #: outside a loop.
+    register_steps: int = 0
     #: Each register group's accumulator root to its op (``mpp_registers``).
     register_atoms: dict[str, Atom] = dataclasses.field(default_factory=dict)
     #: Each accumulator root of a grid run (``mpp_registers._grid_run``) to
@@ -884,6 +888,17 @@ def _emit_for(
 
     runs = split_runs(stmt.body, loop_var)
     register_runs = register_split_runs(stmt.body, loop_var)
+    saved_steps = state.register_steps
+    state.register_steps = sum(
+        int(ast.literal_eval(k.value))
+        for s in stmt.body
+        for node in ast.walk(s)
+        if isinstance(node, ast.For)
+        and _is_call_to(node.iter, REG_RUN)
+        and isinstance(node.iter, ast.Call)
+        for k in node.iter.keywords
+        if k.arg == "steps"
+    )
     if runs or register_runs:
         start, step = split_range(start, step, state.split)
         state.split_loops.append(loop_var)
@@ -897,6 +912,7 @@ def _emit_for(
         state.declare(loop_var)
         _emit_stmts(stmt.body, parts, indent=indent + 4, state=state, subs=subs)
     parts.append(f"{pad}}}")
+    state.register_steps = saved_steps
     if runs or register_runs:
         state.split_loops.pop()
     if runs:
