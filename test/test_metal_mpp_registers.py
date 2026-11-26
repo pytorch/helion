@@ -14,6 +14,7 @@ import pytest
 import torch
 
 import helion
+from helion import exc
 from helion._compiler.metal import coop_layout
 from helion._compiler.metal import mpp_registers
 from helion._testing import TestCase
@@ -32,12 +33,18 @@ from helion._testing.metal_registers import dequant_forms_mm
 from helion._testing.metal_registers import filled_mm
 from helion._testing.metal_registers import free_cols_mm
 from helion._testing.metal_registers import inner_tiled_mm
+from helion._testing.metal_registers import inner_tiled_weight_mm
+from helion._testing.metal_registers import long_k_mm
 from helion._testing.metal_registers import mm_and_double
+from helion._testing.metal_registers import offset_k_mm
 from helion._testing.metal_registers import register_config
 from helion._testing.metal_registers import row_scaled_mm
 from helion._testing.metal_registers import rowsum_mm
+from helion._testing.metal_registers import shifted_x_mm
+from helion._testing.metal_registers import staged_apart_mm
 from helion._testing.metal_registers import transposed_out_mm
 from helion._testing.metal_registers import two_acc_mm
+from helion._testing.metal_registers import unread_x
 from helion.autotuner.config_spec import DEFAULT_NUM_WARPS
 
 pytestmark = [pytest.mark.cpu_only, skipUnlessBackends(["metal"])]
@@ -258,6 +265,19 @@ class TestRegisterCodegen(TestCase):
         self.assertIn("matmul2d_descriptor(16, 32, 16, false, true, false,", msl)
         self.assertNotIn("_mr_a", msl)
 
+    def test_accumulator_indexed(self) -> None:
+        """A register op's accumulator is indexed by constants only: filled
+        by an unrolled loop over its capacity and stored by an element loop
+        unrolled over its slots (16 of a 16 x 32 op on one SIMD group),
+        never by a loop over its iterator."""
+        args = affine_args(4, 32, 16, 64, 512)
+        msl = render_msl(affine_mm, args, register_config([16, 32, 64]))
+        self.assertIn(
+            "for (ushort _e = 0; _e < acc.get_capacity(); _e++) acc[_e] = 0.0f;", msl
+        )
+        self.assertIn("constexpr ushort _mpp_slots = ((512u + 32 - 1) / 32)", msl)
+        self.assertNotIn(".begin(); _it != ", msl)
+
     def test_op_shapes(self) -> None:
         """With two cooperative inputs MPP takes M, N and K of 16 or 32, one
         of them 32: a 16 x 16 tile takes a K of 32 and a 32-row tile ops 32
@@ -274,20 +294,203 @@ class TestRegisterCodegen(TestCase):
         self.assertIn("matmul2d_descriptor(32, 64, 16,", msl)
         self.assertRegex(msl, r"auto _mpp_a\d+ = tensor<device half")
 
-    def test_more_simdgroups_stage(self) -> None:
-        """A launch of two SIMD groups stages the weight through threadgroup
-        memory, as before: cooperative inputs need one SIMD group, and the
-        two share each tile, whether their threads split K or N."""
-        args = affine_args(4, 32, 16, 64, 256)
-        for block_sizes, threads in (
-            ([16, 32, 64], [4, 8, 2]),
-            ([16, 64, 64], [4, 16, 1]),
+    def test_grid(self) -> None:
+        """A launch of several SIMD groups splits a whole tile over them, each
+        running an op with two cooperative inputs over its sub-tile: every
+        thread stages a run of one row's K positions of the weight, its
+        masks true, into a tile of rows of N positions padded by 16 bytes
+        (4 floats); after a barrier each SIMD group builds x from its view
+        and the weight from the tile, and its sub-tile's origin offsets its
+        accumulator's elements.  The sub-tiles prefer 32 x 32, then the
+        most rows."""
+        for rows, block_sizes, threads, (am, an, ak) in (
+            # 2 SIMD groups, their threads splitting K: 16 x 16 sub-tiles.
+            (16, [16, 32, 64], [4, 8, 2], (16, 16, 32)),
+            (16, [16, 64, 64], [4, 16, 1], (16, 32, 16)),
+            (64, [64, 64, 64], [8, 16, 1], (32, 32, 16)),
+            # 32 x 16 sub-tiles over 16 x 32.
+            (32, [32, 64, 64], [8, 16, 1], (32, 16, 16)),
         ):
-            with self.subTest(threads=threads):
+            with self.subTest(block_sizes=block_sizes, threads=threads):
+                args = affine_args(4, 32, rows, 128, 256)
+                msl = render_msl(affine_mm, args, register_config(block_sizes, threads))
+                bn, bk = block_sizes[1:]
+                sn = bn // an
+                self.assertIn(
+                    f"matmul2d_descriptor({am}, {an}, {ak}, false, true, false,", msl
+                )
+                self.assertNotIn("execution_simdgroups<", msl)
+                self.assertIn(
+                    f"threadgroup float _mst_tile_float[{bn * (bk + 4)}];", msl
+                )
+                self.assertIn(f"constexpr int _mst0_ld = {bk + 4};", msl)
+                self.assertIn(f"const int _mst0_m0 = int(_frag_sg / {sn}) * {am};", msl)
+                self.assertIn(f"const int _mst0_n0 = int(_frag_sg % {sn}) * {an};", msl)
+                self.assertIn("uint _frag_sg [[simdgroup_index_in_threadgroup]]", msl)
+                loop = _k_loop(msl)
+                self.assertEqual(loop.count("threadgroup_barrier("), 2)
+                self.assertIn(
+                    "_mst_tile_float[_mst0_r * _mst0_ld + _mst0_k + 0] = ", loop
+                )
+                self.assertIn("auto mask_1 = true;", loop)
+                self.assertIn("auto mask_2 = true;", loop)
+                self.assertRegex(
+                    loop, r"_mr_b0\[0\] = _mst_tile_float\[\(_mst0_n0 \+ 0 \+ _mrl\d+\)"
+                )
+                self.assertIn("_mpp_op_0.run(_mr_a0, _mr_b0, acc_copy_0);", loop)
+                self.assertIn("int _e_n = (int)_md[0] + _mst0_n0;", msl)
+                self.assertIn("int _e_m = (int)_md[1] + _mst0_m0;", msl)
+                # The sub-tiles cover the tile: no element lies past it.
+                self.assertNotIn("if (_e_m >= ", msl)
+
+    def test_grid_tiles(self) -> None:
+        """The grid runs of one type share one tile, which counts against the
+        threadgroup memory: two accumulators' runs over [32, 64, 64] take one
+        tile of 64 x 68 floats.  Rows are padded only where every padded tile
+        fits: 128 x 64 floats and 128 x 128 halves fill 32 KB unpadded, and a
+        float tile beside a half one over 32 KB padded fits unpadded; a tile
+        past it even unpadded (128 x 128 floats) is refused before the
+        pipeline is built."""
+        x = torch.randn(32, 256).to(torch.float16)
+        y, z = torch.randn(256, 64), torch.randn(256, 64)
+        msl = render_msl(
+            two_acc_mm, (x, y, z), register_config([32, 64, 64], [8, 16, 1])
+        )
+        self.assertEqual(msl.count("threadgroup float _mst_tile_float[4352];"), 1)
+        self.assertEqual(
+            set(re.findall(r"_mst_tile_float\[_mst(\d)_r \*", msl)), {"0", "1"}
+        )
+        args = affine_args(4, 32, 32, 128, 256)
+        msl = render_msl(affine_mm, args, register_config([32, 128, 64], [8, 16, 1]))
+        self.assertIn("threadgroup float _mst_tile_float[8192];", msl)
+        self.assertIn("constexpr int _mst0_ld = 64;", msl)
+        args = affine_args(4, 32, 32, 256, 512)
+        msl = render_msl(
+            dequant_forms_mm,
+            (*args, "half"),
+            register_config([32, 128, 128], [8, 16, 1]),
+        )
+        self.assertIn("threadgroup half _mst_tile_half[16384];", msl)
+        self.assertIn("constexpr int _mst0_ld = 128;", msl)
+        self.assertEqual(
+            mpp_registers.grid_tiles({0: ("float", 64, 64), 1: ("half", 64, 64)}, 8192),
+            ({"float": 4096, "half": 4096}, {0: 64, 1: 64}, 32768),
+        )
+        self.assertEqual(
+            mpp_registers.grid_tiles({0: ("float", 64, 64)}, 0),
+            ({"float": 4352}, {0: 68}, 17408),
+        )
+        with self.assertRaisesRegex(
+            exc.BackendUnsupported, "grid runs' tiles need 65536 bytes"
+        ):
+            render_msl(affine_mm, args, register_config([32, 128, 128], [8, 16, 1]))
+
+    def test_grid_runtime_lanes(self) -> None:
+        """Where a layout doesn't factor (its coordinates read at run time), a
+        grid run's elements a lane doesn't hold read nothing and hold 0."""
+        args = affine_args(4, 32, 32, 128, 256)
+        with mock.patch.object(mpp_registers, "factor", lambda coords, d: None):
+            msl = render_msl(affine_mm, args, register_config([32, 64, 64], [8, 16, 1]))
+        self.assertRegex(
+            msl, r"if \(_mrl\d+_v0\) _mr_a0\[0\] = _mst0_x\[.*\]; else _mr_a0\[0\] = 0;"
+        )
+        self.assertRegex(
+            msl,
+            r"if \(_mrl\d+_v0\) _mr_b0\[0\] = _mst_tile_float\[.*\]; "
+            r"else _mr_b0\[0\] = 0;",
+        )
+
+    def test_grid_inner_tiled(self) -> None:
+        """M and N tiled in a loop of a one-program grid: the thread axes seen
+        at the accumulator aren't the launch's, so a launch of several SIMD
+        groups keeps the staged op."""
+        x = torch.randn(32, 128).to(torch.float16)
+        y = torch.randn(128, 64)
+        for block_sizes, threads in (
+            ([16, 32, 64], [2, 4, 4]),
+            ([32, 64, 32], [4, 8, 2]),
+        ):
+            with self.subTest(block_sizes=block_sizes, threads=threads):
+                msl = render_msl(
+                    inner_tiled_weight_mm, (x, y), register_config(block_sizes, threads)
+                )
+                self.assertNotIn("_mst_tile", msl)
+                self.assertIn("execution_simdgroups<", msl)
+
+    def test_grid_unread_x(self) -> None:
+        """A widened x the lanes may not read at the op (``registers`` unset,
+        as for a load of a tensor the kernel writes) keeps the staged op."""
+        args = affine_args(4, 32, 16, 128, 256)
+        config = register_config([16, 64, 64], [4, 16, 1])
+        self.assertIn("_mst_tile", render_msl(affine_mm, args, config))
+        with unread_x():
+            msl = render_msl(affine_mm, args, config)
+        self.assertNotIn("_mst_tile", msl)
+        self.assertIn("threadgroup float _mpp_tile", msl)
+
+    def test_grid_views(self) -> None:
+        """A grid run reads x's elements from the tensor unmasked, so each
+        read must lie inside it: a view of x 8 rows past its tile's offset, a
+        K loop whose begin is a run-time value, and one past x's K (64 of
+        128, or 1, a size-1 dim) keep the staged op."""
+        config = register_config([32, 64, 64], [8, 16, 1])
+        cases = [
+            (shifted_x_mm, (torch.randn(40, 128).half(), torch.randn(128, 64))),
+            (offset_k_mm, (torch.randn(32, 256).half(), torch.randn(256, 64), 64)),
+            (offset_k_mm, (torch.randn(32, 1).half(), torch.randn(128, 64), 0)),
+            (long_k_mm, (torch.randn(32, 64).half(), torch.randn(128, 64))),
+            (long_k_mm, (torch.randn(32, 1).half(), torch.randn(128, 64))),
+        ]
+        for kernel, args in cases:
+            with self.subTest(kernel=kernel.name, x=tuple(args[0].shape)):
+                msl = render_msl(kernel, args, config)
+                self.assertNotIn("_mst_tile", msl)
+                self.assertIn("execution_simdgroups<", msl)
+
+    def test_grid_bfloat(self) -> None:
+        """A bfloat x beside weights dequantized in bfloat takes a grid run:
+        the lanes read x as bfloat, and every thread rounds its float
+        weights into a bfloat tile."""
+        x, w, scales, biases = affine_args(4, 32, 32, 128, 512)
+        args = (x.to(torch.bfloat16), w, scales, biases, "bfloat")
+        config = register_config([32, 64, 64], [8, 8, 1])
+        msl = render_msl(dequant_forms_mm, args, config)
+        self.assertIn("threadgroup bfloat _mst_tile_bfloat[4608]", msl)
+        self.assertIn("const device bfloat* _mst0_x = x + ", msl)
+        self.assertIn("= helion_bf16_cast(static_cast<float>(", msl)
+        self.assertIn("cooperative_tensor<bfloat, bfloat, float>", msl)
+
+    def test_grid_all_or_none(self) -> None:
+        """Where one group stays on the staged op (a staged vector), the
+        kernel's other groups that stage an operand do too, whose tiles share
+        threadgroup memory with its own: configs its staged ops fit in, over
+        half of it each, still compile."""
+        x = torch.randn(64, 512).to(torch.float16)
+        y, z, v = torch.randn(512, 128), torch.randn(512, 128), torch.randn(4, 128)
+        for block_sizes in ([32, 64, 64], [32, 128, 64], [64, 64, 128]):
+            with self.subTest(block_sizes=block_sizes):
+                config = register_config(block_sizes, [8, 16, 1])
+                msl = render_msl(staged_apart_mm, (x, y, z, v), config)
+                self.assertNotIn("_mst_tile", msl)
+                self.assertIn("_mpp_vec", msl)
+
+    def test_grid_refusals(self) -> None:
+        """A launch of several SIMD groups stages the weight through
+        threadgroup memory for one op over the whole tile, as before, when a
+        tile is partial (12 rows of a 16-row tile; a K of 288 over tiles of
+        64) or no sub-tile fits two cooperative inputs (16 x 16 over 2 SIMD
+        groups)."""
+        for rows, k, block_sizes, threads in (
+            (12, 256, [16, 64, 64], [4, 16, 1]),
+            (16, 288, [16, 64, 64], [4, 16, 1]),
+            (16, 256, [16, 16, 64], [4, 4, 4]),
+        ):
+            with self.subTest(rows=rows, k=k, block_sizes=block_sizes):
+                args = affine_args(4, 32, rows, 128, k)
                 msl = render_msl(affine_mm, args, register_config(block_sizes, threads))
                 self.assertIn("threadgroup float _mpp_tile", msl)
-                self.assertNotIn("_mr_b", msl)
                 self.assertIn("execution_simdgroups<", msl)
+                self.assertNotIn("_mst0", msl)
 
     def test_operand_types(self) -> None:
         """A register operand exactly representable in half or bfloat takes
@@ -703,7 +906,7 @@ class TestRegisterSplit(TestCase):
         y = torch.randn(256, 32)
         config = register_config([16, 32, 32], num_warps=4)
         msl = render_msl(filled_mm, (x, y), config)
-        self.assertIn("*_it = (_frag_sg == 0 ? 0.5f : 0.0f);", msl)
+        self.assertIn("acc[_e] = (_frag_sg == 0 ? 0.5f : 0.0f);", msl)
         msl = render_msl(two_acc_mm, (x, y, torch.randn(256, 32)), config)
         self.assertEqual(msl.count("threadgroup_barrier("), 2)
         for line in (
@@ -722,7 +925,8 @@ class TestRegisterSplit(TestCase):
         Scalar layout or beside a staged row vector (both through
         threadgroup memory) and a combine over more threadgroup memory than
         there is (a 32x32 tile on 16 SIMD groups) keep one SIMD group's
-        register run; a tile whose threads span two SIMD groups stages."""
+        register run; a tile whose threads span two SIMD groups splits the
+        tile over them (``mpp_registers._grid_run``), not K."""
         x = torch.randn(16, 256).to(torch.float16)
         y = torch.randn(256, 32)
         affine = affine_args(4, 32, 32, 64, 1024)
@@ -746,7 +950,8 @@ class TestRegisterSplit(TestCase):
                 msl = render_msl(
                     kernel, args, register_config(block_sizes, threads, num_warps=16)
                 )
-                self.assertNotIn("_frag_sg", msl)
+                self.assertNotIn("offset_2 = _frag_sg", msl)
+                self.assertEqual("_mst_tile" in msl, name == "two simdgroups")
                 self.assertEqual(
                     msl,
                     render_msl(
@@ -756,7 +961,7 @@ class TestRegisterSplit(TestCase):
                     ),
                 )
                 self.assertIn(
-                    "threadgroup float _mpp_tile" if threads else "_mr_b", msl
+                    "threadgroup float _mst_tile_float" if threads else "_mr_b", msl
                 )
 
 

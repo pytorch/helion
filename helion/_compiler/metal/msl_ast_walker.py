@@ -32,6 +32,7 @@ from typing import TYPE_CHECKING
 from typing import Iterator
 
 from ... import exc
+from ._constants import SIMD_WIDTH
 from .fragment_mma import FRAGMENT_SLOT
 from .fragment_mma import EarlyLoad
 from .fragment_mma import emit_fragment_acc
@@ -51,6 +52,7 @@ from .mpp_matmul import FRAG_RUN
 from .mpp_matmul import REG_RUN
 from .mpp_registers import emit_register_combine
 from .mpp_registers import emit_register_run
+from .mpp_registers import grid_origins
 from .mpp_registers import register_atom
 from .mpp_registers import register_split_runs
 from .msl_expr import GLOBAL_SCOPE
@@ -138,8 +140,14 @@ class EmitState:
     #: type it converts the value to first, if any.
     put: str = "*_it"
     put_type: str | None = None
+    #: Each grid run's group to its tile's type, rows and K positions
+    #: (``mpp_registers._emit_grid``).
+    grid_runs: dict[int, tuple[str, int, int]] = dataclasses.field(default_factory=dict)
     #: Each register group's accumulator root to its op (``mpp_registers``).
     register_atoms: dict[str, Atom] = dataclasses.field(default_factory=dict)
+    #: Each accumulator root of a grid run (``mpp_registers._grid_run``) to
+    #: the names of its SIMD group's sub-tile's first row and column.
+    coop_grid: dict[str, tuple[str, str]] = dataclasses.field(default_factory=dict)
     #: Whether the kernel runs on the GPU here, which the register operands'
     #: layouts are then probed on (``coop_layout``).
     on_gpu: bool = False
@@ -148,8 +156,9 @@ class EmitState:
     #: them, and each op's operand's elements in terms of them.
     lane_names: dict[tuple[int, ...], str] = dataclasses.field(default_factory=dict)
     lane_decls: list[str] = dataclasses.field(default_factory=list)
-    #: The buffers the body views as MPP device tensors (``_coop_view``),
-    #: whose views take a ``device`` pointer.
+    #: The buffers the body reads through a ``device`` pointer: MPP device
+    #: tensors' views (``_coop_view``) and grid runs' staging reads
+    #: (``mpp_registers``).
     device_views: set[str] = dataclasses.field(default_factory=set)
     lane_facts: dict[str, Fact] = dataclasses.field(default_factory=dict)
     lanes: dict[tuple[Atom, str, bool], CoopLanes] = dataclasses.field(
@@ -383,7 +392,10 @@ def _emit_coop_acc(
         ast.literal_eval(a) for a in call.args[9:ACC_SEED]
     )
     seed = ast.literal_eval(call.args[ACC_SEED])
-    if (block_m, block_n) != (tm, tn):
+    sub_tiles = next((k.value for k in call.keywords if k.arg == "grid"), None)
+    # A grid run's op covers its sub-tile, and its sub-tiles the whole tile
+    # (``mpp_registers._grid_run``): none of its elements lies past the block.
+    if (block_m, block_n) != (tm, tn) and sub_tiles is None:
         state.coop_rounded.add(name)
     state.coop_tile[name] = (block_m, block_n)
     state.coop_dims[name] = (tm, tn)
@@ -402,6 +414,10 @@ def _emit_coop_acc(
         # An op on register operands (``mpp_registers``): one SIMD group's,
         # its destination typed by its cooperative and device inputs.
         state.register_atoms[name] = atom
+        if sub_tiles is not None:
+            state.coop_grid[name] = grid_origins(
+                state, gid, ast.literal_eval(sub_tiles), atom
+            )
         parts.extend(
             [
                 f"{pad}{atom.op_type()} _mpp_op_{gid};",
@@ -429,10 +445,22 @@ def _emit_coop_acc(
             # SIMD groups split its K loop (``mpp_registers.register_split``):
             # the others add their tiles to 0.
             value = f"({SIMDGROUP} == 0 ? {value} : 0.0f)"
-        parts.append(
-            f"{pad}for (auto _it = {name}.begin(); _it != {name}.end(); _it++) "
-            f"*_it = {value};"
-        )
+        if atom is not None:
+            # A register op's accumulator, indexed by constants only (as its
+            # element loops are, :func:`_unrolled_elements`): one loop over
+            # its iterator keeps it out of registers for the whole kernel.
+            parts += [
+                f"{pad}#pragma clang loop unroll(full)",
+                (
+                    f"{pad}for (ushort _e = 0; _e < {name}.get_capacity(); _e++) "
+                    f"{name}[_e] = {value};"
+                ),
+            ]
+        else:
+            parts.append(
+                f"{pad}for (auto _it = {name}.begin(); _it != {name}.end(); _it++) "
+                f"*_it = {value};"
+            )
     else:
         # The staged seed (``mpp_matmul``'s ``_mpp_coop``): every thread's
         # writes are visible before any element reads them, and every element
@@ -721,6 +749,7 @@ def _emit_for(
             state,
             lambda body, out, ind, st: _emit_stmts(body, out, indent=ind, state=st),
             functools.partial(_coop_view, views=state.device_views),
+            _ast_expr_to_msl,
         )
         return
 
@@ -747,7 +776,11 @@ def _emit_for(
             **(subs or {}),
             **{name: element for name, r in state.coop.items() if r == root},
         }
-        unroll = any(k.arg == "unroll" for k in it.keywords)
+        # A register op's accumulator is one SIMD group's: unrolled, its
+        # element loop indexes it by constants, which keeps it in registers.
+        unroll = (
+            any(k.arg == "unroll" for k in it.keywords) or root in state.register_atoms
+        )
         if root in state.coop_fold:
             # A fold's update reads its product's element at its own slot: the
             # two tensors hold the same element at each index
@@ -872,11 +905,15 @@ def _element_head(
     holds or it lies past a rounded block, else bind its row and column to
     ``_e_m`` and ``_e_n``.  A cooperative tensor's multidimensional index is
     (column, row)."""
+    m0 = n0 = ""
+    if root in state.coop_grid:
+        # A grid run's accumulator covers its SIMD group's sub-tile.
+        m0, n0 = (f" + {origin}" for origin in state.coop_grid[root])
     lines = [
         f"{pad}    if ({skip}) continue;",
         f"{pad}    auto _md = {coop}.get_multidimensional_index(_it);",
-        f"{pad}    int _e_n = (int)_md[0];",
-        f"{pad}    int _e_m = (int)_md[1];",
+        f"{pad}    int _e_n = (int)_md[0]{n0};",
+        f"{pad}    int _e_m = (int)_md[1]{m0};",
     ]
     if root in state.coop_rounded:
         block_m, block_n = state.coop_tile[root]
@@ -898,7 +935,9 @@ def _unrolled_elements(
     body: Callable[[int], list[str]],
 ) -> list[str]:
     """An element loop that runs once per iteration of an enclosing loop (an
-    accumulator's update), unrolled over a compile-time bound on the
+    accumulator's update), or any of a register op's accumulator, whose
+    tensor a loop over its iterator keeps out of registers for the whole
+    kernel, unrolled over a compile-time bound on the
     thread's element slots: the op's tile over the threadgroup's threads,
     at least ``_MIN_UNROLLED_ELEMENTS``.  Unrolled, every slot index is a
     constant, so each element stays in its register and the compiler hoists
@@ -910,6 +949,9 @@ def _unrolled_elements(
     reads a fold's product at it)."""
     tm, tn = state.coop_dims[root]
     threads = "(_TG_SIZE_X * _TG_SIZE_Y * _TG_SIZE_Z)"
+    if root in state.register_atoms:
+        # One SIMD group's op (``mpp_registers``).
+        threads = str(SIMD_WIDTH)
     share = f"(({tm * tn}u + {threads} - 1) / {threads})"
     least = f"{_MIN_UNROLLED_ELEMENTS}u"
     lines = [

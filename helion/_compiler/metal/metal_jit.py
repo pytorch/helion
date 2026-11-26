@@ -63,8 +63,10 @@ from .masked_branch import branch_masked_steps
 from .mpp_matmul import ACC
 from .mpp_matmul import REG_RUN
 from .mpp_matmul import RUN
+from .mpp_registers import GRID_TILE
 from .mpp_registers import LANE as REGISTER_LANE
 from .mpp_registers import REGISTER_LOWERING
+from .mpp_registers import grid_tiles
 from .msl_ast_walker import MASKED_LOAD
 from .msl_ast_walker import MASKED_LOAD_PREAMBLE
 from .msl_ast_walker import EmitState
@@ -347,9 +349,9 @@ class MSLKernel:
     prologue: tuple[str, ...]
     scratch: tuple[tuple[str, str, int], ...]
     body: tuple[str, ...]
-    #: The buffers the body views as MPP device tensors, whose views take a
-    #: ``device`` pointer (a runtime that binds small inputs in ``constant``
-    #: memory, as MLX does, cannot run them).
+    #: The buffers the body reads through a ``device`` pointer
+    #: (``EmitState.device_views``), which a runtime that binds small inputs
+    #: in ``constant`` memory, as MLX does, cannot run.
     device_views: frozenset[str]
 
     def render(self) -> str:
@@ -422,6 +424,7 @@ def _generate_msl_kernel(
     # ``mpp_registers``): the launch stacks one such layout per SIMD group
     # along z.
     split = _k_split(body_stmts)
+    grid = _grid_runs(body_stmts)
     layout = required_threads_per_threadgroup
     if layout is not None and split > 1:
         tx, ty, tz = layout
@@ -555,7 +558,7 @@ def _generate_msl_kernel(
         attributes.append(("uint", LANE, "thread_index_in_simdgroup"))
     if uses_registers:
         attributes.append(("uint", REGISTER_LANE, "thread_index_in_simdgroup"))
-    if split > 1:
+    if split > 1 or grid:
         # The same integer type as the other position attributes.
         attributes.append(("uint", SIMDGROUP, "simdgroup_index_in_threadgroup"))
     preamble = msl_parts
@@ -612,8 +615,23 @@ def _generate_msl_kernel(
 
     body: list[str] = []
     _emit_stmts(body_stmts, body, indent=4, state=state)
-    # The lane bases of the register operands' layouts.
-    body[:0] = [f"    {line}" for line in state.lane_decls]
+    # The grid runs' tiles share the threadgroup memory with the planned
+    # buffers; the tiles' leading dimensions and the lane bases of the
+    # register operands' layouts open the body.
+    planned = sum(MSL_SCALAR_BYTES[d] * n for _, d, n in threadgroup_buffers)
+    tiles, lds, used = grid_tiles(state.grid_runs, planned)
+    if tiles and used > MAX_THREADGROUP_MEMORY_BYTES:
+        raise exc.BackendUnsupported(
+            "metal",
+            f"MPP staging and grid runs' tiles need {used} bytes of threadgroup "
+            f"memory (max {MAX_THREADGROUP_MEMORY_BYTES})",
+        )
+    scratch += [(t, f"{GRID_TILE}_{t}", n) for t, n in tiles.items()]
+    decls = [
+        *(f"constexpr int _mst{gid}_ld = {ld};" for gid, ld in lds.items()),
+        *state.lane_decls,
+    ]
+    body[:0] = [f"    {line}" for line in decls]
     if state.split_slots:
         # ``fragment_mma._split`` and ``mpp_registers.register_split`` kept
         # it within the threadgroup memory.
@@ -689,6 +707,19 @@ def _matmul_kinds(body_stmts: list[ast.stmt]) -> tuple[bool, bool, bool]:
             fragments |= func.id == ACC and is_fragment_acc(node)
             registers |= func.id == REG_RUN
     return markers and not fragments, fragments, registers
+
+
+def _grid_runs(body_stmts: list[ast.stmt]) -> bool:
+    """Whether the body has register runs whose SIMD groups split the tile
+    (``mpp_registers._grid_run``), the ``grid`` keyword of their ``RUN``
+    calls, as the body reads before elementize."""
+    return any(
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == RUN
+        and any(k.arg == "grid" for k in node.keywords)
+        for node in ast.walk(ast.Module(body=body_stmts, type_ignores=[]))
+    )
 
 
 def _k_split(body_stmts: list[ast.stmt]) -> int:
