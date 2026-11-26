@@ -32,6 +32,7 @@ from .state import cute_codegen_state
 from .state import cute_env_state
 from .tensor_layout_relations import TensorLayoutRelation
 from .tensor_layout_relations import prove_tensor_layout_relations
+from .thread_block_projection import literal_launch_block
 
 if TYPE_CHECKING:
     from collections.abc import Collection
@@ -40,41 +41,6 @@ if TYPE_CHECKING:
 
     from ..device_function import Argument
     from ..device_function import DeviceFunction
-
-
-def _launch_block(df: DeviceFunction) -> tuple[int, int, int] | None:
-    """Read the emitted launcher; strategy x/y order is not authoritative."""
-    calls = [
-        node
-        for statement in df.codegen.host_statements
-        for node in ast.walk(statement)
-        if isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Name)
-        and node.func.id == "_launcher"
-    ]
-    if len(calls) != 1:
-        return None
-    call = calls[0]
-    if (
-        not call.args
-        or not isinstance(call.args[0], ast.Name)
-        or call.args[0].id != df.name
-    ):
-        return None
-    block = next((kw.value for kw in call.keywords if kw.arg == "block"), None)
-    if (
-        not isinstance(block, ast.Tuple)
-        or len(block.elts) != 3
-        or any(
-            not isinstance(item, ast.Constant) or type(item.value) is not int
-            for item in block.elts
-        )
-    ):
-        return None
-    return cast(
-        "tuple[int, int, int]",
-        tuple(cast("ast.Constant", item).value for item in block.elts),
-    )
 
 
 @dataclass
@@ -113,7 +79,7 @@ class BoundedCacheRequest:
             or any(isinstance(arg, TensorDescriptorArg) for arg in arguments)
         ):
             return body
-        launch_block = _launch_block(df)
+        launch_block = literal_launch_block(df.codegen.host_statements, df.name)
         if launch_block is None:
             return body
         integer_names = {

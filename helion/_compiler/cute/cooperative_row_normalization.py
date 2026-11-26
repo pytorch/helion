@@ -25,6 +25,7 @@ from ._ast_pass_utils import parse_expr
 from ._ast_pass_utils import phase_barrier_call
 from ._ast_pass_utils import same_expr
 from .active_phase_joins import participants
+from .active_phase_joins import static_phase_bound
 from .autotune.config_keys import ORDERED_COLUMN_PAIRS_KEY
 from .autotune.config_keys import PHASE_PARTICIPATION_KEY
 from .autotune.config_keys import STAGED_GRID_KEY
@@ -209,7 +210,7 @@ def _require(ok: object, message: str) -> None:
 
 def _dispatch(loop: ast.For, tasks: int) -> tuple[list[ast.stmt], str, int] | None:
     """The verified interleaved emitter assigns a contiguous interval of virtual PIDs."""
-    if participants([loop]) != tasks or len(loop.body) != 2 or loop.orelse:
+    if len(loop.body) != 2 or loop.orelse:
         return None
     pid, guard = loop.body
     if not (
@@ -221,19 +222,25 @@ def _dispatch(loop: ast.For, tasks: int) -> tuple[list[ast.stmt], str, int] | No
         and len(guard.test.values) == 2
         and all(isinstance(x, ast.Pass) for x in guard.orelse)
         and isinstance(first := guard.test.values[0], ast.Compare)
-        and isinstance(first.comparators[0], ast.Constant)
-        and type(base := first.comparators[0].value) is int
+        and isinstance(second := guard.test.values[1], ast.Compare)
+        and len(first.comparators) == len(second.comparators) == 1
+        and (base := static_phase_bound(first.comparators[0])) is not None
+        and static_phase_bound(second.comparators[0]) == base + tasks
         and isinstance(loop.target, ast.Name)
-        and same_expr(
-            guard.test, parse_expr(f"{name} >= {base} and {name} < {base + tasks}")
-        )
+    ):
+        return None
+    lo, hi = ast.unparse(first.comparators[0]), ast.unparse(second.comparators[0])
+    if not (
+        same_expr(guard.test, parse_expr(f"{name} >= ({lo}) and {name} < ({hi})"))
         and same_expr(
             pid.value,
             parse_expr(
-                f"{base} + (cutlass.Int32(cute.arch.block_idx()[0]) + {loop.target.id} * {NUM_SM_VAR})"
+                f"({lo}) + (cutlass.Int32(cute.arch.block_idx()[0]) + {loop.target.id} * {NUM_SM_VAR})"
             ),
         )
     ):
+        return None
+    if participants([loop]) != tasks:
         return None
     return guard.body, name, base
 

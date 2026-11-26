@@ -408,6 +408,16 @@ def register_seed_facts(
                 for site in sites
                 if site.invariant_rows
             }
+            from ...early_indexed_input import immutable_input
+
+            early = [
+                s.row_axis
+                for s in sites
+                if immutable_input(env, device_ir, s, allow_unbound=True)
+            ]
+            env.config_spec.cute_early_indexed_axis = (
+                early[0] if len(early) == 1 else None
+            )
             env.config_spec.cute_indexed_row_epilogue_axes = tuple(
                 (
                     site.row_axis,
@@ -420,8 +430,22 @@ def register_seed_facts(
             )
     env.config_spec.cute_column_sum_structure = has_column_sum_structure(env, device_ir)
     env.config_spec.cute_ordered_column_sum_roots = column_sum_roots(env, device_ir)
+    from ...analysis.selection_handoff import match_selection_handoff
+    from ...analysis.selection_handoff import selection_structure
     from ...packed_row_publication import possible_row_rms
 
+    env.config_spec.cute_selection_handoff_structure = selection_structure(device_ir)
+    if (
+        env.config_spec.cute_selection_handoff_structure
+        and device_ir.host_function is not None
+    ):
+        with device_ir.host_function:
+            pair = match_selection_handoff(env, device_ir)
+            if pair is not None:
+                env.config_spec.cute_selection_handoff_roots = (
+                    pair.producer,
+                    pair.consumer,
+                )
     env.config_spec.cute_packed_publication_pattern = possible_row_rms(device_ir)
     env.config_spec.cute_single_row_publication_roots = publication_roots(
         env, device_ir
@@ -430,6 +454,16 @@ def register_seed_facts(
         root: (fact.row_id, fact.k_id, fact.length, fact.reductions)
         for root, fact in row_sum_roots(env, device_ir).items()
     }
+    from ...spare_row_prefetch import matrix_for_row
+
+    witnessed = [
+        root
+        for root in env.config_spec.cute_warp_row_reduction_roots
+        if matrix_for_row(env, device_ir, root, allow_unbound=True) is not None
+    ]
+    env.config_spec.cute_spare_row_prefetch_root = (
+        witnessed[0] if len(witnessed) == 1 else None
+    )
     from ...cooperative_row_normalization import terminal_column
 
     env.config_spec.cute_normalizable_column = terminal_column(
@@ -454,6 +488,7 @@ def postprocess_seed_configs(
     from .cute_fragment_topk_network import KEY as NETWORK_KEY
     from .cute_fragment_topk_network import active_network_roots
     from .cute_row_publication import add_publication_seeds
+    from .cute_staged_indexed_rows import add_direct_packet_seed
     from .cute_staged_indexed_rows import add_indexed_row_seed
     from .cute_warp_row_partition import add_singleton_row_seed
     from .cute_warp_row_partition import insert_warp_row_seed
@@ -645,7 +680,10 @@ def postprocess_seed_configs(
         # carriers or introduce a top-k dependency into tail-peel coverage.
         configs.append(derived_epilogue)
     from ...cooperative_row_normalization import add_seed as add_normalization_seed
+    from ...early_indexed_input import add_seed as add_early_input_seed
     from ...ordered_column_sum import add_column_seed
+    from ...selection_handoff import add_seed as add_selection_seed
+    from ...warp_row_unroll import add_unrolled_row_seed
     from ..staged_projection_grid import add_staged_grid_seeds
 
     staged = add_column_seed(
@@ -669,12 +707,20 @@ def postprocess_seed_configs(
                     ],
                 )
                 break
+    staged = add_early_input_seed(env.config_spec, staged)
+    staged = add_unrolled_row_seed(env.config_spec, staged)
+    staged = add_direct_packet_seed(staged)
+    from ...spare_row_prefetch import add_seed as add_spare_row_seed
+
+    configs = add_spare_row_seed(
+        env, device_ir, add_selection_seed(env, device_ir, staged)
+    )
     if grid_carrier is not None:
-        staged.append(
+        configs.append(
             Config.from_dict(deepcopy(grid_carrier.config) | {GRID_INIT_KEY: True})
         )
         env.config_spec.autotuner_heuristics.append("in_kernel_grid_init")
-    return staged
+    return configs
 
 
 def _has_vector_lanes(seed: Config) -> bool:

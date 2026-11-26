@@ -29,7 +29,11 @@ from ._ast_pass_utils import call_path
 from ._ast_pass_utils import names_read
 from ._ast_pass_utils import parse_expr
 from ._ast_pass_utils import same_expr
+from .autotune.config_keys import SPARE_ROW_PREFETCH_KEY
+from .autotune.config_keys import UNROLL_WARP_ROWS_KEY
 from .row_carry_terms import empty_if
+from .warp_row_unroll import WarpRowUnroll
+from .warp_row_unroll import bounded_row_sweeps
 
 if TYPE_CHECKING:
     from ..device_function import DeviceFunction
@@ -221,6 +225,7 @@ def pure_row_expression(node: ast.AST, inputs: set[str]) -> bool:
 
 @dataclass
 class RowSweep:
+    outer: ast.For
     inner: ast.For
     index: ast.Assign
     finalize: ast.Call
@@ -317,7 +322,7 @@ def prove_row_sweep(
         ):
             return None
         defined.add(assigned_name(stmt))
-    return RowSweep(inner, index, finalize)
+    return RowSweep(outer, inner, index, finalize)
 
 
 @dataclass(frozen=True)
@@ -721,11 +726,31 @@ def partition_row_sums(
         sw.finalize.keywords[0].value = ast.Constant(WARP)
     state = fn.cute_state.lanes
     if single:
+        if fn.config.get(UNROLL_WARP_ROWS_KEY) is True and bounded_row_sweeps(
+            k, reduction._loop_block_size, len(specs)
+        ):
+            # Keep the two rolled K iterators visible to ordinary reload
+            # fusion; the later pass unrolls these precise loops in place.
+            state.pending_warp_row_unrolls.extend(
+                WarpRowUnroll.record(sw.outer, sw.inner, k, reduction._loop_block_size)
+                for sw in specs
+            )
         assert isinstance(terminal, ast.stmt)
         leader = empty_if(f"{actual_lane} == 0")
         leader.body = [terminal]
         warp = empty_if("cute.arch.warp_idx() == 0")
         warp.body = [*cast("list[ast.stmt]", body[:-1]), leader]
+        if fn.config.get(SPARE_ROW_PREFETCH_KEY):
+            from .spare_row_prefetch import mark_proved_warp
+
+            mark_proved_warp(
+                fn,
+                cg.host_function.device_ir,
+                root.graph_id,
+                warp,
+                row_index,
+                reduction.index_var(kid),
+            )
         body[:] = [warp]
         state.has_singleton_warp_rows = True
         return
@@ -743,6 +768,10 @@ def partition_row_sums(
 def validate_row_launch(fn: DeviceFunction, dims: tuple[int, int, int] | None) -> None:
     """The emitted partition and all its peers must actually share this launch."""
     state = fn.cute_state.lanes
+    if fn.config.get(UNROLL_WARP_ROWS_KEY) is True and not state.unrolled_warp_row:
+        raise exc.InvalidConfig(
+            f"{UNROLL_WARP_ROWS_KEY} requires a proved bounded scalar warp row"
+        )
     if state.has_singleton_warp_rows:
         launch = state.launch_block
         if (

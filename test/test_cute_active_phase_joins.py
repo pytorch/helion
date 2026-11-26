@@ -35,6 +35,24 @@ def test_union_and_exact_interleaved_coverage() -> None:
     assert participants(region) == 64
 
 
+def test_wide_prefix_requires_the_exact_bounded_interleaved_trip() -> None:
+    loop = _phase(81, 17)
+    diff = "(cutlass.Int64(17) + cutlass.Int64(64) - cutlass.Int64(17))"
+    trips = f"{diff} // _NUM_SM + cutlass.Int32(cutlass.Int32(cute.arch.block_idx()[0]) < {diff} % _NUM_SM)"
+    for start in ("", "cutlass.Int64(0), "):
+        valid = f"range({start}cutlass.Int64({trips}))"
+        loop.iter = ast.parse(valid, mode="eval").body
+        assert participants([loop]) == 64
+        for bad in (
+            valid.replace("<", "<="),
+            valid.replace("// _NUM_SM", "// 3"),
+            valid.replace("Int64(64)", "Int64(runtime)"),
+            valid.replace("Int64(64)", "Int64(2147483647)"),
+        ):
+            loop.iter = ast.parse(bad, mode="eval").body
+            assert participants([loop]) is None
+
+
 def test_unknown_effects_and_changed_iteration_keep_full_grid() -> None:
     body = [_phase(8, 4)]
     assert participants([*body, *ast.parse("tmp = arg.iterator.load()").body]) is None

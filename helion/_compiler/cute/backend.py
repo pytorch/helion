@@ -2842,6 +2842,8 @@ class CuteBackend(Backend):
         ctx: DeviceBodyContext,
     ) -> list[ast.stmt]:
         from ..uint64_grid import narrow_uint64_grid_uses
+        from .autotune.config_keys import EARLY_INDEXED_INPUT_KEY
+        from .autotune.config_keys import SPARE_ROW_PREFETCH_KEY
         from .fallback_cluster import outline_fallback_cluster_bodies
         from .passes import launch_attributes
         from .passes import pdl
@@ -2882,10 +2884,23 @@ class CuteBackend(Backend):
             from .cooperative_row_normalization import install
 
             install(fn, fn_def)
+        if fn.config.get(EARLY_INDEXED_INPUT_KEY):
+            from .early_indexed_input import install as install_early_input
+
+            install_early_input(fn, fn_def)
         # One body per cluster shape sharing that shared memory
         # (``tcgen05_fallback_cluster``).
         outline_fallback_cluster_bodies(fn, fn_def, prefix)
         launch_attributes.project_launch_block(fn)
+        if fn.config.get("cute_cooperative_selection_merge"):
+            from .selection_handoff import install as install_selection_handoff
+
+            install_selection_handoff(fn, fn_def)
+            check_smem_budget(fn_def, ctx.constexpr_values, fn.pid)
+        if fn.config.get(SPARE_ROW_PREFETCH_KEY):
+            from .spare_row_prefetch import install as install_spare_row_prefetch
+
+            install_spare_row_prefetch(fn, fn_def)
         if (staged_block := fn.cute_state.staged_indexed_block) is not None:
             from .thread_block_projection import literal_launch_block
 

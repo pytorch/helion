@@ -364,6 +364,10 @@ class Config(Mapping[str, object]):
                 an argmax). Integer and boolean values that do not depend on
                 such arithmetic, masks drawn from Philox words included, do
                 not change.
+            cute_spare_warp_row_prefetch: On SM100, allow idle warps in a
+                cooperative CTA to prefetch an aligned, contiguous BF16 matrix
+                row into L2 while the first warp reduces it. The row must be
+                immutable and fully in bounds. Off when omitted.
             cute_unpadded_rows: Run a persistent reduction row whose static
                 length is not a power of two unpadded and unmasked when the
                 config gives it a whole number of warps that one vector per

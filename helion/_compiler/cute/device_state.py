@@ -777,8 +777,8 @@ class CuteDeviceFunctionState:
         self.flash = CuteFlashState()
         self.lanes = CuteLaneState()
         self.root_plans = CuteRootPlans()
-        self.installed_staged_roots: set[int] = set()
         self.staged_indexed_block: tuple[int, int, int] | None = None
+        self.installed_staged_roots: set[int] = set()
         # Kernel-wide per-node lowering facts.
         self.explicit_rng_seed_exprs: set[str] = set()
         self.uniform_comparison_marker: str | None = None
