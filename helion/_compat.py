@@ -837,6 +837,25 @@ def torch_uses_template_producer_fusion() -> bool:
     )
 
 
+def supports_inductor_flex_attention_backends() -> bool:
+    """Whether Inductor lets an ``InductorChoices`` contributor lower a whole
+    flex_attention call, the hooks ``helion.flex_attention`` registers with:
+    ``lower_flex_attention`` / ``lower_flex_attention_backward``, claimed
+    ``BACKEND`` names (``flex_attention_backends``) and a cache key for
+    flex_attention graphs only (``flex_attention_cache_key``)."""
+    from torch._inductor import choices
+
+    return all(
+        hasattr(choices.InductorChoices, name)
+        for name in (
+            "lower_flex_attention",
+            "lower_flex_attention_backward",
+            "flex_attention_backends",
+            "flex_attention_cache_key",
+        )
+    )
+
+
 @functools.cache
 def supports_torch_compile_template_lowering() -> bool:
     """Check whether Inductor can lower Helion's kernel HOP as a template.

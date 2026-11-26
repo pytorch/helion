@@ -294,6 +294,19 @@ def test_recorded_shard_durations_name_existing_test_modules() -> None:
     assert all(seconds >= 0 for seconds in durations.values())
 
 
+def test_own_job_modules_are_ignored_by_the_cute_shards() -> None:
+    # A module CI runs in a job of its own (matrix "test-path") is ignored by
+    # the CuTe shards in test.yml, and scripts/shard_durations.py leaves it
+    # out of the recorded durations.
+    root = Path(__file__).resolve().parents[1]
+    script = runpy.run_path(str(root / "scripts" / "shard_durations.py"))
+    test_paths = script["own_job_modules"]()
+    assert test_paths
+    workflow = (root / ".github" / "workflows" / "test.yml").read_text()
+    assert all(f"--ignore={path}" in workflow for path in test_paths)
+    assert not test_paths & set(load_durations())
+
+
 @pytest.mark.parametrize("explicit_output", [False, True])
 def test_shard_duration_script_uses_its_checkout(
     tmp_path: Path,
@@ -307,10 +320,19 @@ def test_shard_duration_script_uses_its_checkout(
     shutil.copyfile(
         Path(__file__).resolve().parents[1] / "scripts" / script.name, script
     )
-    for name in ("test_kept.py", "test_small.py", "test_measured_zero.py"):
+    for name in (
+        "test_kept.py",
+        "test_small.py",
+        "test_measured_zero.py",
+        "test_cute_flex_attention_backend.py",  # CI runs it in its own job
+    ):
         (checkout / "test" / name).touch()
     (checkout / "test" / "test_unreported.py").touch()
     (checkout / "test" / "test_legacy_zero.py").touch()
+    (checkout / ".github").mkdir()
+    (checkout / ".github" / "matrix.json").write_text(
+        '{"include": [{"test-path": "test/test_cute_flex_attention_backend.py"}]}'
+    )
 
     # The helper is imported from another checkout. Redirect its duration path
     # to a sentinel so the regression cannot overwrite that checkout's real file.
@@ -335,6 +357,8 @@ def test_shard_duration_script_uses_its_checkout(
         '<testsuite><testcase classname="test.test_kept.TestKept" time="3.5"/>'
         '<testcase classname="test.test_small.TestSmall" time="0.004"/>'
         '<testcase classname="test.test_measured_zero.TestZero" time="0.0"/>'
+        '<testcase classname="test.test_cute_flex_attention_backend.TestFlex" '
+        'time="9.0"/>'
         "</testsuite>"
     )
     args = [str(report)]
@@ -346,6 +370,7 @@ def test_shard_duration_script_uses_its_checkout(
         "test/test_kept.py": 3.5,
         "test/test_small.py": 0.004,
         "test/test_measured_zero.py": 0.0,
+        "test/test_cute_flex_attention_backend.py": 9.0,
     }
     assert namespace["main"](args) == 0
     assert json.loads(output.read_text()) == {

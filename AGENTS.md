@@ -244,6 +244,9 @@ tests and parametrization grids, so new tests must follow these rules:
   `cuda`-marked tests: marker deselection runs before sharding. Do not add zero
   placeholders or import CPU-only or slow-run durations. After deleting or
   renaming a test module, run the script without reports to drop its entry.
+  Modules CI runs in a job of their own (a `"test-path"` entry in
+  `.github/matrix.json`, which the CuTe shards `--ignore` in `test.yml`) stay
+  out of the file; the script drops them from its reports.
 
 ### PyTest Debugging Tips
 

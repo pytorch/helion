@@ -43,6 +43,7 @@ exceptions
 autotuner
 runtime
 backend_api
+flex_attention
 ```
 
 ## Quick Reference

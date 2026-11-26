@@ -439,10 +439,21 @@ jobs:
             # test/conftest.py sizes the workers to the CPUs for this lane.
             export HELION_TEST_LANE=cpu
             PARALLEL="-n auto"
+          elif [[ -n "${{ matrix.test-path }}" ]]; then
+            # A job of its own for one module (matrix "test-path"):
+            # helion.flex_attention's backend tests, which the CuTe shards
+            # below leave out.
+            TEST_PATH="${{ matrix.test-path }}"
+            EXTRA_FLAGS=""
+            if [[ "$HELION_BACKEND" == "cute" ]]; then MARK="not cpu_only or cuda"; fi
           else
             TEST_PATH="."
             EXTRA_FLAGS="--ignore=test/test_examples_dist.py"
-            if [[ "$HELION_BACKEND" == "cute" ]]; then MARK="not cpu_only or cuda"; fi
+            if [[ "$HELION_BACKEND" == "cute" ]]; then
+              MARK="not cpu_only or cuda"
+              # Runs in the b200-flex-attention job.
+              EXTRA_FLAGS="$EXTRA_FLAGS --ignore=test/test_cute_flex_attention_backend.py"
+            fi
           fi
           # Pull requests skip the slow tier (fresh-interpreter replays, real
           # autotune searches); pushes to main run it.
@@ -466,7 +477,7 @@ jobs:
           fi
           # B200 containers have 28 CPUs and most tests are CPU-bound compilation
           # (the GPU sits mostly idle), so eight workers roughly halve the suite.
-          if [[ "$PARALLEL" != "-n0" && "${{ matrix.alias }}" == "b200" ]]; then
+          if [[ "$PARALLEL" != "-n0" && "${{ matrix.alias }}" == b200* ]]; then
             PARALLEL="-n8"
           fi
           # For distributed tests, fail if any test is skipped, failed, or has an error
