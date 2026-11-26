@@ -394,6 +394,13 @@ def _pure_boolean_guard(
         return node.id in boolean_names
     if isinstance(node, ast.Compare):
         return scalar(node)
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.BitAnd):
+        # A shifted tile's two bounds are Boolean even though their
+        # intersection is spelled with a bitwise operator.
+        return all(
+            _pure_boolean_guard(part, boolean_names=boolean_names)
+            for part in (node.left, node.right)
+        )
     if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.Not):
         return scalar(node)
     if isinstance(node, ast.BoolOp):

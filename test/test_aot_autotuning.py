@@ -7,6 +7,8 @@ Tests for the collect/measure/evaluate workflow.
 
 from __future__ import annotations
 
+import ast
+import builtins
 from concurrent.futures import ThreadPoolExecutor
 import csv
 from functools import partial
@@ -14,10 +16,13 @@ import importlib.util
 import inspect
 import json
 import os
+from pathlib import Path
+import runpy
 import struct
 import sys
 import threading
 import time
+from types import ModuleType
 from types import SimpleNamespace
 from typing import TYPE_CHECKING
 from typing import Any
@@ -38,6 +43,8 @@ from helion._testing import cpu_render_target
 from helion._testing import onlyBackends
 from helion._testing import skipIfRefEager
 from helion._testing.cute_codegen import cpu_bind
+from helion._testing.cute_codegen import load_generated_module
+from helion._testing.triton_codegen import interpret_triton_kernel
 from helion.autotuner import BooleanFragment
 from helion.autotuner import EnumFragment
 import helion.autotuner.aot_cache as aot_cache_module
@@ -53,6 +60,7 @@ from helion.autotuner.aot_compile import generate_standalone_file
 from helion.autotuner.aot_kernel import aot_key
 from helion.autotuner.aot_kernel import extract_shape_features
 from helion.autotuner.base_cache import AutotuneCacheBase
+from helion.autotuner.base_search import BaseSearch
 from helion.autotuner.benchmark_provider import LocalBenchmarkProvider
 from helion.autotuner.finite_search import FiniteSearch
 from helion.autotuner.heuristic_generator import PerformanceTarget
@@ -65,11 +73,11 @@ from helion.runtime.config import Config
 from helion.runtime.kernel import _constexpr_key
 from helion.runtime.settings import Settings
 from helion.runtime.settings import default_autotuner_fn
+from helion.runtime.structural_policy import StructuralPolicyError
 
 pytestmark = pytest.mark.cpu_only
 
-if TYPE_CHECKING:
-    from pathlib import Path
+_STANDALONE_KEY_LIMIT = 3
 
 
 def test_future_cuda_arch_does_not_load_sm103_aot_fallback(tmp_path: Path) -> None:
@@ -980,6 +988,35 @@ def test_aot_cache_canonicalizes_defaults_for_compile_get(
     assert selected_args == [(tensor, (1, 2))]
 
 
+def test_standalone_helper_name_in_literal_is_not_a_dependency(tmp_path: Path) -> None:
+    source = 'def label(x):\n    return "helion_triton_helpers.device_error"\n'
+    path = generate_standalone_file("label", [source], "", tmp_path)
+    module = runpy.run_path(str(path))
+    assert module["label"](None) == "helion_triton_helpers.device_error"
+    assert "helion_triton_helpers" not in module
+
+
+@onlyBackends(["triton"])
+def test_standalone_resolves_device_helpers_in_their_own_scope(tmp_path: Path) -> None:
+    source = (
+        "def length(helion_triton_helpers):\n"
+        "    return helion_triton_helpers.size(0)\n"
+        "def nested(helion_triton_helpers):\n"
+        "    return lambda: helion_triton_helpers.size(0)\n"
+        "def check():\n"
+        "    return helion_triton_helpers.device_error('overflow')\n"
+    )
+    path = generate_standalone_file("length", [source], "", tmp_path)
+    module = runpy.run_path(str(path))
+    x = torch.empty(7)
+    assert module["length"](x) == module["nested"](x)() == 7
+    assert isinstance(module["helion_triton_helpers"], ModuleType)
+    with pytest.raises(ValueError, match="unsupported standalone Triton helpers.*size"):
+        generate_standalone_file(
+            "length", [source.replace(".device_error(", ".size(")], "", tmp_path
+        )
+
+
 def test_standalone_preserves_cute_launcher_import(tmp_path: Path) -> None:
     output = generate_standalone_file(
         "demo",
@@ -1044,9 +1081,488 @@ def test_dynamic_standalone_rejects_tensor_descriptors_before_codegen(
         cache._maybe_run_compile()
     assert len(normalized) == 1
     assert codegen_calls == []
-    assert "demo" not in AOTAutotuneCache._compiled_kernels
+    assert not AOTAutotuneCache._compiled_kernels
     assert not (tmp_path / "source_demo_standalone.py").exists()
     AOTAutotuneCache.clear_caches()
+
+
+@onlyBackends(["triton"])
+@pytest.mark.parametrize(
+    "source_kind",
+    [
+        "tensor-size",
+        "aliased-tensor-size",
+        "integer",
+        "tuple-item",
+        "attribute",
+        "constexpr",
+    ],
+)
+def test_dynamic_standalone_checks_baked_inputs(
+    tmp_path: Path, source_kind: str
+) -> None:
+    class Pair(NamedTuple):
+        first: int
+        second: int
+
+    scalar = source_kind not in ("tensor-size", "aliased-tensor-size")
+    aliased = source_kind == "aliased-tensor-size"
+    source = tmp_path / "source.py"
+    expression = {
+        "integer": "hl.specialize(x)",
+        "tuple-item": "hl.specialize(x[0])",
+        "attribute": "hl.specialize(x.first)",
+        "constexpr": "x",
+    }.get(source_kind, "hl.specialize(x.size(0))")
+    source.write_text(
+        "import helion.language as hl\n"
+        f"def fixed(owner, x{': hl.constexpr' if source_kind == 'constexpr' else ''}, out):\n"
+        f"    n = {expression}\n"
+        "    for _ in hl.grid(1):\n"
+        "        out[0] = n\n"
+    )
+    kernel = helion.kernel(load_generated_module(source).fixed, static_shapes=False)
+    n = 7 if scalar or aliased else 2**31 + 7
+    out = torch.full((1,), -1, dtype=torch.int64)
+
+    def input_value(n):
+        if source_kind == "tuple-item":
+            return (n, 2)
+        if source_kind == "attribute":
+            return Pair(n, 2)
+        return n if scalar else torch.empty(n, 0)
+
+    value = input_value(n)
+    owner = value if aliased else torch.empty(3)
+    args = (owner, value, out)
+    model = tmp_path / "model.py"
+    model.write_text("CONFIGS = [{}]\n")
+    with (
+        cpu_render_target(),
+        patch(
+            "helion.autotuner.aot_cache.get_hardware_info",
+            return_value=HardwareInfo(
+                device_kind="cuda",
+                hardware_name="CPU proof",
+                runtime_version="13.0",
+                compute_capability="sm100",
+            ),
+        ),
+    ):
+        cache = AOTAutotuneCache(BaseSearch(cpu_bind(kernel, args), args))
+        with patch.object(cache, "_find_heuristic_file", return_value=model):
+            cache._maybe_run_compile()
+    run = load_generated_module(tmp_path / "source_fixed_standalone.py").fixed
+    run(*args, _launcher=interpret_triton_kernel)
+    assert out.item() == n
+    if aliased:
+        # The two positions may separate when the substituted dimension still agrees.
+        run(owner, torch.empty(n, 0), out, _launcher=interpret_triton_kernel)
+        assert out.item() == n
+    hold = Mock()
+    mismatches = (
+        (input_value(15), input_value(7.0))
+        if scalar
+        else (torch.empty(15 if aliased else 7, 0),)
+    )
+    for mismatch in mismatches:
+        with pytest.raises(ValueError, match="specialized input value"):
+            run(owner=owner, x=mismatch, out=out, _launcher=hold)
+    hold.assert_not_called()
+
+
+@onlyBackends(["triton"])
+@pytest.mark.parametrize(
+    ("value", "different"),
+    [
+        (None, 17),
+        (7, 17),
+        (0.0, -0.0),
+        tuple(
+            struct.unpack("!d", bytes.fromhex(payload))[0]
+            for payload in ("7ff8000000000001", "7ff8000000000002")
+        ),
+        (torch.Size((4, 8)), torch.Size((4, 9))),
+        pytest.param(range(3), None, id="unsupported-range"),
+    ],
+)
+def test_standalone_constexpr_observes_the_bound_literal(
+    tmp_path: Path, value, different
+):
+    source = tmp_path / "source.py"
+    source.write_text(
+        "import helion.language as hl\n"
+        "def fixed(out, value: hl.constexpr):\n"
+        "    for i in hl.grid(1):\n"
+        "        out[i] = 23\n"
+    )
+    kernel = helion.kernel(load_generated_module(source).fixed, static_shapes=False)
+    out = torch.zeros(1, dtype=torch.int64)
+    args = (out, hl.constexpr(value))
+    model = tmp_path / "model.py"
+    model.write_text("CONFIGS = [{}]\n")
+    with (
+        cpu_render_target(),
+        patch(
+            "helion.autotuner.aot_cache.get_hardware_info",
+            return_value=HardwareInfo("cuda", "CPU proof", "13.0", "sm100"),
+        ),
+    ):
+        bound = cpu_bind(kernel, args)
+        cache = AOTAutotuneCache(BaseSearch(bound, args))
+        with patch.object(cache, "_find_heuristic_file", return_value=model):
+            if isinstance(value, range):
+                artifact = tmp_path / "source_fixed_standalone.py"
+                artifact.write_text("# previous export\n")
+                with pytest.raises(
+                    exc.InvalidAPIUsage, match="constexpr argument 'value'"
+                ):
+                    cache._maybe_run_compile()
+                assert artifact.read_text() == "# previous export\n"
+                return
+            cache._maybe_run_compile()
+    assert _constexpr_key(value) != _constexpr_key(different)
+    run = load_generated_module(tmp_path / "source_fixed_standalone.py").fixed
+    for equal in (value, hl.constexpr(value)):
+        out.fill_(-1)
+        run(out, equal, _launcher=interpret_triton_kernel)
+        assert out.item() == 23
+    hold = Mock()
+    for other in (different, hl.constexpr(different)):
+        with pytest.raises(ValueError, match="specialized input value"):
+            run(out, other, _launcher=hold)
+    hold.assert_not_called()
+
+
+@onlyBackends(["triton"])
+def test_standalone_shifted_tile_inlines_its_host_grid_length(tmp_path: Path) -> None:
+    @helion.kernel(backend="triton", static_shapes=False)
+    def max(x, out):  # noqa: A001 - test the exported name
+        for t in hl.tile(1, x.size(0)):
+            out[t] = x[t]
+
+    x = torch.arange(7)
+    out = torch.full_like(x, -1)
+    config = Config(block_sizes=[4])
+    with cpu_render_target():
+        bound = cpu_bind(max, (x, out))
+        direct = bound.to_code(
+            config, options=helion.OutputCodeOptions(allow_helion_deps=False)
+        )
+        ordinary = bound.to_code(config)
+    assert "helion.runtime._grid_range_length(" in ordinary
+    direct_path = tmp_path / "direct.py"
+    direct_path.write_text(direct)
+    aot = generate_standalone_file("max", [ordinary], "", tmp_path)
+    for path in (direct_path, aot):
+        assert not any(
+            isinstance(node, ast.Import)
+            and any(alias.name.split(".")[0] == "helion" for alias in node.names)
+            or isinstance(node, ast.ImportFrom)
+            and (node.module or "").split(".")[0] == "helion"
+            for node in ast.walk(ast.parse(path.read_text()))
+        )
+        out.fill_(-1)
+        load_generated_module(path).max(x, out, _launcher=interpret_triton_kernel)
+        torch.testing.assert_close(out, torch.tensor([-1, 1, 2, 3, 4, 5, 6]))
+
+
+@onlyBackends(["triton"])
+def test_standalone_loaded_range_links_its_device_overflow_check(
+    tmp_path: Path,
+) -> None:
+    @helion.kernel(backend="triton", static_shapes=False)
+    def write(lo, hi, out):
+        for i in hl.grid(lo, hi):
+            out[i] = i + 1
+
+    lo, hi = torch.tensor(1), torch.tensor(4)
+    out = torch.zeros(5, dtype=torch.int64)
+    config = Config(block_sizes=[], pid_type="persistent_blocked")
+    with cpu_render_target():
+        bound = cpu_bind(write, (lo, hi, out))
+        direct = bound.to_code(
+            config, options=helion.OutputCodeOptions(allow_helion_deps=False)
+        )
+        ordinary = bound.to_code(config)
+    assert "helion_triton_helpers.device_error(" in ordinary
+    direct_path = tmp_path / "direct.py"
+    direct_path.write_text(direct)
+    aot = generate_standalone_file("write", [ordinary], "", tmp_path)
+    for path in (direct_path, aot):
+        mod = load_generated_module(path)
+        from triton.language.core import is_builtin
+
+        # Triton permits module globals in JIT code; SimpleNamespace works
+        # in the interpreter but is refused by the native compiler.
+        assert isinstance(mod.helion_triton_helpers, ModuleType)
+        assert is_builtin(mod.helion_triton_helpers.device_error)
+        out.zero_()
+        with patch.object(mod.helion.runtime, "get_num_sm", return_value=1):
+            mod.write(lo, hi, out, _launcher=interpret_triton_kernel)
+        torch.testing.assert_close(out, torch.tensor([0, 2, 3, 4, 0]))
+
+
+@pytest.mark.parametrize("expected_width", [0, None])
+def test_dynamic_width_guard_preserves_keyword_heuristics(
+    tmp_path: Path, expected_width: int | None
+) -> None:
+    # A public name must not shadow the builtins used by the linked width guard.
+    path = generate_standalone_file(
+        "max",
+        [
+            "def max(*args, **kwargs):\n    raise RuntimeError('failed config')\n",
+            "def max(x):\n    return 1\n",
+            "def max(x):\n    return 2\n",
+        ],
+        "def key_max(x):\n    return 1 + int(x.size(0) > 8)\n",
+        tmp_path,
+        expected_width=expected_width,
+    )
+    pick = runpy.run_path(str(path))["max"]
+    for size, expected in ((7, 1), (15, 2)):
+        x = torch.empty(size, 0)
+        assert pick(x) == pick(x=x) == expected
+
+
+def test_ordinary_selector_keeps_its_imports_and_builtins(tmp_path: Path) -> None:
+    # Neither child imports torch, and the public name shadows the model's int.
+    path = generate_standalone_file(
+        "int",
+        ["def int(x):\n    return 16\n", "def int(x):\n    return 32\n"],
+        "import torch\nfrom helion import Config\n"
+        "def key_int(x):\n    return int(isinstance(x, torch.Tensor) and x.numel() > 4)\n",
+        tmp_path,
+    )
+    original_import = __import__
+
+    def forbid_helion(name, *args, **kwargs):
+        if name.split(".")[0] == "helion":
+            raise AssertionError("standalone selector imported Helion")
+        return original_import(name, *args, **kwargs)
+
+    with patch("builtins.__import__", side_effect=forbid_helion):
+        module = runpy.run_path(str(path))
+        select = module["int"]
+        assert select(torch.empty(3)) == 16
+        assert select(x=torch.empty(8)) == 32
+    assert "key_int" not in module and "torch" not in module
+
+
+def test_standalone_uses_shipped_fp8_selector_helpers(tmp_path: Path) -> None:
+    name = "dynamic_per_token_scaled_fp8_quant"
+    model = (
+        Path(__file__).resolve().parents[1]
+        / "pretuned_kernels"
+        / name
+        / f"_helion_aot_{name}_cuda_sm100.py"
+    )
+    original = runpy.run_path(str(model))
+    children = [
+        f"def {name}(scale, x): return {i}" for i in range(len(original["_KEYS"]))
+    ]
+    path = generate_standalone_file(name, children, model.read_text(), tmp_path)
+    module = runpy.run_path(str(path))
+    for shape, expected in (((16, 4096), 13), ((3, 2100), 6)):
+        x = torch.empty(1).expand(shape)
+        assert module[name](None, x) == original[f"key_{name}"](None, x) == expected
+    assert "_pick_index" not in module
+
+
+def test_standalone_runs_shipped_scaled_mm_model_initialization(tmp_path: Path) -> None:
+    model = (
+        Path(__file__).resolve().parents[1]
+        / "pretuned_kernels/scaled_mm/_helion_aot_scaled_mm_cuda_sm90.py"
+    )
+    original = runpy.run_path(str(model))
+    children = [
+        f"def scaled_mm(c, a, b): return {i}" for i in range(len(original["_KEYS"]))
+    ]
+    path = generate_standalone_file("scaled_mm", children, model.read_text(), tmp_path)
+    select = runpy.run_path(str(path))["scaled_mm"]
+    x = torch.empty(1)
+    args = (None, x.expand(3, 2048), x.expand(2048, 4096))
+    # The two initialization loops populate a sorted table. M=3 picks M=4.
+    assert (
+        select(*args)
+        == original["key_scaled_mm"](*args)
+        == original["_KEYS"].index((2048, 4096, 4))
+    )
+
+
+def test_standalone_uses_assigned_selector_and_table_writes(tmp_path: Path) -> None:
+    model = (
+        "import functools\nTABLE = {}\nTABLE[7] = 1\n"
+        "def pick(x): return TABLE.get(x.numel(), 0)\n"
+        "key_demo = functools.cache(pick)\n"
+    )
+    children = ["def demo(x): return 16", "def demo(x): return 32"]
+    path = generate_standalone_file("demo", children, model, tmp_path)
+    select = runpy.run_path(str(path))["demo"]
+    assert select(torch.empty(6)) == 16
+    assert select(torch.empty(7)) == 32
+    # Namespace inspection could observe a seemingly unused Helion import.
+    original = path.read_bytes()
+    with pytest.raises(ValueError, match="requires a Helion import"):
+        generate_standalone_file(
+            "demo",
+            children,
+            "from helion import Config\n" + model + "vars()\n",
+            tmp_path,
+        )
+    assert path.read_bytes() == original
+
+
+def test_standalone_registers_private_selector_by_export_path(tmp_path: Path) -> None:
+    # Dataclasses resolves annotations through sys.modules[cls.__module__].
+    model = (
+        "from __future__ import annotations\nfrom dataclasses import dataclass\n"
+        "@dataclass\nclass Bucket:\n    n: int\n"
+        "def key_demo(x): return int(x.numel() == Bucket(7).n)\n"
+    )
+    children = ["def demo(x): return 16", "def demo(x): return 32"]
+    selectors = []
+    for directory in (tmp_path / "a", tmp_path / "b"):
+        path = generate_standalone_file("demo", children, model, directory)
+        exported = runpy.run_path(str(path))
+        assert exported["demo"](torch.empty(7)) == 32
+        selectors.append(exported["_helion_aot_select"])
+    assert selectors[0].__module__ != selectors[1].__module__
+    for selector in selectors:
+        assert sys.modules[selector.__module__].key_demo is selector
+
+
+@onlyBackends(["triton"])
+def test_compile_saved_model_with_training_only_helion_import(tmp_path: Path) -> None:
+    source = tmp_path / "source.py"
+    source.write_text(
+        "import helion.language as hl\n"
+        "def demo(x):\n"
+        "    for t in hl.tile(x.size(0)):\n"
+        "        x[t] = x[t] + 1\n"
+    )
+    kernel = helion.kernel(load_generated_module(source).demo, static_shapes=False)
+    model = tmp_path / "model.py"
+    model_source = (
+        "from __future__ import annotations\nfrom dataclasses import dataclass\n"
+        "MODEL_FILE = __file__\n"
+        "CONFIGS = [{'block_sizes': [16]}, {'block_sizes': [32]}]\n"
+        "@dataclass\nclass Bucket:\n    n: int\n"
+        "def key_demo(x): return int(Bucket(7).n == x.numel())\n"
+        "def autotune_demo(x):\n    from helion import Config\n    return Config()\n"
+    )
+    model.write_text(model_source)
+    args = (torch.arange(7),)
+    with (
+        cpu_render_target(),
+        patch(
+            "helion.autotuner.aot_cache.get_hardware_info",
+            return_value=HardwareInfo("cuda", "CPU proof", "13.0", "sm100"),
+        ),
+    ):
+        cache = AOTAutotuneCache(BaseSearch(cpu_bind(kernel, args), args))
+        path = tmp_path / "source_demo_standalone.py"
+        with patch.object(cache, "_find_heuristic_file", return_value=model):
+            cache._maybe_run_compile()
+            saved = AOTAutotuneCache._heuristic_modules[model]
+            assert sys.modules[saved.Bucket.__module__] is saved
+            assert Path(saved.MODEL_FILE) == model
+            deployed = load_generated_module(path)
+            selector = deployed._helion_aot_select
+            assert Path(sys.modules[selector.__module__].MODEL_FILE) == path
+            assert selector(*args) == 1 and selector(torch.empty(8)) == 0
+            deployed.demo(*args, _launcher=interpret_triton_kernel)
+            torch.testing.assert_close(args[0], torch.arange(1, 8))
+            original = path.read_bytes()
+            for nonportable in (
+                model_source
+                + "import importlib\nruntime = importlib.import_module('helion')\n",
+                model_source.replace(
+                    "return int(Bucket(7).n == x.numel())", "return autotune_demo(x)"
+                ),
+            ):
+                AOTAutotuneCache.clear_caches()
+                model.write_text(nonportable)
+                with pytest.raises(ValueError, match="requires a Helion import"):
+                    cache._maybe_run_compile()
+                assert path.read_bytes() == original
+
+
+def test_dynamic_standalone_selects_on_portable_user_key(tmp_path: Path) -> None:
+    def size_key(x: torch.Tensor) -> tuple[int, torch.dtype]:
+        return x.numel(), x.dtype
+
+    children = ["def choose(x):\n    return 16", "def choose(x):\n    return 32"]
+    selector = "def key_choose(n, width):\n    return int(n > 3 and width == 2)"
+    path = generate_standalone_file(
+        "choose", children, selector, tmp_path, user_key=size_key
+    )
+    choose = runpy.run_path(str(path))["choose"]
+    assert choose(x=torch.empty(8, dtype=torch.int16)) == 32
+    assert choose(torch.empty(3, dtype=torch.int16)) == 16
+    assert choose(torch.empty(8, dtype=torch.int32)) == 16
+
+    original = path.read_bytes()
+    with pytest.raises(StructuralPolicyError, match="named function"):
+        generate_standalone_file(
+            "choose", children, selector, tmp_path, user_key=lambda x: x.numel()
+        )
+    assert path.read_bytes() == original
+
+
+def test_standalone_key_captures_nested_globals_without_helion(tmp_path: Path) -> None:
+    def count_large_dims(x):
+        return sum(d > _STANDALONE_KEY_LIMIT for d in x.shape)
+
+    def needs_helion(x):
+        return helion.cdiv(x.numel(), 8)
+
+    def runtime_import(x):
+        return importlib.import_module("helion").cdiv(x.numel(), 8)
+
+    def indirect(x):
+        return x.numel() + globals().get("_STANDALONE_KEY_LIMIT", 0)
+
+    def qualified(x):
+        return x.numel() + builtins.globals().get("_STANDALONE_KEY_LIMIT", 0)
+
+    def imported(x):
+        from builtins import globals as namespace
+
+        return x.numel() + namespace().get("_STANDALONE_KEY_LIMIT", 0)
+
+    def typed_key(x):
+        if TYPE_CHECKING:
+            from helion import Config
+
+            assert Config is not None
+        return builtins.len(x)
+
+    children = ["def choose(x): return 16", "def choose(x): return 32"]
+    selector = "def key_choose(count): return int(count > 1)"
+    path = generate_standalone_file(
+        "choose", children, selector, tmp_path, user_key=count_large_dims
+    )
+    choose = runpy.run_path(str(path))["choose"]
+    assert choose(torch.empty(8, 4)) == 32
+    assert choose(torch.empty(8, 3)) == 16
+    path = generate_standalone_file(
+        "choose", children, selector, tmp_path, user_key=typed_key
+    )
+    assert runpy.run_path(str(path))["choose"](torch.empty(4)) == 32
+    original = path.read_bytes()
+    for key, reason in (
+        (needs_helion, "requires a Helion import"),
+        (runtime_import, "requires a Helion import"),
+        (indirect, "inspects its namespace"),
+        (qualified, "inspects its namespace"),
+        (imported, "inspects its namespace"),
+    ):
+        with pytest.raises(StructuralPolicyError, match=reason):
+            generate_standalone_file(
+                "choose", children, selector, tmp_path, user_key=key
+            )
+        assert path.read_bytes() == original
 
 
 def test_dynamic_standalone_still_accepts_pointer_config(tmp_path: Path) -> None:
@@ -1057,7 +1573,11 @@ def test_dynamic_standalone_still_accepts_pointer_config(tmp_path: Path) -> None
     kernel_function = namespace["demo"]
     heuristic_path = tmp_path / "_helion_aot_demo_cuda_sm100.py"
     heuristic_path.write_text(
-        "CONFIGS = [{'block_sizes': [16], 'indexing': 'pointer'}]\n"
+        "import functools\n"
+        "@functools.cache\n"
+        "def autotune_demo(x):\n"
+        "    _C = [{'block_sizes': [16], 'indexing': 'pointer'}]\n"
+        "    return _C[0]\n"
     )
     codegen_calls: list[Config] = []
 
@@ -1065,22 +1585,166 @@ def test_dynamic_standalone_still_accepts_pointer_config(tmp_path: Path) -> None
         codegen_calls.append(config)
         return "from __future__ import annotations\n\ndef demo(x):\n    return x\n"
 
+    class BoundKernelStub(SimpleNamespace):
+        """Support weak references like the bound kernel the cache stores."""
+
     cache = object.__new__(AOTAutotuneCache)
     cache.data_dir = tmp_path
     cache.hardware_id = "test-hardware"
-    cache.kernel = SimpleNamespace(
-        settings=SimpleNamespace(static_shapes=False),
-        kernel=SimpleNamespace(name="demo", __code__=kernel_function.__code__),
+    cache.kernel = BoundKernelStub(
+        settings=SimpleNamespace(static_shapes=False, index_dtype=None),
+        host_function=SimpleNamespace(constexpr_args={}),
+        env=SimpleNamespace(
+            index_dtype=torch.int32, wide_empty_grid=False, specialized_vars=set()
+        ),
+        kernel=SimpleNamespace(
+            name="demo",
+            __code__=kernel_function.__code__,
+            normalize_args=lambda *args: args,
+        ),
         _normalized_config_copy=lambda config: config,
         to_triton_code=to_triton_code,
     )
     cache._find_heuristic_file = lambda: heuristic_path
 
     AOTAutotuneCache.clear_caches()
+    cache.args = (torch.empty(7, 0),)
+    with (
+        patch.object(
+            cache.kernel, "to_triton_code", side_effect=RuntimeError("bad config")
+        ),
+        pytest.raises(RuntimeError, match="bad config"),
+    ):
+        cache._maybe_run_compile()
+    assert not AOTAutotuneCache._compiled_kernels
+    assert not (tmp_path / "source_demo_standalone.py").exists()
     cache._maybe_run_compile()
     assert len(codegen_calls) == 1
-    assert (tmp_path / "source_demo_standalone.py").exists()
+    path = tmp_path / "source_demo_standalone.py"
+    demo = runpy.run_path(str(path))["demo"]
+    assert demo(x=cache.args[0]) is cache.args[0]
+    with pytest.raises(ValueError, match="No standalone variant"):
+        demo(x=torch.empty(2**31 + 7, 0))
+    # A partially compiled file may already serve a successful child, but
+    # requesting the export again must still retry its previously failed child.
     AOTAutotuneCache.clear_caches()
+    heuristic_path.write_text(
+        "CONFIGS = [{'block_sizes': [16]}, {'block_sizes': [32]}]\n"
+        "def key_demo(x): return int(x.shape[0] > 7)\n"
+    )
+
+    def first_attempt(config):
+        if config.block_sizes[0] == 32:
+            raise RuntimeError("transient compile failure")
+        return to_triton_code(config)
+
+    with patch.object(cache.kernel, "to_triton_code", side_effect=first_attempt):
+        cache._maybe_run_compile()
+    partial = runpy.run_path(str(path))["demo"]
+    assert partial(cache.args[0]) is cache.args[0]
+    other = torch.empty(8, 0)
+    with pytest.raises(RuntimeError, match="failed to compile"):
+        partial(other)
+
+    def second_attempt(config):
+        if config.block_sizes[0] == 16:
+            raise RuntimeError("previously compiled child is temporarily unavailable")
+        return to_triton_code(config)
+
+    with patch.object(cache.kernel, "to_triton_code", side_effect=second_attempt):
+        cache._maybe_run_compile()
+    recovered = runpy.run_path(str(path))["demo"]
+    assert recovered(other) is other and recovered(cache.args[0]) is cache.args[0]
+
+    def bind_mode(static: bool) -> None:
+        cache.kernel.settings.static_shapes = static
+        cache.kernel.kernel = helion.kernel(kernel_function, static_shapes=static)
+        if static:
+            _bind_static_export_inputs(cache, *cache.args)
+
+    # Alternate full publications at the same path, including hits on both
+    # in-memory caches. The file must always dispatch the last requested mode.
+    with patch.object(cache, "_get_heuristic_config", return_value=Config()):
+        for static in (True, False, True, False):
+            bind_mode(static)
+            if static:
+                cache._maybe_run_compile()
+            else:
+                with patch.object(
+                    cache.kernel, "to_triton_code", side_effect=second_attempt
+                ):
+                    cache._maybe_run_compile()
+            exported = runpy.run_path(str(path))["demo"]
+            if static:
+                with pytest.raises(ValueError, match="No standalone variant"):
+                    exported(other)
+            else:
+                assert (
+                    exported(other) is other
+                    and exported(cache.args[0]) is cache.args[0]
+                )
+
+    # An incomplete dispatcher displaced by a static one is no longer active.
+    # A different dynamic binding may publish its own partial, without serving
+    # the first binding's output or inheriting its working children.
+    AOTAutotuneCache.clear_caches()
+    with patch.object(cache.kernel, "to_triton_code", side_effect=first_attempt):
+        cache._maybe_run_compile()
+    bind_mode(True)
+    with patch.object(cache, "_get_heuristic_config", return_value=Config()):
+        cache._maybe_run_compile()
+    bind_mode(False)
+    cache.kernel = BoundKernelStub(**vars(cache.kernel))
+    with patch.object(cache.kernel, "to_triton_code", side_effect=second_attempt):
+        cache._maybe_run_compile()
+    displaced = runpy.run_path(str(path))["demo"]
+    assert displaced(other) is other
+    with pytest.raises(RuntimeError, match="failed to compile"):
+        displaced(cache.args[0])
+    cache._maybe_run_compile()
+
+    # A completed previous file cannot admit an unrelated binding's cache hit.
+    cache.kernel = BoundKernelStub(**vars(cache.kernel))
+    replacement = "def demo(x): return 123"
+    with patch.object(cache.kernel, "to_triton_code", return_value=replacement):
+        cache._maybe_run_compile()
+    assert runpy.run_path(str(path))["demo"](other) == 123
+
+    def alternative_key(x):
+        return x.numel()
+
+    previous = path.read_bytes()
+    with (
+        patch.object(
+            cache.kernel.kernel, "_aot_user_key", alternative_key, create=True
+        ),
+        pytest.raises(StructuralPolicyError, match="same custom key"),
+    ):
+        cache._maybe_run_compile()
+    assert path.read_bytes() == previous
+    cache.kernel.settings.index_dtype = torch.int32
+    with pytest.raises(StructuralPolicyError, match="same index dtype"):
+        cache._maybe_run_compile()
+    AOTAutotuneCache.clear_caches()
+    cache.kernel.settings.index_dtype = None
+    cache.kernel.env.index_dtype = torch.int64
+    cache.args = (torch.empty(2**31 + 7, 0),)
+    cache._maybe_run_compile()
+    small = torch.empty(7, 0)
+    assert runpy.run_path(str(path))["demo"](small) is small
+    AOTAutotuneCache.clear_caches()
+
+
+def _bind_static_export_inputs(cache: AOTAutotuneCache, *args: object) -> None:
+    # Only the generated child is stubbed; use the kernel's real binding signature.
+    cache.args = args
+    if not hasattr(cache.kernel, "env"):
+        cache.kernel.env = SimpleNamespace(specialized_vars=set())
+        cache.kernel.host_function = None
+    kernel = cache.kernel.kernel
+    cache.kernel._base_spec_key = kernel._base_specialization_key(
+        kernel.normalize_args(*args)
+    )
 
 
 def test_static_aot_compile_accumulates_observed_shapes(
@@ -1091,13 +1755,6 @@ def test_static_aot_compile_accumulates_observed_shapes(
     namespace: dict[str, object] = {}
     exec(compile(source_path.read_text(), str(source_path), "exec"), namespace)
     kernel_function = namespace["demo"]
-    signature = inspect.signature(kernel_function)
-
-    def normalize_args(*args: object) -> tuple[object, ...]:
-        bound = signature.bind(*args)
-        bound.apply_defaults()
-        return tuple(bound.args)
-
     heuristic_path = tmp_path / "_helion_aot_demo_cuda_sm100.py"
     heuristic_path.write_text("def autotune_demo(*args):\n    return {}\n")
     output_path = tmp_path / "source_demo_standalone.py"
@@ -1106,7 +1763,6 @@ def test_static_aot_compile_accumulates_observed_shapes(
     cache = object.__new__(AOTAutotuneCache)
     cache.data_dir = tmp_path
     cache.hardware_id = "test-hardware"
-    cache.args = (torch.empty(2),)
 
     def get_heuristic_config(args: tuple[object, ...]) -> Config:
         assert args[1] == (1, 2)
@@ -1123,18 +1779,14 @@ def test_static_aot_compile_accumulates_observed_shapes(
         )
 
     cache.kernel = SimpleNamespace(
-        kernel=SimpleNamespace(
-            __code__=kernel_function.__code__,
-            name="demo",
-            normalize_args=normalize_args,
-        ),
+        kernel=helion.kernel(kernel_function, static_shapes=True),
         to_triton_code=to_triton_code,
     )
 
     def compile_shapes(sizes: tuple[int, ...]) -> str:
         AOTAutotuneCache.clear_caches()
         for size in sizes:
-            cache.args = (torch.empty(size),)
+            _bind_static_export_inputs(cache, torch.empty(size))
             cache._compile_current_static_shape(heuristic_path, "demo")
             assert output_path.exists()
         return output_path.read_text()
@@ -1156,7 +1808,7 @@ def test_static_aot_compile_accumulates_observed_shapes(
         cache._compile_current_static_shape(heuristic_path, "demo")
 
     prior_source = output_path.read_text()
-    cache.args = (torch.empty(4),)
+    _bind_static_export_inputs(cache, torch.empty(4))
 
     def fail_compile(_config: Config) -> str:
         raise ValueError("compile failed")
@@ -1195,17 +1847,13 @@ def test_static_aot_compile_dispatches_descriptor_alignment(tmp_path: Path) -> N
         )
 
     cache.kernel = SimpleNamespace(
-        kernel=SimpleNamespace(
-            __code__=kernel_function.__code__,
-            name="demo",
-            normalize_args=lambda *args: tuple(args),
-        ),
+        kernel=helion.kernel(kernel_function, static_shapes=True),
         to_triton_code=to_triton_code,
     )
 
     AOTAutotuneCache.clear_caches()
     for tensor, expected in ((aligned, 1), (unaligned, 2)):
-        cache.args = (tensor,)
+        _bind_static_export_inputs(cache, tensor)
         result = expected
         cache._compile_current_static_shape(
             heuristic_path,
@@ -1233,19 +1881,15 @@ def test_static_aot_compile_supports_non_file_kernel_source(tmp_path: Path) -> N
     cache = object.__new__(AOTAutotuneCache)
     cache.data_dir = tmp_path
     cache.hardware_id = "test-hardware"
-    cache.args = (torch.empty(2),)
     cache._get_heuristic_config = lambda _args: config
     cache.kernel = SimpleNamespace(
-        kernel=SimpleNamespace(
-            __code__=kernel_function.__code__,
-            name="demo",
-            normalize_args=lambda *args: tuple(args),
-        ),
+        kernel=helion.kernel(kernel_function, static_shapes=True),
         to_triton_code=lambda _config: (
             "from __future__ import annotations\n\ndef demo(x):\n    return 2\n"
         ),
     )
 
+    _bind_static_export_inputs(cache, torch.empty(2))
     AOTAutotuneCache.clear_caches()
     cache._compile_current_static_shape(heuristic_path, "demo")
     output_path = tmp_path / "demo_standalone.py"
@@ -1279,7 +1923,6 @@ def test_static_aot_compile_serializes_concurrent_variants(
         cache = object.__new__(AOTAutotuneCache)
         cache.data_dir = tmp_path
         cache.hardware_id = "test-hardware"
-        cache.args = (torch.empty(size),)
         cache._get_heuristic_config = lambda _args: config
 
         def to_triton_code(_config: Config) -> str:
@@ -1290,13 +1933,10 @@ def test_static_aot_compile_serializes_concurrent_variants(
             )
 
         cache.kernel = SimpleNamespace(
-            kernel=SimpleNamespace(
-                __code__=kernel_function.__code__,
-                name="demo",
-                normalize_args=lambda *args: tuple(args),
-            ),
+            kernel=helion.kernel(kernel_function, static_shapes=True),
             to_triton_code=to_triton_code,
         )
+        _bind_static_export_inputs(cache, torch.empty(size))
         return cache
 
     import helion.autotuner.aot_compile as aot_compile

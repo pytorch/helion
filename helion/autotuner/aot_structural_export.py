@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import ast
+import builtins
 import hashlib
 import importlib
 import inspect
 from pathlib import Path
+import symtable
 import tempfile
 import textwrap
 import types
@@ -20,8 +22,13 @@ from torch._dynamo.source import LocalSource
 from torch._dynamo.source import TensorProperty
 from torch._dynamo.source import TensorPropertySource
 
+from .. import exc
 from .._compiler.runtime_tensor_guards import _CanonicalLayoutClassifier
+from ..runtime.kernel import _dynamic_tensor_width_key
+from ..runtime.kernel import _tensor_index_class
+from ..runtime.kernel import _walk_input_tensors
 from ..runtime.structural_policy import StructuralPolicyError
+from .aot_compile import _standalone_value_key
 from .aot_structural_policy import MODEL_MANIFEST
 from .aot_structural_policy import model_configs
 from .aot_structural_policy import policy_path
@@ -57,6 +64,99 @@ RuntimeGuard = _RuntimeGuardBase | _CanonicalRuntimeGuard
 GuardedCallKey = tuple[tuple[RuntimeGuard, ...], tuple[object, ...], tuple[object, ...]]
 
 
+def _export_projection(source: object, indices: dict[str, int]) -> _GuardProjection:
+    if (
+        isinstance(source, TensorPropertySource)
+        and source.prop in (TensorProperty.SIZE, TensorProperty.STRIDE)
+        and source.idx is not None
+    ):
+        index, path = _export_projection(source.base, indices)
+        property_name = "size" if source.prop == TensorProperty.SIZE else "stride"
+        return index, (*path, (property_name, source.idx))
+    if isinstance(source, LocalSource) and source.local_name in indices:
+        return indices[source.local_name], ()
+    if isinstance(source, AttrSource):
+        index, path = _export_projection(source.base, indices)
+        return index, (*path, source.member)
+    if (
+        isinstance(source, GetItemSource)
+        and isinstance(source.index, (int, str))
+        and not source.index_is_slice
+    ):
+        index, path = _export_projection(source.base, indices)
+        return index, (*path, source.index)
+    raise StructuralPolicyError("Standalone AOT has an unsupported guard projection")
+
+
+SpecializedInputFacts = tuple[tuple[_GuardProjection, tuple[object, ...]], ...]
+
+
+def _specialized_tensor_paths(
+    fake_args: tuple[object, ...], path: _GuardProjection
+) -> list[_GuardProjection]:
+    # PyTorch may reuse the same fake tensor for multiple input positions. Its
+    # shape symbol then names only the first one, even if the kernel read another.
+    index, (*base, prop) = path
+    receiver = _project_input(fake_args, (index, tuple(base)))
+    paths = [path]
+    for arg_index, argument in enumerate(fake_args):
+        for role, tensor in _walk_input_tensors(argument):
+            if tensor is receiver:
+                steps = [step[-1] for step in role]
+                if not all(isinstance(key, (int, str)) for key in steps):
+                    raise StructuralPolicyError("Unsupported aliased input projection")
+                alias = (arg_index, (*cast("list[int | str]", steps), prop))
+                if alias not in paths:
+                    paths.append(alias)
+    return paths
+
+
+def export_specialized_input_facts(
+    bound: BoundKernel, args: tuple[object, ...]
+) -> SpecializedInputFacts:
+    """Guard the literals substituted at binding, including tensor metadata."""
+    constants = bound.host_function.constexpr_args if bound.host_function else {}
+    if not bound.env.specialized_vars and not constants:
+        return ()
+    indices = {name: i for i, name in enumerate(bound.kernel.signature.parameters)}
+    facts: dict[_GuardProjection, tuple[object, ...]] = {}
+    for name, value in constants.items():
+        index = indices[name]
+        try:
+            facts[(index, ())] = _standalone_value_key(value)
+        except TypeError as error:
+            raise exc.InvalidAPIUsage(
+                f"Standalone export cannot guard constexpr argument {name!r} "
+                f"of type {type(value).__qualname__}"
+            ) from error
+    for symbol in sorted(bound.env.specialized_vars, key=str):
+        source = bound.env.shape_env.var_to_sources[symbol][0]
+        if not (
+            isinstance(source, (GetItemSource, AttrSource))
+            or isinstance(source, LocalSource)
+            and source.local_name in indices
+            or isinstance(source, TensorPropertySource)
+            and source.prop in (TensorProperty.SIZE, TensorProperty.STRIDE)
+        ):
+            continue
+        path = _export_projection(source, indices)
+        paths = (
+            _specialized_tensor_paths(tuple(bound.fake_args), path)
+            if isinstance(source, TensorPropertySource)
+            else [path]
+        )
+        expected = _standalone_value_key(int(bound.env.specialize_expr(symbol)))
+        for value_path in paths:
+            facts[value_path] = expected
+    if not all(
+        _matches_specialized_input(args, path, key) for path, key in facts.items()
+    ):
+        raise exc.InvalidAPIUsage(
+            "Standalone inputs no longer match a bound specialized input value"
+        )
+    return tuple(facts.items())
+
+
 def export_runtime_guards(
     bound: BoundKernel, args: tuple[object, ...]
 ) -> tuple[tuple[RuntimeGuard, ...], tuple[object, ...]]:
@@ -67,36 +167,10 @@ def export_runtime_guards(
     pointer address is baked into a key. Opaque/content-dependent classifiers
     cannot be relocated by this exporter and retain runtime AOT support.
     """
-    from .aot_compile import _standalone_value_key
-
+    export_specialized_input_facts(bound, args)
     indices = {
         name: index for index, name in enumerate(bound.kernel.signature.parameters)
     }
-
-    def projection(source: object) -> _GuardProjection:
-        if (
-            isinstance(source, TensorPropertySource)
-            and source.prop in (TensorProperty.SIZE, TensorProperty.STRIDE)
-            and source.idx is not None
-        ):
-            index, path = projection(source.base)
-            property_name = "size" if source.prop == TensorProperty.SIZE else "stride"
-            return index, (*path, (property_name, source.idx))
-        if isinstance(source, LocalSource) and source.local_name in indices:
-            return indices[source.local_name], ()
-        if isinstance(source, AttrSource):
-            index, path = projection(source.base)
-            return index, (*path, source.member)
-        if (
-            isinstance(source, GetItemSource)
-            and isinstance(source.index, (int, str))
-            and not source.index_is_slice
-        ):
-            index, path = projection(source.base)
-            return index, (*path, source.index)
-        raise StructuralPolicyError(
-            "Standalone AOT has an unsupported guard projection"
-        )
 
     guards: list[RuntimeGuard] = []
     for key, specialization in sorted(bound.env.runtime_input_specializations.items()):
@@ -131,7 +205,9 @@ def export_runtime_guards(
             hashlib.sha256(Path(source_file).read_bytes()).hexdigest(),
             repr(specialization.classifier_identity),
             tuple(sorted(specialization.reusable_tensor_properties)),
-            tuple(projection(source) for source in specialization.sources),
+            tuple(
+                _export_projection(source, indices) for source in specialization.sources
+            ),
         )
         if canonical:
             classifier = cast("_CanonicalLayoutClassifier", classifier)
@@ -229,48 +305,64 @@ def _export_classifiers(
     return tuple(result)
 
 
+def _project_input(
+    args: tuple[object, ...], path: _GuardProjection, *, missing: object = None
+) -> object:
+    index, steps = path
+    value = args[index]
+    for step in steps:
+        if isinstance(step, tuple):
+            if not isinstance(value, torch.Tensor):
+                return missing
+            property_name, dimension = step
+            if not -value.ndim <= dimension < value.ndim:
+                return missing
+            if property_name == "size":
+                value = value.size(dimension)
+            elif property_name == "stride":
+                value = value.stride(dimension)
+            else:
+                return missing
+        elif (
+            isinstance(step, int)
+            and isinstance(value, (list, tuple))
+            and 0 <= step < len(value)
+            or isinstance(value, dict)
+            and step in value
+        ):
+            value = value[step]
+        elif isinstance(step, str) and value is not None:
+            value = getattr(value, step, missing)
+        else:
+            return missing
+    return value
+
+
+def _matches_specialized_input(
+    args: tuple[object, ...], path: _GuardProjection, expected: tuple[object, ...]
+) -> bool:
+    missing = object()
+    value = _project_input(args, path, missing=missing)
+    if value is missing:
+        return False
+    if isinstance(value, torch.SymInt):
+        value = int(value)
+    try:
+        return _standalone_value_key(value) == expected
+    except TypeError:
+        return False
+
+
 def _export_guard_key(
     args: tuple[object, ...],
     guards: tuple[RuntimeGuard, ...],
     classifiers: tuple[Callable[..., object], ...],
 ) -> tuple[object, ...]:
-    from .aot_compile import _standalone_value_key
-
-    def project(path: _GuardProjection) -> object:
-        index, steps = path
-        value = args[index]
-        for step in steps:
-            if isinstance(step, tuple):
-                if not isinstance(value, torch.Tensor):
-                    return None
-                property_name, dimension = step
-                if not -value.ndim <= dimension < value.ndim:
-                    return None
-                if property_name == "size":
-                    value = value.size(dimension)
-                elif property_name == "stride":
-                    value = value.stride(dimension)
-                else:
-                    return None
-            elif (
-                isinstance(step, int)
-                and isinstance(value, (list, tuple))
-                and 0 <= step < len(value)
-                or isinstance(value, dict)
-                and step in value
-            ):
-                value = value[step]
-            elif isinstance(step, str) and value is not None:
-                value = getattr(value, step, None)
-            else:
-                return None
-        return value
-
     return tuple(
         (
             guard[0],
             _standalone_value_key(
-                classifier(tuple(project(path) for path in guard[6]))
+                classifier(tuple(_project_input(args, path) for path in guard[6]))
             ),
         )
         for guard, classifier in zip(guards, classifiers, strict=True)
@@ -278,17 +370,19 @@ def _export_guard_key(
 
 
 def _export_call_key(
-    args: tuple[object, ...], *, dynamic: bool = False
+    args: tuple[object, ...],
+    *,
+    dynamic: bool = False,
+    index_limit: int | None = None,
+    widths: list[int] | None = None,
 ) -> tuple[object, ...]:
     """Literal metadata and argument-identity guards, never pointer addresses.
 
     Dynamic tensors retain arbitrary sizes (including zero/one) and strides.
-    The index-width bucket matches automatic Int32/Int64 binding. Keeping that
-    bucket for explicitly fixed index types is conservative. Compile-time values
-    and extra bound facts use the exact form instead.
+    Their width bucket matches the binder for the configured index dtype,
+    including empty tensors whose independent grid axis can still be wide.
+    Compile-time values and extra bound facts use the exact form instead.
     """
-    from .aot_compile import _standalone_value_key
-
     tensors: list[torch.Tensor] = []
 
     def key(value: object) -> tuple[object, ...]:
@@ -299,11 +393,13 @@ def _export_call_key(
             )
             if identity == len(tensors):
                 tensors.append(value)
-            metadata = (
-                ("tensor", str(value.dtype), value.ndim, value.numel() > 2**31 - 1)
-                if dynamic
-                else _standalone_value_key(value)
-            )
+            if dynamic:
+                width = _dynamic_tensor_width_key(value, index_limit)
+                if widths is not None:
+                    widths.append(width)
+                metadata = ("tensor", str(value.dtype), value.ndim, width)
+            else:
+                metadata = _standalone_value_key(value)
             return (*metadata, value.device.type, identity)
         if dynamic and type(value) in (bool, int, float):
             return (type(value).__name__,)
@@ -331,6 +427,7 @@ def _select_guarded_variant(
     classifiers: tuple[tuple[Callable[..., object], ...], ...],
     variants: dict[tuple[object, ...], int | list[int]],
     dynamic: bool,
+    index_limit: int | None = None,
 ) -> int | list[int]:
     """Prefer exact calls, then dynamic calls with more checked conditions."""
     observed = [
@@ -340,7 +437,9 @@ def _select_guarded_variant(
     exact_call_key = _export_call_key(args)
     for dynamic_key in (False, True) if dynamic else (False,):
         call_key = (
-            _export_call_key(args, dynamic=True) if dynamic_key else exact_call_key
+            _export_call_key(args, dynamic=True, index_limit=index_limit)
+            if dynamic_key
+            else exact_call_key
         )
         for plan, guard_key in observed:
             key: tuple[object, ...] = (plan, call_key, guard_key)
@@ -397,7 +496,13 @@ def _user_key_source(fn: Callable[..., object]) -> tuple[str, str]:
         raise StructuralPolicyError(
             "Cannot read dynamic standalone user key source"
         ) from error
-    tree = ast.parse(source)
+    try:
+        tree = ast.parse(source)
+    except SyntaxError as error:
+        # inspect can return only the line containing an inline lambda argument.
+        raise StructuralPolicyError(
+            "Dynamic standalone user key must be a named function"
+        ) from error
     if len(tree.body) != 1 or not isinstance(tree.body[0], ast.FunctionDef):
         raise StructuralPolicyError(
             "Dynamic standalone user key must be a named function"
@@ -407,9 +512,50 @@ def _user_key_source(fn: Callable[..., object]) -> tuple[str, str]:
         raise StructuralPolicyError(
             "Dynamic standalone user key cannot carry decorators/defaults"
         )
+    from .aot_compile import _referenced_globals
+
     closure = inspect.getclosurevars(fn)
     lines = ["from __future__ import annotations", "import torch"]
-    for name, value in {**closure.globals, **closure.nonlocals}.items():
+    table = symtable.symtable(lines[0] + "\n" + source, "<standalone key>", "exec")
+    captures = {**fn.__globals__, **closure.nonlocals}
+    references = _referenced_globals(table)
+    # A key that reads its namespace indirectly cannot declare its captures.
+    reflective = {"globals", "locals", "eval", "exec", "__builtins__"}
+    builtin_modules = {name for name in references if captures.get(name) is builtins}
+    for item in ast.walk(node):
+        if isinstance(item, ast.Import):
+            builtin_modules.update(
+                alias.asname or alias.name
+                for alias in item.names
+                if alias.name == "builtins"
+            )
+        elif isinstance(item, ast.ImportFrom) and item.module == "builtins":
+            if any(
+                alias.name in reflective or alias.name == "*" for alias in item.names
+            ):
+                raise StructuralPolicyError(
+                    "Dynamic standalone user key inspects its namespace"
+                )
+    # Allow ordinary qualified builtins such as builtins.len, but do not copy
+    # a module object whose use can conceal a dependency on unsaved globals.
+    safe_receivers = {
+        attr.value
+        for attr in ast.walk(node)
+        if isinstance(attr, ast.Attribute)
+        and attr.attr not in reflective
+        and not attr.attr.startswith("__")
+    }
+    if references & reflective or any(
+        isinstance(item, ast.Name)
+        and item.id in builtin_modules
+        and item not in safe_receivers
+        for item in ast.walk(node)
+    ):
+        raise StructuralPolicyError(
+            "Dynamic standalone user key inspects its namespace"
+        )
+    for name in sorted(references & captures.keys()):
+        value = captures[name]
         if isinstance(value, types.ModuleType):
             lines.append(f"import {value.__name__} as {name}")
         elif isinstance(value, torch.dtype):
@@ -432,6 +578,26 @@ def _user_key_source(fn: Callable[..., object]) -> tuple[str, str]:
                     "Dynamic standalone user key has a nonliteral capture"
                 ) from error
             lines.append(f"{name} = {value!r}")
+    # The saved TYPE_CHECKING value cannot change in the private snapshot.
+    # Erase its non-executing branch only when the key refers to that global.
+    if captures.get("TYPE_CHECKING") is False:
+
+        def locally_bound(scope: symtable.SymbolTable) -> bool:
+            return any(
+                sym.get_name() == "TYPE_CHECKING"
+                and (not sym.is_global() or sym.is_assigned())
+                for sym in scope.get_symbols()
+            ) or any(locally_bound(child) for child in scope.get_children())
+
+        if not locally_bound(table):
+            for guard in ast.walk(node):
+                if (
+                    isinstance(guard, ast.If)
+                    and isinstance(guard.test, ast.Name)
+                    and guard.test.id == "TYPE_CHECKING"
+                ):
+                    guard.body = [ast.Pass()]
+            source = ast.unparse(node)
     lines.append(source)
     return "\n".join(lines), node.name
 
@@ -444,10 +610,11 @@ def generate_policy_standalone(
     kernel_source_file: str | None,
     dispatch_keys: list[tuple[object, ...]] | None,
     policy: StructuralPolicy,
-    user_key: Callable[..., object] | None,
+    key_source: tuple[str, str] | None,
     dynamic_groups: list[tuple[tuple[object, ...], list[int]]] | None,
     runtime_guards: tuple[RuntimeGuard, ...],
     runtime_guard_plans: tuple[tuple[RuntimeGuard, ...], ...] | None = None,
+    index_limit: int | None = None,
 ) -> Path:
     """Link exact generated modules, including embedded multi-launch children.
 
@@ -542,8 +709,11 @@ def generate_policy_standalone(
         prefix += "_"
     linked_helpers = []
     for helper in (
+        _tensor_index_class,
+        _dynamic_tensor_width_key,
         _export_call_key,
         _export_classifiers,
+        _project_input,
         _export_guard_key,
         _select_guarded_variant,
     ):
@@ -596,8 +766,8 @@ def generate_policy_standalone(
         lines.append(
             f"{prefix}_model = {prefix}_cache.load({heuristic_code!r}, extra={policy.identity()!r})"
         )
-        if user_key is not None:
-            key_code, key_name = _user_key_source(user_key)
+        if key_source is not None:
+            key_code, key_name = key_source
             lines.append(
                 f"{prefix}_user_key = {prefix}_cache.load({key_code!r}, extra={policy.identity()!r}).{key_name}"
             )
@@ -618,9 +788,9 @@ def generate_policy_standalone(
     else:
         if dynamic_groups is not None:
             lines.append(
-                f"    indices = {prefix}_utilities._select_guarded_variant(normalized, {prefix}_guard_plans, {prefix}_classifiers, {prefix}_groups, True)"
+                f"    indices = {prefix}_utilities._select_guarded_variant(normalized, {prefix}_guard_plans, {prefix}_classifiers, {prefix}_groups, True, {index_limit!r})"
             )
-        if user_key is not None:
+        if key_source is not None:
             lines.append(
                 f"    normalized = {prefix}_utilities._flatten_key_value({prefix}_user_key(*normalized))"
             )

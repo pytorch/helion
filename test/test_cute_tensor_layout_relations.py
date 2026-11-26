@@ -81,6 +81,9 @@ def test_equal_hints_and_rebound_tensors_are_not_relations(prefix):
         "n = x.size(1); x[0] = 1",
         "n = x.size(1); x.shape = (1, 1)",
         "if independent:\n    n = x.size(1)",
+        "n = x.size(1)\nif unknown(x):\n    raise OverflowError()",
+        "n = x.size(1)\nif n and (n if independent else unknown(x)):\n    raise OverflowError()",
+        "n = x.size(1)\nif independent:\n    raise OverflowError()\nelse:\n    x = other",
         "for i in range(2):\n    n = x.size(1)",
         "n = x.size(independent)",
         "n = x.size(2)",
@@ -106,9 +109,11 @@ def test_actual_launch_positions_are_resolved():
 
 
 def test_metadata_only_host_work_is_allowed():
-    assert _prove("n = x.size(1); q = (n + 255) // 256") == (
-        TensorLayoutRelation("n", "x", "size", 1),
-    )
+    assert _prove(
+        "n = x.size(1); q = (n + 255) // 256\n"
+        "if q > 9223372036854775807 and (n > 0 if independent else n < 0):\n"
+        "    raise OverflowError()"
+    ) == (TensorLayoutRelation("n", "x", "size", 1),)
 
 
 def test_proof_size_is_bounded():

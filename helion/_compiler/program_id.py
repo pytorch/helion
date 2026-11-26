@@ -11,6 +11,7 @@ from typing import cast
 import sympy
 import torch
 
+from .. import exc
 from .ast_extension import ExtendedAST
 from .ast_extension import create
 from .ast_extension import expr_from_string
@@ -22,6 +23,22 @@ from .cross_loop_dsmem import dsmem_worker_count
 from .device_function import DeviceFunction
 from .device_function import TensorArg
 from .host_function import HostFunction
+from .variable_origin import TensorSizeOrigin
+
+
+def _program_id_type(env: CompileEnvironment) -> str:
+    # PID division uses signed axis counts. A narrow or unsigned storage
+    # index must not change that arithmetic or truncate a physical CTA ID.
+    dtype = torch.int64 if torch.iinfo(env.index_dtype).bits == 64 else torch.int32
+    return env.backend.index_type_str(dtype)
+
+
+def root_coordinate_pid(pid: str, dtype: str) -> str:
+    """Convert the scheduler ID before computing a tile origin."""
+    env = CompileEnvironment.current()
+    if dtype == env.index_type() == _program_id_type(env):
+        return pid
+    return env.backend.cast_expr(pid, dtype)
 
 
 def typed_program_id(dim: int = 0) -> str:
@@ -30,7 +47,7 @@ def typed_program_id(dim: int = 0) -> str:
     Triton uses tl.program_id(). CuTe uses block_idx() as the virtual program ID.
     """
     env = CompileEnvironment.current()
-    return env.backend.program_id_expr(dim, index_dtype=env.index_type())
+    return env.backend.program_id_expr(dim, index_dtype=_program_id_type(env))
 
 
 def _stmt_name_uses(stmt: ast.AST) -> tuple[set[str], set[str]]:
@@ -114,6 +131,11 @@ MAX_ACTIVE_CLUSTERS_VAR = "_MAX_ACTIVE_CLUSTERS"
 NUM_XCD_VAR = "_NUM_XCDS"
 
 
+def _nonnegative_cdiv(value: str, divisor: str) -> str:
+    """Ceiling division without adding to an already full-width count."""
+    return f"(({value}) // ({divisor}) + (({value}) % ({divisor}) != 0))"
+
+
 class PIDInfo(NamedTuple):
     pid_var: str
     block_size_var: str
@@ -124,11 +146,29 @@ class PIDInfo(NamedTuple):
     # divides the static tile count).
     pack: int = 1
     pack_axis: int = 0
+    host_factors: tuple[sympy.Expr | str, ...] = ()
 
     def num_pids_expr(self, *, is_device: bool) -> str:
         """Get the number of PIDs expression for device or host."""
         # Handle both sympy.Expr and string numel (for data-dependent bounds)
-        if isinstance(self.numel, str):
+        if self.host_factors:
+            fn = DeviceFunction.current()
+            # XYZ launches need the raw limit even without a device PID decoder.
+            fn.check_flat_grid_factors(self.host_factors)
+            if is_device:
+                numel_str = (
+                    self.numel
+                    if isinstance(self.numel, str)
+                    else fn.sympy_expr(self.numel)
+                )
+            else:
+                host = HostFunction.current()
+                factors = (
+                    axis if isinstance(axis, str) else host.sympy_expr(axis, fn.config)
+                    for axis in self.host_factors
+                )
+                numel_str = " * ".join(f"({factor})" for factor in factors)
+        elif isinstance(self.numel, str):
             numel_str = self.numel
         elif is_device:
             numel_str = DeviceFunction.current().sympy_expr(self.numel)
@@ -136,6 +176,14 @@ class PIDInfo(NamedTuple):
             numel_str = HostFunction.current().sympy_expr(
                 self.numel, DeviceFunction.current().config
             )
+        count = (
+            self.static_num_pids(include_specializations=True) if is_device else None
+        )
+        # Triton gives a bare literal in this range unsigned type, but a
+        # virtual PID divides and takes its remainder in signed Int64.
+        if count is not None and 2**31 <= count < 2**32:
+            backend = CompileEnvironment.current().backend
+            return backend.cast_expr(str(count), backend.dtype_str(torch.int64))
         if self.pack > 1:
             assert self.block_size_var == "1"
             return f"(({numel_str}) // {self.pack})"
@@ -145,17 +193,31 @@ class PIDInfo(NamedTuple):
             # Grid dimensions are always non-negative, so we can use integer
             # arithmetic directly instead of a function call like triton.cdiv.
             return f"(({numel_str}) + ({self.block_size_var}) - 1) // ({self.block_size_var})"
+        if count is None:
+            # A live extent may already use every bit of its signed type. This
+            # also applies to host shape arguments the device receives as Int32.
+            return _nonnegative_cdiv(numel_str, self.block_size_var)
+        width = DeviceFunction.current().resolved_int_constexpr(self.block_size_var)
+        if width is not None and count >= (2**31 - 1) // width:
+            # Constant folding in an Int32 language (notably MSL) must also
+            # avoid overflowing a known, large numerator.
+            return str(count)
         return CompileEnvironment.current().backend.cdiv_expr(
             numel_str, self.block_size_var, is_device=is_device
         )
 
-    def static_num_pids(self) -> int | None:
+    def static_num_pids(self, *, include_specializations: bool = False) -> int | None:
         """The PID count when both the extent and the block size are static."""
-        if isinstance(self.numel, str) or not isinstance(
-            self.numel, (int, sympy.Integer)
+        extent = self.numel
+        if (
+            include_specializations
+            and isinstance(extent, sympy.Expr)
+            and extent.free_symbols
         ):
+            extent = CompileEnvironment.current().specialize_expr(extent)
+        if not isinstance(extent, (int, sympy.Integer)):
             return None
-        numel = int(self.numel)
+        numel = int(extent)
         if self.pack > 1:
             return numel // self.pack
         if self.block_size_var == "1":
@@ -204,14 +266,96 @@ class ProgramIDs(abc.ABC):
         """Generate grid launch expression for kernel execution."""
         raise NotImplementedError
 
+    def device_product(self, factors: list[str], pids: list[PIDInfo]) -> str:
+        """Widen products used to decode persistent or flattened physical PIDs."""
+        if len(factors) > 1 and (
+            self._is_persistent() or isinstance(self, XYZProgramIDs)
+        ):
+            counts = [pid.static_num_pids() for pid in pids]
+            backend = CompileEnvironment.current().backend
+            if None not in counts:
+                product = math.prod(cast("list[int]", counts))
+                if product >= 2**31:
+                    # A bare 2**31..2**32-1 literal is UInt32 in Triton;
+                    # a signed flat PID cannot divide by that unsigned value.
+                    return backend.cast_expr(
+                        str(product), backend.dtype_str(torch.int64)
+                    )
+            else:
+                factors = [
+                    backend.cast_expr(factors[0], backend.dtype_str(torch.int64)),
+                    *factors[1:],
+                ]
+        return " * ".join(f"({factor})" for factor in factors)
+
+    def host_count_known(self) -> bool:
+        fn = DeviceFunction.current()
+        return all(
+            not isinstance(axis, str) or fn.has_host_grid_value(axis)
+            for pid in self.pid_info
+            for axis in (pid.host_factors or (pid.numel,))
+        )
+
+    def _check_host_scalar_grid_count(self, count: str) -> None:
+        if not self.host_count_known():
+            return
+        # A single input dimension fits a host index by construction. A
+        # product of independent axes (even from two tensors), a shifted
+        # host length, or an independent Python scalar has no such proof.
+        if len(self.pid_info) == 1:
+            pid = self.pid_info[0]
+            if not pid.host_factors and isinstance(pid.numel, sympy.Symbol):
+                info = HostFunction.current().expr_to_origin.get(pid.numel)
+                if info is not None and isinstance(info.origin, TensorSizeOrigin):
+                    return
+        DeviceFunction.current().check_host_grid_count(count)
+
     def total_pids_expr(self, *, is_device: bool) -> str:
         """Get total PIDs expression for device or host."""
-        counts = [pid.static_num_pids() for pid in self.pid_info]
+        counts = [
+            pid.static_num_pids(include_specializations=True) for pid in self.pid_info
+        ]
+        if 0 in counts:
+            return "0"
         if None not in counts:
-            return str(math.prod(cast("list[int]", counts)))
-        return " * ".join(
-            f"({pid.num_pids_expr(is_device=is_device)})" for pid in self.pid_info
-        )
+            count = math.prod(cast("list[int]", counts))
+            if count >= 2**63:
+                raise exc.InvalidConfig("root grid count exceeds signed Int64")
+            return str(count)
+        factors = [pid.num_pids_expr(is_device=is_device) for pid in self.pid_info]
+        if not is_device or not self._is_persistent():
+            product = " * ".join(f"({factor})" for factor in factors)
+            if not is_device and not self._is_persistent():
+                self._check_host_scalar_grid_count(product)
+            return product
+        fn = DeviceFunction.current()
+        if len(factors) == 1:
+            pid = self.pid_info[0]
+            if (
+                not pid.host_factors
+                and isinstance(pid.numel, sympy.Expr)
+                and pid.numel.free_symbols
+                and self.host_count_known()
+            ):
+                fn.check_host_grid_count(self.total_pids_expr(is_device=False))
+            return factors[0]
+        if self.host_count_known():
+            fn.check_host_grid_count(self.total_pids_expr(is_device=False))
+        else:
+            # Counts are nonnegative. Check before multiplying, and let any
+            # empty axis annihilate the whole grid rather than trapping.
+            backend = CompileEnvironment.current().backend
+            limit = backend.uint64_expr(str(2**63 - 1))
+            live = [f"(({factor}) != 0)" for factor in factors]
+            for i, factor in enumerate(factors[1:], 1):
+                prefix = self.device_product(factors[:i], self.pid_info[:i])
+                count = counts[i]
+                if count == 1 or all(n == 1 for n in counts[:i]):
+                    continue
+                den = backend.uint64_expr(f"(({factor}) + (({factor}) == 0))")
+                overflow = f"({backend.uint64_expr(prefix)} > ({limit} // {den}))"
+                fn.check_grid_overflow(" and ".join([overflow, *live]))
+        return self.device_product(factors, self.pid_info)
 
     def static_grid_size(self) -> int | None:
         """The CTA count of the grid ``codegen_grid`` launches, when every
@@ -240,6 +384,8 @@ class ProgramIDs(abc.ABC):
         virtual_pid_var: str,
         range_expr: str,
         total_pids_expr: str | None = None,
+        *,
+        relative_pid: str | None = None,
     ) -> list[ast.stmt]:
         """Complete persistent kernel setup: prepare body, wrap in loop, and return."""
         from .ast_extension import create
@@ -261,10 +407,19 @@ class ProgramIDs(abc.ABC):
             )
         )
 
+        if relative_pid is not None:
+            wrapped_body.insert(
+                0,
+                statement_from_string(
+                    f"{virtual_pid_var} = {relative_pid} + ({total_pids_expr})"
+                ),
+            )
         # Create the persistent loop that wraps the entire body
         persistent_loop = create(
             ast.For,
-            target=create(ast.Name, id=virtual_pid_var, ctx=ast.Store()),
+            target=create(
+                ast.Name, id=relative_pid or virtual_pid_var, ctx=ast.Store()
+            ),
             iter=expr_from_string(range_expr),
             body=wrapped_body,
             orelse=[],
@@ -281,10 +436,23 @@ class ProgramIDs(abc.ABC):
         """Check if this is a persistent strategy. Default False."""
         return False
 
+    def _static_empty_coordinates(self) -> list[ast.stmt] | None:
+        if len(self.pid_info) > 1 and any(
+            pid.static_num_pids() == 0 for pid in self.pid_info
+        ):
+            # This root never runs. Its emitted body still has to compile;
+            # decomposing a physical ID would divide by a static zero extent.
+            return [
+                statement_from_string(f"{pid.pid_var} = 0") for pid in self.pid_info
+            ]
+        return None
+
     def _decompose_pid_to_statements(
         self, pid_var: str, state: CodegenState
     ) -> list[ast.stmt]:
         """Generate statements to decompose a single PID variable into multiple PID components."""
+        if (dead := self._static_empty_coordinates()) is not None:
+            return dead
         num_blocks = [
             state.device_function.new_var(f"num_blocks_{i}")
             for i in range(len(self.pid_info[:-1]))
@@ -308,7 +476,7 @@ class ProgramIDs(abc.ABC):
         for i, pid in enumerate(self.pid_info):
             expr = pid_var
             if i > 0:
-                divisor = " * ".join(num_blocks[:i])
+                divisor = self.device_product(num_blocks[:i], self.pid_info[:i])
                 if division is not None:
                     static_divisor: int | None = 1
                     for count in static_counts[:i]:
@@ -327,7 +495,7 @@ class ProgramIDs(abc.ABC):
                     expr = f"({expr}) % ({num_blocks[i]})"
             if pid.pack > 1:
                 # Thread sub-group ``pack_axis`` of this CTA owns its own tile.
-                index_dtype = CompileEnvironment.current().index_type()
+                index_dtype = _program_id_type(CompileEnvironment.current())
                 expr = (
                     f"({expr}) * {pid.pack}"
                     f" + {index_dtype}(cute.arch.thread_idx()[{pid.pack_axis}])"
@@ -365,12 +533,45 @@ class ForEachProgramID(ProgramIDs):
     def _cdiv_sum(self, state: CodegenState, exclude_last: bool = False) -> str:
         """Sum the non-empty cdiv expressions from cases (empty if none)."""
         cases = self.cases[:-1] if exclude_last else self.cases
-        blocks = [
-            cdiv
-            for pid in cases
-            if (cdiv := pid.total_pids_expr(is_device=True))  # drop empty expressions
+        return self._case_sum(cases, is_device=True)
+
+    def _case_sum(self, cases: list[ProgramIDs], *, is_device: bool) -> str:
+        parts = [
+            part
+            for case in cases
+            if (part := case.total_pids_expr(is_device=is_device))
         ]
-        return _sum_pids(blocks)
+        total = _sum_pids(parts)
+        if total.isdecimal() and int(total) >= 2**63:
+            raise exc.InvalidConfig("root grid count exceeds signed Int64")
+        if (
+            not is_device
+            and len(parts) > 1
+            and not total.isdecimal()
+            and all(case.host_count_known() for case in cases)
+        ):
+            DeviceFunction.current().check_host_grid_count(total)
+        if not (
+            is_device
+            and len(parts) > 1
+            and cases[0]._is_persistent()
+            and not total.isdecimal()
+        ):
+            return total
+        fn = DeviceFunction.current()
+        backend = CompileEnvironment.current().backend
+        if all(case.host_count_known() for case in cases):
+            fn.check_host_grid_count(self._case_sum(cases, is_device=False))
+        else:
+            limit = backend.uint64_expr(str(2**63 - 1))
+            # Unlike a Cartesian product, a reached root contributes even if a
+            # separate root is empty.  Compare each addend before the sum.
+            for i in range(1, len(parts)):
+                prefix = _sum_pids([backend.uint64_expr(parts[0]), *parts[1:i]])
+                room = f"({limit} - {backend.uint64_expr(parts[i])})"
+                fn.check_grid_overflow(f"(({prefix}) > {room})")
+        parts[0] = backend.cast_expr(parts[0], backend.dtype_str(torch.int64))
+        return _sum_pids(parts)
 
     def codegen_test(self, state: CodegenState) -> ast.AST:
         return expr_from_string(f"{self.shared_pid_var} < ({self._cdiv_sum(state)})")
@@ -432,8 +633,7 @@ class ForEachProgramID(ProgramIDs):
 
     def total_pids_expr(self, *, is_device: bool) -> str:
         """Get total PIDs expression for ForEachProgramID (sum of all pids)."""
-        cdivs = [pid.total_pids_expr(is_device=is_device) for pid in self.cases]
-        return _sum_pids(cdivs)
+        return self._case_sum(self.cases, is_device=is_device)
 
     def static_grid_size(self) -> int | None:
         """The launch is the persistent grid when the cases are persistent,
@@ -451,7 +651,13 @@ class ForEachProgramID(ProgramIDs):
         blocks = self._cdiv_sum(state, exclude_last=True)
         if blocks:
             env = CompileEnvironment.current()
-            block_expr = env.backend.cast_expr(f"({blocks})", env.index_type())
+            wide = self.cases[0]._is_persistent() and (
+                not blocks.isdecimal() or int(blocks) >= 2**31
+            )
+            dtype = (
+                env.backend.dtype_str(torch.int64) if wide else _program_id_type(env)
+            )
+            block_expr = env.backend.cast_expr(f"({blocks})", dtype)
             state.codegen.statements_stack[-1].insert(
                 0,
                 statement_from_string(
@@ -485,19 +691,16 @@ class ForEachProgramID(ProgramIDs):
 
     def _phase_boundaries(self) -> list[str]:
         """Compute cumulative PID boundaries at phase transitions."""
-        cdivs = [pid.total_pids_expr(is_device=True) for pid in self.cases]
         boundaries: list[str] = []
-        running = "0"
         prev_phase = self.case_phases[0]
-        for idx, cdiv in enumerate(cdivs):
-            running = _sum_pids([running, cdiv])
+        for idx in range(len(self.cases)):
             next_phase = (
                 self.case_phases[idx + 1]
                 if idx + 1 < len(self.case_phases)
                 else prev_phase
             )
-            if next_phase != prev_phase or idx == len(cdivs) - 1:
-                boundaries.append(running)
+            if next_phase != prev_phase or idx == len(self.cases) - 1:
+                boundaries.append(self._case_sum(self.cases[: idx + 1], is_device=True))
             prev_phase = next_phase
         return boundaries
 
@@ -519,6 +722,10 @@ class ForEachProgramID(ProgramIDs):
         block_ids = [pid.block_id for pid in strategy.pid_info]
 
         def range_expr(begin: str, end: str) -> str:
+            if strategy._needs_wide_partition(total_expr):
+                wide = backend.persistent_range_str(begin, end, None)
+                if wide is not None:
+                    return wide
             return TileStrategy.get_range_call_str(
                 device_function.config, block_ids, begin=begin, end=end
             )
@@ -578,6 +785,7 @@ class XYZProgramIDs(ProgramIDs):
             )
 
     def codegen_grid(self) -> ast.AST:
+        self.total_pids_expr(is_device=False)
         env = CompileEnvironment.current()
         if env.backend.name != "pallas":
             assert len(self.pid_info) <= 3
@@ -645,7 +853,7 @@ def _maybe_emit_xcd_remap(
     total = f"({active_total_expr or total_expr})"
     # Matches aiter remap_xcd: the first `tall` XCDs own one extra contiguous PID.
     stmts = [
-        statement_from_string(f"{pids_per} = ({total} + {nx} - 1) // {nx}"),
+        statement_from_string(f"{pids_per} = {_nonnegative_cdiv(total, nx)}"),
         statement_from_string(f"{tall} = {total} % {nx}"),
         statement_from_string(f"{tall} = tl.where({tall} == 0, {nx}, {tall})"),
         statement_from_string(f"{xcd} = ({pid_expr}) % {nx}"),
@@ -750,6 +958,9 @@ class L2GroupingProgramIDs(ProgramIDs):
         assert self.parent_strategy is not None
         parent_pids = self.parent_strategy.pid_info
         assert len(parent_pids) >= 2, "L2 grouping requires at least 2 dimensions"
+        if (dead := self.parent_strategy._static_empty_coordinates()) is not None:
+            state.codegen.statements_stack[-1][:0] = dead
+            return
         new_var = state.device_function.new_var
 
         # Apply L2 grouping to the 2 fastest varying dimensions (pid_0, pid_1)
@@ -777,10 +988,21 @@ class L2GroupingProgramIDs(ProgramIDs):
             # XYZ uses separate program_id(0), program_id(1), etc. for each dimension.
             # We flatten these into a single index using row-major order:
             # flattened_pid = pid_0 + pid_1 * num_blocks_0 + pid_2 * num_blocks_0 * num_blocks_1 + ...
+            total = parent.static_grid_size()
+            wide = total is None or total > 2**31
+            backend = CompileEnvironment.current().backend
             terms = [typed_program_id(0)]
             for i in range(1, num_dims):
+                coordinate = typed_program_id(i)
                 multiplier = " * ".join(num_blocks[:i])
-                terms.append(f"{typed_program_id(i)} * ({multiplier})")
+                if wide:
+                    # Each physical dimension fits Int32 even when its flat
+                    # ordinal does not. Widen before multiplying the stride.
+                    coordinate = backend.cast_expr(
+                        coordinate, backend.dtype_str(torch.int64)
+                    )
+                    multiplier = parent.device_product(num_blocks[:i], parent_pids[:i])
+                terms.append(f"{coordinate} * ({multiplier})")
             pid = " + ".join(terms)
         elif isinstance(state.device_function.pid, ForEachProgramID):
             # For ForEachProgramID, use the shared PID variable
@@ -827,7 +1049,10 @@ class L2GroupingProgramIDs(ProgramIDs):
         if num_dims > 2:
             inner_2d_assignments.extend(
                 [
-                    (inner_2d_size, f"{num_pid_m} * {num_pid_n}"),
+                    (
+                        inner_2d_size,
+                        parent.device_product([num_pid_m, num_pid_n], parent_pids[:2]),
+                    ),
                     (
                         inner_2d_pid,
                         f"{pid} % {inner_2d_size}",
@@ -864,6 +1089,23 @@ class L2GroupingProgramIDs(ProgramIDs):
             group_size_m_expr = f"{self.group_size}"
         else:
             group_size_m_expr = None
+        group_width = str(self.group_size)
+        decoded_m, decoded_n = (axis.static_num_pids() for axis in parent_pids[:2])
+        if decoded_n is None or decoded_n * self.group_size >= 2**31:
+            # A short final group must not form group_size * N when M * N fits
+            # but group_size * N does not. Its reached coordinates are unchanged.
+            group_width = (
+                f"min({num_pid_m}, {self.group_size})"
+                if decoded_m is None
+                else str(min(decoded_m, self.group_size))
+            )
+            if not isinstance(parent, FlatProgramIDs):
+                # The flat physical X launch already bounds min(group, M) * N
+                # by its grid size. Virtual or XYZ-flattened IDs can be wider.
+                backend = CompileEnvironment.current().backend
+                group_width = backend.cast_expr(
+                    group_width, backend.dtype_str(torch.int64)
+                )
         cluster_n = self._decode_cluster_n()
         if cluster_n > 1:
             # Cluster-aware grouped decode (tcgen05 cluster_n > 1). The
@@ -893,7 +1135,7 @@ class L2GroupingProgramIDs(ProgramIDs):
                         ),
                     ),
                     (num_box_n, f"({num_pid_n} + {cluster_n - 1}) // {cluster_n}"),
-                    (num_pid_in_group, f"{self.group_size} * {num_box_n}"),
+                    (num_pid_in_group, f"{group_width} * {num_box_n}"),
                     (group_id, f"{box_pid} // {num_pid_in_group}"),
                     (first_pid_m, f"{group_id} * {self.group_size}"),
                     (
@@ -917,7 +1159,7 @@ class L2GroupingProgramIDs(ProgramIDs):
         else:
             assignments.extend(
                 [
-                    (num_pid_in_group, f"{self.group_size} * {num_pid_n}"),
+                    (num_pid_in_group, f"{group_width} * {num_pid_n}"),
                     (group_id, f"{inner_2d_pid} // {num_pid_in_group}"),
                     (first_pid_m, f"{group_id} * {self.group_size}"),
                     (
@@ -941,7 +1183,7 @@ class L2GroupingProgramIDs(ProgramIDs):
             expr = pid
             # Add divisor for all faster dimensions
             if i > 0:
-                divisor = " * ".join(num_blocks[:i])
+                divisor = parent.device_product(num_blocks[:i], parent_pids[:i])
                 expr = f"({expr}) // ({divisor})"
             # Add modulo unless this is the outermost dimension
             if i + 1 < num_dims:  # Not the outermost dimension
@@ -998,6 +1240,10 @@ class L2GroupingProgramIDs(ProgramIDs):
         return self.parent_strategy.setup_persistent_kernel(
             device_function, total_pids_expr
         )
+
+    def host_count_known(self) -> bool:
+        assert self.parent_strategy is not None
+        return self.parent_strategy.host_count_known()
 
     def _is_persistent(self) -> bool:
         """Forward to parent strategy."""
@@ -1093,14 +1339,28 @@ class PersistentProgramIDs(ProgramIDs):
         num_sm = dsmem_worker_count(DeviceFunction.current(), num_sm)
         return num_sm * self.num_sm_multiplier
 
+    def _needs_wide_partition(self, total: str) -> bool:
+        # A static small launch cannot overflow even on the final advance by
+        # the physical worker count. Device lengths and host root expressions
+        # need not share the pointer index type of the tensors in the body.
+        if total.isdecimal():
+            workers = (
+                CompileEnvironment.current().config_spec.num_sm * self.num_sm_multiplier
+            )
+            return int(total) + workers > torch.iinfo(torch.int32).max
+        # A Python scalar range does not inherit a small tensor's index width.
+        return True
+
     def _persistent_setup_statements(self, total_pids_expr: str) -> list[ast.stmt]:
         """Generate the preamble statements for persistent kernel setup."""
         env = CompileEnvironment.current()
         backend = env.backend
         # Cast total_pids to match the index type so all persistent scheduling
         # variables (start_pid, end_pid, etc.) have consistent types.
-        if env.index_dtype != torch.int32:
-            total_pids_expr = backend.cast_expr(total_pids_expr, env.index_type())
+        wide = self._needs_wide_partition(total_pids_expr)
+        if wide or env.index_dtype != torch.int32:
+            dtype = backend.dtype_str(torch.int64) if wide else _program_id_type(env)
+            total_pids_expr = backend.cast_expr(total_pids_expr, dtype)
         stmts: list[ast.stmt] = [
             statement_from_string(f"{self.total_pids_var} = {total_pids_expr}"),
         ]
@@ -1110,24 +1370,28 @@ class PersistentProgramIDs(ProgramIDs):
             and self.start_pid_var
             and self.end_pid_var
         ):
-            stmts.append(
-                statement_from_string(
-                    f"{self.block_size_var} = {backend.cdiv_expr(self.total_pids_var, self.grid_size_expr, is_device=True)}"
-                )
+            total = self.total_pids_var
+            workers = self.grid_size_expr
+            block_size = (
+                _nonnegative_cdiv(total, workers)
+                if wide
+                else backend.cdiv_expr(total, workers, is_device=True)
             )
+            stmts.append(statement_from_string(f"{self.block_size_var} = {block_size}"))
             worker = typed_program_id(0)
             if DeviceFunction.current().config.get("xcd_remap", False):
                 new_var = DeviceFunction.current().new_var
                 safe_block_size = new_var("xcd_safe_block_size", dce=True)
                 active_workers = new_var("xcd_active_workers", dce=True)
+                # Even when total + workers fits in Int32, total + block_size
+                # may not: these count different partitions.
+                active_count = _nonnegative_cdiv(total, safe_block_size)
                 stmts.extend(
                     [
                         statement_from_string(
                             f"{safe_block_size} = tl.maximum({self.block_size_var}, 1)"
                         ),
-                        statement_from_string(
-                            f"{active_workers} = {backend.cdiv_expr(self.total_pids_var, safe_block_size, is_device=True)}"
-                        ),
+                        statement_from_string(f"{active_workers} = {active_count}"),
                     ]
                 )
                 # Remap only the workers that own at least one block.  Slack
@@ -1140,6 +1404,20 @@ class PersistentProgramIDs(ProgramIDs):
                     active_workers,
                 )
                 stmts.extend(wstmts)
+            if wide:
+                # ceil(total/workers) * worker can exceed signed Int64 for a
+                # slack worker. Clip in unsigned arithmetic before narrowing.
+                start = f"min({backend.uint64_expr(worker)} * {backend.uint64_expr(self.block_size_var)}, {backend.uint64_expr(total)})"
+                start = backend.cast_expr(start, backend.dtype_str(torch.int64))
+                stmts.extend(
+                    (
+                        statement_from_string(f"{self.start_pid_var} = {start}"),
+                        statement_from_string(
+                            f"{self.end_pid_var} = {self.start_pid_var} + min({self.block_size_var}, {total} - {self.start_pid_var})"
+                        ),
+                    )
+                )
+                return stmts
             stmts.extend(
                 [
                     statement_from_string(
@@ -1172,6 +1450,7 @@ class PersistentProgramIDs(ProgramIDs):
         if total_pids_expr is None:
             total_pids_expr = self.total_pids_expr(is_device=True)
 
+        backend = CompileEnvironment.current().backend
         device_function.preamble.extend(
             self._persistent_setup_statements(total_pids_expr)
         )
@@ -1182,11 +1461,32 @@ class PersistentProgramIDs(ProgramIDs):
 
         from .tile_strategy import TileStrategy
 
-        range_expr = TileStrategy.get_range_call_str(
-            device_function.config, pid_block_ids, **self.range_kwargs
-        )
+        bounds = self.range_kwargs
+        relative_pid = None
+        if self._needs_wide_partition(total_pids_expr) and not self.is_blocked:
+            # Count from worker-total to zero. With the usual positive stride,
+            # the last advance can overshoot zero but can never wrap at INT64_MAX.
+            relative_pid = device_function.new_var("relative_pid")
+            bounds = dict(
+                bounds, begin=f"({bounds['begin']}) - {self.total_pids_var}", end="0"
+            )
+        range_expr = None
+        if not total_pids_expr.isdecimal() or int(total_pids_expr) >= 2**31:
+            range_expr = backend.persistent_range_str(
+                bounds["begin"],
+                bounds["end"],
+                bounds.get("step"),
+            )
+        if range_expr is None:
+            range_expr = TileStrategy.get_range_call_str(
+                device_function.config, pid_block_ids, **bounds
+            )
         return self._setup_persistent_kernel_and_wrap_body(
-            device_function, self.virtual_pid_var, range_expr, total_pids_expr
+            device_function,
+            self.virtual_pid_var,
+            range_expr,
+            self.total_pids_var,
+            relative_pid=relative_pid,
         )
 
     def _is_persistent(self) -> bool:

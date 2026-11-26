@@ -42,6 +42,7 @@ from ...autotuner.config_spec import ring_depth
 from ...language import memory_ops
 from ...language._tracing_ops import _for_loop
 from ...language.matmul_ops import dot_scaled
+from ...language.tile_ops import tile_begin
 from ...runtime.config import Config
 from ..ast_extension import clone_ast
 from ..ast_extension import create
@@ -82,6 +83,10 @@ from ..emitter_protocols import RetryPolicy
 from ..host_function import HostFunction
 from ..indexing_strategy import BlockedSubscriptIndexing
 from ..indexing_strategy import TensorDescriptorIndexingStrategy
+from ..indexing_strategy import _block_size_origin
+from ..indexing_strategy import _captured_value
+from ..indexing_strategy import _contiguous_integer_tensor_index_at
+from ..indexing_strategy import _resolve_codegen_block_id
 from ..indexing_strategy import in_warp_specialized_loop
 from ..tile_dependency import TILE_ACCESS_META
 from . import gluon_ops
@@ -834,6 +839,120 @@ class _Tail:
     block_id: int
 
 
+def _ring_multiple(state: CodegenState, value: object, divisor: int) -> bool:
+    """Prove a power-of-two factor of a scalar base, including across captures."""
+    if divisor == 1:
+        return True
+    if isinstance(value, int):
+        return value % divisor == 0
+    if not isinstance(value, torch.fx.Node):
+        return False
+    if (cap := _captured_value(value)) is not None and cap[1] is None:
+        return _ring_multiple(state, cap[0], divisor)
+    if (
+        value.target
+        in (
+            operator.add,
+            operator.sub,
+            torch.ops.aten.add.Tensor,
+            torch.ops.aten.sub.Tensor,
+        )
+        and value.kwargs.get("alpha", 1) == 1
+    ):
+        return all(_ring_multiple(state, term, divisor) for term in value.args[:2])
+    if value.target in (operator.mul, torch.ops.aten.mul.Tensor):
+        for factor, other in (value.args[:2], value.args[:2][::-1]):
+            if isinstance(factor, int):
+                return _ring_multiple(
+                    state, other, divisor // math.gcd(divisor, factor)
+                )
+    if value.target is tile_begin and isinstance(arg := value.args[0], torch.fx.Node):
+        env = CompileEnvironment.current()
+        if (block := env.resolve_block_id(arg.meta.get("val"))) is not None:
+            block = _resolve_codegen_block_id(state, block)
+            width = env.block_sizes[block].from_config(state.device_function.config)
+            if loops := state.codegen.active_device_loops.get(block):
+                info = loops[-1].block_id_to_info.get(block)
+                return (
+                    isinstance(width, int)
+                    and width % divisor == 0
+                    and info is not None
+                    and info.begin_expr is not None
+                    and env.known_multiple(info.begin_expr, divisor)
+                )
+    return False
+
+
+def _aligned_loop_start(state: CodegenState, tile: torch.SymInt, divisor: int) -> bool:
+    """Prove the lower bound of a bare tile, e.g. a parent tile's begin."""
+    origin = _block_size_origin(tile)
+    if origin is None or state.fx_node is None:
+        return False
+    df = state.device_function
+    loop = gluon_ops._graph_info(df, state.fx_node.graph)
+    if not isinstance(loop, ForLoopGraphInfo) or origin.block_id not in loop.block_ids:
+        return False
+    parent, _ = control_flow_parent_entries(df.graph_infos())[loop.graph_id]
+    if parent.target is not _for_loop:
+        return False
+    starts = cast("list[object]", parent.args[1])
+    return _ring_multiple(state, starts[loop.block_ids.index(origin.block_id)], divisor)
+
+
+def _ring_coordinates(
+    state: CodegenState, indexing: BlockedSubscriptIndexing, subscript: list[object]
+) -> bool:
+    """A ring TMA cannot switch to a pointer load on a partially negative or
+    misaligned box. Accept unproven origins only at whole-box multiples: any
+    negative origin then misses the tensor entirely and TMA can zero-fill it."""
+    tensor = indexing.base
+    layout = CompileEnvironment.current().tensor_descriptor_layout_signature(tensor)
+    assert layout is not None and layout[0] is not None
+    contiguous = layout[0]
+    unknown = set(range(tensor.ndim)) - indexing.proven_descriptor_axes
+    subs = [(n, k) for n, k in enumerate(subscript) if k is not None]
+    for dim, ((pos, k), width) in enumerate(
+        zip(subs, gluon_ops.concrete(indexing.block_shape), strict=True)
+    ):
+        divisor = width if dim in unknown else 1
+        if dim == contiguous and dim not in indexing.aligned_descriptor_axes:
+            divisor = max(divisor, 16 // tensor.element_size())
+        if divisor != 1:
+            # The tile's origin advances by the configured width from its start.
+            if (
+                width % divisor == 0
+                and isinstance(k, torch.SymInt)
+                and _aligned_loop_start(state, k, divisor)
+            ):
+                continue
+            info = (
+                _contiguous_integer_tensor_index_at(state, k, pos)
+                if isinstance(k, torch.Tensor)
+                else None
+            )
+            if info is None or not all(
+                _ring_multiple(state, term, divisor) for _, term in info.base_terms
+            ):
+                return False
+    if predicate := indexing.descriptor_box_live(state):
+        # Descriptor extents fit int32. One past a non-contiguous axis is a
+        # representable, aligned OOB box even if the contiguous extent is INT_MAX.
+        outer = 1 if contiguous == 0 else 0
+        live = state.codegen.lift(
+            expr_from_string(predicate), dce=True, prefix="box_live"
+        )
+        for dim in unknown | {outer}:
+            miss = (
+                state.device_function.tensor_size(tensor, dim).name
+                if dim == outer
+                else "0"
+            )
+            indexing.offsets[dim] = (
+                f"tl.where({live.id}, {indexing.offsets[dim]}, {miss})"
+            )
+    return True
+
+
 class RingLowering:
     """Per-kernel ring state: the sites found while lowering the body, and the ring
     kernel built around the body."""
@@ -906,9 +1025,15 @@ class RingLowering:
             state, tensor, subscript
         ):
             return None
-        indexing = BlockedSubscriptIndexing.create(state, tensor, subscript)
+        indexing = BlockedSubscriptIndexing.create(
+            state, tensor, subscript, for_descriptor=True
+        )
         if indexing.broadcasts_tile and not indexing.pad_overshoot():
             # A size-1 dimension broadcast along a wider loop: no slot holds it.
+            return None
+        if tagged_access(state) is None and not _ring_coordinates(
+            state, indexing, subscript
+        ):
             return None
         if not uses:
             # Inside an open step, a register operand of its dot joins the step

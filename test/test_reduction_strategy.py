@@ -160,6 +160,24 @@ def test_reduction_over_runtime_extent_is_rejected(backend: str) -> None:
         kernel.bind((torch.randn(17), 32))
 
 
+@pytest.mark.parametrize("dim", [0, -1])
+def test_gather_rejects_a_scalar_source(dim: int) -> None:
+    @helion.kernel(**_BIND_ONLY)
+    def kernel(x: torch.Tensor, ids: torch.Tensor, dim: hl.constexpr) -> torch.Tensor:
+        out = torch.empty_like(x)
+        for _ in hl.grid(1):
+            out[0] = torch.gather(x[0], dim, ids[0])
+        return out
+
+    with (
+        cpu_render_target(),
+        pytest.raises(
+            exc.BackendUnsupported, match="torch.gather with a scalar source"
+        ),
+    ):
+        cpu_bind(kernel, (torch.tensor([7.0]), torch.tensor([0]), dim))
+
+
 def test_pallas_block_size_slice_keeps_its_extent() -> None:
     # Guards the scope of the tunable-extent fix: only tunable extents take
     # a reduction dim on Pallas; a full slice of a block-size-sized buffer

@@ -805,9 +805,21 @@ def _node_dtype_kwarg(node: Node) -> torch.dtype | None:
 sort_lowering = register_lowering(torch.ops.aten.sort.default)
 
 
+def _make_gather_lowering(lowering: AtenLowering, node: Node) -> Lowering:
+    source = cast("Node", node.args[0]).meta["val"]
+    if source.ndim == 0:
+        raise exc.BackendUnsupported(
+            CompileEnvironment.current().backend_name,
+            "torch.gather with a scalar source",
+        )
+    return lowering
+
+
 # A gather's masked-off lanes read the source at (masked) index 0, which is
 # real data, so its masked value is unknown.
-gather_lowering = register_lowering(torch.ops.aten.gather.default)
+gather_lowering = register_lowering(
+    torch.ops.aten.gather.default, _make_gather_lowering
+)
 
 
 topk_lowering = register_lowering(torch.ops.aten.topk.default)

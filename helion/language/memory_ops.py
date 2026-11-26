@@ -104,7 +104,7 @@ def _record_pad_info(
     block_id: int,
     extra_pad: int = 0,
 ) -> None:
-    """Record that a tensor dimension uses pl.ds() and may need host-side padding.
+    """Record a block transfer that may need host-side padding.
 
     *extra_pad* accounts for non-zero loop begins: 0 when the loop starts
     at offset 0, ``begin % block_size`` for a constant begin, or

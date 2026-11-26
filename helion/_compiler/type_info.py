@@ -1082,9 +1082,8 @@ class TensorType(TypeInfo):
         inputs_consumed = 0
         output_sizes: list[int | torch.SymInt] = []
         env = CompileEnvironment.current()
-        tensor_indexers = [k.fake_value for k in keys if isinstance(k, TensorType)]
-        should_broadcast = env.should_broadcast_tensor_indexers(keys)
-        for k in keys:
+        group = env.tensor_indexer_broadcast_group(keys)
+        for position, k in enumerate(keys):
             if isinstance(k, LiteralType):
                 if isinstance(k.value, (int, torch.SymInt)):
                     inputs_consumed += 1
@@ -1163,12 +1162,10 @@ class TensorType(TypeInfo):
                 )
             elif isinstance(k, TensorType):
                 inputs_consumed += 1
-                if not should_broadcast:
+                if group is None:
                     output_sizes.extend(env.tensor_indexer_dims(k.fake_value))
-                elif k.fake_value is tensor_indexers[0]:
-                    output_sizes.extend(
-                        env.tensor_indexer_broadcast_shape(tensor_indexers)
-                    )
+                elif position == group[0]:
+                    output_sizes.extend(env.tensor_indexer_broadcast_shape(group[1]))
             elif k.contains_type(TileIndexType):
                 # Unwrap single-element containers so hl.tile([m]) works
                 # with multi-dim indexing (e.g. x[tile, :]).

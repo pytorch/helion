@@ -2698,6 +2698,7 @@ class CuteBackend(Backend):
         prefix: list[ast.stmt],
         ctx: DeviceBodyContext,
     ) -> list[ast.stmt]:
+        from ..uint64_grid import narrow_uint64_grid_uses
         from .passes import launch_attributes
         from .passes import pdl
         from .passes.pipeline import run_kernel_def_passes
@@ -2706,6 +2707,14 @@ class CuteBackend(Backend):
 
         run_kernel_def_passes(fn_def, prefix, ctx)
         fn = ctx.device_function
+        if axes := fn.cute_state.root_plans.unbounded_uint64_axes:
+            narrow_uint64_grid_uses(
+                fn_def,
+                axes,
+                lambda v: expr_from_string("cutlass.Int64({v})", v=v),
+                {"_cute_python_mod": 1},
+                "CuTe",
+            )
         pdl.insert_spread_pad(fn, fn_def, ctx.constexpr_values)
         validate_explicit_launch(fn, fn_def)
         # The final body, the spread pad included: a kernel whose shared
@@ -2904,6 +2913,19 @@ class CuteBackend(Backend):
         # pipelines' readiness counters, task events and outlined roots are
         # Triton codegen.
         return ("barrier",)
+
+    def tile_index_dtype(
+        self, index_dtype: torch.dtype, *, serial_device_lane: bool = False
+    ) -> torch.dtype:
+        # Without a thread coordinate to promote the sum, both the native
+        # range counter and lane_offset_expr are signed Int32.
+        if serial_device_lane and index_dtype == torch.uint32:
+            return torch.int32
+        # CuTe ranges and pointer coordinates need at least 32 bits, even
+        # when the kernel uses narrower integer tensors for index values.
+        if index_dtype in (torch.int8, torch.uint8, torch.int16, torch.uint16):
+            return torch.int32
+        return index_dtype
 
     def dtype_str(self, dtype: torch.dtype) -> str:
         from torch._inductor.codegen.cutedsl.cutedsl_op_overrides import (
@@ -4044,6 +4066,20 @@ class CuteBackend(Backend):
 
         return HelionCuteDSLOpOverrides()
 
+    def uint64_expr(self, value: str) -> str:
+        # uint64 scalar tensor storage uses a signed carrier, but division of
+        # a range spanning both signed extremes needs real unsigned arithmetic.
+        if value.isdecimal() and 2**63 <= (literal := int(value)) < 2**64:
+            # MLIR's Python integer attribute constructor takes a signed int64.
+            return f"cutlass.Uint64(cutlass.Int64({literal - 2**64}).ir_value())"
+        return f"cutlass.Uint64({value})"
+
+    def unbounded_uint64_grid_expr(self, name: str, value: str) -> str:
+        from ..device_function import DeviceFunction
+
+        DeviceFunction.current().cute_state.root_plans.unbounded_uint64_axes.add(name)
+        return self.uint64_expr(value)
+
     def cast_expr(self, expr_str: str, dtype_str: str) -> str:
         return f"{dtype_str}({expr_str})"
 
@@ -4142,6 +4178,19 @@ class CuteBackend(Backend):
         if step is not None and step != "1":
             range_args.append(f"cutlass.Int32({step})")
         return f"range({', '.join(range_args)})"
+
+    def device_error_stmt(self, message: str) -> str:
+        return (
+            "_cute_inline_asm_elementwise((cutlass.Int32(0),), "
+            "asm='mov.u32 $0, 0; trap;', constraints='=r,r', "
+            "dtype=cutlass.Int32, is_pure=False)"
+        )
+
+    def persistent_range_str(self, begin: str, end: str, step: str | None) -> str:
+        # Let the DSL promote the operands to the type of the scheduler bound.
+        # An explicit Int32 cast on the upper bound would turn 2**31 negative.
+        args = [begin, end] if step is None else [begin, end, step]
+        return f"range({', '.join(args)})"
 
     def arange_expr(
         self,
@@ -4290,6 +4339,14 @@ class CuteBackend(Backend):
 
     def where_expr(self, mask: str, true_val: str, false_val: str) -> str:
         return f"({true_val}) if ({mask}) else ({false_val})"
+
+    def tile_edge_minimum(self, left: str, right: str) -> str:
+        # A dynamic conditional in the DSL requires matching branch types:
+        # a shape argument is Int64, while a block size or PID can be Int32.
+        return super().tile_edge_minimum(
+            self.cast_expr(left, "cutlass.Int64"),
+            self.cast_expr(right, "cutlass.Int64"),
+        )
 
     def minimum_expr(self, a: str, b: str) -> str:
         from ..compile_environment import CompileEnvironment
@@ -5461,6 +5518,26 @@ class CuteBackend(Backend):
     def canonicalizes_reduction_loop_blocks(self) -> bool:
         return True
 
+    def nd_device_loop_args(self, state: CodegenState) -> list[object]:
+        # The native range converts floating operands toward zero. Its bounds
+        # must describe the same interval to tile masks and to tile.end.
+        args = list(state.ast_args)
+        for pos in (1, 2, 4):  # start, stop, optional step
+            if pos >= len(args):
+                continue
+            values, exprs = state.proxy_arg(pos), args[pos]
+            if not isinstance(values, (list, tuple)) or not isinstance(exprs, list):
+                continue
+            args[pos] = [
+                self.cast_ast(expr, torch.int32)
+                if isinstance(value, torch.Tensor)
+                and value.is_floating_point()
+                and isinstance(expr, ast.AST)
+                else expr
+                for value, expr in zip(values, exprs, strict=True)
+            ]
+        return args
+
     def prepare_device_loop(
         self,
         graph_info: ForLoopGraphInfo,
@@ -5609,7 +5686,9 @@ class CuteBackend(Backend):
         # an extent that is a multiple of V.  The V-loop sink
         # (``cute/sink_vector_loops.py``) finds the constexpr V-loop by this
         # fact wherever it nests.
-        aligned = isinstance(begin, int) and begin == 0 and step in (None, 1)
+        from ..tile_strategy import _unit_grid_step
+
+        aligned = isinstance(begin, int) and begin == 0 and _unit_grid_step(step)
         fn.cute_state.lanes.vloop_sink_wrappers[wrapper.vec_lane_var] = (
             CuteVloopWrapperFact(
                 block_id=block_id,

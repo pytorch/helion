@@ -2238,6 +2238,7 @@ import cutlass.cute as cute
 from helion.runtime import default_cute_launcher as _default_cute_launcher
 from helion._compiler.cute.cluster_helpers import store_shared_remote_x4 as _cute_store_shared_remote_x4
 from helion._compiler.cute.clc_helpers import issue_clc_query_nomulticast as _cute_issue_clc_query_nomulticast
+import builtins as _global_source0
 import helion._compiler.cute._tcgen05_prologue_runtime as _helion_tc_pro
 
 _BLOCK_SIZE_0 = 256
@@ -2643,6 +2644,8 @@ def _selected_kernel(a_packed: torch.Tensor, b_grouped: torch.Tensor, work_tile_
     _NUM_SM = helion.runtime.get_num_sm(a_packed.device)
     _BLOCK_SIZE_0 = 256
     _BLOCK_SIZE_1 = 128
+    if work_tile_metadata.size(0) * ((256 + _BLOCK_SIZE_0 - 1) // _BLOCK_SIZE_0) * ((512 + _BLOCK_SIZE_1 - 1) // _BLOCK_SIZE_1) > 9223372036854775807:
+        raise _global_source0.OverflowError('root grid count exceeds signed Int64')
     _launcher(_helion__selected_kernel, (2, 1, (4 * 2 + 2 - 1) // 2 * ((256 + _BLOCK_SIZE_0 - 1) // _BLOCK_SIZE_0) * ((512 + _BLOCK_SIZE_1 - 1) // _BLOCK_SIZE_1)), work_tile_metadata, a_packed, b_grouped, out, work_tile_metadata.size(0), block=(32, 8, 1))
     return out
 
@@ -2655,6 +2658,7 @@ import helion.language as hl
 import cutlass
 import cutlass.cute as cute
 from helion.runtime import default_cute_launcher as _default_cute_launcher
+import builtins as _global_source0
 import helion._compiler.cute._tcgen05_prologue_runtime as _helion_tc_pro
 
 _BLOCK_SIZE_0 = 256
@@ -3025,6 +3029,8 @@ def _selected_kernel(a_packed: torch.Tensor, b_grouped: torch.Tensor, work_tile_
     _NUM_SM = helion.runtime.get_num_sm(a_packed.device)
     _BLOCK_SIZE_0 = 256
     _BLOCK_SIZE_1 = 128
+    if work_tile_metadata.size(0) * ((256 + _BLOCK_SIZE_0 - 1) // _BLOCK_SIZE_0) * ((224 + _BLOCK_SIZE_1 - 1) // _BLOCK_SIZE_1) > 9223372036854775807:
+        raise _global_source0.OverflowError('root grid count exceeds signed Int64')
     _launcher(_helion__selected_kernel, (2, 1, min((4 * 2 + 2 - 1) // 2 * ((256 + _BLOCK_SIZE_0 - 1) // _BLOCK_SIZE_0) * ((224 + _BLOCK_SIZE_1 - 1) // _BLOCK_SIZE_1), max(1, _NUM_SM // 2))), work_tile_metadata, a_packed, b_grouped, out, work_tile_metadata.size(0), block=(32, 6, 1))
     return out
 
@@ -3037,6 +3043,7 @@ import helion.language as hl
 import cutlass
 import cutlass.cute as cute
 from helion.runtime import default_cute_launcher as _default_cute_launcher
+import builtins as _global_source0
 import helion._compiler.cute._tcgen05_prologue_runtime as _helion_tc_pro
 
 _BLOCK_SIZE_0 = 256
@@ -3463,6 +3470,8 @@ def _selected_kernel(a_packed: torch.Tensor, b_grouped: torch.Tensor, work_tile_
     _NUM_SM = helion.runtime.get_num_sm(a_packed.device)
     _BLOCK_SIZE_0 = 256
     _BLOCK_SIZE_1 = 128
+    if work_tile_metadata.size(0) * ((256 + _BLOCK_SIZE_0 - 1) // _BLOCK_SIZE_0) * ((224 + _BLOCK_SIZE_1 - 1) // _BLOCK_SIZE_1) > 9223372036854775807:
+        raise _global_source0.OverflowError('root grid count exceeds signed Int64')
     _launcher(_helion__selected_kernel, (2, 1, min((4 * 2 + 2 - 1) // 2 * ((256 + _BLOCK_SIZE_0 - 1) // _BLOCK_SIZE_0) * ((224 + _BLOCK_SIZE_1 - 1) // _BLOCK_SIZE_1), max(1, _NUM_SM // 2))), work_tile_metadata, a_packed, b_grouped, out, work_tile_metadata.size(0), block=(32, 8, 1))
     return out
 

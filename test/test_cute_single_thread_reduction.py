@@ -152,7 +152,7 @@ def _full_slice_matmul_grads(
 def _root_launch_threads(code: str) -> tuple[int, int]:
     """The launch's thread count on the root tile's axis and the root block size."""
     axis = re.search(
-        r"_BLOCK_SIZE_0 \+ cutlass\.Int32\(cute\.arch\.thread_idx\(\)\[(\d)\]\)",
+        r"_BLOCK_SIZE_0 \+ cutlass\.Int(?:32|64)\(cute\.arch\.thread_idx\(\)\[(\d)\]\)",
         code,
     )
     block_size = re.search(r"^_BLOCK_SIZE_0 = (\d+)$", code, re.MULTILINE)

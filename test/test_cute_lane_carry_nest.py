@@ -53,6 +53,7 @@ from helion._compiler.cute.lane_loops import split
 from helion._compiler.cute.lane_loops import tile_trips
 from helion._compiler.cute.lane_loops.markers import HELION_LANE_CARRY_ATTR
 from helion._compiler.cute.reduction_lanes import sequence_tile_holds_warp_lanes
+from helion._compiler.cute.tile_bounds import SerialRangeFacts
 from helion._testing import DEVICE
 from helion._testing import cpu_render_target
 from helion._testing import skipIfNotCUDA
@@ -836,7 +837,7 @@ def _trips(
         [loop],
         proven_disjoint_tensor_pairs=_PAIRS if pairs is None else pairs,
         protected_names={"total", "v_1", "dot", "v_2"},
-        constexpr_value={"_BLOCK_SIZE_1": _TRIP}.get,
+        range_facts=SerialRangeFacts({"_BLOCK_SIZE_1": _TRIP}.get),
         rename_groups=_TRIP_RENAMES,
         new_var=_namer(),
     )

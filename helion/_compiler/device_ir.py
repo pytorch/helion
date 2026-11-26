@@ -1332,6 +1332,7 @@ class DeviceIR:
                 for node in graph.nodes
             ):
                 raise exc.NotAllowedInHelperFunction
+        resolve_scalar_index_aliases(graph)
         graph.eliminate_dead_code(is_impure_node=is_impure_node)
         graph_id = len(self.graphs)
         self.graphs.append(graph_info_cls(graph_id=graph_id, graph=graph, **kwargs))
@@ -4891,6 +4892,27 @@ class HelperFunctionGraphInfo(NodeArgsGraphInfo):
         from .helper_function import codegen_helper_function_graph_info
 
         return codegen_helper_function_graph_info(self, state)
+
+
+def resolve_scalar_index_aliases(graph: torch.fx.Graph) -> None:
+    """A local name for a scalar tensor still indexes from the argument's storage."""
+    from ..language._tracing_ops import _host_tensor
+    from ..language.atomic_ops import ATOMIC_OPS
+
+    for alias in graph.find_nodes(op="call_function", target=_new_var):
+        source = alias.args[0]
+        while isinstance(source, torch.fx.Node) and source.target is _new_var:
+            source = source.args[0]
+        if not isinstance(source, torch.fx.Node) or source.target is not _host_tensor:
+            continue
+        tensor = source.meta["val"]
+        if not isinstance(tensor, torch.Tensor) or tensor.ndim != 0:
+            continue
+        for user in tuple(alias.users):
+            if user.target in (hl.load, hl.store) or user.target in ATOMIC_OPS:
+                indices = user.args[1]
+                if isinstance(indices, (list, tuple)) and alias in indices:
+                    user.update_arg(1, [source if i is alias else i for i in indices])
 
 
 def validate_host_tensor_usage(graph: torch.fx.Graph) -> None:

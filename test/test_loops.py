@@ -2317,21 +2317,18 @@ class TestLoops(RefEagerTestBase, TestCase):
         # The id case also pins the parenthesization: unbracketed, ``2 *
         # offset_0 // BLOCK`` would floor-divide the product instead.
         if _get_backend() == "cute":
-            end, count, tile_id = (
+            end, tile_id = (
                 "tile_offset_0 + _BLOCK_SIZE_0",
-                "(200 - begin_0 + _BLOCK_SIZE_0 - 1) // _BLOCK_SIZE_0",
                 "2 * (tile_offset_0 // _BLOCK_SIZE_0)",
             )
         else:
-            end, count, tile_id = (
+            end, tile_id = (
                 "offset_0 + _BLOCK_SIZE_0",
-                "tl.cdiv(",
                 "2 * (offset_0 // _BLOCK_SIZE_0)",
             )
         for label, kernel, fragment in (
             ("end/min", end_min, end),
             ("end/max", end_max, end),
-            ("count", count_min, count),
             ("id", id_min, tile_id),
         ):
             with self.subTest(edge=label):
@@ -2341,6 +2338,9 @@ class TestLoops(RefEagerTestBase, TestCase):
                 rendered = [ln for ln in code.splitlines() if "symnode_0 = " in ln]
                 self.assertTrue(rendered, f"no rendered bound in:\n{code}")
                 self.assertIn(fragment, rendered[0])
+
+        # Both row tiles use min(200, ceil(200 / 128)) columns.
+        torch.testing.assert_close(count_min(x), x[:, :2].sum(-1))
 
     @skipIfFn(
         lambda: _get_backend() not in ("triton", "cute"),

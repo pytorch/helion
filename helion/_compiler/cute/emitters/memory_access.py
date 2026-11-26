@@ -25,6 +25,7 @@ from ...compile_environment import _symint_expr
 from ...host_function import HostFunction
 from ...indexing_strategy import TileWithOffsetInfo
 from ...indexing_strategy import _get_tile_with_offset_info
+from ...indexing_strategy import _scalar_tensor_index_ast
 from ...utils import compute_slice_size
 from ...variable_origin import BlockSizeOrigin
 from ...variable_origin import GridOrigin
@@ -553,6 +554,46 @@ def _cute_index_exprs(
     ).index_exprs
 
 
+_SCALAR_INDEX_DTYPE = "_helion_cute_scalar_index_dtype"
+
+
+def scalar_index_bound(
+    state: CodegenState, tensor: torch.Tensor, dim: int, expr: object
+) -> str | None:
+    """Check a captured scalar argument before narrowing its pointer coordinate."""
+    dtype = getattr(expr, _SCALAR_INDEX_DTYPE, None)
+    if dtype is None:
+        return None
+    assert isinstance(expr, ast.Name)
+    size = _cute_tensor_dim_size_expr(state, tensor, dim)
+    if dtype == torch.uint64:
+        return f"{expr.id} < cutlass.Uint64({size})"
+    return f"(0 <= {expr.id} and cutlass.Int64({expr.id}) < cutlass.Int64({size}))"
+
+
+def resolve_scalar_index_args(state: CodegenState) -> CodegenState:
+    """Read scalar tensor arguments at this operation, once for address and mask."""
+    indices, expressions = state.proxy_arg(1), state.ast_args[1]
+    assert isinstance(indices, (list, tuple)) and isinstance(expressions, (list, tuple))
+    resolved = None
+    for pos, (index, expr) in enumerate(zip(indices, expressions, strict=True)):
+        if (
+            isinstance(index, torch.Tensor)
+            and index.ndim == 0
+            and isinstance(expr, ast.AST)
+        ):
+            value = _scalar_tensor_index_ast(state, index, expr)
+            if value is not expr:
+                if resolved is None:
+                    resolved = list(expressions)
+                captured = state.codegen.lift(value, dce=True, prefix="index")
+                setattr(captured, _SCALAR_INDEX_DTYPE, index.dtype)
+                resolved[pos] = captured
+    if resolved is None:
+        return state
+    return state._replace(ast_args=[state.ast_args[0], resolved, *state.ast_args[2:]])
+
+
 def _cute_resolve_subscript(
     state: CodegenState,
     subscript: list[object] | tuple[object, ...],
@@ -595,6 +636,11 @@ def _cute_resolve_subscript(
                             )
                         return f"({begin_var}) + ({block_size_var})"
                     if isinstance(origin_info.origin, TileCountOrigin):
+                        if (
+                            loop_info is not None
+                            and (count := loop_info.root_tile_count) is not None
+                        ):
+                            return count
                         # The tiles of the whole iteration space, counted
                         # from its first index (``tile_count``'s common
                         # codegen), not from this program's own tile.
@@ -1263,8 +1309,6 @@ def _cute_combined_mask(
     def tensor_index_bounds_term(pos: int, tensor_dim: int) -> str | None:
         if tensor is None or tensor_dim >= tensor.ndim:
             return None
-        if pos in proven_index_bounds:
-            return None
         ast_args = state.ast_args
         if not (
             isinstance(ast_args, list)
@@ -1273,6 +1317,11 @@ def _cute_combined_mask(
             and len(ast_args[1]) == len(subscript)
             and isinstance(ast_args[1][pos], ast.AST)
         ):
+            return None
+        scalar_bound = scalar_index_bound(state, tensor, tensor_dim, ast_args[1][pos])
+        if scalar_bound is not None:
+            return scalar_bound
+        if pos in proven_index_bounds:
             return None
         index_var = state.codegen.lift(
             ast_args[1][pos],

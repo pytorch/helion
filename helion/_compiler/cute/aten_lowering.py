@@ -1559,58 +1559,225 @@ def codegen_gather_cute(ctx: LoweringContext, node: Node) -> object:
     assert isinstance(index_node, Node)
 
     from ...language.memory_ops import load
+    from ..generate_ast import GenerateAST
+    from ..host_function import HostFunction
     from ..inductor_lowering import CodegenState
+    from ..tile_strategy import DeviceLoopState
+    from ..tile_strategy import NDTileStrategy
+    from ..variable_origin import GridOrigin
+    from .cute_reshape import _resolve_tile_extent
+    from .emitters.memory_access import _cute_active_index_var
     from .emitters.memory_access import _cute_combined_mask
-    from .emitters.memory_access import _cute_index_exprs
+    from .emitters.memory_access import _cute_remap_block_id
+    from .emitters.memory_access import _cute_resolve_subscript
 
     if input_node.target is not load:
         raise exc.BackendUnsupported("cute", "torch.gather input")
-    tensor_node = input_node.args[0]
-    if not isinstance(tensor_node, Node):
-        raise exc.BackendUnsupported("cute", "torch.gather tensor input")
+    unsupported = "torch.gather source must be an unmasked rectangular load; materialize the source and gather outside the kernel"
+    tensor_node, indices, extra_mask, _ = input_node.args
+    if (
+        not isinstance(tensor_node, Node)
+        or not isinstance(indices, (list, tuple))
+        or (extra_mask is not None and extra_mask is not True)
+    ):
+        raise exc.BackendUnsupported("cute", unsupported)
     tensor = tensor_node.meta["val"]
     if not isinstance(tensor, torch.Tensor):
-        raise exc.BackendUnsupported("cute", "torch.gather tensor input")
-    input_subscript = input_node.args[1]
-    if not isinstance(input_subscript, (list, tuple)):
-        raise exc.BackendUnsupported("cute", "torch.gather input subscript")
-
-    ndim = len(input_subscript)
-    if dim < 0:
-        dim += ndim
-    if not (0 <= dim < ndim):
-        raise exc.InvalidReductionDim(dim)
-
-    proxy_subscript = cast(
-        "list[object]",
-        list(map_arg(tuple(input_subscript), lambda arg: arg.meta["val"])),
-    )
-    ast_subscript = cast(
-        "list[object]",
-        list(map_arg(tuple(input_subscript), lambda arg: _env_arg(ctx, arg))),
-    )
-    index_ast = _env_arg(ctx, index_node)
-    assert isinstance(index_ast, ast.AST)
-    proxy_subscript[dim] = index_node.meta["val"]
-    ast_subscript[dim] = index_ast
-
-    from ..generate_ast import GenerateAST
-
+        raise exc.BackendUnsupported("cute", unsupported)
     if not isinstance(ctx.cg, GenerateAST):
         raise exc.NotAllowedInHelperFunction
+    from .loop_carries import prepare_gather_range
 
-    state = CodegenState(ctx.cg, fx_node=node, env=ctx.env)
-    index_exprs = _cute_index_exprs(
+    for active in ctx.cg.active_device_loops.values():
+        for loop in active:
+            if isinstance(loop, DeviceLoopState):
+                prepare_gather_range(loop, ctx.cg)
+    env = CompileEnvironment.current()
+    state = CodegenState(ctx.cg, fx_node=input_node, env=ctx.env)
+    proxies = [idx.meta["val"] if isinstance(idx, Node) else idx for idx in indices]
+    expressions: list[object] = [
+        _env_arg(ctx, idx) if isinstance(idx, Node) else idx for idx in indices
+    ]
+
+    # Bare tiles and full slices contribute result axes; scalar indices select
+    # planes. A direct identity iota selects a prefix starting at zero.
+    axes: list[int] = []
+    blocks: dict[int, int] = {}
+    iota_length: str | None = None
+    for pos, idx in enumerate(proxies):
+        if type(idx) is int:
+            continue
+        if isinstance(idx, torch.SymInt):
+            block = env.get_block_id(idx)
+            origin = HostFunction.current().expr_to_origin.get(idx.node.expr)
+            if origin is not None and type(origin.origin) is GridOrigin:
+                continue  # hl.grid selects one plane, not a result axis.
+            if (
+                block is None
+                or env.is_jagged_tile(block)
+                or not env.known_equal(idx, env.block_sizes[block].var)
+                or block in blocks.values()
+            ):
+                raise exc.BackendUnsupported("cute", unsupported)
+            blocks[pos] = block
+        elif isinstance(idx, torch.Tensor):
+            iota = indices[pos]
+            if not (
+                isinstance(iota, Node)
+                and iota.target is torch.ops.prims.iota.default
+                and iota.kwargs.get("start") == 0
+                and iota.kwargs.get("step") == 1
+                and idx.dtype in (torch.int32, torch.int64)
+            ):
+                raise exc.BackendUnsupported("cute", unsupported)
+            if idx.dtype == torch.int32:
+                capacity = _resolve_tile_extent(
+                    idx.shape[0], env, ctx.cg.device_function.config
+                )
+                if capacity is None or capacity - 1 > torch.iinfo(idx.dtype).max:
+                    raise exc.BackendUnsupported("cute", unsupported)
+            length = iota.args[0]
+            if isinstance(length, Node):
+                expr = _env_arg(ctx, length)
+                if not isinstance(expr, ast.AST):
+                    raise exc.BackendUnsupported("cute", unsupported)
+                iota_length = ast.unparse(expr)
+            elif type(length) is int:
+                iota_length = str(length)
+            else:
+                raise exc.BackendUnsupported("cute", unsupported)
+        elif not (isinstance(idx, slice) and idx == slice(None)):
+            raise exc.BackendUnsupported("cute", unsupported)
+        axes.append(pos)
+    # Only replay a lone iota on a scalar-indexed plane. Multiple tensor
+    # indexers can share an axis instead of denoting independent slices.
+    if iota_length is not None and len(axes) != 1:
+        raise exc.BackendUnsupported("cute", unsupported)
+    if not -len(axes) <= dim < len(axes):
+        raise exc.InvalidReductionDim(dim)
+    pos = axes[dim]
+    # A full source slice starts at zero. With a tiled index on this axis,
+    # use its local lane; two full slices share the existing load coordinate.
+    full_slice_lanes: dict[int, str] = {}
+    for result_axis, axis in enumerate(axes):
+        if axis == pos or axis in blocks:
+            continue
+        extent = index_node.meta["val"].shape[result_axis]
+        if env.known_equal(input_node.meta["val"].shape[result_axis], extent):
+            continue
+        if env.known_equal(tensor.shape[axis], 1):
+            full_slice_lanes[axis] = "0"
+            continue
+        bid = env.resolve_block_id(extent)
+        if bid is None or not env.known_equal(env.block_sizes[bid].var, extent):
+            raise exc.BackendUnsupported("cute", unsupported)
+        lane = _cute_active_index_var(state, bid)
+        if lane is None:
+            raise exc.BackendUnsupported("cute", unsupported)
+        begin = ctx.cg.tile_begin_var(_cute_remap_block_id(state, bid))
+        full_slice_lanes[axis] = f"(({lane}) - ({begin}))"
+
+    # The gather index is relative to the source tile. The original lane's
+    # mask cannot guard the selected lane at the tail of a different tile.
+    # Keep the other source dimensions' coordinates and automatic masks.
+    ids = _env_arg(ctx, index_node)
+    assert isinstance(ids, ast.AST)
+    local = ctx.cg.lift(ids, dce=True, prefix="gather_index").id
+    selected = local
+    terms = [f"({local}) >= 0"]
+    if pos in blocks:
+        block = _cute_remap_block_id(state, blocks[pos])
+        loops = ctx.cg.active_device_loops.get(block)
+        owner = loops[-1] if loops else ctx.cg.current_grid_state
+        info = owner.block_id_to_info.get(block) if owner else None
+        if info is None or info.unsigned_grid_end:
+            raise exc.BackendUnsupported("cute", unsupported)
+        end = info.end_var_name
+        end_expr = (
+            info.grid_end_expr if info.grid_end_expr is not None else info.end_expr
+        )
+        if end is None and end_expr is not None:
+            end = state.device_function.literal_expr(end_expr)
+        if end is None:
+            raise exc.BackendUnsupported("cute", unsupported)
+        begin = ctx.cg.tile_begin_var(block)
+        selected = ctx.cg.lift(
+            expr_from_string(f"cutlass.Int64({begin}) + cutlass.Int64({local})"),
+            dce=True,
+            prefix="gather_coord",
+        ).id
+        terms.append(
+            f"({local}) < ({state.device_function.block_size_var(block) or '1'})"
+        )
+
+        def physical_bound(value: str) -> str:
+            # A guarded ND loop compares signed Int32 bounds, even when
+            # the saved tensor-index value carries the same bits as Uint32.
+            if isinstance(owner, DeviceLoopState) and isinstance(
+                owner.strategy, NDTileStrategy
+            ):
+                return f"cutlass.Int32({value})"
+            return value
+
+        wide_extent = ctx.cg.unsigned_tile_edge(block, extent=True)
+        if wide_extent is not None:
+            # A literal unsigned stop must not be compared as a signed CuTe
+            # operand. Every lane of a tile with a negative signed origin fits.
+            terms.append(f"(({begin}) < 0 or ({local}) < ({wide_extent}))")
+        else:
+            # A nonnegative local index cannot move backwards unless the
+            # signed coordinate overflows. Test that and the exclusive stop
+            # directly: Uint64 zero-extends narrower signed CuTe scalars.
+            terms.extend(
+                (
+                    f"({selected}) >= ({begin})",
+                    f"({selected}) < ({physical_bound(end)})",
+                )
+            )
+        if info.mask_has_lower_bound:
+            lower = info.begin_var_name
+            if lower is None and info.begin_expr is not None:
+                lower = state.device_function.literal_expr(info.begin_expr)
+            if lower is None:
+                raise exc.BackendUnsupported("cute", unsupported)
+            terms.append(f"({selected}) >= ({physical_bound(lower)})")
+
+    # Resolve the original load before replacing the gathered coordinate. Its
+    # tile still owns its block; a neighbouring full slice cannot borrow it.
+    resolution = _cute_resolve_subscript(
         state,
-        proxy_subscript,
-        ast_subscript,
+        proxies,
+        expressions,
         tensor=tensor,
         inactive_slice_expr="None",
         inactive_singleton_slice_expr="0",
     )
+    index_exprs = resolution.index_exprs
+    for axis in axes:
+        if axis == pos or axis in full_slice_lanes:
+            proxies[axis] = 0  # The selected coordinates are guarded below.
+        elif axis not in blocks:
+            # Mask each full slice with the block that supplied its address.
+            bid = resolution.dims[axis].block_id
+            proxies[axis] = 0 if bid is None else env.block_sizes[bid].var
+    for axis, coord in full_slice_lanes.items():
+        index_exprs[axis] = coord
+        size = state.device_function.tensor_size(tensor, axis).name
+        terms.extend((f"({coord}) >= 0", f"({coord}) < ({size})"))
+    if pos in blocks and env.known_equal(tensor.shape[pos], 1):
+        index_exprs[pos] = "0"
+    else:
+        index_exprs[pos] = selected
+        physical = state.device_function.tensor_size(tensor, pos).name
+        if iota_length is not None and iota_length != physical:
+            terms.append(f"({local}) < ({iota_length})")
+        terms.extend((f"({selected}) >= 0", f"({selected}) < ({physical})"))
+    other_mask = _cute_combined_mask(state, proxies, None, tensor=tensor)
+    if other_mask is not None:
+        terms.append(other_mask)
+    mask_expr = " and ".join(f"({term})" for term in terms)
     tensor_name = ctx.cg.device_function.tensor_arg(tensor).name
     load_expr = f"{tensor_name}[{', '.join(index_exprs)}]"
-    mask_expr = _cute_combined_mask(state, proxy_subscript, None, tensor=tensor)
     if tensor.dtype is torch.bool:
         load_expr = f"({load_expr} != cutlass.Uint8(0))"
         if mask_expr is None:

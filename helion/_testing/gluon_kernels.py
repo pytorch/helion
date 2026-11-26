@@ -24,6 +24,20 @@ def dot_mm(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
 
 
 @helion.kernel(static_shapes=True, backend="gluon")
+def split_k_mm(x: torch.Tensor, y: torch.Tensor, offset: int = 0) -> torch.Tensor:
+    m, k = x.size()
+    _, n = y.size()
+    offset = hl.specialize(offset)
+    out = torch.zeros([m, n], dtype=torch.float32, device=x.device)
+    for tile_m, tile_n, outer_k in hl.tile([m, n, k], block_size=[None, None, 256]):
+        acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+        for inner_k in hl.tile(outer_k.begin + offset, outer_k.end):
+            acc = torch.addmm(acc, x[tile_m, inner_k], y[inner_k, tile_n])
+        hl.atomic_add(out, [tile_m, tile_n], acc)
+    return out
+
+
+@helion.kernel(static_shapes=True, backend="gluon")
 def nvfp4_mm(
     x: torch.Tensor, x_scale: torch.Tensor, y: torch.Tensor, y_scale: torch.Tensor
 ) -> torch.Tensor:

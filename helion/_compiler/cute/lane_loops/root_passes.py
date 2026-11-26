@@ -27,6 +27,7 @@ from ...ast_read_writes import dead_assignment_elimination
 from ...ast_read_writes import dead_expression_elimination
 from ..passes.hoist_chunk_recurrence import hoist_lane_invariant_chunk_recurrence
 from ..register_tile_admission import RegisterTileOptions
+from ..tile_bounds import SerialRangeFacts
 from .defer_tile_reductions import defer_tile_reductions
 from .markers import has_lane_reduce_markers
 from .markers import restore_unprocessed_lane_reduce_markers
@@ -147,7 +148,9 @@ def run_root_lane_passes(codegen: GenerateAST) -> None:
         proven_tensor_stride_values=(
             codegen.device_function.proven_tensor_stride_values()
         ),
-        constexpr_value=codegen.device_function.resolved_int_constexpr,
+        range_facts=SerialRangeFacts.for_device_function(codegen.device_function)
+        if lane_markers
+        else None,
         rename_groups=lane_rename_groups,
         new_var=codegen.device_function.new_var,
     )

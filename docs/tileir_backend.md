@@ -152,6 +152,13 @@ def optimized_kernel(x: torch.Tensor) -> torch.Tensor:
 
 ## Limitations
 
+TileIR raises `helion.exc.InvalidConfig` at compile time for a grid
+coordinate that may need the full `uint64` range. For example, a tile
+with a loaded `uint64` stop can use `tile.index`: a runtime check keeps
+the reached lanes within signed 64-bit range. Reading `tile.end` can
+still require the unsigned exclusive edge, which TileIR rejects if the
+compiler cannot prove it fits the signed type.
+
 ### Unsupported Triton Operations
 
 There are some operations currently unsupported by the TileIR backend. Please refer to the [Triton-to-tile-IR README](https://github.com/triton-lang/Triton-to-tile-IR) for the latest list of unsupported operations.

@@ -46,6 +46,7 @@ from helion._testing import xfailIfPallas
 from helion._testing.cute_codegen import cpu_bind
 from helion._testing.cute_codegen import forbid_native_compile
 from helion._testing.cute_codegen import mock_cuda_unavailable
+from helion._testing.cute_thread_simulator import execute_pointwise_thread_program
 import helion.language as hl
 
 _LARGE_BF16_SHAPE = (51200, 51200)
@@ -5227,100 +5228,6 @@ def _broadcast_coordinate_pad_3d(x: torch.Tensor, width: int):
     return out
 
 
-def _execute_pointwise_thread_program(source, inputs):
-    """Execute the actual scalar program for every launched CTA/thread on CPU."""
-    import itertools
-    import operator
-    from types import SimpleNamespace
-
-    writes = {}
-
-    class Pointer:
-        def __init__(self, tensor, offset=0):
-            self.tensor, self.offset = tensor, int(offset)
-
-        def __add__(self, offset):
-            return Pointer(self.tensor, self.offset + int(offset))
-
-        def load(self):
-            storage = self.tensor.as_strided(
-                (self.tensor.untyped_storage().nbytes() // self.tensor.element_size(),),
-                (1,),
-                storage_offset=0,
-            )
-            offset = self.tensor.storage_offset() + self.offset
-            assert 0 <= offset < storage.numel()
-            return storage[offset].item()
-
-        def store(self, value):
-            storage = self.tensor.as_strided(
-                (self.tensor.untyped_storage().nbytes() // self.tensor.element_size(),),
-                (1,),
-                storage_offset=0,
-            )
-            offset = self.tensor.storage_offset() + self.offset
-            assert 0 <= offset < storage.numel()
-            key = (self.tensor.untyped_storage().data_ptr(), offset)
-            writes[key] = writes.get(key, 0) + 1
-            storage[offset] = value
-
-    current = {"block": (0, 0, 0), "thread": (0, 0, 0)}
-    launches = []
-
-    def launcher(function, grid, *arguments, block):
-        launches.append(block)
-        args = [
-            SimpleNamespace(
-                iterator=Pointer(arg), layout=SimpleNamespace(stride=arg.stride())
-            )
-            if isinstance(arg, torch.Tensor)
-            else arg
-            for arg in arguments
-        ]
-        for cta in itertools.product(*(range(size) for size in grid)):
-            current["block"] = (*cta, *((0,) * (3 - len(cta))))
-            for thread in itertools.product(*(range(size) for size in block)):
-                current["thread"] = thread
-                function(*args)
-
-    tree = ast.parse(source)
-    body = []
-    for node in tree.body:
-        if isinstance(node, (ast.Import, ast.ImportFrom)):
-            continue
-        if isinstance(node, ast.FunctionDef):
-            node.decorator_list = []
-        body.append(node)
-    namespace = {
-        "torch": torch,
-        "operator": operator,
-        "_cute_python_mod": operator.mod,
-        "cutlass": SimpleNamespace(Int32=int, Int64=int, Float32=float, Boolean=bool),
-        "cute": SimpleNamespace(
-            arch=SimpleNamespace(
-                block_idx=lambda: current["block"], thread_idx=lambda: current["thread"]
-            )
-        ),
-        "_default_cute_launcher": launcher,
-        "_next_power_of_2": lambda value: 1 << (value - 1).bit_length(),
-    }
-    exec(
-        compile(
-            ast.fix_missing_locations(ast.Module(body=body, type_ignores=[])),
-            "<pointwise-thread-model>",
-            "exec",
-        ),
-        namespace,
-    )
-    wrapper = next(
-        node.name for node in reversed(body) if isinstance(node, ast.FunctionDef)
-    )
-    result = namespace[wrapper](*inputs)
-    assert len(writes) == result.numel()
-    assert set(writes.values()) == {1}, "duplicate or missing output ownership"
-    return result, launches
-
-
 @skipUnlessBackends(["cute"])
 @pytest.mark.parametrize(
     "shape,width,tiles",
@@ -5351,7 +5258,7 @@ def test_cute_broadcast_coordinates_generated_values(shape, width, tiles, revers
     # (and so no thread axis) is allocated for them.
     assert not any(block.reduction for block in bound.env.block_sizes)
     validate_thread_axis_accesses(ast.parse(source).body)
-    actual, launches = _execute_pointwise_thread_program(source, inputs)
+    actual, launches = execute_pointwise_thread_program(source, inputs)
     expected = torch.full((*shape[:-1], width), -7.0)
     expected[..., : shape[-1]] = inputs[0] + 1
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
@@ -5527,7 +5434,7 @@ def test_backed_singleton_slice_binding_cache(widths, block):
             bound_by_width[width] = bound
             config = bound.config_spec.default_config()
             config.config["block_sizes"] = [block]
-            actual, _ = _execute_pointwise_thread_program(bound.to_code(config), (x,))
+            actual, _ = execute_pointwise_thread_program(bound.to_code(config), (x,))
             torch.testing.assert_close(actual, x + 1, rtol=0, atol=0)
             torch.testing.assert_close(storage, before, rtol=0, atol=0)
         if widths[0] == 1:
@@ -5667,7 +5574,7 @@ def test_cute_nested_broadcast_coordinates_values(shape, flat, reverse, static_s
         source = bound.to_code(config)
     # The outer tiles' broadcast coordinates allocate no reduction dim.
     assert not any(block.reduction for block in bound.env.block_sizes)
-    actual, launches = _execute_pointwise_thread_program(source, inputs)
+    actual, launches = execute_pointwise_thread_program(source, inputs)
     expected = (values[..., None, None] * table[column]).sum(2)
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
     assert all(len(block) == 3 and math.prod(block) <= 1024 for block in launches)
@@ -5679,7 +5586,7 @@ def test_cute_nested_pointwise_outer_index_values():
     with mock_cuda_unavailable(), _target(), forbid_native_compile():
         bound = cpu_bind(_broadcast_axis_nested, inputs)
         source = bound.to_code(helion.Config(block_sizes=[2, 8]))
-    actual, _ = _execute_pointwise_thread_program(source, inputs)
+    actual, _ = execute_pointwise_thread_program(source, inputs)
     torch.testing.assert_close(
         actual, inputs[0] + torch.arange(3)[:, None], rtol=0, atol=0
     )

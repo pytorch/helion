@@ -6,6 +6,7 @@ import ast
 from contextlib import ExitStack
 from contextlib import contextmanager
 import dataclasses
+from functools import partial
 import importlib.util
 import sys
 from types import MappingProxyType
@@ -22,7 +23,36 @@ if TYPE_CHECKING:
     from collections.abc import Mapping
     from pathlib import Path
 
+    from triton.runtime.jit import JITFunction
+
     from ..runtime.kernel import BoundKernel
+
+
+def descriptor_coordinates(
+    source: str, op: str, *, descriptor: str | None = None
+) -> list[tuple[str, ...]]:
+    """Return each descriptor operation's coordinates without its ABI int32 casts."""
+
+    def coordinate(arg: ast.expr) -> str:
+        if (
+            isinstance(arg, ast.Call)
+            and ast.unparse(arg.func) == "tl.cast"
+            and len(arg.args) == 2
+            and ast.unparse(arg.args[1]) == "tl.int32"
+        ):
+            arg = arg.args[0]
+        return ast.unparse(arg)
+
+    calls = (node for node in ast.walk(ast.parse(source)) if isinstance(node, ast.Call))
+    return [
+        tuple(coordinate(arg) for arg in call.args[0].elts)
+        for call in sorted(calls, key=lambda node: (node.lineno, node.col_offset))
+        if isinstance(call.func, ast.Attribute)
+        and call.func.attr == op
+        and (descriptor is None or ast.unparse(call.func.value) == descriptor)
+        and call.args
+        and isinstance(call.args[0], ast.List)
+    ]
 
 
 @pytest.fixture
@@ -122,6 +152,58 @@ def _cluster_capacity(device: object, cluster_size: int) -> int:
     return 148 // cluster_size * cluster_size
 
 
+def interpret_triton_kernel(
+    kernel: JITFunction,
+    grid: tuple[int, ...],
+    *args: object,
+    selected_ops: set[str] | None = None,
+    physical_pid: int | None = None,
+    **kwargs: object,
+) -> object:
+    """Interpret a launch on CPU and restore Triton builtins before native compilation."""
+    from triton.runtime.interpreter import InterpretedFunction
+    from triton.runtime.interpreter import _patch_lang
+    from triton.runtime.jit import JITFunction
+
+    # The standard library was imported before interpreter mode. Dispatch
+    # its existing JIT helpers through the same interpreter, without
+    # replacing top-k/sort arithmetic with a reference implementation.
+    def device_call(
+        function: JITFunction, *values: object, **options: object
+    ) -> object:
+        if selected_ops is not None and function.fn.__name__ in ("sort", "topk"):
+            selected_ops.add(function.fn.__name__)
+        interpreted = InterpretedFunction(function.fn)
+        # InterpretedFunction.__call__ patches each helper's language
+        # namespace without restoring it. Helpers may import tl.core,
+        # which the outer grid's tl patch does not cover.
+        scope = _patch_lang(function.fn)
+        try:
+            return interpreted.rewrite()(*values, **options)
+        finally:
+            scope.restore()
+
+    with ExitStack() as stack:
+        stack.enter_context(patch.object(JITFunction, "__call__", device_call))
+        if physical_pid is not None:
+            from triton.runtime.interpreter import interpreter_builder
+
+            # Execute one physical program of a large 1-D launch; the kernel
+            # still sees the original grid size and the real Int32 program ID.
+            (size,) = grid
+            set_grid_idx = interpreter_builder.set_grid_idx
+
+            def select(x: int, y: int, z: int) -> None:
+                interpreter_builder.set_grid_dim(size, 1, 1)
+                set_grid_idx(physical_pid, y, z)
+
+            stack.enter_context(
+                patch.object(interpreter_builder, "set_grid_idx", select)
+            )
+            grid = (1,)
+        return InterpretedFunction(kernel.fn)[grid](*args, **kwargs)
+
+
 def interpret_triton_selection(
     source: str,
     inputs: tuple[object, ...],
@@ -135,10 +217,7 @@ def interpret_triton_selection(
     host wrapper, runs on ``inputs``. The names of the ``sort`` and ``topk``
     helpers the kernel calls are added to ``selected_ops``.
     """
-    from triton.runtime.interpreter import InterpretedFunction
-    from triton.runtime.interpreter import _patch_lang
     from triton.runtime.interpreter import interpreter_builder
-    from triton.runtime.jit import JITFunction
 
     # Compiled kernels check integer overflow only in debug mode, and the
     # ordered images (_emit_ordered_image) rely on unsigned wraparound. The
@@ -156,33 +235,11 @@ def interpret_triton_selection(
     monkeypatch.setitem(sys.modules, spec.name, module)
     spec.loader.exec_module(module)
 
-    def launch(
-        kernel: JITFunction, grid: tuple[int, ...], *args: object, **kwargs: object
-    ) -> object:
-        # The standard library was imported before interpreter mode. Dispatch
-        # its existing JIT helpers through the same interpreter, without
-        # replacing top-k/sort arithmetic with a reference implementation.
-        def device_call(
-            function: JITFunction, *values: object, **options: object
-        ) -> object:
-            if selected_ops is not None and function.fn.__name__ in ("sort", "topk"):
-                selected_ops.add(function.fn.__name__)
-            interpreted = InterpretedFunction(function.fn)
-            # InterpretedFunction.__call__ patches each helper's language
-            # namespace without restoring it. Helpers may import tl.core,
-            # which the outer grid's tl patch does not cover.
-            scope = _patch_lang(function.fn)
-            try:
-                return interpreted.rewrite()(*values, **options)
-            finally:
-                scope.restore()
-
-        with patch.object(JITFunction, "__call__", device_call):
-            return InterpretedFunction(kernel.fn)[grid](*args, **kwargs)
-
     function = next(
         node.name
         for node in reversed(ast.parse(source).body)
         if isinstance(node, ast.FunctionDef)
     )
-    return vars(module)[function](*inputs, _launcher=launch)
+    return vars(module)[function](
+        *inputs, _launcher=partial(interpret_triton_kernel, selected_ops=selected_ops)
+    )

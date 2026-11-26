@@ -166,6 +166,9 @@ class TestCapabilityHooks(unittest.TestCase):
         answers, the input returned unchanged, and no mutation of the lists
         they are handed.  The defaults never look at their arguments."""
         arg = SimpleNamespace()
+        ctx = SimpleNamespace(
+            device_function=SimpleNamespace(triton_unbounded_uint64_axes=set())
+        )
         for name, backend in _backends().items():
             if name == "cute":
                 continue
@@ -185,7 +188,7 @@ class TestCapabilityHooks(unittest.TestCase):
                 )
                 self.assertEqual(outputs, [arg])
                 if name != "gluon":  # gluon finalizes its ring and pipelining
-                    self.assertEqual(backend.finalize_kernel_def(arg, [], arg), [])
+                    self.assertEqual(backend.finalize_kernel_def(arg, [], ctx), [])
                 statements: list[object] = [arg]
                 result = backend.finalize_host_statements(arg, arg, statements)
                 self.assertIs(result[0], statements)

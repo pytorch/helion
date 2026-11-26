@@ -23,6 +23,7 @@ from helion._testing.cute_codegen import cpu_bind
 from helion._testing.cute_codegen import cpu_target
 from helion._testing.cute_codegen import forbid_native_compile
 from helion._testing.cute_codegen import mock_cuda_unavailable
+from helion._testing.cute_thread_simulator import execute_pointwise_thread_program
 import helion.language as hl
 from helion.runtime.settings import _get_backend
 
@@ -1616,8 +1617,6 @@ def _ordinary_tiled_scan(x: torch.Tensor, kind: hl.constexpr, reverse: hl.conste
 
 def _execute_direct_scan_program(source, inputs):
     """Interpret generated tensor subscripts using their actual storage strides."""
-    from test.test_indexing import _execute_pointwise_thread_program
-
     tree = ast.parse(source)
     kernel = next(
         node
@@ -1670,7 +1669,7 @@ def _execute_direct_scan_program(source, inputs):
         if isinstance(node, ast.ImportFrom)
         and any(alias.asname == "_cute_checked_block_dims" for alias in node.names)
     ]
-    result, _ = _execute_pointwise_thread_program(
+    result, _ = execute_pointwise_thread_program(
         ast.unparse(ast.fix_missing_locations(TensorIndex().visit(tree))), inputs
     )
     return result

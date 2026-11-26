@@ -798,6 +798,31 @@ and specialization constraints are described in
 
 ## Ahead-of-Time (AOT) Heuristic Tuning
 
+A dynamic standalone export checks the index width of its inputs. An empty
+tensor can still contribute a live launch dimension: for example, `(7, 0)`
+and `(2**31 + 7, 0)` may need different index widths. A non-structural
+export raises `ValueError` before launch if the inputs need a wider index
+than its one compiled binding; a wide binding can still serve narrower inputs.
+CuTe structural exports require a matching binding for each width class.
+Regenerate the file from the additional binding to enable that width. Use one configured
+`index_dtype` per output file. Keep each structural file with the source and
+heuristic model that produced its variants; use a new output location or
+clear the AOT cache to intentionally start a replacement file.
+
+An ordinary dynamic export also checks the values of `hl.constexpr`
+arguments against the values used at compile time. A Python `range`, for
+example, can be used in a Helion kernel but cannot be saved in this
+dispatch key. Export raises `InvalidAPIUsage` naming the argument and
+leaves an existing artifact in place.
+
+A dynamic standalone heuristic choosing among several configurations applies the same
+custom key and flattens its results just as runtime AOT does. Use a named,
+source-defined key with portable captures. Export rejects unsupported keys
+(such as lambdas) before replacing the file. A dynamic artifact also requires
+one custom key, including its captured values, across its variants. Write to
+a different file or clear the AOT cache to change that key. Runtime AOT still
+accepts opaque callables.
+
 Helion's standard autotuning runs at the first call to a kernel and tunes
 for the *exact* arguments seen.  That is great for development, but it
 forces every cold-start invocation to pay a long tuning cost, and it does

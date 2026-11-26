@@ -737,6 +737,7 @@ class CompileEnvironment:
         settings: Settings,
         *,
         index_dtype: torch.dtype | None = None,
+        wide_empty_grid: bool = False,
         is_distributed: bool = False,
     ) -> None:
         from ..autotuner.config_spec import ConfigSpec
@@ -748,6 +749,7 @@ class CompileEnvironment:
         self.index_dtype: torch.dtype = (
             index_dtype or settings.index_dtype or torch.int32
         )
+        self.wide_empty_grid = wide_empty_grid
         self._is_distributed = is_distributed
         self.process_group_name = None
         self._backend = get_backend(settings.backend)
@@ -3024,37 +3026,34 @@ class CompileEnvironment:
         ]
 
     def should_broadcast_tensor_indexers(self, index: typing.Sequence[object]) -> bool:
-        """Check whether tensor indexers need broadcasting.
+        return self.tensor_indexer_broadcast_group(index) is not None
 
-        Args:
-            index: The full index list (may contain torch.Tensor or TensorType)
-        """
-        # Import here to avoid circular import
+    def tensor_indexer_broadcast_group(
+        self, index: typing.Sequence[object]
+    ) -> tuple[int, list[torch.Tensor]] | None:
+        """The first subscript position and the adjacent tensor indices sharing
+        output axes. A scalar alone or beside one vector adds no axes."""
         from .type_info import TensorType
 
-        positions = [
-            i for i, k in enumerate(index) if isinstance(k, (torch.Tensor, TensorType))
-        ]
-        tensors = [
-            k.fake_value if isinstance(k, TensorType) else k
-            for k in index
-            if isinstance(k, (torch.Tensor, TensorType))
-        ]
+        positions: list[int] = []
+        tensors: list[torch.Tensor] = []
+        for position, k in enumerate(index):
+            if isinstance(k, TensorType):
+                k = k.fake_value
+            if isinstance(k, torch.Tensor):
+                positions.append(position)
+                tensors.append(k)
 
-        if not tensors:
-            return False
+        if sum(t.ndim for t in tensors) <= 1:
+            return None
         # 1D tensors with block-size dims don't need broadcasting
         if all(
             t.ndim == 1 and self.get_block_id(t.size(0)) is not None for t in tensors
         ):
-            return False
-        # Single scalar or 1D tensor doesn't need broadcast handling
-        if len(tensors) == 1 and tensors[0].ndim <= 1:
-            return False
-        # Non-consecutive tensor indexers don't broadcast together
-        return len(positions) <= 1 or positions == list(
-            range(positions[0], positions[-1] + 1)
-        )
+            return None
+        if positions[-1] - positions[0] + 1 != len(positions):
+            return None
+        return positions[0], tensors
 
     def tensor_indexer_broadcast_shape(
         self, tensors: typing.Sequence[torch.Tensor]
@@ -4554,6 +4553,10 @@ class BlockSizeInfo:
                 env = CompileEnvironment.current()
                 # Refresh the var_to_val hint to match the resolved block size
                 hint = env.size_hint(size)
+                # An empty logical extent cannot replace a registered physical
+                # width: a later live tile may reuse this same block ID.
+                if hint == 0:
+                    return
                 shape_env_var_hints(env.shape_env)[self.symbol()] = sympy.Integer(hint)
                 with contextlib.suppress(KeyError):
                     # update the size hint now that we know the size

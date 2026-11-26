@@ -26,6 +26,7 @@ import inspect
 import logging
 from pathlib import Path
 import re
+import symtable
 import tempfile
 import textwrap
 from typing import TYPE_CHECKING
@@ -36,14 +37,18 @@ from .._compiler.compile_environment import (
     tensor_descriptor_runtime_alignment_signature,
 )
 from .._compiler.output_code_utils import _check_kernel_name_not_shadowed
+from .._compiler.output_code_utils import dependency_free_runtime_names
 from .._compiler.output_code_utils import dependency_free_runtime_source
 from .._compiler.triton.backend import TritonBackend
+from ..runtime.kernel import _dynamic_tensor_width_key
+from ..runtime.kernel import _tensor_index_class
 
 if TYPE_CHECKING:
     from collections.abc import Callable
 
     from ..runtime.structural_policy import StructuralPolicy
     from .aot_structural_export import RuntimeGuard
+    from .aot_structural_export import SpecializedInputFacts
 
 log: logging.Logger = logging.getLogger(__name__)
 
@@ -69,14 +74,28 @@ def _standalone_value_key(
     if type(value) is int:
         return ("int", value)
     if type(value) is float:
-        return ("float", value.hex())
+        # The binder compares the binary64 representation, including NaN payloads.
+        from struct import pack
+
+        return ("float", pack("!d", value))
     if type(value) is str:
         return ("str", value)
     if isinstance(value, torch.dtype):
         return ("dtype", str(value))
     if isinstance(value, torch.device):
         return ("device", str(value))
-    if type(value) is tuple:
+    if isinstance(value, tuple) and type(value) not in (tuple, torch.Size):
+        # A caller can supply the actual wrapper while a standalone artifact
+        # must remain importable without Helion. A wrapper already has its
+        # defining module loaded; do not mistake a user tuple with a value field.
+        from sys import modules
+
+        constexpr = getattr(modules.get("helion.language.constexpr"), "ConstExpr", ())
+        if isinstance(value, constexpr):
+            return _standalone_value_key(
+                value[0], tensor_descriptor_guards=tensor_descriptor_guards
+            )
+    if type(value) is tuple or type(value) is torch.Size:
         return (
             "tuple",
             tuple(
@@ -154,6 +173,7 @@ def _is_supported_helion_import(import_line: str) -> bool:
         # The tensor maps of box-form prefetches, inlined as ``to_code``'s
         # Helion-free output does (``TritonBackend.embedded_helper_source``).
         TritonBackend().library_imports["helion_tensor_maps"],
+        TritonBackend().library_imports["helion_triton_helpers"],
     }
 
 
@@ -202,70 +222,130 @@ def _rename_config_symbols(body: str, kernel_name: str, config_idx: int) -> str:
     return body
 
 
-def _extract_heuristic_body(heuristic_code: str, kernel_name: str) -> str:
-    """
-    Extract the config-index selection logic from generated heuristic code.
+def _referenced_globals(table: symtable.SymbolTable) -> set[str]:
+    """Global reads, including those in nested functions and comprehensions."""
+    names = {
+        symbol.get_name()
+        for symbol in table.get_symbols()
+        if symbol.is_global() and symbol.is_referenced()
+    }
+    for child in table.get_children():
+        names.update(_referenced_globals(child))
+    return names
 
-    Keeps ``key_<kernel>`` (decision-tree backend) or ``_extract_features``
-    / ``_predict`` (nearest-neighbor backend).  Strips everything else.
-    """
-    lines = heuristic_code.split("\n")
-    out: list[str] = []
 
-    in_docstring = False
-    in_multiline_list = False
-    skip_fn: str | None = None
-    skip_header = True
-
-    for line in lines:
-        stripped = line.strip()
-
-        # --- docstrings ---
-        if stripped.startswith('"""'):
-            if stripped.count('"""') >= 2 and len(stripped) > 3:
-                continue
-            in_docstring = not in_docstring
-            continue
-        if in_docstring:
-            continue
-
-        # --- leading imports / blanks / comments ---
-        if skip_header and (
-            stripped.startswith(("import ", "from ", "#")) or stripped == ""
+def _imports_helion(tree: ast.AST) -> bool:
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            if any(alias.name.split(".")[0] == "helion" for alias in node.names):
+                return True
+        elif (
+            isinstance(node, ast.ImportFrom)
+            and (node.module or "").split(".")[0] == "helion"
         ):
-            continue
-        skip_header = False
+            return True
+    return False
 
-        # --- module-level constants ---
-        if stripped.startswith(("CONFIGS", "FEATURE_NAMES", "USED_FEATURES")):
-            if "[" in stripped and "]" not in stripped:
-                in_multiline_list = True
-            continue
-        if in_multiline_list:
-            if "]" in stripped:
-                in_multiline_list = False
-            continue
 
-        # --- functions: keep only those relevant to this kernel ---
-        if stripped.startswith("def "):
-            keep_prefixes = (
-                f"def key_{kernel_name}(",
-                "def _extract_features(",
-                "def _predict(",
-                "def _get_dtype_cat(",
+def _key_requires_helion(source: str) -> bool:
+    tree = ast.parse(source)
+    if _imports_helion(tree):
+        return True
+    modules: set[str] = set()
+    loaders = {"__import__"}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            modules.update(
+                a.asname or a.name for a in node.names if a.name == "importlib"
             )
-            if not any(stripped.startswith(p) for p in keep_prefixes):
-                skip_fn = stripped
-                continue
-        if skip_fn is not None:
-            if stripped and not line[0].isspace():
-                skip_fn = None
-            else:
-                continue
+        elif isinstance(node, ast.ImportFrom) and node.module == "importlib":
+            loaders.update(
+                a.asname or a.name for a in node.names if a.name == "import_module"
+            )
+    for call in (n for n in ast.walk(tree) if isinstance(n, ast.Call)):
+        fn = call.func
+        if (isinstance(fn, ast.Name) and fn.id in loaders) or (
+            isinstance(fn, ast.Attribute)
+            and fn.attr == "import_module"
+            and isinstance(fn.value, ast.Name)
+            and fn.value.id in modules
+        ):
+            name = (
+                call.args[0]
+                if call.args
+                else next((kw.value for kw in call.keywords if kw.arg == "name"), None)
+            )
+            if not (
+                isinstance(name, ast.Constant)
+                and isinstance(name.value, str)
+                and name.value.partition(".")[0] not in ("", "helion")
+            ):
+                return True
+    return False
 
-        out.append(line)
 
-    return "\n".join(out)
+def _standalone_heuristic_source(source: str, kernel_name: str) -> str:
+    """Keep model initialization and the selector portable without a tuner dependency."""
+    if not _key_requires_helion(source):
+        return source
+    tree = ast.parse(source)
+    namespace_reads = {
+        "globals",
+        "locals",
+        "vars",
+        "exec",
+        "eval",
+        "__builtins__",
+        "__import__",
+    }
+    # Compile mode discovers configs through this entry point. The exported file
+    # dispatches with key_<kernel> instead. Keep defaults and annotations eager;
+    # decorators or a reference from the remaining code can make the body live.
+    tuner_name = f"autotune_{kernel_name}"
+    tuners = [
+        n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == tuner_name
+    ]
+    if len(tuners) == 1 and not tuners[0].decorator_list:
+        tuner = tuners[0]
+        original_body = tuner.body
+        tuner.body = [ast.Pass()]
+        rest = _referenced_globals(
+            symtable.symtable(ast.unparse(tree), "<standalone selector>", "exec")
+        )
+        if tuner_name in rest or namespace_reads & rest:
+            tuner.body = original_body
+    used = _referenced_globals(
+        symtable.symtable(ast.unparse(tree), "<standalone selector>", "exec")
+    )
+    # An indirect namespace lookup can observe even an otherwise unused import.
+    if used & namespace_reads:
+        raise ValueError("Standalone heuristic selector requires a Helion import")
+    body = []
+    for node in tree.body:
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            keep = []
+            for alias in node.names:
+                module = (
+                    alias.name if isinstance(node, ast.Import) else node.module or ""
+                )
+                if module.split(".")[0] != "helion":
+                    keep.append(alias)
+                elif (
+                    alias.name == "*"
+                    or (alias.asname or alias.name.split(".")[0]) in used
+                ):
+                    raise ValueError(
+                        "Standalone heuristic selector requires a Helion import"
+                    )
+            if not keep:
+                continue
+            node.names = keep
+        body.append(node)
+    tree.body = body
+    portable_source = ast.unparse(tree)
+    if _key_requires_helion(portable_source):
+        raise ValueError("Standalone heuristic selector requires a Helion import")
+    return portable_source
 
 
 # ---------------------------------------------------------------------------
@@ -284,7 +364,11 @@ def generate_standalone_file(
     *,
     structural_policy: StructuralPolicy | None = None,
     user_key: Callable[..., object] | None = None,
+    _key_source: tuple[str, str] | None = None,
     dynamic_groups: list[tuple[tuple[object, ...], list[int]]] | None = None,
+    index_limit: int | None = None,
+    expected_width: int | None = None,
+    specialized_input_facts: SpecializedInputFacts = (),
     runtime_guards: tuple[RuntimeGuard, ...] = (),
     runtime_guard_plans: tuple[tuple[RuntimeGuard, ...], ...] | None = None,
 ) -> Path:
@@ -307,6 +391,12 @@ def generate_standalone_file(
         dispatch_keys: Optional static call keys parallel to *triton_codes*.
         tensor_descriptor_guards: Include tensor-descriptor runtime predicates in
             static dispatch keys.
+        expected_width: Bound index width class for a dynamic artifact with one
+            compiled binding. Reject incompatible calls before invoking the child.
+        specialized_input_facts: Binding-time literals and tensor metadata that an
+            ordinary dynamic child substituted as constants.
+        index_limit: Fixed index dtype maximum for dynamic exports;
+            by default use automatic Int32/Int64 indexing.
         runtime_guards: Legacy single structural guard plan. Static keys are
             ``(call_key, guard_key)``; dynamic-group keys wrap that pair as
             ``("exact" | "dynamic", (call_key, guard_key))``.
@@ -319,7 +409,19 @@ def generate_standalone_file(
     Returns:
         Path to the generated file.
     """
+    if (
+        user_key is not None
+        and dispatch_keys is None
+        and (structural_policy is not None or len(triton_codes) > 1)
+    ):
+        from .aot_structural_export import _user_key_source
+
+        _key_source = _user_key_source(user_key)
     if structural_policy is not None:
+        if expected_width is not None:
+            raise ValueError(
+                "Structural standalone widths are selected by dynamic_groups"
+            )
         from .aot_structural_export import generate_policy_standalone
 
         return generate_policy_standalone(
@@ -330,10 +432,11 @@ def generate_standalone_file(
             kernel_source_file,
             dispatch_keys,
             structural_policy,
-            user_key,
+            _key_source,
             dynamic_groups,
             runtime_guards,
             runtime_guard_plans,
+            index_limit,
         )
     if dispatch_keys is not None:
         if len(dispatch_keys) != len(triton_codes):
@@ -360,6 +463,14 @@ def generate_standalone_file(
         imports, body = _split_imports_and_body(code)
         for imp in imports:
             if "helion" in imp:
+                if imp == "import helion.language as hl":
+                    # The generated module postpones annotations. Retain the
+                    # usual refusal if hl is also read by executable code.
+                    table = symtable.symtable(
+                        "from __future__ import annotations\n" + body, "<child>", "exec"
+                    )
+                    if "hl" not in _referenced_globals(table):
+                        continue
                 if "default_cute_launcher" in imp:
                     # CuTe does not yet expose a dependency-free launcher. Keep
                     # its required runtime import instead of silently emitting
@@ -385,11 +496,9 @@ def generate_standalone_file(
 
     if needs_runtime:
         launcher_info = TritonBackend().dependency_free_launcher_info
-        supported_runtime_names = {
-            launcher_info.launcher_symbol,
-            *launcher_info.runtime_helper_names,
-        }
-        if unknown := runtime_references - supported_runtime_names:
+        if unknown := runtime_references.difference(
+            dependency_free_runtime_names(launcher_info)
+        ):
             raise ValueError(
                 "unsupported Helion runtime helper in standalone AOT input: "
                 f"{', '.join(sorted(unknown))}"
@@ -435,10 +544,45 @@ def generate_standalone_file(
     for i, body in enumerate(bodies):
         parts.extend([f"\n# {sep}", f"# Config {i}", f"# {sep}\n", body])
 
+    selector_name = "_helion_aot_select"
+    while kernel_name.startswith(selector_name):
+        selector_name += "_"
     if n > 1 and dispatch_keys is None:
-        # Heuristic dispatch for multi-config
-        parts.extend([f"\n# {sep}", "# Heuristic dispatch", f"# {sep}\n"])
-        parts.append(_extract_heuristic_body(heuristic_code, kernel_name))
+        # The selector is a separate Python module. Its imports and builtins
+        # must not resolve against the publicly named kernel or its children.
+        model_source = _standalone_heuristic_source(heuristic_code, kernel_name)
+        key_name = f"key_{kernel_name}"
+        parts.extend(
+            [
+                f"\n# {sep}",
+                "# Heuristic dispatch",
+                f"# {sep}\n",
+                f"def {selector_name}():",
+                "    from builtins import BaseException, exec, globals",
+                "    from hashlib import sha256",
+                "    import os",
+                "    from sys import modules",
+                "    from types import ModuleType",
+                f"    source = {model_source!r}",
+                "    path = os.path.realpath(globals().get('__file__', __name__))",
+                "    digest = sha256(os.fsencode(path) + b'\\x00' + source.encode()).hexdigest()",
+                "    name = __name__ + '._helion_selector_' + digest",
+                "    model = modules.get(name)",
+                "    if model is None:",
+                "        model = ModuleType(name)",
+                "        model.__file__ = path",
+                "        modules[name] = model",
+                "        try:",
+                "            exec(source, model.__dict__)",
+                "        except BaseException:",
+                "            del modules[name]",
+                "            raise",
+                f"    if {key_name!r} in model.__dict__:",
+                f"        return model.__dict__[{key_name!r}]",
+                "    return lambda *args: model._predict(model._extract_features(*args))",
+                f"{selector_name} = {selector_name}()",
+            ]
+        )
 
     if dispatch_keys is not None:
         parts.extend([f"\n# {sep}", "# Static call dispatch", f"# {sep}\n"])
@@ -475,13 +619,109 @@ def generate_standalone_file(
             ]
         )
     else:
-        if n == 1:
-            select_expr = "0"
-        elif f"def key_{kernel_name}(" in heuristic_code:
-            select_expr = f"key_{kernel_name}(*args)"
-        else:
-            select_expr = "_predict(_extract_features(*args))"
-        parts.extend([f"\ndef {kernel_name}(*args, **kwargs):", "    return ["])
+        select_expr = "0" if n == 1 else f"{selector_name}(*args)"
+        guard_name = "_helion_aot_width_guard"
+        while kernel_name.startswith(guard_name):
+            guard_name += "_"
+        if specialized_input_facts or expected_width is not None or n > 1:
+            children = ", ".join(f"_{kernel_name}_c{i}" for i in range(n))
+            parts.extend(
+                [
+                    f"def {guard_name}():",
+                    "    from builtins import RuntimeError, ValueError, any, bool, int, isinstance, max, next, tuple",
+                    "    import inspect",
+                    "    import torch",
+                    f"    signatures = tuple(inspect.signature(child) for child in ({children},))",
+                    "    signature = next((sig for sig in signatures if not any(p.kind == p.VAR_POSITIONAL for p in sig.parameters.values())), signatures[0])",
+                    "    names = tuple(name for name, p in signature.parameters.items() if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD))",
+                ]
+            )
+            if expected_width is not None:
+                parts.extend(
+                    [
+                        textwrap.indent(inspect.getsource(_tensor_index_class), "    "),
+                        textwrap.indent(
+                            inspect.getsource(_dynamic_tensor_width_key), "    "
+                        ),
+                    ]
+                )
+            features = "normalized"
+            if _key_source is not None:
+                from .aot_kernel import _flatten_key_value
+
+                key_source, key_name = _key_source
+                if not has_helion_deps and _key_requires_helion(key_source):
+                    from ..runtime.structural_policy import StructuralPolicyError
+
+                    raise StructuralPolicyError(
+                        "Dependency-free standalone user key requires a Helion import "
+                        "or an unresolved dynamic import"
+                    )
+                features = "_flatten_key_value(user_key(*normalized))"
+                # Keep captured globals in the key's own namespace. The public
+                # kernel can itself be named like a builtin used by the flattener.
+                parts.extend(
+                    [
+                        "    from builtins import exec, float, list, str",
+                        "    key_globals = {}",
+                        f"    exec({key_source!r}, key_globals)",
+                        f"    user_key = key_globals[{key_name!r}]",
+                        textwrap.indent(inspect.getsource(_flatten_key_value), "    "),
+                    ]
+                )
+            if specialized_input_facts:
+                from .aot_structural_export import _matches_specialized_input
+                from .aot_structural_export import _project_input
+
+                parts.extend(
+                    [
+                        "    from builtins import TypeError, dict, float, getattr, len, list, object, repr, sorted, str, type",
+                        textwrap.indent(
+                            inspect.getsource(_standalone_value_key), "    "
+                        ),
+                        textwrap.indent(inspect.getsource(_project_input), "    "),
+                        textwrap.indent(
+                            inspect.getsource(_matches_specialized_input), "    "
+                        ),
+                    ]
+                )
+            parts.extend(
+                [
+                    "    def check(args, kwargs):",
+                    "        bound = signature.bind(*args, **kwargs)",
+                    "        bound.apply_defaults()",
+                ]
+            )
+            if expected_width is not None:
+                parts.extend(
+                    [
+                        "        tensors = torch.utils._pytree.tree_leaves(tuple(bound.arguments.values()))",
+                        f"        width = max((_dynamic_tensor_width_key(x, {index_limit!r}) for x in tensors if isinstance(x, torch.Tensor)), default=0)",
+                        f"        if width > {expected_width}:",
+                        '            raise ValueError("No standalone variant for the requested index width")',
+                    ]
+                )
+            if specialized_input_facts:
+                parts.extend(
+                    [
+                        "        values = tuple(bound.arguments[name] for name in names)",
+                        f"        if any(not _matches_specialized_input(values, path, value) for path, value in {specialized_input_facts!r}):",
+                        '            raise ValueError("No standalone variant for the specialized input value")',
+                    ]
+                )
+            parts.extend(
+                [
+                    "        normalized = tuple(bound.arguments[name] for name in names) if names else args",
+                    f"        return {features}",
+                    "    return check",
+                    f"{guard_name} = {guard_name}()",
+                ]
+            )
+        parts.append(f"\ndef {kernel_name}(*args, **kwargs):")
+        if specialized_input_facts or expected_width is not None or n > 1:
+            parts.append(f"    normalized = {guard_name}(args, kwargs)")
+            select_expr = select_expr.replace("*args", "*normalized")
+        parts.append("    return [")
         for i in range(n):
             parts.append(f"        _{kernel_name}_c{i},")
         parts.extend([f"    ][{select_expr}](*args, **kwargs)", ""])

@@ -186,25 +186,26 @@ class _HostState:
                 # justify replacing an input's property by this output's.
                 return self.tensor(original.rank)
             raise _Decline
+        # Scalar guards may combine comparisons or select one by stride sign.
+        # Even an untaken arm must be free of calls that could change metadata.
+        operands: tuple[ast.expr, ...]
         if isinstance(node, ast.BinOp):
-            if not all(
-                isinstance(self.read(operand), (_Scalar, _Property))
-                for operand in (node.left, node.right)
-            ):
-                raise _Decline
-            return _Scalar()
-        if isinstance(node, ast.UnaryOp):
-            if not isinstance(self.read(node.operand), (_Scalar, _Property)):
-                raise _Decline
-            return _Scalar()
-        if isinstance(node, ast.Compare):
-            if not all(
-                isinstance(self.read(operand), (_Scalar, _Property))
-                for operand in (node.left, *node.comparators)
-            ):
-                raise _Decline
-            return _Scalar()
-        raise _Decline
+            operands = (node.left, node.right)
+        elif isinstance(node, ast.UnaryOp):
+            operands = (node.operand,)
+        elif isinstance(node, ast.Compare):
+            operands = (node.left, *node.comparators)
+        elif isinstance(node, ast.BoolOp):
+            operands = tuple(node.values)
+        elif isinstance(node, ast.IfExp):
+            operands = (node.test, node.body, node.orelse)
+        else:
+            raise _Decline
+        if not all(
+            isinstance(self.read(arg), (_Scalar, _Property)) for arg in operands
+        ):
+            raise _Decline
+        return _Scalar()
 
     def assign(self, target: ast.expr, value: _Value) -> None:
         if isinstance(target, ast.Name):
@@ -267,6 +268,16 @@ def prove_tensor_layout_relations(
             if isinstance(statement, ast.Assign) and len(statement.targets) == 1:
                 value = state.read(statement.value)
                 state.assign(statement.targets[0], value)
+            elif (
+                isinstance(statement, ast.If)
+                and not statement.orelse
+                and len(statement.body) == 1
+                and isinstance(statement.body[0], ast.Raise)
+                and isinstance(state.read(statement.test), (_Scalar, _Property))
+            ):
+                # Only the fallthrough path can reach the launch. A pure
+                # scalar guard cannot change prior tensor metadata there.
+                continue
             elif isinstance(statement, ast.Expr) and isinstance(
                 statement.value, ast.Constant
             ):

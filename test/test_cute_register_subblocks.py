@@ -264,6 +264,26 @@ def _plain_dot(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     return out
 
 
+def _batch_grid_dot(a, b, begin: hl.constexpr, stop: hl.constexpr, step: hl.constexpr):
+    out = torch.zeros_like(a)
+    for batch in hl.grid(begin, stop, step):
+        rows = hl.arange(16)
+        cols = hl.arange(16)
+        out[batch, rows, cols] = hl.dot(a[batch, rows, cols], b[batch, rows, cols])
+    return out
+
+
+@pytest.mark.parametrize("bounds", [(0, 8, 2), (7, -1, -1), (1, 8, 1)])
+def test_noncanonical_register_batch_grid_declines(bounds):
+    x = torch.empty((8, 16, 16), dtype=torch.bfloat16, device=CPU_DEVICE)
+    bound = _bind(_batch_grid_dot, (x, x, *bounds))
+    program, reason = _program(bound)
+    assert program is None and reason and "zero-based, unit-step" in reason
+    assert bound.config_spec.cute_register_subblocks_facts is None
+    with pytest.raises(InvalidConfig, match="available only for roots"), bound.env:
+        bound.config_spec.normalized_config(_config(bound, **{KEY: family.MODE_ON}))
+
+
 def _acc_dot(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     n = a.size(0)
     k = b.size(2)

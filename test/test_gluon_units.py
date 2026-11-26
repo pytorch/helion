@@ -41,6 +41,7 @@ from helion._testing.gluon_kernels import scale_then_wx_and_f16_vx
 from helion._testing.gluon_kernels import scale_then_wx_and_nvfp4
 from helion._testing.gluon_kernels import split_k_gemv
 from helion._testing.gluon_kernels import split_k_halves
+from helion._testing.gluon_kernels import split_k_mm
 from helion._testing.gluon_kernels import split_k_parts
 from helion._testing.triton_codegen import GLUON_RING_CONFIG as _RING
 from helion._testing.triton_codegen import gluon_cpu_codegen
@@ -201,6 +202,55 @@ def _two_pairs(x: torch.Tensor, w1: torch.Tensor, w3: torch.Tensor) -> torch.Ten
 
 
 class TestAccumulatorRings(TestCase):
+    @skipIfRefEager("inspects the ring producer's generated coordinates")
+    def test_nested_k_tile_keeps_its_ring(self) -> None:
+        x = torch.empty(64, 1024, dtype=torch.bfloat16)
+        y = torch.empty(1024, 64, dtype=torch.bfloat16)
+        config = helion.Config(**_RING, block_sizes=[32, 32, 64])
+        with gluon_cpu_codegen():
+            for offset, sites in ((0, 2), (64, 2), (1, 0), (-8, 0)):
+                with self.subTest(offset=offset):
+                    code = split_k_mm.bind((x, y, offset)).to_triton_code(config)
+                    self.assertEqual(code.count("ring_put("), sites)
+
+    @skipIfRefEager("inspects the ring producer's generated coordinates")
+    def test_ring_descriptor_coordinates(self) -> None:
+        @helion.kernel(static_shapes=True, backend="gluon")
+        def mm(
+            x: torch.Tensor, w: torch.Tensor, rows: torch.Tensor, shift: hl.constexpr
+        ) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for row, col in hl.tile(x.shape, block_size=[128, 128]):
+                start = rows[row.id] * 128
+                acc = hl.zeros([row, col], dtype=torch.float32)
+                for k in hl.tile(128, block_size=64):
+                    acc = hl.dot(
+                        x[start + hl.arange(128), k.index + shift], w[k, col], acc=acc
+                    )
+                out[row, col] = acc
+            return out
+
+        x = torch.empty(256, 256, dtype=torch.float16)
+        rows = torch.empty(2, dtype=torch.int64)
+        config = helion.Config(**_RING, num_warps=4)
+        with gluon_cpu_codegen():
+            aligned, shifted = (
+                mm.bind((x, torch.empty_like(x), rows, shift)).to_triton_code(config)
+                for shift in (0, 1)
+            )
+        # Aligned rows stage. An out-of-range row becomes a true OOB coordinate
+        # before int32 narrowing, including a negative or much wider row id.
+        self.assertRegex(
+            aligned,
+            r"ring_put\(.*x_ring_desc, \(tl.cast\(tl.where\(box_live\w*, \w+, 256\)",
+        )
+        self.assertNotIn("x_ring_desc", shifted)
+        # Both K tiles fit in the 256-row weight; the guarded X load does not
+        # disqualify the independent, aligned W subrange from staging.
+        self.assertIn("w_ring_desc", shifted)
+        self.assertIn("% 8 == 0", shifted)
+        self.assertIn("tl.load(x +", shifted)
+
     @skipIfRefEager("reads compiler state, which ref mode does not build")
     def test_a_dot_takes_a_ring_without_a_live_accumulator(self) -> None:
         """Two K loops of a task, one after the other, with two same-shape dots
@@ -1858,6 +1908,22 @@ class TestTlNamespace(TestCase):
 
 
 class TestPipelinedLoads(TestCase):
+    def test_conditional_load_stays_in_its_branch(self) -> None:
+        loop = cast(
+            "ast.For",
+            ast.parse(
+                "for k in tl.range(0, 128, 64, num_stages=2):\n"
+                "    x = tl.load_tensor_descriptor(desc, [k, 0]) if native else tl.load(p + k)\n"
+                "    y = tl.load(q + k)"
+            ).body[0],
+        )
+        body = gluon_pipeline._pipelined(loop, 2, 0, {"p": 0, "q": 1})
+        assert body is not None
+        code = ast.unparse(ast.Module(body=body, type_ignores=[]))
+        self.assertIn("if native else tl.load(p + k)", code)
+        self.assertEqual(code.count("pipe_alloc("), 1)
+        self.assertIn("pipe_alloc(q +", code)
+
     def test_load_arguments_by_keyword(self) -> None:
         """A pipelined ``tl.load`` keeps its mask and other given by keyword."""
         for source in ("tl.load(p, mask=m, other=0.0)", "tl.load(p, m, 0.0)"):

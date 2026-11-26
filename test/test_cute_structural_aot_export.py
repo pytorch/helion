@@ -36,6 +36,7 @@ import helion.language as hl
 from helion.runtime.cute.structural_config import StructuralPolicyError
 from helion.runtime.cute.structural_policy import CUTE_STRUCTURAL_SETTINGS
 from helion.runtime.cute.structural_policy import CuteStructuralPolicy
+from helion.runtime.kernel import _resolve_index_widths
 
 pytestmark = pytest.mark.cpu_only
 
@@ -239,6 +240,93 @@ def test_actual_public_export_keeps_all_structural_source_closures(
     )
 
 
+@pytest.mark.parametrize(
+    ("static", "structural", "mutation"),
+    [
+        (False, True, "size"),
+        (True, True, "size"),
+        (True, False, "size"),
+        (True, True, "classifier"),
+        (True, False, "item"),
+    ],
+    ids=["dynamic", "static", "ordinary-static", "during-guards", "ordinary-list-item"],
+)
+def test_resized_specialized_input_cannot_publish_an_exact_variant(
+    tmp_path: Path,
+    static: bool,
+    structural: bool,
+    mutation: str,
+) -> None:
+    def fixed(x, out):
+        n = hl.specialize(x.size(0))
+        for _ in hl.grid(1):
+            out[0] = n
+
+    if mutation == "item":
+
+        def item(x, out):
+            n = hl.specialize(x[0])
+            for _ in hl.grid(1):
+                out[0] = n
+
+        function = item
+        value = [7]
+    else:
+        function = fixed
+        value = torch.empty(7, 0)
+
+    policy = CuteStructuralPolicy() if structural else None
+    kernel = helion.aot_kernel(
+        _relocate(function, tmp_path),
+        backend="cute",
+        static_shapes=static,
+        cute_structural_policy=policy,
+    )
+    args = (value, torch.zeros(1, dtype=torch.int64))
+    bound = kernel._bind_isolated(args)
+    model = tmp_path / "model.py"
+    model.write_text(
+        attach_model_policy(
+            f"def key_{kernel.name}(*args):\n    return 0\ndef autotune_{kernel.name}(*args):\n    return {{}}\n",
+            {kernel.name: [helion.Config(block_sizes=[])]},
+            policy,
+        )
+    )
+    cache = AOTAutotuneCache(BaseSearch(bound, args))
+    path = policy_path(tmp_path / f"original_{kernel.name}_standalone.py", policy)
+    with patch.object(cache, "_find_heuristic_file", return_value=model):
+        cache._maybe_run_compile()
+        original = path.read_bytes()
+        if mutation == "classifier":
+
+            def resizing_guard(bound, current):
+                result = export_runtime_guards(bound, current)
+                current[0].resize_(15, 0)
+                return result
+
+            with patch(
+                "helion.autotuner.aot_structural_export.export_runtime_guards",
+                resizing_guard,
+            ):
+                cache._maybe_run_compile()
+            args[0].resize_(15, 0)
+        else:
+            if mutation == "item":
+                value[0] = 15
+            else:
+                value.resize_(15, 0)
+            with pytest.raises(
+                helion.exc.InvalidAPIUsage,
+                match="bound (?:specialized input|input metadata)",
+            ):
+                cache._maybe_run_compile()
+    assert path.read_bytes() == original
+    hold = Mock()
+    with pytest.raises(ValueError, match="No standalone variant"):
+        getattr(_module(path), kernel.name)(*args, _launcher=hold)
+    hold.assert_not_called()
+
+
 def test_dynamic_specialized_export_accumulates_exact_metadata_groups(
     tmp_path: Path,
 ) -> None:
@@ -273,18 +361,21 @@ def test_dynamic_specialized_export_accumulates_exact_metadata_groups(
     hold.assert_not_called()
 
 
-def _size_key(x: torch.Tensor) -> tuple[int, torch.dtype]:
-    return (x.numel(), x.dtype)
-
-
 def test_dynamic_user_key_snapshot_and_named_argument_dispatch(tmp_path: Path) -> None:
     function = _function(tmp_path)
     policy = CuteStructuralPolicy()
+
+    def make_key(shift: int):
+        def size_key(x: torch.Tensor) -> tuple[int, torch.dtype]:
+            return x.numel() + shift, x.dtype
+
+        return size_key
+
     kernel = helion.aot_kernel(
         function,
         backend="cute",
         static_shapes=False,
-        key=_size_key,
+        key=make_key(0),
         cute_structural_policy=policy,
     )
     args = (torch.empty(37),)
@@ -305,6 +396,17 @@ def test_dynamic_user_key_snapshot_and_named_argument_dispatch(tmp_path: Path) -
             x=x, _launcher=lambda *args, calls=calls, **kwargs: calls.append(args[0])
         )
         assert calls[0] is module._helion_aot_modules[index]._helion__pointwise
+
+    # Identical function text with different captured state would change the
+    # selection for an already published group, even on a compile-cache hit.
+    previous = path.read_bytes()
+    with (
+        patch.object(cache, "_find_heuristic_file", return_value=model),
+        patch.object(kernel, "_aot_user_key", make_key(64)),
+        pytest.raises(StructuralPolicyError, match="same custom key"),
+    ):
+        cache._maybe_run_compile()
+    assert path.read_bytes() == previous
 
 
 def test_bad_model_and_unrelocatable_user_key_do_not_replace_export(
@@ -592,6 +694,211 @@ def _canonical_copy(x: torch.Tensor) -> torch.Tensor:
     for i, j in hl.tile(x.shape):
         out[i, j] = x[i, j] + 1
     return out
+
+
+@pytest.mark.parametrize("static_first", [False, True])
+def test_structural_writer_keeps_the_owner_of_its_output(tmp_path, static_first):
+    policy = CuteStructuralPolicy()
+    fn = _relocate(_canonical_copy, tmp_path)
+    tensor = torch.empty(7, 0)
+    model = tmp_path / "model.py"
+    name = fn.__name__
+    model.write_text(_model(name, [helion.Config()], policy, 8))
+    path = policy_path(tmp_path / f"original_{name}_standalone.py", policy)
+    for static in (static_first, not static_first):
+        kernel = helion.aot_kernel(
+            fn, backend="cute", static_shapes=static, cute_structural_policy=policy
+        )
+        bound = kernel._bind_isolated((tensor,))
+        cache = AOTAutotuneCache(BaseSearch(bound, (tensor,)))
+        with (
+            patch.object(cache, "_find_heuristic_file", return_value=model),
+            patch.object(
+                bound, "to_triton_code", return_value=f"def {name}(x): return 7"
+            ),
+        ):
+            if static == static_first:
+                cache._maybe_run_compile()
+                previous = path.read_bytes()
+            else:
+                with pytest.raises(StructuralPolicyError, match="already owns"):
+                    cache._maybe_run_compile()
+                assert path.read_bytes() == previous
+
+
+def test_structural_selector_uses_the_model_snapshot_that_compiled_its_children(
+    tmp_path,
+):
+    policy = CuteStructuralPolicy()
+    function = _relocate(_canonical_copy, tmp_path)
+    kernel = helion.aot_kernel(
+        function, backend="cute", static_shapes=False, cute_structural_policy=policy
+    )
+    tensor = torch.empty(7, 0)
+    bound = kernel._bind_isolated((tensor,))
+    cache = AOTAutotuneCache(BaseSearch(bound, (tensor,)))
+    model = tmp_path / "model.py"
+    configs = [helion.Config(block_sizes=[n]) for n in (16, 32)]
+    original = _model(kernel.name, configs, policy, 5)
+    swapped = _model(kernel.name, list(reversed(configs)), policy, 50)
+    model.write_text(original)
+
+    def compile_child(config):
+        model.write_text(swapped)
+        return f"def {kernel.name}(x): return {config.block_sizes[0]}"
+
+    with (
+        patch.object(cache, "_find_heuristic_file", return_value=model),
+        patch.object(bound, "to_triton_code", side_effect=compile_child),
+    ):
+        cache._maybe_run_compile()
+    path = policy_path(tmp_path / f"original_{kernel.name}_standalone.py", policy)
+    # Seven rows select config 1 in the original model, and config 0 in the replacement.
+    assert getattr(_module(path), kernel.name)(tensor) == 32
+
+
+@pytest.mark.parametrize("dtype", [None, torch.uint32])
+def test_dynamic_export_guards_empty_grid_index_width(
+    tmp_path: Path, dtype: torch.dtype | None
+) -> None:
+    policy = CuteStructuralPolicy()
+    kernel = helion.aot_kernel(
+        _relocate(_canonical_copy, tmp_path),
+        backend="cute",
+        static_shapes=False,
+        index_dtype=dtype,
+        cute_structural_policy=policy,
+    )
+    model = tmp_path / "model.py"
+    raw = (
+        "def key__canonical_copy(*args):\n    return 0\n"
+        "def autotune__canonical_copy(*args):\n    return {}\n"
+    )
+    model.write_text(attach_model_policy(raw, {kernel.name: [helion.Config()]}, policy))
+    path = policy_path(tmp_path / "original__canonical_copy_standalone.py", policy)
+    previous_target = tmp_path / "existing.py"
+    previous_target.write_text("# existing target")
+    path.symlink_to(previous_target)
+    limit = torch.iinfo(dtype or torch.int32).max
+    narrow, wide = (torch.empty(n, 0) for n in (7, limit + 8))
+    observed_guards = []
+    for tensor in (narrow, wide):
+        bound = kernel._bind_isolated((tensor,))
+        observed_guards.append(export_runtime_guards(bound, (tensor,)))
+        cache = AOTAutotuneCache(BaseSearch(bound, (tensor,)))
+        if tensor is wide:
+            cache.data_dir = tmp_path / "second-data-dir"
+        # Isolate dispatch from compilation and GPU launch. Encode the actual
+        # binder decision in the generated child so wrong selection is visible.
+        decision = (str(bound.env.index_dtype), bound.env.wide_empty_grid)
+        code = f"def {kernel.name}(x):\n    return {decision!r}\n"
+        with (
+            patch.object(cache, "_find_heuristic_file", return_value=model),
+            patch.object(bound, "to_triton_code", return_value=code),
+        ):
+            if tensor is wide and dtype is None:
+                previous = path.read_bytes()
+                source = tmp_path / "original.py"
+                original = source.read_bytes()
+                source.write_bytes(original + b"\n# different source revision\n")
+                with pytest.raises(StructuralPolicyError, match="already owns"):
+                    cache._maybe_run_compile()
+                assert path.read_bytes() == previous
+                source.write_bytes(original)
+            cache._maybe_run_compile()
+        wrapper = getattr(_module(path), kernel.name)
+        assert wrapper(tensor) == decision
+        if tensor is narrow:
+            assert wrapper(torch.empty(limit, 0)) == decision
+            with pytest.raises(ValueError, match="No standalone variant"):
+                wrapper(wide)
+    assert not path.is_symlink()
+    assert previous_target.read_text() == "# existing target"
+    assert observed_guards[0] == observed_guards[1]
+    assert wrapper(narrow) != wrapper(wide)
+    previous = path.read_bytes()
+    other_model = tmp_path / "changed_model.py"
+    other_model.write_text(model.read_text() + "\n# updated model\n")
+    with (
+        patch.object(cache, "_find_heuristic_file", return_value=other_model),
+        patch.object(bound, "to_triton_code", return_value=code),
+        pytest.raises(StructuralPolicyError, match="different heuristic model"),
+    ):
+        cache._maybe_run_compile()
+    assert path.read_bytes() == previous
+
+    # Tensor metadata can change between binding and export.
+    bound = kernel._bind_isolated((narrow,))
+    cache = AOTAutotuneCache(BaseSearch(bound, (narrow,)))
+    narrow.resize_(wide.shape)
+    with (
+        patch.object(cache, "_find_heuristic_file", return_value=model),
+        pytest.raises(helion.exc.InvalidAPIUsage, match="bound kernel"),
+    ):
+        cache._maybe_run_compile()
+    narrow.resize_(15, 0)
+
+    def resize_while_compiling(config):
+        narrow.resize_(wide.shape)
+        return code
+
+    with (
+        patch.object(cache, "_find_heuristic_file", return_value=model),
+        patch.object(bound, "to_triton_code", side_effect=resize_while_compiling),
+        pytest.raises(
+            helion.exc.InvalidAPIUsage, match="changed during code generation"
+        ),
+    ):
+        cache._maybe_run_compile()
+    narrow.resize_(7, 0)
+    # Capture the same width that is actually serialized, even if a caller
+    # mutates metadata between the initial binder validation and that read.
+
+    def resize_after_validation(settings, inputs):
+        observed = _resolve_index_widths(settings, inputs)
+        narrow.resize_(wide.shape)
+        return observed
+
+    with (
+        patch.object(cache, "_find_heuristic_file", return_value=model),
+        patch(
+            "helion.autotuner.aot_cache._resolve_index_widths",
+            side_effect=resize_after_validation,
+        ),
+        pytest.raises(helion.exc.InvalidAPIUsage, match="signature index width"),
+    ):
+        cache._maybe_run_compile()
+    narrow.resize_(7, 0)
+    if dtype is not None:
+        # An oversized nonempty tensor cannot use the fixed dtype's wide-grid
+        # variant, even when it has the same rank and requires no large storage.
+        nonempty = torch.empty(1).expand(limit + 8, 1)
+        assert _export_call_key(
+            (wide,), dynamic=True, index_limit=limit
+        ) != _export_call_key((nonempty,), dynamic=True, index_limit=limit)
+        with pytest.raises(ValueError, match="No standalone variant"):
+            wrapper(nonempty)
+
+    # Two binders cannot assign different width policies to one exported file.
+    alias = tmp_path / "alias.py"
+    alias.symlink_to(kernel.fn.__code__.co_filename)
+    other = helion.aot_kernel(
+        _module(alias)._canonical_copy,
+        backend="cute",
+        static_shapes=False,
+        index_dtype=torch.int32,
+        cute_structural_policy=policy,
+    )._bind_isolated((narrow,))
+    previous = path.read_bytes()
+    cache = AOTAutotuneCache(BaseSearch(other, (narrow,)))
+    cache.data_dir = tmp_path / "other-aot-dir"
+    with (
+        patch.object(cache, "_find_heuristic_file", return_value=model),
+        patch.object(other, "to_triton_code", return_value=code),
+        pytest.raises(StructuralPolicyError, match="same index dtype"),
+    ):
+        cache._maybe_run_compile()
+    assert path.read_bytes() == previous
 
 
 def _stride_extent_copy(x: torch.Tensor) -> torch.Tensor:
