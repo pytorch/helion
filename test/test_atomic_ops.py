@@ -6091,6 +6091,13 @@ class TestFragmentTerminalLoopCPU(unittest.TestCase):
                 loop_op = next(
                     op for op in block.operations if op.operation.name == "scf.for"
                 )
+                # Check the effective operands, independently of redundant casts.
+                self.assertEqual(list(loop_op.operands)[:2], list(block.arguments))
+                step = loop_op.operands[2]
+                self.assertEqual(step.owner.operation.name, "arith.constant")
+                self.assertEqual(
+                    ir.IntegerAttr(step.owner.attributes["value"]).value, 1
+                )
                 self.assertEqual(str(loop_op.body.arguments[0].type), "i64")
                 self.assertNotIn("arith.trunci", str(module))
 

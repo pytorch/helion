@@ -742,3 +742,30 @@ these labelled lines.
   A workaround is to use distinct block IDs or to consume the captured
   value before entering the inner loop.
 - Pinned by: none.
+
+## triton-grid-product-stored-in-int64
+
+- Area: Python grid-index arithmetic used as a stored value in Triton and
+  in ordinary and computed-fragment CuTe kernels.
+- What is wrong: For an Int64 output of shape (1, 2), nest
+  `for i in hl.grid(2, 4)` inside `for r in hl.grid(1)` and store
+  `out[r, i - 2] = i * 2**30`. Eager stores [2147483648, 3221225472].
+  With default indexing, both backends multiply in Int32 and sign-extend
+  the result. Their SM103 programs store [-2147483648, -1073741824].
+  An explicit `index_dtype=torch.int64` still gives those negative values
+  for this nested loop on both backends. For the top-level Triton grid,
+  explicit Int64 indexing does give the eager values. The default Triton
+  interpreter reproduces the top-level wrap but misses the nested one.
+  Unchecked CuTe computed fragments also evaluate the product in Int32
+  with default indexing. Unlike the ordinary nested lowering, a computed
+  fragment widens the index before multiplication under explicit Int64 indexing.
+- Since: Pristine main at `229afece6` for both backends; also reproduced
+  on `6e81e9c09` for Triton.
+- Why deferred: Ordinary lowering must distinguish Python index arithmetic
+  used as a value from address arithmetic and explicitly typed tensor math.
+  Correcting it calls for separate coverage of existing configurations and
+  the cost of widening ordinary kernels. This entry concerns unchecked
+  stores only.
+- Pinned by: `test_grid_induction_product_uses_kernel_index_type` in
+  `test/test_cute_fragment_loop_captures.py` checks computed-fragment
+  index widths; it does not exercise the ordinary nested-store overflow.
