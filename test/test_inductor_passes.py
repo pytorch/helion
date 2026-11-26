@@ -2,18 +2,28 @@ from __future__ import annotations
 
 import functools
 import pathlib
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
 import pytest
+import sympy
 import torch
+from torch._dynamo.source import ConstantSource
 from torch._inductor import config
+from torch._inductor import ir
 from torch._inductor.custom_graph_pass import CustomGraphModulePass
 from torch._inductor.decomposition import select_decomp_table
+from torch._inductor.graph import GraphLowering
+from torch._inductor.virtualized import V
 from torch.fx.experimental.proxy_tensor import make_fx
+from torch.fx.experimental.symbolic_shapes import DimDynamic
 from torch.utils import _pytree as pytree
 
 from helion._compat import requires_torch_version
+from helion._compiler import backend_registry
+from helion._compiler.cute import inductor_plan
+from helion._compiler.cute.backend import CuteBackend
 from helion._testing import TestCase
 
 if not requires_torch_version("2.16"):
@@ -21,10 +31,12 @@ if not requires_torch_version("2.16"):
 
 import helion.inductor
 from helion.inductor import config as helion_config
+from helion.inductor.choices import HelionChoices
 from helion.inductor.fx_passes import post_grad
 from helion.inductor.fx_passes.cat_reductions import pointwise
 from helion.inductor.fx_passes.cat_reductions import split_cat_reductions
 from helion.inductor.fx_passes.post_grad import HelionPostGradPass
+from helion.inductor.support import split_k_reduction
 
 pytestmark = pytest.mark.cpu_only
 
@@ -47,8 +59,9 @@ class Recorder(CustomGraphModulePass):
 class TestSourceHash(TestCase):
     def test_covers_subpackages(self):
         # _source_hash, in Inductor's FX graph cache key, hashes every module of
-        # helion.inductor: a change to the codegen in codegen/ or to a pass in
-        # fx_passes/ misses the cache, as one to a module at the top does.
+        # helion.inductor: a change to the codegen in codegen/, to a pass in
+        # fx_passes/ or to a lowering in lowering/ misses the cache, as one to a
+        # module at the top does.
         package = pathlib.Path(helion.inductor.__file__).parent
         hashed = {
             path.relative_to(package).as_posix()
@@ -61,8 +74,28 @@ class TestSourceHash(TestCase):
             "fx_passes/cat_reductions.py",
             "fx_passes/online_softmax.py",
             "fx_passes/post_grad.py",
+            "lowering/mm.py",
         }
         self.assertLessEqual(expected, hashed)
+
+    def test_covers_backend_rules(self):
+        # So does a change to any registered backend's matmul rules
+        # (Backend.inductor_rules_key()), as CuteBackend hashes its rule modules.
+        for backend in (CuteBackend, backend_registry.get_backend_class("pallas")):
+            with patch.object(backend, "inductor_rules_key", return_value="new"):
+                self.assertNotEqual(
+                    helion_config._hash_sources(), helion_config._source_hash
+                )
+        rule_modules = {module.__name__ for module in inductor_plan.RULE_MODULES}
+        expected = {
+            "helion._compiler.cute.cp_async_operand",
+            "helion._compiler.cute.cute_warp_mma_gemm",
+            "helion._compiler.cute.dense_aligned_n",
+            "helion._compiler.cute.inductor_plan",
+            "helion._compiler.cute.tcgen05.search_plan",
+            "helion._compiler.cute.tcgen05_constants",
+        }
+        self.assertLessEqual(expected, rule_modules)
 
 
 class TestPostGradPass(TestCase):
@@ -90,6 +123,28 @@ class TestPostGradPass(TestCase):
         ):
             HelionPostGradPass(None)(gm)
         self.assertEqual(graphs, [gm.graph])
+
+    def test_uuid_keys_the_split_k_flags(self):
+        # Inductor's key lacks allow_bf16_reduced_precision_reduction's _split_k half,
+        # which split_k_reduction reads; the pass's uuid holds it (for cuda_backend
+        # "helion" only).
+        matmul = torch.backends.cuda.matmul
+        saved = (
+            matmul.allow_bf16_reduced_precision_reduction,
+            matmul.allow_bf16_reduced_precision_reduction_split_k,
+        )
+        helion_pass = HelionPostGradPass(None)
+        uuids = []
+        try:
+            for flags in ((False, True), (False, False)):
+                matmul.allow_bf16_reduced_precision_reduction = flags
+                with config.patch(cuda_backend="helion"):
+                    uuids.append(helion_pass.uuid())
+                with config.patch(cuda_backend="triton"):
+                    self.assertIsNone(helion_pass.uuid()[2])
+        finally:
+            matmul.allow_bf16_reduced_precision_reduction = saved
+        self.assertNotEqual(uuids[0], uuids[1])
 
 
 @torch.library.custom_op("helion_test_inductor_passes::strided_copy", mutates_args=())
@@ -479,6 +534,100 @@ class TestCatReductions(TestCase):
         ):
             gm = make_fx(fn, tracing_mode="fake")(a, b)
             self.assertFalse(split_cat_reductions(gm.graph, devices=("cpu",)))
+
+
+class TestSplitKReduction(TestCase):
+    def test_follows_the_flags(self):
+        # torch's three states of a dtype's flag pair, and the strictest over a kernel's
+        # 16-bit dots.
+        matmul = torch.backends.cuda.matmul
+        saved = (
+            matmul.allow_fp16_reduced_precision_reduction,
+            matmul.allow_fp16_reduced_precision_reduction_split_k,
+        )
+        try:
+            for flags, expected in (
+                ((True, True), "output"),
+                ((False, True), "accumulator"),
+                ((False, False), "none"),
+            ):
+                matmul.allow_fp16_reduced_precision_reduction = flags
+                self.assertEqual(split_k_reduction([torch.float16]), expected)
+                both = [torch.bfloat16, torch.float16]
+                self.assertEqual(split_k_reduction(both), expected)
+                self.assertEqual(split_k_reduction([torch.bfloat16]), "output")
+        finally:
+            matmul.allow_fp16_reduced_precision_reduction = saved
+
+
+class TestTransposeMatmul(TestCase):
+    # HelionChoices.transpose_matmul() hands the skinny rule the operands' storage
+    # offsets: on GB300, bf16 [128, 1024] @ [1024, 3072] over a row-major b transposes
+    # with b's rows on 128-byte lines, not 8 elements into its storage.
+
+    @staticmethod
+    def layout(size, stride, offset=0):
+        return ir.FixedLayout(
+            torch.device("cuda", 0), torch.bfloat16, size, stride, offset
+        )
+
+    def b_layout(self, offset=0):
+        """The layout of b, row-major [1024, 3072], at `offset`."""
+        return self.layout([1024, 3072], [3072, 1], offset)
+
+    def transposes(self, graph, b):
+        """Whether bf16 [128, 1024] @ b, lowered in `graph`, transposes on a CPU
+        stand-in of GB300."""
+        a = ir.TensorBox.create(
+            ir.InputBuffer(name="a", layout=self.layout([128, 1024], [1024, 1]))
+        )
+        gb300 = SimpleNamespace(major=10, multi_processor_count=152)
+        with (
+            V.set_graph_handler(graph),
+            config.patch(cuda_backend="helion"),
+            helion_config.patch(backend="cute"),
+            # (it reads the graph being lowered: python_wrapper())
+            patch.object(HelionChoices, "use_native_matmul", return_value=True),
+            patch(
+                "torch._inductor.runtime.hints.DeviceProperties.create",
+                return_value=gb300,
+            ),
+        ):
+            return HelionChoices().transpose_matmul(a, b)
+
+    def test_skinny_rule_reads_the_offsets(self):
+        # b sliced from a graph input: a ReinterpretView at the slice's offset
+        graph = GraphLowering(torch.fx.symbolic_trace(lambda x: x + 1))
+        storage = ir.InputBuffer(name="b", layout=self.layout([64 + 1024 * 3072], [1]))
+        for offset, transposes in ((0, True), (64, True), (8, False)):
+            b = ir.ReinterpretView(data=storage, layout=self.b_layout(offset))
+            self.assertEqual(self.transposes(graph, b), transposes, offset)
+
+    def test_skinny_rule_reads_input_offsets(self):
+        # A graph input or constant at an offset reads offset 0 in its layout; its own
+        # offset counts, adds to a view's, and a symbolic one counts by its hint.
+        graph = GraphLowering(torch.fx.symbolic_trace(lambda x: x + 1))
+        b = ir.TensorBox.create(ir.InputBuffer(name="b", layout=self.b_layout()))
+        offsets = graph.graph_input_storage_offsets
+        for offset, transposes in ((0, True), (64, True), (8, False)):
+            offsets["b"] = sympy.Integer(offset)
+            self.assertEqual(self.transposes(graph, b), transposes, offset)
+        # a view 56 elements into an input at offset 8: 64 in all
+        offsets["b"] = sympy.Integer(8)
+        for view_offset, transposes in ((56, True), (0, False)):
+            view = ir.ReinterpretView(data=b.data, layout=self.b_layout(view_offset))
+            self.assertEqual(self.transposes(graph, view), transposes, view_offset)
+        for hint, transposes in ((64, True), (8, False)):
+            offsets["b"] = graph.sizevars.shape_env.create_symbol(
+                hint, ConstantSource(f"b_offset_{hint}"), DimDynamic.DYNAMIC
+            )
+            self.assertEqual(self.transposes(graph, b), transposes, hint)
+        # (only the constant's storage offset is read)
+        storage = torch.empty(64 + 1024 * 3072, dtype=torch.bfloat16)
+        c = ir.TensorBox.create(ir.ConstantBuffer(name="c", layout=self.b_layout()))
+        for offset, transposes in ((64, True), (8, False)):
+            graph.constants["c"] = storage[offset:][: 1024 * 3072].view(1024, 3072)
+            self.assertEqual(self.transposes(graph, c), transposes, offset)
 
 
 if __name__ == "__main__":

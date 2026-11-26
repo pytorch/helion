@@ -10,6 +10,7 @@ from torch._inductor import config as inductor_config
 from torch._inductor.custom_graph_pass import CustomGraphModulePass
 from torch._inductor.custom_graph_pass import get_hash_for_files
 
+from ..support import reduced_precision_reductions
 from .cat_reductions import split_cat_reductions
 from .online_softmax import online_softmax_patterns
 
@@ -52,4 +53,11 @@ class HelionPostGradPass(CustomGraphModulePass):
         inner = None
         if self.inner is not None and (inner := self.inner.uuid()) is None:
             return None
-        return (get_hash_for_files((__file__,)), inner)
+        # Inductor's key lacks the _split_k halves of torch's reduced-precision
+        # flags, which split_k_reduction reads.
+        reductions = (
+            tuple(reduced_precision_reductions().values())
+            if inductor_config.cuda_backend == "helion"
+            else None
+        )
+        return (get_hash_for_files((__file__,)), inner, reductions)

@@ -807,8 +807,10 @@ class Settings(_Settings):
             "accumulator dtype (fp32 for floating-point dots); 'output' also lets a "
             "dot with a 16-bit output keep or exchange its partials rounded to that "
             "dtype (the sum itself stays fp32); 'none' splits no K loop over CTAs. "
-            "Warps of one CTA sharing a K loop, and a kernel that splits K itself "
-            "(atomic adds of partial products), keep their reductions. "
+            "helion.inductor derives it from torch.backends.cuda.matmul."
+            "allow_{bf16,fp16}_reduced_precision_reduction(_split_k). Warps of one "
+            "CTA sharing a K loop, and a kernel that splits K itself (atomic adds of "
+            "partial products), keep their reductions. "
             "Set HELION_SPLIT_K_REDUCTION=accumulator|output|none."
         ),
         "cute_flash_env_overrides": (

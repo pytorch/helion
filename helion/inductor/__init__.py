@@ -17,10 +17,10 @@ caught, so they fail the compile or that call. Needs the Inductor of torch 2.16
 (pytorch/pytorch#204025).
 
 The package follows Inductor's stages: fx_passes/ rewrites the post-grad FX
-graph (HelionPostGradPass), choices.py holds the heuristics Inductor asks while
-lowering, fusing and generating code (HelionChoices), and codegen/ turns the
-fused nodes into Helion kernels (HelionScheduling, HelionKernel,
-HelionOverrides)."""
+graph (HelionPostGradPass), lowering/ holds the lowerings it adds to
+user_lowerings, choices.py holds the heuristics Inductor asks while lowering,
+fusing and generating code (HelionChoices), and codegen/ turns the fused nodes
+into Helion kernels (HelionScheduling, HelionKernel, HelionOverrides)."""
 
 from __future__ import annotations
 
@@ -50,6 +50,7 @@ from .codegen.overrides import HelionPrinter
 from .codegen.scheduling import HelionScheduling
 from .codegen.scheduling import Unsupported
 from .fx_passes.post_grad import HelionPostGradPass
+from .lowering import register_mm
 
 __all__ = [
     "HelionChoices",
@@ -72,10 +73,12 @@ def _register() -> None:
     """Make "helion" a value of torch._inductor.config.cuda_backend: Inductor's
     CUDA registration maps the others to their schedulings, and has no entry for
     this one. Also registers HelionChoices, helion.inductor.config as the
-    options' "helion." namespace, which puts it in the FX graph cache key, and
+    options' "helion." namespace, which puts it in the FX graph cache key,
     HelionPostGradPass as the CUDA custom backend pass, after any registered
-    before it."""
+    before it, and the lowerings of lowering/ (inert unless HelionChoices is
+    the compile's choices)."""
     register_inductor_choices("helion", HelionChoices)
+    register_mm()
     common.custom_backend_codegen_configs["helion"] = cast("ConfigModule", config)
     common.init_backend_registration()
     default = common.device_codegens["cuda"]

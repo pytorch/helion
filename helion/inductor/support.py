@@ -8,14 +8,20 @@ from typing import TYPE_CHECKING
 
 import torch
 from torch._inductor import config
+from torch._inductor.ir import ComputedBuffer
+from torch._inductor.loop_body import MemoryUsageType
 from torch._inductor.runtime.hints import DeviceProperties
 from torch._inductor.runtime.runtime_utils import last_power_of_2
 from torch._inductor.runtime.runtime_utils import next_power_of_2
+from torch._inductor.scheduler import SchedulerNode
 from torch._inductor.virtualized import V
 from torch.utils._ordered_set import OrderedSet
 
 if TYPE_CHECKING:
+    from collections.abc import Iterable
+
     import sympy
+    from torch._inductor.scheduler import BaseSchedulerNode
 
 MATMUL_DTYPES = OrderedSet([torch.float16, torch.bfloat16, torch.float32])
 
@@ -74,3 +80,55 @@ def mix_order_split(xnumel: int, device: torch.device) -> int | None:
             return split
         split //= 2
     return None
+
+
+def reduced_precision_reductions() -> dict[torch.dtype, tuple[bool, bool]]:
+    """torch.backends.cuda.matmul's flag pair for each 16-bit dtype:
+    (allow_bf16_reduced_precision_reduction, its _split_k) for bf16, whether
+    cuBLAS may reduce a split K in that dtype and whether it may split K."""
+    return {
+        torch.bfloat16: torch._C._get_cublas_allow_bf16_reduced_precision_reduction(),
+        torch.float16: torch._C._get_cublas_allow_fp16_reduced_precision_reduction(),
+    }
+
+
+# Helion's Settings.split_k_reduction, from the most to the least permissive.
+SPLIT_K_REDUCTIONS = ("output", "accumulator", "none")
+
+
+def split_k_reduction(dtypes: Iterable[torch.dtype]) -> str:
+    """The Settings.split_k_reduction of a kernel whose dots multiply 16-bit
+    operands of `dtypes`, the strictest over them: (True, True) -> "output",
+    (False, True) -> "accumulator", (False, False) -> "none"."""
+    flags = reduced_precision_reductions()
+    return SPLIT_K_REDUCTIONS[
+        max(
+            (
+                0 if reduced else 1 if split_k else 2
+                for reduced, split_k in map(flags.__getitem__, dtypes)
+            ),
+            default=0,
+        )
+    ]
+
+
+def dot_rows_on_x(node: BaseSchedulerNode) -> OrderedSet[bool]:
+    """For each native matmul in `node`, whether its dot's rows are the x loop
+    var rather than y: the var whose coefficient in the output's store index
+    is the output's row stride (an N-contiguous output, as lowering/mm.py's
+    transposed product writes, puts them on x)."""
+    rows_on_x: OrderedSet[bool] = OrderedSet()
+    for snode in node.get_nodes():
+        if not (
+            isinstance(snode, SchedulerNode)
+            and isinstance(snode.node, ComputedBuffer)
+            and snode.is_native_matmul()
+        ):
+            continue
+        body = snode._body
+        pointwise = list(body.var_ranges)[: len(snode._sizes[0])]
+        (store,) = body.memory_usage[MemoryUsageType.STORE_REDUCTION]
+        index = body.indexing_exprs[store.index_name]
+        row_stride = snode.node.get_layout().stride[-2]
+        rows_on_x.add(len(pointwise) >= 2 and index.coeff(pointwise[-1]) == row_stride)
+    return rows_on_x

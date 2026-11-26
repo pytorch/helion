@@ -20,6 +20,7 @@ from torch._inductor.codegen.simd import constant_repr
 from .. import exc
 from .ast_extension import expr_from_string
 from .emitter_protocols import NO_RETRY
+from .inductor_matmul import MatmulPlan
 from .utils import is_full_slice
 
 if TYPE_CHECKING:
@@ -64,6 +65,7 @@ if TYPE_CHECKING:
     from .inductor_lowering import CodegenState
     from .inductor_lowering import GenerateASTFromInductor
     from .inductor_lowering import GraphInterpreter
+    from .inductor_matmul import MatmulFacts
     from .program_id import ProgramIDs
     from .reduction_strategy import BlockReductionStrategy
     from .reduction_strategy import ReductionEmitter
@@ -1806,6 +1808,16 @@ class Backend(abc.ABC):
     def inductor_op_overrides(self) -> InductorOpOverrides:
         """The Inductor ``OpsHandler`` the pointwise lowering prints elementwise ops through."""
         raise exc.BackendUnsupported(self.name, "Inductor OpOverrides")
+
+    def inductor_matmul_plan(self, facts: MatmulFacts) -> MatmulPlan:
+        """How helion.inductor lowers the matmul ``facts`` describes in kernels
+        of this backend; the default plan lowers it as written."""
+        return MatmulPlan()
+
+    def inductor_rules_key(self) -> str:
+        """A key of the code :meth:`inductor_matmul_plan` runs, part of
+        Inductor's FX graph cache key."""
+        return ""
 
     def parse_op_expression(self, text: str) -> ast.AST:
         """The device-code AST of *text*, an expression this backend's

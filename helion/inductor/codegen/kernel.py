@@ -26,6 +26,7 @@ from torch._inductor.ir import MutationLayoutSHOULDREMOVE
 from torch._inductor.ir import Reduction
 from torch._inductor.ir import ReinterpretView
 from torch._inductor.runtime.hints import ReductionHint
+from torch._inductor.scheduler import SchedulerNode
 from torch._inductor.shape_propagation import ShapePropagationOpsHandler
 from torch._inductor.utils import IndentedBuffer
 from torch._inductor.utils import sympy_subs
@@ -37,7 +38,9 @@ from torch.utils._sympy.value_ranges import ValueRanges
 from torch.utils._sympy.value_ranges import bound_sympy
 
 from .. import config as helion_config
+from ..support import dot_rows_on_x
 from ..support import names_rdim
+from ..support import split_k_reduction
 from .overrides import HelionOverrides
 from .overrides import HelionPrinter
 from .overrides import number_constant
@@ -407,18 +410,21 @@ class HelionKernel(SIMDKernel[CSEVariable]):
     def __init__(self, tiling: dict[str, sympy.Expr], **kwargs: Any) -> None:  # noqa: ANN401
         super().__init__(tiling, **kwargs)
         self.outer_vars: OrderedSet[CSEVariable] = OrderedSet()
-        # A matmul orders r0_ before x so dot operands read [y, r0_] and [r0_, x].
-        # So does an outer reduction, whose x is contiguous in memory and r0_
-        # strided, so that a tile's last dim is the contiguous one, as in the
+        # A matmul orders r0_ between its dot's row and column axes, so dot
+        # operands read [rows, r0_] and [r0_, cols] (dot_axes()). An outer
+        # reduction orders r0_ before x: its x is contiguous in memory and
+        # r0_ strided, so that a tile's last dim is the contiguous one, as in the
         # first kernel of a split var_mean over the first dim of a [401408, 144]:
         #     tmp0 = in0[tile_y, tile_r, tile_x]          # x of stride 1
         #     tmp7 = torch.sum(tmp6, -2)
         # where in0[tile_y, tile_x, tile_r] puts the dim of stride 144 last,
         # and the autotuner must find lanes and vectors along a dim that is not.
+        matmul = self.is_native_matmul
         outer = self.inside_reduction and self.reads_strided_rdim()
+        self.dot_rows, self.dot_cols = self.dot_axes() if matmul else ("y", "x")
         order = (
-            ("z0_", "y", "r0_", "x")
-            if self.is_native_matmul or outer
+            ("z0_", self.dot_rows, "r0_", self.dot_cols)
+            if matmul or outer
             else ("z0_", "y", "x", "r0_")
         )
         self.axes = tuple(axis for axis in order if axis in self.numels)
@@ -446,6 +452,8 @@ class HelionKernel(SIMDKernel[CSEVariable]):
         self.cast_sources: dict[str, CSEVariable] = {}
         self.accumulator_count = 0
         self.has_fp32_dot = False
+        # The 16-bit dtypes of the dots' operands (split_k_reduction).
+        self.half_dot_dtypes: OrderedSet[torch.dtype] = OrderedSet()
         # Whether the kernel draws random numbers; see rand().
         self.uses_rand = False
         # Whether a persistent reduction names its rdim (rdim = ...), and the
@@ -479,6 +487,19 @@ class HelionKernel(SIMDKernel[CSEVariable]):
         self.axis_cuts: dict[str, OrderedSet[int]] = {}
         self.axis_segments: tuple[str, list[tuple[int, int]]] | None = None
         self.axis_segment: tuple[str, int] | None = None
+
+    def dot_axes(self) -> tuple[str, str]:
+        """The axes of the dot's rows and columns: (y, x), or (x, y) where the loop
+        order Inductor picks from the output's layout puts the rows on x
+        (dot_rows_on_x()), as for the transposed product of lowering/mm.py,
+        whose dot then reads [tile_x, tile_r] @ [tile_r, tile_y]. The kernel's
+        dots agree (HelionScheduling.can_fuse())."""
+        rows_on_x: OrderedSet[bool] = OrderedSet()
+        for node in self.features.node_schedule:
+            if isinstance(node, SchedulerNode):
+                rows_on_x |= dot_rows_on_x(node)
+        assert len(rows_on_x) <= 1, "a kernel's dots run their rows on one axis"
+        return ("x", "y") if True in rows_on_x else ("y", "x")
 
     def __enter__(self) -> Self:
         if self.mix_order_reduction and "y" not in self.symbols:
@@ -663,11 +684,11 @@ class HelionKernel(SIMDKernel[CSEVariable]):
 
     def value_shape(self, axes: Iterable[str]) -> TileShape:
         """Shape of a value over `axes`: their tiles in the kernel's axis order,
-        (z, y, r0_, x) with a dot or an outer reduction (reads_strided_rdim())
-        and (z, y, x, r0_) without. A value holds only
-        its own tiles, since an r0_-only value in a matmul's K loop is [tile_r]
-        next to [tile_y, tile_r] but [tile_r, 1] next to [tile_r, tile_x];
-        align_args() reshapes values as ops combine them."""
+        (z, rows, r0_, cols) with a dot (dot_axes()), (z, y, r0_, x) with an
+        outer reduction (reads_strided_rdim()) and (z, y, x, r0_) without. A
+        value holds only its own tiles, since an r0_-only value in a matmul's K
+        loop is [tile_r] next to [tile_y, tile_r] but [tile_r, 1] next to
+        [tile_r, tile_x]; align_args() reshapes values as ops combine them."""
         return tuple(TILE_NAMES[axis] for axis in self.axes if axis in axes)
 
     def index_tensor(self, axis: str, scope: Sequence[str]) -> str:
@@ -1206,6 +1227,11 @@ class HelionKernel(SIMDKernel[CSEVariable]):
         if self.has_fp32_dot:
             tf32 = torch.backends.cuda.matmul.fp32_precision == "tf32"
             settings += f', dot_precision="{"tf32" if tf32 else "ieee"}"'
+        if self.half_dot_dtypes:
+            # from torch's reduced-precision flags for the operands' dtypes, as
+            # cuBLASLt reads them (support.split_k_reduction())
+            reduction = split_k_reduction(self.half_dot_dtypes)
+            settings += f', split_k_reduction="{reduction}"'
         if helion_config.fast_math:
             settings += ", fast_math=True"
         # CuTe's hl.rand draws offset i from Philox(seed, i // 4)[i % 4] by
@@ -2078,9 +2104,12 @@ class HelionKernel(SIMDKernel[CSEVariable]):
         """`lhs @ rhs`, whose product is rounded to `rounded` (rounded_dot_dtype())
         before anything else reads it."""
         batch = ["z0_"] if "z0_" in self.numels else []
-        lhs = self.dot_operand(lhs, [*batch, "y", "r0_"])
-        rhs = self.dot_operand(rhs, [*batch, "r0_", "x"])
+        lhs = self.dot_operand(lhs, [*batch, self.dot_rows, "r0_"])
+        rhs = self.dot_operand(rhs, [*batch, "r0_", self.dot_cols])
         self.has_fp32_dot |= torch.float32 in (lhs.dtype, rhs.dtype)
+        for dtype in (lhs.dtype, rhs.dtype):
+            if dtype is torch.bfloat16 or dtype is torch.float16:
+                self.half_dot_dtypes.add(dtype)
         if self.persistent_reduction and lhs.dtype == rhs.dtype == rounded:
             # K in one block: one matmul of the whole rows, which accumulates in
             # fp32 and rounds once, as the store of an accumulator would:
@@ -2096,7 +2125,8 @@ class HelionKernel(SIMDKernel[CSEVariable]):
             # by torch.mm(a, b, out_dtype=torch.float32), keeps the
             # accumulator: torch.mm of bf16 tiles would round it to bf16.
             op = "bmm" if batch else "mm"
-            tiles = tuple(TILE_NAMES[axis] for axis in [*batch, "y", "x"])
+            axes = [*batch, self.dot_rows, self.dot_cols]
+            tiles = tuple(TILE_NAMES[axis] for axis in axes)
             line = f"torch.{op}({lhs}, {rhs})"
             return self.cse.generate(self.compute, line, dtype=rounded, shape=tiles)
         # Each dot has its own accumulator, so horizontally fused dots stay apart.
@@ -2209,8 +2239,9 @@ class HelionKernel(SIMDKernel[CSEVariable]):
         for an accumulator of `dtype`, and its shape."""
         # Reduce tile_r wherever the axis order puts it: last without a dot or an
         # outer reduction, before tile_x in an outer reduction (torch.sum(tmp0,
-        # -2) of in0[tile_y, tile_r, tile_x]) and in a matmul's K loop, as in
-        # (a @ b, (a[:, :, None] * b[None]).sum(1)):
+        # -2) of in0[tile_y, tile_r, tile_x]) and before the dot's columns in a
+        # matmul's K loop (dot_axes()), as in (a @ b, (a[:, :, None] *
+        # b[None]).sum(1)):
         #     acc = torch.addmm(acc, tmp0, tmp1)
         #     tmp3 = tmp2 * tmp1                     # [tile_y, tile_r, tile_x]
         #     acc1 = acc1 + torch.sum(tmp3, -2)
