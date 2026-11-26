@@ -14,6 +14,8 @@ import dataclasses
 import enum
 from typing import TYPE_CHECKING
 
+from .tcgen05_constants import TCGEN05_ODD_WIDTH_SUBTILE_N
+
 if TYPE_CHECKING:
     from collections.abc import Mapping
 
@@ -367,6 +369,17 @@ def smem_swizzle_atom_kind_suffix(swizzle_bytes: int) -> str:
     if swizzle_bytes == 0:
         return "INTER"
     return f"SW{swizzle_bytes}"
+
+
+def tcgen05_smem_stage_expr(layout: str, *, select: bool) -> str:
+    """The first stage of a staged ``(atom, rows, k_blocks, stage)`` SMEM
+    operand layout: the box the operand's TMA descriptor and transaction
+    count are built from, on the device and the host alike. ``select``
+    renders ``cute.select`` (the row-union schedules' B, and the 16-bit
+    pairs ``cute_mma._tcgen05_b_stage_select`` names), else ``cute.slice_``."""
+    if select:
+        return f"cute.select({layout}, mode=[0, 1, 2])"
+    return f"cute.slice_({layout}, (None, None, None, 0))"
 
 
 def tcgen05_smem_layout_expr(
@@ -735,9 +748,11 @@ def tcgen05_explicit_epilogue_tile_supported(
     return (
         # Four epilogue warps own 16 or 32 supported TMEM datapaths each.
         epi_tile_m in (64, 128)
-        # Use the dtype-independent, power-of-two TMA store widths validated by
-        # this backend; 16 is the minimum that also gives FP8 a 128-bit row.
-        and epi_tile_n in (16, 32, 64)
+        # Use the dtype-independent TMA store widths validated by this
+        # backend: powers of two (16 is the minimum that also gives FP8 a
+        # 128-bit row) and 48, three 32-byte swizzle atoms of a 16-bit row
+        # (``TCGEN05_ODD_WIDTH_SUBTILE_N``).
+        and epi_tile_n in (16, 32, TCGEN05_ODD_WIDTH_SUBTILE_N, 64)
         # Helion emits one epilogue subtile per TMA store box.
         and d_store_box_n == epi_tile_n
         # Every MMA M tile must partition into whole epilogue subtiles.

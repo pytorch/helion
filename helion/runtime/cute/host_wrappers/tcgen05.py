@@ -25,6 +25,7 @@ from ...._compiler.cute.grouped_row_union import (
 from ...._compiler.cute.strategies import tcgen05_default_epilogue_tile_expr
 from ...._compiler.cute.strategies import tcgen05_explicit_d_store_tile_expr
 from ...._compiler.cute.strategies import tcgen05_smem_layout_expr
+from ...._compiler.cute.strategies import tcgen05_smem_stage_expr
 from ...._compiler.cute.tcgen05_constants import (
     TCGEN05_GROUPED_STATIC_RESERVED_SMS_CONFIG_KEY,
 )
@@ -833,11 +834,11 @@ def emit_ab_tma(ctx: HostWrapperContext, plan: dict[str, object]) -> None:
                 "cutlass.utils.blackwell_helpers.cluster_shape_to_tma_atom_B("
                 f"{cluster_shape}, {tiled_mma}.thr_id), "
                 f"{rhs_tma}, "
-                + (
-                    f"cute.select({smem_b_layout}, mode=[0, 1, 2]), "
-                    if row_profile is not None
-                    else f"cute.slice_({smem_b_layout}, (None, None, None, 0)), "
+                + tcgen05_smem_stage_expr(
+                    smem_b_layout,
+                    select=row_profile is not None or bool(plan.get("b_stage_select")),
                 )
+                + ", "
                 + f"({bm}, {bn}, {bk}), {tiled_mma}, {cluster_layout_vmnk}.shape"
                 f"{tma_internal_type_arg})"
             ),

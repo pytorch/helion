@@ -28,6 +28,7 @@ import helion
 from helion._compiler.cute.autotune.heuristics.cute_tcgen05_default import (
     CuteTcgen05DefaultTileHeuristic,
 )
+from helion._compiler.cute.dense_aligned_n import dense_aligned_n_defaults
 from helion._hardware import get_hardware_info
 from helion._testing import DEVICE
 from helion._testing import RefEagerTestDisabled
@@ -37,6 +38,7 @@ from helion._testing import skipIfNotCUDA
 from helion._testing.cute_aux import rank_two_aux
 from helion._testing.cute_aux import two_residual_aux
 from helion._testing.cute_dense_tcgen05 import bias_mm_into
+from helion._testing.cute_dense_tcgen05 import column_scale_mm_into
 from helion._testing.cute_dense_tcgen05 import plain_mm_into
 from helion._testing.cute_dense_tcgen05 import promoted_bias_mm_into
 from helion._testing.cute_dense_tcgen05 import scale_bias_mm_into
@@ -697,18 +699,75 @@ class TestCuteTcgen05RaggedTwoCtaSearch(RefEagerTestDisabled, TestCase):
                     out, reference.to(out.dtype), rtol=1e-2, atol=1e-1
                 )
 
-    def test_output_edge_pairs_clip_the_partial_tiles(self) -> None:
-        # The 16-bit pairs over a partial last M tile (1000 rows: four 256-row
-        # pair tiles, the last clipped by the TMA store): the one-wave 256x128
-        # pair and the 256x160 pair over whole N tiles (2880 = 18 x 160).
-        cases = (
-            ((1000, 2304, 256), [256, 128, 64], 0, "auto"),
-            ((1000, 2880, 256), [256, 256, 64], 160, "two"),
-        )
-        for (m, n, k), block_sizes, width, cta_group in cases:
+    def test_aligned_width_runs_the_128_row_pair(self) -> None:
+        # 16-bit aligned widths on 128-row CTA pairs (64 rows per CTA) over a
+        # row-major output whose N one tile spans: N = 192 in one tile
+        # (carrier 256) over whole 128-row M tiles and over a partial last one
+        # (3104 = 24 x 128 + 32, clipped by the TMA store), and every other
+        # width the family reaches there: 96 (N = 192 in two tiles), 160,
+        # 176 and 208 (neither 32 nor 48 divides them: the per-round store,
+        # no last-tile staging on the 128-row pair), 224 and 240 (whose CTA
+        # stages 120 B rows per K step).
+        for (m, n, k), width, stages in (
+            ((3200, 192, 768), 192, 10),
+            ((3104, 192, 768), 192, 10),
+            ((1152, 192, 512), 96, 8),
+            ((1152, 160, 512), 160, 8),
+            ((1152, 176, 512), 176, 8),
+            ((1152, 208, 512), 208, 8),
+            ((1152, 224, 512), 224, 8),
+            ((1152, 240, 512), 240, 8),
+        ):
             a = torch.randn(m, k, device=DEVICE, dtype=torch.bfloat16)
             b = torch.randn(n, k, device=DEVICE, dtype=torch.bfloat16).T
             out = torch.empty(m, n, device=DEVICE, dtype=torch.bfloat16)
+            bound = plain_mm_into.bind((a, b, out))
+            config = helion.Config(
+                **dense_aligned_n_defaults(),
+                tcgen05_tile_n=width,
+                block_sizes=[128, 256 if width > 128 else 128, 64],
+                pid_type="persistent_interleaved",
+                tcgen05_ab_stages=stages,
+                tcgen05_c_stages=2,
+            )
+            self.assertIn(f"CtaGroup.TWO, (128, {width})", bound.to_code(config))
+            bound.set_config(config)
+            out.zero_()
+            bound(a, b, out)
+            torch.testing.assert_close(
+                out, (a.float() @ b.float()).to(out.dtype), rtol=1e-2, atol=1e-1
+            )
+
+    def test_output_edge_pairs_clip_the_partial_tiles(self) -> None:
+        # The 16-bit pairs over a partial last M tile (1000 rows: four 256-row
+        # pair tiles, the last clipped by the TMA store): the one-wave 256x128
+        # pair, a 256x112 pair (56 B rows per CTA, an odd count of 8-row
+        # swizzle atoms: the stage-0 B box is the SMEM layout's ``select``),
+        # the 256x160 pair over whole N tiles (2880 = 18 x 160) and, ragged
+        # in N as well, the 256x144 pair (2560 = 17.8 x 144); the 256x144 and
+        # (over whole M tiles, 2000 = 8.3 x 240) 256x240 pairs store (128, 48)
+        # subtiles. The widths 32 does not divide otherwise (112, 176, 208)
+        # stage their CTA's last tile in the A ring its MMAs drained, the
+        # earlier ones in the C ring: 76 256x112 tiles give most CTAs one
+        # (staged) tile, 150 256x176 tiles most CTAs one of each, and 80
+        # 256x208 tiles (partial in N) a few CTAs two. The 256x256 pair over
+        # whole N and K tiles stores its clipped tile through (128, 32)
+        # subtiles, as whole tiles do. The output starts as NaN, so a tile
+        # left unstored fails the check.
+        cases = (
+            ((1000, 2304, 256), [256, 128, 64], 0, "auto", 4),
+            ((1000, 2048, 256), [256, 256, 64], 0, "two", 4),
+            ((1000, 2048, 256), [256, 128, 64], 112, "two", 4),
+            ((1000, 2880, 256), [256, 256, 64], 160, "two", 4),
+            ((1000, 2560, 256), [256, 256, 64], 144, "two", 4),
+            ((2048, 2000, 256), [256, 256, 64], 240, "two", 4),
+            ((6272, 1024, 512), [256, 256, 64], 176, "two", 8),
+            ((2048, 2000, 256), [256, 256, 64], 208, "two", 4),
+        )
+        for (m, n, k), block_sizes, width, cta_group, ab_stages in cases:
+            a = torch.randn(m, k, device=DEVICE, dtype=torch.bfloat16)
+            b = torch.randn(n, k, device=DEVICE, dtype=torch.bfloat16).T
+            out = torch.full((m, n), float("nan"), device=DEVICE, dtype=torch.bfloat16)
             bound = plain_mm_into.bind((a, b, out))
             config = helion.Config(
                 block_sizes=block_sizes,
@@ -716,7 +775,7 @@ class TestCuteTcgen05RaggedTwoCtaSearch(RefEagerTestDisabled, TestCase):
                 tcgen05_cta_group=cta_group,
                 tcgen05_cluster_m=2,
                 tcgen05_cluster_n=1,
-                tcgen05_ab_stages=4,
+                tcgen05_ab_stages=ab_stages,
                 tcgen05_acc_stages=2,
                 tcgen05_c_stages=2,
                 tcgen05_l2_swizzle_size=1,
@@ -726,11 +785,81 @@ class TestCuteTcgen05RaggedTwoCtaSearch(RefEagerTestDisabled, TestCase):
             code = bound.to_code(config)
             physical = width or block_sizes[1]
             self.assertIn(f"CtaGroup.TWO, (256, {physical})", code)
+            if physical // 2 % 16:
+                self.assertIn("sB_tma_layout = cute.select(sB_layout", code)
+            if physical in (144, 240, 256):
+                self.assertIn(
+                    "tcgen05_store_epi_tile = (cute.make_layout(128), "
+                    f"cute.make_layout({32 if physical == 256 else 48}))",
+                    code,
+                )
+            self.assertEqual(
+                "if not tcgen05_epi_next_work.is_valid_tile:" in code,
+                physical in (112, 176, 208),
+            )
             bound.set_config(config)
-            out.zero_()
             bound(a, b, out)
             torch.testing.assert_close(
                 out, (a.float() @ b.float()).to(out.dtype), rtol=1e-2, atol=1e-1
+            )
+
+    def test_column_major_outputs_clip_the_partial_tiles(self) -> None:
+        # The same pairs storing a column-major output: the transposed product
+        # out.T = b.T @ a.T of a tall GEMM, whose pairs run 256 rows of its N
+        # and a width of its M. 224 over 2000 columns (8.9 tiles) clips the
+        # last tile, as 1000 rows of N clip the last 256-row tile; 176 and
+        # 192 divide 2112 and 3072. A per-column FP32 scale (one per row of
+        # ``out``) over the clipped 224-wide tiles takes the split store (TMA
+        # for whole tiles, SIMT for the last), and an FP32 output its own
+        # with-source C tile. The 224-wide pair also runs seven AB stages
+        # (231 596 of the 232 448-byte opt-in, ``pipeline_smem_bytes``'
+        # ``plain_layout``).
+        cases = (
+            ((2000, 1024, 256), 224, "plain"),
+            ((2000, 1024, 512), 224, "seven"),
+            ((1792, 1000, 256), 224, "plain"),
+            ((2112, 1024, 256), 176, "plain"),
+            ((3072, 512, 256), 192, "plain"),
+            ((2000, 1024, 256), 224, "scale"),
+            ((2112, 1024, 256), 176, "fp32"),
+        )
+        for (m, n, k), width, kind in cases:
+            a = torch.randn(m, k, device=DEVICE, dtype=torch.bfloat16)
+            b = torch.randn(n, k, device=DEVICE, dtype=torch.bfloat16).T
+            out_dtype = torch.float32 if kind == "fp32" else torch.bfloat16
+            out = torch.empty(m, n, device=DEVICE, dtype=out_dtype)
+            expected = a.float() @ b.float()
+            if kind == "scale":
+                scale = torch.randn(m, device=DEVICE, dtype=torch.float32)
+                expected = expected * scale[:, None]
+                args = (b.T, a.T, scale, out.T)
+                bound = column_scale_mm_into.bind(args)
+            else:
+                args = (b.T, a.T, out.T)
+                bound = plain_mm_into.bind(args)
+            config = helion.Config(
+                block_sizes=[256, 256, 64],
+                pid_type="persistent_interleaved",
+                tcgen05_cta_group="two",
+                tcgen05_cluster_m=2,
+                tcgen05_cluster_n=1,
+                tcgen05_ab_stages=7 if kind == "seven" else 4,
+                tcgen05_acc_stages=2,
+                tcgen05_c_stages=2,
+                tcgen05_l2_swizzle_size=1,
+                l2_groupings=[1],
+                tcgen05_tile_n=width,
+            )
+            code = bound.to_code(config)
+            self.assertIn(f"CtaGroup.TWO, (256, {width})", code)
+            self.assertIn("LayoutEnum.COL_MAJOR", code)
+            if kind == "seven":
+                self.assertIn("num_stages=7", code)
+            bound.set_config(config)
+            out.zero_()
+            bound(*args)
+            torch.testing.assert_close(
+                out, expected.to(out.dtype), rtol=2e-2, atol=1e-1
             )
 
     @unittest.skipUnless(_promotes_b200_defaults(), "pins B200 default tiles")

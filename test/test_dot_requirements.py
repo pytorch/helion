@@ -1474,11 +1474,14 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
         ):
             bound = fresh(cute_matmul_mma).bind(args)
         spec = bound.config_spec
-        self.assertEqual([x.max_size for x in spec.block_sizes], [256, 128, 64])
+        # A 16-bit N between 128 and 256 is itself an aligned width, so the N
+        # block reaches the 256-wide carrier.
+        self.assertEqual([x.max_size for x in spec.block_sizes], [256, 256, 64])
         self.assertIn("persistent_blocked", spec.allowed_pid_types)
         self.assertIn("persistent_interleaved", spec.allowed_pid_types)
-        # The automatic 256x256 two-CTA tile is still unavailable. The explicit
-        # family has exact 128x64 tiles for N=192 and its own allocation proof.
+        # The automatic 256x256 two-CTA tile is still unavailable (one pair
+        # tile is under the quarter-wave gate). The explicit family has exact
+        # 128x64 tiles for N=192 and its own allocation proof.
         self.assertEqual(spec.tcgen05.cluster_m_search_choices, (1,))
         self.assertEqual(spec.tcgen05.num_epi_warps_search_choices, (4,))
         self.assertTrue(

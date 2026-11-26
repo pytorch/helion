@@ -230,8 +230,10 @@ class CuteTcgen05Config:
         # reserved_sms=N)``), so a persistent grid of more tiles than the
         # SMs left runs several tiles per CTA.
         self.persistent_reserved_sms: int = 0
-        # (key, widths) of ``_dense_aligned_n_clipped_widths``.
-        self._dense_aligned_n_clipped_cache: tuple[object, frozenset[int]] | None = None
+        # search -> (key, widths) of ``_dense_aligned_n_clipped_widths``.
+        self._dense_aligned_n_clipped_cache: dict[
+            bool, tuple[object, frozenset[int]]
+        ] = {}
         # The register-MMA GEMM family (``cute_matmul_family="warp_mma"``):
         # admitted by the search plan (static latency-bound problem, one
         # matmul, supported layouts); its 16x8 tiles widen the M / N block

@@ -355,6 +355,20 @@ def _plan_cute_tcgen05_search_candidate(
         if static_n is None
         else min(256, pow2_floor_at_least(static_n, min_tcgen05_n))
     )
+    if (
+        static_n is not None
+        and lhs.dtype in (torch.bfloat16, torch.float16)
+        and not has_leading_passthrough
+        and 128 < static_n < 256
+        and static_n % 16 == 0
+    ):
+        # A 16-bit N between 128 and 256 is itself an aligned pair width
+        # (``dense_aligned_n.ALIGNED_N_CHOICES``), whose public carrier is
+        # the 256-wide N tile: bf16 25216x192x768 then runs one 128x192 pair
+        # tile per 128 rows (block_sizes [128, 256, 64], tcgen05_tile_n=192)
+        # instead of two N tiles of 128 + 64 that read A twice, 10.14 us
+        # against 11.31 (GB300, cuBLAS 10.47).
+        max_tcgen05_n = 256
     max_tcgen05_m = (
         256 if max_tcgen05_n >= 128 and (static_m is None or static_m >= 256) else 128
     )

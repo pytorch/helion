@@ -23,6 +23,7 @@ from .tcgen05_constants import tcgen05_ab_smem_bytes_per_cta
 from .tcgen05_constants import tcgen05_aux_ring_smem_bytes_per_cta
 from .tcgen05_constants import tcgen05_c_smem_bytes_per_cta
 from .tcgen05_constants import tcgen05_default_epilogue_tile_size
+from .tcgen05_constants import tcgen05_fixed_smem_overhead_bytes
 from .tcgen05_constants import tcgen05_rowvec_stage_smem_bytes
 
 if TYPE_CHECKING:
@@ -309,6 +310,7 @@ def pipeline_smem_bytes(
     aux_stages: int = TCGEN05_AUX_STAGE_COUNT_DEFAULT,
     epi_warp_groups: int = 1,
     epi_subtile_n: int | None = None,
+    plain_layout: bool = False,
 ) -> int:
     """Upper-bound the allocations for the static CtaGroup.TWO schedule.
 
@@ -328,7 +330,12 @@ def pipeline_smem_bytes(
     (128, 32) subtile of a plain 16-bit store on static full tiles (or the
     aligned-N physical tile with a partial last M tile), which the paired
     caller resolves (the staged aux rings keep the plan's
-    with-source subtile, as ``cute_mma`` sizes them).
+    with-source subtile, as ``cute_mma`` sizes them). ``plain_layout``: the
+    caller proved the plain schedule (a 16-bit 256-row pair storing its
+    accumulator alone, nothing beside the AB and C rings), whose arena is
+    priced as ptxas lays its allocations out
+    (``tcgen05_fixed_smem_overhead_bytes``, measured from the cubins)
+    rather than with the flat reserve.
     """
     from cutlass.utils.blackwell_helpers import compute_epilogue_tile_size
 
@@ -389,6 +396,18 @@ def pipeline_smem_bytes(
         if aux_load_mode in TCGEN05_AUX_LOAD_MODES_STAGED
         else 0
     )
+    if plain_layout:
+        # bf16 256x224x64 pair, seven AB stages, two (128, 32) C stages:
+        # 16 384 (C ring) + 128 (AB barriers) + 215 040 (AB ring) + 44
+        # (acc barriers, TMEM cells) = 231 596 B of the 232 448 opt-in,
+        # where the flat reserve prices 233 616 and refuses the stage.
+        return (
+            ab_bytes
+            + c_bytes
+            + tcgen05_fixed_smem_overhead_bytes(
+                ab_stages=ab_stages, acc_stages=acc_stages, cluster_m=2
+            )
+        )
     return (
         ab_bytes
         + c_bytes

@@ -621,6 +621,20 @@ def test_one_wave_pairs_run_over_an_output_edge_m() -> None:
     assert "CtaGroup.TWO, (256, 128)" in bound.to_code(narrow[0])
 
 
+def test_search_tries_clipped_widths_the_seeds_leave_out() -> None:
+    """bf16 1000x4096x2880: one wave of 76 clipped 256x224 pairs is 11% ahead
+    of 64 256x256 pairs by the wave model (it measured 10% ahead on GB300).
+    The seeds, which the autotune-off default picks among, take a clipped
+    width from a 15% lead; the search tries it."""
+    bound = _plain_bind(1000, 4096, 2880)
+    state = bound.config_spec._cute_tcgen05_config
+    assert 224 in facts._dense_aligned_n_widths(state)
+    assert all(
+        seed.config.get("tcgen05_tile_n") != 224
+        for seed in seeds.dense_aligned_n_seed_configs(state)
+    )
+
+
 def test_n_edge_cluster_n_seeds_take_one_n_cluster() -> None:
     """4096x1000x4096 with an N-major B: the CtaGroup.TWO seeds' cluster_n=2
     variants (L2 grouped, or with a scheduler warp) fall outside the proved

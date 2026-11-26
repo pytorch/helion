@@ -95,13 +95,20 @@ class StaticSchedulerHandle:
             ),
         ]
 
-    def create_static_stmts(self, params_var: str) -> list[ast.stmt]:
+    @staticmethod
+    def static_create_expr(params_var: str) -> str:
         """``StaticPersistentTileScheduler`` over the launch grid from the
-        ``PersistentTileSchedulerParams`` bound to ``params_var``."""
-        return self.create_stmts(
+        ``PersistentTileSchedulerParams`` bound to ``params_var``: the role's
+        scheduler, and the lookahead copies that step one tile ahead of it
+        (``scheduler_pids``), which must walk the same tiles."""
+        return (
             "cutlass.utils.StaticPersistentTileScheduler.create("
             f"{params_var}, cute.arch.block_idx(), cute.arch.grid_dim())"
         )
+
+    def create_static_stmts(self, params_var: str) -> list[ast.stmt]:
+        """The role's scheduler (``static_create_expr``) and its first tile."""
+        return self.create_stmts(self.static_create_expr(params_var))
 
     def advance_stmts(self) -> list[ast.stmt]:
         return [

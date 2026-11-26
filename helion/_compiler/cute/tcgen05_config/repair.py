@@ -2394,7 +2394,15 @@ def _normalize_dense_aligned_n(
         if type(acc_stages) is not int or acc_stages not in (1, 2):
             acc_stages = 2
         store_mode = config.get("tcgen05_c_store_mode", "normal")
-        if store_mode not in ("normal", "direct"):
+        dense = state.dense_gemm_facts
+        if store_mode not in ("normal", "direct") or (
+            store_mode == "direct"
+            and dense is not None
+            and dense.output_column_major
+            and facts._dense_aligned_n_sixteen_bit(state)
+        ):
+            # (a 16-bit column-major output stores through the D ring only,
+            # dense_aligned_n_plan)
             store_mode = "normal"
         # The 16-bit pair admits its own L2 grouping and N pairing; keep a
         # sampled value the plan accepts instead of the family default.
@@ -2427,10 +2435,12 @@ def _normalize_dense_aligned_n(
         raise InvalidConfig(
             "tcgen05_tile_n requires a proved dense paired GEMM (dense_aligned_n_plan): "
             "unchanged tile bounds; for FP8 whole M and N tiles; for 16-bit "
-            "whole K tiles under a partial last M or N tile, a row-major "
-            "output, a width that is a multiple of 32, an epilogue subtile "
-            "that divides it, and a persistent pid type (FP32 outputs with a "
-            "partial last K tile have none)"
+            "whole K tiles under a partial last M or N tile, a width that is "
+            "a multiple of 32 over an N-major B, the normal (TMA) store and "
+            "one N tile per cluster for a column-major output, an "
+            "epilogue subtile that divides the physical width, and a "
+            "persistent pid type (FP32 outputs with a partial last K tile "
+            "have none)"
         )
     for key, value in facts._dense_aligned_n_surface(
         state,

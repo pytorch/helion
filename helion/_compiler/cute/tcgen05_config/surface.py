@@ -1209,7 +1209,8 @@ def optional_fragments(
         ab_stages_max = smem._get_dtype_ab_stages_hard_cap(constraints.dtype_bytes)
     else:
         ab_stages_max = 2
-    # Physical N widths with a proved aligned-N seed (computed once).
+    # Physical N widths the search samples (the seeded ones and the
+    # search's own; computed once).
     aligned_widths = facts._dense_aligned_n_widths(state)
     if state.pipeline_smem_facts is not None and (not for_search or paired_search):
         ab_stages_max = max(ab_stages_max, TCGEN05_SMEM_AWARE_MAX_AB_STAGES)
