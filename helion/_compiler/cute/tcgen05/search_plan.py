@@ -31,6 +31,7 @@ from ..cute_warp_mma_gemm import WARP_MMA_MIN_BM
 from ..cute_warp_mma_gemm import WARP_MMA_MIN_BN
 from ..cute_warp_mma_gemm import warp_mma_admission_reason
 from ..dense_aligned_n import DENSE_ALIGNED_N_SIXTEEN_BIT_BLOCK_K
+from ..dense_aligned_n import carrier_n
 from ..dense_aligned_n import dense_aligned_n_mn_b_width
 from ..dense_aligned_n import n_major_b_one_wave_pair128_gain
 from ..dense_aligned_n import transposed_double_edge_without_pairs
@@ -41,10 +42,13 @@ from ..tcgen05_constants import TCGEN05_MANY_SMALL_BATCHES
 from ..tcgen05_constants import TCGEN05_N_MAJOR_B_ONE_WAVE_MAX_K_BLOCKS
 from ..tcgen05_constants import TCGEN05_ONE_CTA_MAX_BLOCK_M
 from ..tcgen05_constants import TCGEN05_ONE_CTA_MIN_BLOCK_M
+from ..tcgen05_constants import TCGEN05_ONE_ROW_TILE_BATCHED_BLOCK_N
 from ..tcgen05_constants import TCGEN05_PAIR_TILE_FIXED_KBLOCKS
+from ..tcgen05_constants import TCGEN05_TRANSPOSED_BATCH_MIN_WAVES
 from ..tcgen05_constants import TCGEN05_TRANSPOSED_PRODUCT_MIN_GAIN
 from ..tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_M
 from ..tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_N
+from ..tcgen05_constants import TCGEN05_TWO_CTA_EDGE_K_TAIL_DEEP_BLOCK_K
 from ..tcgen05_constants import TCGEN05_TWO_CTA_EDGE_K_TAIL_MIN_DIM
 from ..tcgen05_constants import TCGEN05_TWO_CTA_EDGE_PAIR128_BLOCK
 from ..tcgen05_constants import TCGEN05_TWO_CTA_FP8_SMALL_GRID_BLOCK_M
@@ -1073,6 +1077,55 @@ def _pair_tile_columns(n: int, widths: Iterable[int]) -> tuple[int, int]:
     return columns, -negative_width
 
 
+def tcgen05_one_row_tile_batched_narrow_n(
+    *,
+    batched_operand: bool,
+    a_m_major: bool,
+    itemsize: int,
+    static_m: int | None,
+    static_n: int | None,
+    static_k: int | None,
+    batch: int,
+    num_sms: int,
+) -> bool:
+    """Whether the tcgen05 search tiles a batched 16-bit GEMM's N 64 wide
+    (``TCGEN05_ONE_ROW_TILE_BATCHED_BLOCK_N``): each matrix one 64-row tile
+    tall over an M-major A, N 128 to 512 and K 256 to 512 in whole 64-wide
+    steps, the grid two 64x64 tiles a SM or more (the shapes measured; a
+    row-major A keeps its 64x256 default, 1.03 of the ATen bmm on B200 at 384
+    x 64x512x512). Memory-bound: every N tile of a matrix reads its whole 64 x
+    K block of A, and B once.
+
+    The final selection's per-call timing (an L2 flush before each launch)
+    reads 64x128 tiles 0.2-0.5% ahead of the 64x64 tiles on a deep ring
+    (``seeds._batched_one_row_tile_seed_configs``), but back to back in a
+    CUDA graph they run 1-1.5% behind it, and the selection keeps them. bf16
+    256 x 64x512x512 with A stored M-major (GB300, of cuBLAS, CUDA graphs over
+    cold inputs): full-effort pick [1, 64, 128, 64] ab7 0.988 (its final
+    selection read it 31.79 us, the other finalists 31.84-32.03), the 64x64
+    ring by hand 0.999-1.000; 384 x 64x512x512: [1, 64, 128, 64] ab7 0.978
+    (45.17 against 45.31-45.41 us), the ring 0.993. No measured shape runs a
+    wider tile faster in the graph: 192 x 64x512x512 64x64 1.016-1.017
+    against 64x256 0.978, 512 x 64x512x512 1.006-1.014 against 0.985, 1024 x
+    64x256x256 0.969-0.972 against 64x128 0.966-0.973 and 64x256 0.960.
+    """
+    return (
+        batched_operand
+        and a_m_major
+        and itemsize == 2
+        and static_m is not None
+        and static_n is not None
+        and static_k is not None
+        and 0 < static_m <= TCGEN05_ONE_CTA_MIN_BLOCK_M
+        and static_n % TCGEN05_ONE_ROW_TILE_BATCHED_BLOCK_N == 0
+        and 2 * TCGEN05_ONE_ROW_TILE_BATCHED_BLOCK_N <= static_n <= 512
+        and static_k % TCGEN05_WHOLE_K_TILE_MIN == 0
+        and 4 * TCGEN05_WHOLE_K_TILE_MIN <= static_k <= 8 * TCGEN05_WHOLE_K_TILE_MIN
+        and num_sms > 0
+        and batch * (static_n // TCGEN05_ONE_ROW_TILE_BATCHED_BLOCK_N) >= 2 * num_sms
+    )
+
+
 def tcgen05_copies_n_major_b(
     m: int,
     n: int,
@@ -1143,6 +1196,101 @@ def tcgen05_copies_n_major_b(
     )
 
 
+def tcgen05_transposes_skinny_batched_product(
+    batch: int,
+    m: int,
+    n: int,
+    k: int,
+    dtype: torch.dtype,
+    *,
+    a_strides: tuple[int, int, int],
+    b_strides: tuple[int, int, int],
+    num_sms: int,
+) -> bool:
+    """Whether a 16-bit batched ``batch x (m x n x k)`` product whose matrices
+    are one 64-row tile tall runs better as its transpose (``out[i].T =
+    b[i].T @ a[i].T`` over ``[batch, n, m]``) on the CuTe GEMM families, for
+    an M-major ``a`` and an N-major ``b`` (``a_strides`` / ``b_strides``: the
+    operands' element strides; the transposed product has the same majors).
+    helion.inductor asks it before it lowers an ``aten.bmm``
+    (``HelionChoices.transpose_bmm``).
+
+    As written each matrix is one 64-row MMA tile, every N tile of which
+    reads the matrix's whole 64 x K block of ``a``; an M under 64 rows fills
+    half of it and runs the flat launch only. bf16 1024 x 32x128x128 with
+    ``a`` stored [1024, 128, 32] (attention's ``attn.transpose(1, 2)``):
+
+        for tile_z, tile_y, tile_x in hl.tile([1024, 32, 128]):
+            ...  # full-effort pick [1, 64, 64, 64] flat: 15.01 us
+
+    Transposed, N runs on the MMA's M side in 128-row tiles and M on its N
+    side, as cuBLAS runs these products (the transposed product on 128x64
+    CTA pairs: ``nvjet_sm103_tst_128x64_64x10_2x1_2cta_v_bz_NTT``); the
+    transposed product is the as-written ``batch x n x m x k`` one with a
+    column-major output:
+
+        for tile_z, tile_x, tile_y in hl.tile([1024, 128, 32]):
+            ...  # [1, 128, 32, 128] persistent: 9.35 us
+            # out0 [1024, 128, 32] N-contiguous: its transpose is the result
+
+    GB300, cold full-effort autotunes through helion.inductor, CUDA graphs
+    over cold inputs: 1024 x 32x128x128 0.688 -> 1.104 of stock Inductor (a
+    Triton template), 1024 x 64x128x128 0.980 -> 0.996 of cuBLAS (12.05 ->
+    11.86 us; no as-written config by hand above 0.987), 3072 x 64x128x128
+    31.84 -> 31.82 us. A short grid runs the as-written tiles faster, so the
+    batch holds six waves of the transposed product's tiles (one a matrix)
+    at least: 128-row CTA pairs at M = 64 over a K loop of two or more
+    64-deep k-blocks, the transposed one-tile matrices whose search runs only
+    the pairs (``repair.batched_pair128_one_tile_matrices``), a wave of
+    which holds half as many matrices (456 on GB300's 152 SMs); one-CTA
+    128-row tiles otherwise (912): an M under 64, whose N' = M no CTA pair
+    takes, or one K tile, whose transposed search keeps one-CTA tiles. Cold
+    full-effort autotunes of 64x128x128, transposed against as written:
+    512 matrices (6.7 waves of pairs) 6.94-6.98 against 7.14-7.15 us on the
+    128x64 pair (6.93 for cuBLAS), 768 (10.1) 9.58 against 10.47. Those
+    and the shorter grids, 384 (5.1) 6.14 against 5.88, 256 (3.4) 4.53
+    both, 192 (2.5) 4.02 against 4.00, were timed before the transposed
+    search ran only the pairs (its one-CTA picks); 192 by hand, the pair
+    3.96-3.97 against 4.00 us. N is one 128-row tile: over two (1024 x 64x256x256)
+    the tiles of a matrix share its a.mT only on a batch-slowest walk (the
+    pairs by hand 0.976-0.987, batch-fastest 0.87, where the pair seeds
+    start), against 0.977 as written. A longer K loop runs the as-written
+    64x64 ring as fast (192 x 64x512x512: 1.016 / 1.024 by hand), so K holds
+    at most four 64-deep k-blocks. a.mT is the transposed product's B
+    operand, whose rows (a's K stride) and matrices (its batch stride) TMA
+    reads on 16-byte boundaries: in attention's layout an M off a multiple of
+    8 would stage B (1024 x 50x128x128: 100-byte rows) or, under 8 columns
+    (M = 4), leave the tcgen05 search, so those stay as written.
+    """
+    if dtype not in (torch.float16, torch.bfloat16) or num_sms <= 0:
+        return False
+    if a_strides[1] != 1 or b_strides[2] != 1:
+        return False
+    if any(
+        (stride * dtype.itemsize) % TCGEN05_TMA_ROW_ALIGN_BYTES
+        for stride in (a_strides[0], a_strides[2])
+    ):
+        return False
+    tile_rows = TCGEN05_TWO_CTA_BLOCK_M // 2
+    # The transposed product's tile a matrix is a 128-row CTA pair where its
+    # N (this M) reaches the narrowest pair width and its K loop spans two
+    # or more 64-deep k-blocks (its search then runs only the pairs:
+    # ``repair.batched_pair128_one_tile_matrices``), else one CTA: a wave of
+    # pairs holds half as many matrices.
+    pairs = (
+        m >= min(TCGEN05_TWO_CTA_PAIR128_ONE_WAVE_BLOCK_NS)
+        and k > TCGEN05_WHOLE_K_TILE_MIN
+    )
+    tiles_a_wave = num_sms // 2 if pairs else num_sms
+    return (
+        0 < m <= TCGEN05_ONE_CTA_MIN_BLOCK_M
+        and n == tile_rows
+        and k % TCGEN05_WHOLE_K_TILE_MIN == 0
+        and k <= 4 * TCGEN05_WHOLE_K_TILE_MIN
+        and batch >= TCGEN05_TRANSPOSED_BATCH_MIN_WAVES * tiles_a_wave
+    )
+
+
 def batched_pair_matrix(
     *,
     itemsize: int,
@@ -1188,6 +1336,101 @@ def batched_pair_matrix(
             )
             or static_m % TCGEN05_TWO_CTA_BLOCK_M != 0
             or static_n % TCGEN05_TWO_CTA_BLOCK_N != 0
+        )
+    )
+
+
+def tcgen05_batched_pair128_m_edge(static_m: int) -> bool:
+    """Whether a batched GEMM's matrices are one partial 128-row CTA pair
+    tile tall with rows for both CTAs: more than the 64 rows of the pair's
+    first CTA, fewer than the pair tile's 128 (``batched_pair128_matrix``).
+
+    The power-of-two floor of such an M (64 for 80) splits each matrix into a
+    whole and a partial 64-row one-CTA tile, the second reading the matrix's
+    B again. bf16 512 x [80, 128] @ [128, 128] (a M-major), the full-effort
+    pick before:
+
+        for tile_z, tile_y, tile_x in hl.tile([512, 80, 128]):
+            ...  # [1, 64, 128, 32] flat: 1024 CTAs, 10.08 us
+
+    and on one 128-row pair per matrix, its second CTA's A box zero-filled
+    past row 80 and its 3-D TMA store clipped there (cuBLAS runs one 2-CTA
+    pair of 128x96 a matrix, transposed):
+
+        ...  # [1, 128, 128, 64] persistent pair: 7.53-7.59 us
+
+    GB300, CUDA graphs over cold inputs, of cuBLAS's 7.45-7.49 us: 0.740 ->
+    0.987-0.990; M = 96 / 112 run 0.980-0.982 / 0.988 as written. The
+    transposed product (out.mT = b.mT @ a.mT: the same pair over N' = 80 on a
+    128-wide carrier) runs 3.0-3.7% behind at every M (0.951-0.955): its
+    column-major output's epilogue costs that much on a tile of two k-blocks,
+    so these matrices stay as written. At 64 rows or fewer the pair's second
+    CTA would hold none (``tcgen05_transposes_skinny_batched_product``
+    transposes those)."""
+    return TCGEN05_ONE_CTA_MIN_BLOCK_M < static_m < TCGEN05_TWO_CTA_EDGE_PAIR128_BLOCK
+
+
+def batched_pair128_matrix(
+    *,
+    itemsize: int,
+    rank3_operand: bool,
+    static_m: int | None,
+    static_n: int | None,
+    static_k: int | None,
+    ab_tma: bool,
+) -> bool:
+    """Whether a batched 16-bit GEMM runs its matrices on the persistent
+    128-row CTA pairs (``tcgen05_cta_group="two"`` on ``block_m=128``: each
+    CTA owns 64 rows of the pair tile) over an M edge, an N edge or a K
+    tail: matrices whole in 128-row tiles whose N no 64-wide pair tile
+    divides (wider than one, and ``batched_pair_matrix``'s 256-row pairs not
+    taking them), or whose K ends in a tail past the first 64-deep k-block,
+    or matrices shorter than one pair tile whose rows reach the pair's
+    second CTA (``tcgen05_batched_pair128_m_edge``). The role-local TMA
+    producer zero-fills each matrix's A rows past M, its B rows past N and
+    its K tail (the batch is its own tensor-map dim), and the pair's 3-D TMA
+    store clips the tile at the matrix's M and N edges. bf16 512 x [128,
+    128] @ [128, 80] (b K-major) runs one 128x128 pair per matrix, as cuBLAS
+    runs one 2-CTA pair of 128x80; before, only the flat one-CTA tiles ran
+    it (the surface's paired pipeline takes whole 64-wide N and K tiles
+    only).
+
+    ``ab_tma`` as for ``batched_pair_matrix``: without TMA the pair would be
+    the shared scalar-copy kernel (``_ragged_batched_pair_config``)."""
+    if not (
+        itemsize == 2
+        and ab_tma
+        and rank3_operand
+        and static_m is not None
+        and static_n is not None
+        and static_k is not None
+        and (
+            static_m % TCGEN05_TWO_CTA_EDGE_PAIR128_BLOCK == 0
+            or tcgen05_batched_pair128_m_edge(static_m)
+        )
+    ):
+        return False
+    pair_k = TCGEN05_TWO_CTA_EDGE_K_TAIL_DEEP_BLOCK_K
+    pair_n = min(TCGEN05_TWO_CTA_PAIR128_ONE_WAVE_BLOCK_NS)
+    n_edge = static_n % pair_n != 0 and static_n > pair_n
+    k_tail = static_k % pair_k != 0 and static_k > pair_k
+    return (
+        (tcgen05_batched_pair128_m_edge(static_m) or n_edge or k_tail)
+        # the narrowest pair tile is 64 wide: under it (N = 32) no pair tile
+        # fits the search's N range, and the admission's persistent schedules
+        # would only reach the one-CTA tiles
+        and static_n >= pair_n
+        # the pair's k-blocks are 64 deep and its K tail rides only past the
+        # first (``cute_mma``'s ``_ragged_batched_pair_config``): K = 48 runs
+        # on no pair
+        and (static_k % pair_k == 0 or static_k > pair_k)
+        and not batched_pair_matrix(
+            itemsize=itemsize,
+            rank3_operand=rank3_operand,
+            static_m=static_m,
+            static_n=static_n,
+            static_k=static_k,
+            ab_tma=ab_tma,
         )
     )
 
@@ -1271,6 +1514,12 @@ class CuteTcgen05SearchPlan:
     # ``batched_pair_matrix``: the search reaches the 256 x 256 pair tile
     # over each ragged matrix of a batch.
     batched_pair_matrix: bool = False
+    # ``tcgen05_one_row_tile_batched_narrow_n``: the search tiles N 64 wide,
+    # and so does the default.
+    one_row_tile_narrow_n: bool = False
+    # ``batched_pair128_matrix``: the search reaches the 128-row pairs over
+    # each matrix's M edge, N edge or K tail.
+    batched_pair128_matrix: bool = False
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1482,6 +1731,18 @@ def _plan_cute_tcgen05_search_candidate(
         # larger ragged matrix keeps the 256 x 256 ceilings it has).
         max_tcgen05_m = max_search_m = TCGEN05_TWO_CTA_BLOCK_M
         max_tcgen05_n = max_search_n = TCGEN05_TWO_CTA_BLOCK_N
+    pair128_matrix = (
+        has_leading_passthrough
+        and env.settings.cute_flat_edge_tma
+        and batched_pair128_matrix(
+            itemsize=lhs.dtype.itemsize,
+            rank3_operand=lhs.ndim == 3 or rhs.ndim == 3,
+            static_m=static_m,
+            static_n=static_n,
+            static_k=static_k,
+            ab_tma=batched_ab_tma,
+        )
+    )
     max_search_k = (
         128 if static_k is None else min(128, pow2_floor_at_least(static_k, mma_k))
     )
@@ -1614,6 +1875,21 @@ def _plan_cute_tcgen05_search_candidate(
             < num_sms
         ):
             min_search_m = 64
+    from ..cute_mma import _tcgen05_tma_matrix_major
+
+    one_row_tile_narrow_n = tcgen05_one_row_tile_batched_narrow_n(
+        batched_operand=has_leading_passthrough and (lhs.ndim == 3 or rhs.ndim == 3),
+        a_m_major=_tcgen05_tma_matrix_major(lhs if lhs_source is None else lhs_source)
+        == "col",
+        itemsize=lhs.dtype.itemsize,
+        static_m=static_m,
+        static_n=static_n,
+        static_k=static_k,
+        batch=leading_work_multiplier,
+        num_sms=_cuda_num_sms_or_zero(lhs.device),
+    )
+    if one_row_tile_narrow_n:
+        max_search_n = min(max_search_n, TCGEN05_ONE_ROW_TILE_BATCHED_BLOCK_N)
     if small_n_requires_role_local_tma and (
         static_m is None
         or static_k is None
@@ -1621,7 +1897,6 @@ def _plan_cute_tcgen05_search_candidate(
         or static_k % max_search_k != 0
     ):
         return reject()
-    from ..cute_mma import _tcgen05_tma_matrix_major
 
     def static_strides(tensor: torch.Tensor | None) -> tuple[int, ...] | None:
         if tensor is None:
@@ -1678,6 +1953,8 @@ def _plan_cute_tcgen05_search_candidate(
             tcgen05_family_admitted=not operand_casts,
             small_n_zero_fills=small_n_zero_fills,
             batched_pair_matrix=pair_matrix,
+            one_row_tile_narrow_n=one_row_tile_narrow_n,
+            batched_pair128_matrix=pair128_matrix,
         ),
         required_specialized_vars=frozen_required_specialized_vars,
         guards_complete=True,
@@ -1719,13 +1996,16 @@ def enable_cute_tcgen05_search(
     output_dtype_bytes: int | None = None,
     output_stores: int = 1,
     plain_epilogue: bool = False,
+    radix_store: bool = False,
 ) -> None:
     """Apply one preflighted tcgen05 search plan to the shared config.
 
     ``output_dtype_bytes`` / ``output_stores`` size the TMA-store rings the
     AB-stage fit estimate charges (``None``: AB-only estimate);
     ``plain_epilogue``: the epilogue stores the tile once and reads no other
-    tensor (the 128-row pairs' plain GEMMs).
+    tensor (the 128-row pairs' plain GEMMs); ``radix_store``: it stores
+    through a hierarchical (view/permute) destination layout
+    (``radix_store``), which the 128-row pairs do not render.
     """
     env = CompileEnvironment.current()
     spec = env.config_spec
@@ -1746,6 +2026,37 @@ def enable_cute_tcgen05_search(
     max_search_m = plan.max_search_m
     max_search_n = plan.max_search_n
     max_search_k = plan.max_search_k
+    # The batched 128-row pairs (``batched_pair128_matrix``) run plain
+    # epilogues: an auxiliary epilogue below one full N tile keeps the SIMT
+    # edge store (``cute_mma``'s ``tcgen05_use_output_edge_tma_store_for_full_tiles``),
+    # and a head merge's hierarchical store renders from one-CTA tiles only.
+    batched_pair128 = plan.batched_pair128_matrix and plain_epilogue and not radix_store
+    pair128_widths = TCGEN05_TWO_CTA_PAIR128_ONE_WAVE_BLOCK_NS
+    if batched_pair128 and static_n is not None and static_n < max(pair128_widths):
+        # The power-of-two floor of a ragged N under 128 columns (64 for 80)
+        # would split each matrix into a whole and a 16-column tile, the
+        # second reading the matrix's A again; the 128-wide pair tile covers
+        # it whole, its MMA columns past N computing zeros (B's TMA box
+        # zero-fills those rows) that the 3-D TMA store clips. bf16 512 x
+        # [128, 128] @ [128, 80] (GB300, CUDA graphs over cold inputs, of
+        # cuBLAS): block_sizes [1, 128, 128, 128] 1.037, [1, 128, 64, 128]
+        # (64 + 16 columns) 1.015. A wider N keeps its power-of-two floor
+        # (128 for 200): a 256-wide pair over it is unmeasured, and past six
+        # AB stages beside four C stages its edge store no longer fits SMEM
+        # and falls back to the SIMT store
+        # (``cute_mma``'s ``tcgen05_output_edge_tma_store_fits_smem``).
+        max_search_n = carrier_n(static_n)
+    if (
+        batched_pair128
+        and static_m is not None
+        and tcgen05_batched_pair128_m_edge(static_m)
+    ):
+        # Likewise the power-of-two floor of an M under 128 rows (64 for 80)
+        # would split each matrix into a whole and a partial 64-row one-CTA
+        # tile, the second reading its B again; the 128-row pair tile covers
+        # it whole, its second CTA's A box zero-filled past M and the 3-D TMA
+        # store clipped there (``tcgen05_batched_pair128_m_edge``).
+        max_search_m = TCGEN05_TWO_CTA_EDGE_PAIR128_BLOCK
     spec.tcgen05.search_enabled = True
     if static_m is not None and static_m < plan.min_search_m:
         # The frontend left the M search ceiling at the extent; the tcgen05
@@ -1831,6 +2142,9 @@ def enable_cute_tcgen05_search(
             # a batch of matrices on the CTA pairs (``batched_pair_matrix``),
             # K whole
             or (plan.batched_pair_matrix and static_k % max_search_k == 0)
+            # or on the 128-row pairs over an M edge, an N edge or a K tail
+            # (``batched_pair128_matrix``)
+            or batched_pair128
             # both: the pairs' double-edge shape
             or (
                 m_edge
@@ -1843,12 +2157,22 @@ def enable_cute_tcgen05_search(
                     max_search_k=max_search_k,
                 )
             )
-        ) and (not m_edge or max_search_m >= TCGEN05_TWO_CTA_BLOCK_M)
+        ) and (
+            not m_edge
+            or max_search_m >= TCGEN05_TWO_CTA_BLOCK_M
+            # the 128-row pairs clip a matrix's M edge too
+            # (``tcgen05_batched_pair128_m_edge``)
+            or batched_pair128
+        )
         whole_k_tile = static_k & -static_k
         if (
             input_dtype.itemsize == 2
             and static_k % max_search_k != 0
             and not edge_k_tail_shape
+            # (the batched 128-row pairs issue a K tail past their first
+            # k-block themselves, and the flat tiles keep their 128-deep
+            # k-blocks: bf16 512 x [128, 192] @ [192, 80] searches K up to 128)
+            and not batched_pair128
             and (output_edge_shape or not (m_edge or n_edge))
             and whole_k_tile >= TCGEN05_WHOLE_K_TILE_MIN
         ):
@@ -1980,10 +2304,13 @@ def enable_cute_tcgen05_search(
     spec._cute_tcgen05_config.warp_mma_admitted = warp_mma_admitted
     spec._cute_tcgen05_config.tcgen05_family_admitted = plan.tcgen05_family_admitted
     spec._cute_tcgen05_config.tcgen05_min_search_m = plan.min_search_m
-    spec._cute_tcgen05_config.output_edge_persistent_admitted = (
-        output_edge_shape and allow_whole_k_persistent_pid_types
+    spec._cute_tcgen05_config.output_edge_persistent_admitted = output_edge_shape and (
+        allow_whole_k_persistent_pid_types or batched_pair128
     )
+    spec._cute_tcgen05_config.batched_pair128_matrix = batched_pair128
+    spec._cute_tcgen05_config.matmul_radix_store = radix_store
     spec._cute_tcgen05_config.tcgen05_min_search_n = plan.min_search_n
+    spec._cute_tcgen05_config.one_row_tile_narrow_n = plan.one_row_tile_narrow_n
     spec._cute_tcgen05_config.matmul_leading_block_id = leading_block_id
     # True when the edge K-tail family clears the quarter-wave gate on its
     # 64-wide pairs alone (``repair.plain_pair128_widths``): the search then
@@ -2090,6 +2417,9 @@ def enable_cute_tcgen05_search(
         and static_m is not None
         and _one_cta_heights_miss_m(static_m)
         and not allow_cluster_m2_search
+        # (the batched 128-row pairs reach a ragged M through the paired
+        # pipeline: ``tcgen05_batched_pair128_m_edge``)
+        and not batched_pair128
     ):
         # An M ragged for every one-CTA tile height runs persistent only
         # through the CtaGroup.TWO pairs: where none is reachable (bf16
@@ -2144,6 +2474,8 @@ def enable_cute_tcgen05_search(
             allow_whole_k_persistent_pid_types
             or allow_small_n_persistent_pid_types
             or allow_k_tail_persistent_pid_types
+            # (the 128-row pairs' own schedules: ``batched_pair128_matrix``)
+            or batched_pair128
         ),
         enable_cluster_m2_search=allow_cluster_m2_search,
         cluster_m2_static_k=static_k if allow_cluster_m2_search else None,

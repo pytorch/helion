@@ -11328,9 +11328,29 @@ def plan_tcgen05_pipeline(
         and n_size >= bn
         and tcgen05_simt_aux_partial_output
     )
+    # A CTA pair whose N tile is wider than N (no full tile at all: bf16
+    # 512 x [128, 128] @ [128, 80] on one 128x128 pair a matrix) stores
+    # through TMA too when the epilogue reads no auxiliary operand: the
+    # partial-output body (``tcgen05_partial_output_tma_store`` below) puts
+    # every tile on the TMA store, which clips at N, as the double edge does
+    # for a 200x200 matrix on a 256x256 pair. Otherwise every element went
+    # through the predicated SIMT edge store, one 16-bit value per thread and
+    # instruction:
+    #     tcgen05_simt_atom = cute.make_copy_atom(cute.nvgpu.CopyR2GOp(), cutlass.BFloat16, num_bits_per_copy=tcgen05_num_bits, ...)
+    #     ...
+    #     tcgen05_edge_pred[0, _edge_i] = cute.elem_less(_coord, (128, 80))
+    #     cute.copy(tcgen05_simt_atom, tcgen05_edge_src, tcgen05_edge_dst, pred=tcgen05_edge_pred)
+    # GB300, CUDA graphs over cold inputs, that pair at five AB stages: 7.59
+    # us through TMA (1.04 of cuBLAS), 56.9 us through the SIMT store. An
+    # auxiliary epilogue keeps that store below one full tile: its full-tile
+    # TMA store with SIMT fringe tiles is validated with full tiles present.
     tcgen05_use_output_edge_tma_store_for_full_tiles = (
         tcgen05_role_local_m_edge_tma
-        or (tcgen05_role_local_n_edge_tma and tcgen05_is_two_cta and n_size >= bn)
+        or (
+            tcgen05_role_local_n_edge_tma
+            and tcgen05_is_two_cta
+            and (n_size >= bn or not env.config_spec.tcgen05.aux_kernel_detected)
+        )
         or tcgen05_one_cta_n_edge_tma_store
         or tcgen05_role_local_double_edge_tma
     ) and tcgen05_output_edge_tma_store_fits_smem

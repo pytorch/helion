@@ -159,6 +159,10 @@ class CuteTcgen05Config:
         # The shallowest k-block those A's copies take (the deepest of their
         # layouts' ``Tcgen05CpAsyncALayout.min_block_k``).
         self.cp_async_a_min_block_k: int = 16
+        # The search plan capped N at 64 for a batched GEMM one 64-row tile
+        # tall (``search_plan.tcgen05_one_row_tile_batched_narrow_n``); the
+        # default takes the 64-wide tile too.
+        self.one_row_tile_narrow_n: bool = False
         # Every MMA's A and B pass the TensorMap proof, whatever its output
         # (``host_function_matmul_operands_tma_provable(outputs=False)``).
         self.matmul_inputs_tma_provable: bool = True
@@ -271,6 +275,16 @@ class CuteTcgen05Config:
         # (``one_cta_n_edge_partial_output``), so its other partial-tile
         # samples are flattened.
         self.output_edge_persistent_admitted: bool = False
+        # A batched 16-bit GEMM whose matrices run on the 128-row CTA pairs
+        # over an M edge, an N edge or a K tail
+        # (``search_plan.batched_pair128_matrix``): the paired pipeline
+        # searches and seeds them.
+        self.batched_pair128_matrix: bool = False
+        # The MMA's epilogue stores through a hierarchical (view/permute)
+        # destination layout (``radix_store``: a head merge fused into a
+        # bmm's store), which the 128-row CTA pairs' epilogue subtiles do
+        # not render (``store_epilogue``).
+        self.matmul_radix_store: bool = False
         # Block id of the leading passthrough (batch) axis, when any.
         self.matmul_leading_block_id: int | None = None
 

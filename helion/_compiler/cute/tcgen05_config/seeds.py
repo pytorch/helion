@@ -31,6 +31,7 @@ from ..pipeline_smem import TCGEN05_CTA_GROUP_CONFIG_KEY
 from ..pipeline_smem import max_pipeline_ab_stages
 from ..pipeline_smem import paired_pipeline_max_ab_stages
 from ..strategies import TCGEN05_BATCH_RASTER_CONFIG_KEY
+from ..strategies import TCGEN05_BATCH_RASTER_FASTEST
 from ..strategies import TCGEN05_BATCH_RASTER_SLOWEST
 from ..strategies import TCGEN05_L2_SWIZZLE_SIZE_CONFIG_KEY
 from ..strategies import TCGEN05_LAYOUT_OVERRIDES_D_STORE_BOX_N_KEY
@@ -63,6 +64,7 @@ from ..tcgen05_constants import TCGEN05_AUX_LOAD_PLACEMENT_POST_ACC_WAIT
 from ..tcgen05_constants import TCGEN05_AUX_LOAD_PLACEMENT_PRE_ACC_WAIT
 from ..tcgen05_constants import TCGEN05_AUX_PREFETCH_SUBTILES_CONFIG_KEY
 from ..tcgen05_constants import TCGEN05_BATCHED_ONE_K_TILE_SEED_AB_STAGES
+from ..tcgen05_constants import TCGEN05_BATCHED_ONE_ROW_TILE_SEED_AB_STAGES
 from ..tcgen05_constants import TCGEN05_C_STORE_MODE_CONFIG_KEY
 from ..tcgen05_constants import TCGEN05_C_STORE_MODE_DIRECT
 from ..tcgen05_constants import TCGEN05_CLUSTER_N2_SEED_L2_GROUPING
@@ -749,17 +751,51 @@ def _paired_pipeline_seed_configs(
     if pid is None:
         return []
     seeds: list[Config] = []
+    # A batch of matrices over an M edge, an N edge or a K tail
+    # (``search_plan.batched_pair128_matrix``) seeds a partial (only) M tile,
+    # partial last N tiles and the partial last k-block past the first: the
+    # pair's TMA loads zero-fill each matrix's A rows past M, its B rows past
+    # N and its K tail, and its 3-D TMA store clips the M and N edges.
+    ragged = state.batched_pair128_matrix
+    # A batched matrix's N that one 128-row pair tile covers is seeded on
+    # that width alone (``repair.batched_pair128_whole_n_tile``, which the
+    # search's repair projects every sampled 128-row pair onto).
+    whole_n = repair.batched_pair128_whole_n_tile(state)
+    # Matrices each one such pair tile over K <= 128 keep four C stages
+    # (``repair.batched_pair128_c_stages``), the pair's rings sized beside them.
+    pair128_c_stages = repair.batched_pair128_c_stages(state)
+    # Matrices each one such pair tile over two or more 64-deep k-blocks
+    # (``repair.batched_pair128_one_tile_matrices``) are also seeded with four
+    # tiles' k-blocks in the AB ring beside the shallowest and deepest: bf16
+    # 512 x [80, 128] @ [128, 128] ran [1, 128, 128, 64] ab6 / 7 / 8 / 9 / 12
+    # c4 at 0.980 / 0.986 / 0.991 / 0.978 / 0.962 of cuBLAS (GB300, CUDA
+    # graphs over cold inputs, in one process).
+    one_tile = repair.batched_pair128_one_tile_matrices(state)
     for bm in (128, 256):
         for bn in (64, 128, 256):
             for bk in (
                 (64, 128, 256) if pipeline_facts.input_dtype_bytes == 1 else (64, 128)
             ):
                 values = (bm, bn, bk)
+                if (
+                    whole_n is not None
+                    and bm == 128
+                    and (
+                        bn != whole_n or bk != repair.batched_pair128_block_k(state, bk)
+                    )
+                ):
+                    continue
                 if any(
-                    (pipeline_facts.input_dtype_bytes != 1 and extent % value != 0)
+                    (
+                        pipeline_facts.input_dtype_bytes != 1
+                        and extent % value != 0
+                        and not (ragged and axis == 0 and extent < value)
+                        and not (ragged and axis == 1)
+                        and not (ragged and axis == 2 and extent > value)
+                    )
                     or not fragment.low <= value <= fragment.high
-                    for extent, value, fragment in zip(
-                        (m, n, k), values, fragments, strict=True
+                    for axis, (extent, value, fragment) in enumerate(
+                        zip((m, n, k), values, fragments, strict=True)
                     )
                 ):
                     continue
@@ -793,6 +829,11 @@ def _paired_pipeline_seed_configs(
                         TCGEN05_AUX_LOAD_MODE_SIMT,
                         TCGEN05_AUX_LOAD_MODE_EPI_TMA,
                     )
+                c_stages = (
+                    pair128_c_stages
+                    if pair128_c_stages is not None and bm == 128
+                    else 2
+                )
                 for placement in placements:
                     for aux_mode in aux_modes:
                         maximum = max_pipeline_ab_stages(
@@ -800,7 +841,7 @@ def _paired_pipeline_seed_configs(
                             bm=bm,
                             bn=bn,
                             bk=bk,
-                            c_stages=2,
+                            c_stages=c_stages,
                             acc_stages=acc_stages,
                             max_stages=paired_pipeline_max_ab_stages(pipeline_facts),
                             aux_load_placement=placement,
@@ -814,6 +855,11 @@ def _paired_pipeline_seed_configs(
                             if aux_mode == TCGEN05_AUX_LOAD_MODE_EPI_TMA
                             else (min(2, maximum), maximum)
                         )
+                        if one_tile and bm == 128:
+                            depths = (
+                                *depths,
+                                min(4 * -(-k // bk), maximum),
+                            )
                         # nvjet's 2x2 clusters stage the same pair tiles
                         # 64 deep in K (``128x256_64x6_2x2_2cta``): the
                         # deepest bk=64 SIMT ring gets a 2x2 twin where
@@ -854,7 +900,7 @@ def _paired_pipeline_seed_configs(
                                     tcgen05_cluster_m=2,
                                     tcgen05_cluster_n=cluster_n,
                                     tcgen05_ab_stages=stages,
-                                    tcgen05_c_stages=2,
+                                    tcgen05_c_stages=c_stages,
                                     tcgen05_acc_stages=acc_stages,
                                     tcgen05_persistence_model="static_persistent",
                                     tcgen05_strategy="role_local_monolithic",
@@ -1419,6 +1465,110 @@ def _batched_one_k_tile_seed_configs(state: CuteTcgen05Config) -> list[Config]:
         "l2_groupings": [1],
         TCGEN05_L2_SWIZZLE_SIZE_CONFIG_KEY: 1,
         TCGEN05_BATCH_RASTER_CONFIG_KEY: TCGEN05_BATCH_RASTER_SLOWEST,
+        "tcgen05_persistence_model": "static_persistent",
+        "tcgen05_strategy": "role_local_monolithic",
+        "tcgen05_layout_strategy": "default",
+        **dict.fromkeys(TCGEN05_LAYOUT_OVERRIDES_KEYS),
+    }
+    return [Config(**seed_config)]
+
+
+def _batched_one_row_tile_seed_configs(state: CuteTcgen05Config) -> list[Config]:
+    """A persistent one-CTA seed for batched 16-bit GEMMs whose matrices are
+    one 64-row tile tall (memory-bound: every N tile of a matrix reads its
+    whole 64 x K block of A, and B once).
+
+    The 64x64 tile on a twelve-deep ring of 16 KB AB stages
+    (``TCGEN05_BATCHED_ONE_ROW_TILE_SEED_AB_STAGES``, 192 KB of operands in
+    flight a CTA), double-buffered accumulators, a four-deep C ring and the
+    batch-fastest raster. For bf16 192 x 64x512x512 with A stored M-major:
+
+        for tile_z, tile_y, tile_x in hl.tile([192, 64, 512]):
+            acc = hl.zeros([tile_z, tile_y, tile_x], dtype=torch.float32)
+            for tile_r in hl.tile(512):  # [1, 64, 64, 64]: 1536 tiles
+                ...
+
+    eight tiles a matrix where the default's 64x256 four-deep ring runs two
+    (384 tiles: 2.5 a SM), so the grid balances over the SMs and each CTA
+    streams its ring through tile boundaries. GB300, CUDA graphs over cold
+    inputs, of cuBLAS: 192 matrices 1.016-1.017 (the default, which the
+    full-effort search keeps when it reaches no 64x64 tile, 0.978), 256
+    0.999-1.000, 384 0.993, 512 1.006-1.014 (0.985), and 1024 x 64x256x256
+    0.969-0.972 (0.960). The search reaches the tile on its own in some runs
+    (over 128-deep k-blocks on six stages, the same 192 KB: 1.017 at 192
+    matrices, 0.996 at 512), not in others. The batch-major raster runs as
+    fast at K = 512 but 0.85-0.87 at 1024 x 64x256x256 (256 matrices 0.986-
+    0.990). Over two k-blocks a tile the 64x128 tile the search picks runs
+    ahead: 1024 x 64x128x128 0.981-0.987, the 64x64 ring 0.969-0.974.
+    Geometry: M within one 64-row tile, N whole in two or more 64-wide tiles,
+    K whole in four or more 64-deep k-blocks, and two or more tiles a SM.
+    """
+    extents = state.matmul_compile_time_static_extents
+    fragments = facts._matmul_block_fragments(state)
+    dtype = state.matmul_input_dtype
+    if (
+        not state.search_enabled
+        or not state.matmul_has_leading_passthrough
+        # (a grouped GEMM's passthrough is its group loop, not a batch)
+        or state.grouped_worklist_smem_facts is not None
+        or state.aux_kernel_detected
+        or state.device_sm_count <= 0
+        or extents is None
+        or fragments is None
+        or dtype not in (torch.float16, torch.bfloat16)
+        or any(value is None or value <= 0 for value in extents)
+        or "persistent_interleaved" not in state.allowed_pid_types
+    ):
+        return []
+    m, n, k = cast("tuple[int, int, int]", extents)
+    bm = bn = bk = 64
+    bm_fragment, bn_fragment, bk_fragment = fragments
+    if (
+        m > bm
+        or n % bn
+        or n < 2 * bn
+        or k % bk
+        or k < 4 * bk
+        or not (bm_fragment.low <= bm <= bm_fragment.high)
+        or not (bn_fragment.low <= bn <= bn_fragment.high)
+        or not (bk_fragment.low <= bk <= bk_fragment.high)
+        or state.matmul_leading_work_multiplier * (n // bn) < 2 * state.device_sm_count
+    ):
+        return []
+    ab_stages = next(
+        (
+            depth
+            for depth in range(TCGEN05_BATCHED_ONE_ROW_TILE_SEED_AB_STAGES, 1, -1)
+            if smem.default_layout_smem_fits(
+                state,
+                bm=bm,
+                bn=bn,
+                bk=bk,
+                cluster_m=1,
+                ab_stages=depth,
+                c_stages=4,
+                stage_rows=False,
+            )
+        ),
+        None,
+    )
+    if ab_stages is None:
+        return []
+    block_sizes = facts._matmul_seed_block_sizes(state, bm=bm, bn=bn, bk=bk)
+    if block_sizes is None:
+        return []
+    seed_config: dict[str, Any] = {
+        "block_sizes": block_sizes,
+        "pid_type": "persistent_interleaved",
+        "tcgen05_cta_group": "auto",
+        "tcgen05_cluster_m": 1,
+        "tcgen05_cluster_n": 1,
+        "tcgen05_ab_stages": ab_stages,
+        "tcgen05_acc_stages": 2,
+        "tcgen05_c_stages": 4,
+        "l2_groupings": [1],
+        TCGEN05_L2_SWIZZLE_SIZE_CONFIG_KEY: 1,
+        TCGEN05_BATCH_RASTER_CONFIG_KEY: TCGEN05_BATCH_RASTER_FASTEST,
         "tcgen05_persistence_model": "static_persistent",
         "tcgen05_strategy": "role_local_monolithic",
         "tcgen05_layout_strategy": "default",
@@ -3027,6 +3177,7 @@ def autotune_seed_configs(state: CuteTcgen05Config) -> list[Config]:
     seeds.extend(_multi_tile_two_cta_seed_configs(state))
     seeds.extend(_batched_multi_tile_seed_configs(state))
     seeds.extend(_batched_one_k_tile_seed_configs(state))
+    seeds.extend(_batched_one_row_tile_seed_configs(state))
     plain_clc_seed = _plain_clc_seed_config(state)
     if plain_clc_seed is not None:
         seeds.append(plain_clc_seed)

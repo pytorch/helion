@@ -88,6 +88,21 @@ def _cute_tcgen05_plain_epilogue(device_ir: DeviceIR, node: torch.fx.Node) -> bo
     )
 
 
+def _cute_tcgen05_radix_store(device_ir: DeviceIR, node: torch.fx.Node) -> bool:
+    """Whether one MMA's epilogue stores through a hierarchical (view/permute)
+    destination layout the MMA store analysis admitted (``radix_store``: a
+    head merge fused into a bmm's store)."""
+    from .aux_tensor import analyze_tcgen05_matmul_store_chains
+    from .radix_store import proven_radix_store_layout
+
+    stores = analyze_tcgen05_matmul_store_chains(
+        device_ir.graphs, node, prove_aux_only_reorder=False
+    )
+    return stores is not None and any(
+        proven_radix_store_layout(store) is not None for store, _chain in stores
+    )
+
+
 def _finalize_cute_tcgen05_search_planning(
     env: CompileEnvironment,
     planning_results: Sequence[_CuteTcgen05SearchPlanningResult],
@@ -617,6 +632,7 @@ def register_search_surface(device_ir: DeviceIR, config_spec: ConfigSpec) -> Non
                 output_dtype_bytes=output_store_facts[0],
                 output_stores=output_store_facts[1],
                 plain_epilogue=_cute_tcgen05_plain_epilogue(device_ir, mma_node),
+                radix_store=_cute_tcgen05_radix_store(device_ir, mma_node),
             )
             if (
                 len(mma_candidates) == 1

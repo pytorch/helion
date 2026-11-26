@@ -22,6 +22,7 @@ from typing import cast
 
 import torch
 
+from ....autotuner.config_fragment import EnumFragment
 from ....exc import InvalidConfig
 from ..cp_async_operand import TCGEN05_CP_ASYNC_A_BLOCK_KS
 from ..cp_async_operand import TCGEN05_CP_ASYNC_A_TILE_M
@@ -133,6 +134,8 @@ from ..tcgen05_constants import TCGEN05_AUX_STAGE_COUNT_DEFAULT
 from ..tcgen05_constants import TCGEN05_AUX_STAGE_COUNT_VALIDATION_CHOICES
 from ..tcgen05_constants import TCGEN05_AUX_STAGES_CONFIG_KEY
 from ..tcgen05_constants import TCGEN05_AUX_TMA_ILLEGAL_TENSOR_REASON
+from ..tcgen05_constants import TCGEN05_BATCHED_ONE_TILE_PAIR_MAX_WAVES
+from ..tcgen05_constants import TCGEN05_BATCHED_PAIR128_C_STAGES
 from ..tcgen05_constants import TCGEN05_C_ACQUIRE_PLACEMENT_BEFORE_STORE
 from ..tcgen05_constants import TCGEN05_C_ACQUIRE_PLACEMENT_CONFIG_KEY
 from ..tcgen05_constants import TCGEN05_C_ACQUIRE_PLACEMENT_PRE_LOOP
@@ -224,6 +227,7 @@ from ..tcgen05_constants import TCGEN05_TWO_CTA_PAIR128_ONE_WAVE_BLOCK_NS
 from ..tcgen05_constants import TCGEN05_TWO_CTA_PAIR_BLOCK_NS
 from ..tcgen05_constants import TCGEN05_TWO_CTA_SEED_PID_TYPE
 from ..tcgen05_constants import TCGEN05_WARP_REGISTER_REALLOCATION_CONFIG_KEY
+from ..tcgen05_constants import TCGEN05_WHOLE_K_TILE_MIN
 from ..tcgen05_constants import resolve_tcgen05_grouped_worklist_mma_profile
 from ..tcgen05_constants import tcgen05_aux_fragment_bytes_per_thread
 from ..tcgen05_constants import tcgen05_aux_prefetch_bytes_per_thread
@@ -954,6 +958,217 @@ def _m_pair_block_m_is_valid(state: CuteTcgen05Config) -> bool:
     return False
 
 
+def batched_pair128_c_stages(state: CuteTcgen05Config) -> int | None:
+    """The C stages the 128-row CTA pair over a batch of matrices each one
+    pair tile -- at most 128 rows, its N on one pair tile
+    (``batched_pair128_whole_n_tile``) -- over K <= 128 (a k-block or two)
+    takes whatever the search samples (``TCGEN05_BATCHED_PAIR128_C_STAGES``:
+    the shapes measured); None elsewhere, where a taller matrix or a longer K
+    loop keeps its sampled C ring."""
+    extents = state.matmul_compile_time_static_extents
+    if extents is None or batched_pair128_whole_n_tile(state) is None:
+        return None
+    # (``batched_pair128_whole_n_tile`` proved the extents static ints)
+    m, _n, k = cast("tuple[int, int, int]", extents)
+    if m > TCGEN05_TWO_CTA_EDGE_PAIR128_BLOCK or k > 2 * TCGEN05_WHOLE_K_TILE_MIN:
+        return None
+    return TCGEN05_BATCHED_PAIR128_C_STAGES
+
+
+def batched_pair128_block_k(state: CuteTcgen05Config, block_k: int) -> int:
+    """The k-block of the 128-row CTA pair over a batched matrix whose N one
+    pair tile covers (``batched_pair128_whole_n_tile``) in place of a sampled
+    ``block_k``: two 64-deep k-blocks where K is at most one 128-deep k-block.
+
+    The tile's K loop then runs two MMA k-blocks, the first of them on half the
+    tile's operand bytes, where one 128-deep k-block waits for all of them:
+        tcgen05_ab_pipeline = _helion_tc_pro.make_tma_umma_pipeline(num_stages=10, ...)  # 64-deep stages
+    rather than ``num_stages=5`` of 128-deep ones (the same bytes in flight).
+    GB300, CUDA graphs over cold inputs, of cuBLAS (or Triton's template), four
+    C stages, 64- / 128-deep k-blocks: bf16 512 x [128, 128] @ [128, 128] ab
+    10 / 5 0.999-1.002 / 0.982-0.990 (b column-major 0.999-1.000 /
+    0.985-0.987), 512 x [128, 128] @ [128, 64] ab 8 / 8 1.180-1.208 /
+    1.159-1.185, 1024 x [128, 128] @ [128, 64] (a column-major) ab 9 / 8
+    1.129-1.130 / 1.113-1.114, 192 x [128, 128] @ [128, 64] (b column-major)
+    ab 8 / 8 1.023-1.024 / 0.994-0.996, 512 x [128, 80] @ [80, 128] ab 10 / 5
+    1.028-1.034 / 1.030-1.036. The final selection's per-call timing reads
+    them within its noise (512 x 128^3: the 128-deep pick 11.02 us against
+    finalists up to 11.23). A longer K keeps the sampled k-block."""
+    extents = state.matmul_compile_time_static_extents
+    assert extents is not None
+    k = cast("int", extents[2])
+    if block_k > TCGEN05_WHOLE_K_TILE_MIN and k <= 2 * TCGEN05_WHOLE_K_TILE_MIN:
+        return TCGEN05_WHOLE_K_TILE_MIN
+    return block_k
+
+
+def batched_pair128_whole_n_tile(state: CuteTcgen05Config) -> int | None:
+    """The N tile of a 128-row CTA pair that covers each matrix's N whole in
+    a batched 16-bit plain GEMM (TMA operands into an exact-shape
+    destination): N's next power of two (64 or 128), where N is at most 128
+    columns and the batch gives every SM pair at least one matrix row of pair
+    tiles; None where the GEMM is not such a batch.
+
+    The paired-pipeline search (``surface.paired_pipeline_search_enabled``)
+    projects its sampled 128-row pairs onto this width and seeds it alone:
+    an N split into two tiles re-reads the matrix's A once per tile and pays
+    a tile's fixed costs twice, which the final selection's per-call timing
+    (an L2 flush before each launch) does not see -- the splits read the same
+    per call -- while back to back in a CUDA graph the whole width runs
+    ahead. GB300, CUDA graphs over cold inputs, of cuBLAS (one 2-CTA pair a
+    matrix), the deepest AB ring beside four C stages, batch-major:
+
+        b K-major          whole N            N in two tiles
+        512 x [128, 128] @ [128, 128]
+                           [1, 128, 128, 128] 0.989  [1, 128, 64, 128] 0.966
+                           [1, 128, 128, 64]  0.993  [1, 128, 64, 64]  0.962
+        1024 x [128, 128] @ [128, 64]
+                           [1, 128, 128, 64]  1.107  [1, 128, 64, 64]  1.014
+        512 x [128, 80] @ [80, 128]
+                           [1, 128, 128, 64]  1.036  [1, 128, 64, 64]  0.961
+        512 x [128, 128] @ [128, 80] (``search_plan.batched_pair128_matrix``;
+        AB rings of 5 and 8)
+                           [1, 128, 128, 128] 1.037  [1, 128, 64, 128] 1.015
+
+    The 512 x 128^3 full-effort search picked the split [1, 128, 64, 128]
+    (0.975); its finalists read within 1% of each other per call. The pair's
+    k-block is ``batched_pair128_block_k``'s: 64-deep ones over K <= 128
+    (they beat K whole at four C stages, ``batched_pair128_c_stages``), the
+    sampled one over a longer K. The shapes measured are one pair tile a
+    matrix over K <= 128; taller matrices and longer K loops take the whole
+    width too (a split re-reads each row of A once per N tile there as well),
+    beside their sampled C rings. A batch too small to give every SM pair a
+    matrix (16 x [128, 128]) keeps its splits, which add CTAs; a wider N (to
+    256) is unmeasured and keeps its search, as do an operand TMA cannot load
+    (the pair's scalar producers, whose persistent loop refuses a launch of
+    more than one tile), a destination larger than the matrix and a head
+    merge's hierarchical store (``matmul_radix_store``), which the 128-row
+    pairs do not render."""
+    extents = state.matmul_compile_time_static_extents
+    pipeline_facts = state.pipeline_smem_facts
+    fragments = facts._matmul_block_fragments(state)
+    if (
+        not state.matmul_has_leading_passthrough
+        or state.aux_kernel_detected
+        or not state.matmul_operands_tma_provable
+        or not state.matmul_output_matches_extents
+        or state.matmul_radix_store
+        or pipeline_facts is None
+        or pipeline_facts.input_dtype_bytes != 2
+        or extents is None
+        or fragments is None
+        or any(type(value) is not int or value <= 0 for value in extents)
+        or state.device_sm_count <= 0
+    ):
+        return None
+    m, n, _k = cast("tuple[int, int, int]", extents)
+    pair_m = TCGEN05_TWO_CTA_EDGE_PAIR128_BLOCK
+    widths = TCGEN05_TWO_CTA_PAIR128_ONE_WAVE_BLOCK_NS
+    if (
+        n > max(widths)
+        or state.matmul_leading_work_multiplier * -(-m // pair_m)
+        < state.device_sm_count // 2
+    ):
+        return None
+    block_n = max(min(widths), carrier_n(n))
+    bm_fragment, bn_fragment, _bk_fragment = fragments
+    if not (
+        bm_fragment.low <= pair_m <= bm_fragment.high
+        and bn_fragment.low <= block_n <= bn_fragment.high
+    ):
+        return None
+    return block_n
+
+
+def batched_pair128_one_tile_matrices(state: CuteTcgen05Config) -> bool:
+    """Whether every matrix of a batched 16-bit plain GEMM is one 128-row
+    CTA pair tile -- at most 128 rows, its N on one pair tile
+    (``batched_pair128_whole_n_tile``) -- over a K loop of two or more
+    64-deep k-blocks, in a grid of fewer than six waves of one-CTA tiles
+    (one a matrix): the search then runs only the pairs
+    (``_project_one_cta_sample_onto_batched_pair128``), on the family's C
+    ring and k-blocks (``batched_pair128_c_stages``,
+    ``batched_pair128_block_k``).
+
+    The final selection's per-call timing reads these kernels within 1-2% of
+    each other while CUDA graphs over cold inputs separate them by up to
+    20%, so the search picked between the pair and one-CTA tiles by noise.
+    GB300, CUDA graphs over cold inputs, hand configs timed in one process:
+
+        512 x [128, 128] @ [128, 64] (transposed 512 x 64x128x128):
+          pair ab9 6.93-6.94 us     one-CTA persistent 128x64 +3.5-3.8%
+          one-CTA flat 128x64 +19% (a full-effort pick: 8.24 us)
+        192 x [128, 128] @ [128, 64] (transposed 192 x 64x128x128):
+          one-CTA persistent +3.7-4.2%, flat +9.5% behind the pair
+        512 x [128, 128] @ [128, 128] (b K-major), of cuBLAS: one-CTA
+          persistent 0.954-0.993, flat 0.630, pair 0.997
+        512 x [80, 128] @ [128, 128] (as written, M edge), of cuBLAS: the
+          flat one-CTA tiles 0.740, the pair 0.989-0.995
+
+    A K of one k-block (the batched one-K-tile family of ``search_plan``'s
+    ``cluster_m2_whole_k``) keeps one-CTA tiles, and so do grids of six waves
+    or more: full-effort picks there include one-CTA and flat tiles (1024 x
+    64x128x128 transposed, 3072 x 128x64x128)."""
+    whole_n = batched_pair128_whole_n_tile(state)
+    extents = state.matmul_compile_time_static_extents
+    if (
+        whole_n is None
+        or extents is None
+        or not surface.paired_pipeline_search_enabled(state)
+    ):
+        return False
+    # (``batched_pair128_whole_n_tile`` proved the extents static ints)
+    m, _n, k = cast("tuple[int, int, int]", extents)
+    if not (
+        m <= TCGEN05_TWO_CTA_EDGE_PAIR128_BLOCK
+        and k > TCGEN05_TWO_CTA_EDGE_K_TAIL_DEEP_BLOCK_K
+        and state.matmul_leading_work_multiplier
+        < TCGEN05_BATCHED_ONE_TILE_PAIR_MAX_WAVES * state.device_sm_count
+    ):
+        return False
+    # Only where the search samples the pair at all: a kernel whose explicit
+    # ``hl.pdl_wait()`` owns its launch searches one CTA only
+    # (``surface.optional_fragments``), and its pair would fail to render
+    # (``InvalidConfig: explicit PDL markers conflict with this schedule's
+    # native release protocol``), its default config with it.
+    cluster_m = surface.optional_fragments(state, for_search=True)["tcgen05_cluster_m"]
+    return isinstance(cluster_m, EnumFragment) and 2 in cluster_m.choices
+
+
+def _project_one_cta_sample_onto_batched_pair128(
+    state: CuteTcgen05Config, config: dict[str, object]
+) -> None:
+    """Project a one-CTA sample of one-tile batched matrices
+    (``batched_pair128_one_tile_matrices``), flat or persistent, onto the
+    128-row pair, whose search repair then takes it
+    (``_fix_cluster_m2_search_config``): on the family's k-blocks
+    (``batched_pair128_block_k``) and an AB ring of four tiles' k-blocks.
+
+    The one-CTA sample's ring is no measure of the pair's: the default
+    config of bf16 512 x [128, 128] @ [128, 64] (b row-major), a flat
+    one-CTA tile on two AB stages, ran 7.96 us; projected onto the pair with
+    its two stages, 10.06 us; the pair on eight (four tiles of two 64-deep
+    k-blocks) runs 6.84 (GB300, CUDA graphs over cold inputs). Four tiles'
+    k-blocks are the family's measured optimum: 512 x [80, 128] @ [128, 128]
+    ran [1, 128, 128, 64] ab6 / 7 / 8 / 9 / 12 at 0.980 / 0.986 / 0.991 /
+    0.978 / 0.962 of cuBLAS. The AB ring is refitted beside the C ring
+    (``_validate_direct_entry_ab_stage_envelope``)."""
+    config[TCGEN05_CTA_GROUP_CONFIG_KEY] = "two"
+    view = facts._matmul_config_view(state, config)
+    extents = state.matmul_compile_time_static_extents
+    if view is None or extents is None:
+        return
+    block_sizes, _m_index, _n_index, k_index = view
+    sampled_k = block_sizes[k_index]
+    # (``_fix_cluster_m2_search_config``'s clamp of the pair's k-block)
+    if sampled_k not in (64, 128, 256):
+        sampled_k = TCGEN05_WHOLE_K_TILE_MIN
+    block_k = batched_pair128_block_k(state, cast("int", sampled_k))
+    block_sizes[k_index] = block_k
+    k = cast("int", extents[2])
+    config["tcgen05_ab_stages"] = 4 * -(-k // block_k)
+
+
 def plain_pair128_admitted(state: CuteTcgen05Config) -> bool:
     """Whether a 16-bit plain GEMM may run 128-row CTA pairs
     (``tcgen05_cta_group="two"`` on ``block_m=128``: each CTA owns 64 rows
@@ -1534,6 +1749,24 @@ def _fix_cluster_m2_search_config(
             block_sizes[n_index] = 128
         if block_sizes[k_index] not in (64, 128, 256):
             block_sizes[k_index] = 64
+        whole_n = batched_pair128_whole_n_tile(state)
+        if whole_n is not None and block_sizes[m_index] == 128:
+            # A batched matrix's N runs on one pair tile, over k-blocks of
+            # ``batched_pair128_block_k`` with the sampled ring's bytes, and
+            # a matrix of one such tile over K <= 128 beside a four-stage C
+            # ring (``batched_pair128_c_stages``); the AB ring is refitted
+            # below (``_validate_direct_entry_ab_stage_envelope``).
+            block_sizes[n_index] = whole_n
+            c_stages = batched_pair128_c_stages(state)
+            if c_stages is not None:
+                config["tcgen05_c_stages"] = c_stages
+            # (the k-block is 64, 128 or 256 from the clamp above)
+            sampled_k = cast("int", block_sizes[k_index])
+            block_k = batched_pair128_block_k(state, sampled_k)
+            ab_stages = config.get("tcgen05_ab_stages")
+            if block_k != sampled_k and type(ab_stages) is int:
+                config["tcgen05_ab_stages"] = ab_stages * sampled_k // block_k
+            block_sizes[k_index] = block_k
         # A sampled 2x2 multicast cluster stays where the projected pair
         # tile pairs whole N tiles (the config layer refuses an odd count;
         # a batched sample is projected by
@@ -6313,7 +6546,9 @@ def _fix_ab_load_warps_search_config(
 ) -> None:
     """Two A/B-load warps share the role-local TMA producer of a persistent
     monolithic GEMM on one MMA subtile per tile
-    (``cute_mma._build_shared_ring_producer``); a sample outside it runs one."""
+    (``cute_mma._build_shared_ring_producer``); a sample outside it runs one,
+    as does a batched one-tile matrix's pair over a short K loop
+    (``_batched_pair128_short_k_loop``)."""
     if config.get(TCGEN05_WARP_SPEC_AB_LOAD_WARPS_KEY, 1) == 1:
         return
     view = facts._matmul_config_view(state, config)
@@ -6342,8 +6577,51 @@ def _fix_ab_load_warps_search_config(
         and type(config.get("tcgen05_ab_stages")) is int
         and cast("int", config.get("tcgen05_ab_stages"))
         >= cast("int", config.get(TCGEN05_WARP_SPEC_AB_LOAD_WARPS_KEY))
+        and not _batched_pair128_short_k_loop(state, config)
     ):
         config[TCGEN05_WARP_SPEC_AB_LOAD_WARPS_KEY] = 1
+
+
+def _batched_pair128_short_k_loop(
+    state: CuteTcgen05Config, config: dict[str, object]
+) -> bool:
+    """Whether ``config`` is a 128-row CTA pair over a batched matrix whose N
+    one pair tile covers (``batched_pair128_whole_n_tile``) with a K loop of
+    at most three k-blocks a tile, which runs one A/B-load warp: the second
+    warp's alternating ring slots have no K loop to share there and cost a
+    branch per k-block, which the final selection's per-call timing does not
+    see (every pair below reads the same per call either way). GB300, CUDA
+    graphs over cold inputs, of cuBLAS, one load warp / two (b K-major, four
+    C stages, batch-major):
+
+        512 x [128, 128] @ [128, 128]  [1, 128, 128, 128] ab 5   0.991 / 0.983
+        512 x [128, 80] @ [80, 128]    [1, 128, 128, 64]  ab 12  1.032 / 1.014
+        512 x [128, 128] @ [128, 80]   [1, 128, 128, 128] ab 5   1.023 / 1.011
+        1024 x [128, 128] @ [128, 64]  [1, 128, 64, 128]  ab 8   1.200 / 1.190
+                                       [1, 128, 64, 64]   ab 16  1.204 / 1.197
+        192 x [128, 128] @ [128, 64]   [1, 128, 64, 64]   ab 16  1.017 / 0.987
+
+    (The shared producer's own measurements: three k-blocks a tile, bf16
+    1500x384x384 on 128x64 pairs, 0.953 -> 0.900; twelve 128-deep ones
+    neutral; 45 64-deep ones 0.83 -> 0.999.)"""
+    view = facts._matmul_config_view(state, config)
+    if (
+        batched_pair128_whole_n_tile(state) is None
+        or view is None
+        or config.get("tcgen05_cluster_m") != 2
+        or config.get(TCGEN05_CTA_GROUP_CONFIG_KEY) != "two"
+    ):
+        return False
+    # (``batched_pair128_whole_n_tile`` proved the extents static ints)
+    k = cast("tuple[int, int, int]", state.matmul_compile_time_static_extents)[2]
+    block_sizes, m_index, _n_index, k_index = view
+    bk = block_sizes[k_index]
+    return (
+        block_sizes[m_index] == TCGEN05_TWO_CTA_EDGE_PAIR128_BLOCK
+        and type(bk) is int
+        and bk > 0
+        and -(-k // bk) <= 3
+    )
 
 
 def one_tile_ab_stage_cap(
@@ -6483,6 +6761,10 @@ def _fix_search_config_body(
         # projection below cannot choose geometry for this complete recipe.
         _validate_cta_group_config(state, config, fix_invalid=True)
         return
+    if config.get(
+        TCGEN05_CTA_GROUP_CONFIG_KEY
+    ) != "two" and batched_pair128_one_tile_matrices(state):
+        _project_one_cta_sample_onto_batched_pair128(state, config)
     if config.get(TCGEN05_CTA_GROUP_CONFIG_KEY) == "two":
         explicit_pair = surface.paired_pipeline_search_enabled(state)
         if not explicit_pair and plain_pair128_admitted(state):

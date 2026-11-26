@@ -539,6 +539,45 @@ TCGEN05_TWO_CTA_SEED_L2_GROUPING = 4
 # seven lost its finalist slot to a 256x256 pair over 16-deep k-blocks that
 # reads 51.6 per call and runs 55.2 in a graph (0.947).
 TCGEN05_BATCHED_ONE_K_TILE_SEED_AB_STAGES = 6
+# AB stages of the batched one-row-tile seed
+# (``seeds._batched_one_row_tile_seed_configs``, a 64x64 one-CTA tile over
+# 64-deep k-blocks: one 16 KB stage per k-block), 192 KB of operands in flight
+# a CTA beside the tile's four-deep C ring.
+TCGEN05_BATCHED_ONE_ROW_TILE_SEED_AB_STAGES = 12
+# N tile ceiling of a batched 16-bit GEMM one 64-row tile tall over a short K
+# loop (``search_plan.tcgen05_one_row_tile_batched_narrow_n``).
+TCGEN05_ONE_ROW_TILE_BATCHED_BLOCK_N = 64
+# Waves of the transposed product's 128-row tiles (one a matrix: a CTA pair or
+# one CTA) a batch holds at least before
+# ``search_plan.tcgen05_transposes_skinny_batched_product`` transposes it
+# (384 x 64x128x128, 5.1 waves of pairs, ran the as-written tiles faster
+# before the transposed search ran only the pairs).
+TCGEN05_TRANSPOSED_BATCH_MIN_WAVES = 6
+# Waves of one-CTA tiles (one a matrix) under which a batch of matrices each
+# one 128-row CTA pair tile over a K loop of two or more 64-deep k-blocks runs
+# only the pairs in the search (``repair.batched_pair128_one_tile_matrices``):
+# the stored picks of that family at up to 512 matrices are all pairs, at
+# 1024-3072 matrices one-CTA and flat tiles win too.
+TCGEN05_BATCHED_ONE_TILE_PAIR_MAX_WAVES = 6
+# The C stages of the 128-row CTA pair over a batch of matrices each one pair
+# tile whose N it covers, over K <= 128 (``repair.batched_pair128_c_stages``),
+# whatever the search samples. Its tile's K loop of a k-block or two cannot
+# hide the epilogue, and a 128-wide tile's CTA stores its 64 x 128 output in
+# four (64, 32) subtiles:
+#     tcgen05_c_buffer = (tcgen05_tma_store_role_tile * cutlass.Int32(tcgen05_subtile_count) + cutlass.Int32(_tcgen05_subtile)) % cutlass.Int32(4)
+# where with two C stages (``% cutlass.Int32(2)``) the third subtile waits
+# until the first subtile's TMA store has left shared memory. GB300, CUDA
+# graphs over cold inputs, of cuBLAS, at the same AB ring, two / four C
+# stages: bf16 512 x [128, 128] @ [128, 128] 0.986-0.992 / 0.999-1.002 (b
+# column-major 0.986-0.988 / 0.999-1.000), 512 x [128, 128] @ [128, 80]
+# 1.034 / 1.048, 512 x [128, 80] @ [80, 128] 1.010-1.015 / 1.028-1.034,
+# 1024 x [128, 128] @ [128, 64] 1.086-1.094 / 1.102-1.108, 192 x [128, 128]
+# @ [128, 64] 1.054 / 1.063, 3072 x [128, 128] @ [128, 64] 0.982-0.991 /
+# 0.984-0.987; a 64-wide tile (two subtiles) 0 to +1%. The final selection's
+# per-call timing (an L2 flush before each launch) reads them alike (512 x
+# 128^3: 14.98-15.01 us either way), so a seed alone would not keep the four.
+# A taller matrix or a longer K loop, unmeasured, keeps the sampled C ring.
+TCGEN05_BATCHED_PAIR128_C_STAGES = 4
 # The M-tile grouping of a long N sweep (at least this many N tiles): a walk
 # that groups fewer M tiles re-reads B once per group (bf16 8192x32000x1024 +
 # bias, 125 N tiles, of the ATen GEMM: 0.84 grouped by 2, 0.94 by 8, 0.99 by

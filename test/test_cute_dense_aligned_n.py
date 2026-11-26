@@ -44,6 +44,9 @@ from helion._compiler.cute.tcgen05.search_plan import (
     tcgen05_transposes_misaligned_batched_output,
 )
 from helion._compiler.cute.tcgen05.search_plan import tcgen05_transposes_n_edge_b_rows
+from helion._compiler.cute.tcgen05.search_plan import (
+    tcgen05_transposes_skinny_batched_product,
+)
 from helion._compiler.cute.tcgen05.search_plan import tcgen05_transposes_skinny_product
 from helion._compiler.cute.tcgen05.search_plan import (
     tcgen05_transposes_wide_tf32_product,
@@ -1915,6 +1918,68 @@ def test_a_skinny_product_runs_transposed() -> None:
             )
             is expected
         )
+
+
+def test_a_skinny_batched_product_runs_transposed() -> None:
+    # tcgen05_transposes_skinny_batched_product (GB300: 152 SMs) runs N on the
+    # MMA's M side in 128-row tiles where each matrix is one 64-row tile one
+    # 128-row tile wide over a short K loop, for an M-major a
+    # (attn.transpose(1, 2)) and an N-major b, over six waves of those tiles:
+    # 128-row CTA pairs at M = 64 over two or more k-blocks (76 a wave),
+    # one-CTA tiles under it or over one k-block (152).
+    def transposes(
+        batch: int, m: int, n: int, k: int, *, a_m_major: bool = True
+    ) -> bool:
+        return tcgen05_transposes_skinny_batched_product(
+            batch,
+            m,
+            n,
+            k,
+            torch.bfloat16,
+            a_strides=(m * k, 1, m) if a_m_major else (m * k, k, 1),
+            b_strides=(k * n, n, 1),
+            num_sms=152,
+        )
+
+    assert transposes(1024, 32, 128, 128)
+    assert transposes(1024, 64, 128, 128)
+    assert transposes(3072, 64, 128, 128)
+    assert transposes(512, 64, 128, 128)
+    # A short grid runs the as-written tiles faster (384 x 64x128x128: 5.1
+    # waves of pairs, measured before the transposed search ran only the
+    # pairs; 512 x 32x128x128: 3.4 waves of one-CTA tiles), N of two
+    # 128-row tiles shares a matrix's a.mT only on a batch-slowest walk, and a
+    # K loop of eight k-blocks runs the as-written 64x64 ring as fast: these
+    # stay as written.
+    assert not transposes(384, 64, 128, 128)
+    assert not transposes(192, 64, 128, 128)
+    assert not transposes(512, 32, 128, 128)
+    # (one k-block: the transposed search keeps one-CTA tiles, which count
+    # one matrix a CTA: 912 matrices)
+    assert not transposes(512, 64, 128, 64)
+    assert transposes(1024, 64, 128, 64)
+    assert not transposes(1024, 64, 256, 256)
+    assert not transposes(1024, 64, 128, 512)
+    # An M off a multiple of 8 leaves a.mT (the transposed product's B) off
+    # TMA's 16-byte rows (M = 50: 100-byte rows; M = 12: 24) or under the
+    # narrowest tcgen05 N tile (M = 4): as written.
+    assert not transposes(1024, 50, 128, 128)
+    assert not transposes(1024, 12, 128, 128)
+    assert not transposes(1024, 4, 128, 128)
+    # A K-major a, a two-tile M, a K tail and an fp32 product stay too.
+    assert not transposes(1024, 64, 128, 128, a_m_major=False)
+    assert not transposes(1024, 128, 128, 128)
+    assert not transposes(1024, 64, 128, 100)
+    assert not tcgen05_transposes_skinny_batched_product(
+        1024,
+        64,
+        128,
+        128,
+        torch.float32,
+        a_strides=(8192, 1, 64),
+        b_strides=(16384, 128, 1),
+        num_sms=152,
+    )
 
 
 def test_misaligned_b_rows_run_transposed() -> None:
