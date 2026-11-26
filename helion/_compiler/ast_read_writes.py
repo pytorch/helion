@@ -5,8 +5,10 @@ import collections
 import typing
 from typing import TYPE_CHECKING
 from typing import TypeVar
+from typing import overload
 
 from .ast_extension import ExtendedAST
+from .ast_scoped_rename import rename as _scoped_rename
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -215,26 +217,21 @@ class ReadWrites(typing.NamedTuple):
         return visitor.rw
 
 
-def ast_rename(node: _A, renames: dict[str, str]) -> _A:
+@overload
+def ast_rename(node: ast.expr, renames: dict[str, str]) -> ast.expr: ...
+
+
+@overload
+def ast_rename(node: _A, renames: dict[str, str]) -> _A: ...
+
+
+def ast_rename(node: ast.AST, renames: dict[str, str]) -> ast.AST:
+    """Coalesce outer compiler names, preserving lambda and comprehension locals.
+
+    Statements and modules are updated in place. Use the return value for a
+    bare lambda: avoiding a collision with a parameter may wrap the callback.
     """
-    Rename variables in an Abstract Syntax Tree (AST) node, in-place.
-
-    This function traverses the given AST node and renames variables
-    based on the provided mapping of old names to new names.
-
-    Args:
-        node: The root AST node to rename variables in.
-        renames: A dictionary mapping old variable names to new variable names.
-
-    Returns:
-        The modified AST node with variables renamed.
-    """
-    # Every ``Name`` is reached the same way a visitor would reach it; the
-    # flat walk only saves the per-node dispatch of ``NodeVisitor``.
-    for child in ast.walk(node):
-        if isinstance(child, ast.Name):
-            child.id = renames.get(child.id, child.id)
-    return node
+    return _scoped_rename(node, renames) if renames else node
 
 
 class _PreserveRequiredSuites(ast.NodeTransformer):
