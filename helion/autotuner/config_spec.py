@@ -1504,6 +1504,10 @@ class ConfigSpec:
         # Whether the kernel runs several phases in one persistent launch
         # (``hl.barrier()`` or an implicit cross-root dependency).
         self.multi_phase: bool = False
+        # Only offer choices representable by the binding's AOT bundle format.
+        self.unversioned_aot_bundle: bool = False
+        # A private initialization may replace only a local cooperative join.
+        self.cute_local_grid_init_available: bool = False
         # Set only for a single native paired-attention root. The selected
         # emitter also proves complete load/store effects before adding its ABI.
         self.cute_pdl_capture_overlap_available: bool = False

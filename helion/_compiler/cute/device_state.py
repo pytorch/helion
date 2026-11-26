@@ -772,6 +772,7 @@ class CuteDeviceFunctionState:
     """
 
     def __init__(self) -> None:
+        self.private_grid_init_arg: str | None = None
         self.tcgen05 = CuteTcgen05State()
         self.flash = CuteFlashState()
         self.lanes = CuteLaneState()

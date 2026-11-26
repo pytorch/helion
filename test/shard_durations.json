@@ -92,6 +92,7 @@
  "test/test_cute_configured_strides.py": 2.7,
  "test/test_cute_consumer_packet_prefetch.py": 5.1,
  "test/test_cute_contiguous_copy_analysis.py": 12.6,
+ "test/test_cute_cooperative_grid_init.py": 3.4,
  "test/test_cute_deepgemm_selected.py": 33.4,
  "test/test_cute_defer_tile_reduce_cuda.py": 19.4,
  "test/test_cute_delinearized_packets.py": 2.1,

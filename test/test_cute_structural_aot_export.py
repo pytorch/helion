@@ -19,11 +19,16 @@ from torch._inductor.codecache import PyCodeCache
 from torch.utils._pytree import tree_leaves
 
 import helion
+from helion._compiler.cute import cooperative_grid_init
+from helion._compiler.cute import cooperative_grid_ptx
+from helion._compiler.cute.autotune.config_keys import GRID_INIT_KEY
+from helion._testing.cute_ordered_mma import duplicate_mma_loads
 from helion._testing.cute_structural import _case
 from helion._testing.cute_structural import _cpu_only  # noqa: F401
 from helion._testing.cute_structural import _function
 from helion._testing.cute_structural import _module
 from helion.autotuner.aot_cache import AOTAutotuneCache
+from helion.autotuner.aot_cache import TunedConfig
 from helion.autotuner.aot_compile import generate_standalone_file
 from helion.autotuner.aot_structural_export import _export_call_key
 from helion.autotuner.aot_structural_export import _export_classifiers
@@ -32,6 +37,9 @@ from helion.autotuner.aot_structural_export import export_runtime_guards
 from helion.autotuner.aot_structural_policy import attach_model_policy
 from helion.autotuner.aot_structural_policy import policy_path
 from helion.autotuner.base_search import BaseSearch
+from helion.autotuner.finite_search import FiniteSearch
+from helion.autotuner.local_cache import LocalAutotuneCache
+from helion.autotuner.surrogate_pattern_search import LFBOTreeSearch
 import helion.language as hl
 from helion.runtime.cute.structural_config import StructuralPolicyError
 from helion.runtime.cute.structural_policy import CUTE_STRUCTURAL_SETTINGS
@@ -325,6 +333,264 @@ def test_resized_specialized_input_cannot_publish_an_exact_variant(
     with pytest.raises(ValueError, match="No standalone variant"):
         getattr(_module(path), kernel.name)(*args, _launcher=hold)
     hold.assert_not_called()
+
+
+def _two_grid_phases(x: torch.Tensor) -> torch.Tensor:
+    tmp = torch.empty_like(x)
+    out = torch.empty_like(x)
+    for tile in hl.tile(x.numel()):
+        tmp[tile] = x[tile] + 1
+    hl.barrier()
+    for tile in hl.tile(x.numel()):
+        out[tile] = tmp[tile] * 2
+    return out
+
+
+def test_unversioned_aot_search_never_collects_an_unexportable_grid_winner(
+    tmp_path: Path,
+) -> None:
+    function = _relocate(_two_grid_phases, tmp_path)
+    ordinary = helion.kernel(function, backend="cute", static_shapes=True)
+    unversioned = helion.aot_kernel(function, backend="cute", static_shapes=True)
+    local_override = helion.kernel(
+        function,
+        backend="cute",
+        static_shapes=True,
+        autotune_cache="AOTAutotuneCache",
+        autotuner_fn=LocalAutotuneCache[LFBOTreeSearch],
+    )
+    versioned = helion.aot_kernel(
+        function,
+        backend="cute",
+        static_shapes=True,
+        cute_structural_policy=CuteStructuralPolicy(),
+    )
+    args = (torch.empty(513),)
+    with patch.object(
+        cooperative_grid_init, "grid_toolkit_installed", return_value=True
+    ):
+        for kernel, admits in (
+            (ordinary, True),
+            (local_override, True),
+            (unversioned, False),
+            (versioned, True),
+        ):
+            bound = kernel._bind_isolated(args)
+            spec = bound.config_spec
+            generation = spec.create_config_generation()
+            assert (GRID_INIT_KEY in generation._key_to_flat_indices) is admits
+            nominees = [
+                cfg
+                for _, cfg in generation.seed_flat_config_pairs()
+                if cfg.get(GRID_INIT_KEY)
+            ]
+            assert bool(nominees) is admits
+            if not admits:
+                saved = helion.Config.from_dict(
+                    spec.default_config().config
+                    | {"pid_type": "persistent_blocked", GRID_INIT_KEY: True}
+                )
+                assert not spec.backend.can_reuse_autotune_result(spec, saved)
+                with pytest.raises(helion.exc.InvalidConfig, match="unversioned AOT"):
+                    spec.backend.validate_aot_bundle_config(saved)
+                assert not spec.backend.aot_fallback_config(spec, saved).get(
+                    GRID_INIT_KEY
+                )
+                model = tmp_path / "unversioned.py"
+                model.write_text(
+                    f"CONFIGS = [{{}}, {{{GRID_INIT_KEY!r}: True}}]\n"
+                    f"def autotune_{kernel.name}(*args):\n    return CONFIGS[0]\n"
+                )
+                cache = AOTAutotuneCache(BaseSearch(bound, args))
+                cache.mode = "compile"
+                with (
+                    patch.object(cache, "_find_heuristic_file", return_value=model),
+                    patch.object(bound, "to_triton_code") as render,
+                ):
+                    with pytest.raises(
+                        helion.exc.InvalidConfig, match="unversioned AOT"
+                    ):
+                        cache._maybe_run_compile()
+                    with (
+                        patch.object(
+                            cache, "_get_heuristic_config", return_value=saved
+                        ),
+                        patch.object(cache, "_maybe_run_compile") as emit,
+                    ):
+                        with pytest.raises(
+                            helion.exc.InvalidConfig, match="unversioned AOT"
+                        ):
+                            cache.get()
+                        emit.assert_not_called()
+                    render.assert_not_called()
+                assert not list(tmp_path.glob("*standalone.py"))
+
+
+def test_actual_aot_owner_filters_unversioned_factory_and_direct_search(
+    tmp_path: Path,
+) -> None:
+    function = _relocate(_two_grid_phases, tmp_path)
+    indexed = AOTAutotuneCache[LFBOTreeSearch]
+    kernel = helion.kernel(
+        function, backend="cute", static_shapes=True, autotuner_fn=indexed
+    )
+    args = (torch.empty(513),)
+    with patch.object(
+        cooperative_grid_init, "grid_toolkit_installed", return_value=True
+    ):
+        bound = kernel._bind_isolated(args)
+        normal = LFBOTreeSearch(bound, args)
+        assert not bound.config_spec.unversioned_aot_bundle
+        control = helion.Config(pid_type="persistent_blocked")
+        grid = helion.Config.from_dict(control.config | {GRID_INIT_KEY: True})
+        assert normal._apply_config_filter([control, grid], record_trace=False)[1] == [
+            0,
+            1,
+        ]
+        for cache in (
+            indexed(bound, args),
+            AOTAutotuneCache(LFBOTreeSearch(bound, args)),
+            AOTAutotuneCache(FiniteSearch(bound, args, [control, grid])),
+        ):
+            assert isinstance(cache, AOTAutotuneCache)
+            searches = [cache.autotuner]
+            if cache._autotuner_factory is not None:
+                searches.append(cache._autotuner_factory())
+            for search in searches:
+                assert search._apply_config_filter([control, grid], record_trace=False)[
+                    1
+                ] == [0]
+            assert not cache._can_reuse(grid)
+            with pytest.raises(helion.exc.InvalidConfig, match="unversioned AOT"):
+                cache.put(grid)
+        cache._tuned_configs[kernel.name] = [
+            TunedConfig(c, cache.shape_key) for c in (control, grid)
+        ]
+        cache._measure_fn = lambda: [args]
+        with (
+            patch.object(kernel, "bind", return_value=bound),
+            patch.object(
+                bound, "compile_config", return_value=lambda *args: None
+            ) as compile_config,
+            patch("triton.testing.do_bench", return_value=1.0),
+            patch.object(cache, "_save_measurement") as measured,
+        ):
+            cache._run_measure_fn_workflow()
+        compile_config.assert_called_once_with(control)
+        assert measured.call_args.kwargs["config"] == control
+        assert normal._apply_config_filter([control, grid], record_trace=False)[1] == [
+            0,
+            1,
+        ]
+
+
+def test_evaluating_a_stored_grid_slot_keeps_flat_choices_and_rejects_unknown_fields(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("HELION_AOT_MODE", "evaluate")
+    kernel = helion.aot_kernel(
+        _relocate(duplicate_mma_loads.fn, tmp_path),
+        backend="cute",
+        static_shapes=True,
+        cute_structural_policy=CuteStructuralPolicy(),
+    )
+    policy = kernel.cute_structural_policy
+    assert policy is not None
+    args = (
+        torch.empty(128, 64, dtype=torch.bfloat16),
+        torch.empty(64, 64, dtype=torch.bfloat16),
+    )
+    bound = kernel._bind_isolated(args)
+    raw = helion.Config(
+        block_sizes=[128, 64, 64, 64],
+        cute_mma_dag="warp",
+        pid_type="persistent_blocked",
+    )
+    software = bound.config_spec.normalized_config(raw)
+    assert software.pid_type == "flat"
+    learned = helion.Config.from_dict(raw.config | {GRID_INIT_KEY: True})
+    model = tmp_path / "evaluate.py"
+    cache = AOTAutotuneCache(BaseSearch(bound, args))
+    with (
+        patch.object(cache, "_find_heuristic_file", return_value=model),
+        patch.object(
+            cooperative_grid_init, "grid_toolkit_installed", return_value=False
+        ),
+    ):
+        model.write_text(_model(kernel.name, [learned], policy, 1000))
+        assert cache.get() == software
+        bad = helion.Config.from_dict(learned.config | {"unrecognized_control": 1})
+        model.write_text(_model(kernel.name, [bad], policy, 1000))
+        with pytest.raises(helion.exc.InvalidConfig):
+            cache.get()
+        number = helion.Config.from_dict(learned.config | {GRID_INIT_KEY: 1})
+        model.write_text(_model(kernel.name, [number], policy, 1000))
+        with pytest.raises(helion.exc.InvalidConfig, match="must be a boolean"):
+            cache.get()
+        cache.mode = "compile"
+        with pytest.raises(helion.exc.InvalidConfig, match="must be a boolean"):
+            cache.get()
+
+
+@pytest.mark.parametrize("static", [False, True])
+def test_grid_winner_exports_each_original_slot_and_binding(
+    static: bool, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("HELION_AOT_MODE", "compile")
+    kernel = helion.aot_kernel(
+        _relocate(_two_grid_phases, tmp_path),
+        backend="cute",
+        static_shapes=static,
+        cute_structural_policy=CuteStructuralPolicy(),
+    )
+    policy = kernel.cute_structural_policy
+    assert policy is not None
+    configs = [
+        helion.Config(block_sizes=[width, width], pid_type="persistent_blocked")
+        for width in (16, 32)
+    ]
+    grid_winner = helion.Config.from_dict(configs[1].config | {GRID_INIT_KEY: True})
+    model = tmp_path / "grid_heuristic.py"
+    model.write_text(_model(kernel.name, [configs[0], grid_winner], policy, 64))
+    path = policy_path(tmp_path / f"original_{kernel.name}_standalone.py", policy)
+    expected = []
+    with patch.object(
+        cooperative_grid_ptx,
+        "grid_sync_asm",
+        side_effect=AssertionError("export cannot require NVRTC"),
+    ):
+        for slot, length in enumerate((64, 128)):
+            args = (torch.empty(length),)
+            bound = kernel._bind_isolated(args)
+            cache = AOTAutotuneCache(BaseSearch(bound, args))
+            expected.append(bound.to_triton_code(configs[slot]))
+            with patch.object(cache, "_find_heuristic_file", return_value=model):
+                selected = cache.get()
+            assert (
+                selected is not None
+                and selected.block_sizes == configs[slot].block_sizes
+            )
+            assert not selected.get(GRID_INIT_KEY)
+            exported = _module(path)
+            assert expected[-1] in vars(exported)["_helion_aot_sources"]
+            _, launches = _call(getattr(exported, kernel.name), args)
+            assert len(launches) == 1
+            assert "_cute_grid_barrier" in launches[0]["source"]
+            direct = getattr(PyCodeCache.load(expected[-1]), kernel.name)
+            _, direct_launches = _call(direct, args)
+            assert launches[0]["constants"] == direct_launches[0]["constants"]
+        for prog in vars(exported)["_helion_aot_sources"]:
+            assert "_cute_toolkit_grid_sync" not in prog
+        assert set(expected) <= set(vars(exported)["_helion_aot_sources"])
+        previous = path.read_bytes()
+        bad = helion.Config.from_dict(grid_winner.config | {"unrecognized_control": 1})
+        model.write_text(_model(kernel.name, [configs[0], bad], policy, 64))
+        with (
+            patch.object(cache, "_find_heuristic_file", return_value=model),
+            pytest.raises(helion.exc.InvalidConfig),
+        ):
+            cache.get()
+        assert path.read_bytes() == previous
 
 
 def test_dynamic_specialized_export_accumulates_exact_metadata_groups(

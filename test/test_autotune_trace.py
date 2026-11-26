@@ -326,15 +326,15 @@ def test_trace_records_backend_and_user_filtered_configs(
     )
     log = AutotuningLogger(settings)
     backend_filter = Mock(side_effect=lambda config: config != configs[1])
-    search = SimpleNamespace(
-        settings=settings,
-        log=log,
-        _autotune_metrics=AutotuneMetrics(),
-        performance_unit="ms",
-        _backend_config_is_viable=backend_filter,
-    )
-    with log.autotune_tracing("LFBOTreeSearch"):
-        passing, indices = BaseSearch._apply_config_filter(search, configs)
+    search = object.__new__(BaseSearch)
+    search.settings = settings
+    search.log = log
+    search._autotune_metrics = AutotuneMetrics()
+    with (
+        patch.object(search, "_backend_config_is_viable", backend_filter),
+        log.autotune_tracing("LFBOTreeSearch"),
+    ):
+        passing, indices = search._apply_config_filter(configs)
     assert indices == ([2] if user_filter else [0, 2])
     assert passing == [configs[index] for index in indices]
     backend_inputs = configs[1:] if user_filter else configs

@@ -296,6 +296,7 @@ def register_search_surface(device_ir: DeviceIR, config_spec: ConfigSpec) -> Non
     # two of its memory accesses can need a thread barrier, which that
     # layout has no place for.
     config_spec.cute_register_lane_rows = lane_rows_stay_in_registers(env, device_ir)
+    config_spec.cute_local_grid_init_available = env.process_group_name is None
     config_spec.cute_signed_bitfield_bf16_available = (
         config_spec.target_device_capability == (10, 0)
         and any(has_signed_byte_field(info.graph) for info in device_ir.graphs)

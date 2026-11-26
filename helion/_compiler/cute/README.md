@@ -352,6 +352,25 @@ rebenchmark's finalist count (32) and isolated timing.  Rule:
 an emitter reads `config` only through its family's knob table; a
 general-purpose emitter does not read it at all.
 
+For a local cooperative barrier schedule, `cute_in_kernel_grid_init` gives the
+tuner a choice between a separate zero-fill for the per-invocation counter
+and initializing it inside the first grid rendezvous. The latter uses the
+installed CUDA toolkit's `cooperative_groups::this_grid().sync()`. It is
+offered when the local NVRTC supports the target and its matching headers are
+installed. Only a selected configuration compiles the operation. A rejected or
+non-self-contained leaf disables this option for that architecture in the
+current compiler process. Existing searches retain their stable coordinate
+but skip the unavailable candidate; explicitly requesting it fails. A direct
+single-binding standalone export (bind with `static_shapes=True`, then call
+`bound.to_code` with `allow_helion_deps=False`)
+uses the same valid schedule with its ordinary software counter, so the file
+does not depend on local NVRTC. Versioned CuTe AOT bundles retain the original
+model and slot order, and export each slot with its portable counter. The legacy
+unversioned AOT search does not offer this option, and its bundle exporter
+refuses an externally supplied grid slot before writing. Every capture
+owns its own counter; later joins keep the software barrier. The compiler
+checks the host allocation and device uses before accepting that option.
+
 ## 7. The runtime
 
 `helion/runtime/cute/launcher.py` (`default_cute_launcher`) builds the
@@ -382,7 +401,7 @@ of the disk-cache key.  Two sets of module paths are byte-pinned:
 
 * the modules `CuteBackend.library_imports` writes into generated import lines
   (`atomic_helpers`, `aux_copy_layout`, `clc_helpers`, `cluster_helpers`,
-  `copysign`, `element_policy_loads`, `epilogue_helpers`, `exact_division`,
+  `cooperative_grid_op`, `copysign`, `element_policy_loads`, `epilogue_helpers`, `exact_division`,
   `_flash_row_mma_runtime`,
   `flex_score_mod_runtime`, `fold_helpers`, `grid_barrier`,
   `inline_asm_helpers`, `integer_helpers`, `join_cast`, `l2_policy`,

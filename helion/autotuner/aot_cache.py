@@ -77,6 +77,7 @@ from .benchmarking import l2_flush_sweep
 
 if TYPE_CHECKING:
     from collections.abc import Hashable
+    from collections.abc import Mapping
     from collections.abc import Sequence
     from typing import Callable
 
@@ -347,8 +348,9 @@ class AOTAutotuneCache(AutotuneCacheBase):
     Behavior depends on the HELION_AOT_MODE environment variable:
     - collect: Tune each shape individually, record results
     - measure: Measure each shape with all observed configs
-    - evaluate: Use heuristics to select configs, validate performance
-    - disabled: Fall through to underlying autotuner (default)
+    - evaluate (default): Use a stored heuristic or the binding's default config
+    - compile: Export a standalone program for the stored heuristic
+    - disabled: Do not write AOT data; ordinary lookup uses the heuristic or default
 
     When collect_fn/measure_fn are set on the kernel:
     - collect_fn: In collect mode, only these inputs are autotuned
@@ -428,6 +430,18 @@ class AOTAutotuneCache(AutotuneCacheBase):
         autotuner_factory: Callable[[], BaseSearch] | None = None,
     ) -> None:
         super().__init__(autotuner, autotuner_factory=autotuner_factory)
+        if bound_structural_policy(self.kernel) is None:
+            # The actual cache can come from Cache[Search] or direct
+            # construction, independent of the kernel's default cache setting.
+            def require_exportable(search: BaseSearch) -> BaseSearch:
+                search._requires_unversioned_aot_export = True
+                return search
+
+            require_exportable(autotuner)
+            if autotuner_factory is not None:
+                self._autotuner_factory = lambda: require_exportable(
+                    autotuner_factory()
+                )
         if not isinstance(self.args, _MultiShapeAutotuneArgs):
             self.args = self.kernel.kernel.normalize_args(*self.args)
         self.mode = get_aot_mode()
@@ -610,7 +624,9 @@ class AOTAutotuneCache(AutotuneCacheBase):
         result: list[Config] = []
         policy = bound_structural_policy(self.kernel)
         for tc in self._tuned_configs[kernel_name]:
-            if tc.cute_structural_policy != policy:
+            if tc.cute_structural_policy != policy or (
+                policy is None and not self._legacy_slot_is_exportable(tc.config)
+            ):
                 continue
             config_hash = hashlib.sha256(
                 config_artifact_json(tc.config, tc.cute_structural_policy).encode()
@@ -686,6 +702,11 @@ class AOTAutotuneCache(AutotuneCacheBase):
         # Use single source of truth from aot_kernel module
         return extract_shape_features(args)
 
+    def _get_usable_config(self) -> Config | None:
+        # In evaluate/compile mode get() selects a heuristic or a default.
+        # A missing compiler capability must never turn that into search.
+        return self.get()
+
     def get(self) -> Config | None:
         """Get a cached config based on current mode."""
         if self.mode == "collect":
@@ -697,6 +718,7 @@ class AOTAutotuneCache(AutotuneCacheBase):
                     tc.shape_key.stable_hash() == self.shape_key.stable_hash()
                     and tc.cute_structural_policy
                     == bound_structural_policy(self.kernel)
+                    and self._can_reuse(tc.config)
                 ):
                     log.info(f"AOT collect: Using existing config for {kernel_name}")
                     return (
@@ -711,14 +733,17 @@ class AOTAutotuneCache(AutotuneCacheBase):
             return None
 
         if self.mode == "compile":
-            # In compile mode: use heuristic + generate standalone Triton code
-            self._maybe_run_compile()
-
-        # For disabled/evaluate/compile modes: try heuristic, fall back to default config
-        # (never trigger autotuning for aot_kernel)
-        config = self._get_heuristic_config(self.args)
+            snapshot = self._compile_snapshot()
+            config = None
+            if snapshot is not None:
+                config = self._get_heuristic_config(self.args, snapshot=snapshot)
+                if config is not None:
+                    config = self._bundle_config(config)
+                self._maybe_run_compile(snapshot=snapshot)
+        else:
+            config = self._get_heuristic_config(self.args)
         if config is not None:
-            return config
+            return self._usable_or_default(config)
 
         # No heuristic available - use default config with warning (once per kernel)
         kernel_name = self.kernel.kernel.name
@@ -734,6 +759,40 @@ class AOTAutotuneCache(AutotuneCacheBase):
                     file=sys.stderr,
                 )
         return self.autotuner.config_spec.default_config()
+
+    def _usable_or_default(self, config: Config) -> Config:
+        if self._can_reuse(config):
+            return config
+        log.warning("AOT heuristic unavailable on this host; using a compatible config")
+        spec = self.autotuner.config_spec
+        return spec.backend.aot_fallback_config(spec, config)
+
+    def _legacy_slot_is_exportable(self, config: Config) -> bool:
+        try:
+            self._validate_bundle(config)
+        except exc.InvalidConfig:
+            return False
+        return True
+
+    def _can_reuse(self, config: Config) -> bool:
+        return (
+            bound_structural_policy(self.kernel) is not None
+            or self._legacy_slot_is_exportable(config)
+        ) and super()._can_reuse(config)
+
+    def _validate_bundle(self, config: Mapping[str, object]) -> None:
+        self.autotuner.config_spec.backend.validate_aot_bundle_config(config)
+
+    def _bundle_config(self, config: Config) -> Config:
+        """Versioned bundles retain the original selector and a complete program per slot."""
+        if bound_structural_policy(self.kernel) is None:
+            self._validate_bundle(config)
+            return config
+        spec = self.autotuner.config_spec
+        # A bundle identifies each slot by its original model config. Never
+        # publish a different default program for an invalid slot. If the
+        # normalized stored carrier has no join here, it needs no grid reset.
+        return spec.backend.standalone_config(spec, config, stored=True)
 
     def _compute_tensor_hashes(
         self, tensors: Sequence[object] | None = None
@@ -752,6 +811,8 @@ class AOTAutotuneCache(AutotuneCacheBase):
             return
 
         if self.mode == "collect":
+            if bound_structural_policy(self.kernel) is None:
+                self._validate_bundle(config)
             kernel_name = self.kernel.kernel.name
             kernel_source_file = self.kernel.kernel.__code__.co_filename
             shape_features = self._extract_shape_features()
@@ -1024,7 +1085,17 @@ class AOTAutotuneCache(AutotuneCacheBase):
             cls._heuristic_modules[path] = module
         return cls._heuristic_modules[key]
 
-    def _maybe_run_compile(self) -> None:
+    def _compile_snapshot(self) -> tuple[Path, bytes] | None:
+        path = self._find_heuristic_file()
+        if path is None:
+            log.warning(
+                "No heuristic for '%s', skipping standalone compile",
+                self.kernel.kernel.name,
+            )
+            return None
+        return path, path.read_bytes()
+
+    def _maybe_run_compile(self, *, snapshot: tuple[Path, bytes] | None = None) -> None:
         """
         In compile mode, generate code for all heuristic-selected configs and
         write a standalone ``.py`` file. Backends with a dependency-free
@@ -1036,17 +1107,14 @@ class AOTAutotuneCache(AutotuneCacheBase):
         dispatch by a normalized call signature.
         """
         kernel_name = self.kernel.kernel.name
-        heuristic_file = self._find_heuristic_file()
-        if heuristic_file is None:
-            log.warning(
-                "No heuristic for '%s', skipping standalone compile", kernel_name
-            )
-            return
-
+        # Use one model snapshot for the return value, children, owner and
+        # selector even if the file is replaced during compilation.
+        if snapshot is None:
+            snapshot = self._compile_snapshot()
+            if snapshot is None:
+                return
+        heuristic_file, model_source = snapshot
         policy = bound_structural_policy(self.kernel)
-        # Read once: the chosen children, the ownership key, and the emitted
-        # selector must all describe the same model, even if it is replaced.
-        model_source = heuristic_file.read_bytes()
         module = self._load_heuristic_module(heuristic_file, policy, model_source)
         if module is None:
             return
@@ -1064,6 +1132,12 @@ class AOTAutotuneCache(AutotuneCacheBase):
             configs_list = self._parse_configs_from_autotune(
                 module, kernel_name, model_source
             )
+
+        # A saved slot must be exportable before the legacy bundle cache
+        # can skip a binding or a failed compilation can become a stub.
+        if policy is None and configs_list is not None:
+            for config_dict in configs_list:
+                self._validate_bundle(config_dict)
 
         if self.kernel.settings.static_shapes:
             # Static dispatch already keys exact shape and stride. Enable the two
@@ -1095,7 +1169,7 @@ class AOTAutotuneCache(AutotuneCacheBase):
         configs = [
             Config(**config_dict)  # pyrefly: ignore [bad-argument-type]
             if policy is None
-            else Config.from_dict(config_dict)
+            else self._bundle_config(Config.from_dict(config_dict))
             for config_dict in configs_list
         ]
         if policy is None:
@@ -1491,6 +1565,7 @@ class AOTAutotuneCache(AutotuneCacheBase):
             )
             return
 
+        config = self._bundle_config(config)
         from .aot_compile import _standalone_call_key
         from .aot_compile import generate_standalone_file
 

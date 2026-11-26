@@ -306,6 +306,18 @@ class AutotuneCacheBase(BaseAutotuner, abc.ABC, metaclass=AutotuneCacheMeta):
     def get(self) -> Config | None:
         raise NotImplementedError
 
+    def _can_reuse(self, config: Config) -> bool:
+        """A saved search result may depend on host compiler capabilities."""
+        spec = self.autotuner.config_spec
+        return spec.backend.can_reuse_autotune_result(spec, config)
+
+    def _get_usable_config(self) -> Config | None:
+        config = self.get()
+        if config is not None and not self._can_reuse(config):
+            log.info("Ignoring a cached schedule that is unusable on this host")
+            return None
+        return config
+
     @abc.abstractmethod
     def put(self, config: Config) -> None:
         raise NotImplementedError
@@ -359,7 +371,7 @@ class AutotuneCacheBase(BaseAutotuner, abc.ABC, metaclass=AutotuneCacheMeta):
             raise exc.CacheAssertionError(self.kernel.kernel.name)
 
         if not skip_read:
-            if (config := self.get()) is not None:
+            if (config := self._get_usable_config()) is not None:
                 counters["autotune"]["cache_hit"] += 1
                 log.debug("cache hit: %s", str(config))
                 if self._should_report_cache_hit():
@@ -406,7 +418,7 @@ class AutotuneCacheBase(BaseAutotuner, abc.ABC, metaclass=AutotuneCacheMeta):
                             print(f"      Cached:   {cached_val}", file=sys.stderr)
                     if not has_diff:
                         print(
-                            "    (no differences found, likely a hash collision)",
+                            "    (no key differences; the stored result may be unusable on this host)",
                             file=sys.stderr,
                         )
             else:

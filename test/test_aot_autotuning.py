@@ -976,9 +976,20 @@ def test_aot_cache_canonicalizes_defaults_for_compile_get(
     compiled: list[bool] = []
     selected_args: list[tuple[object, ...]] = []
     config = Config(block_sizes=[16])
-    cache._maybe_run_compile = lambda: compiled.append(True)
+    cache._validate_bundle = Mock()
+    cache._can_reuse = Mock(return_value=True)
+    model = tmp_path / "model.py"
+    model.write_bytes(b"# model")
+    cache._find_heuristic_file = lambda: model
 
-    def get_config(args: tuple[object, ...]) -> Config:
+    def compile_snapshot(*, snapshot: tuple[Path, bytes]) -> None:
+        assert snapshot == (model, b"# model")
+        compiled.append(True)
+
+    cache._maybe_run_compile = compile_snapshot
+
+    def get_config(args: tuple[object, ...], *, snapshot: tuple[Path, bytes]) -> Config:
+        assert snapshot == (model, b"# model")
         selected_args.append(args)
         return config
 
@@ -1040,6 +1051,13 @@ def test_standalone_preserves_cute_launcher_import(tmp_path: Path) -> None:
     )
 
 
+def _standalone_cache() -> AOTAutotuneCache:
+    cache = object.__new__(AOTAutotuneCache)
+    # These legacy fixtures use a mocked code generator with no backend restrictions.
+    cache._validate_bundle = Mock()
+    return cache
+
+
 @pytest.mark.parametrize(
     "descriptor_config",
     [
@@ -1065,7 +1083,7 @@ def test_dynamic_standalone_rejects_tensor_descriptors_before_codegen(
         normalized.append(config)
         return config
 
-    cache = object.__new__(AOTAutotuneCache)
+    cache = _standalone_cache()
     cache.data_dir = tmp_path
     cache.hardware_id = "test-hardware"
     cache.kernel = SimpleNamespace(
@@ -1433,7 +1451,9 @@ def test_standalone_registers_private_selector_by_export_path(tmp_path: Path) ->
 
 
 @onlyBackends(["triton"])
-def test_compile_saved_model_with_training_only_helion_import(tmp_path: Path) -> None:
+def test_compile_saved_model_with_training_only_helion_import(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
     source = tmp_path / "source.py"
     source.write_text(
         "import helion.language as hl\n"
@@ -1449,7 +1469,7 @@ def test_compile_saved_model_with_training_only_helion_import(tmp_path: Path) ->
         "CONFIGS = [{'block_sizes': [16]}, {'block_sizes': [32]}]\n"
         "@dataclass\nclass Bucket:\n    n: int\n"
         "def key_demo(x): return int(Bucket(7).n == x.numel())\n"
-        "def autotune_demo(x):\n    from helion import Config\n    return Config()\n"
+        "def autotune_demo(x):\n    from helion import Config\n    return Config(**CONFIGS[key_demo(x)])\n"
     )
     model.write_text(model_source)
     args = (torch.arange(7),)
@@ -1463,7 +1483,18 @@ def test_compile_saved_model_with_training_only_helion_import(tmp_path: Path) ->
         cache = AOTAutotuneCache(BaseSearch(cpu_bind(kernel, args), args))
         path = tmp_path / "source_demo_standalone.py"
         with patch.object(cache, "_find_heuristic_file", return_value=model):
-            cache._maybe_run_compile()
+            cache.mode = "compile"
+            selected = cache.get()
+            assert selected is not None and selected.block_sizes == [32]
+            with (
+                patch.object(cache, "_find_heuristic_file", return_value=None),
+                patch.object(AOTAutotuneCache, "_no_heuristic_warned", {"demo"}),
+            ):
+                cache.get()
+                assert (
+                    "No heuristic for 'demo', skipping standalone compile"
+                    in caplog.text
+                )
             saved = AOTAutotuneCache._heuristic_modules[model]
             assert sys.modules[saved.Bucket.__module__] is saved
             assert Path(saved.MODEL_FILE) == model
@@ -1588,7 +1619,7 @@ def test_dynamic_standalone_still_accepts_pointer_config(tmp_path: Path) -> None
     class BoundKernelStub(SimpleNamespace):
         """Support weak references like the bound kernel the cache stores."""
 
-    cache = object.__new__(AOTAutotuneCache)
+    cache = _standalone_cache()
     cache.data_dir = tmp_path
     cache.hardware_id = "test-hardware"
     cache.kernel = BoundKernelStub(
@@ -1760,7 +1791,7 @@ def test_static_aot_compile_accumulates_observed_shapes(
     output_path = tmp_path / "source_demo_standalone.py"
     config = Config(block_sizes=[16])
 
-    cache = object.__new__(AOTAutotuneCache)
+    cache = _standalone_cache()
     cache.data_dir = tmp_path
     cache.hardware_id = "test-hardware"
 
@@ -1835,7 +1866,7 @@ def test_static_aot_compile_dispatches_descriptor_alignment(tmp_path: Path) -> N
     unaligned = backing.as_strided((2, 3), (4, 1), storage_offset=1)
     aligned_offset = backing.as_strided((2, 3), (4, 1), storage_offset=4)
 
-    cache = object.__new__(AOTAutotuneCache)
+    cache = _standalone_cache()
     cache.data_dir = tmp_path
     cache.hardware_id = "test-hardware"
     cache._get_heuristic_config = lambda _args: config
@@ -1878,7 +1909,7 @@ def test_static_aot_compile_supports_non_file_kernel_source(tmp_path: Path) -> N
     heuristic_path.write_text("def autotune_demo(*args):\n    return {}\n")
     config = Config(block_sizes=[16])
 
-    cache = object.__new__(AOTAutotuneCache)
+    cache = _standalone_cache()
     cache.data_dir = tmp_path
     cache.hardware_id = "test-hardware"
     cache._get_heuristic_config = lambda _args: config
@@ -1920,7 +1951,7 @@ def test_static_aot_compile_serializes_concurrent_variants(
     codegen_barrier = threading.Barrier(2)
 
     def make_cache(size: int) -> AOTAutotuneCache:
-        cache = object.__new__(AOTAutotuneCache)
+        cache = _standalone_cache()
         cache.data_dir = tmp_path
         cache.hardware_id = "test-hardware"
         cache._get_heuristic_config = lambda _args: config
@@ -2122,8 +2153,12 @@ def test_fresh_aot_binding_preserves_explicit_selection_mode(
         assert isinstance(cache, AOTAutotuneCache)
         assert cache.mode == mode
         selected = bound.config_spec.default_config()
+        model = tmp_path / "model.py"
+        model.write_text(
+            f"def autotune_{bound.kernel.name}(*args): return {dict(selected)!r}\n"
+        )
         with (
-            patch.object(cache, "_get_heuristic_config", return_value=selected),
+            patch.object(cache, "_find_heuristic_file", return_value=model),
             patch.object(cache, "_maybe_run_compile") as compile_entry,
             patch.object(
                 AutotuneCacheBase,
