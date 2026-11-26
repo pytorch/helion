@@ -372,24 +372,40 @@ def test_fragment_mean_clips_a_wide_interval_before_subtracting():
     assert out.tolist() == [[7, 14, 21, 28]]
 
 
-def test_nested_fragment_mean_uses_the_live_tail():
+@pytest.mark.parametrize("checked", [False, True], ids=["ordinary", "checked"])
+def test_nested_fragment_mean_uses_the_live_tail(checked):
     @helion.kernel(backend="cute", static_shapes=True)
-    def scan(x, out):
+    def scan(x, out, checked: hl.constexpr):
         for _ in hl.grid(1):
             for t in hl.tile(3, 16, block_size=4):
                 mean = x[t].mean()
+                if checked:
+                    torch._assert_async(mean > 0.5, "tail mean")
                 out[t] = torch.cumsum(x[t] * 0 + mean, dim=0)
 
     x = torch.ones(16)
     expected = torch.full_like(x, -1)
     with patch.object(scan.settings, "ref_mode", RefMode.EAGER):
-        scan(x, expected)
+        scan(x, expected, checked)
     assert expected.tolist() == [-1] * 3 + [1, 2, 3, 4] * 3 + [1]
     with mock_cuda_unavailable():
-        code = cpu_bind(scan, (x, expected)).to_code(helion.Config(block_sizes=[]))
+        code = cpu_bind(scan, (x, expected, checked)).to_code(
+            helion.Config(block_sizes=[])
+        )
+    seen = []
+
+    def observe_assert(operands, *, asm, **options):
+        assert (
+            "call __assertfail" in asm and len(operands) == 1 and not options["is_pure"]
+        )
+        seen.append(bool(operands[0]))
+
     actual = torch.full_like(x, -1)
-    _simulate_independent_fragment(code, {"x": x}, {"out": actual}, 1)
+    _simulate_independent_fragment(
+        code, {"x": x}, {"out": actual}, 1, inline_asm=observe_assert
+    )
     torch.testing.assert_close(actual, expected)
+    assert seen == ([True] * 4 if checked else [])
 
 
 @pytest.mark.parametrize(

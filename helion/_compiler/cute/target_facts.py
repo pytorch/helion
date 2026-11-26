@@ -25,13 +25,24 @@ consolidated.
 from __future__ import annotations
 
 import dataclasses
+from typing import TYPE_CHECKING
 
 import torch
 
+from ... import exc
 from ..._hardware import HardwareInfo
 from .tcgen05_constants import SM100_SMEM_PER_BLOCK_OPTIN_BYTES
 from .tcgen05_constants import TCGEN05_AB_STAGES_THREE_MIN_DEVICE_SMEM_OPTIN
 from .tcgen05_constants import TCGEN05_AB_STAGES_THREE_RESERVED_SMEM_BYTES
+
+if TYPE_CHECKING:
+    from collections.abc import Iterable
+
+
+def validate_grid_yz(counts: Iterable[int | None]) -> None:
+    """Reject a known physical Y or Z dimension CUDA cannot launch."""
+    if any(count is not None and count > 65_535 for count in counts):
+        raise exc.InvalidConfig("CUDA grid dimensions Y and Z cannot exceed 65535")
 
 
 def per_cta_smem_capacity_bytes(device: torch.device) -> int:

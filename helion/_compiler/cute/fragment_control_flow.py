@@ -42,14 +42,21 @@ from .register_snapshots import SnapshotBinding
 from .register_snapshots import frame_snapshot_recipes
 from .register_snapshots import snapshot_capture_slots
 from .register_snapshots import snapshot_logical_shape
+from .scalar_fragment_assertion import checked_range_domain
 
 
 class FragmentControlFlow(FragmentContext):
     """Loops, resident while loops and conditionals over fragments."""
 
-    def _control_scalar(self, value: object, snapshots: dict[int, str]) -> str:
+    def _control_scalar(
+        self, value: object, snapshots: dict[int, str], *, predicate: bool = False
+    ) -> str:
         """Snapshot a shared-dependent header operand in each lane before the fence."""
-        if not isinstance(value, Fragment) or not self.referenced_buffers((value,)):
+        if not isinstance(value, Fragment):
+            # An implicit integer truth test must evaluate the Python value at
+            # its proved width before deciding whether to execute the branch.
+            return self.value_scalar(value) if predicate else self.scalar(value)
+        if not self.referenced_buffers((value,)):
             return self.scalar(value)
         if (name := snapshots.get(id(value))) is None:
             name = self.df.new_var("fragment_control")
@@ -176,6 +183,11 @@ class FragmentControlFlow(FragmentContext):
         assert isinstance(graph_id, int)
         graph = self.graphs[graph_id]
         assert isinstance(graph, ForLoopGraphInfo)
+        if self.checked_root and any(bid in self.offsets for bid in graph.block_ids):
+            # A captured outer tile symbol would now name the inner range.
+            raise exc.BackendUnsupported(
+                "cute", "device assertion in a loop that reuses an active tile block"
+            )
         if self.local_allocations and any(
             self.df.resolved_block_size(bid) != 1 for bid in graph.block_ids
         ):
@@ -231,6 +243,7 @@ class FragmentControlFlow(FragmentContext):
         body_operands = dict(outer_operands)
         starts: list[str] = []
         axes = []
+        checked_domains: dict[int, range] = {}
         steps: list[str] = []
         index_types: list[str] = []
         guarded_steps: dict[str, int | Literal["dynamic", "counted"]] = {}
@@ -273,6 +286,8 @@ class FragmentControlFlow(FragmentContext):
                 else None
             )
             step = tile_size if explicit is None else explicit
+            if self.checked_root:
+                checked_domains[bid] = checked_range_domain(self, begin, end, step)
             index_type, guarded_step = self._range_plan(begin, end, step)
             if finalizer_needs_int64:
                 index_type = "Int64"
@@ -320,6 +335,8 @@ class FragmentControlFlow(FragmentContext):
             self.bounds[bid] = stop
             offset = self.offsets[bid] = self.df.new_var("fragment_tile")
             body_operands[offset] = proof
+            if bid in checked_domains:
+                self.checked_domains[offset] = checked_domains[bid]
             if guarded_step is not None:
                 guarded_steps[offset] = guarded_step
             if lexical_interval:
@@ -915,6 +932,7 @@ class FragmentControlFlow(FragmentContext):
             else self._control_scalar(
                 values[predicate] if isinstance(predicate, Node) else predicate,
                 control_snapshots,
+                predicate=True,
             )
         )
         if control_snapshots:

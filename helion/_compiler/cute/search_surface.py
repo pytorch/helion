@@ -33,6 +33,7 @@ from ..compile_environment import FixedBlockSizeSource
 from . import target_facts
 from .autotune.flash_surface import enable_cute_flash_gated_search
 from .autotune.flash_surface import enable_cute_flash_search
+from .state import CuteSearchFacts
 from .state import cute_env_state
 from .tcgen05_config import facts
 
@@ -184,6 +185,18 @@ def register_search_surface(device_ir: DeviceIR, config_spec: ConfigSpec) -> Non
     register_search_surface``, after ``register_rollable_reductions``):
     lane vector widths, tile packing, exact division, signed bitfields and
     the flash / gated-flash / tcgen05 GEMM search surfaces."""
+    from .scalar_fragment_assertion import validate_assertion_graphs
+
+    config_spec.backend_facts = CuteSearchFacts(
+        has_scalar_fragment_assertion=any(
+            info.graph.find_nodes(
+                op="call_function", target=torch.ops.aten._assert_async.msg, sort=False
+            )
+            for info in device_ir.graphs
+        )
+    )
+    if config_spec.backend_facts.has_scalar_fragment_assertion:
+        validate_assertion_graphs(device_ir)
     env = CompileEnvironment.current()
     env_state = cute_env_state(env)
     register_lane_vector_width_specs(config_spec)
@@ -356,8 +369,13 @@ def register_search_surface(device_ir: DeviceIR, config_spec: ConfigSpec) -> Non
     from .analysis.attention_match import detect_flash_search_surface
     from .cute_flash_bwd import detect_flash_bwd_search_surface
     from .cute_flash_gated import detect_flash_gated_search_surface
+    from .scalar_fragment_assertion import requires_assertion_owner
 
     detect_flash_bwd_search_surface(device_ir)
+    if requires_assertion_owner(config_spec):
+        # Forward flash, gated attention and tcgen05 would fix the tile
+        # sizes for a native root that cannot issue the fragment assertion.
+        return
     flash_shape = detect_flash_search_surface(device_ir)
     gated_surface = (
         None

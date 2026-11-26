@@ -18,6 +18,7 @@ from .grouped_row_union import physical_schedule
 from .state import cute_codegen_state
 
 if TYPE_CHECKING:
+    from ...autotuner.config_spec import ConfigSpec
     from ...runtime.config import Config
     from ..device_function import DeviceFunction
     from ..emitter_protocols import KernelGenerator
@@ -31,16 +32,20 @@ def has_explicit_pdl() -> bool:
     return CompileEnvironment.current().config_spec.has_explicit_pdl
 
 
-def config_conflicts_with_explicit_pdl(config: Config) -> bool:
-    """Screen seeds and coverage witnesses before unsupported native codegen.
+def config_conflicts_with_required_owner(spec: ConfigSpec, config: Config) -> bool:
+    """Reject native schedules that cannot issue a required PDL or assertion effect.
 
-    Cover the config-selected entries of KERNEL_GENERATORS;
-    the CPU regression checks coverage against that registry. Structural
-    fission/ordered-phase launches remain checked at their planning/codegen
-    boundaries. Clustered tcgen05 seeds are conservatively screened too:
-    the two-CTA family carries an intrinsic release protocol.
+    Config-selected generators are screened here; structural fission and
+    ordered-phase launches are checked during planning or codegen. Only PDL
+    excludes clustered tcgen05 schedules for their intrinsic release protocol.
     """
-    return bool(
+    from .scalar_fragment_assertion import conflicting_fragment_schedule
+    from .scalar_fragment_assertion import requires_assertion_owner
+
+    assertion = requires_assertion_owner(spec)
+    if not spec.has_explicit_pdl and not assertion:
+        return False
+    if (
         config.get("tcgen05_grouped_prefix_adaptive_n", False)
         or config.get("cute_materialized_operand_schedule", "off") != "off"
         or config.get("cute_materialized_schedule", "off") != "off"
@@ -49,7 +54,26 @@ def config_conflicts_with_explicit_pdl(config: Config) -> bool:
         or config.get("cute_reduction_sequence") in {"bounded", "bounded_layout"}
         or config.get("cute_split_k_schedule") == "cluster8_k4"
         or config.get("cute_split_k_workspace", False)
-        or config.get("tcgen05_cluster_m", 1) == 2
+    ):
+        return True
+    if assertion and (
+        conflicting_fragment_schedule(spec, config) is not None
+        or (
+            spec.tcgen05.warp_mma_admitted
+            and config.get("cute_matmul_family") == "warp_mma"
+        )
+        or (
+            spec.cute_mma_dag_facts is not None
+            and config.get("cute_mma_dag") in {"warp", "tcgen05"}
+        )
+    ):
+        # These explicit modes require their native matmul root. Other
+        # planned owners are validated only when their actual plan is known.
+        return True
+    # Only explicit PDL conflicts with the intrinsic clustered release protocol.
+    # An inert cluster knob does not select a native owner for a fragment.
+    return spec.has_explicit_pdl and (
+        config.get("tcgen05_cluster_m", 1) == 2
         or config.get("tcgen05_cta_group", "auto") == "two"
         # Physical row-union profiles project a single-CTA search carrier
         # into clustered codegen geometry after normalization.
@@ -63,7 +87,13 @@ def _unsupported_generator(
     config: Config,
     emit_repro_caller: bool,
     transforms: KernelTransforms,
+    *,
+    scalar_assertion: bool,
 ) -> ast.Module:
+    if scalar_assertion:
+        raise exc.InvalidConfig(
+            f"torch._assert_async cannot use whole-kernel generator {name}"
+        )
     raise exc.InvalidConfig(
         f"explicit PDL markers are not supported by whole-kernel generator {name}; "
         "select an ordinary device-function schedule (for ordered phases, a "
@@ -72,30 +102,46 @@ def _unsupported_generator(
 
 
 def guard_kernel_generators(
-    generators: tuple[KernelGenerator, ...],
+    generators: tuple[KernelGenerator, ...], *, scalar_assertion: bool = False
 ) -> tuple[KernelGenerator, ...]:
-    if not has_explicit_pdl():
+    if not scalar_assertion and not has_explicit_pdl():
         return generators
     # These generators replace or split the ordinary device function. Until
     # each carries the explicit protocol across its native launch boundary,
     # reject that configuration instead of dropping/reordering user markers.
     return tuple(
-        replace(generator, generate=partial(_unsupported_generator, generator.name))
+        replace(
+            generator,
+            generate=partial(
+                _unsupported_generator,
+                generator.name,
+                scalar_assertion=scalar_assertion,
+            ),
+        )
         for generator in generators
     )
 
 
-def validate_explicit_launch(fn: DeviceFunction, definition: ast.FunctionDef) -> None:
-    if not has_explicit_pdl():
+def validate_explicit_launch(
+    fn: DeviceFunction, definition: ast.FunctionDef, *, scalar_assertion: bool = False
+) -> None:
+    explicit_pdl = has_explicit_pdl()
+    if not explicit_pdl and not scalar_assertion:
         return
     from ...runtime.cute.host_wrappers import HOST_WRAPPER_EMITTERS
 
     for plan in cute_codegen_state(fn.codegen).wrapper_plans:
         kind = cast("str", plan["kind"])
         if HOST_WRAPPER_EMITTERS[kind].host_call is not None:
+            if scalar_assertion:
+                raise exc.InvalidConfig(
+                    f"torch._assert_async cannot use native host wrapper {kind}"
+                )
             raise exc.InvalidConfig(
                 f"explicit PDL markers are not supported by native host wrapper {kind}"
             )
+    if not explicit_pdl:
+        return
     # Intrinsic dependency protocols (for example a materialized producer)
     # cannot be replaced with the ordinary explicit entry/exit sequence.
     if any(

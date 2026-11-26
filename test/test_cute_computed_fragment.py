@@ -563,6 +563,7 @@ def _fragment_extent_fixture(rows_per_block, columns_per_block):
         for i, (symbol, numel) in enumerate(zip(symbols, numels, strict=True))
     ]
     compiler = object.__new__(FragmentCompiler)
+    compiler.checked_root = False
     compiler.df = SimpleNamespace(
         resolved_block_size=lambda block_id: configured[block_id], literal_expr=str
     )
@@ -582,6 +583,7 @@ def _fragment_extent_fixture(rows_per_block, columns_per_block):
     return compiler, host, rows, columns, parts
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(
     "rows_per_block,columns_per_block", [(8, 16), (16, 32), (32, 64), (16, 128)]
 )
@@ -607,6 +609,7 @@ def test_fragment_configured_extents_preserve_coordinate_geometry(
         assert compiler.extent(FloorDiv(columns + 64, columns)) == expected_parts
 
 
+@pytest.mark.cpu_only
 def test_fragment_configured_extents_preserve_dynamic_symbols_and_reject_cycles():
     compiler, host, rows, columns, parts = _fragment_extent_fixture(16, 32)
     dynamic = sympy.Symbol("dynamic", integer=True, positive=True)

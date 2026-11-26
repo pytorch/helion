@@ -21,10 +21,6 @@ import torch
 pytest.importorskip("cutlass")
 pytest.importorskip("cutlass.cute")
 
-from test.test_cute_flash_fp8_facts import dot_attention_k_major
-from test.test_cute_flash_fp8_facts import dot_attention_rows
-from test.test_cute_flash_fp8_facts import fp8_dot_attention_k_major
-
 import helion
 from helion._compiler.cute import cute_flash
 from helion._testing import DEVICE
@@ -32,6 +28,9 @@ from helion._testing import EXAMPLES_DIR
 from helion._testing import import_path
 from helion._testing import skipUnlessBackends
 from helion._testing.cute_aux import cpu_codegen
+from helion._testing.cute_flash_kernels import dot_attention_k_major
+from helion._testing.cute_flash_kernels import dot_attention_rows
+from helion._testing.cute_flash_kernels import fp8_dot_attention_k_major
 import helion.language as hl
 from helion.runtime.kernel import Kernel
 

@@ -315,7 +315,10 @@ _UPPER_CLAMPS = (
 
 
 def integer_bounds(
-    node: object, *, captured_bounds: dict[Node, tuple[int, int]] | None = None
+    node: object,
+    *,
+    captured_bounds: dict[Node, tuple[int, int]] | None = None,
+    symint_bounds: Callable[[Node], tuple[int, int] | None] | None = None,
 ) -> tuple[int, int] | None:
     """Bound integer expressions without observing input tensor contents.
 
@@ -334,6 +337,8 @@ def integer_bounds(
         if value in memo:
             return memo[value]
         fake = value.meta.get("val")
+        if isinstance(fake, torch.SymInt) and symint_bounds is not None:
+            return symint_bounds(value)
         if not isinstance(fake, torch.Tensor) or fake.dtype not in _BOUNDED_DTYPES:
             return None
         visiting.add(value)
