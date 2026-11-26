@@ -248,13 +248,19 @@ def test_selected_grouped_snapshots_preserve_publication_proof() -> None:
         original_wait = _build_sched_pipeline_consumer_wait_block
 
         def create_snapshot(
-            function: DeviceFunction, prefix: str, fields: tuple[int, ...]
+            function: DeviceFunction,
+            prefix: str,
+            fields: tuple[int, ...],
+            *,
+            remote_release: bool = False,
         ) -> _SchedMailboxSnapshot | None:
             with patch.dict(
                 function.config.config,
                 {"tcgen05_sched_consumer_wait_mode": "warp_leader"},
             ):
-                return original_create(function, prefix, fields)
+                return original_create(
+                    function, prefix, fields, remote_release=remote_release
+                )
 
         def wait_snapshot(
             *,

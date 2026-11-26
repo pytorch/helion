@@ -15,6 +15,7 @@ from helion._testing.cute_codegen import cpu_target
 from helion._testing.cute_codegen import stage_sources
 from helion._testing.cute_ordered_mma import duplicate_mma_loads
 from helion._testing.cute_ordered_mma import partitioned_matmul_sum
+from helion._testing.cute_sass import hinted_packets_render  # noqa: F401
 from helion.autotuner.config_generation import ConfigGeneration
 
 pytestmark = pytest.mark.cpu_only
@@ -56,6 +57,7 @@ def test_off_mode_keeps_persistent_barrier_search():
         assert len(stage_sources(bound.to_code(active))) == 3
 
 
+@pytest.mark.usefixtures("hinted_packets_render")
 @pytest.mark.parametrize("mode", ["warp", "tcgen05"])
 @pytest.mark.parametrize("splits", [1, 8])
 def test_mma_phase_preserves_sibling_owners_and_configured_strides(mode, splits):

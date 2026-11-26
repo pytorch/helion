@@ -807,9 +807,9 @@ def test_grouped_worklist_nm_runtime_direct_clc_uses_exact_record_ids() -> None:
     assert "_cute_issue_clc_query_nomulticast" in code
     assert "StaticPersistentGroupTileScheduler.create" not in code
     assert "tcgen05_grouped_runtime_tile_records.iterator" in code
-    assert (
-        "_runtime_direct_linear_idx = tcgen05_work_tile_smem[cutlass.Int32(2)]" in code
-    )
+    # (the 2-CTA cluster's consumers read the mailbox stage whole before
+    # releasing it to the leader)
+    assert "_runtime_direct_linear_idx = tcgen05_role_local_0_mailbox[2]" in code
     assert (
         "tcgen05_clc_cluster_bidz = cutlass.Int32(cute.arch.block_idx()[2])"
     ) in code

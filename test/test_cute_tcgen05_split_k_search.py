@@ -23,11 +23,13 @@ from test.cute_population_contracts import _cpu_target
 
 import helion
 from helion._compiler.cute import target_facts
+from helion._compiler.cute.mma_support import CuteMmaSupport
 from helion._compiler.cute.tcgen05_config import surface
 from helion._hardware import HardwareInfo
 from helion._testing import default_cute_mma_support
 from helion._testing import patch_cute_mma_support
 from helion._testing import skipUnlessBackends
+from helion._testing.cute_dense_tcgen05 import cpu_codegen_target
 from helion.autotuner.config_generation import ConfigGeneration
 import helion.language as hl
 
@@ -205,11 +207,59 @@ def test_a_tile_body_with_another_side_effect_cannot_split() -> None:
         assert plain.config_spec.tcgen05.split_k_plain_body
 
 
+@helion.kernel(backend="cute", static_shapes=True)
+def _gemm_into_k16(a: torch.Tensor, b: torch.Tensor, out: torch.Tensor) -> None:
+    m, k = a.size()
+    _, n = b.size()
+    block_k = hl.register_block_size(16, 16)
+    for tile_m, tile_n in hl.tile([m, n]):
+        acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+        for tile_k in hl.tile(k, block_size=block_k):
+            acc = torch.addmm(acc, a[tile_m, tile_k], b[tile_k, tile_n])
+        out[tile_m, tile_n] = acc.to(out.dtype)
+
+
+# A tile narrower than the tcgen05 MMA's N (8 columns for 16-bit operands, 32
+# for TF32) runs the scalar fallback the search admits for a small-N GEMM,
+# which codegen does not split: a sampled split is dropped, and the split-K
+# default keeps such a tile unsplit. The transposed GEMVs (``out.T = w @ x.T``)
+# pin 16-deep k-blocks: the 16-bit one's 64-block K loop is long enough for
+# that default to split (the TF32 one keeps the base default).
+@pytest.mark.parametrize(
+    ("n", "dtype"),
+    ((4, torch.bfloat16), (16, torch.float32)),
+    ids=("bf16-n4", "tf32-n16"),
+)
+def test_a_tile_narrower_than_the_mma_cannot_split(n: int, dtype: torch.dtype) -> None:
+    support = CuteMmaSupport(
+        universal=True,
+        warp_f16bf16=True,
+        tcgen05_f16bf16=True,
+        tcgen05_f8=True,
+        tcgen05_tf32=True,
+    )
+    with cpu_codegen_target(), patch_cute_mma_support(support):
+        weight = torch.empty(4096, 1024, dtype=dtype)
+        x = torch.empty(n, 1024, dtype=dtype)
+        out = torch.empty(n, 4096, dtype=dtype)
+        bound = _gemm_into_k16._bind_isolated((weight, x.T, out.T))
+        spec = bound.config_spec
+        assert surface.split_k_search_choices(spec._cute_tcgen05_config)
+        config = spec.default_config()
+        # the registered K block comes first: K, M, N
+        assert config.block_sizes == [16, 64, n]
+        assert config.config["tcgen05_split_k"] == 1
+        assert "cute.gemm(" not in bound.to_code(config)
+        seeds = ConfigGeneration(spec).seed_flat_config_pairs()
+        assert all(seed.config.get("tcgen05_split_k", 1) == 1 for _, seed in seeds)
+        sample = {**config.config, "tcgen05_split_k": 4}
+        spec.normalize(sample, _fix_invalid=True)
+    assert sample["tcgen05_split_k"] == 1
+
+
 def test_sampled_splits_render() -> None:
     # The envelope predicate above mirrors the fixer; rendering closes the
     # loop with codegen's own envelope check.
-    from helion._testing.cute_dense_tcgen05 import cpu_codegen_target
-
     with cpu_codegen_target():
         bound = _bind(512, 512, 65536)
         gen = ConfigGeneration(bound.config_spec)

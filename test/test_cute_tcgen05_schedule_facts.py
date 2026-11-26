@@ -34,6 +34,12 @@ from helion._compiler.cute.tcgen05_config import repair
 from helion._compiler.cute.tcgen05_config import seeds
 from helion._compiler.cute.tcgen05_config import smem
 from helion._compiler.cute.tcgen05_config import surface
+from helion._compiler.cute.tcgen05_constants import TCGEN05_LARGE_BN_PROOF_BLOCK_SIZES
+from helion._compiler.cute.tcgen05_constants import TCGEN05_LARGE_BN_PROOF_CLUSTER_M
+from helion._compiler.cute.tcgen05_constants import TCGEN05_LARGE_BN_PROOF_CONFIG_KEY
+from helion._compiler.cute.tcgen05_constants import TCGEN05_LARGE_BN_PROOF_PID_TYPE
+from helion._compiler.cute.tcgen05_constants import TCGEN05_LARGE_BN_PROOF_PROBLEM_SHAPE
+from helion._compiler.cute.tcgen05_constants import TCGEN05_LARGE_BN_PROOF_STAGE_CONFIGS
 from helion._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_SEED_L2_GROUPING
 from helion._compiler.cute.tcgen05_schedule_facts import Tcgen05FullTileScheduleFacts
 from helion._compiler.cute.tcgen05_schedule_facts import analyze_native_gemm
@@ -54,6 +60,7 @@ from helion._testing.cute_dense_tcgen05 import bias_mm_into
 from helion._testing.cute_dense_tcgen05 import blackwell_capability
 from helion._testing.cute_dense_tcgen05 import cpu_codegen_target
 from helion._testing.cute_dense_tcgen05 import extra_store_mm
+from helion._testing.cute_dense_tcgen05 import gb300_target
 from helion._testing.cute_dense_tcgen05 import plain_mm
 from helion._testing.cute_dense_tcgen05 import plain_mm_into
 from helion._testing.cute_dense_tcgen05 import promoted_bias_mm_into
@@ -64,6 +71,7 @@ from helion._testing.cute_dense_tcgen05 import scaled_bmm_into
 from helion._testing.cute_dense_tcgen05 import scaled_mm
 from helion._testing.cute_dense_tcgen05 import user_bound_mm
 from helion._testing.cute_dense_tcgen05 import vector_scaled_mm
+from helion._testing.cute_dense_tcgen05 import wrapper_plans
 from helion._testing.cute_inductor_epilogues import INDUCTOR_EPILOGUES
 from helion._testing.cute_inductor_epilogues import dropout_mm_into
 from helion._testing.cute_inductor_epilogues import gelu_tanh_grad_mm_into
@@ -71,6 +79,7 @@ from helion._testing.cute_inductor_epilogues import inductor_epilogue_args
 from helion.autotuner.config_generation import ConfigGeneration
 from helion.exc import InvalidConfig
 import helion.language as hl
+from helion.runtime.cute.launcher import _append_cute_wrapper_plan
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -502,6 +511,27 @@ def test_output_edge_admission_excludes_unpaired_and_double_edge_shapes(
 ) -> None:
     bound = _plain_bind(*shape, dtype=dtype)
     assert not bound.config_spec._cute_tcgen05_config.output_edge_persistent_admitted
+
+
+def test_flat_one_cta_samples_keep_128_rows() -> None:
+    """A flat one-CTA sample runs 128 rows at most: two 128-row subtiles per
+    CTA run only on the pairs (or the cp.async-A kernel), and a flat 256-row
+    sample renders the SIMT fallback with no MMA."""
+    bound = _plain_bind(1000, 2304, 2048)
+    spec = bound.config_spec
+    config = helion.Config(
+        **{
+            **spec.default_config().config,
+            "block_sizes": [256, 128, 64],
+            "pid_type": "flat",
+            "tcgen05_cluster_m": 1,
+            "tcgen05_cluster_n": 1,
+            "tcgen05_cta_group": "auto",
+        }
+    )
+    spec.normalize(config, _fix_invalid=True)
+    assert config.config["block_sizes"][0] == 128
+    assert "tiled_mma" in bound.to_code(config)
 
 
 def test_n_edge_cluster_n_seeds_take_one_n_cluster() -> None:
@@ -2464,6 +2494,35 @@ def test_unaligned_batched_output_takes_the_one_cta_tile() -> None:
     assert config.config["pid_type"] == "flat"
 
 
+def test_batched_output_wider_than_n_stores_stop_at_the_gemm_extents() -> None:
+    """Matrices 96 columns wide written over N = 80: the flat edge store
+    predicates at the GEMM's (M, N), not at the destination's, whose columns
+    past N the loops never cover (eager leaves them as they are). Over
+    whole tiles (N = 64) the TMA store's (M, N, L) TensorMap view stops at
+    N as well (``d_extents``)."""
+    config = helion.Config(block_sizes=[1, 128, 64, 64], pid_type="flat")
+    codes = {}
+    for n in (80, 64):
+        bound = _scores_into._bind_isolated(
+            (
+                torch.empty((4, 128, 128), dtype=torch.bfloat16),
+                torch.empty((4, n, 128), dtype=torch.bfloat16).transpose(1, 2),
+                torch.empty((4, 128, 96), dtype=torch.bfloat16),
+            )
+        )
+        codes[n] = bound.to_code(config)
+    assert "cute.elem_less(_coord, (128, 80))" in codes[80]
+    assert "cute.elem_less(_coord, (128, 96))" not in codes[80]
+    assert "<= 96" not in codes[80]
+    (d_plan,) = (
+        plan for plan in wrapper_plans(codes[64]) if plan["kind"] == "tcgen05_d_tma"
+    )
+    assert d_plan["d_extents"] == [128, 64]
+    body: list[str] = []
+    _append_cute_wrapper_plan(body, [], d_plan)
+    assert any("cute.make_layout((128, 64, arg2_shape0)," in line for line in body)
+
+
 def test_partial_narrow_batched_tile_stays_flat() -> None:
     """N = 16 takes a 32-wide tile, partial in every matrix: a partial
     batched tile runs only on the flat launch, so the default stays flat
@@ -3427,6 +3486,178 @@ def test_default_tile_one_cta_tile_keeps_a_registered_k_block() -> None:
         ).config_spec.default_config()
     # block 0 is the registered K block size
     assert config.block_sizes[0] == 32
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _k_first_mm_into(a: torch.Tensor, b: torch.Tensor, out: torch.Tensor) -> None:
+    """``plain_mm_into`` with its K block size registered first: the config
+    orders the block sizes [K, M, N]."""
+    m, k = a.shape
+    n = b.shape[1]
+    block_k = hl.register_block_size(k)
+    for rows, cols in hl.tile((m, n)):
+        acc = hl.zeros((rows, cols), dtype=torch.float32)
+        for inner in hl.tile(k, block_size=block_k):
+            acc = torch.addmm(acc, a[rows, inner], b[inner, cols])
+        out[rows, cols] = acc.to(out.dtype)
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _residual_mm_into(
+    a: torch.Tensor, b: torch.Tensor, residual: torch.Tensor, out: torch.Tensor
+) -> None:
+    m, k = a.shape
+    n = b.shape[1]
+    for rows, cols in hl.tile((m, n)):
+        acc = hl.zeros((rows, cols), dtype=torch.float32)
+        for inner in hl.tile(k):
+            acc = torch.addmm(acc, a[rows, inner], b[inner, cols])
+        out[rows, cols] = (acc + residual[rows, cols].to(torch.float32)).to(out.dtype)
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _k_first_residual_mm_into(
+    a: torch.Tensor, b: torch.Tensor, residual: torch.Tensor, out: torch.Tensor
+) -> None:
+    """``_residual_mm_into`` with its K block size registered first."""
+    m, k = a.shape
+    n = b.shape[1]
+    block_k = hl.register_block_size(k)
+    for rows, cols in hl.tile((m, n)):
+        acc = hl.zeros((rows, cols), dtype=torch.float32)
+        for inner in hl.tile(k, block_size=block_k):
+            acc = torch.addmm(acc, a[rows, inner], b[inner, cols])
+        out[rows, cols] = (acc + residual[rows, cols].to(torch.float32)).to(out.dtype)
+
+
+def _seed_lists(bound: BoundKernel) -> list[list[dict[str, object]]]:
+    """The kernel's tcgen05 seeds, the same seeds after the search's
+    projection (``normalize(_fix_invalid=True)``), and its default."""
+    spec = bound.config_spec
+    raw = [dict(seed.config) for seed in spec.autotune_seed_configs()]
+    projected = []
+    for seed in raw:
+        values = dict(seed)
+        spec.normalize(values, _fix_invalid=True)
+        projected.append(values)
+    return [raw, projected, [dict(spec.default_config().config)]]
+
+
+def _assert_k_first_seeds_permute_mnk_seeds(
+    mnk_kernel: Kernel, k_first_kernel: Kernel, args: tuple[torch.Tensor, ...]
+) -> tuple[BoundKernel, list[dict[str, object]]]:
+    """The K-first kernel's seed lists are the [M, N, K] kernel's with each
+    block size moved to its index; returns the K-first kernel and its seeds."""
+
+    def in_k_first_order(values: dict[str, object]) -> dict[str, object]:
+        bm, bn, bk = cast("list[int]", values["block_sizes"])
+        return {**values, "block_sizes": [bk, bm, bn]}
+
+    with gb300_target():
+        mnk = mnk_kernel._bind_isolated(args)
+        k_first = k_first_kernel._bind_isolated(args)
+        expected = [
+            [in_k_first_order(values) for values in seed_list]
+            for seed_list in _seed_lists(mnk)
+        ]
+        actual = _seed_lists(k_first)
+    assert facts._matmul_block_indices(k_first.config_spec.tcgen05) == (1, 2, 0)
+    assert actual == expected
+    return k_first, actual[0]
+
+
+@pytest.mark.parametrize("extent", (4096, 5000))
+def test_seeds_write_each_block_size_at_its_matmul_index(extent: int) -> None:
+    """A kernel that registers its K block size first takes the [M, N, K]
+    kernel's seeds, projected seeds and default with each block size at its
+    index: the whole-tile families at 4096^3, the edge family at 5000^3.
+    Seeds written by position as [bm, bn, bk] put a 256- or 512-deep K tile
+    there, above K's 16..128 range, and made the edge family's promoted
+    default [256, 256, 256]."""
+    args = tuple(torch.empty((extent, extent), dtype=torch.bfloat16) for _ in range(3))
+    k_first, raw = _assert_k_first_seeds_permute_mnk_seeds(
+        plain_mm_into, _k_first_mm_into, args
+    )
+    k_block = k_first.config_spec.block_sizes[0]
+    for values in raw:
+        block_k = cast("list[int]", values["block_sizes"])[0]
+        assert k_block.min_size <= block_k <= k_block.max_size, values
+
+
+def test_aux_edge_seeds_keep_their_schedule_in_either_block_order() -> None:
+    """The residual edge family at 5000^3: the C-input seeds, their CLC and
+    aux-TMA twins and the narrow-N twin survive the search's projection in
+    either block order, as the CLC check and the narrow-N projection read
+    the tiles at the matmul's indices."""
+    args = tuple(torch.empty((5000, 5000), dtype=torch.bfloat16) for _ in range(4))
+    _assert_k_first_seeds_permute_mnk_seeds(
+        _residual_mm_into, _k_first_residual_mm_into, args
+    )
+
+
+def test_tile_checks_read_a_k_first_kernels_tiles() -> None:
+    """The scheduler-mailbox and large-BN checks judge a K-first config by
+    its M, N and K tiles, not by its first three positions; a batched GEMM
+    keeps the mailbox refusal."""
+    with gb300_target():
+        args = tuple(torch.empty((4096, 4096), dtype=torch.bfloat16) for _ in range(3))
+        spec = _k_first_mm_into._bind_isolated(args).config_spec
+        clc = next(
+            dict(seed.config)
+            for seed in spec.autotune_seed_configs()
+            if seed.config.get("tcgen05_persistence_model") == "clc_persistent"
+        )
+        # the 256x256 CTA pair at a 128-deep K tile, K first
+        assert clc["block_sizes"] == [128, 256, 256]
+        clc["tcgen05_sched_stage_count"] = 2
+        spec.normalize(clc)
+        assert clc["tcgen05_sched_stage_count"] == 2
+        # The same CLC pair on a batched GEMM, its 256-row M tile behind the
+        # batch block: one scheduler stage passes, two stay refused.
+        batched = (
+            helion.kernel(batched_gemm, backend="cute", static_shapes=True)
+            ._bind_isolated(
+                tuple(
+                    torch.empty((8, 2048, 2048), dtype=torch.bfloat16) for _ in range(2)
+                )
+            )
+            .config_spec
+        )
+        assert batched.tcgen05.matmul_has_leading_passthrough
+        pair = {
+            "block_sizes": [1, 256, 256, 128],
+            "pid_type": "persistent_interleaved",
+            "tcgen05_cluster_m": 2,
+            "tcgen05_cluster_n": 1,
+            "tcgen05_strategy": "role_local_with_scheduler",
+            "tcgen05_persistence_model": "clc_persistent",
+            "tcgen05_warp_spec_scheduler_warps": 1,
+        }
+        batched.normalize({**pair, "tcgen05_sched_stage_count": 1})
+        with pytest.raises(InvalidConfig, match="tcgen05_sched_stage_count=2"):
+            batched.normalize({**pair, "tcgen05_sched_stage_count": 2})
+        m, n, k = TCGEN05_LARGE_BN_PROOF_PROBLEM_SHAPE
+        spec = _k_first_mm_into._bind_isolated(
+            (
+                torch.empty((m, k), dtype=torch.bfloat16),
+                torch.empty((k, n), dtype=torch.bfloat16),
+                torch.empty((m, n), dtype=torch.bfloat16),
+            )
+        ).config_spec
+        proof = {
+            "tcgen05_cluster_m": TCGEN05_LARGE_BN_PROOF_CLUSTER_M,
+            "pid_type": TCGEN05_LARGE_BN_PROOF_PID_TYPE,
+            **dict(TCGEN05_LARGE_BN_PROOF_STAGE_CONFIGS),
+            TCGEN05_LARGE_BN_PROOF_CONFIG_KEY: True,
+        }
+        bm, bn, bk = TCGEN05_LARGE_BN_PROOF_BLOCK_SIZES
+        config = {**proof, "block_sizes": [bk, bm, bn]}
+        spec.normalize(config)
+        assert config[TCGEN05_LARGE_BN_PROOF_CONFIG_KEY] is True
+        with pytest.raises(
+            InvalidConfig, match=f"{TCGEN05_LARGE_BN_PROOF_CONFIG_KEY}=True requires"
+        ):
+            spec.normalize({**proof, "block_sizes": [bm, bn, bk]})
 
 
 def test_default_tile_promotion_survives_ffi_normalization() -> None:

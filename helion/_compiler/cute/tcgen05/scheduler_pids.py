@@ -186,14 +186,21 @@ def _sched_mailbox_load_expr(
 
 @dataclasses.dataclass(frozen=True)
 class _SchedMailboxSnapshot:
-    """Warp-uniform registers loaded only by the lane that acquired the stage."""
+    """Warp-uniform registers loaded only by the lane that acquired the stage,
+    or (``vector``) the whole mailbox stage every lane loads at once."""
 
     valid: str
     fields: dict[int, str]
+    vector: bool = False
 
     @classmethod
     def create(
-        cls, device_function: DeviceFunction, prefix: str, fields: tuple[int, ...]
+        cls,
+        device_function: DeviceFunction,
+        prefix: str,
+        fields: tuple[int, ...],
+        *,
+        remote_release: bool = False,
     ) -> _SchedMailboxSnapshot | None:
         if (
             device_function.config.get(
@@ -202,9 +209,45 @@ class _SchedMailboxSnapshot:
             )
             != TCGEN05_SCHED_CONSUMER_WAIT_MODE_WARP_LEADER
         ):
-            # Do not even allocate names in normal mode: its generated code
-            # and producer/publication protocol must remain unchanged.
-            return None
+            if not remote_release:
+                # Do not even allocate names in normal mode: its generated
+                # code and producer/publication protocol must remain
+                # unchanged.
+                return None
+            # The consumers release the stage to the leader CTA's empty
+            # barrier, whose scheduler warp then writes the next work tile
+            # into this CTA's mailbox (``st.async``). The CTA-scoped release
+            # does not wait for a lane's mailbox load, which the generated
+            # code issues right before it:
+            #
+            #     virtual_pid = (tcgen05_work_tile_smem[cutlass.Int32(0)] >> cutlass.Int32(1)) + ...
+            #     tcgen05_sched_pipeline.consumer_release(tcgen05_sched_pipeline_consumer_state)
+            #     # SASS: LDS.64 R2, [mailbox]; SYNCS.ARRIVE.TRANS64.RED.A1T0 RZ, [leader barrier]
+            #
+            # so the next tile's coordinates can land in the mailbox before
+            # the load reads it, and that warp stores its rows of the tile
+            # at the next tile's coordinates. Loading the whole stage at once
+            # ahead of the valid test makes the loop's branch wait for the
+            # load, before any release:
+            #
+            #     tcgen05_role_local_2_mailbox = tcgen05_work_tile_smem.load()
+            #     tcgen05_role_local_2_valid = tcgen05_role_local_2_mailbox[3] != cutlass.Int32(0)
+            #     while tcgen05_role_local_2_valid:
+            #         virtual_pid = (tcgen05_role_local_2_mailbox[0] >> cutlass.Int32(1)) + ...
+            #
+            # bf16 131072x144x288 on the CLC 256x256 pair (GB300, NaN-filled
+            # outputs on fresh inputs): 7 of 300 calls left an epilogue
+            # warp's rows of the peer CTA unwritten, 0 with the vector load.
+            # A cluster-scoped release (or a ``fence.acq_rel.cluster``
+            # before it) also closes the race, but drains each role's
+            # outstanding memory operations every tile: the stored CLC
+            # configs of bf16 16384x4096x1024 and 8192x128112x1024 ran 5%
+            # slower (in one process, of cuBLAS: 1.005 -> 0.956, 1.018 ->
+            # 0.966).
+            name = device_function.new_var(f"{prefix}_mailbox")
+            return cls(
+                name, {field: f"{name}[{field}]" for field in fields}, vector=True
+            )
         return cls(
             device_function.new_var(f"{prefix}_mailbox_valid"),
             {
@@ -216,6 +259,15 @@ class _SchedMailboxSnapshot:
     def read_block(
         self, mailbox: str, valid_var: str, valid_field: int, stage: str | None
     ) -> list[ast.stmt]:
+        if self.vector:
+            tensor = mailbox if stage is None else f"{mailbox}[None, {stage}]"
+            return [
+                statement_from_string(f"{self.valid} = {tensor}.load()"),
+                statement_from_string(
+                    f"{valid_var} = {self.valid}[{valid_field}] != cutlass.Int32(0)"
+                ),
+            ]
+
         def read(field: int, name: str) -> list[ast.stmt]:
             return [
                 statement_from_string(
@@ -321,6 +373,17 @@ def _build_sched_pipeline_consumer_wait_block(
                 orelse=[],
             ),
             statement_from_string("cute.arch.sync_warp()"),
+            statement_from_string("cute.arch.fence_view_async_shared()"),
+            statement_from_string("cute.arch.sync_warp()"),
+            *snapshot.read_block(
+                work_tile_smem, valid_var, valid_slot_index, work_tile_stage_index
+            ),
+        ]
+    if snapshot is not None and snapshot.vector:
+        return [
+            statement_from_string(
+                f"{sched_pipeline}.consumer_wait({sched_consumer_state})"
+            ),
             statement_from_string("cute.arch.fence_view_async_shared()"),
             statement_from_string("cute.arch.sync_warp()"),
             *snapshot.read_block(
@@ -520,6 +583,17 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
             # DeviceFunction; in that context the tcgen05 plan-dependent
             # branches should behave like the legacy 1-CTA path.
             return None
+
+    def _tcgen05_sched_releases_to_leader(self) -> bool:
+        """Whether every consumer of the scheduler mailbox releases its stage
+        to the leader CTA's empty barrier: CLC on a cluster of two or more
+        CTAs (``cute_mma``'s ``consumer_mask_to_leader``)."""
+        plan = self._tcgen05_plan()
+        return (
+            plan is not None
+            and plan.is_clc_persistent
+            and self._tcgen05_cluster_m() * self._tcgen05_cluster_n() > 1
+        )
 
     def _tcgen05_cluster_m(self) -> int:
         if (plan := self._tcgen05_plan()) is not None:
@@ -806,13 +880,61 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         the static tile count that decides whether padding exists is read
         from that axis, the same one the guard's bound is built from.
         """
-        swizzle = self._tcgen05_l2_swizzle_size()
-        if swizzle == 1:
-            return None
         plan = self._tcgen05_plan()
         if plan is not None and (plan.is_clc_persistent or plan.grouped is not None):
             # CLC cancellation and grouped worklists have separate work-space
-            # contracts; this guard covers the ordinary static scheduler only.
+            # contracts: the CLC scheduler warp skips the padding slots
+            # itself (``_tcgen05_clc_padding_predicate``), so its roles never
+            # see one; grouped worklists have no swizzle padding.
+            return None
+        return self._tcgen05_swizzle_padding_predicate(f"{work_tile_var}.tile_idx[1]")
+
+    def _tcgen05_clc_padding_predicate(self, coord: str) -> str | None:
+        """The swizzle-padding test of the ordinary CLC scheduler warp's work
+        tile (``coord``: its dim-1 tile coordinate), or None where its
+        scheduler has no padding slot (no swizzle, a swizzle that divides the
+        cluster count, or a CLC family that decodes work tiles from a runtime
+        record table instead of the swizzled scheduler).
+
+        The CLC launch grid and every ``try_cancel`` response name clusters
+        by their linear launch id, which the scheduler decodes through the
+        same swizzled layout as the static scheduler, padding slots
+        included. bf16 8192x50272x768 on 256x256 CTA pairs at swizzle 2: 32 x
+        197 = 6304 clusters, whose layout rounds the 197 N tiles up to 198.
+        Launching 6304 clusters then decodes some ids to the padding column
+        (N tile 197) and never decodes the real tiles of the last ids. A
+        published padding tile hangs the kernel: its TMA-load warp skips the
+        loads (``tile_offset_1 < 50272`` is false), while its MMA warp waits
+        for them:
+
+            if tcgen05_tma_initial_full_tile:  # false past N
+                tcgen05_ab_pipeline.producer_acquire(...)
+            ...
+            tcgen05_ab_pipeline.consumer_wait(...)  # MMA warp: never arrives
+
+        (every CLC config of that shape at swizzle 2-8 hung its first call,
+        which the autotuner records as a compile-deadline failure). So the
+        CLC grid launches the padded cluster count
+        (``_tcgen05_num_work_clusters_expr(pad_to_swizzle=True)``) and the
+        scheduler warp publishes only the tiles this predicate admits,
+        querying past the padding ones.
+        """
+        plan = self._tcgen05_plan()
+        if (
+            plan is None
+            or not plan.is_clc_persistent
+            or plan.grouped is not None
+            or self._scheduler_family() is SchedulerFamily.GROUPED_RUNTIME_CLC
+            or (plan.row_union is not None and plan.row_union.linear_record_clc)
+        ):
+            return None
+        return self._tcgen05_swizzle_padding_predicate(coord)
+
+    def _tcgen05_swizzle_padding_predicate(self, coord: str) -> str | None:
+        """``coord`` (a scheduler dim-1 tile coordinate) lies inside the
+        logical grid, or None where the scheduler pads no dim-1 slot."""
+        swizzle = self._tcgen05_l2_swizzle_size()
+        if swizzle == 1:
             return None
         cluster_n = self._tcgen05_cluster_n()
         if len(self.pid_info) < 2:
@@ -835,7 +957,6 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
             if clusters % swizzle == 0:
                 return None
         logical_n = self._tcgen05_scheduler_tile_dims_expr(is_device=True)[1]
-        coord = f"{work_tile_var}.tile_idx[1]"
         if cluster_n > 1:
             coord = (
                 f"({coord} // cutlass.Int32({cluster_n})) * cutlass.Int32({cluster_n})"
@@ -877,7 +998,9 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
             )
         ]
 
-    def _tcgen05_num_work_clusters_expr(self, *, is_device: bool) -> str:
+    def _tcgen05_num_work_clusters_expr(
+        self, *, is_device: bool, pad_to_swizzle: bool = False
+    ) -> str:
         """Return the number of scheduler work clusters.
 
         ``StaticPersistentTileScheduler.create`` initializes its current
@@ -885,6 +1008,12 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         the CTA's coordinate inside a cluster. The launch grid therefore
         needs one z block per persistent work cluster, not a flat x-only
         ``(_NUM_SM,)`` grid.
+
+        ``pad_to_swizzle`` counts the scheduler's swizzle-padding slots too
+        (its dim-1 cluster extent rounded up to the swizzle size, as
+        ``PersistentTileSchedulerParams`` lays it out), where they exist:
+        the CLC grid launches one cluster per slot, so that every logical
+        tile has a launch id (``_tcgen05_clc_padding_predicate``).
         """
         dims = self._tcgen05_scheduler_tile_dims_expr(is_device=is_device)
         cluster_m = self._tcgen05_cluster_m()
@@ -894,6 +1023,9 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         if cluster_n > 1:
             # Each cluster covers ``cluster_n`` consecutive logical N tiles.
             dims[1] = f"(({dims[1]}) + {cluster_n} - 1) // {cluster_n}"
+        if pad_to_swizzle and self._tcgen05_clc_padding_predicate("0") is not None:
+            swizzle = self._tcgen05_l2_swizzle_size()
+            dims[1] = f"(({dims[1]}) + {swizzle} - 1) // {swizzle} * {swizzle}"
         return " * ".join(f"({dim})" for dim in dims[:3])
 
     def _tcgen05_max_active_clusters_var(self) -> str:
@@ -977,6 +1109,22 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
 
     def _tcgen05_grid_work_clusters_expr(self, total_clusters: str) -> str:
         """Return the scheduler z dimension for the persistent launch grid."""
+        if (
+            self._tcgen05_cluster_n() > 1
+            and self._tcgen05_persistent_grid_cap()
+            == TCGEN05_PERSISTENT_GRID_CAP_RESIDENT_CLUSTERS
+            and (plan := self._tcgen05_plan()) is not None
+            and plan.one_shot_role_scheduler
+        ):
+            # The one-shot roles run one tile per CTA and no scheduler loop
+            # (``tcgen05_one_shot_role_scheduler``: at most one CTA per SM),
+            # so the launch covers every tile. The resident-cluster cap
+            # (``_MAX_ACTIVE_CLUSTERS``) can be below that and would leave
+            # tiles unwritten: fp16 512x4352 on the 256x128 2x2 cluster has 34
+            # clusters (136 CTAs), against the 33 4-CTA clusters a B200
+            # co-schedules; the 34th now runs as a later hardware wave. Every
+            # other capacity holds at least one CTA per SM pair.
+            return total_clusters
         max_persistent_clusters = self._tcgen05_max_persistent_work_clusters_expr()
         return f"min(({total_clusters}), ({max_persistent_clusters}))"
 
@@ -992,9 +1140,12 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         # is derived from this case's pid_info only.
         cluster_m = self._tcgen05_cluster_m()
         cluster_n = self._tcgen05_cluster_n()
-        total_clusters = self._tcgen05_num_work_clusters_expr(is_device=False)
         plan = self._tcgen05_plan()
-        if plan is not None and plan.is_clc_persistent:
+        clc = plan is not None and plan.is_clc_persistent
+        total_clusters = self._tcgen05_num_work_clusters_expr(
+            is_device=False, pad_to_swizzle=clc
+        )
+        if clc:
             # G2-H (cute_plan.md): CLC mode launches the *full*
             # problem grid (one cluster slot per problem cluster),
             # not the persistent sub-grid. The hardware tile-scheduler
@@ -3387,6 +3538,9 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
                 )
                 if scheduler_mailbox
                 else (2,),
+                # (the runtime-CLC worklist's four-field mailbox on a 2-CTA
+                # cluster; the group-search scheduler's releases stay local)
+                remote_release=self._tcgen05_sched_releases_to_leader(),
             )
             handshake = self._sched_consumer_handshake(
                 layout,
@@ -3873,7 +4027,10 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         # does, just sourcing from SMEM coords instead of the
         # work_tile object.
         snapshot = _SchedMailboxSnapshot.create(
-            device_function, scheduler_var_prefix, tuple(range(len(self.pid_info)))
+            device_function,
+            scheduler_var_prefix,
+            tuple(range(len(self.pid_info))),
+            remote_release=self._tcgen05_sched_releases_to_leader(),
         )
         handshake = self._sched_consumer_handshake(layout, valid_var, snapshot)
         mailbox_slots = [
@@ -4989,13 +5146,15 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         # Throttled pacing: wait for the TMA-load warp's per-tile credit
         # (``cute_mma._tcgen05_clc_throttle_credit``) before each query.
         clc_throttle_barrier = device_function.cute_state.tcgen05.clc_throttle_barrier
-        clc_query_block = [
+        clc_query_preamble = [
             statement_from_string("cute.arch.sync_warp()"),
             *(
                 [statement_from_string(f"{clc_throttle_barrier}.arrive_and_wait()")]
                 if clc_throttle_barrier
                 else []
             ),
+        ]
+        clc_query_block = [
             create(
                 ast.If,
                 test=expr_from_string(_LEADER_PREDICATE),
@@ -5063,9 +5222,31 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         # Inserting another leader-only ``if`` around it would gate
         # the entire publish to lane 0 and either skip the broadcast
         # to peer CTAs or stall only lane 0 on ``producer_acquire``.
-        per_tile_body = [
+        publish_and_pace = [
             *per_tile_publish_warp,
             statement_from_string(emit_pipeline_advance(sched_producer_state)),
+            *clc_query_preamble,
+        ]
+        padding = self._tcgen05_clc_padding_predicate(cluster_bidy_var)
+        if padding is not None:
+            # Publish only logical tiles (``_tcgen05_clc_padding_predicate``)
+            # and query straight past a padding slot: the warp-uniform test
+            # skips the throttle wait with the publish, since the TMA-load
+            # warp arrives once per tile it receives.
+            #
+            #     if tcgen05_clc_cluster_bidy < (50272 + 255) // 256:
+            #         <publish, advance, throttle wait>
+            #     <try_cancel query, decode the next cluster>
+            publish_and_pace = [
+                create(
+                    ast.If,
+                    test=expr_from_string(padding),
+                    body=publish_and_pace,
+                    orelse=[],
+                )
+            ]
+        per_tile_body = [
+            *publish_and_pace,
             *clc_query_block,
             statement_from_string("cute.arch.sync_warp()"),
         ]
@@ -5274,6 +5455,7 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
                 ()
                 if aux_requires_full_tile and tile_phase == "edge"
                 else tuple(range(len(self.pid_info))),
+                remote_release=self._tcgen05_sched_releases_to_leader(),
             )
         )
         handshake = self._sched_consumer_handshake(layout, valid_var, snapshot)

@@ -612,6 +612,27 @@ def _matmul_config_view(
     return block_sizes, m_index, n_index, k_index
 
 
+def _matmul_config_tiles(
+    state: CuteTcgen05Config, config: dict[str, object]
+) -> tuple[object, object, object] | None:
+    """``(bm, bn, bk)`` of ``config``, read at the matmul's block indices
+    (``_matmul_config_view``).  A spec without the MMA analysis's block
+    ids (one normalizing a saved config by itself) reads the leading three
+    block sizes as the canonical ``[M, N, K]`` triple."""
+    view = _matmul_config_view(state, config)
+    if view is not None:
+        block_sizes, m_index, n_index, k_index = view
+        return block_sizes[m_index], block_sizes[n_index], block_sizes[k_index]
+    block_sizes = config.get("block_sizes")
+    if (
+        state.matmul_block_ids is None
+        and isinstance(block_sizes, list)
+        and len(block_sizes) >= 3
+    ):
+        return block_sizes[0], block_sizes[1], block_sizes[2]
+    return None
+
+
 def _region_output_facts(
     state: CuteTcgen05Config, region: int
 ) -> Tcgen05PipelineSmemFacts | None:
@@ -1222,6 +1243,19 @@ def _config_is_two_cta_mma(
         bm == TCGEN05_TWO_CTA_FP8_SMALL_GRID_BLOCK_M
         and state.matmul_input_dtype == torch.float8_e4m3fn
     )
+
+
+def _tcgen05_min_block_n(state: CuteTcgen05Config) -> int:
+    """The narrowest N tile the tcgen05 MMA takes for the GEMM's operands.
+
+    Mirrors the floor of ``cute_mma._mma_impl_matches_problem_shape``: 16
+    for FP8, 32 for TF32, 8 for 16-bit operands. A narrower tile, which the
+    search admits for a small-N GEMM's scalar fallback (``search_plan``),
+    lowers through the SIMT MMA.
+    """
+    if state.matmul_input_dtype == torch.float8_e4m3fn:
+        return 16
+    return 32 if state.matmul_input_dtype == torch.float32 else 8
 
 
 def _plain_narrow_subtile_facts(

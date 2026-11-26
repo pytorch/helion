@@ -438,12 +438,13 @@ def _cute_leading_passthrough_view_2d(
 def _destination_gemm_extents(
     env: CompileEnvironment, tensor: torch.Tensor, output_block_ids: Sequence[int]
 ) -> tuple[int, int] | None:
-    """The tile loops' static (M, N) where a rank-2 destination is larger
-    than them, else ``None``."""
-    if tensor.ndim != 2 or len(output_block_ids) < 2:
+    """The tile loops' static (M, N) where a destination's matrix (a rank-2
+    destination, or the trailing two dims of a batched one) is larger than
+    them, else ``None``."""
+    if tensor.ndim not in (2, 3) or len(output_block_ids) < 2:
         return None
     rows, cols = (env.block_sizes[block_id].size for block_id in output_block_ids[-2:])
-    dest_rows, dest_cols = tensor.shape
+    dest_rows, dest_cols = tensor.shape[-2:]
     if not all(type(v) is int for v in (rows, cols, dest_rows, dest_cols)):
         return None
     rows, cols = cast("int", rows), cast("int", cols)
@@ -978,7 +979,9 @@ def _codegen_cute_store_tcgen05_tile(
     # over the tile loops' N) has its rows and columns past the loops written
     # by others: the edge predicates and the TMA store's TensorMap view stop
     # at the loops' extents, not the destination's (the TMA store's edge
-    # tiles zeroed columns 576-639 of a 640-wide output).
+    # tiles zeroed columns 576-639 of a 640-wide output), a batched output's
+    # as well (the flat edge store's predicate admitted columns 80-95 of
+    # each 96-wide matrix written over N = 80).
     gemm_extents = (
         _destination_gemm_extents(env, tensor, tcgen05_value.output_block_ids)
         if radix_layout is None
@@ -986,7 +989,6 @@ def _codegen_cute_store_tcgen05_tile(
         and not segment_store
         and fragment_epilogue is None
         and grouped_tail_epilogue is None
-        and not leading_passthrough_output
         and tcgen05_value.orientation is not Tcgen05Orientation.NM
         else None
     )

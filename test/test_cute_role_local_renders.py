@@ -33,6 +33,9 @@ from helion._testing import onlyBackends
 from helion._testing.cute_codegen import cpu_bind
 import helion.language as hl
 
+# Renders on a CPU target: the CPU lane runs them without a GPU.
+pytestmark = pytest.mark.cpu_only
+
 if matchesBackends(["cute"]):
     pytest.importorskip("cutlass")
     pytest.importorskip("cutlass.cute")

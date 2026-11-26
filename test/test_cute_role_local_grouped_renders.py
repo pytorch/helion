@@ -64,6 +64,9 @@ from helion._testing import matchesBackends
 from helion._testing import onlyBackends
 from helion._testing import skipUnlessTcgen05RuntimeNPtx
 
+# Renders on a CPU target: the CPU lane runs them without a GPU.
+pytestmark = pytest.mark.cpu_only
+
 grouped_gemm_jagged = import_example("grouped_gemm").grouped_gemm_jagged
 
 if matchesBackends(["cute"]):

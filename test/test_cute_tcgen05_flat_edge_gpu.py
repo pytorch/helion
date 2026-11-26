@@ -267,6 +267,34 @@ class TestCuteTcgen05FlatEdgeGpu(RefEagerTestDisabled, TestCase):
                     bound(lhs, rhs), torch.bmm(lhs, rhs), rtol=1e-2, atol=1e-1
                 )
 
+    def test_ragged_batched_output_wider_than_n_keeps_its_columns(self) -> None:
+        # Matrices 96 columns wide written over N = 80 (the flat edge store)
+        # and over N = 64 (whole tiles, the TMA store): both stores stop at
+        # the GEMM's N, so the columns past it keep their NaN, as eager
+        # leaves them.
+        a = torch.randn(4, 128, 128, device=DEVICE, dtype=torch.bfloat16)
+        config = _flat_config([1, 128, 64, 64])
+        for n in (80, 64):
+            with self.subTest(n=n):
+                b = torch.randn(4, 128, n, device=DEVICE, dtype=torch.bfloat16)
+                out = torch.full(
+                    (4, 128, 96), float("nan"), device=DEVICE, dtype=torch.bfloat16
+                )
+                bound = _bmm_into.bind((a, b, out))
+                self.assertEqual(
+                    "cute.copy(tcgen05_tma_store_atom" in bound.to_code(config),
+                    n == 64,
+                )
+                bound.set_config(config)
+                bound(a, b, out)
+                torch.testing.assert_close(
+                    out[..., :n],
+                    torch.bmm(a.float(), b.float()).to(out.dtype),
+                    rtol=1e-2,
+                    atol=1e-1,
+                )
+                self.assertTrue(bool(out[..., n:].isnan().all()))
+
 
 @onlyBackends(["cute"])
 @skipIfNotCUDA()

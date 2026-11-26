@@ -1884,11 +1884,9 @@ def _c_input_seed_config(state: CuteTcgen05Config) -> Config | None:
             return None
 
     seed_config: dict[str, Any] = {
-        "block_sizes": [
-            TCGEN05_TWO_CTA_BLOCK_M,
-            TCGEN05_TWO_CTA_BLOCK_N,
-            bk,
-        ],
+        "block_sizes": facts._matmul_seed_block_sizes(
+            state, bm=TCGEN05_TWO_CTA_BLOCK_M, bn=TCGEN05_TWO_CTA_BLOCK_N, bk=bk
+        ),
         "pid_type": TCGEN05_TWO_CTA_SEED_PID_TYPE,
         "tcgen05_cluster_m": 2,
         "tcgen05_num_epi_warps": 4,
@@ -1966,11 +1964,9 @@ def _plain_clc_seed_config(
         else 2
     )
     seed_config: dict[str, Any] = {
-        "block_sizes": [
-            TCGEN05_TWO_CTA_BLOCK_M,
-            TCGEN05_TWO_CTA_BLOCK_N,
-            bk,
-        ],
+        "block_sizes": facts._matmul_seed_block_sizes(
+            state, bm=TCGEN05_TWO_CTA_BLOCK_M, bn=TCGEN05_TWO_CTA_BLOCK_N, bk=bk
+        ),
         "pid_type": TCGEN05_TWO_CTA_SEED_PID_TYPE,
         # L2 grouping matters even under the hardware scheduler: CLC
         # preserves the interleaved rasterization order it cancels into,
@@ -2024,7 +2020,9 @@ def _plain_m_pair_seed_config(state: CuteTcgen05Config) -> Config | None:
     if not repair.cluster_m2_bk_is_valid(bk, constraints):
         return None
     seed_config: dict[str, Any] = {
-        "block_sizes": [pair_bm, TCGEN05_TWO_CTA_BLOCK_N, bk],
+        "block_sizes": facts._matmul_seed_block_sizes(
+            state, bm=pair_bm, bn=TCGEN05_TWO_CTA_BLOCK_N, bk=bk
+        ),
         "pid_type": TCGEN05_TWO_CTA_SEED_PID_TYPE,
         "l2_groupings": [TCGEN05_TWO_CTA_SEED_L2_GROUPING],
         "tcgen05_cluster_m": 2,
@@ -2112,7 +2110,9 @@ def _m_pair_deep_seed_configs(state: CuteTcgen05Config) -> list[Config]:
     seeds: list[Config] = []
     for cluster_n in (2, 1):
         seed_config: dict[str, Any] = {
-            "block_sizes": [pair_bm, bn, bk],
+            "block_sizes": facts._matmul_seed_block_sizes(
+                state, bm=pair_bm, bn=bn, bk=bk
+            ),
             "pid_type": TCGEN05_TWO_CTA_SEED_PID_TYPE,
             "l2_groupings": [1],
             "tcgen05_cluster_m": 2,
@@ -2198,11 +2198,9 @@ def _plain_edge_seed_config(state: CuteTcgen05Config) -> Config | None:
     if ab_stages <= 0:
         return None
     seed_config: dict[str, Any] = {
-        "block_sizes": [
-            TCGEN05_TWO_CTA_BLOCK_M,
-            TCGEN05_TWO_CTA_BLOCK_N,
-            bk,
-        ],
+        "block_sizes": facts._matmul_seed_block_sizes(
+            state, bm=TCGEN05_TWO_CTA_BLOCK_M, bn=TCGEN05_TWO_CTA_BLOCK_N, bk=bk
+        ),
         "pid_type": TCGEN05_TWO_CTA_SEED_PID_TYPE,
         "l2_groupings": [TCGEN05_TWO_CTA_SEED_L2_GROUPING],
         "tcgen05_cluster_m": 2,
@@ -2352,11 +2350,9 @@ def _plain_cluster_n2_seed_config(
         # optin); sub-B200 devices keep the known-good ab=2 envelope.
         ab_stages = 3 if state.ab_stages_three_search_constraints is not None else 2
     seed_config: dict[str, Any] = {
-        "block_sizes": [
-            TCGEN05_TWO_CTA_BLOCK_M,
-            TCGEN05_TWO_CTA_BLOCK_N,
-            bk,
-        ],
+        "block_sizes": facts._matmul_seed_block_sizes(
+            state, bm=TCGEN05_TWO_CTA_BLOCK_M, bn=TCGEN05_TWO_CTA_BLOCK_N, bk=bk
+        ),
         "pid_type": TCGEN05_TWO_CTA_SEED_PID_TYPE,
         "l2_groupings": [TCGEN05_TWO_CTA_SEED_L2_GROUPING],
         "tcgen05_cluster_m": 2,
@@ -2587,11 +2583,12 @@ def _clc_aux_tma_narrow_n_seed_config(
     ):
         return None
     seed_config: dict[str, Any] = dict(clc_aux_tma_seed.config)
-    seed_config["block_sizes"] = [
-        TCGEN05_TWO_CTA_BLOCK_M,
-        TCGEN05_TWO_CTA_EDGE_K_TAIL_NARROW_BLOCK_N,
-        TCGEN05_TWO_CTA_EDGE_K_TAIL_NARROW_BLOCK_K,
-    ]
+    seed_config["block_sizes"] = facts._matmul_seed_block_sizes(
+        state,
+        bm=TCGEN05_TWO_CTA_BLOCK_M,
+        bn=TCGEN05_TWO_CTA_EDGE_K_TAIL_NARROW_BLOCK_N,
+        bk=TCGEN05_TWO_CTA_EDGE_K_TAIL_NARROW_BLOCK_K,
+    )
     seed_config["tcgen05_acc_stages"] = TCGEN05_TWO_CTA_EDGE_K_TAIL_NARROW_ACC_STAGES
     seed_config["l2_groupings"] = [TCGEN05_TWO_CTA_EDGE_K_TAIL_NARROW_L2_GROUPING]
     return Config(**seed_config)
@@ -2629,16 +2626,19 @@ def autotune_seed_configs(state: CuteTcgen05Config) -> list[Config]:
         # at ab=6/bk=64/c=2, from 0.980 at the ab=3/bk=128 pick). cuBLAS
         # nvjet uses the same 64x6 staging for this shape class.
         deep_seed_config: dict[str, Any] = dict(plain_clc_seed.config)
-        deep_block_sizes = list(cast("list[int]", deep_seed_config["block_sizes"]))
-        deep_block_sizes[-1] = 64
+        deep_view = facts._matmul_config_view(state, deep_seed_config)
+        assert deep_view is not None
+        blocks, m_index, n_index, k_index = deep_view
+        deep_block_sizes = list(blocks)
+        deep_block_sizes[k_index] = 64
         constraints = state.cluster_m2_search_constraints
         if (
             constraints is not None
             and repair.cluster_m2_bk_is_valid(64, constraints)
             and smem.ab_stages_three_fits(
                 state,
-                bm=deep_block_sizes[0],
-                bn=deep_block_sizes[1],
+                bm=cast("int", deep_block_sizes[m_index]),
+                bn=cast("int", deep_block_sizes[n_index]),
                 bk=64,
                 cluster_m=2,
                 ab_stages=6,

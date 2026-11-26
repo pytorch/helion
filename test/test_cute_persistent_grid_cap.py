@@ -118,6 +118,20 @@ def test_resident_clusters_caps_the_launch_at_the_co_resident_cluster_count() ->
     assert "while tcgen05_role_local_0_work_tile.is_valid_tile:" in source
 
 
+def test_a_one_tile_per_cta_grid_launches_every_cluster() -> None:
+    # fp16 512x4352 on 256x128 pair tiles: 34 2x2 clusters of one tile per CTA
+    # (136 CTAs), whose roles run no scheduler loop, against the 33 a B200
+    # co-schedules: the resident-cluster cap would leave the last cluster's
+    # tiles unwritten, so the launch keeps every cluster.
+    bound = plain_mm._bind_isolated(_args(m=512, n=4352))
+    source = bound.to_code(
+        _config(**{TCGEN05_PERSISTENT_GRID_CAP_CONFIG_KEY: "resident_clusters"})
+    )
+    assert "_helion_cute_cluster_shape = (2, 2, 1)" in source
+    assert "while tcgen05_role_local_0_work_tile.is_valid_tile:" not in source
+    assert "_MAX_ACTIVE_CLUSTERS" not in source
+
+
 def test_sm_pairs_is_the_implicit_default() -> None:
     bound = plain_mm._bind_isolated(_args())
     for config in (_config(), _config(tcgen05_persistent_grid_cap="sm_pairs")):

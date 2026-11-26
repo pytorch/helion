@@ -927,6 +927,39 @@ def plain_edge_pair128_admitted(state: CuteTcgen05Config) -> bool:
     return -(-m // 256) * -(-n // 256) < state.device_sm_count // 2
 
 
+def _block_admits(state: CuteTcgen05Config, axis: int, size: int) -> bool:
+    """Whether the kernel's ``axis`` (0 M, 1 N, 2 K) block size admits
+    ``size``, for a search repair that sets that block size: the search
+    fragment's range holds it, and it is not below the spec's ``min_size``,
+    to which strict normalization raises a smaller block size
+    (``BlockSizeSpec._normalize``). A compiler ceiling under a registered
+    minimum leaves the fragment below that minimum: on bf16 1000x1000x1000,
+    ragged in M and N, the search caps M at 128, so
+    ``hl.register_block_size(256, 256)`` for M gives the fragment [128, 128]
+    over a minimum of 256."""
+    indices = facts._matmul_block_indices(state)
+    if indices is None:
+        return True
+    spec = state.config_spec.block_sizes[indices[axis]]
+    fragment = spec._fragment(state.config_spec)
+    return spec.min_size <= size and fragment.low <= size <= fragment.high
+
+
+def _k_tile_outside_kernel_bounds(state: CuteTcgen05Config, block_k: int) -> bool:
+    """Whether a CTA-pair repair's ``block_k`` lies outside the kernel's K
+    bounds: a plain kernel's K block-size range, or the range a user
+    registered (``hl.register_block_size``) for any kernel. An auxiliary
+    kernel may otherwise leave the compiler's own K ceiling for its validated
+    tile (the narrow CLC aux-TMA tile's 256, above the default K range)."""
+    if not state.aux_kernel_detected and not _block_admits(state, 2, block_k):
+        return True
+    indices = facts._matmul_block_indices(state)
+    if indices is None:
+        return False
+    bounds = state.config_spec.block_sizes[indices[2]].registered_bounds
+    return bounds is not None and not bounds[0] <= block_k <= bounds[1]
+
+
 def _project_edge_pair128_search_config(
     state: CuteTcgen05Config, config: dict[str, object]
 ) -> bool:
@@ -934,8 +967,9 @@ def _project_edge_pair128_search_config(
     on a ``bm <= 128`` tile of the ragged edge family onto its validated
     128x128 pair tile: one N tile per CTA (no N multicast), a K tile the
     family admits and an AB depth that fits the pair's SMEM. False when
-    the family is not admitted (``plain_edge_pair128_admitted``) or the
-    sample is a 256-row tile, which keeps the 256x256 projection.
+    the family is not admitted (``plain_edge_pair128_admitted``), the
+    sample is a 256-row tile, which keeps the 256x256 projection, or the
+    family's K tile lies outside a plain kernel's K bounds.
     """
     if not plain_edge_pair128_admitted(state):
         return False
@@ -955,6 +989,11 @@ def _project_edge_pair128_search_config(
         and cluster_m2_bk_is_valid(bk, constraints)
     ):
         bk = TCGEN05_TWO_CTA_EDGE_K_TAIL_BLOCK_K
+        if _k_tile_outside_kernel_bounds(state, bk):
+            # A kernel whose K bounds leave out the family's K tile
+            # (hl.register_block_size(32, 32) against 128) declines the pair,
+            # as the 256x256 projection keeps the one-CTA tile.
+            return False
     block_sizes[m_index] = 128
     block_sizes[n_index] = 128
     block_sizes[k_index] = bk
@@ -1022,13 +1061,16 @@ def _normalize_split_k(
         k = cast("tuple[int, int, int]", extents)[2]
         valid = (
             # The tile must run the one-CTA tcgen05 MMA (a 256-row flat
-            # tile falls off tcgen05 and could not split).
+            # tile falls off tcgen05, and so does one narrower than the
+            # MMA's N, a small-N GEMM's scalar fallback: neither could
+            # split).
             bm in (64, TCGEN05_ONE_CTA_MAX_BLOCK_M)
             and isinstance(bk, int)
             and bk > 0
             and -(-k // bk) >= split
             and isinstance(bm, int)
             and isinstance(bn, int)
+            and bn >= facts._tcgen05_min_block_n(state)
             and surface.split_k_tiles_supported(state, bm=bm, bn=bn, bk=bk)
         )
     if not valid:
@@ -1202,11 +1244,19 @@ def _fix_cluster_m2_search_config(
             and not isinstance(sampled_bk, bool)
             and cluster_m2_bk_is_valid(sampled_bk, constraints)
         ):
-            block_sizes[k_index] = (
+            fallback_bk = (
                 TCGEN05_TWO_CTA_EDGE_K_TAIL_NARROW_BLOCK_K
                 if is_narrow_clc_aux_tma
                 else TCGEN05_TWO_CTA_EDGE_K_TAIL_BLOCK_K
             )
+            if _k_tile_outside_kernel_bounds(state, fallback_bk):
+                # A kernel whose K bounds leave out the family's K tile
+                # (hl.register_block_size(32, 32) against 128) keeps the
+                # one-CTA tile: the pair would run a K tile the kernel never
+                # allowed (block_sizes [128, 256, 256] for a [32, 32] K).
+                config["tcgen05_cluster_m"] = 1
+                return
+            block_sizes[k_index] = fallback_bk
     bk = block_sizes[k_index]
     if not isinstance(bk, int) or isinstance(bk, bool):
         config["tcgen05_cluster_m"] = 1
@@ -2595,6 +2645,8 @@ def _fix_c_stages_search_config(
         return
     if config.get("tcgen05_c_stages") != TCGEN05_RESIDUAL_FULL_TILE_DEEP_C_STAGES:
         return
+    if _fix_m_pair_column_major_c_stages_search_config(state, config):
+        return
     if not facts._is_default_layout_full_tile_config(state, config):
         _fix_one_cta_c_stages_search_config(state, config)
         return
@@ -2630,6 +2682,53 @@ def _fix_c_stages_search_config(
         has_source_c=state.aux_kernel_detected,
     ):
         config["tcgen05_c_stages"] = 2
+
+
+def _fix_m_pair_column_major_c_stages_search_config(
+    state: CuteTcgen05Config, config: dict[str, object]
+) -> bool:
+    """Demote a four-deep C ring of an M-paired (block_m=512) sample over a
+    column-major output to two where AB + C do not fit; ``True`` where the
+    sample is such a tile (judged here), ``False`` otherwise.
+
+    An M-paired sample keeps its sampled rings (``_fix_cluster_m2_search_config``),
+    and the AB gate admits four 48 KiB stages at bk=64 against the budget
+    that holds back room for a row-major tile's (128, 32) C ring. A
+    column-major output keeps CuTe's (128, 64) subtile (``c_stages_fits``),
+    so 401408x512x128 as its transpose at 512x256x64, four AB stages and
+    four C stages renders a 192 KiB AB ring and a 64 KiB C ring, and libNVVM
+    fails with an empty log; at two C stages (32 KiB) it compiles. A
+    row-major M-paired sample keeps its sampled C ring as before.
+    """
+    pipeline_facts = state.pipeline_smem_facts
+    if pipeline_facts is None or not pipeline_facts.output_column_major:
+        return False
+    layout = config.get(
+        TCGEN05_LAYOUT_STRATEGY_CONFIG_KEY, Tcgen05LayoutStrategy.DEFAULT.value
+    )
+    config_view = facts._matmul_config_view(state, config)
+    if layout != Tcgen05LayoutStrategy.DEFAULT.value or config_view is None:
+        return False
+    block_sizes, m_index, n_index, k_index = config_view
+    if (
+        block_sizes[m_index] != 2 * TCGEN05_TWO_CTA_BLOCK_M
+        or block_sizes[n_index] != TCGEN05_TWO_CTA_BLOCK_N
+        or config.get("tcgen05_cluster_m") != 2
+    ):
+        return False
+    ab_stages = config.get("tcgen05_ab_stages")
+    if type(ab_stages) is not int or not smem.c_stages_fits(
+        state,
+        bm=2 * TCGEN05_TWO_CTA_BLOCK_M,
+        bn=TCGEN05_TWO_CTA_BLOCK_N,
+        bk=cast("int", block_sizes[k_index]),
+        cluster_m=2,
+        ab_stages=ab_stages,
+        c_stages=TCGEN05_RESIDUAL_FULL_TILE_DEEP_C_STAGES,
+        has_source_c=state.aux_kernel_detected,
+    ):
+        config["tcgen05_c_stages"] = 2
+    return True
 
 
 def _fix_one_cta_c_stages_search_config(
@@ -3993,11 +4092,12 @@ def _is_clc_aux_tma_config(state: CuteTcgen05Config, config: dict[str, object]) 
 def _is_clc_aux_tma_narrow_n_request(
     state: CuteTcgen05Config, config: dict[str, object]
 ) -> bool:
-    block_sizes = config.get("block_sizes")
+    view = facts._matmul_config_view(state, config)
+    if view is None:
+        return False
+    block_sizes, m_index, n_index, k_index = view
     if not (
-        isinstance(block_sizes, list)
-        and len(block_sizes) >= 3
-        and block_sizes[1] == TCGEN05_TWO_CTA_EDGE_K_TAIL_NARROW_BLOCK_N
+        block_sizes[n_index] == TCGEN05_TWO_CTA_EDGE_K_TAIL_NARROW_BLOCK_N
         and _is_clc_aux_tma_request(state, config)
     ):
         return False
@@ -4005,8 +4105,8 @@ def _is_clc_aux_tma_narrow_n_request(
     projected_block_sizes = list(block_sizes)
     projected_config["block_sizes"] = projected_block_sizes
     projected_config["pid_type"] = TCGEN05_TWO_CTA_SEED_PID_TYPE
-    projected_block_sizes[0] = TCGEN05_TWO_CTA_BLOCK_M
-    projected_block_sizes[2] = TCGEN05_TWO_CTA_EDGE_K_TAIL_NARROW_BLOCK_K
+    projected_block_sizes[m_index] = TCGEN05_TWO_CTA_BLOCK_M
+    projected_block_sizes[k_index] = TCGEN05_TWO_CTA_EDGE_K_TAIL_NARROW_BLOCK_K
     if (
         state.aux_kernel_detected
         and facts._has_any_matmul_fact_edge_tile(state, projected_config)
@@ -4207,17 +4307,18 @@ def _is_validated_clc_persistence_search_candidate(
         return False
     if not _is_with_scheduler_c_input_config(config):
         return False
-    block_sizes = config.get("block_sizes")
-    if not isinstance(block_sizes, list) or len(block_sizes) < 3:
+    view = facts._matmul_config_view(state, config)
+    if view is None:
         return False
-    if block_sizes[0] != TCGEN05_TWO_CTA_BLOCK_M:
+    block_sizes, m_index, n_index, k_index = view
+    if block_sizes[m_index] != TCGEN05_TWO_CTA_BLOCK_M:
         return False
-    if block_sizes[1] not in (
+    if block_sizes[n_index] not in (
         TCGEN05_TWO_CTA_BLOCK_N,
         TCGEN05_TWO_CTA_EDGE_K_TAIL_NARROW_BLOCK_N,
     ):
         return False
-    is_narrow_n = block_sizes[1] == TCGEN05_TWO_CTA_EDGE_K_TAIL_NARROW_BLOCK_N
+    is_narrow_n = block_sizes[n_index] == TCGEN05_TWO_CTA_EDGE_K_TAIL_NARROW_BLOCK_N
     if is_narrow_n:
         if not facts._has_any_matmul_fact_n_edge_for_block_n(
             state, TCGEN05_TWO_CTA_EDGE_K_TAIL_NARROW_BLOCK_N
@@ -4225,12 +4326,12 @@ def _is_validated_clc_persistence_search_candidate(
             return False
         if config.get(TCGEN05_AUX_LOAD_MODE_CONFIG_KEY) != TCGEN05_AUX_LOAD_MODE_TMA:
             return False
-        if block_sizes[2] not in (
+        if block_sizes[k_index] not in (
             TCGEN05_TWO_CTA_EDGE_K_TAIL_BLOCK_K,
             TCGEN05_TWO_CTA_EDGE_K_TAIL_NARROW_BLOCK_K,
         ):
             return False
-    elif block_sizes[2] != TCGEN05_TWO_CTA_EDGE_K_TAIL_BLOCK_K:
+    elif block_sizes[k_index] != TCGEN05_TWO_CTA_EDGE_K_TAIL_BLOCK_K:
         return False
     if state.config_spec.supports_config_key("indexing"):
         indexing = config.get("indexing")
@@ -4322,11 +4423,14 @@ def _validate_sched_stage_count_config(
         TCGEN05_SCHED_STAGE_COUNTS,
         fix_invalid=fix_invalid,
     )
-    block_sizes = config.get("block_sizes")
+    tiles = facts._matmul_config_tiles(state, config)
     is_full_role_local_two_cta_shape = (
-        isinstance(block_sizes, list)
-        and len(block_sizes) >= 3
-        and block_sizes[0] == TCGEN05_TWO_CTA_BLOCK_M
+        # A batched GEMM (a leading passthrough block ahead of the M/N tile)
+        # keeps the refusal: the two-stage mailbox is exercised on two-axis
+        # GEMMs only, never on a batched CLC schedule.
+        not state.matmul_has_leading_passthrough
+        and tiles is not None
+        and tiles[0] == TCGEN05_TWO_CTA_BLOCK_M
         and config.get("pid_type") == TCGEN05_TWO_CTA_SEED_PID_TYPE
         and config.get("tcgen05_cluster_m", 1) == 2
         and config.get("tcgen05_cluster_n", 1) == 1
@@ -4650,7 +4754,12 @@ def _fix_cluster_m1_persistent_search_config(
         config["pid_type"] = "flat"
         return
     bm = block_sizes[m_index]
-    if isinstance(bm, int) and not isinstance(bm, bool):
+    if (
+        isinstance(bm, int)
+        and not isinstance(bm, bool)
+        and _block_admits(state, 0, TCGEN05_ONE_CTA_MAX_BLOCK_M)
+    ):
+        # (a kernel whose M range leaves out 128 rows keeps its sampled M)
         block_sizes[m_index] = bm = min(bm, TCGEN05_ONE_CTA_MAX_BLOCK_M)
     bn, bk = block_sizes[n_index], block_sizes[k_index]
     if (
@@ -4667,6 +4776,41 @@ def _fix_cluster_m1_persistent_search_config(
         # whose epilogue and rings ``fix_search_config`` judges after the
         # later fixups (``_fix_one_cta_n_edge_rings_search_config``).
         config["pid_type"] = "flat"
+
+
+def _fix_cluster_m1_flat_block_m_search_config(
+    state: CuteTcgen05Config, config: dict[str, object]
+) -> None:
+    """Keep a flat one-CTA sample's M tile within one CTA's MMA (128 rows).
+
+    Two 128-row M subtiles per CTA (``tcgen05_m_subtile_count``) run only on
+    the CtaGroup.TWO pairs or the cp.async-A kernel; a flat one-CTA sample of
+    256 rows takes neither, and renders the SIMT fallback with no MMA::
+
+        _launcher(_helion_plain_mm, (72,), a, b, out, block=(16, 16, 1))
+
+    (bf16 1000x2304x2048 sampled ``block_sizes=[256, ...]``, ``pid_type=
+    'flat'``, ``tcgen05_cluster_m=1``: 107 of 200 random samples while its
+    search covered the flat pipeline only). Projected to 128 rows, the
+    sample keeps the flat one-CTA tcgen05 pipeline. A kernel whose M block
+    size range leaves out 128 rows (``hl.register_block_size(256, 256)``)
+    keeps its sampled M.
+    """
+    if not (
+        state.search_enabled
+        and not state.cp_async_a_provable
+        and config.get("tcgen05_cluster_m", 1) == 1
+        and config.get("pid_type") == "flat"
+        and _block_admits(state, 0, TCGEN05_ONE_CTA_MAX_BLOCK_M)
+    ):
+        return
+    view = facts._matmul_config_view(state, config)
+    if view is None:
+        return
+    block_sizes, m_index, _n_index, _k_index = view
+    bm = block_sizes[m_index]
+    if type(bm) is int and bm > TCGEN05_ONE_CTA_MAX_BLOCK_M:
+        block_sizes[m_index] = TCGEN05_ONE_CTA_MAX_BLOCK_M
 
 
 def _fix_target1_tvm_ffi_search_config(
@@ -5459,8 +5603,12 @@ def normalize_pre_pid_type(
         fix_invalid=fix_invalid,
     )
     if config.get(TCGEN05_LARGE_BN_PROOF_CONFIG_KEY) is True:
+        block_sizes = config.get("block_sizes", [])
         proof_envelope_matches = (
-            tuple(cast("list[int]", config.get("block_sizes", [])))
+            # A plain GEMM: its only block sizes are the M, N and K tiles.
+            isinstance(block_sizes, list)
+            and len(block_sizes) == len(TCGEN05_LARGE_BN_PROOF_BLOCK_SIZES)
+            and facts._matmul_config_tiles(state, config)
             == TCGEN05_LARGE_BN_PROOF_BLOCK_SIZES
             and config.get("tcgen05_cluster_m", 1) == TCGEN05_LARGE_BN_PROOF_CLUSTER_M
             and config.get("pid_type", "flat") == TCGEN05_LARGE_BN_PROOF_PID_TYPE
@@ -5473,9 +5621,10 @@ def normalize_pre_pid_type(
             if fix_invalid:
                 config.pop(TCGEN05_LARGE_BN_PROOF_CONFIG_KEY, None)
             else:
+                bm, bn, bk = TCGEN05_LARGE_BN_PROOF_BLOCK_SIZES
                 raise InvalidConfig(
                     f"{TCGEN05_LARGE_BN_PROOF_CONFIG_KEY}=True requires "
-                    f"block_sizes={list(TCGEN05_LARGE_BN_PROOF_BLOCK_SIZES)}, "
+                    f"the block sizes bm={bm}, bn={bn}, bk={bk} and no other, "
                     f"tcgen05_cluster_m={TCGEN05_LARGE_BN_PROOF_CLUSTER_M}, "
                     f"pid_type={TCGEN05_LARGE_BN_PROOF_PID_TYPE!r}, "
                     "tcgen05_ab_stages=2, tcgen05_acc_stages=1, "
@@ -5794,6 +5943,7 @@ def _fix_search_config_body(
     _fix_aux_edge_search_config(state, config)
     _fix_cluster_m2_search_config(state, config)
     _fix_cluster_m1_persistent_search_config(state, config)
+    _fix_cluster_m1_flat_block_m_search_config(state, config)
     if (
         state.search_enabled
         and state.matmul_input_dtype is not None

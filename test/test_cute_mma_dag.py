@@ -76,6 +76,8 @@ from helion._testing.cute_mma_dag import run_triton
 from helion._testing.cute_mma_dag import tensors
 from helion._testing.cute_sass import cute_launcher_cubins
 from helion._testing.cute_sass import cute_launcher_sass
+from helion._testing.cute_sass import hinted_packets_render  # noqa: F401
+from helion._testing.cute_sass import skip_unless_nvdisasm_runs
 from helion.autotuner.config_fragment import EnumFragment
 from helion.runtime.cute import sass_check
 from helion.runtime.cute.standalone_launcher import _standalone_validate_mma_dag_aliases
@@ -6396,6 +6398,7 @@ def _unhinted_seed_knobs(
     ]
 
 
+@pytest.mark.usefixtures("hinted_packets_render")
 def test_cta_rich_programs_seed_the_top_tiles_measured_neighbours() -> None:
     # The cold autotune of the gated delta rule at s1 (seed 31337) left the
     # ranked ladder for: dqkw at three stages, wy_dL at the full kk tile
@@ -6485,6 +6488,7 @@ def test_cta_rich_programs_seed_the_top_tiles_measured_neighbours() -> None:
     assert dag.mma_dag_seed_variants(facts, dag.mma_dag_seed_configs(facts)) == []
 
 
+@pytest.mark.usefixtures("hinted_packets_render")
 @pytest.mark.parametrize("kernel", ("dqkw", "wy_dL", "dk"), ids=("dqkw", "wy_dL", "dk"))
 def test_every_seed_variant_normalizes_and_renders(kernel: str) -> None:
     bf16 = torch.bfloat16
@@ -7498,6 +7502,7 @@ _WY_FAULT_CONFIG: dict[str, object] = {
 }
 
 
+@pytest.mark.usefixtures("hinted_packets_render")
 def test_the_autotune_fault_config_renders_hinted_packets_behind_a_sass_check() -> None:
     # The config whose kernel died in the kda autotune renders its staged k
     # and v tiles' packets hinted ``L2::cache_hint`` again (the normalizer
@@ -7615,6 +7620,7 @@ def test_the_autotune_fault_config_renders_hinted_packets_behind_a_sass_check() 
     assert "createpolicy.fractional.L2::evict_last" in rows
 
 
+@pytest.mark.usefixtures("hinted_packets_render")
 def test_staged_tiles_carry_the_l2_policy_of_their_slot() -> None:
     # The decode program's loads in program order take the tunable slots k
     # (0), q (1), the weights (2), ``tile_n.index`` (3, 5), ks (4), ke (6);
@@ -7668,6 +7674,7 @@ def test_staged_tiles_carry_the_l2_policy_of_their_slot() -> None:
     assert mixed.count("md_pol_") == 2 + 12
 
 
+@pytest.mark.usefixtures("hinted_packets_render")
 def test_the_normalizer_keeps_the_staged_slots_canonical_and_pins_the_rest() -> None:
     # One value per packet form on the staged slots ("l2_last" for the
     # evict_last hint, "streaming" for evict_first); the side loads' slots,
@@ -7717,6 +7724,7 @@ def test_hinted_packets_need_a_disassembler() -> None:
     # SASS, so nothing hinted exists: the normalizer pins every slot to ""
     # (the render is the plain one) and the seeds carry no hinted twin.
     hinted = _config(1, 64, warps=4, stages=4, load_eviction_policies=["l2_last"] * 7)
+    available = cutedsl_compat.hinted_cp_async_available()
     with patch.object(cutedsl_compat, "nvdisasm_path", return_value=None):
         assert not cutedsl_compat.hinted_cp_async_available()
         # (The seeds are planted at bind time.)
@@ -7732,9 +7740,63 @@ def test_hinted_packets_need_a_disassembler() -> None:
     assert "cp_async_16_l2" not in source and "_helion_cute_sass_checks" not in source
     assert source == _source(bound, _config(1, 64, warps=4, stages=4))
     assert seeds and not any("load_eviction_policies" in c for c in seeds)
-    assert cutedsl_compat.hinted_cp_async_available()
+    assert cutedsl_compat.hinted_cp_async_available() == available
 
 
+def test_hinted_packets_fall_back_where_nvdisasm_cannot_run(tmp_path: Path) -> None:
+    # A disassembler that dies at startup (the aarch64 wheel's binary on the
+    # GB300 hosts) verifies nothing either: the render is the plain one, as
+    # without a disassembler, where the launcher's SASS check used to refuse
+    # the hinted kernel ("could not disassemble: nvdisasm failed (-11)").
+    crashing = tmp_path / "nvdisasm"
+    crashing.write_text("#!/bin/sh\nkill -SEGV $$\n")
+    crashing.chmod(0o755)
+    hinted = _config(1, 64, warps=4, stages=4, load_eviction_policies=["l2_last"] * 7)
+    available = cutedsl_compat.hinted_cp_async_available()
+    cutedsl_compat.nvdisasm_unusable_reason.cache_clear()
+    try:
+        with patch.object(
+            cutedsl_compat, "_nvdisasm_binary", return_value=str(crashing)
+        ):
+            assert cutedsl_compat.nvdisasm_unusable_reason() == (
+                f"{crashing} --version exits with status -11"
+            )
+            assert cutedsl_compat.nvdisasm_path() is None
+            assert not cutedsl_compat.hinted_cp_async_available()
+            bound = _bind_fn(_head_sum_logits_batched, _head_sum_inputs(h=32))
+            with bound.env:
+                normalized = bound.config_spec.normalized_config(hinted)
+            assert normalized.config["load_eviction_policies"] == [""] * 7
+            source = bound.to_code(normalized)
+    finally:
+        cutedsl_compat.nvdisasm_unusable_reason.cache_clear()
+    assert "cp_async_16_l2" not in source and "_helion_cute_sass_checks" not in source
+    assert source == _source(bound, _config(1, 64, warps=4, stages=4))
+    assert cutedsl_compat.hinted_cp_async_available() == available
+
+
+def test_a_disassembler_that_hangs_counts_as_unusable(tmp_path: Path) -> None:
+    # The probe runs on the compile path (the normalizer, the seeds), so it
+    # is bounded: a binary that does not answer is no disassembler, rather
+    # than a compile that never returns.
+    hanging = tmp_path / "nvdisasm"
+    hanging.write_text("#!/bin/sh\nexec sleep 30\n")
+    hanging.chmod(0o755)
+    cutedsl_compat.nvdisasm_unusable_reason.cache_clear()
+    try:
+        with (
+            patch.object(cutedsl_compat, "_nvdisasm_binary", return_value=str(hanging)),
+            patch.object(cutedsl_compat, "_NVDISASM_PROBE_TIMEOUT_S", 0.2),
+        ):
+            assert cutedsl_compat.nvdisasm_unusable_reason() == (
+                f"{hanging} --version does not answer within 0.2 s"
+            )
+            assert cutedsl_compat.nvdisasm_path() is None
+    finally:
+        cutedsl_compat.nvdisasm_unusable_reason.cache_clear()
+
+
+@pytest.mark.usefixtures("hinted_packets_render")
 def test_the_first_warp_seed_has_an_l2_evict_last_twin() -> None:
     # Right behind the first warp seed (and its derived-route / side-load
     # twins), the same tile with the staged operands' slots at "l2_last";
@@ -7784,6 +7846,7 @@ def test_the_first_warp_seed_has_an_l2_evict_last_twin() -> None:
     assert seeds[2]["block_sizes"] == seeds[0]["block_sizes"]
 
 
+@pytest.mark.usefixtures("hinted_packets_render")
 def test_ring_and_zero_filled_packets_carry_the_policy_too() -> None:
     # A K-loop recurrence: the ring's packets of every iteration name the
     # one policy word bound ahead of the loop.  A ragged root tile: the
@@ -12597,6 +12660,7 @@ def test_tf32_bf16_dot_checks_rounding_intervals() -> None:
 @_COMPILED_PATH
 @pytest.mark.cuda
 def test_the_anchored_wy_autotune_fault_config_is_verified_before_it_runs() -> None:
+    skip_unless_nvdisasm_runs()
     # The candidate that died in the kda autotune renders hinted packets
     # again, behind the launcher's SASS check: on the DSL's current
     # assembler the check refuses the kernel before any launch (its split
@@ -12666,6 +12730,7 @@ def test_the_anchored_wy_autotune_fault_config_is_verified_before_it_runs() -> N
 def test_l2_hinted_operand_packets_are_a_pure_cache_hint(
     policies: tuple[str, str], words: tuple[str, ...]
 ) -> None:
+    skip_unless_nvdisasm_runs()
     # ``load_eviction_policies`` on the staged operands' slots (k: 0, q: 1)
     # puts an L2 cache policy on their cp.async packets: the same bits as
     # the plain kernel and as Triton over eight launches.  The launcher's
@@ -12696,6 +12761,7 @@ def test_l2_hinted_operand_packets_are_a_pure_cache_hint(
 @_COMPILED_PATH
 @pytest.mark.cuda
 def test_l2_hinted_zero_filled_packets_match_torch() -> None:
+    skip_unless_nvdisasm_runs()
     # The ragged root tile's zero-filled packets carry the policy behind
     # their byte count; integer inputs: exact.
     fn = _ragged_rows_summed
@@ -12716,6 +12782,7 @@ def test_l2_hinted_zero_filled_packets_match_torch() -> None:
 def test_the_hinted_decode_kernels_sass_has_no_collision_under_several_configs() -> (
     None
 ):
+    skip_unless_nvdisasm_runs()
     # The SASS check read against the assembler's actual output for the
     # indexer decode program at the tiles the campaign reaches (one, four
     # and eight warps; 16 / 32 / 64 keys): every uniform register an LDGSTS

@@ -211,7 +211,18 @@ def emit_d_tma(ctx: HostWrapperContext, plan: dict[str, object]) -> None:
         )
     elif bool(plan.get("d_leading_passthrough")):
         d_tensor_name = f"{kernel_args[0]}_d_tma"
-        ctx.append_permuted_cute_tensor_view(d_tensor_name, d_idx, (1, 2, 0))
+        if (d_extents := plan.get("d_extents")) is None:
+            ctx.append_permuted_cute_tensor_view(d_tensor_name, d_idx, (1, 2, 0))
+        else:
+            # A batched destination larger than the GEMM: its (M, N, L) view
+            # stops at the GEMM's (M, N), as a rank-2 one's does below.
+            rows, cols = cast("list[int]", d_extents)
+            ctx.body.append(
+                f"    {d_tensor_name} = cute.make_tensor(arg{d_idx}.iterator, "
+                f"layout=cute.make_layout(({rows}, {cols}, arg{d_idx}_shape0), "
+                f"stride=(arg{d_idx}_stride1, arg{d_idx}_stride2, "
+                f"arg{d_idx}_stride0)))"
+            )
     elif (d_extents := plan.get("d_extents")) is not None:
         # A destination larger than the GEMM: the TensorMap clips the edge
         # tiles at the GEMM's (M, N), not at the destination's shape.

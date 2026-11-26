@@ -4147,6 +4147,10 @@ class BlockSizeSpec(_PowerOfTwoBlockIdItem):
         # (``update_hint``). Fused surfaces whose tiles overshoot the
         # dimension (ragged flash rows) check their pins against this.
         self.declared_max_size: int | None = None
+        # The (min, max) range ``hl.register_block_size`` gave this block size,
+        # or None: a search repair that may leave the compiler's own ceilings
+        # (an auxiliary kernel's validated tile) still keeps a user's range.
+        self.registered_bounds: tuple[int, int] | None = None
         # Outer block_id whose tile extent caps this block's size in normalize().
         self.bounded_by_block_id: int | None = bounded_by_block_id
         # The one block size a fused lowering's envelope admits

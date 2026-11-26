@@ -360,10 +360,11 @@ def test_disassemble_needs_the_disassembler() -> None:
 
 def test_the_bundled_nvdisasm_is_found() -> None:
     # Helion's cute extra installs the nvidia-cuda-nvdisasm wheel; where it is
-    # installed the probe finds its binary (the environment this repository
-    # tests the cute backend in).
+    # installed the lookup finds its binary (the environment this repository
+    # tests the cute backend in), whether or not it runs: on the aarch64
+    # GB300 hosts it dies at startup and nvdisasm_path() is None.
     pytest.importorskip("cutlass")
     # A system toolkit binary must not hide a missing package dependency.
     assert importlib.metadata.distribution("nvidia-cuda-nvdisasm").version
-    path = cutedsl_compat.nvdisasm_path()
+    path = cutedsl_compat._nvdisasm_binary()
     assert path is not None and path.endswith("nvdisasm")

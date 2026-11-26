@@ -2375,9 +2375,10 @@ def _helion__selected_kernel(work_tile_metadata, a_packed, b_grouped, out, work_
         tcgen05_sched_pipeline.consumer_wait(tcgen05_sched_pipeline_consumer_state)
         cute.arch.fence_view_async_shared()
         cute.arch.sync_warp()
-        tcgen05_role_local_0_valid = tcgen05_work_tile_smem[cutlass.Int32(3)] != cutlass.Int32(0)
+        tcgen05_role_local_0_mailbox = tcgen05_work_tile_smem.load()
+        tcgen05_role_local_0_valid = tcgen05_role_local_0_mailbox[3] != cutlass.Int32(0)
         while tcgen05_role_local_0_valid:
-            tcgen05_role_local_0_runtime_direct_linear_idx = tcgen05_work_tile_smem[cutlass.Int32(2)]
+            tcgen05_role_local_0_runtime_direct_linear_idx = tcgen05_role_local_0_mailbox[2]
             tcgen05_sched_pipeline.consumer_release(tcgen05_sched_pipeline_consumer_state)
             tcgen05_sched_pipeline_consumer_state.advance()
             cute.arch.sync_warp()
@@ -2413,7 +2414,8 @@ def _helion__selected_kernel(work_tile_metadata, a_packed, b_grouped, out, work_
             tcgen05_sched_pipeline.consumer_wait(tcgen05_sched_pipeline_consumer_state)
             cute.arch.fence_view_async_shared()
             cute.arch.sync_warp()
-            tcgen05_role_local_0_valid = tcgen05_work_tile_smem[cutlass.Int32(3)] != cutlass.Int32(0)
+            tcgen05_role_local_0_mailbox = tcgen05_work_tile_smem.load()
+            tcgen05_role_local_0_valid = tcgen05_role_local_0_mailbox[3] != cutlass.Int32(0)
         tcgen05_sched_pipeline.consumer_release(tcgen05_sched_pipeline_consumer_state)
         tcgen05_sched_pipeline_consumer_state.advance()
         cute.arch.sync_warp()
@@ -2421,9 +2423,10 @@ def _helion__selected_kernel(work_tile_metadata, a_packed, b_grouped, out, work_
         tcgen05_sched_pipeline.consumer_wait(tcgen05_sched_pipeline_consumer_state)
         cute.arch.fence_view_async_shared()
         cute.arch.sync_warp()
-        tcgen05_role_local_1_valid = tcgen05_work_tile_smem[cutlass.Int32(3)] != cutlass.Int32(0)
+        tcgen05_role_local_1_mailbox = tcgen05_work_tile_smem.load()
+        tcgen05_role_local_1_valid = tcgen05_role_local_1_mailbox[3] != cutlass.Int32(0)
         while tcgen05_role_local_1_valid:
-            tcgen05_role_local_1_runtime_direct_linear_idx = tcgen05_work_tile_smem[cutlass.Int32(2)]
+            tcgen05_role_local_1_runtime_direct_linear_idx = tcgen05_role_local_1_mailbox[2]
             tcgen05_sched_pipeline.consumer_release(tcgen05_sched_pipeline_consumer_state)
             tcgen05_sched_pipeline_consumer_state.advance()
             cute.arch.sync_warp()
@@ -2476,7 +2479,8 @@ def _helion__selected_kernel(work_tile_metadata, a_packed, b_grouped, out, work_
             tcgen05_sched_pipeline.consumer_wait(tcgen05_sched_pipeline_consumer_state)
             cute.arch.fence_view_async_shared()
             cute.arch.sync_warp()
-            tcgen05_role_local_1_valid = tcgen05_work_tile_smem[cutlass.Int32(3)] != cutlass.Int32(0)
+            tcgen05_role_local_1_mailbox = tcgen05_work_tile_smem.load()
+            tcgen05_role_local_1_valid = tcgen05_role_local_1_mailbox[3] != cutlass.Int32(0)
         tcgen05_sched_pipeline.consumer_release(tcgen05_sched_pipeline_consumer_state)
         tcgen05_sched_pipeline_consumer_state.advance()
         cute.arch.sync_warp()
@@ -2485,9 +2489,10 @@ def _helion__selected_kernel(work_tile_metadata, a_packed, b_grouped, out, work_
         tcgen05_sched_pipeline.consumer_wait(tcgen05_sched_pipeline_consumer_state)
         cute.arch.fence_view_async_shared()
         cute.arch.sync_warp()
-        tcgen05_role_local_2_valid = tcgen05_work_tile_smem[cutlass.Int32(3)] != cutlass.Int32(0)
+        tcgen05_role_local_2_mailbox = tcgen05_work_tile_smem.load()
+        tcgen05_role_local_2_valid = tcgen05_role_local_2_mailbox[3] != cutlass.Int32(0)
         while tcgen05_role_local_2_valid:
-            tcgen05_role_local_2_runtime_direct_linear_idx = tcgen05_work_tile_smem[cutlass.Int32(2)]
+            tcgen05_role_local_2_runtime_direct_linear_idx = tcgen05_role_local_2_mailbox[2]
             tcgen05_sched_pipeline.consumer_release(tcgen05_sched_pipeline_consumer_state)
             tcgen05_sched_pipeline_consumer_state.advance()
             cute.arch.sync_warp()
@@ -2569,7 +2574,8 @@ def _helion__selected_kernel(work_tile_metadata, a_packed, b_grouped, out, work_
             tcgen05_sched_pipeline.consumer_wait(tcgen05_sched_pipeline_consumer_state)
             cute.arch.fence_view_async_shared()
             cute.arch.sync_warp()
-            tcgen05_role_local_2_valid = tcgen05_work_tile_smem[cutlass.Int32(3)] != cutlass.Int32(0)
+            tcgen05_role_local_2_mailbox = tcgen05_work_tile_smem.load()
+            tcgen05_role_local_2_valid = tcgen05_role_local_2_mailbox[3] != cutlass.Int32(0)
         tcgen05_sched_pipeline.consumer_release(tcgen05_sched_pipeline_consumer_state)
         tcgen05_sched_pipeline_consumer_state.advance()
         cute.arch.sync_warp()

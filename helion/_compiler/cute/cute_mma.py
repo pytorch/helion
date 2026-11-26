@@ -1371,9 +1371,9 @@ def host_function_matmul_output_matches_extents(
     exactly the GEMM's static (M, N) extents.
 
     Gates the persistent one-CTA N-edge tiles (``one_cta_n_edge_tiles``),
-    measured on exact-shape outputs only. (A larger rank-2 destination's
-    edge stores, row- or column-major, stop at the GEMM's extents,
-    ``store_epilogue._destination_gemm_extents``.)
+    measured on exact-shape outputs only. (A larger destination's edge
+    stores, rank-2 row- or column-major or batched, stop at the GEMM's
+    extents, ``store_epilogue._destination_gemm_extents``.)
     """
     device_ir = host_function.device_ir
     with _host_function_tma_proof_scope(env, host_function):
@@ -18319,7 +18319,9 @@ def _tcgen05_clc_throttle_credit(
     tile; the scheduler warp (leader CTA only when the cluster has several
     CTAs, so the credit is gated the same way) syncs on it before every CLC
     query.  Credits and queries alternate strictly: the warp cannot start tile
-    k+1 before the record the k+1-th query fetched exists.  ``None`` when the
+    k+1 before the record the k+1-th query fetched exists.  (A swizzle-padded
+    grid's scheduler queries past a padding slot without a credit: it
+    publishes no tile there, so no warp starts one.)  ``None`` when the
     kernel has no throttle barrier.
     """
     sched_plan = df.cute_state.tcgen05.sched_pipeline_plan

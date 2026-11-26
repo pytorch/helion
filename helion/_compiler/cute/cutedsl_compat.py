@@ -18,6 +18,7 @@ from dataclasses import dataclass
 from functools import lru_cache
 import importlib.metadata
 import logging
+import subprocess
 
 from packaging.version import InvalidVersion
 from packaging.version import Version
@@ -224,8 +225,8 @@ def emit_producer_tail_tma_umma(
 
 
 @lru_cache(maxsize=1)
-def nvdisasm_path() -> str | None:
-    """The ``nvdisasm`` binary the SASS checks disassemble with: the one the
+def _nvdisasm_binary() -> str | None:
+    """The ``nvdisasm`` binary installed here: the one the
     ``nvidia-cuda-nvdisasm`` wheel ships (installed by Helion's cute extra
     and installer through the DSL libraries' SASS extra), else one on ``PATH`` or under
     ``CUDA_HOME``; None when there is none."""
@@ -251,6 +252,59 @@ def nvdisasm_path() -> str | None:
         if os.path.isfile(candidate):
             return candidate
     return None
+
+
+# Seconds ``nvdisasm --version`` may take (it answers in milliseconds).
+_NVDISASM_PROBE_TIMEOUT_S = 30
+
+
+@lru_cache(maxsize=1)
+def nvdisasm_unusable_reason() -> str | None:
+    """Why the SASS checks have no disassembler here (None: they have one).
+
+    An installed binary counts only if it runs: the aarch64 build of the CUDA
+    13 wheel's ``nvidia/cu13/bin/nvdisasm`` dies at startup on the GB300
+    hosts, whatever it is asked,
+
+        $ .../site-packages/nvidia/cu13/bin/nvdisasm --version
+        Segmentation fault                       # exit status 139
+
+    and with it taken for a disassembler, every hinted kernel was refused at
+    its launch instead of rendering plain (``hinted_cp_async_available``):
+
+        CuteSassCheckFailed: The SASS check hinted_cp_async refused kernel
+        '_helion__head_sum_logits_batched': could not disassemble: nvdisasm
+        failed (-11)
+    """
+    tool = _nvdisasm_binary()
+    if tool is None:
+        return "no nvdisasm binary"
+    try:
+        # (bounded: the probe runs on the compile path, the normalizer's and
+        # the seeds', where a disassembler that hangs would hang every
+        # compile that reaches mma_dag)
+        result = subprocess.run(
+            [tool, "--version"],
+            capture_output=True,
+            check=False,
+            timeout=_NVDISASM_PROBE_TIMEOUT_S,
+        )
+    except OSError as error:
+        return f"{tool} does not start: {error}"
+    except subprocess.TimeoutExpired:
+        return f"{tool} --version does not answer within {_NVDISASM_PROBE_TIMEOUT_S} s"
+    if result.returncode != 0:
+        return f"{tool} --version exits with status {result.returncode}"
+    return None
+
+
+def nvdisasm_path() -> str | None:
+    """The ``nvdisasm`` binary the SASS checks disassemble with
+    (``_nvdisasm_binary``), or None when there is none or it does not run
+    (``nvdisasm_unusable_reason``)."""
+    if nvdisasm_unusable_reason() is not None:
+        return None
+    return _nvdisasm_binary()
 
 
 def hinted_cp_async_available() -> bool:
