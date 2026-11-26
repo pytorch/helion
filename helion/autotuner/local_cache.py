@@ -146,6 +146,29 @@ def _search_policy_hash(
     cute_flash_search_enabled: bool,
     explicit_aot: bool = False,
 ) -> str:
+    """``_search_and_timing_policy_hash``, and whether the search follows its
+    L2 flushes with the sweep (``autotune_l2_flush_sweep``): such a search
+    ranks hinted candidates without the L2 lines their earlier calls pinned,
+    so its winners get keys of their own, which neither a search without the
+    sweep reads nor it reads theirs. Every key of a search without it stays
+    what it was, and so do the stable identifiers of explicit AOT artifacts.
+    """
+    digest = _search_and_timing_policy_hash(
+        autotuner,
+        cute_flash_search_enabled=cute_flash_search_enabled,
+        explicit_aot=explicit_aot,
+    )
+    if explicit_aot or not autotuner.settings.autotune_l2_flush_sweep:
+        return digest
+    return _hash_search_policy(b"helion.l2_flush_sweep.v1\0" + digest.encode())
+
+
+def _search_and_timing_policy_hash(
+    autotuner: BaseSearch,
+    *,
+    cute_flash_search_enabled: bool,
+    explicit_aot: bool = False,
+) -> str:
     """Hash the effective clone, accuracy, search and timing policy.
 
     CuTe flash keys cover the full search policy. Other kernels also key an

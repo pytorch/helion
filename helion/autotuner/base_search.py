@@ -80,6 +80,7 @@ from .benchmarking import final_selection_second_regime
 from .benchmarking import final_selection_target_regime
 from .benchmarking import interleaved_bench
 from .benchmarking import kernel_timer_available
+from .benchmarking import l2_flush_sweep
 from .benchmarking import mirrored_bench_generic
 from .benchmarking import untraced_regime
 from .compiler_refinement import MAX_REFINEMENT_TRIALS
@@ -1250,6 +1251,14 @@ class BaseSearch(BaseAutotuner):
             return config
 
     def _autotune_with_logging(self, *, skip_cache: bool) -> Config:
+        # Every timer of the search, from the reference baseline's to the
+        # final selection's, follows its L2 flushes with the sweep where the
+        # setting asks (in this process; the benchmark worker's jobs carry
+        # the block, ``LocalBenchmarkProvider``).
+        with l2_flush_sweep(self.settings.autotune_l2_flush_sweep):
+            return self._autotune_and_log(skip_cache=skip_cache)
+
+    def _autotune_and_log(self, *, skip_cache: bool) -> Config:
         self._skip_cache = skip_cache
         # Constructing the benchmark provider compiles the reference baseline.
         with _searching_candidates():

@@ -25,6 +25,7 @@ from .benchmark_provider import _format_selected_multi_shape_measurement
 from .benchmark_provider import _has_valid_multi_shape_measurement
 from .benchmark_provider import _materialize_multi_shape_config
 from .benchmark_provider import _MultiShapeAutotuneArgs
+from .benchmarking import l2_flush_sweep
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -685,15 +686,17 @@ class AutotuneCacheBase(BaseAutotuner, abc.ABC, metaclass=AutotuneCacheMeta):
         rebench_autotuner = self._autotuner_factory()
         # ``_prepare`` constructs the ``benchmark_provider``; ``setup`` /
         # ``cleanup`` bracket the provider's lifetime. Mirror the lifecycle
-        # ``BaseSearch.autotune`` runs internally.
-        rebench_autotuner._prepare()
-        rebench_autotuner.benchmark_provider.setup()
-        try:
-            results = rebench_autotuner.benchmark_batch(
-                configs, desc="Best-of-K rebench"
-            )
-        finally:
-            rebench_autotuner.benchmark_provider.cleanup()
+        # ``BaseSearch.autotune`` runs internally, its timers' L2 flush
+        # sweep included (``autotune_l2_flush_sweep``).
+        with l2_flush_sweep(rebench_autotuner.settings.autotune_l2_flush_sweep):
+            rebench_autotuner._prepare()
+            rebench_autotuner.benchmark_provider.setup()
+            try:
+                results = rebench_autotuner.benchmark_batch(
+                    configs, desc="Best-of-K rebench"
+                )
+            finally:
+                rebench_autotuner.benchmark_provider.cleanup()
         return [r.perf for r in results]
 
 
