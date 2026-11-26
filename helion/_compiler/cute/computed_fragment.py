@@ -68,7 +68,10 @@ from .fragment_shared_arena import plan_shared_arena
 from .full_reduction_owner import fragment_store_destinations
 from .full_reduction_owner import requires_full_reduction_owner
 from .gathered_bf16_dot import gathered_bf16_dot
+from .gathered_launch import GATHERED_SEED_THREADS
 from .gathered_launch import gathered_launch_compatible
+from .gathered_softmax import emit_gathered_softmax_preamble
+from .gathered_softmax import gathered_softmax_page
 from .handler_ops import integer_to_float_expr
 from .handler_ops import scalar_value_dtype
 from .launch_shape import LINEAR_THREAD
@@ -94,6 +97,7 @@ from .scan_analysis import completed_scan_plans
 from .selection.ordered_selection import is_ordered_selection
 from .selection.ordered_selection import ordered_selection_args
 from .selection.ordered_selection import topk_outputs_keep_sort_lanes
+from .split_weighted_merge import emit_split_weighted_merge
 from .static_indexing import shape_only_indices
 from .static_indexing import static_tensor_index
 
@@ -652,8 +656,21 @@ class FragmentCompiler(
         values: dict[Node, object],
         *,
         output_indices: frozenset[int] | None = None,
+        private_loop_outputs: dict[int, tuple[Node, Fragment]] | None = None,
     ) -> object:
         from .producer_cache import producer_cache_candidates
+
+        if output_indices is None and self.df.config.get(
+            "cute_fragment_half_mma", False
+        ):
+            fused = gathered_softmax_page(self, graph, values, private_loop_outputs)
+            if fused is not None:
+                return fused
+        if private_loop_outputs is not None:
+            # Ordinary graph evaluation does not promise that all readers of
+            # an incoming carry finished before a returned fragment aliases it.
+            # Keep its established parallel-assignment/synchronization path.
+            private_loop_outputs.clear()
 
         cache_nodes = (
             producer_cache_candidates(graph, self.shape)
@@ -2241,6 +2258,9 @@ def codegen_computed_fragment_root(cg: GenerateAST) -> bool:
                 "a planned root cannot share a computed fragment schedule"
             )
         return False
+    if state.lanes.gathered_phase_threads == GATHERED_SEED_THREADS:
+        if emit_split_weighted_merge(cg):
+            return True
     ir = cg.host_function.device_ir
     multiple_roots = len(ir.root_ids) != 1
     selection_required = False
@@ -2708,6 +2728,17 @@ def codegen_computed_fragment_root(cg: GenerateAST) -> bool:
             compiler.synchronize()
     if compiler.warp_producer_recorder is not None:
         compiler.warp_producer_recorder.lower(body)
+    if (
+        gathered_region is not None
+        and compiler.df.config.get("cute_gathered_page_pipeline")
+        and not compiler.used_async_gathered_page
+    ):
+        # A different gathered-dot fold is not evidence that the configured
+        # complete page pipeline ran. Do not time scalar or direct folds
+        # under an explicit async configuration.
+        raise exc.InvalidConfig(
+            "the certified producer did not emit the configured asynchronous gathered page"
+        )
     capacity = target_facts.per_cta_smem_capacity_bytes(compiler.env.device)
     if (
         required_owner
@@ -2755,8 +2786,10 @@ def codegen_computed_fragment_root(cg: GenerateAST) -> bool:
             "shared producer caches require a known shared memory capacity"
         )
     if capacity and compiler.smem_bytes > capacity:
-        if required_owner:
-            # These roots have no other owner: the config is invalid.
+        if required_owner or compiler.used_async_gathered_page:
+            # A required owner has no fallback; an explicitly selected async
+            # program must also fit its actual allocation rather than silently
+            # timing a scalar fallback under the pipeline's config.
             raise exc.InvalidConfig(
                 f"computed fragments need {compiler.smem_bytes} shared bytes, exceeding {capacity}"
             )
@@ -2809,6 +2842,8 @@ def codegen_computed_fragment_root(cg: GenerateAST) -> bool:
         )
     elif gathered_region is not None:
         cg.device_function.cute_state.lanes.gathered_phase_threads = compiler.threads
+    if compiler.needs_gathered_softmax_runtime:
+        emit_gathered_softmax_preamble(cg)
     compiler.emit_mma_preamble()
     allocations = compiler.allocations()
     if compiler.shared_arena_plan is not None:

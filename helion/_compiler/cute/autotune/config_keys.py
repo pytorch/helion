@@ -129,6 +129,8 @@ CUTE_FRAGMENT_KEYS: tuple[str, ...] = (
     "cute_fragment_reduction",
     "cute_fp32_dot",
     "cute_fragment_half_mma",
+    "cute_gathered_page_pipeline",
+    "cute_gathered_page_stages",
     "cute_fragment_threads",
     "cute_fragment_register_loads",
     "cute_fragment_producer_cache",

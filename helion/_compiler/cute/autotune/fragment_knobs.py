@@ -1659,6 +1659,7 @@ def _half_mma_roots(env: CompileEnvironment, ir: DeviceIR) -> RootFacts:
     from ..analysis.gathered_bf16_mma import gathered_phase_region
     from ..computed_fragment import computed_fragment_supported
     from .heuristics.cute_gathered_bf16_mma import gathered_phase_carrier
+    from .heuristics.cute_gathered_bf16_mma import streaming_phase_carriers
 
     roots = {
         region.root
@@ -1672,7 +1673,7 @@ def _half_mma_roots(env: CompileEnvironment, ir: DeviceIR) -> RootFacts:
         carrier = gathered_phase_carrier(env, ir, region)
         if carrier is not None:
             roots.add(ir.root_ids[0])
-            carriers = (carrier,)
+            carriers = (carrier, *streaming_phase_carriers(env, ir, carrier, region))
             return RootFacts(
                 frozenset(roots),
                 (
@@ -1681,6 +1682,15 @@ def _half_mma_roots(env: CompileEnvironment, ir: DeviceIR) -> RootFacts:
                         frozenset(tuple(c.num_threads) for c in carriers),
                     ),
                     ("cute_gathered_phase_carriers", tuple(c.config for c in carriers)),
+                    (
+                        "cute_gathered_page_value_bid",
+                        ir.grid_block_ids[0][1]
+                        if any(
+                            c.config.get("cute_gathered_page_pipeline")
+                            for c in carriers
+                        )
+                        else None,
+                    ),
                 ),
             )
     return RootFacts(frozenset(roots))

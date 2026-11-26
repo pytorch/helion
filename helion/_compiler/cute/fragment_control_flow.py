@@ -373,7 +373,19 @@ class FragmentControlFlow(FragmentContext):
                 ],
             ),
         ):
-            results = self.graph(graph.graph, body_inputs)
+            # A newly copied loop carry is private to this invocation. A
+            # specialized graph may update it in place only if it proves the
+            # matching input/output dependence and coordinate ownership itself.
+            private_outputs = {
+                i: (placeholders[slot], carries[i])
+                for i, slot in carry_slots.items()
+                if slot in copied_slots
+            }
+            results = self.graph(
+                graph.graph,
+                body_inputs,
+                private_loop_outputs=private_outputs,
+            )
             assert isinstance(results, list)
             # Snapshot every value that reads a carry before writing any carry.
             # Disjoint recipes can write directly: none of their inputs changes
@@ -381,15 +393,25 @@ class FragmentControlFlow(FragmentContext):
             snapshots = []
             self.held.extend([results, snapshots])
             destinations = self.referenced_buffers(carries)
-            for result in results:
+            in_place = {
+                i for i, (_, target) in private_outputs.items() if results[i] is target
+            }
+            for i, result in enumerate(results):
                 value = cast("Fragment", result)
+                if i in in_place:
+                    # The certified native transition has already written this
+                    # result to its private target and synchronized the CTA.
+                    snapshots.append(value)
+                    continue
                 snapshots.append(
                     self.materialize(value, copy=True)
                     if self.referenced_buffers([value]) & destinations
                     and id(value) not in self.local_logical_sizes
                     else value
                 )
-            for target, source in zip(carries, snapshots, strict=True):
+            for i, (target, source) in enumerate(zip(carries, snapshots, strict=True)):
+                if i in in_place:
+                    continue
                 if id(target) in self.local_logical_sizes:
                     if source is not target:
                         raise exc.InvalidConfig(

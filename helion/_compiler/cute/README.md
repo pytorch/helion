@@ -543,3 +543,10 @@ Module docstrings carry a `Role:` line using one of these words:
 * **Known test gaps.** `test/test_cute_tcgen05_split_k_search.py::test_sampled_splits_render`
   is unseeded; the rank-1 recurrence kernels do not bind on CPU, so the CPU
   render dump never covers them.
+
+The gathered BF16 online reduction recognizes the base-2, FP32 softmax
+recurrence with an explicit negative-infinity identity and a signed
+per-row position limit. Equivalently spelled or differently rounded
+recurrences (natural exponentials, reordered masking, other dot precision)
+use normal lowering. The two-pass split combiner also proves both masks,
+loop-carried values, and nonaliasing output before sharing weights.

@@ -92,6 +92,8 @@ from ..fragment_mma_dot import FRAGMENT_MMA_KEY
 from ..fragment_mma_dot import FRAGMENT_MMA_ROW_THREADS
 from ..gathered_launch import GATHERED_SEED_THREADS
 from ..gathered_launch import gathered_launch_compatible
+from ..gathered_panel_layout import RING_STAGES
+from ..gathered_panel_layout import VALUE_PANEL
 from ..packet_store_policy import store_policy_reaches_a_packet
 from ..pdl_release import CUTE_PDL_CAPTURE_RELEASE_CHOICES
 from ..pdl_release import CUTE_PDL_RELEASE_CHOICES
@@ -397,6 +399,25 @@ _FRAGMENT_OPTIONS: dict[str, _FragmentOption] = {
         lambda spec, config: spec.cute_fp32_dot_root_ids,
         "an fp32 hl.dot in a computed fragment under tf32 dot precision",
         ("simt", "tf32_mma"),
+    ),
+    "cute_gathered_page_stages": _FragmentOption(
+        lambda spec, config: config.get("cute_gathered_page_pipeline") is True,
+        "a 16-byte-aligned asynchronous gathered page",
+        RING_STAGES,
+    ),
+    "cute_gathered_page_pipeline": _FragmentOption(
+        lambda spec, config: (
+            config.get("cute_fragment_half_mma") is True
+            and (bid := spec.cute_gathered_page_value_bid) is not None
+            and isinstance(sizes := config.get("block_sizes"), (list, tuple))
+            and spec.block_sizes.config_get(list(sizes), bid) == VALUE_PANEL
+            and gathered_launch_compatible(
+                config,
+                actual_threads=_fragment_threads(config),
+                required_threads=GATHERED_SEED_THREADS,
+            )
+        ),
+        "a certified, 16-byte aligned gathered BF16 page and its four-warp panel geometry",
     ),
     "cute_fragment_half_mma": _FragmentOption(
         lambda spec, config: spec.cute_fragment_half_mma_root_ids,
@@ -3284,6 +3305,12 @@ def normalize_knobs(
             )
         ):
             config.pop("cute_fragment_half_mma", None)
+    _normalize_fragment_option(
+        config_spec, config, "cute_gathered_page_pipeline", fix_invalid=fix_invalid
+    )
+    _normalize_fragment_option(
+        config_spec, config, "cute_gathered_page_stages", fix_invalid=fix_invalid
+    )
     _normalize_cute_fragment_threads(config_spec, config, fix_invalid=fix_invalid)
     _normalize_fragment_option(
         config_spec, config, "cute_fragment_producer_cache", fix_invalid=fix_invalid
@@ -4525,6 +4552,12 @@ def cute_flat_fields(
             if enabled
         }
     )
+    if any(
+        c.get("cute_gathered_page_pipeline")
+        for c in config_spec.cute_gathered_phase_carriers
+    ):
+        fields["cute_gathered_page_pipeline"] = BooleanFragment()
+        fields["cute_gathered_page_stages"] = EnumFragment(choices=RING_STAGES)
     if config_spec.cute_fragment_warp_scan_search_enabled:
         fields["cute_fragment_warp_scan"] = BooleanFragment()
     if config_spec.cute_fragment_topk_network_search_enabled:
@@ -5488,6 +5521,8 @@ def flatten_missing_field_default(
         return True, "off"
     if key == "cute_materialized_operand_schedule":
         return True, "off"
+    if key == "cute_gathered_page_stages":
+        return True, 2
     if key in ("cute_fragment_private_scalar_loops", GRID_INIT_KEY):
         return True, False
     if key == "cute_fragment_producer_cache":
@@ -5497,6 +5532,7 @@ def flatten_missing_field_default(
     if key in (
         "cute_fragment_register_loads",
         "cute_fragment_half_mma",
+        "cute_gathered_page_pipeline",
         "cute_fragment_warp_scan",
         "cute_fragment_topk_network",
         "cute_fragment_cta_topk",

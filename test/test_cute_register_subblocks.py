@@ -20,6 +20,9 @@ from test.test_cute_tcgen05_fixed_chain import CPU_DEVICE
 
 import helion
 from helion._compiler.cute import cute_register_subblocks as family
+from helion._compiler.cute.autotune.mma_dag_surface import (
+    _normalize_cute_register_subblocks,
+)
 from helion._testing import DEVICE
 from helion.exc import InvalidConfig
 import helion.language as hl
@@ -980,6 +983,20 @@ def test_knob_normalization() -> None:
         )
         assert on.config[WARPS] == 2 and on.config[PREFETCH] == 0
         assert "cute_fp32_dot" not in on.config  # inert fragment knobs are pinned
+        explicit = on.config | {
+            "cute_fragment_half_mma": True,
+            "cute_gathered_page_pipeline": True,
+            "cute_gathered_page_stages": 8,
+        }
+        _normalize_cute_register_subblocks(spec, explicit, fix_invalid=False)
+        assert (
+            not {
+                "cute_fragment_half_mma",
+                "cute_gathered_page_pipeline",
+                "cute_gathered_page_stages",
+            }
+            & explicit.keys()
+        )
         # the promoted default carries the family and its first seed
         assert spec.default_config().config.get(KEY) == "on"
         off = spec.normalized_config(
