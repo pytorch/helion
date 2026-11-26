@@ -149,7 +149,8 @@ class TestAffineFold(unittest.TestCase):
         self.assertGreater(folds, 300)
 
     def test_kernel_constants(self) -> None:
-        """A kernel's constants are the names assigned once, a literal."""
+        """A kernel's constants are the names assigned once, a literal or a
+        cast to int of an integer constant that int holds."""
         body = ast.parse(
             textwrap.dedent(
                 """\
@@ -164,10 +165,21 @@ class TestAffineFold(unittest.TestCase):
                 d = 2
                 _helion_mpp_bind('e', 3)
                 e = 5
-                f = a + 1"""
+                f = a + 1
+                i = static_cast(int, h)
+                h = static_cast(int, g)
+                g = 256
+                j = static_cast(int, 3)
+                k = static_cast(int, unknown)
+                m = static_cast(float, g)
+                o = static_cast(int, 4294967296)
+                p = static_cast(int, g)
+                p = 1"""
             )
         ).body
-        self.assertEqual(kernel_constants(body), {"a": 4})
+        self.assertEqual(
+            kernel_constants(body), {"a": 4, "g": 256, "h": 256, "i": 256, "j": 3}
+        )
 
     def test_no_fold(self) -> None:
         """A term unbounded below keeps the division; a nonnegative value
