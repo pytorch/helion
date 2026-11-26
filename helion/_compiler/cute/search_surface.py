@@ -71,6 +71,23 @@ def _cute_tcgen05_output_store_facts(
     return max(widths), len(stores)
 
 
+def _cute_tcgen05_plain_epilogue(device_ir: DeviceIR, node: torch.fx.Node) -> bool:
+    """Whether one MMA's epilogue stores its tile once and reads no other
+    tensor: the store-chain analysis of
+    ``aux_tensor.host_function_has_tcgen05_aux_kernel_pattern``, which runs
+    after planning (``tcgen05.aux_kernel_detected``)."""
+    from .aux_tensor import analyze_tcgen05_matmul_store_chains
+
+    stores = analyze_tcgen05_matmul_store_chains(
+        device_ir.graphs, node, prove_aux_only_reorder=False
+    )
+    return (
+        stores is not None
+        and len(stores) == 1
+        and not stores[0][1].auxiliary_tensor_loads
+    )
+
+
 def _finalize_cute_tcgen05_search_planning(
     env: CompileEnvironment,
     planning_results: Sequence[_CuteTcgen05SearchPlanningResult],
@@ -568,14 +585,10 @@ def register_search_surface(device_ir: DeviceIR, config_spec: ConfigSpec) -> Non
             pass
         elif single_analysis:
             candidate, lhs, search_plan = search_candidates[0]
-            output_store_facts = _cute_tcgen05_output_store_facts(
-                device_ir,
-                next(
-                    node
-                    for item, _lhs, _rhs, node in mma_candidates
-                    if item is candidate
-                ),
+            mma_node = next(
+                node for item, _lhs, _rhs, node in mma_candidates if item is candidate
             )
+            output_store_facts = _cute_tcgen05_output_store_facts(device_ir, mma_node)
             config_spec._cute_tcgen05_config.fission_bundle = (
                 env_state.fission_plan is not None
             )
@@ -598,6 +611,7 @@ def register_search_surface(device_ir: DeviceIR, config_spec: ConfigSpec) -> Non
                 warp_mma_plain_kernel=len(mma_candidates) == 1,
                 output_dtype_bytes=output_store_facts[0],
                 output_stores=output_store_facts[1],
+                plain_epilogue=_cute_tcgen05_plain_epilogue(device_ir, mma_node),
             )
             if (
                 len(mma_candidates) == 1

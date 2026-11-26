@@ -9493,6 +9493,16 @@ def plan_tcgen05_pipeline(
         and tcgen05_requested_two_cta
         and tcgen05_k_tail_only
     )
+    # A single ragged output edge of a CTA pair may also have a K tail (one
+    # N tile per cluster): the role-local producer issues the partial last
+    # K tile as a whole box, which TMA zero-fills past K, the same way the
+    # double edge does (``tcgen05_role_local_uses_k_tail_tma`` below).
+    tcgen05_single_edge_k_tail = (
+        tcgen05_has_k_tail
+        and tcgen05_cluster_m == 2
+        and tcgen05_cluster_n_requested == 1
+        and tcgen05_requested_two_cta
+    )
     tcgen05_m_edge_only = (
         mma_impl == "tcgen05"
         and tcgen05_use_tma_pipeline
@@ -9502,7 +9512,7 @@ def plan_tcgen05_pipeline(
         and tcgen05_requested_two_cta
         and m_size % bm != 0
         and n_size % bn == 0
-        and k_total_size % bk == 0
+        and (k_total_size % bk == 0 or tcgen05_single_edge_k_tail)
     )
     # The new N-multicast edge family keeps every peer's tile origin in
     # bounds and all roles on one identical, unsplit static tile stream.
@@ -9541,7 +9551,7 @@ def plan_tcgen05_pipeline(
         and (tcgen05_cluster_n_requested == 1 or tcgen05_even_n_cluster_edge)
         and m_size % bm == 0
         and n_size % bn != 0
-        and k_total_size % bk == 0
+        and (k_total_size % bk == 0 or tcgen05_single_edge_k_tail)
         # Both supported tcgen05 CTA protocols can consume a general N
         # remainder through the role-local TMA producer.
         and (
@@ -9689,8 +9699,23 @@ def plan_tcgen05_pipeline(
     tcgen05_role_local_double_edge_tma = (
         tcgen05_double_edge_tma and tcgen05_is_two_cta and tcgen05_cluster_n in (1, 2)
     )
+    # The K-tail pairs issue the partial last K tile; the whole-K families
+    # issue only tiles that end inside K. bf16 8192x240x240 on 128x128x64
+    # pairs at four AB stages (240 = 3 x 64 + 48), the producer's guard on
+    # k-block 3, the last of its initial ring:
+    #
+    #     # K tail: issued, its box zero-filled past K = 240
+    #     tcgen05_tma_initial_next_full_tile = ... and (192 < 240)
+    #     # whole-K form: never issued, so the MMA warp waits on that
+    #     # stage's full barrier forever
+    #     tcgen05_tma_initial_next_full_tile = ... and (256 <= 240)
     tcgen05_role_local_uses_k_tail_tma = tcgen05_role_local_k_tail_tma or (
-        tcgen05_role_local_double_edge_tma and tcgen05_has_k_tail
+        (
+            tcgen05_role_local_double_edge_tma
+            or tcgen05_role_local_m_edge_tma
+            or (tcgen05_role_local_n_edge_tma and tcgen05_is_two_cta)
+        )
+        and tcgen05_has_k_tail
     )
     if (
         tcgen05_cluster_n > 1

@@ -40,6 +40,7 @@ from ..tcgen05_constants import TCGEN05_TWO_CTA_FP8_SMALL_GRID_BLOCK_M
 from ..tcgen05_constants import TCGEN05_TWO_CTA_FP8_SMALL_GRID_BLOCK_N
 from ..tcgen05_constants import TCGEN05_TWO_CTA_MAX_K_TILES
 from ..tcgen05_constants import TCGEN05_TWO_CTA_ONE_WAVE_BLOCK_NS
+from ..tcgen05_constants import TCGEN05_TWO_CTA_PAIR128_ONE_WAVE_BLOCK_NS
 from ..tcgen05_constants import TCGEN05_WHOLE_K_TILE_MIN
 
 if TYPE_CHECKING:
@@ -64,6 +65,103 @@ def _cuda_num_sms_or_zero(device: torch.device) -> int:
         return get_num_sm(device)
     except (AssertionError, NotImplementedError):
         return 0
+
+
+def tcgen05_mma_k(dtype: torch.dtype, *, tf32: bool = False) -> int:
+    """K extent of one tcgen05 MMA instruction for ``dtype`` operands."""
+    return 32 if dtype == torch.float8_e4m3fn else (8 if tf32 else 16)
+
+
+def tcgen05_min_n(dtype: torch.dtype, *, tf32: bool = False) -> int:
+    """The narrowest tcgen05 N tile for ``dtype`` operands (tf32's bn >= 32
+    floor mirrors ``_mma_impl_matches_problem_shape``)."""
+    return 16 if dtype == torch.float8_e4m3fn else (32 if tf32 else 8)
+
+
+def tcgen05_shape_rejected(
+    m: int,
+    n: int,
+    k: int,
+    dtype: torch.dtype,
+    *,
+    tf32: bool = False,
+    static_m: bool = True,
+    static_n: bool = True,
+    batch: int | None = None,
+    small_n_supported: bool = False,
+) -> bool:
+    """Whether the planner leaves an ``m x n x k`` dot of ``dtype`` operands
+    off the tcgen05 search for its shape alone (``m`` / ``n`` / ``k`` are the
+    extents, or their hints where ``static_m`` / ``static_n`` say they are
+    dynamic). ``batch``: the static leading batch of a rank-3 operand, if any;
+    ``small_n_supported``: an N below the narrowest tile has a lowering (role-
+    local TMA or the scalar fallback). helion.inductor asks it too, before it
+    writes a dot's K loop (``helion.inductor.choices.dot_keeps_k_loop``)."""
+    if not static_m:
+        # A dynamic M keeps the 64-row floor.
+        rows_rejected = m < 64
+    else:
+        rows_rejected = (
+            # Fewer than 64 static rows run as one zero-filled 64-row tile
+            # on the flat pipeline (decode GEMMs: bf16 16x14336x4096 27 us
+            # against the SIMT fallback's 358 us), but a single row stays
+            # SIMT (a TMA box over an extent-1 dimension ran 1x4096x4096 at
+            # 327 us against 20 us for two rows).
+            m < 2
+            # Only the memory-bound decode shapes profit from the padded
+            # tile; a tiny GEMM (33^3) keeps the SIMT lowering, which wins
+            # there (2.8 us against the tile's 13.8).
+            or (
+                m < 64
+                and (n < 128 or k < 128)
+                # A batch of such matrices runs one zero-filled tile each
+                # and fills the machine (window attention's 32768 x
+                # 56x56x32: 14.0 ms on the SIMT lowering, 0.23 ms on the
+                # one-CTA 64x64x32 tile).
+                and (batch or 0) < TCGEN05_MANY_SMALL_BATCHES
+            )
+        )
+    min_n = tcgen05_min_n(dtype, tf32=tf32)
+    return (
+        rows_rejected
+        # Size-one tile axes are fixed to block size one before this
+        # analysis, so they cannot carry the minimum tcgen05 instruction tile.
+        or (n < 2 if static_n else n < min_n)
+        or (static_n and n < min_n and not small_n_supported)
+        or k < tcgen05_mma_k(dtype, tf32=tf32)
+    )
+
+
+def _one_cta_heights_miss_m(static_m: int) -> bool:
+    """Whether no one-CTA tile height (64 or 128 rows) divides M: no
+    persistent one-CTA schedule runs it, only the CtaGroup.TWO pairs, whose
+    TMA store clips the partial last M tile."""
+    return static_m % (TCGEN05_ONE_CTA_MAX_BLOCK_M // 2) != 0
+
+
+def _double_edge_pair_shape(
+    *,
+    itemsize: int,
+    has_leading_passthrough: bool,
+    static_m: int,
+    static_k: int,
+    max_search_k: int,
+) -> bool:
+    """Whether a GEMM ragged in both M and N runs on the 256-row pairs.
+
+    16-bit operands, whole ``max_search_k`` tiles of K (a K tail on both
+    edges is the edge + K-tail family's shape) and an M that no one-CTA tile
+    height (64, 128 rows) divides: no persistent one-CTA schedule runs it, and
+    the pair's TMA store clips both edges. ``_plan_cute_tcgen05_search_candidate``
+    keeps its 256-row M ceiling and ``enable_cute_tcgen05_search`` admits it as
+    an output edge on this one test.
+    """
+    return (
+        itemsize == 2
+        and not has_leading_passthrough
+        and static_k % max_search_k == 0
+        and _one_cta_heights_miss_m(static_m)
+    )
 
 
 @dataclasses.dataclass(frozen=True)
@@ -206,9 +304,8 @@ def _plan_cute_tcgen05_search_candidate(
 
     is_fp8 = lhs.dtype == torch.float8_e4m3fn
     is_tf32 = lhs.dtype == torch.float32 and cute_fp32_dot_uses_tf32()
-    mma_k = 32 if is_fp8 else (8 if is_tf32 else 16)
-    # tf32's bn >= 32 floor mirrors _mma_impl_matches_problem_shape.
-    min_tcgen05_n = 16 if is_fp8 else (32 if is_tf32 else 8)
+    mma_k = tcgen05_mma_k(lhs.dtype, tf32=is_tf32)
+    min_tcgen05_n = tcgen05_min_n(lhs.dtype, tf32=is_tf32)
     is_small_n = static_n is not None and static_n < min_tcgen05_n
     if (
         env.backend_name != "cute"
@@ -217,51 +314,25 @@ def _plan_cute_tcgen05_search_candidate(
             and not is_tf32
         )
         or rhs.dtype != lhs.dtype
-        # Fewer than 64 static rows run as one zero-filled 64-row tile on the
-        # flat pipeline (decode GEMMs: bf16 16x14336x4096 27 us against the
-        # SIMT fallback's 358 us); a dynamic M keeps the 64-row floor, and a
-        # single row stays SIMT (a TMA box over an extent-1 dimension ran
-        # 1x4096x4096 at 327 us against 20 us for two rows).
-        or (
-            m_hint < 64
-            if static_m is None
-            # Only the memory-bound decode shapes profit from the padded
-            # tile; a tiny GEMM (33^3) keeps the SIMT lowering, which wins
-            # there (2.8 us against the tile's 13.8).
-            else static_m < 2
-            or (
-                static_m < 64
-                and (n_hint < 128 or k_hint < 128)
-                # A batch of such matrices runs one zero-filled tile each
-                # and fills the machine (window attention's 32768 x
-                # 56x56x32: 14.0 ms on the SIMT lowering, 0.23 ms on the
-                # one-CTA 64x64x32 tile).
-                and not (
-                    has_leading_passthrough
-                    # the batch is a rank-3 operand's leading dimension (a
-                    # leading passthrough over two rank-2 operands has none)
-                    and (lhs.ndim == 3 or rhs.ndim == 3)
-                    and (
-                        _static_problem_extent(
-                            env, (lhs if lhs.ndim == 3 else rhs).shape[0]
-                        )
-                        or 0
-                    )
-                    >= TCGEN05_MANY_SMALL_BATCHES
-                )
-            )
-        )
-        # Size-one tile axes are fixed to block size one before this analysis,
-        # so they cannot carry the minimum tcgen05 instruction tile.
-        or (static_n is not None and static_n < 2)
-        or (static_n is None and n_hint < min_tcgen05_n)
-        or (
-            is_small_n
-            and not (
+        or tcgen05_shape_rejected(
+            m_hint,
+            n_hint,
+            k_hint,
+            lhs.dtype,
+            tf32=is_tf32,
+            static_m=static_m is not None,
+            static_n=static_n is not None,
+            # the batch is a rank-3 operand's leading dimension (a leading
+            # passthrough over two rank-2 operands has none)
+            batch=(
+                _static_problem_extent(env, (lhs if lhs.ndim == 3 else rhs).shape[0])
+                if has_leading_passthrough and (lhs.ndim == 3 or rhs.ndim == 3)
+                else None
+            ),
+            small_n_supported=(
                 supports_small_n_role_local_tma or supports_small_n_scalar_fallback
-            )
+            ),
         )
-        or k_hint < mma_k
     ):
         return reject()
     small_n_requires_role_local_tma = (
@@ -360,6 +431,17 @@ def _plan_cute_tcgen05_search_candidate(
         and static_n is not None
         and static_m % max_search_m != 0
         and static_n % max_search_n != 0
+        # the 256-row pairs' double edges keep the pair tile
+        and not (
+            static_k is not None
+            and _double_edge_pair_shape(
+                itemsize=lhs.dtype.itemsize,
+                has_leading_passthrough=has_leading_passthrough,
+                static_m=static_m,
+                static_k=static_k,
+                max_search_k=max_search_k,
+            )
+        )
     ):
         max_search_m = min(max_search_m, 128)
     # A GEMM with fewer 128x128 output tiles than SMs is bound by per-CTA
@@ -483,11 +565,14 @@ def enable_cute_tcgen05_search(
     warp_mma_plain_kernel: bool = True,
     output_dtype_bytes: int | None = None,
     output_stores: int = 1,
+    plain_epilogue: bool = False,
 ) -> None:
     """Apply one preflighted tcgen05 search plan to the shared config.
 
     ``output_dtype_bytes`` / ``output_stores`` size the TMA-store rings the
-    AB-stage fit estimate charges (``None``: AB-only estimate).
+    AB-stage fit estimate charges (``None``: AB-only estimate);
+    ``plain_epilogue``: the epilogue stores the tile once and reads no other
+    tensor (the 128-row pairs' plain GEMMs).
     """
     env = CompileEnvironment.current()
     spec = env.config_spec
@@ -522,7 +607,12 @@ def enable_cute_tcgen05_search(
     # pairs (persistent cluster_m=1 needs whole M tiles: the host multi-tile
     # guard rejects it, so those samples are flattened by
     # ``_fix_cluster_m1_persistent_search_config``), so it needs the 256-row
-    # pair tile; shapes ragged in both M and N stay on the flat pipeline.
+    # pair tile. Shapes ragged in both M and N take the same pairs when K is
+    # whole and no one-CTA tile height divides M (no persistent one-CTA
+    # schedule runs them): the store clips both edges (bf16 1000x2880x4096:
+    # the flat one-CTA winner ran 0.64 of cuBLAS, the 256x160 pair 1.03). An
+    # M whole in one-CTA tiles keeps the one-CTA N-edge family's schedules,
+    # and a K tail on both edges is the edge + K-tail family's shape.
     output_edge_shape = False
     # the K tile ceiling before an output edge's whole-K cap below
     flat_max_search_k = max_search_k
@@ -532,9 +622,14 @@ def enable_cute_tcgen05_search(
         # 16-bit operands, whole in both with a K that no 64-deep tile
         # divides (the family's edges with nothing clipped; bf16
         # 2048x2560x8008, fp32 out: 0.92 of cuBLAS on the family's
-        # 256x256x64 seed, 0.75 on the flat pipeline's autotuned winner).
-        # A single ragged edge with a K tail is outside the runtime's
-        # validated persistent shapes.
+        # 256x256x64 seed, 0.75 on the flat pipeline's autotuned winner),
+        # or ragged in one of them with a 16-bit K tail. That edge runs on
+        # its 128-row pairs too (``cute_mma``'s single-edge K tail), so its
+        # floor is one 128 x 128 pair tile: GB300, CUDA graphs over cold
+        # inputs, full-effort autotune, of cuBLAS, flat winner -> family:
+        # bf16 8192x240x240 0.85 -> 1.03 (the 128x128 pair, two tiles per
+        # CTA), 4096x240x240 0.94 -> 1.02, 1280x1600x1000 0.70 -> 0.99,
+        # 320x2048x1000 0.57 -> 0.71, 1000x2560x8008 0.39 -> 0.69.
         m_ragged = static_m % TCGEN05_TWO_CTA_BLOCK_M != 0
         n_ragged = static_n % TCGEN05_TWO_CTA_BLOCK_N != 0
         k_tail = static_k % TCGEN05_WHOLE_K_TILE_MIN != 0
@@ -545,15 +640,37 @@ def enable_cute_tcgen05_search(
             and min(static_m, static_n, static_k) >= TCGEN05_TWO_CTA_EDGE_K_TAIL_MIN_DIM
             and m_ragged == n_ragged
             and (m_ragged or (k_tail and input_dtype.itemsize == 2))
+        ) or (
+            not has_leading_passthrough
+            and input_dtype.itemsize == 2
+            and k_tail
+            and m_ragged != n_ragged
+            and min(plan.max_tcgen05_m, plan.max_tcgen05_n)
+            >= TCGEN05_TWO_CTA_EDGE_PAIR128_BLOCK
+            and min(static_m, static_n, static_k) >= TCGEN05_TWO_CTA_EDGE_PAIR128_BLOCK
         )
         m_edge = static_m % max_search_m != 0
         n_edge = static_n % max_search_n != 0
         output_edge_shape = (
-            not has_leading_passthrough
-            and input_dtype.itemsize == 2
-            and m_edge != n_edge
-            and (not m_edge or max_search_m >= TCGEN05_TWO_CTA_BLOCK_M)
-        )
+            # one ragged edge of a 16-bit GEMM
+            (
+                m_edge != n_edge
+                and not has_leading_passthrough
+                and input_dtype.itemsize == 2
+            )
+            # both: the pairs' double-edge shape
+            or (
+                m_edge
+                and n_edge
+                and _double_edge_pair_shape(
+                    itemsize=input_dtype.itemsize,
+                    has_leading_passthrough=has_leading_passthrough,
+                    static_m=static_m,
+                    static_k=static_k,
+                    max_search_k=max_search_k,
+                )
+            )
+        ) and (not m_edge or max_search_m >= TCGEN05_TWO_CTA_BLOCK_M)
         whole_k_tile = static_k & -static_k
         if (
             input_dtype.itemsize == 2
@@ -627,8 +744,11 @@ def enable_cute_tcgen05_search(
         # these tiles cannot fill a quarter of the SMs).
         allow_one_wave_cluster_m2_search = (
             allow_full_tile_cluster_m2_search
-            # the one-wave two-CTA tiles run whole M tiles only
-            and static_m % TCGEN05_TWO_CTA_BLOCK_M == 0
+            # the one-wave two-CTA tiles run whole M tiles, or a 16-bit
+            # output edge's partial last M tile, which the pair's TMA store
+            # clips (bf16 1000x2304x2048: 72 256x128 pairs, one per SM pair,
+            # 0.97 of cuBLAS against 0.77 for the flat one-CTA winner)
+            and (static_m % TCGEN05_TWO_CTA_BLOCK_M == 0 or output_edge_shape)
             and static_n % min(TCGEN05_TWO_CTA_ONE_WAVE_BLOCK_NS) == 0
             and plan.leading_work_multiplier
             * -(-static_m // TCGEN05_TWO_CTA_BLOCK_M)
@@ -648,6 +768,9 @@ def enable_cute_tcgen05_search(
     one_wave_only_cluster_m2_search = False
     num_sms = _cuda_num_sms_or_zero(lhs.device)
     spec._cute_tcgen05_config.device_sm_count = num_sms
+    spec._cute_tcgen05_config.persistent_reserved_sms = (
+        env.settings.persistent_reserved_sms
+    )
     # The register-MMA family replaces the whole device body of ONE GEMM (its
     # root tile loop around its K loop; ``detect_warp_mma_gemm`` proves that
     # root holds nothing else); kernels with several matmuls keep the tcgen05
@@ -684,13 +807,38 @@ def enable_cute_tcgen05_search(
                     * -(-static_m // TCGEN05_TWO_CTA_BLOCK_M)
                     * -(-static_n // min(TCGEN05_TWO_CTA_ONE_WAVE_BLOCK_NS))
                 )
+                pair128_n = min(TCGEN05_TWO_CTA_PAIR128_ONE_WAVE_BLOCK_NS)
+                if (
+                    input_dtype.itemsize == 2
+                    and plain_epilogue
+                    and static_m % (TCGEN05_TWO_CTA_BLOCK_M // 2) != 0
+                    and static_n % pair128_n == 0
+                ):
+                    # The 16-bit family also runs 128-row CTA pairs, each
+                    # CTA 64 rows (``tcgen05_config.repair.plain_pair128_widths``),
+                    # so its work is counted in its narrowest pair tile too:
+                    # bf16 1500x384x384 has 36 tiles of 256x64, under a
+                    # quarter of GB300's 152 SMs, but 72 pairs of 128x64
+                    # (cuBLAS's tile), which ran 2.69 us against the flat
+                    # one-CTA winner's 3.12 (cuBLAS 2.55). Only where the
+                    # family takes those pairs: a plain epilogue (an
+                    # auxiliary operand keeps its 256-row tiles) over an M
+                    # whole 128-row tiles do not cover (over whole tiles
+                    # the paired-pipeline search runs the 128-row pairs
+                    # without this family).
+                    one_wave_work_clusters = max(
+                        one_wave_work_clusters,
+                        plan.leading_work_multiplier
+                        * -(-static_m // (TCGEN05_TWO_CTA_BLOCK_M // 2))
+                        * (static_n // pair128_n),
+                    )
                 one_wave_only_cluster_m2_search = (
                     work_clusters < num_sms // 4 <= one_wave_work_clusters
                 )
                 work_clusters = max(work_clusters, one_wave_work_clusters)
             if allow_edge_cluster_m2_search and input_dtype.itemsize == 2:
                 # The 16-bit edge family also runs 128x128 CTA pairs
-                # (``tcgen05_config.repair.plain_edge_pair128_admitted``: each CTA
+                # (``tcgen05_config.repair.plain_pair128_admitted``: each CTA
                 # owns 64 rows), so its work is counted in 128x128 tiles,
                 # partial ones included: a ragged bf16 1000^3 GEMM has 16
                 # 256x256 pairs but 64 of 128x128, enough to keep the two-CTA
@@ -716,8 +864,7 @@ def enable_cute_tcgen05_search(
         output_edge_shape
         and allow_whole_k_persistent_pid_types
         and static_m is not None
-        # every one-CTA tile height: 64 and 128 rows
-        and static_m % (TCGEN05_ONE_CTA_MAX_BLOCK_M // 2) != 0
+        and _one_cta_heights_miss_m(static_m)
         and not allow_cluster_m2_search
     ):
         # An M ragged for every one-CTA tile height runs persistent only
@@ -729,6 +876,15 @@ def enable_cute_tcgen05_search(
         # (``_fix_cluster_m1_persistent_search_config``).
         allow_whole_k_persistent_pid_types = False
         max_search_k = flat_max_search_k
+        if static_n is not None and static_n % max_search_n != 0:
+            # A double edge kept the 256-row M ceiling for its pairs alone
+            # (``_double_edge_pair_shape``); with none reachable it takes the
+            # planner's one-CTA ceiling back (bf16 1000x1000x4096, 16 pairs).
+            # A single M edge keeps 256 rows: the cp.async-A pipeline runs
+            # them as two 128-row MMAs, and the repair projects the TMA
+            # kernels' flat samples to 128 rows
+            # (``_fix_cluster_m1_flat_block_m_search_config``).
+            max_search_m = min(max_search_m, TCGEN05_ONE_CTA_MAX_BLOCK_M)
     surface.narrow_autotune_to_validated_configs(
         spec.tcgen05,
         allow_persistent_pid_types=(

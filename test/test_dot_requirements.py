@@ -1554,7 +1554,11 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
 
     @onlyBackends(["cute"])
     def test_cute_tcgen05_partial_single_edge_search_stays_enabled(self) -> None:
-        """A double-edge default tile keeps wide-N tcgen05 candidates searchable."""
+        """A double edge with whole K tiles and an M no one-CTA tile height
+        divides searches the 256-row pairs, whose TMA store clips both edges,
+        next to the wide-N one-CTA candidates (fp16 5000x5000x64 on GB300: the
+        flat one-CTA default ran 46.0 us, the pair default 10.5, cuBLAS
+        11.8)."""
 
         args = (
             torch.randn([5000, 64], device=DEVICE, dtype=HALF_DTYPE),
@@ -1564,7 +1568,8 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
             bound = fresh(cute_matmul_mma).bind(args)
         spec = bound.config_spec
         self.assertTrue(spec.tcgen05.search_enabled)
-        self.assertEqual([x.max_size for x in spec.block_sizes], [128, 256, 64])
+        self.assertEqual([x.max_size for x in spec.block_sizes], [256, 256, 64])
+        self.assertEqual(spec.tcgen05.cluster_m_search_choices, (1, 2))
 
     @onlyBackends(["cute"])
     def test_cute_tcgen05_edge_k_tail_family_admits_cluster_m2_search(self) -> None:

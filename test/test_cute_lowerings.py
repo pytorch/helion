@@ -17836,21 +17836,46 @@ class TestCuteTcgen05AuxPipelineCycle2a(unittest.TestCase):
         self.assertIsNone(_tcgen05_rowvec_aux_stage_copy_elems(8, 8, 480))
         self.assertIsNone(_tcgen05_rowvec_aux_stage_copy_elems(256, 256, 512))
 
-    def test_aux_tma_load_rejects_partial_tiles_without_tma_store_routing(
+    def test_aux_tma_load_stages_single_edge_k_tail_for_partial_tma_store(
         self,
     ) -> None:
-        """Bulk aux TMA still rejects partial tiles with no routed edge store."""
+        """Bulk aux TMA stages an M edge with a K tail for the partial TMA store.
 
-        kernel = self._bias_residual_gelu_kernel()
-        args = (
-            torch.empty([5000, 5000], device=DEVICE, dtype=torch.bfloat16),
-            torch.empty([5000, 512], device=DEVICE, dtype=torch.bfloat16),
-            torch.empty([512], device=DEVICE, dtype=torch.bfloat16),
-            torch.empty([5000, 512], device=DEVICE, dtype=torch.bfloat16),
-        )
+        5000 x 512 x 5000 on 256x256x128 pairs has an M edge (5000 = 19 x 256
+        + 136), whole N tiles and a K tail (5000 = 39 x 128 + 8). Its pairs
+        once had no role-local family, so this config had no routed edge store
+        and refused bulk aux TMA ("... with partial output tiles requires
+        either a partial-output TMA-store epilogue or the full-tile/edge
+        fallback split ..."). The M-edge family takes a K tail since the
+        producer issues the partial last K tile, so the C-input warp stages the
+        residual through TMA and the partial-output TMA store clips the M edge,
+        as for the double edge (test_aux_tma_load_allows_partial_tiles_with_tma_store):
+
+            cute.copy(tcgen05_aux_tma_atom_0, tcgen05_aux_tma_gmem_part_0[None, cutlass.Int32(_tcgen05_aux_subtile)], tcgen05_aux_tma_smem_part_0[None, tcgen05_aux_pipeline_producer_state.index], tma_bar_ptr=tcgen05_aux_tma_barrier)
+            ...
+            cute.copy(tcgen05_tma_store_atom, tcgen05_bSG_sD[None, tcgen05_c_buffer], tcgen05_bSG_gD[None, cutlass.Int32(_tcgen05_subtile)])
+
+        The output starts as NaN, so a tile the clipped store leaves unwritten
+        fails. The refusal stays where no TMA store runs
+        (test_aux_tma_partial_store_keeps_guard_for_unaligned_rowvec_tail).
+        """
+
+        from helion._compiler.cute.mma_support import get_cute_mma_support
+
+        if not get_cute_mma_support().tcgen05_f16bf16:
+            self.skipTest("tcgen05 F16/BF16 MMA is not supported on this machine")
+
+        torch.manual_seed(0)
+        x = torch.randn([5000, 5000], device=DEVICE, dtype=torch.bfloat16)
+        y = torch.randn([5000, 512], device=DEVICE, dtype=torch.bfloat16)
+        bias = torch.randn([512], device=DEVICE, dtype=torch.bfloat16)
+        residual = torch.randn([5000, 512], device=DEVICE, dtype=torch.bfloat16)
+        out = torch.full([5000, 512], float("nan"), device=DEVICE, dtype=torch.bfloat16)
 
         with patch_cute_mma_support():
-            bound = kernel.bind(args)
+            bound = self._bias_residual_gelu_into_kernel().bind(
+                (x, y, bias, residual, out)
+            )
             cfg = _make_tcgen05_persistent_config(
                 block_sizes=[256, 256, 128],
                 l2_groupings=[1],
@@ -17866,12 +17891,20 @@ class TestCuteTcgen05AuxPipelineCycle2a(unittest.TestCase):
                 **{TCGEN05_AUX_LOAD_MODE_CONFIG_KEY: TCGEN05_AUX_LOAD_MODE_TMA},
                 indexing=["tensor_descriptor"] * bound.env.config_spec.indexing.length,
             )
-            with self.assertRaises(exc.BackendUnsupported) as cm:
-                bound.to_code(cfg)
-        msg = str(cm.exception)
-        self.assertIn(TCGEN05_AUX_LOAD_MODE_CONFIG_KEY, msg)
-        self.assertIn("partial output tiles", msg)
-        self.assertIn("partial-output TMA-store epilogue", msg)
+            code = bound.to_code(cfg)
+            bound.set_config(cfg)
+            bound(x, y, bias, residual, out)
+        self.assertIn("'kind': 'tcgen05_aux_tma'", code)
+        self.assertIn("cute.copy(tcgen05_aux_tma_atom_0", code)
+        self.assertIn("cute.copy(tcgen05_tma_store_atom", code)
+        self._assert_partial_tma_rowvec_bias_staged(code)
+        self.assertNotIn("tcgen05_aux_full_tile", code)
+        self.assertNotIn("_helion_tcgen05_persistent_total_tiles", code)
+        expected = torch.nn.functional.gelu(
+            1.25 * (x.float() @ y.float()) + 0.5 * residual.float() + bias.float(),
+            approximate="tanh",
+        ).to(x.dtype)
+        torch.testing.assert_close(out, expected, atol=3e-1, rtol=2e-2)
 
     def test_aux_tma_load_rejects_no_producer_warp(self) -> None:
         """Explicit aux TMA must not silently no-op when the producer gate is shut.

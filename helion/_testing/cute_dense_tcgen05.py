@@ -410,7 +410,10 @@ def bf16_mm_args(
 
 def clc_fringe_config(**changes: object) -> helion.Config:
     """The CLC 256x256 CTA pair (a scheduler warp publishing each work tile to
-    both CTAs' mailboxes)."""
+    both CTAs' mailboxes), the CuTe default of a bf16 GEMM whose N is
+    narrower than the tile (``plain_mm_into`` over 131072x144x288): every tile
+    is a fringe tile, stored by the epilogue warps through the predicated SIMT
+    store, which no named barrier keeps in step."""
     return helion.Config.from_dict(
         {
             "block_sizes": [256, 256, 64],

@@ -204,7 +204,19 @@ def _integer_fragment_with_seed_values(
 
 
 class _CompilerSeedIntegerFragment(IntegerFragment):
-    """An integer search range that can also encode frozen compiler seeds."""
+    """An integer search range that can also encode frozen compiler seeds.
+
+    Values off the range are not only the seeds': normalization rewrites a
+    sampled knob to whatever the repaired tile needs. On bf16 1000x512x2880
+    (``tcgen05_ab_stages`` searched over 1..12, seed-only 16), the 64-wide
+    pair seed ``[128, 64, 64]`` at 16 stages with a sampled N tile of 128
+    normalizes to the 128x128 pair at its deepest ring, 13 stages: neither in
+    the range nor a seed. The pattern search walks the neighbors of such a
+    canonical config and the surrogate encodes it, so both accept any int
+    (as ``IntegerFragment`` and ``EnumFragment`` do); a check that raised
+    ``ValueError: 13 is not a compiler-seed integer value`` ended the
+    autotune.
+    """
 
     def __init__(
         self,
@@ -219,16 +231,13 @@ class _CompilerSeedIntegerFragment(IntegerFragment):
             raise TypeError(f"Expected int, got {type(current).__name__}")
         if self.low <= current <= self.high:
             return super().pattern_neighbors(current, radius)
-        if current not in self.seed_only_values:
-            raise ValueError(f"{current!r} is not a compiler-seed integer value")
+        # A seed or normalized value off the range steps back onto it.
         boundary = self.clamp(current)
         return [boundary, *super().pattern_neighbors(boundary, radius)]
 
     def encode(self, value: object) -> list[float]:
         if type(value) is not int:
             raise TypeError(f"Expected int, got {type(value).__name__}")
-        if not (self.low <= value <= self.high or value in self.seed_only_values):
-            raise ValueError(f"{value!r} is not a compiler-seed integer value")
         return [float(value)]
 
     def fingerprint(self) -> tuple[str | int, ...]:
