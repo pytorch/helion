@@ -352,6 +352,26 @@ def partition_row_publication(
         # Only replace the K coordinate and the final FP32 addition tree.
         # In particular the original per-element operations and all later
         # casts, normalization, weighting and a single store stay in place.
+        if fn.config.get("cute_packed_row_publication"):
+            from .packed_row_publication import install_paired_sweeps
+            from .packed_row_publication import paired_sweeps
+
+            plans = paired_sweeps(
+                fn,
+                parallel,
+                region[3:-1],
+                loop,
+                acc,
+                statistic,
+                dst,
+                sw.inner.body[1:],
+                n,
+                threads,
+                kindex,
+                tid,
+            )
+            if plans is not None:
+                install_paired_sweeps(fn, grid, [*parallel, *region[3:-1], loop], plans)
         body[len(prefix) + 1 : len(prefix) + 3] = parallel
         body[-1:] = [loop]
     else:
@@ -364,6 +384,13 @@ def validate_publication_launch(
 ) -> None:
     """The full set of owners must match the literal block in the host launcher."""
     state = fn.cute_state.lanes
+    if (
+        fn.config.get("cute_packed_row_publication")
+        and not state.packed_row_publication
+    ):
+        raise exc.InvalidConfig(
+            "packed row publication requires matching BF16 input, statistic and output sweeps"
+        )
     if not state.single_row_publication_dims:
         raise exc.InvalidConfig(f"{KEY} needs a proved independent full-row store")
     if (

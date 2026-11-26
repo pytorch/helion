@@ -392,6 +392,8 @@ def register_seed_facts(
 
     # The appended families outside the ranked tuple register their facts
     # here, the ranked ones through their own ``register_facts``.
+    from ...ordered_column_sum import column_sum_roots
+    from ...ordered_column_sum import has_column_sum_structure
     from ...single_row_publication import publication_roots
     from ...warp_row_partition import row_sum_roots
 
@@ -416,6 +418,11 @@ def register_seed_facts(
                 for site in sites
                 if (pair := indexed_row_epilogue(env, device_ir, site)) is not None
             )
+    env.config_spec.cute_column_sum_structure = has_column_sum_structure(env, device_ir)
+    env.config_spec.cute_ordered_column_sum_roots = column_sum_roots(env, device_ir)
+    from ...packed_row_publication import possible_row_rms
+
+    env.config_spec.cute_packed_publication_pattern = possible_row_rms(device_ir)
     env.config_spec.cute_single_row_publication_roots = publication_roots(
         env, device_ir
     )
@@ -423,6 +430,11 @@ def register_seed_facts(
         root: (fact.row_id, fact.k_id, fact.length, fact.reductions)
         for root, fact in row_sum_roots(env, device_ir).items()
     }
+    from ...cooperative_row_normalization import terminal_column
+
+    env.config_spec.cute_normalizable_column = terminal_column(
+        env.config_spec, device_ir
+    )
     return computed_fragment_specialization_facts(
         env, device_ir
     ) | CutePointwiseMinBlocksHeuristic.register_facts(env, device_ir)
@@ -632,12 +644,37 @@ def postprocess_seed_configs(
         # producer/reuse seeds. Its addition must not silently change their
         # carriers or introduce a top-k dependency into tail-peel coverage.
         configs.append(derived_epilogue)
+    from ...cooperative_row_normalization import add_seed as add_normalization_seed
+    from ...ordered_column_sum import add_column_seed
+    from ..staged_projection_grid import add_staged_grid_seeds
+
+    staged = add_column_seed(
+        env, device_ir, add_staged_grid_seeds(env.config_spec, configs)
+    )
+    if (
+        env.config_spec.target_device_capability is not None
+        and env.config_spec.target_device_capability[0] == 10
+        and env.config_spec.cute_packed_publication_pattern
+        and env.config_spec.cute_single_row_publication_roots
+    ):
+        for c in reversed(staged):
+            if c.get("cute_parallel_row_sum"):
+                staged = add_normalization_seed(
+                    env.config_spec,
+                    [
+                        *staged,
+                        Config.from_dict(
+                            c.config | {"cute_packed_row_publication": True}
+                        ),
+                    ],
+                )
+                break
     if grid_carrier is not None:
-        configs.append(
+        staged.append(
             Config.from_dict(deepcopy(grid_carrier.config) | {GRID_INIT_KEY: True})
         )
         env.config_spec.autotuner_heuristics.append("in_kernel_grid_init")
-    return configs
+    return staged
 
 
 def _has_vector_lanes(seed: Config) -> bool:

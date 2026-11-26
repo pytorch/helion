@@ -79,6 +79,8 @@ def register_row_schema(env: CompileEnvironment, ir: DeviceIR) -> None:
                 for n in inner.nodes
             ) and any(n.target is torch.ops.aten.sum.dim_IntList for n in inner.nodes):
                 spec.cute_indexed_row_structure = True
+                if len(ir.root_ids) > 1 and not env.settings.persistent_reserved_sms:
+                    spec.cute_staged_grid_structure = True
                 if any(len(other) == 2 for other in ir.grid_block_ids):
                     spec.cute_row_epilogue_structure = True
                 break

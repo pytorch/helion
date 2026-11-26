@@ -1660,9 +1660,14 @@ class ConfigSpec:
         self.cute_explicit_local_barrier = False
         self.cute_fragment_warp_topk_requires_flat = False
         self.cute_fragment_warp_reduction_requires_flat = False
+        self.cute_normalizable_column: tuple[int, int] | None = None
+        self.cute_column_sum_structure = False
+        self.cute_ordered_column_sum_roots: dict[int, tuple[int, int, int, int]] = {}
+        self.cute_packed_publication_pattern = False
         self.cute_row_publication_structure = False
         self.cute_row_reduction_structure = False
         self.cute_indexed_row_structure = False
+        self.cute_staged_grid_structure = False
         self.cute_row_epilogue_structure = False
         self.cute_single_row_publication_roots: dict[int, tuple[int, int]] = {}
         self.cute_warp_row_reduction_roots: dict[int, tuple[int, int, int, int]] = {}
@@ -1672,6 +1677,7 @@ class ConfigSpec:
         self.cute_shared_row_carry_structure = False
         self.cute_reusable_row_inputs: dict[int, int] = {}
         self.cute_indexed_row_epilogue_axes: tuple[tuple[int, ...], ...] = ()
+        self.cute_staged_row_domains: tuple[tuple[int, int, int], ...] = ()
         self.cute_staged_indexed_row_axes: tuple[
             tuple[int, int, int, int, bool], ...
         ] = ()

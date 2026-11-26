@@ -17,6 +17,9 @@ from ...ast_extension import iter_statements
 from ...ast_extension import statement_from_string
 from ...source_location import SyntheticLocation
 from .._ast_pass_utils import phase_barrier_call
+from ..active_phase_joins import apply_active_joins
+from ..autotune.config_keys import PHASE_PARTICIPATION_KEY
+from ..autotune.config_keys import STAGED_GRID_KEY
 from ..pdl_ops import has_explicit_pdl
 from ..thread_block_projection import update_launch_block
 from .pdl import pdl_applies
@@ -38,6 +41,20 @@ def module_statements(fn: DeviceFunction, fn_def: ast.FunctionDef) -> list[ast.s
         result.append(
             statement_from_string(f"{fn.name}._helion_cute_cooperative = True")
         )
+    joins: dict[ast.stmt, ast.Call] = {}
+
+    if fn.config.get(STAGED_GRID_KEY, 1) != 1:
+        from ..staged_projection_grid import validate_staged_grid
+
+        stride, joins = validate_staged_grid(fn, fn_def)
+        result.extend(
+            (
+                statement_from_string(f"{fn.name}._helion_cute_check_residency = True"),
+                statement_from_string(f"{fn.name}._helion_cute_grid_stride = {stride}"),
+            )
+        )
+    if fn.config.get(PHASE_PARTICIPATION_KEY):
+        apply_active_joins(fn, fn_def, joins)
     if fn.cute_state.lanes.resident_reduction_layouts:
         # These imported device helpers are absent from generated source.
         # Persist their dependency with this kernel through source reload.

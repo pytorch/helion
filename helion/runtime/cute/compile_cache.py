@@ -108,6 +108,7 @@ class CompiledCuteLauncher:
         "_compile_options",
         "_compiled",
         "_jit_func",
+        "_proven_grids",
         "_kernel_name",
         "_sass_checks",
     )
@@ -119,7 +120,16 @@ class CompiledCuteLauncher:
         cache_key: str | None = None,
         sass_checks: tuple[str, ...] = (),
         kernel_name: str = "",
+        expected_grid_x: int | None = None,
     ) -> None:
+        if expected_grid_x is not None:
+            from .cooperative_residency import ProvenCooperativeGrids
+
+            self._proven_grids: ProvenCooperativeGrids | None = ProvenCooperativeGrids(
+                expected_grid_x
+            )
+        else:
+            self._proven_grids = None
         self._jit_func = jit_func
         self._compile_options = compile_options
         self._compiled: object = None
@@ -173,6 +183,8 @@ class CompiledCuteLauncher:
                 if self._cache_key is not None:
                     self._persist_to_disk(compiled)
             self._compiled = compiled
+        if self._proven_grids is not None:
+            self._proven_grids.check(cast("Any", compiled), args)
         return cast("Any", compiled)(*args)
 
     def persist_compiled(self) -> None:

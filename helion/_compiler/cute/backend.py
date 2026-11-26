@@ -2878,6 +2878,10 @@ class CuteBackend(Backend):
                     self._lower_wide_pid_loop(node, fn)
         # Inspect the kernel before outlining moves its joins into a helper.
         statements = launch_attributes.module_statements(fn, fn_def)
+        if fn.config.get("cute_cooperative_row_norm"):
+            from .cooperative_row_normalization import install
+
+            install(fn, fn_def)
         # One body per cluster shape sharing that shared memory
         # (``tcgen05_fallback_cluster``).
         outline_fallback_cluster_bodies(fn, fn_def, prefix)
@@ -3579,6 +3583,8 @@ class CuteBackend(Backend):
             "_cute_red_add_f32_vec": "from helion._compiler.cute.vec_utils import red_add_f32_vec as _cute_red_add_f32_vec",
             "_cute_red_add_f16_vec": "from helion._compiler.cute.vec_utils import red_add_f16_vec as _cute_red_add_f16_vec",
             "_cute_red_add_bf16_vec": "from helion._compiler.cute.vec_utils import red_add_bf16_vec as _cute_red_add_bf16_vec",
+            "_cute_column_pack_bf16x2": "from helion._compiler.cute._flash_row_mma_runtime import pack_bf16x2 as _cute_column_pack_bf16x2",
+            "_cute_column_unpack_bf16x2": "from helion._compiler.cute._flash_row_mma_runtime import unpack_bf16x2 as _cute_column_unpack_bf16x2",
             "_cute_rank1_pack_bf16x2": "from helion._compiler.cute.single_token_rank1_recurrence import rank1_pack_bf16x2 as _cute_rank1_pack_bf16x2",
             "_cute_rank1_mul_bf16x2": "from helion._compiler.cute.single_token_rank1_recurrence import rank1_mul_bf16x2 as _cute_rank1_mul_bf16x2",
             "_cute_rank1_add_bf16x2": "from helion._compiler.cute.single_token_rank1_recurrence import rank1_add_bf16x2 as _cute_rank1_add_bf16x2",
@@ -3600,6 +3606,10 @@ class CuteBackend(Backend):
             "_cute_store_fp8e4m3fn_vec_streaming": "from helion._compiler.cute.packet_store_helpers import store_fp8e4m3fn_vec_streaming as _cute_store_fp8e4m3fn_vec_streaming",
             "_cute_store_fp8e5m2_vec_streaming": "from helion._compiler.cute.packet_store_helpers import store_fp8e5m2_vec_streaming as _cute_store_fp8e5m2_vec_streaming",
             "_cute_toolkit_grid_sync": "from helion._compiler.cute.cooperative_grid_op import toolkit_grid_sync as _cute_toolkit_grid_sync",
+            "_cute_publication_unpack": "from helion._compiler.cute._flash_row_mma_runtime import unpack_bf16x2 as _cute_publication_unpack",
+            "_cute_publication_pack": "from helion._compiler.cute._flash_row_mma_runtime import pack_bf16x2 as _cute_publication_pack",
+            "_cute_publication_mul": "from helion._compiler.cute.device.ptx import mul_bf16x2 as _cute_publication_mul",
+            "_cute_join_active": "from helion._compiler.cute.device.active_phase_barrier import join_active as _cute_join_active",
             "_cute_grid_barrier": "from helion._compiler.cute.grid_barrier import grid_barrier as _cute_grid_barrier",
             "_cute_tmem_store_atom": "from helion._compiler.cute.split_k_exchange import tmem_store_atom as _cute_tmem_store_atom",
             "_cute_join_cast": "from helion._compiler.cute.join_cast import join_cast as _cute_join_cast",
@@ -4324,6 +4334,22 @@ class CuteBackend(Backend):
         if arg.name == DeviceFunction.current().cute_state.private_grid_init_arg:
             return empty_private_counter(arg, host_str)
         return host_str
+
+    def grid_barrier_scratch_words(self, config: Config, joins: int) -> int:
+        from .active_phase_joins import COUNTER_STRIDE
+        from .autotune.config_keys import PHASE_PARTICIPATION_KEY
+
+        if config.get("cute_cooperative_row_norm"):
+            from ..compile_environment import CompileEnvironment
+            from .cooperative_row_normalization import scratch_words
+
+            fact = CompileEnvironment.current().config_spec.cute_normalizable_column
+            if fact is None:
+                raise exc.InvalidConfig(
+                    "cooperative normalization requires a proven row extent"
+                )
+            return scratch_words(fact[1])
+        return joins * COUNTER_STRIDE if config.get(PHASE_PARTICIPATION_KEY) else 1
 
     def grid_barrier_stmt(self, sem_arg: str) -> str | None:
         # ``sem_arg`` is a TensorArg that arrives as a ``cute.Tensor``; its
@@ -5699,6 +5725,19 @@ class CuteBackend(Backend):
     ) -> ProgramIDs | None:
         """The tcgen05 persistent scheduler for persistent pid types on a
         tcgen05 GEMM body; ``None`` (the generic strategies) otherwise."""
+        from .autotune.config_keys import STAGED_GRID_KEY
+
+        if fn.config.get(STAGED_GRID_KEY, 1) != 1:
+            from .staged_projection_grid import StagedProjectionProgramIDs
+
+            if (
+                pid_type != "persistent_interleaved"
+                or _kernel_specialized_mma_impl(fn, config=fn.config) == "tcgen05"
+            ):
+                raise exc.InvalidConfig(
+                    "staged projection grids require ordinary interleaved phases"
+                )
+            return StagedProjectionProgramIDs(fn)
         if not pid_type.startswith("persistent"):
             return None
         from .cute_warp_mma_gemm import MATMUL_FAMILY_WARP_MMA
@@ -5743,11 +5782,14 @@ class CuteBackend(Backend):
         self, codegen: GenerateAST, grid_state: DeviceGridState, body: list[ast.AST]
     ) -> bool:
         from .direct_affine_lowering import try_lower_direct_affine_root
+        from .ordered_column_sum import lower_ordered_columns
         from .single_row_publication import partition_row_publication
         from .thread_budget import record_root_read_axes
         from .warp_row_partition import partition_row_sums
 
         record_root_read_axes(codegen, grid_state, body)
+        if lower_ordered_columns(codegen, grid_state, body):
+            return True
         partition_row_sums(codegen, grid_state, body)
         partition_row_publication(codegen, grid_state, body)
         return try_lower_direct_affine_root(codegen, grid_state, body)

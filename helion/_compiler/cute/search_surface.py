@@ -245,9 +245,16 @@ def register_search_surface(device_ir: DeviceIR, config_spec: ConfigSpec) -> Non
     from .tile_packing import tile_pack_counts
 
     register_row_schema(env, device_ir)
+    indexed_sites = indexed_row_phases(env, device_ir)
+    # Dependency phases are installed after static IR registration. Their real
+    # joins and installed device schedules are checked on the selected render.
+    if len(device_ir.root_ids) > 1 and not env.settings.persistent_reserved_sms:
+        config_spec.cute_staged_row_domains = tuple(
+            (site.row_axis, site.instances, site.rows) for site in indexed_sites
+        )
     config_spec.cute_staged_indexed_row_axes = tuple(
         (site.row_axis, site.k_axis, site.rows, site.k, site.paired)
-        for site in indexed_row_phases(env, device_ir)
+        for site in indexed_sites
     )
     config_spec.cute_tile_pack_counts = tile_pack_counts(env, device_ir)
 

@@ -1033,11 +1033,14 @@ class ForEachProgramID(ProgramIDs):
             barrier_stmt = backend.grid_barrier_stmt(sem_arg)
             if barrier_stmt is not None:
                 barrier_dtype = torch.uint32
+                words = backend.grid_barrier_scratch_words(
+                    device_function.config, len(boundaries) - 1
+                )
                 device_function.arguments.append(
                     TensorArg(
                         sem_arg,
-                        torch.empty(1, device="meta", dtype=barrier_dtype),
-                        f"torch.zeros((1,), device={strategy.get_device_str()}, dtype={barrier_dtype})",
+                        torch.empty(words, device="meta", dtype=barrier_dtype),
+                        f"torch.zeros(({words},), device={strategy.get_device_str()}, dtype={barrier_dtype})",
                     )
                 )
 
@@ -1672,9 +1675,7 @@ class PersistentProgramIDs(ProgramIDs):
             if transports := dsmem_transports(device_function):
                 reserved_arg += f", cluster_size={cluster_size(transports)}"
             device_function.codegen.host_statements.append(
-                statement_from_string(
-                    f"{NUM_SM_VAR} = helion.runtime.get_num_sm({self.get_device_str()}{reserved_arg})"
-                )
+                self.physical_grid_statement(reserved_arg)
             )
             if transports:
                 # The schedule takes the compile device's count, but another
@@ -1690,6 +1691,12 @@ class PersistentProgramIDs(ProgramIDs):
                         f" keeps ' + str({NUM_SM_VAR}))"
                     )
                 )
+
+    def physical_grid_statement(self, reserved_arg: str) -> ast.stmt:
+        """Initialize the one constexpr shared by the physical grid and all phases."""
+        return statement_from_string(
+            f"{NUM_SM_VAR} = helion.runtime.get_num_sm({self.get_device_str()}{reserved_arg})"
+        )
 
     def get_device_str(self) -> str:
         """Get the device string for the current device, reusing the first tensor's origin."""

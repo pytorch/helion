@@ -1071,6 +1071,10 @@ class Backend(abc.ABC):
         """
         return None
 
+    def grid_barrier_scratch_words(self, config: Config, joins: int) -> int:
+        """Number of private uint32 words to zero for a local phase pipeline."""
+        return 1
+
     def grid_barrier_stmt(self, sem_arg: str) -> str | None:
         """Statement emitted between persistent phases, if supported."""
         raise exc.BackendUnsupported(self.name, "hl.barrier()")

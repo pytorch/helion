@@ -785,7 +785,7 @@ def test_single_row_launch_refuses_a_larger_actual_block() -> None:
     # The host launch can widen the x axis after strategy planning. Extra
     # lanes would overlap or run beyond the last column.
     lanes = SimpleNamespace(single_row_publication_dims={dims}, launch_block=(8, 32, 1))
-    fn = SimpleNamespace(cute_state=SimpleNamespace(lanes=lanes))
+    fn = SimpleNamespace(config={}, cute_state=SimpleNamespace(lanes=lanes))
     with pytest.raises(exc.InvalidConfig, match="proved full CTA"):
         validate_publication_launch(fn, dims)
     lanes.launch_block = dims

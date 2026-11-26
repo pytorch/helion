@@ -604,6 +604,9 @@ def _get_compiled_cute_launcher(
     compile_options: str | None = None,
     arch_args: tuple[object, ...] | None = None,
 ) -> object:
+    cluster_shape = getattr(
+        cast("Any", cute_kernel), "_helion_cute_cluster_shape", None
+    )
     # Always ensure ``--enable-tvm-ffi`` is present on the generic launcher
     # path: the generated wrapper signature (``cute.Pointer`` + scalars) is
     # TVM-FFI compatible and the FFI bridge bypasses CUTLASS-DSL's per-arg
@@ -613,9 +616,6 @@ def _get_compiled_cute_launcher(
     # ``compile_options``.  The division option is merged the same way
     # (``merge_default_compile_options``): ``div.full.f32`` unless the
     # kernel's launch chose the IEEE division.
-    cluster_shape = getattr(
-        cast("Any", cute_kernel), "_helion_cute_cluster_shape", None
-    )
     cache_key, compile_options, num_sm = _cute_compiled_launcher_discriminator(
         schema_key,
         block,
@@ -633,6 +633,29 @@ def _get_compiled_cute_launcher(
     cached = cache.get(cache_key)
     if cached is not None:
         return cached
+
+    check_residency = getattr(
+        cast("Any", cute_kernel), "_helion_cute_check_residency", False
+    )
+    if check_residency and (
+        not _cute_cooperative(cute_kernel)
+        or getattr(cast("Any", cute_kernel), "_helion_cute_wrapper_plans", ())
+        or cluster_shape
+        or _cute_use_pdl(cute_kernel)
+    ):
+        raise exc.InvalidConfig(
+            "The cooperative residency check needs a single nonclustered "
+            "cooperative kernel with the generic CUDA launcher"
+        )
+
+    expected_grid_x = None
+    if check_residency:
+        from .cooperative_residency import stride_from_schema
+
+        expected_grid_x = stride_from_schema(
+            schema_key,
+            getattr(cast("Any", cute_kernel), "_helion_cute_grid_stride", None),
+        )
 
     if arch_args is not None:
         _ensure_cute_dsl_arch_env(arch_args)
@@ -667,6 +690,7 @@ def _get_compiled_cute_launcher(
             getattr(cast("Any", cute_kernel), "_helion_cute_sass_checks", ())
         ),
         kernel_name=getattr(cast("Any", cute_kernel), "__name__", "cute_kernel"),
+        expected_grid_x=expected_grid_x,
     )
     cache[cache_key] = launcher
     return launcher
@@ -3483,6 +3507,11 @@ def _cute_build_fast_relaunch(
     signature: ArgSignature | None = None,
 ) -> _CuteFastRelaunch | None:
     if not isinstance(compiled, _CompiledCuteLauncher):
+        return None
+    if compiled._proven_grids is not None:
+        # The packed executor may use a separately JIT-loaded C-API twin
+        # (capi_function). Its CUfunction is not the one we probed. Keep
+        # the original executable, including in warm CUDA graph capture.
         return None
     if cast("Any", compiled)._compiled is None:
         return None

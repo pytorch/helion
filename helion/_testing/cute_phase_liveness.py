@@ -272,3 +272,19 @@ def row_sum_after_independent_store(
             acc = acc + w[row, col].float() * x[col].float()[None, :]
         out[row] = torch.sum(acc, dim=-1)
     return out
+
+
+@helion.kernel(backend="cute", static_shapes=True)
+def ordered_column_pool(
+    values: torch.Tensor, peer: torch.Tensor, output: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    published = torch.empty_like(peer)
+    for i in hl.tile(peer.size(0)):
+        published[i] = peer[i] + 1
+    for batch, column in hl.tile(
+        [values.shape[0], values.shape[-1]], block_size=[1, None]
+    ):
+        output[batch, column] = (
+            values[batch, :, column].to(torch.float32).sum(dim=1).to(output.dtype)
+        )
+    return output, published

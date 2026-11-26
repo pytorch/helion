@@ -195,8 +195,11 @@ from .config_keys import CUTE_LOAD_HINT_FORM_KEYS
 from .config_keys import CUTE_TOPK_CHOICES
 from .config_keys import GRID_INIT_KEY
 from .config_keys import INDEXED_ROW_EPILOGUE_KEY
+from .config_keys import ORDERED_COLUMN_PAIRS_KEY
+from .config_keys import PHASE_PARTICIPATION_KEY
 from .config_keys import REUSE_INDEXED_INPUT_KEY
 from .config_keys import ROW_DOT_KEY
+from .config_keys import STAGED_GRID_KEY
 from .config_keys import STAGED_INDEXED_ROWS_KEY
 from .config_keys import VALID_CUTE_CHUNK_PREPARE_SCHEDULES
 from .config_keys import VALID_CUTE_CHUNK_RECURRENCE_REGISTER_CAPS
@@ -3325,6 +3328,16 @@ def normalize_knobs(
         fix_invalid=fix_invalid,
         fill=False,
     )
+    _normalize_gated_boolean(
+        config,
+        ORDERED_COLUMN_PAIRS_KEY,
+        enabled=bool(config_spec.cute_ordered_column_sum_roots),
+        requirement="a contiguous BF16 output with an ordered short FP32 slot reduction",
+        fix_invalid=fix_invalid,
+        fill=False,
+    )
+    if config.get(ORDERED_COLUMN_PAIRS_KEY) is False:
+        config.pop(ORDERED_COLUMN_PAIRS_KEY)
     if config.get("cute_single_row_publication") is False:
         config.pop("cute_single_row_publication")
     _normalize_gated_boolean(
@@ -3336,6 +3349,20 @@ def normalize_knobs(
         fix_invalid=fix_invalid,
         fill=False,
     )
+    _normalize_gated_boolean(
+        config,
+        "cute_packed_row_publication",
+        enabled=config_spec.cute_packed_publication_pattern
+        and bool(config_spec.cute_single_row_publication_roots)
+        and config.get("cute_parallel_row_sum") is True
+        and config_spec.target_device_capability is not None
+        and config_spec.target_device_capability[0] == 10,
+        requirement="a full-CTA BF16 row square-sum on SM100",
+        fix_invalid=fix_invalid,
+        fill=False,
+    )
+    if config.get("cute_packed_row_publication") is False:
+        config.pop("cute_packed_row_publication")
     if config.get("cute_parallel_row_sum") is False:
         config.pop("cute_parallel_row_sum")
     _normalize_cute_host_paired_sum(config_spec, config, fix_invalid=fix_invalid)
@@ -3852,6 +3879,21 @@ def normalize_after_sequences(
         fix_invalid=fix_invalid,
         fill=False,
     )
+    from .staged_projection_grid import normalize_staged_grid
+
+    normalize_staged_grid(config_spec, config, fix_invalid=fix_invalid)
+    from ..cooperative_row_normalization import can_offer as can_normalize_cooperatively
+
+    _normalize_gated_boolean(
+        config,
+        "cute_cooperative_row_norm",
+        enabled=can_normalize_cooperatively(config_spec, config),
+        requirement="a checked complete column-pair producer and adjacent packed RMS",
+        fix_invalid=fix_invalid,
+        fill=False,
+    )
+    if config.get("cute_cooperative_row_norm") is False:
+        config.pop("cute_cooperative_row_norm")
     _normalize_gated_boolean(
         config,
         INDEXED_ROW_EPILOGUE_KEY,
@@ -4721,6 +4763,10 @@ def cute_flat_fields(
                     "cute_single_row_publication",
                 ),
                 (
+                    config_spec.cute_column_sum_structure,
+                    ORDERED_COLUMN_PAIRS_KEY,
+                ),
+                (
                     config_spec.cute_row_publication_structure,
                     "cute_parallel_row_sum",
                 ),
@@ -4796,6 +4842,17 @@ def cute_flat_fields(
         or config_spec.cute_shared_row_carry_structure
     ):
         fields["cute_fragment_row_carry"] = BooleanFragment()
+    if config_spec.cute_staged_grid_structure:
+        fields[STAGED_GRID_KEY] = EnumFragment(choices=(1, 2, 3))
+        fields[PHASE_PARTICIPATION_KEY] = BooleanFragment()
+    if (
+        config_spec.cute_packed_publication_pattern
+        and config_spec.target_device_capability is not None
+        and config_spec.target_device_capability[0] == 10
+    ):
+        fields["cute_packed_row_publication"] = BooleanFragment()
+        if config_spec.cute_column_sum_structure:
+            fields["cute_cooperative_row_norm"] = BooleanFragment()
     if config_spec.cute_indexed_row_structure:
         fields[STAGED_INDEXED_ROWS_KEY] = BooleanFragment()
         fields[REUSE_INDEXED_INPUT_KEY] = BooleanFragment()
@@ -5593,7 +5650,8 @@ def cute_flat_fields(
         assert config_spec.cute_mma_dag_stages is not None
         assert config_spec.cute_mma_dag_store is not None
         assert config_spec.cute_mma_dag_exchange is not None
-        assert config_spec.cute_mma_dag_pass_warps is not None
+        pass_warps_fragment = config_spec.cute_mma_dag_pass_warps
+        assert pass_warps_fragment is not None
         loads_fragment = config_spec.cute_mma_dag_loads
         assert loads_fragment is not None
         derived_fragment = config_spec.cute_mma_dag_derived
@@ -5606,7 +5664,7 @@ def cute_flat_fields(
         fields[MMA_DAG_STAGES_KEY] = config_spec.cute_mma_dag_stages
         fields[MMA_DAG_STORE_KEY] = config_spec.cute_mma_dag_store
         fields[MMA_DAG_EXCHANGE_KEY] = config_spec.cute_mma_dag_exchange
-        fields[MMA_DAG_PASS_WARPS_KEY] = config_spec.cute_mma_dag_pass_warps
+        fields[MMA_DAG_PASS_WARPS_KEY] = pass_warps_fragment
         v_lag_fragment = config_spec.cute_mma_dag_v_lag
         if v_lag_fragment is not None:
             fields[MMA_DAG_V_LAG_KEY] = v_lag_fragment
@@ -5715,7 +5773,7 @@ def cute_flat_fields(
     if config_spec.cross_loop_pipeline is not None:
         fields["cross_loop_pipeline"] = config_spec.cross_loop_pipeline
     fields.update(config_spec.user_defined_tunables)
-    if config_spec.cute_radix_selection_graph is not None:
+    if (radix := config_spec.cute_radix_selection_graph) is not None:
         fields[RADIX_ALGORITHM_KEY] = EnumFragment(choices=RADIX_ALGORITHMS)
         fields.update(
             (key, EnumFragment(choices=choices))
@@ -5725,8 +5783,7 @@ def cute_flat_fields(
         fields.update(
             (key, BooleanFragment())
             for key in RADIX_BOOLEAN_KEYS
-            if key != "cute_radix_valid_domain"
-            or config_spec.cute_radix_selection_graph.largest
+            if key != "cute_radix_valid_domain" or radix.largest
         )
         fields.update(
             (key, EnumFragment(choices=choices))
@@ -5753,12 +5810,19 @@ def flatten_missing_field_default(
         return True, "off"
     if key == "cute_gathered_page_stages":
         return True, 2
+    if key == PHASE_PARTICIPATION_KEY:
+        return True, False
+    if key == STAGED_GRID_KEY:
+        return True, 1
     if key in (
         "cute_fragment_private_scalar_loops",
         GRID_INIT_KEY,
         "cute_warp_row_reductions",
         "cute_single_row_publication",
         "cute_parallel_row_sum",
+        ORDERED_COLUMN_PAIRS_KEY,
+        "cute_packed_row_publication",
+        "cute_cooperative_row_norm",
         INDEXED_ROW_EPILOGUE_KEY,
         REUSE_INDEXED_INPUT_KEY,
         STAGED_INDEXED_ROWS_KEY,

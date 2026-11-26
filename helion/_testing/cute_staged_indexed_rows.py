@@ -15,7 +15,7 @@ def selected_projection_pair(
     down: torch.Tensor,
     ids: torch.Tensor,
     scores: torch.Tensor,
-    scale: torch.Tensor,
+    _cute_join_active: torch.Tensor,
     eps: float,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     batches, width = x.shape
@@ -42,7 +42,7 @@ def selected_projection_pair(
         h = hl.zeros([m], dtype=torch.float32)
         for k in hl.tile(width):
             vector = (x[bi, k].float() * inv).to(x.dtype)
-            normal = (vector * scale[k]).to(x.dtype).float()
+            normal = (vector * _cute_join_active[k]).to(x.dtype).float()
             a = a + torch.sum(matrix[low, k].float() * normal, dim=-1)
             h = h + torch.sum(matrix[high, k].float() * normal, dim=-1)
         mid[bi * slots + si, m] = a.to(x.dtype)
