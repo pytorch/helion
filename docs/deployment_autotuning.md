@@ -764,6 +764,8 @@ heuristic**.  At runtime, the heuristic picks a tuned config for the
 caller's shape in microseconds — no autotuner involved.  The pretuned
 kernels under [`pretuned_kernels/`](https://github.com/pytorch/helion/tree/main/pretuned_kernels)
 ship pretuned heuristic files that demonstrate this end-to-end.
+To publish a kernel together with its heuristic files on the Hugging Face
+Kernel Hub, see {doc}`hf_kernels`.
 
 ### When to use AOT
 
