@@ -1,8 +1,9 @@
-"""The shared-memory carveout preference the CuTe launcher passes
+"""The CuTe launcher’s residency and shared-memory carveout preferences
 (``helion.runtime.cute.launch_descriptor.preferred_smem_carveout``)."""
 
 from __future__ import annotations
 
+import ast
 import inspect
 import re
 from types import SimpleNamespace
@@ -14,6 +15,7 @@ import pytest
 import torch
 
 from helion.runtime.cute import launcher
+from helion.runtime.cute.compile_cache import disk_cache_key
 from helion.runtime.cute.launch_descriptor import DRIVER_DEFAULT_SMEM_CARVEOUT
 from helion.runtime.cute.launch_descriptor import min_blocks_per_mp
 from helion.runtime.cute.launch_descriptor import preferred_smem_carveout
@@ -171,3 +173,27 @@ def test_the_fa4_topology_launches_one_cta_per_sm() -> None:
     )
     assert min_blocks_per_mp(_kernel(), [{"topology": "ws_overlap"}]) is None
     assert min_blocks_per_mp(_kernel(min_blocks_per_mp=True)) is None
+
+
+def test_cooperative_marker_changes_the_launch_and_its_cache_key() -> None:
+    keys = []
+    for marked in (False, True):
+        kernel = SimpleNamespace(_helion_cute_source_hash="same source")
+        if marked:
+            kernel._helion_cute_cooperative = True
+        wrapper = launcher._create_cute_wrapper(kernel, (), (32, 1, 1))
+        (launch,) = [
+            node
+            for node in ast.walk(ast.parse(inspect.getsource(wrapper)))
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "launch"
+        ]
+        flags = [
+            ast.literal_eval(kw.value)
+            for kw in launch.keywords
+            if kw.arg == "cooperative"
+        ]
+        assert flags == ([True] if marked else [])
+        keys.append(disk_cache_key(kernel, (), (32, 1, 1), (), None, None))
+    assert None not in keys and keys[0] != keys[1]

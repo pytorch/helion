@@ -26,6 +26,7 @@ from typing import TYPE_CHECKING
 from typing import Any
 from typing import cast
 
+from .launch_descriptor import cooperative
 from .launch_descriptor import preferred_smem_carveout
 from .launch_descriptor import use_pdl
 from .source_dependencies import referenced_helper_sources
@@ -495,6 +496,7 @@ def disk_cache_key(
             cutlass_version,
             num_sm,
             use_pdl(cute_kernel),
+            *(("cooperative",) if cooperative(cute_kernel) else ()),
             *(() if resident_clusters is None else (resident_clusters,)),
             *checker,
         )
