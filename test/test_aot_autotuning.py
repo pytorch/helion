@@ -1358,6 +1358,34 @@ def test_static_aot_compile_serializes_concurrent_variants(
     AOTAutotuneCache.clear_caches()
 
 
+_AOT_INT_DIVISOR = 4
+
+
+@onlyBackends(["triton", "cute"])
+@skipIfRefEager("checks the generated code, which ref mode does not build")
+def test_aot_cache_keeps_int_globals_runtime_arguments() -> None:
+    # An AOT standalone artifact cannot compile again when a global changes,
+    # so under the AOT cache a module-level int global stays an argument the
+    # kernel reads when it runs, not a constant of the binding.
+    @helion.kernel(
+        static_shapes=True,
+        autotune_effort="none",
+        autotune_cache="AOTAutotuneCache",
+    )
+    def add_block_index(x: torch.Tensor) -> torch.Tensor:
+        out = torch.empty_like(x)
+        for tile in hl.tile(x.size(0)):
+            out[tile] = x[tile] + (tile.index // _AOT_INT_DIVISOR).to(x.dtype)
+        return out
+
+    with cpu_render_target():
+        bound = cpu_bind(add_block_index, (torch.zeros(64),))
+        code = bound.to_code(bound.config_spec.default_config())
+    generated = "\n".join(line for line in code.splitlines() if "src[" not in line)
+    assert "_AOT_INT_DIVISOR" in generated
+    assert bound.env.specialized_globals == {}
+
+
 @helion.aot_kernel()
 def _explicit_aot_pointwise(x):
     out = torch.empty_like(x)

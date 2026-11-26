@@ -372,9 +372,10 @@ def _function_fast_dispatch_key(
     traced (``lift_closures`` passes ``__defaults__`` through), so they key by
     value like constexpr arguments; a default the constexpr rules cannot key
     (a tensor, a function) keeps the slow path.  Module globals the function
-    reads are not part of the key: like the kernel's own globals they are read
-    from the module when the kernel runs and specialized once, on the first
-    call's values.
+    reads are not part of the key: like the kernel's own globals, an int
+    among them is a constant of the binding whose value the binding's
+    schema reads on every call, and any other value is read from the module
+    when the kernel runs and specialized once, on the first call's values.
     """
     closure = fn.__closure__
     defaults = _function_defaults_fast_dispatch_key(fn)
@@ -942,6 +943,67 @@ class _HostModesTrustedExtractor:
             # a dispatch mode eagerly (where the full check applies).
             return function_modes_trusted()
         return host_modes_trusted()
+
+
+_MISSING_GLOBAL = object()
+
+
+@dataclasses.dataclass(frozen=True)
+class _ModuleGlobalExtractor:
+    """The current value of a module-level int global that a binding
+    compiled as a constant (``CompileEnvironment.specialized_globals``).
+    Module state changes between calls with the same arguments, so this runs
+    on every call; a new value misses the binding and compiles again."""
+
+    module: types.ModuleType
+    name: str
+
+    def __call__(self, args: Sequence[object]) -> Hashable:
+        value = getattr(self.module, self.name, _MISSING_GLOBAL)
+        if type(value) is int:
+            return (int, value)
+        # Any other value misses every compiled int and compiles again.  A
+        # float or bool is then lifted and read at run time, so its type is
+        # key enough; anything else (a container, a deleted name) keys by id.
+        if type(value) in (float, bool):
+            return (type(value),)
+        return (type(value), id(value))
+
+
+def _compiled_result(
+    env: CompileEnvironment,
+    extractor: Callable[[Sequence[object]], Hashable],
+    result: Hashable,
+) -> Hashable:
+    """``result`` of ``extractor`` with each module int global that ``env``
+    compiled as a constant read as the value its code holds.  A key reads
+    the module before the trace (a lookup) or after it (a new key), so a
+    global another thread assigns in between would file the binding under a
+    value it does not compute with."""
+    if isinstance(extractor, _ModuleGlobalExtractor):
+        value = env.specialized_globals.get((extractor.module, extractor.name))
+        return result if value is None else (int, value)
+    if isinstance(extractor, _SpecializationAlias) and isinstance(result, tuple):
+        inner = extractor.schemas.get(extractor.canonical_signature)
+        if inner is not None and len(inner) == len(result):
+            return tuple(
+                _compiled_result(env, fn, r)
+                for fn, r in zip(inner, result, strict=True)
+            )
+    return result
+
+
+def _module_global_extractors(env: CompileEnvironment) -> list[_ModuleGlobalExtractor]:
+    """An extractor per module int global a binding compiled as a constant
+    (``CompileEnvironment.specialized_globals``), in a stable order."""
+    return list(
+        itertools.starmap(
+            _ModuleGlobalExtractor,
+            sorted(
+                env.specialized_globals, key=lambda item: (item[0].__name__, item[1])
+            ),
+        )
+    )
 
 
 def _implied_by_exact_metadata(
@@ -2272,7 +2334,10 @@ class Kernel(Generic[_R]):
                 )
                 with unset_fake_temporarily():
                     current_results = tuple(
-                        extractor(full_args) for extractor in updated_extractors
+                        _compiled_result(
+                            bound_kernel.env, extractor, extractor(full_args)
+                        )
+                        for extractor in updated_extractors
                     )
                     current_compiler_seed_results = tuple(
                         extractor(full_args) for extractor in compiler_seed_fns
@@ -2352,6 +2417,65 @@ class Kernel(Generic[_R]):
                 bound_kernel._compile_cache.clear()
                 bound_kernel._cache_path_map.clear()
             return True
+
+    def _publish_module_globals(self, bound_kernel: BoundKernel) -> bool:
+        """Append to the signature's published dispatch schema the module int
+        globals ``bound_kernel`` compiled as constants that it does not read
+        yet, and return whether it changed.
+
+        Which globals a binding reads can depend on the values of others (an
+        ``if`` on one picks the branch that reads the next), and each signature
+        keys on the schema its first binding published.  The signature's other
+        bounds read none of the new globals, so they are re-keyed in place
+        with the globals' current values, as ``_publish_guard_facts`` re-keys.
+        """
+        from ..autotuner.base_cache import BoundKernelInMemoryCacheKey
+
+        signature = bound_kernel._base_spec_key
+        with self._bind_lock, self._specialize_extra_lock:
+            if bound_kernel._reset_generation != self._reset_generation:
+                return False
+            published = self._specialize_extra.get(signature)
+            if published is None:
+                return False
+            new = [
+                extractor
+                for extractor in _module_global_extractors(bound_kernel.env)
+                if extractor not in published
+            ]
+            if not new:
+                return False
+            results = tuple(extractor(()) for extractor in new)
+            aliases = {
+                alias_signature: alias
+                for alias_signature, alias in self._specialization_aliases.items()
+                if alias.canonical_signature == signature
+            }
+            for key, bound in list(self._bound_kernels.items()):
+                if key.specialization_key not in (signature, *aliases):
+                    continue
+                del self._bound_kernels[key]
+                if key.specialization_key == signature:
+                    self._bound_kernels[
+                        BoundKernelInMemoryCacheKey(
+                            signature,
+                            (*key.extra_results, *results),
+                            compiler_seed_results=key.compiler_seed_results,
+                        )
+                    ] = bound
+            # Replacing a published list requires the generation bump below.
+            self._specialize_extra[signature] = [*published, *new]
+            for alias_signature, alias in aliases.items():
+                if alias_signature in self._specialize_extra:
+                    self._specialize_extra[alias_signature] = [alias]
+            self._has_specialization_extras = True
+            self._specialization_generation += 1
+            self._fast_dispatch_schemas = {}
+            for fast_key, cached_bound in list(self._dispatch_cache.items()):
+                if cached_bound._base_spec_key == signature:
+                    del self._dispatch_cache[fast_key]
+            self._prepared_call = None
+        return True
 
     def _publish_guard_facts(
         self,
@@ -2720,6 +2844,13 @@ class Kernel(Generic[_R]):
                 return None
             if bound._reset_generation != self._reset_generation:
                 return None
+            if any(
+                _compiled_result(bound.env, fn, result) != result
+                for fn, result in fast_entry.extra_guards
+            ):
+                # The key read a module int global at another value than
+                # ``bound`` compiled (assigned meanwhile).
+                return None
             dist_initialized = dist.is_initialized()
             is_distributed = self._compute_is_distributed(
                 args, dist_initialized=dist_initialized
@@ -2890,6 +3021,8 @@ class Kernel(Generic[_R]):
                         bound_kernel, signature, extensions, args
                     )
                     cache_key = self._get_bound_kernel_cache_key(args, signature)
+                if created and self._publish_module_globals(bound_kernel):
+                    cache_key = self._get_bound_kernel_cache_key(args, signature)
                 if cache_key is None:
                     cache_key = self._create_bound_kernel_cache_key(
                         bound_kernel,
@@ -2907,12 +3040,41 @@ class Kernel(Generic[_R]):
                             published_extra_fns,
                             cache_key.extra_results,
                         )
+                if bound_kernel.env.specialized_globals:
+                    cache_key = self._key_by_compiled_globals(
+                        bound_kernel, signature, cache_key
+                    )
                 self._bound_kernels[cache_key] = bound_kernel
                 if created:
                     # Key the input-shape guards this compile recorded.
                     bound_kernel._publish_guarded_input_facts()
             self._retain_opaque_binding(bound_kernel)
             return bound_kernel
+
+    def _key_by_compiled_globals(
+        self,
+        bound_kernel: BoundKernel,
+        signature: tuple[Hashable, ...],
+        cache_key: BoundKernelInMemoryCacheKey,
+    ) -> BoundKernelInMemoryCacheKey:
+        """``cache_key`` with its module int global slots set to the values
+        ``bound_kernel`` compiled (:func:`_compiled_result`); lookups keep
+        reading the module."""
+        from ..autotuner.base_cache import BoundKernelInMemoryCacheKey
+
+        with self._specialize_extra_lock:
+            extra_fns = self._specialize_extra.get(signature)
+        if extra_fns is None or len(extra_fns) != len(cache_key.extra_results):
+            # The schema moved on: no lookup reads this key's layout.
+            return cache_key
+        return BoundKernelInMemoryCacheKey(
+            cache_key.specialization_key,
+            tuple(
+                _compiled_result(bound_kernel.env, fn, result)
+                for fn, result in zip(extra_fns, cache_key.extra_results, strict=True)
+            ),
+            compiler_seed_results=cache_key.compiler_seed_results,
+        )
 
     def _retain_opaque_binding(self, bound: BoundKernel) -> None:
         """Bound owner retention for identity-sensitive opaque helper calls.
@@ -4717,6 +4879,7 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
             and not tensor_descriptor_alignment_guards
             and not self.env.runtime_input_specializations
             and not self.env.torch_mode_sensitive
+            and not self.env.specialized_globals
         ):
             return []
 
@@ -4995,6 +5158,7 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
             )
         if self.env.torch_mode_sensitive:
             extractors.append(_HostModesTrustedExtractor())
+        extractors.extend(_module_global_extractors(self.env))
         return extractors
 
     def _publish_guarded_input_facts(self) -> None:

@@ -951,7 +951,7 @@ class DeviceFunction:
         env = CompileEnvironment.current()
         with contextlib.suppress(Exception):
             expr = env.shape_env.simplify(expr)
-        expr = env.specialize_expr(expr)
+        expr = env.substitute_specialized_globals(env.specialize_expr(expr))
         host = HostFunction.current()
         resolved = host.resolve_tunable_expr(expr, self.config)
         if isinstance(resolved, (int, float, bool)):

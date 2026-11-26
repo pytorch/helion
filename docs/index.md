@@ -72,6 +72,13 @@ kernels more performance portable between different hardware. Helion automates a
 
     * Automates the handling of kernel arguments, including tensor sizes and strides.
     * Lifts global variables and (nested) closures into kernel arguments, allowing better templating.
+      A module-level `int` the kernel reads by name is specialized instead: the kernel is keyed on its
+      value and the generated code reads that value as a constant, so assigning it a new value compiles
+      the kernel again on its next call, and autotunes it again unless a config is fixed, once per
+      distinct value (pass a value that changes often as an argument). It is lifted like any other
+      global, for every call, where a new value could not compile again: under the AOT autotune cache,
+      and on older PyTorch builds without Helion's `torch.compile` fusion support, where `torch.compile`
+      traces the kernel call inline (except on the CuTe backend, which it never traces).
 
 6. **Looping Reductions:**
 
