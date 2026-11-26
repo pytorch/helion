@@ -10,11 +10,32 @@ The `helion.exc` module provides an exception hierarchy for error handling and d
 
 Helion's exception system provides detailed error messages with automatic source location tracking. All exceptions inherit from `Base` and provide formatted error reports that help identify exactly where and why compilation failed.
 
-Helion's built-in backends currently reject `torch._assert_async(predicate)`
-and `torch._assert_async(predicate, message)` in device loops. When a traced
-assertion reaches lowering, it raises `helion.exc.BackendUnsupported`. The
-error can name `aten._assert_async.msg` for either spelling, because Helion
-traces the effect using the message overload. Compilation fails rather than silently removing the check.
+CuTe can lower `torch._assert_async(predicate)` and
+`torch._assert_async(predicate, message)` for a computed rank-zero Boolean
+in supported device fragments. An unsupported CuTe assertion, or a traced
+assertion on a backend without this lowering, raises
+`helion.exc.BackendUnsupported`. The error can name `aten._assert_async.msg`
+for either spelling, because Helion traces the effect using the message
+overload. A predicate whose element count is known at trace time and is not one raises
+`helion.exc.TorchOpTracingError` during tracing, before backend lowering.
+If the CuTe launch configuration cannot keep the check in its producing
+thread block, compilation raises `helion.exc.InvalidConfig`.
+
+A false predicate triggers a CUDA device assertion at execution, which may
+first be reported at the next synchronization. The assertion only tests
+its predicate: CuTe must prove that unmasked reads in the checked fragment
+stay in bounds, but stores keep their normal upper-bound mask. Skipping an
+out-of-bounds store lane does not itself trigger a device assertion.
+When a checked scalar expression depends on a runtime Python float, CuTe
+declines it because the launcher passes that argument at Float32 precision.
+A Float64 tensor input retains its precision.
+CuTe also declines a checked fragment when a nested loop reuses a block
+size registered by an enclosing active tile: the two tile bounds must
+remain distinguishable for the assertion to be reliable.
+
+CuTe embeds the UTF-8 message and its terminating null byte in the
+generated device code. It accepts at most 254 bytes of message text;
+a longer message raises `helion.exc.InvalidAPIUsage` at compile time.
 
 Device assertions are also unsupported in the combine functions passed to
 `hl.reduce` or `hl.associative_scan`: the compiler may discard an unused

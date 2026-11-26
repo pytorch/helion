@@ -54,6 +54,7 @@ from .fragment_domain import render_ownership
 from .fragment_storage import aligned_shared_bytes
 from .fragment_storage import configured_fragment_expr
 from .fragment_storage import metadata_guarded
+from .handler_ops import integer_to_float_expr
 from .local_atomic_registers import MAX_SLOTS
 from .local_atomic_registers import local_atomic_register_chains
 from .private_scalar_loops import private_scalar_loop_nodes
@@ -61,6 +62,10 @@ from .register_snapshots import SnapshotBinding
 from .register_snapshots import SnapshotOwner
 from .register_snapshots import snapshot_chains
 from .register_snapshots import snapshot_logical_shape
+from .scalar_fragment_assertion import check_literal_assignment
+from .scalar_fragment_assertion import checked_predicate_wide
+from .scalar_fragment_assertion import checked_scalar_wide
+from .scalar_fragment_assertion import requires_assertion_owner
 from .selection.ordered_selection import is_ordered_selection
 from .selection.ordered_selection import ordered_selection_args
 from .warp_results import warp_result_chain
@@ -487,6 +492,8 @@ class FragmentContext:
         self.stride_operands: dict[str, tuple[str, str, str]] = {}
         self.host_step_statements: list[ast.stmt] = []
         self.host_step_arguments: list[SymbolArgument] = []
+        self.checked_domains: dict[str, range] = {}
+        self.checked_root = requires_assertion_owner(self.env.config_spec)
         self.allocator = ""
         self.smem_bytes = 0
         self.buffers: list[tuple[str, torch.dtype, int]] = []
@@ -747,6 +754,8 @@ class FragmentContext:
     def sym(self, value: object, *, wide: bool = False) -> str:
         if isinstance(value, str):
             return value
+        if self.checked_root and isinstance(value, torch.SymBool):
+            wide |= checked_predicate_wide(self, value._sympy_())
         if isinstance(value, (torch.SymInt, torch.SymFloat, torch.SymBool)):
             value = value._sympy_()
         if isinstance(value, sympy.Basic):
@@ -799,6 +808,42 @@ class FragmentContext:
             assert math.prod(value.shape) == 1
             return value.read(tuple("0" for _ in value.shape))
         return self.sym(value, wide=wide)
+
+    def value_scalar(
+        self,
+        value: object,
+        tensor_dtypes: tuple[torch.dtype, ...] = (),
+        *,
+        assignment_dtype: torch.dtype | None = None,
+    ) -> str:
+        """Render a value separately from an address or a loop header."""
+        if self.checked_root and assignment_dtype is not None:
+            if isinstance(value, (int, float)):
+                check_literal_assignment(value, assignment_dtype)
+            elif isinstance(value, torch.SymFloat):
+                # A binding hint does not guard later calls; a Python float
+                # kernel argument may even round before the device sees it.
+                raise exc.BackendUnsupported(
+                    "cute",
+                    f"a checked symbolic float assignment not proved to fit {assignment_dtype}",
+                )
+        if self.checked_root and isinstance(value, torch.SymFloat):
+            # The CuTe scalar ABI transports Python floats in Float32. A bind
+            # hint cannot prove that later calls are exactly representable.
+            raise exc.BackendUnsupported(
+                "cute", "a checked symbolic float operand may lose precision"
+            )
+        wide = (
+            self.checked_root
+            and isinstance(value, torch.SymInt)
+            and checked_scalar_wide(
+                self,
+                value._sympy_(),
+                tensor_dtypes,
+                assignment_dtype=assignment_dtype,
+            )
+        )
+        return self.scalar(value, wide=wide)
 
     def host_stride(self, tensor: HostTensor, dim: int) -> str:
         # Fresh wrapper allocations have configured symbolic strides, which
@@ -964,6 +1009,20 @@ class FragmentContext:
 
     def dtype(self, dtype: torch.dtype) -> str:
         return self.env.backend.dtype_str(dtype)
+
+    def convert(
+        self, expression: str, source: torch.dtype | None, dtype: torch.dtype
+    ) -> str:
+        """``expression``, of dtype ``source``, cast to ``dtype``: an integer
+        or a bool becomes a float as in the pointwise lowering
+        (``integer_to_float_expr``), where MLIR could fold an 8-bit float
+        conversion into it."""
+        converted = integer_to_float_expr(
+            expr_from_string(expression), dtype, source, self.cg.device_function
+        )
+        if converted is None:
+            return self.cast(expression, dtype)
+        return ast.unparse(converted)
 
     def cast(self, expression: str, dtype: torch.dtype) -> str:
         return f"{self.dtype(dtype)}({expression})"
