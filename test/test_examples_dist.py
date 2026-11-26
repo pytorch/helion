@@ -387,17 +387,12 @@ class TestExamplesDist(TestCase, MultiProcessTestCase):
             .T
         )
         b = b.to(FP8_DTYPE)
-        scale_a = (
-            torch.rand((M_per_rank, 1), device=self.device, dtype=torch.float32) * 0.05
-            + 0.01
+        # Scales near 1 that differ by row and by rank: a row read with another
+        # row's scale, or none, shows in the bf16 output
+        scale_a = (torch.rand((M_per_rank, 1), device=self.device) + 0.5) * (
+            self.rank + 1
         )
-        scale_b = (
-            torch.rand((1, N), device=self.device, dtype=torch.float32) * 0.05 + 0.01
-        )
-        min_val = 1e-4
-        max_val = 100
-        scale_a = scale_a.clamp(min=min_val, max=max_val)
-        scale_b = scale_b.clamp(min=min_val, max=max_val)
+        scale_b = torch.rand((1, N), device=self.device) + 0.5
 
         result = mod.helion_ag_matmul(
             a_shared, b, scale_a, scale_b, self.world_size, group
@@ -409,7 +404,7 @@ class TestExamplesDist(TestCase, MultiProcessTestCase):
             a_shared, b, scale_a, scale_b, self.world_size, group
         )
 
-        torch.testing.assert_close(result, expected, rtol=1e-1, atol=1e-1)
+        torch.testing.assert_close(result, expected, rtol=2e-2, atol=2e-2)
 
         self._cleanup_process()
 
