@@ -1657,13 +1657,24 @@ class ConfigSpec:
         self.cute_fragment_reduction_search_enabled = False
         self.cute_fragment_reduction_shared = False
         self.cute_fragment_cta_requires_flat = False
+        self.cute_explicit_local_barrier = False
         self.cute_fragment_warp_topk_requires_flat = False
         self.cute_fragment_warp_reduction_requires_flat = False
+        self.cute_row_publication_structure = False
+        self.cute_row_reduction_structure = False
+        self.cute_indexed_row_structure = False
+        self.cute_row_epilogue_structure = False
+        self.cute_single_row_publication_roots: dict[int, tuple[int, int]] = {}
         self.cute_warp_row_reduction_roots: dict[int, tuple[int, int, int, int]] = {}
         # Flat field presence follows the carry's FX structure. Physical roots
         # and extents below authorize a choice separately on each binding.
         self.cute_warp_row_dot_structure = False
         self.cute_shared_row_carry_structure = False
+        self.cute_reusable_row_inputs: dict[int, int] = {}
+        self.cute_indexed_row_epilogue_axes: tuple[tuple[int, ...], ...] = ()
+        self.cute_staged_indexed_row_axes: tuple[
+            tuple[int, int, int, int, bool], ...
+        ] = ()
         self.cute_warp_row_dot_roots: dict[int, tuple[tuple[int, int], ...]] = {}
         self.cute_fragment_compact_row_extents: dict[int, int] = {}
         self.cute_fragment_row_carry_root_ids: frozenset[int] = frozenset()
@@ -1695,6 +1706,7 @@ class ConfigSpec:
         ] = ()
         self.cute_fragment_warp_scan_search_enabled = False
         self.cute_fragment_topk_network_root_ids: frozenset[int] = frozenset()
+        self.cute_shared_selection_network_root_ids: frozenset[int] = frozenset()
         self.cute_fragment_topk_network_search_enabled = False
         self.cute_fragment_cta_topk_root_ids: frozenset[int] = frozenset()
         self.cute_fragment_cta_topk_search_enabled = False

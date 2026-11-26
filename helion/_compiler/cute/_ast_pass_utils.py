@@ -227,6 +227,43 @@ def call_path_str(node: ast.AST) -> str | None:
     return None if path is None else ".".join(path)
 
 
+def block_uniform_scalar(
+    value: ast.AST,
+    name_uniform: Callable[[str], bool],
+    calls: Collection[str],
+    *,
+    integer_literals: bool = False,
+) -> bool:
+    """Prove only scalar arithmetic on uniform names and physical block indices."""
+
+    def visit(expr: ast.AST) -> bool:
+        if isinstance(expr, ast.Constant):
+            return not integer_literals or type(expr.value) in (int, bool)
+        if isinstance(expr, ast.Name):
+            return name_uniform(expr.id)
+        if isinstance(expr, (ast.BinOp, ast.UnaryOp, ast.BoolOp, ast.Compare)):
+            return all(
+                visit(n) for n in ast.iter_child_nodes(expr) if isinstance(n, ast.expr)
+            )
+        if isinstance(expr, ast.Call):
+            return (
+                call_path_str(expr.func) in calls
+                and not expr.keywords
+                and all(visit(a) for a in expr.args)
+            )
+        return (
+            isinstance(expr, ast.Subscript)
+            and isinstance(expr.value, ast.Call)
+            and call_path(expr.value.func) == ("cute", "arch", "block_idx")
+            and not expr.value.args
+            and not expr.value.keywords
+            and isinstance(expr.slice, ast.Constant)
+            and expr.slice.value in (0, 1, 2)
+        )
+
+    return visit(value)
+
+
 def callee_name(node: ast.AST) -> str | None:
     """The last component of a ``Name`` / ``Attribute`` callee (``a().b``
     included), the way the DSL preprocessor matches loops and tests."""
@@ -275,6 +312,68 @@ def same_expr(left: ast.AST, right: ast.AST) -> bool:
     """Structural equality ignoring source positions."""
     return ast.dump(left, include_attributes=False) == ast.dump(
         right, include_attributes=False
+    )
+
+
+def scalar_index_cast_arg(n: ast.AST) -> ast.expr | None:
+    """The value inside one emitted integer index cast."""
+    if (
+        isinstance(n, ast.Call)
+        and ast.unparse(n.func) in ("cutlass.Int32", "cutlass.Int64")
+        and len(n.args) == 1
+        and not n.keywords
+    ):
+        return n.args[0]
+    return None
+
+
+def scalar_index_offsets(n: ast.AST, tensor: str, dims: int) -> list[ast.expr] | None:
+    """Invert the canonical address of one scalar tensor access; no pointer algebra."""
+    parts = []
+    for i in reversed(range(dims)):
+        if not (
+            isinstance(n, ast.BinOp)
+            and isinstance(n.op, ast.Add)
+            and isinstance(term := n.right, ast.BinOp)
+            and isinstance(term.op, ast.Mult)
+            and (v := scalar_index_cast_arg(term.left)) is not None
+            and (step := scalar_index_cast_arg(term.right)) is not None
+            and ast.unparse(step) == f"{tensor}.layout.stride[{i}]"
+        ):
+            return None
+        parts.append(v)
+        n = n.left
+    return list(reversed(parts)) if ast.unparse(n) == f"{tensor}.iterator" else None
+
+
+def scalar_tensor_access(n: ast.Call) -> tuple[str, str] | None:
+    """Return the unique base tensor and operation of a scalar load or store."""
+    if not (
+        isinstance(n.func, ast.Attribute)
+        and n.func.attr in ("load", "store")
+        and not n.keywords
+        and len(n.args) == (n.func.attr == "store")
+    ):
+        return None
+    bases = {
+        a.value.id if isinstance(a.value, ast.Name) else None
+        for a in ast.walk(n.func.value)
+        if isinstance(a, ast.Attribute) and a.attr == "iterator"
+    }
+    if len(bases) != 1 or (base := bases.pop()) is None:
+        return None
+    return (base, n.func.attr)
+
+
+def scalar_index_ptr(name: str, *coords: str) -> str:
+    """Form the stride-based pointer used by ordinary scalar tensor stores."""
+    return (
+        name
+        + ".iterator"
+        + "".join(
+            f" + cutlass.Int32({x}) * cutlass.Int32({name}.layout.stride[{i}])"
+            for i, x in enumerate(coords)
+        )
     )
 
 

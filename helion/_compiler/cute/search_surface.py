@@ -232,6 +232,8 @@ def register_search_surface(device_ir: DeviceIR, config_spec: ConfigSpec) -> Non
     env = CompileEnvironment.current()
     env_state = cute_env_state(env)
     register_lane_vector_width_specs(config_spec)
+    from .analysis.indexed_row_phases import indexed_row_phases
+    from .analysis.routed_row_schema import register_row_schema
     from .guarded_lanes import has_guarded_lane_sites
     from .half_extremum_folds import has_half_extremum_reduction
     from .handler_ops import has_fp32_extrema
@@ -242,6 +244,11 @@ def register_search_surface(device_ir: DeviceIR, config_spec: ConfigSpec) -> Non
     from .signed_bitfield import has_signed_byte_field
     from .tile_packing import tile_pack_counts
 
+    register_row_schema(env, device_ir)
+    config_spec.cute_staged_indexed_row_axes = tuple(
+        (site.row_axis, site.k_axis, site.rows, site.k, site.paired)
+        for site in indexed_row_phases(env, device_ir)
+    )
     config_spec.cute_tile_pack_counts = tile_pack_counts(env, device_ir)
 
     # Under ``Settings.cute_exact_division``, an fp32 quotient by a scalar or

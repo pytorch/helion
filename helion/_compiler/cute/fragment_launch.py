@@ -10,6 +10,15 @@ if TYPE_CHECKING:
     from ...autotuner.config_spec import ConfigSpec
 
 
+def uses_shared_barrier(spec: ConfigSpec, config: Mapping[str, object]) -> bool:
+    """Whether several roots share a CTA across a local grid barrier."""
+    return config.get("cross_loop_pipeline") == "barrier" or (
+        spec.cute_explicit_local_barrier
+        and config.get("pid_type", spec.allowed_pid_types[0])
+        in ("persistent_blocked", "persistent_interleaved")
+    )
+
+
 def fragment_option_fits_shared_block(
     key: str,
     value: object,

@@ -18,6 +18,8 @@ from helion._testing.cute_phase_liveness import row_sum_two_outputs
 from helion._testing.cute_phase_liveness import selected_rows_after_producer
 from helion._testing.cute_phase_liveness import selected_rows_config
 from helion._testing.cute_phase_liveness import slice_sum_phases
+from helion._testing.cute_staged_indexed_rows import selected_projection_pair
+from helion._testing.cute_staged_indexed_rows import selected_projection_with_epilogue
 
 
 @pytest.mark.parametrize("tensor_indices", [False, True])
@@ -66,7 +68,9 @@ def test_warp_routing_consumes_a_preceding_persistent_phase(pid_type):
         torch.testing.assert_close(result, values + payload[indices], rtol=0, atol=0)
 
 
-@pytest.mark.parametrize("mode", ["direct", "negative_gather", "wrapped_gather"])
+@pytest.mark.parametrize(
+    "mode", ["direct", "negative_gather", "wrapped_gather", "explicit_network"]
+)
 def test_grouped_selection_preserves_the_unpadded_index_domain(mode):
     rows, groups, width = 307, 2, 31
     # Strictly negative unique scores make a zero-padded 32nd lane observable.
@@ -75,8 +79,16 @@ def test_grouped_selection_preserves_the_unpadded_index_domain(mode):
     ).view(rows, -1)
     payload = torch.arange(groups * width, dtype=x.dtype, device=DEVICE).square()
     out = torch.empty((rows, groups, 4), dtype=x.dtype, device=DEVICE)
-    bound = grouped_selection_after_producer.bind((x, payload, out, mode))
-    fn = bound.compile_config(routed_phase_config(8, warp=False))
+    config = routed_phase_config(8, warp=False)
+    if mode == "explicit_network":
+        del config.config["cross_loop_pipeline"]
+        config.config["cute_fragment_topk_network"] = True
+        args = (x, payload, out, "direct")
+        bound = explicit_direct_selection.bind(args)
+    else:
+        args = (x, payload, out, mode)
+        bound = grouped_selection_after_producer.bind(args)
+    fn = bound.compile_config(config)
     offsets = width * torch.arange(groups, device=DEVICE)[None, :, None]
     for shift in (5, 14):
         x.copy_(x.roll(shift, dims=-1))
@@ -87,7 +99,7 @@ def test_grouped_selection_preserves_the_unpadded_index_domain(mode):
             # both scores and payload. Only explicit normalization may wrap.
             expected = torch.zeros_like(expected)
         torch.testing.assert_close(
-            fn(x, payload, out, mode),
+            fn(*args),
             expected,
             rtol=0,
             atol=0,
@@ -224,6 +236,81 @@ def test_warp_carry_packets_handle_sliced_weights_and_partial_rows():
             atol=0,
         )
         x.neg_()
+
+
+@pytest.mark.parametrize("activated", [False, True])
+def test_staged_bf16_projections_preserve_changed_router_and_rounded_pair(activated):
+    if torch.cuda.get_device_capability(DEVICE) < (8, 0):
+        pytest.skip("asynchronous copies and BF16 warp MMA require SM80+")
+    rng = torch.Generator(device=DEVICE).manual_seed(78)
+
+    def signed(shape: tuple[int, ...]) -> torch.Tensor:
+        return (
+            torch.randint(0, 2, shape, device=DEVICE, generator=rng) * 2 - 1
+        ).bfloat16()
+
+    x = signed((2, 256))
+    # The valid -1 lookup has real backing before the logical view as well.
+    # A broken raw signed offset therefore reads a distinctive protected row.
+    pair_base = signed((6, 64, 256))
+    pair_base[0].fill_(9)
+    pair = pair_base[1:]
+    down_base = signed((6, 64, 32 if activated else 64))
+    if activated:
+        # Two copies of the identity expose every activation at the end of the
+        # joined down phase; poison the prefix to reveal incorrect -1 indexing.
+        down_base[1:].copy_(torch.eye(32, device=DEVICE).repeat(2, 1))
+    down_base[0].fill_(-9)
+    down = down_base[1:]
+    scale = signed((256,))
+    route = torch.tensor([[0, 2, 3], [4, 1, 0]], device=DEVICE, dtype=torch.int32)
+    scores = torch.tensor([[0.25, -0.5, 1.0], [2.0, 0.5, -1.0]], device=DEVICE)
+    args = (x, pair, down, route, scores, scale, 3.0)
+    config = helion.Config(
+        block_sizes=[16, 256, 1, 1, 64, 32] if activated else [16, 256, 64, 64],
+        num_threads=[4, 32, 1, 1, 4, 2, 1] if activated else [4, 32, 4, 2, 1],
+        reduction_loops=[64],
+        pid_type="persistent_interleaved",
+        cross_loop_pipeline="barrier",
+        cute_defer_tile_reduce=True,
+        cute_staged_indexed_rows=True,
+    )
+    if activated:
+        config.config["cute_indexed_row_epilogue"] = True
+    op = selected_projection_with_epilogue if activated else selected_projection_pair
+    call = op.bind(args).compile_config(config)
+    call(*args)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        mid, ids, weights, result = call(*args)
+    for changed in (False, True):
+        if changed:
+            route.copy_(
+                torch.tensor([[3, -1, 1], [2, 0, 4]], device=DEVICE, dtype=route.dtype)
+            )
+            x.neg_()
+            scores.neg_()
+        graph.replay()
+        # x consists of signed ones, so rsqrt(mean(x^2) + 3) is exactly 1/2.
+        # Dyadic operands give exact FP32 sums in either reduction grouping.
+        v = (x * 0.5 * scale).float()
+        a = (pair[route.long()].float() * v[:, None, None, :]).sum(-1).bfloat16()
+        if activated:
+            lo, hi = a.float().chunk(2, dim=-1)
+            activation = (lo * 0.25 - hi * 0.5).bfloat16()
+        else:
+            activation = a
+        y = (
+            (down[route.long()].float() * activation.float()[:, :, None, :]).sum(-1)
+            * scores[:, :, None]
+        ).bfloat16()
+        for actual, expected in (
+            (mid, a.flatten(0, 1)),
+            (ids, route),
+            (weights, scores),
+            (result, y),
+        ):
+            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
 def test_warp_row_dot_replays_selected_rows_with_independent_base_alignment():

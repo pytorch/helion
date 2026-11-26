@@ -194,7 +194,10 @@ from .config_keys import CUTE_IMPLICIT_DEFAULT_KEYS
 from .config_keys import CUTE_LOAD_HINT_FORM_KEYS
 from .config_keys import CUTE_TOPK_CHOICES
 from .config_keys import GRID_INIT_KEY
+from .config_keys import INDEXED_ROW_EPILOGUE_KEY
+from .config_keys import REUSE_INDEXED_INPUT_KEY
 from .config_keys import ROW_DOT_KEY
+from .config_keys import STAGED_INDEXED_ROWS_KEY
 from .config_keys import VALID_CUTE_CHUNK_PREPARE_SCHEDULES
 from .config_keys import VALID_CUTE_CHUNK_RECURRENCE_REGISTER_CAPS
 from .config_keys import _cute_chunk_recurrence_config_is_safe
@@ -211,6 +214,9 @@ from .flash_surface import fingerprint_extra
 from .flash_surface import pdl_searched
 from .flash_surface import prepare_config_generation_overrides
 from .flash_surface import prepare_override_normalization
+from .heuristics.cute_fragment_topk_network import active_network_roots
+from .indexed_row_epilogue import reusable_row_axes
+from .indexed_row_epilogue import supports_row_epilogue
 from .mma_dag_surface import _normalize_cute_mma_dag
 from .mma_dag_surface import _normalize_cute_register_subblocks
 from .mma_dag_surface import normalize_value_metadata_options
@@ -351,7 +357,7 @@ _FRAGMENT_OPTIONS: dict[str, _FragmentOption] = {
         "repeated pure fragment producers",
     ),
     "cute_fragment_topk_network": _FragmentOption(
-        lambda spec, config: spec.cute_fragment_topk_network_root_ids,
+        active_network_roots,
         "a supported complete fragment top-k",
     ),
     "cute_fragment_atomic_aggregation": _FragmentOption(
@@ -3183,6 +3189,10 @@ def _require_family_enabled(
 def normalize_family_gates(
     config_spec: ConfigSpec, config: dict[str, object], *, fix_invalid: bool
 ) -> None:
+    # Row and selection families need the inferred pipeline before the generic
+    # defaults pass. The legacy spelling has already been translated here.
+    if (pipeline := config_spec.cross_loop_pipeline) is not None:
+        config.setdefault("cross_loop_pipeline", pipeline.default())
     normalize_value_metadata_options(config_spec, config, fix_invalid=fix_invalid)
     for keys, enabled, reason in (
         (
@@ -3307,6 +3317,27 @@ def normalize_knobs(
         fix_invalid=fix_invalid,
         fill=False,
     )
+    _normalize_gated_boolean(
+        config,
+        "cute_single_row_publication",
+        enabled=bool(config_spec.cute_single_row_publication_roots),
+        requirement="a full row sum followed by a single complete output sweep",
+        fix_invalid=fix_invalid,
+        fill=False,
+    )
+    if config.get("cute_single_row_publication") is False:
+        config.pop("cute_single_row_publication")
+    _normalize_gated_boolean(
+        config,
+        "cute_parallel_row_sum",
+        enabled=bool(config_spec.cute_single_row_publication_roots)
+        and config.get("cute_single_row_publication") is True,
+        requirement="a proved single-writer row publication",
+        fix_invalid=fix_invalid,
+        fill=False,
+    )
+    if config.get("cute_parallel_row_sum") is False:
+        config.pop("cute_parallel_row_sum")
     _normalize_cute_host_paired_sum(config_spec, config, fix_invalid=fix_invalid)
     _normalize_fragment_option(
         config_spec, config, "cute_fragment_scan", fix_invalid=fix_invalid
@@ -3811,6 +3842,37 @@ def normalize_after_sequences(
             if key in config:
                 _normalize_fragment_option(config_spec, config, key, fix_invalid=True)
 
+    _normalize_gated_boolean(
+        config,
+        STAGED_INDEXED_ROWS_KEY,
+        enabled=bool(config_spec.cute_staged_indexed_row_axes)
+        and config.get("cross_loop_pipeline") == "barrier"
+        and config.get("cute_defer_tile_reduce") is True,
+        requirement="a local phased row projection with deferred tile sums",
+        fix_invalid=fix_invalid,
+        fill=False,
+    )
+    _normalize_gated_boolean(
+        config,
+        INDEXED_ROW_EPILOGUE_KEY,
+        enabled=supports_row_epilogue(config_spec, config),
+        requirement="a staged BF16 paired projection followed by an independent pointwise consumer",
+        fix_invalid=fix_invalid,
+        fill=False,
+    )
+    _normalize_gated_boolean(
+        config,
+        REUSE_INDEXED_INPUT_KEY,
+        enabled=bool(reusable_row_axes(config_spec, config)),
+        requirement="a staged singleton input shared by multiple row tiles per block",
+        fix_invalid=fix_invalid,
+        fill=False,
+    )
+    if config.get(REUSE_INDEXED_INPUT_KEY) is False:
+        config.pop(REUSE_INDEXED_INPUT_KEY)
+    # Explicit off retains the existing configuration, including cache identity.
+    if config.get(INDEXED_ROW_EPILOGUE_KEY) is False:
+        config.pop(INDEXED_ROW_EPILOGUE_KEY)
     _normalize_gated_boolean(
         config,
         ROW_DOT_KEY,
@@ -4655,7 +4717,15 @@ def cute_flat_fields(
             key: BooleanFragment()
             for enabled, key in (
                 (
-                    bool(config_spec.cute_warp_row_reduction_roots),
+                    config_spec.cute_row_publication_structure,
+                    "cute_single_row_publication",
+                ),
+                (
+                    config_spec.cute_row_publication_structure,
+                    "cute_parallel_row_sum",
+                ),
+                (
+                    config_spec.cute_row_reduction_structure,
                     "cute_warp_row_reductions",
                 ),
                 (
@@ -4726,6 +4796,11 @@ def cute_flat_fields(
         or config_spec.cute_shared_row_carry_structure
     ):
         fields["cute_fragment_row_carry"] = BooleanFragment()
+    if config_spec.cute_indexed_row_structure:
+        fields[STAGED_INDEXED_ROWS_KEY] = BooleanFragment()
+        fields[REUSE_INDEXED_INPUT_KEY] = BooleanFragment()
+    if config_spec.cute_row_epilogue_structure:
+        fields[INDEXED_ROW_EPILOGUE_KEY] = BooleanFragment()
     if config_spec.cute_warp_row_dot_structure:
         fields[ROW_DOT_KEY] = BooleanFragment()
     if config_spec.cute_shared_row_carry_structure:
@@ -5519,8 +5594,10 @@ def cute_flat_fields(
         assert config_spec.cute_mma_dag_store is not None
         assert config_spec.cute_mma_dag_exchange is not None
         assert config_spec.cute_mma_dag_pass_warps is not None
-        assert config_spec.cute_mma_dag_loads is not None
-        assert config_spec.cute_mma_dag_derived is not None
+        loads_fragment = config_spec.cute_mma_dag_loads
+        assert loads_fragment is not None
+        derived_fragment = config_spec.cute_mma_dag_derived
+        assert derived_fragment is not None
         epilogue_fragment = config_spec.cute_mma_dag_epilogue
         assert epilogue_fragment is not None
         lookahead_fragment = config_spec.cute_mma_dag_lookahead
@@ -5551,13 +5628,13 @@ def cute_flat_fields(
         probability_fragment = config_spec.cute_mma_dag_probability_schedule
         if probability_fragment is not None:
             fields[MMA_DAG_PROBABILITY_SCHEDULE_KEY] = probability_fragment
-        fields[MMA_DAG_LOADS_KEY] = config_spec.cute_mma_dag_loads
+        fields[MMA_DAG_LOADS_KEY] = loads_fragment
         # (Locals: the type checker's attribute narrowing does not
         # reach this far into the function.)
         aux_fragment = config_spec.cute_mma_dag_aux
         if aux_fragment is not None:
             fields[MMA_DAG_AUX_KEY] = aux_fragment
-        fields[MMA_DAG_DERIVED_KEY] = config_spec.cute_mma_dag_derived
+        fields[MMA_DAG_DERIVED_KEY] = derived_fragment
         fields[MMA_DAG_EPILOGUE_KEY] = epilogue_fragment
         fields[MMA_DAG_LOOKAHEAD_KEY] = lookahead_fragment
         persistent_fragment = config_spec.cute_mma_dag_persistent
@@ -5680,6 +5757,11 @@ def flatten_missing_field_default(
         "cute_fragment_private_scalar_loops",
         GRID_INIT_KEY,
         "cute_warp_row_reductions",
+        "cute_single_row_publication",
+        "cute_parallel_row_sum",
+        INDEXED_ROW_EPILOGUE_KEY,
+        REUSE_INDEXED_INPUT_KEY,
+        STAGED_INDEXED_ROWS_KEY,
         ROW_DOT_KEY,
         COMPACT_ROWS_KEY,
     ):

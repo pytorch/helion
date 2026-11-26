@@ -61,6 +61,7 @@ from .fragment_domain import selected_ownership
 from .fragment_dot import FragmentDotEmitter
 from .fragment_expression import FragmentExpression
 from .fragment_launch import fragment_option_fits_shared_block
+from .fragment_launch import uses_shared_barrier
 from .fragment_scan import FragmentScanEmitter
 from .fragment_selection import FragmentSelectionEmitter
 from .fragment_shared_arena import SharedArenaRequest
@@ -2148,6 +2149,7 @@ def codegen_computed_fragment_root(cg: GenerateAST) -> bool:
     from .autotune.heuristics.cute_fragment_reduction import (
         fragment_warp_reduction_supported,
     )
+    from .autotune.heuristics.cute_fragment_topk_network import active_network_roots
     from .autotune.heuristics.cute_fragment_warp_scan import active_warp_scan_roots
 
     env = CompileEnvironment.current()
@@ -2179,9 +2181,10 @@ def codegen_computed_fragment_root(cg: GenerateAST) -> bool:
         cg.device_function.config.get("cute_fragment_register_snapshots", False) is True
         and root.graph_id in env.config_spec.cute_fragment_register_snapshots_root_ids
     )
-    topk_network_required = (
-        cg.device_function.config.get("cute_fragment_topk_network", False)
-        and root.graph_id in env.config_spec.cute_fragment_topk_network_root_ids
+    topk_network_required = cg.device_function.config.get(
+        "cute_fragment_topk_network", False
+    ) and root.graph_id in active_network_roots(
+        env.config_spec, cg.device_function.config
     )
     bounded_gather_required = (
         cg.device_function.config.get("cute_fragment_bounded_gather", False) is True
@@ -2331,12 +2334,7 @@ def codegen_computed_fragment_root(cg: GenerateAST) -> bool:
     # same persistent phase loop. In either case retain the per-root alias,
     # ordinary-fragment and lane-geometry checks below.
     cfg = cg.device_function.config
-    shared_barrier = cfg.get("cross_loop_pipeline") == "barrier" or (
-        env.has_barrier
-        and len(ir.phases) > 1
-        and cfg.pid_type in ("persistent_blocked", "persistent_interleaved")
-        and env.process_group_name is None
-    )
+    shared_barrier = uses_shared_barrier(env.config_spec, cfg)
     if (multiple_roots and shared_barrier) or cg.host_function.partial_program:
         region = (
             ir.graphs

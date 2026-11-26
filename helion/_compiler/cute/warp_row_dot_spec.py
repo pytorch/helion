@@ -132,7 +132,7 @@ def admitted_row_dot_loads(
     env: CompileEnvironment, plan: RowLoop
 ) -> tuple[Node, Node] | None:
     if (
-        # MMA does not round to nearest after each FP32 addition.
+        # MMA does not implement IEEE round-to-nearest after each FP32 sum.
         env.settings.fast_math
         and supported_row_dot(env.config_spec)
         and (loads := row_dot_loads(plan)) is not None

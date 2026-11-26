@@ -49,6 +49,7 @@ __all__ = [
     "check_thread_block_dims",
     "check_thread_limit",
     "checked_thread_block_dims",
+    "linear_thread_index",
     "record_root_read_axes",
     "register_tile_shape",
     "shared_memory_budget_bytes",
@@ -94,6 +95,25 @@ def referenced_thread_axes(statements: Iterable[ast.AST]) -> list[int]:
         for node in ast.walk(statement)
         if (axis := thread_idx_axis(node)) is not None
     ]
+
+
+def linear_thread_index(
+    axis_sizes: dict[int, int],
+    cast_index: Callable[[str], str],
+    *,
+    cast_strides: bool = True,
+) -> str:
+    """Linearize physical thread axes in CUDA order, preserving the index ABI."""
+    terms = []
+    stride = 1
+    for axis, size in sorted(axis_sizes.items()):
+        term = cast_index(f"cute.arch.thread_idx()[{axis}]")
+        if stride != 1:
+            extent = cast_index(str(stride)) if cast_strides else str(stride)
+            term = f"({term}) * {extent}"
+        terms.append(term)
+        stride *= size
+    return " + ".join(terms) if terms else cast_index("0")
 
 
 class TileAxis(NamedTuple):

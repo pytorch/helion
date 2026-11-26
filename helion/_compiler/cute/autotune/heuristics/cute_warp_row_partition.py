@@ -5,9 +5,14 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 from typing import cast
 
+import torch
+
 from .....language import _tracing_ops
+from .....language import memory_ops
 from .....runtime.config import Config
+from ...loop_nesting import boundary_only_grid_blocks
 from ...row_carry_stripes import stripe_tiles
+from ...thread_budget import tile_loop_thread_count
 from ...warp_row_dot_spec import BF16_PACKET_LANES
 from ...warp_row_dot_spec import ROW_DOT_K
 from ...warp_row_dot_spec import ROW_DOT_ROWS
@@ -16,6 +21,7 @@ from ...warp_row_partition import KEY
 from ...warp_row_partition import WARP
 from ..config_keys import COMPACT_ROWS_KEY
 from ..config_keys import ROW_DOT_KEY
+from .cute_row_publication import compatible_warp_rows
 
 if TYPE_CHECKING:
     from ....compile_environment import CompileEnvironment
@@ -212,3 +218,79 @@ def insert_warp_row_seed(
                     Config.from_dict(compact.config | {COMPACT_ROWS_KEY: True})
                 )
     return [*configs[:1], *companions, *configs[1:]]
+
+
+def add_singleton_row_seed(
+    env: CompileEnvironment, ir: DeviceIR, configs: list[Config]
+) -> list[Config]:
+    """Offer more independent row programs when another root supplies the warps."""
+    spec = env.config_spec
+    facts = spec.cute_warp_row_reduction_roots
+    if len(facts) != 1 or ir.host_function is None:
+        return configs
+    ((root, (row, _kid, _extent, _count)),) = facts.items()
+    grid = ir.grid_block_ids[ir.root_ids.index(root)]
+    # Changing one root's tile must not repack another root or an axis
+    # sharing its config slot. Other grid axes must be scalar.
+    if (
+        row not in spec.block_sizes.valid_block_ids()
+        or row not in spec.num_threads.valid_block_ids()
+        or spec.block_sizes.block_id_lookup(row).min_size > 1
+        or spec.num_threads.block_id_lookup(row).block_ids != [row]
+        or any(row in axes for axes in ir.grid_block_ids if axes is not grid)
+        or any(
+            type(env.block_sizes[axis].size) is not int
+            or env.block_sizes[axis].size != 1
+            for axis in grid
+            if axis != row
+        )
+    ):
+        return configs
+    with ir.host_function:
+        # An immutable row-by-K input justifies distributing the independent
+        # work. The emitter verifies the scalar address and disjoint winner.
+        matrix = any(
+            n.target is memory_ops.load
+            and isinstance(indices := n.args[1], (list, tuple))
+            and len(indices) == 2
+            and indices[1] == slice(None)
+            and isinstance(ix := indices[0], torch.fx.Node)
+            and ix.target is _tracing_ops._get_symnode
+            and isinstance(sym := ix.meta.get("val"), torch.SymInt)
+            and env.get_block_id(sym) == row
+            and isinstance(src := n.args[0], torch.fx.Node)
+            and src.target is _tracing_ops._host_tensor
+            and isinstance(v := src.meta.get("val"), torch.Tensor)
+            and v.ndim == 2
+            for n in ir.graphs[root].graph.nodes
+        )
+        if not matrix:
+            return configs
+        inactive = boundary_only_grid_blocks(env, ir, ir.graphs)
+        for seed in reversed(configs):
+            if (
+                seed.get(KEY) is not True
+                or seed.get("pid_type") != "persistent_interleaved"
+            ):
+                continue
+            bs = seed.get("block_sizes")
+            nt = seed.get("num_threads")
+            if not isinstance(bs, list) or not isinstance(nt, list):
+                continue
+            bx = spec.block_sizes.block_id_to_index(row)
+            tx = spec.num_threads.block_id_to_index(row)
+            if not 1 < nt[tx] < bs[bx] or not compatible_warp_rows(
+                env, ir, seed, nt[tx]
+            ):
+                continue
+            blocks, threads = list(bs), list(nt)
+            blocks[bx] = threads[tx] = 1
+            candidate = Config.from_dict(
+                seed.config | {"block_sizes": blocks, "num_threads": threads}
+            )
+            total = tile_loop_thread_count(
+                env, ir, ir.graphs, candidate, inactive_block_ids=inactive
+            )
+            if WARP <= total <= 1024 and total % WARP == 0 and candidate not in configs:
+                return [*configs, candidate]
+    return configs

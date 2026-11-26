@@ -1565,6 +1565,10 @@ def _validate_thread_axis_accesses(s: _KernelDefState) -> None:
         from ..warp_row_partition import validate_row_launch
 
         validate_row_launch(s.fn, s.ctx.exact_thread_block_dims)
+    if s.ctx.config.get("cute_single_row_publication"):
+        from ..single_row_publication import validate_publication_launch
+
+        validate_publication_launch(s.fn, s.ctx.exact_thread_block_dims)
     validate_thread_axis_accesses([*s.prefix, s.definition])
 
 
@@ -1640,6 +1644,27 @@ def _pair_lane_math(s: _KernelDefState) -> None:
             )
         ),
     )
+
+
+def _lower_indexed_rows(s: _KernelDefState) -> None:
+    from ...host_function import HostFunction
+    from ..analysis.indexed_row_phases import indexed_row_phases
+    from ..indexed_row_tiles import lower_indexed_row_tiles
+
+    ir = HostFunction.current().device_ir
+    lower_indexed_row_tiles(
+        s.definition,
+        s.prefix,
+        s.ctx,
+        indexed_row_phases(s.ctx.env, ir),
+        ir,
+    )
+
+
+def _validate_parallel_row_sum(s: _KernelDefState) -> None:
+    from ..parallel_row_sum import validate_parallel_sum
+
+    validate_parallel_sum(s.definition, s.fn.cute_state.lanes.parallel_row_sum_anchors)
 
 
 def _select_native_warp_reductions(s: _KernelDefState) -> None:
@@ -2129,6 +2154,12 @@ KERNEL_DEF_PASSES: tuple[KernelDefPass, ...] = (
         requires=(RENAMED,),
     ),
     KernelDefPass(
+        "stage_indexed_row_tiles",
+        _config_flag("cute_staged_indexed_rows"),
+        _lower_indexed_rows,
+        requires=(RENAMED,),
+    ),
+    KernelDefPass(
         "select_native_warp_reductions",
         _config_flag("cute_warp_fp32_redux"),
         _select_native_warp_reductions,
@@ -2185,6 +2216,13 @@ KERNEL_DEF_PASSES: tuple[KernelDefPass, ...] = (
         # the loads still plain here are the ones that take a hint.  A hint
         # changes no value and no store, and the staged image's loads name
         # no tensor parameter.
+        requires=(RENAMED,),
+    ),
+    KernelDefPass(
+        "validate_parallel_row_sum",
+        _config_flag("cute_parallel_row_sum"),
+        _validate_parallel_row_sum,
+        # Validate shared-memory order and CTA convergence on the final AST.
         requires=(RENAMED,),
     ),
 )

@@ -1424,6 +1424,7 @@ def _topk_network_roots(env: CompileEnvironment, ir: DeviceIR) -> RootFacts:
 
     roots = set()
     cta_roots = set()
+    shared_only = set()
     owned = fragment_regions(ir)
     owned_root_ids = {region.root for region in owned}
     shared_regions = _shared_warp_regions(env, ir)
@@ -1444,7 +1445,8 @@ def _topk_network_roots(env: CompileEnvironment, ir: DeviceIR) -> RootFacts:
             continue
         # A complete intrinsic owner keeps the existing in-place contract.
         # Only the new cross-phase coordinate proof adds a storage guard.
-        if not computed_fragment_supported(env, region.graphs) and not (
+        ordinary = computed_fragment_supported(env, region.graphs)
+        if not ordinary and not (
             len(ir.root_ids) > 1
             # The projected stage owns its helper graphs. A root borrowing
             # a persistent block still needs a single ordinary region.
@@ -1472,12 +1474,17 @@ def _topk_network_roots(env: CompileEnvironment, ir: DeviceIR) -> RootFacts:
                 value.dtype, n, k, values_only=values_only
             ):
                 roots.add(region.root)
+                if not ordinary:
+                    shared_only.add(region.root)
+                # A projected flat stage owns its CTA even when selection
+                # supplies the coordinates; a shared persistent stage does not.
                 if can_own_launch and value.dtype == torch.int64 and values_only:
                     cta_roots.add(region.root)
     return RootFacts(
         frozenset(roots),
         (
             ("cute_fragment_cta_topk_root_ids", frozenset(cta_roots)),
+            ("cute_shared_selection_network_root_ids", frozenset(shared_only)),
             (
                 "cute_fragment_warp_topk_requires_flat",
                 env.config_spec.cute_fragment_cta_requires_flat

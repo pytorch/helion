@@ -99,6 +99,7 @@ KERNEL_DEF_PASS_NAMES = [
     "validate_shared_arenas",
     "pack_half_extremum_folds",
     "pair_lane_math",
+    "stage_indexed_row_tiles",
     "select_native_warp_reductions",
     "stage_cta_stores",
     "guard_lanes",
@@ -108,6 +109,7 @@ KERNEL_DEF_PASS_NAMES = [
     # After the table: the element hints of ``cute_scalar_load_hints``, on
     # the loads every earlier pass left plain.
     "hint_element_loads",
+    "validate_parallel_row_sum",
 ]
 
 

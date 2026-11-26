@@ -82,6 +82,7 @@ if TYPE_CHECKING:
     from .host_remainder_fills import RemainderFill
     from .iota_utils import FreeArangeLanes
     from .materialized_fission import MaterializedFissionPlan
+    from .parallel_row_sum import RowSumAnchor
     from .register_region import RegisterRegionPlan
     from .resident_reductions import ResidentReductionLayout
     from .resident_sequence import SequenceRegion
@@ -683,6 +684,17 @@ class CuteLaneState:
     # Minimum x threads required by the warp-partitioned row sums in this
     # kernel. Zero means that no row-sum partition was emitted.
     warp_row_threads: int = 0
+    # A complete physical warp owns a scalar row; all other warps skip it.
+    has_singleton_warp_rows: bool = False
+    # Exact CTA shapes used to assign independent output columns to threads.
+    single_row_publication_dims: set[tuple[int, int, int]] = dataclasses.field(
+        default_factory=set
+    )
+    parallel_row_sum_anchors: dict[str, RowSumAnchor] = dataclasses.field(
+        default_factory=dict
+    )
+    # Row sweeps proven against an exact number of complete physical warps.
+    warp_row_wave_counts: set[int] = dataclasses.field(default_factory=set)
     # The static ``block=`` the launcher call was emitted with
     # (``CuteBackend.launcher_keyword_args``, which runs ahead of the
     # kernel definition's codegen); None before that call, and for a
