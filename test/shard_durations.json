@@ -346,7 +346,6 @@
  "test/test_cute_split_exchange.py": 17.9,
  "test/test_cute_split_k_cluster.py": 13.2,
  "test/test_cute_split_k_workspace.py": 40.0,
- "test/test_cute_split_k_workspace_protocol.py": 5.7,
  "test/test_cute_split_single_token_rank1_recurrence.py": 29.6,
  "test/test_cute_split_view_consumers.py": 3.7,
  "test/test_cute_stage_aligned_operands.py": 3.1,

@@ -24,8 +24,13 @@ from test.test_cute_split_k_workspace import _proof
 import helion
 from helion._compiler.cute import target_facts
 from helion._compiler.cute.split_k_workspace import workspace_schedule
+from helion._compiler.cute.split_k_workspace_codegen import REDUCER_THREADS
 from helion._compiler.cute.split_k_workspace_codegen import _reducer_source
 from helion._testing.cute_codegen import cpu_target
+
+# Every test binds on the CPU stand-in below and runs the emitted host code,
+# reducer and tile scheduler without a GPU.
+pytestmark = pytest.mark.cpu_only
 
 
 @pytest.fixture(autouse=True)
@@ -69,8 +74,9 @@ class _MaskIfs(ast.NodeTransformer):
 
 
 def _execute_reducer(source, partial_values, output_dtype, bias_storage=None):
-    """Execute the actual arithmetic/copy/shuffle AST across all 128 lanes."""
+    """Execute the actual arithmetic/copy AST across every lane of each CTA."""
     partitions, rows, columns = partial_values.shape
+    lanes = REDUCER_THREADS
     partials = partial_values.reshape(-1)
     output = np.full((rows * columns,), np.nan, dtype=output_dtype)
     reads = np.zeros(partials.size, dtype=np.int32)
@@ -78,13 +84,13 @@ def _execute_reducer(source, partial_values, output_dtype, bias_storage=None):
     bias_reads = np.zeros(
         0 if bias_storage is None else bias_storage.size, dtype=np.int32
     )
-    state = {"block": 0, "masks": [np.ones(128, dtype=np.bool_)]}
+    state = {"block": 0, "masks": [np.ones(lanes, dtype=np.bool_)]}
 
     class Fragment:
         def __init__(self, shape, dtype):
             # Inactive lanes are unspecified and never consumed by the kernel.
             # Give those lanes a neutral value in this vectorized interpreter.
-            self.values = np.zeros((128, *shape), dtype=dtype)
+            self.values = np.zeros((lanes, *shape), dtype=dtype)
 
         def fill(self, value):
             self.values.fill(value)
@@ -123,7 +129,7 @@ def _execute_reducer(source, partial_values, output_dtype, bias_storage=None):
             assert pointer.allocation is bias_storage
             indices = np.asarray(pointer.offset)
             active = state["masks"][-1]
-            result = np.zeros(128, dtype=np.float32)
+            result = np.zeros(lanes, dtype=np.float32)
             assert np.all(indices[active] >= 0)
             assert np.all(indices[active] < bias_storage.size)
             result[active] = bias_storage[indices[active]]
@@ -140,7 +146,7 @@ def _execute_reducer(source, partial_values, output_dtype, bias_storage=None):
                 indices[active] < partials.size
             )
             assert np.all(pointer.offset[active] * 4 % 16 == 0)
-            values = np.zeros((128, 4), dtype=np.float32)
+            values = np.zeros((lanes, 4), dtype=np.float32)
             values[active] = partials[indices[active]]
             destination.store(values)
             np.add.at(reads, indices[active], 1)
@@ -192,11 +198,12 @@ def _execute_reducer(source, partial_values, output_dtype, bias_storage=None):
             copy=copy_values,
             nvgpu=SimpleNamespace(CopyUniversalOp=lambda: None),
             arch=SimpleNamespace(
-                thread_idx=lambda: (np.arange(128, dtype=np.int32), 0, 0),
+                thread_idx=lambda: (np.arange(lanes, dtype=np.int32), 0, 0),
                 block_idx=lambda: (state["block"], 0, 0),
-                shuffle_sync_bfly=lambda value, offset: value[np.arange(128) ^ offset],
                 # The reducer is a programmatic dependent of the producer.
                 griddepcontrol_wait=lambda: None,
+                # It lets the next kernel of the stream launch first.
+                griddepcontrol_launch_dependents=lambda: None,
             ),
         ),
     }
@@ -214,7 +221,7 @@ def _execute_reducer(source, partial_values, output_dtype, bias_storage=None):
     ]
     if bias_storage is not None:
         arguments.append(Tensor(Pointer(bias_storage), bias_storage.shape))
-    for block in range(helion.cdiv(output.size, 128)):
+    for block in range(helion.cdiv(output.size // 4, lanes)):
         state["block"] = block
         namespace[kernel.name](*arguments)
         assert len(state["masks"]) == 1
@@ -226,12 +233,12 @@ def _execute_reducer(source, partial_values, output_dtype, bias_storage=None):
 
 
 def _ordered_reference(partials, bias=None):
-    sums = np.zeros((4, *partials.shape[1:]), dtype=np.float32)
-    for partition, values in enumerate(partials):
-        if partition == 0 and bias is not None:
-            values = np.float32(values + bias)
-        sums[partition % 4] = np.float32(sums[partition % 4] + values)
-    return np.float32(np.float32(sums[0] + sums[1]) + np.float32(sums[2] + sums[3]))
+    total = partials[0]
+    if bias is not None:
+        total = np.float32(total + bias)
+    for values in partials[1:]:
+        total = np.float32(total + values)
+    return total
 
 
 @pytest.mark.parametrize("partitions", (1, 2, 3, 4, 5, 16, 32))
