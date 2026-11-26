@@ -849,6 +849,11 @@ class CompileEnvironment:
         # Set while ``generate_ast`` regenerates a kernel whose gluon ring the
         # lowering rejected (``RingFallback``): the rejection's reason.
         self.ring_disabled: str | None = None
+        # Set while ``generate_ast`` regenerates a kernel whose ring's operand
+        # fills the lowering rejected (``RingFillFallback``): the reason.
+        self.ring_fills_disabled: str | None = None
+        # The warnings ``warn_dropped`` printed for this kernel.
+        self.dropped_requests: set[str] = set()
         self._dispatch_guards_enforced: contextvars.ContextVar[bool] = (
             contextvars.ContextVar(
                 f"helion_dispatch_guards_enforced_{id(self)}",
@@ -1073,8 +1078,10 @@ class CompileEnvironment:
         # The root a trigger between top-level loops precedes (it also stays in
         # ``pdl_exit``, where a kernel that cannot place it runs it).
         self.pdl_trigger_root: int | None = None
-        # hl.prefetch_code(): the kernel prefetches its native code into L2 at entry.
-        self.prefetch_code: bool = False
+        # hl.prefetch_code() calls (on targets whose code it can prefetch), in
+        # source order: None prefetches the kernel's native code into L2 at entry,
+        # a root index where the kernel reaches that top-level loop.
+        self.prefetch_code_sites: list[int | None] = []
 
     def warn_symbolic_fragment_domain(self) -> None:
         """Emit at most once per binding, subject to Python's warning filters."""
@@ -4779,6 +4786,21 @@ def warning(warning: exc.BaseWarning | type[exc.BaseWarning]) -> None:
         # operand staging copy), not one the user wrote.
         return
     print(f"WARNING[{type(warning).__name__}]: {warning.args[0]}", file=sys.stderr)
+
+
+def warn_dropped(key: str, value: object, reason: str) -> None:
+    """Warn (``exc.ConfigRequestDropped``) that codegen drops the config's
+    explicit request ``key=value``, once per kernel and reason (an autotune
+    search compiles its candidates into captured output).  Only in a kernel's
+    environment: ``ConfigSpec.normalize`` also runs outside it, and again in
+    it for codegen."""
+    if not CompileEnvironment.has_current():
+        return
+    dropped = exc.ConfigRequestDropped(f"{key}={value!r}", reason)
+    reported = CompileEnvironment.current().dropped_requests
+    if str(dropped) not in reported:
+        reported.add(str(dropped))
+        warning(dropped)
 
 
 def _symint_sympy_expr(x: torch.SymInt) -> sympy.Expr:

@@ -536,6 +536,9 @@ def deepseek_v3_moe_nvfp4_tp_verify(
     # Each token's eight expert rows, weighted in top-k order, plus the shared.
     for partial_tile_t, partial_tile_n in hl.tile([rows, hidden], block_size=[1, None]):
         partial_token = partial_tile_t.begin
+        # The shared expert's output first: it is ready long before the routed
+        # rows (a task waits for what it reads in the order it reads it).
+        partial_shared = shared_expert_output[partial_token, partial_tile_n]
         partial_routed_values = routed_output[partial_token, :, partial_tile_n].to(
             torch.float32
         )
@@ -546,7 +549,7 @@ def deepseek_v3_moe_nvfp4_tp_verify(
             partial_routed_values * partial_routed_weights[:, None], dim=0
         ).to(torch.bfloat16)
         symmetric_partial[partial_token, partial_tile_n] = (
-            partial_routed_output + shared_expert_output[partial_token, partial_tile_n]
+            partial_routed_output + partial_shared
         ).to(torch.bfloat16)
 
     # Each token's sum over ranks (in rank order), then the residual.

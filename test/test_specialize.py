@@ -6,6 +6,7 @@ from typing import Any
 from typing import cast
 import unittest
 
+import pytest
 import torch
 
 import helion
@@ -29,6 +30,7 @@ from helion._testing.tensor_container_guards import TensorField
 from helion._testing.tensor_container_guards import TensorTuple
 from helion._testing.tensor_container_guards import container_bias_case
 from helion._testing.tensor_container_guards import field_increment
+from helion._testing.triton_codegen import cpu_codegen as cpu_codegen
 from helion.autotuner.benchmark_provider import _searching_candidates
 from helion.exc import ShapeSpecializingAllocation
 import helion.language as hl
@@ -37,6 +39,39 @@ import helion.language as hl
 @dataclasses.dataclass
 class TensorContainer:
     x: torch.Tensor
+
+
+@helion.kernel(backend="triton", static_shapes=False, autotune_effort="none")
+def device_size_read(x: torch.Tensor, read: hl.constexpr) -> torch.Tensor:
+    """Row sums over K tiles whose loop bound is a specialized size read in
+    device code."""
+    hl.specialize(x.size())
+    out = torch.empty([x.size(0)], dtype=torch.float32, device=x.device)
+    for tile_m in hl.tile(x.size(0)):
+        acc = hl.zeros([tile_m], dtype=torch.float32)
+        if read == "size":
+            k = x.size(1)
+        else:
+            k = x.shape[1]
+        for tile_k in hl.tile(k):
+            acc = acc + x[tile_m, tile_k].sum(-1)
+        out[tile_m] = acc
+    return out
+
+
+@pytest.mark.cpu_only
+@skipUnlessBackends(["triton"])
+@skipIfRefEager("checks generated code")
+@pytest.mark.parametrize("read", ["size", "shape"])
+def test_specialized_size_read_on_device_is_a_constant(
+    cpu_codegen: None, read: str
+) -> None:
+    """A specialized size read inside a device loop is the constant a host read
+    is: the inner loop's bound is a literal, not a symbolic size."""
+    bound = device_size_read.bind((torch.zeros(64, 96), read))
+    code = bound.to_triton_code(helion.Config(block_sizes=[16, 32]))
+    assert "tl.range(0, 96, _BLOCK_SIZE_1)" in code
+    assert "symnode" not in code
 
 
 @onlyBackends(["triton", "cute"])

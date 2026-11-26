@@ -2227,7 +2227,7 @@ class TestDistributedTileDependencies(TestCase):
         self.assertEqual(code.count("_helion_ring.tagged_load("), 2)
         self.assertEqual(code.count("_helion_ring.ring_put_tagged("), 2)
         # Each poller arrives on every step: two groups and the second poller.
-        self.assertIn("ring_barriers(_helion_ring_S, 3)", code)
+        self.assertRegex(code, r"ring_barriers\(_helion_ring_S\d, 3\)")
 
         def puts_z(code: str) -> bool:
             """Whether a producer TMA-loads z into the ring."""

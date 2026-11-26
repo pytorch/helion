@@ -752,6 +752,13 @@ def dsmem_replicated(size: int, tasks: Sequence[int | None]) -> bool:
     return len(several) > 1 or (len(several) == 1 and several[0] != size)
 
 
+def _warn_dropped(key: str, value: object, reason: str) -> None:
+    """``compile_environment.warn_dropped`` (which imports this module)."""
+    from .._compiler.compile_environment import warn_dropped
+
+    warn_dropped(key, value, reason)
+
+
 class DsmemSlabFacts(NamedTuple):
     """A dsmem candidate's slab under a config (``cross_loop_dsmem``): the
     factors of its elements (the ranges its load reads), of each store's tile
@@ -761,13 +768,13 @@ class DsmemSlabFacts(NamedTuple):
     (``ConfigValueExpression``) or ``("block", i)``, the config's
     ``block_sizes[i]``.  Its 32-bit elements make ``4 * numel`` bytes, in
     clusters of ``numel // tile``, or of 1 when the axes' task counts make the
-    slab replicated (``dsmem_replicated``).  ``carried`` is False for a
-    candidate that breaks a rule under every config."""
+    slab replicated (``dsmem_replicated``).  ``refusal`` is the rule a
+    candidate breaks under every config, which is never carried."""
 
     numel: tuple[object, ...]
     tiles: tuple[tuple[object, ...], ...]
     axes: tuple[tuple[object, object], ...] | None = None
-    carried: bool = True
+    refusal: str | None = None
 
     def evaluate(self, config: dict[str, object]) -> tuple[int, int] | None:
         """``(cluster size, slab bytes)`` under ``config``, or None when a
@@ -985,6 +992,7 @@ _BACKEND_GATED_GENERIC_KEYS: frozenset[str] = frozenset(
         "cross_loop_dsmem",
         "cross_loop_inband_protocol",
         "worker_registers",
+        "cross_loop_claim_groups",
         "load_cache_modifiers",
         "store_cache_modifiers",
         "host_tensor_descriptors",
@@ -2486,21 +2494,23 @@ class ConfigSpec:
         ):
             if not enabled:
                 continue
-            if facts is not None and not facts.carried:
-                flags[index] = False
-                continue
-            slab = None if facts is None else facts.evaluate(config)
-            if slab is None:
+            if facts is not None and facts.refusal is not None:
+                refusal: str | None = facts.refusal
+            elif (slab := None if facts is None else facts.evaluate(config)) is None:
                 # Codegen checks its slab; it still takes an entry, and the
                 # count's limit needs no slab.
+                refusal = None
                 if layout.entries >= MAX_DSMEM_ENTRIES:
-                    flags[index] = False
+                    refusal = f"C1: more than {MAX_DSMEM_ENTRIES} entries"
                 else:
                     layout.entries += 1
-            elif layout.refusal(*slab) is None:
+            elif (refusal := layout.refusal(*slab)) is None:
                 layout.take(*slab)
             else:
+                refusal = f"C1: {refusal}"
+            if refusal is not None:
                 flags[index] = False
+                _warn_dropped(f"cross_loop_dsmem[{index}]", True, refusal)
         config["cross_loop_dsmem"] = flags
 
     def normalize(
@@ -2785,6 +2795,7 @@ class ConfigSpec:
             "store_cache_modifiers",
             "cross_loop_dsmem",
             "cross_loop_inband_protocol",
+            "cross_loop_claim_groups",
             "indexing",
             "atomic_indexing",
             "prefetch_indexing",
@@ -2842,22 +2853,32 @@ class ConfigSpec:
             config.setdefault(
                 "store_cache_modifiers", self.store_cache_modifiers.default()
             )
-        for key, flags, entry, valid in (
+        for key, flags, entry, candidate, valid in (
             (
                 "cross_loop_dsmem",
                 self.cross_loop_dsmem,
                 "one bool per cluster candidate",
+                "cluster candidate",
                 lambda value: type(value) is bool,
             ),
             (
                 "cross_loop_inband_protocol",
                 self.cross_loop_inband_protocol,
                 '"tagged" or "lamport" per Lamport candidate',
+                "Lamport candidate",
                 lambda value: value in INBAND_PROTOCOLS,
             ),
         ):
             if not (self.supports_config_key(key) and flags.length > 0):
-                config.pop(key, None)
+                requested = config.pop(key, None)
+                # A request is an entry other than the default ("tagged" asks
+                # for nothing a kernel without candidates drops).
+                if (
+                    self.supports_config_key(key)
+                    and isinstance(requested, (list, tuple))
+                    and any(value != flags.inner.default() for value in requested)
+                ):
+                    _warn_dropped(key, requested, f"this kernel has no {candidate}")
                 continue
             values = config.setdefault(key, flags.default())
             if (
@@ -2933,17 +2954,43 @@ class ConfigSpec:
             # Only workers that own their tasks carry a dsmem transport
             # (cross_loop_dsmem's C2): the barrier pipeline and dynamic packets
             # (no ring) keep one tune point.
+            pipeline = config["cross_loop_pipeline"]
             if "cross_loop_dsmem" in config and (
-                config["cross_loop_pipeline"] == "barrier"
-                or (
-                    config["cross_loop_pipeline"] == "dynamic"
-                    and not ring_depth(config, self.backend_name)
-                )
+                pipeline == "barrier"
+                or (pipeline == "dynamic" and not ring_depth(config, self.backend_name))
             ):
+                reason = f"C2: cross_loop_pipeline={pipeline!r}" + (
+                    " without a Gluon ring" if pipeline == "dynamic" else ""
+                )
+                dsmem = cast("list[bool]", config["cross_loop_dsmem"])
+                for index, flag in enumerate(dsmem):
+                    if flag:
+                        _warn_dropped(f"cross_loop_dsmem[{index}]", True, reason)
                 config["cross_loop_dsmem"] = self.cross_loop_dsmem.default()
         dsmem = config.get("cross_loop_dsmem")
         if isinstance(dsmem, list) and any(dsmem):
             self._normalize_dsmem(config)
+        # ``cross_loop_claim_groups`` (a hand override the search never
+        # proposes): consecutive claimed roots claim one ticket stream, a root's
+        # keys a wave of claims behind each earlier member it waits on key by
+        # key, after the live keys of the others it waits on and, with a dot on
+        # the ring, of the roots with one before it
+        # (cross_loop_codegen.claim_group_body).  Only claimed dispatch (dynamic
+        # workers under a ring) forms groups: elsewhere the key is no entry
+        # (and on a ring that falls back at codegen an error, ``finalize_ring``).
+        groups = config.get("cross_loop_claim_groups", False)
+        if not isinstance(groups, bool):
+            if not _fix_invalid:
+                raise InvalidConfig(
+                    f"cross_loop_claim_groups must be a bool, got {groups!r}"
+                )
+            groups = False
+        if (
+            not groups
+            or config.get("cross_loop_pipeline") != "dynamic"
+            or not ring_depth(config, self.backend_name)
+        ):
+            config.pop("cross_loop_claim_groups", None)
         surface.normalize_recurrence_families(self, config, fix_invalid=_fix_invalid)
         surface.normalize_pre_pid_type(self, config, fix_invalid=_fix_invalid)
         indirect_modes = (

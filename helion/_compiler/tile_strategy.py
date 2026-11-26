@@ -1389,7 +1389,7 @@ class TileStrategy:
             # range pipelines tend to cause CUDA "misaligned address" or
             # "unspecified launch failure" errors. Host-created descriptors
             # do not carry that per-program construction through the range.
-            if range_num_stages > 0 and not config.host_tensor_descriptors:
+            if range_num_stages > 0 and not env.backend.host_tensor_descriptors(config):
                 range_num_stages = 0
             # Host construction has not established that descriptor indexing
             # is safe with both unrolling and a separate kernel-level pipeline

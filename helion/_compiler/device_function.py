@@ -7,6 +7,7 @@ import contextlib
 import dataclasses
 import enum
 import itertools
+import logging
 import math
 import threading
 from typing import TYPE_CHECKING
@@ -61,6 +62,7 @@ if TYPE_CHECKING:
     from ..runtime.config import IndexingLiteral
     from .cross_loop_codegen import PeerState
     from .cross_loop_dsmem import DsmemTransport
+    from .cross_loop_scheduler import CrossLoopDispatchMode
     from .cross_loop_timeline import Timeline
     from .cute.bounded_cache_codegen import BoundedCacheRequest
     from .cute.device_state import CuteDeviceFunctionState
@@ -86,6 +88,7 @@ if TYPE_CHECKING:
 
 
 tls: _TLS = cast("_TLS", threading.local())
+log: logging.Logger = logging.getLogger(__name__)
 
 
 FLAT_GRID_ELEMENT_LIMIT = (
@@ -98,6 +101,15 @@ class RingFallback(exc.Base):
 
     def report(self) -> str:
         return f"gluon ring fallback: {self}"
+
+
+class RingFillFallback(exc.Base):
+    """The gluon ring cannot take this kernel's computed dot operands as body
+    fills (``RingLowering._fill``): regenerate it with the ring but no fills,
+    those dots issuing from the body."""
+
+    def report(self) -> str:
+        return f"gluon ring fill fallback: {self}"
 
 
 def _exact_thread_block_dims(
@@ -572,6 +584,14 @@ class DeviceFunction:
         # sends as tagged words and the graph whose transport says so.
         self.tagged_allocation_ids: frozenset[int] | None = None
         self.codegen_dependency_graph: TileDependencyGraph | None = None
+        # The roots before which the megakernel codegen ran hl.prefetch_code()
+        # (``CompileEnvironment.prefetch_code_sites``); the others run at entry.
+        self.prefetch_code_placed: set[int] = set()
+        # How the megakernel schedule dispatches its tasks (None: barrier phases
+        # or no megakernel schedule): static and claimed dispatch run each
+        # resident root's tasks as a block of their own on a resident persistent
+        # grid; dynamic packet dispatch launches a program per task.
+        self.cross_loop_dispatch: CrossLoopDispatchMode | None = None
         # Cross-grid polling is safe in isolation only when the required worker
         # cohort can reside together. The launcher validates exact compiled
         # occupancy, but does not reserve capacity against concurrent streams.
@@ -1295,6 +1315,23 @@ class DeviceFunction:
     def sync_names(self, *kinds: str) -> set[str]:
         return {name for name, role in self.sync_roles.items() if role.kind in kinds}
 
+    def prefetch_code_statement(self) -> ast.stmt:
+        """An hl.prefetch_code() site's call: each CTA passes its rank in a count
+        of the CTAs that selects and numbers the readers, who split the text
+        (``prefetch_code``).  A persistent grid counts from its last worker,
+        the one that idles longest at entry when the first root has fewer
+        tasks than workers (the static plan fills it from the first worker);
+        a site between roots uses the same count.  Any other launch counts
+        from its first CTA (the later CTAs of a grid of waves, or of packet
+        dispatch's program per task, launch after it)."""
+        rank = "tl.program_id(0)"
+        if (
+            str(self.config.pid_type).startswith("persistent")
+            and self.cross_loop_dispatch != "dynamic"
+        ):
+            rank = f"tl.num_programs(0) - 1 - {rank}"
+        return statement_from_string(f"helion_prefetch_code.prefetch_code({rank})")
+
     def graph_infos(self) -> list[GraphInfo]:
         """This config's codegen graph copies, then the traced originals (a copy's
         ``placeholder_to_outer_arg`` returns nodes of the originals)."""
@@ -1735,13 +1772,27 @@ class DeviceFunction:
             and "wait" not in env.pdl_entry
         ):
             raise exc.PdlStateWithoutWait
-        prefetch_code = (
-            [statement_from_string("helion_prefetch_code.prefetch_code()")]
-            if env.prefetch_code and backend.uses_triton_compiler
-            else []
-        )
+        unplaced = [
+            root
+            for root in env.prefetch_code_sites
+            if root is not None and root not in self.prefetch_code_placed
+        ]
+        for root in unplaced:
+            log.info(
+                "hl.prefetch_code() before root %d runs at entry: %s",
+                root,
+                # A static or claimed schedule gives each resident root a block.
+                "its tasks continue an earlier root's, in that root's block"
+                if self.cross_loop_dispatch in ("static", "claimed")
+                else "the launch runs no root's tasks as a block of its own (a "
+                "static or claimed persistent schedule does)",
+            )
         entry = [
-            *prefetch_code,
+            *(
+                [self.prefetch_code_statement()]
+                if None in env.prefetch_code_sites or unplaced
+                else []
+            ),
             *[
                 statement_from_string(backend.pdl_instruction(op))
                 for op in env.pdl_entry

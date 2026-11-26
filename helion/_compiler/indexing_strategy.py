@@ -4,6 +4,7 @@ import ast
 import collections
 import dataclasses
 import logging
+import math
 import operator
 import threading
 from typing import TYPE_CHECKING
@@ -1007,6 +1008,150 @@ def _resolve_configured_extent(
         substitutions[symbol] = sympy.Integer(value)  # pyrefly: ignore[unsupported-operation]
     result = expression.xreplace(substitutions)
     return int(result) if result.is_Integer else None
+
+
+def _concrete_extents(shape: list[int | torch.SymInt]) -> list[int]:
+    env = CompileEnvironment.current()
+    config = DeviceFunction.current().config
+    return [
+        size
+        if (size := _resolve_configured_extent(d, config)) is not None
+        else env.size_hint(d)
+        for d in shape
+    ]
+
+
+def proves_multiple(state: CodegenState, value: object, divisor: int) -> bool:
+    """Prove a power-of-two factor of a scalar base, including across captures."""
+    from ..language.tile_ops import tile_begin
+
+    if divisor == 1:
+        return True
+    if isinstance(value, int):
+        return value % divisor == 0
+    if not isinstance(value, torch.fx.Node):
+        return False
+    if (cap := _captured_value(value)) is not None and cap[1] is None:
+        return proves_multiple(state, cap[0], divisor)
+    if (
+        value.target
+        in (
+            operator.add,
+            operator.sub,
+            torch.ops.aten.add.Tensor,
+            torch.ops.aten.sub.Tensor,
+        )
+        and value.kwargs.get("alpha", 1) == 1
+    ):
+        return all(proves_multiple(state, term, divisor) for term in value.args[:2])
+    if value.target in (operator.mul, torch.ops.aten.mul.Tensor):
+        for factor, other in (value.args[:2], value.args[:2][::-1]):
+            if isinstance(factor, int):
+                return proves_multiple(
+                    state, other, divisor // math.gcd(divisor, factor)
+                )
+    if (
+        value.target in (operator.floordiv, torch.ops.aten.floor_divide.default)
+        and isinstance(quotient := value.args[1], int)
+        and quotient > 0
+    ):
+        # a // q is a multiple of d when a is a multiple of q * d (exact).
+        return proves_multiple(state, value.args[0], divisor * quotient)
+    if value.target is tile_begin and isinstance(arg := value.args[0], torch.fx.Node):
+        env = CompileEnvironment.current()
+        if (block := env.resolve_block_id(arg.meta.get("val"))) is not None:
+            block = _resolve_codegen_block_id(state, block)
+            width = env.block_sizes[block].from_config(state.device_function.config)
+            if loops := state.codegen.active_device_loops.get(block):
+                info = loops[-1].block_id_to_info.get(block)
+                return (
+                    isinstance(width, int)
+                    and width % divisor == 0
+                    and info is not None
+                    and info.begin_expr is not None
+                    and env.known_multiple(info.begin_expr, divisor)
+                )
+    return False
+
+
+def _aligned_loop_start(state: CodegenState, tile: torch.SymInt, divisor: int) -> bool:
+    """Prove the lower bound of a bare tile, e.g. a parent tile's begin."""
+    from ..language._tracing_ops import _for_loop
+    from .device_ir import ForLoopGraphInfo
+    from .device_ir import control_flow_parent_entries
+
+    origin = _block_size_origin(tile)
+    if origin is None or state.fx_node is None:
+        return False
+    df = state.device_function
+    loop = next(i for i in df.graph_infos() if i.graph is state.fx_node.graph)
+    if not isinstance(loop, ForLoopGraphInfo) or origin.block_id not in loop.block_ids:
+        return False
+    parent, _ = control_flow_parent_entries(df.graph_infos())[loop.graph_id]
+    if parent.target is not _for_loop:
+        return False
+    starts = cast("list[object]", parent.args[1])
+    return proves_multiple(
+        state, starts[loop.block_ids.index(origin.block_id)], divisor
+    )
+
+
+def whole_box_descriptor(
+    state: CodegenState, indexing: BlockedSubscriptIndexing, subscript: list[object]
+) -> bool:
+    """Whether a descriptor load needs no guard: true when every axis whose
+    range is unproven has its origin at a whole-box multiple (a negative origin
+    then misses the tensor entirely) and the contiguous origin is aligned. A
+    box that may be dead then gets an aligned out-of-bounds origin instead
+    (``tl.where``), which TMA zero-fills, so the load has no branch. A ring
+    load requires this (it cannot switch to a pointer load); another load
+    takes it when it holds, else the guarded TMA and pointer arms."""
+    tensor = indexing.base
+    layout = CompileEnvironment.current().tensor_descriptor_layout_signature(tensor)
+    assert layout is not None and layout[0] is not None
+    contiguous = layout[0]
+    unknown = set(range(tensor.ndim)) - indexing.proven_descriptor_axes
+    subs = [(n, k) for n, k in enumerate(subscript) if k is not None]
+    for dim, ((pos, k), width) in enumerate(
+        zip(subs, _concrete_extents(indexing.block_shape), strict=True)
+    ):
+        divisor = width if dim in unknown else 1
+        if dim == contiguous and dim not in indexing.aligned_descriptor_axes:
+            divisor = max(divisor, 16 // tensor.element_size())
+        if divisor != 1:
+            # The tile's origin advances by the configured width from its start.
+            if (
+                width % divisor == 0
+                and isinstance(k, torch.SymInt)
+                and _aligned_loop_start(state, k, divisor)
+            ):
+                continue
+            info = (
+                _contiguous_integer_tensor_index_at(state, k, pos)
+                if isinstance(k, torch.Tensor)
+                else None
+            )
+            if info is None or not all(
+                proves_multiple(state, term, divisor) for _, term in info.base_terms
+            ):
+                return False
+    if predicate := indexing.descriptor_box_live(state):
+        # Descriptor extents fit int32. One past a non-contiguous axis is a
+        # representable, aligned OOB box even if the contiguous extent is INT_MAX.
+        outer = 1 if contiguous == 0 else 0
+        live = state.codegen.lift(
+            expr_from_string(predicate), dce=True, prefix="box_live"
+        )
+        for dim in unknown | {outer}:
+            miss = (
+                state.device_function.tensor_size(tensor, dim).name
+                if dim == outer
+                else "0"
+            )
+            indexing.offsets[dim] = (
+                f"tl.where({live.id}, {indexing.offsets[dim]}, {miss})"
+            )
+    return True
 
 
 def _tensor_dimension_fits_int32(size: int | torch.SymInt) -> bool:
@@ -2049,6 +2194,8 @@ class TensorDescriptorIndexingStrategy(IndexingStrategy):
                 cache_modifier,
             )
 
+        # A whole-box origin needs no guard: a dead box reads zeros from TMA.
+        guarded = not whole_box_descriptor(state, indexing, subscript)
         # Load from tensor descriptor with permuted offsets
         backend = CompileEnvironment.current().backend
         load_expr = expr_from_string(
@@ -2068,7 +2215,7 @@ class TensorDescriptorIndexingStrategy(IndexingStrategy):
             )
 
         result = indexing.reshape_load(state, load_expr)
-        if native := indexing.native_descriptor_box():
+        if guarded and (native := indexing.native_descriptor_box()):
             fallback = PointerIndexingStrategy(wide_offsets=True).codegen_load(
                 state,
                 fake_tensor,
@@ -2080,7 +2227,7 @@ class TensorDescriptorIndexingStrategy(IndexingStrategy):
             result = expr_from_string(
                 f"{{box}} if {native} else {{fallback}}", box=result, fallback=fallback
             )
-        if live := indexing.descriptor_box_live(state):
+        if guarded and (live := indexing.descriptor_box_live(state)):
             shape = state.tile_strategy.shape_str(indexing.reshaped_size)
             zero = backend.zeros_expr(shape, backend.dtype_str(fake_tensor.dtype))
             result = expr_from_string(f"{{box}} if {live} else {zero}", box=result)

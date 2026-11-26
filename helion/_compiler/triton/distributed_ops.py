@@ -1465,19 +1465,25 @@ def _record_scatter(
     device_function.inband_scatter_done[scatter.root] = done
 
 
+def _extent(state: CodegenState, size: int | torch.SymInt) -> int | None:
+    """A tile extent as the config fixes it, else None."""
+    env = CompileEnvironment.current()
+    block_id = None if isinstance(size, int) else env.resolve_block_id(size)
+    if block_id is not None:
+        # A global block size is a SymInt; from_config_int reads a size
+        # the config fixes without pinning it.
+        size = env.block_sizes[block_id].from_config_int(state.config)
+    return size if isinstance(size, int) else None
+
+
 def _poll_pack(
     state: CodegenState, output_size: list[int | torch.SymInt], lanes: int
 ) -> int:
     """Words per asm lane: more than a thread's words would fault."""
-    env = CompileEnvironment.current()
     numel = 1
     for size in output_size:
-        block_id = None if isinstance(size, int) else env.resolve_block_id(size)
-        if block_id is not None:
-            # A global block size is a SymInt; from_config_int reads a size
-            # the config fixes without pinning it.
-            size = env.block_sizes[block_id].from_config_int(state.config)
-        if not isinstance(size, int):
+        size = _extent(state, size)
+        if size is None:
             return 1
         numel *= size
     numel //= lanes
@@ -1567,6 +1573,15 @@ def inband_load_codegen(state: CodegenState, codegen_load: LoadCodegen) -> LoadC
         backend = env.backend
         indexing = SubscriptIndexing.create(state, fake_tensor, subscript, extra_mask)
         output_size = SubscriptIndexing.compute_shape(fake_tensor, subscript, state)
+        if (
+            indexing.needs_broadcast()
+            and indexing.block_shaped_offset
+            and indexing.broadcast_mask_expr is None
+            and all(_extent(state, size) == 1 for _, size in indexing.broadcast_dims)
+        ):
+            # A block-1 tile on a size-1 dim broadcasts nothing: a uniform
+            # index, which polls like a scalar one (block words, a CTA vote).
+            indexing = indexing._replace(broadcast_dims=())
         shape = state.tile_strategy.shape_str(output_size)
         offset = indexing.index_expr
         if indexing.has_mask() and not indexing.block_shaped_offset:

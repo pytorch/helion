@@ -20,6 +20,7 @@ from ..cross_loop_codegen import _all_names
 from ..cross_loop_codegen import _argument_allocations
 from ..cross_loop_codegen import _effect_kind
 from ..cross_loop_codegen import _is_tl_call
+from ..cross_loop_codegen import _is_volatile
 from ..cross_loop_codegen import _may_write
 from ..cross_loop_codegen import _named_allocations
 from ..cross_loop_codegen import _stored_names
@@ -259,7 +260,7 @@ def _pipelined(
                 continue
             other = _load_args(load)[2]
             if (
-                any(k.arg == "volatile" for k in load.keywords)
+                _is_volatile(load)
                 or _named_allocations(load, allocations) & written
                 or not (isinstance(other, ast.Constant) and other.value in (None, 0))
             ):
