@@ -168,6 +168,7 @@
  "test/test_cute_fuse_two_pass_loads.py": 1.8,
  "test/test_cute_gathered_mma.py": 29.2,
  "test/test_cute_gdn_recurrence.py": 68.2,
+ "test/test_cute_gemma4_pretuned.py": 14.8,
  "test/test_cute_graph_cse.py": 6.4,
  "test/test_cute_grid_launch_extents.py": 7.1,
  "test/test_cute_grouped_ab_k.py": 25.7,

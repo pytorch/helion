@@ -65,13 +65,14 @@ KERNELS = [
     "rms_norm_per_block_quant",
     "silu_and_mul_per_block_quant",
     "fused_qk_norm_rope",
-    # Fixed-shape model regions compiled as one Triton kernel.
+    # Pretuned model regions. Each backend has its own dashboard row.
     "kda_decode",
     "qwen3_decode_layer",
     "qwen3_decode_layer_bf16",
     "qwen3_30b_a3b_moe",
     "llama32_1b_decode_layer_bf16",
     "gemma4_a4b_moe",
+    "gemma4_a4b_moe_cute",
     "gpt_oss_moe",
     "flash_mla",
     "flash_mla_cute",
@@ -173,6 +174,11 @@ def run_kernel(name: str, current_hardware: str) -> dict:
         # main(verbose=True) prints the per-shape table (relayed to CI logs) and
         # returns the metrics dict directly -- no stdout scraping.
         metrics = module.main(verbose=True)
+        # An architecture-matched device can expose fewer SMs than the
+        # checked-in schedule requires, for instance in a partition.
+        if "skipped" in metrics:
+            record["skipped"] = metrics["skipped"]
+            return record
         record.update(
             helion_wins=int(metrics["helion_wins"]),
             total=int(metrics["total"]),
