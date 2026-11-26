@@ -661,6 +661,8 @@ PTX_ROW_EXPORTS: dict[str, tuple[str, ...]] = {
     ),
     "_mma_dag_runtime": (
         "bits_f32",
+        "copy_s2g_b16",
+        "copy_s2g_b32",
         "cp_async_16",
         "cp_async_16_ca",
         "cp_async_16_l2",
@@ -1283,6 +1285,22 @@ PTX_ROW_FINGERPRINTS: dict[str, _Fingerprint] = {
     ),
     "stg_b32": (
         "st.global.b32 [$0], $1;",
+        "l,r,~{memory}",
+        True,
+        ("i64", "i32"),
+        None,
+        None,
+    ),
+    "copy_s2g_b16": (
+        "{ .reg .b16 h; ld.shared.b16 h, [$1]; st.global.b16 [$0], h; }",
+        "l,r,~{memory}",
+        True,
+        ("i64", "i32"),
+        None,
+        None,
+    ),
+    "copy_s2g_b32": (
+        "{ .reg .b32 w; ld.shared.b32 w, [$1]; st.global.b32 [$0], w; }",
         "l,r,~{memory}",
         True,
         ("i64", "i32"),

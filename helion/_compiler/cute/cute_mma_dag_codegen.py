@@ -444,7 +444,12 @@ class WarpMmaDagEmitter(MmaDagEmitterBase):
         }
         self.staging: dict[Node, _Tile] = {
             node: _Tile(
-                spec.name, spec.offset, spec.rows, spec.cols, spec.elem_bytes, 2
+                spec.name,
+                spec.offset,
+                spec.rows,
+                spec.cols,
+                spec.elem_bytes,
+                spec.slots,
             )
             for node, spec in staging_specs.items()
         }
@@ -554,6 +559,34 @@ class WarpMmaDagEmitter(MmaDagEmitterBase):
             terms.append(window)
         return " and ".join(terms) if terms else None
 
+    def packet_exists(
+        self, access: Access, rows_pos: int, prow: str, pch: str
+    ) -> str | None:
+        """The Boolean saying the 16-byte packet at tile-local row ``prow``
+        and chunk ``pch`` of a 2-D tile of ``access`` (its rows along tile
+        dim ``rows_pos``) exists (None: every packet does): its row does
+        (``row_exists``), and so does its first column where the contiguous
+        dim runs ragged, whose extent fills whole packets
+        (``ragged_root_axes``), so the packet is all inside or all past it.
+        A 64-wide tile of B over N = 56 (bf16, 112-byte rows) loads its
+        last packet of each row as
+            md_zf = cutlass.Int32(16) if md_a2 + md_pc8 * 8 < 56 else cutlass.Int32(0)
+            _helion_mma_dag.cp_async_16_zfill(..., md_base_1 + cutlass.Int64(md_pr8) * 112 + cutlass.Int64(md_pc8 * 16), md_zf)
+        Unguarded, ``md_pc8 = 7`` reads the next row's first packet (the
+        last matrix's last row reads past the tensor: an illegal address on
+        16384 matrices of 56 x 32)."""
+        terms = [
+            guard
+            for guard in (
+                self.row_exists(access, rows_pos, prow),
+                self.row_exists(
+                    access, 1 - rows_pos, f"{pch} * {16 // access.dtype.itemsize}"
+                ),
+            )
+            if guard is not None
+        ]
+        return " and ".join(terms) if terms else None
+
     def bounds_pred(self, access: Access, coords: Coords) -> str | None:
         """The Int32 predicate of a per-lane load of ``access`` at ``coords``
         bound at the current site (None: unpredicated)."""
@@ -561,6 +594,33 @@ class WarpMmaDagEmitter(MmaDagEmitterBase):
         if bounds is None:
             return None
         return self.bind("md_ok", self.pred_int(bounds))
+
+    def pair_preds(
+        self, access: Access, coords: Coords, paired: bool
+    ) -> tuple[str | None, str | None]:
+        """The predicates of a per-lane pair load of ``access`` whose first
+        element sits at ``coords``: the first element's, and the second's
+        where the two load singly (None: the first's covers it). Over an odd
+        ragged contiguous extent the second element can lie past it: bias
+        tiles of 49 x 49 bf16 (98-byte rows) on a 64-column tile load
+            md_ok_16 = ... if md_a1 + md_L0_rowl < 49 and md_a2 + md_L0_coll < 49 else ...
+            md_lo_8 = ldg_bf16_as_f32_pred(md_lb, md_ok_16)
+            md_ok_17 = ... if md_a1 + md_L0_rowl < 49 and md_a2 + (md_L0_coll + 1) < 49 else ...
+            md_hi_8 = ldg_bf16_as_f32_pred(md_lb + 2, md_ok_17)
+        With column 48's predicate for both, the second load would read
+        column 49 (the next row's first element; past the tensor on the last
+        matrix's last row). A paired load moves both or neither
+        (``ragged_root_axes``: a pair never straddles the extent)."""
+        pred = self.bounds_pred(access, coords)
+        if paired:
+            return pred, None
+        positions = access.tile_positions
+        second = list(coords)
+        second[positions[1]] = f"({coords[positions[1]]} + 1)"
+        bounds = self.bounds(access, tuple(second))
+        if bounds is None or bounds == self.bounds(access, coords):
+            return pred, None
+        return pred, self.bind("md_ok", self.pred_int(bounds))
 
     def has_aux_shared(self, loop: int) -> bool:
         """Whether ``loop``'s aux ring has a side tile."""
@@ -867,8 +927,8 @@ class WarpMmaDagEmitter(MmaDagEmitterBase):
         (``emit_stage_in`` lays those side by side), at a staging offset
         the swizzle pattern's period divides, with no window (a box lands
         whole rows; the packets drop the rows at and past the limit) and
-        no ragged row axis (the packets drop the rows the CTA does not own;
-        a box clips at the tensor's bounds only), of a storage no other
+        no ragged axis (the packets drop the rows and columns the CTA does
+        not own; a box clips at the tensor's bounds only), of a storage no other
         access touches (a bulk store completes at the kernel's end: the
         in-loop waits retire its staging reads, not its global writes),
         within the tensor map rank and count limits.  Other snapshots keep
@@ -898,6 +958,7 @@ class WarpMmaDagEmitter(MmaDagEmitterBase):
                 es != 2
                 or access.windows
                 or plan.ragged(access.tile_dims[0])
+                or plan.ragged(access.tile_dims[1])
                 or tile.rows > 256
                 or (tile.cpr not in (1, 2, 4, 8) and tile.row_bytes % ATOM_MAX_BYTES)
                 or tile.offset % period
@@ -1090,7 +1151,7 @@ class WarpMmaDagEmitter(MmaDagEmitterBase):
             gofs = f" + {pk.row_off * row_stride}" if pk.row_off else ""
             dst = f"{smem} + {pk.offset(row_bytes)} + {pk.swz} * 16"
             src = f"{gbase} + cutlass.Int64({pk.pr}) * {row_stride} + cutlass.Int64({pk.pch} * 16){gofs}"
-            guard = self.row_exists(load, rows_pos, pk.prow)
+            guard = self.packet_exists(load, rows_pos, pk.prow, pk.pch)
             if guard is not None:
                 src_bytes = self.bind(
                     "md_zf",
@@ -1414,13 +1475,52 @@ class WarpMmaDagEmitter(MmaDagEmitterBase):
                 f"{self.iter_vars[load.node]} + cutlass.Int64({prow}) * {row_stride} "
                 f"+ cutlass.Int64({pcol}) * {2 * load_es}"
             )
-            guard = self.row_exists(load, operand.rows_pos, prow)
-            pred = (
-                self.bind("md_ok", self.pred_int(guard)) if guard is not None else None
-            )
-            lo, hi = self.pair_load(
-                address, load.dtype, paired, pred, readonly=self.readonly(load)
-            )
+            row_guard = self.row_exists(load, operand.rows_pos, prow)
+            col_guards = [
+                self.row_exists(load, operand.cols_pos, f"2 * {pcol}"),
+                self.row_exists(load, operand.cols_pos, f"(2 * {pcol} + 1)"),
+            ]
+            if paired or col_guards[0] == col_guards[1]:
+                # A pair lies wholly inside a ragged contiguous dim's extent or
+                # wholly past it where its moves are pairs (``ragged_root_
+                # axes``): its first column decides.
+                guard = " and ".join(
+                    term
+                    for term in (
+                        row_guard,
+                        self.row_exists(load, operand.cols_pos, f"2 * {pcol}"),
+                    )
+                    if term is not None
+                )
+                pred = self.bind("md_ok", self.pred_int(guard)) if guard else None
+                lo, hi = self.pair_load(
+                    address, load.dtype, paired, pred, readonly=self.readonly(load)
+                )
+            else:
+                # Single elements over an odd ragged extent, each under its
+                # own predicate. B [32, 49] (98-byte rows) on a 64-wide tile:
+                #     md_lo = ldg_bf16_as_f32_pred(md_a, cutlass.Int32(1) if md_a2 + 2 * md_pc < 49 else ...)
+                #     md_hi = ldg_bf16_as_f32_pred(md_a + 2, cutlass.Int32(1) if md_a2 + (2 * md_pc + 1) < 49 else ...)
+                # One predicate per pair (column 48's) would read column 49,
+                # the next row's first element, into a tile column that only
+                # unstored outputs read; the last matrix's last row would read
+                # past the tensor.
+                halves = []
+                for half, col_guard in enumerate(col_guards):
+                    guard = " and ".join(
+                        term for term in (row_guard, col_guard) if term is not None
+                    )
+                    pred = self.bind("md_ok", self.pred_int(guard)) if guard else None
+                    element = f"{address} + {half * load_es}" if half else address
+                    halves.append(
+                        self.bind(
+                            "md_lo" if half == 0 else "md_hi",
+                            self.scalar_load(
+                                element, load.dtype, pred, readonly=self.readonly(load)
+                            ),
+                        )
+                    )
+                lo, hi = halves
             self.set_tile_leaf(load, 0, lo)
             self.set_tile_leaf(load, 1, hi)
             values = []
@@ -1679,7 +1779,8 @@ class WarpMmaDagEmitter(MmaDagEmitterBase):
         threads = self.plan.threads
         # The staging rows are the store's first tile dim (``staged_store_
         # reason``); a ragged axis or a window there drops the packets past
-        # the extent / the limit.
+        # the extent / the limit, as a ragged contiguous dim drops its
+        # packets past the extent (``packet_exists``).
         for rep in range(-(-tile.packets // threads)):
             idx = f"({rep * threads} + md_tidx)" if rep else "md_tidx"
             guard = tile.packets < (rep + 1) * threads
@@ -1697,7 +1798,7 @@ class WarpMmaDagEmitter(MmaDagEmitterBase):
                 f"{_RUNTIME}.stg_v4_b32({gbase} + cutlass.Int64({prow}) * {row_stride} "
                 f"+ cutlass.Int64({pch} * 16), {', '.join(words)})"
             )
-            row_guard = self.row_exists(access, 0, prow)
+            row_guard = self.packet_exists(access, 0, prow, pch)
             if nest is not None:
                 self.emit_guarded(row_guard, line)
                 nest.__exit__(None, None, None)
@@ -1741,6 +1842,9 @@ class WarpMmaDagEmitter(MmaDagEmitterBase):
 
     def emit_store(self, store: Store) -> None:
         """Pair stores of a fragment-derived value at the store's coordinates."""
+        if store in self.plan.element_stores:
+            self.emit_element_store(store)
+            return
         access = store.access
         slot = self.program.frag_slots[store.frag]
         layout = self.slot_layouts[slot]
@@ -1803,6 +1907,91 @@ class WarpMmaDagEmitter(MmaDagEmitterBase):
                             )
         self.evaluator.leave_frag()
 
+    def emit_element_store(self, store: Store) -> None:
+        """An ``element_store``: the fragment's values written into the
+        store's shared staging tile as rounded pairs, a CTA barrier, then
+        the tile copied out along its rows, lane ``t`` of a round the
+        element ``t`` columns into its row. A 64 x 64 tile of 49 x 49 bf16
+        scores (98-byte rows) over four warps:
+            sts_b32(md_se0 + row * 128 + swizzled chunk * 16 + ..., pack_bf16x2(v0, v1))   # per pair
+            cute.arch.barrier()
+            md_sr = md_tidx // 64; md_sc = md_tidx % 64                                   # round 0
+            if md_a1 + md_sr < 49 and md_a2 + md_sc < 49:
+                copy_s2g_b16(out + row * 98 + col * 2, md_se0 + md_sr * 128 + ...)
+        where the fragment pairs store one element per lane, eight rows per
+        warp instruction:
+            if md_a1 + md_L0_rowl < 49 and md_a2 + md_L0_coll < 49:
+                stg_bf16(md_lb, md_v)
+        """
+        access = store.access
+        tile = self.staging[access.node]
+        slot = self.program.frag_slots[store.frag]
+        layout = self.slot_layouts[slot]
+        es = access.dtype.itemsize
+        base = tile.base("0")
+        positions = access.tile_positions
+        self.hoist_scalars(store.value)
+        self.evaluator.enter_frag(slot)
+        for am in range(layout.atoms_m):
+            for an in range(layout.atoms_n):
+                for half in range(2):
+                    lanes = tuple(
+                        _Lane(
+                            self.frag_coords(
+                                store.value, layout, am, an, 2 * half + bit
+                            ),
+                            None,
+                            (am, an, 2 * half + bit),
+                        )
+                        for bit in range(2)
+                    )
+                    if es == 4:
+                        lo, hi = self.evaluator.pair(store.value, lanes)
+                    else:
+                        lo, hi = self.evaluator.unrounded_pair(store.value, lanes)
+                    self.evaluator.reg = None
+                    row, col = layout.row(am, half), layout.col(an)
+                    chunk = f"(({col}) * {es} // 16)"
+                    swz = _staging_swizzle(row, chunk, tile.cpr, es)
+                    address = (
+                        f"{base} + {row} * {tile.row_bytes} + {swz} * 16 "
+                        f"+ ({col}) * {es} % 16"
+                    )
+                    if es == 4:
+                        self.emit(f"{_RUNTIME}.sts_v2_f32({address}, {lo}, {hi})")
+                    else:
+                        self.emit(
+                            f"{_RUNTIME}.sts_b32({address}, "
+                            f"{self.pack(lo, hi, access.dtype)})"
+                        )
+        self.evaluator.leave_frag()
+        self.emit(self.sync)
+        elements = tile.rows * tile.cols
+        threads = self.plan.threads
+        copy = "copy_s2g_b32" if es == 4 else "copy_s2g_b16"
+        for rep in range(-(-elements // threads)):
+            idx = f"({rep * threads} + md_tidx)" if rep else "md_tidx"
+            with (
+                self.nest(f"if {idx} < {elements}:")
+                if elements < (rep + 1) * threads
+                else contextlib.nullcontext()
+            ):
+                srow = self.bind("md_sr", f"{idx} // {tile.cols}")
+                scol = self.bind("md_sc", f"{idx} % {tile.cols}")
+                coords = ["0"] * len(access.dims)
+                coords[positions[0]] = srow
+                coords[positions[1]] = scol
+                chunk = f"({scol} * {es} // 16)"
+                swz = _staging_swizzle(srow, chunk, tile.cpr, es)
+                source = (
+                    f"{base} + {srow} * {tile.row_bytes} + {swz} * 16 "
+                    f"+ {scol} * {es} % 16"
+                )
+                self.emit_guarded(
+                    self.bounds(access, tuple(coords)),
+                    f"{_RUNTIME}.{copy}({self.address(access, tuple(coords))}, {source})",
+                )
+
     def emit_carry_init(self, loop: Loop) -> None:
         for carry in loop.carries:
             layout = self.slot_layouts[carry.slot]
@@ -1843,11 +2032,13 @@ class WarpMmaDagEmitter(MmaDagEmitterBase):
                             coords[positions[0]] = layout.row(am, half)
                             coords[positions[1]] = layout.col(an)
                             address = self.address(init, tuple(coords))
+                            pred, pred_hi = self.pair_preds(init, tuple(coords), paired)
                             lo, hi = self.pair_load(
                                 address,
                                 init.dtype,
                                 paired,
-                                self.bounds_pred(init, tuple(coords)),
+                                pred,
+                                pred_hi=pred_hi,
                             )
                             self.set_tile_leaf(init, 0, lo)
                             self.set_tile_leaf(init, 1, hi)
@@ -1908,11 +2099,13 @@ class WarpMmaDagEmitter(MmaDagEmitterBase):
                         coords[positions[0]] = layout.row(am, half)
                         coords[positions[1]] = layout.col(an)
                         address = self.address(init, tuple(coords))
+                        pred, pred_hi = self.pair_preds(init, tuple(coords), paired)
                         lo, hi = self.pair_load(
                             address,
                             init.dtype,
                             paired,
-                            self.bounds_pred(init, tuple(coords)),
+                            pred,
+                            pred_hi=pred_hi,
                             readonly=self.readonly(init),
                         )
                         self.emit(f"{self.reg(carry.slot, am, an, 2 * half)} = {lo}")
@@ -3648,11 +3841,15 @@ class WarpMmaDagEmitter(MmaDagEmitterBase):
                             coords[positions[1]] = col
                             address = self.address(access, tuple(coords))
                             paired = self.pairs_aligned(access, 1)
+                            pred, pred_hi = self.pair_preds(
+                                access, tuple(coords), paired
+                            )
                             lo, hi = self.pair_load(
                                 address,
                                 access.dtype,
                                 paired,
-                                self.bounds_pred(access, tuple(coords)),
+                                pred,
+                                pred_hi=pred_hi,
                                 readonly=self.readonly(access),
                             )
                         self.set_tile_leaf(access, 0, lo)

@@ -422,6 +422,24 @@ stg_f16 = ptx_op(
     doc="One fp32 value rounded (RN) to fp16 and stored (2-byte aligned).",
 )
 
+copy_s2g_b16 = ptx_op(
+    "copy_s2g_b16",
+    "{ .reg .b16 h; ld.shared.b16 h, [$1]; st.global.b16 [$0], h; }",
+    (cutlass.Int64, cutlass.Int32),
+    side_effects=True,
+    memory=True,
+    doc="One 16-bit element copied from shared to global memory (2-byte aligned).",
+)
+
+copy_s2g_b32 = ptx_op(
+    "copy_s2g_b32",
+    "{ .reg .b32 w; ld.shared.b32 w, [$1]; st.global.b32 [$0], w; }",
+    (cutlass.Int64, cutlass.Int32),
+    side_effects=True,
+    memory=True,
+    doc="One 4-byte element copied from shared to global memory.",
+)
+
 stg_bf16 = ptx_op(
     "stg_bf16",
     "{ .reg .b16 h; cvt.rn.bf16.f32 h, $1; st.global.b16 [$0], h; }",

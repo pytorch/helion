@@ -502,7 +502,18 @@ def tcgen05_facts(program: MmaDagProgram) -> Tcgen05Facts | None:
                 ):
                     return None
     from .cute_mma_dag import cluster_split_axis
+    from .cute_mma_dag import padded_row_axes
 
+    if padded_row_axes(program):
+        # A padded row (a K of 49 on a 64-wide row) stays with the warp
+        # emitter, whose staging guards the elements past the extent
+        # (``in_bounds``). The tensor-memory renderers keep whole tiles: their
+        # synchronous pass of a [1024, 49] bf16 A (98-byte rows, which TMA
+        # cannot fetch) in a loop over N tiles loads every column up to 63,
+        #     md_lo = _helion_mma_dag.ldg_bf16_as_f32(md_base + cutlass.Int64(md_spr_t0_0) * 98 + cutlass.Int64(md_spc_t0_0) * 4, nc=True)
+        # reading the next row's elements into columns 49-63 and, from the
+        # last row, past the tensor.
+        return None
     vector_steps = (*program.reduces, *program.vec_ops, *program.vec_stores)
     split = cluster_split_axis(program)
     if (

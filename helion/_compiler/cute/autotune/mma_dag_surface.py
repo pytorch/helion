@@ -971,7 +971,7 @@ def _normalize_cute_mma_dag(
     )
     if not facts.identity_candidates and not tcgen05_exchange:
         config[MMA_DAG_EXCHANGE_KEY] = MMA_DAG_EXCHANGE_CHOICES[0]
-    if not facts.staging:
+    if not facts.staging and not facts.element_staging:
         config[MMA_DAG_STORE_KEY] = MMA_DAG_STORE_CHOICES[0]
     if not facts.aux_candidates:
         config[MMA_DAG_AUX_KEY] = MMA_DAG_AUX_CHOICES[0]

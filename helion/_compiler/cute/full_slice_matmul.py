@@ -2,8 +2,10 @@
 
 The envelope accepts two-dimensional half/BF16 input tensors whose contraction
 is a full slice. A private FP32 accumulator spans the entire contraction; the
-original result dtype is restored once, before any following epilogue. The
-contraction extents must already be provably equal; sample values cannot
+original result dtype is restored once, before any following epilogue. A
+static contraction of at most ``RANK1_MAX_K`` elements updates it with K
+unrolled rank-1 products (``_Rewriter.rank1_updates``) instead of a K loop.
+The contraction extents must already be provably equal; sample values cannot
 establish equality for distinct dynamic shape symbols.
 
 Two root shapes are rewritten:
@@ -157,6 +159,19 @@ _POINTWISE_METHODS = frozenset(
     }
 )
 _PURE_HL = ("zeros", "full", "arange", "dot")
+# The longest static contraction written as unrolled rank-1 updates
+# (``_Rewriter.rank1_updates``). Each output takes K FMAs on the CUDA cores,
+# against a K loop whose block is one tensor-core K step (16 for the 16-bit
+# operands this pass takes) however short K is. Up to half that step the
+# rank-1 updates run about as fast as the output stores; at three quarters
+# they are compute-bound. GB300, CUDA graphs over cold inputs, of stock
+# Inductor max-autotune, K loop -> rank-1 updates, both autotuned in one
+# process at full effort: bf16 8192x768x4 0.72 -> 1.21, 4096x2048x4 0.74 ->
+# 1.21; 1024x1024x8 0.96 -> 1.22, 4096x2048x8 0.78 -> 0.88, 8192x768x8 0.78
+# -> 0.76, 128x4096x8 1.10 -> 1.04 (the K loop's two wins kept a picked
+# dependent launch overlapping back-to-back calls; a 128x4096x8 K loop picked
+# without it ran 0.91); quick autotune, 8192x768x12 0.68 -> 0.51.
+RANK1_MAX_K = 8
 
 
 def _bound_names(host: HostFunction) -> set[str]:
@@ -903,18 +918,82 @@ class _Rewriter:
                 zeros=zeros,
                 dtype=float32,
             )
-            loop = statement_from_string(
-                f"for {contraction} in {{tile}}({lhs_name}.size(1)):\n"
-                f"    {accumulator} = {{addmm}}({accumulator}, "
-                f"{lhs_name}[{m_name}, {contraction}], {rhs_name}[{contraction}, {n_name}])",
-                tile=cast("ast.Call", root.iter).func,
-                addmm=addmm,
+            loop = self.rank1_updates(
+                lhs_name, rhs_name, m_name, n_name, accumulator, contraction, float32
             )
+            if loop is None:
+                loop = statement_from_string(
+                    f"for {contraction} in {{tile}}({lhs_name}.size(1)):\n"
+                    f"    {accumulator} = {{addmm}}({accumulator}, "
+                    f"{lhs_name}[{m_name}, {contraction}], {rhs_name}[{contraction}, {n_name}])",
+                    tile=cast("ast.Call", root.iter).func,
+                    addmm=addmm,
+                )
             finish = statement_from_string(
                 f"{{target}} = {accumulator}.to({lhs_name}.dtype)",
                 target=target,
             )
             return [initial, loop, finish]
+
+    def rank1_updates(
+        self,
+        lhs_name: str,
+        rhs_name: str,
+        m_name: str,
+        n_name: str,
+        accumulator: str,
+        contraction: str,
+        float32: ast.expr,
+    ) -> ast.stmt | None:
+        """The contraction as K unrolled rank-1 updates of the accumulator,
+        for a static K of at most half a tensor-core K step
+        (``RANK1_MAX_K``); None keeps the K loop. bf16 [8192, 2] @ [2, 768]:
+            for _helion_fullslice_k in hl.static_range(2):
+                _helion_fullslice_acc = _helion_fullslice_acc + in0[tile_y, _helion_fullslice_k].to(torch.float32)[:, None] * in1[_helion_fullslice_k, tile_x].to(torch.float32)[None, :]
+        is a pointwise body, which CuTe vectorizes along N (one thread, eight
+        outputs):
+            _tile_unroll_vec_1_0 = cute.arch.load(in1.iterator + ... + lane_base_1 * ..., ir.VectorType.get([8], cutlass.Uint16.mlir_type))
+            for vec_lane_1 in cutlass.range_constexpr(8):
+                v_3 = cute.math.fma(v_0, v_1, _helion_fullslice_acc)
+                v_7 = cute.math.fma(v_4, v_5, v_3)
+                ...
+            _cute_store_u16_vec(out0.iterator + ..., _tile_store_vals_1_0)
+        The K loop the other contractions get,
+            for _helion_fullslice_k in hl.tile(in0.size(1)):
+                _helion_fullslice_acc = torch.addmm(_helion_fullslice_acc, in0[tile_y, _helion_fullslice_k], in1[_helion_fullslice_k, tile_x])
+        takes a K block of one MMA K step (16) whatever K is: its SIMT
+        configs run a masked 16-step loop of scalar loads per output element
+        and store one element at a time,
+            for lane_2 in range(16):
+                mask_2 = indices_2 < 2
+                load = (...).load() if mask_2 else cutlass.BFloat16(0)
+            (out0.iterator + ...).store(cutlass.BFloat16(v_0))
+        and its MMA configs zero-fill K to 16 and store through a scalar
+        epilogue. helion.inductor's stored form (a dot whose K is one block),
+        GB300, CUDA graphs over cold inputs, full-effort autotune, of stock
+        Inductor max-autotune (its Triton template): bf16 8192x768x2 0.652 ->
+        1.559 (8.02 -> 3.09 us), 4096x2048x2 0.843 -> 1.554 (the K sweep:
+        ``RANK1_MAX_K``). The fp32 accumulation is the MMA's: exact products
+        of the 16-bit operands, summed in fp32 and rounded to the output
+        dtype once."""
+        k_extent = self.input_tensors[lhs_name].size(1)
+        static_range = _global_reference(hl.static_range, self.host, self.local_names)
+        if not (
+            isinstance(k_extent, int)
+            # (an empty contraction keeps its loop: hl.static_range(0)
+            # leaves the accumulator nothing to type)
+            and 0 < k_extent <= RANK1_MAX_K
+            and static_range is not None
+        ):
+            return None
+        return statement_from_string(
+            f"for {contraction} in {{static_range}}({k_extent}):\n"
+            f"    {accumulator} = {accumulator} + "
+            f"{lhs_name}[{m_name}, {contraction}].to({{dtype}})[:, None] * "
+            f"{rhs_name}[{contraction}, {n_name}].to({{dtype}})[None, :]",
+            static_range=static_range,
+            dtype=float32,
+        )
 
     def splice(
         self,
