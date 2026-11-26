@@ -81,6 +81,19 @@ jobs:
         with:
           path: ./site
 
+      # deploy-pages sometimes fails to find the artifact uploaded seconds
+      # before ("Fetching artifact metadata failed", then "No artifacts named
+      # github-pages were found for this workflow run"), a GitHub-side fault,
+      # and Pages sometimes answers 502. Try once more after a pause.
       - name: Deploy to GitHub Pages
         id: deployment
+        continue-on-error: true
+        uses: actions/deploy-pages@v5
+
+      - name: Wait before deploying again
+        if: steps.deployment.outcome == 'failure'
+        run: sleep 60
+
+      - name: Deploy to GitHub Pages (second attempt)
+        if: steps.deployment.outcome == 'failure'
         uses: actions/deploy-pages@v5
