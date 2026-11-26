@@ -222,7 +222,9 @@ from .tcgen05_constants import TCGEN05_LARGE_BN_PROOF_CLUSTER_M
 from .tcgen05_constants import TCGEN05_LARGE_BN_PROOF_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_LARGE_BN_PROOF_PID_TYPE
 from .tcgen05_constants import TCGEN05_LARGE_BN_PROOF_PROBLEM_SHAPE
+from .tcgen05_constants import TCGEN05_MIXED_MAJOR_PAIR_L2_PREFETCH_MAX_BN
 from .tcgen05_constants import TCGEN05_ODD_WIDTH_SUBTILE_N
+from .tcgen05_constants import TCGEN05_ONE_CTA_L2_PREFETCH_EARLY_GRID_MAX_LINES
 from .tcgen05_constants import TCGEN05_ONE_CTA_MAX_BLOCK_M
 from .tcgen05_constants import TCGEN05_OPERAND_L2_PREFETCH_MAX_LINES
 from .tcgen05_constants import TCGEN05_PDL_L2_WARMUP_CTAS
@@ -249,6 +251,7 @@ from .tcgen05_constants import tcgen05_pdl_l2_warmup_cta_rows
 from .tcgen05_constants import tcgen05_pdl_l2_warmup_kblocks
 from .tcgen05_constants import tcgen05_plain_narrow_subtile_covers_n
 from .tcgen05_constants import tcgen05_role_launch_n_width
+from .tcgen05_constants import tcgen05_two_cta_max_k_tiles
 from .tcgen05_lifecycle import Tcgen05LifecycleContext
 from .tcgen05_prologue import floordiv_nonneg_expr
 from .tcgen05_prologue import masked_cluster_rank_expr
@@ -7140,7 +7143,8 @@ def _tcgen05_operand_l2_prefetch_lines(
     """
     # A one-CTA tile takes up to ``one_cta_max_lines``
     # (``tcgen05_one_cta_l2_prefetch_max_lines``: more where most of its grid
-    # starts early), a pair's CTA ``TCGEN05_OPERAND_L2_PREFETCH_MAX_LINES``.
+    # starts early), a pair's CTA ``TCGEN05_OPERAND_L2_PREFETCH_MAX_LINES``
+    # over K-major or MN-major operands (mixed majors: below).
     max_lines = (
         TCGEN05_OPERAND_L2_PREFETCH_MAX_LINES
         if plan.tcgen05_is_two_cta
@@ -7148,16 +7152,51 @@ def _tcgen05_operand_l2_prefetch_lines(
     )
     if plan.tcgen05_mma_a_k_major != plan.tcgen05_mma_b_k_major:
         # Mixed majors (the transposed product of an N-major b: b.T is an
-        # M-major A, a.T a K-major B) prefetch a one-CTA tile's whole
-        # footprint (``_flat_operand_l2_prefetch_footprint``); a pair's take
-        # none.
-        if plan.tcgen05_is_two_cta:
-            return 0
-        footprint = _flat_operand_l2_prefetch_footprint(plan)
+        # M-major A, a.T a K-major B; as written, a K-major A and an N-major
+        # B) prefetch the CTA's whole footprint
+        # (``_flat_operand_l2_prefetch_footprint``), a one-CTA tile up to
+        # ``one_cta_max_lines``, a pair's CTA its half of the pair tile up to
+        # ``TCGEN05_ONE_CTA_L2_PREFETCH_EARLY_GRID_MAX_LINES`` on any one-tile
+        # grid where the pair is at most
+        # ``TCGEN05_MIXED_MAJOR_PAIR_L2_PREFETCH_MAX_BN`` wide, and up to the
+        # pair window where it is wider (the 128x96 pair's 1816 lines: 0.904
+        # of cuBLAS without, 0.822 with; the 128x80 pair's 1680: 0.910, 0.809).
+        # GB300, CUDA graphs over cold inputs, of cuBLAS, the same pair
+        # config without and with it, helion.inductor's transposed bf16
+        # products with b stored [K, N] on 128x64 pairs: 256x1024x512 (64 CTAs,
+        # 768 lines) 0.95 -> 1.11 (its RC twin's K-major pair, prefetched
+        # already, 1.10-1.12), 64x4096x1000 (64, ~1540) 0.91 -> 1.14,
+        # 128x2304x1000 (72, ~1530) 0.90 -> 1.00, 128x3072x1000 (96) 0.79 ->
+        # 0.94, 128x4096x1000 (128) 0.91-0.95 -> 1.01. The CTAs of a 2x2
+        # cluster's two pairs, which read one A tile through the multicast,
+        # prefetch half of their A rows each (``cluster_n_rank``); prefetching
+        # all of them, both pairs fetch the A lines the multicast shares. As
+        # written on 128x64 pairs in 2x2 clusters, without, with all of its A
+        # rows, and with its half: 128x2304x1000 (72 CTAs) 0.88 / 1.00 / 1.02,
+        # 128x3072x1000 (96) 0.94 / 0.90 / 1.02, 128x4096x1000 (128) 1.02 /
+        # 0.91 / 1.05; transposed, without and with its half: 0.88 / 1.02,
+        # 0.91 / 1.00, 0.94 / 1.06.
+        two_cta = plan.tcgen05_is_two_cta
+        footprint = _flat_operand_l2_prefetch_footprint(
+            plan,
+            pair_rank="rank" if two_cta else None,
+            cluster_n_rank="rank_n"
+            if two_cta and plan.tcgen05_cluster_n == 2
+            else None,
+        )
         if footprint is None:
             return 0
         lines = _flat_operand_l2_prefetch_lines(footprint, plan.k_total_size)
-        return lines if lines <= max_lines else 0
+        cap = (
+            (
+                TCGEN05_ONE_CTA_L2_PREFETCH_EARLY_GRID_MAX_LINES
+                if plan.tcgen05_mma_bn <= TCGEN05_MIXED_MAJOR_PAIR_L2_PREFETCH_MAX_BN
+                else max_lines
+            )
+            if two_cta
+            else one_cta_max_lines
+        )
+        return lines if lines <= cap else 0
     if not plan.tcgen05_mma_a_k_major:
         # An M-major A and an N-major B prefetch along K instead
         # (``_tcgen05_operand_l2_prefetch_lines_mn_major``).
@@ -7241,10 +7280,21 @@ def _build_operand_l2_prefetch(
     the loads after the wait read it.
     """
     if plan.tcgen05_mma_a_k_major != plan.tcgen05_mma_b_k_major:
-        # mixed majors on a one-CTA tile (``_tcgen05_operand_l2_prefetch_lines``)
-        footprint = _flat_operand_l2_prefetch_footprint(plan)
-        assert footprint is not None and not plan.tcgen05_is_two_cta
-        return _build_flat_operand_l2_prefetch(
+        # mixed majors (``_tcgen05_operand_l2_prefetch_lines``); a pair's CTA
+        # binds its rank in the pair first, and in a 2x2 cluster its pair's
+        # rank in the cluster
+        two_cta = plan.tcgen05_is_two_cta
+        pair_rank = names("tcgen05_l2_pf_rank") if two_cta else None
+        cluster_n_rank = (
+            names("tcgen05_l2_pf_rank_n")
+            if two_cta and plan.tcgen05_cluster_n == 2
+            else None
+        )
+        footprint = _flat_operand_l2_prefetch_footprint(
+            plan, pair_rank=pair_rank, cluster_n_rank=cluster_n_rank
+        )
+        assert footprint is not None
+        prefetch = _build_flat_operand_l2_prefetch(
             plan,
             footprint,
             lane="cute.arch.lane_idx()"
@@ -7252,6 +7302,23 @@ def _build_operand_l2_prefetch(
             threads=32 * load_warps,
             gate=None,
             names=names,
+        )
+        if pair_rank is None:
+            return prefetch
+        rank_src = (
+            f"{pair_rank} = cute.arch.make_warp_uniform("
+            "cute.arch.block_idx_in_cluster()) & cutlass.Int32(1)\n"
+        )
+        if cluster_n_rank is not None:
+            # (the cluster's (2, 2) CTA layout: the rank in the pair, then the
+            # pair)
+            rank_src += (
+                f"{cluster_n_rank} = (cute.arch.make_warp_uniform("
+                "cute.arch.block_idx_in_cluster()) >> cutlass.Int32(1)) & "
+                "cutlass.Int32(1)\n"
+            )
+        return statement_from_string(
+            "if True:\n" + textwrap.indent(rank_src + ast.unparse(prefetch), "    ")
         )
     if not plan.tcgen05_mma_a_k_major:
         return _build_operand_l2_prefetch_mn_major(
@@ -7715,9 +7782,10 @@ def _build_operand_l2_prefetch_mn_major(
 
 @dataclass(frozen=True)
 class _FlatOperandL2Prefetch:
-    """One operand's footprint in the L2 prefetch of a one-CTA CTA that runs
-    one tile (``_flat_operand_l2_prefetch_footprint``; issued by the flat
-    pipeline and, for mixed majors, the persistent one: see
+    """One operand's footprint in the L2 prefetch of a CTA that runs one
+    tile, a one-CTA tile or, for mixed majors, a CTA pair's CTA
+    (``_flat_operand_l2_prefetch_footprint``; issued by the flat pipeline
+    and, for mixed majors, the persistent one: see
     ``_build_flat_operand_l2_prefetch``): ``tensor`` is the argument,
     ``offset`` the CTA's tile offset along its M (A) or N (B) extent of
     ``extent`` elements. A K-major operand prefetches ``cta_elems`` rows, each
@@ -7737,10 +7805,13 @@ class _FlatOperandL2Prefetch:
 
 def _flat_operand_l2_prefetch_footprint(
     plan: Tcgen05PipelinePlan,
+    pair_rank: str | None = None,
+    cluster_n_rank: str | None = None,
 ) -> tuple[_FlatOperandL2Prefetch, ...] | None:
-    """The lines of A and B a one-CTA CTA running one tile reads, per operand
-    of either major (``_build_flat_operand_l2_prefetch``: the flat pipeline,
-    and the persistent pipeline for mixed majors); ``None`` for an operand
+    """The lines of A and B a CTA running one tile reads (a one-CTA tile's,
+    or for mixed majors a CTA pair's CTA's: below), per operand of either
+    major (``_build_flat_operand_l2_prefetch``: the flat pipeline, and the
+    persistent pipeline for mixed majors); ``None`` for an operand
     transposed inside the kernel (``x[k, m].T``), whose argument strides are
     in source order.
 
@@ -7752,7 +7823,47 @@ def _flat_operand_l2_prefetch_footprint(
     112, 64, 16, 96, 48 bytes into a line in turn, and those starting more
     than 48 bytes in reach a 17th line (elements 0, 64, ..., 960 address 16,
     element 999 the 17th). An MN-major operand's segment of one K index
-    covers its own lines likewise (``_mn_major_operand_segments``)."""
+    covers its own lines likewise (``_mn_major_operand_segments``).
+
+    A CTA of a CtaGroup.TWO pair reads half the pair tile's A rows and half
+    its B rows, at its rank in the pair (``pair_rank``, bound by the
+    prefetch). helion.inductor's transposed bf16 256x1024x512 with b stored
+    [K, N] (in0 = b.T M-major, in1 = a.T K-major) on 128x64 pairs::
+
+        tcgen05_l2_pf_rank = cute.arch.make_warp_uniform(
+            cute.arch.block_idx_in_cluster()
+        ) & cutlass.Int32(1)
+        # in0: the CTA's 64 of the pair's 128 M-contiguous elements, one line
+        tcgen05_l2_pf_point = (
+            tile_offset_0 + tcgen05_l2_pf_rank * cutlass.Int32(64) + ...
+        )
+        # in1: the CTA's 32 of the pair's 64 rows of 1024 bytes, 8 lines each
+        tcgen05_l2_pf_index = (
+            tile_offset_1 + tcgen05_l2_pf_rank * cutlass.Int32(32) + ...
+        )
+
+    The two pairs of a 2x2 cluster read one A tile (the multicast shares it),
+    so each CTA prefetches half of its A rows, at its pair's rank in the
+    cluster (``cluster_n_rank``): a K-major A's rows once per cluster (an
+    M-major A's half-line segments still share their lines). The as-written
+    bf16 128x3072x1000 with b stored [K, N] on 128x64 pairs in 2x2 clusters,
+    a's 64 rows of the CTA split between the two pairs::
+
+        tcgen05_l2_pf_rank_n = (
+            cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
+            >> cutlass.Int32(1)
+        ) & cutlass.Int32(1)
+        # in0: the CTA's 32 of the pair tile's 128 rows of 2000 bytes
+        tcgen05_l2_pf_index = (
+            tile_offset_0
+            + tcgen05_l2_pf_rank * cutlass.Int32(64)
+            + tcgen05_l2_pf_rank_n * cutlass.Int32(32)
+            + tcgen05_l2_pf_row
+        )
+
+    A pair CTA's MN-major segment shorter than a line (the as-written 64-wide
+    pair's N-major B half, 32 bf16) starts at a multiple of its own length,
+    which divides the line: one line, no last-element line."""
     analysis = plan.analysis
     if (
         analysis is None
@@ -7767,12 +7878,18 @@ def _flat_operand_l2_prefetch_footprint(
     # A is [M, K]: its rows step stride[0] (K-major) or K steps stride[1]
     # (M-major); B is [K, N]: rows step stride[1] (K-major) or K steps
     # stride[0] (N-major).
+    # A CTA pair's CTA reads its half of the pair tile's A rows and its half
+    # of its B rows (the CtaGroup.TWO MMA splits both), at its rank in the
+    # pair (``pair_rank``, the name the prefetch binds it to).
+    pair = 2 if plan.tcgen05_is_two_cta else 1
+    assert (pair == 2) == (pair_rank is not None)
+    assert cluster_n_rank is None or pair_rank is not None
     for tensor, offset, extent, cta_elems, operand, k_major, row_dim in (
         (
             plan.lhs_arg_name,
             plan.m_offset_var,
             plan.m_size,
-            plan.tcgen05_mma_bm,
+            plan.tcgen05_mma_bm // pair,
             analysis.lhs,
             plan.tcgen05_mma_a_k_major,
             0,
@@ -7781,12 +7898,17 @@ def _flat_operand_l2_prefetch_footprint(
             plan.rhs_arg_name,
             plan.n_offset_var,
             plan.n_size,
-            plan.tcgen05_mma_bn,
+            plan.tcgen05_mma_bn // pair,
             analysis.rhs,
             plan.tcgen05_mma_b_k_major,
             1,
         ),
     ):
+        if pair_rank is not None:
+            offset = f"{offset} + {pair_rank} * cutlass.Int32({cta_elems})"
+            if row_dim == 0 and cluster_n_rank is not None:
+                cta_elems //= 2
+                offset = f"{offset} + {cluster_n_rank} * cutlass.Int32({cta_elems})"
         k_dim = 1 - row_dim
         stride = operand.logical_fake.stride(row_dim if k_major else k_dim)
         offset_elems = operand.logical_fake.storage_offset()
@@ -7794,10 +7916,19 @@ def _flat_operand_l2_prefetch_footprint(
             return None
         run = k if k_major else cta_elems
         elements = list(range(0, run, line_elems))
+        segment_bytes = cta_elems * item_bytes
         if (
             (stride * item_bytes) % 128
             or (offset_elems * item_bytes) % 128
-            or (not k_major and (cta_elems * item_bytes) % 128)
+            or (
+                not k_major
+                and segment_bytes % 128
+                # (a pair CTA's MN-major segment shorter than a line starts at
+                # a multiple of its own length, which divides the line: one
+                # line. The 64-wide pair's N-major B half, 32 bf16 at byte 0 or
+                # 64 of a line.)
+                and not (pair_rank is not None and 128 % segment_bytes == 0)
+            )
         ) and run - 1 not in elements:
             elements.append(run - 1)
         footprint.append(
@@ -7835,17 +7966,18 @@ def _build_flat_operand_l2_prefetch(
     gate: str | None,
     names: Callable[[str], str],
 ) -> ast.stmt:
-    """Prefetch the A and B footprint of a one-CTA CTA that runs one tile into
-    L2 ahead of its dependent-launch wait (``_flat_operand_l2_prefetch_footprint``):
+    """Prefetch the A and B footprint of a CTA that runs one tile into L2
+    ahead of its dependent-launch wait (``_flat_operand_l2_prefetch_footprint``):
     ``lane`` and ``threads`` number the issuing threads, ``gate`` selects them.
     Two pipelines issue it:
 
     - the flat one-CTA pipeline, whose warps all pass one wait: its epilogue
       warps, idle until the accumulator is ready (``gate``: the first
       ``TCGEN05_FLAT_L2_PREFETCH_WARPS`` warps);
-    - the persistent (role-local) one-CTA pipeline for mixed majors: its
-      TMA-load warps ahead of their wait (``_build_operand_l2_prefetch``, no
-      gate).
+    - the persistent (role-local) pipeline for mixed majors, one-CTA or a CTA
+      pair's: its TMA-load warps ahead of their wait
+      (``_build_operand_l2_prefetch``, no gate; a pair's CTA prefetches its
+      share of the pair tile at its rank).
 
     bf16 128 x 192 x 1000 with b stored [K, N], transposed (in0 = b.T
     [192, 1000] M-major, in1 = a.T [1000, 128] K-major), on flat [64, 8, 128]
@@ -15200,6 +15332,7 @@ def _emit_mma_pipeline(
             epi_warp_count=tcgen05_epi_warp_count_value,
             output_offsets=(plan.m_offset_var, plan.n_offset_var),
             ab_load_warp_count=tcgen05_warp_spec.ab_load_warps,
+            max_two_cta_k_tiles=tcgen05_two_cta_max_k_tiles(plan.input_dtype.itemsize),
             one_shot_role_scheduler=tcgen05_one_shot_role_scheduler,
             scheduler_warp_count=tcgen05_scheduler_warp_count_for_plan,
             sched_stage_count=tcgen05_sched_stage_count_for_plan,

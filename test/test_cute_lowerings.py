@@ -214,6 +214,9 @@ from helion._compiler.cute.tcgen05_constants import (
 from helion._compiler.cute.tcgen05_constants import (
     TCGEN05_TWO_CTA_EDGE_K_TAIL_SCHEDULER_L2_SWIZZLE_SIZE,
 )
+from helion._compiler.cute.tcgen05_constants import (
+    TCGEN05_TWO_CTA_SIXTEEN_BIT_MAX_K_TILES,
+)
 from helion._compiler.cute.view_subtile import _feeds_split
 from helion._compiler.cute.view_subtile import _propagated_coord_meta
 from helion._compiler.cute.view_subtile import _split_minor_coord_meta
@@ -244,6 +247,7 @@ from helion._testing import onlyBackends
 from helion._testing import patch_cute_mma_support
 from helion._testing import skipIfLowVRAM
 from helion._testing import skipUnlessTcgen05RuntimeNPtx
+from helion._testing.cute_codegen import cpu_target
 from helion._testing.cute_repeated_axes import full_slice_tiled_dot
 from helion._testing.shared_block_kernels import root_beside_a_device_loop
 from helion._testing.shared_block_kernels import shared_block_softmax
@@ -11264,7 +11268,26 @@ class TestCuteLowerings(unittest.TestCase):
     def test_tcgen05_persistent_cluster_m2_two_cta_k_cap_runtime_correctness(
         self,
     ) -> None:
-        """CtaGroup.TWO codegen runs correctly at the validated K cap."""
+        """CtaGroup.TWO codegen runs correctly over 4 to 256 K tiles
+        (``TCGEN05_TWO_CTA_MAX_K_TILES``, still the cap over operands other
+        than 16-bit ones)."""
+        self._check_two_cta_role_local_k_loops((64, 256, 4096))
+
+    def test_tcgen05_persistent_cluster_m2_two_cta_16bit_k_cap_runtime_correctness(
+        self,
+    ) -> None:
+        """A 16-bit CtaGroup.TWO pair runs correctly past 256 K tiles, up to its
+        own cap (``TCGEN05_TWO_CTA_SIXTEEN_BIT_MAX_K_TILES``): 257 and 4096 K
+        tiles at bk = 16, which used to hit the host guard."""
+        self._check_two_cta_role_local_k_loops(
+            (16 * 257, 16 * TCGEN05_TWO_CTA_SIXTEEN_BIT_MAX_K_TILES)
+        )
+
+    def _check_two_cta_role_local_k_loops(self, k_sizes: tuple[int, ...]) -> None:
+        """Run one 256x256 bf16 output tile on one role-local CtaGroup.TWO
+        cluster over K loops of ``k_sizes`` (bk = 16) and check each against
+        an FP32 product rounded to bf16 (cuBLAS may reduce a deep bf16 K
+        split in bf16)."""
 
         from helion._compiler.cute.mma_support import get_cute_mma_support
 
@@ -11289,7 +11312,7 @@ class TestCuteLowerings(unittest.TestCase):
             Tcgen05PersistentProgramIDs,
         )
 
-        for k_size in (64, 256, 4096):
+        for k_size in k_sizes:
             with self.subTest(k_size=k_size):
                 torch.manual_seed(0)
                 args = (
@@ -11329,7 +11352,7 @@ class TestCuteLowerings(unittest.TestCase):
                         code,
                     )
                     out = bound(*args)
-                expected = args[0] @ args[1]
+                expected = (args[0].float() @ args[1].float()).to(args[0].dtype)
                 torch.testing.assert_close(out, expected, atol=2e-1, rtol=1e-2)
 
     def test_tcgen05_persistent_cluster_m2_two_cta_k_tail_runtime_correctness(
@@ -11774,7 +11797,9 @@ class TestCuteLowerings(unittest.TestCase):
     def test_tcgen05_persistent_cluster_m2_two_cta_k_tile_limit_guard(
         self,
     ) -> None:
-        """CtaGroup.TWO shapes above the validated K-tile cap stay guarded."""
+        """CtaGroup.TWO shapes above the validated K-tile cap stay guarded: a
+        16-bit pair's 4096 tiles (``TCGEN05_TWO_CTA_SIXTEEN_BIT_MAX_K_TILES``),
+        4097 here at bk = 16."""
 
         @helion.kernel(backend="cute")
         def cute_matmul_cluster_m2_two_cta_k_tile_limit(
@@ -11790,9 +11815,10 @@ class TestCuteLowerings(unittest.TestCase):
                 out[tile_m, tile_n] = acc.to(x.dtype)
             return out
 
+        k = 16 * (TCGEN05_TWO_CTA_SIXTEEN_BIT_MAX_K_TILES + 1)
         args = (
-            torch.randn(256, 4112, device=DEVICE, dtype=torch.bfloat16),
-            torch.randn(4112, 256, device=DEVICE, dtype=torch.bfloat16),
+            torch.randn(256, k, device=DEVICE, dtype=torch.bfloat16),
+            torch.randn(k, 256, device=DEVICE, dtype=torch.bfloat16),
         )
         from helion._compiler.cute.tcgen05.scheduler_pids import (
             Tcgen05PersistentProgramIDs,
@@ -11813,10 +11839,16 @@ class TestCuteLowerings(unittest.TestCase):
                 f"if {Tcgen05PersistentProgramIDs._MULTI_TILE_GUARD_TOTAL_VAR} > 0:",
                 code,
             )
+            # (the message names the 16-bit pair's cap)
+            cap = (
+                f"at most {TCGEN05_TWO_CTA_SIXTEEN_BIT_MAX_K_TILES} K tiles over "
+                "16-bit operands"
+            )
+            self.assertIn(cap, code)
             self.assertIn("above the validated K-tile limit", code)
             with self.assertRaisesRegex(
                 RuntimeError,
-                "above the validated K-tile limit",
+                f"{cap}.*above the validated K-tile limit",
             ):
                 bound(*args)
 
@@ -15614,6 +15646,8 @@ class TestCuteLowerings(unittest.TestCase):
         self.assertIn("cutlass.Int32(6)", per_cta_emitted)
         self.assertEqual(len(per_cta_stmts), 6)
 
+    # Codegen only, bound on CPU (``cpu_target``): the CPU lane runs it.
+    @pytest.mark.cpu_only
     def test_tcgen05_codegen_emits_cluster_and_role_split_knobs(self) -> None:
         @helion.kernel(backend="cute")
         def cute_matmul_mma_codegen_only(
@@ -15629,9 +15663,14 @@ class TestCuteLowerings(unittest.TestCase):
                 out[tile_m, tile_n] = acc.to(x.dtype)
             return out
 
+        # A K past the 16-bit pair's 4096 tiles at bk = 16
+        # (``TCGEN05_TWO_CTA_SIXTEEN_BIT_MAX_K_TILES``). Codegen only, bound on
+        # CPU for the B200 model (``cpu_target``): the 8192 x 65552 operands
+        # (2 GiB) are never allocated on the GPU.
+        k = 16 * (TCGEN05_TWO_CTA_SIXTEEN_BIT_MAX_K_TILES + 1)
         args = (
-            torch.randn(8192, 8192, device=DEVICE, dtype=torch.float16),
-            torch.randn(8192, 8192, device=DEVICE, dtype=torch.float16),
+            torch.empty(8192, k, dtype=torch.float16),
+            torch.empty(k, 8192, dtype=torch.float16),
         )
         config = helion.Config(
             block_sizes=[256, 256, 16],
@@ -15641,10 +15680,11 @@ class TestCuteLowerings(unittest.TestCase):
         )
 
         with (
+            cpu_target(),
             patch.dict("os.environ", {"HELION_CUTE_MMA_IMPL": "tcgen05"}, clear=False),
             patch_cute_mma_support(),
         ):
-            bound = cute_matmul_mma_codegen_only.bind(args)
+            bound = cute_matmul_mma_codegen_only._bind_isolated(args)
             # matmul_ops narrows tcgen05_cluster_m to (1,) when binding the
             # bf16/fp16 matmul until the cluster=2 path is benchmarked. This
             # K-over-cap codegen-only test still exercises the guarded
@@ -15664,6 +15704,12 @@ class TestCuteLowerings(unittest.TestCase):
         self.assertIn("cute.nvgpu.tcgen05.CtaGroup.TWO", code)
         self.assertIn("_helion_tcgen05_persistent_total_tiles", code)
         self.assertIn("above the validated K-tile limit", code)
+        # (the guard's message names the 16-bit pair's cap)
+        self.assertIn(
+            f"at most {TCGEN05_TWO_CTA_SIXTEEN_BIT_MAX_K_TILES} K tiles over "
+            "16-bit operands",
+            code,
+        )
         self.assertIn(
             "PersistentTileSchedulerParams(((8192 + _BLOCK_SIZE_0 - 1) // "
             "_BLOCK_SIZE_0 * 2",

@@ -13132,8 +13132,23 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
         }
         self.assertTrue(expected_seed_modes.issubset(best_available_modes))
 
+        # The dense aligned-N family's search seed (the clipped width the
+        # wave model ranks first, ``dense_aligned_n_search_seed_configs``:
+        # 192-column pairs here) is a CTA pair of its own family, persistent
+        # interleaved; the cluster-m2 heuristic's pairs are the rest.
+        aligned_n_configs = [
+            config
+            for config in configs
+            if config.get("tcgen05_cta_group") == "two"
+            and config.get("tcgen05_tile_n", 0)
+        ]
+        for config in aligned_n_configs:
+            self.assertEqual(config["pid_type"], "persistent_interleaved")
         paired_configs = [
-            config for config in configs if config.get("tcgen05_cta_group") == "two"
+            config
+            for config in configs
+            if config.get("tcgen05_cta_group") == "two"
+            and not config.get("tcgen05_tile_n", 0)
         ]
         self.assertTrue(paired_configs)
         facts = bound.config_spec._cute_tcgen05_config.pipeline_smem_facts

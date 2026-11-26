@@ -404,16 +404,139 @@ def test_line_aligned_mn_major_columns_prefetch_one_line_each() -> None:
         ((768, 768, 2048), (False, False), {}),
         # 1024 tiles of 256x256 on 76 SM pairs: CTAs walk several tiles
         ((4096, 4096, 128), (False, False), {}),
-        # a K-major A with an N-major B: mixed majors take no prefetch
-        ((1000, 768, 128), (True, False), PAIR_128x128),
+        # mixed majors past the window: the 128x128 pair over 2048 K indices,
+        # each CTA's 64 K-major A rows of 32 lines and 64 N-major B columns of
+        # one line per K index (6144 lines)
+        ((1000, 768, 2048), (True, False), PAIR_128x128),
     ),
 )
-def test_an_mn_major_footprint_past_the_window_or_mixed_majors_prefetch_nothing(
+def test_an_mn_major_footprint_past_the_window_prefetches_nothing(
     shape, majors, overrides
 ) -> None:
     lhs_k_major, rhs_k_major = majors
     code = _code(*shape, lhs_k_major=lhs_k_major, rhs_k_major=rhs_k_major, **overrides)
     assert "cute.arch.prefetch(" not in code
+
+
+# The 128x64 CTA pair over 128-deep k-blocks: the full-effort pick of
+# helion.inductor's transposed bf16 256x1024x512 with b stored [K, N].
+PAIR_128x64 = {
+    "block_sizes": [128, 64, 128],
+    "tcgen05_cluster_m": 2,
+    "tcgen05_cta_group": "two",
+    "pid_type": "persistent_blocked",
+    "tcgen05_ab_stages": 4,
+}
+
+
+def test_a_mixed_major_pair_prefetches_its_ctas_half_of_the_tile() -> None:
+    # helion.inductor's transposed bf16 256x1024x512 with b stored [K, N]
+    # (out.T = b.T @ a.T: b.T an M-major A of 1024 rows, a.T a K-major B of
+    # 256 rows) on 32 pairs of 128x64: each CTA prefetches its own half of
+    # the pair tile, its 64 A rows of every K column (128 bytes: one line)
+    # and its 32 B rows of 1024 bytes (8 lines), 768 lines in all, at its
+    # rank in the pair. GB300, CUDA graphs over cold inputs, of cuBLAS:
+    # 0.934 / 0.950 without, 1.111 / 1.108 with (its RC twin's K-major pair,
+    # which took the prefetch already, 1.10-1.12).
+    code = _code(1024, 256, 512, lhs_k_major=False, rhs_k_major=True, **PAIR_128x64)
+    pf = code.index("tcgen05_l2_pf_rank = ")
+    wait = code.index("cute.arch.griddepcontrol_wait()", pf)
+    block = code[pf:wait]
+    assert block.startswith(
+        "tcgen05_l2_pf_rank = cute.arch.make_warp_uniform("
+        "cute.arch.block_idx_in_cluster()) & cutlass.Int32(1)"
+    )
+    # A: one line per K index at the CTA's 64-row half of the pair's M tile
+    assert (
+        "tcgen05_l2_pf_point = tile_offset_0 + tcgen05_l2_pf_rank * "
+        "cutlass.Int32(64) + cutlass.Int32(0)"
+    ) in block
+    assert "for tcgen05_l2_pf_i in cutlass.range_constexpr(16):" in block
+    # B: the CTA's 32 rows of the pair's 64-row N tile, eight lines each
+    assert (
+        "tcgen05_l2_pf_index = tile_offset_1 + tcgen05_l2_pf_rank * "
+        "cutlass.Int32(32) + tcgen05_l2_pf_row"
+    ) in block
+    assert block.count("cute.arch.prefetch(") == 1 + 8
+    # As written (a K-major A, an N-major B: 1000x768x128 on 48 pairs of
+    # 128x128), a CTA's 64 B columns are one line per K index too.
+    written = _code(1000, 768, 128, lhs_k_major=True, rhs_k_major=False, **PAIR_128x128)
+    assert "tcgen05_l2_pf_rank * cutlass.Int32(64)" in written
+    assert written.count("cute.arch.prefetch(") == 2 + 1
+    # A 64-wide pair's CTA takes up to 2048 lines on any one-tile grid (a wider
+    # pair's the pair window: the next test): the transposed bf16
+    # 128x4096x1000 on 64 pairs of 128x64 (128 CTAs) prefetches its 64 A
+    # rows over 1000 K indices and its 32 B rows of 2000 bytes (17 lines with
+    # their last element's), 0.91-0.95 -> 1.007 of cuBLAS.
+    pair64 = {**PAIR_128x64, "block_sizes": [128, 64, 64], "tcgen05_ab_stages": 14}
+    wide = _code(4096, 128, 1000, lhs_k_major=False, rhs_k_major=True, **pair64)
+    assert "tcgen05_l2_pf_rank = " in wide
+    # In a 2x2 cluster (A multicast across two pairs) each CTA prefetches half
+    # of its A rows, at its pair's rank in the cluster, so the cluster
+    # prefetches each A line once (as written bf16 128x4096x1000, of cuBLAS:
+    # 1.020 without, 0.909 with every A row, 1.055 with the half): 32 rows of
+    # 2000 bytes (16 lines and the last element's) and one B line per K index.
+    cluster = _code(
+        128,
+        4096,
+        1000,
+        lhs_k_major=True,
+        rhs_k_major=False,
+        **pair64,
+        tcgen05_cluster_n=2,
+    )
+    assert "cute.make_layout((2, 2, 1))" in cluster
+    assert (
+        "tcgen05_l2_pf_rank_n = cute.arch.make_warp_uniform("
+        "cute.arch.block_idx_in_cluster()) >> cutlass.Int32(1) & cutlass.Int32(1)"
+    ) in cluster
+    assert (
+        "tcgen05_l2_pf_index = tile_offset_0 + tcgen05_l2_pf_rank * "
+        "cutlass.Int32(64) + tcgen05_l2_pf_rank_n * cutlass.Int32(32) + "
+        "tcgen05_l2_pf_row"
+    ) in cluster
+    assert cluster.count("cute.arch.prefetch(") == 17 + 1
+    # An M-major A in a 2x2 (the transposed product's operands, here over a
+    # row-major output; test_cute_tcgen05_pair128_search renders the
+    # column-major one) binds its pair's rank in the cluster likewise.
+    transposed = _code(
+        4096,
+        128,
+        1000,
+        lhs_k_major=False,
+        rhs_k_major=True,
+        **pair64,
+        tcgen05_cluster_n=2,
+    )
+    assert "cute.make_layout((2, 2, 1))" in transposed
+    assert "tcgen05_l2_pf_rank_n * cutlass.Int32(32)" in transposed
+
+
+def test_a_mixed_major_pair_wider_than_64_prefetches_within_the_pair_window() -> None:
+    # helion.inductor's transposed bf16 512x1280x1000 with b stored [K, N] (a's
+    # rows 2000 bytes apart) on 60 pairs of 128x96: each CTA's 64 A rows of
+    # b.T over 1000 K indices and its 48 B rows of a.T of 17 lines, 1816 in
+    # all, past the pair window that a pair wider than 64 keeps: no prefetch
+    # (GB300, of cuBLAS, the same config: 0.904 without, 0.822 with). The
+    # 128x80 pair's 1680 lines neither (0.910 without, 0.809 with). The
+    # 64-wide pair prefetches past the window, and the as-written 128x128
+    # pair's 256 lines within it (above).
+    pair = {
+        **PAIR_128x128,
+        "pid_type": "persistent_interleaved",
+        "tcgen05_ab_stages": 13,
+        "tcgen05_warp_spec_ab_load_warps": 2,
+    }
+    with gb300_target(), forbid_cuda_work():
+        a, b, out = bf16_mm_args(512, 1280, 1000, rhs_k_major=False)
+        bound = plain_mm_into._bind_isolated((b.T, a.T, out.T))
+        default = bound.config_spec.default_config().config
+        for tile_n in (96, 80):
+            code = bound.to_code(
+                helion.Config(**{**default, **pair, "tcgen05_tile_n": tile_n})
+            )
+            assert f"'cta_tile_shape_mnk': (64, {tile_n}, 64)" in code
+            assert "tcgen05_l2_pf_" not in code
 
 
 @helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")

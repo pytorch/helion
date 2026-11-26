@@ -16,11 +16,13 @@ import torch
 
 import helion
 from helion._compiler.cute import cute_mma
+from helion._compiler.cute import tcgen05_constants
 from helion._compiler.cute.dense_aligned_n import ALIGNED_N_CHOICES
 from helion._compiler.cute.dense_aligned_n import carrier_n
 from helion._compiler.cute.dense_aligned_n import dense_aligned_n_defaults
 from helion._compiler.cute.dense_aligned_n import dense_aligned_n_mn_b_atom_bytes
 from helion._compiler.cute.dense_aligned_n import dense_aligned_n_mn_b_width
+from helion._compiler.cute.dense_aligned_n import n_major_b_one_wave_pair128_gain
 from helion._compiler.cute.dense_aligned_n import pair_tile_wave_cost
 from helion._compiler.cute.dense_aligned_n import transposed_double_edge_without_pairs
 from helion._compiler.cute.dense_aligned_n import transposed_pair_tile_gain
@@ -31,6 +33,9 @@ from helion._compiler.cute.strategies import tcgen05_two_cta_m128_epilogue_tile_
 from helion._compiler.cute.tcgen05.search_plan import tcgen05_copies_n_major_b
 from helion._compiler.cute.tcgen05.search_plan import (
     tcgen05_transposes_epilogue_bound_product,
+)
+from helion._compiler.cute.tcgen05.search_plan import (
+    tcgen05_transposes_misaligned_a_rows,
 )
 from helion._compiler.cute.tcgen05.search_plan import (
     tcgen05_transposes_misaligned_b_rows,
@@ -52,6 +57,7 @@ from helion._compiler.cute.tcgen05_constants import tcgen05_last_wave_idle_sms
 from helion._compiler.cute.tcgen05_schedule_facts import analyze_native_gemm
 from helion._testing import default_cute_mma_support
 from helion._testing import patch_cute_mma_support
+from helion._testing import patch_target_facts
 from helion._testing import skipUnlessBackends
 from helion._testing.cute_codegen import forbid_cuda_work
 from helion._testing.cute_codegen import kernel_body
@@ -96,6 +102,16 @@ def _gb300() -> Iterator[None]:
 
 def _args(mode=0, shape=(128, 5120, 2880)):
     return scaled_args(*shape, mode=mode)
+
+
+def _empty_bf16_mm_args(m, n, k):
+    """``bf16_mm_args``'s operands (a row-major, b K-major) without values, for
+    a deep K: a bind reads only their shapes and strides."""
+    return (
+        torch.empty((m, k), dtype=torch.bfloat16),
+        torch.empty((n, k), dtype=torch.bfloat16).T,
+        torch.empty((m, n), dtype=torch.bfloat16),
+    )
 
 
 def _smem_bytes(width, *, ab_stages, c_stages=2, acc_stages=2, bk=128):
@@ -160,12 +176,25 @@ def _source_c(a: torch.Tensor, b: torch.Tensor, out: torch.Tensor) -> torch.Tens
     return out
 
 
+def _search_seed_widths(bound) -> set[int]:
+    """The clipped width the search alone seeds
+    (``seeds.dense_aligned_n_search_seed_configs``)."""
+    return {
+        seed.config["tcgen05_tile_n"]
+        for seed in seeds.dense_aligned_n_search_seed_configs(
+            bound.config_spec._cute_tcgen05_config
+        )
+    }
+
+
 def _seeded_widths(bound) -> set[int]:
+    """The widths of the seeds the autotune-off default picks among: the
+    compiler seeds but the search's own clipped-width seed."""
     return {
         seed.config["tcgen05_tile_n"]
         for seed in bound.config_spec.compiler_seed_configs
         if seed.config.get("tcgen05_tile_n")
-    }
+    } - _search_seed_widths(bound)
 
 
 @pytest.mark.parametrize("mode", (0, 1, 2, 3))
@@ -282,6 +311,76 @@ def test_unsupported_tails_and_traversals_rejected(shape, store_mode):
     bound = scaled_mm._bind_isolated(_args(shape=shape))
     with pytest.raises(InvalidConfig, match="tcgen05_tile_n"):
         bound.to_code(_config(tcgen05_c_store_mode=store_mode))
+
+
+def test_search_seeds_the_best_clipped_width_the_default_does_not_take():
+    # bf16 4096x4096x16384 (b K-major): 304 pairs of 256x224 fill four waves
+    # of 76 pairs, 256 of 256x256 3.4; the 12.5% the model gives the clipped
+    # width is under the default's 15% lead, so only the search seeds it.
+    with patch_target_facts(num_sm=152):
+        bound = plain_mm_into._bind_isolated(_empty_bf16_mm_args(4096, 4096, 16384))
+    spec = bound.config_spec
+    widths = [seed.config.get("tcgen05_tile_n") for seed in spec.compiler_seed_configs]
+    assert 224 in widths
+    assert spec.default_config().config.get("tcgen05_tile_n") != 224
+
+
+def test_search_seeds_the_whole_width_the_seeds_skip():
+    # bf16 32768x144x288: 144 tiles N whole, but the seeds take multiples of
+    # 32 only, so they take the clipped 160 (every tile a fringe tile, on the
+    # SIMT epilogue); the search also starts from 144, the model's best, at
+    # the walk's deepest ring. The autotune-off default keeps its own pick.
+    with patch_target_facts(num_sm=152):
+        bound = plain_mm_into._bind_isolated(bf16_mm_args(32768, 144, 288))
+    spec = bound.config_spec
+    seeded = [
+        (seed.config.get("tcgen05_tile_n"), seed.config.get("tcgen05_ab_stages"))
+        for seed in spec.compiler_seed_configs
+    ]
+    assert (144, 8) in seeded
+    assert spec.default_config().config.get("tcgen05_tile_n") != 144
+
+
+def test_a_multi_tile_walk_keeps_an_ab_ring_past_its_k_loop():
+    # bf16 32768x144x288 is 128 tiles of 256x144 on GB300's 76 SM pairs, five
+    # k-blocks each: the persistent walk's producer fills a deeper ring with
+    # the next tile's k-blocks, so the plan admits the SMEM fit (eight
+    # stages). 1024x144x288's four tiles run one per pair and keep the K
+    # loop's five.
+    config = aligned_n_bf16_config(tcgen05_tile_n=144, tcgen05_ab_stages=6)
+    for m, depth in ((32768, 8), (1024, 5)):
+        with patch_target_facts(num_sm=152):
+            bound = plain_mm_into._bind_isolated(bf16_mm_args(m, 144, 288))
+        with bound.env:
+            plan = facts._dense_aligned_n_plan(
+                bound.config_spec._cute_tcgen05_config, config.config
+            )
+        assert plan is not None and plan.max_ab_stages == depth
+
+
+def test_a_k_loop_past_256_tiles_keeps_the_aligned_plan():
+    # A 16-bit pair runs K loops past 256 tiles (bf16 LM-head gradients run K
+    # = 30528 .. 128104 on it), up to TCGEN05_TWO_CTA_SIXTEEN_BIT_MAX_K_TILES:
+    # K = 32896 is 514 tiles of 64.
+    bound = plain_mm_into._bind_isolated(_empty_bf16_mm_args(1000, 2560, 32896))
+    state = bound.config_spec._cute_tcgen05_config
+    config = aligned_n_bf16_config(tcgen05_tile_n=144)
+    with bound.env:
+        plan = facts._dense_aligned_n_plan(state, config.config)
+        assert plan is not None
+        with patch.object(
+            tcgen05_constants, "TCGEN05_TWO_CTA_SIXTEEN_BIT_MAX_K_TILES", 256
+        ):
+            assert facts._dense_aligned_n_plan(state, config.config) is None
+    # FP8 keeps the 256 tiles it was validated within: 257 tiles of 128.
+    fp8 = scaled_mm._bind_isolated(_args(shape=(128, 5120, 32896)))
+    with fp8.env:
+        assert (
+            facts._dense_aligned_n_plan(
+                fp8.config_spec._cute_tcgen05_config, _config().config
+            )
+            is None
+        )
 
 
 @pytest.mark.parametrize("restriction", ("max64", "min128", "fixed128", "outer"))
@@ -1080,10 +1179,12 @@ def test_sixteen_bit_pair_n_tails_and_fp32_outputs():
     # 256x256 (22% less by the cost model) is seeded; 224 (12%) is not, and
     # neither are the widths that are not multiples of 32 (176 and 208, 25%
     # and 16%). The search, which measures its samples, also tries every
-    # clipped width the model ranks ahead of 256x256.
+    # clipped width the model ranks ahead of 256x256, and seeds the first
+    # of them.
     x, y, out = bf16_mm_args(3072, 1024, 6272)
     c4_15 = plain_mm_into._bind_isolated((x, y, out.float()))
     assert _seeded_widths(c4_15) == {192}
+    assert _search_seed_widths(c4_15) == {176}
     assert facts._dense_aligned_n_widths(c4_15.config_spec._cute_tcgen05_config) == (
         176,
         192,
@@ -1116,15 +1217,21 @@ def test_sixteen_bit_pair_n_tails_and_fp32_outputs():
     assert _seeded_widths(
         plain_mm_into._bind_isolated(bf16_mm_args(1024, 160, 512))
     ) == {160}
-    # The edge schedule needs whole K tiles: N and K tails together leave.
-    both = plain_mm_into._bind_isolated(bf16_mm_args(1024, 1024, 544))
-    with both.env:
-        assert (
-            facts._dense_aligned_n_plan(
-                both.config_spec._cute_tcgen05_config, aligned_n_bf16_config().config
+    # A partial last N tile runs a K tail too (544 = 8 x 64 + 32: the
+    # producer issues the clipped N tile and the partial last K tile, both
+    # zero-filled past the edge); a partial last M tile keeps whole K tiles.
+
+    def plan(m, n, k):
+        bound = plain_mm_into._bind_isolated(bf16_mm_args(m, n, k))
+        with bound.env:
+            return facts._dense_aligned_n_plan(
+                bound.config_spec._cute_tcgen05_config,
+                aligned_n_bf16_config().config,
             )
-            is None
-        )
+
+    assert plan(1024, 1024, 544) is not None
+    assert plan(1000, 1024, 512) is not None
+    assert plan(1000, 1024, 544) is None
 
 
 def test_plain_pair_prices_its_allocations_in_kernel_order():
@@ -1621,26 +1728,35 @@ def test_an_n_major_b_runs_transposed_where_its_widths_tile_worse() -> None:
         >= TCGEN05_TRANSPOSED_PRODUCT_MIN_GAIN
         > transposed_pair_tile_gain(8192, 768, 768, sm_pairs=76)
     )
-    # An m or n under one 256-row pair tile, a K loop past the pair's 256 K
-    # blocks of 64, or a grid of 256x256 tiles under one per SM pair is no
-    # orientation the model prices: 128x16384x4096 runs as written on the
-    # 128-row pair (1.16 both ways), 25216x192x768 transposed leaves a
-    # quarter of every tile's rows empty (1.00 as written, 0.96 transposed),
-    # 16384x768x30528 runs the 128-row pair both ways (0.93 as written, 0.87
-    # transposed), 4096x1024x512 (64 tiles) runs 128 256x128 pairs as
-    # written (1.10-1.11 as written, 1.06-1.07 transposed); 4096x4096x16384
-    # (256 K blocks) transposes (1.00 -> 1.10).
-    for m, n, k in (
-        (128, 16384, 4096),
-        (25216, 192, 768),
-        (16384, 768, 30528),
-        (4096, 1024, 512),
-    ):
+    # An m or n under one 256-row pair tile, or a grid of 256x256 tiles under
+    # one per SM pair, is no orientation the model prices: 128x16384x4096
+    # runs as written on the 128-row pair (1.16 both ways), 25216x192x768
+    # transposed leaves a quarter of every tile's rows empty (1.00 as
+    # written, 0.96 transposed), 4096x1024x512 (64 tiles) runs 128 256x128
+    # pairs as written (1.10-1.11 as written, 1.06-1.07 transposed).
+    for m, n, k in ((128, 16384, 4096), (25216, 192, 768), (4096, 1024, 512)):
         assert transposed_pair_tile_gain(m, n, k, sm_pairs=76, b_n_major=True) == 1.0
-    assert (
-        transposed_pair_tile_gain(4096, 4096, 16384, sm_pairs=76, b_n_major=True)
-        >= TCGEN05_TRANSPOSED_PRODUCT_MIN_GAIN
-    )
+    # Deep K loops run the pair both ways and follow the model: 4096x4096x16384
+    # (256 K blocks) transposes (1.00 -> 1.10), so does 16384x768x30528 (477:
+    # 0.99 -> 1.13). A K tail prices the clipped widths too: transposed,
+    # 4096x2048x50264 is 8 x 19 = 152 tiles of 256x224 (two full waves; as
+    # written 128 of 256x256, or split K four ways: 1.02 -> 1.12),
+    # 16384x768x50272 3 x 74 = 222 (1.03 -> 1.12), 8192x768x50272 3 x 47 =
+    # 141 of 256x176 (1.03 -> 1.06) and 4096x1536x128104 6 x 24 = 144 of
+    # 256x176, which as written splits K three ways at 1.07-1.08 (the split,
+    # which the model does not price, against 1.04 transposed).
+    for m, n, k in (
+        (4096, 4096, 16384),
+        (16384, 768, 30528),
+        (4096, 2048, 50264),
+        (16384, 768, 50272),
+        (8192, 768, 50272),
+        (4096, 1536, 128104),
+    ):
+        assert (
+            transposed_pair_tile_gain(m, n, k, sm_pairs=76, b_n_major=True)
+            >= TCGEN05_TRANSPOSED_PRODUCT_MIN_GAIN
+        )
 
 
 def test_a_skinny_product_runs_transposed() -> None:
@@ -1663,6 +1779,43 @@ def test_a_skinny_product_runs_transposed() -> None:
     assert transposes(64, 4096, 4096, b_n_major=True)
     # 2 x 64 = 128 tiles fill the pairs with 64-column slabs as written.
     assert not transposes(128, 4096, 4096, b_n_major=True)
+    # ... unless, over whole K tiles, the transposed product runs a one-wave
+    # grid of 128x64 pairs whose CTAs' footprint the pair prefetch takes: 24 x
+    # 2 = 48 pairs over 768 K indices (768 lines of b.T, 32 rows of a.T of 12
+    # lines: 1152), 0.95 as written against 1.10 transposed at full effort
+    # (GB300, of cuBLAS). Not where the footprint exceeds 2048 lines (K =
+    # 2048: 3072), the pairs take two waves (128x9216: 144 pairs) or K has a
+    # tail (128x3072x1000: the as-written 2x2 cluster 1.017 against 1.002).
+    assert transposes(128, 3072, 768, b_n_major=True)
+    assert transposes(128, 4096, 1024, b_n_major=True)
+    assert not transposes(128, 4096, 2048, b_n_major=True)
+    assert not transposes(128, 9216, 768, b_n_major=True)
+    assert not transposes(128, 3072, 1000, b_n_major=True)
+    assert not transposes(128, 4096, 1000, b_n_major=True)
+    # Only for an M of one 128-row pair row (the shapes measured): 256x2048x1024
+    # and 512x1024x512 also fit one wave of transposed pairs but stay.
+    assert not transposes(256, 2048, 1024, b_n_major=True)
+    assert not transposes(512, 1024, 512, b_n_major=True)
+
+    # The footprint counts b's row stride as the prefetch does: b sliced from
+    # [1024, 3080] (rows 6160 bytes apart) puts each CTA's 64 elements of b.T
+    # across two lines at most K indices, 2560 lines in all, past the 2048
+    # the pair prefetches, so 128x3072x1024 stays as written there.
+    def padded(b_row: int, b_offset: int = 0) -> bool:
+        return tcgen05_transposes_skinny_product(
+            128,
+            3072,
+            1024,
+            torch.bfloat16,
+            a_strides=(1024, 1),
+            b_strides=(b_row, 1),
+            num_sms=152,
+            b_offset=b_offset,
+        )
+
+    assert padded(3072)
+    assert not padded(3080)
+    assert not padded(3072, b_offset=8)
     # A K-major b loads 128-byte rows either way: only an M under the one-CTA
     # tile's 64 rows (zero-filled as written) transposes.
     assert transposes(32, 1280, 960, b_n_major=False)
@@ -2410,6 +2563,224 @@ def test_a_small_n_k_block_under_64_bytes_keeps_the_scalar_fallback() -> None:
         assert config.config["block_sizes"] == [32, 64, 8]
         (plan, *_) = wrapper_plans(bound.to_code(config))
         assert (plan["kind"], plan["bn"], plan["bk"]) == ("tcgen05_ab_tma", 8, 32)
+
+
+def test_a_one_wave_product_of_misaligned_a_rows_runs_transposed() -> None:
+    def transposes(
+        m: int, n: int, k: int, *, a_row: int | None = None, b_n_major: bool = True
+    ) -> bool:
+        return tcgen05_transposes_misaligned_a_rows(
+            m,
+            n,
+            k,
+            torch.bfloat16,
+            a_strides=(k if a_row is None else a_row, 1),
+            b_strides=(n, 1) if b_n_major else (1, k),
+            num_sms=152,
+        )
+
+    # bf16 512x1280x1000 with b stored [K, N]: a's rows are 2000 bytes apart,
+    # an odd multiple of 16, and its 2 x 5 tiles of 256x256 fit one wave of
+    # GB300's 76 SM pairs. As written the 128-row pairs (each CTA 64 rows)
+    # run 4 x 10 = 40 pairs of 128x128 (the widths whose half rows of b hold
+    # 64-byte swizzle atoms), transposed 10 x 7 = 70 pairs of 128x80.
+    assert transposes(512, 1280, 1000)
+    assert n_major_b_one_wave_pair128_gain(512, 1280, 1000, sm_pairs=76) == (
+        pytest.approx(
+            pair_tile_wave_cost(512, 1280, 1000, width=128, block_m=128, sm_pairs=76)
+            / pair_tile_wave_cost(1280, 512, 1000, width=80, block_m=128, sm_pairs=76)
+        )
+    )
+    # Sector-aligned rows of a stay as written (1024x640x1024 and
+    # 1024x768x1024 ran 2% slower transposed), and so does the shape over
+    # rows padded to 2048 bytes; so does a K-major b, a product whose
+    # orientations fill the machine alike (512x2048x1000: 64 pairs of
+    # 128x128 either way), a grid of more than one wave, and a K loop past
+    # TCGEN05_N_MAJOR_B_ONE_WAVE_MAX_K_BLOCKS.
+    assert not transposes(1024, 640, 1024)
+    assert not transposes(512, 1280, 1000, a_row=1024)
+    assert not transposes(512, 1280, 1000, b_n_major=False)
+    assert not transposes(512, 2048, 1000)
+    assert not transposes(4096, 1280, 1000)
+    assert not transposes(512, 1280, 2056)
+    # The transposed side is priced at its search's 128-row pair widths only:
+    # an aligned width over whole 256-row tiles, the 64-wide pair over whole
+    # 64-column tiles. 768x1152x1000 and 640x1152x1000 transposed (1152 rows)
+    # run no aligned width, and 264x1608x1000 transposed no 64-wide pair over
+    # 264 columns: 128x128 pairs either way (768x1152x1000: 0.831 of cuBLAS
+    # as written, 0.826 transposed). 640x2048x1000 transposed (2048 rows)
+    # runs 64 aligned pairs of 128x160 where as written 80 pairs of 128x128
+    # pass a wave: 0.674 -> 0.910.
+    for m, n in ((768, 1152), (640, 1152), (264, 1608)):
+        assert n_major_b_one_wave_pair128_gain(m, n, 1000, sm_pairs=76) == 1.0
+        assert not transposes(m, n, 1000)
+    assert transposes(640, 2048, 1000)
+
+
+def test_operands_off_tma_alignment_keep_the_pair_clauses_as_written() -> None:
+    # The one-wave misaligned-a-row rule and the skinny rule's whole-K pair
+    # clause transpose products onto CTA pairs, which load both operands
+    # through TMA. b's rows off TMA's 16-byte alignment take TMA off both
+    # operands either way round: bf16 960x640x360 over b's rows sliced from
+    # [360, 644] (1288 bytes apart; 230,400 elements, too few to stage), the
+    # transposed 128x64 pair and the as-written 128x128 one fall back to the
+    # scalar producers behind the host guard; over b's rows from [360, 640]
+    # the transposed pair loads both operands through TMA.
+    guard = "_helion_tcgen05_persistent_total_tiles"
+
+    def code(
+        args: tuple[torch.Tensor, ...], block_sizes: list[int], **config: object
+    ) -> str:
+        bound = plain_mm_into._bind_isolated(args)
+        return bound.to_code(helion.Config(block_sizes=block_sizes, **config))
+
+    pair: dict[str, object] = {
+        "l2_groupings": [1],
+        "pid_type": "persistent_interleaved",
+        "tcgen05_cta_group": "two",
+        "tcgen05_cluster_m": 2,
+        "tcgen05_ab_stages": 6,
+    }
+    a = torch.randn((960, 360), dtype=torch.bfloat16)
+    out = torch.empty((960, 640), dtype=torch.bfloat16)
+    for b_row in (640, 644):
+        b = torch.randn((360, b_row), dtype=torch.bfloat16)[:, :640]
+        transposed = code((b.T, a.T, out.T), [128, 64, 64], **pair)
+        if b_row == 640:
+            assert "tma_atom_a" in transposed and guard not in transposed
+            continue
+        for rendered in (transposed, code((a, b, out), [128, 128, 64], **pair)):
+            assert "tma_atom_a" not in rendered and "sA_mma[" in rendered
+            assert guard in rendered
+
+    # So the misaligned-a-row rule keeps such rows (and odd ones) as written;
+    # rows on the alignment, 1296 bytes apart, still transpose, as do those
+    # of the measured 512x1280x1000 (2576 bytes apart, but not 2568).
+    def misaligned_a(m: int, n: int, k: int, b_row: int) -> bool:
+        return tcgen05_transposes_misaligned_a_rows(
+            m,
+            n,
+            k,
+            torch.bfloat16,
+            a_strides=(k, 1),
+            b_strides=(b_row, 1),
+            num_sms=152,
+        )
+
+    for b_row, expected in ((640, True), (648, True), (644, False), (641, False)):
+        assert misaligned_a(960, 640, 360, b_row) is expected
+    for b_row, expected in ((1280, True), (1288, True), (1284, False)):
+        assert misaligned_a(512, 1280, 1000, b_row) is expected
+
+    # The pair clause: bf16 128x3072x768 transposes onto one wave of 128x64
+    # pairs. Over b's rows sliced from [768, 3076] (6152 bytes apart, an even
+    # count of elements) the CuTe backend leaves b.T, the transposed
+    # product's M-major A, to the flat one-CTA kernel's cp.async copies
+    # beside a.T's TMA loads, and refuses the pair config.
+    a = torch.randn((128, 768), dtype=torch.bfloat16)
+    b = torch.randn((768, 3076), dtype=torch.bfloat16)[:, :3072]
+    out = torch.empty((128, 3072), dtype=torch.bfloat16)
+    with pytest.raises(InvalidConfig, match="cp.async"):
+        code((b.T, a.T, out.T), [128, 64, 64], **pair)
+    rendered = code((b.T, a.T, out.T), [128, 16, 64], pid_type="flat")
+    assert "tma_atom_a" not in rendered and "tma_atom_b" in rendered
+    assert "cpasync.CopyG2SOp" in rendered
+
+    # So the clause keeps such rows (and odd ones) as written; rows on the
+    # alignment, 6160 bytes apart, still transpose.
+    def skinny(
+        m: int, n: int, k: int, b_row: int, a_offset: int = 0, b_offset: int = 0
+    ) -> bool:
+        return tcgen05_transposes_skinny_product(
+            m,
+            n,
+            k,
+            torch.bfloat16,
+            a_strides=(k, 1),
+            b_strides=(b_row, 1),
+            num_sms=152,
+            a_offset=a_offset,
+            b_offset=b_offset,
+        )
+
+    for b_row, expected in ((3072, True), (3080, True), (3076, False), (3073, False)):
+        assert skinny(128, 3072, 768, b_row) is expected
+
+    # No clause transposes over an operand whose base is off the alignment,
+    # which neither TMA nor cp.async loads either way round: bf16
+    # 128x768x1000 (the slab clause's) over a b 8 bytes into its storage
+    # runs the scalar producers as written and transposed; 16 bytes in, TMA
+    # loads both operands.
+    a = torch.randn((128, 1000), dtype=torch.bfloat16)
+    storage = torch.randn(1000 * 768 + 8, dtype=torch.bfloat16)
+    out = torch.empty((128, 768), dtype=torch.bfloat16)
+    for offset in (4, 8):
+        b = storage[offset:][: 1000 * 768].view(1000, 768)
+        transposed = code((b.T, a.T, out.T), [64, 16, 128], pid_type="flat")
+        if offset == 8:
+            assert "tma_atom_a" in transposed and "tma_atom_b" in transposed
+            continue
+        as_written = code((a, b, out), [64, 32, 128], pid_type="flat")
+        for rendered in (transposed, as_written):
+            assert "tma_atom_a" not in rendered and "sA_mma[" in rendered
+    for a_offset, b_offset, expected in (
+        (0, 0, True),
+        (8, 0, True),
+        (0, 8, True),
+        (4, 0, False),
+        (0, 4, False),
+        (1, 0, False),
+    ):
+        assert skinny(128, 768, 1000, 768, a_offset, b_offset) is expected
+    # (the pair clause's too)
+    assert skinny(128, 3072, 768, 3072, b_offset=8)
+    assert not skinny(128, 3072, 768, 3072, b_offset=4)
+
+
+def test_a_k_tail_one_wave_product_seeds_its_128_row_pairs() -> None:
+    # bf16 512x1280x1000 with b stored [K, N], transposed (out.T 1280 x 512):
+    # no K step divides K = 1000, so the one-wave family stays out of the
+    # search (the CTA pairs run as the edge K-tail family); the one-wave seeds
+    # take its 128-row pairs over 64-deep k-blocks, the last one partial:
+    # 40 pairs of 128x128 and, beside them, the 70 aligned pairs of 128x80
+    # (512 = 6 x 80 + 32: the last N tile clipped), each with its deepest AB
+    # ring (no deeper than the 16 k-blocks) and two A/B-load warps.
+    a, b, out = bf16_mm_args(512, 1280, 1000, rhs_k_major=False)
+    bound = plain_mm_into._bind_isolated((b.T, a.T, out.T))
+    state = bound.config_spec._cute_tcgen05_config
+    assert not state.cluster_m2_search_constraints.allow_one_wave_tiles
+    assert state.cluster_m2_search_constraints.allow_edge_k_tail_family
+    assert {
+        (
+            tuple(seed.config["block_sizes"]),
+            seed.config.get("tcgen05_tile_n"),
+            seed.config["tcgen05_ab_stages"],
+            seed.config.get("tcgen05_warp_spec_ab_load_warps", 1),
+        )
+        for seed in seeds._one_wave_seed_configs(state)
+    } == {
+        ((128, 128, 64), None, 13, 1),
+        ((128, 128, 64), None, 13, 2),
+        ((128, 128, 64), 80, 16, 1),
+        ((128, 128, 64), 80, 16, 2),
+    }
+    gen = ConfigGeneration(bound.config_spec)
+    for seed in seeds._one_wave_seed_configs(state):
+        _flat, normalized = gen.strict_config_pair(seed)
+        assert normalized.config["block_sizes"] == [128, 128, 64]
+    # As written (b an N-major B) the 128x128 pairs alone: no aligned width
+    # holds whole 64-byte atoms over 1280 columns where 128 does not.
+    as_written = plain_mm_into._bind_isolated((a, b, out))
+    assert {
+        (
+            tuple(seed.config["block_sizes"]),
+            seed.config.get("tcgen05_tile_n"),
+            seed.config.get("tcgen05_warp_spec_ab_load_warps", 1),
+        )
+        for seed in seeds._one_wave_seed_configs(
+            as_written.config_spec._cute_tcgen05_config
+        )
+    } == {((128, 128, 64), None, 1), ((128, 128, 64), None, 2)}
 
 
 def test_a_one_wave_product_no_pair_tiles_as_written_runs_transposed() -> None:

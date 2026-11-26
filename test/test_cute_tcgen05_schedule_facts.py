@@ -3732,7 +3732,10 @@ def test_small_grid_default_takes_the_fewest_waves(m: int, n: int, k: int) -> No
 # Small grids no 128-row pair serves: a 64-row M (64x4096x4096), K tails
 # under 128-row M (K=1000, 16 k-blocks: unsplit, at two per-SM CTA counts;
 # a single ragged edge with 128 rows or more runs the edge family's pairs,
-# ``test_single_edge_k_tail_runs_the_128_row_pair``), a K loop
+# ``test_single_edge_k_tail_runs_the_128_row_pair``, and its 64-wide pairs
+# where their grid fills a quarter of the SMs: 128x4096x1000,
+# ``test_edge_family_runs_the_64_wide_pair_over_a_k_tail_on_a_half_empty_grid``;
+# 128x1024x1000's 16 of them do not), a K loop
 # past the pairs' 256 k-blocks, the 32 k-block minimum's edge (31 unsplit,
 # 32 in four slices) and three CTAs per SM capping 216 tiles at two slices.
 @pytest.mark.parametrize(
@@ -3740,7 +3743,7 @@ def test_small_grid_default_takes_the_fewest_waves(m: int, n: int, k: int) -> No
     (
         (64, 4096, 4096, 4),
         (32, 1280, 1000, 1),
-        (128, 4096, 1000, 1),
+        (128, 1024, 1000, 1),
         (256, 512, 32768, 8),
         (64, 4096, 1984, 1),
         (64, 4096, 2048, 4),
@@ -3780,7 +3783,7 @@ def test_small_grid_without_a_pair_splits_k(m: int, n: int, k: int, split: int) 
     (
         (64, 4096, 320, 4, True),
         (64, 4096, 192, 3, True),
-        (128, 4096, 1000, 4, True),
+        (128, 1024, 1000, 4, True),
         (64, 4096, 4000, 4, False),
     ),
 )

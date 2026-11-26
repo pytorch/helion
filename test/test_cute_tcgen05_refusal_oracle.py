@@ -61,6 +61,9 @@ from helion._compiler.cute.tcgen05_constants import (
 )
 from helion._compiler.cute.tcgen05_constants import TCGEN05_SCHED_STAGE_COUNT_CONFIG_KEY
 from helion._compiler.cute.tcgen05_constants import TCGEN05_SPLIT_K_CONFIG_KEY
+from helion._compiler.cute.tcgen05_constants import (
+    TCGEN05_TWO_CTA_SIXTEEN_BIT_MAX_K_TILES,
+)
 from helion._testing.cute_codegen import cpu_target
 from helion.exc import BackendUnsupported
 from helion.exc import InvalidConfig
@@ -641,11 +644,17 @@ LIVE: list[tuple[str, Callable[[], Any], dict[str, Any], type[Exception], str]] 
         "need the standard static-full role-local TMA-store epilogue",
     ),
     (
+        # One K tile past the 16-bit pair's cap: outside the validated two-CTA
+        # role-local runtime, the side store's residual shared loop stays and
+        # the staged mailbox refuses it. Within the cap (257 tiles of 128 since
+        # the cap is 4096) the role-local runtime refuses the shared loop
+        # first ("a statement beside the warp roles ... hangs",
+        # test_cute_tcgen05_persistent_residual.py).
         "sched_stage_count_with_a_residual_shared_loop",
         lambda: bind_args(
             side_store_single,
-            fp16(512, 257 * 128),
-            fp16(257 * 128, 512),
+            fp16(256, (TCGEN05_TWO_CTA_SIXTEEN_BIT_MAX_K_TILES + 1) * 128),
+            fp16((TCGEN05_TWO_CTA_SIXTEEN_BIT_MAX_K_TILES + 1) * 128, 512),
             torch.zeros(8, 8),
         ),
         clc_pair(),

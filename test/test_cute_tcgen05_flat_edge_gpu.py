@@ -783,21 +783,44 @@ class TestCuteTcgen05RaggedTwoCtaSearch(RefEagerTestDisabled, TestCase):
         # 15 x 64 + 40): the 128-row pair's producer issues the partial last
         # K tile as a whole box (zero-filled past K) and the TMA store clips
         # the edge, over a ragged N (8192x240), a ragged M (240x8192) and a
-        # longer K loop (1280x1600x1000).
-        for m, n, k in ((8192, 240, 240), (240, 8192, 240), (1280, 1600, 1000)):
+        # longer K loop (1280x1600x1000). 8192x240 defaults to one wave of
+        # 64 aligned 128x240 pairs (its K-tail one-wave seed, no N edge), so
+        # its ragged N edge runs on the 128x128 pair, its default before
+        # (GB300, autotune off, of cuBLAS: 0.896 on the 128x128 pair, 0.880
+        # on the 128x240; 8192x240x480 RC 0.729 -> 0.946).
+        for m, n, k, tile_n in (
+            (8192, 240, 240, 240),
+            (240, 8192, 240, 0),
+            (1280, 1600, 1000, 0),
+        ):
             a = torch.randn(m, k, device=DEVICE, dtype=torch.bfloat16)
             b = torch.randn(n, k, device=DEVICE, dtype=torch.bfloat16).T
             out = torch.empty(m, n, device=DEVICE, dtype=torch.bfloat16)
             bound = plain_mm_into.bind((a, b, out))
             config = bound.config_spec.default_config()
             self.assertEqual(config.config["tcgen05_cta_group"], "two")
-            self.assertEqual(config.config["block_sizes"][:2], [128, 128])
-            bound.set_config(config)
-            out.zero_()
-            bound(a, b, out)
-            torch.testing.assert_close(
-                out, (a.float() @ b.float()).to(out.dtype), rtol=1e-2, atol=1e-1
+            self.assertEqual(
+                config.config["block_sizes"][:2], [128, 256 if tile_n else 128]
             )
+            self.assertEqual(config.config.get("tcgen05_tile_n") or 0, tile_n)
+            configs = [config]
+            if tile_n:
+                configs.append(
+                    helion.Config(
+                        **{
+                            **config.config,
+                            "block_sizes": [128, 128, 64],
+                            "tcgen05_tile_n": 0,
+                        }
+                    )
+                )
+            for config in configs:
+                bound.set_config(config)
+                out.zero_()
+                bound(a, b, out)
+                torch.testing.assert_close(
+                    out, (a.float() @ b.float()).to(out.dtype), rtol=1e-2, atol=1e-1
+                )
 
     def test_single_edge_k_tail_runs_the_256_row_pair(self) -> None:
         # The same single ragged edge with a K tail on the 256-row pair the
@@ -1010,6 +1033,124 @@ class TestCuteTcgen05RaggedTwoCtaSearch(RefEagerTestDisabled, TestCase):
             torch.testing.assert_close(
                 out, expected.to(out.dtype), rtol=2e-2, atol=1e-1
             )
+
+    def test_clipped_pairs_run_a_k_tail(self) -> None:
+        # The 16-bit pair's clipped last N tile over a K tail (600 = 9 x 64 +
+        # 24): the producer issues the clipped N tile and the partial last K
+        # tile, TMA zero-filling both past the edge, and the MMA warp runs
+        # all ten K blocks. As written (2048 x 2000 on 256x176 pairs) and
+        # transposed (out.T = b.T @ a.T: 1024 x 2000 on 256x224 pairs, into a
+        # column-major output) over a K-major b, and transposed over b stored
+        # [K, N], whose transpose is the pair's M-major A. The output starts
+        # as NaN, so a tile left unstored fails the check.
+        cases = (
+            ((2048, 2000, 600), 176, False, False),
+            ((2000, 1024, 600), 224, True, False),
+            ((2000, 1024, 600), 224, True, True),
+        )
+        for (m, n, k), width, transposed, b_n_major in cases:
+            a = torch.randn(m, k, device=DEVICE, dtype=torch.bfloat16)
+            b = (
+                torch.randn(k, n, device=DEVICE, dtype=torch.bfloat16)
+                if b_n_major
+                else torch.randn(n, k, device=DEVICE, dtype=torch.bfloat16).T
+            )
+            out = torch.full((m, n), float("nan"), device=DEVICE, dtype=torch.bfloat16)
+            args = (b.T, a.T, out.T) if transposed else (a, b, out)
+            bound = plain_mm_into.bind(args)
+            config = helion.Config(
+                block_sizes=[256, 256, 64],
+                pid_type="persistent_interleaved",
+                tcgen05_cta_group="two",
+                tcgen05_cluster_m=2,
+                tcgen05_cluster_n=1,
+                tcgen05_ab_stages=4,
+                tcgen05_acc_stages=2,
+                tcgen05_c_stages=2,
+                tcgen05_l2_swizzle_size=1,
+                l2_groupings=[1],
+                tcgen05_tile_n=width,
+            )
+            code = bound.to_code(config)
+            self.assertIn(f"CtaGroup.TWO, (256, {width})", code)
+            self.assertIn(
+                "for tile_offset_2 in range(cutlass.Int32(0), "
+                f"cutlass.Int32({k}), cutlass.Int32(_BLOCK_SIZE_2)):",
+                code,
+            )
+            bound.set_config(config)
+            bound(*args)
+            torch.testing.assert_close(
+                out, (a.float() @ b.float()).to(out.dtype), rtol=1e-2, atol=1e-1
+            )
+
+    def _run_64_wide_pair_seeds(
+        self, m: int, n: int, k: int, *, transposed: bool
+    ) -> dict[int, str]:
+        """Run the first 128x64x64 CTA-pair seed on 2x1 and on 2x2 clusters
+        of a bf16 ``m x n x k`` product with b stored [K, N], as written or
+        transposed (out.T = b.T @ a.T, into the column-major output), check
+        each output against torch and return each seed's source by
+        ``tcgen05_cluster_n``. The output starts as NaN, so a tile left
+        unstored fails the check."""
+        a = torch.randn(m, k, device=DEVICE, dtype=torch.bfloat16)
+        b = torch.randn(k, n, device=DEVICE, dtype=torch.bfloat16)
+        out = torch.empty(m, n, device=DEVICE, dtype=torch.bfloat16)
+        args = (b.T, a.T, out.T) if transposed else (a, b, out)
+        bound = plain_mm_into.bind(args)
+        pairs = [
+            seed
+            for seed in bound.config_spec.compiler_seed_configs
+            if seed.config.get("tcgen05_cta_group") == "two"
+            and seed.config["block_sizes"][:3] == [128, 64, 64]
+        ]
+        codes = {}
+        for cluster_n in (1, 2):
+            config = next(
+                seed
+                for seed in pairs
+                if seed.config.get("tcgen05_cluster_n", 1) == cluster_n
+            )
+            code = bound.to_code(config)
+            self.assertIn("CtaGroup.TWO, (128, 64)", code)
+            self.assertIn(f"cute.make_layout((2, {cluster_n}, 1))", code)
+            self.assertIn(
+                "for tile_offset_2 in range(cutlass.Int32(0), "
+                f"cutlass.Int32({k}), cutlass.Int32(_BLOCK_SIZE_2)):",
+                code,
+            )
+            bound.set_config(config)
+            out.fill_(float("nan"))
+            bound(*args)
+            torch.testing.assert_close(
+                out, (a.float() @ b.float()).to(out.dtype), rtol=1e-2, atol=1e-1
+            )
+            codes[cluster_n] = code
+        return codes
+
+    @unittest.skipUnless(_promotes_b200_defaults(), "seeds a B200-sized grid")
+    def test_edge_family_runs_64_wide_pairs_over_a_k_tail(self) -> None:
+        # bf16 128x4096x1000 with b stored [K, N] (K = 15 x 64 + 40): the edge
+        # K-tail family's 64 pairs of 128x64 over a K-major A and an N-major B
+        # (``seeds._plain_edge_pair128_seed_configs``), on 2x1 clusters and on
+        # 2x2 clusters (A multicast across the two pairs of a cluster), whose
+        # CTAs prefetch their share of the operand footprint into L2 ahead of
+        # the dependent-launch wait.
+        codes = self._run_64_wide_pair_seeds(128, 4096, 1000, transposed=False)
+        self.assertIn("tcgen05_l2_pf_rank_n = ", codes[2])
+
+    @unittest.skipUnless(_promotes_b200_defaults(), "seeds a B200-sized grid")
+    def test_transposed_64_wide_pairs_run_a_k_tail(self) -> None:
+        # helion.inductor's transposed bf16 128x2304x1000 with b stored [K, N]
+        # (out.T = b.T @ a.T: 36 pairs of 128x64 over an M-major A, into the
+        # column-major output): the one-wave seeds' 2x1 pair over the K tail
+        # (``seeds._one_wave_seed_configs``) and the edge family's 2x2
+        # cluster, which ``seeds._paired_pipeline_parameters`` admits over a
+        # column-major output. Each CTA prefetches its share of the pair's
+        # operand footprint, a 2x2 CTA half of its pair's A rows.
+        codes = self._run_64_wide_pair_seeds(128, 2304, 1000, transposed=True)
+        self.assertIn("tcgen05_l2_pf_rank = ", codes[1])
+        self.assertIn("tcgen05_l2_pf_rank_n = ", codes[2])
 
     @unittest.skipUnless(_promotes_b200_defaults(), "pins B200 default tiles")
     def test_double_edge_defaults_run_the_pairs(self) -> None:

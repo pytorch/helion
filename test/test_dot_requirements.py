@@ -339,19 +339,22 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
         # 8192 columns are a long N sweep (32 N tiles), grouped by 32 M tiles
         # (B200, of cuBLAS: 0.98-1.03 ungrouped or grouped by 2, 4 or 32 here).
         self.assertEqual(spec.default_config().config["l2_groupings"], [32])
-        # K=8192 can form validated CtaGroup.TWO products at bk >= 32 even
-        # though bk=16 is over the K-tile cap. The FFI full-tile default lands
-        # on cluster_m=2, and the search exposes both arms.
+        # K=8192 forms validated CtaGroup.TWO products at every K step: the
+        # 16-bit pair runs up to TCGEN05_TWO_CTA_SIXTEEN_BIT_MAX_K_TILES (4096)
+        # K tiles, so bk=16 (512 tiles) keeps the pair on the persistent
+        # projection like bk=32 below. The FFI full-tile default lands on
+        # cluster_m=2, and the search exposes both arms.
         self.assertEqual(spec.default_config().config["tcgen05_cluster_m"], 2)
         self.assertEqual(spec.tcgen05.cluster_m_search_choices, (1, 2))
-        over_cap_config = {
+        deep_k_config = {
             "block_sizes": [256, 256, 16],
             "pid_type": "flat",
             "tcgen05_cluster_m": 2,
         }
-        spec.normalize(over_cap_config, _fix_invalid=True)
-        self.assertEqual(over_cap_config["tcgen05_cluster_m"], 1)
-        self.assertEqual(over_cap_config["pid_type"], "flat")
+        spec.normalize(deep_k_config, _fix_invalid=True)
+        self.assertEqual(deep_k_config["tcgen05_cluster_m"], 2)
+        self.assertEqual(deep_k_config["pid_type"], "persistent_interleaved")
+        self.assertEqual(deep_k_config["block_sizes"][:3], [256, 256, 16])
         valid_config = {
             "block_sizes": [128, 256, 32],
             "pid_type": "flat",
@@ -738,9 +741,10 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
             bound = fresh(cute_matmul_mma).bind(args)
         spec = bound.config_spec
 
+        # A missing, non-dividing or boolean K step. (A dividing one is valid
+        # at any depth here: the 16-bit pair takes up to 4096 K tiles.)
         for block_sizes in (
             [TCGEN05_TWO_CTA_BLOCK_M, TCGEN05_TWO_CTA_BLOCK_N],
-            [TCGEN05_TWO_CTA_BLOCK_M, TCGEN05_TWO_CTA_BLOCK_N, 8],
             [TCGEN05_TWO_CTA_BLOCK_M, TCGEN05_TWO_CTA_BLOCK_N, 24],
             [TCGEN05_TWO_CTA_BLOCK_M, TCGEN05_TWO_CTA_BLOCK_N, True],
         ):
@@ -942,7 +946,13 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
                 facts = tcfg.pipeline_smem_facts
                 assert facts is not None
                 self.assertEqual(facts.capacity_bytes, capacity)
+                # The compact paired family's allocation; the aligned-N
+                # family's seed (``tcgen05_tile_n``: here the clipped 256x192
+                # pair) sizes its ring by its own plan, whose (128, 32) store
+                # subtile this estimate does not model.
                 for seed in paired:
+                    if seed.get("tcgen05_tile_n"):
+                        continue
                     bm, bn, bk = seed.block_sizes
                     self.assertLessEqual(
                         pipeline_smem_bytes(

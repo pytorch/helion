@@ -30,24 +30,31 @@ from ..cp_async_operand import tcgen05_cp_async_a_strided_layout
 from ..cute_warp_mma_gemm import WARP_MMA_MIN_BM
 from ..cute_warp_mma_gemm import WARP_MMA_MIN_BN
 from ..cute_warp_mma_gemm import warp_mma_admission_reason
+from ..dense_aligned_n import DENSE_ALIGNED_N_SIXTEEN_BIT_BLOCK_K
 from ..dense_aligned_n import dense_aligned_n_mn_b_width
+from ..dense_aligned_n import n_major_b_one_wave_pair128_gain
 from ..dense_aligned_n import transposed_double_edge_without_pairs
 from ..tcgen05_config import facts
 from ..tcgen05_config import surface
 from ..tcgen05_constants import RAGGED_BATCHED_MIN_BLOCK_N
 from ..tcgen05_constants import TCGEN05_MANY_SMALL_BATCHES
+from ..tcgen05_constants import TCGEN05_N_MAJOR_B_ONE_WAVE_MAX_K_BLOCKS
 from ..tcgen05_constants import TCGEN05_ONE_CTA_MAX_BLOCK_M
 from ..tcgen05_constants import TCGEN05_ONE_CTA_MIN_BLOCK_M
+from ..tcgen05_constants import TCGEN05_PAIR_TILE_FIXED_KBLOCKS
+from ..tcgen05_constants import TCGEN05_TRANSPOSED_PRODUCT_MIN_GAIN
 from ..tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_M
 from ..tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_N
 from ..tcgen05_constants import TCGEN05_TWO_CTA_EDGE_K_TAIL_MIN_DIM
 from ..tcgen05_constants import TCGEN05_TWO_CTA_EDGE_PAIR128_BLOCK
 from ..tcgen05_constants import TCGEN05_TWO_CTA_FP8_SMALL_GRID_BLOCK_M
 from ..tcgen05_constants import TCGEN05_TWO_CTA_FP8_SMALL_GRID_BLOCK_N
-from ..tcgen05_constants import TCGEN05_TWO_CTA_MAX_K_TILES
 from ..tcgen05_constants import TCGEN05_TWO_CTA_ONE_WAVE_BLOCK_NS
 from ..tcgen05_constants import TCGEN05_TWO_CTA_PAIR128_ONE_WAVE_BLOCK_NS
 from ..tcgen05_constants import TCGEN05_WHOLE_K_TILE_MIN
+from ..tcgen05_constants import tcgen05_edge_pair128_narrow_width_fits
+from ..tcgen05_constants import tcgen05_transposed_pair_prefetch_fits
+from ..tcgen05_constants import tcgen05_two_cta_max_k_tiles
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
@@ -223,6 +230,8 @@ def tcgen05_transposes_skinny_product(
     a_strides: tuple[int, int],
     b_strides: tuple[int, int],
     num_sms: int,
+    a_offset: int = 0,
+    b_offset: int = 0,
 ) -> bool:
     """Whether a 16-bit ``m x n x k`` product with a skinny ``m`` runs better
     as its transpose (``n x m x k``, out.T = b.T @ a.T) on the CuTe GEMM
@@ -263,12 +272,39 @@ def tcgen05_transposes_skinny_product(
     way, so only an M below the one-CTA tile's 64 rows, which the as-written
     tile zero-fills, transposes: 32x1280x960 0.829 -> 0.925, while
     128x768x768 (1.003 -> 0.982) and 64x4096x4096 (1.004 -> 1.006) stay.
+    Over whole 64-element K tiles, an N-major b of an M of one 128-row pair
+    row also transposes where the transposed product runs a one-wave grid of
+    128x64 CTA pairs whose operand footprint their L2 prefetch takes
+    (``tcgen05_transposed_pair_prefetch_fits``, which counts b's row stride
+    and the operands' offsets as the prefetch does), each CTA reading one
+    whole line of b.T per K index where the as-written pair's CTAs read half
+    lines of b: bf16 128x3072x768 (48 pairs) at full effort 0.95 as written
+    (0.87 once the as-written pairs prefetch too: the search keeps a one-CTA
+    tile) and 1.10 transposed; the best as-written and transposed configs
+    by hand, of cuBLAS: 128x3072x768 1.05 / 1.11, 128x4096x768 1.03 / 1.09,
+    128x4096x1024 1.03 / 1.09 (the same pair config either way: 1.05 ->
+    1.09 at 128x3072x512, 1.03 -> 1.04 at 128x3072x1024). A K tail keeps it
+    as written, where the 64-wide pair's 2x2 cluster with its shared
+    prefetch runs at least as fast: 128x3072x1000 1.017 as written against
+    1.002, 128x4096x1000 1.055 against 1.056. The pairs load both operands
+    through TMA, so this clause asks both operands' strides on its 16-byte
+    alignment (``_operands_tma_aligned``) and keeps other products as
+    written, b's rows that the flat one-CTA kernel copies with ``cp.async``
+    included: over b's rows sliced from [768, 3076] (6152 bytes apart) the
+    CuTe backend leaves b.T, the transposed product's M-major A, to those
+    copies and refuses the transposed 128x64 pair config. No clause
+    transposes over an operand whose base (``a_offset`` / ``b_offset``) is
+    off that alignment, which neither TMA nor ``cp.async`` loads either way
+    round: bf16 128x768x1000 over a b 8 bytes into its storage runs the
+    scalar producers as written and transposed.
     A quick-effort sweep of 60 shapes (M 16 to 512 by N x K in 768 x 768,
-    1024 x 4096, 4096 x 1024, 4096 x 4096 and 1280 x 1000, both layouts)
-    runs the shapes inside the rule 0.98 to 1.43 times as fast transposed
-    and those outside it 0.83 to 1.03 times, but for three of the K-tail
-    1280 x 1000 shapes (1.06 to 1.16), which both orientations run on the
-    flat one-CTA kernel at 0.61 to 0.80 of stock Inductor.
+    1024 x 4096, 4096 x 1024, 4096 x 4096 and 1280 x 1000, both layouts),
+    before the CTA pairs prefetched their operands, ran the shapes inside
+    the slab rule 0.98 to 1.43 times as fast transposed and those outside it
+    0.83 to 1.03 times (128x4096x1024 among them, which the pair clause
+    above now transposes), but for three of the K-tail 1280 x 1000 shapes
+    (1.06 to 1.16), which both orientations run on the flat one-CTA kernel
+    at 0.61 to 0.80 of stock Inductor.
 
     The warp-MMA family tiles M in 16-row steps, so a skinny M fits it as
     written: a product it admits (``warp_mma_admission_reason``, the
@@ -299,7 +335,8 @@ def tcgen05_transposes_skinny_product(
     apart over an even n), while as written TMA loads neither operand over
     them (the scalar producers run, or the CuTe backend first copies a b of
     ``STAGING_MIN_ELEMENTS`` elements or more): such rows do not keep the
-    product as written (unmeasured), the others do. The warp-MMA admission
+    product as written in the slab clauses (unmeasured; the pair clause
+    above keeps them), the others do. The warp-MMA admission
     reads the real strides, as the planner's does: over b's rows sliced
     from [256, 776] (16-byte aligned) the family runs bf16 32x768x256 as
     written; from [256, 772] it admits no warp MMA, and the product
@@ -311,6 +348,13 @@ def tcgen05_transposes_skinny_product(
     b_k_major = b_strides[0] == 1
     if a_strides[1] != 1 or not (b_k_major or b_strides[1] == 1):
         return False
+    if any(
+        offset * dtype.itemsize % TCGEN05_TMA_ROW_ALIGN_BYTES
+        for offset in (a_offset, b_offset)
+    ):
+        # (an operand based off TMA's 16-byte alignment: unmeasured either
+        # way round)
+        return False
     if not (1 < m < n) or tcgen05_shape_rejected(m, n, k, dtype):
         # (a product the planner leaves to the SIMT or warp-MMA lowering as
         # written is too small for its tiles to matter: bf16 40x96x64)
@@ -321,7 +365,28 @@ def tcgen05_transposes_skinny_product(
         return False
     slabs = TCGEN05_ONE_CTA_MIN_BLOCK_M
     if not (
-        m < slabs or (not b_k_major and -(-m // slabs) * -(-n // slabs) < num_sms // 2)
+        m < slabs
+        or (not b_k_major and -(-m // slabs) * -(-n // slabs) < num_sms // 2)
+        or (
+            not b_k_major
+            # (one 128-row pair row as written, whose 64-wide pairs read half
+            # lines of b: the shapes measured)
+            and m <= TCGEN05_TWO_CTA_BLOCK_M // 2
+            and k % TCGEN05_WHOLE_K_TILE_MIN == 0
+            and tcgen05_transposed_pair_prefetch_fits(
+                m,
+                n,
+                k,
+                itemsize=dtype.itemsize,
+                a_row_bytes=a_strides[0] * dtype.itemsize,
+                b_row_bytes=b_strides[0] * dtype.itemsize,
+                num_sms=num_sms,
+                a_offset_bytes=a_offset * dtype.itemsize,
+                b_offset_bytes=b_offset * dtype.itemsize,
+            )
+            # (the pairs load both operands through TMA)
+            and _operands_tma_aligned(a_strides, b_strides, dtype.itemsize)
+        )
     ):
         return False
     return (
@@ -619,6 +684,97 @@ def tcgen05_transposes_n_edge_b_rows(
     if min(m, n) < TCGEN05_TWO_CTA_BLOCK_M:
         return False
     return _transposed_clusters_fill_two_waves(m, n, num_sms)
+
+
+def tcgen05_transposes_misaligned_a_rows(
+    m: int,
+    n: int,
+    k: int,
+    dtype: torch.dtype,
+    *,
+    a_strides: tuple[int, int],
+    b_strides: tuple[int, int],
+    num_sms: int,
+) -> bool:
+    """Whether a 16-bit one-wave ``m x n x k`` product of a row-major ``a``
+    whose rows straddle L2 sectors and an N-major ``b`` runs better as its
+    transpose (out.T = b.T @ a.T) on the CuTe CTA pairs (``a_strides`` /
+    ``b_strides``: element strides). helion.inductor asks it before it
+    lowers an ``aten.mm`` (``HelionChoices.transpose_matmul``).
+
+    bf16 a of shape [512, 1000] stores its rows 2000 bytes apart, an odd
+    multiple of 16, so every other TMA row of a starts mid-sector; and b of
+    shape [1000, 1280], stored [K, N], leaves the as-written 128-row CTA
+    pairs (each CTA 64 rows of the tile) only the widths whose half rows of b
+    hold 64-byte swizzle atoms. Its 2 x 5 tiles of 256x256 are one wave of
+    GB300's 76 SM pairs, and so is either orientation's best grid:
+
+        for tile_y, tile_x in hl.tile([512, 1280]):  # as written: 40 pairs
+            ...                                       # of 128x128
+            tmp0 = in0[tile_y, tile_r]  # a: 64 straddling rows per CTA
+        for tile_x, tile_y in hl.tile([1280, 512]):  # transposed: 70 pairs
+            ...                                       # of 128x80
+            tmp1 = in1[tile_r, tile_y]  # a.T: 40 straddling rows per CTA
+
+    (``dense_aligned_n.n_major_b_one_wave_pair128_gain`` prices the two grids
+    at 1.13.) GB300, cold full-effort autotunes, both orientations forced, of
+    cuBLAS (CUDA graphs over cold inputs, each mode in its own blocks), as
+    written / transposed: 512x1280x1000 0.779 / 0.903, 640x2048x1000 0.674 /
+    0.910. Padding a's rows to 2048 bytes speeds the as-written pick up 12%
+    and the transposed one 4% (cuBLAS 3-4%). Over 1152 rows the transposed
+    pairs run no aligned width (the pricing's gate), and 768x1152x1000
+    (0.831 / 0.826) and 640x1152x1000 (0.793 / 0.797) stay as written.
+    Sector-aligned rows of a stay as written too, where the model's gains
+    (1.08-1.09) do not hold: 1024x768x1024 0.968 / 0.952 (1024x1280x1024,
+    0.825 / 0.958, stays too). Measured at K = 1000 (16 K blocks); a K loop no
+    longer than the pair tile's fixed cost (``TCGEN05_PAIR_TILE_FIXED_KBLOCKS``)
+    or past ``TCGEN05_N_MAJOR_B_ONE_WAVE_MAX_K_BLOCKS`` keeps the
+    orientation, as do a K-major b, a grid of a wave or more, and a skinny
+    side (``tcgen05_transposes_skinny_product``'s).
+
+    Both grids are CTA pairs, which load both operands through TMA, so b's
+    rows off TMA's 16-byte alignment keep the product as written too
+    (``_operands_tma_aligned``): as written they are the product's N-major
+    B, transposed b.T's columns, an M-major A that only the flat one-CTA
+    kernel copies (``cp.async``), and either way round TMA loads neither
+    operand. bf16 960x640x360 over b's rows sliced from [360, 644] (1288
+    bytes apart; 230,400 elements, too few to stage): the transposed 128x64
+    pair and the as-written 128x128 one fall back to the scalar producers
+    behind a host guard that refuses every launch, where over b's rows from
+    [360, 640] the transposed pair loads both operands through TMA, and the
+    product transposes there and over rows from [360, 648]. The CuTe
+    backend first copies a b of ``STAGING_MIN_ELEMENTS`` elements or more
+    (``stage_aligned_operands``), row-major, which makes the transposed
+    product's b.T K-major, unless it leaves b.T to the flat one-CTA
+    kernel's ``cp.async`` (beside an a.T at most ``CP_ASYNC_MAX_N`` wide):
+    layouts the rule did not measure."""
+    if dtype not in (torch.bfloat16, torch.float16):
+        return False
+    itemsize = 2
+    if a_strides[1] != 1 or b_strides[1] != 1 or b_strides[0] == 1:
+        return False
+    if a_strides[0] * itemsize % TCGEN05_L2_SECTOR_BYTES != TCGEN05_TMA_ROW_ALIGN_BYTES:
+        return False
+    if not _operands_tma_aligned(a_strides, b_strides, itemsize):
+        # (b's rows off TMA's alignment: neither orientation's pairs load
+        # through TMA)
+        return False
+    if tcgen05_shape_rejected(m, n, k, dtype):
+        return False
+    if min(m, n) < TCGEN05_TWO_CTA_BLOCK_M:
+        # (a skinny product is ``tcgen05_transposes_skinny_product``'s)
+        return False
+    sm_pairs = num_sms // 2
+    if -(-m // TCGEN05_TWO_CTA_BLOCK_M) * -(-n // TCGEN05_TWO_CTA_BLOCK_N) >= sm_pairs:
+        return False
+    if not (
+        TCGEN05_PAIR_TILE_FIXED_KBLOCKS
+        < -(-k // DENSE_ALIGNED_N_SIXTEEN_BIT_BLOCK_K)
+        <= TCGEN05_N_MAJOR_B_ONE_WAVE_MAX_K_BLOCKS
+    ):
+        return False
+    gain = n_major_b_one_wave_pair128_gain(m, n, k, sm_pairs=sm_pairs)
+    return gain is not None and gain >= TCGEN05_TRANSPOSED_PRODUCT_MIN_GAIN
 
 
 # The longest K loop, in 64-wide K blocks, under which the epilogue bounds a
@@ -1629,6 +1785,7 @@ def enable_cute_tcgen05_search(
         # bf16 8192x240x240 0.85 -> 1.03 (the 128x128 pair, two tiles per
         # CTA), 4096x240x240 0.94 -> 1.02, 1280x1600x1000 0.70 -> 0.99,
         # 320x2048x1000 0.57 -> 0.71, 1000x2560x8008 0.39 -> 0.69.
+        narrow_pair_n = min(TCGEN05_TWO_CTA_PAIR128_ONE_WAVE_BLOCK_NS)
         m_ragged = static_m % TCGEN05_TWO_CTA_BLOCK_M != 0
         n_ragged = static_n % TCGEN05_TWO_CTA_BLOCK_N != 0
         k_tail = static_k % TCGEN05_WHOLE_K_TILE_MIN != 0
@@ -1644,9 +1801,23 @@ def enable_cute_tcgen05_search(
             and input_dtype.itemsize == 2
             and k_tail
             and m_ragged != n_ragged
-            and min(plan.max_tcgen05_m, plan.max_tcgen05_n)
-            >= TCGEN05_TWO_CTA_EDGE_PAIR128_BLOCK
-            and min(static_m, static_n, static_k) >= TCGEN05_TWO_CTA_EDGE_PAIR128_BLOCK
+            and plan.max_tcgen05_m >= TCGEN05_TWO_CTA_EDGE_PAIR128_BLOCK
+            and min(static_m, static_k) >= TCGEN05_TWO_CTA_EDGE_PAIR128_BLOCK
+            and (
+                min(plan.max_tcgen05_n, static_n) >= TCGEN05_TWO_CTA_EDGE_PAIR128_BLOCK
+                # or one N tile of the 64-wide pair, where a wave of them fits
+                # (``tcgen05_edge_pair128_narrow_width_fits``): bf16
+                # 16384x64x1000 would take 256 CTAs and stays one-CTA
+                or (
+                    plan.max_tcgen05_n == static_n == narrow_pair_n
+                    and tcgen05_edge_pair128_narrow_width_fits(
+                        rows=plan.leading_work_multiplier
+                        * -(-static_m // TCGEN05_TWO_CTA_EDGE_PAIR128_BLOCK),
+                        n=static_n,
+                        num_sms=_cuda_num_sms_or_zero(lhs.device),
+                    )
+                )
+            )
         )
         m_edge = static_m % max_search_m != 0
         n_edge = static_n % max_search_n != 0
@@ -1691,7 +1862,8 @@ def enable_cute_tcgen05_search(
             # 64-deep two-CTA tile at 26.9 us against cuBLAS's 26.6 and the
             # flat winner's 30.7.
             max_search_k = whole_k_tile
-    max_cluster_m2_search_k = TCGEN05_TWO_CTA_MAX_K_TILES * max_search_k
+    cluster_m2_max_k_tiles = tcgen05_two_cta_max_k_tiles(input_dtype.itemsize)
+    max_cluster_m2_search_k = cluster_m2_max_k_tiles * max_search_k
     if static_m is None or static_n is None or static_k is None:
         allow_whole_k_persistent_pid_types = False
         allow_small_n_persistent_pid_types = False
@@ -1813,6 +1985,10 @@ def enable_cute_tcgen05_search(
     )
     spec._cute_tcgen05_config.tcgen05_min_search_n = plan.min_search_n
     spec._cute_tcgen05_config.matmul_leading_block_id = leading_block_id
+    # True when the edge K-tail family clears the quarter-wave gate on its
+    # 64-wide pairs alone (``repair.plain_pair128_widths``): the search then
+    # keeps just those pairs.
+    edge_pair128_only = False
     if allow_cluster_m2_search:
         assert static_m is not None and static_n is not None and static_k is not None
         if num_sms > 0:
@@ -1877,13 +2053,33 @@ def enable_cute_tcgen05_search(
                 # (``tcgen05.aux_kernel_detected``), so a 16-bit kernel
                 # with one is admitted on this count too and runs the
                 # family's 256x256 pairs, which the pair-128 gate excludes.
-                edge_work_clusters = (
-                    plan.leading_work_multiplier
-                    * -(-static_m // TCGEN05_TWO_CTA_EDGE_PAIR128_BLOCK)
-                    * -(-static_n // TCGEN05_TWO_CTA_EDGE_PAIR128_BLOCK)
+                edge_rows = plan.leading_work_multiplier * -(
+                    -static_m // TCGEN05_TWO_CTA_EDGE_PAIR128_BLOCK
                 )
+                edge_work_clusters = edge_rows * -(
+                    -static_n // TCGEN05_TWO_CTA_EDGE_PAIR128_BLOCK
+                )
+                narrow_n = min(TCGEN05_TWO_CTA_PAIR128_ONE_WAVE_BLOCK_NS)
+                if plain_epilogue and tcgen05_edge_pair128_narrow_width_fits(
+                    rows=edge_rows, n=static_n, num_sms=num_sms
+                ):
+                    # A plain epilogue's family also runs its 64-wide pairs on
+                    # a grid of one wave of them, whose CTAs keep it on where
+                    # the 128x128 pairs sit under the gate but they fill a
+                    # quarter of the SMs, alone (``edge_pair128_only``): the
+                    # transposed bf16 128x2304x1000 with b stored [K, N]
+                    # (out.T 2304 x 128) has 18 tiles of 128x128 and 36 pairs
+                    # of 128x64, 72 CTAs, which ran 0.90 of cuBLAS against the
+                    # one-CTA pick's 0.79 (GB300, CUDA graphs over cold
+                    # inputs). An auxiliary epilogue, which runs no 128-row
+                    # pair, stays under the gate.
+                    narrow_pairs = edge_rows * (static_n // narrow_n)
+                    edge_pair128_only = (
+                        max(work_clusters, edge_work_clusters) < num_sms // 4
+                        and 2 * narrow_pairs >= num_sms // 4
+                    )
                 work_clusters = max(work_clusters, edge_work_clusters)
-            if work_clusters < num_sms // 4:
+            if work_clusters < num_sms // 4 and not edge_pair128_only:
                 allow_cluster_m2_search = False
                 allow_edge_cluster_m2_search = False
                 allow_fp8_small_grid_cluster_m2_search = False
@@ -1951,10 +2147,12 @@ def enable_cute_tcgen05_search(
         ),
         enable_cluster_m2_search=allow_cluster_m2_search,
         cluster_m2_static_k=static_k if allow_cluster_m2_search else None,
+        cluster_m2_max_k_tiles=cluster_m2_max_k_tiles,
         allow_cluster_m2_edge_k_tail_family=allow_edge_cluster_m2_search,
         allow_cluster_m2_fp8_small_grid=allow_fp8_small_grid_cluster_m2_search,
         allow_cluster_m2_one_wave_tiles=allow_one_wave_cluster_m2_search,
         cluster_m2_one_wave_only=one_wave_only_cluster_m2_search,
+        cluster_m2_edge_pair128_only=edge_pair128_only,
         cluster_m2_whole_k=cluster_m2_whole_k,
         ab_stages_three_dtype_bytes=lhs.dtype.itemsize,
         ab_stages_three_device=lhs.device,

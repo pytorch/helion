@@ -287,10 +287,8 @@ def _paired_pipeline_parameters(
         or config.get(TCGEN05_CTA_GROUP_CONFIG_KEY) != "two"
         or config.get("tcgen05_cluster_m", 1) != 2
         # cluster_n=2 is the 2x2 cluster of CTA pairs (A multicast across
-        # the N neighbours); the SMEM model is per CTA either way. The
-        # column-major-output family keeps its priced cluster_n=1 schedule.
-        or config.get("tcgen05_cluster_n", 1)
-        not in ((1,) if pipeline_facts.output_column_major else (1, 2))
+        # the N neighbours); the SMEM model is per CTA either way.
+        or config.get("tcgen05_cluster_n", 1) not in (1, 2)
         or config.get("pid_type")
         not in (
             "persistent_blocked",
@@ -325,6 +323,25 @@ def _paired_pipeline_parameters(
         or c_stages not in (2, 4)
         or acc_stages not in (1, 2)
     ):
+        return None
+    if (
+        pipeline_facts.output_column_major
+        and config.get("tcgen05_cluster_n", 1) == 2
+        and not (
+            (bm, bn) == (128, min(TCGEN05_TWO_CTA_PAIR128_ONE_WAVE_BLOCK_NS))
+            and pipeline_facts.input_dtype_bytes == 2
+            and not pipeline_facts.has_auxiliary_loads
+        )
+    ):
+        # A column-major output keeps its priced cluster_n=1 schedule but on
+        # the 64-wide 128-row pair of a 16-bit GEMM without auxiliary loads,
+        # whose 2x2 CTAs take the pair's operand prefetch (their M-major A's
+        # half rows share lines: ``cute_mma._flat_operand_l2_prefetch_footprint``),
+        # which the 2x2 needs to beat the 2x1 cluster. helion.inductor's
+        # transposed bf16 128x2304x1000, 128x3072x1000 and 128x4096x1000 with
+        # b stored [K, N] (out.T = b.T @ a.T, written column-major), of
+        # cuBLAS: 1.00 / 0.95 / 1.01 on 2x1 clusters, 1.02 / 1.00 / 1.06 on 2x2
+        # (0.88 / 0.91 / 0.94 on 2x2 without the prefetch).
         return None
     if state.matmul_has_leading_passthrough and config.get("tcgen05_cluster_n", 1) == 2:
         # The batched cluster_n=2 kernel pairs N tiles on the scheduler's
@@ -1459,8 +1476,20 @@ def _one_wave_seed_configs(state: CuteTcgen05Config) -> list[Config]:
         ),
         None,
     )
-    if bk is None:
-        return []
+    k_tail = bk is None
+    if k_tail:
+        # A K no K step divides: the 16-bit 128-row CTA pairs (below) run it
+        # as the edge K-tail family, over 64-deep k-blocks whose last one the
+        # loads zero-fill past K; they alone are seeded. The transposed bf16
+        # 512x1280x1000 (K = 15 x 64 + 40):
+        #     for tile_r in hl.tile(1000):  # _BLOCK_SIZE_2 = 64: 16 k-blocks
+        # seeds 40 pairs of 128x128 and 70 of 128x80 at 13 and 16 AB stages,
+        # where before it had no one-wave seed (its full-effort pick ran 0.90
+        # of cuBLAS on GB300: a 128x96 pair grown from them).
+        if dtype_bytes != 2 or not bk_fragment.low <= 64 <= bk_fragment.high:
+            return []
+        bk = 64
+    k_blocks = -(-k // bk)
     rowvec_aux_only = (
         state.aux_kernel_detected and not state.exact_shape_aux_kernel_detected
     )
@@ -1503,7 +1532,7 @@ def _one_wave_seed_configs(state: CuteTcgen05Config) -> list[Config]:
                 state, bm=bm, bn=bn, bk=bk, cluster_m=cluster_m
             )
         )
-        stages = max(1, min(k // bk, fit if fit > 0 else 2))
+        stages = max(1, min(k_blocks, fit if fit > 0 else 2))
         seed_config["tcgen05_ab_stages"] = stages
         if rowvec_aux_only and smem.rowvec_aux_stage_fits(
             state,
@@ -1526,7 +1555,8 @@ def _one_wave_seed_configs(state: CuteTcgen05Config) -> list[Config]:
     for bm in (128, 64):
         for bn in (128, 64, 32):
             if (
-                m % bm
+                k_tail
+                or m % bm
                 or n % bn
                 or not in_range(bm_fragment, bm)
                 or not in_range(bn_fragment, bn)
@@ -1543,14 +1573,18 @@ def _one_wave_seed_configs(state: CuteTcgen05Config) -> list[Config]:
     constraints = state.cluster_m2_search_constraints
     if (
         constraints is not None
-        and constraints.allow_one_wave_tiles
+        and (
+            constraints.allow_one_wave_tiles
+            # (the one-wave family takes whole K; a K tail, the edge family)
+            or (k_tail and constraints.allow_edge_k_tail_family)
+        )
         and repair.cluster_m2_bk_is_valid(bk, constraints)
         and (m % TCGEN05_TWO_CTA_BLOCK_M == 0 or state.output_edge_persistent_admitted)
         and in_range(bm_fragment, TCGEN05_TWO_CTA_BLOCK_M)
     ):
         two_cta: tuple[int, int] | None = None
         for bn in TCGEN05_TWO_CTA_ONE_WAVE_BLOCK_NS:
-            if n % bn or not in_range(bn_fragment, bn):
+            if k_tail or n % bn or not in_range(bn_fragment, bn):
                 continue
             ctas = batch * -(-m // TCGEN05_TWO_CTA_BLOCK_M) * (n // bn) * 2
             if ctas > sm_count:
@@ -1584,25 +1618,35 @@ def _one_wave_seed_configs(state: CuteTcgen05Config) -> list[Config]:
                 # slowly than they arrive (bf16 1000x512x2880, 128x64: 0.86
                 # -> 0.99 of cuBLAS; 1000x1024x1024, 128x128: 0.95 -> 0.96).
                 emit(128, pair128[1], 2, 1, cta_group="two", ab_load_warps=2)
-        elif pair128 is None and n % min(TCGEN05_TWO_CTA_PAIR128_ONE_WAVE_BLOCK_NS):
-            # An N no pair width divides: the aligned-N family's 128-row
-            # pair where it runs one (``dense_aligned_n_block_ms``), at the
-            # searched width whose grid puts the most CTAs on the machine
-            # in one wave, clipping the last N tile, with the plan's deepest
-            # AB ring, and its two-warp twin. cuBLAS's swapped tile for the
-            # transposed bf16 1000x1024x2048 (out.T 1024 x 1000): 72 pairs
-            # of 128x112, fourteen AB stages, 0.96 of cuBLAS against 0.94
-            # for the 64 pairs of 128x128 as written (GB300, in one
-            # process; the search samples no 128-row pair without a seed).
-            aligned = _aligned_n_pair128_one_wave_seed(state)
-            if aligned is not None and (two_cta is None or aligned[0] >= two_cta[0]):
-                seeds.append(Config.from_dict(aligned[1]))
-                if surface.shared_ring_producer_search_enabled(state):
-                    seeds.append(
-                        Config.from_dict(
-                            aligned[1] | {TCGEN05_WARP_SPEC_AB_LOAD_WARPS_KEY: 2}
-                        )
+        # The aligned-N family's 128-row pair where it runs one
+        # (``dense_aligned_n_block_ms``), at the searched width whose grid
+        # puts the most CTAs on the machine in one wave, clipping the last N
+        # tile, with the plan's deepest AB ring, and its two-warp twin:
+        # - over an N no pair width divides. cuBLAS's swapped tile for the
+        #   transposed bf16 1000x1024x2048 (out.T 1024 x 1000): 72 pairs of
+        #   128x112, fourteen AB stages, 0.96 of cuBLAS against 0.94 for the
+        #   64 pairs of 128x128 as written (GB300, in one process; the search
+        #   samples no 128-row pair without a seed);
+        # - beside the plain pair, where its grid puts more CTAs on the
+        #   machine: the transposed bf16 512x1280x1000 (out.T 1280 x 512) runs
+        #   70 pairs of 128x80 (each CTA 64 + 40 operand rows per K step)
+        #   beside the 40 of 128x128 (64 + 64).
+        aligned = _aligned_n_pair128_one_wave_seed(state)
+        if (
+            aligned is not None
+            and (two_cta is None or aligned[0] >= two_cta[0])
+            and (
+                (pair128 is None and n % min(TCGEN05_TWO_CTA_PAIR128_ONE_WAVE_BLOCK_NS))
+                or (pair128 is not None and aligned[0] > pair128[0])
+            )
+        ):
+            seeds.append(Config.from_dict(aligned[1]))
+            if surface.shared_ring_producer_search_enabled(state):
+                seeds.append(
+                    Config.from_dict(
+                        aligned[1] | {TCGEN05_WARP_SPEC_AB_LOAD_WARPS_KEY: 2}
                     )
+                )
     return seeds
 
 
@@ -2568,10 +2612,23 @@ def _plain_edge_pair128_seed_configs(
     state: CuteTcgen05Config, edge_seed: Config
 ) -> list[Config]:
     """128-row CTA-pair twins of the plain edge seed
-    (``plain_pair128_admitted``). bf16 1000^3 runs the pair at 7.5 us
-    against the 256-row edge seed's 11.3 and the flat one-CTA winner's 8.4
-    (burst timer; cuBLAS, a 2x1-cluster 64x112 kernel, 6.5 us burst and
-    7.4 us sustained).
+    (``plain_pair128_admitted``), at each width the family runs
+    (``repair.plain_pair128_widths``). bf16 1000^3 runs the 128x128 pair at
+    7.5 us against the 256-row edge seed's 11.3 and the flat one-CTA
+    winner's 8.4 (burst timer; cuBLAS, a 2x1-cluster 64x112 kernel, 6.5 us
+    burst and 7.4 us sustained).
+
+    The 64-wide pair's grid runs one tile per CTA, so its ring holds the
+    whole K loop where it fits, and it comes with its two-A/B-load-warp twin
+    and its 2x2 cluster (A multicast across the two pairs of a cluster,
+    where its N tiles pair, which the paired pipeline takes): cuBLAS runs
+    bf16 128x4096x1000 with b stored [K, N] on the swapped 64x64 2-CTA tile
+    in 2x2 clusters. GB300, CUDA graphs over cold inputs, of cuBLAS: the 64
+    pairs of 128x64 on 2x1 clusters 0.76, on 2x2 clusters 1.02; bf16
+    128x3072x1000 0.71 / 0.94 (its full-effort search picked the 2x2 at
+    0.935); the one-CTA picks without them 0.78 / 0.72. With the 2x2's
+    operand prefetch (``cute_mma._flat_operand_l2_prefetch_footprint``) the
+    2x2 runs 1.05 and 1.02.
     """
     if not repair.plain_pair128_admitted(state):
         return []
@@ -2581,37 +2638,62 @@ def _plain_edge_pair128_seed_configs(
     seeds: list[Config] = []
     constraints = state.cluster_m2_search_constraints
     assert constraints is not None
-    for bk, stages in ((64, 5), (128, 6)):
-        if not bk_fragment.low <= bk <= bk_fragment.high:
-            continue
-        # The edge family's K-tile rule (a bk the search repair would
-        # rewrite is no seed) and a ring depth that fits the pair.
-        if not repair.cluster_m2_bk_is_valid(bk, constraints):
-            continue
-        fit = smem.max_ab_stages_that_fit(state, bm=128, bn=128, bk=bk, cluster_m=2)
-        if fit <= 0:
-            continue
-        seed_config: dict[str, Any] = dict(edge_seed.config)
-        seed_config.update(
-            {
-                "block_sizes": facts._matmul_seed_block_sizes(
-                    state, bm=128, bn=128, bk=bk
-                ),
-                TCGEN05_CTA_GROUP_CONFIG_KEY: "two",
-                "tcgen05_cluster_m": 2,
-                "tcgen05_cluster_n": 1,
-                "tcgen05_ab_stages": min(stages, fit),
-                "tcgen05_acc_stages": 2,
-                "tcgen05_c_stages": 2,
+    extents = state.matmul_compile_time_static_extents
+    assert extents is not None
+    k = cast("int", extents[2])
+    for bn in repair.plain_pair128_widths(state):
+        for bk, stages in ((64, 5), (128, 6)):
+            if not bk_fragment.low <= bk <= bk_fragment.high:
+                continue
+            # The edge family's K-tile rule (a bk the search repair would
+            # rewrite is no seed) and a ring depth that fits the pair.
+            if not repair.cluster_m2_bk_is_valid(bk, constraints):
+                continue
+            fit = smem.max_ab_stages_that_fit(state, bm=128, bn=bn, bk=bk, cluster_m=2)
+            if fit <= 0:
+                continue
+            if bn < 128:
+                # (the whole K loop in flight, a partial last k-block included)
+                stages = -(-k // bk)
+            seed_config: dict[str, Any] = dict(edge_seed.config)
+            seed_config.update(
+                {
+                    "block_sizes": facts._matmul_seed_block_sizes(
+                        state, bm=128, bn=bn, bk=bk
+                    ),
+                    TCGEN05_CTA_GROUP_CONFIG_KEY: "two",
+                    "tcgen05_cluster_m": 2,
+                    "tcgen05_cluster_n": 1,
+                    "tcgen05_ab_stages": min(stages, fit),
+                    "tcgen05_acc_stages": 2,
+                    "tcgen05_c_stages": 2,
+                }
+            )
+            for key in (
+                TCGEN05_STRATEGY_CONFIG_KEY,
+                TCGEN05_PERSISTENCE_MODEL_CONFIG_KEY,
+                TCGEN05_WARP_SPEC_SCHEDULER_WARPS_KEY,
+            ):
+                seed_config.pop(key, None)
+            seeds.append(Config(**seed_config))
+            if bn == 128:
+                continue
+            two_warps = surface.shared_ring_producer_search_enabled(state)
+            if two_warps:
+                seeds.append(
+                    Config.from_dict(
+                        seed_config | {TCGEN05_WARP_SPEC_AB_LOAD_WARPS_KEY: 2}
+                    )
+                )
+            cn2: dict[str, Any] = seed_config | {
+                "tcgen05_cluster_n": 2,
+                TCGEN05_WARP_SPEC_AB_LOAD_WARPS_KEY: 2 if two_warps else 1,
             }
-        )
-        for key in (
-            TCGEN05_STRATEGY_CONFIG_KEY,
-            TCGEN05_PERSISTENCE_MODEL_CONFIG_KEY,
-            TCGEN05_WARP_SPEC_SCHEDULER_WARPS_KEY,
-        ):
-            seed_config.pop(key, None)
-        seeds.append(Config(**seed_config))
+            if (
+                repair._cluster_n2_n_tile_refusal(state, cn2) is None
+                and _paired_pipeline_parameters(state, cn2) is not None
+            ):
+                seeds.append(Config.from_dict(cn2))
     return seeds
 
 
@@ -2950,8 +3032,14 @@ def autotune_seed_configs(state: CuteTcgen05Config) -> list[Config]:
         seeds.append(plain_clc_seed)
     plain_edge_seed = _plain_edge_seed_config(state)
     if plain_edge_seed is not None:
-        seeds.append(plain_edge_seed)
         seeds.extend(_plain_edge_pair128_seed_configs(state, plain_edge_seed))
+    if plain_edge_seed is not None and repair.plain_pair128_widths(state) != (
+        min(TCGEN05_TWO_CTA_PAIR128_ONE_WAVE_BLOCK_NS),
+    ):
+        # (where the family runs its 64-wide pair alone, the 256x256 tiles
+        # stay out: their grid would idle most SMs, and over an N of one
+        # 64-wide tile leave three quarters of its columns empty)
+        seeds.append(plain_edge_seed)
         # Edge-family 4-CTA multicast variant: with the generalized CLC
         # broadcast this is quack's winning 5000^3 shape (dynamic
         # persistence + cluster 2x2), measured 907 vs the cluster_n=1
@@ -3095,6 +3183,45 @@ def autotune_seed_configs(state: CuteTcgen05Config) -> list[Config]:
         # no seed list grows a twin.
         seeds = [Config.from_dict({**seed.config, "cute_pdl": True}) for seed in seeds]
     return seeds
+
+
+def dense_aligned_n_search_seed_configs(state: CuteTcgen05Config) -> list[Config]:
+    """The 16-bit pair at the clipped width (a partial last N tile) the wave
+    model ranks first on the family's default pair M, where no seed takes it,
+    as a seed of the search's initial population only:
+    ``dense_aligned_n_seed_configs`` (which the autotune-off default picks
+    among) takes a clipped width from a ``TCGEN05_ALIGNED_N_CLIPPED_MIN_GAIN``
+    lead, and the search otherwise reaches it only by sampling. bf16
+    4096x4096x16384 (K-major b) runs 304 pairs of 256x224, four full waves
+    of 76, against 256 of 256x256 (3.4 waves), 12.5% less by the model: two
+    full-effort searches found it once (1.086 of cuBLAS) and once kept the
+    256-wide pairs (0.948).
+
+    So does the best width that tiles N whole where the seeds skip it (an
+    odd multiple of 16: ``facts._dense_aligned_n_skipped_whole_ranking``).
+    bf16 131072x144x288 seeds the clipped 160, whose tiles all store through
+    the SIMT epilogue (0.11 of cuBLAS); one full-effort search reached 144
+    by sampling (0.97 at five stages)."""
+    block_m = facts._dense_aligned_n_block_m(state)
+    if block_m is None or not facts._dense_aligned_n_sixteen_bit(state):
+        return []
+    found: list[Config] = []
+    seeded = facts._dense_aligned_n_clipped_widths(state)
+    for ranking in (
+        facts._dense_aligned_n_clipped_ranking(state, block_m, search=True),
+        facts._dense_aligned_n_skipped_whole_ranking(state, block_m),
+    ):
+        for _cost, width in ranking:
+            if width in seeded:
+                break
+            plans = list(facts._dense_aligned_n_width_plans(state, width, search=True))
+            if plans:
+                found.extend(
+                    Config.from_dict(values | {"tcgen05_ab_stages": plan.max_ab_stages})
+                    for values, plan in plans
+                )
+                break
+    return found
 
 
 def dense_aligned_n_seed_configs(state: CuteTcgen05Config) -> list[Config]:

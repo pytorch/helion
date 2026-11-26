@@ -439,11 +439,13 @@ def allow_cluster_m2_search(
     allow_fp8_small_grid: bool = False,
     allow_one_wave_tiles: bool = False,
     one_wave_only: bool = False,
+    edge_pair128_only: bool = False,
     whole_k: bool = False,
 ) -> None:
     assert static_k > 0, "static_k is required for cluster_m=2 K-cap checks"
     assert max_k_tiles > 0, "cluster_m=2 max K tiles must be positive"
     assert allow_one_wave_tiles or not one_wave_only
+    assert allow_edge_k_tail_family or not edge_pair128_only
     state.cluster_m2_search_constraints = Tcgen05ClusterM2SearchConstraints(
         static_k=static_k,
         max_k_tiles=max_k_tiles,
@@ -451,6 +453,7 @@ def allow_cluster_m2_search(
         allow_fp8_small_grid=allow_fp8_small_grid,
         allow_one_wave_tiles=allow_one_wave_tiles,
         one_wave_only=one_wave_only,
+        edge_pair128_only=edge_pair128_only,
         whole_k=whole_k,
     )
     restrict_cluster_m_search(state, (1, 2))
@@ -1054,10 +1057,12 @@ def narrow_autotune_to_validated_configs(
     allow_persistent_pid_types: bool = False,
     enable_cluster_m2_search: bool = False,
     cluster_m2_static_k: int | None = None,
+    cluster_m2_max_k_tiles: int = TCGEN05_TWO_CTA_MAX_K_TILES,
     allow_cluster_m2_edge_k_tail_family: bool = False,
     allow_cluster_m2_fp8_small_grid: bool = False,
     allow_cluster_m2_one_wave_tiles: bool = False,
     cluster_m2_one_wave_only: bool = False,
+    cluster_m2_edge_pair128_only: bool = False,
     cluster_m2_whole_k: bool = False,
     ab_stages_three_dtype_bytes: int | None = None,
     ab_stages_three_device: torch.device | None = None,
@@ -1108,10 +1113,12 @@ def narrow_autotune_to_validated_configs(
         allow_cluster_m2_search(
             state,
             static_k=cluster_m2_static_k_int,
+            max_k_tiles=cluster_m2_max_k_tiles,
             allow_edge_k_tail_family=allow_cluster_m2_edge_k_tail_family,
             allow_fp8_small_grid=allow_cluster_m2_fp8_small_grid,
             allow_one_wave_tiles=allow_cluster_m2_one_wave_tiles,
             one_wave_only=cluster_m2_one_wave_only,
+            edge_pair128_only=cluster_m2_edge_pair128_only,
             whole_k=cluster_m2_whole_k,
         )
     else:

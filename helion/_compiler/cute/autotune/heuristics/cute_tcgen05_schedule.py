@@ -78,5 +78,6 @@ class CuteTcgen05ScheduleHeuristic(AutotunerHeuristic):
             *seeds.full_tile_schedule_seed_configs(state),
             *seeds.n_edge_cluster_schedule_seed_configs(state),
             *seeds.dense_aligned_n_seed_configs(state),
+            *seeds.dense_aligned_n_search_seed_configs(state),
             *seeds.one_cta_pipeline_seed_configs(state),
         ]
