@@ -28,6 +28,30 @@ python benchmarks/run.py --metrics speedup --kernel <kernel_name>
 
 CUDA graph benchmarking reduces kernel launch overhead and provides timing that better represents deployment scenarios where cuda graph is used.
 
+### Dist-MoE routing on CuTe
+
+[The Helion kernel](cute/dist_moe/layout_kernel.py) builds the expert layout
+for eight experts and two ranks, with each of 1,024 tokens per rank routed to
+two experts. It has a fixed configuration. The benchmark compares checking
+peer readiness, total receive capacity, and per-expert row capacity inside
+the kernel with returning the status and dispatching `torch._assert_async`
+separately. Both variants run as CUDA graphs.
+
+Run from the root of the checkout you want to measure:
+
+```bash
+PYTHONPATH=. python benchmarks/cute/dist_moe/bench.py --check-only
+PYTHONPATH=. python benchmarks/cute/dist_moe/bench.py
+```
+
+Select one GPU with `CUDA_VISIBLE_DEVICES`. The driver runs each logical rank
+on that GPU and checks all six outputs against a CPU reference. It reports
+microseconds per replay for balanced and concentrated routing: CUDA events
+bracket a batch of graph launches issued from Python, so gaps between launches
+count toward this measurement. It measures the layout and its check, without
+the projections or distributed forward. The original measurements used a
+GB300 (SM103a) and CuTe DSL 4.8.1.
+
 ### TPU / Pallas Benchmarking
 
 `benchmarks/run_tpu.py` runs registered Helion examples on TPU with the Pallas
