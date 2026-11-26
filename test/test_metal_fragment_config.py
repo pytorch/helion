@@ -237,7 +237,9 @@ class TestFragmentConfig(unittest.TestCase):
         from fragment seeds beside the MPP default, which leaves the key out,
         and ``metal_tabulate_max_entries`` at the caps that admit the kernel's
         tables, on one SIMD group and on four splitting the K loop
-        (``num_warps``, which the search keeps); a matmul the fragment run
+        (``num_warps``, which the search keeps), and on four splitting its
+        rows (``metal_fragment_row_split``; eight don't take whole fragments
+        of its 48); a matmul the fragment run
         can't lower searches MPP and the scalar contraction, without tables,
         and a kernel with no matmul has neither field."""
         spec = nvfp4_rows.bind(nvfp4_cpu_args()).config_spec
@@ -258,18 +260,28 @@ class TestFragmentConfig(unittest.TestCase):
                     c.config.get("metal_tabulate_max_entries"),
                     c.config.get("range_num_stages"),
                     c.config.get("num_warps"),
+                    c.config.get("metal_fragment_row_split"),
                 )
                 for c in spec.autotune_seed_configs()
             ],
             [
-                (*knobs, num_warps)
-                for num_warps in (1, 4)
-                for knobs in (
-                    ("fragment", None, None),
-                    ("fragment", None, [2]),
-                    ("fragment", 16, None),
-                    ("fragment", 16, [2]),
-                )
+                # Each lowering's strongest guess first (a budget cut keeps
+                # them): the largest row split that takes whole fragments of
+                # N's 48 rows (the group is transposed, so its rows are N's),
+                # its activation staged and loaded a tile ahead, MPP's
+                # default, then the other seeds.
+                ("fragment", None, [2], 1, 4),
+                (None, None, None, 4, None),
+                *(
+                    (*knobs, num_warps, None)
+                    for num_warps in (1, 4)
+                    for knobs in (
+                        ("fragment", None, None),
+                        ("fragment", None, [2]),
+                        ("fragment", 16, None),
+                        ("fragment", 16, [2]),
+                    )
+                ),
             ],
         )
         # The search keeps a fragment config's SIMD groups, which split its
@@ -297,29 +309,46 @@ class TestFragmentConfig(unittest.TestCase):
                     range_num_stages=[3],
                 )
             )
-        # Only a K loop that can load ahead has a slot (``loads_ahead``): known
-        # bounds it runs between.  One from 16 has one and loads ahead under
-        # it; one from a runtime offset, or to an end known only at runtime,
-        # has none, so the search never asks it for 2 stages.
+        # Only a K loop that can load ahead has a slot: known bounds it runs
+        # between (``loads_ahead``), or a view it can stage, whose tile copies
+        # load ahead between any bounds (``pipeline_tile_copies``).  One from
+        # 16 has one and loads ahead under it.  One from a runtime offset has
+        # one through its views: under 2 stages it pipelines its tile copies
+        # when it stages them, and is refused (its element loads need known
+        # bounds) when it doesn't.  A dynamic kernel whose operands are
+        # computed has none, so the search never asks it for 2 stages.
         from_16 = k_from_16.bind((torch.randn(16, 64), torch.randn(64, 16)))
         self.assertEqual(len(from_16.config_spec.range_num_stages), 1)
         code = from_16.to_code(fragment_config([16, 16, 16], range_num_stages=[2]))
         self.assertRegex(code, r"k_step=\('offset_\d+', 16\)")
         x = torch.randn(8, 64, dtype=torch.float16)
         y = torch.randn(64, 16, dtype=torch.float16)
+        from_offset = k_from_offset.bind((x, y, 16))
+        self.assertEqual(len(from_offset.config_spec.range_num_stages), 1)
+        piped = render_msl(
+            k_from_offset,
+            (x, y, 16),
+            fragment_config(
+                [16, 16, 16], range_num_stages=[2], metal_fragment_stage=True
+            ),
+        )
+        self.assertIn("_pipe0_frag_tile", piped)
+        with self.assertRaisesRegex(
+            exc.BackendUnsupported, "range_num_stages=2 on a K loop without known"
+        ):
+            from_offset.to_code(fragment_config([16, 16, 16], range_num_stages=[2]))
         dynamic = helion.kernel(nvfp4_rows.fn, backend="metal", static_shapes=False)
-        for bound in (k_from_offset.bind((x, y, 16)), dynamic.bind(nvfp4_cpu_args())):
-            with self.subTest(kernel=bound.kernel.name):
-                self.assertEqual(len(bound.config_spec.range_num_stages), 0)
-                # A user's fragment config asking for stages there is
-                # refused; the search's repair drops them.
-                staged = fragment_config([16, 16, 16], range_num_stages=[2])
-                with self.assertRaisesRegex(
-                    exc.InvalidConfig, "one entry per Metal fragment K loop"
-                ):
-                    bound.config_spec.normalize(staged)
-                bound.config_spec.normalize(staged, _fix_invalid=True)
-                self.assertNotIn("range_num_stages", staged.config)
+        bound = dynamic.bind(nvfp4_cpu_args())
+        self.assertEqual(len(bound.config_spec.range_num_stages), 0)
+        # A user's fragment config asking for stages there is refused; the
+        # search's repair drops them.
+        staged = fragment_config([16, 16, 16], range_num_stages=[2])
+        with self.assertRaisesRegex(
+            exc.InvalidConfig, "one entry per Metal fragment K loop"
+        ):
+            bound.config_spec.normalize(staged)
+        bound.config_spec.normalize(staged, _fix_invalid=True)
+        self.assertNotIn("range_num_stages", staged.config)
         # An MPP config keeps loading with the range_num_stages a config
         # carried before Metal read the key (a Triton config's), as zeros.
         mpp = helion.Config(block_sizes=[16, 16, 64], range_num_stages=[3, 4])
@@ -600,6 +629,76 @@ class TestFragmentConfig(unittest.TestCase):
         args = (x, torch.randn(3, 32, 24, dtype=torch.float16))
         with self.assertRaises(exc.BackendUnsupported):
             render_msl(batched_k_loop, args, fragment_config([2, 16, 16, 16]))
+
+    def test_few_row_seeds(self) -> None:
+        """Row splits fit the rows an op over the row block holds: the
+        block cut to the loop's extent (``op_dim``), not the block.  At 16
+        rows no split of 4 or 8 takes whole fragments, so the featured seed
+        is one SIMD group's, staged, and the search's repair lowers a split
+        of 8 to the 2 the cut rows take; at 64 rows the seeds split 8 and 4.
+        Every seed compiles."""
+        h = torch.float16
+        y, bias = torch.randn(64, 64, dtype=h), torch.randn(64)
+        for m, splits in ((16, [None]), (64, [8, 4])):
+            with self.subTest(m=m):
+                bound = views_epilogue.bind((torch.randn(m, 64, dtype=h), y, bias))
+                spec = bound.config_spec
+                self.assertEqual(kernel_facts(spec).fragment_row_extent, m)
+                gen = ConfigGeneration(spec)
+                seeds = [
+                    c
+                    for _, c in gen.user_seed_flat_config_pairs(
+                        spec.autotune_seed_configs()
+                    )
+                ]
+                featured = [
+                    c for c in seeds if c.config.get("metal_fragment_stage") is True
+                ]
+                self.assertEqual(
+                    [c.config.get("metal_fragment_row_split") for c in featured],
+                    splits,
+                )
+                for config in seeds:
+                    bound.to_code(config)
+                repaired = fragment_config([64, 16, 16], metal_fragment_row_split=8)
+                spec.normalize(repaired, _fix_invalid=True)
+                self.assertEqual(
+                    repaired.config.get("metal_fragment_row_split"),
+                    2 if m == 16 else 8,
+                )
+
+    def test_runtime_bound_stages(self) -> None:
+        """A K loop from a runtime offset loads a tile ahead only through
+        its tile copies, under ``metal_fragment_stage``: the search's repair
+        drops a config's 2 stages there when it stages nothing, and none of
+        its drawn configs is refused for them.  A loop with a side that
+        loads per lane at any config (an lhs over one row, which a tile
+        can't hold) gets no slot."""
+        random.seed(0)
+        h = torch.float16
+        y = torch.randn(64, 16, dtype=h)
+        bound = k_from_offset.bind((torch.randn(8, 64, dtype=h), y, 16))
+        spec = bound.config_spec
+        self.assertEqual(len(spec.range_num_stages), 1)
+        for stage, expected in ((False, [0]), (True, [2])):
+            config = fragment_config(
+                [16, 16, 16], range_num_stages=[2], metal_fragment_stage=stage
+            )
+            spec.normalize(config, _fix_invalid=True)
+            self.assertEqual(config["range_num_stages"], expected)
+            bound.to_code(config)
+        gen = ConfigGeneration(spec)
+        refused = []
+        for flat in gen.random_population_flat(16):
+            config = gen.unflatten(list(flat))
+            try:
+                bound.to_code(config)
+            except exc.BackendUnsupported as e:
+                if "without known bounds" in str(e):
+                    refused.append(config)
+        self.assertEqual(refused, [])
+        one_row = k_from_offset.bind((torch.randn(1, 64, dtype=h), y, 16))
+        self.assertEqual(len(one_row.config_spec.range_num_stages), 0)
 
     def test_whole_k_extent(self) -> None:
         """A ':' K is one fragment K tile, which no config changes: past the

@@ -127,6 +127,7 @@ from .matmul_ops import scalar_contraction
 from .msl_expr import PURE_CALLS
 from .msl_reduction import REDUCTION_NAMESPACE
 from .reduction import alloc_threadgroup_buffer
+from .search_surface import op_dim
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -191,6 +192,10 @@ HOLD_LOOP = "_helion_mpp_hold_loop"
 #: Metal element type (a line's, a held value's), from its FX node's dtype:
 #: ``_METAL_SLOT_TYPE_<name> = 'bool'`` (``fragment_lines.codegen_slot``).
 SLOT_TYPE_GLOBAL_PREFIX = "_METAL_SLOT_TYPE_"
+#: A fragment operand built before its loop (``fragment_mma``'s
+#: ``codegen_fragment_hoist``): its marker and the loop that builds it.
+FRAG_HOIST = "_helion_mpp_frag_hoist"
+FRAG_HOIST_LOOP = "_helion_mpp_frag_hoist_loop"
 _ELEMENT_LOOPS = (
     ELEMENTS,
     FRAG_RUN,
@@ -203,6 +208,7 @@ _ELEMENT_LOOPS = (
     LINES,
     LINE_RED,
     HOLD_LOOP,
+    FRAG_HOIST_LOOP,
 )
 BIND = "_helion_mpp_bind"
 STAGE = "_helion_mpp_stage"
@@ -415,7 +421,10 @@ class _Operand:
     #: (``mpp_registers``).
     registers: bool = False
     #: A computed operand that widens a 16-bit device view (``x.to(float32)``):
-    #: the view, which a register run may read instead (``mpp_registers``).
+    #: the view, which a register run may read instead (``mpp_registers``)
+    #: and a fragment run may copy, as its 16-bit elements, into a
+    #: threadgroup tile whose fragment loads widen them
+    #: (``fragment_mma.can_stage``).
     widened: View | None = None
 
     @property
@@ -569,6 +578,14 @@ class MppPlan:
     #: Each ``_frag_hold`` node, an element value computed once into a
     #: fragment group's registers (``fragment_lines``), to its group.
     holds: dict[Node, MppGroup] = dataclasses.field(default_factory=dict)
+    #: The SIMD groups that split each fragment group's grid rows
+    #: (``metal_fragment_row_split``, ``fragment_mma.row_split_refusal``):
+    #: each runs the tiles, as with a K split, on its share of the rows.
+    row_split: int = 1
+    #: Whether fragment runs load their device-view operands from
+    #: threadgroup tiles (``metal_fragment_stage``,
+    #: ``fragment_mma.tile_side``).
+    stage: bool = False
 
     def groups(self) -> list[MppGroup]:
         """Every group that holds a cooperative tensor: each matmul's, and
@@ -1125,7 +1142,7 @@ def plan_mpp_matmuls(
     when the planner takes every one of them (:func:`_takes_dots`), of the
     kernel's live graphs as a cooperative group, or raise ``BackendUnsupported``.
     ``threaded`` holds the blocks the config's tile strategies spread over more
-    than one thread; ``fragment`` (``fragment_mma.FRAGMENT_LOWERING`` under
+    than one thread; ``fragment`` (a ``fragment_mma.FragmentLowering`` under
     the config's ``metal_matmul="fragment"``) lowers every group on
     simdgroup-matrix fragments, or raises ``BackendUnsupported`` for one that
     can't be; ``widen_k`` says of a K block whether the config's tiles of
@@ -1706,7 +1723,7 @@ def _plan_update(group: MppGroup, graphs: Graphs, defer_vecs: bool = False) -> N
             if not isinstance(val, torch.Tensor):
                 raise metal_unsupported(
                     f"an update of an MPP accumulator reads {a.name}, a scalar "
-                    "that isn't a tensor, such as a float kernel argument"
+                    "that isn't a tensor and changes between iterations"
                 )
             if not _mn_dims(group, val):
                 raise metal_unsupported(
@@ -2638,7 +2655,9 @@ class Recomputable:
         val = node.meta.get("val")
         if isinstance(val, torch.Tensor) and val.ndim == 0:
             return True
-        if isinstance(val, (torch.SymInt, int, float)):
+        if isinstance(val, (torch.SymInt, int, float)) or _launch_constant(val):
+            # A SymFloat of host values is a float kernel argument (or math
+            # on them): uniform, as a SymInt is.
             return True
         if node not in self.memo:
             self.memo[node] = False
@@ -3184,9 +3203,11 @@ def _finalize(group: MppGroup, plan: MppPlan, graphs: Graphs) -> None:
     block (``positional_rebind``)."""
     # After ``_order_memory``, so an operand it demotes to staged is checked.
     # A fragment group's operands never reach threadgroup memory: each lane
-    # computes its own elements at the op.
-    if plan.fragment is None and group.product is None:
+    # computes its own elements at the op, or, hoisted (the config's
+    # ``metal_fragment_hoist``), builds them into fragments before the loop.
+    if group.product is None and (plan.fragment is None or plan.fragment.hoist):
         _hoist_invariant(group, plan, graphs)
+    if plan.fragment is None and group.product is None:
         _stage_in_float(group, plan, graphs)
     coop = group.cur | group.derived
     # The update's nodes read the carry where the update's element loop
@@ -3548,10 +3569,15 @@ def _(state: CodegenState) -> ast.AST:
 
 @_decorators.codegen(_mpp_hoist, "metal")
 def _(state: CodegenState) -> ast.AST:
-    """Stage a hoisted operand into its tile, before its loop."""
+    """Stage a hoisted operand into its tile, before its loop; a fragment
+    group's builds it into fragments there
+    (``FragmentLowering.codegen_hoist``)."""
     node = state.fx_node
     assert node is not None
-    group, side = current_plan().by_hoist[node]
+    plan = current_plan()
+    group, side = plan.by_hoist[node]
+    if plan.fragment is not None:
+        return plan.fragment.codegen_hoist(state, group, side)
     operand, blocks, k_pos = group_sides(group)[side]
     tile = static_tile(state.codegen, blocks)
     tile[k_pos] *= group.k_factor
@@ -3737,12 +3763,9 @@ def op_dims(group: MppGroup, block_m: int, block_n: int) -> tuple[int, int]:
     dims = []
     for block, size in ((group.m_block, block_m), (group.n_block, block_n)):
         extent = env.block_sizes[block].size
-        if size == 1:
-            size = 8
-        elif isinstance(extent, int) and not mats:
-            # A zero-trip loop still gets an op MPP accepts.
-            size = min(size, -(-max(extent, 1) // 8) * 8)
-        dims.append(size)
+        dims.append(
+            op_dim(size, extent if isinstance(extent, int) and not mats else None)
+        )
     m, n = dims
     if m % 16 and n % 16 and current_plan().fragment is None:
         if m != block_m:
@@ -4987,6 +5010,45 @@ def elementize(
         assert isinstance(row_binds, ast.List)
         return ast.literal_eval(rows), ast.literal_eval(block_m), row_binds.elts
 
+    def frag_hoist(value: ast.Call, seen: list[ast.stmt]) -> ast.For:
+        """The loop that builds a hoisted fragment operand before its loop,
+        each element re-running the hoisted value's statements under the
+        bindings of the thread that holds it, and 0 past a K tail's live
+        length, as a run's computed operand (``fragment_mma.fragment_run``)."""
+        src, *form, k_live, binds_arg = value.args
+        assert isinstance(src, ast.Name) and isinstance(binds_arg, ast.List)
+        binds: dict[str, ast.expr] = {}
+        for b in binds_arg.elts:
+            assert isinstance(b, ast.Tuple)
+            binds[_bind_name(b)] = b.elts[1]
+        element: ast.expr = ast.Name(src.id, ast.Load())
+        if not (isinstance(k_live, ast.Constant) and k_live.value is None):
+            kind = ast.literal_eval(form[-1])
+            zero = (
+                ast.Constant(0.0)
+                if kind == "float"
+                else ast.Call(
+                    ast.Name("static_cast", ast.Load()),
+                    [ast.Name(kind, ast.Load()), ast.Constant(0.0)],
+                    [],
+                )
+            )
+            element = ast.IfExp(
+                ast.Compare(ast.Name("_e_k", ast.Load()), [ast.Lt()], [k_live]),
+                element,
+                zero,
+            )
+        put = ast.Expr(ast.Call(ast.Name(PUT, ast.Load()), [element], []))
+        head, _ = rerun(binds, {src.id}, [src], seen)
+        loop = ast.For(
+            target=ast.Name("_it", ast.Store()),
+            iter=ast.Call(ast.Name(FRAG_HOIST_LOOP, ast.Load()), form, []),
+            body=[*head, put],
+            orelse=[],
+        )
+        ast.fix_missing_locations(loop)
+        return loop
+
     def hold_loop(t: str, value: ast.Call, seen: list[ast.stmt]) -> ast.For:
         """The loop that writes a held value at each element a lane holds of
         its root, re-running what it is computed from; its name then reads
@@ -5111,6 +5173,9 @@ def elementize(
             if t is not None and isinstance(value, ast.Call):
                 if call_name(value) == HOLD:
                     out.append(hold_loop(t, value, seen))
+                    continue
+                if call_name(value) == FRAG_HOIST:
+                    out.append(frag_hoist(value, seen))
                     continue
                 if call_name(value) == LINE_FILL:
                     lines[t] = line_layout(value)

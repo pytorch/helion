@@ -150,10 +150,13 @@ class _Rows:
         self.batch = {g.batch_block for g in groups} - {None}
         self.written = written
 
-    def over_rows(self, value: object) -> bool:
+    def over_rows(self, value: object, predicate: bool = False) -> bool:
         """Whether ``value`` is a float32 tensor over the block (and batch
-        and size-1 dims), which a line can hold."""
-        if not isinstance(value, torch.Tensor) or value.dtype != torch.float32:
+        and size-1 dims), which a line can hold; with ``predicate`` a bool
+        one too (a line op's mask, such as ``m == -inf``), which a line
+        loop's ``bool`` slots hold (:func:`emit_line_loop`)."""
+        dtypes = (torch.float32, torch.bool) if predicate else (torch.float32,)
+        if not isinstance(value, torch.Tensor) or value.dtype not in dtypes:
             return False
         return self.over_block(value.size())
 
@@ -358,7 +361,7 @@ class _LinePlanner:
     def _line_op(self, node: Node) -> bool:
         return (
             (_pointwise(node) or node.target in _LINE_MOVES)
-            and self.rows.over_rows(node.meta.get("val"))
+            and self.rows.over_rows(node.meta.get("val"), predicate=True)
             and all(map(self._input_ok, node.all_input_nodes))
         )
 
@@ -803,7 +806,7 @@ def emit_line_loop(
     assert isinstance(stmt.iter, ast.Call)
     rows, block_m, targets, is_store = (ast.literal_eval(a) for a in stmt.iter.args)
     writer = "_fn == 0"
-    if 8 * rows > block_m:
+    if 8 * rows * state.row_split > block_m:
         writer += f" && _e_m < {block_m}"
     *_, last = stmt.body
     for t in targets:
@@ -822,7 +825,7 @@ def emit_line_loop(
         lines = [
             f"{pad}{{",
             f"{inner}constexpr short _ri = {r};",
-            f"{inner}int _e_m = 8 * _ri + _fm;",
+            f"{inner}int _e_m = 8 * _ri + _fm{state.row_base};",
         ]
         subs = line_subs(state, "_ri")
         *body, last = stmt.body
@@ -888,7 +891,7 @@ def emit_line_reduce(
                 lines += [
                     f"{inner}{{",
                     f"{inner}    constexpr short _fi = {fi};",
-                    f"{inner}    int _e_m = 8 * {r} + _fm;",
+                    f"{inner}    int _e_m = 8 * {r} + _fm{state.row_base};",
                     f"{inner}    int _e_n = 8 * {c} + _fn + {e};",
                 ]
                 body: list[str] = []

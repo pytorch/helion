@@ -342,6 +342,7 @@ class TestFragmentSplit(TestCase):
                     {
                         c.config["num_warps"]
                         for c in bound.config_spec.autotune_seed_configs()
+                        if c.config.get("metal_matmul") == "fragment"
                     },
                     {1},
                 )

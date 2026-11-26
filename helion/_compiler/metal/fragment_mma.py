@@ -55,8 +55,8 @@ run the same code beside it, so every barrier is reached by all of them.
 from __future__ import annotations
 
 import ast
-from collections.abc import Callable
 import copy
+import dataclasses
 from fractions import Fraction
 from typing import TYPE_CHECKING
 from typing import NoReturn
@@ -65,10 +65,13 @@ from typing import cast
 import sympy
 import torch
 
+from ...language.creation_ops import full
+from ...language.matmul_ops import dot
 from ...language.memory_ops import load
 from ..ast_extension import expr_from_string
 from ..compile_environment import CompileEnvironment
 from ..compile_environment import _to_sympy
+from ..inductor_lowering import ReductionLowering
 from ._constants import MAX_THREADGROUP_MEMORY_BYTES
 from ._constants import SIMD_WIDTH
 from .affine_fold import Affine
@@ -76,14 +79,17 @@ from .affine_fold import Fact
 from .affine_fold import evaluate
 from .affine_fold import render
 from .backend import static_extent
+from .free_arange import live_graphs
 from .lane_fold import load_mask_other
 from .lane_fold import tl_load
 from .mpp_matmul import ACC_SEED
 from .mpp_matmul import FRAG_A
 from .mpp_matmul import FRAG_B
+from .mpp_matmul import FRAG_HOIST
 from .mpp_matmul import FRAG_RUN
 from .mpp_matmul import PUT
 from .mpp_matmul import RUN
+from .mpp_matmul import WRITES
 from .mpp_matmul import Dim
 from .mpp_matmul import Graphs
 from .mpp_matmul import MppGroup
@@ -118,13 +124,17 @@ from .operand_elements import static_int
 from .operand_elements import static_loop
 from .operand_elements import tile_mask
 from .operand_elements import tiles_in_range
+from .reduction import alloc_threadgroup_buffer
 from .search_surface import fragment_stages
 from .search_surface import metal_tabulate_max_entries
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
     from collections.abc import Mapping
 
+    from ..device_ir import GraphInfo
     from ..generate_ast import GenerateAST
+    from ..inductor_lowering import CodegenState
     from .msl_ast_walker import EmitState
 
 
@@ -138,6 +148,15 @@ LANE_PREAMBLE = (
 )
 #: What the fold (``affine_fold``) knows of ``_fm`` and ``_fn``.
 _LANE_FACTS = {"_fm": Fact(1, 0, 7), "_fn": Fact(2, 0, 6)}
+
+
+def lane_facts(state: EmitState) -> dict[str, Fact]:
+    """What the fold knows of a lane's names: ``_fm`` and ``_fn``, and its
+    SIMD group's index when SIMD groups split the fragment rows."""
+    facts = dict(_LANE_FACTS)
+    if state.row_split > 1:
+        facts[SIMDGROUP] = Fact(1, 0, state.row_split - 1)
+    return facts
 
 
 def check_fragment_group(group: MppGroup, plan: MppPlan, graphs: Graphs) -> None:
@@ -248,6 +267,64 @@ def _chain_refusal(group: MppGroup, side: int, plan: MppPlan) -> str | None:
     return None
 
 
+def row_split_refusal(plan: MppPlan, graphs: list[GraphInfo]) -> str | None:
+    """Why the SIMD groups of a threadgroup can't split the grid rows of
+    the plan's fragment groups (``metal_fragment_row_split``), or None when
+    they can.  The SIMD groups stack along z as a K split's do, each
+    running the kernel's one-SIMD-group code, on its own rows of every
+    fragment grid (``EmitState.row_base``): its element loops visit, and
+    its row reductions fold, those rows only, and it re-runs every Scalar
+    statement, which is why the kernel may write only from those loops.  So
+    the groups' grid rows lie over one block (M, or N for a group
+    transposed for its computed rhs), and no operand is built from another
+    group's rows (a chained rhs takes the source's rows as its K); the
+    kernel writes memory only from element loops, at their rows, and reads
+    no tensor it writes; and nothing passes through threadgroup memory,
+    which every SIMD group would write: no reduction but the row
+    reductions of fragment results, no ``hl.dot`` the runs don't take, no
+    seed tile or update vector.  SIMD groups splitting the
+    K loops (``split_refusal``) are a different launch."""
+    groups = list(plan.by_matmul.values())
+    if len({g.n_block if transposed(g) else g.m_block for g in groups}) > 1:
+        return "the fragment groups' rows lie over different blocks"
+    if any(g.rhs.elements is not None and not transposed(g) for g in groups):
+        return "an operand is built from another matmul's rows"
+    # A fragment group's ``stage_uses`` are chains (``check_fragment_group``),
+    # which read registers.
+    if any(g.vecs for g in groups) or any(
+        g.seed is not None and g.seed.target is not full for g in groups
+    ):
+        return "a fragment group stages values in threadgroup memory"
+    live = live_graphs(graphs)
+    nodes = [node for info in live for node in info.graph.nodes]
+    if any(
+        isinstance(node.meta.get("lowering"), ReductionLowering)
+        and node not in plan.line_reds
+        for node in nodes
+    ):
+        return "the kernel has a reduction its fragment rows don't hold"
+    if any(node.target is dot and node not in plan.by_matmul for node in nodes):
+        return (
+            "the kernel has an hl.dot the fragment runs don't take, whose "
+            "contraction reduces across threads"
+        )
+    element_stores = plan.line_stores.union(*(g.stores for g in groups))
+    if any(node.target in WRITES and node not in element_stores for node in nodes):
+        return "the kernel writes memory outside a fragment element loop"
+    if any(node.target is load and storage_key(node) in plan.written for node in nodes):
+        return "the kernel reads a tensor it writes"
+    return None
+
+
+def row_block(plan: MppPlan) -> int:
+    """The block the plan's fragment grid rows lie over, which
+    ``row_split_refusal`` admits only when it is one."""
+    (block,) = {
+        g.n_block if transposed(g) else g.m_block for g in plan.by_matmul.values()
+    }
+    return block
+
+
 def transposed(group: MppGroup) -> bool:
     """Whether the group computes ``C^T = B^T A^T``: only its rhs is computed
     by each lane at its elements, which then takes the MMA's A, whose lane
@@ -296,17 +373,26 @@ def _whole_k_tile(block: int) -> int | None:
 def fragment_grid(group: MppGroup, m: int, n: int, k: int) -> tuple[int, int, int]:
     """The accumulator's ``(rows, cols, transposed)``: its 8x8 fragments
     over the op's M and N (N and M when transposed), for an op of ``m`` x
-    ``n`` over a K tile of ``k``.  A wide tile keeps many fragments live in
-    each lane; that is slower, not wrong, and the autotuner times it."""
+    ``n`` over a K tile of ``k``, the rows those of one SIMD group's share
+    when SIMD groups split them (``MppPlan.row_split``).  A wide tile keeps
+    many fragments live in each lane; that is slower, not wrong, and the
+    autotuner times it."""
     if m % 8 or n % 8:
         raise metal_unsupported(
             f"a fragment matmul tile {m}x{n}x{k}: M and N must be multiples of 8"
         )
     if (why := k_tile_refusal(k)) is not None:
         raise metal_unsupported(f"{why}; use a smaller K block")
-    if transposed(group):
-        return n // 8, m // 8, 1
-    return m // 8, n // 8, 0
+    rows, cols, flipped = (
+        (n // 8, m // 8, 1) if transposed(group) else (m // 8, n // 8, 0)
+    )
+    split = current_plan().row_split
+    if rows % split:
+        raise metal_unsupported(
+            f"a fragment matmul tile of {rows * 8} rows split over {split} SIMD "
+            "groups (metal_fragment_row_split): each takes whole 8-row fragments"
+        )
+    return rows // split, cols, flipped
 
 
 #: How a view's element load treats a dim (:func:`_dim_mode`).
@@ -390,13 +476,17 @@ def codegen_fragment_run(
     """``_helion_mpp_run(acc, gid, lhs..., rhs..., ..., fragment=[lhs, rhs])``
     of a fragment group: each operand as a view's nine run arguments
     (``view_args``) or the name of its value cast to the operand's dtype,
-    and per operand ``(computed, view dims masked, bindings, wide, past)``,
-    where the bindings make a lane act as the thread holding the element at
+    and per operand ``(computed, view dims masked, bindings, wide, past,
+    chain, hoisted, tile)``, where the bindings make a lane act as the
+    thread holding the element at
     ``(_e_m or _e_n, _e_k)`` of a computed operand, ``wide`` marks a view
     whose indices may pass 2**31 and ``past`` names a computed operand's M
     or N tile's mask, index and offset when the mask is live
     (:func:`tile_mask`), for its loads past the tile's loop end
-    (:func:`clamp_past_end`).  ``steps`` is the K tile's MMA steps,
+    (:func:`clamp_past_end`); ``chain`` names the result a chained operand
+    is built from (:func:`_chain_name`), ``hoisted`` the fragments a hoisted
+    one was built into (:func:`codegen_fragment_hoist`) and ``tile`` the
+    layout of a tile side's copy (:data:`TILE_COPY`).  ``steps`` is the K tile's MMA steps,
     ``k_live`` its live length, which masks a computed operand's K tail
     (None when every tile is whole), ``facts`` the tile offsets' ``(offset,
     multiple, least, most)`` (:func:`offset_fact`), over whose multiple and
@@ -419,9 +509,15 @@ def codegen_fragment_run(
         zip(group_sides(group), values, ("_e_m", "_e_n"), strict=True)
     ):
         view = operand.view
+        if view is None and tile_side(group, side):
+            # A widened view: copied into its tile like a view, as its 16-bit
+            # elements, which the fragment loads widen (``_tile_loads``).
+            view = operand.widened
         chain = None
         if operand.elements is not None:
             chain = _chain_name(cg, group, side, plan, op, k)
+        hoisted = None if operand.hoist is None else hoist_name(group, side)
+        tile = None
         if view is None:
             assert isinstance(value, ast.AST)
             name = cg.lift(backend.cast_ast(value, operand.dtype), prefix="_mpp_fv")
@@ -447,18 +543,30 @@ def codegen_fragment_run(
             binds = []
             outer = "".join(f"({x}, {s}, {st}, {a}), " for x, s, st, a in view_outer)
             past = None
+            if tile_side(group, side):
+                shape = (op[group.m_block], k) if side == 0 else (k, op[group.n_block])
+                tile_outer, pitch, vector = _tile_layout(view, shape, masks)
+                buf = alloc_threadgroup_buffer(
+                    backend.dtype_str(view.tensor.dtype),
+                    shape[tile_outer] * pitch,
+                    prefix=TILE_PREFIX,
+                )
+                size = _TILE_TYPES[view.tensor.dtype]
+                # A widened view's tile holds the view's type; each lane
+                # widens its fragment elements as it loads them.
+                widen = (
+                    backend.dtype_str(view.tensor.dtype)
+                    if view.tensor.dtype != operand.dtype
+                    else None
+                )
+                tile = (buf, shape, tile_outer, pitch, vector, size, widen)
         parts += op_parts
         outers.append(f"[{outer}]")
         sides.append(
             f"({int(operand.staged)}, {masks}, [{', '.join(binds)}], {wide}, "
-            f"{past!r}, {chain!r})"
+            f"{past!r}, {chain!r}, {hoisted!r}, {tile!r})"
         )
-    info = cg.active_device_loops[group.k_block][-1].block_id_to_info[group.k_block]
-    k_live = "None"
-    if (group.lhs.staged or group.rhs.staged) and not tiles_in_range(
-        cg, group.k_block, k, static_int(info.end_expr)
-    ):
-        k_live = f"{info.end_var_name} - {cg.offset_var(group.k_block)}"
+    k_live = _k_live(cg, group, k) if group.lhs.staged or group.rhs.staged else "None"
     anchor_list = ", ".join(f"({p}, {a})" for p, a in anchors)
     facts = [
         fact
@@ -476,7 +584,16 @@ def codegen_fragment_run(
     # checks the loop codegen sees.
     k_step = None
     k_tiles = None
-    if stages >= 2:
+    # Tile sides load a tile ahead through their copies, between any bounds
+    # (``pipeline_tile_copies``); the other sides' element loads need known
+    # ones, unless no side loads per lane (chained or hoisted sides).
+    tiles = [tile_side(group, side) for side in (0, 1)]
+    pipe = stages >= 2 and any(tiles)
+    per_lane = any(
+        not tiles[side] and operand.elements is None and operand.hoist is None
+        for side, operand in enumerate((group.lhs, group.rhs))
+    )
+    if stages >= 2 and (per_lane or not pipe):
         k_fact = offset_fact(cg, group.k_block)
         k_loop = static_loop(cg, group.k_block)
         end = None if k_loop is None else static_int(_specialized(k_loop[0].end_expr))
@@ -487,20 +604,148 @@ def codegen_fragment_run(
         assert end is not None  # loads_ahead admits known bounds only
         k_step = (k_fact[0], k_loop[2])
         k_tiles = -(-(end - k_loop[1]) // k_loop[2])
-    # A chained side reads its source's fragments a K step at a time, in
-    # order; its run's operand fragments hold the operands' own type.
-    natural = any(o.elements is not None for o in (group.lhs, group.rhs))
-    element = "float"
-    if natural and group.lhs.dtype in (torch.float16, torch.bfloat16):
-        element = backend.dtype_str(group.lhs.dtype)
+    natural, element = run_form(group)
     return expr_from_string(
         f"{RUN}({acc.id}, {group.gid}, {', '.join(parts)}, "
         f"anchors=[{anchor_list}], outer=[{', '.join(outers)}], steps={k // 8}, "
         f"k_live={k_live}, facts={facts!r}, "
         f"tables={metal_tabulate_max_entries(cg.device_function.config)}, "
         f"k_step={k_step!r}, split={_split(cg, group, k_tiles)!r}, "
-        f"natural={int(natural)}, element={element!r}, "
+        f"natural={int(natural)}, element={element!r}, pipe={int(pipe)}, "
         f"fragment=[{', '.join(sides)}])"
+    )
+
+
+def run_form(group: MppGroup) -> tuple[bool, str]:
+    """Whether the group's run takes K in its natural order, and its
+    operand fragments' element type.  A chained side reads its source's
+    fragments a K step at a time, in order, and a tile side loads them so
+    (:func:`tile_side`); such a run's operand fragments hold the operands'
+    own type (half or bfloat); any other run keeps the order
+    :func:`emit_fragment_run` describes and float fragments."""
+    natural = any(o.elements is not None for o in (group.lhs, group.rhs)) or any(
+        tile_side(group, side) for side in (0, 1)
+    )
+    element = "float"
+    if natural and group.lhs.dtype in (torch.float16, torch.bfloat16):
+        element = CompileEnvironment.current().backend.dtype_str(group.lhs.dtype)
+    return natural, element
+
+
+def hoist_name(group: MppGroup, side: int) -> str:
+    """The fragments a hoisted operand is built into before its loop."""
+    return f"_frag_h{group.gid}_{side}"
+
+
+#: The element types a tile side copies as raw bits: their bytes.
+_TILE_TYPES = {torch.float16: 2, torch.bfloat16: 2, torch.float32: 4}
+#: The threadgroup tiles of tile sides (:func:`tile_side`).
+TILE_PREFIX = "_frag_tile"
+#: A tile side's copy, ``_helion_frag_tile_copy(tile, (shape, outer, pitch,
+#: vector, element bytes, widen), view..., masks=, wide=, outer=)``: the third argument of its
+#: side's loop marker (:func:`fragment_run`), emitted by
+#: :func:`emit_tile_copy`.
+TILE_COPY = "_helion_frag_tile_copy"
+
+
+def tile_view(group: MppGroup, side: int) -> View | None:
+    """The device view the operand on ``side`` would copy into a tile: its
+    own, or the half or bfloat view a float32 operand converts from
+    (``mpp_matmul._Operand.widened``), copied as its 16-bit elements and
+    widened at the fragment loads."""
+    operand = (group.lhs, group.rhs)[side]
+    return operand.view if operand.view is not None else operand.widened
+
+
+def can_stage(group: MppGroup, side: int) -> bool:
+    """Whether the operand on ``side`` can load its fragments from a
+    threadgroup tile (``metal_fragment_stage``, :func:`tile_side`): a device
+    view (:func:`tile_view`), not hoisted, the tile holding the run's
+    operand type (both operands half, bfloat or float), over two dims of
+    more than one element (a size-1 dim broadcasts, which a tile row
+    can't).  In a transposed group (:func:`transposed`) the lhs view's
+    fragments are the MMA's B side (:func:`_tile_loads`).  Not a few-row
+    activation (``_Operand.few_rows``), which a transposed group reads as
+    its 16-bit view, widened at each element in the order of
+    :func:`_emit_by_fragment`, and whose tile was never checked against
+    the GPU."""
+    operand = (group.lhs, group.rhs)[side]
+    view = tile_view(group, side)
+    if view is None or operand.hoist is not None or operand.few_rows:
+        return False
+    dtype = operand.dtype
+    if dtype not in _TILE_TYPES or {group.lhs.dtype, group.rhs.dtype} != {dtype}:
+        return False
+    return all(static_extent(view.tensor.size(p)) != 1 for p in view.positions)
+
+
+def tile_side(group: MppGroup, side: int) -> bool:
+    """Whether the run loads the operand on ``side`` from a threadgroup tile
+    that every thread of the threadgroup copies from its view each time the
+    run's loop body runs (``metal_fragment_stage``; :func:`emit_tile_copy`),
+    with ``simdgroup_load``: one copy shared by the SIMD groups that split
+    the rows, coalesced, in place of each lane's element loads."""
+    return current_plan().stage and can_stage(group, side)
+
+
+def _tile_layout(
+    view: View, shape: tuple[int, int], modes: list[int]
+) -> tuple[int, int, int]:
+    """A tile side's ``(outer, pitch, vector)``: the op dim its tile rows
+    run over (the other, its tile columns, is the view's unit-stride dim
+    when it has one), its row pitch in elements, padded by 16 bytes so the
+    rows of an 8 x 8 load start in different banks, and the elements each
+    thread copies at a time: 8 bytes' worth where the columns are unit
+    stride, unmasked and a multiple of it, else 1."""
+    inner = 1 if view.strides[1] == 1 or view.strides[0] != 1 else 0
+    outer = 1 - inner
+    size = _TILE_TYPES[view.tensor.dtype]
+    vector = 8 // size
+    if view.strides[inner] != 1 or modes[inner] != _UNMASKED or shape[inner] % vector:
+        vector = 1
+    return outer, shape[inner] + 16 // size, vector
+
+
+def _k_live(cg: GenerateAST, group: MppGroup, k: int) -> str:
+    """The live length of the group's K tile, ``end - offset``, where its
+    last tile may pass the K extent (:func:`tiles_in_range`), else
+    ``"None"``: the bound past which a computed operand's elements are 0."""
+    info = cg.active_device_loops[group.k_block][-1].block_id_to_info[group.k_block]
+    if tiles_in_range(cg, group.k_block, k, static_int(info.end_expr)):
+        return "None"
+    return f"{info.end_var_name} - {cg.offset_var(group.k_block)}"
+
+
+def codegen_fragment_hoist(state: CodegenState, group: MppGroup, side: int) -> ast.AST:
+    """``_helion_mpp_frag_hoist(value, name, role, position, steps, count,
+    natural, element, k_live, binds)`` before the loop of a hoisted operand
+    (``mpp_matmul._hoist_invariant``, under ``metal_fragment_hoist``): the
+    operand's fragments for every MMA step of its op, built once into
+    ``name``, ``steps * count`` of them, the MMA's A fragments (``role`` 0)
+    or B fragments (1), over M (``position`` ``_e_m``, the lhs) or N, in
+    the order and type of its run
+    (:func:`run_form`); ``k_live`` is the live length of a K tile past
+    the operand's extent, whose elements there are 0, as a run's are
+    (:func:`fragment_run`), or None; ``binds`` make a lane act as the thread
+    holding an element.  Its run reads them (:func:`emit_fragment_run`)."""
+    cg = state.codegen
+    backend = CompileEnvironment.current().backend
+    m, n, k = static_tile(cg, (group.m_block, group.n_block, group.k_block))
+    rows, cols, flipped = fragment_grid(group, *op_dims(group, m, n), k)
+    role = side ^ flipped
+    operand, blocks, k_pos = group_sides(group)[side]
+    position = "_e_m" if side == 0 else "_e_n"
+    binds = virtual_thread(cg, ((blocks[1 - k_pos], position), (group.k_block, "_e_k")))
+    value = cg.lift(backend.cast_ast(state.ast_arg(0), operand.dtype), prefix="_mpp_fv")
+    natural, element = run_form(group)
+    k_live = _k_live(cg, group, k)
+    return cg.lift(
+        expr_from_string(
+            f"{FRAG_HOIST}({value.id}, {hoist_name(group, side)!r}, {role}, "
+            f"{position!r}, {k // 8}, {cols if role else rows}, {int(natural)}, "
+            f"{element!r}, {k_live}, [{', '.join(binds)}])"
+        ),
+        prefix="_frag_hv",
     )
 
 
@@ -666,7 +911,8 @@ def fragment_run(
     tile's live length; a view's is a load masked or clamped at the view's
     extents (:func:`_view_element`)."""
     grid = keyword(acc_call, "fragment")
-    steps, k_live, facts, tables, k_step, split, natural, element_arg, sides = (
+    assert grid is not None
+    steps, k_live, facts, tables, k_step, split, natural, element_arg, pipe, sides = (
         keyword(call, name)
         for name in (
             "steps",
@@ -677,27 +923,61 @@ def fragment_run(
             "split",
             "natural",
             "element",
+            "pipe",
             "fragment",
         )
     )
     assert grid is not None and steps is not None and facts is not None
     assert tables is not None and k_step is not None and split is not None
-    assert natural is not None and element_arg is not None
+    assert natural is not None and element_arg is not None and pipe is not None
     assert isinstance(sides, ast.List)
     element = ast.literal_eval(element_arg)
-    _, _, flipped = ast.literal_eval(grid)
+    _, _, flipped, _ = ast.literal_eval(grid)
     outer = run_outer(call)
     pos = 2
     loops: list[list[ast.stmt]] = []
     chains: list[str | None] = []
+    hoists: list[str | None] = []
+    tiles: list[ast.expr] = []
     for i, (side, binds_list) in enumerate(
         zip(sides.elts, fragment_run_binds(call), strict=True)
     ):
         assert isinstance(side, ast.Tuple)
-        staged, masks, wide, past, chain = (
-            ast.literal_eval(side.elts[j]) for j in (0, 1, 3, 4, 5)
+        staged, masks, wide, past, chain, hoisted = (
+            ast.literal_eval(side.elts[j]) for j in (0, 1, 3, 4, 5, 6)
         )
         chains.append(chain)
+        hoists.append(hoisted)
+        tile = ast.literal_eval(side.elts[7])
+        if tile is not None:
+            # Copied into its tile (:func:`emit_tile_copy`) and loaded from
+            # it, with no element loop.
+            buf, *layout = tile
+            tiles.append(
+                ast.Call(
+                    ast.Name(TILE_COPY, ast.Load()),
+                    [
+                        ast.Name(buf, ast.Load()),
+                        _literal(tuple(layout)),
+                        *call.args[pos : pos + 9],
+                    ],
+                    [
+                        ast.keyword("masks", _literal(tuple(masks))),
+                        ast.keyword("wide", ast.Constant(wide)),
+                        ast.keyword(
+                            "outer",
+                            ast.List(
+                                [ast.Tuple(list(o), ast.Load()) for o in outer[i]],
+                                ast.Load(),
+                            ),
+                        ),
+                    ],
+                )
+            )
+            pos += 9
+            loops.append([])
+            continue
+        tiles.append(ast.Constant(None))
         index = ("_e_m", "_e_k") if i == 0 else ("_e_k", "_e_n")
         if staged:
             value = parse_expr(f"static_cast({element}, {src(call.args[pos])})")
@@ -725,13 +1005,18 @@ def fragment_run(
             mask, tile_index, offset = past
             position = index[0] if i == 0 else index[1]
             stmts = clamp_past_end(stmts, mask, tile_index, offset, binds, position)
-        loops.append([*stmts, put])
+        # A hoisted side's fragments were built before the loop.
+        loops.append([] if hoisted is not None else [*stmts, put])
     assert pos == len(call.args)
     a_side = 1 if flipped else 0
     body: list[ast.stmt] = [
         ast.For(
             ast.Name("_it", ast.Store()),
-            ast.Call(ast.Name(marker, ast.Load()), [ast.Constant(chains[side])], []),
+            ast.Call(
+                ast.Name(marker, ast.Load()),
+                [ast.Constant(chains[side]), ast.Constant(hoists[side]), tiles[side]],
+                [],
+            ),
             loops[side],
             [],
         )
@@ -741,7 +1026,17 @@ def fragment_run(
         ast.Name("_it", ast.Store()),
         ast.Call(
             ast.Name(FRAG_RUN, ast.Load()),
-            [call.args[0], steps, facts, tables, k_step, split, natural, element_arg],
+            [
+                call.args[0],
+                steps,
+                facts,
+                tables,
+                k_step,
+                split,
+                natural,
+                element_arg,
+                pipe,
+            ],
             [],
         ),
         body,
@@ -798,7 +1093,7 @@ def fragment_elements(
     inner = pad + "    "
     element = f"{coop}{FRAGMENT_SLOT}"
     lines = [
-        f"{inner}int {row} = 8 * ((_fi >> 1) / {cols}) + _fm;",
+        f"{inner}int {row} = 8 * ((_fi >> 1) / {cols}) + _fm{state.row_base};",
         f"{inner}int {col} = 8 * ((_fi >> 1) % {cols}) + _fn + (_fi & 1);",
     ]
     saved = state.put
@@ -826,7 +1121,11 @@ def emit_fragment_acc(
     seed value; the others add their tiles to 0 (:func:`emit_split_combine`)."""
     grid = keyword(call, "fragment")
     assert grid is not None
-    rows, cols, flipped = ast.literal_eval(grid)
+    rows, cols, flipped, split = ast.literal_eval(grid)
+    # This SIMD group's rows of the tile, set before the kernel's first
+    # statement (``metal_jit._fragment_row_split``).
+    assert state.row_split == split, (state.row_split, split)
+    assert state.row_base == (f" + {SIMDGROUP} * {8 * rows}" if split > 1 else "")
     fill = ast.literal_eval(call.args[7])
     block_m, block_n = (ast.literal_eval(a) for a in call.args[11:ACC_SEED])
     tm, tn = (ast.literal_eval(a) for a in call.args[1:3])
@@ -886,12 +1185,12 @@ def _run_setup(
     :func:`_chain_refusal`) takes K positions ``8 s`` to ``8 s + 7`` at step
     ``s``; any other the order :func:`emit_fragment_run` describes."""
     assert isinstance(stmt.iter, ast.Call)
-    _, steps, facts_arg, tables, _, _, natural, _ = stmt.iter.args
+    _, steps, facts_arg, tables, _, _, natural, _, _ = stmt.iter.args
     rows, cols, flipped = _grid(state, root)
     row, col = _element_names(flipped)
     a_loop, b_loop = stmt.body
     assert isinstance(a_loop, ast.For) and isinstance(b_loop, ast.For)
-    facts = dict(_LANE_FACTS)
+    facts = lane_facts(state)
     for name, multiple, least, _ in ast.literal_eval(facts_arg):
         facts[name] = Fact(multiple, least)
     n_steps = ast.literal_eval(steps)
@@ -902,7 +1201,12 @@ def _run_setup(
         a_k = f"_e_k = {n_steps} * (_fn + (_fi & 1)) + _fs"
         b_k = f"_e_k = {n_steps} * _fm + _fs"
     sides = [
-        (a_loop, "_frag_a", rows, (f"{row} = 8 * (_fi >> 1) + _fm", a_k)),
+        (
+            a_loop,
+            "_frag_a",
+            rows,
+            (f"{row} = 8 * (_fi >> 1) + _fm{state.row_base}", a_k),
+        ),
         (b_loop, "_frag_b", cols, (b_k, f"{col} = 8 * (_fi >> 1) + _fn + (_fi & 1)")),
     ]
     return n_steps, sides, facts, ast.literal_eval(tables)
@@ -916,10 +1220,13 @@ def emit_fragment_run(
     emit_body: Callable[
         [list[ast.stmt], list[str], int, EmitState, dict[str, str]], None
     ],
+    expr: Callable[[ast.expr], str],
 ) -> None:
     """A fragment run's loop (:func:`fragment_run`): per MMA step, the A and
-    B fragments of every lane's operand elements, then each accumulator
-    fragment's ``simdgroup_multiply_accumulate``.  Lane ``l``'s elements of
+    B fragments of every lane's operand elements, or of a tile side's tile
+    (:func:`tile_side`, copied first unless its statement list's copies
+    were, :func:`tile_copy_groups`), then each accumulator fragment's
+    ``simdgroup_multiply_accumulate``.  Lane ``l``'s elements of
     an A fragment are row ``fm``, columns ``j = fn`` and ``fn + 1``; of a B
     fragment, row ``j = fm`` and columns ``fn`` and ``fn + 1``.  Column (row)
     ``j`` of step ``s`` is K position ``steps * j + s`` of the tile: any
@@ -951,8 +1258,16 @@ def emit_fragment_run(
     split = _run_split(stmt)
     # Its K loop, which it lies in, splits it (``split_range``).
     assert split is None or split[0] in state.split_loops, split
-    rows, cols, _ = _grid(state, state.coop[acc.id])
+    rows, cols, flipped = _grid(state, state.coop[acc.id])
     n_steps, sides, facts, tables = _run_setup(stmt, state, state.coop[acc.id])
+    copies = [_side_tile(loop) for loop, _, _, _ in sides]
+    pending = [
+        c
+        for c in copies
+        if c is not None and cast("ast.Name", c.args[0]).id not in state.tiles_copied
+    ]
+    if pending:
+        parts += emit_tile_copies(pending, " " * indent, state, expr)
     elem_type = ast.literal_eval(stmt.iter.args[7])
     frag_type = (
         "simdgroup_float8x8"
@@ -963,6 +1278,9 @@ def emit_fragment_run(
     elements = dict(elements)
     for step in range(n_steps):
         for side, (loop, _, count, decls) in enumerate(sides):
+            if not loop.body:
+                # Hoisted, or loaded from its tile.
+                continue
             for i in range(2 * count):
                 if (side, step, i) not in elements:
                     elements[side, step, i] = element_body(
@@ -988,82 +1306,125 @@ def emit_fragment_run(
             emit_body(body, lines, len(at) + 4, state, subs[side])
         return [*lines, f"{at}}}"]
 
+    # Each side's fragment ``i`` of step ``s``: built at the step, or
+    # hoisted, built before the loop (``codegen_fragment_hoist``).
+    names: list[Callable[[int, int], str]] = []
+    for loop, array, count, _ in sides:
+        hoisted = _hoisted(loop)
+        if hoisted is None:
+            names.append(lambda s, i, a=array: f"{a}[{i}]")
+        else:
+            names.append(lambda s, i, h=hoisted, c=count: f"{h}[{s * c + i}]")
+    run = _Run(
+        acc.id,
+        frag_type,
+        rows,
+        cols,
+        n_steps,
+        sides,
+        copies,
+        names,
+        int(flipped),
+        element_lines,
+    )
     saved = state.put
-    if state.coop[acc.id] in state.by_fragment:
+    if state.coop[acc.id] in state.by_fragment and not any(
+        c is not None or _hoisted(loop) is not None
+        for c, (loop, *_) in zip(copies, sides, strict=True)
+    ):
         assert not early, "the planner keeps a prefetching K loop's x computed"
-        _emit_by_fragment(
-            acc.id, frag_type, rows, cols, n_steps, parts, indent, state, element_lines
-        )
+        _emit_by_fragment(run, parts, indent, state)
     else:
-        _emit_steps(
-            acc.id, frag_type, rows, cols, n_steps, parts, indent, state, element_lines
-        )
+        _emit_steps(run, parts, indent, state)
     state.put = saved
 
 
-#: Builds the block that writes a lane's element of a fragment
-#: (``emit_fragment_run``'s ``element_lines``): its side, step, element and
-#: indent.
-ElementLines = Callable[[int, int, int, str], list[str]]
+def _hoisted(loop: ast.For) -> str | None:
+    """The array a hoisted run side's fragments were built in before the
+    loop (``codegen_fragment_hoist``), None for a side built at its steps."""
+    assert isinstance(loop.iter, ast.Call)
+    return ast.literal_eval(loop.iter.args[1])
 
 
-def _emit_steps(
-    acc: str,
-    frag_type: str,
-    rows: int,
-    cols: int,
-    n_steps: int,
-    parts: list[str],
-    indent: int,
-    state: EmitState,
-    element_lines: ElementLines,
-) -> None:
-    """A run's steps in turn: each builds its A and B fragments, of
-    ``frag_type``, then runs its MMAs (:func:`emit_fragment_run`)."""
+@dataclasses.dataclass
+class _Run:
+    """A fragment run as :func:`emit_fragment_run` emits it: its
+    accumulator, the fragments' ``simdgroup_matrix`` type, the grid's rows
+    and columns, its MMA steps, its sides (:func:`_run_setup`), each side's
+    tile copy or None (:func:`_side_tile`), each side's fragment ``i`` of
+    step ``s`` (``names``), the side the A fragments come from
+    (``flipped``), and the block that writes a lane's element of a fragment
+    at a side, step, element and indent (``element_lines``)."""
+
+    acc: str
+    frag_type: str
+    rows: int
+    cols: int
+    n_steps: int
+    sides: list[tuple[ast.For, str, int, tuple[str, str]]]
+    copies: list[ast.Call | None]
+    names: list[Callable[[int, int], str]]
+    flipped: int
+    element_lines: Callable[[int, int, int, str], list[str]]
+
+
+def _emit_steps(run: _Run, parts: list[str], indent: int, state: EmitState) -> None:
+    """A run's steps in turn: each declares the fragments its sides build at
+    the step, loads a tile side's from its tile (:func:`_tile_loads`) and
+    computes the others', then runs its MMAs (:func:`emit_fragment_run`)."""
     pad = " " * indent
     inner = pad + "    "
-    for step in range(n_steps):
-        parts += [
-            f"{pad}{{",
-            f"{inner}constexpr short _fs = {step};",
-            f"{inner}{frag_type} _frag_a[{rows}];",
-            f"{inner}{frag_type} _frag_b[{cols}];",
-        ]
-        for side, (array, count) in enumerate((("_frag_a", rows), ("_frag_b", cols))):
+    for step in range(run.n_steps):
+        parts += [f"{pad}{{", f"{inner}constexpr short _fs = {step};"]
+        for loop, array, count, _ in run.sides:
+            if _hoisted(loop) is None:
+                parts.append(f"{inner}{run.frag_type} {array}[{count}];")
+        # ``run.sides`` hold the A fragments, then the B fragments; the A
+        # fragments come from the rhs in a transposed run (``flipped``).
+        for slot, (copy_call, (_, array, count, _)) in enumerate(
+            zip(run.copies, run.sides, strict=True)
+        ):
+            if copy_call is not None:
+                side = slot ^ run.flipped
+                parts += [
+                    f"{inner}{line}"
+                    for line in _tile_loads(
+                        copy_call, side, run.flipped, step, array, count, state
+                    )
+                ]
+        for side, (loop, array, count, _) in enumerate(run.sides):
+            if not loop.body:
+                # Hoisted, or loaded from its tile.
+                continue
             state.put = f"{array}{FRAGMENT_SLOT}"
             for i in range(2 * count):
-                parts += element_lines(side, step, i, inner)
+                parts += run.element_lines(side, step, i, inner)
         parts += [
-            f"{inner}simdgroup_multiply_accumulate({acc}[{a * cols + b}], "
-            f"_frag_a[{a}], _frag_b[{b}], {acc}[{a * cols + b}]);"
-            for a in range(rows)
-            for b in range(cols)
+            f"{inner}simdgroup_multiply_accumulate({run.acc}[{a * run.cols + b}], "
+            f"{run.names[0](step, a)}, {run.names[1](step, b)}, "
+            f"{run.acc}[{a * run.cols + b}]);"
+            for a in range(run.rows)
+            for b in range(run.cols)
         ]
         parts.append(f"{pad}}}")
 
 
 def _emit_by_fragment(
-    acc: str,
-    frag_type: str,
-    rows: int,
-    cols: int,
-    n_steps: int,
-    parts: list[str],
-    indent: int,
-    state: EmitState,
-    element_lines: ElementLines,
+    run: _Run, parts: list[str], indent: int, state: EmitState
 ) -> None:
     """A few-row run's MMAs fragment by fragment, as MLX's few-row kernel
     orders them: first the B fragments (the activation's) of every step,
     then per A fragment (a weight row's) that fragment at each step,
     computed and followed by its MMAs, so the compiler overlaps one
     fragment's decode with the MMAs before it.  Each accumulator adds its
-    steps in the order :func:`_emit_steps` does.  ``frag_type`` is the
-    fragments' ``simdgroup_matrix`` type, as in :func:`_emit_steps`."""
+    steps in the order :func:`_emit_steps` does.  A run with a hoisted or
+    tile side takes the step order."""
+    acc, frag_type, rows, cols = run.acc, run.frag_type, run.rows, run.cols
+    element_lines = run.element_lines
     pad = " " * indent
     inner = pad + "    "
     parts.append(f"{pad}{{")
-    for step in range(n_steps):
+    for step in range(run.n_steps):
         parts += [
             f"{inner}{frag_type} _frag_b{step}[{cols}];",
             f"{inner}{{",
@@ -1074,7 +1435,7 @@ def _emit_by_fragment(
             parts += element_lines(1, step, i, inner + "    ")
         parts.append(f"{inner}}}")
     for a in range(rows):
-        for step in range(n_steps):
+        for step in range(run.n_steps):
             parts += [
                 f"{inner}{{",
                 f"{inner}    constexpr short _fs = {step};",
@@ -1090,6 +1451,330 @@ def _emit_by_fragment(
             ]
             parts.append(f"{inner}}}")
     parts.append(f"{pad}}}")
+
+
+def _side_tile(loop: ast.For) -> ast.Call | None:
+    """A run side's tile copy (:func:`fragment_run`), None for a side that
+    builds its fragments otherwise."""
+    assert isinstance(loop.iter, ast.Call)
+    copy_call = loop.iter.args[2]
+    if isinstance(copy_call, ast.Constant):
+        return None
+    assert isinstance(copy_call, ast.Call)
+    return copy_call
+
+
+def _tile_loads(
+    call: ast.Call,
+    side: int,
+    flipped: int,
+    step: int,
+    array: str,
+    count: int,
+    state: EmitState,
+) -> list[str]:
+    """A tile side's ``simdgroup_load`` of each of its ``count`` fragments of
+    MMA step ``step`` (K positions ``8 step`` to ``8 step + 7``, the run's
+    natural order) into ``array``, for the operand on ``side`` (0 the lhs,
+    1 the rhs).  The operand's two dims are the op's (M, K) on the lhs and
+    (K, N) on the rhs; its A fragments (the side
+    ``flipped`` names) run over the grid rows, this SIMD group's share
+    (``EmitState.row_base``), its B fragments over the grid columns.  A
+    fragment whose rows are the tile's columns loads transposed."""
+    buf = cast("ast.Name", call.args[0]).id
+    _, outer, pitch, _, _, widen = ast.literal_eval(call.args[1])
+    k_dim = 1 - side
+    role_a = side == flipped
+    lines = []
+    for i in range(count):
+        at = [""] * 2
+        at[k_dim] = f"{8 * step}"
+        at[1 - k_dim] = f"{8 * i}{state.row_base if role_a else ''}"
+        rows = 1 - k_dim if role_a else k_dim
+        first, second = (rows, 1 - rows) if rows == outer else (1 - rows, rows)
+        offset = f"({at[first]}) * {pitch} + {at[second]}"
+        transpose = "false" if rows == outer else "true"
+        load = f"{buf} + {offset}, {pitch}, ulong2(0, 0), {transpose});"
+        if widen is None:
+            lines.append(f"simdgroup_load({array}[{i}], {load}")
+            continue
+        # A widened view's tile (``tile_view``): loaded in its own type, each
+        # lane's two elements widened (all fragment types share the lanes).
+        lines += [
+            "{",
+            f"    simdgroup_matrix<{widen}, 8, 8> _frag_w;",
+            f"    simdgroup_load(_frag_w, {load}",
+            f"    {array}[{i}].thread_elements()[0] = _frag_w.thread_elements()[0];",
+            f"    {array}[{i}].thread_elements()[1] = _frag_w.thread_elements()[1];",
+            "}",
+        ]
+    return lines
+
+
+def tile_copy_groups(stmts: list[ast.stmt]) -> dict[int, list[ast.Call]]:
+    """The tile copies (:func:`tile_side`) of the fragment runs among
+    ``stmts``, grouped at the first run of each group: a run's copy joins
+    the group before it unless it reads a name a statement since that
+    group's first run assigns.  Each group's copies run together between
+    one barrier pair (:func:`emit_tile_copies`), each into its own tile, so
+    a loop body whose runs read the same tensors' tiles (attention's K and
+    V) waits once per iteration.  A view reads no tensor the kernel writes
+    (``mpp_matmul._order_memory``), so moving its copy up reads the same
+    values."""
+    groups: dict[int, list[ast.Call]] = {}
+    first: int | None = None
+    assigned: set[str] = set()
+    for index, stmt in enumerate(stmts):
+        copies: list[ast.Call] = []
+        if isinstance(stmt, ast.For) and call_name(stmt.iter) == FRAG_RUN:
+            for loop in stmt.body:
+                assert isinstance(loop, ast.For)
+                if (copy_call := _side_tile(loop)) is not None:
+                    copies.append(copy_call)
+        if copies:
+            reads = {
+                n.id for c in copies for n in ast.walk(c) if isinstance(n, ast.Name)
+            }
+            if first is None or reads & assigned:
+                first, assigned = index, set()
+            groups.setdefault(first, []).extend(copies)
+        if first is not None:
+            assigned |= {
+                n.id
+                for n in ast.walk(stmt)
+                if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store)
+            }
+    return groups
+
+
+#: The raw-bits type a tile copy moves ``(element bytes, vector)`` as, and
+#: its zero.
+_TILE_BITS = {
+    (2, 1): ("ushort", "0"),
+    (2, 4): ("packed_ushort4", "packed_ushort4(0, 0, 0, 0)"),
+    (4, 1): ("uint", "0u"),
+    (4, 2): ("packed_uint2", "packed_uint2(0u, 0u)"),
+}
+
+
+def _literal(value: tuple[object, ...]) -> ast.expr:
+    """``value`` as the expression ``ast.literal_eval`` reads it back from."""
+    return ast.parse(repr(value), mode="eval").body
+
+
+def emit_tile_copies(
+    calls: list[ast.Call], pad: str, state: EmitState, expr: Callable[[ast.expr], str]
+) -> list[str]:
+    """Tile copies (:func:`emit_tile_copy`) between a barrier that keeps
+    their writes after every SIMD group's reads of the tiles' previous
+    contents and one that keeps the runs' loads after the writes."""
+    barrier = f"{pad}threadgroup_barrier(mem_flags::mem_threadgroup);"
+    lines = [barrier]
+    for call in calls:
+        lines += emit_tile_copy(call, pad, state, expr)
+        state.tiles_copied.add(cast("ast.Name", call.args[0]).id)
+    return [*lines, barrier]
+
+
+def emit_tile_copy(
+    call: ast.Call, pad: str, state: EmitState, expr: Callable[[ast.expr], str]
+) -> list[str]:
+    """Every thread of the threadgroup copies a tile side's view (the op's
+    two dims from their origins, ``mpp_matmul.view_args``) into its tile as
+    raw bits, ``vector`` elements at a time, in tile-row order, so
+    consecutive threads read consecutive addresses; an element past a
+    masked or clamped dim's extent (a clamped one's value is free:
+    :func:`_dim_mode`), or where an outer index lies outside its dim, is
+    written as 0.  A pipelined tile (:func:`pipeline_tile_copies`) is
+    written from the registers its copy loaded the iteration before."""
+    copy = _TileCopy(call, state, expr)
+    regs = state.tile_regs.get(copy.buf)
+    if regs is not None:
+        return copy.unrolled(pad, [f"{copy.dst} = {reg};" for reg in regs])
+    inner = pad + "    "
+    lines = [
+        f"{pad}for (uint _c = {copy.thread}; _c < {copy.total}; _c += {copy.threads}) {{",
+        *copy.position(inner),
+        *copy.assign(inner, copy.dst),
+    ]
+    return [*lines, f"{pad}}}"]
+
+
+class _TileCopy:
+    """A tile copy's pieces (:func:`emit_tile_copy`): the tile, its chunks
+    (``vector`` elements each, ``total`` in all, the threads taking chunks
+    ``thread``, ``thread + threads``, ...), each chunk's tile and device
+    addresses at ``_tr`` and ``_tc`` and the terms that keep it in bounds."""
+
+    def __init__(
+        self, call: ast.Call, state: EmitState, expr: Callable[[ast.expr], str]
+    ) -> None:
+        self.buf = cast("ast.Name", call.args[0]).id
+        shape, outer, pitch, vector, element_bytes, _ = ast.literal_eval(call.args[1])
+        tensor, *dims = call.args[2:11]
+        keywords = {k.arg: k.value for k in call.keywords}
+        masks = ast.literal_eval(keywords["masks"])
+        wide = ast.literal_eval(keywords["wide"])
+        outer_dims = cast("ast.List", keywords["outer"]).elts
+        inner = 1 - outer
+        self.chunks = shape[inner] // vector
+        self.vector = vector
+        self.total = shape[outer] * self.chunks
+        position = {outer: "_tr", inner: "_tc"}
+        offset: list[str] = []
+        self.terms: list[str] = []
+        for d in range(2):
+            o, e, size, stride = (expr(x) for x in dims[4 * d : 4 * d + 4])
+            at = f"({o} + {position[d]})"
+            offset.append(f"{f'static_cast<long>({at})' if wide else at} * {stride}")
+            if masks[d] != _UNMASKED:
+                self.terms.append(f"{at} < {e}")
+                if e != size:
+                    self.terms.append(f"{at} < {size}")
+        for item in outer_dims:
+            x, size, stride = (expr(v) for v in cast("ast.Tuple", item).elts)
+            offset.append(f"{f'static_cast<long>({x})' if wide else x} * {stride}")
+            self.terms.append(f"0 <= {x} && {x} < {size}")
+        self.threads = SIMD_WIDTH * state.row_split
+        self.thread = (
+            LANE if state.row_split == 1 else f"{SIMDGROUP} * {SIMD_WIDTH} + {LANE}"
+        )
+        self.bits, self.zero = _TILE_BITS[element_bytes, vector]
+        self.dst = (
+            f"*reinterpret_cast<threadgroup {self.bits}*>"
+            f"({self.buf} + _tr * {pitch} + _tc)"
+        )
+        self.src = (
+            f"*reinterpret_cast<device const {self.bits}*>({expr(tensor)} + "
+            f"{' + '.join(offset)})"
+        )
+
+    def position(self, pad: str) -> list[str]:
+        """The chunk ``_c``'s tile row and column."""
+        return [
+            f"{pad}int _tr = int(_c / {self.chunks});",
+            f"{pad}int _tc = int(_c % {self.chunks}) * {self.vector};",
+        ]
+
+    def assign(self, pad: str, target: str) -> list[str]:
+        """``target`` set to the chunk's device bits, or 0 out of bounds."""
+        if not self.terms:
+            return [f"{pad}{target} = {self.src};"]
+        return [
+            f"{pad}if ({' && '.join(self.terms)}) {{",
+            f"{pad}    {target} = {self.src};",
+            f"{pad}}} else {{",
+            f"{pad}    {target} = {self.zero};",
+            f"{pad}}}",
+        ]
+
+    @property
+    def per_thread(self) -> int:
+        """The chunks a thread takes at most."""
+        return -(-self.total // self.threads)
+
+    def unrolled(self, pad: str, bodies: list[list[str]] | list[str]) -> list[str]:
+        """Each of a thread's chunks in turn, its ``_c``, ``_tr`` and ``_tc``
+        bound around its body (a line, or lines); a chunk past the tile's
+        last runs nothing."""
+        lines: list[str] = []
+        inner = pad + "    "
+        for j, body in enumerate(bodies):
+            body_lines = [body] if isinstance(body, str) else body
+            lines += [
+                f"{pad}{{",
+                f"{inner}uint _c = {self.thread} + {j * self.threads};",
+            ]
+            guard = self.total % self.threads != 0
+            at = inner + ("    " if guard else "")
+            if guard:
+                lines.append(f"{inner}if (_c < {self.total}) {{")
+            lines += self.position(at) + [f"{at}{line}" for line in body_lines]
+            if guard:
+                lines.append(f"{inner}}}")
+            lines.append(f"{pad}}}")
+        return lines
+
+
+def pipeline_tile_copies(
+    body: list[ast.stmt],
+    loop_var: str,
+    start: str,
+    end: str,
+    step: str,
+    pad: str,
+    state: EmitState,
+    expr: Callable[[ast.expr], str],
+) -> tuple[list[str], list[str]]:
+    """Software pipelining of a K loop's tile copies (a fragment run's
+    ``pipe``, ``range_num_stages=2`` on a run with tile sides): the lines
+    to emit before the loop and at the top of its body.  Each thread loads
+    its chunks of the first tile into registers before the loop (when the
+    loop runs), and at the top of each iteration copies them out and loads
+    the next tile's, so those loads are in flight across this tile's
+    barriers and multiplies; the copy writes the tile from the registers
+    (:func:`emit_tile_copy`).  A copy that reads a name the loop body
+    assigns (a view origin computed in the loop) stays unpipelined.  The
+    loop pipelines when a run whose K it is takes ``pipe``."""
+    assigned = {
+        n.id
+        for s in body
+        for n in ast.walk(s)
+        if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store)
+    }
+    before: list[str] = []
+    top: list[str] = []
+    ahead: list[str] = []
+    runs = [
+        stmt
+        for stmt in body
+        if isinstance(stmt, ast.For) and call_name(stmt.iter) == FRAG_RUN
+    ]
+    # The loop's stages (its slot) reach the runs whose K it is; a run over
+    # another K (a ``:`` K, or one this loop is N of) copies its tiles in
+    # the same loop body, so the loop pipelines every copy in it.
+    if not any(ast.literal_eval(cast("ast.Call", r.iter).args[8]) for r in runs):
+        return before, top
+    for stmt in runs:
+        for loop in stmt.body:
+            assert isinstance(loop, ast.For)
+            call = _side_tile(loop)
+            if call is None:
+                continue
+            buf = cast("ast.Name", call.args[0]).id
+            reads = {
+                n.id
+                for a in [*call.args[2:], *(k.value for k in call.keywords)]
+                for n in ast.walk(a)
+                if isinstance(n, ast.Name)
+            }
+            if buf in state.tile_regs or (reads & assigned) - {loop_var}:
+                continue
+            copy = _TileCopy(call, state, expr)
+            regs = [f"_pipe{j}{buf}" for j in range(copy.per_thread)]
+            state.tile_regs[buf] = regs
+            loads = copy.unrolled(
+                "    ", [copy.assign("", f"{reg}_next") for reg in regs]
+            )
+            before += [f"{pad}{copy.bits} {reg}_next = {copy.zero};" for reg in regs]
+            before += [
+                f"{pad}if ({start} < {end}) {{",
+                f"{pad}    const int {loop_var} = {start};",
+            ]
+            before += [f"{pad}{line}" for line in loads] + [f"{pad}}}"]
+            top += [f"{pad}    {copy.bits} {reg} = {reg}_next;" for reg in regs]
+            ahead += [f"{pad}    {line}" for line in loads]
+    if ahead:
+        top += [
+            f"{pad}    if ({loop_var} + {step} < {end}) {{",
+            f"{pad}        const int _pipe_next = {loop_var} + {step};",
+            f"{pad}        {{",
+            f"{pad}            const int {loop_var} = _pipe_next;",
+            *(f"{pad}        {line}" for line in ahead),
+            f"{pad}        }}",
+            f"{pad}    }}",
+        ]
+    return before, top
 
 
 def _chain_subs(loop: ast.For, side: int, state: EmitState) -> dict[str, str]:
@@ -1120,6 +1805,60 @@ def _chain_subs(loop: ast.For, side: int, state: EmitState) -> dict[str, str]:
         if r == root
     }
     return subs
+
+
+def emit_fragment_hoist(
+    stmt: ast.For,
+    parts: list[str],
+    indent: int,
+    state: EmitState,
+    emit_body: Callable[
+        [list[ast.stmt], list[str], int, EmitState, dict[str, str]], None
+    ],
+) -> None:
+    """A hoisted operand's loop (``mpp_matmul.elementize`` of
+    :func:`codegen_fragment_hoist`'s marker): its fragments for every MMA
+    step, declared before the loop that runs the op, each element computed
+    by the loop's body at its position, as its run would compute it at the
+    step, with the same position declarations (:func:`_run_setup`)."""
+    pad = " " * indent
+    inner = pad + "    "
+    assert isinstance(stmt.iter, ast.Call)
+    name, role, position, n_steps, count, natural, element = (
+        ast.literal_eval(a) for a in stmt.iter.args
+    )
+    frag_type = (
+        "simdgroup_float8x8"
+        if element == "float"
+        else f"simdgroup_matrix<{element}, 8, 8>"
+    )
+    if role == 0:
+        k_decl = (
+            "_e_k = 8 * _fs + _fn + (_fi & 1)"
+            if natural
+            else f"_e_k = {n_steps} * (_fn + (_fi & 1)) + _fs"
+        )
+        decls = (f"{position} = 8 * (_fi >> 1) + _fm{state.row_base}", k_decl)
+    else:
+        k_decl = "_e_k = 8 * _fs + _fm" if natural else f"_e_k = {n_steps} * _fm + _fs"
+        decls = (k_decl, f"{position} = 8 * (_fi >> 1) + _fn + (_fi & 1)")
+    parts.append(f"{pad}{frag_type} {name}[{n_steps * count}];")
+    facts = lane_facts(state)
+    saved = state.put
+    for step in range(n_steps):
+        for i in range(2 * count):
+            state.put = f"{name}[{step * count + (i >> 1)}].thread_elements()[{i & 1}]"
+            lines = [
+                f"{pad}{{",
+                f"{inner}constexpr short _fs = {step};",
+                f"{inner}constexpr short _fi = {i};",
+                *(f"{inner}int {decl};" for decl in decls),
+            ]
+            body, _, _ = element_body(stmt, decls, step, i, facts, 0, state)
+            with state.isolated_scope():
+                emit_body(body, lines, indent + 4, state, {})
+            parts += [*lines, f"{pad}}}"]
+    state.put = saved
 
 
 #: A load a fragment run reads a K tile early: its tensor, its index without
@@ -1366,7 +2105,7 @@ def fragment_acc_keywords(
     cg: GenerateAST, group: MppGroup, m: int, n: int, k: int
 ) -> str:
     """The keywords of a fragment group's ``_helion_mpp_acc``: its grid
-    (:func:`fragment_grid`), and ``by_fragment=True`` for a few-row group
+    (:func:`fragment_grid`) and the SIMD groups splitting its rows, and ``by_fragment=True`` for a few-row group
     (``_Operand.few_rows``)."""
     grid = fragment_grid(group, m, n, k)
     # A few-row group's runs order their MMAs fragment by fragment
@@ -1374,7 +2113,10 @@ def fragment_acc_keywords(
     # transposed group whose activation is already a float32 view keeps the
     # step order, though the overlap the order buys doesn't depend on it.
     by_fragment = ", by_fragment=True" if group.lhs.few_rows else ""
-    return f", fragment={grid!r}{by_fragment}"
+    rows, cols, flipped = grid
+    return (
+        f", fragment={(rows, cols, flipped, current_plan().row_split)!r}{by_fragment}"
+    )
 
 
 def plan_fragment_lines(plan: MppPlan, graphs: Graphs) -> None:
@@ -1392,14 +2134,20 @@ def plan_fragment_holds(plan: MppPlan, graphs: Graphs) -> None:
     plan_holds(plan, graphs)
 
 
+@dataclasses.dataclass(frozen=True)
 class FragmentLowering:
     """What :mod:`mpp_matmul` calls to lower a fragment group: the planner's
     row values (``fragment_lines``) and check, the accumulator's keywords,
     the op's codegen and its loops in ``elementize``.
     ``MetalBackend.pre_codegen`` gives it to the planner and ``metal_jit``
     to ``elementize``, so :mod:`mpp_matmul`, which this module builds on,
-    doesn't import it."""
+    doesn't import it.  ``hoist`` is the config's ``metal_fragment_hoist``:
+    the planner hoists loop-invariant operands
+    (:func:`codegen_fragment_hoist`)."""
 
+    hoist: bool = False
+
+    codegen_hoist = staticmethod(codegen_fragment_hoist)
     plan_lines = staticmethod(plan_fragment_lines)
     plan_holds = staticmethod(plan_fragment_holds)
     check_group = staticmethod(check_fragment_group)
