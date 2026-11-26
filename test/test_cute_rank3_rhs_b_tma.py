@@ -489,6 +489,8 @@ def _code_for(
         args = _make_full_args()
     if config is None:
         config = _rank3_rhs_tma_config()
+    # Direct codegen reads the tensors from the original bind to infer group tails.
+    kernel.reset()
     bound = kernel.bind(args)
     bound.env.config_spec.tcgen05.search_enabled = True
     with (

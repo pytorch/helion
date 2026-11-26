@@ -2719,11 +2719,10 @@ class Backend(abc.ABC):
     def decomp_table_overrides(
         self, table: dict[torch._ops.OpOverload, Callable[..., object]]
     ) -> None:
-        """Adjust the Inductor decomposition table used while tracing.
+        """Customize the copied decomposition table before other device rewrites.
 
-        Called on the copied table before Helion's own overrides are applied;
-        a backend that lowers an op natively pops its decomposition here.
-        Default: no-op.
+        The table includes the effect-preserving default assertion decomposition.
+        A backend may replace it, or remove it to lower the default overload itself.
         """
         return
 

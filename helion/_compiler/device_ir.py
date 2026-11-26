@@ -198,10 +198,30 @@ def _host_tensor_stride(
     return symbolic(value, dim % tensor.ndim)
 
 
+def combine_decomp_table() -> dict[torch._ops.OpOverload, Callable[..., object]]:
+    def reject_assertion(*args: object, **kwargs: object) -> None:
+        # Combine calls have no effect contract: an unused result can discard
+        # the entire callback, even when the backend lowers ordinary assertions.
+        raise CompileEnvironment.current().backend.unsupported(
+            "device assertions in hl.reduce or hl.associative_scan combine functions"
+        )
+
+    table = select_decomp_table().copy()
+    table[torch.ops.aten._assert_async.default] = reject_assertion
+    table[torch.ops.aten._assert_async.msg] = reject_assertion
+    return table
+
+
 def _get_custom_decomp_table() -> dict[torch._ops.OpOverload, Callable[..., object]]:
     from ..language._gelu_tanh_approx import install_gelu_decomp
 
     decomp_table = select_decomp_table().copy()
+    # An inherited no-op for the message overload would erase both checks.
+    # Keep FX's effectful message form unless the backend explicitly overrides it.
+    decomp_table.pop(torch.ops.aten._assert_async.msg, None)
+    decomp_table[torch.ops.aten._assert_async.default] = lambda predicate: (
+        torch.ops.aten._assert_async.msg(predicate, "")
+    )
     if CompileEnvironment.has_current():
         CompileEnvironment.current().backend.decomp_table_overrides(decomp_table)
     # Normally, aten.stack is decomposed to aten.unsqueeze + aten.cat, but it's difficult to
@@ -1302,6 +1322,16 @@ class DeviceIR:
         graph_info_cls: type[GraphInfo] = GraphInfo,
         **kwargs: object,
     ) -> int:
+        if graph_info_cls is HelperFunctionGraphInfo:
+            # A discarded combine never reaches helper codegen. Reject its
+            # effectful Helion API calls here; unused pure calls can disappear.
+            if any(
+                node.op == "call_function"
+                and is_api_func(node.target)
+                and is_impure_node(node)
+                for node in graph.nodes
+            ):
+                raise exc.NotAllowedInHelperFunction
         graph.eliminate_dead_code(is_impure_node=is_impure_node)
         graph_id = len(self.graphs)
         self.graphs.append(graph_info_cls(graph_id=graph_id, graph=graph, **kwargs))
@@ -2242,7 +2272,7 @@ class DeviceIR:
             return (
                 node.op == "call_function"
                 and node.target not in (memory_ops.load, inline_asm_elementwise)
-                and not node.is_impure()
+                and not is_impure_node(node)
             )
 
         for graph_info in self.graphs:

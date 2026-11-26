@@ -10,6 +10,23 @@ The `helion.exc` module provides an exception hierarchy for error handling and d
 
 Helion's exception system provides detailed error messages with automatic source location tracking. All exceptions inherit from `Base` and provide formatted error reports that help identify exactly where and why compilation failed.
 
+Helion's built-in backends currently reject `torch._assert_async(predicate)`
+and `torch._assert_async(predicate, message)` in device loops. When a traced
+assertion reaches lowering, it raises `helion.exc.BackendUnsupported`. The
+error can name `aten._assert_async.msg` for either spelling, because Helion
+traces the effect using the message overload. Compilation fails rather than silently removing the check.
+
+Device assertions are also unsupported in the combine functions passed to
+`hl.reduce` or `hl.associative_scan`: the compiler may discard an unused
+reduction or scan along with its callback. Effectful Helion calls, such as
+`hl.device_print` or `hl.inline_asm_elementwise(..., is_pure=False)`, raise
+`helion.exc.NotAllowedInHelperFunction` in either combine function, even
+when the result is discarded.
+
+A traced `aten._validate_compressed_sparse_indices` also has no return
+value. Backends without a lowering reject the operation instead of
+compiling a kernel that omits the validation.
+
 ## Exception Hierarchy
 
 ### Base Classes
