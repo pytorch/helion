@@ -989,9 +989,9 @@ class ForEachProgramID(ProgramIDs):
             *body,
         ]
 
-    def _phase_boundaries(self) -> list[str]:
-        """Compute cumulative PID boundaries at phase transitions."""
-        boundaries: list[str] = []
+    def _phase_boundaries(self) -> list[tuple[str, int]]:
+        """Pair each cumulative PID boundary with the exclusive root stop."""
+        boundaries: list[tuple[str, int]] = []
         prev_phase = self.case_phases[0]
         for idx in range(len(self.cases)):
             next_phase = (
@@ -1000,7 +1000,9 @@ class ForEachProgramID(ProgramIDs):
                 else prev_phase
             )
             if next_phase != prev_phase or idx == len(self.cases) - 1:
-                boundaries.append(self._case_sum(self.cases[: idx + 1], is_device=True))
+                boundaries.append(
+                    (self._case_sum(self.cases[: idx + 1], is_device=True), idx + 1)
+                )
             prev_phase = next_phase
         return boundaries
 
@@ -1021,7 +1023,7 @@ class ForEachProgramID(ProgramIDs):
         boundaries = self._phase_boundaries()
         block_ids = [pid.block_id for pid in strategy.pid_info]
 
-        base_body = self._prepare_persistent_body(
+        dispatch_init, *dispatch_body = self._prepare_persistent_body(
             device_function.body, device_function, strategy.virtual_pid_var
         )
 
@@ -1041,12 +1043,23 @@ class ForEachProgramID(ProgramIDs):
 
         loops: list[ast.stmt] = []
         start_expr = "0"
-        for boundary in boundaries:
+        first = 0
+        for phase_index, (boundary, stop) in enumerate(boundaries):
             cond = expr_from_string(
                 f"({strategy.virtual_pid_var} >= ({start_expr})) and ({strategy.virtual_pid_var} < ({boundary}))"
             )
             loop_body: list[ast.stmt] = [
-                create(ast.If, test=cond, body=list(base_body), orelse=[])
+                create(
+                    ast.If,
+                    test=cond,
+                    body=[
+                        dispatch_init,
+                        *backend.specialize_phase_dispatch(
+                            self, dispatch_body, first, stop
+                        ),
+                    ],
+                    orelse=[],
+                )
             ]
             target = strategy.virtual_pid_var
             if strategy.is_blocked:
@@ -1087,11 +1100,12 @@ class ForEachProgramID(ProgramIDs):
                 orelse=[],
                 type_comment=None,
             )
-            PersistentPhase.mark(loop, start_expr, boundary, setup, base_body[0])
+            PersistentPhase.mark(loop, start_expr, boundary, setup, dispatch_init)
             loops.append(backend.persistent_program_loop(loop, device_function))
-            if boundary != boundaries[-1] and barrier_stmt is not None:
+            if phase_index + 1 < len(boundaries) and barrier_stmt is not None:
                 loops.extend(device_function.cta_barrier(barrier_stmt))
             start_expr = boundary
+            first = stop
         return loops
 
 

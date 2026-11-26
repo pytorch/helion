@@ -68,7 +68,9 @@ def register_fragment_threads_coverage(
     spec = env.config_spec
     if not spec.cute_fragment_thread_root_ids:
         return
-    carrier = fragment_coverage_carrier(spec, resource_carrier)
+    carrier = fragment_coverage_carrier(
+        spec, resource_carrier, require_flat=spec.cute_fragment_cta_requires_flat
+    )
     if carrier is None:
         return
     spec.cute_fragment_threads_search_enabled = True

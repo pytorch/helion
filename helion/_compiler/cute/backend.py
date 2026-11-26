@@ -133,6 +133,7 @@ if TYPE_CHECKING:
     from ..inductor_lowering import CodegenState
     from ..inductor_matmul import MatmulFacts
     from ..inductor_matmul import MatmulPlan
+    from ..program_id import ForEachProgramID
     from ..program_id import ProgramIDs
     from ..reduction_strategy import ReductionEmitter
     from ..reduction_strategy import ReductionStrategy
@@ -1697,6 +1698,15 @@ class CuteBackend(Backend):
     @property
     def lowers_mask_select(self) -> bool:
         return True
+
+    def specialize_phase_dispatch(
+        self, owner: ForEachProgramID, body: list[ast.AST], first: int, stop: int
+    ) -> list[ast.AST]:
+        # The backend registry loads this module while CompileEnvironment
+        # is still initializing; program_id needs that class at import time.
+        from .phase_dispatch import specialize_phase_cases
+
+        return specialize_phase_cases(owner, body, first, stop)
 
     def barrier_allows_pid_type(self, pid_type: str) -> bool:
         # Flat phases require independent ordered launches. An interleaved
@@ -4875,6 +4885,13 @@ class CuteBackend(Backend):
                 if static_block is not None
                 else None
             )
+            launched = device_function.cute_state.lanes.launch_block
+            if device_function.cute_state.lanes.shared_fragment_uses_warps and (
+                launched is None or math.prod(launched) % 32 != 0
+            ):
+                raise exc.InvalidConfig(
+                    f"warp-cooperative fragments require a whole number of warps in {block_arg}"
+                )
             launcher_args = [block_arg]
             # One --ptxas-options flag carries them all (a second would
             # replace the first).

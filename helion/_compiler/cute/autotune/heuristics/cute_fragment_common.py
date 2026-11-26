@@ -22,7 +22,10 @@ if TYPE_CHECKING:
 
 
 def fragment_coverage_carrier(
-    spec: ConfigSpec, resource_carrier: Config | None = None
+    spec: ConfigSpec,
+    resource_carrier: Config | None = None,
+    *,
+    require_flat: bool = False,
 ) -> Config | None:
     """Strictly admit the carrier before enabling a new search coordinate.
 
@@ -37,6 +40,10 @@ def fragment_coverage_carrier(
         carrier = resource_carrier
         if carrier is None:
             _, carrier = generation.canonicalize_flat(generation.default_flat())
+        if require_flat:
+            if "flat" not in spec.allowed_pid_types:
+                return None
+            carrier = Config.from_dict(deepcopy(carrier.config) | {"pid_type": "flat"})
         if carrier.config.get(MMA_DAG_KEY, MMA_DAG_OFF) != MMA_DAG_OFF:
             _, carrier = generation.strict_config_pair(
                 Config.from_dict(deepcopy(carrier.config) | {MMA_DAG_KEY: MMA_DAG_OFF})

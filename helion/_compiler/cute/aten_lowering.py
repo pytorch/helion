@@ -1808,8 +1808,7 @@ def _topk_args(node: Node) -> tuple[int, int, bool]:
 
 @topk_lowering.register_codegen("cute")
 def codegen_topk_cute(ctx: LoweringContext, node: Node) -> object:
-    from ...language import memory_ops
-    from .memory_ops import _cute_topk_cast_input
+    from .selection.ordered_selection import topk_outputs_keep_sort_lanes
 
     k, _, largest = _topk_args(node)
     input_node = node.args[0]
@@ -1820,28 +1819,12 @@ def codegen_topk_cute(ctx: LoweringContext, node: Node) -> object:
         load = input_node.meta.get("cute_sortable_load")
     if not isinstance(load, CuteSortableLoad):
         raise exc.BackendUnsupported("cute", "torch.topk input")
-    # Output ``j`` is held on the lane at position ``j`` of the sorted input
-    # dim, which only a store addresses (``_cute_topk_store_index_exprs``);
-    # dtype conversions retain that lane. Other consumers would read it on
-    # the output dim's own lanes.
-    pending = list(node.users)
-    visited: set[Node] = set()
-    while pending:
-        output = pending.pop()
-        if output in visited:
-            continue
-        visited.add(output)
-        for user in output.users:
-            if user.target is memory_ops.store and user.args[2] is output:
-                continue
-            if _cute_topk_cast_input(user) is output:
-                pending.append(user)
-                continue
-            raise exc.BackendUnsupported(
-                "cute",
-                "torch.topk output that feeds anything but a store: its "
-                "elements are held on the lanes of the sorted input dim",
-            )
+    if not topk_outputs_keep_sort_lanes(node):
+        raise exc.BackendUnsupported(
+            "cute",
+            "torch.topk output that feeds anything but a store: its "
+            "elements are held on the lanes of the sorted input dim",
+        )
     if k == 1 and CompileEnvironment.current().known_equal(input_tensor.shape[-1], 1):
         # A singleton keeps its original masked load and has index zero. Its
         # size-one axis has no block owner or sorting coordinates to publish.

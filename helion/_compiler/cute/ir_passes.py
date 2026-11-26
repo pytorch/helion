@@ -148,6 +148,11 @@ def promote_partitioned_outputs_pass(
                 node.meta[FP32_MULTIPLY_ROUNDING_META_KEY] = True
 
     env = CompileEnvironment.current()
+    # Without materialized fission, only the flat ordered-phase generator
+    # gives these roots separate blocks. A persistent launch shares its CTA.
+    env.config_spec.cute_fragment_cta_requires_flat = (
+        len(device_ir.phases) > 1 and env_state.fission_plan is None
+    )
     if env.has_barrier and "flat" in env.config_spec.allowed_pid_types:
         from ...language.barrier import BARRIER_PID_TYPE_REASON
         from .ordered_phases import ordered_phases_supported

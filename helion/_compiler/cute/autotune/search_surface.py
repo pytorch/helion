@@ -84,6 +84,7 @@ from ..cutedsl_compat import readonly_packet_load_supported
 from ..direct_affine_plan import DIRECT_AFFINE_ORDINARY_SCHEDULE
 from ..direct_affine_plan import direct_affine_schedule_choices
 from ..emitters.lane_packets import _CUTE_BYTE_PACKET_WIDTHS
+from ..fragment_launch import fragment_option_fits_shared_block
 from ..fragment_mma_dot import FRAGMENT_MMA_K_THREADS
 from ..fragment_mma_dot import FRAGMENT_MMA_KEY
 from ..fragment_mma_dot import FRAGMENT_MMA_ROW_THREADS
@@ -403,7 +404,7 @@ _FRAGMENT_OPTIONS: dict[str, _FragmentOption] = {
     ),
     "cute_fragment_cta_topk": _FragmentOption(
         lambda spec, config: spec.cute_fragment_cta_topk_root_ids,
-        "a supported complete Int64 value-only selection",
+        "a supported complete Int64 value-only selection with its own CTA",
     ),
     "cute_fragment_split_k": _FragmentOption(
         lambda spec, config: spec.cute_fragment_split_k_root_ids,
@@ -529,6 +530,10 @@ def _normalize_cute_fragment_option(
         if (
             value in option.choices
             and option.admitted(config_spec, config)
+            and (
+                _fragment_cta_owner(config_spec, config)
+                or fragment_option_fits_shared_block(key, value, spec=config_spec)
+            )
             and not any(config.get(other) for other in option.excludes)
         ):
             return
@@ -540,12 +545,24 @@ def _normalize_cute_fragment_option(
     )
 
 
+def _fragment_cta_owner(spec: ConfigSpec, config: Mapping[str, object]) -> bool:
+    return not spec.cute_fragment_cta_requires_flat or (
+        config.get("pid_type", spec.allowed_pid_types[0]) == "flat"
+    )
+
+
 def _normalize_fragment_option(
     config_spec: ConfigSpec, config: dict[str, object], key: str, *, fix_invalid: bool
 ) -> None:
     """Normalize one ``_FRAGMENT_OPTIONS`` mode."""
+    option = _FRAGMENT_OPTIONS[key]
+    if key == "cute_fragment_reduction" and (
+        config_spec.cute_fragment_reduction_shared
+        or not _fragment_cta_owner(config_spec, config)
+    ):
+        option = option._replace(choices=option.choices[:2])
     _normalize_cute_fragment_option(
-        config_spec, config, key, _FRAGMENT_OPTIONS[key], fix_invalid=fix_invalid
+        config_spec, config, key, option, fix_invalid=fix_invalid
     )
 
 
@@ -4503,8 +4520,10 @@ def cute_flat_fields(
     if config_spec.cute_fragment_scan_search_enabled:
         fields["cute_fragment_scan"] = EnumFragment(choices=("serial", "cooperative"))
     if config_spec.cute_fragment_reduction_search_enabled:
+        from .heuristics.cute_fragment_reduction import reduction_modes
+
         fields["cute_fragment_reduction"] = EnumFragment(
-            choices=("serial", "warp", "cta", "cta_unroll")
+            choices=reduction_modes(config_spec)
         )
     if config_spec.cute_fp32_dot_search_enabled:
         fields["cute_fp32_dot"] = EnumFragment(choices=("simt", "tf32_mma"))
