@@ -678,6 +678,303 @@ def test_a_load_leaves_nested_lane_loops() -> None:
     assert code.index("seed =") < code.index("for outer"), code
 
 
+def _tabulate(
+    inner_body: str,
+    *,
+    inner: str = "cutlass.range_constexpr(4)",
+    outer_lead: str = "",
+    outer_extra: str = "",
+    after: str = "",
+    base: str = "cutlass.Int32(cute.arch.thread_idx()[0]) * 2",
+    disjoint: tuple[frozenset[str], ...] = (),
+    rename_groups: dict[str, str] | None = None,
+) -> str:
+    """The pass over a thread's two rows (an outer constexpr loop) whose inner
+    lane loop runs ``inner_body``, followed by ``after``."""
+    source = (
+        "cache = cute.make_rmem_tensor(4, cutlass.Float32)\n"
+        "for row in cutlass.range_constexpr(2):\n"
+        + textwrap.indent(outer_lead, "    ")
+        + f"    base = {base}\n"
+        f"    for lane in {inner}:\n"
+        + textwrap.indent(inner_body, "        ")
+        + textwrap.indent(outer_extra, "    ")
+        + after
+    )
+    result = hoist_lane_invariant_loads(
+        ast.parse(source).body,
+        tensor_dtypes=_TENSOR_DTYPES,
+        proven_disjoint_tensor_pairs=disjoint,
+        rename_groups=rename_groups,
+    )
+    return ast.unparse(ast.Module(body=result, type_ignores=[]))
+
+
+_KEY_LOADS = (
+    "key = base + cutlass.Int32(lane)\n"
+    "doc = _cute_scalar_policy_load(seeds.iterator + key, cutlass.Int64, 'last')\n"
+    "cache[lane] = cutlass.Float32(doc + cutlass.Int64(row))\n"
+)
+
+
+def test_a_key_load_both_rows_repeat_moves_to_a_table() -> None:
+    """A thread's two rows read the same per-key value: it is read once per
+    key, before the row loop, and each row indexes the table."""
+    code = _tabulate(_KEY_LOADS)
+    before, loop = code.split("for row in", 1)
+    assert (
+        "doc_lanes = []" in before
+        and "doc_by_lane = _cute_scalar_policy_load(seeds.iterator + key_by_lane"
+        in before
+    ), code
+    # The table reads the row loop's leading definition of its base.
+    assert before.index("base =") < before.index("for lane_table in"), code
+    assert "doc = doc_lanes[lane]" in loop and "_cute_scalar_policy_load" not in loop, (
+        code
+    )
+    # The per-row use stays.
+    assert "cache[lane] = cutlass.Float32(doc + cutlass.Int64(row))" in loop, code
+
+
+def test_a_table_reads_every_spelling_of_a_chain_name() -> None:
+    """``key_1`` and ``key`` spell one variable (a rename group): the table
+    loop's load reads the key it computed for its lane, not the value the
+    group held before the row loop.  The table loop walks the lanes with a
+    variable of its own."""
+    code = _tabulate(
+        _KEY_LOADS.replace("key = base", "key_1 = base"),
+        rename_groups={"key_1": "key"},
+    )
+    before, _ = code.split("for row in", 1)
+    assert "for lane_table in cutlass.range_constexpr(4)" in before, code
+    assert "key_1_by_lane = base + cutlass.Int32(lane_table)" in before, code
+    assert "seeds.iterator + key_1_by_lane" in before, code
+
+
+def test_a_chain_name_read_after_the_row_loop_keeps_its_binding() -> None:
+    """``last_key = key`` after the row loop reads the key of the last lane
+    of the last row: ``key`` keeps a table, and the rows still bind it."""
+    code = _tabulate(_KEY_LOADS, after="last_key = key\n")
+    _, loop = code.split("for row in", 1)
+    assert "key = key_lanes[lane]" in loop, code
+
+
+def test_an_address_temporary_of_the_table_loads_gets_no_table() -> None:
+    """``key`` addresses the key load and nothing else in the rows: read from
+    a table, it would be dead, so it gets none, leaves the row loop and
+    takes no value of the budget (32 lanes of doc alone fit)."""
+    code = _tabulate(_KEY_LOADS, inner="cutlass.range_constexpr(32)")
+    before, loop = code.split("for row in", 1)
+    assert "doc_lanes = []" in before and "key_lanes" not in code, code
+    assert "key_by_lane = base + cutlass.Int32(lane_table)" in before, code
+    assert "key = " not in loop and "doc = doc_lanes[lane]" in loop, code
+
+
+@pytest.mark.parametrize(
+    ("inner_body", "kwargs"),
+    [
+        pytest.param(
+            _KEY_LOADS.replace(
+                "base + cutlass.Int32(lane)", "base + cutlass.Int32(lane + row)"
+            ),
+            {},
+            id="row-dependent",
+        ),
+        pytest.param(_KEY_LOADS, {"inner": "range(4)"}, id="inner-loop-not-unrolled"),
+        pytest.param(
+            _KEY_LOADS,
+            {"outer_extra": "(seeds.iterator + base).store(cutlass.Int64(0))\n"},
+            id="row-loop-stores-the-loaded-tensor",
+        ),
+        pytest.param(
+            _KEY_LOADS.replace(
+                "cutlass.Int64, 'last'", "cutlass.Float32, 'last'"
+            ).replace("seeds.iterator", "scales.iterator"),
+            {},
+            id="float-load",
+        ),
+        pytest.param(
+            _KEY_LOADS, {"outer_extra": "cute.arch.sync_threads()\n"}, id="barrier"
+        ),
+        # The row loop reads base before its leading definition: a copy of
+        # the definition in front of the loop would change what it reads.
+        pytest.param(
+            _KEY_LOADS,
+            {"outer_lead": "first = base + cutlass.Int32(row)\n"},
+            id="leading-definition-read-before",
+        ),
+        # The same with an inner loop that gets no table in between: the
+        # outer body's read history outlives the inner loop's own.
+        pytest.param(
+            _KEY_LOADS,
+            {
+                "outer_lead": (
+                    "first = base + cutlass.Int32(row)\n"
+                    "for j in cutlass.range_constexpr(2):\n"
+                    "    cache[j] = cutlass.Float32(first)\n"
+                )
+            },
+            id="leading-definition-read-before-an-inner-loop",
+        ),
+        # The leading definition reads table, which out (the row loop's
+        # store) may alias: copied in front of the loop, every row would read
+        # the value the first row read.
+        pytest.param(
+            _KEY_LOADS,
+            {
+                "base": "cutlass.Int32(table[0]) * 2",
+                "outer_extra": "(out.iterator + base).store(cutlass.Float32(0.0))\n",
+                "disjoint": (frozenset({"seeds", "out"}),),
+            },
+            id="leading-definition-reads-what-the-row-loop-may-store",
+        ),
+        # A float product of the loaded value: from a table, both rows would
+        # compute it from one value (the existing move's integer-only rule).
+        pytest.param(
+            _KEY_LOADS.replace(
+                "cache[lane] = cutlass.Float32(doc + cutlass.Int64(row))",
+                "cache[lane] = cutlass.Float32(doc) * cutlass.Float32(0.7) + cache[lane]",
+            ),
+            {},
+            id="float-arithmetic-of-the-loaded-value",
+        ),
+        # 64 lanes of doc: 64 values live across the row loop.
+        pytest.param(
+            _KEY_LOADS,
+            {"inner": "cutlass.range_constexpr(64)"},
+            id="past-the-register-cap",
+        ),
+    ],
+)
+def test_a_key_load_stays(inner_body: str, kwargs: dict[str, object]) -> None:
+    code = _tabulate(inner_body, **kwargs)  # pyrefly: ignore[bad-argument-type]
+    assert "_lanes" not in code, code
+
+
+def test_a_loop_around_tables_still_gives_up_its_invariants() -> None:
+    """The tables' appends write no memory: the lane loop around a row loop
+    whose key loads moved to a table still moves its own invariant load out."""
+    body = ast.parse(
+        textwrap.dedent(
+            """\
+            cache = cute.make_rmem_tensor(4, cutlass.Float32)
+            for v in range(2):
+                t = (seeds.iterator + 3).load()
+                for row in cutlass.range_constexpr(2):
+                    base = cutlass.Int32(cute.arch.thread_idx()[0]) * 2
+                    for lane in cutlass.range_constexpr(4):
+                        key = base + cutlass.Int32(lane)
+                        doc = (seeds.iterator + key + t).load()
+                        cache[lane] = cutlass.Float32(doc + cutlass.Int64(row + v))
+            """
+        )
+    ).body
+    setattr(body[1], HELION_LANE_LOOP_VAR_ATTR, "v")
+    result = hoist_lane_invariant_loads(body, tensor_dtypes=_TENSOR_DTYPES)
+    code = ast.unparse(ast.Module(body=result, type_ignores=[]))
+    assert "doc_lanes" in code, code
+    assert code.index("t = ") < code.index("for v"), code
+
+
+@pytest.mark.parametrize(
+    ("row_store", "after_rows"),
+    [
+        # A later sibling loop reads the trace lists before the row loop's
+        # tables reach the body: the lists still include the tables.
+        (
+            "cache[lane] = cutlass.Float32(doc + cutlass.Int64(row + v))",
+            (
+                "for j in cutlass.range_constexpr(2):\n"
+                "    cache[j] = cache[j] + cutlass.Float32(v)\n"
+            ),
+        ),
+        # The rows read doc from its table: still an integer.
+        (
+            (
+                "cache[lane] = cutlass.Float32(doc + cutlass.Int64(row))"
+                " + cutlass.Float32(v)"
+            ),
+            "",
+        ),
+    ],
+    ids=["a-later-sibling-loop", "integer-table-reads"],
+)
+def test_a_loop_around_tables_moves_its_invariant_load(
+    row_store: str, after_rows: str
+) -> None:
+    body = ast.parse(
+        "cache = cute.make_rmem_tensor(4, cutlass.Float32)\n"
+        "for v in range(2):\n"
+        "    t = (seeds.iterator + 3).load()\n"
+        "    for row in cutlass.range_constexpr(2):\n"
+        "        base = cutlass.Int32(cute.arch.thread_idx()[0]) * 2\n"
+        "        for lane in cutlass.range_constexpr(4):\n"
+        "            key = base + cutlass.Int32(lane)\n"
+        "            doc = (seeds.iterator + key + t).load()\n"
+        f"            {row_store}\n" + textwrap.indent(after_rows, "    ")
+    ).body
+    setattr(body[1], HELION_LANE_LOOP_VAR_ATTR, "v")
+    result = hoist_lane_invariant_loads(body, tensor_dtypes=_TENSOR_DTYPES)
+    code = ast.unparse(ast.Module(body=result, type_ignores=[]))
+    assert "doc_lanes" in code, code
+    assert code.index("t = ") < code.index("for v"), code
+
+
+def test_a_float_of_table_values_keeps_the_feeding_load_in_its_loop() -> None:
+    """The rows scale doc by the row as floats: the tables are made (the
+    product differs between rows), but within ``for v`` the product would
+    not change, so ``t``, which feeds the tables (an append writes its
+    list), stays in ``for v``."""
+    body = ast.parse(
+        textwrap.dedent(
+            """\
+            cache = cute.make_rmem_tensor(4, cutlass.Float32)
+            for v in range(2):
+                t = (seeds.iterator + 3).load()
+                for row in cutlass.range_constexpr(2):
+                    base = cutlass.Int32(cute.arch.thread_idx()[0]) * 2
+                    for lane in cutlass.range_constexpr(4):
+                        key = base + cutlass.Int32(lane)
+                        doc = (seeds.iterator + key + t).load()
+                        cache[lane] = cutlass.Float32(doc) * cutlass.Float32(row) + cache[lane]
+            """
+        )
+    ).body
+    setattr(body[1], HELION_LANE_LOOP_VAR_ATTR, "v")
+    result = hoist_lane_invariant_loads(body, tensor_dtypes=_TENSOR_DTYPES)
+    code = ast.unparse(ast.Module(body=result, type_ignores=[]))
+    assert "doc_lanes" in code, code
+    assert code.index("for v") < code.index("t = "), code
+
+
+def test_a_float_the_tables_would_make_invariant_keeps_the_loads() -> None:
+    """The row loop scales the key loads' values as floats: read from a
+    table, ``cutlass.Float32(doc) * 0.5`` would be one product for both rows,
+    which LLVM may round apart from the add it contracts with, so the loads
+    stay in the rows, and so does the lane loop's own load ``t`` that feeds
+    them (the existing move's integer-only rule)."""
+    body = ast.parse(
+        textwrap.dedent(
+            """\
+            cache = cute.make_rmem_tensor(4, cutlass.Float32)
+            for v in range(2):
+                t = (seeds.iterator + 3).load()
+                for row in cutlass.range_constexpr(2):
+                    base = cutlass.Int32(cute.arch.thread_idx()[0]) * 2
+                    for lane in cutlass.range_constexpr(4):
+                        key = base + cutlass.Int32(lane)
+                        doc = (seeds.iterator + key + t).load()
+                        cache[lane] = cutlass.Float32(doc) * cutlass.Float32(0.5) + cache[lane]
+            """
+        )
+    ).body
+    setattr(body[1], HELION_LANE_LOOP_VAR_ATTR, "v")
+    result = hoist_lane_invariant_loads(body, tensor_dtypes=_TENSOR_DTYPES)
+    code = ast.unparse(ast.Module(body=result, type_ignores=[]))
+    assert "_lanes" not in code, code
+    assert code.index("for v") < code.index("t = "), code
+
+
 @functools.cache
 def _compiled(hoisted: bool) -> tuple[str, tuple[torch.Tensor, torch.Tensor]]:
     args = _args(DEVICE)
