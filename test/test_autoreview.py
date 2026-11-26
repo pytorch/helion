@@ -554,6 +554,7 @@ def test_claude_command_and_foreground_env_without_processes(
     for index, (cmd, kwargs) in enumerate(calls):
         prompt = cmd[cmd.index("-p") + 1]
         assert prompt.startswith(prompts[index] + "\n\n")
+        assert "LGTM comes BEFORE the completion line" in prompt
         assert cmd == [
             "claude",
             *(["--dangerously-enable-internet-mode"] if meta else []),
@@ -783,6 +784,19 @@ def test_followup_cannot_reuse_previous_completion(review, monkeypatch, tmp_path
     (log_dir,) = (tmp_path / "logs").iterdir()
     assert (log_dir / "claude-review.txt").read_text() == "claude says LGTM"
     assert not (log_dir / "combined-review.txt").exists()
+
+
+@pytest.mark.slow
+def test_verdict_after_the_completion_line_is_unconfirmed(review, monkeypatch):
+    # A resumed reviewer once followed the two "last line" instructions in
+    # reverse order. A passing verdict cannot confirm an unfinished response.
+    monkeypatch.setenv(
+        "FAKE_CLAUDE_PAYLOAD",
+        json.dumps({"result": "<CURRENT_COMPLETION>\n\nLGTM", "session_id": "s1"}),
+    )
+    code, out, err = review("claude")
+    assert code == 2 and not out.strip()
+    assert "did not confirm completion" in err and "autoreview passed:" not in err
 
 
 @pytest.mark.slow
