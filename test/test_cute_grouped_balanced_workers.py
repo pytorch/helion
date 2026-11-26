@@ -11,9 +11,6 @@ import torch
 from test._cute_grouped_gemm_split_sizes import _device_offsets_kernel
 from test._cute_grouped_gemm_split_sizes import _device_split_sizes_kernel
 from test.cute_population_contracts import _target
-from test.test_cute_grouped_ab_k import _unsupported_k_loop
-from test.test_cute_grouped_d_shift import _args
-from test.test_cute_grouped_d_shift import _config as _d_shift_config
 from test.test_cute_grouped_d_shift import _plans
 from test.test_cute_grouped_d_shift import _unsafe_output
 
@@ -22,6 +19,9 @@ from helion._compiler.cute.grouped_balanced_workers import balanced_workers_inde
 from helion._testing.cute_codegen import cpu_bind
 from helion._testing.cute_codegen import forbid_cuda_work
 from helion._testing.cute_codegen import mock_cuda_unavailable
+from helion._testing.cute_grouped_gemm import _unsupported_k_loop
+from helion._testing.cute_grouped_gemm import grouped_d_shift_args as _args
+from helion._testing.cute_grouped_gemm import grouped_d_shift_config as _d_shift_config
 from helion.exc import BackendUnsupported
 from helion.exc import InvalidConfig
 from helion.runtime.cute.launcher import _append_cute_wrapper_plan

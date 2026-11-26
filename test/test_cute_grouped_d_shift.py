@@ -13,7 +13,6 @@ from test._cute_grouped_gemm_split_sizes import _device_offsets_kernel
 from test._cute_grouped_gemm_split_sizes import _device_split_sizes_kernel
 from test.cute_population_contracts import _target
 from test.test_cute_grouped_ab_k import _observed_logical_k
-from test.test_cute_grouped_ab_k import _unsupported_k_loop
 
 import helion
 from helion._compiler.cute.grouped_d_shift import bounded_d_shift_index_domain
@@ -23,6 +22,8 @@ from helion._testing.cute_codegen import forbid_cuda_work
 from helion._testing.cute_codegen import mock_cuda_unavailable
 from helion._testing.cute_codegen import require_cute_codegen
 from helion._testing.cute_flash import seeds_per_codegen_branch
+from helion._testing.cute_grouped_gemm import grouped_d_shift_args as _args
+from helion._testing.cute_grouped_gemm import grouped_d_shift_config as _config
 from helion.exc import BackendUnsupported
 from helion.exc import InvalidConfig
 import helion.language as hl
@@ -61,38 +62,6 @@ def _unsafe_output(
             acc = torch.addmm(acc, left, b[group, columns, inner].T)
         hl.store(out, [row, columns], acc, extra_mask=valid[:, None])
     return out
-
-
-def _config(orientation: str, *, cluster_n: int = 1) -> helion.Config:
-    return helion.Config(
-        block_sizes=[256, 128, 64],
-        pid_type="persistent_interleaved",
-        tcgen05_cluster_m=2,
-        tcgen05_cluster_n=cluster_n,
-        tcgen05_ab_stages=2,
-        tcgen05_acc_stages=2,
-        tcgen05_c_stages=2,
-        tcgen05_num_epi_warps=4,
-        tcgen05_grouped_mode="worklist_nm",
-        tcgen05_grouped_worklist_orientation=orientation,
-        tcgen05_grouped_worklist_mma_n=256,
-        tcgen05_grouped_worklist_source_m_tile=128,
-        tcgen05_grouped_full_allocation_a=True,
-        tcgen05_grouped_d_shift=True,
-    )
-
-
-def _args(kind: str, dtype: torch.dtype):
-    metadata = (
-        [0, 1, 128, 128, 128, 128, 126, 1]
-        if kind == "sizes"
-        else [0, 0, 1, 129, 257, 385, 513, 639, 640]
-    )
-    return (
-        torch.empty((640, 256), dtype=torch.bfloat16),
-        torch.empty((8, 512, 256), dtype=torch.bfloat16),
-        torch.tensor(metadata, dtype=dtype),
-    )
 
 
 def _plans(source: str):
@@ -277,15 +246,6 @@ def test_default_off_matches_the_original_source(orientation: str) -> None:
         generated = bound.to_code(config)
         assert "TensorMapManager" in generated
         assert "bounded_output_shift" not in generated
-
-
-@pytest.mark.parametrize("variant", [1, 2, 3, 5])
-def test_noncanonical_reductions_cannot_request_bounded_d_shift(variant: int) -> None:
-    with forbid_cuda_work(), _target(), mock_cuda_unavailable():
-        bound = cpu_bind(_unsupported_k_loop, (*_args("fp32", torch.int32), variant))
-        assert not bound.config_spec._cute_tcgen05_config.grouped_d_shift_supported
-        with pytest.raises((InvalidConfig, BackendUnsupported)):
-            bound.to_code(_config("mn"))
 
 
 @pytest.mark.parametrize("variant", [0, 1])

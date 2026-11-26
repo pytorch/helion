@@ -14,7 +14,7 @@ from helion._compiler.cute.tcgen05_constants import tcgen05_grouped_worklist_sme
 from helion._testing.cute_codegen import cpu_bind
 from helion._testing.cute_codegen import forbid_cuda_work
 from helion._testing.cute_codegen import mock_cuda_unavailable
-import helion.language as hl
+from helion._testing.cute_grouped_gemm import _grouped_offsets_k64
 
 pytestmark = pytest.mark.cpu_only
 
@@ -22,32 +22,6 @@ SOURCE = "tcgen05_grouped_worklist_source_m_tile"
 IMMUTABLE = "tcgen05_grouped_full_allocation_a"
 PHYSICAL_K = "tcgen05_grouped_ab_tile_k"
 SHIFTED = "tcgen05_grouped_d_shift"
-
-
-@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
-def _grouped_offsets_k64(
-    a: torch.Tensor, weights: torch.Tensor, offsets: torch.Tensor
-) -> torch.Tensor:
-    rows, reduction = a.shape
-    groups, columns, _ = weights.shape
-    block_m = hl.register_block_size(256)
-    block_n = hl.register_block_size(128)
-    block_k = hl.register_block_size(64)
-    out = torch.empty((rows, columns), device=a.device, dtype=a.dtype)
-    for group_tile, row_tile, column_tile in hl.tile(
-        [groups, rows, columns], block_size=[1, block_m, block_n]
-    ):
-        group = group_tile.index.sum()
-        start = offsets[group]
-        extent = offsets[group + 1] - offsets[group]
-        row_indices = start + row_tile.index
-        valid = row_tile.index < extent
-        acc = hl.zeros([row_tile, column_tile], dtype=torch.float32)
-        for inner in hl.tile(reduction, block_size=block_k):
-            left = hl.load(a, [row_indices, inner], extra_mask=valid[:, None])
-            acc = torch.addmm(acc, left, weights[group, column_tile, inner].T)
-        hl.store(out, [row_indices, column_tile], acc, extra_mask=valid[:, None])
-    return out
 
 
 def _kernel():

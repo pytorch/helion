@@ -14,7 +14,6 @@ import pytest
 import torch
 
 from test.cute_population_contracts import _target
-from test.test_cute_grouped_d_shift import _config as _ordinary_config
 from test.test_cute_grouped_large_device_seeds import _kernel
 from test.test_cute_grouped_paired_clc_layout import _sdk
 from test.test_cute_grouped_prefix_adaptive_config import _args
@@ -29,6 +28,7 @@ from helion._testing.cute_codegen import cpu_bind
 from helion._testing.cute_codegen import forbid_cuda_work
 from helion._testing.cute_codegen import mock_cuda_unavailable
 from helion._testing.cute_codegen import require_cute_codegen
+from helion._testing.cute_grouped_gemm import grouped_d_shift_config as _ordinary_config
 from helion.exc import InvalidConfig
 import helion.language as hl
 from helion.runtime.cute.launcher import _create_cute_wrapper
