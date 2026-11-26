@@ -3,6 +3,7 @@ from __future__ import annotations
 import functools
 import importlib
 import inspect
+import os
 import re
 import unittest
 from unittest.mock import patch
@@ -574,6 +575,13 @@ def kernel(in0: torch.Tensor, in1: torch.Tensor, out0: torch.Tensor, out1: torch
                 ((False, True), "accumulator"),
                 ((False, False), "none"),
             ):
+                if (
+                    flags == (False, False)
+                    and os.environ.get("HELION_INTERPRET") == "1"
+                ):
+                    # Ref mode runs the kernel's 16-bit mm eagerly, which torch
+                    # refuses with allow_splitk=False outside its cuBLASLt backend.
+                    continue
                 setattr(matmul, attr, flags)
                 for fn in (torch.mm, fp32_out):
                     torch._dynamo.reset()
