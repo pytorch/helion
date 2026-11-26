@@ -11119,9 +11119,21 @@ class CutePointwiseVecHeuristic(AutotunerHeuristic):
             None,
         )
         fragments = {s.block_id: s._fragment(spec) for s in spec.block_sizes}
+        # A group whose tile.index the kernel reads (helion.inductor's pads
+        # and cats: ``tmp0 = (tile_x.index).to(torch.int64)``) decodes every
+        # element's indices from the flat offset once flattened
+        # (``indices_1 = offsets_0_1_2 % 384``, ``indices_0 = offsets_0_1_2 //
+        # 24576`` beside each packet), where its tiles keep them as tile
+        # indices.  It flattens only where its stride-1 axis takes no packets
+        # (vec <= 1: a pad to rows of 23923 bf16), and a narrow axis that
+        # takes them keeps the tile seeds: given the flattened seeds of a
+        # GhostNet cat over [128, 64, 384], a full search selected a tile
+        # config of 7.0 us on GB300, where one from the tile seeds had
+        # selected 4.6.
+        index_group = flatten_group is not None and spec.reads_tile_index(flatten_group)
         # Flatten when one axis cannot supply a full CTA of vector packets.
         narrow = fragments[vec_block].high < cls.NT * full_vec
-        flatten = vec <= 1 or (flatten_group is not None and narrow)
+        flatten = vec <= 1 or (flatten_group is not None and narrow and not index_group)
         tile_ids = [vec_block]
         if flatten:
             if flatten_group is None:
@@ -11197,7 +11209,12 @@ class CutePointwiseVecHeuristic(AutotunerHeuristic):
             return []
         seeds = [primary]
         base_variants: list[dict[str, Any]] = [primary.config]
-        if not flatten and len(spec.block_sizes) > 1 and flatten_group is not None:
+        if (
+            not flatten
+            and len(spec.block_sizes) > 1
+            and flatten_group is not None
+            and not index_group
+        ):
             flat_seed: dict[str, Any] = deepcopy(primary.config)
             flat_seed["flatten_loops"] = [
                 group is flatten_group for group in spec.flatten_loops

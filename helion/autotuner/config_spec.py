@@ -1873,6 +1873,10 @@ class ConfigSpec:
         # (``update_allow_flattened``); re-registered for PURE pointwise
         # kernels on cute once device-IR analysis proves the fact.
         self.cute_reflatten_candidates: list[FlattenLoopSpec] = []
+        # Blocks whose tile.index the kernel reads (``defer_flatten_loop``
+        # with ``per_element``): a flattened tile decodes each of their
+        # indices from the flat offset.
+        self.cute_tile_index_block_ids: set[int] = set()
         self.backend_tunable_fragments = self.backend.tunable_fragments()
         # A backend may give a fragment to any of its own surface's keys
         # (built-in or plugin) except Helion's gated generic ones;
@@ -2060,6 +2064,44 @@ class ConfigSpec:
         self.range_multi_buffers._remove_duplicates()
         self.range_flattens._remove_duplicates()
         self.static_ranges._remove_duplicates()
+
+    def defer_flatten_loop(
+        self,
+        block_id: int,
+        *,
+        spec: FlattenLoopSpec | None = None,
+        per_element: bool = False,
+    ) -> None:
+        """Drop the flatten_loops choice of ``block_id``'s loop until the
+        kernel proves pure pointwise: it waits in ``cute_reflatten_candidates``,
+        which CuTe's device-IR analysis offers again for such a kernel
+        (``restore_pointwise_flatten_choices``).  ``spec``: the loop's own
+        choice, the one that waits (a partial access of the loop); without
+        it, every choice that holds the block waits, unless it shares a block
+        with one already waiting (the loop or loops that read the block's
+        tile.index: the choices of a [bm, bn, bk] loop and a [bm, bn] loop
+        would come back both).  ``per_element``: the kernel reads the block's
+        tile.index (``cute_tile_index_block_ids``)."""
+        if per_element:
+            self.cute_tile_index_block_ids.add(block_id)
+        waiting = self.cute_reflatten_candidates
+        if spec is not None:
+            if all(c.block_ids != spec.block_ids for c in waiting):
+                waiting.append(spec)
+        else:
+            for held in self.flatten_loops:
+                if block_id in held.block_ids and all(
+                    not set(c.block_ids) & set(held.block_ids) for c in waiting
+                ):
+                    waiting.append(held)
+        self.flatten_loops.disable_block_id(block_id)
+
+    def reads_tile_index(self, spec: FlattenLoopSpec) -> bool:
+        """Whether the kernel reads the tile.index of a block of ``spec``'s
+        loop (``cute_tile_index_block_ids``)."""
+        return any(
+            block_id in self.cute_tile_index_block_ids for block_id in spec.block_ids
+        )
 
     def pin_flatten_loop(self, block_id: int) -> None:
         """Pin the flatten_loops choice of ``block_id``'s loop to False.

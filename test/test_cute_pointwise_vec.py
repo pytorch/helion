@@ -807,21 +807,34 @@ class TestCutePointwiseVec(TestCase):
                 x = storage[start : start + 6144].view(4, 24, 2, 32).permute(0, 2, 1, 3)
                 self.assertTrue(torch.equal(kernel(x), x.to(torch.float32)))
 
-    def test_tile_index_disables_flatten_reregistration(self) -> None:
-        """Regression: hl.tile_index only disabled flatten at CODEGEN time,
-        so the pointwise flatten re-registration resurrected it -> wrong
-        results under flatten_loops=[True]."""
+    def test_flattened_tile_index_matches_eager(self) -> None:
+        """hl.tile_index keeps a pure pointwise kernel's flatten choice: each
+        element decodes its own row from the flat offset, element by element
+        and in packets (test_cute_flatten_tile_index.py pins the code)."""
         x = torch.randn(64, 512, device=DEVICE, dtype=torch.float32)
         b = torch.randn(512, device=DEVICE, dtype=torch.float32)
         spec = _tile_index_bias.bind((x, b)).config_spec
-        self.assertEqual(len(spec.flatten_loops), 0)
-        _, out = code_and_output(
-            _tile_index_bias, (x, b), block_sizes=[16, 128], num_threads=[1, 64]
-        )
+        self.assertEqual(len(spec.flatten_loops), 1)
         ref = (
             x + b + torch.arange(x.size(0), device=DEVICE, dtype=torch.float32)[:, None]
         )
-        torch.testing.assert_close(out, ref)
+        for config in (
+            {
+                "block_sizes": [16, 128],
+                "num_threads": [1, 64],
+                "flatten_loops": [False],
+            },
+            {"block_sizes": [16, 128], "num_threads": [1, 64], "flatten_loops": [True]},
+            {
+                "block_sizes": [1, 512],
+                "num_threads": [1, 64],
+                "flatten_loops": [True],
+                "cute_vector_widths": [1, 4],
+            },
+        ):
+            with self.subTest(**config):
+                _, out = code_and_output(_tile_index_bias, (x, b), **config)
+                torch.testing.assert_close(out, ref)
 
     def test_scalar_strided_lane_keeps_launch_width(self) -> None:
         """Regression: a SCALAR lane loop with cute_lane_layouts=strided
