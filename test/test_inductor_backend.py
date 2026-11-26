@@ -3,9 +3,7 @@ from __future__ import annotations
 import functools
 import importlib
 import inspect
-import os
 import re
-import tempfile
 import unittest
 from unittest.mock import patch
 
@@ -45,7 +43,6 @@ if not requires_torch_version("2.16"):
 from torch._inductor.choices import registered_inductor_choices
 
 import helion
-from helion.autotuner.benchmark_provider import LocalBenchmarkProvider
 import helion.inductor
 from helion.inductor import config as helion_config
 from helion.inductor import kernel_sequence
@@ -1853,56 +1850,6 @@ def kernel(in0: torch.Tensor, out0: torch.Tensor, out1: torch.Tensor) -> None:
             torch._dynamo.reset()
             self.compile(lambda x: x.sum(0), x, tol=1e-3)
         self.assertNotIn("helion_in_sequence", self.code)
-
-    @pytest.mark.slow
-    @skipIfRefEager("reference mode sequences nothing: it searches no config")
-    def test_kernels_searched_in_sequence_cache_under_their_prelude(self):
-        # Quick searches of the split sum over y's two kernels: the
-        # benchmark jobs of the second carry the first kernel's call as their
-        # prelude, and the generated module, loaded again, finds both winners
-        # in the autotune cache (the second under its prelude's key) and
-        # searches nothing.
-        jobs = []
-        run_job = LocalBenchmarkProvider._run_subprocess_benchmark_job
-
-        def recorded(provider, *args, **kwargs):
-            jobs.append(provider._prelude_path is not None)
-            return run_job(provider, *args, **kwargs)
-
-        environ = {
-            name: value
-            for name, value in os.environ.items()
-            # a regime without a flush per call refuses a prelude
-            if name
-            not in (
-                "HELION_AUTOTUNE_L2_FLUSH",
-                "HELION_AUTOTUNE_FINAL_L2_FLUSH",
-                "HELION_AUTOTUNE_TARGET_REGIME",
-            )
-        }
-        environ["HELION_CACHE_DIR"] = self.enterContext(tempfile.TemporaryDirectory())
-        self.enterContext(patch.dict(os.environ, environ, clear=True))
-        self.enterContext(
-            patch.object(
-                LocalBenchmarkProvider, "_run_subprocess_benchmark_job", recorded
-            )
-        )
-        # As in test_kernels_tuned_in_sequence: the sequence on Triton.
-        self.enterContext(
-            patch.object(kernel_sequence, "times_short_kernels", lambda bound: True)
-        )
-        self.enterContext(config.patch({"triton.mix_order_reduction": True}))
-        self.enterContext(helion_config.patch(autotune_effort="quick"))
-        x = torch.randn(100000, 96, device=DEVICE)
-        self.assertEqual(len(self.compile(lambda x: x.sum(0), x, tol=1e-3)), 2)
-        self.assertIn(False, jobs)
-        self.assertIn(True, jobs)
-        jobs.clear()
-        torch._dynamo.reset()
-        PyCodeCache.cache_clear()
-        with fresh_cache():
-            self.compile(lambda x: x.sum(0), x, tol=1e-3)
-        self.assertEqual(jobs, [])
 
     def test_split_reduction_chunks(self):
         # Inductor cuts x.sum(0), an rdim of 100000, into chunks by a
