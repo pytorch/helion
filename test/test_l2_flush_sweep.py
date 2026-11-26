@@ -491,7 +491,11 @@ def test_traced_windows_read_each_call_behind_the_flush_and_the_sweep(
 def test_graph_timers_sweep_outside_the_timed_call(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    x = torch.randn(1 << 16, device=DEVICE)
+    # An add long enough to stand above the noise of subtracting the 256 MB
+    # flush before each call (4 MB in, 4 MB out: some 20 us on an A10G by its
+    # bandwidth, 3 us on a GB300), yet short enough that do_bench batches it
+    # (_BATCHED_REPLAY_BELOW_US)
+    x = torch.randn(1 << 20, device=DEVICE)
     monkeypatch.setenv("HELION_BENCHMARK_CUDAGRAPH", "1")
     batched: list[int] = []
     capture = benchmarking._batched_flushed_replays
@@ -502,11 +506,11 @@ def test_graph_timers_sweep_outside_the_timed_call(
 
     monkeypatch.setattr(benchmarking, "_batched_flushed_replays", recorded)
 
-    def short() -> float:
+    def short(rep: int = 5) -> float:
         return benchmarking.do_bench(  # pyrefly: ignore[bad-return]
             lambda: torch.add(x, 1.0),
             warmup=1,
-            rep=5,
+            rep=rep,
             return_mode="median",
             l2_flush_mode="call",
         )
@@ -514,7 +518,10 @@ def test_graph_timers_sweep_outside_the_timed_call(
     with l2_flush_sweep(True):
         assert 0.0 < short() < 1.0
     assert batched == []
-    assert 0.0 < short() < 1.0
+    # 50 ms holds several batches even on an A10G (an estimated 1 to 2 ms
+    # each, flushes included), and do_bench reads inf only when every
+    # flush-corrected sample is non-positive
+    assert 0.0 < short(rep=50) < 1.0
     assert batched
     # do_bench_cuda_graph captures [flush, sweep] before its start event
     with l2_flush_sweep(True):
