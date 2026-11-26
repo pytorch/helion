@@ -211,10 +211,15 @@ class RefTile(TileInterface, torch.Tensor):
 
     @property
     def index(self) -> torch.Tensor:  # pyrefly: ignore [bad-override]
-        """Return tensor of indices for .index attribute access in ref mode."""
+        """Return tensor of indices for .index attribute access in ref mode:
+        Int32, or Int64 where a coordinate does not fit Int32 (a tile shifted
+        past 2**31), as compiled code widens such a grid's coordinates."""
         from .._compiler.compile_environment import CompileEnvironment
 
         env = CompileEnvironment.current()
-        return torch.arange(
-            self._slice.start, self._slice.stop, dtype=torch.int32, device=env.device
-        )
+        start, stop = self._slice.start, self._slice.stop
+        int32 = torch.iinfo(torch.int32)
+        if stop <= start or (int32.min <= start and stop - 1 <= int32.max):
+            return torch.arange(start, stop, dtype=torch.int32, device=env.device)
+        # Counted from the start: the stop itself may not fit Int64 (2**63).
+        return start + torch.arange(stop - start, dtype=torch.int64, device=env.device)
