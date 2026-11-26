@@ -5,6 +5,7 @@ and without the affine split, and the register run's other forms."""
 
 from __future__ import annotations
 
+import re
 import sys
 from typing import TYPE_CHECKING
 from typing import cast
@@ -132,7 +133,7 @@ class TestMppRegisters(unittest.TestCase):
         """x is read as a device view at 8 rows or fewer; past that on an M4,
         whose layout relabels K, it is built in registers (on a GPU whose
         layout keeps a lane's K positions in order it stays a view)."""
-        view = "auto _mpp_a = tensor<device half" in msl
+        view = re.search(r"auto _mpp_a\d+ = tensor<device half", msl) is not None
         if rows <= 8:
             self.assertTrue(view)
         elif "M4" in torch.backends.mps.get_name():  # pyrefly: ignore[missing-attribute]
@@ -224,7 +225,7 @@ class TestMppRegisters(unittest.TestCase):
         y = torch.randn(128, 32, device=DEVICE)
         config = register_config([16, 32, 64], [1, 2, 16])
         out, msl = _run(inner_tiled_mm, (x, y), config)
-        self.assertIn("_mpp_op_0.run(_mr_a, ", msl)
+        self.assertRegex(msl, r"_mpp_op_0\.run\(_mr_a\d+, ")
         self._close(out, (2 * x).cpu().double() @ y.cpu().double())
 
     def test_forms(self) -> None:

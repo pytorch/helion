@@ -49,6 +49,20 @@ def _k_loop(msl: str) -> str:
     return msl[start : msl.index("\n    }\n", start)]
 
 
+def _runs(loop: str, left: str, right: str) -> list[int]:
+    """The steps of the ops on ``left``/``right`` operands in ``loop``, in
+    order: each step's operands carry its number (``_mr_a1``, ``_mpp_a1``),
+    and the loop runs no other op."""
+    steps = [
+        int(m.group(1))
+        for m in re.finditer(
+            rf"_mpp_op_0\.run\({left}(\d+), {right}\1, acc_copy_0\);", loop
+        )
+    ]
+    assert loop.count("_mpp_op_0.run(") == len(steps), loop
+    return steps
+
+
 class TestLayout(TestCase):
     def test_blocked_layout_factors(self) -> None:
         """The M4's layout of each operand of each op shape is a lane base
@@ -168,12 +182,15 @@ class TestRegisterCodegen(TestCase):
                     msl,
                 )
                 self.assertIn(
-                    "auto _mr_a = _mpp_op_0.get_left_input_cooperative_tensor"
+                    "auto _mr_a0 = _mpp_op_0.get_left_input_cooperative_tensor"
                     "<half, float, float>();",
                     loop,
                 )
-                self.assertEqual(
-                    loop.count("_mpp_op_0.run(_mr_a, _mr_b, acc_copy_0);"), 4
+                self.assertEqual(_runs(loop, "_mr_a", "_mr_b"), [0, 1, 2, 3])
+                # With both operands in registers the steps keep their order.
+                self.assertLess(
+                    loop.index("_mpp_op_0.run(_mr_a0, _mr_b0, acc_copy_0);"),
+                    loop.index("auto _mr_a1 = "),
                 )
                 self.assertIn(
                     "const short _mrl0 = ((_mpp_lane >> 1) & 1) + ((_mpp_lane >> 2) "
@@ -207,11 +224,23 @@ class TestRegisterCodegen(TestCase):
         loop = self._assert_registers(msl)
         self.assertIn("matmul2d_descriptor(8, 32, 16, false, true, false,", msl)
         self.assertNotIn("_mr_a", msl)
-        self.assertEqual(loop.count("auto _mpp_a = tensor<device half"), 4)
+        self.assertEqual(
+            len(re.findall(r"auto _mpp_a\d+ = tensor<device half", loop)), 4
+        )
         self.assertIn("(long)((offset_2) + 16) * 1)", loop)
         # Every K tile is whole, so every step is live.
         self.assertNotIn("< (long)(512)) {", loop)
-        self.assertEqual(loop.count("_mpp_op_0.run(_mpp_a, _mr_b, acc_copy_0);"), 4)
+        self.assertEqual(_runs(loop, "_mpp_a", "_mr_b"), [0, 1, 2, 3])
+        # Beside a view, each step's operands are built before the previous
+        # step's op, so their reads overlap it.
+        self.assertLess(
+            loop.index("auto _mr_b1 = "),
+            loop.index("_mpp_op_0.run(_mpp_a0, _mr_b0, acc_copy_0);"),
+        )
+        self.assertLess(
+            loop.index("_mpp_op_0.run(_mpp_a0, _mr_b0, acc_copy_0);"),
+            loop.index("auto _mr_b2 = "),
+        )
         # The destination is typed by the device input.
         self.assertIn(
             "get_destination_cooperative_tensor<tensor<device half, extents<int32_t, "
@@ -237,13 +266,13 @@ class TestRegisterCodegen(TestCase):
         args = affine_args(4, 32, 16, 64, 256)
         msl = render_msl(affine_mm, args, register_config([16, 16, 64]))
         self.assertIn("matmul2d_descriptor(16, 16, 32,", msl)
-        self.assertEqual(_k_loop(msl).count("_mpp_op_0.run(_mr_a, _mr_b,"), 2)
+        self.assertEqual(_runs(_k_loop(msl), "_mr_a", "_mr_b"), [0, 1])
         args = affine_args(4, 32, 32, 64, 256)
         msl = render_msl(affine_mm, args, register_config([32, 32, 64]))
         self.assertIn("matmul2d_descriptor(32, 32, 16,", msl)
         msl = render_msl(affine_mm, args, register_config([32, 64, 64]))
         self.assertIn("matmul2d_descriptor(32, 64, 16,", msl)
-        self.assertIn("auto _mpp_a = tensor<device half", msl)
+        self.assertRegex(msl, r"auto _mpp_a\d+ = tensor<device half")
 
     def test_more_simdgroups_stage(self) -> None:
         """A launch of two SIMD groups stages the weight through threadgroup
@@ -266,18 +295,18 @@ class TestRegisterCodegen(TestCase):
         x, wq, s = nvfp4_cpu_args(16)
         msl = render_msl(nvfp4_rows, (x, wq, s), register_config([16, 32, 64]))
         self.assertIn("get_right_input_cooperative_tensor<bfloat, bfloat, float>", msl)
-        self.assertIn("auto _mpp_a = tensor<device bfloat", msl)
+        self.assertRegex(msl, r"auto _mpp_a\d+ = tensor<device bfloat")
         # Every conversion to bfloat in the element loops rounds as lane
         # copies round (helion_bf16_cast), keeping bfloat subnormals that
         # Metal's own cast flushes.
-        self.assertRegex(msl, r"_mr_b\[\d+\] = helion_bf16_cast\(")
+        self.assertRegex(msl, r"_mr_b\d+\[\d+\] = helion_bf16_cast\(")
         self.assertNotIn("static_cast<bfloat>", _k_loop(msl))
         args = affine_args(4, 32, 16, 64, 256)
         msl = render_msl(
             affine_mm, (args[0].float(), *args[1:]), register_config([16, 32, 64])
         )
         self.assertIn("get_right_input_cooperative_tensor<float, float, float>", msl)
-        self.assertIn("auto _mpp_a = tensor<device float", msl)
+        self.assertRegex(msl, r"auto _mpp_a\d+ = tensor<device float")
 
     def test_narrowed_operands(self) -> None:
         """Operands converted to half from float are both built in registers
@@ -287,7 +316,7 @@ class TestRegisterCodegen(TestCase):
         msl = render_msl(k_from_16, (x, y), register_config([16, 32, 16]))
         loop = self._assert_registers(msl)
         self.assertIn(
-            "auto _mr_a = _mpp_op_0.get_left_input_cooperative_tensor<half, half, "
+            "auto _mr_a0 = _mpp_op_0.get_left_input_cooperative_tensor<half, half, "
             "float>();",
             loop,
         )
@@ -345,7 +374,7 @@ class TestRegisterCodegen(TestCase):
         msl = render_msl(affine_mm, args, register_config([16, 16, 512]))
         loop = self._assert_registers(msl)
         self.assertIn("matmul2d_descriptor(16, 16, 32, false, true, false,", msl)
-        self.assertEqual(loop.count("_mpp_op_0.run(_mr_a, _mr_b, acc_copy_0);"), 16)
+        self.assertEqual(_runs(loop, "_mr_a", "_mr_b"), list(range(16)))
 
     def test_view_tail(self) -> None:
         """Over a K tail a view's step past the tile's live K is skipped."""
@@ -364,7 +393,7 @@ class TestRegisterCodegen(TestCase):
         msl = render_msl(inner_tiled_mm, (x, y), config)
         self.assertIn("execution_simdgroup> _mpp_op_0;", msl)
         self.assertNotIn("_mpp_tile", msl)
-        self.assertIn("_mpp_op_0.run(_mr_a, ", msl)
+        self.assertRegex(msl, r"_mpp_op_0\.run\(_mr_a\d+, ")
 
     def test_lane_table(self) -> None:
         """A lane base that factors but isn't a sum of the lane index's bits'
@@ -401,7 +430,7 @@ class TestRegisterCodegen(TestCase):
             msl,
         )
         self.assertIn("if (_mrl0_v0) {", msl)
-        self.assertIn("} else _mr_a[0] = 0;", msl)
+        self.assertRegex(msl, r"\} else _mr_a\d+\[0\] = 0;")
 
     def test_fast_half_families(self) -> None:
         """The affine split's GPU table, read from the device's name: on for
@@ -452,6 +481,11 @@ class TestRegisterCodegen(TestCase):
                     "get_right_input_cooperative_tensor<half, half, float>", loop
                 )
                 self.assertEqual(loop.count("_mpp_op_0.run("), 2 * (k_block // 16))
+                # The split's steps keep their order: each step's ops run
+                # before the next step's operands are built.
+                self.assertLess(
+                    loop.index("_mr_ones, _mr_x);"), loop.index("auto _mr_b1 = ")
+                )
                 self.assertRegex(
                     loop,
                     r"acc_copy_0\[0\] = \(_mr_av \+ \(\(_mpp_rs_0 \* _mr_pv\) "
@@ -556,7 +590,7 @@ class TestRegisterSplit(TestCase):
             "offset_2 += 8 * _BLOCK_SIZE_2) {",
             msl,
         )
-        self.assertIn("_mpp_op_0.run(_mr_a, _mr_b, acc_copy_0);", msl)
+        self.assertRegex(msl, r"_mpp_op_0\.run\(_mr_a(\d+), _mr_b\1, acc_copy_0\);")
         tail = msl[msl.index("    threadgroup_barrier(") :]
         for e in range(8):
             self.assertIn(
@@ -573,8 +607,8 @@ class TestRegisterSplit(TestCase):
         args = affine_args(6, 128, 8, 64, 4096)
         msl = render_msl(affine_mm, args, register_config([16, 16, 128], num_warps=16))
         self.assertIn("offset_2 += 16 * _BLOCK_SIZE_2) {", msl)
-        self.assertIn("auto _mpp_a = tensor<device half", msl)
-        self.assertIn("_mpp_op_0.run(_mpp_a, _mr_b, acc_copy_0);", msl)
+        self.assertRegex(msl, r"auto _mpp_a\d+ = tensor<device half")
+        self.assertRegex(msl, r"_mpp_op_0\.run\(_mpp_a(\d+), _mr_b\1, acc_copy_0\);")
         # With the affine split, each SIMD group's epilogue adds its own
         # tiles' terms before the combine.
         args = affine_args(4, 32, 16, 64, 4096)
