@@ -2366,6 +2366,7 @@ def codegen_computed_fragment_root(cg: GenerateAST) -> bool:
     for bid, info in grid.block_id_to_info.items():
         compiler.offsets[bid] = grid.strategy.grid_origin_var(bid)
         compiler.bounds[bid] = cast("str", info.end_var_name)
+        compiler.record_tile_interval(bid, info.begin_expr, info.end_expr)
     body: list[ast.AST] = []
     with cg.set_statements(body):
         compiler.emit(f"{compiler.thread} = cutlass.Int32(cute.arch.thread_idx()[0])")

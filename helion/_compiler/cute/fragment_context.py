@@ -480,6 +480,8 @@ class FragmentContext:
         self.env = CompileEnvironment.current()
         self.offsets: dict[int, str] = {}
         self.bounds: dict[int, str] = {}
+        # Nested loops may reuse a block ID. Key each interval by its induction variable.
+        self.tile_intervals: dict[str, tuple[int, int]] = {}
         self.allocator = ""
         self.smem_bytes = 0
         self.buffers: list[tuple[str, torch.dtype, int]] = []
@@ -681,6 +683,17 @@ class FragmentContext:
                 f"computed fragments require static local extents: {value}"
             )
         return resolved
+
+    def record_tile_interval(self, bid: int, begin: object, end: object) -> None:
+        if (
+            not self.vector_io
+            or not isinstance(begin, (int, torch.SymInt, sympy.Expr))
+            or not isinstance(end, (int, torch.SymInt, sympy.Expr))
+        ):
+            return
+        start, stop = self.static_extent(begin), self.static_extent(end)
+        if start is not None and stop is not None:
+            self.tile_intervals[self.offsets[bid]] = (start, stop)
 
     def static_extent(self, value: object) -> int | None:
         if isinstance(value, int):
