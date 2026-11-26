@@ -393,6 +393,25 @@ def _shared_storage(args: tuple[object, ...]) -> frozenset[int]:
     return frozenset(i for group in seen.values() if len(group) > 1 for i in group)
 
 
+class _DropTritonHints(ast.NodeTransformer):
+    """Replace Triton's value hints, ``tl.max_contiguous(x, ...)`` and
+    ``tl.multiple_of(x, ...)``, with ``x``.  The shared indexing code wraps
+    load offsets in ``tl.max_contiguous`` for Triton's vectorizer; the hints
+    don't change the value, and MSL has no counterpart."""
+
+    def visit_Call(self, node: ast.Call) -> ast.AST:
+        self.generic_visit(node)
+        func = node.func
+        if (
+            isinstance(func, ast.Attribute)
+            and func.attr in ("max_contiguous", "multiple_of")
+            and isinstance(func.value, ast.Name)
+            and func.value.id == "tl"
+        ):
+            return node.args[0]
+        return node
+
+
 def _generate_msl_kernel(
     kernel_name: str,
     body_stmts: list[ast.stmt],
@@ -423,7 +442,8 @@ def _generate_msl_kernel(
     for dtype in tensor_dtypes.values():
         if dtype not in DTYPE_TO_METAL:
             raise ValueError(f"Unsupported Metal dtype: {dtype}")
-    body_stmts = defer_group_sums(body_stmts, param_names)
+    hints = _DropTritonHints()
+    body_stmts = defer_group_sums([hints.visit(s) for s in body_stmts], param_names)
     # The threads each SIMD group lays the tiles out over when SIMD groups
     # split the fragment or register runs' K loops (``fragment_mma``,
     # ``mpp_registers``) or the fragment grids' rows: the launch stacks one

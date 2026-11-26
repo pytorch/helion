@@ -12,6 +12,11 @@ Overrides:
 - ``exp`` / ``truediv``: under the kernel's ``fast_math`` setting, take
   ``metal::fast::exp`` and ``metal::fast::divide``, the operations the Triton
   backend makes approximate under the same setting.
+- ``exp2``: Metal's own ``exp2`` (``metal::fast::exp2`` under ``fast_math``).
+  Inductor's MPS overrides have none, so it fell back to
+  ``exp(x * log(2))``: a multiply more per element (online-softmax
+  attention takes one per score), and the rounding of ``x * log(2)``
+  scaled by ``x`` into the result.
 - ``log1p`` / ``expm1``: Inductor's MPS overrides before pytorch#201580 have
   neither, so they would fall back to ``log(1 + x)`` and ``exp(x) - 1``, which
   lose every digit of a small ``x`` (``log1p(1e-8)`` is 0); later ones still
@@ -54,6 +59,12 @@ class MetalOverrides(_InductorMetalOverrides):
         if CompileEnvironment.current().settings.fast_math:
             return f"metal::fast::exp({x})"
         return _InductorMetalOverrides.exp(x)
+
+    @staticmethod
+    def exp2(x: CSEVariable | str) -> str:
+        if CompileEnvironment.current().settings.fast_math:
+            return f"metal::fast::exp2({x})"
+        return f"metal::precise::exp2({x})"
 
     # log1p and expm1 take str | CSEVariable: Inductor's MetalOverrides declares
     # them on CSEVariable from pytorch#201580 on; before that, they come from
