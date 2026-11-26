@@ -1076,7 +1076,35 @@ def _is_proven_relocatable_call(
         # Another backend's pure device calls (Metal's casts); the AST passes
         # also run outside a compile, in their unit tests.
         return True
+    if name == _uniform_comparison_marker():
+        # A dropout's ``rand > p``, ``_helion_uniform_gt(word, uniform, p)``
+        # (``uniform_comparison.py``), which ``lower_uniform_comparisons``
+        # rewrites into ``operator.gt(uniform, p)`` or an integer compare
+        # of ``word`` with cutoffs it hoists: a value of its operands, like
+        # the ``operator.gt`` it stands for.  Pinned as an unknown call, it
+        # kept a second dropout's seed load, ``tmp19 = in3.iterator.load()``
+        # read only after a row's sum, from moving out of the lane loops
+        # ahead of the first dropout's compare, and the lane split failed:
+        # "a lane-invariant statement is ordered before the accumulate pass
+        # of a lane reduction" (T5's RMSNorm between two dropouts).
+        return True
     return allow_reduction and is_cta_reduce_call(call)
+
+
+def _uniform_comparison_marker() -> str | None:
+    """The name of the current device function's uniform comparison marker
+    (``UniformComparisonLowering``), or None outside a CuTe codegen."""
+    from ..device_function import DeviceFunction
+    from ..device_function import NoCurrentFunction
+    from .device_state import CuteDeviceFunctionState
+
+    try:
+        state = DeviceFunction.current().backend_state
+    except NoCurrentFunction:
+        return None
+    if not isinstance(state, CuteDeviceFunctionState):
+        return None
+    return state.uniform_comparison_marker
 
 
 def _is_proven_relocatable_assignment(
