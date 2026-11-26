@@ -3675,10 +3675,10 @@ class TestCuteTcgen05ConfigSpecSplit(TestCase):
             patch("helion._compat._supports_tensor_descriptor", return_value=True),
             # Patch the helion seam: torch.cuda.get_device_capability is
             # memoized behind _target_device_capability (is_hip / _is_hip
-            # pattern), so config_spec's get_target_device_capability() must
+            # pattern), so the CuTe search surface's capability must
             # be patched at the wrapper, not the cached torch query.
             patch(
-                "helion._compiler.cute.autotune.search_surface.get_target_device_capability",
+                "helion._compat.target_device_capability",
                 return_value=(9, 0),
             ),
         ):

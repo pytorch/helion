@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import dataclasses
+import functools
 import itertools
 import json
 from pathlib import Path
@@ -10,6 +11,7 @@ import runpy
 import shutil
 import sys
 import textwrap
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -18,6 +20,8 @@ import torch
 import helion
 from helion import _compat
 from helion import _hardware
+from helion._compiler.cute.autotune.search_surface import CuteSearchSurface
+from helion._compiler.cute.backend import CuteBackend
 from helion._compiler.cute.target_facts import B200
 from helion._testing import cpu_render_target
 from helion._testing import import_path
@@ -27,16 +31,223 @@ from helion._testing import patch_target_facts
 from helion._testing import sharding
 from helion._testing.cute_codegen import CpuRefMode
 from helion._testing.cute_codegen import cpu_bind
+from helion._testing.cute_codegen import mock_cuda_unavailable
 from helion._testing.cute_codegen import tcgen05_target
 from helion._testing.sharding import MIN_WEIGHT
 from helion._testing.sharding import assign_shards
 from helion._testing.sharding import load_durations
 from helion._testing.sharding import shard_loads
+from helion.autotuner import config_spec
 from helion.autotuner.base_search import BaseSearch
+from helion.autotuner.config_spec import ConfigSpec
 from helion.autotuner.local_cache import LocalAutotuneCache
+from helion.autotuner.search_surface import BackendSearchSurface
 import helion.language as hl
 
 pytestmark = pytest.mark.cpu_only
+
+
+@onlyBackends(["cute"])
+def test_direct_cute_config_uses_the_scoped_target() -> None:
+    probe = _compat.target_device_capability
+    sm_probe = config_spec.device_num_sm
+    with (
+        patch.object(_compat, "target_device_capability", return_value=(9, 0)),
+        patch.object(config_spec, "device_num_sm", return_value=120),
+    ):
+        with cpu_render_target(capability=(10, 3), num_sm=148):
+            outer = ConfigSpec(backend=CuteBackend())
+            assert (outer.target_device_capability, outer.num_sm) == ((10, 3), 148)
+            with patch_target_facts(capability=None, num_sm=17):
+                inner = ConfigSpec(backend=CuteBackend())
+                assert (inner.target_device_capability, inner.num_sm) == (None, 17)
+            restored = ConfigSpec(backend=CuteBackend())
+            assert (restored.target_device_capability, restored.num_sm) == (
+                (10, 3),
+                148,
+            )
+        external = ConfigSpec(backend=CuteBackend())
+        assert (external.target_device_capability, external.num_sm) == ((9, 0), 120)
+    assert _compat.target_device_capability is probe
+    assert config_spec.device_num_sm is sm_probe
+
+
+@onlyBackends(["cute"])
+def test_direct_config_uses_its_device_for_an_implicit_capability() -> None:
+    b200 = torch.device("cuda:1")
+    with (
+        patch.object(
+            _compat,
+            "target_device_capability",
+            side_effect=lambda device=None: (10, 0) if device == b200 else (9, 0),
+        ) as probe,
+        patch.object(
+            config_spec,
+            "device_num_sm",
+            side_effect=lambda device: 148 if device == b200 else 120,
+        ),
+    ):
+        backend = CuteBackend()
+        current = ConfigSpec(backend=backend)
+        requested = ConfigSpec(backend=backend, device=b200)
+        assert (current.target_device_capability, current.num_sm) == ((9, 0), 120)
+        assert (requested.target_device_capability, requested.num_sm) == ((10, 0), 148)
+        probe.reset_mock()
+        unknown = ConfigSpec(
+            backend=backend, device=b200, target_device_capability=None
+        )
+        explicit = ConfigSpec(
+            backend=backend, device=b200, target_device_capability=(8, 0)
+        )
+        assert (unknown.target_device_capability, unknown.num_sm) == (None, 148)
+        assert explicit.target_device_capability == (8, 0)
+        probe.assert_not_called()
+
+
+@onlyBackends(["cute"])
+def test_unavailable_cuda_skips_cold_and_warm_indexed_capability_caches() -> None:
+    # A fresh instance of the actual indexed cache leaves other tests' state
+    # alone and makes the cold-to-warm transition deterministic.
+    cached = functools.cache(_compat._target_device_capability.__wrapped__)
+    device = torch.device("cuda:0")
+    backend = CuteBackend()
+    with (
+        patch.object(_compat, "_target_device_capability", cached),
+        patch.object(torch.cuda, "is_available", return_value=True),
+        patch.object(
+            torch.cuda, "get_device_capability", return_value=(10, 0)
+        ) as hardware,
+    ):
+        for start_size in (0, 1):
+            before = cached.cache_info()
+            assert before.currsize == start_size
+            with mock_cuda_unavailable():
+                direct = ConfigSpec(backend=backend, device=device, num_sm=148)
+                assert direct.target_device_capability is None
+            assert cached.cache_info() == before
+            assert _compat.target_device_capability(device) == (10, 0)
+        hardware.assert_called_once_with(0)
+
+        # Explicit test models are above the raw cache, so an outer model
+        # remains effective inside the CUDA-denied renderer.
+        with patch_target_facts(capability=(9, 0)), mock_cuda_unavailable():
+            assert ConfigSpec(
+                backend=backend, device=device
+            ).target_device_capability == (9, 0)
+
+
+def test_indexed_capability_retries_after_cuda_becomes_visible() -> None:
+    cached = functools.cache(_compat._target_device_capability.__wrapped__)
+    device = torch.device("cuda:0")
+    with (
+        patch.object(_compat, "_target_device_capability", cached),
+        patch.object(torch.cuda, "is_available", return_value=False) as visible,
+        patch.object(torch.cuda, "get_device_capability", return_value=(10, 0)) as read,
+    ):
+        assert _compat.target_device_capability(device) is None
+        assert cached.cache_info().currsize == 0
+        read.assert_not_called()
+
+        visible.return_value = True
+        assert _compat.target_device_capability(device) == (10, 0)
+        visible.reset_mock()
+        assert _compat.target_device_capability(device) == (10, 0)
+        visible.assert_not_called()
+        read.assert_called_once_with(0)
+        assert cached.cache_info().hits == 1
+
+
+@onlyBackends(["cute"])
+def test_direct_config_handles_only_an_unavailable_cuda_ordinal() -> None:
+    # Exercise Torch's actual get_device_capability -> get_device_properties
+    # validation with one visible ordinal; only device discovery is simulated.
+    cached = functools.cache(_compat._target_device_capability.__wrapped__)
+    backend = CuteBackend()
+    device = torch.device("cuda:1")
+    with (
+        mock_cuda_unavailable(),
+        patch.object(torch.cuda, "current_device", return_value=0),
+        patch.object(_compat, "_target_device_capability", cached),
+        patch.object(torch.cuda, "is_available", return_value=True),
+        patch.object(config_spec, "get_num_xcd", return_value=1),
+        patch.object(torch.cuda, "_lazy_init"),
+        patch.object(torch.cuda, "device_count", return_value=1) as count,
+        patch.object(
+            torch.cuda,
+            "_get_device_properties",
+            create=True,
+            return_value=SimpleNamespace(major=10, minor=0),
+        ) as properties,
+    ):
+
+        def capability() -> tuple[int, int] | None:
+            return ConfigSpec(
+                backend=backend, device=device, num_sm=1
+            ).target_device_capability
+
+        assert capability() is None
+        assert cached.cache_info().currsize == 0
+        properties.assert_not_called()
+        with patch_target_facts(capability=(9, 0)):
+            assert capability() == (9, 0)
+        assert ConfigSpec(
+            backend=backend, device=device, num_sm=1, target_device_capability=(8, 0)
+        ).target_device_capability == (8, 0)
+
+        count.return_value = 2
+        assert capability() == (10, 0)
+        before = count.call_count
+        assert capability() == (10, 0)
+        assert count.call_count == before
+        properties.assert_called_once_with(1)
+
+        for available, error in (
+            (1, AssertionError("unrelated assertion")),
+            (2, AssertionError("Invalid device id")),
+            (1, RuntimeError("driver failed")),
+        ):
+            count.return_value = available
+            with (
+                patch.object(
+                    _compat,
+                    "target_device_capability",
+                    side_effect=error,
+                ),
+                pytest.raises(type(error), match=str(error)),
+            ):
+                capability()
+
+
+@onlyBackends(["cute"])
+def test_direct_config_keeps_legacy_capability_hook() -> None:
+    class PluginSurface(BackendSearchSurface):
+        def default_target_device_capability(self) -> tuple[int, int]:
+            return (7, 0)
+
+    class SpecializedSurface(CuteSearchSurface):
+        def default_target_device_capability(self) -> tuple[int, int]:
+            return (8, 0)
+
+    backend = CuteBackend()
+    with patch_target_facts(capability=(10, 0), num_sm=148):
+        for surface, expected in (
+            (PluginSurface(), (7, 0)),
+            (SpecializedSurface(), (8, 0)),
+        ):
+            with patch.object(backend, "config_spec_extension", return_value=surface):
+                assert ConfigSpec(backend=backend).target_device_capability == expected
+                assert (
+                    ConfigSpec(
+                        backend=backend, device=torch.device("cuda:1")
+                    ).target_device_capability
+                    == expected
+                )
+        with patch.object(
+            CuteSearchSurface, "default_target_device_capability", lambda self: (8, 9)
+        ):
+            assert ConfigSpec(
+                backend=backend, device=torch.device("cuda:1")
+            ).target_device_capability == (8, 9)
 
 
 @onlyBackends(["triton", "cute"])

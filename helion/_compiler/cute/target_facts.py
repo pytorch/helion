@@ -1,9 +1,11 @@
 """Target facts: the device model behind the CuTe planners' budget probes (analysis).
 
 The facts about the compile target are answered by probes:
-``helion._compat.target_device_capability`` (also bound by name in
-``helion.runtime.kernel`` and ``helion._compiler.compile_environment``;
-``patch_target_facts`` patches all three), ``helion.runtime.get_num_sm``,
+``helion._compat.target_device_capability`` (read through its module by the
+CuTe search surface, and also bound by name in ``helion.runtime.kernel`` and
+``helion._compiler.compile_environment``; ``patch_target_facts`` patches all
+three), ``helion.runtime.get_num_sm`` and
+the direct configuration probe ``helion.autotuner.config_spec.device_num_sm``,
 ``cute.tcgen05.search_plan._cuda_num_sms_or_zero`` (the wave-quantization
 gate's raw SM count), the per-CTA SMEM probes of this module
 (:func:`per_cta_smem_capacity_bytes` and the two budgets derived from it),

@@ -1224,6 +1224,8 @@ class ConfigSpec:
         if target_device_capability is _TARGET_DEVICE_CAPABILITY_UNSET:
             self.target_device_capability: tuple[int, int] | None = (
                 self.search_surface.default_target_device_capability()
+                if device is None
+                else self.search_surface.default_target_device_capability_for(device)
             )
         else:
             self.target_device_capability = cast(

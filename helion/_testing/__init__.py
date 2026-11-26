@@ -678,10 +678,11 @@ def patch_target_facts(
     dotted path fixtures patched by hand before this helper existed, so the
     values a fixture pins are unchanged:
 
-    * ``capability`` -> ``helion._compat.target_device_capability`` and its
-      by-name bindings ``helion.runtime.kernel.target_device_capability`` and
-      ``helion._compiler.compile_environment.target_device_capability``
-    * ``num_sm`` -> ``helion.runtime.get_num_sm``
+    * ``capability`` -> ``helion._compat.target_device_capability``, which the
+      CuTe search surface reads through its module, and the two bindings
+      imported by the kernel runtime and compile environment
+    * ``num_sm`` -> ``helion.runtime.get_num_sm`` and the direct constructor
+      probe ``helion.autotuner.config_spec.device_num_sm``
     * ``matmul_num_sm`` -> ``helion._compiler.cute.tcgen05.search_plan._cuda_num_sms_or_zero``
     * ``smem_capacity_bytes`` / ``smem_budget_bytes`` ->
       ``helion._compiler.cute.target_facts.per_cta_smem_capacity_bytes`` /
@@ -736,7 +737,10 @@ def patch_target_facts(
             "helion.runtime.kernel.target_device_capability",
             "helion._compiler.compile_environment.target_device_capability",
         ),
-        "num_sm": ("helion.runtime.get_num_sm",),
+        "num_sm": (
+            "helion.autotuner.config_spec.device_num_sm",
+            "helion.runtime.get_num_sm",
+        ),
         "matmul_num_sm": (
             "helion._compiler.cute.tcgen05.search_plan._cuda_num_sms_or_zero",
         ),

@@ -828,7 +828,7 @@ def test_flex_coverage_design_covers_the_cooperative_widths() -> None:
         with (
             patch.dict(os.environ, {"CUDA_VISIBLE_DEVICES": ""}, clear=True),
             patch(
-                "helion._compiler.cute.autotune.search_surface.get_target_device_capability",
+                "helion._compat.target_device_capability",
                 return_value=(10, 0),
             ),
         ):
