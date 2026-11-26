@@ -12,14 +12,21 @@ import sys
 from types import SimpleNamespace
 from typing import TYPE_CHECKING
 from unittest.mock import Mock
+from unittest.mock import patch
 
 import pytest
 import torch
+from torch._inductor.codecache import PyCodeCache
 
+import helion
 from helion import exc
+from helion._testing import onlyBackends
+from helion._testing import skipIfRefEager
 from helion._testing.benchmark_timers import LoggedPrelude
 from helion._testing.benchmark_timers import stand_in_event_timer
 from helion._testing.benchmark_timers import stand_in_trace
+from helion._testing.cute_codegen import cpu_bind
+from helion._testing.cute_codegen import cpu_target
 from helion.autotuner import benchmark_job
 from helion.autotuner import benchmark_provider
 from helion.autotuner import benchmarking
@@ -41,6 +48,7 @@ from helion.autotuner.local_cache import _hash_search_policy
 from helion.autotuner.local_cache import _search_policy_hash
 from helion.autotuner.logger import AutotuningLogger
 from helion.autotuner.metrics import AutotuneMetrics
+import helion.language as hl
 from helion.runtime.settings import Settings
 
 if TYPE_CHECKING:
@@ -291,6 +299,47 @@ def test_a_saved_prelude_runs_alike_where_it_is_loaded(
     assert float(loaded.timed(kernels.total)()) == float(
         (tensors["x"] * 2.0)[1:].sum() + 12.0 + tensors["x"].sum()
     )
+
+
+@helion.kernel(autotune_effort="none", static_shapes=True)
+def _doubled(x: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tile in hl.tile(x.size()):
+        out[tile] = x[tile] * 2.0
+    return out
+
+
+@onlyBackends(["triton", "cute"])
+@skipIfRefEager("ref mode compiles no module")
+def test_a_compiled_kernels_step_keys_the_cache_alike_after_a_reload() -> None:
+    # helion.inductor times a kernel behind the call before it as a step that
+    # runs that call's compiled module (``bound.compile_config``). The search
+    # caches its winner under the step's fingerprint, so the fingerprint must
+    # name the module by its code alone: the same kernel at the same config,
+    # compiled again in another process (here: a fresh bind, which cpu_bind
+    # makes outside the kernel's caches, and a module loaded afresh from
+    # PyCodeCache), keys the same.
+    x = torch.randn(256, 64)
+
+    def step() -> tuple[object, str | None]:
+        with cpu_target():
+            bound = cpu_bind(_doubled, (x,))
+            with (
+                patch.object(bound.env.backend, "setup_compile_cache_dir"),
+                patch.object(bound.env.backend, "after_compile"),
+            ):
+                compiled = bound.compile_config(
+                    bound.config_spec.default_config(), allow_print=False
+                )
+        prelude = BenchmarkPrelude((PreludeStep(compiled, (x,)),), ())
+        return compiled, prelude.fingerprint()
+
+    first, key = step()
+    assert key is not None
+    PyCodeCache.cache_clear()
+    again, key_again = step()
+    assert again is not first
+    assert key_again == key
 
 
 def test_a_prelude_that_cannot_cross_says_so(tmp_path: Path) -> None:
