@@ -57,6 +57,7 @@ from helion._testing.cute_codegen import forbid_cuda_work
 from helion._testing.cute_codegen import full_and_edge_store_bodies
 from helion._testing.cute_dense_tcgen05 import atomic_output_mm
 from helion._testing.cute_dense_tcgen05 import batched_gemm
+from helion._testing.cute_dense_tcgen05 import bf16_mm_args
 from helion._testing.cute_dense_tcgen05 import bias_mm_into
 from helion._testing.cute_dense_tcgen05 import blackwell_capability
 from helion._testing.cute_dense_tcgen05 import cpu_codegen_target
@@ -2646,6 +2647,39 @@ def test_partial_narrow_batched_tile_stays_flat() -> None:
     assert config.block_sizes == [1, 128, 32, 64]
     assert config.config["pid_type"] == "flat"
     assert "cute.gemm(" in code
+
+
+def test_one_cta_persistent_k_tail_keeps_the_tma_producer() -> None:
+    """A persistent one-CTA kernel over whole output tiles with a K tail runs
+    the role-local TMA producer, which issues the partial last K tile as a
+    whole box (zero-filled past K), not the scalar-copy body the host guard
+    refuses: helion.inductor's transposed bf16 128x768x1000 with b stored
+    [K, N] (768 x 128 over K = 3 x 256 + 232) on [64, 16, 256] tiles."""
+    a, b, out = bf16_mm_args(128, 768, 1000, rhs_k_major=False)
+    with gb300_target(), forbid_cuda_work():
+        bound = plain_mm_into._bind_isolated((b.T, a.T, out.T))
+        config = bound.config_spec.default_config()
+        config.config.update(
+            block_sizes=[64, 16, 256],
+            pid_type="persistent_interleaved",
+            tcgen05_persistence_model="static_persistent",
+            tcgen05_ab_stages=4,
+        )
+        code = bound.to_code(config)
+    assert "_helion_tcgen05_persistent_total_tiles" not in code
+    assert "tcgen05_role_local_0_work_tile.is_valid_tile" in code
+    # the producer's guard on k-block 3, the last of its initial ring: it
+    # starts inside K, so it is issued
+    assert "(cutlass.Int32(768) < cutlass.Int32(1000))" in code
+    # The search runs the persistent pid types over the K tail, and the
+    # small-grid seeds take the widest K packet (no packet divides K) with
+    # a ring as deep as the K loop: ceil(1000 / 128) = 8.
+    assert "persistent_interleaved" in bound.config_spec.tcgen05.allowed_pid_types
+    seeded = {
+        (tuple(seed.config["block_sizes"]), seed.config["tcgen05_ab_stages"])
+        for seed in seeds._small_grid_seed_configs(bound.config_spec.tcgen05)
+    }
+    assert ((64, 16, 128), 8) in seeded
 
 
 def test_untma_operand_batched_default_stays_flat() -> None:

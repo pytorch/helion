@@ -1468,10 +1468,15 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         assert plan is not None, (
             "tcgen05 TMA-load role predicate requires a registered matmul plan"
         )
-        return (
-            "cute.arch.make_warp_uniform(cute.arch.warp_idx()) "
-            f"== cutlass.Int32({plan.tma_warp_id})"
-        )
+        warp = "cute.arch.make_warp_uniform(cute.arch.warp_idx())"
+        if plan.ab_load_warp_count > 1:
+            # ``tcgen05_warp_spec_ab_load_warps=2``: warps 5 and 6 both run
+            # the role (``cute_mma._build_shared_ring_producer``).
+            return (
+                f"{warp} >= cutlass.Int32({plan.ab_load_warp_begin}) "
+                f"and {warp} < cutlass.Int32({plan.ab_load_warp_end})"
+            )
+        return f"{warp} == cutlass.Int32({plan.tma_warp_id})"
 
     def _tcgen05_mma_exec_role_predicate(self) -> str:
         """Boolean expression that gates the MMA-exec warp's role block."""

@@ -90,6 +90,7 @@ from ..strategies import TCGEN05_PERSISTENT_GRID_CAP_CONFIG_KEY
 from ..strategies import TCGEN05_PERSISTENT_GRID_CAP_DEFAULT
 from ..strategies import TCGEN05_STRATEGY_CONFIG_KEY
 from ..strategies import TCGEN05_STRATEGY_CONFIG_KEYS
+from ..strategies import TCGEN05_WARP_SPEC_AB_LOAD_WARPS_KEY
 from ..strategies import TCGEN05_WARP_SPEC_C_INPUT_WARPS_KEY
 from ..strategies import TCGEN05_WARP_SPEC_SCHEDULER_WARPS_KEY
 from ..strategies import TCGEN05_WARP_SPEC_STORE_WARPS_KEY
@@ -2384,7 +2385,12 @@ def _normalize_dense_aligned_n(
         if view is not None and block_m is not None:
             blocks, mi, ni, ki = view
             blocks = list(blocks)
-            blocks[mi], blocks[ni] = block_m, carrier_n(width)
+            # a sampled pair M the family runs stays (the 128-row pair where
+            # ``dense_aligned_n_block_ms`` admits it), any other takes the
+            # default
+            if blocks[mi] not in facts._dense_aligned_n_block_ms(state):
+                blocks[mi] = block_m
+            blocks[ni] = carrier_n(width)
             if facts._dense_aligned_n_sixteen_bit(state):
                 blocks[ki] = DENSE_ALIGNED_N_SIXTEEN_BIT_BLOCK_K
             elif blocks[ki] not in (64, 128):
@@ -2411,10 +2417,16 @@ def _normalize_dense_aligned_n(
             for key in ("l2_groupings", "tcgen05_cluster_n")
             if key in config
         }
+        # The family's producer runs one or two A/B-load warps (the plan
+        # does not pin them, ``dense_aligned_n_plan``); the sample's count
+        # stays, which ``_fix_ab_load_warps_search_config`` checks last.
+        load_warps = config.get(TCGEN05_WARP_SPEC_AB_LOAD_WARPS_KEY)
         surface = facts._dense_aligned_n_surface(
             state, acc_stages=acc_stages, store_mode=cast("str", store_mode)
         )
         config.update(surface)
+        if load_warps is not None:
+            config[TCGEN05_WARP_SPEC_AB_LOAD_WARPS_KEY] = load_warps
         facts._drop_inactive_direct_entry_controls(state, config)
         if config.get("pid_type") not in state.allowed_pid_types or config.get(
             "pid_type"
@@ -6027,6 +6039,46 @@ def fix_search_config(state: CuteTcgen05Config, config: dict[str, object]) -> No
     _clamp_l2_swizzle_size_to_shape(state, config)
     # (after the clamp: the one-tile test reads the final swizzle)
     _fix_one_tile_ab_stages_search_config(state, config)
+    # (after the one-tile clamp: the load warps need the final ring)
+    _fix_ab_load_warps_search_config(state, config)
+
+
+def _fix_ab_load_warps_search_config(
+    state: CuteTcgen05Config, config: dict[str, object]
+) -> None:
+    """Two A/B-load warps share the role-local TMA producer of a persistent
+    monolithic GEMM on one MMA subtile per tile
+    (``cute_mma._build_shared_ring_producer``); a sample outside it runs one."""
+    if config.get(TCGEN05_WARP_SPEC_AB_LOAD_WARPS_KEY, 1) == 1:
+        return
+    view = facts._matmul_config_view(state, config)
+    if not (
+        surface.shared_ring_producer_search_enabled(state)
+        and config.get(WARP_MMA_FAMILY_KEY, MATMUL_FAMILY_TCGEN05)
+        == MATMUL_FAMILY_TCGEN05
+        and config.get("pid_type") in ("persistent_blocked", "persistent_interleaved")
+        and config.get(
+            TCGEN05_STRATEGY_CONFIG_KEY, Tcgen05Strategy.ROLE_LOCAL_MONOLITHIC.value
+        )
+        == Tcgen05Strategy.ROLE_LOCAL_MONOLITHIC.value
+        and config.get(TCGEN05_WARP_SPEC_SCHEDULER_WARPS_KEY, 0) == 0
+        and config.get(TCGEN05_SPLIT_K_CONFIG_KEY, 1) == 1
+        and not config.get("cute_split_k_workspace")
+        and config.get(TCGEN05_GROUPED_MODE_CONFIG_KEY) is None
+        # the flat 8-warp role layout keeps one A/B-load warp
+        and config.get(TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY) is not True
+        # codegen admits the shared producer on one MMA subtile per tile
+        # (``cute_mma``'s admission): a 512-row M-paired tile
+        # (``_m_pair_block_m_is_valid``) runs two 256-row subtiles
+        and view is not None
+        and view[0][view[1]] != 2 * TCGEN05_TWO_CTA_BLOCK_M
+        # each warp's waits are ``load_warps`` ring slots apart, which the
+        # ring must cover (``cute_mma``'s admission)
+        and type(config.get("tcgen05_ab_stages")) is int
+        and cast("int", config.get("tcgen05_ab_stages"))
+        >= cast("int", config.get(TCGEN05_WARP_SPEC_AB_LOAD_WARPS_KEY))
+    ):
+        config[TCGEN05_WARP_SPEC_AB_LOAD_WARPS_KEY] = 1
 
 
 def one_tile_ab_stage_cap(

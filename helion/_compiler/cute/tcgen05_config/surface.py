@@ -52,6 +52,7 @@ from ..pipeline_smem import TCGEN05_CTA_GROUP_CHOICES
 from ..pipeline_smem import TCGEN05_CTA_GROUP_CONFIG_KEY
 from ..pipeline_smem import TCGEN05_SMEM_AWARE_MAX_AB_STAGES
 from ..pipeline_smem import max_pipeline_ab_stages
+from ..pipeline_smem import paired_pipeline_max_ab_stages
 from ..split_k_workspace_config import workspace_search_fields
 from ..strategies import ROLE_LOCAL_MONOLITHIC_DEFAULT_WARP_SPEC
 from ..strategies import TCGEN05_BATCH_RASTER_CHOICES
@@ -1213,9 +1214,16 @@ def optional_fragments(
     # search's own; computed once).
     aligned_widths = facts._dense_aligned_n_widths(state)
     if state.pipeline_smem_facts is not None and (not for_search or paired_search):
-        ab_stages_max = max(ab_stages_max, TCGEN05_SMEM_AWARE_MAX_AB_STAGES)
+        ab_stages_max = max(
+            ab_stages_max, paired_pipeline_max_ab_stages(state.pipeline_smem_facts)
+        )
     if aligned_widths:
-        ab_stages_max = max(ab_stages_max, TCGEN05_SMEM_AWARE_MAX_AB_STAGES)
+        ab_stages_max = max(
+            ab_stages_max,
+            TCGEN05_SMEM_AWARE_MAX_AB_STAGES
+            if state.pipeline_smem_facts is None
+            else paired_pipeline_max_ab_stages(state.pipeline_smem_facts),
+        )
     if state.one_cta_pipeline_facts is not None and (
         not for_search or facts._preferred_persistent_pid_type(state) is not None
     ):
@@ -1812,6 +1820,26 @@ def persistence_model_autotune_fragments(
     return {TCGEN05_PERSISTENCE_MODEL_CONFIG_KEY: EnumFragment(choices)}
 
 
+def shared_ring_producer_search_enabled(state: CuteTcgen05Config) -> bool:
+    """Whether the search samples two A/B-load warps
+    (``tcgen05_warp_spec_ab_load_warps``; ``cute_mma._build_shared_ring_producer``).
+
+    A plain GEMM over static extents whose operands TMA loads: the second
+    warp halves the serial issue chain per AB stage, which paces the K loop
+    where a stage carries little data (bf16 1000x512x2880, 128x64 CTA pair:
+    0.855 -> 0.999 of cuBLAS) and costs a warp where the data rate already
+    paces it (1500x384x1536 at 128-wide K steps: 0.953 -> 0.950), so the
+    search decides. Aux epilogues keep their own producer-warp families.
+    """
+    return (
+        state.search_enabled
+        and not state.aux_kernel_detected
+        and state.matmul_operands_tma_provable
+        and state.matmul_compile_time_static_extents is not None
+        and not state.materialized_matmul_block_ids
+    )
+
+
 def strategy_autotune_fragments(
     state: CuteTcgen05Config,
 ) -> dict[str, ConfigSpecFragment]:
@@ -1883,7 +1911,9 @@ def strategy_autotune_fragments(
             else None,
         ),
         TCGEN05_WARP_SPEC_MMA_WARPS_KEY: EnumFragment((1,)),
-        TCGEN05_WARP_SPEC_AB_LOAD_WARPS_KEY: EnumFragment((1,)),
+        TCGEN05_WARP_SPEC_AB_LOAD_WARPS_KEY: EnumFragment(
+            (1, 2) if shared_ring_producer_search_enabled(state) else (1,)
+        ),
         TCGEN05_WARP_SPEC_EPI_LOAD_WARPS_KEY: EnumFragment((0,)),
         TCGEN05_WARP_SPEC_SCHEDULER_WARPS_KEY: _enum_fragment_with_seed_values(
             scheduler_warps_choices,
@@ -1926,6 +1956,7 @@ def strategy_validation_fragments(
         )
     )
     fragments[TCGEN05_WARP_SPEC_SCHEDULER_WARPS_KEY] = EnumFragment((0, 1))
+    fragments[TCGEN05_WARP_SPEC_AB_LOAD_WARPS_KEY] = EnumFragment((1, 2))
     fragments[TCGEN05_WARP_SPEC_C_INPUT_WARPS_KEY] = EnumFragment((0, 1))
     # Cycle 91 (Workstream A Stage 3): the user-config validation surface
     # accepts ``{0, 1}`` so an explicit ``store_warps=1`` round-trips; the

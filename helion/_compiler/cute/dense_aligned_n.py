@@ -14,6 +14,7 @@ from .one_cta_pipeline import one_cta_pipeline_defaults
 from .pipeline_smem import TCGEN05_SMEM_AWARE_MAX_AB_STAGES
 from .pipeline_smem import Tcgen05PipelineSmemFacts
 from .pipeline_smem import deepest_fitting_ab_stages
+from .pipeline_smem import paired_pipeline_max_ab_stages
 from .pipeline_smem import pipeline_smem_bytes
 from .strategies import TCGEN05_LAYOUT_OVERRIDES_KEYS
 from .tcgen05_constants import TCGEN05_EPI_SUBTILE_N_CONFIG_KEY
@@ -27,7 +28,9 @@ from .tcgen05_constants import TCGEN05_PLAIN_NARROW_SUBTILE_N
 from .tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_M
 from .tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_N
 from .tcgen05_constants import TCGEN05_TWO_CTA_MAX_K_TILES
+from .tcgen05_constants import TCGEN05_TWO_CTA_PAIR128_ONE_WAVE_BLOCK_NS
 from .tcgen05_constants import tcgen05_odd_width_subtile
+from .tcgen05_constants import tcgen05_plain_narrow_subtile_covers_n
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
@@ -70,11 +73,18 @@ def dense_aligned_n_block_ms(
     (GB300, CUDA graphs over cold inputs, cuBLAS 10.47 us): 197 pairs of
     128x192 (one N tile: A read once) 10.14 us, 99 of 256x192 11.28 us (two
     rounds on 76 pairs for 1.3 rounds of work), 394 of the 128-row pair at
-    128 + 64 columns (A read twice) 11.31 us. A column-major output keeps the
-    256-row pair: its 128-row tile stores through 16-column rounds (bf16
-    4096x512x1024 transposed: 76 pairs of 128x224 6.06 us against 64 of
-    256x128 5.93; 1000x1024x2560 transposed, 128x112 6.43 us against the
-    as-written 128x128 pair's 6.21).
+    128 + 64 columns (A read twice) 11.31 us.
+
+    So does a plain 16-bit pair over a column-major output (the transposed
+    product's out.T) at any N, where its CTA's last tile stages its
+    16-column subtiles at once (``cute_mma``'s
+    ``tcgen05_last_tile_staging``) instead of storing them in 16-column
+    rounds. bf16 1000x1024xK transposed (out.T: 1024 x 1000) runs cuBLAS's
+    swapped tile, 72 pairs of 128x112 (each CTA streams 64 + 56 operand
+    rows per K step), against the as-written 64 pairs of 128x128 (64 + 64);
+    GB300, in one process, two A/B-load warps, of cuBLAS: K=1024 0.950 ->
+    0.955, 2048 0.937 -> 0.957, 4096 0.946 -> 0.970 (the 16-column rounds
+    0.896 at K=1024, 0.918 at 2048).
     """
     block_m = dense_aligned_n_block_m(input_dtype)
     if block_m is None:
@@ -82,8 +92,7 @@ def dense_aligned_n_block_ms(
     if (
         dense_aligned_n_sixteen_bit(input_dtype)
         and plain_epilogue
-        and not output_column_major
-        and n <= TCGEN05_TWO_CTA_BLOCK_N
+        and (output_column_major or n <= TCGEN05_TWO_CTA_BLOCK_N)
     ):
         return (block_m, TCGEN05_TWO_CTA_BLOCK_M // 2)
     return (block_m,)
@@ -126,14 +135,18 @@ def pair_tile_wave_cost(
     """Wave-quantized time of a 16-bit pair-tile grid over ``m`` x ``n``
     (arbitrary units: 256-column K-block MMAs). Each of the
     ``ceil(m / block_m) x ceil(n / width)`` tiles takes ``ceil(k / 64)`` K
-    blocks, each the larger of its MMA time (its width) and its operand
-    stream (``TCGEN05_PAIR_TILE_STREAM_RATIO`` x (block_m + width): a narrow
-    tile reloads the A tile per N tile), plus a fixed prologue and epilogue
+    blocks, each the larger of its MMA time (its width, halved on the
+    128-row pair's M128 instruction) and its operand stream
+    (``TCGEN05_PAIR_TILE_STREAM_RATIO`` x (block_m + width): a narrow tile
+    reloads the A tile per N tile), plus a fixed prologue and epilogue
     (``TCGEN05_PAIR_TILE_FIXED_KBLOCKS`` 256-wide K blocks); ``sm_pairs`` tiles
     run per wave."""
     tiles = -(-m // block_m) * -(-n // width)
     k_blocks = -(-k // DENSE_ALIGNED_N_SIXTEEN_BIT_BLOCK_K)
-    k_block = max(float(width), TCGEN05_PAIR_TILE_STREAM_RATIO * (block_m + width))
+    k_block = max(
+        width * block_m / TCGEN05_TWO_CTA_BLOCK_M,
+        TCGEN05_PAIR_TILE_STREAM_RATIO * (block_m + width),
+    )
     fixed = TCGEN05_PAIR_TILE_FIXED_KBLOCKS * TCGEN05_TWO_CTA_BLOCK_N
     return -(-tiles // sm_pairs) * (k_blocks * k_block + fixed)
 
@@ -190,27 +203,90 @@ def transposed_pair_tile_gain(m: int, n: int, k: int, *, sm_pairs: int) -> float
         # transposed (2496 = 39 x 64 rows).
         return 1.0
     widths = (64, 128, TCGEN05_TWO_CTA_BLOCK_N, *ALIGNED_N_CHOICES)
+    pair128_m = TCGEN05_TWO_CTA_BLOCK_M // 2
 
-    def best(rows: int, cols: int) -> float:
+    def pair128_costs(
+        rows: int, cols: int, *, output_column_major: bool
+    ) -> list[float]:
+        # The 128-row pairs (each CTA 64 rows) on a grid the 256-row pairs
+        # leave short of one pair per SM pair and the 128-row tiles fill to
+        # at least a quarter of the SMs (``search_plan``'s gate) within one
+        # wave:
+        # - the one-wave family's (``repair.plain_pair128_widths``): a ragged
+        #   M under whole N tiles of its widths. bf16 512x1000x1280: as
+        #   written no pair tiles its N (1000 = 15.6 x 64; the flat one-CTA
+        #   kernel runs 0.86 of cuBLAS), transposed 64 pairs of 128x64 do
+        #   (0.96 with two A/B-load warps);
+        # - the aligned-N family's, where it runs the 128-row pair over the
+        #   output (``dense_aligned_n_block_ms``): an N no 64-column tile
+        #   divides, under an aligned width that clips only its last tile
+        #   (cuBLAS's swapped tile), on the whole 256-row M tiles whose
+        #   single N edge the one-wave search takes (``search_plan``: its
+        #   M ceiling divides such an M, and its quarter-wave gate counts
+        #   256x64 tiles). bf16 1000x1024x2048: as written 64 pairs of
+        #   128x128 (each CTA streams 64 + 64 operand rows per K step),
+        #   transposed 72 pairs of 128x112 (64 + 56), 0.93 -> 0.96 of
+        #   cuBLAS;
+        # GB300, in one process.
+        if not whole_k or rows < pair128_m:
+            # (an M under one 128-row tile is no M tile the search reaches)
+            return []
+        if (
+            -(-rows // TCGEN05_TWO_CTA_BLOCK_M) * -(-cols // TCGEN05_TWO_CTA_BLOCK_N)
+            >= sm_pairs
+        ):
+            return []
+        pair_widths = [
+            width
+            for width in TCGEN05_TWO_CTA_PAIR128_ONE_WAVE_BLOCK_NS
+            if rows % pair128_m and cols % width == 0
+        ]
+        if (
+            cols % 64
+            and rows % TCGEN05_TWO_CTA_BLOCK_M == 0
+            and -(-rows // TCGEN05_TWO_CTA_BLOCK_M) * -(-cols // 64) >= sm_pairs // 2
+            and pair128_m
+            in dense_aligned_n_block_ms(
+                torch.bfloat16,
+                n=cols,
+                output_column_major=output_column_major,
+                plain_epilogue=True,
+            )
+        ):
+            pair_widths.extend(width for width in ALIGNED_N_CHOICES if width <= cols)
+        return [
+            pair_tile_wave_cost(
+                rows, cols, k, width=width, block_m=pair128_m, sm_pairs=sm_pairs
+            )
+            for width in pair_widths
+            if sm_pairs // 2 <= -(-rows // pair128_m) * -(-cols // width) <= sm_pairs
+        ]
+
+    def best(rows: int, cols: int, *, output_column_major: bool) -> float:
         if rows % TCGEN05_TWO_CTA_BLOCK_M and not whole_k:
             return math.inf
         return min(
             (
-                pair_tile_wave_cost(
-                    rows,
-                    cols,
-                    k,
-                    width=width,
-                    block_m=TCGEN05_TWO_CTA_BLOCK_M,
-                    sm_pairs=sm_pairs,
-                )
-                for width in widths
-                if cols % width == 0 or whole_k
+                *(
+                    pair_tile_wave_cost(
+                        rows,
+                        cols,
+                        k,
+                        width=width,
+                        block_m=TCGEN05_TWO_CTA_BLOCK_M,
+                        sm_pairs=sm_pairs,
+                    )
+                    for width in widths
+                    if cols % width == 0 or whole_k
+                ),
+                *pair128_costs(rows, cols, output_column_major=output_column_major),
             ),
             default=math.inf,
         )
 
-    as_written, transposed = best(m, n), best(n, m)
+    # (the transposed product stores out.T, a column-major output)
+    as_written = best(m, n, output_column_major=False)
+    transposed = best(n, m, output_column_major=True)
     if math.inf in (as_written, transposed):
         # an orientation the pair cannot tile (a partial last 256-row tile
         # over a K tail) runs other tiles, which the model does not price
@@ -237,6 +313,7 @@ def dense_aligned_n_plan(
     tile: tuple[int, int, int],
     *,
     bounds: tuple[tuple[int, int], tuple[int, int], tuple[int, int]],
+    sm_pairs: int,
 ) -> DenseAlignedNPlan | None:
     """Reuse the strict ordinary native multiplicative-epilogue facts.
 
@@ -313,6 +390,9 @@ def dense_aligned_n_plan(
     pinned = dense_aligned_n_defaults(
         acc_stages=acc_stages, store_mode=cast("str", store_mode)
     )
+    # The family's producer is the role-local TMA producer, which one or two
+    # A/B-load warps run (``cute_mma._build_shared_ring_producer``).
+    pinned.pop("tcgen05_warp_spec_ab_load_warps")
     if sixteen_bit:
         pinned.pop("l2_groupings")
         # N pairing (A multicast) takes whole, evenly split N tiles: the
@@ -333,12 +413,14 @@ def dense_aligned_n_plan(
     # (M128 with 64: ``dense_aligned_n_block_ms``).
     # Its allocations are exactly those of the native paired pipeline at this
     # width and stored dtype, with the configured epilogue subtile and warp
-    # groups; a plain 16-bit store on whole N and K tiles (a partial last M
-    # tile is clipped by the TMA store) at a width ``cute_mma``'s plain narrow
-    # rule covers takes the plan's (128, 32) subtile, a plain 16-bit store at
-    # 144 or 240 columns the (128, 48) one where its ring fits beside the
-    # configured AB ring (below), any other C stage (an FP32 output, a
-    # partial last N tile, a column-major output) the model's own
+    # groups; a plain 16-bit store on whole K tiles at a width ``cute_mma``'s
+    # plain narrow rule covers takes the plan's (128, 32) subtile over whole
+    # N tiles, and over a partial last N tile where
+    # ``tcgen05_plain_narrow_subtile_covers_n`` admits one (the TMA store
+    # clips a partial last M or N tile), a plain 16-bit store at 144 or 240
+    # columns the (128, 48) one where its ring fits beside the configured AB
+    # ring (below), any other C stage (an FP32 output, a partial last N tile
+    # that rule leaves out, a column-major output) the model's own
     # with-source tile.
     allocations = Tcgen05PipelineSmemFacts(
         facts.input_dtype.itemsize,
@@ -368,7 +450,11 @@ def dense_aligned_n_plan(
     # ``_paired_pipeline_store_subtile_n`` for power-of-two pairs): pricing a
     # (128, 32) ring that codegen then renders at (128, 64) would overflow
     # the seven-stage ring (``test_cute_dense_aligned_n`` renders the
-    # 192-wide plain pair, whole and over an M tail, at the priced subtile).
+    # 192-wide plain pair, whole and over an M or N tail, at the priced
+    # subtile). Over an N tail the (128, 64) ring would leave room for six
+    # stages only: bf16 1000x10240x2560 on the 192-wide pair (53.3 N tiles),
+    # GB300, of cuBLAS in one process, 0.985-0.989 at six AB stages and
+    # 1.001-1.009 at seven.
     # Those rules (and the odd-width one below) retile the row-major store
     # only; a column-major output keeps CuTe's with-source tile, which the
     # model prices itself:
@@ -392,12 +478,19 @@ def dense_aligned_n_plan(
         else TCGEN05_PLAIN_NARROW_SUBTILE_N
         if plain_sixteen_bit_store
         and width in TCGEN05_PLAIN_NARROW_SUBTILE_BLOCK_NS
-        and n % width == 0
         and k % bk == 0
+        and tcgen05_plain_narrow_subtile_covers_n(
+            m, n, k, bm=block_m, bn=width, bk=bk, sm_pairs=sm_pairs
+        )
         else None
     )
 
-    max_stages = min(TCGEN05_SMEM_AWARE_MAX_AB_STAGES, (k + bk - 1) // bk)
+    max_stages = min(
+        paired_pipeline_max_ab_stages(allocations)
+        if facts.plain_epilogue
+        else TCGEN05_SMEM_AWARE_MAX_AB_STAGES,
+        (k + bk - 1) // bk,
+    )
     # A plain 16-bit pair allocates the AB and C rings and nothing else, so
     # its arena is priced as ptxas lays it out (``plain_layout``, the
     # measured ``tcgen05_fixed_smem_overhead_bytes``): the 224-wide pair's

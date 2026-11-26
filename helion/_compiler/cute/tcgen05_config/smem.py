@@ -23,6 +23,7 @@ from ..grouped_ab_k import physical_grouped_ab_k
 from ..pipeline_smem import TCGEN05_CTA_GROUP_CONFIG_KEY
 from ..pipeline_smem import max_pipeline_ab_stages
 from ..pipeline_smem import one_cta_pipeline_tile_modeled
+from ..pipeline_smem import paired_pipeline_max_ab_stages
 from ..pipeline_smem import pipeline_smem_bytes
 from ..strategies import TCGEN05_LAYOUT_OVERRIDES_KEYS
 from ..strategies import TCGEN05_LAYOUT_STRATEGY_CONFIG_KEY
@@ -127,6 +128,7 @@ def _paired_pipeline_stage_limit(
     bm, bn, bk, c_stages, acc_stages = parameters
     return max_pipeline_ab_stages(
         facts,
+        max_stages=paired_pipeline_max_ab_stages(facts),
         bm=bm,
         bn=bn,
         bk=bk,

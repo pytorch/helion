@@ -29,6 +29,7 @@ from helion._compiler.cute.tcgen05_config import facts
 from helion._compiler.cute.tcgen05_config import repair
 from helion._compiler.cute.tcgen05_config import seeds
 from helion._compiler.cute.tcgen05_config import surface
+from helion._compiler.cute.tcgen05_constants import TCGEN05_TRANSPOSED_PRODUCT_MIN_GAIN
 from helion._compiler.cute.tcgen05_schedule_facts import analyze_native_gemm
 from helion._testing import skipUnlessBackends
 from helion._testing.cute_codegen import forbid_cuda_work
@@ -1004,9 +1005,13 @@ def test_sixteen_bit_pair_judges_full_tiles_at_its_width():
 def test_sixteen_bit_pair_n_tails_and_fp32_outputs():
     # A weight gradient: bf16 operands into an fp32 output whose N (1024) no
     # width divides. A width with a partial last N tile (its loads zero-fill,
-    # its TMA store clips) is admitted; the C ring takes the with-source
-    # subtile at the stored width and N tiles pair only when whole. Here no
-    # clipped width is seeded or searched: one wave of 256x64 pairs beats them.
+    # its TMA store clips) is admitted; its C ring takes the with-source
+    # subtile at the stored width (six AB stages): the output is fp32, or
+    # (bf16) its 24 tiles fill less than one wave, so no epilogue hides behind
+    # a next tile (``tcgen05_plain_narrow_subtile_covers_n``; 8192 rows take
+    # the plain (128, 32) ring and seven, below). N tiles pair only when
+    # whole. Here no clipped width is seeded or searched: one wave of 256x64
+    # pairs beats them.
     x, y, out = bf16_mm_args(1024, 1024, 512)
     for dtype in (torch.float32, torch.bfloat16):
         bound = plain_mm_into._bind_isolated((x, y, out.to(dtype)))
@@ -1020,10 +1025,26 @@ def test_sixteen_bit_pair_n_tails_and_fp32_outputs():
             )
         assert plan is not None and plan.max_ab_stages == 6
         assert paired is None
-        # both outputs render: the FP32 one is the C4_15 weight gradient's
+        # both outputs render at the priced depth, through CuTe's tile: the
+        # FP32 one is the C4_15 weight gradient's
         source = bound.to_code(aligned_n_bf16_config(tcgen05_ab_stages=6))
         assert "_BLOCK_SIZE_1 = 192" in source
         assert "tcgen05_tma_store_atom" in source
+        ab, d = wrapper_plans(source)
+        assert ab["ab_stage_count"] == 6
+        assert d.get("epi_tile_n") is None
+    # 32 x 6 = 192 tiles of the 192-wide pair over 8192 x 1024 run more than
+    # one per CTA pair: the 16-bit output prices and renders the (128, 32)
+    # ring, which leaves room for seven AB stages.
+    tall = plain_mm_into._bind_isolated(bf16_mm_args(8192, 1024, 512))
+    with tall.env:
+        plan = facts._dense_aligned_n_plan(
+            tall.config_spec._cute_tcgen05_config, aligned_n_bf16_config().config
+        )
+    assert plan is not None and plan.max_ab_stages == 7
+    ab, d = wrapper_plans(tall.to_code(aligned_n_bf16_config(tcgen05_ab_stages=7)))
+    assert ab["ab_stage_count"] == 7
+    assert d["epi_tile_n"] == 32
     # Multiple epilogue warp groups need whole physical tiles: refused as
     # given, dropped when the autotuner repairs a sampled config.
     groups = aligned_n_bf16_config(tcgen05_ab_stages=4, tcgen05_epi_warp_groups=2)
@@ -1428,13 +1449,18 @@ def test_one_cta_tiles_keep_the_stage_slice():
     assert "sB_tma_layout = cute.slice_(sB_layout, (None, None, None, 0))" in source
 
 
-def test_plain_256_wide_pair_takes_the_narrow_subtile_over_an_m_tail():
+def test_plain_256_wide_pair_takes_the_narrow_subtile_over_output_tails():
     # The 256x256 pair over a partial last M tile: bf16 25216x768x768 is 98.5
     # 256-row pairs over whole N and K tiles, every tile on the TMA store,
     # which clips the rows past M. Its plain store takes the (128, 32)
     # subtile, as the whole tiles of 25344x768x768 do; CuTe's with-source
-    # rule would render (128, 64). Only whole tiles also take the no-unroll
-    # K loop. A partial last N tile or a K tail keeps CuTe's tile.
+    # rule would render (128, 64). So does a partial last N tile (1000
+    # columns: 3.9 256-wide tiles), whose columns past N the TMA store clips
+    # the same way, where a tile's epilogue hides behind the next tile's
+    # mainloop: more tiles than SM pairs and a K loop past the tile's fixed
+    # cost (twelve K blocks here; four, as 25344x1000x256 has, or one wave of
+    # 64 tiles, as 4096x1000x2048 has, keep CuTe's tile). Only whole tiles
+    # also take the no-unroll K loop; a K tail keeps CuTe's tile.
     config = helion.Config(
         block_sizes=[256, 256, 64],
         pid_type="persistent_interleaved",
@@ -1449,7 +1475,10 @@ def test_plain_256_wide_pair_takes_the_narrow_subtile_over_an_m_tail():
     for (m, n, k), takes_subtile, nounroll in (
         ((25344, 768, 768), True, True),
         ((25216, 768, 768), True, False),
-        ((25344, 1000, 768), False, False),
+        ((25344, 1000, 768), True, False),
+        ((25216, 1000, 768), True, False),
+        ((25344, 1000, 256), False, False),
+        ((4096, 1000, 2048), False, False),
         ((25216, 768, 736), False, False),
     ):
         source = plain_mm_into._bind_isolated(bf16_mm_args(m, n, k)).to_code(config)
@@ -1529,6 +1558,291 @@ def test_a_short_k_loop_keeps_the_product_as_written() -> None:
     assert transposed_pair_tile_gain(8192, 512, 512, sm_pairs=76) > 1.08
 
 
+def _search_range(bound, block_id: int) -> tuple[int, int, int]:
+    """A block's floor for provided configs and its search range."""
+    spec = bound.config_spec
+    block = spec.block_sizes.block_id_lookup(block_id)
+    fragment = block._fragment(spec)
+    return block.min_size, fragment.low, fragment.high
+
+
+def test_a_small_n_runs_one_zero_filled_tcgen05_tile() -> None:
+    # The transposed GEMV of bf16 4x4096x4096 (out.T = b.T @ a.T, N = 4):
+    # the search's N tile is the 8-column tcgen05 tile, whose edge TMA
+    # zero-fills a.T's rows 4-7, not the scalar fallback's 4-column block,
+    # over K tiles of at least 32 (a K-major B stage of 32-byte rows is
+    # refused).
+    a, b, out = bf16_mm_args(4, 4096, 4096)
+    with gb300_target(), forbid_cuda_work():
+        bound = plain_mm_into._bind_isolated((b.T, a.T, out.T))
+        assert _search_range(bound, 1) == (4, 8, 8)
+        assert _search_range(bound, 2) == (16, 32, 128)
+        (plan, *_) = wrapper_plans(bound.to_code(bound.config_spec.default_config()))
+        assert (plan["kind"], plan["bn"], plan["n_size"]) == ("tcgen05_ab_tma", 8, 4)
+        # The block floor stays the scalar fallback's: a provided config
+        # keeps its tiles, [64, 4, 16] the SIMT dot it ran before (raised to
+        # 8 columns, its 16-deep K tile would make the refused B stage).
+        code = bound.to_code(helion.Config(block_sizes=[64, 4, 16], pid_type="flat"))
+        assert "_BLOCK_SIZE_1 = 4\n_BLOCK_SIZE_2 = 16\n" in code
+        assert "cute.gemm(" not in code
+    # A short K is no memory-bound GEMM: the 4-column block stays.
+    a, b, out = bf16_mm_args(4, 4096, 64)
+    with gb300_target(), forbid_cuda_work():
+        bound = plain_mm_into._bind_isolated((b.T, a.T, out.T))
+        assert _search_range(bound, 1) == (4, 4, 4)
+
+
+def test_a_small_n_b_off_the_tensormap_rule_keeps_the_scalar_fallback() -> None:
+    # The GEMV as written, bf16 4096x4x1024 with b stored [K, N]: its 8-byte
+    # rows are off the 16-byte TensorMap rule, so the tile would load B on
+    # the scalar shared-memory producer; the default and the search keep the
+    # scalar fallback's SIMT dot. 16-byte rows (four columns of an
+    # eight-column b) take the tile.
+    a, b, out = bf16_mm_args(4096, 4, 1024, rhs_k_major=False)
+    with gb300_target(), forbid_cuda_work():
+        bound = plain_mm_into._bind_isolated((a, b, out))
+        assert _search_range(bound, 1) == (4, 4, 4)
+        assert "cute.gemm(" not in bound.to_code(bound.config_spec.default_config())
+        b = torch.randn((1024, 8), dtype=torch.bfloat16)[:, :4]
+        bound = plain_mm_into._bind_isolated((a, b, out))
+        assert _search_range(bound, 1) == (4, 8, 8)
+        (plan, *_) = wrapper_plans(bound.to_code(bound.config_spec.default_config()))
+        assert (plan["kind"], plan["bn"]) == ("tcgen05_ab_tma", 8)
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _bounded_k_mm_into(
+    a: torch.Tensor, b: torch.Tensor, out: torch.Tensor, maximum: int
+) -> None:
+    m, k = a.shape
+    n = b.shape[1]
+    block_k = hl.register_block_size(16, maximum)
+    for rows, cols in hl.tile((m, n)):
+        acc = hl.zeros((rows, cols), dtype=torch.float32)
+        for inner in hl.tile(k, block_size=block_k):
+            acc = torch.addmm(acc, a[rows, inner], b[inner, cols])
+        out[rows, cols] = acc.to(out.dtype)
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _k16_mm_into(a: torch.Tensor, b: torch.Tensor, out: torch.Tensor) -> None:
+    m, k = a.shape
+    n = b.shape[1]
+    for rows, cols in hl.tile((m, n)):
+        acc = hl.zeros((rows, cols), dtype=torch.float32)
+        for inner in hl.tile(k, block_size=16):
+            acc = torch.addmm(acc, a[rows, inner], b[inner, cols])
+        out[rows, cols] = acc.to(out.dtype)
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _bounded_n_mm_into(
+    a: torch.Tensor, b: torch.Tensor, out: torch.Tensor, minimum: int, maximum: int
+) -> None:
+    m, k = a.shape
+    n = b.shape[1]
+    block_n = hl.register_block_size(minimum, maximum)
+    for rows, cols in hl.tile((m, n), block_size=[None, block_n]):
+        acc = hl.zeros((rows, cols), dtype=torch.float32)
+        for inner in hl.tile(k):
+            acc = torch.addmm(acc, a[rows, inner], b[inner, cols])
+        out[rows, cols] = acc.to(out.dtype)
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _n4_mm_into(a: torch.Tensor, b: torch.Tensor, out: torch.Tensor) -> None:
+    m, k = a.shape
+    n = b.shape[1]
+    for rows, cols in hl.tile((m, n), block_size=[None, 4]):
+        acc = hl.zeros((rows, cols), dtype=torch.float32)
+        for inner in hl.tile(k):
+            acc = torch.addmm(acc, a[rows, inner], b[inner, cols])
+        out[rows, cols] = acc.to(out.dtype)
+
+
+def test_a_small_n_block_range_without_8_keeps_the_scalar_fallback() -> None:
+    # bf16 4096x4x1024 over a K-major B with N registered at (4, 4) (block
+    # ids N, M, K; the range bounds the search, and the block may size
+    # allocations) or fixed at 4 (M, K): neither takes the 8-column tile,
+    # and the search and the default stay the scalar fallback's, K tiles
+    # from 16 deep included; registered up to 16, N takes the tile.
+    a, b, out = bf16_mm_args(4096, 4, 1024)
+    with gb300_target(), forbid_cuda_work():
+        bound = _bounded_n_mm_into._bind_isolated((a, b, out, 4, 4))
+        assert _search_range(bound, 0) == (4, 4, 4)
+        assert _search_range(bound, 2) == (16, 16, 128)
+        config = bound.config_spec.default_config()
+        assert config.config["block_sizes"] == [4, 64, 64]
+        assert "cute.gemm(" not in bound.to_code(config)
+        bound = _n4_mm_into._bind_isolated((a, b, out))
+        assert _search_range(bound, 2) == (16, 16, 128)
+        assert "cute.gemm(" not in bound.to_code(bound.config_spec.default_config())
+        bound = _bounded_n_mm_into._bind_isolated((a, b, out, 4, 16))
+        assert _search_range(bound, 0) == (4, 8, 8)
+        assert _search_range(bound, 2) == (16, 32, 128)
+        (plan, *_) = wrapper_plans(bound.to_code(bound.config_spec.default_config()))
+        assert (plan["kind"], plan["bn"]) == ("tcgen05_ab_tma", 8)
+
+
+def test_a_small_n_k_block_under_64_bytes_keeps_the_scalar_fallback() -> None:
+    # The transposed GEMV with K registered at 16 (block ids K, M, N) or
+    # fixed at 16 (M, N): no K tile feeds the 8-column tile its K-major B,
+    # so the search keeps the scalar fallback's 4-column tiles, which
+    # render; registered up to 32, it takes the tile over 32-deep K tiles.
+    a, b, out = bf16_mm_args(4, 4096, 4096)
+    with gb300_target(), forbid_cuda_work():
+        bound = _bounded_k_mm_into._bind_isolated((b.T, a.T, out.T, 16))
+        assert _search_range(bound, 2) == (4, 4, 4)
+        code = bound.to_code(helion.Config(block_sizes=[16, 64, 4], pid_type="flat"))
+        assert "cute.gemm(" not in code
+        bound = _k16_mm_into._bind_isolated((b.T, a.T, out.T))
+        assert _search_range(bound, 1) == (4, 4, 4)
+        assert "cute.gemm(" not in bound.to_code(bound.config_spec.default_config())
+        bound = _bounded_k_mm_into._bind_isolated((b.T, a.T, out.T, 32))
+        assert _search_range(bound, 0) == (16, 32, 32)
+        assert _search_range(bound, 2) == (4, 8, 8)
+        config = bound.config_spec.default_config()
+        assert config.config["block_sizes"] == [32, 64, 8]
+        (plan, *_) = wrapper_plans(bound.to_code(config))
+        assert (plan["kind"], plan["bn"], plan["bk"]) == ("tcgen05_ab_tma", 8, 32)
+
+
+def test_a_one_wave_product_no_pair_tiles_as_written_runs_transposed() -> None:
+    # bf16 512x1000x1280: as written no CTA pair tiles N (1000 = 15.6 x 64:
+    # the one-wave family's 128-row pairs take whole N tiles) and the
+    # 256-row pairs give 8 tiles, so the flat one-CTA kernel runs it (0.86 of
+    # cuBLAS on GB300); transposed (1000x512), 64 pairs of 128x64 do (0.96).
+    assert (
+        transposed_pair_tile_gain(512, 1000, 1280, sm_pairs=76)
+        >= TCGEN05_TRANSPOSED_PRODUCT_MIN_GAIN
+    )
+    assert transposed_pair_tile_gain(1000, 512, 1280, sm_pairs=76) < 1.0
+    # The 128-row pairs count only where the search runs them: not under
+    # one 128-row tile of M (4096x2x2048 transposed: 2 rows), nor on a grid
+    # under a quarter of the SMs (128x1000x768 transposed: 16 pairs).
+    for m, n, k in ((4096, 2, 2048), (128, 1000, 768)):
+        assert (
+            transposed_pair_tile_gain(m, n, k, sm_pairs=76)
+            < TCGEN05_TRANSPOSED_PRODUCT_MIN_GAIN
+        )
+
+
+def _transposed_args(m: int, n: int, k: int) -> tuple[torch.Tensor, ...]:
+    """helion.inductor's transposed product of a bf16 RC ``m`` x ``n`` x ``k``
+    mm: out.T (n x m, column-major) = b.T (n x k) @ a.T (k x m)."""
+    a, b, out = bf16_mm_args(m, n, k)
+    return b.T, a.T, out.T
+
+
+def test_the_transposed_product_runs_the_swapped_128_row_pair() -> None:
+    # bf16 1000x1024xK transposed (out.T 1024 x 1000): the one-wave pairs
+    # clip N's last tile (1000 is no multiple of 64), the aligned-N family
+    # runs the 128-row pair over the column-major output, and 72 pairs of
+    # 128x112 (cuBLAS's swapped tile) put 144 CTAs on GB300's 152 SMs.
+    bound = plain_mm_into._bind_isolated(_transposed_args(1000, 1024, 2048))
+    state = bound.config_spec._cute_tcgen05_config
+    assert state.cluster_m2_search_constraints.allow_one_wave_tiles
+    assert facts._dense_aligned_n_block_ms(state) == (256, 128)
+    # the 256-row pair ranks no clipped width ahead of its 64-wide tile; the
+    # 128-row pair ranks 112 ahead of its 128-wide one
+    assert facts._dense_aligned_n_clipped_widths(state) == frozenset()
+    assert facts._dense_aligned_n_widths(state) == (112,)
+    pairs = [
+        seed.config
+        for seed in bound.config_spec.compiler_seed_configs
+        if seed.config.get("tcgen05_tile_n") == 112
+    ]
+    assert {
+        (
+            tuple(seed["block_sizes"]),
+            seed["tcgen05_ab_stages"],
+            seed["tcgen05_warp_spec_ab_load_warps"],
+        )
+        for seed in pairs
+    } == {((128, 128, 64), 14, 1), ((128, 128, 64), 14, 2)}
+    # The search keeps the sampled 128-row pair and its two A/B-load warps.
+    gen = ConfigGeneration(bound.config_spec)
+    two = next(seed for seed in pairs if seed["tcgen05_warp_spec_ab_load_warps"] == 2)
+    _flat, normalized = gen.strict_config_pair(helion.Config(**two))
+    assert normalized.config["block_sizes"][0] == 128
+    assert normalized.config["tcgen05_warp_spec_ab_load_warps"] == 2
+    # Its CTA's one tile stages its seven (64, 16) subtiles in the drained A
+    # ring (fourteen 8 KB stages hold the 14 KB tile).
+    code = bound.to_code(helion.Config(**two))
+    assert "CtaGroup.TWO, (128, 112)" in code
+    assert "if not tcgen05_epi_next_work.is_valid_tile:" in code
+    assert "tcgen05_last_sD = cute.make_tensor(cute.recast_ptr(smem_a" in code
+
+
+def test_the_last_tile_stages_over_a_column_major_output() -> None:
+    def staged(args, config) -> bool:
+        code = plain_mm_into._bind_isolated(args).to_code(config)
+        return "if not tcgen05_epi_next_work.is_valid_tile:" in code
+
+    pair256 = aligned_n_bf16_config(
+        tcgen05_tile_n=112,
+        block_sizes=[256, 128, 64],
+        pid_type="persistent_interleaved",
+        tcgen05_ab_stages=9,
+    )
+    pair128 = aligned_n_bf16_config(
+        tcgen05_tile_n=112,
+        block_sizes=[128, 128, 64],
+        pid_type="persistent_interleaved",
+        tcgen05_ab_stages=14,
+    )
+    # The 256-row pair over either output (1000x2048x2304 as written and
+    # transposed); the 128-row pair over a column-major output, not over a
+    # row-major one, whose (64, 16) rounds measured the same staged
+    # (4864x224x1024: 0.937 -> 0.938 of cuBLAS, GB300).
+    assert staged(bf16_mm_args(1000, 2048, 2304), pair256)
+    assert staged(_transposed_args(1000, 2048, 2304), pair256)
+    assert staged(_transposed_args(1000, 1024, 2048), pair128)
+    assert not staged(bf16_mm_args(4864, 224, 1024), pair128)
+
+
+def test_the_swapped_pair_flips_only_an_n_no_64_column_tile_divides() -> None:
+    # The model prices the aligned-N 128-row pair over an N no 64-column
+    # tile divides, where the family runs it (a column-major output: the
+    # transposed side). bf16 1000x1024xK: as written 64 pairs of 128x128, 64
+    # + 64 operand rows per CTA and K step; transposed 72 of 128x112, 64 + 56
+    # (GB300, of cuBLAS: K=1024 0.950 -> 0.955, 2048 0.937 -> 0.957, 4096
+    # 0.946 -> 0.970).
+    for k in (1024, 2048, 2304, 2560, 3072, 4096):
+        assert (
+            transposed_pair_tile_gain(1000, 1024, k, sm_pairs=76)
+            >= TCGEN05_TRANSPOSED_PRODUCT_MIN_GAIN
+        )
+    # Whole 64-column N tiles keep their orientation: the transposed 128x176
+    # (2048x768) and 128x224 (4096x512) pairs, and the as-written 128x240 of
+    # 128x16384 (a row-major output wider than 256 runs no 128-row aligned
+    # pair).
+    assert (
+        transposed_pair_tile_gain(2048, 768, 3072, sm_pairs=76)
+        < TCGEN05_TRANSPOSED_PRODUCT_MIN_GAIN
+    )
+    assert (
+        transposed_pair_tile_gain(4096, 512, 384, sm_pairs=76)
+        < TCGEN05_TRANSPOSED_PRODUCT_MIN_GAIN
+    )
+    assert (
+        transposed_pair_tile_gain(128, 16384, 4096, sm_pairs=76)
+        >= TCGEN05_TRANSPOSED_PRODUCT_MIN_GAIN
+    )
+    # Nor does an out.T whose M the search does not tile in 256-row pairs:
+    # 1000x896 transposed (896 rows: an M ceiling of 128, no CTA pair runs
+    # its N edge).
+    assert (
+        transposed_pair_tile_gain(1000, 896, 2048, sm_pairs=76)
+        < TCGEN05_TRANSPOSED_PRODUCT_MIN_GAIN
+    )
+    transposed = plain_mm_into._bind_isolated(_transposed_args(1000, 896, 2048))
+    assert (
+        transposed.config_spec._cute_tcgen05_config.cluster_m2_search_constraints
+        is None
+    )
+
+
 def test_a_row_major_pair_under_a_128_row_ceiling_runs_128_rows() -> None:
     # bf16 25216x192x768: M is ragged for 256-row tiles and N for 128-wide
     # ones, so the search keeps M tiles of at most 128 rows. N (192) is itself
@@ -1573,17 +1887,19 @@ def test_a_row_major_pair_under_a_128_row_ceiling_runs_128_rows() -> None:
     assert facts._matmul_search_bounds(wide_state)[0] == (128, 128)
     assert facts._dense_aligned_n_widths(wide_state) == ()
     assert not _seeded_widths(wide)
-    # The transposed product (a column-major output) keeps the 256-row pair,
-    # which the 128-row M ceiling of its 192 rows excludes: its 128-row tile
-    # would store through 16-column rounds.
+    # The transposed product (a column-major output, any N) runs the 128-row
+    # pair under the 128-row M ceiling of its 192 rows too, its CTA's last
+    # tile staged at once (``cute_mma``'s ``tcgen05_last_tile_staging``): the
+    # search samples the widths the 128-row pair ranks ahead of its
+    # references, and no width is seeded (none divides 25216 or clears the
+    # seeds' margin).
     x = torch.empty((192, 768), dtype=torch.bfloat16)
     y = torch.empty((25216, 768), dtype=torch.bfloat16).T
     out = torch.empty((25216, 192), dtype=torch.bfloat16).T
     transposed = plain_mm_into._bind_isolated((x, y, out))
-    assert (
-        facts._dense_aligned_n_block_m(transposed.config_spec._cute_tcgen05_config)
-        == 256
-    )
+    transposed_state = transposed.config_spec._cute_tcgen05_config
+    assert facts._dense_aligned_n_block_m(transposed_state) == 128
+    assert facts._dense_aligned_n_widths(transposed_state) == (224, 240)
     assert not _seeded_widths(transposed)
 
 

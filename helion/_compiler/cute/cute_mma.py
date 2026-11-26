@@ -236,6 +236,7 @@ from .tcgen05_constants import resolve_tcgen05_grouped_worklist_mma_profile
 from .tcgen05_constants import tcgen05_ab_smem_bytes_per_cta
 from .tcgen05_constants import tcgen05_grouped_worklist_smem_bytes
 from .tcgen05_constants import tcgen05_grouped_worklist_store_shape
+from .tcgen05_constants import tcgen05_plain_narrow_subtile_covers_n
 from .tcgen05_constants import tcgen05_role_launch_n_width
 from .tcgen05_lifecycle import Tcgen05LifecycleContext
 from .tcgen05_prologue import floordiv_nonneg_expr
@@ -6971,6 +6972,109 @@ def _build_initial_prefetch_if(
     return statement_from_string(src)
 
 
+def _build_shared_ring_producer(
+    args: _InitialPrefetchTmaArgs,
+    *,
+    tile_gate: str,
+    k_tiles: int,
+    load_warps: int,
+    load_rank: str,
+    k_tile_var: str,
+    ab_stage_count: int,
+    fresh_ring: bool,
+) -> ast.stmt:
+    """The whole A/B TMA producer of one tile, shared by ``load_warps`` warps.
+
+    ``tcgen05_warp_spec_ab_load_warps=2`` (bf16 1000x512x2880, 128x64 CTA
+    pair, 16-stage ring)::
+
+        if tcgen05_tma_initial_full_tile:
+            for tcgen05_ab_load_k_tile in cutlass.range(
+                cutlass.Int32(0), cutlass.Int32(45), cutlass.Int32(1), unroll=1
+            ):
+                # warp 5 issues the even ring slots, warp 6 the odd ones
+                if (
+                    tcgen05_ab_producer_state.count % cutlass.Int32(2)
+                    == tcgen05_ab_load_rank
+                ):
+                    tcgen05_ab_pipeline.producer_acquire(tcgen05_ab_producer_state)
+                    tcgen05_tma_barrier = tcgen05_ab_pipeline.producer_get_barrier(
+                        tcgen05_ab_producer_state
+                    )
+                    cute.copy(
+                        tma_atom_a,
+                        tma_gA[None, tcgen05_ab_load_k_tile],
+                        tma_sA[None, tcgen05_ab_producer_state.index],
+                        tma_bar_ptr=tcgen05_tma_barrier,
+                        mcast_mask=tcgen05_a_mcast_mask,
+                    )
+                    cute.copy(
+                        tma_atom_b,
+                        tma_gB[None, tcgen05_ab_load_k_tile],
+                        tma_sB[None, tcgen05_ab_producer_state.index],
+                        tma_bar_ptr=tcgen05_tma_barrier,
+                        mcast_mask=tcgen05_b_mcast_mask,
+                    )
+                    tcgen05_ab_pipeline.producer_commit(tcgen05_ab_producer_state)
+                # both warps walk every ring slot, so their ring states agree
+                tcgen05_ab_producer_state.advance()
+
+    The one-warp producer (the unrolled ring fill, then a loop issuing k-block
+    ``k + stages``) runs every stage's issue chain serially: an elected
+    thread's empty-barrier wait, ``expect_tx`` and, per copy, the SMEM
+    destination taken through the generic address space into
+    ``shared::cluster`` (``S2R SR_SWINHI``, ``S2UR SR_CgaCtaId``) and the
+    descriptor address -- about 200 cycles. %globaltimer probes put one stage
+    out every ~96 ns from the very first stage on, with the ring empty: a
+    12 KB stage per CTA (128x64 pair) arrives every 96 ns where the 16 KB
+    stages of cuBLAS's 64x64 2x2 kernel arrive every ~73. Two warps
+    alternating the k-blocks issue the ring fill at ~49 ns per stage, the ring
+    fills and the data rate paces the loop (GB300, CUDA graphs over cold
+    inputs, in-process against cuBLAS): 1000x512x2880 0.855 -> 0.999,
+    1000x512x2048 0.604 -> 0.975, 1000x1024x2560 0.937 -> 0.949. A rolled
+    loop per warp over its own k-blocks (``range(rank, k_tiles, 2)``, its
+    ring state advanced twice per k-block) reads 0.988, and keeping the
+    unrolled fill with each warp skipping the stages it does not own 0.907.
+    One warp in this rolled form reads 0.83: the default keeps the unrolled
+    producer.
+    """
+    acquire_token = (
+        f", cutlass.Boolean({k_tile_var} < cutlass.Int32({ab_stage_count}))"
+        if fresh_ring
+        else ""
+    )
+    copy_src = _tma_copy_a_src(args, k_offset=k_tile_var) + _tma_copy_b_src(
+        args, k_offset=k_tile_var
+    )
+    issue_src = (
+        f"    {args.tma_pipeline}.producer_acquire({args.tma_producer_state}{acquire_token})\n"
+        f"    {args.tma_barrier_ptr} = "
+        f"{args.tma_pipeline}.producer_get_barrier({args.tma_producer_state})\n"
+        + copy_src
+        + f"    {args.tma_pipeline}.producer_commit({args.tma_producer_state})\n"
+    )
+    # A warp owns every ``load_warps``-th k-block of the ring's running
+    # count, which continues across the tiles of a persistent CTA: a warp's
+    # waits stay ``load_warps`` slots apart, which the ring's depth covers
+    # (the admission requires ``tcgen05_ab_stages >= load_warps``). Owning
+    # the tile's k-block index instead restarts at each tile, and over an
+    # odd k-block count puts three slots between one warp's waits (k=43 of
+    # tile t, then k=1 of tile t+1), past a two-stage ring: bf16
+    # 4096x4096x2880 on persistent 256x256 pairs (45 k-blocks a tile) with
+    # two stages failed with "CUDA error: unspecified launch failure" on
+    # GB300, and matches torch with the running count.
+    src = (
+        f"if {tile_gate}:\n"
+        f"    for {k_tile_var} in cutlass.range(cutlass.Int32(0), "
+        f"cutlass.Int32({k_tiles}), cutlass.Int32(1), unroll=1):\n"
+        f"        if {args.tma_producer_state}.count % cutlass.Int32({load_warps}) "
+        f"== {load_rank}:\n"
+        + textwrap.indent(issue_src, "        ")
+        + emit_pipeline_advance(args.tma_producer_state, indent="        ")
+    )
+    return statement_from_string(src)
+
+
 def _build_split_initial_prefetch(
     args: _InitialPrefetchTmaArgs,
     *,
@@ -9525,6 +9629,39 @@ def plan_tcgen05_pipeline(
         and tcgen05_requested_two_cta
         and tcgen05_k_tail_only
     )
+    # A persistent one-CTA kernel over whole output tiles with a K tail runs
+    # the same role-local producer: it issues the partial last K tile as a
+    # whole box, which TMA zero-fills past K (``tcgen05_role_local_k_tail_tma``
+    # below):
+    #     while tcgen05_role_local_0_work_tile.is_valid_tile:
+    #         ...
+    #         # k-block 3 starts inside K = 1000: issued
+    #         tcgen05_tma_initial_next_full_tile = ... and (cutlass.Int32(768) < cutlass.Int32(1000))
+    # Without it the persistent kernel drops TMA for the shared scalar-copy
+    # body, whose host guard refuses every launch of more than one tile:
+    #     if _helion_tcgen05_persistent_total_tiles > 1:
+    #         raise RuntimeError('Helion CuTe persistent + tcgen05 currently supports ...')
+    # so a K tail ran only on the flat kernel. GB300, of cuBLAS, the same
+    # tile flat -> persistent: helion.inductor's transposed bf16 128x768x1000
+    # with b stored [K, N] (768 x 128, K = 3 x 256 + 232) on [64, 16, 128]
+    # 0.900 -> 0.935, [64, 16, 256] 0.903 -> 0.941; 128x640x1000 0.899 ->
+    # 0.934; 32x1280x1000 (1280 x 32) on [64, 16, 128] 0.902 -> 0.937.
+    tcgen05_preserve_tma_for_one_cta_k_tail = (
+        mma_impl == "tcgen05"
+        and tcgen05_use_tma_pipeline
+        and tcgen05_pid_is_persistent
+        and tcgen05_cluster_m == 1
+        and tcgen05_cluster_n_requested == 1
+        and not tcgen05_requested_two_cta
+        and tcgen05_k_tail_only
+        # the 16-bit rank-2 GEMMs the search admits it for
+        # (``search_plan``'s ``allow_k_tail_persistent_pid_types``)
+        and input_dtype in (torch.float16, torch.bfloat16)
+        and not (analysis is not None and analysis.has_leading_passthrough)
+        and grouped_mode is None
+        and not row_union_requested
+        and not rhs_rank3_segment_metadata
+    )
     # A single ragged output edge of a CTA pair may also have a K tail (one
     # N tile per cluster): the role-local producer issues the partial last
     # K tile as a whole box, which TMA zero-fills past K, the same way the
@@ -9598,6 +9735,7 @@ def plan_tcgen05_pipeline(
         and not tcgen05_mixed_tma_scalar_fallback
         and not tcgen05_flat_edge_tma
         and not tcgen05_preserve_tma_for_two_cta_k_tail
+        and not tcgen05_preserve_tma_for_one_cta_k_tail
         and not tcgen05_m_edge_only
         and not tcgen05_n_edge_only
         and not tcgen05_double_edge_tma
@@ -9719,6 +9857,11 @@ def plan_tcgen05_pipeline(
         tcgen05_preserve_tma_for_two_cta_k_tail
         and tcgen05_is_two_cta
         and tcgen05_cluster_n in (1, 2)
+    ) or (
+        tcgen05_preserve_tma_for_one_cta_k_tail
+        and not tcgen05_is_two_cta
+        and tcgen05_cluster_m == 1
+        and tcgen05_cluster_n == 1
     )
     # Mirror the K-tail role-local guard so later cluster demotion or
     # cluster_n enablement cannot silently admit unvalidated edge ownership.
@@ -12271,7 +12414,8 @@ def _emit_mma_pipeline(
                         tcgen05_cluster_init_wait
                     )
                 tcgen05_cluster_init_wait = (
-                    f"if not {tma_warp}:\n    {tcgen05_cluster_init_wait}"
+                    f"if not {tcgen05_ab_load_warp or tma_warp}:\n"
+                    f"    {tcgen05_cluster_init_wait}"
                 )
             prefix.append(statement_from_string(tcgen05_cluster_init_wait))
         if plan.row_union_plan is not None and plan.row_union_plan.linear_record_clc:
@@ -12337,7 +12481,9 @@ def _emit_mma_pipeline(
                 # the role (ahead of its first stage); every other
                 # non-epilogue warp still meets warp 0 here.
                 df.cute_state.tcgen05.tma_role_hoist_anchor = tcgen05_init_fence
-                tcgen05_init_waiters = f"(not {epi_active} and not {tma_warp})"
+                tcgen05_init_waiters = (
+                    f"(not {epi_active} and not {tcgen05_ab_load_warp or tma_warp})"
+                )
             tcgen05_tmem_publication = statement_from_string(
                 f"if {tcgen05_init_waiters} or {warp_idx} == cutlass.Int32(0):\n"
                 f"    {tcgen05_pipeline_init_barrier}.arrive_and_wait()"
@@ -12711,6 +12857,14 @@ def _emit_mma_pipeline(
     tcgen05_free_tmem_in_epilogue = False
     tcgen05_one_shot_role_scheduler = False
     tcgen05_hoist_tma_role = False
+    # A/B-load warps sharing the role-local TMA producer
+    # (``_build_shared_ring_producer``; ``tcgen05_warp_spec_ab_load_warps``).
+    tcgen05_ab_load_warps = 1
+    tcgen05_ab_load_rank = ""
+    # ``warp_idx`` in the A/B-load warps' range (two or more of them)
+    tcgen05_ab_load_warp = ""
+    tcgen05_shared_ring_k_tiles = 0
+    tcgen05_shared_ring_emitted = False
     tcgen05_effective_scheduler_warps = 0
     tcgen05_hoist_row_union_tma_role = False
     tcgen05_output_stores_value: tuple[Node, ...] | None = None
@@ -12741,6 +12895,7 @@ def _emit_mma_pipeline(
     tcgen05_use_flat_role_coordinates = False
     if plan.mma_impl == "tcgen05":
         tcgen05_warp_spec = warp_spec_from_config(df.config)
+        tcgen05_ab_load_warps = tcgen05_warp_spec.ab_load_warps
         # The public NM profile reserves its scheduler warp internally.
         nm_scheduler_decode = (
             plan.requested_schedule is not None
@@ -13139,11 +13294,11 @@ def _emit_mma_pipeline(
         # 2048x4096x2048 (one tile per pair) 26.8 -> 26.4, within noise. A
         # configured tile wins, aux epilogues keep the promoted rule above,
         # and narrower tiles already take (128, 32) from the default rule.
-        # One 16-bit output through the 256-row pair's role-local TMA-store
-        # epilogue, no auxiliary operand and no configured or promoted
-        # subtile: the stores the plain narrow and odd-width rules below
-        # retile.
-        tcgen05_plain_pair_store = (
+        # One 16-bit output through the pair's role-local TMA-store epilogue,
+        # no auxiliary operand and no configured or promoted subtile; over a
+        # row-major output, the stores the plain narrow and odd-width rules
+        # below retile.
+        tcgen05_plain_pair_output = (
             not tcgen05_explicit_epi_tile_configured
             and not tcgen05_promoted_rowvec_subtile
             and not plan.tcgen05_nm_orientation
@@ -13151,29 +13306,45 @@ def _emit_mma_pipeline(
             and plan.tcgen05_grouped_plan is None
             and plan.tcgen05_use_tma_store_epilogue
             and plan.tcgen05_is_two_cta
-            and not plan.output_column_major
             and not aux_tensor_descriptors_value
             and tcgen05_output_stores_value is not None
             and len(tcgen05_output_stores_value) == 1
             and plan.input_dtype_str in ("cutlass.Float16", "cutlass.BFloat16")
             and plan.epi_elem_dtype_str in ("cutlass.Float16", "cutlass.BFloat16")
         )
+        tcgen05_plain_pair_store = (
+            tcgen05_plain_pair_output and not plan.output_column_major
+        )
+        # (the CTA pairs of one wave, ``tcgen05_plain_narrow_subtile_covers_n``:
+        # the count ``dense_aligned_n_plan`` priced the C ring with)
+        tcgen05_sm_pairs = facts._sm_pairs(
+            CompileEnvironment.current().config_spec._cute_tcgen05_config
+        )
         tcgen05_plain_narrow_subtile = (
             tcgen05_plain_pair_store
             and (
                 plan.tcgen05_static_full_tiles
-                # The aligned-N family's physical tile stores whole N and K
-                # tiles and clips a partial last M tile in its TMA store.
+                # The aligned-N family's physical tile stores whole K tiles
+                # and clips a partial last M or N tile in its TMA store.
                 or (
                     plan.tcgen05_aligned_n_plan is not None
-                    and plan.n_size % plan.tcgen05_mma_bn == 0
                     and plan.k_total_size % plan.bk == 0
+                    and tcgen05_plain_narrow_subtile_covers_n(
+                        plan.m_size,
+                        plan.n_size,
+                        plan.k_total_size,
+                        bm=plan.tcgen05_mma_bm,
+                        bn=plan.tcgen05_mma_bn,
+                        bk=plan.bk,
+                        sm_pairs=tcgen05_sm_pairs,
+                    )
                 )
-                # So does the 256-wide tile over whole N and K tiles, when
-                # every tile takes the TMA store (the partial-output store,
-                # which clips the rows past M). bf16 25216x768x768 (98.5
-                # 256-row pairs, the last half full) on the 256x256 pair,
-                # six AB stages; CuTe's with-source rule renders
+                # So does the 256-wide tile over whole K tiles, when every
+                # tile takes the TMA store (the partial-output store, which
+                # clips the rows past M and the columns past N). bf16
+                # 25216x768x768 (98.5 256-row pairs, the last half full) on
+                # the 256x256 pair, six AB stages; CuTe's with-source rule
+                # renders
                 #
                 #     tcgen05_epi_tile = compute_epilogue_tile_shape((256, 256), ...)
                 #     # (128, 64): four rounds of 64 columns per tile
@@ -13183,15 +13354,37 @@ def _emit_mma_pipeline(
                 #     tcgen05_epi_tile = (cute.make_layout(128), cute.make_layout(32))
                 #     # eight rounds of 32 columns
                 #
-                # GB300, both kernels in one process (CUDA graphs over cold
-                # inputs, median of 15 per-round cuBLAS/Helion ratios): 0.966
-                # -> 1.011 and 0.963 -> 1.009 (25344x768x768: 1.006-1.011).
-                # A full/edge split, whose fringe tiles take the predicated
-                # SIMT store, keeps CuTe's tile (not measured).
+                # A round wholly past N (rounds 2-5 of the last 192-wide
+                # tile over 10240 columns, which holds columns 10176-10239)
+                # loads and converts zeros (the zero-filled B rows) and its
+                # TMA store writes nothing, as a round past M does.
+                # GB300, the old and new kernel of one config in one process
+                # (CUDA graphs over cold inputs, median of 15 per-round
+                # cuBLAS/Helion ratios): 25216x768x768 0.966 -> 1.011 and
+                # 0.963 -> 1.009 (25344x768x768: 1.006-1.011); over an N tail
+                # 4096x8008x2560 (31.3 tiles) 0.977-0.982 -> 0.990-0.995 and,
+                # on the 192-wide aligned pair, 1000x10240x2560 (53.3 tiles)
+                # 0.967-0.973 -> 0.985-0.989 at six AB stages, 1.001-1.009 at
+                # the seven the (128, 32) ring leaves room for
+                # (``dense_aligned_n_plan``), where a tile's epilogue hides
+                # behind the next tile's mainloop
+                # (``tcgen05_plain_narrow_subtile_covers_n``: a one-wave grid,
+                # or a one-K-block batched 200x200 tile on the 256x256 pair,
+                # keeps CuTe's four rounds). A full/edge split, whose fringe
+                # tiles take the predicated SIMT store, keeps CuTe's tile (not
+                # measured).
                 or (
                     tcgen05_partial_output_tma_store
-                    and plan.n_size % plan.tcgen05_mma_bn == 0
                     and plan.k_total_size % plan.bk == 0
+                    and tcgen05_plain_narrow_subtile_covers_n(
+                        plan.m_size,
+                        plan.n_size,
+                        plan.k_total_size,
+                        bm=plan.tcgen05_mma_bm,
+                        bn=plan.tcgen05_mma_bn,
+                        bk=plan.bk,
+                        sm_pairs=tcgen05_sm_pairs,
+                    )
                 )
             )
             and plan.tcgen05_mma_bn in TCGEN05_PLAIN_NARROW_SUBTILE_BLOCK_NS
@@ -13261,17 +13454,28 @@ def _emit_mma_pipeline(
         # measured, and the 256x128 pair's four (128, 32) ones lose; 144 and
         # 240 keep the ring, which their (128, 48) subtiles take where they
         # fit and which a deep C ring's (128, 16) ones were not measured on.
+        # The 256-row pair stages its CTA's 128-row C tile over either
+        # output; the 128-row pair's 64-row tile, whose rounds store (64, 16)
+        # boxes, over a column-major output only. GB300, cuBLAS time / Helion
+        # time, the same kernel with and without the branch in one process
+        # (bf16, two A/B-load warps on the 128-row pairs): the transposed
+        # 1000x1024xK (out.T 1024 x 1000, 72 pairs of 128x112) 0.895 ->
+        # 0.950 at K=1024, 0.915 -> 0.955 at 2048, 0.940 -> 0.966 at 4096;
+        # 2000x1024x2048 transposed (two tiles per CTA pair) 0.864 -> 0.889;
+        # 1000x2048x2304 transposed on the 256x112 pair 0.957 -> 0.983; a
+        # row-major 128x112 pair, 4864x224x1024 and 4864x224x2048, 0.937 ->
+        # 0.938 and 0.946 -> 0.946.
         tcgen05_last_tile_staging_shape = (
-            tcgen05_plain_pair_store
+            tcgen05_plain_pair_output
             and plan.tcgen05_aligned_n_plan is not None
             and not tcgen05_plain_narrow_subtile
             and plan.tcgen05_mma_bn % 32 != 0
             and plan.tcgen05_mma_bn % TCGEN05_ODD_WIDTH_SUBTILE_N != 0
             and plan.tcgen05_mma_bn >= 112
-            # measured on the 256-row pair, whose CTA stages a 128-row C tile
-            # in the A ring (``tcgen05_last_tile_staging``'s ring bound); the
-            # 128-row aligned pair (64-row C tile) keeps the per-round store
-            and plan.tcgen05_mma_bm == TCGEN05_TWO_CTA_BLOCK_M
+            and (
+                plan.tcgen05_mma_bm == TCGEN05_TWO_CTA_BLOCK_M
+                or plan.output_column_major
+            )
         )
         # A hierarchical (view/permute) destination (``radix_store``) takes TMA
         # store boxes that stay inside the layout's innermost runs, which its
@@ -13572,6 +13776,57 @@ def _emit_mma_pipeline(
             and plan.tcgen05_grouped_plan is None
             and not plan.knobs.ab_startup_prefill
         )
+        if tcgen05_ab_load_warps > 1:
+            # Two A/B-load warps share the role-local TMA producer
+            # (``_build_shared_ring_producer``), which walks the tile's whole
+            # K range with TMA: every k-block whole, or a last partial one
+            # the K-tail descriptors zero-fill.
+            k_size = plan.k_total_size
+            if not (
+                plan.tcgen05_use_role_local_tma_producer
+                and plan.tcgen05_use_separate_tma_producer
+                and plan.tcgen05_use_tma_pipeline
+                and tcgen05_effective_scheduler_warps == 0
+                and plan.knobs.int_or(plan.knobs.split_k, 1) == 1
+                and plan.tcgen05_m_subtile_count == 1
+                and not plan.tcgen05_cp_async_a
+                and plan.row_union_plan is None
+                and plan.tcgen05_grouped_plan is None
+                and not plan.tcgen05_grouped_static_persistent
+                and not plan.knobs.ab_startup_prefill
+                and not plan.knobs.materialized_pdl
+                and isinstance(k_size, int)
+                and (k_size % plan.bk == 0 or plan.tcgen05_role_local_uses_k_tail_tma)
+            ):
+                raise exc.BackendUnsupported(
+                    "cute",
+                    "tcgen05_warp_spec_ab_load_warps > 1 requires the role-local "
+                    "TMA producer of a plain dense GEMM over a static K",
+                )
+            if plan.tcgen05_ab_stage_count_value < tcgen05_ab_load_warps:
+                # Each warp waits only on the slots it issues, every
+                # ``load_warps``-th one (``_build_shared_ring_producer``): a
+                # shallower ring puts two uses of a slot between one warp's
+                # waits, and the wait's parity test cannot tell a barrier two
+                # phases behind from a complete one. One stage over two
+                # warps:
+                #
+                #     # warp 5: k=0 into stage 0; warp 6: k=1 into stage 0;
+                #     # warp 5 at k=2 waits on the parity it waited on at
+                #     # k=0, which the barrier still shows: its TMA lands in
+                #     # stage 0 while k=0 and k=1 are in flight
+                #
+                # (bf16 1000x512x2880 on the 128x64 pair with one stage, the
+                # check removed: "CUDA error: unspecified launch failure" on
+                # GB300; two stages run and match torch.)
+                raise exc.InvalidConfig(
+                    "tcgen05_warp_spec_ab_load_warps="
+                    f"{tcgen05_ab_load_warps} needs at least as many "
+                    f"tcgen05_ab_stages, got {plan.tcgen05_ab_stage_count_value}"
+                )
+            tcgen05_shared_ring_k_tiles = -(-k_size // plan.bk)
+            tcgen05_ab_load_rank = df.new_var("tcgen05_ab_load_rank")
+            tcgen05_ab_load_warp = df.new_var("tcgen05_ab_load_warp")
         # The clustered row-union kernel with the static persistent scheduler
         # (the transposed profile) hoists its TMA-load role the same way; the
         # role's scheduler setup then overlaps the cluster rendezvous and the
@@ -13849,16 +14104,26 @@ def _emit_mma_pipeline(
         if plan.mma_impl == "tcgen05":
             assert plan.tcgen05_plan is not None
             assert tcgen05_matmul_plan is not None
-            # The current lowering has a single A/B load warp at
-            # `tma_warp_id`, so `tma_warp` doubles as the A/B-load-active
-            # predicate. When role-local persistent loops land and split
-            # those roles, this is the place to add a separate
-            # `tcgen05_ab_load_active` predicate.
+            # `tma_warp` is the first A/B-load warp (`tma_warp_id`): it alone
+            # prefetches the TMA descriptors and runs the AB ring's single
+            # `producer_tail`. Two or more A/B-load warps
+            # (`_build_shared_ring_producer`) also get `tcgen05_ab_load_warp`,
+            # their whole range, which a hoisted TMA-load role's init
+            # rendezvous leaves out.
             prefix.append(
                 statement_from_string(
                     f"{tma_warp} = {warp_idx} == cutlass.Int32({tcgen05_matmul_plan.tma_warp_id})"
                 )
             )
+            if tcgen05_ab_load_warp:
+                prefix.append(
+                    statement_from_string(
+                        f"{tcgen05_ab_load_warp} = {warp_idx} >= "
+                        f"cutlass.Int32({tcgen05_matmul_plan.ab_load_warp_begin}) "
+                        f"and {warp_idx} < "
+                        f"cutlass.Int32({tcgen05_matmul_plan.ab_load_warp_end})"
+                    )
+                )
             prefix.append(
                 statement_from_string(
                     f"{plan.tcgen05_plan.exec_active} = "
@@ -15185,7 +15450,8 @@ def _emit_mma_pipeline(
         and plan.knobs.int_or(plan.knobs.split_k, 1) == 1
         and df.config.get(TCGEN05_EPI_ROUND_SUBTILES_CONFIG_KEY, 1) == 1
         # the A ring holds the CTA's C tile (128 x bn against 128 x bk per
-        # stage); a shorter ring would spill the staged tile past it
+        # stage; 64 rows of each on the 128-row pair); a shorter ring would
+        # spill the staged tile past it
         and plan.tcgen05_ab_stage_count_value * plan.bk >= plan.tcgen05_mma_bn
     )
     tcgen05_last_tile_next_work = (
@@ -16468,6 +16734,35 @@ def _emit_mma_pipeline(
                                 )
                             )
                             df.cute_state.tcgen05.pdl_wait_in_prefetch = True
+                        elif tcgen05_ab_load_warps > 1:
+                            # The tile's whole producer, on every A/B-load
+                            # warp (``_build_shared_ring_producer``); no
+                            # unrolled fill and no K-loop clone below.
+                            if tcgen05_tma_wait_after_first_acquire:
+                                # (a statement: the hoisted one-shot role
+                                # inserts its init rendezvous ahead of it)
+                                initial_prefetch.append(
+                                    statement_from_string(
+                                        "cute.arch.griddepcontrol_wait()"
+                                    )
+                                )
+                            initial_prefetch.append(
+                                f"{tcgen05_ab_load_rank} = {warp_idx} - "
+                                f"cutlass.Int32({tcgen05_matmul_plan.ab_load_warp_begin})"
+                            )
+                            tcgen05_shared_ring_emitted = True
+                            initial_prefetch.append(
+                                _build_shared_ring_producer(
+                                    prefetch_args,
+                                    tile_gate=tma_initial_full_tile,
+                                    k_tiles=tcgen05_shared_ring_k_tiles,
+                                    load_warps=tcgen05_ab_load_warps,
+                                    load_rank=tcgen05_ab_load_rank,
+                                    k_tile_var=df.new_var("tcgen05_ab_load_k_tile"),
+                                    ab_stage_count=plan.tcgen05_ab_stage_count_value,
+                                    fresh_ring=tcgen05_one_shot_role_scheduler,
+                                )
+                            )
                         else:
                             if (
                                 plan.tcgen05_pdl
@@ -16915,7 +17210,13 @@ def _emit_mma_pipeline(
                         else None
                     )
                 )
-                if plan.tcgen05_use_separate_tma_producer:
+                # The admission above guarantees the shared-ring producer
+                # replaced the unrolled fill; the K-loop clone is one warp's.
+                assert tcgen05_ab_load_warps == 1 or tcgen05_shared_ring_emitted
+                if (
+                    plan.tcgen05_use_separate_tma_producer
+                    and tcgen05_ab_load_warps == 1
+                ):
                     producer_loop_body = [
                         statement_from_string(
                             f"{tma_k_tile} = {floordiv_nonneg_expr(df, plan.k_offset_var, plan.bk)}"

@@ -40,6 +40,37 @@ if TYPE_CHECKING:
 TCGEN05_CTA_GROUP_CONFIG_KEY = "tcgen05_cta_group"
 TCGEN05_CTA_GROUP_CHOICES = ("auto", "two")
 TCGEN05_SMEM_AWARE_MAX_AB_STAGES = 16
+# A CTA pair's ring may go one stage deeper, to 17: the 128x64 bf16 pair (12 KB
+# per stage, 64 A rows and 32 B rows per CTA) then fills shared memory beside
+# its two 8 KB C stages (17 * 12 + 16 KB of 227), as CUTLASS's own stage count
+# (shared memory left after the epilogue, divided by the stage) does.  Its
+# one-wave K loop is bound by bytes in flight per CTA (~12 stages in flight at
+# ~900 ns from issue to data), so the extra stage streams faster.  GB300, bf16,
+# in one process against cuBLAS, the same config at 16 and 17 stages:
+# 1500x384x1536 0.990-0.993 -> 0.995-0.998, 1000x512x2880 1.000-1.006 ->
+# 1.013-1.020, 768x768x8192 CR 0.947-0.956 -> 0.954-0.966, 768x768x2048 CR
+# 0.958-0.968 -> 0.964-0.974, 1024x512x4096 CR 0.970-0.971 -> 0.973-0.976,
+# 512x1000x1280 (transposed) 0.975 -> 0.976-0.978.  The cap applies to the
+# dense pair's own ring (``paired_pipeline_max_ab_stages``) with 16-bit
+# operands and a plain epilogue, where it was measured; fp8 pairs, epilogues
+# with staged rows or auxiliary loads, the one-CTA family, the ordered region
+# chains and the split-K workspace keep 16.  Smaller pairs than 128x64
+# would fit deeper rings, unmeasured, so the cap is that tile's fill.
+TCGEN05_PAIRED_MAX_AB_STAGES = 17
+
+
+def paired_pipeline_max_ab_stages(facts: Tcgen05PipelineSmemFacts) -> int:
+    """The ring cap of a dense CTA pair's AB pipeline:
+    ``TCGEN05_PAIRED_MAX_AB_STAGES`` for 16-bit operands under a plain
+    epilogue (no staged rows, no auxiliary loads: the measured case), else
+    ``TCGEN05_SMEM_AWARE_MAX_AB_STAGES``."""
+    return (
+        TCGEN05_PAIRED_MAX_AB_STAGES
+        if facts.input_dtype_bytes == 2
+        and not facts.rows
+        and not facts.has_auxiliary_loads
+        else TCGEN05_SMEM_AWARE_MAX_AB_STAGES
+    )
 
 
 def tcgen05_bookkeeping_smem_bytes(*, ab_stages: int, acc_stages: int) -> int:
