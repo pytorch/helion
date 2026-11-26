@@ -357,7 +357,16 @@ def prepare_node_lowering(
     prior_buffers = len(graph_lowering.buffers)
     input_names: list[str] = []
     input_layouts: dict[str, tuple[list[sympy.Expr], list[sympy.Expr]]] = {}
-    with _patched_inductor_config():
+    # Inductor's lowerings compute host constants with factory calls on the
+    # default device, as promote_constants rounds a scalar operand of a
+    # bf16/fp16 op through ``torch.tensor(v, dtype=dtype).item()``. The
+    # compilation context makes the kernel's device the default, and fake-tensor
+    # mode keeps the value of such a tensor off CPU only when it may initialize
+    # an accelerator (CUDA, XPU, HPU or PrivateUse1 available, its
+    # ``_avoid_device_init``): on MPS ``item()`` is a fresh unbacked symbol
+    # (``zuf0``) the kernel never defines. Run the lowering with CPU as the
+    # default device; IR nodes carry their devices explicitly.
+    with _patched_inductor_config(), torch.device("cpu"):
         with node.meta["location"], graph_lowering.set_current_node(node):
             try:
                 result = graph_lowering.call_function(
