@@ -80,7 +80,11 @@ pretuned_kernels/
 ```
 
 Each kernel ships with one heuristic file per supported compute capability.
-At runtime Helion picks the file matching the current GPU.
+At runtime Helion picks the file matching the current GPU for AOT kernels.
+The fixed `flash_mla_cute` preset is declared on the public kernel in
+`megakernels/flash_mla/flash_mla.py`; its SM100 heuristic exposes that same
+config and input guard to the benchmark registry. Retune the public preset
+there rather than replacing the discovery file.
 
 | Kernel | Shape sweep | Reference baseline |
 |---|---|---|
@@ -115,7 +119,8 @@ At runtime Helion picks the file matching the current GPU.
 | `qwen3_decode_layer_bf16` | Qwen3-8B BF16 batch-1 decode, contexts 576 and 1088 (B2/B4 configs checked, not benchmarked) | compiled vLLM `Qwen3DecoderLayer` with default backends |
 | `llama32_1b_decode_layer_bf16` | Llama-3.2-1B BF16 batch-1 decode, contexts 576 and 1088 (B2/B4 configs checked, not benchmarked) | compiled vLLM `LlamaDecoderLayer` with default backends |
 | `qwen3_30b_a3b_moe` | Qwen3-30B-A3B BF16 MoE block (RMSNorm, router, top-8 experts, residual), batch 1 | vLLM's compiled RMSNorm + `Qwen3MoeSparseMoeBlock` with default backend selection (its residual add is fused into the next layer) |
-| `flash_mla` | DeepSeek-V3 MLA decode, one request, 16 heads (TP8), context 1024 (checked up to 64K) | FlashInfer TRT-LLM-gen MLA decode, as vLLM's decode CUDA graph calls it (`max_seq_len` = `max_model_len`) |
+| `flash_mla` | DeepSeek-V3 MLA decode, one request, 16 heads (TP8), context 1024 (checked up to 64K); shipped Triton preset | FlashInfer TRT-LLM-gen MLA decode, as vLLM's decode CUDA graph calls it (`max_seq_len` = `max_model_len`) |
+| `flash_mla_cute` | Same decode on B200: one query token, a contiguous (1, 1024) int32 block table, 16-byte aligned query and KV pointers, int32 indexing (at most 2³¹ − 1 KV elements), and compiler support for CUDA cooperative groups. Materialize lazy negative views first. | Shipped Helion Triton preset and FlashInfer TRT-LLM-gen, measured with the same graph timer |
 | `deepseek_v3_moe_nvfp4_tp` | DeepSeek-V3 NVFP4 MoE batch-1 decode at TP4, fused all-reduce + residual + RMSNorm | vLLM's router kernel + FlashInfer MoE (PDL) + FlashInfer fused all-reduce/RMSNorm |
 | `gpt_oss_decode_layer` | GPT-OSS-120B MXFP4 batch-1 decode layer, positions 1000 and 4000, sliding-window and full attention | FP32 PyTorch reference (check); timed alone (it replaces SGLang's per-layer launches) |
 | `gpt_oss_verify_layer` | GPT-OSS-120B EAGLE3 verify layer, 4 tokens, positions 400 and 4000, sliding-window and full attention | FP32 PyTorch reference (check); timed alone |
@@ -127,6 +132,8 @@ At runtime Helion picks the file matching the current GPU.
 | `glm5_3_flash_tp4` | GLM-5.3 Flash NVFP4 at TP4, 6-token verify window: KDA, MLA prologue + pooled DSA indexer, sparse MLA + o_proj, MoE and dense MLP, each with the all-reduce and the mHC layer boundary; MTP draft layer and LM head | torch references on synthetic weights (check); timed with cold weights, alone or (LM head) against the stock chain (README: served in SGLang) |
 | `inkling2_small` | Inkling-2-Small TP4 / EP4 verify, 8 rows, local / block / global attention layers and NVFP4 / MXFP8 MoE | the stock vLLM Inkling 2 path, end to end in vLLM |
 | `gemma4_a4b_moe` | Gemma 4 26B-A4B BF16 batch-1 MoE | vLLM Gemma 4 router + fused MoE with default backend selection |
+
+The nightly B200 sweep reports both MLA rows. To run just the CuTe comparison, use `python pretuned_kernels/run.py --kernels flash_mla_cute --hardware b200`. The CuTe B200 pull-request tests separately replay the preset against the FP32 reference with changed lengths and signed page IDs; on GitHub Actions these tests fail if the SM100 NVRTC/cooperative-groups prerequisite is unavailable. They do not require FlashInfer.
 
 Most kernels additionally benchmark against `torch.compile` of the listed
 PyTorch baseline (a speedup-comparison baseline only -- correctness is checked

@@ -6,11 +6,13 @@ the hardware where each kernel's checked-in heuristics apply.
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 from dataclasses import dataclass
 import importlib.util
 import inspect
 import math
 import os
+import runpy
 import subprocess
 import sys
 from typing import TYPE_CHECKING
@@ -19,7 +21,11 @@ from unittest.mock import patch
 
 import pytest
 import torch
+from torch._dynamo import config as dynamo_config
 from torch._environment import is_fbcode
+from torch._functorch import config as functorch_config
+from torch._inductor import config as inductor_config
+from torch._subclasses.fake_tensor import FakeTensorMode
 import torch.distributed as dist
 import torch.nn.functional as F
 from torch.testing._internal.distributed.fake_pg import FakeStore
@@ -27,6 +33,8 @@ from torch.testing._internal.distributed.fake_pg import FakeStore
 import helion
 from helion._compat import GLUON_REQUIREMENT
 from helion._compat import supports_gluon
+from helion._compat import supports_torch_compile_template_lowering
+from helion._compiler.cute import cooperative_grid_ptx
 from helion._hardware import HardwareInfo
 from helion._hardware import get_hardware_info
 from helion._testing import DEVICE
@@ -212,6 +220,43 @@ def test_qwen3_decode_layer_has_explicit_runtime_metadata_contract() -> None:
     assert len(module.CONTEXT_LENGTHS) == 3
     assert all(length & (length - 1) for length in module.CONTEXT_LENGTHS)
     assert max(module.CONTEXT_LENGTHS) <= module.CONTEXT
+
+
+@pytest.mark.cpu_only
+def test_runner_registers_b200_flash_mla_cute() -> None:
+    from pretuned_kernels.megakernels.flash_mla import flash_mla as mla
+
+    runner = _import_pretuned_runner()
+    name = "flash_mla_cute"
+    assert {"flash_mla", name} <= set(runner.KERNELS)
+    assert runner._supported_hardware(name) == {"b200"}
+    assert "skipped" in runner.run_kernel(name, "h100")
+    metrics = {
+        "helion_wins": 1,
+        "total": 1,
+        "geomean": 1.25,
+        "best_speedup": 1.25,
+        "baselines": {
+            name: {"wins": 1, "total": 1, "geomean": speedup, "best_speedup": speedup}
+            for name, speedup in (
+                ("helion_triton", 1.25),
+                ("flashinfer_trtllm_gen", 1.5),
+            )
+        },
+    }
+    with patch.object(mla, "main", return_value=metrics) as compare:
+        assert runner.run_kernel(name, "b200") == {
+            "kernel": name,
+            "pretuned_hardware": ["b200"],
+            "cudagraph": True,
+            **metrics,
+        }
+        compare.assert_called_once_with(verbose=True, include_cute=True)
+        compare.reset_mock()
+        runpy.run_module(
+            "pretuned_kernels.megakernels.flash_mla.flash_mla_cute", run_name="__main__"
+        )
+        compare.assert_called_once_with(verbose=True, include_cute=True)
 
 
 def test_runner_supported_hardware_parses_cuda_and_rocm_heuristics(
@@ -426,6 +471,87 @@ def test_flash_mla_key_keeps_context_and_pool_runtime() -> None:
     ):
         with pytest.raises(ValueError):
             key(*changed)
+
+
+@pytest.mark.cpu_only
+@onlyBackends(["cute"])
+@pytest.mark.parametrize("cpp", [False, True])
+def test_flash_mla_key_infers_metadata_without_a_fake_pointer(cpp: bool) -> None:
+    # Exercise the preset key itself; the separate compiler-wide C++ fake
+    # issue is documented in KNOWN_GAPS.md (cpp-fake-mode-tile-provenance).
+    module = _import_pretuned_kernel_module("flash_mla")
+    supports_cpp = hasattr(dynamo_config, "use_cpp_fake_tensor")
+    if cpp and not supports_cpp:
+        pytest.skip("this PyTorch does not offer C++ fake tensors")
+    with (
+        dynamo_config.patch(use_cpp_fake_tensor=cpp) if supports_cpp else nullcontext(),
+        functorch_config.patch(fake_tensor_allow_unsafe_data_ptr_access=False),
+        FakeTensorMode(),
+        patch.object(torch.cuda, "get_device_capability", return_value=(10, 0)),
+        patch.object(
+            cooperative_grid_ptx, "grid_sync_asm", return_value="ret;"
+        ) as leaf,
+    ):
+        cuda = torch.device("cuda", 0)
+        q = torch.empty((1, 1, 16, 576), dtype=torch.bfloat16, device=cuda)
+        kv = torch.empty((16, 1, 64, 576), dtype=q.dtype, device=cuda)
+        table = torch.empty((1, 1024), dtype=torch.int32, device=cuda)
+        seq = torch.empty((1,), dtype=table.dtype, device=cuda)
+        fake_args = (q, kv, table, seq, module.MLA_SCALE)
+        assert module._cute_key(*fake_args) == 1
+        preset = _import_pretuned_heuristic("flash_mla_cute")
+        assert preset.key_flash_mla_cute(*fake_args) == 1
+        config = preset.autotune_flash_mla_cute(*fake_args)
+        assert config == dict(module.flash_mla_cute.configs[0])
+        # Fake tensors exercise the actual automatic index transition without
+        # allocating a multi-gigabyte KV pool on device.
+        limit = torch.iinfo(torch.int32).max // (64 * 576)
+        for pages in (limit, limit + 1):
+            pool = kv.new_empty((pages, 1, 64, 576))
+            if pages == limit:
+                assert module._cute_key(q, pool, table, seq, module.MLA_SCALE) == 1
+            else:
+                with pytest.raises(ValueError, match="int32 indexing"):
+                    module._cute_key(q, pool, table, seq, module.MLA_SCALE)
+        with (
+            patch.object(module.flash_mla_cute.settings, "index_dtype", torch.int64),
+            pytest.raises(ValueError, match="int32 indexing"),
+        ):
+            module._cute_key(*fake_args)
+        with pytest.raises(ValueError, match="single-query"):
+            module._cute_key(q[..., :512], kv, table, seq, module.MLA_SCALE)
+        inputs = (q, kv, table, seq)
+        for i, arg in enumerate(inputs):
+            args = [*inputs]
+            args[i] = torch._neg_view(arg)
+            with pytest.raises(ValueError, match="resolved negative views"):
+                module._cute_key(*args, module.MLA_SCALE)
+        leaf.return_value = None
+        with pytest.raises(RuntimeError, match="cooperative-groups"):
+            module._cute_key(q, kv, table, seq, module.MLA_SCALE)
+
+
+@pytest.mark.cpu_only
+@onlyBackends(["cute"])
+def test_flash_mla_checks_the_grid_operation_on_first_use() -> None:
+    module = _import_pretuned_kernel_module("flash_mla")
+    toolkit = cooperative_grid_ptx._Toolkit(cooperative_grid_ptx, (), frozenset({100}))
+    with (
+        patch.object(cooperative_grid_ptx, "_toolkit", return_value=toolkit),
+        patch.object(
+            cooperative_grid_ptx, "_compile_grid_sync", return_value=None
+        ) as compile_leaf,
+    ):
+        assert cooperative_grid_ptx.grid_toolkit_installed((10, 0))
+        assert not module._cute_grid_available()
+        assert not module._cute_grid_available()
+        compile_leaf.assert_called_once_with(toolkit, 100)
+    with patch.object(
+        cooperative_grid_ptx,
+        "grid_sync_asm",
+        side_effect=cooperative_grid_ptx.GridCompilerUnavailable("NVRTC unavailable"),
+    ):
+        assert not module._cute_grid_available()
 
 
 @skipIfRefEager("tile dependencies are built only in compiled mode")
@@ -1313,6 +1439,115 @@ class TestPretunedKernelsCorrectness(TestCase):
         if not module.has_vllm():
             self.skipTest("gpt_oss_moe correctness requires vLLM with FlashInfer.")
         module.correctness_check()
+
+    @onlyBackends(["cute"])
+    def test_flash_mla_cute_pretuned(self) -> None:
+        if not is_cuda() or torch.cuda.get_device_capability() != (10, 0):
+            self.skipTest("requires an SM100 device")
+        module = _import_pretuned_kernel_module("flash_mla")
+        kernel = module.flash_mla_cute
+        self.assertIs(kernel.fn, module.flash_mla.fn)
+        if not module._cute_grid_available():
+            requirement = cooperative_grid_ptx.grid_sync_requirement((10, 0))
+            if os.environ.get("GITHUB_ACTIONS") == "true":
+                self.fail(f"SM100 CuTe CI must run the MLA preset: {requirement}")
+            self.skipTest(requirement)
+        # 513 pages require repeated softmax updates within a split. Within
+        # each page, the nine 64-column QK panels wrap the eight-stage ring.
+        data = module._make_inputs(32769, seed=41)
+        args = module._kernel_args(data)
+        # The same graph and pointers must observe new page IDs and the new
+        # live length. The CuTe preset must never cache them in the config key.
+        kernel(*args)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            output = kernel(*args)
+        graph.replay()
+        torch.testing.assert_close(
+            output.float(), module.reference(data).float(), atol=0.02, rtol=0.05
+        )
+        table = data["block_tables"]
+        table.copy_(table.roll(1, 1))
+        table[0, 0] = -1
+        table[0, 1] = -data["kv_cache"].shape[0]
+        # Both signed page IDs are live at 65 tokens; only the first is live
+        # at 31. These replays use the same graph and storage addresses.
+        for length in (65, 31):
+            data["seq_lens"].fill_(length)
+            graph.replay()
+            torch.testing.assert_close(
+                output.float(), module.reference(data).float(), atol=0.02, rtol=0.05
+            )
+        with self.assertRaisesRegex(ValueError, "single-query"):
+            kernel.bind((args[0].expand(1, 2, -1, -1), *args[1:]))
+        query = data["query"]
+        offset_query = query.new_empty(query.numel() + 1)[1:].view_as(query)
+        with self.assertRaisesRegex(ValueError, "16-byte aligned"):
+            kernel.bind((offset_query, *args[1:]))
+        # The lazy and materialized negatives have equal logical values but
+        # different storage values. A warm eager bind may only use the latter.
+        for i in (0, 1):
+            lazy = list(args)
+            lazy[i] = torch._neg_view(args[i])
+            with self.assertRaisesRegex(ValueError, "resolved negative views"):
+                kernel(*lazy)
+
+    @pytest.mark.slow
+    @onlyBackends(["cute"])
+    def test_flash_mla_cute_compiled_alignment(self) -> None:
+        if (
+            not is_cuda()
+            or torch.cuda.get_device_capability() != (10, 0)
+            or not supports_torch_compile_template_lowering()
+        ):
+            self.skipTest("requires SM100 and torch.compile template lowering")
+        module = _import_pretuned_kernel_module("flash_mla")
+        if not module._cute_grid_available():
+            self.skipTest("requires matching NVRTC and cooperative-groups headers")
+        data = module._make_inputs(65, seed=41)
+        args = module._kernel_args(data)
+        expected = module.reference(data).float()
+        eager = torch.compile(module.flash_mla_cute, backend="eager", fullgraph=True)
+        # Exercise the copying policy even if this installation normally asks
+        # Inductor to assert alignment instead. Older versions always copy.
+        options = (
+            {"alignment_asserts_inputs": False}
+            if hasattr(inductor_config, "alignment_asserts_inputs")
+            else {}
+        )
+        compiled = torch.compile(module.flash_mla_cute, fullgraph=True, options=options)
+        for run in (eager, compiled):
+            torch.testing.assert_close(
+                run(*args).float(), expected, atol=0.02, rtol=0.05
+            )
+
+        for name in ("query", "kv_cache"):
+            src = data[name]
+            lazy_args = module._kernel_args({**data, name: torch._neg_view(src)})
+            for run in (eager, compiled):
+                with self.assertRaisesRegex(
+                    (ValueError, RuntimeError), "resolved negative views"
+                ):
+                    run(*lazy_args)
+            shifted = src.new_empty(src.numel() + 1)[1:].view_as(src)
+            shifted.copy_(-src)
+            changed = {**data, name: shifted}
+            actual_args = module._kernel_args(changed)
+            other = module.reference(changed).float()
+            self.assertFalse(torch.equal(expected, other))
+            # An unallocated operand does not exempt the other (real) pointer.
+            counterpart = 1 if name == "query" else 0
+            mixed = list(actual_args)
+            mixed[counterpart] = FakeTensorMode().from_tensor(args[counterpart])
+            with self.assertRaisesRegex(ValueError, "16-byte aligned"):
+                module._cute_key(*mixed)
+            # Eager dispatch checks the caller's pointer. The default
+            # Inductor graph realigns its input before the generated launch.
+            with self.assertRaisesRegex(ValueError, "16-byte aligned"):
+                eager(*actual_args)
+            torch.testing.assert_close(
+                compiled(*actual_args).float(), other, atol=0.02, rtol=0.05
+            )
 
     @pytest.mark.timeout(600)
     @skipIfCute(_PINNED_TO_TRITON)
