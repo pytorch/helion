@@ -10,6 +10,7 @@ import sympy
 from torch._inductor import config
 from torch._inductor import metrics
 from torch._inductor.codegen.common import BackendFeature
+from torch._inductor.codegen.common import WorkspaceZeroMode
 from torch._inductor.codegen.simd import SIMDScheduling
 from torch._inductor.codegen.simd_kernel_features import DisableReduction
 from torch._inductor.codegen.simd_kernel_features import EnableReduction
@@ -36,6 +37,8 @@ from .kernel import ARG_REDUCTIONS
 from .kernel import REDUCTIONS
 from .kernel import HelionKernel
 from .overrides import HelionOverrides
+from .sequence import module_key
+from .sequence import predecessor
 from .tiling import UNROLLED_RDIM_MAX
 from .tiling import natural_tiling
 
@@ -266,12 +269,29 @@ class HelionScheduling(SIMDScheduling):
         return inductor_tiling, scores
 
     @staticmethod
-    def format_kernel_definition(name: str, source: str) -> str:
+    def format_kernel_definition(
+        name: str, source: str, after: str | None = None, after_key: str = ""
+    ) -> str:
         escaped = source.replace("\\", "\\\\").replace('"""', '\\"""')
-        return (
-            f'{name}_source = """\\\n{escaped}"""\n'
-            f"{name} = PyCodeCache.load({name}_source).kernel"
+        # A kernel tuned behind another loads its module under that kernel's
+        # source (after_key): PyCodeCache gives graphs with the same source
+        # one module and one Kernel, whose config the first graph to call it
+        # selects, so a graph that calls the kernel behind other work must
+        # not get it. In the same graph's code, behind the same kernel, it is
+        # the same module.
+        load = (
+            f"PyCodeCache.load({name}_source{f', {after_key!r}' if after_key else ''})"
         )
+        definition = f'{name}_source = """\\\n{escaped}"""\n{name} = {load}.kernel'
+        if helion_config.tune_in_sequence:
+            # The kernel's first call is tuned behind the first call of
+            # kernel ``after``, the Helion kernel call just before it, or
+            # alone (helion.inductor.codegen.sequence).
+            definition += (
+                f'\n{name} = helion_in_sequence({name}, globals(), "{name}", '
+                f"after={after!r})"
+            )
+        return definition
 
     def generate_node_schedule(
         self,
@@ -636,11 +656,38 @@ class HelionScheduling(SIMDScheduling):
         )
         wrapper.src_to_kernel[src_code] = name
         wrapper.add_import_once("from torch._inductor.codecache import PyCodeCache")
+        if helion_config.tune_in_sequence:
+            wrapper.add_import_once(
+                "from helion.inductor.kernel_sequence import "
+                "in_sequence as helion_in_sequence"
+            )
+        after = after_key = None
+        if helion_config.tune_in_sequence and not any(
+            # A workspace the call zeroes first is a memset launched between
+            # the two calls (generate_workspace_allocation writes it before
+            # the call): the kernel is tuned alone.
+            workspace.zero_mode != WorkspaceZeroMode.UNINITIALIZED
+            for workspace in kernel.args.workspace_args
+        ):
+            after = predecessor(wrapper)
+        if after is not None:
+            (after_source,) = (
+                source
+                for source, kernel_name in wrapper.src_to_kernel.items()
+                if kernel_name == after
+            )
+            after_key = module_key(
+                wrapper,
+                name,
+                after,
+                after_source,
+                cast("HelionKernel", kernel).call_args(),
+            )
         # gpu=False keeps it out of the compile-time autotune block, which has
         # no PyCodeCache import.
         wrapper.define_kernel(
             name,
-            self.format_kernel_definition(name, src_code),
+            self.format_kernel_definition(name, src_code, after, after_key or ""),
             gpu=False,
             standalone=True,
         )
