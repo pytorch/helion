@@ -24,6 +24,9 @@ from helion._testing.cute_aux import cpu_codegen
 from helion._testing.cute_aux import rank_two_aux
 from helion._testing.cute_aux import rank_two_code
 from helion._testing.cute_aux import rank_two_inputs
+from helion._testing.cute_dense_tcgen05 import bf16_mm_args
+from helion._testing.cute_dense_tcgen05 import clc_fringe_config
+from helion._testing.cute_dense_tcgen05 import plain_mm_into
 from helion.exc import InvalidConfig
 import helion.language as hl
 
@@ -305,3 +308,27 @@ def test_clustered_scheduler_multiwave_runtime(
             assert torch.equal(captured, first)
         assert torch.equal(lhs, before[0])
         assert torch.equal(rhs, before[1])
+
+
+@skipUnlessCuteAvailable("requires the supported CuTe runtime")
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires TCgen05 GPU")
+def test_clc_peer_cta_writes_every_tile_it_reads_from_the_mailbox() -> None:
+    if torch.cuda.get_device_capability()[0] < 10:
+        pytest.skip("requires a TCgen05-capable GPU")
+    # bf16 131072x144x288: 512 tiles of 256x256 over a 144-column output.
+    # With a mailbox read issued right before the CTA-scoped release, the
+    # leader's next st.async could land in the peer CTA's mailbox before the
+    # read: 7 of 300 calls (GB300) left that warp's 32 rows of the peer CTA's
+    # half of a tile at the NaN the output was filled with.
+    torch.manual_seed(0)
+    lhs, rhs, out = bf16_mm_args(131072, 144, 288, device=DEVICE)
+    bound = plain_mm_into.bind((lhs, rhs, out))
+    bound.set_config(clc_fringe_config())
+    for _ in range(300):
+        lhs.normal_()
+        rhs.normal_()
+        out.fill_(float("nan"))
+        bound(lhs, rhs, out)
+        torch.testing.assert_close(
+            out.float(), torch.mm(lhs, rhs).float(), atol=0.06, rtol=0.02
+        )

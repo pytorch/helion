@@ -15,14 +15,17 @@ import re
 import pytest
 import torch
 
-from test.cute_population_contracts import tcgen05_mma_support
-
 import helion
 from helion import exc
 from helion._testing import DEVICE
 from helion._testing import cpu_render_target
 from helion._testing import skipUnlessBackends
 from helion._testing.cute_codegen import cpu_bind
+from helion._testing.cute_codegen import tcgen05_mma_support
+from helion._testing.cute_fragment_kernels import anchored_gram
+from helion._testing.cute_fragment_kernels import anchored_gram_reference
+from helion._testing.cute_fragment_kernels import batched_dot
+from helion._testing.cute_fragment_kernels import gram_inputs
 from helion.autotuner.config_fragment import BooleanFragment
 import helion.language as hl
 
@@ -31,59 +34,7 @@ UNROLL = "cute_fragment_unrolled_loops"
 PACKETS = "cute_fragment_packet_loads"
 DOT = "cute_fp32_dot"
 MMA = "_helion_fragment_mma.mma_tf32("
-pytestmark = skipUnlessBackends(["cute"])
-
-
-@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
-def _anchored_gram(
-    q: torch.Tensor, k: torch.Tensor, gc: torch.Tensor, scale: float
-) -> torch.Tensor:
-    """Two 16-row tiers of the anchored intra-chunk gram (chunk 32): fp32
-    operands that are pointwise products of staged loads, a transposed
-    column operand, iota-window stores into a zero-filled output."""
-    BHN = q.size(0)
-    C = hl.specialize(q.size(1))
-    A = torch.zeros([BHN, C, C], dtype=q.dtype, device=q.device)
-    for tile_b in hl.tile(BHN, block_size=1):
-        rows0 = hl.arange(16)
-        cols0 = hl.arange(16)
-        n0 = gc[tile_b, 0, :]
-        e0 = torch.exp2(gc[tile_b, rows0, :] - n0[:, None, :])
-        kg0 = k[tile_b, cols0, :].float() * torch.exp2(
-            n0[:, None, :] - gc[tile_b, cols0, :]
-        )
-        a0 = hl.dot(q[tile_b, rows0, :].float() * e0, kg0.transpose(-2, -1)) * scale
-        causal0 = (rows0[:, None] >= cols0[None, :])[None, :, :]
-        A[tile_b, rows0, cols0] = a0 * causal0.to(a0.dtype)
-
-        rows1 = 16 + hl.arange(16)
-        cols1 = hl.arange(32)
-        n1 = gc[tile_b, 16, :]
-        e1 = torch.exp2(gc[tile_b, rows1, :] - n1[:, None, :])
-        kg1 = k[tile_b, cols1, :].float() * torch.exp2(
-            n1[:, None, :] - gc[tile_b, cols1, :]
-        )
-        a1 = hl.dot(q[tile_b, rows1, :].float() * e1, kg1.transpose(-2, -1)) * scale
-        causal1 = (rows1[:, None] >= cols1[None, :])[None, :, :]
-        A[tile_b, rows1, cols1] = a1 * causal1.to(a1.dtype)
-    return A
-
-
-def _anchored_gram_reference(
-    q: torch.Tensor, k: torch.Tensor, gc: torch.Tensor, scale: float
-) -> torch.Tensor:
-    A = torch.zeros(q.shape[0], 32, 32, dtype=torch.float32, device=q.device)
-    for tier in range(2):
-        rows = slice(16 * tier, 16 * tier + 16)
-        cols = slice(0, 16 * tier + 16)
-        n = gc[:, 16 * tier, :]
-        e = torch.exp2(gc[:, rows, :] - n[:, None, :])
-        kg = k[:, cols, :].float() * torch.exp2(n[:, None, :] - gc[:, cols, :])
-        r = torch.arange(16 * tier, 16 * tier + 16, device=q.device)
-        c = torch.arange(0, 16 * tier + 16, device=q.device)
-        a = (q[:, rows, :].float() * e) @ kg.transpose(-2, -1) * scale
-        A[:, rows, cols] = a * (r[:, None] >= c[None, :]).float()
-    return A
+pytestmark = [pytest.mark.cpu_only, skipUnlessBackends(["cute"])]
 
 
 @helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
@@ -137,20 +88,13 @@ def _cpu_only():
         yield
 
 
-def _gram_inputs(device: torch.device | str = "cpu", batches: int = 4):
-    q = torch.ones(batches, 32, 128, dtype=torch.bfloat16, device=device)
-    k = torch.ones(batches, 32, 128, dtype=torch.bfloat16, device=device)
-    gc = torch.zeros(batches, 32, 128, dtype=torch.float32, device=device)
-    return q, k, gc, 0.125
-
-
 def _config(bound: object, **overrides: object) -> helion.Config:
     spec = bound.config_spec  # type: ignore[attr-defined]
     return helion.Config.from_dict(dict(spec.default_config()) | overrides)
 
 
 def test_staging_knobs_join_the_search_surface(_cpu_only: None) -> None:
-    bound = cpu_bind(_anchored_gram, _gram_inputs())
+    bound = cpu_bind(anchored_gram, gram_inputs())
     spec = bound.config_spec
     assert spec.cute_fragment_padded_rows_root_ids
     assert spec.cute_fragment_unrolled_loops_root_ids
@@ -178,7 +122,7 @@ def test_loads_beside_a_fresh_zero_filled_output_are_readonly(
     # The gram's outputs are ``torch.zeros`` the host function allocates on
     # every call: a storage no input can alias, so the loads beside its
     # stores are readonly and the packet-load knob is offered.
-    bound = cpu_bind(_anchored_gram, _gram_inputs())
+    bound = cpu_bind(anchored_gram, gram_inputs())
     assert bound.config_spec.cute_fragment_packet_load_root_ids
     assert PACKETS in bound.config_spec._flat_fields()
     code = bound.to_code(_config(bound, **{PACKETS: True}))
@@ -186,7 +130,7 @@ def test_loads_beside_a_fresh_zero_filled_output_are_readonly(
 
 
 def test_padded_rows_stride_every_staged_tile(_cpu_only: None) -> None:
-    bound = cpu_bind(_anchored_gram, _gram_inputs())
+    bound = cpu_bind(anchored_gram, gram_inputs())
     dense = bound.to_code(_config(bound))
     padded = bound.to_code(_config(bound, **{PAD: True}))
     # [rows, 128] fp32 tiles stride 132 words, [rows, 128] bf16 tiles 136
@@ -204,7 +148,7 @@ def test_padded_rows_stride_every_staged_tile(_cpu_only: None) -> None:
 
 
 def test_unrolled_loops_walk_slots_as_constexpr(_cpu_only: None) -> None:
-    bound = cpu_bind(_anchored_gram, _gram_inputs())
+    bound = cpu_bind(anchored_gram, gram_inputs())
     rolled = bound.to_code(_config(bound))
     unrolled = bound.to_code(_config(bound, **{UNROLL: True}))
     assert "fragment_slot in cutlass.range_constexpr(" not in rolled
@@ -226,7 +170,7 @@ def test_unrolled_loops_walk_slots_as_constexpr(_cpu_only: None) -> None:
 
 
 def test_whole_tile_transposed_operand_is_read_in_place(_cpu_only: None) -> None:
-    bound = cpu_bind(_anchored_gram, _gram_inputs())
+    bound = cpu_bind(anchored_gram, gram_inputs())
     simt = bound.to_code(_config(bound))
     tf32 = bound.to_code(_config(bound, **{DOT: "tf32_mma", PAD: True}))
     assert tf32.count(MMA) == 2
@@ -249,9 +193,8 @@ def test_a_partial_tile_keeps_the_staged_operands(_cpu_only: None) -> None:
     x = torch.ones(2, 24, 20)
     y = torch.ones(2, 20, 12)
     z = torch.ones(2, 24, 12)
-    from test.test_cute_fp32_dot import _batched_dot
 
-    bound = cpu_bind(_batched_dot, (x, y, z))
+    bound = cpu_bind(batched_dot, (x, y, z))
     simt = bound.to_code(_config(bound))
     tf32 = bound.to_code(_config(bound, **{DOT: "tf32_mma"}))
     # Both operands keep their staged (padded) copies, one barrier each
@@ -264,6 +207,7 @@ def test_a_partial_tile_keeps_the_staged_operands(_cpu_only: None) -> None:
     assert tf32.count("sync_threads") - simt.count("sync_threads") == 1
 
 
+@pytest.mark.cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize(
     ("dot", "threads", "pad", "unroll"),
@@ -283,7 +227,7 @@ def test_anchored_gram_matches_reference(
     k = torch.randn(64, 32, 128, device=DEVICE, dtype=torch.bfloat16)
     gc = (-torch.rand(64, 32, 128, device=DEVICE) * 0.1).cumsum(1)
     scale = 0.125
-    bound = _anchored_gram.bind((q, k, gc, scale))
+    bound = anchored_gram.bind((q, k, gc, scale))
     config = _config(
         bound,
         **{DOT: dot, PAD: pad, UNROLL: unroll, "cute_fragment_threads": threads},
@@ -296,11 +240,12 @@ def test_anchored_gram_matches_reference(
     assert ("fragment_slot in cutlass.range_constexpr(" in code) == unroll
     out = bound.compile_config(config)(q, k, gc, scale)
     torch.cuda.synchronize()
-    expected = _anchored_gram_reference(q, k, gc, scale)
+    expected = anchored_gram_reference(q, k, gc, scale)
     # bf16 output rounding dominates; tf32 adds ~1e-3 relative per product.
     torch.testing.assert_close(out.float(), expected, rtol=2e-2, atol=2e-2)
 
 
+@pytest.mark.cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize(
     ("dot", "block", "threads"),

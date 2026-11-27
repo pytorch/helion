@@ -110,6 +110,7 @@ from ..compile_environment import shape_env_size_hint
 from ..compile_environment import shape_env_var_hints
 from ..variable_origin import BlockSizeOrigin
 from ..variable_origin import GridOrigin
+from .analysis.match_common import root_grid_origin_is_canonical
 from .fx_matcher import _is_call
 from .state import cute_codegen_state
 
@@ -724,6 +725,8 @@ class _Matcher:
         device_ir = self.host.device_ir
         if len(device_ir.grid_block_ids) != 1:
             raise _NotMine("the kernel must have exactly one root tile grid")
+        if not root_grid_origin_is_canonical(device_ir):
+            raise _NotMine("register subblocks require zero-based, unit-step root axes")
         batch: list[int] = []
         tiled: list[int] = []
         for block_id in device_ir.grid_block_ids[0]:

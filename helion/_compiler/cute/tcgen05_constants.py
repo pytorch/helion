@@ -40,14 +40,38 @@ TCGEN05_TWO_CTA_EDGE_K_TAIL_NARROW_BLOCK_K = 256
 # CLC + aux-TMA row runs faster with two accumulator stages than the historical
 # edge-family default.
 TCGEN05_TWO_CTA_EDGE_K_TAIL_NARROW_ACC_STAGES = 2
+# The K tiles a CtaGroup.TWO pair loops over (``k_tile_count``) where
+# ``tcgen05_two_cta_max_k_tiles`` sets no deeper bound: the envelope the FP8,
+# grouped, N-edge-cluster and default-heuristic families were validated in.
 TCGEN05_TWO_CTA_MAX_K_TILES = 256
+# A 16-bit dense pair's K-tile bound (the search's cluster_m=2 admission, the
+# aligned-N plan, the role-local runtime). The pair's K loop is a runtime loop
+# whatever its trip count:
+#     for tile_offset_2 in range(cutlass.Int32(0), cutlass.Int32(50272), cutlass.Int32(_BLOCK_SIZE_2)):
+# so the bound only covers what has been measured: twice the deepest GEMM
+# timed (4096x1536x128104: 2002 tiles of 64). At 256 tiles (K = 16384 at
+# bk = 64) every deeper GEMM ran one-CTA tiles: GB300, bf16, full-effort
+# autotune, of stock Inductor (cuBLAS), one-CTA -> pair: 4096x1536x128104
+# 0.63 -> 0.98, 8192x768x50272 0.75 -> 0.97, 32768x512x30528 0.90 -> 1.07,
+# 16384x768x30528 0.93 -> 1.11, 32768x768x30528 0.93 -> 1.12.
+TCGEN05_TWO_CTA_SIXTEEN_BIT_MAX_K_TILES = 4096
+
+
+def tcgen05_two_cta_max_k_tiles(itemsize: int) -> int:
+    """The K tiles a dense CtaGroup.TWO pair over operands of ``itemsize``
+    bytes loops over at most (16-bit: ``TCGEN05_TWO_CTA_SIXTEEN_BIT_MAX_K_TILES``)."""
+    if itemsize == 2:
+        return TCGEN05_TWO_CTA_SIXTEEN_BIT_MAX_K_TILES
+    return TCGEN05_TWO_CTA_MAX_K_TILES
+
+
 # The edge + K-tail CtaGroup.TWO search family (ragged M with ragged N, or a
 # 16-bit K tail on whole tiles; ``enable_cute_tcgen05_search``): originally
 # validated on large square-ish GEMMs (5000^3), it holds on every ragged
 # shape probed from 1000 to 4160 (bf16 3000^3 45 us against cuBLAS's 45,
 # 1500x2500x3000 47.5 against 118.6, 2048x2048x2050 30.7 against 71.6, all
 # matching torch within bf16 rounding) and, through its 128-row CTA pair
-# (``tcgen05_config.repair.plain_edge_pair128_admitted``), down to 1000^3 (the
+# (``tcgen05_config.repair.plain_pair128_admitted``), down to 1000^3 (the
 # pair 7.2 us burst / 8.2 us sustained against cuBLAS's 6.5 / 7.4 in the
 # interleaved runs; the flat one-CTA winner 8.4 burst). The quarter-wave
 # work gate in ``enable_cute_tcgen05_search`` counts 128x128 tiles for
@@ -59,6 +83,11 @@ TCGEN05_TWO_CTA_EDGE_K_TAIL_MIN_DIM = 256
 # keep the persistent and CtaGroup.TWO schedules (``enable_cute_tcgen05_search``);
 # a K no such tile divides is the edge + K-tail family's K tail.
 TCGEN05_WHOLE_K_TILE_MIN = 64
+# The narrowest power-of-two N tile over which the persistent one-CTA K-tail
+# kernel is admitted when N is no multiple of the search's widest N tile
+# (``search_plan``'s ``allow_k_tail_persistent_pid_types``): the measured
+# family's 128 columns (bf16 16384x384x54, N = 3 x 128).
+TCGEN05_K_TAIL_PERSISTENT_MIN_N = 128
 # The tile of the edge family's 128-row CTA pair (each CTA owns 64 rows of a
 # 128 x 128 pair tile); the planner counts a 16-bit edge grid in these.
 TCGEN05_TWO_CTA_EDGE_PAIR128_BLOCK = 128
@@ -89,6 +118,27 @@ TCGEN05_TWO_CTA_DEEP_AB_STAGES = 6
 # in 2x2 clusters with a 64x10 K ring for fp16 1024^3).  Admitted by the
 # search projection and seeded when the 256x256 grid is below the SM count.
 TCGEN05_TWO_CTA_ONE_WAVE_BLOCK_NS = (128, 64)
+# N tiles of the one-wave family's 128-row CTA pair (each CTA owns 64 rows),
+# widest first (``tcgen05_config.repair.plain_pair128_widths``). The 64-wide
+# pair is cuBLAS's tile for the grids the 128-wide one leaves half empty
+# (nvjet ``64x64_64x16_2x2_2cta`` on bf16 1500x384x384: 72 pairs of 128x64,
+# against 36 of 128x128).
+TCGEN05_TWO_CTA_PAIR128_ONE_WAVE_BLOCK_NS = (128, 64)
+
+
+def tcgen05_edge_pair128_narrow_width_fits(*, rows: int, n: int, num_sms: int) -> bool:
+    """Whether the edge K-tail family's 128-row CTA pairs also run the
+    narrowest one-wave width (``TCGEN05_TWO_CTA_PAIR128_ONE_WAVE_BLOCK_NS``,
+    64; ``repair.plain_pair128_widths``): ``n`` whole 64-wide N tiles whose
+    grid of ``rows`` 128-row pair rows holds at most one CTA per SM, as the
+    one-wave family's 64-wide pair. bf16 128x4096x1000 with b stored [K, N]
+    (K = 15 x 64 + 40): 64 pairs of 128x64 (128 CTAs) in one wave, where the
+    128x128 pair puts 64 CTAs on GB300's 152 SMs; bf16 1000x1024x1000 would
+    take 128 pairs of 128x64, two waves, and keeps the 128x128 pair."""
+    narrow = min(TCGEN05_TWO_CTA_PAIR128_ONE_WAVE_BLOCK_NS)
+    return num_sms > 0 and n % narrow == 0 and 2 * rows * (n // narrow) <= num_sms
+
+
 # The N tiles the tcgen05 CTA pair (``tcgen05_cluster_m=2`` on the 256-row
 # pair tile) runs its MMA at throughout the backend: the paired pipeline, the
 # materialized two-CTA regions and the cluster_m=2 search projection all take
@@ -130,6 +180,21 @@ TCGEN05_PLAIN_NARROW_SUBTILE_BLOCK_N = 256
 TCGEN05_PLAIN_NARROW_SUBTILE_BLOCK_NS = (192, TCGEN05_PLAIN_NARROW_SUBTILE_BLOCK_N)
 # The C-ring subtile width of that rule: ``(128, 32)`` stages.
 TCGEN05_PLAIN_NARROW_SUBTILE_N = 32
+# Plain 16-bit pairs whose physical width 48 divides and 32 does not (the
+# aligned-N family's 144 and 240) take ``(128, 48)`` subtiles, where CuTe's
+# with-source rule halves its 64-column target down to (128, 16). Measured in
+# ``cute_mma`` next to the decision (``tcgen05_odd_width_subtile``).
+TCGEN05_ODD_WIDTH_SUBTILE_N = 48
+
+
+def tcgen05_odd_width_subtile(width: int) -> bool:
+    """Whether a plain 16-bit pair of physical ``width`` stores (128, 48)
+    subtiles: 144 = 3 x 48, 240 = 5 x 48 (a width 32 divides keeps CuTe's
+    rule, and 112 or 176 have no wider 16-column multiple than the whole
+    tile, which costs AB stages)."""
+    return width % TCGEN05_ODD_WIDTH_SUBTILE_N == 0 and width % 32 != 0
+
+
 # The radix-store admission box, (the 64-row MMA tile's accumulator rows, the
 # plain narrow rule's 32 columns): the pre-filter admits a hierarchical
 # destination whose innermost runs hold whole boxes of it, the smallest
@@ -146,14 +211,314 @@ TCGEN05_RADIX_STORE_BOX_N = TCGEN05_PLAIN_NARROW_SUBTILE_N
 # than ~200 columns are stream-bound. A tile's fixed prologue and epilogue, in
 # 256-wide K blocks (~2.4k cycles measured at 1000x4096x2880). A width that
 # clips its last N tile must save at least the minimum gain over every
-# reference width: the model ranked a clipped 256x224 tile 12% ahead of
-# 256x256 where it measured 13% behind.
+# reference width to be seeded (the autotune-off default picks among the
+# seeds): the model ranked a clipped 256x224 tile 12% ahead of 256x256 where
+# it measured 13% behind (B200, bf16 -> fp32 3072x1024x6272). The search,
+# which measures its samples, tries every clipped width the model ranks ahead
+# of the references: on GB300 the model ranked bf16 1000x4096x2880's clipped
+# 256x224 tile (one wave of 76 pairs) 11% ahead of 256x256 and it measured
+# 10% ahead, and 2048x2560x2560's 256x144 tile (two waves of 72 pairs, as
+# nvjet tiles it) 4% ahead of 256x160, measured 3% ahead.
 TCGEN05_PAIR_TILE_STREAM_RATIO = 0.44
 TCGEN05_PAIR_TILE_FIXED_KBLOCKS = 4.5
 TCGEN05_ALIGNED_N_CLIPPED_MIN_GAIN = 0.15
+TCGEN05_ALIGNED_N_CLIPPED_SEARCH_MIN_GAIN = 0.0
+
+
+def tcgen05_plain_narrow_subtile_covers_n(
+    m: int, n: int, k: int, *, bm: int, bn: int, bk: int, sm_pairs: int
+) -> bool:
+    """Whether the plain narrow ``(128, TCGEN05_PLAIN_NARROW_SUBTILE_N)``
+    subtile takes a ``bm`` x ``bn`` pair tile over an ``m`` x ``n`` x ``k``
+    product: whole N tiles, or a partial last N tile where a tile's epilogue
+    hides behind the next tile's mainloop, so the narrower C ring pays (it
+    leaves the 192-wide pair its seventh AB stage, and its 8 KiB rounds
+    interleave with the mainloop's loads). That takes CTAs with a next tile
+    (more tiles than ``sm_pairs`` CTA pairs) and a K loop longer than the
+    pair tile's fixed prologue and epilogue (``TCGEN05_PAIR_TILE_FIXED_KBLOCKS``
+    K blocks); otherwise the epilogue is on the critical path and twice the
+    rounds cost more than they save. bf16, GB300, the old and new kernel of
+    one config in one process, of cuBLAS: 1000x10240x2560 (216 192-wide
+    tiles, 40 K blocks) 0.970 -> 1.005 at seven AB stages, 4096x8008x2560
+    (512 256-wide tiles) 0.980 -> 0.993; but 4096x1000xK (64 256-wide tiles
+    on 76 pairs, one wave) loses at every K from 64 to 2048 (-0.6..-3.4%),
+    and the batched 768 x 200x200x64 (one K block per 200-of-256-column
+    tile) reads 1.043 -> 0.950. ``m`` and ``n`` are one matrix's: a batched
+    product counts one matrix's tiles, so a batch of 300 200x200x512
+    matrices (300 pair tiles) keeps CuTe's tile too (not measured).
+    """
+    tiles = -(-m // bm) * -(-n // bn)
+    return n % bn == 0 or (
+        k // bk > TCGEN05_PAIR_TILE_FIXED_KBLOCKS and tiles > sm_pairs
+    )
+
+
+# The modeled gain (``dense_aligned_n.transposed_pair_tile_gain``) from which
+# helion.inductor lowers a 16-bit matmul as its transposed product. GB300,
+# bf16 RC, cuBLAS time / Helion time, both orientations autotuned in one
+# process (quick), modeled gain: as written / transposed:
+#   0.88 1000x4096x4096 1.03 / 0.95, 0.92 16384x384x768 1.06 / 0.97,
+#   0.97 1000x2880x4096 1.06 / 0.56; 1.00 25344x768x3072 1.01 / 1.02,
+#   1.03 8192x768x768 1.06 / 1.06, 1.04 32768x768x3072 1.00 / 1.00;
+#   1.03 8192x768x3072 1.04 / 1.10, 1.11 8192x1024x1024 0.96 / 1.02;
+# and full effort against 224-wide transposed pairs, modeled 1.11-1.13:
+# 16384x1024x4096 0.92 / 1.04, 8192x1024x4096 0.98 / 1.09, 4096x1024x4096
+# 0.99 / 1.07, 16384x768x3072 0.99 / 1.09, 25088x512x2048 1.03 / 1.11,
+# 25088x512x1024 1.06 / 1.09, 8192x512x2048 1.01 / 1.04, 32768x256x1024
+# 1.00 / 1.02. The model ranks the orientations by wave-quantized pair
+# tiles alone: every loss sits below 1.0, the gains from 1.0 to 1.04 split
+# (ties), and the first clear win is at 1.033.
+TCGEN05_TRANSPOSED_PRODUCT_MIN_GAIN = 1.03
+# The most K blocks (64 deep, the last one partial) of a one-wave GEMM of a
+# row-major a whose rows straddle L2 sectors and an N-major b that
+# ``search_plan.tcgen05_transposes_misaligned_a_rows`` prices on its 128-row
+# pairs in both orientations. Its measurements are at 16 (bf16 K = 1000,
+# both orientations autotuned on GB300); it takes K loops up to twice that,
+# and longer ones, which nothing measured, stay as written.
+TCGEN05_N_MAJOR_B_ONE_WAVE_MAX_K_BLOCKS = 32
+# The 128-byte lines of A and B rows a one-tile CTA prefetches into L2 ahead
+# of its dependent-launch wait (``cute_mma._tcgen05_operand_l2_prefetch_lines``):
+# 96 KB, what one SM pulls in the ~400 ns its CTA waits for the release.
+TCGEN05_OPERAND_L2_PREFETCH_MAX_LINES = 768
+# The warps of a flat one-CTA kernel that prefetch its CTA's operand footprint
+# ahead of the dependent-launch wait (``cute_mma._build_flat_operand_l2_prefetch``):
+# the epilogue warps, idle until the accumulator is ready.
+TCGEN05_FLAT_L2_PREFETCH_WARPS = 4
+# The shortest K loop, in 64-wide k-blocks, over which a flat one-CTA kernel
+# prefetches its footprint: shorter loops lose to the prefetch, longer ones
+# gain. GB300, bf16, the same flat config without and with the prefetch, of
+# cuBLAS: transposed 128x192xK with b stored [K, N] on 48 CTAs of [64, 8,
+# 128]: K 512 (8 k-blocks) 0.934 -> 0.867, 1000 (16) 0.885 -> 0.943, 2048 (32)
+# 1.081 -> 1.154, 4096 (64) 0.771 -> 0.797; 32x1280x1000 RR (16, 40 CTAs)
+# 0.901 -> 1.020; 128x1000x768 RC (12, 64 CTAs) 0.882 -> 0.874. The persistent
+# one-tile kernel's prefetch (the TMA-load role's) gains over short loops too
+# (bf16 256x512x512 RR, 8 k-blocks: 0.989 -> 1.048) and takes no such floor;
+# issuing the flat kernel's prefetch from its TMA warp or releasing its
+# dependents ahead of the prefetch changes none of these.
+TCGEN05_FLAT_L2_PREFETCH_MIN_K_BLOCKS = 16
+# The lines a one-tile one-CTA CTA prefetches when most of its grid starts
+# early (``tcgen05_one_cta_l2_prefetch_max_lines``).
+TCGEN05_ONE_CTA_L2_PREFETCH_EARLY_GRID_MAX_LINES = 2048
+# The widest CTA pair tile (``tcgen05_mma_bn``) whose CTAs L2-prefetch a
+# mixed-major one-tile footprint past the pair window
+# (``TCGEN05_OPERAND_L2_PREFETCH_MAX_LINES``), up to
+# ``TCGEN05_ONE_CTA_L2_PREFETCH_EARLY_GRID_MAX_LINES``
+# (``cute_mma._tcgen05_operand_l2_prefetch_lines``). The 64-wide pairs gain
+# up to 1544 lines per CTA (there). A wider pair's CTA, more rows of B, keeps
+# the window: the transposed bf16 512x1280x1000 (a's rows 2000 bytes apart)
+# on 60 pairs of 128x96, each CTA 1000 lines of b.T and 48 rows of a.T of 17
+# lines (1816), runs 0.904 of cuBLAS without the prefetch and 0.822 with it,
+# and on 70 pairs of 128x80 (1680 lines) 0.910 and 0.809 (GB300, CUDA graphs
+# over cold inputs, the same config back to back).
+TCGEN05_MIXED_MAJOR_PAIR_L2_PREFETCH_MAX_BN = 64
+
+
+def tcgen05_transposed_pair_prefetch_fits(
+    m: int,
+    n: int,
+    k: int,
+    *,
+    itemsize: int,
+    a_row_bytes: int,
+    b_row_bytes: int,
+    num_sms: int,
+    a_offset_bytes: int = 0,
+    b_offset_bytes: int = 0,
+) -> bool:
+    """Whether the transposed product (out.T = b.T @ a.T) of a skinny
+    ``m x n x k`` product with an N-major b runs a one-wave grid of 128x64
+    CTA pairs (``cdiv(n, 128)`` pair rows by ``cdiv(m, 64)`` columns) whose
+    CTAs' operand footprint fits the 64-wide mixed-major pair's L2 prefetch
+    (``cute_mma._tcgen05_operand_l2_prefetch_lines``: up to
+    ``TCGEN05_ONE_CTA_L2_PREFETCH_EARLY_GRID_MAX_LINES``, within
+    ``TCGEN05_MIXED_MAJOR_PAIR_L2_PREFETCH_MAX_BN``), counted as
+    ``cute_mma._flat_operand_l2_prefetch_footprint`` counts it: the CTA's 64
+    M-contiguous elements of b.T at every K index, one line where b's rows
+    (``b_row_bytes`` apart, from ``b_offset_bytes``) start on line
+    boundaries and two where they do not, and its 32 rows of a.T, one more
+    line each where a's rows are not whole lines apart. bf16 128x3072x1024:
+    48 pairs, 1024 + 32 x 16 = 1536 lines; with b sliced from [1024, 3080]
+    (rows 6160 bytes apart), 2 x 1024 + 32 x 16 = 2560, past the cap."""
+    pairs = -(-n // 128) * -(-m // 64)
+    if num_sms <= 0 or 2 * pairs > num_sms:
+        return False
+    b_lines = 1 if b_row_bytes % 128 == 0 and b_offset_bytes % 128 == 0 else 2
+    a_lines = -(-(k * itemsize) // 128) + (
+        1 if a_row_bytes % 128 or a_offset_bytes % 128 else 0
+    )
+    lines = k * b_lines + 32 * a_lines
+    return lines <= TCGEN05_ONE_CTA_L2_PREFETCH_EARLY_GRID_MAX_LINES
+
+
+def tcgen05_one_cta_l2_prefetch_max_lines(*, work_ctas: int, num_sm: int) -> int:
+    """The most 128-byte lines a one-tile one-CTA CTA L2-prefetches ahead of
+    its dependent-launch wait (``cute_mma._tcgen05_operand_l2_prefetch_lines``,
+    ``cute_mma._build_flat_operand_l2_prefetch``).
+
+    Under a dependent launch the previous call of a ``work_ctas``-CTA grid
+    holds ``work_ctas`` SMs; this call's CTAs start on the other ones as soon
+    as the previous call releases its dependents, a whole kernel ahead of the
+    dependency, and the rest only as SMs free up (~400 ns ahead, the window
+    ``TCGEN05_OPERAND_L2_PREFETCH_MAX_LINES`` is sized for). Where at least
+    half the grid starts early (``3 * work_ctas <= 2 * num_sm``), a CTA
+    prefetches up to ``TCGEN05_ONE_CTA_L2_PREFETCH_EARLY_GRID_MAX_LINES``.
+    GB300 (152 SMs), bf16, CUDA graphs over cold inputs, the same config
+    without and with the prefetch, of cuBLAS: 128x768x768 RR (48 CTAs, 1152
+    lines) 0.982 -> 1.129, 32x1280x960 RC (80, 1080) 0.924 -> 1.037,
+    128x640x1000 RR (80, 1272) 0.934 -> 0.982, 128x768x1000 RR (96, 1272)
+    0.942 -> 0.966, 128x768x768 RC (96, 960) 1.006 -> 1.077; with 128 CTAs
+    (24 start early) 640 lines still gain (256x512x512 RR 0.989 -> 1.048)
+    and 1280 lose (256x512x1024 RR 1.034 -> 1.004, RC 1.011 -> 1.001)."""
+    if num_sm > 0 and 3 * work_ctas <= 2 * num_sm:
+        return TCGEN05_ONE_CTA_L2_PREFETCH_EARLY_GRID_MAX_LINES
+    return TCGEN05_OPERAND_L2_PREFETCH_MAX_LINES
+
+
+# The dependent-launch L2 warm-up (``cute_mma._tcgen05_pdl_l2_warmup_kblocks``):
+# the grid's first CTAs in launch order, which sit on the SMs the previous
+# call (or its last wave) leaves idle, prefetch the grid's first k-blocks of
+# every A and B row. Eight of them: from 24 the burst competes with the
+# previous call's DRAM reads. At most 8192 lines each (~4 us of issue at one
+# line per clock): the release test stops the warm-up when the dependency
+# resolves, so the cap bounds the issue work rather than an overrun into
+# the warming CTA's own epilogue (which cost -12..-15% before that test).
+# At least four 128-byte lines per row (four 64-deep 16-bit k-blocks, two
+# 128-deep ones): fewer keep little of the gain (six keep about half). The
+# bytes warmed count, not the k-blocks they split into: bf16 1500x1536x384 on
+# the 256x128x128 pair (three 2-line k-blocks), CUDA graphs over cold inputs,
+# of cuBLAS: 1.00 -> 1.13 with the warm-up; 4096x512x384 on 128x256x128 1.02 ->
+# 1.18.
+TCGEN05_PDL_L2_WARMUP_CTAS = 8
+TCGEN05_PDL_L2_WARMUP_MAX_LINES_PER_CTA = 8192
+TCGEN05_PDL_L2_WARMUP_MIN_LINES = 4
+# A 128-row CTA pair whose grid leaves this many SMs idle or more warms only
+# rows of at most TCGEN05_PDL_L2_WARMUP_WIDE_MAX_LINES lines over all of K:
+# with 24 idle SMs, K of 512-1280 gains 2-14%, while K of 2048-4096 loses
+# 0.4-2.9% on 128x128 and 128x64 pairs (256-row pairs gain there: 2048x768x3072
+# +2%, 1000x9216x2304 +2%).
+TCGEN05_PDL_L2_WARMUP_WIDE_IDLE_SMS = 16
+TCGEN05_PDL_L2_WARMUP_WIDE_MAX_LINES = 24
+
+
+def tcgen05_last_wave_idle_sms(work_ctas: int, *, num_sm: int) -> int:
+    """The SMs a persistent CTA-pair grid of ``work_ctas`` tile CTAs leaves
+    idle in its last wave, where the next call's first CTAs start while it
+    still runs: one wave leaves ``num_sm - work_ctas``; with more tiles than
+    pairs (``num_sm // 2`` pairs, one tile each per wave) the pairs short of
+    a tile in the last wave exit a tile early. bf16 1000x9216x2304 on the
+    256x256 pair: 144 tiles over 76 pairs, 68 in the second wave, 16 idle
+    SMs."""
+    grid_ctas = min(work_ctas, num_sm // 2 * 2)
+    waves = -(-work_ctas // grid_ctas)
+    return num_sm - (work_ctas - grid_ctas * (waves - 1))
+
+
+def tcgen05_pdl_l2_warmup_cta_rows(m: int, n: int) -> int:
+    """The rows of A and B (counted together, A's first) each of the grid's
+    first ``TCGEN05_PDL_L2_WARMUP_CTAS`` CTAs warms
+    (``cute_mma._build_pdl_l2_warmup``): a contiguous block of
+    ``ceil(rows / CTAS)``."""
+    return -(-(m + n) // TCGEN05_PDL_L2_WARMUP_CTAS)
+
+
+def tcgen05_operand_l2_prefetch_lines(
+    *,
+    k: int,
+    itemsize: int,
+    cta_rows: int,
+    max_lines: int = TCGEN05_OPERAND_L2_PREFETCH_MAX_LINES,
+) -> int:
+    """The 128-byte lines per row a one-tile CTA whose ``cta_rows`` A and B
+    rows are K-major L2-prefetches ahead of its dependent-launch wait
+    (``cute_mma._tcgen05_operand_l2_prefetch_lines``, which has the study):
+    every line of its K extent where its rows hold at most ``max_lines``
+    lines in all (``TCGEN05_OPERAND_L2_PREFETCH_MAX_LINES``, or a one-CTA
+    tile's ``tcgen05_one_cta_l2_prefetch_max_lines``), else none."""
+    lines = -(-k * itemsize // 128)
+    return lines if cta_rows * lines <= max_lines else 0
+
+
+def tcgen05_pdl_l2_warmup_kblocks(
+    *,
+    m: int,
+    n: int,
+    k: int,
+    bk: int,
+    block_m: int,
+    block_n: int,
+    itemsize: int,
+    work_ctas: int,
+    num_sm: int,
+    one_tile_per_cta: bool,
+    ab_stages: int | None = None,
+) -> int:
+    """The k-blocks of every A and B row the first
+    ``TCGEN05_PDL_L2_WARMUP_CTAS`` CTAs of a CTA pair's persistent grid of
+    ``work_ctas`` tile CTAs warm into L2 for an ``m`` x ``n`` x ``k`` GEMM
+    with K-major operands on ``block_m`` x ``block_n`` pairs, 0 for none:
+    the shape's part of ``cute_mma._tcgen05_pdl_l2_warmup_kblocks``, which
+    adds the operand majors and the plan's gates, and which the pair-tile
+    orientation model asks too (``dense_aligned_n``). A ring of ``ab_stages``
+    stages (``None``: one deeper than the warm-up needs). None for:
+
+    - fewer than ``TCGEN05_PDL_L2_WARMUP_CTAS`` work CTAs (each warming CTA
+      takes its own block of ``tcgen05_pdl_l2_warmup_cta_rows`` rows);
+    - a one-tile CTA that prefetches its whole operand footprint itself
+      (``tcgen05_operand_l2_prefetch_lines``);
+    - fewer idle SMs than warming CTAs in the previous call's last wave
+      (``tcgen05_last_wave_idle_sms``), or a ``block_m`` under 256 (the
+      128-row pair) with ``TCGEN05_PDL_L2_WARMUP_WIDE_IDLE_SMS`` idle SMs and
+      rows of more than ``TCGEN05_PDL_L2_WARMUP_WIDE_MAX_LINES`` lines;
+    - a depth under ``TCGEN05_PDL_L2_WARMUP_MIN_LINES`` lines (the bytes
+      warmed per row, whatever ``bk`` splits them into).
+
+    bf16 1000x2048x2304 on 256x112 pairs: as written 76 tiles (152 CTAs)
+    leave none of GB300's 152 SMs idle (0); transposed, 72 leave 8, whose
+    eight CTAs warm the first k-blocks of all 3048 rows, 381 each (9 with
+    the 9-stage ring)."""
+    if work_ctas < TCGEN05_PDL_L2_WARMUP_CTAS:
+        return 0
+    if one_tile_per_cta and tcgen05_operand_l2_prefetch_lines(
+        k=k, itemsize=itemsize, cta_rows=block_m // 2 + block_n // 2
+    ):
+        return 0
+    idle_sms = tcgen05_last_wave_idle_sms(work_ctas, num_sm=num_sm)
+    if idle_sms < TCGEN05_PDL_L2_WARMUP_CTAS:
+        return 0
+    line_elems = 128 // itemsize
+    if bk % line_elems or (
+        idle_sms >= TCGEN05_PDL_L2_WARMUP_WIDE_IDLE_SMS
+        and -(-k // line_elems) > TCGEN05_PDL_L2_WARMUP_WIDE_MAX_LINES
+        and block_m < 256
+    ):
+        return 0
+    kblocks = min(
+        k // bk,
+        TCGEN05_PDL_L2_WARMUP_MAX_LINES_PER_CTA
+        // (tcgen05_pdl_l2_warmup_cta_rows(m, n) * (bk // line_elems)),
+    )
+    if ab_stages is not None:
+        kblocks = min(kblocks, ab_stages)
+    return (
+        kblocks
+        if kblocks * (bk // line_elems) >= TCGEN05_PDL_L2_WARMUP_MIN_LINES
+        else 0
+    )
+
+
 # An N-major B half row of the aligned-N pair must hold whole swizzle atoms
 # of at least this many bytes to be seeded.
 TCGEN05_ALIGNED_N_MN_B_ROW_BYTES = 64
+# The as-written 16-bit pair's K-block time over an N-major B whose half rows
+# hold 64-byte but not 128-byte swizzle atoms (64 or 192 bf16 columns: 32 or
+# 96 per CTA, 64- or 192-byte rows), relative to a K-major B, in the
+# orientation model (``dense_aligned_n.transposed_pair_tile_gain``). GB300,
+# bf16, the same as-written configs on B [K, N] row-major vs column-major,
+# alternating on one GPU, Helion us (RR / RC): 192 columns 2048x3072x768
+# 8.82 / 8.63, 4096x1536x1536 14.84 / 14.57, 8192x768x768 9.12 / 8.97
+# (+1.7..2.2%); 256 and 128 columns (128-byte atoms) within 0.8% either way
+# (64 columns, the same atom, was not measured).
+TCGEN05_MN_B_64B_ATOM_STREAM_COST = 1.02
 # Tall 16-bit aligned-N problems (at least this many 256-row pair rows) also
 # seed the grouped persistent raster at these L2 groupings.
 TCGEN05_ALIGNED_N_TALL_PAIR_ROWS = 64
@@ -170,6 +535,60 @@ TCGEN05_TWO_CTA_FP8_SMALL_GRID_BLOCK_M = 128
 TCGEN05_TWO_CTA_FP8_SMALL_GRID_BLOCK_N = 128
 # Best measured seed L2 grouping for the full-tile CtaGroup.TWO row.
 TCGEN05_TWO_CTA_SEED_L2_GROUPING = 4
+# AB stages of the batched one-K-tile seed (``seeds._batched_one_k_tile_seed_configs``,
+# a 128x64 one-CTA tile: one 24 KB stage per tile): the ring six tiles deep,
+# not the seven that also fit. In CUDA graphs over cold inputs the two run alike
+# (bf16 512 x 512x512x64 RC, GB300, of cuBLAS: six 0.988-0.991, seven
+# 0.978-0.987), but the final selection's per-call timing reads the seven-deep
+# ring 6% slower than the six-deep one (55.4 us against 50.9), so a seed of
+# seven lost its finalist slot to a 256x256 pair over 16-deep k-blocks that
+# reads 51.6 per call and runs 55.2 in a graph (0.947).
+TCGEN05_BATCHED_ONE_K_TILE_SEED_AB_STAGES = 6
+# AB stages of the batched one-row-tile seed
+# (``seeds._batched_one_row_tile_seed_configs``, a 64x64 one-CTA tile over
+# 64-deep k-blocks: one 16 KB stage per k-block), 192 KB of operands in flight
+# a CTA beside the tile's four-deep C ring.
+TCGEN05_BATCHED_ONE_ROW_TILE_SEED_AB_STAGES = 12
+# N tile ceiling of a batched 16-bit GEMM one 64-row tile tall over a short K
+# loop (``search_plan.tcgen05_one_row_tile_batched_narrow_n``).
+TCGEN05_ONE_ROW_TILE_BATCHED_BLOCK_N = 64
+# The waves of pair tiles from which a persistent grid runs in the steady
+# state, each tile's epilogue beside the next tile's loads: measured from 6.8
+# waves of 256x256 tiles (``search_plan.tcgen05_transposes_epilogue_bound_product``);
+# each rule that asks it counts the waves of its own pair tiles (a K-major copy
+# of b repays itself there, 1.7 waves do not).
+TCGEN05_EPILOGUE_BOUND_MIN_WAVES = 6
+# Waves of the transposed product's 128-row tiles (one a matrix: a CTA pair or
+# one CTA) a batch holds at least before
+# ``search_plan.tcgen05_transposes_skinny_batched_product`` transposes it
+# (384 x 64x128x128, 5.1 waves of pairs, ran the as-written tiles faster
+# before the transposed search ran only the pairs).
+TCGEN05_TRANSPOSED_BATCH_MIN_WAVES = 6
+# Waves of one-CTA tiles (one a matrix) under which a batch of matrices each
+# one 128-row CTA pair tile over a K loop of two or more 64-deep k-blocks runs
+# only the pairs in the search (``repair.batched_pair128_one_tile_matrices``):
+# the stored picks of that family at up to 512 matrices are all pairs, at
+# 1024-3072 matrices one-CTA and flat tiles win too.
+TCGEN05_BATCHED_ONE_TILE_PAIR_MAX_WAVES = 6
+# The C stages of the 128-row CTA pair over a batch of matrices each one pair
+# tile whose N it covers, over K <= 128 (``repair.batched_pair128_c_stages``),
+# whatever the search samples. Its tile's K loop of a k-block or two cannot
+# hide the epilogue, and a 128-wide tile's CTA stores its 64 x 128 output in
+# four (64, 32) subtiles:
+#     tcgen05_c_buffer = (tcgen05_tma_store_role_tile * cutlass.Int32(tcgen05_subtile_count) + cutlass.Int32(_tcgen05_subtile)) % cutlass.Int32(4)
+# where with two C stages (``% cutlass.Int32(2)``) the third subtile waits
+# until the first subtile's TMA store has left shared memory. GB300, CUDA
+# graphs over cold inputs, of cuBLAS, at the same AB ring, two / four C
+# stages: bf16 512 x [128, 128] @ [128, 128] 0.986-0.992 / 0.999-1.002 (b
+# column-major 0.986-0.988 / 0.999-1.000), 512 x [128, 128] @ [128, 80]
+# 1.034 / 1.048, 512 x [128, 80] @ [80, 128] 1.010-1.015 / 1.028-1.034,
+# 1024 x [128, 128] @ [128, 64] 1.086-1.094 / 1.102-1.108, 192 x [128, 128]
+# @ [128, 64] 1.054 / 1.063, 3072 x [128, 128] @ [128, 64] 0.982-0.991 /
+# 0.984-0.987; a 64-wide tile (two subtiles) 0 to +1%. The final selection's
+# per-call timing (an L2 flush before each launch) reads them alike (512 x
+# 128^3: 14.98-15.01 us either way), so a seed alone would not keep the four.
+# A taller matrix or a longer K loop, unmeasured, keeps the sampled C ring.
+TCGEN05_BATCHED_PAIR128_C_STAGES = 4
 # The M-tile grouping of a long N sweep (at least this many N tiles): a walk
 # that groups fewer M tiles re-reads B once per group (bf16 8192x32000x1024 +
 # bias, 125 N tiles, of the ATen GEMM: 0.84 grouped by 2, 0.94 by 8, 0.99 by
@@ -301,7 +720,11 @@ def tcgen05_fixed_smem_overhead_bytes(
     128 B alignment: 128 B up to eight stages, 256 B up to sixteen), the
     accumulator barriers, the TMEM holding buffer and, on a CTA pair, the
     dealloc mbarrier. Exact for the measured kernels (164 B one-CTA / 172 B
-    two-CTA up to eight AB stages, 292 B / 300 B at nine to sixteen).
+    two-CTA up to eight AB stages, 292 B / 300 B at nine to sixteen). It
+    leaves out the 8 B release mbarrier of the dependent-launch L2 warm-up
+    (``cute_mma._build_pdl_l2_warmup``): the rings, the row stages and the
+    opt-in capacity are whole KiB, and these allocations, that barrier and
+    its alignment padding stay under one KiB, so an arena that fits holds it.
     """
     assert ab_stages > 0 and acc_stages > 0
     assert cluster_m in (1, 2)
@@ -482,12 +905,15 @@ TCGEN05_REGION_PID_TYPE_CHOICES: tuple[str, ...] = (
     "persistent_blocked",
     "persistent_interleaved",
 )
-# The monolithic role-local schedule every proved tcgen05 family pins: one
-# AB-load (TMA) warp, one MMA warp, four epilogue warps and no scheduler,
+# The monolithic role-local schedule the proved tcgen05 families start from:
+# one AB-load (TMA) warp, one MMA warp, four epilogue warps and no scheduler,
 # C-input, epilogue-load or store warps, static persistent, the default
 # layout.  Each family's surface -- ``one_cta_pipeline_defaults``,
 # ``n_edge_cluster_schedule_defaults``, the two-CTA region projection below,
-# the fanout and row-union admission -- composes its own pins over it.
+# the fanout and row-union admission -- composes its own pins over it.  A
+# plain static GEMM's search also samples two AB-load warps
+# (``surface.shared_ring_producer_search_enabled``), which the aligned-N plan
+# admits.
 TCGEN05_ROLE_LOCAL_SCHEDULE: tuple[tuple[str, object], ...] = (
     ("tcgen05_strategy", "role_local_monolithic"),
     ("tcgen05_persistence_model", "static_persistent"),
@@ -621,10 +1047,119 @@ TCGEN05_EPILOG_SYNC_BARRIER_ID = 2
 # It lies in the 6..9 range of the epilogue warp-group barriers below, which
 # the split-K envelope never allocates (it admits one epilogue warp group).
 TCGEN05_SPLIT_K_BARRIER_ID = 7
-# ``tcgen05_split_k``: CTAs per output tile along K (1 = no split). Every
-# split stores an fp32 partial tile to a launcher-owned workspace and the
-# last arriver reduces them into its TMEM accumulator before the epilogue.
+# ``tcgen05_split_k``: CTAs per output tile along K (1 = no split). On the
+# flat one-CTA kernel every split stores an fp32 partial tile to a
+# launcher-owned workspace and the last arriver reduces them into its TMEM
+# accumulator before the epilogue. On a CtaGroup.TWO kernel with a 4-CTA
+# cluster (``tcgen05_cluster_m=2, tcgen05_cluster_n=2``), ``tcgen05_split_k=2``
+# gives the cluster's two CTA pairs the two K halves of one output tile
+# instead of two N tiles, reduced through DSMEM
+# (``tcgen05_cluster_split_k``).
 TCGEN05_SPLIT_K_CONFIG_KEY = "tcgen05_split_k"
+
+
+def tcgen05_cluster_split_k(config: Mapping[str, object]) -> int:
+    """The K splits of one output tile a config runs on its 4-CTA cluster: 2
+    for ``tcgen05_split_k=2`` on ``tcgen05_cluster_m=2, tcgen05_cluster_n=2``,
+    else 1 (a ``tcgen05_split_k`` above 1 is then the flat grid's split).
+
+    A cluster's two CTA pairs sit on the scheduler's N axis.  With
+    ``tcgen05_cluster_n=2`` alone they take N tiles ``2j`` and ``2j + 1`` and
+    share one A multicast; with the split they take the same output tile,
+    pair 0 the first K half and pair 1 the second, and each adds the other's
+    fp32 partial of half the tile's subtiles (1024x512x4096 bf16 on 128x128
+    pairs, the 32 output tiles' 128 CTAs of GB300's 152 SMs)::
+
+        cluster_n=2:  pair 0 -> tile (i, 2j),  K [0, 4096)
+                      pair 1 -> tile (i, 2j+1), K [0, 4096)
+        split:        pair 0 -> tile (i, j),  K [0, 2048),    stores subtile 0
+                      pair 1 -> tile (i, j),  K [2048, 4096), stores subtile 1
+    """
+    if (
+        config.get(TCGEN05_SPLIT_K_CONFIG_KEY, 1) == 2
+        and config.get("tcgen05_cluster_m", 1) == 2
+        and config.get("tcgen05_cluster_n", 1) == 2
+    ):
+        return 2
+    return 1
+
+
+# K tiles (64 deep) from which the one-wave seeds include the K-split
+# cluster (``seeds._cluster_split_k_seed_exchanges``): its exchange costs about
+# what 40 k-blocks of the 128x64 pair's extra operand traffic do.
+TCGEN05_CLUSTER_SPLIT_K_SEED_MIN_K_TILES = 48
+# The same for the seed exchanging 16-bit partials
+# (``tcgen05_split_k_exchange="output"``), half the bytes: bf16 768x768x2048
+# CR (32 K tiles) on GB300 ran 1.033 of cuBLAS on it against 0.971 with fp32
+# partials (one process; the full-effort unsplit pick read 0.977).
+TCGEN05_CLUSTER_SPLIT_K_OUTPUT_EXCHANGE_SEED_MIN_K_TILES = 32
+
+
+def tcgen05_cluster_split_k_exchange_smem_bytes(
+    *, bm: int, bn: int, itemsize: int = 4
+) -> int:
+    """Per-CTA shared memory of a K-split cluster's partial exchange: the
+    receive buffer of half the CTA's ``bm // 2 x bn`` tile (the partner's
+    half of the epilogue subtiles) in ``itemsize``-byte elements, 128-byte
+    aligned, and its transaction mbarrier.  The 128x128 pair: 64 x 128 / 2
+    x 4 B = 16 KiB of fp32 partials, 8 KiB of 16-bit ones
+    (``tcgen05_split_k_exchange="output"``).
+    """
+    return (bm // 2) * bn * itemsize // 2 + 128
+
+
+# ``tcgen05_split_k_exchange``: the element type a K-split cluster's pairs
+# exchange their partials in (``tcgen05_cluster_split_k``).  "accumulator"
+# sends fp32; "output" rounds them to the 16-bit output dtype first, half the
+# bytes, offered only under ``Settings.split_k_reduction="output"`` (torch's
+# reduced-precision reduction flags, through helion.inductor)::
+#
+#     # "accumulator": 4 fp32 per 16-byte store
+#     _helion_skc.st_async_f32x4(addr, bar, acc[4 * j], ..., acc[4 * j + 3])
+#     # "output": 8 bf16 per 16-byte store, the receiver adds them in fp32
+#     _helion_skc.st_async_b32x4(addr, bar, _helion_skc.pack_bf16x2(acc[8 * j], acc[8 * j + 1]), ...)
+TCGEN05_SPLIT_K_EXCHANGE_CONFIG_KEY = "tcgen05_split_k_exchange"
+TCGEN05_SPLIT_K_EXCHANGE_ACCUMULATOR = "accumulator"
+TCGEN05_SPLIT_K_EXCHANGE_OUTPUT = "output"
+TCGEN05_SPLIT_K_EXCHANGE_CHOICES: tuple[str, ...] = (
+    TCGEN05_SPLIT_K_EXCHANGE_ACCUMULATOR,
+    TCGEN05_SPLIT_K_EXCHANGE_OUTPUT,
+)
+
+
+# ``tcgen05_fallback_cluster``: launch a 4-CTA pair cluster
+# (``tcgen05_cluster_m=2, tcgen05_cluster_n=2``) as the preferred cluster with
+# its pair (2, 1, 1) as the fallback (``cudaLaunchAttributePreferredClusterDimension``).
+# GB300 co-schedules 36 4-CTA clusters (144 of its 152 SMs); the GPU forms
+# pairs on the SMs left over.  The kernel holds one body per cluster shape and
+# both walk the preferred schedule: a pair runs the N lane (``block_idx.y``)
+# of the 2x2 slot it occupies, without the A multicast across the lanes::
+#
+#     @cute.kernel
+#     def _helion_mm(..., tma_atom_a, ..., tma_atom_a_fb, ...):
+#         if cute.experimental.is_preferred_cluster((2, 2, 1)):
+#             _helion_mm_body(..., tma_atom_a, ..., False)
+#         else:
+#             _helion_mm_body(..., tma_atom_a_fb, ..., True)
+#     ...launch(grid=..., cluster=[2, 2, 1], fallback_cluster=[2, 1, 1], smem_merge_branch_allocs=True)
+TCGEN05_FALLBACK_CLUSTER_CONFIG_KEY = "tcgen05_fallback_cluster"
+
+
+def tcgen05_fallback_cluster_shape(
+    config: Mapping[str, object],
+) -> tuple[int, int, int] | None:
+    """The fallback cluster of a ``tcgen05_fallback_cluster`` config: the
+    (2, 1, 1) pair of its 4-CTA cluster, else ``None``."""
+    if (
+        config.get(TCGEN05_FALLBACK_CLUSTER_CONFIG_KEY) is True
+        and config.get("tcgen05_cluster_m", 1) == 2
+        and config.get("tcgen05_cluster_n", 1) == 2
+        and tcgen05_cluster_split_k(config) == 1
+    ):
+        return (2, 1, 1)
+    return None
+
+
 TCGEN05_SPLIT_K_SEARCH_CHOICES: tuple[int, ...] = (1, 2, 4, 8, 16)
 # K tiles each split-K slice keeps at least (the seeds and the default): a
 # shorter slice loses its AB pipeline.
@@ -1149,6 +1684,7 @@ TCGEN05_LARGE_BN_PROOF_STAGE_CONFIGS = (
 
 # CtaGroup.ONE tcgen05 MMA covers 64/128 M tiles; 256 M tiles are validated only
 # after projecting onto the CtaGroup.TWO path.
+TCGEN05_ONE_CTA_MIN_BLOCK_M = 64
 TCGEN05_ONE_CTA_MAX_BLOCK_M = 128
 
 

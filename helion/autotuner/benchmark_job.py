@@ -37,6 +37,7 @@ from .kernel_args import load_private_kernel_args
 from .kernel_args import load_trusted_kernel_args
 from .kernel_args import resolve_portable_args
 from .logger import capture_output
+from .logger import runtime_error_message
 from .precompile_future import _load_compiled_fn
 from .precompile_future import _unload_compiled_fn
 
@@ -58,7 +59,7 @@ def _load_compiled_fn_for_worker(
         return _load_compiled_fn(fn_spec)
     except Exception as error:
         raise CompiledFunctionLoadError(
-            f"{type(error).__qualname__}: {error}"
+            f"{type(error).__qualname__}: {runtime_error_message(error)}"
         ) from error
 
 
@@ -135,10 +136,12 @@ class BenchmarkJob(PhasedJob):
                 else contextlib.nullcontext()
             ):
                 prelude.run()
+                # Surface asynchronous prelude errors before the candidate runs.
+                synchronize_device()
         except Exception as error:
             raise PreludeFailed(
                 "the benchmark prelude failed before the candidate's first "
-                f"call: {type(error).__name__}: {error}"
+                f"call: {type(error).__name__}: {runtime_error_message(error)}"
             ) from error
         return prelude
 

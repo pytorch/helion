@@ -29,6 +29,7 @@ from helion._compiler.tile_strategy import TileStrategy
 from helion._testing import DEVICE
 from helion._testing import _example_kernel
 from helion._testing import patch_cute_mma_support
+from helion._testing.cute_thread_simulator import execute_pointwise_thread_program
 import helion.language as hl
 from helion.language._decorators import is_api_func
 
@@ -599,17 +600,14 @@ def _tile_count_weight(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
     return out
 
 
+@pytest.mark.cpu_only
 def test_grid_tile_count_counts_the_whole_axis() -> None:
-    # ``tile.count`` of a grid tile is the number of tiles along the axis
-    # (``cdiv(end - begin, block)`` from the iteration space's begin), the
-    # same in every program; the CuTe index renderer counted the tiles left
-    # from the program's own tile offset.
-    x = torch.zeros((8, 256))
-    w = torch.zeros(8)
-    code = _code(_tile_count_weight, (x, w), helion.Config(block_sizes=[4, 256]))
-    (scalar_load,) = [line for line in code.splitlines() if "w.iterator" in line]
-    assert "tile_offset_0" not in scalar_load, scalar_load
-    assert "begin_0" in scalar_load, scalar_load
+    # Both row tiles must read w[2], including the partial tile at row four.
+    x = torch.zeros((7, 8))
+    w = torch.arange(4, dtype=x.dtype)
+    code = _code(_tile_count_weight, (x, w), helion.Config(block_sizes=[4, 8]))
+    out, _ = execute_pointwise_thread_program(code, (x, w))
+    torch.testing.assert_close(out, x + w[2])
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")

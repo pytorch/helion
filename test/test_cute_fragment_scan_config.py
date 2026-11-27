@@ -18,6 +18,7 @@ from helion._compiler.cute.autotune.search_surface import _normalize_fragment_op
 from helion._compiler.cute.emitters import PlannedRootEmitter
 from helion._testing import cpu_render_target
 from helion._testing.cute_codegen import cpu_bind
+from helion._testing.cute_fragment_simulator import simulate_independent_fragment
 from helion._testing.cute_scan_kernels import computed_scan as _computed_scan
 from helion.autotuner.config_fragment import EnumFragment
 from helion.autotuner.pattern_search import InitialPopulationStrategy
@@ -1035,8 +1036,6 @@ def test_fragment_threads_unsupported_root_rejected(kernel):
 def test_fragment_threads_scan_loop_and_launch_ownership(count, mode):
     import ast
 
-    from test.test_cute_computed_fragment import _simulate_independent_fragment
-
     x = torch.arange(3 * 5 * 65, dtype=torch.float32).reshape(3, 5, 65) % 8
     bound = cpu_bind(_computed_scan, (x, 2, False))
     config = _thread_config(bound, count)
@@ -1058,7 +1057,7 @@ def test_fragment_threads_scan_loop_and_launch_ownership(count, mode):
         assert sorted(owned) == list(range(extent))
     actual = torch.empty_like(x)
     reused = torch.empty_like(x)
-    _simulate_independent_fragment(code, {"x": x}, {"out": actual, "reused": reused}, 1)
+    simulate_independent_fragment(code, {"x": x}, {"out": actual, "reused": reused}, 1)
     torch.testing.assert_close(actual, (x + 1).cumsum(2), rtol=0, atol=0)
     torch.testing.assert_close(reused, (x + 1) * 2, rtol=0, atol=0)
 

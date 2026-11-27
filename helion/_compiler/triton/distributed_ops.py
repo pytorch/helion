@@ -31,6 +31,7 @@ from ..cross_loop_codegen import cta_threads
 from ..cross_loop_codegen import peer_state
 from ..cross_loop_codegen import tagged_allocations
 from ..device_function import SyncRole
+from ..fx_side_effects import is_effectful_void_op
 from ..host_function import HostFunction
 from ..indexing_strategy import SubscriptIndexing
 from ..indexing_strategy import _in_warp_specialized_loop
@@ -1464,19 +1465,25 @@ def _record_scatter(
     device_function.inband_scatter_done[scatter.root] = done
 
 
+def _extent(state: CodegenState, size: int | torch.SymInt) -> int | None:
+    """A tile extent as the config fixes it, else None."""
+    env = CompileEnvironment.current()
+    block_id = None if isinstance(size, int) else env.resolve_block_id(size)
+    if block_id is not None:
+        # A global block size is a SymInt; from_config_int reads a size
+        # the config fixes without pinning it.
+        size = env.block_sizes[block_id].from_config_int(state.config)
+    return size if isinstance(size, int) else None
+
+
 def _poll_pack(
     state: CodegenState, output_size: list[int | torch.SymInt], lanes: int
 ) -> int:
     """Words per asm lane: more than a thread's words would fault."""
-    env = CompileEnvironment.current()
     numel = 1
     for size in output_size:
-        block_id = None if isinstance(size, int) else env.resolve_block_id(size)
-        if block_id is not None:
-            # A global block size is a SymInt; from_config_int reads a size
-            # the config fixes without pinning it.
-            size = env.block_sizes[block_id].from_config_int(state.config)
-        if not isinstance(size, int):
+        size = _extent(state, size)
+        if size is None:
             return 1
         numel *= size
     numel //= lanes
@@ -1566,6 +1573,15 @@ def inband_load_codegen(state: CodegenState, codegen_load: LoadCodegen) -> LoadC
         backend = env.backend
         indexing = SubscriptIndexing.create(state, fake_tensor, subscript, extra_mask)
         output_size = SubscriptIndexing.compute_shape(fake_tensor, subscript, state)
+        if (
+            indexing.needs_broadcast()
+            and indexing.block_shaped_offset
+            and indexing.broadcast_mask_expr is None
+            and all(_extent(state, size) == 1 for _, size in indexing.broadcast_dims)
+        ):
+            # A block-1 tile on a size-1 dim broadcasts nothing: a uniform
+            # index, which polls like a scalar one (block words, a CTA vote).
+            indexing = indexing._replace(broadcast_dims=())
         shape = state.tile_strategy.shape_str(output_size)
         offset = indexing.index_expr
         if indexing.has_mask() and not indexing.block_shaped_offset:
@@ -2090,8 +2106,26 @@ def _by_group(polls: list[InbandPoll]) -> dict[str, list[InbandPoll]]:
     return groups
 
 
+def _may_run_void_effect(node: torch.fx.Node, device_function: DeviceFunction) -> bool:
+    from ..device_ir import codegen_node_order
+    from ..device_ir import control_flow_child_graph_ids
+
+    if is_effectful_void_op(node):
+        return True
+    children = control_flow_child_graph_ids(node)
+    return bool(children) and any(
+        is_effectful_void_op(child)
+        for _, child in codegen_node_order(
+            device_function.codegen.codegen_graphs,
+            children,
+            repeat_conditions=False,
+            unreached=False,
+        )
+    )
+
+
 def flush_inband_polls(cg: CodegenInterface, node: torch.fx.Node) -> None:
-    """Wait on the pending polls of ``node``'s graph once ``node`` reads one.
+    """Wait at their first use, an effect-only operator, or the graph end.
 
     Outside WS loops, block polls first reload together until a CTA vote finds
     them current. The per-thread spin then covers replicas the vote may skip.
@@ -2100,9 +2134,12 @@ def flush_inband_polls(cg: CodegenInterface, node: torch.fx.Node) -> None:
     polls = [
         poll for poll in device_function.inband_polls if poll.node.graph is node.graph
     ]
+    # An effect-only operator (for example, a backend's assertion) may
+    # terminate the program before a later consumer forces an earlier wait.
     if not polls or (
         node.op != "output"
         and not any(poll.node in node.all_input_nodes for poll in polls)
+        and not _may_run_void_effect(node, device_function)
     ):
         return
     device_function.inband_polls = [

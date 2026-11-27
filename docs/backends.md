@@ -70,6 +70,15 @@ pipeline stages and indexing strategies, subject to the installed compiler
 and hardware. Triton remains useful when you need its operation coverage or
 existing Triton-specific configurations.
 
+A root grid and a loop nested inside a kernel use different lowering paths.
+The Cartesian root checks do not widen ordinary nested Triton loops.
+Use `index_dtype=torch.int64` for wider signed coordinates. Its bounds,
+coordinate arithmetic, and the increment after the last tile must fit in
+signed 64 bits. Widen device operands before doing arithmetic. For an
+interval near the signed limit, iterate from zero and add the base to
+the live coordinates. See the `triton-native-nested-range-width` entry in
+[Known Gaps](https://github.com/pytorch/helion/blob/main/KNOWN_GAPS.md).
+
 ### CuTe DSL
 
 [CuTe DSL](https://github.com/NVIDIA/cutlass) exposes NVIDIA-specific layouts,
@@ -85,6 +94,40 @@ for a source checkout, use `pip install -e '.[cute]'` or
 The backend requires a CUDA 13+ build of PyTorch, even if a newer system CUDA
 toolkit is already installed. The B200/B300 recommendation does not imply
 that every Blackwell GPU has the same instructions or performance profile.
+
+When CuTe implements `torch.gather` by reading its source tile again, it
+supports rectangular loads such as `x[rows, cols]`, `x[1, rows, cols]`, and
+`x[row, :]` for an `hl.grid` row. Gather indices are relative to the tile.
+CuTe can also gather from a one-dimensional source such as `x[row, lane]`,
+where `lane = hl.arange(n)` is a direct `int32` or `int64` sequence
+starting at zero with step one. Its length `n` can be a tile size. When
+`n` is shorter than the axis, the gather selects from that prefix.
+The other subscripts must be integer literals
+or scalar `hl.grid` coordinates that select a fixed plane. Each gather index
+must be nonnegative and smaller than both `n` and the size of the indexed
+dimension of `x`.
+
+CuTe cannot replay a nontrivial explicit load mask, a jagged tile, a scalar
+tensor subscript, a transformed subscript such as `lane + 1`, or correlated
+subscripts such as `x[lane, lane]`. Older versions could compile some of these
+forms and read the wrong elements. To gather from such a source, return the
+selected values from the Helion kernel and call PyTorch's
+`torch.gather` on that output, within each tile if the indices are tile-local.
+
+Ordinary nested CuTe loops use signed 32-bit counters. Literal bounds and
+the magnitude of an explicit step must fit; the step must be nonzero.
+When a gather reads its source tile again inside such a loop, CuTe also
+checks dynamic bounds and steps it cannot prove safe before entering the
+loop. Floating-point bounds convert toward zero; these checks reject NaN
+and infinity.
+
+Other ordinary nested loops can silently narrow runtime bounds and do not
+check a runtime step for zero. This applies with 8- or 16-bit storage
+indices, too: these counters still use 32 bits. For a
+short range with a large origin, pass its length and iterate from zero.
+If you need the absolute coordinate, add the origin in 64-bit arithmetic.
+Split larger ranges on the host so each loop's counter and increments fit.
+Computed fragments and root grids use separate loop lowerings.
 
 ### TileIR
 
@@ -140,6 +183,11 @@ the stable starting point on AMD.
 Keep the algorithm in portable `helion.language` and PyTorch operations when
 you intend to compare backends. Inline compiler code, assembly, supported
 dtypes and some operations are backend-specific.
+
+Helion does not support `torch.gather` on a scalar source such as
+`torch.gather(x[0], dim, ids[0])`. For `dim=0` or `dim=-1`, use `x[0]`
+directly if the index is known to be zero. If the index must be checked,
+perform the gather in eager PyTorch.
 
 Retune for each backend and target device. A `helion.Config` saved for one
 backend is not a portable performance preset: another backend may reject its

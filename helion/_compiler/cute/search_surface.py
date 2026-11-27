@@ -33,6 +33,7 @@ from ..compile_environment import FixedBlockSizeSource
 from . import target_facts
 from .autotune.flash_surface import enable_cute_flash_gated_search
 from .autotune.flash_surface import enable_cute_flash_search
+from .state import CuteSearchFacts
 from .state import cute_env_state
 from .tcgen05_config import facts
 
@@ -68,6 +69,38 @@ def _cute_tcgen05_output_store_facts(
     if not widths:
         return None, 1
     return max(widths), len(stores)
+
+
+def _cute_tcgen05_plain_epilogue(device_ir: DeviceIR, node: torch.fx.Node) -> bool:
+    """Whether one MMA's epilogue stores its tile once and reads no other
+    tensor: the store-chain analysis of
+    ``aux_tensor.host_function_has_tcgen05_aux_kernel_pattern``, which runs
+    after planning (``tcgen05.aux_kernel_detected``)."""
+    from .aux_tensor import analyze_tcgen05_matmul_store_chains
+
+    stores = analyze_tcgen05_matmul_store_chains(
+        device_ir.graphs, node, prove_aux_only_reorder=False
+    )
+    return (
+        stores is not None
+        and len(stores) == 1
+        and not stores[0][1].auxiliary_tensor_loads
+    )
+
+
+def _cute_tcgen05_radix_store(device_ir: DeviceIR, node: torch.fx.Node) -> bool:
+    """Whether one MMA's epilogue stores through a hierarchical (view/permute)
+    destination layout the MMA store analysis admitted (``radix_store``: a
+    head merge fused into a bmm's store)."""
+    from .aux_tensor import analyze_tcgen05_matmul_store_chains
+    from .radix_store import proven_radix_store_layout
+
+    stores = analyze_tcgen05_matmul_store_chains(
+        device_ir.graphs, node, prove_aux_only_reorder=False
+    )
+    return stores is not None and any(
+        proven_radix_store_layout(store) is not None for store, _chain in stores
+    )
 
 
 def _finalize_cute_tcgen05_search_planning(
@@ -184,6 +217,18 @@ def register_search_surface(device_ir: DeviceIR, config_spec: ConfigSpec) -> Non
     register_search_surface``, after ``register_rollable_reductions``):
     lane vector widths, tile packing, exact division, signed bitfields and
     the flash / gated-flash / tcgen05 GEMM search surfaces."""
+    from .scalar_fragment_assertion import validate_assertion_graphs
+
+    config_spec.backend_facts = CuteSearchFacts(
+        has_scalar_fragment_assertion=any(
+            info.graph.find_nodes(
+                op="call_function", target=torch.ops.aten._assert_async.msg, sort=False
+            )
+            for info in device_ir.graphs
+        )
+    )
+    if config_spec.backend_facts.has_scalar_fragment_assertion:
+        validate_assertion_graphs(device_ir)
     env = CompileEnvironment.current()
     env_state = cute_env_state(env)
     register_lane_vector_width_specs(config_spec)
@@ -356,8 +401,13 @@ def register_search_surface(device_ir: DeviceIR, config_spec: ConfigSpec) -> Non
     from .analysis.attention_match import detect_flash_search_surface
     from .cute_flash_bwd import detect_flash_bwd_search_surface
     from .cute_flash_gated import detect_flash_gated_search_surface
+    from .scalar_fragment_assertion import requires_assertion_owner
 
     detect_flash_bwd_search_surface(device_ir)
+    if requires_assertion_owner(config_spec):
+        # Forward flash, gated attention and tcgen05 would fix the tile
+        # sizes for a native root that cannot issue the fragment assertion.
+        return
     flash_shape = detect_flash_search_surface(device_ir)
     gated_surface = (
         None
@@ -398,6 +448,7 @@ def register_search_surface(device_ir: DeviceIR, config_spec: ConfigSpec) -> Non
     else:
         from .cute_mma import _rank3_grouped_root_axes
         from .cute_mma import analyze_cute_mma_node
+        from .cute_mma import batched_ab_tma_provable
         from .cute_mma import tcgen05_fragment_epilogue_source_tiles_reachable
         from .tcgen05.search_plan import _plan_cute_tcgen05_search_candidate
         from .tcgen05.search_plan import enable_cute_tcgen05_search
@@ -502,6 +553,10 @@ def register_search_surface(device_ir: DeviceIR, config_spec: ConfigSpec) -> Non
                     or candidate.operands.rhs.source_to_logical_order is not None
                 ),
                 operand_casts=candidate in cast_candidates,
+                batched_ab_tma=(
+                    candidate.operands.has_leading_passthrough
+                    and batched_ab_tma_provable(env, candidate.operands)
+                ),
             )
             planning_results.append(planning_result)
             search_plan = planning_result.plan
@@ -550,14 +605,10 @@ def register_search_surface(device_ir: DeviceIR, config_spec: ConfigSpec) -> Non
             pass
         elif single_analysis:
             candidate, lhs, search_plan = search_candidates[0]
-            output_store_facts = _cute_tcgen05_output_store_facts(
-                device_ir,
-                next(
-                    node
-                    for item, _lhs, _rhs, node in mma_candidates
-                    if item is candidate
-                ),
+            mma_node = next(
+                node for item, _lhs, _rhs, node in mma_candidates if item is candidate
             )
+            output_store_facts = _cute_tcgen05_output_store_facts(device_ir, mma_node)
             config_spec._cute_tcgen05_config.fission_bundle = (
                 env_state.fission_plan is not None
             )
@@ -580,6 +631,8 @@ def register_search_surface(device_ir: DeviceIR, config_spec: ConfigSpec) -> Non
                 warp_mma_plain_kernel=len(mma_candidates) == 1,
                 output_dtype_bytes=output_store_facts[0],
                 output_stores=output_store_facts[1],
+                plain_epilogue=_cute_tcgen05_plain_epilogue(device_ir, mma_node),
+                radix_store=_cute_tcgen05_radix_store(device_ir, mma_node),
             )
             if (
                 len(mma_candidates) == 1
@@ -641,6 +694,11 @@ def register_search_surface(device_ir: DeviceIR, config_spec: ConfigSpec) -> Non
                     for candidate, _lhs, _rhs, node in mma_candidates
                 },
             )
+    # The tcgen05 search is planned (on, or off as under a flash surface):
+    # from here on a batched fp32 dot the search did not take gets no operand
+    # analysis (``cute_mma._batched_tf32_tma_operands``), so the lowering
+    # that took it before keeps it.
+    config_spec.tcgen05.search_planned = True
 
 
 def detect_collective_knobs(

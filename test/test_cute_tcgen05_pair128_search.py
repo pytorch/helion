@@ -1,10 +1,10 @@
-"""CPU checks of the ragged edge family's 128-row CTA pairs on the search surface.
+"""CPU checks of the 128-row CTA pairs (edge and one-wave families) on the search surface.
 
 ``tcgen05_cta_group="two"`` on ``block_m=128`` is the two-CTA tile cuBLAS-class
 kernels run on ragged GEMMs below the 256-row pair's reach. The seeds and the
 sampled pairs must survive search normalization (the cta_group validator and
 the cluster_m=2 fixer used to project both onto the 256x256 pair), checked
-here on a fake SM100 target with 148 SMs.
+here on fake SM100 targets (148 SMs; GB300's 152 for the one-wave family).
 """
 
 from __future__ import annotations
@@ -20,9 +20,22 @@ from test.test_cute_tcgen05_split_k_search import _samples
 from test.test_cute_tcgen05_split_k_search import _sm100_target
 
 import helion
+from helion._compiler.cute.pipeline_smem import TCGEN05_PAIRED_MAX_AB_STAGES
+from helion._compiler.cute.pipeline_smem import TCGEN05_SMEM_AWARE_MAX_AB_STAGES
+from helion._compiler.cute.pipeline_smem import Tcgen05PipelineSmemFacts
+from helion._compiler.cute.pipeline_smem import max_pipeline_ab_stages
+from helion._compiler.cute.pipeline_smem import paired_pipeline_max_ab_stages
+from helion._compiler.cute.pipeline_smem import pipeline_smem_bytes
 from helion._compiler.cute.tcgen05_config import repair
 from helion._compiler.cute.tcgen05_config import seeds
 from helion._testing import skipUnlessBackends
+from helion._testing.cute_aux import rank_two_aux
+from helion._testing.cute_codegen import forbid_cuda_work
+from helion._testing.cute_dense_tcgen05 import bf16_mm_args
+from helion._testing.cute_dense_tcgen05 import bias_mm_into
+from helion._testing.cute_dense_tcgen05 import gb300_target
+from helion._testing.cute_dense_tcgen05 import plain_mm_into
+from helion._testing.cute_dense_tcgen05 import user_bound_mm
 from helion.autotuner.config_generation import ConfigGeneration
 import helion.language as hl
 
@@ -35,7 +48,7 @@ def test_ragged_edge_family_keeps_its_128_row_pairs(shape) -> None:
         bound = _bind(*shape)
         spec = bound.config_spec
         tcgen05 = spec._cute_tcgen05_config
-        assert repair.plain_edge_pair128_admitted(tcgen05)
+        assert repair.plain_pair128_admitted(tcgen05)
         gen = ConfigGeneration(spec)
         # The seeds themselves, ahead of the small-grid default's promoted
         # copy of one of them.
@@ -79,13 +92,35 @@ def test_ragged_edge_family_keeps_its_128_row_pairs(shape) -> None:
         )
 
 
+def test_a_sampled_edge_pair_takes_the_proofs_ring_depth() -> None:
+    # The edge family's projection clamps a sampled 128x128 pair's ring to
+    # its allocation proof: 13 stages for bf16 1000^3 (the coarse per-stage
+    # model stops at 12).
+    with gb300_target(), forbid_cuda_work():
+        bound = plain_mm_into._bind_isolated(bf16_mm_args(1000, 1000, 1000))
+        spec = bound.config_spec
+        tcgen05 = spec._cute_tcgen05_config
+        assert tcgen05.cluster_m2_search_constraints.allow_edge_k_tail_family
+        (seed,) = [
+            seed
+            for seed in seeds.autotune_seed_configs(tcgen05)
+            if seed.get("tcgen05_cta_group") == "two"
+            and seed.config["block_sizes"][:3] == [128, 128, 64]
+        ][:1]
+        gen = ConfigGeneration(spec)
+        sample = {**copy.deepcopy(seed.config), "tcgen05_ab_stages": 16}
+        normalized = gen.unflatten(gen.flatten(helion.Config(**sample))).config
+        assert normalized["block_sizes"][:3] == [128, 128, 64]
+        assert normalized["tcgen05_ab_stages"] == 13
+
+
 def test_a_grid_of_256_row_pairs_keeps_the_pair_family_as_is() -> None:
     # 4096^3 fills the machine with 256-row pairs: the ragged 128-row pair
     # family is not admitted (its full-tile paired family has its own seeds).
     with _sm100_target():
         bound = _bind(4096, 4096, 4096)
         tcgen05 = bound.config_spec._cute_tcgen05_config
-        assert not repair.plain_edge_pair128_admitted(tcgen05)
+        assert not repair.plain_pair128_admitted(tcgen05)
         assert seeds._plain_edge_pair128_seed_configs(tcgen05, helion.Config()) == []
 
 
@@ -110,7 +145,7 @@ def test_a_half_machine_of_256_row_pairs_keeps_the_edge_family_on_them() -> None
         bound = _bind(5000, 5000, 5000)
         tcgen05 = bound.config_spec._cute_tcgen05_config
         assert 2 in tcgen05.cluster_m_search_choices
-        assert not repair.plain_edge_pair128_admitted(tcgen05)
+        assert not repair.plain_pair128_admitted(tcgen05)
 
 
 def test_fp8_and_auxiliary_epilogues_keep_the_256_row_pair() -> None:
@@ -124,14 +159,14 @@ def test_fp8_and_auxiliary_epilogues_keep_the_256_row_pair() -> None:
         a = torch.empty(1000, 1000, dtype=torch.float8_e4m3fn)
         b = torch.empty(1000, 1000, dtype=torch.float8_e4m3fn).T
         fp8 = _gemm_fp8.bind((a, b)).config_spec._cute_tcgen05_config
-        assert not repair.plain_edge_pair128_admitted(fp8)
+        assert not repair.plain_pair128_admitted(fp8)
         assert fp8.cluster_m_search_choices == (1,)
         a = torch.empty(1000, 1000, dtype=torch.bfloat16)
         b = torch.empty(1000, 1000, dtype=torch.bfloat16)
         bias = torch.empty(1000, dtype=torch.bfloat16)
         aux = _bias_gemm.bind((a, b, bias)).config_spec
         assert aux.tcgen05.aux_kernel_detected
-        assert not repair.plain_edge_pair128_admitted(aux._cute_tcgen05_config)
+        assert not repair.plain_pair128_admitted(aux._cute_tcgen05_config)
         assert 2 in aux._cute_tcgen05_config.cluster_m_search_choices
 
 
@@ -156,3 +191,449 @@ def test_a_sampled_pair_on_a_wide_tile_is_reset_to_auto() -> None:
         assert normalized["tcgen05_cta_group"] == "auto"
         assert normalized["tcgen05_cluster_m"] == 2
         assert normalized["block_sizes"][:2] == [256, 256]
+
+
+def test_one_wave_family_runs_128_row_pairs_at_its_deepest_ring() -> None:
+    # bf16 1000x1024x4096 (M ragged, N and K whole) is a one-wave shape: 16
+    # pairs of 256x256 against GB300's 76 SM pairs. Its 256x64 tiles and the
+    # 128x128 pair both put 128 CTAs on the machine, but each CTA of the
+    # 256x64 tile streams 128 + 32 operand rows per K step against 64 + 64
+    # for the pair (10.2 us against 8.3, cuBLAS 7.75). The pair is seeded at
+    # the deepest ring its allocation proof admits (13 stages: the coarse
+    # per-stage model stops at 12, measured 8.5 us), and a sampled pair keeps
+    # its 128-row tile, a K tile it runs and that depth.
+    with gb300_target(), forbid_cuda_work():
+        bound = plain_mm_into._bind_isolated(bf16_mm_args(1000, 1024, 4096))
+        spec = bound.config_spec
+        tcgen05 = spec._cute_tcgen05_config
+        constraints = tcgen05.cluster_m2_search_constraints
+        assert constraints is not None and constraints.one_wave_only
+        assert not constraints.allow_edge_k_tail_family
+        assert repair.plain_pair128_admitted(tcgen05)
+        pair_seeds = [
+            seed
+            for seed in seeds.autotune_seed_configs(tcgen05)
+            if seed.get("tcgen05_cta_group") == "two"
+            and seed.get("tcgen05_warp_spec_ab_load_warps", 1) == 1
+        ]
+        # (each with a twin on two A/B-load warps: test_cute_tcgen05_ab_load_warps)
+        assert [
+            seed.config["block_sizes"][:3]
+            for seed in seeds.autotune_seed_configs(tcgen05)
+            if seed.get("tcgen05_warp_spec_ab_load_warps", 1) == 2
+        ] == [seed.config["block_sizes"][:3] for seed in pair_seeds]
+        assert [
+            (seed.config["block_sizes"][:3], seed.config["tcgen05_ab_stages"])
+            for seed in pair_seeds
+        ] == [([128, 128, 64], 13)]
+        gen = ConfigGeneration(spec)
+        (seed,) = pair_seeds
+        assert seed in spec.compiler_seed_configs
+        _flat, normalized = gen.strict_config_pair(seed)
+        assert normalized.config["block_sizes"][:3] == [128, 128, 64]
+        assert normalized.config["tcgen05_ab_stages"] == 13
+        sample = copy.deepcopy(seed.config)
+        sample.update({"block_sizes": [128, 32, 32], "tcgen05_ab_stages": 16})
+        normalized = gen.unflatten(gen.flatten(helion.Config(**sample))).config
+        # (a 32-deep K tile the pair does not run: its 64-deep ring)
+        assert normalized["tcgen05_cta_group"] == "two"
+        assert normalized["block_sizes"][:3] == [128, 128, 64]
+        assert normalized["tcgen05_ab_stages"] == 13
+        # The autotune-off default promotes the seed
+        # (``_small_grid_pair_default``); it ran the flat base default's
+        # non-persistent 128x16x16 tile before (83 us against 8.3).
+        default = spec.default_config().config
+        assert default["tcgen05_cta_group"] == "two"
+        assert default["block_sizes"][:3] == [128, 128, 64]
+        assert default["tcgen05_ab_stages"] == 13
+        # An N that 128 does not divide keeps the one-wave family's 256-row
+        # tiles (the pair would clip a partial last N tile, which only the
+        # edge family's pairs run).
+        uneven = plain_mm_into._bind_isolated(bf16_mm_args(1000, 960, 4096))
+        assert not repair.plain_pair128_admitted(
+            uneven.config_spec._cute_tcgen05_config
+        )
+        # A sampled pair on a deeper K tile keeps its ring's K depth at the
+        # pair's 64-deep tile (normalization sized it for the sample's own
+        # tile: 128x128x256 asking for 10 stages arrives with 3).
+        sample.update({"block_sizes": [128, 128, 256], "tcgen05_ab_stages": 10})
+        normalized = gen.unflatten(gen.flatten(helion.Config(**sample))).config
+        assert normalized["block_sizes"][:3] == [128, 128, 64]
+        assert normalized["tcgen05_ab_stages"] == 12
+        # A K block size the user bounds below the pair's K tiles
+        # (hl.register_block_size(32, 32)) keeps the family off the pair.
+        x, y, _out = bf16_mm_args(1000, 1024, 4096)
+        bounded = user_bound_mm._bind_isolated((x, y, 32))
+        assert not repair.plain_pair128_admitted(
+            bounded.config_spec._cute_tcgen05_config
+        )
+        # A whole-tile M leaves the 128x128 pair to the paired-pipeline
+        # search, which seeds it; the one-wave family does not take it.
+        whole = plain_mm_into._bind_isolated(bf16_mm_args(1024, 1024, 4096))
+        whole_tcgen05 = whole.config_spec._cute_tcgen05_config
+        assert not repair.plain_pair128_admitted(whole_tcgen05)
+        assert any(
+            seed.get("tcgen05_cta_group") == "two"
+            and seed.config["block_sizes"][:3] == [128, 128, 64]
+            for seed in seeds.autotune_seed_configs(whole_tcgen05)
+        )
+
+
+def test_one_wave_family_runs_the_64_wide_pair_on_a_half_empty_grid() -> None:
+    # bf16 1500x384x384 (M and N ragged for the 256-row pair, whole K): 36
+    # tiles of 256x64 sit under the quarter-wave gate (38 on GB300's 152
+    # SMs), so the work is also counted in 128x64 pair tiles (72). The
+    # 128x128 pair would put 72 CTAs on the machine, the 128x64 pair 144:
+    # the seed and the autotune-off default take the 64-wide pair (2.69 us
+    # against the flat one-CTA winner's 3.12; cuBLAS runs 72 pairs of the
+    # swapped 128x64 tile in 2.55).
+    with gb300_target(), forbid_cuda_work():
+        bound = plain_mm_into._bind_isolated(bf16_mm_args(1500, 384, 384))
+        spec = bound.config_spec
+        tcgen05 = spec._cute_tcgen05_config
+        constraints = tcgen05.cluster_m2_search_constraints
+        assert constraints is not None and constraints.one_wave_only
+        assert repair.plain_pair128_widths(tcgen05) == (128, 64)
+        pair_seeds = [
+            seed
+            for seed in seeds.autotune_seed_configs(tcgen05)
+            if seed.get("tcgen05_cta_group") == "two"
+            and seed.get("tcgen05_warp_spec_ab_load_warps", 1) == 1
+        ]
+        # (each with a twin on two A/B-load warps: test_cute_tcgen05_ab_load_warps)
+        assert [
+            seed.config["block_sizes"][:3]
+            for seed in seeds.autotune_seed_configs(tcgen05)
+            if seed.get("tcgen05_warp_spec_ab_load_warps", 1) == 2
+        ] == [seed.config["block_sizes"][:3] for seed in pair_seeds]
+        assert [
+            (seed.config["block_sizes"][:3], seed.config["tcgen05_ab_stages"])
+            for seed in pair_seeds
+        ] == [([128, 64, 64], 6)]
+        default = spec.default_config().config
+        assert default["tcgen05_cta_group"] == "two"
+        assert default["block_sizes"][:3] == [128, 64, 64]
+        # A sampled pair keeps a width the family runs, and an N tile it
+        # does not run takes the widest one.
+        gen = ConfigGeneration(spec)
+        (seed,) = pair_seeds
+        normalized = gen.unflatten(gen.flatten(seed)).config
+        assert normalized["block_sizes"][:3] == [128, 64, 64]
+        sample = {**copy.deepcopy(seed.config), "block_sizes": [128, 32, 64]}
+        normalized = gen.unflatten(gen.flatten(helion.Config(**sample))).config
+        assert normalized["tcgen05_cta_group"] == "two"
+        assert normalized["block_sizes"][:3] == [128, 128, 64]
+        # This whole-K family keeps one N tile per pair: a sampled 2x2 cluster
+        # on its 64-wide pair runs on 2x1 clusters (the edge K-tail family's
+        # 2x2 was measured, not this one's).
+        sample = {**copy.deepcopy(seed.config), "tcgen05_cluster_n": 2}
+        normalized = gen.unflatten(gen.flatten(helion.Config(**sample))).config
+        assert normalized["block_sizes"][:3] == [128, 64, 64]
+        assert normalized["tcgen05_cluster_n"] == 1
+        # The 64-wide pair only where its grid fits one wave: bf16
+        # 1000x1024x4096 has 64 pairs of 128x128 and would have 128 of
+        # 128x64.
+        wide = plain_mm_into._bind_isolated(bf16_mm_args(1000, 1024, 4096))
+        assert repair.plain_pair128_widths(wide.config_spec._cute_tcgen05_config) == (
+            128,
+        )
+
+
+def test_a_one_tile_grid_keeps_its_ab_ring_within_the_k_loop() -> None:
+    # bf16 1500x384x384 on 72 pairs of 128x64x128: every CTA runs one tile
+    # of three k-blocks, so a sampled seven-stage ring (168 KB, one CTA per
+    # SM, no dependent-launch overlap) is the three-stage kernel (72 KB)
+    # with four stages never written.
+    with gb300_target(), forbid_cuda_work():
+        bound = plain_mm_into._bind_isolated(bf16_mm_args(1500, 384, 384))
+        spec = bound.config_spec
+        gen = ConfigGeneration(spec)
+        (seed,) = [
+            seed
+            for seed in seeds.autotune_seed_configs(spec._cute_tcgen05_config)
+            if seed.get("tcgen05_cta_group") == "two"
+            and seed.get("tcgen05_warp_spec_ab_load_warps", 1) == 1
+        ]
+        sample = {
+            **copy.deepcopy(seed.config),
+            "block_sizes": [128, 64, 128],
+            "tcgen05_ab_stages": 7,
+        }
+        normalized = gen.unflatten(gen.flatten(helion.Config(**sample))).config
+        assert normalized["block_sizes"][:3] == [128, 64, 128]
+        assert normalized["tcgen05_ab_stages"] == 3
+        # An L2 swizzle that pads the scheduler's layout keeps the ring: at
+        # swizzle 4 the six N tiles take eight slots (96 for 72 clusters),
+        # so 12 clusters walk to a second tile. Swizzle 2 pads no slot.
+        for swizzle, stages in ((4, 7), (2, 3)):
+            sample["tcgen05_l2_swizzle_size"] = swizzle
+            normalized = gen.unflatten(gen.flatten(helion.Config(**sample))).config
+            assert normalized["tcgen05_l2_swizzle_size"] == swizzle
+            assert normalized["tcgen05_ab_stages"] == stages
+        # A grid with more tiles than CTAs keeps the ring: bf16
+        # 4096x4096x128 on 256x256x64 pairs (256 tiles over GB300's 76
+        # pairs, two k-blocks each) keeps four stages; the producer runs
+        # ahead into the next tile's K loop.
+        many = plain_mm_into._bind_isolated(bf16_mm_args(4096, 4096, 128))
+        many_gen = ConfigGeneration(many.config_spec)
+        sample = {
+            **copy.deepcopy(seed.config),
+            "block_sizes": [256, 256, 64],
+            "tcgen05_cta_group": "auto",
+            "tcgen05_ab_stages": 4,
+        }
+        normalized = many_gen.unflatten(
+            many_gen.flatten(helion.Config(**sample))
+        ).config
+        assert normalized["tcgen05_ab_stages"] == 4
+
+
+def test_reserved_sms_keep_the_ring_of_a_grid_that_loops() -> None:
+    # With 32 SMs reserved (``persistent_reserved_sms``) the persistent
+    # launch keeps 60 of GB300's 76 SM pairs: bf16 1500x384x384's 72 pairs
+    # of 128x64x128 then run a second tile on 12 of them, whose producer
+    # runs ahead into it, so a sampled seven-stage ring is not clamped.
+    kernel = helion.kernel(
+        plain_mm_into.fn,
+        backend="cute",
+        static_shapes=True,
+        autotune_effort="none",
+        persistent_reserved_sms=32,
+    )
+    with gb300_target(), forbid_cuda_work():
+        bound = kernel._bind_isolated(bf16_mm_args(1500, 384, 384))
+        spec = bound.config_spec
+        gen = ConfigGeneration(spec)
+        (seed,) = [
+            seed
+            for seed in seeds.autotune_seed_configs(spec._cute_tcgen05_config)
+            if seed.get("tcgen05_cta_group") == "two"
+            and seed.get("tcgen05_warp_spec_ab_load_warps", 1) == 1
+        ]
+        sample = {
+            **copy.deepcopy(seed.config),
+            "block_sizes": [128, 64, 128],
+            "tcgen05_ab_stages": 7,
+        }
+        normalized = gen.unflatten(gen.flatten(helion.Config(**sample))).config
+        assert normalized["block_sizes"][:3] == [128, 64, 128]
+        assert normalized["tcgen05_ab_stages"] == 7
+
+
+def test_a_one_tile_epi_tma_default_keeps_the_256_row_pair() -> None:
+    # bf16 2048x2048x192 + residual: 64 pairs of 256x256x64, one tile per
+    # CTA, three k-blocks. The default stages the residual through the
+    # epilogue-issued ring beside the AB ring the one-tile cap leaves (the
+    # whole K loop, under the ring's usual four-stage floor) instead of
+    # moving to 128 pairs of 256x128, two waves.
+    with gb300_target(), forbid_cuda_work():
+        lhs, rhs, residual = (
+            torch.empty(shape, dtype=torch.bfloat16)
+            for shape in ((2048, 192), (192, 2048), (2048, 2048))
+        )
+        bound = rank_two_aux._bind_isolated((lhs, rhs, residual))
+        default = bound.config_spec.default_config().config
+    assert default["block_sizes"][:3] == [256, 256, 64]
+    assert default["tcgen05_aux_load_mode"] == "epi_tma"
+    assert default["tcgen05_ab_stages"] == 3
+
+
+def test_a_cta_pair_ring_fills_shared_memory_to_seventeen_stages() -> None:
+    # The bf16 128x64 pair (64 A rows and 32 B rows of 64 K per CTA, 12 KB a
+    # stage) fits 17 stages beside its two C stages in GB300's 232448 bytes
+    # (227632) and not 18 (239936): the plain pair's cap with 16-bit operands
+    # is that fill.  The one-CTA model keeps 16 where 18 would fit (64x32 at
+    # bk 64).
+    facts = Tcgen05PipelineSmemFacts(2, 2, 232448)
+    pair = {"bm": 128, "bn": 64, "bk": 64, "c_stages": 2, "acc_stages": 2}
+    assert TCGEN05_PAIRED_MAX_AB_STAGES == 17
+    cap = paired_pipeline_max_ab_stages(facts)
+    assert max_pipeline_ab_stages(facts, max_stages=cap, **pair) == 17
+    assert pipeline_smem_bytes(facts, ab_stages=17, **pair) <= 232448
+    assert pipeline_smem_bytes(facts, ab_stages=18, **pair) > 232448
+    # (fp8 pairs, unmeasured at 17, keep 16; so does every caller that does
+    # not ask for the pair's cap)
+    assert paired_pipeline_max_ab_stages(facts._replace(input_dtype_bytes=1)) == 16
+    assert max_pipeline_ab_stages(facts, **pair) == 16
+    one_cta = {"bm": 64, "bn": 32, "bk": 64, "c_stages": 2, "acc_stages": 2}
+    assert max_pipeline_ab_stages(facts, cluster_m=1, max_stages=18, **one_cta) == 18
+    assert (
+        max_pipeline_ab_stages(facts, cluster_m=1, **one_cta)
+        == TCGEN05_SMEM_AWARE_MAX_AB_STAGES
+        == 16
+    )
+
+
+def test_a_normalized_ring_off_the_searched_range_still_encodes() -> None:
+    # bf16 1000x512x2880 searches tcgen05_ab_stages over 1..12 plus the
+    # 64-wide pair seed's 17. That seed with a sampled N tile of 128
+    # normalizes to the 128x128 pair at its deepest ring, 13 stages: off
+    # the range and not a seed. The pattern search walks its neighbors and
+    # the surrogate encodes it (a full-effort autotune of this GEMM died on
+    # "13 is not a compiler-seed integer value").
+    with gb300_target(), forbid_cuda_work():
+        bound = plain_mm_into._bind_isolated(bf16_mm_args(1000, 512, 2880))
+        spec = bound.config_spec
+        gen = ConfigGeneration(spec)
+        (ab_index,), _ = gen._key_to_flat_indices["tcgen05_ab_stages"]
+        fragment = gen.flat_spec[ab_index]
+        assert (fragment.low, fragment.high) == (1, 12)
+        (seed,) = [
+            seed
+            for seed in seeds.autotune_seed_configs(spec._cute_tcgen05_config)
+            if seed.get("tcgen05_cta_group") == "two"
+            and seed.get("tcgen05_warp_spec_ab_load_warps", 1) == 1
+        ]
+        assert seed.config["block_sizes"][:3] == [128, 64, 64]
+        assert seed.config["tcgen05_ab_stages"] == TCGEN05_PAIRED_MAX_AB_STAGES
+        sample = {**copy.deepcopy(seed.config), "block_sizes": [128, 128, 64]}
+        flat, config = gen.canonicalize_flat(gen.flatten(helion.Config(**sample)))
+        assert config.config["tcgen05_cta_group"] == "two"
+        assert config.config["tcgen05_ab_stages"] == 13
+        gen.encode_config(flat)
+        assert fragment.encode(13) == [13.0]
+        assert fragment.pattern_neighbors(13) == [12, 11]
+
+
+def _transposed_rr_args(m: int, n: int, k: int):
+    """helion.inductor's transposed product of a bf16 [m, k] @ [k, n] with b
+    stored [K, N] (``lowering/mm.py``): out.T = b.T @ a.T, b.T an M-major A,
+    a.T a K-major B, the output column-major."""
+    a = torch.empty(m, k, dtype=torch.bfloat16)
+    b = torch.empty(k, n, dtype=torch.bfloat16)
+    out = torch.empty(m, n, dtype=torch.bfloat16)
+    return b.T, a.T, out.T
+
+
+def test_edge_family_runs_the_64_wide_pair_over_a_k_tail_on_a_half_empty_grid() -> None:
+    # bf16 128x4096x1000 with b stored [K, N] (K = 15 x 64 + 40): the edge
+    # K-tail family's 128x128 pairs count 32 tiles, under the quarter-wave
+    # gate (38 on GB300's 152 SMs), but its 64-wide pairs put 64 pairs (128
+    # CTAs) in one wave: the family admits them and seeds the pair, its
+    # two-A/B-load-warp twin and its 2x2 cluster (A multicast across two
+    # pairs), which the search keeps (cuBLAS: nvjet 64x64 2-CTA tiles in 2x2
+    # clusters). GB300, of cuBLAS: the start pick (a one-CTA [64, 128, 64]
+    # tile, 64 CTAs) 0.783, the 64-wide pair 0.76 and in a 2x2 cluster 1.017.
+    with gb300_target(), forbid_cuda_work():
+        bound = plain_mm_into._bind_isolated(
+            bf16_mm_args(128, 4096, 1000, rhs_k_major=False)
+        )
+        spec = bound.config_spec
+        tcgen05 = spec._cute_tcgen05_config
+        constraints = tcgen05.cluster_m2_search_constraints
+        assert constraints is not None and constraints.allow_edge_k_tail_family
+        # (the 64-wide pair alone: the 128x128 pairs' 32 tiles sit under the
+        # gate)
+        assert repair.plain_pair128_widths(tcgen05) == (64,)
+        narrow = [
+            seed
+            for seed in seeds.autotune_seed_configs(tcgen05)
+            if seed.get("tcgen05_cta_group") == "two"
+            and seed.config["block_sizes"][1] == 64
+        ]
+        assert [
+            (
+                seed.config["block_sizes"][:3],
+                seed.get("tcgen05_warp_spec_ab_load_warps", 1),
+                seed.get("tcgen05_cluster_n", 1),
+            )
+            for seed in narrow
+        ] == [
+            ([128, 64, 64], 1, 1),
+            ([128, 64, 64], 2, 1),
+            ([128, 64, 64], 2, 2),
+            ([128, 64, 128], 1, 1),
+            ([128, 64, 128], 2, 1),
+            ([128, 64, 128], 2, 2),
+        ]
+        gen = ConfigGeneration(spec)
+        for seed in narrow:
+            assert seed in spec.compiler_seed_configs
+            _flat, normalized = gen.strict_config_pair(seed)
+            assert (
+                normalized.config["block_sizes"][:3] == seed.config["block_sizes"][:3]
+            )
+            assert normalized.config["tcgen05_cluster_n"] == seed.get(
+                "tcgen05_cluster_n", 1
+            )
+        # A sampled 128-wide pair is projected onto the 64-wide pair, its 2x2
+        # cluster kept.
+        sample = {**copy.deepcopy(narrow[2].config), "block_sizes": [128, 128, 64]}
+        normalized = gen.unflatten(gen.flatten(helion.Config(**sample))).config
+        assert normalized["block_sizes"][:3] == [128, 64, 64]
+        assert normalized["tcgen05_cluster_n"] == 2
+        # The gate admits the family for its 64-wide pairs alone: no 256-row
+        # pair seeds (the 256x256 edge seed and its 2x2 twin), and no sample
+        # leaves the one-CTA tiles but for the 64-wide pair.
+        assert constraints.edge_pair128_only
+        assert not any(
+            seed.config["block_sizes"][0] == 256
+            for seed in seeds.autotune_seed_configs(tcgen05)
+            if seed.get("tcgen05_cluster_m") == 2
+        )
+        for config in _samples(gen, 200):
+            if config.get("tcgen05_cluster_m", 1) == 2:
+                assert config["block_sizes"][:2] == [128, 64]
+        # An auxiliary epilogue (Inductor's addmm bias row) runs no 128-row
+        # pair: it stays under the gate, on one-CTA tiles.
+        a, b, out = bf16_mm_args(128, 4096, 1000, rhs_k_major=False)
+        bias = torch.randn(4096, dtype=torch.bfloat16)
+        biased = bias_mm_into._bind_isolated((a, b, bias, out))
+        assert biased.config_spec._cute_tcgen05_config.cluster_m_search_choices == (1,)
+    with gb300_target(), forbid_cuda_work():
+        # The transposed 128x2304x1000 (36 pairs of 128x64: 72 CTAs, a quarter
+        # of the SMs and more) takes the 64-wide pair too, and its 2x2 cluster
+        # over the column-major output, which the search keeps: of cuBLAS,
+        # the start pick 0.793, the 64-wide pair 1.00 and in a 2x2 cluster
+        # 1.02 with their operand prefetch.
+        transposed = plain_mm_into._bind_isolated(_transposed_rr_args(128, 2304, 1000))
+        spec = transposed.config_spec
+        tcgen05 = spec._cute_tcgen05_config
+        assert repair.plain_pair128_widths(tcgen05) == (64,)
+        clusters = [
+            seed
+            for seed in seeds.autotune_seed_configs(tcgen05)
+            if seed.get("tcgen05_cta_group") == "two"
+            and seed.get("tcgen05_cluster_n", 1) == 2
+        ]
+        assert [seed.config["block_sizes"][:3] for seed in clusters] == [
+            [128, 64, 64],
+            [128, 64, 128],
+        ]
+        gen = ConfigGeneration(spec)
+        for seed in clusters:
+            _flat, normalized = gen.strict_config_pair(seed)
+            assert normalized.config["tcgen05_cluster_n"] == 2
+        normalized = gen.unflatten(gen.flatten(clusters[0])).config
+        assert normalized["tcgen05_cluster_n"] == 2
+        # The 2x2 renders over the column-major out.T, each CTA prefetching
+        # its pair's share of the operand footprint.
+        code = transposed.to_code(clusters[0])
+        assert "cute.make_layout((2, 2, 1))" in code
+        assert "tcgen05_l2_pf_rank_n * cutlass.Int32(32)" in code
+        # 16 pairs of 128x64 (128x1024x1000: 32 CTAs) stay off the pairs.
+        small = plain_mm_into._bind_isolated(_transposed_rr_args(128, 1024, 1000))
+        assert small.config_spec._cute_tcgen05_config.cluster_m_search_choices == (1,)
+        # One N tile of the 64-wide pair (the transposed 64x4096x1000: 32 pairs
+        # of 128x64, N' = 64) takes the pair alone, without the 256x256 edge
+        # seed: 0.928 (the one-CTA pick) -> 1.14 of cuBLAS with the prefetch.
+        one_tile = plain_mm_into._bind_isolated(_transposed_rr_args(64, 4096, 1000))
+        tcgen05 = one_tile.config_spec._cute_tcgen05_config
+        assert repair.plain_pair128_widths(tcgen05) == (64,)
+        assert sorted(
+            seed.config["block_sizes"][:3]
+            for seed in seeds.autotune_seed_configs(tcgen05)
+            if seed.get("tcgen05_cluster_m") == 2
+        ) == [[128, 64, 64], [128, 64, 64], [128, 64, 128], [128, 64, 128]]
+        # An N of one 64-wide tile joins the family only where a wave of those
+        # pairs fits: bf16 16384x64x1000 would take 128 pairs (256 CTAs).
+        tall = plain_mm_into._bind_isolated(
+            bf16_mm_args(16384, 64, 1000, rhs_k_major=False)
+        )
+        assert tall.config_spec._cute_tcgen05_config.cluster_m_search_choices == (1,)
+        # A grid whose 64-wide pairs would take more than one wave keeps the
+        # family's 128-wide pair alone (1000^2 x 1000: 8 x 16 = 128 pairs).
+        wide = plain_mm_into._bind_isolated(bf16_mm_args(1000, 1024, 1000))
+        assert repair.plain_pair128_widths(wide.config_spec._cute_tcgen05_config) == (
+            128,
+        )

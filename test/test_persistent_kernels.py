@@ -554,7 +554,7 @@ class TestPersistentKernels(RefEagerTestBase, TestCase):
         torch.manual_seed(42)  # Set seed for reproducible results
         args = (
             torch.randn([8, 8], device=DEVICE),
-            torch.randn([8, 8], device=DEVICE),
+            torch.randn([5, 3], device=DEVICE),
         )
 
         # Test persistent + ForEachProgramID
@@ -575,13 +575,17 @@ class TestPersistentKernels(RefEagerTestBase, TestCase):
 
         # Check that code contains persistent loop with ForEachProgramID structure
         # The new implementation correctly combines persistent kernels with ForEachProgramID
-        self.assertIn(_BLOCKED_PID_LOOP, code_persistent_shared)
+        self.assertRegex(
+            code_persistent_shared, r"for virtual_pid in [^\n]*start_pid[^\n]*end_pid"
+        )
         self.assertIn("pid_shared = virtual_pid", code_persistent_shared)
         self.assertIn("if pid_shared <", code_persistent_shared)
-        # Should have the combined total calculation
-        self.assertIn(
-            "total_pids = x_size_0 * x_size_1 + y_size_0 * y_size_1",
+        # Each Cartesian root contributes its own area, with any casts needed
+        # to keep large products and their sum representable.
+        self.assertRegex(
             code_persistent_shared,
+            r"total_pids = [^\n]*x_size_0[^\n]*\* x_size_1[^\n]*\+ "
+            r"[^\n]*y_size_0[^\n]*\* y_size_1",
         )
         # Grid should use SM count for persistent kernels
         # Check that NUM_SM is used in device code and get_num_sm() in host code

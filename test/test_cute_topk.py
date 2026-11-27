@@ -56,6 +56,7 @@ from helion._testing.cute_codegen import cpu_bind
 from helion._testing.cute_codegen import forbid_native_compile
 from helion._testing.cute_codegen import mock_cuda_unavailable
 from helion._testing.cute_codegen import tcgen05_target as _target
+from helion._testing.cute_fragment_simulator import simulate_independent_fragment
 from helion.autotuner.config_generation import ConfigGeneration
 from helion.autotuner.config_spec import ConfigSpec
 import helion.language as hl
@@ -8090,56 +8091,19 @@ def _fragment_composed_topk_gather(x, k: hl.constexpr):
 
 
 def _simulate_topk_fragment(source, inputs, outputs, blocks):
-    import inspect
-    import math
-
-    from test.test_cute_computed_fragment import _simulate_independent_fragment
-
-    text = inspect.getsource(_simulate_independent_fragment)
-    text = text.replace("Int32=int,", "Int32=np.int32,").replace(
-        "Int64=int,", "Int64=np.int64,"
-    )
-    text = text.replace(
-        '"operator": operator,',
-        '"operator": operator, "_bitcast": _bitcast, '
-        '"_cute_gather_registers": _gather_registers,',
-    )
-    text = text.replace(
-        "Float32=np.float32,", "Float32=np.float32, Float16=np.float16, Int16=np.int16,"
+    # TopK bitcasts register values, so the CPU scalars must keep their width.
+    simulate_independent_fragment(
+        source,
+        inputs,
+        outputs,
+        blocks,
+        int32=np.int32,
+        int64=np.int64,
+        gather_registers=gather_registers,
     )
 
-    def bitcast(value, dtype):
-        return np.asarray(value).view(dtype)[()]
 
-    class Bitcasts(ast.NodeTransformer):
-        def visit_Call(self, node):
-            node = self.generic_visit(node)
-            if isinstance(node.func, ast.Attribute) and node.func.attr == "bitcast":
-                return ast.copy_location(
-                    ast.Call(
-                        func=ast.Name(id="_bitcast", ctx=ast.Load()),
-                        args=[node.func.value, *node.args],
-                        keywords=[],
-                    ),
-                    node,
-                )
-            return node
-
-    namespace = {
-        "ast": ast,
-        "math": math,
-        "torch": torch,
-        "SimpleNamespace": SimpleNamespace,
-        "_bitcast": bitcast,
-        "_gather_registers": gather_registers,
-    }
-    exec(compile(text, "<existing-fragment-model-with-bitcast>", "exec"), namespace)
-    modeled = ast.unparse(
-        ast.fix_missing_locations(Bitcasts().visit(ast.parse(source)))
-    )
-    namespace["_simulate_independent_fragment"](modeled, inputs, outputs, blocks)
-
-
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(
     "dtype,largest,width,k",
     # Rows are the fragment shapes (partial, full and singleton rows); each
@@ -8195,6 +8159,7 @@ def test_fragment_leading_axes_topk_generated_values(dtype, largest, width, k):
     assert "fragment_topk_previous_rank" in source
 
 
+@pytest.mark.cpu_only
 def test_fragment_composed_topk_gather_generated_values():
     x = ((torch.arange(5 * 17).reshape(5, 17) * 3) % 11).float()
     with mock_cuda_unavailable(), _target(), forbid_native_compile():
@@ -8232,6 +8197,7 @@ def test_fragment_leading_axes_topk_native(dtype):
         torch.testing.assert_close(x, before, rtol=0, atol=0)
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(
     "dtype", [torch.float16, torch.float32, torch.int32, torch.int64]
 )
@@ -8305,6 +8271,7 @@ def _topk_padded_producer_reference(x, largest, mode):
     return computed.gather(-1, indices), indices
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(
     "largest,mode,width,rows",
     _pairwise_cases(
@@ -8437,6 +8404,7 @@ def _fragment_masked_computed_row_topk(x, bias, k: hl.constexpr, largest: hl.con
     return values, indices
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("width,k", [(17, 3), (65, 8)])
 @pytest.mark.parametrize("largest", [False, True])
 @pytest.mark.parametrize("tile", [1, 4])
@@ -8721,6 +8689,7 @@ def test_fragment_network_topk_values(
     assert state.exchanges > 0 and "fragment_topk_previous_rank" not in source
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("mode", [0, 1, 2])
 @pytest.mark.parametrize("largest", [False, True])
 def test_fragment_network_topk_masked_producer(mode, largest):
@@ -9031,6 +9000,7 @@ def _fragment_network_topk_reshaped(x):
     return output, output_indices
 
 
+@pytest.mark.cpu_only
 def test_fragment_network_topk_resident_reshape():
     x = ((torch.arange(5 * 4 * 16).reshape(5, 64) * 7) % 31).float()
     with mock_cuda_unavailable(), _target(), forbid_native_compile():

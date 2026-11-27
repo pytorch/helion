@@ -72,6 +72,7 @@ from .compile_environment import warning
 from .container_identity import compare_container_identity
 from .container_identity import record_opaque_container_result
 from .cross_loop_dsmem import dsmem_slab_facts
+from .device_assertion import device_assertion_context
 from .fragment_call import guard_fragment_call_input
 from .fragment_comparison import guard_fragment_comparison
 from .fx_side_effects import is_impure_node
@@ -198,10 +199,30 @@ def _host_tensor_stride(
     return symbolic(value, dim % tensor.ndim)
 
 
+def combine_decomp_table() -> dict[torch._ops.OpOverload, Callable[..., object]]:
+    def reject_assertion(*args: object, **kwargs: object) -> None:
+        # Combine calls have no effect contract: an unused result can discard
+        # the entire callback, even when the backend lowers ordinary assertions.
+        raise CompileEnvironment.current().backend.unsupported(
+            "device assertions in hl.reduce or hl.associative_scan combine functions"
+        )
+
+    table = select_decomp_table().copy()
+    table[torch.ops.aten._assert_async.default] = reject_assertion
+    table[torch.ops.aten._assert_async.msg] = reject_assertion
+    return table
+
+
 def _get_custom_decomp_table() -> dict[torch._ops.OpOverload, Callable[..., object]]:
     from ..language._gelu_tanh_approx import install_gelu_decomp
 
     decomp_table = select_decomp_table().copy()
+    # An inherited no-op for the message overload would erase both checks.
+    # Keep FX's effectful message form unless the backend explicitly overrides it.
+    decomp_table.pop(torch.ops.aten._assert_async.msg, None)
+    decomp_table[torch.ops.aten._assert_async.default] = lambda predicate: (
+        torch.ops.aten._assert_async.msg(predicate, "")
+    )
     if CompileEnvironment.has_current():
         CompileEnvironment.current().backend.decomp_table_overrides(decomp_table)
     # Normally, aten.stack is decomposed to aten.unsqueeze + aten.cat, but it's difficult to
@@ -1302,6 +1323,17 @@ class DeviceIR:
         graph_info_cls: type[GraphInfo] = GraphInfo,
         **kwargs: object,
     ) -> int:
+        if graph_info_cls is HelperFunctionGraphInfo:
+            # A discarded combine never reaches helper codegen. Reject its
+            # effectful Helion API calls here; unused pure calls can disappear.
+            if any(
+                node.op == "call_function"
+                and is_api_func(node.target)
+                and is_impure_node(node)
+                for node in graph.nodes
+            ):
+                raise exc.NotAllowedInHelperFunction
+        resolve_scalar_index_aliases(graph)
         graph.eliminate_dead_code(is_impure_node=is_impure_node)
         graph_id = len(self.graphs)
         self.graphs.append(graph_info_cls(graph_id=graph_id, graph=graph, **kwargs))
@@ -2242,7 +2274,7 @@ class DeviceIR:
             return (
                 node.op == "call_function"
                 and node.target not in (memory_ops.load, inline_asm_elementwise)
-                and not node.is_impure()
+                and not is_impure_node(node)
             )
 
         for graph_info in self.graphs:
@@ -2512,6 +2544,18 @@ class WalkDeviceAST(NodeVisitor):
 
     def generic_visit(self, node: ast.AST) -> None:
         raise exc.StatementNotSupported(type(node).__name__)
+
+    # pyrefly: ignore [bad-override]
+    def visit(self, node: ast.AST) -> object:
+        result = super().visit(node)
+        # A specialized size read here (``x.size(1)``) is a SymInt the shape
+        # env has replaced by a constant: an int, as a host read is
+        # (``SymIntType.proxy``), not a symnode of the graph.
+        if isinstance(result, torch.SymInt):
+            constant = result.node.maybe_as_int()
+            if constant is not None:
+                return constant
+        return result
 
     def _assign(
         self, target: ast.AST, value: object, origin: _StaticOrigin = None
@@ -3851,8 +3895,9 @@ class WalkDeviceAST(NodeVisitor):
                 # stride can be a size expression or lack a host symbol origin.
                 func = functools.partial(_host_tensor_stride, tensor, origin, source)
 
-        # pyrefly: ignore [bad-argument-type]
-        result = _CheckForIndexCalls.retry_call(func, args, kwargs)
+        with device_assertion_context(func, args, kwargs):
+            # pyrefly: ignore [bad-argument-type]
+            result = _CheckForIndexCalls.retry_call(func, args, kwargs)
         if (
             func is tuple
             and len(args) == 1
@@ -4861,6 +4906,27 @@ class HelperFunctionGraphInfo(NodeArgsGraphInfo):
         from .helper_function import codegen_helper_function_graph_info
 
         return codegen_helper_function_graph_info(self, state)
+
+
+def resolve_scalar_index_aliases(graph: torch.fx.Graph) -> None:
+    """A local name for a scalar tensor still indexes from the argument's storage."""
+    from ..language._tracing_ops import _host_tensor
+    from ..language.atomic_ops import ATOMIC_OPS
+
+    for alias in graph.find_nodes(op="call_function", target=_new_var):
+        source = alias.args[0]
+        while isinstance(source, torch.fx.Node) and source.target is _new_var:
+            source = source.args[0]
+        if not isinstance(source, torch.fx.Node) or source.target is not _host_tensor:
+            continue
+        tensor = source.meta["val"]
+        if not isinstance(tensor, torch.Tensor) or tensor.ndim != 0:
+            continue
+        for user in tuple(alias.users):
+            if user.target in (hl.load, hl.store) or user.target in ATOMIC_OPS:
+                indices = user.args[1]
+                if isinstance(indices, (list, tuple)) and alias in indices:
+                    user.update_arg(1, [source if i is alias else i for i in indices])
 
 
 def validate_host_tensor_usage(graph: torch.fx.Graph) -> None:

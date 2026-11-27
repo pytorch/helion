@@ -24,6 +24,7 @@ from .state import CuteFlashState
 from .state import CuteLaneState
 from .state import CuteRootPlans
 from .state import CuteTcgen05State
+from .tcgen05_constants import TCGEN05_TWO_CTA_MAX_K_TILES
 
 if TYPE_CHECKING:
     import ast
@@ -322,6 +323,22 @@ class CuteTcgen05StoreValue(_CuteTcgen05OrientationMixin):
     tail_tma_store_atom: str = ""
     tail_tma_store_tensor: str = ""
     role_local_tile_counter: str = ""
+    # The CTA's last output tile stages its subtiles in the drained A ring
+    # (``cute_mma``'s ``tcgen05_last_tile_staging``): the A ring's SMEM pointer
+    # and the work tile one step ahead of the epilogue role's, which the
+    # role's scheduler lookahead binds (the tile is the last when that one is
+    # not valid); "" on every other store.
+    last_tile_smem: str = ""
+    last_tile_next_work: str = ""
+    # The K-split cluster's partial exchange (``tcgen05_cluster_split_k``):
+    # the pair's split index, the receive buffer and its transaction mbarrier
+    # (``split_k_exchange.render_split_k_cluster_exchange``); "" on every other
+    # store. The buffer holds fp32 partials, or the 16-bit output dtype's
+    # (``split_k_cluster_exchange_dtype``, ``tcgen05_split_k_exchange="output"``).
+    split_k_cluster_idx: str = ""
+    split_k_cluster_recv: str = ""
+    split_k_cluster_recv_bar: str = ""
+    split_k_cluster_exchange_dtype: torch.dtype | None = None
     use_role_local_epi: bool = False
     use_tma_store_epilogue: bool = False
     tma_store_full_tiles_only: bool = False
@@ -408,6 +425,9 @@ class CuteTcgen05MatmulPlan(_CuteTcgen05OrientationMixin):
     # with the MMA and epilogue roles after PID remapping.
     output_offsets: tuple[str, str] | None = None
     ab_load_warp_count: int = 1
+    # The K tiles the role-local pair runs (``tcgen05_two_cta_max_k_tiles`` of
+    # the operand dtype).
+    max_two_cta_k_tiles: int = TCGEN05_TWO_CTA_MAX_K_TILES
     one_shot_role_scheduler: bool = False
     # Dedicated scheduler warp count for ROLE_LOCAL_WITH_SCHEDULER. Default
     # zero keeps MONOLITHIC's historical role IDs; one adds a scheduler warp
@@ -432,6 +452,17 @@ class CuteTcgen05MatmulPlan(_CuteTcgen05OrientationMixin):
     store_warp_count: int = 0
     persistence_model: str = "static_persistent"
     cluster_n: int = 1
+    # K splits per output tile on the cluster's N lanes
+    # (``tcgen05_cluster_split_k``): 2 makes the two CTA pairs of a
+    # ``cluster_n=2`` cluster split one tile's K instead of taking two N
+    # tiles; the scheduler then counts ``cluster_split_k`` virtual N tiles
+    # per output tile.
+    cluster_split_k: int = 1
+    # ``tcgen05_fallback_cluster``: the 4-CTA cluster launches with its pair
+    # as the fallback; both bodies walk this (2, 2, 1) schedule, and a
+    # static grid launches a slot per four SMs instead of per co-resident
+    # 4-CTA cluster.
+    fallback_cluster: bool = False
     l2_swizzle_size: int = 1
     tma_store_full_tiles_only: bool = False
     # M-paired tiles: number of 256-row UMMA subtiles per work tile along M

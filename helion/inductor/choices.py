@@ -3,6 +3,7 @@ from __future__ import annotations
 import dataclasses
 import math
 from typing import TYPE_CHECKING
+from typing import Any
 from typing import cast
 
 import sympy
@@ -11,17 +12,27 @@ from torch._inductor import config as inductor_config
 from torch._inductor.choices import FusionScore
 from torch._inductor.choices import InductorChoices
 from torch._inductor.choices import Sortable
+from torch._inductor.ir import BaseView
 from torch._inductor.ir import ComputedBuffer
+from torch._inductor.ir import InputBuffer
+from torch._inductor.ir import MutableBox
 from torch._inductor.ir import Pointwise
+from torch._inductor.ir import Reduction
 from torch._inductor.ir import StorageBox
 from torch._inductor.ir import TensorBox
+from torch._inductor.runtime.hints import DeviceProperties
 from torch._inductor.scheduler import FusedMixOrderReductions
 from torch._inductor.scheduler import MixOrderReduction
+from torch._inductor.scheduler import SchedulerNode
 from torch._inductor.utils import sympy_product
 from torch._inductor.virtualized import V
 from torch.fx.operator_schemas import normalize_function
 from torch.utils._ordered_set import OrderedSet
 
+from .._compiler.backend import Backend
+from .._compiler.backend_registry import get_backend
+from .._compiler.inductor_matmul import MatmulFacts
+from .._compiler.inductor_matmul import MatmulPlan
 from . import config
 from .support import MATMUL_DTYPES
 from .support import mix_order_split
@@ -30,6 +41,7 @@ from .support import numerics_modes
 from .support import python_wrapper
 
 if TYPE_CHECKING:
+    from collections.abc import Iterator
     from collections.abc import Sequence
 
     from torch._inductor.codegen.simd_kernel_features import SIMDKernelFeatures
@@ -128,6 +140,82 @@ def contiguous_run(value: torch.Tensor, dims: Sequence[int]) -> int:
     return run
 
 
+def _backend() -> Backend | None:
+    """The backend whose kernels helion.inductor emits (config.backend), if it
+    plans matmuls (overrides Backend.inductor_matmul_plan)."""
+    backend = get_backend(config.backend)
+    if type(backend).inductor_matmul_plan is Backend.inductor_matmul_plan:
+        return None
+    return backend
+
+
+def _tf32(dtype: torch.dtype) -> bool:
+    return (
+        dtype == torch.float32 and torch.backends.cuda.matmul.fp32_precision == "tf32"
+    )
+
+
+def _facts(
+    dtype: torch.dtype,
+    device: torch.device,
+    out_dtype: torch.dtype | None = None,
+    **sizes: Any,  # noqa: ANN401
+) -> MatmulFacts:
+    props = DeviceProperties.create(device)
+    return MatmulFacts(
+        dtype=dtype,
+        out_dtype=dtype if out_dtype is None else out_dtype,
+        tf32=_tf32(dtype),
+        major=props.major,
+        sm_count=props.multi_processor_count,
+        **sizes,
+    )
+
+
+def _dot_plans(features: SIMDKernelFeatures) -> Iterator[MatmulPlan]:
+    """The backend's plan for each dot of a kernel on a GPU, with cuda_backend
+    "helion"."""
+    backend = _backend()
+    if backend is None or inductor_config.cuda_backend != "helion":
+        return
+    for node in features.node_schedule:
+        if not (
+            isinstance(node, SchedulerNode)
+            and isinstance(node.node, ComputedBuffer)
+            and node.node.get_reduction_type() == "dot"
+        ):
+            continue
+        reduction = node.node.data
+        assert isinstance(reduction, Reduction)
+        device = node.node.get_device_or_error()
+        if device.type != "cuda":
+            continue
+        facts = _facts(reduction.src_dtype, device, reduction.dtype)
+        if not backend.inductor_matmul_plan(facts).may_rewrite:
+            continue
+        size = node.node.get_size()
+        m, n = (int(dim) for dim in size[-2:])
+        (k,) = (int(dim) for dim in node.node.get_reduction_size())
+        yield backend.inductor_matmul_plan(
+            dataclasses.replace(facts, rank=len(size), m=m, n=n, k=k)
+        )
+
+
+def dot_keeps_k_loop(features: SIMDKernelFeatures) -> bool:
+    """Whether a kernel's dot keeps its loop over K however short K is
+    (MatmulPlan.keep_k_loop): K in one block is written as a stored
+    torch.mm / torch.bmm, which a backend may run on another path."""
+    return any(plan.keep_k_loop for plan in _dot_plans(features))
+
+
+def dot_reads_k_whole(features: SIMDKernelFeatures) -> bool:
+    """Whether a kernel's dot reads K as one block where Inductor's rule would
+    loop over it (MatmulPlan.whole_k)."""
+    return inductor_config.triton.persistent_reductions and any(
+        plan.whole_k for plan in _dot_plans(features)
+    )
+
+
 def static_layout(node: IRNode) -> bool:
     """Whether node's sizes are constants, as HelionKernel's tiles need
     (supports_tiling()), and for a buffer or view, its offset and the strides of
@@ -140,6 +228,24 @@ def static_layout(node: IRNode) -> bool:
         exprs += [stride for size, stride in dims if size != 1]
         exprs.append(layout.offset)
     return all(isinstance(expr, (int, sympy.Integer)) for expr in exprs)
+
+
+def storage_offset(node: IRNode) -> int:
+    """The storage offset, in elements, of the tensor a kernel receives for
+    operand `node`: its layout's offset plus that of the graph input or
+    constant it is or views, whose buffer Inductor builds at offset 0 (a
+    symbolic one by its hint, which Dynamo does not guard on)."""
+    hint = V.graph.sizevars.optimization_hint
+    offset = hint(node.get_layout().offset)
+    while isinstance(node, (MutableBox, BaseView)):
+        node = node.data
+    if isinstance(node, InputBuffer):
+        name = node.get_name()
+        if name in V.graph.constants:  # (a real tensor)
+            offset += int(V.graph.constants[name].storage_offset())
+        else:
+            offset += hint(V.graph.graph_input_storage_offsets.get(name, 0))
+    return offset
 
 
 def is_pad(node: IRNode) -> bool:
@@ -229,6 +335,127 @@ class HelionChoices(InductorChoices):
         return native
 
     @staticmethod
+    def _plan(
+        mat1: IRNode, mat2: IRNode | None = None, operands: Sequence[int] = ()
+    ) -> MatmulPlan:
+        """The backend's plan for mat1 @ mat2 (torch.bmm at rank 3). Without mat2
+        it reads mat1's dtype and device only; with it, the sizes, which
+        static_layout() proved constant, and the strides and storage offsets of
+        `operands` (0: mat1, 1: mat2), whose layouts the caller has."""
+        backend = _backend()
+        if backend is None:
+            return MatmulPlan()
+        sizes: dict[str, Any] = {}
+        if mat2 is not None:
+            *batch, m, k = (int(size) for size in mat1.get_size())
+            sizes.update(
+                rank=2 + len(batch),
+                batch=batch[0] if batch else None,
+                m=m,
+                n=int(mat2.get_size()[-1]),
+                k=k,
+            )
+            for operand in operands:
+                mat = (mat1, mat2)[operand]
+                name = "ab"[operand]
+                strides = tuple(int(stride) for stride in mat.get_layout().stride)
+                sizes[f"{name}_strides"] = strides
+                sizes[f"{name}_offset"] = storage_offset(mat)
+        facts = _facts(mat1.get_dtype(), mat1.get_device_or_error(), **sizes)
+        return backend.inductor_matmul_plan(facts)
+
+    def transpose_matmul(self, mat1: IRNode, mat2: IRNode) -> bool:
+        """Whether helion.inductor lowers mat1 @ mat2 as its transposed product
+        (lowering/mm.py, MatmulPlan.transpose). Asks use_native_matmul() first,
+        which may realize a pad operand. Inert outside cuda_backend "helion",
+        as are the other matmul questions below."""
+        if not (
+            mat1.get_device_or_error().type == "cuda"
+            and inductor_config.cuda_backend == "helion"
+            and self._plan(mat1).may_transpose
+            and self.use_native_matmul(mat1, mat2)
+        ):
+            return False
+        if mat1.maybe_get_layout() is None or mat2.maybe_get_layout() is None:
+            return False
+        return self._plan(mat1, mat2, (0, 1)).transpose
+
+    def transpose_bmm(self, mat1: IRNode, mat2: IRNode) -> bool:
+        """Whether helion.inductor lowers torch.bmm(mat1, mat2) as its transposed
+        product (lowering/mm.py, MatmulPlan.transpose)."""
+        if not self._rewritable(mat1, mat2):
+            return False
+        if mat1.maybe_get_layout() is None or mat2.maybe_get_layout() is None:
+            return False
+        if int(mat1.get_size()[0]) == 1:
+            # (one matrix is no batch, and static_layout() leaves its stride open)
+            return False
+        return self._plan(mat1, mat2, (0, 1)).transpose
+
+    def copy_matmul_b(self, mat1: IRNode, mat2: IRNode) -> bool:
+        """Whether helion.inductor lowers mat1 @ mat2 over a K-major copy of mat2
+        (lowering/mm.py, MatmulPlan.copy_b_k_major)."""
+        if not self._rewritable(mat1, mat2):
+            return False
+        if mat1.maybe_get_layout() is None or mat2.maybe_get_layout() is None:
+            return False
+        return self._plan(mat1, mat2, (0, 1)).copy_b_k_major
+
+    @staticmethod
+    def may_rewrite(mat1: IRNode) -> bool:
+        """Whether the backend may copy, stage or pad the operands of a matmul of
+        mat1, or transpose it as a bmm (MatmulPlan.may_rewrite). Reads no layout
+        and realizes nothing, so lowering/mm.py asks it before it reads a zero
+        pad's FX nodes."""
+        return (
+            mat1.get_device_or_error().type == "cuda"
+            and inductor_config.cuda_backend == "helion"
+            and HelionChoices._plan(mat1).may_rewrite
+        )
+
+    def _rewritable(self, mat1: IRNode, mat2: IRNode) -> bool:
+        """may_rewrite(), then use_native_matmul(), which may realize a pad
+        operand."""
+        return self.may_rewrite(mat1) and self.use_native_matmul(mat1, mat2)
+
+    def stage_matmul_operand(
+        self, mat1: IRNode, mat2: IRNode, operand: int
+    ) -> int | None:
+        """The row stride of an aligned copy of operand `operand` of mat1 @ mat2
+        (0: mat1, 1: mat2) that helion.inductor writes ahead of the product, or
+        None to read the operand as it is (lowering/mm.py, MatmulPlan.stage)."""
+        if not self._rewritable(mat1, mat2):
+            return None
+        if (mat1, mat2)[operand].maybe_get_layout() is None:
+            # a Pointwise not yet realized, whose strides are Inductor's to pick
+            return None
+        return self._plan(mat1, mat2, (operand,)).stage[operand]
+
+    def pad_matmul_output(
+        self, mat1: IRNode, mat2: IRNode, operand: int, *, exact: bool
+    ) -> bool:
+        """Whether helion.inductor computes mat1 @ mat2, the product of the source
+        of pad_mm's zero pad of mat1's M (operand 0) or mat2's N (operand 1),
+        into a padded output instead (lowering/mm.py, MatmulPlan.pad_output),
+        for a product it lowers as written. With `exact`, something can read
+        past the slices, so the pad holds eager's values, a reduction over the
+        other operand: declined where that operand is larger than the source,
+        which the pad kernel would copy."""
+        if not self._rewritable(mat1, mat2):
+            return False
+        source, other = (mat1, mat2)[operand], (mat1, mat2)[1 - operand]
+        if source.maybe_get_layout() is None:
+            return False
+        if exact and int(other.get_numel()) > int(source.get_numel()):
+            return False
+        return (
+            self._plan(mat1, mat2, (operand,)).pad_output[operand]
+            and self.stage_matmul_operand(mat1, mat2, 1 - operand) is None
+            and not self.transpose_matmul(mat1, mat2)
+            and not self.copy_matmul_b(mat1, mat2)
+        )
+
+    @staticmethod
     def should_use_persistent_reduction(
         features: SIMDKernelFeatures, cooperative_reduction: bool
     ) -> bool:
@@ -254,8 +481,10 @@ class HelionChoices(InductorChoices):
                     tmp0 = in0[tile_x, tile_r]
                     acc = acc + torch.sum(tmp0, -1)
 
-        A kernel with a matmul keeps Triton's rule, which loops over K, and so
-        does one with a Welford or online-softmax reduction: its loop reads each
+        A kernel with a matmul keeps Triton's rule, which loops over K, unless the
+        backend's plan keeps its K loop or reads K whole (dot_keeps_k_loop(),
+        dot_reads_k_whole()); so does a kernel with a Welford or online-softmax
+        reduction: its loop reads each
         rdim once, combining as it goes, where an rdim written as one block
         computes the mean before the variance (and the max before the sum of
         exps), so a loop over the rdim reads it twice. The first kernel of every
@@ -276,6 +505,8 @@ class HelionChoices(InductorChoices):
         keeps an rdim it cannot write as one block in a loop, whatever this says
         (names_rdim()), and so does an rdim past UNROLLED_RDIM_MAX that no
         input's full rdim names (HelionScheduling.create_kernel_choices())."""
+        if dot_keeps_k_loop(features):
+            return False
         devices = {
             device.type
             for node in features.scheduler_nodes()
@@ -307,7 +538,7 @@ class HelionChoices(InductorChoices):
                 return True
         return InductorChoices.should_use_persistent_reduction(
             features, cooperative_reduction
-        )
+        ) or dot_reads_k_whole(features)
 
     @staticmethod
     def mix_order_reductions(
@@ -527,6 +758,9 @@ class HelionChoices(InductorChoices):
 
     def uuid(self) -> None:
         # The FX graph cache key already holds what these choices read:
-        # Inductor's config (cuda_backend, triton.*), and helion.inductor.config,
-        # which helion.inductor registers with Inductor.
+        # Inductor's config (cuda_backend, triton.*), helion.inductor.config
+        # (which helion.inductor registers with Inductor; its _source_hash covers
+        # the backends' matmul rules), the device, by its name in the system
+        # info, and torch.backends.cuda.matmul.fp32_precision (Inductor's own
+        # cuda_matmul_settings).
         return None

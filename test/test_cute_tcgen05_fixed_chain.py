@@ -724,16 +724,38 @@ def test_two_cta_cluster_keeps_the_cluster_init_protocol() -> None:
     assert kernel.index("tcgen05_tmem_allocator.allocate(") < relinquish
     assert relinquish < kernel.index("tcgen05_tmem_allocator.wait_for_alloc()")
     # This CPU-mocked bind is a multi-tile persistent kernel (the SM count
-    # mock keeps it off the one-shot path), so the TMA-load role stays after
-    # the prefix wait and the teardown frees TMEM before the store drain (the
-    # two-CTA order: free, then drain); the one-shot hoist / epilogue
-    # free are covered on a real device by
+    # mock keeps it off the one-shot path).  Its TMA-load role is hoisted
+    # right after the cluster arrive and joins the rendezvous itself, once,
+    # ahead of its first tile's first stage: the producer state counts every
+    # stage the role issues across tiles, so the count is 0 only there.  The
+    # teardown repeats the guarded join for a CTA that ran no tile (only
+    # swizzle-padding slots) before its tail waits on the empty barriers;
+    # every other warp joins in the prefix.  The teardown frees TMEM before
+    # the store drain (the two-CTA order: free, then drain); the one-shot
+    # hoist / epilogue free are covered on a real device by
     # ``test_matmul_mma_tcgen05_two_cta_one_shot_prologue_teardown``.
     assert "advance_to_next_work()" in kernel
-    assert (
-        "if not tcgen05_tma_warp:\n        cutlass.pipeline.pipeline_init_wait("
-        not in kernel
+    role_join = kernel.index(
+        "            if tcgen05_ab_producer_state.count == cutlass.Int32(0):\n"
+        "                cutlass.pipeline.pipeline_init_wait("
     )
+    prefix_join = kernel.index(
+        "    if not tcgen05_tma_warp:\n        cutlass.pipeline.pipeline_init_wait("
+    )
+    tail_join = kernel.index(
+        "    if tcgen05_tma_warp:\n"
+        "        if tcgen05_ab_producer_state.count == cutlass.Int32(0):\n"
+        "            cutlass.pipeline.pipeline_init_wait("
+    )
+    assert (
+        kernel.index("cutlass.pipeline.pipeline_init_arrive(")
+        < role_join
+        < kernel.index("tcgen05_ab_pipeline.producer_acquire(")
+        < prefix_join
+        < tail_join
+        < kernel.index("tcgen05_ab_pipeline.producer_tail(")
+    )
+    assert kernel.count("cutlass.pipeline.pipeline_init_wait(") == 3
     # The one-warp prologue blocks the TMA-load warp skips (the two-CTA TMEM
     # dealloc barrier init, the pipeline inits, epilogue warp 0's store
     # descriptor prefetch) sit behind one guard ahead of the cluster arrive.

@@ -57,7 +57,11 @@ turns off every entry at once:
   the load reads are strided runs that do not overlap, and every range a
   store writes lies in one of them.  The slab is the load's region in row-major
   run order, at most ``MAX_CLUSTER_SLAB`` bytes for every entry together.
-  32-bit elements, shapes and strides static under the config, no masks.
+  32-bit elements, shapes and strides static under the config, no masks
+  but a load's padded full slice (six parts in a tile of eight: its receive
+  reads the slab where the mask holds and gives the padding lanes a masked
+  load's zero; a padded root-axis tile still fails C2, its slab spanning the
+  block).
 - C2 (the schedule, ``check_dispatch``): task lanes (``cross_loop_pipeline``
   static or dynamic, no packets); both roots resident and unguarded, without
   continuations, claimed tasks, reordered tasks or L2 grouping; the producer
@@ -738,8 +742,9 @@ def dsmem_slab_facts(
 
     facts: list[DsmemSlabFacts | None] = []
     for stores, load in graph.dsmem_candidates:
-        if _static_refusal(stores, load, root_ids) is not None:
-            facts.append(DsmemSlabFacts(numel=(), tiles=(), carried=False))
+        if (refusal := _static_refusal(stores, load, root_ids)) is not None:
+            name = load.tensor_name or f"allocation {load.allocation_id}"
+            facts.append(DsmemSlabFacts((), (), refusal=f"{name}: C1: {refusal}"))
             continue
         numel, tiles = factors(load), tuple(map(factors, stores))
         # A load of the whole allocation is replicated or not by its consumer

@@ -16,6 +16,7 @@ from .._compiler.variable_origin import TileBeginOrigin
 from .._compiler.variable_origin import TileCountOrigin
 from .._compiler.variable_origin import TileEndOrigin
 from .._compiler.variable_origin import TileIdOrigin
+from .._utils import cdiv
 from . import _decorators
 
 if TYPE_CHECKING:
@@ -64,7 +65,9 @@ def _(tile: torch.SymInt) -> torch.Tensor:
     # tiles) deferred (_disable_flatten_get_tile).
     _disable_flatten_get_tile(tile, per_element=True)
     env = CompileEnvironment.current()
-    base = torch.empty([tile], dtype=env.index_dtype, device=env.device)
+    base = torch.empty(
+        [tile], dtype=env.backend.tile_index_dtype(env.index_dtype), device=env.device
+    )
     return env.new_index_result(base, [tile])
 
 
@@ -196,23 +199,7 @@ def _(tile: torch.SymInt) -> torch.SymInt:
 @_decorators.codegen(tile_end, "common")
 def _(state: CodegenState) -> ast.AST:
     index = _disable_flatten_get_tile(state.proxy_arg(0), state)
-    offset_var = state.codegen.tile_begin_var(index)
-    block_size_var = state.device_function.block_size_var(index)
-    if block_size_var is None:
-        block_size_var = "1"
-    naive_exp = f"{offset_var} + {block_size_var}"
-    if state.codegen.mask_var(index) is not None:
-        # if masking is used, we must update the end bound of the last tile
-        end_var = (
-            state.codegen.active_device_loops[index][-1]
-            .block_id_to_info[index]
-            .end_var_name
-        )
-        assert end_var is not None
-        backend = CompileEnvironment.current().backend
-        return expr_from_string(backend.minimum_expr(naive_exp, end_var))
-    # If we don't have a mask, we can simply return the offset + block size
-    return expr_from_string(naive_exp)
+    return expr_from_string(state.codegen.tile_end_expr(index))
 
 
 @_decorators.ref(tile_end)
@@ -271,6 +258,8 @@ def _(state: CodegenState) -> ast.AST:
     index = _disable_flatten_get_tile(state.proxy_arg(0), state)
     # Use device loop metadata to compute cdiv(end - begin, block_size)
     loop_info = state.codegen.active_device_loops[index][-1].block_id_to_info[index]
+    if (count := loop_info.root_tile_count) is not None:
+        return expr_from_string(count)
     begin_var = loop_info.begin_var_name or "0"
     end_var = loop_info.end_var_name
     assert end_var is not None
@@ -284,11 +273,7 @@ def _(state: CodegenState) -> ast.AST:
 
 @_decorators.ref(tile_count)
 def _(tile: RefTile) -> int:
-    # Number of tiles covering [begin, end) at granularity block_size
-    begin = tile._slice.start
-    end = tile._slice.stop
-    bs = tile._block_size
-    return (end - begin + bs - 1) // bs
+    return cdiv(tile._extent_end - tile._extent_begin, tile._block_size)
 
 
 @_decorators.api(tiles_as_sizes=True)

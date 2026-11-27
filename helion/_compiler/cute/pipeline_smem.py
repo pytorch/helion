@@ -23,6 +23,7 @@ from .tcgen05_constants import tcgen05_ab_smem_bytes_per_cta
 from .tcgen05_constants import tcgen05_aux_ring_smem_bytes_per_cta
 from .tcgen05_constants import tcgen05_c_smem_bytes_per_cta
 from .tcgen05_constants import tcgen05_default_epilogue_tile_size
+from .tcgen05_constants import tcgen05_fixed_smem_overhead_bytes
 from .tcgen05_constants import tcgen05_rowvec_stage_smem_bytes
 
 if TYPE_CHECKING:
@@ -39,6 +40,37 @@ if TYPE_CHECKING:
 TCGEN05_CTA_GROUP_CONFIG_KEY = "tcgen05_cta_group"
 TCGEN05_CTA_GROUP_CHOICES = ("auto", "two")
 TCGEN05_SMEM_AWARE_MAX_AB_STAGES = 16
+# A CTA pair's ring may go one stage deeper, to 17: the 128x64 bf16 pair (12 KB
+# per stage, 64 A rows and 32 B rows per CTA) then fills shared memory beside
+# its two 8 KB C stages (17 * 12 + 16 KB of 227), as CUTLASS's own stage count
+# (shared memory left after the epilogue, divided by the stage) does.  Its
+# one-wave K loop is bound by bytes in flight per CTA (~12 stages in flight at
+# ~900 ns from issue to data), so the extra stage streams faster.  GB300, bf16,
+# in one process against cuBLAS, the same config at 16 and 17 stages:
+# 1500x384x1536 0.990-0.993 -> 0.995-0.998, 1000x512x2880 1.000-1.006 ->
+# 1.013-1.020, 768x768x8192 CR 0.947-0.956 -> 0.954-0.966, 768x768x2048 CR
+# 0.958-0.968 -> 0.964-0.974, 1024x512x4096 CR 0.970-0.971 -> 0.973-0.976,
+# 512x1000x1280 (transposed) 0.975 -> 0.976-0.978.  The cap applies to the
+# dense pair's own ring (``paired_pipeline_max_ab_stages``) with 16-bit
+# operands and a plain epilogue, where it was measured; fp8 pairs, epilogues
+# with staged rows or auxiliary loads, the one-CTA family, the ordered region
+# chains and the split-K workspace keep 16.  Smaller pairs than 128x64
+# would fit deeper rings, unmeasured, so the cap is that tile's fill.
+TCGEN05_PAIRED_MAX_AB_STAGES = 17
+
+
+def paired_pipeline_max_ab_stages(facts: Tcgen05PipelineSmemFacts) -> int:
+    """The ring cap of a dense CTA pair's AB pipeline:
+    ``TCGEN05_PAIRED_MAX_AB_STAGES`` for 16-bit operands under a plain
+    epilogue (no staged rows, no auxiliary loads: the measured case), else
+    ``TCGEN05_SMEM_AWARE_MAX_AB_STAGES``."""
+    return (
+        TCGEN05_PAIRED_MAX_AB_STAGES
+        if facts.input_dtype_bytes == 2
+        and not facts.rows
+        and not facts.has_auxiliary_loads
+        else TCGEN05_SMEM_AWARE_MAX_AB_STAGES
+    )
 
 
 def tcgen05_bookkeeping_smem_bytes(*, ab_stages: int, acc_stages: int) -> int:
@@ -309,6 +341,7 @@ def pipeline_smem_bytes(
     aux_stages: int = TCGEN05_AUX_STAGE_COUNT_DEFAULT,
     epi_warp_groups: int = 1,
     epi_subtile_n: int | None = None,
+    plain_layout: bool = False,
 ) -> int:
     """Upper-bound the allocations for the static CtaGroup.TWO schedule.
 
@@ -328,13 +361,23 @@ def pipeline_smem_bytes(
     (128, 32) subtile of a plain 16-bit store on static full tiles (or the
     aligned-N physical tile with a partial last M tile), which the paired
     caller resolves (the staged aux rings keep the plan's
-    with-source subtile, as ``cute_mma`` sizes them).
+    with-source subtile, as ``cute_mma`` sizes them). ``plain_layout``: the
+    caller proved the plain schedule (a 16-bit 256-row pair storing its
+    accumulator alone, nothing beside the AB and C rings), whose arena is
+    priced as ptxas lays its allocations out
+    (``tcgen05_fixed_smem_overhead_bytes``, measured from the cubins)
+    rather than with the flat reserve. ``bm=512`` is the M-paired tile: two
+    256-row subtiles, each CTA staging an A ring per subtile beside the one
+    B ring, its epilogue draining both subtiles through the 256-row pair's
+    C ring:
+
+        tcgen05_msub_smem_a = cute.arch.alloc_smem(cutlass.BFloat16, cute.cosize(sA_layout.outer), alignment=128)
     """
     from cutlass.utils.blackwell_helpers import compute_epilogue_tile_size
 
     # Non-power-of-two N widths are the aligned-N family's physical tiles.
     assert bn in (64, 128, 256) or (bn % 16 == 0 and 64 < bn < 256)
-    assert bm in (128, 256) and bk in (64, 128, 256)
+    assert bm in (128, 256, 512) and bk in (64, 128, 256)
     assert facts.input_dtype_bytes in (1, 2)
     assert facts.output_dtype_bytes in (2, 4)
     assert ab_stages > 0 and c_stages in (2, 4) and acc_stages in (1, 2)
@@ -342,7 +385,7 @@ def pipeline_smem_bytes(
     two_cta_m128 = bm == 128
     output_width = facts.output_dtype_bytes * 8
     epi_m, epi_n = compute_epilogue_tile_size(
-        bm // 2 if two_cta_m128 else bm,
+        bm // 2 if two_cta_m128 else min(bm, 256),
         bn,
         two_cta_m128,
         output_width,
@@ -389,6 +432,18 @@ def pipeline_smem_bytes(
         if aux_load_mode in TCGEN05_AUX_LOAD_MODES_STAGED
         else 0
     )
+    if plain_layout:
+        # bf16 256x224x64 pair, seven AB stages, two (128, 32) C stages:
+        # 16 384 (C ring) + 128 (AB barriers) + 215 040 (AB ring) + 44
+        # (acc barriers, TMEM cells) = 231 596 B of the 232 448 opt-in,
+        # where the flat reserve prices 233 616 and refuses the stage.
+        return (
+            ab_bytes
+            + c_bytes
+            + tcgen05_fixed_smem_overhead_bytes(
+                ab_stages=ab_stages, acc_stages=acc_stages, cluster_m=2
+            )
+        )
     return (
         ab_bytes
         + c_bytes
@@ -534,10 +589,13 @@ class SmemArena:
         aux_stages: int = TCGEN05_AUX_STAGE_COUNT_DEFAULT,
         epi_warp_groups: int = 1,
         epi_subtile_n: int | None = None,
+        exchange_bytes: int = 0,
     ) -> int:
-        """Bytes of the launch's rings under this arena's byte model."""
+        """Bytes of the launch's rings under this arena's byte model, plus
+        ``exchange_bytes`` of allocations beside them (a K-split cluster's
+        partial exchange, ``tcgen05_cluster_split_k_exchange_smem_bytes``)."""
         if self.cluster_m == 1:
-            return one_cta_pipeline_smem_bytes(
+            return exchange_bytes + one_cta_pipeline_smem_bytes(
                 self.facts,
                 bm=bm,
                 bn=bn,
@@ -550,7 +608,7 @@ class SmemArena:
                 epi_warp_groups=epi_warp_groups,
                 epi_subtile_n=epi_subtile_n,
             )
-        return pipeline_smem_bytes(
+        return exchange_bytes + pipeline_smem_bytes(
             self.facts,
             bm=bm,
             bn=bn,
@@ -583,6 +641,7 @@ class SmemArena:
         aux_stages: int = TCGEN05_AUX_STAGE_COUNT_DEFAULT,
         epi_warp_groups: int = 1,
         epi_subtile_n: int | None = None,
+        exchange_bytes: int = 0,
     ) -> int:
         """Deepest AB ring in ``1..max_stages`` that fits the capacity, else 0.
 
@@ -604,6 +663,7 @@ class SmemArena:
                 aux_stages=aux_stages,
                 epi_warp_groups=epi_warp_groups,
                 epi_subtile_n=epi_subtile_n,
+                exchange_bytes=exchange_bytes,
             ),
             self.facts.capacity_bytes,
             max_stages=max_stages,
@@ -627,6 +687,7 @@ def max_pipeline_ab_stages(
     aux_stages: int = TCGEN05_AUX_STAGE_COUNT_DEFAULT,
     epi_warp_groups: int = 1,
     epi_subtile_n: int | None = None,
+    exchange_bytes: int = 0,
 ) -> int:
     """Fill shared memory without changing the epilogue or accumulator ring.
 
@@ -647,6 +708,7 @@ def max_pipeline_ab_stages(
         aux_stages=aux_stages,
         epi_warp_groups=epi_warp_groups,
         epi_subtile_n=epi_subtile_n,
+        exchange_bytes=exchange_bytes,
     )
 
 

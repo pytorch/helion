@@ -96,9 +96,12 @@ def my_kernel(x: torch.Tensor) -> torch.Tensor:
 
 .. autoattribute:: Settings.index_dtype
 
-   The data type used for index variables in generated code. By default Helion auto-selects
-   between ``torch.int32`` and ``torch.int64`` based on whether any input tensor exceeds
-   ``torch.iinfo(torch.int32).max`` elements. Override via ``HELION_INDEX_DTYPE=<dtype>``
+   The data type used for index variables in generated code. By default Helion uses
+   ``torch.int64`` when an input tensor's element count or any individual dimension
+   exceeds ``torch.iinfo(torch.int32).max``. An empty tensor's dimensions still count:
+   its size can supply an independent grid axis. An explicitly narrow index type
+   still rejects excess elements, but an empty input keeps the selected storage
+   index type and can supply a wider grid coordinate. Override via ``HELION_INDEX_DTYPE=<dtype>``
    (or set it to ``auto`` to keep the automatic behavior).
 
 .. autoattribute:: Settings.dot_precision
@@ -211,6 +214,42 @@ def my_kernel(x: torch.Tensor) -> torch.Tensor:
    math (flush-to-zero exp, fast online softmax, etc.). May reduce numerical precision and change
    NaN/Inf behavior. Default is ``False``.
    Controlled by ``HELION_FAST_MATH=1``.
+
+.. autoattribute:: Settings.split_k_reduction
+
+   The split-K reductions the compiler may introduce into a dot's K loop, where several
+   CTAs each compute part of K and their partial products meet through memory. A new,
+   additive setting: its default, ``"accumulator"``, keeps the behavior from before it
+   existed.
+
+   - ``"accumulator"`` (default): split-K is searched; the partials are summed in the
+     accumulator dtype (fp32 for floating-point dots).
+   - ``"output"``: as ``"accumulator"``, and a dot with a 16-bit (``bfloat16`` or ``float16``)
+     output may also keep or exchange its partials rounded to that dtype, where a split-K form
+     offers it; the sum itself stays fp32. On the CuTe backend this offers
+     ``tcgen05_split_k_exchange="output"`` on the 4-CTA cluster split (``tcgen05_split_k=2``
+     with ``tcgen05_cluster_m=2, tcgen05_cluster_n=2``): each CTA pair sends its partner the
+     half of the tile it does not store as packed 16-bit values, and the receiver adds them to
+     its own fp32 partials; and ``cute_split_k_partials="output"`` on the split-K workspace
+     schedule over a plain GEMM store: the producer writes each partition's partials rounded
+     to the output dtype, and the reducer widens them to fp32 for the same sum.
+   - ``"none"``: no split-K. The search, the compiler seeds and the defaults offer none, and a
+     config that asks for one is refused (or, while autotuning, repaired to the unsplit loop):
+     on the CuTe backend ``tcgen05_split_k`` and the split-K workspace schedule
+     (``cute_split_k_workspace`` over a plain GEMM store).
+
+   ``torch.compile`` with ``cuda_backend="helion"`` sets it on every generated kernel with a
+   dot of 16-bit operands from ``torch.backends.cuda.matmul``'s reduced-precision flags for
+   that dtype (``allow_bf16_reduced_precision_reduction`` and
+   ``allow_bf16_reduced_precision_reduction_split_k``, or the ``fp16`` pair), as cuBLASLt
+   reads them for the operand type: both ``True`` gives ``"output"``, a ``False``
+   reduced-precision flag gives ``"accumulator"``, and a ``False`` split-K flag gives
+   ``"none"``. Warps of one CTA sharing a K loop (their partials summed in fp32 inside the
+   CTA, as cuBLASLt's no-split-K scheme still slices K inside a threadblock), and a kernel
+   that splits K itself (``hl.atomic_add`` of partial products), keep their reductions.
+   Controlled by ``HELION_SPLIT_K_REDUCTION=accumulator|output|none``, except in the kernels
+   ``torch.compile`` generates with a 16-bit dot, where the value from torch's flags takes
+   precedence.
 
 .. autoattribute:: Settings.cute_flash_env_overrides
 
@@ -392,7 +431,7 @@ def my_kernel(x: torch.Tensor) -> torch.Tensor:
 
 .. autoattribute:: Settings.autotune_ignore_errors
 
-   Continue autotuning even when candidate configurations raise recoverable runtime errors (for example, GPU out-of-memory). Default is ``False``. Controlled by ``HELION_AUTOTUNE_IGNORE_ERRORS``.
+   Continue autotuning even when candidate configurations raise recoverable runtime errors (for example, GPU out-of-memory). If an in-process candidate encounters an unrecoverable device error, such as a CUDA assertion or illegal memory access, the search raises ``helion.exc.TritonUnrecoverableRuntimeError`` even when this option is enabled. This applies to Triton and CuTe: the device context cannot safely run another candidate. Default is ``False``. Controlled by ``HELION_AUTOTUNE_IGNORE_ERRORS``.
 
 .. autoattribute:: Settings.autotune_accuracy_check
 
@@ -575,6 +614,7 @@ Built-in values for ``HELION_AUTOTUNER`` include ``"LFBOTreeSearch"`` (default),
 | ``HELION_INDEX_DTYPE`` | ``index_dtype`` | Choose the index dtype (accepts any ``torch.<dtype>`` name, e.g. ``int64``), or set to ``auto``/unset to allow Helion to pick ``int32`` vs ``int64`` based on input sizes. |
 | ``HELION_STATIC_SHAPES`` | ``static_shapes`` | Set to ``0``/``false`` to disable global static shape specialization. |
 | ``HELION_FAST_MATH`` | ``fast_math`` | Set to ``1`` to enable fast math approximations (Helion-level and Inductor-level). May reduce numerical precision and change NaN/Inf behavior. |
+| ``HELION_SPLIT_K_REDUCTION`` | ``split_k_reduction`` | ``accumulator`` (default) allows split-K with partials summed in the accumulator dtype, ``output`` also lets a 16-bit output's partials be kept or exchanged in its dtype, ``none`` disables split-K. |
 | ``HELION_PERSISTENT_RESERVED_SMS`` | ``persistent_reserved_sms`` | Reserve this many streaming multiprocessors when launching persistent kernels (``0`` uses all available SMs). |
 | ``HELION_FORCE_AUTOTUNE`` | ``force_autotune`` | Force the autotuner to run even when explicit configs are provided. The result is saved to the cache. |
 | ``HELION_AUTOTUNE_FORCE_PERSISTENT`` | ``autotune_force_persistent`` | Restrict ``pid_type`` to persistent kernel strategies during config search. |
@@ -617,7 +657,7 @@ Built-in values for ``HELION_AUTOTUNER`` include ``"LFBOTreeSearch"`` (default),
 | ``HELION_ASSERT_CACHE_HIT`` | ``AutotuneCacheBase`` | When set to ``1``, require a cache hit; raises ``CacheAssertionError`` on cache miss with detailed diagnostics. |
 | ``HELION_AUTOTUNE_CACHE`` | ``autotune_cache`` | Cache class to use (``"LocalAutotuneCache"`` (default), ``"StrictLocalAutotuneCache"``, ``"RemoteAutotuneCache"``, ``"StrictRemoteAutotuneCache"``, ``"AOTAutotuneCache"``). |
 | ``HELION_REMOTE_CACHE_BACKEND`` | (used by ``RemoteAutotuneCache`` and warm-start) | Fully-qualified class path to a ``RemoteCacheBackend`` subclass (e.g. ``mypackage.cache.RedisBackend``); enables remote read-through/write-through caching and, when the backend overrides ``list()``, remote warm-start lookups for ``from_best_available`` / ``helion.from_cache``. |
-| ``HELION_BENCHMARK_CUDAGRAPH`` | (benchmarking) | Wrap ``run_example``'s timing loop in CUDA-graph capture/replay so launch overhead is amortized for both helion and the torch baseline. Defaults on inside ``run_example``, off elsewhere. Set ``0`` to opt out; ``1`` to enable globally. Capture silently falls back to non-CG if unavailable (HIP, no CUDA, nested capture). Note: ``=1`` globally also applies during autotune, which is counterproductive — each of thousands of configs triggers a fresh capture (warmup + sync per config, no reuse across configs since launch parameters differ), captured graphs accumulate memory pool allocations, and many configs raise on capture due to shape/stride differences across the search space. Prefer leaving unset (default off in autotune, on in ``run_example``). When it is on, kernels whose single replay takes under 64 us are timed as one captured graph holding several flushed calls minus a graph of the same flushes, because a lone replay carries the graph launch latency (4-6 us on B200, in ~2 us steps) and would read the same value for every short kernel. |
+| ``HELION_BENCHMARK_CUDAGRAPH`` | (benchmarking) | Wrap ``run_example``'s timing loop in CUDA-graph capture/replay so launch overhead is amortized for both helion and the torch baseline. Unset, it is on inside ``run_example``; autotuning then times calls eagerly, except a call that launches several kernels (CuTe's split-K workspace schedule and materialized fission modules), which the search's trace timer and the per-call kernel timer read as a replay of one captured graph, on the scale of its one-kernel rivals' eager calls (the event timers and a benchmark prelude keep it eager). Set ``0`` to opt out of both; ``1`` to enable globally. Capture silently falls back to non-CG if unavailable (HIP, no CUDA, nested capture). Note: ``=1`` globally also applies during autotune, which is counterproductive — each of thousands of configs triggers a fresh capture (warmup + sync per config, no reuse across configs since launch parameters differ), captured graphs accumulate memory pool allocations, and many configs raise on capture due to shape/stride differences across the search space. Prefer leaving unset (default off in autotune but for those multi-launch calls, on in ``run_example``). When it is on, kernels whose single replay takes under 64 us are timed as one captured graph holding several flushed calls minus a graph of the same flushes, because a lone replay carries the graph launch latency (4-6 us on B200, in ~2 us steps) and would read the same value for every short kernel. |
 | ``HELION_BENCHMARK_GRAPH_WARMUP`` | (benchmarking) | Before the first CUDA graph a benchmark captures, drive the process into its steady graph-dispatch state (16 eager launches on side streams, kept alive; ``steady_graph_dispatch``). A fresh process replays graphs with shorter inter-kernel gaps until it has launched about ten kernels on non-default streams, then every graph of the process replays slower for its lifetime, so without the warm-up the first candidates are ranked in one state and the rest in another. Runs once per device per process; a warm-up that cannot run is skipped (and retried at the next capture), never fatal. Defaults on; set ``0`` to measure the fast state itself (the example catalogue drivers pass this variable through to their workers). Any other value logs a warning and keeps the default. |
 | ``HELION_PRINT_OUTPUT_CODE`` | ``print_output_code`` | Print generated code to stderr for inspection. |
 | ``HELION_PRINT_REPRO`` | ``print_repro`` | Print Helion kernel code, config, and caller code to stderr as a standalone repro script. |

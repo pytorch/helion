@@ -6,12 +6,41 @@ reads their code and MSL; the affine weights' kernel is
 
 from __future__ import annotations
 
+import contextlib
+from typing import TYPE_CHECKING
+from unittest import mock
+
 import torch
 
 import helion
+from helion._compiler.metal import mpp_registers
 import helion.language as hl
 
+if TYPE_CHECKING:
+    from collections.abc import Iterator
+
+    from .._compiler.metal.mpp_matmul import Graphs
+    from .._compiler.metal.mpp_matmul import MppGroup
+    from .._compiler.metal.mpp_matmul import MppPlan
+
 F32 = torch.float32
+
+
+@contextlib.contextmanager
+def unread_x() -> Iterator[None]:
+    """Leave every group's left operand unmarked for registers
+    (``check_register_operands``), as for a widened x that loads a tensor the
+    kernel writes."""
+    check = mpp_registers.RegisterLowering.check_group
+
+    def check_group(group: MppGroup, plan: MppPlan, graphs: Graphs) -> None:
+        check(group, plan, graphs)
+        group.lhs.registers = False
+
+    with mock.patch.object(
+        mpp_registers.RegisterLowering, "check_group", staticmethod(check_group)
+    ):
+        yield
 
 
 def register_config(
@@ -38,6 +67,100 @@ def inner_tiled_mm(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
                 acc = torch.addmm(acc, x[tm, tk] * 2, y[tk, tn])
             out[tm, tn] = acc
     return out
+
+
+@helion.kernel(backend="metal", static_shapes=True)
+def inner_tiled_weight_mm(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    """x @ (y / 2) with M and N tiled in a loop of a one-program grid, x a
+    half view and the weight computed: the thread axes codegen sees at the
+    accumulator aren't the launch's."""
+    m, k = x.size()
+    _, n = y.size()
+    out = torch.empty([m, n], dtype=F32, device=x.device)
+    for _g in hl.grid(1):
+        for tm, tn in hl.tile([m, n]):
+            acc = hl.zeros([tm, tn], dtype=F32)
+            for tk in hl.tile(k):
+                acc = torch.addmm(acc, x[tm, tk], (y[tk, tn] * 0.5).to(x.dtype))
+            out[tm, tn] = acc
+    return out
+
+
+@helion.kernel(backend="metal", static_shapes=True)
+def shifted_x_mm(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    """x[8:] @ (y / 2) for x of 8 rows more than the output: x's view starts
+    8 rows past its tile's offset."""
+    m = x.size(0) - 8
+    k = x.size(1)
+    _, n = y.size()
+    out = torch.empty([m, n], dtype=F32, device=x.device)
+    for tile_m, tile_n in hl.tile([m, n]):
+        acc = hl.zeros([tile_m, tile_n], dtype=F32)
+        for tile_k in hl.tile(k):
+            xs = hl.load(x, [tile_m.index + 8, tile_k.index])
+            acc = torch.addmm(acc, xs, (y[tile_k, tile_n] * 0.5).to(x.dtype))
+        out[tile_m, tile_n] = acc
+    return out
+
+
+@helion.kernel(backend="metal", static_shapes=True)
+def offset_k_mm(x: torch.Tensor, y: torch.Tensor, k0: int) -> torch.Tensor:
+    """x[:, k0 : k0 + 128] @ (y[k0 : k0 + 128] / 2): a K loop whose begin is
+    a run-time value and whose extent is 128."""
+    m = x.size(0)
+    _, n = y.size()
+    out = torch.empty([m, n], dtype=F32, device=x.device)
+    for tile_m, tile_n in hl.tile([m, n]):
+        acc = hl.zeros([tile_m, tile_n], dtype=F32)
+        for tile_k in hl.tile(k0, k0 + 128):
+            acc = torch.addmm(
+                acc, x[tile_m, tile_k], (y[tile_k, tile_n] * 0.5).to(x.dtype)
+            )
+        out[tile_m, tile_n] = acc
+    return out
+
+
+@helion.kernel(backend="metal", static_shapes=True)
+def long_k_mm(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    """x @ (y / 2) over y's K, x's K dim shorter than the loop: x's view
+    reads past its tensor's K, where the staged op's view zero-fills."""
+    m = x.size(0)
+    k, n = y.size()
+    out = torch.empty([m, n], dtype=F32, device=x.device)
+    for tile_m, tile_n in hl.tile([m, n]):
+        acc = hl.zeros([tile_m, tile_n], dtype=F32)
+        for tile_k in hl.tile(k):
+            acc = torch.addmm(
+                acc, x[tile_m, tile_k], (y[tile_k, tile_n] * 0.5).to(x.dtype)
+            )
+        out[tile_m, tile_n] = acc
+    return out
+
+
+@helion.kernel(backend="metal", static_shapes=True)
+def staged_apart_mm(
+    x: torch.Tensor, y: torch.Tensor, z: torch.Tensor, v: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """(x @ (y / 2)) * s and x @ (z / 4) stored apart from one K loop, s a
+    row vector summed over v's rows: the first's staged vector keeps it on
+    the staged op."""
+    m, k = x.size()
+    _, n = y.size()
+    out_a = torch.empty([m, n], dtype=F32, device=x.device)
+    out_b = torch.empty([m, n], dtype=F32, device=x.device)
+    for tile_m, tile_n in hl.tile([m, n]):
+        s = hl.zeros([tile_n], dtype=F32)
+        for r in hl.grid(v.size(0)):
+            s = s + v[r, tile_n]
+        a = hl.zeros([tile_m, tile_n], dtype=F32)
+        b = hl.zeros([tile_m, tile_n], dtype=F32)
+        for tile_k in hl.tile(k):
+            xs = x[tile_m, tile_k]
+            a = torch.addmm(a, xs, (y[tile_k, tile_n] * 0.5).to(x.dtype))
+            b = torch.addmm(b, xs, (z[tile_k, tile_n] * 0.25).to(x.dtype))
+        out_a[tile_m, tile_n] = a * s[None, :]
+        out_b[tile_m, tile_n] = b
+    return out_a, out_b
 
 
 @helion.kernel(backend="metal", static_shapes=True)
@@ -211,9 +334,10 @@ def dequant_forms_mm(
     form: hl.constexpr,
 ) -> torch.Tensor:
     """x @ W.T for 4-bit codes in int16 words (``metal_fragment.affine_mm``'s
-    format, groups of 32) dequantized four ways (``form``): ``promoted``,
+    format, groups of 32) dequantized five ways (``form``): ``promoted``,
     its fp16 scale and bias promoted by the float32 codes; ``half``, all of
-    it in fp16, the weight already half; ``bf16_product``, the product
+    it in fp16, the weight already half; ``bfloat``, all of it in bf16
+    beside a bf16 x; ``bf16_product``, the product
     rounded to bf16; ``negative_group``, the group index ``k // -32 + 9``,
     which isn't constant over an aligned tile."""
     m, k = x.size()
@@ -231,6 +355,10 @@ def dequant_forms_mm(
             if form == "half":
                 deq = q.to(torch.float16) * scales[tile_n, grp] + biases[tile_n, grp]
                 acc = torch.addmm(acc, x[tile_m, tile_k], deq.T)
+            elif form == "bfloat":
+                bf = torch.bfloat16
+                deq = q.to(bf) * scales[tile_n, grp].to(bf) + biases[tile_n, grp].to(bf)
+                acc = torch.addmm(acc, x[tile_m, tile_k], deq.T)
             else:
                 if form == "bf16_product":
                     deq = (
@@ -244,15 +372,21 @@ def dequant_forms_mm(
 
 
 def dequant_reference(
-    x: torch.Tensor, w: torch.Tensor, scales: torch.Tensor, biases: torch.Tensor
+    x: torch.Tensor,
+    w: torch.Tensor,
+    scales: torch.Tensor,
+    biases: torch.Tensor,
+    weight: torch.dtype = torch.float64,
 ) -> torch.Tensor:
-    """:func:`dequant_forms_mm`'s ``promoted`` form in float64 on the CPU."""
+    """:func:`dequant_forms_mm` in float64 on the CPU, the weight dequantized
+    in ``weight``: its ``promoted`` form's float64, its ``half`` form's
+    ``torch.float16``."""
     x, w, scales, biases = (t.cpu() for t in (x, w, scales, biases))
     bit = torch.arange(x.size(1)) * 4
     codes = ((w.to(torch.int64) & 0xFFFF)[:, bit // 16] >> (bit % 16)) & 15
     grp = torch.arange(x.size(1)) // 32
-    deq = codes.double() * scales.double()[:, grp] + biases.double()[:, grp]
-    return x.double() @ deq.T
+    deq = codes.to(weight) * scales.to(weight)[:, grp] + biases.to(weight)[:, grp]
+    return x.double() @ deq.double().T
 
 
 @helion.kernel(backend="metal", static_shapes=True)

@@ -43,6 +43,7 @@ from ..inductor_lowering import size1_reduction_positions
 from ..variable_origin import GridOrigin
 from ..variable_origin import TileBeginOrigin
 from ..variable_origin import TileEndOrigin
+from ..variable_origin import TileExtentOrigin
 from ..variable_origin import TileIdOrigin
 from .dead_zero_atomics import dead_zero_atomic_results
 from .fragment_domain import OwnershipMask
@@ -53,6 +54,7 @@ from .fragment_domain import render_ownership
 from .fragment_storage import aligned_shared_bytes
 from .fragment_storage import configured_fragment_expr
 from .fragment_storage import metadata_guarded
+from .handler_ops import integer_to_float_expr
 from .local_atomic_registers import MAX_SLOTS
 from .local_atomic_registers import local_atomic_register_chains
 from .private_scalar_loops import private_scalar_loop_nodes
@@ -60,6 +62,10 @@ from .register_snapshots import SnapshotBinding
 from .register_snapshots import SnapshotOwner
 from .register_snapshots import snapshot_chains
 from .register_snapshots import snapshot_logical_shape
+from .scalar_fragment_assertion import check_literal_assignment
+from .scalar_fragment_assertion import checked_predicate_wide
+from .scalar_fragment_assertion import checked_scalar_wide
+from .scalar_fragment_assertion import requires_assertion_owner
 from .selection.ordered_selection import is_ordered_selection
 from .selection.ordered_selection import ordered_selection_args
 from .warp_results import warp_result_chain
@@ -71,6 +77,7 @@ if TYPE_CHECKING:
     from collections.abc import Mapping
     from collections.abc import Sequence
 
+    from ..device_function import SymbolArgument
     from ..device_ir import GraphInfo
     from ..generate_ast import GenerateAST
     from .atomic_consumer_fusion import AtomicConsumerRegion
@@ -480,6 +487,13 @@ class FragmentContext:
         self.env = CompileEnvironment.current()
         self.offsets: dict[int, str] = {}
         self.bounds: dict[int, str] = {}
+        # Nested loops may reuse a block ID. Key each interval by its induction variable.
+        self.tile_intervals: dict[str, tuple[int, int]] = {}
+        self.stride_operands: dict[str, tuple[str, str, str]] = {}
+        self.host_step_statements: list[ast.stmt] = []
+        self.host_step_arguments: list[SymbolArgument] = []
+        self.checked_domains: dict[str, range] = {}
+        self.checked_root = requires_assertion_owner(self.env.config_spec)
         self.allocator = ""
         self.smem_bytes = 0
         self.buffers: list[tuple[str, torch.dtype, int]] = []
@@ -682,6 +696,48 @@ class FragmentContext:
             )
         return resolved
 
+    def record_tile_interval(self, bid: int, begin: object, end: object) -> None:
+        if not isinstance(begin, (int, torch.SymInt, sympy.Expr)) or not isinstance(
+            end, (int, torch.SymInt, sympy.Expr)
+        ):
+            return
+        start, stop = self.static_extent(begin), self.static_extent(end)
+        if start is not None and stop is not None:
+            self.tile_intervals[self.offsets[bid]] = (start, stop)
+
+    def _native_tile_bounds(self, block: int) -> bool:
+        """All tile offsets, padded lanes, and remaining distances fit Int32."""
+        interval = self.tile_intervals.get(self.offsets[block])
+        width = self.df.resolved_block_size(block)
+        if interval is None or not isinstance(width, int):
+            return False
+        lo, hi = interval
+        return -(2**31) <= lo <= hi <= 2**31 - width and hi - lo < 2**31
+
+    def tile_lane_predicate(self, block: int) -> Callable[[str], str]:
+        """Capture the lexical tile: inner loops may reuse its registered block ID."""
+        offset, end = self.offsets[block], self.bounds[block]
+        if self._native_tile_bounds(block):
+            return lambda coord: f"(({offset}) + ({coord}) < ({end}))"
+        # A padded lane may overflow even Int64 near the signed limit.
+        wide = f"cutlass.Int64({offset})"
+
+        def predicate(coord: str) -> str:
+            lane = f"cutlass.Int64({coord})"
+            return f"(({wide}) <= {2**63 - 1} - ({lane}) and ({wide}) + ({lane}) < ({end}))"
+
+        return predicate
+
+    def tile_live_extent(self, block: int, capacity: int) -> str:
+        offset, end = self.offsets[block], self.bounds[block]
+        if self._native_tile_bounds(block):
+            return f"min({capacity}, ({end}) - ({offset}))"
+        # Clamp the end to [offset, saturating_add(offset, capacity)]
+        # before subtraction: a signed interval can span more than INT64_MAX.
+        lo, hi = f"cutlass.Int64({offset})", f"cutlass.Int64({end})"
+        limit = f"(min({lo}, {2**63 - 1 - capacity}) + {capacity})"
+        return f"(max({lo}, min({hi}, {limit})) - {lo})"
+
     def static_extent(self, value: object) -> int | None:
         if isinstance(value, int):
             return value
@@ -695,9 +751,11 @@ class FragmentContext:
     def shape(self, shape: object) -> tuple[int, ...]:
         return tuple(self.extent(x) for x in cast("tuple[object, ...]", shape))
 
-    def sym(self, value: object) -> str:
+    def sym(self, value: object, *, wide: bool = False) -> str:
         if isinstance(value, str):
             return value
+        if self.checked_root and isinstance(value, torch.SymBool):
+            wide |= checked_predicate_wide(self, value._sympy_())
         if isinstance(value, (torch.SymInt, torch.SymFloat, torch.SymBool)):
             value = value._sympy_()
         if isinstance(value, sympy.Basic):
@@ -705,21 +763,38 @@ class FragmentContext:
 
             def symbol_expression(symbol: sympy.Symbol) -> str:
                 if symbol in self.sym_indices:
-                    return self.sym_indices[symbol]
+                    scalar = self.sym_indices[symbol]
+                    return f"cutlass.Int64({scalar})" if wide else scalar
                 origin_info = HostFunction.current().expr_to_origin.get(symbol)
                 origin = origin_info.origin if origin_info is not None else None
                 if isinstance(origin, GridOrigin) and origin.block_id in self.offsets:
                     offset = self.offsets[origin.block_id]
+                    # The loop counter may be narrower than the index dtype
+                    # selected for this expression.
+                    if wide or self.env.index_dtype == torch.int64:
+                        offset = f"cutlass.Int64({offset})"
                     size = self.df.resolved_block_size(origin.block_id)
+                    if isinstance(origin, TileExtentOrigin):
+                        # Nested fragment loops own their lexical end. A partial
+                        # tile contributes only the lanes before that end.
+                        return self.tile_live_extent(
+                            origin.block_id,
+                            self.extent(self.env.block_sizes[origin.block_id].var),
+                        )
                     if isinstance(origin, TileIdOrigin):
                         return f"({offset}) // {size}"
                     if isinstance(origin, TileEndOrigin):
-                        return (
-                            f"min(({offset}) + {size}, {self.bounds[origin.block_id]})"
+                        if self._native_tile_bounds(origin.block_id):
+                            return f"min(({offset}) + {size}, {self.bounds[origin.block_id]})"
+                        extent = self.tile_live_extent(
+                            origin.block_id,
+                            self.extent(self.env.block_sizes[origin.block_id].var),
                         )
+                        return f"(cutlass.Int64({offset}) + ({extent}))"
                     if type(origin) in (GridOrigin, TileBeginOrigin):
                         return offset
-                return self.df.literal_expr(symbol)
+                scalar = self.df.literal_expr(symbol)
+                return f"cutlass.Int64({scalar})" if wide else scalar
 
             substitutions = {
                 symbol: sympy.Symbol(f"({symbol_expression(symbol)})")
@@ -728,11 +803,47 @@ class FragmentContext:
             return self.env.backend.sympy_printer_expr(value.xreplace(substitutions))
         return self.df.literal_expr(value)
 
-    def scalar(self, value: object) -> str:
+    def scalar(self, value: object, *, wide: bool = False) -> str:
         if isinstance(value, Fragment):
             assert math.prod(value.shape) == 1
             return value.read(tuple("0" for _ in value.shape))
-        return self.sym(value)
+        return self.sym(value, wide=wide)
+
+    def value_scalar(
+        self,
+        value: object,
+        tensor_dtypes: tuple[torch.dtype, ...] = (),
+        *,
+        assignment_dtype: torch.dtype | None = None,
+    ) -> str:
+        """Render a value separately from an address or a loop header."""
+        if self.checked_root and assignment_dtype is not None:
+            if isinstance(value, (int, float)):
+                check_literal_assignment(value, assignment_dtype)
+            elif isinstance(value, torch.SymFloat):
+                # A binding hint does not guard later calls; a Python float
+                # kernel argument may even round before the device sees it.
+                raise exc.BackendUnsupported(
+                    "cute",
+                    f"a checked symbolic float assignment not proved to fit {assignment_dtype}",
+                )
+        if self.checked_root and isinstance(value, torch.SymFloat):
+            # The CuTe scalar ABI transports Python floats in Float32. A bind
+            # hint cannot prove that later calls are exactly representable.
+            raise exc.BackendUnsupported(
+                "cute", "a checked symbolic float operand may lose precision"
+            )
+        wide = (
+            self.checked_root
+            and isinstance(value, torch.SymInt)
+            and checked_scalar_wide(
+                self,
+                value._sympy_(),
+                tensor_dtypes,
+                assignment_dtype=assignment_dtype,
+            )
+        )
+        return self.scalar(value, wide=wide)
 
     def host_stride(self, tensor: HostTensor, dim: int) -> str:
         # Fresh wrapper allocations have configured symbolic strides, which
@@ -899,6 +1010,20 @@ class FragmentContext:
     def dtype(self, dtype: torch.dtype) -> str:
         return self.env.backend.dtype_str(dtype)
 
+    def convert(
+        self, expression: str, source: torch.dtype | None, dtype: torch.dtype
+    ) -> str:
+        """``expression``, of dtype ``source``, cast to ``dtype``: an integer
+        or a bool becomes a float as in the pointwise lowering
+        (``integer_to_float_expr``), where MLIR could fold an 8-bit float
+        conversion into it."""
+        converted = integer_to_float_expr(
+            expr_from_string(expression), dtype, source, self.cg.device_function
+        )
+        if converted is None:
+            return self.cast(expression, dtype)
+        return ast.unparse(converted)
+
     def cast(self, expression: str, dtype: torch.dtype) -> str:
         return f"{self.dtype(dtype)}({expression})"
 
@@ -969,11 +1094,11 @@ class FragmentContext:
         copied: set[Node],
         readonly: list[object],
     ) -> Generator[None, None, None]:
-        """Retire last-use initial values after their synchronized carry copy.
+        """Retire last-use operands after a synchronized carry copy or header snapshot.
 
-        Only a copied initial may leave the parent scope. Readonly captures
-        stay pinned across every backedge, including after their final use
-        within one iteration. Other parent aliases and later uses remain live.
+        Readonly captures stay pinned across every backedge, including after
+        their final use within one iteration. Other parent aliases and later
+        uses remain live.
         """
         assert self.scopes and self.scopes[-1] is values
         assert len(self.scope_uses) == len(self.scopes)
@@ -1264,7 +1389,7 @@ class FragmentContext:
         extent = str(capacity)
         if bid is not None:
             if bid in self.offsets:
-                extent = f"min({extent}, ({self.bounds[bid]}) - ({self.offsets[bid]}))"
+                extent = self.tile_live_extent(bid, capacity)
             elif self.env.block_sizes[bid].reduction:
                 extent = f"min({extent}, {self.sym(self.env.block_sizes[bid].numel)})"
         return extent

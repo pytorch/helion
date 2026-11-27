@@ -17,6 +17,8 @@ from torch.utils._sympy.numbers import int_oo
 from torch.utils._sympy.value_ranges import ValueRanges
 from torch.utils._sympy.value_ranges import bound_sympy
 
+from .fx_side_effects import is_impure_node
+
 if TYPE_CHECKING:
     from collections.abc import Iterable
     from collections.abc import Sequence
@@ -345,7 +347,7 @@ def opaque_access_target(node: Node) -> list[Node] | None:
 
     if (
         node.op != "call_function"
-        or not node.is_impure()
+        or not is_impure_node(node)
         or node.target
         in (_phi, memory_ops.prefetch, _for_loop, _for_loop_step, _if, _while_loop)
         or memory_write_target(node) is not None

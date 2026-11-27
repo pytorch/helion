@@ -52,6 +52,15 @@ def shifted_descriptor_pointwise(
     return out
 
 
+@helion.kernel(static_shapes=False, autotune_effort="none")
+def shifted_descriptor_read(
+    x: torch.Tensor, out: torch.Tensor, shift: int
+) -> torch.Tensor:
+    for row, col in hl.tile([0, 32], x.size()):
+        out[row, col] = x[row, col.index + shift]
+    return out
+
+
 @helion.kernel(autotune_effort="none")
 def transposed_padded_pointwise(x: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
     m, n = x.size()
@@ -172,16 +181,39 @@ class TestEpilogueSubtilingBounds(TestCase):
                 code = bound.to_code(config)
                 compiled = bound.compile_config(config, allow_print=False)
                 self._assert_split(code, split_factor, "_desc.store")
-                self.assertNotIn("tl.store(", code)
+                self.assertIn(
+                    "tl.store(", code
+                )  # Unaligned runtime shifts use pointers.
                 # A full tile with a matching end permits TMA, and each aligned
                 # shift keeps the stored interval inside the destination.
-                for shift in (-8, -16, -24, 0):
+                # A wrapped ±2**32 tile would incorrectly store into columns 32:64.
+                for shift in (-8, -16, -24, 0, -40, 1, -1, 2**32, -(2**32)):
                     with self.subTest(shift=shift):
                         out.fill_(-9.0)
                         expected = torch.full_like(out, -9.0)
-                        expected[:, 32 + shift : x.size(1) + shift] = x[:, 32:] + 1.0
+                        for source in range(32, 64):
+                            if 0 <= source + shift < 64:
+                                expected[:, source + shift] = x[:, source] + 1.0
                         output = compiled(x, out, shift)
                         torch.testing.assert_close(output, expected, atol=0, rtol=0)
+
+    @skipIfRefEager("test requires tensor descriptors")
+    @skipUnlessTensorDescriptor("Tensor descriptor support is required")
+    def test_descriptor_load_preserves_overlap_before_narrowing(self) -> None:
+        x = torch.arange(8 * 64, device=DEVICE, dtype=torch.float32).reshape(8, 64)
+        out = torch.full_like(x, -9.0)
+        bound = shifted_descriptor_read.bind((x, out, -8))
+        config = helion.Config(
+            block_sizes=[8, 32], indexing=["tensor_descriptor", "pointer"]
+        )
+        self.assertIn("_desc.load(", bound.to_code(config))
+        run = bound.compile_config(config)
+        for shift in (-40, 1, -1, 2**32, -(2**32)):
+            out.fill_(-9)
+            expected = torch.full_like(out, -9.0)
+            for dest in range(32, 64):
+                expected[:, dest] = x[:, dest + shift] if 0 <= dest + shift < 64 else 0
+            torch.testing.assert_close(run(x, out, shift), expected, atol=0, rtol=0)
 
     @skipIfRefEager("test requires epilogue subtiling")
     def test_transposed_output_with_two_ragged_dims(self) -> None:

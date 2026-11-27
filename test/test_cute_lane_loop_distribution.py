@@ -8396,11 +8396,17 @@ def test_next_column_read_beside_the_store_matches_reference(
 ) -> None:
     # The stencil neighbour along the column threads, rows over two threads
     # and two lanes: the barrier between the read and the store orders the
-    # neighbour thread's store after the read.
+    # neighbour thread's store after the read.  Each column tile is its own
+    # CTA, and nothing orders two CTAs: the last column of every tile but the
+    # last may read the next tile's first column before or after its store.
     run = _compiled(
         _read_next_column_then_store,
         tuple(_small_integers(shape) for _ in range(3)),
         **_ONE_COLUMN_PER_THREAD_CONFIG,
+    )
+    block = _ONE_COLUMN_PER_THREAD_CONFIG["block_sizes"][1]
+    tile_ends = torch.arange(
+        block - 1, max(block, shape[1]) - 1, block, device=CUDA_DEVICE
     )
     for _ in range(_RUNS):
         x = _small_integers(shape)
@@ -8408,6 +8414,10 @@ def test_next_column_read_beside_the_store_matches_reference(
         y = torch.full(shape, -7.0, device=CUDA_DEVICE)
         expected_y, expected_x = _mapped_reference(_read_next_column_then_store, x, v)
         run(x, v, y)  # pyrefly: ignore [not-callable]
+        stored = v[:, tile_ends + 1]
+        expected_y[:, tile_ends] = torch.where(
+            y[:, tile_ends] == stored, stored, expected_y[:, tile_ends]
+        )
         torch.testing.assert_close(y, expected_y, rtol=0, atol=0)
         torch.testing.assert_close(x, expected_x, rtol=0, atol=0)
     with pytest.raises(exc.BackendUnsupported, match="across the lanes"):

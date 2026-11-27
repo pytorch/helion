@@ -396,16 +396,45 @@ def bf16_mm_args(
     k: int,
     *,
     rhs_k_major: bool = True,
+    lhs_k_major: bool = True,
     device: torch.device | str = "cpu",
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Random 16-bit operands and an argument output for ``plain_mm_into``."""
-    a = torch.randn((m, k), dtype=torch.bfloat16, device=device)
+    """Random 16-bit operands and an argument output for ``plain_mm_into``.
+
+    ``lhs_k_major=False`` gives an M-major A (``x.T`` of a weight gradient)."""
+    a = (
+        torch.randn((m, k), dtype=torch.bfloat16, device=device)
+        if lhs_k_major
+        else torch.randn((k, m), dtype=torch.bfloat16, device=device).T
+    )
     b = (
         torch.randn((n, k), dtype=torch.bfloat16, device=device).T
         if rhs_k_major
         else torch.randn((k, n), dtype=torch.bfloat16, device=device)
     )
     return a, b, torch.empty((m, n), dtype=torch.bfloat16, device=device)
+
+
+def clc_fringe_config(**changes: object) -> helion.Config:
+    """The CLC 256x256 CTA pair (a scheduler warp publishing each work tile to
+    both CTAs' mailboxes), the CuTe default of a bf16 GEMM whose N is
+    narrower than the tile (``plain_mm_into`` over 131072x144x288): every tile
+    is a fringe tile, stored by the epilogue warps through the predicated SIMT
+    store, which no named barrier keeps in step."""
+    return helion.Config.from_dict(
+        {
+            "block_sizes": [256, 256, 64],
+            "pid_type": "persistent_interleaved",
+            "l2_groupings": [4],
+            "cute_pdl": True,
+            "tcgen05_ab_stages": 5,
+            "tcgen05_cluster_m": 2,
+            "tcgen05_persistence_model": "clc_persistent",
+            "tcgen05_strategy": "role_local_with_scheduler",
+            "tcgen05_warp_spec_scheduler_warps": 1,
+        }
+        | changes
+    )
 
 
 def aligned_n_bf16_config(**changes: object) -> helion.Config:

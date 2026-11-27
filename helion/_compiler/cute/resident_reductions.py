@@ -17,6 +17,7 @@ from ..ast_read_writes import ReadWrites
 from ..ast_read_writes import ast_rename
 from ..compile_environment import CompileEnvironment
 from ..device_function import TensorArg
+from ..device_function import TensorSizeArg
 from ._ast_pass_utils import assigned_name
 from ._ast_pass_utils import call_path_str
 from .affine_vector_io import _i32_offset
@@ -37,6 +38,8 @@ from .persistent_branch_vec import _plain_scalar_store_pointer
 from .persistent_branch_vec import _pointer_integer_affine_form
 from .persistent_branch_vec import _scalar_pointer_calls_are_known
 from .scalar_recipe import build_recipe
+from .tile_bounds import clipped_tile_width
+from .tile_bounds import minimum_terms
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -185,6 +188,7 @@ class ResidentPassContext:
     )
     tensor_alignments: Mapping[str, int] = dataclasses.field(default_factory=dict)
     constexpr_values: Mapping[str, int] = dataclasses.field(default_factory=dict)
+    tensor_size_names: frozenset[str] = frozenset()
 
     @classmethod
     def for_device_function(
@@ -211,6 +215,9 @@ class ResidentPassContext:
             uniform_names={argument.name for argument in fn.arguments}
             | set(extra_params),
             new_var=fn.new_var,
+            tensor_size_names=frozenset(
+                arg.name for arg in fn.arguments if isinstance(arg, TensorSizeArg)
+            ),
         )
 
     def with_reduction_facts(self, fn: DeviceFunction) -> ResidentPassContext:
@@ -457,6 +464,7 @@ def _row_count_bound(
     definitions: dict[str, ast.expr],
     mutable_names: set[str],
     uniform_names: set[str],
+    tensor_size_names: frozenset[str],
 ) -> tuple[int, bool] | None:
     if not (
         isinstance(iterator, ast.Call)
@@ -503,6 +511,8 @@ def _row_count_bound(
             )
         ):
             return None
+    if (width := clipped_tile_width(start, end, tensor_size_names)) is not None:
+        return width, False
     candidates = [(end, True)]
     unwrapped = end
     while (
@@ -517,19 +527,11 @@ def _row_count_bound(
         )
     ):
         unwrapped = unwrapped.args[0]
-    if (
-        isinstance(unwrapped, ast.IfExp)
-        and isinstance(unwrapped.test, ast.Compare)
-        and len(unwrapped.test.ops) == len(unwrapped.test.comparators) == 1
-        and isinstance(unwrapped.test.ops[0], (ast.Lt, ast.LtE))
-        and ast.dump(unwrapped.test.left) == ast.dump(unwrapped.body)
-        and ast.dump(unwrapped.test.comparators[0]) == ast.dump(unwrapped.orelse)
-        and _i32_offset(unwrapped.body)
-        and _i32_offset(unwrapped.orelse)
-    ):
+    upper = minimum_terms(unwrapped)
+    if upper is not None and all(_i32_offset(term) for term in upper):
         # min(start + coarse_extent, runtime_end) has a bounded trip count,
         # but its last group may be partial. Do not narrow Int64 operands.
-        candidates.extend([(unwrapped.body, False), (unwrapped.orelse, False)])
+        candidates.extend((term, False) for term in upper)
     for candidate, exact in candidates:
         difference = _pointer_integer_affine_form(
             ast.BinOp(left=candidate, op=ast.Sub(), right=start), "", {}, set(), ""
@@ -850,6 +852,7 @@ def _plan(
         definitions,
         mutable_names,
         context.uniform_names | set(context.tensor_dtypes),
+        context.tensor_size_names,
     )
     if row_domain is None:
         return None

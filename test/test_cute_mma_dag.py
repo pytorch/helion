@@ -76,6 +76,8 @@ from helion._testing.cute_mma_dag import run_triton
 from helion._testing.cute_mma_dag import tensors
 from helion._testing.cute_sass import cute_launcher_cubins
 from helion._testing.cute_sass import cute_launcher_sass
+from helion._testing.cute_sass import hinted_packets_render  # noqa: F401
+from helion._testing.cute_sass import skip_unless_nvdisasm_runs
 from helion.autotuner.config_fragment import EnumFragment
 from helion.runtime.cute import sass_check
 from helion.runtime.cute.standalone_launcher import _standalone_validate_mma_dag_aliases
@@ -6396,6 +6398,7 @@ def _unhinted_seed_knobs(
     ]
 
 
+@pytest.mark.usefixtures("hinted_packets_render")
 def test_cta_rich_programs_seed_the_top_tiles_measured_neighbours() -> None:
     # The cold autotune of the gated delta rule at s1 (seed 31337) left the
     # ranked ladder for: dqkw at three stages, wy_dL at the full kk tile
@@ -6485,6 +6488,7 @@ def test_cta_rich_programs_seed_the_top_tiles_measured_neighbours() -> None:
     assert dag.mma_dag_seed_variants(facts, dag.mma_dag_seed_configs(facts)) == []
 
 
+@pytest.mark.usefixtures("hinted_packets_render")
 @pytest.mark.parametrize("kernel", ("dqkw", "wy_dL", "dk"), ids=("dqkw", "wy_dL", "dk"))
 def test_every_seed_variant_normalizes_and_renders(kernel: str) -> None:
     bf16 = torch.bfloat16
@@ -6643,6 +6647,321 @@ def test_a_16_bit_bmm_stored_as_it_is_is_a_rounded_dot() -> None:
     (dot,) = _program(bound).dots
     assert dot.node.target is torch.ops.aten.bmm.default
     assert bound.config_spec.cute_mma_dag is not None
+
+
+def _small_bmm(batch: int, m: int, n: int, k: int) -> BoundKernel:
+    a = torch.empty((batch, m, k), dtype=torch.bfloat16, device=CPU_DEVICE)
+    b = torch.empty((batch, k, n), dtype=torch.bfloat16, device=CPU_DEVICE)
+    out = torch.empty((batch, m, n), dtype=torch.bfloat16, device=CPU_DEVICE)
+    return _bind_fn(bmm_stored, (a, b, out))
+
+
+def test_a_ragged_contiguous_n_drops_its_packets_past_the_extent() -> None:
+    # N = 56 (112-byte rows, whole 16-byte packets) runs ragged: one 64-wide
+    # CTA covers a matrix. Its B packets past column 56 read nothing, and its
+    # stores past it are dropped.
+    bound = _small_bmm(8, 56, 56, 32)
+    facts = bound.config_spec.cute_mma_dag_facts
+    assert [axis.ragged for axis in facts.axes] == [False, True, True, False]
+    body = _kernel_body(_source(bound, _config(1, 64, 64, warps=1, stages=1)))
+    guard = "cutlass.Int32(16) if md_a2 + md_pc8 * 8 < 56 else cutlass.Int32(0)"
+    assert body.count(guard) == 8
+    assert f"{RT}.cp_async_16(" not in body
+    # (64 x 64 over one warp: 64 pairs per lane)
+    assert body.count(f"{RT}.stg_b32(") == 64
+    assert "md_a2 + (md_L0_coll + 56) < 56" in body
+    # Every N block starts a CTA at a whole packet: a block below the 8-column
+    # atom, computed at the atom, would issue B's packets and the output's
+    # pairs two bytes apart (N = 1), a pair writing the next CTA's column.
+    assert [axis.min_block for axis in facts.axes] == [1, 1, 8, 1]
+    assert dag.mma_dag_config_reason(facts, {0: 1, 1: 64, 2: 4}, 1, 1) == (
+        "block size 4 of tile axis 2 must be at least 8: each CTA must start at "
+        "a whole move along this contiguous dim"
+    )
+    assert dag.mma_dag_config_reason(facts, {0: 1, 1: 64, 2: 8}, 1, 1) is None
+    # A contiguous extent that splits a packet does not run ragged: N = 52
+    # of rows 56 elements apart tiles by divisors of 52.
+    a = torch.empty((8, 56, 32), dtype=torch.bfloat16, device=CPU_DEVICE)
+    b = torch.empty((8, 32, 56), dtype=torch.bfloat16, device=CPU_DEVICE)[..., :52]
+    out = torch.empty((8, 56, 52), dtype=torch.bfloat16, device=CPU_DEVICE)
+    facts = _bind_fn(bmm_stored, (a, b, out)).config_spec.cute_mma_dag_facts
+    assert [axis.ragged for axis in facts.axes] == [False, True, False, False]
+
+
+def _gated_value_state(
+    k: torch.Tensor, v: torch.Tensor, s: torch.Tensor
+) -> torch.Tensor:
+    """sum_i k_i^T @ (v_i * s_i): the pass of v_i reads the row s_i along
+    v's contiguous dim, varying with the loop."""
+    BH, N, D, DV = k.size(0), k.size(1), k.size(3), v.size(3)
+    out = torch.empty([BH, D, DV], dtype=torch.float32, device=k.device)
+    for tile_bh, tile_d, tile_dv in hl.tile([BH, D, DV], block_size=[1, None, None]):
+        idx = tile_bh.id
+        acc = hl.zeros([tile_d, tile_dv], dtype=torch.float32)
+        for i in hl.grid(N):
+            v_i = v[idx, i, :, tile_dv].to(torch.float32) * s[idx, i, tile_dv][None, :]
+            k_i = k[idx, i, :, tile_d]
+            acc = hl.dot(k_i.transpose(-2, -1), v_i.to(torch.bfloat16), acc=acc)
+        out[idx, tile_d, tile_dv] = acc
+    return out
+
+
+def test_a_vector_along_a_ragged_contiguous_dim_takes_no_aux_run() -> None:
+    # Over DV = 64 the aux ring copies s_i's block once per CTA as 16-byte
+    # runs. DV = 56 may run ragged: the runs would copy columns 56-63 past
+    # each row (past the tensor on the last), and the reads past the extent
+    # are predicated, which skips the ring. s_i takes per-thread words there,
+    # which only the unpredicated reads fill.
+    bf16, f32 = torch.bfloat16, torch.float32
+    for dv, kind in ((64, "run"), (56, "packed")):
+        k = torch.empty((4, 8, 64, 64), dtype=bf16, device=CPU_DEVICE)
+        v = torch.empty((4, 8, 64, dv), dtype=bf16, device=CPU_DEVICE)
+        s = torch.empty((4, 8, dv), dtype=f32, device=CPU_DEVICE)
+        bound = _bind_fn(_gated_value_state, (k, v, s))
+        facts = bound.config_spec.cute_mma_dag_facts
+        assert facts is not None
+        (record,) = facts.aux_loads
+        assert (record.kind, facts.axes[record.along].ragged) == (kind, dv == 56)
+    config = _config(64, 32, warps=4, stages=2, cute_mma_dag_aux="ring")
+    body = _kernel_body(_source(bound, config))
+    assert f"{RT}.cp_async_16(md_aux" not in body
+
+
+def _bmm_bias_stored(
+    a: torch.Tensor, b: torch.Tensor, bias: torch.Tensor, out: torch.Tensor
+) -> None:
+    for tile_z, tile_y, tile_x in hl.tile([a.size(0), a.size(1), b.size(2)]):
+        out[tile_z, tile_y, tile_x] = (
+            torch.bmm(a[tile_z, tile_y, :], b[tile_z, :, tile_x])
+            + bias[tile_z, tile_y, tile_x]
+        )
+
+
+def test_an_epilogue_tile_over_unaligned_rows_predicates_each_element() -> None:
+    # Window attention's scores plus a [4, 49, 49] bias (98-byte rows): the
+    # epilogue reads the bias pair by pair at the fragment coordinates, one
+    # element at a time, and the second element of a pair has its own column
+    # predicate (column 48's would let it read column 49, the next row's
+    # first element).
+    empty = functools.partial(torch.empty, dtype=torch.bfloat16, device=CPU_DEVICE)
+    bound = _bind_fn(
+        _bmm_bias_stored,
+        (
+            empty((4, 49, 32)),
+            empty((4, 32, 49)),
+            empty((4, 49, 49)),
+            empty((4, 49, 49)),
+        ),
+    )
+    body = _kernel_body(_source(bound, _config(1, 64, 64, warps=4, stages=1)))
+    assert "md_a2 + md_L0_coll < 49 else" in body
+    assert "md_a2 + (md_L0_coll + 1) < 49 else" in body
+    lo = re.search(
+        r"(md_lo_\d+) = _helion_mma_dag.ldg_bf16_as_f32_pred\((md_lb\w*), (md_ok_\d+)\)",
+        body,
+    )
+    assert lo is not None
+    hi = re.search(
+        rf"md_hi_\d+ = _helion_mma_dag.ldg_bf16_as_f32_pred\({lo.group(2)} \+ 2, (md_ok_\d+)\)",
+        body,
+    )
+    assert hi is not None and hi.group(1) != lo.group(3)
+
+
+def test_unaligned_rows_move_element_by_element() -> None:
+    # Window attention's 49 x 49 x 32 scores: B and the output have 98-byte
+    # rows, so B takes the synchronous pass one element at a time, each
+    # column under its own predicate, and the output is written element by
+    # element: staged through a shared tile and copied out along its rows
+    # (``cute_mma_dag_store="staged"``), or from the fragments ("direct").
+    bound = _small_bmm(4, 49, 49, 32)
+    facts = bound.config_spec.cute_mma_dag_facts
+    assert [axis.ragged for axis in facts.axes] == [False, True, True, False]
+    # the element store is a staging subject (the store knob is searched),
+    # which the shared-memory estimate does not charge
+    assert facts.element_staging == ((1, 2, 2),) and facts.staging == ()
+    body = _kernel_body(_source(bound, _config(1, 64, 64, warps=4, stages=1)))
+    assert "md_ok = cutlass.Int32(1) if md_a2 + 2 * md_pc < 49 else" in body
+    assert "md_ok_1 = cutlass.Int32(1) if md_a2 + (2 * md_pc + 1) < 49 else" in body
+    assert f"{RT}.ldg_b32" not in body
+    assert f"{RT}.stg_b32(" not in body
+    assert f"{RT}.stg_bf16(" not in body
+    # 64 x 64 elements over 128 threads: 32 rounds, lane t of a round the
+    # element t columns into its row
+    assert body.count(f"{RT}.copy_s2g_b16(") == 32
+    assert "md_sr = md_tidx // 64" in body and "md_sc = md_tidx % 64" in body
+    assert "if md_a1 + md_sr < 49 and md_a2 + md_sc < 49:" in body
+    body = _kernel_body(
+        _source(
+            bound,
+            _config(1, 64, 64, warps=4, stages=1, cute_mma_dag_store="direct"),
+        )
+    )
+    assert f"{RT}.copy_s2g_b16(" not in body
+    assert "if md_a1 + md_L0_rowl < 49 and md_a2 + (md_L0_coll + 1) < 49:" in body
+    # A staging tile that would not fit beside the rest (the estimate,
+    # which does not charge it, one byte under the capacity) leaves the
+    # store to the fragments.
+    with patch.object(
+        dag, "mma_dag_smem_estimate", return_value=facts.smem_capacity - 1
+    ):
+        body = _kernel_body(_source(bound, _config(1, 64, 64, warps=4, stages=1)))
+    assert f"{RT}.copy_s2g_b16(" not in body
+    assert f"{RT}.stg_bf16(" in body
+
+
+def _window_attention_grad_bmm(batch: int, k: int) -> BoundKernel:
+    """Window attention's backward ``attn.mT @ grad`` over 7x7 windows: a bmm
+    of [B, 49, K] column-major (rows of 49 elements, 98 bytes) by
+    [B, K, 32]."""
+    bf16 = torch.bfloat16
+    a = torch.empty((batch, k, 49), dtype=bf16, device=CPU_DEVICE).mT
+    b = torch.empty((batch, k, 32), dtype=bf16, device=CPU_DEVICE)
+    out = torch.empty((batch, 49, 32), dtype=bf16, device=CPU_DEVICE)
+    return _bind_fn(bmm_stored, (a, b, out))
+
+
+def test_a_k_row_that_is_no_power_of_two_runs_on_its_padded_row() -> None:
+    # K = 49 runs on a 64-wide row: B's rows and A's columns past 49 are
+    # zero-filled (B's cp.async packets read nothing for them, A's
+    # synchronous pass loads nothing), so the fourth K step adds products of
+    # zeros. Before, the owner declined the row and the kernel ran the SIMT
+    # dot, a shared-memory reduction per output element.
+    bound = _window_attention_grad_bmm(8, 49)
+    facts = bound.config_spec.cute_mma_dag_facts
+    assert facts is not None
+    (row,) = [axis for axis in facts.axes if axis.kind == dag.AXIS_RDIM]
+    assert (row.extent, row.fixed) == (49, 64)
+    body = _kernel_body(_source(bound, _config(1, 64, 32, warps=4, stages=1)))
+    assert SIMT_FALLBACK not in body
+    # B [64, 32] over 128 threads: two rounds of 64-byte rows, 32 rows each
+    assert "md_zf = cutlass.Int32(16) if md_pr4 < 49 else cutlass.Int32(0)" in body
+    assert (
+        "md_zf_1 = cutlass.Int32(16) if 32 + md_pr4 < 49 else cutlass.Int32(0)" in body
+    )
+    assert body.count(f"{RT}.cp_async_16_zfill(") == 2
+    assert f"{RT}.cp_async_16(" not in body
+    # A [K=64, M=64] (M contiguous, 98-byte rows): element by element, each
+    # under its K row's and its M column's predicates
+    assert (
+        "md_ok = cutlass.Int32(1) if md_pr < 49 and md_a1 + 2 * md_pc < 49 else" in body
+    )
+    assert (
+        "md_ok_1 = cutlass.Int32(1) if md_pr < 49 and md_a1 + (2 * md_pc + 1) < 49 else"
+        in body
+    )
+    # four K steps of 16 over the padded row
+    assert body.count(f"{RT}.ldmatrix_x4_trans(md_t0 + (48 + md_arow)") == 1
+    assert f"{RT}.ldmatrix_x4_trans(md_t0 + (64 + md_arow)" not in body
+    # The frontend's own block of the row is the padding (static_rdim_size);
+    # a K the owner takes as it is keeps its row.
+    assert _window_attention_grad_bmm(8, 32).config_spec.cute_mma_dag_facts.axes[
+        3
+    ] == dataclasses.replace(row, extent=32, fixed=None)
+
+
+def _bmm_exp_a(a: torch.Tensor, b: torch.Tensor, out: torch.Tensor) -> None:
+    for tile_z, tile_y, tile_x in hl.tile([a.size(0), a.size(1), b.size(2)]):
+        out[tile_z, tile_y, tile_x] = torch.bmm(
+            torch.exp(a[tile_z, tile_y, :]), b[tile_z, :, tile_x]
+        )
+
+
+def _bmm_full_n(a: torch.Tensor, b: torch.Tensor, out: torch.Tensor) -> None:
+    for tile_z, tile_y in hl.tile([a.size(0), a.size(1)]):
+        out[tile_z, tile_y, :] = torch.bmm(a[tile_z, tile_y, :], b[tile_z, :, :])
+
+
+def _bmm_batched_views(a: torch.Tensor, b: torch.Tensor, out: torch.Tensor) -> None:
+    # (torch.matmul's batching of rank-2 operands)
+    for tile_z, tile_y, tile_x in hl.tile([out.size(0), a.size(0), b.size(1)]):
+        aa = a[tile_y, :].unsqueeze(0).expand([tile_z, -1, -1])
+        bb = b[:, tile_x].unsqueeze(0).expand([tile_z, -1, -1])
+        out[tile_z, tile_y, tile_x] = torch.bmm(aa, bb)
+
+
+def _bmm_batched_exp_views(a: torch.Tensor, b: torch.Tensor, out: torch.Tensor) -> None:
+    for tile_z, tile_y, tile_x in hl.tile([out.size(0), a.size(0), b.size(1)]):
+        aa = torch.exp(a[tile_y, :]).unsqueeze(0).expand([tile_z, -1, -1])
+        bb = torch.exp(b[:, tile_x]).unsqueeze(0).expand([tile_z, -1, -1])
+        out[tile_z, tile_y, tile_x] = torch.bmm(aa, bb)
+
+
+def test_a_padded_k_row_keeps_to_tiles_loaded_from_memory() -> None:
+    bf16 = torch.bfloat16
+    empty = functools.partial(torch.empty, dtype=bf16, device=CPU_DEVICE)
+
+    def matched(fn: object, args: tuple[torch.Tensor, ...]) -> bool:
+        bound = _bind_fn(fn, args)
+        with bound.env, bound.host_function:
+            return dag.match_mma_dag(bound.host_function.device_ir.graphs) is not None
+
+    # exp(0) = 1: an operand computed from a zero-filled tile takes the
+    # frontend's _mask_to fill past the extent (K contiguous here).
+    bound = _bind_fn(
+        _bmm_exp_a, (empty((8, 64, 49)), empty((8, 49, 64)), empty((8, 64, 64)))
+    )
+    body = _kernel_body(_source(bound, _config(1, 64, 64, warps=4, stages=1)))
+    assert re.search(
+        r"md_v_\d+ = md_v_\d+ if 2 \* md_pc < 49 else cutlass\.BFloat16\(cutlass\.Float32\(0\.0\)\)",
+        body,
+    )
+    # Over batched views the frontend fills the view, which the dot peels
+    # off: an operand loaded as it is keeps its zero-filled padding, while
+    # exp of it, 1 there without the fill, is not padded (K = 64 needs none).
+    for fn, k, owned in (
+        (_bmm_batched_views, 49, True),
+        (_bmm_batched_exp_views, 49, False),
+        (_bmm_batched_exp_views, 64, True),
+    ):
+        assert (
+            matched(fn, (empty((64, k)), empty((k, 64)), empty((4, 64, 64)))) is owned
+        )
+    # A K-major K of 52 in rows 56 elements apart: its 16-byte packet of
+    # columns 48-55 straddles the extent (loaded whole, it would read the
+    # row's padding). A K of 56 there fills whole packets, and 98-byte rows
+    # (K = 49) move element by element.
+    for k, owned in ((52, False), (56, True)):
+        args = (empty((8, 64, 56))[..., :k], empty((8, k, 64)), empty((8, 64, 64)))
+        assert matched(bmm_stored, args) is owned
+    args = (empty((8, 64, 49)), empty((8, 49, 64)), empty((8, 64, 64)))
+    assert matched(bmm_stored, args)
+    # A full slice that is a dot's N runs along the output's columns and its
+    # store: it is not padded (N = 64 is the owner's, N = 49 is not).
+    for n, owned in ((64, True), (49, False)):
+        args = (empty((8, 64, 32)), empty((8, 32, n)), empty((8, 64, n)))
+        assert matched(_bmm_full_n, args) is owned
+
+
+def _mm_over_n_tiles(a: torch.Tensor, b: torch.Tensor, out: torch.Tensor) -> None:
+    for tile_m in hl.tile(a.size(0)):
+        for tile_n in hl.tile(b.size(1)):
+            out[tile_m, tile_n] = torch.mm(a[tile_m, :], b[:, tile_n])
+
+
+def test_a_padded_k_row_stays_with_the_warp_emitter() -> None:
+    # The tensor-memory renderers keep whole tiles: their synchronous pass
+    # of a K-major A at K = 49 (98-byte rows) would load columns 49-63 past
+    # each row. A tile loop over a padded K runs on the warp MMA alone; over
+    # K = 64 it may run on tensor memory too.
+    bf16 = torch.bfloat16
+    empty = functools.partial(torch.empty, dtype=bf16, device=CPU_DEVICE)
+    for k, modes in (
+        (64, ("off", "warp", "tcgen05")),
+        (49, ("off", "warp")),
+        (80, ("off", "warp")),
+    ):
+        bound = _bind_fn(
+            _mm_over_n_tiles, (empty((1024, k)), empty((k, 512)), empty((1024, 512)))
+        )
+        spec = bound.config_spec
+        assert spec.cute_mma_dag is not None
+        assert spec.cute_mma_dag.choices == modes
+    # A K under one 16-element MMA step runs on a 16-wide row.
+    facts = _window_attention_grad_bmm(8, 8).config_spec.cute_mma_dag_facts
+    assert facts is not None
+    (row,) = [axis for axis in facts.axes if axis.kind == dag.AXIS_RDIM]
+    assert (row.extent, row.fixed) == (8, 16)
 
 
 # --------------------------------------------------------------------------
@@ -7498,6 +7817,7 @@ _WY_FAULT_CONFIG: dict[str, object] = {
 }
 
 
+@pytest.mark.usefixtures("hinted_packets_render")
 def test_the_autotune_fault_config_renders_hinted_packets_behind_a_sass_check() -> None:
     # The config whose kernel died in the kda autotune renders its staged k
     # and v tiles' packets hinted ``L2::cache_hint`` again (the normalizer
@@ -7615,6 +7935,7 @@ def test_the_autotune_fault_config_renders_hinted_packets_behind_a_sass_check() 
     assert "createpolicy.fractional.L2::evict_last" in rows
 
 
+@pytest.mark.usefixtures("hinted_packets_render")
 def test_staged_tiles_carry_the_l2_policy_of_their_slot() -> None:
     # The decode program's loads in program order take the tunable slots k
     # (0), q (1), the weights (2), ``tile_n.index`` (3, 5), ks (4), ke (6);
@@ -7668,6 +7989,7 @@ def test_staged_tiles_carry_the_l2_policy_of_their_slot() -> None:
     assert mixed.count("md_pol_") == 2 + 12
 
 
+@pytest.mark.usefixtures("hinted_packets_render")
 def test_the_normalizer_keeps_the_staged_slots_canonical_and_pins_the_rest() -> None:
     # One value per packet form on the staged slots ("l2_last" for the
     # evict_last hint, "streaming" for evict_first); the side loads' slots,
@@ -7717,6 +8039,7 @@ def test_hinted_packets_need_a_disassembler() -> None:
     # SASS, so nothing hinted exists: the normalizer pins every slot to ""
     # (the render is the plain one) and the seeds carry no hinted twin.
     hinted = _config(1, 64, warps=4, stages=4, load_eviction_policies=["l2_last"] * 7)
+    available = cutedsl_compat.hinted_cp_async_available()
     with patch.object(cutedsl_compat, "nvdisasm_path", return_value=None):
         assert not cutedsl_compat.hinted_cp_async_available()
         # (The seeds are planted at bind time.)
@@ -7732,9 +8055,63 @@ def test_hinted_packets_need_a_disassembler() -> None:
     assert "cp_async_16_l2" not in source and "_helion_cute_sass_checks" not in source
     assert source == _source(bound, _config(1, 64, warps=4, stages=4))
     assert seeds and not any("load_eviction_policies" in c for c in seeds)
-    assert cutedsl_compat.hinted_cp_async_available()
+    assert cutedsl_compat.hinted_cp_async_available() == available
 
 
+def test_hinted_packets_fall_back_where_nvdisasm_cannot_run(tmp_path: Path) -> None:
+    # A disassembler that dies at startup (the aarch64 wheel's binary on the
+    # GB300 hosts) verifies nothing either: the render is the plain one, as
+    # without a disassembler, where the launcher's SASS check used to refuse
+    # the hinted kernel ("could not disassemble: nvdisasm failed (-11)").
+    crashing = tmp_path / "nvdisasm"
+    crashing.write_text("#!/bin/sh\nkill -SEGV $$\n")
+    crashing.chmod(0o755)
+    hinted = _config(1, 64, warps=4, stages=4, load_eviction_policies=["l2_last"] * 7)
+    available = cutedsl_compat.hinted_cp_async_available()
+    cutedsl_compat.nvdisasm_unusable_reason.cache_clear()
+    try:
+        with patch.object(
+            cutedsl_compat, "_nvdisasm_binary", return_value=str(crashing)
+        ):
+            assert cutedsl_compat.nvdisasm_unusable_reason() == (
+                f"{crashing} --version exits with status -11"
+            )
+            assert cutedsl_compat.nvdisasm_path() is None
+            assert not cutedsl_compat.hinted_cp_async_available()
+            bound = _bind_fn(_head_sum_logits_batched, _head_sum_inputs(h=32))
+            with bound.env:
+                normalized = bound.config_spec.normalized_config(hinted)
+            assert normalized.config["load_eviction_policies"] == [""] * 7
+            source = bound.to_code(normalized)
+    finally:
+        cutedsl_compat.nvdisasm_unusable_reason.cache_clear()
+    assert "cp_async_16_l2" not in source and "_helion_cute_sass_checks" not in source
+    assert source == _source(bound, _config(1, 64, warps=4, stages=4))
+    assert cutedsl_compat.hinted_cp_async_available() == available
+
+
+def test_a_disassembler_that_hangs_counts_as_unusable(tmp_path: Path) -> None:
+    # The probe runs on the compile path (the normalizer, the seeds), so it
+    # is bounded: a binary that does not answer is no disassembler, rather
+    # than a compile that never returns.
+    hanging = tmp_path / "nvdisasm"
+    hanging.write_text("#!/bin/sh\nexec sleep 30\n")
+    hanging.chmod(0o755)
+    cutedsl_compat.nvdisasm_unusable_reason.cache_clear()
+    try:
+        with (
+            patch.object(cutedsl_compat, "_nvdisasm_binary", return_value=str(hanging)),
+            patch.object(cutedsl_compat, "_NVDISASM_PROBE_TIMEOUT_S", 0.2),
+        ):
+            assert cutedsl_compat.nvdisasm_unusable_reason() == (
+                f"{hanging} --version does not answer within 0.2 s"
+            )
+            assert cutedsl_compat.nvdisasm_path() is None
+    finally:
+        cutedsl_compat.nvdisasm_unusable_reason.cache_clear()
+
+
+@pytest.mark.usefixtures("hinted_packets_render")
 def test_the_first_warp_seed_has_an_l2_evict_last_twin() -> None:
     # Right behind the first warp seed (and its derived-route / side-load
     # twins), the same tile with the staged operands' slots at "l2_last";
@@ -7784,6 +8161,7 @@ def test_the_first_warp_seed_has_an_l2_evict_last_twin() -> None:
     assert seeds[2]["block_sizes"] == seeds[0]["block_sizes"]
 
 
+@pytest.mark.usefixtures("hinted_packets_render")
 def test_ring_and_zero_filled_packets_carry_the_policy_too() -> None:
     # A K-loop recurrence: the ring's packets of every iteration name the
     # one policy word bound ahead of the loop.  A ragged root tile: the
@@ -8353,26 +8731,34 @@ def test_a_vector_along_ragged_rows_is_stored_under_the_row_guard() -> None:
 
 
 def test_a_ragged_axis_on_a_contiguous_dim_keeps_whole_tiles() -> None:
-    # The output transposed: ``tile_m`` is its contiguous dim, whose
-    # 16-byte packets and pairs would straddle the extent -- the axis may
-    # not run ragged, so a 16-row tile over M = 8 is refused as before.
-    a, b = _ragged_inputs(m=8)
-    out = torch.empty((256, 8), dtype=torch.float32, device=CPU_DEVICE).t()
+    # The output transposed: ``tile_m`` is its contiguous dim. M = 6 rows
+    # 8 elements apart (fp32: 32-byte strides, so packets may move) splits a
+    # 16-byte packet at the extent -- the axis may not run ragged, so a
+    # 16-row tile over M = 6 is refused as before.
+    a, b = _ragged_inputs(m=6)
+    out = torch.empty((256, 8), dtype=torch.float32, device=CPU_DEVICE).t()[:6]
     bound = _bind_fn(_ragged_dot_stored, (a, b, out))
     spec = bound.config_spec
     facts = spec.cute_mma_dag_facts
     assert facts is not None
     assert sorted((a.kind, a.extent, a.ragged) for a in facts.axes) == [
         ("rdim", 64, False),
-        ("root", 8, False),
+        ("root", 6, False),
         ("root", 256, False),
     ]
     assert dag.mma_dag_seed_ladder(facts.axes[0]) == []
     assert dag.mma_dag_config_reason(facts, {0: 16, 2: 128}, 4, 2) == (
-        "block size 16 must divide the extent 8 of tile axis 0"
+        "block size 16 must divide the extent 6 of tile axis 0"
     )
-    with bound.env, pytest.raises(InvalidConfig, match="must divide the extent 8"):
+    with bound.env, pytest.raises(InvalidConfig, match="must divide the extent 6"):
         spec.normalized_config(_config(16, 128, warps=4, stages=2))
+    # M = 8 of a dense transposed output fills two whole packets: no packet
+    # straddles the extent, and the transposed stores are per element, so
+    # the axis runs ragged under the 16-row atom.
+    a, b = _ragged_inputs(m=8)
+    out = torch.empty((256, 8), dtype=torch.float32, device=CPU_DEVICE).t()
+    facts = _bind_fn(_ragged_dot_stored, (a, b, out)).config_spec.cute_mma_dag_facts
+    assert facts is not None and facts.axes[0].ragged
     # The same store into a row-major output: the rows may run ragged.
     out = torch.empty((8, 256), dtype=torch.float32, device=CPU_DEVICE)
     facts = _bind_fn(_ragged_dot_stored, (a, b, out)).config_spec.cute_mma_dag_facts
@@ -8412,11 +8798,13 @@ def test_the_matmul_block_size_overshoot_is_a_backend_capability() -> None:
         plain = _bind_fn(_head_sum_logits, _head_sum_inputs(m=8)).config_spec
     assert [b.max_size for b in plain.block_sizes] == [8, 512]
     # A root axis the ragged rules refuse (the contiguous dim of the
-    # transposed output) keeps the extent's ceiling under the dag owner.
-    a, b = _ragged_inputs(m=8)
-    out = torch.empty((256, 8), dtype=torch.float32, device=CPU_DEVICE).t()
+    # transposed output, splitting a packet at its extent) keeps the
+    # extent's ceiling under the dag owner.
+    a, b = _ragged_inputs(m=6)
+    out = torch.empty((256, 8), dtype=torch.float32, device=CPU_DEVICE).t()[:6]
     spec = _bind_fn(_ragged_dot_stored, (a, b, out)).config_spec
     assert spec.cute_mma_dag_facts is not None
+    # (the power of two over the extent, not the 16-row atom)
     assert spec.block_sizes[0].max_size == 8
     # A ragged extent at or above its atom already admits it (24 under 32).
     spec = _bind_fn(_head_sum_logits, _head_sum_inputs(m=24)).config_spec
@@ -12597,6 +12985,7 @@ def test_tf32_bf16_dot_checks_rounding_intervals() -> None:
 @_COMPILED_PATH
 @pytest.mark.cuda
 def test_the_anchored_wy_autotune_fault_config_is_verified_before_it_runs() -> None:
+    skip_unless_nvdisasm_runs()
     # The candidate that died in the kda autotune renders hinted packets
     # again, behind the launcher's SASS check: on the DSL's current
     # assembler the check refuses the kernel before any launch (its split
@@ -12666,6 +13055,7 @@ def test_the_anchored_wy_autotune_fault_config_is_verified_before_it_runs() -> N
 def test_l2_hinted_operand_packets_are_a_pure_cache_hint(
     policies: tuple[str, str], words: tuple[str, ...]
 ) -> None:
+    skip_unless_nvdisasm_runs()
     # ``load_eviction_policies`` on the staged operands' slots (k: 0, q: 1)
     # puts an L2 cache policy on their cp.async packets: the same bits as
     # the plain kernel and as Triton over eight launches.  The launcher's
@@ -12696,6 +13086,7 @@ def test_l2_hinted_operand_packets_are_a_pure_cache_hint(
 @_COMPILED_PATH
 @pytest.mark.cuda
 def test_l2_hinted_zero_filled_packets_match_torch() -> None:
+    skip_unless_nvdisasm_runs()
     # The ragged root tile's zero-filled packets carry the policy behind
     # their byte count; integer inputs: exact.
     fn = _ragged_rows_summed
@@ -12716,6 +13107,7 @@ def test_l2_hinted_zero_filled_packets_match_torch() -> None:
 def test_the_hinted_decode_kernels_sass_has_no_collision_under_several_configs() -> (
     None
 ):
+    skip_unless_nvdisasm_runs()
     # The SASS check read against the assembler's actual output for the
     # indexer decode program at the tiles the campaign reaches (one, four
     # and eight warps; 16 / 32 / 64 keys): every uniform register an LDGSTS

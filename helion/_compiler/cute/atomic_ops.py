@@ -251,7 +251,9 @@ def _codegen_cute_atomic_rmw(
     keyword_names: list[str],
 ) -> ast.AST:
     from ..compile_environment import CompileEnvironment
+    from .emitters.memory_access import resolve_scalar_index_args
 
+    state = resolve_scalar_index_args(state)
     target = state.proxy_arg(0)
     index = state.proxy_arg(1)
     sem = expr_from_string(repr(state.proxy_arg(len(state.ast_args) - 1)))
@@ -420,11 +422,26 @@ def _cute_atomic_predicates(
         HELION_ATOMIC_UNIFORM_LANES_ATTR,
         _cute_uniform_lane_vars(state, indexed_block_ids),
     )
+    from .emitters.memory_access import scalar_index_bound
+
+    scalar_bounds = []
+    expressions = state.ast_args[1]
+    assert isinstance(expressions, (list, tuple))
+    # None inserts an output dim without consuming a source dim.
+    dim = 0
+    for item, expr in zip(index, expressions, strict=True):
+        if item is not None:
+            if isinstance(item, torch.Tensor) and item.ndim == 0:
+                bound = scalar_index_bound(state, state.proxy_tensor_arg(0), dim, expr)
+                if bound is not None:
+                    scalar_bounds.append(bound)
+            dim += 1
     return [
         predicate
         for predicate in (
             _cute_active_mask_predicate(state, indexed_block_ids),
             _cute_leader_predicate(leader_axes),
+            *scalar_bounds,
             *(extra_predicates or []),
         )
         if predicate is not None

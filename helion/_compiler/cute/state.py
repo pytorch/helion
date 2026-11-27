@@ -35,6 +35,7 @@ from typing import TYPE_CHECKING
 from typing import cast
 
 from .tcgen05_constants import TCGEN05_SPLIT_K_CONFIG_KEY
+from .tcgen05_constants import tcgen05_cluster_split_k
 
 if TYPE_CHECKING:
     import ast
@@ -97,6 +98,13 @@ if TYPE_CHECKING:
 # ---------------------------------------------------------------------------
 
 
+@dataclasses.dataclass(frozen=True)
+class CuteSearchFacts:
+    """Facts collected from the completed IR for both search and code generation."""
+
+    has_scalar_fragment_assertion: bool
+
+
 @dataclasses.dataclass
 class CuteEnvState:
     """``CompileEnvironment.backend_state`` of the CuTe backend."""
@@ -147,6 +155,11 @@ class CuteEnvState:
 class CuteCodegenState:
     """``GenerateAST.backend_state`` of the CuTe backend."""
 
+    # Materialize this precondition only for a generic gather that actually
+    # replays a source address under the corresponding native device range.
+    gather_device_range_guards: dict[
+        int, tuple[ast.AST | None, dict[str, int | None]]
+    ] = dataclasses.field(default_factory=dict)
     wrapper_plans: list[dict[str, object]] = dataclasses.field(default_factory=list)
     uses_matmul: bool = False
     # Count declarations, not False-to-True transitions: an unrelated
@@ -268,11 +281,18 @@ def new_device_state(config: Config) -> CuteDeviceFunctionState:
     ``tcgen05_split_k``: the flat grid holds ``split_k`` CTAs per output tile
     (``block_idx // split_k`` is the tile's program id); the tcgen05 pipeline
     marks the config applied or the launch codegen rejects it
-    (``DeviceFunction.codegen_function_call``).
+    (``DeviceFunction.codegen_function_call``).  A split on the CtaGroup.TWO
+    4-CTA cluster (``tcgen05_cluster_split_k``) keeps one program id per
+    output tile: its splits are the cluster's CTA pairs, which the persistent
+    scheduler places.
     """
     state = new_unseeded_device_state()
     split_k = config.get(TCGEN05_SPLIT_K_CONFIG_KEY, 1)
-    if isinstance(split_k, int) and split_k > 1:
+    if (
+        isinstance(split_k, int)
+        and split_k > 1
+        and tcgen05_cluster_split_k(config) == 1
+    ):
         state.tcgen05.program_id_divisor = split_k
         state.lanes.launch_grid_multiplier = split_k
     return state
@@ -327,6 +347,11 @@ class CuteTcgen05State:
     epi_row_prefetches: list[Tcgen05EpiRowPrefetch] = dataclasses.field(
         default_factory=list
     )
+    # The work tile one step ahead of the epilogue role's, which the role's
+    # scheduler lookahead (``scheduler_pids``) binds when the store stages the
+    # CTA's last tile in the drained A ring (``cute_mma``'s
+    # ``tcgen05_last_tile_staging``); "" when no store does.
+    epi_last_tile_next_work: str = ""
     fragment_epilogue_plan: Tcgen05FragmentEpiloguePlan | None = None
     # Rejected proofs are stable for this per-config codegen state. Keep
     # the tile shape in the key so callers cannot accidentally reuse a
@@ -381,6 +406,16 @@ class CuteTcgen05State:
     epi_role_tile_counter_var: str | None = None
     epi_role_tile_counter_increment_per_tile: bool = True
     cluster_shape: tuple[int, int, int] | None = None
+    # ``tcgen05_fallback_cluster``: the fallback cluster the preferred
+    # ``cluster_shape`` launches with, and the ``cutlass.Constexpr`` body
+    # parameter (``True`` in the fallback body) the cluster-shape-dependent
+    # statements select on (``fallback_cluster_select``).
+    fallback_cluster_shape: tuple[int, int, int] | None = None
+    fallback_cluster_var: str | None = None
+    # The kernel parameters the fallback body receives in place of the
+    # preferred body's (the A/B TMA atoms built without the multicast across
+    # the cluster's N lanes): preferred name -> fallback name.
+    fallback_cluster_twin_args: dict[str, str] = dataclasses.field(default_factory=dict)
     block_shape: tuple[int, int, int] | None = None
     # ``min_blocks_per_mp`` the tcgen05 role launch requires (the
     # epilogue warp groups' 10+-warp block runs without a ``setmaxnreg``
@@ -672,6 +707,9 @@ class CuteRootPlans:
     ``PlannedRootEmitter`` entry; every ``PlannedRootEmitter.slot`` names a
     field of this class (checked when the registry is built).
     """
+
+    # Scalar grid origins whose runtime value is not bounded by signed Int64.
+    unbounded_uint64_axes: set[str] = dataclasses.field(default_factory=set)
 
     # Grouped two-phase lowering for structurally proven fixed-token,
     # split-input BF16 rank-1 recurrences.

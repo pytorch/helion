@@ -228,7 +228,8 @@ def _attention_scalar_batch_block_id(node: object) -> int | None:
     unbacked symbol whose origin is the grid axis, ``GridOrigin``). The block
     must be pinned to one element (``_attention_unit_fixed_block``): only
     then does the scalar address the whole tile, so the fused body's one
-    batch head per program is the kernel's.
+    batch head per program is the kernel's. The caller checks the root's stride
+    separately before selecting the fused kernel.
     """
     from ....language import tile_ops
     from ....language._tracing_ops import _get_symnode

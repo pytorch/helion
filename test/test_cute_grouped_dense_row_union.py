@@ -33,7 +33,8 @@ from helion._compiler.cute.grouped_row_union import GroupedRowUnionPlan
 from helion._compiler.cute.grouped_row_union import index_domain
 from helion._compiler.cute.grouped_row_union import schedule_supported
 from helion._compiler.cute.tcgen05.scheduler_pids import Tcgen05PersistentProgramIDs
-from helion._compiler.program_id import ProgramIDs
+from helion._compiler.program_id import FlatProgramIDs
+from helion._compiler.program_id import PIDInfo
 from helion._testing import cpu_render_target
 from helion._testing import import_example
 from helion.autotuner.metrics import AutotuneMetrics
@@ -476,20 +477,17 @@ def test_pid_mapping_retains_mn_for_every_original_axis_order(shape: tuple) -> N
     # The metadata holds only the already-proved single-CTA geometry. Both
     # the new linearization and original inverse decomposition are real code.
     for order in itertools.permutations(extents):
+        axis_decoder = FlatProgramIDs(
+            pid_info=[PIDInfo(f"pid_{b}", "1", str(extents[b]), b) for b in order]
+        )
         strategy = SimpleNamespace(
-            pid_info=[
-                SimpleNamespace(
-                    block_id=block,
-                    pid_var=f"pid_{block}",
-                    pack=1,
-                    pack_axis=0,
-                    num_pids_expr=lambda *, is_device, value=extents[block]: str(value),
-                )
-                for block in order
-            ],
+            pid_info=axis_decoder.pid_info,
             _tcgen05_plan=lambda: plan,
+            # (no K-split cluster: ``tcgen05_cluster_split_k``)
+            _tcgen05_cluster_split_k=lambda: 1,
+            # (no fallback cluster: ``tcgen05_fallback_cluster``)
+            _tcgen05_fallback_cluster=lambda: False,
             _tcgen05_logical_m_coord_expr=lambda value: value,
-            pid_division_exprs=lambda state: None,
         )
         expression = (
             Tcgen05PersistentProgramIDs._tcgen05_linear_virtual_pid_from_coords_expr(
@@ -499,7 +497,7 @@ def test_pid_mapping_retains_mn_for_every_original_axis_order(shape: tuple) -> N
         state = SimpleNamespace(
             device_function=SimpleNamespace(new_var=lambda name: name)
         )
-        statements = ProgramIDs._decompose_pid_to_statements(strategy, "virtual", state)
+        statements = axis_decoder._decompose_pid_to_statements("virtual", state)
         code = compile(
             ast.fix_missing_locations(
                 ast.Module(

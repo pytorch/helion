@@ -86,6 +86,7 @@ from .state import cute_env_state
 from .state import new_codegen_state
 from .state import new_device_state
 from .state import new_env_state
+from .target_facts import validate_grid_yz
 from .tcgen05.knobs import launch_epi_warp_groups_knob
 from .tcgen05_constants import TCGEN05_SPLIT_K_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY
@@ -130,6 +131,8 @@ if TYPE_CHECKING:
     from ..helper_function import CodegenInterface
     from ..host_function import HostFunction
     from ..inductor_lowering import CodegenState
+    from ..inductor_matmul import MatmulFacts
+    from ..inductor_matmul import MatmulPlan
     from ..program_id import ProgramIDs
     from ..reduction_strategy import ReductionEmitter
     from ..reduction_strategy import ReductionStrategy
@@ -821,6 +824,7 @@ def _detect_specialized_mma_loop(
     from .cute_mma import _mma_tiles_are_static_full
     from .cute_mma import _ragged_batched_tcgen05_config
     from .cute_mma import _tcgen05_cp_async_a_mma_bm
+    from .cute_mma import _tcgen05_fp32_lowering_blocked
     from .cute_mma import analyze_cute_mma_node
     from .cute_mma import ensure_tcgen05_fragment_epilogue_plan
     from .mma_support import cute_fp32_dot_uses_tf32
@@ -897,14 +901,17 @@ def _detect_specialized_mma_loop(
     if not isinstance(bk, int):
         return False
     # Ragged batched tiles take the flat one-CTA tcgen05 pipeline (TMA
-    # zero-fill, predicated stores); the launch geometry must agree with
-    # ``plan_tcgen05_pipeline``'s admission or the MMA warp never exists.
+    # zero-fill, predicated stores) or the persistent CTA pairs' TMA producer
+    # (``_ragged_batched_tcgen05_config``); the launch geometry must agree
+    # with ``plan_tcgen05_pipeline``'s admission or the MMA warp never exists.
     candidates = [
         (node, candidate)
         for node, candidate in candidates
         if not candidate.operands.has_leading_passthrough
         or _mma_tiles_are_static_full(candidate.operands, bm=bm, bn=bn, bk=bk)
-        or _ragged_batched_tcgen05_config(config, bn)
+        or _ragged_batched_tcgen05_config(
+            config, candidate.operands, bm=bm, bn=bn, bk=bk
+        )
     ]
     if not candidates:
         return False
@@ -966,6 +973,24 @@ def _detect_specialized_mma_loop(
             # emitter raises rather than declining, so this agreement holds.
             return True
         if k_loop_is_subrange:
+            continue
+        if (
+            mma_impl == "tcgen05"
+            and lhs_val.dtype == torch.float32
+            and candidate.operands.has_leading_passthrough
+            and _tcgen05_fp32_lowering_blocked(
+                fn.codegen,
+                node,
+                lhs_operand=candidate.operands.lhs,
+                rhs_operand=candidate.operands.rhs,
+                config=config,
+            )
+        ):
+            # The emitter demotes this fp32 dot to the universal lowering
+            # (``_emit_mma_pipeline``), which declines a batched GEMM: the
+            # scalar fallback that runs instead reads one k per lane, so a
+            # lane-free K loop would sum one k per K tile (an epilogue_subtile
+            # config of fp32 4 x 512^3 bmm).
             continue
         if mma_impl != "universal" and _specialized_mma_root_threads_support_impl(
             mma_impl,
@@ -1699,6 +1724,15 @@ class CuteBackend(Backend):
         return None
 
     def transform_launch_grid(self, fn: DeviceFunction, grid_expr: ast.AST) -> ast.AST:
+        from ..program_id import L2GroupingProgramIDs
+        from ..program_id import XYZProgramIDs
+
+        pid = fn.pid
+        if isinstance(pid, L2GroupingProgramIDs):
+            pid = pid.parent_strategy
+        if isinstance(pid, XYZProgramIDs):
+            validate_grid_yz(axis.static_num_pids() for axis in pid.pid_info[1:])
+
         if (
             fn.cute_state.tcgen05.program_id_divisor > 1
             and not fn.cute_state.tcgen05.split_k_applied
@@ -1971,9 +2005,9 @@ class CuteBackend(Backend):
         from .cute_mma_dag import apply_mma_dag_cluster
         from .cute_mma_dag import mma_dag_config_reason
         from .paged_attention_config import paged_attention_config_reason
-        from .pdl_ops import config_conflicts_with_explicit_pdl
+        from .pdl_ops import config_conflicts_with_required_owner
 
-        if config_spec.has_explicit_pdl and config_conflicts_with_explicit_pdl(config):
+        if config_conflicts_with_required_owner(config_spec, config):
             return False
         facts = config_spec.cute_mma_dag_facts
         mode = config.config.get(MMA_DAG_KEY)
@@ -2061,11 +2095,15 @@ class CuteBackend(Backend):
     def pre_inductor_lowering(self, node: torch.fx.Node) -> Lowering | None:
         from ..aten_lowering import sort_lowering
         from .aten_lowering import NumericExtremumLowering
+        from .scalar_fragment_assertion import ScalarFragmentAssertionLowering
         from .static_indexing import StaticIndexLowering
         from .static_indexing import static_tensor_index
         from .uniform_comparison import UniformComparisonLowering
         from .uniform_comparison import match_uniform_float_gt
 
+        if node.target is torch.ops.aten._assert_async.msg:
+            # This impure FX node returns None, not a value for Inductor.
+            return ScalarFragmentAssertionLowering(node)
         if node.target is torch.ops.aten.sort.stable:
             # CuTe's rank/fragment sorting already breaks ties by input index.
             # Keep other backends' existing Inductor stable-sort lowering.
@@ -2698,19 +2736,35 @@ class CuteBackend(Backend):
         prefix: list[ast.stmt],
         ctx: DeviceBodyContext,
     ) -> list[ast.stmt]:
+        from ..uint64_grid import narrow_uint64_grid_uses
+        from .fallback_cluster import outline_fallback_cluster_bodies
         from .passes import launch_attributes
         from .passes import pdl
         from .passes.pipeline import run_kernel_def_passes
         from .pdl_ops import validate_explicit_launch
+        from .scalar_fragment_assertion import requires_assertion_owner
         from .smem_footprint import check_smem_budget
 
         run_kernel_def_passes(fn_def, prefix, ctx)
         fn = ctx.device_function
+        if axes := fn.cute_state.root_plans.unbounded_uint64_axes:
+            narrow_uint64_grid_uses(
+                fn_def,
+                axes,
+                lambda v: expr_from_string("cutlass.Int64({v})", v=v),
+                {"_cute_python_mod": 1},
+                "CuTe",
+            )
         pdl.insert_spread_pad(fn, fn_def, ctx.constexpr_values)
-        validate_explicit_launch(fn, fn_def)
+        validate_explicit_launch(
+            fn, fn_def, scalar_assertion=requires_assertion_owner()
+        )
         # The final body, the spread pad included: a kernel whose shared
         # memory cannot fit one block fails here, not in libNVVM.
         check_smem_budget(fn_def, ctx.constexpr_values, fn.pid)
+        # One body per cluster shape sharing that shared memory
+        # (``tcgen05_fallback_cluster``).
+        outline_fallback_cluster_bodies(fn, fn_def, prefix)
         statements = launch_attributes.module_statements(fn)
         launch_attributes.project_launch_block(fn)
         return statements
@@ -2746,8 +2800,11 @@ class CuteBackend(Backend):
     def kernel_generators(self) -> tuple[KernelGenerator, ...]:
         from .kernel_generators import KERNEL_GENERATORS
         from .pdl_ops import guard_kernel_generators
+        from .scalar_fragment_assertion import requires_assertion_owner
 
-        return guard_kernel_generators(KERNEL_GENERATORS)
+        return guard_kernel_generators(
+            KERNEL_GENERATORS, scalar_assertion=requires_assertion_owner()
+        )
 
     def retry_policy(self) -> RetryPolicy:
         from .kernel_generators import REGENERATION
@@ -2794,19 +2851,23 @@ class CuteBackend(Backend):
         self, env: CompileEnvironment, device_ir: DeviceIR, configs: list[Config]
     ) -> list[Config]:
         from .autotune.heuristics import postprocess_seed_configs
-        from .pdl_ops import config_conflicts_with_explicit_pdl
+        from .pdl_ops import config_conflicts_with_required_owner
+        from .scalar_fragment_assertion import requires_assertion_owner
 
         configs = postprocess_seed_configs(env, device_ir, configs)
-        if env.config_spec.has_explicit_pdl:
+        spec = env.config_spec
+        if spec.has_explicit_pdl or requires_assertion_owner(spec):
             # Promotion precedes this hook; the no-autotuning path consumes
             # that default without calling autotune_config_is_viable.
-            default = env.config_spec.compiler_default_config
-            if default is not None and config_conflicts_with_explicit_pdl(default):
-                env.config_spec.compiler_default_config = None
+            default = spec.compiler_default_config
+            if default is not None and config_conflicts_with_required_owner(
+                spec, default
+            ):
+                spec.compiler_default_config = None
             configs = [
                 config
                 for config in configs
-                if not config_conflicts_with_explicit_pdl(config)
+                if not config_conflicts_with_required_owner(spec, config)
             ]
         return configs
 
@@ -2904,6 +2965,19 @@ class CuteBackend(Backend):
         # pipelines' readiness counters, task events and outlined roots are
         # Triton codegen.
         return ("barrier",)
+
+    def tile_index_dtype(
+        self, index_dtype: torch.dtype, *, serial_device_lane: bool = False
+    ) -> torch.dtype:
+        # Without a thread coordinate to promote the sum, both the native
+        # range counter and lane_offset_expr are signed Int32.
+        if serial_device_lane and index_dtype == torch.uint32:
+            return torch.int32
+        # CuTe ranges and pointer coordinates need at least 32 bits, even
+        # when the kernel uses narrower integer tensors for index values.
+        if index_dtype in (torch.int8, torch.uint8, torch.int16, torch.uint16):
+            return torch.int32
+        return index_dtype
 
     def dtype_str(self, dtype: torch.dtype) -> str:
         from torch._inductor.codegen.cutedsl.cutedsl_op_overrides import (
@@ -3425,6 +3499,16 @@ class CuteBackend(Backend):
                 # output tile (the split index is ``block_idx % divisor``).
                 return f"{index_dtype}(cute.arch.block_idx()[0] // {divisor})"
         return f"{index_dtype}(cute.arch.block_idx()[{dim}])"
+
+    def inductor_matmul_plan(self, facts: MatmulFacts) -> MatmulPlan:
+        from .inductor_plan import matmul_plan
+
+        return matmul_plan(facts)
+
+    def inductor_rules_key(self) -> str:
+        from .inductor_plan import rules_key
+
+        return rules_key()
 
     def inductor_op_overrides(self) -> InductorOpOverrides:
         from torch._inductor.codegen.cutedsl.cutedsl_op_overrides import CuteDSLArg
@@ -4044,6 +4128,20 @@ class CuteBackend(Backend):
 
         return HelionCuteDSLOpOverrides()
 
+    def uint64_expr(self, value: str) -> str:
+        # uint64 scalar tensor storage uses a signed carrier, but division of
+        # a range spanning both signed extremes needs real unsigned arithmetic.
+        if value.isdecimal() and 2**63 <= (literal := int(value)) < 2**64:
+            # MLIR's Python integer attribute constructor takes a signed int64.
+            return f"cutlass.Uint64(cutlass.Int64({literal - 2**64}).ir_value())"
+        return f"cutlass.Uint64({value})"
+
+    def unbounded_uint64_grid_expr(self, name: str, value: str) -> str:
+        from ..device_function import DeviceFunction
+
+        DeviceFunction.current().cute_state.root_plans.unbounded_uint64_axes.add(name)
+        return self.uint64_expr(value)
+
     def cast_expr(self, expr_str: str, dtype_str: str) -> str:
         return f"{dtype_str}({expr_str})"
 
@@ -4142,6 +4240,19 @@ class CuteBackend(Backend):
         if step is not None and step != "1":
             range_args.append(f"cutlass.Int32({step})")
         return f"range({', '.join(range_args)})"
+
+    def device_error_stmt(self, message: str) -> str:
+        return (
+            "_cute_inline_asm_elementwise((cutlass.Int32(0),), "
+            "asm='mov.u32 $0, 0; trap;', constraints='=r,r', "
+            "dtype=cutlass.Int32, is_pure=False)"
+        )
+
+    def persistent_range_str(self, begin: str, end: str, step: str | None) -> str:
+        # Let the DSL promote the operands to the type of the scheduler bound.
+        # An explicit Int32 cast on the upper bound would turn 2**31 negative.
+        args = [begin, end] if step is None else [begin, end, step]
+        return f"range({', '.join(args)})"
 
     def arange_expr(
         self,
@@ -4290,6 +4401,14 @@ class CuteBackend(Backend):
 
     def where_expr(self, mask: str, true_val: str, false_val: str) -> str:
         return f"({true_val}) if ({mask}) else ({false_val})"
+
+    def tile_edge_minimum(self, left: str, right: str) -> str:
+        # A dynamic conditional in the DSL requires matching branch types:
+        # a shape argument is Int64, while a block size or PID can be Int32.
+        return super().tile_edge_minimum(
+            self.cast_expr(left, "cutlass.Int64"),
+            self.cast_expr(right, "cutlass.Int64"),
+        )
 
     def minimum_expr(self, a: str, b: str) -> str:
         from ..compile_environment import CompileEnvironment
@@ -5368,6 +5487,14 @@ class CuteBackend(Backend):
     def validate_codegen_config(
         self, env: CompileEnvironment, device_ir: DeviceIR, config: Config
     ) -> None:
+        from .scalar_fragment_assertion import conflicting_fragment_schedule
+        from .scalar_fragment_assertion import requires_assertion_owner
+
+        if requires_assertion_owner(env.config_spec):
+            if (
+                conflict := conflicting_fragment_schedule(env.config_spec, config)
+            ) is not None:
+                raise exc.InvalidConfig(f"torch._assert_async cannot use {conflict}")
         if config.get("cute_fragment_warp_scan", False):
             from .autotune.heuristics.cute_fragment_warp_scan import (
                 validate_warp_scan_request,
@@ -5461,6 +5588,26 @@ class CuteBackend(Backend):
     def canonicalizes_reduction_loop_blocks(self) -> bool:
         return True
 
+    def nd_device_loop_args(self, state: CodegenState) -> list[object]:
+        # The native range converts floating operands toward zero. Its bounds
+        # must describe the same interval to tile masks and to tile.end.
+        args = list(state.ast_args)
+        for pos in (1, 2, 4):  # start, stop, optional step
+            if pos >= len(args):
+                continue
+            values, exprs = state.proxy_arg(pos), args[pos]
+            if not isinstance(values, (list, tuple)) or not isinstance(exprs, list):
+                continue
+            args[pos] = [
+                self.cast_ast(expr, torch.int32)
+                if isinstance(value, torch.Tensor)
+                and value.is_floating_point()
+                and isinstance(expr, ast.AST)
+                else expr
+                for value, expr in zip(values, exprs, strict=True)
+            ]
+        return args
+
     def prepare_device_loop(
         self,
         graph_info: ForLoopGraphInfo,
@@ -5526,7 +5673,14 @@ class CuteBackend(Backend):
         self, fn: DeviceFunction, block_ids: list[int], config: Config
     ) -> TileStrategy:
         from ..per_thread_planning import plan_per_thread_loop_strategy
+        from .scalar_fragment_assertion import check_root_widths
+        from .scalar_fragment_assertion import requires_assertion_owner
 
+        if (
+            requires_assertion_owner()
+            and block_ids in fn.codegen.host_function.device_ir.grid_block_ids
+        ):
+            check_root_widths(block_ids, config)
         return plan_per_thread_loop_strategy(self, fn, block_ids, config)
 
     # -- thread layout and lane loops of the tile strategies -------------------
@@ -5609,7 +5763,9 @@ class CuteBackend(Backend):
         # an extent that is a multiple of V.  The V-loop sink
         # (``cute/sink_vector_loops.py``) finds the constexpr V-loop by this
         # fact wherever it nests.
-        aligned = isinstance(begin, int) and begin == 0 and step in (None, 1)
+        from ..tile_strategy import _unit_grid_step
+
+        aligned = isinstance(begin, int) and begin == 0 and _unit_grid_step(step)
         fn.cute_state.lanes.vloop_sink_wrappers[wrapper.vec_lane_var] = (
             CuteVloopWrapperFact(
                 block_id=block_id,

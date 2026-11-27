@@ -6,7 +6,12 @@ from types import SimpleNamespace
 
 
 def generated_output_address_coverage(
-    source: str, output_name: str, blocks: int, threads: int
+    source: str,
+    output_name: str,
+    blocks: int,
+    threads: int,
+    *,
+    scalar_args: dict[str, object] | None = None,
 ) -> dict[int, int]:
     """Count every emitted output store for the selected launch geometry."""
     tree = ast.parse(source)
@@ -72,6 +77,7 @@ def generated_output_address_coverage(
     for block in range(blocks):
         for thread in range(threads):
             env: dict[str, object] = {
+                **(scalar_args or {}),
                 "cutlass": SimpleNamespace(
                     Int32=int, Int64=int, Uint32=int, Uint64=int
                 ),

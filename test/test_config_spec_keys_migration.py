@@ -180,7 +180,8 @@ _BASE_VALID_KEYS = """
     tcgen05_clc_query_pacing tcgen05_cluster_m tcgen05_cluster_n
     tcgen05_consumer_regs tcgen05_cta_group tcgen05_cubin_lineinfo
     tcgen05_diagnostic_invalid_output tcgen05_epi_subtile_n tcgen05_epi_warp_groups
-    tcgen05_epilogue_fanout tcgen05_epilogue_layout tcgen05_flat_role_coordinates
+    tcgen05_epilogue_fanout tcgen05_epilogue_layout tcgen05_fallback_cluster
+    tcgen05_flat_role_coordinates
     tcgen05_grouped_ab_tile_k tcgen05_grouped_balanced_workers
     tcgen05_grouped_ctas_per_sm tcgen05_grouped_d_shift
     tcgen05_grouped_dense_row_union tcgen05_grouped_external_direct_pointers
@@ -199,18 +200,20 @@ _BASE_VALID_KEYS = """
     tcgen05_materialized_pdl tcgen05_num_epi_warps tcgen05_persistence_model
     tcgen05_persistent_grid_cap tcgen05_region_ab_stages tcgen05_region_c_stages
     tcgen05_region_pid_types tcgen05_sched_consumer_wait_mode
-    tcgen05_sched_stage_count tcgen05_split_k tcgen05_strategy tcgen05_tile_n
+    tcgen05_sched_stage_count tcgen05_split_k tcgen05_split_k_exchange
+    tcgen05_strategy tcgen05_tile_n
     tcgen05_tvm_ffi_launch tcgen05_warp_register_reallocation
     tcgen05_warp_spec_ab_load_warps tcgen05_warp_spec_c_input_warps
     tcgen05_warp_spec_epi_load_warps tcgen05_warp_spec_mma_warps
     tcgen05_warp_spec_register_decrease tcgen05_warp_spec_register_increase
     tcgen05_warp_spec_scheduler_warps tcgen05_warp_spec_store_warps waves_per_eu
     xcd_remap
-    cute_dot_fragment_mma cute_dot_ring_mma cute_dot_ring_split cute_dot_ring_stages cute_flash_gated_row_warps cute_pdl_spread cute_split_k_atomic_epilogue tcgen05_epi_round_subtiles cute_privatize_atomics
+    cute_dot_fragment_mma cute_dot_ring_mma cute_dot_ring_split cute_dot_ring_stages cute_flash_gated_row_warps cute_pdl_spread cute_split_k_atomic_epilogue cute_split_k_partials tcgen05_epi_round_subtiles cute_privatize_atomics
     cross_loop_tmem_prefetch
     cross_loop_dsmem
     cross_loop_inband_protocol
     worker_registers
+    cross_loop_claim_groups
 """
 
 # ``BACKEND_SPECIFIC_KEYS``.
@@ -353,7 +356,8 @@ _BASE_BACKEND_SPECIFIC_KEYS = """
     tcgen05_c_stages tcgen05_c_store_mode tcgen05_clc_query_pacing tcgen05_cluster_m
     tcgen05_cluster_n tcgen05_consumer_regs tcgen05_cta_group tcgen05_cubin_lineinfo
     tcgen05_diagnostic_invalid_output tcgen05_epi_subtile_n tcgen05_epi_warp_groups
-    tcgen05_epilogue_fanout tcgen05_epilogue_layout tcgen05_flat_role_coordinates
+    tcgen05_epilogue_fanout tcgen05_epilogue_layout tcgen05_fallback_cluster
+    tcgen05_flat_role_coordinates
     tcgen05_grouped_ab_tile_k tcgen05_grouped_balanced_workers
     tcgen05_grouped_ctas_per_sm tcgen05_grouped_d_shift
     tcgen05_grouped_dense_row_union tcgen05_grouped_external_direct_pointers
@@ -372,18 +376,20 @@ _BASE_BACKEND_SPECIFIC_KEYS = """
     tcgen05_materialized_pdl tcgen05_num_epi_warps tcgen05_persistence_model
     tcgen05_persistent_grid_cap tcgen05_region_ab_stages tcgen05_region_c_stages
     tcgen05_region_pid_types tcgen05_sched_consumer_wait_mode
-    tcgen05_sched_stage_count tcgen05_split_k tcgen05_strategy tcgen05_tile_n
+    tcgen05_sched_stage_count tcgen05_split_k tcgen05_split_k_exchange
+    tcgen05_strategy tcgen05_tile_n
     tcgen05_tvm_ffi_launch tcgen05_warp_register_reallocation
     tcgen05_warp_spec_ab_load_warps tcgen05_warp_spec_c_input_warps
     tcgen05_warp_spec_epi_load_warps tcgen05_warp_spec_mma_warps
     tcgen05_warp_spec_register_decrease tcgen05_warp_spec_register_increase
     tcgen05_warp_spec_scheduler_warps tcgen05_warp_spec_store_warps waves_per_eu
     xcd_remap
-    cute_dot_fragment_mma cute_dot_ring_mma cute_dot_ring_split cute_dot_ring_stages cute_flash_gated_row_warps cute_pdl_spread cute_split_k_atomic_epilogue tcgen05_epi_round_subtiles cute_privatize_atomics
+    cute_dot_fragment_mma cute_dot_ring_mma cute_dot_ring_split cute_dot_ring_stages cute_flash_gated_row_warps cute_pdl_spread cute_split_k_atomic_epilogue cute_split_k_partials tcgen05_epi_round_subtiles cute_privatize_atomics
     cross_loop_tmem_prefetch
     cross_loop_dsmem
     cross_loop_inband_protocol
     worker_registers
+    cross_loop_claim_groups
 """
 
 # ``_CUTE_IMPLICIT_DEFAULT_KEYS``.
@@ -446,7 +452,7 @@ _BASE_CUTE_IMPLICIT_DEFAULT_KEYS = """
     l2_groupings load_eviction_policies loop_orders maxnreg num_sm_multiplier
     num_stages num_warps pid_type range_flattens range_multi_buffers
     range_num_stages range_unroll_factors range_warp_specializes static_ranges
-    cute_dot_fragment_mma cute_dot_ring_mma cute_dot_ring_split cute_dot_ring_stages cute_pdl_spread cute_split_k_atomic_epilogue cute_privatize_atomics
+    cute_dot_fragment_mma cute_dot_ring_mma cute_dot_ring_split cute_dot_ring_stages cute_pdl_spread cute_split_k_atomic_epilogue cute_split_k_partials cute_privatize_atomics
 """
 
 # ``{k in VALID_KEYS: CuteBackend().supports_config_key(k)}``.
@@ -585,7 +591,8 @@ _BASE_CUTE_ACCEPTED = """
     tcgen05_clc_query_pacing tcgen05_cluster_m tcgen05_cluster_n
     tcgen05_consumer_regs tcgen05_cta_group tcgen05_cubin_lineinfo
     tcgen05_diagnostic_invalid_output tcgen05_epi_subtile_n tcgen05_epi_warp_groups
-    tcgen05_epilogue_fanout tcgen05_epilogue_layout tcgen05_flat_role_coordinates
+    tcgen05_epilogue_fanout tcgen05_epilogue_layout tcgen05_fallback_cluster
+    tcgen05_flat_role_coordinates
     tcgen05_grouped_ab_tile_k tcgen05_grouped_balanced_workers
     tcgen05_grouped_ctas_per_sm tcgen05_grouped_d_shift
     tcgen05_grouped_dense_row_union tcgen05_grouped_external_direct_pointers
@@ -604,13 +611,14 @@ _BASE_CUTE_ACCEPTED = """
     tcgen05_materialized_pdl tcgen05_num_epi_warps tcgen05_persistence_model
     tcgen05_persistent_grid_cap tcgen05_region_ab_stages tcgen05_region_c_stages
     tcgen05_region_pid_types tcgen05_sched_consumer_wait_mode
-    tcgen05_sched_stage_count tcgen05_split_k tcgen05_strategy tcgen05_tile_n
+    tcgen05_sched_stage_count tcgen05_split_k tcgen05_split_k_exchange
+    tcgen05_strategy tcgen05_tile_n
     tcgen05_tvm_ffi_launch tcgen05_warp_register_reallocation
     tcgen05_warp_spec_ab_load_warps tcgen05_warp_spec_c_input_warps
     tcgen05_warp_spec_epi_load_warps tcgen05_warp_spec_mma_warps
     tcgen05_warp_spec_register_decrease tcgen05_warp_spec_register_increase
     tcgen05_warp_spec_scheduler_warps tcgen05_warp_spec_store_warps
-    cute_dot_fragment_mma cute_dot_ring_mma cute_dot_ring_split cute_dot_ring_stages cute_flash_gated_row_warps cute_pdl_spread cute_split_k_atomic_epilogue tcgen05_epi_round_subtiles cute_privatize_atomics
+    cute_dot_fragment_mma cute_dot_ring_mma cute_dot_ring_split cute_dot_ring_stages cute_flash_gated_row_warps cute_pdl_spread cute_split_k_atomic_epilogue cute_split_k_partials tcgen05_epi_round_subtiles cute_privatize_atomics
 """
 
 # The same census for ``TritonBackend``.
@@ -627,10 +635,12 @@ _BASE_TRITON_ACCEPTED = """
 
 # The same census for ``GluonBackend``: Triton's keys but the ones Gluon
 # ignores (``maxnreg``, ``range_flattens``, ``range_multi_buffers``), and its
-# own: ``cross_loop_dsmem``, ``cross_loop_tmem_prefetch`` and
-# ``worker_registers`` (the last two hand overrides the search never proposes).
+# own: ``cross_loop_claim_groups``, ``cross_loop_dsmem``,
+# ``cross_loop_tmem_prefetch`` and ``worker_registers`` (all but
+# ``cross_loop_dsmem`` hand overrides the search never proposes).
 _BASE_GLUON_ACCEPTED = """
-    advanced_controls_file atomic_indexing block_sizes cross_loop_dsmem
+    advanced_controls_file atomic_indexing block_sizes cross_loop_claim_groups
+    cross_loop_dsmem
     cross_loop_inband_protocol cross_loop_pipeline
     cross_loop_tmem_prefetch epilogue_subtile flatten_loops indexing l2_groupings load_cache_modifiers
     load_eviction_policies loop_orders num_sm_multiplier num_stages num_warps

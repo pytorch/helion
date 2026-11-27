@@ -1917,8 +1917,7 @@ def _subscript_slot_dims(
     }
     sizes: list[int | torch.SymInt] = []
     block_ids: list[int | None] = []
-    tensor_indexers = [idx for idx in subscript if isinstance(idx, torch.Tensor)]
-    should_broadcast = env.should_broadcast_tensor_indexers([*subscript])
+    group = env.tensor_indexer_broadcast_group([*subscript])
     tensor_dim = 0
     for position, idx in enumerate(subscript):
         if idx is None:
@@ -1929,7 +1928,11 @@ def _subscript_slot_dims(
             tensor.shape[tensor_dim], 1
         )
         tile_info = _get_tile_with_offset_info(idx, state.fx_node, position)
-        if tile_info is not None and tile_info.block_size is not None:
+        if (
+            (group is None or not isinstance(idx, torch.Tensor))
+            and tile_info is not None
+            and tile_info.block_size is not None
+        ):
             # ``_cute_index_exprs`` takes its unit-dim "0" branch first and
             # does not use the block then.
             if not unit_dim:
@@ -1953,10 +1956,10 @@ def _subscript_slot_dims(
         elif isinstance(idx, int):
             tensor_dim += 1
         elif isinstance(idx, torch.Tensor):
-            if not should_broadcast:
+            if group is None:
                 indexer_sizes = [*env.tensor_indexer_dims(idx)]
-            elif idx is tensor_indexers[0]:
-                indexer_sizes = [*env.tensor_indexer_broadcast_shape(tensor_indexers)]
+            elif position == group[0]:
+                indexer_sizes = [*env.tensor_indexer_broadcast_shape(group[1])]
             else:
                 indexer_sizes = []
             sizes.extend(indexer_sizes)

@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import ast
+import builtins
 from collections import defaultdict
 import contextlib
 import dataclasses
 import enum
 import itertools
+import logging
 import math
 import threading
 from typing import TYPE_CHECKING
@@ -20,6 +22,8 @@ import torch
 from torch._dynamo.source import TensorProperty
 from torch._dynamo.source import TensorPropertySource
 from torch.fx.graph import _Namespace
+from torch.utils._sympy.value_ranges import ValueRanges
+from torch.utils._sympy.value_ranges import bound_sympy
 
 from .. import exc
 from .._compat import get_tensor_descriptor_fn_name
@@ -58,6 +62,7 @@ if TYPE_CHECKING:
     from ..runtime.config import IndexingLiteral
     from .cross_loop_codegen import PeerState
     from .cross_loop_dsmem import DsmemTransport
+    from .cross_loop_scheduler import CrossLoopDispatchMode
     from .cross_loop_timeline import Timeline
     from .cute.bounded_cache_codegen import BoundedCacheRequest
     from .cute.device_state import CuteDeviceFunctionState
@@ -83,6 +88,12 @@ if TYPE_CHECKING:
 
 
 tls: _TLS = cast("_TLS", threading.local())
+log: logging.Logger = logging.getLogger(__name__)
+
+
+FLAT_GRID_ELEMENT_LIMIT = (
+    "flattened root grid count exceeds signed Int64 before dividing by the tile width"
+)
 
 
 class RingFallback(exc.Base):
@@ -90,6 +101,15 @@ class RingFallback(exc.Base):
 
     def report(self) -> str:
         return f"gluon ring fallback: {self}"
+
+
+class RingFillFallback(exc.Base):
+    """The gluon ring cannot take this kernel's computed dot operands as body
+    fills (``RingLowering._fill``): regenerate it with the ring but no fills,
+    those dots issuing from the body."""
+
+    def report(self) -> str:
+        return f"gluon ring fill fallback: {self}"
 
 
 def _exact_thread_block_dims(
@@ -434,6 +454,11 @@ class DeviceFunction:
         self.arguments: list[Argument] = []
         self.preamble: list[ast.AST] = []
         self.body: list[ast.AST] = []
+        self._grid_length_checks: set[str] = set()
+        self._host_grid_operands: dict[sympy.Expr, str] = {}
+        self.signed_host_grid_bounds: set[sympy.Expr] = set()
+        self.host_grid_size_exprs: set[sympy.Expr] = set()
+        self._device_grid_products: dict[sympy.Expr, str] = {}
         self._tensor_args: dict[torch.Tensor, TensorArg] = {}
         self._tensor_descriptor_args: dict[
             tuple[torch.Tensor, str, bool | None, bool], TensorDescriptorArg
@@ -525,6 +550,7 @@ class DeviceFunction:
         # Triton/NVSHMEM receive completion is hidden from the frontend. The
         # lowering appends one compiler-managed signal-pad pointer to the kernel
         # signature and assigns one slot per receive-wait descriptor.
+        self.triton_unbounded_uint64_axes: set[str] = set()
         self.triton_remote_copy_signal_arg: str | None = None
         self.triton_remote_copy_signal_dst: str | None = None
         self.triton_remote_copy_signal_slots = 0
@@ -558,6 +584,14 @@ class DeviceFunction:
         # sends as tagged words and the graph whose transport says so.
         self.tagged_allocation_ids: frozenset[int] | None = None
         self.codegen_dependency_graph: TileDependencyGraph | None = None
+        # The roots before which the megakernel codegen ran hl.prefetch_code()
+        # (``CompileEnvironment.prefetch_code_sites``); the others run at entry.
+        self.prefetch_code_placed: set[int] = set()
+        # How the megakernel schedule dispatches its tasks (None: barrier phases
+        # or no megakernel schedule): static and claimed dispatch run each
+        # resident root's tasks as a block of their own on a resident persistent
+        # grid; dynamic packet dispatch launches a program per task.
+        self.cross_loop_dispatch: CrossLoopDispatchMode | None = None
         # Cross-grid polling is safe in isolation only when the required worker
         # cohort can reside together. The launcher validates exact compiled
         # occupancy, but does not reserve capacity against concurrent streams.
@@ -947,7 +981,138 @@ class DeviceFunction:
             )
         self.pid = pid
 
+    def check_grid_length(self, length: str, live_siblings: list[str]) -> None:
+        """An empty Cartesian product does not need its other coordinates."""
+        backend = CompileEnvironment.current().backend
+        ceiling = backend.uint64_expr(str(2**63 - 1))
+        checks = [f"({length}) > {ceiling}", *live_siblings]
+        self.check_grid_overflow(" and ".join(f"({check})" for check in checks))
+
+    def has_host_grid_value(self, name: str) -> bool:
+        return name in self._constexpr_host_defs
+
+    def check_host_grid_count(
+        self,
+        count: str,
+        message: str = "root grid count exceeds signed Int64",
+    ) -> None:
+        """Evaluate host-known products before native fixed-width arithmetic."""
+        self.check_host_grid_error(f"({count}) > {2**63 - 1}", message)
+
+    def check_host_grid_error(self, condition: str, message: str) -> None:
+        if condition not in self._grid_length_checks:
+            self._grid_length_checks.add(condition)
+            error = (
+                HostFunction.current()
+                .import_from_module(vars(builtins), "OverflowError")
+                .host_str()
+            )
+            self.codegen.host_statements.append(
+                statement_from_string(
+                    f"if {condition}:\n    raise {error}({message!r})"
+                )
+            )
+
+    def check_grid_overflow(self, condition: str) -> None:
+        self.check_grid_error(condition, "root grid count exceeds signed Int64")
+
+    def check_grid_error(self, condition: str, message: str) -> None:
+        backend = CompileEnvironment.current().backend
+        if condition not in self._grid_length_checks:
+            self._grid_length_checks.add(condition)
+            self.preamble.append(
+                statement_from_string(
+                    f"if {condition}:\n    {backend.device_error_stmt(message)}"
+                )
+            )
+
+    def host_grid_arg(self, prefix: str, host_expr: str) -> str:
+        """Pass a Python range operand without repeating its arithmetic on the device."""
+        code = HostFunction.current().fn.__code__
+        host_names = {
+            *code.co_names,
+            *code.co_varnames,
+            *code.co_freevars,
+            *code.co_cellvars,
+        }
+        name = self.new_var(prefix)
+        while name in host_names:
+            name = self.new_var(prefix)
+        self.host_constexpr_def(name, host_expr)
+        self.arguments.append(SymbolArgument(name, name))
+        return name
+
+    def root_grid_operand(self, expr: sympy.Expr, prefix: str) -> str:
+        host_fn = HostFunction.current()
+        host = host_fn.sympy_expr(expr, self.config)
+        if isinstance(expr, sympy.Symbol) or not expr.free_symbols:
+            return host
+        origin = host_fn.expr_to_origin.get(expr)
+        if origin is not None and origin.origin.is_host():
+            # The original host scalar already carries the complete expression.
+            # Keep its config specialization and ABI, including for derived grids.
+            if expr not in self._host_grid_operands:
+                self._host_grid_operands[expr] = self.sympy_expr(expr)
+            return host
+        if expr not in self._host_grid_operands:
+            self._host_grid_operands[expr] = self.host_grid_arg(prefix, host)
+        return self._host_grid_operands[expr]
+
+    def grid_factor_product(self, left: str, right: str) -> str:
+        backend = CompileEnvironment.current().backend
+        return (
+            f"({backend.cast_expr(left, backend.dtype_str(torch.int64))} * ({right}))"
+        )
+
+    def root_grid_product(self, left: sympy.Expr, right: sympy.Expr) -> sympy.Expr:
+        product = sympy.Mul(left, right)
+        # Render partial products before SymPy distributes a factor over a
+        # captured compound bound. A zero product never needs a wide prefix.
+        if (
+            product not in (left, right)
+            and CompileEnvironment.current().specialize_expr(product).free_symbols
+        ):
+            self._device_grid_products[product] = self.grid_factor_product(
+                self.sympy_expr(left), self.sympy_expr(right)
+            )
+        return product
+
+    def check_flat_grid_factors(self, factors: tuple[sympy.Expr | str, ...]) -> None:
+        if all(
+            not isinstance(axis, str) or self.has_host_grid_value(axis)
+            for axis in factors
+        ):
+            host = HostFunction.current()
+            sizes = [
+                axis if isinstance(axis, str) else host.sympy_expr(axis, self.config)
+                for axis in factors
+            ]
+            self.check_host_grid_count(
+                " * ".join(f"({size})" for size in sizes), FLAT_GRID_ELEMENT_LIMIT
+            )
+            return
+        backend = CompileEnvironment.current().backend
+        sizes = [
+            axis if isinstance(axis, str) else self.sympy_expr(axis) for axis in factors
+        ]
+        ceiling = backend.uint64_expr(str(2**63 - 1))
+        live = [f"(({size}) != 0)" for size in sizes]
+        prefix = sizes[0]
+        for size in sizes[1:]:
+            den = backend.uint64_expr(f"(({size}) + (({size}) == 0))")
+            self.check_grid_error(
+                " and ".join(
+                    [f"({backend.uint64_expr(prefix)} > {ceiling} // {den})", *live]
+                ),
+                FLAT_GRID_ELEMENT_LIMIT,
+            )
+            prefix = self.grid_factor_product(prefix, size)
+
     def sympy_expr(self, expr: sympy.Expr) -> str:
+        if expr in self._device_grid_products:
+            return self._device_grid_products[expr]
+        if expr in self._host_grid_operands:
+            return self._host_grid_operands[expr]
         env = CompileEnvironment.current()
         with contextlib.suppress(Exception):
             expr = env.shape_env.simplify(expr)
@@ -1086,19 +1251,17 @@ class DeviceFunction:
             block_size = "1"
         if self.codegen.mask_var(block_id) is None:
             return block_size
-        end = (
-            self.codegen.active_device_loops[block_id][-1]
-            .block_id_to_info[block_id]
-            .end_var_name
-        )
-        if end is None:
+        info = self.codegen.active_device_loops[block_id][-1].block_id_to_info[block_id]
+        if info.end_var_name is None:
             raise exc.BackendUnsupported(
                 env.backend.name,
                 f"a mean over tile dim {block_id} in a masked loop without an end "
                 "variable: the tile's extent is unknown there",
             )
+        if unsigned := self.codegen.unsigned_tile_edge(block_id, extent=True):
+            return unsigned
         begin = self.codegen.tile_begin_var(block_id)
-        clamped = env.backend.minimum_expr(f"{begin} + {block_size}", end)
+        clamped = self.codegen.tile_end_expr(block_id)
         return f"(({clamped}) - {begin})"
 
     def user_sympy_expr(self, expr: sympy.Expr) -> str:
@@ -1151,6 +1314,23 @@ class DeviceFunction:
 
     def sync_names(self, *kinds: str) -> set[str]:
         return {name for name, role in self.sync_roles.items() if role.kind in kinds}
+
+    def prefetch_code_statement(self) -> ast.stmt:
+        """An hl.prefetch_code() site's call: each CTA passes its rank in a count
+        of the CTAs that selects and numbers the readers, who split the text
+        (``prefetch_code``).  A persistent grid counts from its last worker,
+        the one that idles longest at entry when the first root has fewer
+        tasks than workers (the static plan fills it from the first worker);
+        a site between roots uses the same count.  Any other launch counts
+        from its first CTA (the later CTAs of a grid of waves, or of packet
+        dispatch's program per task, launch after it)."""
+        rank = "tl.program_id(0)"
+        if (
+            str(self.config.pid_type).startswith("persistent")
+            and self.cross_loop_dispatch != "dynamic"
+        ):
+            rank = f"tl.num_programs(0) - 1 - {rank}"
+        return statement_from_string(f"helion_prefetch_code.prefetch_code({rank})")
 
     def graph_infos(self) -> list[GraphInfo]:
         """This config's codegen graph copies, then the traced originals (a copy's
@@ -1592,13 +1772,27 @@ class DeviceFunction:
             and "wait" not in env.pdl_entry
         ):
             raise exc.PdlStateWithoutWait
-        prefetch_code = (
-            [statement_from_string("helion_prefetch_code.prefetch_code()")]
-            if env.prefetch_code and backend.uses_triton_compiler
-            else []
-        )
+        unplaced = [
+            root
+            for root in env.prefetch_code_sites
+            if root is not None and root not in self.prefetch_code_placed
+        ]
+        for root in unplaced:
+            log.info(
+                "hl.prefetch_code() before root %d runs at entry: %s",
+                root,
+                # A static or claimed schedule gives each resident root a block.
+                "its tasks continue an earlier root's, in that root's block"
+                if self.cross_loop_dispatch in ("static", "claimed")
+                else "the launch runs no root's tasks as a block of its own (a "
+                "static or claimed persistent schedule does)",
+            )
         entry = [
-            *prefetch_code,
+            *(
+                [self.prefetch_code_statement()]
+                if None in env.prefetch_code_sites or unplaced
+                else []
+            ),
             *[
                 statement_from_string(backend.pdl_instruction(op))
                 for op in env.pdl_entry
@@ -1770,7 +1964,49 @@ class DeviceFunction:
                 result[tensor_arg.name, dim] = (property_arg.name, value)
         return result
 
+    def _check_marshaled_grid_bounds(self) -> None:
+        """Check the grid values the native ABI actually receives, after DCE."""
+        candidates = {
+            **{
+                expr: arg.name
+                for expr, arg in self._expr_args.items()
+                if expr in self.signed_host_grid_bounds
+            },
+            **self._host_grid_operands,
+        }
+        if not candidates:
+            return
+        surviving = {arg.name: arg.host_str() for arg in self.arguments}
+        for expr, name in candidates.items():
+            if name not in surviving or not expr.free_symbols:
+                continue
+            value = surviving[name]
+            if value.lstrip("-").isdigit() and -(2**63) <= int(value) < 2**63:
+                continue
+            if expr in self.host_grid_size_exprs:
+                continue
+            if expr.free_symbols <= self.host_grid_size_exprs:
+                # Tensor dimensions have a signed ABI already. Preserve the
+                # fast path for any arithmetic proved safe over their domain.
+                try:
+                    bounds = bound_sympy(
+                        expr,
+                        {
+                            cast("sympy.Symbol", symbol): ValueRanges(0, 2**63 - 1)
+                            for symbol in expr.free_symbols
+                        },
+                    )
+                    if bounds.lower >= -(2**63) and bounds.upper < 2**63:
+                        continue
+                except (KeyError, AttributeError, NotImplementedError):
+                    pass
+            self.check_host_grid_error(
+                f"(not {-(2**63)} <= ({value}) < {2**63})",
+                "runtime root grid argument does not fit signed Int64",
+            )
+
     def codegen_function_call(self) -> ast.AST:
+        self._check_marshaled_grid_bounds()
         env = CompileEnvironment.current()
         backend = env.backend
 

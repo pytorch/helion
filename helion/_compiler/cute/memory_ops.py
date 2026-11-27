@@ -109,6 +109,7 @@ from .emitters.memory_access import _cute_tensor_dim_size_expr
 from .emitters.memory_access import _cute_unique_graph_block_id
 from .emitters.memory_access import _matching_block_ids
 from .emitters.memory_access import _maybe_codegen_cute_packed_affine_lhs_load
+from .emitters.memory_access import resolve_scalar_index_args
 from .gathered_bounds import mask_bounded_gather_positions
 from .gathered_bounds import proven_gather_positions
 from .indexing import CUTE_SCALAR_LOAD_SITE_META
@@ -3417,6 +3418,7 @@ def _(state: CodegenState) -> ast.AST:
             raise tcgen05_rebound_store_error(state, rebound)
         drain_deferred_rebound_checks()
 
+    state = resolve_scalar_index_args(state)
     tensor = state.proxy_arg(0)
     subscript = state.proxy_arg(1)
     assert isinstance(subscript, (list, tuple))
@@ -7705,6 +7707,7 @@ def _(state: CodegenState) -> object:
         else None
     )
 
+    state = resolve_scalar_index_args(state)
     tensor = state.proxy_arg(0)
     subscript = state.proxy_arg(1)
     assert isinstance(subscript, (list, tuple))

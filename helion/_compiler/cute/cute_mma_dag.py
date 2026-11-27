@@ -499,6 +499,44 @@ MMA_DAG_TILE_LADDER: tuple[int, ...] = (16, 32, 64, 128)
 MMA_DAG_MIN_BM = 16
 MMA_DAG_MIN_BN = 8
 MMA_DAG_K_STEP = 16
+
+
+def mma_dag_takes_row(extent: int) -> bool:
+    """Whether cute_mma_dag takes a reduction row of ``extent`` elements read
+    as one block as it is, such as the K of helion.inductor's stored bmm
+        tmp0 = in0[tile_z, tile_y, :]
+        tmp1 = in1[tile_z, :, tile_x]
+        tmp2 = torch.bmm(tmp0, tmp1)
+    a power of two and a multiple of the MMA K step. Another row it computes
+    padded to the next such row (``mma_dag_padded_row``) where the row only
+    contracts dots over tiles loaded from memory (``padded_rows_zero_filled``),
+    and declines elsewhere."""
+    return extent > 0 and not extent & (extent - 1) and extent % MMA_DAG_K_STEP == 0
+
+
+def mma_dag_padded_row(extent: int) -> int:
+    """The row cute_mma_dag computes a reduction row of ``extent`` elements
+    over when it does not take the row as it is (``mma_dag_takes_row``): the
+    next power of two (the size the frontend gives the full slice's block,
+    ``static_rdim_size``), but at least one MMA K step (16 over a K of 8,
+    whose frontend block is 8), and a row the swizzled shared tiles hold (a
+    K-major K of 80 padded to 80 only would make rows of ten 16-byte chunks,
+    which the eight-way XOR swizzle maps past the row: chunk 9 of row 7 to
+    14). The window attention backward's bf16
+    ``attn.mT @ grad`` over 7x7 windows, a bmm of [B, 49, 49] (column-major)
+    by [B, 49, 32], computes its K of 49 over a 64-wide row:
+        md_zf = cutlass.Int32(16) if md_pr4 < 49 else cutlass.Int32(0)
+        _helion_mma_dag.cp_async_16_zfill(md_t1 + md_pr4 * 64 + ..., md_base_1 + cutlass.Int64(md_pr4) * 64 + ..., md_zf)
+        md_ok = cutlass.Int32(1) if md_pr < 49 and md_a1 + 2 * md_pc < 49 else cutlass.Int32(0)
+        md_lo = _helion_mma_dag.ldg_bf16_as_f32_pred(md_base + cutlass.Int64(md_pr) * 98 + ..., md_ok)
+    its B rows and A columns past 49 zero-filled, the fourth K step of each
+    MMA adding 15 products of zeros. The row it is not taken over runs the
+    SIMT dot: GB300, 32768 matrices, of stock Inductor max-autotune (its
+    Triton template) in CUDA graphs over cold inputs, full-effort autotune,
+    0.17 on the SIMT dot (577 us) against 1.34 padded (74.8 us)."""
+    return max(MMA_DAG_K_STEP, 1 << (extent - 1).bit_length())
+
+
 _OPERAND_DTYPES: tuple[torch.dtype, ...] = (torch.bfloat16, torch.float16)
 # fp32 operands run as tf32 (``mma.sync.m16n8k8.tf32``, inputs truncated to
 # tf32 like Triton's ``input_precision='tf32'``) only under that setting.
@@ -707,7 +745,9 @@ class Axis:
     extent: int
     loop: int = -1
     # A fixed tile loop or complete root tile (``hl.tile(n, block_size=C)``):
-    # the size is the kernel's, not the config's.
+    # the size is the kernel's, not the config's.  An ``rdim`` whose extent
+    # is not a row the owner takes (``mma_dag_takes_row``) is computed over
+    # its padded row (``mma_dag_padded_row``): a K of 49 has size 64.
     size: int | None = None
 
 
@@ -1572,9 +1612,12 @@ class AxisFacts:
     # the last CTA's rows past the extent are zero-filled operand rows and
     # zero side loads, their stores dropped).  See ``ragged_root_axes``.
     ragged: bool = False
-    # The block size of a fixed tile loop or complete root (``Axis.size``);
-    # None for an axis the config sizes.
+    # The block size of a fixed tile loop or complete root, or the padded
+    # row of an rdim (``Axis.size``); None for an axis the config sizes.
     fixed: int | None = None
+    # The smallest block of a ragged contiguous dim: its CTAs must start at
+    # whole moves of the accesses along it (``ragged_min_blocks``).
+    min_block: int = 1
 
     @property
     def tunable(self) -> bool:
@@ -1739,6 +1782,12 @@ class CuteMmaDagFacts:
     loops: tuple[LoopFacts, ...] = (LoopFacts(-1, True),)
     # The frame of each staging entry (empty: all in loop 0's frame).
     staging_frames: tuple[int, ...] = ()
+    # ``element_store``s' staging tiles: (rows, cols, bytes). They make
+    # ``cute_mma_dag_store`` a search subject, but ``mma_dag_smem_estimate``
+    # does not charge them: the planner stages such a store only where its
+    # tile fits beside the rest (``plan_mma_dag``), else stores it directly,
+    # so every config the estimate admitted before still runs.
+    element_staging: tuple[tuple[int, int, int], ...] = ()
     # Vector slots (row / column reductions of fragments and their carries).
     vecs: tuple[VecFacts, ...] = ()
     # The tcgen05 mode's admission facts (None: not admitted).
@@ -1808,7 +1857,10 @@ class CuteMmaDagFacts:
             return 1
         if facts.kind == AXIS_RDIM:
             value = sizes.get(facts.block_id)
-            return value if type(value) is int else facts.extent
+            if type(value) is int:
+                return value
+            # A padded row is computed at its padding (64 over a K of 49).
+            return facts.extent if facts.fixed is None else facts.fixed
         if facts.fixed is not None:
             return facts.fixed
         value = sizes.get(facts.block_id)
@@ -1921,6 +1973,9 @@ class MmaDagPlan:
     routes: dict[tuple[Node, str], str]
     staged_stores: tuple[Store, ...]
     exchange_mode: str
+    # ``element_store``s staged through a shared tile and copied out along
+    # its rows (the warp mode's ``cute_mma_dag_store="staged"``).
+    element_stores: tuple[Store, ...] = ()
     # Fragment shape (rows, cols) -> warp grid (wm, wn).
     layouts: Layouts = dataclasses.field(default_factory=dict)
     # Derived values' 2-D tile loads (by load node): ``shared`` (cp.async
@@ -2062,8 +2117,19 @@ class MmaDagPlan:
         owns: the block does not divide the extent (the last CTA holds rows
         past it) or the block is below the MMA atom (every CTA computes the
         atom, of which it owns the block).  ``mma_dag_config_reason`` admits
-        this only for the axes ``ragged_root_axes`` names."""
+        this only for the axes ``ragged_root_axes`` names.  A padded row
+        (``padded_row_axes``) overshoots its extent in every CTA."""
         block = self.block(axis)
+        if axis.kind == AXIS_RDIM:
+            # The staging zero-fills a padded row's elements past the extent
+            # under ``in_bounds``'s guard (``md_pr < 49`` over a K of 49 on a
+            # 64-wide row). Unguarded, the window attention backward's bmm of
+            # 4100 x [49, 49] (column-major) by [49, 32] loads B's K rows
+            # 49-63 from the next matrix and A's from past each matrix's
+            # last row: max abs error 25.9 against an fp32 reference (0.12
+            # guarded). A cluster-split rdim (``extent // cluster`` per CTA)
+            # is not padded: its slices are whole.
+            return axis.size is not None and axis.size != axis.extent
         return axis.kind == AXIS_ROOT and (
             block != self.size(axis) or axis.extent % block != 0
         )
@@ -2378,6 +2444,12 @@ class MmaDagPlan:
                 2,
             )
             items.append((store.loop, "staging", store.access.node, spec))
+        for index, store in enumerate(self.element_stores):
+            rows, cols = self.slot_shape(program.frag_slots[store.frag])
+            spec = SmemTileSpec(
+                f"md_se{index}", 0, rows, cols, store.access.dtype.itemsize, 1
+            )
+            items.append((-1, "staging", store.access.node, spec))
         # The vector operations' shared scratch (cross-warp reductions,
         # relayouts, scalar reductions), used one at a time behind barriers.
         scratch_bytes = self.vec_scratch_bytes()
@@ -2737,7 +2809,9 @@ def mma_dag_aux_records(
     across the packets a word per packet the thread owns, one along the
     source tile's contiguous dim a 16-byte run per packet copied once per
     CTA (a word per packet element where its runs cannot be 16-byte
-    copies) -- and the other per-thread
+    copies, or where the dim may run ragged: a run copies the whole block,
+    past a ragged extent, while the predicated reads there skip the ring)
+    -- and the other per-thread
     side loads varying with the loop that the lanes read at their own
     coordinates (the carry rescale's decay scalar / row, a derived value's
     gate row, a store's or reduction's vector): fp32 scalars and one-dim
@@ -2824,6 +2898,7 @@ def mma_dag_aux_records(
                     and access.dtype in (torch.float16, torch.bfloat16, torch.float32)
                     and (run_elems * access.dtype.itemsize) % 16 == 0
                     and aux_run_reason(env, access) is None
+                    and along.index not in ragged
                 ):
                     kind = "run"
                 else:
@@ -3280,6 +3355,12 @@ def mma_dag_config_reason(
             return Reason(
                 f"block size {size} of tile axis {axis.block_id} must be a power of two"
             )
+        if size < axis.min_block:
+            return Reason(
+                f"block size {size} of tile axis {axis.block_id} must be at least "
+                f"{axis.min_block}: each CTA must start at a whole move along "
+                "this contiguous dim"
+            )
         if axis.kind in (AXIS_ROOT, AXIS_LOOP) and axis.extent % size:
             # A root tile past its extent (a 16-row MMA atom over M = 8)
             # runs on the warp path where the emitter predicates the ragged
@@ -3466,8 +3547,9 @@ def mma_dag_ragged_ceilings(facts: CuteMmaDagFacts) -> dict[int, int]:
 
 def _fixed_sizes(facts: CuteMmaDagFacts) -> dict[int, int]:
     """Block id -> size of every axis the config does not size: one for a
-    lead, the extent for an rdim, the kernel's block size for a fixed-size
-    tile loop."""
+    lead, the extent for an rdim (its padded row when the extent is not a
+    row the owner takes: ``mma_dag_padded_row``), the kernel's block size
+    for a fixed-size tile loop."""
     sizes: dict[int, int] = {}
     for axis in facts.axes:
         if axis.tunable:
@@ -4860,13 +4942,15 @@ class _Matcher:
                 extent = self.static_int(info.size)
             if extent is None or extent <= 0:
                 raise _NotMine
-            if kind == AXIS_RDIM and (extent & (extent - 1) or extent % MMA_DAG_K_STEP):
-                raise _NotMine
             size = (
                 self.fixed_sizes.get(block_id)
                 if kind in (AXIS_ROOT, AXIS_LOOP)
                 else None
             )
+            if kind == AXIS_RDIM and not mma_dag_takes_row(extent):
+                # Computed over its padded row, which the program must keep
+                # to dots over zero-filled loads (``padded_rows_zero_filled``).
+                size = mma_dag_padded_row(extent)
             if kind == AXIS_LOOP and size is not None and extent % size:
                 raise _NotMine
             axis = Axis(len(self.axis_list), block_id, kind, extent, loop, size)
@@ -6227,11 +6311,6 @@ class _Matcher:
         cols_pos = contiguous[0]
         rows_pos = 1 - cols_pos
         rows, cols = source_dims[rows_pos], source_dims[cols_pos]
-        if (
-            access.index_map is None
-            and (access.tile_dim_strides[rows_pos] * access.dtype.itemsize) % 4
-        ):
-            raise _NotMine
         # The tile is staged as loaded, or rewritten per element (a 16-bit
         # tile in place or from an fp32 source, an fp32 operand from a 16-bit
         # source; the in-place pass rewrites 16-bit packets only).
@@ -6328,6 +6407,24 @@ class _Matcher:
                 break
             current = inner
         return current if peeled else node
+
+    def peels_fill(self, node: Node, peeled: Node) -> bool:
+        """Whether ``squeeze_lead`` took dot operand ``node`` to ``peeled``
+        past a ``_mask_to`` that ``peeled`` may need: the frontend zero-fills
+        the batched view, ``_mask_to(exp(a[tile_m, :]).unsqueeze(0).expand(
+        [tile_z, -1, -1]), 0)``, and the peeled ``exp(load)`` is 1 where the
+        staging zero-fills the load.  A tile loaded as it is needs no fill."""
+        from ...language import _tracing_ops
+        from ...language import memory_ops
+
+        if _is_call(self.resolve(peeled), memory_ops.load):
+            return False
+        current = node
+        while current is not peeled:
+            if _is_call(current, _tracing_ops._mask_to):
+                return True
+            current = cast("Node", current.args[0])
+        return False
 
     def leaf_consumers(self, leaf: Node) -> list[Node]:
         """The nodes consuming ``leaf``'s value, looked through the
@@ -6872,6 +6969,8 @@ class _Matcher:
             not _is_call(access.node, memory_ops.store) and _storage(access) in stored
             for access in program.accesses
         ):
+            raise _NotMine
+        if not padded_rows_zero_filled(program):
             raise _NotMine
         program.pass_chains.update(mma_dag_pass_chains(program))
         return program
@@ -7723,12 +7822,28 @@ class _Matcher:
             b_node, torch.fx.Node
         ):
             raise _NotMine
+        operands = (a_node, b_node)
         a_node, b_node = self.squeeze_lead(a_node), self.squeeze_lead(b_node)
         a_dims = self.tile_dims(a_node)
         if len(a_dims) != 2 or a_dims[0] is not rows:
             raise _NotMine
         k = a_dims[1]
         if k.kind == AXIS_LEAD:
+            raise _NotMine
+        if (
+            k.kind == AXIS_RDIM
+            and k.size is not None
+            and k.size != k.extent
+            and any(
+                itertools.starmap(
+                    self.peels_fill, zip(operands, (a_node, b_node), strict=True)
+                )
+            )
+        ):
+            # A padded row's extra K steps must add products of zeros
+            # (``padded_rows_zero_filled``): batched ``exp(load)`` operands
+            # stripped of the frontend's fill (``peels_fill``) would add
+            # 1 * 1 per padded element of K.
             raise _NotMine
         # A loop axis sizes the dot only inside that loop (or a nested one).
         if not all(self.encloses(loop, axis) for axis in (rows, cols, k)):
@@ -8017,6 +8132,81 @@ class _Matcher:
         )
 
 
+def padded_row_axes(program: MmaDagProgram) -> frozenset[int]:
+    """The full-slice axes (by index) computed over a padded row
+    (``mma_dag_padded_row``): their extent is not a row cute_mma_dag takes."""
+    return frozenset(
+        axis.index
+        for axis in program.axes
+        if axis.kind == AXIS_RDIM and axis.size is not None and axis.size != axis.extent
+    )
+
+
+def padded_rows_zero_filled(program: MmaDagProgram) -> bool:
+    """Whether every padded row of ``program`` (``padded_row_axes``) only
+    contracts dots over tiles loaded from memory, which the staging
+    zero-fills past the extent (``MmaDagPlan.ragged``), so the padded K
+    steps add products of zeros. A pointwise operand over such a tile
+    takes the frontend's ``_mask_to`` fill there (``value_bounds``): for
+    ``torch.bmm(torch.exp(a[tile_z, tile_y, :]), torch.exp(b[tile_z, :,
+    tile_x]))`` over K = 49 it renders
+        md_v_3 = md_v_2 if 2 * md_pc < 49 else cutlass.BFloat16(cutlass.Float32(0.0))
+    and matches an fp32 reference to 0.19 (bf16 rounding, as the SIMT dot);
+    without the fill each padded step adds exp(0) * exp(0) = 1 (every
+    output off by 15). Where the fill wraps a batch view that the dot
+    peels off its operand (``_Matcher.squeeze_lead``), only an operand
+    loaded as it is keeps the padding (``_Matcher.peels_fill``).
+
+    Every move along the contiguous dim of a padded tile must lie wholly
+    inside the extent or wholly past it (``contiguous_granule_bytes``): a
+    K-major K of 52 in rows 56 elements apart loads the 16-byte packet of
+    columns 48-55 whole, columns 52-55 being the row's padding (NaN there:
+    every output NaN), while a K of 56 there fills whole packets and 98-byte
+    rows (K = 49) move element by element.
+
+    The padding is kept out of everything the guards were not written for:
+    no fragment or vector runs along a padded row (an attention's P @ V
+    would make it the columns of the output), and no other access reads it
+    (a store, a side load, a window at a runtime offset, a folded index
+    map): such programs stay with the other lowerings."""
+    padded = padded_row_axes(program)
+    if not padded:
+        return True
+    for rows, cols in program.slots:
+        if rows.index in padded or cols.index in padded:
+            return False
+    if any(
+        slot.axis is not None and slot.axis.index in padded
+        for slot in program.vec_slots
+    ):
+        return False
+    operand_loads = {
+        operand.load.node
+        for dot in program.dots
+        if dot.k.index in padded
+        for operand in (dot.a, dot.b)
+        if operand.load is not None
+    }
+    for access in program.accesses:
+        if not {axis.index for axis in access.dims} & padded:
+            continue
+        if (
+            access.node not in operand_loads
+            or access.windows
+            or access.index_map is not None
+        ):
+            return False
+        granule = contiguous_granule_bytes(access)
+        for axis, stride in zip(access.tile_dims, access.tile_dim_strides, strict=True):
+            if (
+                axis.index in padded
+                and stride == 1
+                and (axis.extent * access.dtype.itemsize) % granule
+            ):
+                return False
+    return True
+
+
 def match_mma_dag(
     graphs: Sequence[GraphInfo],
     *,
@@ -8149,17 +8339,74 @@ def _whole_k_words(program: MmaDagProgram, dot: Dot, operand: Operand) -> bool:
     return operand.dtype.itemsize == 2 or program.frag_slots[operand.frag] == dot.slot
 
 
+def contiguous_granule_bytes(access: Access) -> int:
+    """The widest move the warp emitter may make along the contiguous dim
+    of ``access``, whatever the tensor's base alignment: a 16-byte packet
+    (``cp.async``, staged-store ``stg.v4``) where every other stride is a
+    16-byte multiple, an element pair (``ldg.b32`` / ``stg.b32``) where every
+    one is a pair multiple, else one element. Window attention's [49, 49]
+    bf16 scores (98-byte rows) move element by element: a column ragged at 49
+    is predicated per element."""
+    es = access.dtype.itemsize
+    strides = [stride * es for stride in access.strides if stride != 1]
+    for granule in (16, 2 * es):
+        if all(stride % granule == 0 for stride in strides):
+            return granule
+    return es
+
+
+def element_store(store: Store) -> bool:
+    """Whether ``store`` writes its tile element by element: a store after
+    the loops (or of a loop-less program) into an output whose rows no pair
+    move fits (``contiguous_granule_bytes``), not transposed. The fragment
+    pairs would store one element per lane, a warp instruction touching
+    eight rows in two-byte pieces (``stg_bf16`` over the mma.sync layout);
+    ``cute_mma_dag_store="staged"`` writes the tile into a shared staging
+    tile instead, and the lanes copy it out along the rows, a warp
+    instruction 32 consecutive elements of one row (``WarpMmaDagEmitter.
+    emit_element_store``), where the tile fits (``plan_mma_dag``). Window attention's 49 x 49 bf16 scores (98-byte
+    rows), 4096 matrices on 64x64 tiles: 29.0 us with the fragment stores,
+    6.5 us without any store."""
+    access = store.access
+    return (
+        store.region == "epilogue"
+        and not store.swap
+        # (``tile_dim_strides`` refuses a folded storage index map)
+        and access.index_map is None
+        and len(access.tile_dims) == 2
+        and access.tile_dim_strides[1] == 1
+        and access.dtype in (torch.bfloat16, torch.float16, torch.float32)
+        and not access.windows
+        and contiguous_granule_bytes(access) == access.dtype.itemsize
+    )
+
+
 def ragged_root_axes(program: MmaDagProgram) -> frozenset[int]:
     """The root axes (by index) whose tile may overshoot the extent on the
-    warp path.  Each access along such an axis is predicated per element
-    or per row by the emitter, so the axis must be one the predication
-    covers: never a dot's K (padded K rows would sum into the result;
-    operand zero-fill alone does not cover fragment operands), never the
-    contiguous dim of a 2-D tile (its 16-byte packets and element pairs
-    straddle the extent), never offset (``tile.index + c``: the bounds
-    proof assumed the whole tile fits), never both dims of one access and
-    never a dim of a scanned fragment (a reversed prefix sum would carry
-    the padded rows into the real ones)."""
+    warp path.  Each access along such an axis is predicated per element,
+    per pair, per 16-byte packet or per row by the emitter, so the axis
+    must be one the predication covers: never a dot's K (padded K rows
+    would sum into the result; operand zero-fill alone does not cover
+    fragment operands), the contiguous dim of a 2-D tile only where its
+    extent fills whole moves of the widest kind its strides allow
+    (``contiguous_granule_bytes``: a packet or element pair then lies
+    wholly inside the extent or wholly past it; its blocks start every CTA
+    at a whole move, ``ragged_min_blocks``) and no ladder tile divides
+    it (an axis that may run ragged gives up the whole-tile forms: the aux
+    side tile and runs, the TMA store; 512 keeps whole tiles), never offset (``tile.index
+    + c``: the bounds proof assumed the whole tile fits), never both dims
+    of one access and never a dim of a scanned fragment (a reversed prefix
+    sum would carry the padded rows into the real ones).
+
+    A contiguous dim may run ragged so that one CTA covers a small
+    matrix: a batch of bf16 56 x 56 x 32 products,
+    ``torch.bmm(in0[tile_z, tile_y, :], in1[tile_z, :, tile_x])``, tiles
+    N = 56 with one 64-wide CTA whose last 8 columns are not loaded (their
+    packets zero-filled) and not stored. Without it the N tile must divide
+    56, so seven 8-wide CTAs per matrix each re-read the whole A tile and
+    store 16-byte row pieces: GB300, 8192 matrices, the full-effort pick of
+    64 x 8 tiles (one warp) 67.7 us, 64 x 64 tiles 22.1 us (stock
+    Inductor's best, its Triton template, 32.5 us)."""
     candidates = {axis.index for axis in program.axes if axis.kind == AXIS_ROOT}
     candidates.difference_update(dot.k.index for dot in program.dots)
     for access in program.accesses:
@@ -8171,12 +8418,17 @@ def ragged_root_axes(program: MmaDagProgram) -> frozenset[int]:
         if access.repeated_axes:
             candidates.difference_update(axis.index for axis in access.dims)
         if len(access.tile_dims) == 2:
+            granule = contiguous_granule_bytes(access)
             candidates.difference_update(
                 axis.index
                 for axis, stride in zip(
                     access.tile_dims, access.tile_dim_strides, strict=True
                 )
                 if stride == 1
+                and (
+                    axis.extent % MMA_DAG_TILE_LADDER[0] == 0
+                    or (axis.extent * access.dtype.itemsize) % granule
+                )
             )
         candidates.difference_update(
             cast("Axis", subscript.axis).index
@@ -8186,6 +8438,27 @@ def ragged_root_axes(program: MmaDagProgram) -> frozenset[int]:
     for scan in program.scans:
         candidates.difference_update(axis.index for axis in program.slots[scan.slot])
     return frozenset(candidates)
+
+
+def ragged_min_blocks(program: MmaDagProgram, ragged: frozenset[int]) -> dict[int, int]:
+    """Axis index -> the smallest block of each ``ragged`` axis that is the
+    contiguous dim of a 2-D access (``AxisFacts.min_block``): the elements
+    of the widest move along it (``contiguous_granule_bytes``), so that
+    every CTA, a block from the last, starts at a whole move.  A block below
+    the MMA atom is computed at the atom (``mma_dag_padded_sizes``): bf16
+    56 x 56 products on 1-wide N blocks would issue B's 16-byte packets and
+    the output's column pairs two bytes apart, a pair writing the next
+    CTA's column; their packets need blocks of 8, 98-byte rows (N = 49)
+    none."""
+    blocks: dict[int, int] = {}
+    for access in program.accesses:
+        if access.index_map is not None or len(access.tile_dims) != 2:
+            continue
+        elements = contiguous_granule_bytes(access) // access.dtype.itemsize
+        for axis, stride in zip(access.tile_dims, access.tile_dim_strides, strict=True):
+            if stride == 1 and axis.index in ragged:
+                blocks[axis.index] = max(blocks.get(axis.index, 1), elements)
+    return blocks
 
 
 def mma_dag_staged_loads(program: MmaDagProgram) -> tuple[Access, ...]:
@@ -8238,6 +8511,7 @@ def mma_dag_facts(program: MmaDagProgram) -> CuteMmaDagFacts:
 
     env = CompileEnvironment.current()
     ragged = ragged_root_axes(program)
+    min_blocks = ragged_min_blocks(program, ragged)
     grid_blocks = 1
     for axis in program.lead_axes:
         grid_blocks *= axis.extent
@@ -8312,6 +8586,15 @@ def mma_dag_facts(program: MmaDagProgram) -> CuteMmaDagFacts:
         for store in program.stores
         if store.region == "loop" and store.source == "carry_in"
     ]
+    element_staging = tuple(
+        (
+            program.slots[program.frag_slots[store.frag]][0].index,
+            program.slots[program.frag_slots[store.frag]][1].index,
+            store.access.dtype.itemsize,
+        )
+        for store in program.stores
+        if element_store(store)
+    )
     staging = tuple(
         (
             program.slots[program.frag_slots[store.frag]][0].index,
@@ -8327,7 +8610,15 @@ def mma_dag_facts(program: MmaDagProgram) -> CuteMmaDagFacts:
     attention = match_paged_attention(program)
     return CuteMmaDagFacts(
         axes=tuple(
-            AxisFacts(a.block_id, a.kind, a.extent, a.loop, a.index in ragged, a.size)
+            AxisFacts(
+                a.block_id,
+                a.kind,
+                a.extent,
+                a.loop,
+                a.index in ragged,
+                a.size,
+                min_blocks.get(a.index, 1),
+            )
             for a in program.axes
         ),
         frags=tuple((rows.index, cols.index) for rows, cols in program.slots),
@@ -8394,6 +8685,7 @@ def mma_dag_facts(program: MmaDagProgram) -> CuteMmaDagFacts:
             for loop in program.loops
         ),
         staging_frames=tuple(store.loop for store in snapshots),
+        element_staging=element_staging,
         vecs=tuple(
             VecFacts(
                 slot.axis.index if slot.axis is not None else -1,
@@ -9085,6 +9377,33 @@ def plan_mma_dag(graphs: Sequence[GraphInfo], config: object) -> MmaDagPlan | No
             epilogue=cast("str", epilogue),
             mma_warp=tc.mma_warp,
         )
+    # (The warp mode's: the tensor-memory mode stores through its own tiles.)
+    element_stores = tuple(
+        store
+        for store in program.stores
+        if store_mode in (MMA_DAG_STORE_STAGED, MMA_DAG_STORE_TMA)
+        and element_store(store)
+    )
+    if element_stores and facts.smem_capacity:
+        # The staging tiles take shared memory the estimate does not charge
+        # (``CuteMmaDagFacts.element_staging``): where they would not fit
+        # beside the rest, the stores go out from the fragments.
+        staging_bytes = 0
+        for store in element_stores:
+            rows, cols = program.slots[program.frag_slots[store.frag]]
+            staging_bytes += (
+                sizes[rows.index] * sizes[cols.index] * store.access.dtype.itemsize
+            )
+        smem = mma_dag_smem_estimate(
+            facts,
+            sizes,
+            stages,
+            warps,
+            cast("str", derived_mode),
+            cast("str", aux_mode),
+        )
+        if smem + staging_bytes > facts.smem_capacity:
+            element_stores = ()
     plan = MmaDagPlan(
         program=program,
         sizes=sizes,
@@ -9092,6 +9411,7 @@ def plan_mma_dag(graphs: Sequence[GraphInfo], config: object) -> MmaDagPlan | No
         stages=stages,
         routes=routes,
         staged_stores=staged,
+        element_stores=element_stores,
         exchange_mode=cast("str", exchange_mode),
         layouts=layouts,
         derived_routes=derived_routes,
@@ -9255,8 +9575,9 @@ def mma_dag_aux_ring(
     (its block extent once per CTA, read by coordinate), a 16-bit scalar a
     word per thread, a 16-bit vector across the packets a word per packet
     the thread owns, one along the contiguous dim its block extent once per
-    CTA (a word per packet element when its runs cannot be 16-byte copies);
-    the other fp32 side loads of the loop take side tile entries too."""
+    CTA (a word per packet element when its runs cannot be 16-byte copies
+    or the dim may run ragged); the other fp32 side loads of the loop take
+    side tile entries too."""
     records = mma_dag_aux_records(env, program, loop)
     if not records:
         return None

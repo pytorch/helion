@@ -214,6 +214,9 @@ from helion._compiler.cute.tcgen05_constants import (
 from helion._compiler.cute.tcgen05_constants import (
     TCGEN05_TWO_CTA_EDGE_K_TAIL_SCHEDULER_L2_SWIZZLE_SIZE,
 )
+from helion._compiler.cute.tcgen05_constants import (
+    TCGEN05_TWO_CTA_SIXTEEN_BIT_MAX_K_TILES,
+)
 from helion._compiler.cute.view_subtile import _feeds_split
 from helion._compiler.cute.view_subtile import _propagated_coord_meta
 from helion._compiler.cute.view_subtile import _split_minor_coord_meta
@@ -244,6 +247,7 @@ from helion._testing import onlyBackends
 from helion._testing import patch_cute_mma_support
 from helion._testing import skipIfLowVRAM
 from helion._testing import skipUnlessTcgen05RuntimeNPtx
+from helion._testing.cute_codegen import cpu_target
 from helion._testing.cute_repeated_axes import full_slice_tiled_dot
 from helion._testing.shared_block_kernels import root_beside_a_device_loop
 from helion._testing.shared_block_kernels import shared_block_softmax
@@ -5201,9 +5205,16 @@ class TestCuteLowerings(unittest.TestCase):
             "tcgen05_sched_pipeline_producer_state.index].iterator",
             code,
         )
+        # Each consumer loads its stage of the mailbox whole before testing
+        # it (the release to the leader CTA does not wait for a lane's load).
         self.assertIn(
-            "tcgen05_work_tile_smem[cutlass.Int32(3), "
-            "tcgen05_sched_pipeline_consumer_state.index] != cutlass.Int32(0)",
+            "tcgen05_role_local_0_mailbox = tcgen05_work_tile_smem[None, "
+            "tcgen05_sched_pipeline_consumer_state.index].load()",
+            code,
+        )
+        self.assertIn(
+            "tcgen05_role_local_0_valid = tcgen05_role_local_0_mailbox[3] "
+            "!= cutlass.Int32(0)",
             code,
         )
 
@@ -10317,10 +10328,12 @@ class TestCuteLowerings(unittest.TestCase):
 
         torch.manual_seed(0)
         # Use a problem big enough that both M and N divide by
-        # cluster_m * bm = 512 and cluster_n * bn = 512 respectively.
+        # cluster_m * bm = 512 and cluster_n * bn = 512 respectively, with
+        # more CTAs than SMs (8 x 16 pair tiles, 256 CTAs): a grid of one tile
+        # per CTA runs no scheduler loop and launches every cluster instead.
         args = (
-            torch.randn(1024, 128, device=DEVICE, dtype=torch.bfloat16),
-            torch.randn(128, 1024, device=DEVICE, dtype=torch.bfloat16),
+            torch.randn(2048, 128, device=DEVICE, dtype=torch.bfloat16),
+            torch.randn(128, 4096, device=DEVICE, dtype=torch.bfloat16),
         )
         with patch_cute_mma_support():
             bound = cute_matmul_cluster_n2.bind(args)
@@ -10389,8 +10402,8 @@ class TestCuteLowerings(unittest.TestCase):
             code,
         )
         self.assertIn(
-            "(2, 2, min(((1024 + _BLOCK_SIZE_0 - 1) // _BLOCK_SIZE_0 * 2 + 2 - 1)"
-            " // 2 * (((1024 + _BLOCK_SIZE_1 - 1) // _BLOCK_SIZE_1 + 2 - 1) // 2)"
+            "(2, 2, min(((2048 + _BLOCK_SIZE_0 - 1) // _BLOCK_SIZE_0 * 2 + 2 - 1)"
+            " // 2 * (((4096 + _BLOCK_SIZE_1 - 1) // _BLOCK_SIZE_1 + 2 - 1) // 2)"
             " * 1, _MAX_ACTIVE_CLUSTERS))",
             code,
         )
@@ -11255,7 +11268,26 @@ class TestCuteLowerings(unittest.TestCase):
     def test_tcgen05_persistent_cluster_m2_two_cta_k_cap_runtime_correctness(
         self,
     ) -> None:
-        """CtaGroup.TWO codegen runs correctly at the validated K cap."""
+        """CtaGroup.TWO codegen runs correctly over 4 to 256 K tiles
+        (``TCGEN05_TWO_CTA_MAX_K_TILES``, still the cap over operands other
+        than 16-bit ones)."""
+        self._check_two_cta_role_local_k_loops((64, 256, 4096))
+
+    def test_tcgen05_persistent_cluster_m2_two_cta_16bit_k_cap_runtime_correctness(
+        self,
+    ) -> None:
+        """A 16-bit CtaGroup.TWO pair runs correctly past 256 K tiles, up to its
+        own cap (``TCGEN05_TWO_CTA_SIXTEEN_BIT_MAX_K_TILES``): 257 and 4096 K
+        tiles at bk = 16, which used to hit the host guard."""
+        self._check_two_cta_role_local_k_loops(
+            (16 * 257, 16 * TCGEN05_TWO_CTA_SIXTEEN_BIT_MAX_K_TILES)
+        )
+
+    def _check_two_cta_role_local_k_loops(self, k_sizes: tuple[int, ...]) -> None:
+        """Run one 256x256 bf16 output tile on one role-local CtaGroup.TWO
+        cluster over K loops of ``k_sizes`` (bk = 16) and check each against
+        an FP32 product rounded to bf16 (cuBLAS may reduce a deep bf16 K
+        split in bf16)."""
 
         from helion._compiler.cute.mma_support import get_cute_mma_support
 
@@ -11280,7 +11312,7 @@ class TestCuteLowerings(unittest.TestCase):
             Tcgen05PersistentProgramIDs,
         )
 
-        for k_size in (64, 256, 4096):
+        for k_size in k_sizes:
             with self.subTest(k_size=k_size):
                 torch.manual_seed(0)
                 args = (
@@ -11320,7 +11352,7 @@ class TestCuteLowerings(unittest.TestCase):
                         code,
                     )
                     out = bound(*args)
-                expected = args[0] @ args[1]
+                expected = (args[0].float() @ args[1].float()).to(args[0].dtype)
                 torch.testing.assert_close(out, expected, atol=2e-1, rtol=1e-2)
 
     def test_tcgen05_persistent_cluster_m2_two_cta_k_tail_runtime_correctness(
@@ -11765,7 +11797,9 @@ class TestCuteLowerings(unittest.TestCase):
     def test_tcgen05_persistent_cluster_m2_two_cta_k_tile_limit_guard(
         self,
     ) -> None:
-        """CtaGroup.TWO shapes above the validated K-tile cap stay guarded."""
+        """CtaGroup.TWO shapes above the validated K-tile cap stay guarded: a
+        16-bit pair's 4096 tiles (``TCGEN05_TWO_CTA_SIXTEEN_BIT_MAX_K_TILES``),
+        4097 here at bk = 16."""
 
         @helion.kernel(backend="cute")
         def cute_matmul_cluster_m2_two_cta_k_tile_limit(
@@ -11781,9 +11815,10 @@ class TestCuteLowerings(unittest.TestCase):
                 out[tile_m, tile_n] = acc.to(x.dtype)
             return out
 
+        k = 16 * (TCGEN05_TWO_CTA_SIXTEEN_BIT_MAX_K_TILES + 1)
         args = (
-            torch.randn(256, 4112, device=DEVICE, dtype=torch.bfloat16),
-            torch.randn(4112, 256, device=DEVICE, dtype=torch.bfloat16),
+            torch.randn(256, k, device=DEVICE, dtype=torch.bfloat16),
+            torch.randn(k, 256, device=DEVICE, dtype=torch.bfloat16),
         )
         from helion._compiler.cute.tcgen05.scheduler_pids import (
             Tcgen05PersistentProgramIDs,
@@ -11804,10 +11839,16 @@ class TestCuteLowerings(unittest.TestCase):
                 f"if {Tcgen05PersistentProgramIDs._MULTI_TILE_GUARD_TOTAL_VAR} > 0:",
                 code,
             )
+            # (the message names the 16-bit pair's cap)
+            cap = (
+                f"at most {TCGEN05_TWO_CTA_SIXTEEN_BIT_MAX_K_TILES} K tiles over "
+                "16-bit operands"
+            )
+            self.assertIn(cap, code)
             self.assertIn("above the validated K-tile limit", code)
             with self.assertRaisesRegex(
                 RuntimeError,
-                "above the validated K-tile limit",
+                f"{cap}.*above the validated K-tile limit",
             ):
                 bound(*args)
 
@@ -13819,6 +13860,7 @@ class TestCuteLowerings(unittest.TestCase):
             "out = load(x)",
         )
 
+    @pytest.mark.cpu_only
     def test_create_loop_strategy_preserves_auto_threads_for_mma_candidate(
         self,
     ) -> None:
@@ -13842,17 +13884,7 @@ class TestCuteLowerings(unittest.TestCase):
                 _FakeBlockSize(8, block_id=1),
                 _FakeBlockSize(16, block_id=2, reduction=True),
             ],
-            config_spec=SimpleNamespace(
-                cute_attention_generic_fallback_enabled=False,
-                cute_flash_bwd_search_enabled=False,
-                cute_flash_gated_search_enabled=False,
-                num_threads=SimpleNamespace(config_get=lambda *args: 0),
-                loop_orders=SimpleNamespace(
-                    config_get=lambda *args: None,
-                    config_get_for_tile=lambda *args: None,
-                ),
-                l2_groupings=SimpleNamespace(config_get=lambda *args: 1),
-            ),
+            config_spec=ConfigSpec(backend=backend, target_device_capability=(10, 0)),
         )
         # The planner reads the matmul family key through ``Config.get``
         # (``warp_mma`` takes its own detector); the fake config carries no
@@ -15614,6 +15646,8 @@ class TestCuteLowerings(unittest.TestCase):
         self.assertIn("cutlass.Int32(6)", per_cta_emitted)
         self.assertEqual(len(per_cta_stmts), 6)
 
+    # Codegen only, bound on CPU (``cpu_target``): the CPU lane runs it.
+    @pytest.mark.cpu_only
     def test_tcgen05_codegen_emits_cluster_and_role_split_knobs(self) -> None:
         @helion.kernel(backend="cute")
         def cute_matmul_mma_codegen_only(
@@ -15629,9 +15663,14 @@ class TestCuteLowerings(unittest.TestCase):
                 out[tile_m, tile_n] = acc.to(x.dtype)
             return out
 
+        # A K past the 16-bit pair's 4096 tiles at bk = 16
+        # (``TCGEN05_TWO_CTA_SIXTEEN_BIT_MAX_K_TILES``). Codegen only, bound on
+        # CPU for the B200 model (``cpu_target``): the 8192 x 65552 operands
+        # (2 GiB) are never allocated on the GPU.
+        k = 16 * (TCGEN05_TWO_CTA_SIXTEEN_BIT_MAX_K_TILES + 1)
         args = (
-            torch.randn(8192, 8192, device=DEVICE, dtype=torch.float16),
-            torch.randn(8192, 8192, device=DEVICE, dtype=torch.float16),
+            torch.empty(8192, k, dtype=torch.float16),
+            torch.empty(k, 8192, dtype=torch.float16),
         )
         config = helion.Config(
             block_sizes=[256, 256, 16],
@@ -15641,10 +15680,11 @@ class TestCuteLowerings(unittest.TestCase):
         )
 
         with (
+            cpu_target(),
             patch.dict("os.environ", {"HELION_CUTE_MMA_IMPL": "tcgen05"}, clear=False),
             patch_cute_mma_support(),
         ):
-            bound = cute_matmul_mma_codegen_only.bind(args)
+            bound = cute_matmul_mma_codegen_only._bind_isolated(args)
             # matmul_ops narrows tcgen05_cluster_m to (1,) when binding the
             # bf16/fp16 matmul until the cluster=2 path is benchmarked. This
             # K-over-cap codegen-only test still exercises the guarded
@@ -15664,6 +15704,12 @@ class TestCuteLowerings(unittest.TestCase):
         self.assertIn("cute.nvgpu.tcgen05.CtaGroup.TWO", code)
         self.assertIn("_helion_tcgen05_persistent_total_tiles", code)
         self.assertIn("above the validated K-tile limit", code)
+        # (the guard's message names the 16-bit pair's cap)
+        self.assertIn(
+            f"at most {TCGEN05_TWO_CTA_SIXTEEN_BIT_MAX_K_TILES} K tiles over "
+            "16-bit operands",
+            code,
+        )
         self.assertIn(
             "PersistentTileSchedulerParams(((8192 + _BLOCK_SIZE_0 - 1) // "
             "_BLOCK_SIZE_0 * 2",
@@ -17214,9 +17260,13 @@ class TestCuteTcgen05AuxPipelineCycle2a(unittest.TestCase):
 
         self.assertIn("'kind': 'tcgen05_d_tma'", code)
         self.assertIn("cutlass.pipeline.PipelineTmaStore.create", code)
+        # The store ring exists before the epilogue first uses it.  (The
+        # TMA-load role, hoisted ahead of the prefix's cluster join by
+        # ``tcgen05_hoist_persistent_tma_role``, may open its role-local loop
+        # earlier: it never touches the store ring.)
         self.assertLess(
             code.index("cutlass.pipeline.PipelineTmaStore.create"),
-            code.index("while tcgen05_role_local_"),
+            code.index("tcgen05_c_pipeline.producer_"),
         )
         # the full-tile guard covers the residual load only
         self.assertEqual(code.count("tcgen05_full_tile = "), 1, code)
@@ -17836,21 +17886,46 @@ class TestCuteTcgen05AuxPipelineCycle2a(unittest.TestCase):
         self.assertIsNone(_tcgen05_rowvec_aux_stage_copy_elems(8, 8, 480))
         self.assertIsNone(_tcgen05_rowvec_aux_stage_copy_elems(256, 256, 512))
 
-    def test_aux_tma_load_rejects_partial_tiles_without_tma_store_routing(
+    def test_aux_tma_load_stages_single_edge_k_tail_for_partial_tma_store(
         self,
     ) -> None:
-        """Bulk aux TMA still rejects partial tiles with no routed edge store."""
+        """Bulk aux TMA stages an M edge with a K tail for the partial TMA store.
 
-        kernel = self._bias_residual_gelu_kernel()
-        args = (
-            torch.empty([5000, 5000], device=DEVICE, dtype=torch.bfloat16),
-            torch.empty([5000, 512], device=DEVICE, dtype=torch.bfloat16),
-            torch.empty([512], device=DEVICE, dtype=torch.bfloat16),
-            torch.empty([5000, 512], device=DEVICE, dtype=torch.bfloat16),
-        )
+        5000 x 512 x 5000 on 256x256x128 pairs has an M edge (5000 = 19 x 256
+        + 136), whole N tiles and a K tail (5000 = 39 x 128 + 8). Its pairs
+        once had no role-local family, so this config had no routed edge store
+        and refused bulk aux TMA ("... with partial output tiles requires
+        either a partial-output TMA-store epilogue or the full-tile/edge
+        fallback split ..."). The M-edge family takes a K tail since the
+        producer issues the partial last K tile, so the C-input warp stages the
+        residual through TMA and the partial-output TMA store clips the M edge,
+        as for the double edge (test_aux_tma_load_allows_partial_tiles_with_tma_store):
+
+            cute.copy(tcgen05_aux_tma_atom_0, tcgen05_aux_tma_gmem_part_0[None, cutlass.Int32(_tcgen05_aux_subtile)], tcgen05_aux_tma_smem_part_0[None, tcgen05_aux_pipeline_producer_state.index], tma_bar_ptr=tcgen05_aux_tma_barrier)
+            ...
+            cute.copy(tcgen05_tma_store_atom, tcgen05_bSG_sD[None, tcgen05_c_buffer], tcgen05_bSG_gD[None, cutlass.Int32(_tcgen05_subtile)])
+
+        The output starts as NaN, so a tile the clipped store leaves unwritten
+        fails. The refusal stays where no TMA store runs
+        (test_aux_tma_partial_store_keeps_guard_for_unaligned_rowvec_tail).
+        """
+
+        from helion._compiler.cute.mma_support import get_cute_mma_support
+
+        if not get_cute_mma_support().tcgen05_f16bf16:
+            self.skipTest("tcgen05 F16/BF16 MMA is not supported on this machine")
+
+        torch.manual_seed(0)
+        x = torch.randn([5000, 5000], device=DEVICE, dtype=torch.bfloat16)
+        y = torch.randn([5000, 512], device=DEVICE, dtype=torch.bfloat16)
+        bias = torch.randn([512], device=DEVICE, dtype=torch.bfloat16)
+        residual = torch.randn([5000, 512], device=DEVICE, dtype=torch.bfloat16)
+        out = torch.full([5000, 512], float("nan"), device=DEVICE, dtype=torch.bfloat16)
 
         with patch_cute_mma_support():
-            bound = kernel.bind(args)
+            bound = self._bias_residual_gelu_into_kernel().bind(
+                (x, y, bias, residual, out)
+            )
             cfg = _make_tcgen05_persistent_config(
                 block_sizes=[256, 256, 128],
                 l2_groupings=[1],
@@ -17866,12 +17941,20 @@ class TestCuteTcgen05AuxPipelineCycle2a(unittest.TestCase):
                 **{TCGEN05_AUX_LOAD_MODE_CONFIG_KEY: TCGEN05_AUX_LOAD_MODE_TMA},
                 indexing=["tensor_descriptor"] * bound.env.config_spec.indexing.length,
             )
-            with self.assertRaises(exc.BackendUnsupported) as cm:
-                bound.to_code(cfg)
-        msg = str(cm.exception)
-        self.assertIn(TCGEN05_AUX_LOAD_MODE_CONFIG_KEY, msg)
-        self.assertIn("partial output tiles", msg)
-        self.assertIn("partial-output TMA-store epilogue", msg)
+            code = bound.to_code(cfg)
+            bound.set_config(cfg)
+            bound(x, y, bias, residual, out)
+        self.assertIn("'kind': 'tcgen05_aux_tma'", code)
+        self.assertIn("cute.copy(tcgen05_aux_tma_atom_0", code)
+        self.assertIn("cute.copy(tcgen05_tma_store_atom", code)
+        self._assert_partial_tma_rowvec_bias_staged(code)
+        self.assertNotIn("tcgen05_aux_full_tile", code)
+        self.assertNotIn("_helion_tcgen05_persistent_total_tiles", code)
+        expected = torch.nn.functional.gelu(
+            1.25 * (x.float() @ y.float()) + 0.5 * residual.float() + bias.float(),
+            approximate="tanh",
+        ).to(x.dtype)
+        torch.testing.assert_close(out, expected, atol=3e-1, rtol=2e-2)
 
     def test_aux_tma_load_rejects_no_producer_warp(self) -> None:
         """Explicit aux TMA must not silently no-op when the producer gate is shut.
@@ -20721,11 +20804,14 @@ mailbox[cutlass.Int32(3), producer_state.index] = first
             has_c_input_warp=True,
             has_store_warp=True,
             tma_warp_id=5,
+            ab_load_warp_count=1,
             exec_warp_id=4,
             epi_warp_count=4,
             store_warp_id=7,
             c_input_warp_id=7,
             is_two_cta=two_cta,
+            # (no K split over the cluster: ``tcgen05_cluster_split_k``)
+            cluster_split_k=1,
             sched_stage_count=2 if staged else 1,
             grouped=None,
             row_union=None,
@@ -20736,6 +20822,7 @@ mailbox[cutlass.Int32(3), producer_state.index] = first
             accumulator_view="nm",
             output_offsets=("tile_offset_0", "tile_offset_1"),
             tma_store_full_tiles_only=True,
+            is_clc_persistent=False,
         )
         splitter._tcgen05_plan = lambda: plan
         splitter._tcgen05_sched_pipeline_plan = lambda: SimpleNamespace(

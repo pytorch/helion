@@ -16,12 +16,17 @@ tensor, re-running the Scalar statements that compute each element with
 the thread and lanes that hold it in the Scalar layout bound, as a
 fragment element is computed (``operand_elements``), and the op runs on
 them.  The accumulator and its element loops (stores, updates,
-epilogues) are the MPP lowering's.  Tiles that take more SIMD groups keep
-staging: they share each tile, which one decode serves.  Tiles of one SIMD
-group can still run in several: a config's ``num_warps`` above 1 splits
-the K loop among that many (:func:`register_split`), each over every
-``num_warps``-th K tile from its own registers, the first adding the
-others' accumulators after the loop.
+epilogues) are the MPP lowering's.  Tiles that take more SIMD groups share
+one decode of the computed operand: where every tile is whole and the
+tile splits into sub-tiles that an op with two cooperative inputs covers,
+the threads stage the operand once into a threadgroup tile and each SIMD
+group runs the op over its own sub-tile, both inputs built in registers
+(:func:`_grid_run`); other such tiles stage for one op over the whole
+tile.  Tiles of one SIMD group can still run in several: a config's
+``num_warps`` above 1 splits the K loop among that many
+(:func:`register_split`), each over every ``num_warps``-th K tile from
+its own registers, the first adding the others' accumulators after the
+loop.
 
 Which elements a lane holds is the op's layout, probed on the GPU that runs
 the kernel and factored into lane bases plus constants (``coop_layout``),
@@ -64,10 +69,12 @@ from ...language.memory_ops import load
 from ...language.tile_ops import tile_index
 from ..ast_extension import expr_from_string
 from ..compile_environment import CompileEnvironment
+from ..tile_strategy import DeviceLoopState
 from ._constants import MAX_THREADGROUP_MEMORY_BYTES
 from ._constants import MAX_THREADS_PER_THREADGROUP
 from ._constants import SIMD_WIDTH
 from .affine_fold import Fact
+from .backend import static_extent
 from .coop_layout import INVALID
 from .coop_layout import Atom
 from .coop_layout import base_fact
@@ -91,6 +98,7 @@ from .mpp_matmul import WIDENING
 from .mpp_matmul import Graphs
 from .mpp_matmul import MppGroup
 from .mpp_matmul import MppPlan
+from .mpp_matmul import View
 from .mpp_matmul import block_id_of
 from .mpp_matmul import call_name
 from .mpp_matmul import current_plan
@@ -98,12 +106,14 @@ from .mpp_matmul import group_sides
 from .mpp_matmul import matmul_operands
 from .mpp_matmul import names_read
 from .mpp_matmul import op_dims
+from .mpp_matmul import staged_seed
 from .mpp_matmul import static_tile
 from .mpp_matmul import storage_key
 from .mpp_matmul import transposed_view
 from .mpp_matmul import view_args
 from .mpp_matmul import view_span
 from .mpp_matmul import virtual_thread
+from .operand_elements import SIMDGROUP
 from .operand_elements import SPLIT_BUFFER
 from .operand_elements import OperandRecomputable
 from .operand_elements import clamp_past_end
@@ -135,6 +145,9 @@ if TYPE_CHECKING:
 #: The lane's index in its SIMD group, a kernel parameter of a kernel with
 #: register operands (``metal_jit``).
 LANE = "_mpp_lane"
+#: The threadgroup tile of the grid runs of one type (:func:`_emit_grid`),
+#: suffixed by the type.
+GRID_TILE = "_mst_tile"
 #: Most steps in a K tile: they are unrolled, each element's statements
 #: folded, so the source grows with them.  A bound on the code, not a
 #: hardware limit: a K tile past it is staged.
@@ -155,15 +168,23 @@ _SPLIT_VALUES = ("_mr_av", "_mr_pv", "_mr_xv")
 class RegisterRun:
     """How a group's op takes its operands in registers: the op, each
     side's kind (``"reg"``, a cooperative tensor built in registers, or
-    ``"view"``, a device view), its K tile's steps, whether the K positions
-    are relabelled across steps (two register operands), and the affine
-    split's FX values ``(codes, scale, bias)`` when the op takes it."""
+    ``"view"``, a device view; in a grid run ``"lanes"``, a view each lane
+    reads its elements of, and ``"tile"``, built from the threadgroup tile),
+    its K tile's steps, whether the K positions are relabelled across steps
+    (two register operands), and the affine split's FX values ``(codes,
+    scale, bias)`` when the op takes it."""
 
     atom: Atom
     sides: tuple[str, str]
     steps: int
     interleave: bool
     affine: tuple[Node, Node, Node] | None
+    #: The SIMD groups over the tile's M and N, each running the op over its
+    #: own sub-tile ((1, 1): one SIMD group runs it over the whole tile), and
+    #: how the staged operand of such a grid is written: the K positions each
+    #: thread stages of one row, and the runs a row takes (:func:`_grid_run`).
+    grid: tuple[int, int] = (1, 1)
+    stage: tuple[int, int] = (0, 0)
 
 
 def _narrow_dtype(node: Node, dtype: torch.dtype) -> torch.dtype:
@@ -377,7 +398,8 @@ def register_run_spec(cg: GenerateAST, group: MppGroup) -> RegisterRun | None:
     group, an operand is a device view or a computed operand the lanes can
     recompute at any element (``registers``, set by
     :func:`check_register_operands`), at least one is the latter, and the
-    op fits ``matmul2d`` with cooperative inputs.
+    op fits ``matmul2d`` with cooperative inputs; a launch of several takes
+    a grid run where one applies (:func:`_grid_run`).
 
     The op covers the tile: with two cooperative inputs its M, N and K are
     16 or 32 and one of them 32; with one, M and N are the MPP op's
@@ -391,9 +413,23 @@ def register_run_spec(cg: GenerateAST, group: MppGroup) -> RegisterRun | None:
     projections and 8-20% slower on q/og and down, whose long K loops read
     a word of packed codes per element of a row in K order."""
     plan = current_plan()
-    if math.prod(cg.launch_thread_axis_sizes().values()) != SIMD_WIDTH:
+    threads = math.prod(cg.launch_thread_axis_sizes().values())
+    if threads != SIMD_WIDTH:
         assert plan.split == 1
-        return None
+        if (
+            threads % SIMD_WIDTH
+            or threads > MAX_THREADS_PER_THREADGROUP
+            # M or N tiled in a device loop: the thread axes seen here aren't
+            # the launch's (``launch_thread_axis_sizes``), which a grid run's
+            # sub-tiles and staging must cover.
+            or any(
+                (loops := cg.active_device_loops.get(block))
+                and isinstance(loops[-1], DeviceLoopState)
+                for block in (group.m_block, group.n_block)
+            )
+        ):
+            return None
+        return _grid_run(cg, group, plan, threads)
     tile = static_tile(cg, (group.m_block, group.n_block, group.k_block))
     chosen = _register_op(group, plan, tile[0], tile[1], tile[2])
     if chosen is None:
@@ -408,6 +444,175 @@ def register_run_spec(cg: GenerateAST, group: MppGroup) -> RegisterRun | None:
             affine = parts
             atom = dataclasses.replace(atom, right="half")
     return RegisterRun(atom, sides, tile[2] // atom.k, sides == ("reg", "reg"), affine)
+
+
+def whole_k_tiles(group: MppGroup, k: int) -> bool:
+    """Whether every K tile of ``k`` of the group's loop is whole, from the
+    loop's extent, whatever its begin: a grid run's condition
+    (:func:`_grid_run`), which its codegen relies on."""
+    size = static_extent(CompileEnvironment.current().block_sizes[group.k_block].size)
+    return size is not None and size % k == 0
+
+
+def _k_inside(group: MppGroup, view: View) -> bool:
+    """Whether every K position the group's loop takes lies inside x's K dim
+    (``view``'s), which a grid run reads unmasked: the loop over K alone
+    has literal bounds, its begin at least 0 and its end at most the dim's
+    size."""
+    if not group.levels:
+        return False
+    loop = group.levels[0].owner
+    if not _tracing_ops.is_for_loop_target(loop.target):
+        return False
+    begins, ends = loop.args[1], loop.args[2]
+    assert isinstance(begins, list) and isinstance(ends, list)
+    size = _view_size(view, group.k_block)
+    return (
+        len(begins) == 1
+        and isinstance(begins[0], int)
+        and isinstance(ends[0], int)
+        and size is not None
+        and begins[0] >= 0
+        and ends[0] <= size
+    )
+
+
+def _grid_run(
+    cg: GenerateAST, group: MppGroup, plan: MppPlan, threads: int
+) -> RegisterRun | None:
+    """The group's grid run (:func:`_grid_layout`), or None for the staged
+    path, which every group of the kernel that stages an operand then takes
+    too: a grid run's tile doesn't share threadgroup memory with a staged
+    op's tiles, which share it with each other (``tile_sharing``), so a
+    kernel of both could need more than its staged ops fit in."""
+    spec = _grid_layout(cg, group, plan, threads)
+    if spec is None:
+        return None
+    for other in plan.groups():
+        if other is group or not (other.lhs.staged or other.rhs.staged):
+            continue
+        if _grid_layout(cg, other, plan, threads) is None:
+            return None
+    return spec
+
+
+def _view_size(view: View, block: int) -> int | None:
+    """The size of the tensor dim ``view`` reads over ``block``, when known
+    at compile time."""
+    (position,) = (
+        p for d, p in zip(view.dims, view.positions, strict=True) if d.block_id == block
+    )
+    return static_extent(view.tensor.size(position))
+
+
+def _grid_layout(
+    cg: GenerateAST, group: MppGroup, plan: MppPlan, threads: int
+) -> RegisterRun | None:
+    """The register run of a launch of several SIMD groups, or None for the
+    staged path: the SIMD groups split the tile over M and N, each running
+    a ``matmul2d`` with both inputs cooperative over its own sub-tile, which
+    the op covers (M and N 16 or 32, K 16, or 32 for 16 x 16); the left
+    input a device view each lane reads its elements of; the right a
+    computed operand the lanes can recompute (``registers``), staged once
+    for every SIMD group, each thread writing a run of adjacent K positions
+    of one row, into a threadgroup tile whose rows are its N positions.  On
+    an M5 Max gate/up (4-bit 39936 x 6656, half dequant) took 461, 496 and
+    732 us at 16, 32 and 64 rows ([16|32, 64, 64] on 2 SIMD groups, [64,
+    64, 64] on 4), against 596, 665 and 750 us for the best register runs
+    on one SIMD group and 1520 us for the staged path at 64 rows.  Every tile
+    is whole, so the staged elements' masks fold to true (:func:`register_run`);
+    the view, widened or not, is 16-bit with K its unit-stride dim; the
+    right input is computed, not a widened view; and the tile's sub-tiles
+    prefer 32 x 32, then the most rows."""
+    if (
+        plan.registers is None
+        or group.fold is not None
+        or group.product is not None
+        or group.batch_block is not None
+        or group.k_factor != 1
+        # A staged seed, a materialization or a staged vector reads the
+        # accumulator over the whole tile (``_coop_elements``), not one
+        # SIMD group's sub-tile.
+        or staged_seed(group)
+        or group.mats
+        or group.stage_uses
+        or any(g is group for g in plan.by_vec.values())
+    ):
+        return None
+    lhs, rhs = group.lhs, group.rhs
+    # x as a view of its own tensor, widened or not (``x.to(float32)`` reads
+    # its half elements, exactly), the latter only where the lanes may read
+    # it at the op (``registers``: no tensor the kernel writes).
+    view = lhs.view
+    if view is None and lhs.registers:
+        view = lhs.widened
+    if view is None or view.outer or not rhs.registers or rhs.widened is not None:
+        return None
+    # Each lane reads its elements of x from the tensor unmasked
+    # (_emit_grid): x's dims must be tiles from their loops' offsets, no base,
+    # hl.arange or ``:``, and its M loop must end inside the tensor (below).
+    if any(
+        d.full or d.factor != 1 or d.iota is not None or d.base is not None
+        for d in view.dims
+    ) or not _k_inside(group, view):
+        return None
+    bm, bn, bk = static_tile(cg, (group.m_block, group.n_block, group.k_block))
+    if not _view_fits(view, (bm, bk)) or transposed_view(view):
+        return None
+    for block, size in ((group.m_block, bm), (group.n_block, bn)):
+        loop = static_loop(cg, block)
+        if loop is None or not tiles_in_range(
+            cg, block, size, static_int(loop[0].end_expr)
+        ):
+            return None
+        if block == group.m_block:
+            rows = _view_size(view, block)
+            end = static_int(loop[0].end_expr)
+            if rows is None or end is None or end > rows:
+                return None
+    # The accumulator, which decides the op, precedes its K loop: K's whole
+    # tiles come from its size, which the run checks inside the loop
+    # (codegen_register_run).
+    if not whole_k_tiles(group, bk):
+        return None
+    backend = CompileEnvironment.current().backend
+    left = backend.dtype_str(view.tensor.dtype)
+    right = _coop_type(group, 1)
+    if left not in ("half", "bfloat") or right not in (left, "float"):
+        return None
+    run, extra = divmod(bn * bk, threads)
+    if extra or not run or bk % run:
+        return None
+    sgs = threads // SIMD_WIDTH
+    best: tuple[tuple[int, int], int, int, int] | None = None
+    for sm in range(1, sgs + 1):
+        sn, rem = divmod(sgs, sm)
+        if rem or bm % sm or bn % sn:
+            continue
+        am, an = bm // sm, bn // sn
+        ak = _two_input_k(am, an, bk)
+        if ak is None:
+            continue
+        rank = (am * an, am)
+        if best is None or rank > best[0]:
+            best = (rank, sm, sn, ak)
+    if best is None:
+        return None
+    _, sm, sn, ak = best
+    atom = Atom(bm // sm, bn // sn, ak, left, right, "float")
+    return RegisterRun(
+        atom, ("lanes", "tile"), bk // ak, False, None, (sm, sn), (run, bk // run)
+    )
+
+
+def _two_input_k(am: int, an: int, k: int) -> int | None:
+    """The K of an op with two cooperative inputs over an ``am`` x ``an``
+    tile: 32 for 16 x 16, else 16, where M and N are 16 or 32 and a K tile
+    of ``k`` takes at most MAX_STEPS of them; else None."""
+    if am not in (16, 32) or an not in (16, 32):
+        return None
+    ak = 32 if (am, an) == (16, 16) else 16
+    return ak if k % ak == 0 and k // ak <= MAX_STEPS else None
 
 
 def _affine_candidate(atom: Atom, sides: tuple[str, str]) -> bool:
@@ -474,15 +679,18 @@ def _register_op(
             am, an = (16 if s <= 16 else 32 if s <= 32 else 0 for s in (m, n))
             if not am or not an or am > block_m or an > block_n:
                 return None
-            ak = 32 if (am, an) == (16, 16) else 16
+            two_k = _two_input_k(am, an, k)
+            if two_k is None:
+                return None
+            ak = two_k
         else:
             am, an, ak = m, n, 16
             if am % 8 or an % 8 or (am % 16 and an % 16):
                 return None
             if am > MAX_OP_TILE[0] or an > MAX_OP_TILE[1]:
                 return None
-        if k % ak or k // ak > MAX_STEPS:
-            return None
+            if k % ak or k // ak > MAX_STEPS:
+                return None
         return Atom(
             am,
             an,
@@ -637,8 +845,10 @@ def check_register_operands(group: MppGroup, plan: MppPlan, graphs: Graphs) -> N
 
 def register_acc_keywords(spec: RegisterRun) -> str:
     """The ``registers`` keyword of a register group's ``_helion_mpp_acc``:
-    its op (:class:`~coop_layout.Atom`'s fields)."""
-    return f", registers={dataclasses.astuple(spec.atom)!r}"
+    its op (:class:`~coop_layout.Atom`'s fields), and the SIMD groups over
+    the tile's M and N when they split it (:func:`_grid_run`)."""
+    grid = "" if spec.grid == (1, 1) else f", grid={spec.grid!r}"
+    return f", registers={dataclasses.astuple(spec.atom)!r}{grid}"
 
 
 def codegen_register_run(
@@ -657,7 +867,10 @@ def codegen_register_run(
     offset when the mask is live (``tile_mask``), for its loads past the
     tile's loop end; a device view as its nine run arguments
     (``view_args``) with ``("view", live)``, ``live`` whether each dim is
-    live by construction.  ``steps`` is the K tile's steps, ``interleave``
+    live by construction.  A grid run's computed operand takes ``("tile",
+    bindings, None, masks)``, its tiles' masks folded to true, and its view
+    ``("lanes", live)``, with ``grid`` and ``stage`` its sub-tiles and its
+    staging (:func:`_grid_run`).  ``steps`` is the K tile's steps, ``interleave``
     whether they relabel K, ``k_live`` the tile's live length, which masks
     a register operand's K tail and cuts a view's last steps (None when
     every tile is whole), ``facts`` the tile offsets' ``(offset, multiple,
@@ -673,16 +886,26 @@ def codegen_register_run(
     for (operand, blocks, k_pos), value, e, kind in zip(
         group_sides(group), values, ("_e_m", "_e_n"), spec.sides, strict=True
     ):
-        if kind == "reg":
+        if kind in ("reg", "tile"):
             assert isinstance(value, ast.AST)
             name = cg.lift(backend.cast_ast(value, operand.dtype), prefix="_mpp_rv")
             binds = virtual_thread(
                 cg, ((blocks[1 - k_pos], e), (group.k_block, "_e_k"))
             )
-            past = tile_mask(cg, blocks[1 - k_pos])
             parts.append(name.id)
             outers.append("[]")
-            sides.append(f"('reg', [{', '.join(binds)}], {past!r})")
+            if kind == "tile":
+                # Every tile of a grid run is whole (_grid_run): its masks
+                # hold at every element.
+                masks = [
+                    mask
+                    for block in (blocks[1 - k_pos], group.k_block)
+                    if (mask := cg.mask_var(block)) is not None
+                ]
+                sides.append(f"('tile', [{', '.join(binds)}], None, {masks!r})")
+                continue
+            past = tile_mask(cg, blocks[1 - k_pos])
+            sides.append(f"({kind!r}, [{', '.join(binds)}], {past!r})")
             continue
         view = operand.view if operand.view is not None else operand.widened
         assert view is not None
@@ -696,10 +919,14 @@ def codegen_register_run(
             + "".join(f"({x}, {s}, {st}, {a}), " for x, s, st, a in view_outer)
             + "]"
         )
-        sides.append(f"('view', {[bool(f) for f in live]!r})")
+        sides.append(f"({kind!r}, {[bool(f) for f in live]!r})")
     info = cg.active_device_loops[group.k_block][-1].block_id_to_info[group.k_block]
     k_live = "None"
-    if not tiles_in_range(cg, group.k_block, k, static_int(info.end_expr)):
+    if spec.grid != (1, 1):
+        # Its accumulator took the grid run on whole K tiles of the loop's
+        # extent (_grid_run), whatever the loop's begin.
+        assert whole_k_tiles(group, k), k
+    elif not tiles_in_range(cg, group.k_block, k, static_int(info.end_expr)):
         k_live = f"{info.end_var_name} - {cg.offset_var(group.k_block)}"
     facts = [
         fact
@@ -720,12 +947,15 @@ def codegen_register_run(
     split = current_plan().split
     k_split = None if split == 1 else (cg.offset_var(group.k_block), split)
     anchor_list = ", ".join(f"({p}, {a})" for p, a in anchors)
+    grid = ""
+    if spec.grid != (1, 1):
+        grid = f", grid={spec.grid!r}, stage={spec.stage!r}"
     return expr_from_string(
         f"{RUN}({acc.id}, {group.gid}, {', '.join(parts)}, "
         f"anchors=[{anchor_list}], outer=[{', '.join(outers)}], "
         f"registers=[{', '.join(sides)}], steps={spec.steps}, "
         f"interleave={spec.interleave}, k_live={k_live}, facts={facts!r}, "
-        f"k_split={k_split!r}{affine})"
+        f"k_split={k_split!r}{affine}{grid})"
     )
 
 
@@ -740,7 +970,7 @@ def run_binds(call: ast.Call) -> list[list[ast.Tuple]]:
     for side in sides.elts:
         assert isinstance(side, ast.Tuple)
         kind = ast.literal_eval(side.elts[0])
-        if kind == "reg":
+        if kind in ("reg", "tile"):
             binds = side.elts[1]
             assert isinstance(binds, ast.List)
             out.append(cast("list[ast.Tuple]", binds.elts))
@@ -789,7 +1019,8 @@ def register_run(
     args = list(call.args)
     for i, side in enumerate(sides.elts):
         assert isinstance(side, ast.Tuple)
-        if ast.literal_eval(side.elts[0]) == "view":
+        kind = ast.literal_eval(side.elts[0])
+        if kind in ("view", "lanes"):
             pos += 9
             continue
         binds_list = side.elts[1]
@@ -814,6 +1045,9 @@ def register_run(
             value = parse_expr(f"({src(value)} if _e_k < {src(k_live)} else 0.0)")
         put = ast.Expr(ast.Call(ast.Name(PUT, ast.Load()), [value], []))
         stmts = rerun(binds, names_read(put), [value])
+        if kind == "tile":
+            # A grid run's staged operand: its tiles are whole.
+            stmts = _true_masks(stmts, set(ast.literal_eval(side.elts[3])))
         if past is not None:
             mask, index, offset = past
             position = "_e_m" if i == 0 else "_e_n"
@@ -849,6 +1083,27 @@ def register_run(
     )
     ast.fix_missing_locations(loop)
     return loop
+
+
+def _true_masks(stmts: list[ast.stmt], masks: set[str]) -> list[ast.stmt]:
+    """``stmts`` with each assignment to a name in ``masks`` assigning True:
+    the masks of tiles that every element lies inside (a launch of several
+    SIMD groups masks each thread against the layout and each index against
+    its end, as ``mask_1 = (tid[1] < 16) & (indices_1 < n)``)."""
+
+    class Fold(ast.NodeTransformer):
+        def visit_Assign(self, node: ast.Assign) -> ast.Assign:
+            if (
+                len(node.targets) == 1
+                and isinstance(node.targets[0], ast.Name)
+                and node.targets[0].id in masks
+            ):
+                return ast.copy_location(
+                    ast.Assign(node.targets, ast.Constant(True)), node
+                )
+            return node
+
+    return [Fold().visit(stmt) for stmt in stmts]
 
 
 # MSL emission (msl_ast_walker).
@@ -1013,6 +1268,7 @@ def emit_register_run(
     state: EmitState,
     emit_body: Callable[[list[ast.stmt], list[str], int, EmitState], None],
     coop_view: Callable[..., tuple[list[str], list[str], str]],
+    to_msl: Callable[[ast.expr], str],
 ) -> None:
     """A register run's loop (:func:`register_run`): per step of the K tile,
     each register operand's cooperative tensor, every lane writing its
@@ -1067,23 +1323,42 @@ def emit_register_run(
     loops = {
         call_name(loop.iter): loop for loop in stmt.body if isinstance(loop, ast.For)
     }
-    # Each side: ("reg", lanes, element loop) or ("view", run args, live, outer).
+    # Each side: ("reg" or "tile", lanes, element loop) or ("view" or
+    # "lanes", run args, live, outer).
     pos = 2
     sides: list[tuple[object, ...]] = []
     for i, side in enumerate(sides_kw.elts):
         assert isinstance(side, ast.Tuple)
         operand = ("left", "right")[i]
-        if ast.literal_eval(side.elts[0]) == "reg":
+        kind = ast.literal_eval(side.elts[0])
+        if kind in ("reg", "tile"):
             lanes = operand_lanes(state, atom, operand, interleave)
             facts.update(state.lane_facts)
-            sides.append(("reg", lanes, loops[REG_A if i == 0 else REG_B]))
+            sides.append((kind, lanes, loops[REG_A if i == 0 else REG_B]))
             pos += 1
         else:
             live = tuple(ast.literal_eval(side.elts[1]))
             outer = outers.elts[i]
             assert isinstance(outer, ast.List)
-            sides.append(("view", call.args[pos : pos + 9], live, outer.elts))
+            sides.append((kind, call.args[pos : pos + 9], live, outer.elts))
             pos += 9
+    grid = keyword(call, "grid")
+    if grid is not None:
+        assert not affine and not interleave and whole and k_split is None
+        stage = ast.literal_eval(cast("ast.expr", keyword(call, "stage")))
+        _emit_grid(
+            parts,
+            pad,
+            state,
+            emit_body,
+            to_msl,
+            (atom, op, acc.id, gid, steps),
+            ast.literal_eval(grid),
+            stage,
+            facts,
+            sides,
+        )
+        return
     saved = state.put, state.put_type
     dest = None
     if affine:
@@ -1244,6 +1519,160 @@ def emit_register_run(
             parts += element
         parts.append(f"{' ' * indent}}}")
     state.put, state.put_type = saved
+
+
+def grid_origins(
+    state: EmitState, gid: int, grid: tuple[int, int], atom: Atom
+) -> tuple[str, str]:
+    """The names of the row and the column at which the SIMD group's
+    sub-tile of a grid run's tile starts (:func:`_grid_run`), declared once
+    in the preamble with their facts: SIMD group ``g`` takes sub-tile
+    ``(g / sn, g % sn)`` of the ``sm`` x ``sn`` grid."""
+    m0, n0 = f"_mst{gid}_m0", f"_mst{gid}_n0"
+    if m0 not in state.lane_facts:
+        sm, sn = grid
+        state.lane_decls += [
+            f"const int {m0} = int({SIMDGROUP} / {sn}) * {atom.m};",
+            f"const int {n0} = int({SIMDGROUP} % {sn}) * {atom.n};",
+        ]
+        state.lane_facts[m0] = Fact(atom.m, 0, (sm - 1) * atom.m)
+        state.lane_facts[n0] = Fact(atom.n, 0, (sn - 1) * atom.n)
+    return m0, n0
+
+
+def _emit_grid(
+    parts: list[str],
+    pad: str,
+    state: EmitState,
+    emit_body: Callable[[list[ast.stmt], list[str], int, EmitState], None],
+    to_msl: Callable[[ast.expr], str],
+    run_of: tuple[Atom, str, str, int, int],
+    grid: tuple[int, int],
+    stage: tuple[int, int],
+    facts: dict[str, Fact],
+    sides: list[tuple[object, ...]],
+) -> None:
+    """A grid run's K tile (:func:`_grid_run`).  Every thread computes its
+    run of adjacent K positions of one row of the right input, element by
+    element (``operand_elements.element_body``), into the threadgroup tile,
+    whose rows are the N positions, padded where that fits
+    (:func:`grid_tiles`); then, after a barrier, each
+    SIMD group builds both inputs of each step in registers, the left from
+    the view and the right from the tile, and runs the op over its sub-tile
+    (:func:`grid_origins`); a second barrier keeps the next tile's writes
+    behind every read of this one."""
+    atom, op, acc, gid, steps = run_of
+    sm, sn = grid
+    run, runs = stage
+    m0, n0 = grid_origins(state, gid, grid, atom)
+    inner = pad + "    "
+    tile_k = atom.k * steps
+    # The kernel's grid runs of one type share one tile, which ``metal_jit``
+    # declares at the largest run's size, and each run's rows are ``ld``
+    # apart, which it decides over every run (``grid_tiles``): each run's
+    # barriers keep its writes and reads apart from every other run's.
+    buf, row, k0 = f"{GRID_TILE}_{atom.right}", f"_mst{gid}_r", f"_mst{gid}_k"
+    ld = f"_mst{gid}_ld"
+    state.grid_runs[gid] = (atom.right, atom.n * sn, tile_k)
+    if row not in state.lane_facts:
+        flat = f"int({SIMDGROUP} * {SIMD_WIDTH} + {LANE})"
+        state.lane_decls += [
+            f"const int {row} = {flat} / {runs};",
+            f"const int {k0} = ({flat} % {runs}) * {run};",
+        ]
+        state.lane_facts[row] = Fact(1, 0, atom.n * sn - 1)
+        state.lane_facts[k0] = Fact(run, 0, tile_k - run)
+    facts = {**facts, **state.lane_facts}
+    (_, args, _, outer), (_, lanes, loop) = sides
+    assert sides[0][0] == "lanes" and sides[1][0] == "tile" and not outer
+    assert isinstance(loop, ast.For) and isinstance(lanes, CoopLanes)
+    saved = state.put, state.put_type
+    state.put_type = atom.right
+    parts.append(f"{pad}{{")
+    for i in range(run):
+        decls = (f"_e_k = {k0} + {i}", f"_e_n = {row}")
+        state.put = f"{buf}[{row} * {ld} + {k0} + {i}]"
+        element = [f"{inner}{{", *(f"{inner}    int {decl};" for decl in decls)]
+        body, _, _ = element_body(loop, decls, 0, i, facts, 0, state)
+        with state.isolated_scope():
+            emit_body(body, element, len(inner) + 4, state)
+        parts += [*element, f"{inner}}}"]
+    parts += [f"{pad}}}", f"{pad}threadgroup_barrier(mem_flags::mem_threadgroup);"]
+    # The left input's elements: the view at the sub-tile's rows and the
+    # step's K positions, every tile whole.
+    assert isinstance(args, list)
+    tensor, (o_m, _, _, st_m), (o_k, _, _, st_k) = (
+        to_msl(args[0]),
+        [to_msl(a) for a in args[1:5]],
+        [to_msl(a) for a in args[5:9]],
+    )
+    root = args[0]
+    while isinstance(root, ast.BinOp):
+        root = root.left
+    if isinstance(root, ast.Name):
+        state.device_views.add(root.id)
+    left = operand_lanes(state, atom, "left")
+    xp = f"_mst{gid}_x"
+    parts += [
+        f"{pad}{{",
+        (
+            f"{inner}const device {atom.left}* {xp} = {tensor} + "
+            f"((long)({o_m}) + {m0}) * (long)({st_m}) + (long)({o_k}) * (long)({st_k});"
+        ),
+    ]
+
+    def put(target: str, value: str, valid: tuple[str, ...] | None, e: int) -> str:
+        # An element a lane doesn't hold (coordinates read at run time,
+        # :func:`_runtime_lanes`) reads nothing and holds 0.
+        if valid is None:
+            return f"{inner}{target} = {value};"
+        return f"{inner}if ({valid[e]}) {target} = {value}; else {target} = 0;"
+
+    for step in range(steps):
+        a, b = f"_mr_a{step}", f"_mr_b{step}"
+        parts.append(f"{inner}auto {a} = {atom.tensor(op, 'left')};")
+        for e in range(len(left.rows)):
+            k = _at(atom.k * step, left.cols[e])
+            value = (
+                f"{xp}[(long)({_at(0, left.rows[e])}) * (long)({st_m}) "
+                f"+ (long)({k}) * (long)({st_k})]"
+            )
+            parts.append(put(f"{a}[{e}]", value, left.valid, e))
+        parts.append(f"{inner}auto {b} = {atom.tensor(op, 'right')};")
+        for e in range(len(lanes.rows)):
+            k = _at(atom.k * step, lanes.rows[e])
+            n = f"{n0} + {_at(0, lanes.cols[e])}"
+            parts.append(put(f"{b}[{e}]", f"{buf}[({n}) * {ld} + {k}]", lanes.valid, e))
+        parts.append(f"{inner}{op}.run({a}, {b}, {acc});")
+    parts += [f"{pad}}}", f"{pad}threadgroup_barrier(mem_flags::mem_threadgroup);"]
+    state.put, state.put_type = saved
+
+
+def grid_tiles(
+    runs: Mapping[int, tuple[str, int, int]], planned: int
+) -> tuple[dict[str, int], dict[int, int], int]:
+    """The slots of the tile each type of the kernel's grid ``runs`` (each
+    group's type, rows and K positions, :func:`_emit_grid`) share, each
+    run's row length, and the threadgroup memory's bytes they and the
+    ``planned`` buffers' take.  Rows are padded by 16 bytes, so the lanes'
+    reads of 8 rows spread over the banks, where every padded tile fits in
+    the threadgroup memory; else none is, as the staged op's tiles aren't."""
+
+    def layout(pad: bool) -> tuple[dict[str, int], dict[int, int], int]:
+        lds = {
+            gid: k + (16 // MSL_SCALAR_BYTES[t] if pad else 0)
+            for gid, (t, _, k) in runs.items()
+        }
+        slots: dict[str, int] = {}
+        for gid, (t, rows, _) in runs.items():
+            slots[t] = max(slots.get(t, 0), rows * lds[gid])
+        used = planned + sum(MSL_SCALAR_BYTES[t] * n for t, n in slots.items())
+        return slots, lds, used
+
+    padded = layout(pad=True)
+    if padded[2] > MAX_THREADGROUP_MEMORY_BYTES:
+        return layout(pad=False)
+    return padded
 
 
 def register_split_runs(body: list[ast.stmt], loop_var: str) -> list[ast.For]:

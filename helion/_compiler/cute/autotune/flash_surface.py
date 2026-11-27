@@ -16,6 +16,7 @@ from typing import cast
 
 import torch
 
+from ....exc import BackendUnsupported
 from ....exc import InvalidConfig
 from ....runtime.config import Config
 from ....runtime.config_cache import ConfigSet
@@ -1254,6 +1255,16 @@ def enable_cute_flash_bwd_search(
     ``cute_flash_bwd_row_mma``): its knobs are offered where the facts
     admit the family and searched / seeded on small grids.
     """
+    from ..scalar_fragment_assertion import requires_assertion_owner
+
+    if requires_assertion_owner(config_spec):
+        # Both native families replace the root. The ordinary fragment cannot
+        # take it instead: both backward matchers require a global dQ atomic.
+        raise BackendUnsupported(
+            "cute",
+            "torch._assert_async in fused attention backward requires a fragment "
+            "that can emit the global dQ atomic add",
+        )
     config_spec.cute_flash_bwd_search_enabled = True
     # The backward family (the tcgen05 pair vs the register-MMA rows)
     # picks the body the same way the forward's pipeline family does.

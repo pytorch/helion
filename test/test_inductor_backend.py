@@ -5,7 +5,6 @@ import importlib
 import inspect
 import os
 import re
-import tempfile
 import unittest
 from unittest.mock import patch
 
@@ -43,13 +42,37 @@ if not requires_torch_version("2.16"):
 
 # After the check: torch 2.13 and 2.14 do not have it.
 from torch._inductor.choices import registered_inductor_choices
+from torch._inductor.lowering import user_lowerings
+from torch._inductor.runtime.hints import DeviceProperties
 
 import helion
-from helion.autotuner.benchmark_provider import LocalBenchmarkProvider
+from helion._compiler.cute.inductor_plan import transposed_product_wins
+from helion._compiler.cute.tcgen05.search_plan import tcgen05_copies_n_major_b
+from helion._compiler.cute.tcgen05.search_plan import (
+    tcgen05_transposes_epilogue_bound_product,
+)
+from helion._compiler.cute.tcgen05.search_plan import (
+    tcgen05_transposes_misaligned_a_rows,
+)
+from helion._compiler.cute.tcgen05.search_plan import (
+    tcgen05_transposes_misaligned_b_rows,
+)
+from helion._compiler.cute.tcgen05.search_plan import (
+    tcgen05_transposes_misaligned_batched_output,
+)
+from helion._compiler.cute.tcgen05.search_plan import tcgen05_transposes_n_edge_b_rows
+from helion._compiler.cute.tcgen05.search_plan import (
+    tcgen05_transposes_skinny_batched_product,
+)
+from helion._compiler.cute.tcgen05.search_plan import tcgen05_transposes_skinny_product
+from helion._compiler.cute.tcgen05.search_plan import (
+    tcgen05_transposes_wide_tf32_product,
+)
 import helion.inductor
 from helion.inductor import config as helion_config
 from helion.inductor import kernel_sequence
 from helion.inductor.codegen.kernel import exact_cast
+from helion.inductor.lowering.mm import register_mm
 import helion.language as hl
 
 SOURCE_RE = re.compile(r'helion_\w+_source = """\\\n(.*?)"""', re.DOTALL)
@@ -62,6 +85,147 @@ needs_native_matmul = unittest.skipUnless(
     "use_native_matmul" in vars(InductorChoices),
     "torch without InductorChoices.use_native_matmul",
 )
+
+
+def transposes(m: int, n: int, k: int, *, b_n_major: bool = False) -> bool:
+    """Whether helion.inductor's pair-tile rule transposes a 16-bit m x n x k RC (RR)
+    product on this GPU."""
+    return transposed_product_wins(m, n, k, torch.device(DEVICE), b_n_major=b_n_major)
+
+
+def skinny_transposes(m: int, n: int, k: int, *, b_n_major: bool) -> bool:
+    """Whether tcgen05_transposes_skinny_product() transposes a skinny product on this
+    GPU."""
+    props = DeviceProperties.create(torch.device(DEVICE))
+    return props.major == 10 and tcgen05_transposes_skinny_product(
+        m,
+        n,
+        k,
+        torch.bfloat16,
+        a_strides=(k, 1),
+        b_strides=(n, 1) if b_n_major else (1, k),
+        num_sms=props.multi_processor_count,
+    )
+
+
+def misaligned_transposes(m: int, n: int, k: int) -> bool:
+    """Whether tcgen05_transposes_misaligned_b_rows() transposes an RR product on this
+    GPU."""
+    props = DeviceProperties.create(torch.device(DEVICE))
+    return props.major == 10 and tcgen05_transposes_misaligned_b_rows(
+        m,
+        n,
+        k,
+        torch.bfloat16,
+        a_strides=(k, 1),
+        b_strides=(n, 1),
+        num_sms=props.multi_processor_count,
+    )
+
+
+def n_edge_transposes(m: int, n: int, k: int) -> bool:
+    """Whether tcgen05_transposes_n_edge_b_rows() transposes an RR product on this GPU."""
+    props = DeviceProperties.create(torch.device(DEVICE))
+    return props.major == 10 and tcgen05_transposes_n_edge_b_rows(
+        m,
+        n,
+        k,
+        torch.bfloat16,
+        a_strides=(k, 1),
+        b_strides=(n, 1),
+        num_sms=props.multi_processor_count,
+    )
+
+
+def misaligned_a_transposes(m: int, n: int, k: int) -> bool:
+    """Whether tcgen05_transposes_misaligned_a_rows() transposes an RR product on this
+    GPU."""
+    props = DeviceProperties.create(torch.device(DEVICE))
+    return props.major == 10 and tcgen05_transposes_misaligned_a_rows(
+        m,
+        n,
+        k,
+        torch.bfloat16,
+        a_strides=(k, 1),
+        b_strides=(n, 1),
+        num_sms=props.multi_processor_count,
+    )
+
+
+def skinny_batched_transposes(batch: int, m: int, n: int, k: int) -> bool:
+    """Whether tcgen05_transposes_skinny_batched_product() transposes an M-major a's
+    bmm on this GPU."""
+    props = DeviceProperties.create(torch.device(DEVICE))
+    return props.major == 10 and tcgen05_transposes_skinny_batched_product(
+        batch,
+        m,
+        n,
+        k,
+        torch.bfloat16,
+        a_strides=(m * k, 1, m),
+        b_strides=(k * n, n, 1),
+        num_sms=props.multi_processor_count,
+    )
+
+
+def epilogue_bound_transposes(m: int, n: int, k: int) -> bool:
+    """Whether tcgen05_transposes_epilogue_bound_product() transposes an RC product on
+    this GPU."""
+    props = DeviceProperties.create(torch.device(DEVICE))
+    return props.major == 10 and tcgen05_transposes_epilogue_bound_product(
+        m,
+        n,
+        k,
+        torch.bfloat16,
+        a_strides=(k, 1),
+        b_strides=(1, k),
+        num_sms=props.multi_processor_count,
+    )
+
+
+def misaligned_bmm_transposes(batch: int, m: int, n: int, k: int) -> bool:
+    """Whether tcgen05_transposes_misaligned_batched_output() transposes an RC bmm on
+    this GPU."""
+    props = DeviceProperties.create(torch.device(DEVICE))
+    return props.major == 10 and tcgen05_transposes_misaligned_batched_output(
+        batch,
+        m,
+        n,
+        k,
+        torch.bfloat16,
+        a_strides=(k, 1),
+        b_strides=(1, k),
+        num_sms=props.multi_processor_count,
+    )
+
+
+def wide_tf32_transposes(m: int, n: int, k: int) -> bool:
+    """Whether tcgen05_transposes_wide_tf32_product() transposes a tf32 RC product on
+    this GPU."""
+    props = DeviceProperties.create(torch.device(DEVICE))
+    return props.major == 10 and tcgen05_transposes_wide_tf32_product(
+        m,
+        n,
+        k,
+        torch.float32,
+        a_strides=(k, 1),
+        b_strides=(1, k),
+        num_sms=props.multi_processor_count,
+    )
+
+
+def copies_b(m: int, n: int, k: int) -> bool:
+    """Whether tcgen05_copies_n_major_b() copies an RR product's b K-major on this GPU."""
+    props = DeviceProperties.create(torch.device(DEVICE))
+    return props.major == 10 and tcgen05_copies_n_major_b(
+        m,
+        n,
+        k,
+        torch.bfloat16,
+        a_strides=(k, 1),
+        b_strides=(n, 1),
+        num_sms=props.multi_processor_count,
+    )
 
 
 def randn(*shape, dtype=torch.bfloat16):
@@ -251,7 +415,7 @@ import torch
 import helion
 import helion.language as hl
 
-@helion.kernel(backend="triton", static_shapes=True, autotune_effort="none")
+@helion.kernel(backend="triton", static_shapes=True, autotune_effort="none", split_k_reduction="output")
 def kernel(in0: torch.Tensor, in1: torch.Tensor, in2: torch.Tensor, out0: torch.Tensor) -> None:
     for tile_y, tile_x in hl.tile([40, 136]):
         acc = hl.zeros([tile_y, tile_x], dtype=torch.float32)
@@ -363,7 +527,7 @@ import torch
 import helion
 import helion.language as hl
 
-@helion.kernel(backend="triton", static_shapes=True, autotune_effort="none")
+@helion.kernel(backend="triton", static_shapes=True, autotune_effort="none", split_k_reduction="output")
 def kernel(in0: torch.Tensor, in1: torch.Tensor, out0: torch.Tensor, out1: torch.Tensor) -> None:
     for tile_y, tile_x in hl.tile([64, 48]):
         tmp0 = in0[tile_y, :]
@@ -394,6 +558,43 @@ def kernel(in0: torch.Tensor, in1: torch.Tensor, out0: torch.Tensor, out1: torch
         self.assertIn("acc = torch.addmm(acc, tmp0, tmp1)", source)
         self.assertIn("out0[tile_y, tile_x] = acc\n", source)
 
+    @parametrize("dtype", [torch.bfloat16, torch.float16])
+    def test_split_k_reduction_follows_torch_flags(self, dtype):
+        # A 16-bit dot takes torch's reduced-precision flags for its dtype, an fp32
+        # output included; an fp32 dot has none.
+        name = "bf16" if dtype is torch.bfloat16 else "fp16"
+        attr = f"allow_{name}_reduced_precision_reduction"
+        matmul = torch.backends.cuda.matmul
+        saved = getattr(matmul, attr), getattr(matmul, f"{attr}_split_k")
+        a = torch.randn(40, 72, device=DEVICE, dtype=dtype)
+        b = torch.randn(72, 136, device=DEVICE, dtype=dtype)
+        fp32_out = lambda a, b: torch.mm(a, b, out_dtype=torch.float32)  # noqa: E731
+        try:
+            for flags, expected in (
+                ((True, True), "output"),
+                ((False, True), "accumulator"),
+                ((False, False), "none"),
+            ):
+                if (
+                    flags == (False, False)
+                    and os.environ.get("HELION_INTERPRET") == "1"
+                ):
+                    # Ref mode runs the kernel's 16-bit mm eagerly, which torch
+                    # refuses with allow_splitk=False outside its cuBLASLt backend.
+                    continue
+                setattr(matmul, attr, flags)
+                for fn in (torch.mm, fp32_out):
+                    torch._dynamo.reset()
+                    (source,) = self.compile(fn, a, b, tol=2e-2)
+                    self.assertIn(
+                        f'autotune_effort="none", split_k_reduction="{expected}")',
+                        source,
+                    )
+        finally:
+            setattr(matmul, attr, saved)
+        (source,) = self.compile(torch.mm, a.float(), b.float(), tol=2e-2)
+        self.assertNotIn("split_k_reduction", source)
+
     def test_persistent_dot_epilogue_reads_fp32(self):
         # The epilogue reads the bf16 product in fp32, as it would from memory. In
         # bf16, + 1000 would round it to a multiple of 4.
@@ -414,7 +615,7 @@ import torch
 import helion
 import helion.language as hl
 
-@helion.kernel(backend="triton", static_shapes=True, autotune_effort="none")
+@helion.kernel(backend="triton", static_shapes=True, autotune_effort="none", split_k_reduction="output")
 def kernel(in0: torch.Tensor, in1: torch.Tensor, out0: torch.Tensor, out1: torch.Tensor) -> None:
     for tile_y, tile_x in hl.tile([40, 136]):
         acc = hl.zeros([tile_y, tile_x], dtype=torch.float32)
@@ -714,29 +915,571 @@ class TestInductorCute(InductorBackendTestCase):
         self.check_mix_order_reduction("cute")
 
     @needs_native_matmul
-    def test_persistent_dot(self):
-        # K in one block: CuTe gets torch.mm and torch.bmm stored as they are
-        # (test_cute_mma_dag_stored_dot_gpu.py checks that cute_mma_dag runs
-        # them on tensor cores).
-        (source,) = self.compile(
-            torch.mm, randn(128, 64), randn(256, 64).t(), backend="cute"
-        )
-        self.assertIn("tmp2 = torch.mm(tmp0, tmp1)", source)
+    def test_dot_keeps_k_loop(self):
+        # A K of 64 is one block, but on an SM100-family GPU a 16-bit dot keeps its K
+        # loop (MatmulPlan.keep_k_loop); elsewhere the persistent form stays.
         (source,) = self.compile(
             torch.bmm, randn(4, 128, 64), randn(4, 64, 128), backend="cute"
         )
+        if torch.cuda.get_device_capability()[0] != 10:
+            self.assertIn("tmp2 = torch.bmm(tmp0, tmp1)", source)
+            return
+        self.assertExpectedInline(
+            source,
+            """\
+import torch
+import helion
+import helion.language as hl
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none", split_k_reduction="output")
+def kernel(in0: torch.Tensor, in1: torch.Tensor, out0: torch.Tensor) -> None:
+    for tile_z, tile_y, tile_x in hl.tile([4, 128, 128]):
+        acc = hl.zeros([tile_z, tile_y, tile_x], dtype=torch.float32)
+        for tile_r in hl.tile(64):
+            tmp0 = in0[tile_z, tile_y, tile_r]
+            tmp1 = in1[tile_z, tile_r, tile_x]
+            acc = torch.baddbmm(acc, tmp0, tmp1)
+        out0[tile_z, tile_y, tile_x] = acc.to(torch.bfloat16)
+""",
+        )
+        (source,) = self.compile(
+            torch.mm, randn(128, 64), randn(256, 64).t(), backend="cute"
+        )
+        self.assertIn("acc = torch.addmm(acc, tmp0, tmp1)", source)
+
+    @needs_native_matmul
+    def test_persistent_dot(self):
+        # A small matmul the tcgen05 planner rejects keeps K in one block: a stored
+        # torch.mm.
+        (source,) = self.compile(torch.mm, randn(40, 64), randn(64, 96), backend="cute")
+        self.assertIn("tmp2 = torch.mm(tmp0, tmp1)", source)
+        self.assertNotIn("acc", source)
+        # So does a batch of small matrices.
+        (source,) = self.compile(
+            torch.bmm, randn(256, 56, 32), randn(256, 32, 56), backend="cute"
+        )
         self.assertIn("tmp2 = torch.bmm(tmp0, tmp1)", source)
+        self.assertNotIn("acc", source)
+        # On an SM100-family GPU it reads a K of up to 128 whole (MatmulPlan.whole_k); a
+        # K that is no power of two, or a longer one, keeps the loop.
+        whole_k = torch.cuda.get_device_capability()[0] == 10
+        for k, stored in ((128, whole_k), (96, False), (256, False)):
+            (source,) = self.compile(
+                torch.bmm, randn(256, 56, k), randn(256, k, 56), backend="cute"
+            )
+            if stored:
+                self.assertIn("tmp2 = torch.bmm(tmp0, tmp1)", source)
+                self.assertNotIn("acc", source)
+            else:
+                self.assertIn("acc = torch.baddbmm(acc, tmp0, tmp1)", source)
+        # Inductor's switch for persistent reductions still turns it off.
+        with config.patch({"triton.persistent_reductions": False}):
+            (source,) = self.compile(
+                torch.bmm, randn(256, 56, 128), randn(256, 128, 56), backend="cute"
+            )
+        self.assertIn("acc = torch.baddbmm(acc, tmp0, tmp1)", source)
+
+    @needs_native_matmul
+    def test_k_major_copy_of_b(self):
+        # A tall product over a row-major b runs as written over a K-major copy of b
+        # (tcgen05_copies_n_major_b()).
+        sources = self.compile(
+            torch.mm, randn(65536, 144), randn(144, 288), tol=1e-2, backend="cute"
+        )
+        if not copies_b(65536, 288, 144):
+            (source,) = sources
+            self.assertIn("for tile_y, tile_x in hl.tile([65536, 288]):", source)
+            return
+        copy, source = sources
+        self.assertIn("for tile_y, tile_x in hl.tile([144, 288]):", copy)
+        self.assertNotRegex(copy, DOT_RE)
+        self.assertIn("for tile_y, tile_x in hl.tile([65536, 288]):", source)
+        self.assertIn("tmp1 = in1[tile_r, tile_x]", source)
+        self.assertIn(
+            "empty_strided_cuda((144, 288), (1, 144), torch.bfloat16)", self.code
+        )
+        # A K-major b needs no copy.
+        (source,) = self.compile(
+            torch.mm, randn(65536, 144), randn(288, 144).t(), tol=1e-2, backend="cute"
+        )
+        self.assertIn("for tile_y, tile_x in hl.tile([65536, 288]):", source)
+        # A user's aten.mm lowering registered first that declines still leaves the
+        # product the copy.
+        declined = []
+
+        def declining(mat1, mat2):
+            declined.append(mat2)
+
+        mm = torch.ops.aten.mm.default
+        saved = user_lowerings[mm]
+        try:
+            user_lowerings[mm] = declining
+            register_mm()
+            torch._dynamo.reset()
+            # (a fresh cache, so that the graph is lowered again)
+            with fresh_cache():
+                copy, source = self.compile(
+                    torch.mm,
+                    randn(65536, 144),
+                    randn(144, 288),
+                    tol=1e-2,
+                    backend="cute",
+                )
+        finally:
+            user_lowerings[mm] = saved
+        self.assertTrue(declined)
+        self.assertIn("tmp1 = in1[tile_r, tile_x]", source)
+        self.assertIn(
+            "empty_strided_cuda((144, 288), (1, 144), torch.bfloat16)", self.code
+        )
+
+    @needs_native_matmul
+    def test_transposed_product(self):
+        # A tall product over a column-major b lowers as (b.T @ a.T).T where the
+        # pair-tile model says so (transposes()): the kernel reads views of the inputs
+        # and writes an N-contiguous buffer whose transpose is the result. (A K of 4096
+        # sums in another order than eager's.)
+        (source,) = self.compile(
+            torch.mm,
+            randn(8192, 4096),
+            randn(1024, 4096).t(),
+            tol=1e-2,
+            backend="cute",
+        )
+        # (each case checks its own rule's answer for the GPU at hand)
+        if not transposes(8192, 1024, 4096):
+            self.assertIn("for tile_y, tile_x in hl.tile([8192, 1024]):", source)
+        else:
+            # The dot's rows (tile_x, b's 1024 columns) are tiled first.
+            self.assertIn("for tile_x, tile_y in hl.tile([1024, 8192]):", source)
+            self.assertIn("tmp0 = in0[tile_x, tile_r]", source)
+            self.assertIn("tmp1 = in1[tile_r, tile_y]", source)
+            self.assertIn("out0[tile_x, tile_y] = acc.to(torch.bfloat16)", source)
+            self.assertIn(
+                "empty_strided_cuda((1024, 8192), (1, 1024), torch.bfloat16)",
+                self.code,
+            )
+            self.assertIn(
+                "helion_fused_mm_0(reinterpret_tensor(arg1_1, (1024, 4096), (4096, 1), 0), "
+                "reinterpret_tensor(arg0_1, (4096, 8192), (1, 4096), 0), buf0)",
+                self.code,
+            )
+            self.assertIn(
+                "return (reinterpret_tensor(buf0, (8192, 1024), (1024, 1), 0), )",
+                self.code,
+            )
+        # A one-wave product whose N no CTA pair tiles as written runs transposed.
+        (source,) = self.compile(
+            torch.mm, randn(512, 1280), randn(1000, 1280).t(), tol=1e-2, backend="cute"
+        )
+        if transposes(512, 1000, 1280):
+            self.assertIn("for tile_x, tile_y in hl.tile([1000, 512]):", source)
+        else:
+            self.assertIn("for tile_y, tile_x in hl.tile([512, 1000]):", source)
+        # So does one whose N an aligned 128-row pair tiles finer transposed.
+        (source,) = self.compile(
+            torch.mm, randn(1000, 2048), randn(1024, 2048).t(), tol=1e-2, backend="cute"
+        )
+        if transposes(1000, 1024, 2048):
+            self.assertIn("for tile_x, tile_y in hl.tile([1024, 1000]):", source)
+        else:
+            self.assertIn("for tile_y, tile_x in hl.tile([1000, 1024]):", source)
+        # So does a square-ish product of a row-major b, though not of a column-major
+        # one.
+        (source,) = self.compile(
+            torch.mm, randn(2048, 2560), randn(2560, 2560), tol=1e-2, backend="cute"
+        )
+        if transposes(2048, 2560, 2560, b_n_major=True):
+            self.assertIn("for tile_x, tile_y in hl.tile([2560, 2048]):", source)
+            self.assertIn("tmp0 = in0[tile_x, tile_r]", source)
+            self.assertIn(
+                "reinterpret_tensor(arg1_1, (2560, 2560), (1, 2560), 0)", self.code
+            )
+        else:
+            self.assertIn("for tile_y, tile_x in hl.tile([2048, 2560]):", source)
+        self.assertFalse(transposes(2048, 2560, 2560))
+        # A wide product tiles finer as written, and the Triton backend keeps every
+        # product as written.
+        for backend, m, n in (("cute", 1000, 4096), ("triton", 8192, 1024)):
+            (source,) = self.compile(
+                torch.mm,
+                randn(m, 4096),
+                randn(n, 4096).t(),
+                tol=1e-2,
+                backend=backend,
+            )
+            self.assertIn(f"for tile_y, tile_x in hl.tile([{m}, {n}]):", source)
+
+    @needs_native_matmul
+    def test_transposed_product_by_rule(self):
+        # A skinny product over a row-major b runs transposed
+        # (tcgen05_transposes_skinny_product()), reading b.T as the dot's first operand.
+        (source,) = self.compile(
+            torch.mm, randn(128, 1000), randn(1000, 768), tol=1e-2, backend="cute"
+        )
+        if skinny_transposes(128, 768, 1000, b_n_major=True):
+            self.assertIn("for tile_x, tile_y in hl.tile([768, 128]):", source)
+            self.assertIn("tmp0 = in0[tile_x, tile_r]", source)
+            self.assertIn(
+                "reinterpret_tensor(arg1_1, (768, 1000), (1, 768), 0)", self.code
+            )
+        else:
+            self.assertIn("for tile_y, tile_x in hl.tile([128, 768]):", source)
+        # A row-major b whose rows straddle L2 sectors runs transposed
+        # (tcgen05_transposes_misaligned_b_rows()).
+        (source,) = self.compile(
+            torch.mm, randn(2048, 768), randn(768, 20008), tol=1e-2, backend="cute"
+        )
+        if misaligned_transposes(2048, 20008, 768):
+            self.assertIn("for tile_x, tile_y in hl.tile([20008, 2048]):", source)
+            self.assertIn(
+                "reinterpret_tensor(arg1_1, (20008, 768), (1, 20008), 0)", self.code
+            )
+        else:
+            self.assertIn("for tile_y, tile_x in hl.tile([2048, 20008]):", source)
+        # A wide, epilogue-bound product over a column-major b runs transposed
+        # (tcgen05_transposes_epilogue_bound_product()).
+        (source,) = self.compile(
+            torch.mm,
+            randn(2048, 512),
+            randn(19712, 512).t(),
+            tol=1e-2,
+            backend="cute",
+        )
+        if epilogue_bound_transposes(2048, 19712, 512):
+            self.assertIn("for tile_x, tile_y in hl.tile([19712, 2048]):", source)
+            self.assertIn(
+                "empty_strided_cuda((19712, 2048), (1, 19712), torch.bfloat16)",
+                self.code,
+            )
+        else:
+            self.assertIn("for tile_y, tile_x in hl.tile([2048, 19712]):", source)
+
+    @needs_native_matmul
+    def test_transposed_rows_and_bmm(self):
+        # More transposed products (see test_transposed_product); each case checks its
+        # own rule's answer for the GPU at hand.
+        # A one-wave product over a row-major a whose rows straddle L2 sectors, with a K
+        # tail (tcgen05_transposes_misaligned_a_rows()).
+        (source,) = self.compile(
+            torch.mm, randn(512, 1000), randn(1000, 1280), tol=1e-2, backend="cute"
+        )
+        if misaligned_a_transposes(512, 1280, 1000):
+            self.assertIn("for tile_x, tile_y in hl.tile([1280, 512]):", source)
+            self.assertIn(
+                "reinterpret_tensor(arg1_1, (1280, 1000), (1, 1280), 0)", self.code
+            )
+        else:
+            self.assertIn("for tile_y, tile_x in hl.tile([512, 1280]):", source)
+        # A row-major b whose N ends in a partial pair tile
+        # (tcgen05_transposes_n_edge_b_rows()).
+        (source,) = self.compile(
+            torch.mm, randn(2048, 512), randn(512, 20000), tol=1e-2, backend="cute"
+        )
+        if n_edge_transposes(2048, 20000, 512):
+            self.assertIn("for tile_x, tile_y in hl.tile([20000, 2048]):", source)
+            self.assertIn(
+                "reinterpret_tensor(arg1_1, (20000, 512), (1, 20000), 0)", self.code
+            )
+        else:
+            self.assertIn("for tile_y, tile_x in hl.tile([2048, 20000]):", source)
+        # A skinny batched product of an M-major a (attention's attn.transpose(1, 2))
+        # and a row-major b runs transposed
+        # (tcgen05_transposes_skinny_batched_product()), reading b.mT as the dot's first
+        # operand.
+        (source,) = self.compile(
+            lambda a, b: torch.bmm(a.transpose(1, 2), b),
+            randn(1024, 128, 64),
+            randn(1024, 128, 128),
+            tol=1e-2,
+            backend="cute",
+        )
+        if skinny_batched_transposes(1024, 64, 128, 128):
+            self.assertIn(
+                "for tile_z, tile_x, tile_y in hl.tile([1024, 128, 64]):", source
+            )
+            self.assertIn("tmp0 = in0[tile_z, tile_x, tile_r]", source)
+            self.assertIn(
+                "empty_strided_cuda((1024, 128, 64), (8192, 1, 128), torch.bfloat16)",
+                self.code,
+            )
+            self.assertIn(
+                "reinterpret_tensor(arg1_1, (1024, 128, 128), (16384, 1, 128), 0)",
+                self.code,
+            )
+            self.assertIn(
+                "return (reinterpret_tensor(buf0, (1024, 64, 128), (8192, 128, 1), 0), )",
+                self.code,
+            )
+        else:
+            self.assertIn(
+                "for tile_z, tile_y, tile_x in hl.tile([1024, 64, 128]):", source
+            )
+
+    @needs_native_matmul
+    def test_transposed_tf32_product(self):
+        # A wide fp32 product computed as tf32 runs transposed on SM100-family GPUs
+        # (tcgen05_transposes_wide_tf32_product()); a tall one, and every product under
+        # "ieee" precision, stays as written.
+        previous = torch.backends.cuda.matmul.fp32_precision
+        try:
+            torch.backends.cuda.matmul.fp32_precision = "tf32"
+            (source,) = self.compile(
+                torch.mm,
+                randn(8192, 256, dtype=torch.float32),
+                randn(9216, 256, dtype=torch.float32).t(),
+                tol=1e-2,
+                backend="cute",
+            )
+            self.assertIn('dot_precision="tf32"', source)
+            if wide_tf32_transposes(8192, 9216, 256):
+                self.assertIn("for tile_x, tile_y in hl.tile([9216, 8192]):", source)
+                self.assertIn(
+                    "empty_strided_cuda((9216, 8192), (1, 9216), torch.float32)",
+                    self.code,
+                )
+            else:
+                self.assertIn("for tile_y, tile_x in hl.tile([8192, 9216]):", source)
+            (source,) = self.compile(
+                torch.mm,
+                randn(8192, 256, dtype=torch.float32),
+                randn(1024, 256, dtype=torch.float32).t(),
+                tol=1e-2,
+                backend="cute",
+            )
+            self.assertIn("for tile_y, tile_x in hl.tile([8192, 1024]):", source)
+            torch.backends.cuda.matmul.fp32_precision = "ieee"
+            (source,) = self.compile(
+                torch.mm,
+                randn(8192, 256, dtype=torch.float32),
+                randn(9216, 256, dtype=torch.float32).t(),
+                tol=1e-3,
+                backend="cute",
+            )
+            self.assertIn('dot_precision="ieee"', source)
+            self.assertIn("for tile_y, tile_x in hl.tile([8192, 9216]):", source)
+        finally:
+            torch.backends.cuda.matmul.fp32_precision = previous
+
+    @needs_native_matmul
+    def test_transposed_bmm(self):
+        # A batched product over a column-major b whose output rows straddle L2 lines
+        # lowers as (b.mT @ a.mT).mT where its rule says so
+        # (misaligned_bmm_transposes()).
+        (source,) = self.compile(
+            torch.bmm,
+            randn(64, 1000, 64),
+            randn(64, 1000, 64).transpose(1, 2),
+            tol=1e-2,
+            backend="cute",
+        )
+        if not misaligned_bmm_transposes(64, 1000, 1000, 64):
+            self.assertIn(
+                "for tile_z, tile_y, tile_x in hl.tile([64, 1000, 1000]):", source
+            )
+        else:
+            # The dot's rows (tile_x, b's 1000 columns) follow the batch.
+            self.assertIn(
+                "for tile_z, tile_x, tile_y in hl.tile([64, 1000, 1000]):", source
+            )
+            self.assertIn("tmp0 = in0[tile_z, tile_x, tile_r]", source)
+            self.assertIn("tmp1 = in1[tile_z, tile_r, tile_y]", source)
+            self.assertIn(
+                "out0[tile_z, tile_x, tile_y] = acc.to(torch.bfloat16)", source
+            )
+            self.assertIn(
+                "empty_strided_cuda((64, 1000, 1000), (1000000, 1, 1000), "
+                "torch.bfloat16)",
+                self.code,
+            )
+            self.assertIn(
+                "helion_fused_bmm_0(reinterpret_tensor(arg1_1, (64, 1000, 64), "
+                "(64000, 64, 1), 0), reinterpret_tensor(arg0_1, (64, 64, 1000), "
+                "(64000, 1, 64), 0), buf0)",
+                self.code,
+            )
+            self.assertIn(
+                "return (reinterpret_tensor(buf0, (64, 1000, 1000), "
+                "(1000000, 1000, 1), 0), )",
+                self.code,
+            )
+        # Rows of whole lines ([64, 1024, 64] @ [64, 64, 1024]) and a
+        # row-major b stay as written.
+        for b in (
+            randn(64, 1024, 64).transpose(1, 2),
+            randn(64, 64, 1000),
+        ):
+            n = b.size(2)
+            (source,) = self.compile(
+                torch.bmm, randn(64, n, 64), b, tol=1e-2, backend="cute"
+            )
+            self.assertIn(
+                f"for tile_z, tile_y, tile_x in hl.tile([64, {n}, {n}]):", source
+            )
+
+    @needs_native_matmul
+    def test_dot_axes_follow_the_output(self):
+        # The dot's rows are the axis the output's store scales by its row stride,
+        # whatever the operands load: ones_like(a) @ b keeps its rows on tile_y.
+        a, b = randn(256, 512), randn(384, 512).t()
+        (source,) = self.compile(
+            lambda a, b: torch.ones_like(a) @ b, a, b, tol=1e-2, backend="cute"
+        )
+        self.assertIn("for tile_y, tile_x in hl.tile([256, 384]):", source)
+        # The transposed product with a fused epilogue (an MLP's
+        # relu(x @ w.t())) keeps its rows on tile_x and the epilogue in it.
+        a, b = randn(4096, 1024), randn(1024, 1024).t()
+        transposed = transposes(4096, 1024, 1024)
+        (source,) = self.compile(
+            lambda a, b: torch.relu(a @ b), a, b, tol=1e-2, backend="cute"
+        )
+        if transposed:
+            self.assertIn("for tile_x, tile_y in hl.tile([1024, 4096]):", source)
+        # a @ b + a @ c with c row-major transposes a @ b only, so the two dots stay in
+        # kernels of their own (HelionScheduling.can_fuse()).
+        # (small integers keep each bf16 product, and their sum, exact)
+        a, b, c = (
+            torch.randint(-1, 2, shape, device=DEVICE).to(torch.bfloat16)
+            for shape in ((4096, 1024), (1024, 1024), (1024, 1024))
+        )
+        b = b.t()
+        sources = self.compile(
+            lambda a, b, c: a @ b + a @ c, a, b, c, tol=1e-2, backend="cute"
+        )
+        if transposed:
+            self.assertEqual(len(sources), 2)
+            self.assertTrue(
+                any(
+                    "for tile_x, tile_y in hl.tile([1024, 4096]):" in s for s in sources
+                )
+            )
+            self.assertTrue(
+                any(
+                    "for tile_y, tile_x in hl.tile([4096, 1024]):" in s for s in sources
+                )
+            )
+        # An operand that is still a prologue has no layout to prove K-major,
+        # so its product stays as written.
+        s = randn(1024, 1)
+        # (the dot reads s + b rounded to bf16, as eager's bf16 sum is)
+        expected = (a.float() @ (s + b).float()).to(torch.bfloat16)
+        sources = self.compile(
+            lambda a, b, s: a @ (s + b),
+            a,
+            b,
+            s,
+            expected=expected,
+            tol=1e-2,
+            backend="cute",
+        )
+        self.assertIn("for tile_y, tile_x in hl.tile([4096, 1024]):", sources[-1])
 
     @needs_native_matmul
     @config.patch(force_shape_pad=True)
     def test_padded_operand(self):
-        # pad_mm pads N from 1001 to 1008. The pad is a kernel of its own, and
-        # the dot reads the padded b as tiles, not through b's masked loads.
+        # pad_mm pads N from 1001 to 1008; over an N-major b the pad is a kernel of its
+        # own, whose output the dot reads as tiles.
+        a, b = randn(64, 128), randn(128, 1001)
+        sources = self.compile(torch.matmul, a, b, tol=1e-2, backend="cute")
+        self.assertEqual([bool(DOT_RE.search(s)) for s in sources], [False, True])
+        self.assertNotIn("hl.load(", sources[1])
+        # Over a K-major b the product writes the first 1001 columns of the padded
+        # output (HelionChoices.pad_matmul_output()). The graph returns the slice, so
+        # the pad columns hold eager's sum(|a| * 0, 1) (_pad_of_product()).
         a, b = randn(64, 128), randn(1001, 128).t()
         sources = self.compile(torch.matmul, a, b, backend="cute")
+        if DeviceProperties.create(torch.device(DEVICE)).major != 10:
+            self.assertEqual([bool(DOT_RE.search(s)) for s in sources], [False, True])
+            self.assertIn("tmp1 = in1[tile_r, tile_x]", sources[1])
+            self.assertNotIn("hl.load(", sources[1])
+            return
+        (dot,) = [s for s in sources if DOT_RE.search(s)]
+        self.assertIn("for tile_y, tile_x in hl.tile([64, 1001]):", dot)
+        self.assertIn("tmp1 = in1[tile_r, tile_x]", dot)
+        self.assertNotIn("hl.load(", dot)
+        self.assertTrue(any("torch.abs(" in s and "torch.sum(" in s for s in sources))
+        self.assertIn(
+            "empty_strided_cuda((64, 1008), (1008, 1), torch.bfloat16)", self.code
+        )
+        # Where every reader reads within the slice, a small kernel zeroes the pad.
+        relu = lambda a, b: torch.matmul(a, b).relu()  # noqa: E731
+        sources = self.compile(relu, a, b, backend="cute")
+        self.assertTrue(
+            any(
+                "tmp0 = 0.0" in s and "hl.full([], tmp0, dtype=torch.float32)" in s
+                for s in sources
+            )
+        )
+        self.assertFalse(any("torch.abs(" in s for s in sources))
+        # An M pad over a K-major a likewise: the pad rows hold sum(|b| * 0, 0).
+        a, b = randn(1001, 128), randn(64, 128).t()
+        sources = self.compile(torch.mm, a, b, backend="cute")
+        (dot,) = [s for s in sources if DOT_RE.search(s)]
+        self.assertIn("for tile_y, tile_x in hl.tile([1001, 64]):", dot)
+        self.assertTrue(any("torch.abs(" in s and "torch.sum(" in s for s in sources))
+        self.assertIn(
+            "empty_strided_cuda((1008, 64), (64, 1), torch.bfloat16)", self.code
+        )
+        # A pad whose columns the program reads keeps its pad kernel: a @ 0 is NaN in a
+        # row of a that holds inf.
+        a, b = randn(64, 128), randn(1001, 128).t()
+        a[3, 5] = float("inf")
+        fn = lambda a, b: a @ F.pad(b, (0, 7))  # noqa: E731
+        sources = self.compile(fn, a, b, backend="cute")
         self.assertEqual([bool(DOT_RE.search(s)) for s in sources], [False, True])
-        self.assertIn("tmp1 = in1[tile_r, tile_x]", sources[1])
-        self.assertNotIn("hl.load(", sources[1])
+
+        def strided(a, b):
+            return (a @ F.pad(b, (0, 7)))[:, :1001].as_strided((64, 1008), (1008, 1))
+
+        # An as_strided that reads past the slice (_read_past()) reads eager's pad
+        # values; no kernel copies b.
+        sources = self.compile(strided, a, b, backend="cute")
+        (dot,) = [s for s in sources if DOT_RE.search(s)]
+        self.assertIn("for tile_y, tile_x in hl.tile([64, 1001]):", dot)
+        self.assertTrue(any("torch.abs(" in s and "torch.sum(" in s for s in sources))
+        self.assertNotIn("empty_strided_cuda((128, 1008)", self.code)
+
+    @needs_native_matmul
+    @config.patch(shape_padding=False)
+    def test_unaligned_k_major_operands(self):
+        # K-major rows TMA cannot load: on an SM100-family GPU, kernels copy each
+        # operand into aligned rows ahead of the product
+        # (HelionChoices.stage_matmul_operand()).
+        a, b = randn(64, 4097), randn(128, 4097).t()
+        sources = self.compile(torch.mm, a, b, tol=1e-2, backend="cute")
+        if DeviceProperties.create(torch.device(DEVICE)).major != 10:
+            self.assertEqual(len(sources), 1)
+            return
+        *copies, dot = sources
+        self.assertEqual(len(copies), 2)
+        for copy in copies:
+            self.assertNotRegex(copy, DOT_RE)
+        self.assertIn("for tile_y, tile_x in hl.tile([64, 128]):", dot)
+        self.assertIn("tmp0 = in0[tile_y, tile_r]", dot)
+        self.assertIn("tmp1 = in1[tile_r, tile_x]", dot)
+        self.assertIn(
+            "empty_strided_cuda((64, 4097), (4160, 1), torch.bfloat16)", self.code
+        )
+        self.assertIn(
+            "empty_strided_cuda((4097, 128), (1, 4160), torch.bfloat16)", self.code
+        )
+        # An operand under the staging threshold is read as it is. (A function of its
+        # own: a second shape would make torch.mm's dims dynamic.)
+        sources = self.compile(
+            torch.matmul, randn(32, 4097), b, tol=1e-2, backend="cute"
+        )
+        self.assertEqual(len(sources), 2)
+        self.assertNotIn("empty_strided_cuda((32, 4097), (4160, 1)", self.code)
+        # A view whose rows line up from an odd offset gets a fresh copy at an aligned
+        # base.
+        fn = lambda x, b: x[1:].view(64, 4096) @ b  # noqa: E731
+        x, b = randn(64 * 4096 + 1), randn(128, 4096).t()
+        copy, dot = self.compile(fn, x, b, tol=1e-2, backend="cute")
+        self.assertNotRegex(copy, DOT_RE)
+        self.assertIn("tmp0 = in0[tile_y, tile_r]", dot)
+        self.assertIn(
+            "empty_strided_cuda((64, 4096), (4096, 1), torch.bfloat16)", self.code
+        )
 
     @needs_native_matmul
     def test_pad_prologue(self):
@@ -1853,56 +2596,6 @@ def kernel(in0: torch.Tensor, out0: torch.Tensor, out1: torch.Tensor) -> None:
             torch._dynamo.reset()
             self.compile(lambda x: x.sum(0), x, tol=1e-3)
         self.assertNotIn("helion_in_sequence", self.code)
-
-    @pytest.mark.slow
-    @skipIfRefEager("reference mode sequences nothing: it searches no config")
-    def test_kernels_searched_in_sequence_cache_under_their_prelude(self):
-        # Quick searches of the split sum over y's two kernels: the
-        # benchmark jobs of the second carry the first kernel's call as their
-        # prelude, and the generated module, loaded again, finds both winners
-        # in the autotune cache (the second under its prelude's key) and
-        # searches nothing.
-        jobs = []
-        run_job = LocalBenchmarkProvider._run_subprocess_benchmark_job
-
-        def recorded(provider, *args, **kwargs):
-            jobs.append(provider._prelude_path is not None)
-            return run_job(provider, *args, **kwargs)
-
-        environ = {
-            name: value
-            for name, value in os.environ.items()
-            # a regime without a flush per call refuses a prelude
-            if name
-            not in (
-                "HELION_AUTOTUNE_L2_FLUSH",
-                "HELION_AUTOTUNE_FINAL_L2_FLUSH",
-                "HELION_AUTOTUNE_TARGET_REGIME",
-            )
-        }
-        environ["HELION_CACHE_DIR"] = self.enterContext(tempfile.TemporaryDirectory())
-        self.enterContext(patch.dict(os.environ, environ, clear=True))
-        self.enterContext(
-            patch.object(
-                LocalBenchmarkProvider, "_run_subprocess_benchmark_job", recorded
-            )
-        )
-        # As in test_kernels_tuned_in_sequence: the sequence on Triton.
-        self.enterContext(
-            patch.object(kernel_sequence, "times_short_kernels", lambda bound: True)
-        )
-        self.enterContext(config.patch({"triton.mix_order_reduction": True}))
-        self.enterContext(helion_config.patch(autotune_effort="quick"))
-        x = torch.randn(100000, 96, device=DEVICE)
-        self.assertEqual(len(self.compile(lambda x: x.sum(0), x, tol=1e-3)), 2)
-        self.assertIn(False, jobs)
-        self.assertIn(True, jobs)
-        jobs.clear()
-        torch._dynamo.reset()
-        PyCodeCache.cache_clear()
-        with fresh_cache():
-            self.compile(lambda x: x.sum(0), x, tol=1e-3)
-        self.assertEqual(jobs, [])
 
     def test_split_reduction_chunks(self):
         # Inductor cuts x.sum(0), an rdim of 100000, into chunks by a

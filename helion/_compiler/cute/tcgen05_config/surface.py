@@ -52,6 +52,7 @@ from ..pipeline_smem import TCGEN05_CTA_GROUP_CHOICES
 from ..pipeline_smem import TCGEN05_CTA_GROUP_CONFIG_KEY
 from ..pipeline_smem import TCGEN05_SMEM_AWARE_MAX_AB_STAGES
 from ..pipeline_smem import max_pipeline_ab_stages
+from ..pipeline_smem import paired_pipeline_max_ab_stages
 from ..split_k_workspace_config import workspace_search_fields
 from ..strategies import ROLE_LOCAL_MONOLITHIC_DEFAULT_WARP_SPEC
 from ..strategies import TCGEN05_BATCH_RASTER_CHOICES
@@ -111,6 +112,7 @@ from ..tcgen05_constants import TCGEN05_EPI_SUBTILE_N_CHOICES
 from ..tcgen05_constants import TCGEN05_EPI_SUBTILE_N_CONFIG_KEY
 from ..tcgen05_constants import TCGEN05_EPI_WARP_GROUP_CHOICES
 from ..tcgen05_constants import TCGEN05_EPI_WARP_GROUPS_CONFIG_KEY
+from ..tcgen05_constants import TCGEN05_FALLBACK_CLUSTER_CONFIG_KEY
 from ..tcgen05_constants import TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY
 from ..tcgen05_constants import TCGEN05_GROUPED_AB_TILE_K_CONFIG_KEY
 from ..tcgen05_constants import TCGEN05_GROUPED_BALANCED_WORKERS_CONFIG_KEY
@@ -142,6 +144,8 @@ from ..tcgen05_constants import TCGEN05_REGION_PID_TYPE_CHOICES
 from ..tcgen05_constants import TCGEN05_REGION_PID_TYPE_INHERIT
 from ..tcgen05_constants import TCGEN05_REGION_PID_TYPES_CONFIG_KEY
 from ..tcgen05_constants import TCGEN05_SPLIT_K_CONFIG_KEY
+from ..tcgen05_constants import TCGEN05_SPLIT_K_EXCHANGE_CHOICES
+from ..tcgen05_constants import TCGEN05_SPLIT_K_EXCHANGE_CONFIG_KEY
 from ..tcgen05_constants import TCGEN05_SPLIT_K_SEARCH_CHOICES
 from ..tcgen05_constants import TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY
 from ..tcgen05_constants import TCGEN05_TWO_CTA_MAX_K_TILES
@@ -325,9 +329,10 @@ def paired_pipeline_search_enabled(state: CuteTcgen05Config) -> bool:
         )
     m, n, k = cast("tuple[int, int, int]", extents)
     return (
-        m % 128 == 0
-        and n % 64 == 0
-        and k % 64 == 0
+        # a batch of matrices over an M edge, an N edge or a K tail, which the
+        # batched pair's TMA loads zero-fill and its 3-D TMA store clips
+        # (``search_plan.batched_pair128_matrix``)
+        (state.batched_pair128_matrix or (m % 128 == 0 and n % 64 == 0 and k % 64 == 0))
         and _tile_in_fragments(fragments, (128, 64, 64))
     )
 
@@ -436,10 +441,13 @@ def allow_cluster_m2_search(
     allow_fp8_small_grid: bool = False,
     allow_one_wave_tiles: bool = False,
     one_wave_only: bool = False,
+    edge_pair128_only: bool = False,
+    whole_k: bool = False,
 ) -> None:
     assert static_k > 0, "static_k is required for cluster_m=2 K-cap checks"
     assert max_k_tiles > 0, "cluster_m=2 max K tiles must be positive"
     assert allow_one_wave_tiles or not one_wave_only
+    assert allow_edge_k_tail_family or not edge_pair128_only
     state.cluster_m2_search_constraints = Tcgen05ClusterM2SearchConstraints(
         static_k=static_k,
         max_k_tiles=max_k_tiles,
@@ -447,6 +455,8 @@ def allow_cluster_m2_search(
         allow_fp8_small_grid=allow_fp8_small_grid,
         allow_one_wave_tiles=allow_one_wave_tiles,
         one_wave_only=one_wave_only,
+        edge_pair128_only=edge_pair128_only,
+        whole_k=whole_k,
     )
     restrict_cluster_m_search(state, (1, 2))
 
@@ -511,6 +521,48 @@ def _pdl_searched(state: CuteTcgen05Config) -> bool:
 
 
 def split_k_search_choices(state: CuteTcgen05Config) -> tuple[int, ...]:
+    """The ``tcgen05_split_k`` values the search, the seeds and the defaults
+    offer: ``split_k_admissible_choices``, or none under
+    ``split_k_reduction="none"`` (torch's reduced-precision split-K flag off,
+    through helion.inductor), where every K loop runs unsplit."""
+    if state.split_k_reduction == "none":
+        return ()
+    return split_k_admissible_choices(state)
+
+
+def split_k_exchange_admitted(state: CuteTcgen05Config) -> bool:
+    """Whether a K-split cluster (``tcgen05_cluster_split_k``) may exchange
+    its partials rounded to the output dtype
+    (``tcgen05_split_k_exchange="output"``): ``split_k_reduction="output"``
+    (torch's default reduced-precision flags, through helion.inductor) and a
+    16-bit output."""
+    facts = state.pipeline_smem_facts
+    return (
+        state.split_k_reduction == "output"
+        and facts is not None
+        and facts.output_dtype_bytes == 2
+    )
+
+
+def split_k_exchange_search_enabled(state: CuteTcgen05Config) -> bool:
+    """``tcgen05_split_k_exchange`` on the search surface: admitted, and the
+    cluster's two-way split searched."""
+    return split_k_exchange_admitted(state) and 2 in split_k_search_choices(state)
+
+
+def fallback_cluster_search_enabled(state: CuteTcgen05Config) -> bool:
+    """``tcgen05_fallback_cluster`` on the search surface (beside a
+    searched ``tcgen05_cluster_n=2``): a plain unbatched GEMM whose epilogue
+    loads no auxiliary tensor; ``repair._normalize_fallback_cluster`` keeps
+    it on the 4-CTA pair cluster of the persistent pipelines only."""
+    return (
+        not state.matmul_has_leading_passthrough
+        and state.grouped_worklist_smem_facts is None
+        and not state.aux_kernel_detected
+    )
+
+
+def split_k_admissible_choices(state: CuteTcgen05Config) -> tuple[int, ...]:
     """The ``tcgen05_split_k`` values the plain GEMM can take: splits no
     deeper than the K loop of the smallest K tile the search admits,
     for an unbatched static-shape GEMM (the pipeline reads the operands
@@ -1019,10 +1071,13 @@ def narrow_autotune_to_validated_configs(
     allow_persistent_pid_types: bool = False,
     enable_cluster_m2_search: bool = False,
     cluster_m2_static_k: int | None = None,
+    cluster_m2_max_k_tiles: int = TCGEN05_TWO_CTA_MAX_K_TILES,
     allow_cluster_m2_edge_k_tail_family: bool = False,
     allow_cluster_m2_fp8_small_grid: bool = False,
     allow_cluster_m2_one_wave_tiles: bool = False,
     cluster_m2_one_wave_only: bool = False,
+    cluster_m2_edge_pair128_only: bool = False,
+    cluster_m2_whole_k: bool = False,
     ab_stages_three_dtype_bytes: int | None = None,
     ab_stages_three_device: torch.device | None = None,
     ab_stages_three_output_dtype_bytes: int | None = None,
@@ -1072,10 +1127,13 @@ def narrow_autotune_to_validated_configs(
         allow_cluster_m2_search(
             state,
             static_k=cluster_m2_static_k_int,
+            max_k_tiles=cluster_m2_max_k_tiles,
             allow_edge_k_tail_family=allow_cluster_m2_edge_k_tail_family,
             allow_fp8_small_grid=allow_cluster_m2_fp8_small_grid,
             allow_one_wave_tiles=allow_cluster_m2_one_wave_tiles,
             one_wave_only=cluster_m2_one_wave_only,
+            edge_pair128_only=cluster_m2_edge_pair128_only,
+            whole_k=cluster_m2_whole_k,
         )
     else:
         restrict_cluster_m_search(state, (1,))
@@ -1209,12 +1267,20 @@ def optional_fragments(
         ab_stages_max = smem._get_dtype_ab_stages_hard_cap(constraints.dtype_bytes)
     else:
         ab_stages_max = 2
-    # Physical N widths with a proved aligned-N seed (computed once).
+    # Physical N widths the search samples (the seeded ones and the
+    # search's own; computed once).
     aligned_widths = facts._dense_aligned_n_widths(state)
     if state.pipeline_smem_facts is not None and (not for_search or paired_search):
-        ab_stages_max = max(ab_stages_max, TCGEN05_SMEM_AWARE_MAX_AB_STAGES)
+        ab_stages_max = max(
+            ab_stages_max, paired_pipeline_max_ab_stages(state.pipeline_smem_facts)
+        )
     if aligned_widths:
-        ab_stages_max = max(ab_stages_max, TCGEN05_SMEM_AWARE_MAX_AB_STAGES)
+        ab_stages_max = max(
+            ab_stages_max,
+            TCGEN05_SMEM_AWARE_MAX_AB_STAGES
+            if state.pipeline_smem_facts is None
+            else paired_pipeline_max_ab_stages(state.pipeline_smem_facts),
+        )
     if state.one_cta_pipeline_facts is not None and (
         not for_search or facts._preferred_persistent_pid_type(state) is not None
     ):
@@ -1235,12 +1301,12 @@ def optional_fragments(
             TCGEN05_CTA_GROUP_CHOICES
             if not for_search
             or (paired_search and two_cta_regions)
-            # The ragged edge family's whole 128-row pairs run the 2-CTA
-            # MMA only when asked for explicitly (``auto`` keeps bf16
+            # The 128-row pairs of the edge and one-wave families run the
+            # 2-CTA MMA only when asked for explicitly (``auto`` keeps bf16
             # bm=128 + cluster_m=2 on the CtaGroup.ONE bridge, which the
             # edge epilogues refuse); let the search ask
-            # (``plain_edge_pair128_admitted``).
-            or (two_cta_regions and repair.plain_edge_pair128_admitted(state))
+            # (``plain_pair128_admitted``).
+            or (two_cta_regions and repair.plain_pair128_admitted(state))
             else ("auto",)
         ),
         "tcgen05_cluster_m": EnumFragment(cluster_m_choices),
@@ -1266,6 +1332,13 @@ def optional_fragments(
         # surface (explicit configs may still set it).
         fragments[TCGEN05_SPLIT_K_CONFIG_KEY] = EnumFragment(
             TCGEN05_SPLIT_K_SEARCH_CHOICES
+        )
+    if not for_search or split_k_exchange_search_enabled(state):
+        # The K-split cluster's partials in fp32 or rounded to the 16-bit
+        # output (``_normalize_split_k_exchange`` keeps "output" on a
+        # cluster split under ``split_k_reduction="output"`` only).
+        fragments[TCGEN05_SPLIT_K_EXCHANGE_CONFIG_KEY] = EnumFragment(
+            TCGEN05_SPLIT_K_EXCHANGE_CHOICES
         )
     if not for_search or state.grouped_ab_k_fusion_supported:
         fragments[TCGEN05_GROUPED_AB_TILE_K_CONFIG_KEY] = EnumFragment((None, 128))
@@ -1305,6 +1378,13 @@ def optional_fragments(
         fragments[TCGEN05_PERSISTENT_GRID_CAP_CONFIG_KEY] = EnumFragment(
             TCGEN05_PERSISTENT_GRID_CAP_CHOICES
         )
+    if not for_search or (
+        2 in cluster_n_choices and fallback_cluster_search_enabled(state)
+    ):
+        # The 4-CTA pair cluster launched with its pair as the fallback,
+        # filling the SMs its clusters leave over (see
+        # ``TCGEN05_FALLBACK_CLUSTER_CONFIG_KEY``).
+        fragments[TCGEN05_FALLBACK_CLUSTER_CONFIG_KEY] = BooleanFragment()
     if not for_search or state.grouped_full_coverage_eligible:
         fragments[TCGEN05_GROUPED_FULL_COVERAGE_CONFIG_KEY] = EnumFragment(
             TCGEN05_GROUPED_FULL_COVERAGE_MODES
@@ -1811,6 +1891,26 @@ def persistence_model_autotune_fragments(
     return {TCGEN05_PERSISTENCE_MODEL_CONFIG_KEY: EnumFragment(choices)}
 
 
+def shared_ring_producer_search_enabled(state: CuteTcgen05Config) -> bool:
+    """Whether the search samples two A/B-load warps
+    (``tcgen05_warp_spec_ab_load_warps``; ``cute_mma._build_shared_ring_producer``).
+
+    A plain GEMM over static extents whose operands TMA loads: the second
+    warp halves the serial issue chain per AB stage, which paces the K loop
+    where a stage carries little data (bf16 1000x512x2880, 128x64 CTA pair:
+    0.855 -> 0.999 of cuBLAS) and costs a warp where the data rate already
+    paces it (1500x384x1536 at 128-wide K steps: 0.953 -> 0.950), so the
+    search decides. Aux epilogues keep their own producer-warp families.
+    """
+    return (
+        state.search_enabled
+        and not state.aux_kernel_detected
+        and state.matmul_operands_tma_provable
+        and state.matmul_compile_time_static_extents is not None
+        and not state.materialized_matmul_block_ids
+    )
+
+
 def strategy_autotune_fragments(
     state: CuteTcgen05Config,
 ) -> dict[str, ConfigSpecFragment]:
@@ -1882,7 +1982,9 @@ def strategy_autotune_fragments(
             else None,
         ),
         TCGEN05_WARP_SPEC_MMA_WARPS_KEY: EnumFragment((1,)),
-        TCGEN05_WARP_SPEC_AB_LOAD_WARPS_KEY: EnumFragment((1,)),
+        TCGEN05_WARP_SPEC_AB_LOAD_WARPS_KEY: EnumFragment(
+            (1, 2) if shared_ring_producer_search_enabled(state) else (1,)
+        ),
         TCGEN05_WARP_SPEC_EPI_LOAD_WARPS_KEY: EnumFragment((0,)),
         TCGEN05_WARP_SPEC_SCHEDULER_WARPS_KEY: _enum_fragment_with_seed_values(
             scheduler_warps_choices,
@@ -1925,6 +2027,7 @@ def strategy_validation_fragments(
         )
     )
     fragments[TCGEN05_WARP_SPEC_SCHEDULER_WARPS_KEY] = EnumFragment((0, 1))
+    fragments[TCGEN05_WARP_SPEC_AB_LOAD_WARPS_KEY] = EnumFragment((1, 2))
     fragments[TCGEN05_WARP_SPEC_C_INPUT_WARPS_KEY] = EnumFragment((0, 1))
     # Cycle 91 (Workstream A Stage 3): the user-config validation surface
     # accepts ``{0, 1}`` so an explicit ``store_warps=1`` round-trips; the
@@ -1978,10 +2081,7 @@ def flat_fields(
     ):
         fields["loop_orders"] = state.config_spec.loop_orders
     fields.update(optional_fragments(state, for_search=True))
-    if state.config_spec.cute_split_k_workspace_available:
-        fields.update(
-            workspace_search_fields(state.config_spec.cute_split_k_partition_choices)
-        )
+    fields.update(workspace_search_fields(state.config_spec))
     seeds = state.config_spec.compiler_seed_configs
     if isinstance(fragment := fields.get("tcgen05_ab_stages"), IntegerFragment):
         fields["tcgen05_ab_stages"] = _integer_fragment_with_seed_values(

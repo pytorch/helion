@@ -666,6 +666,7 @@ class TestTensorDescriptor(RefEagerTestBase, TestCase):
 
     @skipIfRefEager("Test checks generated code and bound kernel specialization")
     @skipUnlessTensorDescriptor("Tensor descriptor support is required")
+    @skipIfTileIR("TileIR loads a view past its input's base through pointers")
     def test_tensor_descriptor_on_view_past_input_base(self):
         """A view starting a multiple of 16 bytes past its input shares the
         input's alignment guard and loads through a tensor descriptor; a view

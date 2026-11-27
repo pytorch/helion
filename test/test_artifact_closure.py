@@ -182,6 +182,8 @@ def test_standalone_host_helpers_execute_canonical_implementations() -> None:
         + dependency_free_runtime_source(TritonBackend().dependency_free_launcher_info)
         + "\ndef block_size(k, split_k):\n"
         "    return helion.next_power_of_2(helion.cdiv(k, split_k))\n"
+        "\ndef grid_size(begin, end, step):\n"
+        "    return helion.runtime._grid_range_length(begin, end, step)\n"
     )
     namespace = {}
     exec(close_artifact_source(source), namespace)
@@ -189,6 +191,7 @@ def test_standalone_host_helpers_execute_canonical_implementations() -> None:
     assert isinstance(embedded, types.SimpleNamespace)
     assert "cdiv" not in namespace  # Helpers cannot collide with kernel names.
     assert "next_power_of_2" not in namespace
+    assert namespace["grid_size"](1, 12, 3) == len(range(1, 12, 3))
     for k in (-1, 0, 1, 3, 16, 64, 65):
         for split_k in (1, 2, 8):
             assert embedded.cdiv(k, split_k) == cdiv(k, split_k)
@@ -208,8 +211,9 @@ def test_aot_variants_share_runtime_and_host_helpers() -> None:
         path = generate_standalone_file(
             "kernel",
             [source, source],
-            "def key_kernel(*args):\n    return 0\n",
+            "",
             Path(directory),
+            dispatch_keys=[_standalone_call_key((n,)) for n in (65, 130)],
         )
         closed = close_artifact_source(path.read_text())
     assert closed.count("def _make_helion_runtime(") == 1
@@ -219,6 +223,7 @@ def test_aot_variants_share_runtime_and_host_helpers() -> None:
     assert namespace["_kernel_c0"](65) == 32
     assert namespace["_kernel_c1"](65) == 32
     assert namespace["kernel"](65) == 32
+    assert namespace["kernel"](130) == 64
 
 
 def test_static_dispatch_preserves_literals_when_renaming_symbols() -> None:

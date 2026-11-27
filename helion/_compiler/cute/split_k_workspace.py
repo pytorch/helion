@@ -14,6 +14,7 @@ so ``cute_split_k_partitions`` names the partition count of the schedule.
 from __future__ import annotations
 
 import ast
+import dataclasses
 from dataclasses import dataclass
 import math
 import operator
@@ -39,9 +40,13 @@ from ..indexing_strategy import subscript_tile_info
 from ..type_info import CallableType
 from .analysis.match_common import node_tensor
 from .atomic_output_promotions import fresh_half_atomic_outputs
+from .memory_ops import _bound_vec_alignment_signature
 from .pipeline_smem import Tcgen05PipelineSmemFacts
 from .pipeline_smem import max_pipeline_ab_stages
 from .split_k_workspace_config import ATOMIC_EPILOGUE_KEY
+from .split_k_workspace_config import PARTIALS_ACCUMULATOR
+from .split_k_workspace_config import PARTIALS_KEY
+from .split_k_workspace_config import PARTIALS_OUTPUT
 from .split_k_workspace_config import PARTITION_CHOICES
 from .split_k_workspace_config import PARTITIONS_KEY
 from .split_k_workspace_config import STAGES_KEY
@@ -52,6 +57,8 @@ from .state import cute_env_state
 if TYPE_CHECKING:
     from torch.fx import Node
 
+    from ...autotuner.block_id_sequence import BlockIdSequence
+    from ...autotuner.config_spec import BlockSizeSpec
     from ...runtime.config import Config
     from ..compile_environment import CompileEnvironment
     from ..device_ir import DeviceIR
@@ -115,6 +122,10 @@ class SplitKWorkspaceProof:
     # The plain GEMM store pattern: the reducer writes the whole output (the
     # host keeps its ``torch.empty`` allocation) and no atomic is replaced.
     store: bool = False
+    # The plain store's output is a kernel argument (``out0`` of a
+    # helion.inductor kernel) instead of a fresh allocation: the host has no
+    # allocation to keep and its returns stay as written.
+    argument_output: bool = False
 
     def chunk_size(self, config: Config) -> int:
         return (
@@ -138,6 +149,15 @@ class SplitKWorkspaceSchedule:
     # adds (no fp32 partials, no reducer launch); see
     # ``atomic_epilogue_admissible``.
     atomic_epilogue: bool = False
+    # The partitions do not tile K exactly (``partitions * chunk > k``): the
+    # producer reads the operands as they are and offsets each partition's K
+    # coordinates by ``partition * chunk``, so the TMA loads zero-fill the
+    # last partition past K (``plain_store_chunk``).
+    k_offset: bool = False
+    # The dtype the producer stores the partials in and the reducer loads:
+    # fp32, or the 16-bit output dtype (``cute_split_k_partials="output"``,
+    # ``partials_admissible``).
+    partial_dtype: torch.dtype = torch.float32
 
 
 def _is_call(node: object, target: object) -> bool:
@@ -743,6 +763,80 @@ def _fresh_store_output(host: HostFunction, name: str) -> bool:
         and not any(kw.arg in (None, "out") for kw in allocation.keywords)
     ):
         return False
+    return _only_stored_by_device_loop(host, name)
+
+
+def _argument_store_output(host: HostFunction, name: str) -> bool:
+    """``name`` is a parameter of the kernel that the body never rebinds, only
+    ever stored to by the device loop, read for metadata, or returned: the
+    ``out0`` a helion.inductor kernel writes,
+
+        def kernel(in0, in1, out0):
+            for tile_y, tile_x in hl.tile([768, 768]):
+                acc = hl.zeros([tile_y, tile_x], dtype=torch.float32)
+                for tile_r in hl.tile(8192):
+                    acc = torch.addmm(acc, in0[tile_y, tile_r], in1[tile_r, tile_x])
+                out0[tile_y, tile_x] = acc.to(torch.bfloat16)
+
+    The device loop overwrites every element of the argument, as the
+    schedule's reducer does after the producer has read every input, so the
+    caller sees the same tensor either way."""
+    arguments = host.args
+    if name not in {
+        argument.arg
+        for argument in (
+            *arguments.posonlyargs,
+            *arguments.args,
+            *arguments.kwonlyargs,
+        )
+    }:
+        return False
+    module = ast.Module(body=host.body, type_ignores=[])
+    if any(
+        isinstance(node, ast.Name)
+        and node.id == name
+        and not isinstance(node.ctx, ast.Load)
+        for node in ast.walk(module)
+    ):
+        return False
+    return _only_stored_by_device_loop(host, name)
+
+
+def vector_store_alignment(
+    env: CompileEnvironment, output: torch.Tensor
+) -> bool | None:
+    """Whether an argument output's bound base is aligned to the four elements
+    the reducer stores at a time (``_reducer_source``: a 64-bit store of four
+    bf16 values, 128-bit for fp32); None before the binding records the
+    output's alignment (heuristics register ahead of it, so the proof admits
+    the output there and declines it when code generation proves the schedule
+    again with the bound facts).
+
+    A fresh allocation is always aligned; a caller's tensor need not be:
+    ``torch.empty(256 * 256 + 1, dtype=torch.bfloat16)[1:].view(256, 256)`` is
+    row-major with its base 2 bytes past an 8-byte boundary, and the reducer's
+
+        cute.copy(store_atom, converted, cute.make_tensor(out.iterator + output_begin, ...))
+
+    does not compile for it (GB300, a 256 x 8192 x 256 product into that
+    out0, without this check; the launcher types ``out`` with its actual
+    alignment):
+
+        'cute.copy' op D ptr alignment (16 bits) does not meet requirement
+        (64 bits) of atom '!cute_nvgpu.atom.universal_copy<bf16, 64 b>'
+
+    so the schedule declines it."""
+    signature = _bound_vec_alignment_signature(env, env.tensor_input_source(output))
+    if signature is None:
+        return None
+    width = 4 * output.element_size()
+    return signature[0] % width == 0 and env.input_residues_hold_modulo(width)
+
+
+def _only_stored_by_device_loop(host: HostFunction, name: str) -> bool:
+    """Every read of ``name`` in the host body is the device loop's
+    ``name[tile_m, tile_n] = ...``, a metadata attribute or a return."""
+    module = ast.Module(body=host.body, type_ignores=[])
     parents = {
         id(child): parent
         for parent in ast.walk(module)
@@ -786,10 +880,16 @@ def analyze_split_k_store_reduction(
 ) -> SplitKWorkspaceProof | None:
     """The plain GEMM store: ``acc = zeros; for k: acc = addmm(acc, a, b);
     out[tile_m, tile_n] = (acc [+ bias[tile_n]]) [.to(out.dtype)]`` over the
-    whole K extent, ``out`` a fresh private allocation returned as is."""
+    whole K extent, ``out`` a fresh private allocation returned as is, or a
+    kernel argument that only the device loop writes
+    (``_argument_store_output``). None under ``split_k_reduction="none"``:
+    the schedule splits a K loop the kernel runs whole, where a kernel's own
+    atomic split (``analyze_split_k_reduction``) only changes how its
+    partials meet."""
     host = ir.host_function
     if (
         env.backend_name != "cute"
+        or env.settings.split_k_reduction == "none"
         or host is None
         or env._is_distributed
         or cute_env_state(env).fission_plan is not None
@@ -854,9 +954,13 @@ def analyze_split_k_store_reduction(
         or output.dtype not in (torch.float16, torch.bfloat16, torch.float32)
         or not isinstance(output_name, str)
         or not output_name.isidentifier()
-        or not _fresh_store_output(host, output_name)
         or set(output_node.users) != {store}
     ):
+        return None
+    argument_output = _argument_store_output(host, output_name)
+    if not argument_output and not _fresh_store_output(host, output_name):
+        return None
+    if argument_output and vector_store_alignment(env, output) is False:
         return None
     m_axis, n_axis = (_exact_axis(env, index) for index in store.args[1])
     if (
@@ -887,9 +991,11 @@ def analyze_split_k_store_reduction(
         _strides(env, b),
         _strides(env, output),
     )
-    # Row-major operands only: the partition producer's batched views of A
-    # and B are proved for K-major A and N-major B (an M-major A or K-major B
-    # fails its proof at codegen); the leading stride is 16-byte aligned.
+    # Each operand is K-major or MN-major, its leading stride 16-byte
+    # aligned: the producer's batched views keep the operand's strides (an
+    # M-major A [m, k] with strides (1, m) is viewed as [P, m, chunk] with
+    # strides (chunk * m, 1, m)), and the tcgen05 GEMM takes either major
+    # (``OperandMajorMode.MN`` for an M-major A or an N-major B).
     if (
         a.ndim != 2
         or b.ndim != 2
@@ -902,10 +1008,14 @@ def analyze_split_k_store_reduction(
         or out_shape is None
         or a_strides is None
         or b_strides is None
-        or a_strides[1] != 1
-        or b_strides[1] != 1
-        or a_strides[0] < a_shape[1]
-        or b_strides[0] < b_shape[1]
+        or not (
+            (a_strides[1] == 1 and a_strides[0] >= a_shape[1])
+            or (a_strides[0] == 1 and a_strides[1] >= a_shape[0])
+        )
+        or not (
+            (b_strides[1] == 1 and b_strides[0] >= b_shape[1])
+            or (b_strides[0] == 1 and b_strides[1] >= b_shape[0])
+        )
         or any(
             stride != 1 and stride * a.element_size() % 16
             for stride in (*a_strides, *b_strides)
@@ -914,10 +1024,13 @@ def analyze_split_k_store_reduction(
         return None
     m, k = a_shape
     k2, n = b_shape
+    # A column-major output is the row-major output of the swapped product
+    # (``_swap_output_major``).
+    output_column_major = out_strides == (1, m) and out_strides != (n, 1)
     if (
         k != k2
         or out_shape != (m, n)
-        or out_strides != (n, 1)
+        or (out_strides != (n, 1) and not output_column_major)
         or env.specialize_expr(env.block_sizes[m_axis].numel) != m
         or env.specialize_expr(env.block_sizes[n_axis].numel) != n
         or env.specialize_expr(env.block_sizes[k_axis].numel) != k
@@ -1044,13 +1157,22 @@ def analyze_split_k_store_reduction(
     ):
         return None
     returns = [stmt for stmt in host.body if isinstance(stmt, ast.Return)]
-    if (
+    if argument_output:
+        # ``return``, ``return None`` or the argument itself.
+        if any(
+            stmt.value is not None
+            and not (isinstance(stmt.value, ast.Constant) and stmt.value.value is None)
+            and ast.unparse(stmt.value) != output_name
+            for stmt in returns
+        ):
+            return None
+    elif (
         len(returns) != 1
         or returns[0].value is None
         or ast.unparse(returns[0].value) != output_name
     ):
         return None
-    return SplitKWorkspaceProof(
+    proof = SplitKWorkspaceProof(
         root.graph_id,
         a,
         b,
@@ -1073,6 +1195,65 @@ def analyze_split_k_store_reduction(
             "cdiv", (k, ConfigValueExpression("config", (PARTITIONS_KEY,)))
         ),
         store=True,
+        argument_output=argument_output,
+    )
+    return _swap_output_major(proof) if output_column_major else proof
+
+
+def _swap_output_major(proof: SplitKWorkspaceProof) -> SplitKWorkspaceProof:
+    """The proof of a plain store into a column-major ``[m, n]`` output, as
+    the swapped product ``out.T = b.T @ a.T`` into the row-major ``[n, m]``
+    view of the same memory, whose partials the reducer sums in that memory's
+    order. helion.inductor's transposed product (``lowering/mm.py``) is such
+    a kernel: bf16 256 x 512 x 197952 with b stored [K, N] runs
+
+        def kernel(in0, in1, out0):  # in0 = b.T, in1 = a.T, out0 = out.T
+            for tile_x, tile_y in hl.tile([512, 256]):
+                acc = hl.zeros([tile_x, tile_y], dtype=torch.float32)
+                for tile_r in hl.tile(197952):
+                    acc = torch.addmm(acc, in0[tile_x, tile_r], in1[tile_r, tile_y])
+                out0[tile_x, tile_y] = acc.to(torch.bfloat16)
+
+    with out0 of strides (1, 512). The schedule's producer then multiplies
+    the partitions of in1.T = a by in0.T = b into row-major partials of the
+    [256, 512] product, which the reducer adds element by element into
+    out0's storage (out0[i, j] at i + 512 * j is the partials' element
+    [j, i]); 32 partitions of 256x256 tiles (k-offset partitions, the last
+    one running past K into the loads' zero fill) render
+
+        _helion_split_k_partials = torch.empty((32, 256, 512), dtype=torch.float32, ...)
+        _helion_split_k_a = in1.as_strided((1, 256, 197952), (6208, 197952, 1))
+        _helion_split_k_b = in0.as_strided((1, 197952, 512), (3178496, 512, 1))
+        _helion_split_k_native._native_partition_gemm(
+            _helion_split_k_a, _helion_split_k_b, _helion_split_k_partials, ...)
+        _launcher(_helion_split_k_reduce._reduce_partitions, (128,),
+                  _helion_split_k_partials, out0, ...)
+
+    Kept as written, the producer would store [P, 512, 256] row-major
+    partials whose element order is not out0's, and the reducer's flat
+    vector loop (``_reducer_source``) would write them transposed. The
+    swapped proof reads its tile from the kernel's block sizes through the
+    swapped block ids (the producer's rows are the kernel's columns), and a
+    bias indexed by the output's row or column indexes the swapped
+    product's column or row."""
+    bias = proof.bias
+    return dataclasses.replace(
+        proof,
+        lhs=proof.rhs,
+        rhs=proof.lhs,
+        lhs_expression=proof.rhs_expression,
+        rhs_expression=proof.lhs_expression,
+        bias=None
+        if bias is None
+        else dataclasses.replace(
+            bias, dimensions=tuple(1 - dimension for dimension in bias.dimensions)
+        ),
+        m=proof.n,
+        n=proof.m,
+        lhs_strides=(proof.rhs_strides[1], proof.rhs_strides[0]),
+        rhs_strides=(proof.lhs_strides[1], proof.lhs_strides[0]),
+        m_block_id=proof.n_block_id,
+        n_block_id=proof.m_block_id,
     )
 
 
@@ -1081,28 +1262,56 @@ def analyze_split_k_store_reduction(
 # drain, and 128^3 .. 512^3 GEMMs (whose small grids pass the SM gate)
 # would otherwise take 48 workspace seeds into their initial populations.
 PLAIN_STORE_MIN_PARTITION_K_TILES = 8
+# A grid of 256x256 CTA pairs at least half the SMs wide splits K only
+# where its last wave leaves pairs idle (the waves fill less than this) and
+# every partition stays this many 64-wide K tiles deep, so the partials'
+# traffic and the reducer launch stay small beside the GEMM. GB300 (76 SM
+# pairs), bf16 with b stored [K, N], one CUDA graph over cold inputs, of
+# stock Inductor (cuBLAS), plain kernel (full-effort pick) -> split
+# (256x256 tiles): 16384x768x50272 (192 tiles: 84% of three waves) 0.988 ->
+# 1.048 in three partitions (95% of eight); 4096x2048x50264 (128 tiles:
+# 84%) 0.991 -> 1.003 in four (96%); 4096x1536x128104 (96 tiles: 63%)
+# 0.968 -> 1.068 in three (95%). Over a K of 160 tiles the 160 tiles of
+# bf16 4096x2560x10240 (70% of three waves) keep the plain kernel, whose
+# 256x192 pairs fill 98% of three.
+PLAIN_STORE_SPLIT_WAVE_FILL = 0.9
+PLAIN_STORE_DEEP_PARTITION_K_TILES = 128
+
+
+def wave_fill(units: int, num_sm: int) -> float:
+    """The share of ``ceil(units / pairs)`` waves of ``num_sm // 2`` CTA pairs
+    that ``units`` equal work units keep busy: 96 tiles fill 63% of two waves
+    of 76 pairs, 288 (three partitions of them) 95% of four."""
+    pairs = max(1, num_sm // 2)
+    return units / (-(-units // pairs) * pairs)
 
 
 def plain_store_partition_choices(
     proof: SplitKWorkspaceProof, num_sm: int | None
 ) -> tuple[int, ...]:
     """``cute_split_k_partitions`` values of a plain store proof: 1 (the plain
-    kernel) and every search choice that cuts K into whole 64-wide tiles of
-    at least ``PLAIN_STORE_MIN_PARTITION_K_TILES`` per partition, for GEMMs
-    whose 256x256 CTA pairs leave at least half the SMs idle (a fuller grid
-    only pays the partial traffic, and the schedule's seeds would displace
-    the random half of the initial population). Empty without an SM count
-    (hosts without a device) or without an admissible split."""
+    kernel) and every search choice whose partitions keep at least
+    ``PLAIN_STORE_MIN_PARTITION_K_TILES`` 64-wide K tiles, for GEMMs whose
+    256x256 CTA pairs leave at least half the SMs idle (a fuller grid only
+    pays the partial traffic, and the schedule's seeds would displace the
+    random half of the initial population), and those keeping
+    ``PLAIN_STORE_DEEP_PARTITION_K_TILES`` for a fuller grid whose waves its
+    pairs fill less than ``PLAIN_STORE_SPLIT_WAVE_FILL``. Empty without an SM
+    count (hosts without a device) or without an admissible split."""
     if not proof.store or not num_sm:
         return ()
-    if -(-proof.m // 256) * -(-proof.n // 256) * 2 >= num_sm // 2:
-        return ()
+    tiles = -(-proof.m // 256) * -(-proof.n // 256)
+    min_tiles = PLAIN_STORE_MIN_PARTITION_K_TILES
+    if tiles * 2 >= num_sm // 2:
+        if wave_fill(tiles, num_sm) >= PLAIN_STORE_SPLIT_WAVE_FILL:
+            return ()
+        min_tiles = PLAIN_STORE_DEEP_PARTITION_K_TILES
     splits = tuple(
         split
         for split in PARTITION_CHOICES
         if split > 1
-        and proof.k % (split * 64) == 0
-        and proof.k // (split * 64) >= PLAIN_STORE_MIN_PARTITION_K_TILES
+        and (chunk := plain_store_chunk(proof.k, split, 64)) is not None
+        and chunk // 64 >= min_tiles
     )
     return (1, *splits) if splits else ()
 
@@ -1118,7 +1327,12 @@ def analyze_split_k_workspace(
             proof, env.config_spec.num_sm
         ):
             return None
-    if proof is None or proof.m % 128 or proof.n % 64 or proof.k % 64:
+    if (
+        proof is None
+        or proof.m % 128
+        or proof.n % 64
+        or (proof.k % 64 and not proof.store)
+    ):
         return None
     return proof
 
@@ -1258,6 +1472,56 @@ def atomic_epilogue_geometry(
     )
 
 
+def partials_admissible(proof: SplitKWorkspaceProof, env: CompileEnvironment) -> bool:
+    """Whether a proved plain GEMM store may keep its partials in its 16-bit
+    output dtype (``cute_split_k_partials="output"``): torch lets cuBLAS
+    reduce bf16 / fp16 split-K partials in the output type
+    (``allow_{bf16,fp16}_reduced_precision_reduction``, which helion.inductor
+    passes as ``Settings.split_k_reduction="output"``); the sum of the
+    partials stays fp32 in the reducer. bf16 256 x 512 x 197952 in 16
+    partitions: 8 MiB of fp32 partials, 4 MiB of bf16 ones."""
+    return (
+        proof.store
+        and env.settings.split_k_reduction == "output"
+        and proof.output_dtype in (torch.float16, torch.bfloat16)
+    )
+
+
+def workspace_tile_max_stages(
+    *,
+    m: int,
+    n: int,
+    k: int,
+    chunk: int,
+    tile: tuple[int, int, int],
+    capacity_bytes: int,
+    k_offset: bool = False,
+) -> int | None:
+    """The deepest AB ring the partition producer fits for a ``(bm, bn, bk)``
+    tile of an ``m x n x k`` GEMM cut into ``chunk``-deep partitions, ``None``
+    when the producer does not take the tile: a full batch view cannot
+    include padding or cross a partition boundary; with ``k_offset`` the
+    last partition may run past K (the producer's loads zero-fill it)."""
+    bm, bn, bk = tile
+    if (
+        bm not in (128, 256)
+        or bn not in (64, 128, 256)
+        or bk not in (64, 128, 256)
+        or chunk <= 0
+        or (k % chunk if not k_offset else chunk >= k)
+        or m % bm
+        or n % bn
+        or chunk % bk
+        or -(-k // chunk) * m * n >= 1 << 31
+    ):
+        return None
+    facts = Tcgen05PipelineSmemFacts(2, 4, capacity_bytes)
+    maximum = max_pipeline_ab_stages(
+        facts, bm=bm, bn=bn, bk=bk, c_stages=2, acc_stages=2
+    )
+    return min(maximum, 16) if maximum > 0 else None
+
+
 def workspace_schedule(
     proof: SplitKWorkspaceProof,
     env: CompileEnvironment,
@@ -1265,7 +1529,8 @@ def workspace_schedule(
     *,
     capacity_bytes: int,
 ) -> SplitKWorkspaceSchedule | None:
-    """A full batch view cannot include padding or cross a partition boundary."""
+    """The schedule a config asks for, ``None`` when the producer does not
+    take its tile or ring (``workspace_tile_max_stages``)."""
     atomic_epilogue = config.get(ATOMIC_EPILOGUE_KEY, False)
     if type(atomic_epilogue) is not bool or (
         atomic_epilogue and not atomic_epilogue_admissible(proof)
@@ -1279,29 +1544,123 @@ def workspace_schedule(
     if any(type(block) is not int for block in blocks) or type(chunk) is not int:
         return None
     bm, bn, bk = cast("tuple[int, int, int]", blocks)
+    partitions = proof.k // chunk if chunk > 0 else 0
+    k_offset = False
+    if proof.store:
+        partitions = config.get(PARTITIONS_KEY, 1)
+        if type(partitions) is not int or partitions < 2:
+            return None
+        chunk = plain_store_chunk(proof.k, partitions, bk)
+        if chunk is None:
+            return None
+        k_offset = partitions * chunk != proof.k
     stages = config.get(STAGES_KEY, 2)
-    if (
-        bm not in (128, 256)
-        or bn not in (64, 128, 256)
-        or bk not in (64, 128, 256)
-        or chunk <= 0
-        or proof.k % chunk
-        or proof.m % bm
-        or proof.n % bn
-        or chunk % bk
-        or type(stages) is not int
-        or not 1 <= stages <= 16
-    ):
-        return None
-    partitions = proof.k // chunk
-    if partitions * proof.m * proof.n >= 1 << 31:
-        return None
-    facts = Tcgen05PipelineSmemFacts(2, 4, capacity_bytes)
-    maximum = max_pipeline_ab_stages(
-        facts, bm=bm, bn=bn, bk=bk, c_stages=2, acc_stages=2
+    maximum = workspace_tile_max_stages(
+        m=proof.m,
+        n=proof.n,
+        k=proof.k,
+        chunk=chunk,
+        tile=(bm, bn, bk),
+        capacity_bytes=capacity_bytes,
+        k_offset=k_offset,
     )
-    if stages > maximum:
+    if maximum is None or type(stages) is not int or not 1 <= stages <= maximum:
+        return None
+    partials = config.get(PARTIALS_KEY, PARTIALS_ACCUMULATOR)
+    if partials == PARTIALS_OUTPUT and partials_admissible(proof, env):
+        partial_dtype = proof.output_dtype
+    elif partials == PARTIALS_ACCUMULATOR:
+        partial_dtype = torch.float32
+    else:
         return None
     return SplitKWorkspaceSchedule(
-        partitions, chunk, bm, bn, bk, stages, atomic_epilogue=atomic_epilogue
+        partitions,
+        chunk,
+        bm,
+        bn,
+        bk,
+        stages,
+        atomic_epilogue=atomic_epilogue,
+        k_offset=k_offset,
+        partial_dtype=partial_dtype,
     )
+
+
+def plain_store_chunk(k: int, partitions: int, bk: int) -> int | None:
+    """The K depth of each of ``partitions`` partitions of a plain store's
+    ``k``, in whole ``bk`` tiles: ``k / partitions`` where that is whole
+    tiles (the producer's batch views cut K exactly), else that quotient
+    rounded up to whole tiles, the last partition running past K into the
+    zero fill of the producer's loads. bf16 2048 x 768 x 20008 in three
+    partitions of 64-deep tiles: 6720 + 6720 + 6568 (the last 152 columns
+    of the third partition zero). ``None`` when the rounding leaves the last
+    partition empty."""
+    per_partition = -(-k // partitions)
+    chunk = -(-per_partition // bk) * bk
+    if (partitions - 1) * chunk >= k:
+        return None
+    return chunk
+
+
+@dataclass(frozen=True)
+class WorkspaceGeometry:
+    """What ``workspace_schedule`` reads of a proof, kept on the config spec
+    (``cute_split_k_workspace_geometry``) so the search's repair
+    (``split_k_workspace_config.repair_workspace_geometry``) can tell a
+    sampled or mutated schedule the producer cannot run from one it can."""
+
+    m: int
+    n: int
+    k: int
+    block_ids: tuple[int, int, int]
+    chunk: ConfigValueExpression | int
+    capacity_bytes: int
+    # A plain store proof: its partitions run ``plain_store_chunk`` deep.
+    store: bool = False
+
+    @classmethod
+    def of(cls, proof: SplitKWorkspaceProof, capacity_bytes: int) -> WorkspaceGeometry:
+        return cls(
+            proof.m,
+            proof.n,
+            proof.k,
+            (proof.m_block_id, proof.n_block_id, proof.k_block_id),
+            proof.chunk,
+            capacity_bytes,
+            proof.store,
+        )
+
+    def max_stages(
+        self, block_sizes: BlockIdSequence[BlockSizeSpec], config: dict[str, object]
+    ) -> int | None:
+        """``workspace_tile_max_stages`` of the tile ``config``'s block sizes
+        name (read through the spec's ``block_sizes``) and of its chunk."""
+        values = config.get("block_sizes")
+        if not isinstance(values, list):
+            return None
+        tile = tuple(block_sizes.config_get(values, axis) for axis in self.block_ids)
+        chunk = (
+            self.chunk.evaluate(cast("Config", config))
+            if isinstance(self.chunk, ConfigValueExpression)
+            else self.chunk
+        )
+        if type(chunk) is not int or any(type(block) is not int for block in tile):
+            return None
+        k_offset = False
+        if self.store:
+            partitions = config.get(PARTITIONS_KEY, 1)
+            if type(partitions) is not int or partitions < 2:
+                return None
+            aligned = plain_store_chunk(self.k, partitions, cast("int", tile[2]))
+            if aligned is None:
+                return None
+            chunk, k_offset = aligned, partitions * aligned != self.k
+        return workspace_tile_max_stages(
+            m=self.m,
+            n=self.n,
+            k=self.k,
+            chunk=chunk,
+            tile=cast("tuple[int, int, int]", tile),
+            capacity_bytes=self.capacity_bytes,
+            k_offset=k_offset,
+        )

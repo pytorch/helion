@@ -15,6 +15,7 @@ import torch
 
 import test.test_cute_backend as backend_tests
 
+import helion
 from helion._compiler.compile_environment import FixedBlockSizeSource
 from helion._compiler.cute.autotune.heuristics.cute import (
     CuteTcgen05ClusterM2FfiHeuristic,
@@ -32,6 +33,7 @@ from helion._testing.cute_dense_tcgen05 import scaled_mm
 from helion._testing.cute_dense_tcgen05 import user_bound_mm
 from helion.autotuner.config_generation import ConfigGeneration
 from helion.autotuner.config_spec import BlockSizeSpec
+import helion.language as hl
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -385,11 +387,8 @@ def test_clc_twins_keep_high_anchor_and_default_geometry() -> None:
             _, canonical = generator.canonicalize_flat(generator.flatten(seed))
             assert canonical.block_sizes == seed.block_sizes
             cn = seed.config.get("tcgen05_cluster_n", 1)
-            # Existing full-tile CLC validation keeps only cluster_n=1;
-            # the multicast twin retains its static-persistent projection.
-            assert canonical.config["tcgen05_persistence_model"] == (
-                "clc_persistent" if cn == 1 else "static_persistent"
-            )
+            # The 4-CTA multicast twin keeps its CLC schedule too.
+            assert canonical.config["tcgen05_persistence_model"] == "clc_persistent"
             assert canonical.config.get("tcgen05_cluster_n", 1) == cn
     anchor = next(
         seed
@@ -457,3 +456,108 @@ def test_ffi_keeps_its_independent_single_seed_hook() -> None:
         )
         is None
     )
+
+
+def test_edge_family_cluster_repair_keeps_the_kernels_k_bounds() -> None:
+    # The edge family's cluster_m=2 repair and its 128-row pair projection
+    # move a sampled K tile the family does not run onto its own (128 deep);
+    # a kernel whose K block size is bounded at 32
+    # (hl.register_block_size(32, 32)) keeps the one-CTA tile instead: most
+    # samples became 128-deep 128x128 or 256x256 pairs before. (The
+    # registered K block size is the kernel's first block size.)
+    with cpu_codegen_target(), forbid_cuda_work():
+        a = torch.empty((1000, 1000), dtype=torch.bfloat16)
+        b = torch.empty((1000, 1000), dtype=torch.bfloat16).T
+        bound = user_bound_mm._bind_isolated((a, b, 32))
+        spec = bound.config_spec
+        assert spec._cute_tcgen05_config.cluster_m2_search_constraints is not None
+        gen = ConfigGeneration(spec)
+        samples = [gen.unflatten(gen.random_flat()).config for _ in range(200)]
+        assert all(sample["block_sizes"][0] == 32 for sample in samples)
+        assert all(sample.get("tcgen05_cluster_m", 1) == 1 for sample in samples)
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _residual_bound_mm(
+    a: torch.Tensor, b: torch.Tensor, residual: torch.Tensor
+) -> torch.Tensor:
+    """A residual GEMM (an auxiliary kernel) whose K block size is registered
+    at 32."""
+    m, k = a.shape
+    n = b.shape[1]
+    block_k = hl.register_block_size(32, 32)
+    out = torch.empty((m, n), dtype=torch.bfloat16, device=a.device)
+    for rows, cols in hl.tile([m, n]):
+        acc = hl.zeros((rows, cols), dtype=torch.float32)
+        for inner in hl.tile(k, block_size=block_k):
+            acc = torch.addmm(acc, a[rows, inner], b[inner, cols])
+        out[rows, cols] = (acc + residual[rows, cols].to(torch.float32)).to(
+            torch.bfloat16
+        )
+    return out
+
+
+def test_pair_repairs_keep_an_auxiliary_kernels_registered_k_bounds() -> None:
+    # An auxiliary kernel may leave the compiler's own K ceiling for its
+    # validated tile, but not a range the user registered: a residual GEMM
+    # whose K is registered at 32 keeps K=32 on one CTA through the edge
+    # family's repairs.
+    with cpu_codegen_target(), forbid_cuda_work():
+        bound = _residual_bound_mm._bind_isolated(
+            (
+                torch.empty((1000, 1000), dtype=torch.bfloat16),
+                torch.empty((1000, 1000), dtype=torch.bfloat16),
+                torch.empty((1000, 1000), dtype=torch.bfloat16),
+            )
+        )
+        spec = bound.config_spec
+        assert spec._cute_tcgen05_config.aux_kernel_detected
+        gen = ConfigGeneration(spec)
+        samples = [gen.unflatten(gen.random_flat()).config for _ in range(200)]
+        assert all(sample["block_sizes"][0] == 32 for sample in samples)
+        assert all(sample.get("tcgen05_cluster_m", 1) == 1 for sample in samples)
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _m_bound_mm(a: torch.Tensor, b: torch.Tensor, out: torch.Tensor) -> None:
+    """A GEMM whose M block size is registered at 256."""
+    m, k = a.shape
+    n = b.shape[1]
+    block_m = hl.register_block_size(256, 256)
+    for rows, cols in hl.tile((m, n), block_size=[block_m, None]):
+        acc = hl.zeros((rows, cols), dtype=torch.float32)
+        for inner in hl.tile(k):
+            acc = torch.addmm(acc, a[rows, inner], b[inner, cols])
+        out[rows, cols] = acc.to(torch.bfloat16)
+
+
+@pytest.mark.parametrize("pid_type", ["flat", "persistent_interleaved"])
+@pytest.mark.parametrize("extent", [4096, 1000])
+def test_one_cta_m_repairs_keep_a_registered_m_range(
+    pid_type: str, extent: int
+) -> None:
+    # The one-CTA repairs project a 256-row sample onto the one-CTA MMA's 128
+    # rows, but not below the M range a kernel registered: the repaired
+    # sample keeps M=256, so strict normalization leaves it as it is. At 4096
+    # the M search fragment is the registered [256, 256]. bf16 1000^3 is
+    # ragged in M and N, so the search caps M at 128, under the registered
+    # minimum, and the fragment reads [128, 128] (a one-CTA persistent sample
+    # is flattened there, and the flat repair judges it).
+    with cpu_codegen_target(), forbid_cuda_work():
+        bound = _m_bound_mm._bind_isolated(
+            tuple(torch.empty((extent, extent), dtype=torch.bfloat16) for _ in range(3))
+        )
+        spec = bound.config_spec
+        fragments = facts._matmul_block_fragments(spec._cute_tcgen05_config)
+        assert fragments is not None
+        assert fragments[0].high == (256 if extent == 4096 else 128)
+        config = {
+            "block_sizes": [256, 128, 64],
+            "pid_type": pid_type,
+            "tcgen05_cluster_m": 1,
+        }
+        spec.normalize(config, _fix_invalid=True)
+        assert config["block_sizes"][0] == 256
+        strict = copy.deepcopy(config)
+        spec.normalize(strict)
+        assert strict["block_sizes"] == config["block_sizes"]

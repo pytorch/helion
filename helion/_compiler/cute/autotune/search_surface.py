@@ -81,6 +81,7 @@ from ..cute_register_subblocks import ROLL_KEY as RSB_ROLL_KEY
 from ..cute_register_subblocks import WARPS_KEY as RSB_WARPS_KEY
 from ..cutedsl_compat import fixed_l2_evict_last_store_policy_supported
 from ..cutedsl_compat import readonly_packet_load_supported
+from ..direct_affine_plan import DIRECT_AFFINE_ORDINARY_SCHEDULE
 from ..direct_affine_plan import direct_affine_schedule_choices
 from ..emitters.lane_packets import _CUTE_BYTE_PACKET_WIDTHS
 from ..fragment_mma_dot import FRAGMENT_MMA_K_THREADS
@@ -132,6 +133,7 @@ from ..split_k_cluster_config import normalize_cluster_schedule
 from ..split_k_workspace_config import (
     ATOMIC_EPILOGUE_KEY as SPLIT_K_ATOMIC_EPILOGUE_KEY,
 )
+from ..split_k_workspace_config import PARTIALS_KEY as SPLIT_K_PARTIALS_KEY
 from ..split_k_workspace_config import PARTITIONS_KEY as SPLIT_K_PARTITIONS_KEY
 from ..split_k_workspace_config import STAGES_KEY as SPLIT_K_STAGES_KEY
 from ..split_k_workspace_config import WORKSPACE_KEY as SPLIT_K_WORKSPACE_KEY
@@ -731,10 +733,15 @@ def enable_cute_affine_scan_search(
 ) -> None:
     """Expose measured direct-affine schedules for a compatible CuTe scan."""
 
+    from ..scalar_fragment_assertion import requires_assertion_owner
+
     if config_spec.backend_name != "cute":
         raise InvalidConfig("direct affine scan configuration requires CuTe")
     config_spec.cute_affine_scan_schedule = EnumFragment(
-        choices=direct_affine_schedule_choices(step_count)
+        choices=direct_affine_schedule_choices(step_count),
+        search_choices=(DIRECT_AFFINE_ORDINARY_SCHEDULE,)
+        if requires_assertion_owner(config_spec)
+        else None,
     )
 
 
@@ -1798,6 +1805,7 @@ def _normalize_cute_tiles_per_block(
     CTA as thread sub-groups: a flat pid type, no CTA cluster split, no L2
     grouping (its pid decode has no pack term), and a packable root-grid
     axis whose static tile count it divides."""
+    from ..scalar_fragment_assertion import requires_assertion_owner
     from ..tile_packing import TILES_PER_BLOCK_CHOICES
     from ..tile_packing import l2_grouped
 
@@ -1821,6 +1829,12 @@ def _normalize_cute_tiles_per_block(
                 "cute_tiles_per_block needs a flat pid type, no cluster split, "
                 "no L2 grouping and a one-element grid axis whose tile count "
                 "it divides"
+            )
+        pack = 1
+    if pack > 1 and requires_assertion_owner(config_spec):
+        if not fix_invalid:
+            raise InvalidConfig(
+                f"torch._assert_async cannot use cute_tiles_per_block={pack}"
             )
         pack = 1
     if "cute_tiles_per_block" in config or pack != 1:
@@ -3035,6 +3049,7 @@ def _drop_inert_workspace_knobs(config: Config) -> None:
             SPLIT_K_STAGES_KEY,
             SPLIT_K_PARTITIONS_KEY,
             SPLIT_K_ATOMIC_EPILOGUE_KEY,
+            SPLIT_K_PARTIALS_KEY,
         ):
             config.config.pop(key, None)
 
@@ -3192,6 +3207,7 @@ def normalize_knobs(
         fix_invalid=fix_invalid,
         partition_choices=config_spec.cute_split_k_partition_choices,
         atomic_epilogue_available=config_spec.cute_split_k_atomic_epilogue_available,
+        partials_available=config_spec.cute_split_k_partials_available,
     )
     normalize_grouped_rna_config(
         config,
@@ -4372,6 +4388,10 @@ def pdl_fields(
 def cute_flat_fields(
     config_spec: ConfigSpec, flash_pipeline_family: str | None
 ) -> dict[str, BlockIdSequence[Any] | ConfigSpecFragment]:
+    from ..scalar_fragment_assertion import requires_assertion_owner
+
+    assertion = requires_assertion_owner(config_spec)
+    explicit_pdl_or_assertion = config_spec.has_explicit_pdl or assertion
     fields: dict[str, BlockIdSequence[Any] | ConfigSpecFragment] = {
         "block_sizes": config_spec.block_sizes,
     }
@@ -4385,12 +4405,12 @@ def cute_flat_fields(
     if config_spec.cute_materialized_schedule_search_enabled:
         fields["cute_materialized_schedule"] = EnumFragment(
             choices=config_spec.cute_materialized_schedule_choices,
-            search_choices=("off",) if config_spec.has_explicit_pdl else None,
+            search_choices=("off",) if explicit_pdl_or_assertion else None,
         )
     if config_spec.cute_materialized_operand_schedule_search_enabled:
         fields["cute_materialized_operand_schedule"] = EnumFragment(
             choices=("off", "warp_narrow4"),
-            search_choices=("off",) if config_spec.has_explicit_pdl else None,
+            search_choices=("off",) if explicit_pdl_or_assertion else None,
         )
     if config_spec.cute_fragment_private_scalar_loops_search_enabled:
         fields["cute_fragment_private_scalar_loops"] = BooleanFragment()
@@ -4747,13 +4767,14 @@ def cute_flat_fields(
                     "bounded_layout",
                 ),
                 search_choices=("scalar", "reload", "resident")
-                if config_spec.has_explicit_pdl
+                if explicit_pdl_or_assertion
                 else None,
             )
         if config_spec.cute_resident_reduction_blocks:
             fields["cute_reduction_local_tree"] = BooleanFragment()
             fields["cute_reduction_schedule"] = EnumFragment(
-                choices=("scalar", "resident", "pipelined")
+                choices=("scalar", "resident", "pipelined"),
+                search_choices=("scalar",) if assertion else None,
             )
             fields["cute_reduction_group_rows"] = EnumFragment(choices=(1, 2, 4, 3))
             fields["cute_reduction_row_schedule"] = EnumFragment(
@@ -4871,13 +4892,7 @@ def cute_flat_fields(
         # The split-K workspace proof holds for the atomic example and
         # for plain tcgen05 GEMM stores alike; the latter has no
         # collective ``matmul_facts``, so the knobs live outside them.
-        if config_spec.cute_split_k_workspace_available:
-            fields.update(
-                workspace_search_fields(
-                    config_spec.cute_split_k_partition_choices,
-                    atomic_epilogue_available=config_spec.cute_split_k_atomic_epilogue_available,
-                )
-            )
+        fields.update(workspace_search_fields(config_spec))
         if config_spec.matmul_facts:
             if (
                 config_spec.cute_grouped_rna_k_choices
@@ -4896,13 +4911,13 @@ def cute_flat_fields(
                         else ()
                     ),
                     search_choices=(CUTE_MMA_F32_AUTO,)
-                    if config_spec.has_explicit_pdl
+                    if explicit_pdl_or_assertion
                     else None,
                 )
             if config_spec.cute_grouped_rna_k_choices:
                 fields[GROUPED_RNA_WARPS_KEY] = EnumFragment(
                     choices=GROUPED_RNA_WARPS,
-                    search_choices=(0,) if config_spec.has_explicit_pdl else None,
+                    search_choices=(0,) if explicit_pdl_or_assertion else None,
                 )
                 fields[GROUPED_RNA_K_KEY] = EnumFragment(
                     choices=config_spec.cute_grouped_rna_k_choices
@@ -4921,13 +4936,15 @@ def cute_flat_fields(
             if config_spec.cute_split_k_cluster_facts is not None:
                 fields[SPLIT_K_SCHEDULE_KEY] = EnumFragment(
                     SPLIT_K_SCHEDULES,
-                    search_choices=("legacy",)
-                    if config_spec.has_explicit_pdl
-                    else None,
+                    search_choices=("legacy",) if explicit_pdl_or_assertion else None,
                 )
                 fields[SPLIT_K_FINALIZER_KEY] = EnumFragment(FINALIZER_WARPS)
             if config_spec.cute_collective_knobs_enabled:
-                fields["cute_collective_mma"] = BooleanFragment()
+                fields["cute_collective_mma"] = (
+                    EnumFragment((False, True), search_choices=(False,))
+                    if assertion
+                    else BooleanFragment()
+                )
                 fields["cute_collective_static_layouts"] = BooleanFragment()
                 capability = config_spec.target_device_capability
                 native_collective = capability is not None and capability[0] == 10
@@ -5143,7 +5160,9 @@ def cute_flat_fields(
             )
             fields["cute_register_chain"] = EnumFragment(
                 (False, True),
-                search_choices=(False, True) if chain_seeded else (False,),
+                search_choices=(False, True)
+                if chain_seeded and not assertion
+                else (False,),
             )
         if config_spec.cute_simt_mma_enabled:
             from ..simt_gemm import SIMT_MMA_LAYOUTS
@@ -5213,7 +5232,8 @@ def cute_flat_fields(
             from ..tile_packing import TILES_PER_BLOCK_CHOICES
 
             fields["cute_tiles_per_block"] = EnumFragment(
-                choices=TILES_PER_BLOCK_CHOICES
+                choices=TILES_PER_BLOCK_CHOICES,
+                search_choices=(1,) if assertion else None,
             )
     # The fused flash bodies (forward and backward) emit their own
     # epilogues; the subtiled store split rewrites the graphs the
@@ -5641,13 +5661,18 @@ def _inner_loop_shares(config_spec: ConfigSpec, default: int) -> dict[int, int]:
     still takes an axis after those of the blocks around and before it in
     each place, so none of those gets a share either.
     """
-    if config_spec.cute_tile_symbolic_fixed_blocks or any(
-        size < 1 for size in config_spec.cute_tile_fixed_block_sizes.values()
+    if (
+        config_spec.cute_tile_symbolic_fixed_blocks
+        or any(size < 1 for size in config_spec.cute_tile_fixed_block_sizes.values())
+        or any(
+            step is None or step <= 0
+            for block_id, step in config_spec.literal_root_grid_steps.items()
+            if block_id in config_spec.cute_tile_fixed_block_sizes
+        )
     ):
-        # Counted as one thread, such a block (``hl.tile(m,
-        # block_size=next_power_of_2(bm))``) would let the shares take the
-        # reduction's threads.  A descending ``hl.grid``'s negative step is
-        # no thread count either.
+        # A symbolic tile width cannot be counted as one thread. Descending
+        # or live scalar grid strides keep the conservative reduction default,
+        # but must never themselves be counted as physical thread widths.
         return {}
     # The budget is CuTe's (``CuteBackend.max_reduction_threads``): never None.
     budget = cast("int", config_spec.max_reduction_threads)

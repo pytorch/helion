@@ -192,7 +192,9 @@ from helion._compiler.cute.grouped_worklist_policy import (
 from helion._compiler.cute.memory_ops import (
     _PERSISTENT_VEC_ALIGNMENT_SPECIALIZATION_KEY,
 )
+from helion._compiler.cute.pipeline_smem import TCGEN05_PAIRED_MAX_AB_STAGES
 from helion._compiler.cute.pipeline_smem import TCGEN05_SMEM_AWARE_MAX_AB_STAGES
+from helion._compiler.cute.pipeline_smem import paired_pipeline_max_ab_stages
 from helion._compiler.cute.pipeline_smem import pipeline_smem_bytes
 from helion._compiler.cute.strategies import TCGEN05_L2_SWIZZLE_SIZE_CONFIG_KEY
 from helion._compiler.cute.strategies import TCGEN05_LAYOUT_OVERRIDES_D_STORE_BOX_N_KEY
@@ -11084,7 +11086,10 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
             surface.paired_pipeline_search_enabled(spec._cute_tcgen05_config)
         )
         self.assertEqual(
-            search_ab_stages_fragment.high, TCGEN05_SMEM_AWARE_MAX_AB_STAGES
+            search_ab_stages_fragment.high,
+            paired_pipeline_max_ab_stages(
+                spec._cute_tcgen05_config.pipeline_smem_facts
+            ),
         )
 
         @helion.kernel(backend="cute")
@@ -11135,7 +11140,10 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
             )
         )
         self.assertEqual(
-            no_budget_ab_stages_fragment.high, TCGEN05_SMEM_AWARE_MAX_AB_STAGES
+            no_budget_ab_stages_fragment.high,
+            paired_pipeline_max_ab_stages(
+                no_ab3_budget_bound.config_spec._cute_tcgen05_config.pipeline_smem_facts
+            ),
         )
 
         # An fp16 matmul IS eligible for the FFI seed: the direct-entry TMA
@@ -12816,11 +12824,13 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
         # pipelines, and so do the bias and residual epilogues below; the
         # separate AB/source-C budget checks below decide what fits.
         self.assertTrue(surface.paired_pipeline_search_enabled(plain_tcfg))
+        # (the plain 16-bit pair's ring may take a 17th stage; the bias and
+        # residual epilogues keep 16)
         self.assertEqual(
             surface.optional_fragments(plain_tcfg, for_search=True)[
                 "tcgen05_ab_stages"
             ].high,
-            TCGEN05_SMEM_AWARE_MAX_AB_STAGES,
+            TCGEN05_PAIRED_MAX_AB_STAGES,
         )
         # The broadcast (rowvec) bias records its row in the allocation proof
         # (a ``pre_acc_wait`` row stage the model charges) and takes the
@@ -13122,8 +13132,23 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
         }
         self.assertTrue(expected_seed_modes.issubset(best_available_modes))
 
+        # The dense aligned-N family's search seed (the clipped width the
+        # wave model ranks first, ``dense_aligned_n_search_seed_configs``:
+        # 192-column pairs here) is a CTA pair of its own family, persistent
+        # interleaved; the cluster-m2 heuristic's pairs are the rest.
+        aligned_n_configs = [
+            config
+            for config in configs
+            if config.get("tcgen05_cta_group") == "two"
+            and config.get("tcgen05_tile_n", 0)
+        ]
+        for config in aligned_n_configs:
+            self.assertEqual(config["pid_type"], "persistent_interleaved")
         paired_configs = [
-            config for config in configs if config.get("tcgen05_cta_group") == "two"
+            config
+            for config in configs
+            if config.get("tcgen05_cta_group") == "two"
+            and not config.get("tcgen05_tile_n", 0)
         ]
         self.assertTrue(paired_configs)
         facts = bound.config_spec._cute_tcgen05_config.pipeline_smem_facts

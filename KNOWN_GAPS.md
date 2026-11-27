@@ -34,6 +34,30 @@ these labelled lines.
 - Why deferred: what a fix would take.
 - Pinned by: the tests that hold the current behavior, or none.
 
+## indirect-memory-effects-in-inline-assembly
+
+- Area: compiler memory dependencies for `hl.inline_asm_elementwise`.
+- What is wrong: an impure assembly snippet can store through addresses
+  loaded from a tensor. The dependency checker treats the loaded addresses
+  as ordinary computed values; it does not record the write. For example,
+  use the store from `test_dead_code_side_effects.py` with operands
+  `[addresses[t], x[t]]` in a 256-element tile, then read
+  `scratch[(t.index + 32) % 256]` into an output. If the addresses point
+  to the corresponding elements of `scratch`, the reader may run before
+  another warp's write. With Triton CPU code generation the assembly was
+  present, but there was no barrier. Replacing the assembly with
+  `scratch[t] = x[t]` emitted a barrier.
+- Since: reproduced on `main` at `a2f18c2d0`.
+- Why deferred: the assembly interface declares purity but has no way to
+  identify the memory read or written by arbitrary register operands. An
+  unknown-memory effect must reach dependency checks, reduction dimension
+  merging and schedule selection. Treating every impure snippet as reading
+  and writing all memory can introduce barriers or rule out schedules for
+  working kernels even when the snippet only inspects a register. This
+  needs its own compatibility and performance evaluation across backends.
+- Pinned by: none. The tests in `test_dead_code_side_effects.py` check that
+  the assembly survives dead-code elimination, not its memory dependencies.
+
 ## ptxas-signed-extrema-chains
 
 - Area: CuTe backend, elementwise integer extrema. The chain rule of
@@ -218,11 +242,19 @@ these labelled lines.
 
 - Area: compiled kernels, Triton and CuTe backends: a load or a store in a
   device loop through an index tensor.
-- What is wrong: compiled code does not bound the elements of an index
-  tensor. The Triton backend emits no mask for them
-  (`tl.store(out + (indices_0 + 1) * 1, v_2, None)`), and the CuTe backend
-  masks `index < size` and has no term for a negative element. An element
-  out of range reads or writes memory outside the tensor.
+- What is wrong: compiled code does not consistently bound tensor indices.
+  Ordinary Triton pointer accesses can omit the mask
+  (`tl.store(out + (indices_0 + 1) * 1, v_2, None)`). Triton tensor
+  descriptor loads check that the tile overlaps the tensor before narrowing
+  its origin; lanes outside the tensor return zero, including on the masked
+  pointer fallback for an overlapping tile with an invalid native origin.
+  CuTe can check only
+  `index < size` for a vector index or a scalar loaded or computed in device
+  code, so a negative element can read or write outside the tensor.
+  CuTe checks both bounds at the original integer width for a rank-zero
+  tensor argument used directly as the index: an out-of-range load returns
+  zero, and an out-of-range store or atomic does not write. This does not
+  extend to an index loaded explicitly with `idx[()]`.
 
   ```python
   for tile in hl.tile(out.size(0)):
@@ -241,6 +273,151 @@ these labelled lines.
 - Pinned by: reference mode's side only (no test holds the compiled store),
   in
   `test/test_ref_eager.py::TestRefEagerMisc::test_store_leaves_out_index_elements_out_of_range`.
+
+## triton-native-nested-range-width
+
+- Area: Ordinary nested `hl.grid` and `hl.tile` on Triton, Gluon and TileIR.
+  Cartesian roots, descriptors and CuTe fragment loops use separate lowering.
+- What is wrong: Ordinary native loops can narrow bounds to the storage
+  index type. With Int32 indexing, two Python arguments `lo=2**32` and
+  `hi=4` make an empty `hl.grid(lo, hi)` execute four times. A vector
+  `hl.tile(-64, hi, block_size=4)` with Python `hi=129` and Int8
+  indexing can skip all 49 tiles. Loaded wide integers
+  can narrow too: for an interval starting at `2**32 + 1`, an Int32
+  counter can enable all four lanes of a partial tile. Int64 indexing
+  gives zero and 49 iterations for these two Python examples. Widen an
+  expression's operands before doing arithmetic that might overflow.
+  Even with Int64 indexing, the increment after the last live tile must
+  fit. With loaded bounds `[2**63 - 3, 2**63 - 1)` and width 4, that
+  increment wraps below the stop and the loop can continue. A dynamic
+  descending stride also cannot rely on the native normalization of a
+  literal negative step. Iterate over a bounded zero-based span and
+  add the base to each live coordinate instead.
+- Since: The narrow-header cases reproduce on unmodified main at
+  `0092ca313`; the dynamic-stride and loaded-bound cases also reproduce
+  on the stack base `4b86f71b0`.
+- Why deferred: These native counters are also used for grouped GEMM and
+  jagged attention. A general replacement has to preserve their native
+  fast paths and saved static-range configs while handling tail masks,
+  signed and unsigned arguments and dynamic stride direction. Widening
+  all potentially large counters changes compiled code for ordinary
+  inputs. This root-grid change leaves the native lowering in place;
+  selecting and measuring a replacement is a separate compiler change.
+- Pinned by: The native nested-loop compatibility tests exercise working
+  boundary and saved-config behavior, not the incorrect iteration counts.
+
+## observed-tile-count-arithmetic
+
+- Area: An observed `tile.count` inside an ordinary nested device
+  loop. Root tiles and eager evaluation have separate count paths.
+- What is wrong: On Triton, a nested tile over loaded Int8 bounds
+  `[-64, 65)`, width 4 and `index_dtype=torch.int8` executes 33 tiles
+  but can report -31. With loaded signed Int64 bounds
+  `[-2**62, 2**62 - 1)`, width 4 and `index_dtype=torch.int64`,
+  adding 3 for ceiling division can overflow even though the result
+  fits. At width 1, `[-2**62, 2**62)` needs a count above INT64_MAX.
+  Pallas likewise cannot represent a count above INT32_MAX in a
+  signed scalar with JAX 64-bit arithmetic disabled.
+- Since: These nested calculations reproduce on main and the
+  originally submitted Cartesian-grid patch. The Triton Int8 loop's
+  iteration count and stored value were checked in its generated code.
+- Why deferred: A replacement must preserve the signedness of the native
+  loop's endpoints through each backend's integer conversions, retain
+  Python arithmetic for static bounds, and define how a body consumes a
+  result larger than a signed device value. Direct conversion to Uint64
+  can zero-extend negative CuTe values; casting both Pallas bounds to
+  UInt32 can discard a full word of distance. If the bounds are known
+  on the host, pass the calculated count as a representable scalar.
+  Split larger intervals if the result does not fit.
+- Pinned by: none of the incorrect counts are required by tests.
+
+## cute-nested-loop-narrows-runtime-bounds
+
+- Area: ordinary nested CuTe loops with a signed 32-bit counter, including
+  those with 8- or 16-bit storage indices. A gather
+  that reads its source tile again checks dynamic loop bounds before that
+  read. Computed fragments use a separate lowering
+  ([fragment loop widths](https://github.com/pytorch/helion/pull/4672)).
+- What is wrong: a runtime exclusive stop of `2**31` becomes `-2**31`,
+  so an ascending loop can silently skip every write:
+
+  ```python
+  import torch
+  import helion
+  import helion.language as hl
+
+  @helion.kernel(backend="cute", config=helion.Config(block_sizes=[]))
+  def fill(out, lo, hi):
+      for row in hl.grid(2):
+          for tile in hl.tile(lo, hi, block_size=4):
+              out[row, tile.index - tile.begin] = 7
+      return out
+
+  out = torch.full((2, 4), -1, device="cuda", dtype=torch.int64)
+  print(fill(out, 2**31 - 4, 2**31))
+  ```
+
+  Both rows should contain four sevens. CPU replay with signed 32-bit
+  conversion left all eight cells at -1; the same kernel with `(0, 4)`
+  wrote all eight. Offline SM100a compilation confirmed a signed 32-bit
+  comparison after narrowing the 64-bit stop. For this example, pass
+  `count = hi - lo` from the host and use `hl.tile(0, count, block_size=4)`
+  and `out[row, tile] = 7`. This writes all eight cells. If the body needs
+  the absolute coordinate, add its Int64 origin to `tile.index.to(torch.int64)`.
+  Split the range on the host if its count or counter increments cannot fit.
+  A runtime step must also be nonzero; ordinary nested loops without the
+  gather check do not validate this precondition.
+- Since: reproduced on `main` at `5a17ffd4f` and on the rebased parent
+  `83addb13d`.
+- Why deferred: inserting a trapping check before every nested loop
+  prevented 202 existing CuTe tests from selecting or compiling their
+  schedules, including collective matmuls with bounds read from GPU
+  memory. A general fix must preserve those schedules while widening their
+  counters or checking their operands before narrowing.
+- Pinned by: none for the incorrect no-gather result.
+
+## cute-gather-rereads-loaded-tiles
+
+- Area: CuTe `torch.gather` after a write through an alias of the source.
+- What is wrong: The gather reads the source buffer again. If another
+  argument shares that storage, an intervening store can replace the value
+  that the kernel already loaded, even with one thread.
+
+  ```python
+  import torch
+  import helion
+  import helion.language as hl
+
+  @helion.kernel(
+      backend="cute", static_shapes=True, config=helion.Config(block_sizes=[1, 1])
+  )
+  def gather_after_write(x, alias, ids):
+      out = torch.empty_like(x)
+      for m, n in hl.tile(ids.shape):
+          saved = x[m, n]
+          alias[m, n] = 0
+          out[m, n] = torch.gather(saved, 0, ids[m, n])
+      return out
+
+  x = torch.ones((1, 1), device="cuda")
+  ids = torch.zeros_like(x, dtype=torch.int64)
+  print(gather_after_write(x, x.view_as(x), ids))
+  ```
+
+- Since: On main at `4ca0e2699`, this kernel compiled for SM100a. CPU
+  replay of the generated code returned `[[0.0]]`; the saved tile held
+  `[[1.0]]`, so the gather should return `[[1.0]]`.
+- Why deferred: In a tile with multiple threads, gathering from the saved
+  values may require moving them between threads. Keeping the memory reread
+  instead requires proving that intervening stores cannot change its source,
+  including through other kernel arguments.
+  To preserve the original values, save `snapshot = x.clone()` before the
+  write in eager PyTorch. In the one-tile example above, call
+  `torch.gather(snapshot, 0, ids)` outside the compiled kernel. With
+  tile-local indices, [gather each tile
+  separately](docs/backends.md#cute-dsl); index zero in a later tile selects
+  that tile's first row.
+- Pinned by: none.
 
 ## memory-op-facts-behind-new-axis
 
@@ -518,3 +695,77 @@ these labelled lines.
   transcendental; judging it takes timings of its own.
 - Pinned by: `test/test_autotuner_heuristics.py::TestPointwiseGatheredSlab::test_rolled_copy_of_an_op_reads_its_index_in_the_enclosing_graph`
   (`slab_numel == 576`).
+
+## ref-eager-singleton-tile-load
+
+- Area: Eager indexing and Triton and CuTe loads of a statically known
+  size-one axis, including CuTe computed fragments.
+- What is wrong: With `x = torch.ones(1)` and `hl.tile(4, block_size=4)`,
+  the compiled bare-tile load broadcasts across all four live lanes and
+  sums to 4. Eager mode slices the tensor and sums to 1. An explicit
+  all-true lane mask gives the same discrepancy. With an explicit coordinate
+  tensor such as `hl.arange(4)`, Triton and ordinary CuTe can still broadcast
+  a singleton, whereas computed fragments and masked eager loads check
+  physical bounds. Computed-fragment tile stores also check physical bounds.
+- Since: Triton and eager already differed on main at `362b7b182`.
+  Ordinary CuTe already broadcast these loads. Computed CuTe fragments
+  now use the same rule when the input extent is provably one.
+- Why deferred: Matching the documented compiled load requires changing
+  eager tile slicing and explicit-mask evaluation together. It would
+  change the ref-mode results of existing programs; the user asked to
+  keep the documented compiled rule and track the eager change separately.
+- Pinned by: `test_singleton_tile_broadcast_feeds_fragment_sum_and_scan`
+  and `test_masked_singleton_tile_applies_each_lane_mask` in
+  `test/test_cute_fragment_value_codegen.py` check the compiled rule.
+  No test requires the eager discrepancy.
+
+## cute-fragment-captures-across-reused-tile-blocks
+
+- Area: CuTe computed fragments in nested loops using the same
+  `hl.register_block_size`.
+- What is wrong: In a four-lane outer tile, save `ids = outer.index` and
+  `saved_end = outer.end`. In a nested two-lane tile with the same block
+  ID and origin zero, compute `v = ids + inner.begin`, then
+  `out[:] = torch.cumsum(v, dim=0)`, `metrics[0] = v.sum()` and
+  `metrics[1] = saved_end`. CPU replay of the generated CuTe kernel
+  writes `[0, 1, 0, 0]`, 1, and 2 instead of `[0, 1, 3, 6]`, 6, and 4.
+  The fixed contiguous destinations require neither a singleton load nor
+  an indirect store.
+- Since: Present on main at both the stack base `a2f18c2d0` and the
+  current main `29c1bc1f2`: CPU replay returns the same wrong values
+  there, on the parent `ddfc9ec52`, and on the corrected fragment load.
+- Why deferred: Reductions and scans resolve symbolic shape axes against
+  the active block, and scalar bounds can outlive the loop where they
+  were defined. Preserving distinct bindings through symbolic scalar
+  expressions, fragment transformations and nested graph placeholders
+  requires a change to loop provenance beyond fragment-load indexing.
+  A workaround is to use distinct block IDs or to consume the captured
+  value before entering the inner loop.
+- Pinned by: none.
+
+## triton-grid-product-stored-in-int64
+
+- Area: Python grid-index arithmetic used as a stored value in Triton and
+  in ordinary and computed-fragment CuTe kernels.
+- What is wrong: For an Int64 output of shape (1, 2), nest
+  `for i in hl.grid(2, 4)` inside `for r in hl.grid(1)` and store
+  `out[r, i - 2] = i * 2**30`. Eager stores [2147483648, 3221225472].
+  With default indexing, both backends multiply in Int32 and sign-extend
+  the result. Their SM103 programs store [-2147483648, -1073741824].
+  An explicit `index_dtype=torch.int64` still gives those negative values
+  for this nested loop on both backends. For the top-level Triton grid,
+  explicit Int64 indexing does give the eager values. The default Triton
+  interpreter reproduces the top-level wrap but misses the nested one.
+  Unchecked CuTe computed fragments also evaluate the product in Int32
+  with default indexing. Unlike the ordinary nested lowering, a computed
+  fragment widens the index before multiplication under explicit Int64 indexing.
+- Since: Pristine main at `229afece6` for both backends; also reproduced
+  on `6e81e9c09` for Triton.
+- Why deferred: Ordinary lowering must distinguish Python index arithmetic
+  used as a value from address arithmetic and explicitly typed tensor math.
+  Correcting it calls for separate coverage of existing configurations and
+  the cost of widening ordinary kernels. This entry concerns unchecked
+  stores only.
+- Pinned by: `test_grid_induction_product_uses_kernel_index_type` in
+  `test/test_cute_fragment_loop_captures.py` checks computed-fragment
+  index widths; it does not exercise the ordinary nested-store overflow.

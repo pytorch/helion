@@ -44,6 +44,7 @@ from helion._compiler.cute.flash_schedule import verify_flash_schedule
 from helion._testing import DEVICE
 from helion._testing import import_example
 from helion._testing import skipIfNotCUDA
+from helion._testing.cute_sass import skip_unless_nvdisasm_runs
 from helion.autotuner.config_spec import BlockSizeSpec
 from helion.autotuner.config_spec import ConfigSpec
 import helion.language as hl
@@ -1123,6 +1124,7 @@ def test_spin_waits_address_their_barriers_uniformly_in_the_sass(
     # The child runs this file as a script, so ``sys.path[0]`` is test/, not
     # the repository root the ``test.*`` imports need: hand it the root.
     root = Path(cast("str", helion.__file__)).resolve().parents[1]
+    skip_unless_nvdisasm_runs()
     result = subprocess.run(
         [sys.executable, os.path.abspath(__file__), "sass"],
         cwd=root,

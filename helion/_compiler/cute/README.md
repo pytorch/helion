@@ -194,6 +194,35 @@ root asks for fragments), `block_scaled`, `topk`, `register_region`,
 | computed fragments, register sub-blocks / region / program, block scaled | `computed_fragment.prefer_computed_fragment_root`, `cute_register_subblocks.py`, `register_region.py`, `block_scaled_mma.py` | `computed_fragment.codegen_computed_fragment_root` + `fragment_*.py`; `register_program.py`; `block_scaled_*.py`, `mxfp8_*.py` | `host_wrappers/block_scaled.py` |
 | host-sum tails | `host_sums.py` | `host_single_sum.py`, `host_paired_sum.py`, `host_full_sum.py`, `host_remainder_fills.py` | `runtime/cute/single_sum.py`, `paired_sum.py`, `full_sum.py` |
 
+A kernel with one CTA-local fragment root can check a scalar Boolean it computed,
+for example `torch._assert_async(counts.sum() <= capacity, "capacity exceeded")`.
+The message is optional. One thread checks the predicate in the same launch;
+a false value reports a CUDA device assertion when the stream synchronizes.
+Bare host tensors and non-scalar or non-Boolean predicates are rejected.
+Scalar indices on reads and stores must be proved nonnegative after normalizing
+a literal such as `x[-1]`. The proof recognizes direct grid coordinates and
+tile origins, but not an arbitrary displacement such as `out[i + 1]`.
+Unmasked reads also require proof that scalar and tensor indices stay below
+the dimension size.
+A tile slice must have a nonnegative origin. For an unmasked read, the entire
+logical interval must also fit the indexed dimension: clipping could change
+a reduction's result. Masked reads and stores do not require this upper bound.
+Direct grid coordinates, tile origins and tile IDs use the loop's proved range.
+A checked fragment also requires statically proved Int32 grid and nested loop
+bounds, a positive step, and a representable final induction update. Tensor-loaded
+or runtime-symbolic bounds do not qualify even when their sample values fit.
+The flattened logical grid and any scheduler padding must fit Int32. An XYZ
+launch must also fit the CUDA limit of 65,535 blocks on each of Y and Z.
+Each CTA must own one logical tile: configurations that pack tiles or
+replace the fragment with a specialized kernel cannot issue this check.
+
+Earlier CuTe versions could silently drop the message-less form. Such kernels
+now raise a device assertion on false. If the predicate or its computation
+cannot be lowered (for example, two independent root loops, a bare host
+scalar, or a reduction over unsupported dimensions), compilation can now fail
+where it previously succeeded. A checked kernel can also use the ordinary
+fragment in place of a faster specialized schedule that cannot issue the check.
+
 MMA dataflow operand recipes may read a typed 2D grouped auxiliary tensor at
 `floor(global_axis / positive_group)`. The matcher proves its physical capacity;
 INT8/UINT8 auxiliaries require this recipe. Grouped values use scalar addressing

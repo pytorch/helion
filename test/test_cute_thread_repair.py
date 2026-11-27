@@ -2396,9 +2396,8 @@ def test_a_block_nested_in_itself_keeps_the_collapsed_default() -> None:
 
 @skipIfRefEager("binding does not build device IR in ref eager mode")
 def test_a_descending_grid_keeps_the_collapsed_default() -> None:
-    """A descending ``hl.grid``'s step of -1 counts no threads, like a fixed
-    size of tunables: the loop keeps the collapsed default.  Counted, it
-    failed the bind in ``math.isqrt``, an explicit config's too."""
+    """A descending root has one logical row per CTA. Its negative stride
+    keeps the conservative inner default and never sizes a thread axis."""
     kernel = helion.kernel(
         _center_rows_from_the_last, backend="cute", static_shapes=True
     )
@@ -2413,6 +2412,7 @@ def test_a_descending_grid_keeps_the_collapsed_default() -> None:
             )
         )
     assert "block=(32, 1, 1)" in code
+    assert "(64,)" in code  # all 64 reversed rows launch, one per program
 
 
 @pytest.mark.cuda

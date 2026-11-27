@@ -23,6 +23,7 @@ from ..grouped_ab_k import physical_grouped_ab_k
 from ..pipeline_smem import TCGEN05_CTA_GROUP_CONFIG_KEY
 from ..pipeline_smem import max_pipeline_ab_stages
 from ..pipeline_smem import one_cta_pipeline_tile_modeled
+from ..pipeline_smem import paired_pipeline_max_ab_stages
 from ..pipeline_smem import pipeline_smem_bytes
 from ..strategies import TCGEN05_LAYOUT_OVERRIDES_KEYS
 from ..strategies import TCGEN05_LAYOUT_STRATEGY_CONFIG_KEY
@@ -63,6 +64,8 @@ from ..tcgen05_constants import TCGEN05_ONE_CTA_MAX_BLOCK_M
 from ..tcgen05_constants import TCGEN05_SCHED_STAGE_COUNT_CONFIG_KEY
 from ..tcgen05_constants import TCGEN05_SMEM_ROW_STAGE_CHUNK_BYTES
 from ..tcgen05_constants import TCGEN05_SMEM_SMALL_ALLOCATION_ALLOWANCE_BYTES
+from ..tcgen05_constants import TCGEN05_SPLIT_K_EXCHANGE_CONFIG_KEY
+from ..tcgen05_constants import TCGEN05_SPLIT_K_EXCHANGE_OUTPUT
 from ..tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_M
 from ..tcgen05_constants import TCGEN05_TWO_CTA_SEED_PID_TYPE
 from ..tcgen05_constants import resolve_tcgen05_grouped_worklist_mma_profile
@@ -70,6 +73,8 @@ from ..tcgen05_constants import tcgen05_ab_smem_bytes_per_cta
 from ..tcgen05_constants import tcgen05_aux_ring_smem_bytes_per_cta
 from ..tcgen05_constants import tcgen05_aux_subtile_fragment_bytes_per_thread
 from ..tcgen05_constants import tcgen05_c_smem_bytes_per_cta
+from ..tcgen05_constants import tcgen05_cluster_split_k
+from ..tcgen05_constants import tcgen05_cluster_split_k_exchange_smem_bytes
 from ..tcgen05_constants import tcgen05_default_epilogue_tile_size
 from ..tcgen05_constants import tcgen05_fixed_smem_overhead_bytes
 from ..tcgen05_constants import tcgen05_grouped_worklist_smem_bytes
@@ -92,6 +97,8 @@ from .knobs import TCGEN05_GROUPED_WORKLIST_NM_SHAPE_MISMATCH
 from .knobs import Tcgen05AbStagesThreeSearchConstraints
 
 if TYPE_CHECKING:
+    from collections.abc import Mapping
+
     from ..tcgen05_constants import Tcgen05RowvecAuxFacts
     from . import CuteTcgen05Config
 
@@ -116,6 +123,22 @@ def _one_cta_pipeline_stage_limit(
     )
 
 
+def split_k_exchange_itemsize(
+    state: CuteTcgen05Config, config: Mapping[str, object]
+) -> int:
+    """Bytes per partial a K-split cluster's receive buffer holds: 2 under
+    ``tcgen05_split_k_exchange="output"`` where the repair keeps it
+    (``surface.split_k_exchange_admitted``, read here so that a stage count
+    judged before the repair never counts on the smaller buffer), else 4."""
+    return (
+        2
+        if config.get(TCGEN05_SPLIT_K_EXCHANGE_CONFIG_KEY)
+        == TCGEN05_SPLIT_K_EXCHANGE_OUTPUT
+        and surface.split_k_exchange_admitted(state)
+        else 4
+    )
+
+
 def _paired_pipeline_stage_limit(
     state: CuteTcgen05Config, config: dict[str, object]
 ) -> int | None:
@@ -127,6 +150,7 @@ def _paired_pipeline_stage_limit(
     bm, bn, bk, c_stages, acc_stages = parameters
     return max_pipeline_ab_stages(
         facts,
+        max_stages=paired_pipeline_max_ab_stages(facts),
         bm=bm,
         bn=bn,
         bk=bk,
@@ -144,6 +168,13 @@ def _paired_pipeline_stage_limit(
         epi_warps=cast("int", config.get("tcgen05_num_epi_warps", 4)),
         aux_load_mode=aux_load_mode_knob(config),
         aux_stages=aux_stages_knob(config),
+        exchange_bytes=(
+            tcgen05_cluster_split_k_exchange_smem_bytes(
+                bm=bm, bn=bn, itemsize=split_k_exchange_itemsize(state, config)
+            )
+            if tcgen05_cluster_split_k(config) > 1
+            else 0
+        ),
     )
 
 
@@ -717,9 +748,10 @@ def c_stages_fits(
     # bytes use the ``Tcgen05LayoutStrategy.DEFAULT`` epilogue subtile the
     # role-local codegen allocates, not the (128, 32) EXPLICIT_EPI_TILE
     # direct-entry tile: a 256x256 16-bit tile is ``(128, 64)`` with a
-    # source-C (residual family) but ``(128, 32)`` without one (plain
-    # matmul), since ``compute_epilogue_tile_size`` shrinks N when no C tile
-    # competes for SMEM; ``has_source_c`` carries that distinction.
+    # source-C (residual family) or a column-major output, and ``(128, 32)``
+    # for a plain row-major one, which takes the narrow subtile (``cute_mma``'s
+    # ``tcgen05_plain_narrow_subtile``); ``has_source_c`` and the store
+    # facts' ``output_column_major`` carry that distinction.
     constraints = state.ab_stages_three_search_constraints
     if constraints is None:
         return False
@@ -748,11 +780,30 @@ def c_stages_fits(
     # epilogues), so the ring bytes are charged per store.
     output_bytes = constraints.output_dtype_bytes or constraints.dtype_bytes
     elem_width = output_bytes * 8
+    # A column-major output keeps CuTe's with-source subtile: the plain
+    # narrow rule that stores a row-major 256-wide pair through (128, 32)
+    # subtiles skips it (``cute_mma``'s ``tcgen05_plain_narrow_subtile``), so
+    # out.T = b.T @ a.T on the 256x256 pair renders
+    #
+    #     tcgen05_store_epi_tile = compute_epilogue_tile_shape((256, 256), False,
+    #         LayoutEnum.COL_MAJOR, cutlass.BFloat16, layout_c=LayoutEnum.COL_MAJOR,
+    #         elem_ty_c=cutlass.BFloat16)  # (128, 64): 16 KiB per C stage
+    #
+    # Priced at (128, 32), its four-deep ring is charged 32 KiB of the
+    # 64 KiB it allocates: fp16 4096x2048x4096 as its transpose (out.T
+    # column-major) seeded the M-paired 512x256x64 tile at three 48 KiB AB
+    # stages and four C stages, 208 KiB against the 199 KiB budget; priced
+    # at (128, 64) the seed keeps two C stages (176 KiB). The M-paired
+    # samples' C rings are judged by ``_fix_m_pair_column_major_c_stages_search_config``.
+    pipeline_facts = state.pipeline_smem_facts
+    with_source_tile = has_source_c or (
+        pipeline_facts is not None and pipeline_facts.output_column_major
+    )
     epi_tile_m, epi_tile_n = tcgen05_default_epilogue_tile_size(
         bm,
         bn,
         elem_width_d=elem_width,
-        elem_width_c=elem_width if has_source_c else None,
+        elem_width_c=elem_width if with_source_tile else None,
     )
     c_bytes = tcgen05_c_smem_bytes_per_cta(
         epi_tile_m=epi_tile_m,
@@ -1405,9 +1456,10 @@ def epilogue_subtile(
     two-CTA tile (``tcgen05_plain_narrow_subtile``: one output store and no auxiliary
     operand -- a two-output or aux epilogue keeps CuTe's with-source
     (128, 64) subtile there, 64 KiB of C rings for two outputs; the plan
-    also asks for a single static-full-tile store, which every plain
-    kernel the gates see has); otherwise CuTe's with-source rule at the
-    output width, sized for a 32-bit output without store facts.
+    also asks for a single store over static full tiles, or over whole N
+    and K tiles whose partial last M tile the TMA store clips); otherwise
+    CuTe's with-source rule at the output width, sized for a 32-bit output
+    without store facts.
     """
     constraints = state.ab_stages_three_search_constraints
     rowvec_facts = state.rowvec_aux_facts
@@ -1570,7 +1622,15 @@ def _get_dtype_ab_stages_hard_cap(dtype_bytes: int) -> int:
     - FP8 (1 byte): 12 stages - validated on B200, fits 2x bf16
     - FP16/BF16 (2 bytes): 12 stages - the per-CTA SMEM budget decides
       (256x256x64 two-CTA fits 6, 256x64x64 two-CTA fits 9)
-    - FP32 (4 bytes): 3 stages - baseline for larger dtypes
+    - FP32 run as tf32 (4 bytes): 12 stages - the budget decides as for
+      16-bit operands: a 32-deep fp32 K step stages the bytes of a 64-deep
+      16-bit one, so the 256x256 pair fits six 32-deep stages (cuBLAS's
+      tf32 ``256x256x32 ... 2sm`` tile) where the cap of 3 stopped it at
+      three 64-deep ones holding the same 192 KiB. GB300, tf32
+      16384x768x3072 with b K-major, in CUDA graphs over cold inputs, of
+      cuBLAS: 256x256x64 x 3 0.999-1.002, 256x256x32 x 6 1.005-1.013
+      (back to back at the shared clock: 0.958-0.973 -> 1.011-1.017)
+    - larger: 3 stages
 
     Args:
         dtype_bytes: Size of data type in bytes
@@ -1582,9 +1642,8 @@ def _get_dtype_ab_stages_hard_cap(dtype_bytes: int) -> int:
         return 0
     if dtype_bytes == 1:  # FP8
         return 12
-    if dtype_bytes == 2:  # FP16/BF16
+    if dtype_bytes in (2, 4):  # FP16/BF16, FP32 (tf32)
         return 12
-    # FP32 or larger
     return 3
 
 
@@ -1612,22 +1671,23 @@ def max_ab_stages_that_fit(
         bn: Block size in N dimension
         bk: Block size in K dimension
         cluster_m: CTA cluster size (1 or 2)
-        hard_cap: Optional maximum stages override. If None, uses
-            dtype-specific default (12 for FP8, 6 for FP16, 3 for FP32)
+        hard_cap: Optional maximum stages override. If None, uses the
+            dtype-specific default (``_get_dtype_ab_stages_hard_cap``: 12
+            for FP8, FP16/BF16 and FP32 run as tf32, 3 for wider dtypes)
 
     Returns:
         Maximum valid ab_stages in [1, hard_cap], or 0 if constraints
         are unknown or configuration is invalid (e.g., ab_stages=1
         doesn't fit budget).
 
-    Example:
+    Example (GB300's per-CTA budget):
         >>> # FP8 256x256x64 cluster_m=2
         >>> smem.max_ab_stages_that_fit(state, bm=256, bn=256, bk=64, cluster_m=2)
-        8  # FP8 fits 8 stages
+        12  # FP8 fits the cap of 12 stages
 
         >>> # BF16 same tile (2x larger per stage)
         >>> smem.max_ab_stages_that_fit(state, bm=256, bn=256, bk=64, cluster_m=2)
-        4  # BF16 fits only 4 stages
+        6  # BF16 fits 6 stages, as FP32 does at bk=32
     """
     constraints = state.ab_stages_three_search_constraints
     if constraints is None or bm <= 0 or bn <= 0 or bk <= 0:
@@ -1661,6 +1721,27 @@ def max_ab_stages_that_fit(
 
     # Return clamped value: at least 1, at most hard_cap or budget limit
     return max(1, min(max_from_budget, hard_cap))
+
+
+def pair_ab_stage_fit(
+    state: CuteTcgen05Config,
+    config: dict[str, object],
+    *,
+    bm: int,
+    bn: int,
+    bk: int,
+    cluster_m: int,
+) -> int:
+    """Deepest AB ring of an explicit CTA pair: the pair's complete
+    allocation proof, which the direct-entry validator enforces
+    (``_paired_pipeline_stage_limit``), and the coarse per-stage model
+    (``max_ab_stages_that_fit``) where the proof does not apply. The
+    coarse model leaves a stage of the 128x128 pair unused: bf16
+    1000x1024x4096 runs 13 stages at 8.3 us, 12 at 8.5."""
+    proof = _paired_pipeline_stage_limit(state, config)
+    if proof is not None:
+        return proof
+    return max_ab_stages_that_fit(state, bm=bm, bn=bn, bk=bk, cluster_m=cluster_m)
 
 
 def epi_tma_ab_stage_limit(

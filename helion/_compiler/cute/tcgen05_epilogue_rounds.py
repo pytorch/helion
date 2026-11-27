@@ -24,12 +24,17 @@ read it complete.  The acquire and the barrier that publishes it are emitted
 only where a reuse is possible: unconditionally for the rounds past the first
 ``c_stages // K`` of a tile, under a ``tile_counter`` guard for the earlier
 ones, so a CTA's first tile pays none of them.
+
+``render_last_tile_staging`` renders the same plain store's CTA's last tile
+in one round of all its subtiles, staged in the A ring that tile's MMAs have
+drained (``cute_mma``'s ``tcgen05_last_tile_staging``).
 """
 
 from __future__ import annotations
 
 import dataclasses
 import math
+import textwrap
 
 
 @dataclasses.dataclass(frozen=True)
@@ -171,3 +176,91 @@ def render_round_subtile_loop(
             )
         body.append(f"    {names.c_pipeline}.producer_commit()")
     return f"if {names.epi_active}:\n" + "".join(f"    {line}\n" for line in body)
+
+
+@dataclasses.dataclass(frozen=True)
+class Tcgen05LastTileStagingNames:
+    """Generated-source names the last-tile staging renderer composes,
+    beside the rounds renderer's (``Tcgen05EpilogueRoundNames``)."""
+
+    rounds: Tcgen05EpilogueRoundNames
+    last_tile_next_work: str
+    staging_smem: str
+    smem_layout: str
+    smem: str
+    trs_sd: str
+    bsg_sd: str
+    epi_tidx: str
+    tcgc_epi: str
+    d_store_layout: str
+    epi_tile: str
+    subtile_count: str
+
+
+def render_last_tile_staging(
+    names: Tcgen05LastTileStagingNames, *, acc_rhs: str, default_loop: str
+) -> str:
+    """The plain TMA-store epilogue with its CTA's last tile staged at once.
+
+    On the last tile (no valid ``names.last_tile_next_work``, the work tile
+    one step ahead of the role's) every subtile goes from TMEM
+    through registers into its own stage of a C tile carved from the A ring
+    (``names.staging_smem``), which the tile's MMAs have drained; one fence
+    and one barrier publish them, and the leader issues every TMA store
+    behind one commit. Every other tile runs ``default_loop``, the C-ring
+    loop, whose stores never touch the A ring. ``acc_rhs`` is the identity
+    epilogue's conversion of ``names.rounds.trs_racc``.
+    """
+    r = names.rounds
+    assert r.trs_racc in acc_rhs, (r.trs_racc, acc_rhs)
+    body = [
+        (
+            f"{names.smem_layout} = cutlass.utils.blackwell_helpers.make_smem_layout_epi("
+            f"{r.target_dtype}, {names.d_store_layout}, {names.epi_tile}, {names.subtile_count})"
+        ),
+        (
+            f"{names.smem} = cute.make_tensor(cute.recast_ptr({names.staging_smem}, "
+            f"{names.smem_layout}.inner, dtype={r.target_dtype}), {names.smem_layout}.outer)"
+        ),
+        # (the C ring's R2S copy: CuTe builds it from the T2R copy and the
+        # register tile alone, so only the SMEM partition is new)
+        (
+            f"{names.trs_sd} = {r.tiled_copy_r2s}.get_slice({names.epi_tidx})"
+            f".partition_D({names.smem})"
+        ),
+        (
+            f"{names.bsg_sd}, _ = cute.nvgpu.cpasync.tma_partition("
+            f"{r.tma_store_atom}, 0, cute.make_layout(1), cute.group_modes({names.smem}, 0, 2), "
+            f"cute.group_modes({names.tcgc_epi}, 0, 2))"
+        ),
+        f"for _tcgen05_subtile in cutlass.range({names.subtile_count}, unroll_full=True):",
+        "    if _tcgen05_subtile == 0:",
+        f"        {r.acc_pipeline}.consumer_wait({r.acc_consumer_state})",
+        f"    {r.ttr_tacc_mn} = {r.ttr_tacc}[(None, None, None, cutlass.Int32(_tcgen05_subtile))]",
+        f"    cute.copy({r.tiled_copy_t2r}, {r.ttr_tacc_mn}, {r.ttr_racc})",
+        f"    {r.acc_vec} = {acc_rhs}",
+        f"    if _tcgen05_subtile == {names.subtile_count} - 1:",
+        "        cute.arch.fence_view_async_tmem_load()",
+        "        with cute.arch.elect_one():",
+        f"            {r.acc_pipeline}.consumer_release({r.acc_consumer_state})",
+        f"    {r.trs_rd}.store({r.acc_vec})",
+        (
+            f"    cute.copy({r.tiled_copy_r2s}, {r.trs_rd}, "
+            f"{names.trs_sd}[(None, None, None, cutlass.Int32(_tcgen05_subtile))])"
+        ),
+        "cute.arch.fence_view_async_shared()",
+        f"{r.epilog_sync_barrier}.arrive_and_wait()",
+        f"if {r.epi_leader_predicate}:",
+        f"    for _tcgen05_subtile in cutlass.range({names.subtile_count}, unroll_full=True):",
+        (
+            f"        cute.copy({r.tma_store_atom}, {names.bsg_sd}[(None, cutlass.Int32(_tcgen05_subtile))], "
+            f"{r.bsg_gd}[(None, cutlass.Int32(_tcgen05_subtile))]{r.tma_desc_arg})"
+        ),
+        f"    {r.c_pipeline}.producer_commit()",
+    ]
+    return (
+        f"if not {names.last_tile_next_work}.is_valid_tile:\n"
+        + "".join(f"    {line}\n" for line in body)
+        + "else:\n"
+        + textwrap.indent(default_loop, "    ")
+    )

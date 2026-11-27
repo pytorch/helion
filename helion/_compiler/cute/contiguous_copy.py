@@ -331,6 +331,29 @@ class _Analysis:
                     return delta if delta in (0, 1) else None
         return None
 
+    def _conjuncts(self, value: ast.expr) -> Sequence[ast.expr]:
+        if isinstance(value, ast.BoolOp) and isinstance(value.op, ast.And):
+            return value.values
+        if isinstance(value, ast.BinOp) and isinstance(value.op, ast.BitAnd):
+            # A shifted tile can have several bounds joined with bitwise &.
+            # They form a conjunction only when every leaf is Boolean.
+            parts = []
+            pending: list[ast.expr] = [value]
+            seen = set()
+            while pending:
+                part = self.resolve(pending.pop())
+                if part in seen:
+                    continue
+                seen.add(part)
+                if isinstance(part, ast.Compare):
+                    parts.append(part)
+                elif isinstance(part, ast.BinOp) and isinstance(part.op, ast.BitAnd):
+                    pending.extend((part.right, part.left))
+                else:
+                    return ()
+            return parts
+        return ()
+
     def interval(self, value: ast.expr) -> bool:
         value = self.resolve(value)
         if value not in self._intervals:
@@ -340,8 +363,8 @@ class _Analysis:
     def _interval(self, value: ast.expr) -> bool:
         if not self.depends(value):
             return True
-        if isinstance(value, ast.BoolOp) and isinstance(value.op, ast.And):
-            return all(self.interval(part) for part in value.values)
+        if parts := self._conjuncts(value):
+            return all(self.interval(part) for part in parts)
         if isinstance(value, ast.Compare):
             arguments = [value.left, *value.comparators]
             if not all(
@@ -436,8 +459,8 @@ class _Analysis:
     def _packet_uniform_predicate(self, value: ast.expr) -> bool:
         if not self.depends(value):
             return True
-        if isinstance(value, ast.BoolOp) and isinstance(value.op, ast.And):
-            return all(self.packet_uniform_predicate(part) for part in value.values)
+        if parts := self._conjuncts(value):
+            return all(self.packet_uniform_predicate(part) for part in parts)
         if isinstance(value, ast.Compare):
             pairs = list(itertools.pairwise([value.left, *value.comparators]))
             operators = list(value.ops)
@@ -480,8 +503,8 @@ class _Analysis:
     def _predicate_direction(self, value: ast.expr) -> int | None:
         if not self.depends(value):
             return 0
-        if isinstance(value, ast.BoolOp) and isinstance(value.op, ast.And):
-            directions = {self.predicate_direction(part) for part in value.values}
+        if parts := self._conjuncts(value):
+            directions = {self.predicate_direction(part) for part in parts}
         else:
             if isinstance(value, ast.Compare):
                 pairs = list(itertools.pairwise([value.left, *value.comparators]))

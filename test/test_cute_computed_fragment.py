@@ -37,6 +37,9 @@ from helion._testing.cute_fragment_arena import (
 from helion._testing.cute_fragment_branch_lifetimes import branch_scans
 from helion._testing.cute_fragment_layout import _fragment_singleton_scan
 from helion._testing.cute_fragment_loop_captures import loop_tensor_bound
+from helion._testing.cute_fragment_simulator import (
+    simulate_independent_fragment as _simulate_independent_fragment,
+)
 from helion._testing.cute_output_addresses import generated_output_address_coverage
 from helion._testing.cute_repeated_axes import full_slice_add
 from helion._testing.cute_repeated_axes import full_slice_row_sum
@@ -560,6 +563,7 @@ def _fragment_extent_fixture(rows_per_block, columns_per_block):
         for i, (symbol, numel) in enumerate(zip(symbols, numels, strict=True))
     ]
     compiler = object.__new__(FragmentCompiler)
+    compiler.checked_root = False
     compiler.df = SimpleNamespace(
         resolved_block_size=lambda block_id: configured[block_id], literal_expr=str
     )
@@ -579,6 +583,7 @@ def _fragment_extent_fixture(rows_per_block, columns_per_block):
     return compiler, host, rows, columns, parts
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(
     "rows_per_block,columns_per_block", [(8, 16), (16, 32), (32, 64), (16, 128)]
 )
@@ -604,6 +609,7 @@ def test_fragment_configured_extents_preserve_coordinate_geometry(
         assert compiler.extent(FloorDiv(columns + 64, columns)) == expected_parts
 
 
+@pytest.mark.cpu_only
 def test_fragment_configured_extents_preserve_dynamic_symbols_and_reject_cycles():
     compiler, host, rows, columns, parts = _fragment_extent_fixture(16, 32)
     dynamic = sympy.Symbol("dynamic", integer=True, positive=True)
@@ -1035,169 +1041,6 @@ def _fragment_existing_row_reduction(values: torch.Tensor):
     for row in hl.tile(values.size(0)):
         out[row] = values[row, :].amax(-1)
     return out
-
-
-def _simulate_independent_fragment(source, inputs, outputs, blocks):
-    """Execute generated fragment phases serially, preserving every coordinate.
-
-    Each fragment element loop visits all coordinates instead of one thread's
-    residue class. The barriers therefore delimit complete CPU phases. This
-    validates generated indexing/math, not native CUDA synchronization.
-    """
-    import operator
-
-    import numpy as np
-
-    packets = {"vector": 0, "scalar": 0}
-
-    class Pointer:
-        def __init__(self, tensor, offset=0):
-            self.tensor = tensor
-            self.offset = offset
-
-        def __add__(self, offset):
-            return Pointer(self.tensor, self.offset + int(offset))
-
-        def storage(self):
-            return self.tensor.as_strided(
-                (self.tensor.untyped_storage().nbytes() // self.tensor.element_size(),),
-                (1,),
-                storage_offset=0,
-            )
-
-        def align(self, alignment):
-            assert (
-                self.tensor.data_ptr() + self.offset * self.tensor.element_size()
-            ) % alignment == 0
-            return self
-
-        def load(self):
-            packets["scalar"] += 1
-            storage = self.storage()
-            offset = self.tensor.storage_offset() + self.offset
-            assert 0 <= offset < storage.numel()
-            return storage[offset].item()
-
-        def store(self, value):
-            storage = self.storage()
-            offset = self.tensor.storage_offset() + self.offset
-            assert 0 <= offset < storage.numel()
-            storage[offset] = value.item() if isinstance(value, np.generic) else value
-
-    class Shared:
-        def __init__(self, dtype, shape):
-            self.values = np.empty(math.prod(shape), dtype=dtype)
-            self.written = np.zeros(math.prod(shape), dtype=bool)
-
-        def __getitem__(self, index):
-            assert self.written[int(index)], f"read before shared write: {index}"
-            return self.values[int(index)]
-
-        def __setitem__(self, index, value):
-            self.values[int(index)] = value
-            self.written[int(index)] = True
-
-    class Allocator:
-        def allocate_tensor(self, dtype, layout, byte_alignment):
-            return Shared(dtype, layout)
-
-    def copy_packet(atom, source, destination):
-        assert atom == 128
-        assert destination.values.size == 4
-        assert (
-            source.iterator.tensor.data_ptr() + source.iterator.offset * 4
-        ) % 16 == 0
-        packets["vector"] += 1
-        for lane in range(4):
-            destination[lane] = (source.iterator + lane).load()
-
-    class SerialElements(ast.NodeTransformer):
-        def visit_For(self, node):
-            node = self.generic_visit(node)
-            if isinstance(node.target, ast.Name) and node.target.id.startswith(
-                ("fragment_index", "fragment_packet_index")
-            ):
-                assert isinstance(node.iter, ast.Call) and len(node.iter.args) == 3
-                node.iter.args[0] = ast.Constant(0)
-                node.iter.args[2] = ast.Constant(1)
-            return node
-
-    tree = ast.parse(source)
-    function = next(
-        node
-        for node in tree.body
-        if isinstance(node, ast.FunctionDef) and node.name.startswith("_helion_")
-    )
-    function.decorator_list = []
-    function = SerialElements().visit(function)
-    constants = [node for node in tree.body if isinstance(node, ast.Assign)]
-    for block in range(blocks):
-        environment = {
-            "operator": operator,
-            "_cute_python_mod": operator.mod,
-            "cutlass": SimpleNamespace(
-                Float32=np.float32,
-                Float64=np.float64,
-                Int32=int,
-                Int64=int,
-                Uint32=int,
-                Uint64=int,
-                Boolean=bool,
-                utils=SimpleNamespace(SmemAllocator=Allocator),
-            ),
-            "cute": SimpleNamespace(
-                math=SimpleNamespace(
-                    min=lambda a, b, propagate_nan=False: (
-                        np.minimum(a, b) if propagate_nan else np.fmin(a, b)
-                    ),
-                    max=lambda a, b, propagate_nan=False: (
-                        np.maximum(a, b) if propagate_nan else np.fmax(a, b)
-                    ),
-                    tanh=np.tanh,
-                ),
-                make_layout=lambda shape: shape,
-                make_rmem_tensor=lambda layout, dtype: Shared(dtype, layout),
-                make_tensor=lambda iterator, layout: SimpleNamespace(
-                    iterator=iterator, layout=layout
-                ),
-                make_copy_atom=lambda op, dtype, num_bits_per_copy: num_bits_per_copy,
-                nvgpu=SimpleNamespace(CopyUniversalOp=lambda: None),
-                copy=copy_packet,
-                arch=SimpleNamespace(
-                    thread_idx=lambda: (0, 0, 0),
-                    block_idx=lambda block=block: (block, 0, 0),
-                    sync_threads=lambda: None,
-                    fmax=lambda a, b, nan=False: (
-                        np.maximum(a, b) if nan else np.fmax(a, b)
-                    ),
-                    fmin=lambda a, b, nan=False: (
-                        np.minimum(a, b) if nan else np.fmin(a, b)
-                    ),
-                ),
-            ),
-        }
-        for name, tensor in (inputs | outputs).items():
-            if isinstance(tensor, torch.Tensor):
-                environment[name] = SimpleNamespace(
-                    iterator=Pointer(tensor),
-                    layout=SimpleNamespace(stride=tensor.stride()),
-                )
-            else:
-                environment[name] = tensor
-        exec(
-            compile(
-                ast.fix_missing_locations(
-                    ast.Module(body=[*constants, function], type_ignores=[])
-                ),
-                "<generated-fragment-cpu>",
-                "exec",
-            ),
-            environment,
-        )
-        environment[function.name](
-            *(environment[arg.arg] for arg in function.args.args)
-        )
-    return packets
 
 
 # Width pairs distinguish independent/equal reductions, row offsets exercise
@@ -7583,8 +7426,10 @@ def test_grid_row_loop_carries_native_values(block_sizes):
 
 
 @skipUnlessCuteAvailable("requires CuTe DSL")
-def test_mutable_tensor_bound_native_replay():
-    # One compiled shape replays zero, partial and full bounds in both orders.
+@pytest.mark.parametrize("bound_use", ["range", "carry", "readonly"])
+def test_mutable_tensor_bound_native_replay(bound_use):
+    # Each loop ABI replays zero, partial and full bounds: only a genuine
+    # read-only capture needs the original storage on every iteration.
     x = (torch.arange(3 * 17, device=DEVICE).reshape(3, 17) % 5).float()
     counts = torch.zeros(4, device=DEVICE, dtype=torch.int64)
     for count in (0, 1, 5, 17, 5, 0):
@@ -7592,7 +7437,10 @@ def test_mutable_tensor_bound_native_replay():
         expected = torch.cumsum(x, dim=-1)
         for iteration, begin in enumerate(range(0, count, 4)):
             increment = x[:, begin : min(begin + 4, count)].sum(-1, keepdim=True)
-            expected = torch.cumsum(expected + increment + count + iteration, dim=-1)
+            bump = {"carry": count + iteration, "readonly": count, "range": 0}[
+                bound_use
+            ]
+            expected = torch.cumsum(expected + increment + bump, dim=-1)
         torch.testing.assert_close(
-            loop_tensor_bound(x, counts), expected, rtol=0, atol=0
+            loop_tensor_bound(x, counts, bound_use), expected, rtol=0, atol=0
         )

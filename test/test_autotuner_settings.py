@@ -96,6 +96,18 @@ class TestWorkerStartTimeoutSetting(TestCase):
             self.assertIsNone(Settings().autotune_worker_start_timeout)
 
 
+class TestSplitKReductionSetting(TestCase):
+    @pytest.mark.cpu_only
+    def test_defaults_to_fp32_partials(self) -> None:
+        # Helion's own default: split-K searched, its partials summed in fp32.
+        with without_env_var("HELION_SPLIT_K_REDUCTION"):
+            self.assertEqual(Settings().split_k_reduction, "accumulator")
+        with patch.dict(os.environ, {"HELION_SPLIT_K_REDUCTION": "none"}):
+            self.assertEqual(Settings().split_k_reduction, "none")
+        with self.assertRaisesRegex(ValueError, "split_k_reduction must be one of"):
+            Settings(split_k_reduction="fp32")
+
+
 class _NarrowingSearch(BaseSearch):
     """A search that narrows the compile deadline, as
     ``set_adaptive_compile_timeout`` does, then picks the default config or,

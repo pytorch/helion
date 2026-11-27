@@ -76,8 +76,8 @@ def test_integer_fill_task_bound_preserves_hoisted_execution() -> None:
             block_size=1,
             inner_tasks=1,
             variant_names=frozenset({"virtual_pid"}),
-            read_only_tensors=frozenset(),
-            tensor_names=frozenset(),
+            read_only=frozenset(),
+            allocations={},
         )
 
     result = extent(ast.parse(source).body)
@@ -192,6 +192,47 @@ def test_a_grid_index_span_keys_its_readers() -> None:
         code = kernel.bind((torch.empty(128),)).to_triton_code(config)
     assert "tile_dependency_root_barrier" not in code, code
     assert re.search(r"tile_dependency_continuation_task = .* // 2\n", code), code
+
+
+def _merge_then_gemv(
+    att: torch.Tensor, o: torch.Tensor, w: torch.Tensor
+) -> torch.Tensor:
+    out = torch.empty([o.size(0), w.size(0)], dtype=torch.float32, device=o.device)
+    heads = o.view(o.size(0), att.size(0), att.size(2), att.size(3))
+    for tile_g, tile_t in hl.tile([att.size(0), att.size(1)], block_size=[1, 1]):
+        heads[tile_t.begin, tile_g.begin, :, :] = att[tile_g.begin, tile_t.begin].to(
+            o.dtype
+        )
+    for tile_n in hl.tile(w.size(0), block_size=64):
+        acc = hl.zeros([tile_n, o.size(0)], dtype=torch.float32)
+        for tile_k in hl.tile(o.size(1), block_size=128):
+            acc = hl.dot(w[tile_n, tile_k], o[:, tile_k].permute(1, 0), acc=acc)
+        out[:, tile_n] = acc.permute(1, 0)
+    return out
+
+
+@skipUnlessBackends(["triton"])
+@skipIfTileIR("TileIR does not support barrier operations")
+@skipIfRefEager("tile dependencies are built only in compiled mode")
+def test_a_one_key_counter_keeps_its_producer_inline() -> None:
+    """The K loop reads every head the merge writes: its wait is one counter of
+    all 16 merge tasks. Publishing it is one address, like a root arrival, so
+    the merge's single-trip task stays inline (a noinline call costs the whole
+    kernel registers)."""
+    args = (
+        torch.empty(2, 8, 8, 128),
+        torch.empty(8, 2048, dtype=torch.bfloat16),
+        torch.empty(1024, 2048, dtype=torch.bfloat16),
+    )
+    for pipeline in ("static", "dynamic"):
+        config = helion.Config(
+            pid_type="persistent_blocked", cross_loop_pipeline=pipeline
+        )
+        with cuda_metadata_trace():
+            kernel = helion.kernel(_merge_then_gemv, static_shapes=True)
+            code = kernel.bind(args).to_triton_code(config)
+        assert "tile_dependency_nested_loop_wait" in code, code
+        assert "noinline=True" not in code, code
 
 
 def _domain(
@@ -1687,6 +1728,37 @@ class TestCrossLoopScheduler(TestCase):
         self.assertEqual(
             {allocations[dependency] for dependency, *_ in plan.barrier_reasons}, {1}
         )
+
+    def test_counter_drops_a_producer_whose_barrier_its_consumer_waits_on(
+        self,
+    ) -> None:
+        # Root 2 reads roots 0 and 1 exactly, and root 1 also inexactly: the
+        # barrier 1->2 orders every task of root 1 before root 2, so only root
+        # 0 arrives on root 2's counter.
+        graph = _dependency_graph(
+            [[10], [20], [30]],
+            _access(root=0, kind="store", block_id=10),
+            _access(root=1, kind="store", block_id=20, allocation_id=1),
+            _access(root=1, kind="store", block_id=20, allocation_id=2, exact=False),
+            _access(root=2, kind="load", block_id=30),
+            _access(root=2, kind="load", block_id=30, allocation_id=1),
+            _access(root=2, kind="load", block_id=30, allocation_id=2, exact=False),
+        )
+        roots, sites = instantiate_coordinate_domains(
+            graph, axis_geometry={10: (4, 16), 20: (4, 16), 30: (4, 16)}
+        )
+        assert all(root is not None for root in roots)
+        root_domains = tuple(root for root in roots if root is not None)
+        plan = build_static_pipeline_plan(
+            dependency_graph=graph,
+            root_task_orders=tuple(_dense(root) for root in root_domains),
+            site_domains=sites,
+            worker_count=4,
+        )
+        self.assertEqual(plan.root_barrier_edges, frozenset(((1, 2),)))
+        (counter,) = plan.readiness_counters
+        self.assertEqual([p.producer_root for p in counter.producers], [0])
+        self.assertEqual(counter.uniform_arrival_count(), 1)
 
     def test_exact_all_to_all_barrier_reason(self) -> None:
         # The consumer's one task reads every producer task's tile: one total

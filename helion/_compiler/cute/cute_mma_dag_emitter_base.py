@@ -1592,9 +1592,11 @@ class MmaDagEmitterBase:
         pred: str | None = None,
         *,
         readonly: bool = False,
+        pred_hi: str | None = None,
     ) -> tuple[str, str]:
         """Two adjacent elements widened to fp32 or int32 scalars (zeros
-        under a false Int32 ``pred``)."""
+        under a false Int32 ``pred``). ``pred_hi``: the second element's own
+        predicate where the two load singly (``pair_preds``)."""
         lo, hi = self.df.new_var("md_lo"), self.df.new_var("md_hi")
         suffix = "" if pred is None else "_pred"
         args = _load_args(address, pred, readonly)
@@ -1603,8 +1605,9 @@ class MmaDagEmitterBase:
             self.emit(
                 f"{lo} = {self.scalar_load(address, dtype, pred, readonly=readonly)}"
             )
+            hi_pred = pred if pred_hi is None else pred_hi
             self.emit(
-                f"{hi} = {self.scalar_load(f'{address} + {dtype.itemsize}', dtype, pred, readonly=readonly)}"
+                f"{hi} = {self.scalar_load(f'{address} + {dtype.itemsize}', dtype, hi_pred, readonly=readonly)}"
             )
         elif dtype == torch.float32:
             self.emit(f"{lo}, {hi} = {_RUNTIME}.ldg_v2_f32{suffix}({args})")
@@ -1838,6 +1841,13 @@ class MmaDagEmitterBase:
         """The DSL Boolean saying tile-local ``coord`` of ragged ``axis`` is
         a row the CTA owns: below the block when the fragment is padded
         past it, inside the extent when the block does not divide it."""
+        if axis.kind == AXIS_RDIM:
+            # A padded row (a K of 49 on a 64-wide row) starts at 0 in every
+            # CTA. The guard below would read the CTA's base along the axis,
+            # which a full slice has none of:
+            #     md_zf = cutlass.Int32(16) if md_a3 + md_pr4 < 49 else cutlass.Int32(0)
+            #     NameError: name 'md_a3' is not defined
+            return f"({coord} < {axis.extent})"
         block = self.plan.block(axis)
         terms = []
         if block < self.plan.size(axis):

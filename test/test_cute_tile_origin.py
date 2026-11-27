@@ -9,14 +9,18 @@ from types import SimpleNamespace
 from typing import TYPE_CHECKING
 from unittest.mock import patch
 
+import numpy as np
 import pytest
 import torch
 
 import helion
 from helion._testing import import_example
+from helion._testing import skipIfRefEager
 from helion._testing import skipUnlessBackends
+from helion._testing.cute_codegen import cpu_bind
 from helion._testing.cute_codegen import cpu_target
 from helion._testing.cute_codegen import stage_sources
+from helion._testing.cute_thread_simulator import execute_pointwise_thread_program
 import helion.language as hl
 from helion.language import _decorators
 from helion.language import tile_ops
@@ -324,3 +328,96 @@ def test_materialized_interleave_keeps_every_source_row(
         # The interleave's arange uses tile.begin plus the local coordinate;
         # both packed nibbles must return to this same logical input row.
         assert all(origin + index - offset == index for index, origin in records)
+
+
+@pytest.mark.parametrize(
+    "start, stop, pid",
+    [
+        (0, 2**31 - 1, (2**31 - 2) // 4),
+        (2**63 - 3, 2**63 - 1, 0),
+        (-(2**63), -(2**63) + 2, 0),
+    ],
+)
+def test_masked_exclusive_tile_end_preserves_signed_bounds(start, stop, pid):
+    @helion.kernel(backend="cute", static_shapes=True)
+    def edge(out, lo: hl.constexpr, hi: hl.constexpr):
+        for tile in hl.tile(lo, hi, block_size=4):
+            out[0] = tile.end
+
+    source = cpu_bind(edge, (torch.zeros(1, dtype=torch.int64), start, stop)).to_code(
+        helion.Config(block_sizes=[])
+    )
+    tree = ast.parse(source)
+    device = next(
+        n
+        for n in tree.body
+        if isinstance(n, ast.FunctionDef) and n.name.startswith("_helion_")
+    )
+    # Evaluate only the final tile's generated scalar assignments. No allocation
+    # or launch scales with these boundary coordinates.
+    assignments = [n for n in [*tree.body, *device.body] if isinstance(n, ast.Assign)]
+    scope = {
+        "cutlass": SimpleNamespace(Int32=np.int32, Int64=np.int64),
+        "cute": SimpleNamespace(
+            arch=SimpleNamespace(
+                block_idx=lambda: (pid, 0, 0), thread_idx=lambda: (0, 0, 0)
+            )
+        ),
+    }
+    with np.errstate(over="raise"):
+        exec(compile(ast.Module(assignments, []), "<tile end>", "exec"), scope)
+    assert int(scope["tile_end"]) == stop
+
+
+@skipIfRefEager("executes a compiled nested CuTe loop")
+@pytest.mark.parametrize(
+    ("dtype", "start"), [(torch.int8, 126), (torch.int16, 32766), (torch.int64, 126)]
+)
+def test_device_tile_coordinates_use_the_induction_width(dtype, start):
+    @helion.kernel(backend="cute", index_dtype=dtype)
+    def gather(x, ids, out, lo, hi):
+        for row in hl.grid(2):
+            for t in hl.tile(lo, hi, block_size=4):
+                selected = torch.gather(x[row, t], 0, ids[row, t])
+                lane = t.index - t.begin
+                out[row, lane] = selected + lane.float()
+        return out
+
+    x = torch.tensor([[7.0], [9.0]])
+    ids = torch.tensor([[0], [3]])
+    out = torch.empty(2, 4)
+    code = cpu_bind(gather, (x, ids, out, start, start + 4)).to_code(
+        helion.Config(block_sizes=[])
+    )
+    # Cross the narrow signed boundary, then start beyond it. The latter
+    # also checks that the subtraction keeps the width of both coordinates.
+    for lo in (start, start + 4):
+        got, _ = execute_pointwise_thread_program(code, (x, ids, out, lo, lo + 4))
+        torch.testing.assert_close(got, x + torch.arange(4))
+
+
+def test_computed_fragment_clips_the_padded_end_before_signed_overflow():
+    @helion.kernel(backend="cute", static_shapes=True)
+    def scan(x, out, edge, lo: hl.constexpr, hi: hl.constexpr):
+        for row in hl.grid(1):
+            for tile in hl.tile(lo, hi, block_size=4):
+                out[row, :] = torch.cumsum(x[row, :] + 1, dim=0)
+                edge[row] = tile.end
+
+    hi = 2**63 - 1
+    lo = hi - 2
+    x = torch.ones((1, 2), dtype=torch.int64)
+    edge = torch.zeros(1, dtype=torch.int64)
+    source = cpu_bind(scan, (x, x.clone(), edge, lo, hi)).to_code(helion.Config())
+    (value,) = [
+        node.args[0]
+        for node in ast.walk(ast.parse(source))
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "store"
+        and any(isinstance(n, ast.Name) and n.id == "edge" for n in ast.walk(node.func))
+    ]
+    # Replay only the edge store at its one reached coordinate.
+    scope = {"fragment_tile": np.int64(lo), "cutlass": SimpleNamespace(Int64=np.int64)}
+    with np.errstate(over="raise"):
+        assert eval(ast.unparse(value), scope) == hi

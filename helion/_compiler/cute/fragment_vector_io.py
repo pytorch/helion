@@ -12,9 +12,9 @@ addresses at run time), the packet here is proved at compile time:
   starting at an aligned base stays aligned),
 * the base pointer is 16-byte aligned (an input's specialized residue or a
   fresh wrapper allocation with a static storage offset),
-* the innermost index is a full slice, a tile whose block size is a packet
-  multiple, or an ``hl.arange`` window starting at a packet multiple, over a
-  static extent that is a packet multiple,
+* the innermost index is a full slice, a tile whose block size and both
+  interval bounds are packet multiples, or an ``hl.arange`` window starting
+  at a packet multiple, over a static extent that is a packet multiple,
 
 so one address and one predicate per packet are exact for all of its lanes.
 Everything else keeps the scalar element walk.
@@ -147,6 +147,14 @@ def row_packet_lanes(
                 return None
             block_size = compiler.df.resolved_block_size(block)
             if not isinstance(block_size, int) or block_size % lanes:
+                return None
+            # A root or nested tile starts at begin + i * block_size. The
+            # predicate tests only the first lane, so neither edge may cut a packet.
+            bounds = compiler.tile_intervals.get(compiler.offsets[block])
+            if bounds is None:
+                return None
+            begin, end = bounds
+            if not 0 <= begin <= end <= size or begin % lanes or end % lanes:
                 return None
             return lanes if block_size == shape[-1] else None
     return None

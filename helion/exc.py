@@ -125,9 +125,9 @@ class BarrierOnlyAllowedAtTopLevel(BaseError):
 class PdlPlacement(BaseError):
     message = (
         "PDL ops run on the host before the first top level device loop (entry) "
-        "or after the last one (exit); hl.pdl_wait() and hl.prefetch_code() only "
-        "at entry, and at most one hl.pdl_launch_dependents() between device "
-        "loops in a kernel."
+        "or after the last one (exit); hl.pdl_wait() only at entry, hl.prefetch_code() "
+        "before a top level device loop, and at most one hl.pdl_launch_dependents() "
+        "between device loops in a kernel."
     )
 
 
@@ -531,6 +531,20 @@ class TritonOptionUnavailable(BaseWarning):
     message = (
         "The config asks for the Triton option {0!r}, which this Triton build "
         "does not accept; the kernel runs without it."
+    )
+
+
+class ConfigRequestDropped(BaseWarning):
+    message = "The config asks for {0}, which this kernel drops: {1}."
+
+
+class RemoteReadWithoutProducer(BaseWarning):
+    message = (
+        "{0} reads another rank's copy of an allocation that no root of this "
+        "kernel stores ({1}): nothing orders the read after that rank's write, so "
+        "it may see the data before the write lands or after the next launch "
+        "overwrote it. Store the data in an earlier root of this kernel, e.g. a "
+        "publish root, or synchronize the ranks before the launch."
     )
 
 

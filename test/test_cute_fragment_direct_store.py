@@ -18,16 +18,15 @@ import re
 import pytest
 import torch
 
-from test.cute_population_contracts import tcgen05_mma_support
-from test.test_cute_fp32_dot import _batched_dot
-from test.test_cute_fp32_dot import _chunk_cumsum
-
 import helion
 from helion import exc
 from helion._testing import DEVICE
 from helion._testing import cpu_render_target
 from helion._testing import skipUnlessBackends
 from helion._testing.cute_codegen import cpu_bind
+from helion._testing.cute_codegen import tcgen05_mma_support
+from helion._testing.cute_fragment_kernels import batched_dot
+from helion._testing.cute_fragment_kernels import chunk_cumsum
 from helion.autotuner.config_fragment import BooleanFragment
 import helion.language as hl
 
@@ -40,7 +39,7 @@ MMA = "_helion_fragment_mma.mma_tf32("
 SYNC = "cute.arch.sync_threads()"
 PACKET = "fragment_mma_packet"
 PAIR = "num_bits_per_copy=64"
-pytestmark = skipUnlessBackends(["cute"])
+pytestmark = [pytest.mark.cpu_only, skipUnlessBackends(["cute"])]
 
 
 @helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
@@ -225,7 +224,7 @@ def _lane_loop(code: str) -> str:
 
 def test_the_stored_dot_writes_from_the_lanes(_cpu_only: None) -> None:
     g = torch.ones(4, 64, 128, dtype=torch.bfloat16)
-    bound = cpu_bind(_chunk_cumsum, (g,))
+    bound = cpu_bind(chunk_cumsum, (g,))
     simt = bound.to_code(_config(bound))
     tf32 = bound.to_code(_config(bound, **{DOT: "tf32_mma"}))
     vec = bound.to_code(_config(bound, **{DOT: "tf32_mma", VEC: True}))
@@ -262,7 +261,7 @@ def test_unproved_packets_store_scalars(_cpu_only: None) -> None:
     x = torch.ones(2, 24, 20)
     y = torch.ones(2, 20, 10)
     z = torch.ones(2, 24, 10)
-    bound = cpu_bind(_batched_dot, (x, y, z))
+    bound = cpu_bind(batched_dot, (x, y, z))
     code = bound.to_code(_config(bound, **{DOT: "tf32_mma", VEC: True}))
     loop = _lane_loop(code)
     assert PACKET not in loop and PAIR not in loop
@@ -350,7 +349,7 @@ def test_disjoint_accesses_between_the_dot_and_its_store_stay_direct(
 
 def test_split_k_keeps_the_staged_partials(_cpu_only: None) -> None:
     g = torch.ones(4, 64, 16, dtype=torch.bfloat16)
-    bound = cpu_bind(_chunk_cumsum, (g,))
+    bound = cpu_bind(chunk_cumsum, (g,))
     code = bound.to_code(
         _config(bound, **{DOT: "tf32_mma", VEC: True, SPLIT: True, THREADS: 512})
     )
@@ -367,7 +366,7 @@ def test_split_k_keeps_the_staged_partials(_cpu_only: None) -> None:
 
 def test_mma_rows_joins_the_search_surface(_cpu_only: None) -> None:
     g = torch.ones(4, 64, 128, dtype=torch.bfloat16)
-    bound = cpu_bind(_chunk_cumsum, (g,))
+    bound = cpu_bind(chunk_cumsum, (g,))
     spec = bound.config_spec
     assert spec.cute_fragment_mma_rows_root_ids
     assert isinstance(spec._flat_fields()[ROWS], BooleanFragment)
@@ -405,7 +404,7 @@ def test_mma_rows_joins_the_search_surface(_cpu_only: None) -> None:
 
 def test_mma_rows_hoists_the_a_words(_cpu_only: None) -> None:
     g = torch.ones(4, 64, 128, dtype=torch.bfloat16)
-    bound = cpu_bind(_chunk_cumsum, (g,))
+    bound = cpu_bind(chunk_cumsum, (g,))
     tiles = bound.to_code(_config(bound, **{DOT: "tf32_mma", VEC: True}))
     rows = bound.to_code(_config(bound, **{DOT: "tf32_mma", VEC: True, ROWS: True}))
     assert "fragment_mma_tile_row" not in tiles and "fragment_mma_step" in tiles
@@ -428,13 +427,14 @@ def test_mma_rows_hoists_the_a_words(_cpu_only: None) -> None:
     assert column_loop.count(PAIR) == 2
 
 
+@pytest.mark.cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize(("threads", "vec"), [(32, True), (128, False), (256, True)])
 def test_direct_stores_match_the_staged_tile(threads: int, vec: bool) -> None:
     torch.manual_seed(0)
     g = torch.randn(8, 64, 128, device=DEVICE, dtype=torch.bfloat16)
     knobs = {DOT: "tf32_mma", VEC: vec, THREADS: threads}
-    direct = _chunk_cumsum.bind((g,))
+    direct = chunk_cumsum.bind((g,))
     code = direct.to_code(_config(direct, **knobs))
     assert (PAIR in code) == vec and "fragment_index" not in _lane_loop(code)
     out = direct.compile_config(_config(direct, **knobs))(g)
@@ -446,6 +446,7 @@ def test_direct_stores_match_the_staged_tile(threads: int, vec: bool) -> None:
     torch.testing.assert_close(out, g.float().cumsum(1), rtol=1e-5, atol=1e-5)
 
 
+@pytest.mark.cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize("rows", [False, True])
 def test_accesses_between_the_dot_and_its_store_keep_program_order(
@@ -488,13 +489,14 @@ def test_accesses_between_the_dot_and_its_store_keep_program_order(
     torch.testing.assert_close(out, expected, rtol=1e-5, atol=1e-5)
 
 
+@pytest.mark.cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_scalar_direct_stores_match_reference() -> None:
     torch.manual_seed(0)
     x = torch.randn(3, 24, 20, device=DEVICE)
     y = torch.randn(3, 20, 10, device=DEVICE)
     z = torch.randn(3, 24, 10, device=DEVICE)
-    bound = _batched_dot.bind((x, y, z))
+    bound = batched_dot.bind((x, y, z))
     knobs = {DOT: "tf32_mma", VEC: True}
     code = bound.to_code(_config(bound, **knobs))
     assert PAIR not in code and _lane_loop(code).count(".store(") == 4
@@ -506,12 +508,13 @@ def test_scalar_direct_stores_match_reference() -> None:
     torch.testing.assert_close(out, x @ y + z, rtol=1e-2, atol=2e-2)
 
 
+@pytest.mark.cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize("threads", [32, 128])
 def test_row_walk_matches_the_tile_walk(threads: int) -> None:
     torch.manual_seed(0)
     g = torch.randn(8, 64, 128, device=DEVICE, dtype=torch.bfloat16)
-    bound = _chunk_cumsum.bind((g,))
+    bound = chunk_cumsum.bind((g,))
     knobs = {DOT: "tf32_mma", VEC: True, THREADS: threads}
     tiles = bound.compile_config(_config(bound, **knobs))(g)
     rows = bound.compile_config(_config(bound, **(knobs | {ROWS: True})))(g)
@@ -522,7 +525,7 @@ def test_row_walk_matches_the_tile_walk(threads: int) -> None:
     x = torch.randn(3, 24, 20, device=DEVICE)
     y = torch.randn(3, 20, 12, device=DEVICE)
     z = torch.randn(3, 24, 12, device=DEVICE)
-    bound = _batched_dot.bind((x, y, z))
+    bound = batched_dot.bind((x, y, z))
     tiles = bound.compile_config(_config(bound, **{DOT: "tf32_mma", THREADS: threads}))(
         x, y, z
     )

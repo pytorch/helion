@@ -67,6 +67,7 @@ from .compile_environment import _symint_free_symbols
 from .compile_environment import compute_symbolic_min_max
 from .compile_environment import warning
 from .container_identity import record_opaque_container_result
+from .device_assertion import device_assertion_context
 from .device_function import contains_only_block_size_symbols
 from .fragment_call import guard_fragment_call_input
 from .host_function import HostFunction
@@ -1082,9 +1083,8 @@ class TensorType(TypeInfo):
         inputs_consumed = 0
         output_sizes: list[int | torch.SymInt] = []
         env = CompileEnvironment.current()
-        tensor_indexers = [k.fake_value for k in keys if isinstance(k, TensorType)]
-        should_broadcast = env.should_broadcast_tensor_indexers(keys)
-        for k in keys:
+        group = env.tensor_indexer_broadcast_group(keys)
+        for position, k in enumerate(keys):
             if isinstance(k, LiteralType):
                 if isinstance(k.value, (int, torch.SymInt)):
                     inputs_consumed += 1
@@ -1163,12 +1163,10 @@ class TensorType(TypeInfo):
                 )
             elif isinstance(k, TensorType):
                 inputs_consumed += 1
-                if not should_broadcast:
+                if group is None:
                     output_sizes.extend(env.tensor_indexer_dims(k.fake_value))
-                elif k.fake_value is tensor_indexers[0]:
-                    output_sizes.extend(
-                        env.tensor_indexer_broadcast_shape(tensor_indexers)
-                    )
+                elif position == group[0]:
+                    output_sizes.extend(env.tensor_indexer_broadcast_shape(group[1]))
             elif k.contains_type(TileIndexType):
                 # Unwrap single-element containers so hl.tile([m]) works
                 # with multi-dim indexing (e.g. x[tile, :]).
@@ -2123,7 +2121,7 @@ class CallableType(LiteralType):
                         ),
                     )
                     if origin.is_host()
-                    else contextlib.nullcontext()
+                    else device_assertion_context(self.value, proxy_args, proxy_kwargs)
                 ):
                     result = _CheckForIndexCalls.retry_call(
                         self.value, proxy_args, proxy_kwargs

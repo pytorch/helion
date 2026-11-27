@@ -78,6 +78,9 @@ from .reduction_coordinates import physical_capture_axes
 from .reduction_coordinates import reduction_coordinate_proof
 from .repeated_block_ids import matmul_sum_collapse_nodes
 from .repeated_block_ids import scalar_repeated_block_id
+from .scalar_fragment_assertion import check_grid_count
+from .scalar_fragment_assertion import checked_range_domain
+from .scalar_fragment_assertion import requires_assertion_owner
 from .scalar_lowering import scalar_lowering_context
 from .scan_analysis import additive_scan_helper
 from .scan_analysis import completed_scan_plans
@@ -94,6 +97,7 @@ if TYPE_CHECKING:
     from ..device_ir import GraphInfo
     from ..generate_ast import GenerateAST
     from .fragment_domain import OwnershipMask
+    from .scalar_fragment_assertion import ScalarFragmentAssertionLowering
 
 
 class FragmentOps(GenerateASTFromInductor):
@@ -234,20 +238,6 @@ class FragmentCompiler(
     the general-purpose fragment emitters, plus the inductor-backed pointwise
     lowering of a fragment node."""
 
-    def convert(
-        self, expression: str, source: torch.dtype | None, dtype: torch.dtype
-    ) -> str:
-        """``expression``, of dtype ``source``, cast to ``dtype``: an integer
-        or a bool becomes a float as in the pointwise lowering
-        (``integer_to_float_expr``), where MLIR could fold an 8-bit float
-        conversion into it."""
-        converted = integer_to_float_expr(
-            expr_from_string(expression), dtype, source, self.cg.device_function
-        )
-        if converted is None:
-            return self.cast(expression, dtype)
-        return ast.unparse(converted)
-
     def pointwise_read(
         self,
         producer: object,
@@ -270,7 +260,16 @@ class FragmentCompiler(
         for name, source in zip(lowering.input_names, inputs, strict=True):
             value = values[source]
             if not isinstance(value, Fragment):
-                scalar = self.scalar(value)
+                tensor_dtypes = (
+                    tuple(
+                        operand.dtype
+                        for other in inputs
+                        if isinstance(operand := values[other], Fragment)
+                    )
+                    if self.checked_root
+                    else ()
+                )
+                scalar = self.value_scalar(value, tensor_dtypes)
                 value = Fragment((), torch.float32, lambda _, scalar=scalar: scalar)
             lookup[name] = (source, value)
         fake = cast("torch.Tensor", node.meta["val"])
@@ -884,6 +883,13 @@ class FragmentCompiler(
             return self.dot(node, values)
         if target is scan_ops._associative_scan:
             return self.scan(node, values)
+        if target is torch.ops.aten._assert_async.msg:
+            lowering = cast("ScalarFragmentAssertionLowering", node.meta["lowering"])
+            predicate = args[0]
+            if not isinstance(predicate, Fragment) or predicate.shape != ():
+                raise exc.BackendUnsupported("cute", lowering.requirement)
+            lowering.emit(self, predicate)
+            return None
         if target is inline_asm_ops.inline_asm_elementwise:
             assert isinstance(fake, torch.Tensor)
             asm, constraints, operands, dtype, _is_pure, _pack = args
@@ -936,16 +942,14 @@ class FragmentCompiler(
             block_id = self.env.resolve_block_id(args[0])
             assert block_id in self.offsets
             offset = self.offsets[block_id]
-            bound = self.bounds[block_id]
+            lane_mask = self.tile_lane_predicate(block_id)
             return Fragment(
                 self.shape(fake.shape),
                 fake.dtype,
                 lambda coords: self.convert(
                     f"({offset}) + ({coords[0]})", self.env.index_dtype, fake.dtype
                 ),
-                logical_domain=lambda coords: (
-                    f"({offset}) + ({coords[0]}) < ({bound})",
-                ),
+                logical_domain=lambda coords: (lane_mask(coords[0]),),
                 pure=True,
             )
         if target in (torch.ops.aten.fmin.default, torch.ops.aten.fmax.default):
@@ -1006,7 +1010,17 @@ class FragmentCompiler(
                 shape,
                 fake.dtype,
                 lambda _: self.convert(
-                    self.scalar(value),
+                    self.value_scalar(
+                        value,
+                        (fake.dtype,),
+                        # torch.tensor constructs a tensor from its input;
+                        # full and scalar_tensor perform scalar assignment.
+                        assignment_dtype=(
+                            None
+                            if target is _tracing_ops._constant_tensor
+                            else fake.dtype
+                        ),
+                    ),
                     value.dtype
                     if isinstance(value, Fragment)
                     else scalar_value_dtype(value),
@@ -1034,13 +1048,27 @@ class FragmentCompiler(
         if target is torch.ops.prims.iota.default:
             start = _resolve(node.kwargs.get("start", 0), values)
             step = _resolve(node.kwargs.get("step", 1), values)
+            # Widen the coordinate before multiplication if either the product
+            # or sum could wrap. Common small iotas keep narrow arithmetic.
+            wide = fake.dtype == torch.int64
+            if wide and isinstance(start, int) and isinstance(step, int):
+                last_delta = max(shape[0] - 1, 0) * step
+                wide = not all(
+                    -(1 << 31) <= v < (1 << 31)
+                    for v in (start, step, last_delta, start + last_delta)
+                )
+
+            def iota(coords: tuple[str, ...]) -> str:
+                coord = self.cast(coords[0], torch.int64) if wide else coords[0]
+                return self.cast(
+                    f"({self.scalar(start, wide=wide)}) + ({coord}) * ({self.scalar(step, wide=wide)})",
+                    fake.dtype,
+                )
+
             return Fragment(
                 shape,
                 fake.dtype,
-                lambda coords: self.cast(
-                    f"{self.scalar(start)} + ({coords[0]}) * {self.scalar(step)}",
-                    fake.dtype,
-                ),
+                iota,
                 pure=True,
                 affine=(start, step)
                 if len(shape) == 1
@@ -1082,9 +1110,7 @@ class FragmentCompiler(
                     if bid is None:
                         continue
                     if bid in self.offsets:
-                        masks.append(
-                            f"(({self.offsets[bid]}) + ({coord}) < ({self.bounds[bid]}))"
-                        )
+                        masks.append(self.tile_lane_predicate(bid)(coord))
                     elif self.env.block_sizes[bid].reduction:
                         masks.append(
                             f"(({coord}) < ({self.sym(self.env.block_sizes[bid].numel)}))"
@@ -1506,6 +1532,8 @@ def computed_fragment_supported(
 
     def needs_coordinates(node: Node) -> bool:
         nonlocal collapsed_nodes
+        if node.target is torch.ops.aten._assert_async.msg:
+            return True
         index = static_tensor_index(node)
         if index is not None and not shape_only_indices(*index):
             return True
@@ -1676,6 +1704,7 @@ def computed_fragment_supported(
         atomic_ops.atomic_add,
         matmul_ops.dot,
         scan_ops._associative_scan,
+        torch.ops.aten._assert_async.msg,
         inline_asm_ops.inline_asm_elementwise,
         creation_ops.full,
         torch.ops.aten.full.default,
@@ -1722,6 +1751,16 @@ def computed_fragment_supported(
         return False
     for info in graphs:
         for node in info.graph.nodes:
+            # StackTensor lowers its base as (example tensor, pointer table).
+            # The fragment address recipe expects a single FX tensor value.
+            if node.target in (memory_ops.load, memory_ops.store) and isinstance(
+                node.args[0], tuple
+            ):
+                if requires_assertion_owner(env.config_spec):
+                    raise exc.BackendUnsupported(
+                        "cute", "StackTensor memory in a computed fragment root"
+                    )
+                return False
             if is_ordered_selection(node):
                 arguments = ordered_selection_args(node)
                 if arguments is None:
@@ -2271,7 +2310,7 @@ def codegen_computed_fragment_root(cg: GenerateAST) -> bool:
 
     compiler = (
         conditional_attention_compiler(cg, graphs)
-        if not fragment_schedule_required
+        if not fragment_schedule_required and not requires_assertion_owner()
         else None
     ) or FragmentCompiler(cg, graphs)
     if compiler.df.config.get("cute_fragment_warp_producer_regions", False):
@@ -2363,9 +2402,26 @@ def codegen_computed_fragment_root(cg: GenerateAST) -> bool:
         ):
             raise exc.InvalidConfig("CTA-local atomics require scalar grid owners")
     compiler.begin()
+    count = 1
     for bid, info in grid.block_id_to_info.items():
         compiler.offsets[bid] = grid.strategy.grid_origin_var(bid)
+        if compiler.checked_root:
+            # A scalar root has width one even when its coordinate advances
+            # by a larger stride. A contiguous tiled root advances by its width.
+            width = compiler.df.resolved_block_size(bid)
+            domain = checked_range_domain(
+                compiler,
+                info.begin_expr,
+                info.grid_end_expr,
+                info.grid_step_expr if isinstance(width, int) and width == 1 else width,
+                root=True,
+            )
+            count *= max(1, len(domain))
+            compiler.checked_domains[compiler.offsets[bid]] = domain
         compiler.bounds[bid] = cast("str", info.end_var_name)
+        compiler.record_tile_interval(bid, info.begin_expr, info.end_expr)
+    if compiler.checked_root:
+        check_grid_count(compiler, count)
     body: list[ast.AST] = []
     with cg.set_statements(body):
         compiler.emit(f"{compiler.thread} = cutlass.Int32(cute.arch.thread_idx()[0])")
@@ -2378,7 +2434,8 @@ def codegen_computed_fragment_root(cg: GenerateAST) -> bool:
         compiler.warp_producer_recorder.lower(body)
     capacity = target_facts.per_cta_smem_capacity_bytes(compiler.env.device)
     required_owner = (
-        local_required
+        compiler.checked_root
+        or local_required
         or free_required
         or fragment_schedule_required
         or full_reduction_required
@@ -2476,6 +2533,10 @@ def codegen_computed_fragment_root(cg: GenerateAST) -> bool:
                 compiler.threads,
             )
         )
+    # A declined owner must not add unused step arguments or reject their
+    # values in the ordinary kernel's host wrapper.
+    cg.host_statements.extend(compiler.host_step_statements)
+    compiler.df.arguments.extend(compiler.host_step_arguments)
     cg.device_function.cute_state.lanes.owned_root_block_dims = (compiler.threads, 1, 1)
     compiler.emit_mma_preamble()
     allocations = compiler.allocations()

@@ -13,6 +13,8 @@ import copy
 import hashlib
 import importlib.util
 import json
+import os
+import sys
 from typing import TYPE_CHECKING
 
 from ..runtime.cute.structural_config import CuteStructuralConfig
@@ -39,11 +41,24 @@ def load_policy_module(path: Path, source: bytes) -> ModuleType:
     A same-size edit within a filesystem timestamp tick must not turn a new
     source digest into an old bytecode module. Legacy loading is unchanged.
     """
-    spec = importlib.util.spec_from_file_location("heuristic", path)
+    digest = hashlib.sha256(os.fsencode(path.resolve()) + b"\0" + source).hexdigest()
+    name = f"_helion_aot_heuristic_{digest}"
+    spec = importlib.util.spec_from_file_location(name, path)
     if spec is None or spec.loader is None:
         raise StructuralPolicyError("Cannot import policy-bearing AOT model")
     module = importlib.util.module_from_spec(spec)
-    exec(compile(source, str(path), "exec"), vars(module))
+    # Dataclasses and other decorators resolve their defining module at import
+    # time. The path and exact bytes distinguish independent saved models.
+    previous = sys.modules.get(name)
+    sys.modules[name] = module
+    try:
+        exec(compile(source, str(path), "exec"), vars(module))
+    except BaseException:
+        if previous is None:
+            del sys.modules[name]
+        else:
+            sys.modules[name] = previous
+        raise
     return module
 
 

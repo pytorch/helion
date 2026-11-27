@@ -1205,10 +1205,10 @@ class PallasBackend(Backend):
         sorted_args: list[Argument] | None,
         config: Config,
     ) -> list[tuple[int, int, int, int]] | None:
-        """Identify pl.ds() dims that may need padding and their block sizes.
+        """Identify tensor dimensions that may need padding and their block sizes.
 
-        Uses ``pallas_pad_info`` recorded during codegen to identify which
-        tensor dimensions use ``pl.ds()`` slicing, plus the one dummy row an
+        Uses ``pallas_pad_info`` recorded during codegen for root BlockSpecs
+        and explicit ``pl.ds()`` slices, plus the one dummy row an
         empty resident operand needs (see :meth:`_zero_row_resident_pad_info`).
 
         Returns ``[(arg_index, tensor_dim, block_size, extra_pad), ...]``

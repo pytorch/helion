@@ -10,11 +10,14 @@ import sympy
 import torch
 
 from helion._compiler.ast_extension import expr_from_string
+from helion._compiler.compile_environment import CompileEnvironment
+from helion._compiler.host_function import HostFunction
 from helion._compiler.pallas.dma import DmaTransfer
 from helion._compiler.pallas.dma import allocate_dma_resources
 from helion._compiler.pallas.dma import async_copy_statements
 from helion._compiler.pallas.vmem_scalar_load import classify_vmem_scalar_load
 from helion._compiler.pallas.vmem_scalar_load import emit_vmem_scalar_load
+from helion._compiler.variable_origin import TileEndOrigin
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -938,6 +941,25 @@ def _tile_pattern_code(
         for loop in loops
     ):
         return _ds_expr(state, block_id, tensor=tensor, tensor_dim=tensor_dim)
+
+    # Mosaic's CPU interpreter cannot discharge a ragged emit_pipeline DMA:
+    # its partial transfer size is a JAX tracer, not a concrete shape. Native
+    # TPU windows already handle their own tails; don't copy their operands.
+    if not CompileEnvironment.current().settings.pallas_interpret or not any(
+        isinstance(info.origin, TileEndOrigin) and info.origin.block_id == block_id
+        for info in HostFunction.current().expr_to_origin.values()
+    ):
+        return ":"
+    size = tensor.shape[tensor_dim]
+    width = state.device_function.resolved_block_size(block_id)
+    if (
+        isinstance(width, int)
+        and width > 1
+        and (not isinstance(size, int) or (size > width and size % width != 0))
+    ):
+        from helion.language.memory_ops import _record_pad_info
+
+        _record_pad_info(state, tensor, tensor_dim, block_id)
     return ":"
 
 

@@ -280,7 +280,7 @@ def _(
     from .._compiler.device_ir import DeviceIR
     from .._compiler.device_ir import HelperFunctionGraphInfo
     from .._compiler.device_ir import args_to_proxies
-    from .._compiler.device_ir import select_decomp_table
+    from .._compiler.device_ir import combine_decomp_table
     from .._compiler.helper_function import create_combine_function_wrapper
     from .._compiler.helper_function import extract_helper_function_name
 
@@ -324,7 +324,7 @@ def _(
         fake_inputs = [left_fake_tensor, right_fake_tensor]
 
     combine_graph = proxy_tensor.make_fx(
-        combine_fn, decomposition_table=select_decomp_table()
+        combine_fn, decomposition_table=combine_decomp_table()
     )(*fake_inputs).graph
     combine_graph_id = DeviceIR.current().add_graph(
         combine_graph,

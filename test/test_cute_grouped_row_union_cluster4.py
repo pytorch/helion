@@ -32,7 +32,8 @@ from helion._compiler.cute.grouped_row_union import GroupedRowUnionPlan
 from helion._compiler.cute.tcgen05.scheduler_pids import Tcgen05PersistentProgramIDs
 from helion._compiler.cute.tcgen05_config import facts
 from helion._compiler.cute.tcgen05_config import surface
-from helion._compiler.program_id import ProgramIDs
+from helion._compiler.program_id import FlatProgramIDs
+from helion._compiler.program_id import PIDInfo
 from helion._testing import cpu_render_target
 from helion.exc import BackendUnsupported
 from helion.exc import InvalidConfig
@@ -625,20 +626,17 @@ def test_physical_pid_maps_to_original_rows_and_columns(order):
     )
     plan = SimpleNamespace(row_union=union)
     extents = {17: groups, 23: m // 80, 31: n // 256}
+    axis_decoder = FlatProgramIDs(
+        pid_info=[PIDInfo(f"pid_{b}", "1", str(extents[b]), b) for b in order]
+    )
     strategy: Any = SimpleNamespace(
-        pid_info=[
-            SimpleNamespace(
-                block_id=b,
-                pid_var=f"pid_{b}",
-                pack=1,
-                pack_axis=0,
-                num_pids_expr=lambda *, is_device, value=extents[b]: str(value),
-            )
-            for b in order
-        ],
+        pid_info=axis_decoder.pid_info,
         _tcgen05_plan=lambda: plan,
+        # (no K-split cluster: ``tcgen05_cluster_split_k``)
+        _tcgen05_cluster_split_k=lambda: 1,
+        # (no fallback cluster: ``tcgen05_fallback_cluster``)
+        _tcgen05_fallback_cluster=lambda: False,
         _tcgen05_logical_m_coord_expr=lambda value: f"({value}) // 2",
-        pid_division_exprs=lambda state: None,
     )
     expression = (
         Tcgen05PersistentProgramIDs._tcgen05_linear_virtual_pid_from_coords_expr(
@@ -653,9 +651,7 @@ def test_physical_pid_maps_to_original_rows_and_columns(order):
             ast.Module(
                 body=[
                     *ast.parse("virtual = " + expression).body,
-                    *ProgramIDs._decompose_pid_to_statements(
-                        strategy, "virtual", state
-                    ),
+                    *axis_decoder._decompose_pid_to_statements("virtual", state),
                 ],
                 type_ignores=[],
             )
@@ -1347,7 +1343,7 @@ def test_tma_role_hoist_fails_closed_without_exactly_one_role_block():
     with patch.object(
         Tcgen05PersistentProgramIDs,
         "_tcgen05_plan",
-        return_value=SimpleNamespace(tma_warp_id=5),
+        return_value=SimpleNamespace(tma_warp_id=5, ab_load_warp_count=1),
     ):
         setup = [anchor, other, role]
         pids._hoist_tcgen05_tma_role_block(setup, anchor)

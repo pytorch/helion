@@ -635,7 +635,17 @@ class HelionTemplateBuffer(TemplateBuffer):
             fused_code = all_imports + finalized
             module = PyCodeCache.load(fused_code)
             compiled_fn = getattr(module, kernel_name)
-            return lambda *args: compiled_fn(*args, *extra_tensors), module.__file__
+
+            def kernel_fn(*args: object) -> object:
+                return compiled_fn(*args, *extra_tensors)
+
+            # The timers read how many kernels a call launches from the host
+            # function (benchmarking._launches_several_kernels), which this
+            # wrapper hides.
+            launches = getattr(compiled_fn, "_helion_cute_launches", None)
+            if launches is not None:
+                kernel_fn._helion_cute_launches = launches  # pyrefly: ignore[missing-attribute]
+            return kernel_fn, module.__file__
 
         return _compile_for_config
 

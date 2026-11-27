@@ -456,6 +456,9 @@ def deepseek_v3_moe_nvfp4_verify(
     # Each token's eight expert rows, weighted in top-k order, plus the shared.
     for final_tile_t, final_tile_n in hl.tile([rows, hidden], block_size=[1, None]):
         final_token = final_tile_t.begin
+        # The shared expert's output first: it is ready long before the routed
+        # rows (a task waits for what it reads in the order it reads it).
+        final_shared = shared_expert_output[final_token, final_tile_n]
         final_routed_values = routed_output[final_token, :, final_tile_n].to(
             torch.float32
         )
@@ -465,9 +468,9 @@ def deepseek_v3_moe_nvfp4_verify(
         final_routed_output = torch.sum(
             final_routed_values * final_routed_weights[:, None], dim=0
         ).to(torch.bfloat16)
-        output[final_token, final_tile_n] = (
-            final_routed_output + shared_expert_output[final_token, final_tile_n]
-        ).to(torch.bfloat16)
+        output[final_token, final_tile_n] = (final_routed_output + final_shared).to(
+            torch.bfloat16
+        )
     return (
         output,
         router_logits,

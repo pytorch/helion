@@ -737,6 +737,7 @@ class CompileEnvironment:
         settings: Settings,
         *,
         index_dtype: torch.dtype | None = None,
+        wide_empty_grid: bool = False,
         is_distributed: bool = False,
     ) -> None:
         from ..autotuner.config_spec import ConfigSpec
@@ -748,6 +749,7 @@ class CompileEnvironment:
         self.index_dtype: torch.dtype = (
             index_dtype or settings.index_dtype or torch.int32
         )
+        self.wide_empty_grid = wide_empty_grid
         self._is_distributed = is_distributed
         self.process_group_name = None
         self._backend = get_backend(settings.backend)
@@ -847,6 +849,11 @@ class CompileEnvironment:
         # Set while ``generate_ast`` regenerates a kernel whose gluon ring the
         # lowering rejected (``RingFallback``): the rejection's reason.
         self.ring_disabled: str | None = None
+        # Set while ``generate_ast`` regenerates a kernel whose ring's operand
+        # fills the lowering rejected (``RingFillFallback``): the reason.
+        self.ring_fills_disabled: str | None = None
+        # The warnings ``warn_dropped`` printed for this kernel.
+        self.dropped_requests: set[str] = set()
         self._dispatch_guards_enforced: contextvars.ContextVar[bool] = (
             contextvars.ContextVar(
                 f"helion_dispatch_guards_enforced_{id(self)}",
@@ -1071,8 +1078,10 @@ class CompileEnvironment:
         # The root a trigger between top-level loops precedes (it also stays in
         # ``pdl_exit``, where a kernel that cannot place it runs it).
         self.pdl_trigger_root: int | None = None
-        # hl.prefetch_code(): the kernel prefetches its native code into L2 at entry.
-        self.prefetch_code: bool = False
+        # hl.prefetch_code() calls (on targets whose code it can prefetch), in
+        # source order: None prefetches the kernel's native code into L2 at entry,
+        # a root index where the kernel reaches that top-level loop.
+        self.prefetch_code_sites: list[int | None] = []
 
     def warn_symbolic_fragment_domain(self) -> None:
         """Emit at most once per binding, subject to Python's warning filters."""
@@ -3024,37 +3033,34 @@ class CompileEnvironment:
         ]
 
     def should_broadcast_tensor_indexers(self, index: typing.Sequence[object]) -> bool:
-        """Check whether tensor indexers need broadcasting.
+        return self.tensor_indexer_broadcast_group(index) is not None
 
-        Args:
-            index: The full index list (may contain torch.Tensor or TensorType)
-        """
-        # Import here to avoid circular import
+    def tensor_indexer_broadcast_group(
+        self, index: typing.Sequence[object]
+    ) -> tuple[int, list[torch.Tensor]] | None:
+        """The first subscript position and the adjacent tensor indices sharing
+        output axes. A scalar alone or beside one vector adds no axes."""
         from .type_info import TensorType
 
-        positions = [
-            i for i, k in enumerate(index) if isinstance(k, (torch.Tensor, TensorType))
-        ]
-        tensors = [
-            k.fake_value if isinstance(k, TensorType) else k
-            for k in index
-            if isinstance(k, (torch.Tensor, TensorType))
-        ]
+        positions: list[int] = []
+        tensors: list[torch.Tensor] = []
+        for position, k in enumerate(index):
+            if isinstance(k, TensorType):
+                k = k.fake_value
+            if isinstance(k, torch.Tensor):
+                positions.append(position)
+                tensors.append(k)
 
-        if not tensors:
-            return False
+        if sum(t.ndim for t in tensors) <= 1:
+            return None
         # 1D tensors with block-size dims don't need broadcasting
         if all(
             t.ndim == 1 and self.get_block_id(t.size(0)) is not None for t in tensors
         ):
-            return False
-        # Single scalar or 1D tensor doesn't need broadcast handling
-        if len(tensors) == 1 and tensors[0].ndim <= 1:
-            return False
-        # Non-consecutive tensor indexers don't broadcast together
-        return len(positions) <= 1 or positions == list(
-            range(positions[0], positions[-1] + 1)
-        )
+            return None
+        if positions[-1] - positions[0] + 1 != len(positions):
+            return None
+        return positions[0], tensors
 
     def tensor_indexer_broadcast_shape(
         self, tensors: typing.Sequence[torch.Tensor]
@@ -4554,6 +4560,10 @@ class BlockSizeInfo:
                 env = CompileEnvironment.current()
                 # Refresh the var_to_val hint to match the resolved block size
                 hint = env.size_hint(size)
+                # An empty logical extent cannot replace a registered physical
+                # width: a later live tile may reuse this same block ID.
+                if hint == 0:
+                    return
                 shape_env_var_hints(env.shape_env)[self.symbol()] = sympy.Integer(hint)
                 with contextlib.suppress(KeyError):
                     # update the size hint now that we know the size
@@ -4776,6 +4786,21 @@ def warning(warning: exc.BaseWarning | type[exc.BaseWarning]) -> None:
         # operand staging copy), not one the user wrote.
         return
     print(f"WARNING[{type(warning).__name__}]: {warning.args[0]}", file=sys.stderr)
+
+
+def warn_dropped(key: str, value: object, reason: str) -> None:
+    """Warn (``exc.ConfigRequestDropped``) that codegen drops the config's
+    explicit request ``key=value``, once per kernel and reason (an autotune
+    search compiles its candidates into captured output).  Only in a kernel's
+    environment: ``ConfigSpec.normalize`` also runs outside it, and again in
+    it for codegen."""
+    if not CompileEnvironment.has_current():
+        return
+    dropped = exc.ConfigRequestDropped(f"{key}={value!r}", reason)
+    reported = CompileEnvironment.current().dropped_requests
+    if str(dropped) not in reported:
+        reported.add(str(dropped))
+        warning(dropped)
 
 
 def _symint_sympy_expr(x: torch.SymInt) -> sympy.Expr:

@@ -1712,35 +1712,53 @@ def _has_unspecialized_numeric_value(value: object) -> bool:
     return False
 
 
-def _resolve_index_dtype(
-    settings: Settings,
-    args: Sequence[object] | tuple[object, ...],
-) -> torch.dtype:
-    if (index_dtype := settings.index_dtype) is not None:
-        limit = torch.iinfo(index_dtype).max
-    else:
-        limit = _INT32_INDEX_LIMIT
-    over_limit = False
+# Both width helpers are linked by source into standalone AOT files.
+def _tensor_index_class(tensor: torch.Tensor, limit: int) -> int:
+    # Class 2 needs wide storage indexes; class 1 has no elements, but one
+    # dimension can still supply a live independent grid axis.
+    numel = tensor.numel()
+    if numel > limit:
+        return 2
+    return int(numel == 0 and any(s > limit for s in tensor.size()))
 
-    def _check(tensor: torch.Tensor) -> None:
-        nonlocal over_limit
-        if over_limit:
+
+def _dynamic_tensor_width_key(tensor: torch.Tensor, index_limit: int | None) -> int:
+    if index_limit is not None and index_limit >= 2**63 - 1:
+        return 0  # Every PyTorch dimension and numel fit, including symbolic ones.
+    # Automatic indexing uses Int64 for either kind of wide tensor. A fixed
+    # dtype distinguishes a wide empty grid from unrepresentable storage.
+    try:
+        width_class = _tensor_index_class(
+            tensor, 2**31 - 1 if index_limit is None else index_limit
+        )
+    except RuntimeError:  # unbacked SymInt
+        width_class = 2
+    return bool(width_class) if index_limit is None else width_class
+
+
+def _resolve_index_widths(
+    settings: Settings, args: Sequence[object]
+) -> tuple[torch.dtype, bool]:
+    dtype = settings.index_dtype
+    limit = _INT32_INDEX_LIMIT if dtype is None else torch.iinfo(dtype).max
+    width_class = 0
+
+    def check(tensor: torch.Tensor) -> None:
+        nonlocal width_class
+        if width_class == 2:
             return
         try:
-            over_limit = bool(tensor.numel() > limit)
+            width_class = max(width_class, _tensor_index_class(tensor, limit))
         except RuntimeError:  # unbacked SymInt
-            if index_dtype is None:
-                over_limit = True
+            if dtype is None:
+                width_class = 2
 
-    tree_map_only(torch.Tensor, _check, args)
-    # pyrefly: ignore [unbound-name]
-    if index_dtype is None:  # Auto-select when not provided
-        return torch.int64 if over_limit else torch.int32
-    if over_limit:
-        # pyrefly: ignore [unbound-name]
-        raise exc.InputTensorNumelExceedsIndexType(index_dtype=index_dtype)
-    # pyrefly: ignore [unbound-name]
-    return index_dtype
+    tree_map_only(torch.Tensor, check, args)
+    if dtype is None:
+        return (torch.int64 if width_class else torch.int32), False
+    if width_class == 2:
+        raise exc.InputTensorNumelExceedsIndexType(index_dtype=dtype)
+    return dtype, width_class == 1
 
 
 def _argument_device_is_fixed(args: Sequence[object]) -> bool:
@@ -3778,10 +3796,12 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
         # specialization cache key and CompileEnvironment gating; that keeps a
         # symmetric-memory call from ever aliasing a non-distributed compiled
         # kernel of the same shape. See GitHub issue #3024.
+        index_dtype, wide_empty_grid = _resolve_index_widths(self.kernel.settings, args)
         self._env = CompileEnvironment(
             _canonicalize_argument_device(_find_device(args)),
             self.kernel.settings,
-            index_dtype=_resolve_index_dtype(self.kernel.settings, args),
+            index_dtype=index_dtype,
+            wide_empty_grid=wide_empty_grid,
             is_distributed=is_distributed,
         )
         # The structural policy the traced IR will follow (None for backends
@@ -4041,6 +4061,11 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
         ]
         if settings.index_dtype is not None:
             parts.append(f"index_dtype={settings.index_dtype}")
+        if settings.split_k_reduction != "accumulator":
+            # The split-K forms a config may take: a printed config replays
+            # under the setting it was chosen under (helion.inductor emits
+            # split_k_reduction="output" under torch's default flags).
+            parts.append(f"split_k_reduction={settings.split_k_reduction!r}")
         # Resolved from the settings' backend: callers pass foreign Settings
         # and ``self`` may be None.
         parts.extend(get_backend(settings.backend).decorator_settings(settings))
@@ -5779,23 +5804,7 @@ def _concrete_tensor_key(fn: Kernel, obj: torch.Tensor) -> Hashable:
     static_indices = frozenset(si) if si is not None else _EMPTY_FROZENSET
     if fn.settings.static_shapes:
         return (obj.dtype, obj.size(), obj.stride(), static_indices)
-    bucketed = _bucketed_size(obj)
-    if fn.settings.index_dtype is None:
-        try:
-            needs_int64 = bool(obj.numel() > _INT32_INDEX_LIMIT)
-        except RuntimeError:
-            needs_int64 = True  # unbacked SymInt
-        return (
-            obj.dtype,
-            bucketed,
-            needs_int64,
-            static_indices,
-        )
-    return (
-        obj.dtype,
-        bucketed,
-        static_indices,
-    )
+    return _dynamic_tensor_key(fn, obj, static_indices)
 
 
 def _tensor_key(fn: Kernel, obj: torch.Tensor) -> Hashable:
@@ -5808,23 +5817,19 @@ def _tensor_key(fn: Kernel, obj: torch.Tensor) -> Hashable:
             _hashable_dims(obj.stride()),
             static_indices,
         )
+    return _dynamic_tensor_key(fn, obj, static_indices)
+
+
+def _dynamic_tensor_key(
+    fn: Kernel, obj: torch.Tensor, static_indices: frozenset[int]
+) -> Hashable:
+    dtype = fn.settings.index_dtype
     bucketed = _bucketed_size(obj)
-    if fn.settings.index_dtype is None:
-        try:
-            needs_int64 = bool(obj.numel() > _INT32_INDEX_LIMIT)
-        except RuntimeError:
-            needs_int64 = True  # unbacked SymInt
-        return (
-            obj.dtype,
-            bucketed,
-            needs_int64,
-            static_indices,
-        )
-    return (
-        obj.dtype,
-        bucketed,
-        static_indices,
-    )
+    if dtype is torch.int64:
+        # Tensor dimensions and total storage already fit signed Int64.
+        return (obj.dtype, bucketed, static_indices)
+    limit = None if dtype is None else torch.iinfo(dtype).max
+    return obj.dtype, bucketed, _dynamic_tensor_width_key(obj, limit), static_indices
 
 
 def _sequence_key(fn: Kernel, obj: Sequence) -> Hashable:

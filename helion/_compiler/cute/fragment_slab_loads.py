@@ -52,6 +52,7 @@ from ...language import memory_ops
 from ...language import view_ops
 from ..variable_origin import BlockSizeOrigin
 from ..variable_origin import GridOrigin
+from .emitters.memory_access import _cute_wrap_negative_index
 
 if TYPE_CHECKING:
     from ..compile_environment import CompileEnvironment
@@ -117,11 +118,19 @@ def static_window(
     extent = value.shape[0]
     if not isinstance(extent, int):
         return None
-    offset = 0
+    if value.dtype not in (torch.int32, torch.int64):
+        return None
+    shifts: list[int] = []
     current: object = node
     while True:
         current = resolve_capture(current, captures)
         if not isinstance(current, Node):
+            return None
+        intermediate = current.meta.get("val")
+        if (
+            not isinstance(intermediate, torch.Tensor)
+            or intermediate.dtype != value.dtype
+        ):
             return None
         if current.target is torch.ops.prims.iota.default:
             start = current.kwargs.get("start", 0)
@@ -132,7 +141,15 @@ def static_window(
                 and not isinstance(start, bool)
                 and step == 1
             ):
-                return start + offset, extent
+                # A mathematical interval describes the ATen window only if
+                # each intermediate (including a shared, non-varying window)
+                # stays representable. Otherwise keep the original index.
+                info = torch.iinfo(value.dtype)
+                for shift in (0, *reversed(shifts)):
+                    start += shift
+                    if start < info.min or start + extent - 1 > info.max:
+                        return None
+                return start, extent
             return None
         if (
             current.target
@@ -141,14 +158,15 @@ def static_window(
                 torch.ops.aten.add.Scalar,
             )
             and len(current.args) == 2
+            and current.kwargs.get("alpha", 1) == 1
         ):
             a, b = current.args
             if isinstance(a, Node) and isinstance(b, int) and not isinstance(b, bool):
-                offset += b
+                shifts.append(b)
                 current = a
                 continue
             if isinstance(b, Node) and isinstance(a, int) and not isinstance(a, bool):
-                offset += a
+                shifts.append(a)
                 current = b
                 continue
         return None
@@ -166,6 +184,7 @@ class ScalarLoad:
     tensor: str
     indices: tuple[sympy.Expr, ...]
     dtype: torch.dtype
+    """Operand dtype after promotion with the window vector."""
     node: Node = field(compare=False, hash=False, repr=False)
 
 
@@ -180,9 +199,10 @@ class SlabGroup:
     window_dim: int
     start: int
     extent: int
-    members: dict[Node, tuple[int, int]] = field(default_factory=dict)
+    members: dict[Node, tuple[int, int | None]] = field(default_factory=dict)
     """Member load -> ``(start, extent)`` along the window dimension
-    (``extent`` 0 for an integer constant index, which drops the dimension)."""
+    (``None`` for an integer index, which drops the dimension; zero for
+    an empty vector, which keeps the dimension but transfers no elements)."""
     offset: ScalarLoad | None = None
     """The runtime row offset the window dimension's static windows shift
     by (None: static windows at their own offsets)."""
@@ -193,7 +213,7 @@ class SlabGroup:
     """The staged slab, once the root materialized it."""
 
 
-def _uniform_expr(env: CompileEnvironment, proxy: object) -> sympy.Expr | None:
+def uniform_integer_expr(env: CompileEnvironment, proxy: object) -> sympy.Expr | None:
     """``proxy`` as a CTA-uniform integer expression: an int, or a SymInt
     whose symbols are grid tile begins (``tile.begin``), block sizes or host
     values (None: a data-dependent or otherwise unplaceable symbol)."""
@@ -223,6 +243,7 @@ def _uniform_expr(env: CompileEnvironment, proxy: object) -> sympy.Expr | None:
 def scalar_load(
     env: CompileEnvironment,
     node: object,
+    window: object,
     captures: Captures,
     graphs: list[GraphInfo],
 ) -> ScalarLoad | None:
@@ -242,6 +263,8 @@ def scalar_load(
     source = node.args[0]
     if not isinstance(source, Node) or source.target is not _tracing_ops._host_tensor:
         return None
+    vector = resolve_capture(window, captures)
+    vector = vector.meta.get("val") if isinstance(vector, Node) else None
     fake = source.meta.get("val")
     value = node.meta.get("val")
     if (
@@ -249,19 +272,29 @@ def scalar_load(
         or not isinstance(value, torch.Tensor)
         or value.ndim != 0
         or value.dtype not in (torch.int32, torch.int64)
+        or not isinstance(vector, torch.Tensor)
+        or vector.ndim != 1
+        or vector.dtype not in (torch.int32, torch.int64)
     ):
         return None
+    # Both add and lt promote their operands before computing. A 0-D int64
+    # table entry, for example, is converted to int32 for an int32 vector.
+    dtype = torch.result_type(vector, value)
     indices = cast("list[object]", node.args[1])
     if len(indices) != fake.ndim:
         return None
     exprs = []
-    for index in indices:
-        proxy = index.meta.get("val") if isinstance(index, Node) else index
-        expr = _uniform_expr(env, proxy)
+    for dim, index in enumerate(indices):
+        proxy = (
+            index.meta.get("val")
+            if isinstance(index, Node)
+            else _cute_wrap_negative_index(index, fake.shape[dim])
+        )
+        expr = uniform_integer_expr(env, proxy)
         if expr is None:
             return None
         exprs.append(expr)
-    return ScalarLoad(cast("str", source.args[0]), tuple(exprs), value.dtype, source)
+    return ScalarLoad(cast("str", source.args[0]), tuple(exprs), dtype, source)
 
 
 def runtime_window(
@@ -278,13 +311,14 @@ def runtime_window(
         not isinstance(node, Node)
         or node.target is not torch.ops.aten.add.Tensor
         or len(node.args) != 2
+        or node.kwargs.get("alpha", 1) != 1
     ):
         return None
     for first, second in (node.args, node.args[::-1]):
         window = static_window(second, captures)
         if window is None:
             continue
-        offset = scalar_load(env, first, captures, graphs)
+        offset = scalar_load(env, first, second, captures, graphs)
         if offset is not None:
             return offset, *window
     return None
@@ -330,7 +364,7 @@ def window_limit(
     ):
         return None
     window = static_window(node.args[0], captures)
-    limit = scalar_load(env, node.args[1], captures, graphs)
+    limit = scalar_load(env, node.args[1], node.args[0], captures, graphs)
     if window is None or limit is None:
         return None
     return window, limit
@@ -339,6 +373,7 @@ def window_limit(
 def _describe(
     env: CompileEnvironment,
     index: object,
+    dim_size: int | torch.SymInt,
     captures: Captures | None = None,
     graphs: list[GraphInfo] | None = None,
 ) -> tuple[str, object] | None:
@@ -351,6 +386,13 @@ def _describe(
     if isinstance(index, bool):
         return None
     if isinstance(index, int):
+        if index < 0:
+            size = _static_size(env, dim_size)
+            # A slab loads before the source access. If the coordinate is
+            # not known to be valid, keep the ordinary load's bounds guard.
+            if size is None or index < -size:
+                return None
+            index = _cute_wrap_negative_index(index, size)
         return ("const", index)
     if isinstance(index, Node):
         proxy = index.meta.get("val")
@@ -361,7 +403,7 @@ def _describe(
                 and proxy._sympy_() == env.block_sizes[block].var._sympy_()
             ):
                 return ("block", block)
-            expr = _uniform_expr(env, proxy)
+            expr = uniform_integer_expr(env, proxy)
             if expr is not None:
                 return ("uniform", expr)
             return None
@@ -422,10 +464,15 @@ def plan_slab_loads(
             fake = source.meta.get("val")
             if not isinstance(fake, torch.Tensor) or not fake.ndim:
                 continue
-            indices = [index for index in node.args[1] if index is not None]  # type: ignore[union-attr]
-            if len(indices) != fake.ndim:
+            indices = cast("list[object]", node.args[1])
+            # A newaxis consumes a result coordinate but no tensor coordinate;
+            # the ordinary load owns this mapping, not the slab view.
+            if len(indices) != fake.ndim or any(index is None for index in indices):
                 continue
-            described = [_describe(env, index, captures, graphs) for index in indices]
+            described = [
+                _describe(env, index, fake.shape[dim], captures, graphs)
+                for dim, index in enumerate(indices)
+            ]
             if any(item is None for item in described):
                 continue
             items = [item for item in described if item is not None]
@@ -516,7 +563,7 @@ def plan_slab_loads(
             continue
         offset = scalars.get((*key, "offset"))
         limit = scalars.get((*key, "limit"))
-        ranges: dict[Node, tuple[int, int]] = {}
+        ranges: dict[Node, tuple[int, int | None]] = {}
         total = 0
         for node, items in fresh:
             kind, value = items[dim]
@@ -524,7 +571,7 @@ def plan_slab_loads(
                 start, extent = cast("tuple[int, int]", value)
                 span = extent
             else:
-                start, extent, span = cast("int", value), 0, 1
+                start, extent, span = cast("int", value), None, 1
             if start < 0 or (offset is None and start + span > size):
                 # A window past the tensor (a tier guarded off by the chunk
                 # size) keeps its own masked walk.  (A runtime-offset window
@@ -532,10 +579,16 @@ def plan_slab_loads(
                 continue
             ranges[node] = (start, extent)
             total += span
-        if len(ranges) < 2:
+        if len(ranges) < 2 or not total:
             continue
-        slab_start = min(start for start, _ in ranges.values())
-        slab_end = max(start + max(extent, 1) for start, extent in ranges.values())
+        # An empty tensor owns no coordinates. Scalar indices own one.
+        occupied = [
+            (start, start + (1 if extent is None else extent))
+            for start, extent in ranges.values()
+            if extent != 0
+        ]
+        slab_start = min(start for start, _ in occupied)
+        slab_end = max(end for _, end in occupied)
         if slab_end - slab_start > total:
             # The union would move more than the windows do: keep them.
             continue

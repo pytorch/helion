@@ -1854,7 +1854,7 @@ def test_tail_split_matches_the_unsplit_grid(
     """``cute_flash_flex_tail_split``: the grid's last partial wave runs as
     split units merged in the kernel; the full waves run unsplit.  A grid
     of one full wave plus a tail the device's idle SMs hold eight times
-    (``8 * SMs // 8 + 16`` items: a ragged query length, a random table
+    (eight items per batch-head: a ragged query length, a random table
     mask with an empty row): within the merge's rounding of the unsplit
     grid (the unsplit units bitwise, the tail items within the split-KV
     tolerance), close to torch, repeat launches bitwise.  Both walk orders
@@ -1865,8 +1865,11 @@ def test_tail_split_matches_the_unsplit_grid(
     query length (the units' merge stores through the plain output view,
     which the TMA epilogue binds only for a ragged length otherwise)."""
     sm_count = torch.cuda.get_device_properties(DEVICE).multi_processor_count
-    # One full wave plus a tail of 8..16 items (eight pairs per batch-head).
-    bh_total = sm_count // 8 + 2
+    # One full wave plus a tail of at most 16 items (eight per batch-head)
+    # over the fewest even batch-heads past one wave, so head 1 (the empty
+    # row's) exists and the grouped heads pair up: 20 batch-heads on 148
+    # SMs (a tail of 12) and on 152 (a tail of 8).
+    bh_total = next(bh for bh in range(2, sm_count, 2) if 8 * bh > sm_count)
     heads = next(h for h in (4, 2, 1) if bh_total % h == 0)
     batch = bh_total // heads
     # GQA: half as many KV heads (the cursor walk's per-item rows and the
@@ -2105,7 +2108,9 @@ def test_tail_split_gqa_grid_replays_under_a_cuda_graph() -> None:
     of 4; a CUDA-graph capture of the launch (the workspace and its counters
     captured with it) replays the eager result bitwise, three times."""
     sm_count = torch.cuda.get_device_properties(DEVICE).multi_processor_count
-    bh_total = next(bh for bh in range(sm_count // 8 + 2, 4 * sm_count) if bh % 4 == 0)
+    # The fewest batch-heads in fours (two query heads per KV head) past one
+    # full wave of eight items each: 20 on 148 SMs and on 152.
+    bh_total = next(bh for bh in range(4, 4 * sm_count, 4) if 8 * bh > sm_count)
     args, block_mask, (q, k, v) = _tail_grid(2048 - 64, bh_total, 4, kv_heads=2)
     base = {**PAIR_DESC, cute_flash.FLASH_PERSISTENT_KEY: False}
     tail_fn, tail_cfg = _compile_flex(

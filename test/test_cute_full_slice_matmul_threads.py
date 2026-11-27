@@ -102,3 +102,61 @@ class TestCuteFullSliceMatmulThreads(TestCase):
                 block_sizes=[32],
                 num_threads=[16, 0, 0],
             )
+
+
+@helion.kernel(
+    backend="cute",
+    static_shapes=True,
+    autotune_effort="none",
+    cute_full_slice_matmul_tiling=True,
+)
+def _short_k_matmul(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    out = torch.empty([a.size(0), b.size(1)], dtype=a.dtype, device=a.device)
+    for tile_m, tile_n in hl.tile([a.size(0), b.size(1)]):
+        tmp0 = a[tile_m, :]
+        tmp1 = b[:, tile_n]
+        out[tile_m, tile_n] = torch.mm(tmp0, tmp1)
+    return out
+
+
+@onlyBackends(["cute"])
+class TestCuteFullSliceRank1Updates(TestCase):
+    """A 16-bit full slice of K at most 8 runs as unrolled rank-1 updates
+    (``full_slice_matmul.RANK1_MAX_K``); dyadic operands keep the fp32 sums
+    exact, so the result matches torch to the bit."""
+
+    def _operands(
+        self, k: int, dtype: torch.dtype, *, b_k_major: bool
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        generator = torch.Generator(device=DEVICE).manual_seed(k)
+        # 200 rows: a partial last row tile at every row block
+        a = torch.randint(-7, 8, (200, k), generator=generator, device=DEVICE)
+        b = torch.randint(-7, 8, (k, 384), generator=generator, device=DEVICE)
+        a, b = (a / 8).to(dtype), (b / 8).to(dtype)
+        return a, b.T.contiguous().T if b_k_major else b
+
+    def test_short_contractions_match_torch(self) -> None:
+        for dtype in (torch.bfloat16, torch.float16):
+            for k in (1, 8):
+                for b_k_major in (False, True):
+                    a, b = self._operands(k, dtype, b_k_major=b_k_major)
+                    code, out = code_and_output(_short_k_matmul, (a, b))
+                    self.assertIn("cute.math.fma(", code)
+                    torch.testing.assert_close(
+                        out, (a.float() @ b.float()).to(dtype), atol=0, rtol=0
+                    )
+
+    def test_rank1_updates_store_vectors_along_n(self) -> None:
+        a, b = self._operands(2, torch.bfloat16, b_k_major=False)
+        code, out = code_and_output(
+            _short_k_matmul,
+            (a, b),
+            block_sizes=[16, 256],
+            num_threads=[16, 32],
+            loop_orders=[[1, 0]],
+            cute_vector_widths=[1, 8],
+        )
+        self.assertIn("_cute_store_u16_vec(", code)
+        torch.testing.assert_close(
+            out, (a.float() @ b.float()).to(torch.bfloat16), atol=0, rtol=0
+        )

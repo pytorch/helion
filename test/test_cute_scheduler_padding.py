@@ -19,7 +19,14 @@ from helion._compiler.program_id import PIDInfo
 from helion._testing import DEVICE
 from helion._testing import skipUnlessCuteAvailable
 from helion._testing.cute_aux import cpu_codegen
+from helion._testing.cute_dense_tcgen05 import bf16_mm_args
+from helion._testing.cute_dense_tcgen05 import clc_fringe_config
+from helion._testing.cute_dense_tcgen05 import plain_mm_into
 import helion.language as hl
+
+# The code-generation tests bind on CPU; the runtime tests carry ``cuda`` and
+# ride the GPU lane.
+pytestmark = pytest.mark.cpu_only
 
 
 @helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
@@ -302,6 +309,95 @@ def test_clc_source_is_outside_static_padding_change(swizzle: int) -> None:
     assert code == old
 
 
+def _clc_config(swizzle: int) -> helion.Config:
+    return helion.Config.from_dict(
+        _config((0, 1), swizzle, True).config
+        | {
+            "block_sizes": [256, 128, 64],
+            "tcgen05_cluster_m": 2,
+            "tcgen05_persistence_model": "clc_persistent",
+        }
+    )
+
+
+@pytest.mark.parametrize("swizzle", [2, 4])
+def test_clc_scheduler_skips_swizzle_padding_codegen(swizzle: int) -> None:
+    """768x1280 on 256x128 CTA pairs: 3 x 10 clusters. At swizzle 4 the
+    scheduler lays out 12 N slots, so the CLC grid launches 3 x 12 clusters
+    and the scheduler warp publishes only clusters with an N tile below 10;
+    at swizzle 2 (no padding slot) the source keeps the unpadded grid and
+    the unguarded publish."""
+    args = (
+        torch.empty((768, 64), dtype=torch.bfloat16),
+        torch.empty((64, 1280), dtype=torch.bfloat16),
+        torch.empty((768, 1280), dtype=torch.bfloat16),
+    )
+    with cpu_codegen():
+        code = plain_mm_into._bind_isolated(args).to_code(_clc_config(swizzle))
+    tree = ast.parse(code)
+    publish_guards = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.If)
+        and ast.unparse(node.test).startswith("tcgen05_clc_cluster_bidy < ")
+    ]
+    launch = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call) and ast.unparse(node.func) == "_launcher"
+    )
+    grid = ast.unparse(launch.args[1])
+    if swizzle == 2:
+        assert not publish_guards
+        assert f"+ {swizzle} - 1) // {swizzle} * {swizzle}" not in grid
+        return
+    assert len(publish_guards) == 1, code
+    # The guard holds the whole publish and the throttle wait the TMA-load
+    # warp's per-tile arrival pairs with.
+    guarded = ast.unparse(publish_guards[0])
+    assert "producer_acquire" in guarded
+    assert "_cute_store_shared_remote_x4" in guarded
+    assert "tcgen05_clc_throttle_barrier.arrive_and_wait()" in guarded
+    # ... while the try_cancel query runs on every step.
+    assert "_cute_issue_clc_query_nomulticast" not in guarded
+    assert f"+ {swizzle} - 1) // {swizzle} * {swizzle}" in grid
+    sizes = {"__builtins__": {}, "_BLOCK_SIZE_0": 256, "_BLOCK_SIZE_1": 128}
+    assert eval(grid, sizes) == (2, 1, 36)
+
+
+@pytest.mark.cuda
+@skipUnlessCuteAvailable("requires the supported CuTe runtime")
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("swizzle", [2, 4])
+def test_clc_padding_runtime(swizzle: int) -> None:
+    """CLC over a swizzle that pads the cluster grid (10 N tiles at swizzle
+    4) computes every tile; it hung on its first call when the scheduler
+    published padding slots."""
+    if not get_cute_mma_support().tcgen05_f16bf16:
+        pytest.skip("tcgen05 BF16/FP16 support required")
+    generator = torch.Generator(device=DEVICE).manual_seed(31023)
+    lhs = (
+        torch.randn((768, 64), generator=generator, device=DEVICE, dtype=torch.bfloat16)
+        * 0.125
+    )
+    rhs = (
+        torch.randn(
+            (64, 1280), generator=generator, device=DEVICE, dtype=torch.bfloat16
+        )
+        * 0.125
+    )
+    out = torch.empty((768, 1280), device=DEVICE, dtype=torch.bfloat16)
+    compiled = plain_mm_into._bind_isolated((lhs, rhs, out)).compile_config(
+        _clc_config(swizzle)
+    )
+    expected = (lhs.double() @ rhs.double()).to(lhs.dtype)
+    for _ in range(2):
+        out.fill_(float("nan"))
+        compiled(lhs, rhs, out)
+        torch.testing.assert_close(out, expected, atol=0.02, rtol=0.02)
+
+
+@pytest.mark.cuda
 @skipUnlessCuteAvailable("requires the supported CuTe runtime")
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize("mailbox", [False, True])
@@ -341,6 +437,7 @@ def test_padding_runtime_batched_full_history(
     assert torch.equal(rhs, original[1])
 
 
+@pytest.mark.cuda
 @skipUnlessCuteAvailable("requires the supported CuTe runtime")
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize("cluster_n", [1, 2])
@@ -377,3 +474,31 @@ def test_padding_runtime_cluster_peers(
     assert torch.equal(first, second)
     assert torch.equal(lhs, saved[0])
     assert torch.equal(rhs, saved[1])
+
+
+@pytest.mark.parametrize(
+    ("shape", "cluster_n"),
+    [((131072, 144, 288), 1), ((1024, 1024, 256), 2)],
+    ids=["fringe-2x1", "full-2x2"],
+)
+def test_clc_mailbox_is_read_whole_before_its_release_codegen(
+    shape: tuple[int, int, int], cluster_n: int
+) -> None:
+    # The CLC leader's scheduler warp writes each CTA's mailbox with st.async
+    # once every lane released the stage; each consumer role loads the whole
+    # stage before its valid test, so no release goes out ahead of a pending
+    # mailbox read (the GPU repro: test_cute_scheduler_mailbox's
+    # test_clc_peer_cta_writes_every_tile_it_reads_from_the_mailbox).
+    with cpu_codegen():
+        code = plain_mm_into.bind(bf16_mm_args(*shape)).to_code(
+            clc_fringe_config(tcgen05_cluster_n=cluster_n)
+        )
+    assert "consumer_mask=cutlass.Int32(0)" in code
+    for role in range(3):
+        mailbox = f"tcgen05_role_local_{role}_mailbox"
+        assert f"{mailbox} = tcgen05_work_tile_smem.load()" in code
+        assert (
+            f"tcgen05_role_local_{role}_valid = {mailbox}[3] != cutlass.Int32(0)"
+        ) in code
+        assert f"virtual_pid = ({mailbox}[0] >> cutlass.Int32(1))" in code
+    assert "tcgen05_work_tile_smem[cutlass.Int32(" not in code

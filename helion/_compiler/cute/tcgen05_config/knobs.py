@@ -61,6 +61,7 @@ from ..tcgen05_constants import TCGEN05_EPI_ROUND_SUBTILES_CONFIG_KEY
 from ..tcgen05_constants import TCGEN05_EPI_SUBTILE_N_CONFIG_KEY
 from ..tcgen05_constants import TCGEN05_EPI_WARP_GROUPS_CONFIG_KEY
 from ..tcgen05_constants import TCGEN05_EPILOGUE_LAYOUT_CONFIG_KEY
+from ..tcgen05_constants import TCGEN05_FALLBACK_CLUSTER_CONFIG_KEY
 from ..tcgen05_constants import TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY
 from ..tcgen05_constants import TCGEN05_GROUPED_AB_TILE_K_CONFIG_KEY
 from ..tcgen05_constants import TCGEN05_GROUPED_BALANCED_WORKERS_CONFIG_KEY
@@ -86,6 +87,7 @@ from ..tcgen05_constants import TCGEN05_REGION_PID_TYPES_CONFIG_KEY
 from ..tcgen05_constants import TCGEN05_SCHED_CONSUMER_WAIT_MODE_CONFIG_KEY
 from ..tcgen05_constants import TCGEN05_SCHED_STAGE_COUNT_CONFIG_KEY
 from ..tcgen05_constants import TCGEN05_SPLIT_K_CONFIG_KEY
+from ..tcgen05_constants import TCGEN05_SPLIT_K_EXCHANGE_CONFIG_KEY
 from ..tcgen05_constants import TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY
 from ..tcgen05_constants import TCGEN05_WARP_REGISTER_REALLOCATION_CONFIG_KEY
 
@@ -120,6 +122,17 @@ class Tcgen05ClusterM2SearchConstraints(NamedTuple):
     # FFI direct-entry coordinate, the aux-TMA surface) and a sampled
     # cluster_m=2 candidate that is not a one-wave tile runs on one CTA.
     one_wave_only: bool = False
+    # When True, the edge K-tail family's 64-wide 128-row pairs are the only
+    # reason cluster_m=2 search is on (its 128x128 pairs would not fill a
+    # quarter of the SMs): the family runs those pairs alone
+    # (``repair.plain_pair128_widths``) and any other sampled cluster_m=2
+    # candidate runs on one CTA.
+    edge_pair128_only: bool = False
+    # When True, the CTA pairs take K in one k-block (``bk == static_k``): a
+    # batched 16-bit GEMM whose K is one 64-deep K tile at most, whose pairs
+    # the final selection's per-call timing misranks when they split that K
+    # (``search_plan.enable_cute_tcgen05_search``).
+    whole_k: bool = False
 
 
 class Tcgen05AbStagesThreeSearchConstraints(NamedTuple):
@@ -204,7 +217,19 @@ def _integer_fragment_with_seed_values(
 
 
 class _CompilerSeedIntegerFragment(IntegerFragment):
-    """An integer search range that can also encode frozen compiler seeds."""
+    """An integer search range that can also encode frozen compiler seeds.
+
+    Values off the range are not only the seeds': normalization rewrites a
+    sampled knob to whatever the repaired tile needs. On bf16 1000x512x2880
+    (``tcgen05_ab_stages`` searched over 1..12, seed-only 16), the 64-wide
+    pair seed ``[128, 64, 64]`` at 16 stages with a sampled N tile of 128
+    normalizes to the 128x128 pair at its deepest ring, 13 stages: neither in
+    the range nor a seed. The pattern search walks the neighbors of such a
+    canonical config and the surrogate encodes it, so both accept any int
+    (as ``IntegerFragment`` and ``EnumFragment`` do); a check that raised
+    ``ValueError: 13 is not a compiler-seed integer value`` ended the
+    autotune.
+    """
 
     def __init__(
         self,
@@ -219,16 +244,13 @@ class _CompilerSeedIntegerFragment(IntegerFragment):
             raise TypeError(f"Expected int, got {type(current).__name__}")
         if self.low <= current <= self.high:
             return super().pattern_neighbors(current, radius)
-        if current not in self.seed_only_values:
-            raise ValueError(f"{current!r} is not a compiler-seed integer value")
+        # A seed or normalized value off the range steps back onto it.
         boundary = self.clamp(current)
         return [boundary, *super().pattern_neighbors(boundary, radius)]
 
     def encode(self, value: object) -> list[float]:
         if type(value) is not int:
             raise TypeError(f"Expected int, got {type(value).__name__}")
-        if not (self.low <= value <= self.high or value in self.seed_only_values):
-            raise ValueError(f"{value!r} is not a compiler-seed integer value")
         return [float(value)]
 
     def fingerprint(self) -> tuple[str | int, ...]:
@@ -311,6 +333,8 @@ CUTE_TCGEN05_TUNABLE_KEYS: tuple[str, ...] = (
     ACC_STAGES_KEY,
     C_STAGES_KEY,
     TCGEN05_SPLIT_K_CONFIG_KEY,
+    TCGEN05_SPLIT_K_EXCHANGE_CONFIG_KEY,
+    TCGEN05_FALLBACK_CLUSTER_CONFIG_KEY,
     TCGEN05_ACC_WAIT_PLACEMENT_CONFIG_KEY,
     TCGEN05_AUX_LOAD_PLACEMENT_CONFIG_KEY,
     TCGEN05_AUX_FRAGMENT_HOIST_CONFIG_KEY,

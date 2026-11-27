@@ -20,6 +20,7 @@ from ..cross_loop_codegen import _all_names
 from ..cross_loop_codegen import _argument_allocations
 from ..cross_loop_codegen import _effect_kind
 from ..cross_loop_codegen import _is_tl_call
+from ..cross_loop_codegen import _is_volatile
 from ..cross_loop_codegen import _may_write
 from ..cross_loop_codegen import _named_allocations
 from ..cross_loop_codegen import _stored_names
@@ -36,6 +37,7 @@ from .gluon_ring import _slice
 
 if TYPE_CHECKING:
     from collections.abc import Collection
+    from collections.abc import Iterator
 
     from ..device_function import DeviceFunction
 
@@ -201,6 +203,21 @@ def _hoisted(loop: ast.For, stores: collections.Counter[str], n: int) -> list[as
     return hoisted
 
 
+def _unconditional_nodes(node: ast.AST) -> Iterator[ast.AST]:
+    """The nodes a generated expression evaluates regardless of branch choices."""
+    yield node
+    if isinstance(node, ast.IfExp):
+        yield from _unconditional_nodes(node.test)
+    elif isinstance(node, ast.BoolOp):
+        yield from _unconditional_nodes(node.values[0])
+    elif isinstance(node, ast.Compare):
+        for operand in (node.left, node.comparators[0]):
+            yield from _unconditional_nodes(operand)
+    else:
+        for child in ast.iter_child_nodes(node):
+            yield from _unconditional_nodes(child)
+
+
 def _pipelined(
     loop: ast.For, default: int, n: int, allocations: dict[str, int]
 ) -> list[ast.stmt] | None:
@@ -238,12 +255,12 @@ def _pipelined(
     for i, st in enumerate(loop.body):
         if S < 2 or not isinstance(st, ast.Assign):
             continue
-        for load in ast.walk(st.value):
+        for load in _unconditional_nodes(st.value):
             if not _is_tl_call(load, frozenset(["load"])) or len(load.args) > 3:
                 continue
             other = _load_args(load)[2]
             if (
-                any(k.arg == "volatile" for k in load.keywords)
+                _is_volatile(load)
                 or _named_allocations(load, allocations) & written
                 or not (isinstance(other, ast.Constant) and other.value in (None, 0))
             ):

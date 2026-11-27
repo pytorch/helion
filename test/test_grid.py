@@ -3,6 +3,7 @@ from __future__ import annotations
 import unittest
 from unittest.mock import patch
 
+import pytest
 import torch
 
 import helion
@@ -12,11 +13,150 @@ from helion._testing import HALF_DTYPE
 from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
 from helion._testing import code_and_output
+from helion._testing import matchesBackends
 from helion._testing import skipIfMetal
+from helion._testing import skipIfTileIR
 from helion._testing import skipIfXPU
+from helion._testing import skipUnlessBackends
 from helion._testing import skipUnlessTensorDescriptor
 from helion._testing import xfailIfPallas
 import helion.language as hl
+
+
+@skipUnlessBackends(["triton"])
+@skipIfTileIR("TileIR does not expose the static_ranges configuration slot")
+def test_saved_static_range_keeps_its_single_write():
+    @helion.kernel(
+        backend="triton",
+        static_shapes=True,
+        index_dtype=torch.int32,
+        config=helion.Config(block_sizes=[], static_ranges=[True]),
+    )
+    def write(out):
+        for row in hl.grid(out.size(0)):
+            for i in hl.grid(2**31 - 2, 2**31, 2):
+                out[row, i & 3] = row + 1
+
+    out = torch.full((2, 4), -73, dtype=torch.int32, device=DEVICE)
+    write(out)
+    assert out.tolist() == [[-73, -73, 1, -73], [-73, -73, 2, -73]]
+
+
+@skipUnlessBackends(["cute"])
+def test_ragged_dynamic_tile_end():
+    @helion.kernel(
+        backend="cute", static_shapes=False, config=helion.Config(block_sizes=[])
+    )
+    def write(out):
+        for tile in hl.tile(out.size(0), block_size=4):
+            out[tile] = tile.end
+
+    out = torch.zeros(9, device=DEVICE, dtype=torch.int32)
+    write(out)
+    assert out.tolist() == [4] * 4 + [8] * 4 + [9]
+
+
+@skipUnlessBackends(["cute"])
+def test_flattened_tile_mask_across_int32():
+    @helion.kernel(
+        backend="cute",
+        static_shapes=True,
+        config=helion.Config(block_sizes=[4], num_threads=[2]),
+    )
+    def write(out):
+        for tile in hl.tile(2**31 - 6, 2**31 - 1):
+            out[(tile.index.to(torch.int64) - (2**31 - 6)) % 8] = 1
+
+    out = torch.zeros(8, device=DEVICE, dtype=torch.int32)
+    write(out)
+    assert out.tolist() == [1] * 5 + [0] * 3
+
+
+@skipUnlessBackends(["cute"])
+def test_explicit_tile_masks_padded_int64_lanes_by_their_relative_offsets():
+    @helion.kernel(
+        backend="cute", static_shapes=True, config=helion.Config(block_sizes=[])
+    )
+    def write(out):
+        for tile in hl.tile(2**63 - 6, 2**63 - 1, block_size=4):
+            out[(tile.index.to(torch.int64) - (2**63 - 6)) % 8] = 1
+
+    out = torch.zeros(8, device=DEVICE, dtype=torch.int32)
+    write(out)
+    assert out.tolist() == [1] * 5 + [0] * 3
+
+
+@skipUnlessBackends(["cute"])
+@pytest.mark.parametrize("literal_start", [False, True])
+def test_shifted_dynamic_tile_masks_wrapped_int64_lanes(literal_start):
+    @helion.kernel(
+        backend="cute",
+        static_shapes=False,
+        config=helion.Config(block_sizes=[4], num_threads=[2]),
+    )
+    def write(out, start, stop, literal: hl.constexpr):
+        origin = 2**63 - 6 if literal else start
+        for tile in hl.tile(origin, stop):
+            out[(tile.index.to(torch.int64) - origin) % 8] = 1
+
+    out = torch.zeros(8, device=DEVICE, dtype=torch.int32)
+    write(out, 2**63 - 6, 2**63 - 1, literal_start)
+    assert out.tolist() == [1] * 5 + [0] * 3
+
+
+@skipUnlessBackends(["triton", "cute"])
+@pytest.mark.parametrize("bound_type", ["uint32", "uint64", "int64", "python"])
+def test_shifted_tile_with_unsigned_endpoint(bound_type):
+    @helion.kernel(
+        static_shapes=False,
+        config=helion.Config(block_sizes=[], pid_type="persistent_blocked"),
+    )
+    def fill(out, bound, wide: hl.constexpr):
+        if wide:
+            start, stop = bound, 2**63
+        else:
+            start, stop = -1, bound
+        for tile in hl.tile(start, stop, block_size=4):
+            out[tile.index & 7] = tile.end // 2
+
+    wide = bound_type != "uint32"
+    start, stop = (2**63 - 5, 2**63) if wide else (-1, 4)
+    bound = start
+    if bound_type != "python":
+        bound = torch.tensor(
+            start if wide else stop,
+            dtype=getattr(torch, bound_type),
+            device=DEVICE,
+        )
+    out = torch.full((8,), -73, dtype=torch.int64, device=DEVICE)
+    if wide and matchesBackends(["tileir"]):
+        # TileIR's grid coordinates must fit signed Int64 before a division.
+        with pytest.raises(helion.exc.InvalidConfig, match="unbounded UInt64"):
+            fill(out, bound, wide)
+        return
+    fill(out, bound, wide)
+    expected = [-73] * 8
+    for base in range(start, stop, 4):
+        end = min(base + 4, stop)
+        for i in range(base, end):
+            expected[i % 8] = end // 2
+    assert out.tolist() == expected
+
+
+@skipUnlessBackends(["cute"])
+def test_nd_shifted_dynamic_tile_masks_wrapped_int64_lanes():
+    @helion.kernel(
+        backend="cute",
+        static_shapes=False,
+        config=helion.Config(block_sizes=[4, 2], num_threads=[2, 1]),
+    )
+    def write(out, origin):
+        for row, col in hl.tile([origin, 0], [origin + 5, 2]):
+            out[(row.index.to(torch.int64) - origin) % 8, col] = 1
+
+    out = torch.zeros(8, 2, device=DEVICE, dtype=torch.int32)
+    write(out, 2**63 - 6)
+    assert out.tolist() == [[1, 1]] * 5 + [[0, 0]] * 3
 
 
 def grid_2d_pytorch(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:

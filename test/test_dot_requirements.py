@@ -17,7 +17,7 @@ import helion
 from helion import _compat
 from helion._compiler.cute import target_facts
 from helion._compiler.cute.autotune.heuristics.cute import CuteTcgen05ClusterM2Heuristic
-from helion._compiler.cute.pipeline_smem import TCGEN05_SMEM_AWARE_MAX_AB_STAGES
+from helion._compiler.cute.pipeline_smem import TCGEN05_PAIRED_MAX_AB_STAGES
 from helion._compiler.cute.pipeline_smem import pipeline_smem_bytes
 from helion._compiler.cute.strategies import ROLE_LOCAL_MONOLITHIC_DEFAULT_WARP_SPEC
 from helion._compiler.cute.strategies import Tcgen05LayoutOverrides
@@ -31,6 +31,7 @@ from helion._compiler.cute.tcgen05_config import facts
 from helion._compiler.cute.tcgen05_config import repair
 from helion._compiler.cute.tcgen05_config import seeds
 from helion._compiler.cute.tcgen05_config import surface
+from helion._compiler.cute.tcgen05_constants import TCGEN05_FALLBACK_CLUSTER_CONFIG_KEY
 from helion._compiler.cute.tcgen05_constants import TCGEN05_ONE_CTA_MAX_BLOCK_M
 from helion._compiler.cute.tcgen05_constants import TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY
 from helion._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_M
@@ -339,19 +340,22 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
         # 8192 columns are a long N sweep (32 N tiles), grouped by 32 M tiles
         # (B200, of cuBLAS: 0.98-1.03 ungrouped or grouped by 2, 4 or 32 here).
         self.assertEqual(spec.default_config().config["l2_groupings"], [32])
-        # K=8192 can form validated CtaGroup.TWO products at bk >= 32 even
-        # though bk=16 is over the K-tile cap. The FFI full-tile default lands
-        # on cluster_m=2, and the search exposes both arms.
+        # K=8192 forms validated CtaGroup.TWO products at every K step: the
+        # 16-bit pair runs up to TCGEN05_TWO_CTA_SIXTEEN_BIT_MAX_K_TILES (4096)
+        # K tiles, so bk=16 (512 tiles) keeps the pair on the persistent
+        # projection like bk=32 below. The FFI full-tile default lands on
+        # cluster_m=2, and the search exposes both arms.
         self.assertEqual(spec.default_config().config["tcgen05_cluster_m"], 2)
         self.assertEqual(spec.tcgen05.cluster_m_search_choices, (1, 2))
-        over_cap_config = {
+        deep_k_config = {
             "block_sizes": [256, 256, 16],
             "pid_type": "flat",
             "tcgen05_cluster_m": 2,
         }
-        spec.normalize(over_cap_config, _fix_invalid=True)
-        self.assertEqual(over_cap_config["tcgen05_cluster_m"], 1)
-        self.assertEqual(over_cap_config["pid_type"], "flat")
+        spec.normalize(deep_k_config, _fix_invalid=True)
+        self.assertEqual(deep_k_config["tcgen05_cluster_m"], 2)
+        self.assertEqual(deep_k_config["pid_type"], "persistent_interleaved")
+        self.assertEqual(deep_k_config["block_sizes"][:3], [256, 256, 16])
         valid_config = {
             "block_sizes": [128, 256, 32],
             "pid_type": "flat",
@@ -699,13 +703,17 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
                     [TCGEN05_ONE_CTA_MAX_BLOCK_M, 32, 16],
                 )
 
+        # A flat one-CTA sample above 128 rows rendered the SIMT fallback (no
+        # MMA), so the search projects it to the one-CTA tile height too.
         flat_config = {
             "block_sizes": [256, 32, 16],
             "pid_type": "flat",
             "tcgen05_cluster_m": 1,
         }
         spec.normalize(flat_config, _fix_invalid=True)
-        self.assertEqual(flat_config["block_sizes"][:3], [256, 32, 16])
+        self.assertEqual(
+            flat_config["block_sizes"][:3], [TCGEN05_ONE_CTA_MAX_BLOCK_M, 32, 16]
+        )
 
         two_cta_config = {
             "block_sizes": [256, 32, 16],
@@ -734,9 +742,10 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
             bound = fresh(cute_matmul_mma).bind(args)
         spec = bound.config_spec
 
+        # A missing, non-dividing or boolean K step. (A dividing one is valid
+        # at any depth here: the 16-bit pair takes up to 4096 K tiles.)
         for block_sizes in (
             [TCGEN05_TWO_CTA_BLOCK_M, TCGEN05_TWO_CTA_BLOCK_N],
-            [TCGEN05_TWO_CTA_BLOCK_M, TCGEN05_TWO_CTA_BLOCK_N, 8],
             [TCGEN05_TWO_CTA_BLOCK_M, TCGEN05_TWO_CTA_BLOCK_N, 24],
             [TCGEN05_TWO_CTA_BLOCK_M, TCGEN05_TWO_CTA_BLOCK_N, True],
         ):
@@ -806,21 +815,22 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
 
         search_fragments = surface.optional_fragments(spec.tcgen05, for_search=True)
         # The fragment covers both the legacy AB reservation and the explicit
-        # paired-CTA allocation proof. The latter admits up to 16 stages; the
-        # unchanged legacy configs below must still obey their narrower budget.
+        # paired-CTA allocation proof. The latter admits up to the plain 16-bit
+        # pair's cap (17 stages); the unchanged legacy configs below must still
+        # obey their narrower budget.
         self.assertTrue(
             surface.paired_pipeline_search_enabled(spec._cute_tcgen05_config)
         )
         self.assertEqual(
             search_fragments["tcgen05_ab_stages"].high,
-            TCGEN05_SMEM_AWARE_MAX_AB_STAGES,
+            TCGEN05_PAIRED_MAX_AB_STAGES,
         )
         validation_fragments = surface.optional_fragments(
             spec.tcgen05, for_search=False
         )
         self.assertEqual(
             validation_fragments["tcgen05_ab_stages"].high,
-            TCGEN05_SMEM_AWARE_MAX_AB_STAGES,
+            TCGEN05_PAIRED_MAX_AB_STAGES,
         )
 
         # cluster_m=2 256x256x128 ab=3: the canonical 4096^3 fast config —
@@ -918,7 +928,16 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
                 ]
                 # Retain every original family and its baseline depth, while
                 # excluding the old deep-AB CLC seed when its budget is absent.
-                self.assertEqual(len(legacy), 6)
+                # Beside them the CLC 2x2 seed's twin launched with its pair
+                # as the fallback cluster (128 2x2 slots, at least one per
+                # four SMs of the device), at the same depth.
+                fallback = [
+                    seed
+                    for seed in legacy
+                    if seed.get(TCGEN05_FALLBACK_CLUSTER_CONFIG_KEY) is True
+                ]
+                self.assertEqual(len(fallback), 1)
+                self.assertEqual(len(legacy) - len(fallback), 6)
                 self.assertNotIn("tcgen05_ab_stages", legacy[0].config)
                 for seed in legacy:
                     self.assertIn(seed.get("tcgen05_ab_stages"), (None, 2))
@@ -932,12 +951,18 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
                 self.assertTrue(paired)
                 self.assertEqual(
                     search["tcgen05_ab_stages"].high,
-                    TCGEN05_SMEM_AWARE_MAX_AB_STAGES,
+                    TCGEN05_PAIRED_MAX_AB_STAGES,
                 )
                 facts = tcfg.pipeline_smem_facts
                 assert facts is not None
                 self.assertEqual(facts.capacity_bytes, capacity)
+                # The compact paired family's allocation; the aligned-N
+                # family's seed (``tcgen05_tile_n``: here the clipped 256x192
+                # pair) sizes its ring by its own plan, whose (128, 32) store
+                # subtile this estimate does not model.
                 for seed in paired:
+                    if seed.get("tcgen05_tile_n"):
+                        continue
                     bm, bn, bk = seed.block_sizes
                     self.assertLessEqual(
                         pipeline_smem_bytes(
@@ -981,7 +1006,7 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
             )
             self.assertEqual(
                 search_fragments["tcgen05_ab_stages"].high,
-                TCGEN05_SMEM_AWARE_MAX_AB_STAGES,
+                TCGEN05_PAIRED_MAX_AB_STAGES,
             )
 
     @onlyBackends(["cute"])
@@ -1470,11 +1495,14 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
         ):
             bound = fresh(cute_matmul_mma).bind(args)
         spec = bound.config_spec
-        self.assertEqual([x.max_size for x in spec.block_sizes], [256, 128, 64])
+        # A 16-bit N between 128 and 256 is itself an aligned width, so the N
+        # block reaches the 256-wide carrier.
+        self.assertEqual([x.max_size for x in spec.block_sizes], [256, 256, 64])
         self.assertIn("persistent_blocked", spec.allowed_pid_types)
         self.assertIn("persistent_interleaved", spec.allowed_pid_types)
-        # The automatic 256x256 two-CTA tile is still unavailable. The explicit
-        # family has exact 128x64 tiles for N=192 and its own allocation proof.
+        # The automatic 256x256 two-CTA tile is still unavailable (one pair
+        # tile is under the quarter-wave gate). The explicit family has exact
+        # 128x64 tiles for N=192 and its own allocation proof.
         self.assertEqual(spec.tcgen05.cluster_m_search_choices, (1,))
         self.assertEqual(spec.tcgen05.num_epi_warps_search_choices, (4,))
         self.assertTrue(
@@ -1550,7 +1578,11 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
 
     @onlyBackends(["cute"])
     def test_cute_tcgen05_partial_single_edge_search_stays_enabled(self) -> None:
-        """A double-edge default tile keeps wide-N tcgen05 candidates searchable."""
+        """A double edge with whole K tiles and an M no one-CTA tile height
+        divides searches the 256-row pairs, whose TMA store clips both edges,
+        next to the wide-N one-CTA candidates (fp16 5000x5000x64 on GB300: the
+        flat one-CTA default ran 46.0 us, the pair default 10.5, cuBLAS
+        11.8)."""
 
         args = (
             torch.randn([5000, 64], device=DEVICE, dtype=HALF_DTYPE),
@@ -1560,7 +1592,8 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
             bound = fresh(cute_matmul_mma).bind(args)
         spec = bound.config_spec
         self.assertTrue(spec.tcgen05.search_enabled)
-        self.assertEqual([x.max_size for x in spec.block_sizes], [128, 256, 64])
+        self.assertEqual([x.max_size for x in spec.block_sizes], [256, 256, 64])
+        self.assertEqual(spec.tcgen05.cluster_m_search_choices, (1, 2))
 
     @onlyBackends(["cute"])
     def test_cute_tcgen05_edge_k_tail_family_admits_cluster_m2_search(self) -> None:
@@ -2225,7 +2258,8 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
             # requires scheduler_warps=0.
             spec.normalize(helion.Config(**base, tcgen05_warp_spec_scheduler_warps=1))
         with self.assertRaises(InvalidConfig):
-            spec.normalize(helion.Config(**base, tcgen05_warp_spec_ab_load_warps=2))
+            # one or two A/B-load warps (``cute_mma._build_shared_ring_producer``)
+            spec.normalize(helion.Config(**base, tcgen05_warp_spec_ab_load_warps=3))
         with self.assertRaises(InvalidConfig):
             spec.normalize(helion.Config(**base, tcgen05_warp_spec_mma_warps=2))
 

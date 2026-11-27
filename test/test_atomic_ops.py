@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import operator
 import re
 import unittest
@@ -5075,6 +5076,30 @@ def _fragment_ordered_codegen(kernel, args, threads=128):
         return bound.to_code(config)
 
 
+def _fragment_snapshot_branches(fn: ast.FunctionDef) -> list[ast.If]:
+    """Find the uniform guards that read a shared slot into a register before the fence."""
+    branches = []
+    for load, fence, branch in zip(
+        fn.body[:-2], fn.body[1:-1], fn.body[2:], strict=True
+    ):
+        match load:
+            case ast.Assign(
+                targets=[ast.Name(id=register)],
+                value=ast.Subscript(
+                    value=ast.Name(id=slot), slice=ast.Constant(value=0)
+                ),
+            ):
+                if (
+                    slot.startswith("fragment_buffer")
+                    and ast.unparse(fence) == "cute.arch.sync_threads()"
+                    and isinstance(branch, ast.If)
+                    and isinstance(branch.test, ast.Name)
+                    and branch.test.id == register
+                ):
+                    branches.append(branch)
+    return branches
+
+
 def _fragment_publication_args(rows, width, sem, device="cpu"):
     x = torch.arange(rows * width, dtype=torch.int32, device=device).reshape(
         rows, width
@@ -6065,6 +6090,13 @@ class TestFragmentTerminalLoopCPU(unittest.TestCase):
                 self.assertTrue(module.operation.verify())
                 loop_op = next(
                     op for op in block.operations if op.operation.name == "scf.for"
+                )
+                # Check the effective operands, independently of redundant casts.
+                self.assertEqual(list(loop_op.operands)[:2], list(block.arguments))
+                step = loop_op.operands[2]
+                self.assertEqual(step.owner.operation.name, "arith.constant")
+                self.assertEqual(
+                    ir.IntegerAttr(step.owner.attributes["value"]).value, 1
                 )
                 self.assertEqual(str(loop_op.body.arguments[0].type), "i64")
                 self.assertNotIn("arith.trunci", str(module))
@@ -8522,7 +8554,6 @@ class TestFragmentBranchLocalAtomicsCPU(unittest.TestCase):
                     _check_branch_refinement(args)
 
     def test_unused_epochs_finish_inside_each_arm_and_join(self):
-        import ast
         from unittest.mock import patch
 
         from helion._compiler.cute.computed_fragment import FragmentCompiler
@@ -8559,11 +8590,7 @@ class TestFragmentBranchLocalAtomicsCPU(unittest.TestCase):
             for n in tree.body
             if isinstance(n, ast.FunctionDef) and n.name.startswith("_helion_")
         )
-        branch = next(
-            n
-            for n in fn.body
-            if isinstance(n, ast.If) and isinstance(n.test, ast.Subscript)
-        )
+        (branch,) = _fragment_snapshot_branches(fn)
         self.assertEqual(ast.unparse(branch.body[-1]), "cute.arch.sync_threads()")
         self.assertEqual(ast.unparse(branch.orelse[-1]), "cute.arch.sync_threads()")
         self.assertEqual(
@@ -12487,7 +12514,6 @@ def _fragment_uniform_local_epochs(x, lengths, out):
 @onlyBackends(["cute"])
 class TestFragmentUniformLocalBranchEpochsCPU(unittest.TestCase):
     def test_pending_arms_retire_and_sequential_join_preserves_outer_capture(self):
-        import ast
         from unittest.mock import patch
 
         from helion._compiler.cute.computed_fragment import FragmentCompiler
@@ -12513,11 +12539,7 @@ class TestFragmentUniformLocalBranchEpochsCPU(unittest.TestCase):
             )
         self.assertEqual(len(entries), 4)
         fn = next(n for n in ast.parse(source).body if isinstance(n, ast.FunctionDef))
-        branches = [
-            n
-            for n in fn.body
-            if isinstance(n, ast.If) and isinstance(n.test, ast.Subscript)
-        ]
+        branches = _fragment_snapshot_branches(fn)
         self.assertEqual(len(branches), 2)
         for branch in branches:
             self.assertEqual(

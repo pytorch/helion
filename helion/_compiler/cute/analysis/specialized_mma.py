@@ -264,8 +264,11 @@ def _analyzed_specialized_mma_plan(
     env: CompileEnvironment,
 ) -> _SpecializedMmaPlan | None:
     from ..cute_mma import _choose_mma_impl
+    from ..cute_mma import _is_persistent_pid_config
     from ..cute_mma import _mma_tiles_are_static_full
+    from ..cute_mma import _ragged_batched_tcgen05_config
     from ..cute_mma import _tcgen05_cp_async_a_mma_bm
+    from ..cute_mma import _tcgen05_fp32_lowering_blocked
     from ..cute_mma import analyze_cute_mma_node
     from ..cute_mma import ensure_tcgen05_fragment_epilogue_plan
 
@@ -283,8 +286,18 @@ def _analyzed_specialized_mma_plan(
     bn = env.block_sizes[root_mn_block_ids[1]].from_config(config)
     if not isinstance(bm, int) or not isinstance(bn, int):
         return None
-    if candidate.operands.has_leading_passthrough and not _mma_tiles_are_static_full(
-        candidate.operands, bm=bm, bn=bn, bk=bk
+    if (
+        candidate.operands.has_leading_passthrough
+        and not _mma_tiles_are_static_full(candidate.operands, bm=bm, bn=bn, bk=bk)
+        # (the persistent pairs over ragged matrices: ``cute_mma``'s
+        # ``_ragged_batched_tcgen05_config``; the flat one-CTA pipeline keeps
+        # its generic thread layout)
+        and not (
+            _is_persistent_pid_config(config)
+            and _ragged_batched_tcgen05_config(
+                config, candidate.operands, bm=bm, bn=bn, bk=bk
+            )
+        )
     ):
         return None
     lhs_val = candidate.operands.lhs.source_fake
@@ -300,6 +313,22 @@ def _analyzed_specialized_mma_plan(
         input_device=lhs_val.device,
     )
     if mma_impl == "universal":
+        return None
+    if (
+        mma_impl == "tcgen05"
+        and lhs_val.dtype == torch.float32
+        and candidate.operands.has_leading_passthrough
+        and _tcgen05_fp32_lowering_blocked(
+            fn.codegen,
+            node,
+            lhs_operand=candidate.operands.lhs,
+            rhs_operand=candidate.operands.rhs,
+            config=config,
+        )
+    ):
+        # As ``_detect_specialized_mma_loop``: the emitter demotes this fp32
+        # dot to the universal lowering, which declines a batched GEMM, so the
+        # scalar fallback runs on the generic root thread layout.
         return None
     if mma_impl == "tcgen05" and not ensure_tcgen05_fragment_epilogue_plan(
         fn,

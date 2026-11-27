@@ -7,12 +7,14 @@ from typing import TYPE_CHECKING
 
 import sympy
 import torch
+from torch.utils._pytree import tree_leaves
 
 from .. import exc
 from .._utils import next_power_of_2
 from . import active_blocks
 from .compile_environment import CompileEnvironment
 from .compile_environment import _symint_sympy_expr
+from .compile_environment import _to_sympy
 from .device_function import DeviceFunction
 from .device_function import find_block_size_symbols
 from .device_ir import ForLoopGraphInfo
@@ -28,11 +30,14 @@ from .per_thread_planning import fit_reduction_threads
 from .reduction_strategy import LoopedReductionStrategy
 from .reduction_strategy import PersistentReductionStrategy
 from .reduction_strategy import ReductionStrategy
+from .tile_strategy import BlockSizeTileStrategy
 from .tile_strategy import CompactedShape
 from .tile_strategy import DeviceLoopState
 from .tile_strategy import PerThreadNDTileStrategy
 from .tile_strategy import TileStrategy
 from .tile_strategy import compacted_dim_groups
+from .tile_strategy import host_grid_axes
+from .variable_origin import TensorSizeOrigin
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -389,7 +394,109 @@ class TileStrategyDispatch:
             )
             self._register_strategy([block_id], strategy)
 
-    def codegen_grid(self, state: CodegenState, block_ids: list[int]) -> None:
+    def _check_host_range_bounds(
+        self, begins: Sequence[object], ends: Sequence[object], steps: Sequence[object]
+    ) -> None:
+        """Check live host endpoints before a root strategy renders its grid."""
+        host = HostFunction.current()
+        fn = self._device_function
+        # Torch sizes already fit signed Int64, even when a local name
+        # such as M = x.size(0) replaced the size origin on its symbol.
+        input_sizes = {
+            _to_sympy(dim)
+            for tensor in tree_leaves(host.params.arguments)
+            if isinstance(tensor, torch.Tensor)
+            for dim in tensor.shape
+            if isinstance(dim, torch.SymInt)
+        }
+        operands = {
+            expr: host.sympy_expr(expr, fn.config)
+            for value in (*begins, *ends)
+            if isinstance(value, (torch.SymInt, sympy.Expr))
+            and (expr := _to_sympy(value)).free_symbols
+            and host.is_host_scalar_expr(expr)
+            and expr not in input_sizes
+            and not (
+                (info := host.expr_to_origin.get(expr)) is not None
+                and isinstance(info.origin, TensorSizeOrigin)
+            )
+        }
+        fn.signed_host_grid_bounds.update(operands)
+        # An ordinary Python stride can be a device argument too: a loaded
+        # endpoint needs its sign and magnitude to compute the trip count.
+        fn.signed_host_grid_bounds.update(
+            expr
+            for step in steps
+            if isinstance(step, (torch.SymInt, sympy.Expr))
+            and (expr := _to_sympy(step)).free_symbols
+            and host.is_host_scalar_expr(expr)
+        )
+        fn.host_grid_size_exprs.update(input_sizes)
+        if not operands or BlockSizeTileStrategy._literal_empty_axes(
+            begins, ends, steps
+        ):
+            return
+        # A known-empty Cartesian grid needs no coordinate. A device-only
+        # sibling cannot excuse an unrepresentable host argument.
+        live = []
+        for begin, end, step in host_grid_axes(begins, ends, steps):
+            lo = host.sympy_expr(begin, fn.config)
+            hi = host.sympy_expr(end, fn.config)
+            if step is None:
+                live.append(f"(({lo}) != ({hi}))")
+            else:
+                st = host.sympy_expr(step, fn.config)
+                live.append(f"(({lo}) < ({hi}) if ({st}) > 0 else ({lo}) > ({hi}))")
+        for value in operands.values():
+            fn.check_host_grid_error(
+                " and ".join([f"(not {-(2**63)} <= ({value}) < {2**63})", *live]),
+                "runtime root grid bound does not fit signed Int64",
+            )
+
+    def codegen_grid(
+        self, state: CodegenState, block_ids: list[int], step: object
+    ) -> None:
+        # Every root strategy must see the host value before it renders its
+        # first offset or mask. Some flattened lane loops never ask for an
+        # individual axis trip count.
+        begin_or_end, end_arg = state.proxy_args[:2]
+        begins = (
+            tuple(begin_or_end)
+            if isinstance(begin_or_end, (tuple, list))
+            else (begin_or_end,)
+        )
+        if end_arg is None:
+            ends = begins
+            begins = (0,) * len(ends)
+        else:
+            ends = tuple(end_arg) if isinstance(end_arg, (tuple, list)) else (end_arg,)
+        steps = tuple(step) if isinstance(step, (tuple, list)) else (step,) * len(ends)
+        self._check_host_range_bounds(begins, ends, steps)
+        for begin, end in zip(begins, ends, strict=True):
+            bounds = tuple(
+                _symint_sympy_expr(v) if isinstance(v, torch.SymInt) else v
+                for v in (begin, end)
+            )
+            compound = False
+            for expr in bounds:
+                if (
+                    isinstance(expr, sympy.Expr)
+                    and expr.free_symbols
+                    and not isinstance(expr, sympy.Symbol)
+                ):
+                    state.device_function.root_grid_operand(expr, "grid_bound")
+                    compound = True
+            # Persistent schedulers also render this axis's extent. Simplifying
+            # end - begin can remove both registered endpoints from its expression.
+            lo, hi = bounds
+            if (
+                compound
+                and isinstance(lo, (int, sympy.Expr))
+                and isinstance(hi, (int, sympy.Expr))
+            ):
+                state.device_function.root_grid_operand(
+                    sympy.Add(hi, sympy.Mul(-1, lo)), "grid_extent"
+                )
         strategy = self._root_grid_strategy(state, block_ids)
         state.codegen.active_device_loops.clear()
         grid_state = strategy.codegen_grid(state)

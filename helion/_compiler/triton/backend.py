@@ -6,13 +6,16 @@ from __future__ import annotations
 import ast
 import base64
 import contextlib
+import dis
 import functools
 import inspect
+import itertools
 import math
 import os
 from pathlib import Path
 import sys
 import tempfile
+from types import CodeType
 from typing import TYPE_CHECKING
 from typing import Any
 from typing import Sequence
@@ -71,6 +74,23 @@ def _triton_jit_supports_do_not_specialize() -> bool:
 _warned_unavailable_options: set[str] = set()
 
 
+def _global_module_attrs(source: str, module_name: str) -> set[str]:
+    """Find direct module accesses, excluding parameters, locals and closures."""
+    scopes = [compile(source, "<standalone>", "exec", dont_inherit=True)]
+    attrs: set[str] = set()
+    while scopes:
+        scope = scopes.pop()
+        scopes.extend(k for k in scope.co_consts if isinstance(k, CodeType))
+        for name, attr in itertools.pairwise(dis.get_instructions(scope)):
+            if (
+                name.opname in ("LOAD_GLOBAL", "LOAD_NAME")
+                and name.argval == module_name
+                and attr.opname in ("LOAD_ATTR", "LOAD_METHOD")
+            ):
+                attrs.add(attr.argval)
+    return attrs
+
+
 # Under fast_math Triton also lowers torch.sigmoid with libdevice's fast exp
 # and divide (``inductor_lowering``), and the max/min reductions and
 # torch.maximum / torch.minimum to ``tl.max`` / ``tl.maximum`` without the NaN
@@ -116,6 +136,11 @@ class TritonBackend(Backend):
 
     @property
     def uses_triton_compiler(self) -> bool:
+        return True
+
+    @property
+    def native_nested_tile_bounds(self) -> bool:
+        # All three front ends use the same native nested range induction.
         return True
 
     @property
@@ -423,6 +448,42 @@ class TritonBackend(Backend):
 
         return triton_acc_type(dtype)
 
+    def bounded_uint64_grid_expr(self, value: str) -> str:
+        # A loaded UInt64 origin otherwise makes a provably small index unsigned.
+        return self.cast_expr(value, self.dtype_str(torch.int64))
+
+    def unbounded_uint64_grid_expr(self, name: str, value: str) -> str:
+        if self.name != "triton":
+            return super().unbounded_uint64_grid_expr(name, value)
+        from ..device_function import DeviceFunction
+
+        DeviceFunction.current().triton_unbounded_uint64_axes.add(name)
+        return self.uint64_expr(value)
+
+    def finalize_kernel_def(
+        self,
+        fn_def: ast.FunctionDef,
+        prefix: list[ast.stmt],
+        ctx: DeviceBodyContext,
+    ) -> list[ast.stmt]:
+        if axes := ctx.device_function.triton_unbounded_uint64_axes:
+            from ..uint64_grid import narrow_uint64_grid_uses
+
+            narrow_uint64_grid_uses(
+                fn_def,
+                axes,
+                lambda v: expr_from_string("tl.cast({v}, tl.int64)", v=v),
+                {
+                    "triton_helpers.div_floor_integer": 2,
+                    "triton_helpers.remainder_integer": 1,
+                },
+                self.name,
+            )
+        return super().finalize_kernel_def(fn_def, prefix, ctx)
+
+    def device_error_stmt(self, message: str) -> str:
+        return f"helion_triton_helpers.device_error({message!r})"
+
     def cast_expr(self, expr_str: str, dtype_str: str) -> str:
         return f"tl.cast({expr_str}, {dtype_str})"
 
@@ -656,7 +717,7 @@ class TritonBackend(Backend):
                 ],
                 value=ast.Name(id=name, ctx=ast.Load()),
             )
-            for name in ast.literal_eval(exports)
+            for name in [*ast.literal_eval(exports), "device_error"]
         ]
         factory.body[:0] = [
             node
@@ -1012,6 +1073,7 @@ class GluonBackend(TritonBackend):
             "cross_loop_tmem_prefetch",
             "cross_loop_dsmem",
             "worker_registers",
+            "cross_loop_claim_groups",
         ):
             return True
         return key not in self._IGNORED_KEYS and super().supports_config_key(key)

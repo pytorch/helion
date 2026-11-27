@@ -37,6 +37,7 @@ from .compile_environment import _has_unbacked
 from .compile_environment import _symint_free_symbols
 from .compile_environment import _symint_sympy_expr
 from .compile_environment import _to_sympy
+from .fx_side_effects import is_effectful_void_op
 from .fx_side_effects import is_impure_node
 from .indexing_strategy import _contiguous_integer_tensor_index
 from .indexing_strategy import is_block_size_index
@@ -236,7 +237,7 @@ TENSOR_ROUTING_OPS = (
 
 # Ops that keep a prefetching root's loads ordered although they touch no
 # memory: any loop (conservatively: its loads may decide the trip count), a
-# print or breakpoint that shows them.
+# print or breakpoint that shows them, or an assertion that checks them.
 _HINT_BREAKING_OPS = (
     _tracing_ops._for_loop,
     _tracing_ops._for_loop_step,
@@ -410,6 +411,8 @@ _INDEX_CASTS = (
     torch.ops.aten._to_copy.default,
 )
 _INDEX_DTYPES = (torch.int32, torch.int64)
+# Broadcasts of an index tensor (``x[None, :]`` may trace to unsqueeze).
+_BROADCASTS = (torch.ops.aten.unsqueeze.default, torch.ops.aten.expand.default)
 
 
 def _is_gather_subscript(env: CompileEnvironment, subscript: object) -> bool:
@@ -501,11 +504,10 @@ def _indexed_region_sizes(
     index = cast(
         "list[object]", torch.fx.map_arg(index_list, lambda node: node.meta["val"])
     )
-    tensors = [k for k in index if isinstance(k, torch.Tensor)]
-    broadcast = env.should_broadcast_tensor_indexers(index)
+    group = env.tensor_indexer_broadcast_group(index)
     sizes: list[int | torch.SymInt] = []
     dims = iter(tensor.shape)
-    for k in index:
+    for position, k in enumerate(index):
         if k is None:
             continue  # A new axis of size one: it addresses no dim of the tensor.
         size = next(dims)
@@ -515,10 +517,10 @@ def _indexed_region_sizes(
             # Adjacent index tensors address one group of dims (the Cartesian
             # product of 1-D ones, else their broadcast); index tensors that
             # something else separates each address their own.
-            if not broadcast:
+            if group is None:
                 sizes.extend(env.tensor_indexer_dims(k))
-            elif k is tensors[0]:
-                sizes.extend(env.tensor_indexer_broadcast_shape(tensors))
+            elif position == group[0]:
+                sizes.extend(env.tensor_indexer_broadcast_shape(group[1]))
         elif isinstance(k, torch.SymInt) and is_block_size_index(k):
             sizes.append(k)
         # Else a scalar (an int, a symbolic value, a grid index): one element
@@ -607,6 +609,8 @@ def _scalar_subscript_affine(
                     type(origin) in (GridOrigin, TileBeginOrigin)
                     and isinstance(source, FixedBlockSizeSource)
                     and env.known_equal(source.value, 1)
+                    and env.config_spec.literal_root_grid_steps.get(origin.block_id, 1)
+                    == 1
                 )
             ):
                 return origin.block_id, 1, int(offset), type(origin) is TileIdOrigin
@@ -629,6 +633,8 @@ def _subscript_affine(
 
     Tensor chains step only through integer add/mul and value-preserving nodes;
     anything else is unknown (no block, offset ``None``), i.e. the whole dimension.
+    A broadcast tile index indexes its tile; a broadcast ``arange`` stays unknown
+    (its extent is the unbroadcast vector's).
     """
     if type(subscript) is int:
         return None, 1, subscript, True
@@ -639,6 +645,7 @@ def _subscript_affine(
         return _scalar_subscript_affine(env, host, value)
     scale = 1
     offset = 0
+    broadcast = False
     node: object = subscript
     while isinstance(node, torch.fx.Node):
         info = subscript_tile_info(env, node)
@@ -652,7 +659,12 @@ def _subscript_affine(
         args = node.args
         if target is torch.ops.prims.iota.default:
             start = node.kwargs.get("start", 0)
-            if scale == 1 and type(start) is int and node.kwargs.get("step", 1) == 1:
+            if (
+                scale == 1
+                and not broadcast
+                and type(start) is int
+                and node.kwargs.get("step", 1) == 1
+            ):
                 return None, 1, offset + start, False
             break
         if (
@@ -672,6 +684,9 @@ def _subscript_affine(
             else:
                 break
             node = operand
+        elif target in _BROADCASTS:
+            broadcast = True
+            node = args[0]
         elif (
             target is hl.tile_index
             or (target in _INDEX_CASTS and node.meta["val"].dtype in _INDEX_DTYPES)
@@ -762,6 +777,10 @@ def _subscript_dense_span(
     ):
         return None
     axis = origin.block_id
+    # Scalar root grids always occupy one physical lane, even when their
+    # logical coordinates advance by a larger (or runtime) stride.
+    if env.config_spec.literal_root_grid_steps.get(axis, 1) != 1:
+        return None
     info = env.block_sizes[env.canonical_block_id(axis)]
     # A fixed block size keeps a symbolic var, but arange(value * scale) traces
     # as a constant extent; accept either spelling.
@@ -2164,6 +2183,7 @@ class DeviceIRAnalysis:
                 for node in graph_analysis.nodes:
                     if node.op == "call_function" and (
                         node.target in _HINT_BREAKING_OPS
+                        or is_effectful_void_op(node)
                         or _may_access_memory_unseen(node, host.compiler_state)
                     ):
                         effectful.update(owners)

@@ -69,6 +69,7 @@ from ...tcgen05_constants import TCGEN05_EPI_WARP_GROUPS_CONFIG_KEY
 from ...tcgen05_constants import TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY
 from ...tcgen05_constants import TCGEN05_LONG_N_SWEEP_L2_GROUPING
 from ...tcgen05_constants import TCGEN05_MANY_SMALL_BATCHES
+from ...tcgen05_constants import TCGEN05_ONE_ROW_TILE_BATCHED_BLOCK_N
 from ...tcgen05_constants import TCGEN05_SPLIT_K_CONFIG_KEY
 from ...tcgen05_constants import TCGEN05_SPLIT_K_MIN_SLICE_K_TILES
 from ...tcgen05_constants import TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY
@@ -327,6 +328,11 @@ def _promoted_values(seed: Config) -> dict[str, Any]:
     return values
 
 
+# The fewest K rows a short K loop's cp.async-A ring keeps in flight
+# (``_cp_async_a_default``): four 16-deep k-blocks.
+_CP_ASYNC_A_SHORT_K_MIN_ROWS = 64
+
+
 class CuteTcgen05DefaultTileHeuristic(AutotunerHeuristic):
     name = "cute_tcgen05_default_tile"
     backend = "cute"
@@ -395,7 +401,19 @@ class CuteTcgen05DefaultTileHeuristic(AutotunerHeuristic):
         streams all of B, so 30522x128x32768 with ``x.T`` as A read 1.9 GB of
         B beside the 2 GB A on 239 128-row tiles and half that on 120 paired
         ones (0.93 -> 1.00 of the ATen GEMM). The flat SIMT base default ran
-        0.24, the staged (transposing) copy of A 0.54.
+        0.24, the staged (transposing) copy of A 0.54. A batched GEMM counts
+        the tiles of all its matrices, and a K tail rides one more k-block.
+
+        A short K loop keeps about a quarter of it in flight: where the
+        64-deep ring would ask for half the K loop or more at once, the ring
+        holds max(64, K / 4) K rows instead (16-deep k-blocks on four stages
+        at 64 rows). Every one-tile CTA asking for its whole K loop starts its
+        first MMA behind every other CTA's last rows. GB300, bf16 M = 196
+        (392-byte A rows), 256-row tiles, of stock Inductor (Triton), K rows
+        in flight / result: 768 x 196x64x196 64 (bk 16 ab 4) 1.096, 256 (bk
+        64 ab 4) 0.82; 768 x 196x128x196 64 1.052, 256 0.90; 256 x 196x64x512
+        128 (bk 64 ab 2) 1.131, 256 1.054; 128 x 196x64x1024 keeps the
+        deepest ring, 256 rows 1.335 (64: 0.995).
         """
         spec = env.config_spec
         state = spec._cute_tcgen05_config
@@ -404,21 +422,33 @@ class CuteTcgen05DefaultTileHeuristic(AutotunerHeuristic):
             return None
         m, n, k = cast("tuple[int, int, int]", extents)
         bk = TCGEN05_CP_ASYNC_A_BLOCK_K
-        bn = 256 if n > 128 else 128
-        paired_tiles = cdiv(m, 2 * TCGEN05_CP_ASYNC_A_TILE_M) * cdiv(n, bn)
+        # the narrowest power-of-two width covering N up to 128, 256 past it
+        bn = 256 if n > 128 else 128 if n > 64 else 64
+        paired_tiles = (
+            state.matmul_leading_work_multiplier
+            * cdiv(m, 2 * TCGEN05_CP_ASYNC_A_TILE_M)
+            * cdiv(n, bn)
+        )
         bm = (
             2 * TCGEN05_CP_ASYNC_A_TILE_M
             if 4 * paired_tiles >= 3 * state.device_sm_count
             and repair.cp_async_a_paired_rows_allowed(state)
             else TCGEN05_CP_ASYNC_A_TILE_M
         )
-        block_sizes = facts._matmul_seed_block_sizes(state, bm=bm, bn=bn, bk=bk)
         stages = smem.max_ab_stages_that_fit(state, bm=bm, bn=bn, bk=bk, cluster_m=1)
+        ab_stages = min(stages, cdiv(k, bk))
+        if 2 * ab_stages * bk >= k:
+            rows = max(_CP_ASYNC_A_SHORT_K_MIN_ROWS, k // 4)
+            if rows <= _CP_ASYNC_A_SHORT_K_MIN_ROWS:
+                # the shallowest k-block the A layout takes, four of them at 16
+                bk = max(16, state.cp_async_a_min_block_k)
+                ab_stages = max(2, _CP_ASYNC_A_SHORT_K_MIN_ROWS // bk)
+            else:
+                ab_stages = max(2, min(ab_stages, rows // bk))
+        block_sizes = facts._matmul_seed_block_sizes(state, bm=bm, bn=bn, bk=bk)
         if block_sizes is None or stages < 2 or "flat" not in spec.allowed_pid_types:
             return None
-        return _one_cta_config(
-            block_sizes, pid_type="flat", ab_stages=min(stages, k // bk)
-        )
+        return _one_cta_config(block_sizes, pid_type="flat", ab_stages=ab_stages)
 
     @staticmethod
     def _epi_tma_aux_values(
@@ -427,7 +457,10 @@ class CuteTcgen05DefaultTileHeuristic(AutotunerHeuristic):
         """A whole-tile pair's exact-shape auxiliary operands staged through
         the epilogue-issued TMA ring (``epi_tma``), on the widest N tile
         whose AB ring keeps ``_EPI_TMA_MIN_AB_STAGES`` beside it, or ``None``
-        where none does.
+        where none does. A grid whose CTAs each run one tile needs no more
+        than the tile's K loop, where the search repair caps the AB ring
+        (``repair.one_tile_ab_stage_cap``: bf16 2048x2048x192 + residual
+        keeps its 64 256x256 pairs at three stages).
 
         Register (SIMT) loads leave each exact-shape operand's global latency
         on every epilogue subtile. B200, of the ATen GEMM, SIMT -> ``epi_tma``:
@@ -458,12 +491,18 @@ class CuteTcgen05DefaultTileHeuristic(AutotunerHeuristic):
             normalized: dict[str, Any], block_sizes: list[object], min_ab_stages: int
         ) -> bool:
             """Whether the search fixups (``_normalize_epi_tma``) kept the
-            ring and the tile, with ``min_ab_stages`` AB stages beside it."""
+            ring and the tile, with ``min_ab_stages`` AB stages beside it, or
+            the whole K loop where each CTA runs one tile and the repair
+            caps the AB ring there (``repair.one_tile_ab_stage_cap``)."""
+            one_tile_cap = repair.one_tile_ab_stage_cap(
+                state, {**normalized, "tcgen05_ab_stages": min_ab_stages}
+            )
             return (
                 normalized.get(TCGEN05_AUX_LOAD_MODE_CONFIG_KEY)
                 == TCGEN05_AUX_LOAD_MODE_EPI_TMA
                 and normalized["block_sizes"] == block_sizes
-                and cast("int", normalized["tcgen05_ab_stages"]) >= min_ab_stages
+                and cast("int", normalized["tcgen05_ab_stages"])
+                >= (min_ab_stages if one_tile_cap is None else one_tile_cap)
             )
 
         # The narrower pair tile where the 256x256 one keeps too few AB
@@ -537,11 +576,13 @@ class CuteTcgen05DefaultTileHeuristic(AutotunerHeuristic):
         and 1152x1152x1024 37 -> 12 us on the 128x128 pair's two, against
         ATen's 27 and 10.8 us).
 
-        The pairs are the paired-pipeline seeds (and, on the ragged edge
-        family, its 128x128 edge pairs): the allocation proof validates
-        them, not the ``cluster_m=2`` search projection, so the default takes
-        them where the cluster search stays at one CTA, as the autotuner's
-        initial population does. On ties the bias row loaded before the
+        The pairs are the paired-pipeline seeds (and the 128x128 pairs of
+        the ragged edge family and of the one-wave family, whose seed runs
+        bf16 1000x1024x4096 at 8.3 us against cuBLAS's 7.7 on GB300, where
+        the flat base default's 128x16 tile ran 83): the allocation proof
+        validates them, not the ``cluster_m=2`` search projection, so the
+        default takes them where the cluster search stays at one CTA, as the
+        autotuner's initial population does. On ties the bias row loaded before the
         accumulator wait (``pre_acc_wait``) wins: one tile per CTA reads it
         once (128x9216x4096 + bias: 24.1 -> 23.2 us)."""
         state = env.config_spec._cute_tcgen05_config
@@ -597,10 +638,13 @@ class CuteTcgen05DefaultTileHeuristic(AutotunerHeuristic):
         least two), splitting K (``tcgen05_split_k``) over a K loop of at
         least ``_SPLIT_K_MIN_K_TILES`` k-blocks into the most slices of at
         least four k-blocks whose CTAs three per SM hold; unsplit over a
-        shorter loop, where no split qualifies, or where the tiles cannot
+        shorter loop, where no split qualifies, on a tile narrower than the
+        tcgen05 MMA's N (``_tcgen05_min_block_n``), or where the tiles cannot
         split (``split_k_tiles_supported``: whole tiles only without the
-        flat-edge TMA path). A kernel off the split-K search surface
-        (``split_k_search_choices``) keeps the base default. Each axis takes
+        flat-edge TMA path). A kernel off the split-K surface
+        (``split_k_admissible_choices``) keeps the base default; under
+        ``split_k_reduction="none"`` (``split_k_search_choices`` empty) the
+        tile runs unsplit. Each axis takes
         the 64 nearest its block-size range (a narrower N its width, a pinned
         K block its depth), and the slices are counted on that tile.
 
@@ -622,10 +666,10 @@ class CuteTcgen05DefaultTileHeuristic(AutotunerHeuristic):
         state = spec._cute_tcgen05_config
         choices = surface.split_k_search_choices(state)
         fragments = facts._matmul_block_fragments(state)
-        # Off the split-K search surface (a body past one plain store, a
-        # leading passthrough axis: ``split_k_search_choices``) the kernel
-        # keeps the base default.
-        if not choices or fragments is None:
+        # Off the split-K surface (a body past one plain store, a leading
+        # passthrough axis: ``split_k_admissible_choices``) the kernel keeps
+        # the base default.
+        if not surface.split_k_admissible_choices(state) or fragments is None:
             return None
         # The slices are counted on the tile that runs: 64 on each axis,
         # within its block-size range (a narrow N tiles at its width).
@@ -644,11 +688,14 @@ class CuteTcgen05DefaultTileHeuristic(AutotunerHeuristic):
             < ab_stages
         ):
             return None
-        # A short K loop, or ragged tiles off the flat-edge TMA path
-        # (``split_k_tiles_supported``), runs the tile unsplit.
+        # A short K loop, a tile narrower than the tcgen05 MMA's N (a
+        # small-N GEMM's scalar fallback, which codegen does not split), or
+        # ragged tiles off the flat-edge TMA path (``split_k_tiles_supported``)
+        # runs the tile unsplit.
         tiles = cdiv(m, bm) * cdiv(n, bn)
         splittable = (
             k_tiles >= _SPLIT_K_MIN_K_TILES
+            and bn >= facts._tcgen05_min_block_n(state)
             and surface.split_k_tiles_supported(state, bm=bm, bn=bn, bk=bk)
         )
         split = max(
@@ -683,7 +730,8 @@ class CuteTcgen05DefaultTileHeuristic(AutotunerHeuristic):
         whose store merges heads (``radix``: the proved layout and the
         element size): 128 rows (64 where M is not whole in them) by the
         widest of 256, 128, 64 or 32 columns dividing N, else the narrowest
-        power of two holding N up to 128 columns, else 128 (a head merge's:
+        power of two holding N up to 128 columns, else 128 (at most 64 where
+        the search caps N there: ``one_row_tile_narrow_n``; a head merge's:
         the widest tile partitioning its layout whose store boxes sit inside
         its runs, ``RadixStoreLayout.one_cta_tile``), the deepest of 64-,
         32- or 16-deep k-blocks dividing K, else 64 (32 below 64); flat with
@@ -694,9 +742,11 @@ class CuteTcgen05DefaultTileHeuristic(AutotunerHeuristic):
         The base default ran a 64x16 tile; B200, Inductor corpus, of the ATen
         GEMM (many batches of one or two tiles each): 1024 x 256x64x256
         + scale 1.09 (persistent: 1.08), 3072 x 128x64x128 1.35 (1.08),
-        3072 x 64x128x128 1.40 (1.19); eight k-blocks, 64x256 tiles:
-        384 x 64x512x512 flat 1.00 (four AB stages 0.93, two CTAs fit an SM
-        at two), persistent 1.03, 192 x 64x512x512 1.07. A head merge takes
+        3072 x 64x128x128 1.40 (1.19); eight k-blocks, 64x256 tiles over a
+        row-major A (an M-major one takes 64-wide tiles there,
+        ``search_plan.tcgen05_one_row_tile_batched_narrow_n``): 384 x
+        64x512x512 flat 1.00 (four AB stages 0.93, two CTAs fit an SM at
+        two), persistent 1.03, 192 x 64x512x512 1.07. A head merge takes
         it on small grids too, where the 128-row pairs render no radix store
         subtile; a plain narrow GEMM's small grid keeps the pairs' deep rings
         (32 x 128x64x4096: 18.8 us against 31.4 us here)."""
@@ -725,6 +775,9 @@ class CuteTcgen05DefaultTileHeuristic(AutotunerHeuristic):
                 (cols for cols in (256, 128, 64, 32) if n % cols == 0),
                 max(32, 1 << (n - 1).bit_length()) if n <= 128 else 128,
             )
+            if state.one_row_tile_narrow_n:
+                # the search's N ceiling for these products: 64-wide tiles
+                bn = min(bn, TCGEN05_ONE_ROW_TILE_BATCHED_BLOCK_N)
             tile = (bm, bn)
         if tile is None:
             return None
@@ -1129,6 +1182,13 @@ class CuteTcgen05DefaultTileHeuristic(AutotunerHeuristic):
             if width:
                 bn = width
                 efficiency = _aligned_n_efficiency(cluster_m, bm, width)
+            elif bn > n:
+                # A power-of-two tile wider than N (a 16-bit N between 128
+                # and 256 searches the 256-wide aligned carrier) stores
+                # predicated SIMT rows instead of its TMA box: bf16
+                # 32768x192x192 with a bias row ran its (256, 256) pair at
+                # 73.3 us against the flat (128, 16) tile's 24.0 (GB300).
+                continue
             else:
                 efficiency = _TILE_EFFICIENCY.get((cluster_m, bm, bn))
             if (

@@ -6,6 +6,7 @@ import dataclasses
 import enum
 import functools
 import logging
+import math
 import operator
 import os
 from typing import TYPE_CHECKING
@@ -19,6 +20,7 @@ from torch._inductor.codegen.simd import constant_repr
 from .. import exc
 from .ast_extension import expr_from_string
 from .emitter_protocols import NO_RETRY
+from .inductor_matmul import MatmulPlan
 from .utils import is_full_slice
 
 if TYPE_CHECKING:
@@ -63,6 +65,7 @@ if TYPE_CHECKING:
     from .inductor_lowering import CodegenState
     from .inductor_lowering import GenerateASTFromInductor
     from .inductor_lowering import GraphInterpreter
+    from .inductor_matmul import MatmulFacts
     from .program_id import ProgramIDs
     from .reduction_strategy import BlockReductionStrategy
     from .reduction_strategy import ReductionEmitter
@@ -725,6 +728,11 @@ class Backend(abc.ABC):
         return False
 
     @property
+    def native_nested_tile_bounds(self) -> bool:
+        """Whether nested tiles use the native range's counter, upper mask and edge."""
+        return False
+
+    @property
     def compiler_pipelines_ranges(self) -> bool:
         """Whether the compiler software-pipelines ``tl.range`` loops by their
         ``num_stages`` (Triton's), issuing an iteration's loads ahead of the
@@ -827,6 +835,10 @@ class Backend(abc.ABC):
 
     # -- type strings and the expression printer (scalars, indices, loops) -----
 
+    def root_coordinate_type_str(self, dtype: torch.dtype) -> str:
+        """Signed arithmetic type for an axis with a noncanonical grid range."""
+        return self.dtype_str(dtype)
+
     @abc.abstractmethod
     def dtype_str(self, dtype: torch.dtype) -> str:
         """Convert a torch dtype to a backend-specific type string.
@@ -844,12 +856,31 @@ class Backend(abc.ABC):
         """
         ...
 
+    def tile_index_dtype(
+        self, index_dtype: torch.dtype, *, serial_device_lane: bool = False
+    ) -> torch.dtype:
+        """The tensor dtype of a physical tile coordinate."""
+        return index_dtype
+
     def index_type_str(self, index_dtype: torch.dtype) -> str:
         """Get the index type string for the given dtype.
 
         Defaults to dtype_str, but backends may override for special handling.
         """
-        return self.dtype_str(index_dtype)
+        return self.dtype_str(self.tile_index_dtype(index_dtype))
+
+    def uint64_expr(self, value: str) -> str:
+        """Use an unsigned 64-bit arithmetic value for range counts and coordinates."""
+        return self.cast_expr(value, self.dtype_str(torch.uint64))
+
+    def bounded_uint64_grid_expr(self, value: str) -> str:
+        """Render a grid coordinate proved to fit the signed index domain."""
+        return value
+
+    def unbounded_uint64_grid_expr(self, name: str, value: str) -> str:
+        raise exc.InvalidConfig(
+            f"{self.name} cannot represent an unbounded UInt64 grid coordinate"
+        )
 
     def program_id_expr(self, dim: int, *, index_dtype: str) -> str:
         """Expression reading the program id of grid axis ``dim`` as ``index_dtype``."""
@@ -889,6 +920,15 @@ class Backend(abc.ABC):
         """Generate a backend-specific range expression, or None to use the default."""
         return None
 
+    def device_error_stmt(self, message: str) -> str:
+        raise exc.BackendUnsupported(self.name, "checking a device precondition")
+
+    def persistent_range_str(
+        self, begin: str, end: str, step: str | None
+    ) -> str | None:
+        """A device range which preserves a possibly wide persistent PID bound."""
+        return None
+
     def arange_expr(
         self,
         offsets_var: str,
@@ -916,6 +956,10 @@ class Backend(abc.ABC):
     def scalar_load_expr(self, tensor_name: str, index_expr: str | None = None) -> str:
         """Load scalar value from a tensor argument."""
         raise exc.BackendUnsupported(self.name, "scalar load")
+
+    def scalar_tensor_index_expr(self, tensor_name: str) -> str:
+        """Read a rank-zero tensor argument at a memory indexing operation."""
+        return self.scalar_load_expr(tensor_name)
 
     def ast_to_dtype_expr(self, expr_str: str, dtype_str: str) -> str:
         """Generate dtype conversion expression for AST values."""
@@ -1516,6 +1560,10 @@ class Backend(abc.ABC):
         """Generate a backend-specific conditional select expression."""
         raise exc.BackendUnsupported(self.name, "where")
 
+    def tile_edge_minimum(self, left: str, right: str) -> str:
+        """Clamp a tile edge without narrowing either signed operand."""
+        return f"({self.where_expr(f'{left} < {right}', left, right)})"
+
     def mask_padded_range_lanes(
         self, value: str, length: int, dim: int, ndim: int, identity: str
     ) -> str | None:
@@ -1760,6 +1808,16 @@ class Backend(abc.ABC):
     def inductor_op_overrides(self) -> InductorOpOverrides:
         """The Inductor ``OpsHandler`` the pointwise lowering prints elementwise ops through."""
         raise exc.BackendUnsupported(self.name, "Inductor OpOverrides")
+
+    def inductor_matmul_plan(self, facts: MatmulFacts) -> MatmulPlan:
+        """How helion.inductor lowers the matmul ``facts`` describes in kernels
+        of this backend; the default plan lowers it as written."""
+        return MatmulPlan()
+
+    def inductor_rules_key(self) -> str:
+        """A key of the code :meth:`inductor_matmul_plan` runs, part of
+        Inductor's FX graph cache key."""
+        return ""
 
     def parse_op_expression(self, text: str) -> ast.AST:
         """The device-code AST of *text*, an expression this backend's
@@ -2593,6 +2651,10 @@ class Backend(abc.ABC):
         device-side additions that depend on the whole body."""
         return None
 
+    def nd_device_loop_args(self, state: CodegenState) -> list[object]:
+        """Operands used for both the native range and its tile masks."""
+        return state.ast_args
+
     def prepare_device_loop(
         self,
         graph_info: ForLoopGraphInfo,
@@ -2719,11 +2781,10 @@ class Backend(abc.ABC):
     def decomp_table_overrides(
         self, table: dict[torch._ops.OpOverload, Callable[..., object]]
     ) -> None:
-        """Adjust the Inductor decomposition table used while tracing.
+        """Customize the copied decomposition table before other device rewrites.
 
-        Called on the copied table before Helion's own overrides are applied;
-        a backend that lowers an op natively pops its decomposition here.
-        Default: no-op.
+        The table includes the effect-preserving default assertion decomposition.
+        A backend may replace it, or remove it to lower the default overload itself.
         """
         return
 
@@ -3069,6 +3130,22 @@ class Backend(abc.ABC):
 
 
 def _largest_divisor_at_most(size: int, limit: int) -> int:
+    # For small limits the descending scan is already bounded.
+    if size and limit > 64:
+        size = abs(size)
+        if limit >= size:
+            return size
+        root = math.isqrt(size)
+        if root < limit:
+            # A large divisor fits only if its smaller partner is at least
+            # ceil(size / limit). Scan those partners once in quotient order.
+            first = (size + limit - 1) // limit
+            for partner in range(first, root + 1):
+                if size % partner == 0:
+                    return size // partner
+            # No partner already checked divides size. The largest remaining
+            # divisor is the first one below that interval.
+            limit = first - 1
     for divisor in range(limit, 0, -1):
         if size % divisor == 0:
             return divisor

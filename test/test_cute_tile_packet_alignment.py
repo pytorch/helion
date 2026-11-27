@@ -6,7 +6,8 @@ multiple of V.  The tensor base and the non-lane strides remain, which
 residues of an input or from a wrapper allocation; an unprovable site stays
 on scalar loads instead of faulting at runtime on a misaligned view.  The
 tile path already needs static extents (``numel % V`` is decided at bind
-time), so every kernel here binds with static shapes.
+time), so every kernel here binds with static shapes. Fragment vector I/O
+also requires each complete packet to stay inside its tile interval.
 """
 
 from __future__ import annotations
@@ -20,6 +21,8 @@ import helion
 from helion._testing import skipUnlessBackends
 from helion._testing.cute_codegen import cpu_bind
 from helion._testing.cute_codegen import mock_cuda_unavailable
+from helion._testing.cute_fragment_simulator import simulate_independent_fragment
+from helion._testing.cute_output_addresses import generated_output_address_coverage
 import helion.language as hl
 
 pytestmark = [pytest.mark.cpu_only, skipUnlessBackends(["cute"])]
@@ -352,3 +355,121 @@ def test_a_bool_tile_packet_needs_the_same_start(start: int, packed: bool) -> No
         code,
     )
     assert (mask_packet is not None) is packed
+
+
+@helion.kernel(backend="cute", static_shapes=True)
+def _nested_fragment_scan(x, out, starts, start: hl.constexpr, stop: hl.constexpr):
+    for row in hl.grid(x.size(0)):
+        if start is None:
+            lo = starts[row]
+        else:
+            lo = start
+        for tile in hl.tile(lo, stop, block_size=4):
+            out[row, tile] = torch.cumsum(x[row, tile] + 1, dim=0)
+    return out
+
+
+@helion.kernel(backend="cute", static_shapes=True)
+def _root_fragment_scan(
+    x, out, begin: hl.constexpr, stop: hl.constexpr, width: hl.constexpr = None
+):
+    for tile in hl.tile(begin, stop, block_size=width):
+        out[tile] = torch.cumsum(x[tile] + 1, dim=0)
+    return out
+
+
+@pytest.mark.parametrize(
+    ("nested", "start", "stop"),
+    [
+        (False, 4, 16),
+        (False, 3, 16),
+        (False, 4, 15),
+        (True, 0, 16),
+        (True, 3, 16),
+        (True, 4, 15),
+        (True, None, 16),
+    ],
+)
+def test_fragment_packets_need_a_whole_lexical_interval(nested, start, stop):
+    x = torch.zeros((2, 16) if nested else (16,))
+    args = (
+        (x, torch.empty_like(x), torch.zeros(2, dtype=torch.int32), start, stop)
+        if nested
+        else (x, torch.empty_like(x), start, stop)
+    )
+    with mock_cuda_unavailable():
+        bound = cpu_bind(_nested_fragment_scan if nested else _root_fragment_scan, args)
+        code = bound.to_code(
+            helion.Config(
+                block_sizes=[] if nested else [4], cute_fragment_vector_io=True
+            ),
+            output_origin_lines=False,
+        )
+    copies = [
+        line
+        for line in code.splitlines()
+        if "cute.copy(" in line and ".align(16)" in line
+    ]
+    if start in (0, 4) and stop == 16:
+        assert (
+            len(copies) == 2
+            and "x.iterator" in copies[0]
+            and "out.iterator" in copies[1]
+        )
+    else:
+        assert not copies
+        assert any(
+            "x.iterator" in line and ".load()" in line for line in code.splitlines()
+        )
+        assert any(
+            "out.iterator" in line and ".store(" in line for line in code.splitlines()
+        )
+
+
+@pytest.mark.parametrize("vector", [False, True])
+def test_fragment_partial_packet_preserves_shifted_scan_canaries(vector):
+    x = torch.full((12,), 2.0)
+    out = torch.full((12,), -73.0)
+    with mock_cuda_unavailable():
+        config = helion.Config(block_sizes=[4], cute_fragment_vector_io=vector)
+        source = cpu_bind(_root_fragment_scan, (x, out, 4, 9)).to_code(
+            config, output_origin_lines=False
+        )
+    assert not any(
+        "cute.copy(" in line and "out.iterator" in line for line in source.splitlines()
+    )
+    simulate_independent_fragment(source, {"x": x}, {"out": out}, 2)
+    expected = torch.full_like(out, -73.0)
+    expected[4:9] = torch.tensor([3.0, 6.0, 9.0, 12.0, 3.0])
+    torch.testing.assert_close(out, expected, rtol=0, atol=0)
+
+
+def test_fixed_root_scan_matches_configured_tiles_at_both_boundaries() -> None:
+    x = torch.arange(16, dtype=torch.int32)
+    out = torch.full_like(x, -97)
+    args = (x, out, 3, 16)
+    with mock_cuda_unavailable():
+        bound = cpu_bind(_root_fragment_scan, (*args, 4))
+        fixed = bound.to_code(helion.Config(block_sizes=[]), output_origin_lines=False)
+        tuned = cpu_bind(_root_fragment_scan, (*args, None)).to_code(
+            helion.Config(block_sizes=[4]), output_origin_lines=False
+        )
+
+    expected = torch.cat(
+        [
+            torch.full_like(x[:3], -97),
+            *((tile + 1).cumsum(0, dtype=x.dtype) for tile in x[3:].split(4)),
+        ]
+    )
+    for code in (fixed, tuned):
+        launch = re.search(
+            r"_launcher\(\w+, \((\d+),\), x, out, block=\((\d+), 1, 1\)\)", code
+        )
+        assert launch is not None
+        blocks, threads = map(int, launch.groups())
+        out.fill_(-97)
+        simulate_independent_fragment(code, {"x": x}, {"out": out}, blocks)
+        torch.testing.assert_close(out, expected, rtol=0, atol=0)
+        assert generated_output_address_coverage(
+            code, "out", blocks, threads
+        ) == dict.fromkeys(range(3, 16), 1)

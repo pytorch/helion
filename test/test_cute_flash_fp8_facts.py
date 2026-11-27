@@ -38,6 +38,9 @@ from helion._testing import EXAMPLES_DIR
 from helion._testing import import_path
 from helion._testing import skipUnlessBackends
 from helion._testing.cute_aux import as_sm100
+from helion._testing.cute_flash_kernels import dot_attention_k_major
+from helion._testing.cute_flash_kernels import dot_attention_rows
+from helion._testing.cute_flash_kernels import fp8_dot_attention_k_major
 from helion.autotuner.config_generation import ConfigGeneration
 from helion.autotuner.config_spec import BlockSizeSpec
 from helion.autotuner.config_spec import ConfigSpec
@@ -55,109 +58,6 @@ LOG2E = math.log2(math.e)
 # ---------------------------------------------------------------------------
 # The 2-D ``hl.dot`` attention forms (CPU-bound only; never launched).
 # ---------------------------------------------------------------------------
-@helion.kernel(static_shapes=True, backend="cute")
-def fp8_dot_attention_k_major(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    batch: int,
-    heads: int,
-) -> torch.Tensor:
-    """``examples/fp8_attention.py`` with its query-tile loop on the launch
-    grid: fp8 operands, the scale on the scores, a pre-transposed V and the
-    4-D fp8 output."""
-    batch_heads = q.size(0)
-    seq_len = q.size(1)
-    head_dim = q.size(2)
-    out = torch.empty(
-        [batch, heads, seq_len, head_dim], dtype=torch.float8_e4m3fn, device=q.device
-    )
-    sm_scale = 0.18033688
-    for bh, tile_m in hl.tile([batch_heads, seq_len], block_size=[1, None]):
-        b_index = bh.begin // heads
-        h_index = bh.begin % heads
-        m_i = hl.full([tile_m], float("-inf"), dtype=torch.float32)
-        l_i = hl.full([tile_m], 0.0, dtype=torch.float32)
-        acc = hl.zeros([tile_m, head_dim], dtype=torch.float32)
-        q_tile = q[bh.begin, tile_m, :]
-        for tile_n in hl.tile(seq_len):
-            k_tile = k[bh.begin, tile_n, :]
-            qk = hl.dot(q_tile, k_tile.transpose(0, 1)) * sm_scale
-            m_new = torch.maximum(m_i, torch.amax(qk, dim=-1))
-            p = torch.exp2(qk - m_new[:, None])
-            alpha = torch.exp2(m_i - m_new)
-            l_i = l_i * alpha + torch.sum(p, dim=-1)
-            acc = acc * alpha[:, None]
-            v_tile = v[bh.begin, :, tile_n]
-            acc = hl.dot(p.to(v.dtype), v_tile.t(), acc=acc)
-            m_i = m_new
-        out[b_index, h_index, tile_m, :] = (acc / l_i[:, None]).to(torch.float8_e4m3fn)
-    return out
-
-
-@helion.kernel(static_shapes=True, backend="cute")
-def dot_attention_k_major(
-    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor
-) -> torch.Tensor:
-    """The 2-D form with a pre-transposed ``v[bh, :, tile_n]`` and a 3-D
-    output in the operand dtype."""
-    batch_heads = q.size(0)
-    seq_len = q.size(1)
-    head_dim = q.size(2)
-    out = torch.empty([batch_heads, seq_len, head_dim], dtype=q.dtype, device=q.device)
-    sm_scale = 0.18033688
-    for bh, tile_m in hl.tile([batch_heads, seq_len], block_size=[1, None]):
-        m_i = hl.full([tile_m], float("-inf"), dtype=torch.float32)
-        l_i = hl.full([tile_m], 0.0, dtype=torch.float32)
-        acc = hl.zeros([tile_m, head_dim], dtype=torch.float32)
-        q_tile = q[bh.begin, tile_m, :]
-        for tile_n in hl.tile(seq_len):
-            k_tile = k[bh.begin, tile_n, :]
-            qk = hl.dot(q_tile, k_tile.transpose(0, 1)) * sm_scale
-            m_new = torch.maximum(m_i, torch.amax(qk, dim=-1))
-            p = torch.exp2(qk - m_new[:, None])
-            alpha = torch.exp2(m_i - m_new)
-            l_i = l_i * alpha + torch.sum(p, dim=-1)
-            acc = acc * alpha[:, None]
-            v_tile = v[bh.begin, :, tile_n]
-            acc = hl.dot(p.to(v.dtype), v_tile.t(), acc=acc)
-            m_i = m_new
-        out[bh.begin, tile_m, :] = (acc / l_i[:, None]).to(q.dtype)
-    return out
-
-
-@helion.kernel(static_shapes=True, backend="cute")
-def dot_attention_rows(
-    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor
-) -> torch.Tensor:
-    """The 2-D form with the canonical ``v[bh, tile_n, :]`` tile and the
-    scale on Q."""
-    batch_heads = q.size(0)
-    seq_len = q.size(1)
-    head_dim = q.size(2)
-    out = torch.empty([batch_heads, seq_len, head_dim], dtype=q.dtype, device=q.device)
-    qk_scale = 0.18033688
-    for bh, tile_m in hl.tile([batch_heads, seq_len], block_size=[1, None]):
-        m_i = hl.full([tile_m], float("-inf"), dtype=torch.float32)
-        l_i = hl.full([tile_m], 0.0, dtype=torch.float32)
-        acc = hl.zeros([tile_m, head_dim], dtype=torch.float32)
-        q_tile = q[bh.begin, tile_m, :]
-        for tile_n in hl.tile(seq_len):
-            q_scaled = q_tile * qk_scale
-            k_tile = k[bh.begin, tile_n, :]
-            qk = hl.dot(q_scaled, k_tile.transpose(0, 1))
-            m_new = torch.maximum(m_i, torch.amax(qk, dim=-1))
-            p = torch.exp2(qk - m_new[:, None])
-            alpha = torch.exp2(m_i - m_new)
-            l_i = l_i * alpha + torch.sum(p, dim=-1)
-            acc = acc * alpha[:, None]
-            v_tile = v[bh.begin, tile_n, :]
-            acc = hl.dot(p.to(v.dtype), v_tile, acc=acc)
-            m_i = m_new
-        out[bh.begin, tile_m, :] = (acc / l_i[:, None]).to(q.dtype)
-    return out
-
-
 @helion.kernel(static_shapes=True, backend="cute")
 def dot_attention_wrong_scale(
     q: torch.Tensor, k: torch.Tensor, v: torch.Tensor
@@ -256,7 +156,7 @@ def dot_attention_grid_step2(
     q: torch.Tensor, k: torch.Tensor, v: torch.Tensor
 ) -> torch.Tensor:
     """``dot_attention_grid`` over every other batch head: a grid axis of
-    step 2 is not a unit block, so its index is not a scalar batch index."""
+    step 2 skips batch heads, which the fused body cannot do."""
     batch_heads = q.size(0)
     seq_len = q.size(1)
     head_dim = q.size(2)
@@ -437,6 +337,33 @@ def test_bf16_dot_form_k_major_v() -> None:
     assert pattern.io_dtype is torch.bfloat16
     assert pattern.v_k_major
     assert pattern.head_dim == 64
+
+
+def test_checked_attention_rows_keeps_the_ordinary_fragment_default() -> None:
+    args = _qkv(torch.bfloat16)
+    with as_sm100():
+        plain = _bind(dot_attention_rows, args)
+        checked = _bind(dot_attention_rows, (*args, True))
+        assert plain.config_spec.cute_flash_search_enabled
+        assert plain.config_spec.autotune_seed_configs()
+        spec = checked.config_spec
+        assert not spec.cute_flash_search_enabled
+        assert not spec.cute_flash_gated_search_enabled
+        assert not spec.tcgen05.search_enabled
+        errors: list[str] = []
+        seeds = spec.create_config_generation().seed_flat_config_pairs(errors.append)
+        assert not errors
+        assert not spec.autotune_seed_configs()
+        assert seeds
+        # Render a real compiler seed, after filling missing values as the
+        # tuner does, as well as the default used without a tuning run.
+        for config in (spec.default_config(), seeds[0][1]):
+            assert (
+                checked.to_code(config, output_origin_lines=False).count(
+                    "call __assertfail"
+                )
+                == 1
+            )
 
 
 def test_bf16_dot_form_rows_v_and_scaled_q() -> None:
@@ -815,16 +742,19 @@ def test_output_plan_standard_example_unchanged() -> None:
 # The scalar batch index: a unit block, and the root's (review fixes N1/N2).
 # ---------------------------------------------------------------------------
 def test_scalar_batch_index_requires_a_unit_block() -> None:
-    """``tile.begin`` of an autotuned batch tile and the index of a grid axis
-    with step 2 address one row of a wider tile: neither is a scalar batch
-    index, so the body is not an attention body."""
+    """A batch tile must be pinned to one row, and the root must visit
+    consecutive batch heads for the fused kernel to implement the loop."""
     q, k, v = _qkv(torch.bfloat16)
     bound = _bind(dot_attention_nonunit_batch_tile, (q, k, v))
     assert bound.host_function.device_ir.grid_block_ids == [[0, 1]]
     assert _pattern(bound) is None
     assert _surface(bound) is None
     assert not bound.config_spec.cute_flash_search_enabled
-    assert _pattern(_bind(dot_attention_grid_step2, (q, k, v))) is None
+    strided = _bind(dot_attention_grid_step2, (q, k, v))
+    # Each program still reads one batch head; the grid skips every other one.
+    assert _pattern(strided) is not None
+    assert _surface(strided) is None
+    assert not strided.config_spec.cute_flash_search_enabled
 
 
 def test_scalar_batch_block_is_recorded() -> None:

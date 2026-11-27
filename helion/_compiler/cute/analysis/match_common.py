@@ -134,7 +134,8 @@ def is_neg_inf(node: object, *, allow_full: bool = False) -> bool:
 
 def unit_fixed_block(env: CompileEnvironment, block_id: int) -> bool:
     """``block_id`` is pinned to one element: ``hl.tile(..., block_size=1)``
-    or an ``hl.grid`` axis of unit step. An autotuned block's ``tile.begin``
+    or a scalar root ``hl.grid`` axis. Width alone does not prove the grid's
+    logical begin or stride. An autotuned block's ``tile.begin``
     is its first row only, so a scalar index of it does not address the
     tile."""
     from ...compile_environment import FixedBlockSizeSource

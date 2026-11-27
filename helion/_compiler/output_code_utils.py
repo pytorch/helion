@@ -94,16 +94,20 @@ def _artifact_annotation_reads(tree: ast.AST) -> set[str]:
 
 def _artifact_runtime_nodes(tree: ast.Module) -> set[ast.AST]:
     """Recognize the exact compiler-owned runtime, including optional CUDA APIs."""
+    from ..autotuner.aot_compile import _standalone_value_key
     from .triton.backend import TritonBackend
 
     canonical = _runtime_shim_statements(TritonBackend().dependency_free_launcher_info)[
         0
     ]
-    canonical_dump = ast.dump(canonical)
+    canonical_dumps = {
+        ast.dump(canonical),
+        ast.dump(ast.parse(inspect.getsource(_standalone_value_key)).body[0]),
+    }
     return {
         child
         for node in tree.body
-        if isinstance(node, ast.FunctionDef) and ast.dump(node) == canonical_dump
+        if isinstance(node, ast.FunctionDef) and ast.dump(node) in canonical_dumps
         for child in ast.walk(node)
     }
 
@@ -113,7 +117,7 @@ def _check_artifact_helion_namespace(tree: ast.Module) -> None:
     from .triton.backend import TritonBackend
 
     info = TritonBackend().dependency_free_launcher_info
-    runtime_names = {*info.runtime_helper_names, info.launcher_symbol}
+    runtime_names = set(dependency_free_runtime_names(info))
     host_names = {helper.__name__ for helper in _HOST_HELPERS}
     parents = {
         child: node for node in ast.walk(tree) for child in ast.iter_child_nodes(node)
@@ -206,6 +210,7 @@ def close_artifact_source(source: str) -> str:
     # allowlist of operations in the source Helion kernel.
     runtime_modules = {
         "__future__",
+        "builtins",
         "collections",
         "contextvars",
         "functools",
@@ -398,6 +403,12 @@ def _raise_needs_helion(kernel_name: str) -> None:
     )
 
 
+def dependency_free_runtime_names(info: LauncherInfo) -> list[str]:
+    return dedupe_preserve_order(
+        [*info.runtime_helper_names, info.launcher_symbol, "_grid_range_length"]
+    )
+
+
 def _runtime_shim_statements(info: LauncherInfo) -> list[ast.stmt]:
     """The dependency-free launcher inlined as a local ``helion.runtime`` shim,
     returned as AST statements to prepend to the module body.
@@ -409,7 +420,8 @@ def _runtime_shim_statements(info: LauncherInfo) -> list[ast.stmt]:
     so the body's verbatim ``helion.runtime.<fn>(...)`` calls resolve against it.
     The outer namespace also exports the canonical pure host helpers.
     """
-    exports = dedupe_preserve_order([*info.runtime_helper_names, info.launcher_symbol])
+    from ..runtime import _grid_range_length
+
     host_source = "\n".join(inspect.getsource(helper) for helper in _HOST_HELPERS)
     module = ast.parse(
         "helion = _make_helion_namespace()\n"
@@ -417,9 +429,11 @@ def _runtime_shim_statements(info: LauncherInfo) -> list[ast.stmt]:
     )
     return [
         *private_module_statements(
-            read_launcher_source(info.launcher_module),
+            read_launcher_source(info.launcher_module)
+            + "\nfrom builtins import OverflowError, ValueError, any, max, range\n"
+            + inspect.getsource(_grid_range_length),
             "_make_helion_runtime",
-            exports,
+            dependency_free_runtime_names(info),
             doc=_SHIM_DOC,
         ),
         *private_module_statements(

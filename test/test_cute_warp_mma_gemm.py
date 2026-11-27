@@ -30,7 +30,9 @@ from helion._compiler.cute.state import cute_env_state
 from helion._compiler.cute.tcgen05_config import seeds
 from helion._compiler.cute.tcgen05_config import surface
 from helion._testing import DEVICE
+from helion._testing import is_cuda
 from helion._testing import skipIfCudaCapabilityLessThan
+from helion._testing import skipIfFn
 from helion._testing import skipIfNotCUDA
 from helion._testing.cute_dense_tcgen05 import batched_gemm
 from helion._testing.cute_dense_tcgen05 import bind_bmm
@@ -1070,6 +1072,22 @@ def _sm100_gpu(test: Callable[..., object]) -> Callable[..., object]:
     )
 
 
+def _grouped_row_union_gpu(test: Callable[..., object]) -> Callable[..., object]:
+    """``_sm100_gpu`` on capability 10.0 only: the register-MMA family lowers
+    the grouped kernel through the grouped row-union family, which
+    ``grouped_row_union_supported`` admits on (10, 0) alone, so a GB300
+    (10.3) binding never admits it:
+
+        assert state.warp_mma_admitted        # False on 10.3
+    """
+    return _sm100_gpu(
+        skipIfFn(
+            lambda: is_cuda() and torch.cuda.get_device_capability() != (10, 0),
+            reason="the grouped row-union family is validated on capability 10.0 only",
+        )(test)
+    )
+
+
 LAUNCHES = 8
 
 
@@ -1371,7 +1389,7 @@ def _grouped_reference(
     return out
 
 
-@_sm100_gpu
+@_grouped_row_union_gpu
 @pytest.mark.cuda
 @pytest.mark.parametrize(
     ("block_sizes", "warps"),
@@ -1418,7 +1436,7 @@ def test_grouped_row_union_matches_the_jagged_kernel(
         _check(outs[0][covered], ref[covered].float())
 
 
-@_sm100_gpu
+@_grouped_row_union_gpu
 @pytest.mark.cuda
 def test_grouped_row_union_rebinds_per_shape_and_fails_closed_off_the_family() -> None:
     """``static_shapes=False``: the family is admitted from each binding's

@@ -30,8 +30,13 @@ from helion._testing.metal_registers import dequant_forms_mm
 from helion._testing.metal_registers import dequant_reference
 from helion._testing.metal_registers import filled_mm
 from helion._testing.metal_registers import inner_tiled_mm
+from helion._testing.metal_registers import inner_tiled_weight_mm
+from helion._testing.metal_registers import offset_k_mm
 from helion._testing.metal_registers import register_config
+from helion._testing.metal_registers import shifted_x_mm
+from helion._testing.metal_registers import staged_apart_mm
 from helion._testing.metal_registers import two_acc_mm
+from helion._testing.metal_registers import unread_x
 
 if TYPE_CHECKING:
     import helion
@@ -63,6 +68,17 @@ _AFFINE = pairwise(
 #: is a device view, 16 and 32) and the SIMD groups that split K (2, 8 and
 #: 16).
 _SPLIT = pairwise(bits=(4, 5, 6), rows=(8, 16, 32), num_warps=(2, 8, 16))
+
+#: The grid runs' cases (``mpp_registers._grid_run``): the bit width, x's
+#: rows (every tile whole) and the tile with its threads, over 2 to 8 SIMD
+#: groups in sub-tiles of 16 x 16 (a K of 32), 16 x 32, 32 x 16 and 32 x 32.
+_GRID = (
+    (4, 16, [16, 32, 64], [4, 8, 2]),
+    (5, 16, [16, 64, 64], [4, 16, 1]),
+    (6, 32, [32, 64, 64], [8, 16, 1]),
+    (4, 64, [64, 64, 64], [8, 16, 1]),
+    (5, 64, [64, 128, 32], [8, 16, 2]),
+)
 
 
 def _run(
@@ -216,6 +232,106 @@ class TestMppRegisters(unittest.TestCase):
             out, msl = _run(affine_mm, args, config)
         self.assertIn("get_multidimensional_index((ushort)0)", msl)
         self._close(out, affine_reference(args))
+
+    def test_grid(self) -> None:
+        """Grid runs, the SIMD groups of a launch splitting the tile, against
+        float64: 4-, 5- and 6-bit affine weights in sub-tiles of each shape,
+        and 4-bit weights dequantized in half, whose tile holds halves."""
+        for bits, rows, block_sizes, threads in _GRID:
+            with self.subTest(bits=bits, rows=rows, block_sizes=block_sizes):
+                group = 32 if bits == 4 else 128
+                args = affine_args(bits, group, rows, 256, 512, DEVICE)
+                out, msl = _run(affine_mm, args, register_config(block_sizes, threads))
+                self.assertIn("threadgroup float _mst_tile_float[", msl)
+                self._close(out, affine_reference(args))
+        x, w, scales, biases = affine_args(4, 32, 32, 256, 512, DEVICE)
+        config = register_config([32, 64, 64], [8, 16, 1])
+        out, msl = _run(dequant_forms_mm, (x, w, scales, biases, "half"), config)
+        self.assertIn("threadgroup half _mst_tile_half[", msl)
+        self._close(out, dequant_reference(x, w, scales, biases, torch.float16))
+
+    def test_grid_bfloat(self) -> None:
+        """Grid runs of a bfloat x beside weights dequantized in bfloat over 2
+        and 4 SIMD groups, against float64 of the rounded weights."""
+        for rows, block_sizes, threads in (
+            (32, [32, 64, 64], [8, 8, 1]),
+            (64, [64, 64, 64], [8, 16, 1]),
+        ):
+            with self.subTest(block_sizes=block_sizes, threads=threads):
+                x, w, scales, biases = affine_args(4, 32, rows, 256, 512, DEVICE)
+                xb = x.to(torch.bfloat16)
+                config = register_config(block_sizes, threads)
+                out, msl = _run(
+                    dequant_forms_mm, (xb, w, scales, biases, "bfloat"), config
+                )
+                self.assertIn("threadgroup bfloat _mst_tile_bfloat[", msl)
+                ref = dequant_reference(xb, w, scales, biases, torch.bfloat16)
+                self._close(out, ref)
+
+    def test_grid_views(self) -> None:
+        """Against float64: a view of x 8 rows past its tile's offset and a K
+        loop beginning at a run-time 64 (both the staged op), and a half
+        weight tile of 128 x 128 (a grid run on an unpadded tile)."""
+        config = register_config([32, 64, 64], [8, 16, 1])
+        x = torch.randn(40, 128, device=DEVICE).to(torch.float16)
+        y = torch.randn(128, 64, device=DEVICE)
+        w64 = (y.cpu().double() * 0.5).half().double()
+        out, msl = _run(shifted_x_mm, (x, y), config)
+        self.assertNotIn("_mst_tile", msl)
+        self._close(out, x.cpu().double()[8:] @ w64)
+        x = torch.randn(32, 256, device=DEVICE).to(torch.float16)
+        y = torch.randn(256, 64, device=DEVICE)
+        w64 = (y.cpu().double()[64:192] * 0.5).half().double()
+        out, msl = _run(offset_k_mm, (x, y, 64), config)
+        self.assertNotIn("_mst_tile", msl)
+        self._close(out, x.cpu().double()[:, 64:192] @ w64)
+        x, w, scales, biases = affine_args(4, 32, 32, 256, 512, DEVICE)
+        out, msl = _run(
+            dequant_forms_mm,
+            (x, w, scales, biases, "half"),
+            register_config([32, 128, 128], [8, 16, 1]),
+        )
+        self.assertIn("threadgroup half _mst_tile_half[16384];", msl)
+        self._close(out, dequant_reference(x, w, scales, biases, torch.float16))
+
+    def test_grid_all_or_none(self) -> None:
+        """Two groups of one K loop, one with a staged vector, both on the
+        staged op over [32, 128, 64] on 4 SIMD groups, against float64."""
+        x = torch.randn(64, 512, device=DEVICE).to(torch.float16)
+        y = torch.randn(512, 128, device=DEVICE)
+        z = torch.randn(512, 128, device=DEVICE)
+        v = torch.randn(4, 128, device=DEVICE)
+        config = register_config([32, 128, 64], [8, 16, 1])
+        outs, _, msl = run_with_msl(
+            staged_apart_mm, (x, y, z, v), config, module_key=f"staged apart {config!r}"
+        )
+        out_a, out_b = cast("tuple[torch.Tensor, torch.Tensor]", outs)
+        self.assertNotIn("_mst_tile", msl)
+        x64 = x.cpu().double()
+        wy = (y.cpu().double() * 0.5).half().double()
+        wz = (z.cpu().double() * 0.25).half().double()
+        self._close(out_a, (x64 @ wy) * v.cpu().double().sum(0))
+        self._close(out_b, x64 @ wz)
+
+    def test_grid_unread_x(self) -> None:
+        """A widened x the lanes may not read at the op keeps the staged op,
+        against float64."""
+        args = affine_args(4, 32, 16, 128, 256, DEVICE)
+        with unread_x():
+            out, msl = _run(affine_mm, args, register_config([16, 64, 64], [4, 16, 1]))
+        self.assertNotIn("_mst_tile", msl)
+        self._close(out, affine_reference(args))
+
+    def test_grid_inner_tiled(self) -> None:
+        """M and N tiled in a loop of a one-program grid over a launch of 2
+        SIMD groups (the staged op), against float64."""
+        x = torch.randn(32, 128, device=DEVICE).to(torch.float16)
+        y = torch.randn(128, 64, device=DEVICE)
+        out, _ = _run(
+            inner_tiled_weight_mm, (x, y), register_config([32, 64, 32], [4, 8, 2])
+        )
+        ref = x.cpu().double() @ (y.cpu().double() * 0.5).half().double()
+        self._close(out, ref)
 
     def test_one_decision(self) -> None:
         """A register run where the launch's thread axes codegen sees differ

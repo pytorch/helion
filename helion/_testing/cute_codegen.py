@@ -447,6 +447,7 @@ def cuda_metadata_trace() -> Generator[None, None, None]:
         *,
         index_dtype: torch.dtype | None = None,
         is_distributed: bool = False,
+        wide_empty_grid: bool = False,
     ) -> None:
         assert device.type in ("cpu", "cuda")
         old_init(
@@ -455,6 +456,7 @@ def cuda_metadata_trace() -> Generator[None, None, None]:
             settings,
             index_dtype=index_dtype,
             is_distributed=is_distributed,
+            wide_empty_grid=wide_empty_grid,
         )
 
     def convert(

@@ -29,6 +29,7 @@ if TYPE_CHECKING:
     from ....autotuner.config_spec import BlockSizeSpec
     from ....autotuner.config_spec import ConfigSpec
     from ....runtime.config import PidTypeLiteral
+    from ....runtime.settings import SplitKReduction
     from ..dense_gemm import DenseGemmFacts
     from ..epilogue_fanout import PairedFanoutPlan
     from ..grouped_prefix_adaptive_n import GroupedPrefixAdaptiveNProfile
@@ -73,6 +74,11 @@ class CuteTcgen05Config:
     def __init__(self, config_spec: ConfigSpec) -> None:
         self.config_spec = config_spec
         self.search_enabled: bool = False
+        # ``register_search_surface`` has planned the search: from then on
+        # ``search_enabled`` and ``matmul_block_ids`` name the GEMM it took,
+        # and a batched fp32 dot it did not take gets no operand analysis
+        # (``cute_mma._batched_tf32_tma_operands``).
+        self.search_planned: bool = False
         self.matmul_block_ids: tuple[int, int, int] | None = None
         # Separate device launches may own independent native contractions.
         # They share pipeline knobs, but never a single matrix-axis projection.
@@ -118,6 +124,11 @@ class CuteTcgen05Config:
         # Split-K runs whole tiles or the flat-edge TMA path: the
         # ``cute_flat_edge_tma`` setting, recorded at bind.
         self.split_k_flat_edge_tma: bool = True
+        # The ``split_k_reduction`` setting, recorded at bind: "none" keeps
+        # ``tcgen05_split_k`` off the search, the seeds and the defaults, and
+        # the repair refuses it; "output" offers the cluster split's 16-bit
+        # exchange (``tcgen05_split_k_exchange``).
+        self.split_k_reduction: SplitKReduction = "accumulator"
         # The device program runs an ``hl.atomic_*`` (``DeviceIR.has_atomic_ops``):
         # codegen refuses it beside the CtaGroup.TWO pair's shared tiles
         # (``reject_atomics_beside_warp_roles``). Set at bind.
@@ -148,8 +159,15 @@ class CuteTcgen05Config:
         self.matmul_operands_tma_provable: bool = True
         # Every MMA's A is an unaligned operand the flat one-CTA kernel's
         # epilogue warps copy with ``cp.async`` beside a TMA-legal B
-        # (``host_function_cp_async_a_provable``).
+        # (``host_function_cp_async_a_layouts``).
         self.cp_async_a_provable: bool = False
+        # The shallowest k-block those A's copies take (the deepest of their
+        # layouts' ``Tcgen05CpAsyncALayout.min_block_k``).
+        self.cp_async_a_min_block_k: int = 16
+        # The search plan capped N at 64 for a batched GEMM one 64-row tile
+        # tall (``search_plan.tcgen05_one_row_tile_batched_narrow_n``); the
+        # default takes the 64-wide tile too.
+        self.one_row_tile_narrow_n: bool = False
         # Every MMA's A and B pass the TensorMap proof, whatever its output
         # (``host_function_matmul_operands_tma_provable(outputs=False)``).
         self.matmul_inputs_tma_provable: bool = True
@@ -225,8 +243,15 @@ class CuteTcgen05Config:
         # SM count of the bound device (0 when unknown); small-grid seeds use
         # it to decide whether the standard tiling can fill the machine.
         self.device_sm_count: int = 0
-        # (key, widths) of ``_dense_aligned_n_clipped_widths``.
-        self._dense_aligned_n_clipped_cache: tuple[object, frozenset[int]] | None = None
+        # ``Settings.persistent_reserved_sms``: SMs the persistent launches
+        # leave out of their grid (``helion.runtime.get_num_sm(...,
+        # reserved_sms=N)``), so a persistent grid of more tiles than the
+        # SMs left runs several tiles per CTA.
+        self.persistent_reserved_sms: int = 0
+        # search -> (key, widths) of ``_dense_aligned_n_clipped_widths``.
+        self._dense_aligned_n_clipped_cache: dict[
+            bool, tuple[object, frozenset[int]]
+        ] = {}
         # The register-MMA GEMM family (``cute_matmul_family="warp_mma"``):
         # admitted by the search plan (static latency-bound problem, one
         # matmul, supported layouts); its 16x8 tiles widen the M / N block
@@ -255,6 +280,22 @@ class CuteTcgen05Config:
         # (``one_cta_n_edge_partial_output``), so its other partial-tile
         # samples are flattened.
         self.output_edge_persistent_admitted: bool = False
+        # The widest power-of-two N tile dividing N of a 16-bit K-tail GEMM
+        # admitted to the persistent one-CTA schedule over N tiles narrower
+        # than the search's widest (``search_plan``'s
+        # ``allow_k_tail_persistent_pid_types``): its persistent one-CTA
+        # samples are narrowed to it.
+        self.k_tail_persistent_n: int | None = None
+        # A batched 16-bit GEMM whose matrices run on the 128-row CTA pairs
+        # over an M edge, an N edge or a K tail
+        # (``search_plan.batched_pair128_matrix``): the paired pipeline
+        # searches and seeds them.
+        self.batched_pair128_matrix: bool = False
+        # The MMA's epilogue stores through a hierarchical (view/permute)
+        # destination layout (``radix_store``: a head merge fused into a
+        # bmm's store), which the 128-row CTA pairs' epilogue subtiles do
+        # not render (``store_epilogue``).
+        self.matmul_radix_store: bool = False
         # Block id of the leading passthrough (batch) axis, when any.
         self.matmul_leading_block_id: int | None = None
 
