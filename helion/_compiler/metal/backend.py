@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import dataclasses
 import functools
+from itertools import starmap
 import math
 from typing import TYPE_CHECKING
 from typing import Any
@@ -1405,6 +1406,13 @@ class MetalBackend(Backend):
                 f"tile masks are elided only if every launch axis is 1 or "
                 f"{self._uniform_extent}, but the kernel launches {dims}"
             )
+        if math.prod(dims) > MAX_THREADS_PER_THREADGROUP:
+            raise exc.BackendUnsupported(
+                self.name,
+                f"a threadgroup of {list(dims)} threads exceeds "
+                f"{MAX_THREADS_PER_THREADGROUP}; lower num_threads or block_sizes"
+                f"{budget_note()}",
+            )
         check_free_arange_launch(self.free_arange_plan, self._tid_axes, dims)
         split = 1
         if self.mpp_plan is not None:
@@ -1774,6 +1782,60 @@ class MetalBackend(Backend):
         for (block_id, _), was, count in zip(serial, current, chosen, strict=True):
             if count != was:
                 changed |= self._record_thread_count(env, num_threads, block_id, count)
+        # Explicit counts may pass the budget, but not Metal's 1024 threads per
+        # threadgroup: a nested one multiplies with the grid's threads, so when
+        # the launch is still past 1024, shrink the explicit ones too, last
+        # block first.
+        explicit = [
+            (block_id, size)
+            for block_id in reversed(block_ids)
+            if block_id in tunable
+            and block_id not in grid_ids
+            and int(spec.config_get(config.num_threads, block_id, 0)) > 0
+            and isinstance(size := env.block_sizes[block_id].from_config(config), int)
+        ]
+        # ``total`` counts requests.  Each loop fits its own tiles, so the
+        # grid's count here is still its request; it launches what its own
+        # pass gives it, fit to the threadgroup budget (``shrink_tile_threads``).
+        active = [
+            (block_id, size)
+            for block_id in _active_loop_block_ids(fn)
+            if not env.block_sizes[block_id].reduction
+            and isinstance(size := env.block_sizes[block_id].from_config(config), int)
+        ]
+
+        def request(block_id: int, size: int) -> int:
+            if block_id not in tunable:
+                return size
+            return requested_threads(
+                size, num_threads[spec.block_id_to_index(block_id)]
+            )
+
+        grid = [(b, size) for b, size in active if b in grid_ids]
+        launched = math.prod(
+            shrink_tile_threads(
+                [size for _, size in grid],
+                list(starmap(request, grid)),
+                threadgroup_budget(config),
+            )
+        ) * math.prod(request(b, size) for b, size in active if b not in grid_ids)
+        if launched > MAX_THREADS_PER_THREADGROUP and explicit:
+            current = [num_threads[spec.block_id_to_index(b)] for b, _ in explicit]
+            chosen, _ = serialize_auto_threads(
+                [size for _, size in explicit],
+                current,
+                range(len(explicit)),
+                launched,
+                MAX_THREADS_PER_THREADGROUP,
+                to_one={i for i, (b, _) in enumerate(explicit) if b in after_loop},
+            )
+            for (block_id, _), was, count in zip(
+                explicit, current, chosen, strict=True
+            ):
+                if count != was:
+                    changed |= self._record_thread_count(
+                        env, num_threads, block_id, count
+                    )
         literal = math.prod(
             size
             for block_id in block_ids
