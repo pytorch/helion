@@ -79,10 +79,7 @@ def _(state: CodegenState) -> ast.AST:
 
 @_decorators.ref(tile_index)
 def _(tile: RefTile) -> torch.Tensor:
-    env = CompileEnvironment.current()
-    return torch.arange(
-        tile._slice.start, tile._slice.stop, dtype=torch.int32, device=env.device
-    )
+    return tile.index
 
 
 @_decorators.api(tiles_as_sizes=True)
