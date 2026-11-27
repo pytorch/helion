@@ -18,6 +18,7 @@ from helion.runtime.cute.capture_pdl import WaitMode
 from helion.runtime.cute.capture_pdl import storage_union
 from helion.runtime.cute.capture_pdl_cuda import CaptureSnapshot
 from helion.runtime.cute.capture_pdl_cuda import CudaCaptureDriver
+from helion.runtime.cute.capture_pdl_cuda import _Edge
 from helion.runtime.cute.capture_pdl_cuda import _KernelParams
 from helion.runtime.cute.capture_pdl_cuda import finish_capture_launch
 
@@ -292,6 +293,70 @@ def test_empty_capture_and_root_dependencies_do_not_issue_zero_capacity_queries(
     snapshot = driver.snapshot(10)
     assert snapshot is not None and not snapshot.nodes
     assert driver.kernel_dependencies(14) == ()
+
+
+def test_one_capture_query_serves_the_snapshot_and_a_graph_lease():
+    """The guard's snapshot and a lease on the captured graph
+    (``graph_lease``) read a stream's capture through one query, which asks
+    for the pending dependencies with their edge data and copies both out of
+    the arrays CUDA lends. The snapshot declines a capture whose next node
+    would get an edge the proof does not cover; the graph is the query's
+    answer either way, and there is none on a stream that captures nothing."""
+    # node, (from_port, to_port, kind): a dependent launch's edge and a plain one.
+    pending = [(21, (1, 0, 1)), (22, (0, 0, 0))]
+    capturing = [1]
+    lent = []
+
+    def context(out):
+        ctypes.cast(out, ctypes.POINTER(ctypes.c_void_p))[0] = 11
+        return 0
+
+    def capture(stream, status, capture_id, graph, dependencies, edges, count):
+        assert stream == 10
+        nodes = (ctypes.c_void_p * len(pending))(*(node for node, _ports in pending))
+        data = (_Edge * len(pending))()
+        for edge, (_node, ports) in zip(data, pending, strict=True):
+            edge.from_port, edge.to_port, edge.kind = ports
+        lent[:] = [nodes, data]
+        ctypes.cast(status, ctypes.POINTER(ctypes.c_int))[0] = capturing[0]
+        ctypes.cast(capture_id, ctypes.POINTER(ctypes.c_uint64))[0] = 12
+        ctypes.cast(graph, ctypes.POINTER(ctypes.c_void_p))[0] = 13
+        ctypes.cast(dependencies, ctypes.POINTER(ctypes.POINTER(ctypes.c_void_p)))[
+            0
+        ] = ctypes.cast(nodes, ctypes.POINTER(ctypes.c_void_p))
+        ctypes.cast(edges, ctypes.POINTER(ctypes.POINTER(_Edge)))[0] = ctypes.cast(
+            data, ctypes.POINTER(_Edge)
+        )
+        ctypes.cast(count, ctypes.POINTER(ctypes.c_size_t))[0] = len(pending)
+        return 0
+
+    def nodes(graph, output, count):
+        assert graph == 13 and output is None
+        ctypes.cast(count, ctypes.POINTER(ctypes.c_size_t))[0] = 0
+        return 0
+
+    driver = object.__new__(CudaCaptureDriver)
+    driver.library = SimpleNamespace(
+        cuCtxGetCurrent=context,
+        cuStreamGetCaptureInfo_v3=capture,
+        cuGraphGetNodes=nodes,
+    )
+    assert driver.stream_capture(10) == (
+        12,
+        13,
+        (Dependency(21, 1, 0, 1), Dependency(22)),
+    )
+    snapshot = driver.snapshot(10)
+    assert snapshot is not None
+    assert (snapshot.key.capture_id, snapshot.key.graph) == (12, 13)
+    # CUDA's launch-order port: not an edge of the proof.
+    pending[1] = (22, (2, 0, 1))
+    assert driver.snapshot(10) is None
+    refused = driver.stream_capture(10)
+    assert refused is not None and refused[:2] == (12, 13)
+    assert not refused[2][1].supported()
+    capturing[0] = 0
+    assert driver.stream_capture(10) is None and driver.snapshot(10) is None
 
 
 @pytest.mark.parametrize(

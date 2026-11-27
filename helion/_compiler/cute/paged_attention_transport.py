@@ -25,6 +25,12 @@ from .cute_mma_dag import MMA_DAG_KEY_CLIP_LEADING
 from .cute_mma_dag import MMA_DAG_KEY_CLIP_OFF
 from .cute_mma_dag import MMA_DAG_KEY_CLIP_TRAILING
 from .cute_mma_dag import MMA_DAG_L2_HINTS
+from .cute_mma_dag import MMA_DAG_PARTITION_BALANCED
+from .cute_mma_dag import MMA_DAG_PARTITION_ITEM
+from .cute_mma_dag import MMA_DAG_PARTITION_KEY
+from .cute_mma_dag import MMA_DAG_PARTITION_SKEW_CHOICES
+from .cute_mma_dag import MMA_DAG_PARTITION_SKEW_KEY
+from .cute_mma_dag import MMA_DAG_PARTITION_WHOLE
 from .cute_mma_dag import MMA_DAG_PASS_WARPS_ATTENTION_PAIRED
 from .cute_mma_dag import MMA_DAG_PASS_WARPS_ATTENTION_SCOPED
 from .cute_mma_dag import MMA_DAG_PASS_WARPS_KEY
@@ -41,6 +47,10 @@ from .cute_mma_dag import paged_attention_early_retirement_default
 from .cute_mma_dag import paged_attention_key_clip_choices
 from .memory_ops import cute_tensor_base_is_aligned
 from .native_s2f6_contract import NATIVE_S2F6_TARGETS
+from .paged_attention_partition import partition_q_stages
+from .paged_attention_partition import partition_skew_choices
+from .paged_attention_partition import partition_slot_bits
+from .paged_attention_partition_bounds import partition_record_bytes
 
 if TYPE_CHECKING:
     from ...runtime.config import Config
@@ -133,6 +143,22 @@ class PagedAttentionScheduleFacts:
     # Original policy slots of raw K, K scale, raw V and V scale.  None means
     # the source load has no autotuned eviction-policy slot.
     tma_load_slots: tuple[int | None, ...] = ()
+    # Work partitions of the paired schedule this bind can run. For the
+    # persistent ones: the static unit count, the page table's page extent
+    # (which bounds a unit's trip count), the query stages one CTA keeps and
+    # the width of its plan's slot products (``paged_attention_partition``);
+    # for the balanced one also a CTA's record in the launch's workspace.
+    partition_choices: tuple[str, ...] = (MMA_DAG_PARTITION_ITEM,)
+    partition_units: int = 0
+    partition_page_limit: int = 0
+    partition_q_stages: int = 0
+    partition_slot_bits: int = 0
+    partition_record_bytes: int = 0
+    # The range skews the balanced partition can apply (zero is none).
+    partition_skew_choices: tuple[int, ...] = (0,)
+    # Whether a sliding window bounds the pages of a unit: every unit then
+    # streams about the same few pages, whatever its length.
+    windowed: bool = False
 
     def min_blocks_per_mp_choices(
         self, *, scoped_registers: bool = False, paired_items: bool = False
@@ -183,6 +209,20 @@ class PagedAttentionSchedule:
     tma_load_hints: tuple[str, ...] = ("", "", "", "")
     # Which keys that no row sees the boundary tiles' load boxes leave out.
     key_clip: str = MMA_DAG_KEY_CLIP_OFF
+    # ``item`` runs one unit per CTA. Other partitions run ``partition_units``
+    # units on persistent CTAs with ``q_stages`` query stages each; a unit
+    # streams at most ``partition_page_limit`` pages, the page table's extent,
+    # and a CTA finds its units with ``partition_slot_bits`` wide products.
+    # The balanced partition's CTAs exchange the parts of a split unit
+    # through records of ``partition_record_bytes`` in a launch workspace.
+    partition: str = MMA_DAG_PARTITION_ITEM
+    partition_units: int = 0
+    partition_page_limit: int = 0
+    partition_slot_bits: int = 32
+    q_stages: int = 1
+    partition_record_bytes: int = 0
+    # The balanced partition's range skew in slots; zero is equal shares.
+    partition_skew: int = 0
 
 
 def plan_paged_attention_schedule(
@@ -260,6 +300,25 @@ def plan_paged_attention_schedule(
     key_clip = config.get(MMA_DAG_KEY_CLIP_KEY, key_clips[0])
     if type(key_clip) is not str or key_clip not in key_clips:
         return None
+    partition = config.get(MMA_DAG_PARTITION_KEY, MMA_DAG_PARTITION_ITEM)
+    if (
+        type(partition) is not str
+        or partition
+        not in (facts.partition_choices if paired_items else (MMA_DAG_PARTITION_ITEM,))
+        or (
+            partition != MMA_DAG_PARTITION_ITEM
+            and (not use_query_tma or value_metadata_skip)
+        )
+    ):
+        return None
+    partition_skew = config.get(MMA_DAG_PARTITION_SKEW_KEY, 0)
+    if type(partition_skew) is not int or partition_skew not in (
+        facts.partition_skew_choices
+        if partition == MMA_DAG_PARTITION_BALANCED
+        else (0,)
+    ):
+        return None
+    persistent_units = partition != MMA_DAG_PARTITION_ITEM
     query_axis, dimension_axis = semantic.query.tile_dims
     key_axis = semantic.key.raw.tile_dims[0]
     if (
@@ -307,6 +366,15 @@ def plan_paged_attention_schedule(
         value_metadata_read_overlap=value_metadata_read_overlap,
         tma_load_hints=paged_attention_load_hints(facts, config),
         key_clip=key_clip,
+        partition=partition,
+        partition_units=facts.partition_units if persistent_units else 0,
+        partition_page_limit=facts.partition_page_limit if persistent_units else 0,
+        partition_slot_bits=facts.partition_slot_bits if persistent_units else 32,
+        q_stages=facts.partition_q_stages if persistent_units else 1,
+        partition_record_bytes=facts.partition_record_bytes
+        if partition == MMA_DAG_PARTITION_BALANCED
+        else 0,
+        partition_skew=partition_skew,
     )
 
 
@@ -428,6 +496,37 @@ def _paged_attention_schedule_facts(
     )
     if semantic.partial_statistics is not None and not paired_items:
         return None
+    query_tma_available = (
+        paired_items and paged_query_tma(transport, query_columns) is not None
+    )
+    # A persistent CTA requests each unit's queries by TMA, its launch is
+    # sized from the SM count, and its plan sums one slot per unit and page
+    # in an Int32.
+    q_stages = partition_q_stages(capacity)
+    page_limit = semantic.page_table.fake.shape[1]
+    slot_bits = (
+        partition_slot_bits(transport.items // 2, page_limit, env.config_spec.num_sm)
+        if isinstance(page_limit, int)
+        else 0
+    )
+    persistent_units = (
+        query_tma_available
+        and q_stages > 0
+        and env.config_spec.num_sm > 1
+        and slot_bits > 0
+    )
+    # Merging the parts of a split unit reassociates the source's sums, which
+    # only fast math licenses, and only the normalized epilogue has a merge.
+    balanced_units = (
+        persistent_units
+        and env.settings.fast_math
+        and semantic.partial_statistics is None
+    )
+    partitions: tuple[str, ...] = (MMA_DAG_PARTITION_ITEM,)
+    if persistent_units:
+        partitions += (MMA_DAG_PARTITION_WHOLE,)
+    if balanced_units:
+        partitions += (MMA_DAG_PARTITION_BALANCED,)
     return PagedAttentionScheduleFacts(
         query_axis=semantic.query.tile_dims[0].index,
         query_rows=transport.query_rows,
@@ -439,8 +538,7 @@ def _paged_attention_schedule_facts(
         reference_scores=semantic.score_reference is not None,
         paired_items=paired_items,
         partial_statistics=semantic.partial_statistics is not None,
-        query_tma_available=paired_items
-        and paged_query_tma(transport, query_columns) is not None,
+        query_tma_available=query_tma_available,
         value_metadata_skip_available=paired_items
         and paged_value_metadata_skip_supported(transport),
         key_clip_choices=paged_attention_key_clips(
@@ -452,6 +550,23 @@ def _paged_attention_schedule_facts(
         tma_load_slots=tuple(
             access.eviction_slot for access in paged_attention_tma_accesses(semantic)
         ),
+        partition_choices=partitions,
+        partition_units=transport.items // 2 if persistent_units else 0,
+        partition_page_limit=int(page_limit) if persistent_units else 0,
+        partition_q_stages=q_stages if persistent_units else 0,
+        partition_slot_bits=slot_bits if persistent_units else 0,
+        partition_record_bytes=partition_record_bytes(query_columns)
+        if balanced_units
+        else 0,
+        partition_skew_choices=partition_skew_choices(
+            MMA_DAG_PARTITION_SKEW_CHOICES,
+            transport.items // 2,
+            int(page_limit),
+            env.config_spec.num_sm,
+        )
+        if balanced_units
+        else (0,),
+        windowed=semantic.mask.window_left is not None,
     )
 
 

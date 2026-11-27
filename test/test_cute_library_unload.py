@@ -1165,9 +1165,9 @@ def test_abandoned_capture_finalized_inside_the_counts_region_does_not_wait(
 
 def test_unload_waits_for_another_threads_driver_calls(events: list[str]) -> None:
     """The job-end unload is its owner's one chance: where another thread
-    holds the capture gate for driver calls of its own (a finalizer's
-    unload), ``unload_libraries`` waits for it and then unloads, instead
-    of leaving the libraries to a finalizer."""
+    holds the capture gate for driver calls of its own (a spare's fill, a
+    finalizer's unload), ``unload_libraries`` waits for it and then
+    unloads, instead of leaving the libraries to a finalizer."""
     fn, _modules = _candidate(events, launched_on=(1,))
     holding = threading.Event()
     errors: list[BaseException] = []

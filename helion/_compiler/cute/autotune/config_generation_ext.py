@@ -62,6 +62,12 @@ from ..cute_flash import _flash_resident_softmax_overrides
 from ..cute_flash import flash_exp2_packet_is_compound
 from ..cute_mma_dag import MMA_DAG_KEY
 from ..cute_mma_dag import MMA_DAG_OFF
+from ..cute_mma_dag import MMA_DAG_PARTITION_BALANCED
+from ..cute_mma_dag import MMA_DAG_PARTITION_ITEM
+from ..cute_mma_dag import MMA_DAG_PARTITION_KEY
+from ..cute_mma_dag import MMA_DAG_PARTITION_SKEW_KEY
+from ..cute_mma_dag import MMA_DAG_PASS_WARPS_ATTENTION_PAIRED
+from ..cute_mma_dag import MMA_DAG_PASS_WARPS_KEY
 from ..flash_knobs import FLASH_COVERAGE_CHILD_PARENTS
 from ..packet_store_policy import store_policy_reaches_a_packet
 from ..pdl_release import CUTE_PDL_CAPTURE_RELEASE_CHOICES
@@ -76,6 +82,7 @@ from ..thread_budget import tile_level_axes
 from ..tile_packing import packed_grid_block
 from .mma_dag_surface import CAPTURE_POLICY_REQUIREMENTS
 from .mma_dag_surface import PAIRED_CAPTURE_SCHEDULE
+from .mma_dag_surface import PARTITION_TRANSPORT
 from .mma_dag_surface import kept_capture_policy
 
 if TYPE_CHECKING:
@@ -496,6 +503,56 @@ class CuteConfigGenerationExtension(ConfigGenerationExtension):
         self._flash_coverage_design_cache: FlashCoverageDesign | None = None
 
     def conditional_neighbor_updates(
+        self, base: FlatConfig, requested: FlatConfig
+    ) -> Mapping[int, object]:
+        """Activate a paired schedule's coupled options together with their
+        prerequisites: a work partition and its range skew
+        (``_partition_neighbor_updates``), and the dependent-launch policies
+        (``_pdl_neighbor_updates``)."""
+        return {
+            **self._partition_neighbor_updates(base, requested),
+            **self._pdl_neighbor_updates(base, requested),
+        }
+
+    def _partition_neighbor_updates(
+        self, base: FlatConfig, requested: FlatConfig
+    ) -> dict[int, object]:
+        """Step onto a persistent work partition with the transport it needs.
+
+        A CTA that runs several units requests each unit's queries by TMA and
+        has no value-metadata actor, and normalization repairs a partition
+        without them back to one unit per CTA
+        (``paged_attention_partition_reason``): from most configs the step
+        alone would be an alias of where it started. A range skew belongs to
+        the balanced partition, so a step onto one takes that partition too.
+        """
+        layout = self.generation._key_to_flat_indices
+        if MMA_DAG_PARTITION_KEY not in layout:
+            return {}
+        # Every other body pins the partition, whatever the step asks for.
+        schedule = layout[MMA_DAG_PASS_WARPS_KEY][0][0]
+        if any(
+            values[schedule] != MMA_DAG_PASS_WARPS_ATTENTION_PAIRED
+            for values in (base, requested)
+        ):
+            return {}
+        partition = layout[MMA_DAG_PARTITION_KEY][0][0]
+        updates: dict[int, object] = {}
+        if MMA_DAG_PARTITION_SKEW_KEY in layout:
+            skew = layout[MMA_DAG_PARTITION_SKEW_KEY][0][0]
+            if requested[skew] != 0 and requested[skew] != base[skew]:
+                updates[partition] = MMA_DAG_PARTITION_BALANCED
+        target = updates.get(partition, requested[partition])
+        if target == MMA_DAG_PARTITION_ITEM or (
+            not updates and target == base[partition]
+        ):
+            return {}
+        for key, value in PARTITION_TRANSPORT.items():
+            if key in layout:
+                updates[layout[key][0][0]] = value
+        return updates
+
+    def _pdl_neighbor_updates(
         self, base: FlatConfig, requested: FlatConfig
     ) -> Mapping[int, object]:
         """Activate paired PDL policies together with their prerequisites.

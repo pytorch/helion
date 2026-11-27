@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 from typing import TYPE_CHECKING
+from typing import ClassVar
 
 from ....autotuner_heuristics.registry import AutotunerHeuristic
 from ....compile_environment import CompileEnvironment
@@ -52,6 +53,12 @@ class CuteMmaDagHeuristic(AutotunerHeuristic):
     promote_seed_to_default = True
     PROMOTE_TARGETS = (("cuda", "sm100"), ("cuda", "sm103"))
     CACHE_SPECIALIZATION_FACTS = frozenset({"input_tensor_metadata"})
+    # A paged-attention kernel's facts also read the SM count
+    # (``ConfigSpec.num_sm``): the partitions a persistent launch can run and
+    # what follows from them, such as the width of its plan.
+    ATTENTION_SPECIALIZATION_FACTS: ClassVar[
+        frozenset[CompilerHeuristicSpecializationFact]
+    ] = frozenset({"input_tensor_metadata", "config_num_sm"})
     SEED_TILES = SEED_TILES
     SEED_TCGEN05 = SEED_TCGEN05
 
@@ -121,6 +128,11 @@ class CuteMmaDagHeuristic(AutotunerHeuristic):
                     capture_policy_available(env.config_spec)
                     and env.settings.autotune_benchmark_input_banks > 1
                 )
+                # The same benchmark resolves the balanced partition's range
+                # skew, a few tenths of a percent of a full-attention call.
+                env.config_spec.cute_mma_dag_partition_skew_searched = (
+                    env.settings.autotune_benchmark_input_banks > 1
+                )
                 if phase_index is not None:
                     from .....language import memory_ops
                     from ....device_ir_analysis import _load_needs_eviction_tunable
@@ -161,6 +173,8 @@ class CuteMmaDagHeuristic(AutotunerHeuristic):
         if facts is None:
             return frozenset()
         enable_cute_mma_dag_search(env.config_spec, facts)
+        if facts.attention is not None:
+            return cls.ATTENTION_SPECIALIZATION_FACTS
         return cls.CACHE_SPECIALIZATION_FACTS
 
     @classmethod

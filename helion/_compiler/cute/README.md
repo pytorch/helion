@@ -317,6 +317,296 @@ entry that selects a transport a search candidate's clip cannot run
 re-derives that clip instead of rejecting the candidate
 (`rederive_overridden_key_clip`).
 
+The paired schedule's `cute_mma_dag_partition` chooses how its units (two
+adjacent leading items: one request with two heads) are divided among CTAs.
+`item`, the default and the meaning of a missing key, launches one CTA per
+unit. `whole` launches `min(units, SMs)` persistent CTAs, with the SM count of
+the launch device (less `persistent_reserved_sms`) read at each launch, and
+balances them by work, not by unit count. A unit that streams `n` pages has
+`n + 1` slots, a header and one per page; with `T` slots in all, the first
+`G = min(grid, T)` CTAs are active and CTA `c` runs, as one page stream, the
+units whose header slot lies in `[c * T // G, (c + 1) * T // G)`. Every unit
+has one owner; a CTA whose share lies inside one long unit runs nothing. The
+sums are exact and computed on the device at every launch
+(`_paged_attention_partition.py`). The threads of the scanning warps, one
+unit per thread up to 640 units and `ceil(units / 640)` beyond, each sum the
+slots of their units into two small tables in shared memory
+(`partition_scan`) and arrive at named barrier 7. Only the loader's warp
+waits there, at the head of its role and behind its register quota, which it
+holds while the others scan: it finds the CTA's range from the tables with
+two divisions (`partition_plan`), its lane zero writes the plan (the first
+unit, the end of the units and the pages of the stream) to shared memory,
+the warp arrives at the setup rendezvous, barrier 6, without waiting, as it
+does with one unit per CTA, and the stream starts from the plan in the
+loader's registers. The quota is the control warpgroup's: its four warps
+take it from one instruction behind the scan, ahead of the rendezvous,
+because `setmaxnreg` has every warp of a warpgroup execute the same
+instruction and the loader needs its quota before the other three have a
+role. No other warp decodes: every other role waits at the
+rendezvous and reads the three plan words behind it. (Decoding in every warp
+behind the rendezvous, with the loader waiting there too, measured 0.1 to
+0.3 us per call slower on a B200.) Barrier 7 counts the scanning warps and
+the loader's warp once. The loader's warp, warp 17, is itself a scanning
+warp only when the scan takes eighteen warps or more, which is more than
+`544 * c` units at `c` units per thread: 545 to 640 units, 1,089 to 1,280,
+1,633 to 1,920. Everywhere else it only waits: up to 544 units, and again
+from 641, where two units per thread take eleven warps. The loader then
+requests the units' pages back to back and, ahead of each unit's pages,
+its queries into one of two query stages (one when shared memory is
+short); only the queries of the CTA's first unit with pages are the QK
+role's own request, as with one unit per CTA, so that the stream starts
+with pages; the conversion warps and the PV issuer follow the stream; a
+compute group stores a unit's outputs and resets its panels and row state
+between two units while the other roles already stage the next unit. The
+row owners reset the state and one thread records the unit for the group,
+ahead of the group barrier that publishes both. The compute groups meet at
+`bar.sync` barriers; per the PTX ISA (9.5, section 9.7.15.1) a barrier
+instruction "causes executing thread to wait for all non-exited threads
+from its warp", so a block that some lanes run ahead of a barrier needs no
+warp synchronization of its own. The setup rendezvous and the retirement
+keep the non-aligned form because their participants reach them at
+different instructions. Each unit gets the instructions and state a CTA of
+its own would, so results are bit-identical to `item`, and a key clip
+applies at each unit's own first and last page, never between two units.
+`whole` needs the query TMA, no value-metadata skip, a static unit count and
+fewer than 2**31 slots (`units * (page table pages + 1)`); an illegal value is
+an `InvalidConfig`, and `fix_invalid` repairs it to `item` without touching
+another knob. The launch is one wave, so the dependent-launch placements
+treat it as such: the default guarded overlap releases from each loader's
+tail, four pages before the end of its CTA's whole stream. The roles of a
+persistent CTA evaluate a unit's loop bounds when they reach it. Up to 640
+units, and when the bounds read nothing but the unit's one Int32 length (the
+generated `..._unit_bounds_scanned` helper exists), the scan keeps every
+length it loaded in a third table and the roles evaluate from that word, so
+no role waits for a global load of a length ahead of its first page;
+otherwise each role loads the length again. Either way the scan and the
+roles must see the same lengths, so `lengths` (or whatever the bounds read)
+must not change while the kernel runs: a concurrent writer can then hang the
+launch, where `item` reads each length once at entry. No seed selects `whole`
+and the search does not draw it. Whole units are a coarse grain: with equal
+lengths and a unit count that is not a multiple of the CTA count some CTAs
+run one unit more and run on alone. On a B200, 200 requests of a 2047-key
+window take 49.0 us against 40.5 us for `item` under the default overlap,
+whose next call refills the SMs a partial wave leaves idle. Nor is `whole`
+the same as `item` when there are no more units than CTAs: the slot rule
+gives each unit a CTA of its own only for equal lengths. With ragged
+lengths the CTAs whose share lies inside a long unit idle while short
+units share a CTA (128 units of 0 to 17 pages on 128 CTAs, by the slot
+model: about 30 CTAs without a unit, up to five units on one, and the
+busiest CTA streams about 22 pages where no unit has more than 17).
+Results stay bit-identical; no identity maps `whole` to `item` there.
+
+`balanced` launches the same grid and gives a CTA the page slots of its
+range themselves, an equal share of the pages whatever the units' lengths.
+Slot `header + 1 + j` of a unit with `n` pages is its loop step `n - 1 - j`,
+so a unit that crosses a range boundary runs in parts on consecutive CTAs,
+the lowest CTA its last steps; a unit without pages runs where its header
+is. The loader, the QK role and the compute groups clip each unit to the
+CTA's slots (`unit_segment`); page coordinates, masks and a key clip keep
+the unit's own steps, so no part boundary is a window edge. A part runs the
+recurrence from an empty state. Its compute groups then exchange the part's
+unnormalized panel and each row's maximum and denominator with the unit's
+other parts through a workspace: `helion.runtime.cute.paged_partition` owns
+one per device, stream and geometry, the record count and size (for the
+sixteen streams that launched most recently, and one per captured graph),
+the generated host function passes it as one more tensor, and it holds, per
+resident CTA, two arrival counters and four partial slots (83,584 bytes at
+40 query columns: 12.4 MB on 148 SMs, whatever the batch). The exchange
+never waits for another CTA:
+
+- A part stores its partial into its CTA's slot and arrives with an atomic
+  add on the unit's counter, the one of the unit's lowest CTA; the part
+  whose arrival is the last merges. The lowest part, which runs the unit's
+  last steps as its CTA's last pages and so normally finishes last, first
+  reads the counter once and merges without arriving if every other part
+  has arrived. The merger resets the counter: all counters are zero
+  whenever no launch that uses the workspace is in flight.
+- A CTA runs at most one part that is not its unit's lowest, the first
+  thing it runs. An arrival takes about as long as a page while the CTA's
+  memory traffic is busy, so the compute group does not make that one
+  itself: it stores the partial, posts it to the CTA's spare warp and goes
+  on. The spare warp joins the group's stores at a named barrier (8 and 9,
+  one per head), arrives for them, and tells the group at the end of its
+  walk (barriers 10 and 11) whether that arrival was the last; only then,
+  which takes the unit's lowest part to finish first, the group merges
+  that unit after its other work.
+- One thread of a group decides what its part does, and the group's next
+  barrier publishes the decision. The decision waits for nothing
+  (`split_arrival`: one look at the unit's counter and, under a skew, a
+  short walk over CTAs that reads no memory), as no part of the exchange
+  waits for another CTA. Keep it so: a single lane that waited there for
+  another CTA never stored its unit, and a source test keeps the block
+  free of waits. The spare warp and the groups meet at
+  barriers of the non-aligned form (`barrier.cta.sync` and `.arrive`),
+  which they reach at different instructions; one of the warp's lanes does
+  wait, for the launch's dependencies, ahead of the warp's arrival.
+- Whichever part merges folds all parts in source order, the unit's first
+  steps first, each term one fused multiply-add onto the sum so far: with
+  `M` the largest of the parts' row maxima `m`, the unit's denominator and
+  panel are the sums of `l * b**(m - M)` and `O * b**(m - M)`. The bits do
+  not depend on the order in which the parts finish. The common merge, of a
+  unit in two parts by its lowest part, starts the other part's loads
+  inside the part's own reduction, so they overlap the wait for its last
+  PV, and folds its own panel onto the other's eight columns at a time: no
+  path holds two panels in registers, which the softmax's register quota
+  has no room for.
+- Every access to the workspace follows the launch's dependency wait in the
+  thread that makes it: a part's epilogue starts with the wait and the
+  spare warp waits before its arrival. The alias plan lists the workspace
+  as stored and not as read ahead of that wait, so the capture proof still
+  lets a captured launch read its inputs while its predecessor runs, and
+  no other argument may overlap the workspace.
+
+`cute_mma_dag_partition_skew`, in pages, makes the shares of a balanced
+launch unequal. With a skew of `k` the range of CTA `c` begins at slot
+`c * T // G + k * c * (G - c) // (G - 1)`, so the shares fall linearly from
+the mean plus `k` for the first CTA, which the launch dispatches first, to
+the mean minus `k` for the last, and the CTAs end one after another instead
+of together. Zero, the default and the meaning of a missing key, is equal
+shares. A skew costs its own length at the end of the launch, where the
+first CTA runs on alone, so it pays only as a small part of the share; at
+the mean share it would give the last CTAs empty or reversed ranges, on
+which a launch hangs. The device therefore applies `min(k, (T // G) // 32)`,
+none on a single CTA, whatever the lengths are: a launch of short units, or
+of a window's few pages out of a long page table, applies less than the
+config names, down to none, and no range is ever empty. A config may name
+only the skews that some launch of the bind can apply in full
+(`partition_skew_choices`: up to `units * (pages + 1) // min(units, SMs) //
+32`). A skew changes which units are split and where, so results move
+within the rounding described next. Finding the CTAs of a split unit under
+a skew walks down from the equal shares' owner, one CTA and two divisions a
+step in one thread (`_slot_cta`); the bound keeps that to two steps on 148
+CTAs. On a B200 (148 CTAs, time against no skew): without a window, over
+six cases each, 8 pages take 0.2% off 320 requests of 211 pages (shares of
+458 slots) and 0.4% off 200 requests of 391 (529), and 16 pages applied
+whole added 0.3% and 0.1%; on a 2047-key window (shares of 39 and 25 slots)
+8 pages applied whole added 7% and 10% (63.6 against 59.4 us and 45.3
+against 41.0), which is where the bound comes from. With it those launches
+apply one page and none, and a config that names 8 reads 59.7 and 41.1 us,
+within the measurement's spread of no skew.
+
+Units that run in one CTA keep `item`'s bits. A unit in parts differs by the
+rounding of a reassociated sum: its parts round their probabilities to BF16
+against their own maxima and the merge adds a few FP32 operations. On the
+partition tests' random data that is at most 0.6% of the unit's largest
+output and 2e-6 in the LSE. That is a reassociation only `fast_math`
+licenses, so the choice exists only under it, and only for the normalized
+epilogue (the raw-statistics one has no merge). Which units are split
+follows from the lengths and the launch's CTA count, so results are
+reproducible on one device and differ in those bits between devices of
+different SM counts. The inputs must not change while a launch runs, as for
+`whole`. Here a changed length (CTAs that read different lengths plan
+different splits), like a launch that never completes, can also leave a
+counter of the workspace at a count `L` above zero, and nothing zeroes it
+again. Every later launch that splits a unit at that counter, in `n` parts,
+then goes wrong at the unit. With `L < n` a part merges without the last `L`
+parts: it folds what their slots hold then, an earlier launch's partials or
+stores still in flight, and the late parts count on from its reset and leave
+`L` behind again (less only by an arrival that falls between a merger's
+read of the counter and its reset), so wrong values can persist across
+launches of the same split; when the early merger is the lowest part, a part
+that arrives between its look at the counter and its reset merges as well,
+and two parts store the unit. With `L >= n` nothing merges, the unit's
+outputs keep the previous contents of their memory, and the counter grows
+with every launch.
+Captured launches adopt a workspace that an earlier eager launch zeroed, so
+the graph gets no fill; a capture without one zeroes the counters inside
+the graph, once ahead of its first launch. The eager launch zeroes that
+spare on a stream the runtime keeps for these fills and waits for the fill
+alone, not for the work queued on the stream it launches on. CUDA creates
+that stream for the runtime (`cuStreamCreate`, one per device, kept for the
+process): a stream of PyTorch's pool is handed to other code too, and a
+thread capturing a graph on it would get the fill as a node of its graph and
+lose its capture to the wait. CUDA refuses a thread in its default capture
+mode the spare's allocation and that wait while any thread captures a graph
+in the global mode, the default of `torch.cuda.graph`, and the refused call
+invalidates that capture. The launch therefore makes the spare with its
+thread in CUDA's `THREAD_LOCAL` mode, pushed and popped around the spare
+(`cuThreadExchangeStreamCaptureMode`), in which the captures of other
+threads do not bar it: beside a default-mode `torch.cuda.graph` that another
+thread holds open, an eager launch makes its spare and the capture replays
+right (measured on a B200, where the wait was refused and the capture lost
+without the exchange). A capture of the launching thread bars those calls in
+either mode, so no spare is made while that thread's current stream captures
+on any device, nor while a `cute_cuda_graph` capture is underway in the
+process, and none of the latter begins while one is made: the launch asks,
+fills and waits under the runtime's capture gate
+(`launch_caches.outside_captures`), which the startup of such a capture
+waits for and which the launch itself only tries. Not seen is a raw
+`torch.cuda.graph` of the launching thread on a stream that is no longer
+current on its device: by CUDA's documentation of the capture modes (no run
+has this case) a thread that launches eagerly there has to capture in the
+`relaxed` mode. A capture that finds no spare zeroes
+its counters inside its graph. A graph's
+workspace lives as long as the graph. One captured through `cute_cuda_graph`
+releases it at its reset. A raw `torch.cuda.graph` does not expose its owner
+to the launcher, so its workspace is leased on the graph being captured, as
+a CUDA user object (`helion.runtime.cute.graph_lease`): CUDA ends the lease
+when the graph is destroyed and its replays have completed, and the next
+launch that captures, or that makes an eager workspace or a spare, returns
+the workspaces whose leases have ended to the allocator. Until such a launch
+a destroyed graph's workspace stays allocated, so a program that captures
+again and again holds the workspaces of the graphs it has alive at once, not
+one per capture. What a live graph holds is a whole workspace per stream it
+captured on, for as long as the graph exists: one record per resident CTA,
+12.4 MB on 148 SMs at 40 query columns and 9.9 MB at 32, whatever the batch.
+A server that keeps one captured graph per batch size therefore holds one
+workspace per graph (about 0.6 GB for fifty graphs at 40 columns), beside
+those of its eager streams.
+
+The search weighs `item` against `balanced` wherever a bind offers both
+(`ConfigSpec.cute_mma_dag_partition`). A step onto the partition from a
+config without the query TMA, or with the value-metadata transport, takes
+the first and drops the second in the same step
+(`CuteConfigGenerationExtension._partition_neighbor_updates`): normalization
+repairs a partition without them to `item` and never changes another knob,
+so the step alone would be an alias of where it started. An
+`autotune_config_overrides` entry that fixes a partition, or a skew other
+than zero, is no step: every candidate on the paired schedule takes the same
+prerequisites under it (`take_overridden_partition_transport`), where
+without them the override kept only the few paired seeds that already had
+the query TMA, or under a skew alone the balanced ones. A partition named
+in a config that selects another schedule is an `InvalidConfig` that says
+so: a key a config leaves out takes its own default, not the kernel's
+default config. The seeds name `balanced` only where the static unit count
+exceeds the bind's SM count: the leading paired family once more on the
+balanced partition, behind every other seed, and for a kernel without a
+window whose shares take it, in a search that samples the skew, a second
+time with a skew of 8 pages, which releases its dependents at entry where
+the benchmark observes the release
+(over twelve cases at 320 and 200 requests without a window, handwritten /
+Helion by the means of 3 x 20 samples, in two runs: with the four configs
+side by side 0.987 for `balanced`, 0.991 with the skew, 0.990 with the entry
+release and 0.993 with both; with three of them again 0.988 for `balanced`,
+0.990 with the skew and 0.994 with both). With every unit on an SM of its
+own the partition only adds its plan and its merges. The skew is searched
+only where candidates are timed over a cycle of input banks
+(`autotune_benchmark_input_banks` above one), the benchmark that resolves
+a few tenths of a percent, and a step onto a skew takes the balanced
+partition with it. The autotune-off default stays `item`. A bound kernel
+is specialized on the SM count (`config_num_sm`): the partitions a bind
+offers, the width of its plan, its skews and the seeds' choice follow it.
+
+Measured on a B200 (148 SMs) with the SDG eval harness, the kernel without a
+config against the same with `balanced`, us per call (means of the first
+draft case of each arm):
+
+| requests, keys | handwritten | `item` | `balanced` |
+| --- | --- | --- | --- |
+| 320, 2047-key window | 54.5 | 64.1 | 59.3 |
+| 200, 2047-key window | 35.7 | 40.0 | 41.1 |
+| 320, 211 pages | 641 | 699 | 653 |
+| 200, 391 pages | 741 | 769 | 757 |
+
+Over the harness's six cases of each row `balanced` takes 6.3% less time
+than `item` at 320 requests on the window and 7.1% less on 211 pages, 2.5%
+less at 200 requests of 391 pages (1.5% by the medians: `item`'s latency
+steps up within a run there), and 2.2% more at 200 requests on the window.
+The exchange is what the window pays: a timing-only probe that ran the
+same ranges without it read 57.4 and 39.3 us, about 2 us less, and at 200
+requests the equal shares alone gain less than that. With 128 requests, an
+SM each, `balanced` reads 26.1 us against 25.2.
+
 ### 3.3 Whole-kernel generators and regeneration
 
 `KERNEL_GENERATORS` (`kernel_generators.py`): `grouped_prefix_adaptive_n`,

@@ -73,6 +73,11 @@ def _key(kernel: SimpleNamespace) -> str | None:
         ),
         (
             "helion_paged_attention",
+            "_compiler/cute/_paged_attention_partition.py",
+            "helion_flash",
+        ),
+        (
+            "helion_paged_attention",
             "_compiler/cute/_warp_mma_runtime.py",
             "helion_flash",
         ),

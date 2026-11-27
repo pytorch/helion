@@ -53,6 +53,11 @@ from ..cute_mma_dag import MMA_DAG_LOOKAHEAD_OFF
 from ..cute_mma_dag import MMA_DAG_LOOKAHEAD_ON
 from ..cute_mma_dag import MMA_DAG_MODES
 from ..cute_mma_dag import MMA_DAG_OFF
+from ..cute_mma_dag import MMA_DAG_PARTITION_BALANCED
+from ..cute_mma_dag import MMA_DAG_PARTITION_ITEM
+from ..cute_mma_dag import MMA_DAG_PARTITION_KEY
+from ..cute_mma_dag import MMA_DAG_PARTITION_SKEW_KEY
+from ..cute_mma_dag import MMA_DAG_PARTITION_WHOLE
 from ..cute_mma_dag import MMA_DAG_PASS_WARPS_ATTENTION_PAIRED
 from ..cute_mma_dag import MMA_DAG_PASS_WARPS_CHOICES
 from ..cute_mma_dag import MMA_DAG_PASS_WARPS_KEY
@@ -95,6 +100,8 @@ from ..cute_mma_dag import mma_dag_ragged_ceilings
 from ..cute_mma_dag import mma_dag_seed_configs
 from ..cute_mma_dag import paged_attention_early_retirement_default
 from ..cute_mma_dag import paged_attention_key_clip_choices
+from ..cute_mma_dag import paged_attention_partition_choices
+from ..cute_mma_dag import paged_attention_partition_skew_choices
 from ..cute_mma_dag import paged_attention_pass_warp_choices
 from ..cute_register_subblocks import COLSIDE_CHOICES as RSB_COLSIDE_CHOICES
 from ..cute_register_subblocks import COLSIDE_KEY as RSB_COLSIDE_KEY
@@ -336,10 +343,37 @@ def enable_cute_mma_dag_search(config_spec: ConfigSpec, facts: CuteMmaDagFacts) 
     config_spec.cute_mma_dag_value_metadata_skip = None
     config_spec.cute_mma_dag_value_metadata_read_overlap = None
     config_spec.cute_mma_dag_key_clip = None
+    config_spec.cute_mma_dag_partition = None
+    config_spec.cute_mma_dag_partition_skew = None
     if facts.attention is not None and facts.attention.paired_items:
         if len(facts.attention.key_clip_choices) > 1:
             config_spec.cute_mma_dag_key_clip = EnumFragment(
                 choices=facts.attention.key_clip_choices
+            )
+        partitions = facts.attention.partition_choices
+        if len(partitions) > 1:
+            # The search weighs one unit per CTA against equal shares of the
+            # pages. Whole units on a persistent grid stay a value configs can
+            # name: no measurement favours them (B200, 148 SMs: 9-24% behind
+            # one unit per CTA at 200 and 320 units, that schedule plus the
+            # plan at 128), and the balanced partition is their refinement
+            # wherever both are legal.
+            config_spec.cute_mma_dag_partition = EnumFragment(
+                choices=partitions,
+                search_choices=tuple(
+                    choice for choice in partitions if choice != MMA_DAG_PARTITION_WHOLE
+                ),
+            )
+        skews = facts.attention.partition_skew_choices
+        if len(skews) > 1:
+            # A skew moves units of many pages by a few tenths of a percent,
+            # either way, so it is sampled only where the benchmark resolves that
+            # (``ConfigSpec.cute_mma_dag_partition_skew_searched``).
+            config_spec.cute_mma_dag_partition_skew = EnumFragment(
+                choices=skews,
+                search_choices=(
+                    None if config_spec.cute_mma_dag_partition_skew_searched else (0,)
+                ),
             )
         config_spec.cute_mma_dag_v_lag = EnumFragment(choices=MMA_DAG_V_LAG_CHOICES)
         config_spec.cute_mma_dag_sleep_waits = EnumFragment(choices=(False, True))
@@ -585,6 +619,120 @@ def _pin_paired_knobs(config: dict[str, object]) -> None:
     for key, default in _PAIRED_KNOB_PINS:
         if key in config:
             config[key] = default
+    # One unit per CTA is the only partition of every other body; it and a
+    # missing key are one identity, as are equal shares and no skew.
+    config.pop(MMA_DAG_PARTITION_KEY, None)
+    config.pop(MMA_DAG_PARTITION_SKEW_KEY, None)
+
+
+def _normalize_partition(
+    facts: CuteMmaDagFacts, config: dict[str, object], *, fix_invalid: bool
+) -> None:
+    """Validate the paired work partition before the attention checks.
+
+    An illegal partition is repaired to one unit per CTA, which keeps the
+    paired schedule and every other knob: coupled changes belong to the
+    search's moves, not to normalization. A range skew the partition cannot
+    apply is repaired to none; no skew and a missing key are one identity.
+    """
+    from ..paged_attention_config import paged_attention_partition_reason
+    from ..paged_attention_config import paged_attention_partition_skew_reason
+
+    reason = paged_attention_partition_reason(facts, config)
+    if reason is not None:
+        if not fix_invalid:
+            raise InvalidConfig(reason)
+        config[MMA_DAG_PARTITION_KEY] = MMA_DAG_PARTITION_ITEM
+    if config.get(MMA_DAG_PARTITION_KEY) == MMA_DAG_PARTITION_ITEM:
+        config.pop(MMA_DAG_PARTITION_KEY)
+    reason = paged_attention_partition_skew_reason(facts, config)
+    if reason is not None:
+        if not fix_invalid:
+            raise InvalidConfig(reason)
+        config[MMA_DAG_PARTITION_SKEW_KEY] = 0
+    skew = config.get(MMA_DAG_PARTITION_SKEW_KEY)
+    if type(skew) is int and skew == 0:
+        config.pop(MMA_DAG_PARTITION_SKEW_KEY)
+
+
+# What a persistent partition needs of a config's transport: the two options
+# ``paged_attention_partition_reason`` rules on, and the read overlap, which
+# exists only with the value-metadata transport. The search's step onto a
+# partition and a fixed override both take it from here.
+PARTITION_TRANSPORT = MappingProxyType(
+    {
+        MMA_DAG_QUERY_TMA_KEY: True,
+        MMA_DAG_VALUE_METADATA_SKIP_KEY: False,
+        MMA_DAG_VALUE_METADATA_READ_OVERLAP_KEY: False,
+    }
+)
+
+
+def take_overridden_partition_transport(
+    config_spec: ConfigSpec,
+    config: dict[str, object],
+    overrides: Mapping[str, object],
+) -> None:
+    """Give a paired candidate what the work partition or range skew that
+    ``overrides``, already layered over it, select needs of it.
+
+    A persistent partition requests each unit's queries by TMA and has no
+    value-metadata actor, and a range skew belongs to the balanced
+    partition (``paged_attention_partition_reason``,
+    ``paged_attention_partition_skew_reason``). A search steps onto either
+    together with those prerequisites
+    (``CuteConfigGenerationExtension._partition_neighbor_updates``). A fixed
+    override is no step: layered over a complete candidate it was rejected
+    wherever the candidate's own transport differed, so
+    ``cute_mma_dag_partition="balanced"`` kept only the paired seeds that
+    already had the query TMA, and a skew alone only the balanced seeds:
+    none where every unit has an SM, which left a search without the paired
+    schedule.
+
+    Under such an override a candidate on the paired schedule therefore
+    takes what the search's step takes: the balanced partition under a skew
+    other than zero, then the query TMA, and it drops the value-metadata
+    transport and its read overlap. A candidate's own skew that the
+    overridden partition cannot apply is dropped, as a key clip that no
+    longer fits is (``rederive_overridden_key_clip``).
+
+    Nothing else changes. An overridden option is never changed, so an entry
+    that names a partition together with a transport that cannot run it is
+    still rejected; a candidate on another schedule is left to that body's
+    rule, whose only partition is one unit per CTA; and a partition or skew
+    the bind does not offer is left for validation to reject."""
+    facts = config_spec.cute_mma_dag_facts
+    named_partition = MMA_DAG_PARTITION_KEY in overrides
+    named_skew = MMA_DAG_PARTITION_SKEW_KEY in overrides
+    if facts is None or not (named_partition or named_skew):
+        return
+    pass_warps = config.get(MMA_DAG_PASS_WARPS_KEY)
+    if pass_warps != MMA_DAG_PASS_WARPS_ATTENTION_PAIRED:
+        return
+    partitions = paged_attention_partition_choices(facts, pass_warps)
+    skew = config.get(MMA_DAG_PARTITION_SKEW_KEY, 0)
+    if named_skew and not named_partition:
+        if (
+            type(skew) is int
+            and skew != 0
+            and MMA_DAG_PARTITION_BALANCED in partitions
+            and skew
+            in paged_attention_partition_skew_choices(facts, MMA_DAG_PARTITION_BALANCED)
+        ):
+            config[MMA_DAG_PARTITION_KEY] = MMA_DAG_PARTITION_BALANCED
+    partition = config.get(MMA_DAG_PARTITION_KEY, MMA_DAG_PARTITION_ITEM)
+    if type(partition) is not str or partition not in partitions:
+        return
+    if not named_skew and (
+        type(skew) is not int
+        or skew not in paged_attention_partition_skew_choices(facts, partition)
+    ):
+        config.pop(MMA_DAG_PARTITION_SKEW_KEY, None)
+    if partition == MMA_DAG_PARTITION_ITEM:
+        return
+    for key, value in PARTITION_TRANSPORT.items():
+        if key not in overrides and (value or config.get(key, False) is not False):
+            config[key] = value
 
 
 def drop_paired_knob_pins(
@@ -979,6 +1127,7 @@ def _normalize_cute_mma_dag(
                 config[key] = False if fragment is None else default
             if fragment is None:
                 config.pop(key, None)
+    _normalize_partition(facts, config, fix_invalid=fix_invalid)
     persistent_fragment = config_spec.cute_mma_dag_persistent
     persistent = config.setdefault(MMA_DAG_PERSISTENT_KEY, 0)
     allowed = (0,) if persistent_fragment is None else persistent_fragment.choices
