@@ -178,14 +178,11 @@ class _HandoffSession:
         result: BenchmarkResult,
         phase: Literal["search", "confirmation"],
     ) -> HandoffMeasurement:
+        from .benchmark_provider import _benchmark_result_has_reading
         from .benchmark_provider import _materialize_multi_shape_config
         from .benchmark_provider import _MultiShapeAutotuneArgs
 
-        valid = (
-            result.status in ("ok", "deduplicated")
-            and math.isfinite(result.perf)
-            and result.perf > 0
-        )
+        valid = _benchmark_result_has_reading(result)
         config = result.config
         cases = [search.kernel]
         if isinstance(search.args, _MultiShapeAutotuneArgs):

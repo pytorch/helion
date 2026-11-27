@@ -31,7 +31,10 @@ from .process_utils import signal_process_tree
 from .process_utils import start_isolated_process_group
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
     from multiprocessing.connection import Connection
+
+    from .benchmark_provider import IsolatedBenchmarkTiming
 
 _T = TypeVar("_T")
 
@@ -344,12 +347,24 @@ class BenchmarkWorkerDied(BenchmarkSubprocessError):
 class BenchmarkWorkerUnkillable(BenchmarkSubprocessError):
     """A worker remained alive after the bounded SIGKILL wait.
 
-    ``fn_index`` is the position in the isolated batch of the candidate that
-    worker last ran (set by ``benchmark_isolated``), so the search can drop a
-    config whose kernel may have hung instead of returning it.
+    ``fn_index`` is the position in the provider's batch of the candidate
+    that worker last ran (set by ``benchmark_isolated`` and ``benchmark``),
+    so the search can drop a config whose kernel may have hung instead of
+    returning it.
+    ``batch_results`` holds what that batch had read by then, one result per
+    candidate from its first on (set there as well): the batch returns
+    nothing, so a candidate that failed in it is known from here alone. A
+    caller that times its members in several such batches (a search, or a
+    multi-shape provider over its shapes) sets both to the members'
+    positions before it lets the error pass.
+    ``BaseSearch.benchmark_batch`` does so too, for the configs that its
+    filters keep out of the provider's batch: both number the configs it
+    was given, and a config that the filters reject is a failure there (an
+    error), as a batch that completes returns it without a reading.
     """
 
     fn_index: int | None = None
+    batch_results: Sequence[IsolatedBenchmarkTiming] = ()
 
 
 class BenchmarkWorker:

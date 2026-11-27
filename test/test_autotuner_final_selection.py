@@ -435,6 +435,91 @@ def test_a_pinned_kernel_keeps_its_pin_under_the_config_that_stands_for_it(
 
 
 @pytest.mark.cpu_only
+@pytest.mark.parametrize("kernel_of", ["failed", "under_test"])
+def test_abandoned_final_selection_excludes_every_config_of_a_failed_kernel(
+    kernel_of: str,
+) -> None:
+    """When a worker that survives its kill ends the final selection, the
+    finalists that failed stay out of the fallback of ``_finalize``: the one
+    that failed its warmup and the one under test.  Where the search drops
+    source aliases the population can hold another config of such a
+    finalist's kernel (its compiled function, ``"deduplicated"``, the
+    kernel's reading), which the selection does not time.  That alias has a
+    better reading than the config that is left, and is not returned
+    either."""
+    failed, alias, under_test, safe = members = [
+        _member(16, 0.5),
+        _member(32, 1.0),
+        _member(64, 2.0),
+        _member(128, 3.0),
+    ]
+    kernel = failed if kernel_of == "failed" else under_test
+    alias.fn = kernel.fn
+    alias.status = "deduplicated"
+    alias.perfs[:] = kernel.perfs
+    policy = FinalSelectionConfig(
+        top_k=2,
+        rounds=2,
+        thermal_warmup_ms=100,
+        screen_rep_ms=20,
+        rep_ms=50,
+        tiebreak_rounds=0,
+    )
+    # the history the final selection draws from holds no alias
+    search = _make_search([failed, under_test, safe], policy=policy)
+    search.population = list(members)
+    search.finishing_rounds = 0
+    search.config_spec.backend = SimpleNamespace(
+        default_final_selection_regime=lambda: None,
+        collapses_generated_source_aliases=lambda config_spec: True,
+    )
+    provider = _mock_worker_provider(search)
+    provider.settles_source_aliases.return_value = True
+    search._kernels = {}
+    timed: list[PopulationMember] = []
+    error = BenchmarkWorkerUnkillable("worker survived SIGKILL")
+
+    def benchmark(fns: list[Callable[..., object]], **kwargs: object) -> list[object]:
+        (member,) = (m for m in (failed, under_test, safe) if m.fn is fns[0])
+        timed.append(member)
+        if str(kwargs["desc"]).endswith("warmup"):
+            return [IsolatedBenchmarkFailure("error")]
+        if member is under_test:
+            raise error
+        return [member.perf]
+
+    provider.benchmark_isolated.side_effect = benchmark
+
+    def measurer(
+        finalists: list[PopulationMember], selected_policy: FinalSelectionConfig
+    ) -> _WorkerFinalSelectionMeasurer:
+        return _WorkerFinalSelectionMeasurer(
+            provider,
+            [member.fn for member in finalists],
+            private_copies=False,
+            timeout_s=1.0,
+        )
+
+    with (
+        patch.dict(os.environ, _SHORTLIST_ALL),
+        _finalization_tail(search, measurer),
+    ):
+        config = search._finalize()
+
+    # the warmup of the best finalist, then the window the worker survives
+    assert timed[0] is failed
+    assert timed[-1] is under_test
+    # the alias keeps the kernel's reading, which is better than safe's
+    assert alias.perfs == kernel.perfs
+    assert config == safe.config
+    assert search._fallback_excluded_configs == {
+        failed.config,
+        under_test.config,
+        alias.config,
+    }
+
+
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("missing", [None, "timeout"])
 def test_final_selection_retains_raw_missing_readings(
     tmp_path: Path, missing: Literal["timeout"] | None

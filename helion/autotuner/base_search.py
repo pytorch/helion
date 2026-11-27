@@ -1169,11 +1169,29 @@ class BaseSearch(BaseAutotuner):
                     "Exploration tracking failed; continuing autotuning",
                     exc_info=True,
                 )
-        inner_results = self.benchmark_provider.benchmark(
-            passing_configs,
-            desc=desc,
-            raise_if_no_viable_config=raise_if_no_viable_config,
-        )
+        try:
+            inner_results = self.benchmark_provider.benchmark(
+                passing_configs,
+                desc=desc,
+                raise_if_no_viable_config=raise_if_no_viable_config,
+            )
+        except BenchmarkWorkerUnkillable as error:
+            if len(passing_indices) != len(configs):
+                # The provider numbers the configs that passed the filters;
+                # the caller's batch is ``configs``. A rejected config is a
+                # failure in it: a batch that completes returns it without
+                # a reading.
+                if error.fn_index is not None:
+                    error.fn_index = passing_indices[error.fn_index]
+                passing = set(passing_indices)
+                readings = iter(error.batch_results)
+                error.batch_results = tuple(
+                    next(readings, None)
+                    if index in passing
+                    else IsolatedBenchmarkFailure("error")
+                    for index in range(len(configs))
+                )
+            raise
 
         if len(passing_indices) == len(configs):
             results = inner_results
@@ -1951,6 +1969,7 @@ class _WorkerFinalSelectionMeasurer:
         except BenchmarkWorkerUnkillable as error:
             # the batch held this one finalist
             error.fn_index = index
+            # the calling loop sets batch_results (empty here) where it is read
             raise
         if results is None:
             return None
@@ -4785,8 +4804,10 @@ class PopulationBasedSearch(BaseSearch):
             results: Sequence[IsolatedBenchmarkTiming],
             failed: list[Literal["error", "timeout"] | None],
         ) -> list[PopulationMember]:
-            # Share the failure policy between normal completion and a terminal
-            # local-worker abort. Retry attempts never reach this commit.
+            # A completed selection: the survivors' results and the failures of
+            # every stage in one application. A terminal local-worker abort
+            # applies its failures through ``_exclude_failed_members``. Retry
+            # attempts never reach this commit.
             failed_members = [
                 (member, status)
                 for member, status in zip(
@@ -5056,12 +5077,7 @@ class PopulationBasedSearch(BaseSearch):
                 abort_failures[error.fn_index] = "timeout"
             # Non-flash history stays intact; direct failures cannot win this
             # fallback. Flash also invalidates their config/source aliases.
-            self._fallback_excluded_configs.update(
-                member.config
-                for member, status in zip(finalists, abort_failures, strict=True)
-                if status is not None
-            )
-            commit_results([], [], abort_failures)
+            self._exclude_failed_members(finalists, abort_failures)
             raise
 
         members = [finalists[index] for index in survivors]
@@ -5608,11 +5624,18 @@ class PopulationBasedSearch(BaseSearch):
             or self._benchmark_prelude is not None
         )
         if isinstance(self.benchmark_provider, MultiShapeBenchmarkProvider):
-            provider_timings = self.benchmark_provider.rebenchmark(
-                [member.config for member in members],
-                [member.perf for member in members],
-                desc=desc,
-            )
+            try:
+                provider_timings = self.benchmark_provider.rebenchmark(
+                    [member.config for member in members],
+                    [member.perf for member in members],
+                    desc=desc,
+                )
+            except BenchmarkWorkerUnkillable as error:
+                # A joint re-timing that completes applies its readings
+                # without the alias policy of a flash search, so an abandoned
+                # one quarantines nothing either.
+                self._record_abandoned_batch(members, error, quarantine=False)
+                raise
             # The provider records only fresh joint measurements; skipped work
             # can return retained timings that must not become new trace rows.
             self._apply_rebenchmark_timings(
@@ -5641,7 +5664,7 @@ class PopulationBasedSearch(BaseSearch):
                     candidate_private_args=candidate_private_args,
                 )
             except BenchmarkWorkerUnkillable as error:
-                self._record_unkillable(members, error)
+                self._record_abandoned_batch(members, error)
                 raise
             if isolated_results is not None:
                 new_timings, failure_statuses = (
@@ -5880,20 +5903,27 @@ class PopulationBasedSearch(BaseSearch):
                 3.0 * window_s + 15.0,
             )
             results: list[IsolatedBenchmarkTiming] = []
-            with _WorkerFinalSelectionMeasurer(
-                provider,
-                fns,
-                private_copies=True,
-                timeout_s=timeout_s,
-                desc=desc,
-            ) as measurer:
-                for index in range(len(fns)):
-                    results.append(measurer.measure(index, 1, rep))
-                    if not provider.steady_window_benchmark_available():
-                        # A wrapper the worker cannot load disables it for
-                        # the rest of the batch; time every finalist
-                        # in-process rather than mixing regimes.
-                        return None
+            try:
+                with _WorkerFinalSelectionMeasurer(
+                    provider,
+                    fns,
+                    private_copies=True,
+                    timeout_s=timeout_s,
+                    desc=desc,
+                ) as measurer:
+                    for index in range(len(fns)):
+                        results.append(measurer.measure(index, 1, rep))
+                        if not provider.steady_window_benchmark_available():
+                            # A wrapper the worker cannot load disables it for
+                            # the rest of the batch; time every finalist
+                            # in-process rather than mixing regimes.
+                            return None
+            except BenchmarkWorkerUnkillable as error:
+                # The measurer's batches hold one member each. The batch this
+                # ends is the members so far, also when the worker survives
+                # its kill at the release of their copies.
+                error.batch_results = tuple(results)
+                raise
             return results
         return provider.benchmark_isolated(
             fns,
@@ -6004,50 +6034,57 @@ class PopulationBasedSearch(BaseSearch):
         elapsed: list[list[float]] = []
         failures: list[Literal["error", "timeout"] | None] = [None] * len(members)
         incomplete = [False] * len(members)
-        with _WorkerFinalSelectionMeasurer(
-            provider,
-            fns,
-            private_copies=provider.private_argument_copies_affordable(len(fns)),
-            timeout_s=float(self.settings.autotune_benchmark_timeout),
-            l2_flush_mode=final_selection_l2_flush_mode(),
-            desc=desc,
-        ) as measurer:
-            indices = list(range(len(members)))
-            for sweep in range(sweeps):
-                offset = (sweep // 2) % len(indices)
-                rotated = indices[offset:] + indices[:offset]
-                order = rotated if sweep % 2 == 0 else list(reversed(rotated))
-                values: list[float] = []
-                for index in order:
-                    if failures[index] is not None or incomplete[index]:
-                        samples[index].append(inf)
-                        values.append(inf)
-                        continue
-                    try:
+        try:
+            with _WorkerFinalSelectionMeasurer(
+                provider,
+                fns,
+                private_copies=provider.private_argument_copies_affordable(len(fns)),
+                timeout_s=float(self.settings.autotune_benchmark_timeout),
+                l2_flush_mode=final_selection_l2_flush_mode(),
+                desc=desc,
+            ) as measurer:
+                indices = list(range(len(members)))
+                for sweep in range(sweeps):
+                    offset = (sweep // 2) % len(indices)
+                    rotated = indices[offset:] + indices[:offset]
+                    order = rotated if sweep % 2 == 0 else list(reversed(rotated))
+                    values: list[float] = []
+                    for index in order:
+                        if failures[index] is not None or incomplete[index]:
+                            samples[index].append(inf)
+                            values.append(inf)
+                            continue
                         result = measurer.measure(
                             index,
                             0,
                             1,
                             fixed_repetitions=cycles,
                         )
-                    except BenchmarkWorkerUnkillable as error:
-                        self._record_unkillable(members, error)
-                        raise
-                    if result is None:
-                        # An unavailable worker reading is not a config failure.
-                        # Keep its prior observation, but exclude this candidate
-                        # from the comparison rather than retrying part of it.
-                        incomplete[index] = True
-                        value = inf
-                    elif isinstance(result, IsolatedBenchmarkFailure):
-                        failures[index] = result.status
-                        value = inf
-                    else:
-                        value = result
-                    samples[index].append(value)
-                    values.append(value)
-                orders.append(order)
-                elapsed.append(values)
+                        if result is None:
+                            # An unavailable worker reading is not a config failure.
+                            # Keep its prior observation, but exclude this candidate
+                            # from the comparison rather than retrying part of it.
+                            incomplete[index] = True
+                            value = inf
+                        elif isinstance(result, IsolatedBenchmarkFailure):
+                            failures[index] = result.status
+                            value = inf
+                        else:
+                            value = result
+                        samples[index].append(value)
+                        values.append(value)
+                    orders.append(order)
+                    elapsed.append(values)
+        except BenchmarkWorkerUnkillable as error:
+            # The measurer's batches hold one member each. The batch this ends
+            # is the sweeps so far, also when the worker survives its kill at
+            # the release of the members' copies.
+            error.batch_results = tuple(
+                IsolatedBenchmarkFailure(failed) if failed else None
+                for failed in failures
+            )
+            self._record_abandoned_batch(members, error)
+            raise
         medians = [
             inf if failed or missing else statistics.median(values)
             for failed, missing, values in zip(
@@ -6328,7 +6365,7 @@ class PopulationBasedSearch(BaseSearch):
                 desc=f"{desc}: confirming suspicious timings",
             )
         except BenchmarkWorkerUnkillable as error:
-            self._record_unkillable([members[i] for i in suspicious], error)
+            self._record_abandoned_batch([members[i] for i in suspicious], error)
             raise
         if confirmed is None:
             return updated
@@ -6632,6 +6669,101 @@ class PopulationBasedSearch(BaseSearch):
         """Exclude the config under test when an isolated worker cannot be reaped."""
         if error.fn_index is not None and 0 <= error.fn_index < len(members):
             self._fallback_excluded_configs.add(members[error.fn_index].config)
+
+    def _record_abandoned_batch(
+        self,
+        members: list[PopulationMember],
+        error: BenchmarkWorkerUnkillable,
+        *,
+        quarantine: bool = True,
+    ) -> None:
+        """Apply what a re-timing batch over ``members`` found before a
+        worker of it could not be reaped. The batch returns nothing, so
+        nothing else applies its failures.
+
+        The member under test may have hung that worker and counts as a
+        timeout, beside every member that ``error.batch_results`` holds a
+        failure for. None of them can win the fallback of ``_finalize``, an
+        error and a timeout alike, nor can another config of their kernels
+        where the search drops source aliases, and a CuTe flash search
+        quarantines them with their config and source aliases, as it does
+        when the batch completes (``_exclude_failed_members``). An abandoned
+        final selection treats its failed finalists the same way. The joint
+        re-timing of a multi-shape search passes ``quarantine=False``: it
+        applies no alias policy when it completes, so its failed members
+        leave the fallback and keep their readings. Where
+        ``torch.distributed`` is initialized only the config under test is
+        excluded, and as on that abort no evidence of one rank is promoted.
+        That branch is a guard, in step with the final selection's handler:
+        no provider starts a benchmark worker in such a process
+        (``LocalBenchmarkProvider._subprocess_benchmark_enabled``), so no
+        batch ends this way there today.
+        """
+        if dist.is_initialized():
+            self._record_unkillable(members, error)
+            return
+        failed: list[Literal["error", "timeout"] | None] = [None] * len(members)
+        for index, result in enumerate(error.batch_results):
+            if isinstance(result, IsolatedBenchmarkFailure):
+                failed[index] = result.status
+        if error.fn_index is not None and 0 <= error.fn_index < len(members):
+            failed[error.fn_index] = "timeout"
+        self._exclude_failed_members(members, failed, quarantine=quarantine)
+
+    def _exclude_failed_members(
+        self,
+        members: Sequence[PopulationMember],
+        failed: Sequence[Literal["error", "timeout"] | None],
+        *,
+        quarantine: bool = True,
+    ) -> None:
+        """Apply the failures of a batch over ``members`` that ended in a
+        worker which could not be reaped: ``failed`` holds each member's
+        failure by position, ``None`` where it has none.
+
+        A failed member cannot win the fallback of ``_finalize``. Where the
+        search drops source aliases (``_collapses_source_aliases``) neither
+        can another config of its kernel: a member of the population with
+        the same compiled function is the kernel that failed, and has only
+        that kernel's reading. Non-flash readings stay as they are; with
+        ``quarantine`` a CuTe flash search sets every config and source
+        alias of a failed member to inf, with the failure for its status.
+        """
+        excluded = [
+            member
+            for member, status in zip(members, failed, strict=True)
+            if status is not None
+        ]
+        self._fallback_excluded_configs.update(member.config for member in excluded)
+        kernels = {id(member.fn) for member in excluded}
+        other_configs = [
+            member.config
+            for member in self.population
+            if id(member.fn) in kernels
+            and member.config not in self._fallback_excluded_configs
+        ]
+        if other_configs and self._collapses_source_aliases():
+            self._fallback_excluded_configs.update(other_configs)
+        if not quarantine:
+            return
+        _, statuses = self._resolve_isolated_rebenchmark_results(
+            members,
+            [IsolatedBenchmarkFailure(status) if status else None for status in failed],
+        )
+        quarantined = [
+            (member, status)
+            for member, status in zip(members, statuses, strict=True)
+            if status is not None
+        ]
+        if quarantined:
+            self._apply_rebenchmark_timings(
+                [member for member, _ in quarantined],
+                [inf] * len(quarantined),
+                failure_statuses=[status for _, status in quarantined],
+                trace_results=[
+                    IsolatedBenchmarkFailure(status) for _, status in quarantined
+                ],
+            )
 
     def _finalize(self) -> Config:
         """Finishing phase, terminal refinement, final selection (or the
