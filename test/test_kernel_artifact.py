@@ -24,6 +24,7 @@ from helion._testing import RefEagerTestDisabled
 from helion._testing import TestCase
 from helion._testing import onlyBackends
 from helion._testing import skipIfCudaCapabilityLessThan
+from helion._testing import skipIfRocm
 from helion._utils import next_power_of_2
 from helion.autotuner import BooleanFragment
 from helion.autotuner import PowerOfTwoFragment
@@ -514,6 +515,7 @@ class TestKernelArtifact(RefEagerTestDisabled, TestCase):
 @pytest.mark.cuda
 @onlyBackends(["triton"])
 class TestKernelArtifactCUDA(RefEagerTestDisabled, TestCase):
+    @skipIfRocm("prefetch lowers to PTX")
     @skipIfCudaCapabilityLessThan((9, 0), reason="tensor prefetch needs TMA")
     def test_descriptor_prefetch_is_rejected_before_codegen(self):
         x = torch.zeros((96, 1024), device=DEVICE, dtype=torch.bfloat16)
