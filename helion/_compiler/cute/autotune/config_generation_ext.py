@@ -53,6 +53,7 @@ from ..cute_flash import FLASH_LEGACY_STRUCTURAL_CONFIG_KEYS
 from ..cute_flash import FLASH_PERSISTENT_KEY
 from ..cute_flash import FLASH_PIPELINE_FAMILY_KEY
 from ..cute_flash import FLASH_ROW_SUM_SCHEDULE_KEY
+from ..cute_flash import FLASH_S_STAGE_KEY
 from ..cute_flash import FLASH_SOFTMAX_DISC_KEY
 from ..cute_flash import FLASH_SOFTMAX_LOWERING_KEY
 from ..cute_flash import _flash_resident_softmax_overrides
@@ -1764,6 +1765,10 @@ class CuteConfigGenerationExtension(ConfigGenerationExtension):
         structural_override_keys = {
             FLASH_PIPELINE_FAMILY_KEY,
             FLASH_PERSISTENT_KEY,
+            # The score-stage count picks the single-tile family's body (one
+            # warpgroup or two); each body has knobs the other does not
+            # render.
+            FLASH_S_STAGE_KEY,
             *FLASH_LEGACY_STRUCTURAL_CONFIG_KEYS,
             *FLASH_DERIVED_CONFIG_KEYS,
         }

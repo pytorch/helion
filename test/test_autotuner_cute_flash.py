@@ -7253,6 +7253,9 @@ class TestAutotunerCuteFlash(AutotunerTestCase):
             return_value=replace(design, uncovered_interactions=[])
         )
         self.assertEqual(generation.extension.deterministic_population_configs(), [])
+        # So does the score-stage count, which picks the single-tile body.
+        generation._override_values = {"cute_flash_s_stage": 1}
+        self.assertEqual(generation.extension.deterministic_population_configs(), [])
 
     def test_lfbo_flash_path_constraint_filters_before_visited(self):
         packet_key = "cute_flash_exp2_packet"

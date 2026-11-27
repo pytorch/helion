@@ -1924,6 +1924,34 @@ def test_ws_kv_stage_search_covers_exact_storage_capacity(
         assert resolved.kv_stage == stage
 
 
+@pytest.mark.parametrize("s_stage", (1, 2))
+def test_score_stage_override_on_the_single_tile_surface_remains_legal(
+    s_stage: int,
+) -> None:
+    """A pinned score-stage count picks one body of the single-tile family:
+    the values only the other body renders (the persistent grid, the staged
+    output, the loader warp and the extra K stage need two stages) are
+    unreachable under the pin, which is no defect of the coverage design, so
+    the search starts and stays on the pinned body."""
+    spec = flash_config_spec(
+        head_dim=64,
+        num_kv=3,
+        dtype=torch.bfloat16,
+        is_causal=False,
+        num_bh=192,
+    )
+    generation = spec.create_config_generation(
+        overrides={cute_flash.FLASH_S_STAGE_KEY: s_stage}
+    )
+    with memoized_flash_fragments():
+        configs = generation.extension.deterministic_population_configs()
+    assert configs
+    assert {config[cute_flash.FLASH_S_STAGE_KEY] for config in configs} == {s_stage}
+    assert {config[cute_flash.FLASH_PIPELINE_FAMILY_KEY] for config in configs} == {
+        "ws_overlap"
+    }
+
+
 @pytest.mark.parametrize(
     ("head_dim", "kv_stage"),
     (
