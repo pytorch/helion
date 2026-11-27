@@ -51,6 +51,7 @@ from ..backend import BackendState
 from ..backend import DeviceIRStage
 from ..backend import _largest_divisor_at_most
 from ..backend import log
+from ..zero_fill_kernels import zero_fill_kernel_names
 from .analysis.attention_match import _attention_flash_gate_enabled
 from .analysis.attention_match import _attention_flash_supported
 from .analysis.attention_match import _attention_pattern_fits_root
@@ -75,7 +76,6 @@ from .math_templates import SIGMOID_TEMPLATE
 from .math_templates import argreduce_candidate_expr
 from .math_templates import nan_extremum_expr
 from .packet_flush_names import streaming_store_rendered
-from .pdl_release import ZERO_FILL_KERNEL_PREFIX
 from .pdl_release import generic_release_rendered
 from .pdl_release import spread_rendered
 from .reduction_lanes import fit_reduction_threads
@@ -3120,26 +3120,27 @@ class CuteBackend(Backend):
     def _compiled_kernels(compiled_fn: object, kernel_name: str) -> tuple[object, ...]:
         """The CuTe kernel objects the generated host function launches: the
         kernel proper and the zero-fill kernels its host zero fills launch
-        as under ``cute_pdl`` (``host_zero_fill_launches``, named
-        ``_helion_zero_fill_<n>_helion_<kernel_name>``), or the bundle a
-        multi-stage module declares (``_helion_cute_kernels``)."""
+        as under ``cute_pdl`` (``host_zero_fill_launches``), found by the
+        rule the benchmark worker finds them by, the names the generator
+        gives the fill kernels of this kernel (``zero_fill_kernel_names``:
+        another kernel's fill kernel in the same globals is not one), or the
+        bundle a multi-stage module declares (``_helion_cute_kernels``)."""
         bundled = getattr(compiled_fn, "_helion_cute_kernels", None)
         if isinstance(bundled, tuple):
             return bundled
         fn_globals = getattr(compiled_fn, "__globals__", None)
         if not isinstance(fn_globals, dict):
             return ()
-        name = f"_helion_{kernel_name}"
-        kernel = fn_globals.get(name)
+        kernel = fn_globals.get(f"_helion_{kernel_name}")
         if kernel is None:
             return ()
-        fills = sorted(
-            key
-            for key in fn_globals
-            if key.startswith(ZERO_FILL_KERNEL_PREFIX)
-            and key.endswith(f"_{name.lstrip('_')}")
+        return (
+            kernel,
+            *(
+                fn_globals[name]
+                for name in zero_fill_kernel_names(fn_globals, kernel_name)
+            ),
         )
-        return (kernel, *(fn_globals[key] for key in fills))
 
     def compiled_cache_key(
         self, bound_kernel: BoundKernel[Any], compiled_fn: object

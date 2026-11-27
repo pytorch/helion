@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING
 
 from torch._inductor.codecache import PyCodeCache
 
-from helion._compiler.cute.pdl_release import ZERO_FILL_KERNEL_PREFIX
+from helion._compiler.cute.pdl_release import device_kernels
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -78,12 +78,5 @@ def attribute_only_control(bound: BoundKernel, source: str) -> Callable[..., obj
 
 def kernel_definition(code: str) -> ast.FunctionDef:
     """Select the kernel proper, excluding auxiliary zero-fill kernels."""
-    module = ast.parse(code)
-    (kernel,) = [
-        node
-        for node in module.body
-        if isinstance(node, ast.FunctionDef)
-        and any(ast.unparse(d) == "cute.kernel" for d in node.decorator_list)
-        and not node.name.startswith(ZERO_FILL_KERNEL_PREFIX)
-    ]
+    (kernel,) = device_kernels(ast.parse(code))
     return kernel

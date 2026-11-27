@@ -763,6 +763,55 @@ class TestReportOnSearchFailure(unittest.TestCase):
         self.assertIn("Autotuning complete", joined)
         self.assertNotIn("Outcome:", joined)
 
+    def test_successful_search_names_the_jobs_that_raised_in_the_worker(self) -> None:
+        config = Config(block_sizes=[32], num_warps=4)
+        search = _fake_search(Settings(), lambda: config)
+        with self.assertLogs(search.log._logger, level="INFO") as captured:
+            search.autotune()
+        self.assertNotIn("raised an exception", "\n".join(captured.output))
+
+        search = _fake_search(Settings(), lambda: config)
+        search._autotune_metrics.num_worker_job_exceptions = 3
+        with self.assertLogs(search.log._logger, level="WARNING") as captured:
+            search.autotune()
+        self.assertIn(
+            "3 benchmark jobs raised an exception past their candidate's "
+            "compile and first call. The warnings above quote each different "
+            "error of a re-timing and, up to a limit, of a candidate; the "
+            "debug log has every job's.",
+            "\n".join(captured.output),
+        )
+
+        search = _fake_search(Settings(), lambda: config)
+        search._autotune_metrics.num_worker_job_exceptions = 12
+        search._autotune_metrics.num_isolated_rebenchmark_exceptions = 11
+        with self.assertLogs(search.log._logger, level="WARNING") as captured:
+            search.autotune()
+        self.assertIn(
+            "12 benchmark jobs raised an exception past their candidate's "
+            "compile and first call, 11 of them re-timings, which gave no "
+            "reading. The warnings above quote",
+            "\n".join(captured.output),
+        )
+
+        # ``autotune_ignore_errors`` silences the jobs' warnings, not the
+        # count, which is logged either way like the other failure counts;
+        # the line then points at no warnings.
+        search = _fake_search(Settings(autotune_ignore_errors=True), lambda: config)
+        search._autotune_metrics.num_worker_job_exceptions = 12
+        search._autotune_metrics.num_isolated_rebenchmark_exceptions = 11
+        with self.assertLogs(search.log._logger, level="WARNING") as captured:
+            search.autotune()
+        joined = "\n".join(captured.output)
+        self.assertIn(
+            "12 benchmark jobs raised an exception past their candidate's "
+            "compile and first call, 11 of them re-timings, which gave no "
+            "reading. autotune_ignore_errors silenced their warnings; the "
+            "debug log has every job's error.",
+            joined,
+        )
+        self.assertNotIn("The warnings above", joined)
+
     def test_failed_search_saves_report_with_outcome(self) -> None:
         with tempfile.TemporaryDirectory() as d:
             search = _fake_search(

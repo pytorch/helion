@@ -26,6 +26,7 @@ from typing import cast
 import uuid
 
 from .. import exc
+from .._compiler.zero_fill_kernels import zero_fill_kernel_names
 from ..runtime.precompile_shim import already_compiled
 from ..runtime.precompile_shim import already_compiled_fail
 from ..runtime.precompile_shim import cached_compile_failure_error
@@ -127,6 +128,12 @@ class SerializedCompiledFunction:
     # name is not importable in a fresh process (notebook / exec / import-by-path
     # kernels, whose synthetic module name only exists in the parent).
     source_modules: list[tuple[str, str]] = dataclasses.field(default_factory=list)
+    # The module globals that carry ``source_hash`` in the parent beside the
+    # kernel named after the function (the zero-fill kernels a host zero fill
+    # launches, which a backend annotates with the module's hash). The worker
+    # gives them the hash again, so each has the on-disk compile-cache key it
+    # has in the parent.
+    source_hash_globals: tuple[str, ...] = ()
 
 
 @dataclasses.dataclass
@@ -183,6 +190,9 @@ def _serialize_compiled_fn(fn: CompiledConfig) -> SerializedCompiledFunction:
         value = getattr(kernel, "_helion_cute_source_hash", None)
         if isinstance(value, str):
             source_hash = value
+        source_hash_globals = _source_hash_globals(fn, fn_globals, source_hash)
+    else:
+        source_hash_globals = ()
     return SerializedCompiledFunction(
         function_name=fn.__name__,
         source_code=source_code,
@@ -190,6 +200,23 @@ def _serialize_compiled_fn(fn: CompiledConfig) -> SerializedCompiledFunction:
         module_name=module_name,
         source_hash=source_hash,
         source_modules=_collect_source_modules(module),
+        source_hash_globals=source_hash_globals,
+    )
+
+
+def _source_hash_globals(
+    fn: CompiledConfig, fn_globals: dict[str, object], source_hash: str | None
+) -> tuple[str, ...]:
+    """The names of the zero-fill kernels of ``fn``'s module
+    (``zero_fill_kernel_names``) that carry ``source_hash``: the kernels the
+    backend gave the module's hash when it annotated the module. One with a
+    hash of its own, or with none, keeps what the module gave it."""
+    if source_hash is None:
+        return ()
+    return tuple(
+        name
+        for name in zero_fill_kernel_names(fn_globals, fn.__name__)
+        if getattr(fn_globals[name], "_helion_cute_source_hash", None) == source_hash
     )
 
 
@@ -311,25 +338,75 @@ def _load_compiled_fn(fn_spec: SerializedCompiledFunction) -> CompiledConfig:
         if fn_spec.source_hash is not None:
             with contextlib.suppress(AttributeError, TypeError):
                 fn._helion_cute_source_hash = fn_spec.source_hash
+            # The module's other kernels that carried the hash in the parent
+            # (a host zero fill's kernel): without it such a kernel has no
+            # on-disk compile-cache key and is compiled afresh in every job.
+            for name in fn_spec.source_hash_globals:
+                with contextlib.suppress(AttributeError, TypeError):
+                    module.__dict__[name]._helion_cute_source_hash = fn_spec.source_hash
         return fn
     except BaseException:
         sys.modules.pop(module_name, None)
         raise
 
 
+def _module_kernels(fn: CompiledConfig, module: types.ModuleType) -> list[object]:
+    """The kernel objects of the temporary ``module`` that ``fn`` launches,
+    each once: the bundle a multi-stage module declares, the kernel named
+    after ``fn`` (the only kernel of a module without a bundle, and the
+    fallback a conditional bundle keeps beside its stages) and the module's
+    zero-fill kernels (``zero_fill_kernel_names``)."""
+    kernels = getattr(fn, "_helion_cute_kernels", None)
+    if not isinstance(kernels, tuple):
+        kernels = ()
+    module_globals = module.__dict__
+    candidates = (
+        *kernels,
+        module_globals.get(f"_helion_{fn.__name__}"),
+        *(
+            module_globals[name]
+            for name in zero_fill_kernel_names(module_globals, fn.__name__)
+        ),
+    )
+    found = {id(kernel): kernel for kernel in candidates if kernel is not None}
+    return list(found.values())
+
+
 def _unload_compiled_fn(fn: CompiledConfig) -> None:
-    """Release caches and the temporary module created by ``_load_compiled_fn``."""
+    """Release caches, loaded device code and the temporary module created by
+    ``_load_compiled_fn``.
+
+    A compiled launcher that loaded device code of its own (the CuTe
+    runtime's CUDA libraries) releases it here, with the kernel's relaunch
+    state that refers to it, rather than leave it to the launcher's
+    finalizers: the dropped module is cyclic garbage, so those would run
+    wherever the collector next runs, and inside the CUDA graph capture of a
+    later job the unload invalidates that capture. What a launcher releases
+    of a kernel is the launcher's to know (its ``release_kernel``, found by
+    name); it keeps its code when unloading is not safe. Every kernel of the
+    module is released that way (``_module_kernels``), not only the one
+    named after ``fn``.
+
+    The caller must be done with what the module launched: no launch of
+    these kernels may be underway, and no CUDA graph that captured their
+    launches may be replayed afterwards, since its nodes refer to the
+    unloaded code. A kernel object can outlive the module: a stage kernel
+    that two temporary modules share (its source is loaded once in the
+    process) loses its libraries, its launchers and its relaunch state
+    when the first of them is released, and the other compiles or reloads
+    it at its next launch. The handoff evaluation holds one copy at a
+    time. The benchmark worker holds its candidate and, for as long as it
+    lives, the steps of a benchmark prelude
+    (``benchmark_prelude.load_prelude``), which its timing jobs run ahead
+    of their candidate: a step that shares a stage kernel with a candidate
+    loads it again in the next job.
+    """
     clear_jit_fast_path_caches(fn)
     module_name = getattr(fn, "__module__", "")
     if module_name.startswith("_helion_autotune_subprocess_"):
         module = sys.modules.get(module_name)
         if module is not None:
-            kernels = getattr(fn, "_helion_cute_kernels", None)
-            if not isinstance(kernels, tuple):
-                kernels = (module.__dict__.get(f"_helion_{fn.__name__}"),)
-            for cute_kernel in kernels:
-                if cute_kernel is None:
-                    continue
+            for cute_kernel in _module_kernels(fn, module):
                 launchers = getattr(
                     cute_kernel, "_helion_cute_compiled_launchers", None
                 )
@@ -341,6 +418,9 @@ def _unload_compiled_fn(fn: CompiledConfig) -> None:
                         filename = getattr(code, "co_filename", "")
                         if filename.startswith("<helion_cute_launcher:"):
                             linecache.cache.pop(filename, None)
+                        release_kernel = getattr(launcher, "release_kernel", None)
+                        if release_kernel is not None:
+                            release_kernel(cute_kernel)
                 for cache_name in (
                     "_helion_cute_compiled_launchers",
                     "_helion_cute_launch_arg_cache",

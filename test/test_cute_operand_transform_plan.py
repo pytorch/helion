@@ -335,6 +335,7 @@ def test_actual_raw_tma_descriptor_preserves_tf32_compute_geometry(
 def _cache_key(plan: Tcgen05OperandTransformPlan) -> str | None:
     wrapper = {"kind": "tcgen05_ab_tma", "operand_transform": plan.cache_identity()}
     kernel = SimpleNamespace(
+        __name__="cute_kernel",
         _helion_cute_source_hash="unchanged generated source",
         _helion_cute_wrapper_plans=[wrapper],
     )

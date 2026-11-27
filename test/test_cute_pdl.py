@@ -45,6 +45,7 @@ import helion
 from helion import exc
 from helion._compiler.cute.host_zero_fill_launches import MAX_FILL_NUMEL
 from helion._compiler.cute.pdl_release import ZERO_FILL_KERNEL_PREFIX
+from helion._compiler.cute.pdl_release import generic_release_rendered
 from helion._compiler.cute.pdl_release import resident_ctas_per_sm
 from helion._testing import DEVICE
 from helion._testing import TestCase
@@ -70,6 +71,7 @@ from helion._testing.cute_vloop_sink_kernels import col_reduce_sum_lower_triangl
 from helion._testing.cute_vloop_sink_kernels import col_reduce_sum_pair_dynamic
 from helion._testing.cute_vloop_sink_kernels import col_reduce_sum_static
 from helion._testing.cute_vloop_sink_kernels import col_weighted_mean_static
+from helion._testing.cute_zero_fill import COLUMN_SUM_CONFIG as _ATOMIC_COLUMN_SUM
 from helion.autotuner.benchmarking import _make_cudagraph_replay
 import helion.language as hl
 
@@ -385,6 +387,57 @@ def test_the_column_sum_waits_before_its_first_global_access(cpu_only: None) -> 
     # The attribute is set on the kernel object the host code launches.
     kernel = _kernel_def(on)
     assert f"_launcher({kernel.name}," in on
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def zero_fill_demo(x: torch.Tensor) -> torch.Tensor:
+    """Column sums through atomics into a zero-filled accumulator (the fill
+    stays), under a name that begins like a fill kernel's."""
+    m, n = x.size()
+    out = torch.zeros([n], dtype=torch.float32, device=x.device)
+    for tile_m, tile_n in hl.tile([m, n]):
+        hl.atomic_add(out, [tile_n], x[tile_m, tile_n].to(torch.float32).sum(0))
+    return out
+
+
+def test_a_kernel_named_like_a_fill_kernel_keeps_its_kernel_proper(
+    cpu_only: None,
+) -> None:
+    """The device kernel of a kernel ``zero_fill_demo`` begins with the fill
+    kernels' prefix. It is the kernel proper all the same, its fill kernel
+    is the one the generator's rule names for it, and the release check
+    reads the former and never the latter."""
+    bound = cpu_bind(zero_fill_demo, (torch.empty(1024, 1024, dtype=torch.bfloat16),))
+    on, _ = _on_and_off(bound, _ATOMIC_COLUMN_SUM)
+    fill = f"{ZERO_FILL_KERNEL_PREFIX}0_helion_zero_fill_demo"
+
+    def kernels(code: str) -> dict[str, ast.FunctionDef]:
+        return {
+            node.name: node
+            for node in ast.parse(code).body
+            if isinstance(node, ast.FunctionDef)
+            and any(ast.unparse(d) == "cute.kernel" for d in node.decorator_list)
+        }
+
+    assert set(kernels(on)) == {fill, "_helion_zero_fill_demo"}
+    assert _kernel_def(on).name == "_helion_zero_fill_demo"
+    assert f"_launcher({fill}, " in on
+    assert generic_release_rendered(on)
+    # With the kernel's own release off only the fill kernel releases at
+    # entry, which is no early release of the kernel.
+    late = bound.to_code(
+        bound.config_spec.normalized_config(
+            helion.Config.from_dict(
+                _ATOMIC_COLUMN_SUM | {"cute_pdl": True, "cute_pdl_release": "none"}
+            )
+        )
+    )
+    assert _kernel_def(late).name == "_helion_zero_fill_demo"
+    assert [ast.unparse(s) for s in kernels(late)[fill].body[:2]] == [
+        _WAIT,
+        _RELEASE,
+    ]
+    assert not generic_release_rendered(late)
 
 
 def test_dynamic_grids_and_pointwise_kernels_follow_the_grid_rule(

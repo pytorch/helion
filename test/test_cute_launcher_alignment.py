@@ -121,6 +121,7 @@ def test_pointer_and_compiled_caches_distinguish_alignment(
     fake_runtime: list[_Pointer], monkeypatch: pytest.MonkeyPatch, bake: bool
 ) -> None:
     kernel = SimpleNamespace(
+        __name__="cute_kernel",
         _helion_cute_disable_bake_tensor_shapes=not bake,
         _helion_cute_source_hash="alignment-test",
     )

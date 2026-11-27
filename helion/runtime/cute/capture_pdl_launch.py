@@ -15,6 +15,7 @@ from .capture_pdl import StorageRange
 from .capture_pdl_cuda import CaptureSnapshot
 from .capture_pdl_cuda import CudaCaptureDriver
 from .capture_pdl_cuda import finish_capture_launch
+from .launch_caches import LAST_LAUNCH_CACHE_ATTRIBUTE
 from .launch_caches import track_cuda_graph_cache_entry
 
 _LOCAL = threading.local()
@@ -57,7 +58,7 @@ def prepare_capture_launch(
         or plans[0].get("capture_pdl_contract") != "paired-output-stores-v1"
         or plans[1].get("kind") != "helion_mma_dag_alias"
         or getattr(cast("Any", kernel), "_helion_cute_use_pdl", False) is not True
-        or getattr(cast("Any", kernel), "_helion_cute_last_launch_cache", None) is None
+        or getattr(cast("Any", kernel), LAST_LAUNCH_CACHE_ATTRIBUTE, None) is None
     ):
         return None
     # The ordinary launcher elides empty grids. Without this gate, another
@@ -116,7 +117,7 @@ def prepare_capture_launch(
         return None
     # Static tensor layouts lower to one pointer argument. Unbaked layouts
     # have a structured CuTe ABI and are deliberately outside this guarded route.
-    last = cast("Any", kernel)._helion_cute_last_launch_cache
+    last = getattr(cast("Any", kernel), LAST_LAUNCH_CACHE_ATTRIBUTE)
     parameter_sizes: list[int] = []
     for entry in last.launch.schema:
         if entry[0] == "tensor" and len(entry) in (5, 6):

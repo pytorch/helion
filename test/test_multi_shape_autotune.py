@@ -622,6 +622,8 @@ class _FakeBoundKernel:
         worker_failure_indices: list[int] | None = None,
         unique_sources: int = 0,
         source_deduplications: int = 0,
+        worker_job_exceptions: int = 0,
+        isolated_rebenchmark_exceptions: int = 0,
     ) -> None:
         self.config_spec = config_spec
         self.settings = SimpleNamespace(
@@ -641,6 +643,8 @@ class _FakeBoundKernel:
         self.worker_failures = len(self.worker_failure_indices)
         self.unique_sources = unique_sources
         self.source_deduplications = source_deduplications
+        self.worker_job_exceptions = worker_job_exceptions
+        self.isolated_rebenchmark_exceptions = isolated_rebenchmark_exceptions
 
 
 class _FakeLocalBenchmarkProvider:
@@ -715,6 +719,12 @@ class _FakeLocalBenchmarkProvider:
         self._autotune_metrics.num_unique_sources += self.kernel.unique_sources
         self._autotune_metrics.num_source_deduplications += (
             self.kernel.source_deduplications
+        )
+        self._autotune_metrics.num_worker_job_exceptions += (
+            self.kernel.worker_job_exceptions
+        )
+        self._autotune_metrics.num_isolated_rebenchmark_exceptions += (
+            self.kernel.isolated_rebenchmark_exceptions
         )
         self._accuracy_failure_config_ids.extend(
             id(config)
@@ -1166,6 +1176,66 @@ class TestMultiShapeBenchmarkProvider(unittest.TestCase):
 
         self.assertEqual(metrics.num_unique_sources, 5)
         self.assertEqual(metrics.num_source_deduplications, 5)
+
+    def test_worker_job_exception_counts_sum_child_deltas(self) -> None:
+        """Each shape's provider warns about its benchmark jobs that raised
+        and counts them in metrics of its own: the search's metrics take
+        what each batch added, for a first timing and for a re-timing,
+        which records no config."""
+        spec = _make_config_spec()
+        first = _FakeBoundKernel(
+            spec, [1.0], worker_job_exceptions=2, isolated_rebenchmark_exceptions=1
+        )
+        second = _FakeBoundKernel(spec, [2.0], worker_job_exceptions=3)
+        provider, metrics = self._make_provider([first, second])
+        configs = [Config(block_sizes=[64])]
+
+        initial = provider.benchmark(configs)
+
+        self.assertEqual(metrics.num_worker_job_exceptions, 5)
+        self.assertEqual(metrics.num_isolated_rebenchmark_exceptions, 1)
+
+        first.worker_job_exceptions = first.isolated_rebenchmark_exceptions = 0
+        second.worker_job_exceptions = 4
+        provider.rebenchmark(
+            configs, [result.perf for result in initial], desc="confirm"
+        )
+
+        self.assertEqual(metrics.num_worker_job_exceptions, 9)
+        self.assertEqual(metrics.num_isolated_rebenchmark_exceptions, 1)
+        self.assertEqual(metrics.num_configs_tested, 1)
+
+    def test_search_summary_names_the_jobs_that_raised_for_its_shapes(self) -> None:
+        """The end-of-search line about benchmark jobs that raised reads the
+        search's metrics: a multi-shape search prints it for the jobs its
+        shapes' providers warned about."""
+        spec = _make_config_spec()
+        provider, metrics = self._make_provider(
+            [
+                _FakeBoundKernel(spec, [1.0], worker_job_exceptions=2),
+                _FakeBoundKernel(spec, [2.0], worker_job_exceptions=1),
+            ]
+        )
+        config = Config(block_sizes=[64])
+        search = TestMultiShapeSearchOrchestration._make_base_search(provider.args)
+        search.benchmark_provider = provider
+        search._autotune_metrics = metrics
+        provider.log = search.log
+
+        def timed_once() -> Config:
+            provider.benchmark([config])
+            return config
+
+        search._autotune = timed_once  # type: ignore[method-assign]
+
+        with self.assertLogs(search.log._logger, level="WARNING") as captured:
+            self.assertIs(BaseSearch.autotune(search), config)
+
+        self.assertIn(
+            "3 benchmark jobs raised an exception past their candidate's "
+            "compile and first call. The warnings above quote",
+            "\n".join(captured.output),
+        )
 
     def test_invalid_anchor_materialization_discards_only_one_config(self) -> None:
         spec = _make_config_spec()

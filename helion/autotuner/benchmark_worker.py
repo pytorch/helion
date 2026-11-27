@@ -23,6 +23,7 @@ from typing import TypeVar
 
 from .benchmark_prelude import PreludeFailed
 from .benchmarking import steady_graph_dispatch
+from .logger import _exception_attributes
 from .logger import _remember_worker_message
 from .logger import match_device_out_of_memory
 from .logger import match_unrecoverable_runtime_error
@@ -205,6 +206,30 @@ class PhasedJob:
 
     def __call__(self, report_phase: Callable[[str], None] | None = None) -> object:
         raise NotImplementedError
+
+
+# Where ``BenchmarkWorker.run`` notes, on an exception a job raised, the
+# last phase the job had reported (``job_phase``).
+_JOB_PHASE_ATTRIBUTE = "_helion_benchmark_job_phase"
+
+
+def job_phase(error: BaseException) -> str | None:
+    """The last phase a worker job had reported when it raised ``error``:
+    :data:`PHASE_COMPILED` once its candidate was compiled and had run once,
+    ``None`` for an error of the compile and first call, of a job that
+    reports no phases, or one that ``BenchmarkWorker.run`` did not re-raise
+    for a job (a failure of the worker, or of this process before the job
+    ran)."""
+    phase = _exception_attributes(error).get(_JOB_PHASE_ATTRIBUTE)
+    return phase if isinstance(phase, str) else None
+
+
+def _set_job_phase(error: BaseException, phase: str | None) -> None:
+    # In the instance's own dict, where the worker's text is kept
+    # (``logger._remember_worker_message``), and not through ``setattr``: an
+    # exception class can refuse attributes it does not define, and a note
+    # that failed would replace the job's error.
+    _exception_attributes(error)[_JOB_PHASE_ATTRIBUTE] = phase
 
 
 class BenchmarkSubprocessError(Exception):
@@ -422,6 +447,8 @@ class BenchmarkWorker:
         failures report ``RuntimeError`` for a sticky fault or
         ``BenchmarkSubprocessError`` otherwise. An unrestorable control exception
         still interrupts the caller as its standard control type (or BaseException).
+        The exception raised for a job carries the last phase the job
+        reported (:func:`job_phase`).
         Sticky CUDA errors and device out-of-memory errors
         additionally kill the worker so the next call respawns it. If a
         killed worker remains alive, raises ``BenchmarkWorkerUnkillable`` and
@@ -479,6 +506,8 @@ class BenchmarkWorker:
 
         phased = compile_timeout is not None and isinstance(job, PhasedJob)
         compiling = phased
+        # The last phase the job reported, whatever its deadlines.
+        reported: str | None = None
         timed_out = threading.Event()
         done = threading.Event()
         completion_lock = threading.Lock()
@@ -551,6 +580,7 @@ class BenchmarkWorker:
                         + (" during compile and first call" if compiling else "")
                     ) from e
                 if isinstance(message, _PhaseReport):
+                    reported = message.phase
                     if compiling and message.phase == PHASE_COMPILED:
                         compiling = False
                         deadline = arm(timeout)
@@ -575,9 +605,11 @@ class BenchmarkWorker:
                     error = result.restore()
                 finally:
                     self._kill_if_current(process, connection)
+                _set_job_phase(error, reported)
                 raise error
             result = result.restore()
         if isinstance(result, BaseException):
+            _set_job_phase(result, reported)
             if not isinstance(result, Exception):
                 raise result
             if match_device_out_of_memory(result):

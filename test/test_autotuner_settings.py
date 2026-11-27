@@ -531,6 +531,8 @@ class TestAutotuneBudget(TestCase):
             num_successful_candidate_measurements=0,
             num_unique_sources=0,
             num_source_deduplications=0,
+            num_worker_job_exceptions=0,
+            num_isolated_rebenchmark_exceptions=0,
             num_generations=0,
             kernel_source="",
         )

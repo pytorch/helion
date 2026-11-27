@@ -63,11 +63,13 @@ from .benchmark_prelude import PreludeFailed
 from .benchmark_prelude import PreludeRefused
 from .benchmark_prelude import PreludeUnsupported
 from .benchmark_prelude import active_prelude
+from .benchmark_worker import PHASE_COMPILED
 from .benchmark_worker import BenchmarkCompileTimeout
 from .benchmark_worker import BenchmarkSubprocessError
 from .benchmark_worker import BenchmarkTimeout
 from .benchmark_worker import BenchmarkWorker
 from .benchmark_worker import BenchmarkWorkerUnkillable
+from .benchmark_worker import job_phase
 from .benchmarking import _BATCH_MEMORY_FRACTION
 from .benchmarking import _BENCHMARK_CUDAGRAPH_ENV
 from .benchmarking import PRELUDE_REGIMES
@@ -636,6 +638,10 @@ _BUDGET_EXEMPT_CANDIDATES = 3
 # succeeds (code generation that reads tensor data, say) are given up after
 # this many in a row: they would only add fork overhead to the serial path.
 _RENDER_POOL_MAX_FORK_ONLY_FAILURES = 3
+# Distinct errors of candidates' benchmark jobs a search warns about, each in
+# full once (``LocalBenchmarkProvider._report_worker_exception``). Errors of
+# re-timings have no limit.
+_WORKER_EXCEPTION_WARNINGS = 8
 
 
 def _local_rank_count() -> int:
@@ -949,6 +955,13 @@ class LocalBenchmarkProvider(BenchmarkProvider):
     # Candidates that had no reading because of the prelude
     # (``prelude_failure_cascade``).
     _prelude_failures: int = 0
+    # Benchmark jobs that raised, per error text warned about: candidates'
+    # jobs, the candidates' jobs whose text came after the limit, and
+    # re-timings (``_report_worker_exception``). The dicts are created on
+    # first use, as the search facts above.
+    _candidate_exception_counts: dict[str, int] | None = None
+    _unlisted_candidate_exceptions: int = 0
+    _retiming_exception_counts: dict[str, int] | None = None
     # Set inside ``fresh_source_timings``: every config of a batch is timed,
     # also one whose generated source this provider holds a reading of.
     _fresh_source_timings: bool = False
@@ -1493,6 +1506,100 @@ class LocalBenchmarkProvider(BenchmarkProvider):
         self._isolated_candidate_configs = {
             id(fn): config for fn, config in zip(fns, configs, strict=True)
         }
+
+    def _report_worker_exception(
+        self,
+        job: str,
+        config: Config | None,
+        error: Exception,
+        *,
+        retiming: bool = False,
+    ) -> None:
+        """Count and log a benchmark job that raised: a candidate's timing
+        job once its candidate had compiled and run, or its accuracy check,
+        either of which drops the candidate, or a re-timing (``retiming``),
+        which gives no reading.
+
+        What comes here is a job's exception that the parent restored and
+        that is no sticky CUDA error, or, for an accuracy check or a
+        re-timing, one this process raised before the job reached the
+        worker. (A sticky CUDA error, a timeout, a worker that died and an
+        exception the parent could not restore are reported on their own.)
+        The worker lives on past such an error, so nothing else shows it,
+        with one exception: ``BenchmarkWorker.run`` replaces the worker
+        before it raises a device out-of-memory error, and warns about that
+        error only where it first ran the job again in the new worker. The
+        error's text is the one it had in the worker
+        (``runtime_error_message``). The first job that raises an error
+        logs it in full at WARNING.
+        Later jobs with the same text log at DEBUG, and at WARNING their
+        number, with the text's first line, each time it doubles. The texts
+        of candidates and of re-timings are told apart: candidates whose
+        jobs fail with more than ``_WORKER_EXCEPTION_WARNINGS`` different
+        texts (errors that quote their config) say so once and log the
+        further texts at DEBUG, while every new text of a re-timing is
+        warned about, however many the candidates produced: each stands for
+        a reading the search lost. The search's summary names the totals
+        (``AutotuneMetrics``).
+
+        Under ``autotune_ignore_errors`` the job is counted and nothing is
+        warned about: every job's error is a DEBUG line, as the in-process
+        path logs nothing for a candidate that raises there under the
+        setting.
+
+        Not for a candidate's timing job that raises in its compile and
+        first call (``_skip_subprocess_candidate``).
+        """
+        self._autotune_metrics.num_worker_job_exceptions += 1
+        if retiming:
+            self._autotune_metrics.num_isolated_rebenchmark_exceptions += 1
+        name = type(error).__name__
+        error_text = runtime_error_message(error)
+        text = f"{name}: {error_text}"
+        message = (
+            f"{job} subprocess raised"
+            + (f" for {config!r}" if config is not None else "")
+            + f": {text}"
+        )
+        if self.settings.autotune_ignore_errors:
+            self.log.debug(message)
+            return
+        if retiming:
+            counts = self._retiming_exception_counts
+            if counts is None:
+                counts = self._retiming_exception_counts = {}
+            jobs = "re-timings"
+        else:
+            counts = self._candidate_exception_counts
+            if counts is None:
+                counts = self._candidate_exception_counts = {}
+            jobs = "candidate jobs"
+            if text not in counts and len(counts) >= _WORKER_EXCEPTION_WARNINGS:
+                self._unlisted_candidate_exceptions += 1
+                if self._unlisted_candidate_exceptions > 1:
+                    self.log.debug(message)
+                    return
+                self.log.warning(
+                    f"{message}\nCandidate jobs of this search have raised more "
+                    f"than {_WORKER_EXCEPTION_WARNINGS} different errors; "
+                    "further new ones of candidates are logged at DEBUG."
+                )
+                return
+        seen = counts[text] = counts.get(text, 0) + 1
+        if seen == 1:
+            self.log.warning(message)
+            return
+        self.log.debug(message)
+        if seen & (seen - 1) == 0:
+            # (the first line that says something: a text can open with a
+            # blank one)
+            first_line = next(
+                (line.strip() for line in error_text.splitlines() if line.strip()), ""
+            )
+            self.log.warning(
+                f"{job} subprocess raised an error again, {seen} {jobs} so "
+                f"far: {name}: {first_line}"
+            )
 
     def _isolated_failure_subject(self, fn: Callable[..., object], desc: str) -> str:
         config = self._isolated_candidate_configs.get(id(fn))
@@ -3897,11 +4004,19 @@ class LocalBenchmarkProvider(BenchmarkProvider):
                 f"{phase} subprocess: {type(error).__qualname__}: {message}\n  Config: {decorator}"
             )
             self.kernel.maybe_log_repro(self.log.warning, self.args, config)
-        else:
+        elif phase == "benchmark" and job_phase(error) != PHASE_COMPILED:
+            # The timing job's compile and first call, which a backend that
+            # does not precompile runs in the worker: an invalid config is
+            # expected to fail there, and the summary counts it ("configs
+            # failed to compile or run"). An error raised before the job ran
+            # (a wrapper that cannot be serialized under input banks) has no
+            # phase either. An accuracy check that raises is always reported.
             self.log.debug(
                 f"{phase.capitalize()} subprocess raised for {config!r}: "
                 f"{type(error).__name__}: {message}"
             )
+        else:
+            self._report_worker_exception(phase.capitalize(), config, error)
         self._record_compile_failure(config, error)
         return inf
 
@@ -4373,8 +4488,11 @@ class LocalBenchmarkProvider(BenchmarkProvider):
                         # still unsafe, so remove it from contention.
                         timings.append(IsolatedBenchmarkFailure("error"))
                         continue
-                    self.log.debug(
-                        f"{desc} subprocess raised: {type(e).__name__}: {message}"
+                    self._report_worker_exception(
+                        desc,
+                        self._isolated_candidate_configs.get(id(fn)),
+                        e,
+                        retiming=True,
                     )
                     timing = None
                 # A wrapper-load failure disables the worker because later
@@ -4730,6 +4848,8 @@ class MultiShapeBenchmarkProvider(BenchmarkProvider):
                 len(child._worker_failure_config_ids),
                 child._autotune_metrics.num_unique_sources,
                 child._autotune_metrics.num_source_deduplications,
+                child._autotune_metrics.num_worker_job_exceptions,
+                child._autotune_metrics.num_isolated_rebenchmark_exceptions,
             )
             for child in self.children
         ]
@@ -4757,6 +4877,23 @@ class MultiShapeBenchmarkProvider(BenchmarkProvider):
         # multi-shape measurement for the same materialized config.
         if self._collect_effective_source_repairs:
             self._collect_child_effective_source_repairs()
+        # Jobs, not configs: each shape's job that raised is one, in a
+        # re-timing (``record_results`` unset) as much as in a first timing.
+        # The children warn about their jobs (``_report_worker_exception``);
+        # the search's summary counts them from here.
+        for child, (
+            *_,
+            before_job_exceptions,
+            before_rebenchmark_exceptions,
+        ) in zip(self.children, child_metric_snapshots, strict=True):
+            self._autotune_metrics.num_worker_job_exceptions += (
+                child._autotune_metrics.num_worker_job_exceptions
+                - before_job_exceptions
+            )
+            self._autotune_metrics.num_isolated_rebenchmark_exceptions += (
+                child._autotune_metrics.num_isolated_rebenchmark_exceptions
+                - before_rebenchmark_exceptions
+            )
         if record_results:
             accuracy_failure_ids: set[int] = set()
             compile_failure_ids: set[int] = set()
@@ -4767,6 +4904,7 @@ class MultiShapeBenchmarkProvider(BenchmarkProvider):
                 before_worker,
                 before_unique_sources,
                 before_source_deduplications,
+                *_,
             ) in zip(self.children, child_metric_snapshots, strict=True):
                 accuracy_failure_ids.update(
                     child._accuracy_failure_config_ids[before_accuracy:]

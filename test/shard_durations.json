@@ -208,7 +208,7 @@
  "test/test_cute_lane_reduction_ownership.py": 10.8,
  "test/test_cute_launch_block_dims.py": 32.0,
  "test/test_cute_launcher_alignment.py": 0.3,
- "test/test_cute_launcher_capture_ownership.py": 4.2,
+ "test/test_cute_launcher_capture_ownership.py": 21.1,
  "test/test_cute_layout.py": 2.4,
  "test/test_cute_live_row_lanes.py": 13.3,
  "test/test_cute_lowerings.py": 194.5,

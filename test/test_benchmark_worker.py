@@ -60,11 +60,16 @@ from helion.autotuner.benchmark_provider import LocalBenchmarkProvider
 from helion.autotuner.benchmark_provider import MultiShapeBenchmarkProvider
 from helion.autotuner.benchmark_worker import _DEFAULT_START_TIMEOUT_SECONDS
 from helion.autotuner.benchmark_worker import _REAP_TIMEOUT_SECONDS
+from helion.autotuner.benchmark_worker import PHASE_COMPILED
 from helion.autotuner.benchmark_worker import BenchmarkSubprocessError
 from helion.autotuner.benchmark_worker import BenchmarkTimeout
 from helion.autotuner.benchmark_worker import BenchmarkWorker
 from helion.autotuner.benchmark_worker import BenchmarkWorkerDied
 from helion.autotuner.benchmark_worker import BenchmarkWorkerUnkillable
+from helion.autotuner.benchmark_worker import PhasedJob
+from helion.autotuner.benchmark_worker import _PhaseReport
+from helion.autotuner.benchmark_worker import _set_job_phase
+from helion.autotuner.benchmark_worker import job_phase
 from helion.autotuner.benchmarking import KernelTraceUnreadable
 from helion.autotuner.benchmarking import _estimate_runtime_and_warmup
 from helion.autotuner.benchmarking import do_bench
@@ -272,6 +277,117 @@ class _RaiseUnpickleableLocalException:
             pass
 
         raise LocalError("local exception")
+
+
+class _CodedError(Exception):
+    """An exception the parent cannot rebuild from its pickle, as the CuTe
+    DSL's ``DSLCudaRuntimeError``: its constructor takes a code and a name
+    and hands ``Exception`` one message, which opens with a blank line."""
+
+    def __init__(self, code: int, name: str) -> None:
+        super().__init__(f"\n{name} (error code: {code})\n- note: error code {code}")
+
+
+@dataclasses.dataclass
+class _RaiseCodedError(PhasedJob):
+    """Raises a ``_CodedError``, after reporting ``phase`` if it has one."""
+
+    code: int
+    name: str
+    phase: str | None = None
+
+    def __call__(self, report_phase: Any = None) -> object:
+        if self.phase is not None:
+            report_phase(self.phase)
+        raise _CodedError(self.code, self.name)
+
+
+# The CUDA errors after which a process's context fails every later call, as
+# CUDA's headers document them (``CUresult`` in ``cuda.h``): the code, the
+# driver's name for it, and the runtime's error string
+# (``cudaGetErrorString``), which PyTorch raises behind "CUDA error: ". Names
+# and strings are CUDA 13.0's.
+_STICKY_CUDA_ERRORS = (
+    (
+        226,
+        "CUDA_ERROR_CONTAINED",
+        "Invalid access of peer GPU memory over nvlink or a hardware error",
+    ),
+    (700, "CUDA_ERROR_ILLEGAL_ADDRESS", "an illegal memory access was encountered"),
+    (702, "CUDA_ERROR_LAUNCH_TIMEOUT", "the launch timed out and was terminated"),
+    (710, "CUDA_ERROR_ASSERT", "device-side assert triggered"),
+    (714, "CUDA_ERROR_HARDWARE_STACK_ERROR", "hardware stack error"),
+    (715, "CUDA_ERROR_ILLEGAL_INSTRUCTION", "an illegal instruction was encountered"),
+    (716, "CUDA_ERROR_MISALIGNED_ADDRESS", "misaligned address"),
+    (
+        717,
+        "CUDA_ERROR_INVALID_ADDRESS_SPACE",
+        "operation not supported on global/shared address space",
+    ),
+    (718, "CUDA_ERROR_INVALID_PC", "invalid program counter"),
+    (719, "CUDA_ERROR_LAUNCH_FAILED", "unspecified launch failure"),
+    (721, "CUDA_ERROR_TENSOR_MEMORY_LEAK", "tensor memory not completely freed"),
+    (
+        810,
+        "CUDA_ERROR_MPS_CLIENT_TERMINATED",
+        "the MPS client has been terminated by the server",
+    ),
+    (
+        911,
+        "CUDA_ERROR_EXTERNAL_DEVICE",
+        # (the runtime's spelling)
+        "an async error has occured in external entity outside of CUDA",  # codespell:ignore occured
+    ),
+)
+# Errors that leave the context usable, the ones nearest to a sticky error
+# in name or in wording among them.
+_RECOVERABLE_CUDA_ERRORS = (
+    (1, "CUDA_ERROR_INVALID_VALUE", "invalid argument"),
+    (218, "CUDA_ERROR_INVALID_PTX", "a PTX JIT compilation failed"),
+    (
+        401,
+        "CUDA_ERROR_ILLEGAL_STATE",
+        "the operation cannot be performed in the present state",
+    ),
+    (
+        701,
+        "CUDA_ERROR_LAUNCH_OUT_OF_RESOURCES",
+        "too many resources requested for launch",
+    ),
+    (801, "CUDA_ERROR_NOT_SUPPORTED", "operation not supported"),
+    (
+        901,
+        "CUDA_ERROR_STREAM_CAPTURE_INVALIDATED",
+        "operation failed due to a previous error during capture",
+    ),
+    (909, "CUDA_ERROR_TIMEOUT", "wait operation timed out"),
+)
+# Hints that PyTorch's CUDA check can append to the runtime's string of an
+# error (``c10/cuda``); none of them names a sticky error.
+_PYTORCH_CUDA_ERROR_HINTS = (
+    "\nCUDA kernel errors might be asynchronously reported at some other API"
+    " call, so the stacktrace below might be incorrect."
+    "\nFor debugging consider passing CUDA_LAUNCH_BLOCKING=1"
+    "\nDevice-side assertions were explicitly omitted for this error check;"
+    " the error probably arose while initializing the DSA handlers."
+)
+
+
+class _SealedError(Exception):
+    """An exception the parent rebuilds from its pickle and that takes no
+    attribute its class does not define."""
+
+    def __setattr__(self, name: str, value: object) -> None:
+        if not name.startswith("__"):
+            raise AttributeError(f"{type(self).__name__} is sealed: {name}")
+        super().__setattr__(name, value)
+
+
+def _after_compile(error: Exception) -> Exception:
+    """``error`` as ``BenchmarkWorker.run`` re-raises it for a job that had
+    reported its compile phase."""
+    _set_job_phase(error, PHASE_COMPILED)
+    return error
 
 
 @dataclasses.dataclass
@@ -720,6 +836,194 @@ class TestBenchmarkWorkerFailureModes(unittest.TestCase):
         self.assertEqual(cute_kernel._helion_cute_compiled_launchers, {})
         self.assertEqual(cute_kernel._helion_cute_launch_arg_cache, {})
         self.assertNotIn(launcher_filename, linecache.cache)
+
+    def test_compiled_fn_restores_the_source_hash_of_every_kernel_that_had_it(
+        self,
+    ) -> None:
+        """A generated module can hold more kernels than the one named after
+        its function (a host zero fill launches a kernel of its own). The
+        backend gives each of them the module's source hash in the parent,
+        and the copy a worker loads gives it to the same globals: a kernel
+        without the hash has no on-disk compile-cache key and would be
+        compiled afresh in every job. The fill kernels are found by the name
+        the generator gives them and named where they carry the module's hash
+        in the parent, so a global with a hash of its own, or with none,
+        keeps what the module gave it."""
+        source = (
+            "class Kernel:\n"
+            "    pass\n"
+            "_helion_call = Kernel()\n"
+            "_helion_zero_fill_0_helion_call = Kernel()\n"
+            "_helion_stage = Kernel()\n"
+            "_helion_stage._helion_cute_source_hash = 'the stage kernel own hash'\n"
+            "_helion_plain = Kernel()\n"
+            "def call():\n"
+            "    pass\n"
+        )
+        module_hash = "parent-source-hash"
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "compiled_module.py"
+            path.write_text(source)
+            source_module = ModuleType("_test_compiled_module_with_fill")
+            source_module.__file__ = str(path)
+            sys.modules[source_module.__name__] = source_module
+            try:
+                exec(compile(source, str(path), "exec"), source_module.__dict__)
+                # What a backend's ``annotate_compiled_module`` leaves.
+                for annotated in (
+                    source_module.call,
+                    source_module._helion_call,
+                    source_module._helion_zero_fill_0_helion_call,
+                ):
+                    annotated._helion_cute_source_hash = module_hash
+                fn_spec = _serialize_compiled_fn(source_module.call)
+            finally:
+                sys.modules.pop(source_module.__name__, None)
+
+        self.assertEqual(fn_spec.source_hash, module_hash)
+        self.assertEqual(
+            fn_spec.source_hash_globals, ("_helion_zero_fill_0_helion_call",)
+        )
+        # Two jobs load a copy each: both give the fill kernel the hash.
+        for _job in range(2):
+            fn = _load_compiled_fn(fn_spec)
+            try:
+                loaded = fn.__globals__
+                for name in ("_helion_call", "_helion_zero_fill_0_helion_call"):
+                    self.assertEqual(loaded[name]._helion_cute_source_hash, module_hash)
+                self.assertEqual(
+                    loaded["_helion_stage"]._helion_cute_source_hash,
+                    "the stage kernel own hash",
+                )
+                self.assertFalse(
+                    hasattr(loaded["_helion_plain"], "_helion_cute_source_hash")
+                )
+            finally:
+                _unload_compiled_fn(fn)
+
+        # A bundle's stages keep their own hashes: nothing is named for it.
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "compiled_bundle.py"
+            path.write_text(source)
+            bundle_module = ModuleType("_test_compiled_bundle_with_fill")
+            bundle_module.__file__ = str(path)
+            sys.modules[bundle_module.__name__] = bundle_module
+            try:
+                exec(compile(source, str(path), "exec"), bundle_module.__dict__)
+                bundle_module.call._helion_cute_kernels = (
+                    bundle_module._helion_call,
+                    bundle_module._helion_stage,
+                )
+                for annotated in (
+                    bundle_module.call,
+                    bundle_module._helion_zero_fill_0_helion_call,
+                ):
+                    annotated._helion_cute_source_hash = module_hash
+                bundle_spec = _serialize_compiled_fn(bundle_module.call)
+            finally:
+                sys.modules.pop(bundle_module.__name__, None)
+        self.assertEqual(bundle_spec.source_hash, module_hash)
+        self.assertEqual(bundle_spec.source_hash_globals, ())
+
+    def test_compiled_fn_unload_has_each_launcher_release_its_kernel(self) -> None:
+        """A compiled launcher that owns loaded device code releases it, and
+        what the kernel keeps of it, when the temporary module is released:
+        the worker asks every launcher by name, with the kernel, before the
+        launcher cache is cleared.  What a launcher releases is the
+        launcher's to know: the worker names none of the kernel's relaunch
+        state."""
+        source = (
+            "class Kernel:\n"
+            "    pass\n"
+            "class Launcher:\n"
+            "    def __init__(self):\n"
+            "        self.released = []\n"
+            "    def release_kernel(self, kernel):\n"
+            "        assert self in kernel._helion_cute_compiled_launchers.values()\n"
+            "        self.released.append(kernel)\n"
+            "_helion_call = Kernel()\n"
+            "_helion_call._helion_cute_compiled_launchers = "
+            "{'first': Launcher(), 'second': Launcher()}\n"
+            "def call():\n"
+            "    pass\n"
+        )
+        fn = _load_compiled_fn(SerializedCompiledFunction("call", source, None, None))
+        kernel = fn.__globals__["_helion_call"]
+        launchers = list(kernel._helion_cute_compiled_launchers.values())
+
+        _unload_compiled_fn(fn)
+
+        self.assertEqual(
+            [launcher.released for launcher in launchers], [[kernel], [kernel]]
+        )
+        self.assertEqual(kernel._helion_cute_compiled_launchers, {})
+
+    def test_compiled_fn_unload_releases_every_kernel_of_the_module_once(self) -> None:
+        """A generated module can hold more kernels than the one named after
+        its function (a host zero fill launches a kernel of its own), and a
+        bundle can name a kernel the module also binds: each kernel's
+        launchers release it once, and its caches are cleared. The module's
+        kernels are the bundle's, the one named after the function and the
+        zero-fill kernels: another global is none of them, whatever its name
+        and whatever it holds."""
+        kernels_source = (
+            "class Launcher:\n"
+            "    def __init__(self, kernel):\n"
+            "        self.kernel = kernel\n"
+            "        self.releases = 0\n"
+            "    def release_kernel(self, kernel):\n"
+            "        assert kernel is self.kernel\n"
+            "        assert self in kernel._helion_cute_compiled_launchers.values()\n"
+            "        self.releases += 1\n"
+            "class Kernel:\n"
+            "    def __init__(self):\n"
+            "        self._helion_cute_compiled_launchers = {'launch': Launcher(self)}\n"
+            "        self._helion_cute_launch_arg_cache = {'arguments': object()}\n"
+            "_helion_call = Kernel()\n"
+            "_helion_zero_fill_0_helion_call = Kernel()\n"
+            "_helion_stage = Kernel()\n"
+            "not_of_the_module = Kernel()\n"
+            "def call():\n"
+            "    pass\n"
+        )
+        names = [
+            "_helion_call",
+            "_helion_zero_fill_0_helion_call",
+            "_helion_stage",
+            "not_of_the_module",
+        ]
+        # The stage kernel is the module's where the bundle names it.
+        for bundle, released in (
+            ("", [1, 1, 0, 0]),
+            (
+                "call._helion_cute_kernels = (_helion_stage, _helion_stage)\n",
+                [1, 1, 1, 0],
+            ),
+        ):
+            with self.subTest(bundle=bool(bundle)):
+                fn = _load_compiled_fn(
+                    SerializedCompiledFunction(
+                        "call", kernels_source + bundle, None, None
+                    )
+                )
+                kernels = [fn.__globals__[name] for name in names]
+                launchers = [
+                    kernel._helion_cute_compiled_launchers["launch"]
+                    for kernel in kernels
+                ]
+
+                _unload_compiled_fn(fn)
+
+                self.assertEqual(
+                    [launcher.releases for launcher in launchers], released
+                )
+                for kernel, count in zip(kernels, released, strict=True):
+                    self.assertEqual(
+                        kernel._helion_cute_compiled_launchers == {}, bool(count)
+                    )
+                    self.assertEqual(
+                        kernel._helion_cute_launch_arg_cache == {}, bool(count)
+                    )
 
     def test_compiled_fn_unload_clears_triton_fast_path_cache(self) -> None:
         source = (
@@ -3082,6 +3386,323 @@ class TestBenchmarkWorkerFailureModes(unittest.TestCase):
         finally:
             worker.shutdown()
 
+    def test_job_exception_carries_the_last_phase_the_job_reported(self) -> None:
+        """The search tells a candidate that fails in its compile and first
+        call from one that fails afterwards by the phase ``run`` notes on
+        the exception it re-raises, whatever deadlines the job is held to."""
+        self.assertIsNone(job_phase(RuntimeError("not a job's")))
+        for reports, phase in (
+            ((), None),
+            ((_PhaseReport(PHASE_COMPILED),), PHASE_COMPILED),
+        ):
+            with self.subTest(phase=phase):
+                worker = BenchmarkWorker()
+                process = Mock(pid=123)
+                process.is_alive.return_value = True
+                connection = Mock()
+                connection.poll.return_value = True
+                # (what the worker's loop sends for a job that raises)
+                failure = benchmark_worker_module._WorkerFailure.capture(
+                    RuntimeError("the job's")
+                )
+                replies = iter([*reports, failure])
+                connection.recv.side_effect = lambda replies=replies: next(replies)
+                worker._process = process
+                worker._parent_connection = connection
+
+                with self.assertRaisesRegex(RuntimeError, "the job's") as raised:
+                    worker.run(_ReturnValue(0), timeout=30.0)
+
+                self.assertEqual(job_phase(raised.exception), phase)
+                self.assertIs(worker._process, process)
+
+    def _job_error_in_the_parent(
+        self, error: BaseException
+    ) -> tuple[BaseException, bool]:
+        """What ``BenchmarkWorker.run`` raises for a job that raised
+        ``error``, an exception the parent cannot restore, after its compile
+        phase, and whether it then killed the worker, so that the next job
+        starts a fresh one."""
+        worker = BenchmarkWorker()
+        process = Mock(pid=123)
+        process.is_alive.return_value = True
+        parent_connection, child_connection = mp.Pipe(duplex=True)
+        worker._process = process
+        worker._parent_connection = parent_connection
+        try:
+            # What the worker's loop sends.
+            child_connection.send(_PhaseReport(PHASE_COMPILED))
+            child_connection.send(benchmark_worker_module._WorkerFailure.capture(error))
+            with (
+                patch(
+                    "helion.autotuner.benchmark_worker.signal_process_tree"
+                ) as signal_tree,
+                patch(
+                    "helion.autotuner.benchmark_worker._wait_for_exit",
+                    return_value=True,
+                ),
+                self.assertRaises(Exception) as raised,
+            ):
+                worker.run(_ReturnValue(0), timeout=30.0)
+        finally:
+            parent_connection.close()
+            child_connection.close()
+        self.assertEqual(job_phase(raised.exception), PHASE_COMPILED)
+        killed = worker._process is None
+        if killed:
+            signal_tree.assert_called_once_with(process, signal.SIGKILL)
+        else:
+            signal_tree.assert_not_called()
+        # It arrives by the worker's text: as a ``RuntimeError`` where the
+        # worker read a sticky error in it, which is what killed the worker.
+        self.assertIs(
+            type(raised.exception),
+            RuntimeError if killed else BenchmarkSubprocessError,
+        )
+        return raised.exception, killed
+
+    def test_sticky_error_under_the_drivers_name_replaces_the_worker(self) -> None:
+        """A launcher that calls the CUDA driver itself raises an error by
+        the driver's name for it (``CUDA_ERROR_ILLEGAL_ADDRESS (error code:
+        700)``), not by the runtime's wording that PyTorch raises (``an
+        illegal memory access was encountered``). The context is as poisoned
+        under either: the worker is replaced, for every error CUDA documents
+        as fatal to the context. An error that leaves the context usable
+        keeps it."""
+        for errors, sticky in (
+            (_STICKY_CUDA_ERRORS, True),
+            (_RECOVERABLE_CUDA_ERRORS, False),
+        ):
+            for code, name, _text in errors:
+                with self.subTest(name=name):
+                    raised, killed = self._job_error_in_the_parent(
+                        _CodedError(code, name)
+                    )
+
+                    self.assertEqual(
+                        str(raised),
+                        "the parent could not restore the worker exception: "
+                        f"{_CodedError.__module__}._CodedError: "
+                        f"\n{name} (error code: {code})\n- note: error code {code}",
+                    )
+                    self.assertEqual(match_unrecoverable_runtime_error(raised), sticky)
+                    self.assertEqual(killed, sticky)
+
+    def test_sticky_error_in_pytorchs_wording_replaces_the_worker(self) -> None:
+        """The same errors as PyTorch raises them: the runtime's error
+        string behind ``CUDA error: ``, with PyTorch's hints after it. In a
+        job's error the worker is replaced, and an error of this process
+        reads the same (what the in-process paths ask). The hints alone,
+        after an error that leaves the context usable, replace nothing."""
+        for errors, sticky in (
+            (_STICKY_CUDA_ERRORS, True),
+            (_RECOVERABLE_CUDA_ERRORS, False),
+        ):
+            for code, _name, text in errors:
+                with self.subTest(text=text):
+                    wording = f"CUDA error: {text}{_PYTORCH_CUDA_ERROR_HINTS}"
+                    raised, killed = self._job_error_in_the_parent(
+                        _CodedError(code, wording)
+                    )
+
+                    prefix, wording_line = str(raised).splitlines()[:2]
+                    self.assertEqual(
+                        prefix,
+                        "the parent could not restore the worker exception: "
+                        f"{_CodedError.__module__}._CodedError: ",
+                    )
+                    self.assertEqual(wording_line, f"CUDA error: {text}")
+                    self.assertEqual(match_unrecoverable_runtime_error(raised), sticky)
+                    self.assertEqual(killed, sticky)
+                    self.assertEqual(
+                        match_unrecoverable_runtime_error(RuntimeError(wording)),
+                        sticky,
+                    )
+
+    @skipUnlessCuteAvailable("raises the CuTe DSL's own CUDA runtime error")
+    def test_sticky_cuda_error_of_the_cute_dsl_replaces_the_worker(self) -> None:
+        """The same with the exception the DSL raises for a launch, under
+        both names it gives the error: the runtime's
+        (``cudaErrorIllegalAddress``) for a launch it makes itself, whose
+        result ``JitExecutor.run_compiled_program`` reads as a
+        ``cudaError_t``, and the driver's, its helper's default, for a fast
+        relaunch. The parent cannot rebuild that exception from its pickle
+        (its constructor takes a code and a name), so it arrives by the
+        worker's text, which names the error. An error of this process
+        reads the same."""
+        from cuda.bindings import driver
+        from cuda.bindings import runtime
+        from cutlass.base_dsl.runtime import cuda as dsl_cuda
+
+        # The DSL ends the text of some errors with a listing of the devices,
+        # for which it initializes the CUDA driver: on a busy host that call
+        # has stalled this test for minutes. Nothing here reads the listing,
+        # so the errors get the one of a host without a device.
+        no_device = dsl_cuda.DeviceInfo()
+        no_device.initialization_failed = True
+        with patch.object(dsl_cuda, "get_device_info", return_value=no_device):
+            for errors, sticky in (
+                (_STICKY_CUDA_ERRORS, True),
+                (_RECOVERABLE_CUDA_ERRORS, False),
+            ):
+                for code, driver_name, _text in errors:
+                    for spelling, name in (
+                        (driver.CUresult, driver_name),
+                        (runtime.cudaError_t, runtime.cudaError_t(code).name),
+                    ):
+                        with self.subTest(name=name):
+                            error = dsl_cuda.create_cuda_runtime_error(code, spelling)
+                            raised, killed = self._job_error_in_the_parent(error)
+
+                            self.assertIn(name, str(error))
+                            self.assertEqual(
+                                str(raised),
+                                "the parent could not restore the worker exception: "
+                                f"cutlass.base_dsl.common.DSLCudaRuntimeError: {error}",
+                            )
+                            self.assertEqual(killed, sticky)
+                            self.assertEqual(
+                                match_unrecoverable_runtime_error(error), sticky
+                            )
+
+    @skipUnlessCuteAvailable("reads CUDA's errors from the DSL's CUDA bindings")
+    def test_sticky_pattern_matches_the_installed_cudas_fatal_errors_alone(
+        self,
+    ) -> None:
+        """Every error the installed CUDA has, under the driver's name for
+        it, under the runtime's name and in the runtime's own error string:
+        the pattern matches the ones listed as sticky and, but for the
+        string of one error CUDA retired, no other. An error CUDA rewords
+        or renames is missed here before it is missed in a search."""
+        from cuda.bindings import driver
+        from cuda.bindings import runtime
+
+        sticky = {code for code, _name, _text in _STICKY_CUDA_ERRORS}
+        for error in driver.CUresult:
+            with self.subTest(name=error.name):
+                self.assertEqual(
+                    match_unrecoverable_runtime_error(RuntimeError(error.name)),
+                    int(error) in sticky,
+                )
+        for error in runtime.cudaError_t:
+            # (what the DSL reads to name a launch's error)
+            name = runtime.cudaGetErrorName(error)[1].decode()
+            with self.subTest(name=name):
+                self.assertEqual(
+                    match_unrecoverable_runtime_error(RuntimeError(name)),
+                    int(error) in sticky,
+                )
+        # One more string reads as sticky: "unspecified launch failure in
+        # prior launch", which holds the launch failure's. It belongs to
+        # ``cudaErrorPriorLaunchFailure``, an error of the device emulation
+        # that CUDA 3.1 removed; the driver has no such error.
+        prior_launch_failure = int(runtime.cudaError_t.cudaErrorPriorLaunchFailure)
+        for error in runtime.cudaError_t:
+            text = runtime.cudaGetErrorString(error)[1].decode()
+            with self.subTest(code=int(error), text=text):
+                self.assertEqual(
+                    match_unrecoverable_runtime_error(
+                        RuntimeError(f"CUDA error: {text}")
+                    ),
+                    int(error) in sticky or int(error) == prior_launch_failure,
+                )
+
+    def test_job_exception_that_refuses_attributes_carries_the_phase_note(
+        self,
+    ) -> None:
+        """An exception class can refuse attributes it does not define. The
+        phase note is kept in the instance's own dict, past the class: the
+        job's error is the one raised, it carries the job's phase, and a
+        sticky one still replaces the worker."""
+        with self.assertRaisesRegex(AttributeError, "is sealed"):
+            _SealedError("refuses").note = PHASE_COMPILED
+        for text, sticky in (
+            ("ordinary failure", False),
+            ("CUDA error: an illegal memory access was encountered", True),
+        ):
+            with self.subTest(sticky=sticky):
+                worker = BenchmarkWorker()
+                process = Mock(pid=123)
+                process.is_alive.return_value = True
+                parent_connection, child_connection = mp.Pipe(duplex=True)
+                worker._process = process
+                worker._parent_connection = parent_connection
+                try:
+                    # What the worker's loop sends for a job that raises
+                    # a ``_SealedError`` after its compile phase.
+                    child_connection.send(_PhaseReport(PHASE_COMPILED))
+                    child_connection.send(
+                        benchmark_worker_module._WorkerFailure.capture(
+                            _SealedError(text)
+                        )
+                    )
+                    with (
+                        patch(
+                            "helion.autotuner.benchmark_worker.signal_process_tree"
+                        ) as signal_tree,
+                        patch(
+                            "helion.autotuner.benchmark_worker._wait_for_exit",
+                            return_value=True,
+                        ),
+                        self.assertRaisesRegex(_SealedError, text) as raised,
+                    ):
+                        worker.run(_ReturnValue(0), timeout=30.0)
+                finally:
+                    parent_connection.close()
+                    child_connection.close()
+
+                self.assertEqual(job_phase(raised.exception), PHASE_COMPILED)
+                if sticky:
+                    signal_tree.assert_called_once_with(process, signal.SIGKILL)
+                    self.assertIsNone(worker._process)
+                else:
+                    signal_tree.assert_not_called()
+                    self.assertIs(worker._process, process)
+
+    @pytest.mark.slow
+    def test_unrebuildable_job_exception_crosses_the_pipe_with_text_and_phase(
+        self,
+    ) -> None:
+        worker = BenchmarkWorker()
+        try:
+            pid = worker.run(_ReturnPid(), timeout=30.0)
+            for phase in (None, PHASE_COMPILED):
+                with self.assertRaises(BenchmarkSubprocessError) as raised:
+                    worker.run(
+                        _RaiseCodedError(
+                            901, "CUDA_ERROR_STREAM_CAPTURE_INVALIDATED", phase
+                        ),
+                        timeout=30.0,
+                    )
+                self.assertEqual(
+                    str(raised.exception),
+                    "the parent could not restore the worker exception: "
+                    f"{_CodedError.__module__}._CodedError: "
+                    "\nCUDA_ERROR_STREAM_CAPTURE_INVALIDATED (error code: 901)\n"
+                    "- note: error code 901",
+                )
+                self.assertEqual(job_phase(raised.exception), phase)
+            # The worker lived through both ...
+            self.assertEqual(worker.run(_ReturnPid(), timeout=30.0), pid)
+            # ... and is replaced after a sticky error raised this way.
+            with self.assertRaisesRegex(
+                RuntimeError, "illegal memory access"
+            ) as raised:
+                worker.run(
+                    _RaiseCodedError(
+                        700,
+                        "CUDA error: an illegal memory access was encountered",
+                        PHASE_COMPILED,
+                    ),
+                    timeout=30.0,
+                )
+            self.assertIs(type(raised.exception), RuntimeError)
+            self.assertEqual(job_phase(raised.exception), PHASE_COMPILED)
+            self.assertFalse(worker.alive())
+            self.assertNotEqual(worker.run(_ReturnPid(), timeout=30.0), pid)
+        finally:
+            worker.shutdown()
+
     @pytest.mark.slow
     def test_unreadable_trace_error_reaches_the_parent_as_itself(self) -> None:
         # The provider tells a window the trace could not read from a config
@@ -3228,6 +3849,8 @@ class TestSuspiciousRebenchmark(unittest.TestCase):
         provider = LocalBenchmarkProvider.__new__(LocalBenchmarkProvider)
         provider.settings = Settings(autotune_benchmark_subprocess=True)
         provider.log = Mock()
+        # (counts the re-timing that raises and keeps its worker)
+        provider._autotune_metrics = AutotuneMetrics()
         worker = BenchmarkWorker()
         try:
             with (
@@ -3355,6 +3978,582 @@ class TestSuspiciousRebenchmark(unittest.TestCase):
         self.assertEqual(
             provider._autotune_metrics.num_isolated_rebenchmark_timeouts, 1
         )
+
+    def _provider_with_fakes(self) -> LocalBenchmarkProvider:
+        provider = LocalBenchmarkProvider.__new__(LocalBenchmarkProvider)
+        provider.settings = Settings(
+            autotune_benchmark_subprocess=True, autotune_accuracy_check=True
+        )
+        provider.config_spec = SimpleNamespace(
+            compiler_seed_timeout_retry_repetitions=None
+        )
+        provider.log = Mock()
+        provider._autotune_metrics = AutotuneMetrics()
+        provider._compile_failure_config_ids = []
+        provider._worker_failure_config_ids = []
+        return provider
+
+    def _retime(
+        self, provider: LocalBenchmarkProvider, errors: list[Exception]
+    ) -> list[object]:
+        fns = [cast("CompiledConfig", object()) for _ in errors]
+        with (
+            patch.object(provider, "_subprocess_benchmark_enabled", return_value=True),
+            patch.object(provider, "_run_subprocess_benchmark_job", side_effect=errors),
+        ):
+            timings = provider.benchmark_isolated(
+                fns, warmup=1, rep=100, desc="Generation 3: verifying top configs"
+            )
+        assert timings is not None
+        return list(timings)
+
+    def test_retiming_that_raises_in_the_worker_is_warned_about_and_counted(
+        self,
+    ) -> None:
+        """A re-timing whose job raises in a worker that survives gives no
+        reading: the search hears the error and its metrics count it."""
+        provider = self._provider_with_fakes()
+        fn = cast("CompiledConfig", object())
+        config = Config(block_sizes=[4])
+        provider.register_isolated_candidates([fn], [config])
+        error = RuntimeError(
+            "CUDA error: operation failed due to a previous error during capture"
+        )
+
+        with (
+            patch.object(provider, "_subprocess_benchmark_enabled", return_value=True),
+            patch.object(provider, "_run_subprocess_benchmark_job", side_effect=error),
+        ):
+            timings = provider.benchmark_isolated(
+                [fn], warmup=1, rep=100, desc="Generation 3: verifying top configs"
+            )
+
+        self.assertEqual(timings, [None])
+        provider.log.warning.assert_called_once_with(
+            f"Generation 3: verifying top configs subprocess raised for {config!r}: "
+            "RuntimeError: CUDA error: operation failed due to a previous error "
+            "during capture"
+        )
+        metrics = provider._autotune_metrics
+        self.assertEqual(metrics.num_worker_job_exceptions, 1)
+        self.assertEqual(metrics.num_isolated_rebenchmark_exceptions, 1)
+        self.assertEqual(metrics.num_isolated_rebenchmark_timeouts, 0)
+        self.assertEqual(metrics.to_dict()["num_worker_job_exceptions"], 1)
+        self.assertEqual(metrics.to_dict()["num_isolated_rebenchmark_exceptions"], 1)
+
+    def test_repeated_worker_exception_is_warned_about_as_its_count_doubles(
+        self,
+    ) -> None:
+        """The count line quotes the first line of the error it counts, so
+        two errors of one type are told apart."""
+        provider = self._provider_with_fakes()
+        capture = "operation failed due to a previous error during capture"
+        # (the text of a CuTe DSL error opens with a blank line)
+        launch = "\nCUDA_ERROR_INVALID_VALUE (error code: 1)\n- note: error code 1"
+        # An exception the parent restores is reported by the text it had
+        # in the worker, whatever its own formatter does in this process:
+        # two errors of one such class are told apart by that text too.
+        names = {
+            901: "CUDA_ERROR_STREAM_CAPTURE_INVALIDATED",
+            1: "CUDA_ERROR_INVALID_VALUE",
+        }
+
+        def sent(code: int) -> str:
+            """The first line of its text."""
+            return f"{names[code]} (error code: {code})"
+
+        def restored(code: int) -> Exception:
+            """An ``_UnprintableError`` as ``BenchmarkWorker.run`` restores
+            it for a job that raised it."""
+            error = benchmark_worker_module._WorkerFailure.capture(
+                _UnprintableError(f"{sent(code)}\n- note: error code {code}")
+            ).restore()
+            assert isinstance(error, _UnprintableError)
+            return error
+
+        timings = self._retime(
+            provider,
+            [RuntimeError(capture) for _ in range(5)]
+            + [RuntimeError(launch) for _ in range(2)]
+            + [ValueError("Invalid GPU-only timing: 0.0")]
+            + [restored(901), restored(901), restored(1), restored(1)],
+        )
+
+        self.assertEqual(timings, [None] * 12)
+        subject = "Generation 3: verifying top configs subprocess raised"
+
+        def again(retimings: int, first_line: str, name: str = "RuntimeError") -> str:
+            return (
+                f"{subject} an error again, {retimings} re-timings so far: "
+                f"{name}: {first_line}"
+            )
+
+        def first(code: int) -> str:
+            return (
+                f"{subject}: _UnprintableError: {sent(code)}\n- note: error code {code}"
+            )
+
+        self.assertEqual(
+            [call.args[0] for call in provider.log.warning.call_args_list],
+            [
+                f"{subject}: RuntimeError: {capture}",
+                again(2, capture),
+                again(4, capture),
+                f"{subject}: RuntimeError: {launch}",
+                again(2, "CUDA_ERROR_INVALID_VALUE (error code: 1)"),
+                f"{subject}: ValueError: Invalid GPU-only timing: 0.0",
+                first(901),
+                again(2, sent(901), "_UnprintableError"),
+                first(1),
+                again(2, sent(1), "_UnprintableError"),
+            ],
+        )
+        # Every repeat keeps its own line in the debug log.
+        self.assertEqual(
+            [call.args[0] for call in provider.log.debug.call_args_list],
+            [f"{subject}: RuntimeError: {capture}"] * 4
+            + [f"{subject}: RuntimeError: {launch}", first(901), first(1)],
+        )
+        self.assertEqual(provider._autotune_metrics.num_worker_job_exceptions, 12)
+        self.assertEqual(
+            provider._autotune_metrics.num_isolated_rebenchmark_exceptions, 12
+        )
+
+    def _time_candidates(
+        self, provider: LocalBenchmarkProvider, errors: list[Exception]
+    ) -> None:
+        """One candidate's timing job per error, which raises it."""
+        for index, error in enumerate(errors):
+            with patch.object(
+                provider, "_run_subprocess_benchmark_job", side_effect=[error]
+            ):
+                result = provider._benchmark_function_subprocess(
+                    Config(block_sizes=[2**index]), cast("CompiledConfig", object())
+                )
+            self.assertEqual(result, math.inf)
+
+    def test_many_distinct_candidate_exceptions_are_warned_about_up_to_a_limit(
+        self,
+    ) -> None:
+        """Errors that quote their config are all different: a search warns
+        about the first of them in full, says once that it stops, and keeps
+        counting the errors it has warned about."""
+        provider = self._provider_with_fakes()
+        limit = 3
+
+        with patch(
+            "helion.autotuner.benchmark_provider._WORKER_EXCEPTION_WARNINGS", limit
+        ):
+            self._time_candidates(
+                provider,
+                [
+                    _after_compile(RuntimeError(f"error {index}"))
+                    for index in [*range(limit + 3), 0]
+                ],
+            )
+
+        def raised(index: int) -> str:
+            config = Config(block_sizes=[2**index])
+            return f"Benchmark subprocess raised for {config!r}"
+
+        warnings = [call.args[0] for call in provider.log.warning.call_args_list]
+        self.assertEqual(
+            warnings[:limit],
+            [f"{raised(index)}: RuntimeError: error {index}" for index in range(limit)],
+        )
+        self.assertEqual(len(warnings), limit + 2)
+        self.assertTrue(
+            warnings[limit].startswith(
+                f"{raised(limit)}: RuntimeError: error {limit}\n"
+            )
+        )
+        self.assertIn(f"more than {limit} different errors", warnings[limit])
+        self.assertEqual(
+            warnings[-1],
+            "Benchmark subprocess raised an error again, 2 candidate jobs so "
+            "far: RuntimeError: error 0",
+        )
+        self.assertEqual(
+            [call.args[0] for call in provider.log.debug.call_args_list],
+            [
+                f"{raised(limit + 1)}: RuntimeError: error {limit + 1}",
+                f"{raised(limit + 2)}: RuntimeError: error {limit + 2}",
+                f"{raised(limit + 3)}: RuntimeError: error 0",
+            ],
+        )
+        self.assertEqual(
+            provider._autotune_metrics.num_worker_job_exceptions, limit + 4
+        )
+
+    def test_retiming_exception_is_warned_about_past_the_limit_of_candidates(
+        self,
+    ) -> None:
+        """The limit on different errors is the candidates': once they have
+        filled it, a re-timing that loses its reading is still warned about,
+        with an error the candidates raised before or with a new one."""
+        provider = self._provider_with_fakes()
+        limit = 2
+        capture = "operation failed due to a previous error during capture"
+        subject = "Generation 3: verifying top configs subprocess raised"
+
+        with patch(
+            "helion.autotuner.benchmark_provider._WORKER_EXCEPTION_WARNINGS", limit
+        ):
+            self._time_candidates(
+                provider,
+                [
+                    _after_compile(RuntimeError(f"error {index}"))
+                    for index in range(limit + 2)
+                ],
+            )
+            provider.log.warning.reset_mock()
+            timings = self._retime(
+                provider,
+                [RuntimeError(capture), RuntimeError("error 0")]
+                + [RuntimeError(f"other error {index}") for index in range(limit + 1)],
+            )
+
+        self.assertEqual(timings, [None] * (limit + 3))
+        self.assertEqual(
+            [call.args[0] for call in provider.log.warning.call_args_list],
+            [f"{subject}: RuntimeError: {capture}", f"{subject}: RuntimeError: error 0"]
+            + [
+                f"{subject}: RuntimeError: other error {index}"
+                for index in range(limit + 1)
+            ],
+        )
+        metrics = provider._autotune_metrics
+        self.assertEqual(metrics.num_worker_job_exceptions, 2 * limit + 5)
+        self.assertEqual(metrics.num_isolated_rebenchmark_exceptions, limit + 3)
+
+    def test_candidate_job_that_raises_past_its_compile_is_warned_about_and_counted(
+        self,
+    ) -> None:
+        """The candidate's timing job once the candidate has compiled and
+        run, and its accuracy check: the candidate is dropped as before, and
+        the error is no longer only in the debug log."""
+        config = Config(block_sizes=[8])
+        fn = cast("CompiledConfig", object())
+        text = "operation failed due to a previous error during capture"
+        for job, timing, accuracy in (
+            ("Benchmark", _after_compile(RuntimeError(text)), None),
+            ("Accuracy check", 1.5, RuntimeError(text)),
+            # (a class that refuses attributes carries its job's phase too)
+            ("Benchmark", _after_compile(_SealedError(text)), None),
+        ):
+            error = accuracy if accuracy is not None else timing
+            with self.subTest(job=job, error=type(error).__name__):
+                provider = self._provider_with_fakes()
+                with (
+                    patch.object(
+                        provider, "_run_subprocess_benchmark_job", side_effect=[timing]
+                    ),
+                    patch.object(
+                        provider,
+                        "_run_subprocess_accuracy_check_job",
+                        side_effect=[accuracy],
+                    ),
+                ):
+                    result = provider._benchmark_function_subprocess(config, fn)
+
+                self.assertEqual(result, math.inf)
+                provider.log.warning.assert_called_once_with(
+                    f"{job} subprocess raised for {config!r}: "
+                    f"{type(error).__name__}: {error}"
+                )
+                metrics = provider._autotune_metrics
+                self.assertEqual(metrics.num_worker_job_exceptions, 1)
+                self.assertEqual(metrics.num_isolated_rebenchmark_exceptions, 0)
+                self.assertEqual(metrics.num_compile_failures, 1)
+                self.assertEqual(metrics.num_worker_failures, 0)
+
+        # An exception the parent cannot restore (the CuTe DSL's CUDA runtime
+        # error, one that does not pickle) arrives as a
+        # ``BenchmarkSubprocessError`` with the worker's text. The candidate
+        # then has no reading: the search warns about it and counts it with
+        # the worker failures, not with the jobs that raised.
+        unrestored = benchmark_worker_module._WorkerFailure.capture(
+            _CodedError(901, "CUDA_ERROR_STREAM_CAPTURE_INVALIDATED")
+        ).restore()
+        self.assertIs(type(unrestored), BenchmarkSubprocessError)
+        for job, timing, accuracy in (
+            ("Benchmark", _after_compile(unrestored), None),
+            ("Accuracy check", 1.5, unrestored),
+        ):
+            with self.subTest(job=job, error="unrestored"):
+                provider = self._provider_with_fakes()
+                with (
+                    patch.object(
+                        provider, "_run_subprocess_benchmark_job", side_effect=[timing]
+                    ),
+                    patch.object(
+                        provider,
+                        "_run_subprocess_accuracy_check_job",
+                        side_effect=[accuracy],
+                    ),
+                ):
+                    result = provider._benchmark_function_subprocess(config, fn)
+
+                self.assertEqual(result, math.inf)
+                provider.log.warning.assert_called_once_with(
+                    f"{job} subprocess failed for {config!r}: "
+                    "the parent could not restore the worker exception: "
+                    f"{_CodedError.__module__}._CodedError: "
+                    "\nCUDA_ERROR_STREAM_CAPTURE_INVALIDATED (error code: 901)\n"
+                    "- note: error code 901"
+                )
+                metrics = provider._autotune_metrics
+                self.assertEqual(metrics.num_worker_job_exceptions, 0)
+                self.assertEqual(metrics.num_compile_failures, 0)
+                self.assertEqual(metrics.num_worker_failures, 1)
+
+    def test_worker_job_errors_are_counted_and_not_warned_about_under_ignore_errors(
+        self,
+    ) -> None:
+        """``autotune_ignore_errors`` skips the logging of autotune errors:
+        a re-timing, a candidate's timing job past its compile and its
+        accuracy check that raise in the worker are counted for the
+        end-of-search summary and warned about nowhere, however often an
+        error repeats and however many different ones there are. Each job's
+        error is a DEBUG line, as before the report."""
+        text = "operation failed due to a previous error during capture"
+        config = Config(block_sizes=[8])
+        fn = cast("CompiledConfig", object())
+
+        def quiet() -> LocalBenchmarkProvider:
+            provider = self._provider_with_fakes()
+            provider.settings = Settings(
+                autotune_benchmark_subprocess=True,
+                autotune_accuracy_check=True,
+                autotune_ignore_errors=True,
+            )
+            return provider
+
+        # A candidate's timing job and its accuracy check.
+        for job, timing, accuracy in (
+            ("Benchmark", _after_compile(RuntimeError(text)), None),
+            ("Accuracy check", 1.5, RuntimeError(text)),
+        ):
+            with self.subTest(job=job):
+                provider = quiet()
+                with (
+                    patch.object(
+                        provider, "_run_subprocess_benchmark_job", side_effect=[timing]
+                    ),
+                    patch.object(
+                        provider,
+                        "_run_subprocess_accuracy_check_job",
+                        side_effect=[accuracy],
+                    ),
+                ):
+                    result = provider._benchmark_function_subprocess(config, fn)
+
+                self.assertEqual(result, math.inf)
+                provider.log.warning.assert_not_called()
+                provider.log.debug.assert_called_once_with(
+                    f"{job} subprocess raised for {config!r}: RuntimeError: {text}"
+                )
+                metrics = provider._autotune_metrics
+                self.assertEqual(metrics.num_worker_job_exceptions, 1)
+                self.assertEqual(metrics.num_isolated_rebenchmark_exceptions, 0)
+                self.assertEqual(metrics.num_compile_failures, 1)
+
+        # Re-timings: an error that repeats past two counts, which without
+        # the setting is one warning in full and one per doubling.
+        provider = quiet()
+        timings = self._retime(provider, [RuntimeError(text) for _ in range(5)])
+        self.assertEqual(timings, [None] * 5)
+        provider.log.warning.assert_not_called()
+        subject = "Generation 3: verifying top configs subprocess raised"
+        self.assertEqual(
+            [call.args[0] for call in provider.log.debug.call_args_list],
+            [f"{subject}: RuntimeError: {text}"] * 5,
+        )
+        metrics = provider._autotune_metrics
+        self.assertEqual(metrics.num_worker_job_exceptions, 5)
+        self.assertEqual(metrics.num_isolated_rebenchmark_exceptions, 5)
+
+        # Candidates past the limit on different errors, which without the
+        # setting says once that it stops.
+        provider = quiet()
+        limit = 2
+        with patch(
+            "helion.autotuner.benchmark_provider._WORKER_EXCEPTION_WARNINGS", limit
+        ):
+            self._time_candidates(
+                provider,
+                [
+                    _after_compile(RuntimeError(f"error {index}"))
+                    for index in range(limit + 2)
+                ],
+            )
+        provider.log.warning.assert_not_called()
+        self.assertEqual(provider.log.debug.call_count, limit + 2)
+        self.assertEqual(
+            provider._autotune_metrics.num_worker_job_exceptions, limit + 2
+        )
+
+        # The control: the same re-timings without the setting.
+        provider = self._provider_with_fakes()
+        self._retime(provider, [RuntimeError(text) for _ in range(5)])
+        self.assertEqual(provider.log.warning.call_count, 3)
+
+    def test_candidate_error_is_reported_by_the_phase_its_job_reported(self) -> None:
+        """A candidate's timing job from the provider to a worker whose pipe
+        is a stand-in: an exception the job raises before it reports its
+        compile phase is a compile failure in the debug log, one after the
+        report a warning the search counts."""
+        config = Config(block_sizes=[8])
+        for reports, reported in (((), 0), ((_PhaseReport(PHASE_COMPILED),), 1)):
+            with self.subTest(reports=len(reports)):
+                provider = self._provider_with_fakes()
+                provider.settings = Settings(
+                    autotune_benchmark_subprocess=True, autotune_accuracy_check=False
+                )
+                provider._precompile_args_path = "args.pt"
+                provider.mutated_arg_indices = ()
+                worker = BenchmarkWorker()
+                process = Mock(pid=123)
+                process.is_alive.return_value = True
+                connection = Mock()
+                connection.poll.return_value = True
+                # (what the worker's loop sends for a job that raises)
+                failure = benchmark_worker_module._WorkerFailure.capture(
+                    RuntimeError("the job's")
+                )
+                replies = iter([*reports, failure])
+                connection.recv.side_effect = lambda replies=replies: next(replies)
+                worker._process = process
+                worker._parent_connection = connection
+                provider._benchmark_worker = worker
+
+                with (
+                    patch(
+                        "helion.autotuner.benchmark_provider._serialize_compiled_fn",
+                        return_value=SerializedCompiledFunction("call", "", None, None),
+                    ),
+                    patch.object(
+                        provider,
+                        "_subprocess_benchmark_uses_wall_clock",
+                        return_value=False,
+                    ),
+                    patch.object(provider, "_probe_long_kernel", return_value=False),
+                ):
+                    result = provider._benchmark_function_subprocess(
+                        config, cast("CompiledConfig", object())
+                    )
+
+                self.assertEqual(result, math.inf)
+                (job,), _ = connection.send.call_args
+                self.assertIsInstance(job, BenchmarkJob)
+                raised = f"Benchmark subprocess raised for {config!r}: RuntimeError: the job's"
+                log = provider.log.warning if reported else provider.log.debug
+                self.assertEqual(
+                    [call.args[0] for call in log.call_args_list], [raised]
+                )
+                self.assertEqual(provider.log.warning.call_count, reported)
+                metrics = provider._autotune_metrics
+                self.assertEqual(metrics.num_worker_job_exceptions, reported)
+                self.assertEqual(metrics.num_compile_failures, 1)
+
+    def test_out_of_memory_past_the_compile_is_reported_beside_a_replaced_worker(
+        self,
+    ) -> None:
+        """A device out-of-memory error is no sticky error: a candidate's
+        timing job that raises one after its compile phase is reported and
+        counted as a job that raised, with its phase, although
+        ``BenchmarkWorker.run`` replaced the worker before it raised the
+        error. The worker here had completed no job, so the job is not run
+        again."""
+        config = Config(block_sizes=[8])
+        text = "CUDA out of memory. Tried to allocate 384.00 MiB."
+        provider = self._provider_with_fakes()
+        provider.settings = Settings(
+            autotune_benchmark_subprocess=True, autotune_accuracy_check=False
+        )
+        provider._precompile_args_path = "args.pt"
+        provider.mutated_arg_indices = ()
+        worker = BenchmarkWorker()
+        process = Mock(pid=123)
+        process.is_alive.return_value = True
+        connection = Mock()
+        connection.poll.return_value = True
+        # (what the worker's loop sends for a job that raises)
+        failure = benchmark_worker_module._WorkerFailure.capture(RuntimeError(text))
+        self.assertFalse(failure.sticky)
+        connection.recv.side_effect = [_PhaseReport(PHASE_COMPILED), failure]
+        worker._process = process
+        worker._parent_connection = connection
+        provider._benchmark_worker = worker
+
+        with (
+            patch(
+                "helion.autotuner.benchmark_provider._serialize_compiled_fn",
+                return_value=SerializedCompiledFunction("call", "", None, None),
+            ),
+            patch.object(
+                provider, "_subprocess_benchmark_uses_wall_clock", return_value=False
+            ),
+            patch.object(provider, "_probe_long_kernel", return_value=False),
+            # (no killed worker of another test is still exiting)
+            patch(
+                "helion.autotuner.benchmark_worker._prune_exiting", return_value=False
+            ),
+            patch(
+                "helion.autotuner.benchmark_worker.signal_process_tree"
+            ) as signal_tree,
+            patch(
+                "helion.autotuner.benchmark_worker._wait_for_exit", return_value=True
+            ),
+            patch.object(worker, "_start", return_value=0.0) as start,
+        ):
+            result = provider._benchmark_function_subprocess(
+                config, cast("CompiledConfig", object())
+            )
+
+        self.assertEqual(result, math.inf)
+        # The worker that ran out of memory was killed and a new one started ...
+        signal_tree.assert_called_once_with(process, signal.SIGKILL)
+        start.assert_called_once_with()
+        # ... and the job is reported as one that raised past its compile.
+        provider.log.warning.assert_called_once_with(
+            f"Benchmark subprocess raised for {config!r}: RuntimeError: {text}"
+        )
+        metrics = provider._autotune_metrics
+        self.assertEqual(metrics.num_worker_job_exceptions, 1)
+        self.assertEqual(metrics.num_compile_failures, 1)
+        self.assertEqual(metrics.num_worker_failures, 0)
+
+    def test_candidate_that_raises_in_its_compile_and_first_call_stays_at_debug(
+        self,
+    ) -> None:
+        """A backend that does not precompile compiles a candidate in the
+        worker's first call, where an invalid config is expected to fail:
+        such an error (the job had not reported its compile phase) is a
+        compile failure in the debug log, as before, and is not counted
+        with the jobs that raised afterwards."""
+        config = Config(block_sizes=[8])
+        provider = self._provider_with_fakes()
+        error = RuntimeError("DSL error: the config does not compile")
+        _set_job_phase(error, None)
+
+        with patch.object(
+            provider, "_run_subprocess_benchmark_job", side_effect=[error]
+        ):
+            result = provider._benchmark_function_subprocess(
+                config, cast("CompiledConfig", object())
+            )
+
+        self.assertEqual(result, math.inf)
+        provider.log.warning.assert_not_called()
+        provider.log.debug.assert_called_once_with(
+            f"Benchmark subprocess raised for {config!r}: RuntimeError: "
+            "DSL error: the config does not compile"
+        )
+        metrics = provider._autotune_metrics
+        self.assertEqual(metrics.num_worker_job_exceptions, 0)
+        self.assertEqual(metrics.num_isolated_rebenchmark_exceptions, 0)
+        self.assertEqual(metrics.num_compile_failures, 1)
 
     def test_isolated_timings_stop_at_the_budget_only_where_asked(self) -> None:
         """A verification's re-timings are not cut by the autotune budget:

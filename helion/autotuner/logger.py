@@ -948,28 +948,67 @@ _EXPECTED_TRITON_ERRORS_RE: re.Pattern[str] = re.compile(
     )
 )
 
+# Errors after which the process's CUDA context fails every later call, so
+# the worker that raised one is replaced: the ones CUDA's headers document
+# that way (``CUresult`` in ``cuda.h``; ``cudaError`` in ``driver_types.h``
+# marks the same ones). Most carry "This leaves the process in an
+# inconsistent state and any further CUDA work will return the same error";
+# after a device-side assert "The context cannot be used anymore", and after
+# the MPS server terminated its client "the process must be terminated and
+# relaunched". Each is listed three times: by a part of the runtime's error
+# string (``cudaGetErrorString``), which is PyTorch's wording; under the
+# driver's name for it (``CUDA_ERROR_ILLEGAL_ADDRESS``), which is what a
+# launcher that calls the driver itself raises; and under the runtime's name
+# (``cudaErrorIllegalAddress``), which is what a launcher raises that reads
+# its launch's result as a ``cudaError_t``.
 _UNRECOVERABLE_RUNTIME_ERROR_RE: re.Pattern[str] = re.compile(
     "|".join(
         map(
             re.escape,
             [
+                "invalid access of peer GPU memory",
+                "CUDA_ERROR_CONTAINED",
+                "cudaErrorContained",
                 "illegal memory access",
                 "CUDA_ERROR_ILLEGAL_ADDRESS",
                 "cudaErrorIllegalAddress",
-                "misaligned address",
-                "CUDA_ERROR_MISALIGNED_ADDRESS",
-                "cudaErrorMisalignedAddress",
-                "unspecified launch failure",
-                "CUDA_ERROR_LAUNCH_FAILED",
-                "cudaErrorLaunchFailure",
-                "illegal instruction",
-                "CUDA_ERROR_ILLEGAL_INSTRUCTION",
-                "cudaErrorIllegalInstruction",
-                "UR_RESULT_ERROR_DEVICE_LOST",
-                "ZE_RESULT_ERROR_DEVICE_LOST",
+                "launch timed out and was terminated",
+                "CUDA_ERROR_LAUNCH_TIMEOUT",
+                "cudaErrorLaunchTimeout",
                 "device-side assert triggered",
                 "CUDA_ERROR_ASSERT",
                 "cudaErrorAssert",
+                "hardware stack error",
+                "CUDA_ERROR_HARDWARE_STACK_ERROR",
+                "cudaErrorHardwareStackError",
+                "illegal instruction",
+                "CUDA_ERROR_ILLEGAL_INSTRUCTION",
+                "cudaErrorIllegalInstruction",
+                "misaligned address",
+                "CUDA_ERROR_MISALIGNED_ADDRESS",
+                "cudaErrorMisalignedAddress",
+                "not supported on global/shared address space",
+                "CUDA_ERROR_INVALID_ADDRESS_SPACE",
+                "cudaErrorInvalidAddressSpace",
+                "invalid program counter",
+                "CUDA_ERROR_INVALID_PC",
+                "cudaErrorInvalidPc",
+                "unspecified launch failure",
+                "CUDA_ERROR_LAUNCH_FAILED",
+                "cudaErrorLaunchFailure",
+                "tensor memory not completely freed",
+                "CUDA_ERROR_TENSOR_MEMORY_LEAK",
+                "cudaErrorTensorMemoryLeak",
+                "MPS client has been terminated",
+                "CUDA_ERROR_MPS_CLIENT_TERMINATED",
+                "cudaErrorMpsClientTerminated",
+                "external entity outside of CUDA",
+                "CUDA_ERROR_EXTERNAL_DEVICE",
+                "cudaErrorExternalDevice",
+                # Not CUDA's: an XPU device that was lost, under Unified
+                # Runtime's and Level Zero's names for it.
+                "UR_RESULT_ERROR_DEVICE_LOST",
+                "ZE_RESULT_ERROR_DEVICE_LOST",
             ],
         )
     ),

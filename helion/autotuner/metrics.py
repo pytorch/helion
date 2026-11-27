@@ -49,6 +49,26 @@ class AutotuneMetrics:
     random_seed: int = 0
     search_algorithm: str = ""
     num_isolated_rebenchmark_timeouts: int = 0
+    # Benchmark jobs that raised past their candidate's compile and first
+    # call (the candidate's timing job from there on, its accuracy check, a
+    # re-timing), and the re-timings among them, which gave no reading. The
+    # job raised in the benchmark worker, or, for an accuracy check or a
+    # re-timing, this process failed before the job reached it (a wrapper
+    # that cannot be serialized under input banks). A candidate that raises
+    # in its compile and first call counts in ``num_compile_failures`` only.
+    # Two kinds of job that raised are not counted here, whatever their
+    # phase (``LocalBenchmarkProvider._report_worker_exception``). One whose
+    # exception this process could not restore (the CuTe DSL's CUDA runtime
+    # error, one that does not pickle) arrives as a
+    # ``BenchmarkSubprocessError``, like a worker that died: a candidate
+    # counts in ``num_worker_failures``, and a re-timing, which keeps its
+    # earlier timing, in no counter; both are warned about. One that raised
+    # a sticky CUDA error, whose worker is replaced, has its own warning.
+    # A multi-shape search counts the jobs of every shape's provider; its
+    # re-timings run the shapes' candidate jobs again, so one that raises
+    # there counts as a job and not among the re-timings.
+    num_worker_job_exceptions: int = 0
+    num_isolated_rebenchmark_exceptions: int = 0
     num_successful_candidate_measurements: int = 0
     selected_config: dict[str, object] | None = None
     selected_source_hash: str | None = None
@@ -74,6 +94,10 @@ class AutotuneMetrics:
             "num_worker_failures": self.num_worker_failures,
             "num_isolated_rebenchmark_timeouts": (
                 self.num_isolated_rebenchmark_timeouts
+            ),
+            "num_worker_job_exceptions": self.num_worker_job_exceptions,
+            "num_isolated_rebenchmark_exceptions": (
+                self.num_isolated_rebenchmark_exceptions
             ),
             "num_accuracy_failures": self.num_accuracy_failures,
             "num_successful_candidate_measurements": (

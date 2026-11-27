@@ -45,11 +45,11 @@ import torch
 
 from ..ast_extension import ExtendedAST
 from ..ast_extension import statement_from_string
+from ..zero_fill_kernels import zero_fill_kernel_name
 from .compile_options import compile_options_keyword
 from .host_zero_fills import _EMPTY_FACTORY
 from .host_zero_fills import _factory_call_source
 from .host_zero_fills import _zero_factory
-from .pdl_release import ZERO_FILL_KERNEL_PREFIX
 from .state import cute_codegen_state
 
 if TYPE_CHECKING:
@@ -250,8 +250,9 @@ def lower_host_zero_fill_launches(
     ``lower_host_zero_fills`` does.  Returns the new host statements and the
     module-level statements (the fill kernel definitions and their launch
     attributes) to place ahead of the host function.  ``kernel_name`` is the
-    device function's name; the fill kernels are named after it so a module
-    never holds two alike.
+    device function's name; the fill kernels are named after it
+    (``zero_fill_kernel_name``, the names everything else finds them by) so
+    a module never holds two alike.
     """
     admitted: dict[SourceLocation, tuple[str, str, str, torch.dtype, int | None]] = {}
     for statement in host.body:
@@ -286,7 +287,7 @@ def lower_host_zero_fill_launches(
         assert isinstance(statement, ast.Assign)
         call = statement.value
         assert isinstance(call, ast.Call)
-        fill_name = f"{ZERO_FILL_KERNEL_PREFIX}{index}_{kernel_name.lstrip('_')}"
+        fill_name = zero_fill_kernel_name(index, kernel_name)
         index += 1
         definitions, launch = zero_fill_kernel_launch(
             fill_name,

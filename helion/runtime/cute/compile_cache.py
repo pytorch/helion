@@ -6,9 +6,14 @@ keyed by :func:`disk_cache_key`: a digest of everything that determines the
 lowered module -- the generated device source, the helper sources it
 compiles (``source_dependencies``), the argument schema, launch shape,
 compile options, the IR-affecting ``CUTE_DSL_*`` environment and the cutlass
-version.  Leaf module of the launcher: it imports ``source_dependencies`` and
-``launch_descriptor`` only, and, to compile, the standalone launcher's
-``_standalone_compile`` (``compile_with_options``).
+version.  The module also owns when a compiled module's CUDA library is
+unloaded: :func:`patch_cutlass_jit_shutdown_unload` keeps the DSL's finalizer
+from calling the driver at interpreter shutdown or inside a CUDA graph
+capture, and :meth:`CompiledCuteLauncher.release_kernel` unloads at a point
+its caller chooses.  Leaf module of the launcher: it imports
+``source_dependencies``, ``launch_descriptor`` and ``launch_caches`` only,
+and, to compile, the standalone launcher's ``_standalone_compile``
+(``compile_with_options``).
 """
 
 from __future__ import annotations
@@ -26,6 +31,10 @@ from typing import TYPE_CHECKING
 from typing import Any
 from typing import cast
 
+import torch
+
+from .launch_caches import drop_relaunch_state
+from .launch_caches import outside_captures
 from .launch_descriptor import preferred_smem_carveout
 from .launch_descriptor import use_pdl
 from .source_dependencies import referenced_helper_sources
@@ -40,16 +49,84 @@ log: logging.Logger = logging.getLogger(__name__)
 
 
 _CUTLASS_SHUTDOWN_PATCHED = False
+# Modules whose finalizer left their CUDA libraries loaded because a CUDA
+# graph capture may have been underway (``skipped_capture_unloads``).
+_SKIPPED_CAPTURE_UNLOADS = 0
+
+
+def skipped_capture_unloads() -> int:
+    """How many dropped modules kept their CUDA libraries loaded because the
+    collector finalized them while a CUDA graph capture may have been
+    underway or beginning, or while another thread held the capture gate
+    for driver calls of its own (``patch_cutlass_jit_shutdown_unload``)."""
+    return _SKIPPED_CAPTURE_UNLOADS
+
+
+def _leave_libraries_loaded(module: Any) -> None:  # noqa: ANN401
+    """Finalize ``module`` without calling the driver: mark it unloaded and,
+    when it still held loaded libraries, count it and warn the first time."""
+    global _SKIPPED_CAPTURE_UNLOADS
+    # (a module whose construction failed has neither attribute)
+    held = bool(getattr(module, "cuda_library", None)) and not getattr(
+        module, "_unloaded", True
+    )
+    module._unloaded = True
+    if not held:
+        return
+    _SKIPPED_CAPTURE_UNLOADS += 1
+    if _SKIPPED_CAPTURE_UNLOADS == 1:
+        log.warning(
+            "A dropped CuTe module was collected while a CUDA graph capture "
+            "may have been underway, or while the runtime made driver calls "
+            "that keep a capture from beginning; its CUDA library stays "
+            "loaded for the life of the process, because unloading it there "
+            "could invalidate a capture. To have such libraries unloaded, drop "
+            "compiled kernels and run gc.collect() outside a capture, before "
+            "starting the next one. Further ones are counted without a "
+            "warning (helion.runtime.cute.compile_cache."
+            "skipped_capture_unloads)."
+        )
 
 
 def patch_cutlass_jit_shutdown_unload() -> None:
-    """Avoid CUDA library unload hangs during interpreter shutdown.
+    """Keep the DSL's finalizer from unloading a CUDA library where the
+    driver call hangs or does damage.
 
-    On current CUTLASS DSL builds, ``CudaDialectJitModule.__del__`` unconditionally
-    calls ``cudaLibraryUnload``. On B200 this can hang during Python finalization
-    after a CuTe kernel has already finished executing. Skipping that unload during
-    interpreter teardown lets the process exit cleanly while preserving the normal
-    unload path during regular runtime GC.
+    On current CUTLASS DSL builds, ``CudaDialectJitModule.__del__`` calls
+    ``cudaLibraryUnload`` and ignores its result. Two places need the call
+    skipped; elsewhere the normal unload during regular runtime GC is
+    preserved.
+
+    Interpreter shutdown: on B200 the unload can hang during Python
+    finalization after a CuTe kernel has already finished executing. Skipping
+    it lets the process exit cleanly. CuTe DSL 4.8.1 skips it there itself
+    (4.7.0 did not); the check here stays as a second guard.
+
+    A CUDA graph capture: the collector runs wherever an allocation crosses
+    its threshold, also between a capture's begin and end, and CUDA refuses
+    ``cudaLibraryUnload`` while a capture is underway
+    (``CUDA_ERROR_STREAM_CAPTURE_UNSUPPORTED``; in the default "global"
+    capture mode from every thread of the process, not only the capturing
+    one). Refused on the capturing thread, the call invalidates the capture,
+    so every later launch and the capture's end fail with "operation failed
+    due to a previous error during capture". While a capture may be underway
+    (``launch_caches.capture_may_be_active``) the finalizer therefore makes
+    no driver call: the module is marked unloaded and its library stays
+    loaded, which is what the refused call left behind as well, minus the
+    damage. Nothing unloads such a library later: a raw ``torch.cuda.graph``
+    captured meanwhile may still replay its code. An owner that knows when
+    its module dies unloads it there instead
+    (``CompiledCuteLauncher.unload_libraries``); without one, dropping
+    kernels and collecting outside a capture keeps their libraries from
+    reaching the next one.
+
+    The question and the unload are one step against the begin of a
+    ``cute_cuda_graph`` capture on any thread
+    (``launch_caches.outside_captures``): the capture waits for an unload
+    that is underway. The finalizer itself never waits. Where it cannot
+    have that step at once (another thread is counting its capture or
+    making such driver calls, or the collector runs the finalizer on the
+    very thread that is), it leaves the library loaded as inside a capture.
     """
 
     global _CUTLASS_SHUTDOWN_PATCHED
@@ -74,7 +151,11 @@ def patch_cutlass_jit_shutdown_unload() -> None:
             with suppress(Exception):
                 module._unloaded = True
             return
-        original_del(module)
+        with outside_captures(wait=False) as safe:
+            if safe:
+                original_del(module)
+            else:
+                _leave_libraries_loaded(module)
 
     module_type.__del__ = _helion_del
     module_type._helion_shutdown_patch = True
@@ -108,6 +189,7 @@ class CompiledCuteLauncher:
         "_compiled",
         "_jit_func",
         "_kernel_name",
+        "_launch_devices",
         "_sass_checks",
     )
 
@@ -130,6 +212,9 @@ class CompiledCuteLauncher:
         # source ``disk_cache_key`` folded into the key).
         self._sass_checks = sass_checks
         self._kernel_name = kernel_name
+        # Indices of the CUDA devices this launcher launched on
+        # (``unload_libraries`` waits for them).
+        self._launch_devices: set[int] = set()
 
     def capi_function(self) -> object:
         """The compiled function in its C-API (``JitExecutor``) form.
@@ -156,6 +241,102 @@ class CompiledCuteLauncher:
             self._capi_compiled = twin
         return twin
 
+    def release_kernel(self, kernel: object) -> None:
+        """Release what ``kernel`` has of this launcher, for an owner that
+        drops the kernel at a point it knows: the autotuner's benchmark
+        worker at the end of a job, which finds this method by its name.
+
+        The libraries are unloaded where that is safe
+        (``unload_libraries``), and the kernel's relaunch state, which holds
+        the functions' executors, is dropped either way
+        (``launch_caches.drop_relaunch_state``): the kernel object may
+        outlive the job, and a relaunch from that state would run unloaded
+        code."""
+        self.unload_libraries()
+        drop_relaunch_state(kernel)
+
+    def unload_libraries(self) -> None:
+        """Unload the CUDA libraries the compiled functions loaded, now, and
+        forget the functions (a later call compiles or reloads them again).
+
+        Left alone, the libraries are unloaded by the DSL's finalizer
+        whenever the collector reclaims the dropped kernel, which can be
+        inside a later CUDA graph capture
+        (``patch_cutlass_jit_shutdown_unload``). The kernel's relaunch state
+        holds the functions' executors: ``release_kernel`` drops it too.
+
+        Nothing happens, and the finalizer keeps the libraries, while a
+        capture may be underway or when a device this launcher launched on
+        cannot be synchronized: after a launch that failed, kernels of these
+        libraries may still be running there. Such a device is the wait
+        raising a ``RuntimeError``, which CUDA's errors are; it is logged at
+        DEBUG, and any other exception of the wait is raised. The wait is
+        for the devices that were current at the launcher's calls, wherever
+        the caller is by now (a benchmark job has left its device when it
+        releases its candidate), and for no other: a device nothing launched
+        on may not have a CUDA context yet, and synchronizing it would
+        create one.
+
+        The question, the wait and the unloads are one step against the
+        begin of a ``cute_cuda_graph`` capture on any thread
+        (``launch_caches.outside_captures``): a capture that another thread
+        starts meanwhile begins behind them, and this call waits for one
+        that is being counted.
+
+        A raw ``torch.cuda.graph`` on another thread is not seen. Beside
+        one in CUDA's default ``global`` mode the wait is refused, so the
+        libraries stay loaded, and the refused wait invalidates that
+        capture (measured on a B200). CUDA's ``THREAD_LOCAL`` capture mode
+        for the calling thread does not lift that: a device
+        synchronization waits for the capturing stream too, and CUDA
+        refuses it in either mode. The callers are the ends of the
+        autotuner's jobs, in a process that synchronizes its device around
+        every timed launch.
+        """
+        # Looked up rather than imported, as ``is_tvm_ffi_compiled_function``
+        # does: a function that loaded a library came from this module.
+        executor = sys.modules.get("cutlass.cutlass_dsl.cuda_jit_executor")
+        if executor is None:
+            return
+        modules = [
+            module
+            for compiled in (self._compiled, self._capi_compiled)
+            # A function that never launched has no module yet, and a TVM-FFI
+            # function never gets one: its library is unloaded by its own
+            # module's destructor.
+            if isinstance(
+                module := getattr(compiled, "jit_module", None),
+                executor.CudaDialectJitModule,
+            )
+            and not module.is_unloaded()
+        ]
+        if not modules:
+            return
+        with outside_captures(wait=True) as safe:
+            if not safe:
+                return
+            devices = sorted(self._launch_devices)
+            try:
+                for device in devices:
+                    torch.cuda.synchronize(device)
+            except RuntimeError:
+                # (a CUDA error of the wait: ``torch.AcceleratorError`` is a
+                # ``RuntimeError``; anything else is a bug and is raised)
+                log.debug(
+                    "CuTe kernel %r keeps its CUDA libraries until the "
+                    "collector finalizes their modules: a device it launched "
+                    "on (%s) did not synchronize",
+                    self._kernel_name,
+                    ", ".join(map(str, devices)),
+                    exc_info=True,
+                )
+                return
+            self._compiled = None
+            self._capi_compiled = None
+            self._launch_devices.clear()
+            for module in modules:
+                module.unload()
+
     def __call__(self, *args: object) -> object:
         compiled = self._compiled
         if compiled is None:
@@ -172,6 +353,12 @@ class CompiledCuteLauncher:
                 if self._cache_key is not None:
                     self._persist_to_disk(compiled)
             self._compiled = compiled
+        if torch.cuda.is_initialized():
+            # The launch goes to the current device's stream (the last
+            # argument); the fast relaunch built from it stays on that
+            # device, which its tensors are on. Recorded before the launch:
+            # one that fails may leave kernels running.
+            self._launch_devices.add(torch.cuda.current_device())
         return cast("Any", compiled)(*args)
 
     def persist_compiled(self) -> None:
@@ -417,7 +604,10 @@ def disk_cache_key(
     hash is unavailable.  The key must be computable *before* the kernel is
     compiled (so a hit can skip recompilation), so it is derived from the
     inputs that determine the lowered IR rather than from the IR itself:
-    generated device-kernel source, external compiled-helper sources, the
+    generated device-kernel source and the device kernel's name in it (the
+    kernels of one generated module carry the module's source hash, a host
+    zero fill's kernel beside the main one, and can agree in everything
+    else), external compiled-helper sources, the
     sources of the Helion helper modules the kernel's globals reference
     (``referenced_helper_sources``), full input
     specialization (dtypes, ranks,
@@ -481,8 +671,11 @@ def disk_cache_key(
         cutlass_version = ""
     payload = repr(
         (
-            "helion-cute-cache-v3",
+            "helion-cute-cache-v4",
             source_hash,
+            # Read without a default: kernels without a name would share
+            # one key again wherever they agree in the rest.
+            cast("Any", cute_kernel).__name__,
             helper_sources,
             called_helper_sources,
             schema_key,

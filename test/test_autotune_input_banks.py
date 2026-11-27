@@ -110,7 +110,11 @@ def test_bank_wrapper_failure_does_not_disable_later_candidates(
     provider.settings = Settings(autotune_accuracy_check=False)
     provider._input_bank_count = 3
     provider.log = Mock()
-    provider._autotune_metrics = SimpleNamespace(num_configs_tested=0)
+    provider._autotune_metrics = SimpleNamespace(
+        num_configs_tested=0,
+        num_worker_job_exceptions=0,
+        num_isolated_rebenchmark_exceptions=0,
+    )
     provider._precompile_args_path = "args.pt"
     provider.mutated_arg_indices = ()
     provider._subprocess_benchmark_enabled = lambda: True

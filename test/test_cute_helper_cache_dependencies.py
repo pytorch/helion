@@ -43,6 +43,7 @@ def source_tree(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
 
 def _kernel(kind: str | None) -> SimpleNamespace:
     return SimpleNamespace(
+        __name__="cute_kernel",
         _helion_cute_source_hash="unchanged generated wrapper and plan",
         _helion_cute_wrapper_plans=[] if kind is None else [{"kind": kind}],
     )

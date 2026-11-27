@@ -52,6 +52,8 @@ from __future__ import annotations
 
 import ast
 
+from ..zero_fill_kernels import ZERO_FILL_KERNEL_PREFIX
+from ..zero_fill_kernels import zero_fill_kernel_names
 from .target_facts import DEFAULT_MAX_SMEM_PER_BLOCK
 
 CUTE_PDL_RELEASE_CHOICES: tuple[str, ...] = (
@@ -210,10 +212,47 @@ def _is_release(node: ast.AST) -> bool:
     return _is_bare_call(node, "cute.arch.griddepcontrol_launch_dependents")
 
 
-# The fill kernels a ``cute_pdl`` kernel's host zero fills launch as
-# (``host_zero_fill_launches``) always wait and release at entry; the
-# release check below reads the kernel proper, not them.
-ZERO_FILL_KERNEL_PREFIX = "_helion_zero_fill_"
+def device_kernels(module: ast.Module) -> list[ast.FunctionDef]:
+    """The kernels proper among the ``cute.kernel`` functions of a generated
+    module: all but the fill kernels that host zero fills launch as, which
+    always wait and release at entry and say nothing about the release of
+    the kernel they fill for.
+
+    A function ``<name>`` of the module has the kernel proper
+    ``_helion_<name>``, and its fill kernels are the ones the code
+    generator's own rule names for it (``zero_fill_kernel_names``). A kernel
+    named ``zero_fill_demo`` therefore keeps its kernel proper, whose name
+    begins with the fill kernels' prefix, beside its fill kernels. The
+    split-K workspace names the fill kernel of its atomic epilogue itself,
+    under the same prefix, in a module whose producer is a kernel of another
+    module (``split_k_workspace_codegen``): a kernel under the prefix that
+    is no function's kernel proper is a fill kernel as well."""
+    kernels = [
+        node
+        for node in module.body
+        if isinstance(node, ast.FunctionDef)
+        and any(ast.unparse(d) == "cute.kernel" for d in node.decorator_list)
+    ]
+    names = dict.fromkeys(kernel.name for kernel in kernels)
+    functions = [
+        node.name
+        for node in module.body
+        if isinstance(node, ast.FunctionDef) and node.name not in names
+    ]
+    proper = {f"_helion_{function}" for function in functions}
+    fills = {
+        name
+        for function in functions
+        for name in zero_fill_kernel_names(names, function)
+    }
+    return [
+        kernel
+        for kernel in kernels
+        if kernel.name not in fills
+        and (
+            kernel.name in proper or not kernel.name.startswith(ZERO_FILL_KERNEL_PREFIX)
+        )
+    ]
 
 
 def generic_release_rendered(source: str) -> bool:
@@ -267,14 +306,7 @@ def generic_release_rendered(source: str) -> bool:
                     and isinstance(mode := plan.get("capture_pdl_mode_param"), str)
                 ):
                     capture_waits[node.targets[0].value.id] = mode
-    kernels = [
-        node
-        for node in module.body
-        if isinstance(node, ast.FunctionDef)
-        and any(ast.unparse(d) == "cute.kernel" for d in node.decorator_list)
-        and not node.name.startswith(ZERO_FILL_KERNEL_PREFIX)
-    ]
-    for kernel in kernels:
+    for kernel in device_kernels(module):
         waits = [
             i
             for i, statement in enumerate(kernel.body)

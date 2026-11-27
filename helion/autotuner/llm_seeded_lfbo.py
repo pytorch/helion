@@ -52,6 +52,8 @@ _AGGREGATED_METRIC_FIELDS = (
     "num_compile_failures",
     "num_worker_failures",
     "num_isolated_rebenchmark_timeouts",
+    "num_worker_job_exceptions",
+    "num_isolated_rebenchmark_exceptions",
     "num_accuracy_failures",
     "num_successful_candidate_measurements",
     "num_unique_sources",
