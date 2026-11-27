@@ -24,7 +24,7 @@ from helion._compiler.cute.lane_loops.split import _certify_lane_running_sum
 from helion._compiler.cute.lane_loops.split import _validate_owned_lane_carry_schedule
 from helion._compiler.cute.lane_loops.split import split_lane_loop_reductions
 
-pytestmark = pytest.mark.cpu_only
+pytestmark = [pytest.mark.cpu_only, pytest.mark.usefixtures("cute_compile_env")]
 
 _RENAMES = {"acc_next": "acc", "extra_next": "extra"}
 

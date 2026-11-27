@@ -93,6 +93,7 @@ def _loop(prefix="base = outer * 8", suffix="", *, owned=True):
         ("base = shared[0]", ""),
     ],
 )
+@pytest.mark.usefixtures("cute_compile_env")
 def test_vector_ownership_declines_unproved_preparation(prefix, suffix):
     loop, vector = _loop(prefix, suffix)
     with pytest.raises(helion.exc.BackendUnsupported, match="scalar ownership proof"):
@@ -129,6 +130,7 @@ def test_vector_lane_reduction_native(threads, width):
 @pytest.mark.parametrize(
     "mutation", ["zero", "orelse", "target", "nested", "owner", "coordinate_write"]
 )
+@pytest.mark.usefixtures("cute_compile_env")
 def test_vector_ownership_rejects_incomplete_domains(mutation):
     loop, vector = _loop()
     if mutation == "zero":
@@ -210,6 +212,7 @@ def test_vector_readonly_packet_preserves_scalar_coordinates():
         "subscript",
     ],
 )
+@pytest.mark.usefixtures("cute_compile_env")
 def test_vector_packet_replay_rejects_effects_and_unstable_addresses(mutation):
     loop, vector = _readonly_packet_loop()
     if mutation in {"store", "atomic", "unknown", "barrier", "address", "result"}:

@@ -71,6 +71,7 @@ def test_phase2_can_drop_unused_declared_pure_assembly() -> None:
 
 
 @pytest.mark.parametrize("shared", [False, True], ids=["unused", "shared"])
+@pytest.mark.usefixtures("cute_compile_env")
 def test_lane_split_declines_an_opaque_effect(shared: bool) -> None:
     # Merely keeping the unused call in phase2 is insufficient: an opaque
     # effect might mutate the input read in phase1. Sharing its value also
@@ -80,6 +81,7 @@ def test_lane_split_declines_an_opaque_effect(shared: bool) -> None:
         pytest.fail(_source(result))
 
 
+@pytest.mark.usefixtures("cute_compile_env")
 def test_lane_split_declines_an_effect_between_reductions() -> None:
     marker = _lane_reduce_marker_expr(
         "value", "sum", "cutlass.Float32(0)", 1, owner_lane="lane"
@@ -115,6 +117,7 @@ def _serial_loop(purity: str) -> ast.For:
     return _create_lane_loop("lane", 4, list(body))
 
 
+@pytest.mark.usefixtures("cute_compile_env")
 def test_serial_interchange_declines_replaying_an_opaque_producer() -> None:
     with pytest.raises(exc.BackendUnsupported, match="inline assembly"):
         result = interchange_lane_outside_serial_reductions([_serial_loop("False")])
@@ -151,6 +154,7 @@ def test_an_unsplit_loop_preserves_the_effect() -> None:
 
 @pytest.mark.parametrize("argument", ["value - reduced", "reduced"])
 @pytest.mark.parametrize("use_output", [False, True])
+@pytest.mark.usefixtures("cute_compile_env")
 def test_impure_epilogue_requires_lane_ownership(
     argument: str, use_output: bool
 ) -> None:
@@ -288,6 +292,7 @@ def test_actual_opaque_memory_producer_uses_two_complete_cta_joins(
     assert "atom.global.add.u32" in source and "st.global.u32" in source
 
 
+@pytest.mark.usefixtures("cute_compile_env")
 def test_epilogue_cannot_reread_inputs_after_an_opaque_write() -> None:
     marker = _lane_reduce_marker_expr(
         "value", "sum", "cutlass.Float32(0)", 1, owner_lane="lane"
@@ -432,6 +437,7 @@ def test_producer_snapshots_all_threads_before_opaque_writes(
         assert memory == [-100] * 8
 
 
+@pytest.mark.usefixtures("cute_compile_env")
 def test_producer_barriers_decline_a_divergent_enclosing_guard() -> None:
     wrapper = ast.parse("if tid == 0:\n    pass\n").body[0]
     assert isinstance(wrapper, ast.If)
@@ -440,12 +446,14 @@ def test_producer_barriers_decline_a_divergent_enclosing_guard() -> None:
         split_lane_loop_reductions([wrapper])
 
 
+@pytest.mark.usefixtures("cute_compile_env")
 def test_producer_declines_an_incomplete_outer_lane_snapshot() -> None:
     outer = _create_lane_loop("row_lane", 2, [_snapshot_producer_loop()])
     with pytest.raises(exc.BackendUnsupported, match="inline assembly"):
         split_lane_loop_reductions([outer])
 
 
+@pytest.mark.usefixtures("cute_compile_env")
 def test_producer_declines_a_post_effect_load_and_a_carried_prefix() -> None:
     for statement in (
         "value = (x.iterator + lane).load()",
@@ -460,6 +468,7 @@ def test_producer_declines_a_post_effect_load_and_a_carried_prefix() -> None:
             split_lane_loop_reductions([loop])
 
 
+@pytest.mark.usefixtures("cute_compile_env")
 def test_producer_declines_an_unproved_tensor_subscript_after_the_effect() -> None:
     loop = _snapshot_producer_loop()
     loop.body[3] = ast.parse("value = shared_memory[lane]").body[0]
@@ -467,6 +476,7 @@ def test_producer_declines_an_unproved_tensor_subscript_after_the_effect() -> No
         split_lane_loop_reductions([loop])
 
 
+@pytest.mark.usefixtures("cute_compile_env")
 def test_producer_declines_a_load_hidden_in_the_opaque_call_operands() -> None:
     loop = _snapshot_producer_loop()
     loop.body[2] = ast.parse(_assembly("(x.iterator + index).load()")).body[0]
@@ -474,6 +484,7 @@ def test_producer_declines_a_load_hidden_in_the_opaque_call_operands() -> None:
         split_lane_loop_reductions([loop])
 
 
+@pytest.mark.usefixtures("cute_compile_env")
 def test_producer_barrier_declines_a_preceding_conditional_exit() -> None:
     prefix = ast.parse("if tid == 0:\n    return\n").body
     with pytest.raises(exc.BackendUnsupported, match="inline assembly"):

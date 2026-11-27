@@ -34,6 +34,7 @@ from ...ast_read_writes import HELION_LANE_LOOP_VAR_ATTR
 from ...ast_read_writes import HELION_VEC_LANE_OF_ATTR
 from ...ast_read_writes import ReadWrites
 from ...compile_environment import CompileEnvironment
+from ...compile_environment import backend_unsupported
 from ...device_function import DeviceFunction
 from ...host_function import NoCurrentFunction
 from ...tile_strategy import _clone_lane_loop_with_body
@@ -321,18 +322,18 @@ def _certify_lane_running_sum(
     if not candidates:
         return None
     if _static_lane_loop_extent(loop) is None or loop.orelse:
-        raise exc.BackendUnsupported(
-            "cute", "certified lane running sum requires a complete static lane loop"
+        raise backend_unsupported(
+            "certified lane running sum requires a complete static lane loop"
         )
     if len(candidates) != 1:
-        raise exc.BackendUnsupported(
-            "cute", "certified lane running sum requires one scalar accumulator"
+        raise backend_unsupported(
+            "certified lane running sum requires one scalar accumulator"
         )
     name = next(iter(candidates))
     positions = [index for index, names in enumerate(writes) if name in names]
     if len(positions) != 1:
-        raise exc.BackendUnsupported(
-            "cute", "certified lane running sum requires one unconditional self-add"
+        raise backend_unsupported(
+            "certified lane running sum requires one unconditional self-add"
         )
     update_index = positions[0]
     update = body[update_index]
@@ -348,8 +349,8 @@ def _certify_lane_running_sum(
         or addend.id not in all_writes
         or any(name in ReadWrites.from_ast(stmt).reads for stmt in body[:update_index])
     ):
-        raise exc.BackendUnsupported(
-            "cute", "certified lane running sum requires one unconditional self-add"
+        raise backend_unsupported(
+            "certified lane running sum requires one unconditional self-add"
         )
 
     marker_indices = {index for index, _ in markers}
@@ -362,23 +363,23 @@ def _certify_lane_running_sum(
         if _is_proven_relocatable_assignment(statement, allow_load=True):
             continue
         if _validated_idempotent_store(statement) is None:
-            raise exc.BackendUnsupported(
-                "cute", "certified lane running sum has an unproved body effect"
+            raise backend_unsupported(
+                "certified lane running sum has an unproved body effect"
             )
 
     selected: set[int] = {update_index}
 
     def require_input_slice(root: str, before: int) -> None:
         if root == name or root in marker_results:
-            raise exc.BackendUnsupported(
-                "cute", "certified lane running sum input depends on a carry or marker"
+            raise backend_unsupported(
+                "certified lane running sum input depends on a carry or marker"
             )
         if root == lane_var or root not in all_writes:
             return
         producers = [index for index, names in enumerate(writes) if root in names]
         if len(producers) != 1:
-            raise exc.BackendUnsupported(
-                "cute", "certified lane running sum has no complete input slice"
+            raise backend_unsupported(
+                "certified lane running sum has no complete input slice"
             )
         index = producers[0]
         statement = body[index]
@@ -395,8 +396,8 @@ def _certify_lane_running_sum(
             or not _is_proven_relocatable_assignment(statement, allow_load=True)
             or _contains_unduplicatable_op(statement)
         ):
-            raise exc.BackendUnsupported(
-                "cute", "certified lane running sum has no complete input slice"
+            raise backend_unsupported(
+                "certified lane running sum has no complete input slice"
             )
         if index in selected:
             return
@@ -466,8 +467,7 @@ def _lane_invariant_tail_after_consume(
             for later in accumulated
             if later > index
         ):
-            raise exc.BackendUnsupported(
-                "cute",
+            raise backend_unsupported(
                 "a lane-invariant statement is ordered before the accumulate pass "
                 f"of a lane reduction: {source}",
             )
@@ -480,8 +480,7 @@ def _lane_invariant_tail_after_consume(
             _depends(statement, analyzed[later]) for later in consumed if later > index
         )
         if follows and precedes:
-            raise exc.BackendUnsupported(
-                "cute",
+            raise backend_unsupported(
                 "a lane-invariant statement is ordered between per-lane statements "
                 f"of a lane reduction's consume pass: {source}",
             )
@@ -805,8 +804,8 @@ def _split_one_lane_loop(
         )
         if producer is not None:
             return producer
-        raise exc.BackendUnsupported(
-            "cute", "impure inline assembly has no proved snapshot/order schedule"
+        raise backend_unsupported(
+            "impure inline assembly has no proved snapshot/order schedule"
         )
     if not markers:
         nested_owners = {
@@ -894,13 +893,11 @@ def _split_one_lane_loop(
                 # anywhere in the loop, a constexpr loop that is not this
                 # lane's own vector lane): its complete reduction would need
                 # the vector unroll folded together with this lane loop.
-                raise exc.BackendUnsupported(
-                    "cute",
+                raise backend_unsupported(
                     "lane reduction nested in a constexpr vector lane "
                     "(cute_vector_widths > 1) has no proved lowering",
                 )
-            raise exc.BackendUnsupported(
-                "cute",
+            raise backend_unsupported(
                 "lane reduction under a guard whose thread uniformity cannot be proven",
             )
         return [loop]
@@ -910,7 +907,7 @@ def _split_one_lane_loop(
         marker.owner_lane is not None and marker.owner_lane != lane_var
         for _, marker in markers
     ):
-        raise exc.BackendUnsupported("cute", NESTED_OWNER_REFUSAL)
+        raise backend_unsupported(NESTED_OWNER_REFUSAL)
     running_sum = _certify_lane_running_sum(
         loop, lane_var, markers, rename_groups, running_sums
     )
@@ -944,8 +941,7 @@ def _split_one_lane_loop(
         ),
         rename_groups=rename_groups,
     ):
-        raise exc.BackendUnsupported(
-            "cute",
+        raise backend_unsupported(
             "synthetic-lane reduction would reorder a potentially aliasing write",
         )
 
@@ -959,8 +955,8 @@ def _split_one_lane_loop(
             rename_groups=rename_groups,
         )
         if staged is None:
-            raise exc.BackendUnsupported(
-                "cute", "matmul contribution has no complete staged lane schedule"
+            raise backend_unsupported(
+                "matmul contribution has no complete staged lane schedule"
             )
         _validate_owned_lane_carry_schedule(
             body, staged, lane_var, marker_indices, rename_groups
@@ -1266,8 +1262,8 @@ def _split_one_lane_loop(
             )
             for stmt in phase2_body
         ):
-            raise exc.BackendUnsupported(
-                "cute", "certified lane running sum has a non-invariant consumer"
+            raise backend_unsupported(
+                "certified lane running sum has a non-invariant consumer"
             )
 
     keep_indices = _live_phase2_indices(phase2_body)
@@ -1565,8 +1561,7 @@ def _renest_vector_lane(
 
     result = [renest(stmt) for stmt in statements]
     if any(is_sentinel(node) for stmt in result for node in ast.walk(stmt)):
-        raise exc.BackendUnsupported(
-            "cute",
+        raise backend_unsupported(
             "lane reduction nested in a constexpr vector lane left the vector "
             "lane outside its lane loop",
         )
@@ -1631,8 +1626,8 @@ def _validate_owned_lane_carry_schedule(
             if running_sum.name in writes
         ]
         if len(positions) != 1 or running_sum.name not in carried:
-            raise exc.BackendUnsupported(
-                "cute", "lane reduction cannot prove the certified per-lane update"
+            raise backend_unsupported(
+                "lane reduction cannot prove the certified per-lane update"
             )
         boundary = positions[0]
         phase1 = selected[boundary]
@@ -1658,8 +1653,8 @@ def _validate_owned_lane_carry_schedule(
             and [ast.dump(stmt) for stmt in phase1.body]
             == [ast.dump(stmt) for stmt in normalize(expected)]
         ):
-            raise exc.BackendUnsupported(
-                "cute", "lane reduction cannot prove the certified per-lane update"
+            raise backend_unsupported(
+                "lane reduction cannot prove the certified per-lane update"
             )
         # Every reduction must finalize after that complete lane sweep, before
         # a tail can observe the completed matmul accumulator.
@@ -1675,8 +1670,8 @@ def _validate_owned_lane_carry_schedule(
                 or definitions[0] <= boundary
                 or assigned_name(selected[definitions[0]]) != marker_result
             ):
-                raise exc.BackendUnsupported(
-                    "cute", "certified lane update precedes no complete finalization"
+                raise backend_unsupported(
+                    "certified lane update precedes no complete finalization"
                 )
             finalized_at.add(definitions[0])
         from ...ast_read_writes import ReadWrites
@@ -1687,8 +1682,8 @@ def _validate_owned_lane_carry_schedule(
             and running_sum.name in ReadWrites.from_ast(statement).reads
             for index, statement in enumerate(selected)
         ):
-            raise exc.BackendUnsupported(
-                "cute", "certified lane running sum is consumed before finalization"
+            raise backend_unsupported(
+                "certified lane running sum is consumed before finalization"
             )
     for name in carried:
         if running_sum is not None and name == running_sum.name:
@@ -1716,8 +1711,8 @@ def _validate_owned_lane_carry_schedule(
                 writes & marker_results for writes in selected_writes[boundary:]
             ):
                 continue
-        raise exc.BackendUnsupported(
-            "cute", "lane reduction cannot prove a once-per-tile carried update"
+        raise backend_unsupported(
+            "lane reduction cannot prove a once-per-tile carried update"
         )
 
 
@@ -1756,8 +1751,8 @@ def _validate_renamed_lane_carries(
     if _has_extra_cross_lane_carry(
         normalized, lane_var, marker_indices, finalized_markers=owned
     ):
-        raise exc.BackendUnsupported(
-            "cute", "lane reduction cannot preserve an independent loop-carried value"
+        raise backend_unsupported(
+            "lane reduction cannot preserve an independent loop-carried value"
         )
 
 
@@ -3214,8 +3209,8 @@ def _restore_lane_markers(
     )
     if rereduced is not None:
         return rereduced
-    raise exc.BackendUnsupported(
-        "cute", "owned lane reduction has no proved complete per-lane restore"
+    raise backend_unsupported(
+        "owned lane reduction has no proved complete per-lane restore"
     )
 
 
@@ -3444,8 +3439,8 @@ def _restore_per_lane_markers(
         )
         for _, marker in markers
     ):
-        raise exc.BackendUnsupported(
-            "cute", "owned lane reduction has no proved complete per-lane restore"
+        raise backend_unsupported(
+            "owned lane reduction has no proved complete per-lane restore"
         )
     for idx, m in sorted(markers, key=operator.itemgetter(0), reverse=True):
         if m.owner_lane is None:
@@ -4114,8 +4109,7 @@ def _interchange_stmt(
             new_var,
         )
         if not isinstance(nest, list):
-            raise exc.BackendUnsupported(
-                "cute",
+            raise backend_unsupported(
                 f"{NESTED_OWNER_REFUSAL}; its lanes cannot carry their values "
                 "through the rows of the tile in one nest either: "
                 f"{nest or 'the nest has no such values'}",
@@ -4158,8 +4152,7 @@ def _interchange_stmt(
             raise
         if isinstance(nest, str):
             detail = str(refusal)[: refusal.base_msg_len].partition(": ")[2]
-            raise exc.BackendUnsupported(
-                "cute",
+            raise backend_unsupported(
                 f"{detail}; its lanes cannot carry their values through the "
                 f"serial loop in one nest either: {nest}",
             ) from refusal
@@ -4181,8 +4174,8 @@ def _flatten_vector_reduction_lane(
     from ...ast_read_writes import ReadWrites
 
     def unsupported() -> NoReturn:
-        raise exc.BackendUnsupported(
-            "cute", "vector lane reduction has no complete scalar ownership proof"
+        raise backend_unsupported(
+            "vector lane reduction has no complete scalar ownership proof"
         )
 
     def extent(node: ast.For) -> int:
@@ -4911,8 +4904,7 @@ def _interchange_one_lane_loop(
     # per-column sum of the centered rows), would keep the partial: Nest A,
     # whose lanes run inside the serial loop, has no lane to carry it in.
     if _reductions_handed_on(mb_body, lane_suffix, marker_results, rename_groups):
-        raise exc.BackendUnsupported(
-            "cute",
+        raise backend_unsupported(
             "interchanged lane reduction would hand a lane's partial reduction "
             "on through the serial loop",
         )
@@ -5035,8 +5027,7 @@ def _interchange_one_lane_loop(
         writes = canonical(effects_a[index].writes)
         if not is_lane_varying(stmt):
             if writes & rerun_uses:
-                raise exc.BackendUnsupported(
-                    "cute",
+                raise backend_unsupported(
                     "an interchanged lane reduction would run a lane-invariant "
                     "assignment ahead of a statement of the lane prefix that uses "
                     "the name it binds",
@@ -5044,8 +5035,7 @@ def _interchange_one_lane_loop(
             continue
         beside = writes - (lane_values_a if writes & lane_values_a else lane_varying)
         if any(beside & uses for other, uses in enumerate(uses_a) if other != index):
-            raise exc.BackendUnsupported(
-                "cute",
+            raise backend_unsupported(
                 "an interchanged lane reduction would bind a lane-invariant value "
                 "in every lane, beside a lane's own",
             )
@@ -5055,8 +5045,7 @@ def _interchange_one_lane_loop(
     if _has_impure_inline_asm(loop):
         # Both nests can retain the original producers. The in-place restore
         # and register-tile fallback above do not clone these effects.
-        raise exc.BackendUnsupported(
-            "cute",
+        raise backend_unsupported(
             "impure inline assembly cannot be interchanged with a lane reduction",
         )
 
@@ -5128,8 +5117,7 @@ def _interchange_one_lane_loop(
         for statement in keep_mb_a
         if _is_lane_reduce_marker_assign(statement) is None
     ):
-        raise exc.BackendUnsupported(
-            "cute",
+        raise backend_unsupported(
             "interchanged lane reduction would carry a lane's value from one "
             "serial iteration to the next through every lane",
         )
@@ -5162,8 +5150,7 @@ def _interchange_one_lane_loop(
         index not in duplicated_stores and not atomic_write_calls(mb_body[index])
         for index in duplicated_indices
     ):
-        raise exc.BackendUnsupported(
-            "cute",
+        raise backend_unsupported(
             "interchanged lane reduction would run a memory write both nests need "
             "twice",
         )
@@ -5196,8 +5183,7 @@ def _interchange_one_lane_loop(
         for statement in mb_loop.body
         for index in duplicated_stores
     ):
-        raise exc.BackendUnsupported(
-            "cute",
+        raise backend_unsupported(
             "interchanged lane reduction cannot drop the first pass's copy of a "
             "store both nests need",
         )
@@ -5206,8 +5192,7 @@ def _interchange_one_lane_loop(
             nest_b, mb_loop, nest_a, atomic_consumers, protected_names
         )
         if dropped != len(atomic_consumers):
-            raise exc.BackendUnsupported(
-                "cute",
+            raise backend_unsupported(
                 "interchanged lane reduction has an atomic consumer the first "
                 "pass cannot drop",
             )
@@ -5224,8 +5209,7 @@ def _interchange_one_lane_loop(
         proven_disjoint_tensor_pairs,
         protected_names,
     ):
-        raise exc.BackendUnsupported(
-            "cute",
+        raise backend_unsupported(
             "a final-pass write of an interchanged lane reduction may overwrite "
             "a later first-pass write",
         )

@@ -141,6 +141,7 @@ def test_a_store_into_another_tensor_stays_between_the_passes() -> None:
     assert after == set()
 
 
+@pytest.mark.usefixtures("cute_compile_env")
 def test_a_store_between_two_per_lane_stores_of_its_tensor_is_rejected() -> None:
     with pytest.raises(exc.BackendUnsupported, match="between per-lane statements"):
         _order(
@@ -170,6 +171,7 @@ def test_the_statements_ordered_after_a_moved_load_move_with_it() -> None:
     assert after == {2, 3, 4}
 
 
+@pytest.mark.usefixtures("cute_compile_env")
 def test_a_moved_load_the_pass_reads_is_rejected() -> None:
     with pytest.raises(exc.BackendUnsupported, match="between per-lane statements"):
         _order(
@@ -183,11 +185,13 @@ def test_a_moved_load_the_pass_reads_is_rejected() -> None:
         )
 
 
+@pytest.mark.usefixtures("cute_compile_env")
 def test_a_store_ordered_before_an_accumulated_load_of_its_tensor_is_rejected() -> None:
     with pytest.raises(exc.BackendUnsupported, match="before the accumulate pass"):
         _order(_X_ZERO, _ROW_LOAD, invariant={0}, accumulated={1}, consumed={1})
 
 
+@pytest.mark.usefixtures("cute_compile_env")
 def test_unknown_effects_in_the_pass_order_the_tail() -> None:
     # A call the ordering cannot see through keeps every memory access on its
     # side: the flag store follows one such call, and is rejected between two.
@@ -272,6 +276,7 @@ def test_pure_scalar_inline_asm_can_run_between_the_lane_passes() -> None:
 
 
 @pytest.mark.parametrize("purity", ["False", "runtime_purity", "1", "missing"])
+@pytest.mark.usefixtures("cute_compile_env")
 def test_inline_asm_without_proven_purity_keeps_memory_order(purity: str) -> None:
     statement = (
         _INLINE_ASM.replace(", is_pure=True", "")
@@ -298,6 +303,7 @@ def test_inline_asm_without_proven_purity_keeps_memory_order(purity: str) -> Non
         "bar.sync 0; mov.u32 $0, $1;",
     ],
 )
+@pytest.mark.usefixtures("cute_compile_env")
 def test_declared_pure_memory_and_synchronization_asm_remain_opaque(
     replacement: str,
 ) -> None:
@@ -324,6 +330,7 @@ def test_declared_pure_memory_and_synchronization_asm_remain_opaque(
         "(out.iterator + i * out.layout.stride[0]).load()",
     ],
 )
+@pytest.mark.usefixtures("cute_compile_env")
 def test_pure_inline_asm_preserves_argument_dependencies(argument: str) -> None:
     statement = _INLINE_ASM.replace("(reduced,)", f"({argument},)")
     with pytest.raises(exc.BackendUnsupported, match="between per-lane statements"):

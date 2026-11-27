@@ -1562,6 +1562,7 @@ def test_a_first_pass_whose_only_effect_was_the_atomic_is_dropped() -> None:
     np.testing.assert_array_equal(buffers["output"].values, expected)
 
 
+@pytest.mark.usefixtures("cute_compile_env")
 def test_an_atomic_statement_with_other_work_declines_the_interchange() -> None:
     """Dropping the statement from the first pass would drop its other
     effect too, and keeping it would double the total: decline the nest."""
@@ -1723,6 +1724,7 @@ for lane in range(4):
 
 
 @pytest.mark.parametrize("source", _WRITTEN_TWICE)
+@pytest.mark.usefixtures("cute_compile_env")
 def test_a_write_both_nests_would_run_declines_the_interchange(source: str) -> None:
     loop = _lane_loop(source)
     with pytest.raises(exc.BackendUnsupported, match="twice"):
@@ -1796,6 +1798,7 @@ _REORDERED = [
 
 
 @pytest.mark.parametrize(("tail", "message"), _REORDERED)
+@pytest.mark.usefixtures("cute_compile_env")
 def test_an_access_out_of_order_across_the_passes_declines_the_interchange(
     tail: str, message: str
 ) -> None:
@@ -1842,6 +1845,7 @@ _UNRESOLVED = [
 
 
 @pytest.mark.parametrize(("tail", "message"), _UNRESOLVED)
+@pytest.mark.usefixtures("cute_compile_env")
 def test_an_access_the_passes_cannot_resolve_declines_the_interchange(
     tail: str, message: str
 ) -> None:
@@ -1938,6 +1942,7 @@ def test_writes_into_thread_local_storage_keep_the_interchange(source: str) -> N
     ],
     ids=["name", "thread_local_storage"],
 )
+@pytest.mark.usefixtures("cute_compile_env")
 def test_a_lane_value_carried_across_serial_iterations_declines_the_interchange(
     prefix: str, update: str, carried: str
 ) -> None:
@@ -2000,6 +2005,7 @@ for lane in range(4):
     ],
     ids=["name", "renamed"],
 )
+@pytest.mark.usefixtures("cute_compile_env")
 def test_a_lane_value_updated_after_its_use_declines_the_interchange(
     update: str, rename_groups: dict[str, str] | None
 ) -> None:
@@ -2099,6 +2105,7 @@ _HANDED_ON = [
 
 
 @pytest.mark.parametrize(("prefix", "update", "stored"), _HANDED_ON)
+@pytest.mark.usefixtures("cute_compile_env")
 def test_a_reduction_handed_on_through_the_serial_loop_declines_the_interchange(
     prefix: str, update: str, stored: str
 ) -> None:
@@ -2387,6 +2394,7 @@ _BOUND_BESIDE = [
 
 
 @pytest.mark.parametrize(("serial_body", "rename_groups"), _BOUND_BESIDE)
+@pytest.mark.usefixtures("cute_compile_env")
 def test_a_lane_invariant_value_bound_beside_a_lanes_own_declines_the_interchange(
     serial_body: str, rename_groups: dict[str, str] | None
 ) -> None:
@@ -2445,6 +2453,7 @@ for lane in range(4):
     ],
     ids=["serial_body", "lane_prefix"],
 )
+@pytest.mark.usefixtures("cute_compile_env")
 def test_an_assignment_ahead_of_a_prefix_statement_that_reads_its_name_declines(
     prefix: str, head: str
 ) -> None:

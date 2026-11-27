@@ -291,6 +291,7 @@ def _body(source: str) -> list[ast.AST]:
 
 @pytest.mark.parametrize("outer,inner", [("feature", "row"), ("a", "b")])
 @pytest.mark.parametrize("inner_extent", [2, 8])
+@pytest.mark.usefixtures("cute_compile_env")
 def test_distinct_lane_owner_rejected_even_for_equal_extents(
     outer: str, inner: str, inner_extent: int
 ) -> None:
@@ -320,6 +321,7 @@ def test_marker_owner_survives_statement_and_lane_cloning() -> None:
     validate_lane_reduce_owners([copied_loop])
 
 
+@pytest.mark.usefixtures("cute_compile_env")
 def test_missing_lane_owner_cannot_reach_residual_restore() -> None:
     body = _body(f"reduced = {_marker('missing')}")
     with pytest.raises(helion.exc.BackendUnsupported, match="different lane owner"):
@@ -330,6 +332,7 @@ def test_missing_lane_owner_cannot_reach_residual_restore() -> None:
 
 @pytest.mark.parametrize("guarded", [False, True])
 @pytest.mark.parametrize("copies", [1, 2])
+@pytest.mark.usefixtures("cute_compile_env")
 def test_late_rename_carry_rejected_before_split_subpaths(
     guarded: bool, copies: int, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -375,6 +378,7 @@ def test_reduced_scalar_can_update_an_existing_online_carry(owner: str | None) -
     assert "_helion_lane_reduce" not in code
 
 
+@pytest.mark.usefixtures("cute_compile_env")
 def test_legacy_per_lane_carry_is_not_an_owned_reduction_proof() -> None:
     def generate(owner: str | None) -> str:
         loop = _create_lane_loop(
@@ -463,6 +467,7 @@ def _execute_scalars(
 
 @pytest.mark.parametrize("has_raw", [False, True])
 @pytest.mark.parametrize("unduplicatable", [False, True])
+@pytest.mark.usefixtures("cute_compile_env")
 def test_mixed_raw_and_renamed_carries_decline_before_stash(
     has_raw: bool, unduplicatable: bool, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -506,6 +511,7 @@ def test_mixed_raw_and_renamed_carries_decline_before_stash(
         split_lane_loop_reductions([*prefix, loop, *suffix], rename_groups=renames)
 
 
+@pytest.mark.usefixtures("cute_compile_env")
 def test_owned_raw_restore_would_lose_complete_reduction_numerically() -> None:
     def make(owner: str | None) -> list[ast.AST]:
         marker = _lane_reduce_marker_expr(
@@ -590,6 +596,7 @@ def test_marker_dependent_online_update_uses_full_lane_sum_once() -> None:
 @pytest.mark.parametrize("renamed", [False, True])
 @pytest.mark.parametrize("indirect", [False, True])
 @pytest.mark.parametrize("guarded", [False, True])
+@pytest.mark.usefixtures("cute_compile_env")
 def test_mixed_marker_and_partial_carry_remains_lane_varying(
     renamed: bool, indirect: bool, guarded: bool
 ) -> None:
@@ -655,6 +662,7 @@ def test_finalized_only_carry_is_uniform_after_reduction(
 @pytest.mark.parametrize("unduplicatable", [False, True])
 @pytest.mark.parametrize("renamed", [False, True])
 @pytest.mark.parametrize("inside_observed", [False, True])
+@pytest.mark.usefixtures("cute_compile_env")
 def test_finalized_carry_requires_a_once_per_tile_schedule(
     unduplicatable: bool, renamed: bool, inside_observed: bool
 ) -> None:
@@ -696,6 +704,7 @@ def test_finalized_carry_requires_a_once_per_tile_schedule(
 
 
 @pytest.mark.parametrize("compound", [False, True])
+@pytest.mark.usefixtures("cute_compile_env")
 def test_finalized_carry_without_a_single_assignment_proof_declines(
     compound: bool,
 ) -> None:
@@ -718,6 +727,7 @@ def test_finalized_carry_without_a_single_assignment_proof_declines(
         )
 
 
+@pytest.mark.usefixtures("cute_compile_env")
 def test_owned_marker_cannot_use_an_unproved_direct_restore() -> None:
     loop = _create_lane_loop(
         "lane", 8, _body(f"partial = lane + 1\nreduced = {_marker('lane')}")
@@ -999,6 +1009,7 @@ def test_lane_reduction_of_an_accumulated_row_runs_after_the_loop_that_accumulat
     )
 
 
+@pytest.mark.usefixtures("cute_compile_env")
 def test_an_accumulated_row_under_a_collective_end_is_reduced_per_lane() -> None:
     """The jagged loop's trip count is a cross-thread max, which no pass may re-run: the owned marker is restored per lane, after the loop, and an owner without a per-lane restore is declined rather than split."""
     code = _split(_accumulated_rows_body(collective_end=True), _ROW_SUMS_RENAMES)
@@ -1019,6 +1030,7 @@ def test_an_accumulated_row_under_a_collective_end_is_reduced_per_lane() -> None
         )
 
 
+@pytest.mark.usefixtures("cute_compile_env")
 def test_a_carry_the_rename_groups_do_not_map_is_read_off_its_phi_copy() -> None:
     """Without the alias of ``v_8`` the slice sees the initializer alone; the loop's ``row_sums_copy = row_sums`` marks it as the carry, and the marker is restored per lane instead of being folded ahead of the loop."""
     code = _split(_accumulated_rows_body(collective_end=False), {})
@@ -1279,6 +1291,7 @@ def test_a_stored_strided_reduction_is_totalled_across_the_lanes() -> None:
     ],
     ids=["scaled_per_lane", "carry_and_store", "second_reader_of_the_carry"],
 )
+@pytest.mark.usefixtures("cute_compile_env")
 def test_a_strided_reduction_without_a_whole_loop_lowering_is_declined(
     tail: str, carry_copies: int
 ) -> None:
@@ -1293,6 +1306,7 @@ def test_a_strided_reduction_without_a_whole_loop_lowering_is_declined(
         )
 
 
+@pytest.mark.usefixtures("cute_compile_env")
 def test_the_restore_declines_a_stored_strided_reduction() -> None:
     loop = _create_lane_loop("lane", 2, _body(_restored_rows_body(_STORED_TOTAL)))
     (index,) = [
@@ -1392,6 +1406,7 @@ def test_a_strided_restore_is_kept_for_a_running_max_carry(update: str) -> None:
 @pytest.mark.parametrize(
     "update", list(_MIN_OF_A_MAX_MARKER.values()), ids=list(_MIN_OF_A_MAX_MARKER)
 )
+@pytest.mark.usefixtures("cute_compile_env")
 def test_a_min_carry_of_a_max_reduction_is_declined(update: str) -> None:
     """A carry folding the other extremum would keep one lane's max per lane: it is no carry of this marker, and the tail touching the carry has no re-reduce either."""
     with pytest.raises(
@@ -1422,6 +1437,7 @@ def test_a_strided_restore_is_kept_for_a_carry_update_under_a_cast(
     )
 
 
+@pytest.mark.usefixtures("cute_compile_env")
 def test_a_carry_update_under_a_narrowing_cast_is_declined() -> None:
     with pytest.raises(
         helion.exc.BackendUnsupported, match="no proved complete per-lane restore"
@@ -1467,6 +1483,7 @@ def test_a_strided_restore_is_kept_for_a_carry_update_in_an_if_join() -> None:
     ],
     ids=["lane_varying_condition", "condition_reads_the_carry", "else_resets"],
 )
+@pytest.mark.usefixtures("cute_compile_env")
 def test_an_if_join_that_is_not_the_same_carry_in_every_lane_is_declined(
     update: str,
 ) -> None:
@@ -1589,6 +1606,7 @@ def test_a_second_marker_input_produced_between_the_markers_joins_the_prefix() -
     assert after.index("tot.iterator") < after.index("tot2.iterator")
 
 
+@pytest.mark.usefixtures("cute_compile_env")
 def test_a_second_marker_input_reading_the_first_result_stays_declined() -> None:
     body = _restored_rows_body(_STORED_TOTAL).replace(
         _SUM_MARKER_LINE,
@@ -1911,6 +1929,7 @@ def test_vector_lane_markers_fold_into_the_lane_split() -> None:
         ),
     ],
 )
+@pytest.mark.usefixtures("cute_compile_env")
 def test_vector_lane_markers_outside_the_fold_shape_decline(text: str) -> None:
     """The fold admits only the per-element shape it proves: every marker
     input depends on the vector element (the original body reduces a
@@ -1927,6 +1946,7 @@ def test_vector_lane_markers_outside_the_fold_shape_decline(text: str) -> None:
         split_lane_loop_reductions([loop])
 
 
+@pytest.mark.usefixtures("cute_compile_env")
 def test_owned_marker_in_serial_loop_without_store_declines() -> None:
     """An owned marker inside a genuine serial loop that no broadcast store
     consumes has no interchange; its raw per-lane input is not a complete
@@ -2026,6 +2046,7 @@ class TestLaneLoopedTileReductionNumerics(TestCase):
 
 
 @pytest.mark.parametrize("observed", [False, True])
+@pytest.mark.usefixtures("cute_compile_env")
 def test_owned_marker_input_updated_by_aliased_serial_loop_splits(
     observed: bool,
 ) -> None:
@@ -2077,6 +2098,7 @@ def test_owned_marker_input_updated_by_aliased_serial_loop_splits(
         assert values["out"] == {lane: float(3 * (lane + 1) + 108) for lane in range(8)}
 
 
+@pytest.mark.usefixtures("cute_compile_env")
 def test_dependent_markers_with_unduplicatable_producer_decline() -> None:
     first = _lane_reduce_marker_expr(
         "acc", "sum", "cutlass.Float32(0)", 1, owner_lane="lane"
@@ -2123,6 +2145,7 @@ def test_dependent_markers_with_unduplicatable_producer_decline() -> None:
 
 
 @pytest.mark.parametrize("extent", [8, 512])
+@pytest.mark.usefixtures("cute_compile_env")
 def test_register_stash_declines_beyond_its_lane_extent_limit(extent: int) -> None:
     marker = _lane_reduce_marker_expr(
         "acc", "sum", "cutlass.Float32(0)", 1, owner_lane="lane"
@@ -2166,6 +2189,7 @@ def test_register_stash_declines_beyond_its_lane_extent_limit(extent: int) -> No
 
 
 @pytest.mark.parametrize("feeds_reduction", [False, True])
+@pytest.mark.usefixtures("cute_compile_env")
 def test_collective_outside_the_reduction_slice_runs_once_per_lane(
     feeds_reduction: bool, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -2434,6 +2458,7 @@ def test_bounded_store_predicate_rejects_unsafe_coordinates(expression):
     )
 
 
+@pytest.mark.usefixtures("cute_compile_env")
 def test_bounded_store_induction_facts_are_scoped_and_invalidated():
     definitions = _bounded_store_coordinate_definitions()
     expression = ast.parse("base + serial", mode="eval").body
@@ -2467,6 +2492,7 @@ def test_bounded_store_induction_facts_are_scoped_and_invalidated():
         "base + tid < 130 and unknown + tid < _BLOCK_SIZE_1",
     ],
 )
+@pytest.mark.usefixtures("cute_compile_env")
 def test_reduced_axis_requires_bounded_proof_for_every_predicate(predicate):
     definitions = _bounded_store_coordinate_definitions()
     definitions["tid"] = ast.parse(
@@ -2554,6 +2580,7 @@ def test_bounded_store_induction_rejects_thread_dependent_ranges(loop):
 
 
 @pytest.mark.parametrize("inside", [False, True])
+@pytest.mark.usefixtures("cute_compile_env")
 def test_bounded_store_canonical_alias_write_invalidates_prior_constant(inside):
     assignments = _body("x = 0\nphi_x = cutlass.Int32(2147483647)")
     body = _body(

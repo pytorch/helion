@@ -200,6 +200,7 @@ def test_each_FP32_product_is_accumulated_without_half_rounding() -> None:
     assert actual["total"] == np.float32(8)
 
 
+@pytest.mark.usefixtures("cute_compile_env")
 def test_matmul_provenance_is_required_for_the_new_stash_schedule() -> None:
     with pytest.raises(helion.exc.BackendUnsupported):
         _lower(_loop(source=_body(product=False)))
@@ -241,6 +242,7 @@ def test_matmul_provenance_is_required_for_the_new_stash_schedule() -> None:
         ),
     ],
 )
+@pytest.mark.usefixtures("cute_compile_env")
 def test_unproved_carries_effects_and_collectives_still_decline(
     before: str, after: str
 ) -> None:
@@ -250,6 +252,7 @@ def test_unproved_carries_effects_and_collectives_still_decline(
         _lower(_loop(source=source.replace(before, after)))
 
 
+@pytest.mark.usefixtures("cute_compile_env")
 def test_raw_product_is_not_a_complete_matmul_contribution() -> None:
     source = _body().replace(_marker("product", "sum", product=True), "product")
     with pytest.raises(helion.exc.BackendUnsupported, match="loop-carried value"):
@@ -294,6 +297,7 @@ def test_signed_modulo_remains_relocatable_in_staged_products(divisor: int) -> N
 @pytest.mark.parametrize(
     "iterator", ["range(0)", "range(1)", "range(dynamic)", "range(257)"]
 )
+@pytest.mark.usefixtures("cute_compile_env")
 def test_staging_requires_a_bounded_complete_lane_sweep(iterator: str) -> None:
     loop = _loop()
     loop.iter = ast.parse(iterator, mode="eval").body
@@ -302,6 +306,7 @@ def test_staging_requires_a_bounded_complete_lane_sweep(iterator: str) -> None:
 
 
 @pytest.mark.parametrize("fault", ["drop", "repeat", "inside", "early"])
+@pytest.mark.usefixtures("cute_compile_env")
 def test_existing_final_carry_validator_rejects_corrupt_staged_schedules(
     fault: str,
 ) -> None:
@@ -335,6 +340,7 @@ def test_existing_final_carry_validator_rejects_corrupt_staged_schedules(
 
 
 @pytest.mark.parametrize("bad", ["1", "'matmul'", "None"])
+@pytest.mark.usefixtures("cute_compile_env")
 def test_product_provenance_is_a_typed_internal_marker(bad: str) -> None:
     marker = _marker("product", "sum", product=True).replace(
         "matmul_contribution=True", f"matmul_contribution={bad}"

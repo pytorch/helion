@@ -20,11 +20,11 @@ import dataclasses
 from typing import TYPE_CHECKING
 from typing import cast
 
-from .... import exc
 from ...ast_extension import create
 from ...ast_extension import expr_from_string
 from ...ast_extension import statement_from_string
 from ...ast_read_writes import HELION_LANE_LOOP_VAR_ATTR
+from ...compile_environment import backend_unsupported
 from ..reduce_call import ReduceCall
 from ..reduce_call import ReduceScope
 
@@ -425,7 +425,7 @@ class _LaneReduceMarker:
     ) -> _LaneReduceMarker:
         """Decode a :meth:`to_call` text; malformed markers are rejected."""
         if len(call.args) != 3:
-            raise exc.BackendUnsupported("cute", "invalid reduction marker")
+            raise backend_unsupported("invalid reduction marker")
         input_node, type_node, identity_node = call.args
         values: dict[str, object] = {}
         for keyword in call.keywords:
@@ -435,11 +435,11 @@ class _LaneReduceMarker:
                 or name in values
                 or not (name == "threads_in_group" or name in _MARKER_KEYWORD_NAMES)
             ):
-                raise exc.BackendUnsupported("cute", "invalid reduction marker")
+                raise backend_unsupported("invalid reduction marker")
             values[name] = ast.literal_eval(keyword.value)
         threads_in_group = values.pop("threads_in_group", None)
         if type(threads_in_group) is not int:
-            raise exc.BackendUnsupported("cute", "invalid reduction marker")
+            raise backend_unsupported("invalid reduction marker")
         reduction_type = ast.literal_eval(type_node)
         marker = cls(
             result_var=result_var,
@@ -453,19 +453,19 @@ class _LaneReduceMarker:
             value = values.get(field.name, field.default)
             if field.name == "owner_lane":
                 if value is not None and (not isinstance(value, str) or not value):
-                    raise exc.BackendUnsupported("cute", "invalid reduction lane owner")
+                    raise backend_unsupported("invalid reduction lane owner")
             elif type(value) is not type(field.default):
                 label = field.name.replace("_", " ")
-                raise exc.BackendUnsupported("cute", f"invalid {label} marker")
+                raise backend_unsupported(f"invalid {label} marker")
             setattr(marker, field.name, value)
         if marker.matmul_contribution and (
             marker.owner_lane is None or reduction_type != "sum"
         ):
-            raise exc.BackendUnsupported("cute", "invalid matmul contribution marker")
+            raise backend_unsupported("invalid matmul contribution marker")
         if marker.strided_restore and marker.owner_lane is None:
-            raise exc.BackendUnsupported("cute", "invalid strided restore marker")
+            raise backend_unsupported("invalid strided restore marker")
         if marker.broadcast_owner and marker.owner_lane is None:
-            raise exc.BackendUnsupported("cute", "invalid broadcast owner marker")
+            raise backend_unsupported("invalid broadcast owner marker")
         return marker
 
 
@@ -644,7 +644,7 @@ def validate_lane_reduce_owners(body: list[ast.AST]) -> None:
             if not owners or not all(
                 constexpr for _, constexpr in lanes[owners[-1] + 1 :]
             ):
-                raise exc.BackendUnsupported("cute", NESTED_OWNER_REFUSAL)
+                raise backend_unsupported(NESTED_OWNER_REFUSAL)
         for child in ast.iter_child_nodes(node):
             visit(child, lanes)
 
@@ -795,10 +795,7 @@ def _finalize_lane_reduce_marker(m: _LaneReduceMarker, acc_var: str) -> list[ast
         # strided-thread-reduction path emits that), so a cluster-split
         # reduce landing here cannot be combined across the cluster —
         # reject the config loudly.
-        from .... import exc
-
-        raise exc.BackendUnsupported(
-            "cute",
+        raise backend_unsupported(
             "cute_cluster_n > 1 is not supported for the two-pass lane "
             "reduction finalize; only the strided cross-warp reduce path "
             "can perform the cluster combine",
@@ -843,10 +840,7 @@ def _finalize_lane_reduce_marker(m: _LaneReduceMarker, acc_var: str) -> list[ast
             # consecutive-lane group must arrive here with cross-warp group
             # params (``group_span`` a multiple of 32) instead of silently
             # summing only the first warp.
-            from .... import exc
-
-            raise exc.BackendUnsupported(
-                "cute",
+            raise backend_unsupported(
                 "lane reduction across more than one warp requires the "
                 f"cross-warp grouped finalize (threads={m.threads_in_group})",
             )
@@ -858,10 +852,7 @@ def _finalize_lane_reduce_marker(m: _LaneReduceMarker, acc_var: str) -> list[ast
 
 def _warp_reduce_expr(reduction_type: str, acc: str, threads_in_group: int) -> str:
     if threads_in_group > 32:
-        from .... import exc
-
-        raise exc.BackendUnsupported(
-            "cute",
+        raise backend_unsupported(
             "lane reduction spanning multiple physical warps requires a proven "
             "CTA reduction group",
         )
@@ -889,8 +880,8 @@ def _restore_stmt_lane_reduce_markers(stmt: ast.AST) -> ast.AST:
         m = _is_lane_reduce_marker_assign(stmt)
         if m is not None:
             if m.owner_lane is not None:
-                raise exc.BackendUnsupported(
-                    "cute", "reduction marker has no proved lane lowering"
+                raise backend_unsupported(
+                    "reduction marker has no proved lane lowering"
                 )
             return statement_from_string(
                 f"{m.result_var} = {m.finalize_expr(m.input_name)}"

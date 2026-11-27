@@ -1717,6 +1717,7 @@ acc = base + dot_acc
 
 @pytest.mark.parametrize("dependent", (False, True))
 @pytest.mark.parametrize("write_kind", ("store", "atomic"))
+@pytest.mark.usefixtures("cute_compile_env")
 def test_lane_split_rejects_interleaved_aliasing_write(
     monkeypatch: pytest.MonkeyPatch,
     dependent: bool,
@@ -1772,6 +1773,7 @@ sink = reduced_0 + reduced_1
         ),
     ],
 )
+@pytest.mark.usefixtures("cute_compile_env")
 def test_lane_split_proves_in_place_lanes_independent(
     element: str, independent: bool
 ) -> None:
@@ -1959,6 +1961,7 @@ sink = reduced_0 + reduced_1
 
 
 @pytest.mark.parametrize("store_shift", (0, 1))
+@pytest.mark.usefixtures("cute_compile_env")
 def test_lane_split_exact_same_lane_state_update(
     store_shift: int,
 ) -> None:
@@ -2087,6 +2090,7 @@ updated = cutlass.Float32(loaded) + reduced
     assert "reduced_lane_acc" in code
 
 
+@pytest.mark.usefixtures("cute_compile_env")
 def test_lane_split_rejects_dynamic_rows_with_insufficient_stride() -> None:
 
     loop = _create_lane_loop(
@@ -2248,6 +2252,7 @@ for synthetic_lane_7 in cutlass.range_constexpr(8):
         "loop-carried-base",
     ),
 )
+@pytest.mark.usefixtures("cute_compile_env")
 def test_lane_split_plain_scalar_same_lane_proof_fails_closed(
     load_pointer: str,
     store_pointer: str,
@@ -2280,6 +2285,7 @@ updated = cutlass.Float32(loaded) + reduced
         )
 
 
+@pytest.mark.usefixtures("cute_compile_env")
 def test_lane_split_plain_scalar_rejects_mutated_address_alias() -> None:
 
     loop = _create_lane_loop(
@@ -2305,6 +2311,7 @@ updated = cutlass.Float32(loaded) + reduced
         split_lane_loop_reductions([loop])
 
 
+@pytest.mark.usefixtures("cute_compile_env")
 def test_lane_split_plain_scalar_rejects_mutated_lane_alias() -> None:
 
     loop = _create_lane_loop(
@@ -2340,6 +2347,7 @@ pointer.store(updated)
     ),
     ids=("augassign", "annotated", "tuple", "conditional"),
 )
+@pytest.mark.usefixtures("cute_compile_env")
 def test_lane_split_plain_scalar_rejects_stale_preload_definition(
     mutation: str,
 ) -> None:
@@ -2361,6 +2369,7 @@ updated = cutlass.Float32(loaded) + reduced
         split_lane_loop_reductions([loop])
 
 
+@pytest.mark.usefixtures("cute_compile_env")
 def test_lane_split_plain_scalar_rejects_captured_shifted_aliases() -> None:
 
     loop = _create_lane_loop(
@@ -2412,6 +2421,7 @@ updated = cutlass.Float32(loaded) + reduced
     ),
     ids=("for-target", "attribute-store", "attribute-store-through-alias"),
 )
+@pytest.mark.usefixtures("cute_compile_env")
 def test_lane_split_plain_scalar_rejects_captured_structured_writes(
     initial: str,
     mutation: str,
@@ -2443,6 +2453,7 @@ updated = cutlass.Float32(loaded) + reduced
         split_lane_loop_reductions([loop])
 
 
+@pytest.mark.usefixtures("cute_compile_env")
 def test_lane_split_rejects_exact_store_before_same_lane_load() -> None:
 
     loop = _create_lane_loop(
@@ -2469,6 +2480,7 @@ sink = reduced + loaded
 @pytest.mark.parametrize("dependent", (False, True))
 @pytest.mark.parametrize("write_kind", ("store", "atomic"))
 @pytest.mark.parametrize("prove_x_y_disjoint", (False, True))
+@pytest.mark.usefixtures("cute_compile_env")
 def test_lane_split_treats_later_write_as_a_backedge_barrier(
     dependent: bool,
     write_kind: str,

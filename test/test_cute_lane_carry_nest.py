@@ -294,6 +294,7 @@ def test_a_producer_both_passes_need_is_copied_for_the_consume_pass() -> None:
     assert not shared, shared
 
 
+@pytest.mark.usefixtures("cute_compile_env")
 def test_a_hand_back_that_reads_the_reduction_is_no_accumulate_statement() -> None:
     """The split checks the hand-backs on its own: one whose value is
     computed from the reduction cannot run in the accumulate pass, ahead of
@@ -327,6 +328,7 @@ def test_a_hand_back_that_reads_the_reduction_is_no_accumulate_statement() -> No
     ],
     ids=["rebound-input", "reduced-carry"],
 )
+@pytest.mark.usefixtures("cute_compile_env")
 def test_a_carry_that_rebinds_a_reductions_input_is_no_accumulate_statement(
     anchor: str, rebinding: str | None
 ) -> None:
@@ -679,6 +681,7 @@ def _mutated(old: str, new: str) -> str:
         ),
     ],
 )
+@pytest.mark.usefixtures("cute_compile_env")
 def test_a_nest_one_condition_short_is_declined(source: str, reason: str) -> None:
     with pytest.raises(exc.BackendUnsupported, match=_SUFFIX) as declined:
         _interchange(source)
@@ -716,6 +719,7 @@ def test_a_prefix_name_bound_ahead_of_its_readers_keeps_the_nest() -> None:
     np.testing.assert_array_equal(buffers["column"].values, 3.0 * values.sum(0))
 
 
+@pytest.mark.usefixtures("cute_compile_env")
 def test_tensors_without_an_alias_proof_decline_the_nest() -> None:
     with pytest.raises(
         exc.BackendUnsupported, match="a load may read a tensor the nest writes"
@@ -1035,6 +1039,7 @@ def _trip_mutated(old: str, new: str) -> str:
         ),
     ],
 )
+@pytest.mark.usefixtures("cute_compile_env")
 def test_a_tile_one_condition_short_keeps_its_lane_loop(
     source: str, reason: str
 ) -> None:
@@ -1079,6 +1084,7 @@ def test_a_tile_one_condition_short_keeps_its_lane_loop(
         ),
     ],
 )
+@pytest.mark.usefixtures("cute_compile_env")
 def test_rows_per_trip_keep_the_single_nests_conditions(
     source: str, reason: str
 ) -> None:
