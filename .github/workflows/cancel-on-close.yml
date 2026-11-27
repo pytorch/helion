@@ -18,15 +18,19 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           BRANCH: ${{ github.event.pull_request.head.ref }}
+          # A ciflow/main run (test.yml) is listed under its tag.
+          CIFLOW: ciflow/main/${{ github.event.pull_request.number }}
           REPO: ${{ github.repository }}
         run: |
           for wf in test.yml lint.yml docs-test.yml; do
-            for status in in_progress queued; do
-              gh run list --repo "$REPO" --workflow "$wf" --branch "$BRANCH" \
-                --status "$status" --json databaseId -q '.[].databaseId' |
-              while read -r id; do
-                echo "Cancelling run $id ($wf, $status)"
-                gh run cancel "$id" --repo "$REPO" || true
+            for branch in "$BRANCH" "$CIFLOW"; do
+              for status in in_progress queued; do
+                gh run list --repo "$REPO" --workflow "$wf" --branch "$branch" \
+                  --status "$status" --json databaseId -q '.[].databaseId' |
+                while read -r id; do
+                  echo "Cancelling run $id ($wf, $status)"
+                  gh run cancel "$id" --repo "$REPO" || true
+                done
               done
             done
           done

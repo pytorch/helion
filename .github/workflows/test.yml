@@ -6,6 +6,11 @@ on:
     branches:
       - main
       - release/*
+    # A pull request's head commit tagged ciflow/main/<number> (the
+    # ciflow/main label, through pytorch-probot) runs as a push to main
+    # does: every matrix entry and the slow tier.
+    tags:
+      - ciflow/main/*
 
 concurrency:
   # Also applies to main: a new push cancels the previous main run so bursts of
@@ -38,7 +43,8 @@ jobs:
       - name: Load matrix from file
         id: set-matrix
         run: |
-          # Entries with "pr": false in matrix.json run on pushes to main only:
+          # Entries with "pr": false in matrix.json run on pushes only (main,
+          # release/*, ciflow/main tags), not on pull requests:
           # near-duplicates of the A10G and H100 jobs that change only the
           # interpreter (3.14t), the dtype asserts, the reference-eager mode or
           # the Triton build (fbtriton).
@@ -154,7 +160,7 @@ jobs:
           restore-cache: true
           # Pull requests can consume caches published by main/release pushes,
           # but should not occupy accelerator runners uploading new archives.
-          save-cache: ${{ github.event_name == 'push' }}
+          save-cache: ${{ github.event_name == 'push' && !startsWith(github.ref, 'refs/tags/') }}
 
       - name: Create virtual environment
         run: |
@@ -445,7 +451,7 @@ jobs:
             if [[ "$HELION_BACKEND" == "cute" ]]; then MARK="not cpu_only or cuda"; fi
           fi
           # Pull requests skip the slow tier (fresh-interpreter replays, real
-          # autotune searches); pushes to main run it.
+          # autotune searches); pushes (main, release/*, ciflow/main tags) run it.
           if [[ "${{ github.event_name }}" == "pull_request" ]]; then
             MARK="${MARK:+($MARK) and }not slow"
           fi
@@ -572,7 +578,7 @@ jobs:
           python-version: "3.12"
           enable-cache: true
           restore-cache: true
-          save-cache: ${{ github.event_name == 'push' }}
+          save-cache: ${{ github.event_name == 'push' && !startsWith(github.ref, 'refs/tags/') }}
 
       - name: Create virtual environment
         run: |

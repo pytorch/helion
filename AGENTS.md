@@ -464,7 +464,9 @@ rebase re-runs CI for the whole stack.
   request, so a small fix goes into the bottom pull request's commit instead
   and a larger one waits for the user to submit (fix-pr-stack skill). A
   failure you cannot reproduce on your hardware (ROCm, fbtriton, TPU) may be
-  skipped with a decorator that names the issue; say so in your report.
+  skipped with a decorator that names the issue; say so in your report. When
+  fixing main is the task itself, follow the fix-ci-main skill, which also
+  covers failures that only main's CI runs.
 - Keep drive-by refactors out of behavioral commits: give them their own
   commit or leave them for later.
 

@@ -1,3 +1,7 @@
+# The ciflow/main label on a pull request tags its head commit
+# ciflow/main/<number>, which runs Tests as on main (test.yml).
+ciflow_push_tags:
+  - ciflow/main
 retryable_workflows:
   - "test"
   - "benchmark"
