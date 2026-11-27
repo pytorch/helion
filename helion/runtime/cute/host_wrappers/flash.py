@@ -89,13 +89,15 @@ def flex_walk_q_coords(
 def emit_small_biased_attention(
     ctx: HostWrapperContext, plan: dict[str, object]
 ) -> None:
-    """``helion_small_biased_attention``: one CTA per (sequence row, batch)."""
+    """``helion_small_biased_attention``: one CTA per (sequence row, batch),
+    flat in x where the plan says the batch is more than CUDA takes on y."""
     batch = ctx.plan_int("batch")
     seq = ctx.plan_int("seq")
+    grid = (seq * batch, 1) if plan.get("flat_grid") else (seq, batch)
     ctx.body.extend(
         [
-            f"    grid_x = cutlass.Int32({seq})",
-            f"    grid_y = cutlass.Int32({batch})",
+            f"    grid_x = cutlass.Int32({grid[0]})",
+            f"    grid_y = cutlass.Int32({grid[1]})",
             "    grid_z = cutlass.Int32(1)",
         ]
     )
@@ -652,11 +654,17 @@ def emit_flash(ctx: HostWrapperContext, plan: dict[str, object]) -> None:
         clc_heads = ctx.plan_int("clc_heads_per_batch", batch)
         if clc_heads <= 0 or batch % clc_heads != 0:
             clc_heads = batch
+        if plan.get("clc_flat_grid"):
+            # A heads split whose y or z extent CUDA rejects (above 65,535):
+            # the same CTAs flat in x, which the body decodes linearly.
+            clc_grid = (total_tiles, 1, 1)
+        else:
+            clc_grid = (total_tiles // batch, clc_heads, batch // clc_heads)
         ctx.body.extend(
             [
-                f"    grid_x = cutlass.Int32({total_tiles // batch})",
-                f"    grid_y = cutlass.Int32({clc_heads})",
-                f"    grid_z = cutlass.Int32({batch // clc_heads})",
+                f"    grid_x = cutlass.Int32({clc_grid[0]})",
+                f"    grid_y = cutlass.Int32({clc_grid[1]})",
+                f"    grid_z = cutlass.Int32({clc_grid[2]})",
             ]
         )
     elif persistent:
