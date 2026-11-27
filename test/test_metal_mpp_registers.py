@@ -6,6 +6,7 @@ in registers, the lanes' elements at layouts factored into lane bases
 from __future__ import annotations
 
 import dataclasses
+from fractions import Fraction
 import re
 from types import SimpleNamespace
 from unittest import mock
@@ -15,13 +16,17 @@ import torch
 
 import helion
 from helion import exc
+from helion._compiler.metal import bit_windows
 from helion._compiler.metal import coop_layout
 from helion._compiler.metal import mpp_registers
+from helion._compiler.metal.affine_fold import Affine
+from helion._compiler.metal.affine_fold import Fact
 from helion._testing import TestCase
 from helion._testing import skipUnlessBackends
 from helion._testing.metal import render_msl
 from helion._testing.metal_fragment import affine_args
 from helion._testing.metal_fragment import affine_mm
+from helion._testing.metal_fragment import affine_mm_f16
 from helion._testing.metal_fragment import k_from_16
 from helion._testing.metal_fragment import nvfp4_cpu_args
 from helion._testing.metal_fragment import nvfp4_rows
@@ -46,6 +51,7 @@ from helion._testing.metal_registers import transposed_out_mm
 from helion._testing.metal_registers import two_acc_mm
 from helion._testing.metal_registers import unread_x
 from helion.autotuner.config_spec import DEFAULT_NUM_WARPS
+from helion.runtime import capture_metal_launches
 
 pytestmark = [pytest.mark.cpu_only, skipUnlessBackends(["metal"])]
 
@@ -963,6 +969,202 @@ class TestRegisterSplit(TestCase):
                 self.assertIn(
                     "threadgroup float _mst_tile_float" if threads else "_mr_b", msl
                 )
+
+
+def _nax_right(atom: coop_layout.Atom, on_gpu: bool) -> coop_layout.Layout:
+    """The M4's layout with the right input of an M5 Max's, as probed there
+    (MLX's M5 GEMM fragments): lane ``l`` holds K positions ``kb .. kb + 3`` of
+    N ``nb + 8 q``, ``kb = 4 (l & 1) + 8 ((l >> 3) & 1)`` and ``nb = ((l >> 1) &
+    1) + 2 ((l >> 2) & 1) + 4 ((l >> 4) & 1)``."""
+    probed = coop_layout.blocked_layout(atom)
+    if atom.right_device:
+        return probed
+    lanes = []
+    for lane in range(32):
+        kb = 4 * (lane & 1) + 8 * ((lane >> 3) & 1)
+        nb = ((lane >> 1) & 1) + 2 * ((lane >> 2) & 1) + 4 * ((lane >> 4) & 1)
+        lanes.append(
+            tuple((kb + j, 8 * q + nb) for q in range(atom.n // 8) for j in range(4))
+        )
+    return dataclasses.replace(probed, right=tuple(lanes))
+
+
+class TestCodeWindows(TestCase):
+    """A lane's run of packed codes read from one window of words
+    (``bit_windows``)."""
+
+    def test_windows(self) -> None:
+        """On an M5's layout (mocked), each lane's 4 adjacent K positions of a
+        weight row read their codes from one window: the words its first
+        code's bit lies in, shifted right by that bit's offset in its word,
+        the codes its bits at 0, b, 2b and 3b.  A word that may be the last
+        code's next word is read clamped as that code reads it (3, 5 and 7
+        bits; 6-bit runs end in their last code's word); 7-bit runs take a
+        ``ulong`` of three words.  The elements keep no division, remainder
+        or word load of their own."""
+        for bits, window, clamped in (
+            (3, "uint", "_mbw0_w + 1"),
+            (5, "uint", "_mbw0_w + 1"),
+            (6, "uint", None),
+            (7, "ulong", "_mbw0_w + 2"),
+        ):
+            with self.subTest(bits=bits):
+                args = affine_args(bits, 128, 32, 64, 1024)
+                config = register_config([32, 32, 128], num_warps=8)
+                with mock.patch.object(mpp_registers, "layout", _nax_right):
+                    loop = _k_loop(render_msl(affine_mm_f16, args, config))
+                # 8 steps of 16, each a window per row of the lane's 4.
+                names = re.findall(rf"const {window} (_mbw\d+) = \(", loop)
+                self.assertEqual(len(names), 32)
+                codes = re.findall(
+                    r"static_cast<int>\(\(\((_mbw\d+) >> (\d+)\) & (\d+)\)\)", loop
+                )
+                self.assertEqual(len(codes), 8 * 16)
+                for name in names:
+                    self.assertEqual(
+                        [(int(o), int(m)) for n, o, m in codes if n == name],
+                        [(bits * j, (1 << bits) - 1) for j in range(4)],
+                    )
+                for absent in ("floor_divide", "remainder", "w["):
+                    self.assertNotIn(absent, loop)
+                self.assertIn(
+                    f"const int _mbw0_x = ((_mrl0 * {bits}) + (offset_2 * {bits}));",
+                    loop,
+                )
+                self.assertEqual(
+                    clamped is not None,
+                    f"metal::min({clamped}, {1024 * bits // 16 - 1})" in loop,
+                )
+                if bits == 6:
+                    self.assertIn(
+                        "const uint _mbw0 = (uint(_mbw0_p[_mbw0_w]) | "
+                        "(uint(_mbw0_p[_mbw0_w + 1]) << 16)) >> (_mbw0_x & 15);",
+                        loop,
+                    )
+
+    def test_windows_read_through_a_device_pointer(self) -> None:
+        """A window loads its words through a ``const device`` pointer, which
+        MLX's ``constant`` binding of a small input cannot take: the packed
+        weight is among the kernel's device reads, which export checks
+        (``export._check_mlx_buffers``)."""
+        args = affine_args(3, 128, 32, 64, 1024)
+        config = register_config([32, 32, 128], num_warps=8)
+        with mock.patch.object(mpp_registers, "layout", _nax_right):
+            (launch,) = capture_metal_launches(affine_mm_f16, args, config)
+        source = launch.msl.render()
+        self.assertTrue("const device ushort* _mbw0_p" in source, "no window")
+        self.assertIn("w", launch.msl.device_views)
+
+    def test_word_forms(self) -> None:
+        """On an M5's layout (mocked), windows over 8-bit words, three bytes
+        whose last is read clamped to the row as the last code reads its next
+        word, and over 16-bit words a row holds one more of, whose next word
+        reads unclamped."""
+        for words, padded, line in (
+            (
+                torch.uint8,
+                False,
+                (
+                    "const uint _mbw0 = (uint(_mbw0_p[_mbw0_w]) | (uint(_mbw0_p[_mbw0_w "
+                    "+ 1]) << 8) | (uint(_mbw0_p[metal::min(_mbw0_w + 2, 639)]) << 16)) "
+                    ">> (_mbw0_x & 7);"
+                ),
+            ),
+            (
+                torch.int16,
+                True,
+                (
+                    "const uint _mbw0 = (uint(_mbw0_p[_mbw0_w]) | (uint(_mbw0_p[_mbw0_w "
+                    "+ 1]) << 16)) >> (_mbw0_x & 15);"
+                ),
+            ),
+        ):
+            with self.subTest(words=words):
+                args = affine_args(5, 64, 32, 64, 1024, words=words, padded=padded)
+                config = register_config([32, 32, 128], num_warps=8)
+                with mock.patch.object(mpp_registers, "layout", _nax_right):
+                    loop = _k_loop(render_msl(affine_mm_f16, args, config))
+                self.assertEqual(len(re.findall(r"const uint _mbw\d+ = \(", loop)), 32)
+                self.assertIn(line, loop)
+                for absent in ("floor_divide", "remainder", "w["):
+                    self.assertNotIn(absent, loop)
+
+    def test_kept_reads(self) -> None:
+        """Codes that no window serves keep their elements' reads: on the
+        M4's layout a lane's codes of a row lie 8 K positions apart, a
+        5-word window for two 6-bit codes; 4-bit codes don't straddle and
+        their shifts fold to constants already."""
+        for bits in (4, 6):
+            with self.subTest(bits=bits):
+                args = affine_args(bits, 128, 32, 64, 1024)
+                loop = _k_loop(
+                    render_msl(
+                        affine_mm_f16, args, register_config([32, 32, 128], num_warps=8)
+                    )
+                )
+                self.assertNotIn("_mbw", loop)
+                self.assertIn("w[", loop)
+                self.assertEqual("floor_divide" in loop, bits == 6)
+
+    def test_plan(self) -> None:
+        """A window loads fewer words than its codes would, two each, and
+        fits a ``ulong``; a word it clamps, which another lane's code may
+        read unclamped, takes the facts' proof that no code's first word
+        lies past the clamp."""
+        facts = {
+            "r": Fact(1, 0, 63),
+            "_mrl0": Fact(4, 0, 12),
+            "offset_2": Fact(128, 0, 896),
+        }
+
+        def run(
+            bits: int, offsets: list[int], clamp: int | None = 319, **extra: Fact
+        ) -> list[bit_windows.Window]:
+            codes = [
+                [
+                    bit_windows.Code(
+                        f"q{i}",
+                        "w",
+                        "ushort",
+                        16,
+                        Affine.term("r", 1024 * bits // 16),
+                        Affine(
+                            Fraction(offset),
+                            (("_mrl0", Fraction(bits)), ("offset_2", Fraction(bits))),
+                        ),
+                        bits,
+                        None if clamp is None else Affine.of(clamp),
+                    )
+                ]
+                for i, offset in enumerate(offsets)
+            ]
+            names = iter(f"_w{i}" for i in range(99))
+            return bit_windows.plan_windows(
+                codes, {**facts, **extra}, lambda: next(names)
+            )
+
+        (window,) = run(5, [0, 5, 10, 15])
+        self.assertEqual((window.count, window.clamped), (2, (False, True)))
+        self.assertEqual(
+            window.members, ((0, "q0", 0), (1, "q1", 5), (2, "q2", 10), (3, "q3", 15))
+        )
+        (window,) = run(6, [0, 6, 12, 18], clamp=383)
+        self.assertEqual((window.count, window.clamped), (2, (False, False)))
+        # Unbounded offsets: the clamped word goes unproven, an unclamped
+        # one needs no proof.
+        unbounded = {"offset_2": Fact(128, 0, None)}
+        self.assertEqual(run(5, [0, 5, 10, 15], **unbounded), [])
+        (window,) = run(5, [0, 5, 10, 15], clamp=None, **unbounded)
+        self.assertEqual(window.clamped, (False, False))
+        # A 5-bit code that may straddle takes its own two words; a 6-bit
+        # one whose first bit is 0 or 8 of a word never straddles: one.
+        self.assertEqual(run(5, [0]), [])
+        (window,) = run(6, [0], clamp=383)
+        self.assertEqual(window.count, 1)
+        # Two codes 48 bits apart, as an M4's lane holds them, from any even
+        # bit of a word: five words.
+        m4 = {"_mrl0": Fact(1, 0, 7)}
+        self.assertEqual(run(6, [0, 48], clamp=383, **m4), [])
 
 
 if __name__ == "__main__":

@@ -205,36 +205,89 @@ def affine_mm(
     return out
 
 
+@helion.kernel(backend="metal", static_shapes=True)
+def affine_mm_f16(
+    x: torch.Tensor, w: torch.Tensor, scales: torch.Tensor, biases: torch.Tensor
+) -> torch.Tensor:
+    """:func:`affine_mm` with the dequantized weight rounded to x's dtype, so
+    the product runs on x as it is, a 16-bit device view beside the weight:
+    MLX's quantized matmul over many rows on an M5.  The codes may be packed
+    in 8-bit words too, and a row of w may hold one word past its codes,
+    which a code's next word then reads unclamped (:func:`affine_args`)."""
+    m, k = x.size()
+    n, kw = w.size()
+    word = 8 * w.element_size()
+    padded = word * kw % k != 0
+    bits = word * (kw - padded) // k
+    group = k // scales.size(1)
+    mask = (1 << bits) - 1
+    ones = (1 << word) - 1
+    out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+    for tile_m, tile_n in hl.tile([m, n]):
+        acc = hl.zeros([tile_m, tile_n], dtype=F32)
+        for tile_k in hl.tile(k):
+            bit = tile_k.index * bits
+            lo = w[tile_n, bit // word].to(torch.int32) & ones
+            if word % bits == 0:
+                q = (lo >> (bit % word)[None, :]) & mask
+            else:
+                if padded:
+                    nxt = bit // word + 1
+                else:
+                    nxt = torch.clamp(bit // word + 1, max=kw - 1)
+                hi = w[tile_n, nxt].to(torch.int32) & ones
+                q = ((lo | (hi << word)) >> (bit % word)[None, :]) & mask
+            grp = tile_k.index // group
+            deq = q.to(F32) * scales[tile_n, grp].to(F32) + biases[tile_n, grp].to(F32)
+            acc = torch.addmm(acc, x[tile_m, tile_k], deq.to(x.dtype).T)
+        out[tile_m, tile_n] = acc.to(x.dtype)
+    return out
+
+
 def affine_args(
-    bits: int, group: int, m: int, n: int, k: int, device: str = "cpu"
+    bits: int,
+    group: int,
+    m: int,
+    n: int,
+    k: int,
+    device: str = "cpu",
+    words: torch.dtype = torch.int16,
+    padded: bool = False,
 ) -> tuple[torch.Tensor, ...]:
-    """Arguments of :func:`affine_mm`: random fp16 rows, codes, scales and
-    biases."""
+    """Arguments of :func:`affine_mm`: random fp16 rows, codes packed in
+    ``words`` (``torch.int16`` or, for :func:`affine_mm_f16`, ``torch.uint8``),
+    one word more a row if ``padded``, and scales and biases."""
     gen = torch.Generator().manual_seed(bits * 1000 + m)
     x = torch.randn(m, k, generator=gen).to(torch.float16)
+    word = 8 * words.itemsize
+    low, high = (0, 256) if words == torch.uint8 else (-(2**15), 2**15)
     w = torch.randint(
-        -(2**15), 2**15, (n, k * bits // 16), generator=gen, dtype=torch.int16
+        low, high, (n, k * bits // word + padded), generator=gen, dtype=words
     )
     scales = (torch.rand(n, k // group, generator=gen) * 0.02).to(torch.float16)
     biases = (torch.randn(n, k // group, generator=gen) * 0.02).to(torch.float16)
     return tuple(t.to(device) for t in (x, w, scales, biases))
 
 
-def affine_reference(args: tuple[torch.Tensor, ...]) -> torch.Tensor:
-    """:func:`affine_mm` in float64 on the CPU."""
+def affine_reference(
+    args: tuple[torch.Tensor, ...], weight: torch.dtype = torch.float64
+) -> torch.Tensor:
+    """:func:`affine_mm` in float64 on the CPU, the dequantized weight rounded
+    to ``weight`` first (:func:`affine_mm_f16`'s ``torch.float16``)."""
     x, w, scales, biases = (t.cpu() for t in args)
     n, kw = w.shape
     k = x.size(1)
-    bits = 16 * kw // k
+    word = 8 * w.element_size()
+    bits = word * (kw - (word * kw % k != 0)) // k
     group = k // scales.size(1)
-    words = w.to(torch.int64) & 0xFFFF
+    words = w.to(torch.int64) & ((1 << word) - 1)
     bit = torch.arange(k) * bits
-    lo = words[:, bit // 16]
-    hi = words[:, torch.clamp(bit // 16 + 1, max=kw - 1)]
-    codes = ((lo | (hi << 16)) >> (bit % 16)) & ((1 << bits) - 1)
+    lo = words[:, bit // word]
+    hi = words[:, torch.clamp(bit // word + 1, max=kw - 1)]
+    codes = ((lo | (hi << word)) >> (bit % word)) & ((1 << bits) - 1)
     grp = torch.arange(k) // group
     deq = codes.double() * scales.double()[:, grp] + biases.double()[:, grp]
-    return x.double() @ deq.T
+    return x.double() @ deq.to(weight).double().T
 
 
 def fragment_transposed(msl: str) -> bool:

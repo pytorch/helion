@@ -31,6 +31,9 @@ loop.
 Which elements a lane holds is the op's layout, probed on the GPU that runs
 the kernel and factored into lane bases plus constants (``coop_layout``),
 so each element's index arithmetic folds as a fragment element's does.
+Packed codes that straddle words where the fold can't place them (5- and
+6-bit codes at an M5 lane's 4 adjacent K positions) are read a lane's run
+at a time, from one window of words (``bit_windows``).
 
 An activation widened from a 16-bit load (``x.to(float32)``) beside a
 register operand is read as a device view of the 16-bit tensor when that
@@ -75,6 +78,11 @@ from ._constants import MAX_THREADS_PER_THREADGROUP
 from ._constants import SIMD_WIDTH
 from .affine_fold import Fact
 from .backend import static_extent
+from .bit_windows import find_codes
+from .bit_windows import plan_windows
+from .bit_windows import rewrite
+from .bit_windows import window_code
+from .bit_windows import window_lines
 from .coop_layout import INVALID
 from .coop_layout import Atom
 from .coop_layout import base_fact
@@ -141,6 +149,7 @@ if TYPE_CHECKING:
     from .coop_layout import Coords
     from .mpp_matmul import View
     from .msl_ast_walker import EmitState
+    from .operand_elements import ElementBody
 
 #: The lane's index in its SIMD group, a kernel parameter of a kernel with
 #: register operands (``metal_jit``).
@@ -874,7 +883,7 @@ def codegen_register_run(
     whether they relabel K, ``k_live`` the tile's live length, which masks
     a register operand's K tail and cuts a view's last steps (None when
     every tile is whole), ``facts`` the tile offsets' ``(offset, multiple,
-    least)``, ``k_split`` the K loop's offset and the SIMD groups that split
+    least, most)``, ``k_split`` the K loop's offset and the SIMD groups that split
     the loop (:func:`register_split`), None for one, and ``affine`` the
     split's codes, scale and bias names."""
     backend = CompileEnvironment.current().backend
@@ -1316,10 +1325,10 @@ def emit_register_run(
     ) and _relabels(state, atom)
     affine = keyword(call, "affine") is not None
     facts = dict(state.lane_facts)
-    for name, multiple, least in ast.literal_eval(
+    for name, multiple, least, most in ast.literal_eval(
         cast("ast.expr", keyword(call, "facts"))
     ):
-        facts[name] = Fact(multiple, least)
+        facts[name] = Fact(multiple, least, most)
     loops = {
         call_name(loop.iter): loop for loop in stmt.body if isinstance(loop, ast.For)
     }
@@ -1405,6 +1414,7 @@ def emit_register_run(
                     f"{inner}    constexpr short _fs = {step};",
                 ]
                 state.put_type = (atom.left, atom.right)[i]
+                elements: list[tuple[tuple[str, str], ElementBody]] = []
                 for e in range(len(lanes.rows)):
                     row, col = lanes.rows[e], lanes.cols[e]
                     k_coord = col if i == 0 else row
@@ -1416,10 +1426,24 @@ def emit_register_run(
                         decls = (f"_e_m = {_at(0, row)}", f"_e_k = {k_pos}")
                     else:
                         decls = (f"_e_k = {k_pos}", f"_e_n = {_at(0, col)}")
+                    elements.append(
+                        (decls, element_body(loop, decls, step, e, facts, 0, state))
+                    )
+                bodies = [body for _, (body, _, _) in elements]
+                if lanes.valid is None:
+                    # A window loads each run of packed codes once, before any
+                    # element; with invalid elements a lane holds, the
+                    # elements keep their own loads, which they skip.
+                    bodies, loads = _code_windows(
+                        [element for _, element in elements], state, to_msl
+                    )
+                    lines += [f"{inner}    {line}" for line in loads]
+                for e, ((decls, _), body) in enumerate(
+                    zip(elements, bodies, strict=True)
+                ):
                     state.put = f"{step_names[i]}[{e}]"
                     el = inner + "    "
                     element = [f"{el}{{", *(f"{el}    int {decl};" for decl in decls)]
-                    body, _, _ = element_body(loop, decls, step, e, facts, 0, state)
                     if lanes.valid is not None:
                         element.append(f"{el}    if ({lanes.valid[e]}) {{")
                         with state.isolated_scope():
@@ -1519,6 +1543,42 @@ def emit_register_run(
             parts += element
         parts.append(f"{' ' * indent}}}")
     state.put, state.put_type = saved
+
+
+def _code_windows(
+    elements: list[ElementBody], state: EmitState, to_msl: Callable[[ast.expr], str]
+) -> tuple[list[list[ast.stmt]], list[str]]:
+    """Each of a step's elements' statements with the packed codes it reads
+    from a window of words instead (``bit_windows``), and the MSL that loads
+    the windows.  On an M5 Max the 6-bit 6656 x 19968 projection (half
+    dequant) at 32 rows on [32, 32, 128] split over 8 SIMD groups took 281
+    us so, 465 us with each element's two loads, division and remainder."""
+    codes = [
+        find_codes(body, env, facts, state.tensor_types)
+        for body, env, facts in elements
+    ]
+    bodies = [body for body, _, _ in elements]
+    if not any(codes):
+        return bodies, []
+    facts: dict[str, Fact] = {}
+    for _, _, element_facts in elements:
+        facts.update(element_facts)
+
+    def name() -> str:
+        state.window_count += 1
+        return f"_mbw{state.window_count - 1}"
+
+    lines: list[str] = []
+    replaced: list[dict[str, ast.expr]] = [{} for _ in elements]
+    for window in plan_windows(codes, facts, name):
+        state.device_views.add(window.first.tensor)
+        lines += window_lines(window, to_msl)
+        for e, code, offset in window.members:
+            replaced[e][code] = window_code(window, offset)
+    return [
+        rewrite(body, codes) if codes else body
+        for body, codes in zip(bodies, replaced, strict=True)
+    ], lines
 
 
 def grid_origins(

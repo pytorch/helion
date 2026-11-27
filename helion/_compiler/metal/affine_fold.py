@@ -83,7 +83,7 @@ class Affine:
         return int(self.const)
 
 
-def _range(
+def value_range(
     value: Affine, facts: Mapping[str, Fact]
 ) -> tuple[Fraction | None, Fraction | None]:
     """The least and greatest ``value`` takes, exactly (None: unbounded)."""
@@ -115,7 +115,7 @@ def floor_divide(value: Affine, divisor: int, facts: dict[str, Fact]) -> Affine 
             (name, coeff)
         )
     base = Affine(Fraction(0), tuple(whole)).scale(Fraction(1, divisor))
-    lo, hi = _range(Affine(value.const, tuple(rest)), facts)
+    lo, hi = value_range(Affine(value.const, tuple(rest)), facts)
     if lo is not None and hi is not None:
         quotient = math.floor(lo / divisor)
         if math.floor(hi / divisor) == quotient:
@@ -129,7 +129,7 @@ def floor_divide(value: Affine, divisor: int, facts: dict[str, Fact]) -> Affine 
     if divisor % g:
         return None
     inner = Affine(Fraction(kept), tuple(rest))
-    lo, hi = _range(inner, facts)
+    lo, hi = value_range(inner, facts)
     if lo is None or lo < 0:
         return None
     quotient_of = ast.BinOp(render(inner), ast.Div(), ast.Constant(divisor))
@@ -152,8 +152,8 @@ def remainder(value: Affine, divisor: int, facts: dict[str, Fact]) -> Affine | N
 
 
 #: Calls the walker prints as floor division and remainder.
-_FLOOR_DIVIDE = "c10.metal.floor_divide"
-_REMAINDER = "c10.metal.remainder"
+FLOOR_DIVIDE = "c10.metal.floor_divide"
+REMAINDER = "c10.metal.remainder"
 
 
 def _callee(node: ast.AST) -> str | None:
@@ -174,7 +174,7 @@ class _Evaluator:
         self.signed_names: set[str] = set()
 
     def nonnegative(self, value: Affine) -> bool:
-        lo = _range(value, self.facts)[0]
+        lo = value_range(value, self.facts)[0]
         return lo is not None and lo >= 0
 
     def __call__(self, node: ast.AST) -> Affine | None:
@@ -216,13 +216,13 @@ class _Evaluator:
             # stays signed: :func:`fold` renders it as an int.
             self.signed = True
             return self(node.args[1])
-        if name in (_FLOOR_DIVIDE, _REMAINDER):
+        if name in (FLOOR_DIVIDE, REMAINDER):
             assert isinstance(node, ast.Call)
             value, divisor = (self(a) for a in node.args)
             d = None if divisor is None else divisor.constant
             if value is None or d is None or d <= 0:
                 return None
-            fold = floor_divide if name == _FLOOR_DIVIDE else remainder
+            fold = floor_divide if name == FLOOR_DIVIDE else remainder
             return fold(value, d, self.facts)
         return None
 
@@ -264,7 +264,7 @@ def _divides(node: ast.AST) -> bool:
     return any(
         isinstance(n, ast.BinOp)
         and isinstance(n.op, (ast.Div, ast.FloorDiv, ast.Mod))
-        or _callee(n) in (_FLOOR_DIVIDE, _REMAINDER)
+        or _callee(n) in (FLOOR_DIVIDE, REMAINDER)
         for n in ast.walk(node)
     )
 

@@ -290,6 +290,12 @@ def _every_loop_shares_a_load(stmts: list[ast.stmt], dependent: set[str]) -> boo
     return bool(loops) and all(any(map(shares, loop.body)) for loop in loops)
 
 
+#: The select a masked load becomes when it loads unconditionally
+#: (``msl_ast_walker.select_masked_loads``): ``_helion_masked(load, mask,
+#: other)``.
+MASKED_LOAD = "_helion_masked"
+
+
 def tl_load(node: ast.AST) -> ast.Call | None:
     """*node* if it is a ``tl.load`` call: a read of device memory."""
     if (

@@ -265,11 +265,16 @@ def tiles_in_range(cg: GenerateAST, block: int, op: int, extent: int | None) -> 
     if loop is None or extent is None:
         return False
     info, begin, step = loop
-    end = static_int(info.end_expr)
+    last = last_tile(begin, static_int(info.end_expr), step)
+    return last is not None and last + op <= extent
+
+
+def last_tile(begin: int, end: int | None, step: int) -> int | None:
+    """The offset of a loop's last tile from ``begin`` to ``end`` by ``step``,
+    or None when its end isn't known or it runs no tile."""
     if end is None or end <= begin:
-        return False
-    last = begin + (end - begin - 1) // step * step
-    return last + op <= extent
+        return None
+    return begin + (end - begin - 1) // step * step
 
 
 def tile_mask(cg: GenerateAST, block: int) -> tuple[str, str, str] | None:
@@ -282,15 +287,17 @@ def tile_mask(cg: GenerateAST, block: int) -> tuple[str, str, str] | None:
     return mask, cg.index_var(block), cg.offset_var(block)
 
 
-def offset_fact(cg: GenerateAST, block: int) -> tuple[str, int, int] | None:
-    """``(offset, multiple, least)`` of the loop over ``block`` when its
-    begin is known: each tile's offset is the begin plus a multiple of the
-    block size."""
+def offset_fact(cg: GenerateAST, block: int) -> tuple[str, int, int, int | None] | None:
+    """``(offset, multiple, least, most)`` of the loop over ``block`` when
+    its begin is known: each tile's offset is the begin plus a multiple of
+    the block size, at most the last tile's when the loop's end is known at
+    codegen (else None)."""
     loop = static_loop(cg, block)
     if loop is None or loop[1] < 0:
         return None
-    _, begin, step = loop
-    return cg.offset_var(block), math.gcd(step, begin), begin
+    info, begin, step = loop
+    most = last_tile(begin, static_int(info.end_expr), step)
+    return cg.offset_var(block), math.gcd(step, begin), begin, most
 
 
 def keyword(call: ast.Call, name: str) -> ast.expr | None:
