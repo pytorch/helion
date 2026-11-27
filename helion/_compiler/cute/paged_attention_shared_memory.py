@@ -89,6 +89,86 @@ MMA_DAG_VALUE_RING_CHOICES: tuple[int, ...] = (PAIRED_DEFAULT_VALUE_RING, 3)
 MMA_DAG_VALUE_RING_TILES_KEY = "cute_mma_dag_value_ring_tiles"
 MMA_DAG_VALUE_RING_TILES_CHOICES: tuple[int, ...] = (0, 5)
 
+# ``cute_mma_dag_partition_look``: which threads of a balanced CTA look at
+# the counter of the split unit it runs the lowest part of. That part runs
+# the unit's last steps as the CTA's last pages, and merges the unit if
+# every other part has arrived (``_paged_attention_partition``). With
+# ``group``, the default and the meaning of a missing key, one thread of the
+# compute group looks once the part's pages are done: the look, and for a
+# unit in two parts the loads of the other part's row statistics, stand
+# between the CTA's last page and its exit. With ``spare`` the group asks
+# the CTA's spare warp when that part starts. The warp, behind the posts it
+# arrives for, looks once (the same relaxed load; the fence and the reset if
+# every other part has arrived), stages the other part's row statistics of
+# a unit in two parts in shared memory (``PARTITION_LOOK_STAGE``: a
+# maximum and a denominator per row and head) and writes the decision into
+# the group's record: the part's role, this CTA as the unit's lowest and
+# the unit's parts. The group meets the warp behind the part's pages at the
+# first barrier of the part's reduction, and its threads read the role and
+# the staged pairs behind that meeting: no thread of the group decides for
+# that part. The decision is the one a thread of the group makes under
+# ``group``, at an earlier time: merge if every other part had arrived,
+# else publish and arrive, and the last arrival merges. Whichever part
+# merges folds the parts in source order, so the bits are the same on every
+# launch and with either value, and nobody waits for another CTA.
+#
+# For that complete unit in two parts the warp also stages the other part's
+# panel, in the raw K ring (``PARTITION_LOOK_KEYS_CONVERTED`` below): the
+# group reads its own panel with one load and folds the other part's values
+# from shared memory, with the fold's operations in their order.
+#
+# Under ``spare`` the group's conditions around the exchange (a range that
+# closes its unit, the lowest part, the meeting) pass through
+# ``make_warp_uniform``: each is one value for the group.
+#
+# Whether the look gains is the bind's: it gains at some grids and
+# positions and loses at others. (The measurements: this package's
+# README.md, under "Special-purpose emitters", where it describes
+# ``cute_mma_dag_partition_look``.) So no default selects it and it must
+# not become one: a search times it per bind, on the balanced partition of
+# a grid of more units than SMs.
+MMA_DAG_PARTITION_LOOK_KEY = "cute_mma_dag_partition_look"
+MMA_DAG_PARTITION_LOOK_GROUP = "group"
+MMA_DAG_PARTITION_LOOK_SPARE = "spare"
+MMA_DAG_PARTITION_LOOK_CHOICES: tuple[str, ...] = (
+    MMA_DAG_PARTITION_LOOK_GROUP,
+    MMA_DAG_PARTITION_LOOK_SPARE,
+)
+# What the spare warp of that look stages for the two compute groups: per
+# head and row, the maximum and the denominator of the other part of a unit
+# in two parts.
+PARTITION_LOOK_STAGE = "look_stage"
+# That warp also stages the other part's panel for the pair's fold, in the
+# raw K ring: a CTA's lowest part is its last range, so once the stream's
+# last K tile is converted the ring holds nothing anyone reads. One raw
+# tile a head, the ring's position behind the stream's last step, takes the
+# panel's leading columns (``partition_look_panel_columns``). The stage is
+# no row of the table and
+# its two barriers lie in the padding of the barrier block
+# (``pipeline_barrier_plan``): it adds no byte. The K conversion warps
+# arrive at the first when each has converted its share of the stream's
+# last K tile, and the copies complete on the second.
+PARTITION_LOOK_KEYS_CONVERTED = "keys_converted"
+PARTITION_LOOK_PANEL_STAGED = "panel_staged"
+# A quad of panel columns for the group's 128 threads, 16 bytes a thread
+# (four Float32), as the workspace holds it
+# (``_paged_attention_partition.store_part``).
+PANEL_QUAD_BYTES = 128 * 16
+
+
+def partition_look_stage_words(query_columns: int) -> int:
+    """Float32 words the spare warp's look stages: a (maximum, denominator)
+    pair per row of both heads."""
+    return 2 * 2 * query_columns
+
+
+def partition_look_panel_columns(query_columns: int) -> int:
+    """The leading columns of the other part's panel that the spare warp's
+    look stages in one raw K tile a head: whole quads of columns, 2,048
+    bytes each for the group's 128 threads, so 32 of 40 columns and every
+    column of a narrower panel."""
+    return min(query_columns, 4 * (RAW_TILE_BYTES // PANEL_QUAD_BYTES))
+
 
 class ValueRingTiles(NamedTuple):
     """A raw V ring counted in tiles, where every function of this module
@@ -147,6 +227,7 @@ def pipeline_barriers(
     prefetch_signal: bool = False,
     value_ring: ValueRing = PAIRED_DEFAULT_VALUE_RING,
     page_order: bool = False,
+    partition_look: bool = False,
 ) -> tuple[tuple[str, int, int], ...]:
     """The pipeline barriers in block order, as ``(name, width, arrivals)``.
 
@@ -160,7 +241,11 @@ def pipeline_barriers(
     initializes. A boundary prefetch that waits for the loader's last
     request adds the barrier of that one arrival, and a bucketed page order
     the barrier at which every lane of the sorting warp arrives for the
-    loader.
+    loader. A balanced partition whose spare warp looks for a unit's lowest
+    part (``partition_look``) adds the two barriers of the panel that warp
+    stages in the raw K ring: one at which each of the four K conversion
+    warps arrives once, behind its share of the stream's last K tile, and
+    one on which the copies into the ring complete.
     """
     ring_tiles = value_ring_tile_count(value_ring)
     assert ring_tiles >= 2 * PAIRED_DEFAULT_VALUE_RING
@@ -197,6 +282,13 @@ def pipeline_barriers(
         barriers += (("prefetch_signal", 1, 1),)
     if page_order:
         barriers += (("page_order_ready", 1, 32),)
+    # Only a balanced partition, which is persistent, has that look.
+    assert query_stages or not partition_look
+    if partition_look:
+        barriers += (
+            (PARTITION_LOOK_KEYS_CONVERTED, 1, 4),
+            (PARTITION_LOOK_PANEL_STAGED, 1, 1),
+        )
     return barriers
 
 
@@ -206,6 +298,7 @@ def pipeline_barrier_plan(
     prefetch_signal: bool = False,
     value_ring: ValueRing = PAIRED_DEFAULT_VALUE_RING,
     page_order: bool = False,
+    partition_look: bool = False,
 ) -> tuple[dict[str, int], int, tuple[tuple[tuple[int, int], ...], ...]]:
     """Where each pipeline barrier lies and how the block is initialized.
 
@@ -214,15 +307,31 @@ def pipeline_barrier_plan(
     whole rounds of 32 so that every lane of the initializing warp executes
     each round's instruction and the rounds never diverge. A round holds the
     arrival counts of its 32 slots as ``(count - 1, signed lane mask)`` terms.
+
+    The two barriers of the spare warp's look (``partition_look``) take
+    slots of that padding: a persistent partition's query barriers open the
+    block's second round, which no ring fills, so the block of a body with
+    the look is as long as the block of the same body without it, which is
+    the one the body's table counts (``pipeline_shared_memory``).
     """
     offsets: dict[str, int] = {}
     counts: list[int] = []
     for name, width, arrivals in pipeline_barriers(
-        value_metadata, query_stages, prefetch_signal, value_ring, page_order
+        value_metadata,
+        query_stages,
+        prefetch_signal,
+        value_ring,
+        page_order,
+        partition_look,
     ):
         offsets[name] = len(counts)
         counts += [arrivals] * width
     counts += [1] * (-len(counts) % 32)
+    if partition_look:
+        _offsets, table_count, _rounds = pipeline_barrier_plan(
+            value_metadata, query_stages, prefetch_signal, value_ring, page_order
+        )
+        assert len(counts) == table_count
     rounds = []
     for start in range(0, len(counts), 32):
         terms = []
@@ -259,7 +368,11 @@ def pipeline_shared_memory(
     scanning thread and one per warp), the plan and, where the scan keeps
     them, the scanned lengths. The balanced partition has longer walk
     records and a longer plan, and adds what each compute group posts to
-    the spare warp. A boundary prefetch that waits for the loader's last
+    the spare warp, and where that warp looks for a unit's lowest part
+    (``cute_mma_dag_partition_look="spare"``) the row statistics it stages
+    for them; the other part's panel it stages lies in the raw K ring and
+    that stage's two barriers in the block's padding, so neither is an
+    entry. A boundary prefetch that waits for the loader's last
     request (``prefetch_signal``) has the barrier of that arrival in the
     block, a deeper V ring four more ring barriers and a bucketed page order
     (``page_order``) the barrier of its handoff: each takes the block past
@@ -302,6 +415,14 @@ def pipeline_shared_memory(
             guard="persistent",
         ),
         SharedArray("mail_raw", "Int32", 4, 2 * MAIL_WORDS, 4, guard="balanced"),
+        SharedArray(
+            PARTITION_LOOK_STAGE,
+            "Float32",
+            4,
+            partition_look_stage_words(query_columns),
+            16,
+            guard="partition_look",
+        ),
         SharedArray("plan_prefix", "Int32", 4, scanning, 4, guard="persistent"),
         SharedArray("plan_totals", "Int32", 4, 32, 4, guard="persistent"),
         SharedArray(
@@ -337,6 +458,7 @@ def pipeline_parts(
     scanned_bounds: bool = False,
     balanced: bool = False,
     page_order: bool = False,
+    partition_look: bool = False,
 ) -> frozenset[str]:
     """The optional parts of a body, as ``SharedArray.guard`` names them.
 
@@ -346,10 +468,12 @@ def pipeline_parts(
     loaded where a thread scans one unit and the prelude has the twin that
     takes a scanned length (``scanned_bounds``). ``balanced``: the
     persistent partition that splits units. ``page_order``: a one-unit
-    body that streams its pages in bucketed order.
+    body that streams its pages in bucketed order. ``partition_look``: a
+    balanced body whose spare warp looks for a unit's lowest part.
     """
     persistent = units > 0
     assert persistent or not balanced
+    assert balanced or not partition_look
     assert not (page_order and (persistent or value_metadata))
     return frozenset(
         name
@@ -363,6 +487,7 @@ def pipeline_parts(
                 persistent and scanned_bounds and plan_geometry(units)[0] == 1,
             ),
             ("page_order", page_order),
+            ("partition_look", partition_look),
         )
         if present
     )
@@ -395,6 +520,7 @@ def paired_shared_memory_bytes(
     scanned_bounds: bool = False,
     prefetch_signal: bool = False,
     page_order: bool = False,
+    partition_look: bool = False,
 ) -> int:
     """Bytes of shared memory one CTA of the paired body occupies, for the
     arguments its table and its optional parts take."""
@@ -410,7 +536,13 @@ def paired_shared_memory_bytes(
             page_order,
         ),
         pipeline_parts(
-            query_map, value_metadata, units, scanned_bounds, balanced, page_order
+            query_map,
+            value_metadata,
+            units,
+            scanned_bounds,
+            balanced,
+            page_order,
+            partition_look,
         ),
     )
 
@@ -486,5 +618,46 @@ def value_ring_reason(
         return (
             f"a raw V ring of {described} needs {needed} bytes "
             f"of shared memory per CTA{stages} and the device grants {capacity}"
+        )
+    return None
+
+
+def partition_look_reason(
+    capacity: int,
+    query_columns: int,
+    *,
+    query_stages: int,
+    units: int,
+    value_ring: ValueRing = PAIRED_DEFAULT_VALUE_RING,
+) -> str | None:
+    """Why a balanced CTA cannot stage what its spare warp's look leaves the
+    compute groups (``cute_mma_dag_partition_look="spare"``) on a device
+    that grants one CTA ``capacity`` bytes of shared memory, or None.
+
+    The stage is a row of the body's table, ``partition_look_stage_words``
+    Float32 words. The table is replayed with it for a balanced CTA of
+    ``units`` units and ``query_stages`` query stages whose raw V ring is
+    ``value_ring``, and with the scanned lengths, which a body has or not by
+    its prelude: a look admitted here fits either way. A capacity of zero
+    is an unknown one (a render without a device), which admits the look as
+    it admits the schedule.
+    """
+    assert units > 0 and query_stages > 0
+    needed = paired_shared_memory_bytes(
+        query_columns,
+        value_ring=value_ring,
+        query_stages=query_stages,
+        units=units,
+        balanced=True,
+        scanned_bounds=True,
+        partition_look=True,
+    )
+    if capacity and needed > capacity:
+        stage = 4 * partition_look_stage_words(query_columns)
+        return (
+            f"the spare warp's look stages {stage} bytes of row statistics: "
+            f"its CTA needs {needed} bytes of shared memory with "
+            f"{query_stages} query stage{'s' if query_stages != 1 else ''} "
+            f"and the device grants {capacity}"
         )
     return None

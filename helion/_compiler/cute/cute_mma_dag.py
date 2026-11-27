@@ -92,6 +92,9 @@ from .paged_attention_registers import MMA_DAG_REGISTER_QUOTAS_CHOICES
 from .paged_attention_registers import MMA_DAG_REGISTER_QUOTAS_DEFAULT
 from .paged_attention_registers import MMA_DAG_REGISTER_QUOTAS_KEY
 from .paged_attention_release import MMA_DAG_RELEASE_LEAD_DEFAULT
+from .paged_attention_shared_memory import MMA_DAG_PARTITION_LOOK_CHOICES
+from .paged_attention_shared_memory import MMA_DAG_PARTITION_LOOK_GROUP
+from .paged_attention_shared_memory import MMA_DAG_PARTITION_LOOK_KEY
 from .paged_attention_shared_memory import MMA_DAG_VALUE_RING_CHOICES
 from .paged_attention_shared_memory import MMA_DAG_VALUE_RING_KEY
 from .paged_attention_shared_memory import MMA_DAG_VALUE_RING_TILES_CHOICES
@@ -99,6 +102,7 @@ from .paged_attention_shared_memory import MMA_DAG_VALUE_RING_TILES_KEY
 from .paged_attention_shared_memory import PAIRED_DEFAULT_VALUE_RING
 from .paged_attention_shared_memory import ValueRing
 from .paged_attention_shared_memory import ValueRingTiles
+from .paged_attention_shared_memory import partition_look_reason
 from .paged_attention_shared_memory import value_ring_reason
 
 if TYPE_CHECKING:
@@ -745,6 +749,113 @@ def paged_attention_value_ring_fit(
     )
 
 
+def paged_attention_partition_look_facts(
+    attention: PagedAttentionScheduleFacts | None,
+    pass_warps: object,
+    value_metadata_skip: object = False,
+    partition: object = MMA_DAG_PARTITION_ITEM,
+) -> PagedAttentionScheduleFacts | None:
+    """The bind's attention facts where a config's schedule, partition and
+    grid have a spare warp that can look for a unit's lowest part, else
+    None: the paired schedule on the balanced partition, the only one that
+    splits units, of a grid known to hold more units than the device has
+    SMs (``PagedAttentionScheduleFacts.past_one_wave_units``), where the
+    look was measured. The choices and the config contract's reason both
+    ask here.
+    """
+    paired = paged_attention_paired_facts(attention, pass_warps, value_metadata_skip)
+    if (
+        paired is None
+        or partition != MMA_DAG_PARTITION_BALANCED
+        or partition not in paired.partition_choices
+        or not paired.past_one_wave_units
+    ):
+        return None
+    return paired
+
+
+def paged_attention_partition_look_choices(
+    attention: PagedAttentionScheduleFacts | None,
+    pass_warps: object,
+    value_metadata_skip: object = False,
+    partition: object = MMA_DAG_PARTITION_ITEM,
+    value_ring: object = PAIRED_DEFAULT_VALUE_RING,
+    value_ring_tiles: object = 0,
+) -> tuple[str, ...]:
+    """Which threads of a balanced CTA may look at the counter of the split
+    unit it runs the lowest part of (``cute_mma_dag_partition_look``), the
+    compute group, which every kernel has, first.
+
+    The spare warp's look is the balanced partition's on a grid of more
+    units than SMs (``paged_attention_partition_look_facts``), and what the
+    warp stages for the groups must fit the device beside the config's raw
+    V ring (``paged_attention_partition_look_fit``). Normalization, the
+    config contract and the planner take the choices from here.
+    """
+    choices, _fit = paged_attention_partition_look_offer(
+        attention,
+        pass_warps,
+        value_metadata_skip,
+        partition,
+        value_ring,
+        value_ring_tiles,
+    )
+    return choices
+
+
+def paged_attention_partition_look_offer(
+    attention: PagedAttentionScheduleFacts | None,
+    pass_warps: object,
+    value_metadata_skip: object = False,
+    partition: object = MMA_DAG_PARTITION_ITEM,
+    value_ring: object = PAIRED_DEFAULT_VALUE_RING,
+    value_ring_tiles: object = 0,
+) -> tuple[tuple[str, ...], str | None]:
+    """``paged_attention_partition_look_choices`` and, where the partition
+    and the grid have the spare warp's look and only the device refuses
+    it, why its CTA does not hold the stage beside the config's raw V
+    ring: the look's facts and its fit, computed once for the choices and
+    for the reason the config contract gives.
+    """
+    looked = paged_attention_partition_look_facts(
+        attention, pass_warps, value_metadata_skip, partition
+    )
+    if looked is None:
+        return (MMA_DAG_PARTITION_LOOK_GROUP,), None
+    fit = paged_attention_partition_look_fit(looked, value_ring, value_ring_tiles)
+    if fit is not None:
+        return (MMA_DAG_PARTITION_LOOK_GROUP,), fit
+    return MMA_DAG_PARTITION_LOOK_CHOICES, None
+
+
+def paged_attention_partition_look_fit(
+    attention: PagedAttentionScheduleFacts,
+    value_ring: object = PAIRED_DEFAULT_VALUE_RING,
+    value_ring_tiles: object = 0,
+) -> str | None:
+    """Why a balanced CTA of the bind cannot stage what its spare warp's
+    look leaves the compute groups, beside a raw V ring of ``value_ring``
+    pages per head or ``value_ring_tiles`` tiles, or None
+    (``paged_attention_shared_memory.partition_look_reason``). A ring the
+    option does not have counts as the default's: its own rule refuses the
+    config."""
+    ring: ValueRing = PAIRED_DEFAULT_VALUE_RING
+    if (
+        type(value_ring_tiles) is int
+        and value_ring_tiles in (MMA_DAG_VALUE_RING_TILES_CHOICES[1:])
+    ):
+        ring = ValueRingTiles(value_ring_tiles)
+    elif type(value_ring) is int and value_ring in MMA_DAG_VALUE_RING_CHOICES:
+        ring = value_ring
+    return partition_look_reason(
+        attention.smem_capacity,
+        attention.query_columns,
+        query_stages=attention.partition_q_stages,
+        units=attention.partition_units,
+        value_ring=ring,
+    )
+
+
 def paged_attention_page_order_facts(
     attention: PagedAttentionScheduleFacts | None,
     pass_warps: object,
@@ -1057,6 +1168,7 @@ MMA_DAG_KEYS: tuple[str, ...] = (
     MMA_DAG_VALUE_RING_TILES_KEY,
     MMA_DAG_PAGE_ORDER_KEY,
     MMA_DAG_CLIPPED_PAGE_LEAD_KEY,
+    MMA_DAG_PARTITION_LOOK_KEY,
     MMA_DAG_LOADS_KEY,
     MMA_DAG_AUX_KEY,
     MMA_DAG_PERSISTENT_KEY,

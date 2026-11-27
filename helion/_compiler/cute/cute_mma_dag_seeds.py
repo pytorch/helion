@@ -93,6 +93,7 @@ from .cute_mma_dag import mma_dag_seed_configs
 from .cute_mma_dag import mma_dag_seed_variants
 from .cute_mma_dag import paged_attention_key_clip_choices
 from .cute_mma_dag import paged_attention_page_order_choices
+from .cute_mma_dag import paged_attention_partition_look_choices
 from .cute_mma_dag import paged_attention_pass_warp_choices
 from .cute_mma_dag import paged_attention_probability_choices
 from .cute_mma_dag import paged_attention_register_quota_choices
@@ -110,8 +111,11 @@ from .paged_attention_page_order import MMA_DAG_PAGE_ORDER_KEY
 from .paged_attention_page_order import MMA_DAG_PAGE_ORDER_REVERSED
 from .paged_attention_page_order import PAGE_ORDER_HEAD
 from .paged_attention_registers import MMA_DAG_REGISTER_QUOTAS_KEY
+from .paged_attention_shared_memory import MMA_DAG_PARTITION_LOOK_KEY
+from .paged_attention_shared_memory import MMA_DAG_PARTITION_LOOK_SPARE
 from .paged_attention_shared_memory import MMA_DAG_VALUE_RING_KEY
 from .paged_attention_shared_memory import MMA_DAG_VALUE_RING_TILES_KEY
+from .paged_attention_shared_memory import PAIRED_DEFAULT_VALUE_RING
 from .pdl_release import CUTE_PDL_CAPTURE_DEFAULT
 from .pdl_release import CUTE_PDL_RELEASE_DEFAULT
 from .pdl_release import capture_policy_available
@@ -808,6 +812,7 @@ class MmaDagSeedPlanner:
         store_policy_seeds: list[Config] = []
         cold_prefetch_seeds: list[Config] = []
         range_ahead_seeds: list[Config] = []
+        partition_look_seeds: list[Config] = []
         query_tma: list[Config] = []
         value_metadata: list[Config] = []
         value_metadata_policies: list[Config] = []
@@ -1414,6 +1419,48 @@ class MmaDagSeedPlanner:
                                 for form in ({}, *evict_last_form)
                                 for triple in triples
                             )
+                            if (
+                                spec.cute_mma_dag_partition_look is not None
+                                and MMA_DAG_PARTITION_LOOK_SPARE
+                                in spec.cute_mma_dag_partition_look.choices
+                            ):
+                                # Each of those seeds once more with the
+                                # spare warp's look for a unit's lowest
+                                # part. The look is the group's decision
+                                # at an earlier time and bit-identical,
+                                # and whether it gains is the bind's, so a
+                                # search times both. (The measurements:
+                                # this package's README.md, under
+                                # "Special-purpose emitters", where it
+                                # describes ``cute_mma_dag_partition_look``.)
+                                # A seed is a legal config: none where the
+                                # device does not hold the look's stage
+                                # beside the seed's own raw V ring.
+                                partition_look_seeds.extend(
+                                    Config.from_dict(
+                                        {
+                                            **triple,
+                                            **form,
+                                            MMA_DAG_PARTITION_LOOK_KEY: (
+                                                MMA_DAG_PARTITION_LOOK_SPARE
+                                            ),
+                                        }
+                                    )
+                                    for form in ({}, *evict_last_form)
+                                    for triple in triples
+                                    if MMA_DAG_PARTITION_LOOK_SPARE
+                                    in paged_attention_partition_look_choices(
+                                        attention,
+                                        pass_warps,
+                                        False,
+                                        MMA_DAG_PARTITION_BALANCED,
+                                        triple.get(
+                                            MMA_DAG_VALUE_RING_KEY,
+                                            PAIRED_DEFAULT_VALUE_RING,
+                                        ),
+                                        triple.get(MMA_DAG_VALUE_RING_TILES_KEY, 0),
+                                    )
+                                )
                         if (
                             attention.windowed
                             and spec.cute_mma_dag_boundary_prefetch_cold is not None
@@ -1653,5 +1700,8 @@ class MmaDagSeedPlanner:
         # reversed order follows with the range-ahead prefetch at each
         # distance and a ring of five tiles, and again under the store hint.
         seeds.extend(range_ahead_seeds)
+        # And in none the spare warp looks for a unit's lowest part. The
+        # range-ahead seeds follow once more with that look.
+        seeds.extend(partition_look_seeds)
         # The paired head leads; every other seed keeps its order.
         return [*paired_head, *(seed for seed in seeds if seed not in paired_head)]

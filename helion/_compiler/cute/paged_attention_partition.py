@@ -35,7 +35,11 @@ if TYPE_CHECKING:
 # scanning (609 to 640 units), is 184,504 bytes with one query stage and
 # 204,984 with two under ``whole``; the ``balanced`` partition's longer
 # records and plan and the groups' posts add 160 bytes to each (184,664 and
-# 205,144). The budgets are the next multiples of 4 KiB.
+# 205,144). The budgets are the next multiples of 4 KiB. What the spare
+# warp of a balanced CTA stages where it looks for a unit's lowest part
+# (``cute_mma_dag_partition_look``) is 648 bytes more at 40 query columns
+# (185,312 and 205,792), inside the same budgets: beside the default raw V
+# ring every device that has the balanced partition holds it.
 PARTITION_SMEM_BYTES_ONE_STAGE = 188416
 PARTITION_SMEM_BYTES_TWO_STAGES = 208896
 # The host name of the launch device's resident capacity in CTAs.

@@ -223,9 +223,21 @@ def _bits(tensor: torch.Tensor) -> torch.Tensor:
     return tensor.contiguous().view(integer).clone()
 
 
+# What the second call of the aliasing scenario runs beside the seeded
+# combination: nothing, or what the seeds of the spare warp's look add to
+# it. That look reads and resets a counter of the launch's workspace and
+# loads another part's row statistics from it, early in its CTA's life:
+# behind the launch's dependencies too.
+ALIAS_OPTIONS = {
+    "combination": {},
+    "look": {"cute_mma_dag_partition_look": "spare"},
+}
+
+
 @skipIfNotCUDA()
 @skipIfRefEager("capture dependency proof needs native CUDA graph nodes")
-def test_a_page_table_the_launch_ahead_stores_is_read_behind_its_stores():
+@pytest.mark.parametrize("options", list(ALIAS_OPTIONS))
+def test_a_page_table_the_launch_ahead_stores_is_read_behind_its_stores(options):
     """Two captured calls back to back. The first stores its output over
     the second's page table: its V pool is zero, so it stores exact zeros,
     which are the valid page id zero. In program order the second call
@@ -235,7 +247,8 @@ def test_a_page_table_the_launch_ahead_stores_is_read_behind_its_stores():
     may come ahead of the first call's stores. The capture guard sees that
     the second call loads what the first stores and has it wait at its
     entry, and every replay has the bits of the two calls run one after
-    the other.
+    the other. Under ``look`` the second call also has its spare warp look
+    for each unit's lowest part (``ALIAS_OPTIONS``).
 
     The first call runs one request a CTA on a grid of two waves and
     releases its dependents at every CTA's entry. Its first requests walk
@@ -327,11 +340,13 @@ def test_a_page_table_the_launch_ahead_stores_is_read_behind_its_stores():
             **WALK,
             KEY: 96,
             TILES: 5,
+            **ALIAS_OPTIONS[options],
         }
     )
     keywords = body_keywords(bound.to_code(combination))
     assert keywords["boundary_prefetch_ahead"] == "96"
     assert keywords["value_ring_tiles"] == "5"
+    assert ("partition_look" in keywords) is (options == "look")
     behind = bound.compile_config(combination)
     behind_plain = bound.compile_config(
         helion.Config.from_dict({**combination.config, "cute_pdl": False})

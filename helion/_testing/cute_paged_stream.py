@@ -247,6 +247,20 @@ def stream_seeds(
         return planner.configs(planner.ranked())
 
 
+def seeds_ahead_of_the_partition_look(
+    seeds: list[helion.Config],
+) -> list[helion.Config]:
+    """The seeds ahead of those whose spare warp looks for a unit's lowest
+    part, which a windowed kernel on a grid of more units than SMs has
+    behind every other seed where its search samples the boundary prefetch:
+    the range-ahead seeds once more with that look
+    (``test_cute_paged_attention_partition_look`` pins them)."""
+    looked = [seed for seed in seeds if "cute_mma_dag_partition_look" in seed.config]
+    ahead = seeds[: len(seeds) - len(looked)]
+    assert seeds[len(ahead) :] == looked
+    return ahead
+
+
 # What a softmax tile loop that the assembler cannot prove warp-uniform
 # carries on its tile path: a yield, convergence regions around its waits,
 # warp synchronizations and divergent branches.
@@ -326,8 +340,10 @@ def seeds_ahead_of_the_range_ahead(
 ) -> list[helion.Config]:
     """The seeds ahead of those that name a distance of the range-ahead
     prefetch, which a windowed kernel on a grid of more units than SMs has
-    behind every other seed where its search samples the boundary
-    prefetches (``test_cute_paged_attention_range_ahead`` pins them)."""
+    behind every other seed but the spare warp's look's where its search
+    samples the boundary prefetches
+    (``test_cute_paged_attention_range_ahead`` pins them)."""
+    seeds = seeds_ahead_of_the_partition_look(seeds)
     served = [
         seed for seed in seeds if "cute_mma_dag_boundary_prefetch_ahead" in seed.config
     ]

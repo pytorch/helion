@@ -60,6 +60,7 @@ from .cute_mma_dag import paged_attention_key_clip_choices
 from .cute_mma_dag import paged_attention_page_order_choices
 from .cute_mma_dag import paged_attention_page_order_facts
 from .cute_mma_dag import paged_attention_partition_choices
+from .cute_mma_dag import paged_attention_partition_look_offer
 from .cute_mma_dag import paged_attention_partition_skew_choices
 from .cute_mma_dag import paged_attention_pass_warps_reason
 from .cute_mma_dag import paged_attention_probability_choices
@@ -82,6 +83,9 @@ from .paged_attention_page_order import PAGE_ORDER_MIN_SORTED
 from .paged_attention_page_order import REVERSED_ORDER_NEEDS_PAIR
 from .paged_attention_registers import MMA_DAG_REGISTER_QUOTAS_KEY
 from .paged_attention_release import MMA_DAG_RELEASE_LEAD_DEFAULT
+from .paged_attention_shared_memory import MMA_DAG_PARTITION_LOOK_GROUP
+from .paged_attention_shared_memory import MMA_DAG_PARTITION_LOOK_KEY
+from .paged_attention_shared_memory import MMA_DAG_PARTITION_LOOK_SPARE
 from .paged_attention_shared_memory import MMA_DAG_VALUE_RING_KEY
 from .paged_attention_shared_memory import MMA_DAG_VALUE_RING_TILES_KEY
 from .paged_attention_shared_memory import PAIRED_DEFAULT_VALUE_RING
@@ -390,6 +394,60 @@ def paged_attention_value_ring_tiles_reason(
     return reason
 
 
+def paged_attention_partition_look_reason(
+    facts: CuteMmaDagFacts, config: Mapping[str, object]
+) -> str | None:
+    """Why this configuration's schedule cannot have its spare warp look at
+    the counter of the split unit a CTA runs the lowest part of.
+
+    That look is the balanced partition's, on a grid known to hold more
+    units than the device has SMs: where the partition or the grid refuses
+    it the reason says so. Where they offer it, what the warp stages for
+    the compute groups must fit the shared memory the device grants one CTA
+    beside the config's raw V ring: the reason then names the ring's two
+    options with their values, and the bytes. A config that has the look
+    and names a value that is no look at all is told the choices, and
+    neither of these. Read behind
+    ``paged_attention_value_ring_tiles_reason``, which holds the ring.
+    """
+    look = config.get(MMA_DAG_PARTITION_LOOK_KEY, MMA_DAG_PARTITION_LOOK_GROUP)
+    if type(look) is str and look == MMA_DAG_PARTITION_LOOK_GROUP:
+        return None
+    attention = facts.attention
+    pass_warps = config.get(MMA_DAG_PASS_WARPS_KEY, MMA_DAG_PASS_WARPS_ATTENTION)
+    value_metadata_skip = config.get(MMA_DAG_VALUE_METADATA_SKIP_KEY, False)
+    partition = config.get(MMA_DAG_PARTITION_KEY, MMA_DAG_PARTITION_ITEM)
+    ring = config.get(MMA_DAG_VALUE_RING_KEY, PAIRED_DEFAULT_VALUE_RING)
+    tiles = config.get(MMA_DAG_VALUE_RING_TILES_KEY, 0)
+    choices, fit = paged_attention_partition_look_offer(
+        attention, pass_warps, value_metadata_skip, partition, ring, tiles
+    )
+    if type(look) is str and look in choices:
+        return None
+    if MMA_DAG_PARTITION_LOOK_SPARE in choices:
+        # Nothing refuses the spare warp's look here: the value is no look.
+        return f"{MMA_DAG_PARTITION_LOOK_KEY} must be one of {choices!r}"
+    if fit is not None:
+        # The partition and the grid have the look, and only the replay of
+        # the shared-memory table refuses it: name the ring that decides
+        # it, and what the warp's stage would need of the device beside it.
+        return (
+            f"{MMA_DAG_PARTITION_LOOK_KEY} must be one of {choices!r} for "
+            f"{MMA_DAG_VALUE_RING_KEY}={ring!r} and "
+            f"{MMA_DAG_VALUE_RING_TILES_KEY}={tiles!r} on this device: the "
+            "statistics the spare warp stages do not fit beside this "
+            f"config's raw V ring: {fit}"
+        )
+    return (
+        f"{MMA_DAG_PARTITION_LOOK_KEY} must be one of {choices!r} for "
+        f"{MMA_DAG_PASS_WARPS_KEY}={pass_warps!r}, "
+        f"{MMA_DAG_VALUE_METADATA_SKIP_KEY}={value_metadata_skip!r} and "
+        f"{MMA_DAG_PARTITION_KEY}={partition!r} on this kernel's grid: the "
+        "spare warp's look is the balanced partition's, on a grid known to "
+        "hold more units than the device has SMs"
+    )
+
+
 def paged_attention_page_order_reason(
     facts: CuteMmaDagFacts, config: Mapping[str, object]
 ) -> str | None:
@@ -593,6 +651,7 @@ def paged_attention_config_reason(
         or paged_attention_value_ring_tiles_reason(facts, config)
         or paged_attention_page_order_reason(facts, config)
         or paged_attention_clipped_page_lead_reason(config)
+        or paged_attention_partition_look_reason(facts, config)
     )
     if partition_reason is not None:
         return partition_reason

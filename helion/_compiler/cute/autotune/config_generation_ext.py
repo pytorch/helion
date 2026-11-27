@@ -81,6 +81,8 @@ from ..paged_attention_page_order import MMA_DAG_PAGE_ORDER_KEY
 from ..paged_attention_page_order import MMA_DAG_PAGE_ORDER_REVERSED
 from ..paged_attention_page_order import MMA_DAG_PAGE_ORDER_SOURCE
 from ..paged_attention_release import MMA_DAG_RELEASE_LEAD_DEFAULT
+from ..paged_attention_shared_memory import MMA_DAG_PARTITION_LOOK_GROUP
+from ..paged_attention_shared_memory import MMA_DAG_PARTITION_LOOK_KEY
 from ..paged_attention_shared_memory import MMA_DAG_VALUE_RING_KEY
 from ..paged_attention_shared_memory import MMA_DAG_VALUE_RING_TILES_KEY
 from ..paged_attention_shared_memory import PAIRED_DEFAULT_VALUE_RING
@@ -104,6 +106,7 @@ from .mma_dag_surface import boundary_prefetch_cold_needs
 from .mma_dag_surface import boundary_prefetch_needs
 from .mma_dag_surface import kept_capture_policy
 from .mma_dag_surface import page_order_needs
+from .mma_dag_surface import partition_look_needs
 from .mma_dag_surface import value_ring_needs
 from .mma_dag_surface import value_ring_tiles_needs
 
@@ -540,7 +543,8 @@ class CuteConfigGenerationExtension(ConfigGenerationExtension):
         (``_value_ring_neighbor_updates``) or its count in tiles
         (``_value_ring_tiles_neighbor_updates``), and a page order or the
         reversed order's lead of its clipped page
-        (``_page_order_neighbor_updates``)."""
+        (``_page_order_neighbor_updates``), and the spare warp's look for
+        a unit's lowest part (``_partition_look_neighbor_updates``)."""
         return {
             **self._partition_neighbor_updates(base, requested),
             **self._pdl_neighbor_updates(base, requested),
@@ -550,6 +554,7 @@ class CuteConfigGenerationExtension(ConfigGenerationExtension):
             **self._value_ring_neighbor_updates(base, requested),
             **self._value_ring_tiles_neighbor_updates(base, requested),
             **self._page_order_neighbor_updates(base, requested),
+            **self._partition_look_neighbor_updates(base, requested),
         }
 
     def _steps_onto_paired_knob(
@@ -701,6 +706,26 @@ class CuteConfigGenerationExtension(ConfigGenerationExtension):
         return self._slots(
             value_ring_tiles_needs(facts.attention, requested[tiles], partition)
         )
+
+    def _partition_look_neighbor_updates(
+        self, base: FlatConfig, requested: FlatConfig
+    ) -> dict[int, object]:
+        """Step onto the spare warp's look for a unit's lowest part with
+        what it needs.
+
+        That look is the balanced partition's. Normalization repairs it on
+        any other partition to the compute group's
+        (``paged_attention_partition_look_reason``) and never changes
+        another knob, so from such a config the step alone would be an
+        alias of where it started: it takes the balanced partition with
+        that partition's transport (``mma_dag_surface.partition_look_needs``).
+        A step that also moves the partition is the partition's.
+        """
+        if not self._steps_onto_paired_knob(
+            base, requested, MMA_DAG_PARTITION_LOOK_KEY, MMA_DAG_PARTITION_LOOK_GROUP
+        ):
+            return {}
+        return self._slots(partition_look_needs())
 
     def _repair_value_ring(self, flat_config: FlatConfig) -> None:
         """Keep the raw V ring at its default depth in a row on a

@@ -406,7 +406,15 @@ def assert_unit_protocol(source, *, balanced):
     )
     assert ast.unparse(walk.body[parked]).startswith("if thread == 0:")
     assert "walk[WALK_END] = end" in ast.unparse(walk.body[parked])
-    assert "cute.arch.barrier(" in ast.unparse(walk.body[parked + 1])
+    # Where the spare warp looks for a unit's lowest part, the group asks
+    # it between the record and the barrier that publishes it: by arrivals
+    # alone, so the unit's start waits for nothing but the group.
+    asked = walk.body[parked + 1]
+    assert ast.unparse(asked.test) == "cutlass.const_expr(look_stage is not None)"
+    assert not asked.orelse and calls(asked, "barrier_cta_arrive")
+    assert not calls(asked, "barrier_cta_sync") and not calls(asked, "barrier")
+    assert "cute.arch.barrier(" in ast.unparse(walk.body[parked + 2])
+    parked += 1
     assert calls(walk.body[parked + 2], "_compute_pages")
     assert [ast.unparse(n) for n in walk.body[parked + 3 : parked + 5]] == [
         "unit = cutlass.Int32(walk[WALK_UNIT])",
@@ -530,8 +538,10 @@ def assert_unit_protocol(source, *, balanced):
         # A part's reduction keeps the one-unit order around the wait for
         # its last PV. Ahead of it: the rows, the other part's loads from
         # the workspace and its weights, none of which is tensor memory.
-        # Behind it: every read of the O panel, eight columns at a time for
-        # a unit in two parts and whole otherwise.
+        # Behind it: every read of the O panel. Where the spare warp staged
+        # the other part's panel in shared memory, one load whatever the
+        # range is, and the pair's fold reads no tensor memory; else eight
+        # columns at a time for a unit in two parts and whole otherwise.
         reduce = function(tree, "_reduce_part")
         drained = assert_drain(tree, reduce)
         position = reduce.body.index(drained)
@@ -546,6 +556,18 @@ def assert_unit_protocol(source, *, balanced):
                 assert not any(calls(helper, name) for name in TMEM_ACCESSES)
         (read,) = reduce.body[position + 1 : -1]
         assert ast.unparse(reduce.body[-1]) == "return panel"
+        assert isinstance(read, ast.If)
+        assert ast.unparse(read.test) == ("cutlass.const_expr(panel_stage is not None)")
+        _stated, own, wait, folded = read.body
+        assert ast.unparse(own) == (
+            "own = load_query_panel(output_address, query_columns)"
+        )
+        assert "Tcgen05Wait.LOAD" in ast.unparse(wait)
+        assert calls(folded, "merge_pair_staged")
+        staged = _called_helpers((tree, helpers), [folded])
+        for node in (folded, *staged.values()):
+            assert not any(calls(node, name) for name in TMEM_ACCESSES)
+        (read,) = read.orelse
         assert isinstance(read, ast.If) and ast.unparse(read.test) == "pair"
         (chunks,) = read.body
         (columns,) = calls(chunks, "tcgen05_ld")
@@ -556,7 +578,7 @@ def assert_unit_protocol(source, *, balanced):
             "own = load_query_panel(output_address, query_columns)"
         )
         assert "Tcgen05Wait.LOAD" in ast.unparse(wait)
-        assert sum(len(calls(reduce, name)) for name in TMEM_ACCESSES) == 2
+        assert sum(len(calls(reduce, name)) for name in TMEM_ACCESSES) == 3
     idle, *planned, empty = after_walk[: 3 if balanced else 2]
     assert ast.unparse(idle) == "no_units = first_unit >= last_unit"
     assert [ast.unparse(node) for node in planned] == (
@@ -1286,6 +1308,9 @@ def test_paired_body_allocates_its_shared_memory_table_in_order():
     assert persistent == {"persistent", "scanned_lengths"}
     balanced = pipeline_parts(True, False, 17, True, True)
     assert balanced == persistent | {"balanced"}
+    # The spare warp's look is a balanced body's.
+    looked = pipeline_parts(True, False, 17, True, True, partition_look=True)
+    assert looked == balanced | {"partition_look"}
     # The scan keeps its lengths only with one unit per scanning thread and
     # a prelude that takes them.
     assert pipeline_parts(True, False, 17) == {"persistent"}
@@ -1293,7 +1318,7 @@ def test_paired_body_allocates_its_shared_memory_table_in_order():
     assert pipeline_parts(True, False, 641, True) == {"persistent"}
     assert {a.guard for a in arrays} - {None} == (
         pipeline_parts(True, True)
-        | balanced
+        | looked
         | pipeline_parts(False, False, page_order=True)
     )
     assert pipeline_parts(False, False, page_order=True) == {"page_order"}

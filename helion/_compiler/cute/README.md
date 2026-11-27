@@ -469,9 +469,10 @@ never waits for another CTA:
   stream; under the evict-first hint the stream may displace them, and
   those loads may miss L2. Against that, one merge uses a partial (only the
   panel's quads are read once on every path: the general merge reads
-  every part, its own included, and the rows' pairs twice): its stores
-  (`store_part`, a thread's quads of the panel and a row owner's pair)
-  carry the L2 evict-first hint (`st.global.L2::cache_hint` under one
+  every part, its own included, and the rows' pairs twice, and the spare
+  warp's look reads the pairs as well): its stores (`store_part`, a
+  thread's quads of the panel and a row owner's pair) carry the L2
+  evict-first hint (`st.global.L2::cache_hint` under one
   `createpolicy.fractional.L2::evict_first` word a thread, made ahead of
   its stores). A counter's reset (`_count_arrival`) carries the evict-last
   hint, and an arrival is an atomic add, which takes no hint.
@@ -481,12 +482,11 @@ requests on 148 SMs 256 of its 592 slots, 4.3 MB at 32 query columns), and
 lines protected from eviction are L2 taken from the K/V stream of every
 CTA, at a price that depends on where the workspace lies among the
 process's other allocations and on what the process ran before. Measured on
-a B200 with the searched configs of a 2047-key window at 320 requests
-(outputs under `l2_evict_last`; kernels in which the CTA's spare warp, not
-the compute group, read a split unit's counter, a form this tree does not
-render), us per call by the legs' means, evict-first against evict-last in
-batches of rotated or mirrored role order, at two calls a sample and,
-where two figures stand, at two and at twelve:
+a B200 with the searched configs of a 2047-key window at 320 requests (the
+spare warp's look, outputs under `l2_evict_last`), us per call by the legs'
+means, evict-first against evict-last in batches of rotated or mirrored
+role order, at two calls a sample and, where two figures stand, at two and
+at twelve:
 
     sample                                      draft, 32 columns   verify, 40 columns
     eval harness, the case alone                -0.47 +- 0.07       -0.05 +- 0.05
@@ -1254,6 +1254,159 @@ sample, hand-edited snapshots of the same changes):
   0.03 less), and the six 200-request cases of the frozen harness keep
   their timer steps; 128 requests, verify, 0.17 less | 0.15 less at
   position 0 and 0.19 less | 0.21 less at position 512.
+
+`cute_mma_dag_partition_look` says which threads of a balanced CTA look at
+the counter of the split unit it runs the lowest part of. That part runs the
+unit's last steps as the CTA's last pages and merges the unit if every other
+part has arrived. With `group`, the default and the meaning of a missing
+key, one thread of the compute group looks behind the part's pages
+(`split_arrival`), and for a unit in two parts the row owners then load the
+other part's row statistics ahead of the reduction's second barrier: on the
+eval's 320-request kernel that barrier comes 1.7 to 1.9 us behind the last
+page, against 0.5 in a whole unit, on the CTA's exit, where a microsecond
+of delay was measured to cost the call 1.03 | 0.66 us (two | twelve calls a
+sample). With `spare` the CTA's spare warp looks (`look_parts`):
+
+- When the lowest part starts, one thread of the group notes the unit's
+  other parts in the group's record (`WALK_LOOK`) and the group arrives,
+  without waiting, at a named barrier (LOOK, 12 and 13 for the two heads).
+- The spare warp, behind the posts it arrives for (`post_parts`), waits
+  there for both groups. Lanes 0 and 1 wait for the launch's dependencies
+  and look once each: the group's own relaxed load of the counter and, if
+  it shows every other part, its fence and reset (`_count_arrival` without
+  an arrival). The lane leaves the answer in the group's record: the
+  three words one thread of the group leaves there where the group looks,
+  which are the part's role (to merge, as a pair for a unit in two parts,
+  or to publish), this CTA as the unit's lowest, and the unit's parts
+  (`WALK_ROLE`, `WALK_LOWEST`, `WALK_PARTS`). The role is the whole
+  answer: where it is to merge as a pair, in the record of a group that
+  asked, the warp's lanes, behind a dependency wait of their own, load the
+  other part's (maximum, denominator) pairs into shared memory. Then the
+  warp arrives at a second named barrier (MEETING, 14 and 15).
+- The group meets the warp there as the first barrier of the lowest part's
+  reduction (`_reduce_rows`): the barrier that publishes the row sums is
+  the meeting, of the group's 128 threads and the warp's 32, for a part
+  the warp looked for and the group's own for every other range, by a
+  condition marked warp-uniform. No thread of the group decides or waits
+  behind that part's pages; every thread reads the role behind the
+  meeting, and `pair_partial` reads the staged pairs. The part's first
+  access to the workspace waits for the launch's dependencies where it is
+  made: the other part's loads of a pair, in `pair_partial` (of the
+  columns the staged panel does not hold, next item), and otherwise the
+  wait ahead of the stores. One thread still notes a part to post
+  (`split_arrival` with `posts`), which reads the plan and no workspace.
+- For that complete unit in two parts the warp also stages the other
+  part's panel, behind its answer (`stage_panels`), in the raw K ring. The
+  ring is the stream's until its last K tile is converted, so each of the
+  four K conversion warps arrives, once, at a barrier of the pipeline's
+  block behind its share of that tile (`_convert_keys`), and the warp's
+  lane 0 waits for that barrier's one phase, suspended. A slot's own
+  barriers do not say this: they alternate with the slot's uses, and a
+  wait on their parity from a role that is not in step with the loader
+  passes early. The lowest part is the CTA's last range (its unit goes on
+  in the next CTA), so nothing is requested into the ring behind that
+  tile. Behind the launch's dependency wait the lane then issues one bulk
+  copy per head, the panel's first 32 columns (16,384 bytes), or all of a
+  narrower panel (8 columns: 4,096 bytes), a quad of columns per thread as
+  the workspace holds it (`partition_look_panel_columns`), from the next
+  CTA's record into the head's raw K tile, completing on a second barrier
+  of the block. The tile is the head's of the ring's position behind the
+  stream's last step (`stage_tile`, from the plan's pages, which the warp
+  and the group's view of the stage share): the two tiles the stream would
+  take next. The group reads its own O panel with one load, as a whole
+  unit does, waits for that barrier's one phase, which is complete unless
+  the warp was slow, and folds element by element with the other part's
+  value from the tile (`merge_pair_staged`): the fused operations of
+  `merge_pair_other` and `merge_pair_own` on their operands in their
+  order, so the same bits. At 40 query columns the last eight columns are
+  loaded and weighted as where the group looks, which loads the two panels
+  in turns, eight columns at a time. Both barriers lie in the padding of
+  the barrier block, which a persistent CTA's query barriers make 64 slots
+  long: the stage adds no byte to the table.
+- A group that met the warp there heard the verdict of its own post, which
+  the warp answers before it looks, and skips the meeting at the end of its
+  walk. The warp's 32 arrivals at that meeting's barrier (POSTED, 10 and
+  11) then stay unmatched in a CTA that ran a lowest part, which is
+  harmless: nothing waits on that barrier, and the CTA does not use it
+  again in its life. A group whose first range is no part to post says so
+  when that range starts, so that the warp can look before the walk ends; a
+  group that runs no lowest part asks for no look at the end of its walk.
+- The meeting at the walk's end also joined the group's warps ahead of the
+  late merge of a posted unit (`merge_parts` behind the walk, when the
+  posted part arrived last). The merge's row owners write the unit's
+  weights into the group's scratch rows, and its maximum, denominator and
+  normalization into the row state, ahead of the merge's first barrier; a
+  warp that is still in the lowest part's epilogue reads those rows (the
+  pair's weights for its fold, behind its wait for the staged panel, the
+  weights of a fold of more parts, and every row's normalization for its
+  stores). So where the spare warp looks the late merge starts with
+  a barrier of the group's 128 threads, on that path alone, and then waits
+  for the dependencies itself. Without the barrier a warp that was slow in
+  its epilogue folded and normalized its remaining rows with the posted
+  unit's values: its 32 output columns of those rows were wrong.
+- The group's conditions around the exchange (a range that closes its
+  unit, the lowest part, a split range, the meeting) pass through
+  `make_warp_uniform` (`_group_uniform`): each is one value for the group,
+  and left to the assembler the named barriers under them cost the kernel
+  its warp-uniform code behind them (measured on a snapshot that also
+  marked the vote: 58 warp synchronizations in the verify kernel against
+  12, and 0.4 to 0.8 us at verify in steady state).
+
+The decision is the one the group makes, at an earlier time: merge if every
+other part had arrived at the look, else publish and arrive, and the last
+arrival merges. Whichever part merges folds the parts in source order, so
+the bits are the same with either value and on every launch, and nobody
+waits for another CTA. The staged pairs are a row of the body's
+shared-memory table (`look_stage`, `4 * query_columns` Float32: 136, 520 and
+648 bytes with its alignment at 8, 32 and 40 query columns), and the
+contract replays the table with it against the device beside the config's
+raw V ring (`partition_look_reason`). Beside the default ring every device
+that has the balanced partition holds it (its largest layouts with the
+stage, 185,312 and 205,792 bytes, are inside the partition's budgets of
+188,416 and 208,896); on a B200 a balanced CTA of 40 query columns with two
+query stages holds it beside a ring of five tiles (223,200 of 232,448 bytes
+at 640 units) and not beside a third page per head (239,584). Where the
+partition and the grid have the look and only this replay refuses it, the
+refusal says that the stage does not fit beside the config's ring, and names
+`cute_mma_dag_value_ring` and `cute_mma_dag_value_ring_tiles` with their
+values, and the bytes. The render asserts the table it allocates against
+the capacity the look was admitted on.
+
+The look is offered on the balanced partition of a grid known to hold more
+units than the device has SMs; elsewhere there is no field and `spare` is an
+`InvalidConfig`, repaired to the group's look. It is a field of the search
+in every timing regime: a step onto `spare` takes the balanced partition
+with its transport, an override is reconciled the same way
+(`reconcile_overridden_partition_look`), and a candidate that another
+override moves off the balanced partition, or whose overridden ring leaves
+the stage no room, loses its look (`drop_displaced_stream_knobs`). It is a
+choice per bind and must not become a default. Measured on a B200 with the
+SDG eval harness (a 2047-key window, us per call at two | twelve calls a
+sample, hand-edited snapshots, each figure against the tuned kernel of its
+batch, which had neither the look nor the warp-uniform softmax loop):
+
+- 320 requests, the loop alone and with the look: draft position 0 0.34
+  less | 0.44 less and 0.75 less | 0.60 less, one timer step of the frozen
+  harness (55 to 54, the handwritten kernel 53); verify position 0 0.50
+  less | 0.97 less and 0.91 less | 1.00 less. With the conditions marked
+  the look has no penalty in steady state there.
+- At positions 512 and 1023 the frozen harness reads the look 0.2 to 0.4 us
+  behind the loop alone in three of the four 320-request cases.
+- It loses on a balanced grid with short look margins: at 160 requests,
+  whose lowest parts start one or two pages behind their neighbour's post
+  (five to seven at 200 requests, eighteen to twenty at 320), the look
+  alone costs 0.74 more | 0.48 more, a timer step: the early look finds the
+  neighbour less often (87% against 92%), and every CTA pays two more
+  meetings in a life of 19 pages.
+- Not measured on the snapshots: a search; the look on full attention; the
+  look with the marks on an L2-hot stream (without them 0.60 more | 0.77
+  more at 320 requests, draft, two legs).
+
+So a search times it case by case. The seeds give it the start it was
+measured from: on a windowed kernel past one wave each range-ahead seed
+(the reversed walk with a distance and a ring of five tiles, plain and
+under the store hint) follows once more with the look, behind every other
+seed, where the device holds the stage beside the seed's ring.
 
 The paired schedule's `cute_mma_dag_page_order` is the order in which a CTA
 streams a unit's pages. `source`, the default and the meaning of a missing

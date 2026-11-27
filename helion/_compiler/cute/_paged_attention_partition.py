@@ -72,6 +72,38 @@ merges them (``split_arrival``, ``store_part``, ``arrive_part``,
   quoted in ``_compute_units``), so no block of some lanes needs a warp
   synchronization. The spare warp and the groups meet at barriers of the
   non-aligned form, which they reach at different instructions.
+- With ``cute_mma_dag_partition_look="spare"`` the lowest part's one look
+  at the counter is the spare warp's too (``look_parts``). A group says at
+  the start of that part how many other parts the unit has and arrives at
+  a named barrier without waiting; a group that runs no such part says so
+  at the end of its walk. The warp, behind its posts, looks once per head
+  with the load, the fence and the reset the group's thread makes
+  otherwise, leaves in the group's record what that thread would (the
+  part's role, the unit's lowest CTA and its parts) and, for a unit in two
+  parts that is complete, stages the other part's row statistics in shared
+  memory. The group meets the warp at a second named barrier, which is the
+  first barrier of the part's reduction: no thread of the group decides
+  behind the part's pages, and every thread reads the role and the staged
+  pairs (``pair_partial``) behind that meeting. The look comes earlier
+  than the group's own would, so it finds the other parts arrived less
+  often; the part then publishes and arrives, and the last arrival merges,
+  as ever.
+  For that complete unit in two parts the warp also stages the other
+  part's panel, behind its answer (``stage_panels``): a bulk copy per
+  head of the panel's leading columns into a tile of the raw K ring, once
+  the K conversion warps have converted the stream's last K tile, which
+  each says by one arrival at a barrier of its own. The lowest part is the
+  CTA's last range, so the ring has no later use. The group then reads its
+  own panel with one load, waits for the copies and folds element by
+  element with the other part's value from that tile
+  (``merge_pair_staged``): the fused operations of ``merge_pair_other``
+  and ``merge_pair_own`` in their order, so the same bits. The columns
+  the tile does not hold (the last eight of forty) are loaded as ever.
+  A group that met the warp there has heard the verdict of its post and
+  does not meet the warp again at the end of its walk, so its late merge
+  of a posted unit starts with a barrier of the group: the merge's row
+  owners rewrite the weights and the row state (``merge_parts``) that the
+  warps still in the lowest part's epilogue read.
 
 A range skew of ``k`` slots moves the range boundaries so that the shares
 fall linearly from the mean plus ``k`` (CTA 0) to the mean minus ``k``. A
@@ -90,6 +122,7 @@ import cutlass.experimental.primitives as prims
 
 from ._paged_attention_compute import output_normalization_factor
 from .device.ptx import atom_add_acq_rel_gpu_u32
+from .device.ptx import cp_bulk_global_to_shared
 from .device.ptx import fence_acq_rel_gpu
 from .device.ptx import l2_policy_evict_first
 from .device.ptx import l2_policy_evict_last
@@ -99,13 +132,17 @@ from .device.ptx import ldcg_v4_f32
 from .device.ptx import stg_u32_l2
 from .device.ptx import stg_v2_f32_l2
 from .device.ptx import stg_v4_f32_l2
+from .device.sync import mbar_wait_sleep
 from .paged_attention_partition_bounds import RECORD_HEADER_BYTES
 from .paged_attention_partition_bounds import SKEW_SHARE
 from .paged_attention_partition_bounds import partial_slot_bytes
 from .paged_attention_partition_bounds import plan_grid_bound
 from .paged_attention_shared_memory import MAIL_WORDS
+from .paged_attention_shared_memory import PANEL_QUAD_BYTES
 from .paged_attention_shared_memory import PLAN_WORDS
+from .paged_attention_shared_memory import RAW_TILE_BYTES
 from .paged_attention_shared_memory import WALK_WORDS
+from .paged_attention_shared_memory import partition_look_panel_columns
 from .paged_attention_shared_memory import plan_geometry
 
 # Words of the plan a balanced CTA's loader leaves in shared memory: its
@@ -166,7 +203,20 @@ WALK_ROLE = 8
 WALK_LOWEST = 9
 WALK_PARTS = 10
 WALK_POSTED = 11
-assert WALK_POSTED < WALK_WORDS
+# And, where the spare warp looks for the unit's lowest part
+# (``look_parts``): the other parts of that unit, which the group asks the
+# warp to look for (zero: this group runs no such part), and whether the
+# group has asked. The warp's answer is that part's role, lowest CTA and
+# parts, which it writes for the group (``WALK_ROLE``, ``WALK_LOWEST``,
+# ``WALK_PARTS``). Words 7 and 13 to 15 of a record are unused.
+WALK_LOOK = 6
+WALK_LOOKED = 12
+assert WALK_LOOKED < WALK_WORDS
+# The named barriers of that look: the group arrives at the first when it
+# has asked, the spare warp at the second, where the group meets it, when
+# it has answered. Head ``h`` uses the barrier ``+ h``.
+LOOK_BARRIER = 12
+MEETING_BARRIER = 14
 # The bound of a launch's skew (``SKEW_SHARE``) and of its active CTAs under
 # Int32 slot products (``plan_grid_bound``) are the compile-time side's too:
 # ``paged_attention_partition_bounds`` states each once.
@@ -620,6 +670,25 @@ def _count_arrival(
 
 
 @cute.jit
+def _note_post(
+    walk: cute.Tensor,
+    mail: cute.Tensor,
+    lowest: cutlass.Int32,
+    highest: cutlass.Int32,
+    item: cutlass.Int32,
+) -> None:
+    """The deciding thread's note of a part it posts (``split_arrival``):
+    the note in the group's record ``walk`` and, in ``mail``, what the
+    spare warp needs to arrive for the part, a unit of the CTAs ``lowest``
+    to ``highest``, and the unit's first item."""
+    walk[WALK_POSTED] = cutlass.Int32(1)
+    mail[MAIL_KIND] = cutlass.Int32(MAIL_PART)
+    mail[MAIL_LOWEST] = lowest
+    mail[MAIL_PARTS] = highest - lowest + 1
+    mail[MAIL_ITEM] = item
+
+
+@cute.jit
 def split_arrival(
     workspace: cutlass.Int64,
     walk: cute.Tensor,
@@ -634,6 +703,7 @@ def split_arrival(
     record_bytes: cutlass.Constexpr,
     slot_bits: cutlass.Constexpr,
     skewed: cutlass.Constexpr,
+    posts: cutlass.Constexpr = False,
 ) -> None:
     """Decide what this part of a split unit does: one thread of the group.
 
@@ -657,6 +727,12 @@ def split_arrival(
     wait. Nothing here waits for another CTA: the counter is read once, and
     the only loop is the walk over CTAs that finds a part's owner under a
     skew (``_slot_cta``), which reads no memory.
+
+    ``posts``: the caller's part is one to post, and the thread need not
+    have waited. Where the spare warp looks (``look_parts``) that warp
+    decides for a unit's lowest part and leaves the role, the lowest CTA
+    and the parts in ``walk`` itself, so the group's thread comes here for
+    a part to post alone, which reads the plan and no workspace.
     """
     cta = cutlass.Int32(cute.arch.block_idx()[0])
     slots = cutlass.Int32(plan[PLAN_SLOTS])
@@ -667,21 +743,22 @@ def split_arrival(
         highest = _slot_cta(header + pages, slots, active, skew, slot_bits, skewed)
     lowest = cta
     role = cutlass.Int32(PART_PUBLISH)
-    if step0 + count != pages:
+    if cutlass.const_expr(posts):
         lowest = _slot_cta(header + 1, slots, active, skew, slot_bits, skewed)
         role = cutlass.Int32(PART_POST)
-        walk[WALK_POSTED] = cutlass.Int32(1)
-        mail[MAIL_KIND] = cutlass.Int32(MAIL_PART)
-        mail[MAIL_LOWEST] = lowest
-        mail[MAIL_PARTS] = highest - lowest + 1
-        mail[MAIL_ITEM] = item
+        _note_post(walk, mail, lowest, highest, item)
     else:
-        if _count_arrival(
-            workspace, cta, highest - cta, pair_head, record_bytes, arrive=False
-        ):
-            role = cutlass.Int32(PART_MERGE)
-            if highest == cta + 1:
-                role = cutlass.Int32(PART_MERGE_PAIR)
+        if step0 + count != pages:
+            lowest = _slot_cta(header + 1, slots, active, skew, slot_bits, skewed)
+            role = cutlass.Int32(PART_POST)
+            _note_post(walk, mail, lowest, highest, item)
+        else:
+            if _count_arrival(
+                workspace, cta, highest - cta, pair_head, record_bytes, arrive=False
+            ):
+                role = cutlass.Int32(PART_MERGE)
+                if highest == cta + 1:
+                    role = cutlass.Int32(PART_MERGE_PAIR)
     walk[WALK_ROLE] = role
     walk[WALK_LOWEST] = lowest
     walk[WALK_PARTS] = highest - lowest + 1
@@ -742,11 +819,11 @@ def store_part(
     # hint the merge's loads may miss L2. Against that, one merge uses a
     # partial. (Only the panel's quads are read once on every path: the
     # general merge reads every part, its own included, and the rows'
-    # pairs twice.) Lines kept in L2 for that are taken from the key and
-    # value stream of every CTA, and how much they cost depends on where
-    # the workspace lies among the process's allocations: these lines are
-    # the first the stream may displace. One policy word a thread, ahead of
-    # its stores.
+    # pairs twice, and a spare warp's look reads the pairs as well.) Lines
+    # kept in L2 for that are taken from the key and value stream of every
+    # CTA, and how much they cost depends on where the workspace lies
+    # among the process's allocations: these lines are the first the
+    # stream may displace. One policy word a thread, ahead of its stores.
     policy = l2_policy_evict_first()
     for quad in cutlass.range_constexpr(query_columns // 4):
         stg_v4_f32_l2(
@@ -873,6 +950,8 @@ def pair_partial(
     thread: cutlass.Int32,
     record_bytes: cutlass.Constexpr,
     query_columns: cutlass.Constexpr,
+    staged: cute.Tensor | None,
+    capture_pdl_wait_mode: cutlass.Int32,
 ) -> tuple[cutlass.Float32, cutlass.Float32]:
     """Load the other part of a unit in two parts that this CTA is the lowest
     part of: its panel into ``panel``, and for a row owner the row's
@@ -881,11 +960,27 @@ def pair_partial(
     The other part is the next CTA's, in that CTA's first pair of slots.
     The caller's group has acquired it. The loads start here so that they
     complete while the group still waits for its own part's last PV.
+
+    ``staged``: the spare warp acquired the part and left every row's pair
+    in shared memory (``look_parts``), which the group has met since. A row
+    owner reads its pair there: the same two values. That warp also copies
+    the panel's leading columns into shared memory (``stage_panels``), and
+    the fold reads them there (``merge_pair_staged``): only the columns
+    behind them are loaded here, the last eight of forty. The caller's
+    thread has then not waited for the launch's dependencies behind this
+    part's pages, as no thread of a group reads the counter where the spare
+    warp looks: the loads are its first access to the workspace, and the
+    wait (``capture_pdl_wait_mode``) stands in front of them.
     """
     panel_bytes, _slot_bytes = partial_slot_bytes(query_columns)
     cta = cutlass.Int32(cute.arch.block_idx()[0])
     slot = _partial_slot(workspace, cta + 1, cta, pair_head, record_bytes)
-    for quad in cutlass.range_constexpr(query_columns // 4):
+    # The quads of columns the stage holds: none where the group looks.
+    held = partition_look_panel_columns(query_columns) // 4 if staged is not None else 0
+    if cutlass.const_expr(staged is not None and held < query_columns // 4):
+        if capture_pdl_wait_mode != 0:
+            cute.arch.griddepcontrol_wait()
+    for quad in cutlass.range_constexpr(held, query_columns // 4):
         query = quad * 4
         panel[query], panel[query + 1], panel[query + 2], panel[query + 3] = _load_quad(
             slot + cutlass.Int64(quad * 128 + thread) * 16
@@ -893,9 +988,15 @@ def pair_partial(
     maximum = cutlass.Float32(float("-inf"))
     denominator = cutlass.Float32(0)
     if thread < query_columns:
-        maximum, denominator = _load_pair(
-            slot + panel_bytes + cutlass.Int64(thread) * 8
-        )
+        if cutlass.const_expr(staged is not None):
+            assert staged is not None
+            pair = (pair_head * query_columns + thread) * 2
+            maximum = cutlass.Float32(staged[pair])
+            denominator = cutlass.Float32(staged[pair + 1])
+        else:
+            maximum, denominator = _load_pair(
+                slot + panel_bytes + cutlass.Int64(thread) * 8
+            )
     return maximum, denominator
 
 
@@ -957,6 +1058,75 @@ def merge_pair_own(
     """Fold ``count`` columns of this CTA's part, from column ``first``,
     onto the other part's term in ``panel``: a unit's last term."""
     _fold_part(panel, values, scratch, 1, first, count, cutlass.Boolean(False))
+
+
+@cute.jit
+def merge_pair_loaded(
+    scratch: cute.Tensor, panel: cute.Tensor, query_columns: cutlass.Constexpr
+) -> None:
+    """Weight the columns of the other part's panel that ``pair_partial``
+    loaded into ``panel`` where the spare warp staged the leading ones
+    (``stage_panels``): those columns' share of ``merge_pair_other``, a
+    unit's first term, the same fused operation onto zero."""
+    first = partition_look_panel_columns(query_columns)
+    for pair in cutlass.range_constexpr(first // 2, query_columns // 2):
+        query = pair * 2
+        panel[query], panel[query + 1] = cute.arch.fma_packed_f32x2(
+            (cutlass.Float32(panel[query]), cutlass.Float32(panel[query + 1])),
+            (
+                cutlass.Float32(scratch[0, query]),
+                cutlass.Float32(scratch[0, query + 1]),
+            ),
+            (cutlass.Float32(0), cutlass.Float32(0)),
+        )
+
+
+@cute.jit
+def merge_pair_staged(
+    scratch: cute.Tensor,
+    panel: cute.Tensor,
+    own: cute.Tensor | cutlass.Array,
+    stage: cute.Tensor,
+    thread: cutlass.Int32,
+    query_columns: cutlass.Constexpr,
+) -> None:
+    """Fold a unit in two parts whose other part's panel the spare warp
+    staged (``stage_panels``): ``own`` is this CTA's part, all columns of
+    it, and ``stage`` the head's raw K tile (``stage_tile``), which holds
+    the other part's leading columns as the workspace does, a quad of
+    columns per thread.
+
+    Per element the unit's first term, the other part's value times its
+    weight onto zero, and its last, this part's value times its weight
+    onto the first: ``merge_pair_other`` and ``merge_pair_own``, the same
+    two fused operations with the same operands in the same order, so the
+    same bits. A column the stage does not hold has its first term in
+    ``panel`` already (``merge_pair_loaded``). The caller's thread has
+    waited for the copies.
+    """
+    staged = partition_look_panel_columns(query_columns)
+    for pair in cutlass.range_constexpr(query_columns // 2):
+        query = pair * 2
+        first0 = cutlass.Float32(panel[query])
+        first1 = cutlass.Float32(panel[query + 1])
+        if cutlass.const_expr(query < staged):
+            word = ((query // 4) * 128 + thread) * 4 + query % 4
+            first0, first1 = cute.arch.fma_packed_f32x2(
+                (cutlass.Float32(stage[word]), cutlass.Float32(stage[word + 1])),
+                (
+                    cutlass.Float32(scratch[0, query]),
+                    cutlass.Float32(scratch[0, query + 1]),
+                ),
+                (cutlass.Float32(0), cutlass.Float32(0)),
+            )
+        panel[query], panel[query + 1] = cute.arch.fma_packed_f32x2(
+            (cutlass.Float32(own[query]), cutlass.Float32(own[query + 1])),
+            (
+                cutlass.Float32(scratch[1, query]),
+                cutlass.Float32(scratch[1, query + 1]),
+            ),
+            (first0, first1),
+        )
 
 
 @cute.jit
@@ -1099,7 +1269,12 @@ def post_parts(
     with the arrival, as a group that arrives for itself does
     (``arrive_part``). The verdict replaces the post's kind: the last
     arrival resets the unit's counter, and the group merges the unit when
-    it reads the verdict behind the second barrier, at the end of its walk.
+    it reads the verdict at the end of its walk. It reads it behind the
+    second barrier, where it waits for this warp. A group that met the
+    warp behind its lowest part under the spare warp's look
+    (``look_parts``) does not wait there: the warp came to that meeting
+    behind both verdicts, and the group's merge starts with a barrier of
+    the group (``_compute_units``).
     The arrival is this warp's access to the workspace, so the lane waits
     for the launch's dependencies first. Both barriers are the non-aligned
     form, as the warp and the groups reach them at different instructions,
@@ -1124,3 +1299,193 @@ def post_parts(
                     verdict = cutlass.Int32(MAIL_LAST)
                 mail[head * MAIL_WORDS + MAIL_KIND] = verdict
         prims.barrier_cta_arrive(POSTED_BARRIER + head, thread_count=POST_THREADS)
+
+
+@cute.jit
+def look_parts(
+    workspace: cutlass.Int64,
+    walks: cute.Tensor,
+    stage: cute.Tensor,
+    lane: cutlass.Int32,
+    capture_pdl_wait_mode: cutlass.Int32,
+    record_bytes: cutlass.Constexpr,
+    query_columns: cutlass.Constexpr,
+) -> tuple[cutlass.Boolean, cutlass.Boolean]:
+    """Look at the counter of the split unit this CTA runs the lowest part
+    of, for both compute groups: the CTA's spare warp, behind its posts
+    (``post_parts``), under ``cute_mma_dag_partition_look="spare"``.
+
+    Each group asks once. All of its threads arrive at the head's first
+    named barrier, without waiting, when the unit's lowest part starts,
+    its record (``walks``, the two groups' records) holding the unit's
+    other parts; a group that runs no such part asks for none at the end
+    of its walk, which lets this warp finish. Lanes 0 and 1 look for heads
+    0 and 1 at once: the one relaxed load of the counter and, if it shows
+    every other part, the fence and the reset (``_count_arrival`` without
+    an arrival), what one thread of the group does where the group looks.
+    The lane leaves the answer in the group's record: the words that thread
+    would have written (``split_arrival``), the part's role (to merge, as a
+    pair for a unit in two parts, or to publish), this CTA as the unit's
+    lowest and the unit's parts. The group arrives for the look when its
+    part starts, so the look finds fewer units complete than one behind
+    the part's pages; a unit it finds incomplete is published and merged
+    by its last arrival.
+
+    For a unit in two parts that is complete, which is the role to merge
+    as a pair in the record of a group that asked, the warp's lanes load
+    the other part's row statistics, a maximum and a denominator per row,
+    into ``stage``: lane ``l`` the rows ``l`` and ``32 + l``. The lowest
+    part's row owners read them there ahead of their reduction's second
+    barrier (``pair_partial``) instead of loading them behind their own
+    pages.
+
+    Every lane that reads the workspace waits for the launch's dependencies
+    itself. The warp then arrives at the head's second named barrier, where
+    the group waits as the first barrier of its part's reduction: a barrier
+    waits for the lanes of its warp, so the arrival follows the record's
+    words and the staged rows. Nothing here waits for another CTA.
+
+    Returns, per head, whether the warp staged the rows: the group asked
+    and its unit is a complete pair. The warp then also stages the other
+    part's panel (``stage_panels``); it tells from these values, since a
+    group it has answered may rewrite its record.
+    """
+    assert cutlass.const_expr(query_columns in (8, 32, 40))
+    for head in cutlass.range_constexpr(2):
+        prims.barrier_cta_sync(LOOK_BARRIER + head, thread_count=POST_THREADS)
+    request0 = cutlass.Int32(walks[WALK_LOOK])
+    request1 = cutlass.Int32(walks[WALK_WORDS + WALK_LOOK])
+    if lane < 2:
+        request = request0
+        if lane == 1:
+            request = request1
+        if request != 0:
+            if capture_pdl_wait_mode != 0:
+                cute.arch.griddepcontrol_wait()
+            cta = cutlass.Int32(cute.arch.block_idx()[0])
+            role = cutlass.Int32(PART_PUBLISH)
+            if _count_arrival(
+                workspace, cta, request, lane, record_bytes, arrive=False
+            ):
+                role = cutlass.Int32(PART_MERGE)
+                if request == 1:
+                    role = cutlass.Int32(PART_MERGE_PAIR)
+            # What the group's own look leaves in its record
+            # (``split_arrival``): the group's threads read these words
+            # behind the meeting, and none of them decides.
+            walks[lane * WALK_WORDS + WALK_ROLE] = role
+            walks[lane * WALK_WORDS + WALK_LOWEST] = cta
+            walks[lane * WALK_WORDS + WALK_PARTS] = request + 1
+    # The roles are two lanes' words: every lane reads them behind this.
+    cute.arch.sync_warp()
+    panel_bytes, _slot_bytes = partial_slot_bytes(query_columns)
+    paired = []
+    for head in cutlass.range_constexpr(2):
+        # The role is this warp's answer where the group asked. The record
+        # of a group that asked for no look holds what its own thread left
+        # there, or what the shared memory held: never an answer.
+        pair = (
+            cutlass.Int32(walks[head * WALK_WORDS + WALK_ROLE]) == PART_MERGE_PAIR
+        ) & (cutlass.Int32(walks[head * WALK_WORDS + WALK_LOOK]) != 0)
+        paired.append(pair)
+        if pair:
+            if capture_pdl_wait_mode != 0:
+                cute.arch.griddepcontrol_wait()
+            cta = cutlass.Int32(cute.arch.block_idx()[0])
+            pairs = _partial_slot(workspace, cta + 1, cta, head, record_bytes)
+            pairs = pairs + panel_bytes
+            for first in cutlass.range_constexpr(0, query_columns, 32):
+                row = first + lane
+                if row < query_columns:
+                    maximum, denominator = _load_pair(pairs + cutlass.Int64(row) * 8)
+                    stage[(head * query_columns + row) * 2] = maximum
+                    stage[(head * query_columns + row) * 2 + 1] = denominator
+    if request0 != 0:
+        prims.barrier_cta_arrive(MEETING_BARRIER, thread_count=POST_THREADS)
+    if request1 != 0:
+        prims.barrier_cta_arrive(MEETING_BARRIER + 1, thread_count=POST_THREADS)
+    return paired[0], paired[1]
+
+
+@cute.jit
+def stage_tile(plan: cute.Tensor, head: cutlass.Int32 | int) -> cutlass.Int32:
+    """The raw K tile in which the spare warp stages the other part's panel
+    for head ``head`` (``stage_panels``): the ring's position behind the
+    stream's last step, the tiles the stream's next step would take if it
+    had one. ``plan`` is the CTA's plan, which holds the pages it streams:
+    a role reads it behind the setup rendezvous, or behind a barrier that
+    a role which waited there has arrived at."""
+    return 2 * (cutlass.Int32(plan[PLAN_PAGES]) & 1) + head
+
+
+@cute.jit
+def stage_panels(
+    workspace: cutlass.Int64,
+    slots: cute.Pointer,
+    plan: cute.Tensor,
+    paired: tuple[cutlass.Boolean, cutlass.Boolean],
+    converted: cute.Pointer,
+    staged: cute.Pointer,
+    lane: cutlass.Int32,
+    capture_pdl_wait_mode: cutlass.Int32,
+    record_bytes: cutlass.Constexpr,
+    query_columns: cutlass.Constexpr,
+) -> None:
+    """Stage the other part's panel of a complete unit in two parts for the
+    lowest part's fold, in the raw K ring: the CTA's spare warp, behind its
+    look (``look_parts``, whose answer ``paired`` is: the heads whose
+    group merges a pair).
+
+    The other part's partial lies in the next CTA's record, the panel
+    first, a quad of columns per thread (``store_part``), and the look
+    acquired it. One bulk copy per head moves the panel's leading columns
+    (``partition_look_panel_columns``: 32, or all of a narrower panel) into
+    that head's raw K tile of ``slots`` (``stage_tile``): the bytes as the
+    workspace holds them. Lane 0 issues the copies, behind the
+    launch's dependency wait as every access to the workspace, and they
+    complete on ``staged``, where the lowest part's group waits in front
+    of its fold (``merge_pair_staged``). The warp has answered the group by
+    then, so the meeting does not wait for the copies.
+
+    The ring is the stream's until its last K tile is converted: the loader
+    requests a tile into a slot, the four K conversion warps read it there,
+    and the slot's own barriers pair those two by the parity of the slot's
+    uses, which says nothing to a role that is not in step with them. So
+    each K conversion warp arrives at ``converted`` once, behind its share
+    of the last tile of the CTA's stream, and lane 0 waits for that phase,
+    the barrier's only one: all four have then read every tile the loader
+    requested, and the loader requests no more. The lowest part is the
+    CTA's last range (its unit goes on in the next CTA, so the CTA's slots
+    end inside it): the stream ends with that part's pages, the group's
+    fold stands behind them, and no later range has a use for the ring.
+    The plan that names the tile was published by the setup rendezvous,
+    which the K conversions passed long before their arrival here.
+    Nothing here waits for another CTA.
+    """
+    size = partition_look_panel_columns(query_columns) // 4 * PANEL_QUAD_BYTES
+    assert cutlass.const_expr(0 < size <= RAW_TILE_BYTES and size % 16 == 0)
+    copies = cutlass.Int32(0)
+    for head in cutlass.range_constexpr(2):
+        if paired[head]:
+            copies = copies + 1
+    if lane == 0:
+        if copies != 0:
+            if capture_pdl_wait_mode != 0:
+                cute.arch.griddepcontrol_wait()
+            # A wait of many pages, off every other role's path: suspended.
+            mbar_wait_sleep(converted, 0)
+            cta = cutlass.Int32(cute.arch.block_idx()[0])
+            # The copies read through the async proxy what the other CTA's
+            # threads stored and the looking lanes acquired.
+            cute.arch.fence_proxy("async.global")
+            prims.mbarrier_arrive_expect_tx(staged, copies * size)
+            for head in cutlass.range_constexpr(2):
+                if paired[head]:
+                    tile = stage_tile(plan, head)
+                    cp_bulk_global_to_shared(
+                        slots
+                        + cute.assume(tile * RAW_TILE_BYTES, divby=RAW_TILE_BYTES),
+                        _partial_slot(workspace, cta + 1, cta, head, record_bytes),
+                        size,
+                        staged,
+                    )

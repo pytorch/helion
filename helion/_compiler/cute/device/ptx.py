@@ -1377,3 +1377,17 @@ stg_v4_f32_l2 = ptx_op(
         "(16-byte aligned) under an L2 cache policy."
     ),
 )
+
+cp_bulk_global_to_shared = ptx_op(
+    "cp_bulk_global_to_shared",
+    "cp.async.bulk.shared::cta.global.mbarrier::complete_tx::bytes [$0], [$1], $2, [$3];",
+    (SharedPointer, cutlass.Int64, cutlass.Int32, SharedPointer),
+    side_effects=True,
+    memory=True,
+    doc=(
+        "``cp.async.bulk`` of a contiguous byte range of global memory into "
+        "this CTA's shared memory (smem, address, bytes, mbarrier): both "
+        "16-byte aligned and the size a multiple of 16; the bytes complete "
+        "on the mbarrier, which the issuer told to expect them."
+    ),
+)

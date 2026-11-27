@@ -54,6 +54,7 @@ from .cute_mma_dag import paged_attention_clipped_page_lead_choices
 from .cute_mma_dag import paged_attention_early_retirement_default
 from .cute_mma_dag import paged_attention_key_clip_choices
 from .cute_mma_dag import paged_attention_page_order_choices
+from .cute_mma_dag import paged_attention_partition_look_choices
 from .cute_mma_dag import paged_attention_register_quota_choices
 from .cute_mma_dag import paged_attention_release_lead_choices
 from .cute_mma_dag import paged_attention_value_ring_choices
@@ -82,6 +83,8 @@ from .paged_attention_registers import PAIRED_DEFAULT_REGISTER_QUOTAS
 from .paged_attention_registers import PAIRED_ROLE_WARPS
 from .paged_attention_registers import parse_register_quotas
 from .paged_attention_release import MMA_DAG_RELEASE_LEAD_DEFAULT
+from .paged_attention_shared_memory import MMA_DAG_PARTITION_LOOK_GROUP
+from .paged_attention_shared_memory import MMA_DAG_PARTITION_LOOK_KEY
 from .paged_attention_shared_memory import MMA_DAG_VALUE_RING_KEY
 from .paged_attention_shared_memory import MMA_DAG_VALUE_RING_TILES_KEY
 from .paged_attention_shared_memory import PAIRED_DEFAULT_VALUE_RING
@@ -319,6 +322,9 @@ class PagedAttentionSchedule:
     # Tiles of a raw V ring counted in tiles, zero for the ring in pages.
     value_ring_tiles: int = 0
     smem_capacity: int = 0
+    # Which threads of a balanced CTA look at the counter of the split unit
+    # it runs the lowest part of: the compute group or the spare warp.
+    partition_look: str = MMA_DAG_PARTITION_LOOK_GROUP
 
 
 def plan_paged_attention_schedule(
@@ -476,6 +482,20 @@ def plan_paged_attention_schedule(
         # still has one was not normalized, and gets no schedule, as with
         # every other knob above.
         return None
+    partition_look = config.get(
+        MMA_DAG_PARTITION_LOOK_KEY, MMA_DAG_PARTITION_LOOK_GROUP
+    )
+    if type(partition_look) is not str or partition_look not in (
+        paged_attention_partition_look_choices(
+            facts,
+            pass_warps,
+            value_metadata_skip,
+            partition,
+            value_ring,
+            value_ring_tiles,
+        )
+    ):
+        return None
     persistent_units = partition != MMA_DAG_PARTITION_ITEM
     quotas = config.get(MMA_DAG_REGISTER_QUOTAS_KEY, MMA_DAG_REGISTER_QUOTAS_DEFAULT)
     register_quotas = parse_register_quotas(quotas)
@@ -553,6 +573,7 @@ def plan_paged_attention_schedule(
         page_order=page_order,
         page_order_shift=facts.page_order_shift,
         clipped_page_lead=clipped_page_lead,
+        partition_look=partition_look,
     )
 
 
