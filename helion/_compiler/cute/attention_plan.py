@@ -20,18 +20,24 @@ PREFIX_LM_MASK_KIND = "prefix_lm_mask"
 DOCUMENT_MASK_KIND = "document_mask"
 # ``kv_idx >= lb[b, q_idx]`` with the causal conjunct: a per-row KV lower bound
 # (FA4 varlen's ``cu_seqlens`` data as a ``[B, S]`` table) lowered as a
-# contiguous KV tile range plus a boundary-only per-row range mask. The kind
+# contiguous KV tile range plus a boundary-only per-row range mask (the
+# single-warpgroup body walks every KV tile and masks each one). The kind
 # folds the causal conjunct, so it is the plan's only mask modifier (a second
 # one, including a separately applied causal mask, declines the lowering). A
 # row whose bound lies past the row sees no key: the lowering returns 0 for it
-# (the FlexAttention / FA4 convention) where the kernel source and the Triton
-# lowering produce NaN from ``0 * inf``. As an interval kind it defaults to
-# the fa4 pair body, whose normalizer is every fa4 plan's ``rcp.approx.ftz``
-# of the row sum (plus the exp2 pipe split) rather than the ws_overlap body's
-# exact divide: a non-empty row's sum is at least about 1 (its row max
-# contributes ``exp2(0)``), so the reciprocal is within 1 ulp and the
-# flush-to-zero never fires; an empty row's published sum is exactly 0
-# (``row_kv_begin_row_sum``) and maps to a 0 output row.
+# (the FlexAttention / FA4 convention). A row whose bound hides its leading KV
+# tiles whole and leaves it a key (a bound of 128 or more, up to the row) gets
+# the masked softmax of the keys it sees, as every other row does. For both
+# rows the kernel source and the Triton lowering produce NaN when the running
+# max starts at ``-inf``: the statements compute ``-inf - -inf`` on a KV tile
+# (128 keys at the block sizes that fuse) that holds no key of a row which has
+# seen none. As an interval kind it defaults to the fa4 pair body, whose
+# normalizer is every fa4 plan's ``rcp.approx.ftz`` of the row sum (plus the
+# exp2 pipe split) rather than the ws_overlap body's exact divide: a non-empty
+# row's sum is at least about 1 (its row max contributes ``exp2(0)``), so the
+# reciprocal is within 1 ulp and the flush-to-zero never fires; an empty row's
+# published sum is exactly 0 (``row_kv_begin_row_sum``) and maps to a 0 output
+# row.
 ROW_KV_BEGIN_MASK_KIND = "row_kv_begin_mask"
 SOFTCAP_KIND = "softcap"
 # The FlexAttention envelope: a BlockMask-driven KV walk plus the user's
@@ -195,6 +201,12 @@ class AttentionScorePlan:
     head_dim: int
     qk_scale_log2: float
     lse_scale: float = 1.0
+    # A per-row KV bound over a running max that starts at a finite sentinel
+    # (``attention_match._attention_row_bound_sentinel_start``, set by the
+    # codegen detector). The single-warpgroup body does not take such a
+    # kernel: ``codegen_attention_flash`` declines a config that resolves to
+    # it.
+    row_bound_sentinel_start: bool = False
     modifiers: tuple[AttentionScoreModifier, ...] = ()
     # Grouped-query attention: K/V are indexed by ``tile_b.index // kv_group``
     # (``heads_q // heads_kv``), so they carry ``batch // kv_group`` leading

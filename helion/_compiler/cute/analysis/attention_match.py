@@ -2438,6 +2438,59 @@ def _running_max_sentinel_bound(dtype: torch.dtype) -> float:
     return 2 * (underflow + 1) / info.eps
 
 
+class _AttentionLoopStart(NamedTuple):
+    """The constants one call of the KV loop enters with (None for a start
+    no constant proves) and the running max's dtype."""
+
+    m: float | None
+    row_sum: float | None
+    acc: float | None
+    m_dtype: torch.dtype
+
+
+def _attention_loop_start_values(
+    pattern: AttentionSoftmaxPattern,
+    graphs: Iterable[GraphInfo],
+    kv_graph_id: int,
+) -> list[_AttentionLoopStart] | None:
+    """The starts of every call of the KV loop ``kv_graph_id``, each read
+    off the call's inputs as a constant tile (``match_common.constant_fill``);
+    None when the loop has no call or a call does not carry the statistics."""
+    from ....language._tracing_ops import is_for_loop_target
+
+    calls = [
+        node
+        for graph_info in graphs
+        for node in graph_info.graph.nodes
+        if node.op == "call_function"
+        and is_for_loop_target(node.target)
+        and len(node.args) >= 4
+        and isinstance(node.args[0], int)
+        and node.args[0] == kv_graph_id
+    ]
+    if not calls:
+        return None
+    carried = pattern.carried
+    starts: list[_AttentionLoopStart] = []
+    for call in calls:
+        inputs = call.args[3]
+        if not isinstance(inputs, (list, tuple)) or len(inputs) <= max(carried):
+            return None
+        m_tile = strip_new_var(inputs[carried.m])
+        m_value = node_tensor(m_tile)
+        if m_value is None:
+            return None
+        starts.append(
+            _AttentionLoopStart(
+                constant_fill(m_tile),
+                constant_fill(inputs[carried.l]),
+                constant_fill(inputs[carried.acc]),
+                m_value.dtype,
+            )
+        )
+    return starts
+
+
 def _attention_loop_starts_fused(
     pattern: AttentionSoftmaxPattern,
     graphs: Iterable[GraphInfo],
@@ -2484,29 +2537,10 @@ def _attention_loop_starts_fused(
     pattern was matched on. Shared by the search surface and the codegen
     detector so the two never diverge.
     """
-    from ....language._tracing_ops import is_for_loop_target
-
-    calls = [
-        node
-        for graph_info in graphs
-        for node in graph_info.graph.nodes
-        if node.op == "call_function"
-        and is_for_loop_target(node.target)
-        and len(node.args) >= 4
-        and isinstance(node.args[0], int)
-        and node.args[0] == kv_graph_id
-    ]
-    if not calls:
+    starts = _attention_loop_start_values(pattern, graphs, kv_graph_id)
+    if starts is None:
         return False
-    carried = pattern.carried
-    for call in calls:
-        inputs = call.args[3]
-        if not isinstance(inputs, (list, tuple)) or len(inputs) <= max(carried):
-            return False
-        m_tile = strip_new_var(inputs[carried.m])
-        m_start = constant_fill(m_tile)
-        l_start = constant_fill(inputs[carried.l])
-        acc_start = constant_fill(inputs[carried.acc])
+    for m_start, l_start, acc_start, m_dtype in starts:
         if (
             m_start is None
             or l_start is None
@@ -2517,16 +2551,37 @@ def _attention_loop_starts_fused(
             return False
         if m_start == -math.inf:
             continue
-        m_value = node_tensor(m_tile)
-        assert m_value is not None
         # A finite start: a sentinel whose key-less row, ``acc / l``, is 0.
         if (
-            m_start > -_running_max_sentinel_bound(m_value.dtype)
+            m_start > -_running_max_sentinel_bound(m_dtype)
             or acc_start != 0
             or l_start == 0
         ):
             return False
     return True
+
+
+def _attention_row_bound_sentinel_start(
+    pattern: AttentionSoftmaxPattern,
+    graphs: Iterable[GraphInfo],
+    kv_graph_id: int,
+) -> bool:
+    """Whether a kernel with a per-row KV bound starts its running max from
+    a finite sentinel (a start ``_attention_loop_starts_fused`` admits).
+
+    The single-warpgroup body does not take such a kernel. It lowers the
+    bound for kernels that start from ``-inf``; under a sentinel start it
+    would compute what the known gap describes (``KNOWN_GAPS.md``,
+    cute-flash-sentinel-start-taken-for-minus-inf) for kernels that never
+    compiled on it. One KV tile, which only that body takes, keeps the
+    generic lowering (the search surface and the codegen detector decline
+    together); a config that pins the body at more tiles is declined by
+    codegen (``AttentionScorePlan.row_bound_sentinel_start``). The other
+    bodies take the kernel as they did."""
+    if not pattern.score_plan.row_kv_begin_masks:
+        return False
+    starts = _attention_loop_start_values(pattern, graphs, kv_graph_id)
+    return starts is not None and any(start.m != -math.inf for start in starts)
 
 
 class _AttentionGeometry(NamedTuple):
@@ -2678,6 +2733,12 @@ def detect_flash_search_surface(device_ir: DeviceIR) -> FlashSearchSurface | Non
         # Read below the TMA-only hand-over: an output that large keeps the
         # generic search's bounds whatever the start.
         if not _attention_loop_starts_fused(
+            pattern, device_ir.graphs, graph_info.graph_id
+        ):
+            continue
+        # One KV tile runs on the single-warpgroup body alone, which does not
+        # take a per-row KV bound over a sentinel start.
+        if num_kv == 1 and _attention_row_bound_sentinel_start(
             pattern, device_ir.graphs, graph_info.graph_id
         ):
             continue

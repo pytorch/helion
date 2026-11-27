@@ -1973,8 +1973,14 @@ def row_kv_begin_mask_t2r(
     table, loaded once per query tile (``row_kv_begin_row_bound``); the mask is
     the same column range form as ``sliding_window_mask_t2r``. A row whose
     bound lies past the row keeps no key at all; the consumer turns its zero
-    row sum into a 0 output (the FlexAttention / FA4 convention) where the
-    kernel source and the Triton lowering produce NaN.
+    row sum into a 0 output (the FlexAttention / FA4 convention). A row whose
+    bound lies past this tile but not past the row keeps no key of the tile
+    and sees its keys in a later one: the consumer leaves the row's statistics
+    as they are over the tile (it scales a row max that is still ``-inf`` as
+    0), so the row gets the masked softmax of the keys it sees. For both rows
+    the kernel source and the Triton lowering produce NaN when the running
+    max starts at ``-inf``: they compute ``-inf - -inf`` on a tile that holds
+    no key of a row which has seen none.
     """
     row_idx = cast("Any", tLDcS)[0][0] + m_block * 128
     block_start = n_block * 128

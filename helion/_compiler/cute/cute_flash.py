@@ -12976,7 +12976,10 @@ def _flash_score_transform_block(
     ``range_suffix`` names the resident query tile whose range prelude
     (``_flash_contiguous_kv_tile_range``) and row bound the per-row KV lower
     bound reads; ``row_kv_begin_guard`` wraps that mask in its boundary-tile
-    predicate (the fa4 body decides per tile or per loop segment itself).
+    predicate, which reads the prelude's interior bound and holds only for a
+    loop that stops at the diagonal (the fa4 body decides per tile or per
+    loop segment itself; the single-warpgroup body walks every KV tile
+    without a range prelude and masks each one).
     ``bias_stage='tma'`` reads the tensor bias from the staged shared-memory
     box ``bias_box_expr`` (this query tile's (128, 64) box of the chunk's KV
     tile half) at column ``bias_col_expr`` instead of global memory.
@@ -13211,6 +13214,13 @@ def _flash_plain_causal_mask(score_plan: AttentionScorePlan) -> bool:
     return kinds == [CAUSAL_MASK_KIND]
 
 
+def _flash_row_kv_begin_batch_row(indent: str = "") -> str:
+    """The lower-bound table's row for the CTA's batch head (``indent``-indented,
+    newline-terminated): the ``[batch, seq]`` table has one row per batch
+    entry, which that entry's heads share."""
+    return f"{indent}flash_rkb_bh = flash_bh // _flash_rkb_heads_per_batch\n"
+
+
 def _flash_contiguous_kv_tile_range(
     score_plan: AttentionScorePlan,
     num_kv: int,
@@ -13301,8 +13311,8 @@ def _flash_contiguous_kv_tile_range(
         # tile, the slot index for the fa4 pair) so the boundary mask, the
         # softmax prelude and the split bounds of each slot read their own.
         prelude = (
-            f"{indent}flash_rkb_bh = flash_bh // _flash_rkb_heads_per_batch\n"
-            f"{indent}flash_rkb_lo{name_suffix}, flash_rkb_hi{name_suffix} = "
+            _flash_row_kv_begin_batch_row(indent)
+            + f"{indent}flash_rkb_lo{name_suffix}, flash_rkb_hi{name_suffix} = "
             "_helion_flash_rt.row_kv_begin_bounds_warp(\n"
             f"{indent}    _flash_mRowKvBegin, flash_rkb_bh, "
             f"{m_tile_expr} * cutlass.Int32(128))\n"
@@ -13427,10 +13437,10 @@ def _flash_row_kv_begin_softmax_prelude(
 
 
 def _flash_ws_inv_sum_source(score_plan: AttentionScorePlan) -> str:
-    """The consumer's ``flash_inv_sum`` line (8-space indented).  A per-row
-    KV lower bound or a BlockMask / mask region may leave a row with no
-    visible key (row sum 0): such rows produce 0 like FlexAttention/FA4
-    instead of ``0 * inf``."""
+    """The consumer's ``flash_inv_sum`` line (8-space indented; the
+    single-warpgroup body dedents it).  A per-row KV lower bound or a
+    BlockMask / mask region may leave a row with no visible key (row sum 0):
+    such rows produce 0 like FlexAttention/FA4 instead of ``0 * inf``."""
     if score_plan.row_kv_begin_masks or score_plan.flex_envelope:
         return (
             "        flash_inv_sum = cutlass.Float32(cutlass.select_(\n"
@@ -13955,6 +13965,11 @@ def _flash_kv_iteration(
         kv_tile_expr="flash_kv",
         causal_condition="flash_kv >= flash_m_tile",
         bias_form=bias_form,
+        # This loop walks every KV tile, the ones above the diagonal
+        # included, and runs no range prelude: the per-row KV lower bound
+        # masks every tile with the row's exact range (the boundary-tile
+        # predicate belongs to the bodies that stop at the diagonal).
+        row_kv_begin_guard=False,
     )
     if rescale_threshold > 0.0:
         alpha_pre = f"""    flash_acc_log = _flash_scale_log2 * (flash_old_row_max - flash_row_max_safe)
@@ -26595,6 +26610,18 @@ def emit_flash_device_body(
         e2e_res=cfg.e2e_res,
         bias_form=cfg.bias_form,
     )
+    # A per-row KV lower bound: each thread loads its row's bound once for
+    # the CTA's query tile, ahead of the KV loops, which mask every tile with
+    # it (``_flash_kv_iteration``).  The table's batch row is the range
+    # prelude's on the other bodies; this body runs none.
+    row_bound_prelude = ""
+    if score_plan.row_kv_begin_masks:
+        row_bound_prelude = _flash_row_kv_begin_batch_row() + textwrap.dedent(
+            _flash_row_kv_begin_softmax_prelude(score_plan)
+        )
+    # (A row the bound leaves without a key has a zero row sum: a 0 output
+    # row, as on the other bodies.)
+    inv_sum = textwrap.dedent(_flash_ws_inv_sum_source(score_plan))
     lse_store = (
         _flash_lse_store(
             "flash_m_tile * 128 + tidx",
@@ -26783,6 +26810,7 @@ if warp_idx == 0:
         cute.copy(_flash_tma_v, tVgV[None, flash_pf], tVsV[None, flash_v_empty.index],
                   tma_bar_ptr=flash_v_empty.barrier)
 
+{row_bound_prelude}
 {loop_body}
 
 if warp_idx == 0:
@@ -26793,7 +26821,7 @@ flash_tmem.relinquish_alloc_permit()
 flash_acc_full = flash_acc_cons.wait_and_advance()
 flash_o_full = flash_mma_o_cons.wait_and_advance()
 
-flash_inv_sum = cutlass.Float32(1.0) / flash_row_sum
+{inv_sum}
 gO = cute.flat_divide(_flash_mOt, cute.select((128, {hd}, 128), mode=[0, 1]))
 tOgO_mma = flash_pvt.partition_C(gO)[None, None, None, flash_m_tile, 0, flash_bh]
 flash_epi_tiler = ((cute.size(tOtO, mode=[0, 0]), cute.size(tOtO, mode=[0, 1])),)
@@ -27761,6 +27789,16 @@ def codegen_attention_flash(cg: GenerateAST) -> bool:
         # The row-max store exists in the bodies of the flex envelope (the
         # fa4 pair body and the single-tile body's cooperative pair), the
         # families the resolver pins every flex plan to.
+        return False
+    if (
+        score_plan.row_bound_sentinel_start
+        and cfg.topology == "ws_overlap"
+        and cfg.s_stage == 1
+    ):
+        # The single-warpgroup body lowers the per-row KV bound for kernels
+        # that start their running max from -inf. One KV tile never gets
+        # here (the detectors keep such a kernel on the generic lowering);
+        # this declines a config that pins the body at more tiles.
         return False
     if head_dim_v != head_dim and (
         cfg.topology != "fa4"

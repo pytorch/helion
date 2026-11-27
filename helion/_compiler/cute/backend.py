@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import ast
 import contextlib
+import dataclasses
 import functools
 import hashlib
 from itertools import starmap
@@ -56,6 +57,7 @@ from .analysis.attention_match import _attention_flash_supported
 from .analysis.attention_match import _attention_loop_starts_fused
 from .analysis.attention_match import _attention_pattern_fits_root
 from .analysis.attention_match import _attention_pattern_geometry
+from .analysis.attention_match import _attention_row_bound_sentinel_start
 from .analysis.attention_match import _attention_softmax_pattern_head_dim
 from .analysis.match_common import root_grid_origin_is_canonical
 from .analysis.specialized_mma import _grouped_rank3_specialized_mma_plan
@@ -1101,6 +1103,15 @@ def _attention_loop_shape(
         or geometry.q_seq % 128 != 0
     ):
         return None
+    # A per-row KV bound over a sentinel start has no single-warpgroup body:
+    # one KV tile, which only that body takes, keeps the generic lowering (the
+    # search surface declines the same way), and the plan tells codegen for
+    # the configs that pin the body at more tiles.
+    row_bound_sentinel_start = _attention_row_bound_sentinel_start(
+        pattern, fn.codegen.codegen_graphs, graph_info.graph_id
+    )
+    if row_bound_sentinel_start and geometry.kv_seq == 128:
+        return None
     # The flash kernel emits its OWN (batch*head, query-tile) program mapping; it
     # is only valid for the default flat pid with no L2 reordering. Persistent /
     # interleaved pids and l2_grouping remap program ids, so the emitted tile
@@ -1133,7 +1144,13 @@ def _attention_loop_shape(
         tile_b = env.block_sizes[root_grid_ids[0]].from_config(config)
         if not isinstance(tile_b, int) or tile_b != 1:
             return None
-    return bm, bn, pattern.score_plan
+    if not row_bound_sentinel_start:
+        return bm, bn, pattern.score_plan
+    return (
+        bm,
+        bn,
+        dataclasses.replace(pattern.score_plan, row_bound_sentinel_start=True),
+    )
 
 
 def _detect_attention_bwd_mma_loop(
