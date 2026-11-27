@@ -14,8 +14,6 @@ import torch
 from test.cute_population_contracts import checked_initial_population
 from test.cute_population_contracts import with_flat_min_blocks_default
 from test.test_cute_flat_grouped_host import rewritten_binding
-from test.test_cute_flat_grouped_ir import _host
-from test.test_cute_flat_grouped_ir import cuda_binding
 
 import helion
 from helion._compiler.cute.autotune.heuristics.cute_grouped_rna import (
@@ -34,6 +32,11 @@ from helion._compiler.cute.tcgen05_flat_grouped_config import (
 from helion._compiler.cute.tcgen05_tma_rn import CONVERSION_KEY
 from helion._compiler.cute.tcgen05_tma_rn import TMA_RN
 from helion._compiler.cute.tcgen05_tma_rn import WARP_RAW
+from helion._testing.cute_flat_grouped import bound_host_function as _host
+from helion._testing.cute_flat_grouped import compiled_source as _source
+from helion._testing.cute_flat_grouped import cuda_binding
+from helion._testing.cute_flat_grouped import flat_converter_config as _config
+from helion._testing.cute_flat_grouped import native_kernel_source as _native_source
 from helion.autotuner.config_generation import ConfigGeneration
 from helion.autotuner.effort_profile import get_effort_profile
 from helion.autotuner.pattern_search import InitialPopulationStrategy
@@ -49,19 +52,6 @@ if TYPE_CHECKING:
     from helion.runtime.kernel import BoundKernel
 
 
-def _config(bound: BoundKernel, warps: int = 4, block_k: int = 32) -> helion.Config:
-    return helion.Config.from_dict(
-        bound.config_spec._base_default_config().config
-        | {WARPS_KEY: warps, K_KEY: block_k}
-    )
-
-
-def _source(bound: BoundKernel, config: helion.Config) -> str:
-    # This is the public compiler entry. There is no emitter/launcher patch.
-    with bound.env.suspend():
-        return bound.to_code(config)
-
-
 def _runtime_arguments(bound: BoundKernel) -> tuple[torch.Tensor, ...]:
     values = tuple(
         bound._runtime_tensor_refs_by_name[name]()
@@ -69,22 +59,6 @@ def _runtime_arguments(bound: BoundKernel) -> tuple[torch.Tensor, ...]:
     )
     assert all(isinstance(value, torch.Tensor) for value in values)
     return tuple(value for value in values if isinstance(value, torch.Tensor))
-
-
-def _native_source(source: str) -> str:
-    candidates = [
-        node.args[0].value
-        for node in ast.walk(ast.parse(source))
-        if isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Attribute)
-        and node.func.attr == "load"
-        and len(node.args) == 1
-        and isinstance(node.args[0], ast.Constant)
-        and isinstance(node.args[0].value, str)
-        and "def _helion_native_grouped_rna(" in node.args[0].value
-    ]
-    assert len(candidates) == 1
-    return candidates[0]
 
 
 @pytest.mark.parametrize("warps", [1, 2, 4, 8])

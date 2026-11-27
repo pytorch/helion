@@ -33,6 +33,24 @@ def d_shift_config(orientation: str, *, cluster_n: int = 1) -> helion.Config:
     )
 
 
+def grid_multiplier_config(multiplier: int) -> helion.Config:
+    """A worklist config that launches ``multiplier`` CTAs per SM
+    (``num_sm_multiplier``), on 32-row source tiles."""
+    return helion.Config(
+        block_sizes=[256, 128, 64],
+        pid_type="persistent_interleaved",
+        num_sm_multiplier=multiplier,
+        tcgen05_cluster_m=1,
+        tcgen05_cluster_n=1,
+        tcgen05_ab_stages=5,
+        tcgen05_acc_stages=2,
+        tcgen05_c_stages=2,
+        tcgen05_num_epi_warps=4,
+        tcgen05_grouped_mode="worklist_nm",
+        tcgen05_grouped_worklist_source_m_tile=32,
+    )
+
+
 def prefix_recipe_args(
     *,
     groups: int = 16,

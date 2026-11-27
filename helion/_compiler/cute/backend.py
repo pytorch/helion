@@ -3380,6 +3380,10 @@ class CuteBackend(Backend):
                 "_warp_reduce_or_native as _cute_warp_reduce_or_redux"
             ),
             "_helion_pdl_spread_keep": "from helion._compiler.cute._pdl_spread_runtime import keep_smem_live as _helion_pdl_spread_keep",
+            "_cute_select_small_alloc_class": (
+                "from helion._compiler.cute.tensormap_alloc_class import "
+                "select_small_alloc_class as _cute_select_small_alloc_class"
+            ),
             "_cute_aux_copy_layout": "from helion._compiler.cute.aux_copy_layout import select_aux_copy_layout as _cute_aux_copy_layout",
             "_cute_gelu_erf_exact_f32x2": (
                 "from helion._compiler.cute.epilogue_helpers import "

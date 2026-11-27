@@ -5,16 +5,17 @@ from copy import deepcopy
 import dataclasses
 import json
 from types import SimpleNamespace
+from unittest.mock import patch
 
+from cutlass.experimental.primitives import nvvm_wrapper
 import pytest
-
-from test.test_cute_flat_grouped_codegen import _schedule
-from test.test_cute_flat_grouped_ir import cuda_binding
-from test.test_cute_flat_grouped_public import _config
-from test.test_cute_flat_grouped_public import _native_source
-from test.test_cute_flat_grouped_public import _source
+import torch
+from torch._inductor.codecache import PyCodeCache
 
 import helion
+from helion import exc
+from helion._compiler.cute import tcgen05_grouped_descriptors
+from helion._compiler.cute import tensormap_alloc_class
 from helion._compiler.cute.autotune.heuristics.cute_grouped_rna import (
     CuteGroupedRnaHeuristic,
 )
@@ -24,8 +25,12 @@ from helion._compiler.cute.tcgen05_flat_grouped_codegen import (
 from helion._compiler.cute.tcgen05_flat_grouped_codegen import (
     flat_grouped_wrapper_plans,
 )
+from helion._compiler.cute.tcgen05_flat_grouped_ir import prove_flat_grouped_rna
+from helion._compiler.cute.tcgen05_flat_grouped_plan import flat_grouped_rna_schedule
 from helion._compiler.cute.tcgen05_grouped_descriptors import DESCRIPTOR_KEY
+from helion._compiler.cute.tcgen05_grouped_descriptors import ELEMENT_BYTES
 from helion._compiler.cute.tcgen05_grouped_descriptors import EXTRA_EXTENT
+from helion._compiler.cute.tcgen05_grouped_descriptors import LARGE_ALLOC_MIN_BYTES
 from helion._compiler.cute.tcgen05_grouped_descriptors import WRAP_EXTENT
 from helion._compiler.cute.tcgen05_grouped_descriptors import WRAP_STRIDE
 from helion._compiler.cute.tcgen05_grouped_descriptors import WRAPPED
@@ -35,6 +40,17 @@ from helion._compiler.cute.tcgen05_grouped_descriptors import (
 from helion._compiler.cute.tcgen05_grouped_descriptors import (
     wrapped_grouped_descriptor_supported,
 )
+from helion._testing.cute_codegen import cpu_bind
+from helion._testing.cute_codegen import forbid_cuda_work
+from helion._testing.cute_codegen import mock_cuda_unavailable
+from helion._testing.cute_codegen import tcgen05_target
+from helion._testing.cute_flat_grouped import bound_host_function as _host
+from helion._testing.cute_flat_grouped import compiled_source as _source
+from helion._testing.cute_flat_grouped import cuda_binding
+from helion._testing.cute_flat_grouped import flat_converter_config as _config
+from helion._testing.cute_flat_grouped import flat_rna_schedule as _schedule
+from helion._testing.cute_flat_grouped import native_kernel_source as _native_source
+from helion._testing.cute_grouped_offsets import grouped_fp32_output
 from helion.autotuner.config_generation import ConfigGeneration
 from helion.runtime.cute.launcher import _append_cute_wrapper_plan
 from helion.runtime.cute.launcher import _create_cute_wrapper
@@ -92,6 +108,166 @@ def test_unsupported_metadata_is_not_admitted(metadata: tuple[int, ...]) -> None
         WrappedGroupedDescriptorPlan(*metadata)
 
 
+@pytest.mark.parametrize(
+    "rows,k,n,admitted",
+    [
+        (256, 128, 128, True),
+        (255, 128, 128, False),
+        # The narrower of the two row-packed buffers decides.
+        (1024, 128, 32, True),
+        (1023, 128, 32, False),
+        (1023, 32, 128, False),
+    ],
+)
+def test_wrapped_buffers_span_the_large_class_window(
+    rows: int, k: int, n: int, admitted: bool
+) -> None:
+    # The driver encodes a wrapped TensorMap in the large allocation class,
+    # which reads up to this far from the buffer's first element.
+    assert (ELEMENT_BYTES * rows * min(k, n) >= LARGE_ALLOC_MIN_BYTES) is admitted
+    assert wrapped_grouped_descriptor_supported(3, rows, k, n, 64) is admitted
+
+
+def _expression_statements(source: str) -> list[str]:
+    return [
+        ast.unparse(node)
+        for node in sorted(
+            (
+                node
+                for node in ast.walk(ast.parse(source))
+                if isinstance(node, ast.Expr)
+            ),
+            key=lambda node: node.lineno,
+        )
+    ]
+
+
+@pytest.mark.parametrize("tma_rn", [False, True])
+def test_dynamic_templates_take_the_small_allocation_class(tma_rn: bool) -> None:
+    with cuda_binding(
+        static=True, original=True, groups=3, rows=273, k=128, n=128
+    ) as bound:
+        proof = prove_flat_grouped_rna(bound.env, _host(bound).device_ir)
+        assert proof is not None
+        schedule = flat_grouped_rna_schedule(
+            bound.env,
+            proof,
+            converter_warps=0 if tma_rn else 8,
+            block_k=32,
+            ab_stages=2 if tma_rn else 6,
+            shared_capacity=232448,
+            tma_rn=tma_rn,
+        )
+        assert schedule is not None and schedule.descriptors is None
+    statements = _expression_statements(flat_grouped_kernel_module(schedule))
+    # The templates of the row-packed operand and of the output are encoded
+    # for all rows and rewritten to one group's: the small class, right after
+    # the copy and before any rewrite.
+    for manager, atom, template, warp, barrier in (
+        (
+            "tcgen05_grouped_tensormap_manager",
+            "tma_atom_b",
+            "tcgen05_grouped_tensormap_b_smem_ptr",
+            5,
+            "cute.arch.sync_warp()",
+        ),
+        (
+            "tcgen05_grouped_d_tensormap_manager",
+            "tcgen05_tma_store_atom",
+            "tcgen05_grouped_d_tensormap_smem_ptr",
+            0,
+            "cute.arch.sync_threads()",
+        ),
+    ):
+        copied = statements.index(
+            f"{manager}.init_tensormap_from_atom({atom}, {template}, {warp})"
+        )
+        # Every lane clears it: the flat kernel's form
+        # (the general grouped path elects one lane).
+        assert statements[copied + 1] == (
+            f"select_small_alloc_class_every_lane({template}, {warp})"
+        )
+        rewrite = next(
+            i
+            for i, text in enumerate(statements)
+            if text.startswith(f"{manager}.update_tensormap(")
+        )
+        # The lanes' stores are ordered ahead of the rewrite, in which one
+        # lane replaces fields of the template: the output's template waits
+        # for the block's barrier, and the operand's warp, which rewrites
+        # next, synchronizes right behind its clear.
+        assert barrier in statements[copied + 2 : rewrite]
+        if warp == 5:
+            assert statements[copied + 2] == barrier
+    # The dense template describes one group's block and only ever another
+    # block of that extent: it keeps the class the driver encoded.
+    selections = [text for text in statements if "select_small_alloc_class" in text]
+    assert len(selections) == 2
+    assert not any("_a_smem_ptr" in text for text in selections)
+
+
+def test_two_ordinary_inputs_clear_every_template_they_rewrite() -> None:
+    # The general grouped path: packed rows routed to one weight matrix per
+    # group by device offsets, both operands and the output through
+    # TensorMaps the kernel rewrites per group. One lane of the owning warp
+    # clears each template's class right behind its copy.
+    args = (
+        torch.empty((640, 128), dtype=torch.bfloat16),
+        torch.empty((4, 512, 128), dtype=torch.bfloat16),
+        torch.tensor([0, 0, 1, 129, 640], dtype=torch.int32),
+    )
+    config = helion.Config(
+        block_sizes=[256, 128, 128],
+        l2_groupings=[1],
+        loop_orders=[[0, 1, 2]],
+        num_stages=7,
+        num_warps=8,
+        pid_type="persistent_interleaved",
+        tcgen05_cluster_m=2,
+        tcgen05_cluster_n=1,
+        tcgen05_ab_stages=3,
+        tcgen05_acc_stages=2,
+        tcgen05_c_stages=2,
+        tcgen05_num_epi_warps=4,
+        tcgen05_grouped_mode="worklist_nm",
+        tcgen05_grouped_worklist_source_m_tile=128,
+        tcgen05_grouped_full_allocation_a=False,
+    )
+    with tcgen05_target(), mock_cuda_unavailable(), forbid_cuda_work():
+        source = cpu_bind(grouped_fp32_output, args).to_code(config)
+    statements = _expression_statements(source)
+    copies = [
+        index
+        for index, text in enumerate(statements)
+        if ".init_tensormap_from_atom(" in text
+    ]
+    # Both operands' templates and the output's.
+    assert len(copies) == 3
+    for index in copies:
+        _atom, template, warp = (
+            statements[index].split("init_tensormap_from_atom(")[1][:-1].split(", ")
+        )
+        assert statements[index + 1] == (
+            f"_cute_select_small_alloc_class({template}, {warp})"
+        )
+    assert source.count("_cute_select_small_alloc_class(") == 3
+
+
+def test_the_helper_clears_the_bit_the_dsl_fix_up_clears() -> None:
+    # CuTe DSL 4.8.1's experimental ``tensormap_replace`` resets a descriptor
+    # copy to the small class by clearing one bit of one 32-bit word
+    # (``_apply_tensormap_fixup``). The helper addresses the descriptor by
+    # quadwords and clears the same bit. A DSL release that moves the bit, or
+    # no longer names it, fails here.
+    cleared = ~nvvm_wrapper._TENSORMAP_FIXUP_MASK & 0xFFFFFFFF
+    assert cleared.bit_count() == 1
+    quadword, half = divmod(nvvm_wrapper._TENSORMAP_FIXUP_WORD, 2)
+    assert (quadword, cleared << (32 * half)) == (
+        tensormap_alloc_class.ALLOC_CLASS_QWORD,
+        tensormap_alloc_class.ALLOC_CLASS_LARGE,
+    )
+
+
 @pytest.mark.parametrize("bits", [32, 64])
 @pytest.mark.parametrize("warps,bk", [(1, 32), (8, 32), (4, 64)])
 def test_typed_plan_wrapper_device_and_cache_agree(
@@ -109,6 +285,7 @@ def test_typed_plan_wrapper_device_and_cache_agree(
         assert new.cache_identity()[-1] == descriptors.cache_identity()
         native = flat_grouped_kernel_module(new)
         assert "TensorMapManager" not in native and "tma_desc_ptr=" not in native
+        assert "alloc_class" not in native
         assert "convert_and_publish_operand_stage" in native
         assert "ld_volatile_shared_u32" in native
         plans = flat_grouped_wrapper_plans(new)
@@ -129,10 +306,16 @@ def test_typed_plan_wrapper_device_and_cache_agree(
             _append_cute_wrapper_plan([], [], broken)
 
 
-@pytest.mark.parametrize("k,n", [(128, 128), (96, 128), (128, 132)])
-def test_ordinary_config_policy_normalization_and_seed_identity(k: int, n: int) -> None:
+@pytest.mark.parametrize(
+    "rows,k,n",
+    # 255 rows of 128: one row short of the large-class window.
+    [(273, 128, 128), (273, 96, 128), (273, 128, 132), (255, 128, 128)],
+)
+def test_ordinary_config_policy_normalization_and_seed_identity(
+    rows: int, k: int, n: int
+) -> None:
     with cuda_binding(
-        static=True, original=True, groups=3, rows=273, k=k, n=n
+        static=True, original=True, groups=3, rows=rows, k=k, n=n
     ) as bound:
         old = _config(bound, 8, 32)
         dynamic = helion.Config.from_dict(old.config | {DESCRIPTOR_KEY: "dynamic"})
@@ -140,7 +323,7 @@ def test_ordinary_config_policy_normalization_and_seed_identity(k: int, n: int) 
         spec = bound.config_spec
         assert spec.normalized_config(dynamic) == spec.normalized_config(old)
         normalized = spec.normalized_config(wrapped)
-        supported = k == n == 128
+        supported = k == n == 128 and rows >= 256
         assert (DESCRIPTOR_KEY in normalized.config) == supported
         assert (
             spec.normalized_config(
@@ -219,16 +402,53 @@ def test_wrapper_rejects_disagreeing_input_and_output_proofs(mutation: str) -> N
 def test_renamed_contract_with_distinct_row_strides_uses_ordinary_policy(
     bits: int,
 ) -> None:
-    with cuda_binding(static=True, bits=bits, groups=5, rows=131, k=64, n=32) as bound:
+    # 1027 rows: both row-packed buffers span the large-class window.
+    with cuda_binding(static=True, bits=bits, groups=5, rows=1027, k=64, n=32) as bound:
         config = helion.Config.from_dict(
             _config(bound, 2, 32).config | {DESCRIPTOR_KEY: WRAPPED}
         )
         source = _source(bound, config)
         native = _native_source(source)
         assert "TensorMapManager" not in native
-        assert "routing, left.view((131, 64))" in source
+        assert "routing, left.view((1027, 64))" in source
         assert "right.transpose(1, 2)" in source
         assert "flat_contract" in source
         assert "jagged_dense_bmm" not in source
         assert "cutlass.Int64(a_packed.layout.stride[0])" in native
         assert "cutlass.Int64(out.layout.stride[0])" in native
+
+
+@pytest.mark.parametrize("bits", [32, 64])
+def test_wrapped_source_for_a_buffer_below_the_window_is_refused(bits: int) -> None:
+    """Generated source names its descriptor policy in the kernel's wrapper
+    plans, where the launcher reads it, and source that left the process
+    (``BoundKernel.to_code``) can have been generated without the large-class
+    window: with the wrapped policy for a row-packed buffer below it, here an
+    output of 131 rows of 32 columns, 16768 bytes. The launcher refuses that
+    kernel and says what to do."""
+    with (
+        # The admission without the window.
+        patch.object(tcgen05_grouped_descriptors, "LARGE_ALLOC_MIN_BYTES", 0),
+        cuda_binding(static=True, bits=bits, groups=5, rows=131, k=64, n=32) as bound,
+    ):
+        config = helion.Config.from_dict(
+            _config(bound, 2, 32).config | {DESCRIPTOR_KEY: WRAPPED}
+        )
+        native = _native_source(_source(bound, config))
+    kernel = PyCodeCache.load(native)._helion_native_grouped_rna
+    identity = (
+        "wrapped_flat_grouped_descriptors_v1",
+        *(5, 131, 64, 32, bits),
+        *(WRAP_EXTENT, WRAP_STRIDE, EXTRA_EXTENT),
+    )
+    assert [
+        plan["wrapped_grouped_descriptors"]
+        for plan in kernel._helion_cute_wrapper_plans
+    ] == [identity, identity]
+    assert not wrapped_grouped_descriptor_supported(5, 131, 64, 32, bits)
+    with pytest.raises(exc.BackendUnsupported) as refused:
+        _create_cute_wrapper(kernel, (), (32, 12, 1))
+    message = str(refused.value)
+    assert f"= (5, 131, 64, 32, {bits})" in message
+    assert f"span {LARGE_ALLOC_MIN_BYTES} bytes" in message
+    assert "has to be generated again" in message

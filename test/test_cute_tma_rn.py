@@ -8,11 +8,6 @@ from itertools import pairwise
 import pytest
 import torch
 
-from test.test_cute_flat_grouped_ir import _host
-from test.test_cute_flat_grouped_ir import cuda_binding
-from test.test_cute_flat_grouped_public import _native_source
-from test.test_cute_flat_grouped_public import _source
-
 import helion
 from helion._compiler.cute.autotune.heuristics.cute_grouped_rna import (
     CuteGroupedRnaHeuristic,
@@ -40,6 +35,10 @@ from helion._compiler.cute.tcgen05_tma_rn import TMA_RN
 from helion._compiler.cute.tcgen05_tma_rn import WARP_RAW
 from helion._compiler.cute.tcgen05_tma_rn import Tcgen05TmaRnRoles
 from helion._testing import skipUnlessCuteAvailable
+from helion._testing.cute_flat_grouped import bound_host_function as _host
+from helion._testing.cute_flat_grouped import compiled_source as _source
+from helion._testing.cute_flat_grouped import cuda_binding
+from helion._testing.cute_flat_grouped import native_kernel_source as _native_source
 from helion.autotuner.config_generation import ConfigGeneration
 from helion.runtime.cute.launcher import _append_cute_wrapper_plan
 

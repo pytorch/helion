@@ -15,14 +15,14 @@ import torch
 
 from test.test_cute_flat_grouped_codegen import _candidate
 from test.test_cute_flat_grouped_codegen import _ordinary
-from test.test_cute_flat_grouped_ir import _host
-from test.test_cute_flat_grouped_ir import cuda_binding
 
 from helion._compiler.ast_extension import ExtendedAST
 from helion._compiler.cute.tcgen05_flat_grouped_host import prove_flat_grouped_host
 from helion._compiler.cute.tcgen05_flat_grouped_ir import prove_flat_grouped_rna
 from helion._compiler.type_info import LiteralType
 from helion._testing import import_example
+from helion._testing.cute_flat_grouped import bound_host_function as _host
+from helion._testing.cute_flat_grouped import cuda_binding
 
 pytestmark = pytest.mark.cpu_only
 

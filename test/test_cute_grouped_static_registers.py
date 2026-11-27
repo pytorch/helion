@@ -6,8 +6,6 @@ import pytest
 import torch
 
 from .cute_population_contracts import _target
-from .test_cute_grouped_fp32_output import _grouped_fp32_output
-from .test_cute_grouped_grid_multiplier import _config
 import helion
 from helion import exc
 from helion._compiler.cute.tcgen05_config import repair
@@ -16,6 +14,8 @@ from helion._compiler.cute.tcgen05_constants import (
 )
 from helion._testing.cute_codegen import cpu_bind
 from helion._testing.cute_codegen import mock_cuda_unavailable
+from helion._testing.cute_grouped_configs import grid_multiplier_config as _config
+from helion._testing.cute_grouped_offsets import grouped_fp32_output
 
 pytestmark = pytest.mark.cpu_only
 
@@ -28,7 +28,7 @@ def test_grouped_static_registers_preserve_pipeline_lifecycle(multiplier: int) -
         torch.tensor([0, 0, 1, 129, 640], dtype=torch.int32),
     )
     with _target(), mock_cuda_unavailable():
-        bound = cpu_bind(_grouped_fp32_output, args)
+        bound = cpu_bind(grouped_fp32_output, args)
         original = dict(_config(multiplier).config)
         default_code = bound.to_code(helion.Config.from_dict(original))
         original[REGISTER_REALLOCATION] = False
@@ -96,7 +96,7 @@ def test_static_registers_reject_conflicting_consumer_ceiling() -> None:
         torch.tensor([0, 0, 1, 129, 640], dtype=torch.int32),
     )
     with _target(), mock_cuda_unavailable():
-        bound = cpu_bind(_grouped_fp32_output, args)
+        bound = cpu_bind(grouped_fp32_output, args)
         config = dict(_config(2).config)
         config[REGISTER_REALLOCATION] = False
         config["tcgen05_consumer_regs"] = 240

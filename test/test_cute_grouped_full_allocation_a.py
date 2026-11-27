@@ -14,16 +14,19 @@ from test._cute_grouped_gemm_split_sizes import _require_runtime_cuda13_sm100
 from test._cute_grouped_gemm_split_sizes import _selected_config
 
 from .cute_population_contracts import _target
-from .test_cute_grouped_fp32_output import _grouped_fp32_output
-from .test_cute_grouped_grid_multiplier import _config
 import helion
 from helion import exc
 from helion._testing import DEVICE
 from helion._testing import skipUnlessBackends
+from helion._testing.cuda_page_touch import tensor_at_block_end
 from helion._testing.cute_codegen import cpu_bind
 from helion._testing.cute_codegen import forbid_cuda_work
 from helion._testing.cute_codegen import mock_cuda_unavailable
+from helion._testing.cute_grouped_configs import grid_multiplier_config as _config
+from helion._testing.cute_grouped_offsets import grouped_fp32_output
 from helion.runtime.cute.launcher import _append_cute_wrapper_plan
+
+pytestmark = pytest.mark.cpu_only
 
 
 @pytest.mark.parametrize("offset_dtype", [torch.int32, torch.int64])
@@ -38,7 +41,7 @@ def test_global_weights_host_descriptor_matches_device_coordinates(
     config = dict(_config(1).config)
     config["tcgen05_grouped_full_allocation_a"] = True
     with _target(), mock_cuda_unavailable():
-        code = cpu_bind(_grouped_fp32_output, args).to_code(
+        code = cpu_bind(grouped_fp32_output, args).to_code(
             helion.Config.from_dict(config)
         )
     parsed = ast.parse(code)
@@ -80,7 +83,7 @@ def test_global_weights_keeps_feature_tail_on_dynamic_path(cluster_m: int) -> No
         torch.tensor([0, 0, 1, 129, 640], dtype=torch.int32),
     )
     with _target(), mock_cuda_unavailable():
-        bound = cpu_bind(_grouped_fp32_output, args)
+        bound = cpu_bind(grouped_fp32_output, args)
         config = dict((_config(1) if cluster_m == 1 else _selected_config(128)).config)
         bound.to_code(helion.Config.from_dict(config))
         config["tcgen05_grouped_full_allocation_a"] = True
@@ -139,9 +142,7 @@ def test_two_immutable_descriptors_address_each_expert_and_live_interval(
         torch.tensor([0, 0, 1, 129, rows], dtype=offset_dtype),
     )
     with _target(), mock_cuda_unavailable(), forbid_cuda_work():
-        source = cpu_bind(_grouped_fp32_output, args).to_code(
-            _two_config(source_m_tile)
-        )
+        source = cpu_bind(grouped_fp32_output, args).to_code(_two_config(source_m_tile))
     tree = ast.parse(source)
     plans = _plans(tree)
     grouped = next(
@@ -261,7 +262,7 @@ def test_two_ordinary_inputs_keep_the_original_dynamic_descriptors(
         torch.tensor([0, 0, 1, 129, 640], dtype=torch.int32),
     )
     with _target(), mock_cuda_unavailable(), forbid_cuda_work():
-        source = cpu_bind(_grouped_fp32_output, args).to_code(
+        source = cpu_bind(grouped_fp32_output, args).to_code(
             _two_config(source_m_tile, immutable=False)
         )
     ab = next(
@@ -271,6 +272,57 @@ def test_two_ordinary_inputs_keep_the_original_dynamic_descriptors(
     for operand in ("a", "b"):
         assert f"init_tensormap_from_atom(tma_atom_{operand}" in source
         assert f"tma_desc_ptr=tcgen05_grouped_tensormap_{operand}_desc_ptr" in source
+
+
+@skipUnlessBackends(["cute"])
+@pytest.mark.cuda
+def test_two_ordinary_inputs_load_inside_the_packed_rows() -> None:
+    """The dynamic descriptors of short experts at the end of the packed rows.
+
+    Each expert's TensorMap is the template of the whole 160 KiB operand with
+    its address and extents rewritten. It kept that operand's large allocation
+    class, so loads that leave a short expert issued their out-of-bounds
+    requests up to 128 KiB past the packed rows.
+    """
+    _require_runtime_cuda13_sm100()
+    groups, rows, columns, reduction = 8, 640, 512, 128
+    generator = torch.Generator().manual_seed(731)
+    left = torch.randint(0, 9, (rows, reduction), generator=generator).float() / 8
+    right = (
+        torch.randint(-4, 5, (groups, columns, reduction), generator=generator).float()
+        / 8
+    )
+    left, right = left.bfloat16(), right.bfloat16()
+    routing = [0, 80, 160, 240, 320, 400, 480, 639, rows]
+    b = right.cuda()
+    offsets = torch.tensor(routing, dtype=torch.int32, device=DEVICE)
+    kernel = helion.kernel(
+        _device_offsets_kernel.fn,
+        backend="cute",
+        static_shapes=True,
+        autotune_effort="none",
+    )
+    bound = kernel._bind_isolated((left.cuda(), b, offsets))
+    config = _two_config(128, immutable=False)
+    source = bound.to_code(config)
+    for operand in ("a", "b"):
+        assert f"init_tensormap_from_atom(tma_atom_{operand}" in source
+    bound.set_config(config)
+    reference = torch.empty((rows, columns), dtype=torch.float64)
+    for expert, (start, end) in enumerate(itertools.pairwise(routing)):
+        reference[start:end] = left[start:end].double() @ right[expert].double().T
+    with tensor_at_block_end((rows, reduction), torch.bfloat16) as a:
+        a.write(left)
+        result = bound(a.tensor, b, offsets)
+        touches = a.touches()
+        torch.testing.assert_close(
+            result.cpu(), reference.to(torch.bfloat16), atol=0, rtol=0
+        )
+    if not touches.observable:
+        pytest.skip("the kernel's page touches are not observable here")
+    assert touches.past_end_pages == 0, (
+        f"read up to {touches.past_end_reach} bytes past the packed rows"
+    )
 
 
 @pytest.mark.parametrize("source_m_tile", [128, 256])
@@ -287,7 +339,7 @@ def test_two_immutable_inputs_require_index_and_ownership_proofs(
         torch.tensor([0, 0, 1, 129, 640], dtype=torch.int32),
     )
     with _target(), mock_cuda_unavailable(), forbid_cuda_work():
-        bound = cpu_bind(_grouped_fp32_output, args)
+        bound = cpu_bind(grouped_fp32_output, args)
         with (
             patch(f"helion._compiler.cute.cute_mma.{proof}", return_value=False),
             pytest.raises(exc.BackendUnsupported),
@@ -324,7 +376,7 @@ def test_two_immutable_inputs_live_experts_and_cuda_graph_replay(
     offsets = torch.tensor(original, dtype=offset_dtype, device=DEVICE)
     args = (a, b, offsets)
     function = (
-        _grouped_fp32_output.fn
+        grouped_fp32_output.fn
         if output_dtype == torch.float32
         else _device_offsets_kernel.fn
     )

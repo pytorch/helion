@@ -7,10 +7,6 @@ from types import SimpleNamespace
 
 import pytest
 
-from test.test_cute_flat_grouped_ir import cuda_binding
-from test.test_cute_flat_grouped_public import _native_source
-from test.test_cute_flat_grouped_public import _source
-
 import helion
 from helion._compiler.cute.grouped_warp_tf32_kernel import grouped_warp_tf32_module
 from helion._compiler.cute.grouped_warp_tf32_plan import GroupedWarpTF32Plan
@@ -22,6 +18,9 @@ from helion._compiler.cute.tcgen05_flat_grouped_config import (
 from helion._compiler.cute.tcgen05_tma_rn import CONVERSION_KEY
 from helion._compiler.cute.tcgen05_tma_rn import TMA_RN
 from helion._compiler.cute.tcgen05_tma_rn import WARP_RAW
+from helion._testing.cute_flat_grouped import compiled_source as _source
+from helion._testing.cute_flat_grouped import cuda_binding
+from helion._testing.cute_flat_grouped import native_kernel_source as _native_source
 from helion.autotuner.config_generation import ConfigGeneration
 
 pytestmark = pytest.mark.cpu_only

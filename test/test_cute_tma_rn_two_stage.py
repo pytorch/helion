@@ -23,10 +23,6 @@ from cutlass.pipeline import helpers as pipeline_helpers
 from cutlass.utils import blackwell_helpers as sm100
 
 from test.cute_population_contracts import with_flat_min_blocks_default
-from test.test_cute_flat_grouped_ir import _host
-from test.test_cute_flat_grouped_ir import cuda_binding
-from test.test_cute_flat_grouped_public import _native_source
-from test.test_cute_flat_grouped_public import _source
 from test.test_cute_tma_rn import rn_config
 from test.test_cute_tma_rn import schedule
 
@@ -54,6 +50,10 @@ from helion._compiler.cute.tcgen05_operand_transform import prove_operand_stage_
 from helion._compiler.cute.tcgen05_tma_rn import CONVERSION_KEY
 from helion._compiler.cute.tcgen05_tma_rn import TMA_RN
 from helion._compiler.cute.tcgen05_tma_rn import WARP_RAW
+from helion._testing.cute_flat_grouped import bound_host_function as _host
+from helion._testing.cute_flat_grouped import compiled_source as _source
+from helion._testing.cute_flat_grouped import cuda_binding
+from helion._testing.cute_flat_grouped import native_kernel_source as _native_source
 from helion.autotuner.config_generation import ConfigGeneration
 
 pytestmark = pytest.mark.cpu_only

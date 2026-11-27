@@ -369,9 +369,9 @@ the shift.  A config that names the shift, passed to the kernel or read from
 the autotune cache, is accepted, normalized and compiled as before.  The
 docstring of `grouped_d_shift.d_shift_searched` has the rule, the
 measurement, what the gate covers and what lifts it; `KNOWN_GAPS.md` has the
-entries for what remains: grouped-d-shift-store-below-output (a config that
-names the shift) and grouped-rewritten-tensormap-keeps-large-class (the
-descriptors a kernel rewrites per group).
+entry for what remains: grouped-d-shift-store-below-output (a config that
+names the shift).  The descriptors a kernel rewrites per group take the
+small class (section 8).
 
 ## 7. The runtime
 
@@ -411,15 +411,41 @@ of the disk-cache key.  Two sets of module paths are byte-pinned:
   `_pdl_spread_runtime`, `quantized_helpers`, `readonly_packet_load_helpers`,
   `reduce_helpers`, `remainder_fill_runtime`, `resident_reduction_runtime`,
   `single_token_rank1_recurrence`, `split_k_exchange`, `tensor_copy_helpers`,
-  `thread_budget`, `vec_utils`, `warp_atomic_runtime`, `_warp_mma_runtime`,
-  and `helion.runtime.cute.{single,paired,full}_sum`), plus the
-  `helion._compiler.cute.<module>` strings emitters compose in f-strings;
+  `tensormap_alloc_class`, `thread_budget`, `vec_utils`, `warp_atomic_runtime`,
+  `_warp_mma_runtime`, and `helion.runtime.cute.{single,paired,full}_sum`),
+  plus the `helion._compiler.cute.<module>` strings emitters compose in
+  f-strings;
 * the paths `helion/runtime/cute/source_dependencies.py` hashes into the
   disk-cache key (`_COMMON_DEPENDENCIES` and the per-kind tables).
 
 Renaming a module of the first set changes every render that imports it; a
 body edit to a module of the second set changes the cache key, not the render.
 Classify a module by grep before moving it.
+
+One helper edits a structure the driver owns:
+`tensormap_alloc_class.select_small_alloc_class` (and its
+`_every_lane` form, which the flat grouped kernel uses) clears the
+allocation-class selector of a TensorMap template a kernel rewrites per
+group, so that no group keeps the large class of the operand it is cut
+from.  NVIDIA's documentation does not say which bit that is; the code of
+CuTe DSL 4.8.1 does: its experimental `tensormap_replace` clears it on every
+device, without asking the driver, when it replaces an extent or a stride.
+That is not the rewrite the kernels use (`update_tensormap`, which leaves
+the class as encoded), so the helper clears the same bit, as that primitive
+does on every device: `ALLOC_CLASS_QWORD` and `ALLOC_CLASS_LARGE`, which
+`test/test_cute_grouped_descriptors.py` holds to the DSL's constants.  That
+a cleared bit is the small class on the hardware was measured on a B200;
+the page-touch tests (`helion._testing.cuda_page_touch`) check it on the
+device they run on.
+
+The helper covers the descriptors a kernel rewrites.  One static descriptor
+is outside it and outside what PTX ISA 9.5 defines: the store descriptor of
+the bounded D shift (`tcgen05_grouped_d_shift`), which the CuTe DSL encodes
+in its compiled host code, where no helper of this module reaches it.
+Section 6 describes it, what was measured, and the gate that keeps the
+autotuner from selecting it; a config that names the option still runs on
+that descriptor.  The descriptor itself is unchanged, and how to replace it
+is open.
 
 ## 9. Testing seams
 

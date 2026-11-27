@@ -4224,6 +4224,12 @@ def _codegen_cute_store_tcgen05_tile(
                 f"{grouped_d_tensormap_atom}, {grouped_d_tensormap_smem_ptr}, "
                 "0)"
             ),
+            # Rewritten per group like the A/B templates: never the large
+            # allocation class of the whole output
+            # (``tensormap_alloc_class``).
+            dynamic_d_initializer(
+                f"_cute_select_small_alloc_class({grouped_d_tensormap_smem_ptr}, 0)"
+            ),
             dynamic_d_initializer(
                 f"{grouped_d_tensormap_manager}.fence_tensormap_initialization()"
             ),

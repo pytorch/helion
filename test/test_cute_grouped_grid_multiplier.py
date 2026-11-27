@@ -8,30 +8,16 @@ import pytest
 import torch
 
 from .cute_population_contracts import _target
-from .test_cute_grouped_fp32_output import _grouped_fp32_output
-import helion
 from helion._compiler.cute.tcgen05_config import repair
 from helion._testing import DEVICE
 from helion._testing.cute_codegen import cpu_bind
 from helion._testing.cute_codegen import mock_cuda_unavailable
+from helion._testing.cute_grouped_configs import grid_multiplier_config as _config
+from helion._testing.cute_grouped_offsets import grouped_fp32_output
 from helion.runtime.cute.launcher import _append_cute_wrapper_plan
 from helion.runtime.cute.launcher import _tcgen05_grouped_dynamic_tensormap_workspace
 
-
-def _config(multiplier: int) -> helion.Config:
-    return helion.Config(
-        block_sizes=[256, 128, 64],
-        pid_type="persistent_interleaved",
-        num_sm_multiplier=multiplier,
-        tcgen05_cluster_m=1,
-        tcgen05_cluster_n=1,
-        tcgen05_ab_stages=5,
-        tcgen05_acc_stages=2,
-        tcgen05_c_stages=2,
-        tcgen05_num_epi_warps=4,
-        tcgen05_grouped_mode="worklist_nm",
-        tcgen05_grouped_worklist_source_m_tile=32,
-    )
+pytestmark = pytest.mark.cpu_only
 
 
 @pytest.mark.parametrize("offset_dtype", [torch.int32, torch.int64])
@@ -44,7 +30,7 @@ def test_grouped_multiplier_owns_actual_grid_workspace(
         torch.tensor([0, 0, 1, 129, 640], dtype=offset_dtype),
     )
     with _target(), mock_cuda_unavailable():
-        bound = cpu_bind(_grouped_fp32_output, args)
+        bound = cpu_bind(grouped_fp32_output, args)
         config = bound.config_spec.normalized_config(_config(2))
         assert config["num_sm_multiplier"] == 2
         code = bound.to_code(config)
@@ -124,6 +110,7 @@ def test_grouped_multiplier_keeps_cooperative_contracts(change: dict) -> None:
     assert not repair._grouped_grid_multiplier_supported(config)
 
 
+@pytest.mark.cuda
 def test_grouped_multiplier_live_offsets() -> None:
     if not torch.cuda.is_available():
         pytest.skip("requires CUDA")
@@ -138,7 +125,7 @@ def test_grouped_multiplier_live_offsets() -> None:
         (groups, columns, width), generator=generator, device=DEVICE
     ).bfloat16()
     offsets = torch.arange(groups + 1, device=DEVICE, dtype=torch.int32) * rows
-    bound = _grouped_fp32_output.bind((a, b, offsets))
+    bound = grouped_fp32_output.bind((a, b, offsets))
     bound.set_config(_config(2))
     expected = torch.bmm(a.view(groups, rows, width).float(), b.float().transpose(1, 2))
     expected = expected.view(groups * rows, columns)

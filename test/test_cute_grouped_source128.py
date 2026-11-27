@@ -14,7 +14,6 @@ from test._cute_grouped_gemm_split_sizes import _device_split_sizes_kernel
 from test.cute_population_contracts import _target
 from test.cute_population_contracts import checked_initial_population
 from test.test_autotuner_heuristics import _grouped_worklist_kernel_body
-from test.test_cute_grouped_fp32_output import _grouped_fp32_output
 
 import helion
 from helion._compiler.cute.autotune.heuristics import cute as heuristics
@@ -34,6 +33,7 @@ from helion._testing.cute_codegen import forbid_cuda_work
 from helion._testing.cute_codegen import mock_cuda_unavailable
 from helion._testing.cute_d_shift_gate import d_shift_proposals
 from helion._testing.cute_flash import seeds_per_codegen_branch
+from helion._testing.cute_grouped_offsets import grouped_fp32_output
 from helion.autotuner.effort_profile import get_effort_profile
 from helion.autotuner.surrogate_pattern_search import LFBOTreeSearch
 from helion.runtime.cute.launcher import _tcgen05_grouped_device_source_m_tile_supported
@@ -114,7 +114,7 @@ def test_source128_codegen_retains_live_offsets_and_feature_tail(
         torch.tensor([0, 0, 1, 129, 257, 512, 639, 640, 640], dtype=offset_dtype),
     )
     with forbid_cuda_work(), _target(), mock_cuda_unavailable():
-        bound = cpu_bind(_grouped_fp32_output, args)
+        bound = cpu_bind(grouped_fp32_output, args)
         config = bound.config_spec.normalized_config(_config(cluster_m, block_k))
         source = bound.to_code(config)
     plan = next(
@@ -253,7 +253,7 @@ def test_source128_seeds_reach_a_cold_full_initial_population() -> None:
         torch.arange(9, dtype=torch.int32) * 256,
     )
     with forbid_cuda_work(), _target(), mock_cuda_unavailable():
-        bound = cpu_bind(_grouped_fp32_output, args)
+        bound = cpu_bind(grouped_fp32_output, args)
         state = random.getstate()
         try:
             random.seed(281)
@@ -350,10 +350,10 @@ def test_source128_seed_depths_use_physical_smem_and_preserve_old_prefix() -> No
             "helion._compiler.cute.autotune.heuristics.cute._tcgen05_grouped_source128_seeds",
             return_value=[],
         ):
-            previous = cpu_bind(_grouped_fp32_output, args)
+            previous = cpu_bind(grouped_fp32_output, args)
             old_seeds = deepcopy(previous.config_spec.compiler_seed_configs)
             old_default = deepcopy(previous.config_spec.compiler_default_config)
-        bound = cpu_bind(_grouped_fp32_output, args)
+        bound = cpu_bind(grouped_fp32_output, args)
         seeds = bound.config_spec.compiler_seed_configs
         # The M,N tiles follow every N,M seed, so the source128 seeds extend
         # the N,M seeds ahead of them.

@@ -51,10 +51,10 @@ def d_shift_searched() -> bool:
     group's own descriptor is the kernel's copy of the output's host-encoded
     one, and the per-group rewrite replaces the copy's address, extents and
     strides and leaves its allocation class as it is, so a base inside the
-    output does not settle the same rule for it: its tail stores are defined
-    where the copy is small-class or 128 KiB of the output remain from the
-    group's first row.  ``KNOWN_GAPS.md`` lists the descriptors that do not
-    meet this.
+    output does not settle the same rule for it: the kernel clears the
+    copy's class selector ahead of the first rewrite
+    (``tensormap_alloc_class``), which makes its tail stores those of a
+    small-class descriptor.
 
     The gate can go once the shift's descriptor is small-class: a CuTe DSL
     that emits PTX ISA 9.5's ``.alloc_small``,
