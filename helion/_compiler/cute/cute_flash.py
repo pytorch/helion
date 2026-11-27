@@ -124,6 +124,7 @@ from .flash_knobs import _FLASH_ROW_BOUND_TILINGS
 from .flash_knobs import _FLASH_SEARCHED_BIAS_FORMS
 from .flash_knobs import _FLASH_SOFTMAX_REGS_VALUES
 from .flash_knobs import FLASH_AUTOTUNE_PIPELINE_FAMILIES
+from .flash_knobs import FLASH_AUTOTUNE_VALUE_DEPENDENCIES
 from .flash_knobs import FLASH_BIAS_FORM_KEY
 from .flash_knobs import FLASH_BIAS_STAGE_KEY
 from .flash_knobs import FLASH_CAUSAL_HEAD_PAIR_KEY
@@ -222,6 +223,8 @@ from .flash_knobs import FLASH_SPLIT_P_ARRIVE_KEY
 from .flash_knobs import FLASH_STAT_TRANSPORT_CHOICES
 from .flash_knobs import FLASH_STAT_TRANSPORT_KEY
 from .flash_knobs import FLASH_TENSOR_4D_TMA_KEY
+from .flash_knobs import FLASH_TMEM_COLS_CHOICES
+from .flash_knobs import FLASH_TMEM_COLS_KEY
 from .flash_knobs import FLASH_TOPOLOGY_KEY
 from .flash_knobs import FLASH_UNEVEN_KV_RING_KEY
 from .flash_knobs import FLASH_USE_2CTA_KEY
@@ -3477,6 +3480,16 @@ class FlashAttentionConfig:
     # that acquire from waiting on the QK that frees it), where the byte
     # model says it fits (230,400 B at the d256 pair).
     ws_k_stage_extra: int = 0
+    # Tensor-memory columns a CTA allocates. Every tcgen05 body takes all
+    # 512, so an SM runs one CTA at a time: a second resident CTA blocks in
+    # its allocation until the first frees its columns. The single-warpgroup
+    # single-tile body needs one 128-column score tile (P is stored over it)
+    # and a ``head_dim``-column output accumulator, which fit 256 columns up
+    # to head dim 128; with 256 it also gives up its allocation permit as
+    # soon as it has its columns, so a second CTA can allocate the other
+    # half and run beside it where the SM's shared memory holds both. A grid
+    # of up to twice as many tiles as SMs then takes one wave, not two.
+    tmem_cols: int = 512
     # ``row_mma`` family: warps per CTA (each owns an equal share of the keys)
     # and query rows per CTA (8 or 16: one or two octets sharing the warps'
     # K/V shared-memory slices).  Pinned to the defaults for every other
@@ -3602,6 +3615,35 @@ FLASH_KV_TILE_N_CHOICES = (128, 160)
 def _flash_kv_tile_n_fits_tmem(kv_tile_n: int, head_dim: int, s_stage: int) -> bool:
     """Return whether the score and output accumulators leave TMEM headroom."""
     return s_stage * kv_tile_n + 2 * head_dim < FLASH_TMEM_COLUMNS
+
+
+def _flash_tmem_cols_legal(
+    tmem_cols: int,
+    *,
+    topology: str,
+    s_stage: int,
+    small_biased: bool,
+    head_dim: int,
+) -> bool:
+    """Whether a CTA may allocate ``tmem_cols`` tensor-memory columns.
+
+    Every body runs in all ``FLASH_TMEM_COLUMNS``. The 256-column allocation
+    is the single-warpgroup single-tile body's alone (``ws_overlap`` with one
+    score stage; the small biased plan's SIMT body allocates none): its one
+    128-column score tile, which the P tile is stored over, and its
+    ``head_dim``-column output accumulator fit 256 columns up to head dim
+    128. The two-warpgroup body buffers two score tiles before its output
+    accumulator and the pair bodies hold two query tiles: they need more.
+    """
+    if tmem_cols == FLASH_TMEM_COLUMNS:
+        return True
+    return (
+        tmem_cols == 256
+        and topology == "ws_overlap"
+        and s_stage == 1
+        and not small_biased
+        and 128 + head_dim <= tmem_cols
+    )
 
 
 def _flash_kv_tile_n_supported(
@@ -6563,6 +6605,26 @@ def flash_config_from_facts(
         <= FlashScheduleLimits().shared_memory_bytes
     ):
         ws_k_stage_extra = 1
+    # The single-warpgroup single-tile body's tensor-memory allocation: a
+    # request for 256 columns is honored where that body runs and its tiles
+    # fit; every other configuration keeps all the columns and one identity.
+    tmem_cols = FLASH_TMEM_COLUMNS
+    tmem_cols_cfg = _cfg(FLASH_TMEM_COLS_KEY)
+    if tmem_cols_cfg is not None:
+        tmem_cols = int(tmem_cols_cfg)  # type: ignore[arg-type]
+        if tmem_cols not in FLASH_TMEM_COLS_CHOICES:
+            raise InvalidConfig(
+                f"{FLASH_TMEM_COLS_KEY} must be one of {FLASH_TMEM_COLS_CHOICES}, "
+                f"got {tmem_cols_cfg!r}"
+            )
+    if not _flash_tmem_cols_legal(
+        tmem_cols,
+        topology=topology,
+        s_stage=s_stage,
+        small_biased=small_biased_candidate and small_biased,
+        head_dim=head_dim,
+    ):
+        tmem_cols = FLASH_TMEM_COLUMNS
 
     # FA4's overlap_sO_sQ: the staged output tiles live in the dead Q stages,
     # so the staged epilogue costs no shared memory.
@@ -7409,6 +7471,7 @@ def flash_config_from_facts(
         ws_loader_warp=ws_loader_warp,
         ws_mask_phases=ws_mask_phases,
         ws_k_stage_extra=ws_k_stage_extra,
+        tmem_cols=tmem_cols,
         alternating_warpgroups=alternating_warpgroups,
         uneven_kv_ring=uneven_kv_ring,
         o_over_q=o_over_q,
@@ -10016,6 +10079,21 @@ def flash_seeds_from_facts(
         ):
             small_grid[FLASH_WS_ONE_PASS_KEY] = True
         source_variants += ((FLASH_Q_TILE_M_KEY, 64, small_grid),)
+    if device_sm_count > 0 and num_bh is not None and num_bh * num_kv > device_sm_count:
+        # A grid of more 128-row tiles than SMs: on 256 tensor-memory
+        # columns (``cute_flash_tmem_cols``) two CTAs of the single-warpgroup
+        # single-tile body can share an SM, which halves the waves of the
+        # grid where their shared memory fits twice. The seed is the knob's
+        # dependency witness, the body the resolver honors the allocation
+        # on; the variant loop below adds it only where the surface searches
+        # the allocation.
+        source_variants += (
+            (
+                FLASH_TMEM_COLS_KEY,
+                256,
+                FLASH_AUTOTUNE_VALUE_DEPENDENCIES[(FLASH_TMEM_COLS_KEY, 256)],
+            ),
+        )
     # The bodies that state the hooked PASS1's all-kept vote keep it below
     # (every seed carries the fragment default; the campaign bodies that do
     # not state it are switched on there).
@@ -12011,10 +12089,12 @@ def flash_fragments_from_facts(
         value: object,
         family: str,
         pins: Mapping[str, object] | None = None,
+        *,
+        s_stage: int = 2,
     ) -> bool:
         request = {
             FLASH_PIPELINE_FAMILY_KEY: family,
-            FLASH_S_STAGE_KEY: 2,
+            FLASH_S_STAGE_KEY: s_stage,
             FLASH_SMALL_BIASED_KEY: False,
             **(pins or {}),
             key: value,
@@ -12106,6 +12186,24 @@ def flash_fragments_from_facts(
             for family in ws_families
         )
         else (defaults.ws_k_stage_extra,),
+    )
+    # The 256-column tensor-memory allocation is searched where every family
+    # of the surface is a single-tile body, the surface searches the
+    # single-warpgroup body (one score stage) and the resolver honors the
+    # value there for each of those families (the dependency witness pins
+    # that body for the design). The cooperative pair's surfaces search two
+    # score stages only, so they keep all the columns.
+    tmem_cols = enum(
+        defaults.tmem_cols,
+        FLASH_TMEM_COLS_CHOICES,
+        FLASH_TMEM_COLS_CHOICES
+        if ws_bodies_only
+        and 1 in _active_values(s_stage)
+        and all(
+            _ws_knob_honored(FLASH_TMEM_COLS_KEY, 256, family, s_stage=1)
+            for family in ws_families
+        )
+        else (defaults.tmem_cols,),
     )
     # The row-program knobs are searched only when the family itself is in
     # play (its structure is independent of the sequence length, so the
@@ -12219,6 +12317,7 @@ def flash_fragments_from_facts(
         FLASH_WS_LOADER_WARP_KEY: ws_loader_warp,
         FLASH_WS_MASK_PHASES_KEY: ws_mask_phases,
         FLASH_WS_K_STAGE_EXTRA_KEY: ws_k_stage_extra,
+        FLASH_TMEM_COLS_KEY: tmem_cols,
         FLASH_ROW_WARPS_KEY: row_warps,
         FLASH_ROW_TILE_M_KEY: row_tile_m,
         FLASH_P_CHUNK_ARRIVE_KEY: p_chunk,
@@ -26738,8 +26837,38 @@ def emit_flash_device_body(
     future tile's load as soon as its ring slot is released, so the K/V load
     latency overlaps the current tile's MMA + softmax, reducing the dominant
     ``long_scoreboard`` stall.
+
+    Warp 0 issues the Q load and every prologue K/V load before it waits
+    for Q, so their latencies overlap (from a cold L2 each is a round trip
+    to DRAM).
+
+    ``cfg.tmem_cols`` is the CTA's tensor-memory allocation: the score tile
+    at column 0 and the output accumulator at half the allocation. With
+    fewer than all the columns (``cute_flash_tmem_cols``) the allocation's
+    base is no longer column 0 for every CTA (two CTAs can share an SM), so
+    the P operand of the PV MMA is rebuilt over the score tile's pointer
+    (``make_fragment_A`` keeps the layout of its argument, not its address),
+    and the CTA gives up its allocation permit as soon as it has its
+    columns: the next CTA of the SM allocates beside it instead of waiting
+    for it to finish.
     """
     hd = head_dim
+    tmem_cols = cfg.tmem_cols
+    assert _flash_tmem_cols_legal(
+        tmem_cols,
+        topology="ws_overlap",
+        s_stage=1,
+        small_biased=False,
+        head_dim=hd,
+    )
+    shared_sm = tmem_cols != FLASH_TMEM_COLUMNS
+    tmem_early_release = "\nflash_tmem.relinquish_alloc_permit()" if shared_sm else ""
+    tmem_late_release = "" if shared_sm else "flash_tmem.relinquish_alloc_permit()\n"
+    p_operand_rebase = (
+        f"\ntOrP = cute.make_tensor(cute.recast_ptr(tStS.iterator, dtype={io_dtype}), tOrP.layout)"
+        if shared_sm
+        else ""
+    )
     relu_output = _flash_output_relu_enabled(output_epilogue)
     relu_store = (
         "\n    _helion_flash_rt.relu_fragment_inplace(flash_reg)" if relu_output else ""
@@ -26829,7 +26958,7 @@ sV = storage.sV.get_tensor(_flash_vsl.outer, swizzle=_flash_vsl.inner)
 flash_tmem_bar = cutlass_pipeline_flash.NamedBarrier(barrier_id=1, num_threads=128)
 flash_tmem = cutlass_utils_flash.TmemAllocator(
     storage.tmem_holding_buf.ptr, barrier_for_retrieve=flash_tmem_bar)
-flash_tmem.allocate(512)
+flash_tmem.allocate({tmem_cols})
 if warp_idx == 0:
     cute_cpasync_flash.prefetch_descriptor(_flash_tma_q)
     cute_cpasync_flash.prefetch_descriptor(_flash_tma_k)
@@ -26908,12 +27037,12 @@ tQgQ = tQgQ_qdl[None, None, 0, flash_bh]
 tKgK = tKgK_kdl[None, None, 0, {_flash_kv_bh_expr(score_plan.kv_group)}]
 tVgV = tVgV_dkl[None, 0, None, {_flash_kv_bh_expr(score_plan.kv_group)}]
 
-flash_tmem.wait_for_alloc()
+flash_tmem.wait_for_alloc(){tmem_early_release}
 flash_tmem_ptr = flash_tmem.retrieve_ptr(cutlass.Float32)
 tStS = cute.make_tensor(flash_tmem_ptr, tStS.layout)
-tOtO = cute.make_tensor(flash_tmem_ptr + 256, tOtO.layout)
+tOtO = cute.make_tensor(flash_tmem_ptr + {tmem_cols // 2}, tOtO.layout)
 tP = cute.make_tensor(tStS.iterator, _flash_ptl.outer)
-tOrP = flash_pvt.make_fragment_A(tP)
+tOrP = flash_pvt.make_fragment_A(tP){p_operand_rebase}
 
 cS = cute.make_identity_tensor((128, 128))
 tScS = flash_qkt.partition_C(cS)
@@ -26942,7 +27071,6 @@ if warp_idx == 0:
     flash_q_empty = flash_q_prod.acquire_and_advance()
     cute.copy(_flash_tma_q, tQgQ[None, flash_m_tile], tQsQ[None, flash_q_empty.index],
               tma_bar_ptr=flash_q_empty.barrier)
-flash_q_full = flash_q_cons.wait_and_advance()
 
 flash_row_max = cutlass.Float32(-cutlass.Float32.inf)
 flash_row_sum = cutlass.Float32(0.0)
@@ -26963,6 +27091,9 @@ if warp_idx == 0:
         flash_v_empty = flash_v_prod.acquire_and_advance()
         cute.copy(_flash_tma_v, tVgV[None, flash_pf], tVsV[None, flash_v_empty.index],
                   tma_bar_ptr=flash_v_empty.barrier)
+# The Q wait follows the prologue's K/V issues: warp 0 has issued Q and
+# every prologue K/V load before it blocks.
+flash_q_full = flash_q_cons.wait_and_advance()
 
 {row_bound_prelude}
 {loop_body}
@@ -26971,8 +27102,7 @@ if warp_idx == 0:
     flash_acc_empty.commit()
 flash_q_full.release()
 
-flash_tmem.relinquish_alloc_permit()
-flash_acc_full = flash_acc_cons.wait_and_advance()
+{tmem_late_release}flash_acc_full = flash_acc_cons.wait_and_advance()
 flash_o_full = flash_mma_o_cons.wait_and_advance()
 
 {inv_sum}
