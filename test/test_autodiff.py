@@ -49,7 +49,6 @@ for _utf8_locale in ("C.UTF-8", "en_US.UTF-8", "C.utf8", "en_US.utf8"):
 @skipIfMTIA("autodiff not tested on MTIA")
 @onlyBackends(["triton", "cute"])
 @skipIfTileIR("autodiff not tested on TileIR")
-@skipIfXPU("autodiff scan-path backward aborts in torch scan-HOP autograd on XPU")
 class TestAutodiff(RefEagerTestDisabled, TestCase):
     def test_aliased_shape_branches_replay(self):
         self._check_alias_shape_replay(ALIAS_SHAPE_CASES)
@@ -1770,6 +1769,10 @@ class TestAutodiff(RefEagerTestDisabled, TestCase):
     @skipIfCute(
         "the scan-hop backward's Q K^T bmm reduces head_dim across threads with "
         "batch, M and the key chunk already on CuTe's three thread axes"
+    )
+    @skipIfXPU(
+        "Intel's Triton compiler fails in TritonIntelGPURemoveLayoutConversions "
+        "on the padded scan-hop backward"
     )
     def test_example_attention_non_divisible_seqlen(self):
         # Non-block-divisible sequence length: the scan zero-pads the key dim

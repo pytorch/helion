@@ -36,6 +36,8 @@ from helion.runtime.ref_mode import RefMode
 if TYPE_CHECKING:
     from collections.abc import Callable
 
+    from helion.runtime.kernel import BoundKernel
+
 pytestmark = [pytest.mark.cpu_only, skipUnlessBackends(["triton", "cute"])]
 
 
@@ -865,7 +867,9 @@ def test_autodiff_refuses_pruned_required_tensor():
         )
         assert power.args == (1.0, None)
         assert not power.meta["lowering"].input_names
-        analyzer = GraphAnalyzer(copy.deepcopy(root.graph), all_graphs=ir.graphs)
+        analyzer = GraphAnalyzer(
+            copy.deepcopy(root.graph), all_graphs=ir.graphs, device=bound.env.device
+        )
         # This was already unsupported: the extractor emitted pow(1,None)
         # and failed only when the extracted module executed.
         with pytest.raises(
@@ -901,7 +905,9 @@ def test_autodiff_preserves_optional_tensor_none():
         clamp.target = torch.ops.aten.clamp.Tensor
         clamp.args = (*clamp.args[:2], None)
         clamp.kwargs = {}
-        analyzer = GraphAnalyzer(extraction_graph, all_graphs=ir.graphs)
+        analyzer = GraphAnalyzer(
+            extraction_graph, all_graphs=ir.graphs, device=bound.env.device
+        )
         graph, mappings, _, _ = analyzer.extract_computation_graph()
         clamp = next(n for n in graph.nodes if n.target is torch.ops.aten.clamp.Tensor)
         assert clamp.args[2] is None
@@ -944,18 +950,65 @@ def test_scan_combine_refuses_pruned_required_tensor():
             if node.target is torch.ops.aten.pow.Scalar
         )
         assert power.args == (1.0, None)
-        root = next(info for info in ir.graphs if isinstance(info, RootGraphInfo))
-        analyzer = GraphAnalyzer(
-            root.graph,
-            all_graphs=ir.graphs,
-            config_block_sizes={
-                block.block_id: int(block.block_size_source.value)
-                for block in bound.env.block_sizes
-                if isinstance(block.block_size_source, FixedBlockSizeSource)
-            },
-        )
+        analyzer = _fixed_block_analyzer(bound)
         with pytest.raises(
             helion.exc.AutodiffNotSupported,
             match="required Tensor argument exponent was pruned",
         ):
             analyzer.extract_computation_graph()
+
+
+def _fixed_block_analyzer(bound: BoundKernel) -> GraphAnalyzer:
+    ir = bound.host_function.device_ir
+    root = next(info for info in ir.graphs if isinstance(info, RootGraphInfo))
+    return GraphAnalyzer(
+        root.graph,
+        all_graphs=ir.graphs,
+        device=bound.env.device,
+        config_block_sizes={
+            block.block_id: int(block.block_size_source.value)
+            for block in bound.env.block_sizes
+            if isinstance(block.block_size_source, FixedBlockSizeSource)
+        },
+    )
+
+
+@helion.kernel(static_shapes=True, autotune_effort="none")
+def _scan_without_carry(x: torch.Tensor):
+    out = torch.empty_like(x)
+    for rows in hl.tile(x.size(0), block_size=8):
+        for columns in hl.tile(x.size(1), block_size=4):
+            out[rows, columns] = torch.sin(x[rows, columns])
+    return out
+
+
+@helion.kernel(static_shapes=True, autotune_effort="none")
+def _scan_with_carry_and_full(x: torch.Tensor):
+    out = torch.empty((x.size(0),), dtype=x.dtype, device=x.device)
+    for rows in hl.tile(x.size(0), block_size=8):
+        total = hl.zeros([rows], dtype=x.dtype)
+        for columns in hl.tile(x.size(1), block_size=4):
+            scale = hl.full([rows, columns], 2.0, dtype=x.dtype)
+            total = total + torch.sum(scale * x[rows, columns], dim=1)
+        out[rows] = total
+    return out
+
+
+@skipIfRefEager("reads compiler state, which ref mode does not build")
+@pytest.mark.parametrize("kernel", [_scan_without_carry, _scan_with_carry_and_full])
+def test_synthesized_scan_tensors_use_analyzer_device(kernel):
+    with cpu_render_target():
+        bound = cpu_bind(kernel, (torch.empty(8, 16),))
+        analyzer = _fixed_block_analyzer(bound)
+        graph, _, _, _ = analyzer.extract_computation_graph()
+    graphs = [graph, *(combine.graph for combine in analyzer.scan_combines)]
+    devices = [
+        node.kwargs["device"]
+        for g in graphs
+        for node in g.nodes
+        if node.op == "call_function" and "device" in node.kwargs
+    ]
+    devices += [spec.device for spec in analyzer.init_specs]
+    assert analyzer.scan_combines
+    assert devices
+    assert all(device == bound.env.device for device in devices), devices
