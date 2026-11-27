@@ -183,6 +183,7 @@ html_sidebars = {
     "examples/index": [],
     "installation": [],
     "deployment_autotuning": [],
+    "hf_kernels": [],
     "tileir_backend": [],
     "events": [],
 }
