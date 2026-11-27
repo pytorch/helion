@@ -1,17 +1,23 @@
 """The gluon backend on CPU: its analyses as plain functions (the ring's
-register budgets, waits and paced fills, the pipeliner's load arguments, the
-native kernels' compile options and the names its ``tl`` resolves), and whole
-kernels' generated Gluon source (``gluon_cpu_codegen``)."""
+register budgets, tensor-memory ledger, waits and paced fills, the layout
+semantic's operand copies, the pipeliner's load arguments, the native kernels'
+compile options and the names its ``tl`` resolves), and whole kernels'
+generated Gluon source (``gluon_cpu_codegen``)."""
 
 from __future__ import annotations
 
 import ast
+import contextlib
 import functools
+import io
+import itertools
 import os
 from pathlib import Path
 import re
+from types import MethodType
 from types import SimpleNamespace
 from typing import TYPE_CHECKING
+from typing import Any
 from typing import cast
 import unittest
 from unittest import mock
@@ -32,8 +38,13 @@ from helion._testing.distributed_kernels import scatter_ring_kernel
 from helion._testing.distributed_kernels import tagged_ring_exchange_kernel
 from helion._testing.gluon_kernels import crossed_parts
 from helion._testing.gluon_kernels import dot_mm
+from helion._testing.gluon_kernels import gated_wy_beside_scaled_vx
+from helion._testing.gluon_kernels import gated_wy_then_scaled_vx
+from helion._testing.gluon_kernels import live_mm_scale_mm
 from helion._testing.gluon_kernels import mm_then_mm
+from helion._testing.gluon_kernels import mm_then_scaled_mm
 from helion._testing.gluon_kernels import nvfp4_mm
+from helion._testing.gluon_kernels import scale_then_chunked_wx
 from helion._testing.gluon_kernels import scale_then_nested_wx
 from helion._testing.gluon_kernels import scale_then_two_wx
 from helion._testing.gluon_kernels import scale_then_wx
@@ -43,6 +54,7 @@ from helion._testing.gluon_kernels import split_k_gemv
 from helion._testing.gluon_kernels import split_k_halves
 from helion._testing.gluon_kernels import split_k_mm
 from helion._testing.gluon_kernels import split_k_parts
+from helion._testing.gluon_kernels import wx_then_scaled_vx
 from helion._testing.triton_codegen import GLUON_RING_CONFIG as _RING
 from helion._testing.triton_codegen import gluon_cpu_codegen
 from helion._testing.triton_codegen import gluon_tail_ring_config
@@ -60,6 +72,7 @@ from helion._compiler.cross_loop_codegen import TaggedPeerFallback
 from helion._compiler.cross_loop_codegen import _allocation
 from helion._compiler.cross_loop_codegen import _argument_allocations
 from helion._compiler.device_function import SyncRole
+from helion._compiler.triton import gluon_layout
 from helion._compiler.triton import gluon_ops
 from helion._compiler.triton import gluon_pipeline
 from helion._compiler.triton import gluon_ring
@@ -117,8 +130,9 @@ def _scale_then_selected_wx(
 def _scale_then_guarded_wx(
     x: torch.Tensor, w: torch.Tensor, rows: torch.Tensor
 ) -> torch.Tensor:
-    """``scale_then_wx`` with each task's product behind a loaded bound (the
-    root's tasks wait for the first root as a whole, ahead of their loop)."""
+    """``scale_then_wx`` with each task's product behind a loaded bound (a
+    worker's first task waits for the first root as a whole, ahead of the
+    bound)."""
     m, k = x.size()
     n = w.size(0)
     y = torch.empty_like(x)
@@ -294,6 +308,42 @@ class TestAccumulatorRings(TestCase):
                 code = bound.to_triton_code(config)
         self.assertIn("holds an accumulator live with this one", "\n".join(logs.output))
         self.assertNotIn("warp_specialize", code)
+
+    def test_tensor_memory_ledgers_by_root(self) -> None:
+        """Roots' tensor memory, block scales included, is not live together: the
+        tails get the columns the root taking the most leaves."""
+        ring = SimpleNamespace(
+            acc_rings={((128, 64), 1): 0},
+            tmem={1: [(128, 128)], 2: [(128, 64)]},
+            scale_tmem={2: [(128, 64)], 3: [(128, 32)]},
+            scale_slots={},
+            scale_buffers=0,
+            _tmem_share=lambda: 512,
+        )
+        tmem_left = gluon_ring.RingLowering._tmem_left
+        # Accumulator rings: 2 x 64 columns; root 1 takes 128, root 2 64 + 64 of
+        # scales, root 3 32 of scales.
+        self.assertEqual(tmem_left(ring), 512 - 128 - 128)
+        ring.scale_tmem[1] = [(128, 32)]
+        self.assertEqual(tmem_left(ring), 512 - 128 - 160)
+        # A channel's block-scale buffers live for the whole kernel: every root's
+        # charge, ``scale_buffers`` each.  Triton gives a [128, 16] buffer of
+        # 8-bit scales 16 columns, a [32, 32] one 16 too.
+        e4m3 = torch.float8_e4m3fn
+        ring.scale_slots = {
+            (True, 0, e4m3, 2048): gluon_ring._ScaleSlots(
+                "_helion_scales0", 128, 16, "S"
+            ),
+            (True, 1, e4m3, 2048): gluon_ring._ScaleSlots(
+                "_helion_scales1", 32, 32, "S"
+            ),
+        }
+        self.assertEqual(tmem_left(ring), 512 - 128 - 160)
+        ring.scale_buffers = 4
+        self.assertEqual(tmem_left(ring), 512 - 128 - 128 - 160)
+        # Two CTAs a SM: each has half.
+        ring._tmem_share = lambda: 256
+        self.assertEqual(tmem_left(ring), 256 - 128 - 128 - 160)
 
 
 @helion.kernel(static_shapes=True, backend="gluon")
@@ -660,6 +710,37 @@ class TestDsmem(TestCase):
         ):
             with self.subTest(reason=reason):
                 self.assertIn(reason, self._fallback(kernel, args, _DSMEM_RING))
+
+    def test_dropped_entry_warns_once(self) -> None:
+        """An entry the config sets that codegen (overlapping rows) or
+        normalize (a rule broken under every config) turns off warns with its
+        reason (ConfigRequestDropped), once a kernel."""
+        x, w4, part = _split_k_inputs()
+        overlapping = torch.empty(part.numel()).as_strided(
+            part.shape, (part.stride(0), 32, 1)
+        )
+        for kernel, args, reason in (
+            (split_k_parts, (x, w4, overlapping), "the load's region overlaps itself"),
+            (_split_k_parts_variant, (x, w4, part, False, True), "a masked access"),
+        ):
+            # A fresh binding: another test's may have warned already.
+            kernel.reset()
+            with self.subTest(reason=reason), gluon_cpu_codegen():
+                bound = kernel.bind(args)
+                with contextlib.redirect_stderr(io.StringIO()) as stderr:
+                    for _ in range(2):
+                        bound.to_triton_code(helion.Config(**_DSMEM_RING))
+                (line,) = [
+                    line
+                    for line in stderr.getvalue().splitlines()
+                    if "ConfigRequest" in line
+                ]
+                self.assertEqual(
+                    line,
+                    "WARNING[ConfigRequestDropped]: The config asks for "
+                    "cross_loop_dsmem[0]=True, which this kernel drops: part4: "
+                    f"C1: {reason}.",
+                )
 
     def test_codegen_rules_fall_back(self) -> None:
         """The C1 and C2 rules codegen checks turn their entries off: a
@@ -1150,9 +1231,7 @@ class TestTmemPrefetch(TestCase):
                 )
             )
         self.assertNotIn("tail_fill(", plain)
-        functions = {
-            chunk.split("(", 1)[0]: chunk for chunk in code.split("\ndef ")[1:]
-        }
+        functions = _bodies(code)
         mma = functions["_helion_scale_then_wx_mma"]
         self.assertEqual(mma.count("tail_fill("), 1)
         self.assertIn("TAIL=_helion_ring_tail0", mma)
@@ -1169,6 +1248,20 @@ class TestTmemPrefetch(TestCase):
         self.assertTrue(any("HEAD=" in line for line in puts))
 
     @skipIfRefEager("reads compiler state, which ref mode does not build")
+    def test_a_chunked_views_box_takes_a_tail(self) -> None:
+        """A chunked view's weight box ([128, 1, 64]: unit dims dropped, a
+        [128, 64] tile) takes a tail: all 8 steps of a chunk's K loop."""
+        x = torch.empty([32, 1024], dtype=torch.bfloat16)
+        w = torch.empty([256, 2, 512], dtype=torch.bfloat16)
+        with gluon_cpu_codegen():
+            bound = scale_then_chunked_wx.bind((x, w))
+            code = bound.to_triton_code(
+                self._ring(bound, cross_loop_tmem_prefetch=[True])
+            )
+        self.assertEqual(code.count("tail_fill("), 1)
+        self.assertIn("tail_buffers(w_ring_desc, 8, 128, 64)", code)
+
+    @skipIfRefEager("reads compiler state, which ref mode does not build")
     def test_loops_that_take_no_tail(self) -> None:
         """A 64-row weight tile and one of 256-byte rows (two swizzle units a
         row) take no tail, nor a loop under cross_loop_pipeline="barrier" (its
@@ -1178,12 +1271,21 @@ class TestTmemPrefetch(TestCase):
         task loop follows a root barrier's wait (each one's fill would go
         behind the task's waits), or one whose A coordinates read what another
         root writes (an expert id: the fill would load ahead of the wait for
-        it), and each is logged; a view of a load (the
+        it), and each warns (ConfigRequestDropped); a view of a load (the
         weight stored transposed) is no candidate; a config that lowers no ring
-        (one stage) rejects an enabled tail. An enabled loop turned away logs a
-        warning; the others keep their tails."""
+        (one stage) rejects an enabled tail. The loops not turned away keep
+        their tails."""
         x = torch.empty([32, 1024], dtype=torch.bfloat16)
         w = torch.empty([256, 1024], dtype=torch.bfloat16)
+        # Fresh bindings: a warning prints once a binding.
+        for kernel in (
+            scale_then_wx,
+            _w1x_then_w3x,
+            _scale_then_guarded_wx,
+            _scale_then_selected_wx,
+            scale_then_nested_wx,
+        ):
+            kernel.reset()
         with gluon_cpu_codegen():
             bound = scale_then_wx.bind((x, w))
             rows = "tensor memory takes 128 rows of 128 bytes"
@@ -1203,19 +1305,19 @@ class TestTmemPrefetch(TestCase):
                 config = self._ring(bound, **extra, cross_loop_tmem_prefetch=[True])
                 with (
                     self.subTest(**extra),
-                    self.assertLogs(self._LOG, "WARNING") as logs,
+                    contextlib.redirect_stderr(io.StringIO()) as logs,
                 ):
                     code = bound.to_triton_code(config)
                     self.assertNotIn("tail_fill(", code)
-                    self.assertIn(reason, "\n".join(logs.output))
+                    self.assertIn(reason, logs.getvalue())
             pair = _w1x_then_w3x.bind((x, w, torch.empty_like(w)))
             config = self._ring(pair, task_loop=1, cross_loop_tmem_prefetch=[True] * 2)
-            with self.assertLogs(self._LOG, "WARNING") as logs:
+            with contextlib.redirect_stderr(io.StringIO()) as logs:
                 code = pair.to_triton_code(config)
             self.assertIn(
                 "loop 5: an earlier loop reading its tensor-memory buffer follows a "
                 "dependency wait",
-                "\n".join(logs.output),
+                logs.getvalue(),
             )
             self.assertEqual(code.count("tail_fill("), 1)
             guarded = _scale_then_guarded_wx.bind(
@@ -1227,23 +1329,23 @@ class TestTmemPrefetch(TestCase):
                 indexing=[*pointers[:2], "pointer", *["tensor_descriptor"] * 3],
                 cross_loop_tmem_prefetch=[True],
             )
-            with self.assertLogs(self._LOG, "WARNING") as logs:
+            with contextlib.redirect_stderr(io.StringIO()) as logs:
                 code = guarded.to_triton_code(config)
             self.assertIn(
-                "loop 4: a dependency wait precedes its task loop",
-                "\n".join(logs.output),
+                "loop 4: a dependency wait precedes the loop's block",
+                logs.getvalue(),
             )
             self.assertNotIn("tail_fill(", code)
             selected = _scale_then_selected_wx.bind(
                 (x, w.view(2, 128, 1024), torch.empty([1], dtype=torch.int32))
             )
-            with self.assertLogs(self._LOG, "WARNING") as logs:
+            with contextlib.redirect_stderr(io.StringIO()) as logs:
                 code = selected.to_triton_code(
                     self._ring(selected, cross_loop_tmem_prefetch=[True])
                 )
             self.assertIn(
                 "loop 4: A's coordinates follow a dependency wait",
-                "\n".join(logs.output),
+                logs.getvalue(),
             )
             self.assertNotIn("tail_fill(", code)
             nested = scale_then_nested_wx.bind((x, w, torch.empty_like(w)))
@@ -1254,18 +1356,22 @@ class TestTmemPrefetch(TestCase):
                 [s.block_ids for s in nested.config_spec.cross_loop_tmem_prefetch],
                 [[4], [5]],
             )
-            for entry, fills in (([True, True], 1), ([False, True], 0)):
-                config = self._ring(nested, task_loop=1, cross_loop_tmem_prefetch=entry)
-                with (
-                    self.subTest(entry=entry),
-                    self.assertLogs(self._LOG, "WARNING") as logs,
-                ):
-                    code = nested.to_triton_code(config)
-                    self.assertIn(
-                        "loop 5: inside another loop of its task",
-                        "\n".join(logs.output),
+            with contextlib.redirect_stderr(io.StringIO()) as logs:
+                for entry, fills in (([True, True], 1), ([False, True], 0)):
+                    config = self._ring(
+                        nested, task_loop=1, cross_loop_tmem_prefetch=entry
                     )
-                    self.assertEqual(code.count("tail_fill("), fills)
+                    with self.subTest(entry=entry):
+                        code = nested.to_triton_code(config)
+                        self.assertEqual(code.count("tail_fill("), fills)
+            # Once a kernel: both configs turn the inner loop away.
+            self.assertEqual(
+                logs.getvalue().count(
+                    "cross_loop_tmem_prefetch[1]=True, which this kernel drops: "
+                    "loop 5: inside another loop of its task."
+                ),
+                1,
+            )
             with self.assertLogs(self._LOG, "INFO") as logs:
                 transposed = _scale_then_wtx.bind((x, w.T.contiguous()))
             self.assertEqual(len(transposed.config_spec.cross_loop_tmem_prefetch), 0)
@@ -1282,10 +1388,10 @@ class TestTmemPrefetch(TestCase):
     @skipIfRefEager("reads compiler state, which ref mode does not build")
     def test_block_scales_take_from_the_tails_budget(self) -> None:
         """An nvfp4 dot in the K loop's task keeps its block scales in tensor
-        memory beside the two accumulator rings (2 x 64 columns): the scales'
-        48 columns (a_scale's two [128, 16] buffers of 16, b_scale's two
-        [32, 16] ones of 8: Triton spreads each over all 128 lanes) leave 336,
-        10 tiles of 32 (12 without them)."""
+        memory beside the two accumulator rings (2 x 64 columns): a buffer per
+        ring slot of each (``slot_scales``), 96 columns (four slots of a_scale's
+        [128, 16] of 16 and b_scale's [32, 16] of 8: Triton spreads each over all
+        128 lanes), leave 288, 9 tiles of 32 (12 without them)."""
         x = torch.empty([32, 1024], dtype=torch.bfloat16)
         w = torch.empty([256, 1024], dtype=torch.bfloat16)
         a = torch.empty([256, 256], dtype=torch.uint8)
@@ -1300,7 +1406,8 @@ class TestTmemPrefetch(TestCase):
             )
         self.assertIn("_helion_gluon.tmem_dot_scaled(", code)
         self.assertEqual(code.count("tail_fill("), 1)
-        self.assertIn("tail_buffers(w_ring_desc, 10, 128, 64)", code)
+        self.assertEqual(code.count("slot_scales("), 2)
+        self.assertIn("tail_buffers(w_ring_desc, 9, 128, 64)", code)
 
     @skipIfRefEager("reads compiler state, which ref mode does not build")
     def test_tails_share_a_buffer_per_tile_shape(self) -> None:
@@ -1445,6 +1552,267 @@ class TestInbandHold(TestCase):
         self.assertIn("_producer1", holds)
         self.assertEqual({part for part, n in holds.items() if n}, {"_body"}, holds)
         self.assertEqual(holds["_body"], 1)
+
+
+def _bodies(code: str) -> dict[str, str]:
+    """Each generated function's body (its signature dropped), by name."""
+    return {
+        fn.name: "\n".join(ast.unparse(st) for st in fn.body)
+        for fn in ast.parse(code).body
+        if isinstance(fn, ast.FunctionDef)
+    }
+
+
+@skipIfRefEager("reads compiler state, which ref mode does not build")
+class TestFilledOperand(TestCase):
+    def test_a_filled_group_without_a_producer(self) -> None:
+        """A filled operand whose gating group no producer streams (every other
+        operand is ungated) takes no producer for it: on the channel's steps
+        without a fill (the first K loop's, which a fill follows), the body
+        arrives for that group (``ring_pass``) and the weight producer only
+        waits for the slot."""
+        x = torch.empty([64, 512], dtype=torch.bfloat16)
+        w = torch.empty([256, 512], dtype=torch.bfloat16)
+        with gluon_cpu_codegen():
+            bound = wx_then_scaled_vx.bind((x, w, w))
+            slots = len(bound.config_spec.range_warp_specialize)
+            code = bound.to_triton_code(
+                helion.Config(
+                    **_RING,
+                    block_sizes=[128, 32, 64, 64],
+                    range_warp_specializes=[True] * slots,
+                )
+            )
+        functions = _bodies(code)
+        prefix = "_helion_wx_then_scaled_vx"
+        self.assertNotIn(f"{prefix}_producer1", functions)
+        fill = re.search(
+            r"_helion_ring\.ring_fill\(\w+, (\w+), ", functions[f"{prefix}_body"]
+        )
+        assert fill is not None
+        (full,) = fill.groups()
+        producer = functions[f"{prefix}_producer0"]
+        self.assertRegex(producer, rf"ring_skip\({full}, \w+, \w+, \w+, \w+, False\)")
+        self.assertRegex(
+            functions[f"{prefix}_body"], rf"ring_pass\({full}, \w+, \w+, \w+, 1\)"
+        )
+        self.assertRegex(
+            functions[prefix], rf"{full} = _helion_ring\.ring_barriers\(\w+, 2\)"
+        )
+        self.assertIn("def _helion_wx_then_scaled_vx_mma(", code)
+        self.assertNotIn("_helion_gluon.stage(", code)
+
+    def test_a_filled_group_streamed_on_the_channel(self) -> None:
+        """A computed operand whose gating group another dot of the channel
+        streams (the first root's output through a projection, gated) is not
+        filled: the body could not arrive for that group at the steps it
+        passes.  The kernel is generated again with the ring but no fills
+        (``RingFillFallback``), that dot issuing from the body, whether the two
+        dots are roots of their own or share a K loop."""
+        x = torch.empty([64, 1024], dtype=torch.bfloat16)
+        g = torch.empty([1024], dtype=torch.bfloat16)
+        w = torch.empty([256, 1024], dtype=torch.bfloat16)
+        for kernel, block_sizes in (
+            (gated_wy_then_scaled_vx, [64, 64, 128, 32, 64, 128, 32, 64]),
+            (gated_wy_beside_scaled_vx, [64, 64, 128, 32, 64]),
+        ):
+            with self.subTest(kernel=kernel.name), gluon_cpu_codegen():
+                bound = kernel.bind((x, g, w, w))
+                slots = len(bound.config_spec.range_warp_specialize)
+                with self.assertLogs(
+                    "helion._compiler.triton.gluon_ring", level="INFO"
+                ) as logs:
+                    code = bound.to_triton_code(
+                        helion.Config(
+                            **_RING,
+                            block_sizes=block_sizes,
+                            num_warps=4,
+                            range_warp_specializes=[True] * slots,
+                            cross_loop_pipeline="static",
+                        )
+                    )
+                self.assertTrue(
+                    any("gluon ring fills disabled" in line for line in logs.output)
+                )
+                self.assertFalse(
+                    any("gluon ring disabled" in line for line in logs.output)
+                )
+                self.assertNotIn("_helion_ring.ring_fill(", code)
+                self.assertIn(f"def _helion_{kernel.name}_mma(", code)
+                self.assertIn("_helion_gluon.stage(", code)
+
+    def test_barrier_mode_skips_once_a_step(self) -> None:
+        """Under barrier mode (phase loops sharing the roots' statements) a
+        filled operand of the second root (the first root's output, a plain
+        load there, doubled) gets the weight producer's arrival once on each
+        of the first root's steps."""
+        x = torch.empty([128, 1024], dtype=torch.bfloat16)
+        w = torch.empty([1024, 128], dtype=torch.bfloat16)
+        v = torch.empty([128, 128], dtype=torch.bfloat16)
+        with gluon_cpu_codegen():
+            bound = mm_then_scaled_mm.bind((x, w, v))
+            slots = len(bound.config_spec.range_warp_specialize)
+            code = bound.to_triton_code(
+                helion.Config(
+                    **_RING,
+                    block_sizes=[128, 128, 64, 128, 64, 64],
+                    num_warps=4,
+                    range_warp_specializes=[True] * slots,
+                    cross_loop_pipeline="barrier",
+                )
+            )
+        self.assertIn("_helion_ring.ring_fill(", code)
+        self.assertNotIn("def _helion_mm_then_scaled_mm_producer1(", code)
+        self.assertIn("ring_skip(", code)
+        self.assertNotRegex(code, r"ring_skip\([^\n]*\n *_helion_ring\.ring_skip\(")
+
+
+@helion.kernel(static_shapes=True, backend="gluon")
+def _mm_prefetch_scale(
+    x: torch.Tensor, y: torch.Tensor, rows: torch.Tensor
+) -> torch.Tensor:
+    """``live_mm_scale_mm``'s first two roots, a code prefetch between them:
+    guarded roots, the second waiting on the first key by key."""
+    m, k = x.size()
+    _, n = y.size()
+    h = torch.zeros([m, n], dtype=torch.float32, device=x.device)
+    h_sum = torch.zeros([n // 128, m], dtype=torch.float32, device=x.device)
+    scaled = torch.zeros([m, n], dtype=torch.bfloat16, device=x.device)
+    for tile_n, tile_m in hl.tile([n, m], block_size=[128, None]):
+        if tile_m.begin < rows[0]:
+            acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+            for tile_k in hl.tile(k):
+                acc = hl.dot(x[tile_m, tile_k], y[tile_k, tile_n], acc=acc)
+            h[tile_m, tile_n] = acc
+            h_sum[tile_n.id, tile_m] = torch.sum(acc, dim=1)
+    hl.prefetch_code()
+    for tile_c, tile_r in hl.tile([n, m], block_size=[64, None]):
+        if tile_r.begin < rows[1]:
+            total = torch.sum(h_sum[:, tile_r], dim=0)
+            scaled[tile_r, tile_c] = (h[tile_r, tile_c] * total[:, None]).to(
+                torch.bfloat16
+            )
+    return scaled
+
+
+def _claimed_live_mm_scale_mm() -> tuple[BoundKernel, dict[str, Any]]:
+    """``live_mm_scale_mm`` over 64 row tiles, bound on CPU, and a claimed ring
+    config of it."""
+    args = (
+        torch.empty([128 * 64, 128], dtype=torch.bfloat16),
+        torch.empty([128, 512], dtype=torch.bfloat16),
+        torch.empty([512, 512], dtype=torch.bfloat16),
+        torch.empty([2], dtype=torch.int32),
+    )
+    with gluon_cpu_codegen():
+        bound = live_mm_scale_mm.bind(args)
+    return bound, {
+        **_RING,
+        "block_sizes": [128, 64, 128, 128, 64],
+        "cross_loop_pipeline": "dynamic",
+    }
+
+
+@skipIfRefEager("reads compiler state, which ref mode does not build")
+class TestClaimGroups(TestCase):
+    def test_claim_groups_by_hand(self) -> None:
+        """``cross_loop_claim_groups`` is a hand override the search never
+        proposes: a bool whatever the pipeline, False no entry, kept only for
+        dynamic workers under a ring; on a ring that falls back at codegen it is
+        an error, as the other hand-set ring overrides are."""
+        bound, ring = _claimed_live_mm_scale_mm()
+        spec = bound.config_spec
+        self.assertNotIn(
+            "cross_loop_claim_groups", {d.name for d in spec.iter_search_dimensions()}
+        )
+        config = {**ring, "cross_loop_claim_groups": True}
+        spec.normalize(config)
+        self.assertIs(config["cross_loop_claim_groups"], True)
+        for off in (
+            {"cross_loop_claim_groups": False},
+            {"cross_loop_claim_groups": True, "cross_loop_pipeline": "static"},
+            {"cross_loop_claim_groups": True, "num_stages": 1},  # no ring
+        ):
+            config = {**ring, **off}
+            spec.normalize(config)
+            self.assertNotIn("cross_loop_claim_groups", config)
+        for wrong, pipeline in itertools.product((1, "yes"), ("dynamic", "static")):
+            with (
+                self.subTest(cross_loop_claim_groups=wrong, pipeline=pipeline),
+                self.assertRaises(helion.exc.InvalidConfig),
+            ):
+                spec.normalize(
+                    {
+                        **ring,
+                        "cross_loop_claim_groups": wrong,
+                        "cross_loop_pipeline": pipeline,
+                    }
+                )
+        # Tensor descriptors for stores only: a ring by the config, none at
+        # codegen (no load streams through it), so the key is an error there.
+        indexing = ["pointer"] * len(ring["indexing"])
+        for fact in spec.memory_op_facts:
+            if fact.kind == "store":
+                indexing[fact.indexing_index] = "tensor_descriptor"
+        ring["indexing"] = indexing
+        with (
+            gluon_cpu_codegen(),
+            self.assertRaisesRegex(helion.exc.InvalidConfig, "cross_loop_claim_groups"),
+        ):
+            bound.to_triton_code(helion.Config(**ring, cross_loop_claim_groups=True))
+
+    def test_a_light_ticket_paces_the_next_claim(self) -> None:
+        """A group root reading only through plain loads (``live_mm_scale_mm``'s
+        scaling root, its ``h_sum`` and ``h`` reads pointers) has no step on the
+        claiming producer's channel: after its ticket the producer's step count
+        is still the mark, so ``task_pace`` waits until its worker took it.
+        The roots with a dot on the ring (the matmuls, roots 0 and 2) are its
+        streaming roots: the second matmul's keys follow the first's 64."""
+        bound, ring = _claimed_live_mm_scale_mm()
+        ring["indexing"] = ["tensor_descriptor"] * 13
+        ring["indexing"][6:8] = ["pointer", "pointer"]  # h_sum and h
+        with (
+            gluon_cpu_codegen(),
+            self.assertLogs("helion._compiler.cross_loop_codegen", "INFO") as logs,
+        ):
+            code = bound.to_triton_code(
+                helion.Config(**ring, cross_loop_claim_groups=True)
+            )
+        match = re.search(r"_group_claim\([^,]+, (\d+),", code)  # the workers
+        assert match is not None
+        wave = -(-int(match[1]) // 4)  # the scaling root: a wave of 4-task keys
+        self.assertIn(f"(key lags [0, {wave}, 64] rounds)", "\n".join(logs.output))
+        claimer = _bodies(code)["_helion_live_mm_scale_mm_producer0"]
+        loop = claimer.split("while tile_dependency_claim >> 32 < 3:", 1)[1]
+        # Steps for the matmuls' tickets (roots 0 and 2), none for root 1's.
+        self.assertEqual(loop.count("_helion_ring_step0 = _helion_ring_step0 + 1"), 2)
+        self.assertNotIn("tile_dependency_claim >> 32 == 1", loop)
+        self.assertIn(
+            "_helion_ring.task_pace(_helion_task_empty, _helion_task_step, "
+            "_helion_task_S, _helion_ring_step0 == _helion_task_mark)",
+            loop,
+        )
+
+    def test_a_group_ends_before_a_code_prefetch(self) -> None:
+        """A claim group ends before the root a code prefetch precedes, as before
+        a trigger's, so that the prefetch runs between the roots' tasks: these
+        roots would otherwise claim one stream."""
+        x = torch.empty([128 * 64, 128], dtype=torch.bfloat16)
+        y = torch.empty([128, 512], dtype=torch.bfloat16)
+        rows = torch.empty([2], dtype=torch.int32)
+        config = helion.Config(
+            **_RING,
+            block_sizes=[128, 64, 64],
+            cross_loop_pipeline="dynamic",
+            cross_loop_claim_groups=True,
+        )
+        with gluon_cpu_codegen():
+            code = _mm_prefetch_scale.bind((x, y, rows)).to_triton_code(config)
+        self.assertNotIn("_group_claim(", code)
+        self.assertEqual(code.count("helion_dist_utils._claim("), 2)
+        # Claimed dispatch's resident workers count readers from the last.
+        rank = "tl.num_programs(0) - 1 - tl.program_id(0)"
+        self.assertEqual(code.count(f"helion_prefetch_code.prefetch_code({rank})"), 1)
 
 
 class TestWorkerRegisters(TestCase):
@@ -1697,6 +2065,60 @@ class TestFirstWaits(TestCase):
 
 
 @helion.kernel(static_shapes=True, backend="gluon")
+def _two_reads_then_publish(
+    x: torch.Tensor, z: torch.Tensor, part: torch.Tensor, aux: torch.Tensor
+) -> torch.Tensor:
+    """A task reading two ring slots into registers (``z``'s row and that of
+    ``part``, which the first root writes), then storing what the last root
+    reads (its publication) and ``aux``, which nothing in the launch reads."""
+    rows, _ = x.size()
+    mid = torch.empty_like(part)
+    out = torch.empty_like(part)
+    for tile_r in hl.tile(rows, block_size=1):
+        part[tile_r.begin, :] = x[tile_r.begin, :] * 2.0
+    for tile_r in hl.tile(rows, block_size=1):
+        a = z[tile_r.begin, :]
+        b = part[tile_r.begin, :]
+        aux[tile_r.begin, :] = a * b
+        mid[tile_r.begin, :] = a + b
+    for tile_r in hl.tile(rows, block_size=1):
+        out[tile_r.begin, :] = mid[tile_r.begin, :] * 3.0
+    return out
+
+
+@skipIfRefEager("reads generated code")
+class TestRingSteps(TestCase):
+    def test_reads_keep_their_steps_past_the_publication(self) -> None:
+        """The task publishes ahead of its store of ``aux``, which trails, but
+        not its first read's step: the reads' step counters are one channel
+        counter once the ring kernel names them, so the second read's acquire
+        follows the first read's increment.  Each partition takes one ring
+        step per read (the second root's two, between each root's one)."""
+        args = tuple(torch.empty([8, 128]) for _ in range(4))
+        with gluon_cpu_codegen():
+            code = _two_reads_then_publish.bind(args).to_triton_code(
+                helion.Config(**_RING, cross_loop_pipeline="dynamic")
+            )
+        functions = {
+            fn.name: ast.unparse(fn)
+            for fn in ast.parse(code).body
+            if isinstance(fn, ast.FunctionDef)
+        }
+        prefix = "_helion__two_reads_then_publish"
+        body = functions[f"{prefix}_body"]
+        mid, aux = (body.index(f"descriptor({t}_desc") for t in ("mid", "aux"))
+        self.assertLess(body.index("atomic_add", mid), aux)
+        for name in ("body", "producer0", "producer1"):
+            steps = re.findall(
+                r"ring_(?:acquire|put|skip)\(|_helion_ring_step0 \+ 1",
+                functions[f"{prefix}_{name}"],
+            )
+            self.assertEqual(
+                ["+" if s.endswith("+ 1") else "S" for s in steps], ["S", "+"] * 4, name
+            )
+
+
+@helion.kernel(static_shapes=True, backend="gluon")
 def _rereads_last_iteration(x: torch.Tensor, scratch: torch.Tensor) -> torch.Tensor:
     m, n = x.shape
     out = torch.empty_like(x)
@@ -1753,6 +2175,47 @@ class TestPartitionWaits(TestCase):
             x_reads = frozenset([_allocation(fakes["x"])])
             self.assertTrue(gluon_ring._orders(function, wait, scratch_reads, named))  # pyrefly: ignore
             self.assertFalse(gluon_ring._orders(function, wait, x_reads, named))  # pyrefly: ignore
+
+    def test_body_drops_waits_its_ring_acquires_cover(self) -> None:
+        """A consumer's ``ring_acquire`` repeats the producer's ``ring_put``
+        arguments (the slot's descriptor and coordinates) but reads shared memory
+        only: a wait ordering nothing else the body reads is dropped (the producer
+        loading the slot keeps it); a wait also ordering the root's barrier
+        publication, or a plain load of the same allocation, keeps it."""
+
+        class Function:
+            def __init__(self) -> None:
+                self.sync_roles = {
+                    "reads": SyncRole("wait", covers=frozenset([1])),
+                    "publishes": SyncRole(
+                        "wait", covers=frozenset([1]), publication=True
+                    ),
+                }
+
+            def sync_names(self, *kinds: str) -> set[str]:
+                return {n for n, r in self.sync_roles.items() if r.kind in kinds}
+
+        def kept(wait: str, plain_load: bool = False) -> bool:
+            body = ast.parse(
+                f"{wait} = 0\n"
+                "slot = _helion_ring.ring_acquire(buf, full, empty, step, S, "
+                "c_ring_desc, (tl.cast(o, tl.int32),), True, nbytes, box)\n"
+                "v = _helion_ring.ring_read(slot, empty, step, S, True)\n"
+                + ("u = tl.load(c + o)\n" if plain_load else "")
+                + "tl.store(out + o, v)\n"
+            ).body
+            # c_ring_desc and c name allocation 1, out allocation 2.
+            names = {"c_ring_desc": 1, "c": 1, "out": 2}
+            with patch.object(gluon_ring, "_argument_allocations", return_value=names):
+                result = gluon_ring._without_waits(body, Function(), frozenset())  # pyrefly: ignore
+            return any(
+                isinstance(st, ast.Assign) and wait in gluon_ring._stored_names([st])
+                for st in result
+            )
+
+        self.assertFalse(kept("reads"))
+        self.assertTrue(kept("publishes"))
+        self.assertTrue(kept("reads", plain_load=True))
 
     def test_partitions_keep_only_waits_ordering_their_reads(self) -> None:
         """A partition keeps a wait only if it orders a read the partition makes;
@@ -1875,6 +2338,38 @@ class TestPacedFill(TestCase):
         self.assertEqual(run("w = 0"), ["w = 0"])
 
 
+class TestLayoutSemantic(TestCase):
+    def test_an_op_consumes_its_operands_once(self) -> None:
+        """An override consuming an operand ``_wrap`` gave its op gets it back
+        unchanged (consumed again, one that cannot replay would leave its layout
+        to a copy); a re-emitted op (``_call``) is another consumer and takes a
+        copy, as does any op of a value another op consumed."""
+
+        class Auto:
+            def __init__(self, i: int) -> None:
+                self.handle = SimpleNamespace(id=lambda: i)
+
+        copies: list[object] = []
+
+        def again(x: object) -> Auto:
+            copies.append(x)
+            return Auto(100 + len(copies))
+
+        semantic = gluon_layout.HelionGluonSemantic
+        sem = SimpleNamespace(meta={}, operands=frozenset([1]), _again=again)
+        sem._m = MethodType(semantic._m, sem)
+        consume = MethodType(semantic._consume, sem)
+        own, other = Auto(1), Auto(2)
+        for x in (own, other):
+            sem._m(x).consumed = True
+        with patch.object(gluon_layout, "_is_auto", lambda x: isinstance(x, Auto)):
+            self.assertIs(consume([own])[0], own)
+            self.assertEqual(copies, [])
+            self.assertIsNot(consume([own], fresh=True)[0], own)
+            self.assertIsNot(consume([other])[0], other)
+        self.assertEqual(copies, [own, other])
+
+
 class TestTlNamespace(TestCase):
     def test_every_emitted_name_resolves(self) -> None:
         """Every ``tl.X`` the Triton lowering emits resolves in a gluon kernel's
@@ -1957,6 +2452,32 @@ class TestNativeKernel(TestCase):
         backend = SimpleNamespace(parse_options=parse_options, parse_attr=str)
         kernel._pack_args(backend, {"num_warps": 4}, {"x": 1}, [("i32", "")], None)
         self.assertEqual(options, {"maxnreg": 128, "num_warps": 4})
+
+
+class TestBodyPipeline(TestCase):
+    @skipIfRefEager("checks generated code")
+    def test_range_num_stages_beside_tensor_descriptors(self) -> None:
+        """A loop's ``range_num_stages`` sets the depth of its body pipeline
+        (``pipe_alloc``) in a kernel with tensor-descriptor indexing too: gluon
+        builds every descriptor on the host, so the knob is not dropped."""
+        x = torch.empty([256, 512], dtype=torch.bfloat16)
+        y = torch.empty([512, 256], dtype=torch.bfloat16)
+        with gluon_cpu_codegen():
+            bound = dot_mm.bind((x, y))
+            for stages in (0, 2, 3):
+                code = bound.to_triton_code(
+                    helion.Config(
+                        block_sizes=[128, 128, 64],
+                        num_stages=4,
+                        num_warps=4,
+                        indexing=["pointer", "pointer", "tensor_descriptor"],
+                        range_num_stages=[0, stages],
+                    )
+                )
+                depths = re.findall(
+                    r"pipe_alloc\(.*, (\d+), (?:True|False), True\)", code
+                )
+                self.assertEqual(depths, [str(stages or 4)] * 2, msg=f"stages={stages}")
 
 
 if __name__ == "__main__":

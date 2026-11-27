@@ -1039,6 +1039,7 @@ class GluonBackend(TritonBackend):
             "cross_loop_tmem_prefetch",
             "cross_loop_dsmem",
             "worker_registers",
+            "cross_loop_claim_groups",
         ):
             return True
         return key not in self._IGNORED_KEYS and super().supports_config_key(key)

@@ -1180,7 +1180,11 @@ class StaticPipelinePlan:
         )
 
     def root_barrier_arrival_count(self, root: int) -> int:
-        """Return the exact number of physical publishers for one root."""
+        """Return the exact number of physical publishers for one root under
+        the plan's placement.  Codegen's claim groups (formed after the plan)
+        publish each member from every worker after the group's loop, so a
+        single-wave member's barrier counts the launch's workers instead
+        (``root_barrier_dependency`` in cross_loop_codegen)."""
         if root in self.continuation_roots:
             return self.execution_orders[root].task_count
         return self.publisher_count(root)
@@ -3095,7 +3099,12 @@ def _finalize_emitted_synchronization(
     obligations_by_root_pair: ObligationsByRootPair,
     readiness_counters: tuple[ReadinessCounterPlan, ...],
 ) -> tuple[tuple[ReadinessCounterPlan, ...], frozenset[tuple[int, int]]]:
-    """Select fallback barriers and remove counter consumers they subsume."""
+    """Select fallback barriers and remove the counter waits and arrivals they
+    subsume.  A root barrier orders every task of its producer before every
+    task of its consumer: a consumer every producer is barrier-ordered before
+    (directly or transitively) needs no counter wait, and a producer whose
+    barrier every consumer waits on needs no counter arrival, since that wait
+    orders all of its accesses (not only those no counter orders)."""
     readiness_counters = tuple(
         plan
         for plan in readiness_counters
@@ -3107,6 +3116,7 @@ def _finalize_emitted_synchronization(
         covered_obligations=covered_obligations,
     )
     root_order_edges = _root_barrier_reachability(root_barrier_edges)
+    pair_obligations = dict(obligations_by_root_pair)
     retained: list[ReadinessCounterPlan] = []
     for plan in readiness_counters:
         kept = tuple(
@@ -3120,10 +3130,45 @@ def _finalize_emitted_synchronization(
         )
         if not kept:
             continue
+        consumers = tuple(consumer for _index, consumer in kept)
+        # A continuation runs on its producers' arrivals: they all stay.
+        barrier_producers = (
+            {
+                producer.producer_root
+                for producer in plan.producers
+                if all(
+                    (producer.producer_root, consumer.consumer_root)
+                    in root_barrier_edges
+                    for consumer in consumers
+                )
+            }
+            if plan.continuation_consumer_index is None
+            else set()
+        )
+        producers = plan.producers
+        if barrier_producers:
+            producers = tuple(
+                producer
+                for producer in producers
+                if producer.producer_root not in barrier_producers
+            )
+            consumers = tuple(
+                dataclasses.replace(
+                    consumer,
+                    covered_obligations=consumer.covered_obligations.difference(
+                        *(
+                            pair_obligations.get((root, consumer.consumer_root), ())
+                            for root in barrier_producers
+                        )
+                    ),
+                )
+                for consumer in consumers
+            )
         retained.append(
             dataclasses.replace(
                 plan,
-                consumers=tuple(consumer for _index, consumer in kept),
+                producers=producers,
+                consumers=consumers,
                 continuation_consumer_index=next(
                     (
                         new

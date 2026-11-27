@@ -68,12 +68,16 @@ def _slab_offsets(
     subscript: list[object],
     *,
     store: int,
-) -> tuple[str, str, int, int]:
+) -> tuple[str, str, int, int, str | None]:
     """The tile's byte offsets into ``CLUSTER_SMEM`` (a lifted name), its
-    shape, the 32-bit elements a thread moves at once and the threads holding
-    each element (one of which sends it), for the transport's ``store``-th
-    store or (-1) its load: a ranged index (the slab's ``store_ranges`` or
-    ``load_ranges``) counts from its tile's first element."""
+    shape, the 32-bit elements a thread moves at once, the threads holding
+    each element (one of which sends it) and the load's tile mask (a lifted
+    name, None: unmasked), for the transport's ``store``-th store or (-1) its
+    load: a ranged index (the slab's ``store_ranges`` or ``load_ranges``)
+    counts from its tile's first element.  A load's padded full slice (``6``
+    columns in a tile of 8) reads the slab only where its mask holds: its
+    padding lanes' offsets point at the slab's first element, and the receive
+    gives them a masked load's zero."""
     slab = transport.slab
     for_store = store >= 0
     strides, ranges = (
@@ -84,7 +88,7 @@ def _slab_offsets(
     per_dim = SubscriptIndexing.compute_per_dim_indexing(
         state, fake_tensor, subscript, for_store=for_store
     )
-    if per_dim.has_mask():
+    if per_dim.has_mask() and for_store:
         raise transport.fallback("C1: a masked tile")
     if len(subscript) != len(strides):
         raise transport.fallback("C1: a subscript of new or elided dimensions")
@@ -123,12 +127,16 @@ def _slab_offsets(
     offsets = " + ".join(
         [str(transport.buffer), *terms, env.backend.zeros_expr(shape_str, "tl.int32")]
     )
+    mask = None
+    if per_dim.has_mask():
+        mask = state.codegen.lift(per_dim.mask_expr, dce=True, prefix="cluster_mask").id
+        offsets = f"tl.where({mask}, {offsets}, {transport.buffer})"
     name = state.codegen.lift(
         expr_from_string(f"tl.cast({offsets}, tl.int32)"),
         dce=True,
         prefix="cluster_offsets",
     ).id
-    return name, shape_str, vec, copies
+    return name, shape_str, vec, copies, mask
 
 
 def dsmem_store_codegen(
@@ -167,7 +175,7 @@ def dsmem_store_codegen(
             for transport, index in transports
         ]
         # The store's tile, the same for every transport.
-        _, shape, _, _ = slabs[0]
+        _, shape, _, _, _ = slabs[0]
         words = state.codegen.lift(
             expr_from_string(
                 f"tl.broadcast_to(tl.cast({{value}}, {dtype}), {shape})",
@@ -176,7 +184,7 @@ def dsmem_store_codegen(
             dce=True,
             prefix="cluster_words",
         ).id
-        for (transport, _), (offsets, _, vec, copies) in zip(
+        for (transport, _), (offsets, _, vec, copies, _) in zip(
             transports, slabs, strict=True
         ):
             # Every rank's slab for a per-rank consumer or a replicated slab,
@@ -220,13 +228,16 @@ def dsmem_load_codegen(state: CodegenState, codegen_load: LoadCodegen) -> LoadCo
     ) -> ast.AST:
         if extra_mask is not None:
             raise transport.fallback("C1: a masked load")
-        offsets, _, vec, _ = _slab_offsets(
+        offsets, _, vec, _, mask = _slab_offsets(
             state, transport, fake_tensor, subscript, store=-1
         )
         dtype = CompileEnvironment.current().backend.dtype_str(fake_tensor.dtype)
-        return expr_from_string(
+        received = (
             f"_helion_gluon.cluster_recv({offsets}, {dtype}, {transport.barrier}, "
             f"{vec})"
         )
+        if mask is not None:
+            received = f"tl.where({mask}, {received}, 0)"
+        return expr_from_string(received)
 
     return receive

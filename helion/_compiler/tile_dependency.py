@@ -254,6 +254,67 @@ def _concrete_integer(value: IntegerExpression, *, description: str) -> int:
     return int(expression)
 
 
+def _projected_source_span(
+    bounds: tuple[sympy.Expr, sympy.Expr, int],
+    count: sympy.Expr,
+) -> tuple[int, int] | None:
+    """The first and last value of a source axis's ``(begin, end, step)``
+    bounds inside its ``count`` values (a piece's bounds may run past the
+    axis), when they are concrete and the run is nonempty."""
+    begin, end, step = bounds
+    try:
+        first = _concrete_integer(begin, description="projected source begin")
+        stop = _concrete_integer(end, description="projected source end")
+    except ValueError:
+        return None
+    count = sympy.sympify(count)
+    if isinstance(count, sympy.Integer):
+        stop = min(stop, int(count))
+    elif not _is_provably_nonnegative(count - stop, None):
+        return None
+    first = first % step if first < 0 else first
+    if stop <= first:
+        return None
+    return first, first + (stop - first - 1) // step * step
+
+
+def _projected_floor_range(
+    begin: sympy.Expr,
+    symbol: sympy.Symbol,
+    bounds: tuple[sympy.Expr, sympy.Expr, int],
+    count: sympy.Expr,
+) -> tuple[sympy.Expr, sympy.Expr] | None:
+    """The union of ``[f(x), f(x) + 1)``, ``f(x) = r + (s * x + b) // w`` (a
+    block mapping, as ``Incidence.from_fibers`` derives; sympy moves the
+    multiples of ``w`` out of the floor into ``r``), over ``x`` in ``bounds``
+    (of ``count`` values): one range while a step of ``x`` moves ``f`` by at
+    most one."""
+    floors = [t for t in sympy.Add.make_args(begin) if symbol in t.free_symbols]
+    quotient = (
+        _static_integer_quotient(cast("sympy.Expr", floors[0]))
+        if len(floors) == 1
+        else None
+    )
+    if quotient is None:
+        return None
+    numerator, divisor = quotient
+    numerator = sympy.expand(numerator)
+    stride = numerator.coeff(symbol)
+    span = _projected_source_span(bounds, count)
+    if (
+        span is None
+        or not isinstance(stride, sympy.Integer)
+        or not 0 < stride * bounds[2] <= divisor
+        or symbol in (numerator - stride * symbol).free_symbols
+    ):
+        return None
+    first, last = span
+    return (
+        cast("sympy.Expr", begin.subs(symbol, first)),
+        sympy.Add(begin.subs(symbol, last), 1),
+    )
+
+
 def _analyze_integer_expression(
     expression: sympy.Expr,
     domain: CoordinateDomain | None = None,
@@ -1060,15 +1121,26 @@ class CoordinateRelation:
                 (eliminated_axis,) = eliminated_axes
                 eliminated_uses.add(eliminated_axis)
                 eliminated_symbol = coordinate_axis_symbol(eliminated_axis)
+                if target_step != 1:
+                    return None
+                width_expression = sympy.simplify(end - begin)  # pyrefly: ignore[unsupported-operation]
+                if width_expression == 1 and (
+                    floor_range := _projected_floor_range(
+                        begin,
+                        eliminated_symbol,
+                        source_bounds[eliminated_axis],
+                        current_counts[eliminated_axis],
+                    )
+                ):
+                    target_ranges.append((target_axis, *floor_range, 1))
+                    continue
                 expanded_begin = sympy.expand(begin)
                 stride_expression = expanded_begin.coeff(eliminated_symbol)
                 base_expression = sympy.simplify(
                     expanded_begin - stride_expression * eliminated_symbol
                 )
-                width_expression = sympy.simplify(end - begin)  # pyrefly: ignore[unsupported-operation]
                 if (
-                    target_step != 1
-                    or stride_expression.free_symbols
+                    stride_expression.free_symbols
                     or width_expression.free_symbols
                     or stride_expression.is_integer is not True
                     or width_expression.is_integer is not True
@@ -1102,20 +1174,12 @@ class CoordinateRelation:
                         )
                     )
                     continue
-                try:
-                    concrete_begin = _concrete_integer(
-                        source_begin, description="projected source begin"
-                    )
-                    concrete_end = _concrete_integer(
-                        source_end, description="projected source end"
-                    )
-                except ValueError:
-                    return None
-                if concrete_end <= concrete_begin:
-                    return None
-                final_source = concrete_begin + (
-                    (concrete_end - concrete_begin - 1) // source_step * source_step
+                span = _projected_source_span(
+                    source_bounds[eliminated_axis], current_counts[eliminated_axis]
                 )
+                if span is None:
+                    return None
+                concrete_begin, final_source = span
                 if width not in (1, stride * source_step):
                     return None
                 target_ranges.append(
@@ -1204,6 +1268,7 @@ class CoordinateRelation:
 
         retained_axes: list[tuple[int, int]] = []
         source_counts = self.source_domain.axis_count_expressions
+        source_symbols = {coordinate_axis_symbol(axis) for axis in source_counts}
         for axis, begin, end, step in piece.target_ranges:
             if step != 1:
                 return None
@@ -1227,8 +1292,11 @@ class CoordinateRelation:
             )
             if source_axis is not None:
                 retained_axes.append((axis, source_axis))
-            elif not (
-                sympy.simplify(begin) == 0 and sympy.simplify(end - count) == 0  # pyrefly: ignore[unsupported-operation]
+            # Else the whole axis, once clipped to it (a masked tile past the
+            # end reaches beyond it), from a begin no source coordinate moves.
+            elif begin.free_symbols & source_symbols or not (
+                _is_provably_nonnegative(-begin, None)
+                and _is_provably_nonnegative(end - count, None)  # pyrefly: ignore[unsupported-operation]
             ):
                 return None
 
@@ -4767,6 +4835,18 @@ class TileDependencyGraph:
         ):
             raise ValueError("access references an unknown execution site")
 
+    def obligations(
+        self, dependency: AccessDependency
+    ) -> frozenset[DependencyObligation]:
+        """One obligation per pair of the accesses' execution sites."""
+        producer_sites = self.site_ids_by_access[dependency.producer_access_id]
+        consumer_sites = self.site_ids_by_access[dependency.consumer_access_id]
+        return frozenset(
+            (dependency.dependency_id, producer_site, consumer_site)
+            for producer_site in producer_sites or (None,)
+            for consumer_site in consumer_sites or (None,)
+        )
+
     def obligations_by_root_pair(
         self,
     ) -> tuple[tuple[tuple[int, int], frozenset[DependencyObligation]], ...]:
@@ -4777,13 +4857,7 @@ class TileDependencyGraph:
                 (edge.producer_root, edge.consumer_root), set()
             )
             for dependency in edge.access_dependencies:
-                producer_sites = self.site_ids_by_access[dependency.producer_access_id]
-                consumer_sites = self.site_ids_by_access[dependency.consumer_access_id]
-                obligations.update(
-                    (dependency.dependency_id, producer_site, consumer_site)
-                    for producer_site in producer_sites or (None,)
-                    for consumer_site in consumer_sites or (None,)
-                )
+                obligations |= self.obligations(dependency)
         return tuple((pair, frozenset(grouped[pair])) for pair in sorted(grouped))
 
     def transport(self, dependency: AccessDependency) -> Transport:
@@ -5669,6 +5743,7 @@ def _symbolic_access_map(
 def _rectangular_overlap_sources(
     owner: CoordinateRelation,
     query: CoordinateRelation,
+    over_approximate: bool = False,
 ) -> CoordinateRelation | None:
     if (
         owner.target_domain != query.target_domain
@@ -5701,11 +5776,15 @@ def _rectangular_overlap_sources(
             fixed = _constant_range(owner_begin, owner_end)
             if fixed is not None:
                 # A range no owner coordinate moves (a fixed index on a view
-                # dimension) constrains no owner item: it only decides whether
-                # a fixed query range on that axis meets it at all.
+                # dimension, a tile narrower than the dim) constrains no owner
+                # item: it only decides whether a fixed query range on that
+                # axis meets it at all; with ``over_approximate``, a moving
+                # one may meet it.
                 query_fixed = _constant_range(query_begin, query_end)
                 if query_fixed is None:
-                    return None
+                    if not over_approximate:
+                        return None
+                    continue
                 if query_fixed[0] < fixed[1] and fixed[0] < query_fixed[1]:
                     continue
                 disjoint = True
@@ -5913,19 +5992,25 @@ def _access_incidence(
     owner: _AccessMap,
     query: _AccessMap,
     prove_nonnegative: Callable[[sympy.Expr], bool] | None,
+    over_approximate: bool = False,
 ) -> Incidence | None:
     owner_relation, _ = owner
     query_relation, _ = query
-    items = _rectangular_overlap_sources(owner_relation, query_relation)
-    if items is None:
-        items = _dense_overlap_sources(owner, query_relation, prove_nonnegative)
+    if over_approximate:
+        # The rectangular over-approximation (which a wait may take), whose
+        # keys must be its converse to agree with it.
+        items = _rectangular_overlap_sources(owner_relation, query_relation, True)
+    else:
+        items = _rectangular_overlap_sources(
+            owner_relation, query_relation
+        ) or _dense_overlap_sources(owner, query_relation, prove_nonnegative)
     if items is None:
         return None
     keys = items.converse()
-    if keys is None:
-        keys = _rectangular_overlap_sources(query_relation, owner_relation)
-    if keys is None:
-        keys = _dense_overlap_sources(query, owner_relation, prove_nonnegative)
+    if keys is None and not over_approximate:
+        keys = _rectangular_overlap_sources(
+            query_relation, owner_relation
+        ) or _dense_overlap_sources(query, owner_relation, prove_nonnegative)
     return Incidence.from_fibers(
         items, keys_by_item=keys, prove_nonnegative=prove_nonnegative
     )
@@ -5940,7 +6025,8 @@ def _symbolic_dependency_incidence(
     prove_nonnegative: Callable[[sympy.Expr], bool] | None = None,
 ) -> Incidence | str:
     """Which producer tasks each consumer task depends on, or why that has no
-    exact form."""
+    form. The exact form on the tensors' axes or on byte addresses comes
+    first; a rectangular over-approximation is the last resort."""
     # A masked access touches a subset of its tile: the tile over-approximates
     # what it may write or read, so a wait on it is still sufficient.
     for side, access in (("producer", producer_access), ("consumer", consumer_access)):
@@ -5953,6 +6039,19 @@ def _symbolic_dependency_incidence(
     producer_dimensions, consumer_dimensions = producer_layout[4], consumer_layout[4]
     # Why the tensors' own axes give no incidence (the byte-address form then may).
     axes_failure = "a tensor's strides are not provably injective"
+    # The maps with no exact incidence, axes first: over-approximated only once
+    # neither form is exact.
+    inexact_maps: list[tuple[_AccessMap, _AccessMap]] = []
+
+    def over_approximation(failure: str) -> Incidence | str:
+        for producer_map, consumer_map in inexact_maps:
+            incidence = _access_incidence(
+                producer_map, consumer_map, prove_nonnegative, over_approximate=True
+            )
+            if incidence is not None:
+                return incidence
+        return failure
+
     if producer_dimensions is not None and consumer_dimensions is not None:
         producer_geometry = tuple(
             (producer_layout[0][axis], producer_layout[1][axis])
@@ -6027,6 +6126,7 @@ def _symbolic_dependency_incidence(
                 )
                 if incidence is not None:
                     return incidence
+                inexact_maps.append((producer_map, consumer_map))
 
     common_offset = _integer_partition_expressions_equal(
         producer_access.storage_offset, consumer_access.storage_offset
@@ -6040,7 +6140,7 @@ def _symbolic_dependency_incidence(
     ):
         span = layout[3]
         if span is None or not _is_provably_nonnegative(offset, prove_nonnegative):
-            return (
+            return over_approximation(
                 f"{axes_failure}; the {side}'s storage span or offset is not provable"
             )
         # pyrefly: ignore [unsupported-operation]
@@ -6080,16 +6180,14 @@ def _symbolic_dependency_incidence(
         allocation_domain=allocation_domain,
         prove_nonnegative=prove_nonnegative,
     )
-    incidence = (
-        None
-        if producer_map is None or consumer_map is None
-        else _access_incidence(producer_map, consumer_map, prove_nonnegative)
+    if producer_map is not None and consumer_map is not None:
+        incidence = _access_incidence(producer_map, consumer_map, prove_nonnegative)
+        if incidence is not None:
+            return incidence
+        inexact_maps.append((producer_map, consumer_map))
+    return over_approximation(
+        f"{axes_failure}; as addresses, {_map_failure(producer_map, consumer_map)}"
     )
-    if incidence is None:
-        return (
-            f"{axes_failure}; as addresses, {_map_failure(producer_map, consumer_map)}"
-        )
-    return incidence
 
 
 def _map_failure(producer: _AccessMap | None, consumer: _AccessMap | None) -> str:
@@ -6658,6 +6756,39 @@ def _reject_same_root_cross_rank_hazards(root_accesses: list[TileAccess]) -> Non
                 f"symmetric allocation ({first.kind}/{second.kind}); load peer "
                 "data only in a later root than the one that stores it"
             )
+
+
+def _warn_remote_reads_without_producer(
+    graph: TileDependencyGraph, device_ir: DeviceIR
+) -> None:
+    """No transport orders a peer load of an allocation no root stores.
+
+    Remote reads wait only for producers in the kernel (in-band epochs, peer
+    counters), not for an earlier kernel's writes; host synchronization the
+    compiler cannot see may order them, so this warns. A hint load only
+    steers prefetches.
+    """
+    from .compile_environment import warning
+    from .cross_loop_report import RootNames
+
+    stored = {
+        access.allocation_id for access in graph.accesses if access.kind == "store"
+    }
+    loads = {
+        (access.root, access.allocation_id): access
+        for access in reversed(graph.accesses)
+        if access.kind == "load"
+        and access.owner_rank is not None
+        and not access.hint
+        and access.allocation_id not in stored
+    }
+    names = RootNames(device_ir, graph)
+    for (root, _), load in sorted(loads.items()):
+        warning(
+            exc.RemoteReadWithoutProducer(
+                names.root(root), names.access(load.access_id)
+            )
+        )
 
 
 def _scatter_position(store: TileAccess) -> int | None:
@@ -7366,7 +7497,7 @@ def build_tile_dependency_graph(
             if tagged is None
             else f"peer_counter ({failure}{tagged and f'; {tagged}'})",
         )
-    return TileDependencyGraph(
+    graph = TileDependencyGraph(
         task_families=task_families,
         accesses=accesses,
         edges=tuple(edges),
@@ -7387,6 +7518,9 @@ def build_tile_dependency_graph(
         ),
         unordered_hint_reads=frozenset(unordered_hint_reads),
     )
+    if device_ir is not None:
+        _warn_remote_reads_without_producer(graph, device_ir)
+    return graph
 
 
 def _tagged_failure(

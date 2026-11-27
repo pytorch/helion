@@ -2545,6 +2545,18 @@ class WalkDeviceAST(NodeVisitor):
     def generic_visit(self, node: ast.AST) -> None:
         raise exc.StatementNotSupported(type(node).__name__)
 
+    # pyrefly: ignore [bad-override]
+    def visit(self, node: ast.AST) -> object:
+        result = super().visit(node)
+        # A specialized size read here (``x.size(1)``) is a SymInt the shape
+        # env has replaced by a constant: an int, as a host read is
+        # (``SymIntType.proxy``), not a symnode of the graph.
+        if isinstance(result, torch.SymInt):
+            constant = result.node.maybe_as_int()
+            if constant is not None:
+                return constant
+        return result
+
     def _assign(
         self, target: ast.AST, value: object, origin: _StaticOrigin = None
     ) -> None:

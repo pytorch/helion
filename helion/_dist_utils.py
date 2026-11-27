@@ -231,11 +231,23 @@ def sync_seed(
             SeedEnsemble.update_seeds_with_rank()
 
 
+def _is_process_group_name(annotation: object) -> bool:
+    """Whether a parameter annotation is ``hl.ProcessGroupName``: the class, or
+    a string naming it in any dotted form (``from __future__ import
+    annotations``)."""
+    from .language.constexpr import ProcessGroupName
+
+    return annotation is ProcessGroupName or (
+        isinstance(annotation, str)
+        and annotation.rpartition(".")[2] == "ProcessGroupName"
+    )
+
+
 def kernel_declares_process_group(fn: Callable) -> bool:
     """True if the kernel has an ``hl.ProcessGroupName``-annotated argument, an
     explicit declaration that it is a distributed kernel."""
     return any(
-        param.annotation == "hl.ProcessGroupName"
+        _is_process_group_name(param.annotation)
         for param in inspect.signature(fn).parameters.values()
     )
 
@@ -251,7 +263,7 @@ def _find_process_group_name(
 
     signature = inspect.signature(fn)
     for param, arg in zip(signature.parameters.values(), args, strict=True):
-        if param.annotation == "hl.ProcessGroupName":
+        if _is_process_group_name(param.annotation):
             assert isinstance(arg, str), f"{type(arg)}"
             return arg
 

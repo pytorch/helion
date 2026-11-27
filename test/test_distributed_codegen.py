@@ -9,7 +9,10 @@ several GPUs in ``test/test_distributed.py``.
 
 from __future__ import annotations
 
+import contextlib
+import io
 import re
+import types
 import unittest
 
 import pytest
@@ -153,6 +156,57 @@ def keyed_then_inband_kernel(
                 out[tile, :] += peer[rows[tile], :]
             else:
                 out[tile, :] += peer[tile, :]
+    return out
+
+
+@helion.kernel(autotune_effort="none", static_shapes=True)
+def peer_sum_kernel(
+    symm: torch.Tensor,
+    x: torch.Tensor,
+    group_name: hl.ProcessGroupName,
+    publish: hl.constexpr,
+) -> torch.Tensor:
+    """Every rank's ``symm`` summed: stored by the first root with
+    ``publish``, else by whatever ran before the launch."""
+    peers = remote_views(symm, group_name)
+    out = torch.empty_like(x)
+    for tile in hl.tile(x.size(0)):
+        if publish:
+            symm[tile] = x[tile]
+        else:
+            out[tile] = x[tile]
+    for tile in hl.tile(x.size(0)):
+        acc = hl.zeros([tile], dtype=x.dtype)
+        for peer in peers:
+            acc = acc + peer[tile]
+        out[tile] = acc
+    return out
+
+
+@helion.kernel(autotune_effort="none", static_shapes=True)
+def unit_row_polls_kernel(
+    symm: torch.Tensor,
+    x: torch.Tensor,
+    group_name: hl.ProcessGroupName,
+    begin: hl.constexpr,
+) -> torch.Tensor:
+    """The ranks' rows summed per 128 columns, the row indexed by its block-1
+    tile or, with ``begin``, by the tile's start."""
+    peers = remote_views(symm, group_name)
+    out = torch.empty_like(x)
+    for rows, cols in hl.tile(x.size(), block_size=[1, 512]):
+        symm[rows, cols] = x[rows, cols]
+    for rows, cols in hl.tile(x.size(), block_size=[1, 128]):
+        if begin:
+            acc = hl.zeros([cols], dtype=torch.float32)
+            for peer in peers:
+                acc = acc + peer[rows.begin, cols].to(torch.float32)
+            out[rows.begin, cols] = acc.to(x.dtype)
+        else:
+            acc2 = hl.zeros([rows, cols], dtype=torch.float32)
+            for peer in peers:
+                acc2 = acc2 + peer[rows, cols].to(torch.float32)
+            out[rows, cols] = acc2.to(x.dtype)
     return out
 
 
@@ -428,6 +482,25 @@ class TestInbandCodegen(TestCase):
         self.assertIn("tile_dependency_peer_epoch << 32", code)
         self.assertIn("tile_dependency_peer_epoch % 3", code)
 
+    def test_unit_tile_on_a_size_one_dim_polls_like_a_scalar_index(self) -> None:
+        """A block-1 tile on a size-1 dim broadcasts nothing: its polls take
+        whole words, one asm for every rank and one CTA vote, as the tile's
+        start does (not a spin per element)."""
+        group = fake_world(4)
+        symm, x = torch.zeros(2, 1, 4096, dtype=torch.bfloat16)
+        for begin in (False, True):
+            with self.subTest(begin=begin), cuda_metadata_trace():
+                bound = cpu_bind(unit_row_polls_kernel, (symm, x, group, begin))
+                config = bound.config_spec.default_config().config
+                code = bound.to_triton_code(
+                    helion.Config(
+                        **{**config, "cross_loop_inband_protocol": ["lamport"]}
+                    )
+                )
+            self.assertEqual(code.count("bar.red.or.pred"), 1)
+            self.assertEqual(code.count("SPIN${:uid}:"), 1)
+            self.assertNotIn(">> tl.cast(inband_offset", code)
+
     @unittest.skipUnless(gluon_api_available(), "the gluon ring needs Triton >= 3.8")
     def test_tagged_credit_in_a_keyed_root(self) -> None:
         """The credit's polls give the mirrors their parity credit (T5) even
@@ -464,3 +537,47 @@ class TestInbandCodegen(TestCase):
                 code = bound.to_triton_code()
                 self.assertIn("on flat/m_peers use inband", logs.output[-1])
                 self.assertEqual("_wait_at_least" in code, polls != "full")
+
+    def test_remote_read_without_producer_warns(self) -> None:
+        """A peer load of an allocation no root of the kernel stores has no
+        cross-rank order: it warns once per root, naming the root and the load,
+        unless an earlier root of the kernel publishes the data."""
+        group = fake_world(4, peer_sum_kernel)
+        symm, x = torch.zeros(2, 256)
+        for publish in (True, False):
+            with (
+                self.subTest(publish=publish),
+                cuda_metadata_trace(),
+                contextlib.redirect_stderr(io.StringIO()) as stderr,
+            ):
+                cpu_bind(peer_sum_kernel, (symm, x, group, publish))
+            warnings = stderr.getvalue().count("WARNING[RemoteReadWithoutProducer]")
+            self.assertEqual(warnings, 0 if publish else 1)
+        self.assertRegex(
+            stderr.getvalue(),
+            r"root 1 \[lines:\d+-\d+\] reads another rank's copy of an allocation "
+            r"that no root of this kernel stores \(peers loaded at line \d+: "
+            r"acc = acc \+ peer\[tile\]\)",
+        )
+
+    def test_process_group_name_class_annotation(self) -> None:
+        """An ``hl.ProcessGroupName`` annotation that is the class (a kernel
+        without ``from __future__ import annotations``) declares the group as
+        the string form does: the kernel is distributed and keeps its
+        cross-rank edge."""
+        group = fake_world(4)
+        fn = peer_sum_kernel.fn
+        plain = types.FunctionType(
+            fn.__code__, fn.__globals__, fn.__name__, fn.__defaults__, fn.__closure__
+        )
+        plain.__annotations__ = {
+            **fn.__annotations__,
+            "group_name": hl.ProcessGroupName,
+        }
+        kernel = helion.kernel(plain, autotune_effort="none", static_shapes=True)
+        symm, x = torch.zeros(2, 256)
+        with cuda_metadata_trace():
+            bound = cpu_bind(kernel, (symm, x, group, True))
+        self.assertEqual(bound.env.process_group_name, group)
+        graph = bound.host_function.device_ir.tile_dependency_graph
+        self.assertTrue(graph is not None and graph.crosses_ranks())
