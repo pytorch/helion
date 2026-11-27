@@ -619,7 +619,9 @@ def _layer_megakernel(qkv: torch.Tensor, positions: torch.Tensor, cos_sin_cache:
                 hl.store(gemm2_ws, [route_row, cols_g], val, extra_mask=routed[:, None])
                 gm = val.to(torch.float32) * nw[None, :]
                 hl.store(sumsq_ws, [route_row, w2_tile_h.begin], torch.sum(gm * gm, dim=-1), extra_mask=routed)
-    for fin_tile_s, fin_tile_c in hl.tile([slots, local], block_size=[topk_g, 128]):
+    # A FIN task reads every rank's partial of its columns: 512 / world columns keep that load at W4's (and W8's
+    # 128-column tiles spilled 72 bytes of stack).
+    for fin_tile_s, fin_tile_c in hl.tile([slots, local], block_size=[topk_g, 512 // world]):
         if not entry:
             if not expert_bf16:
                 if fin_tile_c.begin == 0:  # history for the layer's next launch: the last token's 8 experts (its own tile)

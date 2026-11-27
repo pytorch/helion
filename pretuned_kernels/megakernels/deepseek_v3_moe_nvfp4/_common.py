@@ -103,7 +103,7 @@ def scale_tile(chunk: torch.Tensor) -> torch.Tensor:
     return chunk.reshape(8, 32, 4, 4).permute(2, 1, 0, 3).reshape(128, 32)
 
 
-def _popcount(v: torch.Tensor) -> torch.Tensor:
+def popcount(v: torch.Tensor) -> torch.Tensor:
     """Set bits per int32 lane."""
     v = v - ((v >> 1) & 0x55555555)
     v = (v & 0x33333333) + ((v >> 2) & 0x33333333)
@@ -111,26 +111,39 @@ def _popcount(v: torch.Tensor) -> torch.Tensor:
 
 
 def distinct_table(
-    ids: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """The routed experts (of 256) as bitmap words [8], each word's exclusive
-    prefix count, and the distinct count."""
-    lanes = hl.arange(8)
+    ids: torch.Tensor, lanes: int = 8
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """The routed experts (of ``32 * lanes``; -1 = none) as bitmap
+    words [lanes], each word's popcount and exclusive prefix count, and the
+    distinct count."""
+    words_lanes = hl.arange(lanes)
     row = ids.unsqueeze(0)
-    bits = torch.where((row >> 5) == lanes.unsqueeze(1), 1 << (row & 31), 0)
+    bits = torch.where((row >> 5) == words_lanes.unsqueeze(1), 1 << (row & 31), 0)
     words = hl.reduce(operator.or_, bits, dim=1)
-    counts = _popcount(words)
+    counts = popcount(words)
     before = hl.cumsum(counts, dim=0) - counts
-    return words, before, hl.reduce(operator.add, counts, dim=0)
+    return words, counts, before, hl.reduce(operator.add, counts, dim=0)
 
 
-def expert_of(words: torch.Tensor, before: torch.Tensor, j: object) -> torch.Tensor:
-    """The j-th distinct expert (ascending)."""
-    counts = _popcount(words)
+def expert_of(
+    words: torch.Tensor,
+    before: torch.Tensor,
+    j: object,
+    lanes: int = 8,
+    counts: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """The j-th distinct expert (ascending) of ``lanes`` words, at most 8 (256
+    experts: the key packs the word index in 3 bits); ``counts``: the words'
+    popcounts (``distinct_table``'s), recomputed if not given."""
+    assert lanes <= 8, f"expert_of decodes at most 8 words, got {lanes}"
+    if counts is None:
+        counts = popcount(words)
     hit = (before <= j) & (before + counts > j)
     word = hl.reduce(operator.or_, torch.where(hit, words, 0), dim=0)
-    key = hl.reduce(operator.or_, torch.where(hit, before * 8 + hl.arange(8), 0), dim=0)
+    key = hl.reduce(
+        operator.or_, torch.where(hit, before * 8 + hl.arange(lanes), 0), dim=0
+    )
     # int32 lanes: an int64 index (large weights) would widen the popcount.
-    upto = _popcount(word & ((2 << hl.arange(32).to(torch.int32)) - 1))
+    upto = popcount(word & ((2 << hl.arange(32).to(torch.int32)) - 1))
     bit = hl.reduce(operator.add, (upto <= j - (key >> 3)).to(torch.int32), dim=0)
     return (key & 7) * 32 + bit

@@ -44,6 +44,7 @@ from helion._testing import slowIfBackends
 import helion.language as hl
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
     from pathlib import Path
 
 
@@ -555,11 +556,19 @@ def test_deepseek_v3_tp_megakernels_run_on_four_ranks(name: str) -> None:
     _run_on_four_ranks(name)
 
 
-def _run_on_four_ranks(name: str, *args: str, directory: Path | None = None) -> None:
-    """Run the module's __main__ on four ranks (torchrun), with ``args``."""
+def _run_on_four_ranks(
+    name: str, *args: str, directory: Path | None = None, needs: Sequence[str] = ()
+) -> None:
+    """Run the module's __main__ on four ranks (torchrun), with ``args``; skip
+    unless the modules it imports (``needs``) import."""
     _require_four_sm100_gpus()
     if _under_xdist():
         pytest.skip("four-rank runs need every local GPU")
+    for module in needs:
+        try:
+            importlib.import_module(module)
+        except ImportError:
+            pytest.skip(f"the check imports {module}")
     directory = directory or _pretuned_kernel_directory(name)
     subprocess.run(
         [
@@ -603,6 +612,102 @@ def test_muse_spark_megakernels_check_on_four_ranks(name: str) -> None:
     # --check runs only the FP64 checks, so sglang is not needed.
     _run_on_four_ranks(
         name, "--check", directory=PRETUNED_KERNELS_DIR / "megakernels" / "muse_spark"
+    )
+
+
+@pytest.mark.slow
+@skipIfRefEager("Pretuned kernels use AOT; ref-eager bypasses heuristic logic.")
+@skipIfNotTriton("the gluon tests run in the triton lane")
+@skipUnlessGluon()
+@pytest.mark.timeout(1800)
+@pytest.mark.parametrize(
+    "name",
+    [
+        "qwen3_5_moe_tp4",
+        "qwen3_5_gdn_mixer_tp4",
+        "qwen3_5_attn_mixer_tp4",
+        "qwen3_5_layer_tp4",
+    ],
+)
+def test_qwen3_5_megakernels_check_on_four_ranks(name: str) -> None:
+    # The MoE checks against a torch reference and the merged layer against the
+    # standalone kernels; the mixers check every stage against SGLang's kernels
+    # (module paths of its 2026-10-20 operator regroup), the attention also
+    # against FlashInfer's.
+    ops = "sglang.kernels.ops."
+    quant = ops + "quantization.fp8_kernel"
+    needs = {
+        "qwen3_5_gdn_mixer_tp4": [
+            ops + "mamba.causal_conv1d_triton",
+            ops + "attention.linear.gdn_replayssm_spec_decode",
+            ops + "attention.fla.layernorm_gated",
+            quant,
+        ],
+        "qwen3_5_attn_mixer_tp4": [
+            "sglang.srt.layers.rotary_embedding",
+            "sglang.srt.layers.quantization.utils",
+            ops + "attention.fused_qk_rmsnorm_rope_gate",
+            ops + "kvcache.fused_fp8_qkv_kv_cache",
+            ops + "elementwise.elementwise",
+            "flashinfer",
+            quant,
+        ],
+    }
+    _run_on_four_ranks(name, "--check", needs=needs.get(name, ()))
+
+
+@pytest.mark.slow
+@skipIfRefEager("Pretuned kernels use AOT; ref-eager bypasses heuristic logic.")
+@skipIfNotTriton("the gluon tests run in the triton lane")
+@skipUnlessGluon()
+@pytest.mark.timeout(1800)
+@pytest.mark.parametrize(
+    "name",
+    [
+        "glm5_3_moe_tp4",
+        "glm5_3_attn_front_tp4",
+        "glm5_3_attn_out_tp4",
+        "glm5_3_indexer_tp4",
+        "glm5_3_draft_eh_tp4",
+        "glm5_3_lm_head_tp4",
+    ],
+)
+def test_glm5_3_megakernels_check_on_four_ranks(name: str) -> None:
+    # Each check compares every rank with its torch reference (FP64 for the LM
+    # head) at every served window, and a second launch bitwise.
+    _run_on_four_ranks(
+        name, "--check", directory=PRETUNED_KERNELS_DIR / "megakernels" / "glm5_3_tp4"
+    )
+
+
+@pytest.mark.slow
+@skipIfRefEager("Pretuned kernels use AOT; ref-eager bypasses heuristic logic.")
+@skipIfNotTriton("the gluon tests run in the triton lane")
+@skipUnlessGluon()
+@pytest.mark.timeout(1800)
+@pytest.mark.parametrize(
+    "name",
+    [
+        "kda_tp4",
+        "mla_frontidx_tp4",
+        "mla_out_tp4",
+        "moe_tp4",
+        "dense_tp4",
+        "mla_front_tp4",
+        "mtp_eh_tp4",
+        "mtp_attn_out_tp4",
+        "mtp_moe_tp4",
+        "mtp_lm_head_tp4",
+    ],
+)
+def test_glm5_3_flash_megakernels_check_on_four_ranks(name: str) -> None:
+    # Each check compares every rank with its torch reference on synthetic
+    # weights (FP64 for the LM head; the mHC tails all-reduce rank-dependent
+    # partials) and repeats a launch for the same bits.
+    _run_on_four_ranks(
+        name,
+        "--check",
+        directory=PRETUNED_KERNELS_DIR / "megakernels" / "glm5_3_flash_tp4",
     )
 
 
@@ -1255,6 +1360,34 @@ class TestPretunedKernelsCorrectness(TestCase):
                 torch.testing.assert_close(
                     result.float(), torch.tensor([[expected]]), equal_nan=True
                 )
+
+    def _run_gpt_oss_check(self, name: str) -> None:
+        # The FP32 PyTorch reference needs neither SGLang nor a checkpoint.
+        if not is_cuda() or torch.cuda.get_device_capability()[0] != 10:
+            self.skipTest(f"{name} is pretuned for NVIDIA SM100.")
+        _import_pretuned_kernel_module(name).correctness_check()
+
+    @pytest.mark.slow
+    @pytest.mark.timeout(900)
+    @skipIfCute(_PINNED_TO_GLUON)
+    @skipUnlessGluon()
+    def test_gpt_oss_decode_layer(self):
+        self._run_gpt_oss_check("gpt_oss_decode_layer")
+
+    @pytest.mark.slow
+    @pytest.mark.timeout(900)
+    @skipIfCute(_PINNED_TO_GLUON)
+    @skipUnlessGluon()
+    def test_gpt_oss_verify_layer(self):
+        self._run_gpt_oss_check("gpt_oss_verify_layer")
+
+    @pytest.mark.slow
+    @pytest.mark.timeout(900)
+    @skipIfCute(_PINNED_TO_GLUON)
+    @skipUnlessGluon()
+    def test_kda_mtp_verify(self):
+        # T=8 only; the FP32 PyTorch reference needs no SGLang.
+        _import_pretuned_kernel_module("kda_mtp_verify").correctness_check()
 
 
 @onlyBackends(["cute"])

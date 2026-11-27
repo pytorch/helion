@@ -362,7 +362,7 @@ def deepseek_v3_moe_nvfp4_tp_verify(
     for partial_w13_tile_n, partial_w13_tile_t, partial_w13_tile_j in hl.tile(
         [twice_intermediate, rows, slots], block_size=[128, None, 1]
     ):
-        partial_w13_words, partial_w13_before, partial_w13_distinct = distinct_table(
+        partial_w13_words, _, partial_w13_before, partial_w13_distinct = distinct_table(
             routes[:]
         )
         if partial_w13_tile_j.begin < partial_w13_distinct:
@@ -402,7 +402,7 @@ def deepseek_v3_moe_nvfp4_tp_verify(
     for w13_tile_n, w13_tile_t, w13_tile_j in hl.tile(
         [twice_intermediate, rows, slots], block_size=[128, None, 1]
     ):
-        w13_words, w13_before, w13_distinct = distinct_table(routes[:])
+        w13_words, _, w13_before, w13_distinct = distinct_table(routes[:])
         if w13_tile_j.begin < w13_distinct:
             w13_expert = expert_of(w13_words, w13_before, w13_tile_j.begin)
             # The epilogue's operands load under the K loop.
@@ -490,7 +490,7 @@ def deepseek_v3_moe_nvfp4_tp_verify(
     for w2_tile_n, w2_tile_t, w2_tile_f in hl.tile(
         [hidden, rows, slots], block_size=[128, None, 1]
     ):
-        w2_words, w2_before, w2_distinct = distinct_table(routes[:])
+        w2_words, _, w2_before, w2_distinct = distinct_table(routes[:])
         if w2_tile_f.begin < w2_distinct:
             w2_expert = expert_of(w2_words, w2_before, w2_tile_f.begin)
             # The epilogue's operands load under the K loop: the scale, and

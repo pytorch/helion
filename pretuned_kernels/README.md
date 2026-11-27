@@ -13,10 +13,16 @@ into your code, then retune when your target shapes or hardware differ
 materially from the included sweep.
 
 Each kernel module has a `main()` that benchmarks against one or more named
-reference baselines, except the speculative-decoding verify megakernels outside
-`muse_spark/`, which so far have only a `correctness_check()`, and the Muse
-Spark layer megakernel (`muse_spark/layer.py`), whose `main()` runs its FP64
-checks and times it alone (its baseline is the serving engine's layer).
+reference baselines, with these exceptions. The Llama, Qwen3-8B and DeepSeek-V3
+speculative-decoding verify megakernels so far have only a
+`correctness_check()`. The Muse Spark layer megakernel (`muse_spark/layer.py`),
+the GPT-OSS-120B layers (`gpt_oss_120b/`), the Qwen3.5 TP4 MoE
+(`qwen3_5_moe_tp4/qwen3_5_moe_tp4.py`) and the GLM-5.3 and GLM-5.3 Flash TP4
+kernels (`glm5_3_tp4/`, `glm5_3_flash_tp4/`) run their checks in `main()` and
+time the kernel alone (their baseline is the serving engine's layer); the
+merged Qwen3.5 layer (`qwen3_5_moe_tp4/qwen3_5_layer_tp4.py`) is timed against
+its two standalone kernels. The Inkling-2-Small kernels (`inkling2_small/`) run
+inside vLLM and have neither (see their README).
 
 ## File structure
 
@@ -53,16 +59,24 @@ pretuned_kernels/
 ├── gdn_decode/                       # TPU/Pallas fixed-config recurrent decode
 └── megakernels/
     ├── kda_decode/                   # Kimi-K3 KDA decode sublayer
+    ├── kda_mtp/                      # Kimi-K3 KDA speculative-decoding verify, TP8
     ├── qwen3_8b/                     # Qwen3-8B FP8 and BF16 decode layers, BF16 verify layer
     ├── qwen3_30b_a3b_moe/            # Qwen3-30B-A3B MoE block
+    ├── qwen3_5_moe_tp4/              # Qwen3.5 NVFP4 MoE + all-reduce + RMSNorm, TP4 verify; merged MoE + GDN layer
+    ├── qwen3_5_gdn_tp4/              # Qwen3.5 Gated-DeltaNet mixer, TP4 verify
+    ├── qwen3_5_attn_tp4/             # Qwen3.5 full-attention mixer, TP4 verify
+    ├── glm5_3_tp4/                   # GLM-5.3 NVFP4 TP4 verify (MLA, DSA indexer, MoE) and MTP draft
+    ├── glm5_3_flash_tp4/             # GLM-5.3 Flash NVFP4 TP4 verify (KDA, MLA, MoE, mHC boundary) and MTP draft
     ├── llama32_1b_decode_layer_bf16/ # Llama-3.2-1B BF16 decode and verify layers
     ├── gemma4_a4b_moe/               # Gemma 4 26B-A4B MoE
     ├── gpt_oss_moe/                  # gpt-oss MoE
+    ├── gpt_oss_120b/                 # GPT-OSS-120B decode and EAGLE3 verify layers
     ├── flash_mla/                    # DeepSeek-V3 MLA decode, one request
     ├── deepseek_v3_moe_nvfp4/        # DeepSeek-V3 NVFP4 MoE, decode and verify
     ├── deepseek_v3_moe_nvfp4_tp/     # DeepSeek-V3 NVFP4 MoE + all-reduce + RMSNorm, TP4, decode and verify
     ├── deepseek_v3_attention_nvfp4_tp/
-    └── muse_spark/                   # Muse Spark verify: decoder layer (TP4, TP8), LM head, EP4 MoE
+    ├── muse_spark/                   # Muse Spark verify: decoder layer (TP4, TP8), LM head, EP4 MoE
+    └── inkling2_small/               # Inkling-2-Small TP4 verify layers, served through vLLM
 ```
 
 Each kernel ships with one heuristic file per supported compute capability.
@@ -96,12 +110,22 @@ At runtime Helion picks the file matching the current GPU.
 | `causal_conv1d` | TPU decode `N=512, H=4, D=128, W=4` | tpu-inference `ragged_causal_conv1d` |
 | `gdn_decode` | TPU decode `N=512, H=2, K=V=128` | tpu-inference `fused_decoding_gdn` |
 | `kda_decode` | Kimi-K3 BF16/FP32-state decode, hidden 7168, B1/B2/B4/B8/B16, TP8/H12 and TP16/H6 | vLLM native fused decode (H12) and Triton fallback (H6), with matched projections |
+| `kda_mtp_verify` | Kimi-K3 speculative-decoding verify, TP8/H12, one request of 8 draft tokens, ReplaySSM cache ring (Gluon, GB200/GB300) | SGLang's verify path (`main()`) and sgl-nvidia-mega (`mega_compare.py`, needs `SGL_NVIDIA_MEGA` and SGLang) |
 | `qwen3_decode_layer` | Qwen3-8B FP8 batch-1 decode, context 8192, 128 attention splits | compiled vLLM `Qwen3DecoderLayer` with default backends |
 | `qwen3_decode_layer_bf16` | Qwen3-8B BF16 batch-1 decode, contexts 576 and 1088 (B2/B4 configs checked, not benchmarked) | compiled vLLM `Qwen3DecoderLayer` with default backends |
 | `llama32_1b_decode_layer_bf16` | Llama-3.2-1B BF16 batch-1 decode, contexts 576 and 1088 (B2/B4 configs checked, not benchmarked) | compiled vLLM `LlamaDecoderLayer` with default backends |
 | `qwen3_30b_a3b_moe` | Qwen3-30B-A3B BF16 MoE block (RMSNorm, router, top-8 experts, residual), batch 1 | vLLM's compiled RMSNorm + `Qwen3MoeSparseMoeBlock` with default backend selection (its residual add is fused into the next layer) |
 | `flash_mla` | DeepSeek-V3 MLA decode, one request, 16 heads (TP8), context 1024 (checked up to 64K) | FlashInfer TRT-LLM-gen MLA decode, as vLLM's decode CUDA graph calls it (`max_seq_len` = `max_model_len`) |
 | `deepseek_v3_moe_nvfp4_tp` | DeepSeek-V3 NVFP4 MoE batch-1 decode at TP4, fused all-reduce + residual + RMSNorm | vLLM's router kernel + FlashInfer MoE (PDL) + FlashInfer fused all-reduce/RMSNorm |
+| `gpt_oss_decode_layer` | GPT-OSS-120B MXFP4 batch-1 decode layer, positions 1000 and 4000, sliding-window and full attention | FP32 PyTorch reference (check); timed alone (it replaces SGLang's per-layer launches) |
+| `gpt_oss_verify_layer` | GPT-OSS-120B EAGLE3 verify layer, 4 tokens, positions 400 and 4000, sliding-window and full attention | FP32 PyTorch reference (check); timed alone |
+| `qwen3_5_moe_tp4` | Qwen3.5-397B-A17B NVFP4 MoE (512 experts, top 10, shared expert) + all-reduce + residual + RMSNorm at TP4, 7-token verify window | torch reference on the logical weights (check); timed alone with cold weights |
+| `qwen3_5_gdn_mixer_tp4` | Qwen3.5 Gated-DeltaNet mixer (in_proj to the next RMSNorm) at TP4, 7-token verify window | SGLang's target-verify kernels per stage, torch for the projections and the all-reduce + norm (check); SGLang's stock sequence without the all-reduce (timing) |
+| `qwen3_5_attn_mixer_tp4` | Qwen3.5 full-attention mixer (FP8 paged KV cache) at TP4, 7-token verify window, committed contexts 2048 and 8192 | SGLang's target-verify kernels per stage (`trtllm_mha`), torch for the FP8 projections and the all-reduce + norm (check); SGLang's stock sequence without the all-reduce (timing) |
+| `qwen3_5_layer_tp4` | The Qwen3.5 MoE and the next layer's GDN mixer as one launch | the two standalone kernels (bitwise check and timing) |
+| `glm5_3_tp4` | GLM-5.3 NVFP4 at TP4, 6-token verify window: MLA prologue, sparse MLA + o_proj + all-reduce + norm, DSA indexer logits, MoE + all-reduce + norm; MTP draft input and LM head | torch references on synthetic weights (check); timed with cold weights, alone or (draft input, LM head) against the stock chain (README: served in SGLang) |
+| `glm5_3_flash_tp4` | GLM-5.3 Flash NVFP4 at TP4, 6-token verify window: KDA, MLA prologue + pooled DSA indexer, sparse MLA + o_proj, MoE and dense MLP, each with the all-reduce and the mHC layer boundary; MTP draft layer and LM head | torch references on synthetic weights (check); timed with cold weights, alone or (LM head) against the stock chain (README: served in SGLang) |
+| `inkling2_small` | Inkling-2-Small TP4 / EP4 verify, 8 rows, local / block / global attention layers and NVFP4 / MXFP8 MoE | the stock vLLM Inkling 2 path, end to end in vLLM |
 | `gemma4_a4b_moe` | Gemma 4 26B-A4B BF16 batch-1 MoE | vLLM Gemma 4 router + fused MoE with default backend selection |
 
 Most kernels additionally benchmark against `torch.compile` of the listed
@@ -186,6 +210,11 @@ the included shape set:
 cd pretuned_kernels/softmax
 python softmax.py
 ```
+
+The tensor-parallel modules (`deepseek_v3_*_tp/`, `muse_spark/`,
+`qwen3_5_*_tp4/`, `glm5_3_tp4/`, `glm5_3_flash_tp4/`) run under `torchrun` on
+four local GPUs (the Muse Spark layer also on eight); their module docstrings
+give the command.
 
 The external grouped-GEMM references need explicit pinned checkouts:
 

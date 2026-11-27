@@ -90,6 +90,16 @@ def capture_cuda_graph(
     return graph, output
 
 
+def balanced_order(sample: int, count: int) -> tuple[int, ...]:
+    """The order of ``count`` implementations in timing round ``sample``: every
+    rotation, then the rotations reversed, so no implementation always sees the
+    hottest GPU clocks."""
+    indices = tuple(range(count))
+    rotation = sample % count
+    order = indices[rotation:] + indices[:rotation]
+    return order[::-1] if (sample // count) % 2 else order
+
+
 def bench_pre_captured_cudagraphs(
     calls: Sequence[Callable[[], object]],
     rep: int = 100,
@@ -108,8 +118,7 @@ def bench_pre_captured_cudagraphs(
     graph, which incorrectly includes host-side graph wrapper work as idle time
     in the CUDA-event interval. The clear keeps the GPU busy while the next
     replay is submitted, so the events measure device execution consistently.
-    Calls rotate through every position, then reverse the rotations, so no
-    implementation always sees the hottest GPU clocks.
+    Calls take turns in ``balanced_order``.
     """
     import triton
 
@@ -128,14 +137,8 @@ def bench_pre_captured_cudagraphs(
     cycle = 2 * len(calls)
     repetitions = rep
 
-    def call_order(sample: int) -> tuple[int, ...]:
-        indices = tuple(range(len(calls)))
-        rotation = sample % len(indices)
-        order = indices[rotation:] + indices[:rotation]
-        return order[::-1] if (sample // len(indices)) % 2 else order
-
     for sample in range(cycle):
-        for index in call_order(sample):
+        for index in balanced_order(sample, len(calls)):
             reset = resets[index]
             if reset is not None:
                 reset()
@@ -151,7 +154,7 @@ def bench_pre_captured_cudagraphs(
         for _ in calls
     ]
     for sample in range(repetitions):
-        for index in call_order(sample):
+        for index in balanced_order(sample, len(calls)):
             reset = resets[index]
             if reset is not None:
                 reset()

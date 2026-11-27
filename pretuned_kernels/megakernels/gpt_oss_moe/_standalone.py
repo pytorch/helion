@@ -615,15 +615,16 @@ def _row_permutation(rows: int, device: torch.device) -> torch.Tensor:
 
 
 def _swizzle_scales(scales: torch.Tensor) -> torch.Tensor:
-    rows, cols = scales.shape
+    """[..., rows, cols] scale bytes, each [rows, cols] in FlashInfer's 128x4 swizzle."""
+    *lead, rows, cols = scales.shape
     if rows % 128 or cols % 4:
         raise ValueError("TRT-LLM MXFP4 scales require rows % 128 == cols % 4 == 0")
     row = torch.arange(rows, device=scales.device)[:, None]
     col = torch.arange(cols, device=scales.device)[None, :]
     offsets = _trtllm_scale_offset(row, col, rows, cols)
-    output = torch.empty(rows * cols, device=scales.device, dtype=scales.dtype)
-    output[offsets.reshape(-1)] = scales.reshape(-1)
-    return output.reshape(rows, cols)
+    output = torch.empty(*lead, rows * cols, device=scales.device, dtype=scales.dtype)
+    output[..., offsets.reshape(-1)] = scales.reshape(*lead, -1)
+    return output.view(scales.shape)
 
 
 def _to_production_w13(
@@ -631,16 +632,12 @@ def _to_production_w13(
     scale: torch.Tensor,
     bias: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    rows = weight.size(0)
-    weight = weight.reshape(rows // 2, 2, -1).flip(1).reshape_as(weight)
-    scale = scale.reshape(rows // 2, 2, -1).flip(1).reshape_as(scale)
-    bias = bias.reshape(rows // 2, 2).flip(1).reshape_as(bias)
-    permutation = _row_permutation(rows, weight.device)
-    return (
-        weight[permutation].contiguous(),
-        _swizzle_scales(scale[permutation].contiguous()),
-        bias[permutation].contiguous(),
-    )
+    """[..., rows, ...] gate/up rows: swap each row pair, then the w2 layout."""
+    *lead, rows, _ = weight.shape
+    weight = weight.reshape(*lead, rows // 2, 2, -1).flip(-2).reshape_as(weight)
+    scale = scale.reshape(*lead, rows // 2, 2, -1).flip(-2).reshape_as(scale)
+    bias = bias.reshape(*lead, rows // 2, 2).flip(-1).reshape_as(bias)
+    return _to_production_w2(weight, scale, bias)
 
 
 def _to_production_w2(
@@ -648,11 +645,12 @@ def _to_production_w2(
     scale: torch.Tensor,
     bias: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    permutation = _row_permutation(weight.size(0), weight.device)
+    """[..., rows, ...] rows shuffled to TRT-LLM's order, scales swizzled."""
+    permutation = _row_permutation(weight.size(-2), weight.device)
     return (
-        weight[permutation].contiguous(),
-        _swizzle_scales(scale[permutation].contiguous()),
-        bias[permutation].contiguous(),
+        weight[..., permutation, :].contiguous(),
+        _swizzle_scales(scale[..., permutation, :].contiguous()),
+        bias[..., permutation].contiguous(),
     )
 
 
