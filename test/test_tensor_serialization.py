@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import copyreg
 import dataclasses
+import threading
 from typing import TYPE_CHECKING
 from typing import cast
 from unittest.mock import patch
+import zipfile
 
 import pytest
 import torch
@@ -13,6 +16,7 @@ import torch
 from helion.autotuner.handoff_inputs import _load_inputs
 from helion.autotuner.handoff_inputs import _save_inputs
 from helion.autotuner.handoff_inputs import _SavedInputs
+from helion.autotuner.kernel_args import load_trusted_kernel_args
 from helion.autotuner.tensor_serialization import save_tensor_tree
 
 if TYPE_CHECKING:
@@ -28,6 +32,21 @@ def _handoff_callback(value=None):
 @dataclasses.dataclass
 class _HandoffCallbackHolder:
     callback: object
+
+
+class _RegisteredTensor(torch.Tensor):
+    """A tensor type with unpicklable state that its registered reducer omits."""
+
+
+def _reduce_registered_tensor(tensor: _RegisteredTensor) -> tuple:
+    plain = tensor.detach().as_subclass(torch.Tensor)
+    return (_restore_registered_tensor, (plain, tensor.requires_grad))
+
+
+def _restore_registered_tensor(
+    plain: torch.Tensor, requires_grad: bool
+) -> _RegisteredTensor:
+    return plain.as_subclass(_RegisteredTensor).requires_grad_(requires_grad)
 
 
 @pytest.mark.parametrize("container", ["direct", "list", "record"])
@@ -141,6 +160,110 @@ def test_native_v3_tensor_requires_grad_in_mixed_dtype_retry(tmp_path: Path) -> 
     assert restored.untyped_storage()._cdata == restored_bytes.untyped_storage()._cdata
     torch.testing.assert_close(restored.float(), data.float())
     torch.testing.assert_close(restored_bytes, byte_view)
+
+
+@pytest.mark.parametrize("dtype", [torch.float8_e4m3fn, torch.float8_e5m2])
+@pytest.mark.parametrize("python_state", [False, True])
+def test_fp8_tensor_that_requires_grad_loads_in_the_worker(
+    tmp_path: Path, dtype: torch.dtype, python_state: bool
+) -> None:
+    # PyTorch saves such a tensor and then cannot load it: its v3 rebuild
+    # calls set_ on a leaf that requires grad. TritonBench's fp8 attention
+    # operands are built that way, and the benchmark worker reads the
+    # arguments of every candidate from this file.
+    data = torch.arange(8, dtype=torch.float32).to(dtype)
+    data.requires_grad_(True)
+    if python_state:
+        # Python state nests the rebuild in ``_rebuild_from_type_v2``.
+        data.tag = "payload"  # pyrefly: ignore[missing-attribute]
+    plain = torch.arange(4, dtype=torch.float32, requires_grad=True)
+    path = tmp_path / "args.pt"
+    save_tensor_tree((data, plain, data[2:], 3), path)
+    restored, restored_plain, view, scalar = load_trusted_kernel_args(str(path))
+    assert isinstance(restored, torch.Tensor) and isinstance(view, torch.Tensor)
+    assert isinstance(restored_plain, torch.Tensor)
+    assert restored.dtype == dtype and restored.requires_grad and restored.is_leaf
+    assert view.requires_grad and restored_plain.requires_grad
+    assert view.untyped_storage()._cdata == restored.untyped_storage()._cdata
+    assert view.storage_offset() == 2
+    assert getattr(restored, "tag", None) == ("payload" if python_state else None)
+    torch.testing.assert_close(restored.detach().float(), data.detach().float())
+    torch.testing.assert_close(restored_plain, plain)
+    assert scalar == 3
+
+
+def test_normal_serialization_writes_what_pytorch_writes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Only a v3 tensor that requires grad gets another rebuild function. A
+    # reducer registered for a tensor type keeps its place ahead of
+    # ``__reduce_ex__``, which could not pickle this one's lock.
+    monkeypatch.setitem(
+        copyreg.dispatch_table, _RegisteredTensor, _reduce_registered_tensor
+    )
+    registered = torch.arange(3, dtype=torch.float32).as_subclass(_RegisteredTensor)
+    registered.lock = threading.Lock()  # pyrefly: ignore[missing-attribute]
+    registered.requires_grad_(True)
+    value = (
+        torch.arange(4, dtype=torch.float32, requires_grad=True),
+        torch.arange(4, dtype=torch.float32).to(torch.float8_e4m3fn),
+        torch.nn.Parameter(torch.ones(2, dtype=torch.float16)),
+        registered,
+        {"shape": (2, 3), "dtype": torch.bfloat16},
+    )
+    streams = []
+    for name, save in (("helion", save_tensor_tree), ("torch", torch.save)):
+        (tmp_path / name).mkdir()
+        path = tmp_path / name / "args.pt"
+        save(value, path)
+        with zipfile.ZipFile(path) as archive:
+            (record,) = [n for n in archive.namelist() if n.endswith("/data.pkl")]
+            streams.append(archive.read(record))
+    assert streams[0] == streams[1]
+
+
+@pytest.mark.parametrize("mixed_dtype_view", [False, True])
+def test_registered_reducer_of_fp8_tensor_that_requires_grad_loads(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mixed_dtype_view: bool
+) -> None:
+    # A reducer registered for the type may hand back PyTorch's own v3
+    # rebuild; its file has to load as well, on the first attempt and on the
+    # mixed-dtype retry.
+    monkeypatch.setitem(
+        copyreg.dispatch_table, torch.Tensor, lambda tensor: tensor.__reduce_ex__(2)
+    )
+    data = torch.arange(8, dtype=torch.float32).to(torch.float8_e4m3fn)
+    data.requires_grad_(True)
+    args = (data, data.detach().view(torch.int8)) if mixed_dtype_view else (data,)
+    path = tmp_path / "args.pt"
+    save_tensor_tree(args, path)
+    restored, *views = load_trusted_kernel_args(str(path))
+    assert isinstance(restored, torch.Tensor)
+    assert restored.dtype == data.dtype and restored.requires_grad
+    torch.testing.assert_close(restored.detach().float(), data.detach().float())
+    assert len(views) == len(args) - 1
+    for view in views:
+        assert isinstance(view, torch.Tensor)
+        assert view.untyped_storage()._cdata == restored.untyped_storage()._cdata
+        torch.testing.assert_close(view, data.detach().view(torch.int8))
+
+
+def test_mixed_dtype_retry_uses_a_registered_reducer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setitem(
+        copyreg.dispatch_table, _RegisteredTensor, _reduce_registered_tensor
+    )
+    registered = torch.arange(3, dtype=torch.float32).as_subclass(_RegisteredTensor)
+    registered.lock = threading.Lock()  # pyrefly: ignore[missing-attribute]
+    data = torch.arange(8, dtype=torch.float32)
+    path = tmp_path / "args.pt"
+    save_tensor_tree((registered, data, data.view(torch.int8)), path)
+    restored, restored_data, byte_view = torch.load(path, weights_only=False)
+    assert type(restored) is _RegisteredTensor
+    torch.testing.assert_close(restored.as_subclass(torch.Tensor), torch.arange(3.0))
+    torch.testing.assert_close(restored_data, data)
+    assert byte_view.untyped_storage()._cdata == restored_data.untyped_storage()._cdata
 
 
 def test_normal_serialization_keeps_tensor_and_explicit_typed_storage(
