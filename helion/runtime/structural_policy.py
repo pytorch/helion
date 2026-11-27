@@ -14,6 +14,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 from typing import Protocol
+from typing import TypeVar
 
 if TYPE_CHECKING:
     from .config import Config
@@ -74,6 +75,13 @@ class StructuralConfig:
 
     def identity(self) -> str:
         raise NotImplementedError
+
+
+# What an autotuner may hand a kernel, which ``BoundKernel.set_config`` reads:
+# a ``Config``, a plain dict of its options, or a policy envelope around one.
+SelectedConfig = TypeVar(
+    "SelectedConfig", bound="Config | dict[str, object] | StructuralConfig"
+)
 
 
 class StructuralPolicyError(ValueError):

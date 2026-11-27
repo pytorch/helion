@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 import copy
 import dataclasses
 import functools
@@ -7,8 +8,12 @@ import hashlib
 import inspect
 import json
 from pathlib import Path
+import threading
 import types
 from typing import TYPE_CHECKING
+from typing import Any
+from typing import ClassVar
+from typing import cast
 from unittest.mock import Mock
 from unittest.mock import patch
 
@@ -19,10 +24,24 @@ from torch._inductor.codecache import PyCodeCache
 from torch.utils._pytree import tree_leaves
 
 import helion
+from helion._testing.aot_export_scenarios import HELD_A
+from helion._testing.aot_export_scenarios import HELD_B
+from helion._testing.aot_export_scenarios import INELIGIBLE
+from helion._testing.aot_export_scenarios import KERNEL
+from helion._testing.aot_export_scenarios import OTHER_DIR
+from helion._testing.aot_export_scenarios import OTHER_POLICY
+from helion._testing.aot_export_scenarios import OTHER_SOURCE
+from helion._testing.aot_export_scenarios import PLAIN
+from helion._testing.aot_export_scenarios import SHAPES
+from helion._testing.aot_export_scenarios import TWIN
+from helion._testing.aot_export_scenarios import import_after_rewrite
+from helion._testing.aot_export_scenarios import run_export_scenario
+from helion._testing.aot_export_scenarios import scenario_names
 from helion._testing.cute_structural import _case
 from helion._testing.cute_structural import _cpu_only  # noqa: F401
 from helion._testing.cute_structural import _function
 from helion._testing.cute_structural import _module
+from helion._testing.held_overrides import hold_block_sizes
 from helion.autotuner.aot_cache import AOTAutotuneCache
 from helion.autotuner.aot_compile import generate_standalone_file
 from helion.autotuner.aot_structural_export import _export_call_key
@@ -43,7 +62,7 @@ pytestmark = pytest.mark.cpu_only
 if TYPE_CHECKING:
     from collections.abc import Callable
     from collections.abc import Iterator
-    from typing import Any
+    import contextlib
 
 
 @pytest.fixture(autouse=True)
@@ -74,6 +93,14 @@ def _model(
 ) -> str:
     raw = f"def key_{name}(*args):\n    return int(args[0].shape[0] > {size})\ndef autotune_{name}(*args):\n    return {{}}\n"
     return attach_model_policy(raw, {name: configs}, policy)
+
+
+def _one_config_model(
+    name: str, config: helion.Config, policy: CuteStructuralPolicy
+) -> str:
+    """A heuristic model that selects ``config`` for every call of ``name``."""
+    raw = f"def key_{name}(*args):\n    return 0\ndef autotune_{name}(*args):\n    return {{}}\n"
+    return attach_model_policy(raw, {name: [config]}, policy)
 
 
 def _metadata(value: object) -> object:
@@ -409,6 +436,101 @@ def test_dynamic_user_key_snapshot_and_named_argument_dispatch(tmp_path: Path) -
     assert path.read_bytes() == previous
 
 
+def test_a_dynamic_export_embeds_the_model_its_configs_came_from(
+    tmp_path: Path,
+) -> None:
+    # The embedded model selects among the exported configs by index, so the
+    # configs, the bytes in the export's entry and the embedded text are of
+    # one reading of the model file, also when the file is rewritten while
+    # the export generates its code.
+    function = _function(tmp_path)
+    policy = CuteStructuralPolicy()
+    kernel = helion.aot_kernel(
+        function, backend="cute", static_shapes=False, cute_structural_policy=policy
+    )
+    args = (torch.empty(37),)
+    bound = kernel._bind_isolated(args)
+    blocks = [helion.Config(block_sizes=[size]) for size in (16, 32, 64)]
+    raw = "def key__pointwise(*args):\n    return {}\ndef autotune__pointwise(*args):\n    return {{}}\n"
+    two = attach_model_policy(
+        raw.format("int(args[0].shape[0] > 64)"), {kernel.name: blocks[:2]}, policy
+    )
+    three = attach_model_policy(raw.format(2), {kernel.name: blocks}, policy)
+    model = tmp_path / "model.py"
+    model.write_text(two)
+    path = policy_path(tmp_path / "original__pointwise_standalone.py", policy)
+    cache = AOTAutotuneCache(BaseSearch(bound, args))
+
+    def rewrite_then_generate(config: helion.Config) -> str:
+        model.write_text(three)
+        return generate(config)
+
+    def dispatched(size: int) -> tuple[int, int]:
+        """How many configs the file holds, and the one a call selects."""
+        module = _module(path)
+        calls: list[object] = []
+        module._pointwise(
+            torch.empty(size), _launcher=lambda *args, **kwargs: calls.append(args[0])
+        )
+        kernels = [each._helion__pointwise for each in module._helion_aot_modules]
+        return len(kernels), kernels.index(calls[0])
+
+    generate = bound.to_triton_code
+    with (
+        patch.object(cache, "_find_heuristic_file", return_value=model),
+        patch.object(bound, "to_triton_code", rewrite_then_generate),
+    ):
+        cache._maybe_run_compile()
+        assert [dispatched(size) for size in (37, 101)] == [(2, 0), (2, 1)]
+        # The next call reads the bytes the file holds then, which are
+        # another entry's: the file stays with the model that wrote it.
+        with pytest.raises(StructuralPolicyError, match="already owns"):
+            cache._maybe_run_compile()
+        assert [dispatched(size) for size in (37, 101)] == [(2, 0), (2, 1)]
+
+
+def test_a_static_export_selects_from_the_model_its_entry_is_of(
+    tmp_path: Path,
+) -> None:
+    # A static export reads the model file once: the selector selects from
+    # the bytes its entry is of, also when the file is rewritten during the
+    # export.
+    function = _function(tmp_path)
+    policy = CuteStructuralPolicy()
+    kernel = helion.aot_kernel(
+        function, backend="cute", static_shapes=True, cute_structural_policy=policy
+    )
+    args = (torch.empty(37),)
+    bound = kernel._bind_isolated(args)
+    models = {
+        block: _one_config_model(
+            kernel.name, helion.Config(block_sizes=[block]), policy
+        )
+        for block in (32, 64)
+    }
+    model = tmp_path / "model.py"
+    model.write_text(models[32])
+    path = policy_path(tmp_path / f"original_{kernel.name}_standalone.py", policy)
+    cache = AOTAutotuneCache(BaseSearch(bound, args))
+    select = cache._get_heuristic_config
+
+    def select_then_rewrite(*arguments: Any, **named: Any) -> helion.Config | None:
+        config = select(*arguments, **named)
+        model.write_text(models[64])
+        return config
+
+    with patch.object(cache, "_find_heuristic_file", return_value=model):
+        with patch.object(cache, "_get_heuristic_config", select_then_rewrite):
+            cache._maybe_run_compile()
+        exported = path.read_text()
+        assert "_BLOCK_SIZE_0 = 32" in exported
+        # The next call reads the bytes the file holds then, which are
+        # another entry's: the file stays with the model that wrote it.
+        with pytest.raises(StructuralPolicyError, match="already owns"):
+            cache._maybe_run_compile()
+        assert path.read_text() == exported
+
+
 def test_bad_model_and_unrelocatable_user_key_do_not_replace_export(
     tmp_path: Path,
 ) -> None:
@@ -434,6 +556,27 @@ def test_bad_model_and_unrelocatable_user_key_do_not_replace_export(
                 user_key=key,
             )
         assert path.read_text() == "prior artifact"
+
+
+def test_a_rewritten_structural_file_is_imported_as_written(tmp_path: Path) -> None:
+    # The structural writer removes the bytecode of the file it replaces, as
+    # the plain one does: a file of the same size, written within the second
+    # of the file an import has left bytecode of, is imported as written.
+    policy = CuteStructuralPolicy()
+    model = _one_config_model("demo", helion.Config(), policy)
+
+    def write(value: int) -> Path:
+        return generate_standalone_file(
+            "demo",
+            [f"def demo(x):\n    return {value}\n"],
+            model,
+            tmp_path,
+            structural_policy=policy,
+        )
+
+    path = write(16)
+    before, after = import_after_rewrite(path, lambda: write(32))
+    assert (before.demo(0), after.demo(0)) == (16, 32)
 
 
 @pytest.mark.parametrize("setting", CUTE_STRUCTURAL_SETTINGS)
@@ -513,9 +656,8 @@ def test_export_guards_tensor_identity_and_accepts_fresh_pointers(
     args = (torch.empty(37), torch.empty(37), torch.empty(37))
     bound = kernel._bind_isolated(args)
     config = bound.config_spec.default_config()
-    raw = f"def key_{kernel.name}(*args):\n    return 0\ndef autotune_{kernel.name}(*args):\n    return {{}}\n"
     model = tmp_path / "model.py"
-    model.write_text(attach_model_policy(raw, {kernel.name: [config]}, policy))
+    model.write_text(_one_config_model(kernel.name, config, policy))
     cache = AOTAutotuneCache(BaseSearch(bound, args))
     with patch.object(cache, "_find_heuristic_file", return_value=model):
         cache._maybe_run_compile()
@@ -597,8 +739,7 @@ def test_dynamic_constexpr_export_requires_the_observed_bound_signature(
     bound = kernel._bind_isolated(args)
     config = bound.config_spec.default_config()
     model = tmp_path / "model.py"
-    raw = f"def key_{kernel.name}(*args):\n    return 0\ndef autotune_{kernel.name}(*args):\n    return {{}}\n"
-    model.write_text(attach_model_policy(raw, {kernel.name: [config]}, policy))
+    model.write_text(_one_config_model(kernel.name, config, policy))
     cache = AOTAutotuneCache(BaseSearch(bound, args))
     with patch.object(cache, "_find_heuristic_file", return_value=model):
         cache._maybe_run_compile()
@@ -613,6 +754,339 @@ def test_dynamic_constexpr_export_requires_the_observed_bound_signature(
     hold.assert_not_called()
 
 
+@pytest.mark.parametrize("static", [False, True])
+def test_a_structural_file_keeps_the_entry_that_wrote_it(
+    static: bool, tmp_path: Path
+) -> None:
+    # One file, two entries: the calls of one kernel on two hardware ids.
+    # Under a structural policy a file keeps the entry that wrote it first.
+    # The call of the other entry is refused and changes nothing, on disk
+    # or in what counts as exported, and the first entry's calls keep
+    # accumulating. The constexpr argument makes each call a variant of its
+    # own on the dynamic path too.
+    function = _relocate(_constant_scale, tmp_path)
+    policy = CuteStructuralPolicy()
+    kernel = helion.aot_kernel(
+        function, backend="cute", static_shapes=static, cute_structural_policy=policy
+    )
+    calls = {size: (torch.empty(size), 2) for size in (37, 45)}
+    bound = {size: kernel._bind_isolated(args) for size, args in calls.items()}
+    model = tmp_path / "model.py"
+    stored = bound[37].config_spec.default_config()
+    model.write_text(_one_config_model(kernel.name, stored, policy))
+    path = policy_path(tmp_path / f"original_{kernel.name}_standalone.py", policy)
+
+    def export(hardware: str, size: int) -> set[int]:
+        cache = AOTAutotuneCache(BaseSearch(bound[size], calls[size]))
+        cache.hardware_id = hardware
+        with patch.object(cache, "_find_heuristic_file", return_value=model):
+            cache._maybe_run_compile()
+        # Executed from its text: the file as it is on disk.
+        module = types.ModuleType(path.stem)
+        module.__file__ = str(path)
+        exec(compile(path.read_text(), str(path), "exec"), vars(module))
+        dispatched = set()
+        for candidate, args in calls.items():
+            try:
+                _call(getattr(module, kernel.name), args)
+            except ValueError as error:
+                assert "No standalone variant" in str(error)
+                continue
+            dispatched.add(candidate)
+        return dispatched
+
+    assert export("first", 37) == {37}
+    exported = path.read_bytes()
+    with pytest.raises(StructuralPolicyError, match="already owns"):
+        export("second", 45)
+    assert path.read_bytes() == exported
+    # The refused call does not count as exported: the same call of the
+    # file's own entry is written.
+    assert export("first", 45) == {37, 45}
+    # The file is its entry's: a repeated call writes nothing.
+    written = path.stat().st_mtime_ns
+    assert export("first", 37) == {37, 45}
+    assert path.stat().st_mtime_ns == written
+
+
+@pytest.mark.parametrize("static", [False, True])
+def test_a_structural_file_refuses_an_export_under_other_held_overrides(
+    static: bool, tmp_path: Path
+) -> None:
+    # A backend may hold the configs a kernel selects without a search to
+    # some of its ``autotune_config_overrides``. Stubbed here as one that
+    # holds them to ``block_sizes``: the model's config is then exported as
+    # the kernel compiles it, in an entry of what the kernel holds. Under a
+    # structural policy a file keeps the entry that wrote it first, so the
+    # same call under another held override is refused: the dynamic export
+    # does not skip it as already compiled, the static one does not collide
+    # with the variant of the earlier override, and neither puts its variant
+    # into the file. Clearing the AOT cache starts a replacement file.
+    function = _function(tmp_path)
+    policy = CuteStructuralPolicy()
+    kernel = helion.aot_kernel(
+        function, backend="cute", static_shapes=static, cute_structural_policy=policy
+    )
+    args = (torch.empty(37),)
+    bound = kernel._bind_isolated(args)
+    model = tmp_path / "model.py"
+    stored = helion.Config(block_sizes=[32])
+    model.write_text(_one_config_model(kernel.name, stored, policy))
+    path = policy_path(tmp_path / f"original_{kernel.name}_standalone.py", policy)
+
+    def export(overrides: dict[str, object]) -> str:
+        bound.settings.autotune_config_overrides = overrides
+        cache = AOTAutotuneCache(BaseSearch(bound, args))
+        with patch.object(cache, "_find_heuristic_file", return_value=model):
+            cache._maybe_run_compile()
+        return path.read_text()
+
+    def refused(overrides: dict[str, object]) -> None:
+        exported = path.read_text()
+        with pytest.raises(StructuralPolicyError, match="already owns"):
+            export(overrides)
+        assert path.read_text() == exported
+
+    with hold_block_sizes(type(bound.config_spec.search_surface)):
+        for held, other, size in (
+            ({}, {"block_sizes": [64]}, 32),
+            ({"block_sizes": [64]}, {}, 64),
+        ):
+            exported = export(held)
+            assert (f"_BLOCK_SIZE_0 = {size}" in exported, size) == (True, size)
+            assert f"_BLOCK_SIZE_0 = {96 - size}" not in exported
+            # An override the backend does not hold changes nothing.
+            assert export({**held, "cute_pdl": True}) == exported
+            refused(other)
+            assert export(held) == exported
+            AOTAutotuneCache.clear_caches()
+
+
+@pytest.mark.parametrize("static", [False, True])
+def test_exports_racing_under_other_overrides_leave_the_first_publishers_file(
+    static: bool, tmp_path: Path
+) -> None:
+    # Two kernels over one function, one of them under an override the
+    # backend holds its unsearched configs to (stubbed as ``block_sizes``),
+    # export from two threads. The kernel without the override is still
+    # generating code when the other writes the file. Under a structural
+    # policy a file keeps the entry that wrote it first, and a variant is
+    # published once its code is generated: the first kernel's export is
+    # then refused, as it would be had its turn come later, and the file
+    # holds the other kernel's variant alone.
+    function = _function(tmp_path)
+    policy = CuteStructuralPolicy()
+    args = (torch.empty(37),)
+    model = tmp_path / "model.py"
+    path = policy_path(tmp_path / "original__pointwise_standalone.py", policy)
+    surface = None
+    first_generating = threading.Event()
+    second_published = threading.Event()
+
+    def exporter(overrides: dict[str, object]) -> Callable[[], None]:
+        nonlocal surface
+        kernel = helion.aot_kernel(
+            function,
+            backend="cute",
+            static_shapes=static,
+            cute_structural_policy=policy,
+        )
+        bound = kernel._bind_isolated(args)
+        bound.settings.autotune_config_overrides = overrides
+        surface = type(bound.config_spec.search_surface)
+        if not model.exists():
+            stored = helion.Config(block_sizes=[32])
+            model.write_text(_one_config_model(kernel.name, stored, policy))
+        generate = bound.to_triton_code
+
+        def to_triton_code(config: helion.Config) -> str | None:
+            code = generate(config)
+            if not overrides and not second_published.is_set():
+                first_generating.set()
+                assert second_published.wait(timeout=60)
+            return code
+
+        def export() -> None:
+            cache = AOTAutotuneCache(BaseSearch(bound, args))
+            with (
+                patch.object(cache, "_find_heuristic_file", return_value=model),
+                patch.object(bound, "to_triton_code", to_triton_code),
+            ):
+                cache._maybe_run_compile()
+
+        return export
+
+    first = exporter({})
+    second = exporter({"block_sizes": [64]})
+
+    def export_second() -> None:
+        assert first_generating.wait(timeout=60)
+        try:
+            second()
+        finally:
+            second_published.set()
+
+    assert surface is not None
+    with hold_block_sizes(surface):
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            racing = [pool.submit(first), pool.submit(export_second)]
+            with pytest.raises(StructuralPolicyError, match="already owns"):
+                racing[0].result()
+            racing[1].result()
+        exported = path.read_text()
+        assert "_BLOCK_SIZE_0 = 64" in exported
+        assert "_BLOCK_SIZE_0 = 32" not in exported
+        # The second kernel's call is exported and is not written again; the
+        # first kernel's next call is refused as well.
+        second()
+        assert path.read_text() == exported
+        with pytest.raises(StructuralPolicyError, match="already owns"):
+            first()
+        assert path.read_text() == exported
+
+
+class _StructuralExports:
+    """Standalone exports of CuTe kernels under a structural policy, static
+    or dynamic, for ``helion._testing.aot_export_scenarios``. The backend's
+    hooks are stubbed to hold a kernel's unsearched configs to
+    ``block_sizes``."""
+
+    kernels = frozenset({KERNEL, TWIN, OTHER_DIR, OTHER_SOURCE, OTHER_POLICY})
+    # A file keeps the entry that wrote it first.
+    owned = True
+    codegen_failure_raises = True
+    # The block size the model's config is compiled with under what a kernel
+    # holds; the exported variant launches with it.
+    _BLOCK: ClassVar[dict[str | None, int]] = {PLAIN: 32, HELD_A: 64, HELD_B: 16}
+
+    def __init__(self, tmp_path: Path, *, static: bool) -> None:
+        self.static = static
+        self._root = tmp_path
+        (tmp_path / "other").mkdir()
+        functions = {False: _function(tmp_path), True: _function(tmp_path / "other")}
+        self._policies = {
+            name: CuteStructuralPolicy(cute_region_fission=name == OTHER_POLICY)
+            for name in self.kernels
+        }
+        self._kernels = {
+            name: helion.aot_kernel(
+                functions[name == OTHER_SOURCE],
+                backend="cute",
+                static_shapes=static,
+                cute_structural_policy=self._policies[name],
+            )
+            for name in sorted(self.kernels)
+        }
+        self._bound: dict[tuple[str, int], Any] = {}
+        # The specs of the bindings the stubbed hook leaves alone.
+        self._ineligible: set[int] = set()
+
+    def hooks(self) -> contextlib.AbstractContextManager[None]:
+        surface = type(self._bind(KERNEL, SHAPES[0]).config_spec.search_surface)
+        return hold_block_sizes(surface, self._ineligible)
+
+    def _bind(self, kernel: str, shape: int) -> Any:
+        if (kernel, shape) not in self._bound:
+            bound = self._kernels[kernel]._bind_isolated((torch.empty(shape),))
+            # A static export compiles the config of the call at hand, which
+            # the hook leaves alone for ``INELIGIBLE``; a dynamic export is
+            # generated once, for every call.
+            if self.static and shape == INELIGIBLE:
+                self._ineligible.add(id(bound.config_spec))
+            self._bound[kernel, shape] = bound
+        return self._bound[kernel, shape]
+
+    def _model(self, kernel: str) -> Path:
+        policy = self._policies[kernel]
+        model = self._root / f"model_{policy.identity()}.py"
+        if not model.exists():
+            name = self._kernels[kernel].name
+            stored = helion.Config(block_sizes=[self._BLOCK[PLAIN]])
+            model.write_text(_one_config_model(name, stored, policy))
+        return model
+
+    def export(
+        self,
+        kernel: str,
+        held: str | None,
+        shape: int,
+        *,
+        during_codegen: Callable[[], None] | None = None,
+        fail: bool = False,
+    ) -> None:
+        bound = self._bind(kernel, shape)
+        bound.settings.autotune_config_overrides = (
+            {} if held is PLAIN else {"block_sizes": [self._BLOCK[held]]}
+        )
+        generate = bound.to_triton_code
+
+        def to_triton_code(config: helion.Config) -> str | None:
+            if fail:
+                raise RuntimeError("stubbed code generation failed to compile")
+            code = generate(config)
+            if during_codegen is not None:
+                during_codegen()
+            return code
+
+        cache = AOTAutotuneCache(BaseSearch(bound, (torch.empty(shape),)))
+        if kernel == OTHER_DIR:
+            cache.data_dir = self._root / "other_aot"
+        with (
+            patch.object(
+                cache, "_find_heuristic_file", return_value=self._model(kernel)
+            ),
+            patch.object(bound, "to_triton_code", to_triton_code),
+        ):
+            cache._maybe_run_compile()
+
+    def file(self, kernel: str) -> Path:
+        directory = self._root / "other" if kernel == OTHER_SOURCE else self._root
+        name = self._kernels[kernel].name
+        return policy_path(
+            directory / f"original_{name}_standalone.py", self._policies[kernel]
+        )
+
+    def files(self) -> set[Path]:
+        return set(self._root.rglob("*_standalone*.py"))
+
+    def dispatched(self, path: Path) -> dict[int, str | None]:
+        # Executed from its text: the file as it is on disk.
+        module = types.ModuleType(path.stem)
+        module.__file__ = str(path)
+        exec(compile(path.read_text(), str(path), "exec"), vars(module))
+        wrapper = getattr(module, self._kernels[KERNEL].name)
+        held = {block: name for name, block in self._BLOCK.items()}
+        variants: dict[int, str | None] = {}
+        for shape in SHAPES:
+            try:
+                _, (call,) = _call(wrapper, (torch.empty(shape),))
+            except ValueError as error:
+                assert "No standalone variant" in str(error)
+                continue
+            # The variant launches with the block size it was compiled for.
+            launch = cast("dict[str, tuple[int, ...]]", call["kwargs"])
+            variants[shape] = held[launch["block"][0]]
+        return variants
+
+
+# Each scenario is another sequence of exports, and the static and the
+# dynamic structural path keep their entries apart, so every scenario runs
+# on both.
+@pytest.mark.parametrize("static", [False, True])
+@pytest.mark.parametrize(
+    "scenario", scenario_names(_StructuralExports.kernels, failures=True)
+)
+def test_standalone_export_scenarios(
+    scenario: str, static: bool, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    # What every standalone file holds after each export of kernels whose
+    # held overrides change, differ or agree, two structural policies over
+    # one function among them: see the scenario table.
+    driver = _StructuralExports(tmp_path, static=static)
+    with driver.hooks():
+        run_export_scenario(scenario, driver, caplog)
+
+
 def test_compile_deduplication_includes_original_source_bytes(tmp_path: Path) -> None:
     function = _function(tmp_path)
     policy = CuteStructuralPolicy()
@@ -623,8 +1097,7 @@ def test_compile_deduplication_includes_original_source_bytes(tmp_path: Path) ->
     bound = kernel._bind_isolated(args)
     model = tmp_path / "model.py"
     config = bound.config_spec.default_config()
-    raw = f"def key_{kernel.name}(*args):\n    return 0\ndef autotune_{kernel.name}(*args):\n    return {{}}\n"
-    model.write_text(attach_model_policy(raw, {kernel.name: [config]}, policy))
+    model.write_text(_one_config_model(kernel.name, config, policy))
     cache = AOTAutotuneCache(BaseSearch(bound, args))
     with (
         patch.object(cache, "_find_heuristic_file", return_value=model),
@@ -654,8 +1127,7 @@ def test_unrelocatable_bound_guard_cannot_replace_an_existing_export(
     bound = kernel._bind_isolated(args)
     config = bound.config_spec.default_config()
     model = tmp_path / "model.py"
-    raw = f"def key_{kernel.name}(*args):\n    return 0\ndef autotune_{kernel.name}(*args):\n    return {{}}\n"
-    model.write_text(attach_model_policy(raw, {kernel.name: [config]}, policy))
+    model.write_text(_one_config_model(kernel.name, config, policy))
     cache = AOTAutotuneCache(BaseSearch(bound, args))
     with patch.object(cache, "_find_heuristic_file", return_value=model):
         cache._maybe_run_compile()

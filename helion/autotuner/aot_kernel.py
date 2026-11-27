@@ -21,7 +21,6 @@ from __future__ import annotations
 from collections.abc import Iterable
 import functools
 import hashlib
-import importlib.util
 import os
 from typing import TYPE_CHECKING
 from typing import Any
@@ -268,22 +267,22 @@ class HeuristicKeyFunction:
             )
 
             if heuristic_path is not None:
-                spec = importlib.util.spec_from_file_location(
-                    "heuristic", heuristic_path
-                )
-                if spec is not None and spec.loader is not None:
-                    module = importlib.util.module_from_spec(spec)
-                    spec.loader.exec_module(module)
+                # Executed from the file's bytes, as the cache executes the
+                # heuristic it selects from
+                # (``AOTAutotuneCache._load_heuristic_module``): bytecode
+                # Python keeps for the path may be of a file replaced, and
+                # the key would then be the old heuristic's beside a config
+                # of the new one.
+                module = load_policy_module(heuristic_path, heuristic_path.read_bytes())
+                model_configs(module, self.kernel_name, None)
 
-                    model_configs(module, self.kernel_name, None)
-
-                    # Load the key_<kernel> function
-                    key_fn = getattr(module, f"key_{self.kernel_name}", None)
-                    if key_fn is not None:
-                        self._key_fn = key_fn
-                        self._loaded = True
-                        HeuristicKeyFunction._key_fn_cache[cache_key] = self._key_fn
-                        return self._key_fn
+                # Load the key_<kernel> function
+                key_fn = getattr(module, f"key_{self.kernel_name}", None)
+                if key_fn is not None:
+                    self._key_fn = key_fn
+                    self._loaded = True
+                    HeuristicKeyFunction._key_fn_cache[cache_key] = self._key_fn
+                    return self._key_fn
         except StructuralPolicyError:
             raise
         except Exception:

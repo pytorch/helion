@@ -39,7 +39,13 @@ def load_policy_module(path: Path, source: bytes) -> ModuleType:
     """Execute the exact bytes used for the model's identity, bypassing .pyc.
 
     A same-size edit within a filesystem timestamp tick must not turn a new
-    source digest into an old bytecode module. Legacy loading is unchanged.
+    source digest into an old bytecode module. Every heuristic of the AOT
+    cache is executed this way (``AOTAutotuneCache._load_heuristic_module``),
+    one without a policy too, and so is the key function's of an
+    ``aot_kernel``. The module names its file as an import of the file does,
+    under a module name of its own (the path and the bytes), and the bytes
+    are compiled as an import compiles a file: without this module's future
+    statements.
     """
     digest = hashlib.sha256(os.fsencode(path.resolve()) + b"\0" + source).hexdigest()
     name = f"_helion_aot_heuristic_{digest}"
@@ -52,7 +58,7 @@ def load_policy_module(path: Path, source: bytes) -> ModuleType:
     previous = sys.modules.get(name)
     sys.modules[name] = module
     try:
-        exec(compile(source, str(path), "exec"), vars(module))
+        exec(compile(source, str(path), "exec", dont_inherit=True), vars(module))
     except BaseException:
         if previous is None:
             del sys.modules[name]

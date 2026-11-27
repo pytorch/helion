@@ -443,6 +443,44 @@ def test_policy_lookup_never_falls_back_to_unversioned_model(tmp_path: Path) -> 
     )
 
 
+def test_a_selection_follows_the_model_next_to_a_source_named_through_a_link(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The kernel's code names its source through a link to the directory,
+    # as its module was imported, and a model lies next to the source in
+    # each directory the link names in turn. The kernel selects from the
+    # model of the directory the link names by then: the lookup keeps its
+    # answer, a file in a resolved directory, by the source's directory
+    # resolved. Kept by the source as the code names it, the answer stayed
+    # the model of the link's first directory.
+    monkeypatch.delenv("HELION_HEURISTIC_DIR", raising=False)
+    policy = CuteStructuralPolicy()
+    link = tmp_path / "current"
+    for index, name in enumerate(("first", "second")):
+        (tmp_path / name).mkdir()
+        _function(tmp_path / name)
+        _write_model(
+            policy_path(tmp_path / name / "_helion_aot_original_cuda_sm100.py", policy),
+            "_pointwise",
+            policy,
+            index,
+        )
+    link.symlink_to("first")
+    kernel = helion.aot_kernel(
+        _module(link / "original.py")._pointwise,
+        backend="cute",
+        cute_structural_policy=policy,
+    )
+    args = (torch.empty(37),)
+    cache = AOTAutotuneCache(BaseSearch(kernel._bind_isolated(args), args))
+    selected = []
+    for name in ("first", "second", "first"):
+        link.unlink()
+        link.symlink_to(name)
+        selected.append(cache._get_heuristic_config().block_sizes)
+    assert selected == [[32], [64], [32]]
+
+
 @pytest.mark.parametrize("backend", ["decision_tree", "nearest_neighbor"])
 def test_actual_runner_partitions_train_and_evaluate_separately(
     backend: str, tmp_path: Path

@@ -151,11 +151,13 @@ def test_backend_disabled_handoff_supports_custom_autotuners(
         autotune_log_details=True,
         force_autotune=False,
     )
-    # No fixed config (Backend.autotune asks _fixed_config): this one searches.
+    # No fixed config and no config of the application's (Backend.autotune
+    # asks _fixed_config and _selects_given_config): this one searches.
     bound = SimpleNamespace(
         settings=settings,
-        kernel=SimpleNamespace(configs=[]),
-        _fixed_config=lambda force=False: None,
+        kernel=SimpleNamespace(_selects_given_config=lambda force=False: False),
+        _fixed_config=lambda force=False, report=False: None,
+        _unsearched_config=lambda config, report=False: config,
     )
     backend = SimpleNamespace(supports_precompile=lambda: True)
     automatic = Mock(side_effect=AssertionError("handoff is disabled"))

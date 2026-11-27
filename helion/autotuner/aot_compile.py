@@ -22,6 +22,8 @@ exposed as a scalar/container argument or checked by the emitted runtime wrapper
 from __future__ import annotations
 
 import ast
+import contextlib
+import importlib.util
 import inspect
 import logging
 from pathlib import Path
@@ -353,6 +355,25 @@ def _standalone_heuristic_source(source: str, kernel_name: str) -> str:
 # ---------------------------------------------------------------------------
 
 
+def remove_stale_bytecode(path: Path) -> None:
+    """Remove the bytecode the running interpreter keeps for the standalone
+    file at ``path``, once a writer has replaced that file. Both writers
+    call it.
+
+    Python checks bytecode against the size of the source and its timestamp
+    in whole seconds: after a rewrite of the same size within that second,
+    an import would run the bytecode of the file replaced.
+    """
+    # Best effort: OSError covers a file that has no bytecode, the usual
+    # case, and bytecode this process may not remove (a ``__pycache__``
+    # another account wrote, a read-only bytecode directory). The file is
+    # replaced by now, so the export must not fail over a cache file: it
+    # goes on as it would without the removal, and in that corner the stale
+    # import stays possible.
+    with contextlib.suppress(OSError):
+        Path(importlib.util.cache_from_source(path)).unlink()
+
+
 def generate_standalone_file(
     kernel_name: str,
     triton_codes: list[str],
@@ -550,6 +571,10 @@ def generate_standalone_file(
     if n > 1 and dispatch_keys is None:
         # The selector is a separate Python module. Its imports and builtins
         # must not resolve against the publicly named kernel or its children.
+        # Its text is compiled as the AOT cache compiles the heuristic it
+        # selects from (``load_policy_module``): without the future
+        # statements of the file that executes it, this one's ``annotations``
+        # among them, under which a heuristic's annotations are kept as text.
         model_source = _standalone_heuristic_source(heuristic_code, kernel_name)
         key_name = f"key_{kernel_name}"
         parts.extend(
@@ -558,7 +583,7 @@ def generate_standalone_file(
                 "# Heuristic dispatch",
                 f"# {sep}\n",
                 f"def {selector_name}():",
-                "    from builtins import BaseException, exec, globals",
+                "    from builtins import BaseException, compile, exec, globals",
                 "    from hashlib import sha256",
                 "    import os",
                 "    from sys import modules",
@@ -573,7 +598,10 @@ def generate_standalone_file(
                 "        model.__file__ = path",
                 "        modules[name] = model",
                 "        try:",
-                "            exec(source, model.__dict__)",
+                "            exec(",
+                "                compile(source, '<string>', 'exec', dont_inherit=True),",
+                "                model.__dict__,",
+                "            )",
                 "        except BaseException:",
                 "            del modules[name]",
                 "            raise",
@@ -755,5 +783,6 @@ def generate_standalone_file(
     finally:
         if temp_path is not None:
             temp_path.unlink(missing_ok=True)
+    remove_stale_bytecode(out_file)
     log.info("Standalone file: %s", out_file)
     return out_file

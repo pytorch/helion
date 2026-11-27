@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import copy
 import dataclasses
 import hashlib
@@ -16,7 +17,10 @@ from helion._testing import skipUnlessBackends
 from helion._testing.cute_structural import _cpu_only  # noqa: F401
 from helion._testing.cute_structural import _search
 from helion._testing.cute_structural_kernels import _matmul
+from helion._testing.cute_structural_kernels import _pointwise
+from helion._testing.held_overrides import hold_block_sizes
 from helion.autotuner.aot_cache import AOTAutotuneCache
+from helion.autotuner.base_cache import AutotuneCacheBase
 from helion.autotuner.base_search import BaseSearch
 from helion.autotuner.local_cache import LocalAutotuneCache
 from helion.autotuner.local_cache import parse_cache_entry
@@ -209,6 +213,66 @@ def test_actual_remote_read_through_checks_and_preserves_policy(
     ):
         cache.get()
     assert not path.exists()
+
+
+@pytest.mark.parametrize("held", [False, True])
+@skipUnlessBackends(["cute"])
+def test_a_cache_hit_answers_for_its_policy_before_a_hook_changes_it(
+    held: bool,
+) -> None:
+    # A cache may hand back a policy envelope, and a kernel rejects one of
+    # another policy where it reads its selection. A hook for unsearched
+    # configs that changes the entry replaces the envelope by plain options
+    # (``held``: a backend stubbed to hold such configs to ``block_sizes``),
+    # so the hit answers for the policy before that: otherwise the entry of
+    # another policy would come back as options of the kernel's own.
+    policy = CuteStructuralPolicy()
+    stored = helion.Config(block_sizes=[64])
+    foreign = CuteStructuralConfig(
+        stored, CuteStructuralPolicy(cute_region_fission=True)
+    )
+    own = CuteStructuralConfig(stored, policy)
+    entries = [foreign]
+
+    class Hit(AutotuneCacheBase):
+        def get(self) -> CuteStructuralConfig:
+            return entries[0]
+
+        def put(self, config: helion.Config) -> None:
+            raise AssertionError("a hit writes nothing")
+
+        def _get_cache_key(self) -> None:
+            raise AssertionError("a hit reads no key")
+
+        def _list_cache_entries(self) -> list[tuple[str, object]]:
+            return []
+
+    kernel = helion.kernel(
+        _pointwise,
+        backend="cute",
+        cute_structural_policy=policy,
+        autotune_effort="full",
+        autotune_config_overrides={"block_sizes": [32]},
+        autotuner_fn=Hit[BaseSearch],
+    )
+    args = (torch.empty(37),)
+    bound = kernel.bind(args)
+    hold = (
+        hold_block_sizes(type(bound.config_spec.search_surface))
+        if held
+        else contextlib.nullcontext()
+    )
+    with hold:
+        with pytest.raises(StructuralPolicyError, match="Late config envelope"):
+            bound._normalize_config(
+                bound.env.backend.autotune(bound, args, force=False)
+            )
+        # An entry of the kernel's own policy is selected, as the backend
+        # holds it.
+        entries[0] = own
+        selected = bound.env.backend.autotune(bound, args, force=False)
+        assert (selected is own) == (not held)
+        assert bound._normalize_config(selected).block_sizes == [32 if held else 64]
 
 
 @skipUnlessBackends(["cute"])

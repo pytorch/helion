@@ -625,6 +625,7 @@ def generate_policy_standalone(
     """
     from .aot_compile import _standalone_call_key
     from .aot_compile import _standalone_value_key
+    from .aot_compile import remove_stale_bytecode
     from .aot_kernel import _flatten_key_value
 
     if runtime_guard_plans is None:
@@ -827,4 +828,5 @@ def generate_policy_standalone(
     finally:
         if temp_path is not None:
             temp_path.unlink(missing_ok=True)
+    remove_stale_bytecode(path)
     return path

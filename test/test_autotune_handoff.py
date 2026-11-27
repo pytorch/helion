@@ -90,6 +90,9 @@ class _Spec:
     def normalize(self, config: Config) -> None:
         pass
 
+    def unsearched_config(self, config: Config, overrides: object) -> Config:
+        return config
+
 
 class _Script:
     def __init__(
