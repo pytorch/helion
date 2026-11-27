@@ -285,11 +285,7 @@ _VALUE_DEPENDENCIES: tuple[tuple[str, object, dict[str, object]], ...] = (
             "cute_flash_softmax_disc": True,
         },
     ),
-    (
-        "cute_flash_early_prologue_loads",
-        True,
-        {"cute_flash_pipeline_family": "fa4", "cute_flash_persistent": False},
-    ),
+    ("cute_flash_early_prologue_loads", True, {"cute_flash_pipeline_family": "fa4"}),
     ("cute_flash_flex_skip_absent", True, {"cute_flash_pipeline_family": "fa4"}),
     (
         "cute_flash_flex_dead_stage_split",

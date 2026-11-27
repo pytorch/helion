@@ -846,12 +846,11 @@ FLASH_KNOB_WITNESSES: tuple[FlashKnobWitness, ...] = (
             FLASH_SOFTMAX_DISC_KEY: True,
         },
     ),
-    # The pre-sync prologue loads exist only on the non-persistent one-CTA fa4
-    # ring (the resolver clears them elsewhere).
+    # The pre-sync prologue loads exist only on the one-CTA fa4 ring, with the
+    # one-item grid or the static persistent loop (the resolver clears them
+    # elsewhere).
     FlashKnobWitness(
-        FLASH_EARLY_PROLOGUE_LOADS_KEY,
-        (True,),
-        {FLASH_PIPELINE_FAMILY_KEY: "fa4", FLASH_PERSISTENT_KEY: False},
+        FLASH_EARLY_PROLOGUE_LOADS_KEY, (True,), {FLASH_PIPELINE_FAMILY_KEY: "fa4"}
     ),
     # The absent-stage skip is a property of the fa4 pair body's list walk
     # (the plan pins the family; the witness names the body).
