@@ -4541,9 +4541,15 @@ def test_withheld_packet_seeds_keep_their_structure_on_exact_packets() -> None:
         for fast_math in (False, True)
     }
     # (plus the single-tile issue-stream seed on the causal ws body: load warp,
-    # mask phases and the extra K ring slot: 14 -> 15.)
-    assert len(causal_seeds[False]) == len(causal_seeds[True]) == 15
+    # mask phases and the extra K ring slot: 14 -> 15; plus the persistent
+    # causal pair's CLC loop form on the fragment defaults and on each of the
+    # five measured bodies, with no batch-head count to seed the static
+    # loop's whole-grid launch group: 15 -> 21.)
+    assert len(causal_seeds[False]) == len(causal_seeds[True]) == 21
+    # One item per CTA: the persistent pair's seeds repeat each body below
+    # under the CLC loop form.
     split = {
+        cute_flash.FLASH_PERSISTENT_KEY: False,
         cute_flash.FLASH_PIPELINE_FAMILY_KEY: "fa4",
         cute_flash.FLASH_EXP2_PACKET_KEY: "1x1",
         cute_flash.FLASH_SOFTMAX_DISC_KEY: True,
@@ -4651,17 +4657,23 @@ def test_withheld_packet_seeds_keep_their_structure_on_exact_packets() -> None:
         )
         for fast_math in (False, True)
     }
-    # The three polynomial cadences fold onto the hardware-only sibling.
-    assert len(hd128_seeds[True]) - len(hd128_seeds[False]) == 3
-    assert (
-        len(
-            _seed_values(
-                hd128_seeds[False],
-                **{cute_flash.FLASH_EXP2_PACKET_KEY: _CAUSAL_HD128_RESIDENT_XU_PACKET},
+    # The three polynomial cadences fold onto the hardware-only sibling, each
+    # with the persistent pair's seed on its body (the CLC loop form: no
+    # batch-head count here).
+    assert len(hd128_seeds[True]) - len(hd128_seeds[False]) == 6
+    for persistent in (False, True):
+        assert (
+            len(
+                _seed_values(
+                    hd128_seeds[False],
+                    **{
+                        cute_flash.FLASH_EXP2_PACKET_KEY: _CAUSAL_HD128_RESIDENT_XU_PACKET,
+                        cute_flash.FLASH_PERSISTENT_KEY: persistent,
+                    },
+                )
             )
+            == 1
         )
-        == 1
-    )
     pair_seeds = {
         fast_math: cute_flash.flash_attention_seed_configs(
             192, 32, head_dim_v=128, fast_math=fast_math, **resident

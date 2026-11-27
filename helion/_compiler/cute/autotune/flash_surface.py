@@ -36,6 +36,7 @@ from ..cute_flash import FLASH_MASKED_E2E_SCHEDULE_KEY
 from ..cute_flash import FLASH_MMA_INTERLEAVE_KEY
 from ..cute_flash import FLASH_OTHER_REGS_KEY
 from ..cute_flash import FLASH_PERSISTENT_KEY
+from ..cute_flash import FLASH_PERSISTENT_LOOP_KEY
 from ..cute_flash import FLASH_PIPELINE_FAMILY_KEY
 from ..cute_flash import FLASH_ROWMAX_KEY
 from ..cute_flash import FLASH_SOFTMAX_LOWERING_KEY
@@ -373,9 +374,15 @@ def _normalize_cute_flash(
                     raise InvalidConfig(
                         f"{key} must be one of {list(choices)!r}, got {config[key]!r}"
                     )
-        else:
-            if key not in (*e2e_offset_keys, FLASH_PIPELINE_FAMILY_KEY):
-                config[key] = fragment.default()
+        elif key == FLASH_PERSISTENT_LOOP_KEY and config.get(FLASH_PERSISTENT_KEY):
+            # The fragment's default is the loop of the default resolution,
+            # whose persistence may be off. A config that turns persistence
+            # on and names no loop leaves it to the resolution below, which
+            # reads the environment's request as a direct resolution does,
+            # and gets the effective loop written back.
+            pass
+        elif key not in (*e2e_offset_keys, FLASH_PIPELINE_FAMILY_KEY):
+            config[key] = fragment.default()
     if FLASH_PIPELINE_FAMILY_KEY not in config:
         config[FLASH_PIPELINE_FAMILY_KEY] = fragments[
             FLASH_PIPELINE_FAMILY_KEY

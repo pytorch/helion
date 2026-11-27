@@ -4377,8 +4377,14 @@ def test_attention_canonical_compiler_seeds_fit_all_eight_b200_populations(
     # The examples run without the fast_math setting, so no seed carries a
     # polynomial exp2 packet: each such seed keeps its structure on the exact
     # default packet instead (the same raw and effective counts).
-    assert policy["raw_config_count"] == (15 if causal else 34)
-    assert len(policy["effective_config_ids"]) == (15 if causal else 33)
+    # The causal surface also seeds the persistent causal pair under both
+    # loop forms (the CLC scheduler, and the static loop at the whole-grid
+    # launch group) on the fragment defaults and on each of its five
+    # one-item bodies: the three measured bodies and the two polynomial
+    # packets' own, on the exact default packet like their seeds (twelve
+    # seeds).
+    assert policy["raw_config_count"] == (27 if causal else 34)
+    assert len(policy["effective_config_ids"]) == (27 if causal else 33)
     # Generation zero retains every seed and every structural coverage row;
     # their union may exceed the nominal 100 rows (the dense hd64 surface's
     # resident lowerings widen the design and it seeds the two fa4_local_tma
@@ -4408,17 +4414,22 @@ def test_attention_canonical_compiler_seeds_fit_all_eight_b200_populations(
         # onto it without the setting) and the staggered descending split
         # walk at ring 5 with the output in the Q stages (one seed: the
         # target seed's and the fragment defaults' parents produce the same
-        # structure).
-        ("causal_attention_output", (2, 32, 524288, 128), 8, 8),
+        # structure), and the persistent causal pair under both loop forms
+        # on the fragment defaults and on the resident packet's body (four
+        # seeds).
+        ("causal_attention_output", (2, 32, 524288, 128), 12, 12),
         ("attention_output", (1, 32, 524288, 64), 24, 23),
         # Every plain causal hd64 surface seeds the staggered walk at ring 4
-        # once on top of its measured bodies.
-        ("causal_attention_output", (1, 32, 1048576, 64), 18, 18),
+        # once on top of its measured bodies, and the persistent causal pair
+        # under both loop forms on the fragment defaults, on each measured
+        # body and on the body of the hybrid packet, which keeps its
+        # structure on the exact default packet (ten seeds).
+        ("causal_attention_output", (1, 32, 1048576, 64), 28, 28),
         ("attention_output", (8, 32, 524288, 64), 1, 1),
-        ("causal_attention_output", (8, 32, 786432, 64), 15, 15),
+        ("causal_attention_output", (8, 32, 786432, 64), 25, 25),
         ("attention_relu_output", (2, 32, 524288, 64), 24, 23),
-        ("causal_attention_relu_output", (2, 32, 1048576, 64), 15, 15),
-        ("causal_attention_output", (2, 32, 65536, 64), 20, 20),
+        ("causal_attention_relu_output", (2, 32, 1048576, 64), 25, 25),
+        ("causal_attention_output", (2, 32, 65536, 64), 30, 30),
     ),
 )
 @skipUnlessCuteAvailable("binding a cute-backend kernel requires the CuTe DSL")

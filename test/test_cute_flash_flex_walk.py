@@ -26,6 +26,7 @@ import torch
 from helion._compiler.cute import cute_flash
 from helion._compiler.cute import flash_knobs
 from helion._compiler.cute.attention_plan import FLEX_SCORE_KIND
+from helion._compiler.cute.attention_plan import SLIDING_WINDOW_MASK_KIND
 from helion._compiler.cute.attention_plan import AttentionScorePlan
 from helion._compiler.cute.attention_plan import FlexKvWalk
 from helion._compiler.cute.attention_plan import dense_score_plan
@@ -3706,17 +3707,12 @@ def test_ragged_tma_epilogue_passes_the_plain_output_view(seq: int) -> None:
     assert ("fa4_store_o_smem_to_gmem_rows(" in code) == ragged
 
 
-def test_persistence_stays_pinned_off_for_interval_plans_and_is_on_by_default_for_flex() -> (
+def test_persistence_stays_pinned_off_for_pruned_plans_and_is_on_by_default_for_flex() -> (
     None
 ):
-    assert (
-        not _resolve(
-            {**BODY, cute_flash.FLASH_PERSISTENT_KEY: True}, has_list_walk=False
-        ).persistent
-        or True
-    )  # the dense plan may be persistent
     with patch.dict(os.environ, {}, clear=True):
-        causal = cute_flash.resolve_flash_config(
+        # (The plain causal pair honors the key: test_cute_flash_causal_persistent.)
+        pruned = cute_flash.resolve_flash_config(
             HEAD_DIM,
             16,
             {**BODY, cute_flash.FLASH_PERSISTENT_KEY: True},
@@ -3724,6 +3720,9 @@ def test_persistence_stays_pinned_off_for_interval_plans_and_is_on_by_default_fo
             num_bh=NUM_BH,
             is_causal=True,
             standard_causal_output=True,
+            has_kv_tile_pruning=True,
+            has_score_modifiers=True,
+            score_modifier_kinds=(SLIDING_WINDOW_MASK_KIND,),
         )
         fragments = cute_flash.flash_autotune_fragments(
             HEAD_DIM,
@@ -3733,7 +3732,7 @@ def test_persistence_stays_pinned_off_for_interval_plans_and_is_on_by_default_fo
             has_list_walk=True,
             score_modifier_kinds=(FLEX_SCORE_KIND,),
         )
-    assert not causal.persistent
+    assert not pruned.persistent
     # The list walk defaults to the persistent strided loop over the
     # longest-first item order (every 2026-10-12 campaign winner) and still
     # searches both.
