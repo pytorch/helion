@@ -782,7 +782,8 @@ l2_policy_evict_first = ptx_op(
     memory=False,
     doc=(
         "``createpolicy.fractional.L2::evict_first``: the cache-policy word of "
-        "streamed operand packets read once."
+        "streamed operand packets read once, and of a balanced launch's "
+        "partial stores."
     ),
 )
 

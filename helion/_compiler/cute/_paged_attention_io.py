@@ -107,12 +107,11 @@ def store_output_rows(
       of the launch;
     - ``l2_evict_last``: the L2 evict-last cache hint
       (``st.global.L2::cache_hint``), whose policy word the calling thread
-      makes once, ahead of its stores (``createpolicy``, as
-      ``_paged_attention_partition.store_part`` does for the partition's
-      workspace). The lines an output's first write brings into L2 are then
-      the last ones the K/V stream of the following calls displaces. The
-      word is made at run time, so this form does not need the fixed
-      descriptor of the packet flushes' ``l2_evict_last``.
+      makes once, ahead of its stores (``createpolicy``). The lines an
+      output's first write brings into L2 are then the last ones the K/V
+      stream of the following calls displaces. The word is made at run
+      time, so this form does not need the fixed descriptor of the packet
+      flushes' ``l2_evict_last``.
 
     The addresses are those elements': the same index, in the tensor's own
     strided layout or by the proved storage strides, times the element's

@@ -456,6 +456,61 @@ never waits for another CTA:
   as stored and not as read ahead of that wait, so the capture proof still
   lets a captured launch read its inputs while its predecessor runs, and
   no other argument may overlap the workspace.
+- The stores into the workspace carry cache hints of their own, which
+  `cute_store_policy` (the outputs' option) does not reach. A partial's
+  hint is a trade, which the measurements below decide. In the common
+  merge, of a unit in two parts by its lowest part, the other part's
+  partial waits for the merge while the CTAs stream the rest of their
+  shares through L2: a CTA runs a part that is not its unit's lowest
+  first and a lowest part last (at 320 requests of one length on 148
+  SMs, where a share is more than two units, the wait is more than half
+  of a CTA's walk). The evict-last hint protects the partial's lines for
+  the merge's loads, and with them megabytes of L2 against the K/V
+  stream; under the evict-first hint the stream may displace them, and
+  those loads may miss L2. Against that, one merge uses a partial (only the
+  panel's quads are read once on every path: the general merge reads
+  every part, its own included, and the rows' pairs twice): its stores
+  (`store_part`, a thread's quads of the panel and a row owner's pair)
+  carry the L2 evict-first hint (`st.global.L2::cache_hint` under one
+  `createpolicy.fractional.L2::evict_first` word a thread, made ahead of
+  its stores). A counter's reset (`_count_arrival`) carries the evict-last
+  hint, and an arrival is an atomic add, which takes no hint.
+
+On the stream's side, a launch rewrites much of the workspace (at 320
+requests on 148 SMs 256 of its 592 slots, 4.3 MB at 32 query columns), and
+lines protected from eviction are L2 taken from the K/V stream of every
+CTA, at a price that depends on where the workspace lies among the
+process's other allocations and on what the process ran before. Measured on
+a B200 with the searched configs of a 2047-key window at 320 requests
+(outputs under `l2_evict_last`; kernels in which the CTA's spare warp, not
+the compute group, read a split unit's counter, a form this tree does not
+render), us per call by the legs' means, evict-first against evict-last in
+batches of rotated or mirrored role order, at two calls a sample and,
+where two figures stand, at two and at twelve:
+
+    sample                                      draft, 32 columns   verify, 40 columns
+    eval harness, the case alone                -0.47 +- 0.07       -0.05 +- 0.05
+    eval harness, twelve cases a process        -0.22 +- 0.11       -0.45 +- 0.18
+    a tool of its shape, its own allocations    -0.25 / -0.25       -0.23 / +0.08
+    that tool, the harness's allocations        -0.48 / -0.17       -0.03 / +0.04
+    that tool, behind the draft kernel                              -0.64 / -0.10
+
+The harness clones its inputs ahead of the first launch, which moves a
+captured graph's workspace from a 32 MiB boundary to 6 MiB past one: at two
+calls a sample the evict-last draft kernel read 0.38 +- 0.10 slower there
+than behind the tool's own allocations, the evict-first one 0.15 +- 0.13
+and -0.02 +- 0.11 in two batches. The verify kernel reads the same alone
+and less behind other balanced kernels of its process, as protected lines
+that outlive their kernel's launches would have it. In the harness the
+share of the draft kernel's samples at the handwritten kernel's timer step
+rose from 2 to 39% (the handwritten kernel's own: 58%), and among twelve
+cases in a process the verify kernel's median fell from 56 steps to the
+handwritten kernel's 55. No case of that class lost a step. Without a
+window a partial waits longer for its reader, hundreds of microseconds at
+200 requests: of twelve such cases, all at the handwritten kernel's level
+before and after, the three verify kernels at 320 requests read 0.7 to 1.7
+less on calls of 640 to 670 us, and one of the three at 200 requests 1.4
++- 0.3 more on 760. Results are bit-identical: a hint moves no value.
 
 `cute_mma_dag_partition_skew`, in pages, makes the shares of a balanced
 launch unequal. With a skew of `k` the range of CTA `c` begins at slot
@@ -1550,12 +1605,14 @@ unit:
 - `l2_evict_last` stores it under the L2 evict-last cache hint
   (`st.global.L2::cache_hint`), with one policy word a thread makes ahead of
   its stores (`createpolicy`), the form the balanced partition's workspace
-  stores already use. The word is made at run time, so on this schedule the
-  choice does not need the fixed descriptor that gates it for the packet
-  flushes (`cute_store_policy_choices`, `_normalize_paired_store_policy`): a
-  kernel with the paired schedule is offered all three policies on every
-  target, and a config of it on another body takes `default` for
-  `l2_evict_last` where the descriptor is missing, as before.
+  stores use under hints of their own (the option does not reach them: a
+  part's partial is stored evict-first whatever it says). The word is made
+  at run time, so on this schedule the choice does not need the fixed
+  descriptor that gates it for the packet flushes
+  (`cute_store_policy_choices`, `_normalize_paired_store_policy`): a kernel
+  with the paired schedule is offered all three policies on every target,
+  and a config of it on another body takes `default` for `l2_evict_last`
+  where the descriptor is missing, as before.
 
 Either way the same value goes to the same address, as many stores in the
 same order. A BF16 element is rounded to nearest even inside the store's

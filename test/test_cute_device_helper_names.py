@@ -730,6 +730,7 @@ PTX_ROW_EXPORTS: dict[str, tuple[str, ...]] = {
     "_paged_attention_partition": (
         "atom_add_acq_rel_gpu_u32",
         "fence_acq_rel_gpu",
+        "l2_policy_evict_first",
         "l2_policy_evict_last",
         "ld_relaxed_gpu_u32",
         "ldcg_v2_f32",
