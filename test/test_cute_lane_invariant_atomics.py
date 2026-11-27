@@ -1342,6 +1342,7 @@ def _body_with_a_row_uniform_atomic(source: str) -> list[ast.AST]:
     [("flag", True), ("indices_0 > 3", False)],
     ids=["uniform", "per_lane"],
 )
+@pytest.mark.usefixtures("cute_compile_env")
 def test_pin_inside_a_branch_needs_a_lane_invariant_condition(
     condition: str, accepted: bool
 ) -> None:

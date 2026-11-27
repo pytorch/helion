@@ -242,6 +242,7 @@ def test_matmul_provenance_is_required_for_the_new_stash_schedule() -> None:
         ),
     ],
 )
+@pytest.mark.usefixtures("cute_compile_env")
 def test_unproved_carries_effects_and_collectives_still_decline(
     before: str, after: str
 ) -> None:

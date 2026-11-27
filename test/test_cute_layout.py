@@ -209,6 +209,7 @@ class TestLaneGuardLifting(unittest.TestCase):
         )
         return _create_lane_loop("lane", 4, [*prefix, guard])
 
+    @pytest.mark.usefixtures("cute_compile_env")
     def test_lane_guard_requires_uniform_external_dependencies(self) -> None:
         """A guard is not lifted when an external value is not proven uniform."""
         from helion import exc

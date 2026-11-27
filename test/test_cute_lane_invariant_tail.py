@@ -303,6 +303,7 @@ def test_inline_asm_without_proven_purity_keeps_memory_order(purity: str) -> Non
         "bar.sync 0; mov.u32 $0, $1;",
     ],
 )
+@pytest.mark.usefixtures("cute_compile_env")
 def test_declared_pure_memory_and_synchronization_asm_remain_opaque(
     replacement: str,
 ) -> None:

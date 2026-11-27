@@ -204,6 +204,7 @@ def test_complete_nested_sums_with_tails_and_carried_output(
         "own_wrapper_helper",
     ],
 )
+@pytest.mark.usefixtures("cute_compile_env")
 def test_unproved_nested_schedules_remain_rejected(change: str) -> None:
     program = _nested_body(4, 8)
     loops = [
@@ -421,6 +422,7 @@ def test_reshape_records_only_complete_physical_group_proofs(mode: str) -> None:
         "group_count",
     ],
 )
+@pytest.mark.usefixtures("cute_compile_env")
 def test_only_proven_pruned_owner_is_rebound(mode: str) -> None:
     marker = _lane_reduce_marker_expr(
         "value",
@@ -474,6 +476,7 @@ def test_only_proven_pruned_owner_is_rebound(mode: str) -> None:
         "matmul",
     ],
 )
+@pytest.mark.usefixtures("cute_compile_env")
 def test_physical_reshape_reduction_requires_complete_execution(mode: str) -> None:
     span = 1 if mode == "singleton" else 8
     marker = _lane_reduce_marker_expr(
