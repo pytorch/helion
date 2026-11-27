@@ -90,6 +90,7 @@ from ..cute_mma_dag import mma_dag_pass_warps_reason
 from ..cute_mma_dag import mma_dag_persistent_reason
 from ..cute_mma_dag import mma_dag_ragged_ceilings
 from ..cute_mma_dag import mma_dag_seed_configs
+from ..cute_mma_dag import paged_attention_early_retirement_default
 from ..cute_mma_dag import paged_attention_pass_warp_choices
 from ..cute_register_subblocks import COLSIDE_CHOICES as RSB_COLSIDE_CHOICES
 from ..cute_register_subblocks import COLSIDE_KEY as RSB_COLSIDE_KEY
@@ -115,6 +116,8 @@ from ..phase_load_policies import project_load_policies
 from ..phase_load_policies import scatter_load_policies
 
 if TYPE_CHECKING:
+    from collections.abc import Mapping
+
     from ....autotuner.config_spec import ConfigSpec
 
 
@@ -548,19 +551,42 @@ def normalize_value_metadata_options(
         config[MMA_DAG_VALUE_METADATA_READ_OVERLAP_KEY] = False
 
 
+# The paired schedule's knobs, each with the value that every body ignoring
+# them keeps.
+_PAIRED_KNOB_PINS: tuple[tuple[str, object], ...] = (
+    (MMA_DAG_V_LAG_KEY, 0),
+    (MMA_DAG_SLEEP_WAITS_KEY, False),
+    (MMA_DAG_EARLY_TMEM_RETIREMENT_KEY, False),
+    (MMA_DAG_QUERY_TMA_KEY, False),
+    (MMA_DAG_VALUE_METADATA_SKIP_KEY, False),
+    (MMA_DAG_VALUE_METADATA_READ_OVERLAP_KEY, False),
+    (MMA_DAG_PROBABILITY_SCHEDULE_KEY, MMA_DAG_PROBABILITY_SCHEDULE_SERIAL),
+)
+
+
 def _pin_paired_knobs(config: dict[str, object]) -> None:
     """Bodies that ignore these knobs keep one autotune identity."""
-    for key, default in (
-        (MMA_DAG_V_LAG_KEY, 0),
-        (MMA_DAG_SLEEP_WAITS_KEY, False),
-        (MMA_DAG_EARLY_TMEM_RETIREMENT_KEY, False),
-        (MMA_DAG_QUERY_TMA_KEY, False),
-        (MMA_DAG_VALUE_METADATA_SKIP_KEY, False),
-        (MMA_DAG_VALUE_METADATA_READ_OVERLAP_KEY, False),
-        (MMA_DAG_PROBABILITY_SCHEDULE_KEY, MMA_DAG_PROBABILITY_SCHEDULE_SERIAL),
-    ):
+    for key, default in _PAIRED_KNOB_PINS:
         if key in config:
             config[key] = default
+
+
+def drop_paired_knob_pins(
+    base: dict[str, object], promoted: Mapping[str, object]
+) -> None:
+    """Drop ``base``'s paired knobs where ``promoted``, layered over it next,
+    selects the paired schedule (``ConfigSpec.promoted_default_values``).
+
+    The base default runs another body, which pinned them. A pin left in
+    place reads as a choice of the promoted config, so a knob that config
+    does not name would keep the other body's identity instead of the paired
+    schedule's default: the final join of a schedule that retires its
+    allocation early. Without the pins, normalization derives those
+    defaults."""
+    if promoted.get(MMA_DAG_PASS_WARPS_KEY) != MMA_DAG_PASS_WARPS_ATTENTION_PAIRED:
+        return
+    for key, _pin in _PAIRED_KNOB_PINS:
+        base.pop(key, None)
 
 
 def _normalize_cute_mma_dag(
@@ -629,22 +655,30 @@ def _normalize_cute_mma_dag(
                 config[key] = default
             if fragment is None:
                 config.pop(key, None)
-    for key, fragment in (
-        (MMA_DAG_SLEEP_WAITS_KEY, config_spec.cute_mma_dag_sleep_waits),
+    # The paired schedule retires its allocation early unless the config says
+    # otherwise; every other body has no such phase.
+    retires_early = paged_attention_early_retirement_default(
+        config.get(MMA_DAG_PASS_WARPS_KEY)
+    )
+    for key, fragment, default in (
+        (MMA_DAG_SLEEP_WAITS_KEY, config_spec.cute_mma_dag_sleep_waits, False),
         (
             MMA_DAG_EARLY_TMEM_RETIREMENT_KEY,
             config_spec.cute_mma_dag_early_tmem_retirement,
+            retires_early,
         ),
-        (MMA_DAG_QUERY_TMA_KEY, config_spec.cute_mma_dag_query_tma),
+        (MMA_DAG_QUERY_TMA_KEY, config_spec.cute_mma_dag_query_tma, False),
     ):
         if fragment is not None or key in config:
-            value = config.setdefault(key, False)
+            value = config.setdefault(key, default)
             if type(value) is not bool or (fragment is None and value):
                 if not fix_invalid:
                     raise InvalidConfig(
                         f"{key} needs a bool and a supported paired transport, got {value!r}"
                     )
-                config[key] = False
+                # What leaving the key out gives. Without the fragment the
+                # option is off, and the key is dropped below.
+                config[key] = False if fragment is None else default
             if fragment is None:
                 config.pop(key, None)
     persistent_fragment = config_spec.cute_mma_dag_persistent

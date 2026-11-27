@@ -690,6 +690,10 @@ class CuteLaneState:
     # is distinct from split-K/fused-grid expansion and never applies to a
     # materialized multi-root phase.
     attention_item_group: int = 1
+    # The proved paired attention body releases this kernel's dependents
+    # from its loader's tail (where it renders ``cute_pdl_release:
+    # loader_tail``), so ``passes.pdl`` places no release of its own.
+    pdl_loader_tail_release: bool = False
     # SASS-level checks the launcher runs on the compiled kernel before
     # its first launch (``helion.runtime.cute.sass_check``), declared by
     # the emitters whose instruction forms the DSL's assembler has

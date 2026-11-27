@@ -32,6 +32,22 @@ if TYPE_CHECKING:
     from typing import Any
 
 
+def _tmem_store_address(row: cutlass.Int32, column: cutlass.Int32) -> cutlass.Int32:
+    """The tensor-memory address of lane ``row`` and ``column``, as a sum.
+
+    An address holds the lane in bits 16 and up and the column below them.
+    ``row`` is one of a tile's 128 lanes, so ``row << 16`` has no bit below
+    16. ``column`` is the allocation's base plus an offset inside the
+    allocation; the base ``tcgen05.alloc`` wrote is a column at lane zero and
+    an SM has 512 columns, so ``column`` has no bit at 16 or above. No bit is
+    set in both terms, the sum carries nowhere, and it equals their OR.
+    Only the sum folds: a role's stores differ in constant lane and column
+    offsets, so they share one ``(row << 16) + base`` and each adds an
+    immediate, where every OR is computed on its own.
+    """
+    return (row << 16) + column
+
+
 @cute.jit
 def stage_positive_zero_value_tile(
     dimension_base: cutlass.Int32, tmem_base: cutlass.Int32
@@ -41,7 +57,7 @@ def stage_positive_zero_value_tile(
     for i in cutlass.range_constexpr(32):
         zero[i] = cutlass.Int32(0)
     for half in cutlass.range_constexpr(2):
-        address = (dimension_base << 16) | (tmem_base + half * 32)
+        address = _tmem_store_address(dimension_base, tmem_base + half * 32)
         prims.tcgen05_st(
             "32x32b", cutlass.inttoptr(address, 6, cutlass.Int32), zero[0:32]
         )
@@ -286,7 +302,7 @@ def _stage_scaled_s8_rows(
                 )
             for index in cutlass.range_constexpr(scale_group // 2):
                 packed[inner * (scale_group // 2) + index] = converted[index]
-        address = (warp_row << 16) | (tmem_base + block * store_words)
+        address = _tmem_store_address(warp_row, tmem_base + block * store_words)
         destination = cutlass.inttoptr(address, 6, cutlass.Int32)
         prims.tcgen05_st("32x32b", destination, packed[0:store_words])
 
@@ -662,7 +678,7 @@ def _stage_scaled_s8_transpose_tiles(
                         packed[packed_index] = add_bf16x2(
                             packed[packed_index], cutlass.Int32(0)
                         )
-                address = (dimension << 16) | (tmem_base + key_tile * 8)
+                address = _tmem_store_address(dimension, tmem_base + key_tile * 8)
                 destination = cutlass.inttoptr(address, 6, cutlass.Int32)
                 prims.tcgen05_st("16x256b", destination, packed[0:4])
         else:
@@ -704,7 +720,7 @@ def _stage_scaled_s8_transpose_tiles(
                         packed[packed_index] = add_bf16x2(
                             packed[packed_index], cutlass.Int32(0)
                         )
-                address = (dimension << 16) | (tmem_base + key_tile * 8)
+                address = _tmem_store_address(dimension, tmem_base + key_tile * 8)
                 destination = cutlass.inttoptr(address, 6, cutlass.Int32)
                 prims.tcgen05_st("16x256b", destination, packed[0:4])
 
@@ -768,7 +784,7 @@ def _stage_zero_s8_transpose_tiles(
                 packed[1] = high0
                 packed[2] = low1
                 packed[3] = high1
-                address = (dimension << 16) | (tmem_base + key_tile * 8)
+                address = _tmem_store_address(dimension, tmem_base + key_tile * 8)
                 destination = cutlass.inttoptr(address, 6, cutlass.Int32)
                 prims.tcgen05_st("16x256b", destination, packed[0:4])
 

@@ -744,7 +744,7 @@ class MmaDagSeedPlanner:
         )
         seeds: list[Config] = []
         sleeping: list[Config] = []
-        early_retirement: list[Config] = []
+        late_retirement: list[Config] = []
         query_tma: list[Config] = []
         value_metadata: list[Config] = []
         value_metadata_policies: list[Config] = []
@@ -885,6 +885,10 @@ class MmaDagSeedPlanner:
                             seed = {**config, self.occupancy_key: occupancy}
                             if pass_warps == MMA_DAG_PASS_WARPS_ATTENTION_PAIRED:
                                 seed[MMA_DAG_V_LAG_KEY] = v_lag
+                                # The schedule's default, spelled out: the
+                                # late-retirement counterparts below differ
+                                # from these seeds in this key alone.
+                                seed[MMA_DAG_EARLY_TMEM_RETIREMENT_KEY] = True
                             for policy in priorities:
                                 seed_config = {
                                     **seed,
@@ -921,11 +925,11 @@ class MmaDagSeedPlanner:
                                                 }
                                             )
                                         )
-                                    early_retirement.append(
+                                    late_retirement.append(
                                         Config.from_dict(
                                             {
                                                 **seed_config,
-                                                MMA_DAG_EARLY_TMEM_RETIREMENT_KEY: True,
+                                                MMA_DAG_EARLY_TMEM_RETIREMENT_KEY: False,
                                             }
                                         )
                                     )
@@ -990,7 +994,8 @@ class MmaDagSeedPlanner:
         # of relying on two independently unprofitable neighbor moves. Preserve
         # the old prefix and leave the other scheduling knobs uncrossed.
         seeds.extend(value_metadata_probability)
-        # Keep every old seed in order. One ordinary paired counterpart per
-        # V lag exposes retirement independently of PDL and cache policy.
-        seeds.extend(early_retirement)
+        # Keep every old seed in order. Paired seeds retire the allocation
+        # early, the schedule's default; one counterpart per V lag keeps the
+        # final join.
+        seeds.extend(late_retirement)
         return seeds

@@ -72,6 +72,7 @@ from ..cute_mma_dag import MMA_DAG_V_LAG_KEY
 from ..cute_mma_dag import MMA_DAG_VALUE_METADATA_READ_OVERLAP_KEY
 from ..cute_mma_dag import MMA_DAG_VALUE_METADATA_SKIP_KEY
 from ..cute_mma_dag import MMA_DAG_WARPS_KEY
+from ..cute_mma_dag import paged_attention_early_retirement_default
 from ..cute_register_subblocks import COLSIDE_KEY as RSB_COLSIDE_KEY
 from ..cute_register_subblocks import KEY as RSB_KEY
 from ..cute_register_subblocks import KEYS as RSB_KEYS
@@ -197,6 +198,7 @@ from .flash_surface import prepare_config_generation_overrides
 from .flash_surface import prepare_override_normalization
 from .mma_dag_surface import _normalize_cute_mma_dag
 from .mma_dag_surface import _normalize_cute_register_subblocks
+from .mma_dag_surface import drop_paired_knob_pins
 from .mma_dag_surface import normalize_value_metadata_options
 
 if TYPE_CHECKING:
@@ -5475,6 +5477,13 @@ def flatten_missing_field_default(
         return True, False
     if key == "cute_exact_div_form":
         return True, CUTE_EXACT_DIV_FORMS[0]
+    # The defaults normalization derives from a config's other options, each
+    # from the helper normalization itself asks, so a config flattened before
+    # it is normalized keeps the same meaning.
+    if key == MMA_DAG_EARLY_TMEM_RETIREMENT_KEY:
+        return True, paged_attention_early_retirement_default(
+            config.get(MMA_DAG_PASS_WARPS_KEY)
+        )
     if config_spec.cute_flash_search_enabled and key == FLASH_PIPELINE_FAMILY_KEY:
         return True, _resolve_cute_flash_config(config_spec, config).pipeline_family
     return surface.flatten_missing_field_default(config_spec.tcgen05, key, config)
@@ -5974,6 +5983,8 @@ class CuteSearchSurface(BackendSearchSurface):
     ) -> None:
         # A promoted ``pid_type`` re-derives the tcgen05 persistence model.
         surface.drop_stale_persistence_model(config_spec.tcgen05, base, promoted)
+        # A promoted paired schedule re-derives the knobs the base pinned.
+        drop_paired_knob_pins(base, promoted)
 
     def prepare_flat_config(
         self, config_spec: ConfigSpec, config: dict[str, object]
