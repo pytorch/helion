@@ -2995,7 +2995,16 @@ class PopulationBasedSearch(BaseSearch):
                     seen.add(transferred_config)
                     pinned_configs.add(transferred_config)
                     result.append(flat)
-            except (ValueError, TypeError, KeyError, AssertionError) as e:
+            except (
+                exc.InvalidConfig,
+                ValueError,
+                TypeError,
+                KeyError,
+                AssertionError,
+            ) as e:
+                # As for a compiler or user seed: a config is legal with
+                # options this search has no coordinate for and may not be
+                # without them.
                 self.log(f"Failed to transfer explicit seed config: {e}")
 
         default_flat = generation.default_flat()
