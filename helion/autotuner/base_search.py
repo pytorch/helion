@@ -55,6 +55,7 @@ from .benchmark_prelude import BenchmarkPrelude
 from .benchmark_prelude import PreludeSearchFailed
 from .benchmark_prelude import active_prelude
 from .benchmark_provider import _COMPILER_SEED_TIMEOUT_RETRY_LIMIT
+from .benchmark_provider import CANDIDATE_WINDOW_MS
 from .benchmark_provider import BenchmarkProvider
 from .benchmark_provider import BenchmarkResult
 from .benchmark_provider import IsolatedBenchmarkFailure
@@ -205,6 +206,29 @@ _FINAL_SELECTION_PREFERENCE_TOLERANCE_ENV = (
 _FINAL_SELECTION_PREFERENCE_TOLERANCE_DEFAULT = 0.005
 _REBENCHMARK_TARGET_MS_DEFAULT = 200.0
 _REBENCHMARK_INTERLEAVED_REPEAT_MAX = 20_000
+# A search that times bank cycles re-times a member in this many windows of
+# the candidates' own length (``CANDIDATE_WINDOW_MS``) instead of one window
+# of the target above (``PopulationBasedSearch._bank_cycle_retimings``). A
+# bank cycle is a burst of back-to-back launches, and what a burst reads
+# depends on how long the device has been running it: a power-limited GPU
+# leaves its fast state some tens of milliseconds into a burst, so a longer
+# window reads another device state than the candidates' windows it is
+# compared with, and the candidates' window has no margin to that state. The
+# second sweep runs in reverse order, so a member's two windows are taken at
+# different places of the two sweeps (but for the middle one of an odd
+# number): what a place in a sweep does to a window reaches one of a member's
+# two windows and not both. A single window still reads high now and then,
+# which is what the median of three readings is for. What was measured, on a
+# B200, is in docs/deployment_autotuning.md ("Rotating benchmark inputs").
+_BANK_CYCLE_RETIMING_ROUNDS = 2
+# A sweep of bank-cycle re-timings whose windows sit this far, as a median
+# over its members, from the readings they repeat is logged: the windows of
+# one search are meant to read one device state.
+_BANK_CYCLE_RETIMING_SHIFT_LOGGED = 0.02
+# A member's two re-timing windows that sit further apart than this, as a
+# share of the lower one, are counted in the sweep's debug line: the median
+# of a sweep's shifts does not see a single window that sits apart.
+_BANK_CYCLE_RETIMING_WINDOWS_APART = 0.01
 # The only env override of the harness-grade final selection (full effort):
 # the number of steady-window rounds, for A/B runs against the profile.
 # HELION_AUTOTUNE_FINAL_SELECTION_ROUNDS=0 restores the single-pass final
@@ -1839,6 +1863,12 @@ def performance(member: PopulationMember) -> float:
     return member.perf
 
 
+def _no_tie(member: PopulationMember) -> float:
+    """The tie-break of a ranking that has none: equal timings keep their
+    order."""
+    return 0.0
+
+
 class _PrivateBenchmarkArgs(NamedTuple):
     """Candidate-private kernel arguments for an in-process re-timing.
 
@@ -2111,6 +2141,14 @@ class PopulationBasedSearch(BaseSearch):
     # ``_initial_population_batch``): the batch methods keep their signatures
     # for callers that stub them and read the phase from here.
     _benchmarking_initial_population: bool = False
+    # The promoted compiler default as this search times it, where the
+    # backend has its kernel run the final selection's rounds
+    # (``_resolve_defending_default``; set by ``_prepare``), and the
+    # generated source of that config, by which a search that drops source
+    # aliases knows the default's kernel (``_stands_for_defending_default``;
+    # learned in ``_settle_benchmarked_members``, by such a search alone).
+    _defending_default: Config | None = None
+    _defending_source: str | None = None
 
     # ``Backend.autotune_short_kernel_below_us`` of the kernel's backend, read
     # at construction: a search whose initial population's best config reads
@@ -2175,6 +2213,15 @@ class PopulationBasedSearch(BaseSearch):
             process_group_name=kernel.env.process_group_name,
             compiler_coverage_enabled=not self.settings.disable_autotuner_heuristics,
         )
+        if self.settings.autotune_config_filter is not None:
+            # A seed that the user's filter drops or rewrites starts no
+            # search. Which seeds those are is the filter's answer when the
+            # population is benchmarked (``benchmark_batch``), and the
+            # filter may keep state, so it is not asked before: a backend
+            # that leaves random draws out of the initial population behind
+            # its seeds keeps every draw of this search
+            # (``ConfigGenerationExtension.admits_random_initial_flat``).
+            self.config_gen.search_filters_configs = True
         self._compiler_refinement_keys = (
             self.config_spec.search_surface.compiler_refinement_keys
         )
@@ -2193,6 +2240,97 @@ class PopulationBasedSearch(BaseSearch):
             # The provider and effective verification policy are available now.
             # Leave any independent terminal-refinement registry intact.
             self._terminal_refinement_members = ConfigCache()
+        self._defending_default = self._resolve_defending_default()
+        self._defending_source = None
+
+    def _default_defends_final_selection(self) -> bool:
+        """``Backend.default_defends_final_selection`` of the kernel's
+        backend."""
+        return self.config_spec.backend.default_defends_final_selection()
+
+    def _defending_finalists(self) -> int:
+        """Finalists that run the final selection's rounds whatever their
+        rank, beyond the best pinned seed and the incumbent
+        (``FinalSelectionConfig.finalists``): the one finalist that stands
+        for a defending default's kernel (``_run_final_selection`` takes the
+        best ranked)."""
+        return 0 if self._defending_default is None else 1
+
+    def _resolve_defending_default(self) -> Config | None:
+        """The config the kernel runs without autotuning, in the normalized
+        form the population builders benchmark, where a compiler seed was
+        promoted to it and the backend has it defend its title in the final
+        selection (``Backend.default_defends_final_selection``); else
+        ``None``.
+
+        The promoted default is transferred by the transfer of the compiler
+        seed it is (``ConfigGeneration.transfer_seed``), under this search's
+        fixed overrides, so it is the config that seed is benchmarked as. A
+        default the overrides make untransferable defends nothing.
+
+        What defends is the code this config generates, which a search can
+        hold under another config (``_stands_for_defending_default``)."""
+        if not self._default_defends_final_selection():
+            return None
+        promoted = self.config_spec.compiler_default_config
+        if promoted is None:
+            return None
+        pair = self.config_gen.transfer_seed(promoted)
+        return None if pair is None else pair[1]
+
+    def _stands_for_defending_default(self, member: PopulationMember) -> bool:
+        """Whether ``member`` stands for the kernel of the defending
+        default: the code the kernel runs without autotuning, which the
+        final selection has run its rounds whatever it screens
+        (``_run_final_selection``). ``False`` where the backend has no
+        default defend (``_resolve_defending_default``).
+
+        In a search that drops source aliases
+        (``_collapses_source_aliases``) a kernel is a generated source, and
+        this rule reads it as one: the member's compiled function has the
+        source that the default's config generates
+        (``_defending_source``), whichever config the member is listed
+        under. Such a search times a code under one config and
+        settles its other configs as aliases, so its final selection can
+        hold the default's kernel under another config than the default's:
+        one that was timed before the default (a user seed), one that
+        repaired a default that failed, one that timed the code again after
+        the move to the trace timer dropped it
+        (``_move_search_state_to_trace``), another repeat of the code in a
+        search that pins no seed, or the config the search ended on. The
+        source names the kernel under each of them.
+
+        The search learns that source from a member it settles under the
+        default's config, a source alias and a member whose timing failed
+        included (``_settle_benchmarked_members``), and renders nothing to
+        learn it: a default it never compiled (``autotune_config_filter``
+        dropped or rewrote it, the budget skipped it, its compile failed,
+        or its population never held it) names no code.
+
+        Without that source, the member under the default's own config
+        stands for it, if the search has one. That is the rule of a search
+        that keeps its aliases (a backend that does not drop them, several
+        argument sets, torch.distributed), where every config is a
+        candidate of its own, and it is all there is to go by where the
+        backend reports no source for the default's function or the
+        default was never compiled.
+
+        The rule does not reach a default whose kernel is no live finalist:
+        the search has no reading of its code; it did not shortlist it (a
+        search without pinned seeds, or one that holds the code only under
+        a config that carries no pin: the config that timed it again after
+        the trace move, or a later candidate after a failed default left a
+        pattern search); or its timing failed in the selection before the
+        rounds. Nor a default the search never compiled: there a finalist
+        under another config with the default's code is ranked by its
+        screen reading like any other."""
+        default = self._defending_default
+        if default is None:
+            return False
+        source = self._defending_source
+        if source is not None:
+            return self.config_spec.backend.generated_source_hash(member.fn) == source
+        return _config_key(member.config) == _config_key(default)
 
     def _generation_invalid_config_count(self) -> int:
         return self.config_gen.invalid_config_count
@@ -2232,6 +2370,9 @@ class PopulationBasedSearch(BaseSearch):
             # 5: isolated finalists read private argument copies in one
             # long-lived worker (fresh processes only when the copies do not
             # fit), and the shortlist is sized to the search's spread.
+            # (This policy keys CuTe flash searches alone. What changes the
+            # timing of bank cycles only is versioned for every search with
+            # rotating banks instead: ``local_cache._BANK_TIMING_VERSION``.)
             "timing_version": 5,
             "top_k": self._final_rebenchmark_top_k(),
             "target_ms": self._final_rebenchmark_target_ms(),
@@ -2259,6 +2400,14 @@ class PopulationBasedSearch(BaseSearch):
                 # kernel timer) picks other finalists than the search's
                 # regime would.
                 policy["backend_final_regime"] = backend_regime
+            # A promoted default that defends its title in the rounds
+            # (``_stands_for_defending_default``) is not part of the policy.
+            # This policy keys flash searches, whose kernels have no
+            # promoted default (test_cute_mma_dag_flash_default.py asserts
+            # it where a heuristic that promotes its seed admits a flash
+            # kernel). A result any other kernel cached before that rule
+            # stays the winner of the search that made it, so its key stays
+            # as well.
         return policy
 
     @staticmethod
@@ -2363,7 +2512,10 @@ class PopulationBasedSearch(BaseSearch):
             return 0.0
         policy = self._final_selection_sizing_policy()
         return min(
-            policy.estimated_seconds(self._final_selection_shortlist_estimate()),
+            policy.estimated_seconds(
+                self._final_selection_shortlist_estimate(),
+                self._defending_finalists(),
+            ),
             _FINAL_SELECTION_RESERVE_FRACTION * budget,
         )
 
@@ -2371,7 +2523,9 @@ class PopulationBasedSearch(BaseSearch):
         if not self._final_selection_enabled():
             return 0.0
         smallest = self._final_selection_sizing_policy().budget_ladder()[-1]
-        return smallest.estimated_seconds(self._final_selection_shortlist_estimate())
+        return smallest.estimated_seconds(
+            self._final_selection_shortlist_estimate(), self._defending_finalists()
+        )
 
     def _final_selection_plan(self, shortlist: int) -> FinalSelectionConfig | None:
         """The policy sized to the budget left when the phase starts.
@@ -2385,9 +2539,12 @@ class PopulationBasedSearch(BaseSearch):
         if budget is not None and self._autotune_budget_start is not None:
             remaining = budget - (time.perf_counter() - self._autotune_budget_start)
             sizing = self._final_selection_sizing_policy()
-            plan = sizing.fit_to_seconds(remaining, shortlist)
+            defending = self._defending_finalists()
+            plan = sizing.fit_to_seconds(remaining, shortlist, defending)
             if plan is None:
-                smallest = sizing.budget_ladder()[-1].estimated_seconds(shortlist)
+                smallest = sizing.budget_ladder()[-1].estimated_seconds(
+                    shortlist, defending
+                )
                 self.log(
                     f"Final selection skipped: {remaining:.0f}s of the "
                     f"{budget}s budget remain, less than the {smallest:.0f}s of "
@@ -2397,7 +2554,8 @@ class PopulationBasedSearch(BaseSearch):
             elif plan != sizing:
                 self.log(
                     f"Final selection sized to the {remaining:.0f}s left of the "
-                    f"{budget}s budget: up to {plan.finalists(shortlist)} finalists x "
+                    f"{budget}s budget: up to "
+                    f"{plan.finalists(shortlist, defending)} finalists x "
                     f"{plan.rounds} rounds"
                     + (", no screen" if sizing.screens(shortlist) else "")
                     + (
@@ -2580,8 +2738,25 @@ class PopulationBasedSearch(BaseSearch):
         screened twice (``_refresh_benchmarked_members_after_rebenchmark``),
         so the kernel keeps its place in the final selection whichever of its
         configs was benchmarked first.
+
+        A member under the defending default's config tells a search that
+        drops aliases which generated source is the default's
+        (``_stands_for_defending_default``): the source of its compiled
+        function. An alias has the function of the kernel it repeats, a
+        member whose timing failed has its own, and a config that was never
+        compiled (filtered, skipped by the budget, a compile error) has
+        none.
         """
         collapse = self._collapses_source_aliases()
+        default = self._defending_default
+        if collapse and default is not None:
+            default_key = _config_key(default)
+            for member in members:
+                if _config_key(member.config) != default_key:
+                    continue
+                source = self.config_spec.backend.generated_source_hash(member.fn)
+                if source is not None:
+                    self._defending_source = source
         aliases = []
         for member in members:
             if self._is_source_alias(member):
@@ -2897,13 +3072,22 @@ class PopulationBasedSearch(BaseSearch):
         target: int,
         *,
         generation: ConfigGeneration | None = None,
+        keep_every_draw: bool = False,
     ) -> list[FlatConfig]:
-        """Pad an initial population with normalized, unique random configs."""
+        """Pad an initial population with normalized, unique random configs.
+
+        The pad draws starting points for an iterative search, so a draw the
+        backend declines (``ConfigGenerationExtension.
+        admits_random_initial_flat``) leaves its slot empty, as it does in
+        ``ConfigGeneration.random_population_flat``: the result is then
+        shorter than ``target``. ``keep_every_draw`` pads with every draw
+        instead, for the fallback whose seeds all failed."""
         generation = self.config_gen if generation is None else generation
         result: list[FlatConfig] = []
         seen: MutableSet[Config] = ConfigSet()
         invalid = 0
         duplicate = 0
+        declined = 0
 
         def append_if_valid(flat: FlatConfig) -> None:
             nonlocal invalid, duplicate
@@ -2926,16 +3110,27 @@ class PopulationBasedSearch(BaseSearch):
 
         attempts = 0
         max_attempts = max(64, max(0, target - len(result)) * 64)
-        while len(result) < target and attempts < max_attempts:
+        while len(result) + declined < target and attempts < max_attempts:
             attempts += 1
-            append_if_valid(generation.random_flat())
+            flat = generation.random_flat()
+            if not (
+                keep_every_draw or generation.extension.admits_random_initial_flat(flat)
+            ):
+                declined += 1
+                continue
+            append_if_valid(flat)
 
-        if len(result) < target:
+        if len(result) + declined < target:
             self.log(
                 "Generated only "
                 f"{len(result)}/{target} unique valid initial population configs "
                 f"after {attempts} random attempts "
                 f"({invalid} invalid, {duplicate} duplicate)."
+            )
+        if declined:
+            self.log(
+                f"Left {declined} initial population slots empty: the backend "
+                "declines those random draws."
             )
         if attempts or invalid or duplicate:
             self.log(
@@ -3012,24 +3207,19 @@ class PopulationBasedSearch(BaseSearch):
                 result.append(flat)
 
         for config in self._best_available_seed_configs:
-            try:
-                flat = generation.flatten(config)
-                transferred_config = generation.unflatten(flat)
-                if transferred_config not in seen:
-                    seen.add(transferred_config)
-                    pinned_configs.add(transferred_config)
-                    result.append(flat)
-            except (
-                exc.InvalidConfig,
-                ValueError,
-                TypeError,
-                KeyError,
-                AssertionError,
-            ) as e:
-                # As for a compiler or user seed: a config is legal with
-                # options this search has no coordinate for and may not be
-                # without them.
-                self.log(f"Failed to transfer explicit seed config: {e}")
+            # Transferred as a compiler or user seed is: a config is legal
+            # with options this search has no coordinate for and may not
+            # be without them, and is then logged and skipped.
+            pair = generation.transfer_seed(
+                config, log_func=self.log, label="explicit seed config"
+            )
+            if pair is None:
+                continue
+            flat, transferred_config = pair
+            if transferred_config not in seen:
+                seen.add(transferred_config)
+                pinned_configs.add(transferred_config)
+                result.append(flat)
 
         default_flat = generation.default_flat()
         default_config = generation.unflatten(default_flat)
@@ -3410,10 +3600,12 @@ class PopulationBasedSearch(BaseSearch):
             else visited
         )
         fallback: list[PopulationMember] = []
-        # The padding helper re-adds the seeds first, so pad past them.
+        # The padding helper re-adds the seeds first, so pad past them. Every
+        # draw is kept: no seed is left for a declined draw to stand behind.
         for flat in self._pad_initial_population_with_unique_random(
             [member.flat_values for member in members],
             len(members) + random_fallback_target,
+            keep_every_draw=True,
         ):
             member = self.make_unbenchmarked(flat)
             if member is not None and member.config not in seen:
@@ -4248,12 +4440,15 @@ class PopulationBasedSearch(BaseSearch):
         return kept
 
     def _prefer_backend_preference_within_tolerance(
-        self, after: PopulationMember, live: Sequence[PopulationMember]
+        self,
+        after: PopulationMember,
+        live: Sequence[PopulationMember],
+        tie: Callable[[PopulationMember], float] = _no_tie,
     ) -> PopulationMember:
         """Among the live finalists within the preference tolerance of the
         fastest one, the config the backend ranks first wins
         (``Backend.finalist_preference``: lower is better, the fastest of
-        equal rank keeps its place).
+        equal rank keeps its place; ``tie`` orders equal perfs of one rank).
 
         The isolated timing of a kernel cannot see everything a config
         costs or saves in the sequence it will run in: a CuTe kernel whose
@@ -4301,7 +4496,7 @@ class PopulationBasedSearch(BaseSearch):
         preferred = [member for member in band if preference(member) < best_rank]
         if not preferred:
             return after
-        chosen = min(preferred, key=lambda m: (preference(m), m.perf))
+        chosen = min(preferred, key=lambda m: (preference(m), m.perf, tie(m)))
         self.log(
             "Final selection preferred a config the backend ranks ahead within "
             f"{tolerance:.2%} of the fastest finalist: "
@@ -4589,15 +4784,26 @@ class PopulationBasedSearch(BaseSearch):
         live: Sequence[PopulationMember],
         pinned_configs: MutableSet[Config],
         key: Callable[[PopulationMember], float] = performance,
+        tie: Callable[[PopulationMember], float] = _no_tie,
     ) -> PopulationMember:
         """A pinned seed within the tolerance of the best finalist wins the
-        tie; ``key`` reads the timing compared (the member's perf)."""
+        tie; ``key`` reads the timing compared (the member's perf).
+
+        ``tie`` orders finalists whose ``key`` is equal (the mean of a
+        finalist's rounds where their medians sit on a timer grid): the best
+        pinned seed is the first by ``(key, tie)``, and at the edge of the
+        tolerance it wins only if ``tie`` does not rank it behind ``after``.
+        Without one, equal timings keep their order and a pinned seed wins
+        an exact tie."""
         live_pinned = [member for member in live if member.config in pinned_configs]
         if not live_pinned:
             return after
-        pinned_after = min(live_pinned, key=key)
+        pinned_after = min(live_pinned, key=lambda member: (key(member), tie(member)))
         tolerance = self._final_rebenchmark_pinned_tolerance()
-        if key(pinned_after) <= key(after) * (1.0 + tolerance):
+        if (key(pinned_after), tie(pinned_after)) <= (
+            key(after) * (1.0 + tolerance),
+            tie(after),
+        ):
             return pinned_after
         return after
 
@@ -4782,8 +4988,10 @@ class PopulationBasedSearch(BaseSearch):
         is long enough to be worth it), the best ``top_k`` survivors plus the
         best pinned seed and the ``incumbent`` then run ``rounds`` rounds of
         steady windows whose order alternates every round, and the median
-        across rounds decides (see ``FinalSelectionConfig``). When the
-        selection's L2 regime calls for a second one
+        across rounds decides (see ``FinalSelectionConfig``). The kernel of
+        a promoted default runs the rounds too, where the backend asks and
+        a live finalist stands for it (``_stands_for_defending_default``).
+        When the selection's L2 regime calls for a second one
         (``final_selection_second_regime``), the finalists tied within
         ``policy.tie_tolerance`` of the best median (every complete finalist
         under an explicit target regime) run ``policy.tiebreak_rounds`` more
@@ -4818,6 +5026,7 @@ class PopulationBasedSearch(BaseSearch):
         select_by_second = False
         group: list[int] = []
         family_survivors: list[int] = []
+        defender: int | None = None
         process_group_name = self.kernel.env.process_group_name
 
         def policy_statuses(
@@ -5028,11 +5237,29 @@ class PopulationBasedSearch(BaseSearch):
                 incumbent_index = finalists.index(incumbent)
                 if incumbent_index in alive and incumbent_index not in survivors:
                     survivors.append(incumbent_index)
+                # So does the code the kernel runs without autotuning,
+                # where the backend asks: the best-ranked finalist that
+                # stands for the default's kernel
+                # (``_stands_for_defending_default``), so the rounds gain
+                # one finalist at most. The pick is then compared with that
+                # kernel in the same windows, not only with the best pinned
+                # seed of one screen window.
+                defender = next(
+                    (
+                        index
+                        for index in ranked
+                        if self._stands_for_defending_default(finalists[index])
+                    ),
+                    None,
+                )
+                if defender is not None and defender not in survivors:
+                    survivors.append(defender)
                 # The family quota: the best-ranked config of a body the cut
                 # dropped runs the rounds too (the screen is one window, the
-                # rounds a median of four at the sustained clock). The seed
-                # and the incumbent count as represented, so the quota goes
-                # to families neither of them belongs to.
+                # rounds a median of four at the sustained clock). The seed,
+                # the incumbent and a defending default count as
+                # represented, so the quota goes to families none of them
+                # belongs to.
                 family_survivors = self._family_representatives(
                     "screen" if screened else "rounds",
                     [finalists[index].config for index in survivors],
@@ -5166,6 +5393,7 @@ class PopulationBasedSearch(BaseSearch):
                 select_by_second=select_by_second,
                 selected_by=selected_by if selected is not None else None,
                 family_indices=family_survivors,
+                defender=defender,
                 incumbent=incumbent,
                 quarantined=quarantined,
                 screen_attempted=screen_attempted,
@@ -5221,13 +5449,48 @@ class PopulationBasedSearch(BaseSearch):
         if not live:
             log_selection(None)
             raise exc.NoConfigFound
-        after = self._prefer_pinned_within_tolerance(
-            self._prefer_backend_preference_within_tolerance(
-                min(live, key=performance), live
-            ),
-            live,
-            pinned_configs,
-        )
+
+        def round_mean(
+            column: Sequence[Sequence[float]],
+        ) -> Callable[[PopulationMember], float]:
+            """The tie-break of a pick by the medians of ``column``'s rounds.
+
+            A bank cycle's reading comes from event times that sit on the
+            device timer's grid (``central_mean``). A window of a few
+            replays reads one of a few values between two steps of that
+            grid, and the median of the rounds is one of those or halfway
+            between two, so finalists closer than that tie. The mean of a
+            finalist's rounds separates the tied ones. Every other regime
+            ranks by the median alone."""
+            if self._input_bank_count <= 1:
+                return _no_tie
+            means = {
+                id(finalists[index]): statistics.fmean(column[index])
+                for index in survivors
+                if column[index]
+            }
+            return lambda member: means.get(id(member), 0.0)
+
+        def pick(
+            live: Sequence[PopulationMember],
+            tie: Callable[[PopulationMember], float],
+        ) -> PopulationMember:
+            """The fastest of ``live`` by ``(perf, tie)``, then the backend's
+            preference among equal ranks and the pinned preference. The
+            tie-break applies to each step: a pinned seed would otherwise
+            win a tie of medians whatever its rounds read."""
+            return self._prefer_pinned_within_tolerance(
+                self._prefer_backend_preference_within_tolerance(
+                    min(live, key=lambda member: (member.perf, tie(member))),
+                    live,
+                    tie=tie,
+                ),
+                live,
+                pinned_configs,
+                tie=tie,
+            )
+
+        after = pick(live, round_mean(reported_readings))
 
         # Group eligibility was proved before timing. Keep that invariant
         # explicit when consuming its authoritative second-regime results.
@@ -5256,13 +5519,8 @@ class PopulationBasedSearch(BaseSearch):
                 )
                 live_second = [member for member in timed if math.isfinite(member.perf)]
                 if live_second:
-                    after = self._prefer_pinned_within_tolerance(
-                        self._prefer_backend_preference_within_tolerance(
-                            min(live_second, key=performance), live_second
-                        ),
-                        live_second,
-                        pinned_configs,
-                    )
+                    # the same pick, with that column's rounds as tie-break
+                    after = pick(live_second, round_mean(reported_second))
                     selected_by = second_regime
             if selected_by != second_regime:
                 self.log.warning(
@@ -5369,9 +5627,20 @@ class PopulationBasedSearch(BaseSearch):
         select_by_second: bool = False,
         selected_by: str | None = None,
         family_indices: Sequence[int] = (),
+        defender: int | None = None,
     ) -> None:
+        """Log the final selection's table and record its rows in the
+        search's metrics.
+
+        ``defender`` is the finalist that stands for a defending default
+        (``_stands_for_defending_default``), which runs the rounds whatever
+        its rank. Only a search whose default defends says so: its rows
+        have a ``defending_default`` flag and its table a ``D`` mark, and
+        every other search logs and records what it did without the rule.
+        """
         if selected_by is None and selected is not None:
             selected_by = regime_label
+        defends = self._defending_default is not None
         family_keys = self._final_selection_family_keys()
         result_by_index = dict(zip(survivors, results, strict=True))
         second_by_index: dict[int, IsolatedBenchmarkTiming] = (
@@ -5417,6 +5686,7 @@ class PopulationBasedSearch(BaseSearch):
                 "search_ms": search_perfs[index],
                 "screen_ms": screen[index],
                 "warmup_status": warmup_status if member is incumbent else "not_run",
+                **({"defending_default": index == defender} if defends else {}),
             }
             for index, member in enumerate(finalists)
         ]
@@ -5480,6 +5750,7 @@ class PopulationBasedSearch(BaseSearch):
                 ("*" if member is selected else " ")
                 + ("P" if member.config in pinned_configs else " ")
                 + ("F" if index in family_indices else " ")
+                + (("D" if index == defender else " ") if defends else "")
             )
             family_text = f" family={row['family']}" if family_keys else ""
             quarantine_text = (
@@ -5550,7 +5821,10 @@ class PopulationBasedSearch(BaseSearch):
             f"finalists x {policy.rounds} rounds of {policy.warmup_ms}+{policy.rep_ms} ms "
             f"windows (L2 {regime_label}) in {wall_s:.1f}s; selected "
             f"{selected_text}{second_clause} "
-            "(* selected, P pinned seed, F family quota):\n" + "\n".join(lines)
+            "(* selected, P pinned seed, F family quota"
+            + (", D defending default" if defends else "")
+            + "):\n"
+            + "\n".join(lines)
         )
         self._autotune_metrics.final_selection = {
             "policy": dataclasses.asdict(policy),
@@ -5635,6 +5909,10 @@ class PopulationBasedSearch(BaseSearch):
         Args:
             members: The list of population members to rebenchmark.
             desc: Description for the progress bar.
+            target_ms: The length of a member's window. A search that times
+                bank cycles keeps the candidates' window instead and takes
+                two of them per member (``_bank_cycle_retimings``); its
+                final verification (``candidate_private_args``) does not.
             candidate_private_args: Use a fresh worker process per candidate;
                 when unavailable, keep argument storage private in-process.
             allow_single: Re-time a single member too. A re-timing compares
@@ -5900,7 +6178,9 @@ class PopulationBasedSearch(BaseSearch):
     ) -> list[IsolatedBenchmarkTiming] | None:
         """One isolated steady window per member in the killable worker;
         ``None`` when the worker cannot time them (the caller falls back to
-        the in-process timers).
+        the in-process timers). A search that times bank cycles re-times its
+        members in rounds of the candidates' window instead
+        (``_bank_cycle_retimings``), except for its final verification.
 
         With ``candidate_private_args`` every member reads its own copy of the
         kernel arguments in the one long-lived worker -- the regime of the
@@ -5958,6 +6238,8 @@ class PopulationBasedSearch(BaseSearch):
                 error.batch_results = tuple(results)
                 raise
             return results
+        if self._input_bank_count > 1 and not candidate_private_args:
+            return self._bank_cycle_retimings(members, rep=rep, desc=desc)
         return provider.benchmark_isolated(
             fns,
             warmup=1,
@@ -5970,6 +6252,149 @@ class PopulationBasedSearch(BaseSearch):
             # earlier one left.
             fresh_process=candidate_private_args and self._benchmark_prelude is None,
         )
+
+    def _bank_cycle_retimings(
+        self,
+        members: Sequence[PopulationMember],
+        *,
+        rep: int,
+        desc: str,
+    ) -> list[IsolatedBenchmarkTiming] | None:
+        """Re-time ``members`` of a search that times bank cycles: every
+        member in ``_BANK_CYCLE_RETIMING_ROUNDS`` windows of the candidates'
+        length (``CANDIDATE_WINDOW_MS``; ``rep`` when that is shorter), one
+        per sweep over the members, every second sweep in reverse order.
+
+        A member's result is the median of those windows and the reading it
+        has: three readings of one window length, so one of them that sits
+        apart, the earlier one included, does not become the member's
+        reading. The reading moves only when both new windows sit on one
+        side of it, and then to the nearer of them, also for a member that
+        every generation re-times. A member without a finite reading reads
+        the mean of its two windows. The windows are the search's own on
+        purpose: a longer one reads another device state than the candidates
+        it is compared with (see ``_BANK_CYCLE_RETIMING_ROUNDS``), so
+        accuracy comes from the number of windows, as it does in the final
+        selection's rounds.
+
+        Every sweep is logged at debug level with what its windows read. One
+        line has their shift from the readings they repeat (at info level
+        when the windows read another device state than those readings,
+        ``_BANK_CYCLE_RETIMING_SHIFT_LOGGED``) and the share of members
+        whose two windows sit apart
+        (``_BANK_CYCLE_RETIMING_WINDOWS_APART``), which the median shift
+        does not see. One has each member's ``config_id``, the reading it
+        had, its raw windows and the reading it takes, every value with the
+        digits that tell it from any other, so the line shows which of the
+        three a member took. A member's ``rebenchmark`` row in the trace
+        holds the reading it takes, which is the reading the search goes on
+        with, so the raw windows are in that line alone.
+
+        A member that fails in a window has that failure for its result and
+        is not timed again; one that the worker gave no reading in a window
+        (``None``) keeps the reading it has, as it does when a single window
+        gives none. ``None`` for the whole batch when the worker cannot time
+        it.
+
+        A worker that survives its kill ends the re-timing without results
+        (``BenchmarkWorkerUnkillable``). The error leaves here in the
+        numbering of ``members``: the member it was timing, and in its
+        ``batch_results`` every failure the sweeps read, those of the sweep
+        it ends included. ``rebenchmark`` applies them as it does for the
+        one batch of a one-bank search (``_record_abandoned_batch``): none
+        of those members wins the fallback of ``_finalize`` on the reading
+        it had, and a CuTe flash search quarantines them with their config
+        and source aliases.
+        """
+        provider = self.benchmark_provider
+        window = min(rep, CANDIDATE_WINDOW_MS)
+        windows: list[list[float]] = [[] for _ in members]
+        results: list[IsolatedBenchmarkTiming] = [None] * len(members)
+        settled = [False] * len(members)
+        for sweep in range(_BANK_CYCLE_RETIMING_ROUNDS):
+            order = [index for index in range(len(members)) if not settled[index]]
+            if sweep % 2:
+                order.reverse()
+            if not order:
+                break
+            try:
+                readings = provider.benchmark_isolated(
+                    [members[index].fn for index in order],
+                    warmup=1,
+                    rep=window,
+                    desc=desc,
+                )
+            except BenchmarkWorkerUnkillable as error:
+                # The provider numbers the candidates of this sweep, and its
+                # error holds what this sweep read. The caller applies the
+                # failures of a batch over ``members``: give it their
+                # positions, and the failures of the sweeps before as well.
+                if error.fn_index is not None and 0 <= error.fn_index < len(order):
+                    error.fn_index = order[error.fn_index]
+                for index, reading in zip(order, error.batch_results, strict=False):
+                    if isinstance(reading, IsolatedBenchmarkFailure):
+                        results[index] = reading
+                error.batch_results = tuple(results)
+                raise
+            if readings is None:
+                return None
+            for index, reading in zip(order, readings, strict=True):
+                if reading is None or isinstance(reading, IsolatedBenchmarkFailure):
+                    results[index] = reading
+                    settled[index] = True
+                else:
+                    windows[index].append(reading)
+        shifts: list[float] = []
+        taken: list[tuple[PopulationMember, float | None, list[float], float]] = []
+        for index, member in enumerate(members):
+            if settled[index]:
+                continue
+            raw = windows[index]
+            reading = statistics.median(raw)
+            earlier = None
+            if member.perfs and math.isfinite(member.perf):
+                earlier = member.perf
+                if earlier > 0.0 and math.isfinite(reading):
+                    shifts.append(reading / earlier - 1.0)
+                reading = statistics.median([earlier, *raw])
+            results[index] = reading
+            taken.append((member, earlier, raw, reading))
+        if shifts:
+            shift = statistics.median(shifts)
+            apart = sum(
+                max(raw) - min(raw) > _BANK_CYCLE_RETIMING_WINDOWS_APART * min(raw)
+                for _, _, raw, _ in taken
+            )
+            message = (
+                f"{desc}: {len(shifts)} configs re-timed in "
+                f"{_BANK_CYCLE_RETIMING_ROUNDS} sweeps of {window} ms windows, "
+                f"which read {shift:+.1%} (median) from the readings they repeat; "
+                f"the two windows of {apart} of {len(taken)} configs "
+                f"({apart / len(taken):.0%}) sit more than "
+                f"{_BANK_CYCLE_RETIMING_WINDOWS_APART:.0%} apart"
+            )
+            if abs(shift) >= _BANK_CYCLE_RETIMING_SHIFT_LOGGED:
+                self.log(
+                    message
+                    + ": the windows of this search do not read one device state"
+                )
+            else:
+                self.log.debug(message)
+        if taken:
+            self.log.debug(
+                lambda: (
+                    f"{desc}: re-timing windows in ms (config_id: the reading it "
+                    "had | its windows | the reading it takes): "
+                    + "; ".join(
+                        f"{canonical_config_id(member.config)}: "
+                        f"{'none' if earlier is None else repr(float(earlier))} | "
+                        f"{' '.join(repr(float(value)) for value in raw)} | "
+                        f"{float(reading)!r}"
+                        for member, earlier, raw, reading in taken
+                    )
+                )
+            )
+        return results
 
     def mirrored_rebenchmark(
         self,

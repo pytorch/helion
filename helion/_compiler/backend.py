@@ -1377,6 +1377,43 @@ class Backend(abc.ABC):
         """
         return 0
 
+    @classmethod
+    def default_defends_final_selection(cls) -> bool:
+        """Whether the kernel of a promoted compiler default runs the rounds
+        of the autotuner's final selection (``PopulationBasedSearch.
+        _run_final_selection``) whatever it screens, as the incumbent and
+        the best pinned seed do, where it is a live finalist.
+
+        The promoted default (``ConfigSpec.compiler_default_config``) is the
+        config a kernel runs without autotuning. A search that pins its
+        seeds (pattern search, LFBO, a best-available population) has it as
+        one pinned seed among many, and only the best pinned seed by a
+        single screen window goes on to the rounds: a search whose default
+        is cut there never compares its pick with what the kernel would
+        have run untuned, and can return a config a step of the screen's
+        resolution slower. With this hook the best-ranked live finalist
+        that stands for the default's kernel is timed in the rounds, one
+        finalist more at most, and the selection then read at least as fast
+        as the code the kernel runs untuned in the same interleaved windows
+        (up to the documented pinned and backend preference tolerances). A
+        win returns the config that finalist is listed under, or a simpler
+        config with the same generated source where the search simplifies
+        its selection (``simplified_selected_config``).
+
+        The search has the rule
+        (``PopulationBasedSearch._stands_for_defending_default``): which
+        finalist stands for the default's kernel, by its generated source
+        or by its config, and the defaults the rule does not reach (one
+        whose kernel is no live finalist, one the search never compiled).
+
+        By default a promoted default has no such standing. A class method:
+        the search reaches it through the config spec's backend
+        (``PopulationBasedSearch._default_defends_final_selection``), while
+        it reaches ``finalist_preference`` through the backend's registered
+        name in ``Settings.backend``.
+        """
+        return False
+
     def get_paired_device_micros_bench(
         self,
     ) -> Callable[..., list[tuple[float, float]]] | None:

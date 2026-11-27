@@ -2429,8 +2429,10 @@ class TestBenchmarkWorkerFailureModes(unittest.TestCase):
                 provider = self._job_recording_provider()
                 provider.trace_search_candidates = traces
                 search = self._retiming_search(provider)
-                # (the in-process path is the one that refuses input banks)
-                search._input_bank_count = 2
+                if not traces:
+                    # (the in-process path is the one that refuses input
+                    # banks; a search with banks does not read the trace)
+                    search._input_bank_count = 2
                 members = self._two_members()
                 with patch(
                     "helion.autotuner.benchmark_provider._serialize_compiled_fn",

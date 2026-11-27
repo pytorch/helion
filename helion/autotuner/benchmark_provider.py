@@ -611,6 +611,14 @@ class IsolatedBenchmarkFailure(NamedTuple):
 
 IsolatedBenchmarkTiming = float | None | IsolatedBenchmarkFailure
 
+# The window of a candidate's reading: about this many milliseconds of timed
+# calls after one of warm-up, in the benchmark worker or in process. A search
+# that times bank cycles re-times in the same window
+# (``PopulationBasedSearch._bank_cycle_retimings``), and a multi-shape search
+# with ``relative_to="baseline"`` times in it the baseline its candidates'
+# readings are divided by (``MultiShapeBenchmarkProvider._measure_reference``).
+CANDIDATE_WINDOW_MS = 50
+
 
 @dataclasses.dataclass(frozen=True)
 class _PendingEffectiveSourceFailure:
@@ -3727,7 +3735,7 @@ class LocalBenchmarkProvider(BenchmarkProvider):
                         benchmark_callable,
                         return_mode="median",
                         warmup=1,
-                        rep=50,
+                        rep=CANDIDATE_WINDOW_MS,
                         process_group_name=self.kernel.env.process_group_name,
                         probe_long_kernel=self._probe_long_kernel(),
                         pre_warmed=True,
@@ -3737,7 +3745,7 @@ class LocalBenchmarkProvider(BenchmarkProvider):
                         benchmark_callable,
                         return_mode="median",
                         warmup=1,
-                        rep=50,
+                        rep=CANDIDATE_WINDOW_MS,
                         process_group_name=self.kernel.env.process_group_name,
                     )
             res = sync_object(
@@ -3867,7 +3875,7 @@ class LocalBenchmarkProvider(BenchmarkProvider):
                 latency = self._run_subprocess_benchmark_job(
                     fn,
                     warmup=1,
-                    rep=50,
+                    rep=CANDIDATE_WINDOW_MS,
                     fixed_repetitions=retry_repetitions,
                 )
             if latency is None:
@@ -4033,7 +4041,9 @@ class LocalBenchmarkProvider(BenchmarkProvider):
         confirms it.
         """
         try:
-            return self._run_subprocess_benchmark_job(fn, warmup=1, rep=50)
+            return self._run_subprocess_benchmark_job(
+                fn, warmup=1, rep=CANDIDATE_WINDOW_MS
+            )
         except BenchmarkCompileTimeout as error:
             if error.cold_start_seconds is None or self.budget_exceeded_fn():
                 raise
@@ -4042,7 +4052,7 @@ class LocalBenchmarkProvider(BenchmarkProvider):
                 f"compile deadline ({error}) as the first job of a fresh worker "
                 f"that took {error.cold_start_seconds:.1f}s to start"
             )
-        return self._run_subprocess_benchmark_job(fn, warmup=1, rep=50)
+        return self._run_subprocess_benchmark_job(fn, warmup=1, rep=CANDIDATE_WINDOW_MS)
 
     def _run_subprocess_accuracy_check_job(
         self, fn: CompiledConfig
@@ -4744,7 +4754,7 @@ class MultiShapeBenchmarkProvider(BenchmarkProvider):
                 functools.partial(baseline_fn, *reference_args),
                 return_mode="median",
                 warmup=1,
-                rep=50,
+                rep=CANDIDATE_WINDOW_MS,
                 process_group_name=child.kernel.env.process_group_name,
             )
         except Exception as error:

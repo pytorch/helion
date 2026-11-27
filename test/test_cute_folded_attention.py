@@ -3,7 +3,9 @@ from __future__ import annotations
 import ast
 import dataclasses
 import functools
+import random
 from typing import TYPE_CHECKING
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -11,6 +13,7 @@ import torch
 import helion
 from helion._compiler.cute.analysis.paged_attention_match import match_paged_attention
 from helion._compiler.cute.analysis.separable_index_map import prove_separable_index_map
+from helion._compiler.cute.autotune import config_generation_ext
 from helion._compiler.cute.cute_mma_dag import _Matcher
 from helion._compiler.cute.cute_mma_dag import match_mma_dag
 from helion._compiler.cute.cute_mma_dag_seeds import MmaDagSeedPlanner
@@ -20,13 +23,23 @@ from helion._compiler.cute.paged_attention_transport import (
 from helion._testing import cpu_render_target
 from helion._testing.cute_codegen import cpu_bind
 from helion._testing.cute_folded_attention import folded_paged_attention
+from helion._testing.cute_paged_v_lag import paired_v_lag_bound
 from helion._testing.cute_paged_v_lag import without_paired_head
 from helion._testing.cute_paged_v_lag import without_retirement_seeds
+from helion.autotuner.config_fragment import EnumFragment
+from helion.autotuner.config_generation import ConfigGeneration
+from helion.autotuner.differential_evolution import DifferentialEvolutionSearch
+from helion.autotuner.effort_profile import RANDOM_SEARCH_DEFAULTS
+from helion.autotuner.pattern_search import InitialPopulationStrategy
+from helion.autotuner.pattern_search import PatternSearch
+from helion.autotuner.random_search import RandomSearch
 import helion.language as hl
 from helion.language import tile_ops
 from helion.language.memory_ops import load
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from helion.runtime.kernel import BoundKernel
 
 pytestmark = pytest.mark.cpu_only
@@ -94,7 +107,7 @@ def _nonlead_folded_gather(storage: torch.Tensor, weight: torch.Tensor) -> torch
 
 
 @functools.lru_cache(None)
-def _bound(query_len: int = 5, variant: str = "plain") -> BoundKernel:
+def _args(query_len: int = 5, variant: str = "plain") -> tuple[object, ...]:
     batch, heads, dim, pages = 3, 16, 128, 7
     column_stride = 2 if variant == "strided_columns" else 1
     head_stride = dim * column_stride
@@ -119,7 +132,7 @@ def _bound(query_len: int = 5, variant: str = "plain") -> BoundKernel:
         x.view(torch.uint8).as_strided((pages, 128, 2, 4), (33792, 4, 512, 1), 32768)
         for x in storage
     ]
-    args = (
+    return (
         q,
         k,
         v,
@@ -132,8 +145,12 @@ def _bound(query_len: int = 5, variant: str = "plain") -> BoundKernel:
         True,
         out,
     )
+
+
+@functools.lru_cache(None)
+def _bound(query_len: int = 5, variant: str = "plain") -> BoundKernel:
     with cpu_render_target(fake_device_sm_count=148):
-        return cpu_bind(folded_paged_attention, args)
+        return cpu_bind(folded_paged_attention, _args(query_len, variant))
 
 
 def _config(
@@ -300,6 +317,302 @@ def test_folded_attention_without_a_config_runs_the_paired_family() -> None:
     assert "paged_attention_paired_body(" in source
     assert "paged_attention_partial_body(" not in source
     assert "capture_release_tail=True" in source
+
+
+def test_folded_attention_population_leaves_out_generic_random_draws(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Folded storage leaves the attention schedules as the only lowering
+    # besides the generic one, which a random draw almost always renders and
+    # which cannot compete with the seeds.
+    bound = _bound(5, "plain")
+    spec = bound.config_spec
+    assert spec.cute_mma_dag_facts is not None and spec.cute_mma_dag_facts.mapped_io
+    assert bound.host_function is not None
+    with cpu_render_target(fake_device_sm_count=148), bound.env, bound.host_function:
+        generation = ConfigGeneration(spec)
+        seeds = [config for _flat, config in generation.seed_flat_config_pairs()]
+        assert len(seeds) >= config_generation_ext.MIN_SEEDS_WITHOUT_RANDOM_DRAWS
+        random.seed(0)
+        population = [
+            generation.unflatten(flat)
+            for flat in generation.random_population_flat(100)
+        ]
+        # The fragment default (the search's reference) leads, then the seeds;
+        # the few draws that named an attention schedule follow.
+        assert population[0].get("cute_mma_dag") == "off"
+        assert population[1 : 1 + len(seeds)] == seeds
+        assert len(population) < 100
+        assert all(config.get("cute_mma_dag") == "tcgen05" for config in population[1:])
+        # Too few seeds to stand in for a population: the draws stay.
+        monkeypatch.setattr(
+            config_generation_ext, "MIN_SEEDS_WITHOUT_RANDOM_DRAWS", len(seeds) + 1
+        )
+        random.seed(0)
+        padded = ConfigGeneration(spec).random_population_flat(100)
+        assert len(padded) == 100
+
+
+@pytest.mark.parametrize(
+    "overrides,scheduled",
+    [
+        # Overrides that exclude the attention schedules, or narrow them to a
+        # few seeds, leave the generic lowering as the surface to search:
+        ({"cute_mma_dag": "off"}, False),
+        ({"cute_min_blocks_per_mp": 0}, False),
+        ({"cute_mma_dag_pass_warps": "attention_scoped"}, False),
+        # one that keeps the seeds in the search keeps the short population.
+        ({"cute_pdl_spread": False}, True),
+    ],
+)
+def test_folded_attention_population_follows_the_seeds_overrides_admit(
+    overrides: dict[str, object], scheduled: bool
+) -> None:
+    # The seeds stand in for the random draws only where they start the
+    # search: they are counted as the generation transfers them.
+    bound = _bound(5, "plain")
+    spec = bound.config_spec
+    assert bound.host_function is not None
+    with cpu_render_target(fake_device_sm_count=148), bound.env, bound.host_function:
+        generation = ConfigGeneration(spec, overrides=overrides)
+        seeds = [
+            config
+            for _flat, config in generation.seed_flat_config_pairs()
+            if config.get("cute_mma_dag") != "off"
+        ]
+        enough = len(seeds) >= config_generation_ext.MIN_SEEDS_WITHOUT_RANDOM_DRAWS
+        assert enough is scheduled
+        random.seed(0)
+        population = generation.random_population_flat(100)
+        if scheduled:
+            assert len(seeds) < len(population) < 100
+        else:
+            # A search needs these starting points: differential evolution
+            # draws four members to mutate one.
+            assert len(population) == 100
+
+
+class _OpaqueChoice:
+    """A choice of a user's tunable that config handling leaves as it is: it
+    compares by identity and refuses to be copied."""
+
+    def __deepcopy__(self, memo: dict[int, object]) -> _OpaqueChoice:
+        raise AssertionError("a copy hook of an opaque config value ran")
+
+
+def test_folded_attention_population_copies_no_opaque_choice() -> None:
+    # A user's tunable may hold choices that are opaque to config handling,
+    # which copies the config containers and leaves such a value as it is
+    # (``_copy_config_structure``). The rule that declines a draw decodes a
+    # copy of it. That copy holds the choices themselves: no copy hook runs,
+    # and the generic draws are left out as they are without the tunable.
+    choices = (_OpaqueChoice(), _OpaqueChoice())
+    with cpu_render_target(fake_device_sm_count=148):
+        # A bind of its own: the tunable joins its config spec.
+        bound = cpu_bind(folded_paged_attention, _args(5, "plain"))
+        spec = bound.config_spec
+        spec.user_defined_tunables["selected"] = EnumFragment(choices)
+        assert bound.host_function is not None
+        with bound.env, bound.host_function:
+            generation = ConfigGeneration(spec)
+            random.seed(0)
+            population = [
+                generation.unflatten(flat)
+                for flat in generation.random_population_flat(100)
+            ]
+            assert len(population) < 100
+            assert all(config.get("cute_mma_dag") != "off" for config in population[1:])
+            assert all(
+                any(config["selected"] is choice for choice in choices)
+                for config in population
+            )
+
+
+def _drops_the_seeds(config: helion.Config) -> helion.Config | None:
+    # Every seed of the fixture has a block of 64.
+    return config if max(config.block_sizes) <= 16 else None
+
+
+class _PassesASeedOnce:
+    """A filter that keeps state: it passes a config on an attention
+    schedule the first time it is asked about it, and drops every other
+    config and every repeat."""
+
+    def __init__(self) -> None:
+        self.passed: set[helion.Config] = set()
+
+    def __call__(self, config: helion.Config) -> helion.Config | None:
+        if config.get("cute_mma_dag") == "off" or config in self.passed:
+            return None
+        self.passed.add(config)
+        return config
+
+
+@pytest.mark.parametrize(
+    "new_filter,passes_the_seeds",
+    [
+        # Passes no seed, no witness and not the default, only draws.
+        (lambda: _drops_the_seeds, False),
+        # Leaves every candidate as it is.
+        (lambda: lambda config: config, True),
+        # Asked about a seed a second time, it drops the seed.
+        (_PassesASeedOnce, True),
+    ],
+    ids=["drops_the_seeds", "passes_every_config", "passes_a_seed_once"],
+)
+def test_folded_attention_population_keeps_the_draws_behind_a_filter(
+    monkeypatch: pytest.MonkeyPatch,
+    new_filter: Callable[[], Callable[[helion.Config], helion.Config | None]],
+    passes_the_seeds: bool,
+) -> None:
+    # A seed that ``autotune_config_filter`` drops or rewrites starts no
+    # search, so it stands in for no draw. Which seeds those are is the
+    # filter's answer when the population is benchmarked, and the filter
+    # may keep state, so a search with a filter keeps its draws and asks
+    # the filter nothing while it builds its population. Draws declined
+    # behind seeds that the filter drops leave a search nothing to time,
+    # and seeds shown to a filter that passes each config once are dropped
+    # when they are benchmarked.
+    bound = _bound(5, "plain")
+    args = _args(5, "plain")
+    assert bound.host_function is not None
+
+    def start(
+        cls: type[PatternSearch | DifferentialEvolutionSearch], **kwargs: int
+    ) -> tuple[list[list[object]], list[helion.Config]]:
+        config_filter = Mock(side_effect=new_filter())
+        monkeypatch.setattr(bound.settings, "autotune_config_filter", config_filter)
+        search = cls(bound, args, **kwargs)
+        random.seed(0)
+        population = search._generate_initial_population_flat()
+        config_filter.assert_not_called()
+        configs = [search.config_gen.unflatten(flat) for flat in population]
+        passing, _indices = search._apply_config_filter(configs, record_trace=False)
+        return population, passing
+
+    with cpu_render_target(fake_device_sm_count=148), bound.env, bound.host_function:
+        seeds = [
+            config
+            for _flat, config in ConfigGeneration(
+                bound.config_spec
+            ).seed_flat_config_pairs()
+        ]
+        assert len(seeds) >= config_generation_ext.MIN_SEEDS_WITHOUT_RANDOM_DRAWS
+        # Without a filter the seeds stand in for the draws.
+        unfiltered = PatternSearch(bound, args, initial_population=100)
+        random.seed(0)
+        assert len(unfiltered._generate_initial_population_flat()) < 100
+        # Pattern search draws through a view of its generation
+        # (``initial_population_view``), differential evolution through the
+        # generation itself.
+        population, passing = start(PatternSearch, initial_population=100)
+        evolution, evolving = start(DifferentialEvolutionSearch, population_size=50)
+        assert len(population) >= 100
+        assert len(evolution) == 100
+        assert passing and evolving
+        if passes_the_seeds:
+            assert all(seed in passing and seed in evolving for seed in seeds)
+
+
+def test_refills_of_a_folded_population_bring_no_generic_draws_back(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A search pads its starting points in more places than
+    # ``random_population_flat``: the refill after the backend's pre-screen
+    # rejected a config, and the random pad of a population built from the
+    # best available configs. Each asks the same rule, so none of them
+    # brings back the generic draws the population left out.
+    bound = _bound(5, "plain")
+    args = _args(5, "plain")
+    assert bound.host_function is not None
+
+    def generic(search: PatternSearch | DifferentialEvolutionSearch) -> int:
+        random.seed(0)
+        population = search._generate_initial_population_flat()
+        assert len(population) < 100
+        return sum(
+            search.config_gen.unflatten(flat).get("cute_mma_dag") == "off"
+            for flat in population
+        )
+
+    with cpu_render_target(fake_device_sm_count=148), bound.env, bound.host_function:
+        search = PatternSearch(bound, args, initial_population=100)
+        assert (
+            search.initial_population_strategy is InitialPopulationStrategy.FROM_RANDOM
+        )
+        # The fragment default and the compiler-coverage witnesses, which
+        # are not draws.
+        witnesses = generic(search)
+        assert 0 < witnesses < 20
+        seeds = [config for _flat, config in search.config_gen.seed_flat_config_pairs()]
+        with monkeypatch.context() as screen:
+            # The pre-screen rejects one seed, and the population is refilled.
+            screen.setattr(
+                PatternSearch,
+                "_backend_config_is_viable",
+                lambda self, config: config != seeds[1],
+            )
+            assert generic(search) == witnesses
+        best_available = {
+            "initial_population_strategy": InitialPopulationStrategy.FROM_BEST_AVAILABLE,
+            "best_available_pad_random": True,
+        }
+        for cls in (PatternSearch, DifferentialEvolutionSearch):
+            monkeypatch.setattr(
+                cls, "_find_similar_cached_configs", lambda self, n, **kwargs: []
+            )
+        padded = PatternSearch(bound, args, initial_population=100, **best_available)
+        assert generic(padded) == witnesses
+        # Differential evolution adds no coverage witnesses: the default alone.
+        evolution = DifferentialEvolutionSearch(
+            bound, args, population_size=50, **best_available
+        )
+        assert generic(evolution) == 1
+        # The fallback for a search whose seeds all failed keeps every draw:
+        # no seed is left for the generic lowering to stand behind.
+        random.seed(0)
+        fallback = search._pad_initial_population_with_unique_random(
+            [search.config_gen.default_flat()], 100, keep_every_draw=True
+        )
+        assert len(fallback) == 100
+
+
+def test_random_search_gets_the_candidates_it_asks_for() -> None:
+    # A random search times its population and nothing else: the draws that
+    # the starting points of an iterative search leave out are its
+    # candidates. It asks for 1,000 by default.
+    bound = _bound(5, "plain")
+    spec = bound.config_spec
+    count = RANDOM_SEARCH_DEFAULTS.count
+    assert count == 1000
+    assert bound.host_function is not None
+    with cpu_render_target(fake_device_sm_count=148), bound.env, bound.host_function:
+        generation = ConfigGeneration(spec)
+        random.seed(0)
+        assert len(generation.random_population_flat(count)) < 100
+        random.seed(0)
+        population = generation.random_population(count)
+        assert len(population) == count
+        assert generation.invalid_config_count == 0
+        # Nearly all of them render the generic lowering.
+        generic = sum(config.get("cute_mma_dag") == "off" for config in population)
+        assert generic > count // 2
+        random.seed(0)
+        search = RandomSearch(bound, _args(5, "plain"))
+        assert len(search.configs) == count
+
+
+def test_unfolded_attention_population_keeps_its_random_draws() -> None:
+    # Direct storage also admits the ordinary MMA lowerings, which random
+    # draws can reach: the generic population is unchanged.
+    bound = paired_v_lag_bound()
+    facts = bound.config_spec.cute_mma_dag_facts
+    assert facts is not None and facts.attention is not None and not facts.mapped_io
+    assert bound.host_function is not None
+    with cpu_render_target(fake_device_sm_count=148), bound.env, bound.host_function:
+        random.seed(0)
+        population = ConfigGeneration(bound.config_spec).random_population_flat(100)
+    assert len(population) == 100
 
 
 def test_folded_index_proof_checks_intermediate_integer_overflow() -> None:

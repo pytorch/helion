@@ -11,6 +11,7 @@ import unittest
 from unittest.mock import MagicMock
 from unittest.mock import patch
 
+import pytest
 import torch
 
 from helion._compiler.triton.backend import TileIRBackend
@@ -1756,6 +1757,66 @@ class TestGenerateBestAvailablePopulation(unittest.TestCase):
 
         self.assertEqual(population, [default_flat, default_flat, default_flat])
         self.assertEqual(random_flat.call_count, 2)
+
+    @pytest.mark.cpu_only
+    def test_random_pads_leave_out_the_draws_a_backend_declines(self):
+        """Every pad of an iterative search's starting points asks
+        ``ConfigGenerationExtension.admits_random_initial_flat``; a declined
+        draw is not replaced."""
+        config_gen = self._make_config_gen()
+        default_flat = config_gen.default_flat()
+        kept = config_gen.flatten(
+            Config(block_sizes=[32, 64], num_warps=8, num_stages=2)
+        )
+        declined = config_gen.flatten(
+            Config(block_sizes=[128, 256], num_warps=2, num_stages=4)
+        )
+        draws = (declined, kept, declined, declined)
+        mock_search = self._make_mock_search(config_gen, cached_configs=[])
+
+        def padded(target, **kwargs):
+            with (
+                patch.object(
+                    config_gen.extension,
+                    "admits_random_initial_flat",
+                    side_effect=lambda flat: flat is not declined,
+                ),
+                patch.object(config_gen, "random_flat", side_effect=draws) as draw,
+            ):
+                population = (
+                    PopulationBasedSearch._pad_initial_population_with_unique_random(
+                        mock_search, [default_flat], target, **kwargs
+                    )
+                )
+            return [config_gen.unflatten(flat) for flat in population], draw
+
+        # Four slots to fill: the three declined draws leave theirs empty.
+        population, draw = padded(5)
+        self.assertEqual(
+            population, [config_gen.unflatten(flat) for flat in (default_flat, kept)]
+        )
+        self.assertEqual(draw.call_count, 4)
+        self.assertIn(
+            "Left 3 initial population slots empty: the backend declines those "
+            "random draws.",
+            [call.args[0] for call in mock_search.log.call_args_list],
+        )
+        # The fallback for a population whose seeds all failed keeps them.
+        population, draw = padded(3, keep_every_draw=True)
+        self.assertEqual(
+            population,
+            [config_gen.unflatten(flat) for flat in (default_flat, declined, kept)],
+        )
+        # The best-available pads of pattern search and differential evolution.
+        with (
+            patch.object(
+                config_gen.extension,
+                "admits_random_initial_flat",
+                side_effect=lambda flat: flat is not declined,
+            ),
+            patch.object(config_gen, "random_flat", side_effect=draws),
+        ):
+            self.assertEqual(config_gen.random_initial_flats(4), [kept])
 
     def test_default_only_when_no_cached(self):
         """Population contains only default config when no cached configs found."""

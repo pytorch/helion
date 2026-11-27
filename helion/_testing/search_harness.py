@@ -25,8 +25,9 @@ if TYPE_CHECKING:
 def mock_kernel(settings: Settings, **attrs: object) -> SimpleNamespace:
     """A stand-in for a bound kernel with what building a search and its
     benchmark provider reads: a config spec whose default config is
-    ``block_sizes=[1]``, on a backend that precompiles and finds every config
-    viable, and an environment on ``DEVICE`` outside any process group.
+    ``block_sizes=[1]``, without a promoted compiler default, on a backend
+    that precompiles and finds every config viable, and an environment on
+    ``DEVICE`` outside any process group.
     ``attrs`` adds or replaces kernel attributes, such as the
     ``compile_config`` of a search that compiles configs."""
     config_spec = SimpleNamespace(
@@ -34,6 +35,7 @@ def mock_kernel(settings: Settings, **attrs: object) -> SimpleNamespace:
         search_surface=BackendSearchSurface(),
         cute_flash_search_enabled=False,
         compiler_seed_timeout_retry_repetitions=None,
+        compiler_default_config=None,
         create_config_generation=lambda **kwargs: SimpleNamespace(
             invalid_config_count=0
         ),
@@ -45,6 +47,7 @@ def mock_kernel(settings: Settings, **attrs: object) -> SimpleNamespace:
             generated_source_hash=lambda compiled_fn: None,
             get_do_bench=lambda: None,
             default_final_selection_regime=lambda: None,
+            default_defends_final_selection=lambda: False,
             classify_autotune_exception=lambda error: None,
             probe_long_autotune_kernels=lambda config_spec: False,
             autotune_short_kernel_below_us=lambda config_spec: None,

@@ -241,21 +241,27 @@ class FinalSelectionConfig:
         """
         return self.screen_rep_ms > 0 and shortlist > self.top_k + 1
 
-    def finalists(self, shortlist: int) -> int:
+    def finalists(self, shortlist: int, defending: int = 0) -> int:
         """Most finalists the rounds can time: the ``top_k`` best ranked plus
         the best pinned seed plus the search's incumbent plus the
-        ``family_finalists`` family representatives.
+        ``family_finalists`` family representatives plus ``defending``
+        finalists that run the rounds whatever their rank.
 
         The seed and the incumbent survive even when they rank outside the
         ``top_k`` (the incumbent does when a later phase re-timed it above
-        the shortlist's search numbers), as do the family representatives,
-        so a shortlist of ``top_k + 2 + family_finalists`` can reach the
-        rounds whole; the estimate counts that upper bound.
+        the shortlist's search numbers), as do the family representatives
+        and the ``defending`` finalists, so a shortlist of ``top_k + 2 +
+        family_finalists + defending`` can reach the rounds whole; the
+        estimate counts that upper bound. ``defending`` counts a promoted
+        default the backend has defend its title
+        (``Backend.default_defends_final_selection``).
         """
-        return min(shortlist, self.top_k + 2 + self.family_finalists)
+        return min(shortlist, self.top_k + 2 + self.family_finalists + defending)
 
-    def estimated_seconds(self, shortlist: int) -> float:
-        """Wall-clock estimate for a shortlist of ``shortlist`` configs.
+    def estimated_seconds(self, shortlist: int, defending: int = 0) -> float:
+        """Wall-clock estimate for a shortlist of ``shortlist`` configs, of
+        which ``defending`` run the rounds whatever their rank
+        (:meth:`finalists`).
 
         The reserve the search phase keeps for the phase under a budget.
         """
@@ -264,9 +270,10 @@ class FinalSelectionConfig:
         if self.screens(shortlist):
             screen_window_s = (self.screen_warmup_ms + self.screen_rep_ms) / 1000.0
             screen_s = shortlist * (screen_window_s + self.WINDOW_OVERHEAD_S)
-        rounds_s = self.finalists(shortlist) * self.rounds * window_s
+        finalists = self.finalists(shortlist, defending)
+        rounds_s = finalists * self.rounds * window_s
         # the second column, when the regimes call for one, for every finalist
-        tiebreak_s = self.finalists(shortlist) * self.tiebreak_rounds * window_s
+        tiebreak_s = finalists * self.tiebreak_rounds * window_s
         # 1.25x covers the timer sizing its repetitions from an estimate pass
         # (a window runs up to a quarter longer than requested); the 5 s
         # covers one worker spawn with wrapper and argument loads.
@@ -276,7 +283,7 @@ class FinalSelectionConfig:
         )
 
     def fit_to_seconds(
-        self, seconds: float, shortlist: int
+        self, seconds: float, shortlist: int, defending: int = 0
     ) -> FinalSelectionConfig | None:
         """The most complete plan whose estimate fits in ``seconds``.
 
@@ -286,7 +293,7 @@ class FinalSelectionConfig:
         Returns None when even the minimum plan does not fit.
         """
         for policy in self.budget_ladder():
-            if policy.estimated_seconds(shortlist) <= seconds:
+            if policy.estimated_seconds(shortlist, defending) <= seconds:
                 return policy
         return None
 

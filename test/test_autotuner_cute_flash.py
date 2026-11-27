@@ -6918,6 +6918,7 @@ class TestAutotunerCuteFlash(AutotunerTestCase):
             canonicalize_flat=canonicalize_flat,
             random_flat=Mock(side_effect=([-1], [4])),
             extension=SimpleNamespace(
+                admits_random_initial_flat=lambda flat: True,
                 deterministic_population_configs=lambda: [configs[1], configs[2]],
                 exact_effective_search_space_configs=lambda _limit: None,
                 flash_structural_parent_coverage_prefix_count=lambda: 2,
@@ -7620,6 +7621,40 @@ class TestCuteFlashSearchPolicyCacheKey(unittest.TestCase):
                     "cute_flash_config_generation_policy_version", algorithm
                 )
                 self.assertEqual(algorithm, search._algorithm_cache_policy())
+
+    def test_the_defending_default_is_in_no_cache_key(self) -> None:
+        # The CuTe backend has a promoted default run the final selection's
+        # rounds (``Backend.default_defends_final_selection``). The rule is
+        # part of no cache identity. A flash search hashes its whole policy,
+        # and no flash heuristic promotes a default. Every other kernel's
+        # key names no final-selection policy, so a result one of them
+        # cached before the rule is still served: it stays the winner of the
+        # search that made it. (Searches over rotating banks, where a
+        # default was seen cut, run again once for the bank timing version.)
+        self.assertTrue(CuteBackend.default_defends_final_selection())
+        without_rule = patch.object(
+            CuteBackend, "default_defends_final_selection", return_value=False
+        )
+        # The suite turns the final selection off; a full search has one.
+        with patch.dict(os.environ, {"HELION_AUTOTUNE_FINAL_SELECTION_ROUNDS": "4"}):
+            search = self._search()
+        self.assertIsNotNone(search.final_selection)
+        keys: dict[tuple[bool, int], set[str]] = {}
+        for promoted in (None, helion.Config(block_sizes=[32])):
+            search.config_spec.compiler_default_config = promoted
+            policy = search.cache_policy()
+            assert policy is not None
+            self.assertNotIn("default_defends", policy["final_rebenchmark"])
+            for flash in (True, False):
+                for banks in (1, 3):
+                    search.settings.autotune_benchmark_input_banks = banks
+                    key = self._hash(search, enabled=flash)
+                    keys.setdefault((flash, banks), set()).add(key)
+                    with without_rule:
+                        self.assertEqual(self._hash(search, enabled=flash), key)
+        # One key per kind of search, with a promoted default and without.
+        self.assertEqual([len(found) for found in keys.values()], [1] * 4)
+        self.assertEqual(len(set().union(*keys.values())), 4)
 
     def test_lane_policy_version_is_cute_flash_only(self) -> None:
         search = self._search()

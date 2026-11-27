@@ -401,8 +401,10 @@ class ConfigGenerationExtension:
     (defaults, random draws, mutations, ``flatten``),
     ``conditional_neighbor_updates`` when constructing search neighbors,
     ``shrink_for_threads`` when ``shrink_config`` bounds a random or mutated
-    config without ``num_warps``, and ``initial_population_flats`` first
-    thing in ``random_population_flat``.
+    config without ``num_warps``, ``initial_population_flats`` first
+    thing in ``random_population_flat`` and ``admits_random_initial_flat``
+    on each random draw that pads the generic population of an iterative
+    search.
     The structural-coverage hooks size and seed the population-based searches
     (``PatternSearch``, ``PopulationBasedSearch``); the defaults describe a
     surface without a structural design.  The CuTe implementation (SIMT
@@ -451,6 +453,22 @@ class ConfigGenerationExtension:
         """A structurally designed initial population of ``n`` flat configs,
         or ``None`` for the generic seeds-then-random population."""
         return None
+
+    def admits_random_initial_flat(self, flat_config: FlatConfig) -> bool:
+        """Whether a random draw belongs in the generic initial population
+        (``ConfigGeneration.random_population_flat``); the default admits
+        every draw. A backend declines the draws of a surface on which they
+        cannot compete with its seeds, and the population is then smaller
+        than requested rather than padded with them. Seeds stand in for
+        draws only where they start the search: a backend that decides by
+        its seeds admits every draw of a search whose user filters its
+        candidates (``ConfigGeneration.search_filters_configs``, set under
+        ``autotune_config_filter``), where the filter says which seeds
+        start it only when they are benchmarked. Asked for the starting
+        points of an iterative search only: the candidates of a
+        ``RandomSearch`` (``ConfigGeneration.random_population``) are its
+        whole search and keep every draw."""
+        return True
 
     def population_floor(self, n: int) -> int:
         """The smallest population that measures every structural leaf."""

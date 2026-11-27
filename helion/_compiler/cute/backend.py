@@ -1489,6 +1489,19 @@ class CuteBackend(Backend):
     _pre_inductor_squeeze = True
 
     @classmethod
+    def default_defends_final_selection(cls) -> bool:
+        """A promoted default's kernel runs the final selection's rounds
+        where it is a live finalist (the search's rule says which finalist
+        stands for it, and what it does not reach:
+        ``PopulationBasedSearch._stands_for_defending_default``). The CuTe
+        seed lists are long, the pattern and LFBO searches pin every seed,
+        and only the best pinned seed of the screen's single window goes on
+        to the rounds. A kernel timed between event nodes reads on the
+        device timer's grid in that window, so the default can be cut there
+        and never be compared with the config the search returns."""
+        return True
+
+    @classmethod
     def finalist_preference(cls, config: Config, source: Callable[[], str]) -> int:
         """A kernel that renders the generic early release of its programmatic
         dependents (``cute_pdl`` on the generic path, released at entry or

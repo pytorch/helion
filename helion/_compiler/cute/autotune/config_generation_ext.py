@@ -44,6 +44,7 @@ from ....autotuner.config_spec import fit_thread_count
 from ....autotuner.search_surface import ConfigGenerationExtension
 from ....exc import AutotuneError
 from ....exc import InvalidConfig
+from ....runtime.config import _copy_config_structure
 from ....runtime.config_cache import ConfigSet
 from ...per_thread_planning import cap_auto_thread_axes
 from ...per_thread_planning import demote_auto_thread_axes
@@ -92,6 +93,15 @@ if TYPE_CHECKING:
     from ..loop_nesting import TileLoopPath
     from ..thread_budget import TileAxis
     from .flash_search import FlashCoverageDesign
+
+
+# Random draws that can only render the generic lowering are left out of an
+# attention kernel's initial population when the seeds a search starts from
+# on an attention schedule number at least this many
+# (``CuteConfigGenerationExtension.admits_random_initial_flat``): enough to
+# start every copy of a pattern search and to fill a differential evolution's
+# first generation's choice of parents.
+MIN_SEEDS_WITHOUT_RANDOM_DRAWS = 16
 
 
 def cute_generation_extension(
@@ -570,6 +580,71 @@ class CuteConfigGenerationExtension(ConfigGenerationExtension):
         if all(flat_config[slot] == value for slot, value in schedule):
             for slot, value in policy:
                 flat_config[slot] = value
+
+    @functools.cached_property
+    def _attention_seeds_stand_in(self) -> bool:
+        """Whether the paged attention schedules are this kernel's only
+        lowering besides the generic one, and the seeds this generation
+        starts from a population of them.
+
+        Folded storage (``mapped_io``) admits no other owner of the matched
+        dataflow, and the attention schedule needs a dozen knobs at exact
+        values, so a random draw almost never names one and otherwise
+        renders the generic lowering, which the seeds outrun by orders of
+        magnitude. The seeds stand in for the population
+        only when enough of them start this search on an attention schedule:
+        the seeds are counted as the generation transfers them, under its
+        fixed overrides. An override that excludes the schedules
+        (``cute_mma_dag="off"``, a ``cute_min_blocks_per_mp`` they cannot
+        run with) or narrows them to a few seeds leaves the generic lowering
+        as the surface to search, and its random starting points stay.
+
+        They stay as well in a search whose user filters its candidates
+        (``ConfigGeneration.search_filters_configs``). A seed that
+        ``autotune_config_filter`` drops or rewrites starts no search, and
+        draws declined behind such seeds would leave the search without a
+        candidate. Which seeds those are is the filter's answer when the
+        population is benchmarked, and the filter may keep state, so the
+        seeds are not shown to it here: a filter that passes each config
+        once would then drop them when they are benchmarked."""
+        generation = self.generation
+        spec = generation.config_spec
+        facts = spec.cute_mma_dag_facts
+        if not (
+            facts is not None
+            and facts.attention is not None
+            and facts.mapped_io
+            and list(spec.autotuner_heuristics) == ["cute_mma_dag"]
+        ):
+            return False
+        if generation.search_filters_configs:
+            return False
+        scheduled = sum(
+            config.get(MMA_DAG_KEY) != MMA_DAG_OFF
+            for _flat, config in generation.seed_flat_config_pairs()
+        )
+        return scheduled >= MIN_SEEDS_WITHOUT_RANDOM_DRAWS
+
+    def admits_random_initial_flat(self, flat_config: FlatConfig) -> bool:
+        """Decline the random draws that render the generic lowering where
+        the attention schedules are the kernel's only other lowering and
+        their seeds a population (``_attention_seeds_stand_in``). The
+        fragment default, the seeds and the compiler-coverage witnesses are
+        not draws and stay; so does every candidate of a ``RandomSearch``
+        and of the fallback for a search whose seeds all failed, which are
+        not asked."""
+        if not self._attention_seeds_stand_in:
+            return True
+        # Decoding repairs a flat config in place, so the draw is decoded
+        # from a copy and stays as it was drawn. The copy is of the config
+        # containers alone, as in ``ConfigGeneration.canonicalize_flat``: a
+        # choice of a user's tunable is opaque, and its copy hooks are not
+        # run.
+        try:
+            config = self.generation.unflatten(_copy_config_structure(flat_config))
+        except InvalidConfig:
+            return True
+        return config.get(MMA_DAG_KEY) != MMA_DAG_OFF
 
     # -- SIMT launch threads ---------------------------------------------------
 

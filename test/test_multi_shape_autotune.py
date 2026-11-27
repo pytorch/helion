@@ -1650,6 +1650,28 @@ class TestMultiShapeBenchmarkProvider(unittest.TestCase):
         )
         self.assertTrue(all(not child.benchmark_calls for child in later_children))
 
+    def test_baseline_reference_is_timed_in_the_candidates_window(self) -> None:
+        # The baseline's reading divides every candidate's, so it is taken in
+        # the candidates' window, as the default's is (``child.benchmark``).
+        spec = _make_config_spec()
+        case = _FakeBoundKernel(spec, [2.0])
+        case.settings.autotune_baseline_fn = lambda *args: None
+        provider, _ = self._make_provider([case], relative_to="baseline")
+        windows: list[tuple[int, int]] = []
+
+        def do_bench(fn: object, *, warmup: int, rep: int, **kwargs: object) -> float:
+            windows.append((warmup, rep))
+            return 3.0
+
+        with (
+            patch.object(benchmark_provider_module, "do_bench", do_bench),
+            patch.object(benchmark_provider_module, "CANDIDATE_WINDOW_MS", 37),
+        ):
+            provider.setup()
+
+        self.assertEqual(windows, [(1, 37)])
+        self.assertEqual(provider.args.reference_latencies, (3.0,))
+
     def test_reference_failure_names_shape_and_cleans_up(self) -> None:
         spec = _make_config_spec()
         provider, _ = self._make_provider(

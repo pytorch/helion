@@ -113,13 +113,35 @@ def _search_policy_json_value(
         active.remove(value_id)
 
 
-def _hash_search_policy(encoded: bytes) -> str:
+# Version of the bank-cycle timing policy: part of the cache identity of
+# every search with rotating input banks (``autotune_benchmark_input_banks``
+# above one), whatever the backend, the kernel family or the cache (local,
+# remote, AOT), and of no one-bank search. What it stands for:
+# - A bank cycle's reading is the central mean of its window's event times
+#   instead of their median (``benchmarking.central_mean``: the samples that
+#   did not stall, without their lowest and highest tenth), and the final
+#   selection breaks ties between the medians of its rounds by the mean of
+#   the rounds. Both change which config such a search returns.
+# - A search re-times its members in two windows of the candidates' length
+#   and reads each as the median of those and the reading it had, instead of
+#   reading one window four times as long
+#   (``PopulationBasedSearch._bank_cycle_retimings``): the readings its
+#   paths start from and move by, so the configs it visits and returns.
+# A change to either reading takes the next number.
+_BANK_TIMING_VERSION = 1
+
+
+def _hash_search_policy(encoded: bytes, banks: int = 1) -> str:
     # Includes default one-bank searches: old winners may have been validated
     # with changed metadata identity, uncloned callback captures, or undetected
     # writes to callback-only operands (including with custom accuracy checks),
     # or callbacks whose shared closure cells were split by partial cloning
     # or serialization to the benchmark worker.
-    return hashlib.sha256(b"helion.input_clone.v6\0" + encoded).hexdigest()
+    version = b"helion.input_clone.v6\0"
+    if banks > 1:
+        # Bank searches alone also carry their timing policy's version.
+        version += b"helion.bank_timing.v%d\0" % _BANK_TIMING_VERSION
+    return hashlib.sha256(version + encoded).hexdigest()
 
 
 def _explicit_aot_policy(autotuner: BaseSearch) -> dict[str, object]:
@@ -176,6 +198,8 @@ def _search_and_timing_policy_hash(
     enabled AccuracyCheck independently of their bank and final-selection
     policies. Unknown/custom flash policies get a unique one-shot key. Clone
     semantics version ordinary one-bank keys across every backend and AOT mode.
+    Every key of a search with rotating input banks also carries the bank
+    timing version (``_BANK_TIMING_VERSION``).
     Explicit AOT artifacts use stable identifiers even when custom provider or
     callback state cannot be fingerprinted; their owner must regenerate them
     after changes to that state. This does not enable automatic winner reuse.
@@ -254,10 +278,10 @@ def _search_and_timing_policy_hash(
                 return _hash_search_policy(b"")
             if resident_bank_policy is not None:
                 return _hash_search_policy(
-                    json.dumps(resident_bank_policy, sort_keys=True).encode()
+                    json.dumps(resident_bank_policy, sort_keys=True).encode(), banks
                 )
             return _hash_search_policy(
-                f"helion.benchmark_input_banks.v1:{banks}".encode()
+                f"helion.benchmark_input_banks.v1:{banks}".encode(), banks
             )
 
     if policy is None:
@@ -299,7 +323,7 @@ def _search_and_timing_policy_hash(
             sort_keys=True,
             separators=(",", ":"),
         ).encode("utf-8")
-    return _hash_search_policy(encoded)
+    return _hash_search_policy(encoded, banks)
 
 
 def get_helion_cache_dir() -> Path:

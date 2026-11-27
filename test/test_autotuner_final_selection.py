@@ -36,8 +36,10 @@ from helion.autotuner.base_search import _WorkerFinalSelectionMeasurer
 from helion.autotuner.benchmark_job import BenchmarkJob
 from helion.autotuner.benchmark_prelude import BenchmarkPrelude
 from helion.autotuner.benchmark_prelude import PreludeStep
+from helion.autotuner.benchmark_provider import BenchmarkResult
 from helion.autotuner.benchmark_provider import IsolatedBenchmarkFailure
 from helion.autotuner.benchmark_provider import LocalBenchmarkProvider
+from helion.autotuner.benchmark_provider import _unset_fn
 from helion.autotuner.benchmark_worker import BenchmarkSubprocessError
 from helion.autotuner.benchmark_worker import BenchmarkTimeout
 from helion.autotuner.benchmark_worker import BenchmarkWorkerDied
@@ -54,6 +56,8 @@ from helion.autotuner.logger import AutotuningLogger
 from helion.autotuner.metrics import AutotuneMetrics
 from helion.autotuner.search_space_logger import canonical_config_id
 import helion.language as hl
+from helion.runtime.config_cache import ConfigCache
+from helion.runtime.config_cache import ConfigSet
 from helion.runtime.settings import Settings
 
 if TYPE_CHECKING:
@@ -162,7 +166,9 @@ def _make_search(
     # no family knobs: the family quota admits nothing (``_family_search``
     # names some)
     search.config_spec = SimpleNamespace(  # type: ignore[misc]
-        final_selection_family_keys=(), backend=_BACKEND_WITHOUT_REGIME
+        final_selection_family_keys=(),
+        backend=_BACKEND_WITHOUT_REGIME,
+        compiler_default_config=None,
     )
     search._autotune_metrics = AutotuneMetrics()
     search._autotune_budget_start = (
@@ -198,6 +204,13 @@ def _rows(search: PopulationBasedSearch) -> list[dict[str, object]]:
     metrics = search._autotune_metrics.final_selection
     assert metrics is not None
     return cast("list[dict[str, object]]", metrics["rows"])
+
+
+def _shortlist_rows(search: PopulationBasedSearch) -> list[dict[str, object]]:
+    """The finalists the selection was handed, survivors of the screen or not."""
+    metrics = search._autotune_metrics.final_selection
+    assert metrics is not None
+    return cast("list[dict[str, object]]", metrics["shortlist_rows"])
 
 
 def _member(block: int, perf: float) -> PopulationMember:
@@ -299,7 +312,9 @@ def _family_search(
         members, policy=policy, pinned=pinned, budget_seconds=budget_seconds
     )
     search.config_spec = SimpleNamespace(  # type: ignore[misc]
-        final_selection_family_keys=keys, backend=_BACKEND_WITHOUT_REGIME
+        final_selection_family_keys=keys,
+        backend=_BACKEND_WITHOUT_REGIME,
+        compiler_default_config=None,
     )
     return search
 
@@ -562,6 +577,364 @@ def test_final_selection_retains_raw_missing_readings(
     assert all(row["perf_ms"] is None for row in stale_rows)
 
 
+# The shortlist of ``_defending_default_selection``: (screen, rounds) readings
+# in ms by the block size that names a member. The promoted default's kernel
+# screens fourth and is the fastest in the rounds; blocks 112, 128 and 18 are
+# other configs of that kernel, with the kernel's readings.
+_DEFAULT_BLOCK = 16
+_ALIAS_BLOCK = 112
+_THIRD_BLOCK = 128
+_REWRITTEN_BLOCK = 18
+_DEFAULT_KERNEL_BLOCKS = (_DEFAULT_BLOCK, _ALIAS_BLOCK, _THIRD_BLOCK, _REWRITTEN_BLOCK)
+_DEFENDING_READINGS = {
+    **dict.fromkeys(_DEFAULT_KERNEL_BLOCKS, (1.04, 0.98)),
+    32: (1.02, 1.02),  # the other pinned seed
+    48: (1.00, 1.00),
+    64: (1.01, 1.01),
+    80: (1.08, 1.08),
+    96: (1.09, 1.09),
+}
+_DEFENDING_POLICY = FinalSelectionConfig(
+    top_k=2,
+    rounds=2,
+    thermal_warmup_ms=0,
+    screen_warmup_ms=50,
+    screen_rep_ms=200,
+    tiebreak_rounds=0,
+)
+# The routes of ``_defending_default_selection`` on which the search never
+# compiles the default's config, and all of its routes.
+_UNCOMPILED_ROUTES = ("filtered", "rewritten", "skipped", "uncompilable")
+_DEFENDING_ROUTES = (
+    "earlier",
+    "repaired",
+    "later",
+    "best",
+    "ended",
+    "unread",
+    "retimed",
+    "unpinned",
+    "third",
+    "ahead",
+    "behind",
+    "dropped",
+    "members",
+    "unrepaired",
+    "unshortlisted",
+    *_UNCOMPILED_ROUTES,
+)
+
+
+def _benchmark_without_compiling_default(
+    search: PopulationBasedSearch, members: list[PopulationMember], route: str
+) -> None:
+    """Benchmark ``members``, which hold the function and the reading a
+    timing of their config gives, as a search does it
+    (``benchmark_population``, with its filter), without ever compiling the
+    default's config, by ``route`` (one of ``_UNCOMPILED_ROUTES``): the
+    user's ``autotune_config_filter`` drops it or rewrites it into block 18,
+    which has the default's function, or the provider answers that the
+    budget skipped it or that its compile failed."""
+    timed = {
+        member.config.block_sizes[0]: (member.fn, member.perf) for member in members
+    }
+    timed[_REWRITTEN_BLOCK] = timed[_DEFAULT_BLOCK]
+    for member in members:
+        member.perfs = []
+
+    def benchmark(
+        configs: list[helion.Config], **kwargs: object
+    ) -> list[BenchmarkResult]:
+        results = []
+        for config in configs:
+            block = config.block_sizes[0]
+            if block == _DEFAULT_BLOCK:
+                status: Literal["skipped", "error"] = (
+                    "skipped" if route == "skipped" else "error"
+                )
+                results.append(
+                    BenchmarkResult(config, _unset_fn, float("inf"), status, None)
+                )
+            else:
+                results.append(BenchmarkResult(config, *timed[block], "ok", 1.0))
+        return results
+
+    def config_filter(config: helion.Config) -> helion.Config | None:
+        if config.block_sizes[0] != _DEFAULT_BLOCK:
+            return config
+        if route == "rewritten":
+            return helion.Config(block_sizes=[_REWRITTEN_BLOCK])
+        return None
+
+    search.benchmark_provider.benchmark = benchmark
+    search.benchmark_provider.take_effective_source_repairs = dict
+    search.config_gen = SimpleNamespace(flatten=lambda config: (config.block_sizes[0],))
+    search._search_space_tracker = None
+    if route in ("filtered", "rewritten"):
+        search.settings.autotune_config_filter = config_filter
+    search.benchmark_population(members)
+
+
+def _defending_default_selection(
+    route: str,
+    *,
+    collapse: bool,
+    defends: bool = True,
+    collapses_at_selection: bool | None = None,
+    fails: Literal["screen", "round"] | None = None,
+    screens: dict[int, float] | None = None,
+) -> tuple[int, float, list[int], PopulationBasedSearch]:
+    """The final selection of a search whose promoted default (block 16)
+    generates the code of another config (block 112, 128 or 18), by
+    ``route``:
+
+    - ``"earlier"``: the other config was timed first and holds the kernel
+      (a user seed is timed ahead of the compiler seeds), so the default is
+      a source alias;
+    - ``"repaired"``: the default timed out, and the other config, timed
+      later with its code, repaired it;
+    - ``"later"``: the default holds the kernel and the other config, a
+      later pinned seed, repeats it;
+    - ``"best"``: the default holds the kernel and the search ended on the
+      other config of it;
+    - ``"ended"``: as ``"earlier"``, and the search ended on the default,
+      the alias;
+    - ``"unread"``: as ``"earlier"``, in a search that then moves to the
+      trace timer (``_read_on_settled_timer``). The trace reads the
+      default's kernel in neither pass, so both of its configs leave the
+      search, and a path comes back to the default's own config, which is
+      timed;
+    - ``"retimed"``: as ``"unread"``, but the path comes back to the
+      kernel's code under a new config (block 128), which is timed, and
+      never to the default's;
+    - ``"unpinned"``: as ``"earlier"``, in a search that pins no seed
+      (differential evolution from a random population). The other config
+      is cut from the history on its first reading and replaced in the
+      population, the default stays a member, and a comparison re-times
+      the kernel to a reading that shortlists it;
+    - ``"third"``: as ``"unpinned"``, but the default is replaced as well,
+      and a later candidate that repeats the kernel's code (block 128)
+      stays a member;
+    - ``"ahead"``, ``"behind"``: as ``"unpinned"``, and such a later
+      candidate is a member as well, ahead of the default in the population
+      or behind it;
+    - ``"dropped"``: in a search that pins no seed the default timed out
+      and its member was replaced, so no member is left to repair when a
+      later candidate (block 128) times its code;
+    - ``"members"``: as ``"earlier"``, and the search ends with both configs
+      in its population (an initial population keeps its aliases, as do
+      the populations of the differential-evolution and LLM-guided
+      searches);
+    - ``"unrepaired"``: the default timed out and no config with its code
+      was timed, so the search has no reading of its kernel;
+    - ``"unshortlisted"``: as ``"unpinned"``, without the comparison: the
+      kernel keeps its first reading, the slowest of the search, and a
+      search without pins does not shortlist it;
+    - ``"filtered"``, ``"skipped"``, ``"uncompilable"``: as ``"earlier"``,
+      but the search never compiles the default's config: the user's
+      ``autotune_config_filter`` drops it, the budget runs out before it,
+      or its compile fails;
+    - ``"rewritten"``: the user's filter rewrites the default's config into
+      another one with its code (block 18), which the search times in its
+      place.
+
+    The members are settled and re-timed as a search does it
+    (``_settle_benchmarked_members``, ``_apply_effective_source_repairs``,
+    ``_read_on_settled_timer``, ``_rebenchmark_kernels``; on the routes
+    without a compiled default, ``benchmark_population`` and the search's
+    filter) on a backend that reports the generated source of a compiled
+    function and drops source aliases where ``collapse`` (from the final
+    selection on: where ``collapses_at_selection``, if given), and the
+    selection is screened: the two fastest, the best pinned seed and the
+    search's best go on to the rounds, which the default's kernel reaches
+    only by defending or as that best. With ``fails`` the kernel's finalist
+    fails a window of the selection: its ``"screen"`` window, or its second
+    ``"round"``. ``screens`` replaces the screen reading of a block (the
+    configs of the default's kernel otherwise screen alike).
+    ``search.kernel.compile_config`` stands for a render in
+    the autotuning process. Returns the block of the selected config, its
+    reading, the blocks that ran the rounds in their order, and the
+    search."""
+    policy = _DEFENDING_POLICY
+    sources: dict[object, str] = {}
+
+    def member(block: int, perf: float) -> PopulationMember:
+        # A compiled function has a generated source, and the configs of
+        # the default's kernel generate one.
+        made = _member(block, perf)
+        code = _DEFAULT_BLOCK if block in _DEFAULT_KERNEL_BLOCKS else block
+        sources[made.fn] = f"source of block {code}"
+        return made
+
+    default = member(_DEFAULT_BLOCK, 2.0)
+    other = member(_ALIAS_BLOCK, 2.0)
+    seed = member(32, 1.9)
+    rest = [member(48, 1.8), member(64, 1.7), member(80, 1.6)]
+    best = member(96, 1.5)
+    order = [default, seed, *rest, best]
+    pinned = [default, seed]
+    without_pins = ("unpinned", "third", "ahead", "behind", "unshortlisted")
+    unpinned = route in (*without_pins, "dropped")
+    on_trace = route in ("unread", "retimed")
+    if route in ("earlier", "ended", "members", "unread", "retimed", *without_pins):
+        default.fn, default.status = other.fn, "deduplicated"
+        order.insert(0, other)
+        pinned.insert(0, other)
+        if route == "ended":
+            default.perfs, other.perfs = [1.4], [1.4]
+            best = default
+    elif route == "repaired":
+        default.perfs, default.status = [float("inf")], "timeout"
+        order.insert(1, other)
+        pinned.insert(1, other)
+    elif route == "later":
+        other.fn, other.status = default.fn, "deduplicated"
+        order.insert(1, other)
+        pinned.insert(1, other)
+    elif route == "best":
+        other.fn, other.status, other.perfs = default.fn, "deduplicated", [1.4]
+        order.append(other)
+        best = other
+    elif route in ("dropped", "unrepaired"):
+        default.perfs, default.status = [float("inf")], "timeout"
+    elif route != "rewritten":
+        assert route in _UNCOMPILED_ROUTES, route
+        order.insert(0, other)
+        pinned.insert(0, other)
+    if unpinned:
+        pinned.clear()
+
+    search = _make_search([best], policy=policy)
+    search._benchmarked_members = ConfigCache()
+    search._pinned_finalist_members = ConfigCache()
+    search._pinned_finalist_configs = ConfigSet()
+    search._kernels = {}
+    search._compiler_seed_members = []
+    search._terminal_refinement_members = None
+    collapsing = [collapse]
+    search.config_spec.backend = SimpleNamespace(
+        default_final_selection_regime=lambda: None,
+        collapses_generated_source_aliases=lambda config_spec: collapsing[0],
+        generated_source_hash=sources.get,
+        autotune_config_is_viable=lambda config_spec, config: True,
+    )
+    search.benchmark_provider.settles_source_aliases = lambda: True
+    # what a render of the default's config in this process would return
+    search.kernel.compile_config = Mock(return_value=default.fn)
+    search.pin_finalist_configs([member.config for member in pinned])
+    if defends:
+        # what ``_prepare`` resolves on a backend that asks
+        search._defending_default = default.config
+
+    windows: dict[int, int] = {}
+
+    def model(member: PopulationMember, window_number: int) -> object:
+        # a finalist's first window is its screen window, the next ones
+        # are its rounds
+        block = member.config.block_sizes[0]
+        screen, steady = _DEFENDING_READINGS[block]
+        window = windows[block] = windows.get(block, -1) + 1
+        failing = {"screen": 0, "round": 2}.get(fails or "")
+        if block in _DEFAULT_KERNEL_BLOCKS and window == failing:
+            return IsolatedBenchmarkFailure("error")
+        return (screens or {}).get(block, screen) if window == 0 else steady
+
+    def rebenchmark(members: list[PopulationMember], **kwargs: object) -> None:
+        # The readings of a re-timing. On the trace, which reads 4 us below
+        # the events and never reads the default's kernel. Otherwise that
+        # kernel reads 1.55, below the first window of the config that
+        # holds it, and the others read what they read before.
+        for member in members:
+            if member.fn is not other.fn:
+                member.perfs.append(member.perf - 0.004 * on_trace)
+            elif not on_trace:
+                member.perfs.append(1.55)
+        search._refresh_benchmarked_members_after_rebenchmark(members)
+
+    def repair(failed: PopulationMember, by: PopulationMember) -> None:
+        # what the provider reports once ``by`` has timed the code of
+        # ``failed``, applied to the members the search still has
+        repairs: ConfigCache[BenchmarkResult] = ConfigCache()
+        repairs[failed.config] = BenchmarkResult(
+            config=failed.config,
+            fn=by.fn,
+            perf=by.perf,
+            status="deduplicated",
+            compile_time=None,
+        )
+        search._apply_effective_source_repairs(repairs, [by])
+
+    measurer = _FakeMeasurer(model)
+    # the history holds every config, or the best five of a search without pins
+    history = "5" if unpinned else "12"
+    with (
+        patch.dict(os.environ, {"HELION_AUTOTUNE_FINAL_REBENCHMARK_TOP_K": history}),
+        patch.object(search, "_final_selection_measurer", new=measurer),
+        patch.object(search, "rebenchmark", side_effect=rebenchmark),
+    ):
+        search.population = list(order)
+        if route in _UNCOMPILED_ROUTES:
+            _benchmark_without_compiling_default(search, order, route)
+        else:
+            search._settle_benchmarked_members(order, order)
+        # later generations replaced the initial population
+        population = [best, rest[-1]]
+        if route == "repaired":
+            repair(default, other)
+        elif on_trace:
+            # two passes on the trace, neither of which reads the kernel
+            assert search._read_on_settled_timer(order)
+            assert other not in order
+            assert default not in order
+            # a path comes back to the kernel's code, under the default's
+            # config or under a new one: a candidate of its own
+            again = member(_DEFAULT_BLOCK if route == "unread" else _THIRD_BLOCK, 1.95)
+            search._settle_benchmarked_members([again], [again])
+        elif route == "dropped":
+            # the default's child replaced it, and a later candidate times
+            # its code to the second-best reading of the history's five
+            search.population = [best, *rest]
+            later = member(_THIRD_BLOCK, 1.55)
+            search._settle_benchmarked_members([later], [later])
+            repair(default, later)
+            population = [best, later, rest[0], rest[1]]
+        elif unpinned:
+            # the first window of the config that holds the kernel read
+            # the slowest of seven: no entry in a history of five
+            assert other.config not in search._benchmarked_members
+            if route != "unshortlisted":
+                # the default is compared with its child
+                search._rebenchmark_kernels([default, rest[0]])
+            population = [best, default, rest[0], rest[1]]
+            if route in ("third", "ahead", "behind"):
+                third = member(_THIRD_BLOCK, other.perf)
+                third.fn, third.status = other.fn, "deduplicated"
+                search._settle_benchmarked_members([third], [third])
+                if route == "third":
+                    population[1] = third
+                else:
+                    population.insert(1 if route == "ahead" else 2, third)
+        elif route == "members":
+            population = [best, other, default, rest[-1]]
+        elif route == "unrepaired":
+            population = [best, default, rest[-1]]
+        search.population = population
+        if collapses_at_selection is not None:
+            collapsing[0] = collapses_at_selection
+        selected = search.final_rebenchmark_best(best)
+    rounds = [
+        window[1].config.block_sizes[0]
+        for window in measurer.windows
+        if window[2:] == (policy.warmup_ms, policy.rep_ms)
+    ]
+    return (
+        selected.config.block_sizes[0],
+        selected.perf,
+        list(dict.fromkeys(rounds)),
+        search,
+    )
+
+
 @pytest.mark.cpu_only
 class TestFinalSelection(TestCase):
     def test_median_of_rounds_ignores_a_bimodal_flip(self) -> None:
@@ -634,6 +1007,710 @@ class TestFinalSelection(TestCase):
         behind = record(BenchmarkPrelude((step, step), ()))
         self.assertEqual(behind["prelude_steps"], 2)
         self.assertEqual(behind.keys() - {"prelude_steps"}, alone.keys())
+
+    def test_bank_cycle_ties_on_the_timer_grid_break_by_the_mean_of_rounds(
+        self,
+    ) -> None:
+        # Windows of one captured cycle read on the event timer's grid: both
+        # finalists' medians are the same step, and the first of them took
+        # the next step in a round.
+        policy = FinalSelectionConfig(
+            top_k=2,
+            rounds=4,
+            thermal_warmup_ms=0,
+            screen_rep_ms=0,
+            tiebreak_rounds=0,
+        )
+        gridded = ([2.0, 2.0, 3.0, 2.0], [2.0, 2.0, 2.0, 2.0])
+        level = ([2.0, 2.0, 2.0, 2.0], [2.0, 2.0, 2.0, 2.0])
+        # (input banks, rounds, pinned finalists, the pick). Every compiler
+        # seed is pinned, so the tie-break has to hold among pinned
+        # finalists and against one: with rotating banks the lower mean wins
+        # whichever of the two is pinned, and a pinned seed still wins a tie
+        # the mean cannot break. Any other regime ranks by the median
+        # alone: the first of the tied finalists, or the pinned one.
+        for banks, rounds, pinned, winner in (
+            (3, gridded, (), 1),
+            (3, gridded, (0, 1), 1),
+            (3, gridded, (0,), 1),
+            (3, gridded, (1,), 1),
+            (3, level, (1,), 1),
+            (3, level, (), 0),
+            (1, gridded, (), 0),
+            (1, gridded, (0, 1), 0),
+            (1, gridded, (1,), 1),
+        ):
+            members = [_member(32, 1.0), _member(64, 1.5)]
+            readings = {
+                id(member): values
+                for member, values in zip(members, rounds, strict=True)
+            }
+            taken: dict[int, int] = {}
+
+            def model(member: PopulationMember, window_number: int) -> float:
+                index = taken.get(id(member), 0)  # noqa: B023
+                taken[id(member)] = index + 1  # noqa: B023
+                return readings[id(member)][index]  # noqa: B023
+
+            search = _make_search(members, policy=policy)
+            search._input_bank_count = banks
+            measurer = _FakeMeasurer(model)
+            with patch.object(search, "_final_selection_measurer", new=measurer):
+                chosen = search._run_final_selection(
+                    members,
+                    {members[index].config for index in pinned},
+                    members[0],
+                    policy,
+                )
+            self.assertIs(chosen, members[winner], (banks, rounds, pinned))
+            self.assertEqual([member.perf for member in members], [2.0, 2.0])
+
+    def test_bank_cycle_ties_break_by_the_mean_of_rounds_where_the_second_column_selects(
+        self,
+    ) -> None:
+        # Under an explicit target regime the second column selects, by the
+        # same pick as the ranking column: with rotating banks the mean of
+        # that column's rounds breaks its ties, through the fastest
+        # finalist, the backend's preference and the pinned seed. (The
+        # built-in benchmark provider refuses a second regime together with
+        # rotating banks; the pick does not rely on that.)
+        policy = FinalSelectionConfig(
+            top_k=2,
+            rounds=2,
+            thermal_warmup_ms=0,
+            screen_rep_ms=0,
+            tiebreak_rounds=4,
+        )
+        gridded = ([2.0, 2.0, 3.0, 2.0], [2.0, 2.0, 2.0, 2.0])
+        # (input banks, pinned finalists, the pick): as in the ranking
+        # column, the lower mean wins whichever finalist is pinned, and
+        # without banks the first of the tied finalists or the pinned one.
+        for banks, pinned, winner in (
+            (3, (), 1),
+            (3, (0, 1), 1),
+            (3, (0,), 1),
+            (1, (), 0),
+            (1, (0, 1), 0),
+            (1, (1,), 1),
+        ):
+            members = [_member(32, 1.0), _member(64, 1.5)]
+            readings = dict(zip(map(id, members), gridded, strict=True))
+            taken: dict[int, int] = {}
+
+            def second(member: PopulationMember, window_number: int) -> float:
+                index = taken.get(id(member), 0)  # noqa: B023
+                taken[id(member)] = index + 1  # noqa: B023
+                return readings[id(member)][index]  # noqa: B023
+
+            search = _make_search(members, policy=policy)
+            search._input_bank_count = banks
+            measurer = _FakeMeasurer(
+                lambda member, window: 1.0, second_model=second, regime_label="replay"
+            )
+            with (
+                patch.dict(os.environ),
+                patch.object(search, "_final_selection_measurer", new=measurer),
+            ):
+                _clear_regime_envs()
+                os.environ["HELION_AUTOTUNE_TARGET_REGIME"] = "off"
+                chosen = search._run_final_selection(
+                    members,
+                    {members[index].config for index in pinned},
+                    members[0],
+                    policy,
+                )
+            self.assertEqual(
+                [regime for regime, *_ in measurer.second_windows], ["off"] * 8
+            )
+            self.assertIs(chosen, members[winner], (banks, pinned))
+            self.assertEqual([member.perf for member in members], [2.0, 2.0])
+
+    def test_promoted_default_runs_the_rounds_where_the_backend_asks(self) -> None:
+        # Six finalists, so the shortlist is screened: one window each, of
+        # which the two fastest, the best pinned seed and the incumbent go on
+        # to the rounds. The kernel's promoted default is a pinned seed that
+        # screens fourth and is the fastest finalist in the rounds.
+        policy = FinalSelectionConfig(
+            top_k=2,
+            rounds=2,
+            thermal_warmup_ms=0,
+            screen_warmup_ms=50,
+            screen_rep_ms=200,
+            tiebreak_rounds=0,
+        )
+        screens = [1.04, 1.02, 1.00, 1.01, 1.08, 1.09]
+        steady = [0.98, 1.02, 1.00, 1.01, 1.08, 1.09]
+        for defends in (False, True):
+            members = [_member(16 * (i + 1), 2.0 - 0.1 * i) for i in range(6)]
+            default, seed, incumbent = members[0], members[1], members[5]
+            taken: dict[int, int] = {}
+
+            def model(member: PopulationMember, window_number: int) -> float:
+                index = members.index(member)  # noqa: B023
+                first = id(member) not in taken  # noqa: B023
+                taken[id(member)] = 1  # noqa: B023
+                return (screens if first else steady)[index]
+
+            search = _make_search(members, policy=policy, pinned=[default, seed])
+            if defends:
+                # what ``_prepare`` resolves on a backend that asks
+                search._defending_default = default.config
+            measurer = _FakeMeasurer(model)
+            with (
+                patch.dict(
+                    os.environ, {"HELION_AUTOTUNE_FINAL_REBENCHMARK_TOP_K": "12"}
+                ),
+                patch.object(search, "_final_selection_measurer", new=measurer),
+            ):
+                selected = search.final_rebenchmark_best(incumbent)
+            rounds = [
+                window[1]
+                for window in measurer.windows
+                if window[2:] == (policy.warmup_ms, policy.rep_ms)
+            ]
+            survivors = [members[2], members[3], seed, incumbent]
+            if defends:
+                # The default is timed in the same windows as the pick and
+                # wins them.
+                self.assertEqual(rounds[:5], [*survivors, default])
+                self.assertIs(selected, default)
+            else:
+                # Cut at the screen behind the other pinned seed: never
+                # compared with the config the selection returns.
+                self.assertEqual(rounds[:4], survivors)
+                self.assertNotIn(default, rounds)
+                self.assertIs(selected, members[2])
+        # The time estimate counts the defending finalist.
+        self.assertEqual(policy.finalists(12), 6)
+        self.assertEqual(policy.finalists(12, 1), 7)
+        self.assertEqual(policy.finalists(5, 1), 5)
+        self.assertGreater(
+            policy.estimated_seconds(12, 1), policy.estimated_seconds(12)
+        )
+        search = _make_search(members, policy=policy)
+        self.assertEqual(search._defending_finalists(), 0)
+        search._defending_default = default.config
+        self.assertEqual(search._defending_finalists(), 1)
+
+    def test_a_search_starts_with_its_default_resolved_and_no_source_learned(
+        self,
+    ) -> None:
+        # ``_prepare`` runs at the start of every ``autotune()`` of a search:
+        # the defending default is the one the search resolves then, and
+        # the source it knows that default's kernel by is learned from the
+        # members that run settles, not kept from an earlier one.
+        search = _make_search([_member(_DEFAULT_BLOCK, 1.0)], policy=None)
+        search._terminal_refinement_members = ConfigCache()
+        default = helion.Config(block_sizes=[_DEFAULT_BLOCK])
+        search._defending_source = "what an earlier run of this search learned"
+        with (
+            patch.object(base_search_module.BaseSearch, "_prepare"),
+            patch.object(search, "_resolve_defending_default", return_value=default),
+        ):
+            search._prepare()
+        self.assertIs(search._defending_default, default)
+        self.assertIsNone(search._defending_source)
+
+    def test_defending_default_follows_its_kernel_to_an_earlier_config(self) -> None:
+        # A backend that has its default defend also drops source aliases
+        # (CuTe does both). A config timed before the default with the same
+        # generated code holds the kernel, the default is its alias, and the
+        # final selection knows the kernel under the earlier config alone.
+        # The default's kernel still runs the rounds, under that config.
+        selected, perf, rounds, search = _defending_default_selection(
+            "earlier", collapse=True
+        )
+        self.assertEqual(rounds, [48, 64, 32, 96, _ALIAS_BLOCK])
+        self.assertEqual((selected, perf), (_ALIAS_BLOCK, 0.98))
+        # The search knows the kernel by the source the default's config
+        # generates, which the alias told it; the default is still the
+        # default.
+        self.assertEqual(search._defending_source, "source of block 16")
+        assert search._defending_default is not None
+        self.assertEqual(search._defending_default.block_sizes, [_DEFAULT_BLOCK])
+        self.assertEqual(search._defending_finalists(), 1)
+        # Without the rule the kernel is cut at the screen, behind the other
+        # pinned seed, and a slower config is returned.
+        selected, perf, rounds, _ = _defending_default_selection(
+            "earlier", collapse=True, defends=False
+        )
+        self.assertEqual(rounds, [48, 64, 32, 96])
+        self.assertEqual((selected, perf), (48, 1.00))
+        # A search that keeps its aliases (several argument sets,
+        # torch.distributed) times the default as a candidate of its own,
+        # and it defends under its own config.
+        for defends, expected in (
+            (True, [48, 64, 32, 96, _DEFAULT_BLOCK]),
+            (False, None),
+        ):
+            selected, perf, rounds, search = _defending_default_selection(
+                "earlier", collapse=False, defends=defends
+            )
+            if expected is None:
+                self.assertEqual(rounds, [48, 64, 32, 96])
+                self.assertEqual((selected, perf), (48, 1.00))
+            else:
+                self.assertEqual(rounds, expected)
+                self.assertEqual((selected, perf), (_DEFAULT_BLOCK, 0.98))
+                assert search._defending_default is not None
+                self.assertEqual(
+                    search._defending_default.block_sizes, [_DEFAULT_BLOCK]
+                )
+                # (such a search learns no source: a config is a kernel)
+                self.assertIsNone(search._defending_source)
+
+    def test_defending_default_follows_its_kernel_to_the_config_that_repaired_it(
+        self,
+    ) -> None:
+        # The default failed (a timeout) and a later config with its code
+        # was timed: the default is repaired as an alias of that config,
+        # which holds the kernel and runs the rounds for it.
+        selected, perf, rounds, search = _defending_default_selection(
+            "repaired", collapse=True
+        )
+        self.assertEqual(rounds, [48, 64, 32, 96, _ALIAS_BLOCK])
+        self.assertEqual((selected, perf), (_ALIAS_BLOCK, 0.98))
+        self.assertEqual(search._defending_source, "source of block 16")
+        selected, perf, rounds, _ = _defending_default_selection(
+            "repaired", collapse=True, defends=False
+        )
+        self.assertEqual(rounds, [48, 64, 32, 96])
+        self.assertEqual((selected, perf), (48, 1.00))
+        # Where aliases stay candidates, the repaired default is one.
+        selected, perf, rounds, _ = _defending_default_selection(
+            "repaired", collapse=False
+        )
+        self.assertEqual(rounds, [48, 64, 32, 96, _DEFAULT_BLOCK])
+        self.assertEqual((selected, perf), (_DEFAULT_BLOCK, 0.98))
+
+    def test_defending_default_that_holds_its_kernel_keeps_its_config(self) -> None:
+        # The default was timed first; a later pinned seed that repeats its
+        # code is the alias and passes its pin to the default, which defends
+        # under its own config.
+        selected, perf, rounds, search = _defending_default_selection(
+            "later", collapse=True
+        )
+        self.assertEqual(rounds, [48, 64, 32, 96, _DEFAULT_BLOCK])
+        self.assertEqual((selected, perf), (_DEFAULT_BLOCK, 0.98))
+        assert search._defending_default is not None
+        self.assertEqual(search._defending_default.block_sizes, [_DEFAULT_BLOCK])
+        selected, perf, rounds, _ = _defending_default_selection(
+            "later", collapse=True, defends=False
+        )
+        self.assertEqual(rounds, [48, 64, 32, 96])
+        self.assertEqual((selected, perf), (48, 1.00))
+
+    def test_default_kernel_runs_the_rounds_under_the_config_a_search_ended_on(
+        self,
+    ) -> None:
+        # The search's best is another config of the default's kernel. It
+        # stands for the kernel in the final selection, as the incumbent,
+        # which runs the rounds whatever it screens: the default's kernel is
+        # timed there with or without the rule, and a win returns the
+        # config the search ended on.
+        for defends in (True, False):
+            selected, perf, rounds, _ = _defending_default_selection(
+                "best", collapse=True, defends=defends
+            )
+            self.assertEqual(rounds, [48, 64, 32, _ALIAS_BLOCK])
+            self.assertEqual((selected, perf), (_ALIAS_BLOCK, 0.98))
+
+    def test_default_defends_under_its_own_config_once_the_trace_dropped_its_kernel(
+        self,
+    ) -> None:
+        # A search of a short kernel moves to the trace timer after its
+        # initial population. The config that held the default's kernel was
+        # read in neither pass and left with the default; the search then
+        # timed the default's own config, under which the kernel runs the
+        # rounds. The source the search knows the kernel by outlives the
+        # move.
+        selected, perf, rounds, search = _defending_default_selection(
+            "unread", collapse=True
+        )
+        self.assertEqual(rounds, [48, 64, 32, 96, _DEFAULT_BLOCK])
+        self.assertEqual((selected, perf), (_DEFAULT_BLOCK, 0.98))
+        self.assertEqual(search._defending_source, "source of block 16")
+        self.assertEqual(search._defending_finalists(), 1)
+        selected, perf, rounds, _ = _defending_default_selection(
+            "unread", collapse=True, defends=False
+        )
+        self.assertEqual(rounds, [48, 64, 32, 96])
+        self.assertEqual((selected, perf), (48, 1.00))
+        # Where aliases stay candidates the default's own config defends.
+        selected, perf, rounds, search = _defending_default_selection(
+            "unread", collapse=False
+        )
+        self.assertEqual(rounds, [48, 64, 32, 96, _DEFAULT_BLOCK])
+        self.assertEqual((selected, perf), (_DEFAULT_BLOCK, 0.98))
+        self.assertIsNone(search._defending_source)
+
+    def test_default_kernel_defends_under_the_config_that_timed_its_code_again(
+        self,
+    ) -> None:
+        # As above, but the search comes back to the kernel's code under a
+        # new config and never to the default's. The compiled function is a
+        # new one and the config is neither the default's nor the one that
+        # held the kernel: the generated source says it is the default's
+        # kernel, which runs the rounds under the new config.
+        selected, perf, rounds, search = _defending_default_selection(
+            "retimed", collapse=True
+        )
+        self.assertEqual(rounds, [48, 64, 32, 96, _THIRD_BLOCK])
+        self.assertEqual((selected, perf), (_THIRD_BLOCK, 0.98))
+        self.assertEqual(search._defending_source, "source of block 16")
+        selected, perf, rounds, _ = _defending_default_selection(
+            "retimed", collapse=True, defends=False
+        )
+        self.assertEqual(rounds, [48, 64, 32, 96])
+        self.assertEqual((selected, perf), (48, 1.00))
+
+    def test_default_defends_as_an_alias_once_the_holder_of_its_kernel_left(
+        self,
+    ) -> None:
+        # Differential evolution from a random population pins no seed.
+        # The config that holds the default's kernel left the history and
+        # the population, where the default, its alias, stays: the kernel
+        # is shortlisted under the default's own config and runs the rounds
+        # under it.
+        selected, perf, rounds, search = _defending_default_selection(
+            "unpinned", collapse=True
+        )
+        self.assertEqual(rounds, [48, 64, 96, _DEFAULT_BLOCK])
+        self.assertEqual((selected, perf), (_DEFAULT_BLOCK, 0.98))
+        self.assertEqual(len(search._pinned_finalist_configs), 0)
+        self.assertEqual(search._defending_finalists(), 1)
+        selected, perf, rounds, _ = _defending_default_selection(
+            "unpinned", collapse=True, defends=False
+        )
+        self.assertEqual(rounds, [48, 64, 96])
+        self.assertEqual((selected, perf), (48, 1.00))
+        selected, perf, rounds, _ = _defending_default_selection(
+            "unpinned", collapse=False
+        )
+        self.assertEqual(rounds, [48, 64, 96, _DEFAULT_BLOCK])
+        self.assertEqual((selected, perf), (_DEFAULT_BLOCK, 0.98))
+
+    def test_default_kernel_defends_under_a_config_that_only_repeats_its_code(
+        self,
+    ) -> None:
+        # In a search without pins both the default and the config that
+        # holds its kernel left, and the kernel is shortlisted under a later
+        # candidate that repeats its code: a config that is neither the
+        # default's nor one the default was ever settled against. It has
+        # the default's generated source, so the kernel runs the rounds
+        # under it.
+        selected, perf, rounds, search = _defending_default_selection(
+            "third", collapse=True
+        )
+        self.assertEqual(rounds, [48, 64, 96, _THIRD_BLOCK])
+        self.assertEqual((selected, perf), (_THIRD_BLOCK, 0.98))
+        self.assertEqual(len(search._pinned_finalist_configs), 0)
+        # Without the rule the kernel is screened under that config and cut.
+        third = canonical_config_id(helion.Config(block_sizes=[_THIRD_BLOCK]))
+        selected, perf, rounds, search = _defending_default_selection(
+            "third", collapse=True, defends=False
+        )
+        self.assertEqual(
+            [
+                (row["screen_ms"], row["survived"])
+                for row in _shortlist_rows(search)
+                if row["config_id"] == third
+            ],
+            [(1.04, False)],
+        )
+        self.assertEqual(rounds, [48, 64, 96])
+        self.assertEqual((selected, perf), (48, 1.00))
+
+    def test_default_kernel_defends_under_a_repeat_listed_ahead_of_the_default(
+        self,
+    ) -> None:
+        # A search without pins whose population holds the default and a
+        # later repeat of its code, the config that held the kernel gone
+        # from history and population. The kernel's one entry in the final
+        # selection is the first of the two in the population. Either
+        # defends: the kernel runs the rounds once, under the config it is
+        # listed under.
+        for route, block, behind in (
+            ("ahead", _THIRD_BLOCK, _DEFAULT_BLOCK),
+            ("behind", _DEFAULT_BLOCK, _THIRD_BLOCK),
+        ):
+            selected, perf, rounds, search = _defending_default_selection(
+                route, collapse=True
+            )
+            self.assertEqual(rounds, [48, 64, 96, block], route)
+            self.assertEqual((selected, perf), (block, 0.98), route)
+            self.assertEqual(len(search._pinned_finalist_configs), 0)
+            # both configs are members, and the shortlist has the kernel once
+            members = [member.config.block_sizes[0] for member in search.population]
+            self.assertLess(members.index(block), members.index(behind), route)
+            listed = [
+                canonical_config_id(helion.Config(block_sizes=[kernel_block]))
+                for kernel_block in _DEFAULT_KERNEL_BLOCKS
+            ]
+            self.assertEqual(
+                sum(row["config_id"] in listed for row in _shortlist_rows(search)),
+                1,
+                route,
+            )
+            selected, perf, rounds, _ = _defending_default_selection(
+                route, collapse=True, defends=False
+            )
+            self.assertEqual(rounds, [48, 64, 96], route)
+            self.assertEqual((selected, perf), (48, 1.00), route)
+
+    def test_default_kernel_defends_after_the_failed_default_left_the_search(
+        self,
+    ) -> None:
+        # In a search without pins the default's timing failed and its
+        # member was replaced before a later candidate timed its code, so
+        # the search has no member under the default's config to repair.
+        # The failed member's compiled function had told it the default's
+        # source, and the later candidate defends.
+        selected, perf, rounds, search = _defending_default_selection(
+            "dropped", collapse=True
+        )
+        self.assertEqual(rounds, [48, 64, 96, _THIRD_BLOCK])
+        self.assertEqual((selected, perf), (_THIRD_BLOCK, 0.98))
+        self.assertEqual(search._defending_source, "source of block 16")
+        selected, perf, rounds, _ = _defending_default_selection(
+            "dropped", collapse=True, defends=False
+        )
+        self.assertEqual(rounds, [48, 64, 96])
+        self.assertEqual((selected, perf), (48, 1.00))
+
+    def test_a_default_the_search_never_compiled_defends_nothing(self) -> None:
+        # What the rule does not cover. The search learns the default's
+        # source from a member it compiled under the default's config and
+        # renders nothing to learn it. Where the user's filter drops or
+        # rewrites that config, the budget skips it or its compile fails,
+        # the search does not know that another config (a user seed timed
+        # first; the config the filter returned) has the default's code:
+        # that kernel is screened like any finalist and cut, as it is
+        # without the rule. (``"earlier"`` is the same search with the
+        # default compiled: there the seed's config defends.)
+        for route in _UNCOMPILED_ROUTES:
+            block = _REWRITTEN_BLOCK if route == "rewritten" else _ALIAS_BLOCK
+            listed = canonical_config_id(helion.Config(block_sizes=[block]))
+            for defends in (True, False):
+                selected, perf, rounds, search = _defending_default_selection(
+                    route, collapse=True, defends=defends
+                )
+                self.assertEqual(
+                    [
+                        (row["screen_ms"], row["survived"])
+                        for row in _shortlist_rows(search)
+                        if row["config_id"] == listed
+                    ],
+                    [(1.04, False)],
+                    route,
+                )
+                self.assertEqual(rounds, [48, 64, 32, 96], route)
+                self.assertEqual((selected, perf), (48, 1.00), route)
+                self.assertIsNone(search._defending_source, route)
+                search.kernel.compile_config.assert_not_called()
+
+    def test_a_finalist_of_the_default_kernel_that_fails_is_out_like_any_other(
+        self,
+    ) -> None:
+        # The rule adds a live finalist to the rounds and changes nothing
+        # else about it. A finalist of the default's kernel that fails its
+        # screen window is not alive, and nothing defends. One that defends
+        # and fails a round is disqualified like any finalist that misses
+        # one, and the selection returns what it returns without the rule.
+        for route, block, others in (
+            ("earlier", _ALIAS_BLOCK, [48, 64, 32, 96]),
+            ("third", _THIRD_BLOCK, [48, 64, 96]),
+        ):
+            listed = canonical_config_id(helion.Config(block_sizes=[block]))
+            selected, perf, rounds, search = _defending_default_selection(
+                route, collapse=True, fails="screen"
+            )
+            self.assertEqual(
+                [
+                    (row["screen_status"], row["survived"])
+                    for row in _shortlist_rows(search)
+                    if row["config_id"] == listed
+                ],
+                [("error", False)],
+                route,
+            )
+            self.assertEqual(rounds, others, route)
+            self.assertEqual((selected, perf), (48, 1.00), route)
+            selected, perf, rounds, search = _defending_default_selection(
+                route, collapse=True, fails="round"
+            )
+            self.assertEqual(rounds, [*others, block], route)
+            self.assertEqual(
+                [
+                    (row["rounds_ms"], row["median_ms"], row["disqualified"])
+                    for row in _rows(search)
+                    if row["config_id"] == listed
+                ],
+                [([0.98], None, "error")],
+                route,
+            )
+            self.assertEqual((selected, perf), (48, 1.00), route)
+
+    def test_defending_defaults_finalist_is_flagged_in_the_table_and_its_rows(
+        self,
+    ) -> None:
+        # The finalist that runs the rounds for the default's kernel says so
+        # in its row and its line: in a search that pins no seed it is no
+        # pinned seed, incumbent or family's, and nothing else told why it
+        # ran. A search whose default does not defend has neither the flag
+        # nor the mark.
+        for route, block, defends in (
+            ("earlier", _ALIAS_BLOCK, True),
+            ("unpinned", _DEFAULT_BLOCK, True),
+            ("earlier", _ALIAS_BLOCK, False),
+        ):
+            case = (route, defends)
+            with patch.object(AutotuningLogger, "__call__", autospec=True) as said:
+                *_, rounds, search = _defending_default_selection(
+                    route, collapse=True, defends=defends
+                )
+            (table,) = [
+                str(call.args[1])
+                for call in said.call_args_list
+                if str(call.args[1]).startswith("Final selection:")
+            ]
+            header, *lines = table.splitlines()
+            defender = canonical_config_id(helion.Config(block_sizes=[block]))
+            rows = {row["config_id"]: row for row in _rows(search)}
+            shortlist = {row["config_id"]: row for row in _shortlist_rows(search)}
+            legend = "(* selected, P pinned seed, F family quota"
+            if not defends:
+                self.assertNotIn(block, rounds, case)
+                self.assertTrue(header.endswith(legend + "):"), case)
+                for row in (*rows.values(), *shortlist.values()):
+                    self.assertNotIn("defending_default", row, case)
+                continue
+            self.assertEqual(rounds[-1], block, case)
+            self.assertTrue(header.endswith(legend + ", D defending default):"), case)
+            for listed in (rows, shortlist):
+                self.assertEqual(
+                    [cid for cid, row in listed.items() if row["defending_default"]],
+                    [defender],
+                    case,
+                )
+            row = rows[defender]
+            self.assertFalse(row["incumbent"] or row["family_quota"], case)
+            self.assertEqual(row["pinned"], route == "earlier", case)
+            # the fourth column of the marks, on that finalist's line alone
+            (line,) = [line for line in lines if line.endswith(defender)]
+            self.assertEqual(line[3:6], "P D" if row["pinned"] else "  D", case)
+            self.assertEqual([other[5] for other in lines].count("D"), 1, case)
+
+    def test_defending_default_adds_at_most_one_finalist_to_the_rounds(self) -> None:
+        # The time estimate counts one defending finalist
+        # (``_defending_finalists``): the rule takes the best-ranked finalist
+        # that stands for the default's kernel. So on every route, in a
+        # search that drops source aliases and in one that keeps them, the
+        # rounds of a search with the rule are those of the same search
+        # without it plus at most one finalist, of the default's kernel.
+        #
+        # The config that finalist is listed under where aliases are
+        # dropped. None: the kernel runs the rounds anyway, as the search's
+        # best (``"best"``, ``"ended"``), it is no finalist
+        # (``"unrepaired"``, ``"unshortlisted"``), or the search never
+        # compiled the default.
+        under = {
+            "earlier": _ALIAS_BLOCK,
+            "repaired": _ALIAS_BLOCK,
+            "later": _DEFAULT_BLOCK,
+            "best": None,
+            "ended": None,
+            "unread": _DEFAULT_BLOCK,
+            "retimed": _THIRD_BLOCK,
+            "unpinned": _DEFAULT_BLOCK,
+            "third": _THIRD_BLOCK,
+            "ahead": _THIRD_BLOCK,
+            "behind": _DEFAULT_BLOCK,
+            "dropped": _THIRD_BLOCK,
+            "members": _ALIAS_BLOCK,
+            "unrepaired": None,
+            "unshortlisted": None,
+            **dict.fromkeys(_UNCOMPILED_ROUTES),
+        }
+        self.assertEqual(tuple(under), _DEFENDING_ROUTES)
+        # Where aliases are kept only the default's own config defends: on
+        # these routes such a search ends with a live finalist under it
+        # that is not its best.
+        own = {
+            "earlier",
+            "repaired",
+            "later",
+            "best",
+            "unread",
+            "unpinned",
+            "ahead",
+            "behind",
+            "members",
+        }
+        # the most finalists the plan counts for the rounds (the spec of
+        # these searches names no family knobs, so none is a family's)
+        plan = dataclasses.replace(_DEFENDING_POLICY, family_finalists=0)
+        kernel = {
+            canonical_config_id(helion.Config(block_sizes=[block]))
+            for block in _DEFAULT_KERNEL_BLOCKS
+        }
+        for route, block in under.items():
+            for collapse in (True, False):
+                case = (route, collapse)
+                *_, without, plain = _defending_default_selection(
+                    route, collapse=collapse, defends=False
+                )
+                *_, rounds, search = _defending_default_selection(
+                    route, collapse=collapse
+                )
+                if collapse:
+                    added = block
+                else:
+                    added = _DEFAULT_BLOCK if route in own else None
+                self.assertEqual(
+                    rounds, without if added is None else [*without, added], case
+                )
+                shortlist = [row["config_id"] for row in _shortlist_rows(search)]
+                self.assertLessEqual(len(rounds), plan.finalists(len(shortlist), 1))
+                if route in ("unrepaired", "unshortlisted"):
+                    # (no finalist of the default's code to defend)
+                    self.assertFalse(kernel.intersection(shortlist), case)
+                self.assertEqual(search._defending_finalists(), 1, case)
+                # a backend that does not ask: no finalist counted, no
+                # source learned
+                self.assertEqual(plain._defending_finalists(), 0, case)
+                self.assertIsNone(plain._defending_source, case)
+        # The worst case for the count, which no search path reaches: the
+        # members were settled while the search dropped aliases, and it
+        # keeps them by the time of the selection (torch.distributed
+        # initialized in between), so both configs of the default's kernel
+        # are finalists and both have its source. One defends.
+        *_, rounds, search = _defending_default_selection(
+            "members", collapse=True, collapses_at_selection=False
+        )
+        shortlist = [row["config_id"] for row in _shortlist_rows(search)]
+        self.assertEqual(len(shortlist), 7)
+        self.assertEqual(len(kernel.intersection(shortlist)), 2)
+        self.assertEqual(rounds, [48, 64, 32, 96, _ALIAS_BLOCK])
+        self.assertEqual(len(rounds), plan.finalists(len(shortlist), 1))
+        # The one that defends is the better ranked of them, not the first
+        # in the shortlist: the config that holds the kernel is listed
+        # ahead of the default's, and where its screen window reads slower
+        # than the default's, the default's own config runs the rounds.
+        *_, rounds, search = _defending_default_selection(
+            "members",
+            collapse=True,
+            collapses_at_selection=False,
+            screens={_ALIAS_BLOCK: 1.06},
+        )
+        listed = [row["config_id"] for row in _shortlist_rows(search)]
+        self.assertEqual(listed, shortlist)
+        holder, own_config = (
+            listed.index(canonical_config_id(helion.Config(block_sizes=[block])))
+            for block in (_ALIAS_BLOCK, _DEFAULT_BLOCK)
+        )
+        self.assertLess(holder, own_config)
+        self.assertEqual(rounds, [48, 64, 32, 96, _DEFAULT_BLOCK])
 
     def test_bank_budget_retry_discards_all_private_rounds(self) -> None:
         members = [_member(32, 1.0), _member(64, 2.0)]

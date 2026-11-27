@@ -842,6 +842,55 @@ def _positive_mean(samples: list[float]) -> float:
     return statistics.mean(positive) if positive else math.inf
 
 
+# A replay that reads more than this fraction of its window's median above
+# that median stalled (``central_mean``).
+_STALLED_REPLAY_MARGIN = 0.25
+
+
+def central_mean(samples: Sequence[float]) -> float:
+    """Mean of the ``samples`` that did not stall, without their lowest and
+    their highest tenth.
+
+    The statistic of timings that sit on a coarse grid, such as the event
+    times of a captured graph, which read in steps of the device timer. A
+    window's samples then take two or three neighbouring values and its
+    median is one of them: candidates that differ by less than a step tie,
+    or swap places from one window to the next. The mean reads the share of
+    samples on each value, which tracks the time between the steps.
+
+    A stalled replay is told by its size, whatever the window's length: a
+    sample more than a quarter of the window's median above that median
+    (``_STALLED_REPLAY_MARGIN``) is left out first. Dropping by rank alone
+    takes a fixed share from each end, so a window with more stalls than
+    that share (two of ten) would average the others in.
+
+    The samples that are left lose their lowest and their highest tenth,
+    rounded down, so fewer than ten are averaged whole: dropping by rank
+    would cost a short window the resolution it is read for. Between two
+    steps the median of five replays takes two values and their mean without
+    the lowest and the highest takes four, where the mean of all five takes six.
+    Such a window is not always one of a long cycle, against which a step is
+    small. A window takes as many replays as its length holds
+    (``do_bench_cuda_graph`` sizes the count from the first replay), so a
+    re-timing of a long cycle has few; so has any cycle in a window of a
+    millisecond, which a final selection can be given, and a re-timing
+    under ``HELION_CAP_REBENCHMARK_REPEAT``.
+
+    Where one timer step exceeds the margin (a reading of less than four
+    steps), the samples a step above the median count as stalled too. The
+    reading is then the mean of the samples at or below the median: it
+    reads low, at most the median, and resolves nothing above it.
+    """
+    ordered = sorted(samples)
+    median = statistics.median(ordered)
+    limit = median + _STALLED_REPLAY_MARGIN * abs(median)
+    kept = [sample for sample in ordered if sample <= limit]
+    trim = len(kept) // 10
+    if trim:
+        kept = kept[trim:-trim]
+    return statistics.fmean(kept)
+
+
 def _launches_several_kernels(fn: Callable[[], object]) -> bool:
     """Whether one call of ``fn`` (a generated host function, or a partial of
     one) launches more than one kernel, as the host function of a multi-stage
