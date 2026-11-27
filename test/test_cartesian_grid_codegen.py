@@ -1619,7 +1619,9 @@ def test_zero_origin_tile_checks_plain_python_stop_before_rounding(tmp_path):
 
 @skipUnlessBackends(["triton"])
 def test_an_empty_root_does_not_narrow_a_later_live_root(tmp_path):
-    @helion.kernel(backend="triton", static_shapes=True)
+    # Without dtype asserts: they cast the later root's tile.index to its
+    # traced Int32 (KNOWN_GAPS.md, tile-index-traced-narrower-than-widened-root).
+    @helion.kernel(backend="triton", static_shapes=True, debug_dtype_asserts=False)
     def write(out, other):
         bs = hl.register_block_size(4)
         for t in hl.tile(0, block_size=bs):

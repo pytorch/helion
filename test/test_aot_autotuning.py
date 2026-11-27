@@ -1086,6 +1086,7 @@ def test_dynamic_standalone_rejects_tensor_descriptors_before_codegen(
     AOTAutotuneCache.clear_caches()
 
 
+@skipIfRefEager("generates code, which ref mode does not build")
 @onlyBackends(["triton"])
 @pytest.mark.parametrize(
     "source_kind",
@@ -1171,6 +1172,7 @@ def test_dynamic_standalone_checks_baked_inputs(
     hold.assert_not_called()
 
 
+@skipIfRefEager("generates code, which ref mode does not build")
 @onlyBackends(["triton"])
 @pytest.mark.parametrize(
     ("value", "different"),
@@ -1234,6 +1236,7 @@ def test_standalone_constexpr_observes_the_bound_literal(
     hold.assert_not_called()
 
 
+@skipIfRefEager("generates code, which ref mode does not build")
 @onlyBackends(["triton"])
 def test_standalone_shifted_tile_inlines_its_host_grid_length(tmp_path: Path) -> None:
     @helion.kernel(backend="triton", static_shapes=False)
@@ -1267,6 +1270,7 @@ def test_standalone_shifted_tile_inlines_its_host_grid_length(tmp_path: Path) ->
         torch.testing.assert_close(out, torch.tensor([-1, 1, 2, 3, 4, 5, 6]))
 
 
+@skipIfRefEager("generates code, which ref mode does not build")
 @onlyBackends(["triton"])
 def test_standalone_loaded_range_links_its_device_overflow_check(
     tmp_path: Path,
@@ -1432,6 +1436,7 @@ def test_standalone_registers_private_selector_by_export_path(tmp_path: Path) ->
         assert sys.modules[selector.__module__].key_demo is selector
 
 
+@skipIfRefEager("generates code, which ref mode does not build")
 @onlyBackends(["triton"])
 def test_compile_saved_model_with_training_only_helion_import(tmp_path: Path) -> None:
     source = tmp_path / "source.py"

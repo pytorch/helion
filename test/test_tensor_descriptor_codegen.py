@@ -11,7 +11,9 @@ import pytest
 import torch
 
 import helion
+from helion._testing import _has_fbtriton
 from helion._testing import cpu_render_target
+from helion._testing import skipIfFbTriton
 from helion._testing import skipIfRefEagerMark
 from helion._testing import skipUnlessBackends
 from helion._testing.cute_codegen import cpu_bind
@@ -35,6 +37,12 @@ pytestmark = [
         not triton_is_available(), reason="Triton is required for source generation"
     ),
 ]
+
+# fbtriton's frontend passes store_reduce to create_descriptor_store, which
+# its interpreter's InterpreterBuilder does not take (a TypeError).
+_FBTRITON_INTERPRETED_DESCRIPTOR_STORE = (
+    "fbtriton's interpreter cannot store through a descriptor"
+)
 
 
 @pytest.fixture
@@ -144,6 +152,7 @@ def test_nested_loop_reads_a_scalar_of_the_rows_extent(
 @pytest.mark.parametrize(
     "indices", ["first", "first_copy", "last", "reused", "shifted", "paired"]
 )
+@skipIfFbTriton(_FBTRITON_INTERPRETED_DESCRIPTOR_STORE)
 def test_scalar_and_vector_indices_share_a_broadcast_axis(
     sm90_descriptors: None, tmp_path: Path, indices: str
 ) -> None:
@@ -215,13 +224,15 @@ def test_correlated_shifted_indices_do_not_form_a_descriptor(
                 host_tensor_descriptors=True,
             )
         )
+    assert "tl.load(x +" in source
+    assert "_helion_tensor_descriptor(out," in source
+    if _has_fbtriton():
+        pytest.skip(_FBTRITON_INTERPRETED_DESCRIPTOR_STORE)
     path = tmp_path / "diagonal.py"
     path.write_text(source)
     load_generated_module(path).diagonal(*args, _launcher=interpret_triton_kernel)
     rows = torch.arange(out.size(0))
     torch.testing.assert_close(out, x[plane, rows + 1, rows + 2])
-    assert "tl.load(x +" in source
-    assert "_helion_tensor_descriptor(out," in source
 
 
 def test_batched_descriptor_loop_keeps_matched_axes_unconditional(
