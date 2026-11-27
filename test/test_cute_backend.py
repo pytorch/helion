@@ -5120,6 +5120,7 @@ class TestCuteBackend(TestCase):
                         modifier_kinds=(DENSE_SCORE_KIND,),
                         is_flex=False,
                         has_list_walk=False,
+                        head_dim=64,
                         head_dim_v=None,
                         asymmetric_head_dims=False,
                         kv_group=1,

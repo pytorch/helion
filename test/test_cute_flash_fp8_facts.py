@@ -8,9 +8,12 @@ and the 2-D ``hl.dot`` pair over a scalar batch-head index (the form
 axis). It records the softmax scale from either Q or the scores, V's index
 form (``AttentionScorePlan.v_k_major``) and fp8 operands; the output plan
 reads V's storage from its strides and the 4-D ``out[bh // H, bh % H, tile_m,
-:]`` store. The fa4 pair body hosts every fact (fp8 needs its even KV tile
-count), gated by ``cute_flash.flash_operand_facts_lowered`` for the search
-surface and the codegen detector together. Every test here binds on the CPU
+:]`` store. The fa4 pair body hosts every fact; fp8 runs on it where it fits
+(an even KV tile count, a value width of at most 128, a score plan the pair
+walks) and on the single-tile family elsewhere
+(``cute_flash.flash_fp8_pipeline_family``), gated by
+``cute_flash.flash_operand_facts_lowered`` for the search surface and the
+codegen detector together. Every test here binds on the CPU
 and never compiles or launches CuTe (``test_cute_flash_fp8_body.py`` renders
 and runs the bodies).
 """
@@ -31,6 +34,8 @@ pytest.importorskip("cutlass.cute")
 import helion
 from helion._compiler.cute import cute_flash
 from helion._compiler.cute.analysis import attention_match as _attention_match
+from helion._compiler.cute.attention_plan import CAUSAL_MASK_KIND
+from helion._compiler.cute.attention_plan import SLIDING_WINDOW_MASK_KIND
 from helion._compiler.cute.autotune.flash_surface import enable_cute_flash_search
 from helion._compiler.cute.backend import CuteBackend
 from helion._compiler.device_ir import ForLoopGraphInfo
@@ -252,6 +257,55 @@ def bmm_attention_post_dot_scale(
     return out
 
 
+@helion.kernel(static_shapes=True, backend="cute", autotune_accuracy_check=False)
+def flattened_attention_from(
+    q_in: torch.Tensor,
+    k_in: torch.Tensor,
+    v_in: torch.Tensor,
+    qk_scale: float,
+    m_start: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """The flattened-rows form of ``examples/blackwell_attention.py`` with
+    the scale on the scores and a running max that starts at ``m_start``. A
+    compile-time constant (``hl.constexpr``) traces to the literal a kernel
+    spells, for the start and for the scale alike; a ``float`` scale is the
+    runtime scale."""
+    B, H, M, D = q_in.shape
+    N = k_in.shape[2]
+    D = hl.specialize(D)
+    q = q_in.reshape(-1, D)
+    k = k_in.reshape(-1, D)
+    v = v_in.reshape(-1, D)
+    MM = q.shape[0]
+    o = q.new_empty(MM, D)
+    lse = q.new_empty(MM, dtype=torch.float32)
+    qk_scale = qk_scale * 1.44269504
+    for tile_m in hl.tile(MM):
+        m_i = hl.full([tile_m], m_start, dtype=torch.float32)
+        acc = hl.zeros([tile_m, D])
+        l_i = hl.zeros([tile_m]) + 1.0
+        q_i = q[tile_m, :]
+        start_n = tile_m.begin // M * N
+        for tile_n in hl.tile(N):
+            k_j = k[tile_n + start_n, :]
+            v_j = v[tile_n + start_n, :]
+            qk = hl.dot(q_i, k_j.T, out_dtype=torch.float32) * qk_scale
+            m_ij = torch.maximum(m_i, torch.amax(qk, -1))
+            qk = qk - m_ij[:, None]
+            p = torch.exp2(qk)
+            alpha = torch.exp2(m_i - m_ij)
+            l_ij = torch.sum(p, -1)
+            acc = acc * alpha[:, None]
+            acc = hl.dot(p.to(v.dtype), v_j, acc=acc)
+            l_i = l_i * alpha + l_ij
+            m_i = m_ij
+        m_i += torch.log2(l_i)
+        acc = acc / l_i[:, None]
+        lse[tile_m] = m_i
+        o[tile_m, :] = acc
+    return o.reshape(B, H, M, D), lse.reshape(B, H, M)
+
+
 # ---------------------------------------------------------------------------
 # Helpers.
 # ---------------------------------------------------------------------------
@@ -438,7 +492,8 @@ def test_standard_example_facts_unchanged() -> None:
 
 # ---------------------------------------------------------------------------
 # The operand-facts gate: 16-bit operands in either V index form and root
-# form; fp8 on the fa4 pair body (an even KV tile count).
+# form; fp8 at a static KV tile count and a width its MMA tiles, on the
+# family the geometry picks.
 # ---------------------------------------------------------------------------
 def test_operand_facts_gate() -> None:
     lowered = cute_flash.flash_operand_facts_lowered
@@ -447,16 +502,42 @@ def test_operand_facts_gate() -> None:
     assert lowered(torch.float16, v_k_major=True)
     assert lowered(torch.bfloat16, v_k_major=True, score_rank=2)
     assert lowered(torch.float16, score_rank=2)
-    # fp8 runs on the fa4 pair body alone: the KV tile count must be known
-    # and even; the V index form does not matter (the storage decides the
-    # MMA's major mode, both are hosted).
-    assert not lowered(torch.float8_e4m3fn)
-    assert not lowered(torch.float8_e4m3fn, v_k_major=True)
-    assert not lowered(torch.float8_e4m3fn, v_k_major=True, num_kv=1)
-    assert not lowered(torch.float8_e4m3fn, v_k_major=True, num_kv=3)
-    assert lowered(torch.float8_e4m3fn, v_k_major=True, num_kv=2)
-    assert lowered(torch.float8_e4m3fn, v_k_major=False, num_kv=8, score_rank=2)
-    assert not lowered(torch.float32, num_kv=2)
+    # fp8 has one family per geometry, so the KV tile count must be known,
+    # and its QK MMA steps 32 elements, so the Q/K width must be a multiple
+    # of 32; the V index form does not matter (the storage decides the MMA's
+    # major mode, both are hosted).
+    fp8 = torch.float8_e4m3fn
+    assert not lowered(fp8)
+    assert not lowered(fp8, v_k_major=True)
+    assert not lowered(fp8, num_kv=2)
+    assert not lowered(fp8, head_dim=64)
+    assert lowered(fp8, v_k_major=True, num_kv=1, head_dim=64)
+    assert lowered(fp8, v_k_major=True, num_kv=3, head_dim=64)
+    assert lowered(fp8, v_k_major=True, num_kv=2, head_dim=128)
+    assert lowered(fp8, v_k_major=False, num_kv=8, score_rank=2, head_dim=32)
+    assert cute_flash.FLASH_FP8_MMA_K == 32
+    for width in (16, 48, 80, 112, 144):
+        # A width the 16-bit MMAs' 16-element step tiles and the fp8 MMA's
+        # does not: fp8 keeps the generic lowering at either tile parity.
+        assert lowered(torch.bfloat16, num_kv=1, head_dim=width)
+        assert not lowered(fp8, num_kv=1, head_dim=width)
+        assert not lowered(fp8, num_kv=2, head_dim=width)
+    # The fa4 pair where it fits (an even tile count for its two query
+    # tiles, a value width of at most 128 for its two accumulators), else
+    # the single-tile family.
+    family = cute_flash.flash_fp8_pipeline_family
+    assert family(2, 64) == "fa4"
+    assert family(1, 64) == "ws_overlap"
+    assert family(3, 128) == "ws_overlap"
+    assert family(2, 192) == "ws_overlap"
+    assert family(4, 256) == "ws_overlap"
+    assert family(2, 192, 128) == "fa4"
+    # A plan bound to the single-tile body (more than one mask modifier,
+    # which leaves its per-tile predicate) takes it at either parity.
+    assert family(2, 64, requires_ws_overlap=True) == "ws_overlap"
+    assert family(3, 64, requires_ws_overlap=True) == "ws_overlap"
+    assert family(2, 192, 128, requires_ws_overlap=True) == "ws_overlap"
+    assert not lowered(torch.float32, num_kv=2, head_dim=64)
     assert torch.float8_e4m3fn in cute_flash.FLASH_MATCHED_IO_DTYPES
     assert cute_flash._flash_io_dtype_str(torch.float8_e4m3fn) == "cutlass.Float8E4M3FN"
     assert cute_flash._flash_dtype_bytes("cutlass.Float8E4M3FN") == 1
@@ -527,19 +608,141 @@ def surface_kv_block(bound: BoundKernel) -> int:
     return _kv_loop_graph(bound).block_ids[0]
 
 
-def test_fp8_odd_kv_tile_count_declines() -> None:
-    """fp8 operands need the fa4 pair body (an even KV tile count): one
-    128-key tile builds no surface, while the 16-bit form of the same shape
-    (hosted by the single-tile body) keeps its surface."""
-    q, k, v = _qkv(torch.float8_e4m3fn, seq=128)
+def test_fp8_keeps_the_128_row_query_tile() -> None:
+    """The 64-row query tile's P store hands each thread two rows of 16-bit
+    elements: on the body where 16-bit operands take the tile, an explicit
+    request resolves to the 128-row tile for fp8."""
+    request: dict[str, object] = {
+        cute_flash.FLASH_PIPELINE_FAMILY_KEY: "ws_overlap",
+        cute_flash.FLASH_Q_TILE_M_KEY: 64,
+        cute_flash.FLASH_S_STAGE_KEY: 2,
+        cute_flash.FLASH_PERSISTENT_KEY: False,
+        cute_flash.FLASH_EPI_STG_KEY: True,
+    }
+
+    def q_tile_m(dtype: torch.dtype) -> int:
+        return cute_flash.resolve_flash_config(
+            64,
+            3,
+            request,
+            dtype=dtype,
+            num_bh=8,
+            standard_dense_output=True,
+            plain_row_body=True,
+        ).q_tile_m
+
+    assert q_tile_m(torch.bfloat16) == 64
+    assert q_tile_m(torch.float8_e4m3fn) == 128
+
+
+@pytest.mark.parametrize("seq", [128, 256])
+def test_fp8_width_the_mma_does_not_tile_keeps_the_generic_lowering(seq: int) -> None:
+    """A Q/K width of 48 is three steps of the 16-bit MMAs and one and a half
+    of the fp8 QK MMA: the example still matches as an attention body, and
+    the gate leaves it to the generic lowering at either tile parity."""
+    module = import_path(EXAMPLES_DIR / "fp8_attention.py")
+    kernel = Kernel(
+        module.fp8_attention_kernel.fn,
+        settings=module.fp8_attention_kernel.settings.copy(backend="cute"),
+    )
+    q, k, v = (torch.randn(1, 4, seq, 48, dtype=torch.float16) for _ in range(3))
+    q8, k8, v8 = module.preprocess_fp8_attention_inputs(q, k, v)
+    bound = _bind(kernel, (q8, k8, v8, 1, 4))
+    pattern = _pattern(bound)
+    assert pattern is not None
+    assert pattern.score_plan.head_dim == 48
+    assert _surface(bound) is None
+    assert not bound.config_spec.cute_flash_search_enabled
+
+
+@pytest.mark.parametrize("seq", [128, 384])
+def test_fp8_odd_kv_tile_count_takes_the_single_tile_family(seq: int) -> None:
+    """The fa4 pair needs an even count of 128-key tiles; at an odd count fp8
+    operands take the single-tile family, as the 16-bit form of the same
+    shape does: the surface is built and its default config resolves to that
+    family over ``[128, 128]`` tiles."""
+    q, k, v = _qkv(torch.float8_e4m3fn, seq=seq)
     v = v.transpose(1, 2).contiguous()
     bound = _bind(fp8_dot_attention_k_major, (q, k, v, 1, 4))
     assert _pattern(bound) is not None
-    assert _surface(bound) is None
-    assert not bound.config_spec.cute_flash_search_enabled
-    q, k, v = _qkv(torch.bfloat16, seq=128)
+    surface = _surface(bound)
+    assert surface is not None
+    assert surface.io_dtype is torch.float8_e4m3fn
+    assert surface.num_kv == seq // 128
+    assert bound.config_spec.cute_flash_search_enabled
+    config = bound.config_spec.default_config()
+    assert config.config["block_sizes"] == [128, 128]
+    assert config.config[cute_flash.FLASH_PIPELINE_FAMILY_KEY] == "ws_overlap"
+    q, k, v = _qkv(torch.bfloat16, seq=seq)
     v = v.transpose(1, 2).contiguous()
     assert _surface(_bind(dot_attention_k_major, (q, k, v))) is not None
+
+
+@pytest.mark.parametrize(
+    "scale",
+    [0.125, hl.constexpr(0.125)],
+    ids=["runtime_scale", "literal_scale"],
+)
+def test_fp8_sentinel_start_keeps_the_generic_lowering_on_the_single_tile_family(
+    scale: object,
+) -> None:
+    """The single-tile family takes fp8 operands from a running max that
+    starts at ``-inf``. A finite sentinel (``-1e30``) keeps the generic
+    lowering there, on the search surface and in codegen together: the fused
+    bodies start every row from ``-inf``, and a runtime scale puts the scores
+    of fp8 operands below any sentinel, where the kernel keeps its start
+    (``KNOWN_GAPS.md``, cute-flash-sentinel-start-taken-for-minus-inf). The
+    fa4 pair, which an even count takes, keeps the sentinel start it took,
+    and 16-bit operands keep it on every family."""
+
+    def bind(
+        dtype: torch.dtype,
+        seq: int,
+        m_start: float,
+        *,
+        batch: int = 1,
+        device: str = "cpu",
+    ) -> BoundKernel:
+        q, k, v = (
+            torch.empty(batch, 4, seq, 64, dtype=dtype, device=device) for _ in range(3)
+        )
+        return _bind(flattened_attention_from, (q, k, v, scale, hl.constexpr(m_start)))
+
+    def fused(bound: BoundKernel) -> bool:
+        """Whether codegen takes the fused body at the block sizes it fuses."""
+        with as_sm100():
+            code = bound.to_code(helion.Config(block_sizes=[128, 128]))
+        return "'kind': 'helion_flash'" in code
+
+    fp8 = torch.float8_e4m3fn
+    for seq in (128, 384):
+        assert _surface(bind(fp8, seq, -math.inf)) is not None
+        bound = bind(fp8, seq, -1e30)
+        assert _pattern(bound) is not None
+        assert _surface(bound) is None
+        assert not bound.config_spec.cute_flash_search_enabled
+        assert _surface(bind(torch.bfloat16, seq, -1e30)) is not None
+    # The codegen detector declines on its own: the same config fuses the
+    # ``-inf`` start and not the sentinel.
+    assert fused(bind(fp8, 128, -math.inf))
+    assert not fused(bind(fp8, 128, -1e30))
+    surface = _surface(bind(fp8, 256, -1e30))
+    assert surface is not None
+    assert surface.io_dtype is fp8
+    # An output of more than 2**31 elements on the single-tile family's
+    # geometries is handed to the generic search with its block-size bounds
+    # first, whatever the start.
+    for m_start in (-math.inf, -1e30):
+        large = bind(
+            fp8,
+            384,
+            m_start,
+            batch=32768,
+            device="meta",  # @ignore-device-lint
+        )
+        spec = large.config_spec
+        assert spec.cute_attention_generic_fallback_enabled
+        assert spec.default_config().config["block_sizes"] == [64, 64]
 
 
 def test_rows_v_2d_form_records_its_rank() -> None:
@@ -836,14 +1039,18 @@ def test_3d_post_dot_scale_form_matches_and_surfaces() -> None:
 
 
 # ---------------------------------------------------------------------------
-# The fp8 search surface: pinned to the fa4 family, every searched knob value
+# The fp8 search surface: pinned to one family (the fa4 pair where it fits,
+# else the single-tile family: an odd KV tile count, a value width above 128,
+# a plan bound to the single-tile body), every searched knob value
 # realized by a coverage config (the resolver pins the 16-bit-only knobs off,
 # so they must not be searched: a value searched both ways but always pinned
 # off fails the structural coverage design, as the role chain did).
 # ---------------------------------------------------------------------------
 def _flash_generation(
-    head_dim: int, num_kv: int, num_bh: int, dtype: torch.dtype
+    head_dim: int, num_kv: int, num_bh: int, dtype: torch.dtype, **facts: Any
 ) -> ConfigGeneration:
+    """The search over the surface of ``facts`` (the plain dense plan's when
+    none are given)."""
     spec = ConfigSpec(backend=CuteBackend())
     for block_id, target in ((1, 128), (3, 128)):
         spec.block_sizes.append(BlockSizeSpec(block_id=block_id, size_hint=target))
@@ -854,7 +1061,7 @@ def _flash_generation(
         num_bh=num_bh,
         dtype=dtype,
         block_size_targets={1: 128, 3: 128},
-        standard_dense_output=True,
+        **(facts or {"standard_dense_output": True}),
     )
     spec.compiler_seed_configs = []
     return ConfigGeneration(spec)
@@ -896,3 +1103,92 @@ def test_fp8_surface_coverage_design_is_complete(
         max(config[cute_flash.FLASH_KV_STAGE_KEY] for config in bf16_configs)
         < fp8_max_kv_stage
     )
+
+
+@pytest.mark.parametrize(
+    ("head_dim", "num_kv", "num_bh"),
+    [(64, 1, 192), (64, 3, 4), (128, 5, 32), (192, 2, 4)],
+    ids=["d64_one_tile", "d64_three_tiles", "d128_five_tiles", "d192_two_tiles"],
+)
+def test_fp8_single_tile_surface_coverage_design_is_complete(
+    head_dim: int, num_kv: int, num_bh: int
+) -> None:
+    """At an odd KV tile count, or a width above the pair's (head dim 192,
+    where pinning fa4 left the surface without a legal family), the fp8
+    surface is the single-tile family's: its coverage design is complete and
+    it searches no pinned rescale threshold and no role chain, as the pair's
+    surface does not."""
+    generation = _flash_generation(head_dim, num_kv, num_bh, torch.float8_e4m3fn)
+    configs = generation.extension.deterministic_population_configs()
+    assert configs
+    assert generation.extension.flash_structural_coverage_uncovered_interactions() == []
+    assert {config[cute_flash.FLASH_PIPELINE_FAMILY_KEY] for config in configs} == {
+        "ws_overlap"
+    }
+    assert all(not config[cute_flash.FLASH_ROLE_CHAIN_KEY] for config in configs)
+    assert all(
+        config[cute_flash.FLASH_RESCALE_THRESHOLD_KEY] == 0.0 for config in configs
+    )
+
+
+def _two_mask_facts(num_kv: int) -> dict[str, Any]:
+    """The surface facts of a plan with two composed masks (the causal mask
+    ahead of a sliding window, each its own ``torch.where``) at ``num_kv``
+    tiles, as the detector builds them. The range helpers express one mask
+    modifier as an interval of KV tiles per query tile; a plan with two is
+    bound to the single-tile body's per-tile predicate whatever the masks
+    compose to (``AttentionScorePlan.has_contiguous_kv_interval`` counts the
+    mask modifiers)."""
+    return {
+        "is_causal": True,
+        "has_kv_tile_pruning": True,
+        "requires_ws_overlap": True,
+        "plain_row_body": False,
+        "has_score_modifiers": True,
+        "score_modifier_kinds": (CAUSAL_MASK_KIND, SLIDING_WINDOW_MASK_KIND),
+        "tmem_rowmax_compatible": False,
+        # The detector's ``q_seq % 256 == 0``.
+        "causal_resident_compatible": num_kv % 2 == 0,
+    }
+
+
+@pytest.mark.parametrize("num_kv", [2, 3], ids=["even", "odd"])
+def test_fp8_plan_bound_to_the_single_tile_body_takes_it(num_kv: int) -> None:
+    """A plan with two mask modifiers runs on the single-tile body's per-tile
+    predicate alone (``AttentionScorePlan.requires_ws_overlap``). The fp8
+    family follows the plan at an even tile count as well, where the pinned
+    pair left the surface without a legal family
+    (``flash_autotune_fragments`` raised ``InvalidConfig``) and the resolver
+    handed the plan to the pair whatever the config asked for: the surface
+    is the single-tile family's, as the 16-bit surface of the same plan is,
+    and the resolver keeps a request for the pair on it.
+
+    Only a CPU bind reaches this today: the masks match in the 3-D ``bmm``
+    form alone, which does not trace with fp8 operands on a device
+    (``torch.bmm`` refuses their ``out_dtype``), and the 2-D ``hl.dot`` form
+    fp8 kernels are written in matches no mask.
+    """
+    fp8 = torch.float8_e4m3fn
+    for dtype in (fp8, torch.bfloat16):
+        generation = _flash_generation(64, num_kv, 4, dtype, **_two_mask_facts(num_kv))
+        configs = generation.extension.deterministic_population_configs()
+        assert configs
+        assert {config[cute_flash.FLASH_PIPELINE_FAMILY_KEY] for config in configs} == {
+            "ws_overlap"
+        }
+        assert (
+            generation.extension.flash_structural_coverage_uncovered_interactions()
+            == []
+        )
+    for request in (None, "fa4", "ws_overlap"):
+        resolved = cute_flash.resolve_flash_config(
+            64,
+            num_kv,
+            None
+            if request is None
+            else {cute_flash.FLASH_PIPELINE_FAMILY_KEY: request},
+            dtype=fp8,
+            num_bh=4,
+            **_two_mask_facts(num_kv),
+        )
+        assert resolved.topology == "ws_overlap", request
