@@ -155,6 +155,33 @@ def test_normal_serialization_keeps_tensor_and_explicit_typed_storage(
     assert restored.untyped_storage()._cdata == storage._untyped_storage._cdata
 
 
+def test_mixed_dtype_retry_keeps_explicit_typed_storage(tmp_path: Path) -> None:
+    # The retry writes tensors as untyped bytes; a typed storage written under
+    # its own dtype beside them is what ``torch.save`` refuses.
+    data = torch.arange(8, dtype=torch.float32)
+    other = torch.arange(4, dtype=torch.float64)
+    byte_view = data.view(torch.int8)
+    path = tmp_path / "args.pt"
+    save_tensor_tree(
+        (data, byte_view, data._typed_storage(), other, other._typed_storage()), path
+    )
+    restored, restored_bytes, storage, restored_other, other_storage = torch.load(
+        path, weights_only=False
+    )
+    torch.testing.assert_close(restored, data)
+    torch.testing.assert_close(restored_bytes, byte_view)
+    torch.testing.assert_close(restored_other, other)
+    assert storage.dtype == torch.float32 and storage.tolist() == data.tolist()
+    assert other_storage.dtype == torch.float64
+    assert other_storage.tolist() == other.tolist()
+    shared = restored.untyped_storage()._cdata
+    assert restored_bytes.untyped_storage()._cdata == shared
+    assert storage._untyped_storage._cdata == shared
+    assert (
+        restored_other.untyped_storage()._cdata == other_storage._untyped_storage._cdata
+    )
+
+
 def test_unrelated_serialization_failure_is_not_retried(tmp_path: Path) -> None:
     with patch("torch.save", side_effect=RuntimeError("disk full")) as save:
         with pytest.raises(RuntimeError, match="disk full"):
