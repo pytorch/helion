@@ -745,9 +745,11 @@ def test_online_softmax_chain_ignores_loop_invariant_inputs() -> None:
     score_node = centered.args[0]
     assert isinstance(score_node, torch.fx.Node)
     with bound.env, bound.host_function:
-        assert _attention_match._attention_exact_online_softmax_chain(
+        carried = _attention_match._attention_exact_online_softmax_chain(
             score_node, pv_node
         )
+    # Named by their uses: the loop takes (Q, bias, m, acc, l).
+    assert carried == _attention_match.AttentionCarriedInputs(m=2, l=4, acc=3)
 
 
 # ---------------------------------------------------------------------------

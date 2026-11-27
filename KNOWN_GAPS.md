@@ -769,3 +769,63 @@ these labelled lines.
 - Pinned by: `test_grid_induction_product_uses_kernel_index_type` in
   `test/test_cute_fragment_loop_captures.py` checks computed-fragment
   index widths; it does not exercise the ordinary nested-store overflow.
+
+## cute-flash-sentinel-start-taken-for-minus-inf
+
+- Area: CuTe backend, the fused flash attention forward
+  (`helion/_compiler/cute/analysis/attention_match.py`,
+  `_attention_loop_starts_fused`), for a kernel whose running max starts
+  at a finite sentinel, the `-1e30` of `benchmarks/cute/attngym_kernels.py`
+  and of `helion._testing.cute_attention_kernels.attention_mla`.
+- What is wrong: the fused bodies start every row from `(m, l, acc) =
+  (-inf, 0, 0)`, and they are taken for a kernel that starts from a
+  sentinel `m0` at or below `-_running_max_sentinel_bound` (about -2.5e9
+  for fp32) with `acc = 0` and `l != 0`. The two agree on a row that sees
+  a score above `m0`. On a row that sees none, the kernel as written
+  keeps its running max at `m0`, so that a score below it adds nothing
+  to the start, and the fused body computes from its own start. Three
+  forms of it, each the kernel's statements run eagerly
+  (`ref_mode=helion.RefMode.EAGER`) against the fused body at
+  `block_sizes=[1, 128, 128]` on a B200:
+  - Finite scores at or below the sentinel. `_attention_from` of
+    `test/test_cute_flash_start_values.py` with its three starts passed as
+    compile-time constants, `hl.constexpr(-(2**32))`, `hl.constexpr(1.0)`
+    and `hl.constexpr(0.0)` (a plain float is a runtime scalar, whose
+    start is not fused), on bf16 operands of shape (1, 2, 256, 64) with
+    `q = 2**16`,
+    `k = -(2**16)` and `v = 1`: every score is about -5e10. Eager stores
+    0 (`m` stays at the sentinel, `p = exp2(score - m)` is 0, and
+    `acc / l` is `0 / 1`); the fused body stores 1, the softmax of equal
+    scores.
+  - The LSE of a row that sees no key.
+    `cute_row_kv_begin_mask_attention_with_lse` of
+    `test/test_cute_backend.py` with its running max started at `-1e30`,
+    on fp16 operands of shape (1, 2, 256, 64) with `kv_begin = 256` on
+    rows 128 to 255: both store an output of 0 on those rows; eager
+    stores `m + log2(l) = -1e30` and the fused body `-inf`.
+  - The output of a row that an additive bias hides.
+    `cute_biased_attention` of the same file with its running max started
+    at `-1e30`, on fp16 operands of shape (1, 2, 256, 64) with an fp16
+    bias of `-inf` on rows 128 to 255: eager stores 0 on those rows and
+    the fused body NaN. It divides by the zero row sum: the normalizer
+    that maps a zero row sum to 0 (`empty_row_normalizer` and
+    `_flash_ws_inv_sum_source` in `helion/_compiler/cute/cute_flash.py`)
+    is rendered for a per-row KV bound and a BlockMask, not for a bias.
+    At sequence 128 the small biased body takes this kernel and stores 0.
+- Since: on `main` when the entry was added. `main` at `6972d8c3b` fuses
+  every start and gives the same three results; the start check that came
+  with this entry declines the other starts and leaves the sentinel.
+- Why deferred: the fused bodies have no start but their own. Declining
+  the sentinel moves the six fused attention-gym variants and
+  `attention_mla` to the generic lowering, and the sentinel is how such a
+  kernel has to be written: where a mask hides a KV tile from a row, a
+  start of `-inf` computes `-inf - -inf`. Reproducing the sentinel means
+  an epilogue, in every body family, that combines the kernel's start
+  with the body's result (`m = max(m0, m)` and both statistics rescaled
+  by `exp2` of the differences), with the device tests of each family. A
+  proof that no score reaches the sentinel needs a bound of the operands
+  and of every score transform (fp16 operands have one, bf16 operands do
+  not), and says nothing of a row that sees no key.
+- Pinned by: `test/test_cute_flash_start_values.py`,
+  `test_a_running_max_from_minus_infinity_or_a_sentinel_is_fused[sentinel-max]`,
+  holds that the sentinel start is fused. None holds the three results.

@@ -481,10 +481,11 @@ def _match_bwd_root_graph(
         return None
     k_name, k_block = k_load
     v_name, _ = v_load
+    # The fused body accumulates dV and dK from zero.
     for acc in (dv_full, dk_full):
         if not (isinstance(acc, torch.fx.Node) and acc.target is full):
             return None
-        if acc.args[2] is not torch.float32:
+        if acc.args[2] is not torch.float32 or acc.args[1] != 0:
             return None
 
     # Loop bound arithmetic:

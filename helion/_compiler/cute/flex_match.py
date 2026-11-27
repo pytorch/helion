@@ -42,6 +42,7 @@ import torch.fx
 from torch.utils._sympy.functions import FloorDiv
 
 from ..utils import is_full_slice
+from .analysis.match_common import constant_fill
 from .analysis.match_common import host_tensor_name as _host_tensor_name
 from .analysis.match_common import is_call as _is_call
 from .analysis.match_common import is_neg_inf
@@ -2327,13 +2328,14 @@ def _assemble(
     loops = _phi_chain(ctx, root, nests)
     if loops is None:
         return None
-    final_m, final_l, final_acc = loops
+    final_m, final_l, final_acc, l_start = loops
     epilogue = _match_epilogue(
         ctx,
         root,
         final_m,
         final_l,
         final_acc,
+        l_start,
         (batch, heads, q_seq),
         head_dim_v,
         io_dtype,
@@ -2499,11 +2501,23 @@ def _phi_chain(
     ctx: _Ctx,
     root: GraphInfo,
     nests: list[tuple[_OuterLoop, _InnerLoop, _Body]],
-) -> tuple[torch.fx.Node, torch.fx.Node, torch.fx.Node] | None:
+) -> tuple[torch.fx.Node, torch.fx.Node, torch.fx.Node, float] | None:
     """Prove the (m, l, acc) state flows root inits -> nest 1 -> ``_phi`` ->
-    nest 2 -> ``_phi`` in order; return the final three ``_phi`` nodes."""
+    nest 2 -> ``_phi`` in order; return the final three ``_phi`` nodes and
+    the constant the row sum starts from.
+
+    The root inits are the ones the fused body reproduces. It starts every
+    row from ``(-inf, 0, 0)``: a running max of ``-inf`` makes the first KV
+    step wipe the row sum and the accumulator, and a row whose walks list no
+    block returns the start itself, which the epilogue turns into the fused
+    body's output of 0 and LSE of ``-inf`` only from a zero accumulator and
+    a finite row sum that is not negative; a row sum of zero takes the
+    epilogue's guard besides (``_match_epilogue``, which the start is
+    returned for).  Each init is read as a constant tile
+    (``match_common.constant_fill``)."""
     from ...language._tracing_ops import _phi
 
+    row_sum_start: float | None = None
     carried: list[object] | None = None
     final: list[torch.fx.Node] = []
     for outer, inner, body in nests:
@@ -2539,6 +2553,21 @@ def _phi_chain(
                 if _is_call(value, _phi) or _load_parts(value) is not None:
                     ctx.decline("flex: the first walk does not start from fresh state")
                     return None
+            m_start, l_start, acc_start = (
+                constant_fill(value) for value in root_values
+            )
+            if (
+                m_start != -math.inf
+                or l_start is None
+                or not 0 <= l_start < math.inf
+                or acc_start != 0
+            ):
+                ctx.decline(
+                    "flex: the first walk does not start from a running max of "
+                    "-inf, a finite row sum >= 0 and a zero accumulator"
+                )
+                return None
+            row_sum_start = l_start
         elif any(
             value is not carried_value
             for value, carried_value in zip(root_values, carried, strict=True)
@@ -2559,8 +2588,8 @@ def _phi_chain(
                 return None
             final.append(phis[0])
         carried = list(final)
-    assert len(final) == 3
-    return final[0], final[1], final[2]
+    assert len(final) == 3 and row_sum_start is not None
+    return final[0], final[1], final[2], row_sum_start
 
 
 class _Epilogue(NamedTuple):
@@ -2582,6 +2611,7 @@ def _match_epilogue(
     final_m: torch.fx.Node,
     final_l: torch.fx.Node,
     final_acc: torch.fx.Node,
+    l_start: float,
     bhm: tuple[int, int, int],
     head_dim_v: int,
     io_dtype: torch.dtype,
@@ -2590,7 +2620,39 @@ def _match_epilogue(
     """``l_safe`` guard, ``acc / l_safe[:, None]`` -> O store, the optional
     LSE store and the optional row-max store (the running max ``m`` itself,
     FlexAttention's ``max_scores``, beside the LSE). ``exp_base`` is the
-    softmax's (``"exp2"`` or ``"exp"``), whose units ``m`` is in."""
+    softmax's (``"exp2"`` or ``"exp"``), whose units ``m`` is in.
+
+    ``l_start`` is the constant the row sum starts from (``_phi_chain``). A
+    row whose walks list no block ends at its start, and an epilogue without
+    the guard divides its zero accumulator by that start: a start of 0 takes
+    the guard, without which the kernel stores ``0 / 0`` on every such row
+    where the fused body stores 0. That is the one empty row the start
+    decides.
+
+    What a kernel's statements give for a row that a visited block's mask
+    hides is the lowering's convention, not a start. The fused body computes
+    the masked softmax of the keys a row sees, and 0 for a row that sees
+    none (``_flash_ws_inv_sum_source``; FlexAttention's and FA4's result),
+    where the statements give NaN in two ways, and neither is declined:
+
+    - With the body's safe maximum (``where(m == -inf, 0, m)``, which the
+      match takes or leaves, ``_match_softmax_chain``), a block that hides
+      every key from a row that has seen none makes the row's ``alpha`` and
+      its ``p`` zero: the row sum of a row that sees no key ends at zero
+      whatever it started from, and an epilogue without the row-sum guard
+      divides ``0 / 0``.
+    - Without the safe maximum such a block computes ``-inf - -inf`` for
+      that row, which stays NaN, with the row-sum guard or without it, also
+      when a later block shows it keys (the per-row KV bound has the same
+      for a row's leading tiles, ``attention_plan.ROW_KV_BEGIN_MASK_KIND``).
+
+    A block that hides a row which has seen a key changes nothing, with the
+    safe maximum or without it: the running max stays, ``alpha`` is 1 and
+    ``p`` is 0.
+
+    Which rows a mask hides is runtime data, so the match cannot tell these
+    kernels from ones that need neither guard, and requiring both would keep
+    every kernel without them off the fused body."""
     from ...language import memory_ops
 
     l_safe: torch.fx.Node = final_l
@@ -2609,6 +2671,11 @@ def _match_epilogue(
         ):
             l_safe = user
             break
+    if l_safe is final_l and l_start == 0:
+        ctx.decline(
+            "flex: a row sum that starts at 0 needs the where(l == 0, 1, l) guard"
+        )
+        return None
     stores = [node for node in root.graph.nodes if _is_call(node, memory_ops.store)]
     for info in ctx.graphs.values():
         if info is root:
