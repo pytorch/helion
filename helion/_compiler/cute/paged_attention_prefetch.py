@@ -19,6 +19,26 @@ forms that follow from the grid:
 
 Both read only what the launch reads anyway: the served unit's bounds and
 page ids, and addresses inside the K tensors. Neither changes a result.
+
+A persistent partition launches one wave of CTAs, each of which streams
+several units, so no unit waits for an SM and neither form applies. The
+balanced partition of a grid of more units than SMs has a prefetch of its
+own instead, with its own option, whose value is a distance in CTAs:
+
+- ``range_ahead``: ``cute_mma_dag_boundary_prefetch_ahead=D`` lets the
+  spare control warp of CTA ``c`` request the first pages of the stream of
+  CTA ``c + D``, three of K and five of V, at the CTA's start. The device
+  dispatches a grid's CTAs in index order, so that CTA starts later, and
+  its loader then finds its first tiles on their way into L2. It reads the
+  page table, one page id a lane, and the plan tables the CTA's scan left
+  in shared memory; like the forms above it changes no result.
+
+``cute_mma_dag_boundary_prefetch_cold=N`` gives the sibling form a depth
+for the launches it otherwise leaves alone, those without a head start: the
+CTAs an overlapped launch of the grid would start on idle SMs then request
+the waiting units' first ``N`` K pages. Those requests are for a later
+launch over the same pages, not for the units they name
+(``cute_mma_dag.MMA_DAG_BOUNDARY_PREFETCH_COLD_KEY`` has what was measured).
 """
 
 from __future__ import annotations
@@ -28,9 +48,34 @@ from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from .paged_attention_transport import PagedAttentionTransport
+    from .paged_attention_transport import PagedTmaOperand
 
 BOUNDARY_PREFETCH_WAVE_AHEAD = "wave_ahead"
 BOUNDARY_PREFETCH_SIBLING = "sibling"
+# The distances, in CTAs, of the range-ahead prefetch
+# (``cute_mma_dag_boundary_prefetch_ahead``). 48 is the handwritten
+# kernel's constant for 148 SMs, 96 twice that; nothing derives either.
+# Measured (B200, GPU 3, the SDG eval harness, 320 requests of a 2047-key
+# window, frozen harness at two calls a sample, us per call against the
+# tuned config, 4 legs, on top of the newest-first walk with the clipped
+# page eight pages from a unit's end and a raw V ring of five tiles): 48
+# CTAs -1.11 +- 0.07 and 96 CTAs -1.45 +- 0.10, one timer step each; one
+# CTA ahead +0.29 +- 0.54 and no step; the same code with no CTA served
+# -0.50 +- 0.11 and no step, so the requests carry the gain. At 148 and
+# 296 requests the form alone (48 CTAs) read -0.47 +- 0.06 / -0.60 and
+# -0.31 +- 0.03 / -0.70 at 3 or 2 / 12 calls, at 320 requests +0.01 /
+# -0.14: there it gains only beside the walk and the ring, which is why
+# the seeds name the three together.
+BOUNDARY_PREFETCH_RANGE_AHEAD_DISTANCES: tuple[int, ...] = (48, 96)
+# Pages of the served stream a range-ahead prefetch requests, from its first
+# step: the handwritten kernel's counts, one lane of the spare warp a page.
+RANGE_AHEAD_KEY_PAGES = 3
+RANGE_AHEAD_VALUE_PAGES = 5
+# Units up to which the spare warp of a persistent CTA scans no unit's
+# length (``paged_attention_shared_memory.plan_geometry``: 19 scanning
+# warps of 32 units). The range-ahead role waits at the scan's barrier, as
+# a warp that scans cannot.
+RANGE_AHEAD_UNIT_LIMIT = 19 * 32
 # Both limits are measured on 148 SMs with 8 pages of a 17-page window,
 # back-to-back calls over two or three inputs, in us per call against none.
 #
@@ -68,10 +113,32 @@ def boundary_prefetch_form(units: int, capacity: int) -> str:
     return ""
 
 
+def range_ahead_distances(units: int, capacity: int) -> tuple[int, ...]:
+    """The distances the range-ahead prefetch has on a balanced launch of
+    ``units`` units on ``capacity`` resident CTAs, none where the grid has
+    no such role.
+
+    More units than SMs: the launch is one wave of ``capacity`` CTAs that
+    each stream several units, the grid the role was measured on, where the
+    balanced partition is seeded and the newest-first walk runs on it. The
+    spare warp scans no length (``RANGE_AHEAD_UNIT_LIMIT``). And a distance
+    names a CTA of the grid: one at which no CTA serves another would be
+    the kernel without the requests under another name.
+    """
+    if not 1 < capacity < units <= RANGE_AHEAD_UNIT_LIMIT:
+        return ()
+    return tuple(
+        distance
+        for distance in BOUNDARY_PREFETCH_RANGE_AHEAD_DISTANCES
+        if distance < capacity
+    )
+
+
 def boundary_prefetch_layout(
-    transport: PagedAttentionTransport,
+    transport: PagedAttentionTransport, operand: PagedTmaOperand | None = None
 ) -> tuple[int, int, int] | None:
-    """What one byte-range request per page needs of the K layout.
+    """What one byte-range request per page needs of an operand's layout,
+    K's unless ``operand`` is given.
 
     A request names the rows of both heads of a pair at once, so the two
     heads of a key must be adjacent 128-byte rows and the pair's packed scale
@@ -80,7 +147,7 @@ def boundary_prefetch_layout(
     the scale tensor and the number of pages they hold, or None for a layout
     whose pair is not one range.
     """
-    key = transport.key
+    key = transport.key if operand is None else operand
     if (
         transport.heads != 2
         or transport.subpages != 1

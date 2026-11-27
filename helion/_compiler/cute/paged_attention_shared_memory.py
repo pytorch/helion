@@ -64,6 +64,57 @@ MMA_DAG_VALUE_RING_KEY = "cute_mma_dag_value_ring"
 PAIRED_DEFAULT_VALUE_RING = 2
 MMA_DAG_VALUE_RING_CHOICES: tuple[int, ...] = (PAIRED_DEFAULT_VALUE_RING, 3)
 
+# ``cute_mma_dag_value_ring_tiles``: the raw V ring of a persistent CTA
+# counted in tiles, a tile being one head's page. The loader requests a
+# page's two V tiles one after the other and the V conversion takes them in
+# that order, so the ring need not hold whole pages: a ring of five tiles is
+# the default's four and one more, half a page, where a third page per head
+# (six tiles) does not fit a persistent CTA of 40 query columns beside its
+# two query stages. Tile ``2 * step + head`` of the stream takes slot
+# ``tile % tiles``. Zero, the default and the meaning of a missing key, is
+# the ring counted in pages (``cute_mma_dag_value_ring``) and renders the
+# kernel without the option. The count changes no result, only when a raw
+# tile is requested.
+#
+# Measured (B200, GPU 3, the SDG eval harness, 320 requests of a 2047-key
+# window on the balanced partition, us per call at two calls a sample
+# against the tuned config, frozen harness, 4 legs): five tiles alone
+# -0.10, on top of the newest-first walk -0.68 +- 0.09 against the walk's
+# -0.58 +- 0.08, no timer step either way; with the walk and the
+# range-ahead prefetch -1.16 +- 0.08, one step, where walk and prefetch
+# read -0.51. It gains only in that combination, which the seeds name, and
+# a search has it as one of its moves. Alone it lost up to 5 us on full
+# attention (+4.96 +- 0.68 at 320 requests of 211 pages), so it is offered
+# to kernels with a sliding window only.
+MMA_DAG_VALUE_RING_TILES_KEY = "cute_mma_dag_value_ring_tiles"
+MMA_DAG_VALUE_RING_TILES_CHOICES: tuple[int, ...] = (0, 5)
+
+
+class ValueRingTiles(NamedTuple):
+    """A raw V ring counted in tiles, where every function of this module
+    and of the device template takes the ring's depth in pages per head:
+    the paired body hands it on for ``cute_mma_dag_value_ring_tiles``."""
+
+    tiles: int
+
+
+# What names the raw V ring: its pages per head, or its tiles.
+ValueRing = int | ValueRingTiles
+
+
+def value_ring_tile_count(value_ring: ValueRing) -> int:
+    """Raw V tiles the ring stages: two per page of a depth in pages."""
+    if isinstance(value_ring, ValueRingTiles):
+        return value_ring.tiles
+    return 2 * value_ring
+
+
+def _default_value_ring(value_ring: ValueRing) -> bool:
+    return (
+        not isinstance(value_ring, ValueRingTiles)
+        and value_ring == PAIRED_DEFAULT_VALUE_RING
+    )
+
 
 class SharedArray(NamedTuple):
     """One shared-memory array of the paired body: its name there, the name
@@ -94,13 +145,14 @@ def pipeline_barriers(
     value_metadata: bool,
     query_stages: int = 0,
     prefetch_signal: bool = False,
-    value_ring: int = PAIRED_DEFAULT_VALUE_RING,
+    value_ring: ValueRing = PAIRED_DEFAULT_VALUE_RING,
     page_order: bool = False,
 ) -> tuple[tuple[str, int, int], ...]:
     """The pipeline barriers in block order, as ``(name, width, arrivals)``.
 
     One barrier per raw ring slot (four of K, two per page of the V ring's
-    depth) or per head (two), each initialized to ``arrivals``; the
+    depth, or one per tile of a ring counted in tiles) or per head (two),
+    each initialized to ``arrivals``; the
     value-metadata transport adds its four. A persistent partition adds one
     barrier per query stage for the copies' completion and one for the QK
     role's release of the stage: its loader requests the queries of every
@@ -110,12 +162,13 @@ def pipeline_barriers(
     the barrier at which every lane of the sorting warp arrives for the
     loader.
     """
-    assert value_ring >= PAIRED_DEFAULT_VALUE_RING
+    ring_tiles = value_ring_tile_count(value_ring)
+    assert ring_tiles >= 2 * PAIRED_DEFAULT_VALUE_RING
     barriers = (
         ("raw_k_ready", 4, 1),
         ("raw_k_free", 4, 4),
-        ("raw_v_ready", 2 * value_ring, 1),
-        ("raw_v_free", 2 * value_ring, 128 if value_metadata else 4),
+        ("raw_v_ready", ring_tiles, 1),
+        ("raw_v_free", ring_tiles, 128 if value_metadata else 4),
         ("key_ready", 2, 4),
         ("key_free", 2, 1),
         ("value_ready", 2, 4),
@@ -127,7 +180,7 @@ def pipeline_barriers(
     )
     assert not (value_metadata and query_stages)
     # The value-metadata actor walks the V ring at its default depth.
-    assert not value_metadata or value_ring == PAIRED_DEFAULT_VALUE_RING
+    assert not value_metadata or _default_value_ring(value_ring)
     # The control warp that prefetches is the value-metadata actor's, and
     # the spare one of a persistent partition.
     assert not (prefetch_signal and (value_metadata or query_stages))
@@ -151,7 +204,7 @@ def pipeline_barrier_plan(
     value_metadata: bool,
     query_stages: int = 0,
     prefetch_signal: bool = False,
-    value_ring: int = PAIRED_DEFAULT_VALUE_RING,
+    value_ring: ValueRing = PAIRED_DEFAULT_VALUE_RING,
     page_order: bool = False,
 ) -> tuple[dict[str, int], int, tuple[tuple[tuple[int, int], ...], ...]]:
     """Where each pipeline barrier lies and how the block is initialized.
@@ -187,14 +240,15 @@ def pipeline_shared_memory(
     units: int = 0,
     balanced: bool = False,
     prefetch_signal: bool = False,
-    value_ring: int = PAIRED_DEFAULT_VALUE_RING,
+    value_ring: ValueRing = PAIRED_DEFAULT_VALUE_RING,
     page_order: bool = False,
 ) -> tuple[SharedArray, ...]:
     """The paired body's shared memory, one entry per array in allocation
     order.
 
     Four raw K tiles of 16 KiB and two raw V tiles per page of the V ring's
-    depth (``value_ring``, two by default) with their scales, the query and
+    depth (``value_ring``, two by default; a ``ValueRingTiles`` is the ring
+    counted in tiles) with their scales, the query and
     probability panels and the per-head state and scratch rows of both
     heads, the role slot and one block for every pipeline barrier
     (``pipeline_barrier_plan``). A query map adds its barrier and the
@@ -219,11 +273,12 @@ def pipeline_shared_memory(
     panel = 2 * (query_columns * 128)
     state = 2 * (4 * query_columns)
     scanning = 32 * plan_geometry(units)[1] if units else 0
+    ring_tiles = value_ring_tile_count(value_ring)
     return (
         SharedArray("raw_k", "Int8", 1, 4 * RAW_TILE_BYTES, 1024),
-        SharedArray("raw_v", "Int8", 1, 2 * value_ring * RAW_TILE_BYTES, 1024),
+        SharedArray("raw_v", "Int8", 1, ring_tiles * RAW_TILE_BYTES, 1024),
         SharedArray("scale_k", "Uint8", 1, 4 * SCALE_TILE_BYTES, 128),
-        SharedArray("scale_v", "Uint8", 1, 2 * value_ring * SCALE_TILE_BYTES, 128),
+        SharedArray("scale_v", "Uint8", 1, ring_tiles * SCALE_TILE_BYTES, 128),
         SharedArray("shared_q_raw", "BFloat16", 2, max(query_stages, 1) * panel, 1024),
         SharedArray("probability_raw", "BFloat16", 2, panel, 1024),
         SharedArray("state_raw", "Float32", 4, state, 16),
@@ -331,7 +386,7 @@ def pipeline_shared_bytes(
 def paired_shared_memory_bytes(
     query_columns: int,
     *,
-    value_ring: int = PAIRED_DEFAULT_VALUE_RING,
+    value_ring: ValueRing = PAIRED_DEFAULT_VALUE_RING,
     value_metadata: bool = False,
     query_map: bool = False,
     query_stages: int = 0,
@@ -361,7 +416,7 @@ def paired_shared_memory_bytes(
 
 
 def value_ring_reason(
-    value_ring: int,
+    value_ring: ValueRing,
     capacity: int,
     query_columns: int,
     *,
@@ -384,15 +439,33 @@ def value_ring_reason(
     admitted here fits whatever those turn out to be. A capacity of
     zero is an unknown one (a render without a device), which admits every
     depth as it admits the schedule.
+
+    A ``ValueRingTiles`` is a ring counted in tiles
+    (``cute_mma_dag_value_ring_tiles``), which only a persistent CTA has:
+    the same replay with that many raw V tiles.
     """
-    if value_ring == PAIRED_DEFAULT_VALUE_RING:
+    if _default_value_ring(value_ring):
         return None
-    if value_ring not in MMA_DAG_VALUE_RING_CHOICES:
-        return (
-            f"a raw V ring of {value_ring!r} pages per head is not one of "
-            f"{MMA_DAG_VALUE_RING_CHOICES!r}"
-        )
     persistent = units > 0
+    if isinstance(value_ring, ValueRingTiles):
+        described = f"{value_ring.tiles} tiles"
+        if value_ring.tiles not in MMA_DAG_VALUE_RING_TILES_CHOICES[1:]:
+            return (
+                f"a raw V ring of {value_ring.tiles!r} tiles is not one of "
+                f"{MMA_DAG_VALUE_RING_TILES_CHOICES[1:]!r}"
+            )
+        if not persistent:
+            return (
+                f"a raw V ring of {described} belongs to a persistent partition: "
+                "with one unit per CTA the ring is counted in pages"
+            )
+    else:
+        described = f"{value_ring} pages per head"
+        if value_ring not in MMA_DAG_VALUE_RING_CHOICES:
+            return (
+                f"a raw V ring of {value_ring!r} pages per head is not one of "
+                f"{MMA_DAG_VALUE_RING_CHOICES!r}"
+            )
     needed = paired_shared_memory_bytes(
         query_columns,
         value_ring=value_ring,
@@ -411,7 +484,7 @@ def value_ring_reason(
             else ""
         )
         return (
-            f"a raw V ring of {value_ring} pages per head needs {needed} bytes "
+            f"a raw V ring of {described} needs {needed} bytes "
             f"of shared memory per CTA{stages} and the device grants {capacity}"
         )
     return None

@@ -120,8 +120,11 @@ _BASE_VALID_KEYS = """
     cute_mma_dag_epilogue cute_mma_dag_exchange cute_mma_dag_loads
     cute_mma_dag_lookahead cute_mma_dag_pass_warps cute_mma_dag_persistent
     cute_mma_dag_partition cute_mma_dag_partition_skew
-    cute_mma_dag_boundary_prefetch cute_mma_dag_probability_schedule
+    cute_mma_dag_boundary_prefetch cute_mma_dag_boundary_prefetch_cold
+    cute_mma_dag_boundary_prefetch_ahead
+    cute_mma_dag_probability_schedule
     cute_mma_dag_release_lead cute_mma_dag_value_ring cute_mma_dag_page_order
+    cute_mma_dag_value_ring_tiles
     cute_mma_dag_clipped_page_lead
     cute_mma_dag_register_quotas
     cute_mma_dag_early_tmem_retirement cute_mma_dag_key_clip cute_mma_dag_query_tma cute_mma_dag_sleep_waits cute_mma_dag_split cute_mma_dag_stages
@@ -302,8 +305,11 @@ _BASE_BACKEND_SPECIFIC_KEYS = """
     cute_mma_dag_epilogue cute_mma_dag_exchange cute_mma_dag_loads
     cute_mma_dag_lookahead cute_mma_dag_pass_warps cute_mma_dag_persistent
     cute_mma_dag_partition cute_mma_dag_partition_skew
-    cute_mma_dag_boundary_prefetch cute_mma_dag_probability_schedule
+    cute_mma_dag_boundary_prefetch cute_mma_dag_boundary_prefetch_cold
+    cute_mma_dag_boundary_prefetch_ahead
+    cute_mma_dag_probability_schedule
     cute_mma_dag_release_lead cute_mma_dag_value_ring cute_mma_dag_page_order
+    cute_mma_dag_value_ring_tiles
     cute_mma_dag_clipped_page_lead
     cute_mma_dag_register_quotas
     cute_mma_dag_early_tmem_retirement cute_mma_dag_key_clip cute_mma_dag_query_tma cute_mma_dag_sleep_waits cute_mma_dag_split cute_mma_dag_stages
@@ -544,8 +550,11 @@ _BASE_CUTE_ACCEPTED = """
     cute_mma_dag_epilogue cute_mma_dag_exchange cute_mma_dag_loads
     cute_mma_dag_lookahead cute_mma_dag_pass_warps cute_mma_dag_persistent
     cute_mma_dag_partition cute_mma_dag_partition_skew
-    cute_mma_dag_boundary_prefetch cute_mma_dag_probability_schedule
+    cute_mma_dag_boundary_prefetch cute_mma_dag_boundary_prefetch_cold
+    cute_mma_dag_boundary_prefetch_ahead
+    cute_mma_dag_probability_schedule
     cute_mma_dag_release_lead cute_mma_dag_value_ring cute_mma_dag_page_order
+    cute_mma_dag_value_ring_tiles
     cute_mma_dag_clipped_page_lead
     cute_mma_dag_register_quotas
     cute_mma_dag_early_tmem_retirement cute_mma_dag_key_clip cute_mma_dag_query_tma cute_mma_dag_sleep_waits cute_mma_dag_split cute_mma_dag_stages

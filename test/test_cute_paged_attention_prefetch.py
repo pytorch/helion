@@ -379,14 +379,15 @@ def test_the_role_names_only_tensors_the_capture_proof_lists_as_loaded(units, bo
             and node.id == name
             and isinstance(node.ctx, ast.Load)
         ]
-        # An assertion that the tensor was given, and the role's argument.
-        assert len(uses) == 2
+        # An assertion that the tensor was given and the role's argument,
+        # for this role and for the balanced partition's range-ahead role.
+        assert len(uses) == 4
 
 
 def test_the_device_role_reads_page_ids_in_range_and_requests_pages_in_the_pool():
     tree = ast.parse(DEVICE_HELPERS.read_text())
     role = _function(tree, "prefetch_boundary_units")
-    request = _function(tree, "_request_key_page")
+    request = _function(tree, "_request_page")
     # One global read beside the unit function's: a page id of the served
     # unit's own range, inside the page table.
     loads = [
@@ -408,7 +409,7 @@ def test_the_device_role_reads_page_ids_in_range_and_requests_pages_in_the_pool(
     assert "table_pages = cute.size(pages, mode=[1])" in ast.unparse(role)
     # A request is formed only for an id inside the page pool: the entries a
     # range does not have keep the id -1, and a table may hold anything.
-    (issue,) = _calls(role, "_request_key_page")
+    (issue,) = _calls(role, "_request_page")
     (bounded,) = [
         node
         for node in ast.walk(role)
@@ -432,8 +433,8 @@ def test_the_device_role_reads_page_ids_in_range_and_requests_pages_in_the_pool(
         assert len(uses) == 1 and any(use is uses[0] for use in issue.args)
     prefetches = _calls(request, "cp_async_bulk_prefetch")
     assert [ast.unparse(call.args[0]).split(".iterator")[0] for call in prefetches] == [
-        "key",
-        "key_scales",
+        "raw",
+        "scales",
     ]
     assert [ast.unparse(call.args[1]) for call in prefetches] == ["kept * 256", "1024"]
     assert not any(
@@ -478,14 +479,14 @@ def _key_pool(raw_page: int, scale_page: int) -> tuple[torch.Tensor, torch.Tenso
 
 
 def test_a_request_holds_the_rows_the_loader_reads_and_the_pages_scales():
-    """``_request_key_page`` on the host, its statements run over integers
+    """``_request_page`` on the host, its statements run over integers
     against K tensors on the CPU: the raw request is the byte range of the
     rows of both heads of the keys the loader's box holds, a positive key
     shift leaving out leading keys and a negative one trailing keys, and
     the scale request the page's scale words of both heads. A request
     changes no result, so no launch tells a range beside its page from the
     page's own."""
-    request = _function(ast.parse(DEVICE_HELPERS.read_text()), "_request_key_page")
+    request = _function(ast.parse(DEVICE_HELPERS.read_text()), "_request_page")
     # The helper without its decorator and annotations, the device's integer
     # types Python's, and a request recorded where the device issues it.
     request.decorator_list = []
@@ -500,7 +501,7 @@ def test_a_request_holds_the_rows_the_loader_reads_and_the_pages_scales():
         ),
     }
     exec(compile(ast.Module([request], []), str(DEVICE_HELPERS), "exec"), scope)
-    request_key_page = cast("Callable[..., None]", scope["_request_key_page"])
+    request_page = cast("Callable[..., None]", scope["_request_page"])
 
     args = partition_attention_args(units=128, rows=8)
     fixture = (cast("torch.Tensor", args[1]), cast("torch.Tensor", args[3]))
@@ -524,7 +525,7 @@ def test_a_request_holds_the_rows_the_loader_reads_and_the_pages_scales():
                 # rows, and a head's scale words are adjacent to the next's.
                 assert rows.is_contiguous() and words.transpose(0, 1).is_contiguous()
                 issued.clear()
-                request_key_page(*tensors, page, 0, shift, layout)
+                request_page(*tensors, page, 0, shift, layout)
                 assert issued == [
                     (rows.data_ptr(), rows.numel()),
                     (words.data_ptr(), words.numel()),
@@ -533,7 +534,7 @@ def test_a_request_holds_the_rows_the_loader_reads_and_the_pages_scales():
                 # first head: its ranges begin at that head's row and at its
                 # scale words.
                 issued.clear()
-                request_key_page(*tensors, page, 1, shift, layout)
+                request_page(*tensors, page, 1, shift, layout)
                 assert [address for address, _size in issued] == [
                     key[page, 0, first, 1].data_ptr(),
                     scales[page, 0, 0, 1].data_ptr(),
@@ -687,7 +688,7 @@ def test_the_wave_ahead_requests_wait_for_the_loaders_last_request():
         if "mbar_wait" in text
         else "issue"
         for text in map(ast.unparse, served.body)
-        if "pages[request" in text or "mbar_wait" in text or "_request_key_page" in text
+        if "pages[request" in text or "mbar_wait" in text or "_request_page" in text
     ]
     assert order == ["load", "wait", "issue"]
     (wait,) = _calls(role, "mbar_wait_sleep")

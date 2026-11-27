@@ -215,6 +215,19 @@ def scaled_s8_to_bf16_words(
     return result
 
 
+@cute.jit
+def _native_s8_to_bf16_words(words: cute.Tensor, paired: cutlass.Int32) -> cute.Tensor:
+    """The native arm of ``scaled_s8_to_bf16_words`` for a corrected scale
+    pair in the two low bytes of ``paired``: both bytes at most 253 after a
+    correction that is not negative, which the caller proves."""
+    result = cute.make_rmem_tensor((2 * cute.size(words),), cutlass.Int32)
+    for index in cutlass.range_constexpr(cute.size(words)):
+        word = cutlass.Int32(words[index])
+        result[2 * index] = _scaled_s2f6x2_to_bf16x2(word, paired)
+        result[2 * index + 1] = _scaled_s2f6x2_to_bf16x2(word >> 16, paired)
+    return result
+
+
 @dsl_user_op
 def _load_words4(
     pointer: cute.Pointer,
@@ -240,6 +253,43 @@ def _load_words4(
     )
 
 
+@dsl_user_op
+def _permute_scale_bytes(
+    word: cutlass.Int32, selector: int, *, loc: object = None, ip: object = None
+) -> cutlass.Int32:
+    """Bytes of one scale word in another order: result byte ``i`` is the
+    byte of ``word`` that nibble ``i`` of ``selector`` names (0 to 3).
+
+    One ``prmt.b32``. A shift written in its place is re-derived by NVPTX at
+    every use: sixteen conversions of a V tile then pay 24 more permutes.
+    """
+    assert 0 <= selector <= 0x3333 and not selector & 0xCCCC
+    return cutlass.Int32(
+        nvvm.prmt(
+            word.ir_value(loc=loc, ip=ip),
+            cutlass.Int32(selector).ir_value(loc=loc, ip=ip),
+            nvvm.PermuteMode.DEFAULT,
+            hi=cutlass.Int32(0).ir_value(loc=loc, ip=ip),
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+def _corrected_scale_word(word: cutlass.Int32, post_scale_log2: int) -> cutlass.Int32:
+    """Four scale bytes with S2F6's six fractional bits and a source
+    postscale of ``2**post_scale_log2`` added to each exponent, in one add.
+
+    The caller proves ``post_scale_log2 >= -6``, so the correction is at
+    most six and not negative. For bytes of at most 247, the native finite
+    domain, no byte carries into its neighbour. A word with a byte above
+    that may carry: its caller converts with it only what a failed scale
+    vote replaces.
+    """
+    assert -6 <= post_scale_log2 <= 0
+    return word + cutlass.Int32(0x01010101 * (6 + post_scale_log2))
+
+
 @cute.jit
 def _stage_scaled_s8_rows(
     raw: cute.Tensor,
@@ -253,6 +303,7 @@ def _stage_scaled_s8_rows(
     scale_word: cutlass.Int32,
     row_scales_safe: cutlass.Boolean,
     all_rows_safe: cutlass.Constexpr,
+    packed_tile: cutlass.Constexpr = False,
 ) -> None:
     """Stage rows using a proved warp-wide or original per-lane conversion.
 
@@ -260,7 +311,18 @@ def _stage_scaled_s8_rows(
     vote makes both outer arms uniform, as required by collective TMEM stores.
     Mixed warps retain each row's original guard; generic layouts retain each
     group's original scale check.
+
+    ``packed_tile`` (``packed_scale_tile_layout``) gives the unanimous arm
+    its exponent correction once per row: one add over the row's scale word
+    and one byte permute per group, where each group otherwise extracts its
+    byte, corrects it and pairs it. Every byte is at most 247 in that arm,
+    so the add carries nowhere and each group converts with the scale pair
+    it had.
     """
+    assert cutlass.const_expr(not packed_tile or packed_scales)
+    corrected_word = scale_word
+    if cutlass.const_expr(packed_tile and all_rows_safe):
+        corrected_word = _corrected_scale_word(scale_word, post_scale_log2)
     warp_row = row // 32 * 32
     store_groups = 1
     if cutlass.const_expr(
@@ -290,7 +352,11 @@ def _stage_scaled_s8_rows(
                     words[packet * 4 + index] = values[index]
             # Conversion branches contain no collective. Keep the TMEM store
             # outside these lane-dependent branches.
-            if cutlass.const_expr(all_rows_safe):
+            if cutlass.const_expr(packed_tile and all_rows_safe):
+                converted = _native_s8_to_bf16_words(
+                    words, _permute_scale_bytes(corrected_word, group | (group << 4))
+                )
+            elif cutlass.const_expr(all_rows_safe):
                 converted = scaled_s8_to_bf16_words(words, scale, True, post_scale_log2)
             elif cutlass.const_expr(packed_scales):
                 converted = scaled_s8_to_bf16_words(
@@ -316,6 +382,7 @@ def stage_scaled_s8_rows_to_tmem(
     columns: cutlass.Constexpr,
     scale_group: cutlass.Constexpr,
     post_scale_log2: cutlass.Constexpr = 0,
+    packed_tile_forms: cutlass.Constexpr = False,
 ) -> None:
     """Convert one row per lane from a raw shared tile directly into TMEM.
 
@@ -336,9 +403,19 @@ def stage_scaled_s8_rows_to_tmem(
     The raw base carries at least 16-byte alignment; packet offsets retain
     their proved divisibility in the pointer type.
     Completion/fences and ready/free barriers belong to the owning pipeline.
+
+    ``packed_tile_forms``: the caller takes the forms of the packed
+    four-scales-per-row tile where this call has that layout
+    (``packed_scale_tile_layout``); here the unanimous arm's exponent
+    correction once per row (``_stage_scaled_s8_rows``). The guard, its
+    vote and the mixed arm are unchanged, and every row converts with the
+    scale bytes it had, so the staged K is the same for every input.
     """
     packed_scales = columns // scale_group == 4 and _packed_scale_layout_supported(
         scales
+    )
+    packed_tile = packed_tile_forms and packed_scale_tile_layout(
+        scales, columns, scale_group, post_scale_log2
     )
     scale_word = cutlass.Int32(0)
     row_scales_safe = cutlass.Boolean(False)
@@ -370,6 +447,7 @@ def stage_scaled_s8_rows_to_tmem(
                 scale_word=scale_word,
                 row_scales_safe=row_scales_safe,
                 all_rows_safe=True,
+                packed_tile=packed_tile,
             )
         else:
             cute.arch.sync_warp()
@@ -551,6 +629,33 @@ def _packed_scale_layout_supported(
     )
 
 
+def packed_scale_tile_layout(
+    scales: cute.Tensor,
+    width: int,
+    scale_group: int,
+    post_scale_log2: int,
+) -> bool:
+    """Whether a conversion has the packed four-scales-per-row tile: 128
+    dimensions in groups of 32 whose four scale bytes are one word of the
+    staged 512-byte scale tile, and a source postscale of at least
+    ``2**-6``. ``width`` is the tile's extent along the axis the scales
+    group (K's columns, and for V four warps of 32 dimensions).
+
+    With that postscale the corrected exponent of a native conversion is
+    the scale byte plus zero to six: never negative, so no conversion
+    needs a second multiply, and for a byte of at most 247 never above
+    253. The forms that rest on it (one correction per row or lane, a V
+    tile converted ahead of its scale vote) are for this layout alone;
+    every other layout keeps the code it had.
+    """
+    return (
+        width == 128
+        and scale_group == 32
+        and post_scale_log2 >= -6
+        and _packed_scale_layout_supported(scales)
+    )
+
+
 @cute.jit
 def _scale_word_at_least(
     word: cutlass.Int32, minimum: cutlass.Constexpr
@@ -578,6 +683,7 @@ def _stage_scaled_s8_transpose_tiles(
     native_scale_only: cutlass.Constexpr = False,
     cached_group_word: cutlass.Int32 | None = None,
     positive_zero: cutlass.Constexpr = False,
+    packed_tile: cutlass.Constexpr = False,
 ) -> None:
     """Stage key blocks with a static whole-tile or dynamic packet route.
 
@@ -592,6 +698,16 @@ def _stage_scaled_s8_transpose_tiles(
     warp must remain converged while exchanging those words.
     positive_zero applies the source's final BF16 +0, except where the native
     finite conversion proof excludes negative zero and makes that add an identity.
+
+    ``packed_tile`` (``packed_scale_tile_layout``) gives the native arm
+    (``safe_tile=True``) its exponent correction once per lane: one add over
+    the lane's cached group word ahead of the key blocks, which then
+    exchange corrected words, and one byte permute for a block's upper
+    pair. The arm converts with the scale pairs it had wherever every byte
+    of the warp's group is at most 247. Where one is not, a pair may hold
+    another value than the per-block correction gave; the caller runs the
+    arm there only ahead of the vote that replaces what it staged
+    (``_stage_guarded_s8_transpose_tiles``).
     """
     assert cutlass.const_expr(
         not native_scale_only
@@ -600,6 +716,14 @@ def _stage_scaled_s8_transpose_tiles(
     assert cutlass.const_expr(
         cached_group_word is None or (keys == 128 and packed_scales)
     )
+    corrected_once = packed_tile and safe_tile is True
+    assert cutlass.const_expr(
+        not corrected_once or (cached_group_word is not None and not native_scale_only)
+    )
+    exchanged_word = cached_group_word
+    if cutlass.const_expr(corrected_once):
+        assert cached_group_word is not None
+        exchanged_word = _corrected_scale_word(cached_group_word, post_scale_log2)
     for key_tile in cutlass.range_constexpr(keys // 16):
         first_key = key_tile * 16 + 4 * (lane % 4)
         scale_group = dimension_base // 32
@@ -608,9 +732,12 @@ def _stage_scaled_s8_transpose_tiles(
             # The owner below is first_key // 4 within that 128-row load.
             owner = 4 * key_tile + lane % 4
             scales01 = cute.arch.shuffle_sync(
-                cached_group_word, owner, mask=-1, mask_and_clamp=31
+                exchanged_word, owner, mask=-1, mask_and_clamp=31
             )
-            scales23 = cutlass.Int32(scales01 >> 16)
+            if cutlass.const_expr(corrected_once):
+                scales23 = _permute_scale_bytes(scales01, 0x3232)
+            else:
+                scales23 = cutlass.Int32(scales01 >> 16)
         elif cutlass.const_expr(packed_scales):
             # first_key is a multiple of 4: its four scale words form one
             # aligned 16-byte packet, wholly inside the 128-row tile.
@@ -645,6 +772,12 @@ def _stage_scaled_s8_transpose_tiles(
             if cutlass.const_expr(post_scale_log2 < -6 and not native_scale_only):
                 corrected01, factors01 = _postscale_pair_bits(scales01, post_scale_log2)
                 corrected23, factors23 = _postscale_pair_bits(scales23, post_scale_log2)
+            elif cutlass.const_expr(corrected_once):
+                # The lane's word was corrected ahead of the key blocks.
+                corrected01 = scales01
+                corrected23 = scales23
+                factors01 = cutlass.Int32(0x3F803F80)
+                factors23 = cutlass.Int32(0x3F803F80)
             else:
                 corrected01 = scales01 + (6 + post_scale_log2) * 0x0101
                 corrected23 = scales23 + (6 + post_scale_log2) * 0x0101
@@ -790,6 +923,89 @@ def _stage_zero_s8_transpose_tiles(
 
 
 @cute.jit
+def _stage_voted_s8_transpose_tiles(
+    raw: cute.Tensor,
+    scales: cute.Tensor,
+    dimension_base: cutlass.Int32,
+    lane: cutlass.Int32,
+    tmem_base: cutlass.Int32,
+    keys: cutlass.Constexpr,
+    cached_group_word: cutlass.Int32,
+    packed_scales: cutlass.Constexpr,
+    post_scale_log2: cutlass.Constexpr,
+    positive_zero: cutlass.Constexpr,
+) -> None:
+    """Stage a packed tile (``packed_scale_tile_layout``) with the native
+    conversion at once and vote on its scales behind it.
+
+    The guard at the head of a tile (``_stage_guarded_s8_transpose_tiles``)
+    holds back every load and conversion of the tile until the warp has
+    voted, on the chain that sets a memory-hot stream's page period. Here
+    the warp stages the whole tile with the native arm first, sixteen
+    stores, and votes behind them. A failed vote runs the full-domain arm
+    over the same sixteen column groups: its stores follow the native
+    arm's, behind a store wait, and replace them. The caller publishes the
+    stage only behind this function (its store wait, fence and arrival), so
+    no reader sees the first pass.
+
+    The vote covers the bytes this warp's conversion reads, its own scale
+    group of the tile's 128 keys, and not the other three groups'. Where
+    it passes, every one of those bytes is at most 247 and the native arm
+    converted with the scale pairs the guarded arm corrects per block
+    (``_stage_scaled_s8_transpose_tiles``). The guard at the head sends
+    such a warp through the full-domain arm when another group holds a
+    byte above 247. Both arms are exact for a byte of at most 247 with a
+    postscale of at least ``2**-6``: the product of a signed byte and a
+    power of two of at least ``2**-133`` is a BF16 value, which both
+    produce, a zero byte as +0 (the full-domain arm's rounded product and
+    postscale have nothing to round; mixed warps already send in-range
+    rows of K through it). So the staged tile is the one the guard at the
+    head stages, for every scale byte and every raw byte.
+
+    Where the vote fails the native arm has converted with scale bytes
+    outside its finite domain, or with pairs a carry of the lane's
+    correction changed. The conversion saturates and does not trap, and
+    all of it is replaced.
+    """
+    lane_safe = _scale_word_uses_s2f6(cached_group_word, post_scale_log2)
+    _stage_scaled_s8_transpose_tiles(
+        raw,
+        scales,
+        dimension_base,
+        lane,
+        tmem_base,
+        keys,
+        packed_scales=packed_scales,
+        safe_tile=True,
+        post_scale_log2=post_scale_log2,
+        cached_group_word=cached_group_word,
+        positive_zero=positive_zero,
+        packed_tile=True,
+    )
+    if not cute.arch.vote_all_sync(lane_safe):
+        # The vote is warp-uniform; the join keeps the collectives below
+        # convergent for NVVM, as in the row decoder.
+        cute.arch.sync_warp()
+        # Two asynchronous stores to one column group: the replacement is
+        # issued behind the completion of the first pass, so its order does
+        # not rest on the order the device completes stores in.
+        prims.tcgen05_wait(kind=prims.Tcgen05Wait.STORE)
+        _stage_scaled_s8_transpose_tiles(
+            raw,
+            scales,
+            dimension_base,
+            lane,
+            tmem_base,
+            keys,
+            packed_scales=packed_scales,
+            safe_tile=False,
+            post_scale_log2=post_scale_log2,
+            cached_group_word=cached_group_word,
+            positive_zero=positive_zero,
+        )
+
+
+@cute.jit
 def _stage_guarded_s8_transpose_tiles(
     raw: cute.Tensor,
     scales: cute.Tensor,
@@ -878,6 +1094,7 @@ def stage_scaled_s8_transpose_to_tmem(
     keys: cutlass.Constexpr,
     post_scale_log2: cutlass.Constexpr = 0,
     positive_zero: cutlass.Constexpr = False,
+    packed_tile_forms: cutlass.Constexpr = False,
 ) -> None:
     """One warp decodes 32 dimensions of V and stages their transpose in TMEM.
 
@@ -895,6 +1112,13 @@ def stage_scaled_s8_transpose_to_tmem(
     constant +0 without reading raw bytes when the source explicitly adds +0.
     In particular, ``dimension_base // 32`` must match the physical warp
     index modulo four; looping a single warp over row offsets is invalid.
+
+    ``packed_tile_forms``: the caller takes the forms of the packed
+    four-scales-per-row tile where this call has that layout
+    (``packed_scale_tile_layout``): the native conversion of the whole tile
+    ahead of a vote on the warp's own scale group, and its exponent
+    correction once per lane (``_stage_voted_s8_transpose_tiles``). The
+    staged V is the same for every input.
     """
     # The production rings have this exact staged layout and 16-byte-aligned
     # slot offsets. Other shared views retain scalar byte loads.
@@ -903,6 +1127,11 @@ def stage_scaled_s8_transpose_to_tmem(
     # One 16-byte load per lane spans the complete 512-byte staged scale tile.
     # Every V warp proves its own full tile, so no cross-warp barrier is needed.
     whole_tile_scale_guard = packed_scales and keys == 128
+    # A V warp's tile is 32 dimensions, one scale group, of 128 keys.
+    packed_tile = packed_tile_forms and packed_scale_tile_layout(
+        scales, keys, 32, post_scale_log2
+    )
+    assert cutlass.const_expr(not packed_tile or whole_tile_scale_guard)
     if cutlass.const_expr(whole_tile_scale_guard):
         pointer = cute.recast_ptr(
             scales.iterator + cute.assume(lane * 16, divby=16), dtype=cutlass.Int32
@@ -945,6 +1174,19 @@ def stage_scaled_s8_transpose_to_tmem(
                     post_scale_log2,
                     positive_zero=positive_zero,
                 )
+        elif cutlass.const_expr(packed_tile):
+            _stage_voted_s8_transpose_tiles(
+                raw,
+                scales,
+                dimension_base,
+                lane,
+                tmem_base,
+                keys,
+                _select_scale_group_word(tile_words, dimension_base // 32),
+                packed_scales,
+                post_scale_log2,
+                positive_zero,
+            )
         else:
             _stage_guarded_s8_transpose_tiles(
                 raw,

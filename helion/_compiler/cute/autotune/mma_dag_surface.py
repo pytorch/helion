@@ -22,7 +22,11 @@ from ..cute_mma_dag import MMA_DAG_ATTENTION_PASS_WARPS
 from ..cute_mma_dag import MMA_DAG_AUX_CHOICES
 from ..cute_mma_dag import MMA_DAG_AUX_KEY
 from ..cute_mma_dag import MMA_DAG_AUX_RING
+from ..cute_mma_dag import MMA_DAG_BOUNDARY_PREFETCH_AHEAD_CHOICES
+from ..cute_mma_dag import MMA_DAG_BOUNDARY_PREFETCH_AHEAD_KEY
 from ..cute_mma_dag import MMA_DAG_BOUNDARY_PREFETCH_CHOICES
+from ..cute_mma_dag import MMA_DAG_BOUNDARY_PREFETCH_COLD_CHOICES
+from ..cute_mma_dag import MMA_DAG_BOUNDARY_PREFETCH_COLD_KEY
 from ..cute_mma_dag import MMA_DAG_BOUNDARY_PREFETCH_KEY
 from ..cute_mma_dag import MMA_DAG_CLUSTER_CHOICES
 from ..cute_mma_dag import MMA_DAG_CLUSTER_KEY
@@ -112,6 +116,7 @@ from ..cute_mma_dag import paged_attention_pass_warp_choices
 from ..cute_mma_dag import paged_attention_register_quota_choices
 from ..cute_mma_dag import paged_attention_release_lead_renders
 from ..cute_mma_dag import paged_attention_value_ring_choices
+from ..cute_mma_dag import paged_attention_value_ring_tiles_choices
 from ..cute_register_subblocks import COLSIDE_CHOICES as RSB_COLSIDE_CHOICES
 from ..cute_register_subblocks import COLSIDE_KEY as RSB_COLSIDE_KEY
 from ..cute_register_subblocks import COLSIDE_RMW as RSB_COLSIDE_RMW
@@ -142,6 +147,7 @@ from ..paged_attention_registers import MMA_DAG_REGISTER_QUOTAS_DEFAULT
 from ..paged_attention_registers import MMA_DAG_REGISTER_QUOTAS_KEY
 from ..paged_attention_release import MMA_DAG_RELEASE_LEAD_DEFAULT
 from ..paged_attention_shared_memory import MMA_DAG_VALUE_RING_KEY
+from ..paged_attention_shared_memory import MMA_DAG_VALUE_RING_TILES_KEY
 from ..paged_attention_shared_memory import PAIRED_DEFAULT_VALUE_RING
 from ..pdl_release import CUTE_PDL_CAPTURE_DEFAULT
 from ..pdl_release import CUTE_PDL_CAPTURE_OVERLAP_KEY
@@ -368,8 +374,11 @@ def enable_cute_mma_dag_search(config_spec: ConfigSpec, facts: CuteMmaDagFacts) 
     config_spec.cute_mma_dag_partition_skew = None
     config_spec.cute_mma_dag_register_quotas = None
     config_spec.cute_mma_dag_boundary_prefetch = None
+    config_spec.cute_mma_dag_boundary_prefetch_cold = None
+    config_spec.cute_mma_dag_boundary_prefetch_ahead = None
     config_spec.cute_mma_dag_release_lead = None
     config_spec.cute_mma_dag_value_ring = None
+    config_spec.cute_mma_dag_value_ring_tiles = None
     config_spec.cute_mma_dag_page_order = None
     config_spec.cute_mma_dag_clipped_page_lead = None
     if facts.attention is not None and facts.attention.paired_items:
@@ -434,6 +443,40 @@ def enable_cute_mma_dag_search(config_spec: ConfigSpec, facts: CuteMmaDagFacts) 
                     else (0,)
                 ),
             )
+            if prefetch_form == BOUNDARY_PREFETCH_SIBLING:
+                # The sibling form's depth in a launch without a head start:
+                # a field wherever that form's prefetch has one, sampled
+                # where the prefetch is. Its requests pay only for a later
+                # launch that reads the same pages while L2 holds them,
+                # which the bank cycle's back-to-back calls over few inputs
+                # show and nothing else does.
+                config_spec.cute_mma_dag_boundary_prefetch_cold = EnumFragment(
+                    choices=MMA_DAG_BOUNDARY_PREFETCH_COLD_CHOICES,
+                    search_choices=(
+                        None
+                        if config_spec.cute_mma_dag_boundary_prefetch_searched
+                        else (0,)
+                    ),
+                )
+        # The distances of the balanced partition's range-ahead prefetch have
+        # a field of their own, where the bind's grid has them (more units
+        # than SMs) and the kernel's only root is the paired one. Off is
+        # the default, and it is sampled where the page counts are: over a
+        # cycle of input banks.
+        range_ahead = facts.attention.boundary_prefetch_range_ahead
+        if range_ahead and config_spec.cute_pdl_capture_overlap_available:
+            config_spec.cute_mma_dag_boundary_prefetch_ahead = EnumFragment(
+                choices=tuple(
+                    distance
+                    for distance in MMA_DAG_BOUNDARY_PREFETCH_AHEAD_CHOICES
+                    if distance == 0 or distance in range_ahead
+                ),
+                search_choices=(
+                    None
+                    if config_spec.cute_mma_dag_boundary_prefetch_searched
+                    else (0,)
+                ),
+            )
         if capture_policy_available(config_spec):
             # A field where some config of the kernel releases from its
             # loader's tail (``search_surface.release_lead_policy_reason``).
@@ -471,6 +514,25 @@ def enable_cute_mma_dag_search(config_spec: ConfigSpec, facts: CuteMmaDagFacts) 
         )
         if len(rings) > 1:
             config_spec.cute_mma_dag_value_ring = EnumFragment(choices=rings)
+        # A field where a persistent CTA of a kernel with a sliding window
+        # holds a raw V ring counted in tiles on this device. Searched
+        # whatever the benchmark's timing regime, as the depth in pages
+        # is: the count changes the loader's own schedule. A search steps
+        # onto it with a persistent partition (``value_ring_tiles_needs``).
+        ring_tiles = max(
+            (
+                paged_attention_value_ring_tiles_choices(
+                    facts.attention,
+                    MMA_DAG_PASS_WARPS_ATTENTION_PAIRED,
+                    False,
+                    partition,
+                )
+                for partition in facts.attention.partition_choices
+            ),
+            key=len,
+        )
+        if len(ring_tiles) > 1:
+            config_spec.cute_mma_dag_value_ring_tiles = EnumFragment(choices=ring_tiles)
         # A field where the bind has another page order than the source's:
         # the bucketed one (fast math and units of enough interior pages),
         # the reversed walk (fast math and a sliding window over a source
@@ -746,8 +808,11 @@ def _pin_paired_knobs(config: dict[str, object]) -> None:
     config.pop(MMA_DAG_PARTITION_KEY, None)
     config.pop(MMA_DAG_PARTITION_SKEW_KEY, None)
     config.pop(MMA_DAG_BOUNDARY_PREFETCH_KEY, None)
+    config.pop(MMA_DAG_BOUNDARY_PREFETCH_COLD_KEY, None)
+    config.pop(MMA_DAG_BOUNDARY_PREFETCH_AHEAD_KEY, None)
     config.pop(MMA_DAG_RELEASE_LEAD_KEY, None)
     config.pop(MMA_DAG_VALUE_RING_KEY, None)
+    config.pop(MMA_DAG_VALUE_RING_TILES_KEY, None)
     config.pop(MMA_DAG_PAGE_ORDER_KEY, None)
     config.pop(MMA_DAG_CLIPPED_PAGE_LEAD_KEY, None)
 
@@ -786,18 +851,26 @@ def _normalize_partition(
     partition cannot run: repaired to none, which is the missing key. The
     dependent-launch policy one of its forms needs is checked once that
     policy is resolved (``search_surface._normalize_boundary_prefetch_policy``).
+    The depth of that prefetch in a cold launch belongs to its sibling form:
+    beside no pages, or on another grid, it is repaired to none as well. So
+    is a distance of the range-ahead prefetch off the balanced partition, or
+    on a grid that has none.
     A lead of the tail release that the schedule does not offer is repaired
     to the release's own four pages, which is the missing key; whether the
     config releases from the loader's tail at all is checked with the
     resolved policy too (``search_surface._normalize_release_lead_policy``).
     A depth of the raw V ring that this schedule, value transport and
     partition cannot stage in the device's shared memory is repaired to the
-    default's two pages, the missing key, and a page order they cannot
+    default's two pages, the missing key; a ring counted in tiles that they
+    cannot stage, or that stands beside another depth in pages, to the ring
+    in pages, the missing key; and a page order they cannot
     stream to the source's, the missing key as well. A lead of the clipped
     page is the reversed walk's: a value that is none of the option's is
     repaired to the default, and a lead beside any other order, which names
     nothing, is dropped with the default, the missing key.
     """
+    from ..paged_attention_config import paged_attention_boundary_prefetch_ahead_reason
+    from ..paged_attention_config import paged_attention_boundary_prefetch_cold_reason
     from ..paged_attention_config import paged_attention_boundary_prefetch_reason
     from ..paged_attention_config import paged_attention_clipped_page_lead_applies
     from ..paged_attention_config import paged_attention_clipped_page_lead_reason
@@ -806,6 +879,7 @@ def _normalize_partition(
     from ..paged_attention_config import paged_attention_partition_skew_reason
     from ..paged_attention_config import paged_attention_release_lead_reason
     from ..paged_attention_config import paged_attention_value_ring_reason
+    from ..paged_attention_config import paged_attention_value_ring_tiles_reason
 
     # In this order: each reason reads the options held before it.
     _hold_paired_knob(
@@ -829,6 +903,22 @@ def _normalize_partition(
         paged_attention_boundary_prefetch_reason(facts, config),
         fix_invalid=fix_invalid,
     )
+    # Behind the pages it extends: a cold depth without them names nothing.
+    _hold_paired_knob(
+        config,
+        MMA_DAG_BOUNDARY_PREFETCH_COLD_KEY,
+        0,
+        paged_attention_boundary_prefetch_cold_reason(facts, config),
+        fix_invalid=fix_invalid,
+    )
+    # The balanced partition's own prefetch, by its distance in CTAs.
+    _hold_paired_knob(
+        config,
+        MMA_DAG_BOUNDARY_PREFETCH_AHEAD_KEY,
+        0,
+        paged_attention_boundary_prefetch_ahead_reason(facts, config),
+        fix_invalid=fix_invalid,
+    )
     _hold_paired_knob(
         config,
         MMA_DAG_RELEASE_LEAD_KEY,
@@ -841,6 +931,15 @@ def _normalize_partition(
         MMA_DAG_VALUE_RING_KEY,
         PAIRED_DEFAULT_VALUE_RING,
         paged_attention_value_ring_reason(facts, config),
+        fix_invalid=fix_invalid,
+    )
+    # Behind the depth in pages, beside whose default alone a ring is
+    # counted in tiles.
+    _hold_paired_knob(
+        config,
+        MMA_DAG_VALUE_RING_TILES_KEY,
+        0,
+        paged_attention_value_ring_tiles_reason(facts, config),
         fix_invalid=fix_invalid,
     )
     _hold_paired_knob(
@@ -908,6 +1007,66 @@ def boundary_prefetch_needs(form: str | None) -> dict[str, object]:
     if form == BOUNDARY_PREFETCH_SIBLING:
         needed.update(CAPTURE_POLICY)
     return needed
+
+
+def boundary_prefetch_cold_needs(form: str | None, pages: object) -> dict[str, object]:
+    """What a depth of the sibling prefetch in a cold launch needs of a
+    paired config that prefetches ``pages`` pages per served unit: what the
+    pages need (``boundary_prefetch_needs``) and the pages themselves. A
+    config without pages takes the first page count the option has, the
+    one the prefetch seeds lead with.
+
+    The one statement of it, for a search's step onto a depth
+    (``CuteConfigGenerationExtension._prefetch_neighbor_updates``) and a
+    fixed override (``search_surface.reconcile_overridden_boundary_prefetch``).
+    """
+    needed = boundary_prefetch_needs(form)
+    needed[MMA_DAG_BOUNDARY_PREFETCH_KEY] = (
+        pages
+        if type(pages) is int and pages != 0
+        else next(page for page in MMA_DAG_BOUNDARY_PREFETCH_CHOICES if page)
+    )
+    return needed
+
+
+def boundary_prefetch_ahead_needs() -> dict[str, object]:
+    """What a distance of the range-ahead prefetch needs of a paired
+    config: the balanced partition, whose spare warp runs the role, and
+    what that partition needs of the transport (``PARTITION_TRANSPORT``).
+    It names no skew: the role serves under each.
+
+    The one statement of it, for a search's step onto a distance
+    (``CuteConfigGenerationExtension._prefetch_ahead_neighbor_updates``)
+    and a fixed override
+    (``search_surface.reconcile_overridden_boundary_prefetch_ahead``)."""
+    return {MMA_DAG_PARTITION_KEY: MMA_DAG_PARTITION_BALANCED, **PARTITION_TRANSPORT}
+
+
+# What a paired config that leaves out one of the options the needs here
+# name has of it: the option's default. A fixed override's reconciliation
+# compares a candidate that does not name an option against this
+# (``search_surface._reconcile_overridden_paired_knob``), since what a knob
+# needs is not always a default: a cold depth needs pages. The capture
+# policy's own three options are not listed: a candidate takes each of them
+# by name.
+# A ring counted in tiles needs a persistent partition with its query TMA
+# and the default depth in pages. The query TMA's entry is there for that
+# lookup and never decides: a normalized candidate always names the option
+# where the kernel has the query TMA.
+# A distance of the range-ahead prefetch needs the balanced partition, with
+# the same transport.
+PAIRED_NEED_DEFAULTS = MappingProxyType(
+    {
+        MMA_DAG_QUERY_TMA_KEY: False,
+        MMA_DAG_VALUE_METADATA_SKIP_KEY: False,
+        MMA_DAG_VALUE_METADATA_READ_OVERLAP_KEY: False,
+        MMA_DAG_PARTITION_KEY: MMA_DAG_PARTITION_ITEM,
+        MMA_DAG_PARTITION_SKEW_KEY: 0,
+        MMA_DAG_BOUNDARY_PREFETCH_KEY: 0,
+        MMA_DAG_VALUE_RING_KEY: PAIRED_DEFAULT_VALUE_RING,
+        CUTE_PDL_SPREAD_KEY: False,
+    }
+)
 
 
 def _paired_loader_needs(one_unit_per_cta: bool) -> dict[str, object]:
@@ -981,6 +1140,42 @@ def value_ring_needs(
             attention, MMA_DAG_PASS_WARPS_ATTENTION_PAIRED, False, partition
         )
     )
+
+
+def value_ring_tiles_needs(
+    attention: PagedAttentionScheduleFacts | None, tiles: object, partition: object
+) -> dict[str, object]:
+    """What a raw V ring of ``tiles`` tiles needs of a paired config whose
+    partition is ``partition``: no value-metadata transport, the default
+    depth in pages, and a persistent partition whose CTA holds the count
+    (``paged_attention_value_ring_tiles_choices``). A config on such a
+    partition keeps it; one with one unit per CTA, or on a partition
+    without room, takes the first that has room, the balanced one ahead of
+    whole units, with what that partition needs of the transport
+    (``PARTITION_TRANSPORT``).
+
+    The one statement of it, for a search's step onto a count
+    (``CuteConfigGenerationExtension._value_ring_tiles_neighbor_updates``)
+    and a fixed override
+    (``search_surface.reconcile_overridden_value_ring_tiles``)."""
+    needed: dict[str, object] = {
+        MMA_DAG_VALUE_METADATA_SKIP_KEY: False,
+        MMA_DAG_VALUE_METADATA_READ_OVERLAP_KEY: False,
+        MMA_DAG_VALUE_RING_KEY: PAIRED_DEFAULT_VALUE_RING,
+    }
+
+    def holds(candidate: object) -> bool:
+        return tiles in paged_attention_value_ring_tiles_choices(
+            attention, MMA_DAG_PASS_WARPS_ATTENTION_PAIRED, False, candidate
+        )
+
+    if not holds(partition):
+        for candidate in (MMA_DAG_PARTITION_BALANCED, MMA_DAG_PARTITION_WHOLE):
+            if holds(candidate):
+                needed[MMA_DAG_PARTITION_KEY] = candidate
+                needed.update(PARTITION_TRANSPORT)
+                break
+    return needed
 
 
 # The partition a search samples a deeper raw V ring on: one unit per CTA

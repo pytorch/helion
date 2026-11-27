@@ -1585,6 +1585,13 @@ class ConfigSpec:
         # for a unit that has not started, where the bind's grid has a form
         # for it; zero, the default, is off.
         self.cute_mma_dag_boundary_prefetch: EnumFragment | None = None
+        # K pages that prefetch's serving CTAs request in a launch without a
+        # head start, on a grid of fewer units than SMs; zero is off.
+        self.cute_mma_dag_boundary_prefetch_cold: EnumFragment | None = None
+        # CTAs ahead of its own for whose stream the spare warp of a
+        # persistent CTA of that schedule requests the first pages into L2,
+        # on a grid of more units than SMs; zero, the default, is off.
+        self.cute_mma_dag_boundary_prefetch_ahead: EnumFragment | None = None
         # Pages ahead of its end at which the paired schedule's loader
         # releases the launch's dependents, where the kernel takes the
         # guarded capture policy; four, the default, is the release's own.
@@ -1593,6 +1600,10 @@ class ConfigSpec:
         # device's shared memory holds more than the default's two with one
         # unit per CTA.
         self.cute_mma_dag_value_ring: EnumFragment | None = None
+        # Tiles of raw V a persistent CTA of that schedule stages in a ring
+        # counted in tiles, for a kernel with a sliding window; zero, the
+        # default, is the ring counted in pages.
+        self.cute_mma_dag_value_ring_tiles: EnumFragment | None = None
         # The order in which the paired schedule streams a unit's pages,
         # where fast math licenses another than the source's: the bucketed
         # one where some unit can have enough interior pages for it to pay,

@@ -1,7 +1,8 @@
 """A boundary prefetch changes no output bit, on a grid with idle SMs and on
 one of more than a wave, eager and as captured calls that overlap their
 predecessors, and the host installs a head start only behind a launch of the
-same kernel.
+same kernel. Nor does the depth the sibling form takes in a launch without
+a head start, behind its entry wait or ahead of its dependency wait.
 
 These tests launch the role; they cannot tell which addresses it requests.
 A prefetch of an address outside every allocation does not fault on the
@@ -48,6 +49,7 @@ if TYPE_CHECKING:
     from collections.abc import Iterator
 
 KEY = "cute_mma_dag_boundary_prefetch"
+COLD = "cute_mma_dag_boundary_prefetch_cold"
 QUOTAS = "cute_mma_dag_register_quotas"
 # SMs the one-wave grid leaves idle (a grid with a form leaves at most a
 # fifth of the device's idle), and units past one wave.
@@ -77,13 +79,16 @@ def _pair(
     *,
     window: int | None = None,
     reverse_pages: bool = False,
+    cold: int = 0,
     **knobs: object,
 ) -> tuple[object, ...]:
     """The grid's arguments and its kernel without and with the prefetch,
     under the schedule's default policies: the guarded capture overlap,
     released from the loader's tail on one wave and at the entry of every
-    CTA past it, early retirement and the kernel's default key clip."""
-    key = (form, pages, window, reverse_pages, tuple(sorted(knobs.items())))
+    CTA past it, early retirement and the kernel's default key clip.
+    ``cold`` is the prefetching kernel's depth in a launch without a head
+    start."""
+    key = (form, pages, window, reverse_pages, cold, tuple(sorted(knobs.items())))
     if key not in _PAIRS:
         shape = {} if window is None else {"window": window}
         args = partition_attention_args(
@@ -97,10 +102,12 @@ def _pair(
         bound = partition_attention_kernel(reverse_pages=reverse_pages).bind(args)
         schedule = {"block_sizes": [8], "cute_mma_dag_v_lag": 2, **knobs}
         off = partition_config(default_policies=True, **schedule)
-        on = partition_config(default_policies=True, **{KEY: pages}, **schedule)
+        prefetching = {KEY: pages, **({COLD: cold} if cold else {})}
+        on = partition_config(default_policies=True, **prefetching, **schedule)
         assert "boundary_prefetch" not in bound.to_code(off)
         source = bound.to_code(on)
         assert f"boundary_prefetch={pages}, boundary_prefetch_form={form!r}" in source
+        assert (f"boundary_prefetch_cold={cold}" in source) == bool(cold)
         assert ("capture_release_tail=True" in source) == (form == "sibling")
         kernels = (bound.compile_config(off), bound.compile_config(on))
         # The capture guard tracks only launches of a warmed kernel.
@@ -184,6 +191,77 @@ def test_a_boundary_prefetch_keeps_every_output_bit(form):
     """The whole table as the window: units of zero to seventeen pages, of
     which a request serves the first eight."""
     _check_pair(form, _pair(form), PAGES * PAGE - 1)
+
+
+@skipIfNotCUDA()
+@skipIfRefEager("capture dependency proof needs native CUDA graph nodes")
+def test_a_cold_launch_prefetch_keeps_every_output_bit():
+    """The sibling form with a depth for cold launches. Every eager call and
+    the first captured launch have no head start: their first ``IDLE_SMS``
+    CTAs serve the waiting units' first two pages, behind the entry wait.
+    The later captured launches overlap their predecessor and serve eight.
+    Units of zero to seventeen pages, as for the role without the depth."""
+    _check_pair("sibling", _pair("sibling", cold=2), PAGES * PAGE - 1)
+
+
+@skipIfNotCUDA()
+@skipIfRefEager("capture dependency proof needs native CUDA graph nodes")
+def test_a_cold_launch_ahead_of_its_dependency_wait_keeps_every_output_bit():
+    """A launch of the kernel behind a launch of another kernel is in the
+    before-writes mode and has no head start: it is a cold launch whose
+    serving CTAs read the served units' lengths and page ids and issue
+    their requests ahead of the dependency wait, while the launch ahead
+    still stores. Its outputs are the bits of the kernel without the role,
+    over lengths that change between replays and a page table that holds
+    ids past the pool outside every live range."""
+    args, off, on = cast(
+        "tuple[tuple[object, ...], Callable[..., object], Callable[..., object]]",
+        _pair("sibling", cold=2, window=SHORT_WINDOW),
+    )
+    table, lengths = (cast("torch.Tensor", args[index]) for index in (5, 6))
+    units = lengths.numel()
+    query_len, window = cast("int", args[7]), cast("int", args[9])
+    clean = table.clone()
+    patterns = _patterns(units, SHORT_WINDOW)
+    try:
+        expected = {}
+        for name, values in patterns.items():
+            set_request_lengths(args, values)
+            expected[name] = _launch(off, args)
+        graph = torch.cuda.CUDAGraph()
+        with (
+            _installed_arguments() as installed,
+            observed_wait_modes() as modes,
+            torch.cuda.graph(graph),
+        ):
+            captured = [kernel(*args) for kernel in (off, on, off, on, on)]
+        assert modes == [WaitMode.EARLY] + [WaitMode.BEFORE_WRITES] * 4, modes
+        # The kernel with the role behind the other kernel: the mode and no
+        # head start, a cold launch. Behind itself it overlaps.
+        assert installed == [(1, 0), (1, 0), (1, 0), (1, IDLE_SMS)]
+        poison = torch.tensor(
+            [cast("torch.Tensor", args[1]).size(0), 2**31 - 1, -1, -(2**31), 2**30],
+            dtype=torch.int32,
+            device=DEVICE,
+        )
+        column = torch.arange(table.size(1), device=DEVICE)
+        for name, values in patterns.items():
+            set_request_lengths(args, values)
+            length = lengths.to(torch.int64)[:, None]
+            first = (length - query_len - window).clamp(min=0) // PAGE
+            last = (length + PAGE - 1) // PAGE
+            live = (column >= first) & (column < last)
+            fill = poison[(column + torch.arange(units, device=DEVICE)[:, None]) % 5]
+            table.copy_(torch.where(live, clean, fill))
+            _assert_same(_launch(on, args), expected[name], (name, "eager"))
+            for result in captured:
+                poison_(*cast("tuple[torch.Tensor, ...]", result))
+            graph.replay()
+            torch.cuda.synchronize()
+            for index, result in enumerate(captured):
+                _assert_same(_replayed(result), expected[name], (name, index))
+    finally:
+        table.copy_(clean)
 
 
 @skipIfNotCUDA()
@@ -281,10 +359,12 @@ def test_only_a_launch_behind_the_same_kernel_gets_a_head_start():
 # it), sleeping waits, the page counts a config may name, the key clips
 # (a clipped tile's request is the part of its box the loader reads),
 # whole tiles, the late retirement with its final join (which waits for
-# the role's lanes), pages iterated in reverse, and the register
+# the role's lanes), pages iterated in reverse, the register
 # splits a config may name beside the default (the role's warp keeps the
 # control quota; the other roles' code is another kernel to the assembler),
-# each on the grid where it matters most and one on the other.
+# each on the grid where it matters most and one on the other, and the
+# sibling form's depth in a cold launch beside its smallest and its largest
+# page count (a cold launch requests fewer pages than a lane resolves).
 SCHEDULES = {
     "lag0": ("wave_ahead", 8, {"cute_mma_dag_v_lag": 0}),
     "lag1": ("wave_ahead", 8, {"cute_mma_dag_v_lag": 1}),
@@ -296,6 +376,8 @@ SCHEDULES = {
     "lag0-sibling": ("sibling", 8, {"cute_mma_dag_v_lag": 0}),
     "pages12": ("wave_ahead", 12, {}),
     "pages4-sibling": ("sibling", 4, {}),
+    "pages4-cold-sibling": ("sibling", 4, {"cold": 2}),
+    "reversed-cold-sibling": ("sibling", 12, {"reverse_pages": True, "cold": 2}),
     "pages12-sibling": ("sibling", 12, {}),
     "clip-both": ("wave_ahead", 8, {"cute_mma_dag_key_clip": "both"}),
     "clip-off-sibling": ("sibling", 8, {"cute_mma_dag_key_clip": "off"}),
@@ -319,5 +401,13 @@ def test_a_boundary_prefetch_keeps_every_bit_across_schedule_knobs(schedule):
     form, pages, knobs = SCHEDULES[schedule]
     knobs = dict(knobs)
     reverse_pages = bool(knobs.pop("reverse_pages", False))
-    pair = _pair(form, pages, window=SHORT_WINDOW, reverse_pages=reverse_pages, **knobs)
+    cold = cast("int", knobs.pop("cold", 0))
+    pair = _pair(
+        form,
+        pages,
+        window=SHORT_WINDOW,
+        reverse_pages=reverse_pages,
+        cold=cold,
+        **knobs,
+    )
     _check_pair(form, pair, SHORT_WINDOW, calls=2)

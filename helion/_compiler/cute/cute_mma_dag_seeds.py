@@ -27,6 +27,8 @@ from .cute_mma_dag import AXIS_ROOT
 from .cute_mma_dag import MMA_DAG_AUX_KEY
 from .cute_mma_dag import MMA_DAG_AUX_REGISTER
 from .cute_mma_dag import MMA_DAG_AUX_RING
+from .cute_mma_dag import MMA_DAG_BOUNDARY_PREFETCH_AHEAD_KEY
+from .cute_mma_dag import MMA_DAG_BOUNDARY_PREFETCH_COLD_KEY
 from .cute_mma_dag import MMA_DAG_BOUNDARY_PREFETCH_KEY
 from .cute_mma_dag import MMA_DAG_CLUSTER_KEY
 from .cute_mma_dag import MMA_DAG_CLUSTER_MAX
@@ -109,6 +111,7 @@ from .paged_attention_page_order import MMA_DAG_PAGE_ORDER_REVERSED
 from .paged_attention_page_order import PAGE_ORDER_HEAD
 from .paged_attention_registers import MMA_DAG_REGISTER_QUOTAS_KEY
 from .paged_attention_shared_memory import MMA_DAG_VALUE_RING_KEY
+from .paged_attention_shared_memory import MMA_DAG_VALUE_RING_TILES_KEY
 from .pdl_release import CUTE_PDL_CAPTURE_DEFAULT
 from .pdl_release import CUTE_PDL_RELEASE_DEFAULT
 from .pdl_release import capture_policy_available
@@ -129,6 +132,13 @@ PARTITION_SEED_SKEW = 8
 # The page counts of the boundary-prefetch seeds, beside the default's none:
 # what one unit's requests bring into L2 ahead of a unit, by the amount.
 BOUNDARY_PREFETCH_SEED_PAGES = (8, 12)
+# The depth the prefetching seeds of a windowed one-wave grid take in a cold
+# launch, beside the default's none: the one depth measured to gain.
+BOUNDARY_PREFETCH_COLD_SEED_PAGES = 2
+# The tiles of the raw V ring the range-ahead seeds take, beside the ring
+# counted in pages: the one count measured, and the largest a persistent
+# CTA of 40 query columns holds on a B200.
+VALUE_RING_TILES_SEED = 5
 # The lead of the tail-release seed for kernels without a window, in pages,
 # beside the release's own four.
 RELEASE_LEAD_SEED_PAGES = 16
@@ -796,6 +806,8 @@ class MmaDagSeedPlanner:
         release_lead_seeds: list[Config] = []
         page_order_seeds: list[Config] = []
         store_policy_seeds: list[Config] = []
+        cold_prefetch_seeds: list[Config] = []
+        range_ahead_seeds: list[Config] = []
         query_tma: list[Config] = []
         value_metadata: list[Config] = []
         value_metadata_policies: list[Config] = []
@@ -1348,6 +1360,92 @@ class MmaDagSeedPlanner:
                                         {**balanced_reversed, **evict_last}
                                     )
                                 )
+                        if (
+                            balanced_reversed is not None
+                            and spec.cute_mma_dag_boundary_prefetch_ahead is not None
+                            and spec.cute_mma_dag_boundary_prefetch_searched
+                            and spec.cute_mma_dag_value_ring_tiles is not None
+                            and VALUE_RING_TILES_SEED
+                            in spec.cute_mma_dag_value_ring_tiles.choices
+                        ):
+                            # A windowed kernel on a grid of more units
+                            # than SMs, where the search samples the
+                            # boundary prefetches: the balanced seed in
+                            # reversed order follows once per distance of
+                            # the range-ahead prefetch, each with a raw V
+                            # ring of five tiles, and each once more with its
+                            # output stores under the L2 evict-last hint
+                            # where the seeds above name that hint. The
+                            # three gain together and not one by one, so a
+                            # search that steps one knob at a time from
+                            # the walk sees nothing and drops each. B200,
+                            # 320 requests of a 2047-key window in the SDG
+                            # eval harness, frozen harness, us per call at
+                            # two calls a sample against the source order
+                            # (4 legs): the walk -0.58 +- 0.08, the walk
+                            # with the prefetch -0.51 +- 0.07, the walk
+                            # with the ring -0.68 +- 0.09, none of them a
+                            # timer step; all three -1.16 +- 0.08, one
+                            # step in 11 of 12 legs. Which distance: 48
+                            # CTAs -1.11 +- 0.07, 96 CTAs -1.45 +- 0.10, so
+                            # a search times both. At 12 calls a sample
+                            # the walk's forms read slower than the source
+                            # order at 296 and 320 requests on that GPU, so
+                            # what a search's bank cycles make of the seed
+                            # is the search's to say.
+                            evict_last_form = (
+                                [{"cute_store_policy": "l2_evict_last"}]
+                                if store_policy_seeds
+                                else []
+                            )
+                            triples = [
+                                {
+                                    **balanced_reversed,
+                                    MMA_DAG_BOUNDARY_PREFETCH_AHEAD_KEY: distance,
+                                    MMA_DAG_VALUE_RING_TILES_KEY: VALUE_RING_TILES_SEED,
+                                }
+                                for distance in (
+                                    spec.cute_mma_dag_boundary_prefetch_ahead.choices
+                                )
+                                if distance
+                            ]
+                            range_ahead_seeds.extend(
+                                Config.from_dict({**triple, **form})
+                                for form in ({}, *evict_last_form)
+                                for triple in triples
+                            )
+                        if (
+                            attention.windowed
+                            and spec.cute_mma_dag_boundary_prefetch_cold is not None
+                            and spec.cute_mma_dag_boundary_prefetch_searched
+                            and BOUNDARY_PREFETCH_COLD_SEED_PAGES
+                            in spec.cute_mma_dag_boundary_prefetch_cold.choices
+                        ):
+                            # A kernel with a sliding window on a grid of
+                            # fewer units than SMs, where the search samples
+                            # the sibling prefetch: every seed above that
+                            # prefetches follows once more with that
+                            # prefetch's depth of two pages in a cold
+                            # launch. Its requests pay for a later launch
+                            # over the same pages, by 0.1 to 0.4 us of a
+                            # 23 us call with three input banks and by
+                            # nothing with six: less than the timer step a
+                            # search reads, on top of whichever prefetching
+                            # form wins, so a search times it on each of
+                            # them and does not rely on a step. (The
+                            # measurements: ``cute_mma_dag``, at the key.)
+                            cold_prefetch_seeds.extend(
+                                Config.from_dict(
+                                    {
+                                        **seed.config,
+                                        MMA_DAG_BOUNDARY_PREFETCH_COLD_KEY: (
+                                            BOUNDARY_PREFETCH_COLD_SEED_PAGES
+                                        ),
+                                    }
+                                )
+                                for seed in (*prefetch_seeds, *page_order_seeds)
+                                if seed.config.get(MMA_DAG_BOUNDARY_PREFETCH_KEY)
+                            )
                         if spec.cute_pdl_capture_overlap_searched:
                             # The benchmark times back-to-back captured
                             # calls and the search samples the policy: seed
@@ -1544,5 +1642,16 @@ class MmaDagSeedPlanner:
         # evict-last hint, with one unit per CTA and, where the seeds above
         # name the balanced partition, on it.
         seeds.extend(store_policy_seeds)
+        # None of them requests anything in a launch without a head start.
+        # On a one-wave grid of a kernel with a sliding window, each seed
+        # that prefetches follows with the sibling form's cold depth, where
+        # the search samples that prefetch.
+        seeds.extend(cold_prefetch_seeds)
+        # And none prefetches on a persistent partition or counts its raw V
+        # ring in tiles. Where the units of a windowed kernel outnumber the
+        # SMs and the search samples the prefetches, the balanced seed in
+        # reversed order follows with the range-ahead prefetch at each
+        # distance and a ring of five tiles, and again under the store hint.
+        seeds.extend(range_ahead_seeds)
         # The paired head leads; every other seed keeps its order.
         return [*paired_head, *(seed for seed in seeds if seed not in paired_head)]

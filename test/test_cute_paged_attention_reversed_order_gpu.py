@@ -488,17 +488,17 @@ def test_the_reversed_walk_stays_within_rounding_on_the_balanced_partition():
 # One compile pair each, on a persistent partition: whole units, which no
 # CTA shares; the clipped page last; the walk under a range skew the launch
 # applies, V issued with its K and the stores' L2 hint, as searched balanced
-# configs carry them; and whole tiles under the window. The skew is two
-# pages, the largest this bind offers (a third as many CTAs as units of at
-# most 32 pages: mean shares of about a hundred slots), and the launches
-# of its longer requests apply one page of it.
+# configs carry them; and whole tiles under the window. The skew is one
+# page, the largest this bind offers (a third as many CTAs as units, whose
+# rows see keys of at most thirteen pages under the window: mean shares of
+# about forty slots), and the launches of its longer requests apply it.
 PERSISTENT = {
     "whole-lead8": ("whole", {LEAD: 8}, {}),
     "balanced-last": ("balanced", {}, {}),
     "balanced-lead8-lag0-hint": (
         "balanced",
         {LEAD: 8},
-        {SKEW: 2, V_LAG: 0, "cute_store_policy": "l2_evict_last"},
+        {SKEW: 1, V_LAG: 0, "cute_store_policy": "l2_evict_last"},
     ),
     "balanced-lead8-clip-off": ("balanced", {LEAD: 8}, {CLIP: "off"}),
 }

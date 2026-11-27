@@ -12,6 +12,8 @@ from typing import TYPE_CHECKING
 from .cute_mma_dag import AXIS_LEAD
 from .cute_mma_dag import MMA_DAG_AUX_KEY
 from .cute_mma_dag import MMA_DAG_AUX_REGISTER
+from .cute_mma_dag import MMA_DAG_BOUNDARY_PREFETCH_AHEAD_KEY
+from .cute_mma_dag import MMA_DAG_BOUNDARY_PREFETCH_COLD_KEY
 from .cute_mma_dag import MMA_DAG_BOUNDARY_PREFETCH_KEY
 from .cute_mma_dag import MMA_DAG_CLUSTER_KEY
 from .cute_mma_dag import MMA_DAG_DERIVED_EXCHANGE
@@ -49,7 +51,9 @@ from .cute_mma_dag import MMA_DAG_V_LAG_KEY
 from .cute_mma_dag import MMA_DAG_VALUE_METADATA_READ_OVERLAP_KEY
 from .cute_mma_dag import MMA_DAG_VALUE_METADATA_SKIP_KEY
 from .cute_mma_dag import MMA_DAG_WARPS_KEY
+from .cute_mma_dag import paged_attention_boundary_prefetch_ahead_choices
 from .cute_mma_dag import paged_attention_boundary_prefetch_choices
+from .cute_mma_dag import paged_attention_boundary_prefetch_cold_choices
 from .cute_mma_dag import paged_attention_clipped_page_lead_choices
 from .cute_mma_dag import paged_attention_early_retirement_default
 from .cute_mma_dag import paged_attention_key_clip_choices
@@ -66,6 +70,7 @@ from .cute_mma_dag import paged_attention_v_lag_choices
 from .cute_mma_dag import paged_attention_value_ring_choices
 from .cute_mma_dag import paged_attention_value_ring_facts
 from .cute_mma_dag import paged_attention_value_ring_fit
+from .cute_mma_dag import paged_attention_value_ring_tiles_choices
 from .paged_attention_page_order import MMA_DAG_CLIPPED_PAGE_LEAD_CHOICES
 from .paged_attention_page_order import MMA_DAG_CLIPPED_PAGE_LEAD_DEFAULT
 from .paged_attention_page_order import MMA_DAG_CLIPPED_PAGE_LEAD_KEY
@@ -78,7 +83,9 @@ from .paged_attention_page_order import REVERSED_ORDER_NEEDS_PAIR
 from .paged_attention_registers import MMA_DAG_REGISTER_QUOTAS_KEY
 from .paged_attention_release import MMA_DAG_RELEASE_LEAD_DEFAULT
 from .paged_attention_shared_memory import MMA_DAG_VALUE_RING_KEY
+from .paged_attention_shared_memory import MMA_DAG_VALUE_RING_TILES_KEY
 from .paged_attention_shared_memory import PAIRED_DEFAULT_VALUE_RING
+from .paged_attention_shared_memory import ValueRingTiles
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
@@ -216,6 +223,72 @@ def paged_attention_boundary_prefetch_reason(
     return None
 
 
+def paged_attention_boundary_prefetch_cold_reason(
+    facts: CuteMmaDagFacts, config: Mapping[str, object]
+) -> str | None:
+    """Why this configuration's schedule cannot run the cold-launch depth
+    of the sibling prefetch it names.
+
+    The depth extends the sibling form's role to launches without a head
+    start, so it needs that role in the same config: a boundary prefetch
+    other than none on a grid of fewer units than SMs. Read behind
+    ``paged_attention_boundary_prefetch_reason``, which holds the pages.
+    """
+    cold = config.get(MMA_DAG_BOUNDARY_PREFETCH_COLD_KEY, 0)
+    if type(cold) is int and cold == 0:
+        return None
+    pass_warps = config.get(MMA_DAG_PASS_WARPS_KEY, MMA_DAG_PASS_WARPS_ATTENTION)
+    value_metadata_skip = config.get(MMA_DAG_VALUE_METADATA_SKIP_KEY, False)
+    partition = config.get(MMA_DAG_PARTITION_KEY, MMA_DAG_PARTITION_ITEM)
+    pages = config.get(MMA_DAG_BOUNDARY_PREFETCH_KEY, 0)
+    choices = paged_attention_boundary_prefetch_cold_choices(
+        facts.attention, pass_warps, value_metadata_skip, partition, pages
+    )
+    if type(cold) is not int or cold not in choices:
+        return (
+            f"{MMA_DAG_BOUNDARY_PREFETCH_COLD_KEY} must be one of {choices!r} "
+            f"for {MMA_DAG_BOUNDARY_PREFETCH_KEY}={pages!r}, "
+            f"{MMA_DAG_PASS_WARPS_KEY}={pass_warps!r}, "
+            f"{MMA_DAG_VALUE_METADATA_SKIP_KEY}={value_metadata_skip!r} and "
+            f"{MMA_DAG_PARTITION_KEY}={partition!r} on this kernel's grid: it "
+            "is the depth of the sibling prefetch in a launch without a head "
+            "start, on a grid of fewer units than SMs"
+        )
+    return None
+
+
+def paged_attention_boundary_prefetch_ahead_reason(
+    facts: CuteMmaDagFacts, config: Mapping[str, object]
+) -> str | None:
+    """Why this configuration's schedule cannot run the range-ahead
+    prefetch at the distance it names.
+
+    The role is the spare control warp of a balanced CTA, on the paired
+    schedule without the value-metadata transport, where the bind's grid
+    holds more units than SMs; its value is a distance in CTAs that names a
+    CTA of the grid.
+    """
+    distance = config.get(MMA_DAG_BOUNDARY_PREFETCH_AHEAD_KEY, 0)
+    if type(distance) is int and distance == 0:
+        return None
+    pass_warps = config.get(MMA_DAG_PASS_WARPS_KEY, MMA_DAG_PASS_WARPS_ATTENTION)
+    value_metadata_skip = config.get(MMA_DAG_VALUE_METADATA_SKIP_KEY, False)
+    partition = config.get(MMA_DAG_PARTITION_KEY, MMA_DAG_PARTITION_ITEM)
+    choices = paged_attention_boundary_prefetch_ahead_choices(
+        facts.attention, pass_warps, value_metadata_skip, partition
+    )
+    if type(distance) is not int or distance not in choices:
+        return (
+            f"{MMA_DAG_BOUNDARY_PREFETCH_AHEAD_KEY} must be one of {choices!r} "
+            f"for {MMA_DAG_PASS_WARPS_KEY}={pass_warps!r}, "
+            f"{MMA_DAG_VALUE_METADATA_SKIP_KEY}={value_metadata_skip!r} and "
+            f"{MMA_DAG_PARTITION_KEY}={partition!r} on this kernel's grid: it "
+            "is the distance in CTAs of the balanced partition's range-ahead "
+            "prefetch, on a grid of more units than SMs"
+        )
+    return None
+
+
 def paged_attention_release_lead_reason(
     facts: CuteMmaDagFacts, config: Mapping[str, object]
 ) -> str | None:
@@ -264,6 +337,54 @@ def paged_attention_value_ring_reason(
         # The schedule has the ring: say what this partition's CTA would
         # need of the device for the depth.
         fit = paged_attention_value_ring_fit(ringed, ring, partition)
+        if fit is not None:
+            reason += f": {fit}"
+    return reason
+
+
+def paged_attention_value_ring_tiles_reason(
+    facts: CuteMmaDagFacts, config: Mapping[str, object]
+) -> str | None:
+    """Why this configuration's schedule cannot stage the tiles of raw V it
+    names in a ring counted in tiles.
+
+    That ring is a persistent CTA's, of a kernel with a sliding window, in
+    the place of the default depth in pages, and must fit the shared memory
+    the device grants one CTA with what the partition adds to it. Read
+    behind ``paged_attention_value_ring_reason``, which holds the depth in
+    pages.
+    """
+    tiles = config.get(MMA_DAG_VALUE_RING_TILES_KEY, 0)
+    if type(tiles) is int and tiles == 0:
+        return None
+    attention = facts.attention
+    pass_warps = config.get(MMA_DAG_PASS_WARPS_KEY, MMA_DAG_PASS_WARPS_ATTENTION)
+    value_metadata_skip = config.get(MMA_DAG_VALUE_METADATA_SKIP_KEY, False)
+    partition = config.get(MMA_DAG_PARTITION_KEY, MMA_DAG_PARTITION_ITEM)
+    ring = config.get(MMA_DAG_VALUE_RING_KEY, PAIRED_DEFAULT_VALUE_RING)
+    choices = paged_attention_value_ring_tiles_choices(
+        attention, pass_warps, value_metadata_skip, partition, ring
+    )
+    if type(tiles) is int and tiles in choices:
+        return None
+    reason = (
+        f"{MMA_DAG_VALUE_RING_TILES_KEY} must be one of {choices!r} for "
+        f"{MMA_DAG_PASS_WARPS_KEY}={pass_warps!r}, "
+        f"{MMA_DAG_VALUE_METADATA_SKIP_KEY}={value_metadata_skip!r}, "
+        f"{MMA_DAG_PARTITION_KEY}={partition!r} and "
+        f"{MMA_DAG_VALUE_RING_KEY}={ring!r} on this device: a ring counted in "
+        "tiles is a persistent partition's, of a kernel with a sliding "
+        "window, beside the default depth in pages"
+    )
+    ringed = paged_attention_value_ring_facts(
+        attention, pass_warps, value_metadata_skip, partition
+    )
+    if (
+        type(tiles) is int
+        and ringed is not None
+        and partition != MMA_DAG_PARTITION_ITEM
+    ):
+        fit = paged_attention_value_ring_fit(ringed, ValueRingTiles(tiles), partition)
         if fit is not None:
             reason += f": {fit}"
     return reason
@@ -465,8 +586,11 @@ def paged_attention_config_reason(
         paged_attention_partition_reason(facts, config)
         or paged_attention_partition_skew_reason(facts, config)
         or paged_attention_boundary_prefetch_reason(facts, config)
+        or paged_attention_boundary_prefetch_cold_reason(facts, config)
+        or paged_attention_boundary_prefetch_ahead_reason(facts, config)
         or paged_attention_release_lead_reason(facts, config)
         or paged_attention_value_ring_reason(facts, config)
+        or paged_attention_value_ring_tiles_reason(facts, config)
         or paged_attention_page_order_reason(facts, config)
         or paged_attention_clipped_page_lead_reason(config)
     )

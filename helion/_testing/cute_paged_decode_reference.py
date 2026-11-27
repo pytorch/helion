@@ -10,6 +10,33 @@ import torch
 from . import DEVICE
 from .cuda_graph import cuda_graph_for_replay
 
+# Where the replays of the packed tile's forms place scale bytes 248 to 254,
+# as (key rows, scale groups) of every tile. A K warp converts 32 rows, a V
+# warp one group of all 128 rows; lane ``l`` of a V warp loads rows ``4 l``
+# to ``4 l + 3``.
+PACKED_GUARD_PLACEMENTS: dict[str, tuple[tuple[int, ...], tuple[int, ...]]] = {
+    # A few rows of one K warp, in one group: that warp is mixed, and of the
+    # V warps only the group's own replaces its tile.
+    "rows": ((33, 40, 62), (2,)),
+    # A whole K warp: its unanimous vote fails for every row; every V warp
+    # holds the bytes in a quarter of its lanes.
+    "warp_rows": (tuple(range(64, 96)), (0, 1, 2, 3)),
+    # A whole V warp's group: every K row is mixed, one V warp replaces its
+    # tile and the other three convert natively beside it.
+    "warp_group": (tuple(range(128)), (1,)),
+    # The whole tile.
+    "tile": (tuple(range(128)), (0, 1, 2, 3)),
+    # Scattered rows of the last group: another group than the one three of
+    # the V warps convert.
+    "other_group": (tuple(range(0, 128, 5)), (3,)),
+}
+# Key rows of the replays that hold one scale byte of 248 in a tile of
+# in-range bytes: byte 0, 1, 2 and 3 of a V lane's four-key scale word (lanes
+# 0, 0, 15 and 31), the word that lane's vote reads. Every placement above
+# has a byte in the upper half of some lane's word wherever it has one, so a
+# vote that read only that half of the word would pass them all.
+PACKED_GUARD_SINGLE_ROWS: tuple[int, ...] = (0, 1, 62, 127)
+
 
 def check_full_domain_decode(
     columns: int,
@@ -20,12 +47,24 @@ def check_full_domain_decode(
     post_scale_log2: int = 0,
     *,
     positive_zero: bool = False,
+    packed_tile_forms: bool = False,
 ) -> None:
     """Compare every byte/scale pair and graph replay using raw BF16 bits.
 
     Replay mixes exceptional and ordinary scales within warps, including
     isolated invalid lanes surrounded by valid rows. Bit comparison includes
     NaN, signed zero, and signed infinity cases.
+
+    ``packed_tile_forms`` asks the conversions for the paired body's forms
+    of the packed tile (``packed_scale_tile_layout``) and, on that layout,
+    adds replays that place scale bytes 248 to 254 over varied raw bytes
+    where those forms decide (``PACKED_GUARD_PLACEMENTS``), and replays of
+    one byte of 248 alone in a tile, in each byte of a V lane's scale word
+    and each scale group (``PACKED_GUARD_SINGLE_ROWS``): a V warp's vote
+    must read every key row of every lane. The reference is the source's
+    full-domain arithmetic for every byte, so a form that converted an
+    out-of-range byte natively, or an in-range one otherwise than exactly,
+    differs in bits.
     """
     assert not positive_zero or transpose
     if torch.cuda.get_device_capability()[0] != 10:
@@ -57,6 +96,15 @@ def check_full_domain_decode(
         scale_group,
         post_scale_log2,
         positive_zero,
+        packed_tile_forms,
+    )
+    packed_tile = (
+        packed_tile_forms
+        and columns == 128
+        and scale_group == 32
+        and scale_row_stride == 4
+        and not scale_swizzle
+        and post_scale_log2 >= -6
     )
     with cuda_graph_for_replay() as graph:
         with torch.cuda.graph(graph):
@@ -112,8 +160,40 @@ def check_full_domain_decode(
                 if group < columns // scale_group
                 for scale in (0, lower - 1, 248)
             )
+        if packed_tile:
+            replays.extend(f"guard_{name}" for name in PACKED_GUARD_PLACEMENTS)
+            # One byte of 248 in the first tile, every other byte 127, under
+            # raw bytes of -128: the full-domain product overflows to an
+            # infinity where the native conversion stays finite. Of the V
+            # warps only the group's own replaces its tile, on the vote of
+            # that one row of one lane; the row's K warp is mixed.
+            replays.extend(
+                (127, row, group, 248)
+                for group in range(columns // scale_group)
+                for row in PACKED_GUARD_SINGLE_ROWS
+            )
         for replay in replays:
-            if isinstance(replay, tuple):
+            if isinstance(replay, str) and replay.startswith("guard_"):
+                # Varied raw bytes under in-range scales that differ by row
+                # and group, then the placement's out-of-range bytes.
+                raw.copy_(
+                    ((codes * 37 + (codes // 128) * 13 + 11) % 256)
+                    .to(torch.uint8)
+                    .view(torch.int8)
+                )
+                row = torch.arange(128, device=DEVICE)[None, :, None]
+                group = torch.arange(4, device=DEVICE)[None, None, :]
+                tile = torch.arange(tiles, device=DEVICE)[:, None, None]
+                scales.copy_(
+                    ((tile * 61 + row * 5 + group * 83 + 3) % 248).to(torch.uint8)
+                )
+                rows, groups = PACKED_GUARD_PLACEMENTS[replay.removeprefix("guard_")]
+                for position, placed_row in enumerate(rows):
+                    for placed_group in groups:
+                        scales[:, placed_row, placed_group] = (
+                            248 + (position + placed_group) % 7
+                        )
+            elif isinstance(replay, tuple):
                 background, row, group, scale = replay
                 raw.fill_(-128)
                 scales.fill_(background)
@@ -179,4 +259,4 @@ def check_full_domain_decode(
             assert torch.equal(
                 output.view(torch.bfloat16).view(torch.int16),
                 expected.view(torch.int16),
-            )
+            ), replay

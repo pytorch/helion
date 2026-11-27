@@ -59,8 +59,80 @@ def partition_slot_bits(units: int, page_limit: int, num_sm: int) -> int:
     return 32 if plan_grid_bound(units, page_limit) >= 2 * num_sm else 64
 
 
+def paired_stream_page_bound(page_extent: object, units: int) -> int:
+    """The most pages one CTA of the paired schedule streams, where the
+    bind states it and it is below 2**31, else zero.
+
+    A unit's trips are those of the source's loop over its pages, which
+    stays inside the page table: at most ``page_extent``, the table's
+    extent along its page axis. A CTA of one unit streams that many; a
+    persistent CTA at most all ``units`` units, the product
+    ``partition_slot_bits`` already requires below 2**31. A page table of
+    dynamic extent states no bound. The body counts its per-tile loops in
+    Int32 below a bound (``_paged_attention_paired_pipeline._tile_steps``)
+    and in the source's Int64 without one.
+    """
+    if type(page_extent) is not int or page_extent <= 0 or units <= 0:
+        return 0
+    bound = units * page_extent
+    return bound if bound < 2**31 else 0
+
+
+def window_page_bound(
+    window_left: int | None,
+    query_rows: int,
+    group: int,
+    page_limit: int,
+    key_width: int = 128,
+) -> int | None:
+    """Most pages of a unit's page table that hold a key some row of the
+    unit sees under a static window, or None where the bind proves no such
+    bound and the table's extent stands.
+
+    What the bind proves. The mask is ``key <= position`` and ``key >=
+    position - window_left`` with a constant ``window_left >= 0``
+    (``LogicalAttentionMask``; None: no window, no bound). Row ``r`` of the
+    unit's ``query_rows`` rows stands at ``(length - query_len) + r //
+    group`` (``AttentionCoordinates``), so the rows stand at ``(query_rows
+    - 1) // group + 1`` consecutive positions, wherever the first one lies.
+    ``query_len`` is that first position's offset below the request's
+    length, not a count: only the direct-I/O layout and the head-wide
+    rescale predicate tie the rows to ``query_len * group``, elsewhere the
+    matcher accepts any non-negative offset, zero included, and the bound
+    does not read it. Page ``p`` of the table holds the ``key_width`` keys
+    from ``p * key_width``.
+
+    A row sees keys out of the ``window_left + 1`` up to its position, so
+    all rows see keys out of ``window_left + positions`` consecutive ones;
+    a row whose position the source's Int32 length arithmetic wraps below
+    zero sees none. ``n`` consecutive keys touch at most ``(n + key_width -
+    2) // key_width + 1`` pages: one more than they fill when they start on
+    a page's last key. A 2047-key window with four or five positions gives
+    18; the pages it covers at a given length are 17 or 18.
+
+    That counts each page once only while no two pages of the table have
+    the same key coordinates, which a table of more than ``2**31`` keys
+    does not give an Int32 coordinate: such a bind gets no bound.
+    """
+    if (
+        window_left is None
+        or window_left < 0
+        or query_rows <= 0
+        or group <= 0
+        or key_width <= 0
+        or page_limit * key_width > 2**31
+    ):
+        return None
+    positions = (query_rows - 1) // group + 1
+    return (window_left + positions + key_width - 2) // key_width + 1
+
+
 def partition_skew_choices(
-    choices: tuple[int, ...], units: int, page_limit: int, capacity: int
+    choices: tuple[int, ...],
+    units: int,
+    page_limit: int,
+    capacity: int,
+    window_pages: int | None = None,
 ) -> tuple[int, ...]:
     """The range skews of ``choices`` a balanced bind can apply at all.
 
@@ -69,14 +141,27 @@ def partition_skew_choices(
     ``SKEW_SHARE``): a skew costs its own
     length at the end of the launch, so it pays only as a small fraction of
     the share, and no range is ever empty. The mean share is at most what
-    units of ``page_limit`` pages give the launch's ``min(units, capacity)``
-    CTAs, ``capacity`` being the SMs the kernel may use
-    (``ConfigSpec.num_sm``, which leaves the reserved ones out): a larger
-    skew would be the same kernel as that bound for every launch. A launch
-    of shorter units, or of a window's few pages out of a long page table,
-    applies less than the config names, down to none.
+    units of the most pages a unit can walk give the launch's
+    ``min(units, capacity)`` CTAs, ``capacity`` being the SMs the kernel
+    may use (``ConfigSpec.num_sm``, which leaves the reserved ones out): a
+    larger skew would be the same kernel as that bound for every launch.
+
+    A unit walks at most ``page_limit`` pages, the page table's extent.
+    Where the bind proves how many of them hold a key some row of a unit
+    sees under a static sliding window (``window_pages``, from
+    ``window_page_bound``; None where it proves none), the share is sized
+    by the smaller of the two. A 2047-key window out of a 391-page table
+    bounds 320 units on 148 SMs at a skew of 1, where the table's extent
+    alone offered up to 16: each of those ran the schedule of the skew of
+    1, as a kernel of its own that a search compiled and timed. The bound
+    is the mask's, not the loop's: a source loop that visits more pages
+    than its rows see has shares it understates, and its launches then
+    apply the largest skew offered where they could have applied more. A
+    launch of shorter units applies less than the config names, down to
+    none.
     """
-    largest = units * (page_limit + 1) // min(units, capacity) // SKEW_SHARE
+    pages = page_limit if window_pages is None else min(page_limit, window_pages)
+    largest = units * (pages + 1) // min(units, capacity) // SKEW_SHARE
     return tuple(skew for skew in choices if skew <= largest)
 
 

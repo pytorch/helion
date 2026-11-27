@@ -357,7 +357,8 @@ def assert_protocol(source, *, join):
     assert isinstance(issuer.body[0], ast.Expr) and calls(issuer.body[0], "_issue_qk")
     (issue,) = function(tree, "_issue_qk").body[-1:]
     assert isinstance(issue, ast.For)
-    assert ast.unparse(issue.iter) == "cutlass.range(count)"
+    # Its page count, in the width the bind's page bound gives the loop.
+    assert ast.unparse(issue.iter) == "cutlass.range(_tile_steps(count, int32_steps))"
     assert [ast.unparse(node) for node in issuer.body[1:]] == [
         "_retire_tensor_memory(base)"
     ]
@@ -818,20 +819,30 @@ def test_setup_rendezvous_follows_the_loader_initialization():
     assert [ast.unparse(node) for node in one_unit.body] == [
         "prims.barrier_cta_arrive(6, thread_count=640)"
     ]
-    # The other arrival at barrier 6 is the persistent loader's.
+    # The other arrivals at barrier 6 are the persistent loader's and, under
+    # the range-ahead prefetch of a balanced partition, the spare warp's,
+    # which plans the range it serves behind the scan as the loader does
+    # (``test_cute_paged_attention_range_ahead``).
     assert (
         sum(
             ast.unparse(call.args[0]) == "6"
             for call in calls(body, "barrier_cta_arrive")
         )
-        == 2
+        == 3
     )
     # The QK role's allocation writes the TMEM slot: only the side that
-    # waited reads it.
-    assert [ast.unparse(node) for node in rendezvous.orelse] == [
+    # waited reads it. Every warp but the loader's waits, and under that
+    # prefetch every warp but the loader's and the spare one.
+    waits = [
         "prims.barrier_cta_sync(6, thread_count=640)",
         "base = cute.make_tensor(slot, cute.make_layout((1,)))[0]",
     ]
+    (ahead,) = rendezvous.orelse
+    assert ast.unparse(ahead.test) == "cutlass.const_expr(range_ahead)"
+    (spare,) = ahead.body
+    assert ast.unparse(spare.test) == "warp == 19"
+    assert [ast.unparse(node) for node in spare.orelse] == waits
+    assert [ast.unparse(node) for node in ahead.orelse] == waits
     index = body.body.index(rendezvous)
     assert not any(
         expression_matches(node.value, "cute.arch.barrier()")
@@ -909,7 +920,10 @@ def test_setup_rendezvous_follows_the_loader_initialization():
     planning = body.body[body.body.index(loader_init) + 1]
     assert ast.unparse(planning.test) == "cutlass.const_expr(partition != 'item')"
     assert len(calls(body, "partition_scan")) == 1
-    assert len(calls(body, "partition_plan")) == 1
+    # (The plan is the loader's; the spare warp of the range-ahead prefetch
+    # evaluates the launch's slots from the same tables for the CTA it
+    # serves, and records nothing.)
+    assert len(calls(body, "partition_plan")) == 2
     scan = next(
         i for i, node in enumerate(planning.body) if calls(node, "partition_scan")
     )
@@ -1027,14 +1041,31 @@ def test_setup_rendezvous_follows_the_loader_initialization():
     (convert_arm,) = compute_arm.orelse
     assert ast.unparse(convert_arm.test) == "warp < 16"
     control_arm = convert_arm.orelse
+    # The control warps read it too, all four of them unless the spare warp
+    # runs the range-ahead prefetch: that warp did not wait at the
+    # rendezvous, which publishes the plan, and does not read it.
+    planned_control = control_arm[0]
+    assert isinstance(planned_control, ast.If)
+    assert ast.unparse(planned_control.test) == "cutlass.const_expr(range_ahead)"
+    (spare_excluded,) = [
+        node for node in planned_control.body if isinstance(node, ast.If)
+    ]
+    assert ast.unparse(spare_excluded.test) == "warp != 19"
     assert [
-        ast.unparse(arm[0]) for arm in (compute_arm.body, convert_arm.body, control_arm)
+        ast.unparse(arm[0])
+        for arm in (
+            compute_arm.body,
+            convert_arm.body,
+            planned_control.orelse,
+            spare_excluded.body,
+        )
     ] == [
         "first_unit, last_unit, _pages = _planned_units(plan)",
         "_first, _last, count = _planned_units(plan)",
         "first_unit, last_unit, count = _planned_units(plan)",
+        "first_unit, last_unit, count = _planned_units(plan)",
     ]
-    assert len(calls(body, "_planned_units")) == 3
+    assert len(calls(body, "_planned_units")) == 4
     # Both conversions take one statement, which needs one count for both.
     same, shared, conversions = convert_arm.body[1:4]
     assert ast.unparse(same) == (
