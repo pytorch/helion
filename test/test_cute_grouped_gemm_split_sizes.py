@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+from contextlib import nullcontext
 import os
 from types import SimpleNamespace
 from typing import TYPE_CHECKING
@@ -47,6 +48,7 @@ from helion._hardware import HardwareInfo
 from helion._testing import DEVICE
 from helion._testing import matchesBackends
 from helion._testing import patch_cute_mma_support
+from helion._testing.cute_d_shift_gate import d_shift_proposals
 import helion.language as hl
 
 if TYPE_CHECKING:
@@ -499,6 +501,15 @@ def _assert_device_split_seed_family_policy(
         TCGEN05_GROUPED_WORKLIST_MEDIUM_SOURCE_M_TILE,
         TCGEN05_GROUPED_WORKLIST_LARGE_SOURCE_M_TILE,
     }
+    # An M,N tile carries the bounded D shift only where a search proposes
+    # it; behind the gate no seed does.
+    proposed = bound.config_spec._cute_tcgen05_config.grouped_d_shift_search_enabled
+    assert all(
+        config.get("tcgen05_grouped_d_shift", False) is proposed for config in mn_seeds
+    )
+    assert proposed or not any(
+        config.get("tcgen05_grouped_d_shift") for config in seeds
+    )
     assert all(
         TCGEN05_GROUPED_RUNTIME_DIRECT_CONFIG_KEY not in config.config
         for config in seeds
@@ -510,7 +521,8 @@ def _assert_device_split_seed_family_policy(
     assert bound.config_spec.compiler_default_config == seeds[0]
 
 
-def test_grouped_device_split_seed_family_policy_without_gpu() -> None:
+@pytest.mark.parametrize("proposed", [False, True])
+def test_grouped_device_split_seed_family_policy_without_gpu(proposed: bool) -> None:
     from test.cute_population_contracts import _target
 
     from helion._testing.cute_codegen import mock_cuda_unavailable
@@ -524,8 +536,11 @@ def test_grouped_device_split_seed_family_policy_without_gpu() -> None:
         _target(),
         mock_cuda_unavailable(),
         patch("torch.cuda._lazy_init", side_effect=AssertionError("GPU forbidden")),
+        d_shift_proposals() if proposed else nullcontext(),
     ):
         bound = _device_split_sizes_kernel._bind_isolated(values)
+        model = bound.config_spec._cute_tcgen05_config
+        assert model.grouped_d_shift_search_enabled is proposed
         _assert_device_split_seed_family_policy(bound)
 
 

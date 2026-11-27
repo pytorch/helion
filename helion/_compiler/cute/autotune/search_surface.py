@@ -5936,6 +5936,11 @@ class CuteSearchSurface(BackendSearchSurface):
     def seed_configs(self, config_spec: ConfigSpec) -> list[Config]:
         return seed_configs(config_spec)
 
+    def repair_search_proposal(
+        self, config_spec: ConfigSpec, config: dict[str, object]
+    ) -> tuple[str, ...]:
+        return surface.repair_search_proposal(config_spec.tcgen05, config)
+
     def prepare_config_generation_overrides(
         self, config_spec: ConfigSpec, overrides: Mapping[str, object] | None
     ) -> tuple[dict[str, object] | None, str | None]:

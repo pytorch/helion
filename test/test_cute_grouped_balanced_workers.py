@@ -11,9 +11,7 @@ import torch
 from test._cute_grouped_gemm_split_sizes import _device_offsets_kernel
 from test._cute_grouped_gemm_split_sizes import _device_split_sizes_kernel
 from test.cute_population_contracts import _target
-from test.test_cute_grouped_ab_k import _unsupported_k_loop
 from test.test_cute_grouped_d_shift import _args
-from test.test_cute_grouped_d_shift import _config as _d_shift_config
 from test.test_cute_grouped_d_shift import _plans
 from test.test_cute_grouped_d_shift import _unsafe_output
 
@@ -22,6 +20,8 @@ from helion._compiler.cute.grouped_balanced_workers import balanced_workers_inde
 from helion._testing.cute_codegen import cpu_bind
 from helion._testing.cute_codegen import forbid_cuda_work
 from helion._testing.cute_codegen import mock_cuda_unavailable
+from helion._testing.cute_grouped_configs import d_shift_config as _d_shift_config
+from helion._testing.cute_grouped_offsets import unsupported_k_loop
 from helion.exc import BackendUnsupported
 from helion.exc import InvalidConfig
 from helion.runtime.cute.launcher import _append_cute_wrapper_plan
@@ -371,7 +371,7 @@ def test_unsupported_profiles_and_config_values_fail_closed(updates) -> None:
 def test_noncanonical_k_effects_do_not_gain_a_worker_balance_domain(variant) -> None:
     args = (*_args("offsets", torch.int32), variant)
     with forbid_cuda_work(), _target(), mock_cuda_unavailable():
-        bound = cpu_bind(_unsupported_k_loop, args)
+        bound = cpu_bind(unsupported_k_loop, args)
         assert not bound.config_spec._cute_tcgen05_config.grouped_balanced_workers_supported
         config = _config()
         config.config["tcgen05_grouped_d_shift"] = False

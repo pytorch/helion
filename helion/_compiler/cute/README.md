@@ -352,6 +352,27 @@ rebenchmark's finalist count (32) and isolated timing.  Rule:
 an emitter reads `config` only through its family's knob table; a
 general-purpose emitter does not read it at all.
 
+One knob is validated and never proposed: `tcgen05_grouped_d_shift`.  The
+bounded D shift stores every tile of a group through one static descriptor
+based M rows below the output.  Nearly every shape gives that descriptor the
+large allocation class, for which PTX ISA 9.5 leaves the store of a group's
+partial last tile undefined unless the 128 KiB from the descriptor's address
+are accessible, and they begin below the output, in memory the kernel does
+not own.  Measured on one B200 only, a store through this geometry writes
+the in-bounds bytes and touches no other page.  So no candidate of a search
+stores through the shift: no compiler seed carries it, neither it nor the
+knob of the paired prefix recipes, which are legal only on it, is a search
+coordinate (`tcgen05_config.surface.D_SHIFT_PROPOSAL_KEYS`), and an
+LLM-guided search benchmarks a reply that names one without it
+(`ConfigSpec.search_proposal`).  The M,N worklist tiles stay seeds, without
+the shift.  A config that names the shift, passed to the kernel or read from
+the autotune cache, is accepted, normalized and compiled as before.  The
+docstring of `grouped_d_shift.d_shift_searched` has the rule, the
+measurement, what the gate covers and what lifts it; `KNOWN_GAPS.md` has the
+entries for what remains: grouped-d-shift-store-below-output (a config that
+names the shift) and grouped-rewritten-tensormap-keeps-large-class (the
+descriptors a kernel rewrites per group).
+
 ## 7. The runtime
 
 `helion/runtime/cute/launcher.py` (`default_cute_launcher`) builds the

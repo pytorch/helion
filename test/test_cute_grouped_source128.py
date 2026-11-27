@@ -32,15 +32,19 @@ from helion._testing import DEVICE
 from helion._testing.cute_codegen import cpu_bind
 from helion._testing.cute_codegen import forbid_cuda_work
 from helion._testing.cute_codegen import mock_cuda_unavailable
+from helion._testing.cute_d_shift_gate import d_shift_proposals
 from helion._testing.cute_flash import seeds_per_codegen_branch
 from helion.autotuner.effort_profile import get_effort_profile
 from helion.autotuner.surrogate_pattern_search import LFBOTreeSearch
 from helion.runtime.cute.launcher import _tcgen05_grouped_device_source_m_tile_supported
 from helion.runtime.cute.launcher import _validate_tcgen05_grouped_device_split_sizes
 
+pytestmark = pytest.mark.cpu_only
+
 SOURCE = "tcgen05_grouped_worklist_source_m_tile"
 MODE = "tcgen05_grouped_mode"
 SHIFTED = "tcgen05_grouped_d_shift"
+ORIENTATION = "tcgen05_grouped_worklist_orientation"
 
 
 @pytest.fixture
@@ -192,6 +196,10 @@ def test_typed_device_seeds_and_promotion_survive_newer_dsl(
             "helion._compiler.cute.cutedsl_compat._installed_cute_dsl_version",
             return_value=_CuteDSLVersionProbe(version=Version("4.8.2")),
         ),
+        # The shifted seeds, those of the M,N worklist at each MMA N among
+        # them, are proposals of the bounded D shift: bound with them, so
+        # that their branches render on this DSL.
+        d_shift_proposals(),
     ):
         assert not tcgen05_runtime_n_ptx_compatible()
         bound = cpu_bind(kernel, args)
@@ -215,7 +223,7 @@ def test_typed_device_seeds_and_promotion_survive_newer_dsl(
         # bounded D shift, the orientation and the MMA N; the other seed axes
         # (stage depths, L2 swizzle) re-parameterize the same text.  Render
         # the first seed of each branch and the last seed instead of all.
-        for seed in seeds_per_codegen_branch(
+        rendered = seeds_per_codegen_branch(
             source128,
             lambda seed: (
                 seed["tcgen05_cluster_m"],
@@ -224,7 +232,17 @@ def test_typed_device_seeds_and_promotion_survive_newer_dsl(
                 seed.get("tcgen05_grouped_worklist_orientation"),
                 seed.get("tcgen05_grouped_worklist_mma_n"),
             ),
-        ):
+        )
+        # Nine branches and the last seed; eight of the ten store through
+        # the shift, those of the M,N worklist at each of its MMA Ns.
+        assert len(rendered) == 10
+        assert sum(seed.get(SHIFTED) is True for seed in rendered) == 8
+        assert {
+            seed["tcgen05_grouped_worklist_mma_n"]
+            for seed in rendered
+            if seed.get("tcgen05_grouped_worklist_orientation") == "mn"
+        } == {128, 192, 224, 256}
+        for seed in rendered:
             ast.parse(bound.to_code(seed))
 
 
@@ -333,19 +351,16 @@ def test_source128_seed_depths_use_physical_smem_and_preserve_old_prefix() -> No
             return_value=[],
         ):
             previous = cpu_bind(_grouped_fp32_output, args)
-            old_seeds = deepcopy(
-                [
-                    seed
-                    for seed in previous.config_spec.compiler_seed_configs
-                    if seed.get(SHIFTED) is not True
-                ]
-            )
+            old_seeds = deepcopy(previous.config_spec.compiler_seed_configs)
             old_default = deepcopy(previous.config_spec.compiler_default_config)
         bound = cpu_bind(_grouped_fp32_output, args)
-        all_seeds = bound.config_spec.compiler_seed_configs
-        seeds = [seed for seed in all_seeds if seed.get(SHIFTED) is not True]
-        shifted = [seed for seed in all_seeds if seed.get(SHIFTED) is True]
-        assert all_seeds == [*seeds, *shifted]
+        seeds = bound.config_spec.compiler_seed_configs
+        # The M,N tiles follow every N,M seed, so the source128 seeds extend
+        # the N,M seeds ahead of them.
+        tiles = [seed for seed in seeds if seed.get(ORIENTATION) == "mn"]
+        assert tiles and seeds[-len(tiles) :] == tiles
+        seeds = seeds[: -len(tiles)]
+        old_seeds = [seed for seed in old_seeds if seed.get(ORIENTATION) != "mn"]
         assert seeds[: len(old_seeds)] == old_seeds
         assert bound.config_spec.compiler_default_config == old_default
         for seed in seeds[len(old_seeds) :]:

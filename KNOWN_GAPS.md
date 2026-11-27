@@ -769,3 +769,145 @@ these labelled lines.
 - Pinned by: `test_grid_induction_product_uses_kernel_index_type` in
   `test/test_cute_fragment_loop_captures.py` checks computed-fragment
   index widths; it does not exercise the ordinary nested-store overflow.
+
+## grouped-d-shift-store-below-output
+
+- Area: CuTe backend, a grouped GEMM over a device layout (offsets or split
+  sizes) at a config that names `tcgen05_grouped_d_shift=True`: a config
+  passed to the kernel or read from the autotune cache. No search proposes
+  the option (`helion/_compiler/cute/grouped_d_shift.py`, `d_shift_searched`).
+- What is wrong: the bounded D shift stores every tile of a group through
+  one host-encoded rank-3 TensorMap whose address is M rows below the output
+  (`helion/runtime/cute/host_wrappers/tcgen05.py`,
+  `append_epilogue_tma_wrapper`: `arg.iterator - shape0 * stride0`, with the
+  extents (M, N, M + 1), or (N, M, M + 1) for an N,M worklist), so that the
+  rows past a group's end fall outside the row extent and are not written.
+  The last tile of every group whose rows do not fill it is then a store
+  whose box leaves the tensor. `cuTensorMapEncodeTiled` gives a descriptor
+  the large allocation class once its extents hold 128 KiB, and PTX ISA 9.5
+  ("Out of Boundary Access") leaves such a store undefined unless the
+  128 KiB from the descriptor's address are accessible: here that is memory
+  below the output, which the kernel does not own.
+
+  ```python
+  out = torch.empty((rows, columns), device=a.device, dtype=a.dtype)
+  for group_tile, row_tile, column_tile in hl.tile(
+      [groups, rows, columns], block_size=[1, block_m, block_n]
+  ):
+      group = group_tile.index.sum()
+      start = offsets[group]
+      extent = offsets[group + 1] - offsets[group]
+      row_indices = start + row_tile.index
+      valid = row_tile.index < extent
+      acc = hl.zeros([row_tile, column_tile], dtype=torch.float32)
+      for inner in hl.tile(reduction, block_size=block_k):
+          left = hl.load(a, [row_indices, inner], extra_mask=valid[:, None])
+          acc = torch.addmm(acc, left, weights[group, column_tile, inner].T)
+      hl.store(out, [row_indices, column_tile], acc, extra_mask=valid[:, None])
+  ```
+
+  With a bf16 `a` of 2048 x 2048, `weights` of 16 x 1536 x 2048, int32
+  `offsets`, block sizes registered as (256, 128, 64) and the config
+  `helion.Config(block_sizes=[256, 128, 64],
+  pid_type="persistent_interleaved", tcgen05_cluster_m=2,
+  tcgen05_grouped_mode="worklist_nm", tcgen05_grouped_full_allocation_a=True,
+  tcgen05_grouped_d_shift=True)`, the wrapper plans of the generated code
+  carry `'bounded_output_shift': True` and its store of the output names no
+  per-group descriptor; without the last option the store names the group's
+  own descriptor, which is based on the group's first row inside the output.
+  Measured on a B200 (driver 580.82.07) only: a store through a descriptor
+  of the shift's geometry writes the in-bounds bytes and touches no other
+  page, while a load through it reads below the output; the shift never
+  loads. No wrong result and no fault is known, and no other device or
+  driver was measured.
+- Since: on `main` when this entry was added, where the autotuner proposed
+  the option as well (178 of the 214 compiler seeds of the binding above,
+  and a coordinate of every search of it). "[cutedsl] Keep the bounded
+  grouped D shift out of autotune seeds and search" narrowed it to configs
+  that name the option.
+- Why deferred: the descriptor's class is chosen where the CuTe DSL encodes
+  the descriptor, inside its compiled host code, which Helion cannot reach.
+  A small-class descriptor takes a CuTe DSL on PTX ISA 9.5 (`.alloc_small`
+  on `tensormap.replace`), a descriptor that Helion encodes itself and
+  passes to `cuTensorMapSetAllocationClass` (CUDA 13.5), or a copy that the
+  kernel makes and clears on the device as CuTe DSL 4.8.1 does: its
+  experimental `tensormap_replace`
+  (`cutlass/experimental/primitives/nvvm_wrapper.py`) clears bit 21 of
+  32-bit word 2 of a descriptor whose `global_dim` or `global_stride` it
+  replaces (its "always-safe out-of-bounds fetch mode"), unless its caller
+  passes `keep_oob_fetch_window`. The shift's descriptor is static and the
+  kernel holds no copy of it: making and clearing one is other generated
+  code for every config that names the option, judged on a device by the
+  pages its stores touch and by what it costs. Storing the tail
+  tiles through the group's own descriptor instead helps only where that
+  descriptor is small-class or keeps 128 KiB of the output from its base. It
+  also changes the generated code and the timing of every config that names
+  the option, and gives up the fixed descriptors the option exists for (on
+  that B200 the same config without the option is 0.1% to 6.5% slower), so
+  it takes device timings of its own. Refusing the option would stop saved
+  configs and cache entries from compiling.
+- Pinned by: the descriptor's address and extents, in
+  `test/test_cute_grouped_d_shift.py::test_fixed_bounded_d_view_and_live_coordinates_mask_exact_rows`;
+  that a config which names the option still compiles to it, and that no
+  search proposes it, in `test/test_cute_grouped_d_shift_gate.py`
+  (`test_an_explicit_config_keeps_the_shift_and_its_code`,
+  `test_a_search_gets_no_seed_that_stores_through_the_shift`).
+
+## grouped-rewritten-tensormap-keeps-large-class
+
+- Area: CuTe backend, the grouped tcgen05 kernels that rewrite a TensorMap
+  for each group on the device. On the general grouped path (a grouped GEMM
+  over a device layout: offsets or split sizes) that is the output's
+  descriptor of a worklist config that does not name
+  `tcgen05_grouped_d_shift=True`, the default config and every compiler seed
+  of the binding below among them, and the A and B descriptors where the
+  config leaves them mutable. The flat grouped kernel
+  (`helion/_compiler/cute/tcgen05_flat_grouped_kernel.py`) rewrites the
+  descriptors of its row-packed operand and of its output in the same way.
+- What is wrong: the kernel copies a host-encoded descriptor into shared
+  memory (`TensorMapManager.init_tensormap_from_atom`) and rewrites the copy
+  for each group (`update_tensormap`): the output's to the address
+  `out.iterator + global_m_start * out.layout.stride[0]` and the extents
+  (problem_m, problem_n, 1), or (problem_n, problem_m, 1) for an N,M
+  worklist. The rewrite replaces the address, extents and strides; the CuTe
+  DSL's `update_tma_descriptor` documents every other field as unchanged,
+  and the generated code does nothing else to the copy. The copy therefore
+  keeps the allocation class that `cuTensorMapEncodeTiled` chose for the
+  whole tensor, the large one once the tensor holds 128 KiB, and PTX ISA 9.5
+  ("Out of Boundary Access") leaves a large-class operation whose box leaves
+  the tensor undefined unless the 128 KiB from the descriptor's address are
+  accessible. For a group whose first row is within 128 KiB of the tensor's
+  end they reach past the tensor, into memory the kernel does not own, and
+  the last tile of such a group is a box that leaves the group's extents
+  whenever its rows do not fill the tile.
+
+  With the kernel and the tensors of grouped-d-shift-store-below-output and
+  its config without `tcgen05_grouped_d_shift`, the generated code holds
+  `init_tensormap_from_atom(tcgen05_tma_store_atom, ...)`, one
+  `update_tensormap` of that copy under the test for a new group, and a
+  store of the output that names
+  `tma_desc_ptr=tcgen05_grouped_d_tensormap_desc_ptr`. The output is
+  2048 x 1536 in bf16, 3072 bytes a row: a group that starts in its last 42
+  rows has less than 128 KiB of the output from its first row. The offsets
+  are device data, so any launch can hold such a group, for example a last
+  group over rows [2047, 2048). The default config of that binding, an N,M
+  worklist, copies and rewrites its A and B descriptors (`tma_atom_a`,
+  `tma_atom_b`) in the same way and loads through them.
+  Measured on a B200 (driver 580.82.07) only: through a large-class
+  descriptor with the shift's geometry (grouped-d-shift-store-below-output)
+  a store writes the in-bounds bytes and touches no other page, while a load
+  reads outside the tensor; the flat grouped kernel, loading short groups at
+  the end of its row-packed fp32 operand, touches pages up to 128 KiB past
+  the operand. No wrong result is known; a read past the operand is an
+  illegal memory access where that memory is not mapped.
+- Since: on `main` when this entry was added.
+- Why deferred: nothing the kernel calls sets the class of its copy. The
+  CuTe DSL's rewrite leaves it, and the driver declares a descriptor as
+  opaque quadwords (`CUtensorMap`). A fix has to find the class inside the
+  copy and clear it, for the device and driver at hand, in the generated
+  code of every kernel that rewrites a descriptor, and it is judged on a
+  device: by the pages a launch touches past a short last group, and by
+  what the added instructions cost each kernel.
+- Pinned by: none for the class. That a worklist without the shift stores
+  through its group's descriptor, rewritten at the group's first row, is in
+  `test/test_cute_grouped_d_shift_gate.py::test_an_mn_tile_without_the_shift_stores_through_its_groups_descriptor`.

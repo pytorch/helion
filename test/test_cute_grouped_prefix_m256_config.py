@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 import random
+from typing import TYPE_CHECKING
 from unittest.mock import patch
 
 import pytest
@@ -9,17 +10,21 @@ import torch
 
 from .cute_population_contracts import _target
 from .cute_population_contracts import checked_initial_population
-from .test_cute_grouped_large_device_seeds import _kernel
-from .test_cute_grouped_prefix_adaptive_config import _args
-from .test_cute_grouped_prefix_adaptive_config import _recipes
 from helion._compiler.cute.autotune.heuristics import cute as heuristics
 from helion._compiler.cute.tcgen05_config import facts
 from helion._testing.cute_codegen import cpu_bind
 from helion._testing.cute_codegen import forbid_cuda_work
 from helion._testing.cute_codegen import mock_cuda_unavailable
+from helion._testing.cute_d_shift_gate import d_shift_proposals
+from helion._testing.cute_grouped_configs import prefix_recipe_args as _args
+from helion._testing.cute_grouped_configs import prefix_recipes as _recipes
+from helion._testing.cute_grouped_offsets import fresh_grouped_offsets_k64 as _kernel
 from helion.autotuner.effort_profile import get_effort_profile
 from helion.autotuner.surrogate_pattern_search import LFBOTreeSearch
 from helion.exc import InvalidConfig
+
+if TYPE_CHECKING:
+    from collections.abc import Iterator
 
 pytestmark = pytest.mark.cpu_only
 
@@ -27,6 +32,15 @@ KEY = "tcgen05_grouped_prefix_adaptive_n"
 SOURCE = "tcgen05_grouped_worklist_source_m_tile"
 BALANCED = "tcgen05_grouped_balanced_workers"
 RESERVED = "tcgen05_grouped_static_reserved_sms"
+
+
+@pytest.fixture(autouse=True)
+def _d_shift_proposed() -> Iterator[None]:
+    # The paired prefix recipes store through the bounded D shift,
+    # which a search proposes only behind its gate
+    # (test_cute_grouped_d_shift_gate.py).
+    with d_shift_proposals():
+        yield
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])

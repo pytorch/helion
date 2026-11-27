@@ -2069,6 +2069,44 @@ def _tcgen05_knob_set(
     return True
 
 
+# The two options the gate of the bounded D shift keeps out of a search
+# (``grouped_d_shift.d_shift_searched``): the shift, and the knob of the
+# paired prefix recipes, which is legal only with the shift. ``flat_fields``
+# leaves them out while the gate is closed and ``repair_search_proposal``
+# takes them out of a proposal. Every other grouped option stays a
+# coordinate, the M,N orientation among them: an M,N worklist without the
+# shift stores through its group's own descriptor, as an N,M one does.
+D_SHIFT_PROPOSAL_KEYS: tuple[str, ...] = (
+    TCGEN05_GROUPED_D_SHIFT_CONFIG_KEY,
+    TCGEN05_GROUPED_PREFIX_ADAPTIVE_N_CONFIG_KEY,
+)
+
+
+def repair_search_proposal(
+    state: CuteTcgen05Config, config: dict[str, object]
+) -> tuple[str, ...]:
+    """Take out of ``config``, a proposal from outside a search's flat
+    fields (``ConfigSpec.search_proposal``), the options of
+    ``D_SHIFT_PROPOSAL_KEYS`` that are no coordinates of this kernel's
+    search, and name them.
+
+    A draw or a mutation cannot name such an option, a seed or a cached
+    config that seeds a search comes to it on the flat fields, without the
+    option, and an LLM's reply, which may name whatever normalization
+    accepts, is held to the same here: what is left is the same worklist on
+    the descriptors every candidate of the search stores through. So no
+    candidate stores through the bounded D shift unless the search proposes
+    the shift. Where the options are coordinates (the gate lifted) a reply
+    may name them as a draw may."""
+    fields = state.config_spec._flat_fields()
+    returned = tuple(
+        key for key in D_SHIFT_PROPOSAL_KEYS if key in config and key not in fields
+    )
+    for key in returned:
+        del config[key]
+    return returned
+
+
 def flat_fields(
     state: CuteTcgen05Config,
 ) -> dict[str, BlockIdSequence[Any] | ConfigSpecFragment]:
@@ -2081,6 +2119,13 @@ def flat_fields(
     ):
         fields["loop_orders"] = state.config_spec.loop_orders
     fields.update(optional_fragments(state, for_search=True))
+    if not state.grouped_d_shift_search_enabled:
+        # Validated wherever a config names them, and no coordinates of a
+        # search: the bounded D shift and the paired prefix recipes, which
+        # run on it (``grouped_d_shift.d_shift_searched``). A config that
+        # reaches a search with them is transferred without them.
+        for key in D_SHIFT_PROPOSAL_KEYS:
+            fields.pop(key, None)
     fields.update(workspace_search_fields(state.config_spec))
     seeds = state.config_spec.compiler_seed_configs
     if isinstance(fragment := fields.get("tcgen05_ab_stages"), IntegerFragment):

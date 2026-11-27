@@ -2,10 +2,8 @@ from __future__ import annotations
 
 import ast
 from collections import Counter
-from contextlib import contextmanager
 from itertools import pairwise
 from types import SimpleNamespace
-from typing import TYPE_CHECKING
 from typing import Any
 
 import pytest
@@ -13,42 +11,15 @@ import torch
 
 from helion._compiler.cute.grouped_row_union import PAIRED_CLC
 from helion._compiler.cute.grouped_row_union import GroupedRowUnionPlan
+from helion._testing.cute_sdk_module import sdk_module as _sdk
 
 pytestmark = pytest.mark.cpu_only
-
-if TYPE_CHECKING:
-    from collections.abc import Iterator
 
 
 def _plan(groups: int = 16) -> GroupedRowUnionPlan:
     return GroupedRowUnionPlan(
         groups, 10240, 1024, 1024, 0, 1, 2, "offsets", "union", schedule=PAIRED_CLC
     )
-
-
-@contextmanager
-def _sdk() -> Iterator[SimpleNamespace]:
-    import cutlass
-    from cutlass._mlir import ir
-    from cutlass._mlir import passmanager
-    from cutlass._mlir.dialects import func
-    import cutlass.cute as cute
-    from cutlass.utils.gemm import sm100
-
-    initialized = torch.cuda.is_initialized()
-    with ir.Context(), ir.Location.unknown():
-        module = ir.Module.create()
-        with ir.InsertionPoint(module.body):
-            yield SimpleNamespace(
-                cutlass=cutlass,
-                cute=cute,
-                ir=ir,
-                func=func,
-                passmanager=passmanager,
-                epi=sm100,
-                module=module,
-            )
-    assert torch.cuda.is_initialized() == initialized
 
 
 def _geometry(sdk: SimpleNamespace) -> SimpleNamespace:

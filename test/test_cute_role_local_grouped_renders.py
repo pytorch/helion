@@ -17,8 +17,8 @@ proves it reached its builder in
 
 The kernels and config builders belong to the tests that own those paths
 (``test_cute_rank3_rhs_b_tma``, ``test_cute_deepgemm_selected``,
-``test_cute_grouped_large_device_seeds``, ``examples.grouped_gemm``); their
-argument builders allocate on ``DEVICE``, so the CPU copies live here.
+``examples.grouped_gemm``) and to ``helion._testing.cute_grouped_offsets``;
+their argument builders allocate on ``DEVICE``, so the CPU copies live here.
 """
 
 from __future__ import annotations
@@ -28,7 +28,6 @@ import torch
 
 from test.test_cute_deepgemm_selected import _selected_config
 from test.test_cute_deepgemm_selected import _selected_kernel
-from test.test_cute_grouped_large_device_seeds import _grouped_offsets_k64
 from test.test_cute_rank3_rhs_b_tma import _dynamic_bk64_config
 from test.test_cute_rank3_rhs_b_tma import _grouped_config
 from test.test_cute_rank3_rhs_b_tma import _rank3_rhs_grouped_nt
@@ -63,6 +62,7 @@ from helion._testing import import_example
 from helion._testing import matchesBackends
 from helion._testing import onlyBackends
 from helion._testing import skipUnlessTcgen05RuntimeNPtx
+from helion._testing.cute_grouped_offsets import grouped_offsets_k64
 
 # Renders on a CPU target: the CPU lane runs them without a GPU.
 pytestmark = pytest.mark.cpu_only
@@ -277,7 +277,7 @@ class TestRoleLocalGroupedRenders(RenderPins):
             torch.empty((16, 1536, 2048), dtype=torch.bfloat16),
             torch.arange(17, dtype=torch.int32) * 128,
         )
-        code = _render(_grouped_offsets_k64, args, config)
+        code = _render(grouped_offsets_k64, args, config)
         self._pin(code, PANEL_LOCAL_INDEX, GROUP_TILE_SCHEDULER, MAILBOX_VALID)
 
     def test_dense_full_coverage(self) -> None:

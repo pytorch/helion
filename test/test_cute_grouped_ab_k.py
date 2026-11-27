@@ -24,82 +24,20 @@ from helion._testing.cute_codegen import cpu_bind
 from helion._testing.cute_codegen import forbid_cuda_work
 from helion._testing.cute_codegen import mock_cuda_unavailable
 from helion._testing.cute_codegen import require_cute_codegen
+from helion._testing.cute_grouped_offsets import observed_logical_k
+from helion._testing.cute_grouped_offsets import unsupported_k_loop
 from helion.autotuner.effort_profile import get_effort_profile
 from helion.autotuner.surrogate_pattern_search import LFBOTreeSearch
 from helion.exc import BackendUnsupported
 from helion.exc import InvalidConfig
-import helion.language as hl
 from helion.language import _tracing_ops
 from helion.language import memory_ops
 from helion.runtime.cute.launcher import _validate_tcgen05_grouped_device_split_sizes
 
+pytestmark = pytest.mark.cpu_only
+
 KEY = TCGEN05_GROUPED_AB_TILE_K_CONFIG_KEY
-SHIFTED = "tcgen05_grouped_d_shift"
-
-
-@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
-def _observed_logical_k(
-    a: torch.Tensor, b: torch.Tensor, offsets: torch.Tensor
-) -> tuple[torch.Tensor, int]:
-    m, k = a.shape
-    groups, n, _ = b.shape
-    block_m = hl.register_block_size(256)
-    block_n = hl.register_block_size(128)
-    block_k = hl.register_block_size(64)
-    out = torch.empty((m, n), dtype=torch.float32, device=a.device)
-    for group_tile, rows, columns in hl.tile(
-        [groups, m, n], block_size=[1, block_m, block_n]
-    ):
-        group = group_tile.index.sum()
-        start = offsets[group]
-        length = offsets[group + 1] - offsets[group]
-        row_index = start + rows.index
-        valid = rows.index < length
-        acc = hl.zeros([rows, columns], dtype=torch.float32)
-        for inner in hl.tile(k, block_size=block_k):
-            left = hl.load(a, [row_index, inner], extra_mask=valid[:, None])
-            acc = torch.addmm(acc, left, b[group, columns, inner].T)
-        hl.store(out, [row_index, columns], acc, extra_mask=valid[:, None])
-    return out, block_k
-
-
-@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
-def _unsupported_k_loop(
-    a: torch.Tensor, b: torch.Tensor, offsets: torch.Tensor, variant: int
-) -> torch.Tensor:
-    hl.specialize(variant)
-    m, k = a.shape
-    groups, n, _ = b.shape
-    block_m = hl.register_block_size(256)
-    block_n = hl.register_block_size(128)
-    block_k = hl.register_block_size(64)
-    out = torch.empty((m, n), dtype=torch.float32, device=a.device)
-    for group_tile, rows, columns in hl.tile(
-        [groups, m, n], block_size=[1, block_m, block_n]
-    ):
-        group = group_tile.index.sum()
-        start = offsets[group]
-        length = offsets[group + 1] - offsets[group]
-        row_index = start + rows.index
-        valid = rows.index < length
-        acc = hl.full(
-            [rows, columns], 1.0 if variant == 1 else 0.0, dtype=torch.float32
-        )
-        begin = 64 if variant == 2 else 0
-        for inner in hl.tile(begin, k, block_size=block_k):
-            left = hl.load(a, [row_index, inner], extra_mask=valid[:, None])
-            if variant == 3:
-                left = left * 1.0
-            acc = torch.addmm(
-                acc,
-                left,
-                b[group, columns, inner].T,
-                alpha=2 if variant == 4 else 1,
-            )
-            if variant == 5:
-                acc = acc * 1.0
-        hl.store(out, [row_index, columns], acc, extra_mask=valid[:, None])
-    return out
+ORIENTATION = "tcgen05_grouped_worklist_orientation"
 
 
 def _args(
@@ -152,7 +90,7 @@ def test_physical128_keeps_observed_logical64_and_both_loop_steps(
 ) -> None:
     args = _args(n=160, dtype=dtype, offset_dtype=offset_dtype)
     with forbid_cuda_work(), _target(), mock_cuda_unavailable():
-        bound = cpu_bind(_observed_logical_k, args)
+        bound = cpu_bind(observed_logical_k, args)
         block = bound.config_spec.block_sizes[2]
         assert block.max_size == block.declared_max_size == 64
         requested = _config(cluster_m)
@@ -180,7 +118,7 @@ def test_physical128_keeps_observed_logical64_and_both_loop_steps(
         namespace: dict[str, object] = {}
         exec(compile(source, "<physical grouped K128>", "exec"), namespace)
         launcher = Mock()
-        result, observed = namespace["_observed_logical_k"](*args, _launcher=launcher)
+        result, observed = namespace["observed_logical_k"](*args, _launcher=launcher)
         assert result.shape == (640, 160)
         assert observed == 64
         launcher.assert_called_once()
@@ -210,7 +148,7 @@ def test_physical128_cuda_live_offsets_and_graph_replay(
     config = _config(cluster_m)
     if immutable:
         config.config["tcgen05_grouped_full_allocation_a"] = True
-    bound = _observed_logical_k._bind_isolated(args)
+    bound = observed_logical_k._bind_isolated(args)
     bound.set_config(config)
 
     def reference() -> torch.Tensor:
@@ -240,7 +178,7 @@ def test_physical128_cuda_live_offsets_and_graph_replay(
 @pytest.mark.parametrize("variant", [1, 2, 3, 5])
 def test_noncanonical_k_loops_cannot_request_physical128(variant: int) -> None:
     with forbid_cuda_work(), _target(), mock_cuda_unavailable():
-        bound = cpu_bind(_unsupported_k_loop, (*_args(), variant))
+        bound = cpu_bind(unsupported_k_loop, (*_args(), variant))
         assert not bound.config_spec._cute_tcgen05_config.grouped_ab_k_fusion_supported
         with pytest.raises((InvalidConfig, BackendUnsupported)):
             bound.to_code(_config(2))
@@ -254,7 +192,7 @@ def test_nonunit_addmm_arguments_fail_the_closed_loop_proof(
     # backend guard against a future lowering supplying an otherwise valid FX
     # contraction with those kwargs.
     with forbid_cuda_work(), _target(), mock_cuda_unavailable():
-        bound = cpu_bind(_observed_logical_k, _args())
+        bound = cpu_bind(observed_logical_k, _args())
         graphs = bound.host_function.device_ir.graphs
         mma = next(
             node
@@ -285,7 +223,7 @@ def test_nonunit_addmm_arguments_fail_the_closed_loop_proof(
 )
 def test_unmatched_k_dataflow_and_effects_fail_closed(mutation: str) -> None:
     with forbid_cuda_work(), _target(), mock_cuda_unavailable():
-        bound = cpu_bind(_observed_logical_k, _args())
+        bound = cpu_bind(observed_logical_k, _args())
         graphs = bound.host_function.device_ir.graphs
         mma = next(
             node
@@ -354,7 +292,7 @@ def test_unmatched_k_dataflow_and_effects_fail_closed(mutation: str) -> None:
 
 def test_partial_physical_k_tail_fails_closed() -> None:
     with forbid_cuda_work(), _target(), mock_cuda_unavailable():
-        bound = cpu_bind(_observed_logical_k, _args(k=192))
+        bound = cpu_bind(observed_logical_k, _args(k=192))
         assert not bound.config_spec._cute_tcgen05_config.grouped_ab_k_fusion_supported
         with pytest.raises((InvalidConfig, BackendUnsupported)):
             bound.to_code(_config(2))
@@ -367,7 +305,7 @@ def test_physical_k_requires_an_existing_native_worklist_profile(
     invalid_geometry: str,
 ) -> None:
     with forbid_cuda_work(), _target(), mock_cuda_unavailable():
-        bound = cpu_bind(_observed_logical_k, _args())
+        bound = cpu_bind(observed_logical_k, _args())
         config = _config(2)
         if invalid_geometry == "rows":
             config.block_sizes[0] = 128
@@ -389,7 +327,7 @@ def test_physical_k_requires_an_existing_native_worklist_profile(
 @pytest.mark.parametrize("cluster_m,stages", [(1, 6), (2, 7)])
 def test_physical_k_uses_its_own_smem_footprint(cluster_m: int, stages: int) -> None:
     with forbid_cuda_work(), _target(), mock_cuda_unavailable():
-        bound = cpu_bind(_observed_logical_k, _args())
+        bound = cpu_bind(observed_logical_k, _args())
         config = _config(cluster_m, stages=stages)
         legacy = deepcopy(config)
         legacy.config.pop(KEY)
@@ -444,20 +382,22 @@ def test_none_keeps_legacy_source_and_fused_seeds_keep_logical_cap() -> None:
             "helion._compiler.cute.autotune.heuristics.cute._tcgen05_grouped_physical_k_seeds",
             return_value=[],
         ):
-            old = cpu_bind(_observed_logical_k, args)
+            old = cpu_bind(observed_logical_k, args)
             old_seeds = deepcopy(
                 [
                     seed
                     for seed in old.config_spec.compiler_seed_configs
-                    if seed.get(SHIFTED) is not True
+                    if seed.get(ORIENTATION) != "mn"
                 ]
             )
             old_default = deepcopy(old.config_spec.compiler_default_config)
-        bound = cpu_bind(_observed_logical_k, args)
+        bound = cpu_bind(observed_logical_k, args)
         all_seeds = bound.config_spec.compiler_seed_configs
-        seeds = [seed for seed in all_seeds if seed.get(SHIFTED) is not True]
-        shifted = [seed for seed in all_seeds if seed.get(SHIFTED) is True]
-        assert all_seeds == [*seeds, *shifted]
+        # The M,N tiles follow every N,M seed, so the fused seeds extend the
+        # N,M seeds ahead of them.
+        seeds = [seed for seed in all_seeds if seed.get(ORIENTATION) != "mn"]
+        tiles = [seed for seed in all_seeds if seed.get(ORIENTATION) == "mn"]
+        assert tiles and all_seeds == [*seeds, *tiles]
         assert seeds[: len(old_seeds)] == old_seeds
         assert bound.config_spec.compiler_default_config == old_default
         added = seeds[len(old_seeds) :]
@@ -476,7 +416,7 @@ def test_none_keeps_legacy_source_and_fused_seeds_keep_logical_cap() -> None:
 def test_physical_k_seeds_reach_cold_full_population() -> None:
     args = _args(m=2048, k=512)
     with forbid_cuda_work(), _target(), mock_cuda_unavailable():
-        bound = cpu_bind(_observed_logical_k, args)
+        bound = cpu_bind(observed_logical_k, args)
         state = random.getstate()
         try:
             random.seed(188)

@@ -12,8 +12,6 @@ import torch
 from test._cute_grouped_gemm_split_sizes import _device_offsets_kernel
 from test._cute_grouped_gemm_split_sizes import _device_split_sizes_kernel
 from test.cute_population_contracts import _target
-from test.test_cute_grouped_ab_k import _observed_logical_k
-from test.test_cute_grouped_ab_k import _unsupported_k_loop
 
 import helion
 from helion._compiler.cute.grouped_d_shift import bounded_d_shift_index_domain
@@ -22,7 +20,11 @@ from helion._testing.cute_codegen import cpu_bind
 from helion._testing.cute_codegen import forbid_cuda_work
 from helion._testing.cute_codegen import mock_cuda_unavailable
 from helion._testing.cute_codegen import require_cute_codegen
+from helion._testing.cute_d_shift_gate import d_shift_proposals
 from helion._testing.cute_flash import seeds_per_codegen_branch
+from helion._testing.cute_grouped_configs import d_shift_config as _config
+from helion._testing.cute_grouped_offsets import observed_logical_k
+from helion._testing.cute_grouped_offsets import unsupported_k_loop
 from helion.exc import BackendUnsupported
 from helion.exc import InvalidConfig
 import helion.language as hl
@@ -30,6 +32,10 @@ from helion.runtime.cute.launcher import _append_cute_wrapper_plan
 from helion.runtime.cute.launcher import _cute_dynamic_tensormap_contexts
 from helion.runtime.cute.launcher import _validate_tcgen05_grouped_device_split_sizes
 from helion.runtime.cute.launcher import _validate_tcgen05_grouped_dynamic_ab_tensormaps
+
+# The launches at the end of the module carry the ``cuda`` marker and stay
+# in the GPU lane; no other test of the module needs a device.
+pytestmark = pytest.mark.cpu_only
 
 KEY = "tcgen05_grouped_d_shift"
 
@@ -61,25 +67,6 @@ def _unsafe_output(
             acc = torch.addmm(acc, left, b[group, columns, inner].T)
         hl.store(out, [row, columns], acc, extra_mask=valid[:, None])
     return out
-
-
-def _config(orientation: str, *, cluster_n: int = 1) -> helion.Config:
-    return helion.Config(
-        block_sizes=[256, 128, 64],
-        pid_type="persistent_interleaved",
-        tcgen05_cluster_m=2,
-        tcgen05_cluster_n=cluster_n,
-        tcgen05_ab_stages=2,
-        tcgen05_acc_stages=2,
-        tcgen05_c_stages=2,
-        tcgen05_num_epi_warps=4,
-        tcgen05_grouped_mode="worklist_nm",
-        tcgen05_grouped_worklist_orientation=orientation,
-        tcgen05_grouped_worklist_mma_n=256,
-        tcgen05_grouped_worklist_source_m_tile=128,
-        tcgen05_grouped_full_allocation_a=True,
-        tcgen05_grouped_d_shift=True,
-    )
 
 
 def _args(kind: str, dtype: torch.dtype):
@@ -137,7 +124,7 @@ def test_fixed_bounded_d_view_and_live_coordinates_mask_exact_rows(
     kernel = {
         "offsets": _device_offsets_kernel,
         "sizes": _device_split_sizes_kernel,
-        "fp32": _observed_logical_k,
+        "fp32": observed_logical_k,
     }[kind]
     args = _args(kind, dtype)
     with forbid_cuda_work(), _target(), mock_cuda_unavailable():
@@ -268,7 +255,7 @@ def test_fixed_bounded_d_view_and_live_coordinates_mask_exact_rows(
 @pytest.mark.parametrize("orientation", ["mn", "nm"])
 def test_default_off_matches_the_original_source(orientation: str) -> None:
     with forbid_cuda_work(), _target(), mock_cuda_unavailable():
-        bound = cpu_bind(_observed_logical_k, _args("fp32", torch.int32))
+        bound = cpu_bind(observed_logical_k, _args("fp32", torch.int32))
         config = _config(orientation)
         config.config.pop(KEY)
         explicit_off = deepcopy(config)
@@ -282,7 +269,7 @@ def test_default_off_matches_the_original_source(orientation: str) -> None:
 @pytest.mark.parametrize("variant", [1, 2, 3, 5])
 def test_noncanonical_reductions_cannot_request_bounded_d_shift(variant: int) -> None:
     with forbid_cuda_work(), _target(), mock_cuda_unavailable():
-        bound = cpu_bind(_unsupported_k_loop, (*_args("fp32", torch.int32), variant))
+        bound = cpu_bind(unsupported_k_loop, (*_args("fp32", torch.int32), variant))
         assert not bound.config_spec._cute_tcgen05_config.grouped_d_shift_supported
         with pytest.raises((InvalidConfig, BackendUnsupported)):
             bound.to_code(_config("mn"))
@@ -308,7 +295,7 @@ def test_feature_tail_requires_exact_grouped_input_extents(orientation: str):
     args = list(_args("fp32", torch.int32))
     args[1] = torch.empty((8, 160, 256), dtype=torch.bfloat16)
     with forbid_cuda_work(), _target(), mock_cuda_unavailable():
-        bound = cpu_bind(_observed_logical_k, tuple(args))
+        bound = cpu_bind(observed_logical_k, tuple(args))
         if orientation == "mn":
             source = bound.to_code(_config(orientation))
             _, ab, output = _plans(source)
@@ -322,7 +309,7 @@ def test_feature_tail_requires_exact_grouped_input_extents(orientation: str):
 @pytest.mark.parametrize("bad", [1, "true", "ptr_shift"])
 def test_invalid_config_values_are_rejected(bad) -> None:
     with forbid_cuda_work(), _target(), mock_cuda_unavailable():
-        bound = cpu_bind(_observed_logical_k, _args("fp32", torch.int32))
+        bound = cpu_bind(observed_logical_k, _args("fp32", torch.int32))
         config = _config("mn")
         config.config[KEY] = bad
         with pytest.raises(InvalidConfig):
@@ -352,8 +339,15 @@ def test_shifted_compiler_seeds_keep_the_old_prefix_and_logical_cap() -> None:
         torch.empty((4, 512, 512), dtype=torch.bfloat16),
         torch.tensor([0, 0, 1, 129, 2048], dtype=torch.int32),
     )
-    with forbid_cuda_work(), _target(), mock_cuda_unavailable():
-        bound = cpu_bind(_observed_logical_k, args)
+    # The seeds a search proposes once the shift's gate is lifted
+    # (test_cute_grouped_d_shift_gate.py covers the gate itself).
+    with (
+        forbid_cuda_work(),
+        _target(),
+        mock_cuda_unavailable(),
+        d_shift_proposals(),
+    ):
+        bound = cpu_bind(observed_logical_k, args)
         seeds = bound.config_spec.compiler_seed_configs
         original = [seed for seed in seeds if not seed.get(KEY)]
         shifted = [seed for seed in seeds if seed.get(KEY)]
@@ -382,11 +376,8 @@ def test_shifted_compiler_seeds_keep_the_old_prefix_and_logical_cap() -> None:
             ast.parse(bound.to_code(seed))
 
 
-@pytest.mark.cuda
-@pytest.mark.parametrize("orientation", ["mn", "nm"])
-@pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
-def test_bounded_output_shift_live_empty_tail_rows_and_graph_replay(
-    orientation: str, dtype: torch.dtype
+def _live_empty_tail_rows_and_graph_replay(
+    orientation: str, dtype: torch.dtype, *, shifted: bool
 ) -> None:
     if not torch.cuda.is_available():
         pytest.skip("requires CUDA")
@@ -401,7 +392,10 @@ def test_bounded_output_shift_live_empty_tail_rows_and_graph_replay(
     offsets = torch.tensor(boundaries, device=DEVICE, dtype=dtype)
     args = (a, b, offsets)
     bound = _device_offsets_kernel._bind_isolated(args)
-    bound.set_config(_config(orientation))
+    config = _config(orientation)
+    if not shifted:
+        config.config.pop(KEY)
+    bound.set_config(config)
 
     def reference():
         out = torch.empty((640, 512), device=DEVICE, dtype=torch.bfloat16)
@@ -421,3 +415,23 @@ def test_bounded_output_shift_live_empty_tail_rows_and_graph_replay(
     offsets[1] = 0
     graph.replay()
     torch.testing.assert_close(output, reference(), rtol=1e-2, atol=1e-2)
+
+
+@pytest.mark.cuda
+@pytest.mark.parametrize("orientation", ["mn", "nm"])
+@pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
+def test_bounded_output_shift_live_empty_tail_rows_and_graph_replay(
+    orientation: str, dtype: torch.dtype
+) -> None:
+    _live_empty_tail_rows_and_graph_replay(orientation, dtype, shifted=True)
+
+
+@pytest.mark.cuda
+@pytest.mark.parametrize("orientation", ["mn", "nm"])
+@pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
+def test_the_worklist_without_the_shift_live_empty_tail_rows_and_graph_replay(
+    orientation: str, dtype: torch.dtype
+) -> None:
+    """The same worklists on the group's own descriptor: what a search seeds
+    and draws while the shift's gate is closed, the M,N tiles among them."""
+    _live_empty_tail_rows_and_graph_replay(orientation, dtype, shifted=False)

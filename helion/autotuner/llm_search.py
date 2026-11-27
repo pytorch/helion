@@ -38,6 +38,7 @@ import os
 import time
 from typing import TYPE_CHECKING
 
+from .. import exc
 from .base_search import BenchmarkResult
 from .base_search import PopulationBasedSearch
 from .base_search import PopulationMember
@@ -383,13 +384,45 @@ class LLMGuidedSearch(PopulationBasedSearch):
         return prefix + suffix
 
     def _parse_configs(self, response: str) -> list[Config]:
-        """Parse and validate candidate configs from a raw LLM response."""
-        return parse_response_configs(
-            response,
-            config_spec=self.config_spec,
-            default_config_dict=self._default_config_dict,
-            log=self.log,
+        """Parse and validate candidate configs from a raw LLM response,
+        each held to what this search proposes (``_admit_proposals``): the
+        one way a round takes a reply in."""
+        return self._admit_proposals(
+            parse_response_configs(
+                response,
+                config_spec=self.config_spec,
+                default_config_dict=self._default_config_dict,
+                log=self.log,
+            )
         )
+
+    def _admit_proposals(self, configs: list[Config]) -> list[Config]:
+        """The configs of an LLM's reply as this search benchmarks them.
+
+        A reply's keys are merged over the reference config and normalized
+        like any caller's config, so a reply can name an option the search
+        space described to the LLM does not hold. The backend holds each
+        proposal to what a search of this kernel proposes on its own
+        (``ConfigSpec.search_proposal``): a proposal it changes is
+        benchmarked as changed, and one that is not legal that way is
+        dropped. Both are logged."""
+        admitted: list[Config] = []
+        for config in configs:
+            try:
+                proposal, returned = self.config_spec.search_proposal(config)
+            except exc.InvalidConfig as e:
+                self.log(
+                    "Dropped an LLM proposal that is not legal without options "
+                    f"this search does not propose: {e}"
+                )
+                continue
+            if returned:
+                self.log(
+                    "An LLM proposal names options this search does not "
+                    f"propose ({', '.join(returned)}); benchmarking it without them"
+                )
+            admitted.append(proposal)
+        return admitted
 
     # ── Search loop ──────────────────────────────────────────────
 

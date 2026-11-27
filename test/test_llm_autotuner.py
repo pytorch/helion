@@ -69,6 +69,8 @@ class TestLLMGuidedSearch(TestCase):
             normalize=lambda raw, _fix_invalid=False: None,
             default_config=lambda: helion.Config(block_sizes=[64]),
             _flat_fields=dict,
+            # The hook's default: a proposal is admitted as it is.
+            search_proposal=lambda config: (config, ()),
         )
         search._default_config_dict = dict(search.config_spec.default_config())
         for name, value in overrides.items():
@@ -217,6 +219,7 @@ class TestLLMGuidedSearch(TestCase):
                     "num_stages": IntegerFragment(1, 8, 2),
                     "num_warps": PowerOfTwoFragment(1, 32, 4),
                 },
+                search_proposal=lambda config: (config, ()),
             ),
         )
         search._default_config_dict = dict(search.config_spec.default_config())
@@ -236,6 +239,41 @@ class TestLLMGuidedSearch(TestCase):
             with self.subTest(name=name):
                 configs = LLMGuidedSearch._parse_configs(search, response)
                 self.assertEqual(len(configs), expected)
+
+    @pytest.mark.cpu_only
+    def test_parse_configs_holds_each_proposal_to_the_search(self):
+        """Each config of a reply passes through the backend's hook: one it
+        leaves alone is benchmarked as parsed, one it changes as changed, and
+        one that is not legal that way is dropped; the log says which."""
+        from helion.autotuner.llm_search import LLMGuidedSearch
+
+        def search_proposal(config):
+            if config.block_sizes == [32]:
+                raise helion.exc.InvalidConfig("block_sizes=[32] needs kept_out")
+            if config.block_sizes == [16]:
+                return helion.Config(block_sizes=[8]), ("kept_out",)
+            return config, ()
+
+        search = self._make_mock_search()
+        search.config_spec.search_proposal = search_proposal
+        messages: list[str] = []
+        search.log = messages.append
+        response = json.dumps(
+            {"configs": [{"block_sizes": [size]} for size in (64, 32, 16)]}
+        )
+        configs = LLMGuidedSearch._parse_configs(search, response)
+        self.assertEqual([config.block_sizes for config in configs], [[64], [8]])
+        dropped = (
+            "Dropped an LLM proposal that is not legal without options this "
+            "search does not propose: block_sizes=[32] needs kept_out"
+        )
+        changed = (
+            "An LLM proposal names options this search does not propose "
+            "(kept_out); benchmarking it without them"
+        )
+        self.assertEqual(
+            messages, ["Parsed 3 valid configs from LLM response", dropped, changed]
+        )
 
     def test_context_window_keeps_prefix_and_recent_history(self):
         """Prompt context always keeps the fixed prefix and trims only old round history."""
