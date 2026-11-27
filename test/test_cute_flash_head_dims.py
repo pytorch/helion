@@ -27,6 +27,7 @@ from unittest.mock import patch
 import pytest
 import torch
 from torch.nn.attention.flex_attention import create_block_mask
+from torch.nn.attention.flex_attention import noop_mask
 
 import helion
 from helion._compiler.cute import cute_flash
@@ -1237,6 +1238,140 @@ def test_dense_surface_opens_above_128_on_the_single_tile_body(
         f"flash_shared_storage({head_dim}, 1, 2, cutlass.BFloat16, o_stage={o_stage}"
         in single
     )
+
+
+@pytest.mark.parametrize("head_dim", (192, 256))
+def test_tma_only_output_above_128_takes_the_generic_fallback(head_dim: int) -> None:
+    """An output of more than 2**31 elements needs the TMA epilogue, which
+    only the pair body has, and a value width above 128 runs on the
+    single-tile body alone. Such a kernel has no fused body: the detector
+    hands it to the generic lowering's search, as it does at an odd tile
+    count, where it used to build a surface without a legal family
+    (``InvalidConfig`` at bind). The pair's widths keep the fused surface at
+    that output size."""
+    num_bh = 8192 * 8
+
+    def bind(width: int, seq: int) -> Any:
+        assert cute_flash._flash_output_requires_tma(num_bh, seq, width)
+        kernel = helion.kernel(backend="cute", static_shapes=True)(_dense_attention.fn)
+        with cpu_codegen():
+            return kernel.bind(
+                tuple(
+                    torch.empty(
+                        8192,
+                        8,
+                        seq,
+                        width,
+                        dtype=torch.bfloat16,
+                        device="meta",  # @ignore-device-lint
+                    )
+                    for _ in range(3)
+                )
+            )
+
+    bound = bind(head_dim, 256)
+    spec = bound.config_spec
+    assert not spec.cute_flash_search_enabled
+    assert spec.cute_attention_generic_fallback_enabled
+    initial = spec.default_config()
+    assert initial.config["block_sizes"] == [1, 64, 64]
+    with cpu_codegen():
+        code = bound.to_code(initial)
+    assert "'kind': 'helion_flash'" not in code
+    pair = bind(128, 512).config_spec
+    assert pair.cute_flash_search_enabled
+    assert not pair.cute_attention_generic_fallback_enabled
+    pair_default = pair.default_config().config
+    assert pair_default[cute_flash.FLASH_PIPELINE_FAMILY_KEY] == "fa4"
+    assert pair_default[cute_flash.FLASH_EPI_TMA_KEY]
+
+
+@pytest.mark.parametrize(
+    ("mask", "batch", "head_dim", "seq"),
+    [
+        ("causal", 8192, 192, 256),
+        ("none", 8192, 192, 256),
+        ("none", 8192, 128, 384),
+        ("causal", 32769, 128, 64),
+    ],
+)
+def test_flex_tma_only_output_without_a_pair_body_takes_the_generic_fallback(
+    mask: str, batch: int, head_dim: int, seq: int
+) -> None:
+    """The FlexAttention envelope at an output of more than 2**31 elements:
+    a value width above the pair's, on the BlockMask list walk (a causal
+    mask over two 128-row blocks) and on the dense plan; the dense plan at
+    an odd tile count, which the collapsed detector hands over as well; and
+    a query shorter than one 128-row tile (a causal mask inside its one
+    block: a trivial walk with a mask region), where the TMA store has no
+    whole tile to write. None has a body with the TMA epilogue. The first
+    three used to raise ``InvalidConfig`` at bind (the surface held no legal
+    family), the last opened a surface whose every config codegen
+    declined."""
+    assert cute_flash._flash_output_requires_tma(batch * 8, seq, head_dim)
+    q, k, v = (
+        torch.empty(
+            batch,
+            8,
+            seq,
+            head_dim,
+            dtype=torch.bfloat16,
+            device="meta",  # @ignore-device-lint
+        )
+        for _ in range(3)
+    )
+    cpu = torch.device("cpu")
+    if mask == "causal":
+        block_mask = create_block_mask(
+            _causal, None, None, seq, seq, BLOCK_SIZE=128, device=cpu
+        )
+        full_num = block_mask.full_kv_num_blocks
+        full_idx = block_mask.full_kv_indices
+        assert full_num is not None and full_idx is not None
+    else:
+        # No mask: one block covers the sequence and the walk is trivial.
+        block_mask = create_block_mask(
+            noop_mask, None, None, seq, seq, BLOCK_SIZE=seq, device=cpu
+        )
+        full_num = torch.zeros_like(block_mask.kv_num_blocks)
+        full_idx = torch.zeros_like(block_mask.kv_indices)
+    # The tables' shapes and dtypes are what the bind reads; they sit beside
+    # the operands, which the generic lowering requires.
+    tables = (
+        torch.empty(
+            table.shape,
+            dtype=table.dtype,
+            device="meta",  # @ignore-device-lint
+        )
+        for table in (
+            block_mask.kv_num_blocks,
+            block_mask.kv_indices,
+            full_num,
+            full_idx,
+        )
+    )
+    args = (
+        q,
+        k,
+        v,
+        _identity,
+        *tables,
+        block_mask.mask_mod,
+        block_mask.BLOCK_SIZE[0],
+        block_mask.BLOCK_SIZE[1],
+        1.0 / math.sqrt(head_dim),
+        False,
+    )
+    with cpu_codegen():
+        bound = _flex_kernel().bind(args)
+    spec = bound.config_spec
+    assert not spec.cute_flash_search_enabled
+    assert spec.cute_attention_generic_fallback_enabled
+    initial = spec.default_config()
+    assert initial.config["block_sizes"] == [64, 64]
+    with cpu_codegen():
+        code = bound.to_code(initial)
+    assert "'kind': 'helion_flash'" not in code
 
 
 @pytest.mark.parametrize("head_dim", (192, 256))
