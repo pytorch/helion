@@ -46,6 +46,9 @@ from helion._compiler.autotuner_heuristics.triton import TritonNarrowReductionHe
 from helion._compiler.autotuner_heuristics.triton import TritonPointwiseSeedHeuristic
 from helion._compiler.autotuner_heuristics.triton import TritonReductionHeuristic
 from helion._compiler.autotuner_heuristics.triton import TritonSkinnyGemmHeuristic
+from helion._compiler.autotuner_heuristics.triton import (
+    TritonSm120FormulaMatmulHeuristic,
+)
 from helion._compiler.autotuner_heuristics.triton import _h100_matmul_tile
 from helion._compiler.compile_environment import _symint_free_symbols
 from helion._compiler.cute import cute_flash
@@ -4427,6 +4430,7 @@ class TestHeuristicRegistry(TestCase):
                 "triton_b200_packed_mxfp8",
                 "triton_b200_formula_matmul",
                 "triton_b200_multi_matmul",
+                "triton_sm120_formula_matmul",
                 "triton_matmul_reduction_epilogue",
                 "triton_reduction",
                 "triton_reduction_narrow",
@@ -5229,6 +5233,51 @@ class TestTritonH100MatmulHeuristic(TestCase):
             )
             assert bf16 is not None and fp16 is not None
             self.assertEqual(dict(bf16), dict(fp16))
+
+    def test_sm120_front_end_owns_sm120_and_fits_its_shared_memory(self) -> None:
+        # sm120 (consumer Blackwell) keeps register-resident mma.sync accumulators like
+        # sm90, but has 101376 B of shared memory per CTA. The sm90 budget emits a
+        # [128,256,64] tile at 4 stages that needs ~160 KB there and fails to compile, so
+        # sm120 gets its own front end, and the two front ends stay disjoint.
+        cls = TritonSm120FormulaMatmulHeuristic
+        for name, hardware, sm90_eligible, sm120_eligible in (
+            ("sm90", HOPPER_HARDWARE, True, False),
+            ("sm120", RTX5080_HARDWARE, False, True),
+            ("sm100", BLACKWELL_HARDWARE, False, False),
+            ("sm80", A100_HARDWARE, False, False),
+        ):
+            env = self._make_env()
+            self._attach_matmul(env, self._matmul_fact())
+            with (
+                self.subTest(arch=name),
+                patch("helion._hardware.get_hardware_info", return_value=hardware),
+            ):
+                self.assertEqual(
+                    TritonH100FormulaMatmulHeuristic.is_eligible(env, MagicMock()),
+                    sm90_eligible,
+                )
+                self.assertEqual(cls.is_eligible(env, MagicMock()), sm120_eligible)
+        self.assertTrue(cls.promote_seed_to_default)
+        self.assertIn(cls, get_heuristics("triton"))
+        for m, n, k in ((2048, 2048, 2048), (4096, 4096, 4096), (64, 4096, 4096)):
+            with self.subTest(shape=(m, n, k)):
+                sm90 = TritonH100FormulaMatmulHeuristic._matmul_tile(m, n, k, 2, 84, 1)
+                bm, bn, bk, _nw, ns, _l2 = cls._matmul_tile(m, n, k, 2, 84, 1)
+                self.assertLessEqual(
+                    cls._smem_bytes(bm, bn, bk, 2, ns), cls.SMEM_BUDGET
+                )
+                if m >= 2048:
+                    self.assertGreater(
+                        TritonH100FormulaMatmulHeuristic._smem_bytes(
+                            sm90[0], sm90[1], sm90[2], 2, sm90[4]
+                        ),
+                        cls.SMEM_BUDGET,
+                    )
+                # More programs than SMs: a shallow ring keeps a second CTA resident.
+                # Within one wave (64 programs on 84 SMs) the deep ring stays.
+                grid = -(-m // bm) * -(-n // bn)
+                expected_stages = cls.MULTI_WAVE_MAX_STAGES if grid > 84 else 6
+                self.assertEqual(ns, expected_stages)
 
     @onlyBackends(["triton"])
     @skipIfTileIR(
