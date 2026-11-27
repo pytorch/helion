@@ -1,0 +1,23 @@
+diff --git a/vllm/models/inkling2/model.py b/vllm/models/inkling2/model.py
+index 7a02fad389..dca38b4afa 100644
+--- a/vllm/models/inkling2/model.py
++++ b/vllm/models/inkling2/model.py
+@@ -50,6 +50,7 @@ from vllm.v1.worker.encoder_cudagraph_defs import (
+     EncoderItemSpec,
+ )
+
++from . import helion_verify
+ from .attention import Inkling2Attention
+ from .configs import Inkling2MMConfig, Inkling2ModelConfig
+ from .lora import (
+@@ -259,6 +260,10 @@ class Inkling2Model(nn.Module):
+         self, positions: torch.Tensor, inputs_embeds: torch.Tensor
+     ) -> torch.Tensor | tuple[torch.Tensor, list[torch.Tensor]]:
+         num_tokens, hidden = inputs_embeds.shape
++        if helion_verify.ENABLED:
++            helion_verify.prepare(self, inputs_embeds.device)
++        if helion_verify.applies(self, positions):
++            return helion_verify.forward(self, positions, inputs_embeds)
+         aux_hidden_states = []
+         num_layers = len(self.layers)
+         # With a conv-state cache (TP > 1), the hidden-stream conv runs fused

@@ -23,8 +23,9 @@ HIDDEN = 8192
 EXPERT_HIDDEN = 4096
 NUM_EXPERTS = 256
 TOPK = 8
-# dot_scaled needs N >= 16: a shorter verify window pads the MoE's MMA token rows
-# to 16 with zero activations; routes and outputs keep T rows.
+# The MoE's MMA token rows (its expert dots' N): a shorter verify window pads them
+# to 16 with zero activations; routes and outputs keep T rows. Block-scaled (NVFP4)
+# dots also take 8 rows, which a layer image can opt into (``LayerFamily.moe_rows``).
 MOE_TOKENS = 16
 
 

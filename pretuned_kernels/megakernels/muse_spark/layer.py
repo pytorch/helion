@@ -161,6 +161,13 @@ class LayerFamily:
     # Router planes stacked per 64-expert chunk (hi rows, then lo rows).
     stacked_router: bool
     expert_prefetch: bool  # pf_* operands: the bank as prefetch boxes and the layer's hot-expert list
+    # The NVFP4 global image's MoE MMA token rows (its expert dots' N); every other
+    # image keeps MOE_TOKENS (bf16 dots need 16).
+    global_moe_rows: int = MOE_TOKENS
+
+    def moe_rows(self, *, global_attn: bool, expert_bf16: bool = False) -> int:
+        """An image's MoE MMA token rows: its x / z slots' rows and its expert dots' N."""
+        return self.global_moe_rows if global_attn and not expert_bf16 else MOE_TOKENS
 
     def config_name(
         self,
@@ -206,6 +213,8 @@ TP4_FAMILY = LayerFamily(
     q_tile=(64, 256),
     stacked_router=False,
     expert_prefetch=False,
+    # 8-column block-scaled MMAs: faster in the global image, slower in the sliding-window one.
+    global_moe_rows=8,
 )
 
 
@@ -555,6 +564,7 @@ def _workspaces(
     group: dist.ProcessGroup,
     device: torch.device,
     sms: int,
+    global_attn: bool,
     expert_bf16: bool,
     final_norm: bool,
 ) -> tuple[dict[str, torch.Tensor], helpers.State]:
@@ -576,7 +586,9 @@ def _workspaces(
         return torch.zeros(*shape, dtype=dtype, device=device)
 
     rows = (dims.kv_heads, family.attention_splits, T, dims.heads_per_kv)
-    moe = helpers.State(device, group, tokens=T, expert_bf16=expert_bf16)
+    x_rows = family.moe_rows(global_attn=global_attn, expert_bf16=expert_bf16)
+    assert x_rows >= T, f"a {T}-token window in {x_rows} MoE token rows"
+    moe = helpers.State(device, group, tokens=T, expert_bf16=expert_bf16, rows=x_rows)
     s_u = helpers.parts_for(local // helpers.U_BM, EXPERT_HIDDEN // helpers.U_BK, sms)
     s_q = family.qkv_splits or helpers.parts_for(
         dims.qkv_width // q_bm, HIDDEN // q_bk, sms
@@ -586,13 +598,13 @@ def _workspaces(
     # The bf16 images' expert input: the normed bf16 rows, unit row scales (NVFP4: e2m1 bytes and the token scales).
     if expert_bf16:
         x_q, x_ts = (
-            zeros(MOE_TOKENS, EXPERT_HIDDEN, dtype=torch.bfloat16),
-            torch.ones(MOE_TOKENS, device=device),
+            zeros(x_rows, EXPERT_HIDDEN, dtype=torch.bfloat16),
+            torch.ones(x_rows, device=device),
         )
     else:
         x_q, x_ts = (
-            zeros(MOE_TOKENS, EXPERT_HIDDEN // 2, dtype=torch.uint8),
-            zeros(MOE_TOKENS),
+            zeros(x_rows, EXPERT_HIDDEN // 2, dtype=torch.uint8),
+            zeros(x_rows),
         )
     buffers = {
         "out": zeros(helpers.PAD_ROWS, dims.q_width, dtype=torch.bfloat16),
@@ -608,7 +620,7 @@ def _workspaces(
         "pooled": symm(T, n_local, dtype=torch.bfloat16),
         "logit_q": symm(T, ROUTER_E, dtype=torch.float32),
         "x_q": x_q,
-        "x_sf": zeros(MOE_TOKENS, EXPERT_HIDDEN // 16, dtype=torch.uint8),
+        "x_sf": zeros(x_rows, EXPERT_HIDDEN // 16, dtype=torch.uint8),
         "x_ts": x_ts,
         "packed": zeros(T, TOPK, dtype=torch.int32),
         "topk_ids": zeros(T, TOPK, dtype=torch.int32),
@@ -674,6 +686,7 @@ class LayerVerifyMegakernel:
             group=group,
             device=device,
             sms=sms,
+            global_attn=global_attn,
             expert_bf16=expert_bf16,
             final_norm=final_norm,
         )

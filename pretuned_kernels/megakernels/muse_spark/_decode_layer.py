@@ -242,7 +242,8 @@ def fi_w13_blocks(w13: torch.Tensor) -> torch.Tensor:
 
 
 class State:
-    """Per-rank symmetric MoE buffers and the MoE output rows (padded to 16)."""
+    """Per-rank symmetric MoE buffers (z: ``rows`` MMA token rows per slot) and the
+    MoE output rows (padded to 16)."""
 
     def __init__(
         self,
@@ -253,6 +254,7 @@ class State:
         intermediate: int = INTERMEDIATE,
         hidden: int = EXPERT_HIDDEN,
         expert_bf16: bool = False,
+        rows: int = MOE_TOKENS,
     ) -> None:
         world = group.size()
         local = hidden // world
@@ -260,14 +262,14 @@ class State:
         # The bf16-expert images' z: bf16 SwiGLU rows (z_scale stays unread).
         if expert_bf16:
             self.z = symm_mem.empty(
-                slots, MOE_TOKENS, intermediate, dtype=torch.bfloat16, device=device
+                slots, rows, intermediate, dtype=torch.bfloat16, device=device
             )
         else:
             self.z = symm_mem.empty(
-                slots, MOE_TOKENS, intermediate // 2, dtype=torch.uint8, device=device
+                slots, rows, intermediate // 2, dtype=torch.uint8, device=device
             )
         self.z_scale = symm_mem.empty(
-            slots, MOE_TOKENS, intermediate // 16, dtype=torch.uint8, device=device
+            slots, rows, intermediate // 16, dtype=torch.uint8, device=device
         )
         self.gemm2_ws = symm_mem.empty(
             slots, local, dtype=torch.bfloat16, device=device
