@@ -41,6 +41,7 @@ from ..attention_plan import TENSOR_BIAS_KIND
 from ..attention_plan import AttentionScoreModifier
 from ..attention_plan import AttentionScorePlan
 from ..attention_plan import flash_head_dims_supported
+from ..attention_plan import flash_pair_head_dims_supported
 from .match_common import FlattenedRowOffset
 from .match_common import flattened_row_offset
 from .match_common import host_tensor_name
@@ -2512,11 +2513,16 @@ def detect_flash_search_surface(device_ir: DeviceIR) -> FlashSearchSurface | Non
             or output_requires_tma
         ):
             continue
-        # TMA output is currently FA4-only. Do not expose a flash search whose
-        # only legal output path is unavailable; the generic CuTe search can
-        # still handle these uncommon large-output shapes.
+        # TMA output is currently FA4-only: the pair body's epilogue. Do not
+        # expose a flash search whose only legal output path is unavailable,
+        # which is every geometry the single-tile body alone hosts (an odd
+        # tile count, a plan bound to its per-tile predicate, a value width
+        # above the pair's); the generic CuTe search can still handle these
+        # uncommon large-output shapes.
         if output_requires_tma and (
-            num_kv % 2 != 0 or pattern.score_plan.requires_ws_overlap
+            num_kv % 2 != 0
+            or pattern.score_plan.requires_ws_overlap
+            or not flash_pair_head_dims_supported(pattern.head_dim, pattern.head_dim_v)
         ):
             generic_fallback_required = True
             fallback_targets = _attention_flash_block_size_targets(
@@ -2599,6 +2605,35 @@ def _detect_flex_search_surface(
         return None
     match = match_flex_envelope(device_ir.graphs, root_grid_ids, env=env)
     if match is None:
+        return None
+    from ..cute_flash import _flash_output_requires_tma
+
+    # TMA output is the pair body's epilogue, here as on the collapsed
+    # envelope: a value width above the pair's runs on bodies without it,
+    # and so does the dense plan at an odd tile count (the list walk tiles
+    # an odd count on the pair). A query shorter than one 128-row tile has
+    # no whole tile for the TMA store (codegen stores such an output through
+    # the staged epilogue). Such an output has no fused body, and a surface
+    # for it would hold no legal family or no config that renders: the
+    # generic search takes the kernel.
+    if _flash_output_requires_tma(match.num_bh, match.q_seq, match.head_dim_v) and (
+        not flash_pair_head_dims_supported(match.head_dim, match.head_dim_v)
+        or (match.plan.flex_dense and match.num_kv % 2 != 0)
+        or match.q_seq < 128
+    ):
+        from ..autotune.flash_surface import enable_cute_attention_generic_fallback
+
+        fallback_targets = {match.q_block_id: 64, match.kv_block_id: 64}
+        enable_cute_attention_generic_fallback(
+            env.config_spec,
+            block_size_targets=(
+                fallback_targets
+                if _flash_block_sizes_reachable(
+                    env, fallback_targets, overshoot_dimension=True
+                )
+                else None
+            ),
+        )
         return None
     return flex_search_surface(match, env)
 

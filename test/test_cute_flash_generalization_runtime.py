@@ -202,14 +202,23 @@ def _run_and_check(
     return code, resolved
 
 
+@pytest.mark.parametrize(
+    ("seq", "head_dim"), [(384, 64), (256, 192)], ids=["odd_kv", "wide_value"]
+)
 # pyrefly: ignore [bad-argument-type]
-def test_odd_kv_required_tma_generic_fallback_initial_config_is_correct() -> None:
+def test_required_tma_generic_fallback_initial_config_is_correct(
+    seq: int, head_dim: int
+) -> None:
+    """An output that needs the TMA epilogue on a geometry only the
+    single-tile body hosts (an odd KV tile count; a value width above the
+    pair's) takes the generic lowering, whose first config is correct."""
     fallback_kernel = helion.kernel(backend="cute", static_shapes=True)(
         _dense_attention.fn
     )
     torch.manual_seed(20260817)
     q, k, v = (
-        torch.randn(1, 2, 384, 64, dtype=torch.float16, device=DEVICE) for _ in range(3)
+        torch.randn(1, 2, seq, head_dim, dtype=torch.float16, device=DEVICE)
+        for _ in range(3)
     )
     with patch.object(cute_flash, "_flash_output_requires_tma", return_value=True):
         bound = fallback_kernel.bind((q, k, v))
