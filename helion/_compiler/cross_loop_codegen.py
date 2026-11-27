@@ -64,6 +64,7 @@ from .tile_dependency import _concrete_integer
 from .tile_dependency import coordinate_axis_symbol
 from .tile_dependency import instantiate_coordinate_domains
 from .tile_dependency import nested_logical_axes
+from .tile_dependency import scatter_operands
 from .tile_dependency import tile_dependency_site_id
 from .tile_strategy import L2GroupingProgramIDs
 from .tile_strategy import TileStrategy
@@ -1905,10 +1906,7 @@ def _scatter_layout(
             for axis in family.axes
         }
         mine = [store for store in stores.values() if store.root == root]
-        if len({store.graph_id for store in mine}) != 1:
-            raise exc.CrossLoopSchedulingError(
-                "because a root's inband scatter stores must share one block"
-            )
+        assert len({store.graph_id for store in mine}) == 1, "R11"
         last = max(mine, key=lambda store: store.graph_node_index)
         scatter_roots[root] = ScatterRoot(
             axis_order=family.logical_axis_order,
@@ -1921,18 +1919,10 @@ def _scatter_layout(
     for allocation_id, store in stores.items():
         position = graph.scatter_position(allocation_id)
         assert position is not None
-        node = next(
-            node
-            for node in device_ir.graphs[store.graph_id].graph.nodes
-            if store.access_id in node.meta.get(TILE_ACCESS_META, ())
-        )
-        index = node.args[1][position]
+        index = scatter_operands(device_ir, store)[0][position]
         assert isinstance(index, torch.fx.Node)
         rows = index.meta["val"]
-        if rows.ndim > 1:
-            raise exc.CrossLoopSchedulingError(
-                "because an inband scatter's row index must be a vector"
-            )
+        assert rows.ndim <= 1, "R10"
         lanes = 1
         if rows.ndim == 1:
             size = rows.size(0)
@@ -1944,10 +1934,7 @@ def _scatter_layout(
             extent = (
                 1 if dim == position else graph.inband_extent(store, dim, block_size)
             )
-            if extent is None:
-                raise exc.CrossLoopSchedulingError(
-                    "because an inband scatter must write aligned row blocks"
-                )
+            assert extent is not None, "R1 admits only aligned row blocks"
             extents.append(extent)
         counts = [-(-n // extent) for n, extent in zip(shape, extents, strict=True)]
         strides = [math.prod(counts[dim + 1 :]) for dim in range(len(shape))]

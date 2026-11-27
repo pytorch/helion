@@ -245,6 +245,40 @@ def tagged_credit_in_push_kernel(
     return out, total
 
 
+@helion.kernel(autotune_effort="none", static_shapes=True)
+def scatter_mask_kernel(
+    symm: torch.Tensor,
+    x: torch.Tensor,
+    rows: torch.Tensor,
+    count: torch.Tensor,
+    group_name: hl.ProcessGroupName,
+    variant: hl.constexpr,
+) -> torch.Tensor:
+    """A row scatter (``test_distributed.scatter_exchange_kernel``'s) whose mask
+    takes its rows ("") or also its columns ("col-mask")."""
+    peers = remote_views(symm, group_name)
+    out = torch.empty(symm.size(), dtype=torch.float32, device=symm.device)
+    half = symm.size(1) // 2
+    for tile_h, tile_t in hl.tile([2, x.size(0)], block_size=[1, 1]):
+        if tile_t.begin < count[0]:
+            row = rows[tile_t.begin, :]
+            cols = tile_h.begin * half + hl.arange(half)
+            live = (row >= 0)[:, None]
+            if variant == "col-mask":
+                live_cols = live & (cols < count[0] + 40)[None, :]
+                hl.store(
+                    symm, [row, cols], x[tile_t.begin, :, cols], extra_mask=live_cols
+                )
+            else:
+                hl.store(symm, [row, cols], x[tile_t.begin, :, cols], extra_mask=live)
+    for tile_m, tile_c in hl.tile(symm.size(), block_size=[8, 32]):
+        acc = hl.zeros([tile_m, tile_c], dtype=torch.float32)
+        for peer in peers:
+            acc = acc + peer[tile_m, tile_c].to(torch.float32)
+        out[tile_m, tile_c] = acc
+    return out
+
+
 @skipIfTileIR("TileIR does not support barrier operations")
 @pytest.mark.usefixtures("fake_group")
 @instantiate_parametrized_tests
@@ -285,6 +319,30 @@ class TestInbandCodegen(TestCase):
                     pushes = code.count("st.relaxed.sys.global.")
                     self.assertEqual(code.count("@p st.relaxed.sys.global."), world)
                     self.assertEqual(pushes, 2 * world)
+
+    def test_inband_scatter_keys_rows_alone(self) -> None:
+        """A row scatter travels inband when its mask takes only its rows; one
+        whose mask also takes its columns keeps peer counters (R10) instead of
+        failing in codegen."""
+        group = fake_world(4)
+        for variant, expected in (("", "use inband"), ("col-mask", "R10:")):
+            args = (
+                torch.zeros(32, 64, dtype=torch.bfloat16),
+                torch.zeros(4, 8, 64, dtype=torch.bfloat16),
+                torch.zeros(4, 8, dtype=torch.int32),
+                torch.zeros(1, dtype=torch.int32),
+                group,
+                variant,
+            )
+            with (
+                self.subTest(variant=variant),
+                cuda_metadata_trace(),
+                self.assertLogs(tile_dependency.log, "INFO") as logs,
+            ):
+                code = cpu_bind(scatter_mask_kernel, args).to_triton_code()
+            (line,) = (line for line in logs.output if "peers/symm " in line)
+            self.assertIn(expected, line)
+            self.assertEqual("_scatter_cover(" in code, variant == "")
 
     def test_inband_gates_differ_by_their_whole_path(self) -> None:
         """Gates are keyed by their host path: a store gated on ``gates[0]``

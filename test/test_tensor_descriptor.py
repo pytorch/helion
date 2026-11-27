@@ -2334,6 +2334,39 @@ class TestTensorDescriptor(RefEagerTestBase, TestCase):
                 )
                 self.assertIn("[_BLOCK_SIZE_0, _REDUCTION_BLOCK_1])", code)
 
+    @skipUnlessHostTensorDescriptor("Host tensor descriptor support is required")
+    @skipIfTileIR("tileir does not take host_tensor_descriptors")
+    @skipIfRefEager("checks generated code")
+    def test_routed_row_store_skips_dead_boxes(self):
+        """A store of a routed row takes the whole-box rule: one descriptor
+        store with no branch, whose dead boxes (a row past the tensor, a
+        negative one) write nothing."""
+
+        @helion.kernel(autotune_effort="none", static_shapes=True)
+        def routed_store(x, ids, out):
+            for t in hl.grid(ids.size(0)):
+                e = ids[t]
+                for k in hl.tile(out.size(1), block_size=16):
+                    out[e, k] = x[t, k]
+
+        x = torch.randn(6, 64, device=DEVICE)
+        ids = torch.tensor([3, 0, 8, -1, 5, 1], device=DEVICE, dtype=torch.int32)
+        out = torch.zeros(8, 64, device=DEVICE)
+        code, _ = code_and_output(
+            routed_store,
+            (x, ids, out),
+            indexing="tensor_descriptor",
+            host_tensor_descriptors=True,
+        )
+        expected = torch.zeros_like(out)
+        for t, e in enumerate(ids.tolist()):
+            if 0 <= e < out.size(0):
+                expected[e] = x[t]
+        torch.testing.assert_close(out, expected)
+        self.assertEqual(code.count("_desc.store("), 1)
+        self.assertIn("tl.where(box_live", code)
+        self.assertNotRegex(code, r"\n\s+if ")
+
 
 if __name__ == "__main__":
     unittest.main()

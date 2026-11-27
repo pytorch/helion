@@ -6810,11 +6810,48 @@ def _scatter_position(store: TileAccess) -> int | None:
     return indirect[0] if len(indirect) == 1 else None
 
 
+def scatter_operands(
+    device_ir: DeviceIR, store: TileAccess
+) -> tuple[list[object], object]:
+    """The subscript and the mask of a row scatter ``store``'s ``hl.store``."""
+    node = next(
+        node
+        for node in device_ir.graphs[store.graph_id].graph.nodes
+        if store.access_id in node.meta.get(TILE_ACCESS_META, ())
+    )
+    return cast("list[object]", node.args[1]), node.args[3]
+
+
+def _scatter_rows_fit(store: TileAccess, index: list[object], mask: object) -> bool:
+    """Whether a row scatter keys and masks its tile by row alone: its row index
+    is a vector (or one row) and its mask, broadcast against the tile from the
+    right, varies along the rows' axis only."""
+    from .compile_environment import CompileEnvironment
+    from .indexing_strategy import index_axes
+
+    position = _scatter_position(store)
+    assert position is not None
+    rows = index[position]
+    assert isinstance(rows, torch.fx.Node)
+    if rows.meta["val"].ndim > 1:
+        return False
+    if not isinstance(mask, torch.fx.Node):
+        return True
+    rank, axes = index_axes(index)
+    shape = mask.meta["val"].shape
+    env = CompileEnvironment.current()
+    return all(
+        dim + rank - len(shape) in axes[position] or env.known_equal(size, 1)
+        for dim, size in enumerate(shape)
+    )
+
+
 def _inband_failure(
     accesses: list[TileAccess],
     task_families: tuple[TaskFamily, ...],
     runs_at_root: Callable[[TileAccess], bool],
     runs_in_root_branch: Callable[[TileAccess], bool],
+    scatter_rows_fit: Callable[[TileAccess], bool],
     world_size: int,
 ) -> str | None:
     """The first rule a symmetric allocation breaks for inband transport."""
@@ -6867,6 +6904,8 @@ def _inband_failure(
         )
     ):
         return "R1: one unmasked store through the local view, one tile per task"
+    if scatter and not scatter_rows_fit(store):
+        return "R10: a scatter keys and masks its tile by row alone"
     region = _inband_store_region(store, task_families[store.root])
     numel = math.prod(region.layout[0]) if region.layout is not None else 0
     row_major = True
@@ -7401,16 +7440,37 @@ def build_tile_dependency_graph(
             accesses[dependency.consumer_access_id],
         )
     }
+
+    def scatter_rows_fit(store: TileAccess) -> bool:
+        # Without the device IR there is no codegen to key the rows either.
+        return device_ir is None or _scatter_rows_fit(
+            store, *scatter_operands(device_ir, store)
+        )
+
     failures = {
         allocation_id: _inband_failure(
             accesses_by_allocation[allocation_id],
             task_families,
             runs_at_root,
             runs_in_root_branch,
+            scatter_rows_fit,
             world_size,
         )
         for allocation_id in crossing_allocation_ids
     }
+    # A root marks its tasks' scatter rows done after its last scatter store,
+    # so the scatter stores of a root share one block.
+    scatter_stores: dict[int, TileAccess] = {}
+    for allocation_id, failure in failures.items():
+        store = next(
+            a for a in accesses_by_allocation[allocation_id] if a.kind == "store"
+        )
+        if not failure and _scatter_position(store) is not None:
+            scatter_stores[allocation_id] = store
+    for allocation_id, store in scatter_stores.items():
+        blocks = {s.graph_id for s in scatter_stores.values() if s.root == store.root}
+        if len(blocks) > 1:
+            failures[allocation_id] = "R11: a root's scatter stores share one block"
     inband_allocation_ids = {key for key, failure in failures.items() if not failure}
     if inband_allocation_ids and not _polls_every_rank(
         accesses, inband_allocation_ids, task_families, runs_at_root, world_size

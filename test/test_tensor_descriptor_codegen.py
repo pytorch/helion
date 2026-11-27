@@ -253,6 +253,46 @@ def test_batched_descriptor_loop_keeps_matched_axes_unconditional(
     assert src.count("_desc.load(") == 2 and src.count("_desc.store(") == 1
 
 
+def test_routed_row_descriptor_load_is_branch_free() -> None:
+    """A plain load of a routed row (a loaded expert id) inside a K loop takes
+    the whole-box rule: one descriptor load whose origin a ``tl.where`` moves
+    past the tensor for a dead box, with no native/live branches around it."""
+
+    @helion.kernel(backend="triton", static_shapes=True)
+    def routed(w, ids, out):
+        for t in hl.grid(ids.size(0)):
+            e = ids[t]
+            acc = hl.zeros([w.size(2)], dtype=torch.float32)
+            for k in hl.tile(w.size(1), block_size=16):
+                acc = acc + w[e, k, :].to(torch.float32).sum(0)
+            out[t, :] = acc
+
+    args = (
+        torch.empty(8, 64, 32, dtype=torch.bfloat16),
+        torch.zeros(4, dtype=torch.int32),
+        torch.empty(4, 32),
+    )
+    with (
+        cuda_metadata_trace(),
+        patch("helion._compat._supports_host_tensor_descriptor", return_value=True),
+    ):
+        src = cpu_bind(routed, args, capability=(9, 0)).to_code(
+            helion.Config(
+                indexing="tensor_descriptor",
+                block_sizes=[],
+                host_tensor_descriptors=True,
+            )
+        )
+    kernel = next(
+        n
+        for n in ast.parse(src).body
+        if isinstance(n, ast.FunctionDef) and n.name.startswith("_helion_")
+    )
+    assert not any(isinstance(n, (ast.If, ast.IfExp)) for n in ast.walk(kernel))
+    assert src.count("w_desc.load(") == 1
+    assert re.search(r"w_desc\.load\(\[tl\.cast\(tl\.where\(", src)
+
+
 @pytest.mark.parametrize(
     ("dtype", "minimum"), [(torch.float16, True), (torch.bfloat16, False)]
 )

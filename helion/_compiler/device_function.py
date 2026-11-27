@@ -1337,6 +1337,10 @@ class DeviceFunction:
         ``placeholder_to_outer_arg`` returns nodes of the originals)."""
         return [*self.codegen.codegen_graphs, *HostFunction.current().device_ir.graphs]
 
+    def graph_info(self, graph: torch.fx.Graph) -> GraphInfo:
+        """The ``graph_infos`` entry of ``graph``."""
+        return next(info for info in self.graph_infos() if info.graph is graph)
+
     def async_store_drain(self) -> list[ast.stmt]:
         """Complete this thread's TMA global writes before a cross-thread sync."""
         if not self.uses_async_proxy_global:

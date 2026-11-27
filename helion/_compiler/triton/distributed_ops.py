@@ -35,6 +35,7 @@ from ..fx_side_effects import is_effectful_void_op
 from ..host_function import HostFunction
 from ..indexing_strategy import SubscriptIndexing
 from ..indexing_strategy import _in_warp_specialized_loop
+from ..indexing_strategy import proves_multiple
 from ..tile_dependency import LAMPORT_KEYS
 from ..tile_dependency import TILE_ACCESS_META
 from ..tile_dependency import _concrete_integer
@@ -1232,20 +1233,6 @@ def _is_arange(node: object) -> bool:
     return bool(node.kwargs.get("start", 0) == 0 and node.kwargs.get("step", 1) == 1)
 
 
-def _multiple_of(value: object, lanes: int) -> bool:
-    """Whether an index start is provably a multiple of ``lanes``."""
-    if isinstance(value, int):
-        return value % lanes == 0
-    if not isinstance(value, torch.fx.Node):
-        return False
-    name = _op_name(value)
-    if name in ("mul", "mul_"):
-        return any(_multiple_of(arg, lanes) for arg in value.args)
-    if name in ("add", "add_"):
-        return all(_multiple_of(arg, lanes) for arg in value.args)
-    return False
-
-
 def tagged_tile(
     state: CodegenState,
     fake_tensor: torch.Tensor,
@@ -1310,9 +1297,9 @@ def tagged_tile(
             # start + hl.arange(n): starts at multiples of n tile the dim exactly.
             other = next(arg for arg in item.args if not _is_arange(arg))
             extent = cast("int", access.subscript_static_extents[dim])
-            if shape[dim] % extent or not _multiple_of(other, extent):
+            if shape[dim] % extent or not proves_multiple(state, other, extent):
                 raise fallback(f"{access.tensor_name}: a vector not tiling its dim")
-            multiple = _multiple_of(other, lanes)
+            multiple = proves_multiple(state, other, lanes)
         else:
             raise fallback(f"{access.tensor_name}: an index whose start is unknown")
         extents.append(extent)
@@ -1352,7 +1339,7 @@ def _record_scatter(
     """
     device_function = state.device_function
     peer = device_function.peer_state
-    assert peer is not None and state.fx_node is not None
+    assert peer is not None
     env = CompileEnvironment.current()
     scatter = peer.scatters[access.allocation_id]
     root = peer.scatter_roots[scatter.root]
@@ -1365,26 +1352,10 @@ def _record_scatter(
     rows = terms[scatter.position]
     if any(term is None for term in terms) or rows is None:
         raise exc.CrossLoopSchedulingError("because an inband scatter tile is ragged")
-    # Each lane's first element of its block keys the block; masks are per row.
+    # Each lane's first element of its block keys the block; masks are per row
+    # (planner rule R10).
     expand = rows[rows.rindex(")") + 1 :] if scatter.lanes > 1 else ""
     lane = f"(tl.arange(0, {scatter.lanes})){expand}" if scatter.lanes > 1 else "0"
-    row_dim = None
-    if scatter.lanes > 1:
-        entries = (
-            [entry.strip() for entry in expand[1:-1].split(",")] if expand else [":"]
-        )
-        row_dim = entries.index(":")
-    extra = state.fx_node.args[3]
-    if isinstance(extra, torch.fx.Node):
-        fake = extra.meta["val"]
-        if any(
-            dim + len(output_size) - fake.ndim != row_dim
-            and not env.known_equal(size, 1)
-            for dim, size in enumerate(fake.shape)
-        ):
-            raise exc.CrossLoopSchedulingError(
-                "because an inband scatter's mask must depend on its row alone"
-            )
     key = f"tl.cast({rows}, tl.int64) * {scatter.key_strides[scatter.position]}"
     first = []
     for dim, (term, extent, stride) in enumerate(

@@ -1268,8 +1268,15 @@ class TestDistributed(TestCase, MultiProcessTestCase):
         kernel = helion.kernel(
             kernel, ignore_warnings=[helion.exc.TensorOperationInWrapper]
         )
+        # The test checks the autotuner's collectives, so it autotunes every run
+        # (a cached config would skip them).
         context = unittest.mock.patch.dict(
-            os.environ, {"HELION_AUTOTUNER": "LFBOTreeSearch"}
+            os.environ, {"HELION_AUTOTUNER": "LFBOTreeSearch", "HELION_SKIP_CACHE": "1"}
+        )
+        # The two TP groups autotune independently; a default-group collective
+        # waits for the slower one.
+        torch.distributed.distributed_c10d._set_pg_timeout(
+            timedelta(minutes=10), dist.group.WORLD
         )
 
         with context:

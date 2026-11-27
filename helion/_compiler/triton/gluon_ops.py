@@ -65,19 +65,18 @@ from ..compile_environment import CompileEnvironment
 from ..cross_loop_codegen import _is_load
 from ..cross_loop_codegen import _is_tl_call
 from ..cross_loop_dsmem import cluster_layout
-from ..device_function import DeviceFunction
 from ..device_ir import ForLoopGraphInfo
 from ..device_ir import ReductionLoopGraphInfo
 from ..device_ir import control_flow_parent_entries
 from ..device_ir_analysis import matmul_operand_positions
-from ..indexing_strategy import _resolve_configured_extent
+from ..indexing_strategy import concrete_extents
 from ..matmul_utils import _pad_tensor
 from . import gluon_layout
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
 
-    from ..device_ir import GraphInfo
+    from ..device_function import DeviceFunction
     from ..generate_ast import GenerateAST
     from ..inductor_lowering import GraphInterpreter
 
@@ -1400,7 +1399,7 @@ def scale_tiles(dot_node: torch.fx.Node) -> list[tuple[torch.dtype, int, int]]:
     tiles = []
     for position in _SCALES.get(dot_node.target, ()):
         val = cast("torch.fx.Node", dot_node.args[position]).meta["val"]
-        rows, cols = concrete(val.shape)[-2:]
+        rows, cols = concrete_extents(val.shape)[-2:]
         tiles.append((val.dtype, max(rows, 32), cols))
     return tiles
 
@@ -1431,7 +1430,7 @@ def copied_scale(dot_node: torch.fx.Node, position: int) -> bool:
     arg = cast("torch.fx.Node", dot_node.args[position])
     return (
         is_scale(dot_node, position)
-        and concrete(arg.meta["val"].shape)[0] >= 128
+        and concrete_extents(arg.meta["val"].shape)[0] >= 128
         and arg.target in (*_TRANSPOSES, *_RESHAPES)
     )
 
@@ -1596,17 +1595,6 @@ def plan_load(
             value.keywords.append(ast.keyword("TRANSPOSED", ast.Constant(plan[0])))
 
 
-def concrete(shape: Iterable[int | torch.SymInt]) -> list[int]:
-    env = CompileEnvironment.current()
-    config = DeviceFunction.current().config
-    return [
-        size
-        if (size := _resolve_configured_extent(d, config)) is not None
-        else env.size_hint(d)
-        for d in shape
-    ]
-
-
 def _tl_type(value: torch.Tensor, shape: list[int]) -> tl.block_type:
     dtype = (
         tl.uint8
@@ -1646,10 +1634,6 @@ def _carried(node: torch.fx.Node) -> torch.fx.Node | None:
     return None
 
 
-def _graph_info(device_function: DeviceFunction, graph: torch.fx.Graph) -> GraphInfo:
-    return next(i for i in device_function.graph_infos() if i.graph is graph)
-
-
 def padded_k(node: torch.fx.Node) -> int | None:
     """The K a dot's Triton lowering zero-pads its operands to
     (``emit_tl_dot_with_padding``: doubling up to ``min_dot_size``), else None."""
@@ -1659,7 +1643,7 @@ def padded_k(node: torch.fx.Node) -> int | None:
         cast("torch.fx.Node", node.args[i]).meta["val"]
         for i in matmul_operand_positions()[node.target]
     )
-    k = concrete(a.shape)[-1]
+    k = concrete_extents(a.shape)[-1]
     min_k = min_dot_size(CompileEnvironment.current().device, a.dtype, b.dtype)[2]
     return min_k if k < min_k else None
 
@@ -1685,7 +1669,7 @@ def tmem_dot_supported(device_function: DeviceFunction, node: torch.fx.Node) -> 
         )
     ):
         return False
-    shapes = [concrete(t.shape) for t in (a, b)]
+    shapes = [concrete_extents(t.shape) for t in (a, b)]
     if len(shapes[0]) == 3:
         if shapes[0][0] != 1 or shapes[1][0] != 1:
             return False
@@ -1728,7 +1712,7 @@ def resident(device_function: DeviceFunction, node: torch.fx.Node) -> bool:
     """Whether the dot's accumulator stays in tensor memory through its loop: a
     loop-carried fp32 one nothing else in the loop touches."""
     accumulator = _carried(node)
-    info = _graph_info(device_function, node.graph)
+    info = device_function.graph_info(node.graph)
     return (
         accumulator is not None
         and len([u for u in accumulator.users if u.target not in _SHAPE_QUERIES]) == 1
@@ -1773,7 +1757,7 @@ def codegen_view(interp: GraphInterpreter, node: torch.fx.Node) -> SharedValue:
 def fresh_accumulator(device_function: DeviceFunction, node: torch.fx.Node) -> bool:
     """Whether the dot's loop starts its accumulator at zero and statically runs."""
     accumulator = cast("torch.fx.Node", _carried(node))
-    info = cast("ForLoopGraphInfo", _graph_info(device_function, accumulator.graph))
+    info = cast("ForLoopGraphInfo", device_function.graph_info(accumulator.graph))
     loop, _ = control_flow_parent_entries(device_function.graph_infos())[info.graph_id]
     if loop.target not in (_for_loop, _for_loop_step):
         return False
@@ -1801,7 +1785,7 @@ def codegen_tmem_dot(
     cg = cast("GenerateAST", interp.cg)
     device_function = cg.device_function
     a_pos, b_pos = matmul_operand_positions()[node.target]
-    shape = concrete(node.meta["val"].shape)
+    shape = concrete_extents(node.meta["val"].shape)
     M, N = shape[-2:]
     squeeze = len(shape) == 3  # a unit batch (``tmem_dot_supported``)
 
@@ -1849,7 +1833,7 @@ def codegen_tmem_dot(
         if isinstance(value, SharedValue):
             operand_asts[position] = value.expr
             if squeeze and not is_scale(node, position):
-                dims = map(str, concrete(arg.meta["val"].shape)[1:])
+                dims = map(str, concrete_extents(arg.meta["val"].shape)[1:])
                 operand_asts[position] = reshape(value.expr, dims)
         elif is_scale(node, position):
             operand_asts[position] = cast("ast.AST", value)
@@ -1999,7 +1983,7 @@ def _staged(
     if squeeze or k_pad:
         value = cast("ast.AST", interp.env[node])
         if k_pad:
-            dims = concrete(shape)[squeeze:]
+            dims = concrete_extents(shape)[squeeze:]
             if squeeze:
                 value = expr_from_string(f"tl.reshape({{x}}, {dims})", x=value)
             axis = 1 if lhs else 0

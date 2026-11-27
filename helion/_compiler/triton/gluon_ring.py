@@ -86,6 +86,7 @@ from ..emitter_protocols import RetryPolicy
 from ..host_function import HostFunction
 from ..indexing_strategy import BlockedSubscriptIndexing
 from ..indexing_strategy import TensorDescriptorIndexingStrategy
+from ..indexing_strategy import concrete_extents
 from ..indexing_strategy import in_warp_specialized_loop
 from ..indexing_strategy import whole_box_descriptor
 from ..tile_dependency import TILE_ACCESS_META
@@ -1101,7 +1102,7 @@ class RingLowering:
                 self._tagged(state, tensor, indexing, True),
                 joined,
             )
-        block_shape = gluon_ops.concrete(indexing.block_shape)
+        block_shape = concrete_extents(indexing.block_shape)
         # A scale tcgen05.cp copies takes an unswizzled slot (as Triton's): whole
         # rows of a 16-byte multiple, at most one TMA box row (256 elements).
         swizzles = {not gluon_ops.copied_scale(d, p) for d, p in uses}
@@ -1203,7 +1204,7 @@ class RingLowering:
                 f"T6: {access.tensor_name}: a ring operand not in an unpermuted, "
                 "swizzled slot"
             )
-        box = gluon_ops.concrete(indexing.block_shape)
+        box = concrete_extents(indexing.block_shape)
         last = tensor.ndim - 1
         rows = [dim for dim in range(last) if box[dim] != 1]
         presence, chunk, chunks = -1, 1, 1
@@ -1273,7 +1274,7 @@ class RingLowering:
         tagged: tuple[str, tuple[int, ...]] | None = None,
     ) -> tuple[str, TensorDescriptorArg]:
         """Emit ring site ``node``'s acquire; returns the slot and the descriptor."""
-        block_shape = gluon_ops.concrete(indexing.block_shape)
+        block_shape = concrete_extents(indexing.block_shape)
         descriptor = self._descriptor(tensor, indexing, swizzle)
         site = self.sites.get(node)
         if site is None:
@@ -1385,7 +1386,7 @@ class RingLowering:
         while gluon_ops._is_view(root):
             root = cast("torch.fx.Node", root.args[0])
         value = cast("torch.Tensor", source.meta["val"])
-        shape = gluon_ops.concrete(value.shape)
+        shape = concrete_extents(value.shape)
         if (
             # A plain load (a view of one) is no computed operand: the pipeline
             # stages it (an MMA reads a TMA load in place).
@@ -1457,7 +1458,7 @@ class RingLowering:
         memory for another, one of the shape's it shares (``_shared_ring``).
         ``peek``: None where that raises."""
         root = self.tmem_root(cast("GenerateAST", interp.cg))
-        shape = tuple(gluon_ops.concrete(node.meta["val"].shape)[-2:])
+        shape = tuple(concrete_extents(node.meta["val"].shape)[-2:])
         peers = [
             n
             for n, m in self.mma.items()
@@ -1466,7 +1467,7 @@ class RingLowering:
             and n is not node
             and self.dot_roots.get(n) == root
         ]
-        shapes = [tuple(gluon_ops.concrete(n.meta["val"].shape)[-2:]) for n in peers]
+        shapes = [tuple(concrete_extents(n.meta["val"].shape)[-2:]) for n in peers]
         key = (shape, shapes.count(shape) + 1)
         if key not in self.acc_rings and self._tmem_left(key[0]) < 0:
             try:
@@ -1544,9 +1545,7 @@ class RingLowering:
         parents = control_flow_parent_ids(self.device_function.graph_infos())
 
         def graphs(dot: torch.fx.Node) -> list[int]:
-            graph: int | None = gluon_ops._graph_info(
-                self.device_function, dot.graph
-            ).graph_id
+            graph: int | None = self.device_function.graph_info(dot.graph).graph_id
             chain = []
             while graph is not None:
                 chain.append(graph)
@@ -1575,7 +1574,7 @@ class RingLowering:
         None; logs why an enabled loop takes none."""
         df = self.device_function
         env = CompileEnvironment.current()
-        info = gluon_ops._graph_info(df, node.graph)
+        info = df.graph_info(node.graph)
         spec = env.config_spec.cross_loop_tmem_prefetch
         block_ids = info.block_ids if isinstance(info, ForLoopGraphInfo) else []
         if len(block_ids) != 1 or block_ids[0] not in spec.valid_block_ids():

@@ -40,6 +40,7 @@ from .variable_origin import TileBeginOrigin
 
 if TYPE_CHECKING:
     from collections.abc import Callable
+    from collections.abc import Iterable
     from collections.abc import Sequence
 
     from ..runtime.config import Config
@@ -366,19 +367,17 @@ def _padded_iota_dims_once(
     return memo[key]
 
 
-def load_index_axes(node: torch.fx.Node) -> dict[int, list[int | None]] | None:
-    """For each tensor index of the load ``node``, by its position in the
-    subscript, the load's dim each of the index's dims runs along (None: none),
-    as ``SubscriptIndexing.compute_shape`` lays them out (through the same
-    helpers); None when they do not add up to the load's rank.
+def index_axes(
+    index: Sequence[object],
+) -> tuple[int, dict[int, list[int | None]]]:
+    """The rank of a subscript's result and, for each tensor index by its
+    position in the subscript, the result dim each of the index's dims runs
+    along (None: none), as ``SubscriptIndexing.compute_shape`` lays them out
+    (through the same helpers).
 
     ``hl.load(x, [i, hl.arange(200)])`` has one dim, along which the range
     runs; ``x[tile, rows, :]`` has three, the second ``rows``'.
     """
-    index = node.args[1]
-    val = node.meta.get("val")
-    if not isinstance(index, (list, tuple)) or not isinstance(val, torch.Tensor):
-        return None
     env = CompileEnvironment.current()
     fake = [
         item.meta.get("val") if isinstance(item, torch.fx.Node) else item
@@ -408,6 +407,17 @@ def load_index_axes(node: torch.fx.Node) -> dict[int, list[int | None]] | None:
                     rank += 1
         elif k is None or isinstance(k, slice) or is_block_size_index(k):
             rank += 1
+    return rank, axes
+
+
+def load_index_axes(node: torch.fx.Node) -> dict[int, list[int | None]] | None:
+    """``index_axes`` of the load ``node``'s subscript; None when they do not
+    add up to the load's rank."""
+    index = node.args[1]
+    val = node.meta.get("val")
+    if not isinstance(index, (list, tuple)) or not isinstance(val, torch.Tensor):
+        return None
+    rank, axes = index_axes(index)
     return axes if rank == val.ndim else None
 
 
@@ -1010,7 +1020,8 @@ def _resolve_configured_extent(
     return int(result) if result.is_Integer else None
 
 
-def _concrete_extents(shape: list[int | torch.SymInt]) -> list[int]:
+def concrete_extents(shape: Iterable[int | torch.SymInt]) -> list[int]:
+    """``shape``'s extents under this config: configured block sizes, else size hints."""
     env = CompileEnvironment.current()
     config = DeviceFunction.current().config
     return [
@@ -1022,7 +1033,7 @@ def _concrete_extents(shape: list[int | torch.SymInt]) -> list[int]:
 
 
 def proves_multiple(state: CodegenState, value: object, divisor: int) -> bool:
-    """Prove a power-of-two factor of a scalar base, including across captures."""
+    """Prove a scalar base a multiple of ``divisor``, including across captures."""
     from ..language.tile_ops import tile_begin
 
     if divisor == 1:
@@ -1050,6 +1061,8 @@ def proves_multiple(state: CodegenState, value: object, divisor: int) -> bool:
                 return proves_multiple(
                     state, other, divisor // math.gcd(divisor, factor)
                 )
+        # A product is a multiple of whatever divides one of its factors.
+        return any(proves_multiple(state, factor, divisor) for factor in value.args[:2])
     if (
         value.target in (operator.floordiv, torch.ops.aten.floor_divide.default)
         and isinstance(quotient := value.args[1], int)
@@ -1084,7 +1097,7 @@ def _aligned_loop_start(state: CodegenState, tile: torch.SymInt, divisor: int) -
     if origin is None or state.fx_node is None:
         return False
     df = state.device_function
-    loop = next(i for i in df.graph_infos() if i.graph is state.fx_node.graph)
+    loop = df.graph_info(state.fx_node.graph)
     if not isinstance(loop, ForLoopGraphInfo) or origin.block_id not in loop.block_ids:
         return False
     parent, _ = control_flow_parent_entries(df.graph_infos())[loop.graph_id]
@@ -1099,13 +1112,14 @@ def _aligned_loop_start(state: CodegenState, tile: torch.SymInt, divisor: int) -
 def whole_box_descriptor(
     state: CodegenState, indexing: BlockedSubscriptIndexing, subscript: list[object]
 ) -> bool:
-    """Whether a descriptor load needs no guard: true when every axis whose
+    """Whether a descriptor access needs no guard: true when every axis whose
     range is unproven has its origin at a whole-box multiple (a negative origin
     then misses the tensor entirely) and the contiguous origin is aligned. A
     box that may be dead then gets an aligned out-of-bounds origin instead
-    (``tl.where``), which TMA zero-fills, so the load has no branch. A ring
-    load requires this (it cannot switch to a pointer load); another load
-    takes it when it holds, else the guarded TMA and pointer arms."""
+    (``tl.where``), which TMA zero-fills (a store or atomic writes nothing
+    there), so the access has no branch. A ring load requires this (it cannot
+    switch to a pointer load); another access takes it when it holds, else the
+    guarded TMA and pointer arms."""
     tensor = indexing.base
     layout = CompileEnvironment.current().tensor_descriptor_layout_signature(tensor)
     assert layout is not None and layout[0] is not None
@@ -1113,7 +1127,7 @@ def whole_box_descriptor(
     unknown = set(range(tensor.ndim)) - indexing.proven_descriptor_axes
     subs = [(n, k) for n, k in enumerate(subscript) if k is not None]
     for dim, ((pos, k), width) in enumerate(
-        zip(subs, _concrete_extents(indexing.block_shape), strict=True)
+        zip(subs, concrete_extents(indexing.block_shape), strict=True)
     ):
         divisor = width if dim in unknown else 1
         if dim == contiguous and dim not in indexing.aligned_descriptor_axes:
@@ -2271,6 +2285,8 @@ class TensorDescriptorIndexingStrategy(IndexingStrategy):
             for statement in state.device_function.async_store_drain():
                 state.add_statement(statement)
 
+        # A whole-box origin needs no guard: TMA drops a dead box's writes.
+        guarded = not whole_box_descriptor(state, indexing, subscript)
         # Apply permutation to the value being stored if needed
         desc_arg = indexing.tensor_descriptor_arg(state)
         store_value = indexing.reshape_store(state, value)
@@ -2292,6 +2308,8 @@ class TensorDescriptorIndexingStrategy(IndexingStrategy):
             ),
             value=store_value,
         )
+        if not guarded:
+            return store
         return indexing.guarded_descriptor_store(
             state,
             store,
@@ -2347,6 +2365,8 @@ class TensorDescriptorIndexingStrategy(IndexingStrategy):
         state.device_function.note_tma_store(
             warp_specialized=_in_warp_specialized_loop(state)
         )
+        # A whole-box origin needs no guard, as for a store.
+        guarded = not whole_box_descriptor(state, indexing, subscript)
         desc_arg = indexing.tensor_descriptor_arg(state)
         atomic_value = indexing.reshape_store(state, value)
 
@@ -2382,6 +2402,8 @@ class TensorDescriptorIndexingStrategy(IndexingStrategy):
                 indexing.descriptor_lane_mask(state),
             )
 
+        if not guarded:
+            return atomic
         return indexing.guarded_descriptor_store(state, atomic, misaligned)
 
 
