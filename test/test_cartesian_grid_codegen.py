@@ -13,6 +13,8 @@ import pytest
 import torch
 
 import helion
+from helion import _compat
+from helion._compiler import indexing_strategy
 from helion._testing import _get_backend
 from helion._testing import cpu_render_target
 from helion._testing import matchesBackends
@@ -1645,6 +1647,124 @@ def test_an_empty_root_does_not_narrow_a_later_live_root(tmp_path):
         load_generated_module(path).write(*args, _launcher=interpret_triton_kernel)
     assert args[0].tolist() == [-1] * 8
     assert args[1].tolist() == [2**31, 2**31 + 1] + [-1] * 6
+
+
+@skipUnlessBackends(["triton"])
+def test_old_block_pointers_narrow_only_exact_offsets():
+    # Block pointers before Triton 3.8 take Int32 offsets only. An offset of
+    # a root with Int64 coordinates (a block size the config does not fix, a
+    # dynamic, shifted or distant root) is narrowed where its origin is
+    # proven inside a dim that fits Int32; otherwise the access uses pointer
+    # indexing, as narrowed, a distant origin of 2**32 would land on element
+    # 0.
+    @helion.kernel(backend="triton", static_shapes=True)
+    def arg_block(x, block_size: int):
+        out = torch.empty_like(x)
+        for tile in hl.tile(x.size(0), block_size=block_size):
+            out[tile] = torch.sin(x[tile])
+        return out
+
+    @helion.kernel(backend="triton", static_shapes=False)
+    def column_sums(x):
+        m, n = x.size()
+        out = torch.empty([n], dtype=torch.float32, device=x.device)
+        for tile_n in hl.tile(n):
+            acc = hl.zeros([tile_n], dtype=torch.float32)
+            for tile_m in hl.tile(m):
+                acc += x[tile_m, tile_n].sum(0)
+            out[tile_n] = acc
+        return out
+
+    @helion.kernel(backend="triton", static_shapes=True)
+    def shifted(x, block_size: int):
+        out = torch.zeros_like(x)
+        for tile in hl.tile(1, x.size(0), block_size=block_size):
+            out[tile] = torch.sin(x[tile])
+        return out
+
+    @helion.kernel(backend="triton", static_shapes=True)
+    def distant(out):
+        for tile in hl.tile(2**32, 2**32 + 4, block_size=4):
+            out[tile] = 1.0
+
+    @helion.kernel(backend="triton", static_shapes=False)
+    def rows(x):
+        out = torch.zeros_like(x)
+        for i in hl.grid(1, x.size(0)):
+            for tile in hl.tile(x.size(1)):
+                out[i - 1, tile] = x[i - 1, tile] * 2
+        return out
+
+    @helion.kernel(backend="triton", static_shapes=True)
+    def broadcast(x, out, block_size: int):
+        for row, col in hl.tile([1, 0], [5, 4], block_size=[block_size, 4]):
+            out[row.index - 1, col] = x[row, col]
+
+    @helion.kernel(backend="triton", static_shapes=False)
+    def scalar(x):
+        out = torch.zeros_like(x)
+        for i in hl.grid(1, x.size(0)):
+            out[i] = x[i] * 2
+        return out
+
+    @helion.kernel(backend="triton", static_shapes=True)
+    def mixed(small):
+        big = torch.zeros(2**32 + 4, dtype=torch.uint8, device=small.device)
+        for row, col in hl.tile([2**31, 0], [2**31 + 4, 4], block_size=[4, 4]):
+            small[row.index % 4] = 1
+            big[col] = 1
+        return big
+
+    def render(kernel, args, block_sizes=()):
+        with (
+            cpu_render_target(),
+            patch.object(_compat, "_supports_block_ptr", lambda: True),
+            patch.object(
+                indexing_strategy, "block_ptr_offsets_must_fit_int32", lambda: True
+            ),
+        ):
+            return cpu_bind(kernel, args).to_code(
+                helion.Config(block_sizes=list(block_sizes), indexing="block_ptr")
+            )
+
+    source = render(arg_block, (torch.randn(1024), 32))
+    assert "tl.cast(pid_0, tl.int64)" in source, source
+    assert "[tl.cast(offset_0, tl.int32)], [_BLOCK_SIZE_0]" in source, source
+    # Dynamic dims fit Int32 where they are an argument's: Int32 indexing
+    # requires each argument to fit.
+    source = render(column_sums, (torch.randn(20, 64),), [32, 16])
+    assert "tl.cast(pid_0, tl.int64)" in source, source
+    # The inner loop's offset is not a root's: it stays as it was.
+    assert "[offset_1, tl.cast(offset_0, tl.int32)]" in source, source
+    assert "tl.make_block_ptr(out, [x_size_1], [1], [tl.cast(offset_0, tl.int32)]" in (
+        source
+    ), source
+    # Unproven origins (a masked shifted tile, a distant one, arithmetic on a
+    # shifted grid index) take pointer indexing within the tensor's bounds,
+    # which the block pointer's boundary check gave.
+    for source, bound in (
+        (render(shifted, (torch.randn(1025), 32)), "< 1025)"),
+        (render(distant, (torch.zeros(4),)), "< 4)"),
+        (render(rows, (torch.randn(8, 16),), [16]), "< x_size_0)"),
+    ):
+        assert "tl.cast(pid_0, tl.int64)" in source, source
+        assert "tl.make_block_ptr(" not in source, source
+        (store,) = [line for line in source.splitlines() if "tl.store(out" in line]
+        assert bound in store, source
+    # Accesses that make no block pointer (a size-one broadcast, a scalar)
+    # keep plain pointer indexing.
+    for source in (
+        render(broadcast, (torch.randn(5, 1), torch.zeros(4, 4), 4)),
+        render(scalar, (torch.randn(8),)),
+    ):
+        assert "tl.cast(pid_0, tl.int64)" in source, source
+        assert "tl.make_block_ptr(" not in source, source
+        assert "tl.reshape(" not in source, source
+    # A root's Int32 axis keeps its block pointer as it was, beside an Int64
+    # axis of the same root.
+    source = render(mixed, (torch.zeros(4),))
+    assert "tl.cast(pid_0, tl.int64)" in source, source
+    assert "tl.make_block_ptr(big, [4294967300], [1], [offset_1]," in source, source
 
 
 @skipUnlessBackends(["triton"])

@@ -753,6 +753,27 @@ def _fp8_block_ptr_padding_broken() -> bool:
     return version.parse("3.8.0") <= triton_version < version.parse("3.9.0")
 
 
+@functools.cache
+def block_ptr_offsets_must_fit_int32() -> bool:
+    """Whether ``tl.make_block_ptr`` refuses Int64 offsets.
+
+    Block pointers before the python-only rewrite of the triton 3.8 series
+    (triton-lang/triton#9668) assert "Block pointers only support 32 bit
+    `offsets/block_shape`"; the rewrite takes Int64 offsets. Looked up in the
+    semantic layer's source, by version without it. See
+    ``BlockedSubscriptIndexing.make_block_ptr``.
+    """
+    if not triton_is_available():
+        return False
+    import triton.language.semantic as semantic
+
+    try:
+        source = inspect.getsource(semantic)
+    except (OSError, TypeError):
+        return get_triton_version() < version.parse("3.8")
+    return "Block pointers only support 32 bit `offsets" in source
+
+
 def sm100_dot_tmem_lhs_broken(device: torch.device) -> bool:
     # call private func we can patch in testing
     return _sm100_dot_tmem_lhs_broken(device)

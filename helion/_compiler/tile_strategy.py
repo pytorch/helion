@@ -1274,6 +1274,8 @@ class PersistentReductionState(DeviceLoopOrGridState):
 class TileStrategy:
     _fn: weakref.ReferenceType[DeviceFunction]
     block_ids: list[int]
+    # The blocks to which this root gave Int64 coordinates (_note_root_width).
+    wide_root_blocks: frozenset[int] = frozenset()
 
     def __init__(
         self,
@@ -2232,6 +2234,14 @@ class BlockSizeTileStrategy(TileStrategy):
             return backend.cast_expr(value, backend.dtype_str(torch.int64))
         return value
 
+    def _note_root_width(self, block_ids: Sequence[int], dtype: str) -> None:
+        """Note the blocks to which this root gives Int64 coordinates, whose
+        offsets a block pointer before Triton 3.8 narrows
+        (``BlockedSubscriptIndexing.wide_axes``)."""
+        env = CompileEnvironment.current()
+        if dtype == env.backend.root_coordinate_type_str(torch.int64):
+            self.wide_root_blocks = self.wide_root_blocks | frozenset(block_ids)
+
     def _root_coordinate_dtype(
         self,
         begin: object,
@@ -2985,6 +2995,7 @@ class FlattenedTileStrategy(BlockSizeTileStrategy):
                 )
                 env = CompileEnvironment.current()
                 dtype = self._root_coordinate_dtype(begin, end, step)
+                self._note_root_width([block_id], dtype)
                 pid_var = state.device_function.new_var("pid_flat", dce=True)
                 coordinate_pid = root_coordinate_pid(pid_var, dtype)
                 offsets_var = self._offsets_var
@@ -3076,6 +3087,7 @@ class FlattenedTileStrategy(BlockSizeTileStrategy):
             for b, e, s in zip(begins, ends, steps, strict=True)
         ):
             dtype = env.backend.root_coordinate_type_str(torch.int64)
+        self._note_root_width(self.block_ids, dtype)
 
         pid_var = state.device_function.new_var("pid_flat", dce=True)
         coordinate_pid = root_coordinate_pid(pid_var, dtype)
@@ -3441,6 +3453,7 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
                 block_size,
                 empty_root=self._literal_empty_axes(begins, ends, steps),
             )
+            self._note_root_width([block_idx], dtype)
             offset_var = self.offset_var(block_idx)
             index_var = self.index_var(block_idx)
             pid_var = device_function.new_var(f"pid_{i}", dce=True)
@@ -5403,6 +5416,7 @@ class PerThreadFlattenedTileStrategy(_LaneContextOwner, FlattenedTileStrategy):
             for b, e, s in zip(begins, ends, steps, strict=True)
         ):
             dtype = env.backend.root_coordinate_type_str(torch.int64)
+        self._note_root_width(self.block_ids, dtype)
         coordinate_pid = root_coordinate_pid(pid_var, dtype)
         tile_base = f"({coordinate_pid}) * ({block_size_var})"
         if not _known_zero_bound(begin):
