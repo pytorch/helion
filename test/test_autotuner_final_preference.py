@@ -25,21 +25,23 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from test.cute_population_contracts import tcgen05_mma_support
-from test.test_cute_pdl import _COLUMN_SUM
-from test.test_cute_tcgen05_fixed_chain import _bind_gemm
-from test.test_cute_tcgen05_fixed_chain import _source
-from test.test_cute_tcgen05_pdl import _persistent_config
-
 import helion
 from helion._compiler.cute.backend import CuteBackend
 from helion._compiler.cute.packet_flush_names import PACKET_FLUSH_STREAMING
 from helion._compiler.cute.packet_flush_names import streaming_store_rendered
 from helion._compiler.cute.pdl_release import generic_release_rendered
+from helion._compiler.cute.pdl_release import loader_tail_release_rendered
 from helion._compiler.triton.backend import TritonBackend
 from helion._testing import skipUnlessBackends
 from helion._testing.cute_codegen import cpu_bind
 from helion._testing.cute_codegen import mock_cuda_unavailable
+from helion._testing.cute_mma_dag import bind_cpu_gemm as _bind_gemm
+from helion._testing.cute_mma_dag import normalized_source as _source
+from helion._testing.cute_mma_dag import persistent_gemm_config as _persistent_config
+from helion._testing.cute_population_contracts import tcgen05_mma_support
+from helion._testing.cute_vloop_sink_kernels import (
+    COLUMN_SUM_SINK_CONFIG as _COLUMN_SUM,
+)
 from helion._testing.cute_vloop_sink_kernels import col_reduce_sum_static
 from helion.autotuner.base_search import PopulationBasedSearch
 from helion.runtime.settings import Settings
@@ -102,6 +104,19 @@ _STREAMING_ENTRY = _module(
 _EXIT = _module(_WAIT + _BODY + _RELEASE)
 _FAMILY = _module(_WAIT + _BODY + "    if warp_idx == 0:\n    " + _RELEASE)
 _OFF = _module(_BODY)
+# The proved paired attention kernel: the capture contract's conditional
+# entry wait, then the body that releases from its loader's tail.
+_TAIL = (
+    "@cute.kernel\ndef _helion_k(x, out, capture_pdl_wait_mode):\n"
+    "    if capture_pdl_wait_mode == 0:\n"
+    "        cute.arch.griddepcontrol_wait()\n"
+    "    _helion_paged_paired.paged_attention_paired_body(\n"
+    "        x, out, capture_pdl_wait_mode=capture_pdl_wait_mode, capture_release_tail=True)\n"
+    "_helion_k._helion_cute_use_pdl = True\n"
+    "_helion_k._helion_cute_wrapper_plans = [{'kind': 'helion_paged_attention',"
+    " 'capture_pdl_contract': 'paired-output-stores-v1',"
+    " 'capture_pdl_mode_param': 'capture_pdl_wait_mode'}]\n"
+)
 
 
 def _member(perf: float, source: str = _OFF, **config: object) -> SimpleNamespace:
@@ -127,6 +142,7 @@ def _search(backend: str, members: list[SimpleNamespace] = ()) -> PopulationBase
     return search
 
 
+@skipUnlessBackends(["cute"])
 def test_the_generic_early_release_is_read_off_the_rendered_module() -> None:
     assert generic_release_rendered(_ENTRY)
     assert generic_release_rendered(_GUARD)
@@ -139,6 +155,27 @@ def test_the_generic_early_release_is_read_off_the_rendered_module() -> None:
     assert not generic_release_rendered("def kernel(:")
 
 
+@skipUnlessBackends(["cute"])
+def test_the_loader_tail_release_is_read_off_the_rendered_module() -> None:
+    # The paired body owns this release: no generic release statement, the
+    # audited contract and its wait-mode parameter identify it.
+    assert loader_tail_release_rendered(_TAIL)
+    assert not generic_release_rendered(_TAIL)
+    for source in (
+        _ENTRY,
+        _NONE,
+        _OFF,
+        _TAIL.replace("capture_release_tail=True", "capture_release_tail=False"),
+        _TAIL.replace("paired-output-stores-v1", "another-contract"),
+        _TAIL.replace("capture_pdl_wait_mode == 0", "capture_pdl_wait_mode != 0"),
+        _TAIL.replace("'capture_pdl_mode_param': 'capture_pdl_wait_mode'", "'x': 1"),
+        # (a module that does not parse)
+        "def kernel(:",
+    ):
+        assert not loader_tail_release_rendered(source), source
+
+
+@skipUnlessBackends(["cute"])
 def test_cute_prefers_a_kernel_that_renders_the_generic_release() -> None:
     # The generic early release ranks ahead of none; the release with the
     # pad of ``cute_pdl_spread`` (an early launch of the kernel then never
@@ -148,6 +185,9 @@ def test_cute_prefers_a_kernel_that_renders_the_generic_release() -> None:
         (_SPREAD, 0),
         (_ENTRY, 1),
         (_GUARD, 1),
+        # The paired attention body's own early release, from its loader's
+        # tail, ranks with the generic one.
+        (_TAIL, 1),
         (_NONE, 2),
         (_EXIT, 2),
         (_FAMILY, 2),

@@ -93,7 +93,8 @@ def prepare_device_body(
         # would have launched it, ``last_wave`` releases at entry in the
         # CTAs of the launch's last wave only (``_last_wave_release``),
         # and ``auto`` (the default) picks ``entry`` while the grid fits
-        # in one wave and ``last_wave`` past it (``_implicit_pdl_release``).
+        # in one wave and ``last_wave`` past it, ``entry`` again for one
+        # paired attention unit per CTA (``_implicit_pdl_release``).
         # The dependents still wait for this grid's completion and memory
         # flush at their own wait, so the placement never changes what
         # they read.  A tcgen05 kernel on the entry-wait path
@@ -169,9 +170,12 @@ def _pdl_release_placement(fn: DeviceFunction) -> str:
         )
     if placement == "loader_tail" and not fn.cute_state.lanes.pdl_loader_tail_release:
         # Only the proved paired body places this release, and its codegen
-        # records where it does.  Everywhere else (a later effect proof can
-        # decline the normalized capture route) the kernel keeps an ordinary
-        # entry wait and the automatic release.
+        # records where it does: on a launch known to fit one wave
+        # (``loader_tail_release_applies``).  Everywhere else the kernel gets
+        # the automatic release: past one wave, where that body keeps the
+        # capture contract's conditional wait, and where a later effect
+        # proof declined the capture route, which leaves an ordinary entry
+        # wait.
         placement = "auto"
     if placement == "auto":
         placement = _implicit_pdl_release(fn, "entry")
@@ -437,7 +441,9 @@ def _implicit_pdl_release(fn: DeviceFunction, default: str) -> str:
     sizes at runtime (``_last_wave_release`` then compares against the
     launched grid).  A persistent launch sized to the resident capacity
     (``_NUM_SM * num_sm_multiplier``, or the tcgen05 schedulers'
-    ``min(work, capacity)`` clusters) is one wave by construction.
+    ``min(work, capacity)`` clusters) is one wave by construction.  A
+    paired attention launch of one unit per CTA keeps ``entry`` past one
+    wave too (``_entry_release_past_one_wave``).
 
     A release right after the wait lets the dependents' CTAs become
     resident while this kernel runs.  PTX launches the dependent grid
@@ -461,19 +467,84 @@ def _implicit_pdl_release(fn: DeviceFunction, default: str) -> str:
     paired-attention item group, then times the fused-body or split-K grid
     multiplier and the cluster size. The resident capacity is the SM count
     times the CTAs an SM holds, estimated from
-    the launch block (``resident_ctas_per_sm``: the thread limit, or
-    ``cute_min_blocks_per_mp`` when the config asked for an occupancy).
+    the launch block (``resident_ctas_per_sm``: the thread limit, or the
+    occupancy the lowering launches with, else ``cute_min_blocks_per_mp``
+    when the config asked for one).
     A launch shape or SM count codegen cannot know takes ``default``.
     """
+    if _launch_fits_one_wave(fn):
+        return default
+    if _entry_release_past_one_wave(fn):
+        return "entry"
+    return "last_wave"
+
+
+def _launch_fits_one_wave(fn: DeviceFunction) -> bool:
+    """Whether the kernel's launch is one wave of CTAs as far as codegen can
+    tell: a static CTA count within the resident capacity, a persistent
+    launch sized to that capacity, or a device whose capacity is unknown.
+    The test ``auto`` and ``loader_tail`` apply (``_implicit_pdl_release``,
+    ``loader_tail_release_applies``)."""
     capacity = _pdl_resident_capacity(fn)
     if capacity is None:
-        return default
+        return True
     ctas = _pdl_launch_ctas(fn)
     if ctas is not None and ctas <= capacity:
-        return default
-    if ctas is None and _pdl_launch_is_persistent(fn):
-        return default
-    return "last_wave"
+        return True
+    return ctas is None and _pdl_launch_is_persistent(fn)
+
+
+def _entry_release_past_one_wave(fn: DeviceFunction) -> bool:
+    """Whether a launch known to take more than one wave still releases its
+    dependents at entry in every CTA: the proved paired attention schedule
+    with one unit per CTA on a static grid.
+
+    The dependent grid launches once every CTA of this grid has released or
+    exited, and its CTAs then need SMs.  One paired CTA holds an SM for its
+    whole life (it owns the SM's tensor memory), so with ``n`` CTAs on a
+    capacity of ``c`` the last CTA enters, and with a release at entry in
+    every CTA the dependents launch, at the ``(n - c)``-th exit: every CTA
+    of this grid is resident or done by then, and the dependents take SMs
+    only as this grid's CTAs leave them.  The last-wave guard launches them
+    when CTAs ``0 .. n - c - 1`` in particular have exited, which is never
+    earlier and waits for the slowest of those: 200 units of 17 pages on
+    148 SMs start the next call 26.6-27.1 us after the launch instead of
+    25.0-25.2, with 96 SMs idle meanwhile (0.4-0.8 us per call at two
+    calls).  The guard's measurements are of grids of 1024-32768 short
+    CTAs at several per SM, which keep it (``_implicit_pdl_release``).
+
+    A persistent partition of that schedule launches one wave and never
+    asks; a grid the host sizes at runtime keeps the guard, which compares
+    against the launched grid.  ``last_wave`` as an explicit value keeps the
+    guard on every kernel.
+    """
+    return (
+        fn.cute_state.lanes.attention_item_group > 1
+        and _pdl_launch_ctas(fn) is not None
+    )
+
+
+def loader_tail_release_applies(fn: DeviceFunction) -> bool:
+    """Whether ``cute_pdl_release: loader_tail`` releases from the loader's
+    tail: while the launch is known to fit in one wave of CTAs, and while
+    codegen does not know the device's SM count and so cannot count waves
+    (``_launch_fits_one_wave``, the test ``auto`` applies, which keeps the
+    placement it is asked about on a device of unknown capacity).
+
+    The dependent grid launches once every CTA of this grid has released or
+    exited.  In one wave that is when the slowest loader has four pages
+    left, and the dependents' CTAs take over the SMs as this grid's CTAs
+    retire.  Past one wave the earlier waves count at their exit, so a tail
+    release launches the dependents only when the last wave's loaders are
+    nearly done, and the SMs a partial last wave leaves idle stay idle for
+    that whole wave: little better than no dependent launch.  Such a launch,
+    and one the host sizes at runtime on a device whose SM count is known,
+    takes the automatic placement instead (``_implicit_pdl_release``): the
+    entry of every CTA for this schedule's one unit per CTA on a static grid
+    (``_entry_release_past_one_wave``), the last wave's guard on a grid the
+    host sizes at runtime.
+    """
+    return _launch_fits_one_wave(fn)
 
 
 def _pdl_launch_is_persistent(fn: DeviceFunction) -> bool:
@@ -517,9 +588,9 @@ def _pdl_launch_ctas(fn: DeviceFunction) -> int | None:
 def _pdl_resident_capacity(fn: DeviceFunction) -> int | None:
     """How many CTAs of this launch the device holds at once, as far as
     codegen can tell: the SM count times ``resident_ctas_per_sm`` of the
-    launch block (the thread limit, or ``cute_min_blocks_per_mp`` when the
-    config asked for an occupancy); ``None`` when the SM count is unknown
-    (CPU targets)."""
+    launch block (the thread limit, or the occupancy the lowering launches
+    with, else ``cute_min_blocks_per_mp`` when the config asked for one);
+    ``None`` when the SM count is unknown (CPU targets)."""
     env = CompileEnvironment.current()
     num_sm = env.config_spec.num_sm
     if num_sm <= 1:
@@ -533,6 +604,14 @@ def _pdl_resident_capacity(fn: DeviceFunction) -> int | None:
         # an occupancy (the thread limit would call a 1024-CTA flat grid
         # of 192-thread CTAs one wave).
         return num_sm * max(1, min_blocks)
+    if fn.cute_state.tcgen05.min_blocks_per_mp is not None:
+        # A lowering that launches with an occupancy of its own (the paged
+        # attention roles: one CTA holds the SM's tensor memory) overrides
+        # the tunable, as it does for the kernel's ``minnctapersm``
+        # (``launch_attributes``).  A config that leaves the tunable out
+        # would otherwise be sized by the thread limit, which calls three
+        # 640-thread paired CTAs per SM resident.
+        min_blocks = fn.cute_state.tcgen05.min_blocks_per_mp
     launch_block = fn.cute_state.lanes.launch_block
     per_sm = resident_ctas_per_sm(
         math.prod(launch_block) if launch_block is not None else None,

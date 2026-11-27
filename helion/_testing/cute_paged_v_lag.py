@@ -23,8 +23,10 @@ from .cute_paged_base2 import base2_attention_fixture
 from .cute_paged_reference import reference_attention_fixture
 import helion
 from helion._compiler.cute.cute_mma_dag import MMA_DAG_V_LAG_CHOICES
+from helion._compiler.cute.cute_mma_dag import paged_attention_probability_choices
 
 if TYPE_CHECKING:
+    from helion._compiler.cute.cute_mma_dag import CuteMmaDagFacts
     from helion.runtime.kernel import BoundKernel
     from helion.runtime.kernel import Kernel
 
@@ -76,6 +78,40 @@ def without_retirement_seeds(seeds: list[helion.Config]) -> list[helion.Config]:
         for seed in suffix
     )
     return prefix
+
+
+def without_paired_head(
+    seeds: list[helion.Config], facts: CuteMmaDagFacts
+) -> list[helion.Config]:
+    """Check the rank-0 seed of a kernel with the pair proof and return the
+    seeds behind it, in the planner's order.
+
+    The head is the paired schedule with V two tiles behind K, early
+    retirement, streaming hints on the TMA operands and, where proved, the
+    query map and the early probability schedule. It names neither a key
+    clip nor a value-metadata skip: the kernel's defaults apply.
+    """
+    attention = facts.attention
+    assert attention is not None and attention.paired_items
+    head, rest = seeds[0], seeds[1:]
+    assert head not in rest
+    assert head.get("cute_mma_dag_pass_warps") == "attention_paired"
+    assert head.get("cute_mma_dag_v_lag") == 2
+    assert head.get("cute_mma_dag_early_tmem_retirement") is True
+    assert head.get("cute_mma_dag_sleep_waits", False) is False
+    assert head.get("cute_mma_dag_query_tma", False) is attention.query_tma_available
+    probability = paged_attention_probability_choices(facts, "attention_paired")
+    assert head.get("cute_mma_dag_probability_schedule", "serial") == (
+        "early" if "early" in probability else "serial"
+    )
+    policies = head.get("load_eviction_policies")
+    assert isinstance(policies, list)
+    slots = {slot for slot in attention.tma_load_slots if slot is not None}
+    assert [policy for policy in policies if policy] == ["streaming"] * len(slots)
+    assert all(policies[slot] == "streaming" for slot in slots)
+    assert "cute_mma_dag_key_clip" not in head.config
+    assert "cute_mma_dag_value_metadata_skip" not in head.config
+    return rest
 
 
 def check_paired_v_lag_replay(

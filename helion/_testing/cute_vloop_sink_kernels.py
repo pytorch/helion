@@ -12,6 +12,16 @@ import helion.language as hl
 
 FRAGMENT_REDUCE = "_cute_grouped_reduce_shared_two_stage_fragment("
 TWO_STAGE_REDUCE = "_cute_grouped_reduce_shared_two_stage("
+# A config of the column sums below that sinks the row loop into vectors:
+# one CTA a column block, on the generic dependent-launch path.
+COLUMN_SUM_SINK_CONFIG = {
+    "block_sizes": [1024, 16],
+    "num_threads": [128, 4],
+    "cute_vector_widths": [1, 4],
+    "cute_lane_layouts": ["strided", "blocked"],
+    "cute_vloop_sink": True,
+    "cute_lane_unroll": 8,
+}
 
 
 def _col_reduce_sum_fn(x: torch.Tensor) -> torch.Tensor:

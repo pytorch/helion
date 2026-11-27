@@ -55,10 +55,10 @@ from ..cute_mma_dag import MMA_DAG_EARLY_TMEM_RETIREMENT_KEY
 from ..cute_mma_dag import MMA_DAG_EPILOGUE_KEY
 from ..cute_mma_dag import MMA_DAG_EXCHANGE_KEY
 from ..cute_mma_dag import MMA_DAG_KEY
+from ..cute_mma_dag import MMA_DAG_KEY_CLIP_KEY
 from ..cute_mma_dag import MMA_DAG_KEYS
 from ..cute_mma_dag import MMA_DAG_LOADS_KEY
 from ..cute_mma_dag import MMA_DAG_LOOKAHEAD_KEY
-from ..cute_mma_dag import MMA_DAG_PASS_WARPS_ATTENTION_PAIRED
 from ..cute_mma_dag import MMA_DAG_PASS_WARPS_KEY
 from ..cute_mma_dag import MMA_DAG_PERSISTENT_KEY
 from ..cute_mma_dag import MMA_DAG_PROBABILITY_SCHEDULE_KEY
@@ -67,7 +67,6 @@ from ..cute_mma_dag import MMA_DAG_SLEEP_WAITS_KEY
 from ..cute_mma_dag import MMA_DAG_SPLIT_KEY
 from ..cute_mma_dag import MMA_DAG_STAGES_KEY
 from ..cute_mma_dag import MMA_DAG_STORE_KEY
-from ..cute_mma_dag import MMA_DAG_TCGEN05
 from ..cute_mma_dag import MMA_DAG_V_LAG_KEY
 from ..cute_mma_dag import MMA_DAG_VALUE_METADATA_READ_OVERLAP_KEY
 from ..cute_mma_dag import MMA_DAG_VALUE_METADATA_SKIP_KEY
@@ -89,10 +88,12 @@ from ..fragment_mma_dot import FRAGMENT_MMA_K_THREADS
 from ..fragment_mma_dot import FRAGMENT_MMA_KEY
 from ..fragment_mma_dot import FRAGMENT_MMA_ROW_THREADS
 from ..packet_store_policy import store_policy_reaches_a_packet
-from ..pdl_release import CUTE_PDL_CAPTURE_RELEASE_CHOICES
+from ..pdl_release import CUTE_PDL_CAPTURE_DEFAULT
+from ..pdl_release import CUTE_PDL_CAPTURE_OVERLAP_KEY
 from ..pdl_release import CUTE_PDL_RELEASE_CHOICES
 from ..pdl_release import CUTE_PDL_RELEASE_DEFAULT
 from ..pdl_release import CUTE_PDL_SPREAD_KEY
+from ..pdl_release import capture_policy_available
 from ..reduction_lanes import THREADED_SEQUENCES
 from ..reduction_lanes import WARP_THREADS
 from ..reduction_lanes import fit_reduction_threads
@@ -196,10 +197,20 @@ from .flash_surface import fingerprint_extra
 from .flash_surface import pdl_searched
 from .flash_surface import prepare_config_generation_overrides
 from .flash_surface import prepare_override_normalization
+from .mma_dag_surface import CAPTURE_POLICY
+from .mma_dag_surface import CAPTURE_POLICY_REQUIREMENTS
+from .mma_dag_surface import PAIRED_CAPTURE_SCHEDULE
 from .mma_dag_surface import _normalize_cute_mma_dag
 from .mma_dag_surface import _normalize_cute_register_subblocks
+from .mma_dag_surface import capture_overlap_eligible
+from .mma_dag_surface import carried_capture_policies
+from .mma_dag_surface import carries_capture_overlap
 from .mma_dag_surface import drop_paired_knob_pins
+from .mma_dag_surface import kept_capture_policy
+from .mma_dag_surface import key_clip_choices
 from .mma_dag_surface import normalize_value_metadata_options
+from .mma_dag_surface import paired_capture_schedule
+from .mma_dag_surface import rederive_overridden_key_clip
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -1702,6 +1713,16 @@ def _normalize_gated_boolean(
             raise InvalidConfig(f"{key} must be a boolean, got {value!r}")
 
 
+# The options that state a dependent-launch policy, read off the one table
+# of them (``mma_dag_surface.CAPTURE_POLICY``). A proved paired kernel takes
+# its guarded default only from a config that names none of them.
+_CUTE_PDL_POLICY_KEYS = tuple(CAPTURE_POLICY)
+
+
+def _names_cute_pdl_policy(config: Mapping[str, object]) -> bool:
+    return any(key in config for key in _CUTE_PDL_POLICY_KEYS)
+
+
 def _normalize_cute_pdl(
     config_spec: ConfigSpec, config: dict[str, object], *, fix_invalid: bool
 ) -> None:
@@ -1720,7 +1741,19 @@ def _normalize_cute_pdl(
     Config identity is therefore not canonical for this key: a knob-off
     config with ``none`` and one without the key, or a knob-on config
     with ``auto`` and one without the key, hash and compare as different
-    configs while generating the same code."""
+    configs while generating the same code.
+
+    A kernel with the capture-time dependency proof resolves an absent
+    ``cute_pdl`` to its guarded default only when the config names none of
+    the dependent-launch options (``_normalize_cute_pdl_capture_overlap``),
+    so a config that names another of them records ``cute_pdl=False`` here,
+    before an inert default it wrote out is dropped."""
+    if (
+        "cute_pdl" not in config
+        and capture_policy_available(config_spec)
+        and _names_cute_pdl_policy(config)
+    ):
+        config["cute_pdl"] = False
     pdl = config.get("cute_pdl", False)
     if type(pdl) is not bool:
         if not fix_invalid:
@@ -1757,29 +1790,42 @@ def _normalize_cute_pdl(
         config.pop(CUTE_PDL_SPREAD_KEY, None)
 
 
+def _takes_capture_default(available: bool, config: Mapping[str, object]) -> bool:
+    """Whether ``config`` gets the proved paired kernel's guarded
+    dependent-launch policy (``CUTE_PDL_CAPTURE_DEFAULT``) on a kernel whose
+    ``capture_policy_available`` is ``available``
+    (``mma_dag_surface.paired_capture_schedule``): it selects that schedule
+    and names no dependent-launch option.  Normalization and the default of
+    a config flattened before it is normalized share this rule."""
+    paired = paired_capture_schedule(available, config)
+    return paired and not _names_cute_pdl_policy(config)
+
+
 def _normalize_cute_pdl_capture_overlap(
     config_spec: ConfigSpec, config: dict[str, object], *, fix_invalid: bool
 ) -> None:
-    key = "cute_pdl_capture_overlap"
+    key = CUTE_PDL_CAPTURE_OVERLAP_KEY
+    available = capture_policy_available(config_spec)
+    if _takes_capture_default(available, config):
+        # A config that names no dependent-launch option takes the guarded
+        # policy of the proved paired schedule. Naming any of them keeps
+        # exactly what the config says, with an absent ``cute_pdl`` off as
+        # everywhere else (flat search configs always name it, so the search
+        # domain is unchanged): ``_normalize_cute_pdl``, which runs first,
+        # recorded that as ``cute_pdl=False``, so such a config stays
+        # declined when it is normalized again.
+        config.update(CUTE_PDL_CAPTURE_DEFAULT)
     value = config.get(key, False)
     if type(value) is not bool:
         if not fix_invalid:
             raise InvalidConfig(f"{key} must be a boolean")
         value = False
-    eligible = (
-        config_spec.cute_pdl_capture_overlap_available
-        and not config_spec.has_explicit_pdl
-        and config.get("cute_pdl") is True
-        and not config.get(CUTE_PDL_SPREAD_KEY)
-        and config.get("cute_pdl_release", CUTE_PDL_RELEASE_DEFAULT)
-        in CUTE_PDL_CAPTURE_RELEASE_CHOICES
-        and config.get(MMA_DAG_KEY) == MMA_DAG_TCGEN05
-        and config.get(MMA_DAG_PASS_WARPS_KEY) == MMA_DAG_PASS_WARPS_ATTENTION_PAIRED
-    )
+    eligible = capture_overlap_eligible(available, config)
     if value and not eligible and not fix_invalid:
         raise InvalidConfig(
             f"{key}=True requires a supported paired attention kernel, "
-            "cute_pdl=True, cute_pdl_spread=False and automatic, entry or loader-tail release"
+            "cute_pdl=True, cute_pdl_spread=False and automatic, entry, "
+            "loader-tail or last-wave release"
         )
     if config.get("cute_pdl_release") == "loader_tail" and not (eligible and value):
         if not fix_invalid:
@@ -1798,6 +1844,375 @@ def _normalize_cute_pdl_capture_overlap(
         return
     if key in config or value:
         config[key] = value
+
+
+def _decline_overridden_capture_policy(
+    available: bool, config: dict[str, object], overrides: Mapping[str, object]
+) -> None:
+    """Decline the guarded capture policy of a candidate where ``overrides``,
+    already layered over it, contradict that policy, on a kernel whose
+    ``capture_policy_available`` is ``available``
+    (``mma_dag_surface.paired_capture_schedule``).
+
+    Every paired compiler seed spells out the proved paired kernel's guarded
+    default (``CUTE_PDL_CAPTURE_DEFAULT``), and a user seed or stored config
+    may carry capture overlap too. Capture overlap and the tail release are
+    legal only together, under ``cute_pdl``, without spread padding, with a
+    release a capture launch can use and on the paired schedule. An override
+    that takes one of those away (``cute_pdl=False`` or
+    ``cute_pdl_capture_overlap=False``, the documented opt-outs; spread
+    padding; an ``exit`` release; another schedule) would leave the rest
+    of the policy behind for strict normalization to reject, and seed
+    transfer would drop every paired seed from the search.
+
+    Such an override declines the policy the way a config that names the
+    option does: unless overridden themselves, the candidate's ``cute_pdl``
+    goes off and its capture overlap, release and spread padding are
+    dropped, so normalization resolves them from the overrides alone. A
+    compiler seed thereby becomes the same seed without the policy.
+
+    So does a user seed or stored config that names ``cute_pdl=True`` with
+    the overlap and the tail release. Flattened, it is the default policy
+    spelled out: option for option what a compiler seed holds here, and
+    what a config that names none of the options holds, so this hook cannot
+    tell a ``cute_pdl`` its author asked for from the default's, and it
+    keeps no ordinary dependent launch for such a seed. A candidate with
+    the overlap on another release (``entry``, ``last_wave``, automatic) is
+    not that default: under ``cute_pdl_capture_overlap=False`` it keeps its
+    ``cute_pdl`` and its release, which hold without the overlap.
+    Overriding ``cute_pdl=True`` beside the opt-out keeps ordinary
+    dependent launch for every candidate.
+
+    The hook acts on a candidate that still shows the policy under the
+    overrides: the overlap on, or the tail release, which is legal with the
+    overlap alone. A candidate that shows neither has nothing left for
+    normalization to reject and keeps the ``cute_pdl`` it has. Overrides
+    that name the release beside ``cute_pdl_capture_overlap=False`` (an
+    ``auto``, ``entry`` or ``last_wave`` release) therefore keep ordinary
+    dependent launch on that release, in a compiler seed too. Nothing of
+    the seed's default is left to see there, so the seed reads like any
+    candidate that names ``cute_pdl=True``, a random draw or a mutation
+    among them. Reading the overridden release as the tail release at this
+    point would turn ``cute_pdl`` off in each of them and take ordinary
+    dependent launch out of the search.
+
+    Nothing else changes. Overrides the policy can keep (``cute_pdl=True``,
+    an ``entry``, ``last_wave`` or automatic release) leave it in place, and
+    an overridden option is never dropped. A candidate that never held the policy
+    together is left for validation to reject where the options at fault
+    are its own: capture overlap forced by an override over a candidate
+    without ``cute_pdl``, an explicit config inconsistent in options the
+    overrides do not name. Whether a candidate that still shows the policy
+    carried it is decided on its own options. Where an override names the
+    option at fault, the candidate's own value is gone by the time this
+    hook runs, and the option is read as the value the policy needs: a
+    config that names ``cute_pdl=False`` beside capture overlap, an error
+    on its own, is declined under the override ``cute_pdl=False`` like a
+    seed that carried the policy.
+
+    The rule reads that one fact of a binding and nothing else, so it can
+    be asked what overrides do to a policy on a kernel with the proof
+    (``_capture_policy_left``)."""
+    key = CUTE_PDL_CAPTURE_OVERLAP_KEY
+    if config.get(key) is not True and config.get("cute_pdl_release") != "loader_tail":
+        # Nothing of the policy shows: neither the overlap nor the release
+        # that needs it.
+        return
+    if carries_capture_overlap(available, config):
+        return
+    # The candidate as it was where an override now sits: it carried the
+    # policy only if its own options satisfy what the policy needs.
+    carried = {
+        **config,
+        **{
+            name: value
+            for name, value in CAPTURE_POLICY_REQUIREMENTS.items()
+            if name in overrides
+        },
+    }
+    if not carries_capture_overlap(available, carried):
+        return
+    if "cute_pdl" not in overrides:
+        # Named and off, as in every flat config that never had the policy.
+        config["cute_pdl"] = False
+    for name in (key, "cute_pdl_release", CUTE_PDL_SPREAD_KEY):
+        if name not in overrides:
+            config.pop(name, None)
+
+
+def _keep_overridden_capture_policy(
+    config_spec: ConfigSpec,
+    config: dict[str, object],
+    overrides: Mapping[str, object],
+) -> None:
+    """Give a candidate that ``overrides``, already layered over it, put on
+    the proved paired schedule the dependent-launch policy its search keeps
+    (``kept_capture_policy``).
+
+    A search that does not sample the policy keeps it in every flat config
+    of the paired schedule (``CuteConfigGenerationExtension.
+    repair_flat_config``). That repair reads the row's own schedule, and a
+    row is repaired and decoded before the overrides are layered over it.
+    Under an override that selects the schedule, a row can therefore become
+    a paired candidate after the repair: its own schedule slot holds another
+    value (any random draw, and every row mutated from one, since a
+    mutation leaves an overridden slot as drawn), or decoding moved a row
+    the attention schedule rejects to another schedule and fixed its knobs
+    before the override put it back. Either way the decoded config has no
+    capture policy left, so the kept options are written here.
+
+    Nothing is written where no override names the schedule: the candidate
+    is then on the schedule its row decoded to, which the flat repair
+    covered."""
+    if not any(key in overrides for key in PAIRED_CAPTURE_SCHEDULE):
+        return
+    kept = kept_capture_policy(config_spec, overrides)
+    if kept is not None and paired_capture_schedule(
+        capture_policy_available(config_spec), config
+    ):
+        config.update(kept)
+
+
+def _stated_cute_pdl_policy(config: Mapping[str, object]) -> tuple[object, ...]:
+    """The dependent-launch policy a normalized ``config`` states, option by
+    option (``_CUTE_PDL_POLICY_KEYS``). An option it does not name is one
+    normalization left out: off, or the automatic release."""
+    return tuple(
+        config.get(
+            key, CUTE_PDL_RELEASE_DEFAULT if key == "cute_pdl_release" else False
+        )
+        for key in _CUTE_PDL_POLICY_KEYS
+    )
+
+
+def _hold_proposed_capture_policy(
+    config_spec: ConfigSpec,
+    config: dict[str, object],
+    overrides: Mapping[str, object],
+) -> tuple[str, ...]:
+    """Hold the capture policy of ``config``, a normalized proposal that
+    reaches a search under ``overrides`` from outside its flat fields
+    (``ConfigSpec.search_proposal``), to the policy of that search's
+    candidates, in place, and name the options this changed.
+
+    A candidate comes by its policy in two steps. It is decoded from a flat
+    config, in which a search that does not sample the policy keeps it on
+    the paired schedule (``CuteConfigGenerationExtension.
+    repair_flat_config``), and the overrides are layered over it, where one
+    that contradicts the policy declines it
+    (``_decline_overridden_capture_policy``). A proposal goes through
+    neither. The reply of an LLM-guided search is merged over the reference
+    config, which names ``cute_pdl=False``, and normalization keeps what a
+    config names: on the paired schedule the proposal has the policy off
+    unless the reply spells one out, and then it has that one.
+
+    Both steps are applied here, to a proposal on the proved paired
+    schedule. Where the search keeps a policy (``kept_capture_policy``), the
+    proposal gets the kept options, which hold the overridden ones, as a
+    seed or a cached config that names another policy does: eager timing
+    cannot rank what it states against them. Where the search keeps none
+    (it samples the policy over input banks, or its overrides decline the
+    policy or select another schedule), the proposal keeps the policy it
+    states under the overrides of the policy's own options
+    (``_capture_policy_overrides``). Those reach it the way they reach a
+    candidate (``ConfigGeneration._apply_overrides``): they are layered
+    over it, one that contradicts the policy it carries declines that
+    policy, and a proposal this changes is normalized strictly.
+    ``InvalidConfig`` rejects one on which the overrides cannot hold
+    (capture overlap fixed over a proposal without ``cute_pdl``), as it
+    rejects that seed. Every other proposal is left as it is."""
+    available = capture_policy_available(config_spec)
+    if not paired_capture_schedule(available, config):
+        return ()
+    before = _stated_cute_pdl_policy(config)
+    kept = kept_capture_policy(config_spec, overrides)
+    if kept is not None:
+        config.update(kept)
+    else:
+        named = _capture_policy_overrides(overrides)
+        config.update(named)
+        _decline_overridden_capture_policy(available, config, named)
+        if _stated_cute_pdl_policy(config) != before:
+            config_spec.normalize(config)
+    return tuple(
+        key
+        for key, was, now in zip(
+            _CUTE_PDL_POLICY_KEYS,
+            before,
+            _stated_cute_pdl_policy(config),
+            strict=True,
+        )
+        if was != now
+    )
+
+
+def _capture_policy_overrides(overrides: Mapping[str, object]) -> dict[str, object]:
+    """The entries of ``overrides`` that decide whether the guarded capture
+    policy of a config no search produced is declined: the policy's own
+    options as named. ``_decline_capture_policy_without_search`` reads the
+    overrides through these alone, and they are the overrides a proposal
+    from outside a search's flat fields is held to
+    (``_hold_proposed_capture_policy``).
+
+    An override of the schedule is not among them. It moves the candidates
+    of a search, and a candidate it takes off the paired schedule has no
+    policy left to keep (``_decline_overridden_capture_policy``). A config
+    no search produced keeps the schedule it selects, on which its policy
+    holds, and a schedule override does not say that the application edits
+    its captured graphs. Declining there would compile a paired config
+    without the overlap: not the config its search selected, and not what
+    an override to another schedule does to a search either. The candidates
+    it is layered over all leave the paired schedule, and a proposal from
+    outside the flat fields, over which nothing is layered, keeps the
+    schedule its reply names and the policy it states
+    (``_hold_proposed_capture_policy``)."""
+    return {
+        name: overrides[name] for name in _CUTE_PDL_POLICY_KEYS if name in overrides
+    }
+
+
+def _held_capture_overrides(overrides: Mapping[str, object]) -> dict[str, object]:
+    """``_capture_policy_overrides`` as the identity of what a kernel
+    generates from a config no search produced: the policy's own options as
+    named; nothing where the overrides decline the policy of no config.
+
+    Those are the overrides the decline never acts on: the ones the policy
+    keeps (``cute_pdl=True``, a release a capture launch can use, the
+    default restated) and the ones that leave the overlap in every config
+    (``cute_pdl`` without a value). A kernel under them generates what a
+    kernel without overrides generates, and shares its export. Which
+    overrides those are is asked of the decline's own rule
+    (``_capture_policy_left``), for every policy a config can carry
+    (``carried_capture_policies``) on a kernel that has the proof (the rule
+    takes that fact as a value, not a binding): where it leaves each of
+    them the overlap, no config of any binding is declined.
+
+    The entries are read off the overrides and nothing else. The capture
+    proof belongs to a binding (two heads per request have it, one head has
+    not), while the entries identify what a kernel generates across its
+    bindings: an AOT standalone export keeps the variants of every shape
+    the kernel was called with in the entry of what the kernel holds, so an
+    answer that followed the proof would split them over two entries, which
+    no file holds together. The price is paid by kernels that never have
+    the proof, a plain matmul among them: an override that declines the
+    policy is held for them as well, though they have no policy to decline,
+    and a kernel under such an override and one without it export from two
+    entries. Only the binding's proof tells the two kinds of kernel apart."""
+    named = _capture_policy_overrides(overrides)
+    if all(
+        _capture_policy_left(True, policy, named) is None
+        for policy in carried_capture_policies()
+    ):
+        return {}
+    return named
+
+
+def _capture_policy_left(
+    available: bool,
+    resolved: Mapping[str, object],
+    named: Mapping[str, object],
+) -> dict[str, object] | None:
+    """The dependent-launch options that ``named``
+    (``_capture_policy_overrides``) leave ``resolved``, a normalized config
+    that launches with the overlap; ``None`` where they leave it the
+    overlap. The rule of ``_decline_capture_policy_without_search``, which
+    says why.
+
+    ``available`` is ``capture_policy_available`` of the kernel the rule is
+    asked for. The rule reads nothing else of a binding, so the identity of
+    the held overrides asks it for a kernel with the proof without one
+    (``_held_capture_overrides``)."""
+    candidate = {**resolved, **named}
+    _decline_overridden_capture_policy(available, candidate, named)
+    # The policy the config states afterwards. An option without a value is
+    # an absent one: ``Config`` drops it before normalization.
+    stated = {
+        name: candidate[name]
+        for name in _CUTE_PDL_POLICY_KEYS
+        if candidate.get(name) is not None
+    }
+    # What the kernel would compile: the config's own schedule under that
+    # policy, or under the default again where no option of it is left.
+    compiled = {
+        name: value
+        for name, value in resolved.items()
+        if name not in _CUTE_PDL_POLICY_KEYS
+    }
+    compiled.update(stated)
+    if _takes_capture_default(available, compiled) or carries_capture_overlap(
+        available, compiled
+    ):
+        return None
+    return stated
+
+
+def _decline_capture_policy_without_search(
+    config_spec: ConfigSpec,
+    config: Mapping[str, object],
+    overrides: Mapping[str, object],
+) -> dict[str, object] | None:
+    """``config`` with the guarded capture policy declined, where
+    ``overrides`` decline that policy and no search under them produced
+    ``config``; ``None`` where the config stands as it is.
+
+    Overrides act on a search, and ``_decline_overridden_capture_policy``
+    declines the policy for every candidate of one. The kernel also selects
+    configs without a search: an autotune cache hit (the cache identity
+    does not hold the overrides, so the hit may come from a search without
+    them), AOT tuning data, the promoted default of a kernel that does not
+    autotune. Capture overlap has a condition the compiler cannot check,
+    that the application leaves its captured graphs as captured, and the
+    overrides are how an application that edits them says so; a selected
+    config that kept the overlap would read its inputs ahead of a
+    predecessor on such a graph. So the overrides of the policy's own
+    options that decline it for a search decline it here, by the same rule
+    (``_capture_policy_overrides``): they are layered over the normalized
+    config, the search's hook declines, and the config's four
+    dependent-launch options become what that leaves the candidate. For
+    the default policy that is the overridden options as overridden,
+    ``cute_pdl`` off unless overridden and the others dropped;
+    the overlap on an ``entry``, ``last_wave`` or automatic release keeps
+    ``cute_pdl`` and that release under ``cute_pdl_capture_overlap=False``,
+    which hold without the overlap, and so does any config under overrides
+    that name such a release beside that opt-out: dependent launch on the
+    release they name. An override set that is inconsistent in itself (a
+    ``loader_tail`` release beside an opt-out) is left to validation,
+    which rejects the config as it rejects that candidate.
+
+    Nothing else is applied. A config without the overlap, overrides that
+    name none of those options (an override of the schedule among them:
+    the config keeps the schedule it selects, and its policy with it) and
+    overrides the policy keeps (``cute_pdl=True``, an ``entry``,
+    ``last_wave`` or automatic release, the default restated) return
+    ``None``: like every other override they act on a search only, also
+    for the options named here.
+
+    The config the kernel would compile decides: it keeps its schedule and
+    names an option only where it gives a value. Overrides that leave the
+    overlap in that config declined nothing, and return ``None`` as well:
+    an override of ``None`` for ``cute_pdl``, after which the config names
+    no dependent-launch option and takes the default policy back."""
+    available = capture_policy_available(config_spec)
+    if not available:
+        # A binding without the proof has no policy to decline, and never
+        # normalizes for this.
+        return None
+    named = _capture_policy_overrides(overrides)
+    if not named:
+        return None
+    resolved = config_spec.normalized_config(config).config
+    if not carries_capture_overlap(available, resolved):
+        return None
+    stated = _capture_policy_left(available, resolved, named)
+    if stated is None:
+        return None
+    declined = {
+        name: value
+        for name, value in config.items()
+        if name not in _CUTE_PDL_POLICY_KEYS
+    }
+    declined.update(stated)
+    return declined
 
 
 def _normalize_cute_tiles_per_block(
@@ -4319,6 +4734,13 @@ def normalize_finalize(
     if config.get(MMA_DAG_PERSISTENT_KEY):
         # The persistent dag launch's program ids (set by its knob).
         preserve_keys = {*preserve_keys, "pid_type", "num_sm_multiplier"}
+    if paired_capture_schedule(capture_policy_available(config_spec), config):
+        # An absent ``cute_pdl`` selects this schedule's guarded default
+        # (``_normalize_cute_pdl_capture_overlap``), so the normalized config
+        # names the policy it resolved to, whichever way.
+        preserve_keys = {*preserve_keys, "cute_pdl"}
+        if config.get(CUTE_PDL_CAPTURE_OVERLAP_KEY) is True:
+            preserve_keys = {*preserve_keys, *CUTE_PDL_CAPTURE_DEFAULT}
     for key in CUTE_IMPLICIT_DEFAULT_KEYS - provided_keys - preserve_keys:
         config.pop(key, None)
 
@@ -4341,7 +4763,8 @@ def pdl_fields(
 
     Where a ``cute_pdl`` kernel releases its own dependents: ``auto``
     (the default) resolves at codegen to ``entry`` while the launch grid
-    fits in one wave of resident CTAs and to ``last_wave`` past it,
+    fits in one wave of resident CTAs and to ``last_wave`` past it (to
+    ``entry`` again for one paired attention unit per CTA),
     ``entry`` right after the wait, so the dependents launch while this
     kernel runs (their CTAs sit resident at their own wait), ``exit``
     after the body's last statement, ``none`` leaves the implicit trigger
@@ -4355,24 +4778,56 @@ def pdl_fields(
     sequence pays for a non-releasing pick (mamba2_ssd backward: dqkg
     alone reads 3.66 us under every placement; the sequence reads 11.2 us
     per call with dqkg at ``none`` and 10.3 at ``entry``).  The explicit
-    values stay valid for pins, seeds and users. Capture overlap and its
-    ``loader_tail`` release require an explicit opt-in: their storage proof
-    assumes captured topology and parameter addresses remain immutable, which
-    ordinary autotuning cannot establish for the application's future graphs.
+    values stay valid for pins, seeds and users.
+
+    The dependent-launch policy of a proved paired kernel (the capture
+    contract: ``cute_pdl``, capture overlap and its ``loader_tail`` release)
+    comes from the kernel's default (``_normalize_cute_pdl_capture_overlap``),
+    the compiler's paired seeds or an explicit config; its storage proof
+    assumes captured topology and parameter addresses stay immutable. A
+    search that times eager launches cannot observe a capture-only overlap
+    and samples neither the overlap nor its release.
+
+    The policy is searched where the benchmark can observe it
+    (``ConfigSpec.cute_pdl_capture_overlap_searched``): rotating input banks
+    time the kernel's calls back to back inside one captured graph, where a
+    call overlaps its predecessor exactly as in an application's graph. The
+    search then samples the overlap and both releases its guard admits
+    without an explicit placement, ``auto`` and ``loader_tail``, and the
+    seeds cover the diagonal off / overlap with ``auto`` / overlap with
+    ``loader_tail`` (``MmaDagSeedPlanner.configs``). The benchmark graph is
+    captured once and only replayed, and every bank's call is a node of its
+    own with that bank's addresses, so the storage proof's premise holds
+    for the graphs the search times.
+
+    Every other benchmark times eager launches, or captured launches that a
+    flush or an event separates, where the guard grants nothing: the policy
+    reads as a tie there, or as a loss by the capture test's host time on a
+    host-bound kernel. Those searches leave it alone: every searched config
+    of the paired schedule carries the default policy
+    (``CuteConfigGenerationExtension.repair_flat_config``), one transferred
+    from a user seed or a cached config that names another policy included,
+    so only ``autotune_config_overrides`` opts such a search out; the
+    fragments keep the off values for the other schedules.
     """
     if not config_spec.supports_config_key("cute_pdl"):
         return
     searched = pdl_searched(config_spec)
+    observed = config_spec.cute_pdl_capture_overlap_searched
     fields["cute_pdl"] = EnumFragment(
         (False, True), search_choices=(False, True) if searched else (False,)
     )
     if config_spec.cute_pdl_capture_overlap_available:
         fields["cute_pdl_capture_overlap"] = EnumFragment(
-            (False, True), search_choices=(False,)
+            (False, True), search_choices=(False, True) if observed else (False,)
         )
     fields["cute_pdl_release"] = EnumFragment(
         CUTE_PDL_RELEASE_CHOICES,
-        search_choices=(CUTE_PDL_RELEASE_DEFAULT,),
+        search_choices=(
+            (CUTE_PDL_RELEASE_DEFAULT, CUTE_PDL_CAPTURE_DEFAULT["cute_pdl_release"])
+            if observed
+            else (CUTE_PDL_RELEASE_DEFAULT,)
+        ),
     )
     # Pad the kernel's shared memory to one wave's density so an early
     # launch cannot pack its CTAs onto the SMs its primary left idle
@@ -5306,6 +5761,9 @@ def cute_flat_fields(
         probability_fragment = config_spec.cute_mma_dag_probability_schedule
         if probability_fragment is not None:
             fields[MMA_DAG_PROBABILITY_SCHEDULE_KEY] = probability_fragment
+        key_clip_fragment = config_spec.cute_mma_dag_key_clip
+        if key_clip_fragment is not None:
+            fields[MMA_DAG_KEY_CLIP_KEY] = key_clip_fragment
         fields[MMA_DAG_LOADS_KEY] = config_spec.cute_mma_dag_loads
         # (Locals: the type checker's attribute narrowing does not
         # reach this far into the function.)
@@ -5484,6 +5942,14 @@ def flatten_missing_field_default(
         return True, paged_attention_early_retirement_default(
             config.get(MMA_DAG_PASS_WARPS_KEY)
         )
+    if key in CUTE_PDL_CAPTURE_DEFAULT and _takes_capture_default(
+        capture_policy_available(config_spec), config
+    ):
+        return True, CUTE_PDL_CAPTURE_DEFAULT[key]
+    if key == MMA_DAG_KEY_CLIP_KEY and config_spec.cute_mma_dag_key_clip is not None:
+        # Whole tiles under value metadata, where the fragment's own default
+        # is the windowed kernel's leading clip.
+        return True, key_clip_choices(config_spec, config)[0]
     if config_spec.cute_flash_search_enabled and key == FLASH_PIPELINE_FAMILY_KEY:
         return True, _resolve_cute_flash_config(config_spec, config).pipeline_family
     return surface.flatten_missing_field_default(config_spec.tcgen05, key, config)
@@ -5946,9 +6412,13 @@ class CuteSearchSurface(BackendSearchSurface):
         return seed_configs(config_spec)
 
     def repair_search_proposal(
-        self, config_spec: ConfigSpec, config: dict[str, object]
+        self,
+        config_spec: ConfigSpec,
+        config: dict[str, object],
+        overrides: Mapping[str, object],
     ) -> tuple[str, ...]:
-        return surface.repair_search_proposal(config_spec.tcgen05, config)
+        returned = surface.repair_search_proposal(config_spec.tcgen05, config)
+        return returned + _hold_proposed_capture_policy(config_spec, config, overrides)
 
     def prepare_config_generation_overrides(
         self, config_spec: ConfigSpec, overrides: Mapping[str, object] | None
@@ -5968,6 +6438,24 @@ class CuteSearchSurface(BackendSearchSurface):
     ) -> None:
         prepare_override_normalization(config_spec, config, overrides)
         reopen_load_hint_forms(config, overrides)
+        _decline_overridden_capture_policy(
+            capture_policy_available(config_spec), config, overrides
+        )
+        _keep_overridden_capture_policy(config_spec, config, overrides)
+        rederive_overridden_key_clip(config_spec, config, overrides)
+
+    def overrides_without_search(
+        self,
+        config_spec: ConfigSpec,
+        config: Mapping[str, object],
+        overrides: Mapping[str, object],
+    ) -> dict[str, object] | None:
+        return _decline_capture_policy_without_search(config_spec, config, overrides)
+
+    def overrides_held_without_search(
+        self, overrides: Mapping[str, object]
+    ) -> dict[str, object]:
+        return _held_capture_overrides(overrides)
 
     def trim_reference_config(self, config_spec: ConfigSpec, config: Config) -> None:
         trim_reference_config(config_spec, config)

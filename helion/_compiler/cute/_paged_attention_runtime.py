@@ -1036,8 +1036,15 @@ def enqueue_paged_tma_operand(
     key_width: cutlass.Constexpr,
     l2_hints: cutlass.Constexpr = ("", ""),
     include_scales: cutlass.Constexpr = True,
+    key: cutlass.Int32 = cutlass.Int32(0),  # noqa: B008
 ) -> None:
-    """Issue raw bytes and optional scales with one matching transaction count."""
+    """Issue raw bytes and optional scales with one matching transaction count.
+
+    key is the page key held by the first row of both boxes, a multiple of
+    four so the packed scale words stay 16-byte aligned. Rows whose key is
+    outside the descriptor's key extent are not fetched from their own
+    addresses, are filled with zeros and still count toward the transaction.
+    """
     raw_policy = _tma_l2_policy(l2_hints[0])
     scale_policy = raw_policy
     if cutlass.const_expr(include_scales and l2_hints[0] != l2_hints[1]):
@@ -1046,7 +1053,7 @@ def enqueue_paged_tma_operand(
     prims.cp_async_bulk_tensor_shared_cta_global(
         raw_destination,
         raw_map.get_ptr(),
-        [cutlass.Int32(0), cutlass.Int32(0), head, subpage, page],
+        [cutlass.Int32(0), key, head, subpage, page],
         ready,
         l2_cache_hint=raw_policy,
     )
@@ -1054,7 +1061,7 @@ def enqueue_paged_tma_operand(
         prims.cp_async_bulk_tensor_shared_cta_global(
             scale_destination,
             scale_map.get_ptr(),
-            [cutlass.Int32(0), head, subpage, page],
+            [key, head, subpage, page],
             ready,
             l2_cache_hint=scale_policy,
         )

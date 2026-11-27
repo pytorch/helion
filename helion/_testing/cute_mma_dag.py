@@ -227,6 +227,27 @@ def bind_cpu_gemm(shape: tuple[int, int, int], dtype: torch.dtype) -> BoundKerne
     return helion.kernel(_ordinary_gemm, backend="cute", static_shapes=True).bind(args)
 
 
+def normalized_source(bound: BoundKernel, requested: helion.Config) -> str:
+    """The source ``bound`` generates for ``requested`` as its spec
+    normalizes it."""
+    with bound.env:
+        config = bound.config_spec.normalized_config(requested)
+    return bound.to_code(config)
+
+
+def persistent_gemm_config(**overrides: object) -> helion.Config:
+    """A persistent tcgen05 config of the ``bind_cpu_gemm`` kernel with TMA
+    operands and stores, which ``overrides`` extend."""
+    values: dict[str, object] = {
+        "block_sizes": [128, 128, 64],
+        "pid_type": "persistent_blocked",
+        "indexing": ["tensor_descriptor"] * 3,
+        "tcgen05_ab_stages": 4,
+    }
+    values.update(overrides)
+    return helion.Config(**values)  # pyrefly: ignore[bad-argument-type]
+
+
 def normalize_config(
     bound: BoundKernel, config: helion.Config, *, fix: bool
 ) -> dict[str, object]:

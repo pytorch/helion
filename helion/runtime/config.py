@@ -612,7 +612,13 @@ class Config(Mapping[str, object]):
                 filled tensor instead (the fill kernel releases only after its
                 own wait, so every earlier kernel has completed), which lets a
                 split-K kernel's operand loads overlap the fill of its atomic
-                output. Off by default. Kernels that
+                output. Off by default, with one exception: a proved
+                single-root paired attention kernel whose config sets none
+                of this option, ``cute_pdl_capture_overlap``,
+                ``cute_pdl_release`` and ``cute_pdl_spread`` launches as a
+                dependent, with the guarded capture overlap that
+                ``cute_pdl_capture_overlap`` describes together with its
+                condition on captured graphs and its opt-outs. Kernels that
                 already take part in dependent launch (native plans launched
                 with it, bodies with their own wait or release, the
                 materialized-fission producer) and pre-sm_90 targets generate
@@ -621,22 +627,34 @@ class Config(Mapping[str, object]):
                 paired attention kernel to read inputs before its PDL dependency
                 completes when none of its known pending ancestors can write
                 those storages. It still waits before every global write.
-                Requires ``cute_pdl=True`` and automatic, entry or loader-tail
-                release.
+                Requires ``cute_pdl=True`` without ``cute_pdl_spread`` and an
+                automatic, entry, loader-tail or last-wave release.
                 Unknown predecessors, aliases, unsupported wrappers and eager
-                calls retain the ordinary early wait. Default autotuning and
-                compiler seeds leave it off. An explicit Config, user seed, or
-                autotune_config_overrides may opt an eligible kernel in, with
-                ``cute_pdl=True`` and ``cute_pdl_spread=False``.
-                Eager benchmark timings cannot demonstrate this capture-only
-                overlap benefit; a selected configuration is not evidence of a
-                speedup for the application's captured graph.
+                calls retain the ordinary early wait.
+                Default: a proved single-root paired attention kernel whose
+                config sets none of ``cute_pdl``, this option,
+                ``cute_pdl_release`` and ``cute_pdl_spread`` gets
+                ``cute_pdl=True``, this overlap and the ``loader_tail``
+                release. Setting any of the four, to any value, keeps exactly
+                the configured policy, in which an absent ``cute_pdl`` is off
+                as for every other kernel. Off for every other kernel.
                 With this policy enabled, captured topology and parameter
                 addresses must remain immutable; tensor contents may change
                 between replays. Recapture after rewiring a graph or replacing
                 its pointer arguments. Applications that edit captured graphs
-                must leave this policy off, including when supplying stored
-                configurations or user seeds that previously enabled it.
+                turn the policy off in one of two ways: with ``cute_pdl=False``
+                or ``cute_pdl_capture_overlap=False`` in a config they pass
+                to the kernel, which is compiled as written, or with either
+                entry in ``autotune_config_overrides``, which holds for every
+                config the kernel selects itself (the candidates and the
+                result of a search, a result read back from an autotune cache
+                or from AOT tuning data, the default of a kernel that does not
+                autotune).
+                A seed or a stored config that names either option does not
+                opt a search out.
+                ``docs/deployment_autotuning.md`` ("Capture overlap of paired
+                attention kernels") describes how searches and caches treat
+                the policy.
             cute_pdl_release: Where a ``cute_pdl`` kernel releases its own
                 dependents (``griddepcontrol.launch_dependents``), which is what
                 lets the next kernel of a sequence launch early too. ``entry``
@@ -654,13 +672,27 @@ class Config(Mapping[str, object]):
                 larger grid undisturbed. ``auto`` (the default) picks ``entry``
                 while the launch grid is known to fit in one wave of resident
                 CTAs (the SM count times the CTAs an SM holds, from the launch
-                block or ``cute_min_blocks_per_mp``) and ``last_wave`` past it
-                or when the grid is sized at runtime. ``loader_tail`` requires
-                proved paired capture overlap: the loader releases with four
-                logical pages left to issue, or after a shorter/empty loop.
-                Its waits and ancestor-storage proof are unchanged. This choice
-                also requires explicit opt-in; default search leaves placement
-                at ``auto``. Every placement reads the same data: a
+                block, the occupancy the kernel's lowering launches with or
+                ``cute_min_blocks_per_mp``) and ``last_wave`` past it
+                or when the grid is sized at runtime. One exception: a paired
+                attention kernel that launches one unit per CTA on a grid
+                known to take more than one wave keeps ``entry`` in every
+                CTA, since each of its CTAs holds an SM for its whole life,
+                so the dependents launch as its last CTA enters and take SMs
+                only as its CTAs leave them (the last wave's guard would
+                wait for the first CTAs in particular). ``loader_tail``
+                requires proved paired capture overlap: while the grid is
+                known to fit in one wave the loader releases with four
+                logical pages left to issue, or after a shorter/empty loop;
+                past one wave, or when the grid is sized at runtime, it
+                releases as ``auto`` does (at entry in every CTA of that
+                kernel's one unit per CTA on a static grid, from the last
+                wave's CTAs on a grid sized at runtime), since a tail release
+                there would leave the SMs a partial last wave frees idle
+                until that wave's loaders finish.
+                Its waits and ancestor-storage proof are unchanged. It is the
+                placement of the default capture overlap policy above. Every
+                placement reads the same data: a
                 dependent's own wait blocks until this grid has completed and
                 flushed. On the tcgen05 GEMM kernels, whose lowering waits in
                 its warp roles and releases after the last MMA, ``entry`` and

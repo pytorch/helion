@@ -41,6 +41,9 @@ from .cute_mma_dag import MMA_DAG_EPILOGUE_STREAMED
 from .cute_mma_dag import MMA_DAG_EXCHANGE_AUTO
 from .cute_mma_dag import MMA_DAG_EXCHANGE_KEY
 from .cute_mma_dag import MMA_DAG_KEY
+from .cute_mma_dag import MMA_DAG_KEY_CLIP_BOTH
+from .cute_mma_dag import MMA_DAG_KEY_CLIP_KEY
+from .cute_mma_dag import MMA_DAG_KEY_CLIP_LEADING
 from .cute_mma_dag import MMA_DAG_LOADS_KEY
 from .cute_mma_dag import MMA_DAG_LOADS_LANE
 from .cute_mma_dag import MMA_DAG_LOADS_TMA
@@ -55,6 +58,7 @@ from .cute_mma_dag import MMA_DAG_PASS_WARPS_MMA
 from .cute_mma_dag import MMA_DAG_PASS_WARPS_OFF
 from .cute_mma_dag import MMA_DAG_PASS_WARPS_ON
 from .cute_mma_dag import MMA_DAG_PERSISTENT_KEY
+from .cute_mma_dag import MMA_DAG_PROBABILITY_SCHEDULE_EARLY
 from .cute_mma_dag import MMA_DAG_PROBABILITY_SCHEDULE_KEY
 from .cute_mma_dag import MMA_DAG_PROBABILITY_SCHEDULE_SERIAL
 from .cute_mma_dag import MMA_DAG_QUERY_TMA_KEY
@@ -80,6 +84,7 @@ from .cute_mma_dag import mma_dag_pass_warps_lead
 from .cute_mma_dag import mma_dag_pass_warps_reason
 from .cute_mma_dag import mma_dag_seed_configs
 from .cute_mma_dag import mma_dag_seed_variants
+from .cute_mma_dag import paged_attention_key_clip_choices
 from .cute_mma_dag import paged_attention_pass_warp_choices
 from .cute_mma_dag import paged_attention_probability_choices
 from .cute_mma_dag import paged_attention_v_lag_choices
@@ -90,6 +95,9 @@ from .cute_mma_dag_tcgen05 import tcgen05_seed_configs
 from .cute_mma_dag_tcgen05 import tcgen05_split_seed
 from .cute_mma_dag_tcgen05 import tcgen05_split_twins
 from .cutedsl_compat import hinted_cp_async_available
+from .pdl_release import CUTE_PDL_CAPTURE_DEFAULT
+from .pdl_release import CUTE_PDL_RELEASE_DEFAULT
+from .pdl_release import capture_policy_available
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -743,8 +751,10 @@ class MmaDagSeedPlanner:
             and MMA_DAG_EPILOGUE_STREAMED in spec.cute_mma_dag_epilogue.choices
         )
         seeds: list[Config] = []
+        paired_head: list[Config] = []
         sleeping: list[Config] = []
         late_retirement: list[Config] = []
+        key_clip_seeds: list[Config] = []
         query_tma: list[Config] = []
         value_metadata: list[Config] = []
         value_metadata_policies: list[Config] = []
@@ -814,8 +824,10 @@ class MmaDagSeedPlanner:
             from .paged_attention_config import paged_attention_config_reason
             from .paged_attention_config import paged_attention_required_knobs
 
-            # A measured default is not implied by semantic recognition.
-            # Append the explicit topology after the ordinary seed ranking.
+            # Semantic recognition alone implies no default: the explicit
+            # topologies follow the ordinary seed ranking. The exception is
+            # the paired family, which leads every seed (``paired_head``
+            # below).
             sizes = {
                 axis.block_id: 1 if axis.kind == AXIS_LEAD else axis.extent
                 for axis in facts.axes
@@ -869,6 +881,26 @@ class MmaDagSeedPlanner:
                     "load_eviction_policies": [""] * eviction_length,
                 }
                 if (
+                    pass_warps == MMA_DAG_PASS_WARPS_ATTENTION_PAIRED
+                    and capture_policy_available(spec)
+                ):
+                    # The proved paired kernel's dependent launch is guarded
+                    # at capture time (``capture_pdl``): seed what an absent
+                    # ``cute_pdl`` normalizes to. Timing one eager launch
+                    # cannot rank this policy, so every paired seed has it;
+                    # an override that contradicts it declines it at transfer
+                    # (``_decline_overridden_capture_policy``).
+                    # A search whose benchmark observes the policy gets the
+                    # other policies on the leading seed (``paired_head``).
+                    config.update(CUTE_PDL_CAPTURE_DEFAULT)
+                # Where the kernel's default clips the leading side alone, one
+                # counterpart per V lag clips both sides (seeded below).
+                key_clips = paged_attention_key_clip_choices(attention, pass_warps)
+                seed_both_clips = (
+                    key_clips[0] == MMA_DAG_KEY_CLIP_LEADING
+                    and MMA_DAG_KEY_CLIP_BOTH in key_clips
+                )
+                if (
                     paged_attention_config_reason(facts, sizes, config) is None
                     and mma_dag_config_reason(
                         facts,
@@ -880,6 +912,58 @@ class MmaDagSeedPlanner:
                     )
                     is None
                 ):
+                    if pass_warps == MMA_DAG_PASS_WARPS_ATTENTION_PAIRED:
+                        # Rank 0, the autotune-off default of every kernel
+                        # with the pair proof: the paired schedule with the
+                        # V load two tiles behind K, streaming L2 hints on
+                        # the TMA operands and, where proved, the query map
+                        # and the early probability schedule. It is the
+                        # fastest of the attention seeds on windowed and on
+                        # full attention, and the per-key ``attention``
+                        # schedule the slowest. Like every paired seed it
+                        # carries the schedule's retirement and
+                        # dependent-launch defaults and takes the kernel's
+                        # default key clip.
+                        head = {
+                            **config,
+                            MMA_DAG_V_LAG_KEY: 2,
+                            MMA_DAG_EARLY_TMEM_RETIREMENT_KEY: True,
+                            "load_eviction_policies": policy_bundle(
+                                "streaming" if "streaming" in priorities else ""
+                            ),
+                        }
+                        if attention.query_tma_available:
+                            head[MMA_DAG_QUERY_TMA_KEY] = True
+                        if MMA_DAG_PROBABILITY_SCHEDULE_EARLY in probability_choices:
+                            head[MMA_DAG_PROBABILITY_SCHEDULE_KEY] = (
+                                MMA_DAG_PROBABILITY_SCHEDULE_EARLY
+                            )
+                        paired_head.append(Config.from_dict(head))
+                        if spec.cute_pdl_capture_overlap_searched:
+                            # The benchmark times back-to-back captured
+                            # calls and the search samples the policy: seed
+                            # its diagonal on the leading family. The seed
+                            # above overlaps and releases from the loader's
+                            # tail; these overlap with the automatic release
+                            # and launch without dependent launch. The steps
+                            # between the three are too small for a search
+                            # to walk reliably from one end.
+                            off = {
+                                key: value
+                                for key, value in head.items()
+                                if key not in CUTE_PDL_CAPTURE_DEFAULT
+                            }
+                            paired_head.extend(
+                                (
+                                    Config.from_dict(
+                                        {
+                                            **head,
+                                            "cute_pdl_release": CUTE_PDL_RELEASE_DEFAULT,
+                                        }
+                                    ),
+                                    Config.from_dict({**off, "cute_pdl": False}),
+                                )
+                            )
                     for occupancy in occupancies:
                         for v_lag in paged_attention_v_lag_choices(facts, pass_warps):
                             seed = {**config, self.occupancy_key: occupancy}
@@ -933,6 +1017,15 @@ class MmaDagSeedPlanner:
                                             }
                                         )
                                     )
+                                    if seed_both_clips:
+                                        key_clip_seeds.append(
+                                            Config.from_dict(
+                                                {
+                                                    **seed_config,
+                                                    MMA_DAG_KEY_CLIP_KEY: MMA_DAG_KEY_CLIP_BOTH,
+                                                }
+                                            )
+                                        )
                                     sleeping.append(
                                         Config.from_dict(
                                             {
@@ -972,8 +1065,7 @@ class MmaDagSeedPlanner:
         # Probe query transport once per paired V lag, after the old prefix.
         seeds.extend(query_tma)
         # One seed per P schedule and V lag, bundled with available query TMA.
-        # Capture overlap requires the caller's immutable-graph opt-in, so no
-        # compiler seed enables it. Keep the topology/cache prefix independent.
+        # Keep the topology/cache prefix independent.
         seeds.extend(probability_seeds)
         # Keep the original metadata/default-policy prefix. Seed metadata with
         # the existing TMA policy ladder too: a default-policy metadata seed can
@@ -998,4 +1090,12 @@ class MmaDagSeedPlanner:
         # early, the schedule's default; one counterpart per V lag keeps the
         # final join.
         seeds.extend(late_retirement)
-        return seeds
+        # Every seed above takes the kernel's default key clip, also as the
+        # promoted no-config default (``drop_paired_knob_pins``). Where that
+        # is the leading clip, one paired counterpart per V lag also clips
+        # the trailing side, with the paired seeds' retirement and
+        # dependent-launch defaults; the trailing clip alone is left to the
+        # search.
+        seeds.extend(key_clip_seeds)
+        # The paired head leads; every other seed keeps its order.
+        return [*paired_head, *(seed for seed in seeds if seed not in paired_head)]

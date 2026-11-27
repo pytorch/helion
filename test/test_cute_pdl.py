@@ -64,6 +64,9 @@ from helion._testing.cute_pdl import attribute_only_control as _attribute_only_c
 from helion._testing.cute_pdl import kernel_definition as _kernel_def
 from helion._testing.cute_pdl import produce as _produce
 from helion._testing.cute_pdl import triton_kernels as _tk
+from helion._testing.cute_vloop_sink_kernels import (
+    COLUMN_SUM_SINK_CONFIG as _COLUMN_SUM,
+)
 from helion._testing.cute_vloop_sink_kernels import col_reduce_max_dynamic
 from helion._testing.cute_vloop_sink_kernels import col_reduce_sum_dynamic
 from helion._testing.cute_vloop_sink_kernels import col_reduce_sum_from8_static
@@ -113,15 +116,6 @@ def two_roots(x: torch.Tensor, y: torch.Tensor) -> tuple[torch.Tensor, torch.Ten
         out_y[tile_m, tile_n] = y[tile_m, tile_n] + 1
     return out_x, out_y
 
-
-_COLUMN_SUM = {
-    "block_sizes": [1024, 16],
-    "num_threads": [128, 4],
-    "cute_vector_widths": [1, 4],
-    "cute_lane_layouts": ["strided", "blocked"],
-    "cute_vloop_sink": True,
-    "cute_lane_unroll": 8,
-}
 
 _RELEASE = "cute.arch.griddepcontrol_launch_dependents()"
 _ATTRIBUTE = "._helion_cute_use_pdl = True"

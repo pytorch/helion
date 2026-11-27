@@ -24,6 +24,7 @@ from helion._compiler.cute._paged_attention_paired_pipeline import (
     _pipeline_shared_memory,
 )
 from helion._compiler.cute.cute_mma_dag_seeds import MmaDagSeedPlanner
+from helion._compiler.cute.pdl_release import CUTE_PDL_CAPTURE_DEFAULT
 from helion._compiler.cute.pdl_release import CUTE_PDL_RELEASE_CHOICES
 from helion._testing import cpu_render_target
 from helion._testing.cute_paged_v_lag import paired_v_lag_bound
@@ -656,7 +657,10 @@ def test_retirement_seeds_are_four_independent_paired_counterparts():
         assert [s.get("cute_mma_dag_v_lag", 0) for s in late] == [0, 1, 2, 3]
         for seed in late:
             assert seed.get("cute_mma_dag_pass_warps") == "attention_paired"
-            assert seed.get("cute_pdl") is False
+            # The guarded dependent-launch default of every paired seed.
+            assert {key: seed.get(key) for key in CUTE_PDL_CAPTURE_DEFAULT} == dict(
+                CUTE_PDL_CAPTURE_DEFAULT
+            )
             assert not any(seed.get("load_eviction_policies"))
             counterpart = helion.Config.from_dict({**seed.config, KEY: True})
             assert counterpart in paired

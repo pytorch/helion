@@ -15,6 +15,7 @@ from helion._testing import cpu_render_target
 from helion._testing.cute_codegen import cpu_bind
 from helion._testing.cute_paged_attention import paged_online_attention
 from helion._testing.cute_paged_attention_schedule import paged_attention_args
+from helion._testing.cute_paged_v_lag import without_paired_head
 from helion._testing.cute_paged_v_lag import without_retirement_seeds
 
 if TYPE_CHECKING:
@@ -86,7 +87,10 @@ def test_partial_schedule_seeds_supported_topologies_and_occupancies():
         seeds = MmaDagSeedPlanner(
             facts, bound.config_spec, occupancy_key="cute_min_blocks_per_mp"
         ).configs([])
-        seeds = without_retirement_seeds(seeds)
+        seeds = without_paired_head(without_retirement_seeds(seeds), facts)
+        # Only the paired schedule has the guarded capture default.
+        unpaired = (False, False, "auto")
+        paired = (True, True, "loader_tail")
         assert [
             (
                 seed.get("cute_mma_dag_pass_warps"),
@@ -104,19 +108,19 @@ def test_partial_schedule_seeds_supported_topologies_and_occupancies():
             )
             for seed in seeds
         ] == [
-            (*schedule, False, False, (policy,) * 4, False, False, "auto")
-            for schedule in [
-                ("attention", 1, 0),
-                ("attention", 2, 0),
-                ("attention_scoped", 2, 0),
-                *(("attention_paired", 1, lag) for lag in range(4)),
+            (*schedule, False, False, (policy,) * 4, *pdl)
+            for schedule, pdl in [
+                (("attention", 1, 0), unpaired),
+                (("attention", 2, 0), unpaired),
+                (("attention_scoped", 2, 0), unpaired),
+                *((("attention_paired", 1, lag), paired) for lag in range(4)),
             ]
             for policy in ("", "streaming", "l2_last")
         ] + [
-            ("attention_paired", 1, lag, True, False, ("",) * 4, False, False, "auto")
+            ("attention_paired", 1, lag, True, False, ("",) * 4, *paired)
             for lag in range(4)
         ] + [
-            ("attention_paired", 1, lag, False, True, ("",) * 4, False, False, "auto")
+            ("attention_paired", 1, lag, False, True, ("",) * 4, *paired)
             for lag in range(4)
         ]
         for seed in seeds:

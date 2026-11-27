@@ -645,8 +645,8 @@ def test_an_llm_reply_that_names_a_gated_knob_is_held_to_the_search() -> None:
             (config,) = admitted
             named = f"{KEY}, {PREFIX}" if pick.get(PREFIX) else KEY
             assert messages[-1] == (
-                "An LLM proposal names options this search does not propose "
-                f"({named}); benchmarking it without them"
+                "An LLM proposal states options as this search does not propose "
+                f"them ({named}); benchmarking it as the search has them"
             )
             assert config == spec.normalized_config(config)
             # What the search benchmarks is the reply's worklist without the
@@ -797,7 +797,7 @@ def test_neither_round_of_an_llm_search_benchmarks_a_gated_knob() -> None:
         changed = [
             call.args[0]
             for call in search.log.call_args_list
-            if call.args[0].startswith("An LLM proposal names options")
+            if call.args[0].startswith("An LLM proposal states options")
         ]
         assert len(changed) == 3
 

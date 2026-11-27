@@ -5,7 +5,9 @@
 (``generation.extension``). It owns these CuTe-specific parts of config
 generation:
 
-* the conditional neighbor prerequisites of paired PDL policies;
+* the conditional neighbor prerequisites of paired PDL policies, and the
+  default dependent-launch policy of a proved paired kernel in every search
+  whose benchmark cannot observe it (``repair_flat_config``);
 * the SIMT launch-thread repairs (``repair_flat_config``): ``num_threads``
   slots follow their block sizes, the collective warp MMA's ownership rule,
   flattened loop groups and simultaneous launch axes stay under 1024 threads,
@@ -59,20 +61,21 @@ from ..cute_flash import _flash_resident_softmax_overrides
 from ..cute_flash import flash_exp2_packet_is_compound
 from ..cute_mma_dag import MMA_DAG_KEY
 from ..cute_mma_dag import MMA_DAG_OFF
-from ..cute_mma_dag import MMA_DAG_PASS_WARPS_ATTENTION_PAIRED
-from ..cute_mma_dag import MMA_DAG_PASS_WARPS_KEY
-from ..cute_mma_dag import MMA_DAG_TCGEN05
 from ..flash_knobs import FLASH_COVERAGE_CHILD_PARENTS
 from ..packet_store_policy import store_policy_reaches_a_packet
 from ..pdl_release import CUTE_PDL_CAPTURE_RELEASE_CHOICES
 from ..pdl_release import CUTE_PDL_RELEASE_DEFAULT
 from ..pdl_release import CUTE_PDL_SPREAD_KEY
+from ..pdl_release import capture_policy_available
 from ..reduction_lanes import THREADED_SEQUENCES
 from ..reduction_lanes import fit_reduction_threads
 from ..reduction_lanes import sequence_tile_holds_warp_lanes
 from ..thread_budget import MAX_THREADS_PER_BLOCK
 from ..thread_budget import tile_level_axes
 from ..tile_packing import packed_grid_block
+from .mma_dag_surface import CAPTURE_POLICY_REQUIREMENTS
+from .mma_dag_surface import PAIRED_CAPTURE_SCHEDULE
+from .mma_dag_surface import kept_capture_policy
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -494,25 +497,17 @@ class CuteConfigGenerationExtension(ConfigGenerationExtension):
         """
         generation = self.generation
         spec = generation.config_spec
-        if not spec.cute_pdl_capture_overlap_available or spec.has_explicit_pdl:
+        if not capture_policy_available(spec):
             return {}
         layout = generation._key_to_flat_indices
-        keys = (
-            MMA_DAG_KEY,
-            MMA_DAG_PASS_WARPS_KEY,
-            "cute_pdl",
-            "cute_pdl_capture_overlap",
-            "cute_pdl_release",
-            CUTE_PDL_SPREAD_KEY,
-        )
+        keys = tuple(CAPTURE_POLICY_REQUIREMENTS)
         if any(key not in layout for key in keys):
             return {}
         slots = {key: layout[key][0][0] for key in keys}
         for values in (base, requested):
-            if (
-                values[slots[MMA_DAG_KEY]] != MMA_DAG_TCGEN05
-                or values[slots[MMA_DAG_PASS_WARPS_KEY]]
-                != MMA_DAG_PASS_WARPS_ATTENTION_PAIRED
+            if any(
+                values[slots[key]] != value
+                for key, value in PAIRED_CAPTURE_SCHEDULE.items()
             ):
                 return {}
         pdl = slots["cute_pdl"]
@@ -534,6 +529,47 @@ class CuteConfigGenerationExtension(ConfigGenerationExtension):
         ):
             updates[release] = CUTE_PDL_RELEASE_DEFAULT
         return updates
+
+    @functools.cached_property
+    def _kept_capture_policy(
+        self,
+    ) -> tuple[tuple[tuple[int, object], ...], tuple[tuple[int, object], ...]] | None:
+        """What keeps a flat config of the proved paired schedule on the
+        default dependent-launch policy (``kept_capture_policy``): the flat
+        slots that select the schedule and the policy slots of a config on
+        it, each with its value; ``None`` where nothing is kept.
+
+        The repair runs wherever a flat config is made or decoded
+        (``flatten``, ``unflatten``), so it also replaces what a user seed
+        or a cached config names: a seed's ``cute_pdl=False`` does not opt
+        such a search out. Only a fixed override does."""
+        generation = self.generation
+        layout = generation._key_to_flat_indices
+        overrides = generation._override_values
+        policy = kept_capture_policy(generation.config_spec, overrides)
+        schedule = PAIRED_CAPTURE_SCHEDULE
+        if policy is None or any(key not in layout for key in (*schedule, *policy)):
+            return None
+        # The overridden policy slots are written as well: a flat config is
+        # repaired and decoded before the overrides are layered over it, so
+        # a slot that contradicts the kept options there (a mutation's
+        # ``cute_pdl=False`` under an override of that option) would drop
+        # them first.
+        return (
+            tuple((layout[key][0][0], value) for key, value in schedule.items()),
+            tuple((layout[key][0][0], value) for key, value in policy.items()),
+        )
+
+    def _keep_capture_policy(self, flat_config: FlatConfig) -> None:
+        """Give a flat config of the proved paired schedule the default
+        dependent-launch policy (``_kept_capture_policy``)."""
+        kept = self._kept_capture_policy
+        if kept is None:
+            return
+        schedule, policy = kept
+        if all(flat_config[slot] == value for slot, value in schedule):
+            for slot, value in policy:
+                flat_config[slot] = value
 
     # -- SIMT launch threads ---------------------------------------------------
 
@@ -1202,8 +1238,10 @@ class CuteConfigGenerationExtension(ConfigGenerationExtension):
 
     def repair_flat_config(self, flat_config: FlatConfig) -> None:
         """Make a random or mutated flat config one the normalization keeps:
-        the packet prefetch, the reduction pipeline and sequence, the thread
-        layouts and the store policy."""
+        a proved paired kernel's dependent-launch policy at its default where
+        the search does not own it, the packet prefetch, the reduction
+        pipeline and sequence, the thread layouts and the store policy."""
+        self._keep_capture_policy(flat_config)
         self._repair_packet_prefetch(flat_config)
         self._repair_reduction_pipeline_depth(flat_config)
         self._repair_reduction_sequence(flat_config)

@@ -246,6 +246,77 @@ L2 priorities canonicalize to `streaming` (evict first) and `l2_last` (evict
 last), with the empty policy preserving the default. Generic seeds try all
 three uniform choices, and search can vary the four inputs independently.
 
+A kernel with the pair proof runs the paired schedule without a config: its
+first compiler seed, promoted to the autotune-off default, is the paired body
+with V issued two tiles behind K, `streaming` hints on the four TMA inputs
+and, where proved, the query TMA map and the `early` probability schedule,
+under the schedule's own defaults for retirement, dependent launch and key
+clip. The other seeds follow in the planner's order. Kernels without the
+proof default to the first seed of the ordinary MMA ranking, or to the per-key
+`attention` schedule where folded storage admits the attention schedules
+alone. A kernel is without it when its count of KV heads or of leading items
+is odd (one KV head among them), when its denominator is reduced rather than
+kept per key, when it has an ordered phase or more than one leading axis,
+when a bound differs between the two heads of a pair, or when the device
+offers a CTA less than 184,320 bytes (180 KiB) of shared memory.
+
+The schedule's default dependent-launch policy is the guarded capture
+overlap with the `loader_tail` release (docs/deployment_autotuning.md,
+"Capture overlap of paired attention kernels"), and where that release is
+placed depends on the grid. On a launch that fits one wave of resident CTAs
+it is the loader's tail, and `auto` is the entry of every CTA. On a launch
+of one unit per CTA that is known to take more than one wave both render the
+entry of every CTA (`passes.pdl._entry_release_past_one_wave`), which is
+what `cute_pdl_release="entry"` renders; a generic kernel past one wave, and
+a grid the host sizes at runtime, release from the CTAs of the last wave.
+The dependent grid launches once every CTA of this grid has released or
+exited. A paired CTA holds its SM for its whole life, so with a release at
+entry in every CTA the dependents launch as the last CTA enters: every CTA
+of the grid is resident or done by then, and the dependents take SMs only as
+this grid's CTAs leave them. A release from the last wave alone launches them
+when the first CTAs in particular have exited, which is never earlier and
+waits for the slowest of them. Measured
+on a B200 (148 SMs) with 200 units of a 17-page window (two waves), the next
+captured call started 26.6 to 27.1 us after the launch under the last-wave
+release and 25.0 to 25.2 under the entry release, with 96 SMs idle in
+between, and the entry release read 0.4 to 0.8 us less per call at two calls
+a sample (four cases; 0.5 less on 320 units in three waves). So a saved
+config that names `auto` or `loader_tail` on such a grid compiles to the
+entry release; `cute_pdl_release="last_wave"` names the release from the
+last wave alone, with the capture overlap or without it, and no search
+samples it.
+
+The paired schedule's `cute_mma_dag_key_clip` shifts the TMA boxes of a
+boundary tile past keys that no row of the tile sees. Those keys then lie
+outside the descriptor's key extent: the hardware does not fetch them from
+their own addresses and fills them with zeros. That is not a load without
+memory traffic for them: in the large allocation class, which a descriptor
+over a whole cache has, a box that leaves its tensor still issues requests
+for the out-of-bounds elements, inside the 128 KiB after the descriptor's
+address (`tensormap_alloc_class`). `leading` clips the keys before every
+row's window, `trailing` those after every row's causal bound, and `both` the
+larger side of each tile. Shifts are multiples of four keys, keeping the packed
+scale box 16-byte aligned, and the softmax masks the zero-filled rows with the
+same shift. The knob exists only under `fast_math`, because a shifted tile is
+not bit-exact: it drops the NaN a nonfinite hidden V would propagate, can turn
+a `-0` accumulator into `+0`, and moves its keys to other lanes. The per-key
+denominator's row sum then associates differently (normalization and LSE move
+in their last FP32 bits), and the PV MMA adds the tile's products in another
+order, so each FP32 output accumulator rounds differently. That last change is
+absolute, not a scaling of the row: an element whose terms nearly cancel can
+change by many of its own BF16 ulps and in sign, so the clip has no bound in
+output ulps. Windowed kernels default to `leading`, causal-only kernels to
+`off`; value-metadata transport, which copies unshifted scale words, keeps
+whole tiles. Naming a
+clip the kernel does not offer, or any clip but `off` together with value
+metadata, is an `InvalidConfig`; on every body but the paired one a clip the
+kernel offers is pinned to `off`, like the other paired knobs. The default
+follows those options wherever a config leaves the clip out, also in a config
+that is flattened before it is normalized, and an `autotune_config_overrides`
+entry that selects a transport a search candidate's clip cannot run
+re-derives that clip instead of rejecting the candidate
+(`rederive_overridden_key_clip`).
+
 ### 3.3 Whole-kernel generators and regeneration
 
 `KERNEL_GENERATORS` (`kernel_generators.py`): `grouped_prefix_adaptive_n`,

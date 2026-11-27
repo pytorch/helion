@@ -26,6 +26,7 @@ from helion._testing.cute_dense_tcgen05 import batched_gemm
 from helion._testing.cute_dense_tcgen05 import bind_bmm
 from helion._testing.cute_mma_dag import CPU_DEVICE
 from helion._testing.cute_mma_dag import bind_cpu_gemm as _bind_gemm
+from helion._testing.cute_mma_dag import normalized_source as _source
 import helion.language as hl
 
 # The B200 model with tcgen05 MMA support, CUDA hidden, the inputs traced
@@ -140,12 +141,6 @@ def _bind_compact_fragment() -> BoundKernel:
     return helion.kernel(
         _compact_group4_fragment, backend="cute", static_shapes=True
     ).bind(args)
-
-
-def _source(bound: BoundKernel, requested: helion.Config) -> str:
-    with bound.env:
-        config = bound.config_spec.normalized_config(requested)
-    return bound.to_code(config)
 
 
 def _plain_config(**overrides: object) -> helion.Config:

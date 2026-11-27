@@ -14,6 +14,10 @@ when the caller needs one common end, all 640 threads join before the release.
 Barrier 6 is the setup rendezvous. The loader warp initializes the pipeline
 barriers and only arrives, so its page stream starts while the other roles
 finish their setup; the QK role owns the query barrier and copies.
+With a key clip the loader issues each boundary tile's K, V and scale boxes at
+the key offset the compute groups derive for that tile's mask. Both sides
+compute that offset from kernel arguments and compile-time constants alone, so
+the loader needs nothing the setup rendezvous publishes.
 """
 
 from __future__ import annotations
@@ -30,6 +34,7 @@ import cutlass.utils as utils
 
 from ._mma_dag_tcgen05_runtime import mbar_wait
 from ._mma_dag_tcgen05_runtime import mbar_wait_sleep
+from ._paged_attention_compute import logical_attention_key_shift
 from ._paged_attention_compute import normalize_output
 from ._paged_attention_compute import output_normalization_factor
 from ._paged_attention_io import load_query_element
@@ -108,6 +113,7 @@ def _compute_head(
     rowwise_rescale_threshold: cutlass.Constexpr,
     early_tmem_retirement: cutlass.Constexpr,
     headwide_rescale: cutlass.Constexpr,
+    key_clip: cutlass.Constexpr,
 ) -> None:
     cute.arch.setmaxregister_increase(144)
     thread = cute.arch.thread_idx()[0] % 128
@@ -171,6 +177,7 @@ def _compute_head(
                 previous_sleep=sleep_waits,
                 rowwise_rescale_threshold=rowwise_rescale_threshold,
                 headwide_rescale=headwide_rescale,
+                key_clip=key_clip,
             )
         else:
             # Only reference-score publication opts out here. Keep the per-key
@@ -195,6 +202,7 @@ def _compute_head(
                 query_columns,
                 base2_scores,
                 coefficients_capped,
+                key_clip=key_clip,
             )
         if maximum_changed:
             previous = load_query_panel(output_address, query_columns)
@@ -413,6 +421,7 @@ def _enqueue_operand_tile(
     sleep_waits: cutlass.Constexpr = False,
     metadata_ready: cute.Pointer | None = None,
     metadata_flags: cute.Tensor | None = None,
+    key: cutlass.Int32 = cutlass.Int32(0),  # noqa: B008
 ) -> None:
     ring = 2 * (step & 1) + pair_head
     if cutlass.const_expr(metadata_ready is not None):
@@ -463,6 +472,7 @@ def _enqueue_operand_tile(
             first_head + pair_head,
             128,
             l2_hints=l2_hints,
+            key=key,
         )
 
 
@@ -646,9 +656,13 @@ def paged_attention_paired_body(
     early_tmem_retirement: cutlass.Constexpr = False,
     headwide_rescale: cutlass.Constexpr = False,
     join_before_exit: cutlass.Constexpr = False,
+    key_clip: cutlass.Constexpr = "off",
 ) -> None:
     assert cutlass.const_expr(rowwise_rescale_threshold is None or reference_scores)
     assert cutlass.const_expr(v_lag in (0, 1, 2, 3))
+    assert cutlass.const_expr(key_clip in ("off", "leading", "trailing", "both"))
+    # The metadata actor copies unshifted scale words for the shifted raw tile.
+    assert cutlass.const_expr(key_clip == "off" or value_metadata_scales is None)
     assert cutlass.const_expr(query_columns in (8, 32, 40))
     assert cutlass.const_expr(
         not value_metadata_read_overlap or value_metadata_scales is not None
@@ -897,6 +911,7 @@ def paged_attention_paired_body(
             rowwise_rescale_threshold,
             early_tmem_retirement,
             headwide_rescale,
+            key_clip,
         )
     elif warp < 12:
         cute.arch.setmaxregister_decrease(72)
@@ -1016,10 +1031,21 @@ def paged_attention_paired_body(
                             # four cannot overflow, including empty ranges.
                             if step == count - 4:
                                 cute.arch.griddepcontrol_launch_dependents()
-                        logical_page, _logical_key_base = attention_page_coordinates(
+                        logical_page, logical_key_base = attention_page_coordinates(
                             first_page, last_page, step, reflected_dtype
                         )
                         physical = cutlass.Int32(pages[request, logical_page])
+                        key_shift = logical_attention_key_shift(
+                            logical_key_base,
+                            128,
+                            length,
+                            query_columns,
+                            query_len,
+                            group,
+                            window,
+                            coordinate_dtype,
+                            key_clip,
+                        )
                         for head in cutlass.range_constexpr(2):
                             _enqueue_operand_tile(
                                 raw_k,
@@ -1034,6 +1060,7 @@ def paged_attention_paired_body(
                                 first_head,
                                 l2_hints=tma_load_hints[:2],
                                 sleep_waits=sleep_waits,
+                                key=key_shift,
                             )
                         for head in cutlass.range_constexpr(2):
                             _enqueue_operand_tile(
@@ -1051,21 +1078,36 @@ def paged_attention_paired_body(
                                 metadata_flags=metadata_flags,
                                 l2_hints=tma_load_hints[2:],
                                 sleep_waits=sleep_waits,
+                                key=key_shift,
                             )
                 else:
                     # K(i) precedes V(i-lag). Iterating steps then two heads
                     # avoids overflow from doubling an INT64 step count.
                     # A bounded drain also avoids adding lag to that count.
+                    # Each delayed V tile reuses its K tile's page and shift.
                     previous_page = cutlass.Int32(0)
                     older_page = cutlass.Int32(0)
+                    previous_shift = cutlass.Int32(0)
+                    older_shift = cutlass.Int32(0)
                     for step in cutlass.range(count):
                         if cutlass.const_expr(capture_release_tail):
                             if step == count - 4:
                                 cute.arch.griddepcontrol_launch_dependents()
-                        logical_page, _logical_key_base = attention_page_coordinates(
+                        logical_page, logical_key_base = attention_page_coordinates(
                             first_page, last_page, step, reflected_dtype
                         )
                         physical = cutlass.Int32(pages[request, logical_page])
+                        key_shift = logical_attention_key_shift(
+                            logical_key_base,
+                            128,
+                            length,
+                            query_columns,
+                            query_len,
+                            group,
+                            window,
+                            coordinate_dtype,
+                            key_clip,
+                        )
                         for head in cutlass.range_constexpr(2):
                             _enqueue_operand_tile(
                                 raw_k,
@@ -1080,14 +1122,18 @@ def paged_attention_paired_body(
                                 first_head,
                                 l2_hints=tma_load_hints[:2],
                                 sleep_waits=sleep_waits,
+                                key=key_shift,
                             )
                             distance = (v_lag + 1 - head) // 2
                             if cutlass.const_expr(distance == 0) or step >= distance:
                                 delayed_page = physical
+                                delayed_shift = key_shift
                                 if cutlass.const_expr(distance == 1):
                                     delayed_page = previous_page
+                                    delayed_shift = previous_shift
                                 elif cutlass.const_expr(distance == 2):
                                     delayed_page = older_page
+                                    delayed_shift = older_shift
                                 _enqueue_operand_tile(
                                     raw_v,
                                     scale_v,
@@ -1103,17 +1149,22 @@ def paged_attention_paired_body(
                                     metadata_flags=metadata_flags,
                                     l2_hints=tma_load_hints[2:],
                                     sleep_waits=sleep_waits,
+                                    key=delayed_shift,
                                 )
                         older_page = previous_page
                         previous_page = physical
+                        older_shift = previous_shift
+                        previous_shift = key_shift
                     # Drain at most three V tiles from already-loaded page
                     # IDs. Guards precede subtraction, including empty ranges.
                     for tail in cutlass.range_constexpr(v_lag):
                         distance = (v_lag - tail + 1) // 2
                         if count >= distance:
                             delayed_page = previous_page
+                            delayed_shift = previous_shift
                             if cutlass.const_expr(distance == 2):
                                 delayed_page = older_page
+                                delayed_shift = older_shift
                             _enqueue_operand_tile(
                                 raw_v,
                                 scale_v,
@@ -1129,6 +1180,7 @@ def paged_attention_paired_body(
                                 metadata_flags=metadata_flags,
                                 l2_hints=tma_load_hints[2:],
                                 sleep_waits=sleep_waits,
+                                key=delayed_shift,
                             )
                 if cutlass.const_expr(capture_release_tail):
                     # Every CTA releases even for short or zero-trip ranges.

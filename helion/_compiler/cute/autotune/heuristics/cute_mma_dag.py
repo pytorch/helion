@@ -12,6 +12,7 @@ from ...cute_mma_dag_seeds import SEED_TILES
 from ...cute_mma_dag_seeds import MmaDagSeedPlanner
 from ...cute_mma_dag_seeds import streaming_regions
 from ...cute_mma_dag_seeds import wide_epilogue_rows
+from ...pdl_release import capture_policy_available
 from ...phase_load_policies import scatter_load_policies
 from ..mma_dag_surface import enable_cute_mma_dag_search
 from .cute_launch_bounds import MIN_BLOCKS_KEY
@@ -112,6 +113,13 @@ class CuteMmaDagHeuristic(AutotunerHeuristic):
                     len(device_ir.root_ids) == 1
                     and facts.attention is not None
                     and facts.attention.paired_items
+                )
+                # A bank cycle times the kernel's calls back to back inside
+                # one captured graph: the only benchmark that sees a call
+                # overlap its predecessor (``pdl_fields``).
+                env.config_spec.cute_pdl_capture_overlap_searched = (
+                    capture_policy_available(env.config_spec)
+                    and env.settings.autotune_benchmark_input_banks > 1
                 )
                 if phase_index is not None:
                     from .....language import memory_ops

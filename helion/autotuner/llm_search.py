@@ -92,7 +92,6 @@ def guided_search_kwargs_from_config(
     settings: Settings,
 ) -> dict[str, object]:
     """Merge LLM config defaults with the supported HELION_LLM_* overrides."""
-    del settings
     kwargs: dict[str, object] = {}
 
     if config is not None:
@@ -402,24 +401,27 @@ class LLMGuidedSearch(PopulationBasedSearch):
         A reply's keys are merged over the reference config and normalized
         like any caller's config, so a reply can name an option the search
         space described to the LLM does not hold. The backend holds each
-        proposal to what a search of this kernel proposes on its own
-        (``ConfigSpec.search_proposal``): a proposal it changes is
-        benchmarked as changed, and one that is not legal that way is
-        dropped. Both are logged."""
+        proposal to what a search of this kernel under this search's
+        overrides proposes on its own (``ConfigSpec.search_proposal``): a
+        proposal it changes is benchmarked as changed, and one that is not
+        legal that way is dropped. Both are logged."""
         admitted: list[Config] = []
         for config in configs:
             try:
-                proposal, returned = self.config_spec.search_proposal(config)
+                proposal, returned = self.config_spec.search_proposal(
+                    config, self.settings.autotune_config_overrides
+                )
             except exc.InvalidConfig as e:
                 self.log(
-                    "Dropped an LLM proposal that is not legal without options "
-                    f"this search does not propose: {e}"
+                    "Dropped an LLM proposal that is not legal with its options "
+                    f"as this search has them: {e}"
                 )
                 continue
             if returned:
                 self.log(
-                    "An LLM proposal names options this search does not "
-                    f"propose ({', '.join(returned)}); benchmarking it without them"
+                    "An LLM proposal states options as this search does not "
+                    f"propose them ({', '.join(returned)}); benchmarking it as "
+                    "the search has them"
                 )
             admitted.append(proposal)
         return admitted

@@ -17,9 +17,10 @@ def paged_attention_args(
     width: int = 128,
     heads: int = 2,
     requests: int = 2,
+    pages: int = 13,
     device: torch.device | str = "cpu",
 ) -> tuple[object, ...]:
-    pages, dim = 13, 128
+    dim = 128
     raw_bytes = width * heads * dim
     scale_bytes = width * heads * 4
     page_stride = raw_bytes + scale_bytes

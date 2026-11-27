@@ -13,9 +13,25 @@ the six-value domain; selecting an existing value keeps its arithmetic.
 The caller supplies strided BF16 queries, page-major INT8 caches with embedded
 E8M0 scales, page tables, sequence lengths and an output allocation. Unsupported
 layouts report the profile file used by the dispatcher. The kernels explicitly
-use the CuTe backend, static shapes and `fast_math=True`. A stored config may
-enable `cute_pdl_capture_overlap`, which requires fixed captured graph topology
-and pointer parameters.
+use the CuTe backend, static shapes and `fast_math=True`.
+
+A profile that selects the paired schedule (`cute_mma_dag_pass_warps:
+"attention_paired"`) runs with guarded PDL capture overlap by default: a stored
+config that names none of `cute_pdl`, `cute_pdl_capture_overlap`,
+`cute_pdl_release` and `cute_pdl_spread` gets `cute_pdl=True`, the overlap and
+the `loader_tail` release, and a config may also enable the overlap itself.
+With the overlap, captured graph topology and pointer parameters must stay
+fixed (tensor contents may change between replays). To opt out, set
+`cute_pdl=False` or `cute_pdl_capture_overlap=False` in the profile's config;
+naming any of the four options keeps exactly the policy the config states.
+That is the rule for a profile, which is compiled as written. A kernel that
+selects its config itself opts out with the same two entries in
+`autotune_config_overrides`: they hold for a search, for a result read back
+from an autotune cache and for the default of a kernel that does not autotune.
+A seed does not opt a search out: without rotating input banks the search
+gives every paired candidate the default policy, also one built from a seed
+that names `cute_pdl=False` (`docs/deployment_autotuning.md`, "Capture overlap
+of paired attention kernels").
 
 ## Programmatic use
 

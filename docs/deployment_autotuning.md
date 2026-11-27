@@ -239,6 +239,12 @@ bank cloning separates arguments between banks and benchmark jobs, not between
 successive calls within one bank. Per-call flushing remains unsupported for
 multiple banks, and final selection requires an explicit matching target regime.
 
+A bank cycle is also the one benchmark in which a call can overlap its
+predecessor the way back-to-back calls of an application's captured graph do,
+so it is the only regime in which the CuTe backend searches the
+dependent-launch policy of a proved paired attention kernel
+([Capture overlap of paired attention kernels](#capture-overlap-of-paired-attention-kernels)).
+
 This option does not change the default timer or existing replay behavior.
 Resident bank searches have separate cache identities. Saved configurations
 remain valid, but older replay-only autotune cache entries are invalidated by
@@ -274,6 +280,169 @@ logs the reason and restarts the entire selection phase once without those
 copies. Readings from the abandoned phase are discarded. An unsupported timing
 context remains an error; a memory-budget failure is reported as resource
 exhaustion rather than API misuse.
+
+### Capture overlap of paired attention kernels
+
+On the CuTe backend a proved single-root paired attention kernel launches by
+default as a programmatic dependent with guarded capture overlap
+(`cute_pdl=True`, `cute_pdl_capture_overlap=True` and
+`cute_pdl_release="loader_tail"`): inside a captured CUDA graph a call may read
+its inputs before the call ahead of it has completed, when a capture-time
+guard proves that call writes none of them. The overlap requires that captured
+topology and pointer arguments stay fixed (tensor contents may change between
+replays), so an application that edits captured graphs opts out.
+
+The policy has two costs outside a replay, and the opt-outs below remove
+both. An eager launch of such a kernel asks whether its stream is capturing:
+about 1.2 us of host time per launch, measured on a B200 against a kernel
+without the policy. A launch inside a capture reads the capturing graph's
+node list before and after it is enqueued, to find the node it added, and
+then that node's dependency edges, so capturing N launches into one graph
+takes time quadratic in N. That is bounded: a launch captured into a graph of
+more than 4,096 nodes is not examined and keeps the wait at its entry, with no
+overlap and no message. Replaying a captured graph costs nothing extra.
+
+A config the application passes to the kernel is compiled as written: one
+that names none of `cute_pdl`, `cute_pdl_capture_overlap`, `cute_pdl_release`
+and `cute_pdl_spread` gets the default policy, and one that names any of them
+keeps exactly what it states, so `cute_pdl=False` or
+`cute_pdl_capture_overlap=False` opts it out.
+
+For the configs a kernel selects itself, the opt-out is one of those two
+entries in `autotune_config_overrides`:
+
+- `cute_pdl=False` and `cute_pdl_capture_overlap=False` are the opt-outs.
+  Either keeps the overlap out of every candidate of a search, with any
+  number of benchmark input banks, and out of every config the kernel
+  selects without one (below). In a search without rotating input banks the
+  compiler's paired seeds then start without dependent launch, and
+  `cute_pdl`, unless it is the option overridden, is searched as on any
+  other kernel. A search with rotating input banks samples the policy
+  (below), and under `cute_pdl_capture_overlap=False` its seed with the
+  automatic release stays in as ordinary dependent launch.
+- A `cute_pdl_release` of `auto`, `entry` or `last_wave` named beside
+  `cute_pdl_capture_overlap=False` keeps ordinary dependent launch on that
+  release, which holds without the overlap: a paired seed that carries the
+  default policy then starts with `cute_pdl=True`, and `cute_pdl` is searched
+  from there. `cute_pdl=True` beside that opt-out keeps it as well.
+- `cute_pdl_spread=True` and a `cute_pdl_release` other than `auto`, `entry`,
+  `loader_tail` or `last_wave` decline the policy as well.
+- Any other override of these options (`cute_pdl=True`,
+  `cute_pdl_capture_overlap=True`, `cute_pdl_spread=False`, a
+  `cute_pdl_release` of `auto`, `entry`, `loader_tail` or `last_wave`) fixes
+  the option it names. In a search without rotating input banks the others
+  keep their default; with rotating input banks the search samples them.
+- An override that selects another schedule is no opt-out. It takes every
+  candidate a search draws, and every seed and cached config it starts from,
+  off the paired schedule, and so leaves none of them with the policy; like
+  every override of another option it acts on a search only (below). The
+  overrides are not layered over a config that the model of an LLM-guided
+  search proposes: one that names the paired schedule is benchmarked on it,
+  and can be what the search returns. Under an override to another schedule
+  such a proposal keeps the dependent-launch options its reply states (no
+  dependent launch unless the reply names them), and of the overrides only
+  those of the four options above reach it.
+
+A config the kernel selects without a search (a result read back from a local
+or remote autotune cache or from AOT tuning data, the default of a kernel with
+`autotune_effort="none"`) is taken as written in the same way, with one
+exception: an override of those four options that declines the policy for a
+search declines it there too. An override of the schedule does not: such a
+config keeps the schedule it selects, and its policy with it. The cache
+identity does not hold `autotune_config_overrides`, so a
+kernel that adds an opt-out can read back the result of an earlier search
+without it. It then compiles that result without the overlap and leaves the
+cache entry as it is. A result that carries the default policy loses it as a
+compiler seed does in a search: `cute_pdl` is off unless an override sets it
+or names a release beside `cute_pdl_capture_overlap=False`, which keeps
+dependent launch on that release.
+A result with the overlap on an `entry`, `last_wave` or automatic release keeps
+`cute_pdl=True` and that release under `cute_pdl_capture_overlap=False`
+(ordinary dependent launch, which holds without the overlap), and loses
+dependent launch under `cute_pdl=False`. Every other override, and whatever
+else a declining override names, acts on a search only and reaches a cached
+result through a new search (`HELION_FORCE_AUTOTUNE=1`). A kernel reads its
+overrides when it selects a config; one that already runs keeps its config
+until `reset()`. An AOT standalone export follows the same rule: the
+declining overrides a kernel exports under are part of the entry its variants
+are kept in, as its heuristic and its hardware are. No call counts as
+exported on what other declining overrides generated, and no file holds the
+variants of two sets. An export under other declining overrides than the file
+was written with is an export from another entry. Without a structural
+policy the file is then written again, without a warning, from the entry of
+the kernel that exports. With `static_shapes=True` it holds the calls
+exported under that kernel's declining overrides so far and no others, and
+every entry keeps its variants for its next turn (a dynamic export, which
+keeps one table per file, generates its table again). Two live kernels over
+one function whose declining overrides differ therefore write the file again
+each time they take turns, and leave the variants of the one that exported
+last.
+A CuTe structural export keeps the entry that wrote its file first: an
+export under other declining overrides raises `StructuralPolicyError` ("...
+already owns this standalone file") and leaves the file as it is, until the
+AOT cache is cleared or the export gets a new output location
+([Ahead-of-Time (AOT) Heuristic Tuning](#ahead-of-time-aot-heuristic-tuning)).
+What counts as declining is read off the overrides alone: the
+four options above as they are named. Overrides that decline the policy of
+no result count as none, such as `cute_pdl=True`, a `cute_pdl_release` of
+`auto`, `entry`, `loader_tail` or `last_wave`, the default restated, or an
+override of the schedule: a kernel under them shares the export of a kernel
+without overrides.
+The rule does not look at the kernel, so it also covers kernels that have no
+capture policy to decline, a plain matmul among them: a kernel under a
+declining override and one without it export from two entries, as above,
+although both generate the same code. Whether a kernel has the policy depends
+on the shape it is bound for, and entries that followed the shape would keep
+the shapes of one kernel that have the policy and those that have not out of
+one file.
+
+The autotuner a kernel builds for itself (`settings.autotuner_fn(bound,
+args)`, by default a cache around a search) applies the same rule in
+`autotune()`: it returns what the kernel compiles on a cache hit as after a
+search. An application that calls it directly and passes the result to
+`set_config` therefore gets the opt-out too, and so does the native source
+that `autotune_handoff` exports from a cached result. A cache's `get()`
+returns the entry as stored; a config your code takes from there, like any
+config it passes to the kernel, is compiled as written. A custom
+`autotuner_fn` that returns stored configs is held to the opt-out where the
+kernel calls it, not where your code does.
+
+How a search treats the policy depends on whether its benchmark can observe
+it. With [rotating benchmark inputs](#rotating-benchmark-inputs) the calls of
+a bank cycle run back to back inside one captured graph, so the search samples
+the policy: the seeds cover no dependent launch, the overlap with the
+automatic release and the overlap with the loader-tail release; the search
+samples those three and ordinary dependent launch (`cute_pdl=True` without
+the overlap), and a seed or a cached config keeps the policy it names. Past
+one wave of resident CTAs both overlap releases generate the same code (the
+loader-tail release is then placed where the automatic one is: one unit per
+CTA releases at entry in every CTA, since each CTA holds an SM and the
+dependents then launch as the last CTA enters), so the search times that
+code once and a win returns the spelling it timed first. A saved config that
+names `auto` or `loader_tail` on such a grid compiles to that release;
+`cute_pdl_release="last_wave"` names the release from the CTAs of the last
+wave only (no search samples it). The benchmark graph is captured once and
+only replayed, with one node per bank at that bank's addresses, which is what
+the overlap's storage proof requires.
+
+With one bank, eager timing cannot rank the policy, so the search does not
+sample it. Unless its overrides decline the policy or select another schedule
+(above), every candidate on the paired schedule carries the default policy,
+and so does the config the search returns, whatever the candidate was built
+from: a compiler seed, a config in `autotune_seed_configs`, a cached config of
+an earlier search, a random draw, a mutation or a config that the model of an
+LLM-guided search proposes. That includes a candidate that an override, not
+its own knobs, puts on the paired schedule. A seed or cached config that names
+`cute_pdl=False` therefore does not opt a search out. Only
+`autotune_config_overrides` does.
+
+An application that never captures its calls in a CUDA graph gets nothing
+from the policy and still pays its eager cost, about 1.2 us of host time per
+launch (above): such a search returns the policy also where eager timing read
+the kernel without dependent launch as faster. To leave it out, put
+`cute_pdl_capture_overlap=False` in `autotune_config_overrides`, under which
+the search ranks `cute_pdl` by its eager timing as on any other kernel, or
+`cute_pdl=False`, which keeps dependent launch out altogether.
 
 ### Initial Population Strategies
 

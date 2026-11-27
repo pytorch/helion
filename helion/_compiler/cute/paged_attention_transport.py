@@ -19,6 +19,11 @@ from . import target_facts
 from .analysis.paged_attention_pair import paired_attention_item_axis
 from .cute_mma_dag import MMA_DAG_ATTENTION_PASS_WARPS
 from .cute_mma_dag import MMA_DAG_EARLY_TMEM_RETIREMENT_KEY
+from .cute_mma_dag import MMA_DAG_KEY_CLIP_BOTH
+from .cute_mma_dag import MMA_DAG_KEY_CLIP_KEY
+from .cute_mma_dag import MMA_DAG_KEY_CLIP_LEADING
+from .cute_mma_dag import MMA_DAG_KEY_CLIP_OFF
+from .cute_mma_dag import MMA_DAG_KEY_CLIP_TRAILING
 from .cute_mma_dag import MMA_DAG_L2_HINTS
 from .cute_mma_dag import MMA_DAG_PASS_WARPS_ATTENTION_PAIRED
 from .cute_mma_dag import MMA_DAG_PASS_WARPS_ATTENTION_SCOPED
@@ -33,6 +38,7 @@ from .cute_mma_dag import MMA_DAG_V_LAG_KEY
 from .cute_mma_dag import MMA_DAG_VALUE_METADATA_READ_OVERLAP_KEY
 from .cute_mma_dag import MMA_DAG_VALUE_METADATA_SKIP_KEY
 from .cute_mma_dag import paged_attention_early_retirement_default
+from .cute_mma_dag import paged_attention_key_clip_choices
 from .memory_ops import cute_tensor_base_is_aligned
 from .native_s2f6_contract import NATIVE_S2F6_TARGETS
 
@@ -116,6 +122,8 @@ class PagedAttentionScheduleFacts:
     partial_statistics: bool = False
     query_tma_available: bool = False
     value_metadata_skip_available: bool = False
+    # Boundary key clips of the paired loader, default first.
+    key_clip_choices: tuple[str, ...] = (MMA_DAG_KEY_CLIP_OFF,)
     key_width: int = 128
     dimension: int = 128
     compute_warps: int = 4
@@ -173,6 +181,8 @@ class PagedAttentionSchedule:
     value_metadata_skip: bool = False
     value_metadata_read_overlap: bool = False
     tma_load_hints: tuple[str, ...] = ("", "", "", "")
+    # Which keys that no row sees the boundary tiles' load boxes leave out.
+    key_clip: str = MMA_DAG_KEY_CLIP_OFF
 
 
 def plan_paged_attention_schedule(
@@ -246,6 +256,10 @@ def plan_paged_attention_schedule(
         value_metadata_read_overlap and not value_metadata_skip
     ):
         return None
+    key_clips = paged_attention_key_clip_choices(facts, pass_warps, value_metadata_skip)
+    key_clip = config.get(MMA_DAG_KEY_CLIP_KEY, key_clips[0])
+    if type(key_clip) is not str or key_clip not in key_clips:
+        return None
     query_axis, dimension_axis = semantic.query.tile_dims
     key_axis = semantic.key.raw.tile_dims[0]
     if (
@@ -292,6 +306,37 @@ def plan_paged_attention_schedule(
         value_metadata_skip=value_metadata_skip,
         value_metadata_read_overlap=value_metadata_read_overlap,
         tma_load_hints=paged_attention_load_hints(facts, config),
+        key_clip=key_clip,
+    )
+
+
+def paged_attention_key_clips(
+    *, paired_items: bool, fast_math: bool, windowed: bool
+) -> tuple[str, ...]:
+    """Boundary key clips this kernel may select, default first.
+
+    A shifted load zero-fills the K, V and scale bytes of keys that no row
+    sees and moves the tile's other keys to different lanes. That is not
+    bit-exact, so only fast_math licenses it: a nonfinite V at a hidden key
+    no longer reaches the output as NaN, a zero can change sign, and the
+    denominators and every output accumulator can round differently, without
+    a bound in output ulps (the ``cute_mma_dag_key_clip`` paragraph of the
+    CuTe README, under "Special-purpose emitters", has the details).
+    Scores are unaffected: a masked score is -inf whatever K holds.
+
+    Only the paired loader implements the shift. A leading clip needs a
+    window; the default clips that side alone, and a causal-only kernel
+    keeps whole tiles unless the trailing clip is chosen.
+    """
+    if not paired_items or not fast_math:
+        return (MMA_DAG_KEY_CLIP_OFF,)
+    if not windowed:
+        return (MMA_DAG_KEY_CLIP_OFF, MMA_DAG_KEY_CLIP_TRAILING)
+    return (
+        MMA_DAG_KEY_CLIP_LEADING,
+        MMA_DAG_KEY_CLIP_BOTH,
+        MMA_DAG_KEY_CLIP_TRAILING,
+        MMA_DAG_KEY_CLIP_OFF,
     )
 
 
@@ -398,6 +443,11 @@ def _paged_attention_schedule_facts(
         and paged_query_tma(transport, query_columns) is not None,
         value_metadata_skip_available=paired_items
         and paged_value_metadata_skip_supported(transport),
+        key_clip_choices=paged_attention_key_clips(
+            paired_items=paired_items,
+            fast_math=env.settings.fast_math,
+            windowed=semantic.mask.window_left is not None,
+        ),
         smem_bytes=smem_bytes,
         tma_load_slots=tuple(
             access.eviction_slot for access in paged_attention_tma_accesses(semantic)

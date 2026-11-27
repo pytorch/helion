@@ -26,12 +26,10 @@ from test.test_cute_tcgen05_fixed_chain import PUBLICATION_HOISTED
 from test.test_cute_tcgen05_fixed_chain import _addmm_gemm
 from test.test_cute_tcgen05_fixed_chain import _bias_gemm
 from test.test_cute_tcgen05_fixed_chain import _bind_bias_gemm
-from test.test_cute_tcgen05_fixed_chain import _bind_gemm
 from test.test_cute_tcgen05_fixed_chain import _config
 from test.test_cute_tcgen05_fixed_chain import _gemm
 from test.test_cute_tcgen05_fixed_chain import _kernel_body
 from test.test_cute_tcgen05_fixed_chain import _plain_config
-from test.test_cute_tcgen05_fixed_chain import _source
 
 import helion
 from helion._compiler.cute.tcgen05_config import facts
@@ -50,6 +48,8 @@ from helion._testing import skipIfNotCUDA
 from helion._testing.cute_dense_tcgen05 import batched_gemm
 from helion._testing.cute_dense_tcgen05 import bind_bmm
 from helion._testing.cute_dense_tcgen05 import wrapper_plans
+from helion._testing.cute_mma_dag import bind_cpu_gemm as _bind_gemm
+from helion._testing.cute_mma_dag import normalized_source as _source
 from helion.exc import BackendUnsupported
 from helion.exc import InvalidConfig
 import helion.language as hl

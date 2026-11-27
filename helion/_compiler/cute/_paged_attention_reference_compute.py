@@ -15,6 +15,7 @@ from ._mma_dag_tcgen05_runtime import mbar_wait
 from ._mma_dag_tcgen05_runtime import mbar_wait_sleep
 from ._paged_attention_compute import logical_attention_mask
 from ._paged_attention_compute import logical_attention_tile_is_interior
+from ._paged_attention_compute import shifted_attention_key
 from ._paged_attention_partial_compute import load_query_panel
 from ._paged_attention_partial_compute import store_query_panel
 from .device.ptx import sts_v4_b32
@@ -142,8 +143,27 @@ def _reference_values(
     query_columns: cutlass.Constexpr,
     apply_mask: cutlass.Constexpr,
     rowwise_rescale_threshold: cutlass.Constexpr = None,
+    key_clip: cutlass.Constexpr = "off",
 ) -> cutlass.Boolean:
-    """Center scores and vote without per-element masking on proved interior tiles."""
+    """Center scores and vote without per-element masking on proved interior tiles.
+
+    A key_clip other than ``off`` requires the loader to issue this tile at
+    the same shift: this lane's row then holds another key of the page, or
+    zero fill that no row may see (shifted_attention_key).
+    """
+    assert cutlass.const_expr(apply_mask or key_clip == "off")
+    key_offset, key_loaded = shifted_attention_key(
+        thread,
+        logical_key_base,
+        128,
+        length,
+        query_columns,
+        query_length,
+        group_size,
+        window,
+        coordinate_dtype,
+        key_clip,
+    )
     local_maxima = cute.make_rmem_tensor((4,), cutlass.Float32)
     for chain in cutlass.range_constexpr(4):
         local_maxima[chain] = cutlass.Float32(float("-inf"))
@@ -169,7 +189,7 @@ def _reference_values(
             if cutlass.const_expr(apply_mask):
                 visible = logical_attention_mask(
                     logical_key_base,
-                    thread,
+                    key_offset,
                     length,
                     row,
                     query_length,
@@ -177,6 +197,8 @@ def _reference_values(
                     window,
                     coordinate_dtype,
                 )
+                if cutlass.const_expr(key_clip != "off"):
+                    visible = visible & key_loaded
                 if not visible:
                     x = cutlass.Float32(float("-inf"))
             values[row] = x
@@ -229,6 +251,7 @@ def online_softmax_reference(
     previous_sleep: cutlass.Constexpr = False,
     rowwise_rescale_threshold: cutlass.Constexpr = None,
     headwide_rescale: cutlass.Constexpr = False,
+    key_clip: cutlass.Constexpr = "off",
 ) -> tuple[cutlass.Boolean, cutlass.Boolean]:
     """Consume the separately proved reference-score recurrence.
 
@@ -313,6 +336,7 @@ def online_softmax_reference(
             query_columns,
             apply_mask=True,
             rowwise_rescale_threshold=rowwise_rescale_threshold,
+            key_clip=key_clip,
         )
     maximum_changed = prims.barrier_cta_red(
         needs_update, barrier_id, "or", thread_count=128

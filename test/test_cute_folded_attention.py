@@ -20,6 +20,7 @@ from helion._compiler.cute.paged_attention_transport import (
 from helion._testing import cpu_render_target
 from helion._testing.cute_codegen import cpu_bind
 from helion._testing.cute_folded_attention import folded_paged_attention
+from helion._testing.cute_paged_v_lag import without_paired_head
 from helion._testing.cute_paged_v_lag import without_retirement_seeds
 import helion.language as hl
 from helion.language import tile_ops
@@ -222,7 +223,10 @@ def test_folded_attention_exposes_only_implemented_mma_seeds() -> None:
         seeds = MmaDagSeedPlanner(
             facts, bound.config_spec, occupancy_key="cute_min_blocks_per_mp"
         ).configs([])
-        seeds = without_retirement_seeds(seeds)
+        seeds = without_paired_head(without_retirement_seeds(seeds), facts)
+        # Only the paired schedule has the guarded capture default.
+        unpaired = (False, False, "auto")
+        paired = (True, True, "loader_tail")
         assert [
             (
                 seed.get("cute_mma_dag_pass_warps"),
@@ -240,25 +244,26 @@ def test_folded_attention_exposes_only_implemented_mma_seeds() -> None:
             )
             for seed in seeds
         ] == [
-            (*schedule, False, False, (policy,) * 4, False, False, "auto")
-            for schedule in [
-                ("attention", 1, 0),
-                ("attention", 2, 0),
-                ("attention_scoped", 2, 0),
-                *(("attention_paired", 1, lag) for lag in range(4)),
+            (*schedule, False, False, (policy,) * 4, *pdl)
+            for schedule, pdl in [
+                (("attention", 1, 0), unpaired),
+                (("attention", 2, 0), unpaired),
+                (("attention_scoped", 2, 0), unpaired),
+                *((("attention_paired", 1, lag), paired) for lag in range(4)),
             ]
             for policy in ("", "streaming", "l2_last")
         ] + [
-            ("attention_paired", 1, lag, True, False, ("",) * 4, False, False, "auto")
+            ("attention_paired", 1, lag, True, False, ("",) * 4, *paired)
             for lag in range(4)
         ] + [
-            ("attention_paired", 1, lag, False, True, ("",) * 4, False, False, "auto")
+            ("attention_paired", 1, lag, False, True, ("",) * 4, *paired)
             for lag in range(4)
         ]
         for seed in seeds:
             config = bound.config_spec.normalized_config(seed)
-            assert not seed.get("cute_pdl_capture_overlap", False)
-            assert config.get("cute_pdl_capture_overlap", False) is False
+            assert config.get("cute_pdl_capture_overlap", False) is seed.get(
+                "cute_pdl_capture_overlap", False
+            )
             assert config.get("cute_pdl_release", "auto") == seed.get(
                 "cute_pdl_release", "auto"
             )
@@ -274,6 +279,27 @@ def test_folded_attention_exposes_only_implemented_mma_seeds() -> None:
             assert bound.env.backend.autotune_config_is_viable(
                 bound.config_spec, config
             )
+
+
+def test_folded_attention_without_a_config_runs_the_paired_family() -> None:
+    # Folded storage admits the attention schedules alone, and the attention
+    # block is the whole seed list: its paired head is the default.
+    bound = _bound(5, "plain")
+    spec = bound.config_spec
+    promoted = spec.compiler_default_config
+    assert promoted is not None and promoted == spec.compiler_seed_configs[0]
+    assert promoted.get("cute_mma_dag_pass_warps") == "attention_paired"
+    assert bound.host_function is not None
+    with cpu_render_target(fake_device_sm_count=148):
+        with bound.env, bound.host_function:
+            default = spec.default_config()
+        source = bound.to_code(default)
+        assert source == bound.to_code(helion.Config.from_dict(dict(promoted.config)))
+    assert default.get("cute_mma_dag_pass_warps") == "attention_paired"
+    assert default.get("cute_pdl_capture_overlap") is True
+    assert "paged_attention_paired_body(" in source
+    assert "paged_attention_partial_body(" not in source
+    assert "capture_release_tail=True" in source
 
 
 def test_folded_index_proof_checks_intermediate_integer_overflow() -> None:
