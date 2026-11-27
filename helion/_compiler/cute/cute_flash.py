@@ -7902,6 +7902,40 @@ def _flash_choices_with_default(default: _T, choices: Iterable[_T]) -> tuple[_T,
     return tuple(ordered)
 
 
+#: CUDA's cap on the y and z extents of a launch grid (x takes 2**31 - 1).
+_CUDA_GRID_YZ_MAX = 65535
+
+
+def flash_grid_yz_legal(*extents: int) -> bool:
+    """Whether CUDA accepts ``extents`` along y or z of a launch grid. A
+    launch above the cap is rejected, so a body whose grid has such an
+    extent launches the same CTAs flat in x and decodes its block index
+    from the linear one."""
+    return max(extents) <= _CUDA_GRID_YZ_MAX
+
+
+def flash_clc_grid_is_flat(num_bh: int, heads_per_batch: int) -> bool:
+    """Whether the CLC loop's CTAs launch flat in x.
+
+    The CLC grid is ``(Q pairs, heads, batches)``: a CTA's block index is
+    its work item, and ``heads_per_batch`` splits the ``num_bh`` batch heads
+    over y and z. A split that CUDA rejects (``flash_grid_yz_legal``: 65,536
+    batch heads of a kernel without a batch dimension, on y alone) launches
+    flat, and the body decodes the item from x, which is then the factored
+    grid's linear index (x fastest): every CTA keeps its item.
+
+    ``heads_per_batch`` is the resolved split, as codegen writes it into the
+    config before the plan and the body are built (a 4-D kernel's unset
+    split has become its head count by then): one that does not divide the
+    batch heads (0 included) puts them all on y, as the body and the
+    launcher read it. The plan builder and the body both ask here with the
+    plan's batch heads and that value, so the launcher's grid and the
+    body's decode cannot disagree."""
+    if heads_per_batch <= 0 or num_bh % heads_per_batch != 0:
+        heads_per_batch = num_bh
+    return not flash_grid_yz_legal(heads_per_batch, num_bh // heads_per_batch)
+
+
 def _flash_clc_heads_per_batch_candidates(num_bh: int | None) -> tuple[int, ...]:
     """Return non-aliasing CLC decompositions for the detected work grid."""
     if num_bh is None or num_bh <= 0:
@@ -12716,13 +12750,21 @@ def _small_biased_attention_gmem_expr(
     dim2: str,
     *,
     strides: tuple[int, int, int] | None = None,
+    wide_dim0: bool = False,
 ) -> str:
+    """The address of ``tensor[dim0, dim1, dim2]``. ``wide_dim0`` computes
+    the first term in 64 bits: the batch-head offset of a flat launch, whose
+    batch heads number more than a 32-bit element offset holds (the bias has
+    2**31 elements at 131,072 of them)."""
     stride0, stride1, stride2 = strides or (None, None, None)
+    int0 = "cutlass.Int64" if wide_dim0 else "cutlass.Int32"
     stride0_expr = (
-        f"cutlass.Int32({stride0})"
+        f"{int0}({stride0})"
         if stride0 is not None
-        else f"cutlass.Int32({tensor_name}.layout.stride[0])"
+        else f"{int0}({tensor_name}.layout.stride[0])"
     )
+    if wide_dim0:
+        dim0 = f"cutlass.Int64({dim0})"
     stride1_expr = (
         f"cutlass.Int32({stride1})"
         if stride1 is not None
@@ -12755,6 +12797,7 @@ def _small_biased_attention_score_pair_expr(
     *,
     seq: int,
     head_dim: int,
+    wide_batch: bool = False,
 ) -> str:
     qkv_strides = _small_biased_qkv_strides(seq, head_dim)
     bias_strides = _small_biased_bias_strides(seq)
@@ -12764,6 +12807,7 @@ def _small_biased_attention_score_pair_expr(
         "small_row",
         "small_d",
         strides=qkv_strides,
+        wide_dim0=wide_batch,
     )
     k0_load = _small_biased_attention_gmem_expr(
         k_name,
@@ -12771,6 +12815,7 @@ def _small_biased_attention_score_pair_expr(
         "small_col0",
         "small_d",
         strides=qkv_strides,
+        wide_dim0=wide_batch,
     )
     k1_load = _small_biased_attention_gmem_expr(
         k_name,
@@ -12778,6 +12823,7 @@ def _small_biased_attention_score_pair_expr(
         "small_col1",
         "small_d",
         strides=qkv_strides,
+        wide_dim0=wide_batch,
     )
     bias0_load = _small_biased_attention_gmem_expr(
         bias_name,
@@ -12785,6 +12831,7 @@ def _small_biased_attention_score_pair_expr(
         "small_row",
         "small_col0",
         strides=bias_strides,
+        wide_dim0=wide_batch,
     )
     bias1_load = _small_biased_attention_gmem_expr(
         bias_name,
@@ -12792,6 +12839,7 @@ def _small_biased_attention_score_pair_expr(
         "small_row",
         "small_col1",
         strides=bias_strides,
+        wide_dim0=wide_batch,
     )
     return f"""small_dot0 = cutlass.Float32(0.0)
 small_dot1 = cutlass.Float32(0.0)
@@ -12857,19 +12905,32 @@ def emit_small_biased_attention_simt_device_body(
     head_dim: int,
     io_dtype: str,
     v_storage_k_major: bool = False,
+    flat_grid: bool = False,
 ) -> list[ast.AST]:
-    """The SIMT body of the small biased plan. Q, K, the bias and the output
-    are contiguous; V is read from the storage its plan found
-    (``FlashGraphOutputPlan.v_storage_k_major``): the contiguous
-    ``[batch heads, seq, head_dim]`` buffer, or the dense transpose of a
-    contiguous ``[batch heads, head_dim, seq]`` one, whose key dim has the
-    unit stride."""
+    """The SIMT body of the small biased plan, one CTA per (sequence row,
+    batch head): the grid is ``(seq, batch heads)``, or with ``flat_grid``
+    (more batch heads than CUDA takes on y, ``flash_grid_yz_legal``) the
+    same CTAs flat in x, rows fastest, with every batch-head offset in 64
+    bits. Q, K, the bias and the output are contiguous; V is read from the
+    storage its plan found (``FlashGraphOutputPlan.v_storage_k_major``):
+    the contiguous ``[batch heads, seq, head_dim]`` buffer, or the dense
+    transpose of a contiguous ``[batch heads, head_dim, seq]`` one, whose
+    key dim has the unit stride."""
+    block_decode = (
+        f"""small_place = cutlass.Int32(cute.arch.block_idx()[0])
+small_row = small_place % cutlass.Int32({seq})
+small_bh = small_place // cutlass.Int32({seq})"""
+        if flat_grid
+        else """small_row = cutlass.Int32(cute.arch.block_idx()[0])
+small_bh = cutlass.Int32(cute.arch.block_idx()[1])"""
+    )
     score_body = _small_biased_attention_score_pair_expr(
         q_name,
         k_name,
         bias_name,
         seq=seq,
         head_dim=head_dim,
+        wide_batch=flat_grid,
     )
     max_reduce = _small_biased_attention_reduce_block(
         "max",
@@ -12891,6 +12952,7 @@ def emit_small_biased_attention_simt_device_body(
             if v_storage_k_major
             else _small_biased_qkv_strides(seq, head_dim)
         ),
+        wide_dim0=flat_grid,
     )
     o_store = _small_biased_attention_gmem_expr(
         o_name,
@@ -12898,6 +12960,7 @@ def emit_small_biased_attention_simt_device_body(
         "small_row",
         "small_col",
         strides=_small_biased_qkv_strides(seq, head_dim),
+        wide_dim0=flat_grid,
     )
     qk_scale = 1.0 / math.sqrt(head_dim)
     body = f"""
@@ -12907,8 +12970,7 @@ small_col0 = small_col * cutlass.Int32(2)
 small_col1 = small_col0 + cutlass.Int32(1)
 small_warp = small_col // cutlass.Int32(32)
 small_lane = small_col - small_warp * cutlass.Int32(32)
-small_row = cutlass.Int32(cute.arch.block_idx()[0])
-small_bh = cutlass.Int32(cute.arch.block_idx()[1])
+{block_decode}
 small_qk_scale = cutlass.Float32({qk_scale!r})
 small_log2e = cutlass.Float32(1.4426950408889634)
 small_prob_ptr = cute.arch.alloc_smem(cutlass.Float32, {seq}, alignment=128)
@@ -17042,6 +17104,7 @@ def _flash_fa4_wrap(
     use_cga2_local_cta: bool = False,
     use_clc_scheduler: bool = False,
     clc_heads_per_batch: int | None = None,
+    clc_flat_grid: bool = False,
     tensor_4d_heads: int = 0,
     recompute_tile_coords: bool = False,
     kv_group: int = 1,
@@ -17115,6 +17178,15 @@ def _flash_fa4_wrap(
         clc_decode = (
             ""
             if prelude == "none"
+            else (
+                # The flat grid (``flash_clc_grid_is_flat``): x is the linear
+                # index of the ``(Q pairs, batch heads)`` grid, pairs fastest.
+                "        flash_clc_place = cutlass.Int32(flash_clc_work.tile_idx[0])\n"
+                f"        flash_m_pair = cutlass.Int32({num_m_pairs} - 1) - "
+                f"flash_clc_place % cutlass.Int32({num_m_pairs})\n"
+                f"        flash_bh = flash_clc_place // cutlass.Int32({num_m_pairs})\n"
+            )
+            if clc_flat_grid
             else (
                 f"        flash_m_pair = cutlass.Int32({num_m_pairs} - 1) - "
                 "cutlass.Int32(flash_clc_work.tile_idx[0])\n"
@@ -17491,6 +17563,7 @@ def _wrap_role(
         use_cga2_local_cta=ctx.use_cga2_local_cta,
         use_clc_scheduler=ctx.use_clc_scheduler,
         clc_heads_per_batch=ctx.clc_heads_per_batch,
+        clc_flat_grid=ctx.clc_flat_grid,
         tensor_4d_heads=ctx.tensor_4d_heads,
         kv_group=kv_group,
         recompute_tile_coords=ctx.cfg.recompute_tile_coords,
@@ -18735,6 +18808,7 @@ class FlashBodyContext:
     early_prologue_loads: bool = dataclasses.field(init=False)
     segment_wrap: Callable[..., str] = dataclasses.field(init=False)
     clc_heads_per_batch: int = dataclasses.field(init=False)
+    clc_flat_grid: bool = dataclasses.field(init=False)
     split_p_arrive: bool = dataclasses.field(init=False)
     exp2_codegen: _FlashDiscExp2CodegenParams = dataclasses.field(init=False)
     sp_whole_row_sum: bool = dataclasses.field(init=False)
@@ -24323,6 +24397,7 @@ def emit_softmax_shared_role(ctx: FlashBodyContext) -> str:
         use_cga2_local_cta=ctx.use_cga2_local_cta,
         use_clc_scheduler=ctx.use_clc_scheduler,
         clc_heads_per_batch=ctx.clc_heads_per_batch,
+        clc_flat_grid=ctx.clc_flat_grid,
         tensor_4d_heads=ctx.tensor_4d_heads,
         recompute_tile_coords=ctx.cfg.recompute_tile_coords,
     )
@@ -25295,7 +25370,18 @@ def emit_flash_fa4_device_body(
     )
     if ctx.num_bh % ctx.clc_heads_per_batch != 0:
         ctx.clc_heads_per_batch = ctx.num_bh
-    clc_batch_count = ctx.num_bh // ctx.clc_heads_per_batch
+    ctx.clc_flat_grid = ctx.use_clc_scheduler and flash_clc_grid_is_flat(
+        ctx.num_bh, ctx.cfg.clc_heads_per_batch
+    )
+    clc_grid = (
+        (ctx.num_m_pairs * ctx.num_bh, 1, 1)
+        if ctx.clc_flat_grid
+        else (
+            ctx.num_m_pairs,
+            ctx.clc_heads_per_batch,
+            ctx.num_bh // ctx.clc_heads_per_batch,
+        )
+    )
     ctx.split_p_arrive = ctx.cfg.split_p_arrive
     ctx.exp2_codegen = _flash_disc_exp2_codegen_params(
         ctx.cfg.exp2_packet, ctx.cfg.e2e_freq, ctx.cfg.e2e_res
@@ -25496,7 +25582,7 @@ if warp_idx == 0:
     clc_setup = (
         f"""
 flash_clc_params = cutlass_utils_flash.ClcDynamicPersistentTileSchedulerParams(
-    problem_shape_ntile_mnl=({ctx.num_m_pairs}, {ctx.clc_heads_per_batch}, {clc_batch_count}),
+    problem_shape_ntile_mnl=({clc_grid[0]}, {clc_grid[1]}, {clc_grid[2]}),
     cluster_shape_mnk=(1, 1, 1))
 flash_clc_hw = cutlass_utils_flash.ClcDynamicPersistentTileScheduler.create(
     flash_clc_params,
@@ -27868,11 +27954,15 @@ def codegen_attention_flash(cg: GenerateAST) -> bool:
         )
     ):
         bias_arg = bias_args[0]
+        # The grid has the batch heads on y, where CUDA takes 65,535: more
+        # launch flat in x.
+        small_flat_grid = not flash_grid_yz_legal(batch)
         codegen_state.wrapper_plans.append(
             {
                 "kind": "helion_small_biased_attention",
                 "batch": batch,
                 "seq": seq,
+                **({"flat_grid": True} if small_flat_grid else {}),
             }
         )
         df.placeholder_args.update(
@@ -27889,6 +27979,7 @@ def codegen_attention_flash(cg: GenerateAST) -> bool:
             head_dim=head_dim,
             io_dtype=io_dtype_str,
             v_storage_k_major=plan.v_storage_k_major,
+            flat_grid=small_flat_grid,
         ).statements
         df.preamble = []
         return True
@@ -28101,6 +28192,14 @@ def codegen_attention_flash(cg: GenerateAST) -> bool:
         "use_cga2_local_cta": cfg.use_cga2_local_cta,
         "use_clc_scheduler": cfg.use_clc_scheduler,
         "clc_heads_per_batch": cfg.clc_heads_per_batch,
+        # (The CLC grid whose heads split CUDA would reject launches flat in
+        # x; the other grids keep their plan.)
+        **(
+            {"clc_flat_grid": True}
+            if cfg.use_clc_scheduler
+            and flash_clc_grid_is_flat(batch, cfg.clc_heads_per_batch)
+            else {}
+        ),
         "local_tma_partition": cfg.local_tma_partition,
     }
     if kv_group != 1:

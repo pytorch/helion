@@ -51,6 +51,7 @@ from helion._testing.cute_aux import cpu_codegen
 from helion._testing.cute_flash import bind_flash_kernel
 from helion._testing.cute_flash import render_flash_config
 import helion.language as hl
+from helion.runtime.cute.launcher import _append_cute_wrapper_plan
 from helion.runtime.kernel import Kernel
 
 pytestmark = pytest.mark.cpu_only
@@ -1442,6 +1443,143 @@ def test_small_biased_body_reads_v_from_its_storage(transposed: bool) -> None:
     )
 
 
+@pytest.mark.parametrize(
+    ("num_bh", "heads", "grid"),
+    [
+        (65535, 0, (4, 65535, 1)),
+        (65536, 0, (4 * 65536, 1, 1)),
+        (65536, 256, (4, 256, 256)),
+        (65537, 1, (4 * 65537, 1, 1)),
+    ],
+    ids=["heads_at_the_cap", "heads_above", "split_within", "batches_above"],
+)
+def test_clc_grid_above_the_cuda_cap_launches_flat(
+    num_bh: int, heads: int, grid: tuple[int, int, int]
+) -> None:
+    """CUDA rejects a launch grid whose y or z extent is above 65,535. The
+    CLC loop launches ``(Q pairs, heads, batches)``, and a kernel without a
+    batch dimension puts every batch head on y: at 65,536 of them the launch
+    used to be rejected, as was a split that leaves that many batches on z.
+    Such a grid launches the same CTAs flat in x, the plan says so, and the
+    body decodes its item from the linear index (pairs fastest, the order the
+    grid starts in); a split within the cap keeps its grid and its decode."""
+    kernel = helion.kernel(backend="cute", static_shapes=True)(_dense_attention.fn)
+    with cpu_codegen():
+        bound = kernel.bind(
+            tuple(
+                torch.empty(
+                    num_bh,
+                    1024,
+                    64,
+                    dtype=torch.bfloat16,
+                    device="meta",  # @ignore-device-lint
+                )
+                for _ in range(3)
+            )
+        )
+        config = dict(bound.config_spec.default_config().config)
+        config.update(
+            {
+                cute_flash.FLASH_PIPELINE_FAMILY_KEY: "fa4_clc",
+                cute_flash.FLASH_PERSISTENT_KEY: True,
+                cute_flash.FLASH_CLC_HEADS_PER_BATCH_KEY: heads,
+            }
+        )
+        code = bound.to_code(helion.Config(**config))
+    flat = grid[1:] == (1, 1)
+    assert cute_flash.flash_clc_grid_is_flat(num_bh, heads) is flat
+    assert f"problem_shape_ntile_mnl=({grid[0]}, {grid[1]}, {grid[2]})" in code
+    linear = "flash_bh = flash_clc_place // cutlass.Int32(4)"
+    assert (linear in code) is flat
+    assert ("flash_clc_work.tile_idx[2]" in code) is not flat
+    marker = "._helion_cute_wrapper_plans = "
+    payload = next(line for line in code.splitlines() if marker in line)
+    (plan,) = ast.literal_eval(payload.split(marker, 1)[1])
+    assert plan.get("clc_flat_grid", False) is flat
+    body: list[str] = []
+    _append_cute_wrapper_plan(body, [], plan, num_sm=148)
+    launched = tuple(
+        int(extent)
+        for extent in re.findall(
+            r"grid_[xyz] = cutlass\.Int32\((\d+)\)", "\n".join(body)
+        )
+    )
+    assert launched == grid
+    assert max(launched[1:]) <= 65535
+
+
+@pytest.mark.parametrize(
+    ("batch", "grid"),
+    [
+        (65535, (128, 65535, 1)),
+        (65536, (128 * 65536, 1, 1)),
+        (131073, (128 * 131073, 1, 1)),
+    ],
+    ids=["at_the_cap", "above", "bias_past_int32"],
+)
+def test_small_biased_grid_above_the_cuda_cap_launches_flat(
+    batch: int, grid: tuple[int, int, int]
+) -> None:
+    """The small biased body's grid is (rows, batch heads), the batch heads
+    on y: 65,536 of them used to be a launch CUDA rejects. Above the cap the
+    plan asks for the flat grid, the launcher builds it and the body takes
+    its row and batch head from the linear index, rows fastest. A flat
+    launch's batch heads pass what a 32-bit element offset holds (the bias
+    has 2**31 elements at 131,072 of them), so the body computes every
+    batch-head offset in 64 bits; the grid CUDA accepts keeps its 32-bit
+    offsets."""
+    kernel = helion.kernel(backend="cute", static_shapes=True)(_biased_attention.fn)
+    with cpu_codegen():
+        bound = kernel.bind(
+            (
+                *(
+                    torch.empty(
+                        batch,
+                        128,
+                        64,
+                        dtype=torch.float16,
+                        device="meta",  # @ignore-device-lint
+                    )
+                    for _ in range(3)
+                ),
+                torch.empty(
+                    batch,
+                    128,
+                    128,
+                    dtype=torch.float16,
+                    device="meta",  # @ignore-device-lint
+                ),
+            )
+        )
+        code = bound.to_code(bound.config_spec.default_config())
+    flat = grid[1:] == (1, 1)
+    assert cute_flash.flash_grid_yz_legal(batch) is not flat
+    marker = "._helion_cute_wrapper_plans = "
+    payload = next(line for line in code.splitlines() if marker in line)
+    (plan,) = ast.literal_eval(payload.split(marker, 1)[1])
+    assert plan["kind"] == "helion_small_biased_attention"
+    assert plan.get("flat_grid", False) is flat
+    body: list[str] = []
+    _append_cute_wrapper_plan(body, [], plan)
+    assert body == [
+        f"    grid_{axis} = cutlass.Int32({extent})"
+        for axis, extent in zip("xyz", grid, strict=True)
+    ]
+    linear = (
+        "small_row = small_place % cutlass.Int32(128)",
+        "small_bh = small_place // cutlass.Int32(128)",
+    )
+    for line in linear:
+        assert (line in code) is flat
+    assert ("small_bh = cutlass.Int32(cute.arch.block_idx()[1])" in code) is not flat
+    # Two Q/K loads, two bias loads, the V load and the output store: each
+    # moves its pointer by the batch head first.
+    wide = code.count("cutlass.Int64(small_bh) * cutlass.Int64(")
+    narrow = code.count("small_bh * cutlass.Int32(")
+    assert (wide, narrow) == ((7, 0) if flat else (0, 7))
+    assert ("cutlass.Int64(small_bh) * cutlass.Int64(16384)" in code) is flat
+
+
 @pytest.mark.parametrize("head_dim", (192, 256))
 def test_pinned_pair_surface_searches_only_the_pair_knobs(head_dim: int) -> None:
     """A surface pinned to the cooperative pair searches neither the score
@@ -2671,7 +2809,6 @@ def test_extra_k_slot_sizes_the_host_k_layout() -> None:
     is slot 0), so a single-tile body at kv_stage 1 with the extra slot carries
     ``k_stage`` 2 in its plan and the wrapper builds its K layout two deep
     while V's stays one; with the slot off the plan has no such key."""
-    from helion.runtime.cute.launcher import _append_cute_wrapper_plan
 
     def plan_of(code: str) -> dict[str, object]:
         marker = "._helion_cute_wrapper_plans = "

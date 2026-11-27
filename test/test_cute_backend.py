@@ -5230,6 +5230,31 @@ class TestCuteBackend(TestCase):
         expected = torch.nn.functional.scaled_dot_product_attention(q, k, v)
         torch.testing.assert_close(out, expected, atol=1e-2, rtol=1e-2)
 
+    def test_flash_attention_clc_flat_grid_matches_sdpa(self) -> None:
+        """The CLC loop's flat launch (a heads split above CUDA's cap on the
+        grid's y and z, 65,536 batch heads) with the cap lowered to 4, so 24
+        batch heads over three Q pairs take it: every CTA decodes its batch
+        head and Q pair from the linear index."""
+        q, k, v = (
+            torch.randn(3, 8, 768, 64, dtype=torch.float16, device=DEVICE)
+            for _ in range(3)
+        )
+        with patch.object(_cute_flash, "_CUDA_GRID_YZ_MAX", 4):
+            code, out = code_and_output(
+                cute_dense_attention,
+                (q, k, v),
+                block_sizes=[1, 128, 128],
+                cute_flash_topology="fa4",
+                cute_flash_persistent=True,
+                cute_flash_clc=True,
+            )
+
+        self.assertIn("problem_shape_ntile_mnl=(72, 1, 1)", code)
+        self.assertIn("flash_bh = flash_clc_place // cutlass.Int32(3)", code)
+        self.assertIn("'clc_flat_grid': True", code)
+        expected = torch.nn.functional.scaled_dot_product_attention(q, k, v)
+        torch.testing.assert_close(out, expected, atol=1e-2, rtol=1e-2)
+
     def test_flash_attention_late_rejection_is_safe(self) -> None:
         q, k, v = (
             torch.randn(2, 8, 256, 64, dtype=torch.float16, device=DEVICE)
@@ -6703,6 +6728,34 @@ class TestCuteBackend(TestCase):
             attn_mask=bias,
         )
         # The 64-thread small path uses a different fp32 reduction order than SDPA.
+        torch.testing.assert_close(out, expected, atol=2e-2, rtol=2e-2)
+
+    def test_flash_attention_small_biased_flat_grid_matches_sdpa(self) -> None:
+        """The small biased body launches one CTA per (row, batch head) with
+        the batch heads on the grid's y, where CUDA takes 65,535: more of
+        them launch flat in x. Here the cap is lowered to 4, so six batch
+        heads take the flat launch and every CTA decodes its row and batch
+        head from the linear index."""
+        q, k, v = (
+            torch.randn(2, 3, 128, 64, dtype=torch.float16, device=DEVICE)
+            for _ in range(3)
+        )
+        bias = torch.randn(2, 3, 128, 128, dtype=torch.float16, device=DEVICE) * 0.25
+        with patch.object(_cute_flash, "_CUDA_GRID_YZ_MAX", 4):
+            code, out = code_and_output(
+                cute_biased_attention,
+                (q, k, v, bias),
+                block_sizes=[1, 128, 128],
+            )
+        self.assertIn("'kind': 'helion_small_biased_attention'", code)
+        self.assertIn("'flat_grid': True", code)
+        self.assertIn("small_bh = small_place // cutlass.Int32(128)", code)
+        expected = torch.nn.functional.scaled_dot_product_attention(
+            q,
+            k,
+            v,
+            attn_mask=bias,
+        )
         torch.testing.assert_close(out, expected, atol=2e-2, rtol=2e-2)
 
     def test_flash_attention_bias_all_inf_row_matches_sdpa(self) -> None:
