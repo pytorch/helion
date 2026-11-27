@@ -240,6 +240,10 @@ SEED_CAUSAL_HEAD_PAIR_STRUCTURE: Mapping[str, object] = {
 # matched cuDNN at s4096 where an hour of search from the generic seeds ended
 # 3% behind it; with the family's default softmax path instead it is 9%
 # slower than that search's winner, so the softmax knobs are part of the seed.
+# The pre-sync prologue loads are on: from a cold L2 the s1024 body reads
+# 35.1 us with them and 35.4 without (cuDNN 35.0-35.15; means of do_bench
+# samples, b2 h32 fp16 on a B200), and the s2048 and s4096 bodies read the
+# same either way.
 SEED_DENSE_HD64_LOCAL_TMA_PACKETS: tuple[str, ...] = ("4x2", "8x2")
 SEED_DENSE_HD64_LOCAL_TMA_RESCALE_THRESHOLD = 16.0
 SEED_DENSE_HD64_LOCAL_TMA: Mapping[str, object] = {
@@ -256,6 +260,7 @@ SEED_DENSE_HD64_LOCAL_TMA: Mapping[str, object] = {
     FLASH_RESCALE_CHUNK_COLS_KEY: 16,
     FLASH_RESCALE_THRESHOLD_KEY: SEED_DENSE_HD64_LOCAL_TMA_RESCALE_THRESHOLD,
     FLASH_WAIT_HINT_KEY: 0,
+    FLASH_EARLY_PROLOGUE_LOADS_KEY: True,
 }
 
 # The causal hd64 shapes are won by three fa4 bodies that the family and

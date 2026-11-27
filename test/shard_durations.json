@@ -119,7 +119,7 @@
  "test/test_cute_flash_bwd_flex_gpu.py": 939.6,
  "test/test_cute_flash_bwd_match.py": 5.1,
  "test/test_cute_flash_bwd_row_mma.py": 20.0,
- "test/test_cute_flash_early_prologue_loads.py": 2.5,
+ "test/test_cute_flash_early_prologue_loads.py": 28.4,
  "test/test_cute_flash_exp2.py": 37.4,
  "test/test_cute_flash_flex_gpu.py": 232.5,
  "test/test_cute_flash_fp8_body.py": 12.2,

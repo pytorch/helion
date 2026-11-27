@@ -10,6 +10,11 @@ mbarriers) issues the four copies against the pipelines' full barriers right
 after the fence, before the sync. The load warp keeps its four acquires (they
 post the arrive.expect_tx; an mbarrier tx-count may run negative until then)
 and drops the copies, so the ring state and the outputs are unchanged.
+
+A persistent CTA walks several work items. Its first one is its block index:
+warp 0 decodes it before the sync and binds the item's views under names of
+its own (with ``local_tma_partition``, the item's own TMA partitions), and the
+load warp issues the four copies itself from the CTA's second item on.
 """
 
 from __future__ import annotations
@@ -18,6 +23,7 @@ import ast
 import dataclasses
 import math
 import os
+import textwrap
 from typing import TYPE_CHECKING
 from typing import cast
 from unittest.mock import patch
@@ -43,6 +49,8 @@ if TYPE_CHECKING:
 
 pytest.importorskip("cutlass")
 pytest.importorskip("cutlass.cute")
+
+pytestmark = pytest.mark.cpu_only
 
 KEY = cute_flash.FLASH_EARLY_PROLOGUE_LOADS_KEY
 HEAD_PAIR_KEY = cute_flash.FLASH_CAUSAL_HEAD_PAIR_KEY
@@ -114,6 +122,44 @@ DENSE_HD128_BODY: dict[str, object] = {
     "cute_flash_corr_regs": 64,
     "cute_flash_other_regs": 48,
     "cute_flash_corr_tile_size": 8,
+}
+# The dense hd64 body of the per-CTA TMA partitions: one persistent CTA per
+# SM, six-deep K/V ring, plain softmax with the split P arrival.
+DENSE_HD64_LOCAL_TMA_BODY: dict[str, object] = {
+    "block_sizes": [1, 128, 128],
+    "cute_flash_kv_tile_n": 128,
+    "cute_flash_s_stage": 2,
+    "cute_flash_kv_stage": 6,
+    "cute_flash_persistent": True,
+    "cute_flash_persistent_ctas_per_sm": 1,
+    "cute_flash_persistent_loop": "counted",
+    "cute_flash_e2e_schedule": "16/6",
+    "cute_flash_e2e_offset": 2,
+    "cute_flash_e2e_offset0": 0,
+    "cute_flash_exp2_packet": "8x2",
+    "cute_flash_mma_interleave": True,
+    "cute_flash_wait_hint": 0,
+    "cute_flash_stat_transport": "single",
+    "cute_flash_pipeline_family": "fa4_local_tma",
+    "cute_flash_softmax_disc": False,
+    "cute_flash_disc_pipe": 1,
+    "cute_flash_split_p_arrive": True,
+    "cute_flash_p_store_rep": 16,
+    "cute_flash_s_load_rep": 32,
+    "cute_flash_precompute_qk_desc": True,
+    "cute_flash_first_load_order": 0,
+    "cute_flash_epi_tma": False,
+    "cute_flash_epi_stg": False,
+    "cute_flash_rescale_threshold": 4.0,
+    "cute_flash_rescale_chunk_cols": 16,
+    "cute_flash_softmax_regs": 200,
+    "cute_flash_corr_regs": 64,
+    "cute_flash_other_regs": 48,
+    "cute_flash_corr_tile_size": 8,
+}
+DENSE_HD128_PERSISTENT_BODY: dict[str, object] = {
+    **DENSE_HD128_BODY,
+    "cute_flash_persistent": True,
 }
 
 
@@ -331,10 +377,28 @@ def test_resolver_keeps_the_knob_on_the_plain_fa4_bodies() -> None:
     assert dense.first_load_order == 4 and not dense.persistent
 
 
+def test_resolver_keeps_the_knob_on_the_persistent_one_cta_bodies() -> None:
+    # The static persistent loop, with the launch-wide TMA partitions and with
+    # the per-CTA ones.
+    plain = _resolve(
+        {**DENSE_HD128_PERSISTENT_BODY, KEY: True}, is_causal=False, head_dim=128
+    )
+    assert plain.persistent and not plain.local_tma_partition
+    assert plain.early_prologue_loads
+    local = _resolve(
+        {**DENSE_HD64_LOCAL_TMA_BODY, KEY: True}, is_causal=False, head_dim=64
+    )
+    assert local.persistent and local.local_tma_partition
+    assert local.early_prologue_loads
+    assert cute_flash.flash_effective_config_values(local)[KEY] is True
+    assert not _resolve(
+        DENSE_HD64_LOCAL_TMA_BODY, is_causal=False, head_dim=64
+    ).early_prologue_loads
+
+
 @pytest.mark.parametrize(
     ("override", "is_causal", "head_dim"),
     (
-        ({"cute_flash_persistent": True}, False, 128),
         ({"cute_flash_pipeline_family": "fa4_2cta"}, False, 128),
         ({"cute_flash_pipeline_family": "fa4_deep_1cta"}, True, 64),
         ({"cute_flash_pipeline_family": "fa4_alt"}, False, 128),
@@ -346,7 +410,6 @@ def test_resolver_keeps_the_knob_on_the_plain_fa4_bodies() -> None:
         ),
     ),
     ids=(
-        "persistent",
         "two_cta",
         "separate_rings",
         "alt",
@@ -406,10 +469,164 @@ def test_codegen_issues_the_first_loads_before_the_prologue_sync(
     assert "cute.copy(" not in prologue
 
 
+def _block_under(code: str, header: str, start: int = 0) -> str:
+    """The lines of the statement at ``header`` (its own line and the more
+    deeply indented ones that follow)."""
+    lines = code[code.index(header, start) :].splitlines()
+    indent = len(lines[0]) - len(lines[0].lstrip())
+    body = [lines[0]]
+    for line in lines[1:]:
+        if line.strip() and len(line) - len(line.lstrip()) <= indent:
+            break
+        body.append(line)
+    return "\n".join(body)
+
+
+@pytest.mark.parametrize(
+    ("base", "head_dim", "local"),
+    ((DENSE_HD128_PERSISTENT_BODY, 128, False), (DENSE_HD64_LOCAL_TMA_BODY, 64, True)),
+    ids=("dense_hd128", "dense_hd64_local_tma"),
+)
+def test_codegen_issues_a_persistent_ctas_first_item_before_the_sync(
+    base: dict[str, object], head_dim: int, local: bool
+) -> None:
+    cfg = _resolve({**base, KEY: True}, is_causal=False, head_dim=head_dim)
+    assert cfg.persistent and cfg.local_tma_partition is local
+    code = _render(cfg, is_causal=False, head_dim=head_dim)
+    assert code.count("defer_sync=True") == 2
+    fence = code.index(FENCE)
+    sync = code.index(SYNC)
+    assert code.index("PipelineTmaUmma.create(") < fence < sync
+    block = _early_block(code)
+    # Warp 0 decodes the CTA's first work item (its block index, by the
+    # decode the role loops start from) and issues that item's copies.
+    item = _block_under(block, EARLY_GUARD)
+    assert "flash_early_tile_id = cutlass.Int32(cute.arch.block_idx()[0])" in item
+    assert "flash_early_m_pair = flash_early_tile_id & cutlass.Int32(7)" in item
+    assert "flash_early_bh = flash_early_tile_id >> 3" in item
+    assert len(_copies(item)) == len(_copies(block)) == 4
+    # The copies follow the body's first-load order: 4 is K, Q0, Q1, V and 0
+    # is Q0, K, Q1, V.
+    order = {4: "kqqv", 0: "qkqv"}[cfg.first_load_order]
+    assert [line.split("_flash_tma_")[1][0] for line in _copies(item)] == list(order)
+    if local:
+        assert "flash_early_mQ_cur = _flash_mQt[None, None, flash_early_bh]" in item
+        assert "(flash_early_m_pair, 0))" in item
+        for operand in "QKV":
+            assert f"flash_early_t{operand}s{operand}, flash_early_t{operand}g" in item
+        assert (
+            "cute.copy(_flash_tma_q, flash_early_tQgQ[None, 0], "
+            "flash_early_tQsQ[None, 0], "
+            "tma_bar_ptr=storage.q_mbar_ptr.data_ptr() + 0)" in item
+        )
+        assert (
+            "cute.copy(_flash_tma_q, flash_early_tQgQ[None, 1], "
+            "flash_early_tQsQ[None, 1], "
+            "tma_bar_ptr=storage.q_mbar_ptr.data_ptr() + 1)" in item
+        )
+        assert "flash_early_tKgK[None, 0], flash_early_tKsK[None, 0]" in item
+        assert "flash_early_tVgV[None, 0], flash_early_tVsV[None, 1]" in item
+    else:
+        assert "flash_early_tQgQ = tQgQ_qdl[None, None, 0, flash_early_bh]" in item
+        assert "flash_early_tKgK = tKgK_kdl[None, None, 0, flash_early_bh]" in item
+        assert "flash_early_tVgV = tVgV_dkl[None, 0, None, flash_early_bh]" in item
+        assert (
+            "cute.copy(_flash_tma_q, flash_early_tQgQ[None, flash_early_m_pair * 2], "
+            "tQsQ[None, 0], tma_bar_ptr=storage.q_mbar_ptr.data_ptr() + 0)" in item
+        )
+        assert (
+            "cute.copy(_flash_tma_q, "
+            "flash_early_tQgQ[None, flash_early_m_pair * 2 + 1], "
+            "tQsQ[None, 1], tma_bar_ptr=storage.q_mbar_ptr.data_ptr() + 1)" in item
+        )
+        assert "flash_early_tKgK[None, 0], tKsK[None, 0]" in item
+        assert "flash_early_tVgV[None, 0], tVsV[None, 1]" in item
+    # Every name the block binds is its own: a role binds none of them again.
+    bound = {
+        target.id
+        for node in ast.walk(ast.parse(textwrap.dedent(block)))
+        if isinstance(node, ast.Assign)
+        for target in ast.walk(node.targets[0])
+        if isinstance(target, ast.Name)
+    }
+    assert bound and all(name.startswith("flash_early_") for name in bound)
+    assert "flash_early_" not in code[sync:]
+    # The load warp arms the barriers of every item and issues the copies
+    # from the CTA's second item on.
+    prologue = _load_warp_prologue(code)
+    assert prologue.count("acquire_and_advance()") == 4
+    assert prologue.count("flash_load_later = cutlass.Boolean(False)") == 1
+    assert prologue.index("flash_load_later = cutlass.Boolean(False)") < (
+        prologue.index("while flash_tile_id <")
+    )
+    lines = prologue.rstrip().splitlines()
+    for index, line in enumerate(lines):
+        if "cute.copy(" in line:
+            assert lines[index - 1].strip() == "if flash_load_later:"
+            assert "acquire_and_advance()" in lines[index - 2]
+    assert len(_copies(prologue)) == 4
+    assert lines[-1].strip() == "flash_load_later = cutlass.Boolean(True)"
+    # Without the knob the same body issues all four behind their acquires.
+    plain = _render(
+        _resolve(base, is_causal=False, head_dim=head_dim),
+        is_causal=False,
+        head_dim=head_dim,
+    )
+    assert "flash_load_later" not in plain and "flash_early_" not in plain
+    assert plain == _without_early_loads(code)
+
+
+def _without_early_loads(code: str) -> str:
+    """``code`` with the knob's statements taken out again: the pipelines
+    back behind the sync, warp 0's block gone, the load warp's copies
+    unconditional."""
+    lines = code.splitlines()
+    fence = lines.index(next(line for line in lines if line.strip() == FENCE))
+    sync = lines.index(next(line for line in lines if line.strip() == SYNC))
+    pipes = next(
+        index
+        for index, line in enumerate(lines)
+        if line.strip().startswith("flash_q_bytes = ")
+    )
+    late = next(
+        index
+        for index, line in enumerate(lines)
+        if index > sync and line.strip().startswith("flash_tmem = ")
+    )
+    out = [
+        *lines[:pipes],
+        lines[fence],
+        *lines[sync : late + 1],
+        *(line.replace(", defer_sync=True", "") for line in lines[pipes:fence]),
+    ]
+    rest = lines[late + 1 :]
+    kept: list[str] = []
+    index = 0
+    while index < len(rest):
+        line = rest[index]
+        if line.strip() in (
+            "flash_load_later = cutlass.Boolean(False)",
+            "flash_load_later = cutlass.Boolean(True)",
+        ):
+            index += 1
+            continue
+        if line.strip() == "if flash_load_later:":
+            kept.append(rest[index + 1][4:])
+            index += 2
+            continue
+        kept.append(line)
+        index += 1
+    return "\n".join(out + kept)
+
+
 @pytest.mark.parametrize(
     ("base", "is_causal", "head_dim"),
-    ((CAUSAL_HD64_BODY, True, 64), (DENSE_HD128_BODY, False, 128)),
-    ids=("causal_hd64", "dense_hd128"),
+    (
+        (CAUSAL_HD64_BODY, True, 64),
+        (DENSE_HD128_BODY, False, 128),
+        (DENSE_HD128_PERSISTENT_BODY, False, 128),
+    ),
+    ids=("causal_hd64", "dense_hd128", "dense_hd128_persistent"),
 )
 def test_codegen_without_the_knob_is_unchanged(
     base: dict[str, object], is_causal: bool, head_dim: int
@@ -436,16 +653,21 @@ def code_has_late_pipelines(code: str) -> bool:
 
 def test_emitter_rejects_the_knob_outside_the_resolver_legality() -> None:
     cfg = _resolve(
-        {**DENSE_HD128_BODY, "cute_flash_persistent": True},
-        is_causal=False,
-        head_dim=128,
+        {
+            **CAUSAL_HD64_BODY,
+            "cute_flash_first_load_order": cute_flash.FLASH_FIRST_LOAD_ORDER_STAGED,
+            KEY: True,
+        },
+        is_causal=True,
+        head_dim=64,
     )
-    assert cfg.persistent and not cfg.early_prologue_loads
+    assert cfg.first_load_order == cute_flash.FLASH_FIRST_LOAD_ORDER_STAGED
+    assert not cfg.early_prologue_loads
     with pytest.raises(AssertionError, match="pre-sync prologue loads"):
         _render(
             dataclasses.replace(cfg, early_prologue_loads=True),
-            is_causal=False,
-            head_dim=128,
+            is_causal=True,
+            head_dim=64,
         )
 
 
@@ -618,18 +840,41 @@ def _run(
     return out
 
 
+def _heads_past_one_wave() -> int:
+    """Batch heads of 1024 rows (four work items each) whose items outnumber
+    the device's SMs by a few: the persistent grid is one CTA per SM, so its
+    first CTAs walk a second item."""
+    sms = torch.cuda.get_device_properties(DEVICE).multi_processor_count
+    return sms // 4 + 3
+
+
+@pytest.mark.cuda
 @skipIfNotCUDA()
 @pytest.mark.parametrize(
-    ("kernel", "base", "shape", "is_causal"),
+    ("kernel", "base", "heads", "head_dim", "is_causal"),
     (
-        (_causal_attention, CAUSAL_HD64_BODY, (1, 4, 1024, 64), True),
-        (_dense_attention, DENSE_HD128_BODY, (1, 2, 1024, 128), False),
+        (_causal_attention, CAUSAL_HD64_BODY, 4, 64, True),
+        (_dense_attention, DENSE_HD128_BODY, 2, 128, False),
+        # The persistent loop (``heads`` from the device): CTAs of one item
+        # and CTAs of two.
+        (_dense_attention, DENSE_HD128_PERSISTENT_BODY, None, 128, False),
+        (_dense_attention, DENSE_HD64_LOCAL_TMA_BODY, None, 64, False),
     ),
-    ids=("causal_hd64_order2", "dense_hd128_order4"),
+    ids=(
+        "causal_hd64_order2",
+        "dense_hd128_order4",
+        "dense_hd128_persistent",
+        "dense_hd64_persistent_local_tma",
+    ),
 )
 def test_early_prologue_loads_are_bitwise_identical_on_device(
-    kernel: object, base: dict[str, object], shape: tuple[int, ...], is_causal: bool
+    kernel: object,
+    base: dict[str, object],
+    heads: int | None,
+    head_dim: int,
+    is_causal: bool,
 ) -> None:
+    shape = (1, _heads_past_one_wave() if heads is None else heads, 1024, head_dim)
     torch.manual_seed(0)
     q, k, v = (
         torch.randn(*shape, dtype=torch.bfloat16, device=DEVICE) for _ in range(3)

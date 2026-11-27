@@ -9796,6 +9796,8 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
             FLASH_DISC_PIPE_KEY: 1,
             FLASH_RESCALE_CHUNK_COLS_KEY: 16,
             FLASH_WAIT_HINT_KEY: 0,
+            # The first loads go out ahead of the setup sync.
+            FLASH_EARLY_PROLOGUE_LOADS_KEY: True,
         }
         # Threshold 16 where the dtype's largest pinned probability allows it.
         thresholds = {torch.bfloat16: 16.0, torch.float16: 12.0}
@@ -9831,6 +9833,7 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
                         self.assertEqual(resolved.pipeline_family, "fa4_local_tma")
                         self.assertEqual(resolved.exp2_packet, packet)
                         self.assertTrue(resolved.persistent)
+                        self.assertTrue(resolved.early_prologue_loads)
                         # The seed resolves as written (no knob is coerced).
                         effective = flash_effective_config_values(resolved)
                         for key, value in measured.items():

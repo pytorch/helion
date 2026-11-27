@@ -3077,9 +3077,12 @@ class FlashAttentionConfig:
     # The copies target the pipelines' full barriers directly; the load warp's
     # unchanged acquires post the arrive.expect_tx afterwards (an mbarrier
     # tx-count may run negative in between), so the ring state is unchanged
-    # and the outputs are bitwise identical. Plain one-CTA, non-persistent fa4
-    # ring only (no cluster, CLC, local/4-D TMA, segment tiling, uneven or
-    # separate rings, no staged first-load order).
+    # and the outputs are bitwise identical. A persistent CTA's first work
+    # item is its own block index: warp 0 decodes it and builds its views
+    # (the per-CTA partitions of ``local_tma_partition`` included), and the
+    # load warp issues the four copies itself from its second item on. Plain
+    # one-CTA fa4 ring only (no cluster, CLC, 4-D TMA, segment tiling, uneven
+    # or separate rings, no staged first-load order).
     early_prologue_loads: bool = False
     # TMEM P-store repetition for the FA4 softmax P path. Upstream FA4 exposes
     # this as a useful hd64 lever: 16 preserves the original 4-way staged-P
@@ -4287,14 +4290,12 @@ def _flash_causal_mask_storeback_default(legal: bool) -> bool:
 def _flash_early_prologue_loads_legal(
     *,
     topology: str,
-    persistent: bool,
     has_kv_tile_pruning: bool,
     q_tile_count: int,
     use_2cta_instrs: bool,
     use_cga2_local_cta: bool,
     use_clc_scheduler: bool,
     separate_kv_rings: bool,
-    local_tma_partition: bool,
     tensor_4d_tma: bool,
     uneven_kv_ring: bool,
     asymmetric_head_dims: bool,
@@ -4309,10 +4310,22 @@ def _flash_early_prologue_loads_legal(
     (sliding-window, prefix-LM, document masks) starts the load warp at the
     work item's own first/last active tile, which the pre-sync copies (issued
     from the ring's fixed first index) do not follow; a BlockMask list walk's
-    first tile is data dependent."""
+    first tile is data dependent.
+
+    The static persistent loop qualifies, with or without its per-CTA TMA
+    partitions (``local_tma_partition``): a CTA's first work item is its
+    block index, which warp 0 decodes before the sync. The other schedulers
+    stay out. A CLC CTA's first item is known before any response (the
+    scheduler's ``initial_work_tile_info`` rasterizes the block index), but
+    in the CLC grid's own order (the pairs reversed and, on the factored
+    grid, the batch heads split over y and z), which warp 0's block-index
+    decode does not follow. In a cluster, copies that signal a peer CTA's
+    barriers would have to wait for the cluster's init sync
+    (``pipeline_init_arrive`` / ``pipeline_init_wait``, which follow each
+    CTA's own barrier initialization), so a cluster's CTA cannot issue them
+    ahead of its setup synchronization."""
     return (
         topology == "fa4"
-        and not persistent
         and not has_kv_tile_pruning
         and not has_list_walk
         and q_tile_count == 2
@@ -4320,7 +4333,6 @@ def _flash_early_prologue_loads_legal(
         and not use_cga2_local_cta
         and not use_clc_scheduler
         and not separate_kv_rings
-        and not local_tma_partition
         and not tensor_4d_tma
         and not uneven_kv_ring
         and not asymmetric_head_dims
@@ -7297,14 +7309,12 @@ def flash_config_from_facts(
         causal_stagger = False
     if not _flash_early_prologue_loads_legal(
         topology=topology,
-        persistent=persistent,
         has_kv_tile_pruning=has_kv_tile_pruning,
         q_tile_count=q_tile_count,
         use_2cta_instrs=use_2cta_instrs,
         use_cga2_local_cta=use_cga2_local_cta,
         use_clc_scheduler=use_clc_scheduler,
         separate_kv_rings=separate_kv_rings,
-        local_tma_partition=local_tma_partition,
         tensor_4d_tma=tensor_4d_tma,
         uneven_kv_ring=uneven_kv_ring,
         asymmetric_head_dims=asymmetric_head_dims,
@@ -11535,11 +11545,12 @@ def flash_fragments_from_facts(
         (False, True) if causal_stagger_searchable else (defaults.causal_stagger,),
     )
     # The pre-sync prologue loads: searched where the plain fa4 family itself
-    # is in the search (a fixed fa4_* family's rings never take the knob, and
-    # the witness of its dependency entry would put the plain family on that
-    # surface), the KV interval is not pruned and the K/V rings are one
-    # aliased ring (the asymmetric pair's are not); the resolver clears the
-    # knob off the rest of that body.
+    # is in the search (of the fixed fa4_* families only the per-CTA TMA
+    # partitions' ring takes the knob, and the witness of its dependency
+    # entry would put the plain family on any of their surfaces), the KV
+    # interval is not pruned and the K/V rings are one aliased ring (the
+    # asymmetric pair's are not); the resolver clears the knob off the rest
+    # of that body.
     early_prologue_loads_searchable = (
         fa4_search_eligible
         and "fa4" in active_families
@@ -17113,6 +17124,139 @@ def _flash_power2_decode_exprs(value_expr: str, divisor: int) -> tuple[str, str]
     mask = divisor - 1
     shift = divisor.bit_length() - 1
     return f"({value_expr} & cutlass.Int32({mask}))", f"({value_expr} >> {shift})"
+
+
+def _flash_fa4_local_tma_views(
+    ctx: FlashBodyContext,
+    indent: str,
+    mq: str,
+    mk: str,
+    mv: str,
+    m_pair: str,
+    *,
+    early: bool = False,
+) -> str:
+    """One work item's TMA partitions built from its own operand slices
+    (``local_tma_partition``, the segment tiling): the item's ``(S, D)`` Q /
+    K and ``(D, S)`` V views ``mq`` / ``mk`` / ``mv``, the pair's two query
+    tiles at ``m_pair``, and every K/V tile.
+
+    ``early`` names them for warp 0's pre-sync loads of a persistent CTA's
+    first item (``flash_early_*``): the load warp builds its own, under its
+    own names, at the top of each item."""
+
+    def name(base: str) -> str:
+        return f"flash_early_{base.removeprefix('flash_')}" if early else base
+
+    return f"""{indent}{name("flash_mQ_cur")} = {mq}
+{indent}{name("flash_mK_cur")} = {mk}
+{indent}{name("flash_mV_cur")} = {mv}
+{indent}{name("flash_gQ_pair")} = cute.local_tile(
+{indent}    {name("flash_mQ_cur")}, ({ctx.mma_m * ctx.q_stage}, {ctx.hd}), ({m_pair}, 0))
+{indent}{name("flash_gQ_pair")} = _helion_flash_rt.select(
+{indent}    cute.flat_divide({name("flash_gQ_pair")}, ({ctx.mma_m},)), mode=[0, 2, 1])
+{indent}{name("flash_gK")} = cute.local_tile({name("flash_mK_cur")}, ({ctx.kv_n}, {ctx.hd}), (None, 0))
+{indent}{name("flash_gV")} = cute.local_tile({name("flash_mV_cur")}, ({ctx.hd_v}, {ctx.kv_n}), (0, None))
+{indent}{name("tSgQ")} = flash_qkt.partition_A({name("flash_gQ_pair")})
+{indent}{name("tSgK")} = flash_qkt.partition_B({name("flash_gK")})
+{indent}{name("tOgV")} = flash_pvt.partition_B({name("flash_gV")})
+{indent}{name("tQsQ")}, {name("tQgQ")} = cute_cpasync_flash.tma_partition(
+{indent}    _flash_tma_q, 0, cute.make_layout(1),
+{indent}    cute.group_modes(sQ, 0, 3), cute.group_modes({name("tSgQ")}, 0, 3))
+{indent}{name("tKsK")}, {name("tKgK")} = cute_cpasync_flash.tma_partition(
+{indent}    _flash_tma_k, 0, cute.make_layout(1),
+{indent}    cute.group_modes(sK, 0, 3), cute.group_modes({name("tSgK")}, 0, 3))
+{indent}{name("tVsV")}, {name("tVgV")} = cute_cpasync_flash.tma_partition(
+{indent}    _flash_tma_v, 0, cute.make_layout(1),
+{indent}    cute.group_modes(sV, 0, 3), cute.group_modes({name("tOgV")}, 0, 3))
+"""
+
+
+class _EarlyItemViews(NamedTuple):
+    """What warp 0's pre-sync copies of a CTA's first work item read
+    (``cute_flash_early_prologue_loads``): ``setup`` are the statements under
+    the warp guard that bind the item's views (the copies follow them);
+    ``q0`` / ``q1`` are the two query tiles' sources, ``k`` / ``v`` the
+    item's K / V views (indexed by the KV tile) and ``smem_*`` the
+    shared-memory partitions the copies fill."""
+
+    setup: str
+    q0: str
+    q1: str
+    k: str
+    v: str
+    smem_q: str
+    smem_k: str
+    smem_v: str
+
+
+def _flash_fa4_early_item_views(ctx: FlashBodyContext) -> _EarlyItemViews:
+    """The first work item's views for warp 0's pre-sync loads.
+
+    The one-item grid decoded its item and sliced its views in the setup
+    every warp runs: the copies read those.  A persistent CTA's roles decode
+    their items inside their own loops, so warp 0 decodes the first one here
+    (the CTA's block index, by the decode the loops start from) under its own
+    names: the views are tensors, and a name a role binds again later would
+    have to merge with this warp's.  Every CTA has a first item: the
+    launcher caps the persistent grid at the work item count."""
+    if not ctx.persistent:
+        return _EarlyItemViews(
+            setup="",
+            q0=f"{ctx.load_q0_view}[None, flash_q_mma_tile0]",
+            q1=f"{ctx.load_q1_view}[None, flash_q_mma_tile1]",
+            k="tKgK",
+            v="tVgV",
+            smem_q="tQsQ",
+            smem_k="tKsK",
+            smem_v="tVsV",
+        )
+    assert not ctx.causal_head_pair
+    m_pair_expr, bh_expr = _flash_power2_decode_exprs(
+        "flash_early_tile_id", ctx.num_m_pairs
+    ) or (
+        f"flash_early_tile_id % {ctx.num_m_pairs}",
+        f"flash_early_tile_id // {ctx.num_m_pairs}",
+    )
+    kv_bh = _flash_kv_bh_expr(ctx.kv_group, "flash_early_bh")
+    decode = f"""    flash_early_tile_id = cutlass.Int32(cute.arch.block_idx()[0])
+    flash_early_m_pair = {m_pair_expr}
+    flash_early_bh = {bh_expr}
+"""
+    if ctx.use_local_tma_partition:
+        return _EarlyItemViews(
+            setup=decode
+            + _flash_fa4_local_tma_views(
+                ctx,
+                "    ",
+                "_flash_mQt[None, None, flash_early_bh]",
+                f"_flash_mKt[None, None, {kv_bh}]",
+                f"_flash_mVt[None, None, {kv_bh}]",
+                "flash_early_m_pair",
+                early=True,
+            ),
+            q0="flash_early_tQgQ[None, 0]",
+            q1="flash_early_tQgQ[None, 1]",
+            k="flash_early_tKgK",
+            v="flash_early_tVgV",
+            smem_q="flash_early_tQsQ",
+            smem_k="flash_early_tKsK",
+            smem_v="flash_early_tVsV",
+        )
+    return _EarlyItemViews(
+        setup=decode
+        + f"""    flash_early_tQgQ = tQgQ_qdl[None, None, 0, flash_early_bh]
+    flash_early_tKgK = tKgK_kdl[None, None, 0, {kv_bh}]
+    flash_early_tVgV = tVgV_dkl[None, 0, None, {kv_bh}]
+""",
+        q0="flash_early_tQgQ[None, flash_early_m_pair * 2]",
+        q1="flash_early_tQgQ[None, flash_early_m_pair * 2 + 1]",
+        k="flash_early_tKgK",
+        v="flash_early_tVgV",
+        smem_q="tQsQ",
+        smem_k="tKsK",
+        smem_v="tVsV",
+    )
 
 
 def _flash_fa4_load_prologue_for_order(
@@ -23299,28 +23443,9 @@ def emit_load_role(ctx: FlashBodyContext) -> str:
             load_mq_cur = "_flash_mQt[None, None, flash_bh]"
             load_mk_cur = f"_flash_mKt[None, None, {ctx.kv_bh}]"
             load_mv_cur = f"_flash_mVt[None, None, {ctx.kv_bh}]"
-        local_load_tma_block = f"""        flash_mQ_cur = {load_mq_cur}
-        flash_mK_cur = {load_mk_cur}
-        flash_mV_cur = {load_mv_cur}
-        flash_gQ_pair = cute.local_tile(
-            flash_mQ_cur, ({ctx.mma_m * ctx.q_stage}, {ctx.hd}), (flash_m_pair, 0))
-        flash_gQ_pair = _helion_flash_rt.select(
-            cute.flat_divide(flash_gQ_pair, ({ctx.mma_m},)), mode=[0, 2, 1])
-        flash_gK = cute.local_tile(flash_mK_cur, ({ctx.kv_n}, {ctx.hd}), (None, 0))
-        flash_gV = cute.local_tile(flash_mV_cur, ({ctx.hd_v}, {ctx.kv_n}), (0, None))
-        tSgQ = flash_qkt.partition_A(flash_gQ_pair)
-        tSgK = flash_qkt.partition_B(flash_gK)
-        tOgV = flash_pvt.partition_B(flash_gV)
-        tQsQ, tQgQ = cute_cpasync_flash.tma_partition(
-            _flash_tma_q, 0, cute.make_layout(1),
-            cute.group_modes(sQ, 0, 3), cute.group_modes(tSgQ, 0, 3))
-        tKsK, tKgK = cute_cpasync_flash.tma_partition(
-            _flash_tma_k, 0, cute.make_layout(1),
-            cute.group_modes(sK, 0, 3), cute.group_modes(tSgK, 0, 3))
-        tVsV, tVgV = cute_cpasync_flash.tma_partition(
-            _flash_tma_v, 0, cute.make_layout(1),
-            cute.group_modes(sV, 0, 3), cute.group_modes(tOgV, 0, 3))
-"""
+        local_load_tma_block = _flash_fa4_local_tma_views(
+            ctx, "        ", load_mq_cur, load_mk_cur, load_mv_cur, "flash_m_pair"
+        )
         load_prelude_mode = "decode"
     else:
         local_load_tma_block = ""
@@ -23379,15 +23504,36 @@ def emit_load_role(ctx: FlashBodyContext) -> str:
     load_v0 = f"""        flash_kve = {load_v_prod}.acquire_and_advance()
         cute.copy(_flash_tma_v, tVgV[None, {load_first_kv}], {v_load_slot},
                   tma_bar_ptr=flash_kve.barrier)"""
+    early_item_done = ""
     if ctx.early_prologue_loads:
         # Warp 0 issued these copies before the prologue sync; the load warp
         # only arms the barriers (acquire_and_advance posts arrive.expect_tx).
         assert load_first_kv == (
             f"{ctx.kv_loop_bound} - cutlass.Int32(1)" if ctx.desc_kv else "0"
         )
-        load_q0, load_q1, load_k0, load_v0 = (
-            text.split("\n")[0] for text in (load_q0, load_q1, load_k0, load_v0)
-        )
+        if ctx.persistent:
+            # ... for the CTA's first work item: the load warp issues the
+            # copies of every later item behind its acquire as usual.
+            load_head += "\n    flash_load_later = cutlass.Boolean(False)"
+            early_item_done = "\n        flash_load_later = cutlass.Boolean(True)"
+
+            def _later_items_only(text: str) -> str:
+                acquire, *copy = text.split("\n")
+                return "\n".join(
+                    [
+                        acquire,
+                        "        if flash_load_later:",
+                        *(f"    {line}" for line in copy),
+                    ]
+                )
+
+            load_q0, load_q1, load_k0, load_v0 = (
+                _later_items_only(text) for text in (load_q0, load_q1, load_k0, load_v0)
+            )
+        else:
+            load_q0, load_q1, load_k0, load_v0 = (
+                text.split("\n")[0] for text in (load_q0, load_q1, load_k0, load_v0)
+            )
     if ctx.staged_first_load:
         # First work item only: hold Q1/V0 (and the K/V ring behind them) until
         # the MMA warp has seen K0 and Q0 land, so the kernel-start HBM burst is
@@ -23400,8 +23546,11 @@ def emit_load_role(ctx: FlashBodyContext) -> str:
 """
     else:
         staged_wait = ""
-    load_prologue = _flash_fa4_load_prologue_for_order(
-        ctx.cfg.first_load_order, load_q0, load_k0, load_q1, load_v0, staged_wait
+    load_prologue = (
+        _flash_fa4_load_prologue_for_order(
+            ctx.cfg.first_load_order, load_q0, load_k0, load_q1, load_v0, staged_wait
+        )
+        + early_item_done
     )
     # The staged bias's boxes follow each step's K/V copies: the first tile's
     # after the prologue (behind the first score tile's bytes), the next
@@ -25482,14 +25631,13 @@ def emit_flash_fa4_device_body(
     ctx.early_prologue_loads = ctx.cfg.early_prologue_loads
     if ctx.early_prologue_loads:
         assert not (
-            ctx.persistent
-            or ctx.pruned_interval
+            ctx.pruned_interval
             or ctx.list_walk
+            or ctx.flex_body
             or ctx.use_2cta_instrs
             or ctx.use_cga2_local_cta
             or ctx.use_clc_scheduler
             or ctx.separate_kv_rings
-            or ctx.use_local_tma_partition
             or ctx.use_tensor_4d_tma
             or ctx.segment_tiling
             or ctx.uneven_kv_ring
@@ -26402,20 +26550,21 @@ flash_pvt = _flash_pv_mma.get_slice(flash_mma_tile_coord_v)
         early_first_kv = (
             f"{ctx.kv_loop_bound} - cutlass.Int32(1)" if ctx.desc_kv else "0"
         )
+        early = _flash_fa4_early_item_views(ctx)
         early_q0 = (
-            f"    cute.copy(_flash_tma_q, {ctx.load_q0_view}[None, flash_q_mma_tile0], tQsQ[None, 0],\n"
+            f"    cute.copy(_flash_tma_q, {early.q0}, {early.smem_q}[None, 0],\n"
             "              tma_bar_ptr=storage.q_mbar_ptr.data_ptr() + 0)"
         )
         early_q1 = (
-            f"    cute.copy(_flash_tma_q, {ctx.load_q1_view}[None, flash_q_mma_tile1], tQsQ[None, 1],\n"
+            f"    cute.copy(_flash_tma_q, {early.q1}, {early.smem_q}[None, 1],\n"
             "              tma_bar_ptr=storage.q_mbar_ptr.data_ptr() + 1)"
         )
         early_k0 = (
-            f"    cute.copy(_flash_tma_k, tKgK[None, {early_first_kv}], tKsK[None, 0],\n"
+            f"    cute.copy(_flash_tma_k, {early.k}[None, {early_first_kv}], {early.smem_k}[None, 0],\n"
             "              tma_bar_ptr=storage.kv_mbar_ptr.data_ptr() + 0)"
         )
         early_v0 = (
-            f"    cute.copy(_flash_tma_v, tVgV[None, {early_first_kv}], tVsV[None, 1],\n"
+            f"    cute.copy(_flash_tma_v, {early.v}[None, {early_first_kv}], {early.smem_v}[None, 1],\n"
             "              tma_bar_ptr=storage.kv_mbar_ptr.data_ptr() + 1)"
         )
         early_prologue_load_block = (
@@ -26423,6 +26572,7 @@ flash_pvt = _flash_pv_mma.get_slice(flash_mma_tile_coord_v)
             "# pipeline mbarriers) issues the first work item's Q0/Q1/K/V copies\n"
             "# against the full barriers; the load warp arms them afterwards.\n"
             "if warp_idx == 0:\n"
+            + early.setup
             + _flash_fa4_load_prologue_for_order(
                 ctx.cfg.first_load_order, early_q0, early_k0, early_q1, early_v0
             )
