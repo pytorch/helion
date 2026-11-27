@@ -9,6 +9,14 @@ compute/conversion/control threads 128/64/32 registers. Keep each quota call
 inside its role branch: the vendor compiler rejected a join placed directly
 after divergent quota changes. The scoped schedule requires two resident CTAs
 so the entry budget is below the compute quota and above the donor quotas.
+
+A parity wait cannot tell a phase from the one two later, so each barrier
+several warps wait on advances only after all of them arrived somewhere that
+follows their wait: the converters release the raw ring and publish K and V
+with four arrivals, the compute warps release the scores with four arrivals
+and meet at the softmax's 128-thread barriers before the next PV. The value
+barrier's next phase needs just the PV commit, so the issuing compute warp
+waits on it alone; the other three wait for that PV only.
 """
 
 from __future__ import annotations
@@ -269,9 +277,11 @@ def paged_attention_partial_body(
                 prims.tcgen05_wait(kind=prims.Tcgen05Wait.STORE)
                 prims.tcgen05_fence(prims.Tcgen05Fence.BEFORE_THREAD_SYNC)
                 cute.arch.barrier(barrier_id=2, number_of_threads=128)
-            mbar_wait(value_ready, step & 1)
-            prims.tcgen05_fence(prims.Tcgen05Fence.AFTER_THREAD_SYNC)
             if warp == 0:
+                # Only the PV issuer waits for V: its commit alone lets the
+                # converters stage the next V and complete the next phase.
+                mbar_wait(value_ready, step & 1)
+                prims.tcgen05_fence(prims.Tcgen05Fence.AFTER_THREAD_SYNC)
                 mma_128xnx128(
                     base + 64,
                     base + 192,

@@ -3,6 +3,14 @@
 Four compute warps own the online recurrence. Two groups of four conversion
 warps consume raw K/V TMA rings and write disjoint TMEM panels; the last warp
 owns tensor-map loads. Local barriers protect raw and converted slot reuse.
+
+A parity wait cannot tell a phase from the one two later, so each barrier
+several warps wait on advances only after all of them arrived somewhere that
+follows their wait (the raw ring's eight releases, the converters' four
+publications, the softmax's 128-thread barriers before the next issue). The
+key and value barriers' next phases need just the issuer's QK or PV commit, so
+the issuing compute warp waits on them alone; the other three wait for the
+issued MMA only.
 """
 
 from __future__ import annotations
@@ -138,9 +146,10 @@ def paged_attention_body(
         cute.arch.barrier(barrier_id=2, number_of_threads=128)
         prims.tcgen05_fence(prims.Tcgen05Fence.AFTER_THREAD_SYNC)
         for step in cutlass.range(count):
-            mbar_wait(key_ready, step & 1)
-            prims.tcgen05_fence(prims.Tcgen05Fence.AFTER_THREAD_SYNC)
             if warp == 0:
+                # Only the issuer waits for K or V (module docstring).
+                mbar_wait(key_ready, step & 1)
+                prims.tcgen05_fence(prims.Tcgen05Fence.AFTER_THREAD_SYNC)
                 mma_128x64x128(base, base + 128, shared_q.iterator, qk_done, False)
                 if prims.elect_sync():
                     prims.tcgen05_commit(key_free, group=prims.CTAGroup.CTA_1)
@@ -177,9 +186,9 @@ def paged_attention_body(
             prims.tcgen05_wait(kind=prims.Tcgen05Wait.STORE)
             prims.tcgen05_fence(prims.Tcgen05Fence.BEFORE_THREAD_SYNC)
             cute.arch.barrier(barrier_id=2, number_of_threads=128)
-            mbar_wait(value_ready, step & 1)
-            prims.tcgen05_fence(prims.Tcgen05Fence.AFTER_THREAD_SYNC)
             if warp == 0:
+                mbar_wait(value_ready, step & 1)
+                prims.tcgen05_fence(prims.Tcgen05Fence.AFTER_THREAD_SYNC)
                 mma_128x64x128(
                     base + 64, base + 192, probability.iterator, pv_done, True
                 )

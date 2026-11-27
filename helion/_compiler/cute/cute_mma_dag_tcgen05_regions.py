@@ -4060,7 +4060,17 @@ class Tcgen05RegionMmaDagEmitter(Tcgen05MmaDagEmitter):
                 else None
             )
             if self.has_passes(tiles):
-                self.emit_passes(tiles, "0", wait, "md_tidx", self.plan.threads)
+                waited = self.emit_passes(
+                    tiles, "0", wait, "md_tidx", self.plan.threads
+                )
+                if wait is not None and not waited:
+                    # No pass rewrites what the frame's TMA delivered, so
+                    # the passes did not wait for it: a tile it delivers
+                    # directly (beside a tile the threads write themselves)
+                    # is still in flight. Every thread waits for it here,
+                    # behind the passes, which the TMA overlaps, and ahead
+                    # of the barrier that publishes the tiles as settled.
+                    self.emit(wait)
                 passes = True
             elif wait is not None:
                 self.emit(wait)

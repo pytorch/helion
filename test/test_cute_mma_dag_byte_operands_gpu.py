@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 from unittest.mock import patch
 
 import pytest
@@ -71,6 +72,84 @@ def test_byte_operand_numerics(
         reference = other.cpu().float()
         expected = (reference @ values if byte_rhs else values @ reference) * 2
         torch.testing.assert_close(actual.cpu(), expected, rtol=0, atol=0)
+
+
+# The stress below queues its launches in batches until the clock or the
+# batch count stops it.
+_STRESS_BATCH = 128
+_STRESS_SECONDS = 3.0
+_STRESS_MAX_BATCHES = 64
+
+
+@pytest.mark.slow
+@skipIfNotCUDA()
+@skipIfCudaCapabilityLessThan((8, 0))
+def test_byte_operand_launches_queued_back_to_back() -> None:
+    """The tcgen05 kernel of ``test_byte_operand_numerics`` whose bf16
+    operand comes by TMA beside a byte operand the threads load themselves,
+    launched back to back for a few seconds with other work queued between
+    the launches, over four sets of inputs.
+
+    That kernel once issued its first batch without waiting for the TMA
+    load, and a launch then read the operand's tile before it had landed:
+    whole output rows held one of the kernel's two accumulations or stale
+    products. It took a device shared with other processes to see it (about
+    one launch in 15,000 with 22 processes launching this kernel), which a
+    lane's other workers provide and a run of this test alone mostly does
+    not. The source test in ``test_cute_mma_dag_byte_operands.py`` pins the
+    wait; this one runs the kernel where the race was."""
+    require_byte_mma_mode("tcgen05")
+    dtype, output_dtype, offset = torch.int8, torch.bfloat16, 1
+    base = torch.arange(64 * 80).reshape(64, 80)
+    cases = []
+    for variant in range(4):
+        values = base if variant == 0 else base * (6 * variant + 1) + 91 * variant
+        storage = (values % 256).to(dtype).to(DEVICE)
+        byte = storage[:, offset : offset + 64]
+        other = torch.eye(64, dtype=output_dtype).roll(3 * variant, 1)
+        halves = (byte.cpu().float() * 0.5).to(output_dtype).float()
+        expected = (other.float() @ halves) * 2
+        cases.append(
+            ((other.to(DEVICE), byte, True, False, False), expected.to(DEVICE))
+        )
+    bound = helion.kernel(byte_matmul, backend="cute", static_shapes=True).bind(
+        cases[0][0]
+    )
+    with bound.env:
+        config = bound.config_spec.normalized_config(
+            helion.Config(
+                block_sizes=[64],
+                cute_mma_dag="tcgen05",
+                cute_mma_dag_warps=4,
+                cute_mma_dag_stages=1,
+            )
+        )
+    compiled = bound.compile_config(config)
+    # Queued behind every launch, so the process's work on the device never
+    # drains between two of them.
+    filler = torch.zeros(16 << 20, dtype=torch.uint8, device=DEVICE)
+    wrong: list[tuple[int, list[int]]] = []
+    launches = 0
+    deadline = time.monotonic() + _STRESS_SECONDS
+    for batch in range(_STRESS_MAX_BATCHES):
+        outputs = []
+        for index in range(_STRESS_BATCH):
+            outputs.append(compiled(*cases[(batch + index) % 4][0]))
+            filler.add_(1)
+        actual = torch.stack(outputs)
+        expected = torch.stack(
+            [cases[(batch + index) % 4][1] for index in range(_STRESS_BATCH)]
+        )
+        differs = (actual != expected).flatten(1).any(1)
+        for index in differs.nonzero().flatten().tolist():
+            rows = (actual[index] != expected[index]).any(1).nonzero().flatten()
+            wrong.append((launches + index, rows.tolist()))
+        launches += _STRESS_BATCH
+        if time.monotonic() >= deadline:
+            break
+    assert not wrong, (
+        f"{len(wrong)} of {launches} launches wrong; first (launch, rows): {wrong[:3]}"
+    )
 
 
 @skipIfNotCUDA()
