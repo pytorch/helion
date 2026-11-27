@@ -2370,10 +2370,12 @@ def _attention_kv_tile_count(kv_block_id: int) -> int | None:
     """The 128-row KV tile count of the KV loop's block (None unless static).
 
     Counted at the default ``cute_flash_kv_tile_n`` whatever width a config
-    picks: the fp8 parity gate (``flash_operand_facts_lowered``) runs on this
-    count, and the other searched width (160 rows) is offered only to extents
-    it divides, so with an even 128-row count (``seq % 256 == 0``) that
-    extent is a multiple of 1280 and its 160-row count is even too.
+    picks: the fp8 gate (``flash_operand_facts_lowered``) needs this count
+    and the family that hosts fp8 reads its parity, beside the value width
+    and the score plan (``flash_fp8_pipeline_family``). The parity is that
+    of the square sequence's 128-row query tiles, which the pair body takes
+    two at a time (``seq % 256 == 0``); the other KV width a config can pick
+    (160 rows, on the pair body) leaves the query tiles as they are.
     """
     from ...compile_environment import CompileEnvironment
 
@@ -2392,13 +2394,13 @@ def _attention_pattern_fits_root(
     """Whether a matched attention body may lower to a fused flash body under
     the root ``root_block_ids``: its operand facts have a body
     (``cute_flash.flash_operand_facts_lowered``, which for fp8 operands also
-    needs the KV loop's tile count, read from ``kv_block_id``) and, in the
-    2-D form, the K/V loads' scalar batch block is the root batch block the
-    Q tile is read at (the 3-D form ties them through the Q tile's leading
-    dim). The flattened-rows form tiles its rows on a one-axis root, which
-    its K/V offset is taken from; the other forms read the Q tile under a
-    (batch, query) root. Shared by the search surface and the codegen
-    detector so the two never diverge.
+    needs the KV loop's tile count, read from ``kv_block_id``, and the Q/K
+    width) and, in the 2-D form, the K/V loads' scalar batch block is the
+    root batch block the Q tile is read at (the 3-D form ties them through
+    the Q tile's leading dim). The flattened-rows form tiles its rows on a
+    one-axis root, which its K/V offset is taken from; the other forms read
+    the Q tile under a (batch, query) root. Shared by the search surface and
+    the codegen detector so the two never diverge.
     """
     from ..cute_flash import flash_operand_facts_lowered
 
@@ -2407,6 +2409,7 @@ def _attention_pattern_fits_root(
         v_k_major=pattern.v_k_major,
         score_rank=pattern.score_rank,
         num_kv=None if kv_block_id is None else _attention_kv_tile_count(kv_block_id),
+        head_dim=pattern.score_plan.head_dim,
     ):
         return False
     if (pattern.flattened is not None) != (len(root_block_ids) == 1):
@@ -2584,6 +2587,45 @@ def _attention_row_bound_sentinel_start(
     return starts is not None and any(start.m != -math.inf for start in starts)
 
 
+def _attention_fp8_sentinel_start(
+    pattern: AttentionSoftmaxPattern,
+    graphs: Iterable[GraphInfo],
+    kv_graph_id: int,
+    num_kv: int,
+) -> bool:
+    """Whether fp8 operands on the single-tile family start their running
+    max from a finite sentinel (a start ``_attention_loop_starts_fused``
+    admits).
+
+    The family does not take such a kernel. It hosts the fp8 geometries the
+    fa4 pair does not fit (``cute_flash.flash_fp8_pipeline_family``) for
+    kernels that start from ``-inf``; under a sentinel start it would compute
+    what the known gap describes (``KNOWN_GAPS.md``,
+    cute-flash-sentinel-start-taken-for-minus-inf) for kernels that never
+    compiled on it: a runtime scale puts the scores of fp8 operands below
+    any sentinel. fp8 runs on one family per geometry whatever a config asks
+    for, so the kernel keeps the generic lowering (the search surface and
+    the codegen detector decline together). The fa4 pair takes the kernel
+    as it did."""
+    from ..cute_flash import flash_fp8_pipeline_family
+
+    if pattern.io_dtype is not torch.float8_e4m3fn:
+        return False
+    plan = pattern.score_plan
+    if (
+        flash_fp8_pipeline_family(
+            num_kv,
+            plan.head_dim,
+            plan.head_dim_v,
+            requires_ws_overlap=plan.requires_ws_overlap,
+        )
+        == "fa4"
+    ):
+        return False
+    starts = _attention_loop_start_values(pattern, graphs, kv_graph_id)
+    return starts is not None and any(start.m != -math.inf for start in starts)
+
+
 class _AttentionGeometry(NamedTuple):
     num_bh: int
     q_seq: int
@@ -2667,10 +2709,11 @@ def detect_flash_search_surface(device_ir: DeviceIR) -> FlashSearchSurface | Non
         )
         if pattern is None:
             continue
-        # Operand facts no fused body hosts (fp8 operands on an odd KV tile
-        # count or with the canonical V) or a K/V batch index off the root:
-        # the generic lowering keeps the kernel, the codegen detector
-        # (``_attention_loop_shape``) declines the same way.
+        # Operand facts no fused body hosts (fp8 operands on a KV tile count
+        # that is not static, or of a width the fp8 MMA does not tile) or a
+        # K/V batch index off the root: the generic lowering keeps the kernel,
+        # the codegen detector (``_attention_loop_shape``) declines the same
+        # way.
         if not _attention_pattern_fits_root(
             pattern, root_grid_ids, kv_block_id=block_ids[0]
         ):
@@ -2740,6 +2783,11 @@ def detect_flash_search_surface(device_ir: DeviceIR) -> FlashSearchSurface | Non
         # take a per-row KV bound over a sentinel start.
         if num_kv == 1 and _attention_row_bound_sentinel_start(
             pattern, device_ir.graphs, graph_info.graph_id
+        ):
+            continue
+        # The single-tile family takes fp8 operands from a ``-inf`` start.
+        if _attention_fp8_sentinel_start(
+            pattern, device_ir.graphs, graph_info.graph_id, num_kv
         ):
             continue
         block_size_targets = _attention_flash_block_size_targets(

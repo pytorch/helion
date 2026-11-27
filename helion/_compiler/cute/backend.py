@@ -54,6 +54,7 @@ from ..backend import _largest_divisor_at_most
 from ..backend import log
 from .analysis.attention_match import _attention_flash_gate_enabled
 from .analysis.attention_match import _attention_flash_supported
+from .analysis.attention_match import _attention_fp8_sentinel_start
 from .analysis.attention_match import _attention_loop_starts_fused
 from .analysis.attention_match import _attention_pattern_fits_root
 from .analysis.attention_match import _attention_pattern_geometry
@@ -1071,10 +1072,11 @@ def _attention_loop_shape(
     )
     if pattern is None:
         return None
-    # Operand facts without a fused body (fp8 operands on an odd KV tile count
-    # or with the canonical V), a K/V batch index off the root or statistics
-    # whose start the fused bodies do not reproduce keep the generic lowering;
-    # the search surface declines them the same way.
+    # Operand facts without a fused body (fp8 operands on a KV tile count
+    # that is not static, or of a width the fp8 MMA does not tile), a K/V
+    # batch index off the root or statistics whose start the fused bodies do
+    # not reproduce keep the generic lowering; the search surface declines
+    # them the same way.
     if not _attention_pattern_fits_root(
         pattern, root_grid_ids, kv_block_id=block_ids[0]
     ) or not _attention_loop_starts_fused(
@@ -1111,6 +1113,15 @@ def _attention_loop_shape(
         pattern, fn.codegen.codegen_graphs, graph_info.graph_id
     )
     if row_bound_sentinel_start and geometry.kv_seq == 128:
+        return None
+    # Nor do fp8 operands over a sentinel start on the single-tile family,
+    # the one family their geometry runs on.
+    if _attention_fp8_sentinel_start(
+        pattern,
+        fn.codegen.codegen_graphs,
+        graph_info.graph_id,
+        geometry.kv_seq // 128,
+    ):
         return None
     # The flash kernel emits its OWN (batch*head, query-tile) program mapping; it
     # is only valid for the default flat pid with no L2 reordering. Persistent /

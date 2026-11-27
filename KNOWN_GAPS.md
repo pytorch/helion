@@ -796,7 +796,11 @@ these labelled lines.
     `k = -(2**16)` and `v = 1`: every score is about -5e10. Eager stores
     0 (`m` stays at the sentinel, `p = exp2(score - m)` is 0, and
     `acc / l` is `0 / 1`); the fused body stores 1, the softmax of equal
-    scores.
+    scores. (fp8 operands reach such scores under a runtime scale. The fa4
+    body, which an even KV tile count takes, takes them from a sentinel
+    start as on `main`; the single-tile family, which takes the other fp8
+    geometries, declines fp8 operands over a sentinel start,
+    `_attention_fp8_sentinel_start`.)
   - The LSE of a row that sees no key.
     `cute_row_kv_begin_mask_attention_with_lse` of
     `test/test_cute_backend.py` with its running max started at `-1e30`,

@@ -444,16 +444,21 @@ def _flash_flex_graph_output_plan_from_graphs(
 
 def _flash_supported_io_dtype(dtype: torch.dtype) -> bool:
     """Q/K/V/O dtypes every fused flash family lowers (the 16-bit operands);
-    fp8 runs on the plain fa4 pair body alone (``flash_operand_facts_lowered``
-    and the resolver's family pin)."""
+    fp8 runs on the plain fa4 pair body and, where the pair does not fit, on
+    the plain single-tile bodies (``flash_operand_facts_lowered`` and the
+    resolver's family pin)."""
     return dtype in (torch.float16, torch.bfloat16)
 
 
 # Operand dtypes the attention matcher records on its pattern: the 16-bit
 # pair every family hosts plus fp8 (e4m3), whose tcgen05 route
-# (``kind::f8f6f4``, MMA-K 32, an 8-bit TMEM P) the fa4 pair body hosts.
+# (``kind::f8f6f4``, MMA-K 32, an 8-bit TMEM P) the fa4 pair body and the
+# plain single-tile bodies host.
 # ``flash_operand_facts_lowered`` is the gate between the two sets.
 FLASH_MATCHED_IO_DTYPES = (torch.float16, torch.bfloat16, torch.float8_e4m3fn)
+# The K step of the fp8 QK MMA: 32 elements where the 16-bit MMAs step 16
+# (``FLASH_HEAD_DIM_STEP``), so an fp8 Q/K width is a multiple of 32.
+FLASH_FP8_MMA_K = 32
 
 
 def flash_operand_facts_lowered(
@@ -462,6 +467,7 @@ def flash_operand_facts_lowered(
     v_k_major: bool = False,
     score_rank: int = 3,
     num_kv: int | None = None,
+    head_dim: int | None = None,
 ) -> bool:
     """Whether a fused flash body hosts the matched operand facts.
 
@@ -472,17 +478,53 @@ def flash_operand_facts_lowered(
     descriptor, from that) over the 3-D ``bmm`` root (``q[tile_b, tile_m,
     :]``) or the 2-D ``hl.dot`` root (a scalar batch-head index; the
     emitters index programs by root block, not FX node). fp8 (e4m3) operands
-    run on the fa4 pair body alone (``kind::f8f6f4`` MMAs, an 8-bit TMEM P,
-    byte-sized TMA boxes), so they need an even KV tile count (``num_kv``;
-    None declines). The search surface and the codegen detector consult
-    this gate together, so a fact without a body keeps the generic lowering
-    on both.
+    (``kind::f8f6f4`` MMAs, an 8-bit TMEM P, byte-sized TMA boxes) run on
+    the plain fa4 pair body where it fits and on the plain single-tile
+    bodies elsewhere (``flash_fp8_pipeline_family``, which reads the KV tile
+    count beside the value width and the score plan), so they need a static
+    KV tile count (``num_kv``; None declines) and a Q/K width the fp8 QK MMA
+    tiles (``head_dim``, a multiple of ``FLASH_FP8_MMA_K``; None declines):
+    the 16-bit MMAs step 16 elements, which is the step the head-dim check
+    (``attention_plan.flash_head_dim_supported``) admits. The search
+    surface and the codegen detector consult this gate together, so a fact
+    without a body keeps the generic lowering on both.
     """
     if _flash_supported_io_dtype(io_dtype):
         return True
     if io_dtype is torch.float8_e4m3fn:
-        return num_kv is not None and num_kv % 2 == 0
+        return (
+            num_kv is not None
+            and head_dim is not None
+            and head_dim % FLASH_FP8_MMA_K == 0
+        )
     return False
+
+
+def flash_fp8_pipeline_family(
+    num_kv: int,
+    head_dim: int,
+    head_dim_v: int | None = None,
+    *,
+    requires_ws_overlap: bool = False,
+) -> str:
+    """The one pipeline family that hosts fp8 (e4m3) operands at a geometry:
+    the plain fa4 pair where it fits (an even KV tile count for its two
+    128-row query tiles of the square sequence, a value width its two
+    output accumulators hold: ``flash_pair_head_dims_supported``, and a
+    score plan the pair body walks: a ``requires_ws_overlap`` plan prunes its
+    KV tiles by the single-tile body's per-tile predicate), else the plain
+    single-tile family, as for 16-bit operands. Every other family is
+    written and verified for 16-bit operands. The single-tile family takes
+    fp8 operands from a running max that starts at ``-inf``
+    (``attention_match._attention_fp8_sentinel_start``)."""
+    pair_fits = (
+        num_kv % 2 == 0
+        and not requires_ws_overlap
+        and flash_pair_head_dims_supported(
+            head_dim, head_dim if head_dim_v is None else head_dim_v
+        )
+    )
+    return "fa4" if pair_fits else "ws_overlap"
 
 
 def _flash_io_dtype_str(dtype: torch.dtype) -> str:
@@ -5004,10 +5046,18 @@ def flash_config_from_facts(
         # requested family, env override or legacy topology key.
         requested_family_flags = _flash_pipeline_family_flags("fa4")
     if dtype is torch.float8_e4m3fn:
-        # fp8 operands run on the plain fa4 pair body alone (``kind::f8f6f4``
-        # MMAs over an 8-bit TMEM P, byte-sized TMA boxes); every other
-        # family is written and verified for 16-bit operands.
-        requested_family_flags = _flash_pipeline_family_flags("fa4")
+        # fp8 operands (``kind::f8f6f4`` MMAs over an 8-bit TMEM P,
+        # byte-sized TMA boxes) run on one plain family per geometry
+        # whatever was requested: the fa4 pair, or the single-tile bodies
+        # where the pair does not fit.
+        requested_family_flags = _flash_pipeline_family_flags(
+            flash_fp8_pipeline_family(
+                num_kv,
+                head_dim,
+                head_dim_v,
+                requires_ws_overlap=requires_ws_overlap,
+            )
+        )
     if has_list_walk:
         # The BlockMask list walk is written for the plain fa4 pair body
         # (per-stage tile status over the union of two 128-row lists) and
@@ -6394,7 +6444,7 @@ def flash_config_from_facts(
     # 64-row query tiles: only the flat, staged, dense two-warpgroup ws_overlap
     # body has the two-rows-per-thread softmax/epilogue math, and only for
     # plain rows (score modifiers and fused row epilogues index rows by
-    # 128-row tiles, one row per thread).
+    # 128-row tiles, one row per thread) of 16-bit operands.
     q_tile_m = int(_flash_env_get("HELION_CUTE_FLASH_Q_TILE_M", "128"))
     q_tile_m_cfg = _cfg(FLASH_Q_TILE_M_KEY)
     if q_tile_m_cfg is not None:
@@ -6410,6 +6460,7 @@ def flash_config_from_facts(
         has_kv_tile_pruning=has_kv_tile_pruning,
         small_biased_candidate=small_biased_candidate,
         plain_row_body=plain_row_body,
+        dtype=dtype,
     ):
         q_tile_m = 128
     if topology == "ws_overlap" and num_kv >= 2 and not separate_kv_rings:
@@ -7515,10 +7566,14 @@ def _flash_q_tile_m64_supported(
     has_kv_tile_pruning: bool,
     small_biased_candidate: bool,
     plain_row_body: bool,
+    dtype: torch.dtype,
 ) -> bool:
-    """Whether the 64-row query tile is legal for this schedule and body."""
+    """Whether the 64-row query tile is legal for this schedule and body.
+    Its P store hands each thread two rows of 16-bit elements, so fp8
+    operands keep the 128-row tile."""
     return (
         plain_row_body
+        and _flash_supported_io_dtype(dtype)
         and topology == "ws_overlap"
         and s_stage == 2
         and not persistent
@@ -10515,9 +10570,11 @@ def flash_fragments_from_facts(
         # instead of surviving as uncoverable structural rows.
         pipeline_family_override = "fa4"
     if dtype is torch.float8_e4m3fn:
-        # fp8 operands likewise run on the plain fa4 family alone (the
-        # resolver pins it); the surface is the pinned-fa4 surface.
-        pipeline_family_override = "fa4"
+        # fp8 operands likewise run on one plain family per geometry (the
+        # resolver pins it): the surface is that family's pinned surface.
+        pipeline_family_override = flash_fp8_pipeline_family(
+            num_kv, head_dim, head_dim_v, requires_ws_overlap=requires_ws_overlap
+        )
         topology_override = None
     valid_topology = (
         topology_override

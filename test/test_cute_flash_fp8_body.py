@@ -3,9 +3,12 @@
 CPU render pins of the fa4 body's per-dtype text (the ``kind::f8f6f4`` MMA
 arguments, the 8-bit TMEM P store repetition, the P stage stride, the V
 descriptor's major mode, the byte-sized shared storage and schedule specs)
-and GPU numerics of ``examples/fp8_attention.py`` (its promoted root, 4-D
-output and transposed view V) and of the 2-D ``hl.dot`` forms with a dense
-K-major V buffer on the pair and the alternating-warpgroup bodies.
+and of the single-tile bodies an odd KV tile count takes, and GPU numerics
+of ``examples/fp8_attention.py`` (its promoted root, 4-D output and
+transposed view V) on both families and of the 2-D ``hl.dot`` forms with a
+dense K-major V buffer on the pair, the single-tile and the
+alternating-warpgroup bodies. Everything but the ``cuda``-marked tests
+renders on the CPU.
 """
 
 from __future__ import annotations
@@ -23,6 +26,7 @@ pytest.importorskip("cutlass.cute")
 
 import helion
 from helion._compiler.cute import cute_flash
+from helion._compiler.cute.mma_support import get_cute_mma_support
 from helion._testing import DEVICE
 from helion._testing import EXAMPLES_DIR
 from helion._testing import import_path
@@ -34,7 +38,7 @@ from helion._testing.cute_flash_kernels import fp8_dot_attention_k_major
 import helion.language as hl
 from helion.runtime.kernel import Kernel
 
-pytestmark = skipUnlessBackends(["cute"])
+pytestmark = [pytest.mark.cpu_only, skipUnlessBackends(["cute"])]
 
 
 @helion.kernel(static_shapes=True, backend="cute")
@@ -191,6 +195,43 @@ def test_fp8_example_render_pins() -> None:
     assert "flash_reg0.load().to(cutlass.Float8E4M3FN)" in code
 
 
+def test_fp8_single_tile_render_pins() -> None:
+    """One 128-key tile (the suite's smallest input) and three: an odd count
+    takes the single-tile family, whose bodies spell every size, MMA and
+    store through the operand dtype (the host builds the two tiled MMAs from
+    the plan's dtype), so they host fp8 as they are."""
+    _, args = _example_args(1, 4, 128, 64)
+    code = _render(_example_kernel(), args)
+    assert "'kind': 'helion_flash'" in code
+    assert "'dtype': 'cutlass.Float8E4M3FN'" in code
+    # The one-warpgroup body: byte-sized storage and TMA transaction counts.
+    assert "flash_shared_storage(64, 1, dtype=cutlass.Float8E4M3FN)" in code
+    assert "cute.size_in_bytes(cutlass.Float8E4M3FN, cute.select(_flash_qsl" in code
+    assert "cute.size_in_bytes(cutlass.Float8E4M3FN, cute.select(_flash_vsl" in code
+    # Its MMAs are the tiled MMAs' own (no PTX issue helper to parametrize).
+    assert "cute.gemm(_flash_qk_mma, tStS, tSrQ[" in code
+    assert "cute.gemm(_flash_pv_mma, tOtO, tOrP[" in code
+    assert "_helion_flash_ptx." not in code and "mma_kind" not in code
+    # P is stored over the score tile at the operand width; the output store
+    # converts the rescaled fp32 tile to fp8.
+    assert (
+        "flash_tilePlikeFP32 = 128 // cutlass.Float32.width * cutlass.Float8E4M3FN.width"
+        in code
+    )
+    assert "tSTrS_e.store(tLDrS.load().to(cutlass.Float8E4M3FN))" in code
+    assert "flash_rego.store(flash_reg.load().to(cutlass.Float8E4M3FN))" in code
+    # Three tiles: the two-warpgroup body by default.
+    _, args = _example_args(1, 4, 384, 64)
+    code = _render(_example_kernel(), args)
+    assert "'dtype': 'cutlass.Float8E4M3FN'" in code and "'s_stage': 2" in code
+    assert "flash_shared_storage(64, 3, 2, cutlass.Float8E4M3FN" in code
+    assert (
+        "tOrP1 = cute.make_tensor(tOrP0.iterator + cutlass.Float32.width // "
+        "cutlass.Float8E4M3FN.width * 128, tOrP0.layout)" in code
+    )
+    assert "tSTrS_e.store(tLDrS.load().to(cutlass.Float8E4M3FN))" in code
+
+
 def test_fp8_k_major_storage_render_pins() -> None:
     """A dense ``[bh, d, s]`` V buffer: the K-major descriptor and plan key."""
     q, k, v = (torch.randn(4, 256, 64).to(torch.float8_e4m3fn) for _ in range(3))
@@ -199,6 +240,15 @@ def test_fp8_k_major_storage_render_pins() -> None:
     assert "smem_desc_base_from_tensor(sV, _helion_flash_ptx.Major.K)" in code
     assert "'v_k_major': True" in code
     assert "mma_kind='f8f6f4', a_width=8" in code
+    # One tile: the single-tile body has no descriptor helper to name the
+    # major mode; its host builds the PV MMA from the plan key.
+    q, k, v = (torch.randn(4, 128, 64).to(torch.float8_e4m3fn) for _ in range(3))
+    code = _render(
+        fp8_dot_attention_k_major, (q, k, v.transpose(1, 2).contiguous(), 1, 4)
+    )
+    assert "'v_k_major': True" in code
+    assert "flash_shared_storage(64, 1, dtype=cutlass.Float8E4M3FN)" in code
+    assert "_helion_flash_ptx." not in code
 
 
 def test_fp8_staged_output_render_pins() -> None:
@@ -297,8 +347,14 @@ def test_fp8_verified_schedule_sizes_tiles_by_element_render_pins() -> None:
 # ---------------------------------------------------------------------------
 # GPU numerics (sm100).
 # ---------------------------------------------------------------------------
-def _require_sm100() -> None:
-    if DEVICE.type != "cuda" or torch.cuda.get_device_capability()[0] < 10:
+def _require_sm100(dtype: torch.dtype = torch.float8_e4m3fn) -> None:
+    """Skip unless the device runs the fused tcgen05 flash bodies over
+    ``dtype`` operands: the flash gate asks for the 16-bit MMAs, an fp8 body
+    for the fp8 ones as well."""
+    support = get_cute_mma_support()
+    if not support.tcgen05_f16bf16 or (
+        dtype is torch.float8_e4m3fn and not support.tcgen05_f8
+    ):
         pytest.skip("the fused tcgen05 flash bodies need an sm100 device")
 
 
@@ -316,6 +372,7 @@ def _compile_default(
     return bound.compile_config(config), code
 
 
+@pytest.mark.cuda
 @pytest.mark.parametrize(
     ("batch", "heads", "seq", "head_dim"),
     [(2, 4, 256, 64), (1, 2, 256, 128)],
@@ -337,6 +394,44 @@ def test_fp8_example_matches_reference_on_gpu(
     torch.testing.assert_close(out.float(), sdpa.float(), atol=0.1, rtol=0.1)
 
 
+@pytest.mark.cuda
+@pytest.mark.parametrize(
+    ("seq", "head_dim", "overrides"),
+    [
+        (128, 64, {}),
+        (384, 64, {}),
+        (384, 64, {cute_flash.FLASH_S_STAGE_KEY: 1}),
+        (256, 192, {}),
+    ],
+    ids=[
+        "one_tile",
+        "three_tiles_two_warpgroups",
+        "three_tiles_one_warpgroup",
+        "d192_two_tiles",
+    ],
+)
+def test_fp8_example_single_tile_family_matches_reference_on_gpu(
+    seq: int, head_dim: int, overrides: dict[str, object]
+) -> None:
+    """The single-tile family: an odd KV tile count (the suite's
+    (4, 48, 128, 64) input and three tiles) on the one-warpgroup body (one
+    tile, and three tiles behind its K/V ring) and the two-warpgroup body,
+    and a width above the pair's (head dim 192) at an even count."""
+    _require_sm100()
+    (q, k, v), args = _example_args(4, 48, seq, head_dim, device=DEVICE)
+    fn, code = _compile_default(_example_kernel(), args, overrides)
+    assert "'dtype': 'cutlass.Float8E4M3FN'" in code
+    assert "flash_shared_storage(" in code
+    s_stage = overrides.get(cute_flash.FLASH_S_STAGE_KEY, 1 if seq == 128 else 2)
+    assert f"'s_stage': {s_stage}" in code
+    out = fn(*args)
+    reference = _example_module().fp8_attention_pytorch(q, k, v)()
+    torch.testing.assert_close(out.float(), reference.float(), atol=0.1, rtol=0.1)
+    sdpa = torch.nn.functional.scaled_dot_product_attention(q, k, v)
+    torch.testing.assert_close(out.float(), sdpa.float(), atol=0.1, rtol=0.1)
+
+
+@pytest.mark.cuda
 @pytest.mark.parametrize(
     "overrides",
     [
@@ -361,27 +456,41 @@ def test_fp8_example_knobs_match_reference_on_gpu(overrides: dict[str, object]) 
     torch.testing.assert_close(out.float(), sdpa.float(), atol=0.1, rtol=0.1)
 
 
-def test_fp8_k_major_storage_matches_sdpa_on_gpu() -> None:
-    """A dense ``[bh, d, s]`` fp8 V buffer: the K-major PV operand."""
+@pytest.mark.cuda
+@pytest.mark.parametrize(
+    ("seq", "k_major_text"),
+    [
+        (256, "Major.K"),
+        (128, "'v_k_major': True"),
+        (384, "'v_k_major': True"),
+    ],
+    ids=["pair", "one_tile", "three_tiles"],
+)
+def test_fp8_k_major_storage_matches_sdpa_on_gpu(seq: int, k_major_text: str) -> None:
+    """A dense ``[bh, d, s]`` fp8 V buffer, the K-major PV operand: on the
+    pair body and, at an odd tile count, on the single-tile family's
+    one-warpgroup and two-warpgroup bodies (whose host builds the PV MMA
+    from the plan's key)."""
     _require_sm100()
     torch.manual_seed(0)
     q, k, v = (
-        torch.randn(4, 256, 64, device=DEVICE).to(torch.float8_e4m3fn) for _ in range(3)
+        torch.randn(4, seq, 64, device=DEVICE).to(torch.float8_e4m3fn) for _ in range(3)
     )
     args = (q, k, v.transpose(1, 2).contiguous(), 1, 4)
     fn, code = _compile_default(fp8_dot_attention_k_major, args)
-    assert "Major.K" in code
-    out = fn(*args).float().reshape(4, 256, 64)
+    assert k_major_text in code
+    out = fn(*args).float().reshape(4, seq, 64)
     sdpa = torch.nn.functional.scaled_dot_product_attention(
         q.float(), k.float(), v.float()
     )
     torch.testing.assert_close(out, sdpa, atol=0.1, rtol=0.1)
 
 
+@pytest.mark.cuda
 def test_alt_family_k_major_storage_matches_sdpa_on_gpu() -> None:
     """The alternating-warpgroup body over a dense K-major bf16 V buffer
     (hd128): its V descriptor agrees with the host's K-major PV operand."""
-    _require_sm100()
+    _require_sm100(torch.bfloat16)
     torch.manual_seed(0)
     q, k, v = (
         torch.randn(4, 256, 128, device=DEVICE).to(torch.bfloat16) for _ in range(3)
@@ -397,6 +506,7 @@ def test_alt_family_k_major_storage_matches_sdpa_on_gpu() -> None:
     torch.testing.assert_close(out, sdpa, atol=2e-2, rtol=2e-2)
 
 
+@pytest.mark.cuda
 @pytest.mark.parametrize(
     ("kernel", "dtype", "k_major_storage"),
     [
@@ -411,7 +521,7 @@ def test_16bit_2d_root_forms_match_sdpa_on_gpu(
 ) -> None:
     """The 2-D ``hl.dot`` root (a scalar batch-head index) and the dense
     K-major V buffer on the 16-bit bodies."""
-    _require_sm100()
+    _require_sm100(dtype)
     torch.manual_seed(0)
     q, k, v = (torch.randn(4, 256, 64, device=DEVICE).to(dtype) for _ in range(3))
     args = (q, k, v.transpose(1, 2).contiguous() if k_major_storage else v)
