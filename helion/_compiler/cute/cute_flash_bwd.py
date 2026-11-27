@@ -286,16 +286,16 @@ def _match_bwd_inner_graph(
     assert dq_dot is not None and dk_dot is not None
 
     # Q and dO tile loads feed the permutes of qk/dp.
-    q_load = host_tensor_load(
-        typing.cast("torch.fx.Node", qk_dot.args[1]).args[0], index_len=2
-    )
+    q_tile = typing.cast("torch.fx.Node", qk_dot.args[1]).args[0]
+    q_load = host_tensor_load(q_tile, index_len=2)
     dp_permute = dp_dot.args[1]
     if not (
         isinstance(dp_permute, torch.fx.Node)
         and dp_permute.target is torch.ops.aten.permute.default
     ):
         return None
-    do_load = host_tensor_load(dp_permute.args[0], index_len=2)
+    do_tile = dp_permute.args[0]
+    do_load = host_tensor_load(do_tile, index_len=2)
     if q_load is None or do_load is None:
         return None
     q_name, _ = q_load
@@ -384,7 +384,11 @@ def _match_bwd_inner_graph(
         return None
 
     # dV dot consumes convert(p_t) and do_i; dK dot consumes ds and q_i;
-    # dQ dot consumes permute(ds).
+    # dQ dot consumes permute(ds) and k_j (its classification, above). Q and
+    # dO are named by the tiles the qk and dp dots transpose, and the fused
+    # body computes dK and dV from those tensors, so the accumulating dots
+    # must take the same tiles: with another operand the kernel computes
+    # something else.
     dv_a = dv_dot.args[0]
     if not (
         isinstance(dv_a, torch.fx.Node)
@@ -393,7 +397,9 @@ def _match_bwd_inner_graph(
         and dv_a.args[1] == io_dtype
     ):
         return None
-    if dk_dot.args[0] is not ds_node:
+    if strip_new_var(dv_dot.args[1]) is not do_tile:
+        return None
+    if dk_dot.args[0] is not ds_node or strip_new_var(dk_dot.args[1]) is not q_tile:
         return None
     if not _is_permute_of(dq_dot.args[0], ds_node):
         return None
