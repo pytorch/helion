@@ -1,0 +1,2597 @@
+{
+  "metadata": {
+    "calls_per_sample": 1,
+    "causal_q_scale": "1/sqrt(D)",
+    "dense_measurements": "retained unchanged",
+    "helion_causal_launcher": "torchtpu",
+    "helion_compiler_revision": "1496cb1b97fa02275b744aec066c9a76e62bb78c",
+    "libtpu_init_args": "--xla_tpu_dvfs_p_state=7 --xla_tpu_scoped_vmem_limit_kib=65536",
+    "samples": 20,
+    "shape": [
+      8,
+      32,
+      "S",
+      "D"
+    ],
+    "warmups": 3
+  },
+  "results": {
+    "causal/d128/s1024/helion": {
+      "batching": "flatten_batch_heads",
+      "calls_per_sample": 1,
+      "config": {
+        "pallas_fold_dot_lhs_cast": true,
+        "pallas_internal_scratch": true,
+        "pallas_loop_type": "unroll",
+        "pallas_pre_broadcast": false,
+        "pallas_use_low_level_scheduler": false
+      },
+      "head_dim": 128,
+      "implementation": "helion",
+      "launcher": "torchtpu",
+      "median_ms": 0.7228564936667681,
+      "mode": "causal",
+      "sampled_max_abs": 0.008736610412597656,
+      "sampled_max_relative_l2": 0.002029196359217167,
+      "samples": 20,
+      "sequence_length": 1024,
+      "shape": [
+        8,
+        32,
+        1024,
+        128
+      ],
+      "tflops": 95.15939360394007
+    },
+    "causal/d128/s1024/tokamax": {
+      "batching": "vmap_batch",
+      "calls_per_sample": 1,
+      "candidates": [
+        {
+          "batching": "vmap_batch",
+          "median_ms": 0.550941564142704,
+          "sampled_max_abs": 0.007445573806762695,
+          "sampled_max_relative_l2": 0.0014750076225027442,
+          "tflops": 124.85277945408926
+        },
+        {
+          "batching": "flatten_batch_heads",
+          "median_ms": 0.5527075845748186,
+          "sampled_max_abs": 0.007445573806762695,
+          "sampled_max_relative_l2": 0.0014750076225027442,
+          "tflops": 124.45384778447624
+        }
+      ],
+      "config": {
+        "block_kv": 1024,
+        "block_kv_compute": 1024,
+        "block_q": 1024,
+        "k_layout": "HEAD_DIM_MINOR",
+        "q_layout": "HEAD_DIM_MINOR",
+        "qk_diag_grid": 4,
+        "qk_diag_skip": true,
+        "sv_diag_skip": true,
+        "use_base2_exp": true,
+        "use_experimental_scheduler": false,
+        "v_layout": "HEAD_DIM_MINOR"
+      },
+      "head_dim": 128,
+      "implementation": "tokamax",
+      "median_ms": 0.550941564142704,
+      "mode": "causal",
+      "sampled_max_abs": 0.007445573806762695,
+      "sampled_max_relative_l2": 0.0014750076225027442,
+      "samples": 20,
+      "sequence_length": 1024,
+      "shape": [
+        8,
+        32,
+        1024,
+        128
+      ],
+      "tflops": 124.85277945408926
+    },
+    "causal/d128/s16384/helion": {
+      "batching": "flatten_batch_heads",
+      "calls_per_sample": 1,
+      "config": {
+        "pallas_fold_dot_lhs_cast": true,
+        "pallas_internal_scratch": true,
+        "pallas_loop_type": "unroll",
+        "pallas_pre_broadcast": false,
+        "pallas_use_low_level_scheduler": false
+      },
+      "head_dim": 128,
+      "implementation": "helion",
+      "launcher": "torchtpu",
+      "median_ms": 44.09338301047683,
+      "mode": "causal",
+      "sampled_max_abs": 0.006654262542724609,
+      "sampled_max_relative_l2": 0.0013389039086177945,
+      "samples": 20,
+      "sequence_length": 16384,
+      "shape": [
+        8,
+        32,
+        16384,
+        128
+      ],
+      "tflops": 398.99999920758506
+    },
+    "causal/d128/s16384/tokamax": {
+      "batching": "vmap_batch",
+      "calls_per_sample": 1,
+      "candidates": [
+        {
+          "batching": "vmap_batch",
+          "median_ms": 49.59749337285757,
+          "sampled_max_abs": 0.0053157806396484375,
+          "sampled_max_relative_l2": 0.0014355926541611552,
+          "tflops": 354.7207447356197
+        },
+        {
+          "batching": "flatten_batch_heads",
+          "median_ms": 49.60618261247873,
+          "sampled_max_abs": 0.0053157806396484375,
+          "sampled_max_relative_l2": 0.0014355926541611552,
+          "tflops": 354.65861027198474
+        }
+      ],
+      "config": {
+        "block_kv": 2048,
+        "block_kv_compute": 2048,
+        "block_q": 2048,
+        "k_layout": "HEAD_DIM_MINOR",
+        "q_layout": "HEAD_DIM_MINOR",
+        "qk_diag_grid": 4,
+        "qk_diag_skip": true,
+        "sv_diag_skip": true,
+        "use_base2_exp": true,
+        "use_experimental_scheduler": false,
+        "v_layout": "HEAD_DIM_MINOR"
+      },
+      "head_dim": 128,
+      "implementation": "tokamax",
+      "median_ms": 49.59749337285757,
+      "mode": "causal",
+      "sampled_max_abs": 0.0053157806396484375,
+      "sampled_max_relative_l2": 0.0014355926541611552,
+      "samples": 20,
+      "sequence_length": 16384,
+      "shape": [
+        8,
+        32,
+        16384,
+        128
+      ],
+      "tflops": 354.7207447356197
+    },
+    "causal/d128/s2048/helion": {
+      "batching": "flatten_batch_heads",
+      "calls_per_sample": 1,
+      "config": {
+        "pallas_fold_dot_lhs_cast": true,
+        "pallas_internal_scratch": true,
+        "pallas_loop_type": "unroll",
+        "pallas_pre_broadcast": false,
+        "pallas_use_low_level_scheduler": false
+      },
+      "head_dim": 128,
+      "implementation": "helion",
+      "launcher": "torchtpu",
+      "median_ms": 1.2297627981752157,
+      "mode": "causal",
+      "sampled_max_abs": 0.006616830825805664,
+      "sampled_max_relative_l2": 0.0017724609933793545,
+      "samples": 20,
+      "sequence_length": 2048,
+      "shape": [
+        8,
+        32,
+        2048,
+        128
+      ],
+      "tflops": 223.6302196489249
+    },
+    "causal/d128/s2048/tokamax": {
+      "batching": "flatten_batch_heads",
+      "calls_per_sample": 1,
+      "candidates": [
+        {
+          "batching": "vmap_batch",
+          "median_ms": 1.370129408314824,
+          "sampled_max_abs": 0.007547736167907715,
+          "sampled_max_relative_l2": 0.0014303321950137615,
+          "tflops": 200.71981741509234
+        },
+        {
+          "batching": "flatten_batch_heads",
+          "median_ms": 1.3693503569811583,
+          "sampled_max_abs": 0.007547736167907715,
+          "sampled_max_relative_l2": 0.0014303321950137615,
+          "tflops": 200.83401101109442
+        }
+      ],
+      "config": {
+        "block_kv": 2048,
+        "block_kv_compute": 2048,
+        "block_q": 2048,
+        "k_layout": "HEAD_DIM_MINOR",
+        "q_layout": "HEAD_DIM_MINOR",
+        "qk_diag_grid": 4,
+        "qk_diag_skip": true,
+        "sv_diag_skip": true,
+        "use_base2_exp": true,
+        "use_experimental_scheduler": false,
+        "v_layout": "HEAD_DIM_MINOR"
+      },
+      "head_dim": 128,
+      "implementation": "tokamax",
+      "median_ms": 1.3693503569811583,
+      "mode": "causal",
+      "sampled_max_abs": 0.007547736167907715,
+      "sampled_max_relative_l2": 0.0014303321950137615,
+      "samples": 20,
+      "sequence_length": 2048,
+      "shape": [
+        8,
+        32,
+        2048,
+        128
+      ],
+      "tflops": 200.83401101109442
+    },
+    "causal/d128/s32768/helion": {
+      "batching": "flatten_batch_heads",
+      "calls_per_sample": 1,
+      "config": {
+        "pallas_fold_dot_lhs_cast": true,
+        "pallas_internal_scratch": true,
+        "pallas_loop_type": "unroll",
+        "pallas_pre_broadcast": false,
+        "pallas_use_low_level_scheduler": true
+      },
+      "head_dim": 128,
+      "implementation": "helion",
+      "launcher": "torchtpu",
+      "median_ms": 166.174768935889,
+      "mode": "causal",
+      "sampled_max_abs": 0.006845235824584961,
+      "sampled_max_relative_l2": 0.0012396883685141802,
+      "samples": 20,
+      "sequence_length": 32768,
+      "shape": [
+        8,
+        32,
+        32768,
+        128
+      ],
+      "tflops": 423.4751888745603
+    },
+    "causal/d128/s32768/tokamax": {
+      "batching": "flatten_batch_heads",
+      "calls_per_sample": 1,
+      "candidates": [
+        {
+          "batching": "vmap_batch",
+          "median_ms": 183.56161518022418,
+          "sampled_max_abs": 0.005832672119140625,
+          "sampled_max_relative_l2": 0.001396393752656877,
+          "tflops": 383.3638726278397
+        },
+        {
+          "batching": "flatten_batch_heads",
+          "median_ms": 183.49968502297997,
+          "sampled_max_abs": 0.005832672119140625,
+          "sampled_max_relative_l2": 0.001396393752656877,
+          "tflops": 383.4932558739779
+        }
+      ],
+      "config": {
+        "block_kv": 4096,
+        "block_kv_compute": 512,
+        "block_q": 2048,
+        "k_layout": "HEAD_DIM_MINOR",
+        "q_layout": "HEAD_DIM_MINOR",
+        "use_base2_exp": true,
+        "use_experimental_scheduler": true,
+        "v_layout": "HEAD_DIM_MINOR"
+      },
+      "head_dim": 128,
+      "implementation": "tokamax",
+      "median_ms": 183.49968502297997,
+      "mode": "causal",
+      "sampled_max_abs": 0.005832672119140625,
+      "sampled_max_relative_l2": 0.001396393752656877,
+      "samples": 20,
+      "sequence_length": 32768,
+      "shape": [
+        8,
+        32,
+        32768,
+        128
+      ],
+      "tflops": 383.4932558739779
+    },
+    "causal/d128/s4096/helion": {
+      "batching": "flatten_batch_heads",
+      "calls_per_sample": 1,
+      "config": {
+        "pallas_fold_dot_lhs_cast": true,
+        "pallas_internal_scratch": true,
+        "pallas_loop_type": "unroll",
+        "pallas_pre_broadcast": false,
+        "pallas_use_low_level_scheduler": false
+      },
+      "head_dim": 128,
+      "implementation": "helion",
+      "launcher": "torchtpu",
+      "median_ms": 3.6093073431402445,
+      "mode": "causal",
+      "sampled_max_abs": 0.006035566329956055,
+      "sampled_max_relative_l2": 0.0015598733443766832,
+      "samples": 20,
+      "sequence_length": 4096,
+      "shape": [
+        8,
+        32,
+        4096,
+        128
+      ],
+      "tflops": 304.7066815526844
+    },
+    "causal/d128/s4096/tokamax": {
+      "batching": "flatten_batch_heads",
+      "calls_per_sample": 1,
+      "candidates": [
+        {
+          "batching": "vmap_batch",
+          "median_ms": 4.04026685282588,
+          "sampled_max_abs": 0.005660891532897949,
+          "sampled_max_relative_l2": 0.0014710447285324335,
+          "tflops": 272.20480807171975
+        },
+        {
+          "batching": "flatten_batch_heads",
+          "median_ms": 4.039526917040348,
+          "sampled_max_abs": 0.005660891532897949,
+          "sampled_max_relative_l2": 0.0014710447285324335,
+          "tflops": 272.2546688803299
+        }
+      ],
+      "config": {
+        "block_kv": 2048,
+        "block_kv_compute": 2048,
+        "block_q": 2048,
+        "k_layout": "HEAD_DIM_MINOR",
+        "q_layout": "HEAD_DIM_MINOR",
+        "qk_diag_grid": 4,
+        "qk_diag_skip": true,
+        "sv_diag_skip": true,
+        "use_base2_exp": true,
+        "use_experimental_scheduler": false,
+        "v_layout": "HEAD_DIM_MINOR"
+      },
+      "head_dim": 128,
+      "implementation": "tokamax",
+      "median_ms": 4.039526917040348,
+      "mode": "causal",
+      "sampled_max_abs": 0.005660891532897949,
+      "sampled_max_relative_l2": 0.0014710447285324335,
+      "samples": 20,
+      "sequence_length": 4096,
+      "shape": [
+        8,
+        32,
+        4096,
+        128
+      ],
+      "tflops": 272.2546688803299
+    },
+    "causal/d128/s65536/helion": {
+      "batching": "flatten_batch_heads",
+      "calls_per_sample": 1,
+      "config": {
+        "pallas_fold_dot_lhs_cast": true,
+        "pallas_internal_scratch": true,
+        "pallas_loop_type": "unroll",
+        "pallas_pre_broadcast": false,
+        "pallas_use_low_level_scheduler": true
+      },
+      "head_dim": 128,
+      "implementation": "helion",
+      "launcher": "torchtpu",
+      "median_ms": 644.7303891181946,
+      "mode": "causal",
+      "sampled_max_abs": 0.005521297454833984,
+      "sampled_max_relative_l2": 0.0013816497521474957,
+      "samples": 20,
+      "sequence_length": 65536,
+      "shape": [
+        8,
+        32,
+        65536,
+        128
+      ],
+      "tflops": 436.5844644967558
+    },
+    "causal/d128/s65536/tokamax": {
+      "batching": "flatten_batch_heads",
+      "calls_per_sample": 1,
+      "candidates": [
+        {
+          "batching": "vmap_batch",
+          "median_ms": 682.4939418584108,
+          "sampled_max_abs": 0.0061588287353515625,
+          "sampled_max_relative_l2": 0.001394555438309908,
+          "tflops": 412.42750215700414
+        },
+        {
+          "batching": "flatten_batch_heads",
+          "median_ms": 682.1572587359697,
+          "sampled_max_abs": 0.0061588287353515625,
+          "sampled_max_relative_l2": 0.001394555438309908,
+          "tflops": 412.63105841537214
+        }
+      ],
+      "config": {
+        "block_kv": 4096,
+        "block_kv_compute": 512,
+        "block_q": 2048,
+        "k_layout": "HEAD_DIM_MINOR",
+        "q_layout": "HEAD_DIM_MINOR",
+        "use_base2_exp": true,
+        "use_experimental_scheduler": true,
+        "v_layout": "HEAD_DIM_MINOR"
+      },
+      "head_dim": 128,
+      "implementation": "tokamax",
+      "median_ms": 682.1572587359697,
+      "mode": "causal",
+      "sampled_max_abs": 0.0061588287353515625,
+      "sampled_max_relative_l2": 0.001394555438309908,
+      "samples": 20,
+      "sequence_length": 65536,
+      "shape": [
+        8,
+        32,
+        65536,
+        128
+      ],
+      "tflops": 412.63105841537214
+    },
+    "causal/d128/s8192/helion": {
+      "batching": "flatten_batch_heads",
+      "calls_per_sample": 1,
+      "config": {
+        "pallas_fold_dot_lhs_cast": true,
+        "pallas_internal_scratch": true,
+        "pallas_loop_type": "unroll",
+        "pallas_pre_broadcast": false,
+        "pallas_use_low_level_scheduler": false
+      },
+      "head_dim": 128,
+      "implementation": "helion",
+      "launcher": "torchtpu",
+      "median_ms": 11.986444937065244,
+      "mode": "causal",
+      "sampled_max_abs": 0.005093216896057129,
+      "sampled_max_relative_l2": 0.0015961178578436375,
+      "samples": 20,
+      "sequence_length": 8192,
+      "shape": [
+        8,
+        32,
+        8192,
+        128
+      ],
+      "tflops": 366.96313253101613
+    },
+    "causal/d128/s8192/tokamax": {
+      "batching": "flatten_batch_heads",
+      "calls_per_sample": 1,
+      "candidates": [
+        {
+          "batching": "vmap_batch",
+          "median_ms": 13.552750460803509,
+          "sampled_max_abs": 0.009296774864196777,
+          "sampled_max_relative_l2": 0.0021939135622233152,
+          "tflops": 324.5528200889799
+        },
+        {
+          "batching": "flatten_batch_heads",
+          "median_ms": 13.549871277064085,
+          "sampled_max_abs": 0.009296774864196777,
+          "sampled_max_relative_l2": 0.0021939135622233152,
+          "tflops": 324.6217836372732
+        }
+      ],
+      "config": {
+        "block_kv": 2048,
+        "block_kv_compute": 2048,
+        "block_q": 2048,
+        "k_layout": "HEAD_DIM_MINOR",
+        "q_layout": "HEAD_DIM_MINOR",
+        "qk_diag_grid": 4,
+        "qk_diag_skip": true,
+        "sv_diag_skip": true,
+        "use_base2_exp": true,
+        "use_experimental_scheduler": false,
+        "v_layout": "HEAD_DIM_MINOR"
+      },
+      "head_dim": 128,
+      "implementation": "tokamax",
+      "median_ms": 13.549871277064085,
+      "mode": "causal",
+      "sampled_max_abs": 0.009296774864196777,
+      "sampled_max_relative_l2": 0.0021939135622233152,
+      "samples": 20,
+      "sequence_length": 8192,
+      "shape": [
+        8,
+        32,
+        8192,
+        128
+      ],
+      "tflops": 324.6217836372732
+    },
+    "causal/d256/s1024/helion": {
+      "batching": "flatten_batch_heads",
+      "calls_per_sample": 1,
+      "config": {
+        "pallas_fold_dot_lhs_cast": true,
+        "pallas_internal_scratch": true,
+        "pallas_loop_type": "unroll",
+        "pallas_pre_broadcast": false,
+        "pallas_use_low_level_scheduler": false
+      },
+      "head_dim": 256,
+      "implementation": "helion",
+      "launcher": "torchtpu",
+      "median_ms": 0.7998866494745016,
+      "mode": "causal",
+      "sampled_max_abs": 0.008219480514526367,
+      "sampled_max_relative_l2": 0.0021457297261804342,
+      "samples": 20,
+      "sequence_length": 1024,
+      "shape": [
+        8,
+        32,
+        1024,
+        256
+      ],
+      "tflops": 171.9908330641359
+    },
+    "causal/d256/s1024/tokamax": {
+      "batching": "flatten_batch_heads",
+      "calls_per_sample": 1,
+      "candidates": [
+        {
+          "batching": "vmap_batch",
+          "median_ms": 0.6463993340730667,
+          "sampled_max_abs": 0.005423784255981445,
+          "sampled_max_relative_l2": 0.0011734451400116086,
+          "tflops": 212.83000143754668
+        },
+        {
+          "batching": "flatten_batch_heads",
+          "median_ms": 0.6417501717805862,
+          "sampled_max_abs": 0.005423784255981445,
+          "sampled_max_relative_l2": 0.0011734451400116086,
+          "tflops": 214.37184943525986
+        }
+      ],
+      "config": {
+        "block_kv": 1024,
+        "block_kv_compute": 1024,
+        "block_q": 1024,
+        "k_layout": "HEAD_DIM_MINOR",
+        "q_layout": "HEAD_DIM_MINOR",
+        "qk_diag_grid": 4,
+        "qk_diag_skip": true,
+        "sv_diag_skip": true,
+        "use_base2_exp": true,
+        "use_experimental_scheduler": false,
+        "v_layout": "HEAD_DIM_MINOR"
+      },
+      "head_dim": 256,
+      "implementation": "tokamax",
+      "median_ms": 0.6417501717805862,
+      "mode": "causal",
+      "sampled_max_abs": 0.005423784255981445,
+      "sampled_max_relative_l2": 0.0011734451400116086,
+      "samples": 20,
+      "sequence_length": 1024,
+      "shape": [
+        8,
+        32,
+        1024,
+        256
+      ],
+      "tflops": 214.37184943525986
+    },
+    "causal/d256/s16384/helion": {
+      "batching": "flatten_batch_heads",
+      "calls_per_sample": 1,
+      "config": {
+        "pallas_fold_dot_lhs_cast": true,
+        "pallas_internal_scratch": true,
+        "pallas_loop_type": "unroll",
+        "pallas_pre_broadcast": false,
+        "pallas_use_low_level_scheduler": true
+      },
+      "head_dim": 256,
+      "implementation": "helion",
+      "launcher": "torchtpu",
+      "median_ms": 47.20741487108171,
+      "mode": "causal",
+      "sampled_max_abs": 0.0062181949615478516,
+      "sampled_max_relative_l2": 0.0011333884904161096,
+      "samples": 20,
+      "sequence_length": 16384,
+      "shape": [
+        8,
+        32,
+        16384,
+        256
+      ],
+      "tflops": 745.3600174584975
+    },
+    "causal/d256/s16384/tokamax": {
+      "batching": "vmap_batch",
+      "calls_per_sample": 1,
+      "candidates": [
+        {
+          "batching": "vmap_batch",
+          "median_ms": 56.499827886000276,
+          "sampled_max_abs": 0.007615327835083008,
+          "sampled_max_relative_l2": 0.0013472866266965866,
+          "tflops": 622.772155049319
+        },
+        {
+          "batching": "flatten_batch_heads",
+          "median_ms": 56.54482985846698,
+          "sampled_max_abs": 0.007615327835083008,
+          "sampled_max_relative_l2": 0.0013472866266965866,
+          "tflops": 622.2765133532575
+        }
+      ],
+      "config": {
+        "block_kv": 4096,
+        "block_kv_compute": 512,
+        "block_q": 2048,
+        "k_layout": "HEAD_DIM_MINOR",
+        "q_layout": "HEAD_DIM_MINOR",
+        "use_base2_exp": true,
+        "use_experimental_scheduler": true,
+        "v_layout": "HEAD_DIM_MINOR"
+      },
+      "head_dim": 256,
+      "implementation": "tokamax",
+      "median_ms": 56.499827886000276,
+      "mode": "causal",
+      "sampled_max_abs": 0.007615327835083008,
+      "sampled_max_relative_l2": 0.0013472866266965866,
+      "samples": 20,
+      "sequence_length": 16384,
+      "shape": [
+        8,
+        32,
+        16384,
+        256
+      ],
+      "tflops": 622.772155049319
+    },
+    "causal/d256/s2048/helion": {
+      "batching": "flatten_batch_heads",
+      "calls_per_sample": 1,
+      "config": {
+        "pallas_fold_dot_lhs_cast": true,
+        "pallas_internal_scratch": true,
+        "pallas_loop_type": "unroll",
+        "pallas_pre_broadcast": false,
+        "pallas_use_low_level_scheduler": false
+      },
+      "head_dim": 256,
+      "implementation": "helion",
+      "launcher": "torchtpu",
+      "median_ms": 1.277054427191615,
+      "mode": "causal",
+      "sampled_max_abs": 0.008992910385131836,
+      "sampled_max_relative_l2": 0.0012353481724858284,
+      "samples": 20,
+      "sequence_length": 2048,
+      "shape": [
+        8,
+        32,
+        2048,
+        256
+      ],
+      "tflops": 430.6975784529126
+    },
+    "causal/d256/s2048/tokamax": {
+      "batching": "vmap_batch",
+      "calls_per_sample": 1,
+      "candidates": [
+        {
+          "batching": "vmap_batch",
+          "median_ms": 1.530058914795518,
+          "sampled_max_abs": 0.007577657699584961,
+          "sampled_max_relative_l2": 0.0012912637321278453,
+          "tflops": 359.47913117940755
+        },
+        {
+          "batching": "flatten_batch_heads",
+          "median_ms": 1.5302004758268595,
+          "sampled_max_abs": 0.007577657699584961,
+          "sampled_max_relative_l2": 0.0012912637321278453,
+          "tflops": 359.44587525159983
+        }
+      ],
+      "config": {
+        "block_kv": 2048,
+        "block_kv_compute": 2048,
+        "block_q": 2048,
+        "k_layout": "HEAD_DIM_MINOR",
+        "q_layout": "HEAD_DIM_MINOR",
+        "qk_diag_grid": 4,
+        "qk_diag_skip": true,
+        "sv_diag_skip": true,
+        "use_base2_exp": true,
+        "use_experimental_scheduler": false,
+        "v_layout": "HEAD_DIM_MINOR"
+      },
+      "head_dim": 256,
+      "implementation": "tokamax",
+      "median_ms": 1.530058914795518,
+      "mode": "causal",
+      "sampled_max_abs": 0.007577657699584961,
+      "sampled_max_relative_l2": 0.0012912637321278453,
+      "samples": 20,
+      "sequence_length": 2048,
+      "shape": [
+        8,
+        32,
+        2048,
+        256
+      ],
+      "tflops": 359.47913117940755
+    },
+    "causal/d256/s32768/helion": {
+      "batching": "flatten_batch_heads",
+      "calls_per_sample": 1,
+      "config": {
+        "pallas_fold_dot_lhs_cast": true,
+        "pallas_internal_scratch": true,
+        "pallas_loop_type": "unroll",
+        "pallas_pre_broadcast": false,
+        "pallas_use_low_level_scheduler": true
+      },
+      "head_dim": 256,
+      "implementation": "helion",
+      "launcher": "torchtpu",
+      "median_ms": 179.05889148823917,
+      "mode": "causal",
+      "sampled_max_abs": 0.005845546722412109,
+      "sampled_max_relative_l2": 0.0013186493888497353,
+      "samples": 20,
+      "sequence_length": 32768,
+      "shape": [
+        8,
+        32,
+        32768,
+        256
+      ],
+      "tflops": 786.0083470463577
+    },
+    "causal/d256/s32768/tokamax": {
+      "batching": "vmap_batch",
+      "calls_per_sample": 1,
+      "candidates": [
+        {
+          "batching": "vmap_batch",
+          "median_ms": 194.1353294532746,
+          "sampled_max_abs": 0.008144140243530273,
+          "sampled_max_relative_l2": 0.0011197184212505817,
+          "tflops": 724.9673911440133
+        },
+        {
+          "batching": "flatten_batch_heads",
+          "median_ms": 194.2521275486797,
+          "sampled_max_abs": 0.008144140243530273,
+          "sampled_max_relative_l2": 0.0011197184212505817,
+          "tflops": 724.5314895578377
+        }
+      ],
+      "config": {
+        "block_kv": 4096,
+        "block_kv_compute": 512,
+        "block_q": 2048,
+        "k_layout": "HEAD_DIM_MINOR",
+        "q_layout": "HEAD_DIM_MINOR",
+        "use_base2_exp": true,
+        "use_experimental_scheduler": true,
+        "v_layout": "HEAD_DIM_MINOR"
+      },
+      "head_dim": 256,
+      "implementation": "tokamax",
+      "median_ms": 194.1353294532746,
+      "mode": "causal",
+      "sampled_max_abs": 0.008144140243530273,
+      "sampled_max_relative_l2": 0.0011197184212505817,
+      "samples": 20,
+      "sequence_length": 32768,
+      "shape": [
+        8,
+        32,
+        32768,
+        256
+      ],
+      "tflops": 724.9673911440133
+    },
+    "causal/d256/s4096/helion": {
+      "batching": "flatten_batch_heads",
+      "calls_per_sample": 1,
+      "config": {
+        "pallas_fold_dot_lhs_cast": true,
+        "pallas_internal_scratch": true,
+        "pallas_loop_type": "unroll",
+        "pallas_pre_broadcast": false,
+        "pallas_use_low_level_scheduler": false
+      },
+      "head_dim": 256,
+      "implementation": "helion",
+      "launcher": "torchtpu",
+      "median_ms": 3.9001714903861284,
+      "mode": "causal",
+      "sampled_max_abs": 0.00748133659362793,
+      "sampled_max_relative_l2": 0.0015090381493791938,
+      "samples": 20,
+      "sequence_length": 4096,
+      "shape": [
+        8,
+        32,
+        4096,
+        256
+      ],
+      "tflops": 563.9649774082721
+    },
+    "causal/d256/s4096/tokamax": {
+      "batching": "vmap_batch",
+      "calls_per_sample": 1,
+      "candidates": [
+        {
+          "batching": "vmap_batch",
+          "median_ms": 5.208800546824932,
+          "sampled_max_abs": 0.00616145133972168,
+          "sampled_max_relative_l2": 0.0012475212570279837,
+          "tflops": 422.27766386731014
+        },
+        {
+          "batching": "flatten_batch_heads",
+          "median_ms": 5.208812886849046,
+          "sampled_max_abs": 0.00616145133972168,
+          "sampled_max_relative_l2": 0.0012475212570279837,
+          "tflops": 422.2766634634431
+        }
+      ],
+      "config": {
+        "block_kv": 2048,
+        "block_kv_compute": 2048,
+        "block_q": 2048,
+        "k_layout": "HEAD_DIM_MINOR",
+        "q_layout": "HEAD_DIM_MINOR",
+        "qk_diag_grid": 4,
+        "qk_diag_skip": true,
+        "sv_diag_skip": true,
+        "use_base2_exp": true,
+        "use_experimental_scheduler": false,
+        "v_layout": "HEAD_DIM_MINOR"
+      },
+      "head_dim": 256,
+      "implementation": "tokamax",
+      "median_ms": 5.208800546824932,
+      "mode": "causal",
+      "sampled_max_abs": 0.00616145133972168,
+      "sampled_max_relative_l2": 0.0012475212570279837,
+      "samples": 20,
+      "sequence_length": 4096,
+      "shape": [
+        8,
+        32,
+        4096,
+        256
+      ],
+      "tflops": 422.27766386731014
+    },
+    "causal/d256/s65536/helion": {
+      "batching": "flatten_batch_heads",
+      "calls_per_sample": 1,
+      "config": {
+        "pallas_fold_dot_lhs_cast": true,
+        "pallas_internal_scratch": true,
+        "pallas_loop_type": "unroll",
+        "pallas_pre_broadcast": false,
+        "pallas_use_low_level_scheduler": true
+      },
+      "head_dim": 256,
+      "implementation": "helion",
+      "launcher": "torchtpu",
+      "median_ms": 697.4682207219303,
+      "mode": "causal",
+      "sampled_max_abs": 0.006892204284667969,
+      "sampled_max_relative_l2": 0.00134831084869802,
+      "samples": 20,
+      "sequence_length": 65536,
+      "shape": [
+        8,
+        32,
+        65536,
+        256
+      ],
+      "tflops": 807.1457976582803
+    },
+    "causal/d256/s65536/tokamax": {
+      "batching": "vmap_batch",
+      "calls_per_sample": 1,
+      "candidates": [
+        {
+          "batching": "vmap_batch",
+          "median_ms": 712.8865169361234,
+          "sampled_max_abs": 0.008354902267456055,
+          "sampled_max_relative_l2": 0.001981668407097459,
+          "tflops": 789.6888634889789
+        },
+        {
+          "batching": "flatten_batch_heads",
+          "median_ms": 713.3740272838622,
+          "sampled_max_abs": 0.008354902267456055,
+          "sampled_max_relative_l2": 0.001981668407097459,
+          "tflops": 789.149200594451
+        }
+      ],
+      "config": {
+        "block_kv": 4096,
+        "block_kv_compute": 512,
+        "block_q": 2048,
+        "k_layout": "HEAD_DIM_MINOR",
+        "q_layout": "HEAD_DIM_MINOR",
+        "use_base2_exp": true,
+        "use_experimental_scheduler": true,
+        "v_layout": "HEAD_DIM_MINOR"
+      },
+      "head_dim": 256,
+      "implementation": "tokamax",
+      "median_ms": 712.8865169361234,
+      "mode": "causal",
+      "sampled_max_abs": 0.008354902267456055,
+      "sampled_max_relative_l2": 0.001981668407097459,
+      "samples": 20,
+      "sequence_length": 65536,
+      "shape": [
+        8,
+        32,
+        65536,
+        256
+      ],
+      "tflops": 789.6888634889789
+    },
+    "causal/d256/s8192/helion": {
+      "batching": "flatten_batch_heads",
+      "calls_per_sample": 1,
+      "config": {
+        "pallas_fold_dot_lhs_cast": true,
+        "pallas_internal_scratch": true,
+        "pallas_loop_type": "unroll",
+        "pallas_pre_broadcast": false,
+        "pallas_use_low_level_scheduler": true
+      },
+      "head_dim": 256,
+      "implementation": "helion",
+      "launcher": "torchtpu",
+      "median_ms": 13.142833020538092,
+      "mode": "causal",
+      "sampled_max_abs": 0.008759498596191406,
+      "sampled_max_relative_l2": 0.0014861529925838113,
+      "samples": 20,
+      "sequence_length": 8192,
+      "shape": [
+        8,
+        32,
+        8192,
+        256
+      ],
+      "tflops": 669.3508736118621
+    },
+    "causal/d256/s8192/tokamax": {
+      "batching": "flatten_batch_heads",
+      "calls_per_sample": 1,
+      "candidates": [
+        {
+          "batching": "vmap_batch",
+          "median_ms": 15.783927403390408,
+          "sampled_max_abs": 0.007045745849609375,
+          "sampled_max_relative_l2": 0.0011644114274531603,
+          "tflops": 557.3496721824986
+        },
+        {
+          "batching": "flatten_batch_heads",
+          "median_ms": 15.780820045620203,
+          "sampled_max_abs": 0.007045745849609375,
+          "sampled_max_relative_l2": 0.0011644114274531603,
+          "tflops": 557.4594183699319
+        }
+      ],
+      "config": {
+        "block_kv": 2048,
+        "block_kv_compute": 512,
+        "block_q": 2048,
+        "k_layout": "HEAD_DIM_MINOR",
+        "q_layout": "HEAD_DIM_MINOR",
+        "use_base2_exp": true,
+        "use_experimental_scheduler": true,
+        "v_layout": "HEAD_DIM_MINOR"
+      },
+      "head_dim": 256,
+      "implementation": "tokamax",
+      "median_ms": 15.780820045620203,
+      "mode": "causal",
+      "sampled_max_abs": 0.007045745849609375,
+      "sampled_max_relative_l2": 0.0011644114274531603,
+      "samples": 20,
+      "sequence_length": 8192,
+      "shape": [
+        8,
+        32,
+        8192,
+        256
+      ],
+      "tflops": 557.4594183699319
+    },
+    "causal/d64/s1024/helion": {
+      "batching": "flatten_batch_heads",
+      "calls_per_sample": 1,
+      "config": {
+        "pallas_fold_dot_lhs_cast": true,
+        "pallas_internal_scratch": true,
+        "pallas_loop_type": "unroll",
+        "pallas_pre_broadcast": false,
+        "pallas_use_low_level_scheduler": false
+      },
+      "head_dim": 64,
+      "implementation": "helion",
+      "launcher": "torchtpu",
+      "median_ms": 0.895332545042038,
+      "mode": "causal",
+      "sampled_max_abs": 0.006253242492675781,
+      "sampled_max_relative_l2": 0.0016894647851586342,
+      "samples": 20,
+      "sequence_length": 1024,
+      "shape": [
+        8,
+        32,
+        1024,
+        64
+      ],
+      "tflops": 38.413987060400174
+    },
+    "causal/d64/s1024/tokamax": {
+      "batching": "flatten_batch_heads",
+      "calls_per_sample": 1,
+      "candidates": [
+        {
+          "batching": "vmap_batch",
+          "median_ms": 0.7680591661483049,
+          "sampled_max_abs": 0.005148172378540039,
+          "sampled_max_relative_l2": 0.0011540894629433751,
+          "tflops": 44.77948355525385
+        },
+        {
+          "batching": "flatten_batch_heads",
+          "median_ms": 0.6654139142483473,
+          "sampled_max_abs": 0.005148172378540039,
+          "sampled_max_relative_l2": 0.0011540894629433751,
+          "tflops": 51.68706584509992
+        }
+      ],
+      "config": {
+        "block_kv": 1024,
+        "block_kv_compute": 1024,
+        "block_q": 1024,
+        "k_layout": "HEAD_DIM_MINOR",
+        "q_layout": "HEAD_DIM_MINOR",
+        "qk_diag_grid": 4,
+        "qk_diag_skip": true,
+        "sv_diag_skip": true,
+        "use_base2_exp": true,
+        "use_experimental_scheduler": false,
+        "v_layout": "HEAD_DIM_MINOR"
+      },
+      "head_dim": 64,
+      "implementation": "tokamax",
+      "median_ms": 0.6654139142483473,
+      "mode": "causal",
+      "sampled_max_abs": 0.005148172378540039,
+      "sampled_max_relative_l2": 0.0011540894629433751,
+      "samples": 20,
+      "sequence_length": 1024,
+      "shape": [
+        8,
+        32,
+        1024,
+        64
+      ],
+      "tflops": 51.68706584509992
+    },
+    "causal/d64/s16384/helion": {
+      "batching": "flatten_batch_heads",
+      "calls_per_sample": 1,
+      "config": {
+        "pallas_fold_dot_lhs_cast": true,
+        "pallas_internal_scratch": true,
+        "pallas_loop_type": "unroll",
+        "pallas_pre_broadcast": false,
+        "pallas_use_low_level_scheduler": false
+      },
+      "head_dim": 64,
+      "implementation": "helion",
+      "launcher": "torchtpu",
+      "median_ms": 46.80593800731003,
+      "mode": "causal",
+      "sampled_max_abs": 0.006520986557006836,
+      "sampled_max_relative_l2": 0.0022186096757650375,
+      "samples": 20,
+      "sequence_length": 16384,
+      "shape": [
+        8,
+        32,
+        16384,
+        64
+      ],
+      "tflops": 187.93833149431094
+    },
+    "causal/d64/s16384/tokamax": {
+      "batching": "flatten_batch_heads",
+      "calls_per_sample": 1,
+      "candidates": [
+        {
+          "batching": "vmap_batch",
+          "median_ms": 52.78068478219211,
+          "sampled_max_abs": 0.005372047424316406,
+          "sampled_max_relative_l2": 0.0014277476584538817,
+          "tflops": 166.66380759212754
+        },
+        {
+          "batching": "flatten_batch_heads",
+          "median_ms": 50.87507958523929,
+          "sampled_max_abs": 0.005372047424316406,
+          "sampled_max_relative_l2": 0.0014277476584538817,
+          "tflops": 172.90645960330295
+        }
+      ],
+      "config": {
+        "block_kv": 2048,
+        "block_kv_compute": 2048,
+        "block_q": 2048,
+        "k_layout": "HEAD_DIM_MINOR",
+        "q_layout": "HEAD_DIM_MINOR",
+        "qk_diag_grid": 4,
+        "qk_diag_skip": true,
+        "sv_diag_skip": true,
+        "use_base2_exp": true,
+        "use_experimental_scheduler": false,
+        "v_layout": "HEAD_DIM_MINOR"
+      },
+      "head_dim": 64,
+      "implementation": "tokamax",
+      "median_ms": 50.87507958523929,
+      "mode": "causal",
+      "sampled_max_abs": 0.005372047424316406,
+      "sampled_max_relative_l2": 0.0014277476584538817,
+      "samples": 20,
+      "sequence_length": 16384,
+      "shape": [
+        8,
+        32,
+        16384,
+        64
+      ],
+      "tflops": 172.90645960330295
+    },
+    "causal/d64/s2048/helion": {
+      "batching": "flatten_batch_heads",
+      "calls_per_sample": 1,
+      "config": {
+        "pallas_fold_dot_lhs_cast": true,
+        "pallas_internal_scratch": true,
+        "pallas_loop_type": "unroll",
+        "pallas_pre_broadcast": false,
+        "pallas_use_low_level_scheduler": false
+      },
+      "head_dim": 64,
+      "implementation": "helion",
+      "launcher": "torchtpu",
+      "median_ms": 1.516788499429822,
+      "mode": "causal",
+      "sampled_max_abs": 0.004956841468811035,
+      "sampled_max_relative_l2": 0.0011673474218696356,
+      "samples": 20,
+      "sequence_length": 2048,
+      "shape": [
+        8,
+        32,
+        2048,
+        64
+      ],
+      "tflops": 90.65605546698838
+    },
+    "causal/d64/s2048/tokamax": {
+      "batching": "flatten_batch_heads",
+      "calls_per_sample": 1,
+      "candidates": [
+        {
+          "batching": "vmap_batch",
+          "median_ms": 1.8017920665442944,
+          "sampled_max_abs": 0.004968762397766113,
+          "sampled_max_relative_l2": 0.0012908701319247484,
+          "tflops": 76.31627693850744
+        },
+        {
+          "batching": "flatten_batch_heads",
+          "median_ms": 1.5801254194229841,
+          "sampled_max_abs": 0.004968762397766113,
+          "sampled_max_relative_l2": 0.0012908701319247484,
+          "tflops": 87.02224560517051
+        }
+      ],
+      "config": {
+        "block_kv": 2048,
+        "block_kv_compute": 2048,
+        "block_q": 2048,
+        "k_layout": "HEAD_DIM_MINOR",
+        "q_layout": "HEAD_DIM_MINOR",
+        "qk_diag_grid": 4,
+        "qk_diag_skip": true,
+        "sv_diag_skip": true,
+        "use_base2_exp": true,
+        "use_experimental_scheduler": false,
+        "v_layout": "HEAD_DIM_MINOR"
+      },
+      "head_dim": 64,
+      "implementation": "tokamax",
+      "median_ms": 1.5801254194229841,
+      "mode": "causal",
+      "sampled_max_abs": 0.004968762397766113,
+      "sampled_max_relative_l2": 0.0012908701319247484,
+      "samples": 20,
+      "sequence_length": 2048,
+      "shape": [
+        8,
+        32,
+        2048,
+        64
+      ],
+      "tflops": 87.02224560517051
+    },
+    "causal/d64/s32768/helion": {
+      "batching": "flatten_batch_heads",
+      "calls_per_sample": 1,
+      "config": {
+        "pallas_fold_dot_lhs_cast": true,
+        "pallas_internal_scratch": true,
+        "pallas_loop_type": "unroll",
+        "pallas_pre_broadcast": false,
+        "pallas_use_low_level_scheduler": true
+      },
+      "head_dim": 64,
+      "implementation": "helion",
+      "launcher": "torchtpu",
+      "median_ms": 170.29792116954923,
+      "mode": "causal",
+      "sampled_max_abs": 0.004837155342102051,
+      "sampled_max_relative_l2": 0.0011231214739382267,
+      "samples": 20,
+      "sequence_length": 32768,
+      "shape": [
+        8,
+        32,
+        32768,
+        64
+      ],
+      "tflops": 206.61112941963188
+    },
+    "causal/d64/s32768/tokamax": {
+      "batching": "flatten_batch_heads",
+      "calls_per_sample": 1,
+      "candidates": [
+        {
+          "batching": "vmap_batch",
+          "median_ms": 189.83654957264662,
+          "sampled_max_abs": 0.003992438316345215,
+          "sampled_max_relative_l2": 0.0011309590190649033,
+          "tflops": 185.34600375883485
+        },
+        {
+          "batching": "flatten_batch_heads",
+          "median_ms": 185.9417411033064,
+          "sampled_max_abs": 0.003992438316345215,
+          "sampled_max_relative_l2": 0.0011309590190649033,
+          "tflops": 189.22833368064192
+        }
+      ],
+      "config": {
+        "block_kv": 4096,
+        "block_kv_compute": 512,
+        "block_q": 2048,
+        "k_layout": "HEAD_DIM_MINOR",
+        "q_layout": "HEAD_DIM_MINOR",
+        "use_base2_exp": true,
+        "use_experimental_scheduler": true,
+        "v_layout": "HEAD_DIM_MINOR"
+      },
+      "head_dim": 64,
+      "implementation": "tokamax",
+      "median_ms": 185.9417411033064,
+      "mode": "causal",
+      "sampled_max_abs": 0.003992438316345215,
+      "sampled_max_relative_l2": 0.0011309590190649033,
+      "samples": 20,
+      "sequence_length": 32768,
+      "shape": [
+        8,
+        32,
+        32768,
+        64
+      ],
+      "tflops": 189.22833368064192
+    },
+    "causal/d64/s4096/helion": {
+      "batching": "flatten_batch_heads",
+      "calls_per_sample": 1,
+      "config": {
+        "pallas_fold_dot_lhs_cast": true,
+        "pallas_internal_scratch": true,
+        "pallas_loop_type": "unroll",
+        "pallas_pre_broadcast": false,
+        "pallas_use_low_level_scheduler": false
+      },
+      "head_dim": 64,
+      "implementation": "helion",
+      "launcher": "torchtpu",
+      "median_ms": 4.318078979849815,
+      "mode": "causal",
+      "sampled_max_abs": 0.007199525833129883,
+      "sampled_max_relative_l2": 0.001225444138981402,
+      "samples": 20,
+      "sequence_length": 4096,
+      "shape": [
+        8,
+        32,
+        4096,
+        64
+      ],
+      "tflops": 127.3459874592487
+    },
+    "causal/d64/s4096/tokamax": {
+      "batching": "flatten_batch_heads",
+      "calls_per_sample": 1,
+      "candidates": [
+        {
+          "batching": "vmap_batch",
+          "median_ms": 4.85018384642899,
+          "sampled_max_abs": 0.006295919418334961,
+          "sampled_max_relative_l2": 0.0013191772159188986,
+          "tflops": 113.37509031144532
+        },
+        {
+          "batching": "flatten_batch_heads",
+          "median_ms": 4.386204527691007,
+          "sampled_max_abs": 0.006295919418334961,
+          "sampled_max_relative_l2": 0.0013191772159188986,
+          "tflops": 125.36807806029832
+        }
+      ],
+      "config": {
+        "block_kv": 2048,
+        "block_kv_compute": 2048,
+        "block_q": 2048,
+        "k_layout": "HEAD_DIM_MINOR",
+        "q_layout": "HEAD_DIM_MINOR",
+        "qk_diag_grid": 4,
+        "qk_diag_skip": true,
+        "sv_diag_skip": true,
+        "use_base2_exp": true,
+        "use_experimental_scheduler": false,
+        "v_layout": "HEAD_DIM_MINOR"
+      },
+      "head_dim": 64,
+      "implementation": "tokamax",
+      "median_ms": 4.386204527691007,
+      "mode": "causal",
+      "sampled_max_abs": 0.006295919418334961,
+      "sampled_max_relative_l2": 0.0013191772159188986,
+      "samples": 20,
+      "sequence_length": 4096,
+      "shape": [
+        8,
+        32,
+        4096,
+        64
+      ],
+      "tflops": 125.36807806029832
+    },
+    "causal/d64/s65536/helion": {
+      "batching": "flatten_batch_heads",
+      "calls_per_sample": 1,
+      "config": {
+        "pallas_fold_dot_lhs_cast": true,
+        "pallas_internal_scratch": true,
+        "pallas_loop_type": "unroll",
+        "pallas_pre_broadcast": false,
+        "pallas_use_low_level_scheduler": true
+      },
+      "head_dim": 64,
+      "implementation": "helion",
+      "launcher": "torchtpu",
+      "median_ms": 651.8796901218593,
+      "mode": "causal",
+      "sampled_max_abs": 0.006804466247558594,
+      "sampled_max_relative_l2": 0.0013474139850586653,
+      "samples": 20,
+      "sequence_length": 65536,
+      "shape": [
+        8,
+        32,
+        65536,
+        64
+      ],
+      "tflops": 215.8981756475137
+    },
+    "causal/d64/s65536/tokamax": {
+      "batching": "flatten_batch_heads",
+      "calls_per_sample": 1,
+      "candidates": [
+        {
+          "batching": "vmap_batch",
+          "median_ms": 694.952713092789,
+          "sampled_max_abs": 0.0052193403244018555,
+          "sampled_max_relative_l2": 0.001877455972135067,
+          "tflops": 202.51685213607425
+        },
+        {
+          "batching": "flatten_batch_heads",
+          "median_ms": 686.9494365528226,
+          "sampled_max_abs": 0.0052193403244018555,
+          "sampled_max_relative_l2": 0.001877455972135067,
+          "tflops": 204.8762665054663
+        }
+      ],
+      "config": {
+        "block_kv": 4096,
+        "block_kv_compute": 512,
+        "block_q": 2048,
+        "k_layout": "HEAD_DIM_MINOR",
+        "q_layout": "HEAD_DIM_MINOR",
+        "use_base2_exp": true,
+        "use_experimental_scheduler": true,
+        "v_layout": "HEAD_DIM_MINOR"
+      },
+      "head_dim": 64,
+      "implementation": "tokamax",
+      "median_ms": 686.9494365528226,
+      "mode": "causal",
+      "sampled_max_abs": 0.0052193403244018555,
+      "sampled_max_relative_l2": 0.001877455972135067,
+      "samples": 20,
+      "sequence_length": 65536,
+      "shape": [
+        8,
+        32,
+        65536,
+        64
+      ],
+      "tflops": 204.8762665054663
+    },
+    "causal/d64/s8192/helion": {
+      "batching": "flatten_batch_heads",
+      "calls_per_sample": 1,
+      "config": {
+        "pallas_fold_dot_lhs_cast": true,
+        "pallas_internal_scratch": true,
+        "pallas_loop_type": "unroll",
+        "pallas_pre_broadcast": false,
+        "pallas_use_low_level_scheduler": false
+      },
+      "head_dim": 64,
+      "implementation": "helion",
+      "launcher": "torchtpu",
+      "median_ms": 13.352482579648495,
+      "mode": "causal",
+      "sampled_max_abs": 0.006812572479248047,
+      "sampled_max_relative_l2": 0.0015032141236588359,
+      "samples": 20,
+      "sequence_length": 8192,
+      "shape": [
+        8,
+        32,
+        8192,
+        64
+      ],
+      "tflops": 164.71032093762872
+    },
+    "causal/d64/s8192/tokamax": {
+      "batching": "flatten_batch_heads",
+      "calls_per_sample": 1,
+      "candidates": [
+        {
+          "batching": "vmap_batch",
+          "median_ms": 15.18705883063376,
+          "sampled_max_abs": 0.004182219505310059,
+          "sampled_max_relative_l2": 0.00140727951657027,
+          "tflops": 144.81353602001047
+        },
+        {
+          "batching": "flatten_batch_heads",
+          "median_ms": 14.229313470423222,
+          "sampled_max_abs": 0.004182219505310059,
+          "sampled_max_relative_l2": 0.00140727951657027,
+          "tflops": 154.5606325687747
+        }
+      ],
+      "config": {
+        "block_kv": 2048,
+        "block_kv_compute": 2048,
+        "block_q": 2048,
+        "k_layout": "HEAD_DIM_MINOR",
+        "q_layout": "HEAD_DIM_MINOR",
+        "qk_diag_grid": 4,
+        "qk_diag_skip": true,
+        "sv_diag_skip": true,
+        "use_base2_exp": true,
+        "use_experimental_scheduler": false,
+        "v_layout": "HEAD_DIM_MINOR"
+      },
+      "head_dim": 64,
+      "implementation": "tokamax",
+      "median_ms": 14.229313470423222,
+      "mode": "causal",
+      "sampled_max_abs": 0.004182219505310059,
+      "sampled_max_relative_l2": 0.00140727951657027,
+      "samples": 20,
+      "sequence_length": 8192,
+      "shape": [
+        8,
+        32,
+        8192,
+        64
+      ],
+      "tflops": 154.5606325687747
+    },
+    "dense/d128/s1024/helion": {
+      "calls_per_sample": 1,
+      "config": {
+        "block_sizes": [
+          8,
+          1024,
+          1024
+        ],
+        "loop_orders": [
+          [
+            0,
+            1
+          ]
+        ],
+        "pallas_load_buffer_count": [
+          1,
+          1,
+          1
+        ],
+        "pallas_loop_type": "unroll"
+      },
+      "head_dim": 128,
+      "implementation": "helion",
+      "median_ms": 0.6044600158929825,
+      "mode": "dense",
+      "samples": 20,
+      "sequence_length": 1024,
+      "tflops": 227.37476401802743
+    },
+    "dense/d128/s1024/tokamax": {
+      "calls_per_sample": 1,
+      "config": {
+        "block_kv": 1024,
+        "block_kv_compute": 1024,
+        "block_q": 1024,
+        "k_layout": "HEAD_DIM_MINOR",
+        "q_layout": "HEAD_DIM_MINOR",
+        "use_base2_exp": true,
+        "use_experimental_scheduler": true,
+        "v_layout": "HEAD_DIM_MINOR"
+      },
+      "head_dim": 128,
+      "implementation": "tokamax",
+      "median_ms": 0.49912394024431705,
+      "mode": "dense",
+      "samples": 20,
+      "sequence_length": 1024,
+      "tflops": 275.3603712230769
+    },
+    "dense/d128/s16384/helion": {
+      "calls_per_sample": 1,
+      "config": {
+        "block_sizes": [
+          1,
+          512,
+          2048
+        ],
+        "loop_orders": [
+          [
+            0,
+            1
+          ]
+        ],
+        "pallas_load_buffer_count": [
+          1,
+          1,
+          1
+        ],
+        "pallas_loop_type": "unroll"
+      },
+      "head_dim": 128,
+      "implementation": "helion",
+      "median_ms": 74.22085397411138,
+      "mode": "dense",
+      "samples": 20,
+      "sequence_length": 16384,
+      "tflops": 474.0496801762008
+    },
+    "dense/d128/s16384/tokamax": {
+      "calls_per_sample": 1,
+      "config": {
+        "block_kv": 4096,
+        "block_kv_compute": 256,
+        "block_q": 4096,
+        "k_layout": "HEAD_DIM_MINOR",
+        "q_layout": "HEAD_DIM_MINOR",
+        "use_base2_exp": true,
+        "use_experimental_scheduler": true,
+        "v_layout": "HEAD_DIM_MINOR"
+      },
+      "head_dim": 128,
+      "implementation": "tokamax",
+      "median_ms": 75.13689750339836,
+      "mode": "dense",
+      "samples": 20,
+      "sequence_length": 16384,
+      "tflops": 468.270227516922
+    },
+    "dense/d128/s2048/helion": {
+      "calls_per_sample": 1,
+      "config": {
+        "block_sizes": [
+          4,
+          1024,
+          1024
+        ],
+        "loop_orders": [
+          [
+            0,
+            1
+          ]
+        ],
+        "pallas_load_buffer_count": [
+          1,
+          1,
+          1
+        ],
+        "pallas_loop_type": "unroll"
+      },
+      "head_dim": 128,
+      "implementation": "helion",
+      "median_ms": 1.4984169974923134,
+      "mode": "dense",
+      "samples": 20,
+      "sequence_length": 2048,
+      "tflops": 366.8910689134252
+    },
+    "dense/d128/s2048/tokamax": {
+      "calls_per_sample": 1,
+      "config": {
+        "block_kv": 2048,
+        "block_kv_compute": 256,
+        "block_q": 2048,
+        "k_layout": "HEAD_DIM_MINOR",
+        "q_layout": "HEAD_DIM_MINOR",
+        "use_base2_exp": true,
+        "use_experimental_scheduler": true,
+        "v_layout": "HEAD_DIM_MINOR"
+      },
+      "head_dim": 128,
+      "implementation": "tokamax",
+      "median_ms": 1.4190796064212918,
+      "mode": "dense",
+      "samples": 20,
+      "sequence_length": 2048,
+      "tflops": 387.40308253347575
+    },
+    "dense/d128/s32768/helion": {
+      "calls_per_sample": 1,
+      "config": {
+        "block_sizes": [
+          1,
+          4096,
+          256
+        ],
+        "loop_orders": [
+          [
+            0,
+            1
+          ]
+        ],
+        "pallas_emit_pipeline_group_size": 16,
+        "pallas_fold_dot_lhs_cast": true,
+        "pallas_loop_type": "emit_pipeline",
+        "pallas_pre_broadcast": true,
+        "pallas_use_low_level_scheduler": true
+      },
+      "head_dim": 128,
+      "implementation": "helion",
+      "median_ms": 290.666576474905,
+      "mode": "dense",
+      "samples": 20,
+      "sequence_length": 32768,
+      "tflops": 484.1887569673106
+    },
+    "dense/d128/s32768/tokamax": {
+      "calls_per_sample": 1,
+      "config": {
+        "block_kv": 4096,
+        "block_kv_compute": 256,
+        "block_q": 4096,
+        "k_layout": "HEAD_DIM_MINOR",
+        "q_layout": "HEAD_DIM_MINOR",
+        "use_base2_exp": true,
+        "use_experimental_scheduler": true,
+        "v_layout": "HEAD_DIM_MINOR"
+      },
+      "head_dim": 128,
+      "implementation": "tokamax",
+      "median_ms": 297.84321051556617,
+      "mode": "dense",
+      "samples": 20,
+      "sequence_length": 32768,
+      "tflops": 472.5220632416351
+    },
+    "dense/d128/s4096/helion": {
+      "calls_per_sample": 1,
+      "config": {
+        "block_sizes": [
+          2,
+          1024,
+          1024
+        ],
+        "loop_orders": [
+          [
+            0,
+            1
+          ]
+        ],
+        "pallas_load_buffer_count": [
+          1,
+          1,
+          1
+        ],
+        "pallas_loop_type": "unroll"
+      },
+      "head_dim": 128,
+      "implementation": "helion",
+      "median_ms": 5.079771508462727,
+      "mode": "dense",
+      "samples": 20,
+      "sequence_length": 4096,
+      "tflops": 432.89806478273715
+    },
+    "dense/d128/s4096/tokamax": {
+      "calls_per_sample": 1,
+      "config": {
+        "block_kv": 4096,
+        "block_kv_compute": 512,
+        "block_q": 2048,
+        "k_layout": "HEAD_DIM_MINOR",
+        "q_layout": "HEAD_DIM_MINOR",
+        "use_base2_exp": true,
+        "use_experimental_scheduler": true,
+        "v_layout": "HEAD_DIM_MINOR"
+      },
+      "head_dim": 128,
+      "implementation": "tokamax",
+      "median_ms": 4.820876056328416,
+      "mode": "dense",
+      "samples": 20,
+      "sequence_length": 4096,
+      "tflops": 456.1459846422143
+    },
+    "dense/d128/s65536/helion": {
+      "calls_per_sample": 1,
+      "config": {
+        "block_sizes": [
+          1,
+          4096,
+          256
+        ],
+        "loop_orders": [
+          [
+            0,
+            1
+          ]
+        ],
+        "pallas_emit_pipeline_group_size": 16,
+        "pallas_fold_dot_lhs_cast": true,
+        "pallas_loop_type": "emit_pipeline",
+        "pallas_pre_broadcast": true,
+        "pallas_use_low_level_scheduler": true
+      },
+      "head_dim": 128,
+      "implementation": "helion",
+      "median_ms": 1149.3313160026446,
+      "mode": "dense",
+      "samples": 20,
+      "sequence_length": 65536,
+      "tflops": 489.8065036453046
+    },
+    "dense/d128/s65536/tokamax": {
+      "calls_per_sample": 1,
+      "config": {
+        "block_kv": 2048,
+        "block_kv_compute": 256,
+        "block_q": 8192,
+        "k_layout": "HEAD_DIM_MINOR",
+        "q_layout": "HEAD_DIM_MINOR",
+        "use_base2_exp": true,
+        "use_experimental_scheduler": true,
+        "v_layout": "HEAD_DIM_MINOR"
+      },
+      "head_dim": 128,
+      "implementation": "tokamax",
+      "median_ms": 1186.4576333900914,
+      "mode": "dense",
+      "samples": 20,
+      "sequence_length": 65536,
+      "tflops": 474.47960852405896
+    },
+    "dense/d128/s8192/helion": {
+      "calls_per_sample": 1,
+      "config": {
+        "block_sizes": [
+          2,
+          512,
+          2048
+        ],
+        "loop_orders": [
+          [
+            0,
+            1
+          ]
+        ],
+        "pallas_load_buffer_count": [
+          1,
+          1,
+          1
+        ],
+        "pallas_loop_type": "unroll",
+        "pallas_pre_broadcast": false
+      },
+      "head_dim": 128,
+      "implementation": "helion",
+      "median_ms": 18.93871510401368,
+      "mode": "dense",
+      "samples": 20,
+      "sequence_length": 8192,
+      "tflops": 464.45035863831356
+    },
+    "dense/d128/s8192/tokamax": {
+      "calls_per_sample": 1,
+      "config": {
+        "block_kv": 4096,
+        "block_kv_compute": 256,
+        "block_q": 4096,
+        "k_layout": "HEAD_DIM_MINOR",
+        "q_layout": "HEAD_DIM_MINOR",
+        "use_base2_exp": true,
+        "use_experimental_scheduler": true,
+        "v_layout": "HEAD_DIM_MINOR"
+      },
+      "head_dim": 128,
+      "implementation": "tokamax",
+      "median_ms": 19.150504958815873,
+      "mode": "dense",
+      "samples": 20,
+      "sequence_length": 8192,
+      "tflops": 459.31389491423033
+    },
+    "dense/d256/s1024/helion": {
+      "calls_per_sample": 1,
+      "config": {
+        "block_sizes": [
+          4,
+          1024,
+          1024
+        ],
+        "loop_orders": [
+          [
+            0,
+            1
+          ]
+        ],
+        "pallas_load_buffer_count": [
+          1,
+          1,
+          1
+        ],
+        "pallas_loop_type": "unroll"
+      },
+      "head_dim": 256,
+      "implementation": "helion",
+      "median_ms": 0.6143884966149926,
+      "mode": "dense",
+      "samples": 20,
+      "sequence_length": 1024,
+      "tflops": 447.40080333283424
+    },
+    "dense/d256/s1024/tokamax": {
+      "calls_per_sample": 1,
+      "config": {
+        "block_kv": 1024,
+        "block_kv_compute": 256,
+        "block_q": 1024,
+        "k_layout": "HEAD_DIM_MINOR",
+        "q_layout": "HEAD_DIM_MINOR",
+        "use_base2_exp": true,
+        "use_experimental_scheduler": true,
+        "v_layout": "HEAD_DIM_MINOR"
+      },
+      "head_dim": 256,
+      "implementation": "tokamax",
+      "median_ms": 0.5872648907825351,
+      "mode": "dense",
+      "samples": 20,
+      "sequence_length": 1024,
+      "tflops": 468.06460127000446
+    },
+    "dense/d256/s16384/helion": {
+      "calls_per_sample": 1,
+      "config": {
+        "block_sizes": [
+          1,
+          512,
+          1024
+        ],
+        "loop_orders": [
+          [
+            0,
+            1
+          ]
+        ],
+        "pallas_load_buffer_count": [
+          1,
+          1,
+          1
+        ],
+        "pallas_loop_type": "unroll"
+      },
+      "head_dim": 256,
+      "implementation": "helion",
+      "median_ms": 78.44530837610364,
+      "mode": "dense",
+      "samples": 20,
+      "sequence_length": 16384,
+      "tflops": 897.042100214371
+    },
+    "dense/d256/s16384/tokamax": {
+      "calls_per_sample": 1,
+      "config": {
+        "block_kv": 2048,
+        "block_kv_compute": 256,
+        "block_q": 8192,
+        "k_layout": "HEAD_DIM_MINOR",
+        "q_layout": "HEAD_DIM_MINOR",
+        "use_base2_exp": true,
+        "use_experimental_scheduler": true,
+        "v_layout": "HEAD_DIM_MINOR"
+      },
+      "head_dim": 256,
+      "implementation": "tokamax",
+      "median_ms": 80.24516957812011,
+      "mode": "dense",
+      "samples": 20,
+      "sequence_length": 16384,
+      "tflops": 876.9218701589105
+    },
+    "dense/d256/s2048/helion": {
+      "calls_per_sample": 1,
+      "config": {
+        "block_sizes": [
+          4,
+          1024,
+          1024
+        ],
+        "loop_orders": [
+          [
+            0,
+            1
+          ]
+        ],
+        "pallas_load_buffer_count": [
+          1,
+          1,
+          1
+        ],
+        "pallas_loop_type": "unroll"
+      },
+      "head_dim": 256,
+      "implementation": "helion",
+      "median_ms": 1.5622349455952644,
+      "mode": "dense",
+      "samples": 20,
+      "sequence_length": 2048,
+      "tflops": 703.8068319212056
+    },
+    "dense/d256/s2048/tokamax": {
+      "calls_per_sample": 1,
+      "config": {
+        "block_kv": 2048,
+        "block_kv_compute": 256,
+        "block_q": 2048,
+        "k_layout": "HEAD_DIM_MINOR",
+        "q_layout": "HEAD_DIM_MINOR",
+        "use_base2_exp": true,
+        "use_experimental_scheduler": true,
+        "v_layout": "HEAD_DIM_MINOR"
+      },
+      "head_dim": 256,
+      "implementation": "tokamax",
+      "median_ms": 1.6269631450995803,
+      "mode": "dense",
+      "samples": 20,
+      "sequence_length": 2048,
+      "tflops": 675.806106049626
+    },
+    "dense/d256/s32768/helion": {
+      "calls_per_sample": 1,
+      "config": {
+        "block_sizes": [
+          1,
+          8192,
+          256
+        ],
+        "loop_orders": [
+          [
+            0,
+            1
+          ]
+        ],
+        "pallas_emit_pipeline_group_size": 8,
+        "pallas_fold_dot_lhs_cast": true,
+        "pallas_loop_type": "emit_pipeline",
+        "pallas_pre_broadcast": true,
+        "pallas_use_low_level_scheduler": true
+      },
+      "head_dim": 256,
+      "implementation": "helion",
+      "median_ms": 309.29783661849797,
+      "mode": "dense",
+      "samples": 20,
+      "sequence_length": 32768,
+      "tflops": 910.0450872465689
+    },
+    "dense/d256/s32768/tokamax": {
+      "calls_per_sample": 1,
+      "config": {
+        "block_kv": 4096,
+        "block_kv_compute": 256,
+        "block_q": 4096,
+        "k_layout": "HEAD_DIM_MINOR",
+        "q_layout": "HEAD_DIM_MINOR",
+        "use_base2_exp": true,
+        "use_experimental_scheduler": true,
+        "v_layout": "HEAD_DIM_MINOR"
+      },
+      "head_dim": 256,
+      "implementation": "tokamax",
+      "median_ms": 321.9515545060858,
+      "mode": "dense",
+      "samples": 20,
+      "sequence_length": 32768,
+      "tflops": 874.2774270572293
+    },
+    "dense/d256/s4096/helion": {
+      "calls_per_sample": 1,
+      "config": {
+        "block_sizes": [
+          2,
+          1024,
+          2048
+        ],
+        "loop_orders": [
+          [
+            0,
+            1
+          ]
+        ],
+        "pallas_load_buffer_count": [
+          1,
+          1,
+          1
+        ],
+        "pallas_loop_type": "unroll"
+      },
+      "head_dim": 256,
+      "implementation": "helion",
+      "median_ms": 5.301785888150334,
+      "mode": "dense",
+      "samples": 20,
+      "sequence_length": 4096,
+      "tflops": 829.5405744192308
+    },
+    "dense/d256/s4096/tokamax": {
+      "calls_per_sample": 1,
+      "config": {
+        "block_kv": 4096,
+        "block_kv_compute": 512,
+        "block_q": 2048,
+        "k_layout": "HEAD_DIM_MINOR",
+        "q_layout": "HEAD_DIM_MINOR",
+        "use_base2_exp": true,
+        "use_experimental_scheduler": true,
+        "v_layout": "HEAD_DIM_MINOR"
+      },
+      "head_dim": 256,
+      "implementation": "tokamax",
+      "median_ms": 5.2470340160652995,
+      "mode": "dense",
+      "samples": 20,
+      "sequence_length": 4096,
+      "tflops": 838.196683619378
+    },
+    "dense/d256/s65536/helion": {
+      "calls_per_sample": 1,
+      "config": {
+        "block_sizes": [
+          1,
+          4096,
+          256
+        ],
+        "loop_orders": [
+          [
+            0,
+            1
+          ]
+        ],
+        "pallas_emit_pipeline_group_size": 16,
+        "pallas_fold_dot_lhs_cast": true,
+        "pallas_loop_type": "emit_pipeline",
+        "pallas_pre_broadcast": true,
+        "pallas_use_low_level_scheduler": true
+      },
+      "head_dim": 256,
+      "implementation": "helion",
+      "median_ms": 1240.7509655458853,
+      "mode": "dense",
+      "samples": 20,
+      "sequence_length": 65536,
+      "tflops": 907.4342378990364
+    },
+    "dense/d256/s65536/tokamax": {
+      "calls_per_sample": 1,
+      "config": {
+        "block_kv": 2048,
+        "block_kv_compute": 256,
+        "block_q": 8192,
+        "k_layout": "HEAD_DIM_MINOR",
+        "q_layout": "HEAD_DIM_MINOR",
+        "use_base2_exp": true,
+        "use_experimental_scheduler": true,
+        "v_layout": "HEAD_DIM_MINOR"
+      },
+      "head_dim": 256,
+      "implementation": "tokamax",
+      "median_ms": 1264.6348264534026,
+      "mode": "dense",
+      "samples": 20,
+      "sequence_length": 65536,
+      "tflops": 890.2964581484341
+    },
+    "dense/d256/s8192/helion": {
+      "calls_per_sample": 1,
+      "config": {
+        "block_sizes": [
+          2,
+          512,
+          2048
+        ],
+        "loop_orders": [
+          [
+            0,
+            1
+          ]
+        ],
+        "pallas_load_buffer_count": [
+          1,
+          1,
+          1
+        ],
+        "pallas_loop_type": "unroll",
+        "pallas_pre_broadcast": false
+      },
+      "head_dim": 256,
+      "implementation": "helion",
+      "median_ms": 18.82613997440785,
+      "mode": "dense",
+      "samples": 20,
+      "sequence_length": 8192,
+      "tflops": 934.4552876123686
+    },
+    "dense/d256/s8192/tokamax": {
+      "calls_per_sample": 1,
+      "config": {
+        "block_kv": 8192,
+        "block_kv_compute": 512,
+        "block_q": 2048,
+        "k_layout": "HEAD_DIM_MINOR",
+        "q_layout": "HEAD_DIM_MINOR",
+        "use_base2_exp": true,
+        "use_experimental_scheduler": true,
+        "v_layout": "SEQ_MINOR"
+      },
+      "head_dim": 256,
+      "implementation": "tokamax",
+      "median_ms": 20.70231456309557,
+      "mode": "dense",
+      "samples": 20,
+      "sequence_length": 8192,
+      "tflops": 849.7690434950806
+    },
+    "dense/d64/s1024/helion": {
+      "calls_per_sample": 1,
+      "config": {
+        "block_sizes": [
+          8,
+          1024,
+          512
+        ],
+        "loop_orders": [
+          [
+            0,
+            1
+          ]
+        ],
+        "pallas_load_buffer_count": [
+          1,
+          1,
+          1
+        ],
+        "pallas_loop_type": "unroll"
+      },
+      "head_dim": 64,
+      "implementation": "helion",
+      "median_ms": 0.7464934606105089,
+      "mode": "dense",
+      "samples": 20,
+      "sequence_length": 1024,
+      "tflops": 92.05636802203031
+    },
+    "dense/d64/s1024/tokamax": {
+      "calls_per_sample": 1,
+      "config": {
+        "block_kv": 1024,
+        "block_kv_compute": 512,
+        "block_q": 1024,
+        "k_layout": "HEAD_DIM_MINOR",
+        "q_layout": "SEQ_MINOR",
+        "use_base2_exp": true,
+        "use_experimental_scheduler": true,
+        "v_layout": "SEQ_MINOR"
+      },
+      "head_dim": 64,
+      "implementation": "tokamax",
+      "median_ms": 0.6118620513007045,
+      "mode": "dense",
+      "samples": 20,
+      "sequence_length": 1024,
+      "tflops": 112.31204254278431
+    },
+    "dense/d64/s16384/helion": {
+      "calls_per_sample": 1,
+      "config": {
+        "block_sizes": [
+          1,
+          512,
+          2048
+        ],
+        "loop_orders": [
+          [
+            0,
+            1
+          ]
+        ],
+        "pallas_load_buffer_count": [
+          1,
+          1,
+          1
+        ],
+        "pallas_loop_type": "unroll"
+      },
+      "head_dim": 64,
+      "implementation": "helion",
+      "median_ms": 76.51911757420748,
+      "mode": "dense",
+      "samples": 20,
+      "sequence_length": 16384,
+      "tflops": 229.9057621431046
+    },
+    "dense/d64/s16384/tokamax": {
+      "calls_per_sample": 1,
+      "config": {
+        "block_kv": 4096,
+        "block_kv_compute": 256,
+        "block_q": 4096,
+        "k_layout": "HEAD_DIM_MINOR",
+        "q_layout": "HEAD_DIM_MINOR",
+        "use_base2_exp": true,
+        "use_experimental_scheduler": true,
+        "v_layout": "HEAD_DIM_MINOR"
+      },
+      "head_dim": 64,
+      "implementation": "tokamax",
+      "median_ms": 79.11269902251661,
+      "mode": "dense",
+      "samples": 20,
+      "sequence_length": 16384,
+      "tflops": 222.36867483700703
+    },
+    "dense/d64/s2048/helion": {
+      "calls_per_sample": 1,
+      "config": {
+        "block_sizes": [
+          4,
+          1024,
+          1024
+        ],
+        "loop_orders": [
+          [
+            0,
+            1
+          ]
+        ],
+        "pallas_load_buffer_count": [
+          1,
+          1,
+          1
+        ],
+        "pallas_loop_type": "unroll"
+      },
+      "head_dim": 64,
+      "implementation": "helion",
+      "median_ms": 1.803460530936718,
+      "mode": "dense",
+      "samples": 20,
+      "sequence_length": 2048,
+      "tflops": 152.41692414595198
+    },
+    "dense/d64/s2048/tokamax": {
+      "calls_per_sample": 1,
+      "config": {
+        "block_kv": 2048,
+        "block_kv_compute": 1024,
+        "block_q": 2048,
+        "k_layout": "SEQ_MINOR",
+        "q_layout": "SEQ_MINOR",
+        "use_base2_exp": true,
+        "use_experimental_scheduler": false,
+        "v_layout": "HEAD_DIM_MINOR"
+      },
+      "head_dim": 64,
+      "implementation": "tokamax",
+      "median_ms": 1.657872460782528,
+      "mode": "dense",
+      "samples": 20,
+      "sequence_length": 2048,
+      "tflops": 165.80160021130675
+    },
+    "dense/d64/s32768/helion": {
+      "calls_per_sample": 1,
+      "config": {
+        "block_sizes": [
+          1,
+          4096,
+          256
+        ],
+        "loop_orders": [
+          [
+            0,
+            1
+          ]
+        ],
+        "pallas_emit_pipeline_group_size": 16,
+        "pallas_fold_dot_lhs_cast": true,
+        "pallas_loop_type": "emit_pipeline",
+        "pallas_pre_broadcast": true,
+        "pallas_use_low_level_scheduler": true
+      },
+      "head_dim": 64,
+      "implementation": "helion",
+      "median_ms": 295.09614151902497,
+      "mode": "dense",
+      "samples": 20,
+      "sequence_length": 32768,
+      "tflops": 238.46040078815227
+    },
+    "dense/d64/s32768/tokamax": {
+      "calls_per_sample": 1,
+      "config": {
+        "block_kv": 4096,
+        "block_kv_compute": 256,
+        "block_q": 4096,
+        "k_layout": "HEAD_DIM_MINOR",
+        "q_layout": "HEAD_DIM_MINOR",
+        "use_base2_exp": true,
+        "use_experimental_scheduler": true,
+        "v_layout": "HEAD_DIM_MINOR"
+      },
+      "head_dim": 64,
+      "implementation": "tokamax",
+      "median_ms": 306.06646998785436,
+      "mode": "dense",
+      "samples": 20,
+      "sequence_length": 32768,
+      "tflops": 229.91327400370398
+    },
+    "dense/d64/s4096/helion": {
+      "calls_per_sample": 1,
+      "config": {
+        "block_sizes": [
+          2,
+          1024,
+          2048
+        ],
+        "loop_orders": [
+          [
+            0,
+            1
+          ]
+        ],
+        "pallas_load_buffer_count": [
+          1,
+          1,
+          1
+        ],
+        "pallas_loop_type": "unroll"
+      },
+      "head_dim": 64,
+      "implementation": "helion",
+      "median_ms": 5.729590426199138,
+      "mode": "dense",
+      "samples": 20,
+      "sequence_length": 4096,
+      "tflops": 191.9005628654311
+    },
+    "dense/d64/s4096/tokamax": {
+      "calls_per_sample": 1,
+      "config": {
+        "block_kv": 4096,
+        "block_kv_compute": 1024,
+        "block_q": 4096,
+        "k_layout": "HEAD_DIM_MINOR",
+        "q_layout": "SEQ_MINOR",
+        "use_base2_exp": true,
+        "use_experimental_scheduler": false,
+        "v_layout": "SEQ_MINOR"
+      },
+      "head_dim": 64,
+      "implementation": "tokamax",
+      "median_ms": 5.34614606294781,
+      "mode": "dense",
+      "samples": 20,
+      "sequence_length": 4096,
+      "tflops": 205.6643449000233
+    },
+    "dense/d64/s65536/helion": {
+      "calls_per_sample": 1,
+      "config": {
+        "block_sizes": [
+          1,
+          4096,
+          256
+        ],
+        "loop_orders": [
+          [
+            0,
+            1
+          ]
+        ],
+        "pallas_emit_pipeline_group_size": 16,
+        "pallas_fold_dot_lhs_cast": true,
+        "pallas_loop_type": "emit_pipeline",
+        "pallas_pre_broadcast": true,
+        "pallas_use_low_level_scheduler": true
+      },
+      "head_dim": 64,
+      "implementation": "helion",
+      "median_ms": 1158.3329815184698,
+      "mode": "dense",
+      "samples": 20,
+      "sequence_length": 65536,
+      "tflops": 243.0000536992979
+    },
+    "dense/d64/s65536/tokamax": {
+      "calls_per_sample": 1,
+      "config": {
+        "block_kv": 4096,
+        "block_kv_compute": 256,
+        "block_q": 4096,
+        "k_layout": "HEAD_DIM_MINOR",
+        "q_layout": "HEAD_DIM_MINOR",
+        "use_base2_exp": true,
+        "use_experimental_scheduler": true,
+        "v_layout": "HEAD_DIM_MINOR"
+      },
+      "head_dim": 64,
+      "implementation": "tokamax",
+      "median_ms": 1204.1542454389855,
+      "mode": "dense",
+      "samples": 20,
+      "sequence_length": 65536,
+      "tflops": 233.7532569243583
+    },
+    "dense/d64/s8192/helion": {
+      "calls_per_sample": 1,
+      "config": {
+        "block_sizes": [
+          2,
+          512,
+          2048
+        ],
+        "loop_orders": [
+          [
+            0,
+            1
+          ]
+        ],
+        "pallas_load_buffer_count": [
+          1,
+          1,
+          1
+        ],
+        "pallas_loop_type": "unroll",
+        "pallas_pre_broadcast": false
+      },
+      "head_dim": 64,
+      "implementation": "helion",
+      "median_ms": 20.194700337015092,
+      "mode": "dense",
+      "samples": 20,
+      "sequence_length": 8192,
+      "tflops": 217.78221205108804
+    },
+    "dense/d64/s8192/tokamax": {
+      "calls_per_sample": 1,
+      "config": {
+        "block_kv": 4096,
+        "block_kv_compute": 1024,
+        "block_q": 4096,
+        "k_layout": "HEAD_DIM_MINOR",
+        "q_layout": "SEQ_MINOR",
+        "use_base2_exp": true,
+        "use_experimental_scheduler": false,
+        "v_layout": "SEQ_MINOR"
+      },
+      "head_dim": 64,
+      "implementation": "tokamax",
+      "median_ms": 20.620855502784252,
+      "mode": "dense",
+      "samples": 20,
+      "sequence_length": 8192,
+      "tflops": 213.2814766346707
+    }
+  }
+}
