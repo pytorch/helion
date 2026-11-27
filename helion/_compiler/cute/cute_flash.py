@@ -12856,7 +12856,14 @@ def emit_small_biased_attention_simt_device_body(
     seq: int,
     head_dim: int,
     io_dtype: str,
+    v_storage_k_major: bool = False,
 ) -> list[ast.AST]:
+    """The SIMT body of the small biased plan. Q, K, the bias and the output
+    are contiguous; V is read from the storage its plan found
+    (``FlashGraphOutputPlan.v_storage_k_major``): the contiguous
+    ``[batch heads, seq, head_dim]`` buffer, or the dense transpose of a
+    contiguous ``[batch heads, head_dim, seq]`` one, whose key dim has the
+    unit stride."""
     score_body = _small_biased_attention_score_pair_expr(
         q_name,
         k_name,
@@ -12879,7 +12886,11 @@ def emit_small_biased_attention_simt_device_body(
         "small_bh",
         "small_kv",
         "small_col",
-        strides=_small_biased_qkv_strides(seq, head_dim),
+        strides=(
+            (seq * head_dim, 1, seq)
+            if v_storage_k_major
+            else _small_biased_qkv_strides(seq, head_dim)
+        ),
     )
     o_store = _small_biased_attention_gmem_expr(
         o_name,
@@ -27877,6 +27888,7 @@ def codegen_attention_flash(cg: GenerateAST) -> bool:
             seq=seq,
             head_dim=head_dim,
             io_dtype=io_dtype_str,
+            v_storage_k_major=plan.v_storage_k_major,
         ).statements
         df.preamble = []
         return True
