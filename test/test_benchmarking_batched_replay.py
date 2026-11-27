@@ -15,6 +15,7 @@ from torch.profiler import profile
 from helion._dist_utils import all_ranks_agree
 from helion._testing import DEVICE
 from helion._testing import skipIfRocm
+from helion._testing.benchmark_timers import TIMER_SETTINGS
 from helion._testing.benchmark_timers import trace_test
 from helion.autotuner import benchmark_job
 from helion.autotuner import benchmarking
@@ -27,6 +28,44 @@ from helion.runtime.settings import _get_backend
 
 if TYPE_CHECKING:
     from collections.abc import Callable
+    from collections.abc import Iterator
+
+
+@pytest.fixture(autouse=True)
+def _timer_defaults(monkeypatch) -> None:
+    """Every test of this module starts with the timer settings unset, whatever
+    the shell exports or an earlier test left in the worker; a test that
+    needs a setting sets it itself."""
+    for name in TIMER_SETTINGS:
+        monkeypatch.delenv(name, raising=False)
+
+
+@pytest.fixture(scope="class")
+def _exported_timer_settings() -> Iterator[None]:
+    """A shell that exports the four settings, named here so that the test
+    below fails when ``TIMER_SETTINGS`` lacks one. (Class scope: built
+    before the function fixtures of a test, ``_timer_defaults`` among them.)"""
+    with pytest.MonkeyPatch.context() as shell:
+        shell.setenv("HELION_BENCHMARK_CUDAGRAPH", "1")
+        shell.setenv("HELION_AUTOTUNE_L2_FLUSH", "0")
+        shell.setenv("HELION_AUTOTUNE_FINAL_L2_FLUSH", "0")
+        shell.setenv("HELION_AUTOTUNE_TARGET_REGIME", "0")
+        yield
+
+
+@pytest.mark.cpu_only
+@pytest.mark.usefixtures("_exported_timer_settings")
+class TestExportedTimerSettings:
+    def test_a_test_of_this_module_reads_the_defaults(self) -> None:
+        """Under a shell that exports the four settings, a test of this
+        module still starts from their defaults."""
+        assert not benchmarking._env_get_bool(
+            benchmarking._BENCHMARK_CUDAGRAPH_ENV, default=False
+        )
+        # (each of the three regimes would read ``off`` from the shell's ``0``)
+        assert benchmarking._l2_flush_mode() == "call"
+        assert benchmarking.final_selection_l2_flush_mode() == "call"
+        assert benchmarking.final_selection_target_regime() == "auto"
 
 
 def test_batched_replay_calls_fold_short_kernels_only() -> None:
@@ -398,8 +437,8 @@ def test_batch_memory_guard_counts_what_a_call_keeps(monkeypatch) -> None:
     assert benchmarking._batch_memory_calls([in_place], 256) == 256
 
 
+@pytest.mark.cpu_only
 def test_l2_flush_mode_literals(monkeypatch) -> None:
-    monkeypatch.delenv("HELION_AUTOTUNE_L2_FLUSH", raising=False)
     assert benchmarking._l2_flush_mode() == "call"
     monkeypatch.setenv("HELION_AUTOTUNE_L2_FLUSH", "0")
     assert benchmarking._l2_flush_mode() == "off"
@@ -416,13 +455,12 @@ def test_l2_flush_mode_literals(monkeypatch) -> None:
     assert benchmarking._l2_flush_mode() == "call"
 
 
+@pytest.mark.cpu_only
 def test_final_selection_regime_follows_the_search_regime(monkeypatch) -> None:
     """The final selection keeps the per-call flush and replay regimes of
     the search, but a resident search (HELION_AUTOTUNE_L2_FLUSH=0) hands its
     finalists to the replay regime, where configs that tie L2-resident
     separate; HELION_AUTOTUNE_FINAL_L2_FLUSH pins the regime explicitly."""
-    monkeypatch.delenv("HELION_AUTOTUNE_FINAL_L2_FLUSH", raising=False)
-    monkeypatch.delenv("HELION_AUTOTUNE_L2_FLUSH", raising=False)
     assert benchmarking.final_selection_l2_flush_mode() == "call"
     monkeypatch.setenv("HELION_AUTOTUNE_L2_FLUSH", "1")
     assert benchmarking.final_selection_l2_flush_mode() == "call"
@@ -450,8 +488,6 @@ def test_backend_default_replaces_only_the_default_search_regime(
 ) -> None:
     """A backend's final-selection regime (CuTe: ``kernel``) replaces the
     default per-call flush only; an explicit search or final regime wins."""
-    monkeypatch.delenv("HELION_AUTOTUNE_FINAL_L2_FLUSH", raising=False)
-    monkeypatch.delenv("HELION_AUTOTUNE_L2_FLUSH", raising=False)
     assert benchmarking.final_selection_l2_flush_mode("kernel") == "kernel"
     monkeypatch.setenv("HELION_AUTOTUNE_L2_FLUSH", "1")
     assert benchmarking.final_selection_l2_flush_mode("kernel") == "call"
@@ -468,7 +504,6 @@ def test_backend_default_replaces_only_the_default_search_regime(
     assert benchmarking.final_selection_l2_flush_mode() == "kernel"
     # a per-call flushed regime takes no second (cold) column; a warm one's
     # cold column takes the backend's timer
-    monkeypatch.delenv("HELION_AUTOTUNE_TARGET_REGIME", raising=False)
     assert benchmarking.final_selection_second_regime("kernel") is None
     assert benchmarking.final_selection_second_regime("replay") == "call"
     assert benchmarking.final_selection_second_regime("replay", "kernel") == "kernel"
@@ -889,7 +924,6 @@ def test_search_trace_reads_the_replay_of_a_multi_launch_call(
         return window(fn, *args, **kwargs)  # type: ignore[arg-type]
 
     monkeypatch.setattr(benchmarking, "_traced_candidate_window", traced)
-    monkeypatch.delenv("HELION_BENCHMARK_CUDAGRAPH", raising=False)
     reading = benchmarking.do_bench(
         host,
         return_mode="median",
@@ -1496,7 +1530,6 @@ def test_do_bench_drains_the_launch_queue_on_hip(monkeypatch, hip: bool) -> None
     wait on the device."""
     from triton import runtime
 
-    monkeypatch.delenv("HELION_BENCHMARK_CUDAGRAPH", raising=False)
     # Triton picks its driver from ``torch.version.hip`` on first use: build
     # the device's own before the patch (alone in a process, the test would
     # otherwise hand do_bench the AMD driver on an NVIDIA device).

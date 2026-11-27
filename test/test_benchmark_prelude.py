@@ -22,6 +22,7 @@ import helion
 from helion import exc
 from helion._testing import onlyBackends
 from helion._testing import skipIfRefEager
+from helion._testing.benchmark_timers import TIMER_SETTINGS
 from helion._testing.benchmark_timers import LoggedPrelude
 from helion._testing.benchmark_timers import stand_in_event_timer
 from helion._testing.benchmark_timers import stand_in_trace
@@ -666,7 +667,8 @@ def _job_stand_ins(
     monkeypatch.setattr(benchmark_job, "steady_graph_dispatch", lambda **kwargs: None)
     monkeypatch.setattr(benchmark_job, "synchronize_device", lambda: None)
     monkeypatch.setattr(benchmark_job, "do_bench", bench)
-    monkeypatch.delenv("HELION_AUTOTUNE_L2_FLUSH", raising=False)
+    for name in TIMER_SETTINGS:
+        monkeypatch.delenv(name, raising=False)
     return calls
 
 
@@ -828,12 +830,7 @@ def _provider(
         env=SimpleNamespace(device=torch.device("cuda")),
         supports_subprocess_benchmark=lambda: True,
     )
-    for name in (
-        "HELION_AUTOTUNE_L2_FLUSH",
-        "HELION_AUTOTUNE_FINAL_L2_FLUSH",
-        "HELION_AUTOTUNE_TARGET_REGIME",
-        "HELION_BENCHMARK_CUDAGRAPH",
-    ):
+    for name in TIMER_SETTINGS:
         monkeypatch.delenv(name, raising=False)
     # (an NVIDIA build, whatever build runs the test)
     monkeypatch.setattr(torch.version, "hip", None)

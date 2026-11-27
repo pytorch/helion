@@ -1,4 +1,5 @@
-"""Stand-ins for the autotuner's timers in CPU tests, and the marks of the
+"""Stand-ins for the autotuner's timers in CPU tests, the graph replay and L2
+regime settings the timers take from the environment, and the marks of the
 tests that read the CUDA activity trace (``test_benchmark_prelude``,
 ``test_benchmarking_batched_replay``, ``test_l2_flush_sweep``)."""
 
@@ -17,6 +18,18 @@ from helion.autotuner import benchmarking
 
 if TYPE_CHECKING:
     from collections.abc import Callable
+
+# The graph replay and L2 regime settings the timers and the final selection
+# take from the environment: whether a call is timed as a graph replay, the L2
+# regime of the search, and the regime and the target regime of the final
+# selection. (Not everything the timers read there: the graph dispatch
+# warm-up has HELION_BENCHMARK_GRAPH_WARMUP.)
+TIMER_SETTINGS = (
+    benchmarking._BENCHMARK_CUDAGRAPH_ENV,
+    benchmarking._L2_FLUSH_ENV,
+    benchmarking._FINAL_L2_FLUSH_ENV,
+    benchmarking._TARGET_REGIME_ENV,
+)
 
 
 def stand_in_event_timer(
@@ -48,7 +61,7 @@ def stand_in_event_timer(
     monkeypatch.setattr(
         benchmarking, "_release_l2_pins", lambda buffer: log.append(sweep)
     )
-    for name in ("HELION_AUTOTUNE_L2_FLUSH", "HELION_BENCHMARK_CUDAGRAPH"):
+    for name in TIMER_SETTINGS:
         monkeypatch.delenv(name, raising=False)
     return log
 
