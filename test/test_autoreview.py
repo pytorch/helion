@@ -1639,9 +1639,15 @@ def test_resume_continues_both_reviewer_sessions(checkout, scripted):
         "id": session_id,
         "repo_root": str(checkout),
         "target": {"head": True, "args": []},
-        "claude": {"session_id": "claude-session", "model": "opus", "effort": "high"},
+        "claude": {
+            "session_id": "claude-session",
+            "checkout": str(checkout),
+            "model": "opus",
+            "effort": "high",
+        },
         "codex": {
             "session_id": "codex-session",
+            "checkout": str(checkout),
             "model": "",
             "effort": "xhigh",
             "sandbox": "workspace-write",
@@ -2195,12 +2201,27 @@ def test_resume_refuses_sessions_it_cannot_continue(
         assert "is not a review session" in refused("--resume", session_id, "-m", "x")
     path.write_text(saved)
 
-    # Another checkout's session: its reviewers looked at other files.
+    # The session of another repository, whose reviewers looked at other
+    # files: a directory without git, and a clone that has the same commits
+    # and not the ref that pins the reviewed code.
     other = tmp_path_factory.mktemp("other")
-    monkeypatch.setattr(autoreview, "REPO_ROOT", other)
-    err = refused("--resume", str(path), "-m", "x")
-    assert f"belongs to the checkout {checkout}" in err
+    clone = tmp_path_factory.mktemp("clone") / "repo"
+    _git(checkout, "clone", "-q", str(checkout), str(clone))
+    assert _git(clone, "rev-parse", "HEAD") == _git(checkout, "rev-parse", "HEAD")
+    for root in (other, clone):
+        monkeypatch.setattr(autoreview, "REPO_ROOT", root)
+        monkeypatch.setattr(autoreview, "LOGS_BASE", root / "logs")
+        err = refused("--resume", str(path), "-m", "x")
+        assert (
+            f"belongs to the checkout {checkout}, and {root} has no ref of that "
+            f"review (refs/autoreview/{session_id}/)"
+        ) in err
+        assert "the session of another clone, or its refs have expired" in err
+        # Its id names nothing here: the other repository is not searched.
+        assert "no review session" in refused("--resume", session_id, "-m", "x")
     monkeypatch.setattr(autoreview, "REPO_ROOT", checkout)
+    monkeypatch.setattr(autoreview, "LOGS_BASE", checkout / "logs")
+    assert path.read_text() == saved
 
     # The reviewed commit is gone (the ref was deleted and git pruned it).
     lost = json.loads(saved)
@@ -2211,6 +2232,315 @@ def test_resume_refuses_sessions_it_cannot_continue(
     )
     path.write_text(saved)
     assert len(_session(checkout, session_id)["rounds"]) == 1
+
+
+def _worktree(checkout: Path, name: str, monkeypatch) -> Path:
+    """Add a worktree of the test's checkout at its HEAD and make it the
+    checkout that autoreview runs in."""
+    other = checkout.parent / f"{checkout.name}-{name}"
+    head = _git(checkout, "rev-parse", "HEAD")
+    _git(checkout, "worktree", "add", "-q", "--detach", str(other), head)
+    _run_in(other, monkeypatch)
+    return other
+
+
+def _run_in(root: Path, monkeypatch) -> None:
+    monkeypatch.setattr(autoreview, "REPO_ROOT", root)
+    monkeypatch.setattr(autoreview, "LOGS_BASE", root / "logs")
+
+
+@needs_git
+def test_any_worktree_of_the_repository_continues_a_session(
+    checkout, scripted, monkeypatch
+):
+    """A commit reviewed in one worktree gets its next round in another: the
+    session is found there, moves to the worktree that runs the round, and
+    the reviewers are told where the files are now."""
+    scripted.claude += ["1. [defect] claude finding"]
+    scripted.codex += ["LGTM"]
+    code, _, err = scripted("--head")
+    assert code == 0
+    session_id = _session_id(err)
+    home = checkout / "logs" / session_id / "session.json"
+    saved = home.read_text()
+    first_logs = _session(checkout, session_id)["rounds"][0]["log_dir"]
+    assert first_logs == f"logs/{session_id}"
+
+    other = _worktree(checkout, "other", monkeypatch)
+    there = other / "logs" / session_id / "session.json"
+    (other / "x.py").write_text("fixed\n")
+    _git(other, "commit", "-q", "-a", "--amend", "--no-edit")
+    new = _git(other, "rev-parse", "HEAD")
+
+    # A round that fails leaves the session in the worktree that has it.
+    del scripted.calls[:]
+    scripted.claude += [autoreview.ReviewAbort("[claude] failed")]
+    scripted.codex += [autoreview.ReviewAbort("[codex] failed")]
+    code, out, err = scripted("--resume", session_id, "-m", "Fixed.")
+    assert code == 2 and not out and len(scripted.calls) == 2
+    assert home.read_text() == saved and not there.exists()
+
+    # Held by a run in either worktree, the session is not continued.
+    if sys.platform != "win32":
+        for held in (home, there):
+            with autoreview.session_lock(held):
+                code, _, err = scripted("--resume", session_id, "-m", "Fixed.")
+                assert code == 2 and "another autoreview.py run is resuming" in err
+        assert home.read_text() == saved and not there.exists()
+
+    del scripted.calls[:]
+    scripted.claude += ["LGTM"]
+    scripted.codex += ["LGTM"]
+    code, out, err = scripted("--resume", session_id, "-m", "Fixed.")
+    assert code == 0 and out.strip() == "LGTM"
+    moved = autoreview.SESSION_MOVED_NOTICE.format(id=session_id, old=checkout)
+    assert f"autoreview.py: {moved}\n" in err
+    assert err.rstrip().endswith("\nautoreview passed: claude, codex")
+    # Both reviewers continue their own sessions, in the other worktree.
+    assert [call.resumed for call in scripted.calls] == [
+        "claude-session",
+        "codex-session",
+    ]
+    for call in scripted.calls:
+        text = " ".join(call.prompt.split())
+        assert (
+            "Your last round of this review ran in another worktree of this "
+            f"repository, {checkout}. This round runs in {other}: read the "
+            "files here"
+        ) in text
+        assert f"Current: commit {new} (HEAD)" in text
+    # The session is the other worktree's now, with the round it ran; the
+    # logs of the first round are named where they are.
+    assert not home.exists()
+    session = json.loads(there.read_text())
+    assert session["repo_root"] == str(other)
+    assert session["claude"]["checkout"] == session["codex"]["checkout"] == str(other)
+    assert [entry["passed"] for entry in session["rounds"]] == [False, True]
+    assert session["rounds"][0]["log_dir"] == str(checkout / first_logs)
+    assert session["rounds"][1]["log_dir"].startswith("logs/")
+    assert _git(checkout, "rev-parse", f"refs/autoreview/{session_id}/2") == new
+
+    # And back: the first worktree finds it there, by its id.
+    _run_in(checkout, monkeypatch)
+    del scripted.calls[:]
+    scripted.claude += ["LGTM"]
+    scripted.codex += ["LGTM"]
+    code, _, err = scripted("--resume", session_id, "-m", "Once more.")
+    assert code == 0 and not there.exists()
+    assert f"runs in {checkout}: read the files here" in " ".join(
+        scripted.calls[0].prompt.split()
+    )
+    session = _session(checkout, session_id)
+    assert session["repo_root"] == str(checkout) and len(session["rounds"]) == 3
+    assert session["rounds"][0]["log_dir"] == str(checkout / first_logs)
+    assert session["rounds"][1]["log_dir"].startswith(str(other / "logs"))
+    # In its own checkout a round says nothing about where it runs.
+    del scripted.calls[:]
+    scripted.claude += ["LGTM"]
+    scripted.codex += ["LGTM"]
+    code, _, err = scripted("--resume", session_id, "-m", "And again.")
+    assert code == 0 and "it moves to this one" not in err
+    for call in scripted.calls:
+        text = " ".join(call.prompt.split())
+        assert "another worktree" not in text
+        assert f"This round runs in the checkout {checkout}: read the files" in text
+
+
+def _moved_note(prompt: str) -> str | None:
+    """The two worktrees that a round's request names, if it names any."""
+    match = re.search(
+        r"Your last round of this review ran in another worktree of this "
+        r"repository, (\S+)\. This round runs in (\S+): read the files here",
+        " ".join(prompt.split()),
+    )
+    return None if match is None else f"{match.group(1)} -> {match.group(2)}"
+
+
+@needs_git
+def test_each_reviewer_is_told_where_its_own_last_round_ran(
+    checkout, scripted, monkeypatch
+):
+    """The reviewers of a half-done round are out of step: the one that
+    failed has not read the files where the session is kept now."""
+    scripted.claude += ["1. [defect] claude finding"]
+    scripted.codex += ["LGTM"]
+    _, _, err = scripted("--head")
+    session_id = _session_id(err)
+    home = checkout / "logs" / session_id / "session.json"
+    other = _worktree(checkout, "other", monkeypatch)
+    there = other / "logs" / session_id / "session.json"
+
+    def run(*argv: str) -> tuple[int, str, dict[str, str | None]]:
+        del scripted.calls[:]
+        code, _, err = scripted("--resume", session_id, *argv)
+        notes = {
+            call.name: _moved_note(call.prompt)
+            for call in scripted.calls
+            if getattr(call, "phase", "review") == "review"
+        }
+        return code, err, notes
+
+    def checkouts(root: Path) -> list[str]:
+        session = _session(root, session_id)
+        assert session["repo_root"] == str(root)
+        return [session[name]["checkout"] for name in ("claude", "codex")]
+
+    # The half-done round is saved where it ran, and the session with it.
+    scripted.claude += ["LGTM"]
+    scripted.codex += [autoreview.ReviewAbort("[codex] failed")]
+    code, err, notes = run("-m", "Why?")
+    assert code == 2 and "is half done" in err
+    assert notes == {"claude": f"{checkout} -> {other}"} | {
+        "codex": f"{checkout} -> {other}"
+    }
+    assert not home.exists()
+    session = json.loads(there.read_text())
+    assert len(session["rounds"]) == 1
+    assert session["pending"]["reviews"] == {"claude": "LGTM"}
+    assert session["pending"]["log_dir"].startswith("logs/")
+    # Claude read the files here; Codex last did where the first round ran.
+    assert checkouts(other) == [str(other), str(checkout)]
+    # Completed in the same worktree, as the run said: Codex, which has not
+    # finished a round here, is still told where it is.
+    scripted.codex += ["LGTM"]
+    code, err, notes = run()
+    assert code == 0 and "round 2, completed from the review of claude" in err
+    assert notes == {"codex": f"{checkout} -> {other}"}
+    assert "it moves to this one" not in err
+    assert checkouts(other) == [str(other), str(other)]
+
+    # A third worktree starts the next round, half done again, and the
+    # first one completes it: each reviewer hears of its own last worktree.
+    third = _worktree(checkout, "third", monkeypatch)
+    scripted.claude += ["LGTM"]
+    scripted.codex += [autoreview.ReviewAbort("[codex] failed")]
+    code, err, notes = run("-m", "And now?")
+    assert code == 2 and "is half done" in err
+    assert notes == {"claude": f"{other} -> {third}", "codex": f"{other} -> {third}"}
+    assert not there.exists() and checkouts(third) == [str(third), str(other)]
+    _run_in(checkout, monkeypatch)
+    scripted.codex += ["LGTM"]
+    code, err, notes = run()
+    assert code == 0 and "round 3, completed from the review of claude" in err
+    assert notes == {"codex": f"{other} -> {checkout}"}
+    # Claude's review of that round was made in the third worktree.
+    assert checkouts(checkout) == [str(third), str(checkout)]
+    session = _session(checkout, session_id)
+    assert session["pending"] is None and len(session["rounds"]) == 3
+    scripted.claude += ["LGTM"]
+    scripted.codex += ["LGTM"]
+    code, err, notes = run("-m", "Once more.")
+    assert code == 0
+    assert notes == {"claude": f"{third} -> {checkout}", "codex": None}
+    assert checkouts(checkout) == [str(checkout), str(checkout)]
+
+
+@needs_git
+def test_a_failed_attempt_at_a_round_does_not_cut_the_session_off(
+    checkout, scripted, monkeypatch
+):
+    """An attempt at a half-done round pins the code it finds under that
+    round's ref. When it fails, the session still names the code of the
+    half that was saved: the other worktrees continue it all the same."""
+    scripted.claude += ["1. [defect] claude finding"]
+    scripted.codex += ["LGTM"]
+    _, _, err = scripted("--head")
+    session_id = _session_id(err)
+    scripted.claude += ["LGTM"]
+    scripted.codex += [autoreview.ReviewAbort("[codex] failed")]
+    code, _, err = scripted("--resume", session_id, "-m", "Why?")
+    assert code == 2 and "is half done" in err
+    home = checkout / "logs" / session_id / "session.json"
+    saved = home.read_text()
+    half = json.loads(saved)["pending"]["snapshot"]
+
+    other = _worktree(checkout, "other", monkeypatch)
+    (other / "x.py").write_text("fixed\n")
+    _git(other, "commit", "-q", "-a", "--amend", "--no-edit")
+    new = _git(other, "rev-parse", "HEAD")
+    scripted.claude += [autoreview.ReviewAbort("[claude] failed")]
+    scripted.codex += [autoreview.ReviewAbort("[codex] failed")]
+    code, _, err = scripted("--resume", session_id, "-m", "Fixed.")
+    assert code == 2 and "starts over with both reviewers" in err
+    assert home.read_text() == saved
+    # The round's ref is the failed attempt's now, not the saved half's.
+    assert _git(checkout, "rev-parse", f"refs/autoreview/{session_id}/2") == new
+    assert new != half
+
+    scripted.claude += ["LGTM"]
+    scripted.codex += ["LGTM"]
+    code, out, err = scripted("--resume", session_id, "-m", "Fixed.")
+    assert code == 0 and out.strip() == "LGTM"
+    assert not home.exists() and len(_session(other, session_id)["rounds"]) == 2
+
+
+@needs_git
+def test_a_moved_worktree_keeps_its_sessions(checkout, scripted, monkeypatch):
+    other = _worktree(checkout, "other", monkeypatch)
+    scripted.claude += ["1. [defect] claude finding"]
+    scripted.codex += ["LGTM"]
+    _, _, err = scripted("--head")
+    session_id = _session_id(err)
+    renamed = checkout.parent / f"{checkout.name}-renamed"
+    _git(checkout, "worktree", "move", str(other), str(renamed))
+    _run_in(renamed, monkeypatch)
+    del scripted.calls[:]
+    scripted.claude += ["LGTM"]
+    scripted.codex += ["LGTM"]
+    code, _, err = scripted("--resume", session_id, "-m", "Why?")
+    assert code == 0 and "it moves to this one" not in err
+    # The file is where it was, in the logs that moved with the worktree.
+    session = _session(renamed, session_id)
+    assert session["repo_root"] == str(renamed) and len(session["rounds"]) == 2
+    assert session["rounds"][0]["log_dir"] == f"logs/{session_id}"
+    assert _moved_note(scripted.calls[0].prompt) == f"{other} -> {renamed}"
+
+    # Moved once more, and continued from another worktree before a round
+    # ran under the new name: the session still names the old one, and the
+    # logs of its rounds are where the file was found.
+    again = checkout.parent / f"{checkout.name}-again"
+    _git(checkout, "worktree", "move", str(renamed), str(again))
+    _run_in(checkout, monkeypatch)
+    del scripted.calls[:]
+    scripted.claude += ["LGTM"]
+    scripted.codex += ["LGTM"]
+    code, _, err = scripted("--resume", session_id, "-m", "And now?")
+    assert code == 0
+    moved = autoreview.SESSION_MOVED_NOTICE.format(id=session_id, old=again)
+    assert f"autoreview.py: {moved}\n" in err
+    assert not (again / "logs" / session_id / "session.json").exists()
+    session = _session(checkout, session_id)
+    assert session["repo_root"] == str(checkout) and len(session["rounds"]) == 3
+    assert session["rounds"][0]["log_dir"] == str(again / "logs" / session_id)
+    assert Path(session["rounds"][0]["log_dir"], "claude.log").is_file()
+    assert session["rounds"][1]["log_dir"].startswith(str(again / "logs"))
+    assert Path(session["rounds"][1]["log_dir"]).is_dir()
+    # The reviewers knew the files under the name that the worktree had.
+    assert _moved_note(scripted.calls[0].prompt) == f"{renamed} -> {checkout}"
+
+
+@needs_git
+def test_the_session_written_last_is_the_one_an_id_names(checkout, monkeypatch):
+    """A run that was killed between saving a session in its worktree and
+    deleting the other worktree's file leaves two: the later one counts."""
+    session_id = "20260601-120000-7"
+    mine = checkout / "logs" / session_id / "session.json"
+    other = _worktree(checkout, "other", monkeypatch)
+    theirs = other / "logs" / session_id / "session.json"
+    for path, when in ((mine, 1_000_000), (theirs, 2_000_000)):
+        path.parent.mkdir(parents=True)
+        path.write_text("{}")
+        os.utime(path, (when, when))
+    for root in (checkout, other):
+        _run_in(root, monkeypatch)
+        assert autoreview.find_session(session_id) == theirs
+        # A path names its file, whatever the other worktrees have.
+        assert autoreview.find_session(str(mine)) == mine
+    os.utime(mine, (3_000_000, 3_000_000))
+    assert autoreview.find_session(session_id) == mine
+    # Not a session id: no worktree is searched for it.
+    with pytest.raises(autoreview.ReviewAbort, match="another worktree of the"):
+        autoreview.find_session("session.json")
 
 
 @needs_git
@@ -2682,6 +3012,14 @@ def test_the_resume_prompt_and_notices_match_agents_md():
     policy = " ".join(agents.split())
     assert "scripts/autoreview.py --resume" in policy
     assert "refs/autoreview/" in policy
+    # Where a session can be continued, and what that does to it.
+    assert "Any worktree of the repository continues a session" in policy
+    assert "moves it to the one the round runs in" in policy
+    assert "removing that worktree removes the session" in policy
+    assert "the session belongs to another clone of the repository" in policy
+    assert "any worktree of the repository can continue it" in " ".join(
+        autoreview.__doc__.split()
+    )
     # The errors that mean a reviewer's session is gone, and what to do then.
     for error in ("No conversation found", "no rollout found"):
         assert f"`{error}`" in autoreview.RESUME_FAILED_NOTICE
@@ -2718,6 +3056,26 @@ def test_the_resume_prompt_and_notices_match_agents_md():
             # Without recorded bases, the commits are compared from their fork.
             assert f"git range-diff {'a' * 40}...{'b' * 40}" in text
             assert "{" not in prompt.replace("the message", "")
+            # Every round says where it runs; one whose reviewer last read
+            # another worktree names that one too.
+            assert f"This round runs in the checkout {autoreview.REPO_ROOT}: " in text
+            assert "another worktree" not in text and _moved_note(prompt) is None
+            moved = autoreview.build_resume_prompt(
+                3,
+                head,
+                review_args,
+                snapshot,
+                later,
+                "the message",
+                "the review",
+                combined=combined,
+                moved_from="/old/checkout",
+            )
+            assert "{" not in moved.replace("the message", "")
+            # The note stands with what changed, before the author's words.
+            assert _moved_note(moved) == f"/old/checkout -> {autoreview.REPO_ROOT}"
+            assert "This round runs in the checkout" not in moved
+            assert moved.index("/old/checkout") < moved.index("===== BEGIN LAST")
 
 
 @needs_git
