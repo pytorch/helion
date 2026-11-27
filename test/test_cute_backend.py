@@ -9141,6 +9141,95 @@ class TestCuteBackend(TestCase):
         self.assertIn("row_kv_begin_mask_t2r", code)
         torch.testing.assert_close(out, expected, atol=1e-2, rtol=1e-2)
 
+    def _check_row_kv_begin_single_warpgroup(
+        self,
+        seq: int,
+        dtype: torch.dtype,
+        documents: list[int],
+        **config: object,
+    ) -> None:
+        # The single-warpgroup body runs no range prelude and walks every KV
+        # tile, the ones above the diagonal included: each thread loads its
+        # row's bound once and every tile takes the row's exact range mask.
+        # Batch row 0 holds documents (bound 0, then bounds inside a tile).
+        # In row 1 the even rows keep their own key alone (bound == row) and
+        # the odd rows no key (bound == row + 1).  Row 2 has unsorted bounds:
+        # a wide and a narrow window by turns and a few rows that see every
+        # causal key.
+        rows = torch.arange(seq, device=DEVICE)
+        unsorted = torch.where(
+            rows % 2 == 0, (rows - seq // 3).clamp(min=0), (rows - 17).clamp(min=0)
+        )
+        unsorted = torch.where(rows % 31 == 0, torch.zeros_like(rows), unsorted)
+        kv_begin = torch.stack(
+            [
+                _document_kv_begin([documents], DEVICE)[0].to(rows.dtype),
+                torch.where(rows % 2 == 0, rows, rows + 1),
+                unsorted,
+            ]
+        )
+        kv_begin = kv_begin.to(torch.int32).contiguous()
+        torch.manual_seed(0)
+        q, k, v = (
+            torch.randn(3, 2, seq, 64, dtype=dtype, device=DEVICE) for _ in range(3)
+        )
+        code, out = code_and_output(
+            cute_row_kv_begin_mask_attention,
+            (q, k, v, kv_begin),
+            block_sizes=[1, 128, 128],
+            **config,
+        )
+        self.assertTrue(_flash_fired(code))
+        self.assertIn("'s_stage': 1", code)
+        self.assertIn(
+            "flash_rkb_row_lb = _helion_flash_rt.row_kv_begin_row_bound(", code
+        )
+        self.assertIn(
+            "_helion_flash_rt.row_kv_begin_mask_t2r("
+            "tLDrS, tLDcS, flash_rkb_row_lb, flash_m_tile, flash_kv)",
+            code,
+        )
+        self.assertNotIn("flash_rkb_interior_kv", code)
+        result = out.float()
+        self.assertFalse(bool(torch.isnan(result).any()))
+        # The odd rows of batch row 1 see no key: a 0 output row.
+        self.assertEqual(float(result[1, :, 1::2].abs().max()), 0.0)
+        tol = 3e-2 if dtype is torch.bfloat16 else 1e-2
+        torch.testing.assert_close(
+            result,
+            _row_kv_begin_reference(q.float(), k.float(), v.float(), kv_begin),
+            atol=tol,
+            rtol=tol,
+        )
+
+    def test_flash_attention_row_kv_begin_single_warpgroup_one_kv_tile(self) -> None:
+        # One KV tile resolves to the single-warpgroup body, whose score
+        # transform read the range prelude's interior bound and the softmax
+        # prelude's row bound without either being emitted: the kernel did
+        # not compile.
+        self._check_row_kv_begin_single_warpgroup(128, torch.bfloat16, [40, 60, 28])
+
+    def test_flash_attention_row_kv_begin_single_warpgroup_three_kv_tiles(
+        self,
+    ) -> None:
+        # The body pinned at three tiles, with a two-slot K/V ring so both of
+        # its KV loops run: query tiles 0 and 1 walk tiles above their
+        # diagonal, and the rows of the last document see no key of the
+        # first two tiles.  A row whose leading KV tiles hold none of its
+        # keys gets the masked softmax of the keys it sees, which is what the
+        # reference computes: row 128 of batch row 1 (bound 128) sees key 128
+        # alone and gets V[128].  The kernel's statements, started from
+        # m = -inf, compute -inf - -inf for that row on KV tile 0 and leave
+        # it NaN (the kind's comment in attention_plan.py).
+        self._check_row_kv_begin_single_warpgroup(
+            384,
+            torch.float16,
+            [100, 200, 84],
+            cute_flash_pipeline_family="ws_overlap",
+            cute_flash_s_stage=1,
+            cute_flash_kv_stage=2,
+        )
+
     def test_flash_attention_row_kv_begin_int32_max_sentinel_rows(self) -> None:
         # ``INT32_MAX`` marks a row without keys (FA4 varlen's convention for
         # padding rows). The range prelude clamps the bound to the query tile

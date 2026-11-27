@@ -802,7 +802,13 @@ these labelled lines.
     `test/test_cute_backend.py` with its running max started at `-1e30`,
     on fp16 operands of shape (1, 2, 256, 64) with `kv_begin = 256` on
     rows 128 to 255: both store an output of 0 on those rows; eager
-    stores `m + log2(l) = -1e30` and the fused body `-inf`.
+    stores `m + log2(l) = -1e30` and the fused body `-inf`. (This is the
+    fa4 body, the reproducer's default at its two KV tiles. The single-tile
+    body with two score stages, the default at three KV tiles, stores the
+    same `-inf` at shape (1, 2, 384, 64) with `kv_begin = 384` on rows 256
+    to 383. The single-warpgroup body, which one KV tile takes, declines a
+    per-row KV bound over a sentinel start,
+    `_attention_row_bound_sentinel_start`.)
   - The output of a row that an additive bias hides.
     `cute_biased_attention` of the same file with its running max started
     at `-1e30`, on fp16 operands of shape (1, 2, 256, 64) with an fp16
