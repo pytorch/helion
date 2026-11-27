@@ -813,6 +813,7 @@ class MmaDagSeedPlanner:
         cold_prefetch_seeds: list[Config] = []
         range_ahead_seeds: list[Config] = []
         partition_look_seeds: list[Config] = []
+        scale_hint_seeds: list[Config] = []
         query_tma: list[Config] = []
         value_metadata: list[Config] = []
         value_metadata_policies: list[Config] = []
@@ -1436,17 +1437,8 @@ class MmaDagSeedPlanner:
                                 # A seed is a legal config: none where the
                                 # device does not hold the look's stage
                                 # beside the seed's own raw V ring.
-                                partition_look_seeds.extend(
-                                    Config.from_dict(
-                                        {
-                                            **triple,
-                                            **form,
-                                            MMA_DAG_PARTITION_LOOK_KEY: (
-                                                MMA_DAG_PARTITION_LOOK_SPARE
-                                            ),
-                                        }
-                                    )
-                                    for form in ({}, *evict_last_form)
+                                look_triples = [
+                                    triple
                                     for triple in triples
                                     if MMA_DAG_PARTITION_LOOK_SPARE
                                     in paged_attention_partition_look_choices(
@@ -1460,7 +1452,80 @@ class MmaDagSeedPlanner:
                                         ),
                                         triple.get(MMA_DAG_VALUE_RING_TILES_KEY, 0),
                                     )
+                                ]
+                                look = {
+                                    MMA_DAG_PARTITION_LOOK_KEY: (
+                                        MMA_DAG_PARTITION_LOOK_SPARE
+                                    )
+                                }
+                                store_forms = ({}, *evict_last_form)
+                                partition_look_seeds.extend(
+                                    Config.from_dict({**triple, **form, **look})
+                                    for form in store_forms
+                                    for triple in look_triples
                                 )
+                                if "streaming" in priorities and None not in (
+                                    attention.tma_load_slots
+                                ):
+                                    # Every attention seed above hints its
+                                    # four TMA operands alike, these with
+                                    # streaming. Under a window that hint
+                                    # costs on the two scale operands (B200,
+                                    # 200 and 320 requests of a 2047-key
+                                    # window: +0.20 to +0.95 us per call
+                                    # against the default policy in twelve of
+                                    # twelve cases); without a window the
+                                    # default costs (8 to 12 timer steps,
+                                    # about 1.5%), so only these seeds name
+                                    # it. The look's seeds under the store
+                                    # hint (the plain ones where no seed names
+                                    # it) follow once more with the scales
+                                    # under the default policy and raw K and
+                                    # raw V streaming, that form once per
+                                    # other admitted register split, and each
+                                    # of those once more with both key clips
+                                    # where the default clips the leading side
+                                    # alone: a split with both clips reads
+                                    # about 0.25 us ahead of the form without
+                                    # them, which one differs by bind and by
+                                    # session, and a final selection does not
+                                    # rank them. (The measurements and their
+                                    # limits: this package's README.md, under
+                                    # "Special-purpose emitters", where it
+                                    # describes the look's seeds.)
+                                    raw_slots = attention.tma_load_slots[::2]
+                                    policies = [
+                                        "streaming" if slot in raw_slots else ""
+                                        for slot in range(eviction_length)
+                                    ]
+                                    hinted = [
+                                        {
+                                            **triple,
+                                            **store_forms[-1],
+                                            **look,
+                                            "load_eviction_policies": policies,
+                                        }
+                                        for triple in look_triples
+                                    ]
+                                    splits = [
+                                        {},
+                                        *(
+                                            {MMA_DAG_REGISTER_QUOTAS_KEY: quotas}
+                                            for quotas in (
+                                                paged_attention_register_quota_choices(
+                                                    attention, pass_warps
+                                                )[1:]
+                                            )
+                                        ),
+                                    ]
+                                    both = {MMA_DAG_KEY_CLIP_KEY: MMA_DAG_KEY_CLIP_BOTH}
+                                    clips = ({}, both) if seed_both_clips else ({},)
+                                    scale_hint_seeds.extend(
+                                        Config.from_dict({**seed, **split, **clip})
+                                        for clip in clips
+                                        for split in splits
+                                        for seed in hinted
+                                    )
                         if (
                             attention.windowed
                             and spec.cute_mma_dag_boundary_prefetch_cold is not None
@@ -1703,5 +1768,11 @@ class MmaDagSeedPlanner:
         # And in none the spare warp looks for a unit's lowest part. The
         # range-ahead seeds follow once more with that look.
         seeds.extend(partition_look_seeds)
+        # And every attention seed hints its four TMA operands alike. The
+        # look's seeds under the store hint follow once more with the two
+        # scale operands under the default policy, that form once per other
+        # admitted register split, and each of those once more with both
+        # key clips.
+        seeds.extend(scale_hint_seeds)
         # The paired head leads; every other seed keeps its order.
         return [*paired_head, *(seed for seed in seeds if seed not in paired_head)]
