@@ -21,9 +21,12 @@ from .cute_paged_attention import paged_online_attention
 from .cute_paged_attention_schedule import paged_attention_args
 from .cute_paged_base2 import base2_attention_fixture
 from .cute_paged_reference import reference_attention_fixture
+from .cute_paged_stream import seeds_ahead_of_the_store_hint
 import helion
 from helion._compiler.cute.cute_mma_dag import MMA_DAG_V_LAG_CHOICES
 from helion._compiler.cute.cute_mma_dag import paged_attention_probability_choices
+from helion._compiler.cute.cute_mma_dag import paged_attention_register_quota_choices
+from helion._compiler.cute.paged_attention_registers import MMA_DAG_REGISTER_QUOTAS_KEY
 
 if TYPE_CHECKING:
     from helion._compiler.cute.cute_mma_dag import CuteMmaDagFacts
@@ -57,8 +60,11 @@ def without_retirement_seeds(seeds: list[helion.Config]) -> list[helion.Config]:
 
     Paired seeds spell out the schedule's default (early retirement), the
     other schedules have no such knob; the suffix holds one paired counterpart
-    per V lag that keeps the final join instead.
+    per V lag that keeps the final join instead. Only the seeds under the
+    store hint follow it, which a kernel with a sliding window has behind
+    every other seed (``seeds_ahead_of_the_store_hint``).
     """
+    seeds = seeds_ahead_of_the_store_hint(seeds)
     count = len(MMA_DAG_V_LAG_CHOICES)
     assert len(seeds) > count
     prefix, suffix = seeds[:-count], seeds[-count:]
@@ -89,7 +95,9 @@ def without_paired_head(
     The head is the paired schedule with V two tiles behind K, early
     retirement, streaming hints on the TMA operands and, where proved, the
     query map and the early probability schedule. It names neither a key
-    clip nor a value-metadata skip: the kernel's defaults apply.
+    clip nor a value-metadata skip nor a register split: the kernel's
+    defaults apply. One counterpart per other admitted register split
+    follows it and is checked and left out as well.
     """
     attention = facts.attention
     assert attention is not None and attention.paired_items
@@ -111,6 +119,14 @@ def without_paired_head(
     assert all(policies[slot] == "streaming" for slot in slots)
     assert "cute_mma_dag_key_clip" not in head.config
     assert "cute_mma_dag_value_metadata_skip" not in head.config
+    assert MMA_DAG_REGISTER_QUOTAS_KEY not in head.config
+    splits = paged_attention_register_quota_choices(attention, "attention_paired")[1:]
+    counterparts, rest = rest[: len(splits)], rest[len(splits) :]
+    assert counterparts == [
+        helion.Config.from_dict({**head.config, MMA_DAG_REGISTER_QUOTAS_KEY: split})
+        for split in splits
+    ]
+    assert all(MMA_DAG_REGISTER_QUOTAS_KEY not in seed.config for seed in rest)
     return rest
 
 

@@ -13,6 +13,9 @@ import torch
 import helion
 from helion._testing.cute_folded_attention import folded_attention_args
 from helion._testing.cute_paged_rowwise_lazy import paged_query_first_direct_attention
+from helion._testing.cute_paged_rowwise_lazy import (
+    paged_query_first_direct_attention_oldest_first,
+)
 from helion._testing.cute_paged_rowwise_native import check_paged_recurrence_native
 from helion._testing.cute_paged_rowwise_native import configure_rowwise_case
 from helion._testing.cute_paged_rowwise_native import rowwise_config
@@ -61,18 +64,25 @@ class _HeadwideSource(ast.NodeTransformer):
 
 
 @functools.cache
-def headwide_kernel() -> Kernel:
+def headwide_kernel(*, reverse_pages: bool = True) -> Kernel:
+    """The complete-head lazy rescale. ``reverse_pages``: the source's loop
+    reflects its page index, the fixture's form; without it the loop visits
+    the pages oldest first, the form a reversed page order is offered to."""
+    base = (
+        paged_query_first_direct_attention
+        if reverse_pages
+        else paged_query_first_direct_attention_oldest_first()
+    )
+    suffix = "" if reverse_pages else "_oldest_first"
     transform = _HeadwideSource()
     source = transform_kernel(
-        paged_query_first_direct_attention,
+        base,
         transform,
-        name="paged_headwide_rescale",
-        filename="<paged_headwide_rescale>",
+        name=f"paged_headwide_rescale{suffix}",
+        filename=f"<paged_headwide_rescale{suffix}>",
     )
     assert (transform.tiles, transform.votes) == (1, 1)
-    return helion.kernel(
-        source.fn, settings=copy.deepcopy(paged_query_first_direct_attention.settings)
-    )
+    return helion.kernel(source.fn, settings=copy.deepcopy(base.settings))
 
 
 def headwide_config(query_len: int, *, scoped: bool = False) -> helion.Config:

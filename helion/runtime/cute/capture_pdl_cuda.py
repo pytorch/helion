@@ -31,6 +31,7 @@ from .capture_pdl import CaptureKey
 from .capture_pdl import Dependency
 from .capture_pdl import LaunchEffects
 from .capture_pdl import WaitMode
+from .capture_pdl import wait_mode_argument
 
 
 @dataclass(frozen=True)
@@ -45,8 +46,29 @@ class CaptureDriver(Protocol):
     def kernel_dependencies(self, node: int) -> tuple[Dependency, ...] | None: ...
 
     def set_wait_mode(
-        self, node: int, mode: WaitMode, parameter_sizes: tuple[int, ...]
+        self, node: int, mode: int, parameter_sizes: tuple[int, ...]
     ) -> bool: ...
+
+    def kernel_launch(self, node: int) -> tuple[int, int] | None: ...
+
+
+def head_start(driver: CaptureDriver, node: int, predecessor: int, sms: int) -> int:
+    """How many of ``node``'s first CTAs start beside ``predecessor``.
+
+    ``node`` overlaps ``predecessor``, the one launch it depends on. Its
+    kernel holds one SM per CTA and releases its dependents when every
+    loader is nearly done, so a launch of the same kernel ahead of it still
+    occupies one SM per CTA of its grid when this one starts: the SMs it
+    left idle, of the launch device's ``sms``, take this launch's first CTAs
+    at once, and every other CTA waits for an SM of the launch ahead. Any
+    other predecessor may hold its SMs differently or release earlier, and
+    gives no head start that could be told from here.
+    """
+    launched = driver.kernel_launch(node)
+    ahead = driver.kernel_launch(predecessor)
+    if launched is None or ahead is None or launched[0] != ahead[0]:
+        return 0
+    return max(0, sms - ahead[1])
 
 
 def finish_capture_launch(
@@ -55,6 +77,8 @@ def finish_capture_launch(
     before: CaptureSnapshot,
     effects: LaunchEffects,
     parameter_sizes: tuple[int, ...],
+    *,
+    head_start_sms: int = 0,
 ) -> WaitMode:
     """Patch only a uniquely identified new kernel; otherwise retain EARLY.
 
@@ -62,6 +86,10 @@ def finish_capture_launch(
     final dynamic Int32 wait-mode parameter initialized to zero. Comparing the
     whole graph's node sets also detects concurrent submissions to other streams
     in this capture. No decision relies on a pre-enqueue stream-tail snapshot.
+
+    ``head_start_sms`` is the launch device's SM count for a kernel that
+    reads its head start from the argument (``head_start``), else zero: the
+    argument is then the mode alone.
     """
     after = driver.snapshot(before.key.stream)
     if after is None or after.key != before.key or not before.nodes <= after.nodes:
@@ -74,11 +102,18 @@ def finish_capture_launch(
     if dependencies is None:
         return WaitMode.EARLY
     decision = guard.decide(before.key, node, dependencies, effects)
-    if decision.mode == WaitMode.BEFORE_WRITES and not driver.set_wait_mode(
-        node, decision.mode, parameter_sizes
-    ):
-        # Never install proof state for a failed or unavailable ABI patch.
-        return WaitMode.EARLY
+    if decision.mode == WaitMode.BEFORE_WRITES:
+        argument = wait_mode_argument(decision.mode)
+        if head_start_sms > 0:
+            # The proof took exactly one dependency, a tracked launch.
+            (dependency,) = dependencies
+            argument = wait_mode_argument(
+                decision.mode,
+                head_start(driver, node, dependency.node, head_start_sms),
+            )
+        if not driver.set_wait_mode(node, argument, parameter_sizes):
+            # Never install proof state for a failed or unavailable ABI patch.
+            return WaitMode.EARLY
     guard.record(before.key, node, decision)
     return decision.mode
 
@@ -295,8 +330,21 @@ class CudaCaptureDriver:
             for index in range(count.value)
         )
 
+    def kernel_launch(self, node: int) -> tuple[int, int] | None:
+        """The function a kernel node launches and its grid's CTA count."""
+        kind = ctypes.c_int()
+        if self.library.cuGraphNodeGetType(node, ctypes.byref(kind)) or kind.value != 0:
+            return None
+        params = _KernelParams()
+        if self.library.cuGraphKernelNodeGetParams_v2(node, ctypes.byref(params)):
+            return None
+        function = params.func or params.kernel
+        if not function:
+            return None
+        return function, params.grid_x * params.grid_y * params.grid_z
+
     def set_wait_mode(
-        self, node: int, mode: WaitMode, parameter_sizes: tuple[int, ...]
+        self, node: int, mode: int, parameter_sizes: tuple[int, ...]
     ) -> bool:
         # The warmed wrapper schema and compiler's final argument contract
         # supply the exact ABI. Do not discover its length by intentionally

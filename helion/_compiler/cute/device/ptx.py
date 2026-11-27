@@ -449,6 +449,32 @@ stg_bf16 = ptx_op(
     doc="One fp32 value rounded (RN) to bf16 and stored (2-byte aligned).",
 )
 
+stg_cs_f32 = ptx_op(
+    "stg_cs_f32",
+    "st.global.cs.f32 [$0], $1;",
+    (cutlass.Int64, cutlass.Float32),
+    side_effects=True,
+    memory=True,
+    doc=(
+        "``st.global.cs.f32`` of one fp32 value: ``stg_f32`` with the "
+        "streaming cache operator (evict-first), for an output written once."
+    ),
+)
+
+stg_cs_bf16 = ptx_op(
+    "stg_cs_bf16",
+    "{ .reg .b16 h; cvt.rn.bf16.f32 h, $1; st.global.cs.b16 [$0], h; }",
+    (cutlass.Int64, cutlass.Float32),
+    side_effects=True,
+    memory=True,
+    doc=(
+        "One fp32 value rounded (RN) to bf16 and stored with the streaming "
+        "cache operator (``st.global.cs``, evict-first): the bits "
+        "``stg_bf16`` and the DSL's cast and store write, for an output "
+        "written once."
+    ),
+)
+
 stg_v2_f32 = ptx_op(
     "stg_v2_f32",
     "st.global.v2.f32 [$0], {$1, $2};",
@@ -1287,6 +1313,36 @@ stg_u32_l2 = ptx_op(
     doc=(
         "``st.global.L2::cache_hint.u32``: one u32 (a counter no other thread "
         "still uses) under an L2 cache policy (``l2_policy_evict_last``)."
+    ),
+)
+
+stg_f32_l2 = ptx_op(
+    "stg_f32_l2",
+    "st.global.L2::cache_hint.f32 [$0], $1, $2;",
+    (cutlass.Int64, cutlass.Float32, cutlass.Int64),
+    side_effects=True,
+    memory=True,
+    doc=(
+        "``st.global.L2::cache_hint.f32``: ``stg_f32`` under an L2 cache "
+        "policy word (``l2_policy_evict_last``), for an output whose lines "
+        "should stay in L2."
+    ),
+)
+
+stg_bf16_l2 = ptx_op(
+    "stg_bf16_l2",
+    (
+        "{ .reg .b16 h; cvt.rn.bf16.f32 h, $1; "
+        "st.global.L2::cache_hint.b16 [$0], h, $2; }"
+    ),
+    (cutlass.Int64, cutlass.Float32, cutlass.Int64),
+    side_effects=True,
+    memory=True,
+    doc=(
+        "One fp32 value rounded (RN) to bf16 and stored under an L2 cache "
+        "policy word (``l2_policy_evict_last``): the bits ``stg_bf16`` and "
+        "the DSL's cast and store write, for an output whose lines should "
+        "stay in L2."
     ),
 )
 

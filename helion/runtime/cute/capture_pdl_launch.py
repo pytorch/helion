@@ -29,13 +29,21 @@ class PendingCaptureLaunch:
     effects: LaunchEffects
     parameter_sizes: tuple[int, ...]
     device: torch.device
+    # The launch device's SM count for a kernel that reads its head start
+    # from the wait-mode argument, else zero.
+    head_start_sms: int = 0
 
     def finish(self) -> None:
         # Both snapshots and the parameter update must use the launch context,
         # even when the caller restored a different current device after enqueue.
         with torch.cuda.device(self.device):
             finish_capture_launch(
-                self.driver, self.guard, self.before, self.effects, self.parameter_sizes
+                self.driver,
+                self.guard,
+                self.before,
+                self.effects,
+                self.parameter_sizes,
+                head_start_sms=self.head_start_sms,
             )
         nodes = self.guard.captures.get(self.before.key)
         if nodes is not None:
@@ -165,6 +173,11 @@ def prepare_capture_launch(
         before = driver.snapshot(stream)
     if before is None:
         return None
+    head_start_sms = 0
+    if plans[0].get("capture_pdl_head_start") is True:
+        # The boundary prefetch of a one-wave grid: its first CTAs serve the
+        # units that wait for the SMs of the launch ahead.
+        head_start_sms = torch.cuda.get_device_properties(device).multi_processor_count
     return PendingCaptureLaunch(
         driver,
         guard,
@@ -172,4 +185,5 @@ def prepare_capture_launch(
         LaunchEffects(tuple(reads), tuple(writes)),
         tuple(parameter_sizes),
         device,
+        head_start_sms,
     )

@@ -11,6 +11,9 @@ recognize these calls (``packet_access.match_packet_access``) run wherever
 Helion imports.  ``test_cute_packet_access.py`` pins this table to the
 dtype table of ``persistent_branch_vec`` and to the backend's
 ``library_imports``.
+
+``streaming_store_rendered`` reads a streaming store off a generated module:
+one of these flushes, or the paired attention body's own output stores.
 """
 
 from __future__ import annotations
@@ -46,15 +49,42 @@ PACKET_FLUSH_HELPER_NAMES = (
 )
 
 
+# The paired paged-attention body flushes no packet: it stores its outputs
+# itself, with operators of its own template
+# (``_paged_attention_io.store_output_rows``).  The kernel calls the body by
+# this name and hands it a policy other than the default in this keyword
+# (``paged_attention_codegen.codegen_paged_attention``).
+PAIRED_BODY_NAME = "paged_attention_paired_body"
+PAIRED_BODY_STORE_POLICY = "store_policy"
+
+
+def _paired_body_streams(call: ast.Call) -> bool:
+    """Whether ``call`` is the paired attention body's with the streaming
+    policy for its output stores."""
+    return (
+        isinstance(call.func, ast.Attribute)
+        and call.func.attr == PAIRED_BODY_NAME
+        and any(
+            keyword.arg == PAIRED_BODY_STORE_POLICY
+            and isinstance(keyword.value, ast.Constant)
+            and keyword.value.value == "streaming"
+            for keyword in call.keywords
+        )
+    )
+
+
 def streaming_store_rendered(source: str) -> bool:
-    """Whether the generated module ``source`` flushes a packet with the
-    streaming policy (``st.global.cs``, evict-first at L1 and L2): a call of
+    """Whether the generated module ``source`` stores with the streaming
+    policy (``st.global.cs``, evict-first at L1 and L2).  That is a call of
     one of the ``PACKET_FLUSH_STREAMING`` helpers, the names
     ``packet_store_policy.lower_packet_store_policy`` gives the flushes that
-    ``cute_store_policy='streaming'`` applies to.  A config with that policy
-    whose stores are scalars, narrower packets or staged renders none, and
-    its kernel is the default policy's.  The autotuner's final selection asks
-    this of a finalist's rendered source (``CuteBackend.finalist_preference``):
+    ``cute_store_policy='streaming'`` applies to, or the paired attention
+    body's call with ``store_policy='streaming'``: that body flushes no
+    packet and stores every element of its O output with the streaming
+    operator of its own template.  A config with that policy whose stores
+    are scalars, narrower packets or staged renders neither, and its kernel
+    is the default policy's.  The autotuner's final selection asks this of a
+    finalist's rendered source (``CuteBackend.finalist_preference``):
     ``source`` is the text ``BoundKernel.to_code`` rendered in this process,
     or the empty string for a kernel without generated code, so it parses.
     """
@@ -62,7 +92,9 @@ def streaming_store_rendered(source: str) -> bool:
     streaming = frozenset(PACKET_FLUSH_STREAMING.values())
     return any(
         isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Name)
-        and node.func.id in streaming
+        and (
+            (isinstance(node.func, ast.Name) and node.func.id in streaming)
+            or _paired_body_streams(node)
+        )
         for node in ast.walk(module)
     )

@@ -1518,6 +1518,11 @@ class ConfigSpec:
         # work partition: the same regime, whose back-to-back launches of
         # several input banks resolve an effect of a few tenths of a percent.
         self.cute_mma_dag_partition_skew_searched: bool = False
+        # Whether the search samples that kernel's boundary L2 prefetch: the
+        # same regime, the only one in which a call finds the pages an
+        # earlier call requested for it still in L2. Elsewhere searched
+        # configs keep it off, as the default does.
+        self.cute_mma_dag_boundary_prefetch_searched: bool = False
         # Enabled only when the exact five-factor BT16 recurrence carrier is
         # detected. Choice ordering makes the geometry seed the no-autotune
         # default while leaving both legal schedules in cold/full search.
@@ -1571,6 +1576,31 @@ class ConfigSpec:
         # than one unit per CTA, and the range skew of its balanced partition.
         self.cute_mma_dag_partition: EnumFragment | None = None
         self.cute_mma_dag_partition_skew: EnumFragment | None = None
+        # The ``setmaxnreg`` counts of the paired schedule's roles (compute,
+        # K conversion, V conversion, control), among the measured splits
+        # that fit the CTA's register pool; the default is the split the
+        # body has always run.
+        self.cute_mma_dag_register_quotas: EnumFragment | None = None
+        # K pages the paired schedule's idle control warp requests into L2
+        # for a unit that has not started, where the bind's grid has a form
+        # for it; zero, the default, is off.
+        self.cute_mma_dag_boundary_prefetch: EnumFragment | None = None
+        # Pages ahead of its end at which the paired schedule's loader
+        # releases the launch's dependents, where the kernel takes the
+        # guarded capture policy; four, the default, is the release's own.
+        self.cute_mma_dag_release_lead: EnumFragment | None = None
+        # Pages of raw V the paired schedule stages per head, where the
+        # device's shared memory holds more than the default's two with one
+        # unit per CTA.
+        self.cute_mma_dag_value_ring: EnumFragment | None = None
+        # The order in which the paired schedule streams a unit's pages,
+        # where fast math licenses another than the source's: the bucketed
+        # one where some unit can have enough interior pages for it to pay,
+        # the reversed walk under a sliding window.
+        self.cute_mma_dag_page_order: EnumFragment | None = None
+        # Where a walk in reversed page order takes the work item's oldest
+        # page, wherever the kernel is offered that order.
+        self.cute_mma_dag_clipped_page_lead: EnumFragment | None = None
         self.cute_mma_dag_loads: EnumFragment | None = None
         self.cute_mma_dag_aux: EnumFragment | None = None
         # How a dot operand that is a pointwise chain over loaded tiles

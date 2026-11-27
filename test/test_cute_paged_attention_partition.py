@@ -23,10 +23,6 @@ import helion
 from helion import exc
 from helion._compiler.cute import paged_attention_partition
 from helion._compiler.cute import paged_attention_partition_bounds
-from helion._compiler.cute._paged_attention_paired_pipeline import _pipeline_parts
-from helion._compiler.cute._paged_attention_paired_pipeline import (
-    _pipeline_shared_memory,
-)
 from helion._compiler.cute._paged_attention_partition import SKEW_SHARE
 from helion._compiler.cute._paged_attention_partition import partial_slot_bytes
 from helion._compiler.cute._paged_attention_partition import plan_geometry
@@ -52,6 +48,15 @@ from helion._compiler.cute.paged_attention_partition import partition_slot_bits
 from helion._compiler.cute.paged_attention_partition_bounds import (
     partition_record_bytes,
 )
+from helion._compiler.cute.paged_attention_registers import (
+    MMA_DAG_REGISTER_QUOTAS_CHOICES,
+)
+from helion._compiler.cute.paged_attention_registers import (
+    MMA_DAG_REGISTER_QUOTAS_DEFAULT,
+)
+from helion._compiler.cute.paged_attention_registers import parse_register_quotas
+from helion._compiler.cute.paged_attention_shared_memory import pipeline_parts
+from helion._compiler.cute.paged_attention_shared_memory import pipeline_shared_memory
 from helion._testing import cpu_render_target
 from helion._testing.cute_capture_gate import CaptureOnAnotherThread
 from helion._testing.cute_capture_gate import capture_stand_ins
@@ -76,6 +81,7 @@ from helion._testing.cute_paged_partition_plan import simulate_merges
 from helion._testing.cute_paged_partition_plan import slot_ranges
 from helion._testing.cute_paged_partition_plan import split_units
 from helion._testing.cute_paged_partition_plan import unit_headers
+from helion._testing.cute_paged_stream import seeds_ahead_of_the_reversed_order
 from helion.runtime.cute import graph_lease
 from helion.runtime.cute import launch_caches
 from helion.runtime.cute import launcher
@@ -95,6 +101,7 @@ SKEW = "cute_mma_dag_partition_skew"
 PAIRED = "attention_paired"
 QUERY = "cute_mma_dag_query_tma"
 SKIP = "cute_mma_dag_value_metadata_skip"
+QUOTAS = "cute_mma_dag_register_quotas"
 TEMPLATE = (
     Path(__file__).parents[1]
     / "helion/_compiler/cute/_paged_attention_paired_pipeline.py"
@@ -407,7 +414,9 @@ def _seeds(bound, spec=None) -> list[helion.Config]:
     assert facts is not None
     with cpu_render_target(fake_device_sm_count=148), bound.env, bound.host_function:
         planner = MmaDagSeedPlanner(facts, spec, occupancy_key="cute_min_blocks_per_mp")
-        return planner.configs(planner.ranked())
+        # A windowed kernel under fast math also has the leading family in
+        # reversed page order, behind every seed these tests are about.
+        return seeds_ahead_of_the_reversed_order(planner.configs(planner.ranked()))
 
 
 def test_the_search_weighs_one_unit_per_cta_against_balanced():
@@ -530,10 +539,18 @@ def test_seeds_balance_only_more_units_than_sms():
                 assert normalized.config[KEY] == "balanced"
                 assert normalized.config.get(SKEW) == skew
                 assert normalized.config[release] == released
+            # A windowed kernel's balanced seed follows once more under the
+            # L2 evict-last store hint, behind every seed these tests are
+            # about (``test_cute_paged_attention_store_policy`` pins it).
             transferred = [
                 config
                 for _flat, config in generation.seed_flat_config_pairs()
                 if KEY in config.config
+                and config.config.get("cute_store_policy") != "l2_evict_last"
+                # (Nor about that seed in reversed page order, which a
+                # windowed kernel has as well:
+                # ``test_cute_paged_attention_reversed_order`` pins it.)
+                and config.config.get("cute_mma_dag_page_order") != "reversed"
             ]
         assert [
             (config.config.get(SKEW), config.config[release]) for config in transferred
@@ -628,6 +645,13 @@ def test_a_step_onto_a_partition_takes_the_transport_it_needs():
             assert KEY not in alone.config and SKEW not in alone.config
             assert (reached.config[KEY], reached.config[SKEW]) == ("balanced", 4)
             assert reached.config[QUERY] is True and not reached.config[SKIP]
+        # A partition pins nothing but its transport: the roles keep their
+        # warps on a persistent CTA, so a register split crosses the step.
+        split = _paired_parent(**{QUOTAS: "120/96/96/48"})
+        reached, alone = _step(spec, split, **{KEY: "balanced"})
+        assert KEY not in alone.config and alone.config[QUOTAS] == "120/96/96/48"
+        assert reached.config[KEY] == "balanced" and reached.config[QUERY] is True
+        assert reached.config[QUOTAS] == "120/96/96/48"
         balanced = partition_config("balanced", cute_mma_dag_v_lag=3)
         # On the partition a skew is a step of its own, and so is leaving it.
         reached, alone = _step(spec, balanced, **{SKEW: 8})
@@ -707,6 +731,8 @@ def test_an_overridden_partition_or_skew_keeps_every_paired_seed(
         paired = [seed.get("cute_mma_dag_pass_warps") == PAIRED for seed in seeds]
         assert sum(paired) > 20 and not all(paired)
         assert any(seed.get(SKIP) for seed in seeds)
+        # The leading seed's counterparts on the other register splits.
+        assert len({seed.get(QUOTAS) for seed in seeds} - {None}) == 3
         assert any(
             not seed.get(QUERY)
             for seed, pair in zip(seeds, paired, strict=True)
@@ -736,8 +762,13 @@ def test_an_overridden_partition_or_skew_keeps_every_paired_seed(
                 assert config.config.get(SKEW) == override.get(SKEW, own)
                 assert config.config[QUERY] is True
                 assert not config.config.get(SKIP) and not config.config.get(overlap)
-                # Nothing else moved.
-                for key in ("cute_mma_dag_v_lag", "cute_pdl_release", "block_sizes"):
+                # Nothing else moved, a seed's register split included.
+                for key in (
+                    "cute_mma_dag_v_lag",
+                    "cute_pdl_release",
+                    "block_sizes",
+                    QUOTAS,
+                ):
                     assert config.config.get(key) == spec.normalized_config(seed).get(
                         key
                     )
@@ -884,8 +915,15 @@ def test_units_stream_with_their_own_steps_and_the_cta_total():
     walk = _function(tree, "_load_units")
     (stream,) = calls(walk, "_load_pages")
     passed = dict(
-        zip(parameters, (ast.unparse(value) for value in stream.args), strict=True)
+        zip(parameters, (ast.unparse(value) for value in stream.args), strict=False)
     )
+    # A persistent CTA streams its units in source order: its loader names
+    # no page order (test_cute_paged_attention_page_order.py).
+    assert parameters[len(stream.args) :] == [
+        "page_order",
+        "order_first",
+        "order_stop",
+    ]
     # A whole unit starts at its step zero; the balanced partition clips
     # the unit to the CTA's slots and starts where the clip does. The loader
     # takes that range from the helper every walking role calls, for the
@@ -952,34 +990,50 @@ def test_units_stream_with_their_own_steps_and_the_cta_total():
     drained = [ast.unparse(value) for value in drain.args]
     assert drained[8:15] == ["streamed", *lag]
     # Coordinates and the key offset use the unit's step; slots the stream's.
-    coordinates = calls(pages, "attention_page_coordinates")
-    assert len(coordinates) == 2
-    assert all(ast.unparse(call.args[2]) == "step0 + step" for call in coordinates)
-    shifts = calls(pages, "logical_attention_key_shift")
-    assert len(shifts) == 2
+    # Both V-lag forms take them from the loader's one step helper.
+    stepped = calls(pages, "_loader_step")
+    assert len(stepped) == 2
     assert all(
-        [ast.unparse(value) for value in call.args[:3]]
-        == ["logical_key_base", "128", "length"]
-        for call in shifts
+        [ast.unparse(value) for value in call.args[3:7]]
+        == ["first_page", "last_page", "step0", "step"]
+        for call in stepped
     )
+    assert not calls(pages, "attention_page_coordinates")
+    assert not calls(pages, "logical_attention_key_shift")
+    step_helper = _function(tree, "_loader_step")
+    (coordinates,) = calls(step_helper, "attention_page_coordinates")
+    assert ast.unparse(coordinates.args[2]) == "step0 + step"
+    # The compute groups map the same step of the unit, not the part's own.
+    (coordinates,) = calls(
+        _function(tree, "_compute_pages"), "attention_page_coordinates"
+    )
+    assert ast.unparse(coordinates.args[2]) == "step0 + step"
+    (shift,) = calls(step_helper, "logical_attention_key_shift")
+    assert [ast.unparse(value) for value in shift.args[:3]] == [
+        "logical_key_base",
+        "128",
+        "length",
+    ]
     slots = {
         ast.unparse(call.args[6]) for call in calls(pages, "_enqueue_operand_tile")
     }
     assert slots == {"g0 + step", "g0 + step - distance"}
-    releases = [
-        node
-        for node in ast.walk(pages)
-        if isinstance(node, ast.If)
-        and ast.unparse(node.body[0]) == "cute.arch.griddepcontrol_launch_dependents()"
-    ]
-    assert len(releases) == 2
-    assert all(ast.unparse(node.test) == "g0 + step == total - 4" for node in releases)
-    # The one-unit body passes the item itself as the stream.
+    # Per V-lag form, one release at the stream's own step against the
+    # CTA's total: the default lead's test of the bare difference, or every
+    # other lead's of the clamped step
+    # (test_cute_paged_attention_release_lead.py).
+    releases = calls(pages, "_release_at_tail")
+    assert [[ast.unparse(value) for value in call.args] for call in releases] == [
+        ["g0 + step", "total", "release_step"]
+    ] * 2
+    # The one-unit body passes the item itself as the stream, in source
+    # order.
     body = _function(tree, "paged_attention_paired_body")
     (single,) = calls(body, "_load_pages")
     one = dict(
-        zip(parameters, (ast.unparse(value) for value in single.args), strict=True)
+        zip(parameters, (ast.unparse(value) for value in single.args), strict=False)
     )
+    assert len(single.args) == len(stream.args)
     assert (one["g0"], one["step0"]) == ("cutlass.Int64(0)", "cutlass.Int64(0)")
     assert (one["count"], one["total"]) == ("count", "count")
     assert (one["previous_head"], one["older_head"]) == ("first_head", "first_head")
@@ -994,8 +1048,9 @@ def _shared_bytes(
 ) -> int:
     """Replay the paired body's shared-memory table as the allocator places
     it, in order and with each array's alignment, for a kernel with the
-    query map and no value metadata. ``scanned``: the prelude has the helper
-    that takes a scanned length."""
+    query map, no value metadata and no boundary prefetch (a role of one
+    unit per CTA). ``scanned``: the prelude has the helper that takes a
+    scanned length."""
     # What the body passes for its table and its optional parts.
     body = _function(ast.parse(TEMPLATE.read_text()), "paged_attention_paired_body")
     (allocation,) = [
@@ -1004,13 +1059,44 @@ def _shared_bytes(
         if isinstance(call, ast.Call)
         and ast.unparse(call.func) == "_allocate_pipeline_shared_memory"
     ]
-    _allocator, table, parts = allocation.args
+    _allocator, table, shared_parts = allocation.args
+    # The table is stated once, for the allocation and for the check of a
+    # deeper V ring against the device.
+    assert ast.unparse(table) == "shared_table"
+    (table,) = [
+        node.value
+        for node in ast.walk(body)
+        if isinstance(node, ast.Assign)
+        and ast.unparse(node.targets[0]) == "shared_table"
+    ]
+    assert ast.unparse(table.func) == "pipeline_shared_memory"
     assert [ast.unparse(argument) for argument in table.args] == [
         "query_columns",
         "value_metadata_scales is not None",
         "q_stages if partition != 'item' else 0",
         "units if partition != 'item' else 0",
         "partition == 'balanced'",
+        "boundary_prefetch_form == 'wave_ahead'",
+        "value_ring",
+        "bucketed",
+    ]
+    # The block's slots are counted there and laid out here: the body reads
+    # the barrier plan with the table's five arguments for it.
+    (plan,) = [
+        call
+        for call in ast.walk(body)
+        if isinstance(call, ast.Call)
+        and ast.unparse(call.func) == "pipeline_barrier_plan"
+    ]
+    assert [ast.unparse(argument) for argument in plan.args] == [
+        ast.unparse(table.args[index]) for index in (1, 2, 5, 6, 7)
+    ]
+    # The optional parts are evaluated once as well.
+    assert ast.unparse(shared_parts) == "shared_parts"
+    (parts,) = [
+        call
+        for call in ast.walk(body)
+        if isinstance(call, ast.Call) and ast.unparse(call.func) == "pipeline_parts"
     ]
     assert [ast.unparse(argument) for argument in parts.args] == [
         "query_map is not None",
@@ -1018,26 +1104,24 @@ def _shared_bytes(
         "units if partition != 'item' else 0",
         "unit_bounds_scanned is not None",
         "partition == 'balanced'",
+        "bucketed",
     ]
     persistent = partition != "item"
     balanced = partition == "balanced"
-    arrays = _pipeline_shared_memory(
+    arrays = pipeline_shared_memory(
         query_columns,
         False,
         q_stages if persistent else 0,
         units if persistent else 0,
         balanced,
     )
-    present = _pipeline_parts(
-        True, False, units if persistent else 0, scanned, balanced
-    )
+    present = pipeline_parts(True, False, units if persistent else 0, scanned, balanced)
     offset = 0
     for array in arrays:
         if array.guard is not None and array.guard not in present:
             continue
-        width = array.dtype.width // 8
-        alignment = max(array.alignment, width)
-        offset = -(-offset // alignment) * alignment + width * array.count
+        alignment = max(array.alignment, array.width)
+        offset = -(-offset // alignment) * alignment + array.width * array.count
     return offset
 
 
@@ -3062,22 +3146,37 @@ def test_a_persistent_bind_is_specialized_on_the_sm_count():
     assert partition_slot_bits(886, 8192, 74) == 32
 
 
-def _quota_sites(partition: str) -> dict[int, list[tuple[int, str]]]:
+def _quota_sites(
+    partition: str, counts: tuple[int, int, int, int]
+) -> dict[int, list[tuple[int, str, int]]]:
     """The register quotas each of a CTA's twenty warps takes in the template
-    under ``partition``, in order: the line and the call of each.
+    under ``partition`` with the register split ``counts``, in order: the
+    line, the direction and the count of each.
 
     A quota is a ``setmaxregister`` statement of the body, or the one a role
     helper starts with, at the helper's call in the body: the tracer inlines
     a helper at every call, so each call is an instruction of its own. A
     role helper may take its quota through one entry helper it starts with
-    (the compute roles' ``_compute_group``). The tests around a quota may
-    read the warp and the partition only, and are evaluated here for each
-    warp."""
+    (the compute roles' ``_compute_group``). Its count is one of the split's
+    four, by name. The tests around a quota may read the warp, the partition
+    and the split only, and are evaluated here for each warp."""
     tree = ast.parse(TEMPLATE.read_text())
     functions = {
         node.name: node for node in tree.body if isinstance(node, ast.FunctionDef)
     }
     body = functions["paged_attention_paired_body"]
+    split = dict(
+        zip(
+            (
+                "compute_registers",
+                "key_registers",
+                "value_registers",
+                "control_registers",
+            ),
+            counts,
+            strict=True,
+        )
+    )
 
     def quotas(node: ast.AST) -> list[ast.Call]:
         return [
@@ -3086,17 +3185,22 @@ def _quota_sites(partition: str) -> dict[int, list[tuple[int, str]]]:
             if isinstance(call, ast.Call) and "setmaxregister" in ast.unparse(call.func)
         ]
 
+    def quota(call: ast.Call) -> tuple[str, int]:
+        (count,) = call.args
+        direction = ast.unparse(call.func).rpartition("_")[2]
+        return direction[:3], split[ast.unparse(count)]
+
     # A helper's quota is one unconditional statement of the helper: the
     # instruction, or the call of the entry helper that holds it.
     helpers = {}
     for name, function in functions.items():
         if function is not body and quotas(function):
-            (quota,) = quotas(function)
+            (taken,) = quotas(function)
             assert any(
-                isinstance(node, ast.Expr) and node.value is quota
+                isinstance(node, ast.Expr) and node.value is taken
                 for node in function.body
             ), name
-            helpers[name] = ast.unparse(quota)
+            helpers[name] = quota(taken)
     entries = dict(helpers)
     through: list[ast.Call] = []
     for name, function in functions.items():
@@ -3113,7 +3217,7 @@ def _quota_sites(partition: str) -> dict[int, list[tuple[int, str]]]:
             ), name
             helpers[name] = entries[ast.unparse(taken.func)]
             through.append(taken)
-    sites: list[tuple[list[tuple[str, bool]], int, str]] = []
+    sites: list[tuple[list[tuple[str, bool]], int, tuple[str, int]]] = []
 
     def visit(statements: list[ast.stmt], guards: list[tuple[str, bool]]) -> None:
         for node in statements:
@@ -3127,12 +3231,12 @@ def _quota_sites(partition: str) -> dict[int, list[tuple[int, str]]]:
                 if isinstance(call, ast.Call):
                     name = ast.unparse(call.func)
                     if "setmaxregister" in name:
-                        taken.append((call.lineno, ast.unparse(call)))
+                        taken.append((call.lineno, quota(call)))
                     elif name in helpers:
                         taken.append((call.lineno, helpers[name]))
             # Never in a loop or under another kind of block.
             assert not taken or isinstance(node, (ast.Expr, ast.Assign)), taken
-            sites.extend((guards, line, quota) for line, quota in taken)
+            sites.extend((guards, line, found) for line, found in taken)
 
     visit(body.body, [])
     # Every quota of the template is one of those: no other function takes
@@ -3149,11 +3253,14 @@ def _quota_sites(partition: str) -> dict[int, list[tuple[int, str]]]:
             "warp": warp,
             "partition": partition,
             "cutlass": SimpleNamespace(const_expr=lambda value: value),
+            **split,
         }
         return all(bool(eval(test, scope)) is expected for test, expected in guards)
 
     return {
-        warp: [(line, quota) for guards, line, quota in sites if taken_by(guards, warp)]
+        warp: [
+            (line, *found) for guards, line, found in sites if taken_by(guards, warp)
+        ]
         for warp in range(20)
     }
 
@@ -3200,42 +3307,65 @@ def _ptx(config: helion.Config, monkeypatch, directory: Path) -> str:
     return kept.read_text()
 
 
-@pytest.mark.parametrize("partition", ["item", *PARTITIONS])
-def test_a_warpgroup_takes_its_quota_from_one_instruction(
-    partition, monkeypatch, tmp_path
-):
-    """``setmaxnreg`` is ``.sync.aligned``: every warp of a warpgroup has to
-    execute the same instruction, so a quota belongs to a warpgroup, never
-    to one warp's role. Each of a CTA's five warpgroups takes one quota, its
-    four warps from the same statement of the template, and the kernel's
-    PTX has one instruction per statement and no other: with one unit per
-    CTA the two conversion warpgroups have a statement each, and a
-    persistent CTA's share one."""
-    sites = _quota_sites(partition)
+def _warpgroup_quotas(
+    partition: str, counts: tuple[int, int, int, int]
+) -> list[tuple[int, str, int]]:
+    """The one quota each of a CTA's five warpgroups takes under
+    ``partition`` with the split ``counts``: every warp of a group reaches
+    exactly one statement of the template, the same as the group's others."""
+    sites = _quota_sites(partition, counts)
     groups = []
     for group in range(5):
         taken = {tuple(sites[warp]) for warp in range(4 * group, 4 * group + 4)}
         assert len(taken) == 1, (group, taken)
         ((site,),) = taken
         groups.append(site)
-    assert [quota for _line, quota in groups] == [
-        "cute.arch.setmaxregister_increase(144)",
-        "cute.arch.setmaxregister_increase(144)",
-        "cute.arch.setmaxregister_decrease(72)",
-        "cute.arch.setmaxregister_decrease(72)",
-        "cute.arch.setmaxregister_decrease(48)",
+    # Each group takes the count of its role.
+    compute, key, value, control = counts
+    assert [quota for _line, *quota in groups] == [
+        ["inc", compute],
+        ["inc", compute],
+        ["dec", key],
+        ["dec", value],
+        ["dec", control],
     ]
-    assert len(set(groups)) == (4 if partition == "item" else 3)
-    statements = sorted(
-        (action[:3], int(count))
-        for _line, quota in set(groups)
-        for action, count in re.findall(r"setmaxregister_(\w+)\((\d+)\)", quota)
-    )
+    return groups
+
+
+# A partition changes the statements the warpgroups take their quotas from,
+# so each is followed under every admitted register split. One kernel per
+# partition goes to the assembler, at the default split: the others are
+# compiled, and their instructions counted, by the register-quota module.
+@pytest.mark.parametrize("partition", ["item", *PARTITIONS])
+def test_a_warpgroup_takes_its_quota_from_one_instruction(
+    partition, monkeypatch, tmp_path
+):
+    """``setmaxnreg`` is ``.sync.aligned``: every warp of a warpgroup has to
+    execute the same instruction, so a quota belongs to a warpgroup, never
+    to one warp's role. Under every admitted register split each of a CTA's
+    five warpgroups takes one quota, the count the split gives its role, its
+    four warps from the same statement of the template: with one unit per
+    CTA the two conversion warpgroups have a statement each, and a
+    persistent CTA's share one where the split gives both conversions one
+    count, as every admitted one does. The kernel's PTX, compiled at the
+    default split, has one instruction per statement and no other."""
+    statements = {}
+    for quotas in MMA_DAG_REGISTER_QUOTAS_CHOICES:
+        counts = parse_register_quotas(quotas)
+        assert counts is not None
+        groups = _warpgroup_quotas(partition, counts)
+        assert len(set(groups)) == (4 if partition == "item" else 3)
+        statements[quotas] = sorted(
+            (action, count) for _line, action, count in set(groups)
+        )
     instructions = re.findall(
         r"setmaxnreg\.(inc|dec)\.sync\.aligned\.u32\s+(\d+);",
         _ptx(partition_config(partition), monkeypatch, tmp_path),
     )
-    assert sorted((action, int(count)) for action, count in instructions) == statements
+    assert (
+        sorted((action, int(count)) for action, count in instructions)
+        == statements[MMA_DAG_REGISTER_QUOTAS_DEFAULT]
+    )
 
 
 def _aligned_barriers() -> dict[str, list[str]]:

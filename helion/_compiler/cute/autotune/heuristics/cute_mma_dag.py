@@ -133,6 +133,12 @@ class CuteMmaDagHeuristic(AutotunerHeuristic):
                 env.config_spec.cute_mma_dag_partition_skew_searched = (
                     env.settings.autotune_benchmark_input_banks > 1
                 )
+                # And only that benchmark shows a boundary prefetch at all:
+                # its calls rotate over few inputs, so a call can find the
+                # pages an earlier call requested still in L2.
+                env.config_spec.cute_mma_dag_boundary_prefetch_searched = (
+                    env.settings.autotune_benchmark_input_banks > 1
+                )
                 if phase_index is not None:
                     from .....language import memory_ops
                     from ....device_ir_analysis import _load_needs_eviction_tunable

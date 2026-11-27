@@ -21,7 +21,9 @@ aside, below); the explicit values serve
 pins, seeds and users. Proved paired capture overlap can request
 ``loader_tail``: while the launch is known to fit in one wave the audited
 loader releases four logical pages before its end, with an unconditional
-release after the loop for short/empty ranges; past one wave, or when the
+release after the loop for short/empty ranges
+(``cute_mma_dag_release_lead`` names another lead than four pages, which a
+search samples where it samples this policy); past one wave, or when the
 host sizes the grid at runtime, a tail release would only hold the
 dependents back until the last wave's loaders finish, and the placement is
 the automatic one: the entry of every CTA for that kernel's one unit per
@@ -110,7 +112,9 @@ CUTE_PDL_CAPTURE_OVERLAP_KEY = "cute_pdl_capture_overlap"
 # spread padding: launched as a dependent, reading inputs ahead of a
 # predecessor the capture guard proved harmless (an unproved or eager launch
 # keeps the entry wait), and releasing its own dependents when its loader has
-# four pages left on a one-wave launch, from every CTA's entry past it.
+# the release's lead in pages left (four, or the config's
+# ``cute_mma_dag_release_lead``) on a one-wave launch, from every CTA's entry
+# past it.
 CUTE_PDL_CAPTURE_DEFAULT = MappingProxyType(
     {
         "cute_pdl": True,
@@ -361,10 +365,12 @@ def loader_tail_release_rendered(source: str) -> bool:
     the contract's conditional one, calls its body with
     ``capture_release_tail=True`` and the contract's wait-mode parameter.
 
-    That body releases the kernel's dependents when its loader has four
-    pages left, later than the generic entry release and well before the
-    grid completes; like the generic release it is invisible to the
-    kernel's isolated eager timing (``CuteBackend.finalist_preference``).
+    That body releases the kernel's dependents when its loader has the
+    release's lead in pages left (``cute_mma_dag_release_lead``, one of
+    ``cute_mma_dag.MMA_DAG_RELEASE_LEAD_CHOICES``), later than the generic
+    entry release and well before the grid completes; like the generic
+    release it is invisible to the kernel's isolated eager timing
+    (``CuteBackend.finalist_preference``).
     Past one wave the same config renders the generic release instead
     (``generic_release_rendered``): at the entry of every CTA for this
     kernel's one unit per CTA on a static grid, under the last wave's guard

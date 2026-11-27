@@ -27,6 +27,7 @@ from .cute_mma_dag import AXIS_ROOT
 from .cute_mma_dag import MMA_DAG_AUX_KEY
 from .cute_mma_dag import MMA_DAG_AUX_REGISTER
 from .cute_mma_dag import MMA_DAG_AUX_RING
+from .cute_mma_dag import MMA_DAG_BOUNDARY_PREFETCH_KEY
 from .cute_mma_dag import MMA_DAG_CLUSTER_KEY
 from .cute_mma_dag import MMA_DAG_CLUSTER_MAX
 from .cute_mma_dag import MMA_DAG_DERIVED_EXCHANGE
@@ -65,6 +66,7 @@ from .cute_mma_dag import MMA_DAG_PROBABILITY_SCHEDULE_EARLY
 from .cute_mma_dag import MMA_DAG_PROBABILITY_SCHEDULE_KEY
 from .cute_mma_dag import MMA_DAG_PROBABILITY_SCHEDULE_SERIAL
 from .cute_mma_dag import MMA_DAG_QUERY_TMA_KEY
+from .cute_mma_dag import MMA_DAG_RELEASE_LEAD_KEY
 from .cute_mma_dag import MMA_DAG_SLEEP_WAITS_KEY
 from .cute_mma_dag import MMA_DAG_SPLIT_CLUSTER
 from .cute_mma_dag import MMA_DAG_SPLIT_FIXUP
@@ -88,8 +90,10 @@ from .cute_mma_dag import mma_dag_pass_warps_reason
 from .cute_mma_dag import mma_dag_seed_configs
 from .cute_mma_dag import mma_dag_seed_variants
 from .cute_mma_dag import paged_attention_key_clip_choices
+from .cute_mma_dag import paged_attention_page_order_choices
 from .cute_mma_dag import paged_attention_pass_warp_choices
 from .cute_mma_dag import paged_attention_probability_choices
+from .cute_mma_dag import paged_attention_register_quota_choices
 from .cute_mma_dag import paged_attention_v_lag_choices
 from .cute_mma_dag_tcgen05 import tcgen05_corner_seeds
 from .cute_mma_dag_tcgen05 import tcgen05_lookahead_stages
@@ -98,6 +102,13 @@ from .cute_mma_dag_tcgen05 import tcgen05_seed_configs
 from .cute_mma_dag_tcgen05 import tcgen05_split_seed
 from .cute_mma_dag_tcgen05 import tcgen05_split_twins
 from .cutedsl_compat import hinted_cp_async_available
+from .paged_attention_page_order import MMA_DAG_CLIPPED_PAGE_LEAD_KEY
+from .paged_attention_page_order import MMA_DAG_PAGE_ORDER_BUCKETED
+from .paged_attention_page_order import MMA_DAG_PAGE_ORDER_KEY
+from .paged_attention_page_order import MMA_DAG_PAGE_ORDER_REVERSED
+from .paged_attention_page_order import PAGE_ORDER_HEAD
+from .paged_attention_registers import MMA_DAG_REGISTER_QUOTAS_KEY
+from .paged_attention_shared_memory import MMA_DAG_VALUE_RING_KEY
 from .pdl_release import CUTE_PDL_CAPTURE_DEFAULT
 from .pdl_release import CUTE_PDL_RELEASE_DEFAULT
 from .pdl_release import capture_policy_available
@@ -115,6 +126,25 @@ SEED_TCGEN05 = 4
 # The range skew of the balanced paged-attention seed for kernels without a
 # window, in pages.
 PARTITION_SEED_SKEW = 8
+# The page counts of the boundary-prefetch seeds, beside the default's none:
+# what one unit's requests bring into L2 ahead of a unit, by the amount.
+BOUNDARY_PREFETCH_SEED_PAGES = (8, 12)
+# The lead of the tail-release seed for kernels without a window, in pages,
+# beside the release's own four.
+RELEASE_LEAD_SEED_PAGES = 16
+# The depth of the raw V ring that seed's counterpart takes, in pages per
+# head, beside the default's two.
+VALUE_RING_SEED_PAGES = 3
+# The page count of the boundary-prefetch seed in bucketed page order: the
+# pages a unit still streams in source order, its head. A prefetch requests
+# a unit's first pages in source order, and behind the head a bucketed
+# stream takes other pages first.
+PAGE_ORDER_PREFETCH_SEED_PAGES = PAGE_ORDER_HEAD
+# The lead of the clipped page that the first of the reversed-order seeds
+# takes, beside ``VALUE_RING_SEED_PAGES`` of raw V per head; the second
+# keeps the page last and the default ring. The reversed-order seed of the
+# balanced partition takes this lead with that partition's default ring.
+CLIPPED_PAGE_LEAD_SEED = 8
 
 Tile = tuple["Mapping[int, int]", int, int]
 # A ranked ladder entry (``mma_dag_seed_configs``): block sizes by id, warps, stages.
@@ -762,6 +792,10 @@ class MmaDagSeedPlanner:
         late_retirement: list[Config] = []
         key_clip_seeds: list[Config] = []
         partition_seeds: list[Config] = []
+        prefetch_seeds: list[Config] = []
+        release_lead_seeds: list[Config] = []
+        page_order_seeds: list[Config] = []
+        store_policy_seeds: list[Config] = []
         query_tma: list[Config] = []
         value_metadata: list[Config] = []
         value_metadata_policies: list[Config] = []
@@ -1012,6 +1046,308 @@ class MmaDagSeedPlanner:
                                         CUTE_PDL_RELEASE_DEFAULT
                                     )
                                 partition_seeds.append(Config.from_dict(skewed))
+                        # The leading family with each seeded boundary
+                        # prefetch: the prefetch seeds, and the families the
+                        # reversed-order seeds repeat.
+                        prefetch_families: list[dict[str, object]] = []
+                        if (
+                            spec.cute_mma_dag_boundary_prefetch is not None
+                            and spec.cute_mma_dag_boundary_prefetch_searched
+                        ):
+                            # The benchmark cycles input banks, the regime
+                            # in which a boundary prefetch can pay, and the
+                            # search samples it: the leading family follows
+                            # the other seeds with 8 and with 12 pages per
+                            # served unit. No shape selects one: on a B200
+                            # with two or three banks, 2047-key window, us
+                            # per call against none, 8 / 12 pages took 0.9 /
+                            # 1.0 off 128 requests, 0.95 / 1.3 off 200 and
+                            # 1.4 / 1.0 off 320, and either added about 3
+                            # us to 320 requests of 211 pages; with six
+                            # banks or more the gain at 128 requests is a
+                            # loss, and with requests of unequal length 12
+                            # pages cost about 1 us where 8 kept at most 0.3.
+                            # The step from none is too small and too
+                            # coupled (the pages, and for a one-wave grid
+                            # the release) to be found reliably without a
+                            # seed. Elsewhere no seed names the knob.
+                            prefetch_families = [
+                                {**head, MMA_DAG_BOUNDARY_PREFETCH_KEY: pages}
+                                for pages in BOUNDARY_PREFETCH_SEED_PAGES
+                            ]
+                            prefetch_seeds.extend(
+                                Config.from_dict(family) for family in prefetch_families
+                            )
+                        if (
+                            spec.cute_mma_dag_release_lead is not None
+                            and spec.cute_pdl_capture_overlap_searched
+                            and attention.one_wave_units
+                            and not attention.windowed
+                        ):
+                            # The benchmark times back-to-back captured
+                            # calls, the only regime that shows when the
+                            # next call may start, and the search samples
+                            # the lead of the tail release: the leading
+                            # family follows the other seeds with 16 pages
+                            # for a kernel without a window, on a grid of
+                            # one wave, where the release is the loader's.
+                            # B200, two banks, us per call against the
+                            # release's four pages: 8 and 16 pages took 1.0
+                            # off 128 requests of 211 pages and 2.0 off 128
+                            # of 391 at two calls per sample, and 1.9 / 2.4
+                            # and 4.25 / 5.4 at six. A window's few pages
+                            # lose to it (16 pages added 2.0 to 3.4 us to a
+                            # 17-page window at 128 requests), so no seed
+                            # names a lead there, and none outside a search
+                            # that samples the release.
+                            longer_lead = {
+                                **head,
+                                MMA_DAG_RELEASE_LEAD_KEY: RELEASE_LEAD_SEED_PAGES,
+                            }
+                            release_lead_seeds.append(Config.from_dict(longer_lead))
+                            if (
+                                spec.cute_mma_dag_value_ring is not None
+                                and VALUE_RING_SEED_PAGES
+                                in spec.cute_mma_dag_value_ring.choices
+                            ):
+                                # Once more with a raw V ring of three pages
+                                # per head and V issued with its K. The
+                                # deeper ring gains only beside the longer
+                                # lead (or a page order that shortens the
+                                # stream's period): alone it read within
+                                # noise at twelve calls a sample (-0.5 us
+                                # over eight cases, +0.8 on one), on top of
+                                # the lead 2.0 us less, so a search that
+                                # moves one knob at a time from a config
+                                # without the lead would drop it. And it
+                                # needs the V requests in step with K's:
+                                # with V three tiles behind, the pair
+                                # gained 1.0 us on one case where it gained
+                                # 3.1 with none, which the kernel without
+                                # the pair cannot tell apart (264.19
+                                # against 264.22 us).
+                                release_lead_seeds.append(
+                                    Config.from_dict(
+                                        {
+                                            **longer_lead,
+                                            MMA_DAG_VALUE_RING_KEY: VALUE_RING_SEED_PAGES,
+                                            MMA_DAG_V_LAG_KEY: 0,
+                                        }
+                                    )
+                                )
+                        if (
+                            spec.cute_mma_dag_page_order is not None
+                            and attention.one_wave_units
+                            and not attention.windowed
+                        ):
+                            # A kernel without a window on a grid of one
+                            # wave, whose units can have enough interior
+                            # pages: the leading family follows the other
+                            # seeds in bucketed page order, in every timing
+                            # regime, and where the seeds above name the
+                            # longer lead, the last of them once more in
+                            # that order: the one with the deeper ring where
+                            # the device holds that ring, the lead alone
+                            # otherwise. B200, 128 requests of
+                            # 211 and 391 pages over two input banks,
+                            # handwritten / Helion over twelve cases: the
+                            # order alone took 0.9856 to 0.9925, and on top
+                            # of the lead and the ring 0.9942 to 0.9999. A
+                            # search finds neither reliably on its own: each
+                            # of the three moves a call by less than the
+                            # benchmark's timer step.
+                            bucketed = {
+                                MMA_DAG_PAGE_ORDER_KEY: MMA_DAG_PAGE_ORDER_BUCKETED
+                            }
+                            page_order_seeds.append(
+                                Config.from_dict({**head, **bucketed})
+                            )
+                            if release_lead_seeds:
+                                combined = {
+                                    **release_lead_seeds[-1].config,
+                                    **bucketed,
+                                }
+                                page_order_seeds.append(Config.from_dict(combined))
+                                if (
+                                    MMA_DAG_VALUE_RING_KEY in combined
+                                    and spec.cute_mma_dag_boundary_prefetch is not None
+                                    and spec.cute_mma_dag_boundary_prefetch_searched
+                                    and PAGE_ORDER_PREFETCH_SEED_PAGES
+                                    in spec.cute_mma_dag_boundary_prefetch.choices
+                                ):
+                                    # Where the search also samples a
+                                    # boundary prefetch and seeds it (above),
+                                    # the lead, the ring and the order once
+                                    # more on that family, with the pages of
+                                    # the order's head: what a prefetch
+                                    # requests in source order and a bucketed
+                                    # stream still streams first. A search
+                                    # does not walk there from the seed
+                                    # without a prefetch: of four cold
+                                    # searches of 128 requests none timed the
+                                    # three with a four-page prefetch, and
+                                    # set by hand that form read one timer
+                                    # step (1.0 us of 260 and of 480) below
+                                    # the returned config on two of the
+                                    # cases. (On the other two the hand-set
+                                    # config, one with four pages and one
+                                    # without a prefetch, read one step
+                                    # above.) As a seed the form is timed in
+                                    # every such search, and the final
+                                    # selection's pinned-seed slot takes it
+                                    # where it reads best among the seeds.
+                                    page_order_seeds.append(
+                                        Config.from_dict(
+                                            {
+                                                **combined,
+                                                MMA_DAG_BOUNDARY_PREFETCH_KEY: (
+                                                    PAGE_ORDER_PREFETCH_SEED_PAGES
+                                                ),
+                                            }
+                                        )
+                                    )
+                        # The balanced seed in reversed page order, where
+                        # the planner names one (below).
+                        balanced_reversed: dict[str, object] | None = None
+                        if (
+                            spec.cute_mma_dag_page_order is not None
+                            and MMA_DAG_PAGE_ORDER_REVERSED
+                            in spec.cute_mma_dag_page_order.choices
+                        ):
+                            # A kernel with a sliding window that is offered
+                            # the reversed walk: the leading family, and
+                            # each boundary-prefetch seed where there are
+                            # any, follow the other seeds twice in reversed
+                            # order, in every timing regime. First with the
+                            # clipped page 8 pages ahead of the walk's end
+                            # and three pages of raw V per head (where the
+                            # device holds them), then with the page last
+                            # and the default ring. Both keep the family's
+                            # V lag of two: with V issued with its K the
+                            # first form lost its gains. Which form gains is
+                            # a property of the case, so a search has to
+                            # time both, and it does not walk to the first
+                            # one knob at a time: where that form gains
+                            # most, the order alone and the order beside the
+                            # ring read the source order's step. (The
+                            # measurements: this package's README.md, under
+                            # "Special-purpose emitters", where it describes
+                            # ``cute_mma_dag_page_order="reversed"``.)
+                            families = [head, *prefetch_families]
+                            reversed_order = {
+                                MMA_DAG_PAGE_ORDER_KEY: MMA_DAG_PAGE_ORDER_REVERSED
+                            }
+                            deeper_ring = (
+                                spec.cute_mma_dag_clipped_page_lead is not None
+                                and CLIPPED_PAGE_LEAD_SEED
+                                in spec.cute_mma_dag_clipped_page_lead.choices
+                                and spec.cute_mma_dag_value_ring is not None
+                                and VALUE_RING_SEED_PAGES
+                                in spec.cute_mma_dag_value_ring.choices
+                            )
+                            for family in families:
+                                if deeper_ring:
+                                    page_order_seeds.append(
+                                        Config.from_dict(
+                                            {
+                                                **family,
+                                                **reversed_order,
+                                                MMA_DAG_CLIPPED_PAGE_LEAD_KEY: (
+                                                    CLIPPED_PAGE_LEAD_SEED
+                                                ),
+                                                MMA_DAG_VALUE_RING_KEY: (
+                                                    VALUE_RING_SEED_PAGES
+                                                ),
+                                            }
+                                        )
+                                    )
+                                page_order_seeds.append(
+                                    Config.from_dict({**family, **reversed_order})
+                                )
+                            if (
+                                partition_seeds
+                                and spec.cute_mma_dag_clipped_page_lead is not None
+                                and CLIPPED_PAGE_LEAD_SEED
+                                in spec.cute_mma_dag_clipped_page_lead.choices
+                                and MMA_DAG_PAGE_ORDER_REVERSED
+                                in paged_attention_page_order_choices(
+                                    attention,
+                                    pass_warps,
+                                    False,
+                                    MMA_DAG_PARTITION_BALANCED,
+                                )
+                            ):
+                                # More units than SMs, so the seeds above
+                                # name the balanced partition, which runs
+                                # the walk there: its seed follows once
+                                # more in reversed order with the clipped
+                                # page 8 pages ahead of a unit's end, in
+                                # every timing regime. In source order each
+                                # unit of a persistent CTA ends on its
+                                # newest page's tile, which raises the
+                                # maximum and rescales ahead of the unit's
+                                # epilogue. Whether the walk gains is a
+                                # property of the case and of its data, so
+                                # a search has to time it. B200, 320
+                                # requests of a 2047-key window in the SDG
+                                # eval harness (zero prompt K and V), steps
+                                # of 1.024 us against the source order: one
+                                # step less at draft position 512 and 0.5
+                                # to 0.7 us less without a step at draft
+                                # position 0; one step more at position
+                                # 1023, draft and verify, and in half or
+                                # more of the legs at verify position 512.
+                                # And a search does not walk there one knob
+                                # at a time: the order alone, with the page
+                                # last, read 0.15 us of that kernel's 0.75.
+                                balanced_reversed = {
+                                    **partition_seeds[0].config,
+                                    **reversed_order,
+                                    MMA_DAG_CLIPPED_PAGE_LEAD_KEY: (
+                                        CLIPPED_PAGE_LEAD_SEED
+                                    ),
+                                }
+                                page_order_seeds.append(
+                                    Config.from_dict(balanced_reversed)
+                                )
+                        if attention.windowed and spec.supports_config_key(
+                            "cute_store_policy"
+                        ):
+                            # A kernel with a sliding window: the leading
+                            # family follows the other seeds once more with
+                            # its output stores under the L2 evict-last
+                            # hint, and so does its balanced form where the
+                            # seeds above name one. Same values at the same
+                            # addresses; what the hint changes is how long
+                            # the lines of an output stay in L2, which a
+                            # search reads only as a fraction of a timer
+                            # step, so it does not walk there reliably from
+                            # the plain stores. No seed names the hint for a
+                            # kernel without a window, whose calls are ten
+                            # times longer and read within noise. (The
+                            # measurements: this package's README.md, under
+                            # "Special-purpose emitters", where it describes
+                            # ``cute_store_policy`` on the paired schedule.)
+                            evict_last = {"cute_store_policy": "l2_evict_last"}
+                            store_policy_seeds.append(
+                                Config.from_dict({**head, **evict_last})
+                            )
+                            if partition_seeds:
+                                store_policy_seeds.append(
+                                    Config.from_dict(
+                                        {**partition_seeds[0].config, **evict_last}
+                                    )
+                                )
+                            if balanced_reversed is not None:
+                                # And its reversed-order form, where the
+                                # seeds above name one: the walk was
+                                # measured on balanced configs that store
+                                # under the hint.
+                                store_policy_seeds.append(
+                                    Config.from_dict(
+                                        {**balanced_reversed, **evict_last}
+                                    )
+                                )
                         if spec.cute_pdl_capture_overlap_searched:
                             # The benchmark times back-to-back captured
                             # calls and the search samples the policy: seed
@@ -1037,6 +1373,20 @@ class MmaDagSeedPlanner:
                                     Config.from_dict({**off, "cute_pdl": False}),
                                 )
                             )
+                        # The leading seed runs the default register split
+                        # (it names none). One counterpart per other admitted
+                        # split follows it: which split is fastest is an
+                        # outcome of the assembler's scheduling, so the search
+                        # measures each on the leading family instead of
+                        # walking to it one mutation at a time.
+                        paired_head.extend(
+                            Config.from_dict(
+                                {**head, MMA_DAG_REGISTER_QUOTAS_KEY: quotas}
+                            )
+                            for quotas in paged_attention_register_quota_choices(
+                                facts.attention, pass_warps
+                            )[1:]
+                        )
                     for occupancy in occupancies:
                         for v_lag in paged_attention_v_lag_choices(facts, pass_warps):
                             seed = {**config, self.occupancy_key: occupancy}
@@ -1175,5 +1525,24 @@ class MmaDagSeedPlanner:
         # partition, and for a kernel without a window once more with a range
         # skew where the search samples the skew.
         seeds.extend(partition_seeds)
+        # None of them prefetches. Where the benchmark cycles input banks,
+        # the leading family follows once per seeded page count.
+        seeds.extend(prefetch_seeds)
+        # And all of them release with the tail release's own lead. Where the
+        # benchmark observes the release, the leading family of a kernel
+        # without a window follows once with a longer one.
+        seeds.extend(release_lead_seeds)
+        # All of them stream their pages in source order. The leading family
+        # of a kernel without a window follows in bucketed order, and with
+        # it the last of the lead's seeds, once more with a boundary
+        # prefetch of the order's head where a prefetch is seeded. The
+        # leading family of a kernel offered the reversed walk, and each of
+        # its boundary-prefetch seeds, follow twice in reversed order.
+        seeds.extend(page_order_seeds)
+        # All of them store their outputs with the plain stores. The leading
+        # family of a kernel with a sliding window follows under the L2
+        # evict-last hint, with one unit per CTA and, where the seeds above
+        # name the balanced partition, on it.
+        seeds.extend(store_policy_seeds)
         # The paired head leads; every other seed keeps its order.
         return [*paired_head, *(seed for seed in seeds if seed not in paired_head)]

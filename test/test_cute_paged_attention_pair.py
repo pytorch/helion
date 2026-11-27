@@ -13,6 +13,9 @@ from helion._compiler.cute.analysis.paged_attention_pair import (
     paired_attention_item_axis,
 )
 from helion._compiler.cute.cute_mma_dag import match_mma_dag
+from helion._compiler.cute.paged_attention_registers import (
+    MMA_DAG_REGISTER_QUOTAS_CHOICES,
+)
 from helion._compiler.cute.paged_attention_transport import (
     paged_attention_schedule_facts,
 )
@@ -152,7 +155,11 @@ def test_no_config_default_is_the_paired_family_under_the_pair_proof(heads, per_
             assert default.get("cute_mma_dag") == "warp"
             assert "_body(" not in source
             return
-        assert without_paired_head(seeds, facts) == seeds[1:]
+        # The head, then one counterpart per other admitted register split.
+        assert (
+            without_paired_head(seeds, facts)
+            == seeds[len(MMA_DAG_REGISTER_QUOTAS_CHOICES) :]
+        )
         # The schedule's own defaults, none of the base config's pins.
         assert default.get("cute_mma_dag_pass_warps") == "attention_paired"
         assert default.get("cute_mma_dag_v_lag") == 2

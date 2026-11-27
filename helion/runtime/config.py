@@ -261,6 +261,8 @@ class Config(Mapping[str, object]):
                 ``st.global.cs`` for outputs written once, or "l2_evict_last").
                 The packets ``cute_staged_store`` flushes are not covered:
                 they keep the default policy.
+                The paired paged-attention schedule, which stores its outputs
+                itself, takes "streaming" and "l2_evict_last" for them as well.
             cute_compiler_pipeline: CuTe compiler optimization pipeline. "default"
                 leaves SDK options unchanged; "opt2" requests optimization level 2.
                 Explicit SDK compiler environment overrides still take precedence.
@@ -683,22 +685,22 @@ class Config(Mapping[str, object]):
                 wait for the first CTAs in particular). ``loader_tail``
                 requires proved paired capture overlap: while the grid is
                 known to fit in one wave the loader releases with four
-                logical pages left to issue, or after a shorter/empty loop;
-                past one wave, or when the grid is sized at runtime, it
-                releases as ``auto`` does (at entry in every CTA of that
-                kernel's one unit per CTA on a static grid, from the last
-                wave's CTAs on a grid sized at runtime), since a tail release
-                there would leave the SMs a partial last wave frees idle
-                until that wave's loaders finish.
-                Its waits and ancestor-storage proof are unchanged. It is the
-                placement of the default capture overlap policy above. Every
-                placement reads the same data: a
-                dependent's own wait blocks until this grid has completed and
-                flushed. On the tcgen05 GEMM kernels, whose lowering waits in
-                its warp roles and releases after the last MMA, ``entry`` and
-                ``last_wave`` add the release right after each of those waits
-                and ``exit`` / ``none`` keep the late release alone. Inert when
-                ``cute_pdl`` is off.
+                logical pages left to issue, or after a shorter/empty loop
+                (``cute_mma_dag_release_lead`` names another lead); past one
+                wave, or when the grid is sized at runtime, it releases as
+                ``auto`` does (at entry in every CTA of that kernel's one
+                unit per CTA on a static grid, from the last wave's CTAs on
+                a grid sized at runtime), since a tail release there would
+                leave the SMs a partial last wave frees idle until that
+                wave's loaders finish. Its waits and
+                ancestor-storage proof are unchanged. It is the placement of
+                the default capture overlap policy above. Every placement
+                reads the same data: a dependent's own wait blocks until this
+                grid has completed and flushed. On the tcgen05 GEMM kernels,
+                whose lowering waits in its warp roles and releases after the
+                last MMA, ``entry`` and ``last_wave`` add the release right
+                after each of those waits and ``exit`` / ``none`` keep the
+                late release alone. Inert when ``cute_pdl`` is off.
             cute_pdl_spread: Pad a ``cute_pdl`` kernel's shared memory so that
                 at most ``ceil(CTAs / SMs)`` of its CTAs fit on one SM, its
                 density on an idle device. A programmatic dependent launches

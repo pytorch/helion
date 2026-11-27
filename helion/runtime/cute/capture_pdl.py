@@ -23,6 +23,31 @@ class WaitMode(IntEnum):
     BEFORE_WRITES = 1
 
 
+# The kernel's wait-mode argument holds the mode in its low byte. A kernel
+# that asks for it (the boundary prefetch of a one-wave paired attention
+# grid) also gets, above that byte, its head start: how many of the launch's
+# first CTAs start on SMs the launch ahead left idle, while the others wait
+# for its SMs. That is a scheduling hint and no part of the proof: the mode
+# alone says what the kernel may read, and any nonzero argument is
+# ``BEFORE_WRITES``. Device code shifts by the same constant
+# (``_paged_attention_prefetch.HEAD_START_SHIFT``).
+WAIT_MODE_HEAD_START_SHIFT = 8
+# A paired CTA holds an SM, so a head start is below the SM count.
+WAIT_MODE_HEAD_START_LIMIT = 1 << 16
+
+
+def wait_mode_argument(mode: WaitMode, head_start: int = 0) -> int:
+    """The Int32 a launch gets for ``mode`` and ``head_start`` CTAs.
+
+    Only a launch that reads ahead of its predecessor has a head start, so
+    an early launch's argument stays zero.
+    """
+    if mode != WaitMode.BEFORE_WRITES:
+        return int(mode)
+    head_start = max(0, min(head_start, WAIT_MODE_HEAD_START_LIMIT - 1))
+    return int(mode) | head_start << WAIT_MODE_HEAD_START_SHIFT
+
+
 @dataclass(frozen=True, order=True)
 class StorageRange:
     """A conservative allocation-byte interval on one CUDA device/context."""

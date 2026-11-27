@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import functools
 from typing import TYPE_CHECKING
 
 import helion
@@ -16,7 +17,10 @@ if TYPE_CHECKING:
 
 
 class _LazyRows(ast.NodeTransformer):
-    def __init__(self) -> None:
+    def __init__(self, *, reverse_pages: bool = True) -> None:
+        # Which of the shared source's two loops the kernel keeps: the one
+        # that reflects its page index (newest page first) or the plain one.
+        self.reverse_pages = reverse_pages
         self.changed = dict.fromkeys(("specialize", "maximum", "value", "reverse"), 0)
 
     def visit_FunctionDef(self, node: ast.FunctionDef) -> ast.AST:
@@ -46,7 +50,7 @@ class _LazyRows(ast.NodeTransformer):
     def visit_IfExp(self, node: ast.IfExp) -> ast.AST:
         if isinstance(node.test, ast.Name) and node.test.id == "reverse_pages":
             self.changed["reverse"] += 1
-            return self.visit(node.body)
+            return self.visit(node.body if self.reverse_pages else node.orelse)
         return self.generic_visit(node)
 
     def visit_Assign(self, node: ast.Assign) -> ast.AST | list[ast.stmt] | None:
@@ -77,19 +81,28 @@ class _LazyRows(ast.NodeTransformer):
         return node
 
 
-def _rowwise_kernel() -> Kernel:
+def _rowwise_kernel(*, reverse_pages: bool = True) -> Kernel:
     kernel = _postscale_kernel(
         _reciprocal_kernel(_base2_kernel("mapped"), False), -6, -22
     )
-    transform = _LazyRows()
+    transform = _LazyRows(reverse_pages=reverse_pages)
+    suffix = "" if reverse_pages else "_oldest_first"
     result = transform_kernel(
         kernel,
         transform,
-        name="paged_query_first_direct_attention",
-        filename="<helion_rowwise_lazy_attention>",
+        name=f"paged_query_first_direct_attention{suffix}",
+        filename=f"<helion_rowwise_lazy_attention{suffix}>",
     )
     assert all(count == 1 for count in transform.changed.values())
     return helion.kernel(result.fn, backend="cute", static_shapes=True, fast_math=True)
 
 
 paged_query_first_direct_attention = _rowwise_kernel()
+
+
+@functools.cache
+def paged_query_first_direct_attention_oldest_first() -> Kernel:
+    """The same recurrence over a loop that visits its pages oldest first:
+    the source a reversed page order is offered to, which the kernel above,
+    whose loop is already reflected, is not."""
+    return _rowwise_kernel(reverse_pages=False)

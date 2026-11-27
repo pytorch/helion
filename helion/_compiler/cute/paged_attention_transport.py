@@ -18,6 +18,7 @@ from torch.utils._sympy.functions import PythonMod
 from . import target_facts
 from .analysis.paged_attention_pair import paired_attention_item_axis
 from .cute_mma_dag import MMA_DAG_ATTENTION_PASS_WARPS
+from .cute_mma_dag import MMA_DAG_BOUNDARY_PREFETCH_KEY
 from .cute_mma_dag import MMA_DAG_EARLY_TMEM_RETIREMENT_KEY
 from .cute_mma_dag import MMA_DAG_KEY_CLIP_BOTH
 from .cute_mma_dag import MMA_DAG_KEY_CLIP_KEY
@@ -38,19 +39,44 @@ from .cute_mma_dag import MMA_DAG_PROBABILITY_SCHEDULE_CHOICES
 from .cute_mma_dag import MMA_DAG_PROBABILITY_SCHEDULE_KEY
 from .cute_mma_dag import MMA_DAG_PROBABILITY_SCHEDULE_SERIAL
 from .cute_mma_dag import MMA_DAG_QUERY_TMA_KEY
+from .cute_mma_dag import MMA_DAG_RELEASE_LEAD_KEY
 from .cute_mma_dag import MMA_DAG_SLEEP_WAITS_KEY
 from .cute_mma_dag import MMA_DAG_V_LAG_CHOICES
 from .cute_mma_dag import MMA_DAG_V_LAG_KEY
 from .cute_mma_dag import MMA_DAG_VALUE_METADATA_READ_OVERLAP_KEY
 from .cute_mma_dag import MMA_DAG_VALUE_METADATA_SKIP_KEY
+from .cute_mma_dag import paged_attention_boundary_prefetch_choices
+from .cute_mma_dag import paged_attention_clipped_page_lead_choices
 from .cute_mma_dag import paged_attention_early_retirement_default
 from .cute_mma_dag import paged_attention_key_clip_choices
+from .cute_mma_dag import paged_attention_page_order_choices
+from .cute_mma_dag import paged_attention_register_quota_choices
+from .cute_mma_dag import paged_attention_release_lead_choices
+from .cute_mma_dag import paged_attention_value_ring_choices
 from .memory_ops import cute_tensor_base_is_aligned
 from .native_s2f6_contract import NATIVE_S2F6_TARGETS
+from .paged_attention_page_order import MMA_DAG_CLIPPED_PAGE_LEAD_DEFAULT
+from .paged_attention_page_order import MMA_DAG_CLIPPED_PAGE_LEAD_KEY
+from .paged_attention_page_order import MMA_DAG_PAGE_ORDER_KEY
+from .paged_attention_page_order import MMA_DAG_PAGE_ORDER_SOURCE
+from .paged_attention_page_order import REVERSED_ORDER_NEEDS_PAIR
+from .paged_attention_page_order import page_order_offered
+from .paged_attention_page_order import page_order_shift
+from .paged_attention_page_order import reversed_order_missing
 from .paged_attention_partition import partition_q_stages
 from .paged_attention_partition import partition_skew_choices
 from .paged_attention_partition import partition_slot_bits
 from .paged_attention_partition_bounds import partition_record_bytes
+from .paged_attention_prefetch import boundary_prefetch_form
+from .paged_attention_prefetch import boundary_prefetch_layout
+from .paged_attention_registers import MMA_DAG_REGISTER_QUOTAS_DEFAULT
+from .paged_attention_registers import MMA_DAG_REGISTER_QUOTAS_KEY
+from .paged_attention_registers import PAIRED_DEFAULT_REGISTER_QUOTAS
+from .paged_attention_registers import PAIRED_ROLE_WARPS
+from .paged_attention_registers import parse_register_quotas
+from .paged_attention_release import MMA_DAG_RELEASE_LEAD_DEFAULT
+from .paged_attention_shared_memory import MMA_DAG_VALUE_RING_KEY
+from .paged_attention_shared_memory import PAIRED_DEFAULT_VALUE_RING
 
 if TYPE_CHECKING:
     from ...runtime.config import Config
@@ -159,6 +185,35 @@ class PagedAttentionScheduleFacts:
     # Whether a sliding window bounds the pages of a unit: every unit then
     # streams about the same few pages, whatever its length.
     windowed: bool = False
+    # The boundary L2 prefetch the paired schedule's one-unit CTAs can run on
+    # this bind's grid (``paged_attention_prefetch``), empty for none.
+    boundary_prefetch_form: str = ""
+    # Whether the paired schedule may stream a unit's pages in bucketed
+    # order (``paged_attention_page_order``): fast math, and a page table
+    # and window under which some unit can have enough interior pages for
+    # the sort to pay. ``page_order_shift`` then drops the bits of a
+    # physical page id below its bucket, from the K tensor's page extent.
+    page_order_available: bool = False
+    page_order_shift: int = 0
+    # What the kernel lacks for the paired schedule to walk a unit's pages
+    # newest first (``paged_attention_page_order.reversed_order_missing``:
+    # fast math, a sliding window in the mask, a source loop that is not
+    # itself reflected), empty where it lacks nothing. A kernel without the
+    # pair proof lacks the schedule.
+    reversed_order_missing: str = REVERSED_ORDER_NEEDS_PAIR
+    # Shared memory the device grants one CTA, in bytes; zero is unknown (a
+    # render without a device). What a deeper raw V ring is checked against
+    # (``paged_attention_shared_memory.value_ring_reason``).
+    smem_capacity: int = 0
+    # Whether one unit per CTA of the paired schedule is a grid of at most
+    # one CTA per SM: one wave, on which a ``loader_tail`` release is the
+    # loader's own (``passes.pdl.loader_tail_release_applies``).
+    one_wave_units: bool = False
+    # Whether that grid is known to take more than one wave: more units
+    # than the SMs of a device whose SM count is known. A ``loader_tail``
+    # config of it renders the automatic release, and a lead of the tail
+    # release renders nothing.
+    past_one_wave_units: bool = False
 
     def min_blocks_per_mp_choices(
         self, *, scoped_registers: bool = False, paired_items: bool = False
@@ -179,7 +234,7 @@ def paged_attention_launch_warps(
     """Physical role topology shared by planning and emitted-launch checks."""
     if paired_items:
         assert per_key and not scoped_registers
-        return 20
+        return sum(PAIRED_ROLE_WARPS)
     if scoped_registers:
         assert per_key
         return 12
@@ -223,6 +278,27 @@ class PagedAttentionSchedule:
     partition_record_bytes: int = 0
     # The balanced partition's range skew in slots; zero is equal shares.
     partition_skew: int = 0
+    # Registers per thread of the paired body's compute, K conversion, V
+    # conversion and control warps.
+    register_quotas: tuple[int, int, int, int] = PAIRED_DEFAULT_REGISTER_QUOTAS
+    # K pages the idle control warp prefetches per served unit, zero for
+    # none, and the form the bind's grid takes.
+    boundary_prefetch: int = 0
+    boundary_prefetch_form: str = ""
+    # Pages ahead of its end at which the loader releases the launch's
+    # dependents, where the render releases from the loader's tail.
+    release_lead: int = MMA_DAG_RELEASE_LEAD_DEFAULT
+    # The order of a unit's pages, and for the bucketed one the bits of a
+    # physical page id below its bucket.
+    page_order: str = MMA_DAG_PAGE_ORDER_SOURCE
+    page_order_shift: int = 0
+    # The pages a reversed walk has left when it takes the unit's oldest
+    # page; zero is that order's own place for it, last.
+    clipped_page_lead: int = MMA_DAG_CLIPPED_PAGE_LEAD_DEFAULT
+    # Pages of raw V staged per head, and the shared memory of one CTA that
+    # the depth was admitted on (zero: unknown).
+    value_ring: int = PAIRED_DEFAULT_VALUE_RING
+    smem_capacity: int = 0
 
 
 def plan_paged_attention_schedule(
@@ -318,7 +394,54 @@ def plan_paged_attention_schedule(
         else (0,)
     ):
         return None
+    boundary_prefetch = config.get(MMA_DAG_BOUNDARY_PREFETCH_KEY, 0)
+    if type(
+        boundary_prefetch
+    ) is not int or boundary_prefetch not in paged_attention_boundary_prefetch_choices(
+        facts, pass_warps, value_metadata_skip, partition
+    ):
+        return None
+    release_lead = config.get(MMA_DAG_RELEASE_LEAD_KEY, MMA_DAG_RELEASE_LEAD_DEFAULT)
+    if type(
+        release_lead
+    ) is not int or release_lead not in paged_attention_release_lead_choices(
+        facts, pass_warps
+    ):
+        return None
+    value_ring = config.get(MMA_DAG_VALUE_RING_KEY, PAIRED_DEFAULT_VALUE_RING)
+    if type(value_ring) is not int or value_ring not in (
+        paged_attention_value_ring_choices(
+            facts, pass_warps, value_metadata_skip, partition
+        )
+    ):
+        return None
+    page_order = config.get(MMA_DAG_PAGE_ORDER_KEY, MMA_DAG_PAGE_ORDER_SOURCE)
+    if type(page_order) is not str or page_order not in (
+        paged_attention_page_order_choices(
+            facts, pass_warps, value_metadata_skip, partition
+        )
+    ):
+        return None
+    clipped_page_lead = config.get(
+        MMA_DAG_CLIPPED_PAGE_LEAD_KEY, MMA_DAG_CLIPPED_PAGE_LEAD_DEFAULT
+    )
+    if type(clipped_page_lead) is not int or clipped_page_lead not in (
+        paged_attention_clipped_page_lead_choices(
+            facts, pass_warps, value_metadata_skip, partition, page_order
+        )
+    ):
+        # Beside any order but the reversed walk a lead names nothing: the
+        # config contract drops it there (normalization), so a config that
+        # still has one was not normalized, and gets no schedule, as with
+        # every other knob above.
+        return None
     persistent_units = partition != MMA_DAG_PARTITION_ITEM
+    quotas = config.get(MMA_DAG_REGISTER_QUOTAS_KEY, MMA_DAG_REGISTER_QUOTAS_DEFAULT)
+    register_quotas = parse_register_quotas(quotas)
+    if register_quotas is None or quotas not in (
+        paged_attention_register_quota_choices(facts, pass_warps)
+    ):
+        return None
     query_axis, dimension_axis = semantic.query.tile_dims
     key_axis = semantic.key.raw.tile_dims[0]
     if (
@@ -375,6 +498,17 @@ def plan_paged_attention_schedule(
         if partition == MMA_DAG_PARTITION_BALANCED
         else 0,
         partition_skew=partition_skew,
+        register_quotas=register_quotas,
+        boundary_prefetch=boundary_prefetch,
+        boundary_prefetch_form=facts.boundary_prefetch_form
+        if boundary_prefetch
+        else "",
+        release_lead=release_lead,
+        value_ring=value_ring,
+        smem_capacity=facts.smem_capacity,
+        page_order=page_order,
+        page_order_shift=facts.page_order_shift,
+        clipped_page_lead=clipped_page_lead,
     )
 
 
@@ -487,10 +621,15 @@ def _paged_attention_schedule_facts(
         # The native head vote must not include a padded register row.
         return None
     # Two heads double the resident raw/Q/P/state panels. Every layout of the
-    # paired body (each panel width, with and without the query barrier and
-    # the value metadata's barriers and flags) fits the 180 KiB required
-    # here: test_paired_shared_memory_stays_inside_its_budget replays the
-    # body's allocations and holds the byte counts.
+    # paired body with one unit per CTA and the default depth of the raw V
+    # ring (each panel width, with and without the query barrier, the value
+    # metadata's barriers and flags, a boundary prefetch's barrier and a
+    # bucketed page order's tables and barrier: at most 181,144 bytes, in
+    # bucketed order at 40 query columns with the query barrier) fits the
+    # 180 KiB required here: test_paired_shared_memory_stays_inside_its_budget
+    # replays the body's allocations and holds the byte counts. A deeper
+    # ring and a persistent partition's tables are admitted against the
+    # device's own capacity (``value_ring_reason``, ``partition_q_stages``).
     paired_items = (not capacity or capacity >= 184320) and (
         paired_attention_item_axis(env, transport) is not None
     )
@@ -521,6 +660,16 @@ def _paged_attention_schedule_facts(
         persistent_units
         and env.settings.fast_math
         and semantic.partial_statistics is None
+    )
+    # A permutation of whole interior tiles reassociates the recurrence, as
+    # a split unit's merge does, and pays only where some unit can have
+    # enough interior pages: both are facts of the bind.
+    pool_pages = transport.key.raw_shape[4]
+    page_order_available = (
+        paired_items
+        and env.settings.fast_math
+        and isinstance(page_limit, int)
+        and page_order_offered(page_limit, semantic.mask.window_left)
     )
     partitions: tuple[str, ...] = (MMA_DAG_PARTITION_ITEM,)
     if persistent_units:
@@ -567,6 +716,26 @@ def _paged_attention_schedule_facts(
         if balanced_units
         else (0,),
         windowed=semantic.mask.window_left is not None,
+        # One CTA per SM and unit: a static grid on a known SM count, and a
+        # K layout whose pair of heads is one byte range per page.
+        boundary_prefetch_form=boundary_prefetch_form(
+            transport.items // 2, env.config_spec.num_sm
+        )
+        if paired_items and boundary_prefetch_layout(transport) is not None
+        else "",
+        page_order_available=page_order_available,
+        page_order_shift=page_order_shift(pool_pages) if page_order_available else 0,
+        reversed_order_missing=reversed_order_missing(
+            paired=paired_items,
+            fast_math=env.settings.fast_math,
+            windowed=semantic.mask.window_left is not None,
+            reflected=coords.reflected is not None,
+        ),
+        smem_capacity=capacity,
+        one_wave_units=paired_items
+        and 0 < transport.items // 2 <= env.config_spec.num_sm,
+        past_one_wave_units=paired_items
+        and 1 < env.config_spec.num_sm < transport.items // 2,
     )
 
 

@@ -607,6 +607,13 @@ def test_every_rendered_helper_name_resolves() -> None:
 # the two tables and the module in step).
 PTX_ROW_EXPORTS: dict[str, tuple[str, ...]] = {
     "_paged_attention_runtime": ("add_bf16x2",),
+    "_paged_attention_io": (
+        "l2_policy_evict_last",
+        "stg_bf16_l2",
+        "stg_cs_bf16",
+        "stg_cs_f32",
+        "stg_f32_l2",
+    ),
     "_flash_row_mma_runtime": (
         "bulk_reduce_add_f32",
         "cp_async_16",
@@ -1355,6 +1362,41 @@ PTX_ROW_FINGERPRINTS: dict[str, _Fingerprint] = {
         "l,f,~{memory}",
         True,
         ("i64", "f32"),
+        None,
+        None,
+    ),
+    "stg_bf16_l2": (
+        (
+            "{ .reg .b16 h; cvt.rn.bf16.f32 h, $1; "
+            "st.global.L2::cache_hint.b16 [$0], h, $2; }"
+        ),
+        "l,f,l,~{memory}",
+        True,
+        ("i64", "f32", "i64"),
+        None,
+        None,
+    ),
+    "stg_cs_bf16": (
+        "{ .reg .b16 h; cvt.rn.bf16.f32 h, $1; st.global.cs.b16 [$0], h; }",
+        "l,f,~{memory}",
+        True,
+        ("i64", "f32"),
+        None,
+        None,
+    ),
+    "stg_cs_f32": (
+        "st.global.cs.f32 [$0], $1;",
+        "l,f,~{memory}",
+        True,
+        ("i64", "f32"),
+        None,
+        None,
+    ),
+    "stg_f32_l2": (
+        "st.global.L2::cache_hint.f32 [$0], $1, $2;",
+        "l,f,l,~{memory}",
+        True,
+        ("i64", "f32", "i64"),
         None,
         None,
     ),

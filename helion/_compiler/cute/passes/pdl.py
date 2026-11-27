@@ -485,10 +485,10 @@ def _launch_fits_one_wave(fn: DeviceFunction) -> bool:
     launch sized to that capacity, or a device whose capacity is unknown.
     The test ``auto`` and ``loader_tail`` apply (``_implicit_pdl_release``,
     ``loader_tail_release_applies``)."""
-    capacity = _pdl_resident_capacity(fn)
+    capacity = pdl_resident_capacity(fn)
     if capacity is None:
         return True
-    ctas = _pdl_launch_ctas(fn)
+    ctas = pdl_launch_ctas(fn)
     if ctas is not None and ctas <= capacity:
         return True
     return ctas is None and _pdl_launch_is_persistent(fn)
@@ -519,8 +519,7 @@ def _entry_release_past_one_wave(fn: DeviceFunction) -> bool:
     guard on every kernel.
     """
     return (
-        fn.cute_state.lanes.attention_item_group > 1
-        and _pdl_launch_ctas(fn) is not None
+        fn.cute_state.lanes.attention_item_group > 1 and pdl_launch_ctas(fn) is not None
     )
 
 
@@ -532,8 +531,9 @@ def loader_tail_release_applies(fn: DeviceFunction) -> bool:
     placement it is asked about on a device of unknown capacity).
 
     The dependent grid launches once every CTA of this grid has released or
-    exited.  In one wave that is when the slowest loader has four pages
-    left, and the dependents' CTAs take over the SMs as this grid's CTAs
+    exited.  In one wave that is when the slowest loader has the release's
+    lead of pages left (``cute_mma_dag_release_lead``, four by default),
+    and the dependents' CTAs take over the SMs as this grid's CTAs
     retire.  Past one wave the earlier waves count at their exit, so a tail
     release launches the dependents only when the last wave's loaders are
     nearly done, and the SMs a partial last wave leaves idle stay idle for
@@ -562,7 +562,7 @@ def _pdl_launch_is_persistent(fn: DeviceFunction) -> bool:
     return pid._is_persistent()
 
 
-def _pdl_launch_ctas(fn: DeviceFunction) -> int | None:
+def pdl_launch_ctas(fn: DeviceFunction) -> int | None:
     """The CTA count of this kernel's launch when it is static: the
     program-id strategy's grid (``ProgramIDs.static_grid_size``) divided by
     the attention item group, then times the fused-body or split-K grid
@@ -585,7 +585,7 @@ def _pdl_launch_ctas(fn: DeviceFunction) -> int | None:
     )
 
 
-def _pdl_resident_capacity(fn: DeviceFunction) -> int | None:
+def pdl_resident_capacity(fn: DeviceFunction) -> int | None:
     """How many CTAs of this launch the device holds at once, as far as
     codegen can tell: the SM count times ``resident_ctas_per_sm`` of the
     launch block (the thread limit, or the occupancy the lowering launches
@@ -631,7 +631,7 @@ def _last_wave_release(fn: DeviceFunction, release: ast.stmt) -> list[ast.stmt]:
     that never issues it counts at its exit, so guarding the entry
     release to the CTAs whose dispatch-order index (``block_idx`` linear
     in the launch grid, x fastest, the order the hardware dispatches
-    them) lies within the resident capacity (``_pdl_resident_capacity``)
+    them) lies within the resident capacity (``pdl_resident_capacity``)
     of the grid's end launches the dependents as the last wave starts:
     their CTAs fill the slots the tail frees and the earlier waves kept
     every slot.  A grid known to fit in one wave gets the plain entry
@@ -641,10 +641,10 @@ def _last_wave_release(fn: DeviceFunction, release: ast.stmt) -> list[ast.stmt]:
     pads every empty statement list with a located ``pass`` (origin
     comments included), and the branch is rendered either way.
     """
-    capacity = _pdl_resident_capacity(fn)
+    capacity = pdl_resident_capacity(fn)
     if capacity is None:
         return [release]
-    ctas = _pdl_launch_ctas(fn)
+    ctas = pdl_launch_ctas(fn)
     if ctas is not None and ctas <= capacity:
         return [release]
     if ctas is None and _pdl_launch_is_persistent(fn):
@@ -715,7 +715,7 @@ def _pdl_spread_statements(
     """
     env = CompileEnvironment.current()
     num_sm = env.config_spec.num_sm
-    ctas = _pdl_launch_ctas(fn)
+    ctas = pdl_launch_ctas(fn)
     own = kernel_smem_footprint(definition, constexpr_values, fn.pid)
     if num_sm <= 1 or ctas is None or own.high is None:
         return []

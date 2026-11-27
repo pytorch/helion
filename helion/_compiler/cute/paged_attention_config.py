@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING
 from .cute_mma_dag import AXIS_LEAD
 from .cute_mma_dag import MMA_DAG_AUX_KEY
 from .cute_mma_dag import MMA_DAG_AUX_REGISTER
+from .cute_mma_dag import MMA_DAG_BOUNDARY_PREFETCH_KEY
 from .cute_mma_dag import MMA_DAG_CLUSTER_KEY
 from .cute_mma_dag import MMA_DAG_DERIVED_EXCHANGE
 from .cute_mma_dag import MMA_DAG_DERIVED_KEY
@@ -38,6 +39,7 @@ from .cute_mma_dag import MMA_DAG_PERSISTENT_KEY
 from .cute_mma_dag import MMA_DAG_PROBABILITY_SCHEDULE_KEY
 from .cute_mma_dag import MMA_DAG_PROBABILITY_SCHEDULE_SERIAL
 from .cute_mma_dag import MMA_DAG_QUERY_TMA_KEY
+from .cute_mma_dag import MMA_DAG_RELEASE_LEAD_KEY
 from .cute_mma_dag import MMA_DAG_SLEEP_WAITS_KEY
 from .cute_mma_dag import MMA_DAG_STAGES_KEY
 from .cute_mma_dag import MMA_DAG_STORE_KEY
@@ -47,13 +49,36 @@ from .cute_mma_dag import MMA_DAG_V_LAG_KEY
 from .cute_mma_dag import MMA_DAG_VALUE_METADATA_READ_OVERLAP_KEY
 from .cute_mma_dag import MMA_DAG_VALUE_METADATA_SKIP_KEY
 from .cute_mma_dag import MMA_DAG_WARPS_KEY
+from .cute_mma_dag import paged_attention_boundary_prefetch_choices
+from .cute_mma_dag import paged_attention_clipped_page_lead_choices
 from .cute_mma_dag import paged_attention_early_retirement_default
 from .cute_mma_dag import paged_attention_key_clip_choices
+from .cute_mma_dag import paged_attention_page_order_choices
+from .cute_mma_dag import paged_attention_page_order_facts
 from .cute_mma_dag import paged_attention_partition_choices
 from .cute_mma_dag import paged_attention_partition_skew_choices
 from .cute_mma_dag import paged_attention_pass_warps_reason
 from .cute_mma_dag import paged_attention_probability_choices
+from .cute_mma_dag import paged_attention_register_quota_choices
+from .cute_mma_dag import paged_attention_release_lead_choices
+from .cute_mma_dag import paged_attention_reversed_order_partition
 from .cute_mma_dag import paged_attention_v_lag_choices
+from .cute_mma_dag import paged_attention_value_ring_choices
+from .cute_mma_dag import paged_attention_value_ring_facts
+from .cute_mma_dag import paged_attention_value_ring_fit
+from .paged_attention_page_order import MMA_DAG_CLIPPED_PAGE_LEAD_CHOICES
+from .paged_attention_page_order import MMA_DAG_CLIPPED_PAGE_LEAD_DEFAULT
+from .paged_attention_page_order import MMA_DAG_CLIPPED_PAGE_LEAD_KEY
+from .paged_attention_page_order import MMA_DAG_PAGE_ORDER_BUCKETED
+from .paged_attention_page_order import MMA_DAG_PAGE_ORDER_KEY
+from .paged_attention_page_order import MMA_DAG_PAGE_ORDER_REVERSED
+from .paged_attention_page_order import MMA_DAG_PAGE_ORDER_SOURCE
+from .paged_attention_page_order import PAGE_ORDER_MIN_SORTED
+from .paged_attention_page_order import REVERSED_ORDER_NEEDS_PAIR
+from .paged_attention_registers import MMA_DAG_REGISTER_QUOTAS_KEY
+from .paged_attention_release import MMA_DAG_RELEASE_LEAD_DEFAULT
+from .paged_attention_shared_memory import MMA_DAG_VALUE_RING_KEY
+from .paged_attention_shared_memory import PAIRED_DEFAULT_VALUE_RING
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
@@ -136,6 +161,238 @@ def paged_attention_partition_skew_reason(
     return None
 
 
+def _schedule_transport_partition(
+    config: Mapping[str, object],
+) -> tuple[object, object, object]:
+    """What the choices of the paired body's stream options depend on in
+    ``config``: its schedule, its value-metadata transport and its
+    partition, each at the option's own default where the config leaves it
+    out."""
+    return (
+        config.get(MMA_DAG_PASS_WARPS_KEY, MMA_DAG_PASS_WARPS_ATTENTION),
+        config.get(MMA_DAG_VALUE_METADATA_SKIP_KEY, False),
+        config.get(MMA_DAG_PARTITION_KEY, MMA_DAG_PARTITION_ITEM),
+    )
+
+
+def _choices_reason(
+    key: str,
+    choices: tuple[object, ...],
+    selected: tuple[object, object, object],
+    where: str,
+) -> str:
+    """Why a config's value of the option ``key`` is refused: it is none of
+    the ``choices`` the option has on ``where`` under the schedule,
+    value-metadata transport and partition the config ``selected``
+    (``_schedule_transport_partition``)."""
+    pass_warps, value_metadata_skip, partition = selected
+    return (
+        f"{key} must be one of {choices!r} for "
+        f"{MMA_DAG_PASS_WARPS_KEY}={pass_warps!r}, "
+        f"{MMA_DAG_VALUE_METADATA_SKIP_KEY}={value_metadata_skip!r} and "
+        f"{MMA_DAG_PARTITION_KEY}={partition!r} on {where}"
+    )
+
+
+def paged_attention_boundary_prefetch_reason(
+    facts: CuteMmaDagFacts, config: Mapping[str, object]
+) -> str | None:
+    """Why this configuration's schedule cannot run its boundary prefetch.
+
+    The role is the paired schedule's idle control warp on a grid of one
+    unit per CTA. The dependent-launch policy that the form of a one-wave
+    grid needs as well is resolved after this check
+    (``search_surface._normalize_boundary_prefetch_policy``).
+    """
+    pages = config.get(MMA_DAG_BOUNDARY_PREFETCH_KEY, 0)
+    if type(pages) is int and pages == 0:
+        return None
+    selected = _schedule_transport_partition(config)
+    choices = paged_attention_boundary_prefetch_choices(facts.attention, *selected)
+    if type(pages) is not int or pages not in choices:
+        return _choices_reason(
+            MMA_DAG_BOUNDARY_PREFETCH_KEY, choices, selected, "this kernel's grid"
+        )
+    return None
+
+
+def paged_attention_release_lead_reason(
+    facts: CuteMmaDagFacts, config: Mapping[str, object]
+) -> str | None:
+    """Why this configuration's schedule cannot release its dependents with
+    the lead it names.
+
+    The lead belongs to the paired loader's tail release. Whether the
+    config's dependent-launch policy releases there is resolved after this
+    check (``search_surface._normalize_release_lead_policy``).
+    """
+    lead = config.get(MMA_DAG_RELEASE_LEAD_KEY, MMA_DAG_RELEASE_LEAD_DEFAULT)
+    if type(lead) is int and lead == MMA_DAG_RELEASE_LEAD_DEFAULT:
+        return None
+    pass_warps = config.get(MMA_DAG_PASS_WARPS_KEY, MMA_DAG_PASS_WARPS_ATTENTION)
+    choices = paged_attention_release_lead_choices(facts.attention, pass_warps)
+    if type(lead) is not int or lead not in choices:
+        return (
+            f"{MMA_DAG_RELEASE_LEAD_KEY} must be one of {choices!r} for "
+            f"{MMA_DAG_PASS_WARPS_KEY}={pass_warps!r}"
+        )
+    return None
+
+
+def paged_attention_value_ring_reason(
+    facts: CuteMmaDagFacts, config: Mapping[str, object]
+) -> str | None:
+    """Why this configuration's schedule cannot stage the pages of raw V per
+    head it names.
+
+    The ring is the paired body's, the value-metadata actor walks it at its
+    default depth, and a deeper ring must fit the shared memory the device
+    grants one CTA, with what the config's partition adds to it.
+    """
+    ring = config.get(MMA_DAG_VALUE_RING_KEY, PAIRED_DEFAULT_VALUE_RING)
+    if type(ring) is int and ring == PAIRED_DEFAULT_VALUE_RING:
+        return None
+    attention = facts.attention
+    selected = _schedule_transport_partition(config)
+    choices = paged_attention_value_ring_choices(attention, *selected)
+    if type(ring) is int and ring in choices:
+        return None
+    reason = _choices_reason(MMA_DAG_VALUE_RING_KEY, choices, selected, "this device")
+    ringed = paged_attention_value_ring_facts(attention, *selected)
+    partition = selected[2]
+    if type(ring) is int and ringed is not None:
+        # The schedule has the ring: say what this partition's CTA would
+        # need of the device for the depth.
+        fit = paged_attention_value_ring_fit(ringed, ring, partition)
+        if fit is not None:
+            reason += f": {fit}"
+    return reason
+
+
+def paged_attention_page_order_reason(
+    facts: CuteMmaDagFacts, config: Mapping[str, object]
+) -> str | None:
+    """Why this configuration's schedule cannot stream a unit's pages in
+    the order it names.
+
+    The bucketed order belongs to the paired schedule's one-unit CTAs
+    without the value-metadata transport, under fast math, on a kernel some
+    of whose units can have enough interior pages for the sort to pay. For
+    a config whose own options would run the order the reason names both
+    requirements of the bind (fast math, and a unit with that many interior
+    pages); for any other it names the options that exclude the order. The
+    reversed order belongs to the same schedule and transport, under fast
+    math, on a kernel with a sliding window whose source loop visits its
+    pages oldest first, with one unit per CTA and on the persistent
+    partitions of a grid of more units than SMs; its reason names the
+    requirement the kernel or the config does not meet
+    (``_reversed_order_reason``).
+    """
+    order = config.get(MMA_DAG_PAGE_ORDER_KEY, MMA_DAG_PAGE_ORDER_SOURCE)
+    if type(order) is str and order == MMA_DAG_PAGE_ORDER_SOURCE:
+        return None
+    selected = _schedule_transport_partition(config)
+    choices = paged_attention_page_order_choices(facts.attention, *selected)
+    if type(order) is str and order in choices:
+        return None
+    if type(order) is str and order == MMA_DAG_PAGE_ORDER_REVERSED:
+        return _reversed_order_reason(facts, *selected)
+    if (
+        type(order) is str
+        and order == MMA_DAG_PAGE_ORDER_BUCKETED
+        and paged_attention_page_order_facts(facts.attention, *selected) is not None
+    ):
+        # The schedule, transport and partition admit the order, which the
+        # choices do not hold: the bind does not offer it
+        # (``PagedAttentionScheduleFacts.page_order_available``).
+        return (
+            f"{MMA_DAG_PAGE_ORDER_KEY}={order!r} needs a kernel bound with "
+            "fast_math=True, some of whose units can have "
+            f"{PAGE_ORDER_MIN_SORTED} or more interior pages to order: this "
+            "kernel does not offer it"
+        )
+    return _choices_reason(MMA_DAG_PAGE_ORDER_KEY, choices, selected, "this kernel")
+
+
+def _reversed_order_reason(
+    facts: CuteMmaDagFacts,
+    pass_warps: object,
+    value_metadata_skip: object,
+    partition: object,
+) -> str:
+    """Which requirement of ``cute_mma_dag_page_order="reversed"`` a config
+    that the choices do not admit fails: the kernel's first (the pair proof,
+    fast math, a sliding window, a source loop that is not reflected), then
+    the config's own (the paired schedule, a partition the walk runs on, no
+    value-metadata transport)."""
+    named = f"{MMA_DAG_PAGE_ORDER_KEY}={MMA_DAG_PAGE_ORDER_REVERSED!r}"
+    attention = facts.attention
+    missing = (
+        attention.reversed_order_missing
+        if attention is not None and attention.paired_items
+        else REVERSED_ORDER_NEEDS_PAIR
+    )
+    if missing:
+        return f"{named} walks a work item's pages newest first and needs {missing}"
+    if pass_warps != MMA_DAG_PASS_WARPS_ATTENTION_PAIRED:
+        return (
+            f"{named} needs the paired attention schedule "
+            f"({MMA_DAG_PASS_WARPS_KEY}={MMA_DAG_PASS_WARPS_ATTENTION_PAIRED!r}), "
+            f"and this config selects {MMA_DAG_PASS_WARPS_KEY}={pass_warps!r}: "
+            "no other body has the walk"
+        )
+    if not paged_attention_reversed_order_partition(attention, partition):
+        return (
+            f"{named} needs one unit per CTA "
+            f"({MMA_DAG_PARTITION_KEY}={MMA_DAG_PARTITION_ITEM!r}) or a grid of "
+            "more units than the device has SMs, and this config selects "
+            f"{MMA_DAG_PARTITION_KEY}={partition!r} on a grid that is not "
+            "known to hold more: a persistent CTA runs about one unit there, "
+            "and the walk was not examined on it"
+        )
+    assert value_metadata_skip is True
+    return (
+        f"{named} needs {MMA_DAG_VALUE_METADATA_SKIP_KEY}=False: the walk was "
+        "not examined with the value-metadata transport"
+    )
+
+
+def paged_attention_clipped_page_lead_reason(
+    config: Mapping[str, object],
+) -> str | None:
+    """Why this configuration cannot name the lead of the clipped page it
+    names: the value is none of the option's.
+
+    Whether the config has a page for the lead to place is no question of
+    validity. Only a walk in reversed order has one, and beside any other
+    order a lead names nothing: normalization drops it there
+    (``paged_attention_clipped_page_lead_applies``), as it drops the default.
+    """
+    lead = config.get(MMA_DAG_CLIPPED_PAGE_LEAD_KEY, MMA_DAG_CLIPPED_PAGE_LEAD_DEFAULT)
+    if type(lead) is int and lead in MMA_DAG_CLIPPED_PAGE_LEAD_CHOICES:
+        return None
+    return (
+        f"{MMA_DAG_CLIPPED_PAGE_LEAD_KEY} must be one of "
+        f"{MMA_DAG_CLIPPED_PAGE_LEAD_CHOICES!r}: the pages a walk in "
+        f"{MMA_DAG_PAGE_ORDER_KEY}={MMA_DAG_PAGE_ORDER_REVERSED!r} has left when "
+        "it takes the work item's oldest page"
+    )
+
+
+def paged_attention_clipped_page_lead_applies(
+    facts: CuteMmaDagFacts, config: Mapping[str, object]
+) -> bool:
+    """Whether a lead of the clipped page other than the default names
+    something in this configuration: whether its page order, already
+    validated, is the reversed walk (``paged_attention_clipped_page_lead_choices``)."""
+    lead = config.get(MMA_DAG_CLIPPED_PAGE_LEAD_KEY, MMA_DAG_CLIPPED_PAGE_LEAD_DEFAULT)
+    return lead in paged_attention_clipped_page_lead_choices(
+        facts.attention,
+        *_schedule_transport_partition(config),
+        config.get(MMA_DAG_PAGE_ORDER_KEY, MMA_DAG_PAGE_ORDER_SOURCE),
+    )
+
+
 def paged_attention_config_reason(
     facts: CuteMmaDagFacts,
     sizes: Mapping[int, object],
@@ -204,11 +461,21 @@ def paged_attention_config_reason(
     key_clip = config.get(MMA_DAG_KEY_CLIP_KEY, key_clips[0])
     if type(key_clip) is not str or key_clip not in key_clips:
         return f"{MMA_DAG_KEY_CLIP_KEY} must be one of {key_clips!r} for {pass_warps}"
-    partition_reason = paged_attention_partition_reason(
-        facts, config
-    ) or paged_attention_partition_skew_reason(facts, config)
+    partition_reason = (
+        paged_attention_partition_reason(facts, config)
+        or paged_attention_partition_skew_reason(facts, config)
+        or paged_attention_boundary_prefetch_reason(facts, config)
+        or paged_attention_release_lead_reason(facts, config)
+        or paged_attention_value_ring_reason(facts, config)
+        or paged_attention_page_order_reason(facts, config)
+        or paged_attention_clipped_page_lead_reason(config)
+    )
     if partition_reason is not None:
         return partition_reason
+    quota_choices = paged_attention_register_quota_choices(attention, pass_warps)
+    quotas = config.get(MMA_DAG_REGISTER_QUOTAS_KEY, quota_choices[0])
+    if type(quotas) is not str or quotas not in quota_choices:
+        return f"{MMA_DAG_REGISTER_QUOTAS_KEY} must be one of {quota_choices!r} for {pass_warps}"
     for key, expected in paged_attention_required_knobs(facts).items():
         actual = config.get(key, expected)
         if type(actual) is not type(expected) or actual != expected:
