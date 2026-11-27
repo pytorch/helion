@@ -6679,6 +6679,32 @@ class TestCuteBackend(TestCase):
         )
         torch.testing.assert_close(generic_out, expected, atol=2e-2, rtol=2e-2)
 
+    def test_flash_attention_small_biased_transposed_v_matches_sdpa(self) -> None:
+        """V as the dense transpose of a contiguous ``[.., head_dim, seq]``
+        buffer (the key dim has the unit stride), which the tensor plan takes:
+        the small biased body reads it by those strides."""
+        q, k, v = (
+            torch.randn(1, 2, 128, 64, dtype=torch.float16, device=DEVICE)
+            for _ in range(3)
+        )
+        v = v.transpose(-1, -2).contiguous().transpose(-1, -2)
+        self.assertEqual(v.stride(), (16384, 8192, 1, 128))
+        bias = torch.randn(1, 2, 128, 128, dtype=torch.float16, device=DEVICE) * 0.25
+        code, out = code_and_output(
+            cute_biased_attention,
+            (q, k, v, bias),
+            block_sizes=[1, 128, 128],
+        )
+        self.assertIn("helion_small_biased_attention", code)
+        expected = torch.nn.functional.scaled_dot_product_attention(
+            q,
+            k,
+            v,
+            attn_mask=bias,
+        )
+        # The 64-thread small path uses a different fp32 reduction order than SDPA.
+        torch.testing.assert_close(out, expected, atol=2e-2, rtol=2e-2)
+
     def test_flash_attention_bias_all_inf_row_matches_sdpa(self) -> None:
         q, k, v = (
             torch.randn(1, 2, 128, 64, dtype=torch.float16, device=DEVICE)

@@ -722,6 +722,42 @@ def _dense_attention(
     return out.view(q_in.size())
 
 
+@helion.kernel(backend="cute", static_shapes=True)
+def _biased_attention(
+    q_in: torch.Tensor, k_in: torch.Tensor, v_in: torch.Tensor, bias: torch.Tensor
+) -> torch.Tensor:
+    m_dim = q_in.size(-2)
+    n_dim = k_in.size(-2)
+    head_dim = hl.specialize(q_in.size(-1))
+    q_view = q_in.reshape([-1, m_dim, head_dim])
+    k_view = k_in.reshape([-1, n_dim, head_dim])
+    v_view = v_in.reshape([-1, n_dim, head_dim])
+    bias_view = bias.reshape([-1, m_dim, n_dim])
+    out = torch.empty_like(q_view)
+    qk_scale = 1.0 / math.sqrt(head_dim)
+    for tile_b, tile_m in hl.tile([q_view.size(0), m_dim]):
+        m_i = hl.full([tile_b, tile_m], float("-inf"), dtype=torch.float32)
+        l_i = torch.full_like(m_i, 1.0)
+        acc = hl.zeros([tile_b, tile_m, head_dim], dtype=torch.float32)
+        qt = q_view[tile_b, tile_m, :]
+        for tile_n in hl.tile(v_view.size(1)):
+            kt = k_view[tile_b, tile_n, :]
+            qk = torch.bmm(qt * qk_scale, kt.transpose(1, 2), torch.float32)
+            qk = qk + bias_view[tile_b, tile_m, tile_n]
+            m_ij = torch.maximum(m_i, torch.amax(qk, -1))
+            qk = qk - m_ij[:, :, None]
+            p = torch.exp(qk)
+            l_ij = torch.sum(p, -1)
+            alpha = torch.exp(m_i - m_ij)
+            l_i = l_i * alpha + l_ij
+            acc = acc * alpha[:, :, None]
+            vt = v_view[tile_b, tile_n, :]
+            acc = torch.baddbmm(acc, p.to(vt.dtype), vt)
+            m_i = m_ij
+        out[tile_b, tile_m, :] = (acc / l_i[:, :, None]).to(out.dtype)
+    return out.view(q_in.size())
+
+
 def _dense_args(batch: int, heads: int, seq: int, head_dim: int) -> tuple[object, ...]:
     torch.manual_seed(0)
     return tuple(
@@ -1372,6 +1408,38 @@ def test_flex_tma_only_output_without_a_pair_body_takes_the_generic_fallback(
     with cpu_codegen():
         code = bound.to_code(initial)
     assert "'kind': 'helion_flash'" not in code
+
+
+@pytest.mark.parametrize("transposed", (False, True), ids=("contiguous", "transposed"))
+def test_small_biased_body_reads_v_from_its_storage(transposed: bool) -> None:
+    """The small biased body (one KV tile at head dim 64 with a tensor bias)
+    addresses its operands by their strides. The tensor plan takes V as a
+    contiguous ``[batch heads, seq, head_dim]`` buffer or as the dense
+    transpose of a contiguous ``[batch heads, head_dim, seq]`` one, whose
+    key dim has the unit stride; the body used to read both with the
+    contiguous strides, and returned other elements of a transposed V."""
+    q, k, v = (torch.empty(2, 128, 64, dtype=torch.float16) for _ in range(3))
+    bias = torch.empty(2, 128, 128, dtype=torch.float16)
+    if transposed:
+        v = v.transpose(-1, -2).contiguous().transpose(-1, -2)
+        assert v.stride() == (8192, 1, 128)
+    kernel = helion.kernel(backend="cute", static_shapes=True)(_biased_attention.fn)
+    with cpu_codegen():
+        bound = kernel.bind((q, k, v, bias))
+        code = bound.to_code(bound.config_spec.default_config())
+    assert "helion_small_biased_attention" in code
+    key_stride, head_stride = (1, 128) if transposed else (64, 1)
+    (v_load,) = re.findall(r"small_v = \((\w+)\.iterator \+ (.*)\)\.load\(\)", code)
+    assert v_load[1] == (
+        "small_bh * cutlass.Int32(8192) "
+        f"+ small_kv * cutlass.Int32({key_stride}) "
+        f"+ small_col * cutlass.Int32({head_stride})"
+    )
+    # Q, K, the bias and the output are contiguous in every plan.
+    assert code.count("small_d * cutlass.Int32(1)") == 3
+    assert (
+        "small_row * cutlass.Int32(64) + small_col * cutlass.Int32(1)).store(" in code
+    )
 
 
 @pytest.mark.parametrize("head_dim", (192, 256))
