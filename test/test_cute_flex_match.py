@@ -629,6 +629,85 @@ def test_declines_non_unit_batch_tile(tmp_path: pathlib.Path) -> None:
     assert reasons == ["flex: root axis 2 is not pinned to block size 1"]
 
 
+# The example's three starts and its row sum guard, and the variants that
+# replace a start or drop the guard: the edits and the reason the envelope
+# declines for, None when it still matches.
+_M_START = '        m_i = hl.full([tile_m], float("-inf"), dtype=torch.float32)\n'
+_L_START = "        l_i = torch.full_like(m_i, 1.0)\n"
+_ACC_START = "        acc = hl.zeros([tile_m, Dv], dtype=torch.float32)\n"
+_L_GUARD = "        l_i = torch.where(l_i == 0.0, 1.0, l_i)\n"
+_L_ZERO = (_L_START, "        l_i = torch.full_like(m_i, 0.0)\n")
+_OTHER_START = (
+    "flex: the first walk does not start from a running max of -inf, "
+    "a finite row sum >= 0 and a zero accumulator"
+)
+_UNGUARDED_ZERO = "flex: a row sum that starts at 0 needs the where(l == 0, 1, l) guard"
+_START_VARIANTS: dict[str, tuple[tuple[tuple[str, str], ...], str | None]] = {
+    "row_sum_zero": ((_L_ZERO,), None),
+    "finite_max": (
+        ((_M_START, "        m_i = hl.zeros([tile_m], dtype=torch.float32)\n"),),
+        _OTHER_START,
+    ),
+    "negative_row_sum": (
+        ((_L_START, "        l_i = torch.full_like(m_i, -1.0)\n"),),
+        _OTHER_START,
+    ),
+    "accumulator_one": (
+        (
+            (
+                _ACC_START,
+                "        acc = hl.full([tile_m, Dv], 1.0, dtype=torch.float32)\n",
+            ),
+        ),
+        _OTHER_START,
+    ),
+    "row_sum_argument": (
+        (
+            (
+                _L_START,
+                "        l_i = hl.full([tile_m], scale, dtype=torch.float32)\n",
+            ),
+        ),
+        _OTHER_START,
+    ),
+    "unguarded_row_sum_one": (((_L_GUARD, ""),), None),
+    "unguarded_row_sum_zero": ((_L_ZERO, (_L_GUARD, "")), _UNGUARDED_ZERO),
+    # The fp32 row sum holds 0.
+    "unguarded_row_sum_rounding_to_zero": (
+        ((_L_START, "        l_i = torch.full_like(m_i, 1e-50)\n"), (_L_GUARD, "")),
+        _UNGUARDED_ZERO,
+    ),
+}
+
+
+@pytest.mark.parametrize("name", list(_START_VARIANTS))
+def test_first_walk_starts_as_the_fused_body_does(
+    tmp_path: pathlib.Path, name: str
+) -> None:
+    """The fused body starts every row from ``(m, l, acc) = (-inf, 0, 0)``,
+    and a row whose walks list no block ends at its start: output 0, LSE
+    ``-inf``.  A running max of ``-inf`` with a zero accumulator and a finite
+    row sum that is not negative gives the same.  A finite max keeps the
+    start through the first KV step, a negative row sum makes the empty
+    row's LSE NaN, a nonzero accumulator gives it an output, and a runtime
+    scalar is no constant, whatever the call passes.  A row sum of zero is
+    the empty row's divisor unless the epilogue's ``where(l == 0, 1, l)``
+    guards it: without the guard the kernel stores ``0 / 0`` there.  (What
+    a kernel's statements give for a row that a visited block's mask hides,
+    ``0 / 0`` or ``-inf - -inf``, is no start: the fused body's masked
+    softmax, 0 for a row without a key, is the lowering's convention,
+    ``flex_match._match_epilogue``.)"""
+    edits, declined = _START_VARIANTS[name]
+    kernel = _variant_kernel(tmp_path, "start_" + name, *edits)
+    reasons: list[str] = []
+    match = _match(_bind(kernel, _causal_args()), reasons)
+    if declined is None:
+        assert match is not None, reasons
+    else:
+        assert match is None
+        assert reasons == [declined]
+
+
 def test_zeros_like_score_in_a_score_mod_is_admitted() -> None:
     """``torch.zeros_like(score)`` (attention-gym graphormer-edge) lowers to
     ``aten.full`` sized by ``sym_size_int(score, d)``: shape metadata, not

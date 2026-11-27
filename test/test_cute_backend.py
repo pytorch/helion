@@ -5144,6 +5144,13 @@ class TestCuteBackend(TestCase):
                     "_attention_softmax_pattern_head_dim",
                     side_effect=patterns,
                 ),
+                # No graph here calls the two loops, so their statistics have
+                # no start to read.
+                patch.object(
+                    _attention_match,
+                    "_attention_loop_starts_fused",
+                    return_value=True,
+                ),
                 patch.object(
                     _cute_flash,
                     "_flash_output_requires_tma",

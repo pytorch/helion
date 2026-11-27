@@ -23,6 +23,7 @@ import math
 import operator
 import os
 from typing import TYPE_CHECKING
+from typing import Iterable
 from typing import NamedTuple
 from typing import Sequence
 
@@ -43,15 +44,18 @@ from ..attention_plan import AttentionScorePlan
 from ..attention_plan import flash_head_dims_supported
 from ..attention_plan import flash_pair_head_dims_supported
 from .match_common import FlattenedRowOffset
+from .match_common import constant_fill
 from .match_common import flattened_row_offset
 from .match_common import host_tensor_name
 from .match_common import is_call
 from .match_common import is_neg_inf
 from .match_common import new_var_source
+from .match_common import node_tensor
 from .match_common import packed_f32x2_multiply
 from .match_common import root_grid_origin_is_canonical
 from .match_common import scalar_value
 from .match_common import scale_operand
+from .match_common import strip_new_var
 from .match_common import unit_fixed_block
 
 if TYPE_CHECKING:
@@ -59,6 +63,7 @@ if TYPE_CHECKING:
 
     from ...compile_environment import CompileEnvironment
     from ...device_ir import DeviceIR
+    from ...device_ir import GraphInfo
     from ..flex_match import FlexMatch
 
 
@@ -119,9 +124,22 @@ class FlashSearchSurface(NamedTuple):
     flex_hook_ops: int = 0
 
 
+class AttentionCarriedInputs(NamedTuple):
+    """Positions, among a KV loop's inputs, of the three statistics its body
+    carries: the running max, the row sum and the accumulator
+    (``_attention_exact_online_softmax_chain`` names them by their uses)."""
+
+    m: int
+    l: int  # noqa: E741
+    acc: int
+
+
 class AttentionSoftmaxPattern(NamedTuple):
     score_plan: AttentionScorePlan
     io_dtype: torch.dtype
+    # Which of the KV loop's inputs carry the statistics: the values they
+    # enter the loop with are the root's (``_attention_loop_starts_fused``).
+    carried: AttentionCarriedInputs
     # The score tile's rank: 3 for the ``bmm`` form over ``q[tile_b, tile_m, :]``
     # (the root the fused bodies are generated for), 2 for the ``hl.dot`` form
     # over ``q[bh, tile_m, :]`` with a scalar batch-head index.
@@ -1715,9 +1733,10 @@ def _attention_exact_online_softmax_chain(
     pv_node: torch.fx.Node,
     *,
     deferred_max: torch.fx.Node | None = None,
-) -> bool:
-    """Whether ``score_node`` (the scaled, modified score tile) feeds the
-    exact online-softmax chain the fused bodies compute: ``m = maximum(prev_m,
+) -> AttentionCarriedInputs | None:
+    """The loop inputs that carry the statistics when ``score_node`` (the
+    scaled, modified score tile) feeds the exact online-softmax chain the
+    fused bodies compute, None otherwise: ``m = maximum(prev_m,
     amax(_mask_to(score, -inf)))``, ``p = exp2(score - m)``, ``alpha =
     exp2(prev_m - m)``, ``l = prev_l * alpha + sum(_mask_to(p, 0))``, ``acc =
     pv(p, v, prev_acc * alpha)``, the loop returning ``(m, l, acc)`` in the
@@ -1796,7 +1815,7 @@ def _attention_exact_online_softmax_chain(
     placeholders = [node for node in graph.nodes if node.op == "placeholder"]
     candidates = placeholders[1:]
     if len(candidates) < 3:
-        return False
+        return None
 
     def carried_placeholder(node: object) -> torch.fx.Node | None:
         node = unwrap_new_var(node)
@@ -1822,7 +1841,7 @@ def _attention_exact_online_softmax_chain(
         if user.op == "call_function" and user.target is torch.ops.aten.sub.Tensor
     ]
     if len(qk_sub_users) != 1:
-        return False
+        return None
     if deferred_max is None:
         qk_mask_users = [
             user
@@ -1830,29 +1849,29 @@ def _attention_exact_online_softmax_chain(
             if user.op == "call_function" and user.target is _mask_to
         ]
         if len(qk_mask_users) != 1:
-            return False
+            return None
         if set(score_node.users) != {qk_mask_users[0], qk_sub_users[0]}:
-            return False
+            return None
 
         qk_mask = qk_mask_users[0]
         if len(qk_mask.args) < 2 or qk_mask.args[0] is not score_node:
-            return False
+            return None
         if qk_mask.args[1] != float("-inf"):
-            return False
+            return None
         amax_users = [
             user
             for user in qk_mask.users
             if user.op == "call_function" and user.target is torch.ops.aten.amax.default
         ]
         if len(amax_users) != 1 or set(qk_mask.users) != {amax_users[0]}:
-            return False
+            return None
         max_input = amax_users[0]
         if len(max_input.args) < 2 or max_input.args[1] != [-1]:
-            return False
+            return None
         amax_keepdim = len(max_input.args) >= 3 and bool(max_input.args[2])
     else:
         if set(score_node.users) != {qk_sub_users[0]}:
-            return False
+            return None
         max_input = deferred_max
         amax_keepdim = False
     maximum_users = [
@@ -1861,45 +1880,45 @@ def _attention_exact_online_softmax_chain(
         if user.op == "call_function" and user.target is torch.ops.aten.maximum.default
     ]
     if len(maximum_users) != 1:
-        return False
+        return None
     max_node = maximum_users[0]
     if len(max_node.args) < 2:
-        return False
+        return None
     if max_node.args[0] is max_input and isinstance(max_node.args[1], torch.fx.Node):
         prev_m_arg = max_node.args[1]
     elif max_node.args[1] is max_input and isinstance(max_node.args[0], torch.fx.Node):
         prev_m_arg = max_node.args[0]
     else:
-        return False
+        return None
     if amax_keepdim:
         prev_m = broadcast_row_vector_source(prev_m_arg)
         if prev_m is None:
-            return False
+            return None
         max_state_users = [
             user for user in max_node.users if is_squeeze_last_dim(user, max_node)
         ]
         if len(max_state_users) != 1:
-            return False
+            return None
         max_state_node = max_state_users[0]
     else:
         prev_m = prev_m_arg
         max_state_node = max_node
     m_placeholder = carried_placeholder(prev_m)
     if m_placeholder is None:
-        return False
+        return None
 
     centered = qk_sub_users[0]
     if len(centered.args) < 2 or centered.args[0] is not score_node:
-        return False
+        return None
     max_view = centered.args[1]
     if not isinstance(max_view, torch.fx.Node):
-        return False
+        return None
     if amax_keepdim:
         if max_view is not max_node:
-            return False
+            return None
     else:
         if not is_broadcast_row_vector(max_view, max_node):
-            return False
+            return None
 
     p_users = [
         user
@@ -1908,7 +1927,7 @@ def _attention_exact_online_softmax_chain(
         and user.target in (torch.ops.aten.exp.default, torch.ops.aten.exp2.default)
     ]
     if len(p_users) != 1 or set(centered.users) != {p_users[0]}:
-        return False
+        return None
     p_node = p_users[0]
 
     p_mask_users = [
@@ -1930,7 +1949,7 @@ def _attention_exact_online_softmax_chain(
         and user.args[1] == [-1]
     ]
     if len(p_sum_users) != 1:
-        return False
+        return None
     l_ij = p_sum_users[0]
 
     alpha_sub_users = [
@@ -1945,7 +1964,7 @@ def _attention_exact_online_softmax_chain(
         )
     ]
     if len(alpha_sub_users) != 1:
-        return False
+        return None
     alpha_sub = alpha_sub_users[0]
     alpha_users = [
         user
@@ -1953,7 +1972,7 @@ def _attention_exact_online_softmax_chain(
         if user.op == "call_function" and user.target is p_node.target
     ]
     if len(alpha_users) != 1 or set(alpha_sub.users) != {alpha_users[0]}:
-        return False
+        return None
     alpha = alpha_users[0]
 
     # ``l = prev_l * alpha + l_ij``: the carried operand of the multiply
@@ -1980,13 +1999,13 @@ def _attention_exact_online_softmax_chain(
         )
     ]
     if len(l_updates) != 1:
-        return False
+        return None
     l_placeholder, l_update = l_updates[0]
     assert l_placeholder is not None
 
     alpha_views = [user for user in alpha.users if is_broadcast_row_vector(user, alpha)]
     if len(alpha_views) != 1:
-        return False
+        return None
     alpha_view = alpha_views[0]
     # ``acc = prev_acc * alpha[..., None]``: the carried operand of the
     # rescale names the accumulator.
@@ -2002,24 +2021,30 @@ def _attention_exact_online_softmax_chain(
         )
     ]
     if len(acc_rescales) != 1:
-        return False
+        return None
     acc_placeholder, acc_rescaled = acc_rescales[0]
     assert acc_placeholder is not None
 
     pv_operands = _attention_pv_operands(pv_node)
     if pv_operands is None:
-        return False
+        return None
     acc_arg, p_arg, _ = pv_operands
     if acc_arg is not acc_rescaled:
-        return False
+        return None
     if _attention_pv_p_arg_base(p_arg) is not p_node:
-        return False
-    return loop_body_returns(
+        return None
+    if not loop_body_returns(
         {
             m_placeholder: max_state_node,
             l_placeholder: l_update,
             acc_placeholder: pv_node,
         }
+    ):
+        return None
+    return AttentionCarriedInputs(
+        m=placeholders.index(m_placeholder),
+        l=placeholders.index(l_placeholder),
+        acc=placeholders.index(acc_placeholder),
     )
 
 
@@ -2211,9 +2236,10 @@ def _attention_softmax_pattern_head_dim(
     # forms are admitted on the plain dense body only.
     if modifiers and (deferred_max is not None or not isinstance(q_scale, float)):
         return None
-    if not _attention_exact_online_softmax_chain(
+    carried = _attention_exact_online_softmax_chain(
         score_node, pv_node, deferred_max=deferred_max
-    ):
+    )
+    if carried is None:
         return None
     exp_base = _attention_online_softmax_exp_base(score_node)
     if exp_base == "exp2":
@@ -2283,6 +2309,7 @@ def _attention_softmax_pattern_head_dim(
     return AttentionSoftmaxPattern(
         score_plan=score_plan,
         io_dtype=operand_dtype,
+        carried=carried,
         score_rank=score_rank,
         batch_block_id=k_indices.batch_block_id,
         flattened=k_indices.flattened,
@@ -2387,6 +2414,119 @@ def _attention_pattern_fits_root(
     return pattern.batch_block_id is None or pattern.batch_block_id == int(
         root_block_ids[0]
     )
+
+
+def _running_max_sentinel_bound(dtype: torch.dtype) -> float:
+    """The magnitude ``b`` from which a start of the running max is a
+    sentinel: a running max of ``dtype`` that starts at any ``m0 <= -b`` is
+    wiped by the first score above it. The online-softmax step computes
+    ``alpha = exp2(m0 - m)`` for the new max ``m > m0`` (or ``exp`` of it,
+    which is smaller still), and that is exactly zero.
+
+    The floats just above ``m0`` are at least ``|m0| * eps / 2`` apart
+    (exactly that when ``|m0|`` is a power of two), so every representable
+    ``m > m0`` has ``m0 - m <= -|m0| * eps / 2``, and the subtraction rounds
+    no closer to zero than that. ``exp2(x)`` rounds to zero when ``2 ** x``
+    is at most half the smallest subnormal ``tiny * eps = 2 ** -underflow``
+    (``underflow`` is 149 for fp32), that is for ``x <= -(underflow + 1)``.
+    Hence ``|m0| * eps / 2 >= underflow + 1``: ``b = 2 * (underflow + 1) /
+    eps``, about 2.5e9 for fp32 and 9.7e18 for fp64.  ``-1e30`` is such a
+    start in both, ``-1e9`` in neither.
+    """
+    info = torch.finfo(dtype)
+    underflow = -math.log2(info.tiny) - math.log2(info.eps)
+    return 2 * (underflow + 1) / info.eps
+
+
+def _attention_loop_starts_fused(
+    pattern: AttentionSoftmaxPattern,
+    graphs: Iterable[GraphInfo],
+    kv_graph_id: int,
+) -> bool:
+    """Whether the KV loop ``kv_graph_id`` enters with statistics the fused
+    flash bodies reproduce. The bodies start every row from ``(m, l, acc) =
+    (-inf, 0, 0)`` whatever the kernel wrote, and a KV tile that hides every
+    score from a row leaves the row's statistics as they are. The kernel's
+    own start has to give the same result, which takes a finite constant row
+    sum and accumulator (kernels start ``l`` at 0 or at 1) and a running max
+    that starts at one of two constants:
+
+    - ``-inf``. The first KV step's ``alpha = exp2(-inf - m)`` is zero and
+      wipes the row sum and the accumulator (``l * 0 + sum(p)``, ``acc * 0 +
+      p @ v``).
+    - A finite sentinel, at or below ``-_running_max_sentinel_bound`` (kernels
+      write ``-1e30``), with a zero accumulator and a row sum that is not
+      zero. A tile that hides the row leaves its start as it is (``alpha =
+      exp2(m - m)`` is 1 and ``p = exp2(-inf - m)`` is 0, where a start of
+      ``-inf`` computes ``-inf - -inf``), so a row that sees no key ends at
+      its start and stores ``acc / l = 0``, the output the fused bodies give
+      the rows a per-row KV bound hides. The first score above the sentinel
+      makes ``alpha`` exactly zero, which wipes the start as above, so the
+      kernel equals the fused body on every row that sees a score above the
+      sentinel. What is left is a known gap (``KNOWN_GAPS.md``,
+      cute-flash-sentinel-start-taken-for-minus-inf): a row that sees keys
+      but no score above the sentinel, where the kernel as written keeps
+      part of its start and the fused body computes the softmax, and, on a
+      row that sees no key, the LSE (``m + log2(l)`` of the start as
+      written, ``-inf`` fused) and the output of a body that does not guard
+      an empty row (an additive bias of ``-inf`` over the whole row).
+
+    No other start is reproduced. A finite running max above the bound keeps
+    the row sum and the accumulator (``m = 0`` and ``l = 128`` halve a row of
+    128 zero scores), an infinite or NaN ``l`` or ``acc`` turns the ``* 0``
+    into NaN, and a sentinel over another accumulator or a zero row sum
+    stores that start, ``acc / l``, for a row that sees no key. Each start
+    is read off the inputs of the loop's calls as a constant tile
+    (``match_common.constant_fill``); a start no constant proves (a kernel
+    argument, another loop's result, any other expression) keeps the generic
+    lowering. The loop carries the running max in the dtype of its start,
+    which is the one the bound is taken for. ``graphs`` are the ones the
+    pattern was matched on. Shared by the search surface and the codegen
+    detector so the two never diverge.
+    """
+    from ....language._tracing_ops import is_for_loop_target
+
+    calls = [
+        node
+        for graph_info in graphs
+        for node in graph_info.graph.nodes
+        if node.op == "call_function"
+        and is_for_loop_target(node.target)
+        and len(node.args) >= 4
+        and isinstance(node.args[0], int)
+        and node.args[0] == kv_graph_id
+    ]
+    if not calls:
+        return False
+    carried = pattern.carried
+    for call in calls:
+        inputs = call.args[3]
+        if not isinstance(inputs, (list, tuple)) or len(inputs) <= max(carried):
+            return False
+        m_tile = strip_new_var(inputs[carried.m])
+        m_start = constant_fill(m_tile)
+        l_start = constant_fill(inputs[carried.l])
+        acc_start = constant_fill(inputs[carried.acc])
+        if (
+            m_start is None
+            or l_start is None
+            or acc_start is None
+            or not math.isfinite(l_start)
+            or not math.isfinite(acc_start)
+        ):
+            return False
+        if m_start == -math.inf:
+            continue
+        m_value = node_tensor(m_tile)
+        assert m_value is not None
+        # A finite start: a sentinel whose key-less row, ``acc / l``, is 0.
+        if (
+            m_start > -_running_max_sentinel_bound(m_value.dtype)
+            or acc_start != 0
+            or l_start == 0
+        ):
+            return False
+    return True
 
 
 class _AttentionGeometry(NamedTuple):
@@ -2532,6 +2672,14 @@ def detect_flash_search_surface(device_ir: DeviceIR) -> FlashSearchSurface | Non
                 fallback_targets
             ):
                 generic_fallback_targets = fallback_targets
+            continue
+        # Statistics whose start the fused bodies do not reproduce keep the
+        # generic lowering, and the codegen detector declines the same way.
+        # Read below the TMA-only hand-over: an output that large keeps the
+        # generic search's bounds whatever the start.
+        if not _attention_loop_starts_fused(
+            pattern, device_ir.graphs, graph_info.graph_id
+        ):
             continue
         block_size_targets = _attention_flash_block_size_targets(
             root_grid_ids, block_ids[0], tile=128

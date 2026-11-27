@@ -17,16 +17,21 @@ matchers accept Python numbers and ``aten.scalar_tensor(c)`` only
 (``scalar_value(node)``); the flex matchers also accept a 0-d
 ``aten.full([], c)`` / ``hl.full([], c)`` (``allow_full=True``).  The dense
 family keeps its narrower acceptance: widening it would admit kernels to the
-tcgen05 flash lowering that it was never validated on.
+tcgen05 flash lowering that it was never validated on.  ``constant_fill``
+reads a whole constant tile instead (the value a loop-carried statistic
+starts from).
 """
 
 from __future__ import annotations
 
+import math
 from typing import TYPE_CHECKING
 from typing import NamedTuple
 
 import sympy
 import torch
+
+from ..dtypes import round_scalar
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -130,6 +135,73 @@ def is_neg_inf(node: object, *, allow_full: bool = False) -> bool:
     """``node`` is the literal ``-inf`` (see :func:`scalar_value`)."""
     value = scalar_value(node, allow_full=allow_full)
     return value is not None and value == float("-inf")
+
+
+def constant_fill(node: object) -> float | None:
+    """The constant ``c`` of a floating-point tensor that holds one value
+    throughout, in the forms kernels spell such a tile: ``hl.full(shape, c)``
+    / ``aten.full(shape, c)`` of any shape (``hl.zeros``, ``torch.full_like``
+    and ``torch.zeros_like`` trace to them), and one such fill of zero plus
+    or minus a constant (``hl.zeros(shape) - float("inf")``, ``hl.zeros(shape)
+    + 1.0``: exact, since ``0 + x`` is ``x``), through ``_new_var`` copies.
+    The sum is read one level deep: its operands are fills and numbers, not
+    sums of their own, so a start is read off at most three nodes.
+
+    Every element of the tensor is ``c`` rounded to the tensor's dtype, and
+    that rounded value is the one returned: an infinity stays one, a number
+    at or below half the dtype's smallest subnormal is 0 (``1e-50`` in fp32,
+    ``1e-10`` in fp16), and a finite literal beyond the dtype's range, which
+    rounds to an infinity, is not read. None for anything else: a fill by a
+    runtime scalar, a NaN, any other arithmetic, a loaded tile.
+    """
+    from ....language import creation_ops
+
+    node = strip_new_var(node)
+    value = node_tensor(node)
+    if value is None or not value.dtype.is_floating_point:
+        return None
+    dtype = value.dtype
+    limit = torch.finfo(dtype).max
+
+    def literal(operand: object) -> float | None:
+        """``operand`` as the tensor's dtype holds it."""
+        if not isinstance(operand, (int, float)) or operand != operand:
+            return None
+        if operand in (math.inf, -math.inf):
+            return float(operand)
+        if not -limit <= operand <= limit:
+            return None
+        return round_scalar(operand, dtype)
+
+    def fill(operand: object) -> float | None:
+        """The literal of a number, or of a ``full`` of the tensor's dtype."""
+        if not isinstance(operand, torch.fx.Node):
+            return literal(operand)
+        operand = strip_new_var(operand)
+        operand_value = node_tensor(operand)
+        if (
+            operand_value is None
+            or operand_value.dtype != dtype
+            or not is_call(operand, _aten.full.default, creation_ops.full)
+        ):
+            return None
+        assert isinstance(operand, torch.fx.Node)
+        return literal(operand.args[1]) if len(operand.args) >= 2 else None
+
+    if is_call(node, _aten.full.default, creation_ops.full):
+        return fill(node)
+    operands = binary_pair(node, (_aten.add.Tensor, _aten.sub.Tensor))
+    if operands is None:
+        return None
+    assert isinstance(node, torch.fx.Node)
+    lhs, rhs = (fill(operand) for operand in operands)
+    if lhs is None or rhs is None:
+        return None
+    if rhs == 0:
+        return lhs
+    if lhs == 0:
+        return -rhs if node.target is _aten.sub.Tensor else rhs
+    return None
 
 
 def unit_fixed_block(env: CompileEnvironment, block_id: int) -> bool:
