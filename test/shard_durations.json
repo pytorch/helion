@@ -136,6 +136,7 @@
  "test/test_cute_flash_row_epilogue_warps.py": 56.2,
  "test/test_cute_flash_row_mma.py": 63.4,
  "test/test_cute_flash_structural_pins.py": 0.9,
+ "test/test_cute_flash_tmem_cols.py": 17.7,
  "test/test_cute_flash_ws_flat_grid.py": 56.4,
  "test/test_cute_flat_gather_sink.py": 47.6,
  "test/test_cute_flatten_nested_reductions.py": 9.5,

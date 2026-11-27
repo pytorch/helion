@@ -427,12 +427,23 @@ FLASH_FLEX_DEAD_STAGE_SPLIT_KEY = "cute_flash_flex_dead_stage_split"
 FLASH_FLEX_EARLY_QK_KEY = "cute_flash_flex_early_qk"
 FLASH_FLEX_TAIL_SPLIT_KEY = "cute_flash_flex_tail_split"
 FLASH_KV_SPLIT_KEY = "cute_flash_kv_split"
+# Tensor-memory columns one CTA of the single-warpgroup single-tile body
+# allocates: every column (512) or 256, which hold its one score tile and its
+# output accumulator up to head dim 128. With 256 the body gives up its
+# allocation permit as soon as it has its columns, so a second CTA can take
+# the SM's other half while the first runs; whether two CTAs are resident on
+# an SM together is then up to the SM's other resources (their shared
+# memory in the first place).
+FLASH_TMEM_COLS_KEY = "cute_flash_tmem_cols"
+FLASH_TMEM_COLS_CHOICES: tuple[int, ...] = (512, 256)
 # Conditional children of the structural coverage design: a searched value
 # that renders only under its parents' values.  A design whose overrides pin
 # any parent elsewhere reports the child as uncovered telemetry, not a defect
 # (the shared staged output tile needs the TMA epilogue without the staged
 # vector store, the output over the dead Q stages, the uneven ring, the
-# segment tiling or a split merge: ``_flash_o_stage_legal``).
+# segment tiling or a split merge: ``_flash_o_stage_legal``; the 256-column
+# allocation needs the single-warpgroup tensor-core body, the requirements
+# of its dependency witness: ``_flash_tmem_cols_legal``).
 FLASH_COVERAGE_CHILD_PARENTS: dict[
     tuple[str, object], tuple[tuple[str, object], ...]
 ] = {
@@ -444,6 +455,11 @@ FLASH_COVERAGE_CHILD_PARENTS: dict[
         (FLASH_ROW_BOUND_TILING_KEY, "global"),
         (FLASH_KV_SPLIT_KEY, 1),
         (FLASH_FLEX_TAIL_SPLIT_KEY, 0),
+    ),
+    (FLASH_TMEM_COLS_KEY, 256): (
+        (FLASH_PIPELINE_FAMILY_KEY, "ws_overlap"),
+        (FLASH_S_STAGE_KEY, 1),
+        (FLASH_SMALL_BIASED_KEY, False),
     ),
 }
 FLASH_PERSISTENT_LOOP_KEY = "cute_flash_persistent_loop"
@@ -566,6 +582,7 @@ FLASH_KNOBS: tuple[FlashKnob, ...] = (
     FlashKnob(FLASH_WS_K_STAGE_EXTRA_KEY, "ws_k_stage_extra"),
     FlashKnob(FLASH_FLEX_HOOK_FAST_FULL_KEY, "flex_hook_fast_full"),
     FlashKnob(FLASH_BIAS_STAGE_KEY, "bias_stage"),
+    FlashKnob(FLASH_TMEM_COLS_KEY, "tmem_cols"),
 )
 
 FLASH_AUTOTUNE_CONFIG_KEYS: tuple[str, ...] = tuple(knob.key for knob in FLASH_KNOBS)
@@ -866,6 +883,18 @@ FLASH_KNOB_WITNESSES: tuple[FlashKnobWitness, ...] = (
             FLASH_KV_SPLIT_KEY: 1,
         },
     ),
+    # The 256-column tensor-memory allocation is the single-warpgroup
+    # single-tile body's (one score stage; not the small biased plan's SIMT
+    # body, which allocates none).
+    FlashKnobWitness(
+        FLASH_TMEM_COLS_KEY,
+        (256,),
+        {
+            FLASH_PIPELINE_FAMILY_KEY: "ws_overlap",
+            FLASH_S_STAGE_KEY: 1,
+            FLASH_SMALL_BIASED_KEY: False,
+        },
+    ),
 )
 
 # ``(key, value) -> requirements`` in witness order, one entry per value.
@@ -973,6 +1002,7 @@ FLASH_EFFECTIVE_CONFIG_KEYS: tuple[str, ...] = (
     FLASH_S_RESIDENT_KEY,
     FLASH_SOFTMAX_REGION_KEY,
     FLASH_FLEX_HOOK_FAST_FULL_KEY,
+    FLASH_TMEM_COLS_KEY,
 )
 assert sorted(FLASH_EFFECTIVE_CONFIG_KEYS) == sorted(
     (*FLASH_AUTOTUNE_CONFIG_KEYS, *FLASH_DERIVED_CONFIG_KEYS)

@@ -64,6 +64,7 @@ from ..cute_mma_dag import MMA_DAG_PASS_WARPS_ATTENTION_PAIRED
 from ..cute_mma_dag import MMA_DAG_PASS_WARPS_KEY
 from ..cute_mma_dag import MMA_DAG_TCGEN05
 from ..flash_knobs import FLASH_COVERAGE_CHILD_PARENTS
+from ..flash_knobs import FLASH_SMALL_BIASED_KEY
 from ..packet_store_policy import store_policy_reaches_a_packet
 from ..pdl_release import CUTE_PDL_CAPTURE_RELEASE_CHOICES
 from ..pdl_release import CUTE_PDL_RELEASE_DEFAULT
@@ -1582,10 +1583,18 @@ class CuteConfigGenerationExtension(ConfigGenerationExtension):
         """Whether ``goal`` is a conditional child whose parent value the
         overrides pin away (``FLASH_COVERAGE_CHILD_PARENTS``): unreachable by
         the design's construction, so uncovered telemetry rather than a
-        defect (like a family the overrides make unreachable)."""
+        defect (like a family the overrides make unreachable). A pin of
+        ``cute_flash_small_biased`` selects a body only on a small biased
+        plan's surface: elsewhere the resolver ignores it, and it excuses
+        nothing."""
+        overrides = self.generation._override_values
         return any(
-            key in self.generation._override_values
-            and self.generation._override_values[key] != value
+            key in overrides
+            and overrides[key] != value
+            and (
+                key != FLASH_SMALL_BIASED_KEY
+                or self.generation.config_spec._cute_flash_small_biased_candidate
+            )
             for key, value in FLASH_COVERAGE_CHILD_PARENTS.get(goal, ())
         )
 

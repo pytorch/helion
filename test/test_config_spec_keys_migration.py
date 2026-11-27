@@ -89,7 +89,8 @@ _BASE_VALID_KEYS = """
     cute_flash_skip_rescale_stats cute_flash_small_biased cute_flash_softmax_disc
     cute_flash_softmax_lowering cute_flash_softmax_region cute_flash_softmax_regs
     cute_flash_softmax_setup cute_flash_sp_row_sum cute_flash_split_p_arrive
-    cute_flash_stat_transport cute_flash_tensor_4d_tma cute_flash_topology
+    cute_flash_stat_transport cute_flash_tensor_4d_tma cute_flash_tmem_cols
+    cute_flash_topology
     cute_flash_uneven_kv_ring cute_flash_use_2cta cute_flash_wait_hint
     cute_flash_ws_k_stage_extra cute_flash_ws_loader_warp cute_flash_ws_mask_phases
     cute_flash_ws_one_pass cute_fmnmx_extrema cute_fp32_dot
@@ -268,7 +269,8 @@ _BASE_BACKEND_SPECIFIC_KEYS = """
     cute_flash_skip_rescale_stats cute_flash_small_biased cute_flash_softmax_disc
     cute_flash_softmax_lowering cute_flash_softmax_region cute_flash_softmax_regs
     cute_flash_softmax_setup cute_flash_sp_row_sum cute_flash_split_p_arrive
-    cute_flash_stat_transport cute_flash_tensor_4d_tma cute_flash_topology
+    cute_flash_stat_transport cute_flash_tensor_4d_tma cute_flash_tmem_cols
+    cute_flash_topology
     cute_flash_uneven_kv_ring cute_flash_use_2cta cute_flash_wait_hint
     cute_flash_ws_k_stage_extra cute_flash_ws_loader_warp cute_flash_ws_mask_phases
     cute_flash_ws_one_pass cute_fmnmx_extrema cute_fp32_dot
@@ -507,7 +509,8 @@ _BASE_CUTE_ACCEPTED = """
     cute_flash_skip_rescale_stats cute_flash_small_biased cute_flash_softmax_disc
     cute_flash_softmax_lowering cute_flash_softmax_region cute_flash_softmax_regs
     cute_flash_softmax_setup cute_flash_sp_row_sum cute_flash_split_p_arrive
-    cute_flash_stat_transport cute_flash_tensor_4d_tma cute_flash_topology
+    cute_flash_stat_transport cute_flash_tensor_4d_tma cute_flash_tmem_cols
+    cute_flash_topology
     cute_flash_uneven_kv_ring cute_flash_use_2cta cute_flash_wait_hint
     cute_flash_ws_k_stage_extra cute_flash_ws_loader_warp cute_flash_ws_mask_phases
     cute_flash_ws_one_pass cute_fmnmx_extrema cute_fp32_dot

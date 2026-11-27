@@ -399,14 +399,22 @@ def test_fp8_example_matches_reference_on_gpu(
     ("seq", "head_dim", "overrides"),
     [
         (128, 64, {}),
+        (128, 64, {cute_flash.FLASH_TMEM_COLS_KEY: 256}),
         (384, 64, {}),
         (384, 64, {cute_flash.FLASH_S_STAGE_KEY: 1}),
+        (
+            384,
+            64,
+            {cute_flash.FLASH_S_STAGE_KEY: 1, cute_flash.FLASH_TMEM_COLS_KEY: 256},
+        ),
         (256, 192, {}),
     ],
     ids=[
         "one_tile",
+        "one_tile_shared_sm",
         "three_tiles_two_warpgroups",
         "three_tiles_one_warpgroup",
+        "three_tiles_shared_sm",
         "d192_two_tiles",
     ],
 )
@@ -414,9 +422,11 @@ def test_fp8_example_single_tile_family_matches_reference_on_gpu(
     seq: int, head_dim: int, overrides: dict[str, object]
 ) -> None:
     """The single-tile family: an odd KV tile count (the suite's
-    (4, 48, 128, 64) input and three tiles) on the one-warpgroup body (one
-    tile, and three tiles behind its K/V ring) and the two-warpgroup body,
-    and a width above the pair's (head dim 192) at an even count."""
+    (4, 48, 128, 64) input and three tiles) on the one-warpgroup body with
+    all the tensor-memory columns and with two CTAs sharing an SM (192 CTAs
+    or more on 148 SMs, so a CTA whose columns start at 256 reads its own
+    fp8 P tile) and on the two-warpgroup body, and a width above the pair's
+    (head dim 192) at an even count."""
     _require_sm100()
     (q, k, v), args = _example_args(4, 48, seq, head_dim, device=DEVICE)
     fn, code = _compile_default(_example_kernel(), args, overrides)
@@ -424,6 +434,8 @@ def test_fp8_example_single_tile_family_matches_reference_on_gpu(
     assert "flash_shared_storage(" in code
     s_stage = overrides.get(cute_flash.FLASH_S_STAGE_KEY, 1 if seq == 128 else 2)
     assert f"'s_stage': {s_stage}" in code
+    columns = overrides.get(cute_flash.FLASH_TMEM_COLS_KEY, 512)
+    assert f"flash_tmem.allocate({columns})" in code
     out = fn(*args)
     reference = _example_module().fp8_attention_pytorch(q, k, v)()
     torch.testing.assert_close(out.float(), reference.float(), atol=0.1, rtol=0.1)

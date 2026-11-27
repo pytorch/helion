@@ -116,6 +116,7 @@ _AXIS_KEYS: tuple[str, ...] = (
     "cute_flash_ws_k_stage_extra",
     "cute_flash_flex_hook_fast_full",
     "cute_flash_bias_stage",
+    "cute_flash_tmem_cols",
 )
 
 _VALUE_DEPENDENCIES: tuple[tuple[str, object, dict[str, object]], ...] = (
@@ -332,6 +333,15 @@ _VALUE_DEPENDENCIES: tuple[tuple[str, object, dict[str, object]], ...] = (
             "cute_flash_kv_split": 1,
         },
     ),
+    (
+        "cute_flash_tmem_cols",
+        256,
+        {
+            "cute_flash_pipeline_family": "ws_overlap",
+            "cute_flash_s_stage": 1,
+            "cute_flash_small_biased": False,
+        },
+    ),
 )
 
 _LEGACY_STRUCTURAL_KEYS: tuple[str, ...] = (
@@ -438,6 +448,7 @@ _EFFECTIVE_FIELDS: tuple[tuple[str, str], ...] = (
     ("cute_flash_s_resident", "s_resident"),
     ("cute_flash_softmax_region", "softmax_region"),
     ("cute_flash_flex_hook_fast_full", "flex_hook_fast_full"),
+    ("cute_flash_tmem_cols", "tmem_cols"),
 )
 
 _BWD_KEYS: tuple[str, ...] = (

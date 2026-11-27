@@ -1559,9 +1559,13 @@ def test_singleton_kv_stage_is_canonicalized_before_search(
 @pytest.mark.parametrize(
     ("num_kv", "expected_by_shape"),
     (
+        # The one-warpgroup body measures both of its tensor-memory
+        # allocations (``cute_flash_tmem_cols``: all 512 columns, or 256 and
+        # an early release of the allocation permit so a second CTA shares
+        # the SM) beside the packed reduction: 2 -> 4 rows.
         pytest.param(
             1,
-            {(64, False): 2, (64, True): 2, (128, False): 2, (128, True): 2},
+            {(64, False): 4, (64, True): 4, (128, False): 4, (128, True): 4},
             id="singleton",
         ),
         # The two-warpgroup ws_overlap body also chooses its O epilogue
@@ -1569,10 +1573,11 @@ def test_singleton_kv_stage_is_canonicalized_before_search(
         # rows also measure the load warp, the extra K ring slot and, on the
         # causal plan, the mask phases (the single-stage rows keep all three
         # at rest): dense 6 + 24 -> 6 + 96, causal 6 + 12 -> 6 + 96 at 64;
-        # 2 + 8 -> 2 + 32 and 2 + 4 -> 2 + 32 at 128.
+        # 2 + 8 -> 2 + 32 and 2 + 4 -> 2 + 32 at 128. The single-stage rows
+        # double with the tensor-memory allocation: 12 + 96 and 4 + 32.
         pytest.param(
             3,
-            {(64, False): 102, (64, True): 102, (128, False): 34, (128, True): 34},
+            {(64, False): 108, (64, True): 108, (128, False): 36, (128, True): 36},
             id="odd",
         ),
     ),
@@ -1593,11 +1598,12 @@ def test_small_flash_search_spaces_are_exhaustive(
     generation = spec.create_config_generation()
     # The bound is on each family's raw product before normalization, not on
     # the distinct rows: the three-tile d64 ws_overlap family multiplies the
-    # kv_stage triple by six binary knobs (192 raw rows for 102 distinct) once
-    # the single-tile body searches its issue-stream knobs; d128 is 64 raw
-    # rows for 34. Every structural row has each compiler pipeline choice;
-    # scale the next-power-of-two raw bound by that independent coordinate.
-    raw_bound = 256 * len(CUTE_COMPILER_PIPELINE_CHOICES)
+    # kv_stage triple by seven binary knobs (384 raw rows for 108 distinct)
+    # once the single-tile bodies search their issue-stream knobs and the
+    # tensor-memory allocation; d128 is 128 raw rows for 36. Every structural
+    # row has each compiler pipeline choice; scale the next-power-of-two raw
+    # bound by that independent coordinate.
+    raw_bound = 512 * len(CUTE_COMPILER_PIPELINE_CHOICES)
     exact = generation.extension.exact_effective_search_space_configs(raw_bound)
     assert exact is not None
     expected_structural_count = expected_by_shape[(head_dim, is_causal)]
@@ -2206,11 +2212,22 @@ def test_ws_search_has_bounded_effective_active_value_coverage(
     # (``cute_flash_o_stage``, live only on the one-CTA fa4 pair's TMA
     # epilogue) one more (89), the tensor bias's staging singleton
     # (``cute_flash_bias_stage``, live only on dense fa4 plans with one
-    # tensor bias) one more (90). Keep the upstream bound on all other
-    # values and round-trip every value below.
-    assert len(active_values) - len(resident_defaults) <= 90
+    # tensor bias) one more (90), the one-warpgroup body's tensor-memory
+    # allocation (``cute_flash_tmem_cols``) its two measured values (92).
+    # Keep the upstream bound on all other values and round-trip every value
+    # below.
+    assert len(active_values) - len(resident_defaults) <= 92
     for key, value in active_values:
-        requested = {**base, key: value}
+        # A searched value that is legal only together with other values (the
+        # 256-column tensor memory needs the single score stage) is requested
+        # in its witness context, as the structural design requests it; a
+        # pinned value and every other value are requested beside the defaults.
+        witness = (
+            flash_knobs.FLASH_AUTOTUNE_VALUE_DEPENDENCIES.get((key, value), {})
+            if len(_active_choices(enum_fragments[key])) > 1
+            else {}
+        )
+        requested = {**base, **witness, key: value}
         resolved = cute_flash.resolve_flash_config(
             head_dim,
             48,
@@ -2271,8 +2288,9 @@ def test_ws_structural_generation_is_bounded_and_complete(
 
     assert configs
     # Three rows cover the ring depths; the extra K ring slot's dependency
-    # witness (the two-stage body with the slot) is one more.
-    assert len(configs) <= 4
+    # witness (the two-stage body with the slot) is one more, and so is the
+    # 256-column tensor memory's (the one-warpgroup body with it).
+    assert len(configs) <= 5
     assert generation.extension.flash_structural_coverage_uncovered_values() == []
     assert {
         config.config[cute_flash.FLASH_KV_STAGE_KEY] for config in configs
