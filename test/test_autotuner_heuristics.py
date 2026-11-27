@@ -8731,6 +8731,9 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
                         sum(
                             candidate.config.get(FLASH_EXP2_PACKET_KEY) == "deg2_16x6"
                             and candidate.config.get(FLASH_KV_STAGE_KEY) == 2
+                            # (one item per CTA: the persistent pair's seed
+                            # repeats the body under its loop form)
+                            and not candidate.config.get(FLASH_PERSISTENT_KEY)
                             for candidate in ranked
                         ),
                         1,
@@ -9298,12 +9301,23 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
                     standard_causal_output=True,
                     fast_math=True,
                 )
+                # The one-item body; the persistent pair's seed repeats it
+                # under its loop form.
                 resident = [
                     seed
                     for seed in seeds
                     if seed.config.get(FLASH_EXP2_PACKET_KEY) == packet
+                    and not seed.config.get(FLASH_PERSISTENT_KEY)
                 ]
                 self.assertEqual(len(resident), 1)
+                self.assertEqual(
+                    sum(
+                        seed.config.get(FLASH_EXP2_PACKET_KEY) == packet
+                        and seed.config.get(FLASH_PERSISTENT_KEY) is True
+                        for seed in seeds
+                    ),
+                    1,
+                )
                 fragments = flash_autotune_fragments(
                     128,
                     num_kv,
@@ -10004,10 +10018,13 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
                 standard_causal_output=True,
                 fast_math=True,
             )
+            # (One item per CTA: the persistent pair's seeds repeat both
+            # bodies under its loop form.)
             hybrid = [
                 seed
                 for seed in seeds
                 if seed.config[FLASH_EXP2_PACKET_KEY] == "hybrid_deg1_16x8"
+                and not seed.config.get(FLASH_PERSISTENT_KEY)
             ]
             # The packet-loop seed and the measured s4096 body (8-column
             # rescale chunks at threshold 8, TMA epilogue, K-then-V-then-Q
@@ -10374,10 +10391,13 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
                     standard_causal_output=True,
                     fast_math=True,
                 )
+                # (One item per CTA: the persistent pair's seed repeats the
+                # body under its loop form.)
                 degree2 = [
                     seed
                     for seed in seeds
                     if seed.config[FLASH_EXP2_PACKET_KEY] == "deg2_16x6"
+                    and not seed.config.get(FLASH_PERSISTENT_KEY)
                 ]
                 self.assertEqual(len(degree2), 1)
                 config = degree2[0].config
@@ -10532,6 +10552,7 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
                     config
                     for _flat, config in seed_pairs
                     if config.config[FLASH_EXP2_PACKET_KEY] == "deg2_16x6"
+                    and not config.config.get(FLASH_PERSISTENT_KEY)
                 ]
                 self.assertEqual(len(degree2), 1)
                 expected = degree2[0]

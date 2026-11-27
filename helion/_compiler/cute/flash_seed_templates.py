@@ -218,6 +218,34 @@ SEED_CAUSAL_STAGGER_STRUCTURE: Mapping[str, object] = {
     FLASH_CAUSAL_STAGGER_KEY: True,
     FLASH_CAUSAL_HEAD_PAIR_KEY: False,
 }
+# The persistent causal pair (a CTA walks several work items of the
+# longest-first order, paying its setup once): the schedules written for one
+# item per CTA are off (the resolver clears them under it), with each loop
+# form at the launch group that keeps the CTAs level. The CLC scheduler hands
+# out the items as CTAs finish, so it is level at FA4's L2-sized group and
+# keeps a head's K/V in L2. The static strided loop is level only where a
+# round of the grid spans whole launch groups: the whole grid as one group
+# (the builder names the batch-head count), which gives up the L2 locality.
+# Cold means on a B200, causal (2, 32, 4096, 64) fp16 on the hybrid packet's
+# body: one item per CTA 236.3 us, the CLC form 231.3, the static form 229.5
+# (at the L2-sized group 240.3), cuDNN 231.4.
+SEED_CAUSAL_PERSISTENT_STRUCTURE: Mapping[str, object] = {
+    FLASH_PIPELINE_FAMILY_KEY: "fa4",
+    FLASH_PERSISTENT_KEY: True,
+    FLASH_CAUSAL_STAGGER_KEY: False,
+    FLASH_CAUSAL_HEAD_PAIR_KEY: False,
+    FLASH_EARLY_PROLOGUE_LOADS_KEY: False,
+    FLASH_O_OVER_Q_KEY: False,
+}
+SEED_CAUSAL_PERSISTENT_CLC: Mapping[str, object] = {
+    FLASH_PERSISTENT_LOOP_KEY: "clc",
+    FLASH_CAUSAL_LPT_SWIZZLE_KEY: 0,
+    FLASH_CAUSAL_LPT_L2_SHIFT_KEY: 0,
+}
+SEED_CAUSAL_PERSISTENT_STATIC: Mapping[str, object] = {
+    FLASH_PERSISTENT_LOOP_KEY: "while",
+    FLASH_CAUSAL_LPT_L2_SHIFT_KEY: 0,
+}
 # The head pair (two consecutive query heads of one K/V head at one tile)
 # needs the descending split walk and the TMA output store.
 SEED_CAUSAL_HEAD_PAIR_STRUCTURE: Mapping[str, object] = {
@@ -731,6 +759,9 @@ FLASH_SEED_TEMPLATES: dict[str, Mapping[str, object]] = {
     },
     "causal_stagger_structure": SEED_CAUSAL_STAGGER_STRUCTURE,
     "causal_head_pair_structure": SEED_CAUSAL_HEAD_PAIR_STRUCTURE,
+    "causal_persistent_structure": SEED_CAUSAL_PERSISTENT_STRUCTURE,
+    "causal_persistent_clc": SEED_CAUSAL_PERSISTENT_CLC,
+    "causal_persistent_static": SEED_CAUSAL_PERSISTENT_STATIC,
     "dense_hd64_local_tma": SEED_DENSE_HD64_LOCAL_TMA,
     "causal_hd64_fa4_pins": SEED_CAUSAL_HD64_FA4_PINS,
     "causal_hd64_s2048": SEED_CAUSAL_HD64_BODIES[0],

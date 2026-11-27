@@ -273,6 +273,9 @@ from .flash_seed_templates import SEED_CAUSAL_HD64_BODIES
 from .flash_seed_templates import SEED_CAUSAL_HD64_FA4_PINS
 from .flash_seed_templates import SEED_CAUSAL_HD64_HYBRID_BODY
 from .flash_seed_templates import SEED_CAUSAL_HEAD_PAIR_STRUCTURE
+from .flash_seed_templates import SEED_CAUSAL_PERSISTENT_CLC
+from .flash_seed_templates import SEED_CAUSAL_PERSISTENT_STATIC
+from .flash_seed_templates import SEED_CAUSAL_PERSISTENT_STRUCTURE
 from .flash_seed_templates import SEED_CAUSAL_STAGGER_STRUCTURE
 from .flash_seed_templates import SEED_DENSE_HD64_LOCAL_TMA
 from .flash_seed_templates import SEED_DENSE_HD64_LOCAL_TMA_PACKETS
@@ -4303,6 +4306,7 @@ def _flash_early_prologue_loads_legal(
     alternating_warpgroups: bool,
     first_load_order: int,
     has_list_walk: bool = False,
+    persistent_causal: bool = False,
 ) -> bool:
     """Whether the pre-sync prologue loads apply: the plain one-CTA fa4 pair
     body with one aliased K/V ring, whose two Q tiles and first K/V tile are
@@ -4314,13 +4318,15 @@ def _flash_early_prologue_loads_legal(
 
     The static persistent loop qualifies, with or without its per-CTA TMA
     partitions (``local_tma_partition``): a CTA's first work item is its
-    block index, which warp 0 decodes before the sync. The other schedulers
-    stay out. A CLC CTA's first item is known before any response (the
-    scheduler's ``initial_work_tile_info`` rasterizes the block index), but
-    in the CLC grid's own order (the pairs reversed and, on the factored
-    grid, the batch heads split over y and z), which warp 0's block-index
-    decode does not follow. In a cluster, copies that signal a peer CTA's
-    barriers would have to wait for the cluster's init sync
+    block index, which warp 0 decodes before the sync (in the dense pair
+    order; the persistent causal loop's longest-first decode is its roles'
+    alone, ``persistent_causal``). The other schedulers stay out. A CLC
+    CTA's first item is known before any response (the scheduler's
+    ``initial_work_tile_info`` rasterizes the block index), but in the CLC
+    grid's own order (the pairs reversed and, on the factored grid, the
+    batch heads split over y and z), which warp 0's block-index decode does
+    not follow. In a cluster, copies that signal a peer CTA's barriers
+    would have to wait for the cluster's init sync
     (``pipeline_init_arrive`` / ``pipeline_init_wait``, which follow each
     CTA's own barrier initialization), so a cluster's CTA cannot issue them
     ahead of its setup synchronization."""
@@ -4328,6 +4334,7 @@ def _flash_early_prologue_loads_legal(
         topology == "fa4"
         and not has_kv_tile_pruning
         and not has_list_walk
+        and not persistent_causal
         and q_tile_count == 2
         and not use_2cta_instrs
         and not use_cga2_local_cta
@@ -4745,8 +4752,46 @@ def _flash_kv_split_seed(
 _FLASH_CAUSAL_STAGGER_SEED_KV_STAGE: dict[int, int] = {128: 5, 64: 4}
 
 
+def _flash_causal_persistent_legal(
+    *,
+    is_causal: bool,
+    has_kv_tile_pruning: bool,
+    has_list_walk: bool,
+    score_modifier_kinds: Sequence[str],
+    plain_fa4_family: bool,
+    softmax_lowering: str,
+    asymmetric_head_dims: bool,
+) -> bool:
+    """Where a causal plan may run the persistent work-item loop
+    (``cute_flash_persistent`` on a causal surface).
+
+    The plain causal mask on the plain fa4 pair: its roles decode each work
+    item's place in the longest-first order and its KV tile count at the top
+    of the item, as the list walk's roles re-read their tables. The pruned
+    masks and the other score modifiers bind per-item values the roles do
+    not re-derive (the plan holds the causal mask alone, once: a kernel that
+    masks twice keeps one item per CTA), the other fa4 families have
+    schedulers of their own, and the stateful whole-row lowering is verified
+    for one work item per CTA (the value graph is a dense lowering: the
+    resolver rejects it on a causal plan before this is asked). The
+    asymmetric pair (K and V of different widths, its own ring forms) has
+    been run with one item per CTA only.
+    """
+    return (
+        is_causal
+        and not has_kv_tile_pruning
+        and not has_list_walk
+        # The causal mask once (the device body asserts it), or no kinds at
+        # all: a surface built from the plan facts alone (``is_causal``).
+        and tuple(score_modifier_kinds) in ((), (CAUSAL_MASK_KIND,))
+        and plain_fa4_family
+        and softmax_lowering != "resident_stateful"
+        and not asymmetric_head_dims
+    )
+
+
 def _flash_causal_stagger_legal(
-    body: CausalBodyFacts, *, kv_stage: int, uneven_kv_ring: bool
+    body: CausalBodyFacts, *, kv_stage: int, uneven_kv_ring: bool, persistent: bool
 ) -> bool:
     """Where ``cute_flash_causal_stagger`` can offset the two query stages.
 
@@ -4760,12 +4805,16 @@ def _flash_causal_stagger_legal(
     leaves no look-ahead for the next tile's loads below four, and four
     measured level with five, so the knob is pinned off on shallower rings
     (``kv_stage`` is the resolved, budget-clamped depth). FA4's uneven
-    three-slot ring is excluded the same way.
+    three-slot ring is excluded the same way. The walk runs one work item
+    per CTA (its correction warps step one shared consume index a tile less
+    than stage 1's producer per item, which a second item would not line up
+    with), so the persistent loop keeps the plain walk.
     """
     return (
         body.descending_pair_body
         and not uneven_kv_ring
         and kv_stage >= FLASH_CAUSAL_STAGGER_MIN_KV_STAGE
+        and not persistent
     )
 
 
@@ -5264,12 +5313,50 @@ def flash_config_from_facts(
     # over the longest-first item order (searched; on by default: every
     # list-walk winner of the 2026-10-12 attention-gym campaign, 54 of 54,
     # was persistent, and the pinned seeds without it trailed by 37-46% on
-    # flamingo and 10-13% on sta2d).
+    # flamingo and 10-13% on sta2d). The plain causal pair can run the
+    # strided loop as well when a config asks for it (the roles decode the
+    # item's place in the longest-first order and its KV count per item):
+    # off unless requested, so a config without the key keeps one work item
+    # per CTA.
+    causal_persistent_legal = (
+        topology == "fa4"
+        and bool(persistent_cfg)
+        and _flash_causal_persistent_legal(
+            is_causal=is_causal,
+            has_kv_tile_pruning=has_kv_tile_pruning,
+            has_list_walk=has_list_walk,
+            score_modifier_kinds=score_modifier_kinds,
+            plain_fa4_family=True,
+            softmax_lowering=softmax_lowering,
+            asymmetric_head_dims=asymmetric_head_dims,
+        )
+        # The plain family, asked for last (a second resolution): the one
+        # this config resolves to with one work item per CTA. That is the
+        # family the config or the environment names, or its legacy
+        # structural keys ask for, after the gates below, which clear every
+        # variant a causal plan does not take (the clusters, the dense CLC
+        # family, the per-CTA TMA partitions, the 4-D TMA maps) with or
+        # without persistence. Normalization writes that same family into a
+        # config that names none (``upgrade_legacy_flash_config``, the
+        # fragment default), so a config resolves here to what its
+        # normalized form resolves to.
+        and flash_config_from_facts(
+            facts,
+            {**({} if config is None else config), FLASH_PERSISTENT_KEY: False},
+            prefer_packed_reduce=prefer_packed_reduce,
+            row_mma_aligned=row_mma_aligned,
+            row_mma_aux_dtypes=row_mma_aux_dtypes,
+            target_device_capability=target_device_capability,
+        ).pipeline_family
+        == "fa4"
+    )
     interval_setup = is_causal or has_kv_tile_pruning
     if topology == "fa4":
         if persistent_cfg is not None:
             persistent = (
-                bool(persistent_cfg) and not interval_setup and not flex_trivial_walk
+                bool(persistent_cfg)
+                and (not interval_setup or causal_persistent_legal)
+                and not flex_trivial_walk
             )
         else:
             persistent = (
@@ -6041,6 +6128,26 @@ def flash_config_from_facts(
         or separate_kv_rings
     ):
         use_clc_scheduler = False
+    # The persistent causal pair names its scheduler by the loop form
+    # (``cute_flash_persistent_loop``): the static strided loop, or the CLC
+    # scheduler (``clc``), whose launch grid is the whole problem and whose
+    # CTAs take the next item that has not started when they finish one. It
+    # is the plain fa4 family's body either way (its packets and causal knobs
+    # are keyed on that family), so the family name stays ``fa4``.
+    persistent_loop_request = _cfg(FLASH_PERSISTENT_LOOP_KEY)
+    if persistent_loop_request is None:
+        persistent_loop_request = _flash_env_get(
+            "HELION_CUTE_FLASH_PERSISTENT_LOOP", "while"
+        )
+    causal_clc = (
+        topology == "fa4"
+        and is_causal
+        and persistent
+        and causal_persistent_legal
+        and persistent_loop_request == "clc"
+    )
+    if causal_clc:
+        use_clc_scheduler = True
     if use_clc_scheduler and rescale_chunk_cols == 64:
         # The 64-column chunk expands the CLC softmax body beyond what NVVM can
         # compile on Blackwell. Preserve legacy configs via the safe D64 form.
@@ -6055,6 +6162,9 @@ def flash_config_from_facts(
     if (
         clc_heads_per_batch < 0
         or not use_clc_scheduler
+        # (The causal pair decodes the stolen CTA's linear index, which no
+        # factoring of the grid changes: one identity per render.)
+        or is_causal
         or (
             num_bh is not None
             and clc_heads_per_batch > 0
@@ -6078,7 +6188,7 @@ def flash_config_from_facts(
         clc_stages = int(clc_stages_cfg)  # type: ignore[arg-type]
     if not use_clc_scheduler:
         clc_stages = 1
-    elif clc_stages not in (2, 3):
+    elif causal_clc or clc_stages not in (2, 3):
         # A one-stage CLC response pipeline can deadlock when several kernels
         # contend for the GPU. Two stages is performance-neutral and keeps the
         # producer from reusing the only response slot while roles retire it.
@@ -6109,6 +6219,9 @@ def flash_config_from_facts(
         local_tma_partition
         and topology == "fa4"
         and persistent
+        # (The persistent causal pair's roles decode each item's views
+        # themselves; it is the plain family's body.)
+        and not is_causal
         and not use_2cta_instrs
         and not use_cga2_local_cta
         and not separate_kv_rings
@@ -6274,7 +6387,10 @@ def flash_config_from_facts(
             and split_p_arrive
             and causal_kv_order == "descending"
             and causal_loop_split
-            and not use_clc_scheduler
+            # (The persistent causal pair's CLC loop form only replaces the
+            # item loop around the roles; the schedule inside a KV step is
+            # the one-item body's.)
+            and (not use_clc_scheduler or causal_clc)
             and not local_tma_partition
             and not tensor_4d_tma
             and exp2_packet in _FLASH_CAUSAL_HD128_RESIDENT_EXP2_PACKETS
@@ -6896,7 +7012,7 @@ def flash_config_from_facts(
         causal_two_cta=causal_two_cta,
         use_2cta_instrs=use_2cta_instrs,
         use_cga2_local_cta=use_cga2_local_cta,
-        use_clc_scheduler=use_clc_scheduler,
+        use_clc_scheduler=use_clc_scheduler and not causal_clc,
         local_tma_partition=local_tma_partition,
         tensor_4d_tma=tensor_4d_tma,
     )
@@ -6917,11 +7033,10 @@ def flash_config_from_facts(
     ):
         role_chain = False
 
-    persistent_loop = _flash_env_get("HELION_CUTE_FLASH_PERSISTENT_LOOP", "while")
-    persistent_loop_cfg = _cfg(FLASH_PERSISTENT_LOOP_KEY)
-    if persistent_loop_cfg is not None:
-        persistent_loop = str(persistent_loop_cfg)
-    if persistent_loop not in ("while", "counted") or not (
+    persistent_loop = str(persistent_loop_request)
+    if causal_clc:
+        persistent_loop = "clc"
+    elif persistent_loop not in ("while", "counted") or not (
         topology == "fa4" and persistent and not use_clc_scheduler
     ):
         persistent_loop = "while"
@@ -7275,7 +7390,10 @@ def flash_config_from_facts(
     # enough to hold each K/V slot across the two stages' steps; it has no
     # dead tile, so the skip is pinned off under it (one identity per render).
     causal_stagger_legal = _flash_causal_stagger_legal(
-        causal_body, kv_stage=kv_stage, uneven_kv_ring=uneven_kv_ring
+        causal_body,
+        kv_stage=kv_stage,
+        uneven_kv_ring=uneven_kv_ring,
+        persistent=persistent,
     )
     causal_stagger = _flash_causal_stagger_default(causal_stagger_legal)
     causal_stagger_cfg = _cfg(FLASH_CAUSAL_STAGGER_KEY)
@@ -7322,6 +7440,7 @@ def flash_config_from_facts(
         alternating_warpgroups=alternating_warpgroups,
         first_load_order=first_load_order,
         has_list_walk=has_list_walk,
+        persistent_causal=persistent and is_causal,
     ):
         early_prologue_loads = False
     # One softmax warpgroup region for both query stages
@@ -9703,6 +9822,10 @@ def flash_seeds_from_facts(
             )
             if packet not in packets
         )
+    # The causal bodies measured on a compound packet's structure (the packet
+    # seeds below, hd64's bodies further down): the parents of the persistent
+    # pair's seeds.
+    causal_measured_bodies: list[dict[str, object]] = []
     for packet in (*packets, *withheld_packets):
         if packet == base_values[FLASH_EXP2_PACKET_KEY]:
             continue
@@ -9765,6 +9888,10 @@ def flash_seeds_from_facts(
                 )
             )
         seeds.append(_flash_config_with_values(block_sizes, values))
+        if is_causal and packet in _FLASH_MANUAL_EXP2_PACKET_PARAMS:
+            # (A withheld packet's body keeps its structure on the exact
+            # substitute, so it is a parent with and without fast_math.)
+            causal_measured_bodies.append(values)
 
     # The dense hd64 shapes are won by the ``fa4_local_tma`` family with a
     # wide packet (``SEED_DENSE_HD64_LOCAL_TMA``): seeded with each measured
@@ -9822,6 +9949,7 @@ def flash_seeds_from_facts(
             pair_seed = _flash_config_with_values(block_sizes, pair_values)
             if pair_seed not in seeds:
                 seeds.append(pair_seed)
+            causal_measured_bodies.append(pair_values)
         # The s4096 body (``SEED_CAUSAL_HD64_HYBRID_BODY``) on the hybrid
         # packet's structure. The packet is fast_math-only; without the
         # setting the same body is seeded on the surface's exact default
@@ -9879,6 +10007,42 @@ def flash_seeds_from_facts(
                 hybrid_seed = _flash_config_with_values(block_sizes, hybrid_values)
                 if hybrid_seed not in seeds:
                     seeds.append(hybrid_seed)
+                causal_measured_bodies.append(hybrid_values)
+
+    persistent_fragment = fragments[FLASH_PERSISTENT_KEY]
+    persistent_loop_fragment = fragments[FLASH_PERSISTENT_LOOP_KEY]
+    assert isinstance(persistent_fragment, EnumFragment)
+    assert isinstance(persistent_loop_fragment, EnumFragment)
+    if (
+        is_causal
+        and "fa4" in families
+        and True in (persistent_fragment.search_choices or ())
+        and "clc" in (persistent_loop_fragment.search_choices or ())
+    ):
+        # The persistent causal pair under both loop forms
+        # (``SEED_CAUSAL_PERSISTENT_STRUCTURE``), on the fragment defaults
+        # and on the shape's measured one-head bodies (the compound packets'
+        # seeds, hd64's bodies above; the staggered target seeds have no
+        # persistent form): the best body of one item per CTA is a two-knob
+        # step away from either loop form, and the static form at the
+        # default launch group is slower than one item per CTA.
+        persistent_schedulers: list[Mapping[str, object]] = [SEED_CAUSAL_PERSISTENT_CLC]
+        if num_bh is not None:
+            persistent_schedulers.append(
+                {**SEED_CAUSAL_PERSISTENT_STATIC, FLASH_CAUSAL_LPT_SWIZZLE_KEY: num_bh}
+            )
+        for parent in (base_values, *causal_measured_bodies):
+            for scheduler in persistent_schedulers:
+                values = dict(parent)
+                if not _flash_seed_set_all(
+                    values,
+                    fragments,
+                    {**SEED_CAUSAL_PERSISTENT_STRUCTURE, **scheduler},
+                ):
+                    continue
+                seed = _flash_config_with_values(block_sizes, values)
+                if seed not in seeds:
+                    seeds.append(seed)
 
     # The two-tile fa4 body of the dense hd128 shapes
     # (``SEED_DENSE_HD128_TWO_TILE``) with the softmax lowering the surface
@@ -11145,6 +11309,21 @@ def flash_fragments_from_facts(
     fixed_family_requires_persistence = valid_family_flags is not None and (
         valid_family_flags.use_clc_scheduler or valid_family_flags.local_tma_partition
     )
+    # The plain causal fa4 pair honors the persistent loop (the static
+    # strided form and the CLC scheduler); the other causal families
+    # normalize it away.
+    causal_persistent_searchable = (
+        "fa4" in active_families
+        and _flash_causal_persistent_legal(
+            is_causal=is_causal,
+            has_kv_tile_pruning=has_kv_tile_pruning,
+            has_list_walk=has_list_walk,
+            score_modifier_kinds=score_modifier_kinds,
+            plain_fa4_family=True,
+            softmax_lowering="standard",
+            asymmetric_head_dims=asymmetric_head_dims,
+        )
+    )
     if (
         valid_family_flags is not None
         and valid_family_flags.use_clc_scheduler
@@ -11172,10 +11351,15 @@ def flash_fragments_from_facts(
         persistent_ctas = enum(defaults.persistent_ctas_per_sm, (1,), (1,))
         recompute = enum(defaults.recompute_tile_coords, (False,), (False,))
     elif variable_trip_count or num_kv < 2:
+        # The cooperative single-tile pair and the plain causal fa4 pair
+        # honor the persistent loop on these surfaces; every other family
+        # normalizes it away.
         persistent = enum(
             defaults.persistent,
             (False, True),
-            (False, True) if "ws_2cta" in active_families else (False,),
+            (False, True)
+            if "ws_2cta" in active_families or causal_persistent_searchable
+            else (False,),
         )
         persistent_ctas = enum(defaults.persistent_ctas_per_sm, (1,), (1,))
         recompute = enum(defaults.recompute_tile_coords, (False,), (False,))
@@ -11996,8 +12180,13 @@ def flash_fragments_from_facts(
     )
     persistent_loop = enum(
         defaults.persistent_loop,
-        ("while", "counted"),
-        ("while", "counted") if persistent_loop_eligible else ("while",),
+        ("while", "counted", "clc"),
+        ("while", "counted")
+        if persistent_loop_eligible
+        # (The persistent causal pair: the static loop or the CLC scheduler.)
+        else ("while", "clc")
+        if causal_persistent_searchable
+        else ("while",),
     )
     # ``whole`` needs the whole-row body, which a fused row epilogue never gets.
     # The KV-tile-pruned masks run the chunked body (the resolver pins it), so
@@ -17042,6 +17231,21 @@ if warp_idx == {_FLASH_WS_TMEM_WARP}:
 emit_flash_ws_body = statements_adapter(emit_flash_ws_device_body)
 
 
+class FlashItemDecode(NamedTuple):
+    """A body's own decode of the persistent loop's work item
+    (``flash_tile_id``, or the item's CTA ``flash_clc_work.tile_idx`` under
+    the CLC scheduler) into ``flash_m_pair`` / ``flash_bh``, for every role
+    that decodes its item (``_flash_fa4_wrap``): ``setup`` lines before the
+    loop (state the decode carries), the per-item ``prelude`` (8-space
+    indented, newline-terminated) and the ``advance`` lines after the item.
+    The CLC loop runs the prelude alone, so a decode for it carries no
+    state."""
+
+    setup: tuple[str, ...]
+    prelude: str
+    advance: tuple[str, ...]
+
+
 def _flash_fa4_tile_prelude(
     indent: str,
     prelude: str = "full",
@@ -17376,6 +17580,22 @@ def _flash_fa4_wrap_early_head(
     ).render()
 
 
+# The late claim of the CLC scheduler (the persistent causal pair): the load
+# warp asks for the next work tile once it has issued the current item's last
+# load, a ring depth before the item ends, so a CTA reserves no work while it
+# walks a long item (8-space indented; the load role's per-item tail).
+_FLASH_CLC_LATE_CLAIM = """
+        flash_clc_pipeline.producer_acquire(flash_clc_producer_state)
+        flash_clc_mbar = flash_clc_pipeline.producer_get_barrier(
+            flash_clc_producer_state)
+        flash_clc_query_ptr = (
+            flash_clc_response_base
+            + flash_clc_producer_state.index * cutlass.Int32(4)).align(16)
+        with cute.arch.elect_one():
+            cute.arch.issue_clc_query(flash_clc_mbar, flash_clc_query_ptr)
+        flash_clc_producer_state.advance()"""
+
+
 # The CLC scheduler's per-item advance: consume the next work tile from the
 # response ring.
 _FLASH_CLC_ITEM_ADVANCE = (
@@ -17411,6 +17631,7 @@ def _flash_fa4_wrap(
     item_table: str | None = None,
     kv_split: int = 1,
     item_flags: str | None = None,
+    item_decode: FlashItemDecode | None = None,
 ) -> str:
     """Wrap an fa4 role body for the (non-)persistent scheduler.
 
@@ -17440,7 +17661,12 @@ def _flash_fa4_wrap(
     ``u`` is split ``u % kv_split`` of item ``item_table[u // kv_split]``
     (``flash_kv_split_id``).  ``item_flags`` names the tables' host flags
     (``flex_item_flags``): with the identity-order bit set the item is the
-    work-item id itself and the table is not read."""
+    work-item id itself and the table is not read.
+
+    ``item_decode`` (the persistent causal pair): the body's own decode of
+    the work item (``flash_tile_id``; under the CLC scheduler the item's CTA,
+    ``flash_clc_work.tile_idx``) into ``(m_pair, bh)``, in place of the
+    pair-major order every other strided loop carries or recomputes."""
     if not persistent:
         # Flat: head + inner sit directly under the guard at 4-space. ``inner`` is
         # written at 8-space (the persistent while-loop body level), so dedent it 4.
@@ -17475,9 +17701,14 @@ def _flash_fa4_wrap(
     if use_clc_scheduler:
         assert num_m_pairs is not None
         assert clc_heads_per_batch is not None and clc_heads_per_batch > 0
+        # The CLC loop carries no decode state of its own: a body's decode
+        # reads the item's CTA (``flash_clc_work.tile_idx``) in its prelude.
+        assert item_decode is None or not (item_decode.setup or item_decode.advance)
         clc_decode = (
             ""
             if prelude == "none"
+            else item_decode.prelude
+            if item_decode is not None
             else (
                 # The flat grid (``flash_clc_grid_is_flat``): x is the linear
                 # index of the ``(Q pairs, batch heads)`` grid, pairs fastest.
@@ -17572,14 +17803,21 @@ def _flash_fa4_wrap(
             setup=(tile_id_setup,),
             advance=(f"flash_tile_id = flash_tile_id + {grid_dim_expr}",),
         ).render()
+    if item_decode is not None:
+        assert not use_cluster_scheduler and item_table is None
+        return strided(
+            setup=(*grid_setup, *item_decode.setup),
+            prelude=item_decode.prelude + prelude_block,
+            advance=(advance_tile_id, *item_decode.advance),
+        ).render()
     if item_table is not None:
         assert not use_cluster_scheduler
-        item_decode = (
+        table_decode = (
             _flash_power2_decode_exprs("flash_item", num_m_pairs)
             if num_m_pairs is not None
             else None
         )
-        m_pair_expr, bh_expr = item_decode or (
+        m_pair_expr, bh_expr = table_decode or (
             f"flash_item % {num_m_pairs_expr}",
             f"flash_item // {num_m_pairs_expr}",
         )
@@ -17867,6 +18105,7 @@ def _wrap_role(
         tensor_4d_heads=ctx.tensor_4d_heads,
         kv_group=kv_group,
         recompute_tile_coords=ctx.cfg.recompute_tile_coords,
+        item_decode=ctx.fa4_item_decode,
     )
 
 
@@ -19062,8 +19301,11 @@ class FlashBodyContext:
     flex_cursor: bool = dataclasses.field(init=False)
     flex_cursor_kwargs: dict[str, Any] = dataclasses.field(init=False)
     flex_persistent: bool = dataclasses.field(init=False)
+    causal_persistent: bool = dataclasses.field(init=False)
+    clc_late_claim: bool = dataclasses.field(init=False)
     fa4_item_table: str | None = dataclasses.field(init=False)
     fa4_item_flags: str | None = dataclasses.field(init=False)
+    fa4_item_decode: FlashItemDecode | None = dataclasses.field(init=False)
     flex_walk: FlexKvWalk | None = dataclasses.field(init=False)
     flex_q_seq: int = dataclasses.field(init=False)
     ragged_m: bool = dataclasses.field(init=False)
@@ -22926,8 +23168,9 @@ def _corr_epi(
 # (their inner is empty; the wrap supplies the prelude + barrier + stride).
 def emit_empty_role(ctx: FlashBodyContext) -> str:
     """Warp 15: no work (the CLC scheduler's query producer under
-    ``use_clc_scheduler``), paced through the per-work-item loop."""
-    if ctx.use_clc_scheduler:
+    ``use_clc_scheduler``, unless the load warp claims late), paced through
+    the per-work-item loop."""
+    if ctx.use_clc_scheduler and not ctx.clc_late_claim:
         return f"""
 if warp_idx == 15:
     cute.arch.setmaxregister_decrease({ctx.cfg.other_regs})
@@ -23572,6 +23815,12 @@ def emit_load_role(ctx: FlashBodyContext) -> str:
         else "    flash_kv_prod.tail()\n    flash_q_prod.tail()"
     )
     load_inner = ctx.flex_item_prelude + load_inner
+    if ctx.clc_late_claim:
+        load_head += f"""
+    flash_clc_producer_state = cutlass_pipeline_flash.make_pipeline_state(
+        cutlass_pipeline_flash.PipelineUserType.Producer, {ctx.cfg.clc_stages})"""
+        load_inner += _FLASH_CLC_LATE_CLAIM
+        load_tail += "\n    flash_clc_pipeline.producer_tail(flash_clc_producer_state)"
     return _wrap_role(
         ctx,
         f"{ctx.role_next} warp_idx == {ctx.load_warp}:",
@@ -24387,7 +24636,7 @@ def emit_mma_role(ctx: FlashBodyContext) -> str:
         f"{ctx.role_next} warp_idx == 12:",
         mma_head,
         mma_role_inner,
-        prelude="decode" if ctx.flex_persistent else "none",
+        prelude="decode" if ctx.flex_persistent or ctx.causal_persistent else "none",
         segment_prelude="range",
         tail=mma_tmem_teardown,
     )
@@ -24705,6 +24954,7 @@ def emit_softmax_shared_role(ctx: FlashBodyContext) -> str:
         clc_flat_grid=ctx.clc_flat_grid,
         tensor_4d_heads=ctx.tensor_4d_heads,
         recompute_tile_coords=ctx.cfg.recompute_tile_coords,
+        item_decode=ctx.fa4_item_decode,
     )
 
 
@@ -25140,8 +25390,23 @@ def emit_flash_fa4_device_body(
         else 4,
     }
     interval_kv = ctx.is_causal or ctx.pruned_interval or ctx.flex_body
+    # The plain causal pair can run the persistent loop: every role decodes
+    # the item's place in the longest-first order and its KV count at the
+    # top of the item (``fa4_item_decode`` and the item prelude below). The
+    # pruned masks keep one work item per CTA.
+    ctx.causal_persistent = (
+        ctx.is_causal
+        and not ctx.pruned_interval
+        and not ctx.flex_body
+        and ctx.cfg.persistent
+    )
     if interval_kv and not ctx.flex_body:
-        assert not ctx.cfg.persistent
+        assert not ctx.cfg.persistent or ctx.causal_persistent
+    if ctx.causal_persistent:
+        # The per-item decode re-derives the causal range alone: a bias, an
+        # ALiBi slope or another mask binds per-item values in the CTA-wide
+        # setup (the resolver keeps those plans at one item per CTA).
+        assert ctx.score_plan.modifier_kinds == (CAUSAL_MASK_KIND,)
     # The persistent list walk re-reads its tables per work item in every
     # role (a per-role count prelude); the CTA-wide setup keeps only the
     # item-independent bindings.
@@ -25149,6 +25414,7 @@ def emit_flash_fa4_device_body(
     # Its work items run in the host-sorted longest-first order
     # (``flex_item_table``), read through ``_flash_mFlexItems``.
     ctx.fa4_item_table = "_flash_mFlexItems" if ctx.flex_persistent else None
+    ctx.fa4_item_decode = None
     # The tables' host flags (``flex_item_flags``, a runtime kernel scalar):
     # the item order's identity bit skips the item-table read, the all-full
     # bit the words loads.
@@ -25403,6 +25669,8 @@ def emit_flash_fa4_device_body(
         and causal_schedule_ok
         and ctx.use_tmem_row_reduce
         and ctx.is_causal
+        # (Verified for one work item per CTA.)
+        and not ctx.cfg.persistent
         and not ctx.has_lse
         and not ctx.cfg.use_2cta_instrs
         and not ctx.cfg.separate_kv_rings
@@ -25634,6 +25902,7 @@ def emit_flash_fa4_device_body(
             ctx.pruned_interval
             or ctx.list_walk
             or ctx.flex_body
+            or ctx.causal_persistent
             or ctx.use_2cta_instrs
             or ctx.use_cga2_local_cta
             or ctx.use_clc_scheduler
@@ -25664,9 +25933,13 @@ def emit_flash_fa4_device_body(
     )
     if ctx.use_clc_scheduler:
         assert ctx.persistent
-        assert not ctx.is_causal
+        assert not ctx.is_causal or ctx.causal_persistent
         assert not ctx.use_2cta_instrs
         assert not ctx.use_cga2_local_cta
+    # The causal pair's items differ in length by the diagonal: the scheduler
+    # warp's eager queries would reserve the next items while the CTA walks a
+    # long one, so the load warp claims after the current item's loads.
+    ctx.clc_late_claim = ctx.use_clc_scheduler and ctx.causal_persistent
     ctx.clc_heads_per_batch = (
         ctx.cfg.clc_heads_per_batch
         if ctx.use_clc_scheduler and ctx.cfg.clc_heads_per_batch > 0
@@ -26016,11 +26289,11 @@ tOtO1 = tOtO1_full
         if ctx.cfg.causal_lpt_swizzle > 0:
             lpt_swizzle = ctx.cfg.causal_lpt_swizzle
         else:
-            # FA4's L2-sized launch group; the flash io dtypes are two bytes.
+            # FA4's L2-sized launch group, of the operands' element size.
             lpt_swizzle = flash_causal_lpt_l2_swizzle(
                 head_dim,
                 ctx.num_kv,
-                elem_bytes=2,
+                elem_bytes=_flash_dtype_bytes(ctx.io_dtype),
                 kv_group=ctx.score_plan.kv_group,
                 num_bh=ctx.num_bh,
                 head_dim_v=ctx.hd_v,
@@ -26031,21 +26304,19 @@ tOtO1 = tOtO1_full
     lpt_quotient = ctx.num_bh // lpt_swizzle
     lpt_remainder = ctx.num_bh % lpt_swizzle
     lpt_residual = max(lpt_remainder, 1)
-    if lpt_remainder == 0:
-        causal_setup_pid = f"""
-flash_pid = cutlass.Int32(cute.arch.block_idx()[0])
+
+    def lpt_decode(pid_expr: str) -> str:
+        """``flash_bh`` and ``flash_m_pair`` of place ``pid_expr`` in the
+        longest-first order: the pair descends inside a launch group of
+        ``lpt_swizzle`` batch heads (the last group may be smaller)."""
+        if lpt_remainder == 0:
+            return f"""flash_pid = {pid_expr}
 flash_lpt_group = flash_pid // {lpt_group_tiles}
 flash_lpt_mod = flash_pid % {lpt_group_tiles}
 flash_m_pair_raw = flash_lpt_mod // {lpt_swizzle}
 flash_bh = flash_lpt_group * {lpt_swizzle} + (flash_lpt_mod % {lpt_swizzle})
-flash_m_pair = {ctx.num_m_pairs - 1} - flash_m_pair_raw
-flash_m_tile0 = flash_m_pair * 2
-flash_m_tile1 = flash_m_pair * 2 + 1
-flash_q_mma_tile0 = flash_m_tile0
-flash_q_mma_tile1 = flash_m_tile1"""
-    else:
-        causal_setup_pid = f"""
-flash_pid = cutlass.Int32(cute.arch.block_idx()[0])
+flash_m_pair = {ctx.num_m_pairs - 1} - flash_m_pair_raw"""
+        return f"""flash_pid = {pid_expr}
 flash_lpt_group = flash_pid // {lpt_group_tiles}
 flash_lpt_mod = flash_pid % {lpt_group_tiles}
 flash_m_pair_raw = cutlass.Int32(0)
@@ -26056,11 +26327,69 @@ if flash_lpt_group < {lpt_quotient}:
 else:
     flash_m_pair_raw = flash_lpt_mod // {lpt_residual}
     flash_bh = flash_lpt_group * {lpt_swizzle} + (flash_lpt_mod % {lpt_residual})
-flash_m_pair = {ctx.num_m_pairs - 1} - flash_m_pair_raw
+flash_m_pair = {ctx.num_m_pairs - 1} - flash_m_pair_raw"""
+
+    causal_setup_pid = f"""
+{lpt_decode("cutlass.Int32(cute.arch.block_idx()[0])")}
 flash_m_tile0 = flash_m_pair * 2
 flash_m_tile1 = flash_m_pair * 2 + 1
 flash_q_mma_tile0 = flash_m_tile0
 flash_q_mma_tile1 = flash_m_tile1"""
+    if ctx.causal_persistent and ctx.use_clc_scheduler:
+        # The CLC scheduler hands a CTA the grid's next CTA that has not
+        # started: the place in the longest-first order is that CTA's linear
+        # index in the launch grid (x fastest), so the items start in order
+        # and a CTA that finishes early takes the next one. The flat grid
+        # (``flash_clc_grid_is_flat``) has the index on x.
+        clc_place = (
+            "cutlass.Int32(flash_clc_work.tile_idx[0])"
+            if ctx.clc_flat_grid
+            else f"""(
+    cutlass.Int32(flash_clc_work.tile_idx[0])
+    + cutlass.Int32({ctx.num_m_pairs}) * (
+        cutlass.Int32(flash_clc_work.tile_idx[1])
+        + cutlass.Int32({ctx.clc_heads_per_batch})
+        * cutlass.Int32(flash_clc_work.tile_idx[2])))"""
+        )
+        ctx.fa4_item_decode = FlashItemDecode(
+            setup=(),
+            prelude=textwrap.indent(
+                f"""flash_lpt_place = {clc_place}
+{lpt_decode("flash_lpt_place")}
+""",
+                "        ",
+            ),
+            advance=(),
+        )
+    elif ctx.causal_persistent:
+        # The persistent loop's item ``flash_tile_id`` (block index plus a
+        # whole number of grid widths) takes a place of the longest-first
+        # order. Round by round the CTAs alternate direction (CTA c takes
+        # place c of an even round and the mirrored place of an odd one), so
+        # every CTA gets long and short items in turn and their sums stay
+        # level: in a fixed direction the first CTA would take the longest
+        # item of every round.
+        assert ctx.total_tiles is not None
+        ctx.fa4_item_decode = FlashItemDecode(
+            setup=(
+                "flash_lpt_round = cutlass.Int32(0)",
+                "flash_lpt_mirror = cutlass.Int32(0)",
+            ),
+            prelude=textwrap.indent(
+                f"""flash_lpt_place = flash_tile_id
+if flash_lpt_mirror == cutlass.Int32(1):
+    flash_lpt_place = (
+        cutlass.min(flash_lpt_round + flash_grid_dim, cutlass.Int32({ctx.total_tiles}))
+        - cutlass.Int32(1) - (flash_tile_id - flash_lpt_round))
+{lpt_decode("flash_lpt_place")}
+""",
+                "        ",
+            ),
+            advance=(
+                "flash_lpt_round = flash_lpt_round + flash_grid_dim",
+                "flash_lpt_mirror = flash_lpt_mirror ^ cutlass.Int32(1)",
+            ),
+        )
     if ctx.causal_head_pair:
         # One work item per (head pair, 128-row tile): the same CTA count as
         # the one-head pair grid (``num_bh // 2`` pairs x ``2 * num_m_pairs``
@@ -26177,6 +26506,7 @@ flash_q_mma_tile1 = flash_m_tile1"""
         if ctx.persistent or ctx.segment_tiling
         else (causal_setup_pid if interval_kv else noncausal_setup_pid)
     )
+    causal_item_count = ""
     if ctx.cfg.causal_two_cta:
         active_kv_setup = """
 flash_num_active_kv = (
@@ -26184,6 +26514,11 @@ flash_num_active_kv = (
     elif ctx.is_causal:
         active_kv_setup = """
 flash_num_active_kv = flash_m_tile1 + cutlass.Int32(1)"""
+        if ctx.causal_persistent:
+            # Every walking role binds the count at the top of each item,
+            # after its tile decode (``flex_item_prelude``).
+            causal_item_count = active_kv_setup
+            active_kv_setup = ""
     elif ctx.pruned_interval:
         # Union of the two resident query tiles' contiguous KV intervals. Both
         # tiles' intervals end at (or, for prefix-LM, beyond) their own
@@ -26284,6 +26619,10 @@ flash_num_active_kv = flash_kv_last - flash_kv_first + cutlass.Int32(1)"""
     # epilogue warp needs only the live rows of a ragged query length.
     ctx.flex_item_prelude = ""
     ctx.flex_item_rows = ""
+    if ctx.causal_persistent:
+        ctx.flex_item_prelude = (
+            textwrap.indent(causal_item_count.strip("\n"), "        ") + "\n"
+        )
     if ctx.flex_persistent:
         assert ctx.flex_body
         ctx.flex_item_prelude = (

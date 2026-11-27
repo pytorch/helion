@@ -821,6 +821,8 @@ def test_hd64_campaign_seeds_pin_the_knob_off() -> None:
                 if seed.config.get(cute_flash.FLASH_PIPELINE_FAMILY_KEY) == "fa4"
                 and seed.config.get(SKIP_KEY) is False
                 and seed.config.get(cute_flash.FLASH_CAUSAL_LPT_L2_SHIFT_KEY) == 0
+                # (The persistent pair's seeds repeat these bodies.)
+                and not seed.config.get(cute_flash.FLASH_PERSISTENT_KEY)
             ]
 
         pinned = pinned_bodies(seeds)
