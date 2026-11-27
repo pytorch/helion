@@ -36,6 +36,16 @@ def _rebuild_tensor_with_dtype(
     )
 
 
+def _rebuild_typed_storage(
+    storage: torch.storage.TypedStorage, dtype: torch.dtype
+) -> torch.storage.TypedStorage:
+    # Saved files name this module path and symbol; keep it loadable.
+    # ``torch.load`` hands back the saved untyped storage typed as bytes.
+    return torch.storage.TypedStorage(
+        wrap_storage=storage._untyped_storage, dtype=dtype, _internal=True
+    )
+
+
 def _untyped_reduction(reduction: tuple) -> tuple:
     rebuild, args, *state = reduction
     if rebuild is _rebuild_tensor_v3:
@@ -73,14 +83,34 @@ class Pickler(pickle.Pickler):
     ``torch.save`` subclasses the supplied module's ``Pickler`` to install its
     storage persistent IDs. Keeping that mechanism preserves both tensor-object
     identity and storage aliases, including tensors inside callable arguments.
+    A bare ``TypedStorage`` in the tree takes the same format: under its own
+    persistent ID it would name a dtype for data that the tensors here record
+    as untyped bytes, which ``torch.save`` refuses.
     The result loads through ordinary trusted ``torch.load``.
     """
+
+    def __init_subclass__(cls, **kwargs: object) -> None:
+        super().__init_subclass__(**kwargs)
+        persistent_id = cls.__dict__.get("persistent_id")
+        if persistent_id is None:
+            return
+
+        # The pickler asks ``persistent_id`` before ``reducer_override``, and
+        # the subclass of ``torch.save`` answers it for every storage.
+        def untyped_storage_id(self: Pickler, obj: object) -> object:
+            if isinstance(obj, torch.storage.TypedStorage):
+                return None
+            return persistent_id(self, obj)
+
+        cls.persistent_id = untyped_storage_id  # pyrefly: ignore[bad-assignment]
 
     def __init__(self, file: BinaryIO, protocol: int = 2) -> None:
         super().__init__(file, protocol=protocol)
         self._protocol = protocol
 
     def reducer_override(self, obj: object, /) -> tuple | NotImplementedType:
+        if isinstance(obj, torch.storage.TypedStorage):
+            return (_rebuild_typed_storage, (obj._untyped_storage, obj.dtype))
         if isinstance(obj, torch.Tensor):
             reduction = obj.__reduce_ex__(self._protocol)
             if isinstance(reduction, tuple):
@@ -95,7 +125,8 @@ def save_tensor_tree(value: object, path: str | Path) -> None:
     tensor layouts (including bare TypedStorage objects sharing a tensor's data).
     Its typed-storage format refuses, for example, INT8 and
     UINT8 views of the same cache allocation. Retry that specific failure using
-    untyped storage plus each tensor's dtype, without cloning or moving tensors.
+    untyped storage plus each tensor's or storage's dtype, without cloning or
+    moving tensors.
     """
     try:
         torch.save(value, path)
