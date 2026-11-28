@@ -33,8 +33,9 @@ pinned by ``test/test_cute_ast_pass_utils.py`` against the legacy copies:
   node.
 * dataflow -- ``exposed_reads`` (forward, with explicit branch/loop/define
   policies) and ``live_in`` (backward, zero-trip loops).
-* device body -- ``body_end_follows_all_tiles``: whether a statement appended
-  to a device body runs once per CTA, after all of its tiles.
+* device body -- ``phase_barrier_call`` recognizes the emitted local grid join
+  ABI (``PHASE_BARRIER_ARITIES``); ``body_end_follows_all_tiles`` tells whether
+  an appended statement runs once per CTA, after all of its tiles.
 
 Do not import this module from device-helper modules that generated code
 imports (``reduce_helpers``, ``vec_utils``, ``*_runtime``): they are part of
@@ -424,6 +425,21 @@ def constexpr_v_loop(node: ast.AST) -> tuple[ast.For, int] | None:
 # --------------------------------------------------------------------------
 # Device body
 # --------------------------------------------------------------------------
+
+
+PHASE_BARRIER_ARITIES = {"_cute_grid_barrier": 1}
+
+
+def phase_barrier_call(stmt: ast.stmt) -> ast.Call | None:
+    """A direct call to the compiler-emitted local grid join."""
+    if isinstance(stmt, ast.Expr) and isinstance(call := stmt.value, ast.Call):
+        if (
+            isinstance(call.func, ast.Name)
+            and len(call.args) == PHASE_BARRIER_ARITIES.get(call.func.id)
+            and not call.keywords
+        ):
+            return call
+    return None
 
 
 def body_end_follows_all_tiles(body: Sequence[ast.AST], device_ir: DeviceIR) -> bool:

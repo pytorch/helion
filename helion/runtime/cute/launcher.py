@@ -139,6 +139,7 @@ from .launch_descriptor import (
 )
 from .launch_descriptor import bake_tensor_shapes as _cute_bake_tensor_shapes_guard
 from .launch_descriptor import cluster_shape as _cute_cluster_shape
+from .launch_descriptor import cooperative as _cute_cooperative
 from .launch_descriptor import cute_launch_descriptor
 from .launch_descriptor import min_blocks_per_mp as _cute_min_blocks_per_mp
 from .launch_descriptor import preferred_smem_carveout as _cute_preferred_smem_carveout
@@ -439,6 +440,11 @@ def _create_cute_wrapper(
             "cute", "SM100 recurrence must own the complete device root"
         )
     launch_suffix = f", block={block!r}"
+    # Every CTA must be able to reach a spinning grid barrier. Only the
+    # driver can admit the complete grid under concurrent stream workloads.
+    if _cute_cooperative(cute_kernel):
+        launch_suffix += ", cooperative=True"
+
     cluster_shape = _cute_cluster_shape(cute_kernel, wrapper_plans)
     if cluster_shape is not None:
         launch_suffix += f", cluster={list(cluster_shape)!r}"

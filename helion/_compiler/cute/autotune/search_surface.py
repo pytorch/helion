@@ -4287,9 +4287,9 @@ def normalize_strategy(
     _normalize_cute_flash_bwd(config_spec, config)
 
     if config_spec.multi_phase and config.get("num_sm_multiplier", 1) != 1:
-        # The grid barrier between the phases waits for every CTA, and the
-        # CuTe launcher has no cooperative launch to reject a grid larger
-        # than the GPU holds at once: such a launch would hang.
+        # A grid barrier waits for every CTA. A cooperative launch can
+        # reject an oversized grid, but the search has no per-function
+        # proof that additional blocks can reside on each SM.
         if fix_invalid:
             config.pop("num_sm_multiplier", None)
         else:

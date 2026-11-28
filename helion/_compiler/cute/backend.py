@@ -2762,10 +2762,11 @@ class CuteBackend(Backend):
         # The final body, the spread pad included: a kernel whose shared
         # memory cannot fit one block fails here, not in libNVVM.
         check_smem_budget(fn_def, ctx.constexpr_values, fn.pid)
+        # Inspect the kernel before outlining moves its joins into a helper.
+        statements = launch_attributes.module_statements(fn, fn_def)
         # One body per cluster shape sharing that shared memory
         # (``tcgen05_fallback_cluster``).
         outline_fallback_cluster_bodies(fn, fn_def, prefix)
-        statements = launch_attributes.module_statements(fn)
         launch_attributes.project_launch_block(fn)
         return statements
 

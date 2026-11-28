@@ -50,6 +50,11 @@ def cluster_shape_from_wrapper_plans(
     return (cluster_m, cluster_n, 1)
 
 
+def cooperative(cute_kernel: object) -> bool:
+    """Whether all CTAs must be resident for a generated grid join."""
+    return getattr(cast("Any", cute_kernel), "_helion_cute_cooperative", False) is True
+
+
 def use_pdl(cute_kernel: object) -> bool:
     """Whether the generated kernel asked for programmatic dependent launch.
 

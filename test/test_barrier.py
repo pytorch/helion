@@ -298,9 +298,8 @@ class TestCuteBarrier(RefEagerTestBase, TestCase):
 
     @skipIfRefEager("config normalization is only enforced in compiled mode")
     def test_multi_phase_requires_one_cta_per_sm(self) -> None:
-        """The grid barrier waits for every CTA, and the CuTe launcher has no
-        cooperative launch to reject a grid the GPU cannot hold at once: an
-        oversubscribed persistent grid would hang instead of failing."""
+        """The search caps the grid at one CTA per SM. CUDA also checks if the
+        final cooperative launch can keep all those CTAs resident together."""
 
         @helion.kernel(autotune_effort="none")
         def implicit_dependency(x: torch.Tensor) -> torch.Tensor:
@@ -366,6 +365,7 @@ class TestCuteBarrier(RefEagerTestBase, TestCase):
         code, out = code_and_output(barrier_dep_single, (x,), block_sizes=[4, 4])
         torch.testing.assert_close(out, x * 2 + 1)
         self.assertIn("_cute_grid_barrier", code)
+        self.assertIn("._helion_cute_cooperative = True", code)
 
     @skipIfRefEager("promoted-seed pid_type is only materialized in compiled mode")
     def test_reduction_seed_default_config_is_persistent(self) -> None:

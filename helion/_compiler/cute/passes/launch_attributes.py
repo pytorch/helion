@@ -4,17 +4,19 @@ projection (``CuteBackend.finalize_kernel_def``).
 The statements set the attributes ``helion.runtime.cute.launcher`` reads off
 the kernel function before its first launch: the device-helper kinds whose
 imports are absent from the generated source, the thread-block cluster
-shape, programmatic dependent launch (``cute_pdl``), the SASS checks and
-ptxas's ``minnctapersm``.  ``project_launch_block`` refreshes the host launch
-call's ``block=`` once a late device lowering fixed the CTA shape.
+shape, cooperative launch for spinning grid joins, programmatic dependent
+launch (``cute_pdl``), SASS checks and ptxas's ``minnctapersm``.
+``project_launch_block`` updates the host launch block after device lowering.
 """
 
 from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+from ...ast_extension import iter_statements
 from ...ast_extension import statement_from_string
 from ...source_location import SyntheticLocation
+from .._ast_pass_utils import phase_barrier_call
 from ..pdl_ops import has_explicit_pdl
 from ..thread_block_projection import update_launch_block
 from .pdl import pdl_applies
@@ -25,9 +27,17 @@ if TYPE_CHECKING:
     from ...device_function import DeviceFunction
 
 
-def module_statements(fn: DeviceFunction) -> list[ast.stmt]:
+def module_statements(fn: DeviceFunction, fn_def: ast.FunctionDef) -> list[ast.stmt]:
     """The statements that follow ``fn``'s kernel definition in the module."""
     result: list[ast.stmt] = []
+    # A peer join also spins on the local grid. Inspect statement
+    # scopes, including wrappers, without walking every arithmetic expression.
+    if any(
+        phase_barrier_call(stmt) is not None for stmt in iter_statements(fn_def.body)
+    ):
+        result.append(
+            statement_from_string(f"{fn.name}._helion_cute_cooperative = True")
+        )
     if fn.cute_state.lanes.resident_reduction_layouts:
         # These imported device helpers are absent from generated source.
         # Persist their dependency with this kernel through source reload.
