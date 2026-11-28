@@ -442,7 +442,11 @@ def _fragment_logical_shape(
 
 
 def _static_selection_extent(env: CompileEnvironment, source: Node) -> int | None:
-    shape = _fragment_logical_shape(env, source)
+    # An integer row index removes a dimension; a remaining full slice
+    # still has its source tensor's logical width (including unpadded tails).
+    shape = _fragment_logical_shape(
+        env, source, scalar_indexed_loads=True, tensor_indexed_loads=True
+    )
     if not shape:
         return None
     width = shape[-1]

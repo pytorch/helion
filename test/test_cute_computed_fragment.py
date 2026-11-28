@@ -47,6 +47,7 @@ from helion._testing.cute_repeated_axes import grid_full_slice_add
 from helion._testing.cute_scan_kernels import computed_scan as _computed_scan
 from helion._testing.tunable_fragments import load_host_function
 import helion.language as hl
+from helion.language._tracing_ops import _mask_to
 from helion.runtime.ref_mode import RefMode
 
 if TYPE_CHECKING:
@@ -763,6 +764,37 @@ def _fragment_fp8_storage(x: torch.Tensor):
         widened[row, :] = narrowed.float()
         prefix[row, :] = hl.cumsum(values + 1, dim=-1)
     return copied, widened, prefix
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _fp8_partial_mask(x):
+    rows, columns = x.shape
+    block = hl.register_block_size(columns)
+    out = torch.empty((rows,), device=x.device, dtype=torch.float32)
+    for row in hl.grid(rows):
+        acc = hl.zeros([block], dtype=torch.float32)
+        for tile in hl.tile(columns, block_size=block):
+            # Use a nonzero fill so the select cannot be folded into a masked load.
+            acc = acc + _mask_to(x[row, tile], 0.5).float()
+        out[row] = hl.cumsum(acc, dim=0).sum()
+    return out
+
+
+def test_fragment_fp8_select_in_a_partial_tile():
+    x = (
+        torch.arange(14, dtype=torch.float32, device=DEVICE)
+        .reshape(2, 7)
+        .to(torch.float8_e4m3fn)
+    )
+    bound = _fp8_partial_mask.bind((x,))
+    config = bound.config_spec.default_config()
+    config.config["block_sizes"] = [4]
+    actual = bound.compile_config(config)(x)
+    # _mask_to supplies 0.5 for the last column of the final tile. Adding a
+    # tile to a carry keeps the previous lane when the tile has no element.
+    carry = x[:, :4].float()
+    carry[:, :3] += x[:, 4:].float()
+    torch.testing.assert_close(actual, carry.cumsum(1).sum(1), rtol=0, atol=0)
 
 
 @pytest.mark.parametrize("dtype", [torch.float8_e4m3fn, torch.float8_e5m2])

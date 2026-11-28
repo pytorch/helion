@@ -26,6 +26,7 @@ from ..ast_read_writes import HELION_BLOCK_UNIFORM_ATTR
 from ..compile_environment import CompileEnvironment
 from ..dtype_utils import cast_ast
 from .block_uniform import block_uniform
+from .dtypes import masked_select_dtype
 from .handler_ops import extremum_result_kind
 from .synthetic_axes import branch_scope
 
@@ -238,13 +239,7 @@ def _masked_select(
     if mask_expr is None:
         return state.ast_arg(0)
     input_dtype = tensor.dtype
-    # CuTe cannot select between float8 scalars; they convert to float32 and
-    # back exactly.
-    select_dtype = (
-        torch.float32
-        if input_dtype.itemsize == 1 and input_dtype.is_floating_point
-        else input_dtype
-    )
+    select_dtype = masked_select_dtype(input_dtype)
     result = expr_from_string(
         "({expr} if {mask} else {other})",
         expr=cast_ast(state.ast_arg(0), select_dtype),
