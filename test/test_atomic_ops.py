@@ -6385,13 +6385,19 @@ class TestFragmentPrivateScalarLoopNative(TestCase):
                     cute_fragment_threads=128,
                     cute_fragment_private_scalar_loops=True,
                 )
-                expected = torch.tensor(0.0, dtype=torch.float32, device=DEVICE)
-                for column in range(begin, end):
-                    if 0 <= column < x.size(1):
-                        expected = expected + x[0, column]
-                torch.testing.assert_close(result, expected.reshape(1), rtol=0, atol=0)
+                expected = _private_loop_sum_reference(x, begin, end)
+                torch.testing.assert_close(result, expected, rtol=0, atol=0)
                 torch.testing.assert_close(x, before, rtol=0, atol=0)
                 self.assertEqual(int(counter[0]), 3)
+
+
+def _private_loop_sum_reference(x: torch.Tensor, begin: int, end: int) -> torch.Tensor:
+    # Unmasked scalar indices use Python's signed range; outside it the
+    # fragment adds zero. Sum in the same order as the scalar loop.
+    expected = x.new_zeros((1,))
+    for column in range(max(begin, -x.size(1)), min(end, x.size(1))):
+        expected = expected + x[0, column]
+    return expected
 
 
 @helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
@@ -6438,13 +6444,8 @@ class TestFragmentPrivateMaskedLoopCPU(unittest.TestCase):
                         scalar_args={"begin": begin, "end": end},
                         lane_order=list(reversed(range(32))),
                     )
-                    expected = torch.tensor(0.0, dtype=torch.float32)
-                    for column in range(begin, end):
-                        if 0 <= column < x.size(1):
-                            expected = expected + x[0, column]
-                    torch.testing.assert_close(
-                        result, expected.reshape(1), rtol=0, atol=0
-                    )
+                    expected = _private_loop_sum_reference(x, begin, end)
+                    torch.testing.assert_close(result, expected, rtol=0, atol=0)
                     self.assertEqual(int(counter[0]), 3)
 
 

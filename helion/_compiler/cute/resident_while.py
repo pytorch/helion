@@ -533,10 +533,9 @@ def resident_while_domain_facts(
     Mutable entry intervals say nothing about later iterations. Only immutable
     captures with a closed index recipe may retain their entry interval.
     """
-    from .bounded_gather import integer_bounds
     from .fragment_context import _fragment_logical_shape
     from .gather_domains import GatherDomainFacts
-    from .gather_domains import _readonly_index_recipe
+    from .gather_domains import readonly_capture_bounds
     from .register_loads import host_load_is_readonly
 
     calls = [
@@ -613,14 +612,11 @@ def resident_while_domain_facts(
                 ):
                     identities.add(node)
                 preceding.add(node)
-        if _readonly_index_recipe(
-            entry,
-            set(trial.readonly_ranges),
-            identity_captures=frozenset(identities),
-        ):
-            interval = integer_bounds(entry, captured_bounds=trial.readonly_ranges)
-            if interval is not None:
-                trial.readonly_ranges[placeholder] = interval
+        interval = readonly_capture_bounds(
+            entry, trial.readonly_ranges, identity_captures=frozenset(identities)
+        )
+        if interval is not None:
+            trial.readonly_ranges[placeholder] = interval
 
     def prove(context: ResidentCallContext) -> bool:
         entry_shapes = []

@@ -338,14 +338,7 @@ class FragmentAtomicEmitter(FragmentContext):
                     raise exc.InvalidConfig(
                         "fragment atomic static index is outside the logical target"
                     )
-                # Python/PyTorch indexing wraps one valid negative extent.
-                # Widen before adding a possibly 64-bit host extent; this is
-                # address arithmetic, not a conversion of the update value.
-                wrapped = self.df.new_var("fragment_atomic_wrapped")
-                self.emit(f"{wrapped} = cutlass.Int64({position})")
-                self.emit(
-                    f"if {wrapped} < 0:\n    {wrapped} = {wrapped} + cutlass.Int64({size})"
-                )
+                wrapped = self.normalize_signed_index(position, size)
                 masks.append(f"0 <= ({wrapped}) and ({wrapped}) < ({size})")
                 positions.append(wrapped)
             if isinstance(target, Fragment):

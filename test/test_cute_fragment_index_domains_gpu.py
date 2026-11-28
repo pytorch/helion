@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from unittest.mock import patch
+
 import pytest
 import torch
 
@@ -9,6 +11,7 @@ from helion._testing import skipIfNotCUDA
 from helion._testing.cute_fragment_index_domains import dot_then_reduce
 from helion._testing.cute_fragment_index_domains import indexed_gemm
 from helion._testing.cute_fragment_index_domains import reshaped_dot_then_max
+from helion._testing.cute_fragment_index_domains import signed_fragment_address
 from helion._testing.cute_fragment_index_domains import windowed_cumsum
 
 
@@ -110,3 +113,43 @@ def test_reshaped_dot_reduction_uses_the_flat_logical_bound(half_mma):
         value = x.float().reshape(2, 7, 8) @ y.float()
         expected = value + value.amax(dim=1, keepdim=True)
         torch.testing.assert_close(compiled(x, y), expected, rtol=0, atol=0)
+
+
+@skipIfNotCUDA()
+@pytest.mark.parametrize("read", [True, False])
+@pytest.mark.parametrize("normalize", [True, False])
+def test_mixed_signed_fragment_row(read: bool, normalize: bool) -> None:
+    # Allocations have distinct rows outside the logical views: a raw
+    # negative tensor index must not load or overwrite those rows.
+    data = torch.full((2, 10, 8), 113.0, device=DEVICE)
+    x = data[:, 1:-1]
+    x.copy_(torch.arange(128, device=DEVICE).reshape(2, 8, 8) % 13 - 6)
+    storage = torch.full_like(data, -9000.0)
+    eager = storage.clone()
+    expected = storage.clone()
+    out = storage[:, 1:-1]
+    args = (x, out, read, False, torch.int16, normalize)
+    bound = signed_fragment_address.bind(args)
+    bound.compile_config(bound.config_spec.default_config())(*args)
+
+    if read:
+        previous = x.roll(1, dims=1)
+        if not normalize:
+            previous[:, 0] = 0
+        expected[:, 1:-1] = (2 * previous) @ x.transpose(-1, -2)
+    else:
+        gram = (2 * x) @ x.transpose(-1, -2)
+        expected[:, 1:-2] = gram[:, 1:]
+        if normalize:
+            expected[:, -2] = gram[:, 0]
+    torch.testing.assert_close(storage, expected, rtol=0, atol=0)
+
+    # RefMode clamps a negative tensor load and drops a negative tensor
+    # store. An explicitly normalized row is in bounds on both paths.
+    with patch.object(
+        signed_fragment_address.settings, "ref_mode", helion.RefMode.EAGER
+    ):
+        signed_fragment_address(x, eager[:, 1:-1], *args[2:])
+    if read and not normalize:
+        expected[:, 1] = (2 * x[:, :1] @ x.transpose(-1, -2)).squeeze(1)
+    torch.testing.assert_close(eager, expected, rtol=0, atol=0)

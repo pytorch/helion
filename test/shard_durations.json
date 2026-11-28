@@ -155,6 +155,7 @@
  "test/test_cute_fragment_half_mma.py": 3.1,
  "test/test_cute_fragment_index_domains_gpu.py": 2.2,
  "test/test_cute_fragment_input_layout_gpu.py": 0.7,
+ "test/test_cute_fragment_signed_coordinates.py": 4.4,
  "test/test_cute_fragment_tile_staging.py": 12.0,
  "test/test_cute_fragment_vector_io.py": 28.2,
  "test/test_cute_fragment_where.py": 51.0,

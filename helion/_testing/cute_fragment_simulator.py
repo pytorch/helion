@@ -24,6 +24,7 @@ def simulate_independent_fragment(
     *,
     thread: tuple[int, int, int] = (0, 0, 0),
     block_y: int = 0,
+    per_thread_stores: bool = False,
     int32: Callable[..., object] = int,
     int64: Callable[..., object] = int,
     uint64: Callable[..., object] = int,
@@ -35,6 +36,9 @@ def simulate_independent_fragment(
     Each fragment element loop visits all coordinates instead of one thread's
     residue class. The barriers therefore delimit complete CPU phases. This
     validates generated indexing/math, not native CUDA synchronization.
+    With per_thread_stores, prepare the shared input phases as usual but
+    keep element loops containing a store on their original thread. Call
+    once per physical thread to check the complete output ownership.
     """
     packets = {"vector": 0, "scalar": 0}
 
@@ -87,13 +91,22 @@ def simulate_independent_fragment(
             self.values = np.empty(math.prod(shape), dtype=dtype)
             self.written = np.zeros(math.prod(shape), dtype=bool)
 
+        def _checked_index(self, index: int) -> int:
+            index = int(index)
+            assert 0 <= index < self.values.size, (
+                f"fragment scratch index {index} out of bounds for {self.values.size} elements"
+            )
+            return index
+
         def __getitem__(self, index: int) -> np.generic:
-            assert self.written[int(index)], f"read before shared write: {index}"
-            return self.values[int(index)]
+            index = self._checked_index(index)
+            assert self.written[index], f"read before shared write: {index}"
+            return self.values[index]
 
         def __setitem__(self, index: int, value: object) -> None:
-            self.values[int(index)] = value
-            self.written[int(index)] = True
+            index = self._checked_index(index)
+            self.values[index] = value
+            self.written[index] = True
 
     class Allocator:
         def allocate_tensor(
@@ -128,6 +141,13 @@ def simulate_independent_fragment(
 
         def visit_For(self, node: ast.For) -> ast.For:
             self.generic_visit(node)
+            if per_thread_stores and any(
+                isinstance(call, ast.Call)
+                and isinstance(call.func, ast.Attribute)
+                and call.func.attr == "store"
+                for call in ast.walk(node)
+            ):
+                return node
             if isinstance(node.target, ast.Name) and node.target.id.startswith(
                 ("fragment_index", "fragment_packet_index")
             ):

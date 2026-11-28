@@ -17,6 +17,7 @@ from ...language import _tracing_ops
 from ...language import inline_asm_ops
 from ..device_ir import ForLoopGraphInfo
 from ..device_ir import RootGraphInfo
+from .bounded_gather import integer_bounds
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -119,6 +120,24 @@ def _readonly_index_recipe(
     return True
 
 
+def readonly_capture_bounds(
+    entry: Node,
+    incoming: dict[Node, tuple[int, int]],
+    *,
+    identity_captures: frozenset[Node] = frozenset(),
+) -> tuple[int, int] | None:
+    """The inherited interval of an invariant entry in the caller's domain.
+
+    The caller excludes mutable backedge slots. Only pass identity wrappers
+    that the enclosing call has separately proved immutable and dominating.
+    """
+    if not _readonly_index_recipe(
+        entry, set(incoming), identity_captures=identity_captures
+    ):
+        return None
+    return integer_bounds(entry, captured_bounds=incoming)
+
+
 def loop_domain_facts(
     env: CompileEnvironment, graphs: Sequence[GraphInfo], *, allow_unbound: bool = False
 ) -> GatherDomainFacts:
@@ -129,7 +148,6 @@ def loop_domain_facts(
     escape a failed enclosing recurrence. Facts affect admission only; the
     existing loop snapshots, storage dependencies and barriers are retained.
     """
-    from .bounded_gather import integer_bounds
     from .fragment_context import _fragment_logical_shape
 
     facts = GatherDomainFacts()
@@ -348,13 +366,9 @@ def loop_domain_facts(
         ):
             if slot in slots.values() or placeholder not in local:
                 continue
-            if not _readonly_index_recipe(
-                entry,
-                set(incoming.readonly_ranges),
-                identity_captures=identity_captures,
-            ):
-                continue
-            interval = integer_bounds(entry, captured_bounds=incoming.readonly_ranges)
+            interval = readonly_capture_bounds(
+                entry, incoming.readonly_ranges, identity_captures=identity_captures
+            )
             if interval is not None:
                 trial.readonly_ranges[placeholder] = interval
         # Descendants may assume this iteration's entry domains, but nothing

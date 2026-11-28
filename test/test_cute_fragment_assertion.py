@@ -6,6 +6,7 @@ from pathlib import Path
 import re
 import subprocess
 import sys
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import numpy as np
@@ -467,7 +468,7 @@ def test_checked_scalar_grid_stride_is_not_a_tile_width() -> None:
 
     # Each CTA owns one scalar; the third operand advances its coordinate.
     with as_sm100():
-        x = torch.ones(16)
+        x = torch.arange(1, 17, dtype=torch.float32)
         bound = cpu_bind(copy, (x, torch.empty_like(x)))
         source = bound.to_code(helion.Config(block_sizes=[]), output_origin_lines=False)
     launch = re.search(
@@ -475,9 +476,25 @@ def test_checked_scalar_grid_stride_is_not_a_tile_width() -> None:
     )
     assert launch is not None and source.count("call __assertfail") == 1
     blocks, threads = map(int, launch.groups())
-    assert generated_output_address_coverage(
-        source, "out", blocks, threads
-    ) == dict.fromkeys(range(2, 16, 4), 1)
+    writes: list[tuple[int, float]] = []
+
+    class OutputPointer:
+        def __add__(self, offset: int) -> SimpleNamespace:
+            return SimpleNamespace(store=lambda value: writes.append((offset, value)))
+
+    predicates: list[bool] = []
+    for lane in range(threads):
+        simulate_independent_fragment(
+            source,
+            {"x": x},
+            {"out": SimpleNamespace(iterator=OutputPointer())},
+            blocks,
+            thread=(lane, 0, 0),
+            per_thread_stores=True,
+            inline_asm=lambda args, **kwargs: predicates.append(bool(args[0])),
+        )
+    assert predicates == [True] * blocks
+    assert sorted(writes) == [(i, x[i].item()) for i in range(2, 16, 4)]
 
 
 def test_packed_grid_tiles_cannot_skip_checked_rows() -> None:

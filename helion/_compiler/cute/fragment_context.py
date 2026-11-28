@@ -860,6 +860,15 @@ class FragmentContext:
     def emit(self, source: str) -> None:
         self.cg.add_statement(statement_from_string(source))
 
+    def normalize_signed_index(self, expression: str, extent: str) -> str:
+        """Widen before adding one extent to a negative Python coordinate."""
+        position = self.df.new_var("fragment_wrapped_index")
+        self.emit(f"{position} = cutlass.Int64({expression})")
+        self.emit(
+            f"if {position} < 0:\n    {position} = {position} + cutlass.Int64({extent})"
+        )
+        return position
+
     def synchronize(self) -> None:
         self.emit("cute.arch.sync_threads()")
         self.pending_local_atomics.clear()

@@ -2,10 +2,19 @@
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 import torch
 
 import helion
 import helion.language as hl
+
+# The DSL passes the raw compile-time value (a dtype, int or bool) to the
+# kernel body; at runtime the annotation must remain the constexpr marker.
+if TYPE_CHECKING:
+    from typing import Any as _Constexpr
+else:
+    _Constexpr = hl.constexpr
 
 
 def _cumsum_column_tile(x: torch.Tensor, batch: hl.Tile, col: hl.Tile) -> torch.Tensor:
@@ -87,3 +96,67 @@ def reshaped_dot_then_max(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
         r = hl.arange(rows)
         output[batch, r, c] = value + torch.amax(value, dim=0, keepdim=True)
     return output
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _masked_wide_window(
+    x: torch.Tensor,
+    bases: torch.Tensor,
+    lengths: torch.Tensor,
+    out: torch.Tensor,
+    index_dtype: _Constexpr,
+    start: _Constexpr = 0,
+    shift: _Constexpr = False,
+) -> torch.Tensor:
+    for batch in hl.grid(x.size(0)):
+        base = bases[batch]
+        limit = lengths[batch]
+        aidx = hl.arange(8, dtype=index_dtype) + start
+        if shift:
+            aidx = aidx + 1
+        bidx = aidx + 8
+        cols = hl.arange(8)
+        a = hl.load(x, [batch, base + aidx, cols], extra_mask=(aidx < limit)[:, None])
+        b = hl.load(x, [batch, base + bidx, cols], extra_mask=(bidx < limit)[:, None])
+        out[batch, :, :] = hl.dot(a * 2, b.transpose(-2, -1))
+    return out
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def signed_fragment_address(
+    x: torch.Tensor,
+    out: torch.Tensor,
+    read: _Constexpr,
+    masked: _Constexpr,
+    index_dtype: _Constexpr,
+    normalize: _Constexpr = False,
+) -> torch.Tensor:
+    for batch in hl.tile(x.size(0), block_size=1):
+        rows = hl.arange(x.size(1))
+        cols = hl.arange(x.size(2))
+        previous = rows - 1
+        if normalize:
+            previous = previous % x.size(1)
+        previous = previous.to(index_dtype)
+        plain = x[batch, rows, cols]
+        lhs = plain
+        if read:
+            if masked:
+                lhs = hl.load(
+                    x, [batch, rows - 1, cols], extra_mask=(rows != 1)[None, :, None]
+                )
+            else:
+                lhs = x[batch, previous, cols]
+        gram = hl.dot(lhs * 2, plain.transpose(-2, -1))
+        if read:
+            out[batch, rows, cols] = gram
+        elif masked:
+            hl.store(
+                out,
+                [batch, rows - 1, cols],
+                gram,
+                extra_mask=(rows != 1)[None, :, None],
+            )
+        else:
+            out[batch, previous, cols] = gram
+    return out

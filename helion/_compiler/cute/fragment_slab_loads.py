@@ -31,8 +31,8 @@ is loaded at ``base + start + i`` when ``start + i < vlen`` and the row is
 inside the tensor, else zero -- exactly what each masked member read.  The
 offset and the limit are read once per CTA ahead of the slab (readonly
 tensors at uniform subscripts, so the body's own loads of them see the same
-values); a member without the mask, or with a mask over another window or
-another limit, keeps its own walk.
+values). Unmasked members at the same offset form a separate slab and
+retain the ordinary lower and upper tensor bounds. Other masks keep the ordinary walk.
 """
 
 from __future__ import annotations
@@ -52,7 +52,6 @@ from ...language import memory_ops
 from ...language import view_ops
 from ..variable_origin import BlockSizeOrigin
 from ..variable_origin import GridOrigin
-from .emitters.memory_access import _cute_wrap_negative_index
 
 if TYPE_CHECKING:
     from ..compile_environment import CompileEnvironment
@@ -284,12 +283,8 @@ def scalar_load(
     if len(indices) != fake.ndim:
         return None
     exprs = []
-    for dim, index in enumerate(indices):
-        proxy = (
-            index.meta.get("val")
-            if isinstance(index, Node)
-            else _cute_wrap_negative_index(index, fake.shape[dim])
-        )
+    for index in indices:
+        proxy = index.meta.get("val") if isinstance(index, Node) else index
         expr = uniform_integer_expr(env, proxy)
         if expr is None:
             return None
@@ -386,14 +381,14 @@ def _describe(
     if isinstance(index, bool):
         return None
     if isinstance(index, int):
-        if index < 0:
-            size = _static_size(env, dim_size)
-            # A slab loads before the source access. If the coordinate is
-            # not known to be valid, keep the ordinary load's bounds guard.
-            if size is None or index < -size:
-                return None
-            index = _cute_wrap_negative_index(index, size)
-        return ("const", index)
+        extent = _static_size(env, dim_size)
+        if extent is None:
+            # A scalar on a non-varying dynamic axis can use the uniform
+            # address and its runtime bounds check.
+            return ("uniform", sympy.Integer(index))
+        if not -extent <= index < extent:
+            return None
+        return ("const", index + extent if index < 0 else index)
     if isinstance(index, Node):
         proxy = index.meta.get("val")
         if isinstance(proxy, torch.SymInt):
@@ -409,6 +404,8 @@ def _describe(
             return None
         window = static_window(index, captures)
         if window is not None:
+            # Only the chosen varying axis must fit the static union.
+            # Scalar common coordinates retain both of their tensor bounds.
             return ("window", window)
         runtime = runtime_window(env, index, captures, graphs)
         if runtime is not None:
