@@ -1,4 +1,4 @@
-"""Map a root's independent FP32 row sums to warps of an existing linear CTA.
+"""Map a root's independent FP32 row sums to warps of an existing CTA.
 
 The ordinary lowering still chooses the reduction chunks, addresses, masks,
 arithmetic and casts. Only its serial K and output coordinates change. The
@@ -9,7 +9,9 @@ from __future__ import annotations
 
 import ast
 from dataclasses import dataclass
+from math import prod
 from typing import TYPE_CHECKING
+from typing import cast
 
 import torch
 
@@ -27,6 +29,7 @@ from ._ast_pass_utils import call_path
 from ._ast_pass_utils import names_read
 from ._ast_pass_utils import parse_expr
 from ._ast_pass_utils import same_expr
+from .row_carry_terms import empty_if
 
 if TYPE_CHECKING:
     from ..device_function import DeviceFunction
@@ -166,7 +169,7 @@ def _thread(node: ast.AST) -> bool:
     )
 
 
-def _tensor(call: ast.Call, operation: str) -> str | None:
+def sweep_tensor_base(call: ast.Call, operation: str) -> str | None:
     if not isinstance(call.func, ast.Attribute) or call.func.attr != operation:
         return None
     ptr = call.func.value
@@ -181,13 +184,13 @@ def _tensor(call: ast.Call, operation: str) -> str | None:
     )
 
 
-def _pure(node: ast.AST, inputs: set[str]) -> bool:
+def pure_row_expression(node: ast.AST, inputs: set[str]) -> bool:
     for a in ast.walk(node):
         if isinstance(a, (ast.NamedExpr, ast.Lambda, ast.comprehension)):
             return False
         if isinstance(a, ast.Call):
             if (
-                (base := _tensor(a, "load")) is not None
+                (base := sweep_tensor_base(a, "load")) is not None
                 and not a.args
                 and not a.keywords
             ):
@@ -217,20 +220,22 @@ def _pure(node: ast.AST, inputs: set[str]) -> bool:
 
 
 @dataclass
-class _Sweep:
+class RowSweep:
     inner: ast.For
     index: ast.Assign
     finalize: ast.Call
 
 
-def _prove_sweep(
+def prove_row_sweep(
     init: ast.AST,
     outer: ast.For,
     finish: ast.AST,
     strategy: LoopedReductionStrategy,
     k: int,
     inputs: set[str],
-) -> _Sweep | None:
+    *,
+    chunk_multiple: int = WARP,
+) -> RowSweep | None:
     acc = assigned_name(init)
     chunk = strategy._loop_block_size
     if not (
@@ -244,8 +249,8 @@ def _prove_sweep(
         and isinstance(inner := outer.body[0], ast.For)
         and isinstance(inner.target, ast.Name)
         and not inner.orelse
-        and chunk >= WARP
-        and chunk % WARP == 0
+        and chunk >= chunk_multiple
+        and chunk % chunk_multiple == 0
         and k % chunk == 0
         and isinstance(inner.iter, ast.Call)
         and _name(inner.iter.func, "range")
@@ -292,7 +297,9 @@ def _prove_sweep(
     local = {n for n in names if n is not None}
     defined = {names[0]}
     for stmt in inner.body[1:]:
-        if not isinstance(stmt, ast.Assign) or not _pure(stmt.value, inputs):
+        if not isinstance(stmt, ast.Assign) or not pure_row_expression(
+            stmt.value, inputs
+        ):
             return None
         rhs = stmt.value
         if assigned_name(stmt) == acc:
@@ -310,7 +317,207 @@ def _prove_sweep(
         ):
             return None
         defined.add(assigned_name(stmt))
-    return _Sweep(inner, index, finalize)
+    return RowSweep(inner, index, finalize)
+
+
+@dataclass(frozen=True)
+class _RowWaves:
+    index: ast.Assign
+    mask: ast.Assign
+    base: ast.Name
+    lane: str
+    warps: int
+
+
+def _row_waves(
+    grid: DeviceGridState,
+    body: list[ast.AST],
+    row: int,
+    rows: int,
+    index: str,
+    mask: str,
+) -> _RowWaves | None:
+    """Prove a serial row sweep owns each element of a contiguous row tile once."""
+    if not grid.lane_loops or grid.deferred_vector_ops:
+        return None
+    needed, setup, spliced = grid._live_lane_setup(body)
+    loops = [(v, size) for v, size in grid.lane_loops if v in needed]
+    if len(loops) != 1 or len(setup) != 2 or spliced:
+        return None
+    lane, steps = loops[0]
+    if steps < 2 or rows % steps or grid.lane_loop_block_ids.get(lane) != {row}:
+        return None
+    warps = rows // steps
+    ix, pred = setup
+    if not (
+        isinstance(ix, ast.Assign)
+        and assigned_name(ix) == index
+        and isinstance(term := ix.value, ast.BinOp)
+        and isinstance(term.op, ast.Add)
+        and (last := _cast(term.right, "Int32")) is not None
+        and _name(last, lane)
+        and isinstance(offset := term.left, ast.BinOp)
+        and isinstance(offset.op, ast.Add)
+        and isinstance(base := offset.left, ast.Name)
+        and base.id == grid.strategy.grid_origin_var(row)
+        and isinstance(mul := offset.right, ast.BinOp)
+        and isinstance(mul.op, ast.Mult)
+        and _constant(mul.right, steps)
+        and (x := _cast(mul.left, "Int32")) is not None
+        and _thread(x)
+        and isinstance(pred, ast.Assign)
+        and assigned_name(pred) == mask
+        and isinstance(pred.value, ast.BoolOp)
+        and isinstance(pred.value.op, ast.And)
+        and len(pred.value.values) == 2
+        and isinstance(own := pred.value.values[0], ast.Compare)
+        and len(own.ops) == 1
+        and isinstance(own.ops[0], ast.Lt)
+        and same_expr(own.left, mul.left)
+        and _constant(own.comparators[0], warps)
+        and isinstance(bound := pred.value.values[1], ast.Compare)
+        and len(bound.ops) == 1
+        and isinstance(bound.ops[0], ast.Lt)
+        and _name(bound.left, index)
+        and isinstance(bound.comparators[0], ast.Constant)
+        and type(bound.comparators[0].value) is int
+        and bound.comparators[0].value > 0
+    ):
+        return None
+    # Grid origins and other hoisted coordinates must be ordinary arithmetic
+    # on uniform values. A call (including any intrinsic) or subscript could
+    # hide a second, thread-dependent coordinate or an observable load.
+    if any(
+        not isinstance(stmt, ast.Assign)
+        or not assigned_name(stmt)
+        or any(
+            isinstance(n, (ast.Call, ast.Subscript, ast.Attribute))
+            for n in ast.walk(stmt.value)
+        )
+        for stmt in [*grid.outer_prefix, *(grid.hoist_parent_statements or ())]
+    ) or any(lane in names_read(stmt) for stmt in body):
+        return None
+    return _RowWaves(ix, pred, base, lane, warps)
+
+
+def _single_row_owner(
+    fn: DeviceFunction,
+    grid: DeviceGridState,
+    body: list[ast.AST],
+    row: int,
+    index: str,
+) -> bool:
+    """An ordinary one-row tile already gives its whole row to this program ID."""
+    if not body or not isinstance(body[-1], ast.Expr) or fn.pid is None:
+        return False
+    shared_pid = fn.pid.shared_pid_var
+    needed, setup, spliced = grid._live_lane_setup(body)
+    if (
+        not shared_pid
+        or grid.outer_prefix
+        or grid.deferred_vector_ops
+        or setup
+        or spliced
+        or any(lane in needed for lane, _ in grid.lane_loops)
+    ):
+        return False
+    # Permit only ordinary scalar PID decoding. In particular, even a
+    # syntactically scalar row must not come from a lane, load or capture.
+    uniform = {a.name for a in fn.arguments} | {shared_pid, "cutlass", "cute"}
+    origin = grid.strategy.grid_origin_var(row)
+    exact_pid = {shared_pid}
+    units: set[str] = set()
+    proved_index = False
+    for stmt in grid.hoist_parent_statements or ():
+        if not isinstance(stmt, ast.Assign) or not (name := assigned_name(stmt)):
+            return False
+        reads = names_read(stmt.value)
+        if (
+            name in uniform
+            or not reads <= uniform
+            or any(
+                not isinstance(
+                    n,
+                    (
+                        ast.Name,
+                        ast.Load,
+                        ast.Constant,
+                        ast.BinOp,
+                        ast.Add,
+                        ast.Sub,
+                        ast.Mult,
+                        ast.FloorDiv,
+                        ast.Mod,
+                    ),
+                )
+                for n in ast.walk(stmt.value)
+            )
+        ):
+            return False
+        # The one-row grid coordinate is the local PID, possibly decoded
+        # through singleton outer axes. A modulo, scale, or non-unit
+        # division could cause two CTAs to elect a writer for the same row.
+        value = stmt.value
+        is_pid = isinstance(value, ast.Name) and value.id in exact_pid
+        if isinstance(value, ast.BinOp) and isinstance(value.op, ast.FloorDiv):
+            is_pid = (
+                isinstance(value.left, ast.Name)
+                and value.left.id in exact_pid
+                and (
+                    _constant(value.right, 1)
+                    or isinstance(value.right, ast.Name)
+                    and value.right.id in units
+                )
+            )
+        if is_pid:
+            exact_pid.add(name)
+        if _constant(value, 1) or isinstance(value, ast.Name) and value.id in units:
+            units.add(name)
+        if name == index:
+            proved_index = _name(value, origin) and origin in exact_pid
+        uniform.add(name)
+    if not proved_index:
+        return False
+    # Every value read by the transformed scalar code must be a uniform
+    # argument/coordinate, a value computed in this row, or the current K.
+    # A value left over from a previous K iteration or phase is not one.
+    # Subscripts are limited to layout-stride metadata: tensor reads must go
+    # through the ordinary load-inventory and destination-disjointness proof.
+    for position, stmt in enumerate(body):
+        for node in ast.walk(stmt):
+            if isinstance(node, ast.Subscript) and not (
+                isinstance(node.value, ast.Attribute)
+                and node.value.attr == "stride"
+                and isinstance(layout := node.value.value, ast.Attribute)
+                and layout.attr == "layout"
+                and isinstance(layout.value, ast.Name)
+                and isinstance(node.slice, ast.Constant)
+                and type(node.slice.value) is int
+            ):
+                return False
+        if isinstance(stmt, ast.For):
+            if not isinstance(stmt.target, ast.Name) or len(stmt.body) != 1:
+                return False
+            inner = stmt.body[0]
+            if not isinstance(inner, ast.For) or not isinstance(inner.target, ast.Name):
+                return False
+            acc = assigned_name(body[position - 1]) if position else None
+            local = uniform | {stmt.target.id, inner.target.id}
+            for term in inner.body:
+                if not isinstance(term, ast.Assign) or not (lhs := assigned_name(term)):
+                    return False
+                if (lhs in local and lhs != acc) or not names_read(term.value) <= local:
+                    return False
+                local.add(lhs)
+            # No K-local name escapes the sweep; prove_row_sweep separately
+            # checks the one loop-carried FP32 sum and its final shuffle.
+        elif isinstance(stmt, ast.Assign) and (lhs := assigned_name(stmt)):
+            if not names_read(stmt.value) <= uniform or lhs in uniform:
+                return False
+            uniform.add(lhs)
+        elif stmt is not body[-1] or not names_read(stmt) <= uniform:
+            return False
+    return True
 
 
 def partition_row_sums(
@@ -333,7 +540,7 @@ def partition_row_sums(
         isinstance(reduction, LoopedReductionStrategy)
         and reduction._thread_count == 1
         and 1 <= rows <= 32
-        and mask
+        and (mask or rows == 1)
         and not grid.outer_suffix
         and not grid.body_finalizers
         and not grid.vec_lane_wrappers
@@ -342,54 +549,80 @@ def partition_row_sums(
             for s in (grid.hoist_parent_statements or ())
             for n in ast.walk(s)
         )
-        and not any(_thread(n) for s in grid.lane_setup_statements for n in ast.walk(s))
     ):
         return
     # The only thread-dependent setup is the ordinary row coordinate and
     # its row mask. Its offset and unit stride prove injective row ownership.
-    setup = {
-        assigned_name(s): s for s in grid.outer_prefix if isinstance(s, ast.Assign)
-    }
-    ix, pred = setup.get(row_index), setup.get(mask)
-    if not (
-        isinstance(ix, ast.Assign)
-        and isinstance(ix.value, ast.BinOp)
-        and isinstance(ix.value.op, ast.Add)
-        and not any(_thread(n) for n in ast.walk(ix.value.left))
-        and isinstance(term := ix.value.right, ast.BinOp)
-        and isinstance(term.op, ast.Mult)
-        and _constant(term.right, 1)
-        and (x := _cast(term.left, "Int32")) is not None
-        and _thread(x)
-        and isinstance(pred, ast.Assign)
-        and isinstance(pred.value, ast.BoolOp)
-        and isinstance(pred.value.op, ast.And)
-        and any(
-            isinstance(v, ast.Compare)
-            and len(v.ops) == 1
-            and isinstance(v.ops[0], ast.Lt)
-            and same_expr(v.left, term.left)
-            and _constant(v.comparators[0], rows)
-            for v in pred.value.values
-        )
-        and sum(_thread(n) for s in grid.outer_prefix for n in ast.walk(s)) == 2
-    ):
-        return
+    single = rows == 1 and mask is None
+    waves = _row_waves(grid, body, row, rows, row_index, mask) if mask else None
+    if single:
+        ir = cg.host_function.device_ir
+        if any(
+            axis != row
+            and (
+                type(env.block_sizes[axis].size) is not int
+                or env.block_sizes[axis].size != 1
+            )
+            for axis in ir.grid_block_ids[ir.root_ids.index(root.graph_id)]
+        ) or not _single_row_owner(fn, grid, body, row, row_index):
+            return
+        ix = pred = None
+    elif waves is None:
+        assert mask
+        setup = {
+            assigned_name(s): s for s in grid.outer_prefix if isinstance(s, ast.Assign)
+        }
+        ix, pred = setup.get(row_index), setup.get(mask)
+        if not (
+            not any(_thread(n) for s in grid.lane_setup_statements for n in ast.walk(s))
+            and isinstance(ix, ast.Assign)
+            and isinstance(ix.value, ast.BinOp)
+            and isinstance(ix.value.op, ast.Add)
+            and not any(_thread(n) for n in ast.walk(ix.value.left))
+            and isinstance(term := ix.value.right, ast.BinOp)
+            and isinstance(term.op, ast.Mult)
+            and _constant(term.right, 1)
+            and (x := _cast(term.left, "Int32")) is not None
+            and _thread(x)
+            and isinstance(pred, ast.Assign)
+            and isinstance(pred.value, ast.BoolOp)
+            and isinstance(pred.value.op, ast.And)
+            and any(
+                isinstance(v, ast.Compare)
+                and len(v.ops) == 1
+                and isinstance(v.ops[0], ast.Lt)
+                and same_expr(v.left, term.left)
+                and _constant(v.comparators[0], rows)
+                for v in pred.value.values
+            )
+            and sum(_thread(n) for s in grid.outer_prefix for n in ast.walk(s)) == 2
+        ):
+            return
+    else:
+        ix, pred = waves.index, waves.mask
     terminal = body[-1] if body else None
-    if not (
-        isinstance(terminal, ast.If)
+    if single:
+        expr = terminal
+    elif (
+        mask
+        and isinstance(terminal, ast.If)
         and _name(terminal.test, mask)
         and not terminal.orelse
         and len(terminal.body) == 1
-        and isinstance(expr := terminal.body[0], ast.Expr)
+    ):
+        expr = terminal.body[0]
+    else:
+        return
+    if not (
+        isinstance(expr, ast.Expr)
         and isinstance(store := expr.value, ast.Call)
-        and (output := _tensor(store, "store"))
+        and (output := sweep_tensor_base(store, "store"))
         and len(store.args) == 1
         and not store.keywords
     ):
         return
     inputs: set[str] = set()
-    specs: list[_Sweep] = []
+    specs: list[RowSweep] = []
     ptr = store.func
     # The emitted address must really be base + row * its stride, with no
     # dependence on row in the other dimensions. The FX index proof alone
@@ -408,7 +641,7 @@ def partition_row_sums(
         and isinstance(stride.slice, ast.Constant)
         and type(stride.slice.value) is int
         and fn.proven_tensor_stride_values().get((output, stride.slice.value)) == 1
-        and _pure(addr, inputs)
+        and pure_row_expression(addr, inputs)
         and not inputs
     ):
         return
@@ -419,7 +652,7 @@ def partition_row_sums(
             if (
                 not 0 < i < len(body) - 2
                 or (
-                    sw := _prove_sweep(
+                    sw := prove_row_sweep(
                         body[i - 1], stmt, body[i + 1], reduction, k, inputs
                     )
                 )
@@ -437,12 +670,12 @@ def partition_row_sums(
         if i not in skipped and not (
             isinstance(stmt, ast.Assign)
             and assigned_name(stmt)
-            and _pure(stmt.value, inputs)
+            and pure_row_expression(stmt.value, inputs)
             and not names_read(stmt.value) & inner_locals
         ):
             return
     if (
-        not _pure(store.args[0], inputs)
+        not pure_row_expression(store.args[0], inputs)
         or names_read(store.args[0]) & inner_locals
         or any(
             frozenset((output, name)) not in fn.proven_disjoint_tensor_pairs()
@@ -458,8 +691,24 @@ def partition_row_sums(
                 return parse_expr("cute.arch.thread_idx()[0] // 32")
             return self.generic_visit(node)
 
-    for s in (ix, pred):
-        WarpCoordinate().visit(s)
+    if single:
+        actual_lane = "cute.arch.lane_idx()"
+    elif waves is None:
+        assert ix is not None and pred is not None
+        for s in (ix, pred):
+            WarpCoordinate().visit(s)
+        actual_lane = "cute.arch.thread_idx()[0] % 32"
+    else:
+        # Warp/lane coordinates are linear across all CTA axes. The existing
+        # loop still iterates exactly rows / warps times; each warp owns one
+        # row per iteration and only its elected lane may publish it.
+        waves.index.value = parse_expr(
+            f"{waves.base.id} + cutlass.Int32(cute.arch.warp_idx()) + "
+            f"cutlass.Int32({waves.lane}) * {waves.warps}"
+        )
+        assert isinstance(waves.mask.value, ast.BoolOp)
+        waves.mask.value.values[0] = parse_expr(f"cute.arch.warp_idx() < {waves.warps}")
+        actual_lane = "cute.arch.lane_idx()"
     for sw in specs:
         assert isinstance(sw.inner.iter, ast.Call)
         sw.inner.iter.args[0] = ast.Constant(reduction._loop_block_size // WARP)
@@ -467,25 +716,62 @@ def partition_row_sums(
             sw.index.value.left, ast.BinOp
         )
         assert isinstance(sw.index.value.right, ast.BinOp)
-        sw.index.value.left.right = parse_expr(
-            "cutlass.Int32(cute.arch.thread_idx()[0] % 32)"
-        )
+        sw.index.value.left.right = parse_expr(f"cutlass.Int32({actual_lane})")
         sw.index.value.right.right = ast.Constant(WARP)
         sw.finalize.keywords[0].value = ast.Constant(WARP)
+    state = fn.cute_state.lanes
+    if single:
+        assert isinstance(terminal, ast.stmt)
+        leader = empty_if(f"{actual_lane} == 0")
+        leader.body = [terminal]
+        warp = empty_if("cute.arch.warp_idx() == 0")
+        warp.body = [*cast("list[ast.stmt]", body[:-1]), leader]
+        body[:] = [warp]
+        state.has_singleton_warp_rows = True
+        return
+    assert isinstance(terminal, ast.If)
     terminal.test = ast.BoolOp(
         op=ast.And(),
-        values=[terminal.test, parse_expr("cute.arch.thread_idx()[0] % 32 == 0")],
+        values=[terminal.test, parse_expr(f"{actual_lane} == 0")],
     )
-    state = fn.cute_state.lanes
-    state.warp_row_threads = max(state.warp_row_threads, WARP * rows)
+    if waves is None:
+        state.warp_row_threads = max(state.warp_row_threads, WARP * rows)
+    else:
+        state.warp_row_wave_counts.add(waves.warps)
 
 
 def validate_row_launch(fn: DeviceFunction, dims: tuple[int, int, int] | None) -> None:
     """The emitted partition and all its peers must actually share this launch."""
-    need = fn.cute_state.lanes.warp_row_threads
+    state = fn.cute_state.lanes
+    if state.has_singleton_warp_rows:
+        launch = state.launch_block
+        if (
+            launch is None
+            or dims != launch
+            or not WARP <= prod(launch) <= 1024
+            or prod(launch) % WARP
+        ):
+            raise exc.InvalidConfig(
+                f"{KEY} needs a full physical warp for each scalar row"
+            )
+        if not state.warp_row_wave_counts and not state.warp_row_threads:
+            return
+    if state.warp_row_wave_counts:
+        if (
+            dims is None
+            or dims != state.launch_block
+            or {prod(dims)} != {WARP * count for count in state.warp_row_wave_counts}
+        ):
+            raise exc.InvalidConfig(
+                f"{KEY} needs the exact proved number of complete physical warps"
+            )
+        if not state.warp_row_threads:
+            return
+    need = state.warp_row_threads
     if (
         not need
         or dims is None
+        or dims != state.launch_block
         or dims[1:] != (1, 1)
         or dims[0] < need
         or dims[0] % WARP

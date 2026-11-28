@@ -38,6 +38,9 @@ from ..tcgen05_flat_grouped_config import CONFIG_KEYS as GROUPED_RNA_CONFIG_KEYS
 
 GRID_INIT_KEY = "cute_in_kernel_grid_init"
 COMPACT_ROWS_KEY = "cute_fragment_compact_rows"
+REUSE_INDEXED_INPUT_KEY = "cute_reuse_indexed_row_input"
+INDEXED_ROW_EPILOGUE_KEY = "cute_indexed_row_epilogue"
+STAGED_INDEXED_ROWS_KEY = "cute_staged_indexed_rows"
 ROW_DOT_KEY = "cute_warp_row_dot"
 
 # -- recurrence / scan / top-k families (keys owned by their emitters) --------
@@ -214,6 +217,11 @@ CUTE_MISC_SCHEDULE_KEYS: tuple[str, ...] = (
     "cute_warp_fp32_redux",
     GRID_INIT_KEY,
     "cute_warp_row_reductions",
+    "cute_single_row_publication",
+    "cute_parallel_row_sum",
+    INDEXED_ROW_EPILOGUE_KEY,
+    REUSE_INDEXED_INPUT_KEY,
+    STAGED_INDEXED_ROWS_KEY,
     ROW_DOT_KEY,
     "cute_register_tile_warp_fold",
     "cute_register_tile_cooperative_fold",

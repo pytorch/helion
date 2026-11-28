@@ -153,6 +153,9 @@ def promote_partitioned_outputs_pass(
     env.config_spec.cute_fragment_cta_requires_flat = (
         len(device_ir.phases) > 1 and env_state.fission_plan is None
     )
+    env.config_spec.cute_explicit_local_barrier = (
+        env.has_barrier and len(device_ir.phases) > 1 and env.process_group_name is None
+    )
     if env.has_barrier and "flat" in env.config_spec.allowed_pid_types:
         from ...language.barrier import BARRIER_PID_TYPE_REASON
         from .ordered_phases import ordered_phases_supported

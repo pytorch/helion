@@ -209,6 +209,37 @@ def test_interleaved_grid_restarts_at_each_dependency_phase():
                 assert eval(index, {"__builtins__": {}}, context) == worker + i * 148
 
 
+@pytest.mark.parametrize("explicit", [False, True])
+def test_shared_selection_network_requires_its_barrier_phase(explicit):
+    x = torch.zeros((7, 62), dtype=torch.int32)
+    payload = torch.arange(62, dtype=x.dtype)
+    out = torch.empty((7, 2, 4), dtype=x.dtype)
+    with cpu_render_target(fake_device_sm_count=148, smem_budget_bytes=232448):
+        bound = (
+            cpu_bind(explicit_direct_selection, (x, payload, out, "direct"))
+            if explicit
+            else cpu_bind(grouped_selection_after_producer, (x, payload, out, "direct"))
+        )
+        spec = bound.config_spec
+        assert spec.cute_shared_selection_network_root_ids == {
+            bound.host_function.device_ir.root_ids[-1]
+        }
+        config = routed_phase_config(8, warp=False)
+        if explicit:
+            del config.config["cross_loop_pipeline"]
+        config.config["cute_fragment_topk_network"] = True
+        source = bound.to_code(config)
+        assert (
+            "fragment_topk_keys" in source and "for fragment_topk_column" not in source
+        )
+        if not explicit:
+            implicit = dict(config)
+            del implicit["cross_loop_pipeline"]
+            assert spec.normalized_config(implicit) == spec.normalized_config(config)
+            with pytest.raises(exc.InvalidConfig, match="complete fragment top-k"):
+                spec.normalize(config.config | {"cross_loop_pipeline": "none"})
+
+
 @pytest.mark.parametrize("mode", ["direct", "reduced_index", "nested_reduced_index"])
 def test_grouped_selection_keeps_refusal_for_an_aliased_payload(mode):
     x = torch.zeros((7, 62), dtype=torch.int32)
@@ -225,6 +256,10 @@ def test_grouped_selection_keeps_refusal_for_an_aliased_payload(mode):
                 g.key == "cute_fragment_topk_network"
                 for g in bound.config_spec.compiler_coverage_groups
             )
+            network = routed_phase_config(8, warp=False)
+            network.config["cute_fragment_topk_network"] = True
+            with pytest.raises(exc.InvalidConfig, match="complete fragment top-k"):
+                bound.to_code(network)
         with pytest.raises(exc.BackendUnsupported, match="topk output"):
             bound.to_code(routed_phase_config(8, warp=False))
         if mode != "direct":
@@ -263,6 +298,35 @@ def test_shared_values_only_int64_topk_cannot_own_the_cta() -> None:
         with pytest.raises(exc.InvalidConfig, match="cute_fragment_cta_topk"):
             spec.normalized_config(
                 helion.Config.from_dict(warp.config | {"cute_fragment_cta_topk": True})
+            )
+
+
+@helion.kernel(backend="cute", static_shapes=True)
+def _projected_topk_add(x: torch.Tensor) -> torch.Tensor:
+    rows, columns = x.shape
+    scores = torch.empty_like(x)
+    out = torch.empty((rows, 4), dtype=x.dtype, device=x.device)
+    for row, col in hl.tile([rows, columns], block_size=[1, None]):
+        scores[row, col] = x[row, col] * 3 - 1
+    hl.barrier()
+    for row in hl.tile(rows, block_size=1):
+        out[row.begin, :] = torch.topk(scores[row.begin, :], 4).values + 1
+    return out
+
+
+def test_projected_selection_coordinates_keep_the_flat_cta_owner() -> None:
+    with cpu_render_target(fake_device_sm_count=148):
+        bound = cpu_bind(_projected_topk_add, (torch.empty(2, 32, dtype=torch.int64),))
+        config = {
+            "block_sizes": [32],
+            "cute_fragment_topk_network": True,
+            "cute_fragment_cta_topk": True,
+        }
+        flat = bound.to_code(helion.Config.from_dict(config | {"pid_type": "flat"}))
+        assert "fragment_cta_sort_keys" in stage_sources(flat)[-1]
+        with pytest.raises(exc.InvalidConfig, match="cute_fragment_cta_topk"):
+            bound.config_spec.normalized_config(
+                config | {"pid_type": "persistent_blocked"}
             )
 
 

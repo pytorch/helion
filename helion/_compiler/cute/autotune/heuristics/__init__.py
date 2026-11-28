@@ -43,6 +43,8 @@ from ...split_k_cluster_config import FINALIZER_KEY
 from ...tcgen05_constants import TCGEN05_CONSUMER_REGS_CONFIG_KEY
 from ...tcgen05_constants import TCGEN05_WARP_REGISTER_REALLOCATION_CONFIG_KEY
 from ..config_keys import GRID_INIT_KEY
+from ..config_keys import INDEXED_ROW_EPILOGUE_KEY
+from ..config_keys import REUSE_INDEXED_INPUT_KEY
 from ..fragment_knobs import CuteFragmentAtomicAggregationHeuristic
 from ..fragment_knobs import CuteFragmentAtomicConsumerFusionHeuristic
 from ..fragment_knobs import CuteFragmentBatchedLoadsHeuristic
@@ -384,12 +386,39 @@ def register_seed_facts(
     """Backend-wide correctness facts registered before any seed is built."""
     # Imported here: computed_fragment reaches device_ir, which needs the
     # ``helion`` package this registry is imported while initializing.
+    from ...analysis.indexed_row_epilogue import indexed_row_epilogue
+    from ...analysis.indexed_row_phases import indexed_row_phases
     from ...computed_fragment import computed_fragment_specialization_facts
 
     # The appended families outside the ranked tuple register their facts
     # here, the ranked ones through their own ``register_facts``.
+    from ...single_row_publication import publication_roots
     from ...warp_row_partition import row_sum_roots
 
+    if (
+        env.config_spec.cute_staged_indexed_row_axes
+        and device_ir.host_function is not None
+    ):
+        with device_ir.host_function:
+            sites = indexed_row_phases(env, device_ir)
+            env.config_spec.cute_reusable_row_inputs = {
+                site.row_axis: site.invariant_rows
+                for site in sites
+                if site.invariant_rows
+            }
+            env.config_spec.cute_indexed_row_epilogue_axes = tuple(
+                (
+                    site.row_axis,
+                    *device_ir.task_families[
+                        device_ir.root_ids.index(pair.consumer)
+                    ].logical_axis_order,
+                )
+                for site in sites
+                if (pair := indexed_row_epilogue(env, device_ir, site)) is not None
+            )
+    env.config_spec.cute_single_row_publication_roots = publication_roots(
+        env, device_ir
+    )
     env.config_spec.cute_warp_row_reduction_roots = {
         root: (fact.row_id, fact.k_id, fact.length, fact.reductions)
         for root, fact in row_sum_roots(env, device_ir).items()
@@ -407,9 +436,18 @@ def postprocess_seed_configs(
     The sequence is the historical one: each step sees the complete prefix the
     steps before it produced and appends after it.
     """
+    from ..indexed_row_epilogue import pointwise_epilogue_carrier
+    from ..indexed_row_epilogue import reusable_row_axes
+    from ..indexed_row_epilogue import supports_row_epilogue
+    from .cute_fragment_topk_network import KEY as NETWORK_KEY
+    from .cute_fragment_topk_network import active_network_roots
+    from .cute_row_publication import add_publication_seeds
+    from .cute_staged_indexed_rows import add_indexed_row_seed
+    from .cute_warp_row_partition import add_singleton_row_seed
     from .cute_warp_row_partition import insert_warp_row_seed
 
     configs = insert_warp_row_seed(env, device_ir, configs)
+    configs = add_indexed_row_seed(env, configs)
     configs = add_host_sum_seeds(env, configs)
     configs = add_signed_bitfield_seeds(env, configs)
     configs = interleave_grouped_rna_seeds(dedupe_configs(configs))
@@ -546,15 +584,59 @@ def postprocess_seed_configs(
         env.config_spec.autotuner_heuristics.append(
             CuteRowStreamRetentionHeuristic.name
         )
-    # Keep the ordinary counter as a candidate. One representative config
-    # is enough to try initializing that counter in the cooperative kernel.
-    for carrier in configs:
-        if grid_init_carrier(env.config_spec, carrier.config):
-            configs.append(
-                Config.from_dict(deepcopy(carrier.config) | {GRID_INIT_KEY: True})
-            )
-            env.config_spec.autotuner_heuristics.append("in_kernel_grid_init")
-            break
+    grid_carrier = next(
+        (seed for seed in configs if grid_init_carrier(env.config_spec, seed.config)),
+        None,
+    )
+    configs = add_publication_seeds(env, device_ir, configs)
+    # Append one twin. Prefer the fully parallel carrier when present and
+    # retain every older ordinary seed, including the independent publisher.
+    derived_epilogue: Config | None = None
+    if env.config_spec.cute_indexed_row_epilogue_axes:
+        candidates = sorted(configs, key=lambda c: bool(c.get("cute_parallel_row_sum")))
+        for seed in reversed(candidates):
+            if supports_row_epilogue(env.config_spec, seed):
+                configs.append(
+                    Config.from_dict(seed.config | {INDEXED_ROW_EPILOGUE_KEY: True})
+                )
+                break
+        else:
+            # A model ending after its down projection has no later RMS root
+            # from which to inherit the scalar consumer geometry.
+            for seed in reversed(candidates):
+                carrier = pointwise_epilogue_carrier(env.config_spec, seed)
+                if carrier is not None:
+                    derived_epilogue = Config.from_dict(
+                        carrier | {INDEXED_ROW_EPILOGUE_KEY: True}
+                    )
+                    break
+    configs = add_singleton_row_seed(env, device_ir, configs)
+    if env.config_spec.cute_reusable_row_inputs:
+        for seed in reversed(configs):
+            if reusable_row_axes(env.config_spec, seed):
+                reused = Config.from_dict(seed.config | {REUSE_INDEXED_INPUT_KEY: True})
+                configs.append(reused)
+                # A deferred top-k witness can land on an older scalar carrier.
+                # Offer the shared selection on the same tiled projection, so
+                # both sides of the scheduling tradeoff enter the population.
+                if not reused.get(NETWORK_KEY) and (
+                    active_network_roots(env.config_spec, reused)
+                    & env.config_spec.cute_shared_selection_network_root_ids
+                ):
+                    configs.append(
+                        Config.from_dict(reused.config | {NETWORK_KEY: True})
+                    )
+                break
+    if derived_epilogue is not None:
+        # Keep this independently derived choice after the pre-existing
+        # producer/reuse seeds. Its addition must not silently change their
+        # carriers or introduce a top-k dependency into tail-peel coverage.
+        configs.append(derived_epilogue)
+    if grid_carrier is not None:
+        configs.append(
+            Config.from_dict(deepcopy(grid_carrier.config) | {GRID_INIT_KEY: True})
+        )
+        env.config_spec.autotuner_heuristics.append("in_kernel_grid_init")
     return configs
 
 

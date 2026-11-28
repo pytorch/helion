@@ -359,6 +359,13 @@ these labelled lines.
   tensor argument used directly as the index: an out-of-range load returns
   zero, and an out-of-range store or atomic does not write. This does not
   extend to an index loaded explicitly with `idx[()]`.
+  With CuTe's
+  `cute_staged_indexed_rows` enabled, a matched BF16 projection bank is
+  an exception: its scalar fallback wraps in-range negative flattened row
+  indices and checks both ends, even if no site can use shared staging.
+  If the compiler cannot identify the emitted scalar phase, it rejects
+  the staged configuration. Other indexed reads do not gain this guard. See
+  `test/test_cute_staged_indexed_rows.py::test_fixed_rows_replay_signed_inputs_and_negative_bank_indices`.
 
   ```python
   for tile in hl.tile(out.size(0)):

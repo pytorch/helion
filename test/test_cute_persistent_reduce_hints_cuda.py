@@ -8,6 +8,12 @@ from DRAM after every L2 flush while the Triton backend's ``evict_last`` row
 stayed resident.  Every hinted packet width must load every element exactly
 once, and the reduction sized for the launched block (one group, the serial
 fold at <= 8 warps) must match the reference.
+
+The whole-row cases check publication over the physical CTA and, when
+selected, a cross-warp FP32 sum.
+
+The complete-row publication test also validates the resulting physical
+thread coordinates when the forward has multiple persistent roots.
 """
 
 from __future__ import annotations
@@ -288,3 +294,73 @@ def test_the_cluster_exchange_sums_its_partials_as_a_tree() -> None:
         " cluster_n=4)",
         lambda partial: partial * 8.0,
     )
+
+
+@helion.kernel(backend="cute", static_shapes=True)
+def _write_whole_row(x: torch.Tensor, out: torch.Tensor, peer: torch.Tensor) -> None:
+    for _row in hl.tile(1):
+        out[0, :] = x[0, :] + x[0, :].sum()
+    hl.barrier()
+    for i, j in hl.tile([peer.size(0), peer.size(1)]):
+        peer[i, j] = peer[i, j] + 1
+
+
+@skipIfNotCUDA()
+@pytest.mark.parametrize(("x_lanes", "y_lanes"), [(32, 1), (4, 32)])
+def test_single_writer_publishes_all_guarded_columns(
+    x_lanes: int, y_lanes: int
+) -> None:
+    x = torch.arange(256, device=DEVICE, dtype=torch.float32).view(1, -1) - 100
+    arena = torch.full((258,), -1111.0, device=DEVICE)
+    out = arena[1:-1].view_as(x)
+    peer = torch.zeros((32, 32), device=DEVICE)
+    cfg = helion.Config(
+        block_sizes=[1, x_lanes, y_lanes],
+        num_threads=[1, x_lanes, y_lanes, 1],
+        reduction_loops=[16],
+        cute_single_row_publication=True,
+    )
+    run = _write_whole_row.bind((x, out, peer)).compile_config(cfg)
+    for sign in (1, -1):
+        x.mul_(sign)
+        out.fill_(float("nan"))
+        peer.zero_()
+        run(x, out, peer)
+        torch.testing.assert_close(out, x + x.sum(), rtol=0, atol=0)
+        assert (peer == 1).all().item()
+        assert arena[0].item() == arena[-1].item() == -1111
+
+
+@helion.kernel(backend="cute", static_shapes=True)
+def _published_row_sum(x: torch.Tensor) -> torch.Tensor:
+    staged = torch.empty_like(x)
+    out = torch.empty_like(x)
+    for k in hl.tile(x.size(1)):
+        staged[0, k] = x[0, k] + 1.0
+    hl.barrier()
+    for _row in hl.tile(1):
+        values = staged[0, :]
+        out[0, :] = values + values.sum()
+    return out
+
+
+@skipIfNotCUDA()
+def test_published_sum_includes_every_warp_and_every_sweep() -> None:
+    # Four warps traverse this row in four sweeps. Each has a different,
+    # exactly representable contribution; repeating warp zero is observable.
+    k = torch.arange(512, device=DEVICE)
+    x = (k % 32 + (k // 32) % 4 - 2 + 4 * (k // 128)).float().reshape(1, -1)
+    bound = _published_row_sum.bind((x,))
+    cfg = helion.Config(
+        block_sizes=[128, 1],
+        num_threads=[128, 1, 1],
+        reduction_loops=[32],
+        pid_type="persistent_interleaved",
+        cute_single_row_publication=True,
+        cute_parallel_row_sum=True,
+    )
+    run = bound.compile_config(cfg)
+    for scale in (1, -2):
+        x.mul_(scale)
+        staged = x + 1
+        torch.testing.assert_close(run(x), staged + staged.sum(), rtol=0, atol=0)

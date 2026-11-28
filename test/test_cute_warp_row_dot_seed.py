@@ -25,7 +25,7 @@ from helion._compiler.cute.autotune.heuristics.cute_warp_row_partition import (
 from helion._compiler.cute.autotune.search_surface import normalize_after_sequences
 from helion._compiler.cute.backend import CuteBackend
 from helion._compiler.cute.warp_row_dot_spec import row_dot_geometry
-from helion._compiler.cute.warp_row_partition import _pure
+from helion._compiler.cute.warp_row_partition import pure_row_expression
 from helion._testing.cute_codegen import cpu_bind
 from helion._testing.cute_codegen import cpu_render_target
 from helion.autotuner.config_generation import ConfigGeneration
@@ -73,17 +73,17 @@ def test_relaxed_carries_bind_only_complete_rows_and_k_tiles() -> None:
         # The 768-row site now takes its own original walk; the independent
         # complete down projection stays legal.
         normalize_after_sequences(spec, bad, fix_invalid=False)
-        assert _pure(
+        assert pure_row_expression(
             ast.parse("cute.math.div(x, y, approx=True, ftz=True)", mode="eval").body,
             set(),
         )
-        assert not _pure(
+        assert not pure_row_expression(
             ast.parse(
                 "cute.math.div(touch_memory(), y, approx=True, ftz=True)", mode="eval"
             ).body,
             set(),
         )
-        assert not _pure(
+        assert not pure_row_expression(
             ast.parse(
                 "cute.math.div(x, y, approx=True, ftz=touch_memory())", mode="eval"
             ).body,

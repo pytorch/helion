@@ -454,6 +454,7 @@ def test_only_proven_pruned_owner_is_rebound(mode: str) -> None:
             validate_lane_reduce_owners(body)
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(
     "mode",
     [

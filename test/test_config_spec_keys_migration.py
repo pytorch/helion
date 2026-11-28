@@ -48,7 +48,7 @@ _BASE_VALID_KEYS = """
     cute_collective_copy cute_collective_epilogue cute_collective_mma
     cute_collective_native_seeded cute_collective_operand_packets
     cute_collective_recipe cute_collective_stages cute_collective_static_layouts
-    cute_collective_tmem_a cute_collective_tmem_seed cute_compiler_pipeline cute_defer_tile_reduce
+    cute_collective_tmem_a cute_collective_tmem_seed cute_compiler_pipeline cute_defer_tile_reduce cute_staged_indexed_rows cute_indexed_row_epilogue cute_reuse_indexed_row_input
     cute_exact_div_form
     cute_flash_bias_form cute_flash_bias_stage cute_flash_bwd_aux_smem
     cute_flash_bwd_bias_fold cute_flash_bwd_ds_tmem cute_flash_bwd_exp2_emu
@@ -162,7 +162,7 @@ _BASE_VALID_KEYS = """
     cute_unpadded_rows
     cute_vector_packet_unroll
     cute_vector_widths cute_vloop_sink cute_warp_aggregated_atomics
-    cute_warp_fp32_redux cute_fragment_compact_rows cute_warp_row_dot cute_warp_row_reductions cute_wide_packet_hints cute_warp_mma_warps epilogue_subtile flatten_loops
+    cute_warp_fp32_redux cute_fragment_compact_rows cute_warp_row_dot cute_warp_row_reductions cute_single_row_publication cute_parallel_row_sum cute_wide_packet_hints cute_warp_mma_warps epilogue_subtile flatten_loops
     host_tensor_descriptors indexing l2_groupings load_cache_modifiers
     load_eviction_policies loop_orders matrix_instr_nonkdim maxnreg metal_matmul
     metal_tabulate_max_entries num_ctas num_sm_multiplier num_stages num_threads num_warps occupancy
@@ -228,7 +228,7 @@ _BASE_BACKEND_SPECIFIC_KEYS = """
     cute_collective_copy cute_collective_epilogue cute_collective_mma
     cute_collective_native_seeded cute_collective_operand_packets
     cute_collective_recipe cute_collective_stages cute_collective_static_layouts
-    cute_collective_tmem_a cute_collective_tmem_seed cute_compiler_pipeline cute_defer_tile_reduce
+    cute_collective_tmem_a cute_collective_tmem_seed cute_compiler_pipeline cute_defer_tile_reduce cute_staged_indexed_rows cute_indexed_row_epilogue cute_reuse_indexed_row_input
     cute_exact_div_form
     cute_flash_bias_form cute_flash_bias_stage cute_flash_bwd_aux_smem
     cute_flash_bwd_bias_fold cute_flash_bwd_ds_tmem cute_flash_bwd_exp2_emu
@@ -342,7 +342,7 @@ _BASE_BACKEND_SPECIFIC_KEYS = """
     cute_unpadded_rows
     cute_vector_packet_unroll
     cute_vector_widths cute_vloop_sink cute_warp_aggregated_atomics
-    cute_warp_fp32_redux cute_fragment_compact_rows cute_warp_row_dot cute_warp_row_reductions cute_wide_packet_hints cute_warp_mma_warps host_tensor_descriptors
+    cute_warp_fp32_redux cute_fragment_compact_rows cute_warp_row_dot cute_warp_row_reductions cute_single_row_publication cute_parallel_row_sum cute_wide_packet_hints cute_warp_mma_warps host_tensor_descriptors
     load_cache_modifiers matrix_instr_nonkdim metal_matmul
     metal_tabulate_max_entries num_ctas num_threads occupancy
     pallas_emit_pipeline_group_size pallas_fold_dot_lhs_cast
@@ -403,7 +403,7 @@ _BASE_CUTE_IMPLICIT_DEFAULT_KEYS = """
     cute_collective_copy cute_collective_epilogue cute_collective_mma
     cute_collective_native_seeded cute_collective_operand_packets
     cute_collective_recipe cute_collective_stages cute_collective_static_layouts
-    cute_collective_tmem_a cute_collective_tmem_seed cute_compiler_pipeline cute_defer_tile_reduce
+    cute_collective_tmem_a cute_collective_tmem_seed cute_compiler_pipeline cute_defer_tile_reduce cute_staged_indexed_rows cute_indexed_row_epilogue cute_reuse_indexed_row_input
     cute_exact_div_form
     cute_fmnmx_extrema cute_fp32_dot cute_fragment_atomic_aggregation
     cute_fragment_atomic_consumer_fusion cute_fragment_batched_loads
@@ -451,7 +451,7 @@ _BASE_CUTE_IMPLICIT_DEFAULT_KEYS = """
     cute_store_policy cute_tail_peel cute_topk_coarse_keys
     cute_topk_key_recovery cute_uniform_lane_compares cute_unpadded_rows
     cute_vector_packet_unroll cute_vloop_sink
-    cute_warp_aggregated_atomics cute_warp_fp32_redux cute_fragment_compact_rows cute_warp_row_dot cute_warp_row_reductions cute_wide_packet_hints flatten_loops indexing
+    cute_warp_aggregated_atomics cute_warp_fp32_redux cute_fragment_compact_rows cute_warp_row_dot cute_warp_row_reductions cute_single_row_publication cute_parallel_row_sum cute_wide_packet_hints flatten_loops indexing
     l2_groupings load_eviction_policies loop_orders maxnreg num_sm_multiplier
     num_stages num_warps pid_type range_flattens range_multi_buffers
     range_num_stages range_unroll_factors range_warp_specializes static_ranges
@@ -469,7 +469,7 @@ _BASE_CUTE_ACCEPTED = """
     cute_collective_copy cute_collective_epilogue cute_collective_mma
     cute_collective_native_seeded cute_collective_operand_packets
     cute_collective_recipe cute_collective_stages cute_collective_static_layouts
-    cute_collective_tmem_a cute_collective_tmem_seed cute_compiler_pipeline cute_defer_tile_reduce
+    cute_collective_tmem_a cute_collective_tmem_seed cute_compiler_pipeline cute_defer_tile_reduce cute_staged_indexed_rows cute_indexed_row_epilogue cute_reuse_indexed_row_input
     cute_exact_div_form
     cute_flash_bias_form cute_flash_bias_stage cute_flash_bwd_aux_smem
     cute_flash_bwd_bias_fold cute_flash_bwd_ds_tmem cute_flash_bwd_exp2_emu
@@ -583,7 +583,7 @@ _BASE_CUTE_ACCEPTED = """
     cute_unpadded_rows
     cute_vector_packet_unroll
     cute_vector_widths cute_vloop_sink cute_warp_aggregated_atomics
-    cute_warp_fp32_redux cute_fragment_compact_rows cute_warp_row_dot cute_warp_row_reductions cute_wide_packet_hints cute_warp_mma_warps epilogue_subtile flatten_loops indexing
+    cute_warp_fp32_redux cute_fragment_compact_rows cute_warp_row_dot cute_warp_row_reductions cute_single_row_publication cute_parallel_row_sum cute_wide_packet_hints cute_warp_mma_warps epilogue_subtile flatten_loops indexing
     l2_groupings load_eviction_policies loop_orders maxnreg num_sm_multiplier
     num_stages num_threads num_warps pallas_internal_scratch pid_type range_flattens
     range_multi_buffers range_num_stages range_unroll_factors range_warp_specializes

@@ -13,6 +13,7 @@ from ._ast_pass_utils import _PURE_RELOCATABLE_NAMES
 from ._ast_pass_utils import _is_proven_relocatable_assignment
 from ._ast_pass_utils import _is_proven_relocatable_call
 from ._ast_pass_utils import assigned_name
+from ._ast_pass_utils import block_uniform_scalar
 from ._ast_pass_utils import call_path_str
 from .lane_loops.markers import _dtype_ctor_from_identity
 from .lane_loops.markers import _find_lane_reduce_call
@@ -145,33 +146,12 @@ def _resolve_physical_reductions(
     ):
         return
 
+    allowed_calls = _SCALAR_CASTS | {"range", "cute.arch.block_idx"}
+
     def uniform(expr: ast.AST, names: set[str]) -> bool:
-        if isinstance(expr, ast.Constant):
-            return True
-        if isinstance(expr, ast.Name):
-            return _is_proven_uniform_name(expr.id, names)
-        if isinstance(expr, (ast.BinOp, ast.UnaryOp, ast.Compare, ast.BoolOp)):
-            return all(
-                uniform(child, names)
-                for child in ast.iter_child_nodes(expr)
-                if isinstance(child, ast.expr)
-            )
-        if isinstance(expr, ast.Call):
-            name = ast.unparse(expr.func)
-            return (
-                name in {*_SCALAR_CASTS, "range", "cute.arch.block_idx"}
-                and not expr.keywords
-                and all(uniform(arg, names) for arg in expr.args)
-            )
-        if isinstance(expr, ast.Subscript):
-            return (
-                isinstance(expr.value, ast.Call)
-                and ast.unparse(expr.value.func) == "cute.arch.block_idx"
-                and uniform(expr.value, names)
-                and isinstance(expr.slice, ast.Constant)
-                and expr.slice.value in (0, 1, 2)
-            )
-        return False
+        return block_uniform_scalar(
+            expr, lambda name: _is_proven_uniform_name(name, names), allowed_calls
+        )
 
     def visit(statements: Sequence[ast.AST], names: set[str], complete: bool) -> None:
         for stmt in statements:

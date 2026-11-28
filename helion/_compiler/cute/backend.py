@@ -94,6 +94,7 @@ from .tcgen05_constants import TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY
 from .thread_budget import MAX_THREAD_BLOCK_DIMS
 from .thread_budget import MAX_THREADS_PER_BLOCK
 from .thread_budget import check_thread_block_dims
+from .thread_budget import linear_thread_index
 from .thread_budget import referenced_thread_axes
 from .thread_budget import thread_idx_axis
 
@@ -2881,6 +2882,16 @@ class CuteBackend(Backend):
         # (``tcgen05_fallback_cluster``).
         outline_fallback_cluster_bodies(fn, fn_def, prefix)
         launch_attributes.project_launch_block(fn)
+        if (staged_block := fn.cute_state.staged_indexed_block) is not None:
+            from .thread_block_projection import literal_launch_block
+
+            if (
+                literal_launch_block(fn.codegen.host_statements, fn.name)
+                != staged_block
+            ):
+                raise exc.InvalidConfig(
+                    "staged indexed rows require their exact final launch block"
+                )
         return statements
 
     def tensors_proven_disjoint(
@@ -4849,17 +4860,7 @@ class CuteBackend(Backend):
             self._check_thread_axis(axis)
         index_dtype = CompileEnvironment.current().index_dtype
         index_type = self.index_type_str(index_dtype)
-        if not axis_sizes:
-            return self.cast_expr("0", index_type)
-        stride = 1
-        terms: list[str] = []
-        for axis, size in sorted(axis_sizes.items()):
-            term = self.cast_expr(f"cute.arch.thread_idx()[{axis}]", index_type)
-            if stride != 1:
-                term = f"({term}) * {self.cast_expr(repr(stride), index_type)}"
-            terms.append(term)
-            stride *= size
-        return " + ".join(terms)
+        return linear_thread_index(axis_sizes, lambda x: self.cast_expr(x, index_type))
 
     def is_indexed_reduction(self, reduction_type: str) -> bool:
         return reduction_type in {"argmin", "argmax"}
@@ -5742,11 +5743,13 @@ class CuteBackend(Backend):
         self, codegen: GenerateAST, grid_state: DeviceGridState, body: list[ast.AST]
     ) -> bool:
         from .direct_affine_lowering import try_lower_direct_affine_root
+        from .single_row_publication import partition_row_publication
         from .thread_budget import record_root_read_axes
         from .warp_row_partition import partition_row_sums
 
         record_root_read_axes(codegen, grid_state, body)
         partition_row_sums(codegen, grid_state, body)
+        partition_row_publication(codegen, grid_state, body)
         return try_lower_direct_affine_root(codegen, grid_state, body)
 
     def explain_root_failure(
