@@ -807,3 +807,36 @@ these labelled lines.
 - Pinned by: `test_grid_induction_product_uses_kernel_index_type` in
   `test/test_cute_fragment_loop_captures.py` checks computed-fragment
   index widths; it does not exercise the ordinary nested-store overflow.
+
+## triton-raw-storage-lazy-negative-inputs
+
+- Area: compiled Triton kernels that consume a tensor's raw storage without
+  first resolving PyTorch's negative view bit. The shipped B200 MLA preset
+  is a measured example.
+- What is wrong: a lazy-negative view has the original storage address but
+  represents the negated values. The Triton launcher receives the address,
+  not that logical negation. With `m` the published `flash_mla.py` module:
+
+      data = m._make_inputs(65, seed=41)
+      q, kv, pages, lengths, scale = m._kernel_args(data)
+      def call(x):
+          return m.flash_mla(x, kv, pages, lengths, scale)
+      ordinary = call(q)
+      negative = torch._neg_view(q)
+      assert torch.equal(call(negative), ordinary)  # incorrect
+      materialized = negative.resolve_neg()
+      expected = m.reference(dict(data, query=materialized))
+      torch.testing.assert_close(call(materialized), expected, atol=0.01, rtol=0)
+
+  On B200 with PyTorch 2.14.1, the maximum absolute error against this
+  reference was 1.390625 for the view and 0.00390625 after resolving it.
+  Cache reuse exposes the problem in this reproducer; it is not required
+  for the distinction between physical and logical values.
+- Since: reproduced on `main` at `f1d2bf392`.
+- Why deferred: a caller can pass `tensor.resolve_neg()`; materializing in
+  the body of an individual read-only kernel could protect that input
+  too. Neither addresses other raw-pointer consumers or writes through
+  negative views. A shared fix must account for both fresh and cached
+  launches and for graph capture. Materializing a temporary for a writable
+  argument without propagating its writes would itself be incorrect.
+- Pinned by: none.

@@ -361,6 +361,31 @@ def test_kda_decode_uses_existing_tuning_surface() -> None:
     }
 
 
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("expected", [(2,), (0, 1, 2)])
+def test_flash_mla_reference_masks_each_query(expected: tuple[int, ...]) -> None:
+    module = _import_pretuned_kernel_module("flash_mla")
+    # Zero queries give uniform attention. Across the reversed physical pages,
+    # the last three causal prefixes average to 0/63, 64/64, and 130/65.
+    heads = module.NUM_HEADS
+    q = torch.zeros(1, len(expected), heads, module.QK_DIM, dtype=torch.bfloat16)
+    kv = torch.zeros(2, 1, module.CACHE_BLOCK_SIZE, module.QK_DIM, dtype=q.dtype)
+    kv[1, 0, -1] = 64
+    kv[0, 0, 0] = 66
+    out = module.reference(
+        {
+            "query": q,
+            "kv_cache": kv,
+            "block_tables": torch.tensor([[1, 0]], dtype=torch.int32),
+            "seq_lens": torch.tensor([65], dtype=torch.int32),
+        }
+    )
+    want = torch.tensor(expected, dtype=q.dtype).view(1, -1, 1, 1)
+    torch.testing.assert_close(
+        out, want.expand(1, len(expected), heads, module.KV_LORA_RANK), atol=0, rtol=0
+    )
+
+
 def test_flash_mla_key_keeps_context_and_pool_runtime() -> None:
     module = _import_pretuned_kernel_module("flash_mla")
     heuristic = _import_pretuned_heuristic("flash_mla")
