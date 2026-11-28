@@ -8,6 +8,37 @@ import helion
 import helion.language as hl
 
 
+def _cumsum_column_tile(x: torch.Tensor, batch: hl.Tile, col: hl.Tile) -> torch.Tensor:
+    chunk = x.size(1)
+    i = hl.arange(chunk)
+    lower = (i[:, None] >= i[None, :]).float()
+    tri = lower[None, :, :].broadcast_to([batch, chunk, chunk])  # pyrefly: ignore[no-matching-overload]
+    return hl.dot(tri, x[batch, :, col].float())
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def windowed_cumsum(
+    x: torch.Tensor, out: torch.Tensor, begin: int, end: int
+) -> torch.Tensor:
+    begin, end = hl.specialize(begin), hl.specialize(end)
+    for batch, col in hl.tile([0, begin], [x.size(0), end], block_size=[1, 16]):
+        out[batch, :, col] = _cumsum_column_tile(x, batch, col)
+    return out
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def nested_windowed_cumsum(
+    x: torch.Tensor, out: torch.Tensor, begin: int, end: int, fixed_end: hl.constexpr
+) -> torch.Tensor:
+    begin = hl.specialize(begin)
+    if fixed_end:
+        end = hl.specialize(end)
+    for batch in hl.tile(x.size(0), block_size=1):
+        for col in hl.tile(begin, end, block_size=16):
+            out[batch, :, col] = _cumsum_column_tile(x, batch, col)
+    return out
+
+
 @helion.kernel(backend="cute", static_shapes=True)
 def indexed_gemm(
     values: torch.Tensor, weights: torch.Tensor, output: torch.Tensor, rows: int

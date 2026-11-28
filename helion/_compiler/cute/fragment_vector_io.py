@@ -68,7 +68,17 @@ def _static_int(value: object) -> int | None:
     return None
 
 
-def static_strides(tensor: torch.Tensor) -> tuple[int, ...] | None:
+def static_strides(
+    env: CompileEnvironment, tensor: torch.Tensor
+) -> tuple[int, ...] | None:
+    """Static strides which hold whenever the emitted packet is used.
+
+    An Inductor placeholder can be contiguous even when the graph keeps an
+    input stride symbolic. A wrapper clone can preserve that input layout;
+    its freshly allocated base only proves pointer alignment.
+    """
+    if not env.traced_strides_hold(tensor):
+        return None
     strides = [_static_int(s) for s in tensor.stride()]
     if any(s is None for s in strides):
         return None
@@ -94,7 +104,7 @@ def row_packet_lanes(
     fake = tensor.value
     if fake.dtype != dtype or not host_base_aligned(compiler.env, fake):
         return None
-    strides = static_strides(fake)
+    strides = static_strides(compiler.env, fake)
     if strides is None:
         return None
     ordinals = [ordinal for ordinal, index in enumerate(indices) if index is not None]
