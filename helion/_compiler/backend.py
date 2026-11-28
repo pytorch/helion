@@ -66,6 +66,7 @@ if TYPE_CHECKING:
     from .inductor_lowering import GenerateASTFromInductor
     from .inductor_lowering import GraphInterpreter
     from .inductor_matmul import MatmulFacts
+    from .program_id import ForEachProgramID
     from .program_id import ProgramIDs
     from .reduction_strategy import BlockReductionStrategy
     from .reduction_strategy import ReductionEmitter
@@ -464,6 +465,12 @@ class Backend(abc.ABC):
         loop carry; without it such a carry takes the values those lanes
         load (FlyDSL)."""
         return False
+
+    def specialize_phase_dispatch(
+        self, owner: ForEachProgramID, body: list[ast.AST], first: int, stop: int
+    ) -> list[ast.AST]:
+        """Specialize the compiler's root dispatch to one known PID interval."""
+        return list(body)
 
     def barrier_allows_pid_type(self, pid_type: str) -> bool:
         """Whether this PID schedule preserves a phase boundary between root loops.

@@ -135,7 +135,9 @@ def register_fp32_dot_coverage(
     spec = env.config_spec
     if not spec.cute_fp32_dot_root_ids:
         return
-    carrier = fragment_coverage_carrier(spec)
+    carrier = fragment_coverage_carrier(
+        spec, require_flat=spec.cute_fragment_cta_requires_flat
+    )
     if carrier is None:
         return
     spec.cute_fp32_dot_search_enabled = True
@@ -154,6 +156,21 @@ def register_fp32_dot_coverage(
     # least 64 on every axis seeds the mode; smaller dots keep it an ordinary
     # enum choice of the search without a declared witness.
     seeded = spec.cute_fp32_dot_seed_worthy
+    if (
+        seeded
+        and supplemental_carrier is not None
+        and spec.cute_fragment_cta_requires_flat
+    ):
+        supplemental_carrier = fragment_coverage_carrier(
+            spec, supplemental_carrier, require_flat=True
+        )
+        if supplemental_carrier is not None:
+            try:
+                generation.strict_config_pair(
+                    Config.from_dict(supplemental_carrier.config | {KEY: "tf32_mma"})
+                )
+            except InvalidConfig:
+                supplemental_carrier = None
     spec.register_compiler_coverage_group(
         CompilerCoverageGroup(
             mechanism="cute.computed_fragment_fp32_dot",

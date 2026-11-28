@@ -28,6 +28,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 from dataclasses import dataclass
+from dataclasses import replace
 from itertools import starmap
 import math
 from typing import TYPE_CHECKING
@@ -48,6 +49,7 @@ from ....language import scan_ops
 from ....runtime.config import Config
 from ...autotuner_heuristics.registry import AutotunerHeuristic
 from ..fragment_dot_support import fragment_half_dot_supported
+from ..fragment_launch import fragment_option_fits_shared_block
 from .config_keys import CUTE_FRAGMENT_KEYS
 from .heuristics import cute_fragment_bounded_gather
 from .heuristics import cute_fragment_threads
@@ -59,6 +61,7 @@ from .heuristics.cute_fragment_common import fragment_coverage_carrier
 from .heuristics.cute_fragment_common import fragment_root_regions
 from .heuristics.cute_fragment_reduction import MODES as REDUCTION_MODES
 from .heuristics.cute_fragment_reduction import fragment_warp_reduction_supported
+from .heuristics.cute_fragment_reduction import reduction_modes
 from .heuristics.cute_fragment_resources import fragment_resource_carrier
 from .heuristics.cute_fragment_scan_exports import validate_scan_exports
 from .heuristics.cute_fragment_warp_producer_regions import (
@@ -310,7 +313,21 @@ def register_fragment_knob_coverage(
     spec = env.config_spec
     if not getattr(spec, knob.root_ids_attribute):
         return
+    if knob is REDUCTION:
+        modes = reduction_modes(spec)
+        knob = replace(
+            knob,
+            coverage=replace(knob.coverage, domain=modes, witness_values=modes[1:]),
+        )
     coverage = knob.coverage
+    # A resource candidate may also become a supplemental witness. Its
+    # launch must satisfy the same requirement as the primary witness.
+    needs_flat = spec.cute_fragment_cta_requires_flat and any(
+        not fragment_option_fits_shared_block(knob.name, value, spec=spec)
+        for value in coverage.witness_values
+    )
+    if needs_flat and "flat" not in spec.allowed_pid_types:
+        return
     ctx = CoverageContext(knob, env, device_ir, resource_carrier, extended_only)
     if coverage.admit is not None and not coverage.admit(ctx):
         return
@@ -326,6 +343,11 @@ def register_fragment_knob_coverage(
         carrier = None if config is None else Carrier(config)
     if carrier is None:
         return
+    if needs_flat and coverage.plan is not None:
+        flat = fragment_coverage_carrier(spec, carrier.config, require_flat=True)
+        if flat is None:
+            return
+        carrier = replace(carrier, config=flat)
     previous = getattr(spec, knob.search_enabled_attribute)
     setattr(spec, knob.search_enabled_attribute, True)
     plan = (coverage.plan or _default_plan)(ctx, carrier)
@@ -380,21 +402,43 @@ def _default_plan(ctx: CoverageContext, carrier: Carrier) -> CoveragePlan | None
     """One Boolean witness on the carrier, or every enum mode strictly kept."""
     coverage = ctx.knob.coverage
     generation = ctx.spec.create_config_generation()
+
+    def mode_carrier(config: Config, value: CoverageValue) -> Config | None:
+        if (
+            ctx.spec.cute_fragment_cta_requires_flat
+            and not fragment_option_fits_shared_block(
+                ctx.knob.name, value, spec=ctx.spec
+            )
+        ):
+            return fragment_coverage_carrier(ctx.spec, config, require_flat=True)
+        return config
+
+    witnesses = []
     try:
-        if coverage.domain == (False, True):
-            ctx.probe(generation, carrier.config, True)
-        else:
-            for mode in coverage.domain:
-                effective = ctx.probe(generation, carrier.config, mode)
-                if effective.config.get(ctx.knob.name, coverage.legacy) != mode:
-                    return None
+        for mode in coverage.domain:
+            config = mode_carrier(carrier.config, mode)
+            if config is None:
+                return None
+            effective = ctx.probe(generation, config, mode)
+            if effective.config.get(ctx.knob.name, coverage.legacy) != mode:
+                return None
+            if mode in coverage.witness_values:
+                witnesses.append((config, mode))
     except InvalidConfig:
         return None
     supplemental = ()
     if not coverage.resource and ctx.resource_carrier is not None:
-        supplemental = ((ctx.resource_carrier, coverage.witness_values[0]),)
+        value = coverage.witness_values[0]
+        resource = mode_carrier(ctx.resource_carrier, value)
+        if resource is not None:
+            try:
+                ctx.probe(generation, resource, value)
+            except InvalidConfig:
+                pass
+            else:
+                supplemental = ((resource, value),)
     return CoveragePlan(
-        tuple((carrier.config, value) for value in coverage.witness_values),
+        tuple(witnesses),
         carrier.dependencies,
         supplemental,
     )
@@ -1163,9 +1207,85 @@ def _warp_scan_roots(env: CompileEnvironment, ir: DeviceIR) -> RootFacts:
     )
 
 
+def _shared_warp_regions(
+    env: CompileEnvironment, ir: DeviceIR
+) -> dict[int, FragmentRegion]:
+    """Roots that can borrow the persistent CTA under the lowering's proof."""
+    from ..computed_fragment import ordinary_shared_fragment
+    from ..computed_fragment import selection_needs_shared_coordinates
+    from ..computed_fragment import selection_storage_is_disjoint
+    from ..computed_fragment import shared_fragment_graphs
+    from ..full_reduction_owner import requires_full_reduction_owner
+    from ..local_atomic import local_atomic_allocations
+    from ..reduction_coordinates import free_iota_reductions
+
+    if (
+        len(ir.root_ids) <= 1
+        or not (
+            ir.implicit_dependency_starts
+            or (
+                env.has_barrier
+                and len(ir.phases) > 1
+                and env.process_group_name is None
+            )
+        )
+        or local_atomic_allocations(ir.graphs)
+        or requires_full_reduction_owner(ir.graphs)
+    ):
+        return {}
+    free = {node.graph for node in free_iota_reductions(env, ir.graphs)}
+    shared = {}
+    for root in ir.root_ids:
+        region = shared_fragment_graphs(ir.graphs, root)
+        needs_selection = selection_needs_shared_coordinates(region)
+        if needs_selection and not selection_storage_is_disjoint(
+            env, region, allow_unbound=True
+        ):
+            continue
+        if ordinary_shared_fragment(region) and (
+            ir.graphs[root].graph in free or (len(region) == 1 and needs_selection)
+        ):
+            shared[root] = FragmentRegion(root, region)
+    return shared
+
+
+def _warp_fragment_regions(
+    owned: list[FragmentRegion], shared: dict[int, FragmentRegion]
+) -> list[FragmentRegion]:
+    seen = {region.root for region in owned}
+    return [*owned, *(region for root, region in shared.items() if root not in seen)]
+
+
+def _warp_fragment_reduction_roots(env: CompileEnvironment, ir: DeviceIR) -> RootFacts:
+    owned = fragment_regions(ir)
+    shared_regions = _shared_warp_regions(env, ir)
+    regions = _warp_fragment_regions(owned, shared_regions)
+    roots = frozenset(
+        region.root
+        for region in regions
+        if _has_warp_reduction(env, region) and discovery_supported(env, region)
+    )
+    # CTA reduction modes own the entire launch. Any required shared root
+    # without a separate complete phase owner cannot use them.
+    shared = len(regions) != len(owned)
+    return RootFacts(
+        roots,
+        (
+            ("cute_fragment_reduction_shared", shared),
+            (
+                "cute_fragment_warp_reduction_requires_flat",
+                env.config_spec.cute_fragment_cta_requires_flat
+                and not roots.issubset(shared_regions),
+            ),
+        ),
+    )
+
+
 def _topk_network_roots(env: CompileEnvironment, ir: DeviceIR) -> RootFacts:
     from ..computed_fragment import _static_selection_extent
     from ..computed_fragment import computed_fragment_supported
+    from ..computed_fragment import selection_needs_shared_coordinates
+    from ..computed_fragment import selection_storage_is_disjoint
     from ..selection.ordered_selection import is_ordered_selection
     from ..selection.ordered_selection import ordered_selection_args
     from ..selection.ordered_selection import selection_values_only
@@ -1173,7 +1293,14 @@ def _topk_network_roots(env: CompileEnvironment, ir: DeviceIR) -> RootFacts:
 
     roots = set()
     cta_roots = set()
-    for region in fragment_regions(ir):
+    owned = fragment_regions(ir)
+    owned_root_ids = {region.root for region in owned}
+    shared_regions = _shared_warp_regions(env, ir)
+    regions = _warp_fragment_regions(owned, shared_regions)
+    # CTA sorting changes the block for the whole launch. A required shared
+    # fragment may use a warp network, but cannot change its siblings' block.
+    can_own_launch = len(regions) == len(owned)
+    for region in regions:
         # Preserve the native row owner, including its late layout and alias
         # guards. This coordinate belongs only to fragment roots.
         if (
@@ -1184,7 +1311,17 @@ def _topk_network_roots(env: CompileEnvironment, ir: DeviceIR) -> RootFacts:
             is not None
         ):
             continue
-        if not computed_fragment_supported(env, region.graphs):
+        # A complete intrinsic owner keeps the existing in-place contract.
+        # Only the new cross-phase coordinate proof adds a storage guard.
+        if not computed_fragment_supported(env, region.graphs) and not (
+            len(ir.root_ids) > 1
+            # The projected stage owns its helper graphs. A root borrowing
+            # a persistent block still needs a single ordinary region.
+            and (region.root in owned_root_ids or len(region.graphs) == 1)
+            and selection_needs_shared_coordinates(region.graphs)
+            and selection_storage_is_disjoint(env, region.graphs, allow_unbound=True)
+            and computed_fragment_supported(env, region.graphs, selection_owned=True)
+        ):
             continue
         for node in _nodes(region):
             if not is_ordered_selection(node):
@@ -1204,10 +1341,18 @@ def _topk_network_roots(env: CompileEnvironment, ir: DeviceIR) -> RootFacts:
                 value.dtype, n, k, values_only=values_only
             ):
                 roots.add(region.root)
-                if value.dtype == torch.int64 and values_only:
+                if can_own_launch and value.dtype == torch.int64 and values_only:
                     cta_roots.add(region.root)
     return RootFacts(
-        frozenset(roots), (("cute_fragment_cta_topk_root_ids", frozenset(cta_roots)),)
+        frozenset(roots),
+        (
+            ("cute_fragment_cta_topk_root_ids", frozenset(cta_roots)),
+            (
+                "cute_fragment_warp_topk_requires_flat",
+                env.config_spec.cute_fragment_cta_requires_flat
+                and not roots.issubset(shared_regions),
+            ),
+        ),
     )
 
 
@@ -1278,7 +1423,7 @@ REDUCTION = FragmentKnob(
     "cute_fragment_reduction",
     "reduction",
     60,
-    (_has_warp_reduction, discovery_supported),
+    roots=_warp_fragment_reduction_roots,
     precheck=_kernel_has_warp_reduction,
     coverage=KnobCoverage(
         mechanism="cute.computed_fragment_reduction",

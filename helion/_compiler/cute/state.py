@@ -678,6 +678,8 @@ class CuteLaneState:
     # cross-warp reductions for (None when it rewrote nothing); the
     # launcher refuses to emit a different ``block=`` for such a body.
     shared_reduce_launch_block: tuple[int, int, int] | None = None
+    # A warp-local fragment consumes, but does not set, the final CTA dimensions.
+    shared_fragment_uses_warps: bool = False
     # The static ``block=`` the launcher call was emitted with
     # (``CuteBackend.launcher_keyword_args``, which runs ahead of the
     # kernel definition's codegen); None before that call, and for a

@@ -17,6 +17,8 @@ from helion._testing.cute_codegen import tcgen05_target as _target
 from helion._testing.cute_fragment_index_domains import _masked_wide_window
 from helion._testing.cute_fragment_index_domains import nested_windowed_cumsum
 from helion._testing.cute_fragment_index_domains import windowed_cumsum
+from helion._testing.cute_phase_liveness import grouped_selection_after_producer
+from helion._testing.cute_phase_liveness import routed_phase_config
 import helion.language as hl
 
 pytestmark = pytest.mark.cpu_only
@@ -155,6 +157,21 @@ def test_arange_and_positive_offset_do_not_normalize_negative_indices() -> None:
         )
         source = bound.to_code(bound.config_spec.default_config())
     assert "fragment_tensor_index" in source and "ready.iterator" in source
+    assert "fragment_wrapped_index" not in source
+
+
+def test_out_of_bounds_tensor_gathers_keep_their_guards() -> None:
+    # A negative tensor lane is not a source-level scalar subscript.
+    args = (
+        torch.empty(307, 62, dtype=torch.int32),
+        torch.empty(62, dtype=torch.int32),
+        torch.empty(307, 2, 4, dtype=torch.int32),
+        "negative_gather",
+    )
+    with cpu_render_target(fake_device_sm_count=148):
+        bound = cpu_bind(grouped_selection_after_producer, args)
+        source = bound.to_code(routed_phase_config(8, warp=False))
+    assert "fragment_tensor_index" in source
     assert "fragment_wrapped_index" not in source
 
 

@@ -509,6 +509,7 @@ class FragmentContext:
         self.held: list[object] = []
         self.threads = cast("int", self.df.config.get("cute_fragment_threads", 128))
         self.thread = ""
+        self.block_volume: str | None = None
         self.padded_rows = bool(self.df.config.get("cute_fragment_padded_rows", False))
         self.unrolled_loops = bool(
             self.df.config.get("cute_fragment_unrolled_loops", False)
@@ -1234,6 +1235,10 @@ class FragmentContext:
             and not warp_owned
             and threads_per_element == 1
         )
+        if self.block_volume is not None and (register_owned or self.unrolled_loops):
+            raise exc.InvalidConfig(
+                "a shared launch requires ordinary fragment element ownership"
+            )
         if register_owned:
             assert not warp_owned and threads_per_element == 1
             slots = (math.prod(shape) + self.threads - 1) // self.threads
@@ -1319,8 +1324,16 @@ class FragmentContext:
             if threads_per_element == 1
             else f"{self.thread} // {threads_per_element}"
         )
+        if self.block_volume is None:
+            stride = str(self.threads // threads_per_element)
+        elif threads_per_element == 1:
+            stride = self.block_volume
+        else:
+            # The launcher verifies the final shared CTA contains complete warps.
+            self.df.cute_state.lanes.shared_fragment_uses_warps = True
+            stride = f"({self.block_volume} // {threads_per_element})"
         loop = statement_from_string(
-            f"for {index} in range({start}, {math.prod(shape)}, {self.threads // threads_per_element}):\n    pass"
+            f"for {index} in range({start}, {math.prod(shape)}, {stride}):\n    pass"
         )
         assert isinstance(loop, ast.For)
         loop.body.clear()

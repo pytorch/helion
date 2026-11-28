@@ -1651,6 +1651,10 @@ class ConfigSpec:
         self.cute_fragment_scan_search_enabled = False
         self.cute_fragment_reduction_root_ids: frozenset[int] = frozenset()
         self.cute_fragment_reduction_search_enabled = False
+        self.cute_fragment_reduction_shared = False
+        self.cute_fragment_cta_requires_flat = False
+        self.cute_fragment_warp_topk_requires_flat = False
+        self.cute_fragment_warp_reduction_requires_flat = False
         self.cute_fp32_dot_root_ids: frozenset[int] = frozenset()
         self.cute_fp32_dot_search_enabled = False
         self.cute_fragment_half_mma_root_ids: frozenset[int] = frozenset()

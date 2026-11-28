@@ -1759,8 +1759,12 @@ def test_mixed_warp_scan_all_ineligible_phases_reject():
     bound = cpu_bind(
         _mixed_dtype_phase_scans, (torch.ones(3, 1057), torch.ones(3, 2049))
     )
+    config = _warp_scan_config(bound)
+    # The flat phase launch owns its fragment, so this exercises the
+    # bounded scan capacity rather than an earlier shared-block rejection.
+    config.config["pid_type"] = "flat"
     with pytest.raises(exc.InvalidConfig, match="at least one supported operation"):
-        bound.to_code(_warp_scan_config(bound))
+        bound.to_code(config)
 
 
 @helion.kernel(backend="cute", static_shapes=False, autotune_effort="none")

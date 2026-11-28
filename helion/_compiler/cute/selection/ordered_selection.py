@@ -135,3 +135,29 @@ def unordered_topk_args(node: Node) -> tuple[Node, int, int, bool] | None:
     ):
         return None
     return source, k, dim, largest
+
+
+def topk_outputs_keep_sort_lanes(node: Node) -> bool:
+    """Whether every consumer preserves the sorted input's physical lane."""
+    from ....language import memory_ops
+    from ..memory_ops import _cute_topk_cast_input
+
+    # Output ``j`` is held on the lane at position ``j`` of the sorted input
+    # dim, which only a store addresses (``_cute_topk_store_index_exprs``);
+    # dtype conversions retain that lane. Other consumers would read it on
+    # the output dim's own lanes.
+    pending = list(node.users)
+    visited: set[Node] = set()
+    while pending:
+        output = pending.pop()
+        if output in visited:
+            continue
+        visited.add(output)
+        for user in output.users:
+            if user.target is memory_ops.store and user.args[2] is output:
+                continue
+            if _cute_topk_cast_input(user) is output:
+                pending.append(user)
+                continue
+            return False
+    return True

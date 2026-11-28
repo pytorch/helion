@@ -16,8 +16,18 @@ from ....inductor_lowering import ReductionLowering
 if TYPE_CHECKING:
     from torch.fx import Node
 
+    from .....autotuner.config_spec import ConfigSpec
+
 KEY = "cute_fragment_reduction"
 MODES = ("serial", "warp", "cta", "cta_unroll")
+
+
+def reduction_modes(spec: ConfigSpec) -> tuple[str, ...]:
+    if spec.cute_fragment_reduction_shared or (
+        spec.cute_fragment_cta_requires_flat and "flat" not in spec.allowed_pid_types
+    ):
+        return MODES[:2]
+    return MODES
 
 
 def fragment_warp_reduction_supported(node: Node) -> bool:
