@@ -508,6 +508,7 @@ class FragmentContext:
         self.scope_uses: list[dict[Node, int]] = []
         self.held: list[object] = []
         self.threads = cast("int", self.df.config.get("cute_fragment_threads", 128))
+        self.used_gathered_bf16_fold = False
         self.thread = ""
         self.block_volume: str | None = None
         self.padded_rows = bool(self.df.config.get("cute_fragment_padded_rows", False))
@@ -807,6 +808,11 @@ class FragmentContext:
             }
             return self.env.backend.sympy_printer_expr(value.xreplace(substitutions))
         return self.df.literal_expr(value)
+
+    def host_tensor(self, node: Node) -> HostTensor:
+        value = cast("torch.Tensor", node.meta["val"])
+        name = self.df.tensor_arg(value, prefer_name=cast("str", node.args[0])).name
+        return HostTensor(name, value)
 
     def scalar(self, value: object, *, wide: bool = False) -> str:
         if isinstance(value, Fragment):

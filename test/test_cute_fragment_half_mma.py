@@ -7,6 +7,7 @@ import torch
 
 import helion
 from helion._testing import DEVICE
+from helion._testing.cute_gathered_bf16 import routed_transposed_product
 from helion._testing.cute_half_mma import batched_dot
 from helion._testing.cute_half_mma import cast_dot
 from helion._testing.cute_half_mma import computed_dot
@@ -82,3 +83,26 @@ def test_half_mma_partial_in_place_cast_matches_reference() -> None:
     torch.testing.assert_close(
         actual, torch.bmm(x.half().float(), y.float()), rtol=1e-4, atol=1e-4
     )
+
+
+def test_gathered_nt_signed_pages_and_repeated_routes() -> None:
+    # The second rank-2 operand window is a signed physical page; invalid
+    # entries must be zero-filled even when other slots use the same page.
+    torch.manual_seed(45)
+    # 65 native K steps cross the runtime-loop threshold.
+    x = torch.randn((32, 1040), device=DEVICE, dtype=torch.bfloat16)
+    bank = torch.randn((5, 32, 1040), device=DEVICE, dtype=torch.bfloat16)
+    order = torch.tensor([3, -1, -5, -6, 5, 3, 0, 4], device=DEVICE, dtype=torch.int64)
+    args = (x, bank, order, 0, 0, False)
+    bound = routed_transposed_product.bind(args)
+    config = helion.Config(
+        block_sizes=bound.config_spec.default_config().block_sizes,
+        cute_mma_dag="off",
+        cute_fragment_half_mma=True,
+    )
+    assert "gathered_mma_page" in bound.to_code(config)
+    got = bound.compile_config(config)(*args)
+    key = bank[order.remainder(bank.size(0))].float()
+    reference = torch.einsum("mk,bnk->bmn", x.float(), key)
+    reference[(order < -bank.size(0)) | (order >= bank.size(0))] = 0
+    torch.testing.assert_close(got, reference, rtol=3e-4, atol=5e-5)

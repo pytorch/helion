@@ -687,6 +687,8 @@ class CuteLaneState:
     # estimates the resident CTAs per SM from it.
     launch_block: tuple[int, int, int] | None = None
     owned_root_block_dims: tuple[int, int, int] | None = None
+    # A folded fragment producer shares the ordinary persistent launch.
+    gathered_phase_threads: int | None = None
     # The fused body may run one CTA per (grid index, lane): the launch
     # grid is the PID strategy's grid times this factor (``tcgen05_split_k``
     # sets it to the split as well).
@@ -740,6 +742,7 @@ class CuteRootPlans:
     # current root because its shared memory exceeds the CTA capacity; a
     # generic-lowering refusal of that root is then a config failure.
     fragment_capacity_decline: tuple[int, int] | None = None
+    fragment_packed_decline: bool = False
     # Whole-root BT16 five-factor prepare schedule.  This is installed only
     # after the complete semantic graph and packed workspace ABI match.
     chunk_prepare_plan: CuteChunkPreparePlan | None = None

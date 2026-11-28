@@ -1654,11 +1654,55 @@ PURE_PRODUCER_REGIONS = FragmentKnob(
     (fragment_supported, _root_plan_is_lazy),
 )
 
+
+def _half_mma_roots(env: CompileEnvironment, ir: DeviceIR) -> RootFacts:
+    from ..analysis.gathered_bf16_mma import gathered_phase_region
+    from ..computed_fragment import computed_fragment_supported
+    from .heuristics.cute_gathered_bf16_mma import gathered_phase_carrier
+
+    roots = {
+        region.root
+        for region in fragment_regions(ir)
+        if _has_half_dot(env, region) and discovery_supported(env, region)
+    }
+    region = gathered_phase_region(ir, env, ir.graphs)
+    if region is not None and computed_fragment_supported(
+        env, region, gathered_fold_owned=True
+    ):
+        carrier = gathered_phase_carrier(env, ir, region)
+        if carrier is not None:
+            roots.add(ir.root_ids[0])
+            carriers = (carrier,)
+            return RootFacts(
+                frozenset(roots),
+                (
+                    (
+                        "cute_gathered_phase_search_lanes",
+                        frozenset(tuple(c.num_threads) for c in carriers),
+                    ),
+                    ("cute_gathered_phase_carriers", tuple(c.config for c in carriers)),
+                ),
+            )
+    return RootFacts(frozenset(roots))
+
+
+def _half_mma_carrier(ctx: CoverageContext) -> Carrier | None:
+    ordinary = fragment_coverage_carrier(ctx.spec, ctx.resource_carrier)
+    if ordinary is None:
+        return None
+    carriers = ctx.spec.cute_gathered_phase_carriers
+    if not carriers:
+        return Carrier(ordinary)
+    selected = Config.from_dict(deepcopy(ordinary.config) | deepcopy(carriers[0]))
+    return Carrier(selected)
+
+
 HALF_MMA = FragmentKnob(
     "cute_fragment_half_mma",
     "half_mma",
     91,
-    (_has_half_dot, discovery_supported),
+    roots=_half_mma_roots,
+    coverage=KnobCoverage(carrier=_half_mma_carrier),
 )
 
 FRAGMENT_KNOBS: tuple[FragmentKnob, ...] = (

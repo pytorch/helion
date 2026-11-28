@@ -90,6 +90,8 @@ from ..fragment_launch import fragment_option_fits_shared_block
 from ..fragment_mma_dot import FRAGMENT_MMA_K_THREADS
 from ..fragment_mma_dot import FRAGMENT_MMA_KEY
 from ..fragment_mma_dot import FRAGMENT_MMA_ROW_THREADS
+from ..gathered_launch import GATHERED_SEED_THREADS
+from ..gathered_launch import gathered_launch_compatible
 from ..packet_store_policy import store_policy_reaches_a_packet
 from ..pdl_release import CUTE_PDL_CAPTURE_RELEASE_CHOICES
 from ..pdl_release import CUTE_PDL_RELEASE_CHOICES
@@ -3256,6 +3258,32 @@ def normalize_knobs(
     _normalize_fragment_option(
         config_spec, config, "cute_fragment_half_mma", fix_invalid=fix_invalid
     )
+    if (
+        config.get("cute_fragment_half_mma")
+        and config_spec.cute_gathered_phase_search_lanes
+    ):
+        # Arbitrary ordinary launch layouts are still validated by codegen for
+        # an explicit config. The search uses a witnessed common lane map and
+        # varies its block extents; otherwise it spends compile time rejecting
+        # nonuniform barriers and launches that drop some of a warp.
+        lanes = config.get("num_threads")
+        eligible = gathered_launch_compatible(config)
+        if not eligible:
+            if not fix_invalid:
+                raise InvalidConfig(
+                    "gathered fragment MMA requires an ordinary persistent barrier launch"
+                )
+            config.pop("cute_fragment_half_mma", None)
+        elif fix_invalid and (
+            not isinstance(lanes, (list, tuple))
+            or tuple(lanes) not in config_spec.cute_gathered_phase_search_lanes
+            or not gathered_launch_compatible(
+                config,
+                actual_threads=_fragment_threads(config),
+                required_threads=GATHERED_SEED_THREADS,
+            )
+        ):
+            config.pop("cute_fragment_half_mma", None)
     _normalize_cute_fragment_threads(config_spec, config, fix_invalid=fix_invalid)
     _normalize_fragment_option(
         config_spec, config, "cute_fragment_producer_cache", fix_invalid=fix_invalid

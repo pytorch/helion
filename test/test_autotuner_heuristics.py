@@ -4383,10 +4383,12 @@ _CUTE_HEURISTIC_ORDER = (
     "cute_reduction_lane_jam_forwarding",
     "cute_delinearized_row_reduction",
     "cute_lane_carry_row",
+    "cute_gathered_bf16_mma",
 )
 
 
 class TestHeuristicRegistry(TestCase):
+    @pytest.mark.cpu_only
     def test_cute_registry_order_and_priorities_are_pinned(self) -> None:
         names = [heuristic.name for heuristic in get_heuristics("cute")]
         self.assertEqual(names, list(_CUTE_HEURISTIC_ORDER))

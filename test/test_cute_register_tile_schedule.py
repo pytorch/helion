@@ -33,6 +33,7 @@ import helion
 from helion._compiler.cute.autotune.heuristics.cute import CuteRegisterTileHeuristic
 from helion._compiler.cute.backend import CuteBackend
 from helion._compiler.cute.register_tile_admission import RegisterTileUnsupported
+from helion._compiler.cute.state import CuteRootPlans
 from helion._testing import DEVICE
 from helion._testing.cute_codegen import cpu_bind
 from helion.experimental.linear_attention import recurrent_step_correction_fused
@@ -520,9 +521,7 @@ def test_rolled_fallback_passes_through_a_fragment_capacity_decline() -> None:
         SimpleNamespace(
             device_function=SimpleNamespace(
                 cute_state=SimpleNamespace(
-                    root_plans=SimpleNamespace(
-                        fragment_capacity_decline=(262144, 232448)
-                    )
+                    root_plans=CuteRootPlans(fragment_capacity_decline=(262144, 232448))
                 )
             )
         ),

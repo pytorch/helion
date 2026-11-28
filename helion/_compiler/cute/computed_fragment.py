@@ -45,13 +45,13 @@ from ..inductor_lowering import ReductionLowering
 from ..inductor_lowering import SympyExprLowering
 from ..inductor_lowering import install_inductor_kernel_handlers
 from . import target_facts
+from .analysis.gathered_bf16_mma import gathered_phase_region
 from .atomic_consumer_fusion import AtomicConsumerRegion
 from .atomic_consumer_fusion import atomic_consumer_regions
 from .direct_affine_plan import DIRECT_AFFINE_ORDINARY_SCHEDULE
 from .dtypes import masked_select_dtype
 from .fragment_atomics import FragmentAtomicEmitter
 from .fragment_context import Fragment
-from .fragment_context import HostTensor
 from .fragment_context import _fragment_logical_shape
 from .fragment_context import _loop_carry_slots
 from .fragment_context import _resolve
@@ -67,8 +67,11 @@ from .fragment_shared_arena import SharedArenaRequest
 from .fragment_shared_arena import plan_shared_arena
 from .full_reduction_owner import fragment_store_destinations
 from .full_reduction_owner import requires_full_reduction_owner
+from .gathered_bf16_dot import gathered_bf16_dot
+from .gathered_launch import gathered_launch_compatible
 from .handler_ops import integer_to_float_expr
 from .handler_ops import scalar_value_dtype
+from .launch_shape import LINEAR_THREAD
 from .local_atomic import local_atomic_allocations
 from .local_atomic import prove_local_atomics
 from .matmul_utils import cute_static_k_invariant_extent
@@ -813,11 +816,7 @@ class FragmentCompiler(
         args = cast("tuple[object, ...]", _resolve(node.args, values))
         fake = node.meta.get("val")
         if target is _tracing_ops._host_tensor:
-            assert isinstance(fake, torch.Tensor)
-            return HostTensor(
-                self.df.tensor_arg(fake, prefer_name=cast("str", node.args[0])).name,
-                fake,
-            )
+            return self.host_tensor(node)
         if target in (_tracing_ops._get_symnode, torch.ops.aten.sym_size.int):
             return fake
         if target is _tracing_ops._new_var:
@@ -864,6 +863,10 @@ class FragmentCompiler(
         if target is _tracing_ops._while_loop:
             return self.resident_while(node, values)
         if _tracing_ops.is_for_loop_target(target):
+            if self.df.config.get("cute_fragment_half_mma", False):
+                panel = gathered_bf16_dot(self, node, values)
+                if panel is not None:
+                    return panel
             return self.loop(node, values)
         if target is atomic_ops.atomic_add:
             if deferred_updates is not None:
@@ -1354,6 +1357,7 @@ def computed_fragment_supported(
     selection_owned: bool = False,
     snapshot_owned: bool = False,
     bounded_gather_owned: bool = False,
+    gathered_fold_owned: bool = False,
     allow_unbound: bool = False,
 ) -> bool:
     """Structural root ownership shared by search discovery and code generation.
@@ -1722,6 +1726,7 @@ def computed_fragment_supported(
 
     if not (
         selection_owned
+        or gathered_fold_owned
         or snapshot_owned
         or bounded_gather_owned
         or requires_full_reduction_owner(graphs)
@@ -2240,7 +2245,12 @@ def codegen_computed_fragment_root(cg: GenerateAST) -> bool:
     multiple_roots = len(ir.root_ids) != 1
     selection_required = False
 
-    def supports_coordinates(region: list[GraphInfo], *, selection_owned: bool) -> bool:
+    def supports_coordinates(
+        region: list[GraphInfo],
+        *,
+        selection_owned: bool,
+        gathered_fold_owned: bool = False,
+    ) -> bool:
         # An untiled iota may already have a native reduction owner. Compare
         # the intrinsic and selection-owned cases with the exact same facts.
         return computed_fragment_supported(
@@ -2249,6 +2259,7 @@ def codegen_computed_fragment_root(cg: GenerateAST) -> bool:
             physical_axes=physical_axes,
             owned_iota_axes=owned_iota_axes,
             selection_owned=selection_owned,
+            gathered_fold_owned=gathered_fold_owned,
             snapshot_owned=snapshots_required,
             bounded_gather_owned=bounded_gather_required,
         )
@@ -2363,8 +2374,15 @@ def codegen_computed_fragment_root(cg: GenerateAST) -> bool:
             for key, value in cg.device_function.config.items()
         )
     )
+    original_ir = cg.host_function.device_ir
+    wants_gathered_region = (
+        len(original_ir.root_ids) == 2
+        and root.graph_id == original_ir.root_ids[0]
+        and cg.device_function.config.get("cute_fragment_half_mma", False)
+        and gathered_launch_compatible(cg.device_function.config.config)
+    )
     if (
-        (multiple_roots and not shared_launch)
+        (multiple_roots and not shared_launch and not wants_gathered_region)
         or cg.device_function.config.get("cute_collective_mma", False)
         or cg.device_function.config.get("cute_register_chain", False)
     ):
@@ -2465,7 +2483,9 @@ def codegen_computed_fragment_root(cg: GenerateAST) -> bool:
     region = active_graphs(graphs)
     if shared_launch and not ordinary_shared_fragment(region):
         return decline()
-    if not supports_coordinates(region, selection_owned=selection_required):
+    if not wants_gathered_region and not supports_coordinates(
+        region, selection_owned=selection_required
+    ):
         return decline()
     # This owner implements configured reduction tiling directly. Keep the
     # logical producer graph, including every other codegen transformation,
@@ -2482,7 +2502,21 @@ def codegen_computed_fragment_root(cg: GenerateAST) -> bool:
             cg.device_function.config, roll_reductions=False
         )
         region = active_graphs(graphs)
-    if not supports_coordinates(region, selection_owned=selection_required):
+    # Projection can rebuild graphs without rolling reductions. Prove and
+    # lower the same graph objects and preserve the original ownership facts.
+    gathered_region = (
+        gathered_phase_region(original_ir, env, graphs)
+        if wants_gathered_region
+        else None
+    )
+    if wants_gathered_region and gathered_region is None:
+        return decline()
+    region_graphs = gathered_region if gathered_region is not None else region
+    if not supports_coordinates(
+        region_graphs,
+        selection_owned=selection_required,
+        gathered_fold_owned=gathered_region is not None,
+    ):
         return decline()
     root = graphs[root.graph_id]
     from .conditional_attention_codegen import conditional_attention_compiler
@@ -2511,7 +2545,7 @@ def codegen_computed_fragment_root(cg: GenerateAST) -> bool:
             "pure producer regions require a current same-owner publication"
         )
     compiler.local_allocations = prove_local_atomics(graphs)
-    for info in region:
+    for info in region_graphs:
         for node in info.graph.nodes:
             if node.target is _tracing_ops._if:
                 predicate = node.args[0]
@@ -2523,7 +2557,7 @@ def codegen_computed_fragment_root(cg: GenerateAST) -> bool:
                     and math.prod(compiler.shape(value.shape)) != 1
                 ):
                     return decline()
-    for info in region:
+    for info in region_graphs:
         for node in info.graph.nodes:
             lowering = node.meta.get("lowering")
             if not isinstance(lowering, (PointwiseLowering, ReductionLowering)):
@@ -2576,6 +2610,38 @@ def codegen_computed_fragment_root(cg: GenerateAST) -> bool:
                     if stride < span:
                         return decline()
                     span += (size - 1) * stride
+    required_owner = (
+        compiler.checked_root
+        or local_required
+        or free_required
+        or fragment_schedule_required
+        or full_reduction_required
+        or any(
+            node.target is _tracing_ops._while_loop
+            for info in graphs
+            for node in info.graph.nodes
+        )
+    )
+    if cg.device_function.config.get("cute_tiles_per_block", 1) != 1:
+        # Packed grid ownership maps thread.y to a separate logical root tile;
+        # a fragment root uses the whole CTA for a single logical program.
+        if (
+            required_owner
+            or captured_required
+            or (
+                compiler.df.config.get("cute_fragment_half_mma", False)
+                and root.graph_id in env.config_spec.cute_fragment_half_mma_root_ids
+            )
+        ):
+            raise exc.InvalidConfig(
+                "packed grid tiles cannot share a complete fragment CTA"
+            )
+        # Some optional graphs still require whole-CTA fragments in practice.
+        # Let scalar lowering try first; if it refuses, report the config that
+        # made the actual owner incompatible instead of warning about the DSL.
+        if len(cg.host_function.device_ir.root_ids) == 1:
+            compiler.df.cute_state.root_plans.fragment_packed_decline = True
+        return False
     grid = cg.current_grid_state
     assert grid is not None
     if local_required:
@@ -2614,6 +2680,8 @@ def codegen_computed_fragment_root(cg: GenerateAST) -> bool:
             compiler.emit(
                 f"{compiler.thread} = cute.arch.thread_idx()[0] + cute.arch.block_dim()[0] * (cute.arch.thread_idx()[1] + cute.arch.block_dim()[1] * cute.arch.thread_idx()[2])"
             )
+        elif gathered_region is not None:
+            compiler.emit(f"{compiler.thread} = {LINEAR_THREAD}")
         else:
             compiler.emit(
                 f"{compiler.thread} = cutlass.Int32(cute.arch.thread_idx()[0])"
@@ -2632,21 +2700,15 @@ def codegen_computed_fragment_root(cg: GenerateAST) -> bool:
             # The same CTA may immediately reuse the staging buffers for a
             # different logical tile. All consumers must finish the old tile.
             compiler.emit("cute.arch.sync_threads()")
+        if compiler.used_gathered_bf16_fold and str(
+            compiler.df.config.pid_type
+        ).startswith("persistent"):
+            # A warp can revisit the shared allocator for the next virtual PID
+            # before its peers have read this one's branch condition or state.
+            compiler.synchronize()
     if compiler.warp_producer_recorder is not None:
         compiler.warp_producer_recorder.lower(body)
     capacity = target_facts.per_cta_smem_capacity_bytes(compiler.env.device)
-    required_owner = (
-        compiler.checked_root
-        or local_required
-        or free_required
-        or fragment_schedule_required
-        or full_reduction_required
-        or any(
-            node.target is _tracing_ops._while_loop
-            for info in graphs
-            for node in info.graph.nodes
-        )
-    )
     if (
         required_owner
         and cg.statements_stack[-1] is compiler.df.body
@@ -2739,12 +2801,14 @@ def codegen_computed_fragment_root(cg: GenerateAST) -> bool:
     # values in the ordinary kernel's host wrapper.
     cg.host_statements.extend(compiler.host_step_statements)
     compiler.df.arguments.extend(compiler.host_step_arguments)
-    if not shared_launch:
+    if not shared_launch and gathered_region is None:
         cg.device_function.cute_state.lanes.owned_root_block_dims = (
             compiler.threads,
             1,
             1,
         )
+    elif gathered_region is not None:
+        cg.device_function.cute_state.lanes.gathered_phase_threads = compiler.threads
     compiler.emit_mma_preamble()
     allocations = compiler.allocations()
     if compiler.shared_arena_plan is not None:

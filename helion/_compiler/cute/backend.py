@@ -67,6 +67,7 @@ from .compile_options import config_compile_options
 from .direct_affine_plan import DIRECT_AFFINE_ORDINARY_SCHEDULE
 from .exp2_fastmath import FTZ_SAFE_EXP2_META_KEY
 from .exp2_fastmath import TEMPLATE_EXP2_META_KEY
+from .gathered_launch import gathered_launch_compatible
 from .launch_shape import LaunchShapeFlags
 from .launch_shape import check_launch_shape
 from .launch_shape import live_grid_thread_extents
@@ -5003,6 +5004,21 @@ class CuteBackend(Backend):
                 raise exc.InvalidConfig(
                     f"warp-cooperative fragments require a whole number of warps in {block_arg}"
                 )
+            lanes = device_function.cute_state.lanes
+            if lanes.gathered_phase_threads is not None and (
+                not gathered_launch_compatible(
+                    config.config,
+                    actual_threads=math.prod(lanes.launch_block)
+                    if lanes.launch_block is not None
+                    else None,
+                    required_threads=lanes.gathered_phase_threads,
+                )
+                or plan_owned_launch(device_function.cute_state) is not None
+            ):
+                raise exc.InvalidConfig(
+                    f"gathered MMA phase needs {lanes.gathered_phase_threads} physical threads "
+                    f"and an ordinary persistent launch; got {block_arg}"
+                )
             launcher_args = [block_arg]
             # One --ptxas-options flag carries them all (a second would
             # replace the first).
@@ -5734,7 +5750,11 @@ class CuteBackend(Backend):
     def explain_root_failure(
         self, codegen: GenerateAST, error: exc.BackendUnsupported
     ) -> exc.BackendUnsupported | exc.InvalidConfig:
-        """Report a generic-lowering refusal after a fragment capacity decline.
+        """Explain why neither the fragment nor the generic lowering can own a root.
+
+        A whole-CTA fragment cannot run for packed independent grid tiles.
+        If the generic lowering also refuses the root, report the conflicting
+        packing before considering a shared-memory capacity decline.
 
         The computed-fragment owner declines a root whose shared memory exceeds
         the CTA capacity so the ordinary lowering can own it; when that lowering
@@ -5752,9 +5772,13 @@ class CuteBackend(Backend):
 
         if isinstance(error, CuteRegeneration.signals):
             return error
-        declined = (
-            codegen.device_function.cute_state.root_plans.fragment_capacity_decline
-        )
+        plans = codegen.device_function.cute_state.root_plans
+        if plans.fragment_packed_decline:
+            return exc.InvalidConfig(
+                "packed grid tiles cannot share a complete fragment CTA, "
+                f"and no other lowering owns this root: {error}"
+            )
+        declined = plans.fragment_capacity_decline
         if declined is None:
             return error
         needed, capacity = declined

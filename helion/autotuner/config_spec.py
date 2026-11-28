@@ -1663,6 +1663,9 @@ class ConfigSpec:
         self.cute_fp32_dot_search_enabled = False
         self.cute_fragment_half_mma_root_ids: frozenset[int] = frozenset()
         self.cute_fragment_half_mma_search_enabled = False
+        # Validated lane carrier of an ordinary-barrier gathered phase pair.
+        self.cute_gathered_phase_carriers: tuple[dict[str, object], ...] = ()
+        self.cute_gathered_phase_search_lanes: frozenset[tuple[int, ...]] = frozenset()
         self.cute_fp32_dot_seed_worthy = False
         self.cute_fragment_thread_root_ids: frozenset[int] = frozenset()
         self.cute_fragment_threads_search_enabled = False

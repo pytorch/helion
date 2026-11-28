@@ -168,6 +168,7 @@ from .cute_fragment_threads import CuteFragmentThreadsHeuristic
 from .cute_fragment_threads import register_fragment_threads_coverage
 from .cute_fragment_warp_scan import register_gather_warp_scan_coverage
 from .cute_full_chunk_row import CuteFullChunkRowHeuristic
+from .cute_gathered_bf16_mma import CuteGatheredBf16MmaSeed
 from .cute_gemv_fragment_mma import CuteGemvFragmentMmaHeuristic
 from .cute_gemv_ring_mma import CuteGemvRingMmaHeuristic
 from .cute_grouped_rna import CuteGroupedRnaHeuristic
@@ -281,6 +282,7 @@ _CUTE_HEURISTIC_CLASSES: tuple[AutotunerHeuristicType, ...] = (
     CuteTileVecWarpReduceHeuristic,
     CuteTileVecWarpPerRowHeuristic,
     CuteTilePackWarpPerRowHeuristic,
+    CuteGatheredBf16MmaSeed,
     CuteGemvFragmentMmaHeuristic,
     CuteGemvRingMmaHeuristic,
     CuteColumnReductionHeuristic,
