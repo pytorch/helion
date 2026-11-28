@@ -34,6 +34,72 @@ these labelled lines.
 - Why deferred: what a fix would take.
 - Pinned by: the tests that hold the current behavior, or none.
 
+## aot-unversioned-dataclass-evaluation
+
+- Area: cold unversioned AOT heuristic evaluation and binding-key lookup.
+- What is wrong: with Python 3.12, define a saved model with
+  `from __future__ import annotations`, `@dataclass class Bucket` with
+  field `n: int`, and a key `int(x.numel() == Bucket(7).n)`. For slots
+  with block sizes 16 and 32, a seven-element input selects 32 on ordinary
+  import. Cold evaluate mode returns the default block 8 for this kernel.
+  Its legacy loader executes the dataclass module without registering it
+  in `sys.modules`, so dataclass annotation resolution fails; the separate
+  unversioned binding-key loader uses the same import pattern.
+- Since: reproduced on main at `854fbf8ce` with the ordinary CPU AOT path.
+- Why deferred: both loaders need a common module identity and lifetime.
+  Changing this would switch which saved programs run in ordinary evaluate
+  mode, outside the compile/export change that exposed the issue.
+- Pinned by: none for the evaluate-mode fallback. The dataclass case in
+  `test_compile_saved_model_with_training_only_helion_import` checks compile
+  mode and its exported selector.
+
+## aot-selector-inherits-annotation-future
+
+- Area: byte-snapshot loading of AOT models and their standalone selectors.
+- What is wrong: define `class Bucket` with `n: int`, without importing
+  postponed annotations, and choose the slot with
+  `int(Bucket.__annotations__["n"] is int)`. Ordinary import on Python
+  3.12 selects slot 1. The snapshot loader and generated standalone selector
+  inherit their callers' future flags when they compile the model source;
+  both select slot 0. In a real two-slot model compile returned block 16
+  and exported slot 0 instead of the authored block 32 and slot 1.
+- Since: reproduced on main at `854fbf8ce`.
+- Why deferred: honoring the model's own flags in both compilers would change
+  the slot selected when re-exporting an existing saved model. Previously
+  exported files keep their embedded selectors. This compatibility decision
+  is separate from keeping selection and export consistent with each other.
+- Pinned by: none.
+
+## aot-heuristic-result-ignores-stride
+
+- Area: result caching for an unversioned model in static AOT compile mode.
+- What is wrong: set `key_demo(x) = int(x.stride(0) == 2)` with config
+  slots `block_sizes=[16]` and `[32]`. Compile `torch.arange(7)`, then
+  `torch.arange(14)[::2]` with the same kernel and model.
+  The selected results are 16 and 16, although the second input's key is
+  1 and its slot specifies 32. The saved result is looked up by extracted
+  shape features before the model's selector sees the new stride.
+- Since: reproduced on main at `854fbf8ce`.
+- Why deferred: choosing an appropriate cache identity for model-defined keys,
+  or reevaluating the key before reuse, changes selection and cache behavior
+  for existing models beyond the compiler/export path being integrated.
+- Pinned by: none.
+
+## aot-fallback-file-shared-between-kernels
+
+- Area: unversioned heuristic discovery shared by AOT key and config lookup.
+- What is wrong: put kernels `a` and `b` in one Python source file and
+  supply distinct fallback files `heuristic_a.py` and `heuristic_b.py`
+  in the AOT data directory. With no higher-priority model file, lookup
+  for `a` followed by `b` returns `heuristic_a.py` both times. The
+  unversioned discovery cache identifies the kernel source file without
+  distinguishing the fallback kernel name.
+- Since: reproduced on main at `854fbf8ce`.
+- Why deferred: changing the established discovery identity changes which
+  files existing unversioned kernels use. A separate change must cover both
+  binding-key and config lookup, as well as hardware and directory overrides.
+- Pinned by: none.
+
 ## indirect-memory-effects-in-inline-assembly
 
 - Area: compiler memory dependencies for `hl.inline_asm_elementwise`.

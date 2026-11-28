@@ -36,6 +36,8 @@ from ....exc import InvalidConfig
 from ..block_scaled_config import block_scaled_choices
 from ..block_scaled_config import normalize_block_scaled_config
 from ..cache_hint_forms import L2_POLICY_FORMS
+from ..cooperative_grid_init import grid_init_carrier
+from ..cooperative_grid_init import grid_init_surface
 from ..cute_flash import FLASH_KV_STAGE_KEY
 from ..cute_flash import FLASH_PIPELINE_FAMILY_KEY
 from ..cute_flash_bwd_row_mma import FLASH_BWD_FA4_FAMILY
@@ -180,6 +182,7 @@ from .config_keys import CUTE_GDN_RECURRENCE_TOKEN_GROUPS_KEY
 from .config_keys import CUTE_IMPLICIT_DEFAULT_KEYS
 from .config_keys import CUTE_LOAD_HINT_FORM_KEYS
 from .config_keys import CUTE_TOPK_CHOICES
+from .config_keys import GRID_INIT_KEY
 from .config_keys import VALID_CUTE_CHUNK_PREPARE_SCHEDULES
 from .config_keys import VALID_CUTE_CHUNK_RECURRENCE_REGISTER_CAPS
 from .config_keys import _cute_chunk_recurrence_config_is_safe
@@ -4324,6 +4327,15 @@ def normalize_finalize(
     fix_invalid: bool,
     provided_keys: set[str],
 ) -> None:
+    if GRID_INIT_KEY in config:
+        _normalize_gated_boolean(
+            config,
+            GRID_INIT_KEY,
+            enabled=grid_init_carrier(config_spec, config),
+            requirement="a local cooperative barrier schedule and CUDA grid-group support",
+            fix_invalid=fix_invalid,
+            fill=False,
+        )
     preserve_keys = surface.implicit_default_keys_to_preserve(
         config_spec.tcgen05, config
     )
@@ -4413,6 +4425,8 @@ def cute_flat_fields(
         "block_sizes": config_spec.block_sizes,
     }
 
+    if grid_init_surface(config_spec):
+        fields[GRID_INIT_KEY] = BooleanFragment()
     if config_spec.cute_signed_bitfield_bf16_available:
         fields["cute_signed_bitfield_bf16"] = BooleanFragment()
     if config_spec.cute_host_paired_sum_available:
@@ -5446,7 +5460,7 @@ def flatten_missing_field_default(
         return True, "off"
     if key == "cute_materialized_operand_schedule":
         return True, "off"
-    if key == "cute_fragment_private_scalar_loops":
+    if key in ("cute_fragment_private_scalar_loops", GRID_INIT_KEY):
         return True, False
     if key == "cute_fragment_producer_cache":
         return True, False

@@ -33,8 +33,8 @@ pinned by ``test/test_cute_ast_pass_utils.py`` against the legacy copies:
   node.
 * dataflow -- ``exposed_reads`` (forward, with explicit branch/loop/define
   policies) and ``live_in`` (backward, zero-trip loops).
-* device body -- ``phase_barrier_call`` recognizes the emitted local grid join
-  ABI (``PHASE_BARRIER_ARITIES``); ``body_end_follows_all_tiles`` tells whether
+* device body -- ``phase_barrier_call`` recognizes the local software and toolkit join
+  ABIs (``PHASE_BARRIER_ARITIES``); ``body_end_follows_all_tiles`` tells whether
   an appended statement runs once per CTA, after all of its tiles.
 
 Do not import this module from device-helper modules that generated code
@@ -452,11 +452,14 @@ def constexpr_v_loop(node: ast.AST) -> tuple[ast.For, int] | None:
 # --------------------------------------------------------------------------
 
 
-PHASE_BARRIER_ARITIES = {"_cute_grid_barrier": 1}
+PHASE_BARRIER_ARITIES = {
+    "_cute_grid_barrier": 1,
+    "_cute_toolkit_grid_sync": 1,
+}
 
 
 def phase_barrier_call(stmt: ast.stmt) -> ast.Call | None:
-    """A direct call to the compiler-emitted local grid join."""
+    """A local software or toolkit grid join."""
     if isinstance(stmt, ast.Expr) and isinstance(call := stmt.value, ast.Call):
         if (
             isinstance(call.func, ast.Name)

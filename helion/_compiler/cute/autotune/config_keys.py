@@ -36,6 +36,7 @@ from ..tcgen05_config import CUTE_TCGEN05_STRATEGY_CONFIG_KEYS
 from ..tcgen05_config import CUTE_TCGEN05_TUNABLE_KEYS
 from ..tcgen05_flat_grouped_config import CONFIG_KEYS as GROUPED_RNA_CONFIG_KEYS
 
+GRID_INIT_KEY = "cute_in_kernel_grid_init"
 # -- recurrence / scan / top-k families (keys owned by their emitters) --------
 CUTE_CHUNK_RECURRENCE_DV_PARTITIONS_KEY = "cute_chunk_recurrence_dv_partitions"
 CUTE_CHUNK_RECURRENCE_REGISTER_CAP_KEY = "cute_chunk_recurrence_register_cap"
@@ -204,6 +205,7 @@ CUTE_MISC_SCHEDULE_KEYS: tuple[str, ...] = (
     "cute_scalar_epilogue_keep_inputs",
     "cute_scalar_epilogue_owner_fold",
     "cute_warp_fp32_redux",
+    GRID_INIT_KEY,
     "cute_register_tile_warp_fold",
     "cute_register_tile_cooperative_fold",
     "cute_register_tile_store_first",

@@ -27,6 +27,7 @@ from .....autotuner.compiler_coverage import CoverageWitness
 from .....exc import InvalidConfig
 from .....runtime.config import Config
 from ....autotuner_heuristics.common import dedupe_configs
+from ...cooperative_grid_init import grid_init_carrier
 from ...grouped_row_union import AB_STAGES_KEY as GROUPED_ROW_UNION_AB_STAGES_KEY
 from ...grouped_row_union import CONFIG_KEY as GROUPED_ROW_UNION_KEY
 from ...grouped_row_union import LEGACY_SCHEDULE
@@ -41,6 +42,7 @@ from ...grouped_row_union import TRANSPOSED_SCHEDULE
 from ...split_k_cluster_config import FINALIZER_KEY
 from ...tcgen05_constants import TCGEN05_CONSUMER_REGS_CONFIG_KEY
 from ...tcgen05_constants import TCGEN05_WARP_REGISTER_REALLOCATION_CONFIG_KEY
+from ..config_keys import GRID_INIT_KEY
 from ..fragment_knobs import CuteFragmentAtomicAggregationHeuristic
 from ..fragment_knobs import CuteFragmentAtomicConsumerFusionHeuristic
 from ..fragment_knobs import CuteFragmentBatchedLoadsHeuristic
@@ -530,6 +532,15 @@ def postprocess_seed_configs(
         env.config_spec.autotuner_heuristics.append(
             CuteRowStreamRetentionHeuristic.name
         )
+    # Keep the ordinary counter as a candidate. One representative config
+    # is enough to try initializing that counter in the cooperative kernel.
+    for carrier in configs:
+        if grid_init_carrier(env.config_spec, carrier.config):
+            configs.append(
+                Config.from_dict(deepcopy(carrier.config) | {GRID_INIT_KEY: True})
+            )
+            env.config_spec.autotuner_heuristics.append("in_kernel_grid_init")
+            break
     return configs
 
 

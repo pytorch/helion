@@ -138,6 +138,13 @@ def _tma_role_waits_before_dependent_loads(device: ast.FunctionDef, atom: str) -
     return not _dependent_load_before_wait(role.body, atom)
 
 
+def project_flat_stage_pid(config: Config) -> None:
+    """Project a validated resident launch onto ConfigSpec's flat PID policy."""
+    config.config["pid_type"] = "flat"
+    config.config.pop("num_sm_multiplier", None)
+    config.config.pop("maxnreg", None)
+
+
 def _stage_config(
     config: Config,
     plan: MaterializedFissionPlan,
@@ -271,10 +278,7 @@ def _stage_config(
     # particular, the native consumer keeps its original scheduling config.
     pid_type = result.config.pop("cute_pointwise_pid_type", "inherit")
     if pointwise and pid_type == "flat":
-        result.config["pid_type"] = "flat"
-        # Match ConfigSpec's non-persistent PID policy for these two options.
-        result.config.pop("num_sm_multiplier", None)
-        result.config.pop("maxnreg", None)
+        project_flat_stage_pid(result)
     if project_ffi:
         result.config[TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY] = False
     return result

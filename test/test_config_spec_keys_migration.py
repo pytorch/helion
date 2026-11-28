@@ -98,7 +98,7 @@ _BASE_VALID_KEYS = """
     cute_fragment_bounded_gather cute_fragment_cta_topk cute_fragment_half_mma
     cute_fragment_integer_atomic_epochs cute_fragment_local_atomic_registers
     cute_fragment_mma_rows cute_fragment_packet_loads cute_fragment_padded_rows
-    cute_fragment_private_scalar_loops cute_fragment_producer_cache
+    cute_in_kernel_grid_init cute_fragment_private_scalar_loops cute_fragment_producer_cache
     cute_fragment_published_scalars cute_fragment_pure_producer_regions
     cute_fragment_reduction cute_fragment_register_loads
     cute_fragment_register_producers cute_fragment_register_snapshots
@@ -277,7 +277,7 @@ _BASE_BACKEND_SPECIFIC_KEYS = """
     cute_fragment_bounded_gather cute_fragment_cta_topk cute_fragment_half_mma
     cute_fragment_integer_atomic_epochs cute_fragment_local_atomic_registers
     cute_fragment_mma_rows cute_fragment_packet_loads cute_fragment_padded_rows
-    cute_fragment_private_scalar_loops cute_fragment_producer_cache
+    cute_in_kernel_grid_init cute_fragment_private_scalar_loops cute_fragment_producer_cache
     cute_fragment_published_scalars cute_fragment_pure_producer_regions
     cute_fragment_reduction cute_fragment_register_loads
     cute_fragment_register_producers cute_fragment_register_snapshots
@@ -408,7 +408,7 @@ _BASE_CUTE_IMPLICIT_DEFAULT_KEYS = """
     cute_fragment_bounded_gather cute_fragment_cta_topk cute_fragment_half_mma
     cute_fragment_integer_atomic_epochs cute_fragment_local_atomic_registers
     cute_fragment_mma_rows cute_fragment_packet_loads cute_fragment_padded_rows
-    cute_fragment_private_scalar_loops cute_fragment_producer_cache
+    cute_in_kernel_grid_init cute_fragment_private_scalar_loops cute_fragment_producer_cache
     cute_fragment_published_scalars cute_fragment_pure_producer_regions
     cute_fragment_reduction cute_fragment_register_loads
     cute_fragment_register_producers cute_fragment_register_snapshots
@@ -516,7 +516,7 @@ _BASE_CUTE_ACCEPTED = """
     cute_fragment_bounded_gather cute_fragment_cta_topk cute_fragment_half_mma
     cute_fragment_integer_atomic_epochs cute_fragment_local_atomic_registers
     cute_fragment_mma_rows cute_fragment_packet_loads cute_fragment_padded_rows
-    cute_fragment_private_scalar_loops cute_fragment_producer_cache
+    cute_in_kernel_grid_init cute_fragment_private_scalar_loops cute_fragment_producer_cache
     cute_fragment_published_scalars cute_fragment_pure_producer_regions
     cute_fragment_reduction cute_fragment_register_loads
     cute_fragment_register_producers cute_fragment_register_snapshots

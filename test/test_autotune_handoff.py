@@ -79,6 +79,9 @@ class _Backend:
     def generated_source_hash(self, fn: object) -> str | None:
         return cast("_Compiled", fn).source_hash
 
+    def can_reuse_autotune_result(self, spec: object, config: Config) -> bool:
+        return True
+
     def autotune_config_is_viable(self, spec: object, config: Config) -> bool:
         return True
 
@@ -613,6 +616,22 @@ class TestAutotuneHandoff(unittest.TestCase):
         self.assertEqual(cache.writes, [])
         self.assertEqual(script.calls[1], 3)
         self.assert_cleaned_up(script)
+
+    @_scripted_local_provider()
+    def test_cached_winner_missing_a_runtime_dependency_restarts_search(self) -> None:
+        script = _Script({1: [1.0], 2: [0.5]})
+        cache = _Cache(
+            _Search(
+                _Kernel(script),
+                [[1, 2]],
+                returned=2,
+                provider_cls=LocalBenchmarkProvider,
+            ),
+            cached=_config(1),
+        )
+        with patch.object(_Backend, "can_reuse_autotune_result", return_value=False):
+            assert cache.autotune() == _config(2)
+        assert cache.reads == 1 and cache.writes == [_config(2)]
 
     @_scripted_local_provider()
     def test_completed_cache_miss_preserves_search_result_in_cache(self) -> None:

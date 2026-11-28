@@ -109,9 +109,11 @@ class RemoteAutotuneCache(LocalAutotuneCache):
             record = json.loads(data)
             self._validate_config_policy(record)
             config = Config.from_json(record["config"])
-            super().put(config)
-            log.debug("remote cache hit: %s", cache_hash)
-            return config
+            # Local writes normalize the config, so validate it before copying.
+            if self._can_reuse(config):
+                super().put(config)
+                log.debug("remote cache hit: %s", cache_hash)
+                return config
         return super().get()
 
     def put(self, config: Config) -> None:
@@ -148,9 +150,11 @@ class StrictRemoteAutotuneCache(StrictLocalAutotuneCache):
             record = json.loads(data)
             self._validate_config_policy(record)
             config = Config.from_json(record["config"])
-            super().put(config)
-            log.debug("remote cache hit: %s", cache_hash)
-            return config
+            # Local writes normalize the config, so validate it before copying.
+            if self._can_reuse(config):
+                super().put(config)
+                log.debug("remote cache hit: %s", cache_hash)
+                return config
         return super().get()
 
     def put(self, config: Config) -> None:

@@ -497,6 +497,9 @@ class BaseSearch(BaseAutotuner):
         counters: A counter to track various metrics during the search.
     """
 
+    # Set by an actual unversioned AOT cache, including when it wraps an
+    # already constructed search. Such a search may only price deployable slots.
+    _requires_unversioned_aot_export: bool = False
     # Snapshot the timing policy for all queued measurements in this search.
     _input_bank_count: int = 1
     # The prelude this search's candidates are timed behind, read when the
@@ -1100,6 +1103,13 @@ class BaseSearch(BaseAutotuner):
         filtered: list[Config | None] = []
         for config in configs:
             candidate = config_filter(config) if config_filter is not None else config
+            if candidate is not None and self._requires_unversioned_aot_export:
+                # FiniteSearch disables heuristic screening for explicit
+                # configs; a cache's deployment contract still applies to them.
+                try:
+                    self.config_spec.backend.validate_aot_bundle_config(candidate)
+                except exc.InvalidConfig:
+                    candidate = None
             if candidate is not None and not self._backend_config_is_viable(candidate):
                 candidate = None
             filtered.append(candidate)

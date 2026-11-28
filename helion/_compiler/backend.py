@@ -827,6 +827,24 @@ class Backend(abc.ABC):
         """
         return {}
 
+    def can_reuse_autotune_result(self, spec: ConfigSpec, config: Config) -> bool:
+        """Check a cached winner's optional local runtime dependencies on this host."""
+        return True
+
+    def standalone_config(
+        self, spec: ConfigSpec, config: Config, *, stored: bool = False
+    ) -> Config:
+        """Resolve a recorded choice to the portable program exported for its slot."""
+        return config
+
+    def validate_aot_bundle_config(self, config: Mapping[str, object]) -> None:
+        """Reject a new backend schedule the legacy AOT bundle cannot reproduce."""
+        return None
+
+    def aot_fallback_config(self, spec: ConfigSpec, config: Config) -> Config:
+        """Choose a usable program when an AOT winner needs an unavailable dependency."""
+        return spec.default_config()
+
     def autotune_config_is_viable(
         self, config_spec: ConfigSpec, config: Config
     ) -> bool:

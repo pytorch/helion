@@ -103,6 +103,7 @@ from .cute.structural_config import select_structural_policy
 from .ref_mode import RefModeContext
 from .ref_mode import is_ref_mode_enabled
 from .settings import Settings
+from .settings import default_autotuner_fn
 from .structural_policy import StructuralConfig
 from .structural_policy import StructuralPolicyError
 from .structural_policy import require_same_structural_policy
@@ -3210,7 +3211,6 @@ class Kernel(Generic[_R]):
         from ..autotuner.benchmark_provider import _has_valid_multi_shape_measurement
         from ..autotuner.benchmark_provider import _materialize_multi_shape_config
         from ..autotuner.benchmark_provider import _MultiShapeAutotuneArgs
-        from .settings import default_autotuner_fn
 
         if aggregation not in ("geomean", "max"):
             raise exc.InvalidAPIUsage(
@@ -3804,6 +3804,13 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
             wide_empty_grid=wide_empty_grid,
             is_distributed=is_distributed,
         )
+        # The original AOT bundler cannot preserve every backend schedule.
+        # Carry this binding's actual deployment format into its search surface.
+        self._env.config_spec.unversioned_aot_bundle = (
+            kernel.settings.autotuner_fn is default_autotuner_fn
+            and kernel.settings.autotune_cache == "AOTAutotuneCache"
+            and kernel.cute_structural_policy is None
+        )
         # The structural policy the traced IR will follow (None for backends
         # whose config schema does not depend on Settings).
         policy_type = self._env.backend.structural_policy_type()
@@ -4106,6 +4113,10 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
         with self.env, measure("BoundKernel.to_code"):
             # Work on a copy so the caller's Config is not mutated with defaults
             # specific to this BoundKernel's config_spec.
+            if options is not None and not options.allow_helion_deps:
+                config = self.env.backend.standalone_config(
+                    self.config_spec, self._normalize_config(config)
+                )
             config = self._normalized_config_copy(config)
             with (
                 self._runtime_arg_values_for_codegen(),
@@ -4643,7 +4654,11 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
             config = selections.get(key)
             if config is not None:
                 selections.move_to_end(key)
-                return copy.deepcopy(config)
+                config = copy.deepcopy(config)
+        if config is not None and self.env.backend.can_reuse_autotune_result(
+            self.config_spec, config
+        ):
+            return config
         return None
 
     def autotune(

@@ -1988,9 +1988,95 @@ class CuteBackend(Backend):
                 priors["cute_mma_dag"] = weighted_choice({"warp": 4.0, "off": 1.0})
         return priors
 
+    def can_reuse_autotune_result(self, spec: ConfigSpec, config: Config) -> bool:
+        from .autotune.config_keys import GRID_INIT_KEY
+        from .cooperative_grid_init import grid_init_schedule
+        from .cooperative_grid_ptx import grid_sync_asm
+
+        value = config.get(GRID_INIT_KEY, False)
+        if value is False:
+            return True
+        if value is not True:
+            return False
+        cap = spec.target_device_capability
+        if cap is None or not grid_init_schedule(spec, config.config):
+            return False
+        try:
+            spec.normalized_config(config)
+            return grid_sync_asm(cap) is not None
+        except exc.InvalidConfig:
+            return False
+
+    def standalone_config(
+        self, spec: ConfigSpec, config: Config, *, stored: bool = False
+    ) -> Config:
+        from .autotune.config_keys import GRID_INIT_KEY
+        from .cooperative_grid_init import grid_init_requested
+        from .cooperative_grid_init import grid_software_carrier
+
+        if not grid_init_requested(config):
+            return config
+        # Standalone source is deployed separately from the machine that
+        # exports it. Its counter must not require that machine's NVRTC leaf.
+        if not stored and not grid_software_carrier(spec, config.config):
+            raise exc.InvalidConfig(
+                "Private grid initialization needs a cooperative barrier schedule"
+            )
+        carrier = config.config.copy()
+        carrier.pop(GRID_INIT_KEY)
+        if stored and spec.cute_dependent_phase_launches:
+            from .materialized_fission_codegen import project_flat_stage_pid
+
+            # A private grid schedule can only have used the barrier policy.
+            # A separate ordered launch no longer has that config field.
+            for key in ("cross_loop_pipeline", "cross_loop_schedule"):
+                if key in carrier and carrier.pop(key) != "barrier":
+                    raise exc.InvalidConfig(
+                        "A stored private grid schedule requires the barrier policy"
+                    )
+            # Validate the original resident-only choices before projecting
+            # them away, and retain the other tuned math and layout fields.
+            ordered = spec.normalized_config(carrier)
+            project_flat_stage_pid(ordered)
+            for key in ("cute_pdl", "tcgen05_materialized_pdl"):
+                if ordered.get(key) is True:
+                    ordered.config[key] = False
+            return spec.normalized_config(ordered)
+        # This is also a public explicit config: do not repair unrelated errors.
+        normalized = spec.normalized_config(carrier)
+        # A selected contraction schedule can split phases and normalize an
+        # explicitly persistent PID to flat. It has no grid join to preserve.
+        if not stored and not grid_software_carrier(spec, normalized.config):
+            raise exc.InvalidConfig(
+                "Private grid initialization needs a normalized cooperative barrier schedule"
+            )
+        return normalized
+
+    def validate_aot_bundle_config(self, config: Mapping[str, object]) -> None:
+        from .cooperative_grid_init import grid_init_requested
+
+        if grid_init_requested(config):
+            raise exc.InvalidConfig(
+                "An unversioned AOT standalone bundle cannot export private grid initialization; "
+                "bind the desired shape with static_shapes=True, then use "
+                "bound.to_code(config, options=OutputCodeOptions(allow_helion_deps=False)) "
+                "for the portable program of one binding"
+            )
+
+    def aot_fallback_config(self, spec: ConfigSpec, config: Config) -> Config:
+        from .autotune.config_keys import GRID_INIT_KEY
+
+        if GRID_INIT_KEY in config:
+            # A stored slot can normalize its geometry for this binding;
+            # unrelated validation failures must still surface to the caller.
+            return self.standalone_config(spec, config, stored=True)
+        return super().aot_fallback_config(spec, config)
+
     def autotune_config_is_viable(
         self, config_spec: ConfigSpec, config: Config
     ) -> bool:
+        from .autotune.config_keys import GRID_INIT_KEY
+        from .cooperative_grid_init import grid_init_schedule
         from .cute_mma_dag import AXIS_LEAD
         from .cute_mma_dag import AXIS_LOOP
         from .cute_mma_dag import AXIS_ROOT
@@ -2015,6 +2101,11 @@ class CuteBackend(Backend):
         from .cute_mma_dag import mma_dag_config_reason
         from .paged_attention_config import paged_attention_config_reason
         from .pdl_ops import config_conflicts_with_required_owner
+
+        if config.get(GRID_INIT_KEY) and not grid_init_schedule(
+            config_spec, config.config
+        ):
+            return False
 
         if config_conflicts_with_required_owner(config_spec, config):
             return False
@@ -2729,6 +2820,8 @@ class CuteBackend(Backend):
         # at module level, and this module is loaded through
         # ``backend_registry`` (imported at the top of ``compile_environment``)
         # while ``compile_environment`` is still initializing.
+        from ..compile_environment import CompileEnvironment
+        from .cooperative_grid_init import initialize_grid_counter
         from .passes import pdl
         from .passes.pipeline import run_device_body_passes
 
@@ -2737,6 +2830,7 @@ class CuteBackend(Backend):
         body, extra_args = run_device_body_passes(body, ctx)
         if late is not None:
             body = pdl.place_late_wait(body, late)
+        initialize_grid_counter(body, fn, CompileEnvironment.current().config_spec)
         return body, extra_args
 
     def finalize_kernel_def(
@@ -3493,6 +3587,7 @@ class CuteBackend(Backend):
             "_cute_store_u32x4_streaming": "from helion._compiler.cute.l2_policy import store_u32x4_streaming as _cute_store_u32x4_streaming",
             "_cute_store_fp8e4m3fn_vec_streaming": "from helion._compiler.cute.packet_store_helpers import store_fp8e4m3fn_vec_streaming as _cute_store_fp8e4m3fn_vec_streaming",
             "_cute_store_fp8e5m2_vec_streaming": "from helion._compiler.cute.packet_store_helpers import store_fp8e5m2_vec_streaming as _cute_store_fp8e5m2_vec_streaming",
+            "_cute_toolkit_grid_sync": "from helion._compiler.cute.cooperative_grid_op import toolkit_grid_sync as _cute_toolkit_grid_sync",
             "_cute_grid_barrier": "from helion._compiler.cute.grid_barrier import grid_barrier as _cute_grid_barrier",
             "_cute_tmem_store_atom": "from helion._compiler.cute.split_k_exchange import tmem_store_atom as _cute_tmem_store_atom",
             "_cute_join_cast": "from helion._compiler.cute.join_cast import join_cast as _cute_join_cast",
@@ -4208,9 +4303,25 @@ class CuteBackend(Backend):
             return x
         return self.cast_ast(x, torch.float32)
 
+    def transform_host_arg(
+        self, arg: Argument, host_str: str, tensor_host_args: list[str]
+    ) -> str:
+        from ..device_function import DeviceFunction
+        from .cooperative_grid_init import empty_private_counter
+
+        if arg.name == DeviceFunction.current().cute_state.private_grid_init_arg:
+            return empty_private_counter(arg, host_str)
+        return host_str
+
     def grid_barrier_stmt(self, sem_arg: str) -> str | None:
         # ``sem_arg`` is a TensorArg that arrives as a ``cute.Tensor``; its
         # ``.iterator`` is the underlying ``cute.Pointer`` to the semaphore.
+        from ..device_function import DeviceFunction
+        from .autotune.config_keys import GRID_INIT_KEY
+
+        fn = DeviceFunction.current()
+        if fn.config.get(GRID_INIT_KEY):
+            fn.cute_state.private_grid_init_arg = sem_arg
         return f"_cute_grid_barrier({sem_arg}.iterator)"
 
     def _check_thread_axis(self, axis: int) -> None:
