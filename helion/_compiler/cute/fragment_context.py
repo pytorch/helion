@@ -116,6 +116,17 @@ def _loop_carry_slots(node: Node) -> dict[int, int]:
 
 
 @dataclass(frozen=True)
+class DenseSharedIndex:
+    """The canonical zero-offset read of an allocator-owned shared tile."""
+
+    name: str
+    physical_shape: tuple[int, ...]
+
+    def __call__(self, indices: tuple[str, ...]) -> str:
+        return f"{self.name}[{FragmentContext.flatten(indices, self.physical_shape)}]"
+
+
+@dataclass(frozen=True)
 class Fragment:
     shape: tuple[int, ...]
     dtype: torch.dtype
@@ -476,12 +487,17 @@ class FragmentContext:
         values: dict[Node, object],
         *,
         output_indices: frozenset[int] | None = None,
+        private_loop_outputs: dict[int, tuple[Node, Fragment]] | None = None,
     ) -> object:
         """Walk a (nested) graph, binding every node's lowering into ``values``.
 
         The control-flow emitters call back into the walk for their bodies;
         ``FragmentCompiler`` provides it. A proved branch projection can retain
         only selected return slots; it still emits every node and effect.
+        A loop may offer its private input/output buffers to a complete
+        transition. Returning an offered buffer by identity means its final
+        value is already visible to the CTA; lowering that cannot guarantee
+        this clears the offer before returning ordinary graph results.
         """
         raise NotImplementedError
 
@@ -509,6 +525,8 @@ class FragmentContext:
         self.held: list[object] = []
         self.threads = cast("int", self.df.config.get("cute_fragment_threads", 128))
         self.used_gathered_bf16_fold = False
+        self.used_async_gathered_page = False
+        self.needs_gathered_softmax_runtime = False
         self.thread = ""
         self.block_volume: str | None = None
         self.padded_rows = bool(self.df.config.get("cute_fragment_padded_rows", False))
@@ -1190,7 +1208,7 @@ class FragmentContext:
         return Fragment(
             value.shape,
             value.dtype,
-            lambda indices: f"{name}[{self.flatten(indices, physical)}]",
+            DenseSharedIndex(name, physical),
             True,
             (),
             name,

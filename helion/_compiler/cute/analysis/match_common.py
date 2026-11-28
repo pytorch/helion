@@ -24,6 +24,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 from typing import NamedTuple
+from typing import cast
 
 import sympy
 import torch
@@ -45,6 +46,22 @@ def is_call(node: object, *targets: object) -> bool:
         and node.op == "call_function"
         and node.target in targets
     )
+
+
+class MatchFailure(Exception):
+    """A required FX dataflow or memory fact is absent."""
+
+
+def require_match(test: object) -> None:
+    if not test:
+        raise MatchFailure
+
+
+def match_args(node: object, target: object, arity: int) -> tuple[object, ...]:
+    require_match(is_call(node, target))
+    call = cast("torch.fx.Node", node)
+    require_match(len(call.args) == arity and not call.kwargs)
+    return call.args
 
 
 def input_closure(output: torch.fx.Node) -> set[torch.fx.Node]:

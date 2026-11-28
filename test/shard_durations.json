@@ -153,7 +153,7 @@
  "test/test_cute_fragment_assertion.py": 4.2,
  "test/test_cute_fragment_direct_store.py": 12.1,
  "test/test_cute_fragment_epilogue.py": 2.7,
- "test/test_cute_fragment_half_mma.py": 3.1,
+ "test/test_cute_fragment_half_mma.py": 21.2,
  "test/test_cute_fragment_index_domains_gpu.py": 2.2,
  "test/test_cute_fragment_input_layout_gpu.py": 0.7,
  "test/test_cute_fragment_signed_coordinates.py": 4.4,

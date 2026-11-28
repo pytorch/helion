@@ -10,8 +10,12 @@ import torch
 from .....runtime.config import Config
 from ....autotuner_heuristics.registry import AutotunerHeuristic
 from ....inductor_lowering import ReductionLowering
+from ... import gathered_panel_layout as panels
+from ... import target_facts
 from ...analysis.match_common import unit_fixed_block
+from ...cooperative_grid_init import grid_init_carrier
 from ...gathered_launch import GATHERED_SEED_THREADS
+from ..config_keys import GRID_INIT_KEY
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -140,6 +144,136 @@ def _gathered_phase_carrier(
         pid_type="persistent_blocked",
         cross_loop_pipeline="barrier",
     )
+
+
+def streaming_phase_carriers(
+    env: CompileEnvironment, ir: DeviceIR, base: Config, region: Sequence[GraphInfo]
+) -> list[Config]:
+    """When an entire page transition is warp-native, give the merge every lane.
+
+    The producer cooperates across the whole CTA, so its logical page and
+    output axes need no physical thread coordinates. Assigning all CTA lanes
+    to consecutive merge columns avoids executing each split loop once per
+    unused producer x-lane. At two page widths, split-first order balances
+    independent CTAs and QK reuse; a one-page-width value-first panel keeps
+    consecutive PIDs on live splits. Retain the wide panel for long contexts.
+    """
+    # The registry loads before the public Config export; FX analysis imports
+    # fragment memory code that depends on that export.
+    from ...analysis.gathered_softmax import prove_gathered_softmax
+    from ...gathered_softmax import can_pipeline_page
+
+    if ir.host_function is None or len(ir.grid_block_ids) != 2:
+        return []
+    with ir.host_function:
+        pages = [
+            p
+            for g in region
+            if (p := prove_gathered_softmax(g.graph, ir.graphs, env)) is not None
+        ]
+    if len(pages) != 1:
+        return []
+    page = pages[0]
+    _, value_axis = ir.grid_block_ids[0]
+    row_axis, column_axis = ir.grid_block_ids[1]
+    extent = env.block_sizes[value_axis].size
+    if (
+        page.value_bid != value_axis
+        or type(extent) is not int
+        or extent < GATHERED_SEED_THREADS
+        or extent % GATHERED_SEED_THREADS
+    ):
+        return []
+    spec = env.config_spec
+    lanes = [
+        GATHERED_SEED_THREADS if item.block_id == column_axis else 1
+        for item in spec.num_threads
+    ]
+    choices = []
+    for width in dict.fromkeys(
+        min(extent, size)
+        for size in (2 * page.qk.columns, page.qk.columns, 4 * page.qk.columns)
+    ):
+        if width % 32 or extent % width:
+            continue
+        sizes = {value_axis: width, row_axis: 1, column_axis: GATHERED_SEED_THREADS}
+        # The first grid axis is split, the second is value. Only this
+        # narrow panel benefits from assigning neighboring physical workers
+        # consecutive value panels of the same live split. Keep every other
+        # root's ordinary order.
+        order: dict[str, object] = {}
+        if width == page.qk.columns:
+            orders = []
+            for item in spec.loop_orders:
+                axes = list(range(len(item.block_ids)))
+                if item.block_ids == ir.grid_block_ids[0]:
+                    axes.reverse()
+                orders.append(axes)
+            if orders:
+                order["loop_orders"] = orders
+        choices.append(
+            Config.from_dict(
+                base.config
+                | order
+                | {
+                    "block_sizes": [
+                        sizes.get(item.block_id, existing)
+                        for item, existing in zip(
+                            spec.block_sizes, base.block_sizes, strict=True
+                        )
+                    ],
+                    "num_threads": lanes,
+                    # Both independent barrier phases can occupy all workers,
+                    # including a short merge after a much larger producer.
+                    "pid_type": (
+                        "persistent_interleaved"
+                        if "persistent_interleaved" in spec.allowed_pid_types
+                        else base.pid_type
+                    ),
+                }
+            )
+        )
+    # Preserve existing reproducible seeds and add opt-in pipeline
+    # carriers for compatible geometry, row strides and current pointers.
+    # Lowering independently requires all three cache-backed alignment proofs.
+    for config in choices.copy():
+        width = next(
+            size
+            for item, size in zip(spec.block_sizes, config.block_sizes, strict=True)
+            if item.block_id == value_axis
+        )
+        if can_pipeline_page(
+            env, page, width, GATHERED_SEED_THREADS, require_bound_pointer=False
+        ):
+            pipeline = config.config | {"cute_gathered_page_pipeline": True}
+            choices.extend(
+                (
+                    Config.from_dict(pipeline),
+                    Config.from_dict(pipeline | {"cute_gathered_page_stages": 4}),
+                )
+            )
+            # A long contraction can start eight distinct cp.async groups
+            # immediately. Do not plant this high-storage carrier on a short
+            # contraction or a device where even its page buffers do not fit.
+            # Codegen subsequently budgets the complete phase and launcher.
+            maximum = panels.RING_STAGES[-1]
+            capacity = target_facts.per_cta_smem_capacity_bytes(env.device)
+            if (
+                page.qk.depth >= maximum * panels.DEPTH_PANEL
+                and capacity
+                and panels.working_set_bytes(
+                    page.qk.rows, page.qk.columns, width, maximum
+                )
+                <= capacity
+            ):
+                deepest = pipeline | {"cute_gathered_page_stages": maximum}
+                choices.append(Config.from_dict(deepest))
+                # A short merge should not pay a second device launch just
+                # to zero its grid counter. Keep the host-zeroed schedule as
+                # a comparison and offer only one additional long-K carrier.
+                if grid_init_carrier(spec, deepest):
+                    choices.append(Config.from_dict(deepest | {GRID_INIT_KEY: True}))
+    return choices
 
 
 class CuteGatheredBf16MmaSeed(AutotunerHeuristic):

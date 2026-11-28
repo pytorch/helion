@@ -468,6 +468,8 @@ def _normalize_cute_register_subblocks(
     for key in (
         "cute_fp32_dot",
         "cute_fragment_half_mma",
+        "cute_gathered_page_pipeline",
+        "cute_gathered_page_stages",
         "cute_fragment_padded_rows",
         "cute_fragment_unrolled_loops",
         "cute_fragment_vector_io",

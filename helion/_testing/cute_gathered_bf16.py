@@ -33,6 +33,49 @@ def routed_transposed_product(
     return out
 
 
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def masked_page_stream(
+    q: torch.Tensor,
+    bank: torch.Tensor,
+    table: torch.Tensor,
+    state: torch.Tensor,
+    scale: float,
+) -> torch.Tensor:
+    rows, depth = q.shape
+    keys = bank.size(1)
+    out = torch.empty_like(q, dtype=torch.float32)
+    block_k = hl.register_block_size(depth)
+    for tile_d in hl.tile(depth):
+        # These two slices can share one cooperative load. The mask must read
+        # the second row, including its shared-memory offset.
+        limit = state[1, :]
+        maximum = state[0, :].float()
+        norm = hl.zeros([rows], dtype=torch.float32)
+        output = hl.zeros([rows, tile_d], dtype=torch.float32)
+        for page in hl.tile(0, 8, block_size=1):
+            index = table[0, page.begin]
+            scores = hl.zeros([rows, keys], dtype=torch.float32)
+            for k in hl.tile(depth, block_size=block_k):
+                scores = hl.dot(q[:, k], bank[index, :, k].T, acc=scores)
+            pos = page.begin * keys + hl.arange(keys)
+            scores = torch.where(
+                pos[None, :] < limit[:, None], scores * scale, -float("inf")
+            )
+            new_max = torch.maximum(maximum, torch.amax(scores, dim=-1))
+            safe = torch.where(new_max == -float("inf"), 0.0, new_max)
+            alpha = torch.exp2(maximum - safe)
+            probability = torch.exp2(scores - safe[:, None])
+            norm = norm * alpha + torch.sum(probability, dim=-1)
+            output = hl.dot(
+                probability.to(torch.bfloat16),
+                bank[index, :, tile_d],
+                acc=output * alpha[:, None],
+            )
+            maximum = new_max
+        out[:, tile_d] = (output + maximum[:, None]) / norm[:, None]
+    return out
+
+
 def split_paged_attention(
     query: torch.Tensor,
     kv_cache: torch.Tensor,
