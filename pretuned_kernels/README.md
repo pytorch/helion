@@ -132,6 +132,7 @@ there rather than replacing the discovery file.
 | `glm5_3_flash_tp4` | GLM-5.3 Flash NVFP4 at TP4, 6-token verify window: KDA, MLA prologue + pooled DSA indexer, sparse MLA + o_proj, MoE and dense MLP, each with the all-reduce and the mHC layer boundary; MTP draft layer and LM head | torch references on synthetic weights (check); timed with cold weights, alone or (LM head) against the stock chain (README: served in SGLang) |
 | `inkling2_small` | Inkling-2-Small TP4 / EP4 verify, 8 rows, local / block / global attention layers and NVFP4 / MXFP8 MoE | the stock vLLM Inkling 2 path, end to end in vLLM |
 | `gemma4_a4b_moe` | Gemma 4 26B-A4B BF16 batch-1 MoE | vLLM Gemma 4 router + fused MoE with default backend selection |
+| `gemma4_a4b_moe_cute` | Gemma 4 26B-A4B, batch one, three routes on a 148-SM B200 | Shipped Helion Triton preset, using the same inputs and cold-L2 CUDA graph timer |
 
 The nightly B200 sweep reports both MLA rows. To run just the CuTe comparison, use `python pretuned_kernels/run.py --kernels flash_mla_cute --hardware b200`. The CuTe B200 pull-request tests separately replay the preset against the FP32 reference with changed lengths and signed page IDs; on GitHub Actions these tests fail if the SM100 NVRTC/cooperative-groups prerequisite is unavailable. They do not require FlashInfer.
 
@@ -173,9 +174,20 @@ results against that production layer. When vLLM selects DeepGEMM, it also
 rounds dynamic activation scales to UE8M0; the Helion kernel retains its FP32
 activation scales, so the comparison is not instruction-for-instruction.
 
-The model-region benchmarks measure each captured implementation sequentially,
-with a fresh thermal warmup and cold-L2 samples, so one implementation's graph
-does not perturb the other's measurement.
+For batch-one Gemma 4 A4B on a 148-SM B200, the optional [CuTe preset](megakernels/gemma4_a4b_moe/gemma4_a4b_moe_cute.py)
+is measured with aligned, row-major operands, each in its own storage.
+Direct calls check that contract. With `torch.compile`, Inductor checks the
+preset when binding and then runs its generated wrapper. It does not repeat
+the Python storage check on replay. The nine operands are read-only and the
+seven results come from fresh allocations.
+Its whole-kernel `fast_math=True` setting permits approximate exp, division,
+tanh and rsqrt (including flush-to-zero) and relaxed BF16 MMA accumulation.
+This also affects FP32 routing weights. Import `gemma4_a4b_moe_cute` directly;
+the existing `gemma4_a4b_moe` kernel and its benchmark row still use Triton.
+
+The Gemma CuTe row warms the GPU once per route. It then rotates and reverses
+the order of the CuTe and Triton graph replays, clearing L2 before each
+timed replay.
 
 The kernels ported from vLLM (`vllm/kernels/helion/ops`) benchmark each fused
 Helion kernel under CUDA graphs against a torch-native (unfused, eager)
@@ -222,6 +234,13 @@ The tensor-parallel modules (`deepseek_v3_*_tp/`, `muse_spark/`,
 `qwen3_5_*_tp4/`, `glm5_3_tp4/`, `glm5_3_flash_tp4/`) run under `torchrun` on
 four local GPUs (the Muse Spark layer also on eight); their module docstrings
 give the command.
+
+Run the Gemma CuTe benchmark from the repository root with
+`python -m pretuned_kernels.megakernels.gemma4_a4b_moe.gemma4_a4b_moe_cute`.
+For both dashboard rows, use
+`python pretuned_kernels/run.py --hardware b200 --kernels gemma4_a4b_moe,gemma4_a4b_moe_cute`.
+The original Triton row includes its vLLM comparison; the CuTe row compares
+the two public Helion implementations on the same three routing cases.
 
 The external grouped-GEMM references need explicit pinned checkouts:
 

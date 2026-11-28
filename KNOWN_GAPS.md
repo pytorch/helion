@@ -945,3 +945,11 @@ these labelled lines.
   launches and for graph capture. Materializing a temporary for a writable
   argument without propagating its writes would itself be incorrect.
 - Pinned by: none.
+
+## triton-gluon-overlap-across-storage-wrappers
+
+- Area: Triton and Gluon eager binding, prepared-call guards, and in-kernel ordering of accesses to arguments that share memory.
+- What is wrong: For an ordinary contiguous tensor `x`, `y = torch.from_dlpack(x)` can share all of its bytes but have a different PyTorch storage. In `test/test_storage_alias_keys.py`'s `_store_then_load_argument`, bind `(x, y)` instead of `(x, x.view_as(x))` with static shapes and a four-warp, one-row tile. The ordinary view emits a CTA barrier between the write to `x` and the cross-lane read of the other argument. The DLPack pair reuses the disjoint binding and emits none. The prepared guard for disjoint inputs also accepts this pair. Both outcomes were reproduced with the actual CPU code generators for Triton and Gluon. The missing barrier is established; no particular numerical failure rate is claimed. Where aliasing is required, use the same tensor or an ordinary PyTorch view of it.
+- Since: Reproduced on bare main at `fae7cd0e9`, `ba2e8c720` and `854fbf8ce`. The overlap-aware binding from #4531 handles views of one PyTorch storage; it did not cover multiple storage wrappers over one allocation.
+- Why deferred: This requires a runtime change shared by Triton and Gluon. Concrete overlap detection, its cached partitions and the fast prepared guard must agree on the occupied bytes and device even when storage identities differ, without querying pointers on fake tensors. Gemma's new preset does not write its input weights, and its eager guard rejects overlapping concrete ranges before launch.
+- Pinned by: Existing `test/test_storage_alias_keys.py` controls cover same-storage views and disjoint inputs; none currently pins ordering for the DLPack pair.
