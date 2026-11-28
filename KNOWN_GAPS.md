@@ -874,6 +874,38 @@ these labelled lines.
   `test/test_cute_fragment_loop_captures.py` checks computed-fragment
   index widths; it does not exercise the ordinary nested-store overflow.
 
+## cpp-fake-mode-tile-provenance
+
+- Area: all Helion backends when PyTorch constructs C++ fake tensors
+  (`CPP_FAKETENSOR=1` on the November 2026 nightly).
+- What is wrong: `create_fake_tensor_mode(ShapeEnv())` raises
+  `AttributeError: 'CppFakeTensorMode' object has no attribute
+  '_get_output_tensor_from_cache_entry'` before binding a kernel.
+  `CPP_FAKETENSOR=1 pytest test/test_fake_tensor.py::test_fake_tensor_mode_supports_cond`
+  reproduces it without CUDA.
+- Since: reproduced on upstream main at `f1d2bf392`.
+- Why deferred: the C++ implementation does not use Python's dispatch
+  cache or expose its output-rebuilding hook. Simply skipping that hook
+  allows the conditional test to run, but all three
+  `test_bmm_cast_keeps_distinct_tile_axes` cases then lose a symbolic tile
+  at the cast between two matrix multiplies: the second multiply's
+  `m_block_id` is `None` instead of the first multiply's block ID. A
+  private Python mode constructed under
+  `torch._dynamo.config.patch(use_cpp_fake_tensor=False)` passes those
+  eager tests (all six cases in the module), but still receives C++ fake
+  inputs from Dynamo. On main, `_overlap_aliases((x[:4], x[4:8]))` with
+  a 16-element strict C++ fake tensor calls `data_ptr()` and raises; the
+  Python-fake case returns the expected disjoint identity. The alias
+  partition and `CompileEnvironment.live_example_input` both use a
+  Python-subclass check to distinguish trace inputs from concrete storage.
+  A constructor switch alone cannot guarantee that callers using the C++
+  mode will keep fake addresses out of native layout and alias proofs.
+  Supporting that mode across backends needs agreement on those proofs as
+  well as on symbolic tile provenance.
+- Pinned by: `test/test_fake_tensor.py::test_fake_tensor_mode_supports_cond`
+  and `test_bmm_cast_keeps_distinct_tile_axes` exercise these constraints in
+  the normal Python mode. No C++ mode support is asserted.
+
 ## triton-raw-storage-lazy-negative-inputs
 
 - Area: compiled Triton kernels that consume a tensor's raw storage without

@@ -17,20 +17,24 @@ in one dynamic cross-loop launch:
   compiled kernel (dynamic shapes, no host-side bucketing);
 * log-sum-exp combine of the live splits into the BF16 output.
 
-Each call is an isolated launch (no programmatic dependent launch).  Tuned for
-short decode contexts; long contexts pay the column slices' repeated QK^T.  The
-benchmark compares against the production B200 MLA decode of vLLM and SGLang
-(FlashInfer trtllm-gen), called as vLLM's decode CUDA graph calls it (see
-MAX_MODEL_LEN).
+The default Triton preset targets short decode contexts. Its column slices
+repeat QK^T at long contexts. The optional ``flash_mla_cute`` entry targets
+one query on SM100 with 16-byte aligned query and KV pointers and matching
+NVRTC and CUDA cooperative-groups headers for SM100. Each preset
+runs in one launch, without programmatic dependent launch. The benchmark
+compares with FlashInfer TRT-LLM-gen as vLLM calls it in its decode graph
+(see MAX_MODEL_LEN).
 """
 
 from __future__ import annotations
 
+import argparse
 import math
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 import torch
+from torch._subclasses.fake_tensor import is_fake
 
 import helion
 import helion.language as hl
@@ -168,6 +172,99 @@ def flash_mla(
         output[tile_r, tile_e] = (out / denom[:, None]).to(torch.bfloat16)
 
     return output.view(1, query_len, num_heads, value_dim)
+
+
+def _cute_grid_available() -> bool:
+    # Load this CuTe-only prerequisite when the opt-in preset is requested.
+    from helion._compiler.cute.cooperative_grid_ptx import GridCompilerUnavailable
+    from helion._compiler.cute.cooperative_grid_ptx import grid_sync_asm
+
+    try:
+        return grid_sync_asm((10, 0)) is not None
+    except GridCompilerUnavailable:
+        return False
+
+
+def _cute_key(
+    query: torch.Tensor,
+    kv_cache: torch.Tensor,
+    block_tables: torch.Tensor,
+    seq_lens: torch.Tensor,
+    scale: float,
+) -> int:
+    """The one-query B200 preset keeps sequence lengths and page IDs on device."""
+    if (
+        query.device.type != "cuda"
+        or torch.cuda.get_device_capability(query.device) != (10, 0)
+        or query.shape != (1, 1, NUM_HEADS, QK_DIM)
+        or query.dtype != torch.bfloat16
+        or kv_cache.ndim != 4
+        or kv_cache.shape[1:] != (1, CACHE_BLOCK_SIZE, QK_DIM)
+        or kv_cache.dtype != torch.bfloat16
+        or block_tables.shape != (1, BLOCK_TABLE_CAPACITY)
+        or block_tables.dtype != torch.int32
+        or seq_lens.shape != (1,)
+        or seq_lens.dtype != torch.int32
+        or scale != MLA_SCALE
+        or any(
+            t.device != query.device or not t.is_contiguous()
+            for t in (query, kv_cache, block_tables, seq_lens)
+        )
+    ):
+        raise ValueError(
+            "flash_mla_cute requires SM100 and the single-query BF16 decode layout"
+        )
+    # The compiled kernel reads the physical storage of all four operands.
+    # A lazy negative view shares that storage but has different logical values.
+    # The gathered-page config matches an int32 page-lane range. Auto
+    # indexing widens that range when any input exceeds the int32 limit.
+    if kv_cache.numel() > torch.iinfo(
+        torch.int32
+    ).max or flash_mla_cute.settings.index_dtype not in (None, torch.int32):
+        raise ValueError(
+            "flash_mla_cute requires int32 indexing and a KV pool with at most "
+            "2**31 - 1 elements; use flash_mla for wider indexing"
+        )
+    if any(t.is_neg() for t in (query, kv_cache, block_tables, seq_lens)):
+        raise ValueError("flash_mla_cute requires resolved negative views")
+    # Fake operands have no storage addresses. Keep metadata binding separate
+    # from eager dispatch, where both actual inputs must be aligned. Inductor
+    # may realign its graph inputs before calling the generated launch.
+    has_fake_operand = False
+    for operand in (query, kv_cache):
+        if is_fake(operand):
+            has_fake_operand = True
+        elif operand.data_ptr() % 16:
+            raise ValueError(
+                "flash_mla_cute requires 16-byte aligned query and KV pointers"
+            )
+    if not _cute_grid_available():
+        raise RuntimeError(
+            "flash_mla_cute requires matching NVRTC and CUDA cooperative-groups headers "
+            "for SM100; use flash_mla for the Triton preset"
+        )
+    return int(has_fake_operand)
+
+
+# B200, one query / 16 heads: stage eight aligned Q/K panels, then combine
+# the split weights in the same persistent launch. The default Triton entry
+# above and the CuTe entry share the exact same Helion function.
+flash_mla_cute = helion.kernel(
+    flash_mla.fn,
+    backend="cute",
+    static_shapes=False,
+    config=helion.Config(
+        block_sizes=[32, 1, 128, 1, 128],
+        num_threads=[1, 1, 1, 1, 128, 1, 1],
+        pid_type="persistent_interleaved",
+        cross_loop_pipeline="barrier",
+        cute_fragment_half_mma=True,
+        cute_gathered_page_pipeline=True,
+        cute_gathered_page_stages=8,
+        cute_in_kernel_grid_init=True,
+    ),
+    key=_cute_key,
+)
 
 
 def _make_inputs(context: int, seed: int = 0) -> dict[str, torch.Tensor]:
@@ -321,11 +418,15 @@ def correctness_check() -> None:
 
 
 @torch.inference_mode()
-def main(verbose: bool = True) -> dict:
-    """Benchmark the megakernel against FlashInfer trtllm-gen over the decode contexts."""
+def main(verbose: bool = True, *, include_cute: bool = False) -> dict:
+    """Compare captured graphs; request CuTe to also time the shipped Triton preset."""
     _require_sm100()
     if not has_flashinfer():
         raise RuntimeError("FlashInfer is required for this comparison")
+    if include_cute and not _cute_grid_available():
+        raise RuntimeError(
+            "The CuTe benchmark requires NVRTC and matching cooperative-groups headers"
+        )
 
     import sys
 
@@ -333,22 +434,42 @@ def main(verbose: bool = True) -> dict:
     from _bench import capture_cuda_graph
     from _bench import run_sweep
 
+    # CUDA graphs store raw addresses, not ownership of captured Python
+    # tensors. Keep the callable (including FlashInfer's private table,
+    # counter and workspace), its output and its reference through timing.
+    captures: list[
+        tuple[Callable, torch.cuda.CUDAGraph, torch.Tensor, torch.Tensor]
+    ] = []
+
+    def capture(call: Callable[[], torch.Tensor], expected: torch.Tensor) -> Callable:
+        graph, output = capture_cuda_graph(call)
+        graph.replay()
+        torch.testing.assert_close(output.float(), expected, atol=0.02, rtol=0.05)
+        captures.append((call, graph, output, expected))
+        return graph.replay
+
+    def check_timed_graphs() -> None:
+        for _owner, graph, output, expected in captures:
+            graph.replay()
+            torch.testing.assert_close(output.float(), expected, atol=0.02, rtol=0.05)
+        captures.clear()
+
     def make_calls(context: int) -> tuple:
+        # Drop the previous shape's storage only after its timed replays.
+        check_timed_graphs()
         tensors = _make_inputs(context, seed=context)
         args = _kernel_args(tensors)
-        flashinfer = _make_flashinfer_call(tensors)
-        torch.testing.assert_close(
-            flash_mla(*args).float(), reference(tensors).float(), atol=0.02, rtol=0.05
-        )
-        helion_graph, _ = capture_cuda_graph(lambda: flash_mla(*args))
-        flashinfer_graph, _ = capture_cuda_graph(flashinfer)
-        return (
-            helion_graph.replay,
-            [("flashinfer_trtllm_gen", flashinfer_graph.replay)],
-            f"{context:>8d}",
-        )
+        expected = reference(tensors).float()
+        triton = capture(lambda: flash_mla(*args), expected)
+        baseline = capture(_make_flashinfer_call(tensors), expected)
+        baselines = [("flashinfer_trtllm_gen", baseline)]
+        selected = triton
+        if include_cute:
+            selected = capture(lambda: flash_mla_cute(*args), expected)
+            baselines.insert(0, ("helion_triton", triton))
+        return selected, baselines, f"{context:>8d}"
 
-    return run_sweep(
+    result = run_sweep(
         CONTEXTS,
         make_calls,
         use_cudagraph=False,
@@ -357,7 +478,15 @@ def main(verbose: bool = True) -> dict:
         verbose=verbose,
         shape_header=f"{'context':>8s}",
     )
+    check_timed_graphs()
+    return result
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--cute",
+        action="store_true",
+        help="compare CuTe, shipped Triton and FlashInfer",
+    )
+    main(include_cute=parser.parse_args().cute)
