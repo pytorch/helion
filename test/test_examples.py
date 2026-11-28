@@ -2291,6 +2291,37 @@ class TestExamples(RefEagerTestBase, TestCase):
                 **config,
             )
 
+    def test_int4_gemm_two_pass(self):
+        M, K, N = 256, 512, 256
+        mod = import_path(EXAMPLES_DIR / "int4_gemm.py")
+        B_unpacked = torch.randint(-8, 8, (K, N), dtype=torch.int8, device=DEVICE)
+        B_packed = mod._pack_int4_matrix(B_unpacked)
+        B_bf16 = B_unpacked.to(torch.bfloat16)
+        # Fixed configs, so that the test does not autotune.
+        unpack = helion.kernel(
+            mod.unpack_int4.fn, config=helion.Config(block_sizes=[32, 64])
+        )
+        mm = helion.kernel(
+            mod.matmul.fn, config=helion.Config(block_sizes=[64, 64, 32])
+        )
+        # The unpack must be exact.
+        torch.testing.assert_close(unpack(B_packed), B_bf16, rtol=0, atol=0)
+        A = torch.randn(M, K, dtype=torch.bfloat16, device=DEVICE)
+        expected = torch.matmul(A, B_bf16)
+        with (
+            patch.object(mod, "unpack_int4", unpack),
+            patch.object(mod, "matmul", mm),
+        ):
+            result = mod.matmul_bf16_int4_two_pass(A, B_packed)
+            # The TritonBench wrapper takes A as [B, L, K] and the unpacked int4
+            # values of B.
+            run = mod.int4_gemm_tritonbench(
+                None, A.unsqueeze(0), B_unpacked.to(torch.int32)
+            )
+            wrapper_result = run()
+        torch.testing.assert_close(result, expected, rtol=2e-1, atol=1.0)
+        torch.testing.assert_close(wrapper_result, expected, rtol=2e-1, atol=1.0)
+
     @onlyBackends(["cute"])
     @skipIfNotCUDA()
     @skipIfCudaCapabilityLessThan(

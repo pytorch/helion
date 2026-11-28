@@ -5,6 +5,9 @@ This example demonstrates an INT4 GEMM kernel implemented in Helion. The kernel 
 matrix multiplication where the second matrix B is packed with two 4-bit values per byte.
 The kernel unpacks the int4 values, converts to bfloat16, and performs matmul with
 the bfloat16 matrix A.
+
+The TritonBench wrapper runs a two-pass version instead: it unpacks B to bfloat16 once,
+then runs a bfloat16 matmul.
 """
 
 # %%
@@ -21,8 +24,11 @@ from torch import Tensor
 
 import helion
 from helion._testing import DEVICE
+from helion._testing import import_example
 from helion._testing import run_example
 import helion.language as hl
+
+matmul = import_example("matmul").matmul
 
 # %%
 # INT4 GEMM Kernel
@@ -101,6 +107,60 @@ def matmul_bf16_int4(A: Tensor, B: Tensor) -> Tensor:
 
 
 # %%
+# Two-Pass Version
+# ----------------
+# The fused kernel above unpacks each tile of B inside the K loop. So every tile of rows
+# of A unpacks the same part of B again. For large M the matmul is compute-bound, and this
+# repeated unpack costs more than the matrix multiply.
+#
+# The two-pass version unpacks B to bfloat16 once, then runs a normal bfloat16 matmul.
+# It needs a temporary bfloat16 copy of B, 4x the size of the packed B. For small M the
+# fused kernel can be faster, because it reads only the packed B.
+
+
+# %%
+@helion.kernel()
+def unpack_int4(B: Tensor) -> Tensor:
+    """
+    Unpack an int4 matrix stored as two 4-bit values per int8 byte to bfloat16.
+
+    Args:
+        B (Tensor): Packed int4 tensor of shape [K//2, N] in int8 format.
+
+    Returns:
+        Tensor: Unpacked tensor of shape [K, N] in bfloat16 format.
+    """
+    K_half, N = B.shape
+    # Row 2 * k of the result is the low nibble of row k of B, and row 2 * k + 1 is the
+    # high nibble.
+    out = torch.empty([K_half, 2, N], dtype=torch.bfloat16, device=B.device)
+    for tile_k, tile_n in hl.tile([K_half, N]):
+        b_tile = B[tile_k, tile_n]
+        # The same sign extension as in matmul_bf16_int4.
+        b_lo_raw = (b_tile & 0xF).to(torch.int32)
+        b_lo = torch.where(b_lo_raw >= 8, b_lo_raw - 16, b_lo_raw)
+        b_hi = (b_tile >> 4).to(torch.int32)
+        out[tile_k, 0, tile_n] = b_lo.to(torch.bfloat16)
+        out[tile_k, 1, tile_n] = b_hi.to(torch.bfloat16)
+    return out.view(K_half * 2, N)
+
+
+# %%
+def matmul_bf16_int4_two_pass(A: Tensor, B: Tensor) -> Tensor:
+    """
+    BFloat16 x INT4 GEMM in two passes: unpack B to bfloat16, then run a bfloat16 matmul.
+
+    Args:
+        A (Tensor): Input tensor of shape [M, K] in bfloat16 format.
+        B (Tensor): Packed int4 tensor of shape [K//2, N] in int8 format.
+
+    Returns:
+        Tensor: Output tensor of shape [M, N] in bfloat16 format.
+    """
+    return matmul(A, unpack_int4(B))
+
+
+# %%
 # TritonBench Wrapper
 # -------------------
 
@@ -108,7 +168,7 @@ def matmul_bf16_int4(A: Tensor, B: Tensor) -> Tensor:
 # %%
 def int4_gemm_tritonbench(tb_op: object, x: torch.Tensor, w: torch.Tensor) -> Callable:
     """
-    Wrapper for TritonBench compatibility.
+    Wrapper for TritonBench compatibility. Runs the two-pass version.
 
     Args:
         tb_op: TritonBench operator instance
@@ -127,7 +187,7 @@ def int4_gemm_tritonbench(tb_op: object, x: torch.Tensor, w: torch.Tensor) -> Ca
     w_packed = ((w_reshaped[0] & 0xF) | (w_reshaped[1] << 4)).to(torch.int8)
 
     def run_kernel() -> torch.Tensor:
-        return matmul_bf16_int4(x_2d, w_packed)
+        return matmul_bf16_int4_two_pass(x_2d, w_packed)
 
     return run_kernel
 
