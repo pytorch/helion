@@ -248,10 +248,10 @@ three uniform choices, and search can vary the four inputs independently.
 
 ### 3.3 Whole-kernel generators and regeneration
 
-`KERNEL_GENERATORS` (`kernel_generators.py`): `grouped_prefix_adaptive_n`,
+`KERNEL_GENERATORS` (`kernel_generators.py`): `dependent_phases`, `grouped_prefix_adaptive_n`,
 `packed_operand`, `row_resident`, `grouped_warp_tf32`, `flat_grouped_native`,
 `bounded_cache`, `split_k_cluster`, `split_k_workspace`, `materialized_fission`,
-`ordered_phases`.  Each `applies` to a config, carries a `TransformPolicy`
+`ordered_phases`, `compact_carry_rows`.  Each `applies` to a config, carries a `TransformPolicy`
 saying which specializing arguments of `generate_ast` it cannot honor, and
 re-enters `generate_ast` for the kernels it composes.  `CuteRegeneration`
 regenerates after `RegisterTileUnsupported`, `VloopSinkNotApplied`,

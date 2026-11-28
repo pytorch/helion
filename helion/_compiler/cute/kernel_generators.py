@@ -30,6 +30,7 @@ from ..emitter_protocols import KernelTransforms
 from ..emitter_protocols import RetryPolicy
 from ..emitter_protocols import TransformPolicy
 from . import target_facts
+from .autotune.config_keys import COMPACT_ROWS_KEY
 from .execution_plans import VloopSinkLayoutRefused
 from .fragment_mma_dot import FragmentMmaNotApplied
 from .fragment_mma_dot import fragment_mma_off_config
@@ -336,6 +337,14 @@ KERNEL_GENERATORS: tuple[KernelGenerator, ...] = (
             len(func.device_ir.phases) > 1 and config.pid_type == "flat"
         ),
         generate=_generate_ordered_phases,
+    ),
+    KernelGenerator(
+        "compact_carry_rows",
+        applies=lambda func, config, transforms: bool(config.get(COMPACT_ROWS_KEY)),
+        generate=_plain_generator("row_carry_stripes", "generate_striped_rows"),
+        transform_policy=_complete_kernel_only(
+            "compact carry rows require an entire shared launch"
+        ),
     ),
 )
 

@@ -46,9 +46,11 @@ from .scalar_fragment_assertion import check_host_subscripts
 if TYPE_CHECKING:
     from collections.abc import Callable
 
+    from ..device_ir import GraphInfo
     from .fragment_domain import OwnershipMask
     from .fragment_slab_loads import ScalarLoad
     from .fragment_slab_loads import SlabGroup
+    from .warp_carry_packet import WarpCarryPacket
 
 
 class FragmentMemoryEmitter(FragmentContext):
@@ -669,6 +671,8 @@ class FragmentMemoryEmitter(FragmentContext):
         direct: DirectStoreSink | None = None,
         *,
         defer_load: bool = False,
+        deferred_read_region: list[GraphInfo] | None = None,
+        carry_packet: WarpCarryPacket | None = None,
     ) -> object:
         indices = cast("list[object]", node.args[1])
         tensor = values[cast("Node", node.args[0])]
@@ -977,7 +981,11 @@ class FragmentMemoryEmitter(FragmentContext):
         if defer_load:
             # A complete owner may consume this same guarded address recipe
             # directly. Retain every index/mask dependency until that read.
-            if not host_load_is_readonly(node, self.env, self.graphs):
+            if not host_load_is_readonly(
+                node,
+                self.env,
+                self.graphs if deferred_read_region is None else deferred_read_region,
+            ):
                 raise exc.InvalidConfig(
                     "deferred fragment load requires readonly storage"
                 )
@@ -989,7 +997,45 @@ class FragmentMemoryEmitter(FragmentContext):
                 )
                 if isinstance(value, Fragment)
             )
-            return dataclasses.replace(loaded_fragment, dependencies=dependencies)
+            result = dataclasses.replace(loaded_fragment, dependencies=dependencies)
+            if (
+                carry_packet is not None
+                and mask_value is None
+                and shape
+                in (
+                    (carry_packet.lanes * 32,),
+                    (carry_packet.rows, carry_packet.lanes * 32),
+                )
+                and carry_packet.accepts_indices(indices)
+            ):
+                from .fragment_vector_io import contiguous_packet_lanes
+                from .fragment_vector_io import host_base_aligned
+
+                inner = next(i for i in reversed(indices) if i is not None)
+                proxy = inner.meta.get("val") if isinstance(inner, Node) else None
+                # Only the owned K loop proved its start and end are whole
+                # tiles. A sibling tile index may end at a partial packet.
+                if (
+                    not isinstance(proxy, torch.SymInt)
+                    or self.env.resolve_block_id(proxy) == carry_packet.axis
+                ) and contiguous_packet_lanes(
+                    self,
+                    tensor,
+                    indices,
+                    values,
+                    shape,
+                    output.dtype,
+                    index_coordinates,
+                ) == carry_packet.lanes:
+                    result = carry_packet.wrap(
+                        self,
+                        result,
+                        address,
+                        node=node,
+                        base=f"{tensor.name}.iterator",
+                        aligned=host_base_aligned(self.env, tensor.value),
+                    )
+            return result
         if (
             not shape
             and extra_mask is None

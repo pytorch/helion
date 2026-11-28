@@ -9,6 +9,7 @@ import pytest
 import torch
 
 import helion
+from helion._compiler.cute.autotune.config_keys import COMPACT_ROWS_KEY
 import helion._compiler.cute.autotune.heuristics as cute_heuristics
 from helion._compiler.cute.autotune.heuristics.cute import _dependent_launch
 from helion._compiler.cute.grouped_row_union import LEGACY_SCHEDULE
@@ -153,8 +154,10 @@ def test_search_avoids_unsupported_native_generators(
             spec, "cute_materialized_operand_schedule_search_enabled", True
         )
         monkeypatch.setattr(spec, "cute_sequence_reduction_blocks", {0})
+        monkeypatch.setattr(spec, "cute_shared_row_carry_structure", True)
         fields = spec._flat_fields()
         for name, choices in (
+            (COMPACT_ROWS_KEY, (False,)),
             ("cute_materialized_schedule", ("off",)),
             ("cute_materialized_operand_schedule", ("off",)),
             ("cute_reduction_sequence", ("scalar", "reload", "resident")),
@@ -186,6 +189,7 @@ def test_native_seed_screen_matches_generator_registry() -> None:
         "bounded_cache": {"cute_reduction_sequence": "bounded"},
         "split_k_cluster": {"cute_split_k_schedule": "cluster8_k4"},
         "split_k_workspace": {"cute_split_k_workspace": True},
+        "compact_carry_rows": {COMPACT_ROWS_KEY: True},
     }
     assert set(witnesses) == {g.name for g in KERNEL_GENERATORS} - {
         # These generators require an actual bound source/dependency proof,

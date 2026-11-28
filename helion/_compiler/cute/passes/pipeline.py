@@ -1561,6 +1561,10 @@ def _lower_register_producers(s: _KernelDefState) -> None:
 def _validate_thread_axis_accesses(s: _KernelDefState) -> None:
     from ..backend import validate_thread_axis_accesses
 
+    if s.ctx.config.get("cute_warp_row_reductions"):
+        from ..warp_row_partition import validate_row_launch
+
+        validate_row_launch(s.fn, s.ctx.exact_thread_block_dims)
     validate_thread_axis_accesses([*s.prefix, s.definition])
 
 

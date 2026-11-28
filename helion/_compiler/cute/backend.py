@@ -5743,8 +5743,10 @@ class CuteBackend(Backend):
     ) -> bool:
         from .direct_affine_lowering import try_lower_direct_affine_root
         from .thread_budget import record_root_read_axes
+        from .warp_row_partition import partition_row_sums
 
         record_root_read_axes(codegen, grid_state, body)
+        partition_row_sums(codegen, grid_state, body)
         return try_lower_direct_affine_root(codegen, grid_state, body)
 
     def explain_root_failure(

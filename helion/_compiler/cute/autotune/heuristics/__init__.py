@@ -61,6 +61,7 @@ from ..fragment_knobs import CuteFragmentReductionHeuristic
 from ..fragment_knobs import CuteFragmentRegisterLoadsHeuristic
 from ..fragment_knobs import CuteFragmentRegisterProducersHeuristic
 from ..fragment_knobs import CuteFragmentRegisterSnapshotsHeuristic
+from ..fragment_knobs import CuteFragmentRowCarryHeuristic
 from ..fragment_knobs import CuteFragmentScanExportsHeuristic
 from ..fragment_knobs import CuteFragmentScanHeuristic
 from ..fragment_knobs import CuteFragmentSkipZeroAtomicsHeuristic
@@ -91,6 +92,7 @@ from ..fragment_knobs import register_fragment_reduction_coverage
 from ..fragment_knobs import register_fragment_register_loads_coverage
 from ..fragment_knobs import register_fragment_register_producers_coverage
 from ..fragment_knobs import register_fragment_register_snapshots_coverage
+from ..fragment_knobs import register_fragment_row_carry_coverage
 from ..fragment_knobs import register_fragment_scan_coverage
 from ..fragment_knobs import register_fragment_scan_exports_coverage
 from ..fragment_knobs import register_fragment_skip_zero_atomics_coverage
@@ -306,6 +308,7 @@ _CUTE_HEURISTIC_CLASSES: tuple[AutotunerHeuristicType, ...] = (
     CuteFragmentThreadsHeuristic,
     CuteFragmentPrivateScalarLoopsHeuristic,
     CuteFragmentRegisterLoadsHeuristic,
+    CuteFragmentRowCarryHeuristic,
     CuteFragmentWarpResultsHeuristic,
     CuteFragmentProducerCacheHeuristic,
     CuteFragmentWarpScanHeuristic,
@@ -385,6 +388,12 @@ def register_seed_facts(
 
     # The appended families outside the ranked tuple register their facts
     # here, the ranked ones through their own ``register_facts``.
+    from ...warp_row_partition import row_sum_roots
+
+    env.config_spec.cute_warp_row_reduction_roots = {
+        root: (fact.row_id, fact.k_id, fact.length, fact.reductions)
+        for root, fact in row_sum_roots(env, device_ir).items()
+    }
     return computed_fragment_specialization_facts(
         env, device_ir
     ) | CutePointwiseMinBlocksHeuristic.register_facts(env, device_ir)
@@ -398,6 +407,9 @@ def postprocess_seed_configs(
     The sequence is the historical one: each step sees the complete prefix the
     steps before it produced and appends after it.
     """
+    from .cute_warp_row_partition import insert_warp_row_seed
+
+    configs = insert_warp_row_seed(env, device_ir, configs)
     configs = add_host_sum_seeds(env, configs)
     configs = add_signed_bitfield_seeds(env, configs)
     configs = interleave_grouped_rna_seeds(dedupe_configs(configs))
@@ -980,6 +992,9 @@ def register_coverage_groups(env: CompileEnvironment, device_ir: DeviceIR) -> No
         env, device_ir, resource_carrier=resource_carrier
     )
     register_fragment_threads_coverage(
+        env, device_ir, resource_carrier=resource_carrier
+    )
+    register_fragment_row_carry_coverage(
         env, device_ir, resource_carrier=resource_carrier
     )
     register_fragment_register_loads_coverage(

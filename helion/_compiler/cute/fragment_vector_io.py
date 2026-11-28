@@ -56,7 +56,7 @@ def host_base_aligned(env: CompileEnvironment, tensor: torch.Tensor) -> bool:
     ) or env.tensor_storage_is_compiler_allocated(tensor)
 
 
-def _static_int(value: object) -> int | None:
+def static_int(value: object) -> int | None:
     if isinstance(value, bool):
         return None
     if isinstance(value, int):
@@ -79,7 +79,7 @@ def static_strides(
     """
     if not env.traced_strides_hold(tensor):
         return None
-    strides = [_static_int(s) for s in tensor.stride()]
+    strides = [static_int(s) for s in tensor.stride()]
     if any(s is None for s in strides):
         return None
     return tuple(s for s in strides if s is not None)
@@ -96,13 +96,34 @@ def row_packet_lanes(
 ) -> int | None:
     """The packet width (in elements) when the window's innermost coordinate
     may be moved as whole aligned packets; None keeps the scalar walk."""
+    if not host_base_aligned(compiler.env, tensor.value):
+        return None
+    return contiguous_packet_lanes(
+        compiler, tensor, indices, values, shape, dtype, index_coordinates
+    )
+
+
+def contiguous_packet_lanes(
+    compiler: FragmentContext,
+    tensor: HostTensor,
+    indices: list[object],
+    values: dict[Node, object],
+    shape: tuple[int, ...],
+    dtype: torch.dtype,
+    index_coordinates: list[tuple[int | None, ...]],
+) -> int | None:
+    """The address and predicate of the first lane cover the whole packet.
+
+    This does not prove base alignment: callers guard the effective address
+    at runtime or separately prove that the allocation and its offset align.
+    """
     from .fragment_context import Fragment
 
     lanes = packet_lanes(dtype)
     if lanes is None or not shape or shape[-1] % lanes or shape[-1] < lanes:
         return None
     fake = tensor.value
-    if fake.dtype != dtype or not host_base_aligned(compiler.env, fake):
+    if fake.dtype != dtype:
         return None
     strides = static_strides(compiler.env, fake)
     if strides is None:

@@ -86,8 +86,12 @@ from .reduction_coordinates import independent_reduction_coordinates
 from .reduction_coordinates import owned_iota_reduction_axes
 from .reduction_coordinates import physical_capture_axes
 from .reduction_coordinates import reduction_coordinate_proof
+from .register_loads import host_load_is_readonly
 from .repeated_block_ids import matmul_sum_collapse_nodes
 from .repeated_block_ids import scalar_repeated_block_id
+from .row_reduction_carry import folded_results
+from .row_reduction_carry import phase_region
+from .row_reduction_carry import row_phase_supported
 from .scalar_fragment_assertion import check_grid_count
 from .scalar_fragment_assertion import checked_range_domain
 from .scalar_fragment_assertion import requires_assertion_owner
@@ -828,14 +832,20 @@ class FragmentCompiler(
             and not self.transparent_node(node)
         ):
             self.synchronize()
+        if target is torch.ops.aten.sum.dim_IntList:
+            folded = self.folded_row_sums.pop(node, None)
+            if folded is not None:
+                return folded
         if target is _tracing_ops._phi:
             return _resolve(node.args[1], values)
-        args = cast("tuple[object, ...]", _resolve(node.args, values))
         fake = node.meta.get("val")
+        if target in (_tracing_ops._get_symnode, torch.ops.aten.sym_size.int):
+            # Shape-only graph dependencies are intentionally absent from
+            # the evaluated value slice of an independent row carry.
+            return fake
+        args = cast("tuple[object, ...]", _resolve(node.args, values))
         if target is _tracing_ops._host_tensor:
             return self.host_tensor(node)
-        if target in (_tracing_ops._get_symnode, torch.ops.aten.sym_size.int):
-            return fake
         if target is _tracing_ops._new_var:
             return args[0]
         if target is operator.getitem:
@@ -884,6 +894,15 @@ class FragmentCompiler(
                 panel = gathered_bf16_dot(self, node, values)
                 if panel is not None:
                     return panel
+            if (
+                self.df.config.get("cute_fragment_row_carry", False)
+                and self.cg.current_root_graph_info is not None
+                and self.cg.current_root_graph_info.graph_id
+                in self.env.config_spec.cute_fragment_row_carry_root_ids
+            ):
+                folded = folded_results(self, node, values)
+                if folded is not None:
+                    return folded
             return self.loop(node, values)
         if target is atomic_ops.atomic_add:
             if deferred_updates is not None:
@@ -1372,6 +1391,7 @@ def computed_fragment_supported(
     physical_axes: frozenset[int] = frozenset(),
     owned_iota_axes: frozenset[int] = frozenset(),
     selection_owned: bool = False,
+    row_carry_owned: bool = False,
     snapshot_owned: bool = False,
     bounded_gather_owned: bool = False,
     gathered_fold_owned: bool = False,
@@ -1744,6 +1764,7 @@ def computed_fragment_supported(
     if not (
         selection_owned
         or gathered_fold_owned
+        or row_carry_owned
         or snapshot_owned
         or bounded_gather_owned
         or requires_full_reduction_owner(graphs)
@@ -2023,6 +2044,10 @@ def prefer_computed_fragment_root(cg: GenerateAST, root_graph_id: int) -> bool:
             enabled and root_graph_id in roots
             for enabled, roots in (
                 (
+                    config.get("cute_fragment_row_carry", False),
+                    spec.cute_fragment_row_carry_root_ids,
+                ),
+                (
                     config.get("cute_fragment_producer_cache", False),
                     spec.cute_fragment_producer_cache_root_ids,
                 ),
@@ -2094,26 +2119,28 @@ def selection_needs_shared_coordinates(region: list[GraphInfo]) -> bool:
     )
 
 
-def selection_storage_is_disjoint(
+def fragment_destinations_are_disjoint(
     env: CompileEnvironment, region: list[GraphInfo], *, allow_unbound: bool = False
 ) -> bool:
-
     from ..runtime_tensor_guards import tensor_pairs_with_proven_disjoint_storage
-    from .register_loads import host_load_is_readonly
 
     destinations = tuple(fragment_store_destinations(region))
     proven = tensor_pairs_with_proven_disjoint_storage(
         env, dict(enumerate(destinations)), allow_unbound=allow_unbound
     )
-    return (
-        all(
-            host_load_is_readonly(node, env, region, allow_unbound=allow_unbound)
-            for info in region
-            for node in info.graph.nodes
-            if node.target is memory_ops.load
-        )
-        and len(proven) == len(destinations) * (len(destinations) - 1) // 2
-    )
+    return len(proven) == len(destinations) * (len(destinations) - 1) // 2
+
+
+def selection_storage_is_disjoint(
+    env: CompileEnvironment, region: list[GraphInfo], *, allow_unbound: bool = False
+) -> bool:
+
+    return all(
+        host_load_is_readonly(node, env, region, allow_unbound=allow_unbound)
+        for info in region
+        for node in info.graph.nodes
+        if node.target is memory_ops.load
+    ) and fragment_destinations_are_disjoint(env, region, allow_unbound=allow_unbound)
 
 
 def codegen_computed_fragment_root(cg: GenerateAST) -> bool:
@@ -2263,6 +2290,21 @@ def codegen_computed_fragment_root(cg: GenerateAST) -> bool:
             return True
     ir = cg.host_function.device_ir
     multiple_roots = len(ir.root_ids) != 1
+    row_carry_required = (
+        cg.device_function.config.get("cute_fragment_row_carry", False) is True
+        and root.graph_id in env.config_spec.cute_fragment_row_carry_root_ids
+    )
+    if row_carry_required:
+        if (
+            multiple_roots
+            and cg.device_function.config.get("cross_loop_pipeline") != "barrier"
+        ):
+            raise exc.InvalidConfig("shared row carry needs local phase barriers")
+        row_region = phase_region(ir.graphs, root.graph_id)
+        if not row_phase_supported(env, row_region):
+            raise exc.InvalidConfig("a row carry requires phase-local read-only inputs")
+        if not fragment_destinations_are_disjoint(env, row_region):
+            raise exc.InvalidConfig("a row carry requires disjoint output storage")
     selection_required = False
 
     def supports_coordinates(
@@ -2280,6 +2322,7 @@ def codegen_computed_fragment_root(cg: GenerateAST) -> bool:
             owned_iota_axes=owned_iota_axes,
             selection_owned=selection_owned,
             gathered_fold_owned=gathered_fold_owned,
+            row_carry_owned=row_carry_required,
             snapshot_owned=snapshots_required,
             bounded_gather_owned=bounded_gather_required,
         )
@@ -2328,17 +2371,7 @@ def codegen_computed_fragment_root(cg: GenerateAST) -> bool:
         # proof; declining into the unowned scalar iota path would lose the
         # complete reduction. Repeated stores through one tensor retain their
         # existing ordered semantics.
-        destinations = {
-            cg.device_function.tensor_arg(tensor).name
-            for tensor in fragment_store_destinations(cg.host_function.device_ir.graphs)
-        }
-        disjoint = cg.device_function.proven_disjoint_tensor_pairs()
-        if any(
-            frozenset((left, right)) not in disjoint
-            for left in destinations
-            for right in destinations
-            if left < right
-        ):
+        if not fragment_destinations_are_disjoint(env, ir.graphs):
             if local_required or fragment_schedule_required or full_reduction_required:
                 raise exc.InvalidConfig(
                     "fragment store destinations require disjoint storage"
@@ -2385,12 +2418,14 @@ def codegen_computed_fragment_root(cg: GenerateAST) -> bool:
     # it cannot choose a block shape on behalf of its siblings.
     shared_launch = (
         multiple_roots
-        and (free_required or selection_required)
+        and (free_required or selection_required or row_carry_required)
         and not full_reduction_required
         and not local_required
         and shared_barrier
         and all(
-            fragment_option_fits_shared_block(key, value, spec=env.config_spec)
+            fragment_option_fits_shared_block(
+                key, value, spec=env.config_spec, config=cg.device_function.config
+            )
             for key, value in cg.device_function.config.items()
         )
     )
@@ -2432,6 +2467,7 @@ def codegen_computed_fragment_root(cg: GenerateAST) -> bool:
         if captured_required
         or local_required
         or selection_required
+        or row_carry_required
         or free_required
         or snapshots_required
         or bounded_gather_required
@@ -2451,6 +2487,8 @@ def codegen_computed_fragment_root(cg: GenerateAST) -> bool:
     )
 
     def decline() -> bool:
+        if row_carry_required:
+            raise exc.InvalidConfig("unsupported row carry phase")
         if full_reduction_required:
             raise exc.InvalidConfig(
                 "unmerged full reductions require a supported complete fragment root"
@@ -2515,6 +2553,7 @@ def codegen_computed_fragment_root(cg: GenerateAST) -> bool:
         and not local_required
         and not free_required
         and not selection_required
+        and not row_carry_required
         and not snapshots_required
         and not bounded_gather_required
     ):
@@ -2549,6 +2588,10 @@ def codegen_computed_fragment_root(cg: GenerateAST) -> bool:
         else None
     ) or FragmentCompiler(cg, graphs)
     if shared_launch:
+        # Shared launches can packetize the proved row-carry registers, not
+        # the serial shared staging walks of arbitrary sibling phases.
+        compiler.vector_io = False
+        compiler.unrolled_loops = False
         compiler.block_volume = compiler.df.new_var("fragment_block_volume")
     if compiler.df.config.get("cute_fragment_warp_producer_regions", False):
         from .warp_producer_regions import WarpProducerRecorder
