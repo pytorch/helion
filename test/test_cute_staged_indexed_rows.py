@@ -3,6 +3,7 @@ from __future__ import annotations
 import ast
 from copy import deepcopy
 import inspect
+from types import SimpleNamespace
 from typing import TYPE_CHECKING
 from unittest.mock import patch
 
@@ -15,6 +16,8 @@ from helion._compiler.cute.analysis.indexed_row_epilogue import _pure
 from helion._compiler.cute.analysis.indexed_row_epilogue import indexed_row_epilogue
 from helion._compiler.cute.analysis.indexed_row_phases import indexed_row_phases
 from helion._compiler.cute.analysis.match_common import host_tensor_name
+from helion._compiler.cute.autotune.config_keys import PHASE_PARTICIPATION_KEY
+from helion._compiler.cute.autotune.config_keys import STAGED_GRID_KEY
 from helion._compiler.cute.autotune.heuristics.cute_staged_indexed_rows import (
     add_indexed_row_seed,
 )
@@ -367,25 +370,61 @@ def _gemma_kernel_args():
     return model.gemma4_a4b_moe, args + aot._STATIC_ARGS
 
 
+def _staged_gemma_binding():
+    model, args = _gemma_kernel_args()
+    op = helion.kernel(
+        backend="cute", fast_math=True, static_shapes=model.settings.static_shapes
+    )(model.fn)
+    bound = cpu_bind(op, args)
+    with bound.env:
+        generation = bound.config_spec.create_config_generation()
+        seeds = [seed for _, seed in generation.seed_flat_config_pairs()]
+    return bound, generation, seeds
+
+
+def test_cooperative_norm_renders_the_owned_publication_and_join() -> None:
+    with cpu_render_target(
+        fake_device_sm_count=148,
+        smem_budget_bytes=232448,
+        reduction_smem_budget_bytes=232448,
+    ):
+        bound, generation, seeds = _staged_gemma_binding()
+        candidate = next(c for c in seeds if c.get("cute_cooperative_row_norm"))
+        _, checked = generation.strict_config_pair(candidate)
+        complete = bound.to_code(checked)
+        assert "torch.zeros((96,)" in complete
+        assert "normalization_partial + 4 *" in complete
+        assert (
+            "cute.arch.mul_packed_f32x2((normalization_lo, normalization_hi)"
+            in complete
+        )
+        assert (
+            "normalization_square = normalization_lo_square + normalization_hi_square"
+            in complete
+        )
+        assert "normalization_lane < 12" in complete
+        assert complete.count("_cute_grid_barrier(x_grid_sem.iterator)") == 6
+        with pytest.raises(exc.InvalidConfig, match="adjacent packed RMS"):
+            generation.strict_config_pair(
+                helion.Config.from_dict(
+                    checked.config | {PHASE_PARTICIPATION_KEY: True}
+                )
+            )
+
+
 @pytest.mark.slow
 def test_shared_forward_keeps_a_scalar_seed_and_stages_both_complete_projections() -> (
     None
 ):
     # This model supplies two different owned outputs in one cooperative grid:
     # the pair publishes two metadata arrays, the other consumes both.
-    model, args = _gemma_kernel_args()
     with cpu_render_target(
         fake_device_sm_count=148,
         smem_budget_bytes=232448,
         reduction_smem_budget_bytes=232448,
     ):
-        op = helion.kernel(
-            backend="cute", fast_math=True, static_shapes=model.settings.static_shapes
-        )(model.fn)
-        bound = cpu_bind(op, args)
+        bound, generation, seeds = _staged_gemma_binding()
         with bound.env:
-            generation = bound.config_spec.create_config_generation()
-            seeds = [seed for _, seed in generation.seed_flat_config_pairs()]
             assert any(not seed.get("cute_staged_indexed_rows") for seed in seeds)
             (registered,) = [
                 c
@@ -401,8 +440,58 @@ def test_shared_forward_keeps_a_scalar_seed_and_stages_both_complete_projections
         assert source.count("_stage_indexed_scratch = cute.arch.alloc_smem(") == 1
 
         fused, spread, reused, network = [
-            c for c in seeds if c.get("cute_indexed_row_epilogue")
+            c
+            for c in seeds
+            if c.get("cute_indexed_row_epilogue") and not c.get(STAGED_GRID_KEY)
         ]
+        # Ordinary transfer must include the complete larger-grid program.
+        two, three, participants = [
+            c
+            for c in seeds
+            if c.get(STAGED_GRID_KEY)
+            and not c.get("cute_packed_row_publication")
+            and not c.get("cute_ordered_column_pairs")
+        ]
+        assert [two.config, three.config] == [
+            network.config | {STAGED_GRID_KEY: waves} for waves in (2, 3)
+        ]
+        assert participants.config == three.config | {PHASE_PARTICIPATION_KEY: True}
+        for c in (two, three, participants):
+            assert generation.strict_config_pair(c)[1].config == c.config
+        distributed = next(c for c in seeds if c.get("cute_cooperative_row_norm"))
+        flat, checked = generation.strict_config_pair(distributed)
+        assert generation.canonicalize_flat(flat)[1] == checked
+        active = bound.to_code(participants)
+        joins = [
+            call
+            for call in ast.walk(ast.parse(active))
+            if isinstance(call, ast.Call)
+            and ast.unparse(call.func) == "_cute_join_active"
+        ]
+        assert [(ast.unparse(q.args[1]), ast.unparse(q.args[2])) for q in joins] == [
+            ("min(_NUM_SM, 128)", "min(_NUM_SM, 4)"),
+            ("min(_NUM_SM, 4)", "min(_NUM_SM, 1)"),
+            ("min(_NUM_SM, 1)", "_NUM_SM"),
+            ("_NUM_SM", "min(_NUM_SM, 352)"),
+            ("min(_NUM_SM, 352)", "min(_NUM_SM, 11)"),
+            ("min(_NUM_SM, 11)", "min(_NUM_SM, 1)"),
+        ]
+        assert [ast.unparse(q.args[0]) for q in joins] == [
+            f"x_grid_sem.iterator + {i * 32}" for i in range(6)
+        ]
+        # Scratch is sized before the final stage fuses one of the seven
+        # original boundaries. Every surviving edge has distinct storage.
+        assert "torch.zeros((224,)" in active
+        on = bound.to_code(three)
+        assert "min(352, helion.runtime.get_num_sm(residual.device) * 3)" in on
+        assert "._helion_cute_check_residency = True" in on
+        assert "._helion_cute_grid_stride = " in on
+        assert "._helion_cute_check_residency" not in source
+        # A nominal multiplier cannot bypass the existing multi-phase guard.
+        with pytest.raises(exc.InvalidConfig):
+            bound.to_code(
+                helion.Config.from_dict(three.config | {"num_sm_multiplier": 2})
+            )
         # The independent row root may instead give one complete scalar row
         # to each persistent task. Its ordinary block/lane sizes are the
         # only differences; the epilogue and all other choices stay fixed.
@@ -461,8 +550,13 @@ def test_shared_forward_keeps_a_scalar_seed_and_stages_both_complete_projections
         ) and "_cute_staged_indexed_row_dot(" in ast.unparse(phase)
         assert "_stage_indexed_inv" not in ast.unparse(phase)
         (row_axis,) = bound.config_spec.cute_reusable_row_inputs
-        # When every block owns at most one tile, there is no reuse.
-        assert not any(c.get("cute_reuse_indexed_row_input") for c in seeds[:-2])
+        # The grid-width twins preserve their carrier's arithmetic. The
+        # seven existing independent schedules do not request reuse.
+        assert not any(
+            c.get("cute_reuse_indexed_row_input") for c in seeds[: seeds.index(reused)]
+        )
+        # When the input was already too small for the base grid there is
+        # no reuse to inherit.
         for facts in ({row_axis: 1}, {}):
             with (
                 patch.dict(
@@ -789,3 +883,47 @@ def test_normal_seed_fuses_the_right_pair_without_an_unrelated_root(
             ]
             assert len(prep) == 1
             assert roots[3] < prep[0] < roots[4]
+
+
+def test_checked_grid_uses_the_installed_domain_and_refuses_standalone_export():
+    # The 672-tile consumer is deliberately scalar (a 32-row block cannot
+    # cover its staged warp layout). Only the producer's 168 tiles count.
+    x = torch.empty((2, 256), dtype=torch.bfloat16)
+    args = (
+        x,
+        torch.empty((5, 64, 256), dtype=x.dtype),
+        torch.empty((5, 256, 64), dtype=x.dtype),
+        torch.empty((2, 42), dtype=torch.int32),
+        torch.empty((2, 42)),
+        torch.empty(256, dtype=x.dtype),
+        3.0,
+    )
+    config = helion.Config(
+        block_sizes=[16, 256, 32, 64],
+        num_threads=[4, 32, 4, 2, 1],
+        reduction_loops=[64],
+        pid_type="persistent_interleaved",
+        cross_loop_pipeline="barrier",
+        cute_defer_tile_reduce=True,
+        cute_staged_indexed_rows=True,
+        cute_staged_projection_grid=2,
+    )
+    with cpu_render_target(fake_device_sm_count=148):
+        bound = cpu_bind(selected_projection_pair, args)
+        source = bound.to_code(config)
+        assert source.count("= _cute_staged_indexed_row_dot(") == 1
+        assert "min(168, helion.runtime.get_num_sm(x.device) * 2)" in source
+        with (
+            patch.object(
+                torch.cuda,
+                "get_device_properties",
+                return_value=SimpleNamespace(multi_processor_count=148),
+            ),
+            patch.object(helion.runtime, "get_num_sm", return_value=148),
+            pytest.raises(
+                NotImplementedError, match="Standalone CuTe export cannot validate"
+            ),
+        ):
+            bound.to_code(
+                config, options=helion.OutputCodeOptions(allow_helion_deps=False)
+            )

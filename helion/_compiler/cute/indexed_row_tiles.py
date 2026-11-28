@@ -669,6 +669,7 @@ def lower_indexed_row_tiles(
         new_allocations = {_target(n) for n in extra}
         if new_allocations & allocated:
             continue
+        ctx.fn.cute_state.installed_staged_roots.add(site.root)
         ctx.fn.cute_state.staged_indexed_block = block
         allocated.update(new_allocations)
         r.branch.body[-len(r.original) :] = [

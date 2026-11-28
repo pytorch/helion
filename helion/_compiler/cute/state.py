@@ -53,6 +53,8 @@ if TYPE_CHECKING:
     from .chunk_recurrence import CuteChunkRecurrencePlan
     from .collective_matmul import CollectiveMmaSite
     from .completed_matmul_sum import CompletedMatmulSum
+    from .cooperative_row_normalization import NormalizedRow
+    from .cooperative_row_normalization import PublishedPairs
     from .cute_epilogue import Tcgen05GroupedTailEpilogueMatch
     from .cute_flash_bwd import AttentionBwdMatch
     from .cute_flash_gated import GatedAttentionMatch
@@ -687,9 +689,15 @@ class CuteLaneState:
     # A complete physical warp owns a scalar row; all other warps skip it.
     has_singleton_warp_rows: bool = False
     # Exact CTA shapes used to assign independent output columns to threads.
+    ordered_column_dims: set[tuple[int, int, int]] = dataclasses.field(
+        default_factory=set
+    )
     single_row_publication_dims: set[tuple[int, int, int]] = dataclasses.field(
         default_factory=set
     )
+    packed_row_publication: bool = False
+    cooperative_pair_producer: PublishedPairs | None = None
+    cooperative_pair_consumer: NormalizedRow | None = None
     parallel_row_sum_anchors: dict[str, RowSumAnchor] = dataclasses.field(
         default_factory=dict
     )

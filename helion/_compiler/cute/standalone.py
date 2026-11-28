@@ -581,6 +581,11 @@ def _capture_launches(
     def capture(
         kernel: object, grid: tuple[int, ...], *args: object, **kwargs: object
     ) -> None:
+        if getattr(kernel, "_helion_cute_check_residency", False):
+            raise NotImplementedError(
+                "Standalone CuTe export cannot validate function-specific cooperative "
+                "occupancy; export the single-wave config instead"
+            )
         if getattr(kernel, "_helion_cute_disable_bake_tensor_shapes", False):
             raise NotImplementedError(
                 "Standalone CuTe export cannot bake this kernel's runtime tensor layouts"

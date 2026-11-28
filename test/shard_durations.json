@@ -296,7 +296,7 @@
  "test/test_cute_persistent_reduction.py": 14.4,
  "test/test_cute_persistent_slice_vectors.py": 6.1,
  "test/test_cute_persistent_store_packets.py": 15.5,
- "test/test_cute_phase_liveness.py": 74.4,
+ "test/test_cute_phase_liveness.py": 108.8,
  "test/test_cute_phase_two_cta_regions_cuda.py": 55.7,
  "test/test_cute_pipeline_inner_loads.py": 1.8,
  "test/test_cute_pointwise_vec.py": 11.3,

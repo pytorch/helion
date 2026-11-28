@@ -42,6 +42,7 @@ class IndexedRowPhase:
     rows: int
     k: int
     groups: int
+    instances: int  # Two outer unit-tile coordinates of the staged root.
     # Nonzero only for a singleton input in its own dependency phase.
     invariant_rows: int
     matrix: str
@@ -418,6 +419,7 @@ def _phase(
         R,
         K,
         height // s.bank_stride,
+        B * S,
         invariant_rows,
         matrix,
         vector,

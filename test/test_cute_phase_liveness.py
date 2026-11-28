@@ -10,6 +10,7 @@ from helion._testing import DEVICE
 from helion._testing.cute_phase_liveness import explicit_barrier_row_topk
 from helion._testing.cute_phase_liveness import explicit_direct_selection
 from helion._testing.cute_phase_liveness import grouped_selection_after_producer
+from helion._testing.cute_phase_liveness import ordered_column_pool
 from helion._testing.cute_phase_liveness import routed_after_producer
 from helion._testing.cute_phase_liveness import routed_phase_config
 from helion._testing.cute_phase_liveness import row_sum_after_producer
@@ -238,8 +239,18 @@ def test_warp_carry_packets_handle_sliced_weights_and_partial_rows():
         x.neg_()
 
 
-@pytest.mark.parametrize("activated", [False, True])
-def test_staged_bf16_projections_preserve_changed_router_and_rounded_pair(activated):
+@pytest.mark.parametrize(
+    ("activated", "staged_grid", "active_joins"),
+    [
+        (False, False, False),
+        (True, False, False),
+        (False, True, False),
+        (False, True, True),
+    ],
+)
+def test_staged_bf16_projections_preserve_changed_router_and_rounded_pair(
+    activated, staged_grid, active_joins
+):
     if torch.cuda.get_device_capability(DEVICE) < (8, 0):
         pytest.skip("asynchronous copies and BF16 warp MMA require SM80+")
     rng = torch.Generator(device=DEVICE).manual_seed(78)
@@ -265,6 +276,17 @@ def test_staged_bf16_projections_preserve_changed_router_and_rounded_pair(activa
     scale = signed((256,))
     route = torch.tensor([[0, 2, 3], [4, 1, 0]], device=DEVICE, dtype=torch.int32)
     scores = torch.tensor([[0.25, -0.5, 1.0], [2.0, 0.5, -1.0]], device=DEVICE)
+    if staged_grid:
+        if torch.cuda.get_device_capability(DEVICE) != (10, 0):
+            pytest.skip("two resident waves are validated on SM100")
+        # Twelve producer tiles per copy; exercise two waves and a final
+        # partial column wave on the selected device, including its joins.
+        num_sm = helion.runtime.get_num_sm(torch.device(DEVICE))
+        repeats = (2 * num_sm) // 12 + 2
+        route = route.repeat(1, repeats)
+        scores = scores.repeat(1, repeats)
+    else:
+        repeats = 1
     args = (x, pair, down, route, scores, scale, 3.0)
     config = helion.Config(
         block_sizes=[16, 256, 1, 1, 64, 32] if activated else [16, 256, 64, 64],
@@ -275,6 +297,10 @@ def test_staged_bf16_projections_preserve_changed_router_and_rounded_pair(activa
         cute_defer_tile_reduce=True,
         cute_staged_indexed_rows=True,
     )
+    if staged_grid:
+        config.config["cute_staged_projection_grid"] = 2
+    if active_joins:
+        config.config["cute_phase_participation"] = True
     if activated:
         config.config["cute_indexed_row_epilogue"] = True
     op = selected_projection_with_epilogue if activated else selected_projection_pair
@@ -286,7 +312,9 @@ def test_staged_bf16_projections_preserve_changed_router_and_rounded_pair(activa
     for changed in (False, True):
         if changed:
             route.copy_(
-                torch.tensor([[3, -1, 1], [2, 0, 4]], device=DEVICE, dtype=route.dtype)
+                torch.tensor(
+                    [[3, -1, 1], [2, 0, 4]], device=DEVICE, dtype=route.dtype
+                ).repeat(1, repeats)
             )
             x.neg_()
             scores.neg_()
@@ -395,3 +423,51 @@ def test_warp_row_dot_replays_selected_rows_with_independent_base_alignment():
     )
     strict.compile_config(strict_floor)(*aligned_args)
     torch.testing.assert_close(out, expected, rtol=0, atol=0)
+
+
+def test_ordered_columns_cover_each_full_pair_and_scalar_tail() -> None:
+    if torch.cuda.get_device_capability()[0] != 10:
+        pytest.skip("packed FP32 column sums require SM10x")
+    slots, columns = 4, 384
+    cfg = helion.Config(
+        block_sizes=[128, 256],
+        num_threads=[128, 4, 1],
+        reduction_loops=[None],
+        cute_ordered_column_pairs=True,
+    )
+    # The second placement makes both real BF16 device arguments two-byte
+    # aligned. Its first tile must use the same scalar fallback as its tail.
+    for offset in (0, 1):
+        inputs = torch.empty(slots * columns + 4, device=DEVICE, dtype=torch.bfloat16)
+        storage = torch.full((columns + 8,), 123.0, device=DEVICE, dtype=torch.bfloat16)
+        x = inputs[offset : offset + slots * columns].reshape(1, slots, columns)
+        out = storage[2 + offset : 2 + offset + columns].view(1, columns)
+        p = torch.arange(128, device=DEVICE, dtype=torch.float32)
+        assert x.data_ptr() % 4 == out.data_ptr() % 4 == 2 * offset
+        args = (x, p, out)
+        call = ordered_column_pool.bind(args).compile_config(cfg)
+        x.zero_()
+        call(*args)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            y, peer = call(*args)
+        for sign in (1, -1):
+            for ix, number in enumerate((2.0**26, 1, -(2.0**26), 2)):
+                x[0, ix].fill_(sign * number)
+            # Includes a BF16 halfway tie at 1, cancellation and both signs.
+            x[0, 0, ::3] = 1
+            x[0, 1, ::3] = 2.0**-8
+            x[0, 2:, ::3] = 0
+            out.fill_(float("nan"))
+            p.add_(1)
+            graph.replay()
+            reference = torch.zeros_like(out, dtype=torch.float32)
+            for slot in range(slots):
+                reference.add_(x[:, slot, :].float())
+            assert torch.equal(
+                y.view(torch.int16), reference.bfloat16().view(torch.int16)
+            )
+            assert torch.equal(peer, p + 1)
+            assert bool((storage[: 2 + offset] == 123).all()) and bool(
+                (storage[2 + offset + columns :] == 123).all()
+            )
