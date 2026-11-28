@@ -244,6 +244,7 @@ def mock_cuda_unavailable() -> Generator[None, None, None]:
             side_effect=require_cute_codegen,
         ),
         patch("torch.cuda.is_available", return_value=False),
+        patch("helion._compat._target_device_capability", return_value=None),
         patch("helion._compat._supports_maxnreg", return_value=False),
         patch("helion._compat._supports_tensor_descriptor", return_value=False),
         patch("helion._compat._is_hip", return_value=False),

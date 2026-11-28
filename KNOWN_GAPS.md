@@ -238,6 +238,44 @@ these labelled lines.
   test_chains_of_integer_extrema_of_negated_values_equal_eager` compares the
   covered chains with eager; a fix for a form above adds it there.
 
+## tensor-descriptor-choices-use-the-current-gpu
+
+- Area: `ConfigSpec` load, store, atomic and prefetch indexing choices
+  for an explicitly targeted GPU, and the descriptor-dependent epilogue
+  choices. CuTe and Triton share this detection.
+- What is wrong: With Triton's tensor-descriptor API installed, put an
+  SM80 A100 at the current ordinal and request an SM100 B200 at another
+  ordinal. In a fresh process, this reports an SM100 target but no
+  `tensor_descriptor` choice:
+
+  ```python
+  spec = ConfigSpec(backend=CuteBackend(), device=torch.device("cuda:1"),
+                    target_device_capability=(10, 0))
+  print(spec.target_device_capability, spec.valid_indexing_types())
+  ```
+
+  With simulated device properties, the result was `(10, 0)` and
+  `("pointer", "block_ptr")`. Reverse the two devices in another fresh
+  process and request `(8, 0)`: the SM80 spec incorrectly offers
+  `("pointer", "tensor_descriptor")`. Atomic and prefetch choices
+  follow the same wrong-device decision. The calculation caches one
+  answer based on `torch.cuda.current_device()`. Bound kernels already
+  pass the target's capability explicitly; direct CuTe specs can now
+  resolve it from their requested device, but share the same indexing
+  calculation. These are reproduced configuration results, not measured
+  kernel failures on mixed hardware.
+- Since: Reproduced on upstream main at `f1d2bf392` with the explicit
+  capability used by a bound kernel, and on the direct-spec path after
+  requested-device capability resolution.
+- Why deferred: A target-aware answer must agree across the search
+  space, descriptor lowering and epilogue validation, while preserving
+  Triton's installed API checks, ROCm/XPU behavior and saved configs.
+  Changing only the indexing menu can advertise a descriptor that a
+  later stage still rejects. End-to-end validation of both directions
+  requires devices on opposite sides of the SM90 boundary; the release
+  was qualified on homogeneous B200s.
+- Pinned by: No test pins the incorrect indexing choices.
+
 ## index-tensor-out-of-bounds
 
 - Area: compiled kernels, Triton and CuTe backends: a load or a store in a

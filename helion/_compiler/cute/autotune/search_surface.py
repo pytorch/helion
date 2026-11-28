@@ -19,7 +19,7 @@ from typing import cast
 
 import torch
 
-from ...._compat import target_device_capability as get_target_device_capability
+from .... import _compat
 from ...._utils import next_power_of_2
 from ...._utils import prev_power_of_2
 from ...._utils import widest_halvable
@@ -5851,7 +5851,31 @@ class CuteSearchSurface(BackendSearchSurface):
     def default_target_device_capability(self) -> tuple[int, int] | None:
         # Direct CuTe specs use the current CUDA device so validation still
         # enforces the arch gates.
-        return get_target_device_capability()
+        return _compat.target_device_capability()
+
+    def default_target_device_capability_for(
+        self, device: torch.device
+    ) -> tuple[int, int] | None:
+        # A specialization may supply its own target instead of a hardware
+        # query. Its existing no-argument override remains authoritative.
+        legacy = self.default_target_device_capability
+        if getattr(legacy, "__func__", None) is not _BUILTIN_CURRENT_CAPABILITY:
+            return legacy()
+        try:
+            return _compat.target_device_capability(device)
+        except AssertionError as error:
+            # Torch's get_device_properties rejects a missing visible ordinal
+            # with this assertion. A real driver/initialization error must
+            # still reach the caller. Successful (cached) queries do no extra
+            # device discovery, and the failed query cannot populate the cache.
+            if (
+                device.type == "cuda"
+                and device.index is not None
+                and error.args == ("Invalid device id",)
+                and device.index >= torch.cuda.device_count()
+            ):
+                return None
+            raise
 
     def fields(
         self, config_spec: ConfigSpec, *, flash_pipeline_family: str | None = None
@@ -6032,4 +6056,5 @@ class CuteSearchSurface(BackendSearchSurface):
         return CuteConfigGenerationExtension(generation)
 
 
+_BUILTIN_CURRENT_CAPABILITY = CuteSearchSurface.default_target_device_capability
 CUTE_SEARCH_SURFACE = CuteSearchSurface()

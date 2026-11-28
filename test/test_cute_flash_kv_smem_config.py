@@ -46,10 +46,6 @@ def _cpu_only() -> Iterator[None]:
     with (
         cpu_render_target(capability=(10, 3)),
         patch.dict(os.environ, {"CUDA_VISIBLE_DEVICES": ""}, clear=True),
-        patch(
-            "helion._compiler.cute.autotune.search_surface.get_target_device_capability",
-            return_value=(10, 3),
-        ),
     ):
         yield
 

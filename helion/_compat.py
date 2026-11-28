@@ -447,20 +447,28 @@ def target_device_capability(
     if device is not None and device.type != "cuda":
         return None
     if device is not None and device.index is not None:
-        return _target_device_capability(device.index)
-    if not torch.cuda.is_available():
+        index = device.index
+    else:
+        if not torch.cuda.is_available():
+            return None
+        # Resolve the current device per call so set_device is not frozen.
+        index = torch.cuda.current_device()
+    try:
+        return _target_device_capability(index)
+    except _CudaUnavailable:
         return None
-    # device=None means the current device; resolve it per call so a later
-    # set_device is not frozen under one cache key.
-    return _target_device_capability(torch.cuda.current_device())
+
+
+class _CudaUnavailable(Exception):
+    """A transient cache miss before CUDA initialization."""
 
 
 @functools.cache
-def _target_device_capability(index: int) -> tuple[int, int] | None:
-    # Memoize per index (capability is fixed per device). Tests patch the
-    # public wrapper above, mirroring is_hip / _is_hip.
+def _target_device_capability(index: int) -> tuple[int, int]:
+    # An NVML availability check can change before CUDA initializes; only
+    # successful device properties belong in the per-ordinal cache.
     if not torch.cuda.is_available():
-        return None
+        raise _CudaUnavailable
     return torch.cuda.get_device_capability(index)
 
 

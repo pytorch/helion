@@ -47,6 +47,8 @@ if TYPE_CHECKING:
     from collections.abc import Mapping
     from collections.abc import Sequence
 
+    import torch
+
     from ..runtime.config import Config
     from .block_id_sequence import BlockIdSequence
     from .config_fragment import ConfigSpecFragment
@@ -94,6 +96,12 @@ class BackendSearchSurface:
     def default_target_device_capability(self) -> tuple[int, int] | None:
         """The capability a spec built without one validates against."""
         return None
+
+    def default_target_device_capability_for(
+        self, device: torch.device
+    ) -> tuple[int, int] | None:
+        """Resolve an explicit device, preserving existing no-argument hooks."""
+        return self.default_target_device_capability()
 
     def fields(
         self, config_spec: ConfigSpec, *, flash_pipeline_family: str | None = None

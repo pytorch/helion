@@ -1854,7 +1854,7 @@ def test_ws_legacy_kv_stage_is_canonicalized_before_fixed_config_validation(
 ) -> None:
     with (
         patch(
-            "helion._compiler.cute.autotune.search_surface.get_target_device_capability",
+            "helion._compat.target_device_capability",
             return_value=(10, 0),
         ),
         patch(
@@ -2215,7 +2215,7 @@ def test_ws_structural_generation_is_bounded_and_complete(
 ) -> None:
     with (
         patch(
-            "helion._compiler.cute.autotune.search_surface.get_target_device_capability",
+            "helion._compat.target_device_capability",
             return_value=(10, 0),
         ),
         patch(
@@ -3638,7 +3638,7 @@ def test_unsafe_cga2_local_stage_local_softmax_canonicalizes(num_kv: int) -> Non
 
     with (
         patch(
-            "helion._compiler.cute.autotune.search_surface.get_target_device_capability",
+            "helion._compat.target_device_capability",
             return_value=(10, 0),
         ),
         patch(
