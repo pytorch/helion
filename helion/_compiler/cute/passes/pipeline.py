@@ -629,6 +629,12 @@ def _fuse_two_pass_loads(s: _DeviceBodyState) -> None:
     )
 
 
+def _unroll_proved_warp_rows(s: _DeviceBodyState) -> None:
+    from ..warp_row_unroll import unroll_proved_sweeps
+
+    unroll_proved_sweeps(s.fn, s.kernel_body)
+
+
 def _scratch_tensor_names(s: _DeviceBodyState) -> frozenset[str]:
     """The kernel arguments that are kernel-local scratch tensors (found
     once; the forwarding and the store drop both ask).  Not a placeholder
@@ -1827,6 +1833,12 @@ DEVICE_BODY_PASSES: tuple[DeviceBodyPass, ...] = (
         _fuse_two_pass_loads,
         requires=(LAUNCH_SHAPE,),
         provides=("two_pass_loads_fused",),
+    ),
+    DeviceBodyPass(
+        "unroll_proved_warp_rows",
+        _config_flag("cute_unroll_warp_row_sweeps"),
+        _unroll_proved_warp_rows,
+        requires=("two_pass_loads_fused",),
     ),
     DeviceBodyPass(
         "drop_scratch_stores",

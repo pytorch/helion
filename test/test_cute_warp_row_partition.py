@@ -23,7 +23,10 @@ from torch._subclasses.fake_tensor import FakeTensorMode
 import helion
 from helion import exc
 from helion._compiler.cute import single_row_publication as publication
+from helion._compiler.cute.autotune.config_keys import PHASE_PARTICIPATION_KEY
 from helion._compiler.cute.autotune.config_keys import ROW_DOT_KEY
+from helion._compiler.cute.autotune.config_keys import SPARE_ROW_PREFETCH_KEY
+from helion._compiler.cute.autotune.config_keys import UNROLL_WARP_ROWS_KEY
 from helion._compiler.cute.autotune.heuristics.cute_row_publication import (
     add_publication_seeds,
 )
@@ -32,10 +35,13 @@ from helion._compiler.cute.parallel_row_sum import RowSumAnchor
 from helion._compiler.cute.parallel_row_sum import parallel_sum
 from helion._compiler.cute.parallel_row_sum import validate_parallel_sum
 from helion._compiler.cute.single_row_publication import validate_publication_launch
+from helion._compiler.cute.spare_row_prefetch import logical_geometry
 from helion._compiler.cute.warp_row_partition import KEY
 from helion._compiler.cute.warp_row_partition import _row_waves
 from helion._compiler.cute.warp_row_partition import _single_row_owner
 from helion._compiler.cute.warp_row_partition import validate_row_launch
+from helion._compiler.cute.warp_row_unroll import WarpRowUnroll
+from helion._compiler.cute.warp_row_unroll import unroll_proved_sweeps
 from helion._testing.cute_codegen import cpu_bind
 from helion._testing.cute_codegen import cpu_render_target
 from helion._testing.cute_codegen import default_cute_mma_support
@@ -330,6 +336,197 @@ def _target():
         smem_budget_bytes=232448,
         reduction_smem_budget_bytes=232448,
     )
+
+
+@helion.kernel(backend="cute", static_shapes=True)
+def _dependent_rows(
+    x: torch.Tensor, weights: torch.Tensor, peer: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    sums = torch.empty(weights.size(0), dtype=torch.float32, device=x.device)
+    copied = torch.empty_like(peer)
+    for row in hl.tile(weights.size(0)):
+        sums[row] = (weights[row, :].float() * x[:].float()).sum(-1)
+    for j in hl.tile(peer.numel()):
+        copied[j] = peer[j] + sums[(j.index + 1) % weights.size(0)]
+    return sums, copied
+
+
+@helion.kernel(backend="cute", static_shapes=True)
+def _later_reduced_rows(
+    x: torch.Tensor, weights: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    vector = torch.empty_like(x)
+    sums = torch.empty(weights.size(0), dtype=torch.float32, device=x.device)
+    for col in hl.tile(x.numel()):
+        vector[col] = x[col] + 1
+    hl.barrier()
+    for row in hl.tile(weights.size(0)):
+        sums[row] = (weights[row, :].float() * vector[:].float()).sum(-1)
+    return vector, sums
+
+
+def test_spare_warp_prefetch_field_requires_sm10x_and_the_first_root() -> None:
+    with cpu_render_target(capability=(9, 0), fake_device_sm_count=120):
+        older = cpu_bind(_dependent_rows, _args(16, 256), capability=(9, 0))
+        assert older.config_spec.target_device_capability == (9, 0)
+    with _target():
+        later = cpu_bind(_later_reduced_rows, _args(16, 256)[:2])
+        assert later.config_spec.target_device_capability == (10, 0)
+    for bound in (older, later):
+        fields = {key for key, *_ in bound.config_spec.structural_fingerprint()}
+        assert bound.config_spec.cute_warp_row_reduction_roots
+        assert KEY in fields and SPARE_ROW_PREFETCH_KEY not in fields
+
+
+def test_spare_warp_prefetch_owns_only_unused_threads_and_complete_matrix_rows() -> (
+    None
+):
+    with _target():
+        x = torch.empty(256, dtype=torch.bfloat16)
+        matrix = torch.empty(16, 256, dtype=torch.bfloat16)
+        peer = torch.empty(256)
+        bound = cpu_bind(_dependent_rows, (x, matrix, peer))
+        options = {
+            "block_sizes": [1, 64],
+            "num_threads": [1, 64, 1],
+            "reduction_loops": [64],
+            "pid_type": "persistent_interleaved",
+            "cross_loop_pipeline": "barrier",
+            KEY: True,
+        }
+        assert logical_geometry(bound.config_spec, options)
+        assert not logical_geometry(
+            bound.config_spec, options | {PHASE_PARTICIPATION_KEY: True}
+        )
+        ordinary = bound.to_code(helion.Config.from_dict(options))
+        cfg = options | {SPARE_ROW_PREFETCH_KEY: True}
+        source = bound.to_code(helion.Config.from_dict(cfg))
+        tree = ast.parse(source)
+        guards = [
+            n
+            for n in ast.walk(tree)
+            if isinstance(n, ast.If)
+            and "weights.iterator.alignment >= 16" in ast.unparse(n.test)
+        ]
+        (guard,) = guards
+        assert "weights.layout.stride[1] == 1" in ast.unparse(guard.test)
+        assert ">= 32" in ast.unparse(guard) and "< 36" in ast.unparse(guard)
+        for scope in ast.walk(tree):
+            body = getattr(scope, "body", None)
+            if isinstance(body, list) and guard in body:
+                index = body.index(guard)
+                assert ast.unparse(body[index + 1].test) == "cute.arch.warp_idx() == 0"
+                body.remove(guard)
+                break
+        assert ast.dump(tree) == ast.dump(ast.parse(ordinary))
+
+        # Every physical thread already belongs to warp zero.
+        for nt in ([1, 32, 1], [1, 1, 1]):
+            with pytest.raises(exc.InvalidConfig):
+                bound.to_code(helion.Config.from_dict(cfg | {"num_threads": nt}))
+        transposed = torch.empty(256, 16, dtype=torch.bfloat16).T
+        unsafe = cpu_bind(_dependent_rows, (x, transposed, peer))
+        assert unsafe.config_spec.cute_spare_row_prefetch_root is None
+        assert SPARE_ROW_PREFETCH_KEY in {
+            f[0] for f in unsafe.config_spec.structural_fingerprint()
+        }
+        with pytest.raises(exc.InvalidConfig):
+            unsafe.to_code(helion.Config.from_dict(cfg))
+        weak = torch.empty(1 + 16 * 256, dtype=torch.bfloat16)[1:].view(16, 256)
+        assert weak.data_ptr() % 16 == 2
+        unaligned = cpu_bind(_dependent_rows, (x, weak, peer))
+        assert (
+            unaligned.config_spec.structural_fingerprint()
+            == bound.config_spec.structural_fingerprint()
+        )
+        weak_source = unaligned.to_code(helion.Config.from_dict(cfg))
+        assert "weights.iterator.alignment >= 16" in weak_source
+        nested = cfg | {"block_sizes": [[1], [64]], "num_threads": [[1], [64], [1]]}
+        assert bound.to_code(helion.Config.from_dict(nested)) == source
+
+
+def test_scalar_warp_unroll_preserves_the_two_fp32_reduction_bodies() -> None:
+    # Two distinct summers share the same K coordinates. The unchanged warp
+    # result of the first feeds the second through a division.
+    with _target():
+        bound = cpu_bind(_partitioned, _args(16, 256))
+        options = {
+            "block_sizes": [1, 64],
+            "num_threads": [1, 64, 1],
+            "reduction_loops": [64],
+            "pid_type": "persistent_interleaved",
+            KEY: True,
+        }
+        ordinary = ast.parse(bound.to_code(helion.Config.from_dict(options)))
+        full = helion.Config.from_dict(options | {UNROLL_WARP_ROWS_KEY: True})
+        unrolled = ast.parse(bound.to_code(full))
+        nested = dict(full) | {
+            "block_sizes": [[1], [64]],
+            "num_threads": [[1], [64], [1]],
+        }
+        assert ast.dump(
+            ast.parse(bound.to_code(helion.Config.from_dict(nested)))
+        ) == ast.dump(unrolled)
+
+        def sweeps(tree: ast.AST) -> list[ast.For]:
+            (owner,) = [
+                n
+                for n in ast.walk(tree)
+                if isinstance(n, ast.If)
+                and ast.unparse(n.test) == "cute.arch.warp_idx() == 0"
+            ]
+            return [n for n in owner.body if isinstance(n, ast.For)]
+
+        # The ordinary fused two-pass load cache must survive the static
+        # rewrite, including its uses in the second reduction.
+        assert "_fuse_cache_" in ast.unparse(ordinary)
+        before, after = sweeps(ordinary), sweeps(unrolled)
+        assert len(before) == len(after) == 2
+        for old, new in zip(before, after, strict=True):
+            assert ast.unparse(new.iter) == "cutlass.range_constexpr(4)"
+            assign, inner = new.body
+            assert isinstance(assign, ast.Assign) and isinstance(inner, ast.For)
+            assert ast.unparse(assign.targets[0]) == ast.unparse(old.target)
+            assert (
+                ast.unparse(assign.value)
+                == f"cutlass.Int32({ast.unparse(new.target)} * 64)"
+            )
+            assert ast.unparse(inner.iter) == "cutlass.range_constexpr(2)"
+            assert isinstance(old.body[0], ast.For)
+            # Undo only the iterator representation. This must recover all
+            # addresses, masks, accumulation order, and the eventual store.
+            new.body, new.iter, new.target = [inner], old.iter, old.target
+            inner.iter = old.body[0].iter
+        assert ast.dump(unrolled) == ast.dump(ordinary)
+
+        large = cpu_bind(_partitioned, _args(16, 8192))
+        with pytest.raises(exc.InvalidConfig, match="bounded complete scalar warp row"):
+            large.to_code(full)
+        with pytest.raises(exc.InvalidConfig, match="bounded complete scalar warp row"):
+            bound.to_code(
+                helion.Config.from_dict(full.config | {"block_sizes": [2, 64]})
+            )
+
+
+def test_unroll_refuses_an_ambiguous_or_rebound_loop() -> None:
+    (outer,) = ast.parse("for k in range(0, 256, 64):\n for i in range(2): x += i").body
+    assert isinstance(outer, ast.For)
+    inner = outer.body[0]
+    assert isinstance(inner, ast.For)
+    fn = MagicMock()
+    state = fn.cute_state.lanes
+    state.pending_warp_row_unrolls = [WarpRowUnroll.record(outer, inner, 256, 64)]
+    state.unrolled_warp_row = False
+    unroll_proved_sweeps(fn, [outer, outer])
+    assert not state.unrolled_warp_row
+    outer.target = ast.Name(id="other", ctx=ast.Store())
+    unroll_proved_sweeps(fn, [outer])
+    assert not state.unrolled_warp_row
+    outer.target = ast.Name(id="k", ctx=ast.Store())
+    inner.iter = ast.parse("range(4)", mode="eval").body
+    unroll_proved_sweeps(fn, [outer])
+    assert not state.unrolled_warp_row
+    assert not fn.new_var.called
 
 
 def test_semantic_admission_rejects_effects_and_partial_warps() -> None:

@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from .....runtime.config import Config
+from ..config_keys import DIRECT_INDEXED_PACKETS_KEY
 from ..config_keys import STAGED_INDEXED_ROWS_KEY
 
 if TYPE_CHECKING:
@@ -92,4 +93,15 @@ def add_indexed_row_seed(
         opts.pop("cute_warp_row_reductions", None)
         opts[STAGED_INDEXED_ROWS_KEY] = True
         return [*configs, Config.from_dict(opts)]
+    return configs
+
+
+def add_direct_packet_seed(configs: list[Config]) -> list[Config]:
+    """Try the last eligible row schedule without changing any existing seed."""
+    for parent in reversed(configs):
+        if parent.get(STAGED_INDEXED_ROWS_KEY) is True:
+            return [
+                *configs,
+                Config.from_dict(parent.config | {DIRECT_INDEXED_PACKETS_KEY: True}),
+            ]
     return configs

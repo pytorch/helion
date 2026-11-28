@@ -344,6 +344,46 @@ def test_unpaired_projection_seed_supplies_its_own_four_warps() -> None:
             flat, checked = gen.strict_config_pair(candidate)
             assert gen.canonicalize_flat(flat)[1].config == checked.config
         source = bound.to_code(checked)
+        with bound.env:
+            direct = helion.Config.from_dict(
+                checked.config | {"cute_direct_indexed_packets": True}
+            )
+            flat, strict = gen.strict_config_pair(direct)
+            assert gen.canonicalize_flat(flat)[1] == strict
+            with pytest.raises(exc.InvalidConfig, match="a staged indexed BF16"):
+                gen.strict_config_pair(
+                    helion.Config.from_dict(
+                        carrier.config | {"cute_direct_indexed_packets": True}
+                    )
+                )
+        direct_source = bound.to_code(strict)
+    before = ast.parse(source)
+    after = ast.parse(direct_source)
+    (fast_call,) = [
+        n
+        for n in ast.walk(after)
+        if isinstance(n, ast.Call)
+        and ast.unparse(n.func) == "_cute_staged_indexed_row_dot"
+    ]
+    assert (
+        isinstance(fast_call.args[0], ast.Constant) and fast_call.args[0].value is None
+    )
+    assert "_stage_indexed_scratch = " not in direct_source
+    # Only the copy workspace and its argument may change. The fallback is identical.
+    (device,) = [
+        n
+        for n in before.body
+        if isinstance(n, ast.FunctionDef) and n.name.startswith("_helion_")
+    ]
+    (allocation,) = [
+        n
+        for n in device.body
+        if isinstance(n, ast.Assign)
+        and ast.unparse(n.targets[0]) == "_stage_indexed_scratch"
+    ]
+    device.body.remove(allocation)
+    fast_call.args[0] = ast.Name(id="_stage_indexed_scratch", ctx=ast.Load())
+    assert ast.dump(after) == ast.dump(before)
     (launch,) = [
         n
         for n in ast.walk(ast.parse(source))
@@ -354,6 +394,74 @@ def test_unpaired_projection_seed_supplies_its_own_four_warps() -> None:
     block = next(kw.value for kw in launch.keywords if kw.arg == "block")
     assert ast.literal_eval(block) == (4, 32, 1)
     assert source.count("= _cute_staged_indexed_row_dot(") == 1
+
+
+@pytest.mark.cuda
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_direct_indexed_packets_preserve_routed_weights_and_alignment() -> None:
+    if torch.cuda.get_device_capability(DEVICE) < (8, 0):
+        pytest.skip("BF16 warp MMA requires SM80+")
+    rng = torch.Generator(device=DEVICE).manual_seed(4271)
+    x = torch.randint(-3, 4, (2, 3, 256), device=DEVICE, generator=rng).bfloat16()
+    data = torch.randint(-3, 4, (7, 64, 256), device=DEVICE, generator=rng).bfloat16()
+    routes = torch.tensor([[6, 2, 6], [3, 0, 1]], device=DEVICE, dtype=torch.int32)
+    scores = torch.tensor([[0.5, -1.25, 0], [0.25, -1, 0.75]], device=DEVICE)
+    carrier = helion.Config(
+        block_sizes=[64, 64],
+        num_threads=[4, 4],
+        pid_type="persistent_interleaved",
+        cross_loop_pipeline="barrier",
+    )
+    for offset in (0, 1):
+        storage = torch.empty(data.numel() + offset, device=DEVICE, dtype=data.dtype)
+        weights = storage[offset:].view_as(data).copy_(data)
+        assert weights.data_ptr() % 16 == 2 * offset
+        args = (x, weights, routes, scores)
+        bound = _select_rows.bind(args)
+        with bound.env, bound.host_function:
+            _, staged = add_indexed_row_seed(bound.env, [carrier])
+            direct = helion.Config.from_dict(
+                staged.config | {"cute_direct_indexed_packets": True}
+            )
+            _, checked = (
+                bound.config_spec.create_config_generation().strict_config_pair(direct)
+            )
+        fn = bound.compile_config(checked)
+        for indices in (routes, routes.flip(1)):
+            actual = fn(x, weights, indices, scores)
+            expected = (
+                ((x + 1).float().unsqueeze(-2) * weights[indices.long()].float()).sum(
+                    -1
+                )
+                * scores.unsqueeze(-1)
+            ).bfloat16()
+            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        if offset == 0:
+            # A BF16 midpoint distinguishes a tiny FP32 rounding difference
+            # even after the original public BF16 store.
+            probe_x = torch.zeros_like(x)
+            probe_scores = torch.ones_like(scores)
+            weights.zero_()
+            weights[:, :, 0] = 2**24
+            weights[:, :, 32] = 2**16
+            weights[:, :, 64] = 1.5
+            actual = fn(probe_x, weights, routes, probe_scores)
+            expected = torch.full_like(actual, float(2**24 + 2**17))
+            # The relaxed path may land on the adjacent BF16 midpoint.
+            torch.testing.assert_close(actual, expected, rtol=0, atol=2**17)
+            strict_args = probe_x, weights, routes, probe_scores
+            strict = helion.kernel(
+                _select_rows.fn,
+                backend="cute",
+                static_shapes=True,
+                fast_math=False,
+                autotune_effort="none",
+            ).bind(strict_args)
+            assert not strict.config_spec.cute_staged_indexed_row_axes
+            strict_fn = strict.compile_config(carrier)
+            torch.testing.assert_close(
+                strict_fn(*strict_args), expected, rtol=0, atol=0
+            )
 
 
 def _gemma_kernel_args():
@@ -452,6 +560,57 @@ def test_shared_forward_keeps_a_scalar_seed_and_stages_both_complete_projections
             and not c.get("cute_packed_row_publication")
             and not c.get("cute_ordered_column_pairs")
         ]
+        j = next(
+            i
+            for i, cfg in enumerate(seeds)
+            if cfg.get("cute_cooperative_selection_merge")
+        )
+        prior, unrolled, packets, joined = seeds[j - 3 : j + 1]
+        assert unrolled.config == prior.config | {"cute_unroll_warp_row_sweeps": True}
+        assert packets.config == unrolled.config | {"cute_direct_indexed_packets": True}
+        for choice in (unrolled, packets):
+            assert generation.strict_config_pair(choice)[1] == choice
+        assert joined.config == packets.config | {
+            "cute_cooperative_selection_merge": True,
+            "cute_reduction_reloads": ["register", "auto", "auto"],
+        }
+        assert generation.strict_config_pair(joined)[1] == joined
+        joined_source = bound.to_code(joined)
+        assert joined_source.count("_cute_grid_barrier(x_grid_sem.iterator)") == 5
+        joined_tree = ast.parse(joined_source)
+        (selection,) = [
+            n
+            for n in ast.walk(joined_tree)
+            if isinstance(n, ast.If)
+            and ast.unparse(n.test) == "cutlass.Int32(cute.arch.block_idx()[0]) == 0"
+            and any(
+                isinstance(s, ast.Name) and s.id == "selection_slot"
+                for s in ast.walk(n)
+            )
+        ]
+        assert ast.unparse(selection.body[-1]) == "cute.arch.sync_threads()"
+        public_stores = [
+            ast.unparse(n.func.value).split(".")[0]
+            for n in ast.walk(selection)
+            if isinstance(n, ast.Call)
+            and isinstance(n.func, ast.Attribute)
+            and n.func.attr == "store"
+        ]
+        assert sorted(public_stores) == ["candidate_ids", "candidate_values"]
+        assert "route_merge_values_flat.iterator" not in joined_source
+        assert "route_merge_ids_flat.iterator" not in joined_source
+
+        # Simulate a sibling lowering that installs 64 physical threads after
+        # the seed already passed the 128-thread strategy check. Two warps
+        # cannot publish all four candidate groups.
+        def two_warp_override(fn):
+            assert update_launch_block(fn.codegen.host_statements, fn.name, (64, 1, 1))
+
+        with (
+            patch.object(launch_attributes, "project_launch_block", two_warp_override),
+            pytest.raises(exc.InvalidConfig, match="four complete physical warps"),
+        ):
+            bound.to_code(joined)
         assert [two.config, three.config] == [
             network.config | {STAGED_GRID_KEY: waves} for waves in (2, 3)
         ]
@@ -461,6 +620,17 @@ def test_shared_forward_keeps_a_scalar_seed_and_stages_both_complete_projections
         distributed = next(c for c in seeds if c.get("cute_cooperative_row_norm"))
         flat, checked = generation.strict_config_pair(distributed)
         assert generation.canonicalize_flat(flat)[1] == checked
+        (early,) = [
+            c
+            for c in seeds
+            if c.get("cute_early_indexed_input")
+            and not c.get("cute_unroll_warp_row_sweeps")
+        ]
+        assert early.config == distributed.config | {"cute_early_indexed_input": True}
+        assert generation.strict_config_pair(early)[1] == early
+        early_source = bound.to_code(early)
+        assert "torch.zeros((1536 if _NUM_SM >= 150 else 96,)" in early_source
+        assert early_source.count("_cute_grid_barrier(x_grid_sem.iterator)") == 6
         active = bound.to_code(participants)
         joins = [
             call

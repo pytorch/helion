@@ -51,6 +51,19 @@ def register_row_schema(env: CompileEnvironment, ir: DeviceIR) -> None:
                 spec.cute_row_publication_structure = True
             if sums and store.args[2] is sums[-1]:
                 spec.cute_row_reduction_structure = True
+                if (
+                    cap is not None
+                    and cap[0] == 10
+                    and root == ir.root_ids[0]
+                    and any(
+                        n.target is memory_ops.load
+                        and (t := node_tensor(n.args[0])) is not None
+                        and t.dtype == torch.bfloat16
+                        and t.ndim == 2
+                        for n in nodes
+                    )
+                ):
+                    spec.cute_row_prefetch_structure = True
         if (
             len(grid) != 3
             or cap is None

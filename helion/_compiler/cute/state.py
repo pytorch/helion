@@ -75,6 +75,7 @@ if TYPE_CHECKING:
     from .device_state import Tcgen05EpiRowPrefetch
     from .direct_affine_candidate import DirectAffineCandidate
     from .direct_affine_plan import DirectAffinePlan
+    from .early_indexed_input import Prelude
     from .epilogue_fanout import FanoutStore
     from .fixed_token_rank1_recurrence import CuteFixedTokenRank1Plan
     from .flex_bwd_match import FlexBwdMatch
@@ -94,6 +95,7 @@ if TYPE_CHECKING:
     from .simt_gemm import SimtGemmSite
     from .single_token_rank1_recurrence import CuteSingleTokenRank1Plan
     from .split_single_token_rank1_recurrence import CuteSplitSingleTokenRank1Plan
+    from .warp_row_unroll import WarpRowUnroll
 
 
 # ---------------------------------------------------------------------------
@@ -688,6 +690,11 @@ class CuteLaneState:
     warp_row_threads: int = 0
     # A complete physical warp owns a scalar row; all other warps skip it.
     has_singleton_warp_rows: bool = False
+    spare_row_witness: tuple[str, str, ast.expr] | None = None
+    pending_warp_row_unrolls: list[WarpRowUnroll] = dataclasses.field(
+        default_factory=list
+    )
+    unrolled_warp_row: bool = False
     # Exact CTA shapes used to assign independent output columns to threads.
     ordered_column_dims: set[tuple[int, int, int]] = dataclasses.field(
         default_factory=set
@@ -698,6 +705,7 @@ class CuteLaneState:
     packed_row_publication: bool = False
     cooperative_pair_producer: PublishedPairs | None = None
     cooperative_pair_consumer: NormalizedRow | None = None
+    early_indexed_input: Prelude | None = None
     parallel_row_sum_anchors: dict[str, RowSumAnchor] = dataclasses.field(
         default_factory=dict
     )

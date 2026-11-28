@@ -1660,16 +1660,21 @@ class ConfigSpec:
         self.cute_explicit_local_barrier = False
         self.cute_fragment_warp_topk_requires_flat = False
         self.cute_fragment_warp_reduction_requires_flat = False
-        self.cute_normalizable_column: tuple[int, int] | None = None
-        self.cute_column_sum_structure = False
-        self.cute_ordered_column_sum_roots: dict[int, tuple[int, int, int, int]] = {}
-        self.cute_packed_publication_pattern = False
         self.cute_row_publication_structure = False
         self.cute_row_reduction_structure = False
+        self.cute_row_prefetch_structure = False
         self.cute_indexed_row_structure = False
         self.cute_staged_grid_structure = False
         self.cute_row_epilogue_structure = False
+        self.cute_early_indexed_axis: int | None = None
+        self.cute_normalizable_column: tuple[int, int] | None = None
+        self.cute_column_sum_structure = False
+        self.cute_ordered_column_sum_roots: dict[int, tuple[int, int, int, int]] = {}
+        self.cute_selection_handoff_structure = False
+        self.cute_selection_handoff_roots: tuple[int, int] | None = None
+        self.cute_packed_publication_pattern = False
         self.cute_single_row_publication_roots: dict[int, tuple[int, int]] = {}
+        self.cute_spare_row_prefetch_root: int | None = None
         self.cute_warp_row_reduction_roots: dict[int, tuple[int, int, int, int]] = {}
         # Flat field presence follows the carry's FX structure. Physical roots
         # and extents below authorize a choice separately on each binding.

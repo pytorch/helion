@@ -37,6 +37,7 @@ DEVICE_BODY_PROLOGUE_NAMES = [
 DEVICE_BODY_PASS_NAMES = [
     "finalize_shared_reduce_groups",
     "fuse_two_pass_loads",
+    "unroll_proved_warp_rows",
     "drop_scratch_stores",
     "vectorize_branch_local_persistent_fragments",
     "hoist_warp_reduce_from_vloop",

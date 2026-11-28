@@ -8,6 +8,8 @@ from typing import TYPE_CHECKING
 from ...exc import InvalidConfig
 from ..ast_extension import expr_from_string
 from ..program_id import NUM_SM_VAR
+from ._ast_pass_utils import parse_expr
+from ._ast_pass_utils import same_expr
 from .autotune.config_keys import STAGED_GRID_KEY
 
 if TYPE_CHECKING:
@@ -17,30 +19,56 @@ if TYPE_CHECKING:
 COUNTER_STRIDE = 32
 
 
+def static_phase_bound(value: ast.expr) -> int | None:
+    """Recover a small nonnegative constant in an emitted Int64 PID sum."""
+    if isinstance(value, ast.Constant) and type(value.value) is int:
+        return value.value if 0 <= value.value < 2**31 else None
+    if isinstance(value, ast.BinOp) and isinstance(value.op, ast.Add):
+        left, right = static_phase_bound(value.left), static_phase_bound(value.right)
+        if left is not None and right is not None and left + right < 2**31:
+            return left + right
+    elif (
+        isinstance(value, ast.Call)
+        and same_expr(value.func, parse_expr("cutlass.Int64"))
+        and not value.keywords
+        and len(value.args) == 1
+        and isinstance(value.args[0], ast.Constant)
+    ):
+        return static_phase_bound(value.args[0])
+    return None
+
+
 def _count(loop: ast.For) -> int | None:
-    """Recognize the exact zero-trip condition of the interleaved PID emitter."""
+    """Recognize both narrow and wide forms of the interleaved zero-trip condition."""
     if loop.orelse:
         return None
     for x in ast.walk(loop.iter):
-        if not (
-            isinstance(x, ast.BinOp)
-            and isinstance(x.op, ast.Sub)
-            and isinstance(x.left, ast.Constant)
-            and isinstance(x.right, ast.Constant)
-            and type(x.left.value) is int
-            and type(x.right.value) is int
-            and 0 <= x.right.value < x.left.value < 2**31
-        ):
+        if not (isinstance(x, ast.BinOp) and isinstance(x.op, ast.Sub)):
             continue
-        diff = f"({x.left.value} - {x.right.value})"
-        nsm = NUM_SM_VAR
-        expected = expr_from_string(
-            "range(cutlass.Int32(0), "
-            f"cutlass.Int32({diff} // {nsm} + cutlass.Int32("
-            f"cutlass.Int32(cute.arch.block_idx()[0]) < {diff} % {nsm})))"
+        hi, lo = static_phase_bound(x.left), static_phase_bound(x.right)
+        if hi is None or lo is None or hi <= lo:
+            continue
+        diff = f"(({ast.unparse(x.left)}) - ({ast.unparse(x.right)}))"
+        trips = (
+            f"{diff} // {NUM_SM_VAR} + cutlass.Int32("
+            f"cutlass.Int32(cute.arch.block_idx()[0]) < {diff} % {NUM_SM_VAR})"
         )
-        if ast.dump(loop.iter) == ast.dump(expected):
-            return x.left.value - x.right.value
+        # A later symbolic or large root widens even the earlier, constant phases.
+        if any(
+            same_expr(loop.iter, parse_expr(wide))
+            for wide in (
+                f"range(cutlass.Int64({trips}))",
+                f"range(cutlass.Int64(0), cutlass.Int64({trips}))",
+            )
+        ) or (
+            isinstance(x.left, ast.Constant)
+            and isinstance(x.right, ast.Constant)
+            and same_expr(
+                loop.iter,
+                parse_expr(f"range(cutlass.Int32(0), cutlass.Int32({trips}))"),
+            )
+        ):
+            return hi - lo
     return None
 
 

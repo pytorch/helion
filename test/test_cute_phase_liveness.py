@@ -240,16 +240,17 @@ def test_warp_carry_packets_handle_sliced_weights_and_partial_rows():
 
 
 @pytest.mark.parametrize(
-    ("activated", "staged_grid", "active_joins"),
+    ("activated", "staged_grid", "active_joins", "direct"),
     [
-        (False, False, False),
-        (True, False, False),
-        (False, True, False),
-        (False, True, True),
+        (False, False, False, False),
+        (True, False, False, False),
+        (False, True, False, False),
+        (False, True, True, False),
+        pytest.param(False, False, False, True, id="direct"),
     ],
 )
 def test_staged_bf16_projections_preserve_changed_router_and_rounded_pair(
-    activated, staged_grid, active_joins
+    activated, staged_grid, active_joins, direct
 ):
     if torch.cuda.get_device_capability(DEVICE) < (8, 0):
         pytest.skip("asynchronous copies and BF16 warp MMA require SM80+")
@@ -297,6 +298,8 @@ def test_staged_bf16_projections_preserve_changed_router_and_rounded_pair(
         cute_defer_tile_reduce=True,
         cute_staged_indexed_rows=True,
     )
+    if direct:
+        config.config["cute_direct_indexed_packets"] = True
     if staged_grid:
         config.config["cute_staged_projection_grid"] = 2
     if active_joins:

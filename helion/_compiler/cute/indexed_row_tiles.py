@@ -20,9 +20,12 @@ from ._ast_pass_utils import scalar_index_offsets
 from ._ast_pass_utils import scalar_index_ptr
 from ._ast_pass_utils import scalar_tensor_access
 from .analysis.indexed_row_epilogue import indexed_row_epilogue
+from .autotune.config_keys import DIRECT_INDEXED_PACKETS_KEY
+from .autotune.config_keys import EARLY_INDEXED_INPUT_KEY
 from .autotune.config_keys import INDEXED_ROW_EPILOGUE_KEY
 from .autotune.config_keys import REUSE_INDEXED_INPUT_KEY
 from .autotune.indexed_row_epilogue import reusable_row_axes
+from .early_indexed_input import record as record_early_input
 from .warp_row_partition import pure_row_expression
 
 if TYPE_CHECKING:
@@ -399,6 +402,7 @@ def _fast(
     threads: int,
     *,
     reuse_input: bool,
+    direct_packets: bool,
     stage_name: str,
 ) -> tuple[ast.If, list[ast.stmt], list[ast.stmt]] | None:
     k = s.k
@@ -411,6 +415,7 @@ def _fast(
         else f"cute.math.rsqrt({total} / cutlass.Float32({k}) + {r.epsilon})"
     )
     y = s.output
+    scratch = "None" if direct_packets else "_stage_indexed_scratch"
     idx = _target(r.selected)
     batch = r.batch
     slot = r.slot
@@ -474,7 +479,7 @@ cute.arch.sync_threads()
 _stage_indexed_local = _stage_indexed_warp % {width // 8} * 8 + _stage_indexed_lane // 4
 _stage_indexed_row = {r.row_base} + _stage_indexed_local
 _stage_indexed_low = {idx} * {2 * s.rows} + _stage_indexed_row
-_stage_indexed_l,_stage_indexed_h = {stage_name}(_stage_indexed_scratch,{scalar_index_ptr(w, "_stage_indexed_low", "0")},{scalar_index_ptr(w, f"_stage_indexed_low + {s.rows}", "0")},_stage_indexed_xptr,_stage_indexed_lane%4*8+_stage_indexed_group*32,{panel},{k // panel},{threads})
+_stage_indexed_l,_stage_indexed_h = {stage_name}({scratch},{scalar_index_ptr(w, "_stage_indexed_low", "0")},{scalar_index_ptr(w, f"_stage_indexed_low + {s.rows}", "0")},_stage_indexed_xptr,_stage_indexed_lane%4*8+_stage_indexed_group*32,{panel},{k // panel},{threads})
 if _stage_indexed_lane % 4 == 0:
     _stage_indexed_part[_stage_indexed_group*{width}+_stage_indexed_local] = _stage_indexed_l
     _stage_indexed_part[{j}+_stage_indexed_group*{width}+_stage_indexed_local] = _stage_indexed_h
@@ -498,7 +503,7 @@ cute.arch.sync_threads()
 _stage_indexed_row = {r.row_base} + 16*cutlass.Int32(cute.arch.warp_idx()) + _stage_indexed_lane//4
 _stage_indexed_low = {idx} * {s.rows} + _stage_indexed_row
 _stage_indexed_scale = ({scalar_index_ptr(s.weights, batch, slot)}).load()
-_stage_indexed_l,_stage_indexed_h = {stage_name}(_stage_indexed_scratch,{scalar_index_ptr(w, "_stage_indexed_low", "0")},{scalar_index_ptr(w, "_stage_indexed_low + 8", "0")},{scalar_index_ptr(x, batch, slot, "0")},_stage_indexed_lane%4*8,32,{k // 32},{threads})
+_stage_indexed_l,_stage_indexed_h = {stage_name}({scratch},{scalar_index_ptr(w, "_stage_indexed_low", "0")},{scalar_index_ptr(w, "_stage_indexed_low + 8", "0")},{scalar_index_ptr(x, batch, slot, "0")},_stage_indexed_lane%4*8,32,{k // 32},{threads})
 if _stage_indexed_lane%4==0:
     ({scalar_index_ptr(y, batch, slot, "_stage_indexed_row")}).store(cutlass.BFloat16(_stage_indexed_l*_stage_indexed_scale))
     ({scalar_index_ptr(y, batch, slot, "_stage_indexed_row + 8")}).store(cutlass.BFloat16(_stage_indexed_h*_stage_indexed_scale))
@@ -523,6 +528,8 @@ def lower_indexed_row_tiles(
 
     request_reuse = ctx.config.get(REUSE_INDEXED_INPUT_KEY) is True
 
+    direct_packets = ctx.config.get(DIRECT_INDEXED_PACKETS_KEY) is True
+
     def decline() -> None:
         if request_reuse:
             raise InvalidConfig(
@@ -530,6 +537,10 @@ def lower_indexed_row_tiles(
             )
         if request_epilogue:
             raise InvalidConfig("cannot fuse row epilogue with this physical launch")
+        if direct_packets:
+            raise InvalidConfig(
+                "direct indexed packets require a checked physical row projection"
+            )
 
     root_ids = ir.root_ids
     phases = [n for n in definition.body if isinstance(n, ast.For)]
@@ -626,7 +637,13 @@ def lower_indexed_row_tiles(
         )
         if (
             result := _fast(
-                s, r, width, prod(block), reuse_input=keep_input, stage_name=stage_name
+                s,
+                r,
+                width,
+                prod(block),
+                reuse_input=keep_input,
+                direct_packets=direct_packets,
+                stage_name=stage_name,
             )
         ) is not None:
             accepted.append((original, r, *result))
@@ -638,9 +655,12 @@ def lower_indexed_row_tiles(
     # A phase is a sequential outer loop. Its staged branch ends in a CTA
     # fence and drains all copies in the helper, and the fallback never
     # touches these buffers. No two phases execute concurrently on one CTA.
-    setup = ast.parse(
-        f"_stage_indexed_scratch = cute.arch.alloc_smem(cutlass.BFloat16,{48 * prod(block)},alignment=128)"
-    ).body
+    # Direct register loads never need the copy pipeline's three shared panels.
+    setup: list[ast.stmt] = []
+    if not direct_packets:
+        setup = ast.parse(
+            f"_stage_indexed_scratch = cute.arch.alloc_smem(cutlass.BFloat16,{48 * prod(block)},alignment=128)"
+        ).body
     if request_epilogue:
         # Shared scratch for a pair is named once per kernel. Give it to an
         # original producer whose *complete* consumer recipe actually lowers.
@@ -683,6 +703,8 @@ def lower_indexed_row_tiles(
             phase = by_root[site.root]
             i = definition.body.index(phase)
             definition.body[i:i] = prelude
+            if ctx.config.get(EARLY_INDEXED_INPUT_KEY):
+                record_early_input(ctx.fn, site, names, prelude)
             reused = True
     if request_reuse and not reused:
         raise InvalidConfig("cannot reuse the staged row input on this physical launch")

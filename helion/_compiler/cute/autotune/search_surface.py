@@ -176,6 +176,7 @@ from ..warp_carry_packet import has_carry_packet
 from ..warp_carry_packet import uses_warp_carry
 from ..warp_carry_packet import warp_carry_tile
 from ..warp_row_dot_spec import row_dot_geometry
+from ..warp_row_unroll import unrolled_row_geometry
 from .config_generation_ext import CuteConfigGenerationExtension
 from .config_keys import COMPACT_ROWS_KEY
 from .config_keys import CUTE_AFFINE_SCAN_SCHEDULE_KEY
@@ -193,14 +194,19 @@ from .config_keys import CUTE_GDN_RECURRENCE_TOKEN_GROUPS_KEY
 from .config_keys import CUTE_IMPLICIT_DEFAULT_KEYS
 from .config_keys import CUTE_LOAD_HINT_FORM_KEYS
 from .config_keys import CUTE_TOPK_CHOICES
+from .config_keys import DIRECT_INDEXED_PACKETS_KEY
+from .config_keys import EARLY_INDEXED_INPUT_KEY
 from .config_keys import GRID_INIT_KEY
 from .config_keys import INDEXED_ROW_EPILOGUE_KEY
 from .config_keys import ORDERED_COLUMN_PAIRS_KEY
 from .config_keys import PHASE_PARTICIPATION_KEY
 from .config_keys import REUSE_INDEXED_INPUT_KEY
 from .config_keys import ROW_DOT_KEY
+from .config_keys import SELECTION_HANDOFF_KEY
+from .config_keys import SPARE_ROW_PREFETCH_KEY
 from .config_keys import STAGED_GRID_KEY
 from .config_keys import STAGED_INDEXED_ROWS_KEY
+from .config_keys import UNROLL_WARP_ROWS_KEY
 from .config_keys import VALID_CUTE_CHUNK_PREPARE_SCHEDULES
 from .config_keys import VALID_CUTE_CHUNK_RECURRENCE_REGISTER_CAPS
 from .config_keys import _cute_chunk_recurrence_config_is_safe
@@ -3279,6 +3285,8 @@ def normalize_family_gates(
 def normalize_knobs(
     config_spec: ConfigSpec, config: dict[str, object], *, fix_invalid: bool
 ) -> None:
+    from ..selection_handoff import normalize as normalize_selection_handoff
+
     normalize_cluster_schedule(
         config,
         available=config_spec.cute_split_k_cluster_facts is not None,
@@ -3421,6 +3429,7 @@ def normalize_knobs(
         config_spec, config, "cute_fragment_topk_network", fix_invalid=fix_invalid
     )
     _normalize_cute_fragment_cta_topk(config_spec, config, fix_invalid=fix_invalid)
+    normalize_selection_handoff(config_spec, config, fix_invalid=fix_invalid)
     _normalize_fragment_option(
         config_spec, config, "cute_fragment_atomic_aggregation", fix_invalid=fix_invalid
     )
@@ -3879,6 +3888,40 @@ def normalize_after_sequences(
         fix_invalid=fix_invalid,
         fill=False,
     )
+    _normalize_gated_boolean(
+        config,
+        DIRECT_INDEXED_PACKETS_KEY,
+        enabled=config.get(STAGED_INDEXED_ROWS_KEY) is True,
+        requirement="a staged indexed BF16 row projection",
+        fix_invalid=fix_invalid,
+        fill=False,
+    )
+    if config.get(DIRECT_INDEXED_PACKETS_KEY) is False:
+        config.pop(DIRECT_INDEXED_PACKETS_KEY)
+    _normalize_gated_boolean(
+        config,
+        UNROLL_WARP_ROWS_KEY,
+        enabled=unrolled_row_geometry(config_spec, config),
+        requirement="a bounded complete scalar warp row",
+        fix_invalid=fix_invalid,
+        fill=False,
+    )
+    if SPARE_ROW_PREFETCH_KEY in config:
+        from ..spare_row_prefetch import logical_geometry as spare_row_geometry
+
+        _normalize_gated_boolean(
+            config,
+            SPARE_ROW_PREFETCH_KEY,
+            enabled=spare_row_geometry(config_spec, config),
+            requirement="a complete immutable BF16 matrix row reduced by one warp",
+            fix_invalid=fix_invalid,
+            fill=False,
+        )
+        if config.get(SPARE_ROW_PREFETCH_KEY) is False:
+            config.pop(SPARE_ROW_PREFETCH_KEY)
+    if config.get(UNROLL_WARP_ROWS_KEY) is False:
+        config.pop(UNROLL_WARP_ROWS_KEY)
+
     from .staged_projection_grid import normalize_staged_grid
 
     normalize_staged_grid(config_spec, config, fix_invalid=fix_invalid)
@@ -3912,6 +3955,18 @@ def normalize_after_sequences(
     )
     if config.get(REUSE_INDEXED_INPUT_KEY) is False:
         config.pop(REUSE_INDEXED_INPUT_KEY)
+    from ..early_indexed_input import eligible as eligible_early_input
+
+    _normalize_gated_boolean(
+        config,
+        EARLY_INDEXED_INPUT_KEY,
+        enabled=eligible_early_input(config_spec, config),
+        requirement="a checked local grid and an immutable reused indexed row",
+        fix_invalid=fix_invalid,
+        fill=False,
+    )
+    if config.get(EARLY_INDEXED_INPUT_KEY) is False:
+        config.pop(EARLY_INDEXED_INPUT_KEY)
     # Explicit off retains the existing configuration, including cache identity.
     if config.get(INDEXED_ROW_EPILOGUE_KEY) is False:
         config.pop(INDEXED_ROW_EPILOGUE_KEY)
@@ -4762,6 +4817,11 @@ def cute_flat_fields(
                     config_spec.cute_row_publication_structure,
                     "cute_single_row_publication",
                 ),
+                (config_spec.cute_selection_handoff_structure, SELECTION_HANDOFF_KEY),
+                (
+                    config_spec.cute_row_prefetch_structure,
+                    SPARE_ROW_PREFETCH_KEY,
+                ),
                 (
                     config_spec.cute_column_sum_structure,
                     ORDERED_COLUMN_PAIRS_KEY,
@@ -4773,6 +4833,10 @@ def cute_flat_fields(
                 (
                     config_spec.cute_row_reduction_structure,
                     "cute_warp_row_reductions",
+                ),
+                (
+                    config_spec.cute_row_reduction_structure,
+                    UNROLL_WARP_ROWS_KEY,
                 ),
                 (
                     config_spec.cute_fragment_vector_io_search_enabled
@@ -4855,7 +4919,9 @@ def cute_flat_fields(
             fields["cute_cooperative_row_norm"] = BooleanFragment()
     if config_spec.cute_indexed_row_structure:
         fields[STAGED_INDEXED_ROWS_KEY] = BooleanFragment()
+        fields[DIRECT_INDEXED_PACKETS_KEY] = BooleanFragment()
         fields[REUSE_INDEXED_INPUT_KEY] = BooleanFragment()
+        fields[EARLY_INDEXED_INPUT_KEY] = BooleanFragment()
     if config_spec.cute_row_epilogue_structure:
         fields[INDEXED_ROW_EPILOGUE_KEY] = BooleanFragment()
     if config_spec.cute_warp_row_dot_structure:
@@ -5818,13 +5884,18 @@ def flatten_missing_field_default(
         "cute_fragment_private_scalar_loops",
         GRID_INIT_KEY,
         "cute_warp_row_reductions",
+        UNROLL_WARP_ROWS_KEY,
+        SELECTION_HANDOFF_KEY,
+        SPARE_ROW_PREFETCH_KEY,
         "cute_single_row_publication",
         "cute_parallel_row_sum",
         ORDERED_COLUMN_PAIRS_KEY,
         "cute_packed_row_publication",
         "cute_cooperative_row_norm",
+        EARLY_INDEXED_INPUT_KEY,
         INDEXED_ROW_EPILOGUE_KEY,
         REUSE_INDEXED_INPUT_KEY,
+        DIRECT_INDEXED_PACKETS_KEY,
         STAGED_INDEXED_ROWS_KEY,
         ROW_DOT_KEY,
         COMPACT_ROWS_KEY,

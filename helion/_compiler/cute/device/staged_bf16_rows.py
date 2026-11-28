@@ -1,10 +1,11 @@
-"""Two BF16 row fragments times a common BF16 vector, with 3-stage packed reads.
+"""Multiply two BF16 row fragments by a vector using direct or staged weight packets.
 
 Generated device code supplies two independent row bases (which may point to
 paired rows in one output or corresponding rows of two matrices), the common
 vector base, and the first packet inside K for the caller's warp/lane.
 Each thread publishes and consumes only its own 2x8 BF16 matrix packets;
-collective communication happens in the warp MMA, not in shared memory.
+collective communication happens in the warp MMA. An alternate schedule loads
+the same aligned matrix packets directly into registers.
 """
 
 from __future__ import annotations
@@ -19,7 +20,7 @@ from .ptx import cp_async_16
 
 @cute.jit
 def staged_row_dot(
-    scratch: cute.Pointer,
+    scratch: cute.Pointer | None,
     low: cute.Pointer,
     high: cute.Pointer,
     vector: cute.Pointer,
@@ -38,31 +39,45 @@ def staged_row_dot(
     c1 = cutlass.Float32(0)
     c2 = cutlass.Float32(0)
     c3 = cutlass.Float32(0)
-    for panel in cutlass.range_constexpr(2):
-        k = cutlass.Int32(panel * panel_k) + lane_k
-        target = scratch + panel % 3 * stride + packet
-        cp_async_16(cutlass.Int32(target.toint()), cutlass.Int64((low + k).toint()))
-        cp_async_16(
-            cutlass.Int32((target + half).toint()), cutlass.Int64((high + k).toint())
-        )
-        cute.arch.cp_async_commit_group()
-    for panel in range(num_panels):
-        if panel + 2 < num_panels:
-            k = cutlass.Int32((panel + 2) * panel_k) + lane_k
-            target = scratch + (panel + 2) % 3 * stride + packet
+    if cutlass.const_expr(scratch is not None):
+        assert scratch is not None
+        for panel in cutlass.range_constexpr(2):
+            k = cutlass.Int32(panel * panel_k) + lane_k
+            target = scratch + panel % 3 * stride + packet
             cp_async_16(cutlass.Int32(target.toint()), cutlass.Int64((low + k).toint()))
             cp_async_16(
                 cutlass.Int32((target + half).toint()),
                 cutlass.Int64((high + k).toint()),
             )
-        cute.arch.cp_async_commit_group()
-        cute.arch.cp_async_wait_group(2)
-        source = scratch + panel % 3 * stride + packet
+            cute.arch.cp_async_commit_group()
+    for panel in range(num_panels):
+        panel_base = cutlass.Int32(panel * panel_k)
         # VectorType is provided by the MLIR extension at runtime.
         packed = ir.VectorType.get([4], cutlass.Uint32.mlir_type)  # pyrefly: ignore[missing-attribute]
-        v = cute.arch.load(vector + cutlass.Int32(panel * panel_k) + lane_k, packed)
-        a = cute.arch.load(source, packed)
-        b = cute.arch.load(source + half, packed)
+        # Preserve the existing pipeline's load order in the staged specialization.
+        # The direct specialization has no outstanding copies to wait for.
+        if cutlass.const_expr(scratch is None):
+            v = cute.arch.load(vector + panel_base + lane_k, packed)
+            a = cute.arch.load(low + panel_base + lane_k, packed)
+            b = cute.arch.load(high + panel_base + lane_k, packed)
+        else:
+            assert scratch is not None
+            if panel + 2 < num_panels:
+                k = cutlass.Int32((panel + 2) * panel_k) + lane_k
+                target = scratch + (panel + 2) % 3 * stride + packet
+                cp_async_16(
+                    cutlass.Int32(target.toint()), cutlass.Int64((low + k).toint())
+                )
+                cp_async_16(
+                    cutlass.Int32((target + half).toint()),
+                    cutlass.Int64((high + k).toint()),
+                )
+            cute.arch.cp_async_commit_group()
+            cute.arch.cp_async_wait_group(2)
+            source = scratch + panel % 3 * stride + packet
+            v = cute.arch.load(vector + panel_base + lane_k, packed)
+            a = cute.arch.load(source, packed)
+            b = cute.arch.load(source + half, packed)
         c0, c1, c2, c3 = mma_bf16(
             cutlass.Uint32(a[0]),
             cutlass.Uint32(b[0]),
@@ -87,5 +102,6 @@ def staged_row_dot(
             c2,
             c3,
         )
-    cute.arch.cp_async_wait_group(0)
+    if cutlass.const_expr(scratch is not None):
+        cute.arch.cp_async_wait_group(0)
     return c0, c2
