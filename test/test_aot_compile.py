@@ -15,6 +15,7 @@ from helion._testing import DEVICE
 from helion._testing import RefEagerTestDisabled
 from helion._testing import TestCase
 from helion._testing import onlyBackends
+from helion._testing import onlyOn
 from helion._testing import skipIfCudaCapabilityLessThan
 from helion._testing import skipIfCute
 from helion._testing import skipIfNotCUDA
@@ -104,7 +105,7 @@ def _aot_prefetch_copy(w: torch.Tensor, wp: torch.Tensor) -> torch.Tensor:
 
 @onlyBackends(["triton", "cute"])
 @skipIfCute(_TRITON_RUNTIME_EMBEDDING)
-@skipIfNotCUDA()
+@onlyOn(["cuda", "xpu"])
 class TestAOTStandaloneRuntime(RefEagerTestDisabled, TestCase):
     def test_multiple_configs_share_and_execute_canonical_runtime(self) -> None:
         heuristic = "def key_add(*args):\n    return 0\n"
@@ -131,6 +132,7 @@ class TestAOTStandaloneRuntime(RefEagerTestDisabled, TestCase):
                     module.add(torch.device(DEVICE)), module._default_launcher
                 )
 
+    @skipIfNotCUDA()
     @skipIfCudaCapabilityLessThan((9, 0), reason="TMA needs sm90")
     def test_box_prefetch_inlines_tensor_maps(self) -> None:
         """A box-form prefetch's tensor maps are inlined (no helion import),

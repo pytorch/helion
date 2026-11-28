@@ -44,6 +44,7 @@ from helion._compiler.tile_dependency import owner_roots_by_graph_id
 from helion._testing import DEVICE
 from helion._testing import TestCase
 from helion._testing import onlyBackends
+from helion._testing import onlyOn
 from helion._testing import skipIfNotCUDA
 from helion._testing import skipIfRefEager
 from helion._testing import skipIfTileIR
@@ -1300,7 +1301,7 @@ class TestTileDependency(TestCase):
             )
             self.assertEqual(_targets(relation, consumer_task), expected)
 
-    @skipIfNotCUDA()
+    @onlyOn(["cuda", "xpu"])
     @skipIfRefEager("compiled DeviceIR is unavailable in ref eager mode")
     def test_shared_device_graph_preserves_every_root_owner(self) -> None:
         x = torch.empty((2, 64), device=DEVICE, dtype=torch.float32)
@@ -1359,7 +1360,7 @@ class TestTileDependency(TestCase):
             device_ir.task_families = original_task_families
             device_ir.grid_block_ids = original_grid_block_ids
 
-    @skipIfNotCUDA()
+    @onlyOn(["cuda", "xpu"])
     @skipIfRefEager("compiled DeviceIR is unavailable in ref eager mode")
     def test_subscript_facts_are_exact_or_whole_dimension(self) -> None:
         x = torch.empty(256, device=DEVICE, dtype=torch.float32)

@@ -17,7 +17,7 @@ from helion._testing import DEVICE
 from helion._testing import code_and_output
 from helion._testing import cpu_render_target
 from helion._testing import onlyBackends
-from helion._testing import skipIfNotCUDA
+from helion._testing import onlyOn
 from helion._testing import skipIfRefEager
 from helion._testing.cute_codegen import cpu_bind
 import helion.language as hl
@@ -877,7 +877,7 @@ def test_cute_follows_values_through_a_while_loop_beside_the_slice(
 
 
 @pytest.mark.cuda
-@skipIfNotCUDA()
+@onlyOn(["cuda", "xpu"])
 @onlyBackends(["triton", "cute"])
 @skipIfRefEager("hl.register_block_size returns the whole dim in ref eager mode")
 def test_slices_a_constant_branch_or_a_while_keeps_apart_match_eager() -> None:
@@ -921,7 +921,7 @@ def test_slices_a_constant_branch_or_a_while_keeps_apart_match_eager() -> None:
 
 
 @pytest.mark.cuda
-@skipIfNotCUDA()
+@onlyOn(["cuda", "xpu"])
 @onlyBackends(["triton", "cute"])
 @skipIfRefEager("hl.register_block_size returns the whole dim in ref eager mode")
 def test_branch_beside_a_block_sized_buffer_slice_matches_eager() -> None:
@@ -948,7 +948,7 @@ def test_branch_beside_a_block_sized_buffer_slice_matches_eager() -> None:
 
 
 @pytest.mark.cuda
-@skipIfNotCUDA()
+@onlyOn(["cuda", "xpu"])
 @onlyBackends(["triton", "cute"])
 @skipIfRefEager("hl.register_block_size returns the whole dim in ref eager mode")
 @pytest.mark.parametrize(
@@ -992,7 +992,7 @@ def _buffer_columns_by_device_loop_tile_lane(x: torch.Tensor) -> torch.Tensor:
 
 
 @pytest.mark.cuda
-@skipIfNotCUDA()
+@onlyOn(["cuda", "xpu"])
 @onlyBackends(["triton", "cute"])
 @skipIfRefEager("hl.register_block_size returns the whole dim in ref eager mode")
 @pytest.mark.parametrize(

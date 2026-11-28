@@ -14,6 +14,7 @@ from torch.profiler import profile
 
 from helion._dist_utils import all_ranks_agree
 from helion._testing import DEVICE
+from helion._testing import onlyOn
 from helion._testing import skipIfRocm
 from helion._testing.benchmark_timers import stand_in_trace
 from helion._testing.benchmark_timers import trace_test
@@ -105,7 +106,7 @@ def test_kernels_below_the_launch_floor_are_timed_as_batched_flushed_graphs(
     assert replays == {"kernel": 50, "flush": 23}
 
 
-@pytest.mark.skipif(DEVICE.type != "cuda", reason="requires CUDA")
+@onlyOn(["cuda", "rocm", "xpu"])
 def test_resident_batches_are_sized_from_back_to_back_calls(monkeypatch) -> None:
     """A one-call graph replay of a 2.8 us kernel reads ~11 us (graph launch
     latency), which sizes a 6-call batch in which that latency still hides the

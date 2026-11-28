@@ -19,6 +19,7 @@ import torch
 import helion
 from helion._testing import DEVICE
 from helion._testing import _has_cute_dsl
+from helion._testing import onlyOn
 from helion._testing import skipIfRefEager
 from helion._testing import skipUnlessBackends
 from helion._testing import skipUnlessCuteAvailable
@@ -155,7 +156,7 @@ def test_accuracy_rule_records_an_accuracy_check() -> None:
 
 @pytest.mark.slow
 @pytest.mark.timeout(300)
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@onlyOn(["cuda", "rocm", "xpu"])
 @skipIfRefEager("Native handoff requires compilation")
 @skipUnlessBackends(["triton"])
 def test_handoff_applies_an_accuracy_check(tmp_path: Path) -> None:
@@ -320,7 +321,7 @@ _LANE_BACKENDS = [
 
 
 @pytest.mark.timeout(300)
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@onlyOn(["cuda", "rocm", "xpu"])
 @skipIfRefEager("Native handoff requires compilation")
 @skipUnlessBackends(["cute"])
 @skipUnlessCuteAvailable("Native CuTe handoff requires the supported CuTe DSL")
@@ -589,7 +590,7 @@ def test_cute_handoff_with_callable_bool_and_float_arguments(
 
 # The Triton lane's one unmarked fresh-process replay (see _LANE_BACKENDS).
 @pytest.mark.timeout(300)
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@onlyOn(["cuda", "rocm", "xpu"])
 @skipIfRefEager("Native handoff requires compilation")
 @skipUnlessBackends(["triton"])
 def test_numerical_reference_preserves_original_mutation_and_aliases(

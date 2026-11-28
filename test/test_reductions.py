@@ -18,11 +18,11 @@ from helion._testing import TestCase
 from helion._testing import _get_backend
 from helion._testing import code_and_output
 from helion._testing import onlyBackends
+from helion._testing import onlyOn
 from helion._testing import output_only
 from helion._testing import padded_range_kernels
 from helion._testing import skipIfCute
 from helion._testing import skipIfMetal
-from helion._testing import skipIfNotCUDA
 from helion._testing import skipIfPallas
 from helion._testing import skipIfRefEager
 from helion._testing import skipIfRocm
@@ -3395,7 +3395,7 @@ class TestReductions(RefEagerTestBase, TestCase):
             }
         self.assertEqual(chunks, {64: 64, 128: 32})
 
-    @skipIfNotCUDA()
+    @onlyOn(["cuda", "xpu"])
     @skipIfRefEager(
         "promoted-seed reduction_loops is only materialized in compiled mode"
     )

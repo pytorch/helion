@@ -15,6 +15,7 @@ import torch
 
 import helion
 from helion._testing import DEVICE
+from helion._testing import onlyOn
 from helion._testing import skipIfRefEager
 from helion._testing import skipIfTileIR
 from helion._testing import skipUnlessBackends
@@ -332,7 +333,7 @@ def test_narrow_values_select_like_eager(
 # int8 images and float8's casts to FP32 and gathers, compiled for a GPU; the
 # interpreter above does not run those lowerings as a GPU does.
 @pytest.mark.cuda
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@onlyOn(["cuda", "rocm", "xpu"])
 @pytest.mark.parametrize("dtype", [torch.int8, torch.float8_e4m3fn])
 @skipIfRefEager("eager sorts neither float8 nor ties in a stable order")
 @skipIfTileIR(
@@ -340,8 +341,14 @@ def test_narrow_values_select_like_eager(
     "this job's TileIR toolchain does not legalize tt.gather"
 )
 def test_narrow_values_select_like_eager_on_gpu(dtype):
-    if dtype == torch.float8_e4m3fn and torch.cuda.get_device_capability() < (8, 9):
+    if (
+        dtype == torch.float8_e4m3fn
+        and DEVICE.type == "cuda"
+        and torch.cuda.get_device_capability() < (8, 9)
+    ):
         pytest.skip("Triton's fp8e4nv needs CUDA capability 8.9")
+    if dtype == torch.float8_e4m3fn and DEVICE.type == "xpu":
+        pytest.skip("XPU orders float8 ties unlike eager")
     x = _narrow_rows(dtype).to(DEVICE)
     _assert_narrow_selections(x, _row_selections(x), _row_selected_values(x))
 
@@ -395,7 +402,7 @@ def test_sort_indices_follow_rounded_values(
 
 
 @pytest.mark.cuda
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@onlyOn(["cuda", "rocm", "xpu"])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @skipIfRefEager("eager's unstable sort orders ties its own way")
 @skipIfTileIR(

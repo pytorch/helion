@@ -46,6 +46,7 @@ from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
 from helion._testing import code_and_output
 from helion._testing import onlyBackends
+from helion._testing import onlyOn
 from helion._testing import output_only
 from helion._testing import skipIfCudaCapabilityLessThan
 from helion._testing import skipIfNotCUDA
@@ -2487,7 +2488,7 @@ class TestCrossLoopBarrierPipeline(RefEagerTestBase, TestCase):
                 self.assertIn("grid_barrier(", code)
                 self.assertNotIn("tile_dependency_", code)
 
-    @skipIfNotCUDA()
+    @onlyOn(["cuda", "xpu"])
     @skipIfRefEager("persistent tile-dependency codegen is unavailable")
     def test_zero_task_roots_do_not_allocate_task_events(self) -> None:
         x = torch.empty((0, 64), device=DEVICE, dtype=torch.float32)

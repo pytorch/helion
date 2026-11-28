@@ -14,7 +14,7 @@ from helion._testing import TestCase
 from helion._testing import code_and_output
 from helion._testing import import_example
 from helion._testing import onlyBackends
-from helion._testing import skipIfNotCUDA
+from helion._testing import onlyOn
 from helion._testing import skipIfRefEager
 from helion._testing import skipIfTileIR
 import helion.exc as exc
@@ -254,7 +254,7 @@ class TestBarrier(RefEagerTestBase, TestCase):
         self.assertEqual(len(device_ir.rolled_reductions), 1)
         self.assertEqual(len(fake_env.config_spec.reduction_loops), 1)
 
-    @skipIfNotCUDA()
+    @onlyOn(["cuda", "xpu"])
     @skipIfRefEager("promoted-seed pid_type is only materialized in compiled mode")
     @skipIfTileIR("TileIR does not support barrier operations")
     def test_reduction_seed_default_config_is_persistent(self) -> None:

@@ -131,7 +131,7 @@ def test_var_mean_without_keepdim_returns_a_mean_of_its_own() -> None:
 
 
 @pytest.mark.cuda
-@helion._testing.skipIfNotCUDA()
+@helion._testing.onlyOn(["cuda", "xpu"])
 @helion._testing.onlyBackends(["triton", "cute"])
 def test_var_mean_counts_only_the_elements_of_a_row() -> None:
     kernel = helion.kernel(_row_variance, static_shapes=True)
@@ -149,7 +149,7 @@ def test_var_mean_counts_only_the_elements_of_a_row() -> None:
 
 
 @pytest.mark.cuda
-@helion._testing.skipIfNotCUDA()
+@helion._testing.onlyOn(["cuda", "xpu"])
 @helion._testing.onlyBackends(["triton", "cute"])
 @helion._testing.skipIfRefEager("reference mode ignores block_sizes")
 def test_var_mean_counts_only_the_elements_of_a_partial_tile() -> None:
@@ -216,7 +216,7 @@ def test_var_and_std_mask_the_squared_deviations() -> None:
 
 
 @pytest.mark.cuda
-@helion._testing.skipIfNotCUDA()
+@helion._testing.onlyOn(["cuda", "xpu"])
 @helion._testing.onlyBackends(["triton", "cute"])
 def test_var_and_std_count_only_the_elements_of_a_row() -> None:
     # Divided by the elements less one (the default correction), not by the
@@ -230,7 +230,7 @@ def test_var_and_std_count_only_the_elements_of_a_row() -> None:
 
 
 @pytest.mark.cuda
-@helion._testing.skipIfNotCUDA()
+@helion._testing.onlyOn(["cuda", "xpu"])
 @helion._testing.onlyBackends(["triton", "cute"])
 @helion._testing.skipIfRefEager("reference mode ignores block_sizes")
 def test_var_and_std_count_only_the_elements_of_a_partial_tile() -> None:

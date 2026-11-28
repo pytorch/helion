@@ -13,9 +13,9 @@ from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
 from helion._testing import code_and_output
 from helion._testing import onlyBackends
+from helion._testing import onlyOn
 from helion._testing import output_only
 from helion._testing import skipIfCute
-from helion._testing import skipIfNotCUDA
 from helion._testing import skipIfRefEager
 from helion._testing import skipIfTileIR
 from helion._testing import skipUnlessBackends
@@ -1564,7 +1564,7 @@ class TestAssociativeScan(RefEagerTestBase, TestCase):
         torch.testing.assert_close(maxes.cpu(), expected_maxes)
         torch.testing.assert_close(argmaxes.cpu(), expected_argmaxes)
 
-    @skipIfNotCUDA()
+    @onlyOn(["cuda", "xpu"])
     @skipIfRefEager(
         "promoted-seed reduction_loops is only materialized in compiled mode"
     )

@@ -32,6 +32,7 @@ from helion._testing import get_test_float32_matmul_precision
 from helion._testing import import_example
 from helion._testing import import_path
 from helion._testing import onlyBackends
+from helion._testing import onlyOn
 from helion._testing import skipIfA10G
 from helion._testing import skipIfCudaCapabilityLessThan
 from helion._testing import skipIfFn
@@ -720,7 +721,7 @@ class TestExamples(RefEagerTestBase, TestCase):
 
     @parametrize("reduction_block_size", (32, 1024))
     @onlyBackends(["triton", "cute"])
-    @skipIfNotCUDA()
+    @onlyOn(["cuda", "xpu"])
     @skipIfRefEager("Test requires compiling a specific reduction config")
     @skipIfFn(
         lambda: _get_backend() != "cute" and not _compat.supports_tensor_descriptor(),
@@ -1158,7 +1159,7 @@ class TestExamples(RefEagerTestBase, TestCase):
     # Only the CuTe path lowers the fused flash body and the mul.f32x2 idiom
     # this test exercises.
     @onlyBackends(["cute"])
-    @skipIfNotCUDA()
+    @onlyOn(["cuda", "xpu"])
     @skipIfCudaCapabilityLessThan(
         (10, 0), reason="the fused flash body and mul.f32x2 require Blackwell"
     )
@@ -1182,7 +1183,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             mod.blackwell_attention_kernel(q, k, v, -0.125)
 
     @onlyBackends(["cute"])
-    @skipIfNotCUDA()
+    @onlyOn(["cuda", "xpu"])
     @skipIfCudaCapabilityLessThan(
         (10, 0), reason="the example's raw mul.f32x2 requires Blackwell"
     )
@@ -2292,7 +2293,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             )
 
     @onlyBackends(["cute"])
-    @skipIfNotCUDA()
+    @onlyOn(["cuda", "xpu"])
     @skipIfCudaCapabilityLessThan(
         (10, 0), reason="NVFP4 conversion instructions require Blackwell"
     )
@@ -3548,55 +3549,55 @@ class TestExamples(RefEagerTestBase, TestCase):
 
     @pytest.mark.timeout(600)
     @skipIfRefEager("linear examples assert against their own reference")
-    @skipIfNotCUDA()
+    @onlyOn(["cuda", "xpu"])
     def test_linear_simple_gla(self):
         self._run_linear_example("example_simple_gla")
 
     @pytest.mark.timeout(600)
     @skipIfRefEager("linear examples assert against their own reference")
-    @skipIfNotCUDA()
+    @onlyOn(["cuda", "xpu"])
     def test_linear_full_gla(self):
         self._run_linear_example("example_full_gla")
 
     @pytest.mark.timeout(600)
     @skipIfRefEager("linear examples assert against their own reference")
-    @skipIfNotCUDA()
+    @onlyOn(["cuda", "xpu"])
     def test_linear_vanilla_linear_attn(self):
         self._run_linear_example("example_vanilla_linear_attn")
 
     @pytest.mark.timeout(600)
     @skipIfRefEager("linear examples assert against their own reference")
-    @skipIfNotCUDA()
+    @onlyOn(["cuda", "xpu"])
     def test_linear_retention(self):
         self._run_linear_example("example_retention")
 
     @pytest.mark.timeout(600)
     @skipIfRefEager("linear examples assert against their own reference")
-    @skipIfNotCUDA()
+    @onlyOn(["cuda", "xpu"])
     def test_linear_mamba2_ssd(self):
         self._run_linear_example("example_mamba2_ssd")
 
     @pytest.mark.timeout(600)
     @skipIfRefEager("linear examples assert against their own reference")
-    @skipIfNotCUDA()
+    @onlyOn(["cuda", "xpu"])
     def test_linear_delta_rule(self):
         self._run_linear_example("example_delta_rule")
 
     @pytest.mark.timeout(600)
     @skipIfRefEager("linear examples assert against their own reference")
-    @skipIfNotCUDA()
+    @onlyOn(["cuda", "xpu"])
     def test_linear_gated_delta_rule(self):
         self._run_linear_example("example_gated_delta_rule")
 
     @pytest.mark.timeout(600)
     @skipIfRefEager("linear examples assert against their own reference")
-    @skipIfNotCUDA()
+    @onlyOn(["cuda", "xpu"])
     def test_linear_kda(self):
         self._run_linear_example("example_kda")
 
     @pytest.mark.timeout(600)
     @skipIfRefEager("linear examples assert against their own reference")
-    @skipIfNotCUDA()
+    @onlyOn(["cuda", "xpu"])
     def test_linear_kda_fused_preamble(self):
         self._run_linear_example("example_kda", method="test_fused_preamble")
 

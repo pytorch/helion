@@ -11,6 +11,7 @@ from torch.utils._sympy.value_ranges import ValueRanges
 
 import helion
 from helion._testing import DEVICE
+from helion._testing import onlyOn
 from helion._testing import skipIfRefEager
 from helion._testing import skipUnlessBackends
 from helion._testing.triton_codegen import cpu_codegen as cpu_codegen
@@ -97,7 +98,7 @@ def test_config_derived_iota_codegen(cpu_codegen, block, reduction_block, steppe
         assert "rindex_" in code and "roffset_" in code
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@onlyOn(["cuda", "rocm", "xpu"])
 @skipUnlessBackends(["triton", "tileir"])
 @pytest.mark.parametrize("stepped", [False, True])
 @pytest.mark.parametrize("reduction_block", [None, 2])
@@ -223,7 +224,7 @@ def _integer_bitmasks(x: torch.Tensor):
     return out
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@onlyOn(["cuda", "rocm", "xpu"])
 @skipUnlessBackends(["triton", "tileir"])
 def test_integer_power_preserves_int64_values():
     x = torch.arange(17, dtype=torch.int64, device=DEVICE)
@@ -239,7 +240,7 @@ def test_integer_power_preserves_int64_values():
     torch.testing.assert_close(actual[:, :63], expected, rtol=0, atol=0)
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@onlyOn(["cuda", "rocm", "xpu"])
 @skipUnlessBackends(["triton", "tileir"])
 def test_integer_power_supports_bitwise_consumer():
     x = torch.arange(17, dtype=torch.int32, device=DEVICE)

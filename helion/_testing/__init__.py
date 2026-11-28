@@ -240,6 +240,11 @@ def is_cuda() -> bool:
     return _get_triton_backend() == "cuda" and torch.cuda.is_available()
 
 
+def is_rocm() -> bool:
+    """Return True if running on an AMD GPU through ROCm."""
+    return torch.version.hip is not None and torch.cuda.is_available()
+
+
 def is_xpu() -> bool:
     """Return True if running on Intel XPU."""
     return _get_triton_backend() == "xpu" and torch.xpu.is_available()
@@ -1044,6 +1049,30 @@ def skipIfNotCUDA() -> Callable[[Callable], Callable]:
     return skipIfFn(
         lambda: not is_cuda(),
         reason="Test skipped: CUDA (NVIDIA GPU) is not available.",
+    )
+
+
+Device = typing.Literal["cuda", "rocm", "xpu", "mtia"]
+
+_DEVICE_CHECKS: dict[Device, Callable[[], bool]] = {
+    "cuda": is_cuda,
+    "rocm": is_rocm,
+    "xpu": is_xpu,
+    "mtia": is_mtia,
+}
+
+
+def onlyOn(devices: Device | Sequence[Device]) -> Callable[[Callable], Callable]:
+    """Run the test only on ``devices``, like PyTorch's ``onlyOn``.
+
+    ``"cuda"`` means an NVIDIA GPU; ROCm is ``"rocm"``.
+    """
+    if isinstance(devices, str):
+        devices = [devices]
+    # Defers check to test execution time to avoid CUDA init during pytest-xdist collection.
+    return skipIfFn(
+        lambda: not any(_DEVICE_CHECKS[d]() for d in devices),
+        reason=f"Only runs on {', '.join(devices)}",
     )
 
 

@@ -7,7 +7,7 @@ import helion
 from helion import exc
 from helion._testing import DEVICE
 from helion._testing import _has_cute_dsl
-from helion._testing import skipIfNotCUDA
+from helion._testing import onlyOn
 from helion._testing import skipIfRefEager
 from helion._testing import skipUnlessBackends
 import helion.language as hl
@@ -96,7 +96,7 @@ def test_jagged_parent_requires_operand_provenance(
         )
 
 
-@skipIfNotCUDA()
+@onlyOn(["cuda", "xpu"])
 @skipIfRefEager("jagged_tile is not implemented in ref eager mode")
 def test_fixed_unit_jagged_parents_execute(backend: str) -> None:
     @helion.kernel(backend=backend, config={"block_sizes": [4]})

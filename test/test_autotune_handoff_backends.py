@@ -10,6 +10,7 @@ import torch
 import helion
 from helion._testing import DEVICE
 from helion._testing import _has_cute_dsl
+from helion._testing import onlyOn
 from helion._testing import skipIfRefEager
 from helion.autotuner import FiniteSearch
 from helion.autotuner import HandoffPolicy
@@ -22,7 +23,7 @@ if TYPE_CHECKING:
     from pathlib import Path
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@onlyOn(["cuda", "rocm", "xpu"])
 @skipIfRefEager("Autotuning requires compilation, not supported in ref eager mode")
 @pytest.mark.parametrize("backend", ["triton", "cute"])
 @pytest.mark.parametrize("multi_shape", [False, True])

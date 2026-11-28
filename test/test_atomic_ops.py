@@ -16,6 +16,7 @@ from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
 from helion._testing import code_and_output
 from helion._testing import onlyBackends
+from helion._testing import onlyOn
 from helion._testing import skipIfNotCUDA
 from helion._testing import skipIfNotTriton
 from helion._testing import skipIfRefEager
@@ -1150,7 +1151,7 @@ class TestAtomicOperations(RefEagerTestBase, TestCase):
         torch.testing.assert_close(buffer[4:], torch.zeros_like(buffer[4:]))
 
     @onlyBackends(["triton", "cute"])
-    @skipIfNotCUDA()
+    @onlyOn(["cuda", "xpu"])
     @skipIfTileIR("TileIR does not legalize tl.debug_barrier")
     @skipIfRefEager("program-level atomic synchronization is codegen-only")
     def test_release_acquire_atomics_sync_program(self):
@@ -1243,7 +1244,7 @@ class TestAtomicOperations(RefEagerTestBase, TestCase):
             self.assertEqual(code.find(barrier_call, atomic) != -1, after)
 
     @onlyBackends(["triton", "cute"])
-    @skipIfNotCUDA()
+    @onlyOn(["cuda", "xpu"])
     @skipIfTileIR("TileIR does not legalize tl.debug_barrier")
     @skipIfRefEager("program-level atomic synchronization is codegen-only")
     def test_row_release_acquire_atomics_with_several_rows_per_thread(self):
@@ -1311,7 +1312,7 @@ class TestAtomicOperations(RefEagerTestBase, TestCase):
                     self.assertLess(fence, code.index(".load()", atomic))
 
     @onlyBackends(["triton", "cute"])
-    @skipIfNotCUDA()
+    @onlyOn(["cuda", "xpu"])
     @skipIfTileIR("TileIR does not legalize tl.debug_barrier")
     @skipIfRefEager("program-level atomic synchronization is codegen-only")
     def test_per_element_release_acquire_atomics_sync_program(self):
@@ -1433,7 +1434,7 @@ class TestAtomicOperations(RefEagerTestBase, TestCase):
                 torch.testing.assert_close(result, expected, rtol=1e-4, atol=1e-4)
 
     @onlyBackends(["triton", "cute"])
-    @skipIfNotCUDA()
+    @onlyOn(["cuda", "xpu"])
     @skipIfTileIR("TileIR does not legalize tl.debug_barrier")
     @skipIfRefEager("program-level atomic synchronization is codegen-only")
     def test_release_atomic_in_branch(self):
@@ -16246,7 +16247,7 @@ class TestDerivedFrameSnapshotsCPU(unittest.TestCase):
 
 
 @onlyBackends(["cute"])
-@unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
+@onlyOn(["cuda", "rocm", "xpu"])
 class TestDerivedFrameSnapshotsNative(unittest.TestCase):
     @skipUnlessCuteAvailable("requires CuTe DSL")
     def test_typed_snapshot_keys_across_nested_frames(self):
