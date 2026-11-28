@@ -12,6 +12,7 @@ import inspect
 import itertools
 import math
 import os
+from pathlib import Path
 import sys
 import tempfile
 from types import CodeType
@@ -620,41 +621,6 @@ class TritonBackend(Backend):
     def default_launcher_name(self) -> str:
         return "_default_launcher"
 
-    def embedded_helper_source(self, body: str) -> str:
-        """Inline the Helion device helpers referenced by generated Triton."""
-        statements: list[ast.stmt] = []
-        if "helion_tensor_maps." in body:
-            from ...runtime.triton import tensor_maps
-
-            statements += private_module_statements(
-                inspect.getsource(tensor_maps),
-                "_make_helion_tensor_maps",
-                ["prefetch_map"],
-            )
-            statements += ast.parse(
-                "helion_tensor_maps = _make_helion_tensor_maps()"
-            ).body
-        if "helion_triton_helpers" in body:
-            names = _global_module_attrs(body, "helion_triton_helpers")
-            if unsupported := names - {"device_error"}:
-                raise ValueError(
-                    f"unsupported standalone Triton helpers: {sorted(unsupported)}"
-                )
-            if names:
-                from ...runtime.triton import helpers
-
-                statements += private_module_statements(
-                    "import triton.language as tl\nfrom triton.language.semantic import TritonSemantic\n"
-                    + inspect.getsource(inspect.unwrap(helpers.device_error)),
-                    "_make_helion_triton_helpers",
-                    ["device_error"],
-                )
-                statements += ast.parse(
-                    'helion_triton_helpers = types.ModuleType("helion_triton_helpers")\n'
-                    "helion_triton_helpers.device_error = _make_helion_triton_helpers().device_error"
-                ).body
-        return ast.unparse(ast.Module(body=statements, type_ignores=[]))
-
     @property
     def dependency_free_launcher_info(self) -> LauncherInfo:
         # get_num_sm / get_num_xcd / set_triton_allocator are launcher functions
@@ -692,6 +658,74 @@ class TritonBackend(Backend):
             "fast_dividef": "from triton.language.extra.libdevice import fast_dividef",
             "fast_expf": "from triton.language.extra.libdevice import fast_expf",
         }
+
+    def embedded_helper_source(self, body: str) -> str:
+        """Inline the Triton helpers used by a standalone program.
+
+        Keep its functions and their dependencies together in a private scope,
+        including the target-specific wait implementation. Reading the source
+        also supports CPU code generation where Triton cannot be imported.
+        """
+        blocks = []
+        if "helion_tensor_maps." in body:
+            from ...runtime.triton import tensor_maps
+
+            statements = private_module_statements(
+                inspect.getsource(tensor_maps),
+                "_make_helion_tensor_maps",
+                ["prefetch_map"],
+            )
+            statements.extend(
+                ast.parse("helion_tensor_maps = _make_helion_tensor_maps()").body
+            )
+            blocks.append(ast.unparse(ast.Module(body=statements, type_ignores=[])))
+        if "helion_triton_helpers." in body:
+            blocks.append(self._embedded_device_helper_source())
+        return "\n\n".join(blocks)
+
+    @staticmethod
+    def _embedded_device_helper_source() -> str:
+        source = Path(__file__).parents[2] / "runtime" / "triton" / "helpers.py"
+        helpers = ast.parse(source.read_text())
+        module = ast.parse(
+            "def _make_helion_triton_helpers():\n"
+            "    _module = types.ModuleType('helion_triton_helpers')\n"
+            "    return _module\n"
+            "helion_triton_helpers = _make_helion_triton_helpers()\n"
+        )
+        factory = module.body[0]
+        assert isinstance(factory, ast.FunctionDef)
+        exports = next(
+            node.value
+            for node in helpers.body
+            if isinstance(node, ast.Assign)
+            and any(
+                isinstance(target, ast.Name) and target.id == "__all__"
+                for target in node.targets
+            )
+        )
+        # Triton's dependency finder recognizes module namespaces. A generic
+        # container would be deep-copied along with the JIT functions' locks.
+        factory.body[1:1] = [
+            ast.Assign(
+                targets=[
+                    ast.Attribute(
+                        value=ast.Name(id="_module", ctx=ast.Load()),
+                        attr=name,
+                        ctx=ast.Store(),
+                    )
+                ],
+                value=ast.Name(id=name, ctx=ast.Load()),
+            )
+            for name in [*ast.literal_eval(exports), "device_error"]
+        ]
+        factory.body[:0] = [
+            node
+            for node in helpers.body
+            if not (isinstance(node, ast.ImportFrom) and node.module == "__future__")
+        ]
+        ast.fix_missing_locations(module)
+        return ast.unparse(module)
 
     def program_id_expr(self, dim: int, *, index_dtype: str) -> str:
         if index_dtype != "tl.int32":

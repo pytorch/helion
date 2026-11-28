@@ -23,12 +23,14 @@ from __future__ import annotations
 
 import ast
 import inspect
+import io
 import logging
 from pathlib import Path
 import re
 import symtable
 import tempfile
 import textwrap
+import tokenize
 from typing import TYPE_CHECKING
 
 import torch
@@ -199,27 +201,27 @@ def _rename_config_symbols(body: str, kernel_name: str, config_idx: int) -> str:
     Appends ``_c<N>`` to: ``_helion_<kernel>``, the host wrapper
     ``def <kernel>(``, and every ``tl.constexpr`` constant.
     """
-    sfx = f"_c{config_idx}"
-
-    body = body.replace(f"_helion_{kernel_name}", f"_helion_{kernel_name}{sfx}")
-
-    body = re.sub(
-        rf"^(def ){kernel_name}\(",
-        rf"\g<1>_{kernel_name}{sfx}(",
-        body,
-        flags=re.MULTILINE,
+    suffix = f"_c{config_idx}"
+    device_name = f"_helion_{kernel_name}"
+    constexpr_names = set(
+        re.findall(r"^(_[A-Z][A-Z0-9_]*)\s*=\s*tl\.constexpr\(", body, re.MULTILINE)
     )
-
-    # Word-boundary rename, longest first so _BLOCK_SIZE_0_1 is renamed
-    # before _BLOCK_SIZE_0.
-    constexpr_names = re.findall(
-        r"^(_[A-Z][A-Z0-9_]*)\s*=\s*tl\.constexpr\(", body, re.MULTILINE
-    )
-    for name in sorted(constexpr_names, key=len, reverse=True):
-        # pyrefly: ignore [bad-specialization]
-        body = re.sub(rf"\b{re.escape(name)}\b", f"{name}{sfx}", body)
-
-    return body
+    tokens = []
+    for token in tokenize.generate_tokens(io.StringIO(body).readline):
+        name = token.string
+        if token.type == tokenize.NAME:
+            if name == device_name or name.startswith(f"{device_name}_"):
+                name = device_name + suffix + name[len(device_name) :]
+            elif name in constexpr_names:
+                name += suffix
+            elif (
+                name == kernel_name
+                and token.start[1] == 4
+                and token.line.startswith("def ")
+            ):
+                name = f"_{name}{suffix}"
+        tokens.append(token._replace(string=name))
+    return tokenize.untokenize(tokens)
 
 
 def _referenced_globals(table: symtable.SymbolTable) -> set[str]:

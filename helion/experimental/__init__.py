@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from .artifact import ArtifactCase as ArtifactCase
+from .artifact import export_artifact as export_artifact
+from .artifact import load_artifact as load_artifact
 from .autodiff import backward as backward
 
 # ``aot_kernel`` and friends moved out of ``helion.experimental`` into
