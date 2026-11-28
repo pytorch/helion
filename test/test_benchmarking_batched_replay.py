@@ -562,26 +562,29 @@ def test_kernel_timer_sizes_windows_with_the_flush(traced_windows) -> None:
 def test_kernel_timer_probes_a_long_call_once(traced_windows) -> None:
     """A call longer than both windows is one traced call, estimate and
     sample at once (``do_bench``'s long-kernel probe)."""
-    calls: list[None] = []
+    spans: list[tuple[torch.cuda.Event, torch.cuda.Event]] = []
 
     def long_call() -> None:
-        calls.append(None)
+        # Events around every call: the spin counts cycles of the GPU's
+        # clock, which other processes' work on the GPU slows, so only the
+        # traced call's own events time what the trace read.
+        start, end = (
+            torch.cuda.Event(enable_timing=True),
+            torch.cuda.Event(enable_timing=True),
+        )
+        start.record()
         torch.cuda._sleep(50_000_000)
+        end.record()
+        spans.append((start, end))
 
     reading = benchmarking.do_bench(
         long_call, warmup=1, rep=1, probe_long_kernel=True, l2_flush_mode="kernel"
     )
     # the setup call, then the traced probe
-    assert len(calls) == 2
+    assert len(spans) == 2
     assert traced_windows == [1]
-    start, end = (
-        torch.cuda.Event(enable_timing=True),
-        torch.cuda.Event(enable_timing=True),
-    )
-    start.record()
-    long_call()
-    end.record()
     torch.cuda.synchronize()
+    start, end = spans[-1]
     assert reading == pytest.approx(start.elapsed_time(end), rel=0.2)
 
 
