@@ -92,7 +92,7 @@ class InitSpec:
     shape_dim_sources: list  # list[tuple[int, int] | int]
     fill_value: float
     dtype: torch.dtype
-    device: torch.device | None
+    device: torch.device
 
 
 class GraphAnalyzer:
@@ -108,8 +108,11 @@ class GraphAnalyzer:
         all_graphs: list | None = None,
         config_block_sizes: dict[int, int] | None = None,
         kernel_input_names: list[str] | None = None,
+        *,
+        device: torch.device,
     ) -> None:
         self.forward_graph = forward_graph
+        self.device = device
         self.scalar_values = scalar_values or {}
         # Aligns compute-graph outputs with grad_outs (return-order).
         self.return_order = return_order
@@ -486,8 +489,6 @@ class GraphAnalyzer:
         ph_name = f"init_{idx}"
         ph = compute_graph.placeholder(ph_name)
         node_map[node] = ph
-        fake = node.meta.get("val")
-        device = fake.device if isinstance(fake, torch.Tensor) else None
         self.init_specs.append(
             InitSpec(
                 # Use ph.name (actual FX-assigned name), not ph_name
@@ -497,7 +498,7 @@ class GraphAnalyzer:
                 shape_dim_sources=shape_dim_sources,
                 fill_value=float(fill_value),
                 dtype=dtype,
-                device=device,
+                device=self.device,
             )
         )
 
@@ -567,7 +568,7 @@ class GraphAnalyzer:
                 shape_dim_sources=shape_dim_sources,
                 fill_value=fill_value,
                 dtype=dtype,
-                device=fake.device,
+                device=self.device,
             )
         )
 
@@ -1065,7 +1066,7 @@ class GraphAnalyzer:
                 ar = compute_graph.call_function(
                     torch.ops.aten.arange.default,
                     (padded0,),
-                    {"dtype": torch.int64, "device": host_fake0.device},
+                    {"dtype": torch.int64, "device": self.device},
                 )
                 lt = compute_graph.call_function(torch.ops.aten.lt.Scalar, (ar, dim0))
                 mask2d = compute_graph.call_function(
@@ -1087,18 +1088,10 @@ class GraphAnalyzer:
 
         # scan_op requires non-empty init; synthesize a unit carry.
         if not init_nodes:
-            anchor = xs_nodes[0] if xs_nodes else (add_nodes[0] if add_nodes else None)
-            assert anchor is not None
-            anchor_fake = anchor.meta.get("val")
-            device = (
-                anchor_fake.device
-                if isinstance(anchor_fake, torch.Tensor)
-                else torch.device("cuda")
-            )
             unit = compute_graph.call_function(
                 torch.ops.aten.zeros.default,
                 ([],),
-                {"dtype": torch.float32, "device": device},
+                {"dtype": torch.float32, "device": self.device},
             )
             init_nodes = [unit]
             combine_gm = self._wrap_combine_fn_for_unit_carry(combine_gm)
@@ -1434,14 +1427,10 @@ class GraphAnalyzer:
                     resolved.append(s)
                 else:
                     resolved.append(s)
-            fake = n.meta.get("val")
-            dev = (
-                fake.device if isinstance(fake, torch.Tensor) else torch.device("cuda")
-            )
             fn = cg.call_function(
                 torch.ops.aten.full.default,
                 (resolved, fill_value),
-                {"dtype": dtype_arg, "device": dev},
+                {"dtype": dtype_arg, "device": self.device},
             )
             if n.meta:
                 fn.meta = n.meta.copy()
@@ -1775,19 +1764,10 @@ class GraphAnalyzer:
         # empty (no stores, or xs not needed for recomputation), the backward
         # scan_op call does bw_xs[0].shape[0] to get scan_length and raises
         # IndexError.  The dummy ensures bw_xs is non-empty.
-        dummy_device: object = torch.device("cuda")
-        if carry_phs_in_cg:
-            anchor_fake = carry_phs_in_cg[0].meta.get("val")
-            if isinstance(anchor_fake, torch.Tensor):
-                dummy_device = anchor_fake.device
-        elif xs_placeholders:
-            anchor_fake = xs_placeholders[0].meta.get("val")
-            if isinstance(anchor_fake, torch.Tensor):
-                dummy_device = anchor_fake.device
         dummy_ys = cg.call_function(
             torch.ops.aten.zeros.default,
             ([1],),
-            {"dtype": torch.float32, "device": dummy_device},  # pyrefly: ignore [bad-argument-type]
+            {"dtype": torch.float32, "device": self.device},
         )
         cg.output(tuple([*new_carry, dummy_ys, *ys]))
         return torch.fx.GraphModule({}, cg)
@@ -6385,6 +6365,7 @@ def backward(
             all_graphs=list(graphs),
             config_block_sizes=config_block_sizes,
             kernel_input_names=kernel_tensor_input_names,
+            device=tensor_inputs[0].device,
         )
         compute_graph, input_mappings, compute_output_shapes, host_output_shapes = (
             analyzer.extract_computation_graph()
