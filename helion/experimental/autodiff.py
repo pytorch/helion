@@ -33,6 +33,7 @@ from .._compiler.fx_side_effects import is_impure_node
 
 if TYPE_CHECKING:
     from collections.abc import Callable
+    from collections.abc import Iterator
     from collections.abc import Mapping
 
     from .._compiler.device_ir import GraphInfo
@@ -3265,6 +3266,7 @@ class FXToHelionConverter:
         forward_reduce_dims: tuple[int, ...] = (),
         forward_full_slice_dims: tuple[int, ...] = (),
         forward_untiled_inputs: frozenset[str] = frozenset(),
+        forward_whole_inputs: frozenset[str] = frozenset(),
         has_root_matmul: bool = False,
         bw_module: torch.fx.GraphModule | None = None,
         init_specs: list | None = None,
@@ -3303,6 +3305,7 @@ class FXToHelionConverter:
         self.forward_reduce_dims = forward_reduce_dims
         self.forward_full_slice_dims = forward_full_slice_dims
         self.forward_untiled_inputs = forward_untiled_inputs
+        self.forward_whole_inputs = forward_whole_inputs
         self._has_root_matmul = has_root_matmul
 
         if not _has_scan_nodes(backward_graph):
@@ -3417,13 +3420,17 @@ class FXToHelionConverter:
     def _iter_tensor_name(self) -> str:
         """Name of the input that spans the iteration shape (highest rank).
 
-        Ties are broken deterministically by taking the first tensor in
-        ``grad_input_order`` with the maximum rank (plain ``max()`` returns the
-        *last* tied element, making the choice order-dependent).
+        An input the forward reads whole does not span it unless every input
+        is read whole. Ties go to the first tensor in ``grad_input_order``.
         """
+        names = [
+            name
+            for name in self.grad_input_order
+            if name not in self.forward_whole_inputs
+        ] or self.grad_input_order
         best: str | None = None
         best_ndim = -1
-        for name in self.grad_input_order:
+        for name in names:
             ndim = len(self.tensor_shapes[name])
             if ndim > best_ndim:
                 best_ndim = ndim
@@ -4606,6 +4613,14 @@ class FXToHelionConverter:
                     if all(d in full_slice_dims for d in param_iter_dims):
                         # One ':' per param dim — `p[:]`, `p[:, :]`, etc.
                         load_expr = f"{p}[{', '.join([':'] * len(param_iter_dims))}]"
+                    elif p in self.forward_whole_inputs:
+                        # A whole-loaded input that maps onto a tiled dim here
+                        # would be sliced per-tile below, silently reading only
+                        # part of what the forward read in full.
+                        raise exc.AutodiffNotSupported(
+                            f"{p!r}, which the forward loads whole, would be "
+                            "tile-indexed along a tiled dimension here"
+                        )
                     else:
                         indices = []
                         for d in range(iter_ndim):
@@ -4772,6 +4787,18 @@ class FXToHelionConverter:
 
             for p in input_params:
                 indices = self._nonreduction_load_indices(p, iter_shape, tile_vars)
+                if p in self.forward_whole_inputs and any(
+                    index in tile_vars for index in indices
+                ):
+                    # A whole-loaded input only gets ":"/"None" here when its
+                    # own dims are singleton; a real (matching) dim falls
+                    # through to a tile var, silently reading a slice of what
+                    # the forward read in full.
+                    raise exc.AutodiffNotSupported(
+                        f"{p!r}, which the forward loads whole, would be "
+                        "tile-indexed along a tiled dimension in this "
+                        f"{iter_ndim}-D tile loop"
+                    )
                 load_expr = f"{p}[{', '.join(indices)}]"
                 loop_body.append(parse_stmt(f"{p}_tile = {load_expr}"))
 
@@ -4782,6 +4809,11 @@ class FXToHelionConverter:
             # for every output regardless of its rank.
             for grad_name, var_name in output_assignments:
                 out_tensor = self._grad_target(grad_name)
+                if out_tensor in self.forward_whole_inputs:
+                    raise exc.AutodiffNotSupported(
+                        f"the gradient of {out_tensor!r}, which the forward "
+                        "loads whole, needs a sum across tiles"
+                    )
                 out_shape = self.tensor_shapes.get(out_tensor, ())
                 out_ndim = len(out_shape)
                 if out_ndim >= iter_ndim:
@@ -4823,7 +4855,9 @@ class FXToHelionConverter:
         else:
             # All inputs have iter_ndim — single shared `tile` indexer.
             for p in input_params:
-                if any(
+                if p in self.forward_whole_inputs:
+                    index = ", ".join([":"] * self._param_ndim(p))
+                elif any(
                     size == 1 and iter_shape[dim] == 1
                     for dim, size in enumerate(self._param_shape(p)[:iter_ndim])
                 ):
@@ -4842,6 +4876,12 @@ class FXToHelionConverter:
                 loop_body.append(parse_stmt(line))
 
             for grad_name, var_name in output_assignments:
+                target = self._grad_target(grad_name)
+                if target in self.forward_whole_inputs:
+                    raise exc.AutodiffNotSupported(
+                        f"the gradient of {target!r}, which the forward loads "
+                        "whole, needs a sum across tiles"
+                    )
                 loop_body.append(parse_stmt(f"{grad_name}[tile] = {var_name}"))
 
             body.append(
@@ -5246,6 +5286,27 @@ def _forward_has_root_matmul(forward_graph: torch.fx.Graph) -> bool:
     return False
 
 
+def _forward_input_loads(
+    forward_graph: torch.fx.Graph,
+) -> Iterator[tuple[str, list[object]]]:
+    """Yield ``(input name, subscript)`` for every load of a kernel input."""
+    for n in forward_graph.nodes:
+        if n.op != "call_function" or getattr(n.target, "__name__", "") != "load":
+            continue
+        # The logical tensor name is the `_host_tensor` op's first arg, not the
+        # FX node name (which can diverge via dedup suffixes / attribute origins
+        # and then not match grad_input_order / forward_untiled_inputs lookups).
+        host = n.args[0]
+        if not (
+            isinstance(host, Node)
+            and getattr(host.target, "__name__", "") == "_host_tensor"
+            and isinstance(host.args[0], str)
+        ):
+            continue
+        sub = n.args[1]
+        yield host.args[0], list(sub) if isinstance(sub, (list, tuple)) else [sub]
+
+
 def _extract_forward_untiled_inputs(forward_graph: torch.fx.Graph) -> frozenset[str]:
     """Input tensors that the forward loads *fully* — i.e. with no tiled
     (``block_size``) index in any of their load subscripts.
@@ -5266,25 +5327,27 @@ def _extract_forward_untiled_inputs(forward_graph: torch.fx.Graph) -> frozenset[
         )
 
     has_tiled: dict[str, bool] = {}
-    for n in forward_graph.nodes:
-        if n.op != "call_function" or getattr(n.target, "__name__", "") != "load":
-            continue
-        # The logical tensor name is the `_host_tensor` op's first arg, not the
-        # FX node name (which can diverge via dedup suffixes / attribute origins
-        # and then not match grad_input_order / forward_untiled_inputs lookups).
-        host = n.args[0]
-        if not (
-            isinstance(host, Node)
-            and getattr(host.target, "__name__", "") == "_host_tensor"
-            and isinstance(host.args[0], str)
-        ):
-            continue
-        name = host.args[0]
-        sub = n.args[1]
-        sub_list = sub if isinstance(sub, (list, tuple)) else [sub]
+    for name, sub_list in _forward_input_loads(forward_graph):
         tiled = any(_is_tiled_index(idx) for idx in sub_list)
         has_tiled[name] = has_tiled.get(name, False) or tiled
     return frozenset(name for name, tiled in has_tiled.items() if not tiled)
+
+
+def _extract_forward_whole_inputs(forward_graph: torch.fx.Graph) -> frozenset[str]:
+    """Input tensors whose every load subscript is only ``:`` and ``None``.
+
+    Every iteration reads all of such a tensor (e.g. ``t[None, :]``). Unlike
+    ``_extract_forward_untiled_inputs``, a scalar index such as an ``hl.grid``
+    index keeps a tensor out.
+    """
+    whole: dict[str, bool] = {}
+    for name, sub_list in _forward_input_loads(forward_graph):
+        full = all(
+            idx is None or (isinstance(idx, slice) and idx == slice(None, None, None))
+            for idx in sub_list
+        )
+        whole[name] = whole.get(name, True) and full
+    return frozenset(name for name, full in whole.items() if full)
 
 
 def _validate_supported_reductions(forward_graph: torch.fx.Graph) -> None:
@@ -6328,6 +6391,7 @@ def backward(
         forward_reduce_dims = _extract_forward_reduce_dims(fwd_graph)
         forward_full_slice_dims = _extract_forward_full_slice_dims(fwd_graph)
         forward_untiled_inputs = _extract_forward_untiled_inputs(fwd_graph)
+        forward_whole_inputs = _extract_forward_whole_inputs(fwd_graph)
         has_root_matmul = _forward_has_root_matmul(fwd_graph)
 
         kernel_tensor_input_names = [
@@ -6545,6 +6609,7 @@ def backward(
             forward_reduce_dims=forward_reduce_dims,
             forward_full_slice_dims=forward_full_slice_dims,
             forward_untiled_inputs=forward_untiled_inputs,
+            forward_whole_inputs=forward_whole_inputs,
             has_root_matmul=has_root_matmul,
             bw_module=bw_module,
             init_specs=analyzer.init_specs,

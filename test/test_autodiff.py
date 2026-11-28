@@ -1512,6 +1512,66 @@ class TestAutodiff(RefEagerTestDisabled, TestCase):
             grad_shape=(64,),
         )
 
+    def test_compare_against_whole_loaded_input(self):
+        @helion.kernel(autotune_effort="none")
+        def x_first(x: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.size(0)):
+                out[tile] = (x[tile].unsqueeze(1) > t[None, :]).sum(1) * x[tile]
+            return out
+
+        @helion.kernel(autotune_effort="none")
+        def t_first(x: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.size(0)):
+                out[tile] = (t[None, :] < x[tile].unsqueeze(1)).sum(1) * x[tile]
+            return out
+
+        # Each count spans all of t, also when t is exactly as long as x, and
+        # the loop follows x even when the forward loads t first. x_first
+        # covers both n values; t_first only needs the n == len(x) edge
+        # case, since the ordering effect doesn't depend on n.
+        for kernel, ns in ((x_first, (5, 64)), (t_first, (64,))):
+            for n in ns:
+                with self.subTest(kernel=kernel.fn.__name__, n=n):
+                    torch.manual_seed(0)
+                    x = torch.randn(64, device=DEVICE)
+                    t = torch.randn(n, device=DEVICE)
+                    grad_out = torch.randn_like(x)
+                    kernel(x, t)
+                    grad_x, _ = helion.experimental.backward(kernel, grad_out, x, t)
+                    x_ref = x.clone().requires_grad_(True)
+                    ((x_ref.unsqueeze(1) > t[None, :]).sum(1) * x_ref).backward(
+                        grad_out
+                    )
+                    torch.testing.assert_close(grad_x, x_ref.grad)
+
+    def test_grid_indexed_input(self):
+        @helion.kernel(autotune_effort="none")
+        def kernel(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for i in hl.grid(x.size(0)):
+                out[i] = x[i] * 2
+            return out
+
+        self._check_backward(kernel, lambda x: x * 2, n_inputs=1, shape=(64,))
+
+    def test_gradient_of_whole_loaded_input_is_rejected(self):
+        @helion.kernel(autotune_effort="none")
+        def kernel(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.size(0)):
+                out[tile] = (x[tile].unsqueeze(1) * w[None, :]).sum(1)
+            return out
+
+        x = torch.randn(64, device=DEVICE)
+        w = torch.randn(5, device=DEVICE)
+        kernel(x, w)
+        with self.assertRaisesRegex(
+            helion.exc.AutodiffNotSupported, "which the forward loads whole"
+        ):
+            helion.experimental.backward(kernel, torch.ones_like(x), x, w)
+
     def test_softmax_3d_last_dim(self):
         @helion.kernel(autotune_effort="none")
         def kernel(x: torch.Tensor) -> torch.Tensor:
