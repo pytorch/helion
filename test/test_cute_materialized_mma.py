@@ -1,14 +1,13 @@
 from __future__ import annotations
 
 import ast
+from types import SimpleNamespace
 from typing import TYPE_CHECKING
 
 import pytest
 import torch
 
 from test.cute_population_contracts import with_flat_min_blocks_default
-from test.test_cute_full_slice_matmul import _bind
-from test.test_cute_materialized_fission import _sources
 
 import helion
 from helion._compiler.cute.autotune.heuristics.cute_materialized import (
@@ -17,6 +16,8 @@ from helion._compiler.cute.autotune.heuristics.cute_materialized import (
 from helion._compiler.cute.mma_support import CuteMmaSupport
 from helion._testing import cpu_render_target
 from helion._testing import import_example
+from helion._testing.cute_codegen import bind_full_slice_matmul as _bind
+from helion._testing.cute_codegen import stage_sources as _sources
 from helion._testing.cute_structural_kernels import _se_args
 from helion.autotuner.config_generation import ConfigGeneration
 
@@ -157,3 +158,47 @@ def test_auxiliary_producer_uses_second_region_matrix_coordinates(
             node.id for node in ast.walk(value) if isinstance(node, ast.Name)
         }
         assert "tcgen05_work_tile_smem" not in ast.unparse(value)
+
+
+@pytest.mark.parametrize("first,second", [(1, 2), (2, 1)])
+def test_second_region_scheduler_uses_its_actual_group(first: int, second: int) -> None:
+    bound = _bind(
+        squeeze_and_excitation_net_fwd.fn, _se_args((640, 512, 256)), fission=True
+    )
+    config = helion.Config.from_dict(
+        bound.config_spec.default_config().config
+        | {
+            "block_sizes": [256, 256, 128, 256, 256, 128],
+            "loop_orders": [[0, 1], [0, 1]],
+            "l2_groupings": [first, second],
+            "pid_type": "persistent_interleaved",
+            "tcgen05_cluster_m": 2,
+            "tcgen05_persistence_model": "static_persistent",
+            "tcgen05_strategy": "role_local_with_scheduler",
+            "tcgen05_warp_spec_scheduler_warps": 1,
+            "tcgen05_warp_spec_c_input_warps": 1,
+        }
+    )
+    source = _sources(bound.to_code(config))[1]
+    vote = next(
+        line.value
+        for line in ast.walk(ast.parse(source))
+        if isinstance(line, ast.Assign)
+        and isinstance(line.targets[0], ast.Name)
+        and line.targets[0].id == "tcgen05_scheduler_warp_full_tile"
+    )
+    decide = compile(ast.Expression(vote), "<second-region-tile>", "eval")
+    # 640 rows give two full tiles and one fringe for each of two N tiles.
+    # Group size two visits both columns of the first two M tiles first.
+    rows = (0, 1, 0, 1, 2, 2) if second == 2 else (0, 1, 2, 0, 1, 2)
+    for pid, expected_row in enumerate(rows):
+        scope = {
+            "_BLOCK_SIZE_3": 256,
+            "_BLOCK_SIZE_4": 256,
+            "cutlass": SimpleNamespace(Int32=int, Int64=int),
+            "tcgen05_scheduler_warp_work_tile": SimpleNamespace(
+                tile_idx=(2 * (pid % 3), pid // 3, 0)
+            ),
+            "min": min,
+        }
+        assert eval(decide, {"__builtins__": {}}, scope) == (expected_row < 2)

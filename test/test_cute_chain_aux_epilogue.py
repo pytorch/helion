@@ -28,8 +28,6 @@ import pytest
 import torch
 
 from test.cute_population_contracts import with_flat_min_blocks_default
-from test.test_cute_full_slice_matmul import _bind
-from test.test_cute_materialized_fission import _sources
 from test.test_cute_phase_mma_roots import _native_cpu_target  # noqa: F401
 
 import helion
@@ -43,6 +41,8 @@ from helion._compiler.cute.tcgen05_constants import (
 )
 from helion._testing import import_example
 from helion._testing import skipUnlessBackends
+from helion._testing.cute_codegen import bind_full_slice_matmul as _bind
+from helion._testing.cute_codegen import stage_sources as _sources
 from helion._testing.cute_structural_kernels import _se_args
 from helion.autotuner.config_generation import ConfigGeneration
 from helion.exc import InvalidConfig

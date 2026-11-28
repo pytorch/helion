@@ -21,6 +21,7 @@ import ast
 import contextlib
 from itertools import product
 from pathlib import Path
+import textwrap
 import time
 
 import pytest
@@ -35,7 +36,9 @@ from helion._compiler.cute.reduce_routing import use_interleaved_shared_reduce
 from helion._compiler.cute.reduce_routing import use_serial_block_reduce
 from helion._compiler.cute.smem_footprint import RootDispatch
 from helion._compiler.cute.smem_footprint import SmemFootprint
+from helion._compiler.cute.smem_footprint import kernel_smem_footprint
 from helion._compiler.cute.smem_footprint import smem_footprint
+from helion._compiler.program_id import PersistentPhase
 from helion._testing import cpu_render_target
 from helion._testing import patch_target_facts
 from helion._testing.cute_codegen import cpu_bind
@@ -68,6 +71,24 @@ _ALLOC = "p = cute.arch.alloc_smem(cutlass.Float32, 256)\nuse(p)\n"
 
 def _loop(header: str, body: str = _ALLOC) -> str:
     return f"{header}:\n" + "".join(f"    {line}\n" for line in body.splitlines())
+
+
+def test_generated_load_context_rebinding_of_runtime_formal_does_not_force_scratch() -> (
+    None
+):
+    for write in (False, True):
+        body = ("n = 0\n" if write else "") + _loop("for i in range(n)")
+        kernel = ast.parse("def kernel(n):\n" + textwrap.indent(body, "    ")).body[0]
+        assert isinstance(kernel, ast.FunctionDef)
+        if write:
+            assign = kernel.body[0]
+            assert isinstance(assign, ast.Assign) and isinstance(
+                assign.targets[0], ast.Name
+            )
+            assign.targets[0].ctx = ast.Load()
+        # A launch can supply a positive n only when the binding survives.
+        footprint = kernel_smem_footprint(kernel, {})
+        assert footprint.low == (0 if write else 1024)
 
 
 def test_unrolled_loops_allocate_per_copy() -> None:
@@ -577,6 +598,29 @@ def test_every_grouped_reduce_buffer_is_sized_like_its_helper() -> None:
     unknown = SmemFootprint(0, None)
     assert _footprint(f"r = {columns}\n") == unknown
     assert _footprint(f"acc = [a, b, c]\nacc.append(d)\nr = {columns}\n") == unknown
+    # A register tile writes its list at a row-major integer expression of
+    # constexpr induction variables; this cannot assign a slice.
+    grid = (
+        "for row in cutlass.range_constexpr(2):\n"
+        "    for col in cutlass.range_constexpr(2):\n"
+        "        acc[row * 2 + col] = out[row, col]\n"
+    )
+    check = f"r = {columns}\nuse(r)\n"
+    init = "acc = [a, b, c, d]\n"
+    measured = _footprint(init + check)
+    assert measured.low > 0 and measured.low == measured.high
+    assert _footprint(init + grid + check) == measured
+    clobbered = grid.replace("        acc[", "        row = slice(None)\n        acc[")
+    assert _footprint(init + clobbered + check) == unknown
+
+    for expr in (
+        "a * b",
+        "a | b",
+        "cute.math.max(a, b, propagate_nan=True)",
+        "cute.math.min(a, b, propagate_nan=True)",
+    ):
+        callback = f"assert cutlass.const_expr(True)\nv = cute.arch.warp_reduction(x, lambda a, b: {expr})\n"
+        assert _footprint(init + callback + grid + check) == measured
     # Inside an unrolled lane loop every copy takes its own buffer.
     two_stage = next(iter(_REDUCE_BUFFERS))
     unrolled = _loop("for v in cutlass.range_constexpr(16)", f"r = {two_stage}\nuse(r)")
@@ -683,6 +727,202 @@ def two_chunked_sums(
             acc = acc + torch.sum(y[tile_s, tile_r, tile_c].to(torch.float32), dim=1)
         out_y[tile_s, tile_c] = acc
     return out_x, out_y
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def phased_sums(x: torch.Tensor, y: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    rows, depth, cols = x.shape
+    other_rows = y.size(0)
+    a = torch.empty((rows, cols), device=x.device, dtype=torch.float32)
+    b = torch.empty((other_rows, cols), device=x.device, dtype=torch.float32)
+    for i, j in hl.tile([rows, cols]):
+        acc = hl.zeros([i, j], dtype=torch.float32)
+        for k in hl.tile(depth):
+            acc = acc + x[i, k, j].to(torch.float32).sum(1)
+        a[i, j] = acc
+    hl.barrier()
+    for i, j in hl.tile([other_rows, cols]):
+        acc = hl.zeros([i, j], dtype=torch.float32)
+        for k in hl.tile(depth):
+            acc = acc + y[i, k, j].to(torch.float32).sum(1)
+        b[i, j] = acc
+    return a, b
+
+
+@pytest.mark.parametrize("pid_type", ["persistent_interleaved", "persistent_blocked"])
+def test_nonempty_phase_counts_only_its_reachable_reduce(pid_type: str) -> None:
+    # A dynamic phase guard wraps both copies of the entire root dispatch.
+    # ptxas keeps 139264 bytes per occupied phase for width two, not also
+    # the unreachable copy from the other root in each dispatch.
+    x = torch.empty((256, 512, 128), dtype=torch.bfloat16)
+    empty = x[:0]
+    with cpu_render_target(
+        reduction_smem_budget_bytes=232448, smem_budget_bytes=232448
+    ):
+
+        def render(a: torch.Tensor, b: torch.Tensor, width: int) -> str:
+            return cpu_bind(phased_sums, (a, b)).to_code(
+                helion.Config(**_config(width, roots=2).config, pid_type=pid_type)
+            )
+
+        assert TWO_STAGE in render(x, x, 1)
+        with pytest.raises(
+            helion.exc.BackendUnsupported, match="278528 bytes of shared memory"
+        ):
+            render(x, x, 2)
+        # One occupied phase fits in either position. The blocked versions
+        # use the same induction name for both the live and the empty phase.
+        for left, right in ((empty, x), (x, empty)):
+            assert TWO_STAGE in render(left, right, 2)
+
+
+def test_unproved_or_changed_phase_headers_do_not_prove_allocations() -> None:
+    # The names match a compiler-emitted loop. Only its original, nonempty
+    # domain can raise the lower bound; the upper bound stays conservative.
+    def uniform_loop() -> ast.For:
+        loop = ast.parse(
+            "for phase_iteration in range(trips()):\n"
+            "    pid = phase_iteration + worker\n"
+            "    if pid >= 0 and pid < 4:\n"
+            "        p = cute.arch.alloc_smem(cutlass.Float32, 256)\n"
+            "        use(p)"
+        ).body[0]
+        assert isinstance(loop, ast.For)
+        return loop
+
+    plain = uniform_loop()
+    assert smem_footprint([plain]).low == 0
+    for start, stop in (("0", "0"), ("0", "runtime_end")):
+        loop = uniform_loop()
+        PersistentPhase.mark(loop, start, stop, [])
+        assert smem_footprint([loop]).low == 0
+    loop = uniform_loop()
+    PersistentPhase.mark(loop, "0", "4", [])
+    assert smem_footprint([loop]).low == 1024
+    guard = loop.body[-1]
+    assert isinstance(guard, ast.If)
+    guard.body.extend(ast.parse("out[worker] = 1").body)
+    assert smem_footprint([loop]).low == 1024  # Indexing by worker does not rebind it.
+    loop.body.insert(1, ast.parse("pid = 4").body[0])
+    assert smem_footprint([loop]).low == 0
+
+
+def test_phase_reaching_bounds_and_overwritten_buffer() -> None:
+    setup = ast.parse("start = 0\nend = 1").body
+    loop = ast.parse(
+        "for pid in range(start, end):\n    if 0 <= pid < 1:\n        v = 7"
+    ).body[0]
+    assert isinstance(loop, ast.For)
+    PersistentPhase.mark(loop, "0", "1", setup)
+    assert id(loop) in PersistentPhase.entered([*setup, loop])
+    # The phase predates the inserted reassignment; its identical header
+    # now executes zero trips. It cannot prove a nonempty interval.
+    clobber = ast.parse("end = start").body[0]
+    assert isinstance(clobber, ast.Assign) and isinstance(clobber.targets[0], ast.Name)
+    clobber.targets[0].ctx = ast.Load()
+    assert not PersistentPhase.entered([*setup, clobber, loop])
+    # The pre-phase read is dead: the one real iteration overwrites it.
+    pre = ast.parse("p = cute.arch.alloc_smem(cutlass.Float32, 65536)\nv = p[0]").body
+    aft = ast.parse("use(v)").body
+    assert smem_footprint([*pre, *setup, loop, *aft]).low == 0
+    guard = loop.body[0]
+    assert isinstance(guard, ast.If)
+    assign = guard.body[0]
+    assert isinstance(assign, ast.Assign) and isinstance(assign.targets[0], ast.Name)
+    assign.targets[0].ctx = ast.Load()
+    assert smem_footprint([*pre, *setup, loop, *aft]).low == 0
+    # The same Name object can occupy two syntactic positions. A real RHS
+    # read, including when used as the index of a store, must still count.
+    assign.value = assign.targets[0]
+    assert smem_footprint([*pre, assign, *aft]).low == 262144
+    indexed_store = ast.parse("out[v] = 1").body[0]
+    assert smem_footprint([*pre, indexed_store]).low == 262144
+
+
+def test_nested_scopes_do_not_inherit_a_sequence_length_by_spelling() -> None:
+    # Calling inner([0, 1]) requests 2048 bytes, despite the empty outer
+    # value. The estimator does not model calls or ownership across scopes.
+    loop = _loop("for v in items")
+    untracked = SmemFootprint(0, None)
+    for definition, invoke in (
+        ("def inner(items):\n" + textwrap.indent(loop, "    "), "inner([0, 1])"),
+        (
+            "def inner(values):\n    items = values\n" + textwrap.indent(loop, "    "),
+            "inner([0, 1])",
+        ),
+        (
+            "class Nested:\n    items = [0, 1]\n" + textwrap.indent(loop, "    "),
+            "Nested()",
+        ),
+    ):
+        assert _footprint("items = []\n" + definition + "\n" + invoke) == untracked
+    # A lambda or comprehension can also capture or mutate a list through
+    # an alias. No extent is asserted for the named loop across that scope.
+    for expression in (
+        "lambda items: items",
+        "(items for items in source)",
+        "[alias.clear() for alias in [items]]",
+    ):
+        assert _footprint("items = []\nf = " + expression + "\n" + loop) == untracked
+
+
+def test_shadowed_constexpr_and_unmodelled_name_binding_cannot_prove_zero() -> None:
+    inner = _loop("for j in cutlass.range_constexpr(1, N)")
+    for source in (
+        "[(N := v) for v in (3,)]\n" + inner,
+        _loop("for N in cutlass.range_constexpr(3)", inner),
+        "N = 3\n" + inner,
+    ):
+        assert _footprint(source, N=1) == SmemFootprint(0, None)
+    assert _footprint(inner, N=1) == SmemFootprint()
+    inner = "def inner(N):\n" + textwrap.indent(
+        _loop("for i in cutlass.range_constexpr(1, N)"), "    "
+    )
+    assert _footprint(inner + "inner(3)\n", N=1) == SmemFootprint(0, None)
+    matches = "items = []\nmatch value:\n    case [*items]:\n        pass\n"
+    assert _footprint(matches + _loop("for i in items")) == SmemFootprint(0, None)
+
+
+def test_phase_list_trip_count_requires_an_unmodified_literal() -> None:
+    def footprint(edit: str) -> SmemFootprint:
+        body = (
+            "items = [0, 1]\nempty = []\n"
+            + edit
+            + "\n"
+            + (
+                "for v in items:\n    p = cute.arch.alloc_smem(cutlass.Float32, 32768)\n    use(p)"
+            )
+        )
+        loop = ast.parse(
+            "for pid in range(start(), stop()):\n    if 0 <= pid < 1:\n        pass"
+        ).body[0]
+        assert isinstance(loop, ast.For)
+        guard = loop.body[0]
+        assert isinstance(guard, ast.If)
+        guard.body = ast.parse(body).body
+        for stmt in guard.body[2:-1]:
+            if isinstance(stmt, (ast.Assign, ast.Delete)):
+                for target in stmt.targets:
+                    if isinstance(target, (ast.Name, ast.Subscript)):
+                        target.ctx = ast.Load()
+        PersistentPhase.mark(loop, "0", "1", [])
+        return smem_footprint([loop])
+
+    assert footprint("items[0] = 3").low == 262144
+    for edit in (
+        "items = empty",
+        "items[:] = []",
+        "del items[0]",
+        "alias = items\nalias.clear()",
+    ):
+        assert footprint(edit).low == 0
+
+    # The literal exists in the syntax but on a sibling branch, or only
+    # after the consumer. In neither case does it establish its input.
+    for code in ("if test:\n    items = [1,2]\n", ""):
+        use = "for v in items:\n    p = cute.arch.alloc_smem(cutlass.Float32, 32768)\n    read(p)\n"
+        body = ast.parse(code + use + ("" if code else "items = [1,2]")).body
+        assert smem_footprint(list(body)).low == 0
 
 
 @helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
@@ -942,7 +1182,8 @@ def test_the_spread_pad_counts_the_alignment_padding_ahead_of_each_allocation() 
     assert spread_pad_bytes(148 * 14, 148, 40, 40, own_padding=1270) is None
 
 
-def test_a_persistent_loop_is_entered() -> None:
+@pytest.mark.parametrize("wide", [False, True])
+def test_a_persistent_loop_is_entered(wide: bool) -> None:
     # Block 0 starts at the first of the launch's 1024 virtual program ids in
     # either persistent form, so the compiler keeps the loop's body: its 16
     # reduce copies (69632 bytes) are certain.  The one-CTA-per-SM pad then
@@ -951,7 +1192,17 @@ def test_a_persistent_loop_is_entered() -> None:
     # rejected at codegen, where libNVVM would otherwise fail.
     x = torch.empty(256, 512, 128, dtype=torch.bfloat16)
     with cpu_render_target(reduction_smem_budget_bytes=232448):
-        bound = cpu_bind(chunked_sum, (x,))
+        kernel = (
+            helion.kernel(
+                backend="cute",
+                static_shapes=True,
+                autotune_effort="none",
+                index_dtype=torch.int64,
+            )(chunked_sum.fn)
+            if wide
+            else chunked_sum
+        )
+        bound = cpu_bind(kernel, (x,))
         for pid_type in ("persistent_interleaved", "persistent_blocked"):
             config = bound.config_spec.normalized_config(
                 helion.Config(
@@ -962,7 +1213,8 @@ def test_a_persistent_loop_is_entered() -> None:
                 )
             )
             code = bound.to_code(config)
-            assert "for virtual_pid in range(" in code, pid_type
+            induction = "program_iteration" if wide else "virtual_pid"
+            assert f"for {induction} in range(" in code, pid_type
             assert code.count(f"{TWO_STAGE}(") == 1, pid_type
             assert (
                 "pdl_spread_pad = cute.arch.alloc_smem(cutlass.Uint8, 46081, "

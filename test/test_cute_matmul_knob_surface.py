@@ -16,12 +16,12 @@ from typing import TYPE_CHECKING
 import pytest
 import torch
 
-from test.test_cute_full_slice_matmul import _bind
 from test.test_cute_full_slice_matmul import _inputs
 from test.test_cute_full_slice_matmul import _se_block_full_slice_fwd
 
 from helion._testing import cpu_render_target
 from helion._testing import skipUnlessBackends
+from helion._testing.cute_codegen import bind_full_slice_matmul as _bind
 import helion.language as hl
 
 pytestmark = [pytest.mark.cpu_only, skipUnlessBackends(["cute"])]

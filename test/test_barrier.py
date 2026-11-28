@@ -358,7 +358,10 @@ class TestCuteBarrier(RefEagerTestBase, TestCase):
         used to fall back to ``flat`` and raise ``BarrierRequiresPersistent``."""
         x = torch.arange(4, device=DEVICE, dtype=torch.float32)
         spec = barrier_dep_single.bind((x,)).config_spec
-        self.assertEqual(spec.allowed_pid_types, ("persistent_blocked", "flat"))
+        self.assertEqual(
+            spec.allowed_pid_types,
+            ("persistent_blocked", "persistent_interleaved", "flat"),
+        )
         self.assertEqual(spec.default_config().pid_type, "persistent_blocked")
         # A partial user config must keep the persistent choice through normalize
         # (a stripped pid_type would fall back to flat and fail codegen).
@@ -585,22 +588,28 @@ class TestCuteOrderedPhases(RefEagerTestBase, TestCase):
         search must reach them; the persistent launch stays the default."""
         x = torch.randn(137, device=DEVICE)
         spec = barrier_multiple.bind((x,)).config_spec
-        self.assertEqual(spec.allowed_pid_types, ("persistent_blocked", "flat"))
+        self.assertEqual(
+            spec.allowed_pid_types,
+            ("persistent_blocked", "persistent_interleaved", "flat"),
+        )
         self.assertEqual(spec.default_config().pid_type, "persistent_blocked")
         generation = spec.create_config_generation()
         configs = [
             generation.unflatten(flat) for flat in generation.random_population_flat(32)
         ]
         self.assertEqual(
-            {config.pid_type for config in configs}, {"persistent_blocked", "flat"}
+            {config.pid_type for config in configs},
+            {"persistent_blocked", "persistent_interleaved", "flat"},
         )
         bound = barrier_multiple.bind((x,))
-        for pid_type in ("persistent_blocked", "flat"):
+        for pid_type in ("persistent_blocked", "persistent_interleaved", "flat"):
             config = next(config for config in configs if config.pid_type == pid_type)
             torch.testing.assert_close(bound.compile_config(config)(x), (x + 3) * 2 - 5)
         # Phases that share a launch cannot be split into ordered launches.
         grouped = barrier_groups.bind((x, x)).config_spec
-        self.assertEqual(grouped.allowed_pid_types, ("persistent_blocked",))
+        self.assertEqual(
+            grouped.allowed_pid_types, ("persistent_blocked", "persistent_interleaved")
+        )
 
     @skipIfRefEager("checks separately launched matmul phases")
     def test_explicit_barrier_matmul_phase_launch(self) -> None:

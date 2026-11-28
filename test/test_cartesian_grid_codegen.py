@@ -595,6 +595,22 @@ def test_persistent_worker_partition_near_the_signed_limit(pid_type):
     bounds = [
         compile(ast.Expression(n), "<worker range>", "eval") for n in loop.iter.args
     ]
+    assert isinstance(loop.target, ast.Name)
+    # The CuTe front-end may lower a wide range to an iteration count.
+    # Replay its actual induction prefix to recover the logical program ID.
+    prefix = []
+    if loop.target.id != "virtual_pid":
+        for stmt in loop.body:
+            assert isinstance(stmt, ast.Assign)
+            prefix.append(stmt)
+            if any(
+                isinstance(target, ast.Name) and target.id == "virtual_pid"
+                for target in stmt.targets
+            ):
+                break
+        else:
+            raise AssertionError("the scheduling loop did not bind virtual_pid")
+    induction = compile(ast.Module(prefix, []), "<virtual PID>", "exec")
     # Three physical workers make the last signed update wrap on the old
     # interleaved schedule, and overflow the old (total + workers - 1) on
     # the blocked schedule. Replay just the two endpoints of each worker.
@@ -618,24 +634,19 @@ def test_persistent_worker_partition_near_the_signed_limit(pid_type):
                 endpoints = [int(eval(n, scope)) for n in bounds]
                 r = range(*endpoints)
                 assert r and r[-1] + r.step <= 2**63 - 1
+                logical = []
+                for iteration in (r[0], r[-1]):
+                    scope[loop.target.id] = np.int64(iteration)
+                    exec(induction, scope)
+                    logical.append(int(scope["virtual_pid"]))
                 if pid_type == "persistent_blocked":
                     width = -(-total // 3)
-                    assert (r[0], r[-1]) == (
+                    assert logical == [
                         worker * width,
                         min((worker + 1) * width, total) - 1,
-                    )
+                    ]
                 else:
-                    assert isinstance(loop.target, ast.Name)
-                    assignment = loop.body[0]
-                    assert isinstance(assignment, ast.Assign)
-                    virt = compile(
-                        ast.Expression(assignment.value), "<virtual PID>", "eval"
-                    )
-                    actual = []
-                    for relative in (r[0], r[-1]):
-                        scope[loop.target.id] = np.int64(relative)
-                        actual.append(int(eval(virt, scope)))
-                    assert actual == [worker, worker + ((total - 1 - worker) // 3) * 3]
+                    assert logical == [worker, worker + ((total - 1 - worker) // 3) * 3]
 
 
 @skipUnlessBackends(["triton"])
@@ -757,7 +768,7 @@ def test_short_l2_group_in_a_flat_launch_uses_only_live_rows(static):
         scope = {
             "shape_size_0": np.int32(n),
             "tl": SimpleNamespace(program_id=lambda dim, pid=pid: pid),
-            "cutlass": SimpleNamespace(Int32=np.int32),
+            "cutlass": SimpleNamespace(Int32=np.int32, Int64=np.int64),
             "cute": SimpleNamespace(
                 arch=SimpleNamespace(block_idx=lambda pid=pid: (pid, 0, 0))
             ),
@@ -927,11 +938,12 @@ def test_single_flattened_root_reports_its_full_count(threads):
     # Sample one virtual tile of the real persistent program, including its
     # count and stores, without traversing the full Int64 input domain.
     tree = ast.parse(source)
-    (loop,) = (
+    (device,) = (
         n
-        for n in ast.walk(tree)
-        if isinstance(n, ast.For) and "virtual_pid" in ast.unparse(n.target)
+        for n in tree.body
+        if isinstance(n, ast.FunctionDef) and n.name.startswith("_helion_")
     )
+    (loop,) = (stmt for stmt in device.body if isinstance(stmt, ast.For))
     loop.body.append(ast.Break())
     source = ast.unparse(tree)
     for n in (9, 2**63 - 1):

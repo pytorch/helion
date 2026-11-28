@@ -17,13 +17,13 @@ from typing import TYPE_CHECKING
 from typing import cast
 
 from ..ast_extension import expr_from_string
+from ..ast_read_writes import binding_names as _assigned_names
 from ._ast_pass_utils import call_path as _call_path
 from ._ast_pass_utils import call_path_str
 from ._ast_pass_utils import comparison_is_always_true
 from ._ast_pass_utils import is_staged_loop
 from ._ast_pass_utils import merged_names
 from ._ast_pass_utils import names_read
-from ._ast_pass_utils import names_stored_or_deleted as _assigned_names
 from ._ast_pass_utils import with_merged_names
 from .scalar_integer import _INTEGER_CASTS
 

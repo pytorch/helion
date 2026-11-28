@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import ast
+from types import SimpleNamespace
 import unittest
 
 import torch
@@ -43,12 +45,12 @@ def _blocked_pid_chunk(grid: str) -> str:
     return f"tl.cdiv(total_pids, {grid})"
 
 
-def _interleaved_pid_range(step: str) -> str:
+def _interleaved_pid_range(step: str, total: int) -> str:
     """Return the range header of an interleaved loop striding by ``step``."""
     if _get_backend() == "cute":
         return (
             "cutlass.Int32(cute.arch.block_idx()[0])), cutlass.Int32(total_pids), "
-            f"cutlass.Int32({step})"
+            f"cutlass.Int32(min({step}, {total}))"
         )
     return f"tl.range(tl.program_id(0), total_pids, {step}"
 
@@ -553,8 +555,8 @@ class TestPersistentKernels(RefEagerTestBase, TestCase):
 
         torch.manual_seed(42)  # Set seed for reproducible results
         args = (
-            torch.randn([8, 8], device=DEVICE),
-            torch.randn([5, 3], device=DEVICE),
+            torch.randn([2, 3], device=DEVICE),
+            torch.randn([5, 7], device=DEVICE),
         )
 
         # Test persistent + ForEachProgramID
@@ -575,18 +577,56 @@ class TestPersistentKernels(RefEagerTestBase, TestCase):
 
         # Check that code contains persistent loop with ForEachProgramID structure
         # The new implementation correctly combines persistent kernels with ForEachProgramID
-        self.assertRegex(
-            code_persistent_shared, r"for virtual_pid in [^\n]*start_pid[^\n]*end_pid"
-        )
-        self.assertIn("pid_shared = virtual_pid", code_persistent_shared)
         self.assertIn("if pid_shared <", code_persistent_shared)
-        # Each Cartesian root contributes its own area, with any casts needed
-        # to keep large products and their sum representable.
-        self.assertRegex(
-            code_persistent_shared,
-            r"total_pids = [^\n]*x_size_0[^\n]*\* x_size_1[^\n]*\+ "
-            r"[^\n]*y_size_0[^\n]*\* y_size_1",
-        )
+        if _get_backend() == "cute":
+            self.assertIn("for program_iteration in range(", code_persistent_shared)
+            self.assertIn(
+                "virtual_pid = cutlass.Int64(start_pid) + program_iteration",
+                code_persistent_shared,
+            )
+            self.assertIn(
+                "pid_shared = cutlass.Int64(virtual_pid)", code_persistent_shared
+            )
+            total = next(
+                node.value
+                for node in ast.walk(ast.parse(code_persistent_shared))
+                if isinstance(node, ast.Assign)
+                and isinstance(node.targets[0], ast.Name)
+                and node.targets[0].id == "total_pids"
+            )
+            values = {
+                "x_size_0": 2,
+                "x_size_1": 3,
+                "y_size_0": 5,
+                "y_size_1": 7,
+                "cutlass": SimpleNamespace(Int64=int),
+            }
+            self.assertEqual(
+                eval(
+                    compile(ast.Expression(total), "<emitted-count>", "eval"),
+                    {"__builtins__": {}},
+                    values,
+                ),
+                41,
+            )
+            self.assertEqual(
+                {n.id for n in ast.walk(total) if isinstance(n, ast.Name)}
+                - {"cutlass"},
+                {"x_size_0", "x_size_1", "y_size_0", "y_size_1"},
+            )
+        else:
+            self.assertRegex(
+                code_persistent_shared,
+                r"for virtual_pid in [^\n]*start_pid[^\n]*end_pid",
+            )
+            self.assertIn("pid_shared = virtual_pid", code_persistent_shared)
+            # Each Cartesian root contributes its own area, with any casts needed
+            # to keep large products and their sum representable.
+            self.assertRegex(
+                code_persistent_shared,
+                r"total_pids = [^\n]*x_size_0[^\n]*\* x_size_1[^\n]*\+ "
+                r"[^\n]*y_size_0[^\n]*\* y_size_1",
+            )
         # Grid should use SM count for persistent kernels
         # Check that NUM_SM is used in device code and get_num_sm() in host code
         self.assertIn(_NUM_SM_PARAM, code_persistent_shared)
@@ -813,7 +853,7 @@ class TestPersistentKernels(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result_interleaved, expected)
 
         # Should have the correct loop structure
-        self.assertIn(f"{_interleaved_pid_range('_NUM_SM')}):", code_interleaved)
+        self.assertIn(f"{_interleaved_pid_range('_NUM_SM', 3)}):", code_interleaved)
         self.assertIn("pid_0 = virtual_pid %", code_interleaved)
         self.assertIn("pid_1 = virtual_pid //", code_interleaved)
 
@@ -1355,21 +1395,21 @@ class TestNumSmMultiplier(RefEagerTestBase, TestCase):
             add_kernel, args, pid_type="persistent_interleaved", num_sm_multiplier=1
         )
         self.assertIn("(_NUM_SM,)", code_m1)
-        self.assertIn(_interleaved_pid_range("_NUM_SM"), code_m1)
+        self.assertIn(_interleaved_pid_range("_NUM_SM", 32768), code_m1)
 
         # Test with multiplier=2
         code_m2, result_m2 = code_and_output(
             add_kernel, args, pid_type="persistent_interleaved", num_sm_multiplier=2
         )
         self.assertIn("(_NUM_SM * 2,)", code_m2)
-        self.assertIn(_interleaved_pid_range("_NUM_SM * 2"), code_m2)
+        self.assertIn(_interleaved_pid_range("_NUM_SM * 2", 32768), code_m2)
 
         # Test with multiplier=8
         code_m8, result_m8 = code_and_output(
             add_kernel, args, pid_type="persistent_interleaved", num_sm_multiplier=8
         )
         self.assertIn("(_NUM_SM * 8,)", code_m8)
-        self.assertIn(_interleaved_pid_range("_NUM_SM * 8"), code_m8)
+        self.assertIn(_interleaved_pid_range("_NUM_SM * 8", 32768), code_m8)
 
         # All should produce the same result
         expected = args[0] + args[1]

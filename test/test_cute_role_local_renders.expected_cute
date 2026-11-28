@@ -3168,7 +3168,7 @@ def _helion__residual_matmul(a, b, out, residual, tma_atom_a, tma_tensor_a, tma_
         tcgen05_scheduler_warp_tile_sched = cutlass.utils.StaticPersistentTileScheduler.create(tcgen05_scheduler_warp_tile_sched_params, cute.arch.block_idx(), cute.arch.grid_dim())
         tcgen05_scheduler_warp_work_tile = tcgen05_scheduler_warp_tile_sched.initial_work_tile_info()
         while tcgen05_scheduler_warp_work_tile.is_valid_tile:
-            tcgen05_scheduler_warp_full_tile = ((tcgen05_scheduler_warp_work_tile.tile_idx[0] >> cutlass.Int32(1)) + tcgen05_scheduler_warp_work_tile.tile_idx[1] * ((5000 + _BLOCK_SIZE_0 - 1) // _BLOCK_SIZE_0)) % ((5000 + _BLOCK_SIZE_0 - 1) // _BLOCK_SIZE_0) * _BLOCK_SIZE_0 + _BLOCK_SIZE_0 <= 5000 and ((tcgen05_scheduler_warp_work_tile.tile_idx[0] >> cutlass.Int32(1)) + tcgen05_scheduler_warp_work_tile.tile_idx[1] * ((5000 + _BLOCK_SIZE_0 - 1) // _BLOCK_SIZE_0)) // ((5000 + _BLOCK_SIZE_0 - 1) // _BLOCK_SIZE_0) * _BLOCK_SIZE_1 + _BLOCK_SIZE_1 <= 5000
+            tcgen05_scheduler_warp_full_tile = ((tcgen05_scheduler_warp_work_tile.tile_idx[0] >> cutlass.Int32(1)) + tcgen05_scheduler_warp_work_tile.tile_idx[1] * ((5000 + _BLOCK_SIZE_0 - 1) // _BLOCK_SIZE_0)) % ((5000 + _BLOCK_SIZE_0 - 1) // _BLOCK_SIZE_0) < 5000 // _BLOCK_SIZE_0 and ((tcgen05_scheduler_warp_work_tile.tile_idx[0] >> cutlass.Int32(1)) + tcgen05_scheduler_warp_work_tile.tile_idx[1] * ((5000 + _BLOCK_SIZE_0 - 1) // _BLOCK_SIZE_0)) // ((5000 + _BLOCK_SIZE_0 - 1) // _BLOCK_SIZE_0) < 5000 // _BLOCK_SIZE_1
             if tcgen05_scheduler_warp_full_tile:
                 if cute.arch.lane_idx() == cutlass.Int32(0):
                     tcgen05_sched_pipeline.producer_acquire(tcgen05_sched_pipeline_producer_state)
@@ -3193,7 +3193,7 @@ def _helion__residual_matmul(a, b, out, residual, tma_atom_a, tma_tensor_a, tma_
         tcgen05_scheduler_warp_tile_sched = cutlass.utils.StaticPersistentTileScheduler.create(tcgen05_scheduler_warp_tile_sched_params, cute.arch.block_idx(), cute.arch.grid_dim())
         tcgen05_scheduler_warp_work_tile = tcgen05_scheduler_warp_tile_sched.initial_work_tile_info()
         while tcgen05_scheduler_warp_work_tile.is_valid_tile:
-            tcgen05_scheduler_warp_full_tile = ((tcgen05_scheduler_warp_work_tile.tile_idx[0] >> cutlass.Int32(1)) + tcgen05_scheduler_warp_work_tile.tile_idx[1] * ((5000 + _BLOCK_SIZE_0 - 1) // _BLOCK_SIZE_0)) % ((5000 + _BLOCK_SIZE_0 - 1) // _BLOCK_SIZE_0) * _BLOCK_SIZE_0 + _BLOCK_SIZE_0 <= 5000 and ((tcgen05_scheduler_warp_work_tile.tile_idx[0] >> cutlass.Int32(1)) + tcgen05_scheduler_warp_work_tile.tile_idx[1] * ((5000 + _BLOCK_SIZE_0 - 1) // _BLOCK_SIZE_0)) // ((5000 + _BLOCK_SIZE_0 - 1) // _BLOCK_SIZE_0) * _BLOCK_SIZE_1 + _BLOCK_SIZE_1 <= 5000
+            tcgen05_scheduler_warp_full_tile = ((tcgen05_scheduler_warp_work_tile.tile_idx[0] >> cutlass.Int32(1)) + tcgen05_scheduler_warp_work_tile.tile_idx[1] * ((5000 + _BLOCK_SIZE_0 - 1) // _BLOCK_SIZE_0)) % ((5000 + _BLOCK_SIZE_0 - 1) // _BLOCK_SIZE_0) < 5000 // _BLOCK_SIZE_0 and ((tcgen05_scheduler_warp_work_tile.tile_idx[0] >> cutlass.Int32(1)) + tcgen05_scheduler_warp_work_tile.tile_idx[1] * ((5000 + _BLOCK_SIZE_0 - 1) // _BLOCK_SIZE_0)) // ((5000 + _BLOCK_SIZE_0 - 1) // _BLOCK_SIZE_0) < 5000 // _BLOCK_SIZE_1
             if not tcgen05_scheduler_warp_full_tile:
                 if cute.arch.lane_idx() == cutlass.Int32(0):
                     tcgen05_sched_pipeline.producer_acquire(tcgen05_sched_pipeline_producer_state)

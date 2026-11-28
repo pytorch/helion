@@ -60,6 +60,7 @@ from helion._compiler.cute.register_tile_admission import (
     _CUTE_REGISTER_TILE_CONTROL_FLOW,
 )
 from helion._compiler.cute.register_tile_admission import RegisterTileUnsupported
+from helion._compiler.cute.smem_footprint import smem_footprint
 from helion._compiler.emitter_protocols import RetryPolicy
 from helion._testing import DEVICE
 from helion._testing import skipIfRefEager
@@ -1315,6 +1316,15 @@ def test_register_tile_seed_is_the_default_config() -> None:
     code = bound.to_code(default)
     assert COLUMN_REDUCE in code
     assert "block=(8, 8, 1)" in code
+    # The nested constexpr lanes update one value of a four-column list.
+    # Its size still prices the buffer and lets the PDL pass size its pad.
+    (kernel,) = [
+        s
+        for s in ast.parse(code).body
+        if isinstance(s, ast.FunctionDef) and s.name.startswith("_helion_")
+    ]
+    bounds = smem_footprint(list(kernel.body))
+    assert bounds.low == bounds.high == 1024
 
 
 def test_default_stays_the_base_config_without_the_register_tile_shape() -> None:

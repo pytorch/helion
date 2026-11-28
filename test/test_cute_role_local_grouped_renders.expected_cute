@@ -2251,8 +2251,8 @@ def _helion__selected_kernel(work_tile_metadata, a_packed, b_grouped, out, work_
     tcgen05_work_tile_smem_ptr = cute.arch.alloc_smem(cutlass.Int32, 4, alignment=16)
     tcgen05_work_tile_smem_tensor = cute.make_tensor(tcgen05_work_tile_smem_ptr, cute.make_layout((4,), stride=(1,)))
     tcgen05_work_tile_smem = tcgen05_work_tile_smem_tensor
-    num_blocks_0 = work_tile_metadata_size_0
-    num_blocks_1 = (256 + _BLOCK_SIZE_0 - 1) // _BLOCK_SIZE_0
+    num_blocks_0 = cutlass.Int64(work_tile_metadata_size_0)
+    num_blocks_1 = (cutlass.Int64(256) + _BLOCK_SIZE_0 - 1) // _BLOCK_SIZE_0
     group_id = cutlass.Int32(0)
     global_m_start = cutlass.Int32(0)
     valid_m = cutlass.Int32(0)
@@ -2652,6 +2652,8 @@ def _selected_kernel(a_packed: torch.Tensor, b_grouped: torch.Tensor, work_tile_
     _BLOCK_SIZE_1 = 128
     if work_tile_metadata.size(0) * ((256 + _BLOCK_SIZE_0 - 1) // _BLOCK_SIZE_0) * ((512 + _BLOCK_SIZE_1 - 1) // _BLOCK_SIZE_1) > 9223372036854775807:
         raise _global_source0.OverflowError('root grid count exceeds signed Int64')
+    if 4 * ((256 + _BLOCK_SIZE_0 - 1) // _BLOCK_SIZE_0) * ((512 + _BLOCK_SIZE_1 - 1) // _BLOCK_SIZE_1) > 9223372036854775807:
+        raise _global_source0.OverflowError('root grid count exceeds signed Int64')
     _launcher(_helion__selected_kernel, (2, 1, (4 * 2 + 2 - 1) // 2 * ((256 + _BLOCK_SIZE_0 - 1) // _BLOCK_SIZE_0) * ((512 + _BLOCK_SIZE_1 - 1) // _BLOCK_SIZE_1)), work_tile_metadata, a_packed, b_grouped, out, work_tile_metadata.size(0), block=(32, 8, 1))
     return out
 
@@ -2674,8 +2676,8 @@ _BLOCK_SIZE_2 = 128
 def _helion__selected_kernel(work_tile_metadata, a_packed, b_grouped, out, work_tile_metadata_size_0, tcgen05_grouped_runtime_tile_records, tcgen05_grouped_ab_tensormaps, tcgen05_grouped_total_clusters, tma_atom_a, tma_tensor_a, tma_atom_b, tma_tensor_b, tcgen05_tma_store_atom, tcgen05_tma_store_tensor):
     cute.arch.griddepcontrol_wait()
     cute.arch.griddepcontrol_launch_dependents()
-    num_blocks_0 = work_tile_metadata_size_0
-    num_blocks_1 = (256 + _BLOCK_SIZE_0 - 1) // _BLOCK_SIZE_0
+    num_blocks_0 = cutlass.Int64(work_tile_metadata_size_0)
+    num_blocks_1 = (cutlass.Int64(256) + _BLOCK_SIZE_0 - 1) // _BLOCK_SIZE_0
     group_id = cutlass.Int32(0)
     global_m_start = cutlass.Int32(0)
     valid_m = cutlass.Int32(0)
@@ -3037,6 +3039,8 @@ def _selected_kernel(a_packed: torch.Tensor, b_grouped: torch.Tensor, work_tile_
     _BLOCK_SIZE_1 = 128
     if work_tile_metadata.size(0) * ((256 + _BLOCK_SIZE_0 - 1) // _BLOCK_SIZE_0) * ((224 + _BLOCK_SIZE_1 - 1) // _BLOCK_SIZE_1) > 9223372036854775807:
         raise _global_source0.OverflowError('root grid count exceeds signed Int64')
+    if 4 * ((256 + _BLOCK_SIZE_0 - 1) // _BLOCK_SIZE_0) * ((224 + _BLOCK_SIZE_1 - 1) // _BLOCK_SIZE_1) > 9223372036854775807:
+        raise _global_source0.OverflowError('root grid count exceeds signed Int64')
     _launcher(_helion__selected_kernel, (2, 1, min((4 * 2 + 2 - 1) // 2 * ((256 + _BLOCK_SIZE_0 - 1) // _BLOCK_SIZE_0) * ((224 + _BLOCK_SIZE_1 - 1) // _BLOCK_SIZE_1), max(1, _NUM_SM // 2))), work_tile_metadata, a_packed, b_grouped, out, work_tile_metadata.size(0), block=(32, 6, 1))
     return out
 
@@ -3062,8 +3066,8 @@ def _helion__selected_kernel(work_tile_metadata, a_packed, b_grouped, out, work_
     tcgen05_work_tile_smem_ptr = cute.arch.alloc_smem(cutlass.Int32, 9, alignment=16)
     tcgen05_work_tile_smem_tensor = cute.make_tensor(tcgen05_work_tile_smem_ptr, cute.make_layout((9,), stride=(1,)))
     tcgen05_work_tile_smem = tcgen05_work_tile_smem_tensor
-    num_blocks_0 = work_tile_metadata_size_0
-    num_blocks_1 = (256 + _BLOCK_SIZE_0 - 1) // _BLOCK_SIZE_0
+    num_blocks_0 = cutlass.Int64(work_tile_metadata_size_0)
+    num_blocks_1 = (cutlass.Int64(256) + _BLOCK_SIZE_0 - 1) // _BLOCK_SIZE_0
     group_id = cutlass.Int32(0)
     global_m_start = cutlass.Int32(0)
     valid_m = cutlass.Int32(0)
@@ -3477,6 +3481,8 @@ def _selected_kernel(a_packed: torch.Tensor, b_grouped: torch.Tensor, work_tile_
     _BLOCK_SIZE_0 = 256
     _BLOCK_SIZE_1 = 128
     if work_tile_metadata.size(0) * ((256 + _BLOCK_SIZE_0 - 1) // _BLOCK_SIZE_0) * ((224 + _BLOCK_SIZE_1 - 1) // _BLOCK_SIZE_1) > 9223372036854775807:
+        raise _global_source0.OverflowError('root grid count exceeds signed Int64')
+    if 4 * ((256 + _BLOCK_SIZE_0 - 1) // _BLOCK_SIZE_0) * ((224 + _BLOCK_SIZE_1 - 1) // _BLOCK_SIZE_1) > 9223372036854775807:
         raise _global_source0.OverflowError('root grid count exceeds signed Int64')
     _launcher(_helion__selected_kernel, (2, 1, min((4 * 2 + 2 - 1) // 2 * ((256 + _BLOCK_SIZE_0 - 1) // _BLOCK_SIZE_0) * ((224 + _BLOCK_SIZE_1 - 1) // _BLOCK_SIZE_1), max(1, _NUM_SM // 2))), work_tile_metadata, a_packed, b_grouped, out, work_tile_metadata.size(0), block=(32, 8, 1))
     return out

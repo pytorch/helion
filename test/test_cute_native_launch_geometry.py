@@ -12,15 +12,14 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from test.test_cute_full_slice_matmul import _bind
-from test.test_cute_materialized_fission import _sources
-
 import helion
 from helion._compiler.cute.device_state import CuteDeviceFunctionState
 from helion._compiler.cute.state import cute_env_state
 from helion._testing import import_example
 from helion._testing import skipUnlessBackends
+from helion._testing.cute_codegen import bind_full_slice_matmul as _bind
 from helion._testing.cute_codegen import cpu_target
+from helion._testing.cute_codegen import stage_sources as _sources
 from helion._testing.cute_structural_kernels import _se_args
 
 matmul_bf16_int4 = import_example("int4_gemm").matmul_bf16_int4

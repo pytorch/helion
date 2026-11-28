@@ -3,6 +3,7 @@ from __future__ import annotations
 import ast
 import math
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 from unittest.mock import patch
 
 import pytest
@@ -75,6 +76,24 @@ def _execute(
     }
     exec(compile(source, "<proof-oracle>", "exec"), namespace)
     return output
+
+
+def test_general_pass_preserves_a_mask_if_its_input_is_phi_renamed() -> None:
+    body = ast.parse(
+        "row = 0\nfor i in range(2):\n    record(x[row] if row < 600 else -1)\n    row_next = 600"
+    ).body
+    state = MagicMock()
+    ctx = state.ctx
+    ctx.fn.cute_state.lanes.collective_mma_sites = ()
+    ctx.config.config = {"cute_proven_bounds": True}
+    ctx.exact_thread_block_dims = (1, 1, 1)
+    ctx.constexpr_values = {}
+    ctx.rename_groups = {"row_next": "row"}
+    result = pipeline._proven_loop_bounds(state, body)
+    source = ast.unparse(ast.Module(body=result, type_ignores=[]))
+    values = []
+    exec(source.replace("row_next", "row"), {"record": values.append, "x": [5] * 600})
+    assert values == [5, -1]
 
 
 def test_complete_tile_rematerialized_bounds_and_all_thread_coordinates() -> None:

@@ -491,6 +491,9 @@ class CuteFlashState:
 class CuteLaneState:
     """Lane loops, thread axes and the launch shape (``cute_state.lanes``)."""
 
+    # Original schedule induction variables. Rewrite their Int64 ranges only
+    # after the footprint and vector-tail passes have seen the logical loop.
+    wide_pid_loops: set[str] = dataclasses.field(default_factory=set)
     # Physical (axis, thread extent) for grid index/base assignments.
     # The launcher consults only names that survive final AST lowering;
     # this does not depend on blocked/strided index-expression spelling.

@@ -35,6 +35,7 @@ from helion._compiler.cute.tcgen05_config import surface
 from helion._compiler.program_id import FlatProgramIDs
 from helion._compiler.program_id import PIDInfo
 from helion._testing import cpu_render_target
+from helion._testing.cute_codegen import cpu_pid_codegen
 from helion.exc import BackendUnsupported
 from helion.exc import InvalidConfig
 from helion.runtime.cute.launcher import _append_cute_wrapper_plan
@@ -619,6 +620,7 @@ def test_actual_producer_all_ranks_and_ring_wrap(k):
 
 
 @pytest.mark.parametrize("order", list(itertools.permutations((17, 23, 31))))
+@cpu_pid_codegen()
 def test_physical_pid_maps_to_original_rows_and_columns(order):
     groups, m, n = 5, 1280, 768
     union = GroupedRowUnionPlan(
@@ -637,10 +639,11 @@ def test_physical_pid_maps_to_original_rows_and_columns(order):
         # (no fallback cluster: ``tcgen05_fallback_cluster``)
         _tcgen05_fallback_cluster=lambda: False,
         _tcgen05_logical_m_coord_expr=lambda value: f"({value}) // 2",
+        grouped_count_dtype=axis_decoder.grouped_count_dtype,
     )
     expression = (
         Tcgen05PersistentProgramIDs._tcgen05_linear_virtual_pid_from_coords_expr(
-            strategy, ["pm", "pn", "0"]
+            strategy, ["pm", "pn", "0"], count_dtype=None
         )
     )
     state: Any = SimpleNamespace(
@@ -663,7 +666,7 @@ def test_physical_pid_maps_to_original_rows_and_columns(order):
         scope: dict[str, Any] = {
             "pm": pm,
             "pn": pn,
-            "cutlass": SimpleNamespace(Int32=int),
+            "cutlass": SimpleNamespace(Int32=int, Int64=int),
         }
         exec(code, scope)
         assert (scope["pid_17"], scope["pid_23"], scope["pid_31"]) == (0, pn, pm // 2)

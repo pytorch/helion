@@ -34,8 +34,9 @@ range has a trip for some values of its bounds that the enclosing code allows
 (static bounds, or the kernel's runtime scalar arguments, which the enclosing
 loops may already bound: ``range(r, 0)`` never runs inside ``range(0, r)``),
 the persistent loop over a static, nonempty set of virtual program ids (block
-0 runs its first), the lesser branch of an ``if`` (a read counts when both
-branches make it), and every branch of the root dispatch of a multi-root
+0 runs its first), the body of an unchanged nonempty phase's PID range
+guard (some CTA executes it), the lesser branch of another ``if`` (a read counts
+when both branches make it), and every branch of the root dispatch of a multi-root
 launch whose roots all get blocks (``RootDispatch``); a ``while`` body, a loop
 over other runtime bounds or under a runtime test, the code after a statement
 that may ``return``, and the greater branch count in ``high`` only, as does an
@@ -80,15 +81,22 @@ from typing import TYPE_CHECKING
 from typing import cast
 
 from ... import exc
+from ..ast_read_writes import binding_field
+from ..ast_read_writes import binding_names
+from ..ast_read_writes import binding_targets
+from ..ast_read_writes import target_leaves
+from ..ast_read_writes import target_names
 from ..compile_environment import CompileEnvironment
 from ..program_id import ForEachProgramID
 from ..program_id import L2GroupingProgramIDs
+from ..program_id import PersistentPhase
 from ..program_id import PersistentProgramIDs
 from . import target_facts
 from ._ast_pass_utils import call_path
 from ._ast_pass_utils import callee_name
 from ._ast_pass_utils import is_staged_loop
 from ._ast_pass_utils import is_trace_time_test
+from ._ast_pass_utils import scalar_warp_combiner
 from .reduce_call import ReduceScope
 from .reduce_call import shared_columns_elements
 from .reduce_routing import use_interleaved_shared_reduce
@@ -153,10 +161,6 @@ _TRIP_NEUTRAL_KEYWORDS = frozenset(
         "at_least_once",
     }
 )
-
-# List methods that change a list's length (a name bound to a list literal
-# keeps the literal's length only while none of them is called on it).
-_RESIZING_METHODS = frozenset({"append", "extend", "insert", "pop", "remove", "clear"})
 
 # The grouped-reduce dispatchers by the name generated code calls them by.
 _REDUCE_SCOPES: dict[str, ReduceScope] = {scope.value: scope for scope in ReduceScope}
@@ -483,47 +487,163 @@ def _literal_length(node: ast.expr) -> int | None:
     return None
 
 
+def _integer_list_position(expr: ast.expr, inductions: frozenset[str]) -> bool:
+    """A flat position of a register-tile list. Only arithmetic on Python
+    integers and unmodified constexpr induction variables rules out a slice."""
+    pending = [expr]
+    while pending:
+        part = pending.pop()
+        if isinstance(part, ast.Constant) and type(part.value) is int:
+            continue
+        if isinstance(part, ast.Name) and part.id in inductions:
+            continue
+        if isinstance(part, ast.BinOp) and isinstance(part.op, (ast.Add, ast.Mult)):
+            pending.extend((part.left, part.right))
+            continue
+        return False
+    return True
+
+
+# These generated statements have no hidden, string-valued bindings such
+# as a match capture, an import alias, or an exception handler's name.
+_EXPLICIT_BINDINGS = (
+    ast.Assign,
+    ast.Assert,
+    ast.AnnAssign,
+    ast.AugAssign,
+    ast.For,
+    ast.If,
+    ast.While,
+    ast.With,
+    ast.Expr,
+    ast.Return,
+    ast.Delete,
+    ast.Break,
+    ast.Continue,
+    ast.Pass,
+)
+
+
+def _sequence_uses(
+    statements: Iterable[ast.AST],
+) -> Iterator[tuple[ast.AST, frozenset[str], frozenset[str]]]:
+    """Visit expressions with the literal assignments that dominate their
+    statement. A binding inside a conditional or loop cannot escape it."""
+    blocks = [(iter(statements), frozenset[str](), frozenset[str]())]
+    while blocks:
+        stream, before, inductions = blocks[-1]
+        stmt = next(stream, None)
+        if stmt is None:
+            blocks.pop()
+            continue
+        if (
+            isinstance(stmt, ast.Assign)
+            and len(stmt.targets) == 1
+            and isinstance(stmt.targets[0], ast.Name)
+            and _literal_length(stmt.value) is not None
+        ):
+            blocks[-1] = (stream, before | {stmt.targets[0].id}, inductions)
+        pending = [stmt]
+        while pending:
+            node = pending.pop()
+            yield node, before, inductions
+            if isinstance(node, _REPEATED_NODES):
+                continue
+            for field, value in ast.iter_fields(node):
+                if isinstance(value, list) and value and isinstance(value[0], ast.stmt):
+                    inside = inductions
+                    if (
+                        field == "body"
+                        and isinstance(node, ast.For)
+                        and isinstance(node.target, ast.Name)
+                        and isinstance(node.iter, ast.Call)
+                        and call_path(node.iter.func) == ("cutlass", "range_constexpr")
+                        and all(
+                            node.target.id not in binding_names(child)
+                            for child in node.body
+                        )
+                    ):
+                        inside = inductions | {node.target.id}
+                    blocks.append((iter(value), before, inside))
+                elif isinstance(value, list):
+                    pending.extend(
+                        child for child in value if isinstance(child, ast.AST)
+                    )
+                elif isinstance(value, ast.AST):
+                    pending.append(value)
+
+
 def _sequence_lengths(statements: Iterable[ast.AST]) -> dict[str, int]:
-    """The names bound exactly once, by an assignment of a list or tuple
-    literal, whose length nothing changes afterwards (no resizing method
-    call, slice assignment or ``del`` of an element), by that length: the
-    per-element accumulator lists a register tile hands its shared-memory
-    column reduce."""
+    """An unescaped literal assigned once, consumed only as a sequence.
+
+    Count syntactic bindings independent of their ctx. An arbitrary callee,
+    alias, slice write or deletion can change a list's length, so a name
+    with such a use provides no bound, even in a witnessed phase.
+    """
     bindings: dict[str, int] = {}
     lengths: dict[str, int] = {}
-    resized: set[str] = set()
-    for statement in statements:
-        for node in ast.walk(statement):
-            if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store):
-                bindings[node.id] = bindings.get(node.id, 0) + 1
-            elif (
-                isinstance(node, ast.Assign)
-                and len(node.targets) == 1
-                and isinstance(node.targets[0], ast.Name)
+    unknown: set[str] = set()
+    scalar_combiners: set[int] = set()
+    for node, visible, inductions in _sequence_uses(statements):
+        # These facts are keyed by the rendered name, not a lexical owner.
+        # A nested scope can shadow a sequence, or mutate a captured one.
+        # Leave lengths unknown until escapes and owners can be separated.
+        if isinstance(node, _REPEATED_NODES):
+            if id(node) in scalar_combiners:
+                continue
+            return {}
+        if isinstance(node, ast.stmt) and not isinstance(node, _EXPLICIT_BINDINGS):
+            return {}
+        if (combine := scalar_warp_combiner(node)) is not None:
+            scalar_combiners.add(id(combine))
+        for target in binding_targets(node):
+            if isinstance(target, ast.Name):
+                bindings[target.id] = bindings.get(target.id, 0) + 1
+            elif isinstance(target, ast.Subscript) and isinstance(
+                target.value, ast.Name
             ):
-                length = _literal_length(node.value)
-                if length is not None:
-                    lengths[node.targets[0].id] = length
-            elif isinstance(node, ast.Subscript) and (
-                isinstance(node.ctx, ast.Del)
-                or (
-                    isinstance(node.ctx, ast.Store)
-                    and isinstance(node.slice, ast.Slice)
-                )
+                # Replacing one element does not resize a list. An
+                # arbitrary subscript could evaluate to a Python slice.
+                if isinstance(node, ast.Delete) or not _integer_list_position(
+                    target.slice, inductions
+                ):
+                    unknown.add(target.value.id)
+        if (
+            isinstance(node, ast.Assign)
+            and len(node.targets) == 1
+            and isinstance(node.targets[0], ast.Name)
+        ):
+            length = _literal_length(node.value)
+            if length is not None:
+                lengths[node.targets[0].id] = length
+        for field, value in ast.iter_fields(node):
+            if field == binding_field(node):
+                continue
+            for index, child in enumerate(
+                value if isinstance(value, list) else (value,)
             ):
-                if isinstance(node.value, ast.Name):
-                    resized.add(node.value.id)
-            elif (
-                isinstance(node, ast.Call)
-                and isinstance(node.func, ast.Attribute)
-                and node.func.attr in _RESIZING_METHODS
-                and isinstance(node.func.value, ast.Name)
-            ):
-                resized.add(node.func.value.id)
+                if not isinstance(child, ast.Name):
+                    continue
+                if child.id not in visible:
+                    unknown.add(child.id)
+                    continue
+                if (
+                    (isinstance(node, ast.For) and field == "iter")
+                    or (isinstance(node, ast.Subscript) and field == "value")
+                    or (
+                        isinstance(node, ast.Call)
+                        and field == "args"
+                        and index == 0
+                        and isinstance(node.func, ast.Name)
+                        and node.func.id == ReduceScope.SHARED_COLUMNS.value
+                    )
+                ):
+                    continue
+                unknown.add(child.id)
     return {
         name: length
         for name, length in lengths.items()
-        if bindings.get(name) == 1 and name not in resized
+        if bindings.get(name) == 1 and name not in unknown
     }
 
 
@@ -542,6 +662,28 @@ def _shared_two_stage_elements(pre: int, group_span: int, group_count: int) -> i
     return group_count * pre * (warps + 1)
 
 
+def _value_children(node: ast.AST, binds: set[str]) -> Iterator[ast.AST]:
+    """Visit values by position: a generated name can be used as both target
+    and RHS with Load context. Only the target edge binds it. A subscript
+    target still evaluates its base and indices."""
+    field = binding_field(node)
+    if field is None:
+        yield from ast.iter_child_nodes(node)
+        return
+    for name, value in ast.iter_fields(node):
+        for child in value if isinstance(value, list) else (value,):
+            if not isinstance(child, ast.AST):
+                continue
+            if name != field:
+                yield child
+                continue
+            for target in target_leaves(child):
+                if isinstance(target, ast.Name):
+                    binds.add(target.id)
+                else:
+                    yield target
+
+
 class _Walk:
     """One ``smem_footprint`` walk over a rendered body."""
 
@@ -557,6 +699,11 @@ class _Walk:
         self.runtime_scalars = runtime_scalars
         self.dispatch = dispatch
         self.persistent_loop = persistent_loop
+        # A nonempty phase has a CTA taking its range guard. Its other root
+        # dispatch and user conditionals can still drop their dead branches.
+        phases = PersistentPhase.entered(statements)
+        self.phase_loops = frozenset(phases)
+        self.phase_guards = frozenset(phases.values())
         self.statements = statements
         self.facts = _Facts()
         # The names whose current binding the code after the node being
@@ -615,7 +762,10 @@ class _Walk:
         """The facts inside the dynamic ``loop`` when it certainly has a trip
         for some block (``entry``): the persistent loop over virtual program
         ids always does (block 0 starts at the first of a static, nonempty
-        set); None when the walk cannot show a trip."""
+        set), as does some CTA of a proven nonempty phase. None when the
+        walk cannot show a trip."""
+        if id(loop) in self.phase_loops:
+            return self.facts
         target = loop.target
         if (
             self.persistent_loop is not None
@@ -690,7 +840,11 @@ class _Walk:
             # the later ones and the ``else`` may never be traced, so the
             # trips bound the allocations from above only.
             loop = loop.uncertain()
-        targets = self.bound(node.target) if isinstance(node, ast.For) else frozenset()
+        targets = (
+            frozenset(target_names(node.target))
+            if isinstance(node, ast.For)
+            else frozenset()
+        )
         replaced = targets.union(*map(self.bound, node.body))
         self._bound[id(node)] = replaced.union(*map(self.bound, node.orelse))
         if trips[1] == 0:
@@ -715,6 +869,7 @@ class _Walk:
             body = self.nodes(node.body)
             body_live, self.live = self.live, set(after)
             orelse = self.nodes(node.orelse)
+        # In a phase guard, only allocations get a positive witness below.
         # A binding stays certainly read when both branches leave it read,
         # or either does under the root dispatch, which keeps them all.
         if traced == "both":
@@ -726,7 +881,12 @@ class _Walk:
         self._bound[id(node)] = frozenset(binds).union(
             *map(self.bound, node.body), *map(self.bound, node.orelse)
         )
-        return test_footprint + _branches(body, orelse, traced)
+        branches = _branches(body, orelse, traced)
+        if id(node) in self.phase_guards:
+            # Some CTA enters the body. This establishes its allocation
+            # count, not that a skipped branch kept a previous binding live.
+            branches = dataclasses.replace(branches, low=body.low)
+        return test_footprint + branches
 
     def statement(self, node: ast.AST) -> SmemFootprint:
         """A plain statement: its footprint, given the names the code after
@@ -828,18 +988,17 @@ class _Walk:
                     binds.add(current.id)
                 elif id(current) not in metadata_roots:
                     reads.add(current.id)
-            pending.extend(ast.iter_child_nodes(current))
+            pending.extend(_value_children(current, binds))
         return footprint, reads, binds
 
     def repeated(self, node: ast.AST) -> SmemFootprint:
         """A definition allocates whenever it is called, a comprehension once
         per element: counts the walk cannot read.  It may never run, so
         nothing in it is certainly read."""
-        enclosing, self.live = self.live, set()
-        try:
-            return self.children(node).repeated(0, None)
-        finally:
-            self.live = enclosing
+        # In particular, a same-spelled formal is not an outer constexpr
+        # or dispatch variable. The nested body can run any number of times.
+        nested = _Walk([], {}, frozenset(), None, None)
+        return nested.children(node).repeated(0, None)
 
     def children(self, node: ast.AST) -> SmemFootprint:
         """The footprint of what ``node`` holds: its statements, expressions
@@ -871,7 +1030,7 @@ class _Walk:
                     if not isinstance(current.ctx, ast.Load):
                         names.add(current.id)
                 elif not isinstance(current, _REPEATED_NODES):
-                    pending.extend(ast.iter_child_nodes(current))
+                    pending.extend(_value_children(current, names))
             cached = self._bound[id(node)] = frozenset(names)
         return cached
 
@@ -1150,6 +1309,23 @@ def smem_footprint(
     ``persistent_loop`` the variable of a persistent loop every launch
     enters (see ``persistent_loop()``)."""
     nodes = list(statements)
+    if constexpr_values or runtime_scalars:
+        # The launch owns the incoming argument value, not a new binding
+        # in the body. This includes generated assignment targets with Load
+        # context, unrolled inductions and walrus targets in comprehensions.
+        stable = set(constexpr_values or {}) | set(runtime_scalars)
+        for statement in nodes:
+            if any(
+                isinstance(n, ast.stmt) and not isinstance(n, _EXPLICIT_BINDINGS)
+                for n in ast.walk(statement)
+            ):
+                stable.clear()
+                break
+            stable.difference_update(binding_names(statement))
+        constexpr_values = {
+            k: v for k, v in (constexpr_values or {}).items() if k in stable
+        }
+        runtime_scalars = frozenset(runtime_scalars & stable)
     walk = _Walk(
         nodes, constexpr_values or {}, runtime_scalars, dispatch, persistent_loop
     )
@@ -1187,6 +1363,9 @@ def persistent_loop(pid: ProgramIDs | None) -> str | None:
     static, nonempty set; None for any other launch.  Block 0 starts at the
     first id in both the interleaved and the blocked form, so the compiler
     keeps the loop's body, whatever its runtime bounds."""
+    if isinstance(pid, ForEachProgramID) and pid.uses_phase_loops:
+        # Each phase has its own trip proof (PersistentPhase).
+        return None
     cases = pid.cases if isinstance(pid, ForEachProgramID) else [pid]
     strategies: list[PersistentProgramIDs] = []
     for case in cases:
@@ -1208,35 +1387,21 @@ def persistent_loop(pid: ProgramIDs | None) -> str | None:
     return strategies[0].virtual_pid_var
 
 
-def _runtime_scalars(definition: ast.FunctionDef) -> frozenset[str]:
-    """The arguments of the kernel ``definition`` its launch passes as
-    runtime values that its body never rebinds: the unannotated ones (a
-    generated kernel annotates only its ``Constexpr`` arguments), the sizes
-    of a kernel without static shapes among them."""
-    rebound = {
-        node.id
-        for node in ast.walk(definition)
-        if isinstance(node, ast.Name) and not isinstance(node.ctx, ast.Load)
-    }
-    return frozenset(
-        argument.arg
-        for argument in definition.args.args
-        if argument.annotation is None and argument.arg not in rebound
-    )
-
-
 def kernel_smem_footprint(
     definition: ast.FunctionDef,
     constexpr_values: Mapping[str, int],
     pid: ProgramIDs | None = None,
 ) -> SmemFootprint:
     """``smem_footprint`` of the kernel ``definition``'s body, given its
-    runtime scalar arguments (``_runtime_scalars``) and the root dispatch
+    runtime scalar arguments and the root dispatch
     and persistent loop of the launch's program ids ``pid``."""
     return smem_footprint(
         definition.body,
         constexpr_values,
-        runtime_scalars=_runtime_scalars(definition),
+        # Only constexpr launch formals are annotated in the device AST.
+        runtime_scalars=frozenset(
+            arg.arg for arg in definition.args.args if arg.annotation is None
+        ),
         dispatch=root_dispatch(pid),
         persistent_loop=persistent_loop(pid),
     )

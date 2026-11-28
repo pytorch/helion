@@ -5,11 +5,14 @@ from __future__ import annotations
 
 import ast
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
 
 import helion
+from helion._compiler.cute._ast_pass_utils import rename_names
+from helion._compiler.cute.passes.pipeline import _peel_partial_chunks
 from helion._compiler.cute.peel_partial_chunks import merge_unproven_peels
 from helion._compiler.cute.peel_partial_chunks import peel_partial_chunks
 from helion._compiler.cute.proven_loop_bounds import simplify_proven_loop_bounds
@@ -92,6 +95,31 @@ def test_complete_chunks_lose_their_bounds_predicates() -> None:
     full, partial = (ast.unparse(loop) for loop in loops)
     assert "< 1000" not in full, full
     assert "< 1000" in partial
+
+
+@pytest.mark.parametrize("changed", ["S", "S_next"])
+def test_kernel_pass_preserves_rebound_chunk_start(changed: str) -> None:
+    # Until the final rename, the binding and the range can have different
+    # names. The host's S=0 is no longer the device's live start.
+    source = f"""
+{changed} = 8
+total = 0
+for i in range(S, 17, 8):
+    record(i)
+    if i + 7 < 17:
+        total += 1
+"""
+    renames = {"S_next": "S"}
+    expected = _run(rename_names(ast.parse(source), renames).body, 0)
+    assert expected == ([8, 16], 1)
+    state = Mock()
+    state.kernel_body = ast.parse(source).body
+    state.ctx.config = {}
+    state.ctx.constexpr_values = {"S": 0}
+    state.ctx.rename_groups = renames if changed == "S_next" else {}
+    _peel_partial_chunks(state)
+    actual = rename_names(ast.Module(body=state.kernel_body, type_ignores=[]), renames)
+    assert _run(actual.body, 0) == expected
 
 
 @pytest.mark.parametrize("thread", [0, 17, 63])

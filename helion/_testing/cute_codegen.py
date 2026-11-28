@@ -7,6 +7,7 @@ from contextlib import ExitStack
 from contextlib import contextmanager
 import dataclasses
 import importlib.util
+import operator
 import sys
 from types import SimpleNamespace
 from typing import TYPE_CHECKING
@@ -34,10 +35,12 @@ from ..runtime.cute.compile_cache import IEEE_DIVISION_COMPILE_OPTION
 from ..runtime.ref_mode import RefMode
 from ..runtime.ref_mode import RefModeContext
 from ..runtime.ref_mode import RefModeTorchFunctionMode
+from ..runtime.settings import Settings
 from . import cpu_render_target
 from . import default_cute_mma_support
 from . import patch_cute_mma_support
 from . import patch_target_facts
+import helion
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -53,7 +56,6 @@ if TYPE_CHECKING:
     from .._compiler.cute.full_tile_bounds import FullTilePlan
     from ..runtime.kernel import BoundKernel
     from ..runtime.kernel import Kernel
-    from ..runtime.settings import Settings
 
 
 def tcgen05_mma_support() -> SimpleNamespace:
@@ -116,6 +118,60 @@ def stage_sources(source: str) -> list[str]:
         and isinstance(node.args[0], ast.Constant)
         and isinstance(node.args[0].value, str)
     ]
+
+
+class _HostModules:
+    """Load actual generated host code, replacing device functions with tokens."""
+
+    def __init__(self) -> None:
+        self.sources: list[str] = []
+        self.markers: list[SimpleNamespace] = []
+
+    def load(self, source: str, extra: str = "") -> SimpleNamespace:
+        self.sources.append(source)
+        module = ast.parse(source)
+        namespace: dict[str, object] = {
+            "torch": torch,
+            "operator": operator,
+            "_default_cute_launcher": None,
+            "PyCodeCache": self,
+            "__file__": "<cpu-fission-test>",
+        }
+        stage_hosts = [
+            stmt
+            for stmt in module.body
+            if isinstance(stmt, ast.FunctionDef)
+            and "__region_" in stmt.name
+            and not stmt.name.startswith("_helion_")
+        ]
+        if stage_hosts:
+            assert len(stage_hosts) == 1
+            host = stage_hosts[0]
+            marker = SimpleNamespace(index=len(self.markers))
+            self.markers.append(marker)
+            namespace[f"_helion_{host.name}"] = marker
+            statements: list[ast.stmt] = [host]
+        else:
+            statements = [
+                stmt
+                for stmt in module.body
+                if not isinstance(stmt, (ast.Import, ast.ImportFrom))
+            ]
+        statements.insert(
+            0,
+            ast.ImportFrom(
+                module="__future__", names=[ast.alias(name="annotations")], level=0
+            ),
+        )
+        exec(
+            compile(
+                ast.fix_missing_locations(ast.Module(body=statements, type_ignores=[])),
+                "<cpu-fission-test>",
+                "exec",
+            ),
+            namespace,
+        )
+        return SimpleNamespace(**namespace)
 
 
 def load_generated_module(path: Path) -> ModuleType:
@@ -348,6 +404,16 @@ class RejectNativeCuda(TorchDispatchMode):
             ):
                 raise AssertionError("CUDA result forbidden by dispatch guard")
         return result
+
+
+@contextmanager
+def cpu_pid_codegen() -> Generator[None, None, None]:
+    """Run standalone PID mapping expressions with CuTe's scheduling types."""
+    with (
+        cpu_target(),
+        CompileEnvironment(torch.device("cpu"), Settings(backend="cute")),
+    ):
+        yield
 
 
 @contextmanager
@@ -625,3 +691,36 @@ def run_cpu_reference(
     context.func_mode = CpuRefMode()
     with context:
         return fn(*args)
+
+
+@contextmanager
+def full_slice_target() -> Generator[None, None, None]:
+    """The B200 capability, SM count and HIP flag with a 128 KiB reduction
+    SMEM budget (the tcgen05 SMEM capacity stays unmodelled)."""
+    with patch_target_facts(
+        capability=(10, 0),
+        num_sm=148,
+        is_hip=False,
+        reduction_smem_budget_bytes=128 * 1024,
+    ):
+        yield
+
+
+def bind_full_slice_matmul(
+    function: Callable[..., object],
+    args: tuple[torch.Tensor, ...],
+    *,
+    enabled: bool = True,
+    fission: bool = False,
+    static_shapes: bool = True,
+    backend: str = "cute",
+) -> BoundKernel[Any]:
+    kernel = helion.kernel(
+        backend=backend,
+        static_shapes=static_shapes,
+        autotune_effort="none",
+        cute_full_slice_matmul_tiling=enabled,
+        cute_region_fission=fission,
+    )(function)
+    with full_slice_target():
+        return kernel._bind_isolated(args)

@@ -4780,7 +4780,6 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
                     "tile dependencies require a persistent blocked kernel for "
                     "tile-dependency scheduling"
                 )
-                env.require_persistent_blocked(reason)
                 # Peer transports order static and dynamic schedules alike; only
                 # static ones, and dynamic ones with a gluon ring's claimed roots
                 # (ConfigSpec.normalize checks the config), mark guard-skipped
@@ -4806,6 +4805,18 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
                         "tile dependencies that require cross_loop_pipeline in "
                         f"{allowed}",
                     )
+                if (
+                    not cross_rank
+                    and choices == ("barrier",)
+                    and env.backend.barrier_allows_pid_type("persistent_interleaved")
+                ):
+                    # Both persistent layouts preserve the barrier. Arrival
+                    # counters and peer transport still need blocked ownership.
+                    env.require_persistent(
+                        reason="local grid barriers require a persistent kernel"
+                    )
+                else:
+                    env.require_persistent_blocked(reason)
                 config_spec.enable_cross_loop_pipeline(choices=choices)
                 if config_spec.supports_config_key("cross_loop_tmem_prefetch"):
                     for block_ids in env.backend.tmem_prefetch_candidates(device_ir):

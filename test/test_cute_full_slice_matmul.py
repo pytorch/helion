@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import ast
-from contextlib import contextmanager
 import sys
 from types import FunctionType
 from types import ModuleType
@@ -16,8 +15,9 @@ from helion._compiler.cute.state import cute_env_state
 from helion._compiler.device_ir import ForLoopGraphInfo
 from helion._testing import cpu_render_target
 from helion._testing import import_example
-from helion._testing import patch_target_facts
+from helion._testing.cute_codegen import bind_full_slice_matmul as _bind
 from helion._testing.cute_codegen import compile_reference
+from helion._testing.cute_codegen import full_slice_target as _cpu_target
 from helion._testing.cute_codegen import reference_host_function
 from helion._testing.cute_codegen import run_cpu_reference
 from helion._testing.cute_structural_kernels import _matmul
@@ -31,7 +31,6 @@ squeeze_and_excitation_net_fwd = import_example(
 if TYPE_CHECKING:
     from collections.abc import Callable
     from collections.abc import Generator
-    from collections.abc import Iterator
     from typing import Any
 
     from helion._compiler.host_function import HostFunction
@@ -274,19 +273,6 @@ def _direct_imports(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     return out
 
 
-@contextmanager
-def _cpu_target() -> Iterator[None]:
-    """The B200 capability, SM count and HIP flag with a 128 KiB reduction
-    SMEM budget (the tcgen05 SMEM capacity stays unmodelled)."""
-    with patch_target_facts(
-        capability=(10, 0),
-        num_sm=148,
-        is_hip=False,
-        reduction_smem_budget_bytes=128 * 1024,
-    ):
-        yield
-
-
 @pytest.fixture(autouse=True)
 def _cpu_only() -> Generator[None, None, None]:
     previous = torch.get_num_threads()
@@ -296,26 +282,6 @@ def _cpu_only() -> Generator[None, None, None]:
     with cpu_render_target():
         yield
     torch.set_num_threads(previous)
-
-
-def _bind(
-    function: Callable[..., object],
-    args: tuple[torch.Tensor, ...],
-    *,
-    enabled: bool = True,
-    fission: bool = False,
-    static_shapes: bool = True,
-    backend: str = "cute",
-) -> BoundKernel[Any]:
-    kernel = helion.kernel(
-        backend=backend,
-        static_shapes=static_shapes,
-        autotune_effort="none",
-        cute_full_slice_matmul_tiling=enabled,
-        cute_region_fission=fission,
-    )(function)
-    with _cpu_target():
-        return kernel._bind_isolated(args)
 
 
 def _host(bound: BoundKernel[Any]) -> HostFunction:

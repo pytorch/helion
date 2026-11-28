@@ -12,17 +12,17 @@ import torch
 from torch._subclasses.fake_tensor import FakeTensor
 from torch._subclasses.fake_tensor import FakeTensorMode
 
-from test.test_cute_materialized_fission import _HostModules
-from test.test_cute_materialized_fission import _sources
-
 import helion
 from helion import _compat
 from helion import _hardware
 from helion._testing import DEVICE
+from helion._testing import patch_target_facts
 from helion._testing import skipIfRefEager
 from helion._testing import skipUnlessBackends
+from helion._testing.cute_codegen import _HostModules
 from helion._testing.cute_codegen import mock_cuda_unavailable
 from helion._testing.cute_codegen import require_cute_codegen
+from helion._testing.cute_codegen import stage_sources as _sources
 import helion.language as hl
 
 triton = pytest.importorskip("triton")
@@ -100,6 +100,8 @@ def _host_result(code: str, name: str, x: torch.Tensor) -> torch.Tensor:
 
 
 @skipIfRefEager("requires compiler IR and explicit configurations")
+# Compare each supported root topology with widening, narrowing and unit-first
+# blocks, under static and dynamic shapes: all three change the host bindings.
 @pytest.mark.parametrize(
     ("backend", "kind"),
     [
@@ -140,6 +142,7 @@ def test_later_root_reduction_host_dependencies(
         else "persistent_blocked",
     )
     cached_capabilities: tuple[Any, ...] = (
+        _compat._target_device_capability,
         _compat._supports_tensor_descriptor,
         _compat._supports_maxnreg,
         _hardware.get_hardware_info,
@@ -165,13 +168,14 @@ def test_later_root_reduction_host_dependencies(
                 ),
             )
         )
-        for target in (
-            "helion.runtime.kernel.target_device_capability",
-            "helion._compiler.compile_environment.target_device_capability",
-        ):
-            stack.enter_context(patch(target, return_value=(10, 3)))
-        stack.enter_context(patch("helion._compat._is_hip", return_value=False))
-        stack.enter_context(patch("helion.runtime.get_num_sm", return_value=148))
+        # Backend recommendations also read the module-level capability.
+        # Keep the simulated target out of every real per-device cache.
+        stack.enter_context(
+            patch_target_facts(capability=(10, 3), num_sm=148, is_hip=False)
+        )
+        # Run the recommendation's capability lookup without recording a
+        # process-wide warning for this fictitious device.
+        stack.enter_context(patch("helion._compiler.backend_registry.warn_once"))
         stack.enter_context(
             patch(
                 "helion._hardware.get_hardware_info",
@@ -201,7 +205,9 @@ def test_later_root_reduction_host_dependencies(
 
 @skipIfRefEager("requires compiler IR and explicit configurations")
 @pytest.mark.skipif(DEVICE.type != "cuda", reason="requires CUDA")
-@pytest.mark.parametrize("backend", ["triton", "cute"])
+@pytest.mark.parametrize(
+    "backend", ["triton", pytest.param("cute", marks=skipUnlessBackends(["cute"]))]
+)
 def test_multi_root_reduction_native(backend: str) -> None:
     if backend == "cute":
         require_cute_codegen()

@@ -37,6 +37,7 @@ from typing import TYPE_CHECKING
 from typing import NamedTuple
 
 from ..ast_extension import _STATEMENT_LIST_FIELDS
+from ..ast_read_writes import binding_names
 from ._ast_pass_utils import call_path_str
 from ._ast_pass_utils import deep_clone
 from .reduce_call import GROUPED_REDUCE_HELPERS
@@ -205,10 +206,33 @@ def peel_partial_chunks(
     constexpr_values: Mapping[str, int],
     *,
     keep_whole: KeepWhole | None = None,
+    opaque_names: frozenset[str] = frozenset(),
 ) -> list[ast.stmt]:
     """Split every qualifying loop of ``body``, nested ones included;
     ``keep_whole(previous, loop)`` names the loops, at any depth, to leave
     whole with the loops nested in them, given the statement before each."""
+    if constexpr_values:
+        # The copied ranges have literal boundaries computed from the start
+        # and step. Neither incoming value may be replaced by a device binding.
+        root = ast.Module(body=body, type_ignores=[])
+        bound = binding_names(root) | opaque_names
+        for node in ast.walk(root):
+            if isinstance(node, ast.arg):
+                bound.add(node.arg)
+            elif isinstance(
+                node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
+            ):
+                bound.add(node.name)
+            elif isinstance(node, ast.alias):
+                bound.add(node.asname or node.name.split(".", 1)[0])
+            elif isinstance(node, (ast.ExceptHandler, ast.MatchAs, ast.MatchStar)):
+                if node.name is not None:
+                    bound.add(node.name)
+            elif isinstance(node, ast.MatchMapping) and node.rest is not None:
+                bound.add(node.rest)
+            elif isinstance(node, (ast.Global, ast.Nonlocal)):
+                bound.update(node.names)
+        constexpr_values = {k: v for k, v in constexpr_values.items() if k not in bound}
     return _peel(body, constexpr_values, keep_whole)[0]
 
 

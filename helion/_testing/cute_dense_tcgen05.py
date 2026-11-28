@@ -24,6 +24,7 @@ if TYPE_CHECKING:
     from collections.abc import Generator
 
     from helion.runtime.kernel import BoundKernel
+    from helion.runtime.kernel import Kernel
 
 # ``cpu_codegen_target`` reports the full opt-in capacity as the AB budget.
 # ``gb300_target`` restores the production probes, including the 28 KiB AB
@@ -599,3 +600,46 @@ def scaled_bmm_args(
     mask = torch.randn(m, n, device=device, dtype=torch.bfloat16)
     padded = torch.empty(batch, m, row, device=device, dtype=torch.bfloat16)
     return (a, b, mask, padded[..., :n]), padded
+
+
+def make_bias_residual_gelu_kernel() -> Kernel[torch.Tensor]:
+    @helion.kernel(backend="cute")
+    def cute_matmul_bias_residual_gelu(
+        x: torch.Tensor,
+        y: torch.Tensor,
+        bias: torch.Tensor,
+        residual: torch.Tensor,
+    ) -> torch.Tensor:
+        m, k = x.size()
+        _, n = y.size()
+        out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+        for tile_m, tile_n in hl.tile([m, n]):
+            acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+            for tile_k in hl.tile(k):
+                acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+            out[tile_m, tile_n] = torch.nn.functional.gelu(
+                1.25 * acc + 0.5 * residual[tile_m, tile_n] + bias[tile_n],
+                approximate="tanh",
+            ).to(x.dtype)
+        return out
+
+    return cute_matmul_bias_residual_gelu
+
+
+def make_tcgen05_persistent_config(**overrides: object) -> helion.Config:
+    """Build a ``helion.Config`` for the tcgen05 + TMA pipeline path."""
+    defaults: dict[str, object] = {
+        "block_sizes": [128, 256, 16],
+        "l2_groupings": [1],
+        "loop_orders": [[0, 1]],
+        "num_stages": 2,
+        "num_warps": 8,
+        "pid_type": "flat",
+        "tcgen05_cluster_m": 1,
+        "tcgen05_ab_stages": 2,
+        "tcgen05_acc_stages": 2,
+        "tcgen05_c_stages": 2,
+        "tcgen05_num_epi_warps": 4,
+    }
+    defaults.update(overrides)
+    return helion.Config(**defaults)  # type: ignore[arg-type]

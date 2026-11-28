@@ -26,9 +26,9 @@ the loop body may hold warp reductions: a warp shuffle claims no resource of
 its own, so the second copy runs once more what the loop ran once per tile.
 Shared-memory reduces and allocations still keep a loop whole.  For the sake
 of such lane loads, a loop is split only at the top level of the kernel body
-(or of its loop over a persistent launch's virtual program ids), and only
-when a lane loop of its body loads under a mask against the loop's end and
-its complete tiles gain a packet.
+(or inside its persistent PID loop, through that phase's proven uniform
+scheduler guards), and only when a lane loop of its body loads under a mask
+against the loop's end and its complete tiles gain a packet.
 
 A nest ``cute_vloop_sink`` interchanged loads its lanes in packets already,
 each under one predicate (``_cute_load_v16b_if``, zeros where it is false),
@@ -66,13 +66,19 @@ import torch
 
 from ...language._tracing_ops import _for_loop
 from ...language.memory_ops import load
+from ..ast_read_writes import binding_names
+from ..ast_read_writes import binding_targets
 from ..compile_environment import CompileEnvironment
 from ..compile_environment import _symint_expr
 from ..device_ir import ForLoopGraphInfo
+from ..program_id import PersistentPhase
 from ._ast_pass_utils import call_path_str
+from ._ast_pass_utils import cutlass_scalar_type
+from ._ast_pass_utils import dealias_shared_nodes
 from ._ast_pass_utils import deep_clone
 from ._ast_pass_utils import names_read
-from ._ast_pass_utils import names_written
+from ._ast_pass_utils import nontrivial_rename_names
+from ._ast_pass_utils import scalar_warp_combiner
 from .cache_policy_loads import CachePolicy
 from .literal_offset_loads import add_terms
 from .literal_offset_loads import stride_term
@@ -80,6 +86,7 @@ from .literal_offset_loads import strip_int_cast
 from .memory_ops import tensor_proven_base_alignment
 from .packet_access import PacketAccess
 from .packet_access import call_write_roots
+from .packet_access import fragment_writes
 from .packet_access import match_packet_access
 from .packet_access import render_packet_load
 from .peel_partial_chunks import peelable
@@ -90,6 +97,7 @@ from .peel_partial_chunks import with_bounds
 from .persistent_branch_vec import _binding_write_roots
 from .proven_loop_bounds import simplify_proven_loop_bounds
 from .proven_loop_bounds import with_proof_marker
+from .scalar_recipe import _NUMERIC_TYPES
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -337,6 +345,93 @@ def _load_parts(value: ast.expr) -> tuple[ast.Call, ast.Name | None] | None:
     return None
 
 
+def _known_bindings(statements: list[ast.stmt]) -> bool:
+    # Pattern captures, imports, exception names and lexical scopes are not
+    # simple bindings even when no Name node carries Store context.
+    callbacks = {
+        id(combine)
+        for stmt in statements
+        for n in ast.walk(stmt)
+        if (combine := scalar_warp_combiner(n)) is not None
+    }
+    return all(
+        (
+            not isinstance(
+                n,
+                (ast.Lambda, ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp),
+            )
+            or id(n) in callbacks
+        )
+        and (
+            not isinstance(n, ast.stmt)
+            or isinstance(
+                n,
+                (
+                    ast.Assign,
+                    ast.Assert,
+                    ast.AnnAssign,
+                    ast.AugAssign,
+                    ast.For,
+                    ast.While,
+                    ast.If,
+                    ast.With,
+                    ast.Expr,
+                    ast.Return,
+                    ast.Delete,
+                    ast.Break,
+                    ast.Continue,
+                    ast.Pass,
+                ),
+            )
+        )
+        for stmt in statements
+        for n in ast.walk(stmt)
+    )
+
+
+def _only_scalar_updates(loop: ast.For, definitions: Mapping[str, ast.expr]) -> bool:
+    """Augmented assignment may mutate an alias without rebinding its name.
+    Only allow it for known numeric values throughout all lane iterations."""
+    updates = [node for node in ast.walk(loop) if isinstance(node, ast.AugAssign)]
+    if not updates:
+        return True
+
+    def scalar(value: ast.expr) -> bool:
+        if (
+            isinstance(value, ast.UnaryOp)
+            and isinstance(value.op, (ast.UAdd, ast.USub))
+            and isinstance(value.operand, ast.Constant)
+        ):
+            value = value.operand
+        return (
+            isinstance(value, ast.Constant) and type(value.value) in (bool, int, float)
+        ) or (
+            isinstance(value, ast.Call)
+            and cutlass_scalar_type(value.func) in _NUMERIC_TYPES
+            and len(value.args) == 1
+            and not value.keywords
+        )
+
+    numeric = {name for name, value in definitions.items() if scalar(value)}
+    for node in ast.walk(loop):
+        if not isinstance(node, ast.AugAssign):
+            numeric.difference_update(
+                t.id for t in binding_targets(node) if isinstance(t, ast.Name)
+            )
+    # With both operands numeric, each supported scalar operation returns
+    # another numeric value. An unknown RHS could use a reflected method.
+    return all(
+        isinstance(update.target, ast.Name)
+        and update.target.id in numeric
+        and not isinstance(update.op, ast.MatMult)
+        and (
+            scalar(update.value)
+            or (isinstance(update.value, ast.Name) and update.value.id in numeric)
+        )
+        for update in updates
+    )
+
+
 class _Packetizer:
     """Turn the lane loads of a complete-tile loop into packets: in a
     ``range_constexpr(V)`` loop over ``vec_lane_*``, a load whose index is
@@ -351,24 +446,31 @@ class _Packetizer:
         multiples: dict[str, int],
         constexpr_values: Mapping[str, int],
         new_var: Callable[[str], str],
+        renamed: frozenset[str] = frozenset(),
     ) -> None:
+        self.renamed = renamed
         self.facts = facts
         self.multiples = multiples
-        self.constexpr_values = constexpr_values
+        self.constexpr_values = {
+            k: v for k, v in constexpr_values.items() if k not in renamed
+        }
         self.new_var = new_var
         self.count = 0
 
     def block(self, statements: list[ast.stmt]) -> list[ast.stmt]:
+        if not _known_bindings(statements):
+            return statements
         definitions: dict[str, ast.expr] = {}
+        private: set[str] = set()
         result: list[ast.stmt] = []
         for statement in statements:
             if isinstance(statement, (ast.For, ast.While)):
                 # A name the loop binds again holds its multiple only until
                 # that binding, which the loop's next iteration sees.
-                for name in names_written(statement) & self.multiples.keys():
+                for name in binding_names(statement) & self.multiples.keys():
                     del self.multiples[name]
             if isinstance(statement, ast.For):
-                self._loop(statement, definitions, result)
+                self._loop(statement, definitions, private, result)
             else:
                 for field in ("body", "orelse"):
                     inner = getattr(statement, field, None)
@@ -379,7 +481,10 @@ class _Packetizer:
             # binds it, an augmented or tuple assignment), no longer holds
             # its definition, nor does a name defined from it, and the loop
             # variable no longer holds a multiple of its step.
-            written = names_written(statement)
+            written = binding_names(statement)
+            # Only a fresh, unescaped register allocation is known to be
+            # independent of every tensor argument and every other home.
+            private.difference_update(written, names_read(statement))
             for name in [*definitions]:
                 if name in written or names_read(definitions[name]) & written:
                     del definitions[name]
@@ -390,13 +495,22 @@ class _Packetizer:
                 and len(statement.targets) == 1
                 and isinstance(statement.targets[0], ast.Name)
             ):
-                definitions[statement.targets[0].id] = statement.value
+                name, value = statement.targets[0].id, statement.value
+                if name in self.renamed or names_read(value) & self.renamed:
+                    continue
+                definitions[name] = value
+                if (
+                    isinstance(value, ast.Call)
+                    and call_path_str(value.func) == "cute.make_rmem_tensor"
+                ):
+                    private.add(name)
         return result
 
     def _loop(
         self,
         loop: ast.For,
         definitions: dict[str, ast.expr],
+        private: set[str],
         result: list[ast.stmt],
     ) -> None:
         call = loop.iter
@@ -416,13 +530,53 @@ class _Packetizer:
             loop.body = self.block(loop.body)
             result.append(loop)
             return
-        if _binding_write_roots(loop) & self.facts.keys() or any(
-            isinstance(node, ast.Call)
-            and (
-                _synchronizes(node)
-                or call_write_roots(node, lambda address: None) != frozenset()
+        # Generated lvalues can carry Load context. Even a changed pointer
+        # index or tensor subscript then prevents motion over that write.
+        bound = binding_names(loop)
+        # The packet extract must use the same induction value as the
+        # original address. A final phi rename can bind two spellings.
+        if target.id in self.renamed or any(
+            target.id in binding_names(stmt) for stmt in loop.body
+        ):
+            result.append(loop)
+            return
+        assigned = _binding_write_roots(loop) | bound
+        for node in ast.walk(loop):
+            if isinstance(node, (ast.Assert, ast.Return, ast.Break, ast.Continue)):
+                result.append(loop)
+                return
+            for dest in binding_targets(node):
+                if isinstance(dest, ast.Name):
+                    continue
+                # A local name can alias an argument. Accept only a direct
+                # register-element write with an unchanged, unescaped root.
+                if not (
+                    isinstance(dest, ast.Subscript)
+                    and isinstance(dest.value, ast.Name)
+                    and dest.value.id in private
+                    and dest.value.id not in bound
+                ):
+                    result.append(loop)
+                    return
+                assigned.add(dest.value.id)
+        if (
+            assigned & self.facts.keys()
+            or not _only_scalar_updates(loop, definitions)
+            or any(
+                isinstance(node, ast.Call)
+                and (
+                    _synchronizes(node)
+                    # A trace-time list or fragment can be read by the packet
+                    # address through another name even if no tensor is stored.
+                    or (
+                        isinstance(node.func, ast.Attribute)
+                        and node.func.attr == "append"
+                    )
+                    or fragment_writes(node)
+                    or call_write_roots(node, lambda address: None) != frozenset()
+                )
+                for node in ast.walk(loop)
             )
-            for node in ast.walk(loop)
         ):
             # A packet loads before the loop, ahead of every write in it (a
             # store, through a call or a subscript of a tensor argument, or a
@@ -431,7 +585,7 @@ class _Packetizer:
             # makes other threads' stores visible writes nothing itself).
             result.append(loop)
             return
-        hoisted = self._packets(loop, target.id, width, definitions)
+        hoisted = self._packets(loop, target.id, width, definitions, assigned)
         result.extend(hoisted)
         result.append(loop)
 
@@ -441,6 +595,7 @@ class _Packetizer:
         lane: str,
         width: int,
         definitions: dict[str, ast.expr],
+        assigned: set[str],
     ) -> list[ast.stmt]:
         bases: dict[str, ast.expr] = {}
         true_masks: set[str] = set()
@@ -448,11 +603,10 @@ class _Packetizer:
         # A packet loads before the loop, so its pointer may read only names
         # bound before it, and no element or attribute of a name the loop
         # stores one of.
-        assigned = _binding_write_roots(loop)
         for statement in loop.body:
             # A name bound again no longer holds the lane offset or the true
             # mask it was recorded for.
-            for written in names_written(statement):
+            for written in binding_names(statement):
                 bases.pop(written, None)
                 true_masks.discard(written)
             if not (
@@ -462,6 +616,8 @@ class _Packetizer:
             ):
                 continue
             name, value = statement.targets[0].id, statement.value
+            if name in self.renamed:
+                continue
             if isinstance(value, ast.Constant) and value.value is True:
                 true_masks.add(name)
                 continue
@@ -473,7 +629,7 @@ class _Packetizer:
                     bases[name] = ast.Name(id=base, ctx=ast.Load())
                 continue
             parts = _load_parts(value)
-            if parts is None:
+            if parts is None or names_read(value) & self.renamed:
                 continue
             load, mask = parts
             if mask is not None and mask.id not in true_masks:
@@ -573,18 +729,37 @@ def peel_vector_tails(
     new_var: Callable[[str], str],
     persistent_loop: str | None,
     block_grid_dims: tuple[int, int, int] | None = None,
+    rename_groups: Mapping[str, str] | None = None,
 ) -> list[ast.stmt]:
     """Split each qualifying device loop at the top level of ``body``, or of
     the body of its loop over a persistent launch's virtual program ids
-    (whose variable is ``persistent_loop``), whose complete tiles, once
+    (the legacy variable is ``persistent_loop``, a split phase has its own
+    header and uniform phase/root guards), whose complete tiles, once
     their masks are proven, load at least one lane in packets (named by
     ``new_var``); then run the complete tiles of each device loop that loads
     predicated packets, at any depth, unpredicated where the masks are
     proven given the launch's exact block grid (``block_grid_dims``, None
     when it is not known).  Other loops, and ``body`` without such a loop,
     stay as they are."""
-    if thread_block_dims is None:
+    if thread_block_dims is None or not _known_bindings(body):
         return body
+    renamed = nontrivial_rename_names(rename_groups or {})
+    # Both rewrites mutate their input. Already-packetized loads can be
+    # unmasked at any depth, even where no persistent trip could be proved.
+    # Detach shared dispatch subtrees before either pass sees them.
+    dealias_shared_nodes(body)
+    # Layout/stride facts belong to original tensor arguments. Even a
+    # shadowing local with the same name has not proved those facts.
+    rebound = {name for stmt in body for name in binding_names(stmt)}
+    constexpr_values = {
+        k: v
+        for k, v in constexpr_values.items()
+        if k not in rebound and k not in renamed
+    }
+    tensor_facts = {
+        name: facts for name, facts in tensor_facts.items() if name not in rebound
+    }
+    phases = PersistentPhase.entered(list(body))
     result, proven_any = _split_loops(
         body,
         [],
@@ -593,11 +768,15 @@ def peel_vector_tails(
         tensor_facts,
         new_var,
         persistent_loop,
+        renamed,
+        phases=frozenset(phases),
     )
     # After the splits: a loop split for its lane loads keeps the packets
     # its complete tiles gained, and those tiles, which divide their extent,
     # are then unmasked in place.
-    unmasker = _Unmasker(dict(constexpr_values), thread_block_dims, block_grid_dims)
+    unmasker = _Unmasker(
+        dict(constexpr_values), thread_block_dims, block_grid_dims, renamed
+    )
     result = unmasker.block(result, [])
     if not (proven_any or unmasker.count):
         return body
@@ -702,7 +881,9 @@ class _Unmasker:
         constexpr_values: dict[str, int],
         thread_block_dims: tuple[int, int, int],
         block_grid_dims: tuple[int, int, int] | None,
+        renamed: frozenset[str],
     ) -> None:
+        self.renamed = renamed
         self.constexpr_values = constexpr_values
         self.thread_block_dims = thread_block_dims
         self.block_grid_dims = block_grid_dims
@@ -841,6 +1022,7 @@ class _Unmasker:
             constexpr_values=dict(self.constexpr_values),
             block_grid_dims=self.block_grid_dims,
             propagate_truths=True,
+            opaque_names=self.renamed,
         )
 
 
@@ -857,17 +1039,47 @@ def _split_loops(
     tensor_facts: Mapping[str, TensorFacts],
     new_var: Callable[[str], str],
     persistent_loop: str | None,
+    renamed: frozenset[str],
+    phase_branches: frozenset[int] = frozenset(),
+    phases: frozenset[int] = frozenset(),
 ) -> tuple[list[ast.stmt], bool]:
     """``body`` with its qualifying device loops split (``peel_vector_tails``),
     both copies marked ``_SPLIT_COPY``, ``before`` the statements that run
-    ahead of it, and whether one was."""
+    ahead of it, and whether one was. ``phase_branches`` identifies the
+    current phase's original CTA-uniform scheduler guards; ``phases`` holds
+    the top-level persistent loops with proved static nonempty bounds."""
     result: list[ast.stmt] = []
     proven_any = False
     for index, statement in enumerate(body):
-        if (
-            isinstance(statement, ast.For)
-            and isinstance(statement.target, ast.Name)
-            and statement.target.id == persistent_loop
+        if isinstance(statement, ast.If) and id(statement) in phase_branches:
+            # The scheduler's phase/dispatch guards are CTA-uniform. Keep
+            # both branches in place; neither one's writes precede the other.
+            for branch in (statement.body, statement.orelse):
+                branch[:], proven = _split_loops(
+                    branch,
+                    [*before, *body[:index]],
+                    constexpr_values,
+                    thread_block_dims,
+                    tensor_facts,
+                    new_var,
+                    None,
+                    renamed,
+                    phase_branches,
+                )
+                proven_any |= proven
+            result.append(statement)
+            continue
+        phase = (
+            PersistentPhase.match(statement)
+            if isinstance(statement, ast.For) and id(statement) in phases
+            else None
+        )
+        if isinstance(statement, ast.For) and (
+            phase is not None
+            or (
+                isinstance(statement.target, ast.Name)
+                and statement.target.id == persistent_loop
+            )
         ):
             # Each virtual program id runs the loop's body as a block's
             # whole body would.  A statement ahead of the loop that binds a
@@ -875,10 +1087,10 @@ def _split_loops(
             # but it may still have changed any name it writes: in its place
             # the proof sees each of those names bound to a value it cannot
             # know.
-            rebound = names_written(statement)
+            rebound = binding_names(statement)
             ahead: list[ast.stmt] = []
             for earlier in [*before, *body[:index]]:
-                written = names_written(earlier)
+                written = binding_names(earlier)
                 if written & rebound:
                     ahead.extend(_unknown(name) for name in sorted(written))
                 else:
@@ -891,6 +1103,10 @@ def _split_loops(
                 tensor_facts,
                 new_var,
                 None,
+                renamed,
+                phase.phase.uniform_guards(phase.guard)
+                if phase is not None
+                else frozenset(),
             )
             result.append(statement)
             proven_any |= proven
@@ -912,6 +1128,9 @@ def _split_loops(
             continue
         assert isinstance(statement, ast.For)
         assert isinstance(statement.target, ast.Name)
+        if statement.target.id in renamed:
+            result.append(statement)
+            continue
         start, end, full_end, step = split
         complete = with_bounds(statement, start, full_end, mark=False)
         partial = with_bounds(statement, full_end, end, mark=False)
@@ -923,6 +1142,7 @@ def _split_loops(
             enabled=True,
             thread_block_dims=thread_block_dims,
             constexpr_values=dict(constexpr_values),
+            opaque_names=renamed,
         )
         complete = proven[-1]
         assert isinstance(complete, ast.For)
@@ -931,6 +1151,7 @@ def _split_loops(
             {statement.target.id: math.gcd(start, step)},
             constexpr_values,
             new_var,
+            renamed,
         )
         complete.body = packetizer.block(complete.body)
         if not packetizer.count:

@@ -38,10 +38,8 @@ def _(origin: Origin, **kwargs: object) -> LiteralType:
         raise exc.BarrierOnlyAllowedAtTopLevel
 
     env = CompileEnvironment.current()
-    # A barrier introduces a sequential phase boundary between top-level loops,
-    # so force persistent kernels (other PID choices are incompatible) unless
-    # the backend launches the phases in order under a pid type itself
-    # (``Backend.barrier_allows_pid_type``).
+    # Keep blocked persistent execution and any additional PID schedules in
+    # which this backend can preserve the phase boundary.
     env.has_barrier = True
     for disallowed in ("flat", "xyz", "persistent_interleaved"):
         if env.backend.barrier_allows_pid_type(disallowed):

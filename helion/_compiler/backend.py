@@ -466,11 +466,12 @@ class Backend(abc.ABC):
         return False
 
     def barrier_allows_pid_type(self, pid_type: str) -> bool:
-        """Whether ``hl.barrier()`` keeps ``pid_type`` available.
+        """Whether this PID schedule preserves a phase boundary between root loops.
 
-        A barrier is a sequential phase boundary between top-level loops; the
-        default forces the persistent schedulers.  A backend that launches the
-        phases in order itself keeps the pid type it does that under.
+        Explicit barriers and implicit dependencies both impose phase order.
+        Blocked persistent execution is the default. A backend may admit
+        other schedules, for example by launching phases separately or by
+        restarting interleaved workers after a grid barrier.
         """
         return False
 
@@ -928,6 +929,26 @@ class Backend(abc.ABC):
     ) -> str | None:
         """A device range which preserves a possibly wide persistent PID bound."""
         return None
+
+    def pid_extent_expr(self, expr: str, dtype: str) -> str:
+        """Render a tile extent in its scheduling type before ceiling division."""
+        return self.cast_expr(expr, dtype)
+
+    def wide_cumulative_program_ids(self, counts: list[str], *, blocked: bool) -> bool:
+        """Whether these device scheduling offsets need independent Int64 arithmetic."""
+        return False
+
+    def persistent_program_loop(
+        self, loop: ast.For, device_function: DeviceFunction
+    ) -> ast.For:
+        """Lower a generated positive-stride loop over logical programs."""
+        return loop
+
+    def program_id_range_str(
+        self, begin: str | None, end: str, step: str | None
+    ) -> str | None:
+        """Range of logical programs in a persistent launch, in index units."""
+        return self.range_str(begin, end, step)
 
     def arange_expr(
         self,
