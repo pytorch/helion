@@ -11,11 +11,11 @@ from .cute_population_contracts import _target
 from .test_compiler_coverage import DOMAINS
 from .test_compiler_coverage import make_search
 from .test_compiler_coverage import make_spec
-from .test_cute_grouped_ab_k import _unsupported_k_loop
 from helion._testing import skipUnlessBackends
 from helion._testing.cute_codegen import cpu_bind
 from helion._testing.cute_codegen import forbid_cuda_work
 from helion._testing.cute_codegen import mock_cuda_unavailable
+from helion._testing.cute_grouped_gemm import _unsupported_k_loop
 from helion.autotuner.pattern_search import InitialPopulationStrategy
 from helion.autotuner.pattern_search import PatternSearch
 from helion.autotuner.surrogate_pattern_search import LFBOPatternSearch

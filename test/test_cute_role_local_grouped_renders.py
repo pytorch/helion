@@ -13,11 +13,12 @@ proves it reached its builder in
 * F5 ``_build_grouped_worklist_nm_role_local_while``: the runtime tile table,
   the scheduler mailbox, runtime CLC record ids, and the dense ``local_full``
   branch; P2 ``_build_grouped_worklist_nm_scheduler_warp_role_local_while``:
-  the M,N panel raster and the dense full-coverage loop.
+  the dense full-coverage loop. The M,N panel raster is journaled in
+  ``test_cute_grouped_worklist_codegen``.
 
-The kernels and config builders belong to the tests that own those paths
+The kernels and config builders belong to the modules that own those paths
 (``test_cute_rank3_rhs_b_tma``, ``test_cute_deepgemm_selected``,
-``test_cute_grouped_large_device_seeds``, ``examples.grouped_gemm``); their
+``examples.grouped_gemm``); their
 argument builders allocate on ``DEVICE``, so the CPU copies live here.
 """
 
@@ -28,7 +29,6 @@ import torch
 
 from test.test_cute_deepgemm_selected import _selected_config
 from test.test_cute_deepgemm_selected import _selected_kernel
-from test.test_cute_grouped_large_device_seeds import _grouped_offsets_k64
 from test.test_cute_rank3_rhs_b_tma import _dynamic_bk64_config
 from test.test_cute_rank3_rhs_b_tma import _grouped_config
 from test.test_cute_rank3_rhs_b_tma import _rank3_rhs_grouped_nt
@@ -246,40 +246,7 @@ class TestRoleLocalGroupedRenders(RenderPins):
             absent=(RUNTIME_DIRECT_GRID_STRIDE,),
         )
 
-    # P2: the group-search scheduler warp's rasters.
-    def test_p2_panel_raster(self) -> None:
-        # The MN orientation with an L2 swizzle: the scheduler warp walks M,N
-        # panels and publishes the panel-local index.
-        config = helion.Config(
-            block_sizes=[256, 128, 64],
-            l2_groupings=[1],
-            loop_orders=[[0, 1, 2]],
-            num_stages=7,
-            num_warps=8,
-            pid_type="persistent_interleaved",
-            tcgen05_cluster_m=2,
-            tcgen05_cluster_n=1,
-            tcgen05_ab_stages=13,
-            tcgen05_acc_stages=2,
-            tcgen05_c_stages=2,
-            tcgen05_num_epi_warps=4,
-            tcgen05_consumer_regs=256,
-            tcgen05_grouped_mode="worklist_nm",
-            tcgen05_grouped_worklist_orientation="mn",
-            tcgen05_grouped_worklist_source_m_tile=128,
-            tcgen05_grouped_worklist_mma_n=128,
-            tcgen05_grouped_d_shift=True,
-            tcgen05_grouped_full_allocation_a=True,
-            tcgen05_l2_swizzle_size=4,
-        )
-        args = (
-            torch.empty((2048, 2048), dtype=torch.bfloat16),
-            torch.empty((16, 1536, 2048), dtype=torch.bfloat16),
-            torch.arange(17, dtype=torch.int32) * 128,
-        )
-        code = _render(_grouped_offsets_k64, args, config)
-        self._pin(code, PANEL_LOCAL_INDEX, GROUP_TILE_SCHEDULER, MAILBOX_VALID)
-
+    # P2: the group-search scheduler warp's dense full-coverage loop.
     def test_dense_full_coverage(self) -> None:
         # P2's dense full-coverage loop: the scheduler warp publishes every
         # tile of the index domain.

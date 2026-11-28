@@ -1,16 +1,14 @@
 from __future__ import annotations
 
 import ast
+from contextlib import contextmanager
 import random
+from typing import TYPE_CHECKING
+from typing import NamedTuple
 from unittest.mock import patch
 
 import pytest
 import torch
-
-from test.cute_population_contracts import _target
-from test.cute_population_contracts import checked_initial_population
-from test.test_cute_grouped_ab_k import _unsupported_k_loop
-from test.test_cute_grouped_large_device_seeds import _grouped_offsets_k64
 
 import helion
 from helion._compiler.cute.autotune.heuristics import cute as heuristics
@@ -18,8 +16,18 @@ from helion._compiler.cute.tcgen05_constants import tcgen05_grouped_worklist_sme
 from helion._testing.cute_codegen import cpu_bind
 from helion._testing.cute_codegen import forbid_cuda_work
 from helion._testing.cute_codegen import mock_cuda_unavailable
+from helion._testing.cute_grouped_gemm import _grouped_offsets_k64
+from helion._testing.cute_grouped_gemm import _unsupported_k_loop
+from helion._testing.cute_population_contracts import _target
+from helion._testing.cute_population_contracts import checked_initial_population
 from helion.autotuner.effort_profile import get_effort_profile
 from helion.autotuner.surrogate_pattern_search import LFBOTreeSearch
+
+if TYPE_CHECKING:
+    from collections.abc import Iterator
+
+    from helion.autotuner.config_spec import ConfigSpec
+    from helion.runtime.kernel import BoundKernel
 
 pytestmark = pytest.mark.cpu_only
 
@@ -41,13 +49,8 @@ def _args(m: int, groups: int, n: int, k: int):
     )
 
 
-@pytest.mark.parametrize(
-    "m,groups,n,k", [(2048, 16, 1536, 2048), (8192, 16, 1536, 2048), (512, 4, 512, 256)]
-)
-def test_mn_seeds_preserve_old_prefix_normalize_and_reach_native_source(
-    m: int, groups: int, n: int, k: int
-) -> None:
-    args = _args(m, groups, n, k)
+@contextmanager
+def _mn_target() -> Iterator[None]:
     with (
         forbid_cuda_work(),
         _target(),
@@ -56,49 +59,70 @@ def test_mn_seeds_preserve_old_prefix_normalize_and_reach_native_source(
             heuristics, "_tcgen05_grouped_prefix_adaptive_n_seeds", return_value=[]
         ),
     ):
+        yield
+
+
+class _MNSeedCase(NamedTuple):
+    columns: int
+    old: ConfigSpec
+    bound: BoundKernel
+    added: list[helion.Config]
+    representatives: tuple[helion.Config, ...]
+
+
+@pytest.fixture(
+    scope="module",
+    params=[(2048, 16, 1536, 2048), (8192, 16, 1536, 2048), (512, 4, 512, 256)],
+    ids=lambda shape: "-".join(map(str, shape)),
+)
+def mn_seed_case(request: pytest.FixtureRequest) -> Iterator[_MNSeedCase]:
+    m, groups, n, k = request.param
+    args = _args(m, groups, n, k)
+    with _mn_target():
         with patch.object(
             heuristics, "_tcgen05_grouped_mn_device_tile_seeds", return_value=[]
         ):
-            previous = cpu_bind(_kernel(), args)
-            old_seeds = list(previous.config_spec.compiler_seed_configs)
-            old_default = previous.config_spec.compiler_default_config
+            old = cpu_bind(_kernel(), args).config_spec
         bound = cpu_bind(_kernel(), args)
-        spec = bound.config_spec
-        seeds = spec.compiler_seed_configs
-        assert seeds[: len(old_seeds)] == old_seeds
-        assert spec.compiler_default_config == old_default
+    added = bound.config_spec.compiler_seed_configs[len(old.compiler_seed_configs) :]
+    representatives: dict[tuple[object, ...], helion.Config] = {}
+    for seed in added:
+        # Pipeline depths resize the same source. Keep the first seed for
+        # every worklist geometry and L2 swizzle.
+        representatives.setdefault(
+            (
+                seed["tcgen05_grouped_worklist_source_m_tile"],
+                seed["tcgen05_grouped_worklist_mma_n"],
+                seed["tcgen05_cluster_n"],
+                seed.get("tcgen05_grouped_balanced_workers"),
+                seed.get("tcgen05_l2_swizzle_size"),
+                seed.get("tcgen05_grouped_l2_swizzle_alternate"),
+                seed.get("tcgen05_grouped_l2_swizzle_mn_ratio"),
+            ),
+            seed,
+        )
+    # BoundKernel weakly retains runtime inputs: keep args alive while any
+    # batch may render from this binding, with no target mocks active.
+    yield _MNSeedCase(n, old, bound, added, tuple(representatives.values()))
+
+
+def test_mn_seeds_preserve_old_prefix_normalize_and_reach_native_source(
+    mn_seed_case: _MNSeedCase,
+) -> None:
+    old_seeds = mn_seed_case.old.compiler_seed_configs
+    added = mn_seed_case.added
+    with _mn_target():
+        spec = mn_seed_case.bound.config_spec
+        assert spec.compiler_seed_configs[: len(old_seeds)] == old_seeds
+        assert spec.compiler_default_config == mn_seed_case.old.compiler_default_config
         assert spec.block_sizes[2].declared_max_size == 64
-        added = seeds[len(old_seeds) :]
         assert added
-        representatives: dict[tuple[object, ...], helion.Config] = {}
         for seed in added:
             assert seed.get("tcgen05_grouped_worklist_orientation") == "mn"
             assert seed.block_sizes == [256, 128, 64]
             assert seed["tcgen05_grouped_full_allocation_a"] is True
             assert seed["tcgen05_grouped_d_shift"] is True
-            normalized = spec.normalized_config(seed)
-            assert normalized.block_sizes[2] == 64
-            # Every seed is normalized; one seed per worklist geometry and
-            # L2 swizzle layout is rendered below (the pipeline depths only
-            # resize the same source).
-            representatives.setdefault(
-                (
-                    seed["tcgen05_grouped_worklist_source_m_tile"],
-                    seed["tcgen05_grouped_worklist_mma_n"],
-                    seed["tcgen05_cluster_n"],
-                    seed.get("tcgen05_grouped_balanced_workers"),
-                    seed.get("tcgen05_l2_swizzle_size"),
-                    seed.get("tcgen05_grouped_l2_swizzle_alternate"),
-                    seed.get("tcgen05_grouped_l2_swizzle_mn_ratio"),
-                ),
-                normalized,
-            )
-        for normalized in representatives.values():
-            source = bound.to_code(normalized)
-            ast.parse(source)
-            assert "'bounded_output_shift': True" in source
-            assert "'immutable_ab_tensormaps': True" in source
-            assert "TensorMapManager" not in source
+            assert spec.normalized_config(seed).block_sizes[2] == 64
         mn = [
             seed
             for seed in added
@@ -114,7 +138,7 @@ def test_mn_seeds_preserve_old_prefix_normalize_and_reach_native_source(
             224,
             256,
         }
-        if n == 1536:
+        if mn_seed_case.columns == 1536:
             assert any(
                 seed["tcgen05_grouped_worklist_source_m_tile"] == 128
                 and seed["tcgen05_grouped_worklist_mma_n"] == 192
@@ -130,6 +154,23 @@ def test_mn_seeds_preserve_old_prefix_normalize_and_reach_native_source(
                 and seed["tcgen05_ab_stages"] == 7
                 for seed in mn
             )
+
+
+# Cross the original three shapes with disjoint slices of their complete
+# representative sets so one pytest item cannot spend minutes rendering them.
+_RENDER_BATCHES = 8
+
+
+@pytest.mark.parametrize("batch", range(_RENDER_BATCHES))
+def test_mn_seed_native_sources(mn_seed_case: _MNSeedCase, batch: int) -> None:
+    bound = mn_seed_case.bound
+    with _mn_target():
+        for seed in mn_seed_case.representatives[batch::_RENDER_BATCHES]:
+            source = bound.to_code(bound.config_spec.normalized_config(seed))
+            ast.parse(source)
+            assert "'bounded_output_shift': True" in source
+            assert "'immutable_ab_tensormaps': True" in source
+            assert "TensorMapManager" not in source
 
 
 def test_resource_and_complete_cluster_bounds_apply_to_each_proposal() -> None:

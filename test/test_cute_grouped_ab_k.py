@@ -24,6 +24,8 @@ from helion._testing.cute_codegen import cpu_bind
 from helion._testing.cute_codegen import forbid_cuda_work
 from helion._testing.cute_codegen import mock_cuda_unavailable
 from helion._testing.cute_codegen import require_cute_codegen
+from helion._testing.cute_grouped_gemm import grouped_ab_k_args as _args
+from helion._testing.cute_grouped_gemm import grouped_ab_k_config as _config
 from helion.autotuner.effort_profile import get_effort_profile
 from helion.autotuner.surrogate_pattern_search import LFBOTreeSearch
 from helion.exc import BackendUnsupported
@@ -61,76 +63,6 @@ def _observed_logical_k(
             acc = torch.addmm(acc, left, b[group, columns, inner].T)
         hl.store(out, [row_index, columns], acc, extra_mask=valid[:, None])
     return out, block_k
-
-
-@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
-def _unsupported_k_loop(
-    a: torch.Tensor, b: torch.Tensor, offsets: torch.Tensor, variant: int
-) -> torch.Tensor:
-    hl.specialize(variant)
-    m, k = a.shape
-    groups, n, _ = b.shape
-    block_m = hl.register_block_size(256)
-    block_n = hl.register_block_size(128)
-    block_k = hl.register_block_size(64)
-    out = torch.empty((m, n), dtype=torch.float32, device=a.device)
-    for group_tile, rows, columns in hl.tile(
-        [groups, m, n], block_size=[1, block_m, block_n]
-    ):
-        group = group_tile.index.sum()
-        start = offsets[group]
-        length = offsets[group + 1] - offsets[group]
-        row_index = start + rows.index
-        valid = rows.index < length
-        acc = hl.full(
-            [rows, columns], 1.0 if variant == 1 else 0.0, dtype=torch.float32
-        )
-        begin = 64 if variant == 2 else 0
-        for inner in hl.tile(begin, k, block_size=block_k):
-            left = hl.load(a, [row_index, inner], extra_mask=valid[:, None])
-            if variant == 3:
-                left = left * 1.0
-            acc = torch.addmm(
-                acc,
-                left,
-                b[group, columns, inner].T,
-                alpha=2 if variant == 4 else 1,
-            )
-            if variant == 5:
-                acc = acc * 1.0
-        hl.store(out, [row_index, columns], acc, extra_mask=valid[:, None])
-    return out
-
-
-def _args(
-    *,
-    m: int = 640,
-    k: int = 256,
-    n: int = 256,
-    dtype: torch.dtype = torch.bfloat16,
-    offset_dtype: torch.dtype = torch.int32,
-) -> tuple[torch.Tensor, ...]:
-    return (
-        torch.empty((m, k), dtype=dtype),
-        torch.empty((4, n, k), dtype=dtype),
-        torch.tensor([0, 0, 1, 129, m], dtype=offset_dtype),
-    )
-
-
-def _config(cluster_m: int, *, stages: int = 2) -> helion.Config:
-    return helion.Config(
-        block_sizes=[256, 128, 64],
-        pid_type="persistent_interleaved",
-        tcgen05_cluster_m=cluster_m,
-        tcgen05_cluster_n=1,
-        tcgen05_ab_stages=stages,
-        tcgen05_acc_stages=2,
-        tcgen05_c_stages=2,
-        tcgen05_num_epi_warps=4,
-        tcgen05_grouped_mode="worklist_nm",
-        tcgen05_grouped_worklist_source_m_tile=128,
-        tcgen05_grouped_ab_tile_k=128,
-    )
 
 
 def _plans(source: str) -> list[dict[str, object]]:
@@ -235,15 +167,6 @@ def test_physical128_cuda_live_offsets_and_graph_replay(
     offsets[1] = 0
     graph.replay()
     torch.testing.assert_close(captured, reference(), rtol=1e-3, atol=1e-3)
-
-
-@pytest.mark.parametrize("variant", [1, 2, 3, 5])
-def test_noncanonical_k_loops_cannot_request_physical128(variant: int) -> None:
-    with forbid_cuda_work(), _target(), mock_cuda_unavailable():
-        bound = cpu_bind(_unsupported_k_loop, (*_args(), variant))
-        assert not bound.config_spec._cute_tcgen05_config.grouped_ab_k_fusion_supported
-        with pytest.raises((InvalidConfig, BackendUnsupported)):
-            bound.to_code(_config(2))
 
 
 @pytest.mark.parametrize("alpha,beta", [(2, 1), (1, 0), (True, 1)])
