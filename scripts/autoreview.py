@@ -1373,9 +1373,12 @@ class ClaudeSession:
             "format above): keep tool work in the foreground and wait for its "
             "results before completing this request. Do not end the turn with "
             "progress text or a promise to report later. When the requested "
-            "review, combination, or fix is complete, append the following "
-            "exact line after the substantive response (also after an ERROR "
-            "response). Never append it to an interim update.\n"
+            "review, combination, or fix is complete, finish its text first. "
+            "The last-line rules above apply to that text: on a passing "
+            "review, LGTM comes BEFORE the completion line. Then write the "
+            "exact line below as the final line of the entire message, also "
+            "after findings or an ERROR. Nothing follows it. Never append it "
+            "to an interim update.\n"
             f"{completion}"
         )
         # Allow an explicitly long tool command within the send budget. Keep
